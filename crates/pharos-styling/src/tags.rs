@@ -10,6 +10,54 @@ pub(crate) struct Tag {
     pub nested: bool,
 }
 
+/// The tags whose argument is a size in script pixels, longest first so
+/// `\xbord` is not read as `\bord`.
+const SIZED: &[&str] = &[
+    "xbord", "ybord", "xshad", "yshad", "bord", "shad", "blur", "fs",
+];
+
+/// `text` with the argument of every size tag in its override blocks
+/// (`\fs`, `\bord`, `\shad`, `\blur` and their axis forms, nested in
+/// `\t(...)` too) multiplied by `k`, so a line's inline sizes follow the
+/// viewer's subtitle size. Text outside `{...}` is untouched.
+pub(crate) fn scale_sizes(text: &str, k: f32) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut in_block = false;
+    let mut rest = text;
+    while let Some(c) = rest.chars().next() {
+        rest = &rest[c.len_utf8()..];
+        match c {
+            '{' => in_block = true,
+            '}' => in_block = false,
+            '\\' if in_block => {
+                out.push(c);
+                if let Some(name) = SIZED.iter().find(|n| rest.starts_with(**n)) {
+                    let after = &rest[name.len()..];
+                    let len = after
+                        .bytes()
+                        .take_while(|b| b.is_ascii_digit() || *b == b'.')
+                        .count();
+                    if let Some(v) = after.get(..len).and_then(|n| n.parse::<f32>().ok()) {
+                        out.push_str(name);
+                        out.push_str(&size_arg(v * k));
+                        rest = &after[len..];
+                    }
+                }
+                continue;
+            }
+            _ => {}
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// A size argument with at most two decimals and no trailing zeros.
+fn size_arg(v: f32) -> String {
+    let s = format!("{:.2}", v);
+    s.trim_end_matches('0').trim_end_matches('.').to_owned()
+}
+
 /// Every tag name the scanner can split off a run of letters. Names outside
 /// the FR-004 allow-list are listed too so `\alpha` is never read as `\a`.
 const KNOWN: &[&str] = &[
@@ -156,6 +204,22 @@ pub(crate) fn is_animation(name: &str) -> bool {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
+
+    #[test]
+    fn scale_sizes_scales_only_size_tags_inside_blocks() {
+        assert_eq!(
+            scale_sizes(
+                r"{\fs130\bord5\xbord2\shad1.5\blur3\fscx130\fsp2\b1}fs10 \bord4",
+                1.5
+            ),
+            r"{\fs195\bord7.5\xbord3\shad2.25\blur4.5\fscx130\fsp2\b1}fs10 \bord4"
+        );
+        assert_eq!(
+            scale_sizes(r"{\t(0,120,\bord6\fscx100)}Hi{\bord2}", 0.75),
+            r"{\t(0,120,\bord4.5\fscx100)}Hi{\bord1.5}"
+        );
+        assert_eq!(scale_sizes("plain", 2.0), "plain");
+    }
 
     fn names(block: &str) -> Vec<String> {
         scan(block).into_iter().map(|t| t.name).collect()

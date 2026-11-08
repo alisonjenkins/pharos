@@ -85,7 +85,11 @@ pub fn compile(
             continue;
         };
         placer.accept(&evs);
-        for ev in evs {
+        let sized = (theme.tag_scale - 1.0).abs() > f32::EPSILON;
+        for mut ev in evs {
+            if sized {
+                ev.text = crate::tags::scale_sizes(&ev.text, theme.tag_scale);
+            }
             styles.insert(ev.style.clone());
             events.push((i, ev));
         }
