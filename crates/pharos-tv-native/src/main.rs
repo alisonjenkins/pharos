@@ -7,7 +7,7 @@
 use dioxus::prelude::*;
 
 mod screens;
-use screens::{Screen, Spike};
+use screens::{Data, Screen, Spike};
 
 #[cfg(target_os = "android")]
 #[unsafe(no_mangle)]
@@ -69,5 +69,5 @@ fn main() {
 }
 
 fn root() -> Element {
-    rsx! { Spike { start: Screen::Home } }
+    rsx! { Spike { start: Screen::Home, data: Data::fixture() } }
 }

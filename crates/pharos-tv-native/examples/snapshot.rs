@@ -29,7 +29,7 @@ struct Page {
 #[allow(non_snake_case)]
 fn Root(props: Page) -> Element {
     match props.screen {
-        Some(screen) => rsx! { Spike { start: screen } },
+        Some(screen) => rsx! { Spike { start: screen, data: screens::Data::fixture() } },
         // A control: plain text and an aspect-ratio box with no pharos CSS.
         None => rsx! {
             div { style: "color: white; background: #222; font-size: 40px; padding: 20px;",

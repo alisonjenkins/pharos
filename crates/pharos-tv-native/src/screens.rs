@@ -87,6 +87,11 @@ const SPIKE_CSS: &str = r#"
   transform: scale(1.08);
 }
 .pharos-tv-viewport { height: 100vh; overflow: hidden; }
+.pharos-tv-notice {
+  position: absolute; top: 2rem; right: 2rem; z-index: 10; margin: 0;
+  padding: 1rem 1.5rem; border-radius: 0.5rem; font-size: 2rem;
+  background: var(--px-color-surface, #222); color: var(--px-color-text, #fff);
+}
 .pharos-tv-keysink { position: absolute; width: 1px; height: 1px; opacity: 0; }
 "#;
 
@@ -96,8 +101,37 @@ const LITE_POSTERS: &str = r#"
 "#;
 const LITE_BACKDROP: &str = "body::before { display: none; }";
 
+/// What the screens show: rails on home and the library grid.
+#[derive(Clone, PartialEq, Debug)]
+pub struct Data {
+    pub rails: Vec<(String, Vec<Item>)>,
+    pub grid: Vec<Item>,
+}
+
+impl Data {
+    /// Home's rails in the WebView app's order, and a library page.
+    pub fn new(home: &Home, grid: Vec<Item>) -> Self {
+        let mut rails = vec![
+            ("Continue watching".to_owned(), home.resume.clone()),
+            ("Next up".to_owned(), home.next_up.clone()),
+        ];
+        rails.extend(home.rails.iter().map(|r| (r.library.name.clone(), r.latest.clone())));
+        rails.retain(|(_, items)| !items.is_empty());
+        Self { rails, grid }
+    }
+
+    pub fn fixture() -> Self {
+        let grid = (1..=120)
+            .map(|n| item(n, ItemKind::Movie, format!("Poster {n}")))
+            .collect();
+        Self::new(&fixture_home(), grid)
+    }
+}
+
+/// `notice` is shown over the screens: the QuickConnect code, or why the
+/// live server could not be reached.
 #[component]
-pub fn Spike(start: Screen) -> Element {
+pub fn Spike(start: Screen, data: Data, #[props(default)] notice: Option<String>) -> Element {
     let mut screen = use_signal(|| start);
     // (row, column) of the focused poster on the current screen.
     let mut focus = use_signal(|| (0usize, 0usize));
@@ -106,20 +140,7 @@ pub fn Spike(start: Screen) -> Element {
             log::info!("nav {}", to.path());
         }))
     });
-    let home = use_hook(fixture_home);
-    let rails: Vec<(String, Vec<Item>)> = use_hook(|| {
-        let mut rails = vec![
-            ("Continue watching".to_owned(), home.resume.clone()),
-            ("Next up".to_owned(), home.next_up.clone()),
-        ];
-        rails.extend(home.rails.iter().map(|r| (r.library.name.clone(), r.latest.clone())));
-        rails
-    });
-    let grid: Vec<Item> = use_hook(|| {
-        (1..=120)
-            .map(|n| item(n, ItemKind::Movie, format!("Poster {n}")))
-            .collect()
-    });
+    let Data { rails, grid } = data;
     let mut last_key = use_signal(|| None::<std::time::Instant>);
     // Paint-cost probe: "s" steps through 0 (shipped CSS), 1 (no poster
     // shadows or overlays) and 2 (also no full-screen backdrop gradient).
@@ -154,6 +175,9 @@ pub fn Spike(start: Screen) -> Element {
         style { {theme} }
         style { {CSS} }
         style { {SPIKE_CSS} }
+        if let Some(notice) = notice {
+            p { class: "pharos-tv-notice", "{notice}" }
+        }
         if lite() >= 1 { style { {LITE_POSTERS} } }
         if lite() >= 2 { style { {LITE_BACKDROP} } }
         div {
@@ -164,7 +188,7 @@ pub fn Spike(start: Screen) -> Element {
                 let (r, c) = focus();
                 let next = match key {
                     Key::Named(NamedKey::ArrowUp) => (r.saturating_sub(1), c),
-                    Key::Named(NamedKey::ArrowDown) => ((r + 1).min(rows - 1), c),
+                    Key::Named(NamedKey::ArrowDown) => ((r + 1).min(rows.saturating_sub(1)), c),
                     Key::Named(NamedKey::ArrowLeft) => (r, c.saturating_sub(1)),
                     Key::Named(NamedKey::ArrowRight) => (r, c + 1),
                     Key::Named(NamedKey::Enter) => {
