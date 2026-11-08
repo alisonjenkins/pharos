@@ -55,6 +55,11 @@ mod bundle_build_tests {
         ] {
             assert!(profile.contains(setting), "wasm-release lacks `{setting}`");
         }
+        // B837: strip removes the section wasm-bindgen needs.
+        assert!(
+            !profile.contains("strip = true"),
+            "wasm-release must not strip: wasm-bindgen needs target_features"
+        );
         let flake = repo_file("flake.nix");
         assert!(
             flake.contains("--bin pharos-ui-web --features web --release --profile wasm-release"),
