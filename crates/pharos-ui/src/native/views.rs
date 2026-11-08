@@ -936,6 +936,9 @@ pub fn PosterTile(item: Item) -> Element {
                 if item.played {
                     span { class: "pharos-badge", if item.kind == ItemKind::Audio { "Played" } else { "Watched" } }
                 }
+                if item.stereo.is_some() {
+                    span { class: "pharos-badge pharos-badge-3d", title: "Has a 3D version", "3D" }
+                }
                 if let Some(p) = progress {
                     div { class: "pharos-progress", style: "width: {p}%" }
                 }
@@ -2202,6 +2205,24 @@ mod tests {
         );
         assert!(html.contains(r#"href="/ui/browse/1""#), "{html}");
         assert!(html.contains("Showing 1 of 3."), "{html}");
+    }
+
+    /// Spec 022 US1 (V722): a 3D title is badged on its tile, a 2D one is not.
+    #[test]
+    fn a_3d_title_is_badged() {
+        use pharos_client::api::Stereo;
+        let mut movie = item(ItemKind::Movie);
+        let flat = render({
+            let movie = movie.clone();
+            move || rsx! { PosterTile { item: movie.clone() } }
+        });
+        assert!(!flat.contains("pharos-badge-3d"), "{flat}");
+        movie.stereo = Some(Stereo::HalfSideBySide);
+        let tile = render(move || rsx! { PosterTile { item: movie.clone() } });
+        assert!(
+            tile.contains("pharos-badge-3d") && tile.contains(">3D<"),
+            "{tile}"
+        );
     }
 
     #[test]
