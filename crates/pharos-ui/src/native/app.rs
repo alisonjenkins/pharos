@@ -3164,6 +3164,7 @@ impl PartialEq for PlayingRef {
 fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
     let ctx = use_context::<Ctx>();
     let replace = use_context::<Replace>();
+    let together = use_context::<Together>();
     let StageCtx(mut ctx_stage) = use_context::<StageCtx>();
     // A song that follows one handing over fades in as that one fades out.
     // Taken by the first player mounted, so a renegotiated one starts as is.
@@ -3302,6 +3303,7 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
         let pressed = pressed || started_over.get() == Some(id);
         let from_start = previous || pressed;
         let reason = if pressed { "start_over" } else { "previous" };
+        let together = together.clone();
         async move {
             let api = api?;
             // A play outside the full view is the stage's (spec 020 FR-010).
@@ -3342,16 +3344,27 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
                             "This title needs HLS, which this browser cannot play.".to_owned()
                         );
                     }
-                    let start_ms = match resume_from.get() {
-                        0 if from_start => {
+                    // In a group playing this item, the player starts where
+                    // the group is: this member's own resume point would land
+                    // after the group's catch-up seek and carry it away (B664).
+                    let group_start = together.current().and_then(|s| s.start_for(id));
+                    let start_ms = match (resume_from.get(), group_start) {
+                        (0, Some(at)) => {
+                            platform::info(&format!(
+                                "pharos: playback group_start item={id} position_ms={at} saved_ms={}",
+                                detail.item.position_ms
+                            ));
+                            at
+                        }
+                        (0, None) if from_start => {
                             platform::info(&format!(
                                 "pharos: playback from_start item={id} reason={reason} saved_ms={}",
                                 detail.item.position_ms
                             ));
                             0
                         }
-                        0 => start_ms(detail.item.position_ms, detail.item.played),
-                        here => here,
+                        (0, None) => start_ms(detail.item.position_ms, detail.item.played),
+                        (here, _) => here,
                     };
                     Ok(PlayingRef(Rc::new(Playing {
                         title: super::views::display_name(&detail.item),
