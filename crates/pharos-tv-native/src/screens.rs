@@ -90,6 +90,12 @@ const SPIKE_CSS: &str = r#"
 .pharos-tv-keysink { position: absolute; width: 1px; height: 1px; opacity: 0; }
 "#;
 
+const LITE_POSTERS: &str = r#"
+.pharos-poster-art { box-shadow: none; }
+.pharos-poster-art::before, .pharos-poster-art::after { display: none; }
+"#;
+const LITE_BACKDROP: &str = "body::before { display: none; }";
+
 #[component]
 pub fn Spike(start: Screen) -> Element {
     let mut screen = use_signal(|| start);
@@ -115,6 +121,9 @@ pub fn Spike(start: Screen) -> Element {
             .collect()
     });
     let mut last_key = use_signal(|| None::<std::time::Instant>);
+    // Paint-cost probe: "s" steps through 0 (shipped CSS), 1 (no poster
+    // shadows or overlays) and 2 (also no full-screen backdrop gradient).
+    let mut lite = use_signal(|| 0u8);
     use_effect(move || {
         // Runs after the render that follows a key: a rough press-to-render
         // time (the frame itself is committed after this).
@@ -145,6 +154,8 @@ pub fn Spike(start: Screen) -> Element {
         style { {theme} }
         style { {CSS} }
         style { {SPIKE_CSS} }
+        if lite() >= 1 { style { {LITE_POSTERS} } }
+        if lite() >= 2 { style { {LITE_BACKDROP} } }
         div {
             class: "pharos-app pharos-tv-viewport",
             onkeydown: move |e: KeyboardEvent| {
@@ -163,6 +174,12 @@ pub fn Spike(start: Screen) -> Element {
                     Key::Named(NamedKey::BrowserBack) | Key::Named(NamedKey::GoBack) if screen() == Screen::Grid => {
                         screen.set(Screen::Home);
                         (0, 0)
+                    }
+                    Key::Character(ref ch) if ch == "s" => {
+                        let level = (lite() + 1) % 3;
+                        log::info!("lite level {level}");
+                        lite.set(level);
+                        (r, c)
                     }
                     Key::Named(NamedKey::MediaPlayPause) | Key::Character(_) => {
                         screen.set(if screen() == Screen::Home { Screen::Grid } else { Screen::Home });
