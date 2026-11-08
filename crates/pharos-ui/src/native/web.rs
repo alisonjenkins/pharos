@@ -3808,6 +3808,21 @@ fn wake_tap(media: &web_sys::HtmlMediaElement) {
     }
 }
 
+/// Wake a suspended tap context on the media element `id` that a play did
+/// not wake first (V683): a play from outside the player's controls, such
+/// as the browser's own media controls, after the pause rested it.
+pub fn wake_media_tap(id: &str) {
+    let Some(media) = video_element(id) else {
+        return;
+    };
+    let asleep = with_tap(&media, |t| {
+        super::resume::wakes_context(&context_state(&t.context))
+    });
+    if asleep == Some(true) {
+        wake_tap(&media);
+    }
+}
+
 /// Names the MSE engine attaching to `media`, for [`resume_context`].
 pub fn mark_engine(media: &web_sys::HtmlMediaElement, engine: &str) {
     if let Err(e) = media.set_attribute(super::resume::ENGINE_MARK, engine) {
@@ -3858,6 +3873,23 @@ pub fn tap_wake(id: &str) -> super::resume::Wake {
     video_element(id)
         .and_then(|media| with_tap(&media, |t| t.wake.get()))
         .unwrap_or_default()
+}
+
+/// Suspend the running tap context on the media element `id`, letting the
+/// output stream close (B734, V683). Returns the context's state before, or
+/// `None` with no tap.
+pub fn rest_tap(id: &str) -> Option<String> {
+    let media = video_element(id)?;
+    let context = with_tap(&media, |t| t.context.clone())?;
+    let state = context_state(&context);
+    if state == "running" {
+        if let Err(e) = context.suspend() {
+            warn(&format!(
+                "pharos: audio output rest suspend() refused: {e:?}"
+            ));
+        }
+    }
+    Some(state)
 }
 
 /// The largest sample in the tap's latest window on the media element `id`,
