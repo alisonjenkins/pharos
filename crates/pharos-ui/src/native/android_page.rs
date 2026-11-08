@@ -1257,8 +1257,10 @@ struct Owned<T>(T);
 // access is under its mutex from code Dioxus runs one at a time.
 unsafe impl<T> Send for Owned<T> {}
 
-/// The controls the arrow keys move between, as on the web.
-const KEY_TARGETS: &str = "a[href], button:not([disabled]), [tabindex]:not([tabindex='-1'])";
+/// The controls the arrow keys move between: the web's, and the player's
+/// track pickers too, which a remote has no other way to reach.
+const KEY_TARGETS: &str =
+    "a[href], button:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex='-1'])";
 
 /// An app-wide key listener: key, ctrl, meta; true takes the key.
 type AppKeys = Box<dyn FnMut(&str, bool, bool) -> bool>;
@@ -1317,7 +1319,8 @@ fn set_root_attribute(name: &str, value: &str) {
 /// is left to it, so the focused control is clicked.
 const BRIDGE_JS: &str = r#"
 const send = (v) => dioxus.send(v);
-const inText = (t) => !!t && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName));
+// Not a <select>: OK opens its list, and the arrows have to move off it.
+const inText = (t) => !!t && (t.isContentEditable || /^(INPUT|TEXTAREA)$/.test(t.tagName));
 // Space too: the player's mode key toggles play, and the WebView would
 // click the focused button as well (it cannot wait for Rust's answer).
 const takes = new Set(["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", " "]);
