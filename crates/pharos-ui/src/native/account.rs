@@ -92,9 +92,10 @@ pub fn AccountMenuView(
                     if !name.is_empty() {
                         p { class: "pharos-account-name", "{name}" }
                     }
-                    MenuLink { to: Route::Account, "Account" }
+                    // One way into the settings pages (Appearance, Playback,
+                    // Account, Devices, Privacy); their sidebar does the rest.
+                    MenuLink { to: Route::Appearance, "Settings" }
                     MenuLink { to: Route::ApproveDevice, "Approve a device" }
-                    MenuLink { to: Route::Appearance, "Appearance" }
                     if is_admin {
                         MenuLink { to: Route::Manage, "Manage" }
                     }
@@ -198,7 +199,7 @@ mod tests {
         assert!(html.contains(">AJ<"), "{html}");
         assert!(html.contains("aria-expanded=\"false\""), "{html}");
         assert!(!html.contains("Sign out"), "{html}");
-        assert!(!html.contains("Appearance"), "{html}");
+        assert!(!html.contains("Settings"), "{html}");
     }
 
     #[test]
@@ -219,13 +220,7 @@ mod tests {
     fn an_admin_sees_manage() {
         let html = render(me("ali", true), true);
         assert!(html.contains("aria-expanded=\"true\""), "{html}");
-        for item in [
-            "Account",
-            "Approve a device",
-            "Appearance",
-            "Manage",
-            "Sign out",
-        ] {
+        for item in ["Settings", "Approve a device", "Manage", "Sign out"] {
             assert!(html.contains(item), "{item}: {html}");
         }
     }
@@ -234,7 +229,7 @@ mod tests {
     fn a_user_who_is_not_an_admin_does_not_see_manage() {
         let html = render(me("guest", false), true);
         assert!(html.contains("Approve a device"), "{html}");
-        assert!(html.contains("Appearance"), "{html}");
+        assert!(html.contains("Settings"), "{html}");
         assert!(html.contains("Sign out"), "{html}");
         assert!(!html.contains("Manage"), "{html}");
     }
