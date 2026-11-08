@@ -108,6 +108,11 @@ const PROXIED: [&str; 9] = [
     "ui",
 ];
 
+/// The container list a TV build declares: one no file has, so the server
+/// never offers direct play (an empty list would mean "any"). Carried from
+/// `feat/tv-android-playback` (#1002) for the native spike.
+pub const NO_DIRECT_PLAY: &str = "none";
+
 /// Whether the page's request for `segment` (its path's first segment) is
 /// answered from the server.
 pub fn proxied(segment: &str) -> bool {
