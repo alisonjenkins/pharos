@@ -46,6 +46,7 @@ const MEDIA_COLUMNS: &str = "id, path, title, kind, size_bytes, duration_ms, con
     imdb_rating, rt_tomatometer, \
     bpm_mille, tempo_source, energy_mille, audio_analysis_version, \
     audio_analysis_mtime, audio_analysis_size, file_mtime, file_size_seen";
+use futures_util::TryStreamExt;
 use sqlx::PgPool;
 use std::str::FromStr;
 use uuid::Uuid;
@@ -807,11 +808,18 @@ impl MediaStore for PostgresStore {
     #[tracing::instrument(skip(self))]
     async fn list(&self) -> DomainResult<Vec<MediaItem>> {
         let sql = format!("SELECT {MEDIA_COLUMNS} FROM media_items ORDER BY id");
-        let rows = sqlx::query_as::<_, MediaRow>(sqlx::AssertSqlSafe(sql))
-            .fetch_all(&self.pool)
+        // Map each row as it arrives so the raw `MediaRow` buffer for the whole
+        // library is never resident next to the finished items.
+        let mut rows = sqlx::query_as::<_, MediaRow>(sqlx::AssertSqlSafe(sql)).fetch(&self.pool);
+        let mut items = Vec::new();
+        while let Some(row) = rows
+            .try_next()
             .await
-            .map_err(|e| DomainError::Backend(e.to_string()))?;
-        rows.into_iter().map(MediaRow::into_domain).collect()
+            .map_err(|e| DomainError::Backend(e.to_string()))?
+        {
+            items.push(row.into_domain()?);
+        }
+        Ok(items)
     }
 
     #[tracing::instrument(skip(self, q))]
