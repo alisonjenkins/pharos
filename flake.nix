@@ -1250,6 +1250,8 @@
                   pkgs.coreutils
                   pkgs.findutils
                   pkgs.git
+                  pkgs.gnugrep
+                  pkgs.gnused
                   pkgs.nix
                 ];
                 text = builtins.readFile ./scripts/android-apk.sh;
