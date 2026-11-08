@@ -286,6 +286,11 @@ compat-dioxus-full native="on" port="8096" config="playwright.dioxus.config.ts":
     name = "Bulk"
     kind = "movies"
 
+    [[media.libraries]]
+    path = "$TMP/media/Stereo"
+    name = "Stereo"
+    kind = "movies"
+
     [database]
     url = "sqlite://$TMP/pharos.db?mode=rwc"
     $NATIVE_BLOCK
@@ -293,6 +298,14 @@ compat-dioxus-full native="on" port="8096" config="playwright.dioxus.config.ts":
     PHAROS_CONFIG="$TMP/pharos.toml"
     nix develop --command cargo build -q --bin pharos --bin transcode-worker
     nix develop --command cargo run -q --bin pharos -- --config "$PHAROS_CONFIG" admin seed-playwright-user
+    # A film with a half side-by-side edition beside it, and a second copy of
+    # a seeded episode in a "Season 1" folder beside "Season 01", for the 3D
+    # badge, the 3D filter and the version picker (V721, V722).
+    mkdir -p "$TMP/media/Stereo" "$TMP/media/TV/Playwright Show/Season 1"
+    ln "$TMP/media/06-test-av-confirm.webm" "$TMP/media/Stereo/Stereo Film (2009).webm"
+    ln "$TMP/media/06-test-av-confirm.webm" "$TMP/media/Stereo/Stereo Film (2009) - 3D.HSBS.webm"
+    cp "$TMP/media/TV/Playwright Show/Season 01/Playwright Show - S01E02.webm" \
+      "$TMP/media/TV/Playwright Show/Season 1/Playwright Show - S01E02.webm"
     echo "compat-dioxus-full: ui bundle $UI_SRC, served from $UI_DIR"
     if [[ -d "$UI_SRC" ]]; then echo "  present"; else echo "  MISSING from this view of /nix/store"; fi
     nix path-info "$UI_SRC" 2>&1 | sed 's/^/  path-info: /' || true
