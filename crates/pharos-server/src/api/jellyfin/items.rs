@@ -5095,9 +5095,9 @@ pub(crate) fn effective_sort_seed(q: &ItemQuery, user_id: UserId) -> u64 {
 pub(crate) async fn apply_userdata_filter(
     state: &AppState,
     user_id: UserId,
-    items: Vec<MediaItem>,
+    items: Vec<pharos_core::MediaId>,
     q: &ItemQuery,
-) -> Result<Vec<MediaItem>, pharos_core::DomainError> {
+) -> Result<Vec<pharos_core::MediaId>, pharos_core::DomainError> {
     let mut f = match q.filters.as_deref() {
         Some(raw) => UserDataFilter::parse(raw),
         None => UserDataFilter::default(),
@@ -5113,9 +5113,8 @@ pub(crate) async fn apply_userdata_filter(
     if !f.is_active() {
         return Ok(items);
     }
-    let ids: Vec<u64> = items.iter().map(|i| i.id).collect();
-    let user_data = state.stores.user_data_bulk(user_id, &ids).await?;
-    let kept: Vec<MediaItem> = items
+    let user_data = state.stores.user_data_bulk(user_id, &items).await?;
+    let kept: Vec<pharos_core::MediaId> = items
         .into_iter()
         .enumerate()
         .filter_map(|(i, item)| {
@@ -5139,9 +5138,9 @@ pub(crate) async fn apply_userdata_filter(
 /// collapses to nothing (the correct "no item has this tag" result).
 pub(crate) async fn apply_tags_filter(
     state: &AppState,
-    items: Vec<MediaItem>,
+    items: Vec<pharos_core::MediaId>,
     q: &ItemQuery,
-) -> Result<Vec<MediaItem>, pharos_core::DomainError> {
+) -> Result<Vec<pharos_core::MediaId>, pharos_core::DomainError> {
     use pharos_core::TagStore;
     let Some(raw) = q.tags.as_deref() else {
         return Ok(items);
@@ -5167,14 +5166,14 @@ pub(crate) async fn apply_tags_filter(
         });
     }
     let keep = keep.unwrap_or_default();
-    Ok(items.into_iter().filter(|i| keep.contains(&i.id)).collect())
+    Ok(items.into_iter().filter(|id| keep.contains(id)).collect())
 }
 
 /// xorshift64 Fisher–Yates. Deterministic for a given seed — same
 /// `(items, seed)` yields the same permutation. Caller threads a
 /// seed (from `?SortSeed=` or the bearer's user id) so /Items?
 /// SortBy=Random pagination doesn't reshuffle between page requests.
-pub(crate) fn shuffle_in_place(items: &mut [MediaItem], seed: u64) {
+pub(crate) fn shuffle_in_place<T>(items: &mut [T], seed: u64) {
     // xorshift64 reqs non-zero state; caller forces low bit.
     let mut state = seed | 1;
     for i in (1..items.len()).rev() {
