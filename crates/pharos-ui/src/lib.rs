@@ -61,4 +61,22 @@ mod bundle_build_tests {
             "pharosUiBundle must build with --profile wasm-release"
         );
     }
+
+    /// V764 (B814): the proxy compresses the wasm and the bundled font.
+    #[test]
+    fn the_proxy_compresses_the_wasm() {
+        let flake = repo_file("flake.nix");
+        let types = flake
+            .split("gzip_types\n")
+            .nth(1)
+            .and_then(|rest| rest.split(';').next())
+            .unwrap_or_default();
+        for mime in ["application/wasm", "font/ttf"] {
+            assert!(types.contains(mime), "gzip_types lacks {mime}");
+        }
+        assert!(
+            flake.contains("font/ttf ttf;"),
+            "angie must type .ttf as font/ttf"
+        );
+    }
 }
