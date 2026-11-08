@@ -436,6 +436,33 @@ mod root_like_tests {
     }
 }
 
+/// Size of the connection pool a store opens.
+///
+/// Every request holds a connection for each query it runs, so a pool smaller
+/// than the number of concurrent requests queues them; a request that cannot
+/// get one within `acquire_timeout` fails instead of waiting forever. The
+/// defaults are the sizes the stores used before they were configurable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PoolConfig {
+    pub max_connections: u32,
+    pub acquire_timeout: std::time::Duration,
+}
+
+impl PoolConfig {
+    /// Matches `sqlx`'s own default, so leaving it unset changes nothing.
+    pub const DEFAULT_ACQUIRE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+    pub const DEFAULT_MAX_CONNECTIONS: u32 = 8;
+}
+
+impl Default for PoolConfig {
+    fn default() -> Self {
+        Self {
+            max_connections: Self::DEFAULT_MAX_CONNECTIONS,
+            acquire_timeout: Self::DEFAULT_ACQUIRE_TIMEOUT,
+        }
+    }
+}
+
 /// T-fix-RC1 — single-row mutable branding/config snapshot persisted
 /// in the `runtime_config` table by both sqlite + postgres backends.
 /// None for any field means "no override; fall back to config.toml".
