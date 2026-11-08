@@ -186,6 +186,7 @@ pub enum Reason {
     Bandwidth,
     Buffer,
     Ceiling,
+    Timeout,
 }
 
 impl Reason {
@@ -196,6 +197,7 @@ impl Reason {
             Self::Bandwidth => "bandwidth",
             Self::Buffer => "buffer",
             Self::Ceiling => "ceiling",
+            Self::Timeout => "timeout",
         }
     }
 }
@@ -358,6 +360,20 @@ impl Abr {
         None
     }
 
+    /// A segment of the current rung missed its load deadline: drop one rung,
+    /// so the retry asks for fewer bytes. `None` on the lowest rung.
+    pub fn step_down(&mut self, now_ms: u64) -> Option<Switch> {
+        let current = self.current?;
+        let to = current.checked_sub(1)?;
+        self.current = Some(to);
+        self.last_up_ms = Some(now_ms);
+        Some(Switch {
+            from: Some(current),
+            to,
+            reason: Reason::Timeout,
+        })
+    }
+
     fn highest_allowed(&self, ceiling_bps: Option<u64>) -> usize {
         let Some(cap) = ceiling_bps else {
             return self.ladder.len().saturating_sub(1);
@@ -443,6 +459,7 @@ mod tests {
             Reason::Bandwidth,
             Reason::Buffer,
             Reason::Ceiling,
+            Reason::Timeout,
         ];
         let labels: BTreeSet<&'static str> = all.into_iter().map(Reason::label).collect();
         assert_eq!(labels.len(), all.len());
@@ -450,6 +467,37 @@ mod tests {
         assert_eq!(Reason::Bandwidth.label(), "bandwidth");
         assert_eq!(Reason::Buffer.label(), "buffer");
         assert_eq!(Reason::Ceiling.label(), "ceiling");
+        assert_eq!(Reason::Timeout.label(), "timeout");
+    }
+
+    #[test]
+    fn step_down_drops_one_rung_and_holds_off_the_next_up_switch() {
+        let mut abr = Abr::new(sample_ladder(), AbrConfig::default());
+        abr.start(0, Some(1_000_000_000), None).unwrap();
+        let top = abr.current().unwrap();
+        assert_eq!(top, abr.ladder().len() - 1);
+        assert!(top >= 2);
+        assert_eq!(
+            abr.step_down(5_000),
+            Some(Switch {
+                from: Some(top),
+                to: top - 1,
+                reason: Reason::Timeout,
+            }),
+        );
+        assert_eq!(abr.last_up_ms, Some(5_000));
+        while abr.current() != Some(0) {
+            abr.step_down(6_000).unwrap();
+        }
+        assert_eq!(abr.step_down(7_000), None);
+        assert_eq!(abr.current(), Some(0));
+    }
+
+    #[test]
+    fn step_down_before_start_does_nothing() {
+        let mut abr = Abr::new(sample_ladder(), AbrConfig::default());
+        assert_eq!(abr.step_down(0), None);
+        assert_eq!(abr.current(), None);
     }
 
     #[test]
@@ -926,6 +974,7 @@ mod tests {
                             prop_assert!(sw.to < before);
                         }
                         Reason::Bandwidth | Reason::Start => {}
+                        Reason::Timeout => prop_assert!(false, "decide never times out"),
                     }
                 }
             }
