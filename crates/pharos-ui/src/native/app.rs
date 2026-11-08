@@ -3312,6 +3312,9 @@ struct Playing {
     asked_audio: Option<u32>,
     /// How the server plays it: "direct_play", "direct_stream" or "transcode".
     method: String,
+    /// The subtitle this playback was asked for: `Default` left it to the
+    /// server, `Off` asked for none.
+    asked_subtitle: TrackChoice,
 }
 
 impl Playing {
@@ -3590,6 +3593,7 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
                             _ => None,
                         },
                         method: decision.method,
+                        asked_subtitle: asked.subtitle,
                     })))
                 }),
             )
@@ -3941,6 +3945,32 @@ fn seed() -> u64 {
 
 fn choice(index: Option<u32>) -> TrackChoice {
     index.map_or(TrackChoice::Off, TrackChoice::Index)
+}
+
+/// The tracks a progress report names. A track the viewer asked for is
+/// named as it plays, so the next play starts on it; a track left to the
+/// server stays `Default`, so the server's language rules keep deciding. An
+/// in-place subtitle switch is what plays now, so it wins over the ask.
+fn reported_tracks(
+    asked_audio: Option<u32>,
+    audio: Option<u32>,
+    asked_subtitle: TrackChoice,
+    subtitle: Option<u32>,
+    switched: Option<TrackChoice>,
+) -> TrackPicks {
+    let audio = match (asked_audio, audio) {
+        (Some(_), Some(playing)) => TrackChoice::Index(playing),
+        _ => TrackChoice::Default,
+    };
+    let asked = match (asked_subtitle, subtitle) {
+        (TrackChoice::Off, _) => TrackChoice::Off,
+        (TrackChoice::Index(_), Some(playing)) => TrackChoice::Index(playing),
+        _ => TrackChoice::Default,
+    };
+    TrackPicks {
+        audio,
+        subtitle: switched.unwrap_or(asked),
+    }
 }
 
 /// The link that joins group `id`: the invite route on this server.
@@ -4930,10 +4960,13 @@ fn Player(
             };
             let grant = p.grant.borrow().clone();
             let at = last_ms.get();
-            let tracks = TrackPicks {
-                audio: TrackChoice::Default,
-                subtitle: switched.get().unwrap_or_default(),
-            };
+            let tracks = reported_tracks(
+                p.asked_audio,
+                p.audio,
+                p.asked_subtitle,
+                p.subtitle,
+                switched.get(),
+            );
             spawn(async move {
                 let result = grant
                     .report(&call("watch", "report"), at, paused, tracks)
@@ -5510,6 +5543,74 @@ mod tests {
             quality_notice(2_000_000, 8_000_000),
             "Raising quality to 8 Mbps"
         );
+    }
+
+    /// An audio track the viewer did not ask for is left to the server's
+    /// rules, so the report says nothing about it.
+    #[test]
+    fn an_audio_track_left_to_the_server_is_reported_as_default() {
+        let picks = reported_tracks(None, Some(2), TrackChoice::Default, None, None);
+        assert_eq!(picks.audio, TrackChoice::Default);
+    }
+
+    /// The audio the viewer asked for is named as it plays, so the next
+    /// play starts on the same track.
+    #[test]
+    fn an_asked_audio_track_is_reported_as_it_plays() {
+        let picks = reported_tracks(Some(3), Some(3), TrackChoice::Default, None, None);
+        assert_eq!(picks.audio, TrackChoice::Index(3));
+    }
+
+    /// An asked audio the server did not start on has nothing to name, so
+    /// the report leaves it to the server.
+    #[test]
+    fn an_asked_audio_the_server_did_not_start_is_default() {
+        let picks = reported_tracks(Some(3), None, TrackChoice::Default, None, None);
+        assert_eq!(picks.audio, TrackChoice::Default);
+    }
+
+    /// Subtitles asked off are reported off, so the next play stays off.
+    #[test]
+    fn subtitles_asked_off_are_reported_off() {
+        let picks = reported_tracks(None, None, TrackChoice::Off, None, None);
+        assert_eq!(picks.subtitle, TrackChoice::Off);
+    }
+
+    /// A subtitle asked for by index is named as it plays.
+    #[test]
+    fn an_asked_subtitle_is_reported_as_it_plays() {
+        let picks = reported_tracks(None, None, TrackChoice::Index(4), Some(4), None);
+        assert_eq!(picks.subtitle, TrackChoice::Index(4));
+    }
+
+    /// A subtitle the viewer did not ask for is left to the server, even
+    /// when the server started on one.
+    #[test]
+    fn a_subtitle_left_to_the_server_is_reported_as_default() {
+        let picks = reported_tracks(None, None, TrackChoice::Default, Some(2), None);
+        assert_eq!(picks.subtitle, TrackChoice::Default);
+    }
+
+    /// A subtitle switched to in place is what plays now, so it beats the
+    /// subtitle the playback was asked for, including switching off.
+    #[test]
+    fn an_in_place_switch_beats_the_asked_subtitle() {
+        let switched = reported_tracks(
+            None,
+            None,
+            TrackChoice::Index(4),
+            Some(4),
+            Some(TrackChoice::Index(7)),
+        );
+        assert_eq!(switched.subtitle, TrackChoice::Index(7));
+        let off = reported_tracks(
+            None,
+            None,
+            TrackChoice::Index(4),
+            Some(4),
+            Some(TrackChoice::Off),
+        );
+        assert_eq!(off.subtitle, TrackChoice::Off);
     }
 
     /// An invite link is the invite route on this server, the group id as
