@@ -1,6 +1,9 @@
 //! Consolidated integration-test binary: one link instead of 23; each `mod` is a former tests/*.rs.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+#[path = "../common/store_calls.rs"]
+mod store_calls;
+
 mod image_spans;
 mod jellyfin_add_library;
 mod jellyfin_channels;

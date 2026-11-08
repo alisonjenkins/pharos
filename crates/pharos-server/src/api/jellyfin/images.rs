@@ -624,6 +624,13 @@ async fn serve_image(
             .await;
         }
     }
+    // One read of the item's artwork rows serves the episode-still, local and
+    // backdrop lookups below; only the canonical index (0) resolves locally.
+    let artwork = if index == 0 {
+        artwork_rows(state, id).await
+    } else {
+        Vec::new()
+    };
     // An episode's own Primary row is the series-folder poster (the sidecar
     // provider probes the show folder for episodes, and synth series/season
     // tiles rely on that), so serve the episode's own still ahead of it.
@@ -632,7 +639,7 @@ async fn serve_image(
         && matches!(role, ImageRole::Primary)
         && matches!(item.kind, pharos_core::MediaKind::Episode)
     {
-        if let Some(still) = episode_still_path(state, &item).await {
+        if let Some(still) = episode_still_path(&item, &artwork).await {
             return serve_local_artwork(
                 &still,
                 role,
@@ -660,7 +667,7 @@ async fn serve_image(
     // through to the upload / extract path (V6 spirit — never 500 a
     // public image route on a stale row).
     if index == 0 {
-        if let Some(local) = local_artwork_path(state, id, role).await {
+        if let Some(local) = local_artwork_path(id, role, &artwork).await {
             if matches!(role, ImageRole::Thumb) {
                 metrics::counter!("pharos_image_thumb_source_total", "source" => "artwork")
                     .increment(1);
@@ -686,7 +693,7 @@ async fn serve_image(
     // Thumb wants, so serve it. Frame extraction stays the last resort, for
     // items with no artwork at all (unmatched, no sidecar).
     if index == 0 && matches!(role, ImageRole::Thumb) {
-        if let Some(backdrop) = local_artwork_path(state, id, ImageRole::Backdrop).await {
+        if let Some(backdrop) = local_artwork_path(id, ImageRole::Backdrop, &artwork).await {
             metrics::counter!("pharos_image_thumb_source_total", "source" => "backdrop")
                 .increment(1);
             return serve_local_artwork(
@@ -1097,6 +1104,22 @@ fn artwork_role_token(role: ImageRole) -> &'static str {
     }
 }
 
+/// One `artwork` row: role, source, locator.
+type ArtworkRow = (String, String, String);
+
+/// The artwork rows recorded for item `id`. A store error is logged and reads
+/// as no rows, so a stale or unreadable table falls through to the upload /
+/// frame-extract path rather than failing a public route.
+async fn artwork_rows(state: &AppState, id: u64) -> Vec<ArtworkRow> {
+    match state.stores.artwork_for(id).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!(error = %e, media.id = id, "artwork lookup failed");
+            Vec::new()
+        }
+    }
+}
+
 /// LIB-D5 — the recorded on-disk artwork path for `(id, role)`, if a
 /// servable source (`local` sidecar from D4 scanning, or a downloaded
 /// `tmdb`/`tvdb` cache entry from Task 8) recorded one and the file still
@@ -1107,20 +1130,13 @@ fn artwork_role_token(role: ImageRole) -> &'static str {
 /// spirit).
 #[tracing::instrument(name = "image.artwork_lookup", skip_all)]
 async fn local_artwork_path(
-    state: &AppState,
     id: u64,
     role: ImageRole,
+    rows: &[ArtworkRow],
 ) -> Option<std::path::PathBuf> {
     let token = artwork_role_token(role);
-    let rows = match state.stores.artwork_for(id).await {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::warn!(error = %e, media.id = id, "artwork lookup failed");
-            return None;
-        }
-    };
     let locator = rows
-        .into_iter()
+        .iter()
         .find(|(r, source, _)| {
             r.eq_ignore_ascii_case(token) && pharos_core::artwork_source_is_item_servable(source)
         })
@@ -1145,17 +1161,10 @@ async fn local_artwork_path(
 /// first, then a provider's episode image. Show-level art the scanner also
 /// records against the episode (`folder.jpg`, `landscape.jpg`) never counts.
 async fn episode_still_path(
-    state: &AppState,
     item: &pharos_core::MediaItem,
+    rows: &[ArtworkRow],
 ) -> Option<std::path::PathBuf> {
-    let rows = match state.stores.artwork_for(item.id).await {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::warn!(error = %e, media.id = item.id, "artwork lookup failed");
-            return None;
-        }
-    };
-    for locator in episode_still_candidates(&item.path, &rows) {
+    for locator in episode_still_candidates(&item.path, rows) {
         let path = std::path::PathBuf::from(locator);
         if tokio::fs::try_exists(&path).await.unwrap_or(false) {
             return Some(path);
