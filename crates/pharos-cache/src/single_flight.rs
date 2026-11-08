@@ -28,19 +28,36 @@ use std::hash::Hash;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
+/// Map size below which `lock()` never scans for idle entries. Reason: a scan
+/// is O(n), so small maps are not worth the work.
+const MIN_PRUNE_AT: usize = 1024;
+
+#[derive(Debug)]
+struct LockMap<K> {
+    map: HashMap<K, Arc<Mutex<()>>>,
+    /// Map length at which the next idle-entry scan runs.
+    prune_at: usize,
+}
+
 /// A registry of per-key locks. Cheap to clone-share behind an `Arc`; the inner
-/// map holds one tiny `Arc<Mutex<()>>` per distinct key seen (never pruned, same
-/// as the caches this generalises — the entries are pointer-sized and bounded by
-/// the library's distinct-key count).
+/// map holds one tiny `Arc<Mutex<()>>` per distinct key seen. Idle entries are
+/// pruned: when the map reaches `prune_at`, `lock()` drops every entry nobody
+/// holds (`Arc::strong_count == 1`, i.e. only the map). An entry a caller holds
+/// or awaits has a strong count above 1 and is never removed. The next scan is
+/// set at `max(MIN_PRUNE_AT, 2 * len)`, so the scan cost amortises to O(1) per
+/// call.
 #[derive(Debug)]
 pub struct KeyedLocks<K> {
-    locks: Mutex<HashMap<K, Arc<Mutex<()>>>>,
+    inner: Mutex<LockMap<K>>,
 }
 
 impl<K> Default for KeyedLocks<K> {
     fn default() -> Self {
         Self {
-            locks: Mutex::new(HashMap::new()),
+            inner: Mutex::new(LockMap {
+                map: HashMap::new(),
+                prune_at: MIN_PRUNE_AT,
+            }),
         }
     }
 }
@@ -53,12 +70,28 @@ impl<K: Eq + Hash + Clone> KeyedLocks<K> {
     /// The lock guarding `key`'s fill. Take it, then `.lock().await` it, then
     /// re-check the cache (a peer may have filled while you waited).
     pub async fn lock(&self, key: K) -> Arc<Mutex<()>> {
-        self.locks
-            .lock()
-            .await
+        let mut inner = self.inner.lock().await;
+        // Clone for the caller BEFORE pruning: its strong count is then >= 2,
+        // so the retain below keeps this key.
+        let slot = inner
+            .map
             .entry(key)
             .or_insert_with(|| Arc::new(Mutex::new(())))
-            .clone()
+            .clone();
+        if inner.map.len() >= inner.prune_at {
+            inner.map.retain(|_, v| Arc::strong_count(v) > 1);
+            inner.prune_at = MIN_PRUNE_AT.max(inner.map.len().saturating_mul(2));
+        }
+        slot
+    }
+
+    /// Number of entries currently in the map (test helper).
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.inner
+            .try_lock()
+            .map(|g| g.map.len())
+            .unwrap_or(usize::MAX)
     }
 }
 
@@ -112,5 +145,40 @@ mod tests {
         // Different keys → different Arcs → holding one never blocks the other.
         let _ga = a.lock().await;
         assert!(b.try_lock().is_ok(), "distinct keys must not share a lock");
+    }
+
+    #[tokio::test]
+    async fn idle_keys_are_pruned() {
+        let locks: KeyedLocks<u64> = KeyedLocks::new();
+        let inserted = MIN_PRUNE_AT + 100;
+        for k in 0..inserted as u64 {
+            // Drop the Arc immediately: every key is idle.
+            drop(locks.lock(k).await);
+        }
+        assert!(
+            locks.len() < inserted,
+            "idle keys must be pruned; map holds {} of {} inserted",
+            locks.len(),
+            inserted
+        );
+    }
+
+    #[tokio::test]
+    async fn held_key_survives_prune_with_same_arc() {
+        let locks: KeyedLocks<u64> = KeyedLocks::new();
+        let held = locks.lock(5).await;
+        // Churn enough distinct idle keys to force at least one prune.
+        for k in 1000..(1000 + MIN_PRUNE_AT as u64 + 100) {
+            drop(locks.lock(k).await);
+        }
+        assert!(
+            locks.len() < MIN_PRUNE_AT + 101,
+            "prune must have run for this test to mean anything"
+        );
+        let again = locks.lock(5).await;
+        assert!(
+            Arc::ptr_eq(&held, &again),
+            "a held key must survive a prune and resolve to the same lock"
+        );
     }
 }
