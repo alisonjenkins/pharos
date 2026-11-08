@@ -154,7 +154,16 @@ const REFETCH_THRESHOLD: u32 = 5;
 const INIT_REFETCH_THRESHOLD: u32 = 60;
 
 fn refetch_threshold(seg: u32) -> u32 {
-    if matches!(seg, INIT_SEG_H264CMAF | INIT_SEG_VP9 | INIT_SEG_VP9_AUDIO) {
+    if matches!(
+        seg,
+        INIT_SEG_H264CMAF
+            | INIT_SEG_VP9
+            | INIT_SEG_VP9_AUDIO
+            | INIT_SEG_H264CMAF_1080P
+            | INIT_SEG_H264CMAF_720P
+            | INIT_SEG_H264CMAF_480P
+            | INIT_SEG_H264CMAF_360P
+    ) {
         INIT_REFETCH_THRESHOLD
     } else {
         REFETCH_THRESHOLD
@@ -176,6 +185,12 @@ const MAX_TRACKED_REFETCHES: usize = 16_384;
 pub const INIT_SEG_H264CMAF: u32 = u32::MAX;
 pub const INIT_SEG_VP9: u32 = u32::MAX - 1;
 pub const INIT_SEG_VP9_AUDIO: u32 = u32::MAX - 2;
+/// The `abr=1` H.264 fMP4 ladder rungs' inits, one each: a player switching
+/// rungs fetches each rung's init, which is not a storm on the source rung's.
+pub const INIT_SEG_H264CMAF_1080P: u32 = u32::MAX - 3;
+pub const INIT_SEG_H264CMAF_720P: u32 = u32::MAX - 4;
+pub const INIT_SEG_H264CMAF_480P: u32 = u32::MAX - 5;
+pub const INIT_SEG_H264CMAF_360P: u32 = u32::MAX - 6;
 
 /// Counts repeat serves of one segment to one play session (T126).
 ///
@@ -309,7 +324,15 @@ mod tests {
     /// session, hiding exactly the distinction this exists to draw.
     #[test]
     fn init_sentinels_are_distinct_from_each_other_and_real_segments() {
-        let sentinels = [INIT_SEG_H264CMAF, INIT_SEG_VP9, INIT_SEG_VP9_AUDIO];
+        let sentinels = [
+            INIT_SEG_H264CMAF,
+            INIT_SEG_VP9,
+            INIT_SEG_VP9_AUDIO,
+            INIT_SEG_H264CMAF_1080P,
+            INIT_SEG_H264CMAF_720P,
+            INIT_SEG_H264CMAF_480P,
+            INIT_SEG_H264CMAF_360P,
+        ];
         for (i, a) in sentinels.iter().enumerate() {
             for b in &sentinels[i + 1..] {
                 assert_ne!(a, b, "init sentinels must be pairwise distinct");

@@ -54,6 +54,15 @@ async fn seed_with_fixture(
     fixture_path: PathBuf,
     cache_dir: &std::path::Path,
 ) -> (web::Data<AppState>, String) {
+    seed_with_fixture_bitrate(fixture_path, cache_dir, 500_000).await
+}
+
+/// [`seed_with_fixture`] with the probed source bitrate set to `bitrate_bps`.
+async fn seed_with_fixture_bitrate(
+    fixture_path: PathBuf,
+    cache_dir: &std::path::Path,
+    bitrate_bps: u64,
+) -> (web::Data<AppState>, String) {
     let stores = Stores::connect("sqlite::memory:").await.unwrap();
     let auth = BuiltinAuth::new(stores.clone());
     let hash = auth.hash_password(&SecretString::new("p")).unwrap();
@@ -79,7 +88,7 @@ async fn seed_with_fixture(
                 duration_ms: Some(3_000),
                 width: Some(320),
                 height: Some(240),
-                bitrate_bps: Some(500_000),
+                bitrate_bps: Some(bitrate_bps),
                 ..Default::default()
             },
             series: None,
@@ -220,4 +229,31 @@ async fn unknown_variant_returns_404() {
         .to_request();
     let resp = test::call_service(&app, req).await;
     assert_eq!(resp.status(), 404);
+}
+
+#[actix_web::test]
+#[ignore = "requires ffmpeg + PHAROS_TEST_FIXTURES"]
+async fn h264cmaf_rungs_produce_distinct_init_and_segment_bytes() {
+    // V644 — each `abr=1` ladder rung is its own encode: own init, own
+    // segments, own cache key. Identical bytes would mean the rung's bitrate
+    // cap silently no-op'd or two rungs collided in the cache.
+    if !ffmpeg_available() {
+        eprintln!("skipping: ffmpeg/fixture missing");
+        return;
+    }
+    let td = TempDir::new().unwrap();
+    let fx = fixture("dualaudio.mkv").unwrap();
+    // Above every rung, so each rung's cap is what the encoder gets.
+    let (state, token) = seed_with_fixture_bitrate(fx, td.path(), 8_000_000).await;
+    let app = test::init_service(App::new().app_data(state).configure(hls::register)).await;
+    let mut bodies = Vec::new();
+    for path in ["720p/init.mp4", "720p/0.m4s", "360p/init.mp4", "360p/0.m4s"] {
+        let req = test::TestRequest::get()
+            .uri(&format!("/videos/42/h264cmaf/{path}?api_key={token}"))
+            .to_request();
+        let body = test::call_and_read_body(&app, req).await.to_vec();
+        assert!(!body.is_empty(), "{path} produced no bytes");
+        bodies.push(body);
+    }
+    assert_ne!(bodies[1], bodies[3], "720p vs 360p segment bytes identical");
 }
