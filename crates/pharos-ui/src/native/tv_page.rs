@@ -121,6 +121,16 @@ pub fn proxied_segments() -> &'static [&'static str] {
     &PROXIED
 }
 
+/// An artwork `src` (`/Items/{id}/Images/…`) as the server's own URL, which
+/// the WebView loads and caches itself; any other `src` as it is.
+pub fn art_src(base: &str, src: &str) -> String {
+    if src.starts_with('/') && src.contains("/Images/") {
+        server_url(base, src)
+    } else {
+        src.to_owned()
+    }
+}
+
 /// `base` + the page's `path_and_query` for the server.
 pub fn server_url(base: &str, path_and_query: &str) -> String {
     format!("{base}{path_and_query}")
@@ -463,6 +473,15 @@ mod tests {
             server_url("https://s", "/Items/1/Images/Primary?tag=a"),
             "https://s/Items/1/Images/Primary?tag=a"
         );
+        assert_eq!(
+            art_src("https://s", "/Users/2/Images/Primary"),
+            "https://s/Users/2/Images/Primary"
+        );
+        assert_eq!(
+            art_src("https://s", "/videos/1/master.m3u8"),
+            "/videos/1/master.m3u8"
+        );
+        assert_eq!(art_src("https://s", "https://x/a.png"), "https://x/a.png");
     }
 
     #[test]
