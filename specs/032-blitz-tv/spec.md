@@ -146,6 +146,15 @@ Read from the published crates and the Dioxus/Blitz repositories on 2026-11-08, 
 | CSS | Per blitz.is status: 2D transforms, transitions, animations, `box-shadow`, `overflow: scroll`, `object-fit`, `@font-face` supported; `filter` partial; `backdrop-filter` Skia only; 3D transforms and `overflow: auto` not; `position: sticky` in progress. Custom properties come from Stylo | The spike confirms each on the TV |
 | Custom paint | `CustomPaintSource` gives a wgpu texture inside the tree; no API places a native surface under an element | The video hole is ours: a transparent element plus an `ASurfaceControl` child of the window's surface |
 
+## Decisions
+
+Made on 2026-11-08T23:15:00Z while Alison was away, under her instruction to decide rather than ask and to write each decision down. Each can be reversed by editing this section; none has shipped to anyone.
+
+1. **Slice 0's two speed fails are accepted for now.** Slices 1 and 3 go ahead at 1080p with the shipped CSS. The fails (press to frame p95 154 ms, frame about 73 ms) are renderer cost; no part of the platform module or the player depends on the render size or the CSS. The WebView app keeps shipping until slice 4, so nobody uses the slow build meanwhile. Both measured levers are already runtime switches (`debug.pharos.render_scale`, the TV CSS probe), and press latency at 720p is not measured yet, so choosing 720p now would be choosing on a guess. The speed checks move to slice 4's gate unchanged: press to frame p95 under 50 ms and frame p95 under 33 ms on the G08, by whatever mix of 720p, lighter TV CSS and upstream renderer work gets there. The first input is a G08 run of press latency at 720p, with and without the light CSS.
+2. **The spike keeps the anyrender overlap patch until anyrender#92 is released.** The patch is offered upstream as that PR, which "Upstream work" requires. The app moves to the released crate when there is one.
+3. **The video layer is a `SurfaceControl` child built over JNI (spike mode 3).** It works on API 31 through the hidden `ViewRootImpl.getSurfaceControl()` and has a public route from API 33. The Kotlin `SurfaceView` (mode 1) stays the documented fallback only, as ADR-0061 and ADR-0077 rule out hand-written Java and Kotlin.
+4. **The feeder parses fMP4 in `pharos-hls`**, not through `AMediaExtractor_setDataSourceCustom`. `pharos-hls` gains the sample table, the codec boxes and the Annex B conversion as pure functions, tested on the host against ffmpeg fixtures. That keeps variant switches under the planner (an extractor over one concatenated stream would need rebuilding at each switch), and needs no extra copy of each segment. The extractor route stays the stopgap if the feeder stalls.
+
 ## Open questions
 
 1. Does the `NativeActivity` APK launch and draw on the TV? It builds: a smoke app with `android_main` handing the `AndroidApp` to `blitz_shell::set_android_app` produces a 22 MB armeabi-v7a APK whose launcher activity is `android.app.NativeActivity` (2026-11-08, dx 0.7.10).
