@@ -71,6 +71,13 @@ fn font_ctx() -> Option<parley::FontContext> {
 }
 
 fn main() {
+    struct Out;
+    impl log::Log for Out {
+        fn enabled(&self, _: &log::Metadata) -> bool { true }
+        fn log(&self, r: &log::Record) { if r.target().contains("screens") { println!("log {}", r.args()); } }
+        fn flush(&self) {}
+    }
+    let _ = log::set_logger(&Out).map(|()| log::set_max_level(log::LevelFilter::Info));
     let out = std::env::args().nth(1).unwrap_or_else(|| ".".into());
     for screen in [None, Some(Screen::Home), Some(Screen::Grid)] {
         let vdom = VirtualDom::new_with_props(Root, Page { screen });
@@ -86,6 +93,23 @@ fn main() {
         let started = std::time::Instant::now();
         doc.resolve(0.0);
         let resolved = started.elapsed();
+        if screen == Some(Screen::Home) && std::env::var_os("SNAPSHOT_KEYS").is_some() {
+            use blitz_dom::Document as _;
+            use blitz_traits::events::{BlitzKeyEvent, KeyState, UiEvent};
+            use keyboard_types::{Code, Key, Location, Modifiers};
+            println!("focussed node {:?}", doc.get_focussed_node_id());
+            for key in [Key::ArrowRight, Key::ArrowRight, Key::ArrowDown] {
+                let ev = |state| BlitzKeyEvent {
+                    key: key.clone(), code: Code::Unidentified, modifiers: Modifiers::empty(),
+                    location: Location::Standard, is_auto_repeating: false, is_composing: false,
+                    state, text: None,
+                };
+                doc.handle_ui_event(UiEvent::KeyDown(ev(KeyState::Pressed)));
+                doc.handle_ui_event(UiEvent::KeyUp(ev(KeyState::Released)));
+                doc.poll(None);
+            }
+            doc.resolve(0.0);
+        }
         if std::env::var_os("SNAPSHOT_DEBUG").is_some() {
             for sel in [".pharos-grid", ".pharos-grid > li", ".pharos-poster", ".pharos-poster-art", ".pharos-poster-placeholder", ".pharos-poster-name", ".pharos-rail"] {
                 if let Ok(Some(id)) = doc.query_selector(sel) {
