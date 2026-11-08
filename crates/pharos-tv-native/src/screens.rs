@@ -72,6 +72,18 @@ const GRID_COLUMNS: usize = 6;
 const RAIL_VISIBLE: usize = 6;
 /// One grid row's height in CSS px (254 px tile and a 16 px gap).
 const GRID_ROW_PX: usize = 270;
+/// One grid tile's height in CSS px, kept by rows drawn as empty boxes.
+const GRID_TILE_PX: usize = GRID_ROW_PX - 16;
+/// Grid rows above and below the focused one that get real tiles. Blitz has
+/// no `loading="lazy"`, so every `<img>` in the tree is fetched and decoded;
+/// rows outside this window are empty boxes of the same height.
+const GRID_ROWS_BEHIND: usize = 1;
+const GRID_ROWS_AHEAD: usize = 3;
+
+fn near(row: usize, focused: usize) -> bool {
+    row + GRID_ROWS_BEHIND >= focused && row <= focused + GRID_ROWS_AHEAD
+}
+
 /// One home rail's height in CSS px.
 const RAIL_ROW_PX: usize = 362;
 
@@ -244,7 +256,11 @@ pub fn Spike(start: Screen, data: Data, #[props(default)] notice: Option<String>
                         for (i, it) in grid.iter().cloned().enumerate() {
                             li { key: "{it.id}",
                                 class: if i == frow * GRID_COLUMNS + fcol { "pharos-tv-focus" },
-                                PosterTile { item: it }
+                                if near(i / GRID_COLUMNS, frow) {
+                                    PosterTile { item: it }
+                                } else {
+                                    div { style: "height: {GRID_TILE_PX}px" }
+                                }
                             }
                         }
                     }
