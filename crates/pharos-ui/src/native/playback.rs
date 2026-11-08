@@ -2308,7 +2308,7 @@ const GENERIC_TITLE_WORDS: &[&str] = &[
 /// terminology) code, else the code in capitals; nothing for an undetermined
 /// code (`und`, `mis`, `zxx`, `mul`) or an empty one. A region or script tag
 /// after it (`pt-BR`, `zh-Hant`) is dropped; the track title says which.
-fn language_name(code: &str) -> String {
+pub(super) fn language_name(code: &str) -> String {
     let lower = code.trim().to_ascii_lowercase();
     let base = lower.split(['-', '_']).next().unwrap_or_default();
     match base {
