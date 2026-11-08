@@ -109,6 +109,9 @@ pub struct Machine {
     /// A non-blocking message for the signed-in shell, e.g. a failed
     /// sign-out.
     notice: Option<String>,
+    /// Why the last attempt failed, while connecting again after a failure
+    /// that may clear by itself (server down, network gone).
+    waiting: Option<String>,
 }
 
 impl Default for Machine {
@@ -126,6 +129,7 @@ impl Machine {
             signing_out: false,
             reconnecting: false,
             notice: None,
+            waiting: None,
         }
     }
 
@@ -144,6 +148,11 @@ impl Machine {
 
     pub fn signing_out(&self) -> bool {
         self.signing_out
+    }
+
+    /// Why the server could not be reached, while the app keeps trying.
+    pub fn waiting(&self) -> Option<&str> {
+        self.waiting.as_deref()
     }
 
     pub fn reconnecting(&self) -> bool {
@@ -176,16 +185,21 @@ impl Machine {
         match event {
             Event::Resumed { epoch } if current(epoch) => {
                 self.attempt = 0;
+                self.waiting = None;
                 self.phase = Phase::Ready;
             }
             Event::ResumeRefused { epoch } if current(epoch) => self.sign_in(None),
+            // The server is up but could not answer (its database may be
+            // down): treat it like an outage.
             Event::ResumeFailed { epoch, error } if current(epoch) => {
-                self.phase = Phase::Unreachable {
-                    detail: format!("The server would not resume the session: {error}"),
-                };
+                self.wait_and_retry(format!("The server would not resume the session: {error}"));
             }
             Event::NotOpened { epoch, probe } if current(epoch) => {
-                self.phase = not_opened(&probe);
+                if may_clear(&probe) {
+                    self.wait_and_retry(probe_detail(&probe));
+                } else {
+                    self.phase = not_opened(&probe);
+                }
             }
             Event::Closed { epoch, reason } if current(epoch) => {
                 if reason == REVOKED {
@@ -239,7 +253,19 @@ impl Machine {
         }
         if self.phase != Phase::Connecting {
             self.reconnecting = false;
+            self.waiting = None;
         }
+    }
+
+    /// Connects again after the backoff, keeping the screens if they were
+    /// up: the server may be restarting or the network back soon, and a TV
+    /// may have nobody watching to press "Try again".
+    fn wait_and_retry(&mut self, why: String) {
+        let was_reconnecting = self.reconnecting;
+        self.attempt = self.attempt.saturating_add(1);
+        self.connect();
+        self.reconnecting = was_reconnecting;
+        self.waiting = Some(why);
     }
 
     fn connect(&mut self) {
@@ -266,12 +292,27 @@ fn not_opened(probe: &Probe) -> Phase {
                      http."
                 .into(),
         },
-        Probe::Status(status) => Phase::Unreachable {
-            detail: format!("The server answered HTTP {status} when asked about sign-in."),
+        probe => Phase::Unreachable {
+            detail: probe_detail(probe),
         },
-        Probe::Failed(error) => Phase::Unreachable {
-            detail: format!("Could not reach the server: {error}"),
-        },
+    }
+}
+
+/// Whether a failed open may clear by itself: the server unreachable, or
+/// answering with an overload or server error.
+fn may_clear(probe: &Probe) -> bool {
+    match probe {
+        Probe::Failed(_) => true,
+        Probe::Status(status) => *status >= 500 || matches!(status, 408 | 429),
+    }
+}
+
+fn probe_detail(probe: &Probe) -> String {
+    match probe {
+        Probe::Status(status) => {
+            format!("The server answered HTTP {status} when asked about sign-in.")
+        }
+        Probe::Failed(error) => format!("Could not reach the server: {error}"),
     }
 }
 
@@ -362,9 +403,47 @@ mod tests {
             "{detail}"
         );
         assert!(matches!(
-            after(Probe::Failed("offline".into())),
-            Phase::Unreachable { detail } if detail.contains("offline")
+            after(Probe::Status(403)),
+            Phase::Unreachable { detail } if detail.contains("403")
         ));
+    }
+
+    #[test]
+    fn a_server_that_is_down_is_retried_with_backoff_and_the_reason_shown() {
+        for probe in [
+            Probe::Failed("offline".into()),
+            Probe::Status(503),
+            Probe::Status(429),
+        ] {
+            let mut m = Machine::new();
+            m.apply(Event::NotOpened {
+                epoch: 0,
+                probe: probe.clone(),
+            });
+            assert_eq!(m.phase(), &Phase::Connecting, "{probe:?}");
+            assert_eq!((m.epoch(), m.delay_ms()), (1, 500), "{probe:?}");
+            assert!(m.waiting().is_some(), "{probe:?}");
+            assert!(!m.shows_screens(), "a first connect is not a reconnect");
+        }
+
+        let mut m = Machine::new();
+        for epoch in 0..3 {
+            m.apply(Event::NotOpened {
+                epoch,
+                probe: Probe::Failed("offline".into()),
+            });
+        }
+        assert_eq!(m.delay_ms(), 2000);
+        assert!(m.waiting().is_some_and(|why| why.contains("offline")));
+        m.apply(Event::ResumeFailed {
+            epoch: 3,
+            error: "database unavailable".into(),
+        });
+        assert_eq!((m.phase(), m.delay_ms()), (&Phase::Connecting, 4000));
+        assert!(m.waiting().is_some_and(|why| why.contains("database")));
+        m.apply(Event::ResumeRefused { epoch: 4 });
+        assert_eq!(m.waiting(), None);
+        assert!(matches!(m.phase(), Phase::SignIn { .. }));
     }
 
     #[test]
@@ -417,6 +496,14 @@ mod tests {
         m.apply(Event::NotOpened {
             epoch: 3,
             probe: Probe::Failed("offline".into()),
+        });
+        assert!(
+            m.reconnecting() && m.shows_screens(),
+            "a server that is down for a while keeps the screens up"
+        );
+        m.apply(Event::NotOpened {
+            epoch: 4,
+            probe: Probe::Status(405),
         });
         assert!(!m.reconnecting() && !m.shows_screens());
 
