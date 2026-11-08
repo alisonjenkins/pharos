@@ -50,7 +50,7 @@ indexmap = { version = "2" }
 itertools = { version = "0.13" }
 libsqlite3-sys = { version = "0.30", default-features = false, features = ["bundled", "pkg-config", "unlock_notify", "vcpkg"] }
 log = { version = "0.4", default-features = false, features = ["std"] }
-lzma-rust2 = { version = "0.23", default-features = false, features = ["encoder", "optimization", "std"] }
+lzma-rust2 = { version = "0.25", default-features = false, features = ["encoder", "optimization", "std"] }
 md-5 = { version = "0.11" }
 memchr = { version = "2" }
 metrics-util = { version = "0.20" }
@@ -93,6 +93,7 @@ unicode-bidi = { version = "0.3" }
 yoke = { version = "0.8", features = ["derive"] }
 zerocopy = { version = "0.8", default-features = false, features = ["derive", "simd"] }
 zerofrom = { version = "0.1", default-features = false, features = ["alloc", "derive"] }
+zeroize = { version = "1", features = ["derive"] }
 zip = { version = "9", default-features = false, features = ["deflate"] }
 zlib-rs = { version = "0.6", default-features = false, features = ["std"] }
 
@@ -157,6 +158,7 @@ typenum = { version = "1", default-features = false, features = ["const-generics
 unicode-bidi = { version = "0.3" }
 yoke = { version = "0.8", features = ["derive"] }
 zerofrom = { version = "0.1", default-features = false, features = ["alloc", "derive"] }
+zeroize = { version = "1", features = ["derive"] }
 
 [target.x86_64-unknown-linux-gnu.dependencies]
 bitflags = { version = "2", default-features = false, features = ["std"] }

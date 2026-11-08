@@ -30,7 +30,7 @@ pub fn StylePicker(current: Style, on_choose: EventHandler<Style>) -> Element {
     };
     // Escape closes the grid from the button as well as from a tile.
     let on_escape = move |evt: KeyboardEvent| {
-        if open() && evt.key() == Key::Escape {
+        if open() && evt.key() == Key::Named(NamedKey::Escape) {
             evt.stop_propagation();
             evt.prevent_default();
             close();
@@ -39,7 +39,7 @@ pub fn StylePicker(current: Style, on_choose: EventHandler<Style>) -> Element {
     // The screen turns clicks, keys and the wheel into transport controls;
     // inside the grid they belong to the picker, and Escape goes on to it.
     let on_key = move |evt: KeyboardEvent| {
-        if evt.key() != Key::Escape {
+        if evt.key() != Key::Named(NamedKey::Escape) {
             evt.stop_propagation();
         }
     };
