@@ -58,8 +58,12 @@ fn user_record(name: &str, admin: bool) -> UserRecord {
 /// `migrate_sqlite_to_postgres` copies. Returns the store plus a couple of
 /// identifiers the test needs afterwards for spot-checks.
 async fn seed(store: &SqliteStore) -> (UserId, UserId, MediaId) {
-    // ServerConfigStore: system_identity, runtime_config, named_config.
+    // ServerConfigStore: system_identity, server_secrets, runtime_config, named_config.
     store.load_or_create_server_id().await.unwrap();
+    store
+        .load_or_create_secret("image_tag_key", &[0x42; 32])
+        .await
+        .unwrap();
     store
         .set_runtime_config(&RuntimeConfig {
             server_name: Some("Migrate Test Server".into()),
@@ -308,6 +312,7 @@ async fn migrate_sqlite_to_postgres_round_trip() {
         "playlists",
         "media_items",
         "system_identity",
+        "server_secrets",
         "runtime_config",
         "named_config",
         "scan_runs",
@@ -352,6 +357,16 @@ async fn migrate_sqlite_to_postgres_round_trip() {
     }
 
     // Integrity spot-checks via the real Postgres store trait methods.
+    let pg_secret = postgres
+        .load_or_create_secret("image_tag_key", &[0x99; 32])
+        .await
+        .unwrap();
+    assert_eq!(
+        pg_secret,
+        vec![0x42; 32],
+        "migrated server secret must survive sqlite -> postgres copy"
+    );
+
     let pg_item = pharos_core::MediaStore::get(&postgres, item1)
         .await
         .unwrap();
