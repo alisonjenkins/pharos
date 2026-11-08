@@ -555,6 +555,24 @@ impl crate::ServerConfigStore for PostgresStore {
         }
     }
 
+    async fn load_or_create_secret(&self, name: &str, fresh: &[u8]) -> Result<Vec<u8>, StoreError> {
+        let now = now_unix_secs();
+        sqlx::query(
+            "INSERT INTO server_secrets (name, value, created_at) VALUES ($1, $2, $3) ON CONFLICT (name) DO NOTHING",
+        )
+        .bind(name)
+        .bind(fresh)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        let (value,) =
+            sqlx::query_as::<_, (Vec<u8>,)>("SELECT value FROM server_secrets WHERE name = $1")
+                .bind(name)
+                .fetch_one(&self.pool)
+                .await?;
+        Ok(value)
+    }
+
     async fn load_runtime_config(&self) -> Result<crate::RuntimeConfig, StoreError> {
         let row = sqlx::query_as::<_, (Option<String>, Option<String>, Option<String>)>(
             "SELECT server_name, login_disclaimer, custom_css FROM runtime_config WHERE id = 1",

@@ -110,6 +110,26 @@ where
         "server id must be stable across calls"
     );
 
+    let secret_1 = store
+        .load_or_create_secret("secret-a", &[1; 32])
+        .await
+        .unwrap();
+    assert_eq!(secret_1, vec![1; 32]);
+    let secret_2 = store
+        .load_or_create_secret("secret-a", &[2; 32])
+        .await
+        .unwrap();
+    assert_eq!(
+        secret_2,
+        vec![1; 32],
+        "existing secret must win over a later fresh value"
+    );
+    let secret_other = store
+        .load_or_create_secret("secret-b", &[3; 32])
+        .await
+        .unwrap();
+    assert_eq!(secret_other, vec![3; 32]);
+
     let default_runtime = store.load_runtime_config().await.unwrap();
     assert_eq!(default_runtime, RuntimeConfig::default());
     let rc = RuntimeConfig {
