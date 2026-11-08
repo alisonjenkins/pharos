@@ -542,6 +542,16 @@ fn stored_subtitle_size() -> SubtitleSize {
 
 /// Keep `size` for this page load and try to save it on the device. The
 /// write's error comes back so the page can say the choice was not kept.
+/// Keeps `size` for this device and draws subtitles at it now, lifting the
+/// cues on screen. The size applies even when it could not be kept.
+fn set_subtitle_size(size: SubtitleSize) -> Result<(), String> {
+    let kept = store_subtitle_size(size);
+    platform::apply_subtitle_size(size);
+    platform::relift_cues(VIDEO_ID);
+    platform::info(&format!("pharos: subtitle_size set={}", size.as_str()));
+    kept
+}
+
 fn store_subtitle_size(size: SubtitleSize) -> Result<(), String> {
     SESSION_SUBTITLE_SIZE.with(|s| s.set(Some(size)));
     platform::store_theme(SUBTITLE_SIZE_KEY, size.as_str()).inspect_err(|e| {
@@ -2723,7 +2733,7 @@ fn PlaybackScreen() -> Element {
             },
             subtitle_size: subtitle_size(),
             on_subtitle_size: move |size: SubtitleSize| {
-                if let Err(e) = store_subtitle_size(size) {
+                if let Err(e) = set_subtitle_size(size) {
                     notify(
                         notice,
                         format!(
@@ -2732,10 +2742,7 @@ fn PlaybackScreen() -> Element {
                         true,
                     );
                 }
-                platform::apply_subtitle_size(size);
-                platform::relift_cues(VIDEO_ID);
                 subtitle_size.set(size);
-                platform::info(&format!("pharos: subtitle_size set={}", size.as_str()));
             },
             crossfade_s: crossfade(),
             on_crossfade: move |seconds| {
@@ -4030,6 +4037,7 @@ fn Player(
     });
     // Taken at mount: the video this one replaces was paused, or not.
     let start_paused = use_hook(|| was_paused.0.get());
+    let mut sub_size = use_signal(stored_subtitle_size);
     let mut failed = use_signal(|| None::<PlayFailure>);
     let saved_volume = use_hook(last_volume);
     let mut media = use_signal(|| MediaState::at_volume(saved_volume.map(|(v, m, _)| (v, m))));
@@ -5000,6 +5008,12 @@ fn Player(
                     remember_volume(volume, muted);
                 }
                 Control::Fullscreen => platform::toggle_fullscreen(),
+                Control::SubtitleSize(size) => {
+                    if let Err(e) = set_subtitle_size(size) {
+                        platform::warn(&format!("pharos: subtitle_size not kept error={e}"));
+                    }
+                    sub_size.set(size);
+                }
                 Control::Quality(bps) => on_quality_pick.call(Some(bps)),
                 Control::ResetAutoQuality => on_quality_pick.call(None),
                 Control::PictureInPicture => platform::toggle_pip(VIDEO_ID),
@@ -5251,6 +5265,7 @@ fn Player(
             _ => None,
         },
         live_position: Some(position),
+        subtitle_size: sub_size(),
         quality: QualityView {
             manual: manual_cap,
             auto: auto_cap,
