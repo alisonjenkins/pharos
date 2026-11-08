@@ -134,6 +134,26 @@ pub fn controls_inset(controls_visible: bool, box_bottom: f64, controls_top: f64
     }
 }
 
+/// How long the Rust renderer's cues take to glide up or down as the control
+/// bar shows or hides (B820), matching the ASS canvas's CSS transition.
+pub const INSET_GLIDE_MS: f64 = 150.0;
+
+/// The inset `elapsed_ms` into a glide from `from` to `to`: an ease-out, so
+/// the cues move fastest as the bar starts to show or hide. At or past
+/// [`INSET_GLIDE_MS`] it is `to`.
+pub fn glide_inset(from: u32, to: u32, elapsed_ms: f64) -> u32 {
+    if elapsed_ms.is_nan() || elapsed_ms <= 0.0 {
+        return from;
+    }
+    if elapsed_ms >= INSET_GLIDE_MS {
+        return to;
+    }
+    let left = 1.0 - elapsed_ms / INSET_GLIDE_MS;
+    let eased = 1.0 - left * left * left;
+    let (from, to) = (f64::from(from), f64::from(to));
+    (from + (to - from) * eased).round() as u32
+}
+
 /// How far the ASS renderer's canvas moves up while the control bar shows
 /// (B634, V583): the overlap of the canvas, which JASSUB fits to the picture,
 /// with the bar's laid-out box, `player_bottom - controls_height` (the bar sits
@@ -243,6 +263,23 @@ mod tests {
     use pharos_subs::{Mask, MaskKind};
 
     use super::*;
+
+    #[test]
+    fn the_cues_glide_between_the_two_insets_instead_of_jumping() {
+        assert_eq!(glide_inset(0, 100, 0.0), 0);
+        let mid = glide_inset(0, 100, INSET_GLIDE_MS / 2.0);
+        assert!(
+            mid > 50 && mid < 100,
+            "ease-out is past halfway at half time: {mid}"
+        );
+        assert_eq!(glide_inset(0, 100, INSET_GLIDE_MS), 100);
+        assert_eq!(glide_inset(0, 100, INSET_GLIDE_MS * 4.0), 100);
+        // Down again, and never outside the two ends.
+        let down = glide_inset(100, 0, 30.0);
+        assert!(down < 100 && down > 0, "{down}");
+        assert_eq!(glide_inset(80, 80, 40.0), 80);
+        assert_eq!(glide_inset(0, 100, f64::NAN), 0);
+    }
 
     const FONT: &[u8] = include_bytes!("../../assets/fonts/LiberationSans-Regular.ttf");
     const VTT: &str = "WEBVTT\n\n00:00:01.000 --> 00:00:03.000\nHello there\n";
