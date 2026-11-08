@@ -31,7 +31,7 @@ Notes from slice 2 (2026-11-08T00:40:00Z): with #949's `PHAROS_FIREFOX_LIBAV` on
 ## Slice 3 - Recover (V637, V638, V640)
 
 - [x] T031-14 Retries with backoff and per-device deadlines (V637). The deadlines (desktop 10 s first byte, 60 s load; TV and phone 15 s, 90 s) are provisional until the slice 0 baseline (T031-03) measures them.
-- [ ] T031-15 Gap jumping and stall nudges, each counted and logged.
+- [x] T031-15 Gap jumping and stall nudges, each counted and logged (V701, V702). The 1 s jump bound is provisional.
 - [ ] T031-16 MediaSource rebuild on media error under `RecoveryBudget` (V638); failure-path symmetry tests with a disarm check (V640).
 
 ## Slice 4 - Adapt (V644-V649)

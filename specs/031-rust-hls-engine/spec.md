@@ -4,7 +4,7 @@
 **Created**: 2026-11-07T23:10:00Z
 **Status**: Draft
 **Scope**: The native web UI (`/ui/`, 013/017) and the Android TV WebView (025) play HLS through a Pharos-owned engine: a pure-Rust crate, `pharos-hls`, driven by a Media Source Extensions adapter in `pharos-ui`. It sits behind the existing `PlaybackEngine` trait and a per-device setting; the vendored hls.js (ADR-0035) stays the default and the fallback until this spec's parity table and budgets are met. Safari's native HLS, direct play and jellyfin-web are unchanged.
-**Decision record**: ADR-0071. **Bugs reserved**: B680-B699. **Verification**: V630-V649.
+**Decision record**: ADR-0071. **Bugs reserved**: B680-B699, B751-B760 (slice 3 recovery). **Verification**: V630-V649, V701-V710 (slice 3 recovery).
 
 ---
 
@@ -140,6 +140,8 @@ A viewer on the Rust engine watches over a link that drops from fast to slow and
 | V692 | A `playbackSummary` (segments, bytes, kbps, ttfb p50/max, load max, forward buffer min/mean while playing, stalls, seeks, switches, quota hits) goes out every 5 minutes of segments and when the engine is dropped, falls back or fails | `hls_trace` unit tests; e2e |
 | V693 | A stall is `waiting` while playing, after the start and outside a seek, until `playing` or the head moves; it is reported with its duration, buffered ranges, network state, forward buffer and the last video download | `hls_trace` unit tests with a disarm check |
 | V694 | A seek runs from `seeking` to playing (or to `seeked` when paused or able to play on), names where it came from, whether the target was buffered, the scrub it replaced, and the first video segment after it (download vs append split); a seek still open when the engine goes reports `end=abandoned` | `hls_trace` unit tests with a disarm check; e2e |
+| V701 | A play head stuck at a buffer hole of at most 1 s is moved past it; one stuck with data ahead is nudged up to three times, then reported as a fatal `mediaError` `bufferStalledError`; a hole wider than 1 s is left to the planner | watchdog unit tests on a fake clock; e2e with a cut audio range |
+| V702 | Every stall verdict (jump, nudge, starved, give up, recovered) is logged and reported as `playbackStall` with the play head, target, gap, attempt, stall time, each track's buffer ahead and the requests in flight | log/event test with a disarm check |
 
 ## Open questions
 
