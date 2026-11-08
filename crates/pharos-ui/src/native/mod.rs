@@ -30,9 +30,18 @@ pub mod machine;
 pub mod mixes;
 pub mod paging;
 pub mod palette;
-#[cfg(not(all(feature = "web", target_arch = "wasm32")))]
+#[cfg(not(any(
+    all(feature = "web", target_arch = "wasm32"),
+    all(feature = "mobile", target_os = "android")
+)))]
 #[path = "host.rs"]
 mod platform;
+// 025: the Android TV app's WebView, reached through `document::eval`.
+#[cfg(all(feature = "mobile", target_os = "android"))]
+#[path = "android_page.rs"]
+mod platform;
+#[cfg(all(feature = "mobile", target_os = "android"))]
+pub use platform::use_server_proxy;
 #[cfg(all(feature = "web", target_arch = "wasm32"))]
 #[path = "web.rs"]
 mod platform;

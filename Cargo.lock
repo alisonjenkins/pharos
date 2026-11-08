@@ -5448,6 +5448,7 @@ dependencies = [
  "pharos-client",
  "pharos-hls",
  "pharos-subs",
+ "reqwest",
  "rustls",
  "serde",
  "serde_json",
