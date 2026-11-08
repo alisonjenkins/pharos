@@ -23,6 +23,8 @@ pub(crate) enum Route {
     Prewarm,
     /// A native player's `Library.detail` naming a version.
     NativeDetail,
+    /// A native player's `Playback.negotiate` naming a version.
+    Negotiate,
 }
 
 impl Route {
@@ -34,6 +36,7 @@ impl Route {
             Self::Subtitles => "subtitles",
             Self::Prewarm => "prewarm",
             Self::NativeDetail => "native_detail",
+            Self::Negotiate => "negotiate",
         }
     }
 }
