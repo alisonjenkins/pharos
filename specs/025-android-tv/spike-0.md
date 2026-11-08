@@ -14,9 +14,25 @@ async `document::eval` round trip, and events arrive serialised with no
 element behind them. So `android.rs` cannot copy that surface one to one:
 slice 1 must pick an async surface or a JS-side state mirror pushed into
 Rust. That choice is slice 1's main cost and bears on ADR-0061's premise.
-Eval round-trip latency on the TV is not measured yet.
+Eval round-trip latency was measured on 2026-11-08 (below): reads are cheap
+enough for an async surface, and a pushed mirror keeps up with every frame.
 
-## Build
+## Eval latency (2026-11-08)
+
+Release build of the spike bin (`89d85aac0`), on the TV, nobody signed in,
+three seconds after launch (`~/pharos-tv-bench/run.sh`, logcat `bench`):
+
+| Probe | Result |
+|---|---|
+| `document::eval` round trip, one DOM read, 200 runs | min 2.1 ms, p50 2.5 ms, p95 3.3 ms, max 116 ms (the first, warm-up) |
+| One eval reading ten values (viewport, scroll, focus, tile count, `<video>` time/paused/width, a rect, dpr), 50 runs | p50 2.6 ms, p95 3.8 ms |
+| JS pushing a frame into Rust (`dioxus.send`) per `requestAnimationFrame`, 300 frames | gap p50 16.7 ms, p95 16.9 ms, max 17.8 ms; 5.0 s total |
+
+So a round trip costs about 2.5 ms whatever it reads, and batching is free.
+A pushed stream keeps the 60 Hz frame rate with no dropped frame. Neither
+side is a bottleneck: a D-pad press can afford one batched read (under 4 ms
+at p95 against a 16.7 ms frame), and continuous state can be pushed.
+
 
 - `nix develop .#android -c dx build --platform android --package pharos-ui
   --bin pharos-tv --features mobile --target armv7-linux-androideabi`.

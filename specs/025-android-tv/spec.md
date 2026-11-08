@@ -92,20 +92,23 @@ query. Signal to name before slice 1 lands:
 - Alison's TV model (Samsung Tizen / LG webOS cannot run Android apps).
 - Port the WebGL visualisers to the WebView (eval'd JS) or to wgpu, or
   leave music visuals off on TV.
-- **How the Android UI reads the DOM (open, decides slice 1's main cost).**
-  About 20 of `web.rs`'s functions read the DOM synchronously; on the
-  webview renderer the only DOM access is an async `document::eval` round
-  trip. Either `android.rs` exposes an async surface (callers change), or a
-  JS-side mirror pushes DOM state into Rust (callers stay synchronous, the
-  mirror can lag). Not decided: it waits for the eval round-trip latency
-  probe on the TV (`spike-0.md`). The pieces below do not depend on it.
+- **How the Android UI reads the DOM (settled 2026-11-08, `spike-0.md`
+  "Eval latency").** An eval round trip on the TV is 2.5 ms p50 / 3.3 ms
+  p95 whatever it reads, and a JS push into Rust holds 60 Hz. `android.rs`
+  uses both, by how a value changes: state that changes on its own
+  (`<video>` position and media state, viewport, page visibility, current
+  path) is pushed by a JS mirror into Rust and read synchronously from the
+  cache; reads made on an input (D-pad spatial focus, element sizes, tile
+  in view) run as one batched eval per event, with the spatial pick done in
+  JS beside the rects. Fire-and-forget calls (seek, play, focus by id,
+  push path) are a spawned eval with no reply.
 - Whether a real 320x180 banner drawable ships through `dx` (the manifest
   override works; the banner is the launcher icon for now).
 
 ## Quickstart: build and sign the TV APK
 
 Landed in slice 1 (the dev shell, the build, the network layer; the UI is a
-placeholder until the DOM question above is settled).
+placeholder until `android.rs` lands; the DOM question above is settled).
 
 ```sh
 # Dev shell (Android SDK 34, NDK, JDK 17, dx, rust android targets). It is
