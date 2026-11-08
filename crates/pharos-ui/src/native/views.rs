@@ -1215,6 +1215,7 @@ mod tests {
             imdb_rating: None,
             critic_rating: None,
             artist: None,
+            stereo: None,
         }
     }
 
@@ -1276,6 +1277,7 @@ mod tests {
             fonts: Vec::new(),
             artists: Vec::new(),
             album: None,
+            versions: Vec::new(),
         };
         let answer = vec![
             MemberSeen {
@@ -1864,6 +1866,7 @@ mod tests {
             fonts: Vec::new(),
             artists: Vec::new(),
             album: None,
+            versions: Vec::new(),
         };
         let html = render(move || rsx! { TitleView { detail: detail.clone() } });
         assert!(
@@ -1897,6 +1900,7 @@ mod tests {
             fonts: Vec::new(),
             artists: Vec::new(),
             album: None,
+            versions: Vec::new(),
         };
         let html = render(move || rsx! { TitleView { detail: detail.clone() } });
         assert!(html.contains(">Resume<"), "{html}");
@@ -1918,6 +1922,7 @@ mod tests {
             fonts: Vec::new(),
             artists: Vec::new(),
             album: None,
+            versions: Vec::new(),
         };
         let html = render(move || rsx! { TitleView { detail: detail.clone() } });
         assert!(html.contains(">Mark unwatched<"), "{html}");
@@ -1980,6 +1985,7 @@ mod tests {
             fonts: Vec::new(),
             artists: Vec::new(),
             album: None,
+            versions: Vec::new(),
         };
         let html = render(move || rsx! { TitleView { detail: detail.clone(), in_group: true } });
         assert!(html.contains(">Resume for the group<"), "{html}");
@@ -2007,6 +2013,7 @@ mod tests {
                 fonts: Vec::new(),
                 artists: Vec::new(),
                 album: None,
+                versions: Vec::new(),
             };
             let html = render(move || rsx! { TitleView { detail: detail.clone() } });
             assert_eq!(html.contains(">Watch together<"), shown, "{kind:?}: {html}");
@@ -2031,6 +2038,7 @@ mod tests {
                 fonts: vec![],
                 artists: Vec::new(),
                 album: None,
+                versions: Vec::new(),
             }
         };
         let outro = Segment {
@@ -2068,6 +2076,7 @@ mod tests {
             fonts: Vec::new(),
             artists: Vec::new(),
             album: None,
+            versions: Vec::new(),
         };
         let html = render(move || rsx! { TitleView { detail: detail.clone() } });
         assert!(
@@ -2277,6 +2286,7 @@ mod tests {
             fonts: Vec::new(),
             artists: Vec::new(),
             album: None,
+            versions: Vec::new(),
         };
         let page = render(move || rsx! { TitleView { detail: detail.clone() } });
         assert!(
@@ -2316,6 +2326,7 @@ mod tests {
             fonts: Vec::new(),
             artists: Vec::new(),
             album: None,
+            versions: Vec::new(),
         };
         let page = render(move || rsx! { TitleView { detail: detail.clone() } });
         assert!(page.contains("pharos-art-song"), "{page}");

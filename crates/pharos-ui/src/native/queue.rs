@@ -443,6 +443,7 @@ mod tests {
             imdb_rating: None,
             critic_rating: None,
             artist: None,
+            stereo: None,
         }
     }
 
