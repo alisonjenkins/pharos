@@ -2549,6 +2549,16 @@ impl Slot {
     }
 }
 
+type OnMedia = Box<dyn FnMut(MediaEvent)>;
+
+/// The player's media handler, for `timeupdate`s that arrive outside
+/// Dioxus events (`platform::on_time_update`).
+#[derive(Default)]
+struct Ticks {
+    on_media: RefCell<Option<OnMedia>>,
+    media_id: Cell<&'static str>,
+}
+
 /// The one player (spec 020): full on the watch route, else a floating
 /// window or a mini bar. It sits beside the routed screen, so a route change
 /// restyles it rather than unmounting it and its stream.
@@ -6842,6 +6852,24 @@ fn Player(
             });
         }
     };
+    // On the TV `timeupdate` comes through the page bridge, at most once a
+    // second, instead of as a Dioxus event: each Dioxus event holds the
+    // WebView until Rust answers, about 40 ms four times a second.
+    let ticks = use_hook(|| Rc::new(Ticks::default()));
+    *ticks.on_media.borrow_mut() = Some(Box::new(on_media.clone()));
+    ticks.media_id.set(slot.media_id());
+    use_hook({
+        let ticks = Rc::clone(&ticks);
+        move || {
+            Rc::new(platform::on_time_update(move |id| {
+                if id == ticks.media_id.get() {
+                    if let Some(on_media) = ticks.on_media.borrow_mut().as_mut() {
+                        on_media(MediaEvent::TimeUpdate);
+                    }
+                }
+            }))
+        }
+    });
 
     let on_control = {
         let p = Rc::clone(&p);
