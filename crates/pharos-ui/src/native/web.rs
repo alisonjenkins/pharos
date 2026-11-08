@@ -2692,6 +2692,66 @@ pub fn on_page_hide(mut on_hide: impl FnMut() + 'static) -> PageHide {
     PageHide(listener)
 }
 
+/// `visibilitychange` and `pageshow` listeners; removed on drop.
+pub struct PageLifecycle {
+    visibility: Closure<dyn FnMut(web_sys::Event)>,
+    show: Closure<dyn FnMut(web_sys::Event)>,
+}
+
+impl Drop for PageLifecycle {
+    fn drop(&mut self) {
+        if let Some(window) = web_sys::window() {
+            let _ = window.remove_event_listener_with_callback(
+                "pageshow",
+                self.show.as_ref().unchecked_ref(),
+            );
+            if let Some(document) = window.document() {
+                let _ = document.remove_event_listener_with_callback(
+                    "visibilitychange",
+                    self.visibility.as_ref().unchecked_ref(),
+                );
+            }
+        }
+    }
+}
+
+/// Call `on_hidden` when the page becomes hidden (a mobile or TV browser
+/// closing a tab often fires this and no `pagehide`), and `on_restored`
+/// when the browser shows a page again from its back/forward cache.
+pub fn on_page_lifecycle(
+    mut on_hidden: impl FnMut() + 'static,
+    mut on_restored: impl FnMut() + 'static,
+) -> PageLifecycle {
+    let visibility = Closure::<dyn FnMut(web_sys::Event)>::new(move |_| {
+        let hidden = web_sys::window()
+            .and_then(|w| w.document())
+            .is_some_and(|d| d.hidden());
+        if hidden {
+            on_hidden();
+        }
+    });
+    let show = Closure::<dyn FnMut(web_sys::Event)>::new(move |e: web_sys::Event| {
+        // `PageTransitionEvent.persisted`, read without the web-sys feature.
+        let persisted = js_sys::Reflect::get(&e, &JsValue::from_str("persisted"))
+            .ok()
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if persisted {
+            on_restored();
+        }
+    });
+    if let Some(window) = web_sys::window() {
+        let _ = window.add_event_listener_with_callback("pageshow", show.as_ref().unchecked_ref());
+        if let Some(document) = window.document() {
+            let _ = document.add_event_listener_with_callback(
+                "visibilitychange",
+                visibility.as_ref().unchecked_ref(),
+            );
+        }
+    }
+    PageLifecycle { visibility, show }
+}
+
 /// The engine for `kind`, loading hls.js first when it is needed.
 pub async fn engine(kind: Engine) -> Result<Box<dyn PlaybackEngine>, String> {
     match kind {
