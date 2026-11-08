@@ -235,6 +235,8 @@ codegen-units = 1
 # dx's `--debug-symbols false` plus wasm-opt drop the names section instead.
 
 # Spike only (spec 032): blitz-shell with a render-scale knob, to measure
-# GPU cost against resolution on the TV. Not for main.
+# GPU cost against resolution on the TV, and the hybrid renderer with a
+# switch for its per-frame GPU wait. Not for main.
 [patch.crates-io]
 blitz-shell = { path = "spike-patches/blitz-shell" }
+anyrender_vello_hybrid = { path = "spike-patches/anyrender_vello_hybrid" }
