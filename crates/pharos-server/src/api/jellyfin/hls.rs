@@ -274,6 +274,20 @@ impl Variant {
         }
         v
     }
+    /// The rungs an `abr=1` H.264 fMP4 master lists below the source rung
+    /// (V644). A rung at or above the source rung's own bitrate encodes the same
+    /// bytes at a different cache key, so it is left out.
+    fn cmaf_ladder(
+        source_height: Option<u32>,
+        source_bitrate_bps: Option<u64>,
+        bitrate_cap_bps: Option<u64>,
+    ) -> Vec<Self> {
+        let source_rung = effective_video_bitrate(bitrate_cap_bps, source_bitrate_bps);
+        Self::ladder_for(source_height, bitrate_cap_bps)
+            .into_iter()
+            .filter(|v| v.video_bitrate_bps() < source_rung)
+            .collect()
+    }
     /// `surface` label for this rung's fMP4 media segments.
     const fn cmaf_surface(self) -> &'static str {
         match self {
@@ -642,6 +656,14 @@ fn qs_video_bitrate_cap(qs: &str) -> Option<u64> {
         .filter(|n| *n > 0)
 }
 
+/// `abr=1`: the client adapts quality itself (the Rust engine), so the browser
+/// master lists the H.264 fMP4 ladder instead of the single source rung.
+fn qs_abr(qs: &str) -> bool {
+    qs.split('&')
+        .filter_map(|kv| kv.split_once('='))
+        .any(|(k, v)| k.eq_ignore_ascii_case("abr") && v == "1")
+}
+
 /// The single video codec a master playlist may advertise. A master carries
 /// EXACTLY ONE of these. The h264 rungs mux their audio into the mpegts
 /// segments; the vp9 rung demuxes audio into a `DEFAULT=YES`
@@ -762,8 +784,18 @@ fn is_web_client(req: &HttpRequest) -> bool {
 /// muxed + demuxed audio models in one master. The video is audio-free, so its
 /// segment cache is shared across audio tracks — a swap re-spins only the cheap
 /// audio rendition, not the video.
-fn push_h264_cmaf_rungs(body: &mut String, id: &str, qs: &str, item: &HlsItem) {
-    let bitrate = effective_video_bitrate(None, item.source_bitrate_bps) + 128_000;
+fn push_h264_cmaf_rungs(
+    body: &mut String,
+    id: &str,
+    qs: &str,
+    item: &HlsItem,
+    abr: bool,
+    bitrate_cap: Option<u64>,
+) {
+    // Without `abr=1` the source rung ignores the cap, as it always has: the
+    // master must stay byte-identical for hls.js (V644).
+    let source_cap = if abr { bitrate_cap } else { None };
+    let bitrate = effective_video_bitrate(source_cap, item.source_bitrate_bps) + 128_000;
     // Video codec (re-encoded h264) + the audio GROUP's Opus codec.
     let codecs = codecs_string(Some("h264"), None, None, Some("opus"));
     body.push_str(&format!(
@@ -778,6 +810,29 @@ fn push_h264_cmaf_rungs(body: &mut String, id: &str, qs: &str, item: &HlsItem) {
         "#EXT-X-STREAM-INF:BANDWIDTH={bitrate},CODECS=\"{codecs}\",AUDIO=\"aud\"{resolution}\n\
          /videos/{id}/h264cmaf/main.m3u8?{qs}\n"
     ));
+    if !abr {
+        return;
+    }
+    let aspect_w = item
+        .width
+        .zip(item.height)
+        .map(|(w, h)| w as f64 / h as f64);
+    for v in Variant::cmaf_ladder(item.height, item.source_bitrate_bps, bitrate_cap) {
+        let target_h = v.height();
+        let resolution = match aspect_w {
+            Some(ratio) => {
+                let target_w = (ratio * target_h as f64).round() as u32 & !1;
+                format!(",RESOLUTION={target_w}x{target_h}")
+            }
+            None => String::new(),
+        };
+        body.push_str(&format!(
+            "#EXT-X-STREAM-INF:BANDWIDTH={bw},CODECS=\"{codecs}\",AUDIO=\"aud\"{resolution}\n\
+             /videos/{id}/h264cmaf/{name}/main.m3u8?{qs}\n",
+            bw = v.advertised_bandwidth(),
+            name = v.name(),
+        ));
+    }
 }
 
 async fn master_playlist(
@@ -864,7 +919,14 @@ async fn master_playlist(
     // Exactly one codec's rungs — never both. The h264 family shares one muxed
     // audio model across its ladder; the vp9 rung owns its demuxed audio group.
     match video {
-        MasterVideo::H264 if demuxed_h264 => push_h264_cmaf_rungs(&mut body, &id, &qs, &item),
+        MasterVideo::H264 if demuxed_h264 => push_h264_cmaf_rungs(
+            &mut body,
+            &id,
+            &qs,
+            &item,
+            qs_abr(req.query_string()),
+            bitrate_cap,
+        ),
         MasterVideo::H264 => push_h264_rungs(&mut body, &id, &qs, &item, bitrate_cap),
         MasterVideo::Vp9 => push_vp9_rungs(&mut body, &id, &qs, &item),
     }
@@ -4470,6 +4532,131 @@ mod tests {
         );
         assert!(s.contains("/videos/9/h264cmaf/0.m4s"), "fMP4 segments: {s}");
         assert!(!s.contains(".ts"), "video-only fMP4, no mpegts: {s}");
+    }
+
+    /// The browser master for a 1080p source at `bitrate_bps`, with `extra`
+    /// appended to the query.
+    async fn browser_master(bitrate_bps: u64, extra: &str) -> String {
+        let probe = pharos_core::MediaProbe {
+            duration_ms: Some(18_000),
+            width: Some(1920),
+            height: Some(1080),
+            bitrate_bps: Some(bitrate_bps),
+            ..Default::default()
+        };
+        let (state, token) = seed_with_probe(probe).await;
+        let app = test::init_service(App::new().app_data(state).configure(register)).await;
+        let req = test::TestRequest::get()
+            .uri(&format!(
+                "/videos/9/master.m3u8?api_key={token}&renditions=h264{extra}"
+            ))
+            .insert_header((
+                actix_web::http::header::USER_AGENT,
+                "Mozilla/5.0 (X11; Linux x86_64) Firefox/152.0",
+            ))
+            .to_request();
+        let body = test::call_and_read_body(&app, req).await;
+        String::from_utf8(body.to_vec()).unwrap()
+    }
+
+    fn stream_inf_uris(master: &str) -> Vec<&str> {
+        let lines: Vec<&str> = master.lines().collect();
+        lines
+            .windows(2)
+            .filter(|w| w[0].starts_with("#EXT-X-STREAM-INF:"))
+            .map(|w| w[1].split('?').next().unwrap_or(""))
+            .collect()
+    }
+
+    // V644 — `abr=1` lists the source rung plus every ladder rung below it, all
+    // bound to the one audio group.
+    #[actix_web::test]
+    async fn abr_master_lists_the_h264_cmaf_ladder_on_one_audio_group() {
+        let s = browser_master(8_000_000, "&abr=1").await;
+        assert_eq!(
+            stream_inf_uris(&s),
+            vec![
+                "/videos/9/h264cmaf/main.m3u8",
+                "/videos/9/h264cmaf/1080p/main.m3u8",
+                "/videos/9/h264cmaf/720p/main.m3u8",
+                "/videos/9/h264cmaf/480p/main.m3u8",
+                "/videos/9/h264cmaf/360p/main.m3u8",
+            ],
+            "{s}"
+        );
+        assert_eq!(s.matches("#EXT-X-MEDIA:TYPE=AUDIO").count(), 1, "{s}");
+        for line in s.lines().filter(|l| l.starts_with("#EXT-X-STREAM-INF:")) {
+            assert!(line.contains("AUDIO=\"aud\""), "rung off the group: {line}");
+            assert!(line.contains("avc1") && line.contains("opus"), "{line}");
+        }
+        assert!(s.contains("BANDWIDTH=3128000,"), "720p rung bandwidth: {s}");
+        assert!(
+            s.contains("RESOLUTION=1280x720"),
+            "720p rung resolution: {s}"
+        );
+    }
+
+    // V644 — without `abr=1` the master is the single source rung it always was.
+    #[actix_web::test]
+    async fn browser_master_without_abr_keeps_the_single_cmaf_rung() {
+        // Today's master, byte for byte. The URL ceiling never reached the
+        // source rung's BANDWIDTH, and `abr=0` is not `abr=1`.
+        let golden = "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-INDEPENDENT-SEGMENTS\n\
+             #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"Audio\",DEFAULT=YES,\
+             AUTOSELECT=YES,URI=\"/videos/9/vp9/audio.m3u8?api_key=T\"\n\
+             #EXT-X-STREAM-INF:BANDWIDTH=8128000,CODECS=\"avc1.640028,opus\",\
+             AUDIO=\"aud\",RESOLUTION=1920x1080\n\
+             /videos/9/h264cmaf/main.m3u8?api_key=T\n";
+        let redact = |m: String| -> String {
+            let mut out = String::new();
+            let mut rest = m.as_str();
+            while let Some(i) = rest.find("api_key=") {
+                out.push_str(&rest[..i + "api_key=".len()]);
+                out.push('T');
+                rest = &rest[i + "api_key=".len()..];
+                rest = &rest[rest
+                    .find(|c: char| !c.is_ascii_hexdigit())
+                    .unwrap_or(rest.len())..];
+            }
+            out.push_str(rest);
+            out
+        };
+        assert_eq!(redact(browser_master(8_000_000, "").await), golden);
+        assert_eq!(redact(browser_master(8_000_000, "&abr=0").await), golden);
+        let capped = redact(browser_master(8_000_000, "&VideoBitrate=2000000").await);
+        assert_eq!(capped.replace("&VideoBitrate=2000000", ""), golden);
+    }
+
+    // V645's server half — the ladder never lists a rung above the URL ceiling,
+    // and the source rung advertises the capped bitrate.
+    #[actix_web::test]
+    async fn abr_master_drops_rungs_above_the_bitrate_ceiling() {
+        let s = browser_master(8_000_000, "&abr=1&VideoBitrate=2000000").await;
+        assert_eq!(
+            stream_inf_uris(&s),
+            vec![
+                "/videos/9/h264cmaf/main.m3u8",
+                "/videos/9/h264cmaf/480p/main.m3u8",
+                "/videos/9/h264cmaf/360p/main.m3u8",
+            ],
+            "{s}"
+        );
+        assert!(s.contains("BANDWIDTH=2128000,"), "capped source rung: {s}");
+    }
+
+    // A rung at or above the source rung's bitrate would be the same encode
+    // under another cache key, so it is not listed.
+    #[::core::prelude::v1::test]
+    fn cmaf_ladder_leaves_out_rungs_at_or_above_the_source_rung() {
+        assert_eq!(
+            Variant::cmaf_ladder(Some(1080), Some(3_000_000), None),
+            vec![Variant::P480, Variant::P360]
+        );
+        assert_eq!(
+            Variant::cmaf_ladder(Some(1080), Some(8_000_000), Some(3_000_000)),
+            vec![Variant::P480, Variant::P360]
+        );
+        assert!(Variant::cmaf_ladder(Some(1080), Some(500_000), None).is_empty());
     }
 
     // V644 — a rung's playlist sits on the same segment grid as the source
