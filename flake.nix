@@ -866,7 +866,7 @@
               http {
                 include ${pkgs.angie}/conf/mime.types;
                 # The stock table has no entry for the UI's web manifest.
-                types { application/manifest+json webmanifest; }
+                types { application/manifest+json webmanifest; font/ttf ttf; }
                 default_type application/octet-stream;
                 ${angieAccessLog}
                 sendfile on;
@@ -904,7 +904,11 @@
                   application/json
                   application/manifest+json
                   application/xml
-                  image/svg+xml;
+                  image/svg+xml
+                  # The UI's wasm (the largest asset of the bundle, about a
+                  # third of its size gzipped) and its subtitle fallback font.
+                  application/wasm
+                  font/ttf;
                 client_body_temp_path /tmp/angie/client_body;
                 proxy_temp_path        /tmp/angie/proxy;
                 fastcgi_temp_path      /tmp/angie/fastcgi;
