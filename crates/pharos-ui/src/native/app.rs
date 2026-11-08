@@ -1553,6 +1553,7 @@ fn NativeApp(route: Route) -> Element {
     // tab to what the group plays. Read before this page publishes a view.
     let kept_group = use_hook(|| Rc::new(RefCell::new(super::group_app::kept_before_load())));
     let together = use_context::<Together>();
+    let together_again = together.clone();
     use_effect(move || {
         let Some(api) = api.read().clone() else {
             return;
@@ -1573,6 +1574,17 @@ fn NativeApp(route: Route) -> Element {
                 error.set(Some(super::group_app::rejoin_failure(&e.0)));
             }
         });
+    });
+    // Each later API is a new connection: a group membership on the old one
+    // is joined again over it.
+    let resumed_once = use_hook(|| Rc::new(Cell::new(false)));
+    use_effect(move || {
+        let Some(api) = api.read().clone() else {
+            return;
+        };
+        if resumed_once.replace(true) {
+            together_again.reconnected(&api);
+        }
     });
     // The play queue lives as long as the app, across pages and songs.
     let queue = use_signal(Queue::default);

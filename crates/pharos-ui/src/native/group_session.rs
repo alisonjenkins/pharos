@@ -6,7 +6,7 @@
 //! event sink; [`GroupPlayer`] is the `<video>`; [`GroupClient`] is the
 //! network. The app supplies browser versions, the tests supply fakes.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::rc::{Rc, Weak};
 
@@ -25,6 +25,22 @@ use super::together::{
 use super::track_follow::{
     follows_group, route_pick, GroupTracksView, PickRoute, TrackChoice, TrackPicks,
 };
+
+/// How long a rejoin waits before each retry. They add up to 89 s: past a
+/// restarted server's three 20 s rounds of loading its saved groups, which
+/// took 51 s from boot in production on 2026-11-08.
+pub const REJOIN_BACKOFF_MS: [u32; 10] = [
+    500, 1_500, 4_000, 8_000, 12_000, 12_000, 12_000, 12_000, 12_000, 15_000,
+];
+
+/// A member the server keeps refusing rejoins at most this often.
+pub const REJOIN_AFTER_GONE_EVERY_MS: u32 = 30_000;
+
+/// What the viewer reads when the group this tab was in cannot be joined
+/// again (B807); the server's reason follows.
+pub fn rejoin_failure(reason: &str) -> String {
+    format!("Couldn't rejoin your group, so you're watching on your own. ({reason})")
+}
 
 /// Keep-alive cadence (T83's ghost prune is 150 s).
 pub const PING_EVERY_S: u64 = 30;
@@ -669,6 +685,11 @@ pub struct Session<C, E> {
     env: E,
     inner: RefCell<Inner>,
     this: RefCell<Weak<Self>>,
+    /// A rejoin is under way; a second trigger waits for it.
+    rejoining: Cell<bool>,
+    /// When a rejoin triggered by the server last started, so a server that
+    /// keeps refusing this member cannot start one per call.
+    rejoined_ms: Cell<Option<i64>>,
 }
 
 impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
@@ -681,6 +702,8 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
                 ..Inner::default()
             }),
             this: RefCell::new(Weak::new()),
+            rejoining: Cell::new(false),
+            rejoined_ms: Cell::new(None),
         });
         *session.this.borrow_mut() = Rc::downgrade(&session);
         session
@@ -688,6 +711,11 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
 
     fn me(&self) -> Option<Rc<Self>> {
         self.this.borrow().upgrade()
+    }
+
+    /// The group client, to move it to a new connection.
+    pub fn client(&self) -> &C {
+        &self.client
     }
 
     /// Whether a membership is active.
@@ -723,8 +751,11 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
         let asks = ids
             .chunks(seen::MAX_IDS)
             .map(|chunk| self.client.seen(chunk.to_vec()));
+        let answers = futures_util::future::try_join_all(asks)
+            .await
+            .inspect_err(|e| self.rejoin_if_gone(e, "seen"))?;
         let mut all = Vec::new();
-        for answer in futures_util::future::try_join_all(asks).await? {
+        for answer in answers {
             seen::merge(&mut all, answer);
         }
         Ok(all)
@@ -771,6 +802,117 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
         self.began(made)
     }
 
+    /// The membership was lost while the viewer is still in the group: the
+    /// connection it lived on was replaced, or the server no longer counts
+    /// this member. Joins the same group again, without leaving it first or
+    /// showing the viewer out of it, so the server's seat for this device
+    /// is taken back and the group's item brings the player to it.
+    ///
+    /// A server that restarted answers that it knows no such group until it
+    /// has loaded its saved groups (its boot reconciliation retries every
+    /// 20 s), so a refusal is retried on [`REJOIN_BACKOFF_MS`]. Only an
+    /// `ended` from the group, or the backoff running out, gives up; then the
+    /// viewer reads why, and watches on their own.
+    pub async fn rejoin(&self, reason: &'static str) {
+        let id = {
+            let inner = self.inner.borrow();
+            inner.state.id.clone().filter(|_| inner.active)
+        };
+        let Some(id) = id else {
+            return;
+        };
+        if self.rejoining.replace(true) {
+            self.env.info(&format!(
+                "pharos: group rejoin skipped reason={reason} group={id} cause=in_progress"
+            ));
+            return;
+        }
+        let started = self.env.now_ms();
+        self.env.info(&format!(
+            "pharos: group rejoin started reason={reason} group={id}"
+        ));
+        let mut attempts = 0u32;
+        let mut backoff = REJOIN_BACKOFF_MS.iter();
+        let outcome = loop {
+            attempts = attempts.saturating_add(1);
+            // Out of the old membership without a `leave`: that would end
+            // the seat this join takes back, and publish the viewer out.
+            self.inner.borrow_mut().active = false;
+            let epoch = self.prepare(None).await;
+            let made = self.client.join(&id, self.sink(epoch)).await;
+            let error = match self.began(made) {
+                Ok(_) => break Ok(()),
+                Err(e) => e,
+            };
+            if self.inner.borrow().epoch != epoch {
+                break Err(None);
+            }
+            let ended = self.inner.borrow().state.ended.is_some();
+            match backoff.next() {
+                Some(&wait) if !ended => {
+                    self.env.info(&format!(
+                        "pharos: group rejoin retrying reason={reason} group={id} attempt={attempts} wait_ms={wait} error={}",
+                        error.0
+                    ));
+                    self.env.sleep(wait).await;
+                    // The viewer left, or joined another group, meanwhile.
+                    if self.inner.borrow().epoch != epoch {
+                        break Err(None);
+                    }
+                }
+                _ => break Err(Some(error)),
+            }
+        };
+        self.rejoining.set(false);
+        let waited = self.env.now_ms().saturating_sub(started);
+        match outcome {
+            Ok(()) => self.env.info(&format!(
+                "pharos: group rejoined reason={reason} group={id} attempts={attempts} waited_ms={waited}"
+            )),
+            Err(None) => self.env.info(&format!(
+                "pharos: group rejoin stopped reason={reason} group={id} attempts={attempts} cause=superseded"
+            )),
+            Err(Some(e)) => {
+                self.env.warn(&format!(
+                    "pharos: group rejoin failed reason={reason} group={id} attempts={attempts} waited_ms={waited} error={}",
+                    e.0
+                ));
+                {
+                    let mut inner = self.inner.borrow_mut();
+                    inner.active = false;
+                    inner.state.ended.get_or_insert_with(|| rejoin_failure(&e.0));
+                }
+                self.publish();
+            }
+        }
+    }
+
+    /// A membership call was refused because the server no longer counts
+    /// this member in the group (it pruned a silent member, B893): rejoin,
+    /// at most once per [`REJOIN_AFTER_GONE_EVERY_MS`].
+    fn rejoin_if_gone(&self, error: &GroupError, call: &str) {
+        if !error.is_gone() || !self.active() {
+            return;
+        }
+        let now = self.env.now_ms();
+        let every = i64::from(REJOIN_AFTER_GONE_EVERY_MS);
+        if self
+            .rejoined_ms
+            .get()
+            .is_some_and(|at| now.saturating_sub(at) < every)
+        {
+            return;
+        }
+        self.rejoined_ms.set(Some(now));
+        self.env.info(&format!(
+            "pharos: group membership gone call={call}, rejoining"
+        ));
+        if let Some(me) = self.me() {
+            self.env
+                .spawn(Box::pin(async move { me.rejoin("not_a_member").await }));
+        }
+    }
+
     /// A clean slate for a new membership, whose epoch it returns; an old
     /// one is left first. The page being watched stays unless `watching`
     /// names another.
@@ -808,7 +950,7 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
             let mut inner = self.inner.borrow_mut();
             // An `Ended` that raced the answer leaves nothing to run.
             if inner.state.ended.is_some() {
-                return Err(GroupError("This group has ended".into()));
+                return Err(GroupError::gone());
             }
             inner.active = true;
             let now = self.env.now_ms();
@@ -1428,6 +1570,7 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
             if let Err(e) = self.client.ping().await {
                 self.env
                     .warn(&format!("pharos: group ping failed: {}", e.0));
+                self.rejoin_if_gone(&e, "ping");
             }
         }
     }
@@ -1675,6 +1818,7 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
                             e.0
                         ));
                         me.command_failed(epoch);
+                        me.rejoin_if_gone(&e, "command");
                     }
                     Either::Left((Ok(()), _)) => {}
                     Either::Right(_) => {
@@ -2188,6 +2332,107 @@ mod tests {
         }
         assert_eq!(calls_with(&rig, "clock(").len() - clocks, 3);
         assert_eq!(calls_with(&rig, "ping").len(), 1);
+    }
+
+    /// The `View`s the session published, oldest first.
+    fn views(rig: &Rig) -> Vec<GroupView> {
+        rig.env
+            .ui
+            .borrow()
+            .iter()
+            .filter_map(|u| match u {
+                Ui::View(v) => Some(v.clone()),
+                Ui::Navigate(_) => None,
+            })
+            .collect()
+    }
+
+    /// B894: after a server restart the new connection's join is refused
+    /// until the server has loaded its saved groups. The rejoin retries
+    /// through that, never leaves the group or shows the viewer out of it,
+    /// and ends back in it with a new membership.
+    #[test]
+    fn a_rejoin_retries_while_the_server_loads_its_groups() {
+        let rig = rig();
+        let views_before = views(&rig).len();
+        let epoch = rig.session.inner.borrow().epoch;
+        rig.groups.gone_for_joins(3);
+        let _ = rig.session.rejoin("reconnect").now_or_never();
+        rig.env.settle();
+        assert_eq!(
+            calls_with(&rig, "join(g1)").len(),
+            5,
+            "the first join, 3 refused, 1 taken"
+        );
+        assert!(
+            calls_with(&rig, "leave").is_empty(),
+            "a rejoin never leaves"
+        );
+        assert!(rig.session.active());
+        assert!(rig.session.inner.borrow().epoch > epoch, "a new membership");
+        assert!(
+            views(&rig).iter().skip(views_before).all(|v| v.active),
+            "the viewer is never shown out of the group"
+        );
+        assert_eq!(
+            rig.env
+                .logged("pharos: group rejoined reason=reconnect group=g1 attempts=4 ")
+                .len(),
+            1,
+            "{:?}",
+            rig.env.logs.borrow()
+        );
+    }
+
+    /// A group the server no longer has, past every retry, is given up on:
+    /// the viewer reads why and watches on their own.
+    #[test]
+    fn a_rejoin_that_never_finds_the_group_says_so() {
+        let rig = rig();
+        rig.groups.gone_for_joins(u32::MAX);
+        let _ = rig.session.rejoin("reconnect").now_or_never();
+        rig.env.settle();
+        assert_eq!(
+            calls_with(&rig, "join(g1)").len(),
+            1 + 1 + REJOIN_BACKOFF_MS.len(),
+            "one try, then one per backoff step"
+        );
+        assert!(!rig.session.active());
+        let last = views(&rig).pop();
+        assert!(
+            last.as_ref().is_some_and(|v| !v.active),
+            "a view out of the group after giving up"
+        );
+        assert_eq!(
+            last.and_then(|v| v.ended).as_deref(),
+            Some("Couldn't rejoin your group, so you're watching on your own. (This group has ended)")
+        );
+    }
+
+    /// B893: a member the server pruned is told so by its next ping; it joins
+    /// the group again rather than going on as a member nobody hears.
+    #[test]
+    fn a_pruned_member_rejoins_on_the_ping_that_finds_out() {
+        let rig = rig();
+        rig.groups.gone_pings(true);
+        rig.env.now.set(rig.env.now.get() + 30_000);
+        let _ = rig.session.tick().now_or_never();
+        rig.env.settle();
+        assert_eq!(calls_with(&rig, "join(g1)").len(), 2);
+        assert!(rig.session.active());
+        // The server still refuses: no second rejoin within the 30 s.
+        rig.env.now.set(rig.env.now.get() + 29_000);
+        let _ = rig.session.tick().now_or_never();
+        rig.env.settle();
+        assert_eq!(calls_with(&rig, "join(g1)").len(), 2, "one rejoin per 30 s");
+    }
+
+    /// Out of a group there is nothing to rejoin.
+    #[test]
+    fn a_rejoin_out_of_a_group_does_nothing() {
+        let session = Session::new(FakeGroups::default(), TestEnv::default());
+        let _ = session.rejoin("reconnect").now_or_never();
+        assert!(!session.active());
     }
 
     /// B893: a hidden tab's timers fire about once a minute, so the one-second
