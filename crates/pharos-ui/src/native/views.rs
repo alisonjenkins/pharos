@@ -755,6 +755,15 @@ pub fn PaletteView(
                 role: "dialog",
                 "aria-modal": "true",
                 "aria-label": "Go to or search",
+                // Esc closes from anywhere in the dialog, as its footer says,
+                // not only from the input: Tab onto a result and Esc did
+                // nothing (B839). The input handles its own Esc and stops it.
+                onkeydown: move |evt: KeyboardEvent| {
+                    if evt.key() == Key::Escape {
+                        evt.prevent_default();
+                        on_close.call(());
+                    }
+                },
                 input {
                     id: PALETTE_INPUT,
                     r#type: "search",
@@ -768,7 +777,12 @@ pub fn PaletteView(
                     "aria-activedescendant": active_id,
                     value: "{text}",
                     oninput: move |evt: FormEvent| on_input.call(evt.value()),
-                    onkeydown: move |evt| on_key.call(evt),
+                    onkeydown: move |evt: KeyboardEvent| {
+                        if evt.key() == Key::Escape {
+                            evt.stop_propagation();
+                        }
+                        on_key.call(evt)
+                    },
                 }
                 div {
                     id: PALETTE_LIST,
