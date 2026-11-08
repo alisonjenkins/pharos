@@ -78,6 +78,10 @@ impl GroupPlayer for VideoPlayer {
         platform::ended(self.id)
     }
 
+    fn has_data(&self) -> bool {
+        platform::has_data(self.id)
+    }
+
     fn play(&self) {
         platform::play(self.id);
     }

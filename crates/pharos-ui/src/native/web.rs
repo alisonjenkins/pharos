@@ -409,6 +409,13 @@ pub fn ended(video_id: &str) -> bool {
     video_element(video_id).is_some_and(|v| v.ended())
 }
 
+/// Whether the `<video>` can play at its position now, not mid-seek.
+pub fn has_data(video_id: &str) -> bool {
+    video_element(video_id).is_some_and(|v| {
+        !v.seeking() && v.ready_state() >= web_sys::HtmlMediaElement::HAVE_FUTURE_DATA
+    })
+}
+
 /// What the controls show of the `<video>`.
 pub fn media_state(video_id: &str) -> MediaState {
     video_element(video_id).map_or_else(MediaState::default, |v| MediaState {
