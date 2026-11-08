@@ -16,6 +16,8 @@ pharos-ui = { path = "../pharos-ui" }
 # the focused node.
 dioxus-native = { version = "=0.8.0-alpha.3", default-features = false, features = ["autofocus", "html", "svg"] }
 pharos-client = { path = "../pharos-client" }
+# The fMP4 feeder (src/feeder.rs): sample table, codec boxes, Annex B.
+pharos-hls = { path = "../pharos-hls" }
 log = "0.4"
 
 [target.'cfg(target_os = "android")'.dependencies]

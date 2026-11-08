@@ -6,6 +6,9 @@
 //! file's first video track in a loop, paced to its timestamps. The file
 //! must be readable by the app (its external files dir works with adb push).
 //! Logs the decoder's name and, every 2 s, frames shown and dropped.
+//!
+//! A directory holding an fMP4 HLS `index.m3u8` is played through the
+//! `pharos-hls` feeder (src/feeder.rs) instead of the extractor.
 
 use ndk::native_window::NativeWindow;
 use ndk_sys as sys;
@@ -58,43 +61,156 @@ fn check(status: sys::media_status_t, what: &str) -> Result<(), String> {
     }
 }
 
-fn run(window: &NativeWindow, path: &str) -> Result<(), String> {
-    let file = std::fs::File::open(path).map_err(|e| format!("open: {e}"))?;
-    let len = file.metadata().map_err(|e| format!("stat: {e}"))?.len() as i64;
-    // SAFETY: every pointer below comes from the NDK call before it and is
-    // checked for null; the extractor and codec live until this returns and
-    // are deleted on the way out. `file` outlives the extractor.
-    unsafe {
+/// Where the decoder's input comes from.
+enum Source {
+    /// A file `AMediaExtractor` demuxes (the slice 0 probe).
+    Extractor { ex: *mut sys::AMediaExtractor, _file: std::fs::File },
+    /// An fMP4 HLS directory `pharos-hls` demuxes.
+    Fmp4(crate::feeder::Feeder),
+}
+
+impl Source {
+    /// Opens `path` and returns the source, its video format and its mime type.
+    ///
+    /// # Safety
+    /// The returned format must be deleted with `AMediaFormat_delete`.
+    unsafe fn open(path: &str) -> Result<(Self, *mut sys::AMediaFormat, String), String> {
+        if crate::feeder::Feeder::is_feeder_dir(path) {
+            let feeder = crate::feeder::Feeder::open(path)?;
+            let f = feeder.format();
+            let format = sys::AMediaFormat_new();
+            if format.is_null() {
+                return Err("AMediaFormat_new returned null".into());
+            }
+            let mime = f.codec.mime();
+            let mime_c = std::ffi::CString::new(mime).map_err(|e| format!("mime: {e}"))?;
+            sys::AMediaFormat_setString(format, sys::AMEDIAFORMAT_KEY_MIME, mime_c.as_ptr());
+            sys::AMediaFormat_setInt32(format, sys::AMEDIAFORMAT_KEY_WIDTH, i32::from(f.width));
+            sys::AMediaFormat_setInt32(format, sys::AMEDIAFORMAT_KEY_HEIGHT, i32::from(f.height));
+            sys::AMediaFormat_setInt32(
+                format,
+                sys::AMEDIAFORMAT_KEY_MAX_INPUT_SIZE,
+                i32::try_from(f.max_input).unwrap_or(i32::MAX),
+            );
+            for (i, csd) in f.csd.iter().enumerate() {
+                let key = std::ffi::CString::new(format!("csd-{i}"))
+                    .map_err(|e| format!("csd key: {e}"))?;
+                sys::AMediaFormat_setBuffer(format, key.as_ptr(), csd.as_ptr().cast(), csd.len());
+            }
+            return Ok((Self::Fmp4(feeder), format, mime.to_owned()));
+        }
+
+        let file = std::fs::File::open(path).map_err(|e| format!("open: {e}"))?;
+        let len = file.metadata().map_err(|e| format!("stat: {e}"))?.len() as i64;
         let ex = sys::AMediaExtractor_new();
         if ex.is_null() {
             return Err("AMediaExtractor_new returned null".into());
         }
-        let _ex_guard = Guard(move || {
-            sys::AMediaExtractor_delete(ex);
-        });
+        let source = Self::Extractor { ex, _file: file };
+        let Self::Extractor { _file: file, .. } = &source else {
+            return Err("unreachable source".into());
+        };
         check(
             sys::AMediaExtractor_setDataSourceFd(ex, file.as_raw_fd(), 0, len),
             "setDataSourceFd",
         )?;
         let tracks = sys::AMediaExtractor_getTrackCount(ex);
-        let mut picked = None;
         for i in 0..tracks {
             let format = sys::AMediaExtractor_getTrackFormat(ex, i);
             let mut mime = std::ptr::null();
             if sys::AMediaFormat_getString(format, sys::AMEDIAFORMAT_KEY_MIME, &mut mime) {
                 let m = CStr::from_ptr(mime).to_string_lossy().into_owned();
                 if m.starts_with("video/") {
-                    picked = Some((i, format, m));
-                    break;
+                    check(sys::AMediaExtractor_selectTrack(ex, i), "selectTrack")?;
+                    return Ok((source, format, m));
                 }
             }
             sys::AMediaFormat_delete(format);
         }
-        let (track, format, mime) = picked.ok_or("no video track")?;
+        Err("no video track".into())
+    }
+
+    /// Fills one input buffer. Returns false once the end of stream is queued.
+    ///
+    /// # Safety
+    /// `codec` is a started decoder this source was configured for.
+    unsafe fn feed(&mut self, codec: *mut sys::AMediaCodec) -> Result<bool, String> {
+        let idx = sys::AMediaCodec_dequeueInputBuffer(codec, DEQUEUE_TIMEOUT_US);
+        if idx < 0 {
+            return Ok(true);
+        }
+        let idx = idx as usize;
+        let mut cap = 0usize;
+        let buf = sys::AMediaCodec_getInputBuffer(codec, idx, &mut cap);
+        if buf.is_null() {
+            return Err("getInputBuffer returned null".into());
+        }
+        let eos = sys::AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM as u32;
+        match self {
+            Self::Extractor { ex, .. } => {
+                let n = sys::AMediaExtractor_readSampleData(*ex, buf, cap);
+                if n < 0 {
+                    sys::AMediaCodec_queueInputBuffer(codec, idx, 0, 0, 0, eos);
+                    return Ok(false);
+                }
+                let pts = sys::AMediaExtractor_getSampleTime(*ex);
+                sys::AMediaCodec_queueInputBuffer(codec, idx, 0, n as usize, pts as u64, 0);
+                sys::AMediaExtractor_advance(*ex);
+                Ok(true)
+            }
+            Self::Fmp4(feeder) => {
+                let dst = std::slice::from_raw_parts_mut(buf, cap);
+                match feeder.next(dst)? {
+                    crate::feeder::Next::Sample { len, pts_us, key } => {
+                        let flags = if key { BUFFER_FLAG_KEY_FRAME } else { 0 };
+                        sys::AMediaCodec_queueInputBuffer(codec, idx, 0, len, pts_us, flags);
+                        Ok(true)
+                    }
+                    crate::feeder::Next::TooBig { need } => {
+                        Err(format!("sample of {need} bytes over input buffer of {cap}"))
+                    }
+                    crate::feeder::Next::End => {
+                        sys::AMediaCodec_queueInputBuffer(codec, idx, 0, 0, 0, eos);
+                        Ok(false)
+                    }
+                }
+            }
+        }
+    }
+
+    /// # Safety
+    /// The extractor, if any, is live.
+    unsafe fn rewind(&mut self) {
+        match self {
+            Self::Extractor { ex, .. } => {
+                sys::AMediaExtractor_seekTo(*ex, 0, sys::SeekMode::AMEDIAEXTRACTOR_SEEK_PREVIOUS_SYNC);
+            }
+            Self::Fmp4(feeder) => feeder.rewind(),
+        }
+    }
+}
+
+impl Drop for Source {
+    fn drop(&mut self) {
+        if let Self::Extractor { ex, .. } = self {
+            // SAFETY: `ex` came from AMediaExtractor_new and is deleted once.
+            unsafe { sys::AMediaExtractor_delete(*ex) };
+        }
+    }
+}
+
+/// MediaCodec.BUFFER_FLAG_KEY_FRAME; ndk-sys does not export it.
+const BUFFER_FLAG_KEY_FRAME: u32 = 1;
+
+fn run(window: &NativeWindow, path: &str) -> Result<(), String> {
+    // SAFETY: every pointer below comes from the NDK call before it and is
+    // checked for null; the source, format and codec live until this returns
+    // and are deleted on the way out.
+    unsafe {
+        let (mut source, format, mime) = Source::open(path)?;
         let _format_guard = Guard(move || {
             sys::AMediaFormat_delete(format);
         });
-        check(sys::AMediaExtractor_selectTrack(ex, track), "selectTrack")?;
         let mime_c = std::ffi::CString::new(mime.clone()).map_err(|e| format!("mime: {e}"))?;
         let codec = sys::AMediaCodec_createDecoderByType(mime_c.as_ptr());
         if codec.is_null() {
@@ -136,28 +252,7 @@ fn run(window: &NativeWindow, path: &str) -> Result<(), String> {
         let mut report = Instant::now();
         loop {
             if !input_done {
-                let idx = sys::AMediaCodec_dequeueInputBuffer(codec, DEQUEUE_TIMEOUT_US);
-                if idx >= 0 {
-                    let idx = idx as usize;
-                    let mut cap = 0usize;
-                    let buf = sys::AMediaCodec_getInputBuffer(codec, idx, &mut cap);
-                    let n = sys::AMediaExtractor_readSampleData(ex, buf, cap);
-                    if n < 0 {
-                        sys::AMediaCodec_queueInputBuffer(
-                            codec,
-                            idx,
-                            0,
-                            0,
-                            0,
-                            sys::AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM as u32,
-                        );
-                        input_done = true;
-                    } else {
-                        let pts = sys::AMediaExtractor_getSampleTime(ex);
-                        sys::AMediaCodec_queueInputBuffer(codec, idx, 0, n as usize, pts as u64, 0);
-                        sys::AMediaExtractor_advance(ex);
-                    }
-                }
+                input_done = !source.feed(codec)?;
             }
             let mut info = sys::AMediaCodecBufferInfo {
                 offset: 0,
@@ -171,11 +266,7 @@ fn run(window: &NativeWindow, path: &str) -> Result<(), String> {
                 if info.flags & sys::AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM as u32 != 0 {
                     sys::AMediaCodec_releaseOutputBuffer(codec, idx, false);
                     loops += 1;
-                    sys::AMediaExtractor_seekTo(
-                        ex,
-                        0,
-                        sys::SeekMode::AMEDIAEXTRACTOR_SEEK_PREVIOUS_SYNC,
-                    );
+                    source.rewind();
                     check(sys::AMediaCodec_flush(codec), "flush")?;
                     input_done = false;
                     first_pts = None;
