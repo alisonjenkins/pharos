@@ -12,6 +12,30 @@ pub const RESUME_TIMEOUT_MS: f64 = 5_000.0;
 /// above the routing's own zero.
 pub const AUDIBLE_PEAK: f32 = 0.001;
 
+/// Whether a media element playing `src` on a page at `origin` can be routed
+/// through Web Audio: a cross-origin source without CORS would play
+/// silence once routed, and WebKit's native HLS feeds a
+/// `MediaElementAudioSourceNode` silence, so both are left unrouted. The
+/// error names the refused source.
+pub fn routable(src: &str, origin: &str) -> Result<(), String> {
+    let same_origin = src.starts_with("blob:")
+        || (!origin.is_empty()
+            && src
+                .strip_prefix(origin)
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with('/')));
+    if !same_origin {
+        return Err(format!("cross-origin source {src}"));
+    }
+    if src
+        .split('?')
+        .next()
+        .is_some_and(|path| path.ends_with(".m3u8"))
+    {
+        return Err(format!("native HLS source {src}"));
+    }
+    Ok(())
+}
+
 /// Whether a play wakes a tap's `AudioContext` in `state` first: only
 /// a suspended one, or one WebKit interrupted (a call or another app took
 /// the audio session); a closed one cannot be resumed.
@@ -430,6 +454,26 @@ mod tests {
             report.line().contains("context_resumed=true"),
             "{}",
             report.line()
+        );
+    }
+
+    #[test]
+    fn only_same_origin_and_mse_sources_are_routed() {
+        let origin = "https://pharos.example";
+        assert_eq!(
+            routable("https://pharos.example/audio/1/universal?x=1", origin),
+            Ok(())
+        );
+        assert_eq!(routable("https://pharos.example", origin), Ok(()));
+        assert_eq!(routable("blob:https://pharos.example/0b1c", origin), Ok(()));
+        let refused = |src: &str| routable(src, origin).expect_err(src);
+        assert!(refused("https://cdn.example/a.mp3").contains("cross-origin source"));
+        // A host that only starts with the origin is another origin.
+        assert!(refused("https://pharos.example.evil/a.mp3").contains("cross-origin"));
+        assert!(refused("https://pharos.example/v/main.m3u8?t=1").contains("native HLS"));
+        assert!(
+            routable("https://pharos.example/a.mp3", "").is_err(),
+            "no origin, no route"
         );
     }
 }
