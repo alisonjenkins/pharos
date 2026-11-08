@@ -608,6 +608,9 @@ pub fn Rail(title: String, link: Option<Route>, items: Vec<Item>) -> Element {
 pub enum Hits {
     /// Nothing asked yet: the box is blank.
     Idle,
+    /// Text is typed and its matches are on the way (the debounce and the
+    /// round trip), so "no matches" is not yet true (B826).
+    Searching,
     /// The matches for the newest term; empty when nothing matched.
     Found(Page),
     Failed(String),
@@ -664,6 +667,9 @@ pub fn SearchBox(
                     onclick: move |_| on_close.call(()),
                     match hits {
                         Hits::Idle => rsx! {},
+                        Hits::Searching => rsx! {
+                            p { class: "pharos-empty", role: "status", "Searching…" }
+                        },
                         Hits::Failed(message) => rsx! { ErrorNote { message } },
                         Hits::Found(page) if page.items.is_empty() => rsx! {
                             p { class: "pharos-empty", role: "status", "No matches" }
@@ -725,6 +731,9 @@ pub fn PaletteView(
     rows: Vec<Row>,
     active: Option<usize>,
     failed: Option<String>,
+    /// A search for the typed text is on its way (B826).
+    #[props(default)]
+    searching: bool,
     on_input: EventHandler<String>,
     on_key: EventHandler<KeyboardEvent>,
     on_pick: EventHandler<()>,
@@ -806,6 +815,8 @@ pub fn PaletteView(
                 }
                 if let Some(message) = failed {
                     ErrorNote { message }
+                } else if searching {
+                    p { class: "pharos-empty", role: "status", "Searching…" }
                 } else if rows.is_empty() {
                     p { class: "pharos-empty", role: "status", "No matches" }
                 }
@@ -1913,6 +1924,32 @@ mod tests {
         assert!(html.contains(r#"role="alert""#), "{html}");
         assert!(html.contains("the server is busy"), "{html}");
         assert!(palette(None).contains("No matches"));
+    }
+
+    /// B826: while a search is on its way the boxes say so, not "No matches".
+    #[test]
+    fn a_search_on_its_way_says_searching_not_no_matches() {
+        let html = search_box("zz", Hits::Searching, true, None);
+        assert!(html.contains("Searching…"), "{html}");
+        assert!(html.contains(r#"role="status""#), "{html}");
+        assert!(!html.contains("No matches"), "{html}");
+        let html = render(|| {
+            rsx! {
+                PaletteView {
+                    text: "zz".to_owned(),
+                    rows: Vec::new(),
+                    active: None,
+                    failed: None,
+                    searching: true,
+                    on_input: |_| {},
+                    on_key: |_| {},
+                    on_pick: |_| {},
+                    on_close: |_| {},
+                }
+            }
+        });
+        assert!(html.contains("Searching…"), "{html}");
+        assert!(!html.contains("No matches"), "{html}");
     }
 
     #[test]

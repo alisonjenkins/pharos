@@ -2052,16 +2052,19 @@ impl Search {
     fn edit(mut self, ctx: Ctx, value: String) {
         let generation = self.find.write().edit(&value);
         self.text.set(value);
-        self.hits.set(Hits::Idle);
         let Some(generation) = generation else {
+            self.hits.set(Hits::Idle);
             return;
         };
+        // Not "no matches" until the reply says so (B826).
+        self.hits.set(Hits::Searching);
         spawn(async move {
             platform::sleep_ms(DEBOUNCE_MS).await;
             if !self.find.peek().is_current(generation) {
                 return;
             }
             let Some(api) = ctx.api.peek().clone() else {
+                self.hits.set(Hits::Idle);
                 return;
             };
             let term = self.find.peek().term().to_owned();
@@ -2225,6 +2228,7 @@ fn PaletteScreen() -> Element {
             rows: rows(),
             active: active(),
             failed,
+            searching: matches!(&*search.hits.read(), Hits::Searching),
             on_input: move |value| {
                 active.set(Some(0));
                 search.edit(ctx, value);
