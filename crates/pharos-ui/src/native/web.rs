@@ -3007,6 +3007,62 @@ extern "C" {
     fn destroy(this: &Jassub) -> js_sys::Promise;
     #[wasm_bindgen(method, getter, js_class = "JASSUB")]
     fn debug(this: &Jassub) -> JsValue;
+    #[wasm_bindgen(method, catch, js_class = "JASSUB", js_name = manualRender)]
+    fn manual_render(this: &Jassub, frame: &JsValue, force: bool) -> Result<JsValue, JsValue>;
+}
+
+/// Draws the frame a paused `video` shows with `jassub`. JASSUB draws on the
+/// video's frame callbacks, which a paused video never fires, so a renderer
+/// rebuilt while paused (a size, tier or level change) showed nothing until
+/// playback resumed.
+async fn draw_paused_frame(
+    jassub: &Jassub,
+    video: &web_sys::HtmlMediaElement,
+    live: &std::cell::Cell<bool>,
+) {
+    if !video.paused() {
+        return;
+    }
+    let size =
+        |k: &str| js_sys::Reflect::get(video, &JsValue::from_str(k)).unwrap_or(JsValue::UNDEFINED);
+    let frame = js_sys::Object::new();
+    for (k, v) in [
+        ("mediaTime", JsValue::from_f64(video.current_time())),
+        ("width", size("videoWidth")),
+        ("height", size("videoHeight")),
+    ] {
+        let _ = js_sys::Reflect::set(&frame, &JsValue::from_str(k), &v);
+    }
+    let draw = || async {
+        let p = jassub.manual_render(&frame, true)?;
+        wasm_bindgen_futures::JsFuture::from(js_sys::Promise::resolve(&p)).await
+    };
+    // The first draw sizes the canvas. JASSUB's own observer of the new canvas
+    // resizes it again in the same frames, which clears it and leaves an
+    // unforced redraw that libass answers with "unchanged", so draw once more
+    // after it has settled.
+    let drawn = match draw().await {
+        Ok(_) => {
+            animation_frame().await;
+            animation_frame().await;
+            // Dropped or playing by now: its frame callbacks own the canvas.
+            if !live.get() || !video.paused() {
+                return;
+            }
+            draw().await
+        }
+        Err(e) => Err(e),
+    };
+    match drawn {
+        Ok(_) => info(&format!(
+            "pharos: subtitle renderer=jassub paused redraw at={:.3}",
+            video.current_time()
+        )),
+        Err(e) => warn(&format!(
+            "pharos: subtitle renderer=jassub paused redraw failed error={}",
+            js_message(&e)
+        )),
+    }
 }
 
 /// An ASS/SSA script drawn over the `<video>` by libass in a worker. It
@@ -3149,6 +3205,8 @@ pub async fn styled_subtitles(
     let ready = wasm_bindgen_futures::JsFuture::from(jassub.ready());
     spawn_detached({
         let live = Rc::clone(&live);
+        let drawer: Jassub = JsValue::clone(&jassub).unchecked_into();
+        let video = video.clone();
         async move {
             let ready = std::pin::pin!(ready);
             let timeout = std::pin::pin!(sleep_ms(STYLED_READY_MS));
@@ -3160,11 +3218,15 @@ pub async fn styled_subtitles(
                 }
             };
             if live.get() {
-                if result.is_ok() {
+                let ready = result.is_ok();
+                if ready {
                     // The canvas is new: give it the lift the bar already has.
                     lift_styled_subtitles();
                 }
                 report(result);
+                if ready {
+                    draw_paused_frame(&drawer, &video, &live).await;
+                }
             }
         }
     });
