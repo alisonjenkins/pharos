@@ -96,7 +96,8 @@ fn sort_key_column(key: SortKey) -> &'static str {
 fn sort_key_nullable(key: SortKey) -> bool {
     matches!(
         key,
-        SortKey::PremiereDate
+        SortKey::DateCreated
+            | SortKey::PremiereDate
             | SortKey::ProductionYear
             | SortKey::CommunityRating
             | SortKey::CriticRating
