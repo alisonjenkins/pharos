@@ -4,6 +4,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 mod client_schema;
+mod connection_drop;
 mod guard;
 mod instrument;
 mod labels;

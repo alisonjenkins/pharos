@@ -9,6 +9,11 @@ pub const DURATION_SECONDS: &str = "pharos_rpc_duration_seconds";
 /// `pharos_rpc_cancelled_total{interface,method}`: the caller dropped the call
 /// or disconnected before it completed (HTTP's `http_client_aborted_total`).
 pub const CANCELLED_TOTAL: &str = "pharos_rpc_cancelled_total";
+/// `pharos_rpc_calls_in_flight{interface,method}`: calls whose handler future
+/// is alive, across every connection. It returns to 0 once the server goes
+/// quiet; a series that stays up after its connections closed is a handler
+/// future that was never dropped (B730), which keeps whatever it waits on.
+pub const CALLS_IN_FLIGHT: &str = "pharos_rpc_calls_in_flight";
 /// `pharos_rpc_limit_total{limit}`: a call or connection refused at a cap
 /// (FR-010). `limit` is the cap's fixed name, as the typed `Limit` carries it.
 pub const LIMIT_TOTAL: &str = "pharos_rpc_limit_total";
