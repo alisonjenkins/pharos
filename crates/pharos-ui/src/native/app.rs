@@ -36,12 +36,12 @@ use super::playback::{
     parse_volume_setting, pick_mse_engine, position_at, preview_set, restart_styled,
     rust_subtitle_url, shown_font_urls, source_of_styled, start_ms, starting_tier,
     starting_tier_line, styled_subtitle_signals, styled_subtitle_url, styled_track_url,
-    subtitle_switch, tier_drop_line, tier_drop_report, up_next_at, volume_setting, DeviceClass,
-    EffectsLevel, Engine, EngineReason, LibraryTransition, MediaEvent, MediaState, MseEngine,
-    OnFatal, OnFragment, Outgoing, OverlayEffect, PlaybackEngine, ReportClock, SubtitleSize,
-    SubtitleSwitch, Tier, TierDrop, UpNext, UpNextStep, CROSSFADE_KEY, EFFECTS_LEVEL_KEY,
-    LIBRARY_TRANSITION_KEY, MAX_BITRATE_KEY, MSE_ENGINE_KEY, OVERLAY_EFFECT_KEY, SUBTITLE_SIZE_KEY,
-    TIER_DROP_KEY, VOLUME_KEY,
+    subtitle_switch, tier_drop_line, tier_drop_report, tier_spared_line, up_next_at,
+    volume_setting, DeviceClass, EffectsLevel, Engine, EngineReason, LibraryTransition, MediaEvent,
+    MediaState, MseEngine, OnFatal, OnFragment, Outgoing, OverlayEffect, PlaybackEngine,
+    RendererFrames, ReportClock, SubtitleSize, SubtitleSwitch, Tier, TierDrop, TierVerdict, UpNext,
+    UpNextStep, CROSSFADE_KEY, EFFECTS_LEVEL_KEY, LIBRARY_TRANSITION_KEY, MAX_BITRATE_KEY,
+    MSE_ENGINE_KEY, OVERLAY_EFFECT_KEY, SUBTITLE_SIZE_KEY, TIER_DROP_KEY, VOLUME_KEY,
 };
 use super::playback_settings;
 use super::privacy;
@@ -724,17 +724,32 @@ fn current_starting_tier() -> Tier {
 /// styled track shows; one second is a fine-enough grain for a 10 s window.
 const QUALITY_SAMPLE_MS: u32 = 1_000;
 
-/// Feed the video's frame counters to `watch`; a drop is remembered for the
-/// device, logged and reported, and the new tier comes back.
+/// Feed the video's frame counters, and the renderer's own when it counts
+/// them, to `watch`; a drop is remembered for the device, logged and
+/// reported, and the new tier comes back. A window whose dropped frames were
+/// the video's own is logged and keeps the tier (B667).
 fn on_quality_sample(
     watch: &mut TierDrop,
     renderer: &str,
     now_ms: u64,
-    dropped_total: u64,
-    presented_total: u64,
+    (dropped_total, presented_total): (u64, u64),
+    renderer_frames: Option<RendererFrames>,
     counting: bool,
 ) -> Option<Tier> {
-    let drop = watch.sample(now_ms, dropped_total, presented_total, counting)?;
+    let drop = match watch.judge(
+        now_ms,
+        dropped_total,
+        presented_total,
+        renderer_frames,
+        counting,
+    ) {
+        TierVerdict::Hold => return None,
+        TierVerdict::Spared(spared) => {
+            platform::info(&tier_spared_line(&spared));
+            return None;
+        }
+        TierVerdict::Drop(drop) => drop,
+    };
     platform::info(&tier_drop_line(&drop));
     platform::report_event(tier_drop_report(renderer, &drop));
     // A failed write is already warned about; the drop holds for this load.
@@ -4196,8 +4211,12 @@ fn Player(
         move || sampling.set(sampling.get().wrapping_add(1))
     });
     use_effect({
-        let (p, tier_watch, sampling) =
-            (Rc::clone(&p), Rc::clone(&tier_watch), Rc::clone(&sampling));
+        let (p, tier_watch, sampling, styled) = (
+            Rc::clone(&p),
+            Rc::clone(&tier_watch),
+            Rc::clone(&sampling),
+            Rc::clone(&styled),
+        );
         move || {
             let run = sampling.get().wrapping_add(1);
             sampling.set(run);
@@ -4208,8 +4227,13 @@ fn Player(
             if !(generated && styled_ready()) {
                 return;
             }
-            let (tier_watch, sampling) = (Rc::clone(&tier_watch), Rc::clone(&sampling));
+            let (tier_watch, sampling, styled) = (
+                Rc::clone(&tier_watch),
+                Rc::clone(&sampling),
+                Rc::clone(&styled),
+            );
             spawn(async move {
+                let mut warned_uncounted = false;
                 while sampling.get() == run {
                     platform::sleep_ms(QUALITY_SAMPLE_MS).await;
                     if sampling.get() != run {
@@ -4222,12 +4246,24 @@ fn Player(
                         let m = media.peek();
                         !m.paused && !m.loading
                     };
+                    let (live, frames) = styled
+                        .borrow()
+                        .as_ref()
+                        .map_or((false, None), |s| (true, s.frames()));
+                    if live && frames.is_none() && !warned_uncounted {
+                        // Without the counters every video drop is charged to
+                        // the effects again (B667), so say so once.
+                        warned_uncounted = true;
+                        platform::warn(
+                            "pharos: subtitle renderer frames uncounted renderer=jassub",
+                        );
+                    }
                     let lower = on_quality_sample(
                         &mut tier_watch.borrow_mut(),
                         "jassub",
                         now_ms_u64(),
-                        dropped,
-                        presented,
+                        (dropped, presented),
+                        frames,
                         counting,
                     );
                     if let Some(lower) = lower {
@@ -5296,7 +5332,14 @@ mod tests {
         let mut watch = TierDrop::new(Tier::Desktop);
         let drops: Vec<Tier> = (0..=25u64)
             .filter_map(|sec| {
-                on_quality_sample(&mut watch, "jassub", sec * 1000, sec * 30, sec * 60, true)
+                on_quality_sample(
+                    &mut watch,
+                    "jassub",
+                    sec * 1000,
+                    (sec * 30, sec * 60),
+                    None,
+                    true,
+                )
             })
             .collect();
         assert_eq!(drops, [Tier::Tv]);
@@ -5308,7 +5351,14 @@ mod tests {
         let mut watch = TierDrop::new(Tier::Desktop);
         for sec in 0..=60u64 {
             assert_eq!(
-                on_quality_sample(&mut watch, "jassub", sec * 1000, sec * 30, sec * 60, false),
+                on_quality_sample(
+                    &mut watch,
+                    "jassub",
+                    sec * 1000,
+                    (sec * 30, sec * 60),
+                    None,
+                    false
+                ),
                 None
             );
         }
