@@ -3641,12 +3641,7 @@ impl PlaybackEngine for HlsJs {
     ) -> Result<(), String> {
         let video = video_element(video_id).ok_or_else(|| format!("no <video id={video_id}>"))?;
         let config = js_sys::Object::new();
-        #[allow(clippy::cast_precision_loss)]
-        let start = if start_ms > 0 {
-            start_ms as f64 / 1000.0
-        } else {
-            -1.0
-        };
+        let start = super::playback::hls_start_position(start_ms);
         js_sys::Reflect::set(&config, &"startPosition".into(), &start.into())
             .map_err(|e| format!("{e:?}"))?;
         let player = HlsPlayer::new(&config);
