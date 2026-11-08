@@ -695,7 +695,7 @@ const NARROW_SCREEN: &str = "(max-width: 600px)";
 
 /// What kind of screen this page runs on: a TV gets the ten-foot layout
 /// and starts styled subtitles at the TV tier.
-fn this_device() -> DeviceClass {
+pub(crate) fn this_device() -> DeviceClass {
     device_class(
         &platform::user_agent(),
         platform::prefers("(pointer: coarse)"),

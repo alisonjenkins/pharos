@@ -9,6 +9,7 @@ use pharos_client::api::{ClientEvent, ClientEventKind, ClientLevel};
 use pharos_hls::abr::{Abr, AbrConfig, Estimator, EstimatorConfig, Inputs, Rung};
 use pharos_hls::planner::{Action, Buffered, Config, Planner, Request as SegRequest, Track};
 use pharos_hls::playlist::{parse_master, parse_media, Master, MediaPlaylist, Segment};
+use pharos_hls::retry::{Cause, Deadlines, Retries, RetryPolicy, Watch};
 use pharos_hls::timeline::same_grid;
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::{JsCast as _, JsValue};
@@ -19,14 +20,10 @@ use super::platform::{
 };
 use super::playback::{
     abr_ladder, check_master, forward_buffer_ms, pick_audio_uri, plan_hls, ranges_to_ms,
-    rung_label, with_abr, AbrSwitchReport, FragmentLoad, HlsFallbackCause, OnFatal, OnFragment,
-    PlaybackEngine,
+    rung_label, segment_deadlines, with_abr, AbrSwitchReport, FragmentLoad, HlsFallbackCause,
+    OnFatal, OnFragment, PlaybackEngine, SegmentFailureReport, SegmentRecovery,
 };
 
-const MAX_CONSECUTIVE_FAILURES: u32 = 3;
-/// A failed segment is retried after this times its attempt count, so a server
-/// briefly out of encoders is not three failures in a few milliseconds.
-const RETRY_BASE_MS: u32 = 1_000;
 /// The cold-encode time is the slowest time-to-first-byte over this many recent
 /// video segments: a segment the server encodes on demand answers late, a
 /// cached one at once, and an up-switch has to survive the late kind.
@@ -85,14 +82,19 @@ struct TrackRunner {
     generation: u64,
     queue: VecDeque<Op>,
     running: Option<RunningOp>,
-    failures: Option<(SegRequest, u32)>,
+    retries: Retries<SegRequest>,
     /// `updateend`s still to come from `SourceBuffer.abort()`, which belong to no queued op.
     aborted_updateends: u32,
     listeners: Vec<(&'static str, EventListener)>,
 }
 
 impl TrackRunner {
-    fn new(init_uri: String, segments: Vec<Segment>, source_buffer: web_sys::SourceBuffer) -> Self {
+    fn new(
+        init_uri: String,
+        segments: Vec<Segment>,
+        source_buffer: web_sys::SourceBuffer,
+        policy: RetryPolicy,
+    ) -> Self {
         Self {
             init_uri,
             segments,
@@ -101,7 +103,7 @@ impl TrackRunner {
             generation: 0,
             queue: VecDeque::new(),
             running: None,
-            failures: None,
+            retries: Retries::new(policy),
             aborted_updateends: 0,
             listeners: Vec::new(),
         }
@@ -118,6 +120,8 @@ struct Session {
     on_source_open: Option<EventListener>,
     video_listeners: Vec<(&'static str, EventListener)>,
     planner: Option<Planner>,
+    deadlines: Deadlines,
+    device: &'static str,
     abr: Option<AbrState>,
     video_track: Option<TrackRunner>,
     audio_track: Option<TrackRunner>,
@@ -157,6 +161,8 @@ impl PlaybackEngine for RustHls {
         let object_url = web_sys::Url::create_object_url_with_source(&media_source)
             .map_err(|e| format!("createObjectURL: {e:?}"))?;
 
+        let device = super::app::this_device();
+        let deadlines = segment_deadlines(device);
         let session = Rc::new(RefCell::new(Session {
             video_id: video_id.to_owned(),
             url: url.to_owned(),
@@ -167,6 +173,8 @@ impl PlaybackEngine for RustHls {
             on_source_open: None,
             video_listeners: Vec::new(),
             planner: None,
+            deadlines,
+            device: device.label(),
             abr: None,
             video_track: None,
             audio_track: None,
@@ -384,9 +392,16 @@ async fn load(weak: Weak<RefCell<Session>>) {
     let Some(session) = weak.upgrade() else {
         return;
     };
-    let Some((video, media_source)) = ({
+    let Some((video, media_source, deadlines, device)) = ({
         let s = session.borrow();
-        (!s.dead).then(|| (s.video.clone(), s.media_source.clone()))
+        (!s.dead).then(|| {
+            (
+                s.video.clone(),
+                s.media_source.clone(),
+                s.deadlines,
+                s.device,
+            )
+        })
     }) else {
         return;
     };
@@ -423,16 +438,18 @@ async fn load(weak: Weak<RefCell<Session>>) {
         None => None,
     };
 
+    let policy = RetryPolicy::with_deadlines(deadlines);
     let audio_runner = match (audio_sb, audio_pl.as_ref(), audio_init.flatten()) {
         (Some(sb), Some(apl), Some(init_uri)) => {
-            let mut runner = TrackRunner::new(init_uri, apl.segments.clone(), sb);
+            let mut runner = TrackRunner::new(init_uri, apl.segments.clone(), sb, policy);
             wire_source_buffer(&weak, Track::Audio, &mut runner);
             Some(runner)
         }
         _ => None,
     };
 
-    let mut video_runner = TrackRunner::new(video_init_uri, video_pl.segments.clone(), video_sb);
+    let mut video_runner =
+        TrackRunner::new(video_init_uri, video_pl.segments.clone(), video_sb, policy);
     wire_source_buffer(&weak, Track::Video, &mut video_runner);
 
     let seg_count = video_pl.segments.len();
@@ -473,8 +490,8 @@ async fn load(weak: Weak<RefCell<Session>>) {
 
     let audio_label = plan.audio_mime.as_deref().unwrap_or("none");
     info(&format!(
-        "pharos: playback engine=rust start video={} audio={audio_label} segments={seg_count} url={url}",
-        plan.video_mime,
+        "pharos: playback engine=rust start video={} audio={audio_label} segments={seg_count} device={device} first_byte_ms={} load_ms={} url={url}",
+        plan.video_mime, deadlines.first_byte_ms, deadlines.load_ms,
     ));
 
     pump(&session);
@@ -964,7 +981,7 @@ fn start_fetch(session: &Rc<RefCell<Session>>, track: Track, request: SegRequest
     };
     let signal = controller.signal();
 
-    let (uri, media_ms, generation, old_controller) = {
+    let (uri, media_ms, generation, old_controller, deadlines) = {
         let mut s = session.borrow_mut();
         if s.dead {
             return;
@@ -984,7 +1001,7 @@ fn start_fetch(session: &Rc<RefCell<Session>>, track: Track, request: SegRequest
         t.generation = t.generation.saturating_add(1);
         let gen = t.generation;
         let old = t.controller.replace(controller);
-        (uri, media_ms, gen, old)
+        (uri, media_ms, gen, old, s.deadlines)
     };
 
     if let Some(old) = old_controller {
@@ -993,8 +1010,7 @@ fn start_fetch(session: &Rc<RefCell<Session>>, track: Track, request: SegRequest
 
     let weak = Rc::downgrade(session);
     wasm_bindgen_futures::spawn_local(async move {
-        let sent_at = now_ms();
-        let outcome = fetch_segment(&uri, &signal, sent_at).await;
+        let outcome = fetch_segment(&uri, &signal, deadlines).await;
         if signal.aborted() {
             return;
         }
@@ -1015,7 +1031,7 @@ fn start_fetch(session: &Rc<RefCell<Session>>, track: Track, request: SegRequest
                         return;
                     }
                     t.controller = None;
-                    t.failures = None;
+                    t.retries.on_success();
                     t.queue.push_back(Op::Append {
                         bytes,
                         request,
@@ -1029,28 +1045,77 @@ fn start_fetch(session: &Rc<RefCell<Session>>, track: Track, request: SegRequest
                     run_queue(&session, track);
                 }
             }
-            Err((status, reason)) => {
-                on_fetch_failed(&session, track, request, generation, &uri, status, &reason);
+            Err(failure) => {
+                on_fetch_failed(&session, track, request, generation, &uri, failure);
             }
         }
     });
 }
 
+/// Why a segment request failed, and the deadline that passed for a timeout.
+struct FetchFailure {
+    cause: Cause,
+    deadline_ms: Option<u64>,
+    reason: String,
+}
+
+impl FetchFailure {
+    fn timeout(watch: &Watch) -> Self {
+        let (cause, _) = watch.due();
+        Self {
+            cause,
+            deadline_ms: Some(watch.deadline_ms()),
+            reason: "deadline passed".to_owned(),
+        }
+    }
+}
+
+/// `fut`'s output, or `None` once `ms` pass first.
+async fn within<F: std::future::Future>(fut: F, ms: u64) -> Option<F::Output> {
+    let timer = sleep_ms(u32::try_from(ms).unwrap_or(u32::MAX));
+    futures_util::pin_mut!(fut);
+    futures_util::pin_mut!(timer);
+    match futures_util::future::select(fut, timer).await {
+        futures_util::future::Either::Left((out, _)) => Some(out),
+        futures_util::future::Either::Right(_) => None,
+    }
+}
+
+/// Fetches one segment against `deadlines` (FR-005): the headers must arrive
+/// within the first-byte deadline, the body within the load deadline after.
 async fn fetch_segment(
     uri: &str,
     signal: &web_sys::AbortSignal,
-    sent_at: f64,
-) -> Result<(Vec<u8>, u64, u64), (Option<u16>, String)> {
-    let resp = Request::get(uri)
-        .abort_signal(Some(signal))
-        .send()
+    deadlines: Deadlines,
+) -> Result<(Vec<u8>, u64, u64), FetchFailure> {
+    let sent_at = now_ms();
+    let mut watch = Watch::new(deadlines, now_ms_u64());
+    let send = Request::get(uri).abort_signal(Some(signal)).send();
+    let resp = within(send, watch.remaining_ms(now_ms_u64()))
         .await
-        .map_err(|e| (None, e.to_string()))?;
+        .ok_or_else(|| FetchFailure::timeout(&watch))?
+        .map_err(|e| FetchFailure {
+            cause: Cause::Network,
+            deadline_ms: None,
+            reason: e.to_string(),
+        })?;
     let headers_at = now_ms();
+    watch.headers(now_ms_u64());
     if !resp.ok() {
-        return Err((Some(resp.status()), resp.status_text()));
+        return Err(FetchFailure {
+            cause: Cause::Http(resp.status()),
+            deadline_ms: None,
+            reason: resp.status_text(),
+        });
     }
-    let bytes = resp.binary().await.map_err(|e| (None, e.to_string()))?;
+    let bytes = within(resp.binary(), watch.remaining_ms(now_ms_u64()))
+        .await
+        .ok_or_else(|| FetchFailure::timeout(&watch))?
+        .map_err(|e| FetchFailure {
+            cause: Cause::Network,
+            deadline_ms: None,
+            reason: e.to_string(),
+        })?;
     let done_at = now_ms();
     let start = if headers_at > 0.0 {
         headers_at
@@ -1064,97 +1129,159 @@ async fn fetch_segment(
     Ok((bytes, load_ms, ttfb_ms))
 }
 
+/// A video segment that missed its load deadline moves one rung down and is
+/// fetched again at once, so a slow link steps down instead of timing out on
+/// every retry. The switch it took, when it moved.
+fn step_down_rung(
+    s: &mut Session,
+    track: Track,
+    cause: Cause,
+    buffer_ms: u64,
+) -> Option<AbrSwitchReport> {
+    if track != Track::Video || cause != Cause::TimeoutLoad {
+        return None;
+    }
+    let (Some(st), Some(t), Some(planner)) =
+        (s.abr.as_mut(), s.video_track.as_mut(), s.planner.as_mut())
+    else {
+        return None;
+    };
+    let current = st.abr.current()?;
+    let from = st.renditions.get(current)?;
+    let to = st.renditions.get(current.checked_sub(1)?)?;
+    // The request is over; the planner must not hold it in flight, or reinit refuses.
+    planner.failed(track);
+    if !planner.reinit(track) {
+        return None;
+    }
+    let switch = st.abr.step_down(now_ms_u64())?;
+    t.init_uri = to.init_uri.clone();
+    t.segments = to.segments.clone();
+    Some(AbrSwitchReport {
+        from: from.entry_label.clone(),
+        to: to.entry_label.clone(),
+        reason: switch.reason.label(),
+        estimate_bps: st.estimator.estimate_bps(),
+        buffer_ms,
+        cold_ms: st.ttfbs.iter().copied().max().unwrap_or(0),
+        applied: true,
+    })
+}
+
+fn current_rung(s: &Session, track: Track) -> String {
+    if track != Track::Video {
+        return "none".to_owned();
+    }
+    s.abr
+        .as_ref()
+        .and_then(|st| st.abr.current().and_then(|i| st.renditions.get(i)))
+        .map_or_else(|| "none".to_owned(), |r| r.entry_label.clone())
+}
+
 fn on_fetch_failed(
     session: &Rc<RefCell<Session>>,
     track: Track,
     request: SegRequest,
     generation: u64,
     uri: &str,
-    status: Option<u16>,
-    reason: &str,
+    failure: FetchFailure,
 ) {
-    let idx_label = match request {
+    let index = match request {
         SegRequest::Init => "init".to_owned(),
         SegRequest::Media(i) => i.to_string(),
     };
-    let status_label = status.map_or_else(|| "none".to_owned(), |s| s.to_string());
 
-    let (count, on_fatal) = {
-        let mut s = session.borrow_mut();
+    let buffer_ms = if track == Track::Video && failure.cause == Cause::TimeoutLoad {
+        snapshot_state(session).map_or(0, |(play_ms, buffered)| {
+            forward_buffer_ms(&buffered.video, play_ms)
+        })
+    } else {
+        0
+    };
+    let (report, stepped, on_fatal) = {
+        let mut guard = session.borrow_mut();
+        let s = &mut *guard;
         if s.dead {
             return;
         }
         let on_fatal = Rc::clone(&s.on_fatal);
+        let rung = current_rung(s, track);
         let Some(t) = s.track_mut(track) else {
             return;
         };
         if t.generation != generation {
             return;
         }
-        t.controller = None;
-        let next_count = match t.failures {
-            Some((prev, n)) if prev == request => n.saturating_add(1),
-            _ => 1,
-        };
-        t.failures = Some((request, next_count));
-        if next_count >= MAX_CONSECUTIVE_FAILURES {
-            s.dead = true;
+        // A timeout leaves the request running; aborting it frees the connection.
+        if let Some(ctrl) = t.controller.take() {
+            ctrl.abort();
         }
-        (next_count, on_fatal)
-    };
-
-    warn(&format!(
-        "pharos: playback error engine=rust type=network track={} index={idx_label} status={status_label} reason={reason} url={uri}",
-        track.label(),
-    ));
-    let fatal = count >= MAX_CONSECUTIVE_FAILURES;
-    report_event(ClientEvent {
-        kind: ClientEventKind::PlaybackError,
-        level: if fatal {
-            ClientLevel::Error
+        let stepped = step_down_rung(s, track, failure.cause, buffer_ms);
+        let recovery = if stepped.is_some() {
+            SegmentRecovery::StepDown
         } else {
-            ClientLevel::Warn
-        },
-        route: current_path(),
-        fields: vec![
-            ("engine", "rust".to_owned()),
-            ("type", "network".to_owned()),
-            ("track", track.label().to_owned()),
-            ("index", idx_label.clone()),
-            ("status", status_label),
-            ("reason", reason.to_owned()),
-            ("action", if fatal { "fail" } else { "retry" }.to_owned()),
-            ("attempt", count.to_string()),
-        ],
-    });
-
-    if fatal {
-        on_fatal(format!(
-            "the stream failed ({} segment {idx_label}: {reason})",
-            track.label()
-        ));
-    } else {
-        let weak = Rc::downgrade(session);
-        wasm_bindgen_futures::spawn_local(async move {
-            sleep_ms(RETRY_BASE_MS.saturating_mul(count)).await;
-            let Some(session) = weak.upgrade() else {
+            let Some(t) = s.track_mut(track) else {
                 return;
             };
-            // The planner keeps the request in flight through the backoff, so ticks meanwhile do not refetch it.
-            {
-                let mut s = session.borrow_mut();
-                if s.dead
-                    || s.track_mut(track)
-                        .map_or(true, |t| t.generation != generation)
-                {
+            SegmentRecovery::from(t.retries.on_failure(request, failure.cause))
+        };
+        let report = SegmentFailureReport {
+            track: track.label(),
+            index,
+            cause: failure.cause,
+            deadline_ms: failure.deadline_ms,
+            recovery,
+            rung,
+            reason: failure.reason,
+            url: uri.to_owned(),
+        };
+        if report.fatal() {
+            s.dead = true;
+        }
+        (report, stepped, on_fatal)
+    };
+
+    warn(&report.line());
+    report_event(report.event(current_path()));
+
+    if let Some(switch) = stepped {
+        info(&switch.line());
+        report_event(switch.event(current_path()));
+        pump(session);
+        return;
+    }
+    match report.recovery {
+        SegmentRecovery::Fail { .. } => on_fatal(format!(
+            "the stream failed ({} segment {}: {} {})",
+            report.track,
+            report.index,
+            report.cause.label(),
+            report.reason
+        )),
+        SegmentRecovery::Retry { after_ms, .. } => {
+            let weak = Rc::downgrade(session);
+            wasm_bindgen_futures::spawn_local(async move {
+                sleep_ms(u32::try_from(after_ms).unwrap_or(u32::MAX)).await;
+                let Some(session) = weak.upgrade() else {
                     return;
+                };
+                // The planner keeps the request in flight through the backoff, so ticks meanwhile do not refetch it.
+                {
+                    let mut s = session.borrow_mut();
+                    if s.dead
+                        || s.track_mut(track)
+                            .map_or(true, |t| t.generation != generation)
+                    {
+                        return;
+                    }
+                    if let Some(planner) = s.planner.as_mut() {
+                        planner.failed(track);
+                    }
                 }
-                if let Some(planner) = s.planner.as_mut() {
-                    planner.failed(track);
-                }
-            }
-            pump(&session);
-        });
+                pump(&session);
+            });
+        }
+        SegmentRecovery::StepDown => {}
     }
 }
 
