@@ -23,8 +23,8 @@ use tracing::{Instrument, Span};
 use web_time::Instant;
 
 use crate::labels::{
-    client_schema_label, MethodMeta, Outcome, CALLS_TOTAL, CANCELLED_TOTAL, CLIENT_SCHEMA_TOTAL,
-    DURATION_SECONDS, LIMIT_TOTAL,
+    client_schema_label, MethodMeta, Outcome, CALLS_IN_FLIGHT, CALLS_TOTAL, CANCELLED_TOTAL,
+    CLIENT_SCHEMA_TOTAL, DURATION_SECONDS, LIMIT_TOTAL,
 };
 use crate::redact;
 
@@ -185,6 +185,8 @@ impl CallScope {
                 (log.payload)(&record, "request", &redact::render(p));
             }
         }
+        metrics::gauge!(CALLS_IN_FLIGHT, "interface" => meta.interface, "method" => meta.method)
+            .increment(1.0);
         let in_flight = Rc::clone(&conn.in_flight);
         let running = in_flight.get();
         in_flight.set(running.saturating_add(1));
@@ -269,6 +271,8 @@ impl CallScope {
 impl Drop for CallScope {
     fn drop(&mut self) {
         self.in_flight.set(self.in_flight.get().saturating_sub(1));
+        metrics::gauge!(CALLS_IN_FLIGHT, "interface" => self.meta.interface, "method" => self.meta.method)
+            .decrement(1.0);
         if self.finished {
             return;
         }
@@ -300,6 +304,8 @@ pub fn register_metrics() {
             }
             metrics::counter!(CANCELLED_TOTAL, "interface" => m.interface, "method" => m.method)
                 .absolute(0);
+            metrics::gauge!(CALLS_IN_FLIGHT, "interface" => m.interface, "method" => m.method)
+                .set(0.0);
         }
     }
 }

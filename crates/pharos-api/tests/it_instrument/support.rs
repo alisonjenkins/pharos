@@ -65,6 +65,13 @@ impl Observed {
         }
     }
 
+    pub fn gauge(&self, name: &str, labels: &[(&str, &str)]) -> Option<f64> {
+        match self.find(name, labels)? {
+            DebugValue::Gauge(g) => Some(g.into_inner()),
+            _ => None,
+        }
+    }
+
     pub fn histogram_samples(&self, name: &str, labels: &[(&str, &str)]) -> usize {
         match self.find(name, labels) {
             Some(DebugValue::Histogram(h)) => h.len(),
