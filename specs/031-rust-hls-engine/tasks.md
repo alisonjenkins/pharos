@@ -36,7 +36,8 @@ Notes from slice 2 (2026-11-08T00:40:00Z): with #949's `PHAROS_FIREFOX_LIBAV` on
 
 ## Slice 4 - Adapt (V644-V649)
 
-- [ ] T031-19 Server: `abr=1` on the browser master lists the H.264 fMP4 ladder (`h264cmaf/{rung}/main.m3u8`, per-rung init and segments, encoder caps from `Variant`), all rungs on `SegmentGrid` and bound to the one audio group; without `abr=1` the master is byte-identical to today. Segment metrics carry the rung (V644).
+- [x] T031-19 Server: `abr=1` on the browser master lists the H.264 fMP4 ladder (`h264cmaf/{rung}/main.m3u8`, per-rung init and segments, encoder caps from `Variant`), all rungs on `SegmentGrid` and bound to the one audio group; without `abr=1` the master is byte-identical to today. Segment metrics carry the rung (V644).
+  - Rungs cap the bitrate only and keep the source resolution, as the mpegts ladder does (`RESOLUTION` is advertised scaled). Cold-start prewarm still warms only the source rung.
 - [ ] T031-20 `pharos-hls` bandwidth estimator: fast and slow EWMAs over first-to-last-byte samples, minimum-sample guard.
 - [ ] T031-21 `pharos-hls` ABR rule: ceiling, buffer-aware down-switch, cold-encode-aware up-switch, up-switch interval (V645-V647, property tests with a fake clock).
 - [ ] T031-22 Adapter: rung switch on the video `SourceBuffer` (init then segment, `changeType` when codecs differ), the engine asks for `abr=1`, UI auto quality off while the engine adapts, Settings ceiling passed in live (V648).
