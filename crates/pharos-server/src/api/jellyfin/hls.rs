@@ -103,6 +103,20 @@ pub fn register(cfg: &mut web::ServiceConfig) {
             "/videos/{id}/h264cmaf/{seg}.m4s",
             web::get().to(h264cmaf_segment),
         )
+        // The `abr=1` ladder's lower rungs (V644): same grid, same audio group,
+        // only the encoder's bitrate cap differs.
+        .route(
+            "/videos/{id}/h264cmaf/{rung}/main.m3u8",
+            web::get().to(h264cmaf_rung_variant),
+        )
+        .route(
+            "/videos/{id}/h264cmaf/{rung}/init.mp4",
+            web::get().to(h264cmaf_rung_init),
+        )
+        .route(
+            "/videos/{id}/h264cmaf/{rung}/{seg}.m4s",
+            web::get().to(h264cmaf_rung_segment),
+        )
         // `DELETE /Videos/ActiveEncodings` — jellyfin-web calls
         // `apiClient.stopActiveEncodings(playSessionId)` as the FIRST step of a
         // mid-playback audio/subtitle/quality switch (its `changeStream` tears
@@ -259,6 +273,34 @@ impl Variant {
             v.push(Self::P360);
         }
         v
+    }
+    /// `surface` label for this rung's fMP4 media segments.
+    const fn cmaf_surface(self) -> &'static str {
+        match self {
+            Self::P1080 => "h264cmaf-1080p",
+            Self::P720 => "h264cmaf-720p",
+            Self::P480 => "h264cmaf-480p",
+            Self::P360 => "h264cmaf-360p",
+        }
+    }
+    /// This rung's init sentinel for the refetch tracker.
+    const fn cmaf_init_seg(self) -> u32 {
+        use crate::session_start as ss;
+        match self {
+            Self::P1080 => ss::INIT_SEG_H264CMAF_1080P,
+            Self::P720 => ss::INIT_SEG_H264CMAF_720P,
+            Self::P480 => ss::INIT_SEG_H264CMAF_480P,
+            Self::P360 => ss::INIT_SEG_H264CMAF_360P,
+        }
+    }
+    /// `surface` label for this rung's fMP4 init.
+    const fn cmaf_init_surface(self) -> &'static str {
+        match self {
+            Self::P1080 => "h264cmaf-1080p-init",
+            Self::P720 => "h264cmaf-720p-init",
+            Self::P480 => "h264cmaf-480p-init",
+            Self::P360 => "h264cmaf-360p-init",
+        }
     }
 }
 
@@ -2508,16 +2550,60 @@ async fn h264cmaf_variant(
     req: HttpRequest,
     path: web::Path<String>,
 ) -> Result<HttpResponse, actix_web::Error> {
-    let id = path.into_inner();
+    h264cmaf_variant_for(state, user, req, path.into_inner(), None).await
+}
+
+/// `GET /videos/{id}/h264cmaf/{rung}/main.m3u8` — one `abr=1` ladder rung.
+async fn h264cmaf_rung_variant(
+    state: web::Data<AppState>,
+    user: MediaUser,
+    req: HttpRequest,
+    path: web::Path<(String, String)>,
+) -> Result<HttpResponse, actix_web::Error> {
+    let (id, rung) = path.into_inner();
+    let rung = cmaf_rung(&rung)?;
+    h264cmaf_variant_for(state, user, req, id, Some(rung)).await
+}
+
+/// A ladder rung named in a path, or 404.
+fn cmaf_rung(name: &str) -> Result<Variant, actix_web::Error> {
+    Variant::from_name(name).ok_or_else(|| error::ErrorNotFound("unknown rung"))
+}
+
+/// The URL prefix a rung's playlist, init and segments live under.
+fn cmaf_base(id: &str, rung: Option<Variant>) -> String {
+    match rung {
+        Some(v) => format!("/videos/{id}/h264cmaf/{}", v.name()),
+        None => format!("/videos/{id}/h264cmaf"),
+    }
+}
+
+/// Cap a rung's encode at its ladder bitrate. Only ever lowers what the
+/// session and the URL ceiling already allow, so a rung never outruns them.
+fn cmaf_rung_bitrate(current: Option<u64>, rung: Option<Variant>) -> Option<u64> {
+    match rung {
+        Some(v) => current.map(|b| b.min(v.video_bitrate_bps())),
+        None => current,
+    }
+}
+
+async fn h264cmaf_variant_for(
+    state: web::Data<AppState>,
+    user: MediaUser,
+    req: HttpRequest,
+    id: String,
+    rung: Option<Variant>,
+) -> Result<HttpResponse, actix_web::Error> {
     let item = load_hls_item(&state, &req, &user.0, &id).await?;
     let qs = rendition_qs(&req, &item.path, item.edition.as_deref());
+    let base = cmaf_base(&id, rung);
     let body = MediaPlaylist {
         version: 7,
         independent_segments: true,
         cache_epoch: cache_epoch_for(&state, item.media_id),
-        init_uri: Some(format!("/videos/{id}/h264cmaf/init.mp4?{qs}")),
+        init_uri: Some(format!("{base}/init.mp4?{qs}")),
         start_offset_secs: resume_offset_secs(&req),
-        segment_uri: &|seg| format!("/videos/{id}/h264cmaf/{seg}.m4s?{qs}"),
+        segment_uri: &|seg| format!("{base}/{seg}.m4s?{qs}"),
     }
     .render(item.duration_seconds, item.frame_rate_mille);
     Ok(HttpResponse::Ok()
@@ -2534,7 +2620,31 @@ async fn h264cmaf_init(
     path: web::Path<String>,
     q: CiQuery<SegmentQuery>,
 ) -> Result<HttpResponse, actix_web::Error> {
-    let id_num: u64 = pharos_jellyfin_api::dto::parse_item_id(&path.into_inner())
+    h264cmaf_init_for(state, user, req, path.into_inner(), None, q).await
+}
+
+/// `GET /videos/{id}/h264cmaf/{rung}/init.mp4` — one ladder rung's init.
+async fn h264cmaf_rung_init(
+    state: web::Data<AppState>,
+    user: MediaUser,
+    req: HttpRequest,
+    path: web::Path<(String, String)>,
+    q: CiQuery<SegmentQuery>,
+) -> Result<HttpResponse, actix_web::Error> {
+    let (id, rung) = path.into_inner();
+    let rung = cmaf_rung(&rung)?;
+    h264cmaf_init_for(state, user, req, id, Some(rung), q).await
+}
+
+async fn h264cmaf_init_for(
+    state: web::Data<AppState>,
+    user: MediaUser,
+    req: HttpRequest,
+    id: String,
+    rung: Option<Variant>,
+    q: CiQuery<SegmentQuery>,
+) -> Result<HttpResponse, actix_web::Error> {
+    let id_num: u64 = pharos_jellyfin_api::dto::parse_item_id(&id)
         .ok_or_else(|| error::ErrorBadRequest("invalid id"))?;
     let item = fetch_req_item(&state, &req, &user.0, id_num).await?;
     check_session(&state, q.play_session_id.as_deref()).await?;
@@ -2542,8 +2652,11 @@ async fn h264cmaf_init(
         &state.segment_refetches,
         q.play_session_id.as_deref(),
         id_num,
-        crate::session_start::INIT_SEG_H264CMAF,
-        "h264cmaf-init",
+        rung.map_or(
+            crate::session_start::INIT_SEG_H264CMAF,
+            Variant::cmaf_init_seg,
+        ),
+        rung.map_or("h264cmaf-init", Variant::cmaf_init_surface),
     );
     let mut opts = fmp4_segment_opts(
         &state,
@@ -2555,6 +2668,7 @@ async fn h264cmaf_init(
         q.subtitle_stream_index,
     )
     .await;
+    opts.video_bitrate_bps = cmaf_rung_bitrate(opts.video_bitrate_bps, rung);
     {
         let (start_secs, dur_secs) = segment_time_range(0, item.probe.frame_rate_mille);
         gate_image_sub_burn(&state, &item, &mut opts, start_secs, dur_secs).await;
@@ -2585,11 +2699,37 @@ async fn h264cmaf_segment(
     q: CiQuery<SegmentQuery>,
 ) -> Result<HttpResponse, actix_web::Error> {
     let (id, seg) = path.into_inner();
+    h264cmaf_segment_for(state, user, req, id, None, seg, q).await
+}
+
+/// `GET /videos/{id}/h264cmaf/{rung}/{seg}.m4s` — one ladder rung's segment.
+async fn h264cmaf_rung_segment(
+    state: web::Data<AppState>,
+    user: MediaUser,
+    req: HttpRequest,
+    path: web::Path<(String, String, u32)>,
+    q: CiQuery<SegmentQuery>,
+) -> Result<HttpResponse, actix_web::Error> {
+    let (id, rung, seg) = path.into_inner();
+    let rung = cmaf_rung(&rung)?;
+    h264cmaf_segment_for(state, user, req, id, Some(rung), seg, q).await
+}
+
+async fn h264cmaf_segment_for(
+    state: web::Data<AppState>,
+    user: MediaUser,
+    req: HttpRequest,
+    id: String,
+    rung: Option<Variant>,
+    seg: u32,
+    q: CiQuery<SegmentQuery>,
+) -> Result<HttpResponse, actix_web::Error> {
     let id_num: u64 = pharos_jellyfin_api::dto::parse_item_id(&id)
         .ok_or_else(|| error::ErrorBadRequest("invalid id"))?;
     state.note_playback_activity();
     let item = fetch_req_item(&state, &req, &user.0, id_num).await?;
     check_session(&state, q.play_session_id.as_deref()).await?;
+    let surface = rung.map_or("h264cmaf", Variant::cmaf_surface);
     let mut total_segs = None;
     if let Some(dur_ms) = item.probe.duration_ms {
         let grid =
@@ -2606,14 +2746,14 @@ async fn h264cmaf_segment(
         seg,
         total_segs,
         segment_time_range(seg, item.probe.frame_rate_mille).0,
-        "h264cmaf",
+        surface,
     );
     crate::session_start::note_segment_serve(
         &state.segment_refetches,
         q.play_session_id.as_deref(),
         id_num,
         seg,
-        "h264cmaf",
+        surface,
     );
 
     let mut opts = fmp4_segment_opts(
@@ -2626,6 +2766,7 @@ async fn h264cmaf_segment(
         q.subtitle_stream_index,
     )
     .await;
+    opts.video_bitrate_bps = cmaf_rung_bitrate(opts.video_bitrate_bps, rung);
     let wanted_burn = opts.burn_subtitle_stream_index;
     {
         let (start_secs, dur_secs) = segment_time_range(seg, item.probe.frame_rate_mille);
@@ -4329,6 +4470,101 @@ mod tests {
         );
         assert!(s.contains("/videos/9/h264cmaf/0.m4s"), "fMP4 segments: {s}");
         assert!(!s.contains(".ts"), "video-only fMP4, no mpegts: {s}");
+    }
+
+    // V644 — a rung's playlist sits on the same segment grid as the source
+    // rung, with its own init and segments under the rung's path.
+    #[actix_web::test]
+    async fn cmaf_rung_playlist_shares_the_source_grid() {
+        let probe = pharos_core::MediaProbe {
+            duration_ms: Some(18_000),
+            width: Some(1920),
+            height: Some(1080),
+            bitrate_bps: Some(8_000_000),
+            ..Default::default()
+        };
+        let (state, token) = seed_with_probe(probe).await;
+        let app = test::init_service(App::new().app_data(state).configure(register)).await;
+        let get = |uri: String| test::TestRequest::get().uri(&uri).to_request();
+        let main = test::call_and_read_body(
+            &app,
+            get(format!("/videos/9/h264cmaf/main.m3u8?api_key={token}")),
+        )
+        .await;
+        let rung = test::call_and_read_body(
+            &app,
+            get(format!("/videos/9/h264cmaf/720p/main.m3u8?api_key={token}")),
+        )
+        .await;
+        let main = std::str::from_utf8(&main).unwrap();
+        let rung = std::str::from_utf8(&rung).unwrap();
+        assert!(
+            rung.contains("#EXT-X-MAP:URI=\"/videos/9/h264cmaf/720p/init.mp4"),
+            "{rung}"
+        );
+        assert!(rung.contains("/videos/9/h264cmaf/720p/0.m4s"), "{rung}");
+        let extinf = |p: &str| -> Vec<String> {
+            p.lines()
+                .filter(|l| l.starts_with("#EXTINF"))
+                .map(str::to_owned)
+                .collect()
+        };
+        assert!(!extinf(main).is_empty(), "{main}");
+        assert_eq!(extinf(rung), extinf(main), "rung grid drifted");
+        assert_eq!(
+            rung.replace("/h264cmaf/720p/", "/h264cmaf/"),
+            main,
+            "a rung playlist differs only in its paths"
+        );
+    }
+
+    #[actix_web::test]
+    async fn unknown_cmaf_rung_is_404() {
+        let (state, token) = seed_with_probe(pharos_core::MediaProbe {
+            duration_ms: Some(18_000),
+            ..Default::default()
+        })
+        .await;
+        let app = test::init_service(App::new().app_data(state).configure(register)).await;
+        for path in ["main.m3u8", "init.mp4", "0.m4s"] {
+            let req = test::TestRequest::get()
+                .uri(&format!("/videos/9/h264cmaf/4k/{path}?api_key={token}"))
+                .to_request();
+            let resp = test::call_service(&app, req).await;
+            assert_eq!(resp.status(), 404, "{path}");
+        }
+    }
+
+    #[::core::prelude::v1::test]
+    fn cmaf_rung_only_ever_lowers_the_encode_bitrate() {
+        let cap = Some(2_000_000);
+        assert_eq!(
+            cmaf_rung_bitrate(cap, Some(Variant::P720)),
+            cap,
+            "above the cap"
+        );
+        assert_eq!(cmaf_rung_bitrate(cap, Some(Variant::P360)), Some(800_000));
+        assert_eq!(cmaf_rung_bitrate(cap, None), cap);
+        assert_eq!(
+            cmaf_rung_bitrate(None, Some(Variant::P360)),
+            None,
+            "no video"
+        );
+    }
+
+    // Segment metrics carry the rung: `surface` is a metric label, so every
+    // rung's value is distinct from the others and from the source rung's.
+    #[::core::prelude::v1::test]
+    fn cmaf_rung_surfaces_are_distinct_labels() {
+        let mut all = vec!["h264cmaf", "h264cmaf-init"];
+        for v in [Variant::P1080, Variant::P720, Variant::P480, Variant::P360] {
+            all.push(v.cmaf_surface());
+            all.push(v.cmaf_init_surface());
+        }
+        let n = all.len();
+        all.sort_unstable();
+        all.dedup();
+        assert_eq!(all.len(), n, "{all:?}");
     }
 
     async fn master_body(renditions: Option<&str>) -> String {
