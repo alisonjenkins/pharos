@@ -2273,8 +2273,9 @@ fn audio_label(
     position: usize,
 ) -> String {
     let mut parts: Vec<String> = Vec::new();
+    let language = language_name(language);
     if !language.is_empty() {
-        parts.push(language_name(language));
+        parts.push(language);
     }
     let sound = [codec_name(codec), channels.and_then(channel_name)]
         .into_iter()
@@ -2303,31 +2304,104 @@ const GENERIC_TITLE_WORDS: &[&str] = &[
     "surround", "stereo", "mono", "audio", "sound", "track", "-", "ch", "channel", "channels",
 ];
 
-/// A language's English name for an ISO 639 code, else the code in capitals.
+/// A language's English name for an ISO 639-1 or 639-2 (bibliographic or
+/// terminology) code, else the code in capitals; nothing for an undetermined
+/// code (`und`, `mis`, `zxx`, `mul`) or an empty one. A region or script tag
+/// after it (`pt-BR`, `zh-Hant`) is dropped; the track title says which.
 fn language_name(code: &str) -> String {
-    match code.trim().to_ascii_lowercase().as_str() {
-        "en" | "eng" => "English",
-        "ja" | "jpn" => "Japanese",
-        "es" | "spa" => "Spanish",
-        "fr" | "fre" | "fra" => "French",
-        "de" | "ger" | "deu" => "German",
-        "it" | "ita" => "Italian",
-        "pt" | "por" => "Portuguese",
-        "ru" | "rus" => "Russian",
-        "uk" | "ukr" => "Ukrainian",
-        "zh" | "chi" | "zho" => "Chinese",
-        "ko" | "kor" => "Korean",
+    let lower = code.trim().to_ascii_lowercase();
+    let base = lower.split(['-', '_']).next().unwrap_or_default();
+    match base {
+        "aa" | "aar" => "Afar",
+        "af" | "afr" => "Afrikaans",
+        "sq" | "alb" | "sqi" => "Albanian",
+        "am" | "amh" => "Amharic",
         "ar" | "ara" => "Arabic",
-        "nl" | "dut" | "nld" => "Dutch",
-        "pl" | "pol" => "Polish",
-        "sv" | "swe" => "Swedish",
-        "no" | "nor" | "nob" => "Norwegian",
+        "hy" | "arm" | "hye" => "Armenian",
+        "az" | "aze" => "Azerbaijani",
+        "eu" | "baq" | "eus" => "Basque",
+        "be" | "bel" => "Belarusian",
+        "bn" | "ben" => "Bengali",
+        "bs" | "bos" => "Bosnian",
+        "bg" | "bul" => "Bulgarian",
+        "my" | "bur" | "mya" => "Burmese",
+        "ca" | "cat" => "Catalan",
+        "zh" | "chi" | "zho" => "Chinese",
+        "hr" | "hrv" | "scr" => "Croatian",
+        "cs" | "cze" | "ces" => "Czech",
         "da" | "dan" => "Danish",
+        "nl" | "dut" | "nld" => "Dutch",
+        "en" | "eng" => "English",
+        "eo" | "epo" => "Esperanto",
+        "et" | "est" => "Estonian",
+        "fo" | "fao" => "Faroese",
+        "fil" => "Filipino",
         "fi" | "fin" => "Finnish",
-        "tr" | "tur" => "Turkish",
+        "fr" | "fre" | "fra" => "French",
+        "gl" | "glg" => "Galician",
+        "ka" | "geo" | "kat" => "Georgian",
+        "de" | "ger" | "deu" => "German",
+        "el" | "gre" | "ell" => "Greek",
+        "gu" | "guj" => "Gujarati",
+        "he" | "heb" => "Hebrew",
         "hi" | "hin" => "Hindi",
-        "und" => "Unknown language",
-        other => return other.to_ascii_uppercase(),
+        "hu" | "hun" => "Hungarian",
+        "is" | "ice" | "isl" => "Icelandic",
+        "id" | "ind" => "Indonesian",
+        "ga" | "gle" => "Irish",
+        "it" | "ita" => "Italian",
+        "ja" | "jpn" => "Japanese",
+        "kn" | "kan" => "Kannada",
+        "kk" | "kaz" => "Kazakh",
+        "km" | "khm" => "Khmer",
+        "ko" | "kor" => "Korean",
+        "ku" | "kur" => "Kurdish",
+        "lo" | "lao" => "Lao",
+        "la" | "lat" => "Latin",
+        "lv" | "lav" => "Latvian",
+        "lt" | "lit" => "Lithuanian",
+        "lb" | "ltz" => "Luxembourgish",
+        "mk" | "mac" | "mkd" => "Macedonian",
+        "ms" | "may" | "msa" => "Malay",
+        "ml" | "mal" => "Malayalam",
+        "mt" | "mlt" => "Maltese",
+        "mi" | "mao" | "mri" => "Maori",
+        "mr" | "mar" => "Marathi",
+        "mn" | "mon" => "Mongolian",
+        "ne" | "nep" => "Nepali",
+        "no" | "nor" => "Norwegian",
+        "nb" | "nob" => "Norwegian Bokmål",
+        "nn" | "nno" => "Norwegian Nynorsk",
+        "fa" | "per" | "fas" => "Persian",
+        "pl" | "pol" => "Polish",
+        "pt" | "por" => "Portuguese",
+        "pa" | "pan" => "Punjabi",
+        "ro" | "rum" | "ron" => "Romanian",
+        "ru" | "rus" => "Russian",
+        "sr" | "srp" | "scc" => "Serbian",
+        "si" | "sin" => "Sinhala",
+        "sk" | "slo" | "slk" => "Slovak",
+        "sl" | "slv" => "Slovenian",
+        "so" | "som" => "Somali",
+        "es" | "spa" => "Spanish",
+        "sw" | "swa" => "Swahili",
+        "sv" | "swe" => "Swedish",
+        "tl" | "tgl" => "Tagalog",
+        "ta" | "tam" => "Tamil",
+        "te" | "tel" => "Telugu",
+        "th" | "tha" => "Thai",
+        "bo" | "tib" | "bod" => "Tibetan",
+        "tr" | "tur" => "Turkish",
+        "uk" | "ukr" => "Ukrainian",
+        "ur" | "urd" => "Urdu",
+        "uz" | "uzb" => "Uzbek",
+        "vi" | "vie" => "Vietnamese",
+        "cy" | "wel" | "cym" => "Welsh",
+        "xh" | "xho" => "Xhosa",
+        "yi" | "yid" => "Yiddish",
+        "zu" | "zul" => "Zulu",
+        "und" | "mis" | "zxx" | "mul" => "",
+        _ => return code.trim().to_ascii_uppercase(),
     }
     .to_owned()
 }
@@ -3444,6 +3518,7 @@ mod tests {
             "English · AAC"
         );
         assert_eq!(audio_label("", "", None, "", 0), "Track 1");
+        assert_eq!(audio_label("und", "aac", None, "", 0), "AAC");
     }
 
     #[test]
@@ -3453,6 +3528,40 @@ mod tests {
         assert_eq!(channel_name(6).as_deref(), Some("5.1"));
         assert_eq!(channel_name(8).as_deref(), Some("7.1"));
         assert_eq!(channel_name(0), None);
+    }
+
+    #[test]
+    fn every_kind_of_language_code_reads_as_its_name() {
+        let named = |language: &str, title: &str, forced: bool, sdh: bool| {
+            let t = Track {
+                language: language.into(),
+                title: title.into(),
+                codec: "subrip".into(),
+                is_forced: forced,
+                is_hearing_impaired: sdh,
+                ..Track::default()
+            };
+            track_label(&t, 0)
+        };
+        assert_eq!(named("gre", "", false, false), "Greek");
+        assert_eq!(named("ell", "", false, false), "Greek");
+        assert_eq!(named("rum", "", false, false), "Romanian");
+        assert_eq!(named("heb", "", false, false), "Hebrew");
+        assert_eq!(named("ind", "", false, false), "Indonesian");
+        assert_eq!(named("tha", "", false, false), "Thai");
+        assert_eq!(named("pt-BR", "", false, false), "Portuguese");
+        assert_eq!(
+            named("por", "Brazilian", false, false),
+            "Portuguese · Brazilian"
+        );
+        assert_eq!(
+            named("chi", "Simplified", false, false),
+            "Chinese · Simplified"
+        );
+        assert_eq!(named("eng", "SDH", false, true), "English · SDH");
+        assert_eq!(named("eng", "Forced", true, false), "English · Forced");
+        assert_eq!(named("eng", "", true, false), "English (forced)");
+        assert_eq!(named("qaa", "", false, false), "QAA");
     }
 
     #[test]
