@@ -89,6 +89,9 @@ struct TrackState {
     needs_init: bool,
     in_flight: Option<Request>,
     seek_target_ms: Option<u64>,
+    /// The seek target's segment was fetched again because the target itself
+    /// was not buffered, though most of its segment was; once per seek.
+    seek_refetched: bool,
     last_appended: bool,
 }
 
@@ -100,6 +103,7 @@ impl TrackState {
             needs_init: has_init,
             in_flight: None,
             seek_target_ms: Some(start_ms),
+            seek_refetched: false,
         }
     }
 }
@@ -307,6 +311,7 @@ fn seek_track(
         }
     }
     state.seek_target_ms = Some(to_ms);
+    state.seek_refetched = false;
     let end_ms = segments_duration_ms(&state.segments);
     if to_ms < end_ms {
         state.last_appended = state
@@ -331,7 +336,10 @@ fn plan_track(
         return;
     }
 
-    let cutoff_ms = eviction_anchor(state, play_ms).saturating_sub(back_ms);
+    let cutoff_ms = segment_floor(
+        &state.segments,
+        eviction_anchor(state, play_ms).saturating_sub(back_ms),
+    );
     if let Some(&(range_start, range_end)) = track_buffered.first() {
         if range_start < range_end && range_start < cutoff_ms {
             actions.push(Action::Evict {
@@ -352,12 +360,20 @@ fn plan_track(
         return;
     };
 
+    // A segment counts as buffered when its midpoint is; a seek target just
+    // short of where a partly removed segment's data starts is not, so that
+    // segment is fetched again once.
+    let refetch_target = state.seek_target_ms.is_some()
+        && !state.seek_refetched
+        && !point_buffered(track_buffered, anchor_ms);
     let Some((candidate_idx, candidate_seg)) = state
         .segments
         .iter()
         .enumerate()
         .skip(start_idx)
-        .find(|(_, seg)| !is_segment_covered(seg, track_buffered))
+        .find(|&(idx, seg)| {
+            (idx == start_idx && refetch_target) || !is_segment_covered(seg, track_buffered)
+        })
     else {
         return;
     };
@@ -375,11 +391,28 @@ fn plan_track(
         }
     }
 
+    if candidate_idx == start_idx && refetch_target {
+        state.seek_refetched = true;
+    }
     state.in_flight = Some(Request::Media(candidate_idx));
     actions.push(Action::Fetch {
         track,
         index: candidate_idx,
     });
+}
+
+/// The start of the segment holding `at_ms`, so eviction removes whole
+/// segments and never leaves one partly buffered; `at_ms` outside every segment.
+fn segment_floor(segments: &[Segment], at_ms: u64) -> u64 {
+    segment_at_slice(segments, at_ms)
+        .and_then(|idx| segments.get(idx))
+        .map_or(at_ms, |seg| seg.start_ms)
+}
+
+fn point_buffered(buffered: &[(u64, u64)], at_ms: u64) -> bool {
+    buffered
+        .iter()
+        .any(|&(start, end)| start <= at_ms && at_ms < end)
 }
 
 /// The play position eviction keeps `back_ms` behind: the play head clamped
@@ -406,7 +439,8 @@ fn resolve_playhead(
     if let Some(target_ms) = state.seek_target_ms {
         let target_idx = clamped_segment_at(&state.segments, target_ms)?;
         let target_seg = state.segments.get(target_idx)?;
-        let covered = is_segment_covered(target_seg, track_buffered);
+        let covered = is_segment_covered(target_seg, track_buffered)
+            && (state.seek_refetched || point_buffered(track_buffered, target_ms));
         if covered && play_ms != 0 && play_ms != target_ms {
             state.seek_target_ms = None;
         } else {
@@ -553,6 +587,67 @@ mod tests {
             }
         }
         *ranges = out;
+    }
+
+    // B733: eviction leaves the audio track partly holding a segment; a seek
+    // just short of the remaining data used to find the segment "buffered" by
+    // its midpoint, fetch nothing, and stall the play.
+    #[test]
+    fn a_seek_short_of_a_partly_removed_segment_fetches_it_again_once() {
+        let segs = make_segments(&[6_000; 20]);
+        let mut planner = Planner::new(
+            segs.clone(),
+            false,
+            Some((segs, false)),
+            Config::default(),
+            34_000,
+        );
+        let buf = Buffered {
+            video: vec![(24_000, 60_000)],
+            audio: vec![(19_000, 60_000)],
+        };
+        planner.seek(18_440, &buf);
+        assert_eq!(
+            planner.tick(18_440, &buf),
+            vec![
+                Action::Fetch {
+                    track: Track::Video,
+                    index: 3
+                },
+                Action::Fetch {
+                    track: Track::Audio,
+                    index: 3
+                },
+            ]
+        );
+        planner.appended(Track::Video);
+        planner.appended(Track::Audio);
+
+        // The segment's data still starts after the target: no second refetch.
+        let still_short = Buffered {
+            video: vec![(18_000, 60_000)],
+            audio: vec![(18_500, 60_000)],
+        };
+        assert_eq!(planner.tick(18_440, &still_short), Vec::new());
+    }
+
+    #[test]
+    fn eviction_removes_whole_segments() {
+        let segs = make_segments(&[6_000; 10]);
+        let mut planner = Planner::new(segs, false, None, Config::default(), 34_000);
+        let buf = Buffered {
+            video: vec![(0, 60_000)],
+            audio: Vec::new(),
+        };
+        // Cutoff 34_000 - 15_000 = 19_000 lies in segment 3 (18_000..24_000).
+        assert_eq!(
+            planner.tick(34_000, &buf)[0],
+            Action::Evict {
+                track: Track::Video,
+                start_ms: 0,
+                end_ms: 18_000
+            }
+        );
     }
 
     #[test]
@@ -732,9 +827,9 @@ mod tests {
         };
         let mut planner = Planner::new(segs, false, None, config, 0);
 
-        // Segment 0 midpoint is 3_000; range (1_000, 4_000) covers its midpoint.
+        // Segment 0 midpoint is 3_000; range (0, 4_000) covers its midpoint.
         let mut buf = Buffered {
-            video: vec![(1_000, 4_000)],
+            video: vec![(0, 4_000)],
             audio: Vec::new(),
         };
         assert_eq!(
@@ -841,18 +936,19 @@ mod tests {
             }]
         );
 
-        // At play_ms = 20_000 while seg 4 is in flight: no Evict may be emitted.
-        assert_eq!(planner.tick(20_000, &buf), Vec::new());
+        // At play_ms = 22_000 while seg 4 is in flight: no Evict may be emitted.
+        assert_eq!(planner.tick(22_000, &buf), Vec::new());
 
-        // Once the in-flight request completes, Evict [0, 5_000) is emitted.
+        // Once the in-flight request completes, the cutoff (7_000) is floored
+        // to its segment's start: Evict [0, 6_000) removes whole segments only.
         planner.failed(Track::Video);
         assert_eq!(
-            planner.tick(20_000, &buf),
+            planner.tick(22_000, &buf),
             vec![
                 Action::Evict {
                     track: Track::Video,
                     start_ms: 0,
-                    end_ms: 5_000,
+                    end_ms: 6_000,
                 },
                 Action::Fetch {
                     track: Track::Video,
@@ -919,12 +1015,8 @@ mod tests {
         assert_eq!(
             planner.tick(50_000, &buf_v0),
             vec![
-                // Back buffer is anchored at the clamped play head (17_999), not 50_000.
-                Action::Evict {
-                    track: Track::Video,
-                    start_ms: 0,
-                    end_ms: 2_999
-                },
+                // Back buffer is anchored at the clamped play head (17_999), not
+                // 50_000; its cutoff (2_999) floors to segment 0's start, so nothing goes.
                 Action::Fetch {
                     track: Track::Video,
                     index: 2
