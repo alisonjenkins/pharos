@@ -74,9 +74,14 @@ pub fn encode(tracks: &[AudioTrack]) -> Option<String> {
 
 pub fn decode(s: Option<&str>) -> Vec<AudioTrack> {
     let Some(s) = s else { return Vec::new() };
-    serde_json::from_str::<Vec<AudioTrackJson>>(s)
-        .map(|v| v.into_iter().map(Into::into).collect())
-        .unwrap_or_default()
+    let Ok(tracks) = serde_json::from_str::<Vec<AudioTrackJson>>(s) else {
+        return Vec::new();
+    };
+    // serde grows the Vec by doubling from 4; a typical 1-3 track list would
+    // keep 1-2 empty slots resident for the life of the cached library.
+    let mut tracks: Vec<AudioTrack> = tracks.into_iter().map(Into::into).collect();
+    tracks.shrink_to_fit();
+    tracks
 }
 
 #[cfg(test)]
