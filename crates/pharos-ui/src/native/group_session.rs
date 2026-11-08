@@ -2329,6 +2329,52 @@ mod tests {
         assert_eq!(calls_with(&rig, "ready"), ["ready(pl-7,2000,false)"]);
     }
 
+    /// B664, a third order (Firefox): the group's item reached the member
+    /// while its join was still in flight, so the player's events up to
+    /// then went to a session not yet in the group. The first clock sample
+    /// of the membership puts the player at the group's position, and that
+    /// seek's landing says ready.
+    #[test]
+    fn a_player_that_loaded_while_the_join_was_in_flight_is_put_at_the_group() {
+        let groups = FakeGroups::with_groups(vec![summary()]);
+        let env = TestEnv::default();
+        env.now.set(100_000);
+        let session = Session::new(groups.clone(), env.clone());
+        let player = Rc::new(TestPlayer::default());
+        session.set_watching(Some(ItemRef::Real(7)));
+        session.set_player(Some(player.clone()));
+        groups.push_on_join(vec![GroupUpdate::Item {
+            item: ItemRef::Real(7),
+            playlist_item_id: "pl-7".into(),
+            position_ms: 2_000,
+            playing: false,
+        }]);
+        let mut joined = Box::pin(session.join("g1"));
+        let mut cx = std::task::Context::from_waker(futures_util::task::noop_waker_ref());
+        assert!(std::future::Future::poll(joined.as_mut(), &mut cx).is_pending());
+        // Before the answer: the item's seek runs, then the engine applies
+        // this member's own resume point and its events find no group.
+        env.settle();
+        player.position.set(72_000);
+        player.paused.set(true);
+        session.on_media(MediaEvent::Seeked);
+        session.on_media(MediaEvent::CanPlay);
+        assert!(matches!(
+            std::future::Future::poll(joined.as_mut(), &mut cx),
+            std::task::Poll::Ready(Ok(_))
+        ));
+        env.settle();
+        assert_eq!(player.position.get(), 2_000, "{:?}", player.log.borrow());
+        session.on_media(MediaEvent::Seeked);
+        env.settle();
+        let ready: Vec<String> = groups
+            .calls()
+            .into_iter()
+            .filter(|c| c.starts_with("ready"))
+            .collect();
+        assert_eq!(ready, ["ready(pl-7,2000,false)"]);
+    }
+
     /// A server that answers slowly must not reorder what the viewer did:
     /// waiting then canplay reaches it as buffering true, then false.
     #[test]
