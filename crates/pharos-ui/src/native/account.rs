@@ -221,7 +221,7 @@ pub fn Avatar(me: Option<Me>) -> Element {
     let name = me.as_ref().map(|me| me.name.as_str()).unwrap_or_default();
     match me.as_ref().and_then(|me| me.avatar_url.as_deref()) {
         Some(url) => rsx! {
-            img { class: "pharos-avatar pharos-avatar-picture", src: "{url}", alt: "", "aria-hidden": "true" }
+            img { class: "pharos-avatar pharos-avatar-picture", src: super::platform::art_src(url), alt: "", "aria-hidden": "true" }
         },
         None => rsx! {
             span { class: "pharos-avatar", "aria-hidden": "true", {initials(name)} }
