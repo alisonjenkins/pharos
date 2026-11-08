@@ -63,7 +63,8 @@ use super::track_follow;
 use super::trail;
 use super::views::{
     open_route, reveal_palette_row, ErrorNote, Hits, HomeView, Loading, MarkPlayed, Nav,
-    PaletteView, PlayFromStart, SearchBox, Shell, SignInView, StatusView, TitleView, PALETTE_INPUT,
+    PaletteView, PlayFailure, PlayFromStart, PlaybackFailure, SearchBox, Shell, SignInView,
+    StatusView, TitleView, PALETTE_INPUT,
 };
 use super::watch_view::{
     text_track_id, total_ms, Control, Controls, Skip, UpNextCard, WatchView, OUTGOING_ID,
@@ -2932,6 +2933,13 @@ fn WhatsNew(route: Route) -> Element {
     }
 }
 
+/// Back one page, or home when there is none to go back to.
+fn leave_player(nav: Nav) {
+    if !platform::go_back() {
+        nav.0.call(Route::Home);
+    }
+}
+
 /// Renders a load's state: loading, its error, or `view` of its value.
 fn loaded<T>(state: Option<&Result<T, String>>, view: impl FnOnce(&T) -> Element) -> Element {
     match state {
@@ -3529,29 +3537,53 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
     // window still loading or failed needs a way out of its own.
     let stranded = ctx_stage.read().view != View::Full
         && !matches!(state.as_ref().and_then(Option::as_ref), Some(Ok(_)));
-    let body = loaded(state.as_ref().and_then(Option::as_ref), |p: &PlayingRef| {
-        remount_on(
-            &p.0.session,
-            rsx! {
-                Player {
-                    playing: p.clone(),
-                    last_ms: LastMs(Rc::clone(&last_ms)),
-                    near: near.read().as_ref().and_then(|n| n.as_ref()).map(|n| n.0).unwrap_or_default(),
-                    upcoming: upcoming.read().clone().flatten(),
-                    on_renegotiate: move |next| picks.set(next),
-                    // In place of this episode, as the next-episode button does.
-                    on_advance: move |next| replace.0.call(Route::Watch(next)),
-                    watch: watch.clone(),
-                    on_quality: move |cap| {
-                        store_bitrate(quality::AUTO_RUNG_KEY, cap);
-                        auto_cap.set(cap);
-                    },
-                    slot,
-                    fade_in: fade_in.clone(),
-                }
-            },
-        )
+    // A negotiation that failed in the full view has no player and no shell
+    // to leave by, so it gets the failure panel (B806).
+    let start_failure = match state.as_ref().and_then(Option::as_ref) {
+        Some(Err(reason)) if ctx_stage.read().view == View::Full => Some(reason.clone()),
+        _ => None,
+    };
+    let nav = use_context::<Nav>();
+    use_effect(move || {
+        if let Some(Some(Err(reason))) = &*playing.read() {
+            platform::warn(&format!(
+                "pharos: playback failure shown item={id} kind=negotiate view={} reason={reason}",
+                ctx_stage.peek().view.label()
+            ));
+        }
     });
+    let body = match start_failure {
+        Some(reason) => rsx! {
+            PlaybackFailure {
+                failure: PlayFailure::start(reason),
+                on_retry: move |()| playing.restart(),
+                on_back: move |()| leave_player(nav),
+            }
+        },
+        None => loaded(state.as_ref().and_then(Option::as_ref), |p: &PlayingRef| {
+            remount_on(
+                &p.0.session,
+                rsx! {
+                    Player {
+                        playing: p.clone(),
+                        last_ms: LastMs(Rc::clone(&last_ms)),
+                        near: near.read().as_ref().and_then(|n| n.as_ref()).map(|n| n.0).unwrap_or_default(),
+                        upcoming: upcoming.read().clone().flatten(),
+                        on_renegotiate: move |next| picks.set(next),
+                        // In place of this episode, as the next-episode button does.
+                        on_advance: move |next| replace.0.call(Route::Watch(next)),
+                        watch: watch.clone(),
+                        on_quality: move |cap| {
+                            store_bitrate(quality::AUTO_RUNG_KEY, cap);
+                            auto_cap.set(cap);
+                        },
+                        slot,
+                        fade_in: fade_in.clone(),
+                    }
+                },
+            )
+        }),
+    };
     rsx! {
         {body}
         if stranded {
@@ -3711,7 +3743,7 @@ fn Player(
             });
         }
     });
-    let mut failed = use_signal(|| None::<String>);
+    let mut failed = use_signal(|| None::<PlayFailure>);
     let saved_volume = use_hook(last_volume);
     let mut media = use_signal(|| MediaState::at_volume(saved_volume.map(|(v, m, _)| (v, m))));
     let mut hover_ms = use_signal(|| None::<u64>);
@@ -4027,7 +4059,10 @@ fn Player(
             async move {
                 while let Some(reason) = reasons.next().await {
                     stop();
-                    failed.set(Some(format!("Playback failed: {reason}")));
+                    platform::warn(&format!(
+                        "pharos: playback failure shown item={playing_id} kind=stream reason={reason}"
+                    ));
+                    failed.set(Some(PlayFailure::stream(reason)));
                 }
             }
         }
@@ -4082,7 +4117,12 @@ fn Player(
                 };
                 match attached {
                     Ok(e) => *engine.borrow_mut() = Some(e),
-                    Err(e) => failed.set(Some(format!("Could not start playback: {e}"))),
+                    Err(e) => {
+                        platform::warn(&format!(
+                            "pharos: playback failure shown item={playing_id} kind=start reason={e}"
+                        ));
+                        failed.set(Some(PlayFailure::start(e)));
+                    }
                 }
             });
         }
@@ -4699,11 +4739,7 @@ fn Player(
                     }
                 }
                 // Leaving the watch page shrinks the player (spec 020).
-                Control::Back => {
-                    if !platform::go_back() {
-                        nav.0.call(Route::Home);
-                    }
-                }
+                Control::Back => leave_player(nav),
                 Control::Shrink => {
                     // A copy, so the handler stays `Fn`.
                     let mut stage = stage;
@@ -4902,6 +4938,7 @@ fn Player(
             });
         }
     }
+    let retry_audio = p.audio;
     let heading = super::views::watch_heading(&p.detail.item);
     rsx! {
         if compact {
@@ -4914,12 +4951,25 @@ fn Player(
                 pip: p.kind != ItemKind::Audio && platform::pip_supported(),
                 previous: near.previous,
                 next,
-                error: failed().or_else(|| group.ended.clone()),
+                error: failed().map(|f| f.line()).or_else(|| group.ended.clone()),
                 on_action,
             }
         } else {
-            if let Some(message) = failed() {
-                ErrorNote { message }
+            if let Some(failure) = failed() {
+                PlaybackFailure {
+                    failure,
+                    on_retry: move |()| {
+                        platform::info(&format!(
+                            "pharos: playback retry item={playing_id} at_ms={}",
+                            last_ms.0.get()
+                        ));
+                        on_renegotiate.call(TrackPicks {
+                            audio: retry_audio.map_or(TrackChoice::Default, TrackChoice::Index),
+                            subtitle: choice(*subtitle.peek()),
+                        });
+                    },
+                    on_back: move |()| leave_player(nav),
+                }
             }
             if let Some(message) = group.ended.clone() {
                 ErrorNote { message }
