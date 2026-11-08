@@ -65,9 +65,9 @@ use super::track_follow;
 use super::trail;
 use super::turn::{self, EpisodeTurn, EPISODE_TURN_KEY};
 use super::views::{
-    open_route, reveal_palette_row, ErrorNote, GroupEndedNote, Hits, HomeView, Loading, MarkPlayed,
-    Nav, PaletteView, PlayFailure, PlayFromStart, PlaybackFailure, SearchBox, Shell, SignInView,
-    StatusView, TitleView, PALETTE_INPUT,
+    open_route, reveal_palette_row, Busy, ErrorNote, GroupEndedNote, Hits, HomeView, Loading,
+    MarkPlayed, Nav, PaletteView, PlayFailure, PlayFromStart, PlaybackFailure, SearchBox, Shell,
+    SignInView, StatusView, TitleView, PALETTE_INPUT,
 };
 use super::watch_view::{
     split_position, text_track_id, total_ms, Control, Controls, Skip, UpNextCard, WatchView,
@@ -3132,15 +3132,22 @@ fn BrowseScreen(id: ItemRef) -> Element {
         .and_then(|(_, r)| r.as_ref().ok())
         .map(|browse| browse.name(id));
     use_page_name(id, name);
-    loaded(
-        state
-            .as_ref()
-            .and_then(Option::as_ref)
-            .map(|(_, result)| result),
-        |browse: &browse::Browse| {
-            rsx! { SeenBrowse { browse: browse.clone() } }
-        },
-    )
+    // The last parent's listing stays up while the next loads (so a tile
+    // tap never blanks the page), dimmed and marked busy (B822).
+    let busy = state
+        .as_ref()
+        .and_then(Option::as_ref)
+        .is_some_and(|(asked, _)| *asked != id);
+    rsx! {
+        Busy { busy,
+            {loaded(
+                state.as_ref().and_then(Option::as_ref).map(|(_, result)| result),
+                |browse: &browse::Browse| {
+                    rsx! { SeenBrowse { browse: browse.clone() } }
+                },
+            )}
+        }
+    }
 }
 
 /// What the members of the group we are in have seen of `ids`, fetched

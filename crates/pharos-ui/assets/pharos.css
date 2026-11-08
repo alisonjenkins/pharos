@@ -92,6 +92,17 @@ body {
   font-weight: 600;
   cursor: pointer;
 }
+/* The last listing under the next one's load (B822). */
+.pharos-busy {
+  opacity: 0.45;
+  pointer-events: none;
+  transition: opacity 0.15s ease;
+}
+@media (prefers-reduced-motion: reduce) {
+  .pharos-busy {
+    transition: none;
+  }
+}
 .pharos-error {
   color: var(--px-color-danger);
   font-size: 0.875rem;
