@@ -18,6 +18,8 @@ pub mod diagnostics;
 pub mod find;
 pub mod group_app;
 pub mod group_session;
+#[cfg(all(feature = "web", target_arch = "wasm32"))]
+mod hls_web;
 pub mod keymap;
 pub mod keys;
 pub mod letters;
