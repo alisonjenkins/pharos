@@ -1,6 +1,6 @@
 # ADR-0040: Item images answer anonymous requests again; a credential still applies the library policy
 
-- **Status:** Accepted
+- **Status:** Accepted; superseded in part by ADR-0073 (anonymous requests need a keyed tag once enforced)
 - **Date:** 2026-11-02T21:00:00Z
 - **Deciders:** Alison Jenkins
 
