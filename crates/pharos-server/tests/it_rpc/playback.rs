@@ -1035,6 +1035,78 @@ async fn the_styled_track_negotiates_as_its_source_track() {
     assert_eq!(resumed.method, source.method);
 }
 
+/// B853 (V803): with nothing chosen, a playback whose default subtitle is the
+/// styled track's source starts on the styled track, and `startTracks` says
+/// so. A stated pick, the source itself or off, still wins.
+#[actix_web::test]
+async fn the_styled_track_is_the_default_where_its_source_would_show() {
+    use pharos_core::{MediaStore as _, SubtitleStylingStore as _};
+
+    let (server, fx) = crate::revocation::start().await;
+    let (dir, mut item) = crate::styled_track::seed(&fx, 403).await;
+    // No sidecar, and an embedded English ASS flagged default (an anime
+    // release's usual shape), so the default rules pick it and the styled
+    // slot is the first past the embedded streams.
+    std::fs::remove_file(dir.path().join("Show.eng.ass")).unwrap();
+    item.probe.subtitle_tracks[0].is_default = true;
+    item.probe.subtitle_tracks[0].language = Some("eng".into());
+    item.probe.audio_tracks = vec![pharos_core::AudioTrack {
+        stream_index: 1,
+        codec: Some("aac".into()),
+        is_default: true,
+        ..pharos_core::AudioTrack::default()
+    }];
+    fx.state.stores.put(item.clone()).await.unwrap();
+    let (client, _closed) = crate::revocation::connect(&server).await;
+    let session = crate::revocation::signed_in(&client, &fx.user_token).await;
+    let direct = caps(&["h264"], &["aac"], &["mp4"]);
+    let id = WireId::Real(403);
+    let styled_slot = 3;
+
+    let (_g, plain) = negotiate(&session, id, &direct, Choice::Default, Choice::Default)
+        .await
+        .unwrap();
+    assert_eq!(
+        plain.subtitle,
+        Some(2),
+        "the flagged track is the default without a plan"
+    );
+
+    fx.state
+        .stores
+        .put_subtitle_styling(crate::styled_track::styling_row(&item, 2, None))
+        .await
+        .unwrap();
+    let (_g, styled) = negotiate(&session, id, &direct, Choice::Default, Choice::Default)
+        .await
+        .unwrap();
+    assert_eq!(styled.subtitle, Some(styled_slot), "{styled:?}");
+    assert_eq!(styled.method, plain.method, "it decides like its source");
+    assert_eq!(
+        start_tracks(&session, 403, &direct).await.unwrap().1,
+        Some(styled_slot)
+    );
+    let (_g, source) = negotiate(&session, id, &direct, Choice::Default, Choice::Index(2))
+        .await
+        .unwrap();
+    assert_eq!(source.subtitle, Some(2), "the source picked by name stays");
+    let (_g, off) = negotiate(&session, id, &direct, Choice::Default, Choice::Off)
+        .await
+        .unwrap();
+    assert_eq!(off.subtitle, None, "off stays off");
+
+    // A plan made from another track leaves the default alone.
+    fx.state
+        .stores
+        .put_subtitle_styling(crate::styled_track::styling_row(&item, 7, None))
+        .await
+        .unwrap();
+    let (_g, other) = negotiate(&session, id, &direct, Choice::Default, Choice::Default)
+        .await
+        .unwrap();
+    assert_eq!(other.subtitle, Some(2), "{other:?}");
+}
+
 const HDR_MOVIE: u64 = 302;
 
 async fn seed_hdr10(fx: &Fixture) {
