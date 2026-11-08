@@ -5446,6 +5446,7 @@ dependencies = [
  "log",
  "pharos-api",
  "pharos-client",
+ "pharos-hls",
  "pharos-subs",
  "rustls",
  "serde",
