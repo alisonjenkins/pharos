@@ -1385,6 +1385,35 @@ async fn build_transcode_scheduler(
         );
         table.set_decodable(*d, &decodable);
     }
+    // ADR-0072: which VAAPI devices can tonemap HDR on the GPU. Trialled with
+    // the route's own argv, so a missing Vulkan ICD, an ffmpeg without
+    // libplacebo or a driver without Vulkan HEVC decode each read as
+    // "incapable" and HDR jobs stay on the CPU chain. Concurrent, like the
+    // other boot probes: each trial may take its whole timeout, and boot waits
+    // for the slowest device rather than the sum.
+    let tonemap_trials = caps
+        .iter()
+        .map(|(d, _)| *d)
+        .filter(|d| {
+            matches!(
+                d,
+                DeviceId::Hw {
+                    accel: pharos_transcode::HwAccel::Vaapi,
+                    ..
+                }
+            )
+        })
+        .map(|d| async move {
+            let verdict = pharos_transcode::probe::probe_gpu_tonemap(
+                d,
+                pharos_transcode::probe::GPU_TONEMAP_TRIAL_TIMEOUT,
+            )
+            .await;
+            (d, verdict)
+        });
+    for (d, verdict) in futures_util::future::join_all(tonemap_trials).await {
+        table.set_gpu_tonemap(d, verdict);
+    }
     // Read BEFORE the table is moved into the scheduler. This is the whole
     // placement input, digested — see `DeviceTable::placement_fingerprint`.
     let placement_fingerprint = table.placement_fingerprint();
