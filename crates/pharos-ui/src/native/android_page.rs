@@ -489,14 +489,42 @@ pub fn set_volume(video_id: &str, volume: f64, muted: bool) {
     );
 }
 
-pub fn show_text_track(_video_id: &str, _track_id: Option<&str>) {}
+/// Puts the text track whose `<track id>` is `track_id` in `mode`, and every
+/// other track off. The `<track>` may mount just after the effect that asks,
+/// so a missing one is looked for again for up to 2 s.
+fn set_text_track(video_id: &str, track_id: Option<&str>, mode: &str) {
+    run(format!(
+        "const vid = {vid}, want = {want}, mode = {mode};
+const apply = (left) => {{
+  const v = document.getElementById(vid);
+  const tracks = v ? [...v.textTracks] : [];
+  if (want !== null && !tracks.some((t) => t.id === want)) {{
+    if (left > 0) setTimeout(() => apply(left - 1), 100);
+    return;
+  }}
+  for (const t of tracks) t.mode = t.id === want ? mode : 'disabled';
+}};
+apply(20);",
+        vid = js_str(video_id),
+        want = track_id.map_or_else(|| "null".to_owned(), js_str),
+        mode = js_str(mode),
+    ));
+}
+
+/// Shows the text track whose `<track id>` is `track_id`, hiding the rest;
+/// `None` hides them all. The WebView draws the cues itself.
+pub fn show_text_track(video_id: &str, track_id: Option<&str>) {
+    set_text_track(video_id, track_id, "showing");
+}
 
 pub fn lift_cues_as_shown(_video_id: &str) {}
 
 pub fn relift_cues(_video_id: &str) {}
 
-/// Loads the text track without drawing it; nothing to load on the host.
-pub fn hide_text_track(_video_id: &str, _track_id: &str) {}
+/// Loads the text track `track_id` without drawing it, every other off.
+pub fn hide_text_track(video_id: &str, track_id: &str) {
+    set_text_track(video_id, Some(track_id), "hidden");
+}
 
 /// The Rust subtitle driver's handle; the host has no canvas.
 pub struct RustSubtitles;
