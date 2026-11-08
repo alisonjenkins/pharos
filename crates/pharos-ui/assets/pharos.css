@@ -92,6 +92,27 @@ body {
   font-weight: 600;
   cursor: pointer;
 }
+/* A line over the screen for an action that failed away from its button
+   (B824). */
+.pharos-flash {
+  position: fixed;
+  bottom: 1.5rem;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 30;
+  margin: 0;
+  max-width: min(32rem, calc(100vw - 2rem));
+  padding: 0.6rem 1rem;
+  border-radius: var(--px-radius);
+  background: var(--px-color-surface);
+  color: var(--px-color-fg);
+  font-size: 0.875rem;
+  overflow-wrap: anywhere;
+}
+.pharos-flash-error {
+  color: var(--px-color-danger);
+}
+
 /* The last listing under the next one's load (B822). */
 .pharos-busy {
   opacity: 0.45;

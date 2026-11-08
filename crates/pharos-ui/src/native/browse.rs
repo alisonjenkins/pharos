@@ -1455,7 +1455,12 @@ fn Hero(
                             }
                         }
                         if let Some(d) = detail.as_ref().filter(|_| mark) {
-                            WatchedToggle { id: d.item.id, played: d.item.played, what: "show" }
+                            WatchedToggle {
+                                id: d.item.id,
+                                played: d.item.played,
+                                what: "show",
+                                name: d.item.name.clone(),
+                            }
                         }
                     }
                 }
@@ -1532,6 +1537,11 @@ pub fn ShowView(show: Show, #[props(default)] seen: Vec<MemberSeen>) -> Element 
                             id: season,
                             played: all_played(&show.episodes, show.season_played),
                             what: "season",
+                            name: show
+                                .seasons
+                                .iter()
+                                .find(|s| s.id == season)
+                                .map_or_else(String::new, |s| s.name.clone()),
                         }
                     }
                 }
@@ -1799,7 +1809,7 @@ fn EpisodeMark(id: ItemRef, label: String, played: bool) -> Element {
             title: "{what}",
             "aria-label": "{what}",
             "data-key-action": "watched",
-            onclick: move |_| mark.0.call((id, !played)),
+            onclick: move |_| mark.0.call((id, !played, label.clone())),
             svg { view_box: "0 0 24 24", "aria-hidden": "true",
                 path { d: "M5 12.5l4.5 4.5L19 7.5" }
             }
@@ -3023,7 +3033,9 @@ mod tests {
         let mut dom = VirtualDom::new_with_props(
             |body: std::rc::Rc<dyn Fn() -> Element>| {
                 use_context_provider(|| Nav(EventHandler::new(|_: Route| {})));
-                use_context_provider(|| MarkPlayed(EventHandler::new(|_: (ItemRef, bool)| {})));
+                use_context_provider(|| {
+                    MarkPlayed(EventHandler::new(|_: (ItemRef, bool, String)| {}))
+                });
                 body()
             },
             body,

@@ -27,9 +27,10 @@ use super::together_view::InThisGroup;
 pub struct Nav(pub EventHandler<Route>);
 
 /// Marks an item watched (`true`) or unwatched, provided by the app root:
-/// it stores the mark and reloads the screen.
+/// it stores the mark and reloads the screen. The name is what a failure
+/// says it could not mark (B824).
 #[derive(Clone, Copy)]
-pub struct MarkPlayed(pub EventHandler<(ItemRef, bool)>);
+pub struct MarkPlayed(pub EventHandler<(ItemRef, bool, String)>);
 
 /// Plays an item from 0 s whatever position was saved, provided by the app
 /// root.
@@ -45,6 +46,7 @@ pub fn WatchedToggle(
     played: bool,
     what: Option<String>,
     #[props(default)] listen: bool,
+    #[props(default)] name: String,
 ) -> Element {
     let mark = use_context::<MarkPlayed>();
     let state = match (listen, played) {
@@ -62,7 +64,7 @@ pub fn WatchedToggle(
             r#type: "button",
             class: "pharos-button pharos-button-secondary",
             "data-key-action": "watched",
-            onclick: move |_| mark.0.call((id, !played)),
+            onclick: move |_| mark.0.call((id, !played, name.clone())),
             "{text}"
         }
     }
@@ -416,6 +418,30 @@ pub fn LoadFailure(error: LoadError, on_retry: EventHandler<()>) -> Element {
             }
             p { class: "pharos-load-failure-details", "{error.details()}" }
         }
+    }
+}
+
+/// A line that says what just happened or failed, wherever the viewer is on
+/// the page: fixed over the screen, an alert for a failure and a status
+/// otherwise (B824).
+#[component]
+pub fn FlashNote(text: String, error: bool) -> Element {
+    rsx! {
+        p {
+            class: if error { "pharos-flash pharos-flash-error" } else { "pharos-flash" },
+            role: if error { "alert" } else { "status" },
+            "{text}"
+        }
+    }
+}
+
+/// What a watched mark that the server refused says (B824).
+pub fn mark_failure_line(name: &str, played: bool, reason: &str) -> String {
+    let state = if played { "watched" } else { "unwatched" };
+    if name.is_empty() {
+        format!("Couldn't mark this {state}: {reason}")
+    } else {
+        format!("Couldn't mark {name} {state}: {reason}")
     }
 }
 
@@ -1009,7 +1035,7 @@ pub fn TitleView(
                         Link { to: Route::Browse(item.id), class: "pharos-button", "Open" }
                     }
                     if item.kind.playable() {
-                        WatchedToggle { id: item.id, played: item.played, listen: item.kind == ItemKind::Audio }
+                        WatchedToggle { id: item.id, played: item.played, listen: item.kind == ItemKind::Audio, name: display_name(item) }
                     }
                 }
                 if let Some(tracks) = tracks {
@@ -1451,7 +1477,9 @@ mod tests {
         let mut dom = VirtualDom::new_with_props(
             |body: std::rc::Rc<dyn Fn() -> Element>| {
                 use_context_provider(|| Nav(EventHandler::new(|_: Route| {})));
-                use_context_provider(|| MarkPlayed(EventHandler::new(|_: (ItemRef, bool)| {})));
+                use_context_provider(|| {
+                    MarkPlayed(EventHandler::new(|_: (ItemRef, bool, String)| {}))
+                });
                 body()
             },
             body,
@@ -1559,6 +1587,31 @@ mod tests {
             html.contains("Details: unavailable: item 7 (trace t1)"),
             "{html}"
         );
+    }
+
+    /// B824: a failed mark names the item and the reason, and shows as an alert.
+    #[test]
+    fn a_failed_mark_names_the_item_and_the_reason() {
+        assert_eq!(
+            mark_failure_line("Pilot", true, "unavailable: db down"),
+            "Couldn't mark Pilot watched: unavailable: db down"
+        );
+        assert_eq!(
+            mark_failure_line("Pilot", false, "x"),
+            "Couldn't mark Pilot unwatched: x"
+        );
+        assert_eq!(
+            mark_failure_line("", true, "x"),
+            "Couldn't mark this watched: x"
+        );
+        let html =
+            render(|| rsx! { FlashNote { text: "Couldn't mark Pilot watched: x", error: true } });
+        assert!(
+            html.contains(r#"role="alert""#) && html.contains("Pilot"),
+            "{html}"
+        );
+        let html = render(|| rsx! { FlashNote { text: "Saved", error: false } });
+        assert!(html.contains(r#"role="status""#), "{html}");
     }
 
     #[test]

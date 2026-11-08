@@ -65,8 +65,8 @@ use super::track_follow;
 use super::trail;
 use super::turn::{self, EpisodeTurn, EPISODE_TURN_KEY};
 use super::views::{
-    open_route, reveal_palette_row, Busy, ErrorNote, GroupEndedNote, Hits, HomeView, LoadError,
-    LoadFailure, Loading, MarkPlayed, Nav, PaletteView, PlayFailure, PlayFromStart,
+    open_route, reveal_palette_row, Busy, ErrorNote, FlashNote, GroupEndedNote, Hits, HomeView,
+    LoadError, LoadFailure, Loading, MarkPlayed, Nav, PaletteView, PlayFailure, PlayFromStart,
     PlaybackFailure, SearchBox, Shell, SignInView, StatusView, TitleView, PALETTE_INPUT,
 };
 use super::watch_view::{
@@ -1501,6 +1501,33 @@ pub(super) struct Ctx {
     pub(super) marks: Signal<u32>,
 }
 
+/// How long a [`Flash`] line stays up.
+const FLASH_MS: u32 = 7000;
+
+/// A line over the screen for an action that has no screen of its own to
+/// report on, such as a watched mark or a saved mix that failed (B824).
+/// Provided by the app root; the newest line replaces the last and clears
+/// itself.
+#[derive(Clone, Copy)]
+pub(super) struct Flash {
+    line: Signal<Option<Notice>>,
+    generation: Signal<u32>,
+}
+
+impl Flash {
+    pub(super) fn say(mut self, text: String, error: bool) {
+        let this = self.generation.peek().wrapping_add(1);
+        self.generation.set(this);
+        self.line.set(Some(Notice { text, error }));
+        spawn(async move {
+            platform::sleep_ms(FLASH_MS).await;
+            if self.generation.try_peek().is_ok_and(|g| *g == this) {
+                self.line.set(None);
+            }
+        });
+    }
+}
+
 #[component]
 fn NativeApp(route: Route) -> Element {
     let mut machine = use_signal(Machine::new);
@@ -1511,6 +1538,11 @@ fn NativeApp(route: Route) -> Element {
     // send values this build cannot read: it asks to be reloaded.
     let outdated = use_signal(|| false);
     let mut marks = use_signal(|| 0u32);
+    let flash = Flash {
+        line: use_signal(|| None),
+        generation: use_signal(|| 0),
+    };
+    use_context_provider(|| flash);
     use_context_provider(|| Ctx {
         api,
         machine,
@@ -1551,30 +1583,35 @@ fn NativeApp(route: Route) -> Element {
     mixes::use_top_up(api, queue, mix);
     use_context_provider(|| {
         let marking = Rc::new(RefCell::new(std::collections::HashSet::<ItemRef>::new()));
-        MarkPlayed(EventHandler::new(move |(id, played): (ItemRef, bool)| {
-            let Some(api) = api.peek().clone() else {
-                return;
-            };
-            // One mark per item at a time: a second click before the reload
-            // would record a second play.
-            if !marking.borrow_mut().insert(id) {
-                platform::info(&format!(
-                    "pharos: mark {id} played={played} skipped: one in flight"
-                ));
-                return;
-            }
-            let marking = Rc::clone(&marking);
-            spawn(async move {
-                let result = api.set_played(&call("mark", "played"), id, played).await;
-                if let Err(e) = settle(machine, result) {
-                    platform::warn(&format!("pharos: marking {id} played={played} failed: {e}"));
+        MarkPlayed(EventHandler::new(
+            move |(id, played, name): (ItemRef, bool, String)| {
+                let Some(api) = api.peek().clone() else {
+                    return;
+                };
+                // One mark per item at a time: a second click before the reload
+                // would record a second play.
+                if !marking.borrow_mut().insert(id) {
+                    platform::info(&format!(
+                        "pharos: mark {id} played={played} skipped: one in flight"
+                    ));
+                    return;
                 }
-                marking.borrow_mut().remove(&id);
-                // Reload either way: a season that failed part way through
-                // has some episodes marked, and the screen shows what is stored.
-                marks += 1;
-            });
-        }))
+                let marking = Rc::clone(&marking);
+                spawn(async move {
+                    let result = api.set_played(&call("mark", "played"), id, played).await;
+                    if let Err(e) = settle(machine, result) {
+                        platform::warn(&format!(
+                            "pharos: marking {id} played={played} failed: {e}"
+                        ));
+                        flash.say(super::views::mark_failure_line(&name, played, &e), true);
+                    }
+                    marking.borrow_mut().remove(&id);
+                    // Reload either way: a season that failed part way through
+                    // has some episodes marked, and the screen shows what is stored.
+                    marks += 1;
+                });
+            },
+        ))
     });
     let search = Search {
         text: use_signal(String::new),
@@ -1758,6 +1795,9 @@ fn NativeApp(route: Route) -> Element {
                 }
                 if let Some(message) = notice {
                     ErrorNote { message }
+                }
+                if let Some(line) = flash.line.read().clone() {
+                    FlashNote { text: line.text, error: line.error }
                 }
                 Screen { route: route.clone() }
                 StageView {}
