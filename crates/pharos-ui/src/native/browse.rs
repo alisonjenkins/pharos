@@ -25,7 +25,7 @@ use super::letters::{self, Wheel, LETTERS};
 use super::listen::{Icon, ICON_QUEUE_ADD, ICON_QUEUE_NEXT};
 use super::machine::Event;
 use super::mixes::{self, MixCtx, ICON_MIX};
-use super::paging::{Pager, Trigger};
+use super::paging::{Chain, Pager, Trigger, SENTINEL_LEAD};
 use super::platform;
 use super::queue::{added_line, QueueCtx, Track};
 use super::route::Route;
@@ -43,6 +43,9 @@ pub const BROWSE_PAGE: u32 = 100;
 /// `SortBy` for a season's episodes or an album's tracks: season (disc),
 /// then episode (track) number.
 const INDEX_ORDER: &str = "ParentIndexNumber,IndexNumber";
+
+/// `SortBy` for an artist's albums: oldest first, then by name.
+const ARTIST_ALBUM_ORDER: &str = "ProductionYear,SortName";
 
 /// What a browse screen shows under a title that could not be fetched.
 pub const BROWSE_TITLE_FALLBACK: &str = "Browse";
@@ -280,8 +283,17 @@ pub enum Browse {
         library: bool,
     },
     Show(Show),
+    /// A mixed library: its series, then its other stored items, paged as
+    /// one grid (B821).
+    Mixed {
+        title: String,
+        page: Page,
+        chain: Chain,
+    },
     Music {
         title: String,
+        /// The library, whose artists and albums the tabs page through.
+        library: ItemRef,
         artists: Page,
         albums: Page,
     },
@@ -302,7 +314,9 @@ impl Browse {
     /// season is only the default) reads the show alone.
     pub fn name(&self, asked: ItemRef) -> String {
         match self {
-            Browse::Grid { title, .. } | Browse::Music { title, .. } => title.clone(),
+            Browse::Grid { title, .. }
+            | Browse::Mixed { title, .. }
+            | Browse::Music { title, .. } => title.clone(),
             Browse::Show(show) => match show
                 .seasons
                 .iter()
@@ -373,27 +387,17 @@ pub fn plan(detail: Option<&Detail>) -> Plan {
     }
 }
 
-/// A mixed library's listing: its series, then its stored items other than
-/// episodes, which the series tiles stand for. With no series, the stored
-/// items as they are.
-pub fn series_first(series: Page, stored: Page) -> Page {
-    if series.items.is_empty() {
-        return stored;
+/// A mixed library's first page: its series, then its stored items, as one
+/// listing of `series.total + stored.total` places ([`Chain`]). The stored
+/// items join only when every series is already on the page; otherwise the
+/// series continue first, and the stored items follow them.
+pub fn mixed_first(series: &Page, stored: Page) -> Page {
+    let total = series.total.saturating_add(stored.total);
+    let whole_head = series.items.len() >= series.total as usize;
+    let mut items = series.items.clone();
+    if whole_head {
+        items.extend(stored.items);
     }
-    let episodes = stored
-        .items
-        .iter()
-        .filter(|i| i.kind == ItemKind::Episode)
-        .count();
-    let rest = stored
-        .items
-        .into_iter()
-        .filter(|i| i.kind != ItemKind::Episode);
-    let total = series.total
-        + stored
-            .total
-            .saturating_sub(u32::try_from(episodes).unwrap_or(u32::MAX));
-    let items: Vec<Item> = series.items.into_iter().chain(rest).collect();
     Page {
         total: total.max(u32::try_from(items.len()).unwrap_or(u32::MAX)),
         items,
@@ -490,12 +494,18 @@ pub async fn load<A: PharosApi>(
                 list(id, None, "SortName"),
             )
             .await?;
-            // Two listings merged: no single list to continue.
-            Browse::Grid {
+            let chain = Chain {
+                head: Listing::of(id, Some(ItemKind::Series), "SortName"),
+                head_total: series.total,
+                tail: Listing::of(id, None, "SortName"),
+                // With no series the stored items are all there is, and
+                // their episodes show as themselves.
+                hide: (series.total > 0).then_some(ItemKind::Episode),
+            };
+            Browse::Mixed {
                 title,
-                page: series_first(series, stored),
-                more: None,
-                library: false,
+                page: mixed_first(&series, stored),
+                chain,
             }
         }
         (Plan::MusicLibrary, _) => {
@@ -506,6 +516,7 @@ pub async fn load<A: PharosApi>(
             .await?;
             Browse::Music {
                 title,
+                library: id,
                 artists,
                 albums,
             }
@@ -580,7 +591,7 @@ pub async fn load<A: PharosApi>(
             })
         }
         (Plan::Artist, Some(detail)) => Browse::Artist {
-            albums: list(id, Some(ItemKind::Album), "ProductionYear,SortName").await?,
+            albums: list(id, Some(ItemKind::Album), ARTIST_ALBUM_ORDER).await?,
             detail,
         },
         (Plan::Album, Some(detail)) => Browse::Album {
@@ -618,11 +629,13 @@ pub fn BrowseLayout(browse: Browse, #[props(default)] seen: Vec<MemberSeen>) -> 
             library,
         } => rsx! { GridView { title, page, more, library } },
         Browse::Show(show) => rsx! { ShowView { show, seen } },
+        Browse::Mixed { title, page, chain } => rsx! { MixedView { title, page, chain } },
         Browse::Music {
             title,
+            library,
             artists,
             albums,
-        } => rsx! { MusicLibraryView { title, artists, albums } },
+        } => rsx! { MusicLibraryView { title, library, artists, albums } },
         Browse::Artist { detail, albums } => rsx! { ArtistView { detail, albums } },
         Browse::Album { detail, tracks } => rsx! { AlbumView { detail, tracks } },
     }
@@ -647,6 +660,20 @@ pub fn GridView(title: String, page: Page, more: Option<Listing>, library: bool)
                 ),
                 None => rsx! { PosterGrid { page } },
             }
+        }
+    }
+}
+
+/// A mixed library's grid: series, then the rest, paged as one (B821).
+#[component]
+pub fn MixedView(title: String, page: Page, chain: Chain) -> Element {
+    rsx! {
+        section { class: "pharos-browse",
+            h2 { "{title}" }
+            {remount_on(
+                &chain.head.parent.to_string(),
+                rsx! { PagedGrid { first: page, source: chain.head.clone(), rail: None, chain: Some(chain) } },
+            )}
         }
     }
 }
@@ -899,6 +926,8 @@ fn PagedGrid(
     genres: Option<Signal<Vec<String>>>,
     place: Option<String>,
     #[props(default)] restore: bool,
+    #[props(default)] square: Option<bool>,
+    #[props(default)] chain: Option<Chain>,
 ) -> Element {
     let ctx = use_context::<Ctx>();
     let mut pager = use_signal(|| Pager::new(first.clone()));
@@ -906,8 +935,10 @@ fn PagedGrid(
     // here; `Pager::begin` is what keeps a second request out while one is
     // in flight.
     let paged = source.clone();
+    let chained = chain.clone();
     let requests = use_coroutine(move |mut rx: UnboundedReceiver<Ask>| {
         let paged = paged.clone();
+        let chained = chained.clone();
         async move {
             while let Some(ask) = rx.next().await {
                 let claimed = match ask {
@@ -923,7 +954,19 @@ fn PagedGrid(
                     pager.write().fail();
                     continue;
                 };
-                let source = paged.clone();
+                // One listing, or the part of a chain this position is in.
+                let (source, start, limit, chain) = match &chained {
+                    Some(c) => {
+                        let (part, start, limit) = c.step(start, limit);
+                        (
+                            c.listing(part).clone(),
+                            start,
+                            limit,
+                            Some((c.clone(), part)),
+                        )
+                    }
+                    None => (paged.clone(), start, limit, None),
+                };
                 spawn(async move {
                     let result = fetch_more(
                         &api,
@@ -936,7 +979,13 @@ fn PagedGrid(
                     )
                     .await;
                     match result {
-                        Ok(page) => pager.write().land(page),
+                        Ok(page) => match chain {
+                            Some((c, part)) => {
+                                let whole = c.whole(part, page.total, pager.peek().total());
+                                pager.write().land_as(page, whole);
+                            }
+                            None => pager.write().land(page),
+                        },
                         Err(e) => {
                             if e.needs_sign_in() {
                                 let mut machine = ctx.machine;
@@ -1108,8 +1157,16 @@ fn PagedGrid(
     });
 
     let state = pager.read();
+    let shown: Vec<Item> = match &chain {
+        Some(c) => c.shown(state.items()).into_iter().cloned().collect(),
+        None => state.items().to_vec(),
+    };
+    // The sentinel is a place among the tiles shown, which a chain thins.
+    let sentinel = state
+        .has_more()
+        .then(|| shown.len().saturating_sub(SENTINEL_LEAD));
     let page = Page {
-        items: state.items().to_vec(),
+        items: shown,
         total: state.total(),
         start: 0,
     };
@@ -1178,7 +1235,7 @@ fn PagedGrid(
                 }
             }
         }
-        PosterList { page, sentinel: state.sentinel(), arrive_from }
+        PosterList { page, square, sentinel, arrive_from }
         if state.has_more() {
             div { id: END_ID, aria_hidden: "true" }
             p { class: "pharos-muted", "Showing {state.items().len()} of {state.total()}." }
@@ -1480,9 +1537,21 @@ pub fn ShowView(show: Show, #[props(default)] seen: Vec<MemberSeen>) -> Element 
                 }
             }
             InThisGroup { rows: in_group }
-            EpisodeList { page: show.episodes.clone(), seen }
+            {remount_on(
+                &show.selected.map_or_else(String::new, |s| s.to_string()),
+                rsx! { EpisodeList { page: show.episodes.clone(), seen, source: episode_source(&show) } },
+            )}
         }
     }
+}
+
+/// How to list the rest of a show page's episodes: the shown season's, or the
+/// series' own when it has no seasons.
+fn episode_source(show: &Show) -> Option<Listing> {
+    let parent = show
+        .selected
+        .or_else(|| show.series.as_ref().map(|d| d.item.id))?;
+    Some(Listing::of(parent, None, INDEX_ORDER))
 }
 
 /// The episode a show page's Play starts, from the season shown: the one
@@ -1553,15 +1622,104 @@ fn all_played(page: &Page, aggregate: Option<bool>) -> bool {
 }
 
 /// A season's episodes as rows: still, number and name, runtime, watched
-/// state and progress. The row opens the episode; Play starts it.
+/// state and progress. The row opens the episode; Play starts it. Given the
+/// `source` listing, a season longer than one page offers "Show more" for the
+/// rest (B821) and keeps what it loaded when a watched mark reloads the
+/// screen.
 #[component]
-pub fn EpisodeList(page: Page, #[props(default)] seen: Vec<MemberSeen>) -> Element {
+pub fn EpisodeList(
+    page: Page,
+    #[props(default)] seen: Vec<MemberSeen>,
+    #[props(default)] source: Option<Listing>,
+) -> Element {
+    let ctx = try_use_context::<Ctx>();
+    let mut pager = use_signal(|| Pager::new(page.clone()));
+    // The fetch of a range of the listing, as `PagedGrid` makes it; `None`
+    // when there is nothing to ask or no one to ask.
+    let read = {
+        let source = source.clone();
+        move |start: u32, limit: u32| {
+            let (ctx, source) = (ctx?, source.clone()?);
+            let api = ctx.api.peek().clone()?;
+            Some(async move {
+                let result = fetch_more(
+                    &api,
+                    call,
+                    &source,
+                    start,
+                    limit,
+                    |line| platform::warn(&line),
+                    platform::report_event,
+                )
+                .await;
+                if let Err(e) = &result {
+                    if e.needs_sign_in() {
+                        let mut machine = ctx.machine;
+                        machine.write().apply(Event::NeedsSignIn);
+                    }
+                }
+                result
+            })
+        }
+    };
+    // A reloaded screen brings a fresh first page: swap it in, and read the
+    // pages loaded after it again so their marks are fresh too.
+    let reloaded = page.clone();
+    let reread = read.clone();
+    use_effect(use_reactive!(|reloaded| {
+        let same = {
+            let state = pager.peek();
+            state.total() == reloaded.total && state.items().starts_with(&reloaded.items)
+        };
+        if same {
+            return;
+        }
+        let Some((start, count)) = pager.write().refresh_head(reloaded) else {
+            return;
+        };
+        match reread(start, count) {
+            Some(fetch) => {
+                spawn(async move {
+                    match fetch.await {
+                        Ok(tail) => pager.write().land_tail(start, tail),
+                        Err(_) => pager.write().fail(),
+                    }
+                });
+            }
+            None => pager.write().fail(),
+        }
+    }));
+    let mut more = move |trigger: Trigger| {
+        let Some(start) = pager.write().begin(trigger) else {
+            return;
+        };
+        match read(start, BROWSE_PAGE) {
+            Some(fetch) => {
+                spawn(async move {
+                    match fetch.await {
+                        Ok(next) => pager.write().land(next),
+                        Err(_) => pager.write().fail(),
+                    }
+                });
+            }
+            None => pager.write().fail(),
+        }
+    };
+    let state = pager.read();
+    let paged = source.is_some() && state.has_more();
+    let label = if state.in_flight() {
+        "Loading…"
+    } else if state.failed() {
+        "Try again"
+    } else {
+        "Show more"
+    };
     rsx! {
-        if page.items.is_empty() {
+        if state.items().is_empty() {
             p { class: "pharos-empty", "No episodes yet." }
         }
         ol { class: "pharos-episodes", "data-keys-list": "episodes",
-            for ep in page.items.iter() {
+            for ep in state.items().iter() {
                 li {
                     key: "{ep.id}",
                     "data-key-row": "episode",
@@ -1569,7 +1727,18 @@ pub fn EpisodeList(page: Page, #[props(default)] seen: Vec<MemberSeen>) -> Eleme
                 }
             }
         }
-        MoreNote { page }
+        if paged {
+            p { class: "pharos-muted", "Showing {state.items().len()} of {state.total()}." }
+            button {
+                class: "pharos-button",
+                r#type: "button",
+                disabled: state.in_flight(),
+                onclick: move |_| more(Trigger::Button),
+                "{label}"
+            }
+        } else if source.is_none() {
+            MoreNote { page: Page { items: state.items().to_vec(), total: state.total(), start: 0 } }
+        }
     }
 }
 
@@ -1647,7 +1816,7 @@ enum MusicTab {
 
 /// A music library: its artists or its albums, switched by tabs.
 #[component]
-pub fn MusicLibraryView(title: String, artists: Page, albums: Page) -> Element {
+pub fn MusicLibraryView(title: String, library: ItemRef, artists: Page, albums: Page) -> Element {
     let mut tab = use_signal(|| MusicTab::Artists);
     let tab_class = move |t| {
         if tab() == t {
@@ -1677,9 +1846,31 @@ pub fn MusicLibraryView(title: String, artists: Page, albums: Page) -> Element {
                     "Albums"
                 }
             }
+            // Each tab pages through its own listing (B821); switching tabs
+            // mounts the other grid, which starts from the page loaded.
             match tab() {
-                MusicTab::Artists => rsx! { PosterGrid { page: artists.clone(), square: true } },
-                MusicTab::Albums => rsx! { PosterGrid { page: albums.clone(), square: true } },
+                MusicTab::Artists => remount_on(
+                    "artists",
+                    rsx! {
+                        PagedGrid {
+                            first: artists.clone(),
+                            source: Listing::of(library, Some(ItemKind::Artist), "SortName"),
+                            rail: None,
+                            square: Some(true),
+                        }
+                    },
+                ),
+                MusicTab::Albums => remount_on(
+                    "albums",
+                    rsx! {
+                        PagedGrid {
+                            first: albums.clone(),
+                            source: Listing::of(library, Some(ItemKind::Album), "SortName"),
+                            rail: None,
+                            square: Some(true),
+                        }
+                    },
+                ),
             }
         }
     }
@@ -1696,7 +1887,21 @@ pub fn ArtistView(detail: Detail, albums: Page) -> Element {
     rsx! {
         section { class: "pharos-artist",
             Hero { title: detail.item.name.clone(), detail: Some(detail.clone()), facts, square: true }
-            PosterGrid { page: albums, square: true }
+            {remount_on(
+                &detail.item.id.to_string(),
+                rsx! {
+                    PagedGrid {
+                        first: albums,
+                        source: Listing::of(
+                            detail.item.id,
+                            Some(ItemKind::Album),
+                            ARTIST_ALBUM_ORDER,
+                        ),
+                        rail: None,
+                        square: Some(true),
+                    }
+                },
+            )}
         }
     }
 }
@@ -2571,18 +2776,112 @@ mod tests {
         assert_eq!(plan(Some(&artist)), Plan::Artist);
     }
 
+    fn mixed_library(series: u64, stored: Vec<Item>) -> (Fake, ItemRef) {
+        let lib = ItemRef::Synth(50);
+        let mut fake = Fake::default();
+        let mut l = item(lib, ItemKind::Library, "Mixed");
+        l.library_kind = Some(LibraryKind::Mixed);
+        fake.details.insert(lib, detail(l));
+        fake.lists.insert(
+            (lib, Some(ItemKind::Series)),
+            (0..series)
+                .map(|n| item(ItemRef::Synth(1000 + n), ItemKind::Series, &format!("S{n}")))
+                .collect(),
+        );
+        fake.lists.insert((lib, None), stored);
+        (fake, lib)
+    }
+
     #[test]
     fn a_mixed_library_shows_series_in_place_of_their_episodes() {
-        let series = page(vec![item(SERIES, ItemKind::Series, "Show")]);
-        let stored = page(vec![
+        let stored = vec![
             item(ItemRef::Real(1), ItemKind::Episode, "Pilot"),
             item(ItemRef::Real(2), ItemKind::Movie, "Film"),
-        ]);
-        let mixed = series_first(series, stored.clone());
-        let names: Vec<_> = mixed.items.iter().map(|i| i.name.as_str()).collect();
-        assert_eq!(names, ["Show", "Film"]);
-        assert_eq!(mixed.total, 2);
-        assert_eq!(series_first(Page::default(), stored.clone()), stored);
+        ];
+        let (fake, lib) = mixed_library(1, stored);
+        let Browse::Mixed { page, chain, .. } =
+            run(load(&fake, &CallInfo::default(), lib, |_| {})).unwrap()
+        else {
+            panic!("not a mixed library");
+        };
+        let names: Vec<_> = chain
+            .shown(&page.items)
+            .iter()
+            .map(|i| i.name.clone())
+            .collect();
+        assert_eq!(names, ["S0", "Film"]);
+        assert_eq!(chain.head_total, 1);
+        assert_eq!(page.total, 3, "every place the server counts");
+    }
+
+    #[test]
+    fn a_mixed_library_without_series_shows_what_it_stores() {
+        let stored = vec![item(ItemRef::Real(1), ItemKind::Episode, "Pilot")];
+        let (fake, lib) = mixed_library(0, stored);
+        let Browse::Mixed { page, chain, .. } =
+            run(load(&fake, &CallInfo::default(), lib, |_| {})).unwrap()
+        else {
+            panic!("not a mixed library");
+        };
+        assert_eq!(chain.shown(&page.items).len(), 1);
+    }
+
+    #[test]
+    fn a_mixed_library_with_more_series_than_a_page_continues_them_first() {
+        let stored = vec![item(ItemRef::Real(2), ItemKind::Movie, "Film")];
+        let (fake, lib) = mixed_library(u64::from(BROWSE_PAGE) + 20, stored);
+        let Browse::Mixed { page, chain, .. } =
+            run(load(&fake, &CallInfo::default(), lib, |_| {})).unwrap()
+        else {
+            panic!("not a mixed library");
+        };
+        assert_eq!(page.items.len(), BROWSE_PAGE as usize, "series only so far");
+        assert_eq!(page.total, BROWSE_PAGE + 21);
+        let (part, start, limit) = chain.step(BROWSE_PAGE, BROWSE_PAGE);
+        assert_eq!(chain.listing(part).group, Some(ItemKind::Series));
+        assert_eq!((start, limit), (BROWSE_PAGE, 20));
+    }
+
+    #[test]
+    fn a_music_library_names_itself_for_its_tabs_to_page() {
+        let lib = ItemRef::Synth(60);
+        let mut fake = Fake::default();
+        let mut l = item(lib, ItemKind::Library, "Music");
+        l.library_kind = Some(LibraryKind::Music);
+        fake.details.insert(lib, detail(l));
+        fake.lists.insert(
+            (lib, Some(ItemKind::Artist)),
+            (0..150)
+                .map(|n| item(ItemRef::Synth(2000 + n), ItemKind::Artist, "A"))
+                .collect(),
+        );
+        let Browse::Music {
+            library, artists, ..
+        } = run(load(&fake, &CallInfo::default(), lib, |_| {})).unwrap()
+        else {
+            panic!("not a music library");
+        };
+        assert_eq!(library, lib);
+        assert_eq!((artists.items.len(), artists.total), (100, 150));
+    }
+
+    #[test]
+    fn a_season_longer_than_a_page_offers_the_rest() {
+        let episodes: Vec<Item> = (0..100)
+            .map(|n| item(ItemRef::Real(n), ItemKind::Episode, "E"))
+            .collect();
+        let mut long = page(episodes);
+        long.total = 150;
+        let source = Some(Listing::of(S1, None, INDEX_ORDER));
+        let (paged, plain) = (long.clone(), long);
+        let html = render(move || {
+            rsx! { EpisodeList { page: paged.clone(), source: source.clone() } }
+        });
+        assert!(html.contains("Showing 100 of 150."), "{html}");
+        assert!(html.contains(">Show more<"), "{html}");
+        let html = render(move || rsx! { EpisodeList { page: plain.clone() } });
+        assert!(html.contains("Showing 100 of 150."), "{html}");
+        assert!(!html.contains("Show more"), "{html}");
     }
 
     #[test]
