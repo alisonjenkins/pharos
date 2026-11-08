@@ -543,10 +543,10 @@ pub fn StageBar(
             return;
         }
         let delta = match evt.key() {
-            Key::ArrowLeft => (-KEY_STEP_PX, 0.0),
-            Key::ArrowRight => (KEY_STEP_PX, 0.0),
-            Key::ArrowUp => (0.0, -KEY_STEP_PX),
-            Key::ArrowDown => (0.0, KEY_STEP_PX),
+            Key::Named(NamedKey::ArrowLeft) => (-KEY_STEP_PX, 0.0),
+            Key::Named(NamedKey::ArrowRight) => (KEY_STEP_PX, 0.0),
+            Key::Named(NamedKey::ArrowUp) => (0.0, -KEY_STEP_PX),
+            Key::Named(NamedKey::ArrowDown) => (0.0, KEY_STEP_PX),
             _ => return,
         };
         evt.prevent_default();
@@ -777,10 +777,10 @@ pub fn StageGrip() -> Element {
                 // move the handle by the height that step gives.
                 let rise = KEY_STEP_PX * VIDEO_ASPECT;
                 let delta = match evt.key() {
-                    Key::ArrowLeft => (-KEY_STEP_PX, 0.0),
-                    Key::ArrowRight => (KEY_STEP_PX, 0.0),
-                    Key::ArrowUp => (0.0, -rise),
-                    Key::ArrowDown => (0.0, rise),
+                    Key::Named(NamedKey::ArrowLeft) => (-KEY_STEP_PX, 0.0),
+                    Key::Named(NamedKey::ArrowRight) => (KEY_STEP_PX, 0.0),
+                    Key::Named(NamedKey::ArrowUp) => (0.0, -rise),
+                    Key::Named(NamedKey::ArrowDown) => (0.0, rise),
                     _ => return,
                 };
                 evt.prevent_default();

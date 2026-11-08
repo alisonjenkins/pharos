@@ -264,7 +264,7 @@ pub fn LyricsPanel(
             },
             ontouchstart: move |_| hold(),
             onkeydown: move |evt: KeyboardEvent| {
-                if matches!(evt.key(), Key::ArrowUp | Key::ArrowDown | Key::PageUp | Key::PageDown) {
+                if matches!(evt.key(), Key::Named(NamedKey::ArrowUp) | Key::Named(NamedKey::ArrowDown) | Key::Named(NamedKey::PageUp) | Key::Named(NamedKey::PageDown)) {
                     evt.stop_propagation();
                     hold();
                 }

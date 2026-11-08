@@ -601,14 +601,14 @@ fn QueuePanel(
             // Keys on the queue's own buttons are theirs, not the player's.
             onkeydown: move |evt: KeyboardEvent| {
                 let key = evt.key();
-                let own = matches!(key, Key::Enter | Key::ArrowUp | Key::ArrowDown | Key::PageUp | Key::PageDown)
+                let own = matches!(key, Key::Named(NamedKey::Enter) | Key::Named(NamedKey::ArrowUp) | Key::Named(NamedKey::ArrowDown) | Key::Named(NamedKey::PageUp) | Key::Named(NamedKey::PageDown))
                     || matches!(&key, Key::Character(k) if k == " ")
                     // The queue's own keys (spec 029), not the player's k and h/l.
                     || !matches!(keymap::resolve(Mode::Queue, &[&key.to_string()]), Resolved::Unbound);
                 if own {
                     evt.stop_propagation();
                 }
-                if key == Key::Escape && *confirming.peek() {
+                if key == Key::Named(NamedKey::Escape) && *confirming.peek() {
                     evt.prevent_default();
                     evt.stop_propagation();
                     cancel();
