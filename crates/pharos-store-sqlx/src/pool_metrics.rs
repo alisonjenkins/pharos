@@ -4,6 +4,8 @@
 //! - `pharos_db_pool_size{backend}` / `_idle` / `_in_use` / `_max` gauges
 //! - `pharos_db_pool_acquire_seconds{backend}` histogram
 //! - `pharos_db_pool_acquire_errors_total{backend}` counter
+//! - `pharos_db_pool_probe_timeouts_total{backend,verdict}` counter: why a
+//!   probe found no slot (see [`ProbeTimeout`])
 //!
 //! sqlx has no hook around its internal `acquire`, so the wait histogram comes
 //! from a probe (bounded by [`PROBE_TIMEOUT`]): each sample acquires (and immediately releases) one
@@ -13,7 +15,7 @@
 
 use std::time::{Duration, Instant};
 
-use sqlx::{Database, Pool};
+use sqlx::{ConnectOptions, Connection, Database, Pool};
 
 /// Fine enough to catch a pool saturating for a few seconds, coarse enough
 /// that the probe is negligible load.
@@ -65,12 +67,44 @@ pub(crate) async fn sample_pool<DB: Database>(
             // Classify by the state at the timeout, not at the sample: the
             // pool can fill or drain while the probe waits.
             let (size, idle) = (pool.size(), pool.num_idle());
-            match ProbeTimeout::at(idle) {
+            let max = pool.options().get_max_connections();
+            let (verdict, reason) = match ProbeTimeout::at(idle, size, max) {
+                // Room to open a connection and none came: sqlx retries a
+                // failing connect until the acquire deadline and reports only
+                // the timeout, so try one directly to learn why.
+                ProbeTimeout::DatabaseUnreachable => {
+                    match tokio::time::timeout(
+                        DIRECT_CONNECT_TIMEOUT,
+                        pool.connect_options().connect(),
+                    )
+                    .await
+                    {
+                        Ok(Ok(conn)) => {
+                            let _ = conn.close().await;
+                            (ProbeTimeout::Saturated, String::new())
+                        }
+                        Ok(Err(error)) => (ProbeTimeout::DatabaseUnreachable, error.to_string()),
+                        Err(_) => (
+                            ProbeTimeout::DatabaseUnreachable,
+                            format!("connect timed out after {DIRECT_CONNECT_TIMEOUT:?}"),
+                        ),
+                    }
+                }
+                verdict => (verdict, String::new()),
+            };
+            metrics::counter!(
+                "pharos_db_pool_probe_timeouts_total",
+                "backend" => backend,
+                "verdict" => verdict.label(),
+            )
+            .increment(1);
+            match verdict {
                 ProbeTimeout::Saturated => tracing::warn!(
                     backend,
                     waited,
                     size,
                     idle,
+                    max,
                     "pool acquire probe timed out; pool saturated"
                 ),
                 ProbeTimeout::StalledWaiters => tracing::error!(
@@ -78,14 +112,28 @@ pub(crate) async fn sample_pool<DB: Database>(
                     waited,
                     size,
                     idle,
+                    max,
                     "pool acquire probe timed out with idle connections; slots held by stalled waiters"
+                ),
+                ProbeTimeout::DatabaseUnreachable => tracing::error!(
+                    backend,
+                    waited,
+                    size,
+                    idle,
+                    max,
+                    %reason,
+                    "pool acquire probe timed out; database unreachable"
                 ),
             }
         }
     }
 }
 
-/// Why a probe found no slot.
+/// How long the probe's own diagnostic connect may take.
+const DIRECT_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Why a probe found no slot. `label()` is the `verdict` label of
+/// `pharos_db_pool_probe_timeouts_total`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProbeTimeout {
     /// Every connection is checked out: the queries are the load.
@@ -93,15 +141,29 @@ enum ProbeTimeout {
     /// Connections sit idle and still no slot: the slots belong to waiters
     /// that were never resumed or dropped (B730), not to queries.
     StalledWaiters,
+    /// The pool has room to open a connection and could not: the database
+    /// is down or refusing (B731). The log carries the connect error.
+    DatabaseUnreachable,
 }
 
 impl ProbeTimeout {
-    /// From the idle count read when the probe timed out.
-    fn at(idle: usize) -> Self {
-        if idle == 0 {
-            Self::Saturated
-        } else {
+    /// From the pool's state when the probe timed out. `DatabaseUnreachable`
+    /// is provisional here: the probe confirms it with a direct connect.
+    fn at(idle: usize, size: u32, max: u32) -> Self {
+        if idle > 0 {
             Self::StalledWaiters
+        } else if size < max {
+            Self::DatabaseUnreachable
+        } else {
+            Self::Saturated
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Saturated => "saturated",
+            Self::StalledWaiters => "stalled_waiters",
+            Self::DatabaseUnreachable => "database_unreachable",
         }
     }
 }
@@ -208,6 +270,23 @@ mod tests {
             _ => None,
         });
         assert_eq!(errors, Some(1));
+        let saturated = rows.iter().find_map(|(ck, _, _, v)| match v {
+            DebugValue::Counter(n)
+                if ck.key().name() == "pharos_db_pool_probe_timeouts_total"
+                    && ck
+                        .key()
+                        .labels()
+                        .any(|l| l.key() == "verdict" && l.value() == "saturated") =>
+            {
+                Some(*n)
+            }
+            _ => None,
+        });
+        assert_eq!(
+            saturated,
+            Some(1),
+            "a full pool of busy queries is saturated"
+        );
         let in_use = rows.iter().find_map(|(ck, _, _, v)| match v {
             DebugValue::Gauge(g) if ck.key().name() == "pharos_db_pool_in_use" => {
                 Some(g.into_inner())
@@ -264,9 +343,25 @@ mod tests {
                 sample_pool("sqlite", &pool, Duration::from_millis(100)).await;
             });
         });
-        let rows: Rows = snapshotter
-            .snapshot()
-            .into_vec()
+        let snapshot = snapshotter.snapshot().into_vec();
+        let stalled = snapshot.iter().find_map(|(ck, _, _, v)| match v {
+            DebugValue::Counter(n)
+                if ck.key().name() == "pharos_db_pool_probe_timeouts_total"
+                    && ck
+                        .key()
+                        .labels()
+                        .any(|l| l.key() == "verdict" && l.value() == "stalled_waiters") =>
+            {
+                Some(*n)
+            }
+            _ => None,
+        });
+        assert_eq!(
+            stalled,
+            Some(1),
+            "idle connections and no slot is stalled waiters"
+        );
+        let rows: Rows = snapshot
             .into_iter()
             .map(|(ck, _, _, v)| (ck.key().name().to_string(), "sqlite".to_owned(), v))
             .collect();
@@ -280,10 +375,28 @@ mod tests {
     }
 
     #[test]
-    fn a_probe_timeout_blames_stalled_waiters_only_with_idle_connections() {
-        assert_eq!(ProbeTimeout::at(0), ProbeTimeout::Saturated);
-        assert_eq!(ProbeTimeout::at(1), ProbeTimeout::StalledWaiters);
-        assert_eq!(ProbeTimeout::at(8), ProbeTimeout::StalledWaiters);
+    fn a_probe_timeout_is_classified_by_the_pool_at_the_timeout() {
+        assert_eq!(ProbeTimeout::at(0, 8, 8), ProbeTimeout::Saturated);
+        assert_eq!(ProbeTimeout::at(1, 8, 8), ProbeTimeout::StalledWaiters);
+        assert_eq!(ProbeTimeout::at(8, 8, 8), ProbeTimeout::StalledWaiters);
+        // Room to open a connection, none idle: a connect is failing.
+        assert_eq!(ProbeTimeout::at(0, 4, 8), ProbeTimeout::DatabaseUnreachable);
+        assert_eq!(ProbeTimeout::at(0, 0, 8), ProbeTimeout::DatabaseUnreachable);
+    }
+
+    #[test]
+    fn probe_timeout_verdict_labels_are_distinct_and_stable() {
+        let all = [
+            ProbeTimeout::Saturated,
+            ProbeTimeout::StalledWaiters,
+            ProbeTimeout::DatabaseUnreachable,
+        ];
+        let labels: std::collections::HashSet<_> = all.iter().map(|v| v.label()).collect();
+        assert_eq!(labels.len(), all.len());
+        assert_eq!(
+            ProbeTimeout::DatabaseUnreachable.label(),
+            "database_unreachable"
+        );
     }
 
     #[test]
