@@ -126,6 +126,7 @@ struct Session {
     fallback: Option<HlsJs>,
     on_fatal: OnFatal,
     on_fragment: OnFragment,
+    trace: super::hls_trace::PlayTrace,
 }
 
 impl Session {
@@ -175,6 +176,7 @@ impl PlaybackEngine for RustHls {
             fallback: None,
             on_fatal,
             on_fragment,
+            trace: super::hls_trace::PlayTrace::new(now_ms_u64(), start_ms),
         }));
 
         let weak = Rc::downgrade(&session);
@@ -210,6 +212,18 @@ impl Drop for RustHls {
         let Some(session) = self.session.take() else {
             return;
         };
+        let reports = {
+            let mut s = session.borrow_mut();
+            let flush = if s.object_url.is_none() || s.fallback.is_some() {
+                super::hls_trace::Flush::Fallback
+            } else if s.dead {
+                super::hls_trace::Flush::Fatal
+            } else {
+                super::hls_trace::Flush::Closed
+            };
+            s.trace.finish(flush, now_ms_u64())
+        };
+        emit_trace(reports);
         let (
             video,
             media_source,
@@ -685,6 +699,7 @@ fn abr_step(session: &Rc<RefCell<Session>>, index: usize, load: FragmentLoad, tt
         warn(&report.line());
     }
     report_event(report.event(current_path()));
+    session.borrow_mut().trace.switched(report.applied);
 }
 
 fn empty_media_playlist() -> MediaPlaylist {
@@ -727,6 +742,9 @@ async fn fallback(weak: &Weak<RefCell<Session>>, cause: HlsFallbackCause, value:
         let _ = web_sys::Url::revoke_object_url(&obj_url);
     }
 
+    if let Some(session) = weak.upgrade() {
+        finish_trace(&session, super::hls_trace::Flush::Fallback);
+    }
     warn(&format!(
         "pharos: playback engine=rust fallback=hlsjs cause={} value={value} url={url}",
         cause.label()
@@ -768,11 +786,20 @@ fn wire_video(
     weak: &Weak<RefCell<Session>>,
     video: &web_sys::HtmlMediaElement,
 ) -> Vec<(&'static str, EventListener)> {
-    let mut out = Vec::with_capacity(4);
-    for name in ["timeupdate", "progress", "waiting"] {
+    use super::hls_trace::Signal;
+
+    let mut out = Vec::with_capacity(9);
+    for (name, signal) in [
+        ("timeupdate", Some(Signal::TimeUpdate)),
+        ("progress", None),
+        ("waiting", Some(Signal::Waiting)),
+    ] {
         let w = Weak::clone(weak);
         let l = EventListener::new(move |_| {
             if let Some(s) = w.upgrade() {
+                if let Some(signal) = signal {
+                    observe(&s, signal);
+                }
                 pump(&s);
             }
         });
@@ -783,12 +810,125 @@ fn wire_video(
     let w = Weak::clone(weak);
     let on_seeking = EventListener::new(move |_| {
         if let Some(s) = w.upgrade() {
+            observe(&s, Signal::Seeking);
             on_seek(&s);
         }
     });
     let _ = video.add_event_listener_with_callback("seeking", on_seeking.as_ref().unchecked_ref());
     out.push(("seeking", on_seeking));
+
+    // Telemetry only (016 US4): these drive no engine decision.
+    for (name, signal) in [
+        ("playing", Signal::Playing),
+        ("seeked", Signal::Seeked),
+        ("pause", Signal::Pause),
+    ] {
+        let w = Weak::clone(weak);
+        let l = EventListener::new(move |_| {
+            if let Some(s) = w.upgrade() {
+                observe(&s, signal);
+            }
+        });
+        let _ = video.add_event_listener_with_callback(name, l.as_ref().unchecked_ref());
+        out.push((name, l));
+    }
+
+    // A decode error lands on the `<video>`, not on a SourceBuffer.
+    let w = Weak::clone(weak);
+    let on_error = EventListener::new(move |_| {
+        if let Some(s) = w.upgrade() {
+            report_video_error(&s);
+        }
+    });
+    let _ = video.add_event_listener_with_callback("error", on_error.as_ref().unchecked_ref());
+    out.push(("error", on_error));
     out
+}
+
+/// Feeds a `<video>` event to the session's trace and sends what it ended.
+/// Silent once the engine failed or handed the element to hls.js.
+fn observe(session: &Rc<RefCell<Session>>, signal: super::hls_trace::Signal) {
+    let Some((position_ms, buffered)) = snapshot_state(session) else {
+        return;
+    };
+    let reports = {
+        let mut s = session.borrow_mut();
+        if s.dead || s.object_url.is_none() {
+            return;
+        }
+        let video_ms = forward_buffer_ms(&buffered.video, position_ms);
+        let forward_ms = if s.audio_track.is_some() {
+            video_ms.min(forward_buffer_ms(&buffered.audio, position_ms))
+        } else {
+            video_ms
+        };
+        let clip = super::hls_trace::Clip {
+            now_ms: now_ms_u64(),
+            position_ms,
+            paused: s.video.paused(),
+            ready_state: s.video.ready_state(),
+            network_state: s.video.network_state(),
+            forward_ms,
+            // Only a stall keeps the ranges; spare the 4 Hz timeupdate the string.
+            buffered: if signal == super::hls_trace::Signal::Waiting {
+                super::hls_trace::ranges_label(&buffered.video)
+            } else {
+                String::new()
+            },
+        };
+        s.trace.observe(signal, &clip)
+    };
+    emit_trace(reports);
+}
+
+/// Ends the session's trace now, when the engine fails or hands over, rather
+/// than when the player is finally dropped (V692).
+fn finish_trace(session: &Rc<RefCell<Session>>, flush: super::hls_trace::Flush) {
+    let reports = session.borrow_mut().trace.finish(flush, now_ms_u64());
+    emit_trace(reports);
+}
+
+fn emit_trace(reports: Vec<super::hls_trace::Report>) {
+    for report in reports {
+        if report.is_warn() {
+            warn(&report.line());
+        } else {
+            info(&report.line());
+        }
+        report_event(report.event(current_path()));
+    }
+}
+
+/// The `<video>`'s own error (a decode failure, an unsupported sample):
+/// logged and reported with the browser's code and message. Recovery from it
+/// is spec 031 slice 3, so this only makes it visible.
+fn report_video_error(session: &Rc<RefCell<Session>>) {
+    let (video, url) = {
+        let s = session.borrow();
+        if s.dead || s.object_url.is_none() {
+            return;
+        }
+        (s.video.clone(), s.url.clone())
+    };
+    let (code, message) = video
+        .error()
+        .map_or((0, String::new()), |e| (e.code(), e.message()));
+    warn(&format!(
+        "pharos: playback error engine=rust type=mediaError details=videoError code={code} message={message} action=report url={url}"
+    ));
+    report_event(ClientEvent {
+        kind: ClientEventKind::PlaybackError,
+        level: ClientLevel::Error,
+        route: current_path(),
+        fields: vec![
+            ("engine", "rust".to_owned()),
+            ("type", "mediaError".to_owned()),
+            ("details", "videoError".to_owned()),
+            ("code", code.to_string()),
+            ("message", message),
+            ("action", "report".to_owned()),
+        ],
+    });
 }
 
 fn wire_source_buffer(weak: &Weak<RefCell<Session>>, track: Track, runner: &mut TrackRunner) {
@@ -1239,6 +1379,19 @@ fn on_append_error(session: &Rc<RefCell<Session>>, track: Track, err: &JsValue) 
             "pharos: playback engine=rust quota_exceeded track={} forward_target_ms={new_target_ms}",
             track.label()
         ));
+        session.borrow_mut().trace.quota_exceeded();
+        report_event(ClientEvent {
+            kind: ClientEventKind::PlaybackError,
+            level: ClientLevel::Warn,
+            route: current_path(),
+            fields: vec![
+                ("engine", "rust".to_owned()),
+                ("type", "quotaExceeded".to_owned()),
+                ("track", track.label().to_owned()),
+                ("forward_target_ms", new_target_ms.to_string()),
+                ("action", "lower_target".to_owned()),
+            ],
+        });
         run_queue(session, track);
         pump(session);
         return;
@@ -1285,6 +1438,17 @@ fn on_updateend(session: &Rc<RefCell<Session>>, track: Track) {
         media_ms,
     }) = finished
     {
+        let summary = session.borrow_mut().trace.appended(
+            super::hls_trace::Appended {
+                track,
+                index,
+                bytes,
+                ttfb_ms,
+                load_ms,
+            },
+            now_ms_u64(),
+        );
+        emit_trace(summary.into_iter().collect());
         if track == Track::Video && bytes > 0 && media_ms > 0 {
             let load = FragmentLoad {
                 bytes,
@@ -1331,13 +1495,17 @@ fn fail_manifest(
     reason: &str,
     uri: &str,
 ) {
-    let Some(on_fatal) = weak.upgrade().and_then(|s| {
-        let mut s = s.borrow_mut();
-        if s.dead {
-            return None;
-        }
-        s.dead = true;
-        Some(Rc::clone(&s.on_fatal))
+    let Some(on_fatal) = weak.upgrade().and_then(|session| {
+        let on_fatal = {
+            let mut s = session.borrow_mut();
+            if s.dead {
+                return None;
+            }
+            s.dead = true;
+            Rc::clone(&s.on_fatal)
+        };
+        finish_trace(&session, super::hls_trace::Flush::Fatal);
+        Some(on_fatal)
     }) else {
         return;
     };
@@ -1363,13 +1531,17 @@ fn fail_manifest(
 }
 
 fn fail_media(weak: &Weak<RefCell<Session>>, details: &str, message: &str) {
-    let Some((url, on_fatal)) = weak.upgrade().and_then(|s| {
-        let mut s = s.borrow_mut();
-        if s.dead {
-            return None;
-        }
-        s.dead = true;
-        Some((s.url.clone(), Rc::clone(&s.on_fatal)))
+    let Some((url, on_fatal)) = weak.upgrade().and_then(|session| {
+        let out = {
+            let mut s = session.borrow_mut();
+            if s.dead {
+                return None;
+            }
+            s.dead = true;
+            (s.url.clone(), Rc::clone(&s.on_fatal))
+        };
+        finish_trace(&session, super::hls_trace::Flush::Fatal);
+        Some(out)
     }) else {
         return;
     };
