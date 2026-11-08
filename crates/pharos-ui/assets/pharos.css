@@ -3367,6 +3367,40 @@ body::before {
   --px-gutter: 48px;
   padding: 1.5rem var(--px-gutter) 27px;
 }
+/* A TV's GPU is the weakest part of it (the G08 is a Mali on 2.4 GB). Each
+   poster's translateZ(0) gave it its own compositor layer, hundreds on a
+   home page, and the lift drew blurred shadows and 3D tilt; a backdrop
+   blur re-blurs whatever moves beneath it every frame. The TV gets flat
+   posters that scale on focus, and opaque panels instead of blur. */
+:root[data-device="tv"] .pharos-poster {
+  perspective: none;
+}
+:root[data-device="tv"] .pharos-poster-art {
+  transform: none;
+  box-shadow: none;
+}
+:root[data-device="tv"] .pharos-poster:hover .pharos-poster-art,
+:root[data-device="tv"] .pharos-poster:focus-visible .pharos-poster-art {
+  transform: scale(var(--px-motion-focus-scale));
+}
+:root[data-device="tv"] .pharos-poster-art::before,
+:root[data-device="tv"] .pharos-poster-art::after {
+  display: none;
+}
+:root[data-device="tv"] * {
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+}
+:root[data-device="tv"] .pharos-listen-body,
+:root[data-device="tv"] .pharos-lyrics,
+:root[data-device="tv"] .pharos-queue::before,
+:root[data-device="tv"] .pharos-queue-buttons[data-target="album_card"] .pharos-queue-button {
+  background: color-mix(in srgb, var(--px-color-overlay) 88%, transparent);
+}
+:root[data-device="tv"] .pharos-listen .pharos-style-trigger,
+:root[data-device="tv"] .pharos-style-panel {
+  background: color-mix(in srgb, var(--px-color-bg) 90%, transparent);
+}
 :root[data-device="tv"] :focus-visible:not(.pharos-poster, .pharos-player),
 :root[data-device="tv"] .pharos-poster:focus-visible .pharos-poster-art {
   outline: 3px solid var(--px-color-focus);
