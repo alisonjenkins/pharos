@@ -1,8 +1,8 @@
 //! The network [`GroupClient`] (spec 014's Together) over the session's
-//! `Group` and `Membership` capabilities. It needs only the `NativeApi` and
-//! the platform's timer, so any build with a server connection can use it;
-//! the platform supplies its device id. The host build keeps the in-memory
-//! [`FakeGroups`](super::together::FakeGroups).
+//! `Group` and `Membership` capabilities. The browser and the Android TV app
+//! both reach the server through the same `NativeApi`, so both use this one
+//! adapter; each platform only supplies its device id. The host build keeps
+//! the in-memory [`FakeGroups`](super::together::FakeGroups).
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;

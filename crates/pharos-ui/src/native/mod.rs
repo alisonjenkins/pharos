@@ -17,8 +17,11 @@ pub mod depth;
 pub mod diagnostics;
 pub mod find;
 pub mod group_app;
-// 014: the network Together client over the session's `Group`.
-#[cfg(all(feature = "web", target_arch = "wasm32"))]
+// 014: the network Together client, shared by the browser and the TV app.
+#[cfg(any(
+    all(feature = "web", target_arch = "wasm32"),
+    all(feature = "mobile", target_os = "android")
+))]
 mod group_rpc;
 pub mod group_session;
 pub mod hls_trace;

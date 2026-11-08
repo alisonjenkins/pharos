@@ -711,11 +711,11 @@ pub fn tap_peak(_id: &str) -> Option<f32> {
     None
 }
 
-/// The host has no server: the in-memory groups.
-pub type Groups = super::together::FakeGroups;
+/// The session's [`super::group_rpc::Groups`], as this TV's member.
+pub type Groups = super::group_rpc::Groups;
 
-pub fn groups(_api: &NativeApi) -> Groups {
-    Groups::default()
+pub fn groups(api: &NativeApi) -> Groups {
+    Groups::new(api, android::group_device())
 }
 
 // ---- the bridge ---------------------------------------------------------
