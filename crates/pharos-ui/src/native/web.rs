@@ -349,6 +349,13 @@ pub fn art_src(src: &str) -> String {
 
 pub struct BackAtRoot;
 
+/// `timeupdate` reaches the player as a Dioxus event here.
+pub struct TimeUpdates;
+
+pub fn on_time_update(_on_tick: impl FnMut(&str) + 'static) -> TimeUpdates {
+    TimeUpdates
+}
+
 /// The remote's Back at the first page (the Android TV app only): a browser
 /// leaves the page itself.
 pub fn on_back_at_root(_on_back: impl FnMut() -> bool + 'static) -> BackAtRoot {
