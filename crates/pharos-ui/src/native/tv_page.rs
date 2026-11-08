@@ -166,6 +166,9 @@ pub enum Bridge {
     },
     /// The WebView's history moved (the remote's Back) to `path`.
     Pop { path: String },
+    /// The remote's Back at the first page, where the WebView has no page
+    /// before to go back to.
+    Root,
     /// The viewport's CSS size.
     Size { w: f64, h: f64 },
     /// A media element's state, after any of its events.
@@ -391,6 +394,10 @@ mod tests {
                 text: false,
                 at: KeyContext::default(),
             })
+        );
+        assert_eq!(
+            parse_bridge(&serde_json::json!({"t": "root"})),
+            Some(Bridge::Root)
         );
         let pop = serde_json::json!({"t": "pop", "path": "/ui/"});
         assert_eq!(

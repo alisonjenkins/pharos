@@ -318,6 +318,14 @@ pub fn on_escape(mut on_escape: impl FnMut() + 'static) -> EscapeWatch {
     EscapeWatch(listener)
 }
 
+pub struct BackAtRoot;
+
+/// The remote's Back at the first page (the Android TV app only): a browser
+/// leaves the page itself.
+pub fn on_back_at_root(_on_back: impl FnMut() -> bool + 'static) -> BackAtRoot {
+    BackAtRoot
+}
+
 /// Call `on_path` with the new path whenever Back or Forward moves history.
 pub fn on_pop_state(mut on_path: impl FnMut(String) + 'static) -> PopState {
     let listener = Closure::<dyn FnMut(web_sys::Event)>::new(move |_| on_path(current_path()));

@@ -228,6 +228,43 @@ pub fn on_pop_state(on_path: impl FnMut(String) + 'static) -> PopState {
     PopState(listen(Listener::Pop(Box::new(on_path))))
 }
 
+/// A listener for the remote's Back at the first page, removed on drop.
+pub struct BackAtRoot(u64);
+
+impl Drop for BackAtRoot {
+    fn drop(&mut self) {
+        unlisten(self.0);
+    }
+}
+
+/// Call `on_back` when the remote's Back is pressed at the first page. It
+/// answers whether it used the press (closing the player, say); when no
+/// listener does, the app goes to the background, as Android's own Back
+/// would have.
+pub fn on_back_at_root(on_back: impl FnMut() -> bool + 'static) -> BackAtRoot {
+    BackAtRoot(listen(Listener::Root(Box::new(on_back))))
+}
+
+/// Send the app to the background (`Activity.moveTaskToBack`), as Back at
+/// the first page does in any Android app.
+fn leave_app() {
+    let left = (|| -> Result<(), String> {
+        let ctx = ndk_context::android_context();
+        // SAFETY: tao put the process's JavaVM and the activity in the
+        // context at start-up, and both live as long as the app.
+        let vm = unsafe { jni::JavaVM::from_raw(ctx.vm().cast()) }.map_err(|e| e.to_string())?;
+        let mut env = vm.attach_current_thread().map_err(|e| e.to_string())?;
+        let activity = unsafe { jni::objects::JObject::from_raw(ctx.context().cast()) };
+        env.call_method(&activity, "moveTaskToBack", "(Z)Z", &[true.into()])
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    })();
+    match left {
+        Ok(()) => log::info!("pharos: back at root action=leave"),
+        Err(e) => log::warn!("pharos: back at root leave failed error={e}"),
+    }
+}
+
 /// The WebView answers `maybe` for HLS but does not play it well; hls.js
 /// over MSE does (spike 0).
 pub fn plays_hls() -> bool {
@@ -1104,6 +1141,8 @@ enum Listener {
     Mode(Box<dyn FnMut(&str) -> bool>),
     Escape(Box<dyn FnMut()>),
     Pop(Box<dyn FnMut(String)>),
+    /// The remote's Back at the first page; true when it used the press.
+    Root(Box<dyn FnMut() -> bool>),
     /// hls.js events for the player on one media element.
     Hls(String, Box<dyn FnMut(tv_page::HlsEvent)>),
 }
@@ -1186,7 +1225,23 @@ addEventListener("keydown", (e) => {
     on_button: !!(at && at.matches && at.matches("a[href], button")),
   });
 });
-addEventListener("popstate", () => send({ t: "pop", path: location.pathname + location.search }));
+// The WebView takes the remote's Back only while it has a page to go back
+// to; at the first one Android leaves the app, over an open player too. A
+// guard entry under the first page keeps one there, and Rust decides what
+// Back at the first page does.
+if (!window.__pharosGuard) {
+  window.__pharosGuard = true;
+  history.replaceState("pharos-guard", "", location.href);
+  history.pushState("pharos", "", location.href);
+}
+addEventListener("popstate", (e) => {
+  if (e.state === "pharos-guard") {
+    history.pushState("pharos", "", location.href);
+    send({ t: "root" });
+    return;
+  }
+  send({ t: "pop", path: location.pathname + location.search });
+});
 window.__pharosSend = send;
 // Media events do not bubble, but a capturing listener on the document
 // hears every media element's.
@@ -1289,6 +1344,19 @@ fn on_bridge(message: Bridge) {
                         f();
                     }
                 }
+            }
+        }
+        Bridge::Root => {
+            let mut used = false;
+            for f in &listeners {
+                if let Ok(mut f) = f.try_lock() {
+                    if let Listener::Root(f) = &mut f.0 {
+                        used |= f();
+                    }
+                }
+            }
+            if !used {
+                leave_app();
             }
         }
         Bridge::Pop { path } => {
