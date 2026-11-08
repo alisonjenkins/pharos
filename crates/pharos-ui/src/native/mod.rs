@@ -18,6 +18,7 @@ pub mod diagnostics;
 pub mod find;
 pub mod group_app;
 pub mod group_session;
+pub mod hls_trace;
 #[cfg(all(feature = "web", target_arch = "wasm32"))]
 mod hls_web;
 pub mod keymap;
