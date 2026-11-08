@@ -9,6 +9,7 @@ use super::playback::{
     parse_crossfade, MseEngine, SubtitleSize, CROSSFADE_CHOICES, MAX_BITRATE_CHOICES,
 };
 use super::settings::Choices;
+use super::turn::EpisodeTurn;
 
 #[component]
 pub fn PlaybackView(
@@ -23,7 +24,15 @@ pub fn PlaybackView(
     /// The engine that plays HLS through Media Source Extensions here.
     engine: MseEngine,
     on_engine: EventHandler<MseEngine>,
+    /// Whether opening an episode or moving to the next turns like a cube.
+    #[props(default)]
+    episode_turn: EpisodeTurn,
+    #[props(default)] on_episode_turn: EventHandler<EpisodeTurn>,
 ) -> Element {
+    let turns = EpisodeTurn::ALL
+        .iter()
+        .map(|t| (t.as_str().to_owned(), t.label().to_owned()))
+        .collect::<Vec<_>>();
     let engines = MseEngine::ALL
         .iter()
         .map(|e| (e.as_str().to_owned(), e.label().to_owned()))
@@ -79,6 +88,22 @@ pub fn PlaybackView(
                                 on_max_quality.call(bps);
                             }
                         },
+                    }
+                }
+                div { class: "pharos-setting pharos-episode-turn",
+                    div { class: "pharos-setting-text",
+                        p { class: "pharos-setting-name", id: "episode-turn-label", "Episode transitions" }
+                        p { id: "episode-turn-help", class: "pharos-setting-help",
+                            "Opening an episode, or moving to the next, turns like a cube that follows the load, landing as the video starts. Off, or with reduced motion on, the video simply appears. Kept on this device."
+                        }
+                    }
+                    Choices {
+                        id: "episode-turn",
+                        labelled_by: "episode-turn-label",
+                        described_by: "episode-turn-help".to_owned(),
+                        options: turns,
+                        selected: episode_turn.as_str().to_owned(),
+                        on_pick: move |value: String| on_episode_turn.call(EpisodeTurn::parse(&value)),
                     }
                 }
                 div { class: "pharos-setting pharos-subtitle-size",
@@ -264,6 +289,18 @@ mod tests {
         );
         assert!(html.contains("id=\"crossfade-12\""), "{html}");
         assert_eq!(pressed(&html, "crossfade").len(), 1, "{html}");
+    }
+
+    #[test]
+    fn episode_turn_is_offered_and_starts_on() {
+        let html = page(0, SubtitleSize::Medium, 0);
+        assert!(html.contains("Episode transitions"), "{html}");
+        assert!(
+            button(&html, "episode-turn-turn").contains("aria-pressed=\"true\""),
+            "{html}"
+        );
+        assert!(html.contains("id=\"episode-turn-off\""), "{html}");
+        assert_eq!(pressed(&html, "episode-turn").len(), 1, "{html}");
     }
 
     #[test]

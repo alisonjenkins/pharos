@@ -449,6 +449,15 @@ pub fn apply_device(_device: super::playback::DeviceClass) {}
 
 pub fn apply_library_transition(_fx: LibraryTransition) {}
 
+/// No layer off the web: no turn begins.
+pub fn turn_begin(_item: &str, _dir: super::turn::Direction) -> bool {
+    false
+}
+pub fn turn_expect(_item: &str, _dir: super::turn::Direction) {}
+pub fn turn_open(_item: &str) {}
+pub fn turn_ready(_item: &str, _image: Option<&str>, _title: &str) {}
+pub fn turn_cancel(_item: &str, _reason: &str) {}
+
 pub fn apply_overlay_effect(_fx: OverlayEffect) {}
 
 pub fn prefers(_query: &str) -> bool {
