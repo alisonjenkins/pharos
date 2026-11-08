@@ -145,24 +145,44 @@ pub async fn latest(
     kinds: &KindFilter,
     limit: Option<u32>,
 ) -> Result<Vec<(MediaItem, UserItemData)>, ListError> {
-    let all = state.list_items_cached().await.map_err(ListError::Store)?;
-    let all = crate::services::access::visible_items(state, user, all, "latest")
-        .await
-        .map_err(ListError::Hidden)?;
-    // Home-page "Latest" rows must match the library the user clicked into,
-    // and jellyfin-web's "Latest Movies" row filters to Type=Movie.
-    let scoped = restrict_to_parent(state, &all, parent_id).await;
-    let mut typed = kinds.keep(scoped);
+    use crate::api::jellyfin::items::{
+        apply_policy_scope, resolve_parent_filter, ParentResolution,
+    };
+    use pharos_core::{MediaQuery, SortDir, SortKey};
+    let limit = limit.unwrap_or(LATEST_MAX).min(LATEST_MAX);
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
     // B97 — "Latest" means most-recently-ADDED first (DateCreated desc), so a
-    // newly scanned film surfaces in the home "Recently Added" row. Rows
-    // lacking a timestamp sort last; id breaks ties so the order is stable.
-    typed.sort_by(|a, b| {
-        b.created_at
-            .unwrap_or(i64::MIN)
-            .cmp(&a.created_at.unwrap_or(i64::MIN))
-            .then(b.id.cmp(&a.id))
-    });
-    typed.truncate(limit.unwrap_or(LATEST_MAX).min(LATEST_MAX) as usize);
+    // newly scanned film surfaces in the home "Recently Added" row; id breaks
+    // ties so the order is stable. Home-page rows must match the library the
+    // user clicked into, and jellyfin-web's "Latest Movies" row filters to
+    // Type=Movie.
+    let mut mq = MediaQuery {
+        limit: Some(limit),
+        sort: vec![
+            (SortKey::DateCreated, SortDir::Desc),
+            (SortKey::Id, SortDir::Desc),
+        ],
+        ..MediaQuery::default()
+    };
+    match kinds {
+        KindFilter::Unset => {}
+        KindFilter::MatchesNothing => return Ok(Vec::new()),
+        KindFilter::Kinds(wanted) => mq.kinds.clone_from(wanted),
+    }
+    match resolve_parent_filter(state, parent_id)
+        .await
+        .map_err(ListError::Store)?
+    {
+        ParentResolution::Empty => return Ok(Vec::new()),
+        ParentResolution::All => {}
+        ParentResolution::Filter(pf) => mq.parent = Some(pf),
+        ParentResolution::PathPrefix(p) => mq.filters.path_prefix = Some(p),
+        ParentResolution::GenreProbe(t) => mq.filters.genre_probe_token = Some(t),
+    }
+    apply_policy_scope(&mut mq, &user.policy, &state.parental_ratings);
+    let (mut typed, _total) = state.stores.query(&mq).await.map_err(ListError::Store)?;
     crate::services::metadata_text::localize_items(state, user.id, typed.iter_mut()).await;
     let ids: Vec<u64> = typed.iter().map(|i| i.id).collect();
     let user_data = state
