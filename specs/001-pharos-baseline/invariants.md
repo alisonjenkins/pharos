@@ -579,3 +579,5 @@ load-bearing — tasks, bugs and code comments cite these ids. Never renumber; a
 - V777: the sign-in form's name field takes the focus on arrival (B827). Guarded by pharos-ui `the_sign_in_focus_goes_to_the_name_field`.
 - V787: under 40rem the pharos-ui player's skip button is placed from the top, never at a fixed `bottom` that the wrapped control row can reach (B838). Guarded by pharos-ui `on_a_phone_the_skip_button_clears_the_wrapped_controls`.
 - V788: Esc closes the command palette from any focused element inside its dialog, once per press (B839). Guarded by the browser check (compat-playwright has no case yet).
+- V802: the generated styled track is compiled at the viewer's subtitle size, and each size is cached apart (B852). Guarded by pharos-server `a_size_scales_the_dialogue_style` and pharos-styling `scaled_grows_text_outline_and_shadow_but_not_margins`.
+- V803: a native playback with no stated or remembered subtitle starts on the styled track when the default rules pick its source, and never overrides a stated pick (B853). Guarded by pharos-server `the_styled_track_is_the_default_where_its_source_would_show`.
