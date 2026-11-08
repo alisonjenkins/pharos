@@ -12,6 +12,19 @@ pub const RESUME_TIMEOUT_MS: f64 = 5_000.0;
 /// above the routing's own zero.
 pub const AUDIBLE_PEAK: f32 = 0.001;
 
+/// How long a paused song keeps its tap's `AudioContext` running (B734,
+/// V683). A running context holds the browser's output stream open, so the
+/// sound server does not suspend an idle output device under the pause and
+/// the resume does not wait for the device to wake. After this the context
+/// is suspended, sparing the device on a long pause.
+pub const REST_AFTER_PAUSE_MS: f64 = 300_000.0;
+
+/// Whether a song paused at `paused_at_ms` and not played since rests its
+/// output by `now_ms`.
+pub fn rests(paused_at_ms: f64, now_ms: f64) -> bool {
+    now_ms - paused_at_ms >= REST_AFTER_PAUSE_MS
+}
+
 /// Whether a media element playing `src` on a page at `origin` can be routed
 /// through Web Audio (V682): a cross-origin source without CORS would play
 /// silence once routed, and WebKit's native HLS feeds a
@@ -571,6 +584,13 @@ mod tests {
             .expect("nothing to wait for");
         assert_eq!(report.click_to_playing_ms, Some(3));
         assert_eq!(report.playing_to_audible, Audible::Untapped);
+    }
+
+    #[test]
+    fn a_paused_song_rests_its_output_after_five_minutes() {
+        assert!(!rests(1_000.0, 1_000.0));
+        assert!(!rests(1_000.0, 300_999.0));
+        assert!(rests(1_000.0, 301_000.0));
     }
 
     #[test]

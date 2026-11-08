@@ -904,6 +904,34 @@ fn start_resume(id: &str, item: ResumeItem, slot: &ResumeSlot) -> u64 {
     n
 }
 
+/// Keep the paused song's output warm, then rest it (B734, V683): a tap's
+/// running `AudioContext` holds the output stream open through the pause,
+/// so the sound server leaves the device awake for the resume. A pause still
+/// unbroken after [`super::resume::REST_AFTER_PAUSE_MS`] suspends the
+/// context; the play that ends it wakes the context first.
+async fn rest_after_pause(slot: ResumeSlot, paused_at: f64) {
+    let state = platform::resume_context(VIDEO_ID)
+        .audio
+        .map_or_else(|| "untapped".to_owned(), |a| a.context_state);
+    platform::info(&format!(
+        "pharos: audio output warm reason=paused context_state={state} rest_after_ms={}",
+        super::resume::REST_AFTER_PAUSE_MS
+    ));
+    // Lossless: the constant is a whole number of ms well inside u32.
+    platform::sleep_ms(super::resume::REST_AFTER_PAUSE_MS as u32).await;
+    if slot.borrow().paused_at != Some(paused_at)
+        || !super::resume::rests(paused_at, platform::now_ms())
+    {
+        return;
+    }
+    match platform::rest_tap(VIDEO_ID) {
+        Some(state) => platform::info(&format!(
+            "pharos: audio output rest reason=paused_too_long state_before={state}"
+        )),
+        None => platform::info("pharos: audio output rest reason=untapped state_before=none"),
+    }
+}
+
 /// Measure resume number `resume` of the media element `id` until it
 /// sounds, is paused again, or times out (V473).
 async fn watch_resume(id: &'static str, slot: ResumeSlot, resume: u64) {
@@ -4397,6 +4425,7 @@ fn Player(
         let handed_off = Rc::clone(&handed_off);
         let (watch, assess) = (watch.clone(), Rc::clone(&assess));
         let resume = Rc::clone(&resume);
+        let music = p.kind == ItemKind::Audio;
         move |event: MediaEvent| {
             if retiring.get() {
                 return;
@@ -4411,9 +4440,15 @@ fn Player(
                 MediaEvent::Pause => {
                     let now = platform::now_ms();
                     let mut slot = resume.borrow_mut();
-                    // A second pause event inside one pause keeps its start.
-                    if slot.paused_at.is_none() {
-                        slot.paused_at = Some(now);
+                    // Each pause restarts the clock: a play that never reached
+                    // `playing` (refused, or stalled) did not end the pause
+                    // the listener sees, but the newer pause is what they
+                    // last did. An earlier rest timer sees the newer start
+                    // and stands down.
+                    slot.paused_at = Some(now);
+                    // Only a song is tapped; a video has no context to rest.
+                    if music {
+                        spawn(rest_after_pause(Rc::clone(&resume), now));
                     }
                     slot.probe.as_mut().and_then(ResumeProbe::paused)
                 }

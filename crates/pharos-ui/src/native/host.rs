@@ -509,6 +509,12 @@ pub fn tap_wake(_id: &str) -> super::resume::Wake {
     super::resume::Wake::None
 }
 
+pub fn wake_media_tap(_id: &str) {}
+
+pub fn rest_tap(_id: &str) -> Option<String> {
+    None
+}
+
 /// The host has no server: the in-memory groups.
 pub type Groups = super::together::FakeGroups;
 
