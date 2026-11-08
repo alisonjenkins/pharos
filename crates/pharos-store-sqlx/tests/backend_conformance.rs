@@ -680,6 +680,37 @@ where
     assert_eq!(batch, vec![item.clone()]);
     assert!(MediaStore::get_many(&store, &[]).await.unwrap().is_empty());
 
+    // B831 / V781 — newest-first with the id tiebreak and a limit is answered
+    // by the store, and agrees with sorting the full list in memory.
+    let mut every = MediaStore::list(&store).await.unwrap();
+    every.sort_by(|a, b| {
+        b.created_at
+            .unwrap_or(i64::MIN)
+            .cmp(&a.created_at.unwrap_or(i64::MIN))
+            .then(b.id.cmp(&a.id))
+    });
+    let newest = MediaStore::query(
+        &store,
+        &MediaQuery {
+            limit: Some(3),
+            sort: vec![
+                (
+                    pharos_core::SortKey::DateCreated,
+                    pharos_core::SortDir::Desc,
+                ),
+                (pharos_core::SortKey::Id, pharos_core::SortDir::Desc),
+            ],
+            ..MediaQuery::default()
+        },
+    )
+    .await
+    .unwrap()
+    .0;
+    assert_eq!(
+        newest.iter().map(|i| i.id).collect::<Vec<_>>(),
+        every.iter().take(3).map(|i| i.id).collect::<Vec<_>>()
+    );
+
     // B257 — the row holding a path is found by the path, whatever its id.
     assert_eq!(
         MediaStore::id_at_path(&store, &item.path).await.unwrap(),
