@@ -342,8 +342,10 @@ impl<Rend: WindowRenderer> View<Rend> {
                     UiEvent::KeyUp(key_event_data)
                 };
 
+                // A key only needs a frame if it changed the document; the
+                // app's re-render reaches `poll`, which asks for one. Drawing
+                // here as well cost two extra frames per remote press.
                 self.doc.handle_ui_event(event);
-                self.request_redraw();
             }
 
 
