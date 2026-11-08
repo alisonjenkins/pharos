@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- dx writes app_name as the bin name in Pascal case ("PharosTv"); the
+     manifest labels the app directly, and this covers anything that still
+     reads the string. -->
+<resources>
+    <string name="app_name">Pharos</string>
+</resources>
