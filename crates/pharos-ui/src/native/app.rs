@@ -47,7 +47,7 @@ use super::playback_settings;
 use super::privacy;
 use super::quality::{self, Watch};
 use super::queue::{Queue, QueueAction, QueueCtx, Track, RESTART_AFTER_MS};
-use super::resume::{ResumeProbe, ResumeReport};
+use super::resume::{Item as ResumeItem, ResumeProbe, ResumeReport};
 use super::route::Route;
 use super::seen::{self, MemberSeen};
 use super::settings::{Section, SettingsLayout};
@@ -863,29 +863,43 @@ async fn fade(id: &'static str, from: f64, to: f64, fade_ms: u64, cancel: Rc<Cel
 /// How often a resume in flight reads the analyser (B563).
 const RESUME_STEP_MS: u32 = 10;
 
-/// A resume in flight, and a count of resumes so a superseded watch stops.
-type ResumeSlot = Rc<RefCell<(u64, Option<ResumeProbe>)>>;
+/// A resume in flight, a count of resumes so a superseded watch stops, and
+/// when the song was last paused.
+#[derive(Default)]
+struct ResumeState {
+    count: u64,
+    probe: Option<ResumeProbe>,
+    /// `now_ms` of the pause the song is in; `None` while it plays.
+    paused_at: Option<f64>,
+}
 
-fn report_resume(report: &ResumeReport) {
+type ResumeSlot = Rc<RefCell<ResumeState>>;
+
+/// Log and send `report`, with the wake of the tap on [`VIDEO_ID`] as it
+/// stands now (B735).
+fn report_resume(report: ResumeReport) {
+    let report = report.with_wake(platform::tap_wake(VIDEO_ID));
     platform::info(&report.line());
     platform::report_event(report.event());
 }
 
-/// Start timing a resume of the media element `id`, before `play()` so its
-/// `playing` cannot come first. Returns the resume's number.
-fn start_resume(id: &str, slot: &ResumeSlot) -> u64 {
+/// Start timing a resume of `item` on the media element `id`, before
+/// `play()` so its `playing` cannot come first. Returns the resume's number.
+fn start_resume(id: &str, item: ResumeItem, slot: &ResumeSlot) -> u64 {
     let (n, superseded) = {
         let mut slot = slot.borrow_mut();
-        let superseded = slot.1.as_mut().and_then(ResumeProbe::superseded);
-        slot.0 = slot.0.wrapping_add(1);
-        slot.1 = Some(ResumeProbe::start(
+        let superseded = slot.probe.as_mut().and_then(ResumeProbe::superseded);
+        slot.count = slot.count.wrapping_add(1);
+        slot.probe = Some(ResumeProbe::start(
             platform::now_ms(),
             platform::resume_context(id),
+            item,
+            slot.paused_at,
         ));
-        (slot.0, superseded)
+        (slot.count, superseded)
     };
     if let Some(report) = superseded {
-        report_resume(&report);
+        report_resume(report);
     }
     n
 }
@@ -897,10 +911,10 @@ async fn watch_resume(id: &'static str, slot: ResumeSlot, resume: u64) {
         platform::sleep_ms(RESUME_STEP_MS).await;
         let report = {
             let mut slot = slot.borrow_mut();
-            if slot.0 != resume {
+            if slot.count != resume {
                 return;
             }
-            let Some(probe) = slot.1.as_mut() else {
+            let Some(probe) = slot.probe.as_mut() else {
                 return;
             };
             if probe.done() {
@@ -909,7 +923,7 @@ async fn watch_resume(id: &'static str, slot: ResumeSlot, resume: u64) {
             probe.frame(platform::now_ms(), platform::tap_peak(id))
         };
         if let Some(report) = report {
-            report_resume(&report);
+            report_resume(report);
             return;
         }
     }
@@ -3669,7 +3683,7 @@ fn Player(
     // out until the next is ready, but its end no longer moves the queue.
     let handed_off = use_hook(|| Rc::new(Cell::new(false)));
     let fade_in_cancel = use_hook(|| Rc::new(Cell::new(false)));
-    let resume: ResumeSlot = use_hook(|| Rc::new(RefCell::new((0, None))));
+    let resume: ResumeSlot = use_hook(ResumeSlot::default);
     let fade_in_ms = use_hook(|| fade_in.0.take());
     let clock = use_hook(|| Rc::new(RefCell::new(ReportClock::new())));
     let engine = use_hook(|| Rc::new(RefCell::new(None::<Box<dyn PlaybackEngine>>)));
@@ -4390,13 +4404,23 @@ fn Player(
             let resumed = match event {
                 MediaEvent::Playing => {
                     let now = platform::now_ms();
-                    resume.borrow_mut().1.as_mut().and_then(|p| p.playing(now))
+                    let mut slot = resume.borrow_mut();
+                    slot.paused_at = None;
+                    slot.probe.as_mut().and_then(|p| p.playing(now))
                 }
-                MediaEvent::Pause => resume.borrow_mut().1.as_mut().and_then(ResumeProbe::paused),
+                MediaEvent::Pause => {
+                    let now = platform::now_ms();
+                    let mut slot = resume.borrow_mut();
+                    // A second pause event inside one pause keeps its start.
+                    if slot.paused_at.is_none() {
+                        slot.paused_at = Some(now);
+                    }
+                    slot.probe.as_mut().and_then(ResumeProbe::paused)
+                }
                 _ => None,
             };
             if let Some(report) = resumed {
-                report_resume(&report);
+                report_resume(report);
             }
             match event {
                 MediaEvent::Waiting => {
@@ -4551,8 +4575,14 @@ fn Player(
                     // on a load; neither is a resume of a paused song.
                     let state = platform::media_state(VIDEO_ID);
                     let in_group = session().is_some_and(|s| s.drives());
-                    let resuming = (state.paused && state.position_ms > 0 && !in_group)
-                        .then(|| start_resume(VIDEO_ID, &resume));
+                    let resuming =
+                        (state.paused && state.position_ms > 0 && !in_group).then(|| {
+                            let item = match p.kind {
+                                ItemKind::Audio => ResumeItem::Music,
+                                _ => ResumeItem::Video,
+                            };
+                            start_resume(VIDEO_ID, item, &resume)
+                        });
                     if !session().is_some_and(|s| s.toggle_play()) {
                         platform::toggle_play(VIDEO_ID);
                     }

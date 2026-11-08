@@ -3736,6 +3736,8 @@ struct TapNodes {
     media: web_sys::HtmlMediaElement,
     context: web_sys::AudioContext,
     analyser: web_sys::AnalyserNode,
+    /// How the last play's wake of `context` went (B735).
+    wake: Rc<Cell<super::resume::Wake>>,
 }
 
 thread_local! {
@@ -3765,29 +3767,41 @@ fn context_state(context: &web_sys::AudioContext) -> String {
 /// A routed element plays into a suspended `AudioContext` in silence, so
 /// wake the context of `media`'s tap before it plays.
 fn wake_tap(media: &web_sys::HtmlMediaElement) {
-    let Some(context) = with_tap(media, |t| t.context.clone()) else {
+    use super::resume::Wake;
+    let Some((context, wake)) = with_tap(media, |t| (t.context.clone(), Rc::clone(&t.wake))) else {
         return;
     };
     let state = context_state(&context);
+    wake.set(Wake::None);
     if super::resume::wakes_context(&state) {
+        wake.set(Wake::Pending);
         info(&format!(
             "pharos: resume context was not running state={state}"
         ));
         match context.resume() {
-            Err(e) => warn(&format!("pharos: resume context resume() refused: {e:?}")),
+            Err(e) => {
+                wake.set(Wake::Refused);
+                warn(&format!("pharos: resume context resume() refused: {e:?}"));
+            }
             // The promise settles after the play; its outcome is logged on
             // its own, as the report (`context_resumed`) only says a wake
             // was asked for.
             Ok(promise) => wasm_bindgen_futures::spawn_local(async move {
                 match wasm_bindgen_futures::JsFuture::from(promise).await {
-                    Ok(_) => info(&format!(
-                        "pharos: resume context resumed state={}",
-                        context_state(&context)
-                    )),
-                    Err(e) => warn(&format!(
-                        "pharos: resume context resume() rejected: {e:?} state={}",
-                        context_state(&context)
-                    )),
+                    Ok(_) => {
+                        wake.set(Wake::Resumed);
+                        info(&format!(
+                            "pharos: resume context resumed state={}",
+                            context_state(&context)
+                        ));
+                    }
+                    Err(e) => {
+                        wake.set(Wake::Rejected);
+                        warn(&format!(
+                            "pharos: resume context resume() rejected: {e:?} state={}",
+                            context_state(&context)
+                        ));
+                    }
                 }
             }),
         }
@@ -3834,7 +3848,16 @@ pub fn resume_context(id: &str) -> super::resume::ResumeContext {
         engine,
         muted: media.muted() || media.volume() <= 0.0,
         audio,
+        user_agent: user_agent(),
     }
+}
+
+/// How the last play's wake of the tap on the media element `id` went
+/// (B735); `Wake::None` with no tap.
+pub fn tap_wake(id: &str) -> super::resume::Wake {
+    video_element(id)
+        .and_then(|media| with_tap(&media, |t| t.wake.get()))
+        .unwrap_or_default()
 }
 
 /// The largest sample in the tap's latest window on the media element `id`,
@@ -3886,6 +3909,7 @@ pub fn audio_tap(media_id: &str) -> Result<Box<dyn super::visualiser::AudioTap>,
             media: media.clone(),
             context: context.clone(),
             analyser: analyser.clone(),
+            wake: Rc::default(),
         })
     });
     Ok(Box::new(WebAudioTap {
