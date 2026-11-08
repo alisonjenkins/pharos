@@ -1,8 +1,9 @@
 //! Android TV entrypoint (spec 025). Built with `--features mobile` for an
 //! Android target; `nix run .#android-apk` drives the whole build.
 //!
-//! Slice 1 in progress: the shared `App` does not run here yet (its DOM reads
-//! are not ported), so this launches a placeholder screen.
+//! Runs the shared `App` in the system WebView. Its DOM reads go through
+//! `document::eval` (`native/android_page.rs`), and the page's requests to
+//! the server are answered by the app with the device token in a header.
 
 #[cfg(target_os = "android")]
 fn main() {
@@ -13,14 +14,23 @@ fn main() {
             .with_max_level(log::LevelFilter::Info)
             .with_tag("pharos-tv"),
     );
-    dioxus::launch(|| {
+    log::info!(
+        "pharos: start tokio={}",
+        tokio::runtime::Handle::try_current().is_ok()
+    );
+    dioxus::launch(root);
+
+    fn root() -> Element {
+        pharos_ui::native::use_server_proxy();
+        // The shared stylesheet is the server's, through the proxy, so it
+        // matches the server's UI. Linked here, after the proxy's handlers
+        // are in: a link in the page's head loads before them and comes
+        // back empty.
         rsx! {
-            main {
-                style: "display:flex;align-items:center;justify-content:center;height:100vh;margin:0;background:#101014;color:#eee;font:32px sans-serif;",
-                "Pharos for Android TV is in progress."
-            }
+            document::Stylesheet { href: "/ui/assets/pharos.css" }
+            pharos_ui::App {}
         }
-    });
+    }
 }
 
 #[cfg(not(target_os = "android"))]
