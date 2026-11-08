@@ -156,6 +156,7 @@ mod tests {
                     .unwrap();
                 store.query(&MediaQuery::default()).await.unwrap();
                 let _ = MediaStore::get(&store, 1).await;
+                store.get_many(&[1, 2]).await.unwrap();
                 store.get_user_data(UserId::default(), 1).await.unwrap();
                 store
                     .user_data_bulk(UserId::default(), &[1, 2])
@@ -168,6 +169,7 @@ mod tests {
         for method in [
             "query_items",
             "get_item",
+            "get_items_by_ids",
             "get_user_data",
             "user_data_bulk",
             "mark_seen_batch",

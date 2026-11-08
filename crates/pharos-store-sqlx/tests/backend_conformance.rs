@@ -652,6 +652,14 @@ where
     let listed_items = MediaStore::list(&store).await.unwrap();
     assert!(listed_items.iter().any(|i| i.id == item_id));
 
+    // B811 / V761 — a batch fetch skips ids with no row and returns the same
+    // row `get` does, on both backends (order is covered in it_sqlite).
+    let batch = MediaStore::get_many(&store, &[990_999, item_id, 990_998])
+        .await
+        .unwrap();
+    assert_eq!(batch, vec![item.clone()]);
+    assert!(MediaStore::get_many(&store, &[]).await.unwrap().is_empty());
+
     // B257 — the row holding a path is found by the path, whatever its id.
     assert_eq!(
         MediaStore::id_at_path(&store, &item.path).await.unwrap(),

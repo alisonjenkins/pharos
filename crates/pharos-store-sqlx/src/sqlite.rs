@@ -755,6 +755,33 @@ impl MediaStore for SqliteStore {
         }
     }
 
+    #[tracing::instrument(skip(self, ids), fields(count = ids.len()))]
+    async fn get_many(&self, ids: &[MediaId]) -> DomainResult<Vec<MediaItem>> {
+        /// Well under SQLite's bound-variable limit.
+        const CHUNK: usize = 500;
+        let mut by_id: std::collections::HashMap<MediaId, MediaItem> =
+            std::collections::HashMap::with_capacity(ids.len());
+        for chunk in ids.chunks(CHUNK) {
+            let marks = vec!["?"; chunk.len()].join(",");
+            let sql = format!("SELECT {MEDIA_COLUMNS} FROM media_items WHERE id IN ({marks})");
+            let mut q = sqlx::query_as::<_, MediaRow>(sqlx::AssertSqlSafe(sql));
+            for id in chunk {
+                let id_i64 = i64::try_from(*id)
+                    .map_err(|e| DomainError::Backend(format!("id overflow: {e}")))?;
+                q = q.bind(id_i64);
+            }
+            let rows = q
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| DomainError::Backend(e.to_string()))?;
+            for row in rows {
+                let item = row.into_domain()?;
+                by_id.insert(item.id, item);
+            }
+        }
+        Ok(ids.iter().filter_map(|id| by_id.get(id).cloned()).collect())
+    }
+
     #[tracing::instrument(skip(self, item), fields(media.id = %item.id, media.kind = item.kind.as_str()))]
     async fn put(&self, item: MediaItem) -> DomainResult<()> {
         let sql = crate::sqlite_put::upsert_sql(1);
