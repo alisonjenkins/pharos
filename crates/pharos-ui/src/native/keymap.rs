@@ -80,6 +80,8 @@ pub enum Transport {
     Fullscreen,
     NextSubtitle,
     NextAudio,
+    /// Skip the intro, recap or credits whose button is showing.
+    SkipSegment,
 }
 
 /// What a binding does.
@@ -433,6 +435,13 @@ pub const BINDINGS: &[Binding] = &[
         G::Play,
         VIDEO,
         A::Transport(Transport::NextAudio),
+    ),
+    bind(
+        &["s"],
+        "Skip intro or credits",
+        G::Play,
+        VIDEO,
+        A::Transport(Transport::SkipSegment),
     ),
     bind(
         &["a"],
@@ -949,6 +958,13 @@ mod tests {
         assert_eq!(t("3"), Some(Transport::SeekTenths(3)));
         assert_eq!(t("c"), Some(Transport::NextSubtitle));
         assert_eq!(t("a"), Some(Transport::NextAudio));
+        // B805: `s` presses the skip button; the music player's `s` is shuffle.
+        assert_eq!(t("s"), Some(Transport::SkipSegment));
+        assert_eq!(transport(Mode::Music, "s"), None);
+        let help_row = help(Mode::Player, None, |_| true)
+            .into_iter()
+            .find(|r| r.label == "Skip intro or credits");
+        assert_eq!(help_row.map(|r| r.keys), Some(vec!["s".to_owned()]));
         // Video-only keys are not the music player's.
         assert_eq!(transport(Mode::Music, "c"), None);
         assert_eq!(transport(Mode::Music, "k"), Some(Transport::VolumeUp));
