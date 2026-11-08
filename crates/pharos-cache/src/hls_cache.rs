@@ -1200,6 +1200,23 @@ fn top_level_boxes(raw: &[u8]) -> Option<Vec<([u8; 4], std::ops::Range<usize>)>>
     Some(boxes)
 }
 
+/// Flush a finished encode to disk before it is renamed into the keyed path.
+/// Without this the rename can reach the disk before the data, and after a
+/// power cut the cache holds a full-size file of zeros under a key every
+/// later request trusts (B890).
+async fn sync_file(path: &Path) -> std::io::Result<()> {
+    tokio::fs::File::open(path).await?.sync_all().await
+}
+
+/// Make a rename inside `dir` durable. Best-effort: a filesystem that cannot
+/// fsync a directory still has the file's own data synced.
+async fn sync_dir(dir: &Path) {
+    let synced = async { tokio::fs::File::open(dir).await?.sync_all().await }.await;
+    if let Err(e) = synced {
+        tracing::debug!(dir = %dir.display(), error = %e, "could not fsync cache directory");
+    }
+}
+
 /// Appends the filler's fragments to the frames before the hole, writing the
 /// result over `filler`. The filler is encoded for the rest of the window under
 /// the same rendition, so its `moov` matches the partial's and only its
@@ -3534,6 +3551,9 @@ impl HlsSegmentCache {
                 "transcode produced empty/truncated segment ({produced} bytes)"
             )));
         }
+        sync_file(&tmp)
+            .await
+            .map_err(|e| counted("publish_sync", e.into()))?;
         // Raised BEFORE the rename, not after: a flag set afterwards leaves the
         // window it exists to close. Setting it early can only cost a
         // cancellation that was about to become unsafe anyway — the encode is
@@ -3542,6 +3562,9 @@ impl HlsSegmentCache {
         tokio::fs::rename(&tmp, &path)
             .await
             .map_err(|e| counted("publish_rename", e.into()))?;
+        if let Some(parent) = path.parent() {
+            sync_dir(parent).await;
+        }
 
         let bytes = tokio::fs::read(&path)
             .await
