@@ -3078,6 +3078,7 @@ impl PlaybackEngine for HlsJs {
         };
         player.on("hlsError", on_error.as_ref().unchecked_ref());
         player.on("hlsFragLoaded", on_loaded.as_ref().unchecked_ref());
+        mark_engine(&video, "hlsjs");
         player.load_source(url);
         player.attach_media(&video);
         self.player = Some(player);
@@ -3759,6 +3760,15 @@ fn wake_tap(media: &web_sys::HtmlMediaElement) {
     }
 }
 
+/// Names the MSE engine attaching to `media`, for [`resume_context`].
+pub fn mark_engine(media: &web_sys::HtmlMediaElement, engine: &str) {
+    if let Err(e) = media.set_attribute(super::resume::ENGINE_MARK, engine) {
+        warn(&format!(
+            "pharos: engine mark failed engine={engine} error={e:?}"
+        ));
+    }
+}
+
 /// The media element `id` and its audio path as a resume finds them.
 pub fn resume_context(id: &str) -> super::resume::ResumeContext {
     use super::resume::{AudioPath, ResumeContext};
@@ -3773,7 +3783,7 @@ pub fn resume_context(id: &str) -> super::resume::ResumeContext {
         .map_or(0.0, |(_, end)| end - now);
     let src = media.current_src();
     let engine = if src.starts_with("blob:") {
-        "hlsjs"
+        super::resume::blob_engine(media.get_attribute(super::resume::ENGINE_MARK).as_deref())
     } else if src.split('?').next().is_some_and(|p| p.ends_with(".m3u8")) {
         "native_hls"
     } else {
