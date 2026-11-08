@@ -36,11 +36,22 @@ pub struct MarkPlayed(pub EventHandler<(ItemRef, bool)>);
 pub struct PlayFromStart(pub EventHandler<ItemRef>);
 
 /// A button that marks `id` watched, or unwatched when `played`. `what`
-/// names a whole group it marks, such as "season".
+/// names a whole group it marks, such as "season". A song is played, not
+/// watched (V752).
 #[component]
-pub fn WatchedToggle(id: ItemRef, played: bool, what: Option<String>) -> Element {
+pub fn WatchedToggle(
+    id: ItemRef,
+    played: bool,
+    what: Option<String>,
+    #[props(default)] listen: bool,
+) -> Element {
     let mark = use_context::<MarkPlayed>();
-    let state = if played { "unwatched" } else { "watched" };
+    let state = match (listen, played) {
+        (true, true) => "unplayed",
+        (true, false) => "played",
+        (false, true) => "unwatched",
+        (false, false) => "watched",
+    };
     let text = match what {
         Some(what) => format!("Mark {what} {state}"),
         None => format!("Mark {state}"),
@@ -688,7 +699,7 @@ pub fn PosterTile(item: Item) -> Element {
                     None => rsx! { ArtPlaceholder { kind: item.kind, name: item.name.clone() } },
                 }
                 if item.played {
-                    span { class: "pharos-badge", "Watched" }
+                    span { class: "pharos-badge", if item.kind == ItemKind::Audio { "Played" } else { "Watched" } }
                 }
                 if let Some(p) = progress {
                     div { class: "pharos-progress", style: "width: {p}%" }
@@ -825,7 +836,7 @@ pub fn TitleView(
                         Link { to: Route::Browse(item.id), class: "pharos-button", "Open" }
                     }
                     if item.kind.playable() {
-                        WatchedToggle { id: item.id, played: item.played }
+                        WatchedToggle { id: item.id, played: item.played, listen: item.kind == ItemKind::Audio }
                     }
                 }
                 InThisGroup { rows: group_rows }
@@ -2110,6 +2121,46 @@ mod tests {
             html.contains(r#"title="2001""#) && !html.contains("Ignored"),
             "{html}"
         );
+    }
+
+    /// B802 (V752): a song is marked played, not watched, on its title page
+    /// and its card; a film keeps "watched".
+    #[test]
+    fn a_song_is_played_not_watched() {
+        let mut song = item(ItemKind::Audio);
+        song.played = true;
+        let card = render({
+            let song = song.clone();
+            move || rsx! { PosterTile { item: song.clone() } }
+        });
+        assert!(
+            card.contains(">Played<") && !card.contains("Watched"),
+            "{card}"
+        );
+        song.played = false;
+        let detail = Detail {
+            item: song,
+            overview: String::new(),
+            genres: vec![],
+            chapters: vec![],
+            audio_tracks: vec![],
+            subtitle_tracks: vec![],
+            trickplay: vec![],
+            segments: vec![],
+            fonts: Vec::new(),
+            artists: Vec::new(),
+            album: None,
+        };
+        let page = render(move || rsx! { TitleView { detail: detail.clone() } });
+        assert!(
+            page.contains(">Mark played<") && !page.contains(">Mark watched<"),
+            "{page}"
+        );
+
+        let mut film = item(ItemKind::Movie);
+        film.played = true;
+        let card = render(move || rsx! { PosterTile { item: film.clone() } });
+        assert!(card.contains(">Watched<"), "{card}");
     }
 
     /// B801 (V751): a song with no cover gets the music tile, on its card and
