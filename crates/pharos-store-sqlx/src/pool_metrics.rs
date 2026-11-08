@@ -80,7 +80,12 @@ pub(crate) async fn sample_pool<DB: Database>(
                     .await
                     {
                         Ok(Ok(conn)) => {
-                            let _ = conn.close().await;
+                            // The database answered, so the verdict stands
+                            // whatever the close does; bound it so a slow
+                            // goodbye cannot stall the sampler (a timed-out
+                            // close drops the connection instead).
+                            let _ =
+                                tokio::time::timeout(DIRECT_CONNECT_TIMEOUT, conn.close()).await;
                             (ProbeTimeout::Saturated, String::new())
                         }
                         Ok(Err(error)) => (ProbeTimeout::DatabaseUnreachable, error.to_string()),
