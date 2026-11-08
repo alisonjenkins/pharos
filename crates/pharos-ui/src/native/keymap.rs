@@ -725,10 +725,63 @@ pub fn pick(dir: Dir, from: Rect, controls: &[Rect]) -> Option<usize> {
     }
 }
 
+/// [`pick`] with the player docked in a bar along the bottom (the TV's
+/// compact player) reached last: from the page, Down reaches the bar only
+/// with no page control below, so the arrows still scroll the page; in the
+/// bar, Left and Right stay in it and Up goes back to the page. `controls`
+/// pairs each rect with whether it is in the bar.
+pub fn pick_docked(
+    dir: Dir,
+    from: Rect,
+    from_docked: bool,
+    controls: &[(Rect, bool)],
+) -> Option<usize> {
+    let among = |docked: bool| -> Option<usize> {
+        let (index, rects): (Vec<usize>, Vec<Rect>) = controls
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, d))| *d == docked)
+            .map(|(i, (r, _))| (i, *r))
+            .unzip();
+        pick(dir, from, &rects).map(|at| index[at])
+    };
+    match (dir, from_docked) {
+        (Dir::First | Dir::Last, _) => {
+            let rects: Vec<Rect> = controls.iter().map(|(r, _)| *r).collect();
+            pick(dir, from, &rects)
+        }
+        (Dir::Down, false) => among(false).or_else(|| among(true)),
+        (Dir::Up, true) => among(false),
+        (Dir::Down, true) => None,
+        (_, docked) => among(docked),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
+
+    #[test]
+    fn the_docked_bar_is_reached_last_and_left_by_up() {
+        let play = (0.0, 650.0, 40.0, 40.0);
+        let close = (60.0, 650.0, 40.0, 40.0);
+        // A row on screen and one below the fold, under the fixed bar: Down
+        // goes on down the page.
+        let row = (0.0, 100.0, 100.0, 50.0);
+        let below = (0.0, 900.0, 100.0, 50.0);
+        let page = [(row, false), (below, false), (play, true), (close, true)];
+        assert_eq!(pick_docked(Dir::Down, row, false, &page), Some(1));
+        assert_eq!(pick_docked(Dir::Left, row, false, &page), None);
+        // Scrolled to the end, the last row sits above the bar: Down
+        // reaches it, Right moves in it, Up goes back to the page.
+        let last = (0.0, 500.0, 100.0, 50.0);
+        let end = [(row, false), (last, false), (play, true), (close, true)];
+        assert_eq!(pick_docked(Dir::Down, last, false, &end), Some(2));
+        assert_eq!(pick_docked(Dir::Right, play, true, &end), Some(3));
+        assert_eq!(pick_docked(Dir::Up, play, true, &end), Some(1));
+        assert_eq!(pick_docked(Dir::Down, play, true, &end), None);
+    }
 
     const ALL: [Mode; 5] = [
         Mode::Browse,
