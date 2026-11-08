@@ -2878,9 +2878,12 @@ test.describe("pharos Dioxus UI", () => {
       });
       await page.goto(`/ui/title/${nativeId}`);
       await page.getByRole("link", { name: /^(Play|Resume)$/ }).click();
-      await expect(page.getByText(/^Playback failed: the stream failed/)).toBeVisible({
+      // B806: the failure panel names what happened in plain words and keeps
+      // the raw reason as its details line.
+      await expect(page.getByText(/This video stopped playing\./).first()).toBeVisible({
         timeout: 30_000,
       });
+      await expect(page.getByText(/the stream failed/).first()).toBeVisible();
       expect(
         errors.some((e) => /engine=hlsjs .*fatal=true action=fail/.test(e)),
         errors.join("\n"),
