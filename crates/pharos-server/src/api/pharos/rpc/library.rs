@@ -5,15 +5,17 @@ use std::rc::Rc;
 
 use pharos_api::pharos_capnp::{
     home_result, item_detail, item_id, item_summary, items_result, library as wire, track,
-    user_state, Kind, LibraryKind as WireKind, SegmentKind, SubtitleDelivery,
+    user_state, version, Kind, LibraryKind as WireKind, SegmentKind, Stereo3d, StereoFilter,
+    SubtitleDelivery,
 };
 use pharos_api::{server, Denial};
-use pharos_core::{LibraryKind, MediaItem, MediaKind, UserItemData};
+use pharos_core::{LibraryKind, MediaItem, MediaKind, MediaProbe, UserItemData, Video3DFormat};
 use pharos_jellyfin_api::dto::{BaseItemDto, WireId};
 use pharos_jellyfin_api::image_tag_sig::ImageTagKey;
 
 use super::session::Session;
 use crate::api::jellyfin::items::SynthPage;
+use crate::api::jellyfin::media_source;
 use crate::services::library::{
     self, DetailError, GroupError, Grouping, ItemQuery, KindFilter, LibraryView, ListError,
     ListPage, QueryPage, QUERY_DEFAULT, QUERY_MAX,
@@ -415,6 +417,7 @@ impl server::library::Handler for Library {
     ) -> Result<(), capnp::Error> {
         let params = params.get()?;
         let id = read_item_id(params.get_id()?)?;
+        let asked_version = params.get_version()?.to_str()?.trim().to_owned();
         let knows_image_delivery =
             params.get_ctx()?.get_schema_version() >= IMAGE_DELIVERY_SCHEMA_VERSION;
         let user = match self.session.current_user().await {
@@ -450,6 +453,17 @@ impl server::library::Handler for Library {
             Ok(found) => found,
             Err(e) => {
                 item_denial(id, &e, "detail").write(results.get().init_result().init_error());
+                return Ok(());
+            }
+        };
+        let has_versions = matches!(item.kind, MediaKind::Movie | MediaKind::Episode);
+        // The versions list describes every file; the rest of the detail
+        // (tracks, fonts, subtitle URLs) describes the one asked for.
+        let all = item.clone();
+        let item = match select_version(media_source::Route::NativeDetail, item, &asked_version) {
+            Ok(item) => item,
+            Err(denial) => {
+                denial.write(results.get().init_result().init_error());
                 return Ok(());
             }
         };
@@ -499,7 +513,8 @@ impl server::library::Handler for Library {
             c.set_start_ms(chapter.start_position_ticks / 10_000);
         }
         let draws_images = knows_image_delivery && watch::extracts_image_subtitles(state);
-        let styling = if watch::is_video(&item) {
+        // Styling is generated from the primary's subtitles.
+        let styling = if watch::is_video(&item) && item.edition.is_none() {
             crate::styled_track::current(&state.stores, &item).await
         } else {
             None
@@ -533,6 +548,13 @@ impl server::library::Handler for Library {
             w.set_filename(f.filename.as_str());
             w.set_mime(f.mime.as_str());
             w.set_url(f.url.as_str());
+        }
+        if has_versions {
+            write_versions(
+                out.reborrow().init_versions(version_count(&all)),
+                &all,
+                user.policy.admin,
+            );
         }
         let segments: Vec<_> = segments::for_item(state, &item)
             .await
@@ -663,6 +685,12 @@ fn read_query(
         name_starts_with: text(q.get_name_starts_with()?)?,
         filters: (!filters.is_empty()).then(|| filters.join(",")),
         genre: text(q.get_genre()?)?,
+        // An enum value this build does not know narrows nothing.
+        is_3d: match q.get_stereo() {
+            Ok(StereoFilter::Only3d) => Some(true),
+            Ok(StereoFilter::Only2d) => Some(false),
+            Ok(StereoFilter::Any) | Err(_) => None,
+        },
         ..ItemQuery::default()
     };
     let grouping = grouping_of(q.get_kinds()?);
@@ -1376,6 +1404,7 @@ pub(super) fn write_item(
     if let Some(n) = dto.parent_index_number {
         out.reborrow().init_parent_index_number().set_some(n);
     }
+    out.set_stereo(wire_stereo(item_stereo(item)));
     if let Some(score) = dto.critic_rating.and_then(tomatometer) {
         out.reborrow().init_critic_rating().set_some(score);
     }
@@ -1498,6 +1527,123 @@ fn segment_kind(kind: &str) -> Option<SegmentKind> {
         "Commercial" => SegmentKind::Commercial,
         _ => return None,
     })
+}
+
+/// `item` as the file `version` names, or the denial that says why not.
+fn select_version(
+    route: media_source::Route,
+    item: MediaItem,
+    version: &str,
+) -> Result<MediaItem, Denial> {
+    crate::services::playback::select_version(route, item, version).map_err(version_denial)
+}
+
+pub(super) fn version_denial(e: crate::services::playback::VersionError) -> Denial {
+    use crate::services::playback::VersionError;
+    match e {
+        VersionError::NoSuchVersion => Denial::NotFound { what: "version" },
+        VersionError::Unprobed => Denial::Unavailable {
+            dependency: "the version's probe (rescan the library)",
+        },
+    }
+}
+
+/// The packing a tile badges: the primary's, else the first 3D edition's,
+/// so the badge agrees with the store's `has_3d` (V720).
+fn item_stereo(item: &MediaItem) -> Option<Video3DFormat> {
+    item.probe.video_3d_format.or_else(|| {
+        item.probe
+            .alternate_sources
+            .iter()
+            .find_map(|a| a.video_3d_format)
+    })
+}
+
+fn wire_stereo(format: Option<Video3DFormat>) -> Stereo3d {
+    match format {
+        None => Stereo3d::None,
+        Some(Video3DFormat::HalfSideBySide) => Stereo3d::HalfSideBySide,
+        Some(Video3DFormat::FullSideBySide) => Stereo3d::FullSideBySide,
+        Some(Video3DFormat::HalfTopAndBottom) => Stereo3d::HalfTopAndBottom,
+        Some(Video3DFormat::FullTopAndBottom) => Stereo3d::FullTopAndBottom,
+        Some(Video3DFormat::Mvc) => Stereo3d::Mvc,
+    }
+}
+
+fn version_count(item: &MediaItem) -> u32 {
+    u32::try_from(item.probe.alternate_sources.len())
+        .unwrap_or(u32::MAX)
+        .saturating_add(1)
+}
+
+/// An item's playable files, the primary first. An edition's id is what
+/// `detail` and `Playback.negotiate` take as `version`. Paths go to admins
+/// only.
+fn write_versions(
+    mut out: capnp::struct_list::Builder<'_, version::Owned>,
+    item: &MediaItem,
+    admin: bool,
+) {
+    let mut primary = out.reborrow().get(0);
+    primary.set_primary(true);
+    primary.set_stereo(wire_stereo(item.probe.video_3d_format));
+    write_version_facts(primary, &item.probe, &item.path, admin);
+    for (i, alt) in (1..out.len()).zip(&item.probe.alternate_sources) {
+        let mut v = out.reborrow().get(i);
+        v.set_id(alt.id.as_str());
+        v.set_name(alt.name.as_deref().unwrap_or_default());
+        v.set_stereo(wire_stereo(alt.video_3d_format));
+        match alt.probe.as_deref() {
+            Some(probe) => write_version_facts(v, probe, &alt.path, admin),
+            // Probed before editions carried their own probe: only the flat facts.
+            None => {
+                let flat = MediaProbe {
+                    video_codec: alt.video_codec.clone(),
+                    audio_codec: alt.audio_codec.clone(),
+                    size_bytes: alt.size_bytes,
+                    container: alt.container.clone(),
+                    ..MediaProbe::default()
+                };
+                write_version_facts(v, &flat, &alt.path, admin);
+            }
+        }
+    }
+}
+
+fn write_version_facts(
+    mut v: version::Builder<'_>,
+    probe: &MediaProbe,
+    path: &std::path::Path,
+    admin: bool,
+) {
+    v.set_width(probe.width.unwrap_or_default());
+    v.set_height(probe.height.unwrap_or_default());
+    v.set_video_codec(probe.video_codec.as_deref().unwrap_or_default());
+    v.set_hdr(match probe.video_range_type() {
+        pharos_core::VideoRangeType::Sdr => "",
+        other => other.label(),
+    });
+    v.set_size_bytes(probe.size_bytes.unwrap_or_default());
+    v.set_container(probe.container.as_deref().unwrap_or_default());
+    if admin {
+        v.set_path(path.to_string_lossy().as_ref());
+    }
+    if probe.audio_tracks.is_empty() {
+        // A single-stream probe records only the flat codec and channels.
+        if let Some(codec) = probe.audio_codec.as_deref() {
+            let mut a = v.init_audio(1).get(0);
+            a.set_codec(codec);
+            a.set_channels(probe.audio_channels.unwrap_or_default());
+        }
+        return;
+    }
+    let mut audio = v.init_audio(len(&probe.audio_tracks));
+    for (i, track) in (0..).zip(&probe.audio_tracks) {
+        let mut a = audio.reborrow().get(i);
+        a.set_language(track.language.as_deref().unwrap_or_default());
+        a.set_codec(track.codec.as_deref().unwrap_or_default());
+        a.set_channels(track.channels.unwrap_or_default());
+    }
 }
 
 #[cfg(test)]

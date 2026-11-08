@@ -14,6 +14,7 @@ use pharos_jellyfin_api::device_profile::{
 };
 
 use crate::api::jellyfin::dto::container_for;
+use crate::api::jellyfin::media_source;
 use crate::api::jellyfin::subtitle_delivery::{decide_subtitle_delivery, SubtitleDelivery};
 use crate::api::jellyfin::subtitles::is_image_subtitle_codec;
 use crate::state::AppState;
@@ -1403,6 +1404,50 @@ pub enum GrantError {
     Item(crate::services::library::DetailError),
     /// A book is read, not streamed (004-books).
     NotPlayable,
+}
+
+/// Why a native player cannot have the version it named.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VersionError {
+    /// Not one of the item's editions or copies.
+    NoSuchVersion,
+    /// Stored before editions kept their own probe (ADR-0030), so it cannot
+    /// be served until a rescan.
+    Unprobed,
+}
+
+/// `item` as the file `version` names: the primary for an empty id, else a
+/// grouped edition or copy, its path and probe swapped in by
+/// [`media_source::select`] under the item's own id. Unlike a Jellyfin
+/// client's `MediaSourceId`, an edition that cannot be served is refused
+/// rather than replaced by the primary: a player that asked for a 3D file
+/// would draw a 2D one as 3D.
+pub(crate) fn select_version(
+    route: media_source::Route,
+    item: MediaItem,
+    version: &str,
+) -> Result<MediaItem, VersionError> {
+    if version.is_empty() {
+        return Ok(item);
+    }
+    let raw = format!(
+        "{}-{version}",
+        pharos_jellyfin_api::dto::wire_item_id(item.id)
+    );
+    if media_source::classify(&item, Some(&raw)).0 != media_source::Requested::Alternate {
+        tracing::info!(
+            media.id = item.id,
+            route = route.label(),
+            version,
+            "asked for a version the item does not have"
+        );
+        return Err(VersionError::NoSuchVersion);
+    }
+    let item = media_source::select(route, item, Some(&raw));
+    if item.edition.is_none() {
+        return Err(VersionError::Unprobed);
+    }
+    Ok(item)
 }
 
 /// Negotiates `id` for a native player and registers the session that
