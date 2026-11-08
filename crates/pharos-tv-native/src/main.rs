@@ -89,6 +89,7 @@ fn root() -> Element {
 fn root() -> Element {
     let mut data = use_signal(Data::fixture);
     let mut notice = use_signal(|| Some("Connecting…".to_owned()));
+    let mut detail = use_signal(|| None::<pharos_client::api::Detail>);
     use_hook(|| {
         if let Some(mut events) = live::take_events() {
             spawn(async move {
@@ -102,11 +103,21 @@ fn root() -> Element {
                             data.set(Data::new(&home, grid.items));
                             notice.set(None);
                         }
+                        live::Event::Detail(d) => detail.set(Some(*d)),
                         live::Event::Failed(e) => notice.set(Some(format!("Offline: {e}"))),
                     }
                 }
             });
         }
     });
-    rsx! { Spike { start: Screen::Home, data: data(), notice: notice() } }
+    rsx! {
+        Spike {
+            start: Screen::Home,
+            data: data(),
+            notice: notice(),
+            detail: detail(),
+            on_open: move |id| live::send(live::Command::Detail(id)),
+            on_back: move |()| detail.set(None),
+        }
+    }
 }

@@ -2,9 +2,9 @@
 //! snapshot example.
 
 use dioxus::prelude::*;
-use pharos_client::api::{Home, HomeRail, Item, ItemKind, ItemRef, LibraryKind};
+use pharos_client::api::{Detail, Home, HomeRail, Item, ItemKind, ItemRef, LibraryKind};
 use pharos_ui::native::route::Route;
-use pharos_ui::native::views::{Nav, PosterTile};
+use pharos_ui::native::views::{MarkPlayed, Nav, PosterTile, TitleView};
 
 pub const CSS: &str = include_str!("../../pharos-ui/assets/pharos.css");
 
@@ -141,9 +141,17 @@ impl Data {
 }
 
 /// `notice` is shown over the screens: the QuickConnect code, or why the
-/// live server could not be reached.
+/// live server could not be reached. OK on a poster calls `on_open`; while
+/// `detail` is set its item page shows, and Back calls `on_back`.
 #[component]
-pub fn Spike(start: Screen, data: Data, #[props(default)] notice: Option<String>) -> Element {
+pub fn Spike(
+    start: Screen,
+    data: Data,
+    #[props(default)] notice: Option<String>,
+    #[props(default)] detail: Option<Detail>,
+    #[props(default)] on_open: EventHandler<ItemRef>,
+    #[props(default)] on_back: EventHandler<()>,
+) -> Element {
     let mut screen = use_signal(|| start);
     // (row, column) of the focused poster on the current screen.
     let mut focus = use_signal(|| (0usize, 0usize));
@@ -152,7 +160,17 @@ pub fn Spike(start: Screen, data: Data, #[props(default)] notice: Option<String>
             log::info!("nav {}", to.path());
         }))
     });
+    // The item page's watched toggle; the spike logs it and stores nothing.
+    use_context_provider(|| {
+        MarkPlayed(EventHandler::new(move |(id, played): (ItemRef, bool)| {
+            log::info!("mark played {id} {played}");
+        }))
+    });
+    let has_detail = detail.is_some();
     let Data { rails, grid } = data;
+    let rail_ids: Vec<Vec<ItemRef>> =
+        rails.iter().map(|(_, items)| items.iter().map(|i| i.id).collect()).collect();
+    let grid_ids: Vec<ItemRef> = grid.iter().map(|i| i.id).collect();
     let mut last_key = use_signal(|| None::<std::time::Instant>);
     // Paint-cost probe: "s" steps through 0 (shipped CSS), 1 (no poster
     // shadows or overlays) and 2 (also no full-screen backdrop gradient).
@@ -203,8 +221,20 @@ pub fn Spike(start: Screen, data: Data, #[props(default)] notice: Option<String>
                     Key::Named(NamedKey::ArrowDown) => ((r + 1).min(rows.saturating_sub(1)), c),
                     Key::Named(NamedKey::ArrowLeft) => (r, c.saturating_sub(1)),
                     Key::Named(NamedKey::ArrowRight) => (r, c + 1),
+                    Key::Named(NamedKey::BrowserBack) | Key::Named(NamedKey::GoBack) if has_detail => {
+                        on_back.call(());
+                        (r, c)
+                    }
+                    _ if has_detail => (r, c),
                     Key::Named(NamedKey::Enter) => {
+                        let picked = match screen() {
+                            Screen::Home => rail_ids.get(r).and_then(|ids| ids.get(c)),
+                            Screen::Grid => grid_ids.get(r * GRID_COLUMNS + c),
+                        };
                         log::info!("open row {r} col {c}");
+                        if let Some(id) = picked {
+                            on_open.call(*id);
+                        }
                         (r, c)
                     }
                     Key::Named(NamedKey::BrowserBack) | Key::Named(NamedKey::GoBack) if screen() == Screen::Grid => {
@@ -231,6 +261,9 @@ pub fn Spike(start: Screen, data: Data, #[props(default)] notice: Option<String>
             // before Dioxus sets `tabindex`, so a `div` never takes focus. A
             // `button` is focussable by tag; keys bubble from it to the root.
             button { class: "pharos-tv-keysink", autofocus: true }
+            if let Some(detail) = detail {
+                TitleView { detail, tracks: None }
+            } else {
             match screen() {
                 Screen::Home => rsx! {
                     div { style: "margin-top: -{home_y}px",
@@ -265,6 +298,7 @@ pub fn Spike(start: Screen, data: Data, #[props(default)] notice: Option<String>
                         }
                     }
                 },
+            }
             }
         }
     }

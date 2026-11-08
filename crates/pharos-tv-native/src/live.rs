@@ -4,7 +4,8 @@
 
 use futures_channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
 use pharos_client::CallInfo;
-use pharos_client::api::{Home, ItemRef, LibraryKind, NativeApi, Page, PharosApi};
+use futures_util::StreamExt;
+use pharos_client::api::{Detail, Home, ItemRef, LibraryKind, NativeApi, Page, PharosApi};
 use pharos_ui::native::{android, tv_page};
 use std::sync::Mutex;
 
@@ -13,7 +14,13 @@ pub enum Event {
     /// A QuickConnect code waiting for approval in another signed-in client.
     Code(String),
     Ready { home: Home, grid: Page },
+    Detail(Box<Detail>),
     Failed(String),
+}
+
+/// What the screens ask the connection for.
+pub enum Command {
+    Detail(ItemRef),
 }
 
 /// Posters the grid loads: spec 032's state (b) needs at least 100.
@@ -24,6 +31,18 @@ const GRID_LIMIT: u32 = 120;
 const DEVICE: &str = "pharos-android-tv-native";
 
 static EVENTS: Mutex<Option<UnboundedReceiver<Event>>> = Mutex::new(None);
+static COMMANDS: Mutex<Option<UnboundedSender<Command>>> = Mutex::new(None);
+
+/// Ask the connection thread for something; its answer comes as an [`Event`].
+pub fn send(command: Command) {
+    let sent = COMMANDS
+        .lock()
+        .ok()
+        .and_then(|c| c.as_ref().map(|tx| tx.unbounded_send(command).is_ok()));
+    if sent != Some(true) {
+        log::warn!("live: no connection thread for a command");
+    }
+}
 
 /// The receiver `start` made; `None` after the first call.
 pub fn take_events() -> Option<UnboundedReceiver<Event>> {
@@ -41,6 +60,10 @@ pub fn start() {
     if let Ok(mut slot) = EVENTS.lock() {
         *slot = Some(rx);
     }
+    let (commands_tx, commands) = unbounded();
+    if let Ok(mut slot) = COMMANDS.lock() {
+        *slot = Some(commands_tx);
+    }
     let spawned = std::thread::Builder::new()
         .name("pharos-rpc".into())
         .spawn(move || {
@@ -53,12 +76,10 @@ pub fn start() {
             };
             let local = tokio::task::LocalSet::new();
             local.block_on(&rt, async move {
-                if let Err(e) = run(&tx).await {
+                if let Err(e) = run(&tx, commands).await {
                     log::warn!("live: {e}");
                     let _ = tx.unbounded_send(Event::Failed(e));
                 }
-                // Keep the connection for the item page and playback probes.
-                std::future::pending::<()>().await;
             });
         });
     if let Err(e) = spawned {
@@ -66,7 +87,10 @@ pub fn start() {
     }
 }
 
-async fn run(tx: &UnboundedSender<Event>) -> Result<(), String> {
+async fn run(
+    tx: &UnboundedSender<Event>,
+    mut commands: UnboundedReceiver<Command>,
+) -> Result<(), String> {
     let base = server();
     let info = CallInfo { device: DEVICE.into(), ..CallInfo::default() };
     let session = match android::load_token() {
@@ -110,5 +134,24 @@ async fn run(tx: &UnboundedSender<Event>) -> Result<(), String> {
         grid.total
     );
     tx.unbounded_send(Event::Ready { home, grid })
-        .map_err(|_| "ui gone".to_owned())
+        .map_err(|_| "ui gone".to_owned())?;
+    while let Some(command) = commands.next().await {
+        match command {
+            Command::Detail(id) => {
+                let started = std::time::Instant::now();
+                let event = match api.detail(&info, id).await {
+                    Ok(detail) => {
+                        log::info!("bench detail_ms={}", started.elapsed().as_millis());
+                        Event::Detail(Box::new(detail))
+                    }
+                    Err(e) => {
+                        log::warn!("live: detail {id}: {e}");
+                        Event::Failed(format!("detail {id}: {e}"))
+                    }
+                };
+                tx.unbounded_send(event).map_err(|_| "ui gone".to_owned())?;
+            }
+        }
+    }
+    Ok(())
 }
