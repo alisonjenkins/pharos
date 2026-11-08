@@ -157,7 +157,13 @@ async fn play_negotiates_and_reports_progress() {
     assert_eq!(audio, [1]);
     assert!(detail.subtitle_tracks.is_empty() && detail.segments.is_empty());
     let (decision, grant) = api
-        .play(&call, ItemRef::Real(MOVIE), &caps, TrackPicks::default())
+        .play(
+            &call,
+            ItemRef::Real(MOVIE),
+            "",
+            &caps,
+            TrackPicks::default(),
+        )
         .await
         .expect("negotiate");
     assert_eq!(decision.method, "direct_play");
