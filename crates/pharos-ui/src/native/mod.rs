@@ -57,6 +57,7 @@ pub mod resume;
 pub mod route;
 pub mod seen;
 pub mod settings;
+pub mod show_tracks;
 pub mod stage;
 pub mod style_picker;
 #[cfg(all(feature = "web", target_arch = "wasm32"))]
