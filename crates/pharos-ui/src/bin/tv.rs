@@ -418,6 +418,30 @@ return 'playing t=' + v.currentTime.toFixed(2) + ' ' + v.videoWidth + 'x' + v.vi
             .await;
             log::info!("bench playback start: {started:?}");
             let _ = eval_phase("playing").await;
+            // 600 frames (~10 s) so the push crosses the clip's loop boundary.
+            let mut e = document::eval(
+                r#"for (let i = 0; i < 600; i++) { dioxus.send({i, t: performance.now(), w: innerWidth}); await new Promise(r => requestAnimationFrame(r)); } return 'done';"#,
+            );
+            let mut gaps = Vec::with_capacity(600);
+            let t_start = std::time::Instant::now();
+            let mut last = None;
+            for _ in 0..600 {
+                let _ = e.recv::<serde_json::Value>().await;
+                let now = std::time::Instant::now();
+                if let Some(prev) = last {
+                    gaps.push(now.duration_since(prev).as_micros());
+                }
+                last = Some(now);
+            }
+            let total_ms = t_start.elapsed().as_millis();
+            let over = gaps.iter().filter(|g| **g > 20_000).count();
+            let gap_max = gaps.iter().copied().max().unwrap_or(0);
+            let gap_p50 = pct(&mut gaps, 0.50);
+            let gap_p95 = pct(&mut gaps, 0.95);
+            let gap_p99 = pct(&mut gaps, 0.99);
+            log::info!(
+                "bench playing push (600 frames): gap p50={gap_p50}µs p95={gap_p95}µs p99={gap_p99}µs max={gap_max}µs over20ms={over} total={total_ms}ms"
+            );
             let after = document::eval(
                 r#"const v = document.getElementById('v'); const q = v.getVideoPlaybackQuality ? v.getVideoPlaybackQuality() : {}; return 't=' + v.currentTime.toFixed(2) + ' paused=' + v.paused + ' muted=' + v.muted + ' frames=' + q.totalVideoFrames + ' dropped=' + q.droppedVideoFrames;"#,
             )
