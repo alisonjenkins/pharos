@@ -1804,6 +1804,26 @@ impl ReportClock {
         Some(send)
     }
 
+    /// The report owed when the page becomes hidden: a report, not a stop,
+    /// since a hidden tab usually comes back. Nothing once stopped.
+    pub fn on_hidden(&mut self, now_ms: f64) -> Option<Outgoing> {
+        if self.stopped {
+            return None;
+        }
+        self.last_report_ms = Some(now_ms);
+        Some(Outgoing::Report {
+            paused: self.paused,
+        })
+    }
+
+    /// The page came back from the back/forward cache after `pagehide` sent
+    /// the stop: reports flow again, the next one at once. Whether a stop
+    /// had been sent.
+    pub fn restore(&mut self) -> bool {
+        self.last_report_ms = None;
+        std::mem::replace(&mut self.stopped, false)
+    }
+
     /// Whether a stop is still owed: true once, then false.
     pub fn stop(&mut self) -> bool {
         !std::mem::replace(&mut self.stopped, true)
@@ -3985,6 +4005,46 @@ mod tests {
         let mut clock = ReportClock::new();
         assert!(clock.stop());
         assert_eq!(clock.on(1.0, MediaEvent::Ended), None);
+    }
+
+    /// B809: a page that goes hidden reports where it is, as a report and
+    /// with the pause state, and keeps reporting afterwards.
+    #[test]
+    fn hiding_the_page_reports_without_stopping() {
+        let mut clock = ReportClock::new();
+        clock.on(0.0, MediaEvent::Playing);
+        assert_eq!(
+            clock.on_hidden(3_000.0),
+            Some(Outgoing::Report { paused: false })
+        );
+        // The interval restarts from the hidden report.
+        assert_eq!(clock.on(12_999.0, MediaEvent::TimeUpdate), None);
+        assert_eq!(
+            clock.on(13_000.0, MediaEvent::TimeUpdate),
+            Some(Outgoing::Report { paused: false })
+        );
+        clock.on(14_000.0, MediaEvent::Pause);
+        assert_eq!(
+            clock.on_hidden(15_000.0),
+            Some(Outgoing::Report { paused: true })
+        );
+        assert!(clock.stop(), "the stop is still owed");
+    }
+
+    #[test]
+    fn a_stopped_clock_does_not_report_on_hide_until_the_page_is_restored() {
+        let mut clock = ReportClock::new();
+        clock.on(0.0, MediaEvent::Playing);
+        assert!(clock.stop());
+        assert_eq!(clock.on_hidden(1.0), None);
+        assert_eq!(clock.on(2.0, MediaEvent::TimeUpdate), None);
+        assert!(clock.restore(), "a stop had been sent");
+        assert_eq!(
+            clock.on(3.0, MediaEvent::TimeUpdate),
+            Some(Outgoing::Report { paused: false }),
+            "reporting resumes at once"
+        );
+        assert!(!clock.restore(), "nothing to restore on a live clock");
     }
 
     #[test]

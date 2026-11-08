@@ -401,6 +401,15 @@ pub fn on_page_hide(_on_hide: impl FnMut() + 'static) -> PageHide {
     PageHide
 }
 
+pub struct PageLifecycle;
+
+pub fn on_page_lifecycle(
+    _on_hidden: impl FnMut() + 'static,
+    _on_restored: impl FnMut() + 'static,
+) -> PageLifecycle {
+    PageLifecycle
+}
+
 pub async fn engine(_kind: Engine) -> Result<Box<dyn PlaybackEngine>, String> {
     Err(NO_BROWSER.into())
 }
