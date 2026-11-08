@@ -3083,6 +3083,60 @@ test.describe("pharos Dioxus UI now playing", () => {
   });
 });
 
+// B734 / V682: a song is routed through its analyser once it plays, with no
+// visualiser drawing, so its tap's running context keeps the output awake
+// through a pause (V683). B735: the resume names the item, how long it was
+// paused, the wake and the browser.
+test.describe("pharos Dioxus UI music resume", () => {
+  test("a song with the visualiser off is tapped, and its resume says so", async ({
+    page,
+    request,
+  }) => {
+    test.setTimeout(90_000);
+    const probe = await request.get(`${PHAROS_URL}/pharos/session`, {
+      headers: { Accept: "application/json" },
+    });
+    test.skip(probe.status() !== 405, `native API is not enabled (status ${probe.status()})`);
+    const lines: string[] = [];
+    page.on("console", (m) => lines.push(m.text()));
+
+    await page.goto("/ui/");
+    // Off draws no visualiser, the state a shrunk player is in.
+    await page.evaluate(() => localStorage.setItem("pharos.visualiser", "off"));
+    await page.locator("#signin-name").fill(TEST_USER);
+    await page.locator("#signin-password").fill(TEST_PASS);
+    await page.getByRole("button", { name: "Sign in" }).click();
+    await expect(page.locator(".pharos-shell-bar")).toBeVisible({ timeout: 15_000 });
+    await openFirstHit(page, "carefree");
+    await page.getByRole("link", { name: /^(Play|Resume)$/ }).click();
+    await expect(page.locator(".pharos-listen")).toBeVisible({ timeout: 15_000 });
+    await expect(page.locator("canvas.pharos-visualiser")).toHaveCount(0);
+    await expect
+      .poll(() => lines.some((l) => l === "pharos: visualiser tap=connected"), {
+        timeout: 15_000,
+      })
+      .toBe(true);
+
+    const audio = page.locator("#pharos-video");
+    await page.getByRole("button", { name: "Pause" }).click();
+    await expect.poll(() => audio.evaluate((a) => (a as HTMLMediaElement).paused)).toBe(true);
+    await expect
+      .poll(() => lines.find((l) => l.startsWith("pharos: audio output warm ")) ?? "")
+      .toMatch(/reason=paused context_state=running rest_after_ms=300000/);
+    await page.waitForTimeout(1_000);
+    await page.getByRole("button", { name: "Play" }).click();
+    const resumed = () => lines.find((l) => l.startsWith("pharos: resume click_to_playing_ms=")) ?? "";
+    await expect.poll(resumed, { timeout: 15_000 }).toMatch(/item=music/);
+    const line = resumed();
+    expect(line).toMatch(/ context_state=running /);
+    expect(line).not.toMatch(/playing_to_audible_ms=untapped/);
+    expect(line).toMatch(/ context_wake=none /);
+    expect(line).toMatch(/ user_agent=Mozilla\//);
+    const paused = Number(/ paused_ms=(\d+) /.exec(line)?.[1] ?? "0");
+    expect(paused).toBeGreaterThanOrEqual(900);
+  });
+});
+
 // B450 / V390: a volume turned down stays down on the next player, which
 // mounts a new <audio> element, and B478 / V422 its slider shows it from the
 // first frame. B451 / V391: a lost WebGL context comes back
