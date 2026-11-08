@@ -172,3 +172,96 @@ async fn random_pagination_sweep_with_explicit_seed_has_no_dupes_or_holes() {
     }
     assert_eq!(seen.len(), 15, "missed items: got {} of 15", seen.len());
 }
+
+/// The seeded order with the tag and favourite filters on, paged. Pinned so
+/// a change in how the shuffle is fetched cannot reorder what clients see.
+#[actix_web::test]
+async fn seeded_random_order_with_filters_is_pinned_across_pages() {
+    use pharos_core::{TagStore, UserDataStore, UserItemData};
+    let (state, token) = seed_n(12).await;
+    let user = pharos_server::services::auth::user_for_token(&state.stores, &token)
+        .await
+        .unwrap();
+    for id in [2u64, 3, 5, 6, 8, 9, 11] {
+        state
+            .stores
+            .link_item_tags(id, &["keep".to_string()])
+            .await
+            .unwrap();
+    }
+    for id in [3u64, 5, 6, 8, 12] {
+        state
+            .stores
+            .set_user_data(
+                user.id,
+                id,
+                UserItemData {
+                    is_favorite: true,
+                    ..UserItemData::default()
+                },
+            )
+            .await
+            .unwrap();
+    }
+    let app = test::init_service(build_app(state)).await;
+    let page = |query: String| {
+        let app = &app;
+        let token = token.as_str();
+        async move {
+            let body = test::call_and_read_body(
+                app,
+                test::TestRequest::get()
+                    .uri(&format!("/Items?SortBy=Random&SortSeed=424242&{query}"))
+                    .insert_header(("X-Emby-Token", token))
+                    .to_request(),
+            )
+            .await;
+            let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            let names: Vec<String> = v["Items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|i| i["Name"].as_str().unwrap().to_string())
+                .collect();
+            (names, v["TotalRecordCount"].as_u64().unwrap())
+        }
+    };
+    let (everything, total) = page("Limit=100".into()).await;
+    assert_eq!((everything.len(), total), (12, 12));
+    let (tagged, total) = page("Limit=100&Tags=keep".into()).await;
+    assert_eq!(total, 7);
+    assert_eq!(
+        tagged,
+        everything
+            .iter()
+            .filter(
+                |n| ["It02", "It03", "It05", "It06", "It08", "It09", "It11"].contains(&n.as_str())
+            )
+            .cloned()
+            .collect::<Vec<_>>(),
+        "a tag filter keeps the seeded order of the survivors"
+    );
+    let (both, total) = page("Limit=100&Tags=keep&Filters=IsFavorite".into()).await;
+    assert_eq!(total, 4);
+    assert_eq!(
+        both,
+        tagged
+            .iter()
+            .filter(|n| ["It03", "It05", "It06", "It08"].contains(&n.as_str()))
+            .cloned()
+            .collect::<Vec<_>>()
+    );
+    let (first, total) = page("Limit=3&StartIndex=0&Tags=keep".into()).await;
+    let (second, _) = page("Limit=3&StartIndex=3&Tags=keep".into()).await;
+    let (third, _) = page("Limit=3&StartIndex=6&Tags=keep".into()).await;
+    assert_eq!(total, 7, "the total is the filtered count, not the page");
+    assert_eq!([first, second, third].concat(), tagged);
+    assert_eq!(
+        everything,
+        [
+            "It09", "It01", "It04", "It08", "It11", "It05", "It06", "It02", "It12", "It07", "It03",
+            "It10",
+        ],
+        "the seeded permutation of twelve items"
+    );
+}
