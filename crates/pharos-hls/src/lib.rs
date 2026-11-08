@@ -6,6 +6,7 @@
 #![forbid(unsafe_code)]
 
 pub mod abr;
+pub mod annexb;
 pub mod fmp4;
 pub mod planner;
 pub mod playlist;
