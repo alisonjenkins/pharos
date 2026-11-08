@@ -1259,8 +1259,10 @@ addEventListener("keydown", (e) => {
 // its controls (the remote has its own volume keys), and Left and Right move
 // between controls once one has the focus; on the picture itself Left and
 // Right still seek. Taken here, before the player's handler hears them.
+// Not the volume slider: it would keep Left and Right for itself, and the
+// remote has volume keys.
 const controlsIn = (player) => [...player.querySelectorAll(
-  "button:not([disabled]), select:not([disabled]), a[href], input:not([disabled])"
+  "button:not([disabled]), select:not([disabled]), a[href]"
 )].filter((el) => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; });
 const nearest = (from, els, key) => {
   const f = from.getBoundingClientRect();
@@ -1287,7 +1289,7 @@ addEventListener("keydown", (e) => {
   if (!player || !at || !player.contains(at)) return;
   const vertical = e.key === "ArrowUp" || e.key === "ArrowDown";
   const onPicture = at === player;
-  if (!vertical && (onPicture || (at.tagName === "INPUT" && at.type === "range"))) return;
+  if (!vertical && onPicture) return;
   e.preventDefault();
   e.stopPropagation();
   // Any key shows the controls; this one does nothing else.
