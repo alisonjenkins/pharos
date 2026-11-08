@@ -5,6 +5,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod abr;
 pub mod playlist;
 pub mod timeline;
 pub mod uri;
