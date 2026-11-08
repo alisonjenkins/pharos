@@ -1053,6 +1053,56 @@ body:has(.pharos-stage.is-full) .pharos-error {
   border-radius: 6px;
   background: var(--px-color-surface);
 }
+/* A playback failure: a centred panel over the picture with a way to try
+   again and a way out (B806). */
+.pharos-playback-failure {
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  z-index: 11;
+  display: grid;
+  gap: 0.75rem;
+  justify-items: center;
+  width: min(28rem, calc(100vw - 2rem));
+  padding: 1.5rem;
+  border-radius: var(--px-radius);
+  background: var(--px-color-surface);
+  color: var(--px-color-fg);
+  text-align: center;
+}
+.pharos-playback-failure-title {
+  margin: 0;
+  font-size: 1.25rem;
+  font-weight: 600;
+}
+.pharos-playback-failure-hint {
+  margin: 0;
+}
+.pharos-playback-failure-actions {
+  display: flex;
+  gap: 0.75rem;
+}
+.pharos-playback-failure-actions button {
+  padding: 0.5rem 1.25rem;
+  border: var(--px-border) solid var(--px-color-border);
+  border-radius: 6px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+.pharos-playback-failure-actions .pharos-playback-failure-retry {
+  background: var(--px-color-accent);
+  color: var(--px-color-accent-fg);
+}
+.pharos-playback-failure-details {
+  margin: 0;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  font-size: 0.75rem;
+  opacity: 0.7;
+}
 .pharos-video {
   display: block;
   width: 100%;
