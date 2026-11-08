@@ -474,6 +474,20 @@ const FAILURE_REASONS: [&str; 8] = [
 /// event, and `rate()` / `increase()` cannot see that first event (so the
 /// first short or failed segment after a deploy never alerts).
 pub fn register_segment_metrics() {
+    for stage in [DefectStage::Cached, DefectStage::Produced] {
+        for defect in [
+            SegmentDefect::Empty,
+            SegmentDefect::ZeroTail,
+            SegmentDefect::Fmp4Malformed,
+        ] {
+            metrics::counter!(
+                "pharos_segment_defect_total",
+                "reason" => defect.label(),
+                "stage" => stage.label(),
+            )
+            .increment(0);
+        }
+    }
     for class in [JobClass::Interactive, JobClass::Background] {
         for outcome in [
             SegmentOutcome::Ok,
@@ -1198,6 +1212,92 @@ fn top_level_boxes(raw: &[u8]) -> Option<Vec<([u8; 4], std::ops::Range<usize>)>>
         at = end;
     }
     Some(boxes)
+}
+
+/// How much of a segment's end is checked for zeros. An MPEG-TS packet is 188
+/// bytes and starts with a 0x47 sync byte, and fMP4 ends in compressed `mdat`
+/// payload or an `mfra` with sizes in it, so no real encode ends in this many
+/// zeros; a power cut does (B890).
+const ZERO_TAIL_BYTES: usize = 512;
+
+/// Why bytes in the segment cache cannot be served (B890/V840).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SegmentDefect {
+    /// Zero bytes: the rename reached the disk and the data did not. The
+    /// publish path's own minimum size covers the small-but-not-empty case.
+    Empty,
+    /// Ends in [`ZERO_TAIL_BYTES`] of zeros: the file's size reached the
+    /// disk and its data did not.
+    ZeroTail,
+    /// fMP4 whose top-level boxes do not parse, include an all-zero box type,
+    /// or lack the `moov` and `moof` that `fmp4::process_segment` needs.
+    Fmp4Malformed,
+}
+
+impl SegmentDefect {
+    /// Metric label; a dashboard contract, asserted distinct in a test.
+    fn label(self) -> &'static str {
+        match self {
+            Self::Empty => "empty",
+            Self::ZeroTail => "zero_tail",
+            Self::Fmp4Malformed => "fmp4_malformed",
+        }
+    }
+}
+
+/// Where a [`SegmentDefect`] was caught.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DefectStage {
+    /// On a cache hit, before serving: the file was published and later lost
+    /// its bytes.
+    Cached,
+    /// After an encode, before publishing.
+    Produced,
+}
+
+impl DefectStage {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Cached => "cached",
+            Self::Produced => "produced",
+        }
+    }
+}
+
+/// The checks are structural only, cheap enough for every hit: a box walk
+/// for fMP4, an emptiness check and a tail scan for both containers. MPEG-TS gets no
+/// sync-byte walk, because a damaged TS still decodes around the bad packets
+/// and the zero tail already catches the power-cut shape.
+fn segment_defect(bytes: &[u8], container: SegmentContainer) -> Option<SegmentDefect> {
+    if bytes.is_empty() {
+        return Some(SegmentDefect::Empty);
+    }
+    let tail = bytes
+        .get(bytes.len().saturating_sub(ZERO_TAIL_BYTES)..)
+        .unwrap_or_default();
+    if tail.iter().all(|b| *b == 0) {
+        return Some(SegmentDefect::ZeroTail);
+    }
+    if container == SegmentContainer::Fmp4 {
+        let well_formed = top_level_boxes(bytes).is_some_and(|boxes| {
+            boxes.iter().all(|(kind, _)| kind != &[0u8; 4])
+                && boxes.iter().any(|(kind, _)| kind == b"moov")
+                && boxes.iter().any(|(kind, _)| kind == b"moof")
+        });
+        if !well_formed {
+            return Some(SegmentDefect::Fmp4Malformed);
+        }
+    }
+    None
+}
+
+fn record_segment_defect(defect: SegmentDefect, stage: DefectStage) {
+    metrics::counter!(
+        "pharos_segment_defect_total",
+        "reason" => defect.label(),
+        "stage" => stage.label(),
+    )
+    .increment(1);
 }
 
 /// Flush a finished encode to disk before it is renamed into the keyed path.
@@ -2471,6 +2571,74 @@ impl HlsSegmentCache {
         Ok(report)
     }
 
+    /// Take one defective segment out of service, keeping it for inspection
+    /// like [`Self::quarantine_segments`] does, so the next read encodes it
+    /// again. Called from the hit path, so it never fails the request: a
+    /// file that cannot be moved is deleted, and one that cannot be deleted
+    /// either is overwritten by the re-encode's rename.
+    async fn quarantine_defective_segment(
+        &self,
+        key: SegmentIdentity,
+        path: &Path,
+        read: &std::fs::Metadata,
+        defect: SegmentDefect,
+    ) {
+        record_segment_defect(defect, DefectStage::Cached);
+        // A concurrent request may already have quarantined these bytes and
+        // published a fresh encode at the same path; that file is not ours to
+        // move. Same length and mtime is the file this request read.
+        let unchanged = tokio::fs::metadata(path).await.is_ok_and(|now| {
+            now.len() == read.len() && now.modified().ok() == read.modified().ok()
+        });
+        if !unchanged {
+            return;
+        }
+        let bytes = read.len();
+        let pen = self.root.join(QUARANTINE_DIR);
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let dest = pen.join(format!("{}-{name}", key.media_id));
+        let moved = match tokio::fs::create_dir_all(&pen).await {
+            Ok(()) => tokio::fs::rename(path, &dest).await,
+            Err(e) => Err(e),
+        };
+        let kept = match moved {
+            Ok(()) => {
+                let _ = tokio::fs::rename(
+                    provenance_sidecar_path(path),
+                    provenance_sidecar_path(&dest),
+                )
+                .await;
+                metrics::counter!("pharos_segment_quarantined_total").increment(1);
+                Self::trim_quarantine(&pen).await;
+                true
+            }
+            Err(e) => {
+                tracing::debug!(path = %path.display(), error = %e, "could not quarantine a defective segment; deleting it");
+                let _ = tokio::fs::remove_file(path).await;
+                let _ = tokio::fs::remove_file(provenance_sidecar_path(path)).await;
+                false
+            }
+        };
+        {
+            let mut state = self.state.lock().await;
+            if let Some(meta) = state.entries.remove(&key) {
+                state.total_bytes = state.total_bytes.saturating_sub(meta.bytes);
+            }
+        }
+        tracing::warn!(
+            media.id = key.media_id,
+            seg = key.seg_index,
+            reason = defect.label(),
+            bytes,
+            kept,
+            path = %path.display(),
+            "cached segment is defective; taken out of service and re-encoding (B890)"
+        );
+    }
+
     /// Delete every cached audio encode of this item: its Opus rendition
     /// sessions and its continuous AAC sessions, all tracks, bitrates and
     /// editions. Reports the directories removed and every one that could not
@@ -2682,22 +2850,29 @@ impl HlsSegmentCache {
         // the added observability costs no extra stat.
         let hit_started = std::time::Instant::now();
         if let Ok(meta) = tokio::fs::metadata(&path).await {
-            self.touch(key).await;
             match tokio::fs::read(&path).await {
-                Ok(b) => {
-                    record_cache_hit(
-                        media_id,
-                        seg_index,
-                        b.len(),
-                        opts,
-                        class,
-                        CacheHitPath::Fast,
-                        hit_started.elapsed().as_millis() as u64,
-                        cached_age_secs(&meta),
-                    );
-                    self.note_client_playhead(class, stream, seg_index);
-                    return Ok(b);
-                }
+                Ok(b) => match segment_defect(&b, opts.container) {
+                    // Fall through and encode it again.
+                    Some(defect) => {
+                        self.quarantine_defective_segment(key, &path, &meta, defect)
+                            .await;
+                    }
+                    None => {
+                        self.touch(key).await;
+                        record_cache_hit(
+                            media_id,
+                            seg_index,
+                            b.len(),
+                            opts,
+                            class,
+                            CacheHitPath::Fast,
+                            hit_started.elapsed().as_millis() as u64,
+                            cached_age_secs(&meta),
+                        );
+                        self.note_client_playhead(class, stream, seg_index);
+                        return Ok(b);
+                    }
+                },
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => { /* evicted; fall through */
                 }
                 Err(e) => return Err(e.into()),
@@ -3551,6 +3726,23 @@ impl HlsSegmentCache {
                 "transcode produced empty/truncated segment ({produced} bytes)"
             )));
         }
+        let bytes = tokio::fs::read(&tmp)
+            .await
+            .map_err(|e| counted("publish_read", e.into()))?;
+        // The hit path refuses these same shapes, so publishing one would only
+        // buy an encode-quarantine-encode loop.
+        if let Some(defect) = segment_defect(&bytes, opts.container) {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            record_segment_defect(defect, DefectStage::Produced);
+            return Err(counted(
+                "publish_validate",
+                HlsCacheError::Transcode(format!(
+                    "transcode produced a malformed segment ({}, {} bytes)",
+                    defect.label(),
+                    bytes.len()
+                )),
+            ));
+        }
         sync_file(&tmp)
             .await
             .map_err(|e| counted("publish_sync", e.into()))?;
@@ -3565,10 +3757,6 @@ impl HlsSegmentCache {
         if let Some(parent) = path.parent() {
             sync_dir(parent).await;
         }
-
-        let bytes = tokio::fs::read(&path)
-            .await
-            .map_err(|e| counted("publish_read_back", e.into()))?;
         let transcode_ms = started.elapsed().as_millis();
         record_segment_outcome(
             if is_filler {
@@ -5806,6 +5994,203 @@ mod tests {
     /// How many times the stub encoder actually ran.
     fn encode_count(encodes: &Path) -> u64 {
         std::fs::metadata(encodes).map(|m| m.len()).unwrap_or(0)
+    }
+
+    /// The shape `fmp4::process_segment` accepts: init boxes, then a fragment.
+    fn plausible_fmp4() -> Vec<u8> {
+        let mut seg = bmff_box(b"ftyp", b"iso6");
+        seg.extend(bmff_box(b"moov", &[1u8; 32]));
+        seg.extend(bmff_box(b"moof", &[2u8; 32]));
+        seg.extend(bmff_box(b"mdat", &[3u8; 1024]));
+        seg
+    }
+
+    /// B890/V840 — the shapes a power cut leaves are refused, and real
+    /// segments of both containers are not.
+    #[test]
+    fn segment_defect_names_what_a_power_cut_leaves() {
+        use SegmentContainer::{Fmp4, Mpegts};
+        assert_eq!(segment_defect(&plausible_fmp4(), Fmp4), None);
+        assert_eq!(segment_defect(SLOW_SEGMENT_BYTES.as_bytes(), Mpegts), None);
+
+        assert_eq!(segment_defect(b"", Mpegts), Some(SegmentDefect::Empty));
+        assert_eq!(segment_defect(b"", Fmp4), Some(SegmentDefect::Empty));
+        // Size reached the disk, data did not: the seg 54/55 shape, which
+        // `process_segment` reported as "no moov box".
+        assert_eq!(
+            segment_defect(&vec![0u8; 1_500_000], Fmp4),
+            Some(SegmentDefect::ZeroTail)
+        );
+        assert_eq!(
+            segment_defect(&vec![0u8; 1_500_000], Mpegts),
+            Some(SegmentDefect::ZeroTail)
+        );
+        let mut torn = plausible_fmp4();
+        torn.extend(vec![0u8; 4096]);
+        assert_eq!(segment_defect(&torn, Fmp4), Some(SegmentDefect::ZeroTail));
+
+        let mut no_moov = bmff_box(b"ftyp", b"iso6");
+        no_moov.extend(bmff_box(b"moof", &[2u8; 32]));
+        no_moov.extend(bmff_box(b"mdat", &[3u8; 1024]));
+        assert_eq!(
+            segment_defect(&no_moov, Fmp4),
+            Some(SegmentDefect::Fmp4Malformed)
+        );
+        let mut cut = plausible_fmp4();
+        cut.truncate(cut.len() - 100);
+        assert_eq!(
+            segment_defect(&cut, Fmp4),
+            Some(SegmentDefect::Fmp4Malformed)
+        );
+        let mut zero_kind = plausible_fmp4();
+        zero_kind.extend(bmff_box(&[0u8; 4], &[9u8; 16]));
+        assert_eq!(
+            segment_defect(&zero_kind, Fmp4),
+            Some(SegmentDefect::Fmp4Malformed)
+        );
+    }
+
+    #[test]
+    fn segment_defect_labels_are_distinct() {
+        let defects = [
+            SegmentDefect::Empty,
+            SegmentDefect::ZeroTail,
+            SegmentDefect::Fmp4Malformed,
+        ]
+        .map(SegmentDefect::label);
+        let stages = [DefectStage::Cached, DefectStage::Produced].map(DefectStage::label);
+        assert_eq!(defects.iter().collect::<HashSet<_>>().len(), defects.len());
+        assert_eq!(stages.iter().collect::<HashSet<_>>().len(), stages.len());
+    }
+
+    /// B890/V840 — a cached segment whose bytes were lost is re-encoded on the
+    /// next read instead of being trusted forever, the bad file is kept in
+    /// quarantine, and the heal is countable.
+    #[test]
+    fn a_zero_filled_cached_segment_is_quarantined_and_re_encoded() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let dir = TempDir::new().unwrap();
+        let (cache, encodes) = slow_test_cache(&dir, std::time::Duration::ZERO);
+        let opts = slow_opts();
+        let source = Path::new("/no/source");
+        let key = SegmentIdentity::new(1, 0, None, None, &opts, SourceGen::for_read(source, None));
+        let path = cache.segment_path_keyed(key);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, vec![0u8; 8192]).unwrap();
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = pharos_test_metrics::snapshotter(&recorder);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (first, second) = metrics::with_local_recorder(&recorder, || {
+            rt.block_on(async {
+                let first = cache
+                    .segment_bytes(1, 0, source, &opts, JobClass::Interactive)
+                    .await
+                    .expect("the defective entry is replaced by a fresh encode");
+                let second = cache
+                    .segment_bytes(1, 0, source, &opts, JobClass::Interactive)
+                    .await
+                    .expect("the re-encoded entry is a hit");
+                (first, second)
+            })
+        });
+
+        assert_eq!(first, SLOW_SEGMENT_BYTES.as_bytes(), "served the zeros");
+        assert_eq!(second, first);
+        assert_eq!(
+            encode_count(&encodes),
+            1,
+            "the zeros must cost exactly one encode, and the result must be trusted"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            first,
+            "keyed path not healed"
+        );
+        let pen = cache.quarantined();
+        assert_eq!(
+            pen.len(),
+            1,
+            "the defective bytes are kept for inspection: {pen:?}"
+        );
+        assert_eq!(pen[0].1, 8192);
+
+        let defects: u64 = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter_map(|(ck, _, _, v)| {
+                let k = ck.key();
+                let labels: Vec<String> = k
+                    .labels()
+                    .map(|l| format!("{}={}", l.key(), l.value()))
+                    .collect();
+                (k.name() == "pharos_segment_defect_total"
+                    && labels.contains(&"reason=zero_tail".to_string())
+                    && labels.contains(&"stage=cached".to_string()))
+                .then_some(v)
+            })
+            .map(|v| match v {
+                DebugValue::Counter(n) => n,
+                other => panic!("not a counter: {other:?}"),
+            })
+            .sum();
+        assert_eq!(defects, 1, "the heal must be countable by reason and stage");
+    }
+
+    /// B890 — two requests can read the same zeros; the one that loses the
+    /// race must not quarantine the fresh encode the winner published.
+    #[tokio::test]
+    async fn quarantine_leaves_a_segment_replaced_since_it_was_read() {
+        let dir = TempDir::new().unwrap();
+        let (cache, _) = slow_test_cache(&dir, std::time::Duration::ZERO);
+        let opts = slow_opts();
+        let key = SegmentIdentity::new(1, 0, None, None, &opts, SourceGen::LOCAL);
+        let path = cache.segment_path_keyed(key);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, vec![0u8; 8192]).unwrap();
+        let read = std::fs::metadata(&path).unwrap();
+        std::fs::write(&path, SLOW_SEGMENT_BYTES).unwrap();
+
+        cache
+            .quarantine_defective_segment(key, &path, &read, SegmentDefect::ZeroTail)
+            .await;
+
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            SLOW_SEGMENT_BYTES.as_bytes(),
+            "the re-encoded segment must stay in service"
+        );
+        assert!(cache.quarantined().is_empty(), "{:?}", cache.quarantined());
+    }
+
+    /// B890/V840 — an encode whose output has the shape the hit path refuses
+    /// is not published, so a broken encoder cannot loop through quarantine.
+    #[tokio::test]
+    async fn a_zero_filled_encode_is_not_published() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let bin = dir.path().join("zero-ffmpeg");
+        std::fs::write(&bin, "#!/bin/sh\nhead -c 4096 /dev/zero\n").unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let cache = HlsSegmentCache::new(dir.path().join("cache"), 1 << 30).with_ffmpeg(&bin);
+        let opts = slow_opts();
+        let source = Path::new("/no/source");
+
+        let err = cache
+            .segment_bytes(1, 0, source, &opts, JobClass::Interactive)
+            .await
+            .expect_err("zeros are not a segment");
+        assert!(err.to_string().contains("zero_tail"), "{err}");
+        let key = SegmentIdentity::new(1, 0, None, None, &opts, SourceGen::for_read(source, None));
+        assert!(
+            !cache.segment_path_keyed(key).exists(),
+            "the zeros must not be published under the key"
+        );
     }
 
     /// Every provenance sidecar under `root`, recursively. The test does not
