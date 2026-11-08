@@ -15,6 +15,9 @@ import { test, expect, type APIRequestContext, type Locator, type Page } from "@
 const PHAROS_URL = process.env.PHAROS_URL ?? "http://127.0.0.1:8096";
 const TEST_USER = process.env.PHAROS_TEST_USER ?? "playwright";
 const TEST_PASS = process.env.PHAROS_TEST_PASS ?? "playwright-test-pw";
+// A screen that failed to load: the bare error line, or the panel with a
+// retry that Home, Browse and Title show since B823.
+const LOAD_ERRORS = "p.pharos-error, .pharos-load-failure";
 
 /** A song as the Jellyfin item list returns it. */
 type Song = { Album?: string; AlbumArtist?: string; Artists?: string[] };
@@ -584,7 +587,7 @@ test.describe("pharos Dioxus UI", () => {
         timeout: 15_000,
       });
       await expect(page.locator("ul.pharos-grid li").first()).toBeVisible();
-      await expect(page.locator("p.pharos-error")).toHaveCount(0);
+      await expect(page.locator(LOAD_ERRORS)).toHaveCount(0);
 
       // A series is the show page: its name over the season's episodes.
       await page.goto(`/ui/browse/${nativeSynth(episode.SeriesId)}`);
@@ -592,7 +595,7 @@ test.describe("pharos Dioxus UI", () => {
         timeout: 15_000,
       });
       await expect(page.locator("ol.pharos-episodes li").first()).toBeVisible();
-      await expect(page.locator("p.pharos-error")).toHaveCount(0);
+      await expect(page.locator(LOAD_ERRORS)).toHaveCount(0);
 
       // A season opens the same page with that season shown.
       await page.goto(`/ui/browse/${nativeSynth(episode.SeasonId)}`);
@@ -603,7 +606,7 @@ test.describe("pharos Dioxus UI", () => {
         page.locator("section.pharos-show").getByText(/^Season 1$/).first(),
       ).toBeVisible();
       await expect(page.locator("ol.pharos-episodes li").first()).toBeVisible();
-      await expect(page.locator("p.pharos-error")).toHaveCount(0);
+      await expect(page.locator(LOAD_ERRORS)).toHaveCount(0);
 
       // An episode row plays it.
       await page.locator("ol.pharos-episodes li a.pharos-episode-play").first().click();
@@ -678,7 +681,7 @@ test.describe("pharos Dioxus UI", () => {
         seen = now;
       }
       expect(seen, "every title loads once the grid is scrolled").toBe(total);
-      await expect(page.locator("p.pharos-error")).toHaveCount(0);
+      await expect(page.locator(LOAD_ERRORS)).toHaveCount(0);
       await expect(page.getByRole("button", { name: "Show more" })).toHaveCount(0);
     });
 
@@ -888,7 +891,7 @@ test.describe("pharos Dioxus UI", () => {
         String(new Date().getUTCFullYear()),
       );
       await expect(tiles.first()).toBeVisible();
-      await expect(page.locator("p.pharos-error")).toHaveCount(0);
+      await expect(page.locator(LOAD_ERRORS)).toHaveCount(0);
       await page.evaluate(() => window.scrollTo(0, 0));
     });
 
@@ -1117,7 +1120,7 @@ test.describe("pharos Dioxus UI", () => {
       });
       const tiles = page.locator("ul.pharos-grid .pharos-poster-name");
       await expect(tiles).toHaveText(["Another Show", "Playwright Show"]);
-      await expect(page.locator("p.pharos-error")).toHaveCount(0);
+      await expect(page.locator(LOAD_ERRORS)).toHaveCount(0);
 
       // Series -> the show page with its three episodes.
       await tiles.filter({ hasText: "Playwright Show" }).click();
@@ -1126,7 +1129,7 @@ test.describe("pharos Dioxus UI", () => {
       });
       const episodes = page.locator("ol.pharos-episodes li");
       await expect(episodes).toHaveCount(3);
-      await expect(page.locator("p.pharos-error")).toHaveCount(0);
+      await expect(page.locator(LOAD_ERRORS)).toHaveCount(0);
 
       // Episode -> its title page, named as the row was.
       const row = (await episodes.first().locator(".pharos-episode-name").innerText()).trim();
@@ -1136,7 +1139,7 @@ test.describe("pharos Dioxus UI", () => {
       await expect(page.locator("article.pharos-title h2")).toHaveText(name, {
         timeout: 15_000,
       });
-      await expect(page.locator("p.pharos-error")).toHaveCount(0);
+      await expect(page.locator(LOAD_ERRORS)).toHaveCount(0);
     });
 
     // B318: the library buttons and the breadcrumb trail.
@@ -1209,7 +1212,7 @@ test.describe("pharos Dioxus UI", () => {
       await expect(page.locator("section.pharos-browse h2")).toHaveText("Bulk", {
         timeout: 15_000,
       });
-      await expect(page.locator("p.pharos-error")).toHaveCount(0);
+      await expect(page.locator(LOAD_ERRORS)).toHaveCount(0);
     });
 
     // B500: an episode row's tick, the season and the show each mark
@@ -1341,7 +1344,7 @@ test.describe("pharos Dioxus UI", () => {
       await expect(tick).toHaveClass(/is-watched/);
       await season.click();
       await expect(tick).not.toHaveClass(/is-watched/);
-      await expect(page.locator("p.pharos-error")).toHaveCount(0);
+      await expect(page.locator(LOAD_ERRORS)).toHaveCount(0);
 
       // Part way through: the title offers Resume and Play from start, and
       // the latter starts at zero.
@@ -1461,7 +1464,7 @@ test.describe("pharos Dioxus UI", () => {
         timeout: 15_000,
       });
       await expect(page.locator("ol.pharos-tracks li").first()).toBeVisible();
-      await expect(page.locator("p.pharos-error")).toHaveCount(0);
+      await expect(page.locator(LOAD_ERRORS)).toHaveCount(0);
     });
 
     test("unknown route renders a message, not a blank page", async ({
