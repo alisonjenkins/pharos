@@ -52,9 +52,11 @@ idle max is the first call after launch. Playback leaves p50 alone and
 triples the read tail: a read costs up to about 12 ms at p99. The push
 keeps 60 Hz (600 frames in 10.0 s); 3-32 of 600 gaps went over 20 ms and
 none reached two frames. One batched read per D-pad press still fits a
-16.7 ms frame. Polling `<video>` state by eval on every tick would not
-(several reads a tick at up to 12 ms each), so the JS mirror for state
-that changes on its own holds up under playback too. The clip is not HLS
+16.7 ms frame. Polling `<video>` state by eval on every tick would fit
+only as one batched read, and at 12.6 ms p99 that read takes three
+quarters of the frame; the synchronous callers could not wait on it
+anyway. The JS mirror for state that changes on its own costs readers
+nothing and holds 60 Hz, so it holds up under playback too. The clip is not HLS
 through hls.js/MSE, so a real stream adds demux work on the same thread;
 treat these as a floor for playback.
 
