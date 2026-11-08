@@ -32,6 +32,9 @@ pub const MIN_WIDTH_PX: f64 = 240.0;
 /// How a video window's height follows its width: the picture is 16:9.
 const VIDEO_ASPECT: f64 = 9.0 / 16.0;
 
+/// Whether leaving a video's full view stops it (the Android TV app).
+const STOPS_VIDEO: bool = cfg!(target_os = "android");
+
 /// How the player is shown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum View {
@@ -230,6 +233,9 @@ pub struct Stage {
     /// The song handing over to the next one, kept mounted until the next
     /// is ready and, with a crossfade, until it has faded out.
     pub handoff: Option<Handoff>,
+    /// Whether the item playing is a film or an episode, as its player
+    /// reported on mounting: on the TV, leaving its full view stops it.
+    pub video: bool,
 }
 
 impl Default for Stage {
@@ -242,6 +248,7 @@ impl Default for Stage {
             width: None,
             play: 0,
             handoff: None,
+            video: false,
         }
     }
 }
@@ -307,6 +314,11 @@ impl Stage {
             }
             // Manage is another app: the player ends there (FR-009).
             Route::Manage => self.close(),
+            // The TV stops a video there, as TV apps do: a remote cannot
+            // watch one in the bar and use the page at once (Alison, 2026-11-08).
+            _ if self.item.is_some() && self.view == View::Full && self.video && STOPS_VIDEO => {
+                self.close()
+            }
             _ if self.item.is_some() && self.view == View::Full => self.view = self.compact,
             _ => {}
         }
@@ -442,6 +454,7 @@ impl Stage {
 
     /// Stop showing anything.
     pub fn close(&mut self) {
+        self.video = false;
         self.item = None;
         self.view = View::Full;
         self.handoff = None;

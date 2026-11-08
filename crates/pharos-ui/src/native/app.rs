@@ -163,11 +163,16 @@ pub fn Root() -> Element {
     use_effect(move || {
         let at = route();
         let mut next = stage.peek().clone();
+        let item = next.item;
         if let Some(view) = next.follow(&at) {
+            let view = if next.item.is_some() {
+                view.label()
+            } else {
+                "closed"
+            };
             platform::info(&format!(
-                "pharos: stage view={} item={} reason=nav",
-                view.label(),
-                next.item.map(|i| i.to_string()).unwrap_or_default()
+                "pharos: stage view={view} item={} reason=nav",
+                item.map(|i| i.to_string()).unwrap_or_default()
             ));
             stage.set(next);
         }
@@ -3788,6 +3793,14 @@ fn Player(
     let own_queue = use_signal(Queue::default);
     let mut queue = try_use_context::<QueueCtx>().map_or(own_queue, |q| q.0);
     let audio = p.kind == ItemKind::Audio;
+    // Whether Back from the full view stops this play on the TV.
+    let current = matches!(slot, Slot::Current { .. });
+    use_effect(move || {
+        let mut stage = stage;
+        if current && stage.peek().video == audio {
+            stage.write().video = !audio;
+        }
+    });
     let playing_id = p.detail.item.id;
     // A song's next comes from the queue, unless a group decides what plays.
     // A session is kept after its group ends, so ask the group, not it.
