@@ -67,7 +67,20 @@ async fn a_connection_closed_mid_call_gives_the_pool_back() {
         req.get().set_device_token(&fx.user_token);
         calls.push(actix_web::rt::spawn(req.send().promise));
     }
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // Barrier: every call has reached its handler on the server. The server
+    // shares this thread, so once the count is reached and the test yields,
+    // each handler has run to its first await: the saturated pool.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while conn.in_flight() < max + 1 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "only {} of {} calls reached the server",
+            conn.in_flight(),
+            max + 1
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
     assert!(
         calls.iter().all(|c| !c.is_finished()),
         "the calls must be parked on the pool when the connection ends"
@@ -161,14 +174,26 @@ async fn a_websocket_peer_closing_mid_call_gives_the_pool_back() {
     for _ in 0..max {
         held.push(pool.acquire().await.unwrap());
     }
+    // As many parked calls as one connection may run, more than the pool
+    // has slots.
     let mut calls = Vec::new();
-    for _ in 0..=max {
+    for _ in 0..pharos_api::instrument::MAX_CALLS_IN_FLIGHT {
         let mut req = client.resume_request();
         req.get().init_ctx();
         req.get().set_device_token(&fx.user_token);
         calls.push(actix_web::rt::spawn(req.send().promise));
     }
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Barrier, read from outside the server: a call past the cap is refused
+    // with `limit` only once every parked call has reached its handler.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !refused_at_the_cap(&client).await {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the parked calls never all reached the server"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
     assert!(
         calls.iter().all(|c| !c.is_finished()),
         "the calls must be parked on the pool when the peer goes"
@@ -192,4 +217,26 @@ async fn a_websocket_peer_closing_mid_call_gives_the_pool_back() {
         pool.size(),
         pool.num_idle()
     );
+}
+
+/// Whether a `serverInfo` call is refused for the connection's
+/// calls-in-flight cap.
+async fn refused_at_the_cap(client: &bootstrap::Client) -> bool {
+    use pharos_api::pharos_capnp::{error, server_info_result};
+    let mut req = client.server_info_request();
+    req.get().init_ctx();
+    let Ok(reply) = req.send().promise.await else {
+        return false;
+    };
+    let Ok(result) = reply.get().and_then(|r| r.get_result()) else {
+        return false;
+    };
+    let Ok(server_info_result::Error(Ok(err))) = result.which() else {
+        return false;
+    };
+    matches!(
+        err.get_kind().which(),
+        Ok(error::kind::Limit(Ok(limit)))
+            if limit.get_name().ok().and_then(|n| n.to_str().ok()) == Some("calls_in_flight")
+    )
 }
