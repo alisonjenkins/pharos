@@ -147,6 +147,8 @@ tokio-tungstenite = { version = "0.30", default-features = false, features = ["c
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 futures = "0.3"
 android_logger = "0.15"
+# The server proxy (native/android_page.rs): images and streams with the token in a header.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 log = "0.4"
 
 [dev-dependencies]
