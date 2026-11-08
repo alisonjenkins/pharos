@@ -5,7 +5,7 @@
 **Status**: Draft. Slice 0 (spike) run; results in `spike-0.md`.
 **Asked by**: Alison, 2026-11-08: "We should do the Dioxus route and we can potentially help improve the experimental nature of it" (choosing Dioxus Native over a WebView wrapper for the TV app).
 **Scope**: A second Android TV build of `pharos-ui` that draws with Dioxus Native (Blitz: Stylo CSS, Taffy layout, a GPU or CPU 2D renderer) in place of the system WebView, plays video through the NDK `AMediaCodec` fed by `pharos-hls` (spec 031), and draws subtitles with `pharos-subs`. The current WebView app (spec 025, ADR-0061) keeps shipping until this one passes its parity gate.
-**Decision record**: ADR-0077 (supersedes ADR-0061 in part). **Bugs reserved**: B870-B889. **Verification**: V820-V839.
+**Decision record**: ADR-0077 (supersedes ADR-0061 in part). **Bugs reserved**: B870-B889. **Verification**: V820-V839 (V820, V821 used).
 **Depends on**: 011 (input, spatial focus), 013 (playback), 017 (native API), 025 (the TV app's network layer, sign-in and manifest), 026 (`pharos-subs`), 031 (`pharos-hls`).
 
 ---
@@ -154,6 +154,11 @@ Made on 2026-11-08T23:15:00Z while Alison was away, under her instruction to dec
 2. **The spike keeps the anyrender overlap patch until anyrender#92 is released.** The patch is offered upstream as that PR, which "Upstream work" requires. The app moves to the released crate when there is one.
 3. **The video layer is a `SurfaceControl` child built over JNI (spike mode 3).** It works on API 31 through the hidden `ViewRootImpl.getSurfaceControl()` and has a public route from API 33. The Kotlin `SurfaceView` (mode 1) stays the documented fallback only, as ADR-0061 and ADR-0077 rule out hand-written Java and Kotlin.
 4. **The feeder parses fMP4 in `pharos-hls`**, not through `AMediaExtractor_setDataSourceCustom`. `pharos-hls` gains the sample table, the codec boxes and the Annex B conversion as pure functions, tested on the host against ffmpeg fixtures. That keeps variant switches under the planner (an extractor over one concatenated stream would need rebuilding at each switch), and needs no extra copy of each segment. The extractor route stays the stopgap if the feeder stalls.
+
+Made on 2026-11-09 while Alison was asleep, under the same instruction:
+
+5. **The feeder is checked against served segments on the host (V820).** Three segments of the h264cmaf video rendition and the demuxed audio rendition, from the production argv through `process_segment`, read the same as ffprobe, run on across boundaries and decode in Annex B one frame per sample. Served samples carry no in-band SPS/PPS, so the player must always pass the init's parameter sets as `csd-0`/`csd-1`. The TV feeder's first run no longer has to be that check.
+6. **Capabilities come from `MediaCodecList` by fixed rules (V821).** A video codec needs a hardware decoder that takes 1080p (Android's software AV1 is on every device and too slow on the G08's cores); audio takes any decoder; containers are `NO_DIRECT_PLAY` only; image subtitles are burned in until the native player draws them; HDR is the display's answer. Because the negotiator reads an empty list as "any", no list is ever empty: a failed probe declares H.264 and AAC, which the CDD requires. The JNI walk is on `spike/blitz-tv-codecs` and logs the G08's list on its next run; the rules are in `pharos-ui` `native::decoders`.
 
 ## Open questions
 
