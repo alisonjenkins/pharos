@@ -1722,9 +1722,9 @@ fn on_bridge(message: Bridge) {
 struct Targets {
     /// The focused control's rect; `None` with the focus on nothing.
     from: Option<super::keymap::Rect>,
-    /// The shown controls in the move's scope: rect, selector, nth match,
-    /// and whether it is in the docked player bar.
-    targets: Vec<(super::keymap::Rect, String, u32, bool)>,
+    /// The shown controls in the move's scope: rect, and whether it is in
+    /// the docked player bar.
+    targets: Vec<(super::keymap::Rect, bool)>,
     /// Whether the focused control is in the docked player bar.
     #[serde(default)]
     from_docked: bool,
@@ -1738,12 +1738,6 @@ fn targets_js(first_or_last: bool) -> String {
     format!(
         r#"
 const T = {targets};
-const mark = (el) => {{
-  const q = (v) => v.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
-  const href = el.getAttribute("href");
-  const sel = href !== null ? `[href='${{q(href)}}']` : el.id ? `[id='${{q(el.id)}}']` : "";
-  return [sel, sel ? [...document.querySelectorAll(sel)].indexOf(el) : 0];
-}};
 const shown = (area) => [...area.querySelectorAll(T)].filter((el) => {{
   const r = el.getBoundingClientRect();
   return r.width > 0 && r.height > 0;
@@ -1760,11 +1754,28 @@ const docked = (el) => !!el.closest(".pharos-stage.is-mini");
 return {{
   from: from ? rect(from) : null,
   from_docked: !!from && docked(from),
-  targets: els.map((el) => {{ const [s, n] = mark(el); return [rect(el), s, Math.max(n, 0), docked(el)]; }}),
+  targets: els.map((el) => [rect(el), docked(el)]),
 }};
 "#,
         targets = js_str(KEY_TARGETS),
         list = first_or_last,
+    )
+}
+
+/// Focus the `at`th control the last `targets_js` found and return how to
+/// find it again on this page: a selector and its nth match.
+fn focus_js(at: usize) -> String {
+    format!(
+        r#"
+const el = (window.__pharosTargets || [])[{at}];
+if (!el) return ["", 0];
+el.focus();
+el.scrollIntoView(false);
+const q = (v) => v.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+const href = el.getAttribute("href");
+const sel = href !== null ? `[href='${{q(href)}}']` : el.id ? `[id='${{q(el.id)}}']` : "";
+return [sel, sel ? Math.max([...document.querySelectorAll(sel)].indexOf(el), 0) : 0];
+"#
     )
 }
 
@@ -1811,28 +1822,27 @@ async fn move_focus_now(dir: super::keymap::Dir) -> Result<(), String> {
             .map_err(|e| e.to_string())?;
         return Ok(());
     };
-    let controls: Vec<_> = found.targets.iter().map(|(r, _, _, d)| (*r, *d)).collect();
-    let Some(at) = super::keymap::pick_docked(dir, from, found.from_docked, &controls) else {
+    let controls = &found.targets;
+    let Some(at) = super::keymap::pick_docked(dir, from, found.from_docked, controls) else {
         return Ok(());
     };
     if controls[at].0 == from {
         return Ok(());
     }
-    let (_, sel, nth, _) = &found.targets[at];
+    // Only the control moved to is marked for coming back: marking every
+    // one ran a document-wide query per control, hundreds on a home page.
+    let (sel, nth): (String, u32) = document::eval(&focus_js(at))
+        .join()
+        .await
+        .map_err(|e| e.to_string())?;
     if !sel.is_empty() {
         let path = current_path();
         let mut m = lock(&LEFT_AT);
         if m.len() >= 64 && !m.contains_key(&path) {
             m.clear();
         }
-        m.insert(path, (sel.clone(), *nth));
+        m.insert(path, (sel, nth));
     }
-    document::eval(&format!(
-        "const el = (window.__pharosTargets || [])[{at}]; \
-         if (el) {{ el.focus(); el.scrollIntoView(false); }}"
-    ))
-    .await
-    .map_err(|e| e.to_string())?;
     Ok(())
 }
 
