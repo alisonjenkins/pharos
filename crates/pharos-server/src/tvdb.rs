@@ -22,7 +22,7 @@ use tokio::sync::RwLock;
 
 use crate::metadata_language::{record_translation, TranslationOutcome, DEFAULT_LANGUAGE};
 use crate::online_enrich::{EnrichedMetadata, RemoteArt, TextsFetch};
-use pharos_core::{ArtworkRole, LocalizedText, MediaKind, SearchCandidate};
+use pharos_core::{ArtworkRole, LocalizedText, MediaKind, PersonKind, PersonRef, SearchCandidate};
 use serde::Serialize;
 
 /// Body of `POST /login` on the TVDB v4 API.
@@ -33,6 +33,9 @@ struct LoginRequest<'a> {
 
 /// TVDB v4 REST base.
 const API_BASE: &str = "https://api4.thetvdb.com/v4";
+
+/// TVDB artwork host, for an image a record gives as a bare path.
+const ARTWORK_BASE: &str = "https://artworks.thetvdb.com";
 
 /// Abstraction over the HTTP transport TVDB calls ride on. Exists solely so
 /// [`TvdbClient`]'s auth state-machine (cache the JWT, re-login once on a
@@ -224,6 +227,27 @@ impl<T: TvdbTransport> TvdbClient<T> {
         Some(md)
     }
 
+    /// An episode's characters from `/episodes/{id}/extended`: cast, guest
+    /// stars and crew. Best-effort: a 404 or failed request leaves the cast
+    /// empty rather than failing the record.
+    async fn episode_people(&self, episode_id: &str) -> Vec<PersonRef> {
+        match self
+            .authed_get_status(&format!("/episodes/{episode_id}/extended"))
+            .await
+        {
+            Some((200, body)) => parse_tvdb_characters(&body),
+            other => {
+                let status = other.map(|(s, _)| s.to_string());
+                tracing::debug!(
+                    tvdb.episode_id = episode_id,
+                    status = status.as_deref().unwrap_or("no token"),
+                    "tvdb episode credits unavailable; episode has no cast from TVDB"
+                );
+                vec![]
+            }
+        }
+    }
+
     /// The series record with `texts` holding each of `languages` plus the
     /// original. `?meta=translations` inlines every translation TVDB has, so
     /// this is one request whatever the languages.
@@ -275,6 +299,9 @@ impl<T: TvdbTransport> TvdbClient<T> {
             .await
             .ok()?;
         prefer_language(&mut md, DEFAULT_LANGUAGE);
+        if let Some(id) = md.provider_id.as_deref() {
+            md.people = self.episode_people(id).await;
+        }
         Some(md)
     }
 
@@ -847,6 +874,181 @@ pub(crate) fn parse_episode_detail(
     })
 }
 
+/// Parse cast and crew credits from a TVDB `/episodes/{id}/extended` response body.
+///
+/// Reads characters from `data.characters`. Maps `peopleType` `"Actor"` and
+/// `"Guest Star"` to [`PersonKind::Actor`] and [`PersonKind::GuestStar`]
+/// (character name from `name`), and `"Director"` and `"Writer"` to their
+/// kinds. Entries with other types or missing/blank `personName` are dropped.
+///
+/// Thumb uses `personImgURL` if it is a non-empty `http(s)` URL, falling back
+/// to `image` if non-empty `http(s)`. `provider_ids` maps from `peopleId`.
+/// Sorts by kind group (Actor, GuestStar, Director, Writer) then `sort` ascending,
+/// caps Actor and GuestStar at 30 each, deduplicates `(name, kind)` keeping the
+/// first occurrence, and renumbers `sort_order` sequentially 0..n.
+/// Returns an empty `Vec` on malformed JSON or missing `data.characters`.
+pub(crate) fn parse_tvdb_characters(body: &str) -> Vec<PersonRef> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
+        return vec![];
+    };
+    let Some(characters) = v
+        .get("data")
+        .and_then(|d| d.get("characters"))
+        .and_then(|c| c.as_array())
+    else {
+        return vec![];
+    };
+
+    /// A TVDB image reference as an absolute URL: kept when it already is
+    /// one, joined to the artwork host when it is a bare `/banners/...` path.
+    fn image_url(s: &str) -> Option<String> {
+        let t = s.trim();
+        if t.starts_with("http://") || t.starts_with("https://") {
+            Some(t.to_string())
+        } else if t.starts_with('/') {
+            Some(format!("{ARTWORK_BASE}{t}"))
+        } else {
+            None
+        }
+    }
+
+    struct ParsedChar {
+        person: PersonRef,
+        raw_sort: Option<i64>,
+    }
+
+    let mut parsed: Vec<ParsedChar> = Vec::new();
+    for item in characters {
+        let Some(raw_person_name) = item.get("personName").and_then(|n| n.as_str()) else {
+            continue;
+        };
+        let person_name = raw_person_name.trim();
+        if person_name.is_empty() {
+            continue;
+        }
+
+        // `peopleType` names the role; `type` is its numeric id, used when the
+        // name is missing (TVDB people types: 1 Director, 2 Writer, 3 Actor,
+        // 4 Guest Star).
+        let people_type = match item.get("peopleType").and_then(|t| t.as_str()) {
+            Some(t) => t.trim(),
+            None => match item.get("type").and_then(|t| t.as_i64()) {
+                Some(1) => "Director",
+                Some(2) => "Writer",
+                Some(3) => "Actor",
+                Some(4) => "Guest Star",
+                _ => continue,
+            },
+        };
+        let character = || {
+            item.get("name")
+                .and_then(|n| n.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        };
+        let (kind, character) = match people_type {
+            "Actor" => (PersonKind::Actor, character()),
+            "Guest Star" => (PersonKind::GuestStar, character()),
+            "Director" => (PersonKind::Director, None),
+            "Writer" => (PersonKind::Writer, None),
+            _ => continue,
+        };
+
+        let thumb = ["personImgURL", "image"]
+            .into_iter()
+            .find_map(|key| item.get(key).and_then(|u| u.as_str()).and_then(image_url));
+
+        let provider_ids = item
+            .get("peopleId")
+            .and_then(|i| {
+                i.as_i64()
+                    .map(|n| n.to_string())
+                    .or_else(|| i.as_str().map(str::to_string))
+            })
+            .map(|id| format!("tvdb:{id}"));
+
+        let raw_sort = item.get("sort").and_then(|s| {
+            s.as_i64()
+                .or_else(|| s.as_str().and_then(|str_val| str_val.parse::<i64>().ok()))
+        });
+
+        parsed.push(ParsedChar {
+            person: PersonRef {
+                name: person_name.to_string(),
+                // Crew carry their job as the role, as TMDB crew do, so a
+                // person both acting and directing keeps both credits.
+                role: matches!(kind, PersonKind::Director | PersonKind::Writer)
+                    .then(|| people_type.to_string()),
+                kind,
+                character,
+                sort_order: None,
+                thumb,
+                provider_ids,
+            },
+            raw_sort,
+        });
+    }
+
+    /// Numerical rank for kind grouping: Actor < GuestStar < Director < Writer.
+    fn kind_rank(k: PersonKind) -> usize {
+        match k {
+            PersonKind::Actor => 0,
+            PersonKind::GuestStar => 1,
+            PersonKind::Director => 2,
+            PersonKind::Writer => 3,
+            _ => 4,
+        }
+    }
+
+    parsed.sort_by(|a, b| {
+        let ra = kind_rank(a.person.kind);
+        let rb = kind_rank(b.person.kind);
+        match ra.cmp(&rb) {
+            std::cmp::Ordering::Equal => match (a.raw_sort, b.raw_sort) {
+                (Some(s1), Some(s2)) => s1.cmp(&s2),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => std::cmp::Ordering::Equal,
+            },
+            ord => ord,
+        }
+    });
+
+    let mut out: Vec<PersonRef> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut actor_count = 0;
+    let mut guest_star_count = 0;
+
+    for item in parsed {
+        if !seen.insert((item.person.name.clone(), item.person.kind)) {
+            continue;
+        }
+        match item.person.kind {
+            PersonKind::Actor => {
+                if actor_count >= 30 {
+                    continue;
+                }
+                actor_count += 1;
+            }
+            PersonKind::GuestStar => {
+                if guest_star_count >= 30 {
+                    continue;
+                }
+                guest_star_count += 1;
+            }
+            _ => {}
+        }
+        out.push(item.person);
+    }
+
+    for (idx, p) in out.iter_mut().enumerate() {
+        p.sort_order = Some(idx as u32);
+    }
+
+    out
+}
+
 /// B588 — the names of the episodes in `at`'s season within
 /// [`EPISODE_NAME_MAX_SHIFT`] of its number, not counting `at` itself.
 fn neighbour_titles(episodes: &[serde_json::Value], at: (u32, u32)) -> Vec<String> {
@@ -1381,9 +1583,12 @@ mod tests {
             if let Some(answer) = routed {
                 return answer;
             }
-            let episode_lookup = path
-                .strip_prefix("/episodes/")
-                .is_some_and(|id| id.bytes().all(|b| b.is_ascii_digit()));
+            // An episode's extended record (its characters) has no queue slot
+            // either: unrouted, it is a 404.
+            let episode_lookup = path.strip_prefix("/episodes/").is_some_and(|rest| {
+                let id = rest.strip_suffix("/extended").unwrap_or(rest);
+                id.bytes().all(|b| b.is_ascii_digit())
+            });
             if episode_lookup {
                 return (404, String::new());
             }
@@ -1873,7 +2078,8 @@ mod tests {
             vec![
                 "/episodes/76666",
                 "/series/76666/episodes/default",
-                "/episodes/9/translations/eng"
+                "/episodes/9/translations/eng",
+                "/episodes/9/extended"
             ]
         );
         assert_eq!(md.title.as_deref(), Some("The Secret of the Dragon Balls"));
@@ -1934,7 +2140,11 @@ mod tests {
         let md = c.get_episode("76666", 1, 2, None).await.unwrap();
         assert_eq!(
             t.paths(),
-            vec!["/episodes/76666", "/series/76666/episodes/default"]
+            vec![
+                "/episodes/76666",
+                "/series/76666/episodes/default",
+                "/episodes/10/extended"
+            ]
         );
         assert_eq!(md.title.as_deref(), Some("えっ!"));
         let eng = by_lang(&md.texts, "eng").expect("a miss is recorded");
@@ -1973,8 +2183,9 @@ mod tests {
         let t = FakeTransport::new().push_login("jwt").push_ok(body);
         let c = TvdbClient::with_transport("key".into(), t.clone());
         let md = c.get_episode("121361", 1, 1, None).await.unwrap();
-        // The series-id check (B584) and the list; no translation.
-        assert_eq!(t.paths().len(), 2);
+        // The series-id check (B584), the list and the extended record; no
+        // translation.
+        assert_eq!(t.paths().len(), 3);
         assert_eq!(md.overview.as_deref(), Some("Lord Stark..."));
         assert_eq!(md.texts.len(), 1);
         assert!(md.texts[0].is_original && md.texts[0].language == "eng");
@@ -2110,5 +2321,114 @@ mod tests {
             "Game%20of%20Thrones"
         );
         assert_eq!(super::encode_query("abc-123_.~"), "abc-123_.~");
+    }
+
+    #[test]
+    fn tvdb_parse_characters_maps_types_and_fallbacks() {
+        let body = r#"{"data":{"id":100,"characters":[
+            {"peopleType":"Actor","personName":"Actor One","name":"Hero","sort":1,"peopleId":10,"personImgURL":"https://tvdb/p1.jpg","image":"https://tvdb/i1.jpg"},
+            {"peopleType":"Guest Star","personName":"Guest One","name":"Guest Hero","sort":2,"peopleId":20,"personImgURL":null,"image":"https://tvdb/fallback.jpg"},
+            {"peopleType":"Director","personName":"Director One","name":null,"sort":1,"peopleId":30,"personImgURL":"https://tvdb/d1.jpg"},
+            {"peopleType":"Crew","personName":"Crew One","sort":1,"peopleId":40},
+            {"peopleType":"Actor","personName":"   ","name":"Ghost","sort":0}
+        ]}}"#;
+        let people = parse_tvdb_characters(body);
+        assert_eq!(people.len(), 3);
+
+        // Actor One
+        assert_eq!(people[0].name, "Actor One");
+        assert_eq!(people[0].kind, pharos_core::PersonKind::Actor);
+        assert_eq!(people[0].character.as_deref(), Some("Hero"));
+        assert_eq!(people[0].thumb.as_deref(), Some("https://tvdb/p1.jpg"));
+        assert_eq!(people[0].provider_ids.as_deref(), Some("tvdb:10"));
+        assert_eq!(people[0].sort_order, Some(0));
+
+        // Guest One (fallback to image when personImgURL is null)
+        assert_eq!(people[1].name, "Guest One");
+        assert_eq!(people[1].kind, pharos_core::PersonKind::GuestStar);
+        assert_eq!(people[1].character.as_deref(), Some("Guest Hero"));
+        assert_eq!(
+            people[1].thumb.as_deref(),
+            Some("https://tvdb/fallback.jpg")
+        );
+        assert_eq!(people[1].provider_ids.as_deref(), Some("tvdb:20"));
+        assert_eq!(people[1].sort_order, Some(1));
+
+        // Director One
+        assert_eq!(people[2].name, "Director One");
+        assert_eq!(people[2].kind, pharos_core::PersonKind::Director);
+        assert_eq!(people[2].character, None);
+        assert_eq!(people[2].role.as_deref(), Some("Director"));
+        assert_eq!(people[2].thumb.as_deref(), Some("https://tvdb/d1.jpg"));
+        assert_eq!(people[2].provider_ids.as_deref(), Some("tvdb:30"));
+        assert_eq!(people[2].sort_order, Some(2));
+    }
+
+    #[test]
+    fn tvdb_parse_characters_reads_the_type_id_and_bare_image_paths() {
+        let body = r#"{"data":{"characters":[
+            {"type":4,"personName":"Guest Two","name":"Visitor","sort":1,"image":"/banners/person/2/a.jpg"},
+            {"type":3,"personName":"Actor Two","name":"Lead","sort":1,"personImgURL":"","image":null},
+            {"type":5,"personName":"Crew Two","sort":1}
+        ]}}"#;
+        let people = parse_tvdb_characters(body);
+        let got: Vec<_> = people
+            .iter()
+            .map(|p| (p.name.as_str(), p.kind, p.thumb.as_deref()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("Actor Two", pharos_core::PersonKind::Actor, None),
+                (
+                    "Guest Two",
+                    pharos_core::PersonKind::GuestStar,
+                    Some("https://artworks.thetvdb.com/banners/person/2/a.jpg")
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn tvdb_parse_characters_empty_on_malformed() {
+        assert!(parse_tvdb_characters("not json").is_empty());
+        assert!(parse_tvdb_characters("{}").is_empty());
+        assert!(parse_tvdb_characters(r#"{"data":{}}"#).is_empty());
+    }
+
+    #[tokio::test]
+    async fn tvdb_get_episode_fetches_credits_when_present() {
+        let ext = r#"{"data":{"id":102,"characters":[{"peopleType":"Actor","personName":"Lead Actor","name":"Main","sort":1,"peopleId":501}]}}"#;
+        let t = FakeTransport::new()
+            .push_login("jwt")
+            .route("/series/71470/episodes/default", 200, TNG_S1)
+            .route("/episodes/102/extended", 200, ext);
+        let c = TvdbClient::with_transport("key".into(), t.clone());
+        let ep = c.get_episode("71470", 1, 2, None).await.expect("episode");
+        assert_eq!(ep.people.len(), 1);
+        assert_eq!(ep.people[0].name, "Lead Actor");
+        assert_eq!(ep.people[0].character.as_deref(), Some("Main"));
+        assert_eq!(ep.people[0].provider_ids.as_deref(), Some("tvdb:501"));
+        assert_eq!(ep.people[0].sort_order, Some(0));
+        let asked = t
+            .paths()
+            .iter()
+            .filter(|p| p.ends_with("/extended"))
+            .count();
+        assert_eq!(asked, 1, "one extended request per episode");
+    }
+
+    #[tokio::test]
+    async fn tvdb_get_episode_without_extended_record_has_no_people() {
+        for status in [404, 500] {
+            let t = FakeTransport::new()
+                .push_login("jwt")
+                .route("/series/71470/episodes/default", 200, TNG_S1)
+                .route("/episodes/102/extended", status, "");
+            let c = TvdbClient::with_transport("key".into(), t);
+            let ep = c.get_episode("71470", 1, 2, None).await.expect("episode");
+            assert!(ep.people.is_empty(), "status {status}");
+            assert!(ep.title.is_some(), "status {status}: the record survives");
+        }
     }
 }
