@@ -5,6 +5,10 @@
 - **Asked by:** Alison, "I want to go the Rust route with Dioxus, it keeps it
   more like the Web version + means we don't have the heavy weight Java BS".
 - **Ids:** B/V allocated when slices land. ADR-0061 (Proposed).
+- **Successor:** spec 032 (ADR-0077) builds a second TV app on Dioxus Native
+  (Blitz) with a Rust player. This app stays the default until 032's parity
+  gate passes. The eval-latency decision and the WebView playback rows below
+  apply to this app only.
 - **Depends on:** 009 (shell), 011 (D-pad focus, US1/US8), 013 (playback),
   017 (native API: `deviceToken`, `quickConnect*`, `Capabilities`).
 
