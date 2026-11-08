@@ -876,6 +876,14 @@ input:focus-visible {
   color: var(--px-color-fg);
 }
 
+/* 3D sits top-left so it never covers "Watched" (V722). */
+.pharos-badge-3d {
+  right: auto;
+  left: 0.5rem;
+  background: var(--px-color-accent);
+  color: var(--px-color-accent-fg);
+}
+
 /* Outside scores: chips under a title's facts, and small ones in a
    poster's bottom-left corner, above the progress bar. */
 .pharos-ratings {
