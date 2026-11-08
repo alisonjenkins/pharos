@@ -3,7 +3,7 @@
 //! Pure, so the rules run under host tests; the scroll sentinel and the fetch
 //! that feed it live in `browse` and the platform module.
 
-use pharos_client::api::{Item, Page};
+use pharos_client::api::{Item, ItemKind, Listing, Page};
 
 /// How many tiles before the end of the loaded items the scroll sentinel
 /// sits, so the next page is on its way before the viewer reaches the end.
@@ -104,6 +104,13 @@ impl Pager {
 
     /// Appends the page that was asked for. An empty page ends paging.
     pub fn land(&mut self, page: Page) {
+        let total = page.total;
+        self.land_as(page, total);
+    }
+
+    /// As [`Pager::land`], for a listing read in two parts ([`Chain`]): the
+    /// page's own total is only one part's, so the caller says the whole's.
+    pub fn land_as(&mut self, page: Page, total: u32) {
         self.in_flight = false;
         self.failed = false;
         if page.items.is_empty() {
@@ -111,7 +118,43 @@ impl Pager {
             return;
         }
         self.items.extend(page.items);
-        self.total = page.total;
+        self.total = total;
+    }
+
+    /// The first page was read again (a watched mark reloaded the screen):
+    /// replaces the items it covers with the fresh ones and keeps the pages
+    /// loaded after them. Returns the range of those pages, `(start, count)`,
+    /// for the caller to read again so their marks are fresh too; the pager
+    /// counts that read as the page in flight until [`Pager::land_tail`].
+    pub fn refresh_head(&mut self, head: Page) -> Option<(u32, u32)> {
+        let covered = head.items.len();
+        if self.items.len() <= covered {
+            self.items = head.items;
+            self.total = head.total;
+            return None;
+        }
+        let tail = self.items.split_off(covered);
+        let count = u32::try_from(tail.len()).unwrap_or(u32::MAX);
+        let start = u32::try_from(covered).unwrap_or(u32::MAX);
+        self.items = head.items;
+        self.total = head.total;
+        self.in_flight = true;
+        self.failed = false;
+        // The old tail stays on screen until the fresh one lands.
+        self.items.extend(tail);
+        Some((start, count))
+    }
+
+    /// The pages after the first, read again: replaces what was loaded from
+    /// `start` on.
+    pub fn land_tail(&mut self, start: u32, page: Page) {
+        self.in_flight = false;
+        let at = usize::try_from(start).unwrap_or(usize::MAX);
+        if page.items.is_empty() || at > self.items.len() {
+            return;
+        }
+        self.items.truncate(at);
+        self.items.extend(page.items);
     }
 
     /// The page asked for failed; the same page is asked for again on the
@@ -119,6 +162,63 @@ impl Pager {
     pub fn fail(&mut self) {
         self.in_flight = false;
         self.failed = true;
+    }
+}
+
+/// Which listing of a [`Chain`] a position falls in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Part {
+    Head,
+    Tail,
+}
+
+/// One grid read from two listings, the head's items then the tail's (a
+/// mixed library: its series, then its other stored items). Positions run
+/// over both as if they were one listing, so a [`Pager`] pages through them
+/// unchanged.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Chain {
+    pub head: Listing,
+    /// How many items the head listing holds.
+    pub head_total: u32,
+    pub tail: Listing,
+    /// A kind the tail lists but the grid leaves out: the head stands for
+    /// it (a series' episodes). The pager still counts it, so the positions
+    /// stay the server's.
+    pub hide: Option<ItemKind>,
+}
+
+impl Chain {
+    /// Where the read of `limit` items from position `start` goes: the
+    /// listing, its own start, and how many to ask for. A read never
+    /// crosses from head to tail; the next one starts in the tail.
+    pub fn step(&self, start: u32, limit: u32) -> (Part, u32, u32) {
+        if start < self.head_total {
+            (Part::Head, start, limit.min(self.head_total - start))
+        } else {
+            (Part::Tail, start - self.head_total, limit)
+        }
+    }
+
+    pub fn listing(&self, part: Part) -> &Listing {
+        match part {
+            Part::Head => &self.head,
+            Part::Tail => &self.tail,
+        }
+    }
+
+    /// The total over both parts once a page of `part` said its own `total`,
+    /// the other part's being `whole - this part's old size`.
+    pub fn whole(&self, part: Part, page_total: u32, whole: u32) -> u32 {
+        match part {
+            Part::Head => whole.saturating_sub(self.head_total) + page_total,
+            Part::Tail => self.head_total + page_total,
+        }
+    }
+
+    /// The items the grid shows.
+    pub fn shown<'a>(&self, items: &'a [Item]) -> Vec<&'a Item> {
+        items.iter().filter(|i| Some(i.kind) != self.hide).collect()
     }
 }
 
@@ -278,5 +378,67 @@ mod tests {
         p.land(page(2, 2, 6));
         assert_eq!(p.total(), 6);
         assert!(p.has_more());
+    }
+
+    fn chain(head_total: u32) -> Chain {
+        Chain {
+            head: Listing::of(ItemRef::Real(1), Some(ItemKind::Series), "SortName"),
+            head_total,
+            tail: Listing::of(ItemRef::Real(1), None, "SortName"),
+            hide: Some(ItemKind::Episode),
+        }
+    }
+
+    #[test]
+    fn a_chain_reads_the_head_then_the_tail_and_never_across() {
+        let c = chain(150);
+        assert_eq!(c.step(100, 100), (Part::Head, 100, 50));
+        assert_eq!(c.step(150, 100), (Part::Tail, 0, 100));
+        assert_eq!(c.step(250, 100), (Part::Tail, 100, 100));
+        assert_eq!(chain(0).step(0, 100), (Part::Tail, 0, 100));
+    }
+
+    #[test]
+    fn a_chain_totals_both_parts() {
+        let c = chain(150);
+        assert_eq!(c.whole(Part::Head, 150, 400), 400);
+        assert_eq!(c.whole(Part::Tail, 300, 400), 450);
+    }
+
+    #[test]
+    fn a_chain_hides_only_the_kind_its_head_stands_for() {
+        let mut episode = items(0, 1);
+        episode[0].kind = ItemKind::Episode;
+        let mut all = items(1, 2);
+        all.extend(episode);
+        let shown = chain(1).shown(&all);
+        assert_eq!(shown.len(), 2);
+        assert!(shown.iter().all(|i| i.kind == ItemKind::Movie));
+    }
+
+    #[test]
+    fn a_reloaded_head_keeps_the_pages_after_it_and_asks_for_them_again() {
+        let mut p = Pager::new(page(0, 2, 6));
+        p.begin(Trigger::Button);
+        p.land(page(2, 2, 6));
+        let mut fresh = page(0, 2, 6);
+        fresh.items[0].played = true;
+        assert_eq!(p.refresh_head(fresh), Some((2, 2)));
+        assert!(p.items()[0].played);
+        assert_eq!(names(&p), ["m0", "m1", "m2", "m3"], "the old tail stays");
+        assert_eq!(p.begin(Trigger::Button), None, "the read is in flight");
+        let mut again = page(2, 2, 6);
+        again.items[1].played = true;
+        p.land_tail(2, again);
+        assert!(p.items()[3].played);
+        assert!(!p.in_flight());
+        assert_eq!(p.begin(Trigger::Button), Some(4));
+    }
+
+    #[test]
+    fn a_reloaded_head_with_nothing_after_it_asks_for_nothing() {
+        let mut p = Pager::new(page(0, 2, 2));
+        assert_eq!(p.refresh_head(page(0, 2, 2)), None);
+        assert!(!p.in_flight());
     }
 }
