@@ -20,5 +20,6 @@
 
 pub mod device_profile;
 pub mod dto;
+pub mod image_tag_sig;
 pub mod kinds;
 pub mod socket_messages;
