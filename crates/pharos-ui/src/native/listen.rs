@@ -77,13 +77,16 @@ impl PartialEq for Tap {
 }
 
 impl Tap {
-    /// Route the media element through an analyser once it is playing and
-    /// the page has had a gesture; one attempt per screen.
-    fn connect(&self) {
+    /// Route the media element `media_id` through an analyser once it is
+    /// playing and the page has had a gesture; one attempt per screen. Asked
+    /// from the element's `playing` as well as the visualiser's frames, so a
+    /// song is tapped with the player shrunk too (B734, V682): the tap's
+    /// running context is what keeps the output awake through a pause.
+    fn connect(&self, media_id: &str) {
         if self.tried.get() {
             return;
         }
-        let waiting = if !platform::media_playing(VIDEO_ID) {
+        let waiting = if !platform::media_playing(media_id) {
             Some("not_playing")
         } else if !platform::user_activated() {
             Some("no_activation")
@@ -97,7 +100,7 @@ impl Tap {
             return;
         }
         self.tried.set(true);
-        match platform::audio_tap(VIDEO_ID) {
+        match platform::audio_tap(media_id) {
             Ok(tap) => {
                 platform::info("pharos: visualiser tap=connected");
                 *self.tap.borrow_mut() = Some(tap);
@@ -265,6 +268,7 @@ pub fn ListenView(
             if let (false, Some(program), None) = (compact, current.program(), fallback()) {
                 Visualiser {
                     key: "{current.label()}",
+                    media_id,
                     style: current,
                     program,
                     tap: tap.clone(),
@@ -372,7 +376,13 @@ pub fn ListenView(
                         id: media_id,
                         class: "pharos-audio",
                         autoplay: true,
-                        onplaying: move |_| on_media.call(MediaEvent::Playing),
+                        onplaying: {
+                            let tap = tap.clone();
+                            move |_| {
+                                tap.connect(media_id);
+                                on_media.call(MediaEvent::Playing);
+                            }
+                        },
                         onpause: move |_| on_media.call(MediaEvent::Pause),
                         onseeked: move |_| {
                             scrub.set(None);
@@ -868,6 +878,8 @@ fn Visualiser(
     style: Style,
     program: render::Program,
     tap: Tap,
+    /// The `<audio>` element the tap reads.
+    media_id: &'static str,
     on_fallback: EventHandler<Fallback>,
 ) -> Element {
     use_effect(move || {
@@ -881,7 +893,7 @@ fn Visualiser(
             let outcome = match opened {
                 Ok(surface) => {
                     report(style, None);
-                    draw(surface, &tap).await
+                    draw(surface, &tap, media_id).await
                 }
                 Err(f) => Err(f),
             };
@@ -944,7 +956,11 @@ fn renderer_signals(style: Style, fallback: Option<&Fallback>) -> (String, Vec<C
 /// Draw every animation frame until the component unmounts (which drops
 /// this future) or the surface fails. A paused song keeps its last frame,
 /// so a headset spends no GPU time on a still picture.
-async fn draw(mut surface: Box<dyn Surface>, tap: &Tap) -> Result<(), Fallback> {
+async fn draw(
+    mut surface: Box<dyn Surface>,
+    tap: &Tap,
+    media_id: &'static str,
+) -> Result<(), Fallback> {
     let start = platform::now_ms();
     let mut palette = platform::theme_palette();
     let mut palette_at = start;
@@ -952,7 +968,7 @@ async fn draw(mut surface: Box<dyn Surface>, tap: &Tap) -> Result<(), Fallback> 
     let mut drawn = false;
     loop {
         platform::animation_frame().await;
-        if drawn && !platform::media_playing(VIDEO_ID) && !surface.needs_frame() {
+        if drawn && !platform::media_playing(media_id) && !surface.needs_frame() {
             continue;
         }
         let now = platform::now_ms();
@@ -960,7 +976,7 @@ async fn draw(mut surface: Box<dyn Surface>, tap: &Tap) -> Result<(), Fallback> 
             palette = platform::theme_palette();
             palette_at = now;
         }
-        tap.connect();
+        tap.connect(media_id);
         let mut slot = tap.tap.borrow_mut();
         let analysis = slot.as_mut().map(|t| {
             let a = analysis.get_or_insert_with(|| Analysis::new(t.bins(), t.sample_rate()));
