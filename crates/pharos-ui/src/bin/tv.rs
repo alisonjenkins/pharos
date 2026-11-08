@@ -30,21 +30,22 @@ fn main() {
         "pharos: start tokio={}",
         tokio::runtime::Handle::try_current().is_ok()
     );
-    // Pharos Night from the first frame: the WebView is white until the
-    // page paints, and the stylesheet comes later still.
+    // Styled from the first frame: Pharos Night behind the WebView, which is
+    // white until the page paints, and the stylesheet this build's markup
+    // was written against, in the head. Fetched from the server it arrived
+    // after the first paint (unstyled content), and could be a newer
+    // server's.
     let config = dioxus::mobile::Config::new()
         .with_background_color((0x0e, 0x11, 0x16, 0xff))
-        .with_custom_head("<style>html{background:#0e1116}</style>".into());
+        .with_custom_head(format!(
+            "<style>html{{background:#0e1116}}</style><style>{}</style>",
+            include_str!("../../assets/pharos.css")
+        ));
     dioxus::LaunchBuilder::new().with_cfg(config).launch(root);
 
     fn root() -> Element {
         pharos_ui::native::use_server_proxy();
-        // The shared stylesheet is the server's, through the proxy, so it
-        // matches the server's UI. Linked here, after the proxy's handlers
-        // are in: a link in the page's head loads before them and comes
-        // back empty.
         rsx! {
-            document::Stylesheet { href: "/ui/assets/pharos.css" }
             pharos_ui::App {}
         }
     }
