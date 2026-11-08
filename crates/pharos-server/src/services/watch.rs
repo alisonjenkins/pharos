@@ -73,6 +73,7 @@ pub async fn tracks(
         return Tracks::default();
     }
     let id = wire_item_id(item.id);
+    let base = source_base(item);
     let mut out = Tracks::default();
     let sidecar_base = sidecar_base_index(&item.probe);
     let sidecars = discover_sidecars(&item.path).await;
@@ -91,10 +92,15 @@ pub async fn tracks(
             "Subtitle" => {
                 let drawn = if s.is_text_subtitle_stream {
                     Some(Drawn::Vtt(format!(
-                        "/videos/{id}/subtitles/{}/stream.vtt",
+                        "{base}/subtitles/{}/stream.vtt",
                         s.index
                     )))
-                } else if draws_images && s.codec.as_deref().is_some_and(is_image_subtitle_codec) {
+                // The image routes read the primary only, so a version's
+                // image subtitles burn.
+                } else if draws_images
+                    && item.edition.is_none()
+                    && s.codec.as_deref().is_some_and(is_image_subtitle_codec)
+                {
                     Some(Drawn::Images(format!(
                         "/videos/{id}/subtitles/{}/images.json",
                         s.index
@@ -127,6 +133,17 @@ pub async fn tracks(
         });
     }
     out
+}
+
+/// The route prefix that reads `item`'s file: `/videos/{id}` for the
+/// primary, `/videos/{id}/{id}-{edition}` for a version swapped in by
+/// `media_source::select`.
+fn source_base(item: &MediaItem) -> String {
+    let id = wire_item_id(item.id);
+    match &item.edition {
+        Some(edition) => format!("/videos/{id}/{id}-{edition}"),
+        None => format!("/videos/{id}"),
+    }
 }
 
 /// The generated track's title.
@@ -244,7 +261,8 @@ pub struct Font {
 /// The fonts `item` embeds, in file order. Empty for audio and for a file
 /// with no font attachment.
 pub fn fonts(item: &MediaItem) -> Vec<Font> {
-    if !is_video(item) {
+    // The font route reads the primary only.
+    if !is_video(item) || item.edition.is_some() {
         return Vec::new();
     }
     let id = wire_item_id(item.id);
