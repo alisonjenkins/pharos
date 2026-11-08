@@ -46,7 +46,21 @@ pub fn launch(app: fn() -> Element, server: url::Url) {
             ..Default::default()
         },
     );
-    let renderer = DioxusNativeWindowRenderer::with_options(RendererOptions::default());
+    let options = if crate::hole::enabled()
+        && android_properties::getprop("debug.pharos.hole_clear")
+            .value()
+            .as_deref()
+            != Some("0")
+    {
+        RendererOptions {
+            base_color: Some(dioxus_native::Color::TRANSPARENT),
+            alpha_mode: Some(dioxus_native::CompositeAlphaMode::Transparent),
+            ..Default::default()
+        }
+    } else {
+        RendererOptions::default()
+    };
+    let renderer = DioxusNativeWindowRenderer::with_options(options);
     let config = WindowConfig::new(Box::new(doc) as _, renderer);
     let application = DioxusNativeApplication::new(proxy, event_queue, config);
     if let Err(e) = event_loop.run_app(application) {

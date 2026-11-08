@@ -8,6 +8,8 @@
 use dioxus::prelude::*;
 
 #[cfg(target_os = "android")]
+mod hole;
+#[cfg(target_os = "android")]
 mod launch;
 #[cfg(target_os = "android")]
 mod live;
@@ -25,6 +27,9 @@ fn android_main(app: android_activity::AndroidApp) {
             .with_tag("pharos-bench"),
     );
     stdout_to_log();
+    if hole::enabled() {
+        hole::start(&app);
+    }
     blitz_shell::set_android_app(app);
     // Render-scale probe: `setprop debug.pharos.render_scale 0.667` on the TV.
     if let Some(scale) = android_properties::getprop("debug.pharos.render_scale")
@@ -84,9 +89,33 @@ fn root() -> Element {
     rsx! { Spike { start: Screen::Home, data: Data::fixture() } }
 }
 
+/// The hole probe's page: nothing over the video rect, a translucent bar and
+/// an opaque label where a player's controls would go.
+#[cfg(target_os = "android")]
+#[component]
+fn HoleProbe() -> Element {
+    // CSS px: the TV's density 320 gives a 960x540 viewport on 1920x1080.
+    rsx! {
+        div { style: "width: 960px; height: 540px;",
+            div { style: "height: 360px;" }
+            div { style: "margin-left: 160px; width: 620px; height: 20px; padding: 10px; background-color: rgba(0, 0, 0, 0.5); color: white; font-size: 16px;",
+                "Controls drawn by Blitz over the video layer"
+            }
+            div { style: "height: 30px;" }
+            div { style: "margin-left: 160px; width: 300px; height: 40px; padding: 10px; background-color: #1e6fd9; color: white; font-size: 16px;",
+                "Opaque UI outside the video rect"
+            }
+        }
+    }
+}
+
 /// Fixture data until the live server answers; then its home and library.
 #[cfg(target_os = "android")]
 fn root() -> Element {
+    // Constant for the process, so the hooks below run in the same order.
+    if hole::enabled() {
+        return rsx! { HoleProbe {} };
+    }
     let mut data = use_signal(Data::fixture);
     let mut notice = use_signal(|| Some("Connecting…".to_owned()));
     let mut detail = use_signal(|| None::<pharos_client::api::Detail>);

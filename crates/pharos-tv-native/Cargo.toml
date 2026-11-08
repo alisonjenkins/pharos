@@ -28,6 +28,8 @@ libc = "0.2"
 # AndroidApp to blitz-shell itself.
 android-activity = { version = "0.6", features = ["native-activity"] }
 blitz-shell = "=0.3.0-beta.4"
+# The hole probe's Window.setFormat call (src/hole.rs).
+jni = "0.21"
 # The default path calls __system_property_read_callback, which the link
 # under dx does not resolve (unexplained; LTO dropped it in the smoke app).
 # The deprecated bionic calls exist on every API level.

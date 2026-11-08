@@ -7118,6 +7118,7 @@ dependencies = [
  "fontique",
  "futures-channel",
  "futures-util",
+ "jni 0.21.1",
  "keyboard-types",
  "libc",
  "log",
