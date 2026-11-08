@@ -7,11 +7,12 @@ use std::fmt;
 use std::str::FromStr;
 
 use pharos_api::pharos_capnp::{
-    avatar_result, decision_result, detail_result, done, home_result, index_result, item_id,
-    item_query, item_summary, items_result, library, lyrics_result, me_result, media_token_result,
-    negotiate_result, opt_u16, opt_u32, playback, playback_grant, pref_result, prefs, session,
-    stream_choice, telemetry, track, user_data, user_state_result, Kind,
-    LibraryKind as WireLibraryKind, SegmentKind as WireSegmentKind, SubtitleDelivery,
+    avatar_result, capabilities, decision_result, detail_result, done, home_result, index_result,
+    item_id, item_query, item_summary, items_result, library, lyrics_result, me_result,
+    media_token_result, negotiate_result, opt_u16, opt_u32, playback, playback_grant, pref_result,
+    prefs, session, start_tracks_result, stream_choice, telemetry, track, user_data,
+    user_state_result, Kind, LibraryKind as WireLibraryKind, SegmentKind as WireSegmentKind,
+    SubtitleDelivery,
 };
 pub use pharos_api::pharos_capnp::{EventKind as ClientEventKind, Level as ClientLevel};
 pub use pharos_api::PASSWORD_CHANGED_REVOKE_FAILED;
@@ -323,6 +324,14 @@ pub struct TrackPicks {
     pub subtitle: TrackChoice,
 }
 
+/// The tracks a playback naming neither would start on; `None` is no audio
+/// track, or subtitles off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct StartTracks {
+    pub audio: Option<u32>,
+    pub subtitle: Option<u32>,
+}
+
 /// What the player can decode, for the server to choose a delivery.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Capabilities {
@@ -436,6 +445,21 @@ pub trait PharosApi {
         caps: &Capabilities,
         picks: TrackPicks,
     ) -> Result<(Decision, Self::Playing), ClientError>;
+    /// The tracks [`PharosApi::play`] with default picks would start `id`
+    /// on: the user's last choice for it, else their preferences. An
+    /// implementation that cannot ask the server reports the call as
+    /// unimplemented, not as an empty answer.
+    async fn start_tracks(
+        &self,
+        call: &CallInfo,
+        id: ItemRef,
+        caps: &Capabilities,
+    ) -> Result<StartTracks, ClientError> {
+        let _ = (call, id, caps);
+        Err(ClientError::Rpc(capnp::Error::unimplemented(
+            "startTracks is not available from this client".to_owned(),
+        )))
+    }
 }
 
 /// One negotiated playback, for progress reports.
@@ -1078,26 +1102,7 @@ impl PharosApi for NativeApi {
             let mut p = req.get();
             call.write(p.reborrow().init_ctx());
             set_item_ref(p.reborrow().init_id(), id);
-            let mut c = p.reborrow().init_caps();
-            set_texts(
-                c.reborrow().init_video_codecs(len(&caps.video_codecs)),
-                &caps.video_codecs,
-            );
-            set_texts(
-                c.reborrow().init_audio_codecs(len(&caps.audio_codecs)),
-                &caps.audio_codecs,
-            );
-            set_texts(
-                c.reborrow().init_containers(len(&caps.containers)),
-                &caps.containers,
-            );
-            c.set_max_bitrate(caps.max_bitrate);
-            c.set_hdr(caps.hdr);
-            set_texts(
-                c.reborrow()
-                    .init_image_subtitles(len(&caps.image_subtitles)),
-                &caps.image_subtitles,
-            );
+            set_caps(p.reborrow().init_caps(), caps);
             set_choice(p.reborrow().init_audio(), picks.audio);
             set_choice(p.init_subtitle(), picks.subtitle);
         }
@@ -1136,6 +1141,59 @@ impl PharosApi for NativeApi {
         };
         Ok((decision, NativeGrant(grant)))
     }
+
+    async fn start_tracks(
+        &self,
+        call: &CallInfo,
+        id: ItemRef,
+        caps: &Capabilities,
+    ) -> Result<StartTracks, ClientError> {
+        let mut req = self.playback.start_tracks_request();
+        {
+            let mut p = req.get();
+            call.write(p.reborrow().init_ctx());
+            set_item_ref(p.reborrow().init_id(), id);
+            set_caps(p.reborrow().init_caps(), caps);
+        }
+        let reply = req.send().promise.await?;
+        match reply
+            .get()?
+            .get_result()?
+            .which()
+            .map_err(capnp::Error::from)?
+        {
+            start_tracks_result::Tracks(t) => {
+                let t = t?;
+                Ok(StartTracks {
+                    audio: read_opt_u32(t.get_audio()?)?,
+                    subtitle: read_opt_u32(t.get_subtitle()?)?,
+                })
+            }
+            start_tracks_result::Error(e) => Err(ClientError::from_api(e?)),
+        }
+    }
+}
+
+fn set_caps(mut c: capabilities::Builder<'_>, caps: &Capabilities) {
+    set_texts(
+        c.reborrow().init_video_codecs(len(&caps.video_codecs)),
+        &caps.video_codecs,
+    );
+    set_texts(
+        c.reborrow().init_audio_codecs(len(&caps.audio_codecs)),
+        &caps.audio_codecs,
+    );
+    set_texts(
+        c.reborrow().init_containers(len(&caps.containers)),
+        &caps.containers,
+    );
+    c.set_max_bitrate(caps.max_bitrate);
+    c.set_hdr(caps.hdr);
+    set_texts(
+        c.reborrow()
+            .init_image_subtitles(len(&caps.image_subtitles)),
+        &caps.image_subtitles,
+    );
 }
 
 /// Items per home rail: a screen's width of posters and some to scroll.
