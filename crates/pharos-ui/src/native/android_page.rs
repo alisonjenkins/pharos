@@ -20,7 +20,8 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 
 use dioxus::core::spawn_forever;
 use dioxus::prelude::document;
@@ -69,6 +70,9 @@ pub async fn open(call: &CallInfo) -> Result<Open, OpenError> {
         OpenError::NotOpened(Probe::Failed(e))
     })?;
     spawn_forever(system);
+    if lock(&CAPS).is_none() {
+        probe_capabilities().await;
+    }
     let server_schema = pharos_client::server_schema_version(&client, call)
         .await
         .inspect_err(|e| log::warn!("pharos: serverInfo failed: {e}"))
@@ -159,11 +163,11 @@ pub async fn sleep_ms(ms: u32) {
 pub fn set_title(_title: &str) {}
 
 pub fn current_path() -> String {
-    PATHS.with(|p| p.borrow().current().to_owned())
+    lock(&PATHS).current().to_owned()
 }
 
 pub fn push(path: &str) {
-    PATHS.with(|p| p.borrow_mut().push(path));
+    lock(&PATHS).push(path);
     run(format!(
         "history.pushState('pharos', '', {});",
         js_str(path)
@@ -175,7 +179,7 @@ pub fn push(path: &str) {
 pub fn reload() {}
 
 pub fn replace(path: &str) {
-    PATHS.with(|p| p.borrow_mut().replace(path));
+    lock(&PATHS).replace(path);
     run(format!(
         "history.replaceState(history.state, '', {});",
         js_str(path)
@@ -191,7 +195,7 @@ pub fn swallow_next_context_menu() {}
 /// Back to the page before, when the app pushed one; its `popstate` comes
 /// through the bridge as the remote's Back does.
 pub fn go_back() -> bool {
-    let can = PATHS.with(|p| p.borrow().can_go_back());
+    let can = lock(&PATHS).can_go_back();
     if can {
         run("history.back();".into());
     }
@@ -234,41 +238,150 @@ pub fn has_mse() -> bool {
     true
 }
 
+/// What the WebView decodes, as `open` probed it, with no container the
+/// server can play directly (`tv_page::NO_DIRECT_PLAY`).
 pub fn capabilities() -> Capabilities {
-    Capabilities::default()
+    lock(&CAPS).clone().unwrap_or_default()
 }
 
-pub fn position_ms(_video_id: &str) -> u64 {
-    0
+/// Ask the WebView once which codecs MSE and `<video>` take, for
+/// `capabilities`.
+async fn probe_capabilities() {
+    let asked = RefCell::new(std::collections::BTreeSet::new());
+    let note = |mime: &str| {
+        asked.borrow_mut().insert(mime.to_owned());
+        false
+    };
+    let _ = super::playback::capabilities(note, note);
+    let note_true = |mime: &str| {
+        asked.borrow_mut().insert(mime.to_owned());
+        true
+    };
+    let _ = super::playback::capabilities(note_true, note_true);
+    let mimes: Vec<String> = asked.into_inner().into_iter().collect();
+    let script = format!(
+        "const v = document.createElement('video'); \
+         const out = {{}}; \
+         for (const m of {}) {{ \
+           const mse = !!(window.MediaSource && MediaSource.isTypeSupported(m)); \
+           out[m] = [mse, v.canPlayType(m) !== '']; \
+         }} \
+         return out;",
+        serde_json::to_string(&mimes).unwrap_or_else(|_| "[]".into())
+    );
+    let answers: HashMap<String, (bool, bool)> = match document::eval(&script).join().await {
+        Ok(a) => a,
+        Err(e) => {
+            log::warn!("pharos: capabilities probe failed error={e}");
+            return;
+        }
+    };
+    let answer = |mime: &str| answers.get(mime).copied().unwrap_or_default();
+    let mut caps = super::playback::capabilities(|m| answer(m).0 || answer(m).1, |m| answer(m).1);
+    caps.containers = vec![tv_page::NO_DIRECT_PLAY.to_owned()];
+    log::info!(
+        "pharos: capabilities video={} audio={} containers={}",
+        caps.video_codecs.join(","),
+        caps.audio_codecs.join(","),
+        caps.containers.join(",")
+    );
+    *lock(&CAPS) = Some(caps);
 }
 
-pub fn ended(_video_id: &str) -> bool {
-    false
+/// The media element `id` as its last event left it, and how long ago.
+fn media(id: &str) -> Option<(tv_page::Media, f64)> {
+    lock(&MEDIA)
+        .get(id)
+        .map(|(media, at)| (media.clone(), now_ms() - at))
 }
 
-pub fn has_data(_video_id: &str) -> bool {
-    false
+pub fn position_ms(video_id: &str) -> u64 {
+    media(video_id).map_or(0, |(m, ago)| m.position_ms(ago))
 }
 
-pub fn media_state(_video_id: &str) -> MediaState {
-    MediaState::default()
+pub fn ended(video_id: &str) -> bool {
+    media(video_id).is_some_and(|(m, _)| m.ended)
 }
 
-pub fn seek_ms(_video_id: &str, _ms: u64) {}
+pub fn has_data(video_id: &str) -> bool {
+    media(video_id).is_some_and(|(m, _)| m.has_data())
+}
 
-pub fn toggle_play(_video_id: &str) {}
+pub fn media_state(video_id: &str) -> MediaState {
+    media(video_id).map_or_else(MediaState::default, |(m, ago)| MediaState {
+        position_ms: m.position_ms(ago),
+        duration_ms: m.duration_ms(),
+        paused: m.paused,
+        volume: m.vol,
+        muted: m.muted,
+        loading: super::playback::is_loading(m.seeking, m.ready, m.paused, m.ended),
+        video_width: m.w,
+        video_height: m.h,
+    })
+}
 
-pub fn play(_video_id: &str) {}
+/// Run `body` with `v` bound to the media element `id`, when it exists.
+fn on_media(id: &str, body: &str) {
+    run(format!(
+        "const v = document.getElementById({}); if (v) {{ {body} }}",
+        js_str(id)
+    ));
+}
 
-pub fn pause(_video_id: &str) {}
+#[allow(clippy::cast_precision_loss)]
+pub fn seek_ms(video_id: &str, ms: u64) {
+    // Seen at once, before the element's `seeking` comes back.
+    if let Some((media, at)) = lock(&MEDIA).get_mut(video_id) {
+        media.pos = ms as f64 / 1000.0;
+        *at = now_ms();
+    }
+    on_media(
+        video_id,
+        &format!("v.currentTime = {};", ms as f64 / 1000.0),
+    );
+}
 
-pub fn set_rate(_video_id: &str, _rate: f64) {}
+/// Play if paused, else pause. A refused `play()` leaves it paused, which
+/// the controls then show.
+pub fn toggle_play(video_id: &str) {
+    on_media(
+        video_id,
+        "if (v.paused) { v.play().catch((e) => console.warn('pharos: play() refused', e)); } else { v.pause(); }",
+    );
+}
+
+pub fn play(video_id: &str) {
+    on_media(
+        video_id,
+        "v.play().catch((e) => console.warn('pharos: play() refused', e));",
+    );
+}
+
+pub fn pause(video_id: &str) {
+    on_media(video_id, "v.pause();");
+}
+
+pub fn set_rate(video_id: &str, rate: f64) {
+    if rate.is_finite() {
+        on_media(video_id, &format!("v.playbackRate = {rate};"));
+    }
+}
 
 pub fn unix_ms() -> i64 {
     wall_clock_ms() as i64
 }
 
-pub fn set_volume(_video_id: &str, _volume: f64, _muted: bool) {}
+pub fn set_volume(video_id: &str, volume: f64, muted: bool) {
+    let volume = if volume.is_finite() {
+        volume.clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
+    on_media(
+        video_id,
+        &format!("v.volume = {volume}; v.muted = {muted};"),
+    );
+}
 
 pub fn show_text_track(_video_id: &str, _track_id: Option<&str>) {}
 
@@ -292,7 +405,15 @@ pub async fn rust_subtitles(
 
 pub fn set_subtitle_controls_visible(_visible: bool) {}
 
-pub async fn video_metadata(_video_id: &str) {}
+/// Resolves once the video knows its picture size, or after 45 s.
+pub async fn video_metadata(video_id: &str) {
+    for _ in 0..450 {
+        if media(video_id).is_some_and(|(m, _)| m.ready >= 1) {
+            return;
+        }
+        sleep_ms(100).await;
+    }
+}
 
 pub struct StyledSubtitles;
 
@@ -313,8 +434,8 @@ pub async fn styled_subtitles(
 }
 
 /// The video's dropped and total frame counts; the host has no video.
-pub fn video_quality(_video_id: &str) -> Option<(u64, u64)> {
-    None
+pub fn video_quality(video_id: &str) -> Option<(u64, u64)> {
+    media(video_id).map(|(m, _)| (m.dropped, m.frames))
 }
 
 pub fn page_visible() -> bool {
@@ -330,7 +451,7 @@ pub fn element_size(_id: &str) -> (f64, f64) {
 }
 
 pub fn viewport() -> (f64, f64) {
-    VIEWPORT.with(std::cell::Cell::get)
+    *lock(&VIEWPORT)
 }
 
 pub fn key_on_itself(_evt: &dioxus::prelude::KeyboardEvent, _class: &str) -> bool {
@@ -345,11 +466,11 @@ pub fn capture_pointer(_evt: &dioxus::prelude::PointerEvent) {}
 
 /// `sessionStorage`'s twin: kept while the app runs.
 pub fn session_get(key: &str) -> Result<Option<String>, String> {
-    Ok(SESSION.with(|s| s.borrow().get(key).cloned()))
+    Ok(lock(&SESSION).get(key).cloned())
 }
 
 pub fn session_set(key: &str, value: &str) -> Result<(), String> {
-    SESSION.with(|s| s.borrow_mut().insert(key.to_owned(), value.to_owned()));
+    lock(&SESSION).insert(key.to_owned(), value.to_owned());
     Ok(())
 }
 
@@ -452,8 +573,25 @@ pub fn focus_key_area(_name: &str) -> bool {
     false
 }
 
-pub fn forward_to_player(_key: &str) -> bool {
-    false
+/// Press `key` on the page's player when the focus is outside it (B618).
+/// Decided from where the focus was as the key went down; the player's
+/// keydown handler then takes the forwarded key, and the bridge hears it
+/// again from inside the player, so it is not forwarded twice.
+pub fn forward_to_player(key: &str) -> bool {
+    if !tv_page::forwards_to_player(key, *lock(&KEY_AT)) {
+        return false;
+    }
+    run(format!(
+        "const p = document.querySelector('#pharos-player, .pharos-listen'); \
+         if (p) {{ \
+           p.focus({{ preventScroll: true }}); \
+           const key = {key}; \
+           p.dispatchEvent(new KeyboardEvent('keydown', {{ key, bubbles: true, cancelable: true, \
+             shiftKey: key !== key.toLowerCase() }})); \
+         }}",
+        key = js_str(key)
+    ));
+    true
 }
 
 pub fn key_action_shown(_name: &str) -> bool {
@@ -501,10 +639,8 @@ pub fn palette_keys() -> &'static str {
 }
 
 pub fn now_ms() -> f64 {
-    thread_local! {
-        static START: std::time::Instant = std::time::Instant::now();
-    }
-    START.with(|start| start.elapsed().as_secs_f64() * 1000.0)
+    static START: LazyLock<std::time::Instant> = LazyLock::new(std::time::Instant::now);
+    START.elapsed().as_secs_f64() * 1000.0
 }
 
 pub fn wall_clock_ms() -> f64 {
@@ -589,8 +725,172 @@ pub fn on_page_hide(_on_hide: impl FnMut() + 'static) -> PageHide {
     PageHide
 }
 
-pub async fn engine(_kind: Engine) -> Result<Box<dyn PlaybackEngine>, String> {
-    Err(NO_BROWSER.into())
+/// hls.js for every HLS stream; the Rust engine (spec 031) is the web
+/// build's, so it hands over to hls.js here. Direct play is refused (see
+/// `tv_page::NO_DIRECT_PLAY`); `capabilities` keeps the server from asking.
+pub async fn engine(kind: Engine) -> Result<Box<dyn PlaybackEngine>, String> {
+    match kind {
+        Engine::Direct => Err("the TV app plays HLS streams only for now".into()),
+        Engine::HlsJs | Engine::NativeHls | Engine::RustHls => {
+            if kind != Engine::HlsJs {
+                log::info!(
+                    "pharos: engine picked={} using=hlsjs reason=android",
+                    super::playback::engine_label(kind)
+                );
+            }
+            load_hlsjs().await?;
+            Ok(Box::new(HlsJs::default()))
+        }
+        Engine::Unsupported => Err("this TV cannot play HLS".into()),
+    }
+}
+
+const HLSJS_SRC: &str = "/ui/assets/vendor/hls.min.js";
+
+/// Add hls.js's `<script>` once, through the proxy, and wait for it.
+async fn load_hlsjs() -> Result<(), String> {
+    let script = format!(
+        "if (window.Hls) return true; \
+         await new Promise((ok, fail) => {{ \
+           const s = document.createElement('script'); \
+           s.src = {}; s.onload = ok; s.onerror = () => fail('hls.js did not load'); \
+           document.head.append(s); \
+         }}); \
+         return !!window.Hls;",
+        js_str(HLSJS_SRC)
+    );
+    match document::eval(&script).join::<bool>().await {
+        Ok(true) => Ok(()),
+        Ok(false) => Err("hls.js loaded but defined no Hls".into()),
+        Err(e) => Err(format!("hls.js: {e}")),
+    }
+}
+
+/// An hls.js player in the page, at `window.__pharosHls[id]`. Its errors and
+/// fragment loads come back through the bridge; the recovery is chosen here,
+/// as on the web. Dropping it destroys the player.
+#[derive(Default)]
+struct HlsJs {
+    video_id: String,
+    listener: Option<u64>,
+}
+
+impl PlaybackEngine for HlsJs {
+    fn attach(
+        &mut self,
+        video_id: &str,
+        url: &str,
+        start_ms: u64,
+        on_fatal: super::playback::OnFatal,
+        on_fragment: super::playback::OnFragment,
+    ) -> Result<(), String> {
+        let id = video_id.to_owned();
+        let budget = RefCell::new(super::playback::RecoveryBudget::new());
+        let log_url = url.split('?').next().unwrap_or_default().to_owned();
+        let on_event = {
+            let id = id.clone();
+            move |event: tv_page::HlsEvent| match event {
+                tv_page::HlsEvent::Frag {
+                    bytes,
+                    load_ms,
+                    media_ms,
+                } => {
+                    budget.borrow_mut().progressed();
+                    if bytes > 0 && load_ms > 0 && media_ms > 0 {
+                        on_fragment(super::playback::FragmentLoad {
+                            bytes,
+                            load_ms,
+                            media_ms,
+                        });
+                    }
+                }
+                tv_page::HlsEvent::Error {
+                    kind,
+                    details,
+                    fatal: false,
+                } => {
+                    log::warn!(
+                        "pharos: playback error engine=hlsjs type={kind} details={details} fatal=false url={log_url}"
+                    );
+                }
+                tv_page::HlsEvent::Error { kind, details, .. } => {
+                    let mut budget = budget.borrow_mut();
+                    let action = budget.on_fatal(&kind, &details);
+                    log::warn!(
+                        "pharos: playback error engine=hlsjs type={kind} details={details} fatal=true action={} attempt={} url={log_url}",
+                        action.label(),
+                        budget.attempts(&kind)
+                    );
+                    let p = format!("window.__pharosHls && window.__pharosHls[{}]", js_str(&id));
+                    match action {
+                        super::playback::Recovery::StartLoad => {
+                            run(format!("const p = {p}; if (p) p.startLoad();"));
+                        }
+                        super::playback::Recovery::RecoverMedia => {
+                            run(format!("const p = {p}; if (p) p.recoverMediaError();"));
+                        }
+                        super::playback::Recovery::Fail => {
+                            on_fatal(format!("the stream failed ({kind}: {details})"));
+                        }
+                    }
+                }
+            }
+        };
+        self.listener = Some(listen(Listener::Hls(id.clone(), Box::new(on_event))));
+        self.video_id = id.clone();
+        #[allow(clippy::cast_precision_loss)]
+        let start = if start_ms > 0 {
+            start_ms as f64 / 1000.0
+        } else {
+            -1.0
+        };
+        run(format!(
+            r#"
+const id = {id};
+const v = document.getElementById(id);
+if (!v) throw new Error("no <video id=" + id + ">");
+window.__pharosHls = window.__pharosHls || {{}};
+if (window.__pharosHls[id]) window.__pharosHls[id].destroy();
+const h = new Hls({{ startPosition: {start} }});
+window.__pharosHls[id] = h;
+const send = (m) => window.__pharosSend && window.__pharosSend(Object.assign({{ t: "hls", id }}, m));
+h.on(Hls.Events.ERROR, (_, d) => send({{ ev: "error", kind: String(d.type), details: String(d.details), fatal: !!d.fatal }}));
+h.on(Hls.Events.FRAG_LOADED, (_, d) => {{
+  if (!d.frag || d.frag.type !== "main") return;
+  const st = d.frag.stats || d.stats || {{}};
+  const l = st.loading || {{}};
+  const from = l.first > 0 ? l.first : l.start;
+  send({{ ev: "frag", bytes: Math.max(0, Math.round(st.loaded || 0)),
+         load_ms: Math.max(0, Math.round((l.end || 0) - (from || 0))),
+         media_ms: Math.max(0, Math.round((d.frag.duration || 0) * 1000)) }});
+}});
+v.setAttribute({mark}, "hlsjs");
+h.loadSource({url});
+h.attachMedia(v);
+"#,
+            id = js_str(&id),
+            mark = js_str(super::resume::ENGINE_MARK),
+            url = js_str(url),
+        ));
+        Ok(())
+    }
+}
+
+impl Drop for HlsJs {
+    fn drop(&mut self) {
+        if let Some(listener) = self.listener.take() {
+            unlisten(listener);
+        }
+        if self.video_id.is_empty() {
+            return;
+        }
+        run(format!(
+            "const id = {}; const h = window.__pharosHls && window.__pharosHls[id]; \
+             if (h) {{ h.destroy(); delete window.__pharosHls[id]; }}",
+            js_str(&self.video_id)
+        ));
+        lock(&MEDIA).remove(&self.video_id);
+    }
 }
 
 pub fn warn(message: &str) {
@@ -699,8 +999,8 @@ pub fn audio_tap(_media_id: &str) -> Result<Box<dyn super::visualiser::AudioTap>
     Err(NO_BROWSER.into())
 }
 
-pub fn media_playing(_id: &str) -> bool {
-    false
+pub fn media_playing(id: &str) -> bool {
+    media(id).is_some_and(|(m, _)| m.src && !m.paused)
 }
 
 pub fn resume_context(_id: &str) -> super::resume::ResumeContext {
@@ -720,19 +1020,50 @@ pub fn groups(_api: &NativeApi) -> Groups {
 
 // ---- the bridge ---------------------------------------------------------
 
-thread_local! {
-    static PATHS: RefCell<Paths> = RefCell::new(Paths::new());
-    /// The CSS viewport; a TV's WebView is 960 x 540 (spike 0) until the
-    /// bridge says otherwise.
-    static VIEWPORT: std::cell::Cell<(f64, f64)> = const { std::cell::Cell::new((960.0, 540.0)) };
-    static SESSION: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
-    static LISTENERS: RefCell<Vec<(u64, Rc<RefCell<Listener>>)>> = const { RefCell::new(Vec::new()) };
-    static NEXT_LISTENER: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-    static BRIDGED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    /// Per page path, where the arrow keys last left the focus: a selector
-    /// and which match it was (B712's rule, as on the web).
-    static LEFT_AT: RefCell<HashMap<String, (String, u32)>> = RefCell::new(HashMap::new());
+// Process-wide, not thread-local: on Android, Dioxus runs tasks and event
+// handlers on more than one thread (seen on the TV), so a thread-local
+// seen from a handler is not the one the bridge wrote.
+static PATHS: LazyLock<Mutex<Paths>> = LazyLock::new(|| Mutex::new(Paths::new()));
+/// The CSS viewport; a TV's WebView is 960 x 540 (spike 0) until the
+/// bridge says otherwise.
+static VIEWPORT: Mutex<(f64, f64)> = Mutex::new((960.0, 540.0));
+static SESSION: LazyLock<Mutex<HashMap<String, String>>> = LazyLock::new(Mutex::default);
+/// A registered listener, called outside the registry's lock.
+type SharedListener = Arc<Mutex<Owned<Listener>>>;
+static LISTENERS: Mutex<Vec<(u64, SharedListener)>> = Mutex::new(Vec::new());
+static NEXT_LISTENER: AtomicU64 = AtomicU64::new(0);
+static BRIDGED: AtomicBool = AtomicBool::new(false);
+/// Per page path, where the arrow keys last left the focus: a selector
+/// and which match it was (B712's rule, as on the web).
+static LEFT_AT: LazyLock<Mutex<HashMap<String, (String, u32)>>> = LazyLock::new(Mutex::default);
+/// Each media element's last pushed state and when it came (`now_ms`).
+static MEDIA: LazyLock<Mutex<HashMap<String, (tv_page::Media, f64)>>> =
+    LazyLock::new(Mutex::default);
+/// Where the focus was as the key being handled went down.
+static KEY_AT: Mutex<tv_page::KeyContext> = Mutex::new(tv_page::KeyContext {
+    prevented: false,
+    player: false,
+    in_player: false,
+    on_button: false,
+});
+/// What `probe_capabilities` found.
+static CAPS: Mutex<Option<Capabilities>> = Mutex::new(None);
+
+/// A poisoned lock still holds usable state: a panicking handler leaves
+/// these maps whole.
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
+
+/// A listener's closure holds the UI's `Rc`s, so it is not `Send`. It is
+/// only made, called and dropped from Dioxus's own tasks and handlers,
+/// which Dioxus runs one at a time even when on different threads; the
+/// mutex around it orders those calls.
+struct Owned<T>(T);
+
+// SAFETY: see `Owned`: never touched by two threads at once, since every
+// access is under its mutex from code Dioxus runs one at a time.
+unsafe impl<T> Send for Owned<T> {}
 
 /// The controls the arrow keys move between, as on the web.
 const KEY_TARGETS: &str = "a[href], button:not([disabled]), [tabindex]:not([tabindex='-1'])";
@@ -745,21 +1076,21 @@ enum Listener {
     Mode(Box<dyn FnMut(&str) -> bool>),
     Escape(Box<dyn FnMut()>),
     Pop(Box<dyn FnMut(String)>),
+    /// hls.js events for the player on one media element.
+    Hls(String, Box<dyn FnMut(tv_page::HlsEvent)>),
 }
 
 fn listen(listener: Listener) -> u64 {
     install_bridge();
-    let id = NEXT_LISTENER.with(|n| {
-        let id = n.get().wrapping_add(1);
-        n.set(id);
-        id
-    });
-    LISTENERS.with(|l| l.borrow_mut().push((id, Rc::new(RefCell::new(listener)))));
+    let id = NEXT_LISTENER
+        .fetch_add(1, Ordering::Relaxed)
+        .wrapping_add(1);
+    lock(&LISTENERS).push((id, Arc::new(Mutex::new(Owned(listener)))));
     id
 }
 
 fn unlisten(id: u64) {
-    LISTENERS.with(|l| l.borrow_mut().retain(|(at, _)| *at != id));
+    lock(&LISTENERS).retain(|(at, _)| *at != id);
 }
 
 /// `value` as a JavaScript string literal.
@@ -794,13 +1125,61 @@ const inText = (t) => !!t && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/
 // Space too: the player's mode key toggles play, and the WebView would
 // click the focused button as well (it cannot wait for Rust's answer).
 const takes = new Set(["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", " "]);
+const players = '#pharos-player, .pharos-listen';
+// A remote has no Space: OK with the focus on the player itself (or on
+// nothing) and the media keys play and pause, as Space does. Swapped in
+// the capture phase, before any handler hears the remote's key.
+addEventListener("keydown", (e) => {
+  if (e.repeat || !e.isTrusted) return;
+  const player = document.querySelector(players);
+  if (!player) return;
+  const at = document.activeElement;
+  const onPlayer = !at || at === document.body || at === player;
+  const v = player.querySelector("video, audio");
+  const paused = !v || v.paused;
+  const toggle = (e.key === "Enter" && onPlayer) || e.key === "MediaPlayPause" ||
+    (e.key === "MediaPlay" && paused) || (e.key === "MediaPause" && !paused);
+  if (!toggle) return;
+  e.preventDefault();
+  e.stopImmediatePropagation();
+  player.focus({ preventScroll: true });
+  player.dispatchEvent(new KeyboardEvent("keydown", { key: " ", bubbles: true, cancelable: true }));
+}, true);
 addEventListener("keydown", (e) => {
   if (e.repeat) return;
   const text = inText(e.target);
+  const prevented = e.defaultPrevented;
   if (!text && takes.has(e.key)) e.preventDefault();
-  send({ t: "key", key: e.key, ctrl: e.ctrlKey, meta: e.metaKey, text });
+  const player = document.querySelector(players);
+  const at = document.activeElement;
+  send({
+    t: "key", key: e.key, ctrl: e.ctrlKey, meta: e.metaKey, text, prevented,
+    player: !!player, in_player: !!(player && at && player.contains(at)),
+    on_button: !!(at && at.matches && at.matches("a[href], button")),
+  });
 });
 addEventListener("popstate", () => send({ t: "pop", path: location.pathname + location.search }));
+window.__pharosSend = send;
+// Media events do not bubble, but a capturing listener on the document
+// hears every media element's.
+const media = (e) => {
+  const v = e.target;
+  if (!(v instanceof HTMLMediaElement) || !v.id) return;
+  const q = v.getVideoPlaybackQuality ? v.getVideoPlaybackQuality() : null;
+  send({
+    t: "media", id: v.id, pos: v.currentTime,
+    dur: Number.isFinite(v.duration) ? v.duration : null,
+    paused: v.paused, ended: v.ended, seeking: v.seeking, ready: v.readyState,
+    rate: v.playbackRate, vol: v.volume, muted: v.muted,
+    w: v.videoWidth || 0, h: v.videoHeight || 0, src: !!v.currentSrc,
+    dropped: q ? q.droppedVideoFrames : 0, frames: q ? q.totalVideoFrames : 0,
+  });
+};
+for (const name of ["timeupdate", "play", "playing", "pause", "waiting", "canplay",
+  "loadedmetadata", "durationchange", "seeking", "seeked", "ended", "volumechange",
+  "ratechange", "emptied"]) {
+  document.addEventListener(name, media, true);
+}
 const size = () => send({ t: "size", w: innerWidth, h: innerHeight });
 addEventListener("resize", size);
 size();
@@ -810,7 +1189,7 @@ await new Promise(() => {});
 /// Start the bridge once: the page's history starts on the app's first
 /// page, and its keys and Back come into Rust from then on.
 fn install_bridge() {
-    if BRIDGED.with(|b| b.replace(true)) {
+    if BRIDGED.swap(true, Ordering::AcqRel) {
         return;
     }
     let start = current_path();
@@ -830,7 +1209,7 @@ fn install_bridge() {
                 },
                 Err(e) => {
                     log::warn!("pharos: bridge ended error={e}");
-                    BRIDGED.with(|b| b.set(false));
+                    BRIDGED.store(false, Ordering::Release);
                     return;
                 }
             }
@@ -839,19 +1218,23 @@ fn install_bridge() {
 }
 
 fn on_bridge(message: Bridge) {
-    let listeners: Vec<_> = LISTENERS.with(|l| l.borrow().iter().map(|(_, f)| f.clone()).collect());
+    let listeners: Vec<_> = lock(&LISTENERS)
+        .iter()
+        .map(|(_, f)| Arc::clone(f))
+        .collect();
     match message {
         Bridge::Key {
             key,
             ctrl,
             meta,
             text,
-            ..
+            at,
         } => {
+            *lock(&KEY_AT) = at;
             let mut taken = false;
             for f in &listeners {
-                if let Ok(mut f) = f.try_borrow_mut() {
-                    if let Listener::App(f) = &mut *f {
+                if let Ok(mut f) = f.try_lock() {
+                    if let Listener::App(f) = &mut f.0 {
                         taken |= f(&key, ctrl, meta);
                     }
                 }
@@ -859,40 +1242,53 @@ fn on_bridge(message: Bridge) {
             if taken {
                 return;
             }
-            if !(text || ctrl || meta) {
+            if !(text || ctrl || meta || at.prevented) {
                 for f in &listeners {
-                    if let Ok(mut f) = f.try_borrow_mut() {
-                        if let Listener::Mode(f) = &mut *f {
+                    if let Ok(mut f) = f.try_lock() {
+                        if let Listener::Mode(f) = &mut f.0 {
                             taken |= f(&key);
                         }
                     }
                 }
             }
             // As on the web, Escape reaches these from a text field too.
-            if taken || key != "Escape" {
+            if taken || at.prevented || key != "Escape" {
                 return;
             }
             for f in &listeners {
-                if let Ok(mut f) = f.try_borrow_mut() {
-                    if let Listener::Escape(f) = &mut *f {
+                if let Ok(mut f) = f.try_lock() {
+                    if let Listener::Escape(f) = &mut f.0 {
                         f();
                     }
                 }
             }
         }
         Bridge::Pop { path } => {
-            PATHS.with(|p| p.borrow_mut().popped_to(&path));
+            lock(&PATHS).popped_to(&path);
             for f in &listeners {
-                if let Ok(mut f) = f.try_borrow_mut() {
-                    if let Listener::Pop(f) = &mut *f {
+                if let Ok(mut f) = f.try_lock() {
+                    if let Listener::Pop(f) = &mut f.0 {
                         f(path.clone());
                     }
                 }
             }
         }
-        Bridge::Size { w, h } => VIEWPORT.with(|v| v.set((w, h))),
-        // Media and hls.js events have no consumer until the player lands.
-        Bridge::Media(_) | Bridge::Hls { .. } => {}
+        Bridge::Size { w, h } => *lock(&VIEWPORT) = (w, h),
+        Bridge::Media(media) => {
+            let at = now_ms();
+            lock(&MEDIA).insert(media.id.clone(), (media, at));
+        }
+        Bridge::Hls { id, event } => {
+            for f in &listeners {
+                if let Ok(mut f) = f.try_lock() {
+                    if let Listener::Hls(on, f) = &mut f.0 {
+                        if *on == id {
+                            f(event.clone());
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -977,7 +1373,8 @@ async fn move_focus_now(dir: super::keymap::Dir) -> Result<(), String> {
         .await
         .map_err(|e| e.to_string())?;
     let Some(from) = found.from else {
-        let left = LEFT_AT.with(|m| m.borrow().get(&current_path()).cloned());
+        let path = current_path();
+        let left = lock(&LEFT_AT).get(&path).cloned();
         document::eval(&arrive_js(left.as_ref()))
             .await
             .map_err(|e| e.to_string())?;
@@ -993,13 +1390,11 @@ async fn move_focus_now(dir: super::keymap::Dir) -> Result<(), String> {
     let (_, sel, nth) = &found.targets[at];
     if !sel.is_empty() {
         let path = current_path();
-        LEFT_AT.with(|m| {
-            let mut m = m.borrow_mut();
-            if m.len() >= 64 && !m.contains_key(&path) {
-                m.clear();
-            }
-            m.insert(path, (sel.clone(), *nth));
-        });
+        let mut m = lock(&LEFT_AT);
+        if m.len() >= 64 && !m.contains_key(&path) {
+            m.clear();
+        }
+        m.insert(path, (sel.clone(), *nth));
     }
     document::eval(&format!(
         "const el = (window.__pharosTargets || [])[{at}]; \
@@ -1012,17 +1407,12 @@ async fn move_focus_now(dir: super::keymap::Dir) -> Result<(), String> {
 
 // ---- the server proxy ---------------------------------------------------
 
-/// The request headers passed on to the server.
-const PASSED_ON: [&str; 3] = ["range", "accept", "if-none-match"];
+/// The request headers passed on to the server. Not `Range`: the Android
+/// WebView cuts a ranged request's answer out of the whole body itself, so
+/// the proxy fetches and answers whole.
+const PASSED_ON: [&str; 2] = ["accept", "if-none-match"];
 /// The response headers passed back to the page.
-const PASSED_BACK: [&str; 6] = [
-    "content-type",
-    "content-range",
-    "accept-ranges",
-    "cache-control",
-    "etag",
-    "last-modified",
-];
+const PASSED_BACK: [&str; 4] = ["content-type", "cache-control", "etag", "last-modified"];
 
 fn http() -> &'static reqwest::Client {
     static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
@@ -1074,15 +1464,16 @@ pub fn use_server_proxy() {
                 || request.uri().path().to_owned(),
                 |p| p.as_str().to_owned(),
             );
+            let header = |name: &str| {
+                request
+                    .headers()
+                    .get(name)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_owned)
+            };
             let headers: Vec<(String, String)> = PASSED_ON
                 .iter()
-                .filter_map(|name| {
-                    request
-                        .headers()
-                        .get(*name)
-                        .and_then(|v| v.to_str().ok())
-                        .map(|v| ((*name).to_owned(), v.to_owned()))
-                })
+                .filter_map(|name| header(name).map(|v| ((*name).to_owned(), v)))
                 .collect();
             tokio::spawn(async move {
                 let started = std::time::Instant::now();
