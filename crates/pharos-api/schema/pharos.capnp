@@ -12,7 +12,7 @@ annotation secret(field, param) :Void;
 
 # Bumped when the schema changes; served as ServerInfo.schemaVersion so a client
 # can tell which methods a server knows (FR-009).
-const schemaVersion :UInt32 = 23;
+const schemaVersion :UInt32 = 24;
 
 # ---- ids and shared types -------------------------------------------------
 struct ItemId {                # mirrors pharos_jellyfin_api::WireId
@@ -367,6 +367,7 @@ enum EventKind {               # closed catalogue, 016 contracts/events.md
   playbackDecision @10; playbackStall @11; playbackError @12; qualitySwitch @13;
   seek @14; themeFallback @15; focusRecovered @16; cacheServed @17; cspViolation @18;
   groupDrift @19; groupHardSeek @20; groupWait @21; playbackResume @22;
+  playbackStart @23; playbackSummary @24;
 }
 enum Level { error @0; warn @1; info @2; }
 struct TelemetryEvent {
