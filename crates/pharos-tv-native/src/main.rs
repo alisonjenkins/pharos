@@ -17,9 +17,32 @@ fn android_main(app: android_activity::AndroidApp) {
             .with_max_level(log::LevelFilter::Info)
             .with_tag("pharos-bench"),
     );
+    stdout_to_log();
     blitz_shell::set_android_app(app);
     log::info!("pharos-tv-native start");
     main();
+}
+
+/// Blitz's `log-times` feature writes frame and phase times to stdout, which
+/// Android discards. Pipe stdout into the log under the same tag.
+#[cfg(target_os = "android")]
+fn stdout_to_log() {
+    use std::io::BufRead;
+    use std::os::fd::FromRawFd;
+    let mut fds = [0; 2];
+    // SAFETY: `pipe` fills two new descriptors; `dup2` points stdout at the
+    // write end, and the read end is owned by the File below.
+    unsafe {
+        if libc::pipe(fds.as_mut_ptr()) != 0 || libc::dup2(fds[1], 1) < 0 {
+            return;
+        }
+        let read = std::fs::File::from_raw_fd(fds[0]);
+        std::thread::spawn(move || {
+            for line in std::io::BufReader::new(read).lines().map_while(Result::ok) {
+                log::info!("{line}");
+            }
+        });
+    }
 }
 
 fn main() {

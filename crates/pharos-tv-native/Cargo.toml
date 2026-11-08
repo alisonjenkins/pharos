@@ -23,6 +23,7 @@ log = "0.4"
 # snapshot registers its own font.
 dioxus-native = { version = "=0.8.0-alpha.3", default-features = false, features = ["system-fonts"] }
 android_logger = "0.15"
+libc = "0.2"
 # dx writes no `android_main` for the native renderer, so the bin hands the
 # AndroidApp to blitz-shell itself.
 android-activity = { version = "0.6", features = ["native-activity"] }

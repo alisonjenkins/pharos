@@ -7120,6 +7120,7 @@ dependencies = [
  "dioxus-native-dom",
  "fontique",
  "keyboard-types",
+ "libc",
  "log",
  "parley",
  "pharos-client",
