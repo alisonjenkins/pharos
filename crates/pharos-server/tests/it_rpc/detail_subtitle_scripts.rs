@@ -209,3 +209,56 @@ async fn a_songs_detail_names_its_artists_and_album() {
         assert_eq!(text(d.get_album()), album, "V509: item {id} album");
     }
 }
+
+/// B800 (V750): a song's summary, the row its card is drawn from, names its
+/// track artist, else its album artist; a music video's names none, even
+/// with an artist tag.
+#[actix_web::test]
+async fn a_songs_summary_names_its_artist_for_its_card() {
+    let (server, fx) = crate::revocation::start().await;
+    let (client, _closed) = crate::revocation::connect(&server).await;
+    let session = crate::revocation::signed_in(&client, &fx.user_token).await;
+    let mut tracked = MediaItem {
+        id: 305,
+        path: "/libA/Angel.flac".into(),
+        title: "Angel".into(),
+        kind: MediaKind::Audio,
+        ..MediaItem::default()
+    };
+    tracked.probe.artist = Some("Massive Attack".into());
+    tracked.probe.album_artist = Some("Various Artists".into());
+    let mut album_only = MediaItem {
+        id: 306,
+        path: "/libA/Inertia Creeps.flac".into(),
+        title: "Inertia Creeps".into(),
+        kind: MediaKind::Audio,
+        ..MediaItem::default()
+    };
+    album_only.probe.album_artist = Some("Massive Attack".into());
+    let mut video = MediaItem {
+        id: 307,
+        path: "/libA/Teardrop (video).mkv".into(),
+        title: "Teardrop (video)".into(),
+        kind: MediaKind::Movie,
+        ..MediaItem::default()
+    };
+    video.probe.artist = Some("Massive Attack".into());
+    for item in [tracked, album_only, video] {
+        fx.state.stores.put(item).await.unwrap();
+    }
+
+    let library = session.library_request().send().pipeline.get_library();
+    for (id, artist) in [(305, "Massive Attack"), (306, "Massive Attack"), (307, "")] {
+        let mut req = library.detail_request();
+        req.get().init_ctx();
+        req.get().init_id().set_real(id);
+        let reply = req.send().promise.await.expect("detail");
+        let detail_result::Detail(d) = reply.get().unwrap().get_result().unwrap().which().unwrap()
+        else {
+            panic!("detail refused");
+        };
+        let summary = d.unwrap().get_summary().unwrap();
+        let got = summary.get_artist().unwrap().to_str().unwrap();
+        assert_eq!(got, artist, "V750: item {id} card artist");
+    }
+}
