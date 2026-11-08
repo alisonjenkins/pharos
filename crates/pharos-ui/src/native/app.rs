@@ -3802,7 +3802,7 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
                     )
                 });
                 let caps = negotiation_capabilities(detail.item.kind, auto);
-                let (decision, grant) = api.play(&info, id, &caps, asked).await?;
+                let (decision, grant) = api.play(&info, id, "", &caps, asked).await?;
                 Ok::<_, ClientError>((detail, decision, grant, asked))
             }
             .await;
@@ -3973,7 +3973,7 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
                 if *api_gen.peek() != gen {
                     return;
                 }
-                match api.play(&info, id, &negotiation_capabilities(kind, *auto_cap.peek()), asked).await {
+                match api.play(&info, id, "", &negotiation_capabilities(kind, *auto_cap.peek()), asked).await {
                     Ok((decision, grant)) if *api_gen.peek() == gen => {
                         *p.0.grant.borrow_mut() = grant;
                         // The play session id is a stream credential (B256).

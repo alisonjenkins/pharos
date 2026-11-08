@@ -116,6 +116,7 @@ mod tests {
                 artists: Vec::new(),
                 album: None,
                 cast: Vec::new(),
+                versions: Vec::new(),
             })
         }
         async fn person(
@@ -146,6 +147,7 @@ mod tests {
             &self,
             _: &CallInfo,
             _: ItemRef,
+            _: &str,
             _: &Capabilities,
             _: TrackPicks,
         ) -> Result<(Decision, NoGrant), ClientError> {
@@ -190,6 +192,7 @@ mod tests {
             imdb_rating: None,
             critic_rating: None,
             artist: None,
+            stereo: None,
         }
     }
 

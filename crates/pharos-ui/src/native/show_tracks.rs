@@ -239,6 +239,7 @@ mod tests {
                 library_kind: None,
                 imdb_rating: None,
                 critic_rating: None,
+                stereo: None,
             },
             overview: String::new(),
             genres: Vec::new(),
@@ -251,6 +252,7 @@ mod tests {
             artists: Vec::new(),
             album: None,
             cast: Vec::new(),
+            versions: Vec::new(),
         }
     }
 
