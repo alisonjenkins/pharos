@@ -258,8 +258,15 @@ pub fn has_mse() -> bool {
 
 /// What the WebView decodes, as `open` probed it, with no container the
 /// server can play directly (`tv_page::NO_DIRECT_PLAY`).
+///
+/// Before the probe answers (or if it failed) this is still HLS-only: an
+/// empty container list would tell the server any container direct-plays,
+/// and the WebView cannot seek a direct stream through the proxy.
 pub fn capabilities() -> Capabilities {
-    lock(&CAPS).clone().unwrap_or_default()
+    lock(&CAPS).clone().unwrap_or_else(|| Capabilities {
+        containers: vec![tv_page::NO_DIRECT_PLAY.to_owned()],
+        ..Capabilities::default()
+    })
 }
 
 /// Ask the WebView once which codecs MSE and `<video>` take, for
