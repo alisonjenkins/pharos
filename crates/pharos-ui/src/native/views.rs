@@ -710,6 +710,15 @@ pub fn reveal_palette_row(at: usize) {
 /// The Ctrl+K / Cmd+K palette: a box over the page that goes anywhere,
 /// listing `rows` under their group headings. `active` is the row Enter
 /// opens; `failed` is a search that did not answer.
+/// Holds the page behind a modal dialog inert while the calling component is
+/// mounted, and gives the focus back to what opened it after (B825). `root`
+/// selects the dialog's outermost element.
+pub fn use_modal_hold(root: &'static str) {
+    let hold =
+        use_hook(|| std::rc::Rc::new(std::cell::RefCell::new(platform::ModalHold::capture())));
+    use_effect(move || hold.borrow_mut().engage(root));
+}
+
 #[component]
 pub fn PaletteView(
     text: String,
@@ -722,6 +731,7 @@ pub fn PaletteView(
     on_close: EventHandler<()>,
 ) -> Element {
     let active_id = active.map(|at| option_id("palette", at));
+    use_modal_hold(".pharos-palette");
     rsx! {
         div { class: "pharos-palette",
             div { class: "pharos-palette-backdrop", onclick: move |_| on_close.call(()) }

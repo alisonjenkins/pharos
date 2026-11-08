@@ -2028,6 +2028,88 @@ pub fn focus_in_area(name: &str) -> bool {
         .is_some()
 }
 
+/// What an open modal dialog does to the page behind it (B825): every
+/// element outside it is made `inert`, so Tab, the pointer and screen
+/// readers stay inside, and closing it puts the focus back where it was.
+/// Hold it for as long as the dialog is mounted; dropping it undoes both.
+pub struct ModalHold {
+    /// The control that had the focus when the dialog opened.
+    opener: Option<web_sys::Element>,
+    inerted: Vec<web_sys::Element>,
+    root: Option<web_sys::Element>,
+}
+
+impl ModalHold {
+    /// Notes the focused control. Call it as the dialog first renders,
+    /// before it takes the focus.
+    pub fn capture() -> Self {
+        Self {
+            opener: focused(),
+            inerted: Vec::new(),
+            root: None,
+        }
+    }
+
+    /// Makes the page outside `root` (a selector for the dialog's outermost
+    /// element, its backdrop included so a click there still closes it)
+    /// inert. Call it once the dialog is in the page.
+    pub fn engage(&mut self, root: &str) {
+        if !self.inerted.is_empty() {
+            return;
+        }
+        let Some(found) = document().and_then(|d| d.query_selector(root).ok().flatten()) else {
+            warn(&format!("pharos: modal root {root} not in the page"));
+            return;
+        };
+        let mut node = found.clone();
+        while let Some(parent) = node.parent_element() {
+            let children = parent.children();
+            for at in 0..children.length() {
+                let Some(sibling) = children.item(at) else {
+                    continue;
+                };
+                // Scripts and styles are not content; one that is inert
+                // already (another dialog's doing) is left to its owner.
+                if sibling == node
+                    || sibling.has_attribute("inert")
+                    || matches!(sibling.tag_name().as_str(), "SCRIPT" | "STYLE" | "LINK")
+                {
+                    continue;
+                }
+                if sibling.set_attribute("inert", "").is_ok() {
+                    self.inerted.push(sibling);
+                }
+            }
+            if parent.tag_name() == "BODY" {
+                break;
+            }
+            node = parent;
+        }
+        self.root = Some(found);
+    }
+}
+
+impl Drop for ModalHold {
+    fn drop(&mut self) {
+        for el in self.inerted.drain(..) {
+            let _ = el.remove_attribute("inert");
+        }
+        // Back to the opener, unless the focus has already gone somewhere
+        // on the page the dialog led to.
+        let inside = |el: &web_sys::Element| {
+            self.root
+                .as_ref()
+                .is_some_and(|root| root.contains(Some(el)))
+        };
+        let stranded = focused().is_none_or(|now| inside(&now));
+        if let Some(opener) = self.opener.take().filter(|o| o.is_connected()) {
+            if stranded {
+                focus_element(&opener, false);
+            }
+        }
+    }
+}
+
 /// Whether a dialog is open in the page, other than the key help.
 pub fn dialog_open() -> bool {
     document()
