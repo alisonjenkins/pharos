@@ -147,20 +147,37 @@ async fn ffmpeg_probe_attempt(device: DeviceId, ffmpeg_bin: &str, timeout: Durat
 /// Spawn a throwaway ffmpeg with `args` and report whether it exited 0 within
 /// `timeout`. Shared by the session-cap probe and the per-codec encode probe.
 async fn run_ffmpeg_probe(ffmpeg_bin: &str, args: &[String], timeout: Duration) -> bool {
-    let mut cmd = tokio::process::Command::new(ffmpeg_bin);
-    cmd.args(args)
+    run_ffmpeg_capture(ffmpeg_bin, args, timeout).await.is_ok()
+}
+
+/// The one spawn, `kill_on_drop` and timeout core behind every trial: run
+/// `ffmpeg_bin args`, and on failure say why (the timeout, a spawn error, or
+/// ffmpeg's last stderr line) so a trial can log the cause.
+async fn run_ffmpeg_capture(
+    ffmpeg_bin: &str,
+    args: &[String],
+    timeout: Duration,
+) -> Result<(), String> {
+    let child = tokio::process::Command::new(ffmpeg_bin)
+        .args(args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .kill_on_drop(true);
-    let child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(_) => return false,
-    };
-    matches!(
-        tokio::time::timeout(timeout, wait_status(child)).await,
-        Ok(Some(true))
-    )
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| format!("spawn failed: {e}"))?;
+    match tokio::time::timeout(timeout, child.wait_with_output()).await {
+        Err(_) => Err(format!("timed out after {}s", timeout.as_secs())),
+        Ok(Err(e)) => Err(format!("wait failed: {e}")),
+        Ok(Ok(o)) if o.status.success() => Ok(()),
+        Ok(Ok(o)) => Err(String::from_utf8_lossy(&o.stderr)
+            .lines()
+            .rev()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or("ffmpeg exited non-zero with no output")
+            .trim()
+            .to_string()),
+    }
 }
 
 /// Which of the target video codecs `device` can ACTUALLY hardware-encode,
@@ -245,6 +262,160 @@ pub async fn probe_decodable_codecs(
     // pid-scoped, so a failure to clean up cannot collide with another run.
     let _ = std::fs::remove_dir_all(&dir);
     out
+}
+
+/// Budget for the GPU tonemap trial, longer than a plain encode trial: the first
+/// libplacebo filter graph compiles its shaders and Vulkan device creation is
+/// slow on a cold driver.
+pub const GPU_TONEMAP_TRIAL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Whether the GPU HDR tonemap route (ADR-0072) works on `device`: a tiny 10-bit
+/// HDR10 HEVC clip goes through the route's REAL argv (Vulkan decode, libplacebo,
+/// readback, VAAPI encode) and must exit 0 with output. Every way the stack can
+/// break (no Vulkan ICD, ffmpeg without libplacebo, no Vulkan HEVC decode)
+/// fails the same trial, so one verdict covers it. Publishes
+/// `pharos_transcode_tonemap_gpu_capable{device}` and logs the verdict with
+/// ffmpeg's last error line.
+pub async fn probe_gpu_tonemap(
+    device: DeviceId,
+    timeout: Duration,
+) -> crate::device::GpuTonemapCapability {
+    use crate::device::GpuTonemapCapability::{Capable, Incapable};
+    let verdict = match run_gpu_tonemap_trial(device, timeout).await {
+        Ok(()) => {
+            tracing::info!(
+                device = %device,
+                "GPU tonemap route confirmed by trial (Vulkan decode, libplacebo, VAAPI encode)"
+            );
+            Capable
+        }
+        Err(why) => {
+            tracing::warn!(
+                device = %device,
+                reason = %why,
+                "GPU tonemap route trial FAILED; HDR jobs on this device tonemap on the CPU"
+            );
+            Incapable
+        }
+    };
+    publish_gpu_tonemap_capable(device, verdict);
+    verdict
+}
+
+/// The gauge for one device's verdict: `1` capable, `0` not.
+pub fn publish_gpu_tonemap_capable(device: DeviceId, verdict: crate::device::GpuTonemapCapability) {
+    metrics::gauge!(
+        "pharos_transcode_tonemap_gpu_capable",
+        "device" => device.to_string(),
+    )
+    .set(if verdict.is_capable() { 1.0 } else { 0.0 });
+}
+
+async fn run_gpu_tonemap_trial(device: DeviceId, timeout: Duration) -> Result<(), String> {
+    let Some(dir) = decode_probe_scratch_dir(device) else {
+        return Err("could not create a scratch directory".into());
+    };
+    let result = async {
+        let bin = ffmpeg_bin();
+        let sample = dir.join("hdr10.mkv");
+        let out = dir.join("out.ts");
+        run_ffmpeg_capture(&bin, &hdr10_sample_args(&sample), timeout)
+            .await
+            .map_err(|e| format!("could not build the HDR10 sample: {e}"))?;
+        run_ffmpeg_capture(
+            &bin,
+            &gpu_tonemap_trial_args(device, &sample, &out),
+            timeout,
+        )
+        .await?;
+        match std::fs::metadata(&out) {
+            Ok(m) if m.len() > 0 => Ok(()),
+            _ => Err("ffmpeg exited 0 but wrote no output".into()),
+        }
+    }
+    .await;
+    let _ = std::fs::remove_dir_all(&dir);
+    result
+}
+
+/// ffmpeg argv writing five frames of 10-bit HDR10 (BT.2020, PQ) HEVC, the
+/// smallest input the GPU tonemap route has to handle. The colour tags are set
+/// on the encoder AND in x265's VUI: libplacebo reads them to know it is
+/// looking at PQ.
+pub fn hdr10_sample_args(path: &std::path::Path) -> Vec<String> {
+    [
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-nostdin",
+        "-y",
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc=size=256x144:rate=5:duration=1",
+        "-vf",
+        "format=yuv420p10le",
+        "-c:v",
+        "libx265",
+        "-x265-params",
+        "colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc:log-level=error",
+        "-color_primaries",
+        "bt2020",
+        "-color_trc",
+        "smpte2084",
+        "-colorspace",
+        "bt2020nc",
+        "-frames:v",
+        "5",
+        "-f",
+        "matroska",
+    ]
+    .into_iter()
+    .map(String::from)
+    .chain([path.to_string_lossy().into_owned()])
+    .collect()
+}
+
+/// The GPU route's production argv, aimed at the HDR10 `sample`.
+fn gpu_tonemap_trial_args(
+    device: DeviceId,
+    sample: &std::path::Path,
+    out: &std::path::Path,
+) -> Vec<String> {
+    use crate::options::{Container, SourceVideoKind, StereoOutput, Tonemap, TranscodeOptions};
+    let opts = TranscodeOptions {
+        source_video_codec: Some(crate::options::SourceCodec::Hevc),
+        source_video_kind: SourceVideoKind::default(),
+        source_frame_rate: None,
+        container: Container::Mpegts,
+        video: Some(crate::VideoCodec::H264),
+        audio: None,
+        video_bitrate_bps: Some(1_000_000),
+        audio_bitrate_bps: None,
+        start_position_ticks: 0,
+        duration_ticks: None,
+        audio_source_stream_index: None,
+        burn_subtitle_stream_index: None,
+        burn_intent: false,
+        burn_subtitle_is_text: false,
+        burn_subtitle_ass_path: None,
+        burn_fonts_dir: None,
+        decode_preroll_seconds: None,
+        muxed_audio_source: None,
+        filler: None,
+        video_3d_format: None,
+        stereo_output: StereoOutput::Preserve,
+        tonemap: Tonemap::HdrToSdr,
+    };
+    crate::ffmpeg_transcode_args_pipeline(
+        &sample.to_string_lossy(),
+        &opts,
+        device,
+        &out.to_string_lossy(),
+        crate::DecodeOffload::Allowed,
+        None,
+        crate::VaapiPipeline::GpuTonemap,
+    )
 }
 
 /// A pid-scoped scratch directory for one device's decode probe samples.
@@ -524,10 +695,6 @@ fn rate_probe_args(device: DeviceId, frames: u32) -> Option<Vec<String>> {
     a.push("null".into());
     a.push("-".into());
     Some(a)
-}
-
-async fn wait_status(mut child: tokio::process::Child) -> Option<bool> {
-    child.wait().await.ok().map(|s| s.success())
 }
 
 /// ffmpeg argv for a tiny throwaway encode on `device` (lavfi source →
@@ -838,6 +1005,70 @@ mod tests {
         assert!(
             a.contains("-gpu 3"),
             "rate probe for NVENC index 3 must pin -gpu 3, got: {a}"
+        );
+    }
+
+    /// The trial runs the route's own argv against an HDR10-tagged clip: if
+    /// either drifted, the verdict would describe a route that never runs.
+    #[test]
+    fn the_gpu_tonemap_trial_runs_the_production_argv_on_an_hdr10_clip() {
+        let dev = DeviceId::hw(HwAccel::Vaapi, 1);
+        let trial = gpu_tonemap_trial_args(
+            dev,
+            std::path::Path::new("/s/in.mkv"),
+            std::path::Path::new("/s/out.ts"),
+        )
+        .join(" ");
+        for want in [
+            "-init_hw_device vaapi=va:/dev/dri/renderD129",
+            "-hwaccel vulkan",
+            "-i /s/in.mkv",
+            "libplacebo=",
+            "-c:v h264_vaapi",
+            "/s/out.ts",
+        ] {
+            assert!(trial.contains(want), "{want} missing from {trial}");
+        }
+        let sample = hdr10_sample_args(std::path::Path::new("/s/in.mkv")).join(" ");
+        for want in ["libx265", "yuv420p10le", "smpte2084", "bt2020"] {
+            assert!(sample.contains(want), "{want} missing from {sample}");
+        }
+    }
+
+    /// The gauge is the dashboard's answer to "which devices tonemap on the
+    /// GPU": 1 for a passed trial, 0 for anything else, one series per device.
+    #[test]
+    fn the_gpu_tonemap_gauge_reports_each_devices_verdict() {
+        use crate::device::GpuTonemapCapability::{Capable, Incapable, NotProbed};
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = pharos_test_metrics::snapshotter(&recorder);
+        metrics::with_local_recorder(&recorder, || {
+            publish_gpu_tonemap_capable(DeviceId::hw(HwAccel::Vaapi, 0), Capable);
+            publish_gpu_tonemap_capable(DeviceId::hw(HwAccel::Vaapi, 1), Incapable);
+            publish_gpu_tonemap_capable(DeviceId::hw(HwAccel::Vaapi, 2), NotProbed);
+        });
+        let mut got: Vec<(String, f64)> = snapshotter
+            .snapshot()
+            .into_vec()
+            .iter()
+            .filter(|(k, ..)| k.key().name() == "pharos_transcode_tonemap_gpu_capable")
+            .filter_map(|(k, _, _, v)| match v {
+                DebugValue::Gauge(g) => Some((
+                    k.key().labels().next().unwrap().value().to_string(),
+                    g.into_inner(),
+                )),
+                _ => None,
+            })
+            .collect();
+        got.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            got,
+            [
+                ("Vaapi:0".to_string(), 1.0),
+                ("Vaapi:1".to_string(), 0.0),
+                ("Vaapi:2".to_string(), 0.0)
+            ]
         );
     }
 }
