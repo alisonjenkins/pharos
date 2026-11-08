@@ -8,6 +8,8 @@
 use dioxus::prelude::*;
 
 #[cfg(target_os = "android")]
+mod codecs;
+#[cfg(target_os = "android")]
 mod hole;
 #[cfg(target_os = "android")]
 mod launch;
@@ -34,6 +36,14 @@ fn android_main(app: android_activity::AndroidApp) {
     stdout_to_log();
     if hole::enabled() {
         hole::start(&app);
+    }
+    // Decoder probe: logs the device's decoders and the capabilities they
+    // give, off the UI thread.
+    {
+        let app = app.clone();
+        std::thread::spawn(move || {
+            codecs::probe(&app);
+        });
     }
     blitz_shell::set_android_app(app);
     // Render-scale probe: `setprop debug.pharos.render_scale 0.667` on the TV.
