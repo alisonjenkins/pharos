@@ -69,6 +69,7 @@ use super::together_view::{InviteView, TogetherView, INVITE_LINK_ID};
 use super::track_follow;
 use super::trail;
 use super::turn::{self, EpisodeTurn, EPISODE_TURN_KEY};
+use super::versions;
 use super::views::{
     open_route, reveal_palette_row, Busy, ErrorNote, FlashNote, GroupEndedNote, Hits, HomeView,
     LoadError, LoadFailure, Loading, MarkPlayed, Nav, PaletteView, PlayFailure, PlayFromStart,
@@ -1957,7 +1958,8 @@ fn Screen(route: Route) -> Element {
     match route {
         Route::Home => rsx! { HomeScreen {} },
         Route::Browse(id) => rsx! { BrowseScreen { id } },
-        Route::Title(id) => rsx! { TitleScreen { id } },
+        // Remounted per title so the version pick is read for each one.
+        Route::Title(id) => remount_on(&id.to_string(), rsx! { TitleScreen { id } }),
         Route::Person(id) => rsx! { PersonScreen { id } },
         // The stage beside the screen draws the player (spec 020).
         Route::Watch(_) => rsx! {},
@@ -3325,11 +3327,24 @@ fn SeenTitle(
     detail: Detail,
     on_watch_together: EventHandler<(ItemRef, u64)>,
     tracks: Option<Element>,
+    version: String,
+    on_version: EventHandler<String>,
 ) -> Element {
     let seen = use_group_seen(vec![detail.item.id]);
     let in_group = (use_context::<Together>().view)().active;
     let PlayFromStart(on_play_from_start) = use_context::<PlayFromStart>();
-    rsx! { TitleView { detail, on_watch_together, on_play_from_start, seen, in_group, tracks } }
+    rsx! {
+        TitleView {
+            detail,
+            on_watch_together,
+            on_play_from_start,
+            seen,
+            in_group,
+            tracks,
+            version,
+            on_version,
+        }
+    }
 }
 
 #[component]
@@ -3426,6 +3441,7 @@ fn TitleScreen(id: ItemRef) -> Element {
             }
         });
     };
+    let mut picked = use_signal(|| stored_version(id));
     let state = detail.read();
     let name = state
         .as_ref()
@@ -3446,12 +3462,17 @@ fn TitleScreen(id: ItemRef) -> Element {
                 .map(|(_, result)| result),
             EventHandler::new(move |()| detail.restart()),
             |detail: &Detail| {
+                let version = versions::chosen_version(&detail.versions, picked().as_deref()).to_owned();
                 let tracks = start
                     .read()
                     .as_ref()
                     .copied()
                     .flatten()
                     .filter(|(asked, _)| *asked == id)
+                    // The pickers list the primary's tracks; another
+                    // version's indexes name other streams, so it starts on
+                    // the user's language rules instead.
+                    .filter(|_| version.is_empty())
                     .map(|(_, start)| {
                         // A choice made on another episode of the show
                         // applies here.
@@ -3480,6 +3501,11 @@ fn TitleScreen(id: ItemRef) -> Element {
                         detail: detail.clone(),
                         on_watch_together: on_watch_together.clone(),
                         tracks,
+                        version,
+                        on_version: move |v: String| {
+                            store_setting(&versions::version_key(id), &v);
+                            picked.set(Some(v));
+                        },
                     }
                 }
             },
@@ -3522,6 +3548,14 @@ fn PersonScreen(id: ItemRef) -> Element {
     }
 }
 
+/// The version last picked for `title` on this device, if any.
+fn stored_version(title: ItemRef) -> Option<String> {
+    platform::stored_theme(&versions::version_key(title))
+        .map_err(|e| platform::warn(&format!("pharos: version choice unreadable: {e}")))
+        .ok()
+        .flatten()
+}
+
 /// A negotiated playback, ready for the player.
 struct Playing {
     title: String,
@@ -3538,6 +3572,8 @@ struct Playing {
     /// The API generation `grant` was negotiated on.
     grant_gen: Cell<u32>,
     detail: Detail,
+    /// The version playing, so a renewed grant stays on that file (empty: the primary).
+    version: String,
     /// The tracks the server started this playback on.
     audio: Option<u32>,
     subtitle: Option<u32>,
@@ -3778,12 +3814,29 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
             // A play outside the full view is the stage's (spec 020 FR-010).
             let info = call("watch", play_action(ctx_stage.peek().view));
             let result = async {
-                let detail = api.detail(&info, id).await?;
-                if matches!(detail.item.kind, ItemKind::Episode | ItemKind::Movie) {
+                // The primary first, to learn which versions the title has.
+                let primary = api.detail(&info, id).await?;
+                if matches!(primary.item.kind, ItemKind::Episode | ItemKind::Movie) {
                     platform::turn_open(&id.to_string());
                 } else {
                     platform::turn_cancel(&id.to_string(), "not-video");
                 }
+                let stored = stored_version(id);
+                let version =
+                    versions::chosen_version(&primary.versions, stored.as_deref()).to_owned();
+                if primary.versions.len() > 1 {
+                    platform::info(&format!(
+                        "pharos: version chosen={version:?} stored={stored:?} of {}",
+                        primary.versions.len()
+                    ));
+                }
+                // The chosen file's tracks and fonts are its own, so its detail
+                // is fetched once more; the primary's stands when it plays.
+                let detail = if version.is_empty() {
+                    primary
+                } else {
+                    api.detail_version(&info, id, &version).await?
+                };
                 // Every start of an episode comes through here: from its
                 // title page, the next-episode button, up next and the
                 // episode turn alike.
@@ -3802,12 +3855,12 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
                     )
                 });
                 let caps = negotiation_capabilities(detail.item.kind, auto);
-                let (decision, grant) = api.play(&info, id, "", &caps, asked).await?;
-                Ok::<_, ClientError>((detail, decision, grant, asked))
+                let (decision, grant) = api.play(&info, id, &version, &caps, asked).await?;
+                Ok::<_, ClientError>((detail, version, decision, grant, asked))
             }
             .await;
             Some(
-                settle(ctx.machine, result).and_then(|(detail, decision, grant, asked)| {
+                settle(ctx.machine, result).and_then(|(detail, version, decision, grant, asked)| {
                     let (mse_engine, engine_reason) = mse_engine_choice();
                     let picked = choose_engine(
                         decision.is_hls(),
@@ -3868,6 +3921,7 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
                         grant: RefCell::new(grant),
                         grant_gen: Cell::new(grant_gen),
                         detail,
+                        version,
                         audio: decision.audio,
                         subtitle: decision.subtitle,
                         asked_audio: match asked.audio {
@@ -3973,7 +4027,7 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
                 if *api_gen.peek() != gen {
                     return;
                 }
-                match api.play(&info, id, "", &negotiation_capabilities(kind, *auto_cap.peek()), asked).await {
+                match api.play(&info, id, &p.0.version, &negotiation_capabilities(kind, *auto_cap.peek()), asked).await {
                     Ok((decision, grant)) if *api_gen.peek() == gen => {
                         *p.0.grant.borrow_mut() = grant;
                         // The play session id is a stream credential (B256).
