@@ -7,6 +7,7 @@ use peniko::Color;
 use rustc_hash::FxHashMap;
 use std::future::Future;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use vello_common::{TextureId, paint::ImageId};
 use vello_gpu::{
     ClearSettings, RenderSettings, RenderSize, RenderTargetConfig, Renderer as VelloHybridRenderer,
@@ -32,6 +33,17 @@ fn spawn_init<F: Future<Output = ()> + 'static>(f: F) {
 #[cfg(not(target_arch = "wasm32"))]
 fn spawn_init<F: Future<Output = ()>>(f: F) {
     pollster::block_on(f);
+}
+
+static WAIT_FOR_GPU: AtomicBool = AtomicBool::new(false);
+
+/// Spike switch: `true` restores the upstream wait for each frame's GPU work.
+pub fn set_wait_for_gpu(wait: bool) {
+    WAIT_FOR_GPU.store(wait, Ordering::Relaxed);
+}
+
+fn wait_for_gpu() -> bool {
+    WAIT_FOR_GPU.load(Ordering::Relaxed)
 }
 
 struct ActiveRenderState {
@@ -559,12 +571,17 @@ impl WindowRenderer for VelloHybridWindowRenderer {
         }
         timer.record_time("present");
 
-        render_surface
-            .device()
-            .poll(wgpu::PollType::wait_indefinitely())
-            .unwrap();
+        // A blocking poll here keeps the next frame's CPU work from starting
+        // until this frame's GPU work ends. Surface acquisition already bounds
+        // frames in flight through desired_maximum_frame_latency.
+        let poll_type = if wait_for_gpu() {
+            wgpu::PollType::wait_indefinitely()
+        } else {
+            wgpu::PollType::Poll
+        };
+        render_surface.device().poll(poll_type).unwrap();
 
-        timer.record_time("wait");
+        timer.record_time("poll");
         timer.print_times("vello_hybrid: ");
 
         // Empty the Vello scene (memory optimisation)
