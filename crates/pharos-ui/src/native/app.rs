@@ -62,8 +62,8 @@ use super::together_view::{InviteView, TogetherView, INVITE_LINK_ID};
 use super::track_follow;
 use super::trail;
 use super::views::{
-    open_route, reveal_palette_row, ErrorNote, Hits, HomeView, Loading, MarkPlayed, Nav,
-    PaletteView, PlayFailure, PlayFromStart, PlaybackFailure, SearchBox, Shell, SignInView,
+    open_route, reveal_palette_row, ErrorNote, GroupEndedNote, Hits, HomeView, Loading, MarkPlayed,
+    Nav, PaletteView, PlayFailure, PlayFromStart, PlaybackFailure, SearchBox, Shell, SignInView,
     StatusView, TitleView, PALETTE_INPUT,
 };
 use super::watch_view::{
@@ -1417,12 +1417,14 @@ fn NativeApp(route: Route) -> Element {
         };
         platform::info(&format!("pharos: group rejoin reason=reload group={id}"));
         let session = together.session(&api);
+        let mut error = together.error;
         spawn_forever(async move {
             if let Err(e) = session.join(&id).await {
-                platform::info(&format!(
+                platform::warn(&format!(
                     "pharos: group rejoin failed group={id} error={}",
                     e.0
                 ));
+                error.set(Some(super::group_app::rejoin_failure(&e.0)));
             }
         });
     });
@@ -4972,7 +4974,7 @@ fn Player(
                 }
             }
             if let Some(message) = group.ended.clone() {
-                ErrorNote { message }
+                GroupEndedNote { message }
             }
             if let Some(message) = together.error.read().clone() {
                 ErrorNote { message }

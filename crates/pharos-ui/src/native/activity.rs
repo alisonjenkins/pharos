@@ -47,6 +47,8 @@ pub enum Action {
     PickNotShared {
         kind: TrackKind,
     },
+    /// A command to the group failed or timed out, so the group did not hear it.
+    CommandFailed,
 }
 
 /// An event and who caused it.
@@ -92,6 +94,7 @@ pub fn line(event: &Event) -> String {
         Action::OwnTracks { on: false } => {
             format!("{} is following the group's tracks", subject(who))
         }
+        Action::CommandFailed => "Couldn't reach the group. Try again.".to_owned(),
         Action::PickNotShared { kind } => format!(
             "Couldn't change the group's {}; changed yours",
             match kind {
@@ -164,6 +167,14 @@ mod tests {
 
     fn group(action: Action) -> Event {
         Event { by: None, action }
+    }
+
+    #[test]
+    fn a_command_the_group_missed_reads_as_a_plain_retry_line() {
+        assert_eq!(
+            line(&group(Action::CommandFailed)),
+            "Couldn't reach the group. Try again."
+        );
     }
 
     #[test]

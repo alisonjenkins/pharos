@@ -315,6 +315,14 @@ pub fn ErrorNote(message: String) -> Element {
     rsx! { p { class: "pharos-error", role: "alert", "{message}" } }
 }
 
+/// The group ended: news, not an error, and the film plays on.
+#[component]
+pub fn GroupEndedNote(message: String) -> Element {
+    rsx! {
+        p { class: "pharos-status-note", role: "status", "{message}. You can keep watching." }
+    }
+}
+
 /// Why a video is not playing: the plain-language headline the viewer reads
 /// and the raw reason kept for the details line (B806).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1344,6 +1352,20 @@ mod tests {
             "{html}"
         );
         assert!(html.contains(r#"role="alert""#), "{html}");
+    }
+
+    #[test]
+    fn a_group_that_ended_is_a_status_not_an_alert() {
+        let html = render(|| rsx! { GroupEndedNote { message: "This group has ended" } });
+        assert!(html.contains(r#"role="status""#), "{html}");
+        assert!(
+            !html.contains("pharos-error") && !html.contains("alert"),
+            "{html}"
+        );
+        assert!(
+            html.contains("This group has ended. You can keep watching."),
+            "{html}"
+        );
     }
 
     #[test]
