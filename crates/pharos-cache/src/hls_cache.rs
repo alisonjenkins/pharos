@@ -28,9 +28,10 @@
 //!   tmp file on failure.
 
 use dashmap::DashMap;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 use tokio::sync::Mutex;
 use tracing::Instrument;
 
@@ -933,6 +934,25 @@ pub struct AudioDropReport {
     /// listed, each with its error. Anything here may still be served.
     pub failed: Vec<String>,
 }
+
+/// What [`HlsSegmentCache::enforce_cap`] did.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct CapReport {
+    pub scanned_bytes: u64,
+    pub evicted_bytes: u64,
+    pub evicted_files: u64,
+    pub evicted_sessions: u64,
+    pub remaining_bytes: u64,
+}
+
+/// How recently a cached file must have been written for the janitor to
+/// leave it alone: an encode in flight is still writing it.
+const JANITOR_GRACE: Duration = Duration::from_secs(15 * 60);
+
+/// How long a `.running*` marker keeps its audio session from the janitor.
+/// A pod that dies mid-encode leaves its marker behind, and a marker that
+/// protected forever would pin that session on disk for good.
+const RUNNING_MARKER_MAX_AGE: Duration = Duration::from_secs(6 * 60 * 60);
 
 /// Suffix of the provenance sidecar. Named once: the eviction walk, the
 /// quarantine and the sidecar writer all have to agree, and three string
@@ -5166,6 +5186,320 @@ impl HlsSegmentCache {
             // being enforced here.
             let _ = tokio::fs::remove_file(provenance_sidecar_path(&path)).await;
         }
+    }
+
+    /// Enforce `max_bytes` across the on-disk generation tree (`self.root`).
+    ///
+    /// The in-memory LRU (`CacheState.entries`, `record`, `maybe_evict`) starts
+    /// empty at every boot and never tracks `_contaudio/` or `_audiohls/`
+    /// sessions at all. Recounting `self.root` periodically evicts pre-restart
+    /// segments, orphan provenance sidecars, and finished audio sessions
+    /// oldest-first until disk usage is back under `max_bytes`:
+    /// - `max_bytes == 0` disables the cap and returns [`CapReport::default`].
+    /// - Dot-prefixed entries (`.quarantine`, `.running*` markers) are skipped.
+    /// - Each immediate subdirectory of `_contaudio` and `_audiohls` is one
+    ///   eviction unit sized by all files inside it and aged by its newest
+    ///   file mtime; sessions containing a `.running*` marker or modified
+    ///   within [`JANITOR_GRACE`] are never evicted.
+    /// - Every other regular file older than [`JANITOR_GRACE`] is its own unit;
+    ///   evicting a segment removes and counts its provenance sidecar, and a
+    ///   sidecar is only evicted on its own once its segment is already gone.
+    /// - Evicted segments are dropped from the in-memory LRU and now-empty
+    ///   media-id directories are removed.
+    pub async fn enforce_cap(&self) -> CapReport {
+        self.enforce_cap_at(SystemTime::now(), JANITOR_GRACE).await
+    }
+
+    async fn enforce_cap_at(&self, now: SystemTime, grace: Duration) -> CapReport {
+        if self.max_bytes == 0 {
+            return CapReport::default();
+        }
+        struct ScannedFile {
+            path: PathBuf,
+            size: u64,
+            mtime: SystemTime,
+        }
+        enum EvictUnit {
+            File {
+                path: PathBuf,
+                size: u64,
+                sidecar: Option<(PathBuf, u64)>,
+                mtime: SystemTime,
+            },
+            Session {
+                path: PathBuf,
+                size: u64,
+                mtime: SystemTime,
+            },
+        }
+        impl EvictUnit {
+            fn mtime(&self) -> SystemTime {
+                match self {
+                    Self::File { mtime, .. } | Self::Session { mtime, .. } => *mtime,
+                }
+            }
+            fn path(&self) -> &Path {
+                match self {
+                    Self::File { path, .. } | Self::Session { path, .. } => path,
+                }
+            }
+        }
+
+        let contaudio = self.root.join("_contaudio");
+        let audiohls = self.root.join("_audiohls");
+        let mut regular_files: Vec<ScannedFile> = Vec::new();
+        let mut sidecars: HashMap<PathBuf, (u64, SystemTime)> = HashMap::new();
+        let mut units: Vec<EvictUnit> = Vec::new();
+        let mut total: u64 = 0;
+
+        let mut stack = vec![self.root.clone()];
+        while let Some(dir) = stack.pop() {
+            let is_audio_parent = dir == contaudio || dir == audiohls;
+            let Ok(mut rd) = tokio::fs::read_dir(&dir).await else {
+                continue;
+            };
+            while let Ok(Some(entry)) = rd.next_entry().await {
+                let name = entry.file_name();
+                let name_str = name.to_string_lossy();
+                if name_str.starts_with('.') {
+                    continue;
+                }
+                let Ok(meta) = entry.metadata().await else {
+                    continue;
+                };
+                let path = entry.path();
+                if meta.is_dir() {
+                    if is_audio_parent {
+                        let (size, newest_mtime, has_running) =
+                            Self::scan_audio_session(&path, &meta, now).await;
+                        total = total.saturating_add(size);
+                        if !has_running
+                            && now.duration_since(newest_mtime).unwrap_or(Duration::ZERO) >= grace
+                        {
+                            units.push(EvictUnit::Session {
+                                path,
+                                size,
+                                mtime: newest_mtime,
+                            });
+                        }
+                    } else {
+                        stack.push(path);
+                    }
+                } else if meta.is_file() {
+                    let size = meta.len();
+                    let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+                    total = total.saturating_add(size);
+                    if name_str.ends_with(PROVENANCE_SUFFIX) {
+                        sidecars.insert(path, (size, mtime));
+                    } else {
+                        regular_files.push(ScannedFile { path, size, mtime });
+                    }
+                }
+            }
+        }
+
+        let mut report = CapReport {
+            scanned_bytes: total,
+            remaining_bytes: total,
+            ..Default::default()
+        };
+        if total <= self.max_bytes {
+            return report;
+        }
+
+        for f in regular_files {
+            let sidecar_path = provenance_sidecar_path(&f.path);
+            let sidecar = sidecars
+                .remove(&sidecar_path)
+                .map(|(sz, _)| (sidecar_path, sz));
+            if now.duration_since(f.mtime).unwrap_or(Duration::ZERO) >= grace {
+                units.push(EvictUnit::File {
+                    path: f.path,
+                    size: f.size,
+                    sidecar,
+                    mtime: f.mtime,
+                });
+            }
+        }
+        for (sidecar_path, (size, mtime)) in sidecars {
+            if now.duration_since(mtime).unwrap_or(Duration::ZERO) >= grace {
+                units.push(EvictUnit::File {
+                    path: sidecar_path,
+                    size,
+                    sidecar: None,
+                    mtime,
+                });
+            }
+        }
+
+        units.sort_by(|a, b| {
+            a.mtime()
+                .cmp(&b.mtime())
+                .then_with(|| a.path().cmp(b.path()))
+        });
+
+        let mut evicted_paths: HashSet<PathBuf> = HashSet::new();
+        let mut evicted_session_dirs: Vec<PathBuf> = Vec::new();
+        for unit in units {
+            if total <= self.max_bytes {
+                break;
+            }
+            match unit {
+                EvictUnit::File {
+                    path,
+                    size,
+                    sidecar,
+                    ..
+                } => match tokio::fs::remove_file(&path).await {
+                    Ok(()) => {
+                        total = total.saturating_sub(size);
+                        report.evicted_bytes = report.evicted_bytes.saturating_add(size);
+                        report.evicted_files = report.evicted_files.saturating_add(1);
+                        if let Some((sidecar_path, sidecar_size)) = sidecar {
+                            match tokio::fs::remove_file(&sidecar_path).await {
+                                Ok(()) => {
+                                    total = total.saturating_sub(sidecar_size);
+                                    report.evicted_bytes =
+                                        report.evicted_bytes.saturating_add(sidecar_size);
+                                }
+                                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                                Err(e) => {
+                                    tracing::warn!(
+                                        path = %sidecar_path.display(),
+                                        error = %e,
+                                        "could not evict segment provenance sidecar"
+                                    );
+                                }
+                            }
+                        }
+                        evicted_paths.insert(path);
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            path = %path.display(),
+                            error = %e,
+                            "could not evict cached segment file"
+                        );
+                    }
+                },
+                EvictUnit::Session { path, size, .. } => {
+                    match tokio::fs::remove_dir_all(&path).await {
+                        Ok(()) => {
+                            total = total.saturating_sub(size);
+                            report.evicted_bytes = report.evicted_bytes.saturating_add(size);
+                            report.evicted_sessions = report.evicted_sessions.saturating_add(1);
+                            evicted_session_dirs.push(path);
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                path = %path.display(),
+                                error = %e,
+                                "could not evict cached audio session"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        report.remaining_bytes = total;
+
+        if !evicted_paths.is_empty() || !evicted_session_dirs.is_empty() {
+            let mut state = self.state.lock().await;
+            if !evicted_paths.is_empty() {
+                let doomed: Vec<SegmentIdentity> = state
+                    .entries
+                    .keys()
+                    .filter(|k| evicted_paths.contains(&self.segment_path_keyed(**k)))
+                    .copied()
+                    .collect();
+                for key in doomed {
+                    if let Some(meta) = state.entries.remove(&key) {
+                        state.total_bytes = state.total_bytes.saturating_sub(meta.bytes);
+                    }
+                }
+            }
+            if !evicted_session_dirs.is_empty() {
+                let gone = |p: &PathBuf| evicted_session_dirs.iter().any(|d| p.starts_with(d));
+                state.audio_session_starts.retain(|p, _| !gone(p));
+                state.audio_session_failures.retain(|p, _| !gone(p));
+            }
+        }
+
+        // Only directories this sweep emptied: pruning any empty one could
+        // race a writer that has created its media-id directory but not yet
+        // its first segment.
+        let emptied: HashSet<&Path> = evicted_paths
+            .iter()
+            .filter_map(|p| p.parent())
+            .filter(|d| *d != self.root && *d != contaudio && *d != audiohls)
+            .collect();
+        for dir in emptied {
+            // Fails, as intended, while the directory still holds files.
+            let _ = tokio::fs::remove_dir(dir).await;
+        }
+
+        if report.evicted_files > 0 || report.evicted_sessions > 0 || report.evicted_bytes > 0 {
+            tracing::info!(
+                scanned_bytes = report.scanned_bytes,
+                evicted_bytes = report.evicted_bytes,
+                evicted_files = report.evicted_files,
+                evicted_sessions = report.evicted_sessions,
+                remaining_bytes = report.remaining_bytes,
+                cap_bytes = self.max_bytes,
+                "hls cache: cap enforced"
+            );
+        }
+
+        report
+    }
+
+    async fn scan_audio_session(
+        session_dir: &Path,
+        dir_meta: &std::fs::Metadata,
+        now: SystemTime,
+    ) -> (u64, SystemTime, bool) {
+        let mut size: u64 = 0;
+        let mut newest_mtime: Option<SystemTime> = None;
+        let mut has_running = false;
+        let mut stack = vec![session_dir.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            let Ok(mut rd) = tokio::fs::read_dir(&dir).await else {
+                continue;
+            };
+            while let Ok(Some(entry)) = rd.next_entry().await {
+                let name = entry.file_name();
+                let name_str = name.to_string_lossy();
+                if name_str.starts_with(".running") {
+                    let fresh = entry
+                        .metadata()
+                        .await
+                        .ok()
+                        .and_then(|m| m.modified().ok())
+                        .is_some_and(|at| {
+                            now.duration_since(at).unwrap_or(Duration::ZERO)
+                                < RUNNING_MARKER_MAX_AGE
+                        });
+                    has_running |= fresh;
+                    continue;
+                }
+                if name_str.starts_with('.') {
+                    continue;
+                }
+                let Ok(meta) = entry.metadata().await else {
+                    continue;
+                };
+                if meta.is_dir() {
+                    stack.push(entry.path());
+                } else if meta.is_file() {
+                    size = size.saturating_add(meta.len());
+                    let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+                    newest_mtime = Some(newest_mtime.map_or(mtime, |prev| prev.max(mtime)));
+                }
+            }
+        }
+        let mtime =
+            newest_mtime.unwrap_or_else(|| dir_meta.modified().unwrap_or(SystemTime::UNIX_EPOCH));
+        (size, mtime, has_running)
     }
 
     #[cfg(test)]
@@ -11053,6 +11387,230 @@ mod tests {
         assert!(msg.contains("stopped advancing"), "{msg}");
         assert!(msg.contains("3000ms"), "{msg}");
         assert!(msg.contains("a41.m4s"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn enforce_cap_under_cap_deletes_nothing() {
+        let td = TempDir::new().unwrap();
+        let cache = HlsSegmentCache::new(td.path(), 1000);
+        let dir = cache.root().join("42");
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let seg = dir.join("0.ts");
+        tokio::fs::write(&seg, vec![0u8; 400]).await.unwrap();
+
+        let future = SystemTime::now() + Duration::from_secs(3600);
+        let report = cache.enforce_cap_at(future, JANITOR_GRACE).await;
+        assert_eq!(
+            report,
+            CapReport {
+                scanned_bytes: 400,
+                evicted_bytes: 0,
+                evicted_files: 0,
+                evicted_sessions: 0,
+                remaining_bytes: 400,
+            }
+        );
+        assert!(seg.exists());
+    }
+
+    #[tokio::test]
+    async fn enforce_cap_evicts_oldest_files_with_sidecars_and_updates_lru() {
+        let td = TempDir::new().unwrap();
+        let cache = HlsSegmentCache::new(td.path(), 600);
+        let opts = segment_opts();
+        let key_old = SegmentIdentity::new(1, 0, None, None, &opts, SourceGen::LOCAL);
+        let key_new = SegmentIdentity::new(2, 0, None, None, &opts, SourceGen::LOCAL);
+        let seg_old = cache.segment_path_keyed(key_old);
+        let seg_new = cache.segment_path_keyed(key_new);
+        let sidecar_old = provenance_sidecar_path(&seg_old);
+        let sidecar_new = provenance_sidecar_path(&seg_new);
+
+        tokio::fs::create_dir_all(seg_old.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(seg_new.parent().unwrap())
+            .await
+            .unwrap();
+
+        tokio::fs::write(&seg_old, vec![0u8; 400]).await.unwrap();
+        tokio::fs::write(&sidecar_old, vec![0u8; 100])
+            .await
+            .unwrap();
+        cache.record(key_old, 400).await;
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        tokio::fs::write(&seg_new, vec![0u8; 400]).await.unwrap();
+        tokio::fs::write(&sidecar_new, vec![0u8; 100])
+            .await
+            .unwrap();
+        cache.record(key_new, 400).await;
+
+        let future = SystemTime::now() + Duration::from_secs(3600);
+        let report = cache.enforce_cap_at(future, JANITOR_GRACE).await;
+        assert_eq!(
+            report,
+            CapReport {
+                scanned_bytes: 1000,
+                evicted_bytes: 500,
+                evicted_files: 1,
+                evicted_sessions: 0,
+                remaining_bytes: 500,
+            }
+        );
+        assert!(!seg_old.exists(), "oldest segment must be evicted");
+        assert!(
+            !sidecar_old.exists(),
+            "provenance sidecar must be evicted with its segment"
+        );
+        assert!(
+            !cache.root().join("1").exists(),
+            "now-empty media directory must be pruned"
+        );
+        assert!(seg_new.exists(), "newer segment under cap must stay");
+        assert!(sidecar_new.exists(), "newer segment's sidecar must stay");
+        assert_eq!(cache.entry_count().await, 1);
+        assert_eq!(cache.total_bytes().await, 400);
+    }
+
+    #[tokio::test]
+    async fn enforce_cap_evicts_audio_sessions_as_a_unit_and_spares_running_ones() {
+        let td = TempDir::new().unwrap();
+        let cache = HlsSegmentCache::new(td.path(), 900);
+
+        let running_session = cache.root().join("_contaudio").join("1-a0-b128");
+        tokio::fs::create_dir_all(&running_session).await.unwrap();
+        tokio::fs::write(running_session.join("audio.ts"), vec![0u8; 500])
+            .await
+            .unwrap();
+        tokio::fs::write(running_session.join(".running-cont-0"), b"")
+            .await
+            .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let finished_session = cache.root().join("_audiohls").join("2-a0-b128");
+        tokio::fs::create_dir_all(finished_session.join("s40"))
+            .await
+            .unwrap();
+        tokio::fs::write(finished_session.join("init.mp4"), vec![0u8; 200])
+            .await
+            .unwrap();
+        tokio::fs::write(finished_session.join("s40").join("a40.m4s"), vec![0u8; 300])
+            .await
+            .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let seg_dir = cache.root().join("3");
+        tokio::fs::create_dir_all(&seg_dir).await.unwrap();
+        let seg = seg_dir.join("0.ts");
+        tokio::fs::write(&seg, vec![0u8; 300]).await.unwrap();
+
+        let future = SystemTime::now() + Duration::from_secs(3600);
+        let report = cache.enforce_cap_at(future, JANITOR_GRACE).await;
+        assert_eq!(
+            report,
+            CapReport {
+                scanned_bytes: 1300,
+                evicted_bytes: 500,
+                evicted_files: 0,
+                evicted_sessions: 1,
+                remaining_bytes: 800,
+            }
+        );
+        assert!(
+            running_session.exists(),
+            "session with a .running marker must be kept even when oldest"
+        );
+        assert!(
+            !finished_session.exists(),
+            "finished audio session must be evicted as a whole directory"
+        );
+        assert!(
+            cache.root().join("_audiohls").exists(),
+            "_audiohls root must never be deleted"
+        );
+        assert!(
+            cache.root().join("_contaudio").exists(),
+            "_contaudio root must never be deleted"
+        );
+        assert!(seg.exists());
+    }
+
+    #[tokio::test]
+    async fn enforce_cap_evicts_a_session_whose_running_marker_is_stale() {
+        let td = TempDir::new().unwrap();
+        let cache = HlsSegmentCache::new(td.path(), 100);
+        let abandoned = cache.root().join("_contaudio").join("1-a0-b128");
+        tokio::fs::create_dir_all(&abandoned).await.unwrap();
+        tokio::fs::write(abandoned.join("audio.ts"), vec![0u8; 500])
+            .await
+            .unwrap();
+        tokio::fs::write(abandoned.join(".running-cont-0"), b"")
+            .await
+            .unwrap();
+
+        // A pod that died mid-encode left its marker seven hours ago.
+        let later = SystemTime::now() + Duration::from_secs(7 * 60 * 60);
+        let report = cache.enforce_cap_at(later, JANITOR_GRACE).await;
+        assert_eq!(report.evicted_sessions, 1, "{report:?}");
+        assert!(!abandoned.exists());
+    }
+
+    #[tokio::test]
+    async fn enforce_cap_keeps_files_younger_than_grace() {
+        let td = TempDir::new().unwrap();
+        let cache = HlsSegmentCache::new(td.path(), 200);
+        let dir = cache.root().join("7");
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let seg = dir.join("0.ts");
+        tokio::fs::write(&seg, vec![0u8; 600]).await.unwrap();
+
+        let report = cache.enforce_cap_at(SystemTime::now(), JANITOR_GRACE).await;
+        assert_eq!(
+            report,
+            CapReport {
+                scanned_bytes: 600,
+                evicted_bytes: 0,
+                evicted_files: 0,
+                evicted_sessions: 0,
+                remaining_bytes: 600,
+            }
+        );
+        assert!(seg.exists());
+    }
+
+    #[tokio::test]
+    async fn enforce_cap_never_touches_quarantine() {
+        let td = TempDir::new().unwrap();
+        let cache = HlsSegmentCache::new(td.path(), 100);
+        let pen = cache.root().join(QUARANTINE_DIR);
+        tokio::fs::create_dir_all(&pen).await.unwrap();
+        let quarantined = pen.join("7-0-a0-s-1-vauto-bauto-c28.ts");
+        tokio::fs::write(&quarantined, vec![0u8; 800])
+            .await
+            .unwrap();
+
+        let future = SystemTime::now() + Duration::from_secs(3600);
+        let report = cache.enforce_cap_at(future, JANITOR_GRACE).await;
+        assert_eq!(report, CapReport::default());
+        assert!(quarantined.exists());
+    }
+
+    #[tokio::test]
+    async fn enforce_cap_zero_cap_does_nothing() {
+        let td = TempDir::new().unwrap();
+        let cache = HlsSegmentCache::new(td.path(), 0);
+        let dir = cache.root().join("9");
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let seg = dir.join("0.ts");
+        tokio::fs::write(&seg, vec![0u8; 500]).await.unwrap();
+
+        let future = SystemTime::now() + Duration::from_secs(3600);
+        let report = cache.enforce_cap_at(future, JANITOR_GRACE).await;
+        assert_eq!(report, CapReport::default());
+        assert!(seg.exists());
     }
 }
 
