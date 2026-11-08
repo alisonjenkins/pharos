@@ -234,6 +234,9 @@ pub fn SignInView(
     error: Option<String>,
     busy: bool,
     on_submit: EventHandler<(String, String)>,
+    /// Another way in, under the form (the TV's Quick Connect code).
+    #[props(default)]
+    after: Option<Element>,
 ) -> Element {
     let mut name = use_signal(String::new);
     let mut password = use_signal(String::new);
@@ -279,6 +282,7 @@ pub fn SignInView(
                     if busy { "Signing in…" } else { "Sign in" }
                 }
             }
+            {after}
         }
     }
 }

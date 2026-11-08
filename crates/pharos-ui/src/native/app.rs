@@ -26,7 +26,7 @@ use super::find::{self, Find, DEBOUNCE_MS, RESULT_LIMIT};
 use super::group_app::{Together, VideoPlayer};
 use super::group_session::{GroupPlayer, GroupView, Ui};
 use super::listen::ListenView;
-use super::machine::{Event, Machine, Phase};
+use super::machine::{Event, Machine, Phase, SignInReply};
 use super::mixes::{self, ActiveMix, MixCtx};
 use super::palette::{self, Row};
 use super::platform::{self, OpenError};
@@ -1707,8 +1707,40 @@ fn NativeApp(route: Route) -> Element {
                         machine.write().apply(Event::SignInAnswered(reply));
                     });
                 },
+                after: platform::offers_quick_connect().then(|| rsx! {
+                    QuickConnectSignIn {
+                        on_signed_in: move |reply| machine.write().apply(Event::SignInAnswered(reply)),
+                    }
+                }),
             }
         },
+    }
+}
+
+/// A Quick Connect code to approve from a signed-in device (Settings,
+/// Approve a device), for a remote that makes typing a password slow. It
+/// mints a code on mounting, replaces one that expires, and signs in once
+/// the code is approved; leaving the page stops it.
+#[component]
+fn QuickConnectSignIn(on_signed_in: EventHandler<SignInReply>) -> Element {
+    let mut code = use_signal(|| None::<String>);
+    let _sign_in = use_future(move || async move {
+        let reply = platform::quick_connect(move |minted| code.set(Some(minted))).await;
+        on_signed_in.call(reply);
+    });
+    rsx! {
+        section { class: "pharos-login pharos-quick-connect", aria_label: "Quick Connect",
+            h2 { "Or use Quick Connect" }
+            match code() {
+                Some(code) => rsx! {
+                    p { class: "pharos-quick-connect-code", aria_live: "polite", "{code}" }
+                    p { class: "pharos-muted",
+                        "On a signed-in device, open Settings, then Approve a device, and enter this code."
+                    }
+                },
+                None => rsx! { p { class: "pharos-muted", "Getting a code…" } },
+            }
+        }
     }
 }
 
