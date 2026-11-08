@@ -1652,6 +1652,20 @@ mod tests {
         );
     }
 
+    /// B838: on a phone the wrapped control row would sit under a button
+    /// held at a fixed `bottom`, so the narrow layout moves it to the top.
+    #[test]
+    fn on_a_phone_the_skip_button_clears_the_wrapped_controls() {
+        let sheet = include_str!("../../assets/pharos.css");
+        let phone = sheet
+            .split("@media (max-width: 40rem) {\n  .pharos-skip {")
+            .nth(1)
+            .and_then(|r| r.split('}').next())
+            .unwrap_or_default();
+        assert!(phone.contains("bottom: auto;"), "{phone}");
+        assert!(phone.contains("top: calc("), "{phone}");
+    }
+
     /// B805: the idle fade hides the top strip and the control bar but not
     /// the skip button, in the plain rule and in every `data-overlay-fx`
     /// variant, or a viewer who is just watching never sees it.
