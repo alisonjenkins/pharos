@@ -379,6 +379,115 @@ mod tests {
         assert_eq!(errors, Some(1), "the probe finds no slot");
     }
 
+    /// Run one probe against the pool `make_pool` builds, on a fresh runtime,
+    /// with an exclusive transaction held on `lock` if given, and return how
+    /// many timeouts it counted under each verdict label.
+    fn probe_verdicts(
+        make_pool: impl FnOnce() -> sqlx::SqlitePool,
+        probe_timeout: Duration,
+        lock: Option<&std::path::Path>,
+    ) -> Vec<(String, u64)> {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = pharos_test_metrics::snapshotter(&recorder);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        metrics::with_local_recorder(&recorder, || {
+            rt.block_on(async {
+                // Held across the probe: an exclusive transaction on `lock`.
+                let mut _locker = None;
+                if let Some(path) = lock {
+                    let mut c = sqlx::sqlite::SqliteConnectOptions::new()
+                        .filename(path)
+                        .create_if_missing(true)
+                        .connect()
+                        .await
+                        .unwrap();
+                    sqlx::query("BEGIN EXCLUSIVE")
+                        .execute(&mut c)
+                        .await
+                        .unwrap();
+                    _locker = Some(c);
+                }
+                let pool = make_pool();
+                sample_pool("sqlite", &pool, probe_timeout).await;
+            });
+        });
+        snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter_map(|(ck, _, _, v)| match v {
+                DebugValue::Counter(n)
+                    if ck.key().name() == "pharos_db_pool_probe_timeouts_total" =>
+                {
+                    let verdict = ck
+                        .key()
+                        .labels()
+                        .find(|l| l.key() == "verdict")
+                        .map(|l| l.value().to_owned())?;
+                    Some((verdict, n))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// B731: room in the pool and no connection comes, and a direct connect
+    /// does not answer either. The database is unreachable, not the pool
+    /// busy. Every connect here blocks on a write lock another connection
+    /// holds, the shape of a database that accepts and never answers.
+    #[test]
+    fn a_connect_that_never_answers_with_room_in_the_pool_is_database_unreachable() {
+        let dir = std::env::temp_dir().join(format!(
+            "pharos-probe-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("db.sqlite");
+        let verdicts = probe_verdicts(
+            || {
+                let blocked = sqlx::sqlite::SqliteConnectOptions::new()
+                    .filename(&path)
+                    .create_if_missing(true)
+                    .busy_timeout(Duration::from_secs(30))
+                    .pragma("user_version", "1");
+                SqlitePoolOptions::new()
+                    .max_connections(2)
+                    .connect_lazy_with(blocked)
+            },
+            Duration::from_millis(200),
+            Some(&path),
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(verdicts, vec![("database_unreachable".to_owned(), 1)]);
+    }
+
+    /// Room in the pool and the pool's connect is slow, but a direct connect
+    /// answers: the database is up, so the probe does not blame it.
+    #[test]
+    fn a_direct_connect_that_answers_overrules_database_unreachable() {
+        let verdicts = probe_verdicts(
+            || {
+                SqlitePoolOptions::new()
+                    .max_connections(2)
+                    .after_connect(|_, _| {
+                        Box::pin(async {
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                            Ok(())
+                        })
+                    })
+                    .connect_lazy("sqlite::memory:")
+                    .unwrap()
+            },
+            Duration::from_millis(100),
+            None,
+        );
+        assert_eq!(verdicts, vec![("saturated".to_owned(), 1)]);
+    }
+
     #[test]
     fn a_probe_timeout_is_classified_by_the_pool_at_the_timeout() {
         assert_eq!(ProbeTimeout::at(0, 8, 8), ProbeTimeout::Saturated);
