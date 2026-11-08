@@ -463,6 +463,35 @@ pub fn register_static_series() {
     }
 }
 
+/// jemalloc's own view of the heap, so RSS can be split into live data
+/// (`allocated`), pages it holds for reuse (`active` minus `allocated`, and
+/// `resident` minus `active`) and address space it keeps unmapped
+/// (`retained`). A rise in `allocated` is a leak; a gap that grows between it
+/// and `resident` is the allocator.
+#[cfg(target_os = "linux")]
+fn collect_allocator_stats() {
+    use tikv_jemalloc_ctl::{epoch, stats};
+    if let Err(e) = epoch::advance() {
+        tracing::debug!(error = %e, "jemalloc epoch advance failed; allocator stats skipped");
+        return;
+    }
+    let reads: [(&'static str, tikv_jemalloc_ctl::Result<usize>); 5] = [
+        ("allocated", stats::allocated::read()),
+        ("active", stats::active::read()),
+        ("resident", stats::resident::read()),
+        ("mapped", stats::mapped::read()),
+        ("retained", stats::retained::read()),
+    ];
+    for (kind, value) in reads {
+        match value {
+            Ok(bytes) => {
+                metrics::gauge!("pharos_allocator_bytes", "kind" => kind).set(bytes as f64)
+            }
+            Err(e) => tracing::debug!(kind, error = %e, "jemalloc stat read failed"),
+        }
+    }
+}
+
 /// Render Prometheus exposition text for `/metrics`. Lock-free.
 pub fn render() -> String {
     match RESULT.get() {
@@ -470,6 +499,8 @@ pub fn render() -> String {
             if let Some(process) = PROCESS.get() {
                 process.collect();
             }
+            #[cfg(target_os = "linux")]
+            collect_allocator_stats();
             h.render()
         }
         _ => String::new(),
@@ -584,6 +615,22 @@ mod tests {
             "process_threads",
         ] {
             assert!(body.contains(name), "missing {name}; rendered:\n{body}");
+        }
+    }
+
+    /// The heap/allocator split must reach /metrics, or a rise in RSS cannot
+    /// be told apart as live data or allocator-held pages.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn allocator_stats_are_rendered_on_every_scrape() {
+        init("info", None).unwrap();
+        let body = render();
+        for kind in ["allocated", "active", "resident", "mapped", "retained"] {
+            assert!(
+                body.lines()
+                    .any(|l| l.starts_with(&format!("pharos_allocator_bytes{{kind=\"{kind}\"}}"))),
+                "missing pharos_allocator_bytes{{kind={kind}}}; rendered:\n{body}"
+            );
         }
     }
 
