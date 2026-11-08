@@ -61,6 +61,10 @@ enum Kind { movie @0; episode @1; audio @2; book @3; series @4; season @5; album
 # What a `library` item holds; mirrors pharos_core::LibraryKind.
 enum LibraryKind { mixed @0; movies @1; tvShows @2; music @3; books @4; }
 
+# How a video packs two eyes into one frame; mirrors pharos_core::Video3DFormat.
+# `none` is ordinary 2D video, and what an older server's zero reads as.
+enum Stereo3d { none @0; halfSideBySide @1; fullSideBySide @2; halfTopAndBottom @3; fullTopAndBottom @4; mvc @5; }
+
 struct ImageRef { kind @0 :Text; tag @1 :Text; url @2 :Text; blurhash @3 :Text; }
 
 struct UserState { played @0 :Bool; favorite @1 :Bool; positionMs @2 :UInt64; playCount @3 :UInt32; }
@@ -74,6 +78,7 @@ struct ItemSummary {
   imdbRating @12 :OptU16;      # IMDb score in tenths: 78 is 7.8
   criticRating @13 :OptU16;    # Rotten Tomatoes Tomatometer, a percentage
   artist @14 :Text;            # a song's artists for its card, joined; empty for anything else. Since schemaVersion 25.
+  stereo @15 :Stereo3d;        # the primary's packing, else the first 3D version's. Since schemaVersion 28.
 }
 
 struct ItemPage { items @0 :List(ItemSummary); total @1 :UInt32; start @2 :UInt32; }
@@ -168,7 +173,9 @@ struct ItemQuery {
   kinds @1 :List(Kind); sortBy @2 :Text; descending @3 :Bool;
   nameStartsWith @4 :Text; filters @5 :List(Text); start @6 :UInt32; limit @7 :UInt32;
   genre @8 :Text;              # one genre's name; empty means every genre
+  stereo @9 :StereoFilter;     # 3D titles only, 2D only, or both. Since schemaVersion 28.
 }
+enum StereoFilter { any @0; only3d @1; only2d @2; }
 
 # Where each section starts in a listing, in the listing's own order: a
 # section's `start` is the offset of its first item, so a client can page
@@ -194,7 +201,8 @@ interface Library {
   resume @2 (ctx :CallContext, kinds :List(Kind), limit :UInt32) -> (result :ItemsResult);
   nextUp @3 (ctx :CallContext, limit :UInt32) -> (result :ItemsResult);
   query @4 (ctx :CallContext, q :ItemQuery) -> (result :ItemsResult);
-  detail @5 (ctx :CallContext, id :ItemId) -> (result :DetailResult);
+  detail @5 (ctx :CallContext, id :ItemId, version :Text) -> (result :DetailResult);
+  # `version`: a Version.id; its tracks, fonts and subtitle URLs are that file's. Empty is the primary.
   search @6 (ctx :CallContext, text :Text, limit :UInt32) -> (result :ItemsResult);
   home @7 (ctx :CallContext, latestPerView :UInt32, resumeLimit :UInt32, nextUpLimit :UInt32) -> (result :HomeResult);
   index @8 (ctx :CallContext, q :ItemQuery) -> (result :IndexResult);   # `q.start` and `q.limit` are ignored
@@ -214,6 +222,7 @@ struct ItemDetail {
   artists @9 :List(Text);           # a song's track artists, in display order; empty for anything else
   album @10 :Text;                  # a song's album name; empty when it has none
   cast @11 :List(Credit);           # billed order; a series or season ranks its regulars across episodes
+  versions @12 :List(Version);      # a film or episode's files, the primary first; empty for anything else. Since schemaVersion 28.
 }
 # Someone who appears in the item. `imageUrl` is the person's photo on this
 # server, empty when there is none.
@@ -246,6 +255,22 @@ struct PersonShow {
   episodes @2 :List(PersonCredit);
 }
 struct PersonResult { union { person @0 :Person; error @1 :Error; } }
+# One playable file of an item: its primary, a grouped edition (a cut, a 3D
+# rip) or another copy of the same episode. `id` is what Library.detail and
+# Playback.negotiate take as `version`; the primary's is empty. Probe facts
+# are 0 or empty when unknown. `path` is the file on the server's disk, sent
+# to admins only (else empty).
+struct Version {
+  id @0 :Text; name @1 :Text; stereo @2 :Stereo3d; primary @3 :Bool;
+  width @4 :UInt32; height @5 :UInt32;
+  videoCodec @6 :Text;
+  hdr @7 :Text;                     # HDR10 or HLG; empty is SDR
+  audio @8 :List(VersionAudio);
+  sizeBytes @9 :UInt64;
+  container @10 :Text;
+  path @11 :Text;
+}
+struct VersionAudio { language @0 :Text; codec @1 :Text; channels @2 :UInt32; }
 # A font the file embeds, for a renderer drawing an ASS subtitle (spec 026).
 # url holds `{subtitle}`, the index of the subtitle track the font is fetched
 # for: the server cuts the font to the glyphs that track draws. A track that
@@ -374,7 +399,10 @@ struct NegotiateResult { union { grant @0 :PlaybackGrant; error @1 :Error; } }
 struct StartTracks { audio @0 :OptU32; subtitle @1 :OptU32; }
 struct StartTracksResult { union { tracks @0 :StartTracks; error @1 :Error; } }
 interface Playback {
-  negotiate @0 (ctx :CallContext, id :ItemId, caps :Capabilities, audio :StreamChoice, subtitle :StreamChoice) -> (result :NegotiateResult);
+  negotiate @0 (ctx :CallContext, id :ItemId, caps :Capabilities, audio :StreamChoice, subtitle :StreamChoice, version :Text) -> (result :NegotiateResult);
+  # `version`: a Version.id from ItemDetail.versions; empty plays the primary.
+  # An id the item does not have is notFound; an edition the server cannot
+  # serve yet (no stored probe) is unavailable.
   # What a title page shows in its track pickers before playback; opens no session.
   # Since schemaVersion 26.
   startTracks @1 (ctx :CallContext, id :ItemId, caps :Capabilities) -> (result :StartTracksResult);
