@@ -64,6 +64,7 @@ impl server::playback::Handler for Playback {
             .get_client_version()?
             .to_string()
             .unwrap_or_default();
+        let version = params.get_version()?.to_str()?.trim().to_owned();
         let session = &self.session;
         let granted = match (session.current_user().await, id, audio_stream_index) {
             (Err(denial), _, _) | (_, _, Err(denial)) => Err(denial),
@@ -74,6 +75,7 @@ impl server::playback::Handler for Playback {
                     subtitle_stream_index,
                     token: &session.token,
                     client_is_remote: session.client_is_remote(),
+                    version: &version,
                 };
                 match playback::grant(&session.state, &user, id, &request).await {
                     Ok(grant) => {
@@ -84,6 +86,7 @@ impl server::playback::Handler for Playback {
                     Err(GrantError::NotPlayable) => Err(Denial::NotPermitted {
                         what: "streaming a book",
                     }),
+                    Err(GrantError::Version(e)) => Err(super::library::version_denial(e)),
                 }
             }
             (Ok(_), WireId::Synth(_), Ok(_)) => Err(Denial::NotFound { what: "item" }),
@@ -133,6 +136,7 @@ impl server::playback::Handler for Playback {
                         GrantError::NotPlayable => Denial::NotPermitted {
                             what: "streaming a book",
                         },
+                        GrantError::Version(e) => super::library::version_denial(e),
                     })
             }
             (Ok(_), WireId::Synth(_)) => Err(Denial::NotFound { what: "item" }),

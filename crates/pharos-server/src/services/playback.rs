@@ -1381,6 +1381,8 @@ pub struct GrantRequest<'a> {
     /// The session's device token: the playback ends with it (B256).
     pub token: &'a str,
     pub client_is_remote: bool,
+    /// A version's id (`AlternateMediaSource::id`); empty plays the primary.
+    pub version: &'a str,
 }
 
 /// A playback a native player may start: the stream capability and the
@@ -1404,6 +1406,7 @@ pub enum GrantError {
     Item(crate::services::library::DetailError),
     /// A book is read, not streamed (004-books).
     NotPlayable,
+    Version(VersionError),
 }
 
 /// Why a native player cannot have the version it named.
@@ -1557,6 +1560,16 @@ pub async fn grant(
     r: &GrantRequest<'_>,
 ) -> Result<Grant, GrantError> {
     let (item, user_data) = playable_item(state, user, id).await?;
+    let item = select_version(media_source::Route::Negotiate, item, r.version)
+        .map_err(GrantError::Version)?;
+    let item_wire_id = pharos_jellyfin_api::dto::wire_item_id(id);
+    // The `{item}-{edition}` id PlaybackInfo hands Jellyfin clients, so the
+    // stream and playlist routes read the version's file.
+    let source_param = item
+        .edition
+        .as_deref()
+        .map(|e| format!("&MediaSourceId={item_wire_id}-{e}"))
+        .unwrap_or_default();
     let profile = r
         .capabilities
         .profile(crate::services::watch::extracts_image_subtitles(state));
@@ -1596,7 +1609,6 @@ pub async fn grant(
         },
     );
     let play_session_id = uuid::Uuid::new_v4().simple().to_string();
-    let item_wire_id = pharos_jellyfin_api::dto::wire_item_id(id);
     let resume_ticks = if user_data.played {
         0
     } else {
@@ -1604,7 +1616,7 @@ pub async fn grant(
     };
     let stream_url = match negotiated.decision {
         Decision::DirectPlay => format!(
-            "/{}/{item_wire_id}/stream?static=true&tag={play_session_id}",
+            "/{}/{item_wire_id}/stream?static=true&tag={play_session_id}{source_param}",
             if negotiated.is_video {
                 "videos"
             } else {
@@ -1617,7 +1629,7 @@ pub async fn grant(
                 profile: &profile,
                 probe: &item.probe,
                 item_wire_id: &item_wire_id,
-                source_param: "",
+                source_param: &source_param,
                 play_session_id: &play_session_id,
                 api_key: None,
                 audio_stream_index: audio.index.map(|i| i.to_string()),
@@ -1655,6 +1667,8 @@ pub async fn grant(
         client_is_remote = r.client_is_remote,
         audio_index = audio.index.map(i64::from).unwrap_or(-1),
         subtitle_index = subtitle.map(i64::from).unwrap_or(-1),
+        edition = item.edition.as_deref().unwrap_or("primary"),
+        stereo = item.probe.video_3d_format.map_or("none", |f| f.wire_name()),
         "native playback negotiated"
     );
     Ok(Grant {
