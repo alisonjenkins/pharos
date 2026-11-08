@@ -1405,6 +1405,97 @@ pub enum GrantError {
     NotPlayable,
 }
 
+/// The item `id` a native player may start, with the user's play state.
+async fn playable_item(
+    state: &AppState,
+    user: &pharos_core::User,
+    id: u64,
+) -> Result<(MediaItem, pharos_core::UserItemData), GrantError> {
+    let (item, user_data) = crate::services::library::detail(state, user, id)
+        .await
+        .map_err(GrantError::Item)?;
+    if matches!(item.kind, MediaKind::Book) {
+        return Err(GrantError::NotPlayable);
+    }
+    Ok((item, user_data))
+}
+
+/// The tracks a playback starts on, as [`pick_tracks`] chose them.
+pub struct TrackPick {
+    pub audio: AudioPick,
+    /// The subtitle the negotiation asks for, after the styled-track mapping.
+    pub requested_subtitle: Option<i64>,
+    /// The subtitle picked from the source's tracks; `None` is off.
+    pub subtitle: Option<u32>,
+    /// The styled track's own index, when the playback starts on one.
+    pub styled_pick: Option<u32>,
+}
+
+/// Picks the tracks `item` starts on: the explicit pick on the request, else
+/// the user's remembered pick for this item, else their language rules.
+/// `None` names the default. Shared by `grant` and `start_tracks`, so the
+/// tracks a title page shows are the ones the playback starts on.
+async fn pick_tracks(
+    state: &AppState,
+    user: &pharos_core::User,
+    item: &MediaItem,
+    streams: &[pharos_jellyfin_api::dto::MediaStreamDto],
+    subtitle_profiles: &[SubtitleProfileDto],
+    audio_explicit: Option<u32>,
+    subtitle_explicit: Option<i64>,
+) -> TrackPick {
+    let audio = pick_audio(state, user, item, streams, audio_explicit).await;
+    // A remembered pick counts as the player's own: the grant echoes the
+    // styled index, so that is what the player reports and gets remembered.
+    let stated_subtitle = subtitle_explicit.or_else(|| {
+        audio
+            .prefs
+            .remember_subtitle
+            .then_some(audio.remembered.subtitle_stream_index)
+            .flatten()
+            .map(i64::from)
+    });
+    let (requested_subtitle, styled_pick) =
+        crate::styled_track::negotiation_choice(&state.stores, item, stated_subtitle).await;
+    let subtitle = pick_subtitle(
+        &audio,
+        streams,
+        &item.probe,
+        subtitle_profiles,
+        requested_subtitle,
+    );
+    TrackPick {
+        audio,
+        requested_subtitle,
+        subtitle,
+        styled_pick,
+    }
+}
+
+/// The audio and subtitle `grant` would start `id` on for a default
+/// negotiation with `capabilities`. Opens no session.
+pub async fn start_tracks(
+    state: &AppState,
+    user: &pharos_core::User,
+    id: u64,
+    capabilities: &Capabilities,
+) -> Result<(Option<u32>, Option<u32>), GrantError> {
+    let (item, _) = playable_item(state, user, id).await?;
+    let profile = capabilities.profile(crate::services::watch::extracts_image_subtitles(state));
+    let streams = crate::services::watch::streams(&item).await;
+    let picked = pick_tracks(
+        state,
+        user,
+        &item,
+        &streams,
+        &profile.subtitle_profiles,
+        None,
+        None,
+    )
+    .await;
+    Ok((picked.audio.index, picked.styled_pick.or(picked.subtitle)))
+}
+
 /// Negotiates `id` for a native player and registers the session that
 /// authorizes its stream, as `/Items/{id}/PlaybackInfo` does for a
 /// Jellyfin client: the same access check, decision, metric and session.
@@ -1414,38 +1505,26 @@ pub async fn grant(
     id: u64,
     r: &GrantRequest<'_>,
 ) -> Result<Grant, GrantError> {
-    let (item, user_data) = crate::services::library::detail(state, user, id)
-        .await
-        .map_err(GrantError::Item)?;
-    if matches!(item.kind, MediaKind::Book) {
-        return Err(GrantError::NotPlayable);
-    }
+    let (item, user_data) = playable_item(state, user, id).await?;
     let profile = r
         .capabilities
         .profile(crate::services::watch::extracts_image_subtitles(state));
-    // The same start tracks PlaybackInfo picks: the user's remembered track,
-    // else their language rules.
     let streams = crate::services::watch::streams(&item).await;
-    let audio = pick_audio(state, user, &item, &streams, r.audio_stream_index).await;
-    // A remembered pick counts as the player's own: the grant echoes the
-    // styled index, so that is what the player reports and gets remembered.
-    let stated_subtitle = r.subtitle_stream_index.or_else(|| {
-        audio
-            .prefs
-            .remember_subtitle
-            .then_some(audio.remembered.subtitle_stream_index)
-            .flatten()
-            .map(i64::from)
-    });
-    let (requested_subtitle, styled_pick) =
-        crate::styled_track::negotiation_choice(&state.stores, &item, stated_subtitle).await;
-    let subtitle = pick_subtitle(
-        &audio,
-        &streams,
-        &item.probe,
-        &profile.subtitle_profiles,
+    let TrackPick {
+        audio,
         requested_subtitle,
-    );
+        subtitle,
+        styled_pick,
+    } = pick_tracks(
+        state,
+        user,
+        &item,
+        &streams,
+        &profile.subtitle_profiles,
+        r.audio_stream_index,
+        r.subtitle_stream_index,
+    )
+    .await;
     // The decision names these tracks, so the stream must carry them: the
     // picked subtitle (or none) is what gets burned, and an audio track other
     // than the one a player starts on cannot direct play.
