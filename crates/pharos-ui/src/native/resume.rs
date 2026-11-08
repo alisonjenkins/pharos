@@ -28,6 +28,19 @@ pub struct AudioPath {
     pub output_latency_ms: Option<f64>,
 }
 
+/// Attribute an MSE engine sets on the `<video>` it attaches to, naming itself:
+/// both play from a `blob:` URL, so the source alone cannot tell them apart.
+pub const ENGINE_MARK: &str = "data-pharos-engine";
+
+/// The engine playing a `blob:` source, from the element's [`ENGINE_MARK`]
+/// (B732). hls.js when unmarked, as before the Rust engine existed.
+pub fn blob_engine(mark: Option<&str>) -> &'static str {
+    match mark {
+        Some("rust") => "rust",
+        _ => "hlsjs",
+    }
+}
+
 /// The media element as the resume found it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResumeContext {
@@ -35,7 +48,7 @@ pub struct ResumeContext {
     pub ready_state: u16,
     /// Buffered media ahead of the playhead.
     pub buffered_ahead_ms: u64,
-    /// `direct`, `hlsjs` (MSE) or `native_hls`.
+    /// `direct`, `hlsjs` or `rust` (MSE), or `native_hls`.
     pub engine: &'static str,
     pub muted: bool,
     /// `None` when the element is not routed through an analyser.
@@ -267,6 +280,13 @@ mod tests {
     #![allow(clippy::expect_used)]
 
     use super::*;
+
+    #[test]
+    fn a_blob_source_names_the_engine_that_marked_it() {
+        assert_eq!(super::blob_engine(Some("rust")), "rust");
+        assert_eq!(super::blob_engine(Some("hlsjs")), "hlsjs");
+        assert_eq!(super::blob_engine(None), "hlsjs");
+    }
 
     fn tapped() -> ResumeContext {
         ResumeContext {

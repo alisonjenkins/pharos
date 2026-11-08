@@ -198,6 +198,7 @@ impl PlaybackEngine for RustHls {
             })?;
         session.borrow_mut().on_source_open = Some(on_open);
 
+        super::platform::mark_engine(&video, "rust");
         video.set_src(&object_url);
         self.session = Some(session);
         Ok(())
