@@ -77,3 +77,20 @@ def test_a_model_never_loaded_is_not_unloaded() -> None:
     clock.now += 10
     assert not aligner.unload_if_idle()
     assert aligner.loads == 0
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [(None, 600), ("", 600), ("0", None), ("120", 120)],
+)
+def test_idle_unload_secs_parses_the_environment(raw: str | None, expected: float | None) -> None:
+    from pharos_aligner.server import idle_unload_secs
+
+    assert idle_unload_secs(raw) == expected
+
+
+def test_idle_unload_secs_rejects_negative() -> None:
+    from pharos_aligner.server import idle_unload_secs
+
+    with pytest.raises(ValueError):
+        idle_unload_secs("-1")
