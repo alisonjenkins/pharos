@@ -1464,6 +1464,12 @@ async fn pick_tracks(
         subtitle_profiles,
         requested_subtitle,
     );
+    let styled_pick = match (styled_pick, stated_subtitle, subtitle) {
+        (None, None, Some(source)) => {
+            crate::styled_track::default_pick(&state.stores, item, source).await
+        }
+        (picked, _, _) => picked,
+    };
     TrackPick {
         audio,
         requested_subtitle,

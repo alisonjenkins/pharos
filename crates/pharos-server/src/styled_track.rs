@@ -60,6 +60,51 @@ pub async fn negotiation_choice<S: SubtitleStylingStore>(
     }
 }
 
+/// The styled track a playback starts on when nobody chose a subtitle and the
+/// default rules picked `source` (spec 028 FR-017, B853): the item's styled
+/// slot when its current plan was made from `source`, so the Pharos styled
+/// look is the default wherever its plain source would have shown. A player
+/// whose Effects is Off moves back to the source itself.
+pub async fn default_pick<S: SubtitleStylingStore>(
+    store: &S,
+    item: &MediaItem,
+    source: u32,
+) -> Option<u32> {
+    let Some(row) = current(store, item).await else {
+        tracing::info!(
+            item = %item.id,
+            source,
+            verdict = "plain",
+            reason = "no current plan",
+            "default subtitle styled pick"
+        );
+        return None;
+    };
+    if row.source_index != source {
+        tracing::info!(
+            item = %item.id,
+            source,
+            plan_source = row.source_index,
+            verdict = "plain",
+            reason = "plan made from another track",
+            "default subtitle styled pick"
+        );
+        return None;
+    }
+    let count = discover_sidecars(&item.path).await.len();
+    let index = styled_index(&item.probe, u32::try_from(count).unwrap_or(u32::MAX));
+    tracing::info!(
+        item = %item.id,
+        source,
+        plan_source = row.source_index,
+        styled = index,
+        verdict = "styled",
+        reason = "plan made from the default subtitle",
+        "default subtitle styled pick"
+    );
+    Some(index)
+}
+
 /// The item's styling row when its plan can still be served: it has a plan,
 /// its director is this one or older, the video file is the one the plan was
 /// made from, and a sidecar source still has the signature it had then.
