@@ -1860,6 +1860,133 @@ test.describe("pharos Dioxus UI", () => {
       expect(hlsjs).toEqual([]);
     });
 
+    // V637 (spec 031 slice 3): a segment the server fails is retried after a
+    // doubling backoff and playback carries on, each failure logged with its
+    // cause, attempt and delay.
+    test("the Rust engine retries a failed segment with backoff and keeps playing", async ({
+      page,
+      request,
+    }) => {
+      test.setTimeout(120_000);
+      const probe = await request.get(`${PHAROS_URL}/pharos/session`, {
+        headers: { Accept: "application/json" },
+      });
+      test.skip(
+        probe.status() !== 405,
+        `native API is not enabled (status ${probe.status()})`,
+      );
+      const auth = await request.post(
+        `${PHAROS_URL}/Users/AuthenticateByName`,
+        {
+          headers: {
+            "Content-Type": "application/json",
+            "X-Emby-Authorization": `MediaBrowser Client="playwright", Device="pw", DeviceId="pw-retry-${Date.now()}", Version="0"`,
+          },
+          data: { Username: TEST_USER, Pw: TEST_PASS },
+        },
+      );
+      test.skip(!auth.ok(), `pharos has no seeded test user (${TEST_USER})`);
+      const { AccessToken: token, User: user } = await auth.json();
+      const api = { "X-Emby-Token": token };
+      const fixture = async () =>
+        (
+          await (
+            await request.get(
+              `${PHAROS_URL}/Users/${user.Id}/Items?Recursive=true&IncludeItemTypes=Movie&Fields=Path,MediaSources`,
+              { headers: api },
+            )
+          ).json()
+        ).Items?.find((i: { Path?: string }) =>
+          i.Path?.endsWith("/fixture-1.webm"),
+        );
+      await expect
+        .poll(async () => (await fixture())?.MediaSources?.[0]?.Container, {
+          timeout: 30_000,
+        })
+        .toMatch(/webm/);
+      const movie = await fixture();
+      test.skip(!movie, "pharos has no seeded movie");
+      const nativeId = BigInt(`0x${movie.Id}`).toString();
+      // An earlier test's seek leaves a resume point; start from the top.
+      await request.post(`${PHAROS_URL}/Sessions/Playing/Progress`, {
+        headers: api,
+        data: {
+          ItemId: movie.Id,
+          PlaySessionId: `pw-reset-${Date.now()}`,
+          PositionTicks: 0,
+          IsPaused: true,
+        },
+      });
+
+      await page.addInitScript(() => {
+        const canPlayType = HTMLMediaElement.prototype.canPlayType;
+        HTMLMediaElement.prototype.canPlayType = function (type: string) {
+          return /mpegurl|webm|matroska/i.test(type)
+            ? ""
+            : canPlayType.call(this, type);
+        };
+      });
+      const logs: string[] = [];
+      page.on("console", (m) => logs.push(m.text()));
+      let refused = 0;
+      await page.route(
+        (url) => /\/h264cmaf\/(?:[^/]+\/)?\d+\.m4s$/.test(url.pathname),
+        async (route) => {
+          if (refused < 2) {
+            refused += 1;
+            await route.fulfill({ status: 503, body: "busy" });
+          } else {
+            await route.continue();
+          }
+        },
+      );
+
+      await page.goto("/ui/");
+      await page.locator("#signin-name").fill(TEST_USER);
+      await page.locator("#signin-password").fill(TEST_PASS);
+      await page.getByRole("button", { name: "Sign in" }).click();
+      await expect(page.locator(".pharos-shell-bar")).toBeVisible({
+        timeout: 15_000,
+      });
+
+      await page.goto(`/ui/watch/${nativeId}?engine=rust`);
+      await expect
+        .poll(
+          () =>
+            logs.some((l) =>
+              /pharos: playback engine=rust start .* device=desktop first_byte_ms=10000 load_ms=60000 /.test(
+                l,
+              ),
+            ),
+          { timeout: 30_000 },
+        )
+        .toBe(true);
+      const failures = () =>
+        logs.filter((l) => l.includes("playback error engine=rust"));
+      await expect.poll(() => failures().length, { timeout: 30_000 }).toBe(2);
+      expect(failures()[0]).toMatch(
+        /track=video index=\d+ cause=http status=503 deadline_ms=none rung=\S+ action=retry attempt=1 after_ms=1000 give_up=none /,
+      );
+      expect(failures()[1]).toMatch(
+        /index=\d+ cause=http status=503 .*action=retry attempt=2 after_ms=2000 /,
+      );
+
+      const video = () =>
+        page.evaluate(() => {
+          const v = document.getElementById(
+            "pharos-video",
+          ) as HTMLVideoElement | null;
+          return v?.currentTime ?? 0;
+        });
+      await expect.poll(video, { timeout: 60_000 }).toBeGreaterThan(13);
+      expect(refused).toBe(2);
+      expect(failures()).toHaveLength(2);
+      expect(logs.filter((l) => l.includes("action=fail"))).toEqual([]);
+      expect(logs.filter((l) => l.includes("engine=rust fallback="))).toEqual(
+        [],
+      );
+    });
+
     // B733: after the back buffer is trimmed, a seek to just before where the
     // remaining data starts lands in a segment that is only partly buffered.
     // The Rust engine must fetch it again, not wait on data it never asks for.
@@ -2010,6 +2137,16 @@ test.describe("pharos Dioxus UI", () => {
       const movie = await fixture();
       test.skip(!movie, "pharos has no seeded movie");
       const nativeId = BigInt(`0x${movie.Id}`).toString();
+      // An earlier test's seek leaves a resume point; start from the top.
+      await request.post(`${PHAROS_URL}/Sessions/Playing/Progress`, {
+        headers: api,
+        data: {
+          ItemId: movie.Id,
+          PlaySessionId: `pw-reset-${Date.now()}`,
+          PositionTicks: 0,
+          IsPaused: true,
+        },
+      });
 
       // Bytes per second each segment body is trickled at; 0 is full speed.
       let rateBps = 0;
