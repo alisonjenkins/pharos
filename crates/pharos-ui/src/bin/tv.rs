@@ -14,6 +14,18 @@ fn main() {
             .with_max_level(log::LevelFilter::Info)
             .with_tag("pharos-tv"),
     );
+    // The default hook prints a backtrace, and on Android the unwinder loops
+    // through JNI frames (`art_quick_generic_jni_trampoline`) without end:
+    // the panicking thread printed tens of millions of frames, never got to
+    // unwind, and the panic message scrolled out of logcat. Log the message
+    // and where it came from instead.
+    std::panic::set_hook(Box::new(|info| {
+        let thread = std::thread::current();
+        log::error!(
+            "pharos: panic on thread {}: {info}",
+            thread.name().unwrap_or("<unnamed>")
+        );
+    }));
     log::info!(
         "pharos: start tokio={}",
         tokio::runtime::Handle::try_current().is_ok()
