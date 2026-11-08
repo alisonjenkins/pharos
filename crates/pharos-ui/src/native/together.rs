@@ -376,6 +376,7 @@ pub struct FakeGroups {
     joined: Rc<RefCell<Option<GroupId>>>,
     seen: Rc<RefCell<Vec<MemberSeen>>>,
     refuse_follow: Rc<Cell<bool>>,
+    refuse_seek: Rc<Cell<bool>>,
     refuse_tracks: Rc<Cell<bool>>,
     refuse_set_item: Rc<Cell<bool>>,
     hold_buffering: Rc<Cell<bool>>,
@@ -416,6 +417,11 @@ impl FakeGroups {
     /// Makes every `set_item` fail, as a server before schemaVersion 23 would.
     pub fn refuse_set_item(&self) {
         self.refuse_set_item.set(true);
+    }
+
+    /// Makes every `seek` fail, as a dropped connection would.
+    pub fn refuse_seek(&self) {
+        self.refuse_seek.set(true);
     }
 
     /// Makes every `follow_tracks` fail, as a dropped connection would.
@@ -566,6 +572,9 @@ impl GroupClient for FakeGroups {
 
     async fn seek(&self, position_ms: u64) -> Result<(), GroupError> {
         self.log(format!("seek({position_ms})"));
+        if self.refuse_seek.get() {
+            return Err(GroupError("connection lost".into()));
+        }
         Ok(())
     }
 

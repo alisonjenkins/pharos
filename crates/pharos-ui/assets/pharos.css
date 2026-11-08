@@ -1053,6 +1053,21 @@ body:has(.pharos-stage.is-full) .pharos-error {
   border-radius: 6px;
   background: var(--px-color-surface);
 }
+/* The group ended: a neutral status over the picture, not the alert red. */
+.pharos-status-note {
+  color: var(--px-color-fg-muted);
+}
+body:has(.pharos-stage.is-full) .pharos-status-note {
+  position: fixed;
+  top: 4rem;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 11;
+  margin: 0;
+  padding: 0.5rem 1rem;
+  border-radius: 6px;
+  background: var(--px-color-surface);
+}
 /* A playback failure: a centred panel over the picture with a way to try
    again and a way out (B806). */
 .pharos-playback-failure {

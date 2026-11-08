@@ -207,6 +207,12 @@ pub fn group_to_rejoin(kept: Option<String>, in_group: bool) -> Option<String> {
     kept.filter(|id| !id.is_empty() && !in_group)
 }
 
+/// What the viewer reads when the group this tab was in cannot be joined
+/// again after a reload (B807); the server's reason follows.
+pub fn rejoin_failure(reason: &str) -> String {
+    format!("Couldn't rejoin your group, so you're watching on your own. ({reason})")
+}
+
 /// What the tab kept before this page loaded.
 pub fn kept_before_load() -> Option<String> {
     platform::session_get(GROUP_KEY).unwrap_or_else(|e| {
@@ -232,6 +238,14 @@ mod tests {
             kept_group(&view),
             "",
             "a left or ended group is not rejoined"
+        );
+    }
+
+    #[test]
+    fn a_failed_rejoin_says_so_and_carries_the_reason() {
+        assert_eq!(
+            rejoin_failure("This group has ended"),
+            "Couldn't rejoin your group, so you're watching on your own. (This group has ended)"
         );
     }
 

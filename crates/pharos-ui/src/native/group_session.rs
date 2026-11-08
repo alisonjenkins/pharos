@@ -600,6 +600,10 @@ struct Inner {
     /// was made in; one task sends them one at a time, so the server sees
     /// them in the order the viewer caused them.
     commands: VecDeque<QueuedCommand>,
+    /// When the last "couldn't reach the group" line was shown: a burst of
+    /// failures (a socket outage fails every queued command and buffering
+    /// report) shows one line per toast, not one per command.
+    failure_shown_ms: Option<i64>,
     /// A task is working through `commands`.
     draining: bool,
     /// That task has a command's RPC out and unanswered.
@@ -975,8 +979,10 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
                 let Err(e) = client.set_tracks(audio, subtitle, playlist_item_id).await else {
                     return;
                 };
-                me.env
-                    .warn(&format!("pharos: group command failed: {}", e.0));
+                me.env.warn(&format!(
+                    "pharos: group command failed kind=set_tracks: {}",
+                    e.0
+                ));
                 me.apply_pick_here(audio, subtitle, epoch);
             }));
         }
@@ -1041,6 +1047,37 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
             }));
         }
         true
+    }
+
+    /// A command the group never heard: say so on the activity toast, or the
+    /// viewer's click seems to do nothing (B807). Nothing for a membership
+    /// that has moved on.
+    fn command_failed(&self, epoch: u64) {
+        {
+            let mut inner = self.inner.borrow_mut();
+            if !inner.active || inner.epoch != epoch {
+                return;
+            }
+            let now = self.env.now_ms();
+            let toast = i64::try_from(activity::TOAST_MS).unwrap_or(i64::MAX);
+            if inner
+                .failure_shown_ms
+                .is_some_and(|shown| now.saturating_sub(shown) < toast)
+            {
+                return;
+            }
+            inner.failure_shown_ms = Some(now);
+            let at = u64::try_from(now).unwrap_or(0);
+            inner.state.log.push(
+                &Event {
+                    by: None,
+                    action: activity::Action::CommandFailed,
+                },
+                at,
+            );
+            inner.state.activity = inner.state.activity.wrapping_add(1);
+        }
+        self.publish();
     }
 
     /// The group did not take a pick (the call failed), so change this player
@@ -1109,8 +1146,11 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
                 let Err(e) = client.follow_tracks(follow).await else {
                     return;
                 };
-                me.env
-                    .warn(&format!("pharos: group command failed: {}", e.0));
+                me.env.warn(&format!(
+                    "pharos: group command failed kind=follow_tracks({follow}): {}",
+                    e.0
+                ));
+                me.command_failed(epoch);
                 // The server never heard it, so the flag it keeps is the old
                 // one; unless the membership has moved on, show that again.
                 let reverted = {
@@ -1603,13 +1643,20 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
                     continue;
                 }
                 match select(next, me.env.sleep(COMMAND_TIMEOUT_MS)).await {
-                    Either::Left((Err(e), _)) => me
-                        .env
-                        .warn(&format!("pharos: group command failed: {}", e.0)),
+                    Either::Left((Err(e), _)) => {
+                        me.env.warn(&format!(
+                            "pharos: group command failed kind={kind}: {}",
+                            e.0
+                        ));
+                        me.command_failed(epoch);
+                    }
                     Either::Left((Ok(()), _)) => {}
-                    Either::Right(_) => me.env.warn(&format!(
-                        "pharos: group command timed out kind={kind} after_ms={COMMAND_TIMEOUT_MS}"
-                    )),
+                    Either::Right(_) => {
+                        me.env.warn(&format!(
+                            "pharos: group command timed out kind={kind} after_ms={COMMAND_TIMEOUT_MS}"
+                        ));
+                        me.command_failed(epoch);
+                    }
                 }
             }
         }));
@@ -2732,6 +2779,83 @@ mod tests {
             rig.env
                 .logged("pharos: group command timed out kind=buffering(true)"),
             ["pharos: group command timed out kind=buffering(true) after_ms=10000"]
+        );
+    }
+
+    /// B807: a command the group never heard says so on the activity toast
+    /// instead of leaving the click looking dead. Disarm check: dropping the
+    /// `command_failed` calls fails all three.
+    #[test]
+    fn a_failed_command_tells_the_viewer() {
+        let rig = rig();
+        rig.groups.refuse_seek();
+        assert!(rig.session.seek(5_000));
+        let mut live: Vec<LocalBoxFuture<'static, ()>> = Vec::new();
+        pump(&rig.env, &mut live);
+        let lines = rig.session.view().log.lines();
+        assert_eq!(
+            lines.last().map(String::as_str),
+            Some("Couldn't reach the group. Try again.")
+        );
+        assert_eq!(
+            rig.env
+                .logged("pharos: group command failed kind=seek(5000)"),
+            ["pharos: group command failed kind=seek(5000): connection lost"]
+        );
+    }
+
+    /// A burst of failures (an outage fails every queued command) shows one
+    /// line per toast, and a failure after the toast has gone shows again.
+    #[test]
+    fn a_burst_of_failed_commands_shows_one_line() {
+        let rig = rig();
+        rig.groups.refuse_seek();
+        let failed = |rig: &Rig| {
+            rig.session
+                .view()
+                .log
+                .lines()
+                .iter()
+                .filter(|l| l.as_str() == "Couldn't reach the group. Try again.")
+                .count()
+        };
+        let mut live: Vec<LocalBoxFuture<'static, ()>> = Vec::new();
+        for at in [5_000, 6_000, 7_000] {
+            assert!(rig.session.seek(at));
+            pump(&rig.env, &mut live);
+        }
+        assert_eq!(failed(&rig), 1, "{:?}", rig.session.view().log.lines());
+        rig.env.now.set(rig.env.now.get() + 4_000);
+        assert!(rig.session.seek(8_000));
+        pump(&rig.env, &mut live);
+        assert_eq!(failed(&rig), 2);
+    }
+
+    #[test]
+    fn a_command_that_times_out_tells_the_viewer() {
+        let rig = rig();
+        rig.groups.hold_buffering();
+        rig.session.on_media(MediaEvent::Waiting);
+        let mut live: Vec<LocalBoxFuture<'static, ()>> = Vec::new();
+        pump(&rig.env, &mut live);
+        rig.env.timeout_elapsed.set(true);
+        pump(&rig.env, &mut live);
+        assert_eq!(
+            rig.session.view().log.lines().last().map(String::as_str),
+            Some("Couldn't reach the group. Try again.")
+        );
+    }
+
+    #[test]
+    fn a_follow_toggle_the_group_missed_tells_the_viewer() {
+        let rig = rig();
+        rig.groups.refuse_follow();
+        rig.session.follow_tracks(false);
+        let mut live: Vec<LocalBoxFuture<'static, ()>> = Vec::new();
+        pump(&rig.env, &mut live);
+        assert_eq!(
+            rig.session.view().log.lines().last().map(String::as_str),
+            Some("Couldn't reach the group. Try again.")
         );
     }
 
