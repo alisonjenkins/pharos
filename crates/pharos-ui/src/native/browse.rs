@@ -1369,7 +1369,7 @@ fn Hero(
         header { class: "pharos-hero",
             div { class: art_class,
                 if let Some(src) = image {
-                    img { src: "{src}", alt: "" }
+                    img { src: platform::art_src(&src), alt: "" }
                 }
             }
             div { class: "pharos-hero-body",

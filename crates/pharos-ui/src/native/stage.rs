@@ -584,7 +584,7 @@ pub fn StageBar(
                 },
                 onpointercancel: move |_| drag.set(None),
                 if let Some(src) = image {
-                    img { class: "pharos-stage-art", src: "{src}", alt: "" }
+                    img { class: "pharos-stage-art", src: platform::art_src(&src), alt: "" }
                 }
                 div { class: "pharos-stage-text",
                     p { class: "pharos-stage-title", title: "{title}", "{title}" }

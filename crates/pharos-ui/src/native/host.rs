@@ -80,6 +80,11 @@ pub fn on_escape(_on_escape: impl FnMut() + 'static) -> EscapeWatch {
 
 pub struct PopState;
 
+/// Artwork as the page already has it: same-origin with the server.
+pub fn art_src(src: &str) -> String {
+    src.to_owned()
+}
+
 pub struct BackAtRoot;
 
 /// The remote's Back at the first page (the Android TV app only): a browser

@@ -41,6 +41,7 @@ pub fn Art(
     #[props(default)] class: Option<String>,
     #[props(default = true)] lazy: bool,
 ) -> Element {
+    let src = super::platform::art_src(&src);
     let fallback = sized(&src, WIDTHS[WIDTHS.len() - 1], false);
     let jpeg = srcset(&src, false);
     let avif = OFFER_AVIF.then(|| srcset(&src, true));
