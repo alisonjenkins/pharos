@@ -614,6 +614,11 @@ fn last_volume() -> Option<(f64, bool, &'static str)> {
 
 /// Set the new media element to `last`, the viewer's last volume.
 fn restore_volume(last: Option<(f64, bool, &'static str)>) {
+    let last = if platform::owns_volume() {
+        last
+    } else {
+        Some((1.0, false, "device"))
+    };
     if let Some((volume, muted, from)) = last {
         platform::set_volume(VIDEO_ID, volume, muted);
         platform::info(&format!(
@@ -6916,6 +6921,8 @@ fn Player(
                 Control::Seek(ms) => seek(ms),
                 Control::Hover(x) => hover_ms
                     .set(x.and_then(|x| position_at(x, platform::element_width(SEEK_ID), total))),
+                // Without a volume control the device's own volume rules.
+                Control::Volume { .. } if !platform::owns_volume() => {}
                 Control::Volume { volume, muted } => {
                     fade_in_cancel.set(true);
                     platform::set_volume(VIDEO_ID, volume, muted);
