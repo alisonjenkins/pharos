@@ -744,7 +744,9 @@ pub fn open_route(item: &Item) -> Route {
         | ItemKind::Series
         | ItemKind::Season
         | ItemKind::Album
-        | ItemKind::Artist => Route::Browse(item.id),
+        | ItemKind::Artist
+        | ItemKind::Collection
+        | ItemKind::Playlist => Route::Browse(item.id),
         _ => Route::Title(item.id),
     }
 }
@@ -2076,6 +2078,9 @@ mod tests {
             ItemKind::Season,
             ItemKind::Album,
             ItemKind::Artist,
+            // B810: a boxset or playlist has no title page, only members.
+            ItemKind::Collection,
+            ItemKind::Playlist,
         ] {
             assert!(
                 matches!(open_route(&item(kind)), Route::Browse(_)),
