@@ -32,8 +32,8 @@ use super::route::Route;
 use super::seen::{self, MemberSeen};
 use super::together_view::{InThisGroup, SeenDots};
 use super::views::{
-    display_name, episode_label, is_placeholder_episode_name, progress_percent, runtime, Link,
-    MarkPlayed, PosterTile, Ratings, WatchedToggle, MAIN_ACTION,
+    display_name, episode_label, is_placeholder_episode_name, progress_percent, runtime,
+    ArtPlaceholder, Link, MarkPlayed, PosterTile, Ratings, WatchedToggle, MAIN_ACTION,
 };
 use pharos_client::mix::radio;
 
@@ -1364,12 +1364,17 @@ fn Hero(
         "pharos-hero-art"
     };
     let image = detail.as_ref().and_then(|d| d.item.image.clone());
+    let album = detail
+        .as_ref()
+        .is_some_and(|d| d.item.kind == ItemKind::Album);
     let facts = facts.join(" · ");
     rsx! {
         header { class: "pharos-hero",
             div { class: art_class,
-                if let Some(src) = image {
-                    img { src: "{src}", alt: "" }
+                match image {
+                    Some(src) => rsx! { img { src: "{src}", alt: "" } },
+                    None if album => rsx! { ArtPlaceholder { kind: ItemKind::Album, name: title.clone() } },
+                    None => rsx! {},
                 }
             }
             div { class: "pharos-hero-body",
@@ -2716,6 +2721,23 @@ mod tests {
         );
         dom.rebuild_in_place();
         dioxus_ssr::render(&dom)
+    }
+
+    /// B801 (V751): an album with no cover heads its page with the music
+    /// tile; a series with no poster keeps an empty frame.
+    #[test]
+    fn an_album_without_a_cover_heads_its_page_with_the_music_tile() {
+        let album = detail(item(ItemRef::Synth(7), ItemKind::Album, "Mezzanine"));
+        let html = render(move || {
+            rsx! { Hero { title: "Mezzanine", detail: Some(album.clone()), facts: vec![], square: true } }
+        });
+        assert!(html.contains("pharos-art-song"), "{html}");
+
+        let series = detail(item(ItemRef::Synth(8), ItemKind::Series, "Frieren"));
+        let html = render(move || {
+            rsx! { Hero { title: "Frieren", detail: Some(series.clone()), facts: vec![], square: false } }
+        });
+        assert!(!html.contains("pharos-art-song"), "{html}");
     }
 
     fn seen_by(id: &str, name: &str, items: Vec<seen::ItemSeen>) -> MemberSeen {

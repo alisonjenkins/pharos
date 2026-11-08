@@ -703,11 +703,11 @@ pub fn PosterTile(item: Item) -> Element {
     }
 }
 
-/// What stands where an item has no art: a song gets the music tile (V751),
-/// anything else its initial.
+/// What stands where an item has no art: a song or album gets the music tile
+/// (V751), anything else, a music video included, its initial.
 #[component]
-fn ArtPlaceholder(kind: ItemKind, name: String) -> Element {
-    if kind == ItemKind::Audio {
+pub fn ArtPlaceholder(kind: ItemKind, name: String) -> Element {
+    if matches!(kind, ItemKind::Audio | ItemKind::Album) {
         rsx! {
             div { class: "pharos-poster-placeholder pharos-art-song", aria_hidden: "true",
                 span { class: "pharos-art-note", "♪" }
@@ -2113,7 +2113,8 @@ mod tests {
     }
 
     /// B801 (V751): a song with no cover gets the music tile, on its card and
-    /// its title page; a film with no poster keeps its initial.
+    /// its title page, as does an album's card; a film with no poster, a
+    /// music video included, keeps its initial.
     #[test]
     fn a_song_without_a_cover_shows_the_music_tile() {
         let song = item(ItemKind::Audio);
@@ -2140,6 +2141,10 @@ mod tests {
         };
         let page = render(move || rsx! { TitleView { detail: detail.clone() } });
         assert!(page.contains("pharos-art-song"), "{page}");
+
+        let album = item(ItemKind::Album);
+        let card = render(move || rsx! { PosterTile { item: album.clone() } });
+        assert!(card.contains("pharos-art-song"), "{card}");
 
         let film = item(ItemKind::Movie);
         let card = render(move || rsx! { PosterTile { item: film.clone() } });
