@@ -684,6 +684,7 @@ pub fn hide_text_track(video_id: &str, track_id: &str) {
 }
 
 pub use super::subs_web::{rust_subtitles, RustSubtitles};
+pub use super::turn_web::{turn_begin, turn_cancel, turn_expect, turn_open, turn_ready};
 
 /// The shared resize observer for the JASSUB canvases and its callback,
 /// kept alive together.
@@ -3080,6 +3081,8 @@ impl PlaybackEngine for HlsJs {
                     report_event(hls_event(ClientLevel::Warn, &kind, &details, "none", 0));
                     return;
                 }
+                // The stream is in trouble: show the player's own state, not the turn.
+                super::turn_web::turn_cancel_current("engine-fatal");
                 let mut budget = budget.borrow_mut();
                 let action = budget.on_fatal(&kind, &details);
                 let attempt = budget.attempts(&kind);

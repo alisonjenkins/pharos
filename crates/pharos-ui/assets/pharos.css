@@ -1323,6 +1323,130 @@ body:has(.pharos-stage.is-full) .pharos-error {
   opacity: 0;
   animation: pharos-fade-in 250ms ease 8s forwards;
 }
+
+/* The episode turn (V790): a cube turn onto the episode being opened or
+   played next, outside the player so it lives through the swap and is never
+   an ancestor of the video. Only transform and opacity change (set inline
+   by turn_web.rs), and the layer is removed once it lands. */
+.pharos-turn {
+  position: fixed;
+  inset: 0;
+  z-index: 15;
+  pointer-events: none;
+  perspective: 1600px;
+  background: #000; /* not themed: the player's own black, which the video sits on */
+  overflow: hidden;
+}
+.pharos-turn-face {
+  position: absolute;
+  inset: 0;
+  backface-visibility: hidden;
+  background: #000; /* not themed: letterbox black behind the still */
+  overflow: hidden;
+}
+.pharos-turn-still {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+.pharos-turn-face.is-in .pharos-turn-still {
+  opacity: 0;
+  transition: opacity 200ms ease;
+}
+.pharos-turn-face.is-in .pharos-turn-still[src] {
+  opacity: 1;
+}
+/* A face turned away from the viewer is in shadow, as a cube's side is. */
+.pharos-turn-shade {
+  position: absolute;
+  inset: 0;
+  background: #000; /* not themed: shadow on the turning picture */
+  opacity: 0.35;
+}
+.pharos-turn-face.is-out .pharos-turn-shade {
+  opacity: 0;
+  transition: opacity 650ms ease-in;
+}
+.pharos-turn-face.is-out.is-gone .pharos-turn-shade {
+  opacity: 0.6;
+}
+.pharos-turn-rim {
+  position: absolute;
+  inset: 0;
+  box-shadow:
+    inset 0 0 0 2px var(--px-color-accent),
+    inset 0 0 3rem color-mix(in srgb, var(--px-color-accent) 35%, transparent);
+  opacity: 0;
+}
+.pharos-turn.is-waiting .pharos-turn-rim {
+  animation: pharos-turn-rim 1.6s ease-in-out infinite alternate;
+}
+@keyframes pharos-turn-rim {
+  from { opacity: 0.15; }
+  to { opacity: 0.7; }
+}
+.pharos-turn-title {
+  position: absolute;
+  left: 5%;
+  bottom: 9%;
+  margin: 0;
+  max-width: 70%;
+  color: #fff; /* not themed: drawn over the picture */
+  font-size: var(--px-type-step-3);
+  font-weight: 600;
+  text-shadow: 0 2px 12px rgb(0 0 0 / 60%); /* not themed: legibility over the picture */
+}
+.pharos-turn-caption {
+  position: absolute;
+  left: 50%;
+  bottom: 18%;
+  margin: 0;
+  translate: -50% 0;
+  padding: 0.25rem 0.65rem;
+  border-radius: var(--px-radius);
+  background: color-mix(in srgb, var(--px-color-bg) 70%, transparent);
+  color: var(--px-color-fg);
+  font-size: var(--px-type-step--1);
+  opacity: 0;
+  transition: opacity 200ms ease;
+}
+.pharos-turn-caption.is-shown {
+  opacity: 1;
+}
+.pharos-turn-bar {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 3px;
+  background: rgb(255 255 255 / 12%); /* not themed: track drawn over the picture */
+  opacity: 0;
+  transition: opacity 200ms ease;
+}
+.pharos-turn.is-waiting .pharos-turn-bar {
+  opacity: 1;
+}
+.pharos-turn-fill {
+  position: absolute;
+  inset: 0;
+  background: var(--px-color-accent);
+  transform: scaleX(0);
+  transform-origin: left;
+  transition: transform 380ms cubic-bezier(0.25, 0.8, 0.25, 1);
+}
+/* The layer shows the load; the player's spinner would be a second one. */
+[data-turning] .pharos-watch-loading {
+  visibility: hidden;
+}
+@media (prefers-reduced-motion: reduce) {
+  /* No turn starts under reduced motion; a layer left from before the
+     setting changed stops moving at once. */
+  .pharos-turn {
+    display: none;
+  }
+}
 @keyframes pharos-fade-in {
   to {
     opacity: 1;
