@@ -375,32 +375,8 @@ if (!window.__pharosKeys) {
 
             let _ = document::eval("await new Promise(r => setTimeout(r, 3000)); return 1;").await;
 
-            let mut rtt = Vec::with_capacity(200);
-            for _ in 0..200 {
-                let t0 = std::time::Instant::now();
-                let _ = document::eval("return document.querySelectorAll('.tile').length;").await;
-                rtt.push(t0.elapsed().as_micros());
-            }
-            let rtt_min = rtt.iter().copied().min().unwrap_or(0);
-            let rtt_max = rtt.iter().copied().max().unwrap_or(0);
-            let rtt_p50 = pct(&mut rtt, 0.50);
-            let rtt_p95 = pct(&mut rtt, 0.95);
-            log::info!(
-                "bench rtt (200 evals): min={rtt_min}µs p50={rtt_p50}µs p95={rtt_p95}µs max={rtt_max}µs"
-            );
-
-            let mut batch = Vec::with_capacity(50);
-            for _ in 0..50 {
-                let t0 = std::time::Instant::now();
-                let _ = document::eval(
-                    r#"return {w: innerWidth, h: innerHeight, sy: scrollY, a: document.activeElement && document.activeElement.className, n: document.querySelectorAll('.tile').length, t: (document.getElementById('v')||{}).currentTime || 0, p: (document.getElementById('v')||{}).paused, vw: (document.getElementById('v')||{}).videoWidth || 0, r: document.querySelector('.root') ? document.querySelector('.root').getBoundingClientRect().width : 0, d: devicePixelRatio};"#,
-                )
-                .await;
-                batch.push(t0.elapsed().as_micros());
-            }
-            let batch_p50 = pct(&mut batch, 0.50);
-            let batch_p95 = pct(&mut batch, 0.95);
-            log::info!("bench batched read (50 evals): p50={batch_p50}µs p95={batch_p95}µs");
+            let (rtt_min, rtt_p50, rtt_p95, rtt_max, batch_p50, batch_p95) =
+                eval_phase("idle").await;
 
             let mut e = document::eval(
                 r#"for (let i = 0; i < 300; i++) { dioxus.send({i, t: performance.now(), w: innerWidth}); await new Promise(r => requestAnimationFrame(r)); } return 'done';"#,
@@ -423,6 +399,30 @@ if (!window.__pharosKeys) {
             log::info!(
                 "bench push throughput (300 frames): gap p50={gap_p50}µs p95={gap_p95}µs max={gap_max}µs total={total_ms}ms"
             );
+
+            // Phase 2: the same reads while a muted 1080p H.264 clip loops.
+            let started = document::eval(&format!(
+                r#"const v = document.getElementById('v');
+v.parentElement.hidden = false;
+v.muted = true; v.volume = 0; v.loop = true;
+const b64 = {b64};
+const bin = atob(b64); const u = new Uint8Array(bin.length);
+for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i);
+v.src = URL.createObjectURL(new Blob([u], {{type: 'video/mp4'}}));
+try {{ await v.play(); }} catch (e) {{ return 'play() ' + e; }}
+await new Promise(r => setTimeout(r, 3000));
+const q = v.getVideoPlaybackQuality ? v.getVideoPlaybackQuality() : {{}};
+return 'playing t=' + v.currentTime.toFixed(2) + ' ' + v.videoWidth + 'x' + v.videoHeight + ' paused=' + v.paused + ' muted=' + v.muted + ' frames=' + q.totalVideoFrames + ' dropped=' + q.droppedVideoFrames;"#,
+                b64 = serde_json::to_string(LOOP_MP4_B64).unwrap_or_default()
+            ))
+            .await;
+            log::info!("bench playback start: {started:?}");
+            let _ = eval_phase("playing").await;
+            let after = document::eval(
+                r#"const v = document.getElementById('v'); const q = v.getVideoPlaybackQuality ? v.getVideoPlaybackQuality() : {}; return 't=' + v.currentTime.toFixed(2) + ' paused=' + v.paused + ' muted=' + v.muted + ' frames=' + q.totalVideoFrames + ' dropped=' + q.droppedVideoFrames;"#,
+            )
+            .await;
+            log::info!("bench playback end: {after:?}");
 
             let summary = format!(
                 "bench: rtt min={rtt_min} p50={rtt_p50} p95={rtt_p95} max={rtt_max}µs | batch p50={batch_p50} p95={batch_p95}µs | push gap p50={gap_p50} p95={gap_p95} max={gap_max}µs ({total_ms}ms)"
@@ -486,6 +486,43 @@ if (!window.__pharosKeys) {
                 }
             }
         }
+    }
+
+    const LOOP_MP4_B64: &str = include_str!("../../assets/bench/loop.mp4.b64");
+
+    /// 500 single reads and 100 batched reads; logs and returns the percentiles.
+    async fn eval_phase(label: &str) -> (u128, u128, u128, u128, u128, u128) {
+        let mut rtt = Vec::with_capacity(500);
+        for _ in 0..500 {
+            let t0 = std::time::Instant::now();
+            let _ = document::eval("return document.querySelectorAll('.tile').length;").await;
+            rtt.push(t0.elapsed().as_micros());
+        }
+        let rtt_min = rtt.iter().copied().min().unwrap_or(0);
+        let rtt_max = rtt.iter().copied().max().unwrap_or(0);
+        let rtt_p50 = pct(&mut rtt, 0.50);
+        let rtt_p95 = pct(&mut rtt, 0.95);
+        let rtt_p99 = pct(&mut rtt, 0.99);
+        log::info!(
+            "bench {label} rtt (500 evals): min={rtt_min}µs p50={rtt_p50}µs p95={rtt_p95}µs p99={rtt_p99}µs max={rtt_max}µs"
+        );
+        let mut batch = Vec::with_capacity(100);
+        for _ in 0..100 {
+            let t0 = std::time::Instant::now();
+            let _ = document::eval(
+                r#"return {w: innerWidth, h: innerHeight, sy: scrollY, a: document.activeElement && document.activeElement.className, n: document.querySelectorAll('.tile').length, t: (document.getElementById('v')||{}).currentTime || 0, p: (document.getElementById('v')||{}).paused, vw: (document.getElementById('v')||{}).videoWidth || 0, r: document.querySelector('.root') ? document.querySelector('.root').getBoundingClientRect().width : 0, d: devicePixelRatio};"#,
+            )
+            .await;
+            batch.push(t0.elapsed().as_micros());
+        }
+        let batch_max = batch.iter().copied().max().unwrap_or(0);
+        let batch_p50 = pct(&mut batch, 0.50);
+        let batch_p95 = pct(&mut batch, 0.95);
+        let batch_p99 = pct(&mut batch, 0.99);
+        log::info!(
+            "bench {label} batched read (100 evals): p50={batch_p50}µs p95={batch_p95}µs p99={batch_p99}µs max={batch_max}µs"
+        );
+        (rtt_min, rtt_p50, rtt_p95, rtt_max, batch_p50, batch_p95)
     }
 
     fn pct(v: &mut Vec<u128>, p: f64) -> u128 {
