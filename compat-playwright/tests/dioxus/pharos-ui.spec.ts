@@ -331,7 +331,8 @@ test.describe("pharos Dioxus UI", () => {
       await account.click();
       // Not an admin: no Manage.
       await expect(page.getByRole("menuitem", { name: "Manage" })).toHaveCount(0);
-      await page.getByRole("menuitem", { name: "Account" }).click();
+      await page.getByRole("menuitem", { name: "Settings" }).click();
+      await page.getByRole("link", { name: "Account", exact: true }).click();
       await expect(page).toHaveURL(/\/ui\/settings\/account$/);
 
       const form = page.locator("form#change-password");
@@ -465,7 +466,8 @@ test.describe("pharos Dioxus UI", () => {
       const account = page.getByRole("button", { name: "Account", exact: true });
       await expect(account.locator("img")).toHaveCount(0);
       await account.click();
-      await page.getByRole("menuitem", { name: "Account" }).click();
+      await page.getByRole("menuitem", { name: "Settings" }).click();
+      await page.getByRole("link", { name: "Account", exact: true }).click();
 
       // A noisy picture well over the 768 KiB a message may carry, so the
       // browser has to scale it down before it sends it.
@@ -2912,7 +2914,7 @@ test.describe("pharos Dioxus UI", () => {
       await page.locator("#signin-password").fill(TEST_PASS);
       await page.getByRole("button", { name: "Sign in" }).click();
       await page.getByRole("button", { name: "Account", exact: true }).click();
-      await page.getByRole("menuitem", { name: "Appearance" }).click();
+      await page.getByRole("menuitem", { name: "Settings" }).click();
       await expect(page.getByRole("menu")).toHaveCount(0);
       await expect(page).toHaveURL(/\/ui\/settings\/appearance$/);
       await expect(page.locator("li.pharos-theme-card")).toHaveCount(7);
