@@ -59,29 +59,49 @@ pub(crate) async fn sample_pool<DB: Database>(
                 .increment(1);
             tracing::warn!(backend, %error, waited, "pool acquire probe failed");
         }
-        Err(_) if idle == 0 => {
-            metrics::counter!("pharos_db_pool_acquire_errors_total", "backend" => backend)
-                .increment(1);
-            tracing::warn!(
-                backend,
-                waited,
-                size,
-                idle,
-                "pool acquire probe timed out; pool saturated"
-            );
-        }
-        // Idle connections and still no slot: the slots belong to waiters
-        // that were never resumed or dropped (B730), not to queries.
         Err(_) => {
             metrics::counter!("pharos_db_pool_acquire_errors_total", "backend" => backend)
                 .increment(1);
-            tracing::error!(
-                backend,
-                waited,
-                size,
-                idle,
-                "pool acquire probe timed out with idle connections; slots held by stalled waiters"
-            );
+            // Classify by the state at the timeout, not at the sample: the
+            // pool can fill or drain while the probe waits.
+            let (size, idle) = (pool.size(), pool.num_idle());
+            match ProbeTimeout::at(idle) {
+                ProbeTimeout::Saturated => tracing::warn!(
+                    backend,
+                    waited,
+                    size,
+                    idle,
+                    "pool acquire probe timed out; pool saturated"
+                ),
+                ProbeTimeout::StalledWaiters => tracing::error!(
+                    backend,
+                    waited,
+                    size,
+                    idle,
+                    "pool acquire probe timed out with idle connections; slots held by stalled waiters"
+                ),
+            }
+        }
+    }
+}
+
+/// Why a probe found no slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProbeTimeout {
+    /// Every connection is checked out: the queries are the load.
+    Saturated,
+    /// Connections sit idle and still no slot: the slots belong to waiters
+    /// that were never resumed or dropped (B730), not to queries.
+    StalledWaiters,
+}
+
+impl ProbeTimeout {
+    /// From the idle count read when the probe timed out.
+    fn at(idle: usize) -> Self {
+        if idle == 0 {
+            Self::Saturated
+        } else {
+            Self::StalledWaiters
         }
     }
 }
@@ -257,6 +277,13 @@ mod tests {
             _ => None,
         });
         assert_eq!(errors, Some(1), "the probe finds no slot");
+    }
+
+    #[test]
+    fn a_probe_timeout_blames_stalled_waiters_only_with_idle_connections() {
+        assert_eq!(ProbeTimeout::at(0), ProbeTimeout::Saturated);
+        assert_eq!(ProbeTimeout::at(1), ProbeTimeout::StalledWaiters);
+        assert_eq!(ProbeTimeout::at(8), ProbeTimeout::StalledWaiters);
     }
 
     #[test]
