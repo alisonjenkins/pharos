@@ -487,6 +487,12 @@ pub struct ServerConfig {
     /// yields no frame and the image 404s).
     #[serde(default = "default_image_seek_seconds")]
     pub image_seek_seconds: u32,
+    /// ADR-0073 / V712 — refuse an image request that carries no credential
+    /// and no `tag=` this server minted for that image. Off by default:
+    /// `pharos_image_tag_check_total{verdict}` counts the verdict either way,
+    /// so turn this on once `invalid` and `absent` have gone quiet.
+    #[serde(default)]
+    pub image_tags_enforced: bool,
     /// Soft cap on the extracted-image cache (posters / backdrops / thumbs /
     /// scaled sidecar artwork / chapter thumbs), in bytes. `0` = unbounded
     /// (no janitor — the historical behaviour). When non-zero a periodic
