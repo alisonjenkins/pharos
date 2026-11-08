@@ -2131,6 +2131,12 @@ fn NativeApp(route: Route) -> Element {
         };
         let reconnecting = machine.read().reconnecting();
         let me = me.read().clone().flatten();
+        // The update notice waits while the full player is up: it sat over
+        // the picture for the whole film, and nothing in it is urgent there.
+        let on_player = {
+            let stage = stage.read();
+            stage.item.is_some() && stage.view == View::Full
+        };
         return rsx! {
             Shell {
                 libraries: libraries(),
@@ -2159,7 +2165,7 @@ fn NativeApp(route: Route) -> Element {
                     }
                 },
                 search: rsx! { TopSearch {} },
-                if outdated() {
+                if outdated() && !on_player {
                     if platform::can_reload() {
                         p { class: "pharos-error", role: "alert",
                             "Pharos has been updated. Reload to keep using it. "
