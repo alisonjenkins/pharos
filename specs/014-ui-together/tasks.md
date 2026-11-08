@@ -145,3 +145,8 @@ runs before each push (CLAUDE.md).
 - [x] T050 [US1] UI: a reloaded tab joins its group again from the id it kept
   in sessionStorage (B665, V616). Two-browser Playwright: B reloads mid-film
   and is back in the group, in step.
+- [x] T051 [US1] UI: starting a group from the player while the video plays
+  neither seeks nor stalls it; a small gap to the group is closed by rate
+  (B761, V711). Playwright, direct, hls.js and Rust HLS engines in Chromium
+  and Firefox: no seeking, waiting or pause event in the 6 s after Watch
+  together.
