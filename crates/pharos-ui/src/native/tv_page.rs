@@ -243,6 +243,9 @@ pub struct Media {
     pub dropped: u64,
     #[serde(default)]
     pub frames: u64,
+    /// A throttled `timeupdate`, which Rust hears only this way.
+    #[serde(default)]
+    pub tick: bool,
 }
 
 fn one() -> f64 {
@@ -441,6 +444,13 @@ mod tests {
         assert_eq!(m.position_ms(60_000.0), 20_000, "never past the end");
         assert_eq!(m.duration_ms(), 20_000);
         assert!(m.has_data());
+        assert!(!m.tick, "only a throttled timeupdate is a tick");
+        let mut ticked = v.clone();
+        ticked["tick"] = serde_json::json!(true);
+        assert!(matches!(
+            parse_bridge(&ticked),
+            Some(Bridge::Media(Media { tick: true, .. }))
+        ));
         let paused = Media {
             paused: true,
             ..m.clone()
