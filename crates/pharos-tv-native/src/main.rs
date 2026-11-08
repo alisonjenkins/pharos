@@ -2,10 +2,17 @@
 //! (Blitz) on Android TV, no WebView. Renders the home rails, a 120-poster
 //! grid and logs every key with its timing under the `pharos-bench` tag.
 //!
-//! Fixture data only; the live server comes with slice 1.
+//! On the TV it loads home and a library from the live server (signing in
+//! by QuickConnect the first time); on the host it shows fixture data.
 
 use dioxus::prelude::*;
 
+#[cfg(target_os = "android")]
+mod launch;
+#[cfg(target_os = "android")]
+mod live;
+#[cfg(target_os = "android")]
+mod net;
 mod screens;
 use screens::{Data, Screen, Spike};
 
@@ -39,7 +46,11 @@ fn android_main(app: android_activity::AndroidApp) {
         anyrender_vello_hybrid::set_wait_for_gpu(wait);
     }
     log::info!("pharos-tv-native start");
-    main();
+    live::start();
+    match url::Url::parse(&live::server()) {
+        Ok(server) => launch::launch(root, server),
+        Err(e) => log::error!("server address: {e}"),
+    }
 }
 
 /// Blitz's `log-times` feature writes frame and phase times to stdout, which
@@ -68,6 +79,34 @@ fn main() {
     dioxus_native::launch(root);
 }
 
+#[cfg(not(target_os = "android"))]
 fn root() -> Element {
     rsx! { Spike { start: Screen::Home, data: Data::fixture() } }
+}
+
+/// Fixture data until the live server answers; then its home and library.
+#[cfg(target_os = "android")]
+fn root() -> Element {
+    let mut data = use_signal(Data::fixture);
+    let mut notice = use_signal(|| Some("Connecting…".to_owned()));
+    use_hook(|| {
+        if let Some(mut events) = live::take_events() {
+            spawn(async move {
+                use futures_util::StreamExt;
+                while let Some(event) = events.next().await {
+                    match event {
+                        live::Event::Code(code) => {
+                            notice.set(Some(format!("Approve this TV with code {code}")));
+                        }
+                        live::Event::Ready { home, grid } => {
+                            data.set(Data::new(&home, grid.items));
+                            notice.set(None);
+                        }
+                        live::Event::Failed(e) => notice.set(Some(format!("Offline: {e}"))),
+                    }
+                }
+            });
+        }
+    });
+    rsx! { Spike { start: Screen::Home, data: data(), notice: notice() } }
 }

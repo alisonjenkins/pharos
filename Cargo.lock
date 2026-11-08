@@ -7116,6 +7116,8 @@ dependencies = [
  "dioxus-native",
  "dioxus-native-dom",
  "fontique",
+ "futures-channel",
+ "futures-util",
  "keyboard-types",
  "libc",
  "log",
@@ -7123,6 +7125,9 @@ dependencies = [
  "pharos-client",
  "pharos-ui",
  "png 0.17.16",
+ "reqwest",
+ "tokio",
+ "url",
 ]
 
 [[package]]

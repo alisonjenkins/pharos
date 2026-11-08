@@ -32,6 +32,13 @@ blitz-shell = "=0.3.0-beta.4"
 # under dx does not resolve (unexplained; LTO dropped it in the smoke app).
 # The deprecated bionic calls exist on every API level.
 android-properties = { version = "0.2", features = ["bionic-deprecated"] }
+# The live server (src/live.rs) and the image fetcher (src/net.rs).
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "time", "sync"] }
+futures-channel = "0.3"
+futures-util = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+url = "2"
+blitz-traits = "=0.3.0-beta.4"
 # Only for its spike switch, set_wait_for_gpu.
 anyrender_vello_hybrid = { version = "=0.11.0", optional = true }
 
