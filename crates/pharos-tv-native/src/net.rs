@@ -11,6 +11,38 @@ use tokio::sync::Semaphore;
 /// this also bounds how many decodes queue up behind a grid's first paint.
 const MAX_IN_FLIGHT: usize = 4;
 
+/// Blitz ignores `srcset` and `sizes`, so the shared `Art` component's
+/// fallback (the server's largest Primary width, 480) is what it fetches. A
+/// poster tile is 288 device px wide at 1080p, so the spike asks for the
+/// server's next width up instead; `setprop debug.pharos.art_width 480`
+/// restores the fallback for comparison.
+fn art_width() -> &'static str {
+    static WIDTH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    WIDTH.get_or_init(|| {
+        android_properties::getprop("debug.pharos.art_width")
+            .value()
+            .filter(|w| w.parse::<u32>().is_ok())
+            .unwrap_or_else(|| "360".to_owned())
+    })
+}
+
+/// `url` with its `fillWidth` replaced by [`art_width`]; others unchanged.
+fn sized(url: &url::Url) -> url::Url {
+    if !url.query_pairs().any(|(k, _)| k == "fillWidth") {
+        return url.clone();
+    }
+    let pairs: Vec<(String, String)> = url
+        .query_pairs()
+        .map(|(k, v)| {
+            let v = if k == "fillWidth" { art_width().to_owned() } else { v.into_owned() };
+            (k.into_owned(), v)
+        })
+        .collect();
+    let mut out = url.clone();
+    out.query_pairs_mut().clear().extend_pairs(pairs);
+    out
+}
+
 pub struct PharosNet {
     client: reqwest::Client,
     origin: url::Origin,
@@ -52,12 +84,12 @@ impl NetProvider for PharosNet {
                 return;
             };
             let started = Instant::now();
-            let mut get = client.get(url.clone());
+            let mut get = client.get(sized(&url));
             if let Some(token) = &token {
                 get = get.bearer_auth(token);
             }
             // The query is a public cache tag and a size, never a credential.
-            let path = format!("{}?{}", url.path(), url.query().unwrap_or(""));
+            let path = format!("{}?{}", url.path(), sized(&url).query().unwrap_or(""));
             match get.send().await {
                 Ok(resp) => {
                     let status = resp.status().as_u16();
