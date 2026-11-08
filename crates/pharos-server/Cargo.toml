@@ -73,6 +73,12 @@ workspace-hack = { version = "0.1", path = "../../workspace-hack" }
 skera = { version = "0.9.0", default-features = false }
 read-fonts = { version = "0.46", default-features = false, features = ["std"] }
 
+# glibc malloc kept ~1.6 GiB of freed memory in per-thread arenas under
+# playback load (ADR-0074). Unprefixed, so libav's in-process allocations move
+# to jemalloc too. Linux only: the target the server ships on.
+[target.'cfg(target_os = "linux")'.dependencies]
+tikv-jemallocator.workspace = true
+
 [features]
 # P48 — ffmpeg backend selection. Mutually exclusive — pick one. Default is
 # the in-process libav backend (the hybrid: libav tiny-op worker pool +

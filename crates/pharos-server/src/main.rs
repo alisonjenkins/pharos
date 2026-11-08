@@ -16,6 +16,28 @@ use pharos_sync::{ws::TokenResolverData, GroupRegistry};
 use std::io::Write;
 use tracing_actix_web::TracingLogger;
 
+#[cfg(target_os = "linux")]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+/// jemalloc's build-time options, read once at its first allocation. A
+/// background thread returns dirty pages after about a second instead of on
+/// the next allocation, and muzzy pages are released at once, so RSS falls
+/// back soon after a burst of requests ends. `MALLOC_CONF` in the environment
+/// still overrides any of these.
+#[cfg(target_os = "linux")]
+#[unsafe(export_name = "malloc_conf")]
+static MALLOC_CONF: MallocConf =
+    MallocConf(c"background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:0".as_ptr());
+
+#[cfg(target_os = "linux")]
+#[repr(transparent)]
+struct MallocConf(*const std::ffi::c_char);
+
+// SAFETY: the pointer is to a 'static, immutable C string literal.
+#[cfg(target_os = "linux")]
+unsafe impl Sync for MallocConf {}
+
 #[derive(Debug, thiserror::Error)]
 enum AppError {
     #[error("config: {0}")]
