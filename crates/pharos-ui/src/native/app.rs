@@ -467,6 +467,9 @@ fn remember_volume(volume: f64, muted: bool) {
 /// one). The choice limits video only: a song above it still plays as stored.
 fn negotiation_capabilities(kind: ItemKind, auto: u64) -> pharos_client::api::Capabilities {
     let chosen = stored_bitrate(MAX_BITRATE_KEY, parse_max_bitrate);
+    // The Rust engine picks the quality itself: a cap auto quality settled on
+    // under hls.js would otherwise hold the server's ladder down for good.
+    let auto = if hls_engine_adapts() { 0 } else { auto };
     let caps = with_max_bitrate(
         platform::capabilities(),
         kind,
@@ -774,6 +777,18 @@ pub(super) fn crossfade_seconds() -> u32 {
     };
     CROSSFADE_S.set(Some(seconds));
     seconds
+}
+
+/// Whether an HLS stream on this device plays through an engine that adapts
+/// its own quality.
+fn hls_engine_adapts() -> bool {
+    choose_engine(
+        true,
+        platform::plays_hls(),
+        platform::has_mse(),
+        mse_engine_choice().0,
+    )
+    .adapts_quality()
 }
 
 /// This page load's HLS engine and why (V630).
@@ -3987,11 +4002,13 @@ fn Player(
             let (retiring, decided) = (Rc::clone(&retiring), Rc::clone(&decided));
             spawn(async move {
                 let on_fatal: OnFatal = Rc::new(move |reason| fatal.send(reason));
+                let adapts = p.engine.adapts_quality();
                 let on_fragment: OnFragment = {
                     let (watch, assess) = (watch.clone(), Rc::clone(&assess));
                     Rc::new(move |load| {
-                        // Handing over, or already decided: no more downloads count.
-                        if retiring.get() || decided.get() {
+                        // Handing over, or already decided: no more downloads
+                        // count. An engine that adapts itself needs no help.
+                        if adapts || retiring.get() || decided.get() {
                             return;
                         }
                         watch
