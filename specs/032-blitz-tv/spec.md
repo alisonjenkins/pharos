@@ -118,7 +118,7 @@ Any fail goes to Alison with the numbers before slice 1 starts. A pass on everyt
 
 ## Slices
 
-0. **Spike.** A `pharos-tv-native` bin builds for `armv7-linux-androideabi` with its own application id, `com.alisonjenkins.pharos.tv.native`, so it installs beside the WebView app and never over it. It renders the three screens above from fixture data and from the live server, runs the renderer matrix, and records the go/no-go table. Results in `spike-0.md`.
+0. **Spike.** A `pharos-tv-native` bin builds for `armv7-linux-androideabi` with its own application id, `com.alisonjenkins.pharos.tvnative`, so it installs beside the WebView app and never over it. It renders the three screens above from fixture data and from the live server, runs the renderer matrix, and records the go/no-go table. Results in `spike-0.md`.
 1. **Platform module.** `native/blitz.rs` against the shared surface; sign-in and socket reused from `android.rs`; Back and media keys; Nix build and signing as spec 025.
 2. **Ten-foot UI on Blitz.** Spec 011 spatial focus driven from Rust; CSS gaps closed upstream or with TV styles.
 3. **Native player.** `pharos-hls` sample feeder into `AMediaCodec`, `ASurfaceControl` video layer, AAudio, `pharos-subs` overlay, `Capabilities` from `AMediaCodecList`-equivalent probing. Playback signals as 013.
@@ -139,6 +139,7 @@ Read from the published crates and the Dioxus/Blitz repositories on 2026-11-08, 
 | Area | Finding | Consequence |
 |---|---|---|
 | Packaging | `dx` 0.7.10 and 0.8.0-alpha.3 always generate a `WryActivity` (WebView) for Android; `--native` only affects desktop | The manifest override from spec 025 points the launcher at the framework's `android.app.NativeActivity` with `android.app.lib_name = main`, so no Kotlin or Java is written. Upstream fix: `dx` picks `NativeActivity` for the native renderer |
+| Linking | dx 0.7.10 links Android binaries against the API 24 libc whatever `min_sdk` says; `android-properties` (through `android-activity`) needs `__system_property_read_callback` (API 26) | Built with an extra `-L` to the API 28 libc; upstream fix: dx passes `min_sdk` to the link. Application ids must avoid Java keywords (`tv.native` fails in Gradle) |
 | Activity | dioxus-native 0.7.10 → blitz-shell 0.2 → winit 0.30 with `android-activity` `native-activity` | Matches the manifest above |
 | Keys | winit maps D-pad to arrow keys, D-pad centre to Enter, Back to `BrowserBack`, media keys to `Media*`; it marks every key but volume as handled | Back reaches the app as a key (`use_back_button`) and never finishes the activity on its own, so leaving at home is ours to do |
 | Renderer | 0.7.10 hard-wires GPU Vello (wgpu, Vulkan or GLES); Vello CPU only on the iOS simulator. 0.8 alpha makes Vello, Vello CPU, Vello hybrid (its default), Skia and Skia raster features | Testing anything but GPU Vello needs a patched 0.7.10 or 0.8. Open wgpu/Vello issues on Mali GPUs (wgpu #10186, #8937; vello #1816, #1465) |
