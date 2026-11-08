@@ -9,5 +9,6 @@ pub mod abr;
 pub mod fmp4;
 pub mod planner;
 pub mod playlist;
+pub mod stall;
 pub mod timeline;
 pub mod uri;
