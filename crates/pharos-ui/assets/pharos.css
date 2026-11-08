@@ -1799,10 +1799,15 @@ body:has(.pharos-stage.is-full) .pharos-error {
   background-repeat: no-repeat;
   zoom: 0.5;
 }
+/* B750: the skip button and "Up next" sit over the top of
+   .pharos-controls, whose gradient padding comes later in the page and
+   would take the pointer from their lower half; they stand above it.
+   The seek preview, inside the controls, still rises over both. */
 .pharos-skip {
   position: absolute;
   right: 1rem;
   bottom: 5.5rem;
+  z-index: 1;
   padding: 0.6rem 1.2rem;
   border: 1px solid rgb(255 255 255 / 0.6); /* not themed: controls sit on the video, whose colours no theme sets */
   border-radius: 6px;
@@ -1810,6 +1815,9 @@ body:has(.pharos-stage.is-full) .pharos-error {
   color: #fff; /* not themed: controls sit on the video, whose colours no theme sets */
   font-size: 1rem;
   cursor: pointer;
+}
+.pharos-controls:has(.pharos-seek-preview) {
+  z-index: 2;
 }
 .pharos-skip:hover,
 .pharos-skip:focus-visible {
@@ -1823,6 +1831,7 @@ body:has(.pharos-stage.is-full) .pharos-error {
   position: absolute;
   right: 1rem;
   bottom: 5.5rem;
+  z-index: 1;
   display: flex;
   gap: 0.9rem;
   align-items: flex-start;
