@@ -762,7 +762,7 @@ pub fn PaletteView(
                 // not only from the input: Tab onto a result and Esc did
                 // nothing (B839). The input handles its own Esc and stops it.
                 onkeydown: move |evt: KeyboardEvent| {
-                    if evt.key() == Key::Escape {
+                    if evt.key() == Key::Named(NamedKey::Escape) {
                         evt.prevent_default();
                         on_close.call(());
                     }
@@ -781,7 +781,7 @@ pub fn PaletteView(
                     value: "{text}",
                     oninput: move |evt: FormEvent| on_input.call(evt.value()),
                     onkeydown: move |evt: KeyboardEvent| {
-                        if evt.key() == Key::Escape {
+                        if evt.key() == Key::Named(NamedKey::Escape) {
                             evt.stop_propagation();
                         }
                         on_key.call(evt)

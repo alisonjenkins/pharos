@@ -67,6 +67,26 @@
         };
 
 
+        # `dx` must match the Dioxus version the workspace locks
+        # (0.8.0-alpha.3, ADR-0078); nixpkgs ships 0.7. Built with the pinned
+        # toolchain: dioxus-cli 0.8 needs rustc 1.93. Bump version and both
+        # hashes together with the `dioxus` workspace dep.
+        dioxusCli = (pkgs.makeRustPlatform { cargo = rustToolchain; rustc = rustToolchain; }).buildRustPackage rec {
+          pname = "dioxus-cli";
+          version = "0.8.0-alpha.3";
+          src = pkgs.fetchCrate {
+            inherit pname version;
+            hash = "sha256-n1Lk9eCjr1vGqvCDbrOmbU7TTvdcGdx/chRsj4Z3a+Q=";
+          };
+          cargoHash = "sha256-nqGrW0Sf7DWdrSXSKcSl+FlO+1NY4uZA7G7G4AGItuw=";
+          buildFeatures = [ "no-downloads" "disable-telemetry" ];
+          env.OPENSSL_NO_VENDOR = 1;
+          nativeBuildInputs = [ pkgs.pkg-config pkgs.cacert pkgs.makeWrapper ];
+          buildInputs = [ pkgs.openssl ];
+          doCheck = false;
+          meta.mainProgram = "dx";
+        };
+
         # Source for the cargo-based binary build (exclude build outputs).
         repoSrc = pkgs.lib.cleanSourceWith {
           src = ./.;
@@ -794,7 +814,9 @@
           src = uiSrc;
           nativeBuildInputs = [
             rustToolchain
-            pkgs.dioxus-cli
+            dioxusCli
+            # dx 0.8 minifies JS with esbuild and cannot download it here.
+            pkgs.esbuild
             wasmBindgenCli
             pkgs.binaryen
             # pharos-api's build script compiles the schema with `capnp`.
@@ -1303,7 +1325,8 @@
             pkgs.cargo-guppy
             pkgs.cargo-hakari
             pkgs.cargo-audit
-            pkgs.dioxus-cli
+            dioxusCli
+            pkgs.esbuild
             wasmBindgenCli
             # 017 — Cap'n Proto compiler for pharos-api's capnpc build step.
             pkgs.capnproto
@@ -1437,7 +1460,7 @@
                 android_sdk.accept_license = true;
               };
             };
-            # dx 0.7 generates a Gradle project with compileSdk/targetSdk 34.
+            # dx 0.8 generates a Gradle project with compileSdk/targetSdk 34.
             sdk = apkgs.androidenv.composeAndroidPackages {
               platformVersions = [ "34" ];
               buildToolsVersions = [ "34.0.0" "35.0.0" ];
@@ -1456,7 +1479,8 @@
           apkgs.mkShell {
             packages = [
               androidToolchain
-              pkgs.dioxus-cli
+              dioxusCli
+              pkgs.esbuild
               pkgs.capnproto
               pkgs.pkg-config
               apkgs.jdk17

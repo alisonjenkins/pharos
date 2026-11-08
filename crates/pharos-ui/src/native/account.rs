@@ -65,7 +65,7 @@ pub fn AccountMenuView(
         div {
             class: "pharos-account",
             onkeydown: move |evt: KeyboardEvent| {
-                if open && evt.key() == Key::Escape {
+                if open && evt.key() == Key::Named(NamedKey::Escape) {
                     on_close.call(());
                 }
             },
