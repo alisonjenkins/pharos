@@ -357,3 +357,85 @@ async fn the_primary_tag_and_the_primary_image_always_agree() {
          negative case has stopped being tested"
     );
 }
+
+/// ADR-0073 / V712 — the tag a listing hands out is the tag an anonymous
+/// image request must echo. Runs the response-signing layer the server wraps
+/// around every route, then fetches each advertised cover the way the
+/// Android app does: no credential, `?tag=` from the listing. With
+/// enforcement on, that is served and the same URL without the tag is not.
+#[actix_web::test]
+async fn an_anonymous_fetch_with_the_listed_tag_is_served_when_enforced() {
+    let fx = scan_books().await;
+
+    let auth = BuiltinAuth::new(fx.stores.clone());
+    let hash = auth.hash_password(&SecretString::new("p")).unwrap();
+    let uid = UserId::new();
+    fx.stores
+        .create(UserRecord {
+            id: uid,
+            name: "u".into(),
+            password_hash: hash,
+            policy: UserPolicy::default(),
+        })
+        .await
+        .unwrap();
+    let token = fx.stores.issue(uid, "t").await.unwrap();
+    let token = token.0.expose().to_string();
+
+    let mut state = AppState::new(fx.stores.clone(), "srv".into())
+        .with_image_cache(ImageCache::new(fx.cache_dir.path().to_path_buf()));
+    state.image_tags_enforced = true;
+    let app = test::init_service(
+        App::new()
+            .app_data(web::Data::new(state))
+            .wrap(actix_web::middleware::from_fn(
+                pharos_server::middleware::sign_image_tags,
+            ))
+            .wrap(LowercasePath)
+            .configure(jellyfin::configure),
+    )
+    .await;
+
+    let req = test::TestRequest::get()
+        .uri("/Items?IncludeItemTypes=Book")
+        .insert_header(auth_header!(&token))
+        .to_request();
+    let body: serde_json::Value = test::read_body_json(test::call_service(&app, req).await).await;
+    let items = body["Items"].as_array().expect("a list of books");
+
+    let mut fetched = 0;
+    for item in items {
+        let id = item["Id"].as_str().unwrap();
+        let Some(tag) = item["ImageTags"]["Primary"].as_str() else {
+            continue;
+        };
+        let with_tag = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri(&format!(
+                    "/Items/{id}/Images/Primary?fillWidth=240&tag={tag}"
+                ))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(
+            with_tag.status(),
+            StatusCode::OK,
+            "the listed tag {tag} must authorise an anonymous fetch of {id}"
+        );
+        let without = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri(&format!("/Items/{id}/Images/Primary"))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(
+            without.status(),
+            StatusCode::UNAUTHORIZED,
+            "{id} without a tag"
+        );
+        fetched += 1;
+    }
+    assert_eq!(fetched, 2, "both covered books must have been fetched");
+}
