@@ -2,39 +2,102 @@
 
 from __future__ import annotations
 
-from typing import Any
+import ctypes
+import ctypes.util
+import gc
+import logging
+import threading
+import time
+from typing import Any, Callable
+
 import torch
 import torchaudio
+
+logger = logging.getLogger("pharos_aligner")
 
 # MMS_FA's wildcard label, matching any audio that is not the transcript.
 STAR = "*"
 
+Clock = Callable[[], float]
+
+
+def _release_freed_memory() -> None:
+    """Hand glibc's freed heap pages back to the kernel."""
+    # The weights' smaller tensors sit in malloc arenas, which glibc keeps
+    # after free; without a trim the unload barely moves RSS.
+    name = ctypes.util.find_library("c")
+    if name is None:
+        return
+    try:
+        ctypes.CDLL(name).malloc_trim(0)
+    except (OSError, AttributeError):
+        logger.debug("malloc_trim unavailable", exc_info=True)
+
 
 class Aligner:
-    """Lazy-loaded multilingual forced aligner using torchaudio MMS_FA."""
+    """Lazy-loaded multilingual forced aligner using torchaudio MMS_FA.
 
-    def __init__(self) -> None:
+    With `idle_unload_s` set, `unload_if_idle` drops the model once no
+    alignment has run for that long; the next alignment loads it again.
+    """
+
+    def __init__(self, idle_unload_s: float | None = None, clock: Clock = time.monotonic) -> None:
         self._model: Any = None
         self._tokenizer: Any = None
         self._aligner: Any = None
+        self._idle_unload_s = idle_unload_s
+        self._clock = clock
+        self._last_used = clock()
+        # align and unload_if_idle run on different threads.
+        self._lock = threading.Lock()
+
+    @property
+    def loaded(self) -> bool:
+        return self._model is not None
+
+    def _load(self) -> tuple[Any, Any, Any]:
+        bundle = torchaudio.pipelines.MMS_FA
+        model = bundle.get_model()
+        model.eval()
+        return model, bundle.get_tokenizer(), bundle.get_aligner()
 
     def _ensure_loaded(self) -> None:
         if self._model is not None:
             return
-        bundle = torchaudio.pipelines.MMS_FA
-        model = bundle.get_model()
-        model.eval()
-        self._model = model
-        self._tokenizer = bundle.get_tokenizer()
-        self._aligner = bundle.get_aligner()
+        started = time.monotonic()
+        self._model, self._tokenizer, self._aligner = self._load()
+        logger.info("model loaded in %d ms", int((time.monotonic() - started) * 1000))
+
+    def unload_if_idle(self) -> bool:
+        """Drop the model if it has sat unused for the idle timeout; True if it did."""
+        if self._idle_unload_s is None:
+            return False
+        with self._lock:
+            if self._model is None:
+                return False
+            idle_s = self._clock() - self._last_used
+            if idle_s < self._idle_unload_s:
+                return False
+            self._model = None
+            self._tokenizer = None
+            self._aligner = None
+            gc.collect()
+            _release_freed_memory()
+        logger.info("model unloaded after %d s idle", int(idle_s))
+        return True
 
     def align(self, pcm_f32le: bytes, tokens: list[str]) -> list[tuple[int, int]]:
         """Align tokens against 16kHz float32 PCM audio, returning (start_ms, end_ms) per word."""
         if not pcm_f32le or not tokens:
             return []
+        with self._lock:
+            try:
+                self._ensure_loaded()
+                return self._align_loaded(pcm_f32le, tokens)
+            finally:
+                self._last_used = self._clock()
 
-        self._ensure_loaded()
-
+    def _align_loaded(self, pcm_f32le: bytes, tokens: list[str]) -> list[tuple[int, int]]:
         waveform = torch.frombuffer(bytearray(pcm_f32le), dtype=torch.float32).unsqueeze(0)
         n_samples = waveform.size(1)
         if n_samples == 0:
@@ -69,3 +132,19 @@ class Aligner:
             end_ms = int(word_spans[-1].end * ratio)
             result.append((start_ms, end_ms))
         return result
+
+
+def start_idle_reaper(aligner: Aligner, interval_s: float) -> threading.Thread:
+    """Check every `interval_s` seconds whether the model has idled out."""
+
+    def run() -> None:
+        while True:
+            time.sleep(interval_s)
+            try:
+                aligner.unload_if_idle()
+            except Exception:
+                logger.exception("idle unload failed")
+
+    thread = threading.Thread(target=run, name="aligner-idle-reaper", daemon=True)
+    thread.start()
+    return thread
