@@ -1110,8 +1110,14 @@ if (!v) throw new Error("no <video id=" + id + ">");
 window.__pharosHls = window.__pharosHls || {{}};
 if (window.__pharosHls[id]) window.__pharosHls[id].destroy();
 const token = {token};
+// The G08 has 2.4 GB and swaps: keep 10 s behind the playhead (the
+// default keeps all it can, ~70 s seen) and at most 60 s or 40 MB ahead.
 const h = new Hls({{
   startPosition: {start},
+  backBufferLength: 10,
+  maxBufferLength: 30,
+  maxMaxBufferLength: 60,
+  maxBufferSize: 40 * 1000 * 1000,
   xhrSetup: (xhr) => {{ if (token) xhr.setRequestHeader('X-Emby-Token', token); }},
 }});
 h.__pharosGen = {generation};
