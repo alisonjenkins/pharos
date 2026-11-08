@@ -1168,6 +1168,45 @@ where
         after_progress
     );
 
+    // Folding a copy's row into its item keeps the furthest state of the
+    // two: played and favourite stay set, resume follows the later play.
+    let copy_id: MediaId = 9_001;
+    MediaStore::put(&store, media_item(copy_id, "Copy Of Item"))
+        .await
+        .unwrap();
+    let copy = UserItemData {
+        played: false,
+        play_count: 1,
+        last_played_position_ticks: 7_000,
+        is_favorite: false,
+        last_played_at: 1_700_001_000,
+        ..Default::default()
+    };
+    UserDataStore::set_user_data(&store, uid, copy_id, copy)
+        .await
+        .unwrap();
+    MediaStore::merge_user_data(&store, copy_id, item_id)
+        .await
+        .unwrap();
+    MediaStore::merge_user_data(&store, copy_id, item_id)
+        .await
+        .unwrap();
+    let merged = UserDataStore::get_user_data(&store, uid, item_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        (merged.played, merged.play_count, merged.is_favorite),
+        (true, 3, true)
+    );
+    assert_eq!(
+        (merged.last_played_position_ticks, merged.last_played_at),
+        (7_000, 1_700_001_000)
+    );
+    // Into a row that does not exist: nothing is written.
+    MediaStore::merge_user_data(&store, copy_id, 9_999)
+        .await
+        .unwrap();
+
     // -----------------------------------------------------------------
     // 6. PreferenceStore
     // -----------------------------------------------------------------
