@@ -426,6 +426,7 @@ pub fn WhatsNewView(
         Flow::Setup => "Start watching",
         Flow::WhatsNew => "Done",
     };
+    super::views::use_modal_hold(".pharos-whats-new-backdrop");
     rsx! {
         div { class: "pharos-whats-new-backdrop",
             div {
