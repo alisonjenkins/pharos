@@ -143,10 +143,14 @@ reaches SurfaceFlinger and the window composites as non-opaque RGBA_8888.
 In modes 1 and 3 the fill shows through the transparent region, a 50%
 black bar drawn by Blitz darkens it, and an opaque box covers it.
 
-SurfaceFlinger composites the colour-filled layer and the UI window on the
-GPU (CLIENT composition), not on a hardware overlay. A canvas-filled RGBA
-buffer is not a decoder buffer, so this says nothing yet about video; the
-first player step checks it (below).
+A colour fill drawn with a canvas is composited on the GPU (CLIENT). Real
+video is not: with `debug.pharos.video <path>`, mode 3 decodes a file into
+the hole's Surface with `AMediaExtractor` and `AMediaCodec`, and releases
+each frame at its timestamp. A 1080p30 H.264 clip decodes on
+`c2.mtk.avc.decoder` (the hardware decoder) with no dropped frames, and
+SurfaceFlinger puts both the video layer and the UI window on hardware
+overlays (DEVICE composition). Video therefore costs the GPU nothing, and
+the Blitz UI over it composites without a GPU pass.
 
 ## Fixes and gaps found
 
@@ -174,12 +178,9 @@ The plan keeps ADR-0077: `pharos-hls` feeds `AMediaCodec`, no hand-written
 Java. Framework classes with no NDK API are called over JNI from Rust,
 which ADR-0061 allows. In order:
 
-1. **Decode one stream into the mode 3 surface.** `ANativeWindow_fromSurface`
-   on the JNI-built `Surface`, `AMediaCodec` configured with it, H.264 from
-   one fMP4 segment. Checks: frames shown, and whether SurfaceFlinger puts
-   the decoder's buffers on a hardware overlay or composites them on the
-   GPU. GPU composition of every video frame would compete with Blitz for
-   the Mali-G52 and is the main risk to the plan.
+1. **Decode into the mode 3 surface.** Done in the spike for a local file:
+   hardware decoder, no drops, hardware overlay (above). Still to check:
+   HEVC and 4K sources, and tunneled playback onto the TV's video plane.
 2. **Codec capabilities.** The NDK has no codec list on API 31, so
    `MediaCodecList` is read over JNI into `Capabilities` (spec 013): H.264,
    HEVC, VP9, AV1, profiles and levels, and tunneled playback support.
