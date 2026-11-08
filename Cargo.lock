@@ -7122,6 +7122,7 @@ dependencies = [
  "keyboard-types",
  "libc",
  "log",
+ "manganis",
  "parley",
  "pharos-client",
  "pharos-ui",

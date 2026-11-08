@@ -2,23 +2,37 @@
 //! through where Blitz draws nothing? A player would put MediaCodec's output
 //! surface there and draw its controls above it, as Android's SurfaceView.
 //!
-//! `setprop debug.pharos.hole 1` turns it on: the window format becomes
-//! TRANSLUCENT (NativeActivity asks for an opaque RGB_565 window, and
-//! SurfaceFlinger then ignores the buffer's alpha), the
-//! renderer clears to transparent, and a child `ASurfaceControl` filled with
-//! one colour sits at z -1 inside a 16:9 rect. ASurfaceControl is API 29
-//! (setCrop API 31) and dx links against API 24, so the calls are looked up
-//! at run time.
+//! `setprop debug.pharos.hole 1` (or 2) turns it on: the window format
+//! becomes TRANSLUCENT (NativeActivity asks for an opaque RGB_565 window,
+//! and SurfaceFlinger then ignores the buffer's alpha) and the renderer
+//! clears to transparent. The layer under it, one colour in a 16:9 rect:
+//!
+//! - `1`: a SurfaceView added by the Kotlin side (`android/`).
+//! - `2`: a child `ASurfaceControl` at z -1. Android 12 refuses it on this
+//!   window (a BLAST layer); kept to show that. ASurfaceControl is API 29
+//!   (setCrop API 31) and dx links against API 24, so its calls are looked
+//!   up at run time.
 
 use android_activity::AndroidApp;
 use std::ffi::{CStr, c_char, c_void};
 use std::time::Duration;
 
-pub fn enabled() -> bool {
+#[manganis::ffi("android")]
+extern "Kotlin" {
+    pub type VideoHole;
+}
+
+/// The Kotlin class, by its binary name for `ClassLoader.loadClass`.
+const VIDEO_HOLE_CLASS: &str = "com.alisonjenkins.pharos.tvnative.video.VideoHole";
+
+fn mode() -> Option<String> {
     android_properties::getprop("debug.pharos.hole")
         .value()
-        .as_deref()
-        == Some("1")
+        .filter(|v| v == "1" || v == "2")
+}
+
+pub fn enabled() -> bool {
+    mode().is_some()
 }
 
 /// `android.graphics.PixelFormat.TRANSLUCENT`.
@@ -106,13 +120,6 @@ impl Api {
 
 /// Call before the event loop starts. Logs what it did or why it stopped.
 pub fn start(app: &AndroidApp) {
-    let api = match Api::load() {
-        Ok(api) => api,
-        Err(e) => {
-            log::warn!("hole: {e}");
-            return;
-        }
-    };
     match translucent_window(app) {
         Ok(()) => log::info!("hole: window format TRANSLUCENT set"),
         Err(e) => {
@@ -120,6 +127,79 @@ pub fn start(app: &AndroidApp) {
             return;
         }
     }
+    if mode().as_deref() == Some("1") {
+        match surface_view(app) {
+            Ok(()) => log::info!("hole: SurfaceView requested"),
+            Err(e) => log::warn!("hole: SurfaceView: {e}"),
+        }
+    } else {
+        surface_control(app);
+    }
+}
+
+/// `new VideoHole(activity).show(..)`. The class is loaded through the
+/// activity's class loader: `FindClass` on this native thread would search
+/// only the system one.
+fn surface_view(app: &AndroidApp) -> Result<(), String> {
+    use jni::objects::{JClass, JObject, JValue};
+    // SAFETY: as in `translucent_window`.
+    let vm =
+        unsafe { jni::JavaVM::from_raw(app.vm_as_ptr().cast()) }.map_err(|e| format!("vm: {e}"))?;
+    let mut env = vm
+        .attach_current_thread()
+        .map_err(|e| format!("attach: {e}"))?;
+    let activity = unsafe { JObject::from_raw(app.activity_as_ptr().cast()) };
+    let result = (|| -> jni::errors::Result<()> {
+        let loader = env
+            .call_method(
+                &activity,
+                "getClassLoader",
+                "()Ljava/lang/ClassLoader;",
+                &[],
+            )?
+            .l()?;
+        let name = env.new_string(VIDEO_HOLE_CLASS)?;
+        let class = env
+            .call_method(
+                &loader,
+                "loadClass",
+                "(Ljava/lang/String;)Ljava/lang/Class;",
+                &[JValue::Object(&name)],
+            )?
+            .l()?;
+        let hole = env.new_object(
+            JClass::from(class),
+            "(Landroid/app/Activity;)V",
+            &[JValue::Object(&activity)],
+        )?;
+        env.call_method(
+            &hole,
+            "show",
+            "(IIII)V",
+            &[
+                JValue::Int(VIDEO_RECT.left),
+                JValue::Int(VIDEO_RECT.top),
+                JValue::Int(VIDEO_RECT.right - VIDEO_RECT.left),
+                JValue::Int(VIDEO_RECT.bottom - VIDEO_RECT.top),
+            ],
+        )?;
+        Ok(())
+    })();
+    if result.is_err() && env.exception_check().unwrap_or(false) {
+        let _ = env.exception_describe();
+        let _ = env.exception_clear();
+    }
+    result.map_err(|e| format!("{e}"))
+}
+
+fn surface_control(app: &AndroidApp) {
+    let api = match Api::load() {
+        Ok(api) => api,
+        Err(e) => {
+            log::warn!("hole: {e}");
+            return;
+        }
+    };
     let app = app.clone();
     let spawned = std::thread::Builder::new().name("pharos-hole".into()).spawn(move || {
         let started = std::time::Instant::now();
