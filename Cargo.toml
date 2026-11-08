@@ -132,6 +132,9 @@ rcgen = { version = "0.14", default-features = false, features = ["ring"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.11"
+# ADR-0073: keyed image tags (HMAC-SHA256, constant-time compare).
+hmac = "0.13"
+subtle = "2.6"
 base64 = "0.23"
 # Avatar uploads: decoded and re-encoded in memory-safe Rust, not ffmpeg.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"] }

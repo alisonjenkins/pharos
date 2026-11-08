@@ -5197,11 +5197,14 @@ dependencies = [
 name = "pharos-jellyfin-api"
 version = "0.0.0"
 dependencies = [
+ "hmac",
  "pharos-cache",
  "pharos-core",
  "proptest",
  "serde",
  "serde_json",
+ "sha2 0.11.1",
+ "subtle",
  "uuid",
  "workspace-hack",
  "xxhash-rust",
@@ -9384,6 +9387,7 @@ dependencies = [
  "sqlx-macros-core",
  "sqlx-sqlite",
  "stable_deref_trait",
+ "subtle",
  "syn 2.0.119",
  "syn 3.0.7",
  "sync_wrapper",
