@@ -59,6 +59,8 @@ pub mod track_follow;
 pub mod trail;
 // 025: Android TV sign-in logic (backoff, QuickConnect steps); no I/O, builds everywhere.
 pub mod tv_auth;
+// 025: the Android TV app's page rules (history, proxy, bridge); no I/O.
+pub mod tv_page;
 pub mod views;
 pub mod visualiser;
 pub mod watch_view;
