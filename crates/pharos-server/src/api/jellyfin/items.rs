@@ -5560,11 +5560,26 @@ async fn fetch_item_dto(
                 DetailError::Store(e) => error::ErrorInternalServerError(e.to_string()),
             }
         })?;
+    // The four lookups are independent, so they share one wait instead of
+    // queueing on the pool one after another. Each is best-effort: a store
+    // error just means that part is empty, never a 500.
+    //
     // LIB-D5 — advertise ImageTags for any role with a recorded local
     // sidecar (D4) so clients request roles that are otherwise
-    // upload-only (Logo/Banner/Art/Disc). Best-effort: a store error
-    // just means no extra tags, never a 500.
-    let local_art_roles: Vec<String> = match state.stores.artwork_for(id).await {
+    // upload-only (Logo/Banner/Art/Disc).
+    // LIB-C2 — the item's cast/crew (item_people join, NFO order) for
+    // BaseItemDto.People. LIB-C3 — its studios (item_studios join,
+    // name-ordered). LIB-C6 — its tags (item_tags join, name-ordered).
+    let (art, people, studios, tags) = {
+        use pharos_core::{PersonStore, StudioStore, TagStore};
+        tokio::join!(
+            state.stores.artwork_for(id),
+            state.stores.people_for_item(id),
+            state.stores.studios_for_item(id),
+            state.stores.tags_for_item(id),
+        )
+    };
+    let local_art_roles: Vec<String> = match art {
         Ok(rows) => rows
             .into_iter()
             .filter(|(_, source, _)| source == "local")
@@ -5575,45 +5590,18 @@ async fn fetch_item_dto(
             Vec::new()
         }
     };
-    // LIB-C2 — project the item's cast/crew (item_people join, NFO order)
-    // onto BaseItemDto.People. Best-effort: a store error just means an
-    // empty cast list, never a 500.
-    let people: Vec<pharos_core::ItemPerson> = {
-        use pharos_core::PersonStore;
-        match state.stores.people_for_item(id).await {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::warn!(error = %e, media.id = id, "people lookup for item failed");
-                Vec::new()
-            }
-        }
-    };
-    // LIB-C3 — project the item's studios (item_studios join, name-ordered)
-    // onto BaseItemDto.Studios. Best-effort: a store error just means an
-    // empty studio list, never a 500.
-    let studios: Vec<pharos_core::Studio> = {
-        use pharos_core::StudioStore;
-        match state.stores.studios_for_item(id).await {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!(error = %e, media.id = id, "studios lookup for item failed");
-                Vec::new()
-            }
-        }
-    };
-    // LIB-C6 — project the item's tags (item_tags join, name-ordered) onto
-    // BaseItemDto.Tags. Best-effort: a store error just means an empty tag
-    // list, never a 500.
-    let tags: Vec<pharos_core::Tag> = {
-        use pharos_core::TagStore;
-        match state.stores.tags_for_item(id).await {
-            Ok(t) => t,
-            Err(e) => {
-                tracing::warn!(error = %e, media.id = id, "tags lookup for item failed");
-                Vec::new()
-            }
-        }
-    };
+    let people: Vec<pharos_core::ItemPerson> = people.unwrap_or_else(|e| {
+        tracing::warn!(error = %e, media.id = id, "people lookup for item failed");
+        Vec::new()
+    });
+    let studios: Vec<pharos_core::Studio> = studios.unwrap_or_else(|e| {
+        tracing::warn!(error = %e, media.id = id, "studios lookup for item failed");
+        Vec::new()
+    });
+    let tags: Vec<pharos_core::Tag> = tags.unwrap_or_else(|e| {
+        tracing::warn!(error = %e, media.id = id, "tags lookup for item failed");
+        Vec::new()
+    });
     let mut dto = BaseItemDto::from_domain_with_user_data(&item, &state.server_id, user_data)
         // THE load-bearing site for books: jellyfin-web's details page fetches
         // this route with NO `Fields`, hands the result to `playbackManager`,
