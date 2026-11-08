@@ -864,25 +864,30 @@ pub async fn engine(kind: Engine) -> Result<Box<dyn PlaybackEngine>, String> {
     }
 }
 
-const HLSJS_SRC: &str = "/ui/assets/vendor/hls.min.js";
+/// hls.js, shipped inside the app. Fetched through the proxy it waited on
+/// the server's first answer, and on a slow one (over `PROXY_DEADLINE`) the
+/// player was left with no engine and no video.
+const HLSJS: &str = include_str!("../../assets/vendor/hls.min.js");
 
-/// Add hls.js's `<script>` once, through the proxy, and wait for it.
+/// Run the bundled hls.js in the page once.
 async fn load_hlsjs() -> Result<(), String> {
     let script = format!(
         "if (window.Hls) return true; \
-         await new Promise((ok, fail) => {{ \
-           const s = document.createElement('script'); \
-           s.src = {}; s.onload = ok; s.onerror = () => fail('hls.js did not load'); \
-           document.head.append(s); \
-         }}); \
+         const s = document.createElement('script'); \
+         s.textContent = {}; \
+         document.head.append(s); \
          return !!window.Hls;",
-        js_str(HLSJS_SRC)
+        js_str(HLSJS)
     );
-    match document::eval(&script).join::<bool>().await {
+    let loaded = match document::eval(&script).join::<bool>().await {
         Ok(true) => Ok(()),
-        Ok(false) => Err("hls.js loaded but defined no Hls".into()),
+        Ok(false) => Err("hls.js ran but defined no Hls".into()),
         Err(e) => Err(format!("hls.js: {e}")),
+    };
+    if let Err(e) = &loaded {
+        log::warn!("pharos: hls.js load failed error={e}");
     }
+    loaded
 }
 
 /// An hls.js player in the page, at `window.__pharosHls[id]`. Its errors and
