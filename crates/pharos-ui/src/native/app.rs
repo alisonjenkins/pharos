@@ -4082,6 +4082,62 @@ fn Player(
         let stop = stop.clone();
         move || Rc::new(platform::on_page_hide(stop))
     });
+    // A tab that goes hidden reports where it is, since closing it often
+    // fires no pagehide; a page restored from the back/forward cache reports
+    // again (B809).
+    use_hook({
+        let (p, clock, last_ms, switched) = (
+            Rc::clone(&p),
+            Rc::clone(&clock),
+            Rc::clone(&last_ms.0),
+            Rc::clone(&switched),
+        );
+        let retiring = Rc::clone(&retiring);
+        let restored_clock = Rc::clone(&clock);
+        move || {
+            Rc::new(platform::on_page_lifecycle(
+                move || {
+                    if retiring.get() {
+                        return;
+                    }
+                    let here = platform::position_ms(VIDEO_ID);
+                    if here > 0 {
+                        last_ms.set(here);
+                    }
+                    let Some(Outgoing::Report { paused }) =
+                        clock.borrow_mut().on_hidden(platform::now_ms())
+                    else {
+                        return;
+                    };
+                    let grant = p.grant.borrow().clone();
+                    let at = last_ms.get();
+                    let tracks = TrackPicks {
+                        audio: TrackChoice::Default,
+                        subtitle: switched.get().unwrap_or_default(),
+                    };
+                    platform::info(&format!(
+                        "pharos: progress report reason=hidden item={playing_id} at_ms={at} paused={paused}"
+                    ));
+                    platform::spawn_detached(async move {
+                        if let Err(e) = grant
+                            .report(&call("watch", "report"), at, paused, tracks)
+                            .await
+                        {
+                            platform::warn(&format!(
+                                "pharos: progress report failed reason=hidden: {e}"
+                            ));
+                        }
+                    });
+                },
+                move || {
+                    let was_stopped = restored_clock.borrow_mut().restore();
+                    platform::info(&format!(
+                        "pharos: progress reports restored reason=pageshow item={playing_id} was_stopped={was_stopped}"
+                    ));
+                },
+            ))
+        }
+    });
     let retire_stop = stop.clone();
     // The group's track picks arrive from outside the Dioxus runtime; this
     // task switches the player's tracks.
