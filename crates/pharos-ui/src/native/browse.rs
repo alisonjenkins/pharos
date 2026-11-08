@@ -1586,7 +1586,7 @@ fn Hero(
         header { class: "pharos-hero",
             div { class: art_class,
                 match image {
-                    Some(src) => rsx! { img { src: "{src}", alt: "" } },
+                    Some(src) => rsx! { img { src: platform::art_src(&src), alt: "" } },
                     None if album => rsx! { ArtPlaceholder { kind: ItemKind::Album, name: title.clone() } },
                     None => rsx! {},
                 }
