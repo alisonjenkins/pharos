@@ -1860,6 +1860,174 @@ test.describe("pharos Dioxus UI", () => {
       expect(hlsjs).toEqual([]);
     });
 
+    // V648/V649 (spec 031 slice 4): on a link that slows mid-play the Rust
+    // engine steps down a rung at a segment boundary, with no reload and no
+    // jump in currentTime, and logs the switch with what it decided on. The
+    // link is slowed by a local proxy that trickles each segment's body, so
+    // the engine's first-to-last-byte estimate sees a slow link in Chromium
+    // and Firefox alike. The seeded clip is too small for the server to list
+    // a ladder (its listing is covered by the server's handler tests), so the
+    // test adds the 360p rung, which the server serves for any item, to the
+    // abr=1 master and gives the source rung a bandwidth above the link's.
+    test("the Rust engine steps down a quality rung when the link slows", async ({
+      page,
+      request,
+    }) => {
+      test.setTimeout(180_000);
+      const probe = await request.get(`${PHAROS_URL}/pharos/session`, {
+        headers: { Accept: "application/json" },
+      });
+      test.skip(probe.status() !== 405, `native API is not enabled (status ${probe.status()})`);
+      const auth = await request.post(`${PHAROS_URL}/Users/AuthenticateByName`, {
+        headers: {
+          "Content-Type": "application/json",
+          "X-Emby-Authorization": `MediaBrowser Client="playwright", Device="pw", DeviceId="pw-abr-${Date.now()}", Version="0"`,
+        },
+        data: { Username: TEST_USER, Pw: TEST_PASS },
+      });
+      test.skip(!auth.ok(), `pharos has no seeded test user (${TEST_USER})`);
+      const { AccessToken: token, User: user } = await auth.json();
+      const api = { "X-Emby-Token": token };
+      const fixture = async () =>
+        (
+          await (
+            await request.get(
+              `${PHAROS_URL}/Users/${user.Id}/Items?Recursive=true&IncludeItemTypes=Movie&Fields=Path,MediaSources`,
+              { headers: api },
+            )
+          ).json()
+        ).Items?.find((i: { Path?: string }) => i.Path?.endsWith("/fixture-1.webm"));
+      await expect
+        .poll(async () => (await fixture())?.MediaSources?.[0]?.Container, {
+          timeout: 30_000,
+        })
+        .toMatch(/webm/);
+      const movie = await fixture();
+      test.skip(!movie, "pharos has no seeded movie");
+      const nativeId = BigInt(`0x${movie.Id}`).toString();
+
+      // Bytes per second each segment body is trickled at; 0 is full speed.
+      let rateBps = 0;
+      const http = await import("node:http");
+      const proxy = http.createServer(async (req, res) => {
+        try {
+          // The page signs its requests with its session cookie.
+          const upstream = await fetch(`${PHAROS_URL}${req.url}`, {
+            headers: req.headers.cookie ? { cookie: req.headers.cookie } : {},
+          });
+          const body = Buffer.from(await upstream.arrayBuffer());
+          res.writeHead(upstream.status, {
+            "content-type": upstream.headers.get("content-type") ?? "video/mp4",
+            "access-control-allow-origin": "*",
+          });
+          const chunk = 16_384;
+          for (let at = 0; at < body.length; at += chunk) {
+            res.write(body.subarray(at, at + chunk));
+            if (rateBps > 0) {
+              await new Promise((r) => setTimeout(r, (chunk / rateBps) * 1000));
+            }
+          }
+          res.end();
+        } catch (e) {
+          res.destroy(e as Error);
+        }
+      });
+      await new Promise<void>((r) => proxy.listen(0, "127.0.0.1", r));
+      const port = (proxy.address() as { port: number }).port;
+      const segments: string[] = [];
+      await page.route(/\/h264cmaf\/.*\.m4s/, (route) => {
+        const u = new URL(route.request().url());
+        segments.push(u.pathname);
+        return route.continue({ url: `http://127.0.0.1:${port}${u.pathname}${u.search}` });
+      });
+
+      let ladder = "";
+      await page.route(/\/master\.m3u8\?.*abr=1/, async (route) => {
+        const res = await route.fetch();
+        const lines = (await res.text()).split("\n");
+        const at = lines.findIndex((l) => l.startsWith("#EXT-X-STREAM-INF:"));
+        const uri = lines[at + 1] ?? "";
+        if (at < 0 || !uri.includes("/h264cmaf/main.m3u8")) {
+          ladder = `no h264cmaf rung: ${lines.join(" | ")}`;
+          return route.fulfill({ response: res, body: lines.join("\n") });
+        }
+        const inf = lines[at];
+        lines[at] = inf.replace(/BANDWIDTH=\d+/, "BANDWIDTH=4000000");
+        lines.splice(
+          at + 2,
+          0,
+          inf.replace(/BANDWIDTH=\d+/, "BANDWIDTH=500000").replace(/,RESOLUTION=\S+/, "") +
+            ",RESOLUTION=640x360",
+          uri.replace("/h264cmaf/main.m3u8", "/h264cmaf/360p/main.m3u8"),
+        );
+        ladder = "ok";
+        return route.fulfill({ response: res, body: lines.join("\n") });
+      });
+
+      try {
+        await page.addInitScript(() => {
+          const canPlayType = HTMLMediaElement.prototype.canPlayType;
+          HTMLMediaElement.prototype.canPlayType = function (type: string) {
+            return /mpegurl|webm|matroska/i.test(type) ? "" : canPlayType.call(this, type);
+          };
+        });
+        const logs: string[] = [];
+        page.on("console", (m) => logs.push(m.text()));
+
+        await page.goto("/ui/");
+        await page.locator("#signin-name").fill(TEST_USER);
+        await page.locator("#signin-password").fill(TEST_PASS);
+        await page.getByRole("button", { name: "Sign in" }).click();
+        await expect(page.locator(".pharos-shell-bar")).toBeVisible({ timeout: 15_000 });
+
+        await page.goto(`/ui/watch/${nativeId}?engine=rust`);
+        await expect
+          .poll(() => logs.find((l) => l.includes("pharos: abr o")), { timeout: 60_000 })
+          .toBeTruthy();
+        expect(ladder).toBe("ok");
+        const abrLine = logs.find((l) => l.includes("pharos: abr o")) ?? "";
+        expect(abrLine, logs.filter((l) => l.includes("abr")).join("\n")).toContain(
+          "pharos: abr on rungs=360p,240p current=240p",
+        );
+
+        const video = () =>
+          page.evaluate(() => {
+            const v = document.getElementById("pharos-video") as HTMLVideoElement | null;
+            return v?.currentTime ?? 0;
+          });
+        await expect.poll(video, { timeout: 60_000 }).toBeGreaterThan(1);
+
+        // The link drops to 800 kbit/s: room for the 360p rung, not the source.
+        rateBps = 100_000;
+        const switched = () => logs.find((l) => l.includes("pharos: abr switch"));
+        await expect.poll(switched, { timeout: 120_000 }).toBeTruthy();
+        const line = switched() ?? "";
+        expect(line).toMatch(
+          /pharos: abr switch from=\S+ to=\S+ reason=(bandwidth|buffer) est_kbps=\d+ buffer_ms=\d+ cold_ms=\d+ applied=true/,
+        );
+        const to = /to=(\S+)/.exec(line)?.[1] ?? "";
+
+        // The next segments come from the new rung, without a reload, and
+        // the play head keeps going from where it was.
+        const before = await video();
+        await expect
+          .poll(() => segments.some((p) => p.includes(`/h264cmaf/${to}/`)), {
+            timeout: 60_000,
+          })
+          .toBe(true);
+        await expect.poll(video, { timeout: 60_000 }).toBeGreaterThan(before + 1);
+        expect(logs.filter((l) => l.includes("pharos: playback engine=rust start"))).toHaveLength(
+          1,
+        );
+        expect(logs.filter((l) => l.includes("engine=rust fallback="))).toEqual([]);
+        expect(logs.filter((l) => l.includes("playback error engine=rust"))).toEqual([]);
+      } finally {
+        rateBps = 0;
+        await page.unrouteAll({ behavior: "ignoreErrors" });
+        await new Promise((r) => proxy.close(r));
+      }
+    });
+
     // B551: a seek that waits on the server shows a spinner over the video,
     // outside the chrome that hides on idle, and it goes once data arrives.
     test("a seek that waits on the server shows a loading spinner", async ({ page, request }) => {
