@@ -1122,7 +1122,11 @@ const v = document.getElementById(id);
 if (!v) throw new Error("no <video id=" + id + ">");
 window.__pharosHls = window.__pharosHls || {{}};
 if (window.__pharosHls[id]) window.__pharosHls[id].destroy();
-const h = new Hls({{ startPosition: {start} }});
+const token = {token};
+const h = new Hls({{
+  startPosition: {start},
+  xhrSetup: (xhr) => {{ if (token) xhr.setRequestHeader('X-Emby-Token', token); }},
+}});
 h.__pharosGen = {generation};
 window.__pharosHls[id] = h;
 const send = (m) => window.__pharosSend && window.__pharosSend(Object.assign({{ t: "hls", id }}, m));
@@ -1142,10 +1146,24 @@ h.attachMedia(v);
 "#,
             id = js_str(&id),
             mark = js_str(super::resume::ENGINE_MARK),
-            url = js_str(url),
+            url = js_str(&direct_url(&server(), url)),
+            token = android::token().map_or_else(|| "null".to_owned(), |t| js_str(&t)),
             generation = self.generation,
         ));
         Ok(())
+    }
+}
+
+/// The server's own address for a stream path. hls.js loads the playlists
+/// and segments straight from the server, with the token in a header (the
+/// server allows the app's origin): through the page proxy each segment
+/// held a WebView request thread, a JNI copy of the body and the 8 s proxy
+/// deadline.
+fn direct_url(base: &str, url: &str) -> String {
+    if url.starts_with('/') {
+        tv_page::server_url(base, url)
+    } else {
+        url.to_owned()
     }
 }
 
