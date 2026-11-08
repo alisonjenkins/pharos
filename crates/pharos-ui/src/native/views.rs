@@ -5,6 +5,7 @@
 
 use dioxus::prelude::*;
 use pharos_client::api::{Detail, Home, HomeRail, Item, ItemKind, ItemRef, LibraryKind, Page};
+use pharos_client::ClientError;
 
 use super::art::{Art, POSTER_SIZES};
 use super::depth;
@@ -339,6 +340,83 @@ pub fn Busy(busy: bool, children: Element) -> Element {
 #[component]
 pub fn ErrorNote(message: String) -> Element {
     rsx! { p { class: "pharos-error", role: "alert", "{message}" } }
+}
+
+/// Why a screen's load failed: a plain sentence for the viewer, and the raw
+/// reason and trace id kept for the details line (B823).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoadError {
+    pub headline: String,
+    /// The error as the client words it, `kind: reason`.
+    pub raw: String,
+    pub trace_id: Option<String>,
+}
+
+impl LoadError {
+    pub fn from_client(e: &ClientError) -> Self {
+        match e {
+            ClientError::Api { kind, trace_id, .. } => Self::api(kind, e.to_string(), trace_id),
+            ClientError::Rpc(_) => Self::transport(e.to_string()),
+        }
+    }
+
+    /// The server answered with an `Error` of `kind`.
+    fn api(kind: &str, raw: String, trace_id: &str) -> Self {
+        let headline = match kind {
+            "notFound" => "We couldn't find that. It may have been removed.",
+            "notPermitted" => "You don't have access to that.",
+            "revoked" => "Your session has ended. Sign in again.",
+            "unavailable" => "The server can't answer right now. Try again in a moment.",
+            _ => "Something went wrong loading this.",
+        };
+        Self {
+            headline: headline.to_owned(),
+            raw,
+            trace_id: Some(trace_id.to_owned()).filter(|t| !t.is_empty()),
+        }
+    }
+
+    /// The call never got an answer, or one this build cannot read.
+    fn transport(raw: String) -> Self {
+        let headline = if raw.contains("reload the page") {
+            "Pharos has been updated. Reload the page."
+        } else {
+            "We couldn't reach the server. Check your connection and try again."
+        };
+        Self {
+            headline: headline.to_owned(),
+            raw,
+            trace_id: None,
+        }
+    }
+
+    /// The small details line: the raw reason, then the trace id to quote.
+    pub fn details(&self) -> String {
+        match &self.trace_id {
+            Some(trace) => format!("Details: {} (trace {trace})", self.raw),
+            None => format!("Details: {}", self.raw),
+        }
+    }
+}
+
+/// A screen that could not load: what happened in plain words, a "Try
+/// again" that restarts the load, and the raw reason as small print (B823).
+#[component]
+pub fn LoadFailure(error: LoadError, on_retry: EventHandler<()>) -> Element {
+    rsx! {
+        div { class: "pharos-load-failure", role: "alert",
+            p { class: "pharos-load-failure-title", "{error.headline}" }
+            button {
+                class: "pharos-button",
+                r#type: "button",
+                // A remote or keyboard lands on the way forward (TV, Quest).
+                autofocus: true,
+                onclick: move |_| on_retry.call(()),
+                "Try again"
+            }
+            p { class: "pharos-load-failure-details", "{error.details()}" }
+        }
+    }
 }
 
 /// The group ended: news, not an error, and the film plays on.
@@ -1426,6 +1504,61 @@ mod tests {
             "{idle}"
         );
         assert!(idle.contains("old"), "{idle}");
+    }
+
+    fn api_error(kind: &'static str, trace: &str) -> ClientError {
+        ClientError::Api {
+            kind,
+            reason: "item 7".into(),
+            trace_id: trace.into(),
+        }
+    }
+
+    /// B823: the common failures read as sentences, the raw text is kept.
+    #[test]
+    fn load_failures_read_as_sentences_and_keep_the_raw_reason() {
+        let missing = LoadError::from_client(&api_error("notFound", "abc123"));
+        assert!(missing.headline.contains("couldn't find"), "{missing:?}");
+        assert_eq!(
+            missing.details(),
+            "Details: notFound: item 7 (trace abc123)"
+        );
+        let denied = LoadError::from_client(&api_error("notPermitted", ""));
+        assert!(denied.headline.contains("don't have access"));
+        assert_eq!(denied.details(), "Details: notPermitted: item 7");
+        let rpc = LoadError::transport("rpc: disconnected".into());
+        assert!(rpc.headline.contains("reach the server"), "{rpc:?}");
+        assert!(
+            rpc.details().starts_with("Details: rpc"),
+            "{}",
+            rpc.details()
+        );
+        let kinds = [
+            "notFound",
+            "notPermitted",
+            "revoked",
+            "unavailable",
+            "other",
+        ];
+        let headlines: std::collections::HashSet<_> = kinds
+            .iter()
+            .map(|k| LoadError::from_client(&api_error(k, "")).headline)
+            .collect();
+        assert_eq!(headlines.len(), kinds.len(), "every kind its own words");
+    }
+
+    #[test]
+    fn a_failed_load_offers_try_again_and_the_details() {
+        let error = LoadError::from_client(&api_error("unavailable", "t1"));
+        let html = render(move || {
+            rsx! { LoadFailure { error: error.clone(), on_retry: |_| {} } }
+        });
+        assert!(html.contains("Try again"), "{html}");
+        assert!(html.contains(r#"role="alert""#), "{html}");
+        assert!(
+            html.contains("Details: unavailable: item 7 (trace t1)"),
+            "{html}"
+        );
     }
 
     #[test]
