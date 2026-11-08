@@ -10,6 +10,7 @@
 pub mod instrument;
 pub mod labels;
 pub mod redact;
+pub mod serve;
 pub mod track_choice;
 
 /// Ids one `Membership.seen` call may ask about; more is `limit`. The server
@@ -17,6 +18,7 @@ pub mod track_choice;
 pub const MAX_SEEN_IDS: usize = 200;
 
 pub use instrument::{register_metrics, set_trace_parent_hook, Connection, Denial};
+pub use serve::DisconnectOnDrop;
 
 /// `Session.changePassword`'s `unavailable` reason when the new password is
 /// stored but the user's other sessions could not be signed out. Shared so

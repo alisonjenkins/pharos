@@ -1,6 +1,8 @@
-//! B730: `pharos_rpc_calls_in_flight` counts a call while its handler future
-//! lives. capnp-rpc leaks the calls of an `RpcSystem` dropped mid-call (a
-//! cycle through the answer table), and the gauge is what shows it.
+//! B730 / V680: a server that drops its `RpcSystem` while calls are running
+//! must drop those calls. capnp-rpc alone leaks them (a cycle through the
+//! answer table), and a leaked call parked on the database pool keeps its slot
+//! for good: eight leaked calls wedged the sqlite pool with every connection
+//! idle. `pharos_rpc_calls_in_flight` is the signal that shows a leak.
 
 use std::cell::Cell;
 use std::rc::Rc;
@@ -8,7 +10,7 @@ use std::rc::Rc;
 use capnp_rpc::rpc_twoparty_capnp::Side;
 use capnp_rpc::{twoparty, RpcSystem};
 use pharos_api::pharos_capnp::library;
-use pharos_api::{server, Connection};
+use pharos_api::{server, Connection, DisconnectOnDrop};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 use crate::instrument::latest_request;
@@ -51,6 +53,8 @@ enum End {
     CallerGivesUp,
     /// The server drops a bare `RpcSystem` mid-call.
     DropBareSystem,
+    /// The server drops a [`DisconnectOnDrop`] mid-call.
+    DropGuardedSystem,
 }
 
 struct Seen {
@@ -82,7 +86,10 @@ fn park_then(end: End) -> Seen {
             );
             let cap = server::library::client(handler, &Connection::new());
             let system = RpcSystem::new(Box::new(net), Some(cap.client));
-            let server_task = tokio::task::spawn_local(system);
+            let server_task = match end {
+                End::DropGuardedSystem => tokio::task::spawn_local(DisconnectOnDrop::new(system)),
+                End::CallerGivesUp | End::DropBareSystem => tokio::task::spawn_local(system),
+            };
 
             let (cr, cw) = tokio::io::split(client_io);
             let client_net = twoparty::VatNetwork::new(
@@ -107,7 +114,7 @@ fn park_then(end: End) -> Seen {
                 End::CallerGivesUp => call.abort(),
                 // The server goes first, before it has read anything from
                 // the client: the shape of a socket the server closes itself.
-                End::DropBareSystem => server_task.abort(),
+                End::DropBareSystem | End::DropGuardedSystem => server_task.abort(),
             }
             for _ in 0..200 {
                 tokio::task::yield_now().await;
@@ -129,8 +136,27 @@ fn a_parked_call_counts_in_flight_until_its_caller_gives_up() {
 
 #[test]
 fn a_bare_rpc_system_dropped_mid_call_leaks_the_call() {
-    // capnp-rpc's own behaviour: the answer-table cycle keeps the call.
+    // Pins the capnp-rpc behaviour `DisconnectOnDrop` exists for. If this
+    // starts failing, capnp-rpc breaks the cycle itself and the guard can go.
     let seen = park_then(End::DropBareSystem);
     assert!(!seen.dropped, "capnp-rpc now drops the call itself");
     assert_eq!(seen.o.gauge(IN_FLIGHT, LATEST), Some(1.0));
+}
+
+#[test]
+fn dropping_a_guarded_rpc_system_drops_its_calls() {
+    let seen = park_then(End::DropGuardedSystem);
+    assert!(seen.dropped, "the parked call outlived its connection");
+    assert_eq!(
+        seen.o.gauge(IN_FLIGHT, LATEST),
+        Some(0.0),
+        "logs:\n{}",
+        seen.o.logs
+    );
+    assert_eq!(
+        seen.o.counter("pharos_rpc_cancelled_total", LATEST),
+        Some(1),
+        "the released call is counted cancelled; logs:\n{}",
+        seen.o.logs
+    );
 }
