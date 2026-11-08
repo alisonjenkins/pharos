@@ -46,12 +46,8 @@ pub(crate) async fn sample_pool<DB: Database>(
     pool: &Pool<DB>,
     probe_timeout: Duration,
 ) {
-    record_pool_state(
-        backend,
-        pool.size(),
-        pool.num_idle(),
-        pool.options().get_max_connections(),
-    );
+    let (size, idle) = (pool.size(), pool.num_idle());
+    record_pool_state(backend, size, idle, pool.options().get_max_connections());
     let started = Instant::now();
     let outcome = tokio::time::timeout(probe_timeout, pool.acquire()).await;
     let waited = started.elapsed().as_secs_f64();
@@ -63,13 +59,28 @@ pub(crate) async fn sample_pool<DB: Database>(
                 .increment(1);
             tracing::warn!(backend, %error, waited, "pool acquire probe failed");
         }
-        Err(_) => {
+        Err(_) if idle == 0 => {
             metrics::counter!("pharos_db_pool_acquire_errors_total", "backend" => backend)
                 .increment(1);
             tracing::warn!(
                 backend,
                 waited,
+                size,
+                idle,
                 "pool acquire probe timed out; pool saturated"
+            );
+        }
+        // Idle connections and still no slot: the slots belong to waiters
+        // that were never resumed or dropped (B730), not to queries.
+        Err(_) => {
+            metrics::counter!("pharos_db_pool_acquire_errors_total", "backend" => backend)
+                .increment(1);
+            tracing::error!(
+                backend,
+                waited,
+                size,
+                idle,
+                "pool acquire probe timed out with idle connections; slots held by stalled waiters"
             );
         }
     }
@@ -184,6 +195,68 @@ mod tests {
             _ => None,
         });
         assert_eq!(in_use, Some(1.0));
+    }
+
+    /// B730: the wedge's shape. A waiter that was polled once and is never
+    /// polled or dropped again (its future leaked) is handed a slot when one
+    /// frees, and keeps it. Eight of them and every connection is idle while
+    /// every acquire times out. The series read `in_use == 0` alongside a
+    /// rising error count, which is the query that finds it.
+    #[test]
+    fn leaked_waiters_starve_the_pool_with_every_connection_idle() {
+        use std::future::Future;
+        use std::task::{Context, Wake, Waker};
+
+        struct Noop;
+        impl Wake for Noop {
+            fn wake(self: std::sync::Arc<Self>) {}
+        }
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = pharos_test_metrics::snapshotter(&recorder);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        metrics::with_local_recorder(&recorder, || {
+            rt.block_on(async {
+                let pool = SqlitePoolOptions::new()
+                    .max_connections(8)
+                    .connect("sqlite::memory:")
+                    .await
+                    .unwrap();
+                let mut held = Vec::new();
+                for _ in 0..8 {
+                    held.push(pool.acquire().await.unwrap());
+                }
+                let waker = Waker::from(std::sync::Arc::new(Noop));
+                for _ in 0..8 {
+                    let mut waiter = Box::pin(pool.acquire());
+                    assert!(waiter
+                        .as_mut()
+                        .poll(&mut Context::from_waker(&waker))
+                        .is_pending());
+                    std::mem::forget(waiter);
+                }
+                drop(held);
+                // sqlx returns a dropped connection to the pool from a task.
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                sample_pool("sqlite", &pool, Duration::from_millis(100)).await;
+            });
+        });
+        let rows: Rows = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .map(|(ck, _, _, v)| (ck.key().name().to_string(), "sqlite".to_owned(), v))
+            .collect();
+        assert_eq!(gauge(&rows, "pharos_db_pool_idle", "sqlite"), Some(8.0));
+        assert_eq!(gauge(&rows, "pharos_db_pool_in_use", "sqlite"), Some(0.0));
+        let errors = rows.iter().find_map(|(n, _, v)| match v {
+            DebugValue::Counter(c) if n == "pharos_db_pool_acquire_errors_total" => Some(*c),
+            _ => None,
+        });
+        assert_eq!(errors, Some(1), "the probe finds no slot");
     }
 
     #[test]
