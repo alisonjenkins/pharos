@@ -19,6 +19,16 @@ pub fn range_of(p: &MediaPlaylist, index: usize) -> Option<(u64, u64)> {
     range_of_slice(&p.segments, index)
 }
 
+/// Whether two renditions cut the media at the same instants: the same number
+/// of segments, each starting and lasting the same. Only then can a quality
+/// switch carry on at the next index without a gap or an overlap.
+pub fn same_grid(a: &[Segment], b: &[Segment]) -> bool {
+    a.len() == b.len()
+        && a.iter()
+            .zip(b)
+            .all(|(x, y)| x.start_ms == y.start_ms && x.duration_ms == y.duration_ms)
+}
+
 pub(crate) fn segments_duration_ms(segments: &[Segment]) -> u64 {
     segments
         .last()
@@ -52,8 +62,24 @@ mod tests {
 
     use proptest::prelude::*;
 
-    use super::{duration_ms, range_of, segment_at};
-    use crate::playlist::parse_media;
+    use super::{duration_ms, range_of, same_grid, segment_at};
+    use crate::playlist::{parse_media, Segment};
+
+    #[test]
+    fn same_grid_compares_timing_not_uris() {
+        let seg = |uri: &str, start_ms, duration_ms| Segment {
+            uri: uri.to_owned(),
+            start_ms,
+            duration_ms,
+        };
+        let a = [seg("a/0.m4s", 0, 6_000), seg("a/1.m4s", 6_000, 4_000)];
+        let b = [seg("b/0.m4s", 0, 6_000), seg("b/1.m4s", 6_000, 4_000)];
+        assert!(same_grid(&a, &b));
+        assert!(!same_grid(&a, &b[..1]), "fewer segments");
+        let shifted = [seg("b/0.m4s", 0, 5_000), seg("b/1.m4s", 5_000, 5_000)];
+        assert!(!same_grid(&a, &shifted), "same count, different cuts");
+        assert!(same_grid(&[], &[]));
+    }
 
     #[test]
     fn empty_playlist_has_zero_duration_and_no_segments() {
