@@ -149,6 +149,12 @@ pub enum Action {
         delay_ms: u64,
         position_ms: u64,
     },
+    /// Be at the group's `position_ms`, which only re-states where the group
+    /// is (its item arrived for the item already showing), not a member's
+    /// seek: a video playing close to it is left to the drift check (B761).
+    Align {
+        position_ms: u64,
+    },
 }
 
 /// The group as the client knows it. Pure: every change comes through
@@ -464,12 +470,9 @@ impl GroupState {
                 if self.watching == Some(item) {
                     // Already showing it, perhaps loaded at this member's
                     // own resume point before the item arrived: put it at the
-                    // group's (a no-op within `HOLD_BELOW_MS`). The seek's
+                    // group's (a no-op when already close). The seek's
                     // landing carries the ready (B664).
-                    vec![Action::Seek {
-                        delay_ms: 0,
-                        position_ms,
-                    }]
+                    vec![Action::Align { position_ms }]
                 } else {
                     vec![Action::Navigate(item)]
                 }
@@ -1141,7 +1144,7 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
             )
         };
         if let (Some(player), Some((position_ms, playing))) = (player, expected) {
-            if needs_seek(&*player, position_ms) {
+            if self.needs_seek(&*player, position_ms, playing, "catch_up") {
                 self.inner.borrow_mut().self_seek_ms = Some(self.env.now_ms());
                 player.seek_ms(position_ms);
             }
@@ -1209,8 +1212,14 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
     }
 
     fn perform(&self, action: Action, epoch: u64) {
-        let is_seek = matches!(action, Action::Seek { .. });
-        let is_play = matches!(action, Action::Play { .. });
+        // A play or an align only re-states where the group is; a seek or a
+        // pause is a member's own move, followed exactly.
+        let restates = match action {
+            Action::Play { .. } => Some(("play", true)),
+            Action::Align { .. } => Some(("align", false)),
+            _ => None,
+        };
+        let owes_on_arrival = matches!(action, Action::Seek { .. } | Action::Align { .. });
         let (delay_ms, position_ms, then): (u64, u64, fn(&dyn GroupPlayer)) = match action {
             Action::Navigate(item) => {
                 self.env.ui(Ui::Navigate(item));
@@ -1228,6 +1237,7 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
                 delay_ms,
                 position_ms,
             } => (delay_ms, position_ms, |_| {}),
+            Action::Align { position_ms } => (0, position_ms, |_| {}),
         };
         let Some(me) = self.me() else {
             return;
@@ -1248,24 +1258,55 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
             let Some(player) = player else {
                 return;
             };
-            // A play for a video already playing moves it only when it is far
-            // off: the drift check closes a small gap by rate (B761).
-            let off = player.position_ms().abs_diff(position_ms);
-            let far = if is_play {
-                needs_seek(&*player, position_ms)
-            } else {
-                off > HOLD_BELOW_MS
+            let far = match restates {
+                Some((source, play)) => {
+                    let group_playing =
+                        play || me.inner.borrow().state.anchor.is_some_and(|a| a.playing);
+                    me.needs_seek(&*player, position_ms, group_playing, source)
+                }
+                None => player.position_ms().abs_diff(position_ms) > HOLD_BELOW_MS,
             };
             if far {
                 me.inner.borrow_mut().self_seek_ms = Some(me.env.now_ms());
                 player.seek_ms(position_ms);
-            } else if is_seek {
+            } else if owes_on_arrival {
                 // Already there: no `seeked` will come to carry a ready the
                 // group's item asked for, so a loaded player says it now.
                 me.ready_if_loaded();
             }
             then(&*player);
         }));
+    }
+
+    /// Whether re-stating the group's position to `player` takes a seek. A
+    /// seek restarts the video's buffering, a visible stutter while it plays,
+    /// so a video playing along with a playing group is moved only when the
+    /// gap is too big to close by rate soon (`NUDGE_BELOW_MS`); otherwise it
+    /// is put exactly (B761). A skipped seek is logged with its inputs.
+    fn needs_seek(
+        &self,
+        player: &dyn GroupPlayer,
+        position_ms: u64,
+        group_playing: bool,
+        source: &str,
+    ) -> bool {
+        let at = player.position_ms();
+        let off = at.abs_diff(position_ms);
+        let rolling = group_playing && !player.paused();
+        let limit = if rolling {
+            NUDGE_BELOW_MS
+        } else {
+            HOLD_BELOW_MS
+        };
+        if off > limit {
+            return true;
+        }
+        if rolling && off > HOLD_BELOW_MS {
+            self.env.info(&format!(
+                "pharos: group seek skipped reason=small_gap source={source} off_ms={off} position_ms={at} group_ms={position_ms}"
+            ));
+        }
+        false
     }
 
     fn emit(
@@ -1722,18 +1763,10 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
     }
 }
 
-/// Whether putting `player` at `position_ms` takes a seek. A seek restarts
-/// the video's buffering, a visible stutter while it plays, so a playing
-/// video is moved only when the drift check could not close the gap by rate
-/// (more than `SEEK_ABOVE_MS`); a paused one is put exactly (B761).
-fn needs_seek(player: &dyn GroupPlayer, position_ms: u64) -> bool {
-    let off = player.position_ms().abs_diff(position_ms);
-    if player.paused() {
-        off > HOLD_BELOW_MS
-    } else {
-        off > SEEK_ABOVE_MS
-    }
-}
+/// Below this, a video playing along with a playing group is not seeked to
+/// re-state the group's position: the drift check closes the gap by rate in
+/// under about 10 s, where a seek would rebuffer (B761).
+const NUDGE_BELOW_MS: u64 = 500;
 
 /// The `<video>` the stage plays and the item it shows.
 struct Video {
@@ -3447,7 +3480,8 @@ mod tests {
             "{:?}",
             rig.player.log.borrow()
         );
-        rig.player.position.set(14_000);
+        // A second off is too far to close by rate soon: seeked.
+        rig.player.position.set(11_000);
         rig.session.deliver(GroupUpdate::Play {
             at_server_ms: rig.env.now.get(),
             position_ms: 10_000,
@@ -3457,6 +3491,60 @@ mod tests {
         assert_eq!(
             rig.player.position.get(),
             10_000,
+            "{:?}",
+            rig.player.log.borrow()
+        );
+    }
+
+    /// B761: the group's item for the video already playing, arriving a
+    /// moment after it was made, re-states the group's place; a small gap is
+    /// not seeked, and the skip says why.
+    #[test]
+    fn the_groups_item_for_a_playing_video_close_by_is_not_seeked() {
+        let rig = rig();
+        rig.session.set_watching(Some(ItemRef::Real(7)));
+        rig.player.position.set(42_300);
+        rig.session.deliver(GroupUpdate::Item {
+            item: ItemRef::Real(7),
+            playlist_item_id: "pl-7".into(),
+            position_ms: 42_000,
+            playing: true,
+        });
+        rig.env.settle();
+        assert!(
+            rig.player
+                .log
+                .borrow()
+                .iter()
+                .all(|l| !l.starts_with("seek(")),
+            "{:?}",
+            rig.player.log.borrow()
+        );
+        assert_eq!(
+            rig.env
+                .logged("pharos: group seek skipped reason=small_gap source=align")
+                .len(),
+            1
+        );
+    }
+
+    /// The paused side of B761: a video still playing when it learns the
+    /// group is paused is put exactly at the group's place.
+    #[test]
+    fn a_playing_video_in_a_paused_group_is_put_exactly() {
+        let rig = rig();
+        rig.session.set_watching(Some(ItemRef::Real(7)));
+        rig.player.position.set(60_900);
+        rig.session.deliver(GroupUpdate::Item {
+            item: ItemRef::Real(7),
+            playlist_item_id: "pl-7".into(),
+            position_ms: 60_000,
+            playing: false,
+        });
+        rig.env.settle();
+        assert_eq!(
+            rig.player.position.get(),
+            60_000,
             "{:?}",
             rig.player.log.borrow()
         );
