@@ -732,15 +732,17 @@ async fn query_unlocalized(
         });
     }
     // The legacy in-memory order: shuffle the kind/search/chip-filtered set,
-    // then apply the tag and play-state filters, then page.
-    let (mut items, _total) = state.stores.query(&mq).await?;
-    shuffle_in_place(&mut items, effective_sort_seed(q, user.id));
-    let tagged = apply_tags_filter(state, items, q).await?;
+    // then apply the tag and play-state filters, then page. Only ids move
+    // until the page is known; the rows of that page are fetched once.
+    let mut ids = state.stores.query_ids(&mq).await?;
+    shuffle_in_place(&mut ids, effective_sort_seed(q, user.id));
+    let tagged = apply_tags_filter(state, ids, q).await?;
     let filtered = apply_userdata_filter(state, user.id, tagged, q).await?;
     let total = u32::try_from(filtered.len()).unwrap_or(u32::MAX);
     let start = q.start_index as usize;
     let take = q.limit.map_or(usize::MAX, |l| l as usize);
-    let items: Vec<MediaItem> = filtered.into_iter().skip(start).take(take).collect();
+    let page: Vec<pharos_core::MediaId> = filtered.into_iter().skip(start).take(take).collect();
+    let items = state.stores.get_many(&page).await?;
     Ok(QueryPage {
         items,
         total,
