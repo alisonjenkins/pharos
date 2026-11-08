@@ -1239,6 +1239,43 @@ mod tests {
         assert!(!html.contains("data-passed=false"), "{html}");
     }
 
+    /// B750: the skip button and "Up next" overlap the top of the
+    /// controls, which come later in the page; without a z-index above
+    /// theirs the controls' gradient padding took the pointer from the lower
+    /// half of the button. The seek preview, inside the controls, still
+    /// rises over both while it shows.
+    #[test]
+    fn the_skip_button_and_up_next_stand_above_the_controls() {
+        let sheet = include_str!("../../assets/pharos.css");
+        let rule = |selector: &str| {
+            sheet
+                .split(&format!("\n{selector} {{"))
+                .nth(1)
+                .and_then(|r| r.split('}').next())
+                .unwrap_or_default()
+                .to_owned()
+        };
+        assert!(
+            rule(".pharos-skip").contains("z-index: 1;"),
+            "{}",
+            rule(".pharos-skip")
+        );
+        assert!(
+            rule(".pharos-up-next").contains("z-index: 1;"),
+            "{}",
+            rule(".pharos-up-next")
+        );
+        assert!(
+            !rule(".pharos-controls").contains("z-index"),
+            "{}",
+            rule(".pharos-controls")
+        );
+        assert!(
+            rule(".pharos-controls:has(.pharos-seek-preview)").contains("z-index: 2;"),
+            "the seek preview must rise over the skip button"
+        );
+    }
+
     #[test]
     fn the_controls_offer_skip_tracks_and_chapters() {
         let html = render(controls());
