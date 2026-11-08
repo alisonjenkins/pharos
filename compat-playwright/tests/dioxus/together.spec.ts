@@ -112,6 +112,76 @@ test.describe("pharos Dioxus UI watch together", () => {
     }
   });
 
+  // B761/V711: starting a group from the player while the video plays must
+  // not seek or stall it. It did: the group's play is struck at the place the
+  // group was made, a moment behind the video, and the session seeked back to
+  // it, so the video rebuffered (worst on the HLS engines, which flush).
+  for (const engine of ["direct", "hlsjs", "rust"] as const) {
+    test(`starting a group mid-playback leaves the video playing smoothly (${engine})`, async ({
+      browser,
+      request,
+    }) => {
+      test.setTimeout(120_000);
+      const { nativeId } = await seededMovie(request, "/fixture-1.webm");
+      const a = await signIn(browser, "A", OPTED_IN_A);
+      open.push(a);
+      const byA = new Member("A", a.page);
+      try {
+        if (engine !== "direct") {
+          // The fixture plays directly; hide that so the page asks for HLS.
+          await a.page.addInitScript(() => {
+            const canPlayType = HTMLMediaElement.prototype.canPlayType;
+            HTMLMediaElement.prototype.canPlayType = function (type: string) {
+              return /mpegurl|webm|matroska/i.test(type) ? "" : canPlayType.call(this, type);
+            };
+          });
+        }
+        const query = engine === "direct" ? "" : `?engine=${engine}`;
+        await a.page.goto(`${PHAROS_URL}/ui/watch/${nativeId}${query}`);
+        await expect
+          .poll(() => byA.probe().then((p) => (p.paused ? 0 : p.currentTime)), {
+            message: "A's video plays",
+            timeout: 30_000,
+          })
+          .toBeGreaterThan(3);
+        // Every seek, stall or pause of the video from here on.
+        await a.page.evaluate(() => {
+          const w = window as unknown as { __hiccups: string[] };
+          w.__hiccups = [];
+          for (const ev of ["seeking", "waiting", "pause", "emptied"]) {
+            document.addEventListener(
+              ev,
+              (e) => {
+                const v = e.target as HTMLVideoElement;
+                if (v instanceof HTMLVideoElement) {
+                  w.__hiccups.push(`${ev}@${Math.round(v.currentTime * 1000)}`);
+                }
+              },
+              true,
+            );
+          }
+        });
+        const before = (await byA.probe()).currentTime;
+
+        await a.page.mouse.move(200, 200);
+        await a.page.getByRole("button", { name: "Watch together" }).click();
+        await expect(a.page.locator(".pharos-members")).toBeVisible({ timeout: 15_000 });
+        // Past the readiness gate and the group's first play.
+        await a.page.waitForTimeout(6_000);
+
+        const hiccups = await a.page.evaluate(
+          () => (window as unknown as { __hiccups: string[] }).__hiccups,
+        );
+        expect(hiccups, "the video neither seeked nor stalled").toEqual([]);
+        const after = await byA.probe();
+        expect(after.paused, "A's video plays on").toBe(false);
+        expect(after.currentTime).toBeGreaterThan(before + 5);
+      } catch (e) {
+        throw new Error(`${e}\n${a.lines.join("\n")}`);
+      }
+    });
+  }
+
   // V479: A is already watching when they start the group from the player.
   // The group starts where A's video is and A's video plays on; the invite
   // link the player shows brings B in at the group's place.
