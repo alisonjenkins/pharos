@@ -69,7 +69,7 @@ use super::views::{
 };
 use super::watch_view::{
     split_position, text_track_id, total_ms, Control, Controls, Skip, UpNextCard, WatchView,
-    OUTGOING_ID, PLAYER_ID, SEEK_ID, VIDEO_ID,
+    OUTGOING_ID, SEEK_ID, VIDEO_ID,
 };
 use super::whats_new::{self, Close, Gate, GateInputs, Pick, Unseen, WhatsNewBadge, WhatsNewView};
 use crate::theme::editor::{Draft, EffectField};
@@ -3344,6 +3344,27 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
     // Where the player was, so a renegotiation after a reconnect or a track
     // change carries on from there rather than from the stored position.
     let last_ms = use_hook(|| Rc::new(Cell::new(0u64)));
+    let was_paused = use_hook(|| Rc::new(Cell::new(false)));
+    // A line over the picture while a renegotiation replaces the player; it
+    // lives here because the player is remounted under it (B816).
+    let notice = use_signal(|| None::<String>);
+    let notice_gen = use_hook(|| Rc::new(Cell::new(0u32)));
+    let notify: Rc<dyn Fn(String)> = {
+        let notice_gen = Rc::clone(&notice_gen);
+        Rc::new(move |line: String| {
+            let mut notice = notice;
+            let this = notice_gen.get().wrapping_add(1);
+            notice_gen.set(this);
+            notice.set(Some(line));
+            let notice_gen = Rc::clone(&notice_gen);
+            spawn(async move {
+                platform::sleep_ms(NOTICE_MS).await;
+                if notice_gen.get() == this {
+                    notice.set(None);
+                }
+            });
+        })
+    };
     // The tracks asked for; changing them negotiates a new playback.
     let mut picks = use_signal(TrackPicks::default);
     // What the connection has shown about this video, kept across the
@@ -3720,12 +3741,25 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
                         near: near.read().as_ref().and_then(|n| n.as_ref()).map(|n| n.0).unwrap_or_default(),
                         upcoming: upcoming.read().clone().flatten(),
                         on_renegotiate: move |next| picks.set(next),
+                        on_notice: {
+                            let notify = Rc::clone(&notify);
+                            move |line: String| notify(line)
+                        },
+                        notice: notice(),
+                        was_paused: WasPaused(Rc::clone(&was_paused)),
                         // In place of this episode, as the next-episode button does.
                         on_advance: move |next| replace.0.call(Route::Watch(next)),
                         watch: watch.clone(),
-                        on_quality: move |cap| {
-                            store_bitrate(quality::AUTO_RUNG_KEY, cap);
-                            auto_cap.set(cap);
+                        on_quality: {
+                            let notify = Rc::clone(&notify);
+                            move |cap| {
+                                let before = *auto_cap.peek();
+                                if before != cap {
+                                    notify(quality_notice(before, cap));
+                                }
+                                store_bitrate(quality::AUTO_RUNG_KEY, cap);
+                                auto_cap.set(cap);
+                            }
                         },
                         slot,
                         fade_in: fade_in.clone(),
@@ -3790,6 +3824,43 @@ impl PartialEq for LastMs {
     }
 }
 
+/// Whether the viewer had paused the player, shared with its screen so a
+/// renegotiation that remounts the player does not start a paused video
+/// (B816).
+#[derive(Clone)]
+struct WasPaused(Rc<Cell<bool>>);
+
+impl PartialEq for WasPaused {
+    fn eq(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+/// Whether a freshly mounted video starts by itself: not in a group, whose
+/// play it waits for, and not when the viewer had paused the one it replaces.
+fn autoplay_after(grouped: bool, was_paused: bool) -> bool {
+    !grouped && !was_paused
+}
+
+/// How long a "Switching audio…" style notice stays up.
+const NOTICE_MS: u32 = 4000;
+
+/// The line shown while a track change renegotiates the playback.
+fn track_notice(audio: bool) -> String {
+    if audio {
+        "Switching audio…"
+    } else {
+        "Switching subtitles…"
+    }
+    .to_owned()
+}
+
+/// The line shown while the quality step renegotiates from `from` to `to` bps.
+fn quality_notice(from: u64, to: u64) -> String {
+    let verb = if to < from { "Lowering" } else { "Raising" };
+    format!("{verb} quality to {} Mbps", to / 1_000_000)
+}
+
 /// The `ui_action` of a play RPC made in `view`.
 fn play_action(view: View) -> &'static str {
     match view {
@@ -3829,6 +3900,11 @@ fn Player(
     near: Neighbours,
     upcoming: Option<Item>,
     on_renegotiate: EventHandler<TrackPicks>,
+    /// A line to show while the renegotiation replaces this player.
+    on_notice: EventHandler<String>,
+    /// The line the screen is showing over the picture, if any.
+    notice: Option<String>,
+    was_paused: WasPaused,
     /// Plays the next episode once this one is finished: Up next, or the
     /// video ending.
     on_advance: EventHandler<ItemRef>,
@@ -3893,6 +3969,8 @@ fn Player(
             });
         }
     });
+    // Taken at mount: the video this one replaces was paused, or not.
+    let start_paused = use_hook(|| was_paused.0.get());
     let mut failed = use_signal(|| None::<PlayFailure>);
     let saved_volume = use_hook(last_volume);
     let mut media = use_signal(|| MediaState::at_volume(saved_volume.map(|(v, m, _)| (v, m))));
@@ -4184,6 +4262,7 @@ fn Player(
                         picks.audio, p.audio, p.asked_audio
                     ));
                     if audio.is_some() || burn {
+                        on_notice.call(track_notice(audio.is_some()));
                         on_renegotiate.call(TrackPicks {
                             audio: audio
                                 .or(p.audio)
@@ -4641,18 +4720,21 @@ fn Player(
         let (watch, assess) = (watch.clone(), Rc::clone(&assess));
         let resume = Rc::clone(&resume);
         let music = p.kind == ItemKind::Audio;
+        let was_paused = was_paused.clone();
         move |event: MediaEvent| {
             if retiring.get() {
                 return;
             }
             let resumed = match event {
                 MediaEvent::Playing => {
+                    was_paused.0.set(false);
                     let now = platform::now_ms();
                     let mut slot = resume.borrow_mut();
                     slot.paused_at = None;
                     slot.probe.as_mut().and_then(|p| p.playing(now))
                 }
                 MediaEvent::Pause => {
+                    was_paused.0.set(true);
                     let now = platform::now_ms();
                     let mut slot = resume.borrow_mut();
                     // Each pause restarts the clock: a play that never reached
@@ -4858,7 +4940,7 @@ fn Player(
                     platform::set_volume(VIDEO_ID, volume, muted);
                     remember_volume(volume, muted);
                 }
-                Control::Fullscreen => platform::toggle_fullscreen(PLAYER_ID),
+                Control::Fullscreen => platform::toggle_fullscreen(),
                 Control::PictureInPicture => platform::toggle_pip(VIDEO_ID),
                 // The next-episode button while the card counts is Play now.
                 Control::Play(id)
@@ -5008,6 +5090,7 @@ fn Player(
                     }) else {
                         return;
                     };
+                    on_notice.call(track_notice(true));
                     on_renegotiate.call(TrackPicks {
                         audio: TrackChoice::Index(index),
                         subtitle: choice(*subtitle.peek()),
@@ -5027,10 +5110,13 @@ fn Player(
                             switched.set(Some(choice(to)));
                             subtitle.set(to);
                         }
-                        SubtitleSwitch::Renegotiate => on_renegotiate.call(TrackPicks {
-                            audio: p.audio.map_or(TrackChoice::Default, TrackChoice::Index),
-                            subtitle: choice(to),
-                        }),
+                        SubtitleSwitch::Renegotiate => {
+                            on_notice.call(track_notice(false));
+                            on_renegotiate.call(TrackPicks {
+                                audio: p.audio.map_or(TrackChoice::Default, TrackChoice::Index),
+                                subtitle: choice(to),
+                            });
+                        }
                     }
                 }
             }
@@ -5292,7 +5378,7 @@ fn Player(
                 own_tracks: group.own_tracks,
                 on_own_tracks,
                 activity: group.log.lines(),
-                toast: group.log.toast(now_ms_u64()).map(str::to_owned),
+                toast: group.log.toast(now_ms_u64()).map(str::to_owned).or(notice),
                 own_track_members: group
                     .members
                     .iter()
@@ -5301,7 +5387,7 @@ fn Player(
                     .collect::<Vec<_>>(),
                 seen: seen::rows(&watch_seen, p.detail.item.id),
                 on_leave,
-                autoplay: !grouped,
+                autoplay: autoplay_after(grouped, start_paused),
                 can_start_together: can_watch_together(p.kind) && !compact,
                 invite,
                 invite_open,
@@ -5316,6 +5402,28 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    #[test]
+    fn a_remount_keeps_a_paused_video_paused() {
+        assert!(autoplay_after(false, false));
+        assert!(!autoplay_after(false, true), "paused stays paused");
+        assert!(!autoplay_after(true, false), "a group waits for its play");
+        assert!(!autoplay_after(true, true));
+    }
+
+    #[test]
+    fn the_notices_name_what_is_changing() {
+        assert_eq!(track_notice(true), "Switching audio…");
+        assert_eq!(track_notice(false), "Switching subtitles…");
+        assert_eq!(
+            quality_notice(4_000_000, 2_000_000),
+            "Lowering quality to 2 Mbps"
+        );
+        assert_eq!(
+            quality_notice(2_000_000, 8_000_000),
+            "Raising quality to 8 Mbps"
+        );
+    }
 
     /// An invite link is the invite route on this server, the group id as
     /// the server minted it.
