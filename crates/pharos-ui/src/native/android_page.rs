@@ -58,7 +58,18 @@ pub enum OpenError {
 
 /// The server this app talks to.
 pub fn server() -> String {
-    tv_page::server_base(android::load_server().as_deref())
+    // Read once: nothing in the app writes the file, and artwork asks per image.
+    static BASE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    BASE.get_or_init(|| tv_page::server_base(android::load_server().as_deref()))
+        .clone()
+}
+
+/// Artwork straight from the server, which serves it without the token
+/// (keyed tags, ADR-0073). Through the proxy each image held one of the
+/// WebView's request threads for seconds, and the bridge's own calls queued
+/// behind them: a D-pad press took up to 45 s to answer.
+pub fn art_src(src: &str) -> String {
+    tv_page::art_src(&server(), src)
 }
 
 /// Connect, then resume with the stored device token. No token, or one the

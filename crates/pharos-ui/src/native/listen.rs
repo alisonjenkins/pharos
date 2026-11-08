@@ -432,7 +432,7 @@ pub fn ListenView(
                     div { class: "pharos-listen-disc", aria_hidden: "true" }
                     div { class: "pharos-listen-art",
                         match &image {
-                            Some(src) => rsx! { img { src: "{src}", alt: "" } },
+                            Some(src) => rsx! { img { src: platform::art_src(src), alt: "" } },
                             None => rsx! { div { class: "pharos-poster-placeholder", aria_hidden: "true", "♪" } },
                         }
                     }
