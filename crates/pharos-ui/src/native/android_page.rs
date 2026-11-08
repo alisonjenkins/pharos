@@ -305,6 +305,22 @@ pub fn on_back(on_back: impl FnMut() -> bool + 'static) -> BackWatch {
 /// answers whether it used the press (closing the player, say); when no
 /// listener does, the app goes to the background, as Android's own Back
 /// would have.
+/// A listener for media elements' `timeupdate`s, removed on drop.
+pub struct TimeUpdates(u64);
+
+impl Drop for TimeUpdates {
+    fn drop(&mut self) {
+        unlisten(self.0);
+    }
+}
+
+/// Call `on_tick` with the element's id on each media `timeupdate`, at most
+/// once a second per element. The bridge keeps them from Dioxus, whose
+/// events each hold the WebView until Rust answers.
+pub fn on_time_update(on_tick: impl FnMut(&str) + 'static) -> TimeUpdates {
+    TimeUpdates(listen(Listener::Tick(Box::new(on_tick))))
+}
+
 pub fn on_back_at_root(on_back: impl FnMut() -> bool + 'static) -> BackAtRoot {
     BackAtRoot(listen(Listener::Root(Box::new(on_back))))
 }
@@ -1332,6 +1348,8 @@ enum Listener {
     Root(Box<dyn FnMut() -> bool>),
     /// hls.js events for the player on one media element.
     Hls(String, Box<dyn FnMut(tv_page::HlsEvent)>),
+    /// A media element's `timeupdate`, with its id.
+    Tick(Box<dyn FnMut(&str)>),
 }
 
 fn listen(listener: Listener) -> u64 {
@@ -1497,13 +1515,24 @@ addEventListener("popstate", (e) => {
 });
 window.__pharosSend = send;
 // Media events do not bubble, but a capturing listener on the document
-// hears every media element's.
+// hears every media element's. `timeupdate` stops here: Dioxus would hold
+// the page for each of its four a second, so Rust hears one a second as a
+// tick instead.
+const ticked = {};
 const media = (e) => {
   const v = e.target;
   if (!(v instanceof HTMLMediaElement) || !v.id) return;
+  let tick = false;
+  if (e.type === 'timeupdate') {
+    e.stopPropagation();
+    const now = performance.now();
+    if (now - (ticked[v.id] || 0) < 1000) return;
+    ticked[v.id] = now;
+    tick = true;
+  }
   const q = v.getVideoPlaybackQuality ? v.getVideoPlaybackQuality() : null;
   send({
-    t: "media", id: v.id, pos: v.currentTime,
+    t: "media", id: v.id, tick, pos: v.currentTime,
     dur: Number.isFinite(v.duration) ? v.duration : null,
     paused: v.paused, ended: v.ended, seeking: v.seeking, ready: v.readyState,
     rate: v.playbackRate, vol: v.volume, muted: v.muted,
@@ -1644,7 +1673,17 @@ fn on_bridge(message: Bridge) {
         Bridge::Size { w, h } => *lock(&VIEWPORT) = (w, h),
         Bridge::Media(media) => {
             let at = now_ms();
-            lock(&MEDIA).insert(media.id.clone(), (media, at));
+            let (id, tick) = (media.id.clone(), media.tick);
+            lock(&MEDIA).insert(id.clone(), (media, at));
+            if tick {
+                for f in &listeners {
+                    if let Ok(mut f) = f.try_lock() {
+                        if let Listener::Tick(f) = &mut f.0 {
+                            f(&id);
+                        }
+                    }
+                }
+            }
         }
         Bridge::Hls { id, event } => {
             for f in &listeners {
