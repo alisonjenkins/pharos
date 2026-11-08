@@ -250,6 +250,7 @@ mod tests {
             fonts: Vec::new(),
             artists: Vec::new(),
             album: None,
+            cast: Vec::new(),
         }
     }
 

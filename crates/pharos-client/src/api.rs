@@ -11,8 +11,8 @@ use pharos_api::pharos_capnp::{
     item_id, item_query, item_summary, items_result, library, lyrics_result, me_result,
     media_token_result, negotiate_result, opt_u16, opt_u32, playback, playback_grant, pref_result,
     prefs, session, start_tracks_result, stream_choice, telemetry, track, user_data,
-    user_state_result, Kind, LibraryKind as WireLibraryKind, SegmentKind as WireSegmentKind,
-    SubtitleDelivery,
+    user_state_result, CreditKind as WireCreditKind, Kind, LibraryKind as WireLibraryKind,
+    SegmentKind as WireSegmentKind, SubtitleDelivery,
 };
 pub use pharos_api::pharos_capnp::{EventKind as ClientEventKind, Level as ClientLevel};
 pub use pharos_api::PASSWORD_CHANGED_REVOKE_FAILED;
@@ -212,6 +212,28 @@ pub struct Detail {
     pub artists: Vec<String>,
     /// A song's album name.
     pub album: Option<String>,
+    /// Who appears in it, in billed order. A series or season lists its
+    /// regulars ranked across its episodes.
+    pub cast: Vec<Credit>,
+}
+
+/// Someone who appears in an item, and who they play.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Credit {
+    pub name: String,
+    /// Empty when the credit names no character.
+    pub character: String,
+    pub kind: CreditKind,
+    /// The person's photo on this server, `None` when there is none.
+    pub image_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CreditKind {
+    #[default]
+    Actor,
+    /// Appears in this one episode only.
+    GuestStar,
 }
 
 /// A font the file embeds. `url` holds `{subtitle}`, the index of the
@@ -995,6 +1017,22 @@ impl PharosApi for NativeApi {
                         .map(text)
                         .collect::<Result<_, capnp::Error>>()?,
                     album: Some(text(d.get_album())?).filter(|a| !a.is_empty()),
+                    cast: d
+                        .get_cast()?
+                        .iter()
+                        .filter_map(|c| {
+                            let kind = read_credit_kind(c.get_kind())?;
+                            Some((|| -> Result<Credit, capnp::Error> {
+                                Ok(Credit {
+                                    name: text(c.get_name())?,
+                                    character: text(c.get_character())?,
+                                    kind,
+                                    image_url: Some(text(c.get_image_url())?)
+                                        .filter(|u| !u.is_empty()),
+                                })
+                            })())
+                        })
+                        .collect::<Result<_, capnp::Error>>()?,
                 })
             }
             detail_result::Error(e) => Err(ClientError::from_api(e?)),
@@ -1333,6 +1371,15 @@ fn read_library_kind(kind: Result<WireLibraryKind, capnp::NotInSchema>) -> Libra
     }
 }
 
+/// A credit kind newer than this build has no row to show it in, so the
+/// credit is left out rather than failing the whole detail.
+fn read_credit_kind(kind: Result<WireCreditKind, capnp::NotInSchema>) -> Option<CreditKind> {
+    match kind.ok()? {
+        WireCreditKind::Actor => Some(CreditKind::Actor),
+        WireCreditKind::GuestStar => Some(CreditKind::GuestStar),
+    }
+}
+
 fn read_kind(kind: Result<Kind, capnp::NotInSchema>) -> ItemKind {
     let Ok(kind) = kind else {
         return ItemKind::Other;
@@ -1476,6 +1523,15 @@ mod tests {
         assert!(decision("transcode", "/videos/1/master.m3u8?PlaySessionId=p").is_hls());
         assert!(!decision("direct_play", "/videos/1/stream?static=true").is_hls());
         assert!(!decision("", "/videos/1/stream?static=true&x=.m3u8").is_hls());
+    }
+
+    #[test]
+    fn a_credit_kind_newer_than_the_client_is_left_out() {
+        assert_eq!(read_credit_kind(Err(capnp::NotInSchema(9))), None);
+        assert_eq!(
+            read_credit_kind(Ok(WireCreditKind::GuestStar)),
+            Some(CreditKind::GuestStar)
+        );
     }
 
     #[test]
