@@ -216,6 +216,12 @@ pub fn can_reload() -> bool {
     false
 }
 
+/// The TV's remote sets the volume, so the app stays at full and draws no
+/// volume control of its own.
+pub fn owns_volume() -> bool {
+    false
+}
+
 pub fn reload() {}
 
 pub fn replace(path: &str) {

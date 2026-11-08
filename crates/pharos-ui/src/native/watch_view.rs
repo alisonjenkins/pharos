@@ -748,6 +748,9 @@ pub(super) fn Volume(
     #[props(default)]
     filled: bool,
 ) -> Element {
+    if !platform::owns_volume() {
+        return rsx! {};
+    }
     let shown = if media.muted { 0.0 } else { media.volume };
     let fill = format!("--pharos-fill: {:.0}%", shown * 100.0);
     rsx! {
