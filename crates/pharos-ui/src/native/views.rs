@@ -763,7 +763,7 @@ pub fn PosterTile(item: Item) -> Element {
                 onpointerleave: move |evt| depth::untilt(&evt),
                 match &item.image {
                     Some(src) => rsx! { Art { src: src.clone(), sizes: POSTER_SIZES } },
-                    None => rsx! { div { class: "pharos-poster-placeholder", aria_hidden: "true", "{initial(&item.name)}" } },
+                    None => rsx! { ArtPlaceholder { kind: item.kind, name: item.name.clone() } },
                 }
                 if item.played {
                     span { class: "pharos-badge", "Watched" }
@@ -778,6 +778,21 @@ pub fn PosterTile(item: Item) -> Element {
                 span { class: "pharos-poster-sub", title: "{line}", "{line}" }
             }
         }
+    }
+}
+
+/// What stands where an item has no art: a song gets the music tile (V751),
+/// anything else its initial.
+#[component]
+fn ArtPlaceholder(kind: ItemKind, name: String) -> Element {
+    if kind == ItemKind::Audio {
+        rsx! {
+            div { class: "pharos-poster-placeholder pharos-art-song", aria_hidden: "true",
+                span { class: "pharos-art-note", "♪" }
+            }
+        }
+    } else {
+        rsx! { div { class: "pharos-poster-placeholder", aria_hidden: "true", "{initial(&name)}" } }
     }
 }
 
@@ -824,8 +839,10 @@ pub fn TitleView(
     rsx! {
         article { class: "pharos-title",
             div { class: "pharos-title-art",
-                if let Some(src) = &item.image {
-                    Art { src: src.clone(), sizes: "16rem", lazy: false }
+                match &item.image {
+                    Some(src) => rsx! { Art { src: src.clone(), sizes: "16rem", lazy: false } },
+                    None if item.kind == ItemKind::Audio => rsx! { ArtPlaceholder { kind: item.kind, name: item.name.clone() } },
+                    None => rsx! {},
                 }
             }
             div { class: "pharos-title-body",
@@ -2219,6 +2236,43 @@ mod tests {
         assert!(
             html.contains(r#"title="2001""#) && !html.contains("Ignored"),
             "{html}"
+        );
+    }
+
+    /// B801 (V751): a song with no cover gets the music tile, on its card and
+    /// its title page; a film with no poster keeps its initial.
+    #[test]
+    fn a_song_without_a_cover_shows_the_music_tile() {
+        let song = item(ItemKind::Audio);
+        let card = render({
+            let song = song.clone();
+            move || rsx! { PosterTile { item: song.clone() } }
+        });
+        assert!(
+            card.contains("pharos-art-song") && card.contains("♪"),
+            "{card}"
+        );
+        let detail = Detail {
+            item: song,
+            overview: String::new(),
+            genres: vec![],
+            chapters: vec![],
+            audio_tracks: vec![],
+            subtitle_tracks: vec![],
+            trickplay: vec![],
+            segments: vec![],
+            fonts: Vec::new(),
+            artists: Vec::new(),
+            album: None,
+        };
+        let page = render(move || rsx! { TitleView { detail: detail.clone() } });
+        assert!(page.contains("pharos-art-song"), "{page}");
+
+        let film = item(ItemKind::Movie);
+        let card = render(move || rsx! { PosterTile { item: film.clone() } });
+        assert!(
+            !card.contains("pharos-art-song") && card.contains(">N<"),
+            "{card}"
         );
     }
 
