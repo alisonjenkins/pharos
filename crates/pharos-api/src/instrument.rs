@@ -73,6 +73,12 @@ impl Connection {
         self.id
     }
 
+    /// Calls running on this connection now: begun and not yet answered,
+    /// cancelled or dropped.
+    pub fn in_flight(&self) -> u32 {
+        self.in_flight.get()
+    }
+
     /// Records the authenticated user on every later call's span and log.
     pub fn set_user(&self, user: &str) {
         user.clone_into(&mut self.user.borrow_mut());
