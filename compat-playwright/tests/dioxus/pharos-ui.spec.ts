@@ -1860,6 +1860,131 @@ test.describe("pharos Dioxus UI", () => {
       expect(hlsjs).toEqual([]);
     });
 
+    // V701/V702 (spec 031 slice 3, T031-15): a small hole in the buffer stalls
+    // the browser; the Rust engine's watchdog jumps it and logs the jump. The
+    // test cuts 0.4 s of audio out of a segment ahead of the play head. Opus
+    // frames are all keyframes, so the cut is exact, and the segment's
+    // midpoint stays buffered, so the planner does not fetch it again.
+    test("the Rust engine jumps a small hole in the buffer", async ({
+      page,
+      request,
+      browserName,
+    }) => {
+      test.setTimeout(120_000);
+      const probe = await request.get(`${PHAROS_URL}/pharos/session`, {
+        headers: { Accept: "application/json" },
+      });
+      test.skip(probe.status() !== 405, `native API is not enabled (status ${probe.status()})`);
+      const auth = await request.post(`${PHAROS_URL}/Users/AuthenticateByName`, {
+        headers: {
+          "Content-Type": "application/json",
+          "X-Emby-Authorization": `MediaBrowser Client="playwright", Device="pw", DeviceId="pw-gap-${Date.now()}", Version="0"`,
+        },
+        data: { Username: TEST_USER, Pw: TEST_PASS },
+      });
+      test.skip(!auth.ok(), `pharos has no seeded test user (${TEST_USER})`);
+      const { AccessToken: token, User: user } = await auth.json();
+      const api = { "X-Emby-Token": token };
+      const fixture = async () =>
+        (
+          await (
+            await request.get(
+              `${PHAROS_URL}/Users/${user.Id}/Items?Recursive=true&IncludeItemTypes=Movie&Fields=Path,MediaSources`,
+              { headers: api },
+            )
+          ).json()
+        ).Items?.find((i: { Path?: string }) => i.Path?.endsWith("/fixture-1.webm"));
+      await expect
+        .poll(async () => (await fixture())?.MediaSources?.[0]?.Container, {
+          timeout: 30_000,
+        })
+        .toMatch(/webm/);
+      const movie = await fixture();
+      test.skip(!movie, "pharos has no seeded movie");
+      const nativeId = BigInt(`0x${movie.Id}`).toString();
+      // An earlier test's seek leaves a resume point; start from the top.
+      await request.post(`${PHAROS_URL}/Sessions/Playing/Progress`, {
+        headers: api,
+        data: {
+          ItemId: movie.Id,
+          PlaySessionId: `pw-reset-${Date.now()}`,
+          PositionTicks: 0,
+          IsPaused: true,
+        },
+      });
+
+      await page.addInitScript(() => {
+        const canPlayType = HTMLMediaElement.prototype.canPlayType;
+        HTMLMediaElement.prototype.canPlayType = function (type: string) {
+          return /mpegurl|webm|matroska/i.test(type) ? "" : canPlayType.call(this, type);
+        };
+        const add = MediaSource.prototype.addSourceBuffer;
+        MediaSource.prototype.addSourceBuffer = function (mime: string) {
+          const sb = add.call(this, mime);
+          if (/^audio\//.test(mime)) (window as unknown as { pwAudio: SourceBuffer }).pwAudio = sb;
+          return sb;
+        };
+      });
+      const logs: string[] = [];
+      page.on("console", (m) => logs.push(m.text()));
+
+      await page.goto("/ui/");
+      await page.locator("#signin-name").fill(TEST_USER);
+      await page.locator("#signin-password").fill(TEST_PASS);
+      await page.getByRole("button", { name: "Sign in" }).click();
+      await expect(page.locator(".pharos-shell-bar")).toBeVisible({ timeout: 15_000 });
+
+      await page.goto(`/ui/watch/${nativeId}?engine=rust`);
+      const video = () =>
+        page.evaluate(() => {
+          const v = document.getElementById("pharos-video") as HTMLVideoElement | null;
+          const a = (window as unknown as { pwAudio?: SourceBuffer }).pwAudio;
+          const r = a?.buffered;
+          return {
+            t: v?.currentTime ?? 0,
+            audioEnd: r && r.length > 0 ? r.end(r.length - 1) : 0,
+            updating: a?.updating ?? true,
+          };
+        });
+      await expect.poll(async () => (await video()).t, { timeout: 60_000 }).toBeGreaterThan(1);
+
+      // The next segment boundary past the play head, with that whole segment buffered.
+      const hole = Math.ceil(((await video()).t + 1) / 6) * 6 + 1;
+      await expect
+        .poll(
+          async () => {
+            const v = await video();
+            return v.audioEnd > hole + 3 && !v.updating;
+          },
+          { timeout: 60_000 },
+        )
+        .toBe(true);
+      await page.evaluate((from) => {
+        (window as unknown as { pwAudio: SourceBuffer }).pwAudio.remove(from, from + 0.4);
+      }, hole);
+
+      const stalls = () => logs.filter((l) => l.includes("pharos: playback stall")).join("\n");
+      await expect
+        .poll(async () => (await video()).t, { timeout: 30_000 })
+        .toBeGreaterThan(hole + 1);
+      // Firefox plays through a short audio hole by itself; Chromium stalls
+      // at it, so there the watchdog has to jump it.
+      if (browserName === "chromium") {
+        expect(
+          logs.some((l) => /pharos: playback stall engine=rust action=jump .*gap_ms=\d+/.test(l)),
+          stalls(),
+        ).toBe(true);
+        await expect
+          .poll(() => logs.some((l) => l.includes("playback stall engine=rust action=recovered")), {
+            timeout: 5_000,
+          })
+          .toBe(true);
+      }
+      expect(logs.filter((l) => l.includes("action=give_up"))).toEqual([]);
+      expect(logs.filter((l) => l.includes("engine=rust fallback="))).toEqual([]);
+      expect(logs.filter((l) => l.includes("playback error engine=rust"))).toEqual([]);
+    });
+
     // V648/V649 (spec 031 slice 4): on a link that slows mid-play the Rust
     // engine steps down a rung at a segment boundary, with no reload and no
     // jump in currentTime, and logs the switch with what it decided on. The
