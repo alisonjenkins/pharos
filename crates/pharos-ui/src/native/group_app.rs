@@ -209,7 +209,10 @@ pub fn group_to_rejoin(kept: Option<String>, in_group: bool) -> Option<String> {
 
 /// What the tab kept before this page loaded.
 pub fn kept_before_load() -> Option<String> {
-    platform::session_get(GROUP_KEY).ok().flatten()
+    platform::session_get(GROUP_KEY).unwrap_or_else(|e| {
+        platform::warn(&format!("pharos: reading the kept group failed: {e}"));
+        None
+    })
 }
 
 #[cfg(test)]
