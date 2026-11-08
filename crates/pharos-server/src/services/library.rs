@@ -206,15 +206,12 @@ pub async fn resume(
     crate::services::access::retain_visible(state, user, &mut ids, |id| *id, "resume")
         .await
         .map_err(ListError::Hidden)?;
-    let mut items: Vec<MediaItem> = Vec::with_capacity(ids.len());
-    for id in &ids {
-        match state.stores.get(*id).await {
-            Ok(item) => items.push(item),
-            // Deleted since it was resumed: skipped, not an error.
-            Err(DomainError::NotFound(_)) => {}
-            Err(e) => return Err(ListError::Store(e)),
-        }
-    }
+    // One query for every resumed id; a row deleted since it was resumed is skipped.
+    let items = state
+        .stores
+        .get_many(&ids)
+        .await
+        .map_err(ListError::Store)?;
     let items = kinds.keep(items);
     let total = u32::try_from(items.len()).unwrap_or(u32::MAX);
     let start = start.min(total);
