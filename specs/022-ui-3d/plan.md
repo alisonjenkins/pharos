@@ -52,7 +52,7 @@ Each is one PR of atomic commits, reviewed with /review, fixed, fixups
 squashed, then handed to the merge queue. SyncPlay PRs merge first when both
 are ready.
 
-1. **Native API carries 3D (FR-001 to FR-004, FR-009)**, about 1 day.
+1. **Native API carries 3D (FR-001 to FR-004, FR-009)**, about 1 day. Done (2026-11-08, schema 28, B770/V720; the ids V291/B351 below were never landed).
    Schema and contract copy; `rpc/library.rs` writes `stereo` and
    `versions`, reads `ItemQuery.stereo` into the store's `is_3d`;
    `GrantRequest` gains `edition: Option<&str>`, resolved like the Jellyfin
@@ -60,7 +60,7 @@ are ready.
    (2D primary with a 3D edition: summary says 3D, detail lists both,
    negotiate plays the edition's file), the filter test, an older-client test
    that ignores the new fields. B351 and V291 land in the baseline here.
-2. **Library shows 3D (US1)**, about half a day. Badge on `PosterTile`,
+2. **Library shows 3D (US1)**, about half a day. Done (2026-11-08, V722; no per-device 3D default: the primary plays until a version is picked). Badge on `PosterTile`,
    "3D" chip in the filter bar, version picker on the detail page with the
    per-device default (Decision 5) and the remembered choice in
    `localStorage`. Guards: Dioxus render tests; a Playwright case over a
@@ -89,6 +89,8 @@ are ready.
   negotiation; PR 1 adds an `edition` field (`primary` or `alternate`) to the
   native negotiate log line so a 3D play is visible by query:
   `{namespace="pharos"} |= "pharos::rpc::playback" | json | edition="alternate"`.
+  As built, `edition` carries the version's id, or `primary`:
+  `{namespace="pharos"} |= "native playback negotiated" != "edition=primary"`.
 - Client: `xrSessionStarted{format,path}` and `xrSessionFailed{reason}` in
   the 016 telemetry stream.
 
