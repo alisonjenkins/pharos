@@ -138,6 +138,16 @@ impl MediaStore for AnyStore {
         .await
     }
 
+    async fn get_many(&self, ids: &[MediaId]) -> DomainResult<Vec<MediaItem>> {
+        timed("get_items_by_ids", async {
+            match self {
+                AnyStore::Sqlite(s) => MediaStore::get_many(s, ids).await,
+                AnyStore::Postgres(p) => MediaStore::get_many(p, ids).await,
+            }
+        })
+        .await
+    }
+
     async fn put(&self, item: MediaItem) -> DomainResult<()> {
         match self {
             AnyStore::Sqlite(s) => s.put(item).await,

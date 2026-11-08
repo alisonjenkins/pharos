@@ -748,6 +748,27 @@ impl MediaStore for PostgresStore {
         }
     }
 
+    #[tracing::instrument(skip(self, ids), fields(count = ids.len()))]
+    async fn get_many(&self, ids: &[MediaId]) -> DomainResult<Vec<MediaItem>> {
+        let ids_i64 = ids
+            .iter()
+            .map(|id| media_id_i64(*id))
+            .collect::<DomainResult<Vec<i64>>>()?;
+        let sql = format!("SELECT {MEDIA_COLUMNS} FROM media_items WHERE id = ANY($1)");
+        let rows = sqlx::query_as::<_, MediaRow>(sqlx::AssertSqlSafe(sql))
+            .bind(ids_i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| DomainError::Backend(e.to_string()))?;
+        let mut by_id: std::collections::HashMap<MediaId, MediaItem> =
+            std::collections::HashMap::with_capacity(rows.len());
+        for row in rows {
+            let item = row.into_domain()?;
+            by_id.insert(item.id, item);
+        }
+        Ok(ids.iter().filter_map(|id| by_id.get(id).cloned()).collect())
+    }
+
     #[tracing::instrument(skip(self, item), fields(media.id = %item.id, media.kind = item.kind.as_str()))]
     async fn put(&self, item: MediaItem) -> DomainResult<()> {
         let sql = crate::postgres_put::upsert_sql(1);
