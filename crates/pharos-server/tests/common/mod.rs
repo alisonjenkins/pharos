@@ -224,6 +224,9 @@ pub fn build_app(
 > {
     App::new()
         .app_data(state)
+        .wrap(actix_web::middleware::from_fn(
+            pharos_server::middleware::sign_image_tags,
+        ))
         .wrap(pharos_server::middleware::nosniff())
         .wrap(pharos_server::middleware::CookieBackfill)
         .wrap(LowercasePath)
