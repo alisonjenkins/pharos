@@ -4,8 +4,11 @@
 //! renders under `dioxus-ssr` in tests (009 FR-014).
 
 use dioxus::prelude::*;
-use pharos_client::api::{Detail, Home, HomeRail, Item, ItemKind, ItemRef, LibraryKind, Page};
+use pharos_client::api::{
+    Credit, CreditKind, Detail, Home, HomeRail, Item, ItemKind, ItemRef, LibraryKind, Page,
+};
 
+use super::account::initials;
 use super::art::{Art, POSTER_SIZES};
 use super::depth;
 use super::find::SUGGEST_LIMIT;
@@ -743,6 +746,11 @@ pub fn TitleView(
     .collect();
     let facts = facts.join(" · ");
     let resume = progress_percent(item).is_some();
+    let (cast, guests): (Vec<Credit>, Vec<Credit>) = detail
+        .cast
+        .iter()
+        .cloned()
+        .partition(|c| c.kind == CreditKind::Actor);
     rsx! {
         article { class: "pharos-title",
             div { class: "pharos-title-art",
@@ -817,6 +825,38 @@ pub fn TitleView(
                 }
                 if !detail.genres.is_empty() {
                     p { class: "pharos-muted", "{detail.genres.join(\", \")}" }
+                }
+            }
+        }
+        if !cast.is_empty() {
+            CastRail { title: "Cast".to_string(), cast }
+        }
+        if !guests.is_empty() {
+            CastRail { title: "Guest stars".to_string(), cast: guests }
+        }
+    }
+}
+
+/// A row of the people in a title: photo (or initials), name, and the
+/// character they play. A plain `<img>`, not [`Art`]: the portrait route
+/// serves the provider's bytes as they are, with no resizing or AVIF.
+#[component]
+fn CastRail(title: String, cast: Vec<Credit>) -> Element {
+    rsx! {
+        section { class: "pharos-cast", aria_label: "{title}",
+            h3 { "{title}" }
+            ul { class: "pharos-cast-list",
+                for (i, c) in cast.into_iter().enumerate() {
+                    li { key: "{i}", class: "pharos-cast-member",
+                        match &c.image_url {
+                            Some(src) => rsx! { img { class: "pharos-cast-photo", src: "{src}", alt: "", loading: "lazy", decoding: "async" } },
+                            None => rsx! { div { class: "pharos-cast-photo pharos-cast-initials", aria_hidden: "true", "{initials(&c.name)}" } },
+                        }
+                        span { class: "pharos-cast-name", title: "{c.name}", "{c.name}" }
+                        if !c.character.is_empty() {
+                            span { class: "pharos-cast-character", title: "{c.character}", "{c.character}" }
+                        }
+                    }
                 }
             }
         }
@@ -1928,6 +1968,74 @@ mod tests {
             "{html}"
         );
         assert!(html.contains(r#"href="/ui/browse/1""#), "{html}");
+    }
+
+    #[test]
+    fn an_episode_lists_its_cast_then_its_guest_stars() {
+        let credit = |name: &str, character: &str, kind, image: Option<&str>| Credit {
+            name: name.into(),
+            character: character.into(),
+            kind,
+            image_url: image.map(str::to_string),
+        };
+        let detail = Detail {
+            item: item(ItemKind::Episode),
+            overview: String::new(),
+            genres: vec![],
+            chapters: vec![],
+            audio_tracks: vec![],
+            subtitle_tracks: vec![],
+            trickplay: vec![],
+            segments: vec![],
+            fonts: Vec::new(),
+            artists: Vec::new(),
+            album: None,
+            cast: vec![
+                credit(
+                    "Jane Lead",
+                    "Captain",
+                    CreditKind::Actor,
+                    Some("/Items/p1/Images/Primary?tag=t"),
+                ),
+                credit("Sam Guest", "Stranger", CreditKind::GuestStar, None),
+                credit("No Role", "", CreditKind::Actor, None),
+            ],
+        };
+        let html = render(move || rsx! { TitleView { detail: detail.clone() } });
+        let (Some(cast), Some(guests)) = (
+            html.find(r#"aria-label="Cast""#),
+            html.find(r#"aria-label="Guest stars""#),
+        ) else {
+            panic!("both rails drawn: {html}");
+        };
+        assert!(cast < guests, "{html}");
+        assert!(html[cast..guests].contains("Jane Lead") && html[cast..guests].contains("Captain"));
+        assert!(html[cast..guests].contains(r#"src="/Items/p1/Images/Primary?tag=t""#));
+        assert!(
+            html[cast..guests].contains(">NR<"),
+            "initials stand in for a missing photo: {html}"
+        );
+        assert!(html[guests..].contains("Sam Guest") && html[guests..].contains("Stranger"));
+    }
+
+    #[test]
+    fn a_title_with_no_cast_draws_no_cast_rail() {
+        let detail = Detail {
+            item: item(ItemKind::Movie),
+            overview: String::new(),
+            genres: vec![],
+            chapters: vec![],
+            audio_tracks: vec![],
+            subtitle_tracks: vec![],
+            trickplay: vec![],
+            segments: vec![],
+            fonts: Vec::new(),
+            artists: Vec::new(),
+            album: None,
+            cast: vec![],
+        };
+        let html = render(move || rsx! { TitleView { detail: detail.clone() } });
+        assert!(!html.contains("pharos-cast"), "{html}");
     }
 
     #[test]
