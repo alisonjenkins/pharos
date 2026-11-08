@@ -104,6 +104,10 @@ pub fn ended(_video_id: &str) -> bool {
     false
 }
 
+pub fn has_data(_video_id: &str) -> bool {
+    false
+}
+
 pub fn media_state(_video_id: &str) -> MediaState {
     MediaState::default()
 }
