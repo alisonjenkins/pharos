@@ -2303,6 +2303,14 @@ pub fn start_ms(position_ms: u64, played: bool) -> u64 {
     }
 }
 
+/// hls.js `startPosition` for a start `start_ms` in, in seconds. Always an
+/// explicit time: -1 lets hls.js take the playlist's `EXT-X-START`, which the
+/// server sets to the saved position, so Play from start would resume.
+#[allow(clippy::cast_precision_loss)]
+pub fn hls_start_position(start_ms: u64) -> f64 {
+    start_ms as f64 / 1000.0
+}
+
 /// One trickplay thumbnail: the tile it is on and where in the tile.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Thumb {
@@ -5074,6 +5082,12 @@ mod tests {
         assert_eq!(start_ms(90_000, false), 90_000);
         assert_eq!(start_ms(90_000, true), 0);
         assert_eq!(start_ms(0, false), 0);
+    }
+
+    #[test]
+    fn a_start_from_zero_is_an_explicit_zero_not_the_playlist_start() {
+        assert_eq!(hls_start_position(0), 0.0);
+        assert_eq!(hls_start_position(90_500), 90.5);
     }
 
     /// Feeds `(dropped, presented)` totals once a second from t=0 and returns
