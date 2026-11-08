@@ -809,9 +809,10 @@
             export HOME=$TMPDIR
             # dx keeps DWARF by default, and binaryen aborts re-emitting it
             # (wasm-opt SIGABRT), which ships the wasm unoptimised.
+            # `wasm-release` (Cargo.toml) builds for size: opt-level z, fat LTO, 1 CGU.
             # Name the platform, bin and feature: with pharos-tv and its `mobile`
             # feature beside them, dx can no longer infer the target triple.
-            dx build --platform web --package pharos-ui --bin pharos-ui-web --features web --release --debug-symbols false
+            dx build --platform web --package pharos-ui --bin pharos-ui-web --features web --release --profile wasm-release --debug-symbols false
             runHook postBuild
           '';
           installPhase = ''
