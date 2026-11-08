@@ -1755,13 +1755,25 @@ fn NativeApp(route: Route) -> Element {
     }
     let phase = machine.read().phase().clone();
     match phase {
-        Phase::Connecting | Phase::Ready => rsx! {
-            StatusView {
-                title: "Connecting…",
-                detail: "Opening a connection to the server.",
-                action: None,
+        Phase::Connecting | Phase::Ready => {
+            let m = machine.read();
+            match m.waiting() {
+                Some(why) => rsx! {
+                    StatusView {
+                        title: "Waiting for the server…",
+                        detail: format!("{why} Trying again in {} s.", m.delay_ms().div_ceil(1000)),
+                        action: None,
+                    }
+                },
+                None => rsx! {
+                    StatusView {
+                        title: "Connecting…",
+                        detail: "Opening a connection to the server.",
+                        action: None,
+                    }
+                },
             }
-        },
+        }
         Phase::NotEnabled => rsx! {
             StatusView {
                 title: "This interface is not enabled",
