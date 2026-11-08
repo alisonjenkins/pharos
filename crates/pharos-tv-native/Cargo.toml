@@ -11,39 +11,49 @@ dioxus = { workspace = true, features = ["launch", "native"] }
 pharos-ui = { path = "../pharos-ui" }
 # `autofocus` gives the app root focus at start; Blitz sends keys only to
 # the focused node.
-dioxus-native = { version = "=0.7.10", default-features = false, features = ["autofocus"] }
+dioxus-native = { version = "=0.8.0-alpha.3", default-features = false, features = ["autofocus", "html", "svg"] }
 pharos-client = { path = "../pharos-client" }
 log = "0.4"
 
 [target.'cfg(target_os = "android")'.dependencies]
+# Android's font backend. On the host it would need fontconfig, and the
+# snapshot registers its own font.
+dioxus-native = { version = "=0.8.0-alpha.3", default-features = false, features = ["system-fonts"] }
 android_logger = "0.15"
 # dx writes no `android_main` for the native renderer, so the bin hands the
 # AndroidApp to blitz-shell itself.
 android-activity = { version = "0.6", features = ["native-activity"] }
-blitz-shell = "=0.2.3"
+blitz-shell = "=0.3.0-beta.4"
 # The default path calls __system_property_read_callback, which the link
 # under dx does not resolve (unexplained; LTO dropped it in the smoke app).
 # The deprecated bionic calls exist on every API level.
 android-properties = { version = "0.2", features = ["bionic-deprecated"] }
 
 [features]
-# Renderer matrix (spec 032): draw with Vello CPU, presented through wgpu
-# (pixels) or a CPU surface (softbuffer). Default is GPU Vello.
-cpu = ["dioxus-native/cpu-pixels"]
-cpu-softbuffer = ["dioxus-native/cpu-softbuffer"]
+# Renderer matrix (spec 032). Pick exactly one.
+default = ["vello-hybrid"]
+vello = ["dioxus-native/vello"]
+vello-hybrid = ["dioxus-native/vello-hybrid"]
+vello-cpu = ["dioxus-native/vello-cpu-pixels"]
+vello-cpu-softbuffer = ["dioxus-native/vello-cpu-softbuffer"]
+skia = ["dioxus-native/skia"]
+skia-pixels = ["dioxus-native/skia-pixels"]
+skia-softbuffer = ["dioxus-native/skia-softbuffer"]
+# Logs each frame's paint and render times.
+log-times = ["dioxus-native/log-times"]
 
 [lints]
 workspace = true
 
 # Host snapshot (examples/snapshot.rs): the same screens to PNG on the CPU.
 [dev-dependencies]
-dioxus-native-dom = "=0.7.10"
-blitz-dom = "=0.2.4"
-blitz-traits = "=0.2.0"
-blitz-paint = "=0.2.1"
-anyrender = "=0.6.2"
-anyrender_vello_cpu = "=0.8.1"
-keyboard-types = "=0.7.0"
+dioxus-native-dom = "=0.8.0-alpha.3"
+blitz-dom = "=0.3.0-beta.4"
+blitz-traits = "=0.3.0-beta.4"
+blitz-paint = "=0.3.0-beta.4"
+anyrender = "=0.14.0"
+anyrender_vello_cpu = "=0.18.0"
+keyboard-types = "0.8"
 png = "0.17"
-parley = "=0.6.0"
-fontique = "=0.6.0"
+parley = "0.12"
+fontique = "0.12"

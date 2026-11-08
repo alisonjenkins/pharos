@@ -90,15 +90,15 @@ fn main() {
             },
         );
         doc.initial_build();
+        use blitz_dom::Document as _;
         let started = std::time::Instant::now();
-        doc.resolve(0.0);
+        doc.inner_mut().resolve(0.0);
         let resolved = started.elapsed();
         if screen.is_some() && std::env::var_os("SNAPSHOT_KEYS").is_some() {
-            use blitz_dom::Document as _;
             use blitz_traits::events::{BlitzKeyEvent, KeyState, UiEvent};
-            use keyboard_types::{Code, Key, Location, Modifiers};
-            println!("focussed node {:?}", doc.get_focussed_node_id());
-            let keys = if screen == Some(Screen::Grid) { vec![Key::ArrowDown; 4] } else { vec![Key::ArrowRight, Key::ArrowRight, Key::ArrowDown] };
+            use keyboard_types::{Code, Key, Location, Modifiers, NamedKey};
+            println!("focussed node {:?}", doc.inner().get_focussed_node_id());
+            let keys = if screen == Some(Screen::Grid) { vec![Key::Named(NamedKey::ArrowDown); 4] } else { vec![Key::Named(NamedKey::ArrowRight), Key::Named(NamedKey::ArrowRight), Key::Named(NamedKey::ArrowDown)] };
             for key in keys {
                 let ev = |state| BlitzKeyEvent {
                     key: key.clone(), code: Code::Unidentified, modifiers: Modifiers::empty(),
@@ -109,21 +109,22 @@ fn main() {
                 doc.handle_ui_event(UiEvent::KeyUp(ev(KeyState::Released)));
                 doc.poll(None);
             }
-            doc.resolve(0.0);
+            doc.inner_mut().resolve(0.0);
         }
         if std::env::var_os("SNAPSHOT_DEBUG").is_some() {
             for sel in [".pharos-tv-focus", ".pharos-grid", ".pharos-grid > li", ".pharos-poster", ".pharos-poster-art", ".pharos-poster-placeholder", ".pharos-poster-name", ".pharos-rail"] {
-                if let Ok(Some(id)) = doc.query_selector(sel) {
-                    let node = doc.get_node(id).unwrap();
-                    let l = node.final_layout;
-                    println!("{sel}: id {id} size {:?} loc {:?} display {:?} attrs {:?}", l.size, l.location, node.style.display, node.element_data().map(|e| e.attrs().iter().map(|a| (a.name.local.to_string(), a.value.clone())).collect::<Vec<_>>()));
+                let inner = doc.inner();
+                if let Ok(Some(id)) = inner.query_selector(sel) {
+                    let node = inner.get_node(id).unwrap();
+                    let l = node.final_layout();
+                    println!("{sel}: id {id} size {:?} loc {:?} display {:?} attrs {:?}", l.size, l.location, (), node.element_data().map(|e| e.attrs().iter().map(|a| (a.name.local.to_string(), a.value.clone())).collect::<Vec<_>>()));
                 } else {
                     println!("{sel}: none");
                 }
             }
         }
         let rgba = render_to_buffer::<VelloCpuImageRenderer, _>(
-            |scene| blitz_paint::paint_scene(scene, &doc, SCALE as f64, WIDTH, HEIGHT),
+            |scene| blitz_paint::paint_scene(scene, &mut doc.inner_mut(), SCALE as f64, WIDTH, HEIGHT, 0, 0),
             WIDTH,
             HEIGHT,
         );

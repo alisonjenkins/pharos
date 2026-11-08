@@ -462,7 +462,7 @@ pub fn WatchView(
         // The invite panel is a dialog: its keys are its own, and Escape
         // closes it.
         if invite_open {
-            if evt.key() == Key::Escape {
+            if evt.key() == Key::Named(NamedKey::Escape) {
                 evt.prevent_default();
                 on_control.call(Control::ShowInvite(false));
             }
@@ -962,7 +962,7 @@ pub(super) fn slider_key(evt: KeyboardEvent, wake: Option<Wake>) {
 
 /// Whether a track menu keeps `key`: the keys that open it and move along it.
 fn menu_takes(key: &Key) -> bool {
-    moves_a_control(key) || matches!(key, Key::Enter) || key.to_string() == " "
+    moves_a_control(key) || matches!(key, Key::Named(NamedKey::Enter)) || key.to_string() == " "
 }
 
 /// A key pressed on a track menu: the keys that open it and move along
@@ -977,14 +977,14 @@ fn menu_key(evt: KeyboardEvent, wake: Option<Wake>) {
 fn moves_a_control(key: &Key) -> bool {
     matches!(
         key,
-        Key::ArrowLeft
-            | Key::ArrowRight
-            | Key::ArrowUp
-            | Key::ArrowDown
-            | Key::Home
-            | Key::End
-            | Key::PageUp
-            | Key::PageDown
+        Key::Named(NamedKey::ArrowLeft)
+            | Key::Named(NamedKey::ArrowRight)
+            | Key::Named(NamedKey::ArrowUp)
+            | Key::Named(NamedKey::ArrowDown)
+            | Key::Named(NamedKey::Home)
+            | Key::Named(NamedKey::End)
+            | Key::Named(NamedKey::PageUp)
+            | Key::Named(NamedKey::PageDown)
     )
 }
 
@@ -1496,16 +1496,16 @@ mod tests {
     #[test]
     fn a_menu_keeps_its_own_keys_and_a_slider_its_arrows() {
         for key in [
-            Key::ArrowDown,
-            Key::ArrowUp,
-            Key::Enter,
+            Key::Named(NamedKey::ArrowDown),
+            Key::Named(NamedKey::ArrowUp),
+            Key::Named(NamedKey::Enter),
             Key::Character(" ".into()),
         ] {
             assert!(menu_takes(&key), "{key:?}");
         }
         assert!(!menu_takes(&Key::Character("m".into())));
-        assert!(moves_a_control(&Key::ArrowLeft));
-        assert!(!moves_a_control(&Key::Enter));
+        assert!(moves_a_control(&Key::Named(NamedKey::ArrowLeft)));
+        assert!(!moves_a_control(&Key::Named(NamedKey::Enter)));
     }
 
     #[test]
@@ -1732,10 +1732,10 @@ mod tests {
                 muted: true
             })
         );
-        assert_eq!(key(Key::ArrowLeft), Some(Control::Seek(20_000)));
-        assert_eq!(key(Key::ArrowRight), Some(Control::Seek(40_000)));
+        assert_eq!(key(Key::Named(NamedKey::ArrowLeft)), Some(Control::Seek(20_000)));
+        assert_eq!(key(Key::Named(NamedKey::ArrowRight)), Some(Control::Seek(40_000)));
         assert_eq!(
-            key(Key::ArrowUp),
+            key(Key::Named(NamedKey::ArrowUp)),
             Some(Control::Volume {
                 volume: 0.6,
                 muted: false
@@ -1745,7 +1745,7 @@ mod tests {
         // Seeking back from the start stays at the start.
         let start = MediaState::default();
         assert_eq!(
-            transport_key(&Key::ArrowLeft, &start),
+            transport_key(&Key::Named(NamedKey::ArrowLeft), &start),
             Some(Control::Seek(0))
         );
     }

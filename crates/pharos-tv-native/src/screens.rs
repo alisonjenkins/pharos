@@ -152,19 +152,19 @@ pub fn Spike(start: Screen) -> Element {
                 last_key.set(Some(std::time::Instant::now()));
                 let (r, c) = focus();
                 let next = match key {
-                    Key::ArrowUp => (r.saturating_sub(1), c),
-                    Key::ArrowDown => ((r + 1).min(rows - 1), c),
-                    Key::ArrowLeft => (r, c.saturating_sub(1)),
-                    Key::ArrowRight => (r, c + 1),
-                    Key::Enter => {
+                    Key::Named(NamedKey::ArrowUp) => (r.saturating_sub(1), c),
+                    Key::Named(NamedKey::ArrowDown) => ((r + 1).min(rows - 1), c),
+                    Key::Named(NamedKey::ArrowLeft) => (r, c.saturating_sub(1)),
+                    Key::Named(NamedKey::ArrowRight) => (r, c + 1),
+                    Key::Named(NamedKey::Enter) => {
                         log::info!("open row {r} col {c}");
                         (r, c)
                     }
-                    Key::BrowserBack | Key::GoBack if screen() == Screen::Grid => {
+                    Key::Named(NamedKey::BrowserBack) | Key::Named(NamedKey::GoBack) if screen() == Screen::Grid => {
                         screen.set(Screen::Home);
                         (0, 0)
                     }
-                    Key::MediaPlayPause | Key::Character(_) => {
+                    Key::Named(NamedKey::MediaPlayPause) | Key::Character(_) => {
                         screen.set(if screen() == Screen::Home { Screen::Grid } else { Screen::Home });
                         (0, 0)
                     }

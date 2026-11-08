@@ -2148,13 +2148,13 @@ fn PaletteScreen() -> Element {
     };
     let mut close = move || palette.0.set(false);
     let on_key = move |evt: KeyboardEvent| match evt.key() {
-        Key::ArrowDown | Key::ArrowUp => {
+        Key::Named(NamedKey::ArrowDown) | Key::Named(NamedKey::ArrowUp) => {
             evt.prevent_default();
-            let down = evt.key() == Key::ArrowDown;
+            let down = evt.key() == Key::Named(NamedKey::ArrowDown);
             let next = find::step(*active.peek(), rows.peek().len(), down);
             active.set(next);
         }
-        Key::Enter => {
+        Key::Named(NamedKey::Enter) => {
             evt.prevent_default();
             let picked = active.peek().and_then(|at| rows.peek().get(at).cloned());
             match picked {
@@ -2173,7 +2173,7 @@ fn PaletteScreen() -> Element {
             }
         }
         // Closes rather than letting the search input clear itself.
-        Key::Escape => {
+        Key::Named(NamedKey::Escape) => {
             evt.prevent_default();
             close();
         }
@@ -2220,14 +2220,14 @@ fn TopSearch() -> Element {
         _ => Vec::new(),
     };
     let on_key = move |evt: KeyboardEvent| match evt.key() {
-        Key::ArrowDown | Key::ArrowUp => {
+        Key::Named(NamedKey::ArrowDown) | Key::Named(NamedKey::ArrowUp) => {
             evt.prevent_default();
             open.set(true);
-            let down = evt.key() == Key::ArrowDown;
+            let down = evt.key() == Key::Named(NamedKey::ArrowDown);
             let next = find::step(*active.peek(), suggestions().len(), down);
             active.set(next);
         }
-        Key::Enter => {
+        Key::Named(NamedKey::Enter) => {
             evt.prevent_default();
             let picked = active
                 .peek()
@@ -2242,7 +2242,7 @@ fn TopSearch() -> Element {
         }
         // A search input clears itself on Escape; the first press only
         // closes the list, and a second, with the list shut, clears.
-        Key::Escape if *open.peek() => {
+        Key::Named(NamedKey::Escape) if *open.peek() => {
             evt.prevent_default();
             open.set(false);
             active.set(None);

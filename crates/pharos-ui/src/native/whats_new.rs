@@ -437,7 +437,7 @@ pub fn WhatsNewView(
                 tabindex: "-1",
                 onkeydown: move |e: KeyboardEvent| {
                     e.stop_propagation();
-                    if e.key() == Key::Escape {
+                    if e.key() == Key::Named(NamedKey::Escape) {
                         on_close.call(Close::Later);
                     }
                 },

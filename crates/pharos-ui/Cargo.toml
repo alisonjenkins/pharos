@@ -156,7 +156,7 @@ log = "0.4"
 # `#[test]`s so we can assert structural landmarks (input #ids,
 # button text, expected error branches) without a browser. Lives at
 # the same major version as the main `dioxus` workspace dep.
-dioxus-ssr = "0.7"
+dioxus-ssr = "=0.8.0-alpha.3"
 # V530: reads the shipped subtitle fonts' family names in a test.
 skrifa = "0.49"
 
