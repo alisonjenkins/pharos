@@ -21,7 +21,8 @@ use super::track_follow::{GroupTracksView, TrackChoice};
 /// creating replaces it.
 #[derive(Clone)]
 pub struct Groups {
-    group: NativeGroup,
+    /// Shared by every clone, so a reconnect reaches the session's copy.
+    group: Rc<RefCell<NativeGroup>>,
     member: Rc<RefCell<Option<NativeMembership>>>,
     /// Counts the creates and joins, so an update from an earlier one is not
     /// taken for the current membership's.
@@ -34,7 +35,7 @@ impl Groups {
     /// a member by user and device, so each tab or TV needs its own id.
     pub fn new(api: &NativeApi, device: String) -> Self {
         Self {
-            group: api.group().clone(),
+            group: Rc::new(RefCell::new(api.group().clone())),
             member: Rc::default(),
             generation: Rc::default(),
             call: CallInfo {
@@ -64,7 +65,7 @@ fn group_error(e: ClientError) -> GroupError {
     match e {
         ClientError::Api {
             kind: "notFound", ..
-        } => GroupError("This group has ended".into()),
+        } => GroupError::gone(),
         ClientError::Api {
             kind: "notPermitted",
             ..
@@ -167,6 +168,18 @@ fn update(u: GroupUpdate) -> together::GroupUpdate {
 }
 
 impl Groups {
+    /// The session's connection was replaced by `api`'s: later calls go over
+    /// it. The membership held on the old one is dropped without a `leave`,
+    /// which could not reach the server; the next join takes its seat back.
+    pub fn reconnect(&self, api: &NativeApi) {
+        *self.group.borrow_mut() = api.group().clone();
+        self.member.borrow_mut().take();
+    }
+
+    fn group(&self) -> NativeGroup {
+        self.group.borrow().clone()
+    }
+
     fn membership(&self) -> Result<NativeMembership, GroupError> {
         self.member
             .borrow()
@@ -226,7 +239,7 @@ impl Groups {
     ) -> Result<GroupSummary, GroupError> {
         let membership = made.map_err(group_error)?;
         if answer.ended.get() {
-            return Err(GroupError("This group has ended".into()));
+            return Err(GroupError::gone());
         }
         *self.member.borrow_mut() = Some(membership);
         let mut waited = 0;
@@ -246,7 +259,7 @@ impl Groups {
 
 impl GroupClient for Groups {
     async fn list(&self) -> Result<Vec<GroupSummary>, GroupError> {
-        let groups = self.group.list(&self.call).await.map_err(group_error)?;
+        let groups = self.group().list(&self.call).await.map_err(group_error)?;
         Ok(groups.into_iter().map(summary).collect())
     }
 
@@ -259,7 +272,7 @@ impl GroupClient for Groups {
         self.leave_held().await;
         let (on_update, answer) = self.tap(sink);
         let made = self
-            .group
+            .group()
             .create(&self.call, item, position_ms, on_update)
             .await;
         self.settled(made, answer).await
@@ -268,13 +281,13 @@ impl GroupClient for Groups {
     async fn join(&self, id: &str, sink: GroupSink) -> Result<GroupSummary, GroupError> {
         self.leave_held().await;
         let (on_update, answer) = self.tap(sink);
-        let made = self.group.join(&self.call, id, on_update).await;
+        let made = self.group().join(&self.call, id, on_update).await;
         self.settled(made, answer).await
     }
 
     async fn clock(&self, client_ms: i64) -> Result<ClockReply, GroupError> {
         let s = self
-            .group
+            .group()
             .clock(&self.call, unms(client_ms))
             .await
             .map_err(group_error)?;

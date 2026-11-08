@@ -151,6 +151,20 @@ impl Together {
             .session(|| Session::new(group_api(api), AppEnv { ui: self.ui }))
     }
 
+    /// The app's connection was replaced by `api`'s, as after a deploy or a
+    /// dropped socket. A session in a group moves to it and joins its group
+    /// again: its membership lived on the old connection, so without this the
+    /// tab would think itself in the group while hearing nothing from it.
+    pub fn reconnected(&self, api: &NativeApi) {
+        let Some(session) = self.seat.current().filter(|s| s.active()) else {
+            return;
+        };
+        session.client().reconnect(api);
+        platform::spawn_detached(Box::pin(async move {
+            session.rejoin("reconnect").await;
+        }));
+    }
+
     /// A video is on the stage: the group drives it, whatever route shows.
     pub fn attach(&self, item: ItemRef, player: Rc<dyn GroupPlayer>) {
         self.seat.attach(item, player);
@@ -207,11 +221,7 @@ pub fn group_to_rejoin(kept: Option<String>, in_group: bool) -> Option<String> {
     kept.filter(|id| !id.is_empty() && !in_group)
 }
 
-/// What the viewer reads when the group this tab was in cannot be joined
-/// again after a reload (B807); the server's reason follows.
-pub fn rejoin_failure(reason: &str) -> String {
-    format!("Couldn't rejoin your group, so you're watching on your own. ({reason})")
-}
+pub use super::group_session::rejoin_failure;
 
 /// What the tab kept before this page loaded.
 pub fn kept_before_load() -> Option<String> {

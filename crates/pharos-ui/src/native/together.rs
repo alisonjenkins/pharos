@@ -230,6 +230,19 @@ pub struct GroupSummary {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GroupError(pub String);
 
+impl GroupError {
+    const GONE: &'static str = "This group has ended";
+
+    /// The server knows no such group, or no longer counts this member in it.
+    pub fn gone() -> Self {
+        Self(Self::GONE.into())
+    }
+
+    pub fn is_gone(&self) -> bool {
+        self.0 == Self::GONE
+    }
+}
+
 /// The server's reply to `clock`: the client's timestamp echoed, then when
 /// the server received the request and when it replied (`t1`, `t2`, `t3`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -382,6 +395,8 @@ pub struct FakeGroups {
     hold_buffering: Rc<Cell<bool>>,
     buffering_gates: Rc<RefCell<Vec<BufferingGate>>>,
     join_pushes: Rc<RefCell<Vec<GroupUpdate>>>,
+    gone_joins: Rc<Cell<u32>>,
+    gone_pings: Rc<Cell<bool>>,
 }
 
 impl FakeGroups {
@@ -407,6 +422,21 @@ impl FakeGroups {
                 waker.wake();
             }
         }
+    }
+
+    /// The in-memory groups have no connection to move.
+    pub fn reconnect(&self, _api: &NativeApi) {}
+
+    /// The next `n` joins find no group, as a server still hydrating its
+    /// groups after a restart answers.
+    pub fn gone_for_joins(&self, n: u32) {
+        self.gone_joins.set(n);
+    }
+
+    /// Makes every `ping` answer that this member is not in the group, as
+    /// the server does once it has pruned the member.
+    pub fn gone_pings(&self, gone: bool) {
+        self.gone_pings.set(gone);
     }
 
     /// Makes every `set_tracks` fail, as a dropped connection would.
@@ -512,10 +542,14 @@ impl GroupClient for FakeGroups {
 
     async fn join(&self, id: &str, sink: GroupSink) -> Result<GroupSummary, GroupError> {
         self.log(format!("join({id})"));
+        if let Some(left) = self.gone_joins.get().checked_sub(1) {
+            self.gone_joins.set(left);
+            return Err(GroupError::gone());
+        }
         let answer = {
             let mut groups = self.groups.borrow_mut();
             let Some(group) = groups.iter_mut().find(|g| g.id == id) else {
-                return Err(GroupError("This group has ended".into()));
+                return Err(GroupError::gone());
             };
             group.members.push(Self::me());
             group.clone()
@@ -552,6 +586,9 @@ impl GroupClient for FakeGroups {
 
     async fn ping(&self) -> Result<(), GroupError> {
         self.log("ping".into());
+        if self.gone_pings.get() {
+            return Err(GroupError::gone());
+        }
         Ok(())
     }
 
