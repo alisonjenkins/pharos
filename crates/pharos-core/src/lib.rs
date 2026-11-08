@@ -3390,6 +3390,28 @@ pub struct MediaFacets {
 pub trait MediaStore: Send + Sync {
     fn get(&self, id: MediaId)
         -> impl std::future::Future<Output = DomainResult<MediaItem>> + Send;
+
+    /// The items carrying `ids`, in the order of `ids`. An id with no row
+    /// (deleted since the caller learned it) is skipped, not an error. A
+    /// backend should answer in one query; the default loops over
+    /// [`get`](Self::get).
+    fn get_many(
+        &self,
+        ids: &[MediaId],
+    ) -> impl std::future::Future<Output = DomainResult<Vec<MediaItem>>> + Send {
+        async move {
+            let mut out = Vec::with_capacity(ids.len());
+            for id in ids {
+                match self.get(*id).await {
+                    Ok(item) => out.push(item),
+                    Err(DomainError::NotFound(_)) => {}
+                    Err(e) => return Err(e),
+                }
+            }
+            Ok(out)
+        }
+    }
+
     fn put(&self, item: MediaItem) -> impl std::future::Future<Output = DomainResult<()>> + Send;
 
     /// Upsert many items. Equivalent to calling [`put`](Self::put) on each in
