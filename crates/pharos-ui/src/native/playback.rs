@@ -184,6 +184,194 @@ pub fn engine_verdict(picked: Engine, reason: EngineReason) -> EngineVerdict {
     }
 }
 
+/// Stable fallback cause when [`Engine::RustHls`] hands a stream to `hls.js`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum HlsFallbackCause {
+    UnsupportedTag,
+    NotFmp4,
+    Live,
+    Codec,
+    NoVariant,
+}
+
+impl HlsFallbackCause {
+    pub const ALL: [Self; 5] = [
+        Self::UnsupportedTag,
+        Self::NotFmp4,
+        Self::Live,
+        Self::Codec,
+        Self::NoVariant,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::UnsupportedTag => "unsupported_tag",
+            Self::NotFmp4 => "not_fmp4",
+            Self::Live => "live",
+            Self::Codec => "codec",
+            Self::NoVariant => "no_variant",
+        }
+    }
+}
+
+/// Validated playlist and SourceBuffer MIME plan for [`Engine::RustHls`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Plan {
+    pub video_uri: String,
+    pub audio_uri: Option<String>,
+    pub video_mime: String,
+    pub audio_mime: Option<String>,
+}
+
+const VIDEO_CODEC_PREFIXES: &[&str] = &[
+    "avc1", "avc3", "hvc1", "hev1", "dvh1", "dvhe", "dva1", "dvav", "vp09", "av01", "mp4v",
+];
+
+/// Splits a variant's `CODECS` list into `(video_codecs, audio_codecs)`.
+pub fn split_codecs(codecs: &[String]) -> (Vec<String>, Vec<String>) {
+    let mut video = Vec::new();
+    let mut audio = Vec::new();
+    for codec in codecs {
+        if VIDEO_CODEC_PREFIXES.iter().any(|p| codec.starts_with(p)) {
+            video.push(codec.clone());
+        } else {
+            audio.push(codec.clone());
+        }
+    }
+    (video, audio)
+}
+
+/// Picks the audio rendition URI for `variant` from `master`: the default
+/// rendition in `variant.audio_group` with a URI, else the first in that group
+/// with a URI.
+pub fn pick_audio_uri(
+    master: &pharos_hls::playlist::Master,
+    variant: &pharos_hls::playlist::Variant,
+) -> Option<String> {
+    let group_id = variant.audio_group.as_deref()?;
+    master
+        .audio
+        .iter()
+        .find(|r| r.group_id == group_id && r.default)
+        .and_then(|r| r.uri.clone())
+        .or_else(|| {
+            master
+                .audio
+                .iter()
+                .find(|r| r.group_id == group_id && r.uri.is_some())
+                .and_then(|r| r.uri.clone())
+        })
+}
+
+fn check_unsupported_tags(
+    unsupported: &[pharos_hls::playlist::Unsupported],
+) -> Result<(), (HlsFallbackCause, String)> {
+    for &item in unsupported {
+        if item != pharos_hls::playlist::Unsupported::Live {
+            return Err((HlsFallbackCause::UnsupportedTag, item.label().to_owned()));
+        }
+    }
+    Ok(())
+}
+
+fn check_media_playlist(
+    media: &pharos_hls::playlist::MediaPlaylist,
+) -> Result<(), (HlsFallbackCause, String)> {
+    check_unsupported_tags(&media.unsupported)?;
+    if (!media.vod && !media.ended)
+        || media
+            .unsupported
+            .contains(&pharos_hls::playlist::Unsupported::Live)
+    {
+        return Err((HlsFallbackCause::Live, "live".to_owned()));
+    }
+    if media.init_uri.is_none() {
+        return Err((HlsFallbackCause::NotFmp4, "none".to_owned()));
+    }
+    Ok(())
+}
+
+/// The master-level part of [`plan_hls`], checked before any media playlist is fetched.
+pub fn check_master(
+    master: &pharos_hls::playlist::Master,
+) -> Result<(), (HlsFallbackCause, String)> {
+    check_unsupported_tags(&master.unsupported)?;
+    if master
+        .unsupported
+        .contains(&pharos_hls::playlist::Unsupported::Live)
+    {
+        return Err((HlsFallbackCause::Live, "live".to_owned()));
+    }
+    Ok(())
+}
+
+/// Validates parsed master and media playlists plus browser codec support for [`Engine::RustHls`].
+pub fn plan_hls(
+    master: &pharos_hls::playlist::Master,
+    video: &pharos_hls::playlist::MediaPlaylist,
+    audio: Option<&pharos_hls::playlist::MediaPlaylist>,
+    is_type_supported: impl Fn(&str) -> bool,
+) -> Result<Plan, (HlsFallbackCause, String)> {
+    check_master(master)?;
+    let Some(variant) = master.variants.first() else {
+        return Err((HlsFallbackCause::NoVariant, "none".to_owned()));
+    };
+
+    check_media_playlist(video)?;
+    if let Some(audio_pl) = audio {
+        check_media_playlist(audio_pl)?;
+    }
+
+    let audio_uri = pick_audio_uri(master, variant);
+    let (video_mime, audio_mime) = if audio_uri.is_some() {
+        let (video_codecs, audio_codecs) = split_codecs(&variant.codecs);
+        (
+            format!(r#"video/mp4; codecs="{}""#, video_codecs.join(",")),
+            Some(format!(r#"audio/mp4; codecs="{}""#, audio_codecs.join(","))),
+        )
+    } else {
+        (
+            format!(r#"video/mp4; codecs="{}""#, variant.codecs.join(",")),
+            None,
+        )
+    };
+
+    if !is_type_supported(&video_mime) {
+        return Err((HlsFallbackCause::Codec, video_mime));
+    }
+    if let Some(ref a_mime) = audio_mime {
+        if !is_type_supported(a_mime) {
+            return Err((HlsFallbackCause::Codec, a_mime.clone()));
+        }
+    }
+
+    Ok(Plan {
+        video_uri: variant.uri.clone(),
+        audio_uri,
+        video_mime,
+        audio_mime,
+    })
+}
+
+/// Converts `(start_s, end_s)` `TimeRanges` pairs into sorted millisecond ranges.
+pub fn ranges_to_ms(ranges_s: &[(f64, f64)]) -> Vec<(u64, u64)> {
+    let mut out = Vec::with_capacity(ranges_s.len());
+    for &(start_s, end_s) in ranges_s {
+        if !start_s.is_finite() || !end_s.is_finite() || end_s <= 0.0 || end_s <= start_s {
+            continue;
+        }
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let start_ms = (start_s.max(0.0) * 1000.0).round() as u64;
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let end_ms = (end_s * 1000.0).round() as u64;
+        if start_ms < end_ms {
+            out.push((start_ms, end_ms));
+        }
+    }
+    out.sort_unstable_by_key(|&(start, _)| start);
+    out
+}
+
 impl EngineVerdict {
     /// The watch page's log line for this verdict (V630).
     pub fn line(&self) -> String {
@@ -2897,6 +3085,212 @@ mod tests {
                 "{field:?}"
             );
         }
+    }
+
+    #[test]
+    fn hls_fallback_cause_tokens_are_distinct() {
+        let labels: std::collections::BTreeSet<_> = HlsFallbackCause::ALL
+            .into_iter()
+            .map(HlsFallbackCause::label)
+            .collect();
+        assert_eq!(labels.len(), HlsFallbackCause::ALL.len());
+        assert_eq!(
+            HlsFallbackCause::ALL.map(HlsFallbackCause::label),
+            ["unsupported_tag", "not_fmp4", "live", "codec", "no_variant"]
+        );
+    }
+
+    #[test]
+    fn split_codecs_separates_video_and_audio_prefixes() {
+        let s = |items: &[&str]| items.iter().map(|c| (*c).to_owned()).collect::<Vec<_>>();
+        assert_eq!(
+            split_codecs(&s(&["avc1.640028", "opus"])),
+            (s(&["avc1.640028"]), s(&["opus"]))
+        );
+        assert_eq!(
+            split_codecs(&s(&["vp09.00.40.08", "opus"])),
+            (s(&["vp09.00.40.08"]), s(&["opus"]))
+        );
+        assert_eq!(
+            split_codecs(&s(&[
+                "avc3.64001f",
+                "hvc1.1.6.L120.90",
+                "hev1.1.6.L120.90",
+                "av01.0.08M.08",
+                "dvh1.08.06",
+                "mp4a.40.2",
+                "flac",
+                "ac-3",
+                "ec-3"
+            ])),
+            (
+                s(&[
+                    "avc3.64001f",
+                    "hvc1.1.6.L120.90",
+                    "hev1.1.6.L120.90",
+                    "av01.0.08M.08",
+                    "dvh1.08.06"
+                ]),
+                s(&["mp4a.40.2", "flac", "ac-3", "ec-3"])
+            )
+        );
+    }
+
+    #[test]
+    fn plan_hls_covers_demuxed_muxed_and_every_fallback_cause() {
+        use pharos_hls::playlist::{parse_master, parse_media};
+
+        let fmp4_media = parse_media(
+            "#EXTM3U\n\
+             #EXT-X-VERSION:7\n\
+             #EXT-X-PLAYLIST-TYPE:VOD\n\
+             #EXT-X-TARGETDURATION:6\n\
+             #EXT-X-MAP:URI=\"init.mp4\"\n\
+             #EXTINF:6.000,\n\
+             0.m4s\n\
+             #EXT-X-ENDLIST\n",
+            "http://pharos.local/videos/42/main.m3u8",
+        )
+        .unwrap();
+
+        let avc_master = parse_master(
+            "#EXTM3U\n\
+             #EXT-X-VERSION:7\n\
+             #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"Audio\",DEFAULT=YES,URI=\"audio.m3u8\"\n\
+             #EXT-X-STREAM-INF:BANDWIDTH=8000000,CODECS=\"avc1.640028,opus\",AUDIO=\"aud\"\n\
+             h264/main.m3u8\n",
+            "http://pharos.local/videos/42/master.m3u8",
+        )
+        .unwrap();
+        assert_eq!(
+            plan_hls(&avc_master, &fmp4_media, Some(&fmp4_media), |_| true),
+            Ok(Plan {
+                video_uri: "http://pharos.local/videos/42/h264/main.m3u8".to_owned(),
+                audio_uri: Some("http://pharos.local/videos/42/audio.m3u8".to_owned()),
+                video_mime: r#"video/mp4; codecs="avc1.640028""#.to_owned(),
+                audio_mime: Some(r#"audio/mp4; codecs="opus""#.to_owned()),
+            })
+        );
+
+        let vp9_master = parse_master(
+            "#EXTM3U\n\
+             #EXT-X-VERSION:7\n\
+             #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"Audio\",DEFAULT=NO,URI=\"audio.m3u8\"\n\
+             #EXT-X-STREAM-INF:BANDWIDTH=6000000,CODECS=\"vp09.00.40.08,opus\",AUDIO=\"aud\"\n\
+             vp9/main.m3u8\n",
+            "http://pharos.local/videos/42/master.m3u8",
+        )
+        .unwrap();
+        assert_eq!(
+            plan_hls(&vp9_master, &fmp4_media, Some(&fmp4_media), |_| true),
+            Ok(Plan {
+                video_uri: "http://pharos.local/videos/42/vp9/main.m3u8".to_owned(),
+                audio_uri: Some("http://pharos.local/videos/42/audio.m3u8".to_owned()),
+                video_mime: r#"video/mp4; codecs="vp09.00.40.08""#.to_owned(),
+                audio_mime: Some(r#"audio/mp4; codecs="opus""#.to_owned()),
+            })
+        );
+
+        let muxed_master = parse_master(
+            "#EXTM3U\n\
+             #EXT-X-VERSION:7\n\
+             #EXT-X-STREAM-INF:BANDWIDTH=4000000,CODECS=\"avc1.640028,mp4a.40.2\"\n\
+             muxed/main.m3u8\n",
+            "http://pharos.local/videos/42/master.m3u8",
+        )
+        .unwrap();
+        assert_eq!(
+            plan_hls(&muxed_master, &fmp4_media, None, |_| true),
+            Ok(Plan {
+                video_uri: "http://pharos.local/videos/42/muxed/main.m3u8".to_owned(),
+                audio_uri: None,
+                video_mime: r#"video/mp4; codecs="avc1.640028,mp4a.40.2""#.to_owned(),
+                audio_mime: None,
+            })
+        );
+
+        let ts_audio_master = parse_master(
+            "#EXTM3U\n\
+             #EXT-X-VERSION:3\n\
+             #EXT-X-STREAM-INF:BANDWIDTH=128000,CODECS=\"mp4a.40.2\"\n\
+             audio.m3u8\n",
+            "http://pharos.local/Videos/42/master.m3u8",
+        )
+        .unwrap();
+        let ts_media = parse_media(
+            "#EXTM3U\n\
+             #EXT-X-TARGETDURATION:6\n\
+             #EXTINF:6.000,\n\
+             0.ts\n\
+             #EXT-X-ENDLIST\n",
+            "http://pharos.local/Videos/42/audio.m3u8",
+        )
+        .unwrap();
+        assert_eq!(
+            plan_hls(&ts_audio_master, &ts_media, None, |_| true).map_err(|(c, _)| c),
+            Err(HlsFallbackCause::NotFmp4)
+        );
+
+        let live_media = parse_media(
+            "#EXTM3U\n\
+             #EXT-X-TARGETDURATION:6\n\
+             #EXT-X-MAP:URI=\"init.mp4\"\n\
+             #EXTINF:6.000,\n\
+             0.m4s\n",
+            "http://pharos.local/videos/42/live.m3u8",
+        )
+        .unwrap();
+        assert_eq!(
+            plan_hls(&avc_master, &live_media, Some(&fmp4_media), |_| true),
+            Err((HlsFallbackCause::Live, "live".to_owned()))
+        );
+
+        assert_eq!(
+            plan_hls(&avc_master, &fmp4_media, Some(&fmp4_media), |m| !m
+                .contains("opus")),
+            Err((
+                HlsFallbackCause::Codec,
+                r#"audio/mp4; codecs="opus""#.to_owned()
+            ))
+        );
+        assert_eq!(
+            plan_hls(&avc_master, &fmp4_media, Some(&fmp4_media), |m| !m
+                .contains("avc1")),
+            Err((
+                HlsFallbackCause::Codec,
+                r#"video/mp4; codecs="avc1.640028""#.to_owned()
+            ))
+        );
+
+        let encrypted_media = parse_media(
+            "#EXTM3U\n\
+             #EXT-X-TARGETDURATION:6\n\
+             #EXT-X-MAP:URI=\"init.mp4\"\n\
+             #EXT-X-KEY:METHOD=AES-128,URI=\"key\"\n\
+             #EXTINF:6.000,\n\
+             0.m4s\n\
+             #EXT-X-ENDLIST\n",
+            "http://pharos.local/videos/42/enc.m3u8",
+        )
+        .unwrap();
+        assert_eq!(
+            plan_hls(&avc_master, &encrypted_media, None, |_| true),
+            Err((HlsFallbackCause::UnsupportedTag, "encrypted".to_owned()))
+        );
+
+        let empty_master = parse_master("#EXTM3U\n", "http://pharos.local/master.m3u8").unwrap();
+        assert_eq!(
+            plan_hls(&empty_master, &fmp4_media, None, |_| true),
+            Err((HlsFallbackCause::NoVariant, "none".to_owned()))
+        );
+    }
+
+    #[test]
+    fn ranges_to_ms_converts_seconds_and_sorts() {
+        assert_eq!(
+            ranges_to_ms(&[(12.012, 18.018), (0.0, 6.006), (-1.0, 0.0), (5.0, 5.0)]),
+            vec![(0, 6_006), (12_012, 18_018)]
+        );
     }
 
     #[test]
