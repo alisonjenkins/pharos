@@ -4,6 +4,7 @@
 
 use pharos_api::pharos_capnp::{mix_batch, mix_rule, mix_spec, MixWeight};
 use pharos_jellyfin_api::dto::WireId;
+use pharos_jellyfin_api::image_tag_sig::ImageTagKey;
 
 use super::library::{read_item_id, write_item};
 use crate::services::mix::{self, Mixed, Rule, Seed, Test, Weight};
@@ -123,7 +124,12 @@ pub(super) fn read_ask(
     }))
 }
 
-pub(super) fn write_batch(mut out: mix_batch::Builder<'_>, mixed: &Mixed, server_id: &str) {
+pub(super) fn write_batch(
+    mut out: mix_batch::Builder<'_>,
+    mixed: &Mixed,
+    server_id: &str,
+    key: &ImageTagKey,
+) {
     let len = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
     out.set_pool(len(mixed.pool));
     out.set_eligible(len(mixed.eligible));
@@ -137,7 +143,13 @@ pub(super) fn write_batch(mut out: mix_batch::Builder<'_>, mixed: &Mixed, server
     let mut picks = out.init_picks(len(mixed.picks.len()));
     for (i, p) in (0..).zip(&mixed.picks) {
         let mut pick = picks.reborrow().get(i);
-        write_item(pick.reborrow().init_item(), &p.item, p.user_data, server_id);
+        write_item(
+            pick.reborrow().init_item(),
+            &p.item,
+            p.user_data,
+            server_id,
+            key,
+        );
         let mut reasons = pick.init_reasons(len(p.reasons.len()));
         for (j, why) in (0..).zip(&p.reasons) {
             reasons.set(j, why.as_str());

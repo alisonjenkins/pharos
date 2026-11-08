@@ -10,6 +10,7 @@ use pharos_api::pharos_capnp::{
 use pharos_api::{server, Denial};
 use pharos_core::{LibraryKind, MediaItem, MediaKind, UserItemData};
 use pharos_jellyfin_api::dto::{BaseItemDto, WireId};
+use pharos_jellyfin_api::image_tag_sig::ImageTagKey;
 
 use super::session::Session;
 use crate::api::jellyfin::items::SynthPage;
@@ -61,7 +62,12 @@ impl server::library::Handler for Library {
         page.set_start(0);
         let mut items = page.init_items(count);
         for (i, (id, view)) in (0..count).zip(&views) {
-            write_view(items.reborrow().get(i), *id, view);
+            write_view(
+                items.reborrow().get(i),
+                *id,
+                view,
+                &self.session.state.image_tag_key,
+            );
         }
         Ok(())
     }
@@ -102,6 +108,7 @@ impl server::library::Handler for Library {
             listed,
             "latest",
             &state.server_id,
+            &state.image_tag_key,
         );
         Ok(())
     }
@@ -129,6 +136,7 @@ impl server::library::Handler for Library {
             listed,
             "resume",
             &state.server_id,
+            &state.image_tag_key,
         );
         Ok(())
     }
@@ -162,6 +170,7 @@ impl server::library::Handler for Library {
                 grouping,
                 parent.as_deref(),
                 query.start_index,
+                &state.image_tag_key,
             );
             return Ok(());
         }
@@ -182,6 +191,7 @@ impl server::library::Handler for Library {
             listed,
             "query",
             &state.server_id,
+            &state.image_tag_key,
         );
         Ok(())
     }
@@ -342,7 +352,13 @@ impl server::library::Handler for Library {
             match crate::services::search::search(state, &user, text, params.get_limit()).await {
                 Ok(hits) => hits,
                 Err(e) => {
-                    write_listing(out, Err(ListError::Store(e)), "search", &state.server_id);
+                    write_listing(
+                        out,
+                        Err(ListError::Store(e)),
+                        "search",
+                        &state.server_id,
+                        &state.image_tag_key,
+                    );
                     return Ok(());
                 }
             };
@@ -361,7 +377,13 @@ impl server::library::Handler for Library {
         let mut played = match library::with_user_data(state, &user, page).await {
             Ok(listed) => listed.items.into_iter().map(|(_, data)| data),
             Err(e) => {
-                write_listing(out, Err(ListError::Store(e)), "search", &state.server_id);
+                write_listing(
+                    out,
+                    Err(ListError::Store(e)),
+                    "search",
+                    &state.server_id,
+                    &state.image_tag_key,
+                );
                 return Ok(());
             }
         };
@@ -371,12 +393,15 @@ impl server::library::Handler for Library {
         let mut items = page.init_items(len_u32(&hits));
         for (i, hit) in (0..items.len()).zip(&hits) {
             match hit {
-                Hit::Group(id, dto) => write_synth_summary(items.reborrow().get(i), *id, dto),
+                Hit::Group(id, dto) => {
+                    write_synth_summary(items.reborrow().get(i), *id, dto, &state.image_tag_key)
+                }
                 Hit::Stored(item) => write_item(
                     items.reborrow().get(i),
                     item,
                     played.next().unwrap_or_default(),
                     &state.server_id,
+                    &state.image_tag_key,
                 ),
             }
         }
@@ -407,7 +432,7 @@ impl server::library::Handler for Library {
                     Ok(dto) => {
                         let played = synth_played(state, &user, synth, &dto).await;
                         let mut out = results.get().init_result().init_detail();
-                        write_synth_detail(out.reborrow(), synth, &dto);
+                        write_synth_detail(out.reborrow(), synth, &dto, &state.image_tag_key);
                         if played {
                             let data = UserItemData {
                                 played,
@@ -438,7 +463,13 @@ impl server::library::Handler for Library {
         let dto = BaseItemDto::from_domain_with_user_data(&item, &state.server_id, user_data);
         let mut out = results.get().init_result().init_detail();
         let mut summary = out.reborrow().init_summary();
-        write_item(summary.reborrow(), &item, user_data, &state.server_id);
+        write_item(
+            summary.reborrow(),
+            &item,
+            user_data,
+            &state.server_id,
+            &state.image_tag_key,
+        );
         // A film sits straight under its library, as Jellyfin's detail says,
         // so the UI can name the library above it.
         if !summary.has_parent_id() {
@@ -548,7 +579,12 @@ impl server::library::Handler for Library {
         };
         let state = &self.session.state;
         let home = library::home(state, &user, latest, resume, next_up).await;
-        write_home(results.get().init_result(), home, &state.server_id);
+        write_home(
+            results.get().init_result(),
+            home,
+            &state.server_id,
+            &state.image_tag_key,
+        );
         Ok(())
     }
 
@@ -573,6 +609,7 @@ impl server::library::Handler for Library {
             listed,
             "next_up",
             &state.server_id,
+            &state.image_tag_key,
         );
         Ok(())
     }
@@ -637,6 +674,7 @@ fn write_home(
     out: home_result::Builder<'_>,
     home: Result<library::Home, ListError>,
     server_id: &str,
+    key: &ImageTagKey,
 ) {
     let home = match home {
         Ok(home) => home,
@@ -665,24 +703,27 @@ fn write_home(
     let mut list = out.reborrow().init_rails(count);
     for (i, (id, view, items)) in (0..count).zip(&rails) {
         let mut rail = list.reborrow().get(i);
-        write_view(rail.reborrow().init_view(), *id, view);
-        write_items(rail.init_latest(len_u32(items)), items, server_id);
+        write_view(rail.reborrow().init_view(), *id, view, key);
+        write_items(rail.init_latest(len_u32(items)), items, server_id, key);
     }
     write_items(
         out.reborrow().init_resume(len_u32(&home.resume.items)),
         &home.resume.items,
         server_id,
+        key,
     );
     write_items(
         out.reborrow()
             .init_listening(len_u32(&home.listening.items)),
         &home.listening.items,
         server_id,
+        key,
     );
     write_items(
         out.init_next_up(len_u32(&home.next_up.items)),
         &home.next_up.items,
         server_id,
+        key,
     );
 }
 
@@ -698,9 +739,10 @@ fn write_items(
     mut out: capnp::struct_list::Builder<'_, item_summary::Owned>,
     items: &Rows,
     server_id: &str,
+    key: &ImageTagKey,
 ) {
     for (i, (item, user_data)) in (0..out.len()).zip(items) {
-        write_item(out.reborrow().get(i), item, *user_data, server_id);
+        write_item(out.reborrow().get(i), item, *user_data, server_id, key);
     }
 }
 
@@ -720,7 +762,12 @@ async fn run_mix(
 ) {
     let now = crate::sync_recovery::now_unix_secs();
     match mix::mix(state, user, ask, now).await {
-        Ok(mixed) => super::mix::write_batch(out.init_batch(), &mixed, &state.server_id),
+        Ok(mixed) => super::mix::write_batch(
+            out.init_batch(),
+            &mixed,
+            &state.server_id,
+            &state.image_tag_key,
+        ),
         Err(mix::MixError::Invalid(e)) => {
             Denial::Invalid { field: e.label() }.write(out.init_error())
         }
@@ -740,6 +787,7 @@ fn write_listing(
     listed: Result<ListPage, ListError>,
     method: &'static str,
     server_id: &str,
+    key: &ImageTagKey,
 ) {
     let listed = match listed {
         Ok(listed) => listed,
@@ -759,6 +807,7 @@ fn write_listing(
         page.init_items(len_u32(&listed.items)),
         &listed.items,
         server_id,
+        key,
     );
 }
 
@@ -922,6 +971,7 @@ fn write_grouped(
     grouping: Grouping,
     parent: Option<&str>,
     start: u32,
+    key: &ImageTagKey,
 ) {
     record_query(grouping.label(), listed.is_ok());
     let listed = match listed {
@@ -967,7 +1017,7 @@ fn write_grouped(
     page.set_start(start);
     let mut items = page.init_items(len_u32(&groups));
     for (i, (id, dto)) in (0..items.len()).zip(&groups) {
-        write_synth_summary(items.reborrow().get(i), *id, dto);
+        write_synth_summary(items.reborrow().get(i), *id, dto, key);
     }
 }
 
@@ -1159,8 +1209,13 @@ fn synth_kind(dto: &serde_json::Value) -> Kind {
 
 /// A synthesised item's `ItemDetail` from its Jellyfin DTO: its summary,
 /// overview and genres, whichever it has.
-fn write_synth_detail(mut out: item_detail::Builder<'_>, id: WireId, dto: &serde_json::Value) {
-    write_synth_summary(out.reborrow().init_summary(), id, dto);
+fn write_synth_detail(
+    mut out: item_detail::Builder<'_>,
+    id: WireId,
+    dto: &serde_json::Value,
+    key: &ImageTagKey,
+) {
+    write_synth_summary(out.reborrow().init_summary(), id, dto, key);
     out.set_overview(dto_str(dto, "Overview"));
     let genres: Vec<&str> = dto
         .get("Genres")
@@ -1181,6 +1236,7 @@ fn write_synth_summary(
     mut summary: item_summary::Builder<'_>,
     id: WireId,
     dto: &serde_json::Value,
+    key: &ImageTagKey,
 ) {
     let kind = synth_kind(dto);
     set_item_id(summary.reborrow().init_id(), id);
@@ -1203,10 +1259,13 @@ fn write_synth_summary(
         summary.reborrow().init_year().set_some(year);
     }
     if let Some(tag) = dto.pointer("/ImageTags/Primary").and_then(|t| t.as_str()) {
+        // ADR-0073: the same signed tag the Jellyfin routes hand out (V712).
+        let id = dto_str(dto, "Id");
+        let tag = key.sign(id, "primary", tag);
         let mut image = summary.reborrow().init_images(1).get(0);
         image.set_kind("Primary");
-        image.set_tag(tag);
-        image.set_url(format!("/Items/{}/Images/Primary?tag={tag}", dto_str(dto, "Id")).as_str());
+        image.set_tag(tag.as_str());
+        image.set_url(format!("/Items/{id}/Images/Primary?tag={tag}").as_str());
     }
     if let Some(parent) =
         WireId::parse(dto_str(dto, "ParentId")).or_else(|| WireId::parse(dto_str(dto, "SeriesId")))
@@ -1286,6 +1345,7 @@ pub(super) fn write_item(
     item: &MediaItem,
     user_data: UserItemData,
     server_id: &str,
+    key: &ImageTagKey,
 ) {
     let dto = BaseItemDto::from_domain_with_user_data(item, server_id, user_data);
     set_item_id(out.reborrow().init_id(), WireId::Real(item.id));
@@ -1297,9 +1357,10 @@ pub(super) fn write_item(
     // A book's runtime is 0 by design (no time axis).
     out.set_runtime_ms(dto.run_time_ticks / 10_000);
     if let Some(tag) = dto.image_tags.get("Primary").and_then(|t| t.as_str()) {
+        let tag = key.sign(&dto.id, "primary", tag);
         let mut image = out.reborrow().init_images(1).get(0);
         image.set_kind("Primary");
-        image.set_tag(tag);
+        image.set_tag(tag.as_str());
         image.set_url(format!("/Items/{}/Images/Primary?tag={tag}", dto.id).as_str());
     }
     write_user_state(out.reborrow().init_user_state(), user_data);
@@ -1347,12 +1408,18 @@ fn tomatometer(rating: f32) -> Option<u16> {
     Some(rounded as u16)
 }
 
-fn write_view(mut item: item_summary::Builder<'_>, id: WireId, view: &LibraryView) {
+fn write_view(
+    mut item: item_summary::Builder<'_>,
+    id: WireId,
+    view: &LibraryView,
+    key: &ImageTagKey,
+) {
     set_item_id(item.reborrow().init_id(), id);
     item.set_kind(Kind::Library);
     item.set_name(view.name.as_str());
     item.set_library_kind(wire_library_kind(view.kind));
     if let Some(tag) = &view.primary_tag {
+        let tag = key.sign(&view.id, "primary", tag);
         let mut image = item.init_images(1).get(0);
         image.set_kind("Primary");
         image.set_tag(tag.as_str());

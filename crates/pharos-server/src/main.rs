@@ -2362,6 +2362,9 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
             // route patterns and RedMetrics falls back to the concrete
             // URI, exploding Prometheus label cardinality (one series per
             // item id). To get that ingress order, register bottom-up.
+            .wrap(actix_web::middleware::from_fn(
+                pharos_server::middleware::sign_image_tags,
+            ))
             .wrap(pharos_server::middleware::nosniff())
             .wrap(pharos_server::middleware::CookieBackfill)
             .wrap(TracingLogger::<pharos_server::obs::StatusRootSpanBuilder>::new())
