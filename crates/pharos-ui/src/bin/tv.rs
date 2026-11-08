@@ -30,7 +30,12 @@ fn main() {
         "pharos: start tokio={}",
         tokio::runtime::Handle::try_current().is_ok()
     );
-    dioxus::launch(root);
+    // Pharos Night from the first frame: the WebView is white until the
+    // page paints, and the stylesheet comes later still.
+    let config = dioxus::mobile::Config::new()
+        .with_background_color((0x0e, 0x11, 0x16, 0xff))
+        .with_custom_head("<style>html{background:#0e1116}</style>".into());
+    dioxus::LaunchBuilder::new().with_cfg(config).launch(root);
 
     fn root() -> Element {
         pharos_ui::native::use_server_proxy();
