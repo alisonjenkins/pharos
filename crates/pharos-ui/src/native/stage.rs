@@ -285,6 +285,16 @@ impl Stage {
             width: read(WIDTH_KEY).as_deref().and_then(decode_width),
             ..Stage::default()
         }
+        .docked_on_tv()
+    }
+
+    /// The Android TV app's compact player is always the bar along the
+    /// bottom: a remote cannot drag the floating window off what it covers.
+    fn docked_on_tv(mut self) -> Self {
+        if cfg!(target_os = "android") {
+            self.compact = View::Mini;
+        }
+        self
     }
 
     /// Whether something plays outside the full view.
