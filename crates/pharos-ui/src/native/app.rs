@@ -19,7 +19,7 @@ use super::account_settings;
 use super::activity;
 use super::appearance::{AppearanceView, ContrastRow, Edit, EditorView, Notice, ThemeCard};
 use super::approve_device;
-use super::backdrop::Backdrop;
+use super::backdrop::{self, Backdrop};
 use super::browse::{self, Neighbours};
 use super::diagnostics;
 use super::find::{self, Find, DEBOUNCE_MS, RESULT_LIMIT};
@@ -200,7 +200,9 @@ pub fn Root() -> Element {
     match route() {
         Route::Manage => rsx! { RootApp {} },
         route => rsx! {
-            Backdrop {}
+            if backdrop::runs_behind(&route) {
+                Backdrop {}
+            }
             NativeApp { route }
         },
     }

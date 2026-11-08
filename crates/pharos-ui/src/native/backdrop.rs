@@ -11,6 +11,7 @@ use crate::theme::Theme;
 
 use super::app::Themes;
 use super::platform;
+use super::route::Route;
 
 /// The canvas the backdrop draws on.
 pub const CANVAS_ID: &str = "pharos-backdrop";
@@ -22,6 +23,13 @@ pub fn program_for(theme: &Theme) -> Option<Program> {
         Background::Shader => theme.effects.shader.map(Program::backdrop),
         Background::Solid | Background::Gradient => None,
     }
+}
+
+/// Whether the backdrop runs behind `route`: not behind the watch page,
+/// whose video covers the whole screen, so the shader would burn GPU time
+/// nobody can see (B808).
+pub fn runs_behind(route: &Route) -> bool {
+    !matches!(route, Route::Watch(_))
 }
 
 /// The theme colours the shader tints with.
@@ -144,6 +152,7 @@ mod animate {
     pub struct Running {
         tick: Tick,
         pending: Rc<Cell<Option<i32>>>,
+        visibility: Closure<dyn FnMut()>,
     }
 
     impl Drop for Running {
@@ -151,8 +160,20 @@ mod animate {
             if let (Some(window), Some(id)) = (web_sys::window(), self.pending.take()) {
                 let _ = window.cancel_animation_frame(id);
             }
+            if let Some(document) = web_sys::window().and_then(|w| w.document()) {
+                let _ = document.remove_event_listener_with_callback(
+                    "visibilitychange",
+                    self.visibility.as_ref().unchecked_ref(),
+                );
+            }
             drop(self.tick.borrow_mut().take());
         }
+    }
+
+    fn page_hidden() -> bool {
+        web_sys::window()
+            .and_then(|w| w.document())
+            .is_some_and(|d| d.hidden())
     }
 
     pub fn start(program: Program, palette: Palette) -> Option<Running> {
@@ -176,6 +197,12 @@ mod animate {
             let pending = Rc::clone(&pending);
             move |now_ms: f64| {
                 pending.set(None);
+                // The loop stops while the page is hidden and the
+                // visibility listener starts it again (B808).
+                if page_hidden() {
+                    platform::info("pharos: backdrop paused reason=hidden");
+                    return;
+                }
                 if let Some(mean) = budget.over(now_ms) {
                     platform::warn(&format!(
                         "pharos: theme warning reason=effects_reduced path=effects.shader value={program:?} mean_frame_ms={mean:.1}"
@@ -201,7 +228,27 @@ mod animate {
             }
         }));
         request(&tick, &pending);
-        Some(Running { tick, pending })
+        let visibility = Closure::<dyn FnMut()>::new({
+            let tick = Rc::clone(&tick);
+            let pending = Rc::clone(&pending);
+            move || {
+                if !page_hidden() && pending.get().is_none() && tick.borrow().is_some() {
+                    platform::info("pharos: backdrop resumed reason=visible");
+                    request(&tick, &pending);
+                }
+            }
+        });
+        if let Some(document) = web_sys::window().and_then(|w| w.document()) {
+            let _ = document.add_event_listener_with_callback(
+                "visibilitychange",
+                visibility.as_ref().unchecked_ref(),
+            );
+        }
+        Some(Running {
+            tick,
+            pending,
+            visibility,
+        })
     }
 
     fn request(tick: &Tick, pending: &Cell<Option<i32>>) {
@@ -257,6 +304,16 @@ mod tests {
 
     fn shipped(name: &str) -> Theme {
         theme::shipped().resolve(name).unwrap().theme
+    }
+
+    #[test]
+    fn the_backdrop_stays_off_the_watch_page_only() {
+        use pharos_client::api::ItemRef;
+        let item = ItemRef::Real(42);
+        assert!(!runs_behind(&Route::Watch(item)));
+        for route in [Route::Home, Route::Together] {
+            assert!(runs_behind(&route), "{route:?}");
+        }
     }
 
     #[test]
