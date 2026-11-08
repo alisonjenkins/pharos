@@ -100,7 +100,8 @@ Signals already available (use them before adding more):
 `pharos_segment_produced_total{outcome,reason}`, `pharos_segment_cache_total`,
 `pharos_segment_transcode_seconds`, `http_client_aborted_total{method,path}`,
 `pharos_source_unreadable_total{reason}`, `pharos_transcode_device_{capacity,in_use,cooldown}`,
-`pharos_transcode_pending_jobs`, `pharos_audio_analysis_total{outcome,tempo}`. Loki: `{namespace="pharos"}`, LB at
+`pharos_transcode_pending_jobs`, `pharos_audio_analysis_total{outcome,tempo}`,
+`pharos_item_list_cache_total{outcome}`. Loki: `{namespace="pharos"}`, LB at
 `192.168.1.244:3100`. Traces export to Tempo via OTLP when configured.
 
 ## Subagent worktree isolation
