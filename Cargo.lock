@@ -1212,8 +1212,6 @@ dependencies = [
 [[package]]
 name = "blitz-shell"
 version = "0.3.0-beta.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d80b952b007a4bd82012583da8540d95cfd276b3c790ded39299fce728864fdb"
 dependencies = [
  "accesskit",
  "accesskit_xplat",
