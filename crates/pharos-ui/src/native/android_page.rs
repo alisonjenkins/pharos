@@ -1051,12 +1051,7 @@ impl PlaybackEngine for HlsJs {
         // The previous source's state must not answer for this one:
         // `video_metadata` would resolve on its `ready` at once.
         lock(&MEDIA).remove(&id);
-        #[allow(clippy::cast_precision_loss)]
-        let start = if start_ms > 0 {
-            start_ms as f64 / 1000.0
-        } else {
-            -1.0
-        };
+        let start = super::playback::hls_start_position(start_ms);
         run(format!(
             r#"
 const id = {id};
