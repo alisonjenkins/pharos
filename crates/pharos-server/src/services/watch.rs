@@ -26,6 +26,8 @@ pub struct Track {
     pub is_default: bool,
     pub is_forced: bool,
     pub is_hearing_impaired: bool,
+    /// An audio track's channel count, when the probe read one.
+    pub channels: Option<u32>,
     /// How the player draws this subtitle itself. `None` for a subtitle that
     /// only plays burned into the video, and for every audio track.
     pub drawn: Option<Drawn>,
@@ -116,6 +118,7 @@ pub async fn tracks(
             is_default: false,
             is_forced: false,
             is_hearing_impaired: false,
+            channels: None,
             drawn: Some(Drawn::Vtt(format!(
                 "/videos/{id}/subtitles/{}/stream.vtt",
                 row.source_index
@@ -182,6 +185,7 @@ fn track(s: MediaStreamDto, drawn: Option<Drawn>) -> Track {
         is_default: s.is_default,
         is_forced: s.is_forced,
         is_hearing_impaired: s.is_hearing_impaired,
+        channels: s.channels,
         drawn,
         styled: None,
     }
