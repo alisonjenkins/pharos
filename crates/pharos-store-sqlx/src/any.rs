@@ -27,10 +27,17 @@ pub enum AnyStore {
 impl AnyStore {
     /// Dispatch by URL scheme: `postgres://` / `postgresql://` -> Postgres, else SQLite.
     pub async fn connect(url: &str) -> Result<Self, StoreError> {
+        Self::connect_with(url, crate::PoolConfig::default()).await
+    }
+
+    /// [`connect`](Self::connect) with a pool of the given size.
+    pub async fn connect_with(url: &str, sizing: crate::PoolConfig) -> Result<Self, StoreError> {
         if url.starts_with("postgres://") || url.starts_with("postgresql://") {
-            Ok(Self::Postgres(PostgresStore::connect(url).await?))
+            Ok(Self::Postgres(
+                PostgresStore::connect_with(url, sizing).await?,
+            ))
         } else {
-            Ok(Self::Sqlite(SqliteStore::connect(url).await?))
+            Ok(Self::Sqlite(SqliteStore::connect_with(url, sizing).await?))
         }
     }
 }

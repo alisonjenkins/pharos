@@ -2528,8 +2528,20 @@ async fn postgres_conformance() {
         eprintln!("SKIP postgres_conformance: PHAROS_TEST_POSTGRES_URL unset");
         return;
     };
-    let p = pharos_store_sqlx::postgres::PostgresStore::connect(&url)
-        .await
-        .expect("connect postgres");
+    let p = pharos_store_sqlx::postgres::PostgresStore::connect_with(
+        &url,
+        pharos_store_sqlx::PoolConfig {
+            max_connections: 5,
+            acquire_timeout: std::time::Duration::from_secs(7),
+        },
+    )
+    .await
+    .expect("connect postgres");
+    // B836 — a configured pool is the one the postgres store opens.
+    assert_eq!(p.pool().options().get_max_connections(), 5);
+    assert_eq!(
+        p.pool().options().get_acquire_timeout(),
+        std::time::Duration::from_secs(7)
+    );
     run_conformance(p).await;
 }

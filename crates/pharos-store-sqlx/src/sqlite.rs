@@ -166,6 +166,15 @@ impl SqliteStore {
     /// [`SqliteStore::connect`] for the variant that also starts the
     /// `sort_name` backfill.
     pub async fn connect_without_backfill(url: &str) -> Result<Self, StoreError> {
+        Self::connect_without_backfill_with(url, crate::PoolConfig::default()).await
+    }
+
+    /// [`connect_without_backfill`](Self::connect_without_backfill) with a
+    /// pool of the given size.
+    pub async fn connect_without_backfill_with(
+        url: &str,
+        sizing: crate::PoolConfig,
+    ) -> Result<Self, StoreError> {
         // WAL + busy_timeout for the file-backed (on-PVC) deployment: the
         // server runs the periodic library rescan concurrently with read
         // traffic, so the journal must let readers proceed against a live
@@ -183,7 +192,8 @@ impl SqliteStore {
             .synchronous(SqliteSynchronous::Normal)
             .busy_timeout(std::time::Duration::from_secs(15));
         let pool = SqlitePoolOptions::new()
-            .max_connections(8)
+            .max_connections(sizing.max_connections)
+            .acquire_timeout(sizing.acquire_timeout)
             .connect_with(opts)
             .await?;
         MIGRATOR.run(&pool).await?;
@@ -195,7 +205,12 @@ impl SqliteStore {
     /// that predate migration 0054 in the background, so startup never waits
     /// on it. Unfilled rows sort by `title_fold` in the meantime.
     pub async fn connect(url: &str) -> Result<Self, StoreError> {
-        let store = Self::connect_without_backfill(url).await?;
+        Self::connect_with(url, crate::PoolConfig::default()).await
+    }
+
+    /// [`connect`](Self::connect) with a pool of the given size.
+    pub async fn connect_with(url: &str, sizing: crate::PoolConfig) -> Result<Self, StoreError> {
+        let store = Self::connect_without_backfill_with(url, sizing).await?;
         store.spawn_sort_name_backfill();
         Ok(store)
     }

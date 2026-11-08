@@ -193,8 +193,18 @@ impl PostgresStore {
     /// Open a pool and run migrations to latest; see [`PostgresStore::connect`]
     /// for the variant that also starts the `sort_name` backfill.
     pub async fn connect_without_backfill(url: &str) -> Result<Self, StoreError> {
+        Self::connect_without_backfill_with(url, crate::PoolConfig::default()).await
+    }
+
+    /// [`connect_without_backfill`](Self::connect_without_backfill) with a
+    /// pool of the given size.
+    pub async fn connect_without_backfill_with(
+        url: &str,
+        sizing: crate::PoolConfig,
+    ) -> Result<Self, StoreError> {
         let pool = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(8)
+            .max_connections(sizing.max_connections)
+            .acquire_timeout(sizing.acquire_timeout)
             .connect(url)
             .await?;
         MIGRATOR.run(&pool).await?;
@@ -206,7 +216,12 @@ impl PostgresStore {
     /// that predate migration 0054 in the background, so startup never waits
     /// on it. Unfilled rows sort by `title_fold` in the meantime.
     pub async fn connect(url: &str) -> Result<Self, StoreError> {
-        let store = Self::connect_without_backfill(url).await?;
+        Self::connect_with(url, crate::PoolConfig::default()).await
+    }
+
+    /// [`connect`](Self::connect) with a pool of the given size.
+    pub async fn connect_with(url: &str, sizing: crate::PoolConfig) -> Result<Self, StoreError> {
+        let store = Self::connect_without_backfill_with(url, sizing).await?;
         store.spawn_sort_name_backfill();
         Ok(store)
     }
