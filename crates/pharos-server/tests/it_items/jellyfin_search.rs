@@ -283,3 +283,59 @@ async fn search_matches_series_name_not_just_title() {
         "/Items search must match series_name: {items}"
     );
 }
+
+/// B833 — the entity tables (tags here) are read only once the term is as
+/// long as the native search's `GROUP_MIN_CHARS`; shorter terms still match
+/// items but list no tag, person, studio or box-set hints.
+#[actix_web::test]
+async fn search_hints_skip_entity_tables_for_a_short_term() {
+    use pharos_core::TagStore;
+    let (state, token, _u) = seed().await;
+    state
+        .stores
+        .link_item_tags(200, &["Bl".to_string(), "Blades".to_string()])
+        .await
+        .unwrap();
+    let app = test::init_service(build_app(state)).await;
+    let kinds = |term: &str| {
+        let uri = format!("/Search/Hints?searchTerm={term}");
+        let token = token.clone();
+        let app = &app;
+        async move {
+            let body = test::call_and_read_body(
+                app,
+                test::TestRequest::get()
+                    .uri(&uri)
+                    .insert_header(("X-Emby-Token", token.as_str()))
+                    .to_request(),
+            )
+            .await;
+            let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            v["SearchHints"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|h| {
+                    (
+                        h["Type"].as_str().unwrap().to_string(),
+                        h["Name"].as_str().unwrap().to_string(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        }
+    };
+    let short = kinds("bl").await;
+    assert!(
+        short.iter().all(|(t, _)| t != "Tag"),
+        "two letters list no tag: {short:?}"
+    );
+    assert!(
+        short.iter().any(|(t, _)| t == "Movie"),
+        "two letters still match items: {short:?}"
+    );
+    let long = kinds("bla").await;
+    assert!(
+        long.contains(&("Tag".to_string(), "Blades".to_string())),
+        "three letters list the tag: {long:?}"
+    );
+}
