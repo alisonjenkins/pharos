@@ -780,7 +780,12 @@ async fn load_hlsjs() -> Result<(), String> {
 struct HlsJs {
     video_id: String,
     listener: Option<u64>,
+    /// Which attach made the page's player, so a late `Drop` eval cannot
+    /// destroy the one a later attach put at the same id.
+    generation: u64,
 }
+
+static NEXT_HLS: AtomicU64 = AtomicU64::new(1);
 
 impl PlaybackEngine for HlsJs {
     fn attach(
@@ -843,8 +848,15 @@ impl PlaybackEngine for HlsJs {
                 }
             }
         };
+        if let Some(old) = self.listener.take() {
+            unlisten(old);
+        }
         self.listener = Some(listen(Listener::Hls(id.clone(), Box::new(on_event))));
         self.video_id = id.clone();
+        self.generation = NEXT_HLS.fetch_add(1, Ordering::Relaxed);
+        // The previous source's state must not answer for this one:
+        // `video_metadata` would resolve on its `ready` at once.
+        lock(&MEDIA).remove(&id);
         #[allow(clippy::cast_precision_loss)]
         let start = if start_ms > 0 {
             start_ms as f64 / 1000.0
@@ -859,6 +871,7 @@ if (!v) throw new Error("no <video id=" + id + ">");
 window.__pharosHls = window.__pharosHls || {{}};
 if (window.__pharosHls[id]) window.__pharosHls[id].destroy();
 const h = new Hls({{ startPosition: {start} }});
+h.__pharosGen = {generation};
 window.__pharosHls[id] = h;
 const send = (m) => window.__pharosSend && window.__pharosSend(Object.assign({{ t: "hls", id }}, m));
 h.on(Hls.Events.ERROR, (_, d) => send({{ ev: "error", kind: String(d.type), details: String(d.details), fatal: !!d.fatal }}));
@@ -878,6 +891,7 @@ h.attachMedia(v);
             id = js_str(&id),
             mark = js_str(super::resume::ENGINE_MARK),
             url = js_str(url),
+            generation = self.generation,
         ));
         Ok(())
     }
@@ -893,10 +907,12 @@ impl Drop for HlsJs {
         }
         run(format!(
             "const id = {}; const h = window.__pharosHls && window.__pharosHls[id]; \
-             if (h) {{ h.destroy(); delete window.__pharosHls[id]; }}",
-            js_str(&self.video_id)
+             if (h && h.__pharosGen === {}) {{ h.destroy(); delete window.__pharosHls[id]; }}",
+            js_str(&self.video_id),
+            self.generation
         ));
-        lock(&MEDIA).remove(&self.video_id);
+        // MEDIA is left alone: a newer engine may already own this id, and
+        // its attach cleared the entry for itself.
     }
 }
 
