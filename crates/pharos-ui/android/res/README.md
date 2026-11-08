@@ -13,6 +13,7 @@ either. `scripts/android-apk.sh` copies this tree over the generated
 | `mipmap-*/ic_launcher.webp` | Pre-API 26 icon, from `assets/brand/icon-512.png` |
 | `drawable-xhdpi/pharos_banner.png` | 320x180 TV launcher banner: `assets/brand/logo.svg` on `#0e1116` |
 | `values/strings.xml` | `app_name` = Pharos |
+| `values/styles.xml` | `AppTheme`: dark, with a Pharos Night window background, so start-up shows no white |
 
 The rasters are regenerated from the brand assets with ImageMagick:
 
