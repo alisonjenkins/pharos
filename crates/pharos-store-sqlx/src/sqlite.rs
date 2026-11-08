@@ -554,6 +554,24 @@ impl crate::ServerConfigStore for SqliteStore {
         }
     }
 
+    async fn load_or_create_secret(&self, name: &str, fresh: &[u8]) -> Result<Vec<u8>, StoreError> {
+        let now = now_unix_secs();
+        sqlx::query(
+            "INSERT INTO server_secrets (name, value, created_at) VALUES (?, ?, ?) ON CONFLICT (name) DO NOTHING",
+        )
+        .bind(name)
+        .bind(fresh)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        let (value,) =
+            sqlx::query_as::<_, (Vec<u8>,)>("SELECT value FROM server_secrets WHERE name = ?")
+                .bind(name)
+                .fetch_one(&self.pool)
+                .await?;
+        Ok(value)
+    }
+
     /// Read the persisted runtime config snapshot (`runtime_config`
     /// row id=1). Returns `Default` when the row has never been
     /// written.

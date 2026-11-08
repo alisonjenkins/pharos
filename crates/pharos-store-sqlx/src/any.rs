@@ -46,6 +46,13 @@ impl ServerConfigStore for AnyStore {
         }
     }
 
+    async fn load_or_create_secret(&self, name: &str, fresh: &[u8]) -> Result<Vec<u8>, StoreError> {
+        match self {
+            AnyStore::Sqlite(s) => s.load_or_create_secret(name, fresh).await,
+            AnyStore::Postgres(p) => p.load_or_create_secret(name, fresh).await,
+        }
+    }
+
     async fn load_runtime_config(&self) -> Result<RuntimeConfig, StoreError> {
         match self {
             AnyStore::Sqlite(s) => s.load_runtime_config().await,

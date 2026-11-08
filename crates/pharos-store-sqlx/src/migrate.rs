@@ -79,6 +79,10 @@ pub async fn migrate_sqlite_to_postgres(
         copy_system_identity(sp, &mut tx).await?,
     ));
     tables.push((
+        "server_secrets".into(),
+        copy_server_secrets(sp, &mut tx).await?,
+    ));
+    tables.push((
         "runtime_config".into(),
         copy_runtime_config(sp, &mut tx).await?,
     ));
@@ -375,6 +379,28 @@ async fn copy_system_identity(
         sqlx::query("INSERT INTO system_identity (id, server_id, created_at) VALUES ($1, $2, $3)")
             .bind(id)
             .bind(server_id)
+            .bind(created_at)
+            .execute(&mut **tx)
+            .await
+            .map_err(StoreError::Sqlx)?;
+    }
+    Ok(n)
+}
+
+async fn copy_server_secrets(
+    sp: &SqlitePool,
+    tx: &mut Transaction<'_, Postgres>,
+) -> Result<u64, StoreError> {
+    let rows: Vec<(String, Vec<u8>, i64)> =
+        sqlx::query_as("SELECT name, value, created_at FROM server_secrets")
+            .fetch_all(sp)
+            .await
+            .map_err(StoreError::Sqlx)?;
+    let n = rows.len() as u64;
+    for (name, value, created_at) in rows {
+        sqlx::query("INSERT INTO server_secrets (name, value, created_at) VALUES ($1, $2, $3)")
+            .bind(name)
+            .bind(value)
             .bind(created_at)
             .execute(&mut **tx)
             .await

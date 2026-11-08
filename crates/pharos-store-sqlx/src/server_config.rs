@@ -17,6 +17,15 @@ pub trait ServerConfigStore: Send + Sync {
         &self,
     ) -> impl std::future::Future<Output = Result<String, StoreError>> + Send;
 
+    /// Read the secret stored under `name`, or store `fresh` under it and
+    /// return that when none exists yet. Race-safe: when two processes
+    /// initialise at once, both get the value that won the insert.
+    fn load_or_create_secret(
+        &self,
+        name: &str,
+        fresh: &[u8],
+    ) -> impl std::future::Future<Output = Result<Vec<u8>, StoreError>> + Send;
+
     /// Read the persisted runtime config snapshot. Returns `Default` when
     /// the row has never been written.
     fn load_runtime_config(
