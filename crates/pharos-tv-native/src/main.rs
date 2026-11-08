@@ -23,7 +23,7 @@ fn android_main(app: android_activity::AndroidApp) {
 }
 
 fn main() {
-    dioxus::launch(root);
+    dioxus_native::launch(root);
 }
 
 fn root() -> Element {

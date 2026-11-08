@@ -1187,19 +1187,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "blitz-net"
-version = "0.3.0-beta.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "966a91d78155df3fd34af4cfcc711e0a998b3bdc0d2967cda40b0087e129deff"
-dependencies = [
- "blitz-traits",
- "data-url",
- "reqwest 0.13.5",
- "tokio",
- "wasm-bindgen-futures",
-]
-
-[[package]]
 name = "blitz-paint"
 version = "0.3.0-beta.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2433,7 +2420,6 @@ dependencies = [
  "dioxus-history",
  "dioxus-hooks",
  "dioxus-html",
- "dioxus-native",
  "dioxus-signals",
  "dioxus-stores",
  "dioxus-web",
@@ -2746,7 +2732,6 @@ dependencies = [
  "anyrender_vello_hybrid",
  "blitz-dom",
  "blitz-html",
- "blitz-net",
  "blitz-paint",
  "blitz-shell",
  "blitz-traits",
@@ -2754,7 +2739,6 @@ dependencies = [
  "dioxus-asset-resolver",
  "dioxus-cli-config",
  "dioxus-core",
- "dioxus-devtools",
  "dioxus-document",
  "dioxus-history",
  "dioxus-html",
@@ -2764,7 +2748,6 @@ dependencies = [
  "peniko",
  "rustc-hash 2.1.3",
  "slotmap",
- "tokio",
  "webbrowser",
  "wgpu_context",
  "winit",
@@ -4437,22 +4420,6 @@ dependencies = [
  "hyper-util",
  "pin-project-lite",
  "tokio",
- "tower-service",
-]
-
-[[package]]
-name = "hyper-tls"
-version = "0.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "70206fc6890eaca9fde8a0bf71caa2ddfc9fe045ac9e5c70df101a7dbde866e0"
-dependencies = [
- "bytes",
- "http-body-util",
- "hyper",
- "hyper-util",
- "native-tls",
- "tokio",
- "tokio-native-tls",
  "tower-service",
 ]
 
@@ -6509,15 +6476,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7e036b411754132fd6b74e94b74e9a13c5cf606fa93d1885c35860d3060820b1"
 
 [[package]]
-name = "openssl-src"
-version = "300.6.1+3.6.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "46eb8fb9fb3b61ce1c0f8a026c4c1a0714d3a9e138e7fbde78753ce2babc3846"
-dependencies = [
- "cc",
-]
-
-[[package]]
 name = "openssl-sys"
 version = "0.9.118"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6525,7 +6483,6 @@ checksum = "19c413d6ec9ebaf5e1c829d355cb3e9f783778d700f135be0921d52fce3c60ae"
 dependencies = [
  "cc",
  "libc",
- "openssl-src",
  "pkg-config",
  "vcpkg",
 ]
@@ -6924,7 +6881,7 @@ dependencies = [
 name = "pharos-jellyfin-test-client"
 version = "0.0.0"
 dependencies = [
- "reqwest 0.12.28",
+ "reqwest",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
@@ -7013,7 +6970,7 @@ dependencies = [
  "proptest",
  "read-fonts 0.46.0",
  "regex-lite",
- "reqwest 0.12.28",
+ "reqwest",
  "serde",
  "serde_json",
  "sha2 0.11.1",
@@ -7189,7 +7146,7 @@ dependencies = [
  "pharos-client",
  "pharos-hls",
  "pharos-subs",
- "reqwest 0.12.28",
+ "reqwest",
  "rustls",
  "serde",
  "serde_json",
@@ -8340,43 +8297,6 @@ dependencies = [
  "wasm-bindgen-futures",
  "web-sys",
  "webpki-roots 1.0.10",
-]
-
-[[package]]
-name = "reqwest"
-version = "0.13.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "16a1cfa75cc186dd73d5818e510e042e40927bccc9c236b061cea97e1eb08029"
-dependencies = [
- "base64 0.23.1",
- "bytes",
- "encoding_rs",
- "futures-core",
- "http 1.5.0",
- "http-body",
- "http-body-util",
- "hyper",
- "hyper-tls",
- "hyper-util",
- "js-sys",
- "log",
- "mime",
- "native-tls",
- "percent-encoding",
- "pin-project-lite",
- "rustls-pki-types",
- "serde",
- "serde_urlencoded",
- "sync_wrapper",
- "tokio",
- "tokio-native-tls",
- "tower",
- "tower-http",
- "tower-service",
- "url",
- "wasm-bindgen",
- "wasm-bindgen-futures",
- "web-sys",
 ]
 
 [[package]]
@@ -10315,16 +10235,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.7",
-]
-
-[[package]]
-name = "tokio-native-tls"
-version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bbae76ab933c85776efabc971569dd6119c580d8f5d448769dec1764bf796ef2"
-dependencies = [
- "native-tls",
- "tokio",
 ]
 
 [[package]]
