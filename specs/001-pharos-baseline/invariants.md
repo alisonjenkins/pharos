@@ -579,3 +579,4 @@ load-bearing — tasks, bugs and code comments cite these ids. Never renumber; a
 - V777: the sign-in form's name field takes the focus on arrival (B827). Guarded by pharos-ui `the_sign_in_focus_goes_to_the_name_field`.
 - V787: under 40rem the pharos-ui player's skip button is placed from the top, never at a fixed `bottom` that the wrapped control row can reach (B838). Guarded by pharos-ui `on_a_phone_the_skip_button_clears_the_wrapped_controls`.
 - V788: Esc closes the command palette from any focused element inside its dialog, once per press (B839). Guarded by the browser check (compat-playwright has no case yet).
+- V804: a styled subtitle renderer rebuilt while the video is paused draws the paused frame without waiting for playback, and logs whether that draw worked (B854). Guarded by a browser check; JASSUB has no wasm test harness.
