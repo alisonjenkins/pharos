@@ -124,6 +124,8 @@ pub struct Narrow {
     pub genre: Option<String>,
     /// Only watched (`Some(true)`) or unwatched (`Some(false)`) items.
     pub played: Option<bool>,
+    /// Only 3D (`Some(true)`) or only 2D (`Some(false)`) titles (V722).
+    pub stereo: Option<bool>,
 }
 
 impl Default for Narrow {
@@ -133,6 +135,7 @@ impl Default for Narrow {
             descending: false,
             genre: None,
             played: None,
+            stereo: None,
         }
     }
 }
@@ -148,6 +151,7 @@ impl Narrow {
             descending: self.descending,
             genre: self.genre.clone(),
             played: self.played,
+            stereo: self.stereo,
             ..base.clone()
         }
     }
@@ -190,6 +194,11 @@ impl Narrow {
             Some(false) => pairs.push("watched=unwatched".to_owned()),
             None => {}
         }
+        match self.stereo {
+            Some(true) => pairs.push("3d=3d".to_owned()),
+            Some(false) => pairs.push("3d=2d".to_owned()),
+            None => {}
+        }
         if pairs.is_empty() {
             String::new()
         } else {
@@ -204,6 +213,7 @@ impl Narrow {
         let mut descending = None;
         let mut genre = None;
         let mut played = None;
+        let mut stereo = None;
         for pair in query.trim_start_matches('?').split('&') {
             let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
             let value = decode_component(value);
@@ -214,6 +224,8 @@ impl Narrow {
                 ("genre", v) if !v.is_empty() => genre = Some(v.to_owned()),
                 ("watched", "watched") => played = Some(true),
                 ("watched", "unwatched") => played = Some(false),
+                ("3d", "3d") => stereo = Some(true),
+                ("3d", "2d") => stereo = Some(false),
                 _ => {}
             }
         }
@@ -222,6 +234,7 @@ impl Narrow {
             descending: descending.unwrap_or(order.starts_descending()),
             genre,
             played,
+            stereo,
         }
     }
 }
@@ -809,6 +822,11 @@ fn FilterBar(narrow: Signal<Narrow>, genres: Signal<Vec<String>>) -> Element {
         Some(false) => "unwatched",
         Some(true) => "watched",
     };
+    let stereo = match now.stereo {
+        None => ANY,
+        Some(true) => "3d",
+        Some(false) => "2d",
+    };
     let direction = match (now.order, now.descending) {
         (Order::Name, false) => "A to Z",
         (Order::Name, true) => "Z to A",
@@ -878,6 +896,26 @@ fn FilterBar(narrow: Signal<Narrow>, genres: Signal<Vec<String>>) -> Element {
                     option { value: ANY, selected: played == ANY, "All" }
                     option { value: "unwatched", selected: played == "unwatched", "Unwatched" }
                     option { value: "watched", selected: played == "watched", "Watched" }
+                }
+            }
+            label { class: "pharos-filter",
+                span { aria_hidden: "true", "3D" }
+                select {
+                    aria_label: "3D",
+                    value: stereo,
+                    onchange: move |e| {
+                        let value = e.value();
+                        narrow.with_mut(|n| {
+                            n.stereo = match value.as_str() {
+                                "3d" => Some(true),
+                                "2d" => Some(false),
+                                _ => None,
+                            }
+                        });
+                    },
+                    option { value: ANY, selected: stereo == ANY, "2D and 3D" }
+                    option { value: "3d", selected: stereo == "3d", "3D only" }
+                    option { value: "2d", selected: stereo == "2d", "2D only" }
                 }
             }
             if now != Narrow::default() {
@@ -3300,6 +3338,11 @@ mod tests {
         assert_eq!(listing.sort_by, "PremiereDate,ProductionYear,SortName");
         assert_eq!(listing.genre.as_deref(), Some("Drama"));
         assert_eq!(listing.played, Some(false));
+        let three_d = Narrow {
+            stereo: Some(true),
+            ..Narrow::default()
+        };
+        assert_eq!(three_d.apply(&base).stereo, Some(true));
         let by_name = released.ordered(Order::Name);
         assert!(by_name.rail() == Rail::Letters && !by_name.descending);
         assert_eq!(by_name.apply(&base).sort_by, "SortName");
@@ -3334,6 +3377,10 @@ mod tests {
             Narrow {
                 genre: Some("Comédie+ 100%".into()),
                 played: Some(true),
+                ..Narrow::default()
+            },
+            Narrow {
+                stereo: Some(false),
                 ..Narrow::default()
             },
         ] {
