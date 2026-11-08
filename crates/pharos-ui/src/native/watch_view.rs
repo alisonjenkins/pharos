@@ -423,6 +423,12 @@ pub fn WatchView(
         });
     };
     use_hook(wake);
+    use_context_provider(|| {
+        Wake(Callback::new(move |()| {
+            let mut wake = wake;
+            wake();
+        }))
+    });
     // The open invite panel holds the chrome up.
     let invite_open = invite_open && invite.is_some();
     let class = match (media.paused, idle() && !invite_open) {
@@ -885,6 +891,7 @@ pub(super) fn Volume(
     #[props(default)]
     filled: bool,
 ) -> Element {
+    let wake = try_use_context::<Wake>();
     let shown = if media.muted { 0.0 } else { media.volume };
     let fill = format!("--pharos-fill: {:.0}%", shown * 100.0);
     rsx! {
@@ -911,7 +918,7 @@ pub(super) fn Volume(
             step: 0.05,
             value: "{shown}",
             style: if filled { fill },
-            onkeydown: slider_key,
+            onkeydown: move |evt| slider_key(evt, wake),
             oninput: move |evt: FormEvent| {
                 if let Ok(volume) = evt.value().parse::<f64>() {
                     on_control.call(Control::Volume { volume, muted: volume == 0.0 });
@@ -921,24 +928,50 @@ pub(super) fn Volume(
     }
 }
 
+/// Brings the chrome back when a key lands on one of its controls. The
+/// controls stop the keys they own from reaching the player, which is
+/// where the chrome is woken, so they wake it first (B819).
+#[derive(Clone, Copy)]
+pub(super) struct Wake(Callback<()>);
+
+/// Wakes, then stops the key from going on to the player when it `taken`.
+fn route_key(taken: bool, wake: impl FnOnce(), stop: impl FnOnce()) {
+    wake();
+    if taken {
+        stop();
+    }
+}
+
+fn wake_with(wake: Option<Wake>) -> impl FnOnce() {
+    move || {
+        if let Some(Wake(wake)) = wake {
+            wake.call(());
+        }
+    }
+}
+
 /// A key pressed on a range slider: the keys that move it (the arrows,
 /// Home, End, Page Up and Page Down) are the slider's, not the player's
 /// volume and seek keys; every other key goes on to the player, so `m`
 /// still mutes after the slider is dragged (B621).
-pub(super) fn slider_key(evt: KeyboardEvent) {
-    if moves_a_control(&evt.key()) {
-        evt.stop_propagation();
-    }
+pub(super) fn slider_key(evt: KeyboardEvent, wake: Option<Wake>) {
+    route_key(moves_a_control(&evt.key()), wake_with(wake), || {
+        evt.stop_propagation()
+    });
+}
+
+/// Whether a track menu keeps `key`: the keys that open it and move along it.
+fn menu_takes(key: &Key) -> bool {
+    moves_a_control(key) || matches!(key, Key::Enter) || key.to_string() == " "
 }
 
 /// A key pressed on a track menu: the keys that open it and move along
 /// it are the menu's; every other key goes on to the player, so `m` still
 /// mutes when the menu was opened and left without a pick (B621).
-fn menu_key(evt: KeyboardEvent) {
-    let key = evt.key();
-    if moves_a_control(&key) || matches!(key, Key::Enter) || key.to_string() == " " {
+fn menu_key(evt: KeyboardEvent, wake: Option<Wake>) {
+    route_key(menu_takes(&evt.key()), wake_with(wake), || {
         evt.stop_propagation();
-    }
+    });
 }
 
 fn moves_a_control(key: &Key) -> bool {
@@ -958,6 +991,7 @@ fn moves_a_control(key: &Key) -> bool {
 /// "Follow group" or "Just me" for the track menus. Only in a group.
 #[component]
 fn TrackMode(in_group: bool, own_tracks: bool, on_change: EventHandler<bool>) -> Element {
+    let wake = try_use_context::<Wake>();
     if !in_group {
         return rsx! {};
     }
@@ -966,7 +1000,7 @@ fn TrackMode(in_group: bool, own_tracks: bool, on_change: EventHandler<bool>) ->
             class: "pharos-track-picker pharos-track-mode",
             aria_label: "Tracks",
             title: "Tracks",
-            onkeydown: menu_key,
+            onkeydown: move |evt| menu_key(evt, wake),
             onchange: move |evt: FormEvent| {
                 on_change.call(evt.value() == "me");
                 platform::focus_by_id(PLAYER_ID);
@@ -1056,6 +1090,7 @@ fn TrackPicker(
     offer_off: bool,
     on_pick: EventHandler<Option<u32>>,
 ) -> Element {
+    let wake = try_use_context::<Wake>();
     let worth_showing = if offer_off {
         !tracks.is_empty()
     } else {
@@ -1069,7 +1104,7 @@ fn TrackPicker(
             class: "pharos-track-picker",
             aria_label: label,
             title: label,
-            onkeydown: menu_key,
+            onkeydown: move |evt| menu_key(evt, wake),
             onchange: move |evt: FormEvent| {
                 on_pick.call(evt.value().parse::<u32>().ok());
                 // Once picked, the keys that move the picker go to the player again.
@@ -1094,6 +1129,7 @@ fn TrackPicker(
 /// page offers.
 #[component]
 fn SubtitleSizePicker(show: bool, size: SubtitleSize, on_pick: EventHandler<Control>) -> Element {
+    let wake = try_use_context::<Wake>();
     if !show {
         return rsx! {};
     }
@@ -1102,7 +1138,7 @@ fn SubtitleSizePicker(show: bool, size: SubtitleSize, on_pick: EventHandler<Cont
             class: "pharos-track-picker pharos-subtitle-size-picker",
             aria_label: "Subtitle size",
             title: "Subtitle size",
-            onkeydown: menu_key,
+            onkeydown: move |evt| menu_key(evt, wake),
             onchange: move |evt: FormEvent| {
                 on_pick.call(Control::SubtitleSize(SubtitleSize::parse(&evt.value())));
                 platform::focus_by_id(PLAYER_ID);
@@ -1123,13 +1159,14 @@ fn SubtitleSizePicker(show: bool, size: SubtitleSize, on_pick: EventHandler<Cont
 /// reset while Auto has lowered itself.
 #[component]
 fn QualityPicker(quality: QualityView, height: u32, on_pick: EventHandler<Control>) -> Element {
+    let wake = try_use_context::<Wake>();
     let title = quality.title();
     rsx! {
         select {
             class: "pharos-track-picker pharos-quality-picker",
             aria_label: "Quality",
             title,
-            onkeydown: menu_key,
+            onkeydown: move |evt| menu_key(evt, wake),
             onchange: move |evt: FormEvent| {
                 let value = evt.value();
                 let control = if value == quality::RESET_AUTO {
@@ -1436,6 +1473,39 @@ mod tests {
         }
         c.subtitles.clear();
         assert!(!render(c).contains("pharos-subtitle-size-picker"));
+    }
+
+    #[test]
+    fn a_key_a_control_keeps_still_wakes_the_chrome_first() {
+        let order = std::cell::RefCell::new(Vec::new());
+        route_key(
+            true,
+            || order.borrow_mut().push("wake"),
+            || order.borrow_mut().push("stop"),
+        );
+        assert_eq!(*order.borrow(), ["wake", "stop"]);
+        order.borrow_mut().clear();
+        route_key(
+            false,
+            || order.borrow_mut().push("wake"),
+            || order.borrow_mut().push("stop"),
+        );
+        assert_eq!(*order.borrow(), ["wake"], "a key left alone is not stopped");
+    }
+
+    #[test]
+    fn a_menu_keeps_its_own_keys_and_a_slider_its_arrows() {
+        for key in [
+            Key::ArrowDown,
+            Key::ArrowUp,
+            Key::Enter,
+            Key::Character(" ".into()),
+        ] {
+            assert!(menu_takes(&key), "{key:?}");
+        }
+        assert!(!menu_takes(&Key::Character("m".into())));
+        assert!(moves_a_control(&Key::ArrowLeft));
+        assert!(!moves_a_control(&Key::Enter));
     }
 
     #[test]
