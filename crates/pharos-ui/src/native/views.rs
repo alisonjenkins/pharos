@@ -825,6 +825,8 @@ pub fn TitleView(
     /// The viewer is in a group: the together buttons move it here.
     #[props(default)]
     in_group: bool,
+    /// The audio and subtitle pickers, under the actions.
+    tracks: Option<Element>,
 ) -> Element {
     use_ends_at_refresh();
     use_key_mode(Mode::Detail);
@@ -916,6 +918,9 @@ pub fn TitleView(
                     if item.kind.playable() {
                         WatchedToggle { id: item.id, played: item.played, listen: item.kind == ItemKind::Audio }
                     }
+                }
+                if let Some(tracks) = tracks {
+                    {tracks}
                 }
                 InThisGroup { rows: group_rows }
                 if !detail.overview.is_empty() {

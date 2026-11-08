@@ -49,6 +49,7 @@ pub mod playback;
 pub mod playback_settings;
 /// For the non-native player's `<video>` (V455).
 pub use platform::lift_cues_as_shown;
+pub mod preplay;
 pub mod privacy;
 pub mod quality;
 pub mod queue;

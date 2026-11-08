@@ -10,7 +10,7 @@ use dioxus::prelude::*;
 use futures_util::StreamExt as _;
 use pharos_client::api::{
     Detail, Home, Item, ItemKind, ItemRef, NativeApi, NativeGrant, PharosApi as _,
-    PlaybackGrant as _, TrackChoice, TrackPicks,
+    PlaybackGrant as _, StartTracks, TrackChoice, TrackPicks,
 };
 use pharos_client::{CallInfo, ClientError};
 
@@ -44,6 +44,7 @@ use super::playback::{
     MSE_ENGINE_KEY, OVERLAY_EFFECT_KEY, SUBTITLE_SIZE_KEY, TIER_DROP_KEY, VOLUME_KEY,
 };
 use super::playback_settings;
+use super::preplay::{self, PlayPicks, TrackChoices};
 use super::privacy;
 use super::quality::{self, QualityView, Watch};
 use super::queue::{Queue, QueueAction, QueueCtx, Track, RESTART_AFTER_MS};
@@ -1603,6 +1604,8 @@ fn NativeApp(route: Route) -> Element {
     let nav = use_context::<Nav>();
     let mut start_over = use_signal(|| None::<ItemRef>);
     use_context_provider(|| StartOver(start_over));
+    let play_picks = use_signal(|| None);
+    use_context_provider(|| PlayPicks(play_picks));
     use_context_provider(|| {
         PlayFromStart(EventHandler::new(move |id: ItemRef| {
             start_over.set(Some(id));
@@ -3201,11 +3204,15 @@ fn SeenBrowse(browse: browse::Browse) -> Element {
 
 /// A film or episode page with the group's marks on it.
 #[component]
-fn SeenTitle(detail: Detail, on_watch_together: EventHandler<(ItemRef, u64)>) -> Element {
+fn SeenTitle(
+    detail: Detail,
+    on_watch_together: EventHandler<(ItemRef, u64)>,
+    tracks: Option<Element>,
+) -> Element {
     let seen = use_group_seen(vec![detail.item.id]);
     let in_group = (use_context::<Together>().view)().active;
     let PlayFromStart(on_play_from_start) = use_context::<PlayFromStart>();
-    rsx! { TitleView { detail, on_watch_together, on_play_from_start, seen, in_group } }
+    rsx! { TitleView { detail, on_watch_together, on_play_from_start, seen, in_group, tracks } }
 }
 
 #[component]
@@ -3233,6 +3240,50 @@ fn TitleScreen(id: ItemRef) -> Element {
                 settle(ctx.machine, api.detail(&call("title", "load"), id).await),
             ))
         }
+    }));
+    // The tracks playback would start on, for the pickers to show, asked
+    // only once the title has a choice to offer (a book or a one-track song
+    // has none). Without them the pickers start on each list's first entry
+    // and still hand on only what the viewer changes.
+    let start = use_resource(move || {
+        let api = ctx.api.read().clone();
+        let offered = detail
+            .read()
+            .as_ref()
+            .and_then(Option::as_ref)
+            .filter(|(asked, _)| *asked == id)
+            .and_then(|(_, r)| r.as_ref().ok())
+            .map(|d| {
+                (
+                    d.item.kind,
+                    d.item.kind.playable()
+                        && (d.audio_tracks.len() > 1 || !d.subtitle_tracks.is_empty()),
+                )
+            });
+        async move {
+            let api = api?;
+            let (kind, true) = offered? else {
+                return None;
+            };
+            let asked = api
+                .start_tracks(
+                    &call("title", "tracks"),
+                    id,
+                    &negotiation_capabilities(kind, 0),
+                )
+                .await;
+            let tracks = asked.unwrap_or_else(|e| {
+                platform::warn(&format!("pharos: start tracks unavailable: {e}"));
+                StartTracks::default()
+            });
+            Some((id, tracks))
+        }
+    });
+    // Picks made on an earlier visit are not this visit's.
+    let mut pending = use_context::<PlayPicks>().0;
+    use_effect(use_reactive!(|(id,)| {
+        let _ = id;
+        pending.set(None);
     }));
     // Start a group on this title where the viewer chose, then watch it as
     // its member.
@@ -3277,10 +3328,28 @@ fn TitleScreen(id: ItemRef) -> Element {
                 .filter(|(asked, _)| *asked == id)
                 .map(|(_, result)| result),
             |detail: &Detail| {
+                let tracks = start
+                    .read()
+                    .as_ref()
+                    .copied()
+                    .flatten()
+                    .filter(|(asked, _)| *asked == id)
+                    .map(|(_, start)| {
+                        rsx! {
+                            TrackChoices {
+                                key: "{id}",
+                                id,
+                                audio: detail.audio_tracks.clone(),
+                                subtitles: detail.subtitle_tracks.clone(),
+                                start,
+                            }
+                        }
+                    });
                 rsx! {
                     SeenTitle {
                         detail: detail.clone(),
                         on_watch_together: on_watch_together.clone(),
+                        tracks,
                     }
                 }
             },
@@ -3377,8 +3446,11 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
             });
         })
     };
-    // The tracks asked for; changing them negotiates a new playback.
-    let mut picks = use_signal(TrackPicks::default);
+    // The tracks asked for, first those the title page handed on; changing
+    // them negotiates a new playback.
+    let mut pending = use_context::<PlayPicks>().0;
+    let mut picks = use_signal(|| preplay::picks_for(id, *pending.peek()));
+    use_effect(move || pending.set(None));
     // What the connection has shown about this video, kept across the
     // reloads its own decisions cause; the cap it asks for rides the next
     // negotiation.
