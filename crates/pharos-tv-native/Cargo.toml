@@ -32,6 +32,9 @@ blitz-shell = "=0.3.0-beta.4"
 jni = "0.21"
 # Bundles android/ (the Kotlin side) into the APK as a Gradle module.
 manganis = "=0.8.0-alpha.3"
+# The video probe (src/video.rs): AMediaCodec and AMediaExtractor.
+ndk = { version = "0.9", features = ["media", "nativewindow"] }
+ndk-sys = { version = "0.6", features = ["media"] }
 # The default path calls __system_property_read_callback, which the link
 # under dx does not resolve (unexplained; LTO dropped it in the smoke app).
 # The deprecated bionic calls exist on every API level.

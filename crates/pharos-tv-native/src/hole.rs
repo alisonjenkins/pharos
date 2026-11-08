@@ -293,21 +293,37 @@ fn child_layer(
         format!("({SC})V"),
         &[JValue::Object(&child)],
     )?;
-    let canvas = env
-        .call_method(
+    if let Some(path) = crate::video::path() {
+        // A canvas fill would connect the Surface as a CPU producer and the
+        // decoder could not connect after it, so a video gets no fill.
+        // SAFETY: `env` and `surface` are live for this call; the window
+        // takes its own reference to the Surface's producer.
+        match unsafe {
+            ndk::native_window::NativeWindow::from_surface(
+                env.get_raw().cast(),
+                surface.as_raw().cast(),
+            )
+        } {
+            Some(window) => crate::video::play(window, path),
+            None => log::warn!("hole: ANativeWindow_fromSurface returned null"),
+        }
+    } else {
+        let canvas = env
+            .call_method(
+                &surface,
+                "lockCanvas",
+                "(Landroid/graphics/Rect;)Landroid/graphics/Canvas;",
+                &[JValue::Object(&JObject::null())],
+            )?
+            .l()?;
+        env.call_method(&canvas, "drawColor", "(I)V", &[JValue::Int(GREEN)])?;
+        env.call_method(
             &surface,
-            "lockCanvas",
-            "(Landroid/graphics/Rect;)Landroid/graphics/Canvas;",
-            &[JValue::Object(&JObject::null())],
-        )?
-        .l()?;
-    env.call_method(&canvas, "drawColor", "(I)V", &[JValue::Int(GREEN)])?;
-    env.call_method(
-        &surface,
-        "unlockCanvasAndPost",
-        "(Landroid/graphics/Canvas;)V",
-        &[JValue::Object(&canvas)],
-    )?;
+            "unlockCanvasAndPost",
+            "(Landroid/graphics/Canvas;)V",
+            &[JValue::Object(&canvas)],
+        )?;
+    }
     // The layer is released when its SurfaceControl is collected; the probe
     // keeps both for the life of the process.
     std::mem::forget(env.new_global_ref(&child)?);

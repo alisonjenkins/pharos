@@ -7123,6 +7123,8 @@ dependencies = [
  "libc",
  "log",
  "manganis",
+ "ndk",
+ "ndk-sys",
  "parley",
  "pharos-client",
  "pharos-ui",

@@ -15,6 +15,8 @@ mod launch;
 mod live;
 #[cfg(target_os = "android")]
 mod net;
+#[cfg(target_os = "android")]
+mod video;
 mod screens;
 use screens::{Data, Screen, Spike};
 
