@@ -149,6 +149,9 @@ async fn native_views_carry_the_library_id_and_its_poster() {
             .primary_tag
             .as_deref()
             .expect("a seeded movie library has a poster");
+        // ADR-0073: the native API hands out the same signed tag as the
+        // Jellyfin routes (V712).
+        let tag = fx.state.image_tag_key.sign(&view.id, "primary", tag);
         assert_eq!(images.len(), 1, "{}", view.name);
         let image = images.get(0);
         assert_eq!(image.get_kind().unwrap().to_str().unwrap(), "Primary");
