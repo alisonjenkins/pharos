@@ -509,7 +509,15 @@ pub fn StageBar(
     next: Option<ItemRef>,
     error: Option<String>,
     on_action: EventHandler<StageAction>,
+    /// The position as a signal, when the player keeps it apart from `media`
+    /// (B815).
+    #[props(default)]
+    live_position: Option<Signal<u64>>,
 ) -> Element {
+    let media = MediaState {
+        position_ms: live_position.map_or(media.position_ms, |s| s()),
+        ..media
+    };
     let mut drag = use_signal(|| None::<Drag>);
     let StageCtx(stage) = use_context::<StageCtx>();
     let spot = stage.read().spot;
