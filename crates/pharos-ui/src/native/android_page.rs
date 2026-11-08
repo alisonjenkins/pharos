@@ -211,8 +211,12 @@ pub fn push(path: &str) {
     ));
 }
 
-/// android: not yet. A newer server's reload has nothing to reload: the app
-/// is the build installed.
+/// A newer server's reload has nothing to reload: the app is the build
+/// installed, so the page offers no Reload.
+pub fn can_reload() -> bool {
+    false
+}
+
 pub fn reload() {}
 
 pub fn replace(path: &str) {
