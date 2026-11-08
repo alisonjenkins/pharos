@@ -19,6 +19,14 @@ fn android_main(app: android_activity::AndroidApp) {
     );
     stdout_to_log();
     blitz_shell::set_android_app(app);
+    // Render-scale probe: `setprop debug.pharos.render_scale 0.667` on the TV.
+    if let Some(scale) = android_properties::getprop("debug.pharos.render_scale")
+        .value()
+        .and_then(|v| v.parse::<f32>().ok())
+    {
+        log::info!("render scale {scale}");
+        blitz_shell::set_render_scale(scale);
+    }
     log::info!("pharos-tv-native start");
     main();
 }
