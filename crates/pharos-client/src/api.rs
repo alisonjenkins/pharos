@@ -122,6 +122,9 @@ pub struct Item {
     pub imdb_rating: Option<u16>,
     /// Rotten Tomatoes Tomatometer, a percentage.
     pub critic_rating: Option<u16>,
+    /// A song's artists, joined, for its card; `None` for anything else or
+    /// from a server before schemaVersion 25.
+    pub artist: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1384,6 +1387,7 @@ pub(crate) fn read_item(item: item_summary::Reader<'_>) -> Result<Item, capnp::E
             .then(|| read_library_kind(item.get_library_kind())),
         imdb_rating: read_opt_u16(item.get_imdb_rating()?)?,
         critic_rating: read_opt_u16(item.get_critic_rating()?)?,
+        artist: Some(text(item.get_artist())?).filter(|a| !a.is_empty()),
     })
 }
 
