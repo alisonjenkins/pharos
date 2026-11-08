@@ -1202,6 +1202,12 @@ impl SubtitleSize {
         }
     }
 
+    /// [`scale`](Self::scale) in whole percent: the `?size=` the generated
+    /// styled track is compiled at (spec 028 FR-022).
+    pub fn percent(self) -> u16 {
+        (self.scale() * 100.0).round() as u16
+    }
+
     /// The option text shown in the Appearance picker.
     pub fn label(self) -> &'static str {
         match self {
@@ -2477,16 +2483,26 @@ pub fn styled_subtitle_url(track: &Track) -> Option<String> {
         .map(|base| format!("{base}/stream.ass"))
 }
 
-/// The URL of a generated styled track's script at `tier` and `level`
-/// (spec 028 FR-006): `None` for any other track, and for every track while
-/// Effects is Off, where the plain track draws instead.
-pub fn styled_track_url(track: &Track, tier: Tier, level: EffectsLevel) -> Option<String> {
+/// The URL of a generated styled track's script at `tier`, `level` and the
+/// viewer's subtitle `size` (spec 028 FR-006, FR-022): `None` for any other
+/// track, and for every track while Effects is Off, where the plain track
+/// draws instead. Medium sends no `size`, the server's default.
+pub fn styled_track_url(
+    track: &Track,
+    tier: Tier,
+    level: EffectsLevel,
+    size: SubtitleSize,
+) -> Option<String> {
     if level == EffectsLevel::Off {
         return None;
     }
     let url = track.styled_url.as_deref()?;
+    let sized = match size.percent() {
+        100 => String::new(),
+        p => format!("&size={p}"),
+    };
     Some(format!(
-        "{url}?tier={}&effects={}",
+        "{url}?tier={}&effects={}{sized}",
         tier.label(),
         level.as_str()
     ))
@@ -2705,6 +2721,10 @@ mod tests {
         let scales = SubtitleSize::ALL.map(SubtitleSize::scale);
         assert_eq!(scales, [0.75, 1.0, 1.25, 1.5]);
         assert_eq!(SubtitleSize::default().scale(), 1.0);
+        assert_eq!(
+            SubtitleSize::ALL.map(SubtitleSize::percent),
+            [75, 100, 125, 150]
+        );
     }
 
     #[test]
@@ -3617,15 +3637,43 @@ mod tests {
             ..Track::default()
         };
         assert_eq!(
-            styled_track_url(&styled, Tier::Tv, EffectsLevel::Subtle).as_deref(),
+            styled_track_url(
+                &styled,
+                Tier::Tv,
+                EffectsLevel::Subtle,
+                SubtitleSize::Medium
+            )
+            .as_deref(),
             Some("/videos/7/subtitles/3/stream.ass?tier=tv&effects=subtle")
         );
         assert_eq!(
-            styled_track_url(&styled, Tier::Desktop, EffectsLevel::Full).as_deref(),
+            styled_track_url(
+                &styled,
+                Tier::Desktop,
+                EffectsLevel::Full,
+                SubtitleSize::Medium
+            )
+            .as_deref(),
             Some("/videos/7/subtitles/3/stream.ass?tier=desktop&effects=full")
         );
+        // B852: the size choice reaches the styled track.
         assert_eq!(
-            styled_track_url(&styled, Tier::Low, EffectsLevel::Off),
+            styled_track_url(
+                &styled,
+                Tier::Tv,
+                EffectsLevel::Subtle,
+                SubtitleSize::ExtraLarge
+            )
+            .as_deref(),
+            Some("/videos/7/subtitles/3/stream.ass?tier=tv&effects=subtle&size=150")
+        );
+        assert_eq!(
+            styled_track_url(&styled, Tier::Tv, EffectsLevel::Subtle, SubtitleSize::Small)
+                .as_deref(),
+            Some("/videos/7/subtitles/3/stream.ass?tier=tv&effects=subtle&size=75")
+        );
+        assert_eq!(
+            styled_track_url(&styled, Tier::Low, EffectsLevel::Off, SubtitleSize::Large),
             None
         );
         let source = Track {
@@ -3633,7 +3681,7 @@ mod tests {
             ..styled
         };
         assert_eq!(
-            styled_track_url(&source, Tier::Tv, EffectsLevel::Full),
+            styled_track_url(&source, Tier::Tv, EffectsLevel::Full, SubtitleSize::Large),
             None
         );
     }

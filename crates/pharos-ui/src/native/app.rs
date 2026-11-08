@@ -4782,11 +4782,11 @@ fn Player(
         );
         move || {
             let shown = if burned { None } else { subtitle() };
-            // Read before any return, so a tier drop or a level change
-            // reloads the script in place.
-            let (tier_now, level_now) = (tier(), effects());
+            // Read before any return, so a tier drop, a level change or a
+            // size change reloads the script in place.
+            let (tier_now, level_now, size_now) = (tier(), effects(), sub_size());
             let track = shown.and_then(|i| p.detail.subtitle_tracks.iter().find(|t| t.index == i));
-            let generated = track.and_then(|t| styled_track_url(t, tier_now, level_now));
+            let generated = track.and_then(|t| styled_track_url(t, tier_now, level_now, size_now));
             // A generated track at Off draws as the plain track beside it,
             // never from its source's raw script.
             let script = generated.clone().or_else(|| {
