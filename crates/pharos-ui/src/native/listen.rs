@@ -416,7 +416,7 @@ pub fn ListenView(
                             aria_valuetext: "{clock(at)}",
                             disabled: total == 0,
                             style: "--pharos-fill: {played:.2}%",
-                            onkeydown: slider_key,
+                            onkeydown: move |evt| slider_key(evt, None),
                             oninput: move |evt: FormEvent| {
                                 if let Ok(ms) = evt.value().parse::<f64>() {
                                     scrub.set(Some(Scrub { ms: ms as u64, released: false }));
