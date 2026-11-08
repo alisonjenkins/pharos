@@ -79,6 +79,7 @@ pub mod seen;
 pub mod settings;
 pub mod show_tracks;
 pub mod stage;
+pub mod stereo;
 pub mod style_picker;
 #[cfg(all(feature = "web", target_arch = "wasm32"))]
 mod subs_web;
@@ -94,6 +95,7 @@ mod turn_web;
 pub mod tv_auth;
 // 025: the Android TV app's page rules (history, proxy, bridge); no I/O.
 pub mod tv_page;
+pub mod versions;
 pub mod views;
 pub mod visualiser;
 pub mod watch_view;

@@ -24,6 +24,7 @@ use super::route::Route;
 use super::seen::{self, MemberSeen};
 use super::together::can_watch_together;
 use super::together_view::InThisGroup;
+use super::versions;
 
 /// Navigation, provided by the app root: a click on a [`Link`] calls it
 /// instead of reloading the page.
@@ -987,6 +988,12 @@ pub fn TitleView(
     in_group: bool,
     /// The audio and subtitle pickers, under the actions.
     tracks: Option<Element>,
+    /// The version chosen to play; empty is the primary.
+    #[props(default)]
+    version: String,
+    /// Hears a new pick from the Version select.
+    #[props(default)]
+    on_version: Option<EventHandler<String>>,
 ) -> Element {
     use_ends_at_refresh();
     use_key_mode(Mode::Detail);
@@ -1032,6 +1039,23 @@ pub fn TitleView(
                 }
                 Ratings { kind: item.kind, imdb: item.imdb_rating, critic: item.critic_rating, tile: false }
                 div { class: "pharos-actions",
+                    if item.kind.playable() && detail.versions.len() > 1 {
+                        label { class: "pharos-filter",
+                            span { aria_hidden: "true", "Version" }
+                            select {
+                                aria_label: "Version",
+                                value: "{version}",
+                                onchange: move |e| {
+                                    if let Some(h) = on_version {
+                                        h.call(e.value());
+                                    }
+                                },
+                                for v in detail.versions.iter() {
+                                    option { value: "{v.id}", selected: v.id == version, {versions::version_label(v)} }
+                                }
+                            }
+                        }
+                    }
                     if item.kind.playable() {
                         Link {
                             to: Route::Watch(item.id),
@@ -2225,6 +2249,48 @@ mod tests {
         );
     }
 
+    /// Spec 022 US1 (V722): a title with a 3D edition offers both versions
+    /// beside Play, with the chosen one selected.
+    #[test]
+    fn a_3d_title_offers_its_versions() {
+        use pharos_client::api::{Stereo, Version};
+        let version = |id: &str, stereo| Version {
+            id: id.into(),
+            stereo,
+            primary: id.is_empty(),
+            ..Default::default()
+        };
+        let detail = Detail {
+            item: item(ItemKind::Movie),
+            overview: String::new(),
+            genres: vec![],
+            chapters: vec![],
+            audio_tracks: vec![],
+            subtitle_tracks: vec![],
+            trickplay: vec![],
+            segments: vec![],
+            fonts: Vec::new(),
+            artists: Vec::new(),
+            album: None,
+            cast: Vec::new(),
+            versions: vec![
+                version("", None),
+                version("3d-hsbs", Some(Stereo::HalfSideBySide)),
+            ],
+        };
+        let html = render(move || {
+            rsx! { TitleView { detail: detail.clone(), version: "3d-hsbs".to_string() } }
+        });
+        assert!(html.contains(r#"aria-label="Version""#), "{html}");
+        assert!(html.contains(">2D<"), "{html}");
+        assert!(
+            html.contains(
+                r#"<option value="3d-hsbs" selected=true>3D (half side-by-side)</option>"#
+            ),
+            "{html}"
+        );
+    }
+
     #[test]
     fn a_title_offers_play_or_resume_play_from_start_and_a_watched_mark() {
         let mut movie = item(ItemKind::Movie);
@@ -2245,6 +2311,10 @@ mod tests {
             versions: Vec::new(),
         };
         let html = render(move || rsx! { TitleView { detail: detail.clone() } });
+        assert!(
+            !html.contains(r#"aria-label="Version""#),
+            "one version, no choice"
+        );
         assert!(
             html.contains(r#"href="/ui/watch/1""#) && html.contains(">Play<"),
             "{html}"
