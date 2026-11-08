@@ -267,6 +267,101 @@ async fn latest_lists_the_newest_items_the_policy_allows() {
     assert_eq!(capped.len(), LATEST_MAX as usize);
 }
 
+/// The shape of "latest" beyond the policy: ties on the timestamp fall to the
+/// higher id, a kind filter keeps only those kinds, a series or season parent
+/// lists only its episodes, and a limit of 0 lists nothing.
+#[actix_web::test]
+async fn latest_orders_ties_by_id_and_scopes_to_kinds_and_series() {
+    use library::KindFilter;
+    use pharos_core::{MediaItem, MediaKind, MediaStore as _, SeriesInfo};
+    use pharos_jellyfin_api::dto::{season_id_for_key, series_id_for_key};
+
+    let fx = seed_rich().await;
+    let episode = |id: u64, show: &str, season: u32, at: i64| MediaItem {
+        id,
+        path: format!("/libA/{show}/S{season}/e{id}.mkv").into(),
+        title: format!("E{id}"),
+        kind: MediaKind::Episode,
+        created_at: Some(at),
+        series: Some(SeriesInfo {
+            series_name: show.into(),
+            season_number: Some(season),
+            episode_number: Some(1),
+            series_folder: Some(format!("/libA/{show}")),
+            series_year: None,
+        }),
+        ..MediaItem::default()
+    };
+    let movie = |id: u64, at: i64| MediaItem {
+        id,
+        path: format!("/libA/m{id}.mkv").into(),
+        title: format!("M{id}"),
+        kind: MediaKind::Movie,
+        created_at: Some(at),
+        ..MediaItem::default()
+    };
+    let at = 4_100_000_000;
+    for item in [
+        movie(301, at),
+        movie(302, at),
+        episode(311, "Alpha", 1, at + 1),
+        episode(312, "Alpha", 2, at + 3),
+        episode(313, "Beta", 1, at + 2),
+    ] {
+        fx.state.stores.put(item).await.unwrap();
+    }
+    let user = pharos_server::services::auth::user_for_token(&fx.state.stores, &fx.user_token)
+        .await
+        .unwrap();
+    let ids = |rows: Vec<(MediaItem, pharos_core::UserItemData)>| {
+        rows.into_iter().map(|(i, _)| i.id).collect::<Vec<_>>()
+    };
+
+    let all = library::latest(&fx.state, &user, None, &KindFilter::Unset, Some(5))
+        .await
+        .unwrap();
+    assert_eq!(ids(all), [312, 313, 311, 302, 301]);
+
+    let movies = library::latest(
+        &fx.state,
+        &user,
+        None,
+        &KindFilter::Kinds(vec![MediaKind::Movie]),
+        Some(2),
+    )
+    .await
+    .unwrap();
+    assert_eq!(ids(movies), [302, 301]);
+
+    let alpha = series_id_for_key(Some("/libA/Alpha"), "Alpha");
+    let show = library::latest(&fx.state, &user, Some(&alpha), &KindFilter::Unset, None)
+        .await
+        .unwrap();
+    assert_eq!(ids(show), [312, 311]);
+
+    let season = season_id_for_key(Some("/libA/Alpha"), "Alpha", 1);
+    let one = library::latest(&fx.state, &user, Some(&season), &KindFilter::Unset, None)
+        .await
+        .unwrap();
+    assert_eq!(ids(one), [311]);
+
+    let unknown = library::latest(
+        &fx.state,
+        &user,
+        Some("ffffffffffffffffffffffffffffffff"),
+        &KindFilter::Unset,
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(unknown.is_empty(), "an unknown parent lists nothing");
+
+    let zero = library::latest(&fx.state, &user, None, &KindFilter::Unset, Some(0))
+        .await
+        .unwrap();
+    assert!(zero.is_empty());
+}
+
 /// `Library.latest` on `session`, as the Jellyfin fields the test compares.
 async fn wire_latest(
     session: &session::Client,
