@@ -169,7 +169,15 @@ pub fn ListenView(
     /// hands over to the next.
     #[props(default = VIDEO_ID)]
     media_id: &'static str,
+    /// The position as a signal, when the player keeps it apart from `media`
+    /// so its own render does not run on every tick (B815).
+    #[props(default)]
+    live_position: Option<Signal<u64>>,
 ) -> Element {
+    let media = MediaState {
+        position_ms: live_position.map_or(media.position_ms, |s| s()),
+        ..media
+    };
     let tap = use_hook(Tap::default);
     let shortcuts = use_shortcuts(media, previous, next, on_control).for_song();
     let mut style =

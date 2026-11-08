@@ -60,6 +60,12 @@ const IMAGE_CUES_POLL_MS: u32 = 3_000;
 /// gives up; an HTTP error (the extraction failed) ends it at once.
 const IMAGE_CUES_RETRIES: u32 = 3;
 
+#[cfg(test)]
+thread_local! {
+    /// How many times `WatchView`'s body has run, for the render-count test.
+    static BODY_RENDERS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
 /// Everything the controls show.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Controls {
@@ -83,6 +89,66 @@ pub struct Controls {
     pub next: Option<ItemRef>,
     /// The "Up next" card, while it counts down.
     pub up_next: Option<UpNextCard>,
+    /// The playback position as a signal, when the owner updates it apart
+    /// from `media`. The leaves that show the position read it, so a tick
+    /// re-renders them alone and not the whole player (B815). Without it
+    /// `media.position_ms` is the position.
+    pub live_position: Option<Signal<u64>>,
+}
+
+/// Where playback is. Reading it with `now` in a component's body
+/// subscribes that component to every tick; `peek` reads it for a handler.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Position {
+    fixed: u64,
+    live: Option<Signal<u64>>,
+}
+
+impl Position {
+    pub fn of(c: &Controls) -> Self {
+        Self {
+            fixed: c.media.position_ms,
+            live: c.live_position,
+        }
+    }
+
+    pub fn at(ms: u64) -> Self {
+        Self {
+            fixed: ms,
+            live: None,
+        }
+    }
+
+    /// The position, subscribing the calling component to its changes.
+    pub fn now(self) -> u64 {
+        self.live.map_or(self.fixed, |s| s())
+    }
+
+    /// The position, without subscribing.
+    pub fn peek(self) -> u64 {
+        self.live.map_or(self.fixed, |s| *s.peek())
+    }
+}
+
+/// `media` with the position it had when the viewer acted, not when the
+/// component last rendered.
+pub(super) fn media_at(media: MediaState, pos: Position) -> MediaState {
+    MediaState {
+        position_ms: pos.peek(),
+        ..media
+    }
+}
+
+/// `media` split into what changes the player's look and the position that
+/// changes every tick: the player re-renders on the first only (B815).
+pub fn split_position(media: MediaState) -> (MediaState, u64) {
+    (
+        MediaState {
+            position_ms: 0,
+            ..media
+        },
+        media.position_ms,
+    )
 }
 
 /// The next episode, as the "Up next" card shows it.
@@ -304,11 +370,13 @@ pub fn WatchView(
     #[props(default)]
     invite_note: Option<String>,
 ) -> Element {
-    use_ends_at_refresh();
+    #[cfg(test)]
+    BODY_RENDERS.with(|n| n.set(n.get() + 1));
     let in_group = !members.is_empty();
     let c = &controls;
     let total = c.total_ms();
     let media = c.media;
+    let pos = Position::of(c);
     // The chrome over the picture fades while the pointer rests, as in any
     // modern player: `stirred` records movement since the last tick, and one
     // ticking task runs while the chrome is shown.
@@ -356,14 +424,14 @@ pub fn WatchView(
     use_effect(use_reactive!(|controls_shown| {
         platform::set_subtitle_controls_visible(controls_shown);
     }));
-    let shortcuts = use_shortcuts(media, c.previous, c.next, on_control);
+    let shortcuts = use_shortcuts(media, c.previous, c.next, on_control).following(pos);
     let tracks = (
         c.subtitles.clone(),
         c.subtitle_pick,
         c.audio.clone(),
         c.audio_pick,
     );
-    let skip = segment_at(&c.segments, media.position_ms);
+    let segments = c.segments.clone();
     let up_next_shown = c.up_next.is_some();
     let on_key = move |evt: KeyboardEvent| {
         wake();
@@ -388,16 +456,16 @@ pub fn WatchView(
             Some(Transport::NextSubtitle) => next_subtitle(&tracks.0, tracks.1),
             Some(Transport::NextAudio) => next_audio(&tracks.2, tracks.3),
             Some(Transport::SkipSegment) => {
-                let control = skip_segment_control(skip, up_next_shown);
+                let from_ms = pos.peek();
+                let control = skip_segment_control(segment_at(&segments, from_ms), up_next_shown);
                 if let Some(Control::Seek(to_ms)) = control {
                     platform::info(&format!(
-                        "pharos: skip by key from {} ms to {to_ms} ms",
-                        media.position_ms
+                        "pharos: skip by key from {from_ms} ms to {to_ms} ms"
                     ));
                 }
                 control
             }
-            Some(t) => transport_control(t, &media),
+            Some(t) => transport_control(t, &media_at(media, pos)),
             None => None,
         };
         let Some(control) = control else {
@@ -406,7 +474,6 @@ pub fn WatchView(
         evt.prevent_default();
         on_control.call(control);
     };
-    let ends = ends_at(left_to_watch(&c.segments, media.position_ms, total));
     let text_tracks: Vec<(String, Track)> = c
         .subtitles
         .iter()
@@ -493,7 +560,7 @@ pub fn WatchView(
                     }
                 }
                 for url in image_cues {
-                    ImageSubtitles { key: "{url}", url: url.clone(), media }
+                    ImageSubtitles { key: "{url}", url: url.clone(), media, pos }
                 }
                 div { class: "pharos-watch-top",
                     button {
@@ -552,13 +619,8 @@ pub fn WatchView(
                 ActivityToast { line: toast }
                 if let Some(card) = c.up_next.clone() {
                     UpNext { card, on_control }
-                } else if let Some(seg) = skip {
-                    button {
-                        class: "pharos-skip",
-                        r#type: "button",
-                        onclick: move |_| on_control.call(Control::Seek(seg.end_ms)),
-                        {skip_label(seg.kind)}
-                    }
+                } else {
+                    SkipButton { segments: c.segments.clone(), pos, on_control }
                 }
                 div { class: "pharos-controls",
                     SeekBar { controls: controls.clone(), total, on_control }
@@ -588,12 +650,7 @@ pub fn WatchView(
                                 "⏭"
                             }
                         }
-                        span { class: "pharos-time",
-                            "{clock(media.position_ms)} / {clock(total)}"
-                        }
-                        if let Some(ends) = &ends {
-                            span { class: "pharos-time pharos-ends-at", "{ends}" }
-                        }
+                        TimeLabels { segments: c.segments.clone(), pos, total }
                         Volume { media, on_control }
                         span { class: "pharos-control-spacer" }
                         TrackMode { in_group, own_tracks, on_change: on_own_tracks }
@@ -635,6 +692,38 @@ pub fn WatchView(
                     }
                 }
             }
+        }
+    }
+}
+
+/// The skip intro/credits button, while the position is in a skippable
+/// span. It reads the position itself so a tick re-renders it alone.
+#[component]
+fn SkipButton(segments: Vec<Segment>, pos: Position, on_control: EventHandler<Control>) -> Element {
+    let Some(seg) = segment_at(&segments, pos.now()) else {
+        return rsx! {};
+    };
+    rsx! {
+        button {
+            class: "pharos-skip",
+            r#type: "button",
+            onclick: move |_| on_control.call(Control::Seek(seg.end_ms)),
+            {skip_label(seg.kind)}
+        }
+    }
+}
+
+/// "12:03 / 45:00" and "Ends at 10:42 PM": the labels that move with the
+/// position.
+#[component]
+fn TimeLabels(segments: Vec<Segment>, pos: Position, total: u64) -> Element {
+    use_ends_at_refresh();
+    let at = pos.now();
+    let ends = ends_at(left_to_watch(&segments, at, total));
+    rsx! {
+        span { class: "pharos-time", "{clock(at)} / {clock(total)}" }
+        if let Some(ends) = &ends {
+            span { class: "pharos-time pharos-ends-at", "{ends}" }
         }
     }
 }
@@ -690,7 +779,8 @@ fn UpNext(card: UpNextCard, on_control: EventHandler<Control>) -> Element {
 #[component]
 fn SeekBar(controls: Controls, total: u64, on_control: EventHandler<Control>) -> Element {
     let c = &controls;
-    let played = percent(c.media.position_ms, total);
+    let at = Position::of(c).now();
+    let played = percent(at, total);
     let hover = c.hover_ms.map(|ms| {
         let chapter = c
             .chapters
@@ -710,8 +800,8 @@ fn SeekBar(controls: Controls, total: u64, on_control: EventHandler<Control>) ->
             aria_label: "Seek",
             aria_valuemin: 0,
             aria_valuemax: total / 1000,
-            aria_valuenow: c.media.position_ms / 1000,
-            aria_valuetext: clock(c.media.position_ms),
+            aria_valuenow: at / 1000,
+            aria_valuetext: clock(at),
             onmousemove: move |evt: MouseEvent| {
                 on_control.call(Control::Hover(Some(evt.element_coordinates().x)));
             },
@@ -735,7 +825,7 @@ fn SeekBar(controls: Controls, total: u64, on_control: EventHandler<Control>) ->
                         style: "left: {percent(ch.start_ms, total)}%",
                         title: "{ch.name}",
                         // A tick already played dims, so the ones ahead stand out.
-                        "data-passed": ch.start_ms <= c.media.position_ms,
+                        "data-passed": ch.start_ms <= at,
                     }
                 }
             }
@@ -870,7 +960,7 @@ fn TrackMode(in_group: bool, own_tracks: bool, on_change: EventHandler<bool>) ->
 /// them. The canvas box matches the picture's `object-fit: contain` box, so
 /// an anamorphic canvas stretches with the picture.
 #[component]
-fn ImageSubtitles(url: String, media: MediaState) -> Element {
+fn ImageSubtitles(url: String, media: MediaState, pos: Position) -> Element {
     let mut cues = use_signal(ImageCues::default);
     use_future(move || {
         let url = url.clone();
@@ -920,7 +1010,7 @@ fn ImageSubtitles(url: String, media: MediaState) -> Element {
             div {
                 class: "pharos-image-subs-canvas",
                 style: "width: min(100cqw, calc(100cqh * {aw} / {ah})); aspect-ratio: {aw} / {ah};",
-                for cue in cues_at(&cues, media.position_ms) {
+                for cue in cues_at(&cues, pos.now()) {
                     img {
                         key: "{cue.url}",
                         class: "pharos-image-sub",
@@ -1024,6 +1114,7 @@ pub struct Shortcuts {
     carry: Signal<f64>,
     /// Previous goes through `Control::Previous`, as the song's button does.
     song: bool,
+    pos: Position,
 }
 
 pub fn use_shortcuts(
@@ -1039,6 +1130,7 @@ pub fn use_shortcuts(
         on_control,
         carry: use_signal(|| 0.0),
         song: false,
+        pos: Position::at(media.position_ms),
     }
 }
 
@@ -1049,11 +1141,22 @@ impl Shortcuts {
         self
     }
 
+    /// Seek relative to the live position, not the one `media` held at the
+    /// last render.
+    pub fn following(mut self, pos: Position) -> Self {
+        self.pos = pos;
+        self
+    }
+
     pub fn wheel(mut self, evt: &WheelEvent) {
         evt.prevent_default();
         let (notches, rest) = wheel_notches(*self.carry.peek(), evt.delta());
         self.carry.set(rest);
-        if let Some(control) = wheel_control(notches, evt.modifiers().shift(), self.media) {
+        if let Some(control) = wheel_control(
+            notches,
+            evt.modifiers().shift(),
+            media_at(self.media, self.pos),
+        ) {
             self.on_control.call(control);
         }
     }
@@ -1175,6 +1278,68 @@ mod tests {
         );
         dom.rebuild_in_place();
         dioxus_ssr::render(&dom)
+    }
+
+    thread_local! {
+        static LIVE: std::cell::Cell<Option<Signal<u64>>> = const { std::cell::Cell::new(None) };
+    }
+
+    /// B815: a position tick re-renders the leaves that show it, not the
+    /// player's body.
+    #[test]
+    fn a_position_tick_does_not_rerun_the_watch_view_body() {
+        let mut dom = VirtualDom::new(|| {
+            let live = use_signal(|| 0u64);
+            LIVE.with(|l| l.set(Some(live)));
+            let mut c = controls();
+            (c.media, _) = split_position(c.media);
+            c.live_position = Some(live);
+            rsx! {
+                WatchView {
+                    title: "Pilot",
+                    controls: c,
+                    on_media: |_| {},
+                    on_control: |_| {},
+                }
+            }
+        });
+        dom.rebuild_in_place();
+        assert!(dioxus_ssr::render(&dom).contains("0:00 / 20:00"));
+        // Let the mount's own state changes settle first.
+        let _ = dom.render_immediate_to_vec();
+        let renders = BODY_RENDERS.with(std::cell::Cell::get);
+        dom.in_runtime(|| {
+            let mut live = LIVE.with(std::cell::Cell::get).expect("signal");
+            live.set(95_000);
+        });
+        let _ = dom.render_immediate_to_vec();
+        let html = dioxus_ssr::render(&dom);
+        assert!(html.contains("1:35 / 20:00"), "{html}");
+        assert_eq!(
+            BODY_RENDERS.with(std::cell::Cell::get),
+            renders,
+            "WatchView's body must not re-run on a position tick"
+        );
+    }
+
+    #[test]
+    fn splitting_the_position_leaves_the_rest_of_the_media_alone() {
+        let media = MediaState {
+            position_ms: 9_000,
+            duration_ms: 20_000,
+            paused: false,
+            ..MediaState::default()
+        };
+        let (rest, at) = split_position(media);
+        assert_eq!(at, 9_000);
+        assert_eq!(rest.position_ms, 0);
+        assert_eq!((rest.duration_ms, rest.paused), (20_000, false));
+        // Two ticks of one playback are the same to the player.
+        let (later, _) = split_position(MediaState {
+            position_ms: 9_250,
+            ..media
+        });
+        assert_eq!(rest, later);
     }
 
     fn controls() -> Controls {

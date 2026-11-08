@@ -68,8 +68,8 @@ use super::views::{
     StatusView, TitleView, PALETTE_INPUT,
 };
 use super::watch_view::{
-    text_track_id, total_ms, Control, Controls, Skip, UpNextCard, WatchView, OUTGOING_ID,
-    PLAYER_ID, SEEK_ID, VIDEO_ID,
+    split_position, text_track_id, total_ms, Control, Controls, Skip, UpNextCard, WatchView,
+    OUTGOING_ID, PLAYER_ID, SEEK_ID, VIDEO_ID,
 };
 use super::whats_new::{self, Close, Gate, GateInputs, Pick, Unseen, WhatsNewBadge, WhatsNewView};
 use crate::theme::editor::{Draft, EffectField};
@@ -3884,6 +3884,11 @@ fn Player(
     let mut failed = use_signal(|| None::<PlayFailure>);
     let saved_volume = use_hook(last_volume);
     let mut media = use_signal(|| MediaState::at_volume(saved_volume.map(|(v, m, _)| (v, m))));
+    // The position changes every tick and the rest of the state seldom. The
+    // player reads `media_rest` and hands `position` to the leaves that show
+    // it, so a tick does not rebuild the player (B815).
+    let mut position = use_signal(|| 0u64);
+    let media_rest = use_memo(move || split_position(media()).0);
     let mut hover_ms = use_signal(|| None::<u64>);
     // The subtitle on screen: the server's pick, then the viewer's.
     let mut subtitle = use_signal(|| p.subtitle);
@@ -4715,6 +4720,9 @@ fn Player(
             }
             let state = platform::media_state(VIDEO_ID);
             media.set(state);
+            if *position.peek() != state.position_ms {
+                position.set(state.position_ms);
+            }
             if let Some(next) = up_next_to.get() {
                 let total = total_ms(&state, p.detail.item.runtime_ms);
                 let from = up_next_at(&p.detail.segments, total);
@@ -5063,8 +5071,8 @@ fn Player(
     });
     let controls = Controls {
         media: MediaState {
-            loading: media().loading && failed().is_none(),
-            ..media()
+            loading: media_rest().loading && failed().is_none(),
+            ..media_rest()
         },
         runtime_ms: p.detail.item.runtime_ms,
         chapters: p.detail.chapters.clone(),
@@ -5083,6 +5091,7 @@ fn Player(
             }
             _ => None,
         },
+        live_position: Some(position),
     };
     let on_leave = {
         let session = session.clone();
@@ -5175,7 +5184,8 @@ fn Player(
                 view,
                 title: p.title.clone(),
                 image: p.image.clone(),
-                media: media(),
+                media: media_rest(),
+                live_position: Some(position),
                 runtime_ms: p.detail.item.runtime_ms,
                 pip: p.kind != ItemKind::Audio && platform::pip_supported(),
                 previous: near.previous,
@@ -5220,7 +5230,8 @@ fn Player(
                 year: p.detail.item.year,
                 genres: p.detail.genres.clone(),
                 runtime_ms: p.detail.item.runtime_ms,
-                media: media(),
+                media: media_rest(),
+                live_position: Some(position),
                 previous: near.previous,
                 next,
                 lyrics: aligned()
