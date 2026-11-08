@@ -1047,13 +1047,15 @@ fn has_season_episode_token(name: &str) -> bool {
 }
 
 /// The lines under a poster's name: an episode's series, then its numbers,
-/// each on its own line so a long series name cannot hide the numbers.
+/// each on its own line so a long series name cannot hide the numbers. A
+/// song names its artist, or its year when the file has no artist tag (V750).
 fn sub_lines(item: &Item) -> Vec<String> {
     match item.kind {
         ItemKind::Episode => [item.series_name.clone(), episode_label(item)]
             .into_iter()
             .flatten()
             .collect(),
+        ItemKind::Audio if item.artist.is_some() => item.artist.clone().into_iter().collect(),
         _ => item.year.map(|y| y.to_string()).into_iter().collect(),
     }
 }
@@ -2191,6 +2193,33 @@ mod tests {
         unrated.name = "Unrated".into();
         let html = render(move || rsx! { PosterTile { item: unrated.clone() } });
         assert!(!html.contains("pharos-ratings-tile"), "{html}");
+    }
+
+    /// B800 (V750): a song's card names its artist, falling back to the
+    /// year when the file has no artist tag; a film keeps its year.
+    #[test]
+    fn a_song_card_names_its_artist_or_else_its_year() {
+        let mut song = item(ItemKind::Audio);
+        song.name = "Teardrop".into();
+        song.artist = Some("Massive Attack".into());
+        let html = render(move || rsx! { PosterTile { item: song.clone() } });
+        assert!(
+            html.contains(r#"class="pharos-poster-sub" title="Massive Attack""#),
+            "{html}"
+        );
+        assert!(!html.contains(">2001<"), "{html}");
+
+        let untagged = item(ItemKind::Audio);
+        let html = render(move || rsx! { PosterTile { item: untagged.clone() } });
+        assert!(html.contains(r#"title="2001""#), "{html}");
+
+        let mut film = item(ItemKind::Movie);
+        film.artist = Some("Ignored".into());
+        let html = render(move || rsx! { PosterTile { item: film.clone() } });
+        assert!(
+            html.contains(r#"title="2001""#) && !html.contains("Ignored"),
+            "{html}"
+        );
     }
 
     fn library(id: u64, kind: LibraryKind, name: &str) -> Item {
