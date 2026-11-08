@@ -6014,8 +6014,14 @@ mod prewarm_edition_tests {
             .await
             .unwrap();
         let bin = dir.join("stub-ffmpeg");
-        // Above the cache's 64-byte floor for a truncated segment.
-        std::fs::write(&bin, format!("#!/bin/sh\nprintf '{}'\n", "s".repeat(128))).unwrap();
+        // The smallest box sequence the cache will publish for an fMP4
+        // rendition (ftyp, moov, moof, mdat), and above its 64-byte floor.
+        let boxes = format!(
+            "\\000\\000\\000\\014ftypiso6\\000\\000\\000\\020moov{s8}\\000\\000\\000\\020moof{s8}\\000\\000\\000\\150mdat{s96}",
+            s8 = "s".repeat(8),
+            s96 = "s".repeat(96),
+        );
+        std::fs::write(&bin, format!("#!/bin/sh\nprintf '{boxes}'\n")).unwrap();
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
         // A subdirectory: the cache wipes everything else in its root.
         let cache =
