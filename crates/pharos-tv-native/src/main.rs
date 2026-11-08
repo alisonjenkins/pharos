@@ -27,6 +27,17 @@ fn android_main(app: android_activity::AndroidApp) {
         log::info!("render scale {scale}");
         blitz_shell::set_render_scale(scale);
     }
+    // GPU-wait probe: `setprop debug.pharos.gpu_wait 1` restores the upstream
+    // wait after each frame, so one APK compares both.
+    #[cfg(feature = "vello-hybrid")]
+    {
+        let wait = android_properties::getprop("debug.pharos.gpu_wait")
+            .value()
+            .as_deref()
+            == Some("1");
+        log::info!("gpu wait {wait}");
+        anyrender_vello_hybrid::set_wait_for_gpu(wait);
+    }
     log::info!("pharos-tv-native start");
     main();
 }
@@ -60,4 +71,3 @@ fn main() {
 fn root() -> Element {
     rsx! { Spike { start: Screen::Home } }
 }
-
