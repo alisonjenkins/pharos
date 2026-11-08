@@ -1382,6 +1382,53 @@ addEventListener("keydown", (e) => {
   player.focus({ preventScroll: true });
   player.dispatchEvent(new KeyboardEvent("keydown", { key: " ", bubbles: true, cancelable: true }));
 }, true);
+// The remote in the video player: Up and Down move between the picture and
+// its controls (the remote has its own volume keys), and Left and Right move
+// between controls once one has the focus; on the picture itself Left and
+// Right still seek. Taken here, before the player's handler hears them.
+const controlsIn = (player) => [...player.querySelectorAll(
+  "button:not([disabled]), select:not([disabled]), a[href], input:not([disabled])"
+)].filter((el) => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; });
+const nearest = (from, els, key) => {
+  const f = from.getBoundingClientRect();
+  const fx = f.left + f.width / 2, fy = f.top + f.height / 2;
+  let best = null, score = Infinity;
+  for (const el of els) {
+    if (el === from) continue;
+    const r = el.getBoundingClientRect();
+    const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+    const sameRow = r.top < f.bottom - 0.5 && r.bottom > f.top + 0.5;
+    let s = null;
+    if (key === "ArrowDown" && r.top >= f.bottom - 0.5) s = (r.top - f.bottom) * 4 + Math.abs(cx - fx);
+    if (key === "ArrowUp" && r.bottom <= f.top + 0.5) s = (f.top - r.bottom) * 4 + Math.abs(cx - fx);
+    if (key === "ArrowRight" && sameRow && r.left >= f.right - 0.5) s = r.left - f.right + Math.abs(cy - fy);
+    if (key === "ArrowLeft" && sameRow && r.right <= f.left + 0.5) s = f.left - r.right + Math.abs(cy - fy);
+    if (s !== null && s < score) { score = s; best = el; }
+  }
+  return best;
+};
+addEventListener("keydown", (e) => {
+  if (!e.isTrusted || !e.key.startsWith("Arrow")) return;
+  const player = document.querySelector('#pharos-player');
+  const at = document.activeElement;
+  if (!player || !at || !player.contains(at)) return;
+  const vertical = e.key === "ArrowUp" || e.key === "ArrowDown";
+  const onPicture = at === player;
+  if (!vertical && (onPicture || (at.tagName === "INPUT" && at.type === "range"))) return;
+  e.preventDefault();
+  e.stopPropagation();
+  // Any key shows the controls; this one does nothing else.
+  player.dispatchEvent(new KeyboardEvent("keydown", { key: "Unidentified", bubbles: true }));
+  const els = controlsIn(player);
+  let to = null;
+  if (onPicture) {
+    to = player.querySelector(".pharos-control-row button") || els[0] || null;
+  } else {
+    to = nearest(at, els, e.key);
+    if (!to && e.key === "ArrowUp") to = player;
+  }
+  if (to) to.focus({ preventScroll: true });
+}, true);
 addEventListener("keydown", (e) => {
   const text = inText(e.target);
   const prevented = e.defaultPrevented;
