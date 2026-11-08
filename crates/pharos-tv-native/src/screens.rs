@@ -70,14 +70,17 @@ pub enum Screen {
 const GRID_COLUMNS: usize = 6;
 /// Poster rows a rail shows at once.
 const RAIL_VISIBLE: usize = 6;
-/// One grid row's height in CSS px (2:3 art of ~147 px, name, year, gap).
-const GRID_ROW_PX: usize = 290;
+/// One grid row's height in CSS px (254 px tile and a 16 px gap).
+const GRID_ROW_PX: usize = 270;
 /// One home rail's height in CSS px.
 const RAIL_ROW_PX: usize = 362;
 
 /// Blitz 0.2 has no spatial navigation and dioxus-native 0.7 cannot read an
 /// element's rect, so the spike moves a logical focus over the known layout
 /// and shows it with a class. Measures what a press costs to re-render.
+/// Rows move by negative margins, not transforms: blitz-paint 0.2 does not
+/// apply a parent's transform to its children ("TODO: Implement nested
+/// transforms" in render.rs).
 const SPIKE_CSS: &str = r#"
 .pharos-tv-focus .pharos-poster-art {
   outline: 4px solid var(--px-color-accent);
@@ -177,12 +180,12 @@ pub fn Spike(start: Screen) -> Element {
             button { class: "pharos-tv-keysink", autofocus: true }
             match screen() {
                 Screen::Home => rsx! {
-                    div { style: "transform: translateY(-{home_y}px)",
+                    div { style: "margin-top: -{home_y}px",
                         for (r, ((title, items), shift)) in rails.iter().zip(shifts.iter()).enumerate() {
                             section { class: "pharos-rail",
                                 h2 { class: "pharos-rail-title", "{title}" }
                                 ul { class: "pharos-rail-items",
-                                    style: "display: flex; gap: 1rem; transform: translateX(-{shift}px)",
+                                    style: "display: flex; gap: 1rem; margin-left: -{shift}px",
                                     for (c, it) in items.iter().cloned().enumerate() {
                                         li { key: "{it.id}",
                                             class: if r == frow && c == fcol { "pharos-tv-focus" },
@@ -196,7 +199,7 @@ pub fn Spike(start: Screen) -> Element {
                 },
                 Screen::Grid => rsx! {
                     ul { class: "pharos-grid",
-                        style: "transform: translateY(-{grid_y}px)",
+                        style: "margin-top: -{grid_y}px",
                         for (i, it) in grid.iter().cloned().enumerate() {
                             li { key: "{it.id}",
                                 class: if i == frow * GRID_COLUMNS + fcol { "pharos-tv-focus" },
