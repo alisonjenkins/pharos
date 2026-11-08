@@ -17,7 +17,7 @@ use super::listen::{Icon, ICON_FLOAT, ICON_PIP};
 use super::platform;
 use super::playback::{
     clock, cues_at, left_to_watch, percent, segment_at, share, skip_label, thumb_at, track_label,
-    ImageCues, MediaEvent, MediaState,
+    ImageCues, MediaEvent, MediaState, SubtitleSize,
 };
 use super::seen::SeenRow;
 use super::together::Member;
@@ -98,6 +98,8 @@ pub struct Controls {
     /// The quality control's state: the manual maximum, the auto cap and how
     /// the server plays the video.
     pub quality: QualityView,
+    /// The subtitle text size, as the Playback page keeps it.
+    pub subtitle_size: SubtitleSize,
 }
 
 /// Where playback is. Reading it with `now` in a component's body
@@ -296,6 +298,8 @@ pub enum Control {
     Fullscreen,
     /// Limit the video to this many bits per second (0 is Auto).
     Quality(u64),
+    /// Draw subtitles at this size (the Playback page's choice).
+    SubtitleSize(SubtitleSize),
     /// Forget the cap Auto lowered itself to.
     ResetAutoQuality,
     /// Hand the video to the browser's picture-in-picture window (spec 020).
@@ -679,6 +683,11 @@ pub fn WatchView(
                             pick: c.subtitle_pick,
                             offer_off: true,
                             on_pick: move |p| on_control.call(Control::Subtitle(p)),
+                        }
+                        SubtitleSizePicker {
+                            show: !c.subtitles.is_empty(),
+                            size: c.subtitle_size,
+                            on_pick: move |control| on_control.call(control),
                         }
                         QualityPicker {
                             quality: c.quality.clone(),
@@ -1081,6 +1090,35 @@ fn TrackPicker(
     }
 }
 
+/// The subtitle size menu, beside the Subtitles menu: the sizes the Playback
+/// page offers.
+#[component]
+fn SubtitleSizePicker(show: bool, size: SubtitleSize, on_pick: EventHandler<Control>) -> Element {
+    if !show {
+        return rsx! {};
+    }
+    rsx! {
+        select {
+            class: "pharos-track-picker pharos-subtitle-size-picker",
+            aria_label: "Subtitle size",
+            title: "Subtitle size",
+            onkeydown: menu_key,
+            onchange: move |evt: FormEvent| {
+                on_pick.call(Control::SubtitleSize(SubtitleSize::parse(&evt.value())));
+                platform::focus_by_id(PLAYER_ID);
+            },
+            for each in SubtitleSize::ALL {
+                option {
+                    key: "{each.as_str()}",
+                    value: "{each.as_str()}",
+                    selected: each == size,
+                    "Size: {each.label()}"
+                }
+            }
+        }
+    }
+}
+
 /// The quality menu: Auto or a cap, shown as the state in force, with a
 /// reset while Auto has lowered itself.
 #[component]
@@ -1385,6 +1423,19 @@ mod tests {
         assert!(html.contains("Reset Auto (now 2 Mbps)"), "{html}");
         let plain = render(controls());
         assert!(!plain.contains("Reset Auto"), "{plain}");
+    }
+
+    #[test]
+    fn the_control_row_offers_the_subtitle_sizes_when_there_are_subtitles() {
+        let mut c = controls();
+        c.subtitle_size = SubtitleSize::Large;
+        let html = render(c.clone());
+        assert!(html.contains("pharos-subtitle-size-picker"), "{html}");
+        for size in SubtitleSize::ALL {
+            assert!(html.contains(&format!("Size: {}", size.label())), "{html}");
+        }
+        c.subtitles.clear();
+        assert!(!render(c).contains("pharos-subtitle-size-picker"));
     }
 
     #[test]
