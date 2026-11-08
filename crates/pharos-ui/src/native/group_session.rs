@@ -268,6 +268,12 @@ impl GroupState {
         if self.item != Some(item) {
             return None;
         }
+        self.group_ms(now_ms)
+    }
+
+    /// Where the group is now; before the first clock sample, where it
+    /// last said it was.
+    fn group_ms(&self, now_ms: i64) -> Option<u64> {
         self.expected(now_ms)
             .map(|(at, _)| at)
             .or_else(|| self.anchor.map(|a| a.position_ms))
@@ -585,6 +591,11 @@ struct Inner {
     /// The video waited within the grace of our own seek; it is reported as
     /// buffering only if it outlasts the grace.
     held_waiting: bool,
+    /// The player has data at its position: its last media event was a
+    /// `canplay`, `seeked` or `playing`, not a `waiting`. Kept out of a group
+    /// too, so a player that loaded while a join was in flight can still say
+    /// ready once the group's item arrives (B665).
+    media_ready: bool,
     /// Group commands not yet sent, each with the epoch of the membership it
     /// was made in; one task sends them one at a time, so the server sees
     /// them in the order the viewer caused them.
@@ -740,6 +751,7 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
         // reached, so none reaches the new group.
         let commands = std::mem::take(&mut inner.commands);
         let (draining, in_flight) = (inner.draining, inner.in_flight);
+        let media_ready = inner.media_ready;
         *inner = Inner {
             epoch,
             player,
@@ -747,6 +759,7 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
             commands,
             draining,
             in_flight,
+            media_ready,
             ..Inner::default()
         };
         inner.state.watching = watching.or(shown);
@@ -772,10 +785,25 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
         };
         self.publish();
         self.follow_group_tracks();
+        // The player may have loaded while the join was in flight; its
+        // events then found no group.
+        self.ready_if_loaded();
         if let Some(me) = self.me() {
             self.env.spawn(Box::pin(async move { me.run(epoch).await }));
         }
         Ok(summary)
+    }
+
+    /// A ready is owed and the player already has data, from an event this
+    /// session could not act on then: handle it as that `canplay` now.
+    fn ready_if_loaded(&self) {
+        let due = {
+            let inner = self.inner.borrow();
+            inner.active && inner.state.owes_ready && inner.media_ready
+        };
+        if due {
+            self.on_media(MediaEvent::CanPlay);
+        }
     }
 
     /// Leave the group. The player keeps what it is playing.
@@ -812,7 +840,11 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
     /// The watch page's `<video>`, or none when it goes. A player that
     /// arrives mid-playback catches up to the group.
     pub fn set_player(&self, player: Option<Rc<dyn GroupPlayer>>) {
-        self.inner.borrow_mut().player = player;
+        {
+            let mut inner = self.inner.borrow_mut();
+            inner.player = player;
+            inner.media_ready = false;
+        }
         self.catch_up();
         self.follow_group_tracks();
     }
@@ -1124,6 +1156,7 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
     }
 
     fn perform(&self, action: Action, epoch: u64) {
+        let is_seek = matches!(action, Action::Seek { .. });
         let (delay_ms, position_ms, then): (u64, u64, fn(&dyn GroupPlayer)) = match action {
             Action::Navigate(item) => {
                 self.env.ui(Ui::Navigate(item));
@@ -1164,6 +1197,10 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
             if player.position_ms().abs_diff(position_ms) > HOLD_BELOW_MS {
                 me.inner.borrow_mut().self_seek_ms = Some(me.env.now_ms());
                 player.seek_ms(position_ms);
+            } else if is_seek {
+                // Already there: no `seeked` will come to carry a ready the
+                // group's item asked for, so a loaded player says it now.
+                me.ready_if_loaded();
             }
             then(&*player);
         }));
@@ -1525,6 +1562,13 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
         let now = self.env.now_ms();
         let (playlist, position, playing, send_buffering, send_ready, line) = {
             let mut inner = self.inner.borrow_mut();
+            match event {
+                MediaEvent::Waiting => inner.media_ready = false,
+                MediaEvent::CanPlay | MediaEvent::Seeked | MediaEvent::Playing => {
+                    inner.media_ready = true;
+                }
+                _ => {}
+            }
             if !inner.active {
                 return;
             }
@@ -1593,8 +1637,7 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
                     // say ready when that seek lands (B664).
                     let away = inner
                         .state
-                        .expected(now)
-                        .map(|(at, _)| at)
+                        .group_ms(now)
                         .filter(|at| player.position_ms().abs_diff(*at) > SEEK_ABOVE_MS);
                     match away {
                         Some(at) if owes && !inner.ready_held => {
@@ -2416,6 +2459,46 @@ mod tests {
         assert_eq!(rig.session.start_for(ItemRef::Real(8)), None);
         rig.session.leave().now_or_never();
         assert_eq!(rig.session.start_for(ItemRef::Real(7)), None);
+    }
+
+    /// B665 in Firefox: after a reload the player loaded while the rejoin
+    /// was in flight, so its `canplay` reached a session not yet in the
+    /// group. The group's item then put it where it already was (no seek, so
+    /// no `seeked`), and nothing else came to carry the ready: the group
+    /// waited on this member for good. A loaded player says ready as soon
+    /// as the item it owes one for arrives.
+    #[test]
+    fn a_player_loaded_before_the_rejoin_says_ready_for_the_groups_item() {
+        let groups = FakeGroups::with_groups(vec![summary()]);
+        let env = TestEnv::default();
+        env.now.set(100_000);
+        let session = Session::new(groups.clone(), env.clone());
+        let player = Rc::new(TestPlayer::default());
+        player.position.set(400);
+        player.paused.set(true);
+        session.set_watching(Some(ItemRef::Real(7)));
+        session.set_player(Some(player.clone()));
+        session.on_media(MediaEvent::CanPlay);
+        assert!(matches!(session.join("g1").now_or_never(), Some(Ok(_))));
+        env.settle();
+        session.deliver(GroupUpdate::Item {
+            item: ItemRef::Real(7),
+            playlist_item_id: "pl-7".into(),
+            position_ms: 369,
+            playing: false,
+        });
+        env.settle();
+        let ready: Vec<String> = groups
+            .calls()
+            .into_iter()
+            .filter(|c| c.starts_with("ready"))
+            .collect();
+        assert_eq!(
+            ready,
+            ["ready(pl-7,400,false)"],
+            "{:?}",
+            player.log.borrow()
+        );
     }
 
     /// A server that answers slowly must not reorder what the viewer did:
