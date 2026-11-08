@@ -2042,6 +2042,32 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
             );
         }
     }
+    // Cap the on-disk HLS segment tree. The in-memory LRU starts empty at boot
+    // and never tracks `_contaudio/` or `_audiohls/` sessions, so a periodic
+    // leader-only sweep recounts the generation root and evicts the oldest
+    // pre-restart segments and finished audio sessions once disk usage exceeds
+    // the cap.
+    if cfg.server.transcode_cache_max_bytes > 0 {
+        if let Some(hls) = state.hls.clone() {
+            let is_leader = state.is_bg_leader.clone();
+            tokio::spawn(async move {
+                // Warm up, then sweep every 5 minutes.
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(300));
+                loop {
+                    tick.tick().await;
+                    if !is_leader.load(std::sync::atomic::Ordering::Relaxed) {
+                        continue;
+                    }
+                    hls.enforce_cap().await;
+                }
+            });
+            tracing::info!(
+                cap_bytes = cfg.server.transcode_cache_max_bytes,
+                "hls cache janitor enabled"
+            );
+        }
+    }
     if let Some(backend) = build_live_tv_backend(
         cfg.server.live_tv_m3u.clone(),
         cfg.server.live_tv_xmltv.clone(),

@@ -507,8 +507,10 @@ pub struct ServerConfig {
     /// spawns ffmpeg.
     #[serde(default)]
     pub transcode_cache_dir: Option<PathBuf>,
-    /// Soft cap on the HLS segment cache, in bytes. Once exceeded,
-    /// least-recently-used segments are evicted. Default 1 GiB.
+    /// Soft cap on the HLS segment cache, in bytes. Enforced both in-line
+    /// (LRU since boot) and by a periodic janitor that covers segments from
+    /// earlier boots and the audio sessions (`_contaudio/`, `_audiohls/`).
+    /// `0` disables the cap. Default 1 GiB.
     #[serde(default = "default_transcode_cache_bytes")]
     pub transcode_cache_max_bytes: u64,
     /// Directory used to cache Trickplay sprite sheets. When unset,
