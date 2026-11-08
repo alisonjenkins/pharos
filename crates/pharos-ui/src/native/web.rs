@@ -1249,7 +1249,7 @@ pub fn toggle_pip(id: &str) {
     }
 }
 
-fn seconds_to_ms(secs: f64) -> u64 {
+pub(super) fn seconds_to_ms(secs: f64) -> u64 {
     if secs.is_finite() && secs > 0.0 {
         // Saturating cast; a position past u64 milliseconds is not real.
         (secs * 1000.0) as u64
@@ -2692,7 +2692,7 @@ pub async fn engine(kind: Engine) -> Result<Box<dyn PlaybackEngine>, String> {
             load_script(HLSJS_SRC, "Hls").await?;
             Ok(Box::new(HlsJs::default()))
         }
-        Engine::RustHls => Err("the Pharos engine is not built yet".into()),
+        Engine::RustHls => Ok(Box::new(super::hls_web::RustHls::default())),
         Engine::Unsupported => Err("this browser cannot play HLS".into()),
     }
 }
@@ -2785,7 +2785,7 @@ impl Drop for NativeVideo {
 
 /// The vendored hls.js (ADR-0035), served from this origin so the CSP's
 /// `script-src 'self'` covers it.
-const HLSJS_SRC: &str = "/ui/assets/vendor/hls.min.js";
+pub(super) const HLSJS_SRC: &str = "/ui/assets/vendor/hls.min.js";
 
 #[wasm_bindgen::prelude::wasm_bindgen]
 extern "C" {
@@ -2810,7 +2810,7 @@ extern "C" {
 
 /// Add the `<script>` at `src` once and wait for it; `global` is the name
 /// it defines, which shows it already ran.
-async fn load_script(src: &str, global: &str) -> Result<(), String> {
+pub(super) async fn load_script(src: &str, global: &str) -> Result<(), String> {
     let window = web_sys::window().ok_or("no window")?;
     if js_sys::Reflect::has(&window, &JsValue::from_str(global)).unwrap_or(false) {
         return Ok(());
@@ -2987,7 +2987,7 @@ pub async fn styled_subtitles(
 }
 
 /// A thrown value's `message`, or its debug form.
-fn js_message(e: &JsValue) -> String {
+pub(super) fn js_message(e: &JsValue) -> String {
     js_sys::Reflect::get(e, &JsValue::from_str("message"))
         .ok()
         .and_then(|m| m.as_string())
@@ -2996,7 +2996,7 @@ fn js_message(e: &JsValue) -> String {
 
 /// Plays an HLS playlist through hls.js and Media Source Extensions.
 #[derive(Default)]
-struct HlsJs {
+pub(super) struct HlsJs {
     player: Option<HlsPlayer>,
     _listeners: Vec<Closure<dyn FnMut(JsValue, JsValue)>>,
 }
