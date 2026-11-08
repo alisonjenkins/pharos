@@ -225,6 +225,13 @@ pub struct AppState {
     pub trickplay_priority: Option<crate::trickplay_backfill::PriorityTx>,
     pub live_tv: Option<M3uXmltvBackend>,
     pub server_id: String,
+    /// ADR-0073 — signs the `ImageTag`s handed out in listings so an
+    /// anonymous image request must carry one this server minted.
+    pub image_tag_key: pharos_jellyfin_api::image_tag_sig::ImageTagKey,
+    /// ADR-0073 — refuse an anonymous image request whose tag does not
+    /// verify. Off by default: the verdict is counted either way, and the
+    /// operator turns this on once the counts show clients send good tags.
+    pub image_tags_enforced: bool,
     pub server_name: String,
     pub version: &'static str,
     /// Configured media roots — same list the CLI `pharos scan`
@@ -757,6 +764,8 @@ impl AppState {
             storage_folders: StorageFolders::default(),
             quick_connect: crate::quick_connect::QuickConnectRegistry::spawn(),
             server_id: Uuid::new_v4().simple().to_string(),
+            image_tag_key: fresh_image_tag_key(),
+            image_tags_enforced: false,
             server_name,
             version: env!("CARGO_PKG_VERSION"),
             bus,
@@ -849,6 +858,7 @@ impl AppState {
         server_name: String,
     ) -> Result<Self, pharos_store_sqlx::StoreError> {
         let server_id = stores.load_or_create_server_id().await?;
+        let image_tag_key = load_image_tag_key(&stores).await?;
         let auth = BuiltinAuth::new(stores.clone());
         let sessions = SessionRegistry::spawn();
         let transcode_sessions = TranscodeSessionRegistry::spawn(stores.clone());
@@ -880,6 +890,8 @@ impl AppState {
             storage_folders: StorageFolders::default(),
             quick_connect: crate::quick_connect::QuickConnectRegistry::spawn(),
             server_id,
+            image_tag_key,
+            image_tags_enforced: false,
             server_name,
             version: env!("CARGO_PKG_VERSION"),
             bus,
@@ -1450,6 +1462,41 @@ pub fn sockets_draining() -> bool {
 /// promptly (the client reconnects to the already-Ready new pod).
 pub fn shutdown_signal() -> &'static tokio::sync::Notify {
     &SHUTDOWN_NOTIFY
+}
+
+/// Name of the persisted image-tag key in `server_secrets` (ADR-0073).
+const IMAGE_TAG_KEY_SECRET: &str = "image_tag_key";
+
+/// 32 bytes from the OS RNG. On the (never observed) failure of the RNG the
+/// key is derived from a v4 UUID pair, which is itself OS-random.
+fn fresh_image_tag_key() -> pharos_jellyfin_api::image_tag_sig::ImageTagKey {
+    let mut bytes = [0u8; pharos_jellyfin_api::image_tag_sig::ImageTagKey::LEN];
+    if getrandom::fill(&mut bytes).is_err() {
+        bytes[..16].copy_from_slice(Uuid::new_v4().as_bytes());
+        bytes[16..].copy_from_slice(Uuid::new_v4().as_bytes());
+    }
+    pharos_jellyfin_api::image_tag_sig::ImageTagKey::from_array(bytes)
+}
+
+/// Read the persisted image-tag key, creating it on first boot. A stored
+/// value of the wrong length is a corrupt row: refuse to start rather than
+/// silently rotate the key, which would invalidate every cached tag.
+async fn load_image_tag_key(
+    stores: &Stores,
+) -> Result<pharos_jellyfin_api::image_tag_sig::ImageTagKey, pharos_store_sqlx::StoreError> {
+    use pharos_jellyfin_api::image_tag_sig::ImageTagKey;
+    let fresh = fresh_image_tag_key();
+    let fresh_bytes = fresh.to_bytes();
+    let stored = stores
+        .load_or_create_secret(IMAGE_TAG_KEY_SECRET, &fresh_bytes)
+        .await?;
+    ImageTagKey::from_bytes(&stored).ok_or_else(|| {
+        pharos_store_sqlx::StoreError::Parse(format!(
+            "server_secrets.{IMAGE_TAG_KEY_SECRET} holds {} bytes, want {}",
+            stored.len(),
+            ImageTagKey::LEN
+        ))
+    })
 }
 
 #[cfg(test)]
