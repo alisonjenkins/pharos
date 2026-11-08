@@ -215,6 +215,229 @@ pub fn to_ms(decode_time: u64, timescale: u32) -> u64 {
     u64::try_from(ms).unwrap_or(u64::MAX)
 }
 
+/// What a track carries, from its `hdlr` and sample entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrackKind {
+    Video {
+        width: u16,
+        height: u16,
+    },
+    Audio {
+        channels: u16,
+        sample_rate: u32,
+    },
+    /// Any other handler (subtitles, metadata), by its `hdlr` type.
+    Other([u8; 4]),
+}
+
+/// A sample entry's decoder configuration, as the codec's own box carries it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CodecConfig {
+    /// `avcC` payload (AVCDecoderConfigurationRecord).
+    Avc(Vec<u8>),
+    /// `hvcC` payload (HEVCDecoderConfigurationRecord).
+    Hevc(Vec<u8>),
+    /// `vpcC` payload.
+    Vp9(Vec<u8>),
+    /// `av1C` payload.
+    Av1(Vec<u8>),
+    /// The AudioSpecificConfig from `esds`, and its MPEG-4 object type.
+    Aac { object_type: u8, asc: Vec<u8> },
+    /// `dOps` payload.
+    Opus(Vec<u8>),
+    /// `dac3` payload.
+    Ac3(Vec<u8>),
+    /// `dec3` payload.
+    Eac3(Vec<u8>),
+}
+
+/// One track's first sample entry from an init segment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SampleEntry {
+    pub track_id: u32,
+    pub timescale: u32,
+    /// The sample entry's four-character code, such as `avc1`, `hvc1` or `mp4a`.
+    pub format: [u8; 4],
+    pub kind: TrackKind,
+    /// `None` for an entry with no codec box this reader knows, such as an
+    /// encrypted `encv`.
+    pub config: Option<CodecConfig>,
+}
+
+/// ISO/IEC 14496-12 VisualSampleEntry fields before its child boxes.
+const VISUAL_ENTRY_LEN: usize = 78;
+/// ISO/IEC 14496-12 AudioSampleEntry (version 0) fields before its child boxes.
+const AUDIO_ENTRY_LEN: usize = 28;
+
+/// Each track's first sample entry from an init segment's
+/// `moov/trak/mdia/(mdhd, hdlr, minf/stbl/stsd)`.
+pub fn sample_entries(init: &[u8]) -> Result<Vec<SampleEntry>, Fmp4Error> {
+    let mut saw_moov = false;
+    let mut out = Vec::new();
+    let mut iter = BoxIter::new(init, 0);
+    while let Some(bx) = iter.next_box()? {
+        if &bx.fourcc != b"moov" {
+            continue;
+        }
+        saw_moov = true;
+        let mut moov_iter = BoxIter::new(bx.payload, bx.payload_offset);
+        while let Some(trak) = moov_iter.next_box()? {
+            if &trak.fourcc == b"trak" {
+                out.push(trak_entry(&trak)?);
+            }
+        }
+    }
+    if !saw_moov {
+        return Err(Fmp4Error::Missing("moov"));
+    }
+    if out.is_empty() {
+        return Err(Fmp4Error::Missing("trak"));
+    }
+    Ok(out)
+}
+
+fn child<'a>(parent: &ParsedBox<'a>, fourcc: &[u8; 4]) -> Result<Option<ParsedBox<'a>>, Fmp4Error> {
+    let mut iter = BoxIter::new(parent.payload, parent.payload_offset);
+    while let Some(bx) = iter.next_box()? {
+        if &bx.fourcc == fourcc {
+            return Ok(Some(bx));
+        }
+    }
+    Ok(None)
+}
+
+fn require<'a>(
+    parent: &ParsedBox<'a>,
+    fourcc: &'static [u8; 4],
+    name: &'static str,
+) -> Result<ParsedBox<'a>, Fmp4Error> {
+    child(parent, fourcc)?.ok_or(Fmp4Error::Missing(name))
+}
+
+fn trak_entry(trak: &ParsedBox<'_>) -> Result<SampleEntry, Fmp4Error> {
+    let tkhd = require(trak, b"tkhd", "tkhd")?;
+    let track_id = parse_tkhd_or_mdhd(tkhd.payload, tkhd.at, "tkhd")?;
+    let mdia = require(trak, b"mdia", "mdia")?;
+    let mdhd = require(&mdia, b"mdhd", "mdhd")?;
+    let timescale = parse_tkhd_or_mdhd(mdhd.payload, mdhd.at, "mdhd")?;
+    let hdlr = require(&mdia, b"hdlr", "hdlr")?;
+    let handler = read_fourcc(hdlr.payload, 8, hdlr.at)?;
+    let minf = require(&mdia, b"minf", "minf")?;
+    let stbl = require(&minf, b"stbl", "stbl")?;
+    let stsd = require(&stbl, b"stsd", "stsd")?;
+    // version, flags and entry_count come before the entries.
+    let entries = stsd
+        .payload
+        .get(8..)
+        .ok_or(Fmp4Error::Truncated { at: stsd.at })?;
+    let entry = BoxIter::new(entries, stsd.payload_offset.saturating_add(8))
+        .next_box()?
+        .ok_or(Fmp4Error::Missing("sample entry"))?;
+
+    let (kind, children_at) = match &handler {
+        b"vide" => (
+            TrackKind::Video {
+                width: read_u16_be(entry.payload, 24, entry.at)?,
+                height: read_u16_be(entry.payload, 26, entry.at)?,
+            },
+            VISUAL_ENTRY_LEN,
+        ),
+        b"soun" => (
+            TrackKind::Audio {
+                channels: read_u16_be(entry.payload, 16, entry.at)?,
+                // 16.16 fixed point; the integer half is the rate in Hz.
+                sample_rate: read_u32_be(entry.payload, 24, entry.at)? >> 16,
+            },
+            AUDIO_ENTRY_LEN,
+        ),
+        other => (TrackKind::Other(*other), entry.payload.len()),
+    };
+    let mut config = None;
+    if let Some(children) = entry.payload.get(children_at..) {
+        let mut iter = BoxIter::new(children, entry.payload_offset.saturating_add(children_at));
+        while let Some(bx) = iter.next_box()? {
+            let data = bx.payload.to_vec();
+            config = match &bx.fourcc {
+                b"avcC" => Some(CodecConfig::Avc(data)),
+                b"hvcC" => Some(CodecConfig::Hevc(data)),
+                b"vpcC" => Some(CodecConfig::Vp9(data)),
+                b"av1C" => Some(CodecConfig::Av1(data)),
+                b"dOps" => Some(CodecConfig::Opus(data)),
+                b"dac3" => Some(CodecConfig::Ac3(data)),
+                b"dec3" => Some(CodecConfig::Eac3(data)),
+                b"esds" => Some(parse_esds(bx.payload, bx.at)?),
+                _ => continue,
+            };
+            break;
+        }
+    }
+    Ok(SampleEntry {
+        track_id,
+        timescale,
+        format: entry.fourcc,
+        kind,
+        config,
+    })
+}
+
+/// The AudioSpecificConfig inside an `esds` box's ES_Descriptor (ISO/IEC 14496-1).
+fn parse_esds(payload: &[u8], at: usize) -> Result<CodecConfig, Fmp4Error> {
+    let es = payload.get(4..).ok_or(Fmp4Error::Truncated { at })?;
+    let es = descriptor(es, 0x03, at)?;
+    let flags = *es.get(2).ok_or(Fmp4Error::Truncated { at })?;
+    let mut pos = 3usize;
+    if flags & 0x80 != 0 {
+        pos = pos.saturating_add(2);
+    }
+    if flags & 0x40 != 0 {
+        let url_len = *es.get(pos).ok_or(Fmp4Error::Truncated { at })?;
+        pos = pos.saturating_add(1).saturating_add(usize::from(url_len));
+    }
+    if flags & 0x20 != 0 {
+        pos = pos.saturating_add(2);
+    }
+    let dcd = descriptor(es.get(pos..).ok_or(Fmp4Error::Truncated { at })?, 0x04, at)?;
+    let object_type = *dcd.first().ok_or(Fmp4Error::Truncated { at })?;
+    // objectTypeIndication, streamType, bufferSizeDB (3), maxBitrate, avgBitrate.
+    let dsi = descriptor(dcd.get(13..).ok_or(Fmp4Error::Truncated { at })?, 0x05, at)?;
+    Ok(CodecConfig::Aac {
+        object_type,
+        asc: dsi.to_vec(),
+    })
+}
+
+/// The body of an MPEG-4 descriptor with tag `tag` at the start of `buf`; its
+/// size is up to four 7-bit groups.
+fn descriptor(buf: &[u8], tag: u8, at: usize) -> Result<&[u8], Fmp4Error> {
+    if buf.first() != Some(&tag) {
+        return Err(Fmp4Error::Missing(match tag {
+            0x03 => "ES_Descriptor",
+            0x04 => "DecoderConfigDescriptor",
+            _ => "DecoderSpecificInfo",
+        }));
+    }
+    let mut len = 0usize;
+    let mut pos = 1usize;
+    for _ in 0..4 {
+        let b = *buf.get(pos).ok_or(Fmp4Error::Truncated { at })?;
+        pos = pos.saturating_add(1);
+        len = (len << 7) | usize::from(b & 0x7f);
+        if b & 0x80 == 0 {
+            break;
+        }
+    }
+    buf.get(pos..pos.saturating_add(len))
+        .ok_or(Fmp4Error::Truncated { at })
+}
+
+fn read_u16_be(slice: &[u8], offset: usize, err_at: usize) -> Result<u16, Fmp4Error> {
+    let bytes: [u8; 2] = slice
+        .get(offset..offset.saturating_add(2))
+        .and_then(|s| s.try_into().ok())
+        .ok_or(Fmp4Error::Truncated { at: err_at })?;
+    Ok(u16::from_be_bytes(bytes))
+}
+
 /// A 10 s segment at 120 fps is 1200 video samples, and 48 kHz AAC about 470;
 /// a count far past that is a corrupt or hostile `trun`, not a real fragment.
 const MAX_TRUN_SAMPLES: u32 = 65_536;
@@ -648,7 +871,8 @@ mod tests {
     use proptest::prelude::*;
 
     use super::{
-        decode_times, samples, timescales, to_ms, track_defaults, Fmp4Error, TrackDefaults,
+        decode_times, sample_entries, samples, timescales, to_ms, track_defaults, CodecConfig,
+        Fmp4Error, TrackDefaults, TrackKind,
     };
 
     fn bx(fourcc: &[u8; 4], payload: &[u8]) -> Vec<u8> {
@@ -855,6 +1079,7 @@ mod tests {
             let _ = decode_times(&bytes);
             let _ = track_defaults(&bytes);
             let _ = samples(&bytes, &[]);
+            let _ = sample_entries(&bytes);
         }
     }
 
@@ -1111,5 +1336,81 @@ mod tests {
         }
         // Each sample's bytes lie inside the segment's mdat.
         assert!(got.iter().all(|s| s.data(seg).is_some()));
+    }
+
+    /// The codec boxes of ffmpeg's H.264 + AAC and HEVC + Opus init segments,
+    /// checked against the extradata `ffprobe -show_data` prints for each stream.
+    #[test]
+    fn reads_codec_config_from_ffmpeg_init_segments() {
+        let init = include_bytes!("../testdata/init.mp4");
+        let entries = sample_entries(init).unwrap();
+        let scales = timescales(init).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(
+            entries
+                .iter()
+                .map(|e| (e.track_id, e.timescale))
+                .collect::<Vec<_>>(),
+            scales
+        );
+        assert_eq!(&entries[0].format, b"avc1");
+        assert_eq!(
+            entries[0].kind,
+            TrackKind::Video {
+                width: 64,
+                height: 36
+            }
+        );
+        let Some(CodecConfig::Avc(avcc)) = &entries[0].config else {
+            panic!("{:?}", entries[0].config);
+        };
+        assert_eq!(
+            (avcc.len(), &avcc[..4]),
+            (44, &[0x01, 0x64, 0x00, 0x0a][..])
+        );
+        assert_eq!(&entries[1].format, b"mp4a");
+        assert_eq!(
+            entries[1].kind,
+            TrackKind::Audio {
+                channels: 1,
+                sample_rate: 48_000
+            }
+        );
+        assert_eq!(
+            entries[1].config,
+            Some(CodecConfig::Aac {
+                object_type: 0x40,
+                asc: vec![0x11, 0x88, 0x56, 0xe5, 0x00]
+            })
+        );
+
+        let entries = sample_entries(include_bytes!("../testdata/init-hevc-opus.mp4")).unwrap();
+        assert_eq!(&entries[0].format, b"hvc1");
+        assert_eq!(
+            entries[0].kind,
+            TrackKind::Video {
+                width: 64,
+                height: 36
+            }
+        );
+        let Some(CodecConfig::Hevc(hvcc)) = &entries[0].config else {
+            panic!("{:?}", entries[0].config);
+        };
+        assert_eq!((hvcc.len(), &hvcc[..3]), (2_461, &[0x01, 0x02, 0x20][..]));
+        assert_eq!(&entries[1].format, b"Opus");
+        assert_eq!(
+            entries[1].kind,
+            TrackKind::Audio {
+                channels: 2,
+                sample_rate: 48_000
+            }
+        );
+        // dOps: version 0, 2 channels, pre-skip 312, 48 kHz, gain 0, family 0.
+        assert_eq!(
+            entries[1].config,
+            Some(CodecConfig::Opus(vec![
+                0, 2, 0x01, 0x38, 0, 0, 0xbb, 0x80, 0, 0, 0
+            ]))
+        );
     }
 }
