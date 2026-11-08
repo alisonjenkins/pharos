@@ -8,6 +8,9 @@
 //! clears to transparent. The layer under it, one colour in a 16:9 rect:
 //!
 //! - `1`: a SurfaceView added by the Kotlin side (`android/`).
+//! - `3`: a child `android.view.SurfaceControl` at layer -1, made over JNI
+//!   with the window's own SurfaceControl as parent (no Java written; the
+//!   parent comes from the hidden `ViewRootImpl.getSurfaceControl`).
 //! - `2`: a child `ASurfaceControl` at z -1. Android 12 refuses it on this
 //!   window (a BLAST layer); kept to show that. ASurfaceControl is API 29
 //!   (setCrop API 31) and dx links against API 24, so its calls are looked
@@ -28,7 +31,7 @@ const VIDEO_HOLE_CLASS: &str = "com.alisonjenkins.pharos.tvnative.video.VideoHol
 fn mode() -> Option<String> {
     android_properties::getprop("debug.pharos.hole")
         .value()
-        .filter(|v| v == "1" || v == "2")
+        .filter(|v| matches!(v.as_str(), "1" | "2" | "3"))
 }
 
 pub fn enabled() -> bool {
@@ -127,15 +130,193 @@ pub fn start(app: &AndroidApp) {
             return;
         }
     }
-    if mode().as_deref() == Some("1") {
-        match surface_view(app) {
+    match mode().as_deref() {
+        Some("1") => match surface_view(app) {
             Ok(()) => log::info!("hole: SurfaceView requested"),
             Err(e) => log::warn!("hole: SurfaceView: {e}"),
+        },
+        Some("3") => {
+            let app = app.clone();
+            let spawned = std::thread::Builder::new()
+                .name("pharos-hole".into())
+                .spawn(move || java_surface_control(&app));
+            if let Err(e) = spawned {
+                log::warn!("hole: thread: {e}");
+            }
         }
-    } else {
-        surface_control(app);
+        _ => surface_control(app),
     }
 }
+
+/// Mode 3: retries until the window's ViewRootImpl has a valid SurfaceControl.
+fn java_surface_control(app: &AndroidApp) {
+    // SAFETY: as in `translucent_window`.
+    let vm = match unsafe { jni::JavaVM::from_raw(app.vm_as_ptr().cast()) } {
+        Ok(vm) => vm,
+        Err(e) => return log::warn!("hole: vm: {e}"),
+    };
+    let mut env = match vm.attach_current_thread() {
+        Ok(env) => env,
+        Err(e) => return log::warn!("hole: attach: {e}"),
+    };
+    let activity = unsafe { jni::objects::JObject::from_raw(app.activity_as_ptr().cast()) };
+    let started = std::time::Instant::now();
+    let mut attempts = 0u32;
+    loop {
+        attempts += 1;
+        match child_layer(&mut env, &activity) {
+            Ok(true) => {
+                log::info!(
+                    "hole: java SurfaceControl child after {attempts} tries, {} ms",
+                    started.elapsed().as_millis()
+                );
+                return;
+            }
+            Ok(false) => {}
+            Err(e) => {
+                if env.exception_check().unwrap_or(false) {
+                    let _ = env.exception_describe();
+                    let _ = env.exception_clear();
+                }
+                return log::warn!("hole: java SurfaceControl: {e}");
+            }
+        }
+        if started.elapsed() > WINDOW_WAIT {
+            return log::warn!("hole: no valid window SurfaceControl after {attempts} tries");
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// `Ok(false)` while the window has no valid SurfaceControl yet.
+fn child_layer(
+    env: &mut jni::JNIEnv<'_>,
+    activity: &jni::objects::JObject<'_>,
+) -> jni::errors::Result<bool> {
+    use jni::objects::{JObject, JValue};
+    let window = env
+        .call_method(activity, "getWindow", "()Landroid/view/Window;", &[])?
+        .l()?;
+    let decor = env
+        .call_method(&window, "getDecorView", "()Landroid/view/View;", &[])?
+        .l()?;
+    let root = env
+        .call_method(
+            &decor,
+            "getViewRootImpl",
+            "()Landroid/view/ViewRootImpl;",
+            &[],
+        )?
+        .l()?;
+    if root.is_null() {
+        return Ok(false);
+    }
+    let parent = env
+        .call_method(
+            &root,
+            "getSurfaceControl",
+            "()Landroid/view/SurfaceControl;",
+            &[],
+        )?
+        .l()?;
+    if parent.is_null() || !env.call_method(&parent, "isValid", "()Z", &[])?.z()? {
+        return Ok(false);
+    }
+    let width = VIDEO_RECT.right - VIDEO_RECT.left;
+    let height = VIDEO_RECT.bottom - VIDEO_RECT.top;
+    let builder = env.new_object("android/view/SurfaceControl$Builder", "()V", &[])?;
+    let name = env.new_string("pharos-video-hole")?;
+    const B: &str = "Landroid/view/SurfaceControl$Builder;";
+    env.call_method(
+        &builder,
+        "setName",
+        format!("(Ljava/lang/String;){B}"),
+        &[JValue::Object(&name)],
+    )?;
+    env.call_method(
+        &builder,
+        "setBufferSize",
+        format!("(II){B}"),
+        &[JValue::Int(width), JValue::Int(height)],
+    )?;
+    env.call_method(
+        &builder,
+        "setParent",
+        format!("(Landroid/view/SurfaceControl;){B}"),
+        &[JValue::Object(&parent)],
+    )?;
+    let child = env
+        .call_method(&builder, "build", "()Landroid/view/SurfaceControl;", &[])?
+        .l()?;
+
+    let dst = env.new_object(
+        "android/graphics/Rect",
+        "(IIII)V",
+        &[
+            JValue::Int(VIDEO_RECT.left),
+            JValue::Int(VIDEO_RECT.top),
+            JValue::Int(VIDEO_RECT.right),
+            JValue::Int(VIDEO_RECT.bottom),
+        ],
+    )?;
+    let txn = env.new_object("android/view/SurfaceControl$Transaction", "()V", &[])?;
+    const T: &str = "Landroid/view/SurfaceControl$Transaction;";
+    const SC: &str = "Landroid/view/SurfaceControl;";
+    env.call_method(
+        &txn,
+        "setLayer",
+        format!("({SC}I){T}"),
+        &[JValue::Object(&child), JValue::Int(Z_BELOW_UI)],
+    )?;
+    env.call_method(
+        &txn,
+        "setGeometry",
+        format!("({SC}Landroid/graphics/Rect;Landroid/graphics/Rect;I){T}"),
+        &[
+            JValue::Object(&child),
+            JValue::Object(&JObject::null()),
+            JValue::Object(&dst),
+            JValue::Int(0),
+        ],
+    )?;
+    env.call_method(
+        &txn,
+        "setVisibility",
+        format!("({SC}Z){T}"),
+        &[JValue::Object(&child), JValue::Bool(1)],
+    )?;
+    env.call_method(&txn, "apply", "()V", &[])?;
+
+    // What a decoder would render into: MediaCodec takes this Surface.
+    let surface = env.new_object(
+        "android/view/Surface",
+        format!("({SC})V"),
+        &[JValue::Object(&child)],
+    )?;
+    let canvas = env
+        .call_method(
+            &surface,
+            "lockCanvas",
+            "(Landroid/graphics/Rect;)Landroid/graphics/Canvas;",
+            &[JValue::Object(&JObject::null())],
+        )?
+        .l()?;
+    env.call_method(&canvas, "drawColor", "(I)V", &[JValue::Int(GREEN)])?;
+    env.call_method(
+        &surface,
+        "unlockCanvasAndPost",
+        "(Landroid/graphics/Canvas;)V",
+        &[JValue::Object(&canvas)],
+    )?;
+    // The layer is released when its SurfaceControl is collected; the probe
+    // keeps both for the life of the process.
+    std::mem::forget(env.new_global_ref(&child)?);
+    std::mem::forget(env.new_global_ref(&surface)?);
+    Ok(true)
+}
+
+/// ARGB green, so a screencap tells mode 3 from mode 1's red.
+const GREEN: i32 = 0xFF19_C819_u32 as i32;
 
 /// `new VideoHole(activity).show(..)`. The class is loaded through the
 /// activity's class loader: `FindClass` on this native thread would search
