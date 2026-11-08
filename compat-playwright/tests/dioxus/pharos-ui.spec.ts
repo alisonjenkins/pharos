@@ -1860,6 +1860,111 @@ test.describe("pharos Dioxus UI", () => {
       expect(hlsjs).toEqual([]);
     });
 
+    // B733: after the back buffer is trimmed, a seek to just before where the
+    // remaining data starts lands in a segment that is only partly buffered.
+    // The Rust engine must fetch it again, not wait on data it never asks for.
+    test("the Rust engine plays on after a seek back to the back buffer's edge", async ({
+      page,
+      request,
+    }) => {
+      test.setTimeout(180_000);
+      const probe = await request.get(`${PHAROS_URL}/pharos/session`, {
+        headers: { Accept: "application/json" },
+      });
+      test.skip(
+        probe.status() !== 405,
+        `native API is not enabled (status ${probe.status()})`,
+      );
+      const auth = await request.post(
+        `${PHAROS_URL}/Users/AuthenticateByName`,
+        {
+          headers: {
+            "Content-Type": "application/json",
+            "X-Emby-Authorization": `MediaBrowser Client="playwright", Device="pw", DeviceId="pw-seekback-${Date.now()}", Version="0"`,
+          },
+          data: { Username: TEST_USER, Pw: TEST_PASS },
+        },
+      );
+      test.skip(!auth.ok(), `pharos has no seeded test user (${TEST_USER})`);
+      const { AccessToken: token, User: user } = await auth.json();
+      const api = { "X-Emby-Token": token };
+      const fixture = async () =>
+        (
+          await (
+            await request.get(
+              `${PHAROS_URL}/Users/${user.Id}/Items?Recursive=true&IncludeItemTypes=Movie&Fields=Path,MediaSources`,
+              { headers: api },
+            )
+          ).json()
+        ).Items?.find((i: { Path?: string }) =>
+          i.Path?.endsWith("/fixture-1.webm"),
+        );
+      await expect
+        .poll(async () => (await fixture())?.MediaSources?.[0]?.Container, {
+          timeout: 30_000,
+        })
+        .toMatch(/webm/);
+      const movie = await fixture();
+      test.skip(!movie, "pharos has no seeded movie");
+      const nativeId = BigInt(`0x${movie.Id}`).toString();
+      // An earlier test's seek leaves a resume point; start from the top.
+      await request.post(`${PHAROS_URL}/Sessions/Playing/Progress`, {
+        headers: api,
+        data: {
+          ItemId: movie.Id,
+          PlaySessionId: `pw-reset-${Date.now()}`,
+          PositionTicks: 0,
+          IsPaused: true,
+        },
+      });
+
+      await page.addInitScript(() => {
+        const canPlayType = HTMLMediaElement.prototype.canPlayType;
+        HTMLMediaElement.prototype.canPlayType = function (type: string) {
+          return /mpegurl|webm|matroska/i.test(type)
+            ? ""
+            : canPlayType.call(this, type);
+        };
+      });
+      const logs: string[] = [];
+      page.on("console", (m) => logs.push(m.text()));
+      await page.goto("/ui/");
+      await page.locator("#signin-name").fill(TEST_USER);
+      await page.locator("#signin-password").fill(TEST_PASS);
+      await page.getByRole("button", { name: "Sign in" }).click();
+      await expect(page.locator(".pharos-shell-bar")).toBeVisible({
+        timeout: 15_000,
+      });
+
+      await page.goto(`/ui/watch/${nativeId}?engine=rust`);
+      const now = () =>
+        page.evaluate(
+          () =>
+            (document.getElementById("pharos-video") as HTMLVideoElement | null)
+              ?.currentTime ?? 0,
+        );
+      // At 34 s the 15 s back buffer's cutoff (19 s) sits in the first half of
+      // the 18-24 s segment, so the audio track keeps that segment's second half.
+      await expect
+        .poll(now, { timeout: 90_000, intervals: [50] })
+        .toBeGreaterThan(34);
+      const target = (await now()) - 15.6;
+      await page.evaluate((to) => {
+        const v = document.getElementById(
+          "pharos-video",
+        ) as HTMLVideoElement | null;
+        if (v) v.currentTime = to;
+      }, target);
+      await expect.poll(now, { timeout: 15_000 }).toBeGreaterThan(target + 1);
+
+      expect(logs.filter((l) => l.includes("engine=rust fallback="))).toEqual(
+        [],
+      );
+      expect(
+        logs.filter((l) => l.includes("playback error engine=rust")),
+      ).toEqual([]);
+    });
+
     // V648/V649 (spec 031 slice 4): on a link that slows mid-play the Rust
     // engine steps down a rung at a segment boundary, with no reload and no
     // jump in currentTime, and logs the switch with what it decided on. The
