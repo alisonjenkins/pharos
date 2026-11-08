@@ -1069,29 +1069,28 @@ pub fn focus_by_id(id: &str) {
     }
 }
 
-/// Enters fullscreen on the element `id`, or leaves it.
-pub fn toggle_fullscreen(id: &str) {
+/// Leaves fullscreen, or puts the whole page in it. The page, not the player
+/// element: a track or quality change replaces the player node, and an
+/// element's fullscreen would end with it (B816).
+pub fn toggle_fullscreen() {
     let Some(document) = web_sys::window().and_then(|w| w.document()) else {
         return;
     };
-    let result = if document.fullscreen_element().is_some() {
+    if document.fullscreen_element().is_some() {
         document.exit_fullscreen();
-        Ok(())
-    } else {
-        match document.get_element_by_id(id) {
-            Some(e) => e.request_fullscreen(),
-            None => Ok(()),
-        }
-    };
-    if let Err(e) = result {
-        warn(&format!("pharos: fullscreen refused: {e:?}"));
+        return;
     }
+    enter_page_fullscreen_for("key");
 }
 
 /// Puts the whole page in fullscreen, from a play click: the player is not
 /// mounted yet, and the gesture is gone once it is. The page stays fullscreen
 /// across the players the stage mounts, so the next episode keeps it.
 pub fn enter_page_fullscreen() {
+    enter_page_fullscreen_for("play");
+}
+
+fn enter_page_fullscreen_for(reason: &'static str) {
     let Some(document) = web_sys::window().and_then(|w| w.document()) else {
         return;
     };
@@ -1106,14 +1105,16 @@ pub fn enter_page_fullscreen() {
     match root.unchecked_into::<FsElement>().request_fullscreen() {
         Ok(promise) => spawn_detached(async move {
             match wasm_bindgen_futures::JsFuture::from(promise).await {
-                Ok(_) => info("pharos: fullscreen action=enter target=page reason=play"),
+                Ok(_) => info(&format!(
+                    "pharos: fullscreen action=enter target=page reason={reason}"
+                )),
                 Err(e) => warn(&format!(
-                    "pharos: fullscreen action=enter target=page refused reason={e:?}"
+                    "pharos: fullscreen action=enter target=page refused reason={reason} error={e:?}"
                 )),
             }
         }),
         Err(e) => warn(&format!(
-            "pharos: fullscreen action=enter target=page refused reason={e:?}"
+            "pharos: fullscreen action=enter target=page refused reason={reason} error={e:?}"
         )),
     }
 }
@@ -1126,8 +1127,8 @@ extern "C" {
     fn request_fullscreen(this: &FsElement) -> Result<js_sys::Promise, JsValue>;
 }
 
-/// Leaves the fullscreen [`enter_page_fullscreen`] started; the player's own
-/// fullscreen (the F key) is left alone.
+/// Leaves the page fullscreen a play click or the F key started; a
+/// fullscreen on another element is left alone.
 pub fn exit_page_fullscreen() {
     let Some(document) = web_sys::window().and_then(|w| w.document()) else {
         return;
