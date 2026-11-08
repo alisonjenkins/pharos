@@ -25,6 +25,20 @@ ALIGN_LOCK = threading.Lock()
 
 DecoderFunc = Callable[..., bytes]
 
+# The loaded model holds about 1.3 GiB; reloading it takes 10 to 30 s.
+DEFAULT_IDLE_UNLOAD_SECS = 600
+IDLE_CHECK_SECS = 30
+
+
+def idle_unload_secs(raw: str | None) -> float | None:
+    """Parse PHAROS_ALIGNER_IDLE_UNLOAD_SECS; 0 keeps the model loaded."""
+    if raw is None or raw.strip() == "":
+        return DEFAULT_IDLE_UNLOAD_SECS
+    value = float(raw)
+    if value < 0:
+        raise ValueError(f"PHAROS_ALIGNER_IDLE_UNLOAD_SECS must be >= 0, got {raw!r}")
+    return None if value == 0 else value
+
 
 class AlignerHandler(http.server.BaseHTTPRequestHandler):
     """HTTP request handler for health checks and lyric alignment."""
@@ -204,11 +218,20 @@ def main() -> None:
         host = listen
         port = 8790
 
-    # One model for the life of the process: loading it takes seconds.
-    from pharos_aligner.model import Aligner
+    from pharos_aligner.model import Aligner, start_idle_reaper
 
-    server = create_server((host, port), media_root=media_root, aligner=Aligner())
-    logger.info("Serving pharos-aligner on %s:%d (media root: %s)", host, port, media_root)
+    idle_unload_s = idle_unload_secs(os.environ.get("PHAROS_ALIGNER_IDLE_UNLOAD_SECS"))
+    aligner = Aligner(idle_unload_s=idle_unload_s)
+    if idle_unload_s is not None:
+        start_idle_reaper(aligner, interval_s=min(IDLE_CHECK_SECS, idle_unload_s))
+    server = create_server((host, port), media_root=media_root, aligner=aligner)
+    logger.info(
+        "Serving pharos-aligner on %s:%d (media root: %s, idle unload: %s s)",
+        host,
+        port,
+        media_root,
+        "off" if idle_unload_s is None else int(idle_unload_s),
+    )
     try:
         server.serve_forever()
     except KeyboardInterrupt:
