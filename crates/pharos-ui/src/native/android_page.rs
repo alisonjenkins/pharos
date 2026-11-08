@@ -152,6 +152,31 @@ pub async fn sign_in(name: &str, password: &str) -> SignInReply {
     }
 }
 
+/// The TV signs in by Quick Connect too.
+pub fn offers_quick_connect() -> bool {
+    true
+}
+
+/// Sign in by Quick Connect: show each code minted, and answer as a
+/// password sign-in does once one is approved.
+pub async fn quick_connect(mut show_code: impl FnMut(String) + 'static) -> SignInReply {
+    let base = server();
+    let call = CallInfo::default();
+    match android::quick_connect_sign_in(&base, &call, |code| show_code(code.to_owned())).await {
+        Ok(signed) => match android::store_token(&signed.token) {
+            Ok(()) => {
+                log::info!("pharos: sign_in ok via=quick_connect server={base}");
+                SignInReply::Status {
+                    status: 204,
+                    retry_after: None,
+                }
+            }
+            Err(e) => SignInReply::Failed(format!("could not keep the sign-in: {e}")),
+        },
+        Err(e) => SignInReply::Failed(e),
+    }
+}
+
 /// Forget the device token. The server keeps the session until it lapses
 /// or is revoked from another device.
 pub async fn sign_out() -> SignOutReply {

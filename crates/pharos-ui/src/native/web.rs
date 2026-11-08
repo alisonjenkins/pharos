@@ -321,6 +321,17 @@ pub fn on_escape(mut on_escape: impl FnMut() + 'static) -> EscapeWatch {
     EscapeWatch(listener)
 }
 
+/// Quick Connect sign-in is the TV's: a browser has a keyboard.
+pub fn offers_quick_connect() -> bool {
+    false
+}
+
+pub async fn quick_connect(
+    _show_code: impl FnMut(String) + 'static,
+) -> super::machine::SignInReply {
+    super::machine::SignInReply::Failed("Quick Connect sign-in is the TV app's".into())
+}
+
 /// Artwork as the page already has it: same-origin with the server.
 pub fn art_src(src: &str) -> String {
     src.to_owned()
