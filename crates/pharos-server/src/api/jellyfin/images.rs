@@ -858,7 +858,7 @@ pub(crate) async fn resolve_synth_image_item(
             None => None,
         };
     }
-    let all = state.list_items_cached().await.ok()?;
+    let all = state.list_items_fresh().await.ok()?;
     build_synth_image_map(state, &all);
     if let Some(Some(item_id)) = state.synth_image_cached(id_str) {
         return all.iter().find(|it| it.id == item_id).cloned();
@@ -2145,7 +2145,7 @@ mod tests {
             .await
             .unwrap();
 
-        let all = state.list_items_cached().await.unwrap();
+        let all = state.list_items_fresh().await.unwrap();
         build_synth_image_map(&state, &all);
         let various = crate::api::jellyfin::dto::artist_id_for("Various Artists");
         assert_eq!(state.synth_image_cached(&various), Some(Some(7)));
