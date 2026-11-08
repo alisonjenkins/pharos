@@ -395,22 +395,10 @@ pub struct AppState {
     /// (`notify_library_changed` / `notify_library_delta`). The full-item-list
     /// cache below keys on this so any add/remove instantly invalidates it.
     pub library_generation: Arc<std::sync::atomic::AtomicU64>,
-    /// Single-flight cache of the whole `media_items` list. Home-screen +
-    /// synth-id endpoints each did a full ~13k-row `store.list()` (1-4s) per
-    /// request, and browsing fired several at once. Holds
-    /// `((generation, artwork_epoch), built_at, items)` — a hit requires both
-    /// to still match AND the entry to be under `LIST_CACHE_MAX_AGE` (a backstop
-    /// so a missed invalidation self-heals). See `list_items_cached`.
-    #[allow(clippy::type_complexity)]
-    pub item_list_cache: Arc<
-        tokio::sync::Mutex<
-            Option<(
-                (u64, u64),
-                std::time::Instant,
-                Arc<Vec<pharos_core::MediaItem>>,
-            )>,
-        >,
-    >,
+    /// Stale-while-revalidate cache of the whole `media_items` list, keyed on
+    /// `(library_generation, artwork_epoch)` with a 60 s age backstop. See
+    /// `item_list_cache` and `list_items_cached`.
+    pub item_list_cache: Arc<crate::item_list_cache::ItemListCache>,
     /// Synthesised series/season/artist/album wire ids → the parent filter
     /// each names, so a `ParentId` lookup does not re-run four `SELECT
     /// DISTINCT` scans per request. See `items::synth_parent_filter`.
@@ -790,7 +778,7 @@ impl AppState {
             lyrics: Default::default(),
             is_bg_leader: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             library_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            item_list_cache: Arc::new(tokio::sync::Mutex::new(None)),
+            item_list_cache: Arc::new(crate::item_list_cache::ItemListCache::new()),
             synth_parents: Arc::new(std::sync::Mutex::new(None)),
             synth_parents_build: Arc::new(tokio::sync::Mutex::new(())),
             activity_log: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
@@ -913,7 +901,7 @@ impl AppState {
             lyrics: Default::default(),
             is_bg_leader: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             library_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            item_list_cache: Arc::new(tokio::sync::Mutex::new(None)),
+            item_list_cache: Arc::new(crate::item_list_cache::ItemListCache::new()),
             synth_parents: Arc::new(std::sync::Mutex::new(None)),
             synth_parents_build: Arc::new(tokio::sync::Mutex::new(())),
             activity_log: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
@@ -1214,30 +1202,37 @@ impl AppState {
         )
     }
 
-    /// Full `media_items` list, cached until the library changes (see
-    /// `item_list_cache`). Callers that only read/filter the list (home-screen
-    /// rows, synth Series/Season resolution) should use this instead of
-    /// `stores.list()` to avoid a full-table scan on every request. Returns an
+    /// Full `media_items` list, cached (see `item_list_cache`). Callers that
+    /// only read/filter the list (home-screen rows, synth Series/Season
+    /// resolution) should use this instead of `stores.list()`. Returns an
     /// `Arc` so the large Vec is shared, not cloned, across concurrent readers.
+    /// After a library change or the age backstop the previous list is
+    /// returned immediately while one background task refreshes it; use
+    /// [`Self::list_items_fresh`] when a stale list would be wrong.
     pub async fn list_items_cached(
         &self,
     ) -> Result<Arc<Vec<pharos_core::MediaItem>>, pharos_core::DomainError> {
-        use pharos_core::MediaStore;
-        /// Backstop: even if some mutation path forgets to bump the generation,
-        /// the cache refreshes at least this often.
-        const LIST_CACHE_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(60);
-        let gen = self.list_generation();
-        let mut guard = self.item_list_cache.lock().await;
-        if let Some((cached_gen, at, items)) = guard.as_ref() {
-            if *cached_gen == gen && at.elapsed() < LIST_CACHE_MAX_AGE {
-                return Ok(items.clone());
-            }
-        }
-        // Miss (stale generation / expired / cold). The mutex makes this
-        // single-flight: a burst of home-screen requests shares one scan.
-        let items = Arc::new(self.stores.list().await?);
-        *guard = Some((gen, std::time::Instant::now(), items.clone()));
-        Ok(items)
+        let (lib, art) = (
+            Arc::clone(&self.library_generation),
+            Arc::clone(&self.artwork_epoch),
+        );
+        self.item_list_cache
+            .get(&self.stores, move || {
+                use std::sync::atomic::Ordering;
+                (lib.load(Ordering::Relaxed), art.load(Ordering::Relaxed))
+            })
+            .await
+    }
+
+    /// Like [`Self::list_items_cached`] but never stale: waits for a load when
+    /// the cached list predates the current generation. For a caller that
+    /// just observed a library change and must see it.
+    pub async fn list_items_fresh(
+        &self,
+    ) -> Result<Arc<Vec<pharos_core::MediaItem>>, pharos_core::DomainError> {
+        self.item_list_cache
+            .get_fresh(&self.stores, self.list_generation())
+            .await
     }
 
     /// LIB-A4 — fire a `LibraryChanged` event carrying the item-id deltas
