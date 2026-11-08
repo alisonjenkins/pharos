@@ -36,23 +36,27 @@ at p95 against a 16.7 ms frame), and continuous state can be pushed.
 ### During playback (2026-11-08T15:36Z)
 
 Same bin with a second phase: after the idle reads it loops a muted 10 s
-1080p30 H.264 clip (a blob URL, hardware decode, 1-2 frames dropped at
-start, none after) and repeats the reads. 500 single reads and 100 batched
-reads per phase, three launches:
+1080p30 H.264 clip (a blob URL, hardware decode, 1-3 frames dropped at
+start, none after) and repeats the reads, then pushes 600 frames (~10 s, so
+it crosses the clip's loop point). 500 single reads and 100 batched reads
+per phase; five launches, ranges across them:
 
 | Probe | Idle p50 / p95 / p99 | Playing p50 / p95 / p99 |
 |---|---|---|
-| One DOM read | 2.1-2.2 / 2.7-2.9 / 3.1-3.7 ms | 2.5-2.7 / 7.5-8.9 / 9.2-12.2 ms |
-| One batched read (ten values) | 2.7-2.8 / 3.3-3.9 / 3.5-6.2 ms | 3.4-4.2 / 8.9-11.1 / 10.3-12.6 ms |
+| One DOM read | 2.1-2.2 / 2.7-2.9 / 3.1-3.7 ms | 2.5-2.9 / 7.1-8.9 / 9.2-12.2 ms |
+| One batched read (ten values) | 2.7-2.8 / 3.3-3.9 / 3.5-6.8 ms | 3.4-4.2 / 8.6-11.1 / 9.8-12.6 ms |
+| JS push per frame (two launches) | gap 16.7 / 16.8-16.9 ms | gap 16.7 / 17.4-20.1 / 18.6-21.4 ms, max 24.7 ms |
 
-Worst single read while playing was 53 ms (once in 1500); the 65-68 ms
+Worst single read while playing was 53 ms (once in 2500); the 64-68 ms
 idle max is the first call after launch. Playback leaves p50 alone and
-triples the tail: a read now costs up to about 12 ms at p99. One batched
-read per D-pad press still fits a 16.7 ms frame. Polling `<video>` state
-by eval on every tick would not (several reads a tick at up to 12 ms each),
-so the JS mirror for state that changes on its own is confirmed, not just
-preferred. The clip is not HLS through hls.js/MSE, so a real stream adds
-demux work on the same thread; treat these as a floor for playback.
+triples the read tail: a read costs up to about 12 ms at p99. The push
+keeps 60 Hz (600 frames in 10.0 s); 3-32 of 600 gaps went over 20 ms and
+none reached two frames. One batched read per D-pad press still fits a
+16.7 ms frame. Polling `<video>` state by eval on every tick would not
+(several reads a tick at up to 12 ms each), so the JS mirror for state
+that changes on its own holds up under playback too. The clip is not HLS
+through hls.js/MSE, so a real stream adds demux work on the same thread;
+treat these as a floor for playback.
 
 
 - `nix develop .#android -c dx build --platform android --package pharos-ui
