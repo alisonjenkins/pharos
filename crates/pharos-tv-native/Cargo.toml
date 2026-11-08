@@ -26,6 +26,12 @@ blitz-shell = "=0.2.3"
 # The deprecated bionic calls exist on every API level.
 android-properties = { version = "0.2", features = ["bionic-deprecated"] }
 
+[features]
+# Renderer matrix (spec 032): draw with Vello CPU, presented through wgpu
+# (pixels) or a CPU surface (softbuffer). Default is GPU Vello.
+cpu = ["dioxus-native/cpu-pixels"]
+cpu-softbuffer = ["dioxus-native/cpu-softbuffer"]
+
 [lints]
 workspace = true
 
