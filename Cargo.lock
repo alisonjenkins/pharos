@@ -5347,6 +5347,7 @@ dependencies = [
 name = "pharos-store-sqlx"
 version = "0.0.0"
 dependencies = [
+ "futures-util",
  "metrics",
  "metrics-util",
  "pharos-core",
