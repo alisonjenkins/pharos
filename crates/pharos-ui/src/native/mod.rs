@@ -17,6 +17,9 @@ pub mod depth;
 pub mod diagnostics;
 pub mod find;
 pub mod group_app;
+// 014: the network Together client over the session's `Group`.
+#[cfg(all(feature = "web", target_arch = "wasm32"))]
+mod group_rpc;
 pub mod group_session;
 pub mod hls_trace;
 #[cfg(all(feature = "web", target_arch = "wasm32"))]
