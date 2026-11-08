@@ -577,3 +577,5 @@ load-bearing — tasks, bugs and code comments cite these ids. Never renumber; a
 - V775: an open modal dialog makes the page outside it inert, returns the focus to what opened it on close, and keeps single-character mode keys from the page behind it (B825). Guarded by pharos-ui `an_open_dialog_keeps_the_single_letter_mode_keys_from_the_page`.
 - V776: a search that has been asked for and not answered reads "Searching…", never "No matches" (B826). Guarded by pharos-ui `a_search_on_its_way_says_searching_not_no_matches`.
 - V777: the sign-in form's name field takes the focus on arrival (B827). Guarded by pharos-ui `the_sign_in_focus_goes_to_the_name_field`.
+- V787: under 40rem the pharos-ui player's skip button is placed from the top, never at a fixed `bottom` that the wrapped control row can reach (B838). Guarded by pharos-ui `on_a_phone_the_skip_button_clears_the_wrapped_controls`.
+- V788: Esc closes the command palette from any focused element inside its dialog, once per press (B839). Guarded by the browser check (compat-playwright has no case yet).
