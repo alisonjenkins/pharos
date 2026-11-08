@@ -321,6 +321,21 @@ pub fn Loading() -> Element {
     rsx! { p { class: "pharos-loading", role: "status", "Loading…" } }
 }
 
+/// The last screen's content under a cue that the next one is loading
+/// (B822): dimmed, not clickable, `aria-busy`, and a "Loading…" status above
+/// it. Not busy, `children` stand alone, with no wrapper.
+#[component]
+pub fn Busy(busy: bool, children: Element) -> Element {
+    rsx! {
+        if busy {
+            Loading {}
+            div { class: "pharos-busy", aria_busy: "true", {children} }
+        } else {
+            {children}
+        }
+    }
+}
+
 #[component]
 pub fn ErrorNote(message: String) -> Element {
     rsx! { p { class: "pharos-error", role: "alert", "{message}" } }
@@ -1390,6 +1405,27 @@ mod tests {
             "{html}"
         );
         assert!(html.contains(r#"role="alert""#), "{html}");
+    }
+
+    /// B822: the listing left on screen while the next one loads says so.
+    #[test]
+    fn a_screen_that_is_loading_the_next_one_is_dimmed_and_busy() {
+        let busy = render(|| rsx! { Busy { busy: true, p { "old" } } });
+        assert!(busy.contains(r#"aria-busy="true""#), "{busy}");
+        assert!(
+            busy.contains(r#"role="status""#) && busy.contains("Loading…"),
+            "{busy}"
+        );
+        assert!(
+            busy.contains("pharos-busy") && busy.contains("old"),
+            "{busy}"
+        );
+        let idle = render(|| rsx! { Busy { busy: false, p { "old" } } });
+        assert!(
+            !idle.contains("busy") && !idle.contains("Loading"),
+            "{idle}"
+        );
+        assert!(idle.contains("old"), "{idle}");
     }
 
     #[test]
