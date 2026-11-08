@@ -1486,6 +1486,24 @@ async fn remove_session_output(session_dir: &Path, is_root: bool) {
     }
 }
 
+/// Flush every file an audio session wrote since `since`, and its directory,
+/// once the encode exits cleanly. ffmpeg writes these files itself, so this
+/// cannot make a session durable while it runs; it narrows the window a power
+/// cut can hit to the encode itself.
+async fn sync_session_output(session_dir: &Path, since: SystemTime) {
+    if let Ok(mut rd) = tokio::fs::read_dir(session_dir).await {
+        while let Ok(Some(e)) = rd.next_entry().await {
+            let Ok(meta) = e.metadata().await else {
+                continue;
+            };
+            if meta.is_file() && meta.modified().is_ok_and(|m| m >= since) {
+                let _ = sync_file(&e.path()).await;
+            }
+        }
+    }
+    sync_dir(session_dir).await;
+}
+
 /// Wait for an audio session's ffmpeg, rewriting its marker every
 /// [`MARKER_HEARTBEAT`] so other processes can see it is alive.
 async fn wait_with_heartbeat(
@@ -4626,6 +4644,8 @@ impl HlsSegmentCache {
         let media = media_id;
         let failures = self.state.clone();
         let failed_dir = dir.clone();
+        let written_dir = session_dir.clone();
+        let spawned_at = SystemTime::now();
         // Detached: run the encode to completion, then drop the `.running`
         // marker (the from-0 session leaves `audio.m3u8` as the done-marker).
         tokio::spawn(async move {
@@ -4646,7 +4666,10 @@ impl HlsSegmentCache {
                             );
                             true
                         }
-                        Ok(_) => false,
+                        Ok(_) => {
+                            sync_session_output(&written_dir, spawned_at).await;
+                            false
+                        }
                         Err(_) => true,
                     }
                 }
@@ -5364,6 +5387,8 @@ impl HlsSegmentCache {
                 )?;
                 let bin = self.transcoder.binary().to_path_buf();
                 let marker = running.clone();
+                let written_dir = dir.clone();
+                let spawned_at = SystemTime::now();
                 tracing::info!(
                     media.id = media_id,
                     start_secs,
@@ -5389,7 +5414,9 @@ impl HlsSegmentCache {
                     match cmd.spawn() {
                         Ok(mut child) => {
                             if let Ok(s) = wait_with_heartbeat(&mut child, &marker).await {
-                                if !s.success() {
+                                if s.success() {
+                                    sync_session_output(&written_dir, spawned_at).await;
+                                } else {
                                     tracing::warn!(
                                         media.id = media_id,
                                         ?s,
