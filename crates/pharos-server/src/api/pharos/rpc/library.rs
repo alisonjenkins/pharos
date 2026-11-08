@@ -1379,9 +1379,25 @@ pub(super) fn write_item(
     if let Some(score) = dto.critic_rating.and_then(tomatometer) {
         out.reborrow().init_critic_rating().set_some(score);
     }
+    if item.kind == MediaKind::Audio {
+        if let Some(artist) = card_artist(&dto) {
+            out.set_artist(artist.as_str());
+        }
+    }
     if let Some(tenths) = item.metadata.ratings.imdb.and_then(imdb_tenths) {
         out.init_imdb_rating().set_some(tenths);
     }
+}
+
+/// Who a song's card names under its title: its track artists, else its album
+/// artist. Only a song's: a music video's file often carries an artist tag
+/// too, but its card is a video's (V750). A compilation's album artist ("Various Artists") says less than
+/// the track's own, so the track's come first (V750).
+fn card_artist(dto: &BaseItemDto) -> Option<String> {
+    if !dto.artists.is_empty() {
+        return Some(dto.artists.join(", "));
+    }
+    dto.album_artists.first().map(|a| a.name.clone())
 }
 
 /// An IMDb score (0–10) in tenths; `None` outside 0–10.
