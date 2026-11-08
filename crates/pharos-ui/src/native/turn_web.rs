@@ -2,8 +2,8 @@
 //! it lives through the swap from one player to the next and is never an
 //! ancestor of the `<video>`. Only `transform` and `opacity` change, by CSS
 //! transition, so a TV or headset GPU runs it without repainting. The layer
-//! is removed once it lands, leaving playback exactly as with the turn off.
-//! Rules (angles, captions, timings) are in `turn.rs`.
+//! is removed once it has faded into the video, leaving playback exactly as
+//! with the turn off. Rules (timings, bar, captions) are in `turn.rs`.
 
 use std::cell::RefCell;
 
@@ -12,9 +12,7 @@ use wasm_bindgen::{JsCast as _, JsValue};
 use web_sys::{Document, Element, Event, HtmlCanvasElement, HtmlElement, HtmlVideoElement};
 
 use super::platform::{info, now_ms, warn};
-use super::turn::{
-    face_transform, Direction, Step, Turn, FIRST_MOVE_MS, GIVE_UP_MS, LAND_MS, START_DEG, STEP_MS,
-};
+use super::turn::{face_transform, Direction, Step, Turn, FADE_MS, GIVE_UP_MS, START_DEG, TURN_MS};
 use super::watch_view::VIDEO_ID;
 
 /// The old episode's still is drawn no wider than this: enough for a face
@@ -22,11 +20,9 @@ use super::watch_view::VIDEO_ID;
 const SNAPSHOT_MAX_WIDTH: u32 = 640;
 /// How often the caption and the give-up deadline are looked at.
 const TICK_MS: i32 = 250;
-const MOVE_EASE: &str = "cubic-bezier(.2,.7,.2,1)";
-const LAND_EASE: &str = "cubic-bezier(.2,.8,.2,1)";
-/// The layer fades as it lands, slowly at first, so the turn shows and the
-/// video under it is in full view by the end.
-const FADE_EASE: &str = "cubic-bezier(.7,0,.9,.6)";
+/// Quick off the press, so it answers at once, then easing into flat.
+const TURN_EASE: &str = "cubic-bezier(.2,.7,.2,1)";
+const FADE_EASE: &str = "cubic-bezier(.4,0,.2,1)";
 /// The `<html>` attribute that hides the player's own spinner while the
 /// layer shows the load.
 const TURNING_ATTR: &str = "data-turning";
@@ -35,12 +31,10 @@ type Listener = Closure<dyn FnMut(Event)>;
 
 struct Active {
     item: String,
-    dir: Direction,
     turn: Turn,
-    landing: bool,
+    fading: bool,
     waiting_shown: bool,
     layer: HtmlElement,
-    face: HtmlElement,
     fill: HtmlElement,
     caption: Element,
     title: Element,
@@ -198,23 +192,19 @@ fn begin(item: &str, dir: Direction, outgoing: Option<HtmlCanvasElement>, from: 
     if let Some(root) = doc.document_element() {
         let _ = root.set_attribute(TURNING_ATTR, "");
     }
-    // Into the first pose without a transition, then the click's move.
+    // Into the first pose without a transition, then the whole turn in one
+    // move; the load never holds it part way (B841).
     set_face(&face, START_DEG * dir.sign(), None);
     let _ = face.offset_width();
-    set_face(
-        &face,
-        super::turn::angle(Step::Clicked) * dir.sign(),
-        Some(FIRST_MOVE_MS),
-    );
+    set_face(&face, 0.0, Some(TURN_MS));
+    after(TURN_MS, item, turned);
     ACTIVE.with(|a| {
         *a.borrow_mut() = Some(Active {
             item: item.to_owned(),
-            dir,
             turn: Turn::new(started),
-            landing: false,
+            fading: false,
             waiting_shown: false,
             layer,
-            face,
             fill,
             caption,
             title,
@@ -259,7 +249,7 @@ fn build(doc: &Document, outgoing: Option<HtmlCanvasElement>, dir: Direction) ->
         layer.append_child(&out).ok()?;
         set_face(&out, 0.0, None);
         let _ = out.offset_width();
-        set_face(&out, -START_DEG * dir.sign(), Some(LAND_MS));
+        set_face(&out, -START_DEG * dir.sign(), Some(TURN_MS));
         let _ = out.class_list().add_1("is-gone");
     }
     let face = html(el("div", "pharos-turn-face is-in")?)?;
@@ -311,7 +301,7 @@ fn set_face(face: &HtmlElement, deg: f64, ms: Option<u32>) {
     let style = face.style();
     let transition = ms.map_or_else(
         || "none".to_owned(),
-        |ms| format!("transform {ms}ms {MOVE_EASE}"),
+        |ms| format!("transform {ms}ms {TURN_EASE}"),
     );
     let _ = style.set_property("transition", &transition);
     let _ = style.set_property("transform", &face_transform(deg));
@@ -371,73 +361,90 @@ fn buffered_ahead_ms(video: &HtmlVideoElement) -> u32 {
     ms
 }
 
+/// Run `f(item)` after `ms`, if `item`'s turn is still the one running.
+fn after(ms: u32, item: &str, f: fn(&str)) {
+    let id = item.to_owned();
+    let call = Closure::once_into_js(move || {
+        if ACTIVE.with(|a| a.borrow().as_ref().is_some_and(|a| a.item == id)) {
+            f(&id);
+        }
+    });
+    if let Some(w) = web_sys::window() {
+        let ms = i32::try_from(ms).unwrap_or(i32::MAX);
+        let _ = w.set_timeout_with_callback_and_timeout_and_arguments_0(call.unchecked_ref(), ms);
+    }
+}
+
 fn hear(item: &str, step: Step) {
-    let land = ACTIVE.with(|a| {
+    let fade = ACTIVE.with(|a| {
         let mut a = a.borrow_mut();
-        let Some(active) = a.as_mut().filter(|a| a.item == item && !a.landing) else {
+        let Some(active) = a.as_mut().filter(|a| a.item == item && !a.fading) else {
             return false;
         };
-        let Some(deg) = active.turn.hear(step, now_ms()) else {
+        let now = now_ms();
+        let Some(done) = active.turn.hear(step, now) else {
             return false;
         };
-        let done = 1.0 - deg / super::turn::angle(Step::Clicked);
         let _ = active
             .fill
             .style()
             .set_property("transform", &format!("scaleX({done:.3})"));
-        if step != Step::FirstFrame {
-            set_face(&active.face, deg * active.dir.sign(), Some(STEP_MS));
+        active.turn.fades(now)
+    });
+    if fade {
+        fade_out(item);
+    }
+}
+
+/// The turn's one move is over: fade into the video if its first frame is
+/// in, else show on the flat face that the load goes on.
+fn turned(item: &str) {
+    let fade = ACTIVE.with(|a| {
+        let mut a = a.borrow_mut();
+        let Some(active) = a.as_mut().filter(|a| !a.fading) else {
             return false;
+        };
+        // The timer says the turn is over, whatever the clock rounds to.
+        if active.turn.step == Step::FirstFrame {
+            return true;
         }
-        active.landing = true;
-        let style = active.face.style();
-        let _ = style.set_property("transition", &format!("transform {LAND_MS}ms {LAND_EASE}"));
-        let _ = style.set_property("transform", &face_transform(0.0));
-        let _ = active
-            .layer
-            .style()
-            .set_property("transition", &format!("opacity {LAND_MS}ms {FADE_EASE}"));
-        let _ = active.layer.style().set_property("opacity", "0");
+        if !active.waiting_shown {
+            active.waiting_shown = true;
+            let _ = active.layer.class_list().add_1("is-waiting");
+        }
+        false
+    });
+    if fade {
+        fade_out(item);
+    }
+}
+
+fn fade_out(item: &str) {
+    let ms = ACTIVE.with(|a| {
+        let mut a = a.borrow_mut();
+        let active = a.as_mut().filter(|a| a.item == item && !a.fading)?;
+        active.fading = true;
+        let layer = active.layer.style();
+        let _ = layer.set_property("transition", &format!("opacity {FADE_MS}ms {FADE_EASE}"));
+        let _ = layer.set_property("opacity", "0");
         let _ = active.layer.class_list().remove_1("is-waiting");
         let _ = active.caption.class_list().remove_1("is-shown");
-        true
+        Some(now_ms() - active.turn.begun_ms)
     });
-    if land {
-        let ms = ACTIVE.with(|a| {
-            a.borrow()
-                .as_ref()
-                .map_or(0.0, |a| now_ms() - a.turn.begun_ms)
-        });
-        info(&format!("pharos: turn land item={item} after_ms={ms:.0}"));
-        let id = item.to_owned();
-        let done = Closure::once_into_js(move || {
-            if ACTIVE.with(|a| {
-                a.borrow()
-                    .as_ref()
-                    .is_some_and(|a| a.item == id && a.landing)
-            }) {
-                finish("landed");
-            }
-        });
-        if let Some(w) = web_sys::window() {
-            let ms = i32::try_from(LAND_MS).unwrap_or(i32::MAX);
-            let _ =
-                w.set_timeout_with_callback_and_timeout_and_arguments_0(done.unchecked_ref(), ms);
-        }
-    }
+    let Some(ms) = ms else {
+        return;
+    };
+    info(&format!("pharos: turn fade item={item} after_ms={ms:.0}"));
+    after(FADE_MS, item, |_| finish("landed"));
 }
 
 fn tick() {
     let give_up = ACTIVE.with(|a| {
         let mut a = a.borrow_mut();
-        let active = a.as_mut().filter(|a| !a.landing)?;
+        let active = a.as_mut().filter(|a| !a.fading)?;
         let now = now_ms();
         if active.turn.given_up(now) {
             return Some(active.item.clone());
-        }
-        if !active.waiting_shown && now - active.turn.begun_ms >= f64::from(FIRST_MOVE_MS) {
-            active.waiting_shown = true;
-            let _ = active.layer.class_list().add_1("is-waiting");
         }
         match active.turn.caption(now) {
             Some(text) => {
