@@ -61,6 +61,7 @@ use super::together::{
 use super::together_view::{InviteView, TogetherView, INVITE_LINK_ID};
 use super::track_follow;
 use super::trail;
+use super::turn::{self, EpisodeTurn, EPISODE_TURN_KEY};
 use super::views::{
     open_route, reveal_palette_row, ErrorNote, Hits, HomeView, Loading, MarkPlayed, Nav,
     PaletteView, PlayFromStart, SearchBox, Shell, SignInView, StatusView, TitleView, PALETTE_INPUT,
@@ -164,6 +165,7 @@ pub fn Root() -> Element {
                 return;
             }
             if *route.peek() != to {
+                turn_on_nav(&route.peek(), &to);
                 platform::push(&to.path());
                 route.set(to);
             }
@@ -174,6 +176,7 @@ pub fn Root() -> Element {
             if plays_in_place(stage, &to) {
                 return;
             }
+            turn_on_nav(&route.peek(), &to);
             platform::replace(&to.path());
             route.set(to);
         }))
@@ -826,6 +829,61 @@ fn stored_mse_engine_raw() -> Option<String> {
 /// The engine this device's Playback setting names; hls.js when unset.
 fn stored_mse_engine() -> MseEngine {
     pick_mse_engine("", stored_mse_engine_raw().as_deref()).0
+}
+
+thread_local! {
+    /// The episode turn choice this page load, once read or set.
+    static EPISODE_TURN: Cell<Option<EpisodeTurn>> = const { Cell::new(None) };
+}
+
+/// The viewer's episode turn choice; [`EpisodeTurn::Turn`] unless they chose Off.
+fn stored_episode_turn() -> EpisodeTurn {
+    if let Some(choice) = EPISODE_TURN.get() {
+        return choice;
+    }
+    let choice = match platform::stored_theme(EPISODE_TURN_KEY) {
+        Ok(stored) => stored
+            .as_deref()
+            .map_or_else(EpisodeTurn::default, EpisodeTurn::parse),
+        Err(e) => {
+            platform::warn(&format!(
+                "pharos: episode_turn storage read failed error={e}"
+            ));
+            EpisodeTurn::default()
+        }
+    };
+    EPISODE_TURN.set(Some(choice));
+    choice
+}
+
+fn store_episode_turn(choice: EpisodeTurn) -> Result<(), String> {
+    EPISODE_TURN.set(Some(choice));
+    platform::info(&format!("pharos: episode_turn set={}", choice.as_str()));
+    platform::store_theme(EPISODE_TURN_KEY, choice.as_str()).inspect_err(|e| {
+        platform::warn(&format!(
+            "pharos: episode_turn storage write failed error={e}"
+        ));
+    })
+}
+
+/// A navigation to the watch page: turn from the episode on screen, or get
+/// ready to turn onto the one being opened once it is known to be a video.
+fn turn_on_nav(from: &Route, to: &Route) {
+    let direction = turn::take_direction();
+    let Route::Watch(next) = to else {
+        return;
+    };
+    if !turn::wanted(stored_episode_turn(), platform::prefers(REDUCED_MOTION)) {
+        return;
+    }
+    let item = next.to_string();
+    match from {
+        Route::Watch(now) if now != next => {
+            platform::turn_begin(&item, direction);
+        }
+        Route::Watch(_) => {}
+        _ => platform::turn_expect(&item, direction),
+    }
 }
 
 pub(super) fn set_crossfade_seconds(seconds: u32) {
@@ -2581,9 +2639,23 @@ fn PlaybackScreen() -> Element {
     let mut subtitle_size = use_signal(stored_subtitle_size);
     let mut crossfade = use_signal(crossfade_seconds);
     let mut mse_engine = use_signal(stored_mse_engine);
+    let mut episode_turn = use_signal(stored_episode_turn);
     rsx! {
         playback_settings::PlaybackView {
             notice: notice.read().clone(),
+            episode_turn: episode_turn(),
+            on_episode_turn: move |choice: EpisodeTurn| {
+                if let Err(e) = store_episode_turn(choice) {
+                    notify(
+                        notice,
+                        format!(
+                            "Could not save the episode transition on this device: {e}. It applies until you reload."
+                        ),
+                        true,
+                    );
+                }
+                episode_turn.set(choice);
+            },
             max_quality: max_quality(),
             on_max_quality: move |bps: u64| {
                 store_bitrate(MAX_BITRATE_KEY, bps);
@@ -3340,6 +3412,11 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
             let info = call("watch", play_action(ctx_stage.peek().view));
             let result = async {
                 let detail = api.detail(&info, id).await?;
+                if matches!(detail.item.kind, ItemKind::Episode | ItemKind::Movie) {
+                    platform::turn_open(&id.to_string());
+                } else {
+                    platform::turn_cancel(&id.to_string(), "not-video");
+                }
                 let caps = negotiation_capabilities(detail.item.kind, auto);
                 let (decision, grant) = api.play(&info, id, &caps, asked).await?;
                 Ok::<_, ClientError>((detail, decision, grant))
@@ -3516,6 +3593,21 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
             ctx_stage.write().ready(play);
         }
     });
+    // The turn onto this item (V790) follows its load, and stops for an
+    // error, a small player or a page left.
+    use_effect(move || match playing.read().as_ref() {
+        Some(Some(Ok(p))) => {
+            platform::turn_ready(&id.to_string(), p.0.image.as_deref(), &p.0.title);
+        }
+        Some(Some(Err(_))) => platform::turn_cancel(&id.to_string(), "playback-error"),
+        _ => {}
+    });
+    use_effect(move || {
+        if ctx_stage.read().view != View::Full {
+            platform::turn_cancel(&id.to_string(), "not-full");
+        }
+    });
+    use_drop(move || platform::turn_cancel(&id.to_string(), "left"));
     let state = playing.read();
     // The song handing over is not the page's.
     let name = state
@@ -3775,6 +3867,12 @@ fn Player(
     let mut queue = try_use_context::<QueueCtx>().map_or(own_queue, |q| q.0);
     let audio = p.kind == ItemKind::Audio;
     let playing_id = p.detail.item.id;
+    // A player that gives up must show why, not sit under the turn (V790).
+    use_effect(move || {
+        if failed.read().is_some() {
+            platform::turn_cancel(&playing_id.to_string(), "player-failed");
+        }
+    });
     // A song's next comes from the queue, unless a group decides what plays.
     // A session is kept after its group ends, so ask the group, not it.
     let grouped = group.drives(playing_id);
@@ -4590,6 +4688,9 @@ fn Player(
                 // moves the group, whose item brings this member too (014 US9).
                 Control::Play(id) => {
                     if !session().is_some_and(|s| s.move_to(id, 0)) {
+                        if near.previous == Some(id) {
+                            turn::going_back();
+                        }
                         go(id);
                     }
                 }
@@ -4694,7 +4795,10 @@ fn Player(
                         to.map_or_else(|| "restart".to_owned(), |id| id.to_string())
                     ));
                     match to {
-                        Some(id) => go(id),
+                        Some(id) => {
+                            turn::going_back();
+                            go(id);
+                        }
                         None => seek(0),
                     }
                 }
