@@ -309,18 +309,25 @@ const GROUP_DEVICE_KEY: &str = "pharos.group.device";
 
 /// This TV's device id for group calls, the twin of the web's per-tab id: the
 /// server keys a member by user and device. Kept as a preference so a restart
-/// is the same member; if it cannot be kept, this run's id still works.
+/// is the same member; if it cannot be read or kept, this run's id still works.
+/// A failed read never overwrites the stored id: that would make the TV a new
+/// member after a transient error.
 pub fn group_device() -> String {
     static ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     ID.get_or_init(|| {
-        match load_pref(GROUP_DEVICE_KEY) {
+        let keep = match load_pref(GROUP_DEVICE_KEY) {
             Ok(Some(id)) if tv_auth::is_group_device(&id) => return id,
-            Ok(_) => {}
-            Err(e) => log::warn!("group device id: {e}"),
-        }
+            Ok(_) => true,
+            Err(e) => {
+                log::warn!("group device id: {e}; using one for this run only");
+                false
+            }
+        };
         let id = tv_auth::new_group_device(random_u64());
-        if let Err(e) = store_pref(GROUP_DEVICE_KEY, &id) {
-            log::warn!("group device id: {e}");
+        if keep {
+            if let Err(e) = store_pref(GROUP_DEVICE_KEY, &id) {
+                log::warn!("group device id: {e}");
+            }
         }
         id
     })
