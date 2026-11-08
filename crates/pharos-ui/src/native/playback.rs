@@ -493,6 +493,163 @@ impl AbrSwitchReport {
     }
 }
 
+/// Segment deadlines for the Rust engine on `device` (FR-005). Provisional,
+/// not measured: hls.js's ten-second first byte on a desktop, longer on a
+/// TV or phone whose Wi-Fi and CPU answer slower; the slice 0 baseline
+/// (T031-03) retunes them.
+pub fn segment_deadlines(device: DeviceClass) -> pharos_hls::retry::Deadlines {
+    use pharos_hls::retry::Deadlines;
+    match device {
+        DeviceClass::Desktop => Deadlines {
+            first_byte_ms: 10_000,
+            load_ms: 60_000,
+        },
+        DeviceClass::Tv | DeviceClass::Phone => Deadlines {
+            first_byte_ms: 15_000,
+            load_ms: 90_000,
+        },
+    }
+}
+
+/// What the Rust engine does about one failed segment request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SegmentRecovery {
+    /// Fetch it again after `after_ms`; `attempt` failures so far.
+    Retry { attempt: u32, after_ms: u64 },
+    /// It missed its load deadline: fetch it again at once from a lower rung,
+    /// without counting towards the retry limit.
+    StepDown,
+    /// Give up: playback fails with a `networkError`.
+    Fail {
+        attempt: u32,
+        why: pharos_hls::retry::GiveUp,
+    },
+}
+
+impl From<pharos_hls::retry::Verdict> for SegmentRecovery {
+    fn from(verdict: pharos_hls::retry::Verdict) -> Self {
+        use pharos_hls::retry::Verdict;
+        match verdict {
+            Verdict::Retry { attempt, after_ms } => Self::Retry { attempt, after_ms },
+            Verdict::Fail { attempt, why } => Self::Fail { attempt, why },
+        }
+    }
+}
+
+impl SegmentRecovery {
+    fn action(self) -> &'static str {
+        match self {
+            Self::Retry { .. } => "retry",
+            Self::StepDown => "step_down",
+            Self::Fail { .. } => "fail",
+        }
+    }
+
+    fn attempt(self) -> u32 {
+        match self {
+            Self::Retry { attempt, .. } | Self::Fail { attempt, .. } => attempt,
+            Self::StepDown => 0,
+        }
+    }
+
+    fn after_ms(self) -> String {
+        match self {
+            Self::Retry { after_ms, .. } => after_ms.to_string(),
+            Self::StepDown => "0".to_owned(),
+            Self::Fail { .. } => "none".to_owned(),
+        }
+    }
+
+    fn give_up(self) -> &'static str {
+        match self {
+            Self::Fail { why, .. } => why.label(),
+            Self::Retry { .. } | Self::StepDown => "none",
+        }
+    }
+}
+
+/// One failed segment request of the Rust engine and what it led to (V637).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SegmentFailureReport {
+    pub track: &'static str,
+    /// The segment index, or `init`.
+    pub index: String,
+    pub cause: pharos_hls::retry::Cause,
+    /// The deadline that passed, for a timeout.
+    pub deadline_ms: Option<u64>,
+    pub recovery: SegmentRecovery,
+    /// The quality rung the request was for, `none` without a ladder.
+    pub rung: String,
+    pub reason: String,
+    pub url: String,
+}
+
+impl SegmentFailureReport {
+    pub fn fatal(&self) -> bool {
+        matches!(self.recovery, SegmentRecovery::Fail { .. })
+    }
+
+    fn status(&self) -> String {
+        match self.cause {
+            pharos_hls::retry::Cause::Http(status) => status.to_string(),
+            _ => "none".to_owned(),
+        }
+    }
+
+    fn deadline(&self) -> String {
+        self.deadline_ms
+            .map_or_else(|| "none".to_owned(), |d| d.to_string())
+    }
+
+    pub fn line(&self) -> String {
+        let r = self.recovery;
+        format!(
+            "pharos: playback error engine=rust type=network track={} index={} cause={} status={} deadline_ms={} rung={} action={} attempt={} after_ms={} give_up={} reason={} url={}",
+            self.track,
+            self.index,
+            self.cause.label(),
+            self.status(),
+            self.deadline(),
+            self.rung,
+            r.action(),
+            r.attempt(),
+            r.after_ms(),
+            r.give_up(),
+            self.reason,
+            self.url,
+        )
+    }
+
+    /// The client event, in the `networkError` vocabulary hls.js reports in (FR-006).
+    pub fn event(&self, route: String) -> ClientEvent {
+        let r = self.recovery;
+        ClientEvent {
+            kind: ClientEventKind::PlaybackError,
+            level: if self.fatal() {
+                ClientLevel::Error
+            } else {
+                ClientLevel::Warn
+            },
+            route,
+            fields: vec![
+                ("engine", "rust".to_owned()),
+                ("type", "networkError".to_owned()),
+                ("details", self.cause.label().to_owned()),
+                ("track", self.track.to_owned()),
+                ("index", self.index.clone()),
+                ("status", self.status()),
+                ("deadline_ms", self.deadline()),
+                ("rung", self.rung.clone()),
+                ("reason", self.reason.clone()),
+                ("action", r.action().to_owned()),
+                ("attempt", r.attempt().to_string()),
+                ("after_ms", r.after_ms()),
+                ("give_up", r.give_up().to_owned()),
+            ],
+        }
+    }
+}
+
 impl EngineVerdict {
     /// The watch page's log line for this verdict (V630).
     pub fn line(&self) -> String {
@@ -3403,6 +3560,105 @@ mod tests {
         assert!(refused.line().contains("est_kbps=none"));
         assert!(refused.line().ends_with("applied=false"));
         assert_eq!(refused.event(String::new()).level, ClientLevel::Warn);
+    }
+
+    // V637: every failed segment request logs and reports its cause, the
+    // deadline that passed, the rung and what the engine does next.
+    #[test]
+    fn a_segment_failure_is_logged_and_reported_with_its_recovery() {
+        use pharos_hls::retry::{Cause, GiveUp};
+        let r = SegmentFailureReport {
+            track: "video",
+            index: "7".to_owned(),
+            cause: Cause::TimeoutFirstByte,
+            deadline_ms: Some(10_000),
+            recovery: SegmentRecovery::Retry {
+                attempt: 2,
+                after_ms: 2_000,
+            },
+            rung: "720p".to_owned(),
+            reason: "no response".to_owned(),
+            url: "/s/7.m4s".to_owned(),
+        };
+        assert_eq!(
+            r.line(),
+            "pharos: playback error engine=rust type=network track=video index=7 cause=timeout_first_byte status=none deadline_ms=10000 rung=720p action=retry attempt=2 after_ms=2000 give_up=none reason=no response url=/s/7.m4s"
+        );
+        assert!(!r.fatal());
+        let e = r.event("/ui/watch/9".to_owned());
+        assert_eq!(e.kind, ClientEventKind::PlaybackError);
+        assert_eq!(e.level, ClientLevel::Warn);
+        let get = |e: &ClientEvent, k: &str| {
+            e.fields
+                .iter()
+                .find(|(key, _)| *key == k)
+                .map(|(_, v)| v.clone())
+        };
+        assert_eq!(get(&e, "type").as_deref(), Some("networkError"));
+        assert_eq!(get(&e, "details").as_deref(), Some("timeout_first_byte"));
+        assert_eq!(get(&e, "after_ms").as_deref(), Some("2000"));
+
+        let failed = SegmentFailureReport {
+            cause: Cause::Http(404),
+            deadline_ms: None,
+            recovery: SegmentRecovery::Fail {
+                attempt: 1,
+                why: GiveUp::NotRetryable,
+            },
+            ..r.clone()
+        };
+        assert!(failed.fatal());
+        assert!(failed
+            .line()
+            .contains("cause=http status=404 deadline_ms=none rung=720p action=fail attempt=1 after_ms=none give_up=not_retryable"));
+        assert_eq!(failed.event(String::new()).level, ClientLevel::Error);
+
+        let stepped = SegmentFailureReport {
+            cause: Cause::TimeoutLoad,
+            deadline_ms: Some(60_000),
+            recovery: SegmentRecovery::StepDown,
+            ..r
+        };
+        assert!(!stepped.fatal());
+        assert!(stepped.line().contains(
+            "cause=timeout_load status=none deadline_ms=60000 rung=720p action=step_down attempt=0"
+        ));
+    }
+
+    #[test]
+    fn retry_verdicts_map_onto_recoveries() {
+        use pharos_hls::retry::{GiveUp, Verdict};
+        assert_eq!(
+            SegmentRecovery::from(Verdict::Retry {
+                attempt: 3,
+                after_ms: 4_000
+            }),
+            SegmentRecovery::Retry {
+                attempt: 3,
+                after_ms: 4_000
+            },
+        );
+        assert_eq!(
+            SegmentRecovery::from(Verdict::Fail {
+                attempt: 7,
+                why: GiveUp::Exhausted
+            }),
+            SegmentRecovery::Fail {
+                attempt: 7,
+                why: GiveUp::Exhausted
+            },
+        );
+    }
+
+    #[test]
+    fn weak_devices_wait_longer_for_a_segment() {
+        let desktop = segment_deadlines(DeviceClass::Desktop);
+        for weak in [DeviceClass::Tv, DeviceClass::Phone] {
+            let d = segment_deadlines(weak);
+            assert!(d.first_byte_ms > desktop.first_byte_ms);
+            assert!(d.load_ms > desktop.load_ms);
+        }
+        assert_eq!(desktop.first_byte_ms, 10_000);
     }
 
     #[test]
