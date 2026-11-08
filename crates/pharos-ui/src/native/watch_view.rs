@@ -10,6 +10,7 @@ use pharos_client::api::{Chapter, Item, ItemRef, Segment, Track, Trickplay};
 
 use super::keymap::{self, Mode, Transport};
 use super::keys;
+use super::quality::{self, QualityView};
 
 use super::art::Art;
 use super::listen::{Icon, ICON_FLOAT, ICON_PIP};
@@ -94,6 +95,9 @@ pub struct Controls {
     /// re-renders them alone and not the whole player (B815). Without it
     /// `media.position_ms` is the position.
     pub live_position: Option<Signal<u64>>,
+    /// The quality control's state: the manual maximum, the auto cap and how
+    /// the server plays the video.
+    pub quality: QualityView,
 }
 
 /// Where playback is. Reading it with `now` in a component's body
@@ -290,6 +294,10 @@ pub enum Control {
     Audio(u32),
     Subtitle(Option<u32>),
     Fullscreen,
+    /// Limit the video to this many bits per second (0 is Auto).
+    Quality(u64),
+    /// Forget the cap Auto lowered itself to.
+    ResetAutoQuality,
     /// Hand the video to the browser's picture-in-picture window (spec 020).
     PictureInPicture,
     /// Leave the player for the page before it.
@@ -671,6 +679,11 @@ pub fn WatchView(
                             pick: c.subtitle_pick,
                             offer_off: true,
                             on_pick: move |p| on_control.call(Control::Subtitle(p)),
+                        }
+                        QualityPicker {
+                            quality: c.quality.clone(),
+                            height: media.video_height,
+                            on_pick: move |control| on_control.call(control),
                         }
                         if platform::pip_supported() {
                             button {
@@ -1068,6 +1081,41 @@ fn TrackPicker(
     }
 }
 
+/// The quality menu: Auto or a cap, shown as the state in force, with a
+/// reset while Auto has lowered itself.
+#[component]
+fn QualityPicker(quality: QualityView, height: u32, on_pick: EventHandler<Control>) -> Element {
+    let title = quality.title();
+    rsx! {
+        select {
+            class: "pharos-track-picker pharos-quality-picker",
+            aria_label: "Quality",
+            title,
+            onkeydown: menu_key,
+            onchange: move |evt: FormEvent| {
+                let value = evt.value();
+                let control = if value == quality::RESET_AUTO {
+                    Some(Control::ResetAutoQuality)
+                } else {
+                    value.parse::<u64>().ok().map(Control::Quality)
+                };
+                if let Some(control) = control {
+                    on_pick.call(control);
+                }
+                platform::focus_by_id(PLAYER_ID);
+            },
+            for (value, text) in quality.options(height) {
+                option {
+                    key: "{value}",
+                    value: "{value}",
+                    selected: value.parse::<u64>().is_ok_and(|bps| bps == quality.manual),
+                    "{text}"
+                }
+            }
+        }
+    }
+}
+
 /// A neighbour a Shift+click, Shift+P / Shift+N or a media key asks for.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Skip {
@@ -1320,6 +1368,23 @@ mod tests {
             renders,
             "WatchView's body must not re-run on a position tick"
         );
+    }
+
+    #[test]
+    fn the_control_row_shows_the_quality_in_force_and_a_reset_when_lowered() {
+        let mut c = controls();
+        c.media.video_height = 720;
+        c.quality = QualityView {
+            auto: 2_000_000,
+            method: "transcode".into(),
+            ..QualityView::default()
+        };
+        let html = render(c);
+        assert!(html.contains("pharos-quality-picker"), "{html}");
+        assert!(html.contains("Auto · 720p · Transcode"), "{html}");
+        assert!(html.contains("Reset Auto (now 2 Mbps)"), "{html}");
+        let plain = render(controls());
+        assert!(!plain.contains("Reset Auto"), "{plain}");
     }
 
     #[test]

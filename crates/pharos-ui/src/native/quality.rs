@@ -37,6 +37,88 @@ pub fn effective_cap(manual: u64, auto: u64) -> u64 {
     }
 }
 
+/// What the player's quality control shows: the viewer's manual maximum
+/// (0 is Auto), the cap auto quality settled on (0 is none) and how the
+/// server is playing the video.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct QualityView {
+    pub manual: u64,
+    pub auto: u64,
+    /// The server's play method: "direct_play", "direct_stream" or
+    /// "transcode"; empty when unknown.
+    pub method: String,
+}
+
+/// The value of the option that clears the remembered auto cap.
+pub const RESET_AUTO: &str = "reset-auto";
+
+fn mbps(bps: u64) -> String {
+    format!("{} Mbps", bps / 1_000_000)
+}
+
+impl QualityView {
+    fn method_label(&self) -> Option<&'static str> {
+        match self.method.as_str() {
+            "direct_play" => Some("Direct play"),
+            "direct_stream" => Some("Direct stream"),
+            "transcode" => Some("Transcode"),
+            _ => None,
+        }
+    }
+
+    /// The control's face: "Auto · 720p · Direct play", or "4 Mbps · 720p".
+    /// `height` is the picture's, 0 until the metadata has loaded.
+    pub fn label(&self, height: u32) -> String {
+        let mut parts = vec![if self.manual == 0 {
+            "Auto".to_owned()
+        } else {
+            mbps(self.manual)
+        }];
+        if height > 0 {
+            parts.push(format!("{height}p"));
+        }
+        parts.extend(self.method_label().map(str::to_owned));
+        parts.join(" · ")
+    }
+
+    /// The tooltip: what is in force and why.
+    pub fn title(&self) -> String {
+        let mut line = match (self.manual, self.auto) {
+            (0, 0) => "Quality: Auto, no limit".to_owned(),
+            (0, auto) => format!("Quality: Auto, lowered to {}", mbps(auto)),
+            (manual, _) => format!("Quality: limited to {}", mbps(manual)),
+        };
+        if let Some(method) = self.method_label() {
+            line.push_str(". ");
+            line.push_str(method);
+        }
+        line
+    }
+
+    /// The menu's options as (value, text): the choices, the current one
+    /// showing the face, and a reset while Auto holds a lowered cap.
+    pub fn options(&self, height: u32) -> Vec<(String, String)> {
+        let mut options: Vec<(String, String)> = super::playback::MAX_BITRATE_CHOICES
+            .iter()
+            .map(|(bps, name)| {
+                let text = if *bps == self.manual {
+                    self.label(height)
+                } else {
+                    (*name).to_owned()
+                };
+                (bps.to_string(), text)
+            })
+            .collect();
+        if self.auto > 0 {
+            options.push((
+                RESET_AUTO.to_owned(),
+                format!("Reset Auto (now {})", mbps(self.auto)),
+            ));
+        }
+        options
+    }
+}
+
 /// A stall older than this no longer counts.
 const STALL_WINDOW_MS: u64 = 30_000;
 /// Stalls inside the window that step the quality down.
@@ -229,6 +311,24 @@ impl Watch {
         self.cap
     }
 
+    /// The viewer changed their manual maximum mid-video: it is the hard
+    /// ceiling from now on, and the remembered cap stays under it.
+    pub fn set_ceiling(&mut self, ceiling: u64, now: u64) {
+        self.ceiling = ceiling;
+        if ceiling > 0 && self.cap > ceiling {
+            self.cap = ceiling;
+        }
+        self.restarted(now);
+    }
+
+    /// Forget the cap auto quality settled on, so the next negotiation
+    /// starts unlimited again.
+    pub fn clear_cap(&mut self, now: u64) {
+        self.cap = 0;
+        self.headroom_since = None;
+        self.restarted(now);
+    }
+
     /// A fragment of `bytes` took `load_ms` to download and holds
     /// `media_ms` of video.
     pub fn fragment(&mut self, bytes: u64, load_ms: u64, media_ms: u64) {
@@ -343,6 +443,52 @@ impl Watch {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_quality_face_names_the_limit_the_picture_and_the_method() {
+        let auto = QualityView {
+            method: "transcode".into(),
+            ..QualityView::default()
+        };
+        assert_eq!(auto.label(0), "Auto · Transcode");
+        assert_eq!(auto.label(720), "Auto · 720p · Transcode");
+        let capped = QualityView {
+            manual: 4_000_000,
+            method: "direct_play".into(),
+            ..QualityView::default()
+        };
+        assert_eq!(capped.label(1080), "4 Mbps · 1080p · Direct play");
+        assert_eq!(QualityView::default().label(0), "Auto");
+    }
+
+    #[test]
+    fn the_quality_menu_marks_the_current_choice_and_offers_a_reset_only_when_lowered() {
+        let fresh = QualityView::default().options(720);
+        assert_eq!(fresh.len(), 5, "{fresh:?}");
+        assert_eq!(fresh[0], ("0".to_owned(), "Auto · 720p".to_owned()));
+        assert_eq!(fresh[2].1, "4 Mbps");
+        assert!(fresh.iter().all(|(v, _)| v != RESET_AUTO));
+        let lowered = QualityView {
+            auto: 2_000_000,
+            ..QualityView::default()
+        };
+        assert_eq!(
+            lowered.options(0).last(),
+            Some(&(RESET_AUTO.to_owned(), "Reset Auto (now 2 Mbps)".to_owned()))
+        );
+        assert_eq!(lowered.title(), "Quality: Auto, lowered to 2 Mbps");
+    }
+
+    #[test]
+    fn a_manual_pick_lowers_the_remembered_cap_and_a_reset_clears_it() {
+        let mut watch = Watch::new(0, 4_000_000, 0);
+        watch.set_ceiling(2_000_000, 10);
+        assert_eq!(watch.cap(), 2_000_000);
+        watch.set_ceiling(0, 20);
+        assert_eq!(watch.cap(), 2_000_000, "raising the ceiling keeps the cap");
+        watch.clear_cap(30);
+        assert_eq!(watch.cap(), 0);
+    }
 
     const MS: u64 = 1000;
 

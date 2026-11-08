@@ -45,7 +45,7 @@ use super::playback::{
 };
 use super::playback_settings;
 use super::privacy;
-use super::quality::{self, Watch};
+use super::quality::{self, QualityView, Watch};
 use super::queue::{Queue, QueueAction, QueueCtx, Track, RESTART_AFTER_MS};
 use super::resume::{Item as ResumeItem, ResumeProbe, ResumeReport};
 use super::route::Route;
@@ -3291,6 +3291,8 @@ struct Playing {
     /// The audio stream this playback was asked for. The server may play
     /// another, so `audio` alone cannot tell a request was already made.
     asked_audio: Option<u32>,
+    /// How the server plays it: "direct_play", "direct_stream" or "transcode".
+    method: String,
 }
 
 impl Playing {
@@ -3365,6 +3367,9 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
         QualityWatch(Rc::new(RefCell::new(w)))
     });
     let mut auto_cap = use_signal(|| watch.0.borrow().cap());
+    // The manual maximum as the Playback page keeps it, mirrored for the
+    // player's quality control.
+    let mut manual_cap = use_signal(|| stored_bitrate(MAX_BITRATE_KEY, parse_max_bitrate));
     let resume_from = Rc::clone(&last_ms);
     // The episodes either side follow the item, not the playback, so a track
     // change that renegotiates does not look them up again.
@@ -3565,6 +3570,7 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
                             TrackChoice::Index(i) => Some(i),
                             _ => None,
                         },
+                        method: decision.method,
                     })))
                 }),
             )
@@ -3734,6 +3740,43 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
                             move |line: String| notify(line)
                         },
                         notice: notice(),
+                        manual_cap: manual_cap(),
+                        auto_cap: auto_cap(),
+                        on_quality_pick: {
+                            let (watch, notify) = (watch.clone(), Rc::clone(&notify));
+                            move |pick: Option<u64>| {
+                                let now = now_ms_u64();
+                                match pick {
+                                    Some(bps) => {
+                                        if bps == *manual_cap.peek() {
+                                            return;
+                                        }
+                                        store_bitrate(MAX_BITRATE_KEY, bps);
+                                        let kept = {
+                                            let mut w = watch.0.borrow_mut();
+                                            w.set_ceiling(bps, now);
+                                            w.cap()
+                                        };
+                                        store_bitrate(quality::AUTO_RUNG_KEY, kept);
+                                        platform::info(&format!(
+                                            "pharos: max_bitrate set={} from=player auto={}",
+                                            max_bitrate_label(bps),
+                                            max_bitrate_label(kept)
+                                        ));
+                                        notify(quality_choice_notice(bps));
+                                        manual_cap.set(bps);
+                                        auto_cap.set(kept);
+                                    }
+                                    None => {
+                                        watch.0.borrow_mut().clear_cap(now);
+                                        store_bitrate(quality::AUTO_RUNG_KEY, 0);
+                                        platform::info("pharos: auto quality reset from=player");
+                                        notify("Resetting Auto quality…".to_owned());
+                                        auto_cap.set(0);
+                                    }
+                                }
+                            }
+                        },
                         was_paused: WasPaused(Rc::clone(&was_paused)),
                         // In place of this episode, as the next-episode button does.
                         on_advance: move |next| replace.0.call(Route::Watch(next)),
@@ -3833,6 +3876,15 @@ fn autoplay_after(grouped: bool, was_paused: bool) -> bool {
 /// How long a "Switching audio…" style notice stays up.
 const NOTICE_MS: u32 = 4000;
 
+/// The line shown while a quality pick renegotiates the playback.
+fn quality_choice_notice(manual: u64) -> String {
+    if manual == 0 {
+        "Quality: Auto".to_owned()
+    } else {
+        format!("Quality: up to {} Mbps", manual / 1_000_000)
+    }
+}
+
 /// The line shown while a track change renegotiates the playback.
 fn track_notice(audio: bool) -> String {
     if audio {
@@ -3892,6 +3944,13 @@ fn Player(
     on_notice: EventHandler<String>,
     /// The line the screen is showing over the picture, if any.
     notice: Option<String>,
+    /// The viewer's manual maximum and the cap Auto settled on, in bps (0 is
+    /// none), for the quality control.
+    manual_cap: u64,
+    auto_cap: u64,
+    /// The viewer picked a maximum (`Some`, 0 is Auto) or reset Auto (`None`)
+    /// in the player.
+    on_quality_pick: EventHandler<Option<u64>>,
     was_paused: WasPaused,
     /// Plays the next episode once this one is finished: Up next, or the
     /// video ending.
@@ -4929,6 +4988,8 @@ fn Player(
                     remember_volume(volume, muted);
                 }
                 Control::Fullscreen => platform::toggle_fullscreen(),
+                Control::Quality(bps) => on_quality_pick.call(Some(bps)),
+                Control::ResetAutoQuality => on_quality_pick.call(None),
                 Control::PictureInPicture => platform::toggle_pip(VIDEO_ID),
                 // The next-episode button while the card counts is Play now.
                 Control::Play(id)
@@ -5178,6 +5239,11 @@ fn Player(
             _ => None,
         },
         live_position: Some(position),
+        quality: QualityView {
+            manual: manual_cap,
+            auto: auto_cap,
+            method: p.method.clone(),
+        },
     };
     let on_leave = {
         let session = session.clone();
@@ -5397,6 +5463,12 @@ mod tests {
         assert!(!autoplay_after(false, true), "paused stays paused");
         assert!(!autoplay_after(true, false), "a group waits for its play");
         assert!(!autoplay_after(true, true));
+    }
+
+    #[test]
+    fn a_quality_pick_names_the_new_limit() {
+        assert_eq!(quality_choice_notice(0), "Quality: Auto");
+        assert_eq!(quality_choice_notice(4_000_000), "Quality: up to 4 Mbps");
     }
 
     #[test]
