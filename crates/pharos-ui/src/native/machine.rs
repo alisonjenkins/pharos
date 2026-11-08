@@ -312,9 +312,17 @@ fn probe_detail(probe: &Probe) -> String {
         Probe::Status(status) => {
             format!("The server answered HTTP {status} when asked about sign-in.")
         }
+        Probe::Failed(error) if error.contains(NOT_VALID_YET) => format!(
+            "Could not reach the server: {error}. The server's certificate is dated after \
+             this device's clock, so check the device's date and time."
+        ),
         Probe::Failed(error) => format!("Could not reach the server: {error}"),
     }
 }
+
+/// How rustls words a certificate whose notBefore is after the local clock;
+/// a TV that lost power can boot with its clock years behind.
+const NOT_VALID_YET: &str = "certificate not valid yet";
 
 /// The sign-in form's error for a reply, or none when it succeeded.
 fn sign_in_error(reply: &SignInReply) -> Option<String> {
@@ -610,5 +618,31 @@ mod tests {
         let mut m = ready();
         m.apply(Event::Retry);
         assert_eq!(m.phase(), &Phase::Ready);
+    }
+
+    #[test]
+    fn a_certificate_from_the_future_points_at_the_clock() {
+        let mut m = Machine::new();
+        m.apply(Event::NotOpened {
+            epoch: 0,
+            probe: Probe::Failed(
+                "connect wss://example/pharos/rpc: IO error: invalid peer certificate: \
+                 certificate not valid yet: verification time 1749513733 (UNIX)"
+                    .into(),
+            ),
+        });
+        assert_eq!(m.phase(), &Phase::Connecting, "it still retries");
+        assert!(
+            m.waiting()
+                .is_some_and(|why| why.contains("date and time") && why.contains("not valid yet")),
+            "{:?}",
+            m.waiting()
+        );
+    }
+
+    #[test]
+    fn other_failures_do_not_blame_the_clock() {
+        let detail = probe_detail(&Probe::Failed("offline".into()));
+        assert!(!detail.contains("date and time"), "{detail}");
     }
 }
