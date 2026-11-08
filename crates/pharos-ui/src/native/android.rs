@@ -137,13 +137,35 @@ fn token_path() -> Result<PathBuf, String> {
         })
 }
 
+/// The device token as last loaded, stored or forgotten, kept in memory for
+/// the server proxy, which sends it on every image request.
+static TOKEN: std::sync::Mutex<Option<Option<String>>> = std::sync::Mutex::new(None);
+
+fn set_cached(token: Option<String>) {
+    if let Ok(mut t) = TOKEN.lock() {
+        *t = Some(token);
+    }
+}
+
+/// `load_token`, read from disk only the first time. Never log the value.
+pub fn token() -> Option<String> {
+    if let Ok(t) = TOKEN.lock() {
+        if let Some(token) = &*t {
+            return token.clone();
+        }
+    }
+    load_token()
+}
+
 /// The stored device token, if any. Never log the value.
 pub fn load_token() -> Option<String> {
     let path = token_path().ok()?;
-    std::fs::read_to_string(path)
+    let token = std::fs::read_to_string(path)
         .ok()
         .map(|t| t.trim().to_owned())
-        .filter(|t| !t.is_empty())
+        .filter(|t| !t.is_empty());
+    set_cached(token.clone());
+    token
 }
 
 /// Write the token to a temp file in the same directory, fsync it, and
@@ -169,13 +191,16 @@ pub fn store_token(token: &str) -> Result<(), String> {
         }
         std::fs::rename(&tmp, &path)
     };
-    write().map_err(|e| {
-        let _ = std::fs::remove_file(&tmp);
-        format!("{}: {e}", path.display())
-    })
+    write()
+        .inspect(|()| set_cached(Some(token.to_owned())))
+        .map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            format!("{}: {e}", path.display())
+        })
 }
 
 pub fn forget_token() {
+    set_cached(None);
     let Ok(path) = token_path() else { return };
     match std::fs::remove_file(path) {
         Ok(()) => {}
@@ -225,6 +250,79 @@ pub async fn resume(
         }
     };
     bounded(closed, tv_auth::CALL_TIMEOUT, call).await
+}
+
+/// `Bootstrap.login` with a name and password; the device token to
+/// `store_token`. Never log the password or the token.
+pub async fn login(
+    bootstrap: &bootstrap::Client,
+    closed: &Closed,
+    info: &CallInfo,
+    name: &str,
+    password: &str,
+) -> Result<String, NetError> {
+    let mut req = bootstrap.login_request();
+    {
+        let mut params = req.get();
+        info.write(params.reborrow().init_ctx());
+        params.set_name(name);
+        params.set_password(password);
+    }
+    let call = async {
+        let reply = req.send().promise.await?;
+        match reply
+            .get()?
+            .get_result()?
+            .which()
+            .map_err(capnp::Error::from)?
+        {
+            login_result::Ok(ok) => text(ok?.get_device_token()),
+            login_result::Error(e) => Err(ClientError::from_api(e?)),
+        }
+    };
+    bounded(closed, tv_auth::CALL_TIMEOUT, call).await
+}
+
+/// The server address stored in the app's private `server` file, if any;
+/// `tv_page::server_base` checks it.
+pub fn load_server() -> Option<String> {
+    let path = files_dir().ok()?.join("server");
+    std::fs::read_to_string(path).ok()
+}
+
+/// A preference's file: `pref-` and the key, kept to safe file name bytes.
+fn pref_path(key: &str) -> Result<PathBuf, String> {
+    let name: String = key
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    Ok(files_dir()?.join(format!("pref-{name}")))
+}
+
+/// `localStorage.getItem`'s twin.
+pub fn load_pref(key: &str) -> Result<Option<String>, String> {
+    match std::fs::read_to_string(pref_path(key)?) {
+        Ok(v) => Ok(Some(v)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("pref {key}: {e}")),
+    }
+}
+
+/// `localStorage.setItem`'s twin: written whole, then renamed into place.
+pub fn store_pref(key: &str, value: &str) -> Result<(), String> {
+    let path = pref_path(key)?;
+    let dir = path.parent().ok_or("pref path has no directory")?;
+    std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, value)
+        .and_then(|()| std::fs::rename(&tmp, &path))
+        .map_err(|e| format!("pref {key}: {e}"))
 }
 
 fn text(t: capnp::Result<capnp::text::Reader<'_>>) -> Result<String, ClientError> {
