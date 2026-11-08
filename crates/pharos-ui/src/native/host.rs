@@ -80,6 +80,11 @@ pub fn on_escape(_on_escape: impl FnMut() + 'static) -> EscapeWatch {
 
 pub struct PopState;
 
+/// A reload loads the newer server's page.
+pub fn can_reload() -> bool {
+    true
+}
+
 /// Quick Connect sign-in is the TV's: a browser has a keyboard.
 pub fn offers_quick_connect() -> bool {
     false
