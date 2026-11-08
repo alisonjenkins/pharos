@@ -380,9 +380,17 @@ pub struct FakeGroups {
     refuse_set_item: Rc<Cell<bool>>,
     hold_buffering: Rc<Cell<bool>>,
     buffering_gates: Rc<RefCell<Vec<BufferingGate>>>,
+    join_pushes: Rc<RefCell<Vec<GroupUpdate>>>,
 }
 
 impl FakeGroups {
+    /// The next `join` sends `updates` to its sink and yields once before it
+    /// answers, as the server's pushes can reach a member before the answer
+    /// to its join does.
+    pub fn push_on_join(&self, updates: Vec<GroupUpdate>) {
+        *self.join_pushes.borrow_mut() = updates;
+    }
+
     /// Makes every `buffering` wait for [`Self::release_buffering`] before it
     /// is logged, as a slow server would; the gates open in any order.
     pub fn hold_buffering(&self) {
@@ -498,14 +506,33 @@ impl GroupClient for FakeGroups {
 
     async fn join(&self, id: &str, sink: GroupSink) -> Result<GroupSummary, GroupError> {
         self.log(format!("join({id})"));
-        let mut groups = self.groups.borrow_mut();
-        let Some(group) = groups.iter_mut().find(|g| g.id == id) else {
-            return Err(GroupError("This group has ended".into()));
+        let answer = {
+            let mut groups = self.groups.borrow_mut();
+            let Some(group) = groups.iter_mut().find(|g| g.id == id) else {
+                return Err(GroupError("This group has ended".into()));
+            };
+            group.members.push(Self::me());
+            group.clone()
         };
-        group.members.push(Self::me());
-        self.sinks.borrow_mut().push(sink);
-        *self.joined.borrow_mut() = Some(group.id.clone());
-        Ok(group.clone())
+        self.sinks.borrow_mut().push(Rc::clone(&sink));
+        *self.joined.borrow_mut() = Some(answer.id.clone());
+        let pushes = std::mem::take(&mut *self.join_pushes.borrow_mut());
+        if !pushes.is_empty() {
+            for update in pushes {
+                sink(update);
+            }
+            let mut yielded = false;
+            std::future::poll_fn(|cx| {
+                if std::mem::replace(&mut yielded, true) {
+                    std::task::Poll::Ready(())
+                } else {
+                    cx.waker().wake_by_ref();
+                    std::task::Poll::Pending
+                }
+            })
+            .await;
+        }
+        Ok(answer)
     }
 
     async fn clock(&self, client_ms: i64) -> Result<ClockReply, GroupError> {
