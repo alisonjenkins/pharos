@@ -1141,6 +1141,28 @@ body:has(.pharos-stage.is-full) .pharos-status-note {
   font-size: 0.75rem;
   opacity: 0.7;
 }
+/* A screen that could not load: plain words, Try again, small print (B823). */
+.pharos-load-failure {
+  display: grid;
+  gap: 0.75rem;
+  justify-items: center;
+  max-width: 28rem;
+  margin: 3rem auto;
+  padding: 1.5rem;
+  text-align: center;
+}
+.pharos-load-failure-title {
+  margin: 0;
+  font-size: 1.25rem;
+  font-weight: 600;
+}
+.pharos-load-failure-details {
+  margin: 0;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  font-size: 0.75rem;
+  color: var(--px-color-fg-muted);
+}
 .pharos-video {
   display: block;
   width: 100%;

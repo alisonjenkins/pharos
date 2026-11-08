@@ -65,9 +65,9 @@ use super::track_follow;
 use super::trail;
 use super::turn::{self, EpisodeTurn, EPISODE_TURN_KEY};
 use super::views::{
-    open_route, reveal_palette_row, Busy, ErrorNote, GroupEndedNote, Hits, HomeView, Loading,
-    MarkPlayed, Nav, PaletteView, PlayFailure, PlayFromStart, PlaybackFailure, SearchBox, Shell,
-    SignInView, StatusView, TitleView, PALETTE_INPUT,
+    open_route, reveal_palette_row, Busy, ErrorNote, GroupEndedNote, Hits, HomeView, LoadError,
+    LoadFailure, Loading, MarkPlayed, Nav, PaletteView, PlayFailure, PlayFromStart,
+    PlaybackFailure, SearchBox, Shell, SignInView, StatusView, TitleView, PALETTE_INPUT,
 };
 use super::watch_view::{
     split_position, text_track_id, total_ms, Control, Controls, Skip, UpNextCard, WatchView,
@@ -3090,20 +3090,52 @@ fn loaded<T>(state: Option<&Result<T, String>>, view: impl FnOnce(&T) -> Element
     }
 }
 
+/// As [`settle`], for a screen load that offers "Try again": the failure
+/// keeps its kind and trace id for the plain sentence and details (B823).
+fn settle_load<T>(
+    mut machine: Signal<Machine>,
+    result: Result<T, ClientError>,
+) -> Result<T, LoadError> {
+    result.map_err(|e| {
+        if e.needs_sign_in() {
+            machine.write().apply(Event::NeedsSignIn);
+        }
+        LoadError::from_client(&e)
+    })
+}
+
+/// As [`loaded`], with a failure that offers "Try again" through `retry`.
+fn loaded_or_retry<T>(
+    state: Option<&Result<T, LoadError>>,
+    retry: EventHandler<()>,
+    view: impl FnOnce(&T) -> Element,
+) -> Element {
+    match state {
+        None => rsx! { Loading {} },
+        Some(Err(error)) => rsx! { LoadFailure { error: error.clone(), on_retry: retry } },
+        Some(Ok(value)) => view(value),
+    }
+}
+
 #[component]
 fn HomeScreen() -> Element {
     let ctx = use_context::<Ctx>();
-    let home = use_resource(move || {
+    let mut home = use_resource(move || {
         let api = ctx.api.read().clone();
         async move {
             let api = api?;
-            Some(settle(ctx.machine, api.home(&call("home", "load")).await))
+            Some(settle_load(
+                ctx.machine,
+                api.home(&call("home", "load")).await,
+            ))
         }
     });
     let state = home.read();
-    loaded(state.as_ref().and_then(Option::as_ref), |home: &Home| {
-        rsx! { HomeView { home: home.clone() } }
-    })
+    loaded_or_retry(
+        state.as_ref().and_then(Option::as_ref),
+        EventHandler::new(move |()| home.restart()),
+        |home: &Home| rsx! { HomeView { home: home.clone() } },
+    )
 }
 
 #[component]
@@ -3111,7 +3143,7 @@ fn BrowseScreen(id: ItemRef) -> Element {
     let ctx = use_context::<Ctx>();
     // The screen stays mounted when a tile or season tab opens another
     // parent, so the load follows `id` instead of running once.
-    let listing = use_resource(use_reactive!(|(id,)| {
+    let mut listing = use_resource(use_reactive!(|(id,)| {
         let api = ctx.api.read().clone();
         let _ = (ctx.marks)();
         async move {
@@ -3120,7 +3152,7 @@ fn BrowseScreen(id: ItemRef) -> Element {
                 platform::warn(&line)
             })
             .await;
-            Some((id, settle(ctx.machine, result)))
+            Some((id, settle_load(ctx.machine, result)))
         }
     }));
     let state = listing.read();
@@ -3140,8 +3172,9 @@ fn BrowseScreen(id: ItemRef) -> Element {
         .is_some_and(|(asked, _)| *asked != id);
     rsx! {
         Busy { busy,
-            {loaded(
+            {loaded_or_retry(
                 state.as_ref().and_then(Option::as_ref).map(|(_, result)| result),
+                EventHandler::new(move |()| listing.restart()),
                 |browse: &browse::Browse| {
                     rsx! { SeenBrowse { browse: browse.clone() } }
                 },
@@ -3238,14 +3271,14 @@ fn TitleScreen(id: ItemRef) -> Element {
     // (B555). The resource keeps its last value while a new id loads, so
     // each result carries the id it was asked for and a stale one shows as
     // loading, never as the previous title's controls.
-    let detail = use_resource(use_reactive!(|(id,)| {
+    let mut detail = use_resource(use_reactive!(|(id,)| {
         let api = ctx.api.read().clone();
         let _ = (ctx.marks)();
         async move {
             let api = api?;
             Some((
                 id,
-                settle(ctx.machine, api.detail(&call("title", "load"), id).await),
+                settle_load(ctx.machine, api.detail(&call("title", "load"), id).await),
             ))
         }
     }));
@@ -3329,12 +3362,13 @@ fn TitleScreen(id: ItemRef) -> Element {
         if let Some(message) = group_error.read().clone() {
             ErrorNote { message }
         }
-        {loaded(
+        {loaded_or_retry(
             state
                 .as_ref()
                 .and_then(Option::as_ref)
                 .filter(|(asked, _)| *asked == id)
                 .map(|(_, result)| result),
+            EventHandler::new(move |()| detail.restart()),
             |detail: &Detail| {
                 let tracks = start
                     .read()
