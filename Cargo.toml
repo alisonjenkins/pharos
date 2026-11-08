@@ -13,6 +13,7 @@ members = [
     "crates/pharos-scanner",
     "crates/pharos-server",
     "crates/pharos-store-sqlx",
+    "crates/pharos-tv-native",
     "crates/pharos-styling",
     "crates/pharos-subs",
     "crates/pharos-sync",

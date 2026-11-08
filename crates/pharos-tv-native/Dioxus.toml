@@ -1,0 +1,14 @@
+[application]
+name = "pharos-tv-native"
+# Launches the framework's NativeActivity: dx's template only knows the
+# WebView activity.
+android_manifest = "android/AndroidManifest.xml"
+
+[bundle]
+identifier = "com.alisonjenkins.pharos.tvnative"
+publisher = "pharos"
+
+[android]
+# android-properties (via android-activity) calls __system_property_read_callback,
+# which libc only has from API 26; dx's default min_sdk 24 links against API 24.
+min_sdk = 28

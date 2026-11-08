@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 032: launch the framework's NativeActivity directly (no Kotlin/Java),
+     since dx's template only generates a WebView activity. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
+    <uses-feature android:name="android.software.leanback" android:required="false" />
+
+    <application android:hasCode="true" android:icon="@mipmap/ic_launcher"
+        android:banner="@mipmap/ic_launcher"
+        android:extractNativeLibs="true"
+        android:label="Pharos Native"
+        android:theme="@android:style/Theme.NoTitleBar.Fullscreen">
+        <activity android:configChanges="orientation|screenLayout|screenSize|keyboardHidden|keyboard|navigation|uiMode"
+            android:exported="true" android:label="Pharos Native"
+            android:name="android.app.NativeActivity">
+            <meta-data android:name="android.app.lib_name" android:value="main" />
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+                <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

@@ -1,0 +1,27 @@
+[package]
+name = "pharos-tv-native"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "Spec 032 spike: the Android TV app drawn by Dioxus Native (Blitz)"
+
+[dependencies]
+dioxus = { workspace = true, features = ["launch", "native"] }
+pharos-ui = { path = "../pharos-ui" }
+pharos-client = { path = "../pharos-client" }
+log = "0.4"
+
+[target.'cfg(target_os = "android")'.dependencies]
+android_logger = "0.15"
+# dx writes no `android_main` for the native renderer, so the bin hands the
+# AndroidApp to blitz-shell itself.
+android-activity = { version = "0.6", features = ["native-activity"] }
+blitz-shell = "=0.2.3"
+# The default path calls __system_property_read_callback, which the link
+# under dx does not resolve (unexplained; LTO dropped it in the smoke app).
+# The deprecated bionic calls exist on every API level.
+android-properties = { version = "0.2", features = ["bionic-deprecated"] }
+
+[lints]
+workspace = true
