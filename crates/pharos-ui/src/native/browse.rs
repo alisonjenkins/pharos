@@ -2974,6 +2974,23 @@ mod tests {
         assert_eq!(Order::from_token("bogus"), None);
     }
 
+    /// B810: collections and playlists open as the generic grid of their
+    /// members, without the library filter bar.
+    #[test]
+    fn collections_and_playlists_load_as_a_plain_grid() {
+        let mut fake = Fake::default();
+        for (n, kind) in [(10, ItemKind::Collection), (11, ItemKind::Playlist)] {
+            let id = ItemRef::Real(n);
+            fake.details.insert(id, detail(item(id, kind, "Set")));
+            assert_eq!(plan(fake.details.get(&id)), Plan::Grid, "{kind:?}");
+            let opened = run(load(&fake, &CallInfo::default(), id, |_| {})).unwrap();
+            assert!(
+                matches!(opened, Browse::Grid { library: false, .. }),
+                "{kind:?}"
+            );
+        }
+    }
+
     #[test]
     fn only_a_library_grid_gets_the_filter_bar() {
         let mut fake = Fake::default();
