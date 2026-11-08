@@ -9,6 +9,7 @@ use pharos_client::api::{ClientEvent, ClientEventKind, ClientLevel};
 use pharos_hls::abr::{Abr, AbrConfig, Estimator, EstimatorConfig, Inputs, Rung};
 use pharos_hls::planner::{Action, Buffered, Config, Planner, Request as SegRequest, Track};
 use pharos_hls::playlist::{parse_master, parse_media, Master, MediaPlaylist, Segment};
+use pharos_hls::stall::{Sample, Verdict as StallVerdict, Watchdog};
 use pharos_hls::timeline::same_grid;
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::{JsCast as _, JsValue};
@@ -20,7 +21,7 @@ use super::platform::{
 use super::playback::{
     abr_ladder, check_master, forward_buffer_ms, pick_audio_uri, plan_hls, ranges_to_ms,
     rung_label, with_abr, AbrSwitchReport, FragmentLoad, HlsFallbackCause, OnFatal, OnFragment,
-    PlaybackEngine,
+    PlaybackEngine, StallReport,
 };
 
 const MAX_CONSECUTIVE_FAILURES: u32 = 3;
@@ -31,6 +32,9 @@ const RETRY_BASE_MS: u32 = 1_000;
 /// video segments: a segment the server encodes on demand answers late, a
 /// cached one at once, and an up-switch has to survive the late kind.
 const COLD_WINDOW: usize = 4;
+/// How often the stall watchdog samples the play head. Nothing else fires
+/// while it is stuck: `timeupdate` stops with it.
+const STALL_TICK_MS: i32 = 250;
 
 type EventListener = Closure<dyn FnMut(web_sys::Event)>;
 
@@ -126,6 +130,22 @@ struct Session {
     fallback: Option<HlsJs>,
     on_fatal: OnFatal,
     on_fragment: OnFragment,
+    watchdog: Watchdog,
+    stall_timer: Option<StallTimer>,
+}
+
+/// The watchdog's interval; dropping it clears the interval (V642).
+struct StallTimer {
+    id: i32,
+    _tick: Closure<dyn FnMut()>,
+}
+
+impl Drop for StallTimer {
+    fn drop(&mut self) {
+        if let Some(window) = web_sys::window() {
+            window.clear_interval_with_handle(self.id);
+        }
+    }
 }
 
 impl Session {
@@ -175,6 +195,8 @@ impl PlaybackEngine for RustHls {
             fallback: None,
             on_fatal,
             on_fragment,
+            watchdog: Watchdog::new(),
+            stall_timer: None,
         }));
 
         let weak = Rc::downgrade(&session);
@@ -223,6 +245,7 @@ impl Drop for RustHls {
             let mut s = session.borrow_mut();
             s.dead = true;
             s.eos_pending = false;
+            drop(s.stall_timer.take());
             let video_cleanup = s.video_track.take().map(take_track_cleanup);
             let audio_cleanup = s.audio_track.take().map(take_track_cleanup);
             (
@@ -479,6 +502,7 @@ async fn load(weak: Weak<RefCell<Session>>) {
     ));
 
     pump(&session);
+    start_stall_watch(&session);
     drop(session);
     prepare_abr(weak, master, playing).await;
 }
@@ -818,9 +842,11 @@ fn wire_source_buffer(weak: &Weak<RefCell<Session>>, track: Track, runner: &mut 
 }
 
 fn read_time_ranges(sb: &web_sys::SourceBuffer) -> Vec<(u64, u64)> {
-    let Ok(ranges) = sb.buffered() else {
-        return Vec::new();
-    };
+    sb.buffered()
+        .map_or_else(|_| Vec::new(), |r| time_ranges_ms(&r))
+}
+
+fn time_ranges_ms(ranges: &web_sys::TimeRanges) -> Vec<(u64, u64)> {
     let len = ranges.length();
     let mut pairs = Vec::with_capacity(len as usize);
     for i in 0..len {
@@ -829,6 +855,95 @@ fn read_time_ranges(sb: &web_sys::SourceBuffer) -> Vec<(u64, u64)> {
         }
     }
     ranges_to_ms(&pairs)
+}
+
+fn start_stall_watch(session: &Rc<RefCell<Session>>) {
+    let Some(window) = web_sys::window() else {
+        return;
+    };
+    let weak = Rc::downgrade(session);
+    let tick = Closure::<dyn FnMut()>::new(move || {
+        if let Some(s) = weak.upgrade() {
+            stall_tick(&s);
+        }
+    });
+    match window.set_interval_with_callback_and_timeout_and_arguments_0(
+        tick.as_ref().unchecked_ref(),
+        STALL_TICK_MS,
+    ) {
+        Ok(id) => {
+            session.borrow_mut().stall_timer = Some(StallTimer { id, _tick: tick });
+            info(&format!(
+                "pharos: playback stall engine=rust action=on tick_ms={STALL_TICK_MS}"
+            ));
+        }
+        Err(e) => warn(&format!(
+            "pharos: playback stall engine=rust action=off reason={}",
+            js_message(&e)
+        )),
+    }
+}
+
+/// Samples the play head, and jumps, nudges or gives up as the watchdog says.
+/// Gaps are judged on the element's `buffered`: where audio and video both are.
+fn stall_tick(session: &Rc<RefCell<Session>>) {
+    let Some((play_ms, tracks)) = snapshot_state(session) else {
+        return;
+    };
+    let (video, verdict, in_flight) = {
+        let mut guard = session.borrow_mut();
+        let s = &mut *guard;
+        if s.dead {
+            return;
+        }
+        let video = s.video.clone();
+        let held = video.paused() || video.ended() || video.playback_rate() == 0.0;
+        let buffered = time_ranges_ms(&video.buffered());
+        let verdict = s.watchdog.observe(Sample {
+            now_ms: now_ms_u64(),
+            current_ms: play_ms,
+            held,
+            seeking: video.seeking(),
+            buffered: &buffered,
+        });
+        let busy = |t: &Option<TrackRunner>| t.as_ref().is_some_and(|t| t.controller.is_some());
+        let in_flight = match (busy(&s.video_track), busy(&s.audio_track)) {
+            (true, true) => "both",
+            (true, false) => "video",
+            (false, true) => "audio",
+            (false, false) => "none",
+        };
+        (video, verdict, in_flight)
+    };
+    let Some(verdict) = verdict else {
+        return;
+    };
+    let report = StallReport {
+        verdict,
+        video_ahead_ms: forward_buffer_ms(&tracks.video, play_ms),
+        audio_ahead_ms: forward_buffer_ms(&tracks.audio, play_ms),
+        in_flight,
+    };
+    let line = report.line();
+    match verdict {
+        StallVerdict::Recovered { .. } => info(&line),
+        _ => warn(&line),
+    }
+    report_event(report.event(current_path()));
+    match verdict {
+        StallVerdict::Jump { to_ms, .. } | StallVerdict::Nudge { to_ms, .. } => {
+            #[allow(clippy::cast_precision_loss)]
+            video.set_current_time(to_ms as f64 / 1000.0);
+        }
+        StallVerdict::GiveUp {
+            at_ms, stalled_ms, ..
+        } => fail_media(
+            &Rc::downgrade(session),
+            "bufferStalledError",
+            &format!("play head stuck at {at_ms} ms for {stalled_ms} ms with data buffered"),
+        ),
+        StallVerdict::Starved { .. } | StallVerdict::Recovered { .. } => {}
+    }
 }
 
 fn snapshot_state(session: &Rc<RefCell<Session>>) -> Option<(u64, Buffered)> {
