@@ -4,8 +4,9 @@
 use std::rc::Rc;
 
 use pharos_api::pharos_capnp::{
-    credit, home_result, item_detail, item_id, item_summary, items_result, library as wire, track,
-    user_state, CreditKind, Kind, LibraryKind as WireKind, SegmentKind, SubtitleDelivery,
+    credit, home_result, item_detail, item_id, item_summary, items_result, library as wire,
+    person_credit, person_result, track, user_state, CreditKind, Kind, LibraryKind as WireKind,
+    SegmentKind, SubtitleDelivery,
 };
 use pharos_api::{server, Denial};
 use pharos_core::{LibraryKind, MediaItem, MediaKind, UserItemData};
@@ -18,6 +19,7 @@ use crate::services::library::{
     self, DetailError, GroupError, Grouping, ItemQuery, KindFilter, LibraryView, ListError,
     ListPage, QueryPage, QUERY_DEFAULT, QUERY_MAX,
 };
+use crate::services::person::{self, PersonError};
 use crate::services::search::Hit;
 use crate::services::{lyrics, mix, segments, watch};
 use crate::state::AppState;
@@ -428,7 +430,7 @@ impl server::library::Handler for Library {
         let id = match id {
             WireId::Real(id) => id,
             synth @ WireId::Synth(_) => {
-                match synth_detail(state, &user, synth).await {
+                match synth_detail(state, &user, synth, "detail").await {
                     Ok(dto) => {
                         let played = synth_played(state, &user, synth, &dto).await;
                         let cast = synth_cast(state, synth, &dto).await;
@@ -563,6 +565,65 @@ impl server::library::Handler for Library {
             segments = segments.len(),
             cast = cast.len(),
             "native detail: player facts"
+        );
+        Ok(())
+    }
+
+    async fn person(
+        self: Rc<Self>,
+        params: wire::PersonParams,
+        results: &mut wire::PersonResults,
+    ) -> Result<(), capnp::Error> {
+        let id = read_item_id(params.get()?.get_id()?)?;
+        let user = match self.session.current_user().await {
+            Ok(user) => user,
+            Err(denial) => {
+                denial.write(results.get().init_result().init_error());
+                return Ok(());
+            }
+        };
+        let state = &self.session.state;
+        let not_found = Denial::NotFound { what: "person" };
+        let page = match person::page(state, &user, &id.to_string()).await {
+            Ok(page) => page,
+            Err(PersonError::NotFound | PersonError::Hidden) => {
+                not_found.write(results.get().init_result().init_error());
+                return Ok(());
+            }
+            Err(PersonError::Store(_)) => {
+                Denial::Unavailable {
+                    dependency: "media store",
+                }
+                .write(results.get().init_result().init_error());
+                return Ok(());
+            }
+        };
+        // Each show's own projection, for its poster; one that fails is named
+        // from its episodes instead, and logged.
+        use futures_util::StreamExt as _;
+        let shows: Vec<_> = futures_util::stream::iter(page.shows.iter().map(|show| {
+            let user = &user;
+            async move {
+                let series = WireId::parse(&show.series_id)?;
+                match synth_detail(state, user, series, "person").await {
+                    Ok(dto) => Some((series, dto)),
+                    Err(_) => {
+                        tracing::warn!(series.id = %series, "person page: show named from its episodes");
+                        None
+                    }
+                }
+            }
+        }))
+        .buffered(PERSON_SHOWS_AT_ONCE)
+        .collect()
+        .await;
+        write_person(
+            results.get().init_result(),
+            id,
+            &page,
+            &shows,
+            &state.server_id,
+            &state.image_tag_key,
         );
         Ok(())
     }
@@ -1143,18 +1204,20 @@ pub(super) fn record_refusal(call: &'static str, id: WireId, reason: RefusalReas
 /// The synthesised item `id` (library view, series, season, album…) as the
 /// Jellyfin `/Items/{id}` projection, resolved by the same
 /// `synth_item_json` so the two APIs agree and apply the same access rules.
-/// A refusal is recorded and answers like an id that names nothing.
+/// A refusal is recorded under `call` and answers like an id that names
+/// nothing.
 async fn synth_detail(
     state: &AppState,
     user: &pharos_core::User,
     id: WireId,
+    call: &'static str,
 ) -> Result<serde_json::Value, Denial> {
     let item_not_found = Denial::NotFound { what: "item" };
     match crate::api::jellyfin::items::synth_item_json(state, user, &id.to_string()).await {
         Ok(Some(dto)) => Ok(dto),
         Ok(None) => {
             record_refusal(
-                "detail",
+                call,
                 id,
                 RefusalReason::NotFound,
                 "no such synthesised item",
@@ -1162,18 +1225,13 @@ async fn synth_detail(
             Err(item_not_found)
         }
         Err(e) if e.as_response_error().status_code().is_server_error() => {
-            record_refusal(
-                "detail",
-                id,
-                RefusalReason::StoreUnavailable,
-                &e.to_string(),
-            );
+            record_refusal(call, id, RefusalReason::StoreUnavailable, &e.to_string());
             Err(Denial::Unavailable {
                 dependency: "media store",
             })
         }
         Err(e) => {
-            record_refusal("detail", id, RefusalReason::SynthHidden, &e.to_string());
+            record_refusal(call, id, RefusalReason::SynthHidden, &e.to_string());
             Err(item_not_found)
         }
     }
@@ -1218,10 +1276,8 @@ async fn synth_cast(
         })
 }
 
-/// `cast` as wire credits. A person gets a photo url only when the image
-/// route passes their portrait through from this origin: the UI's CSP would
-/// block a redirect to anywhere else. The tag is the one the Jellyfin routes
-/// hand out for a person; portrait routes are not tag-checked (ADR-0073).
+/// `cast` as wire credits, each with the person's id and photo (see
+/// [`portrait_url`]).
 fn write_cast(
     mut out: capnp::struct_list::Builder<'_, credit::Owned>,
     cast: &[pharos_core::ItemPerson],
@@ -1230,19 +1286,100 @@ fn write_cast(
         let mut w = out.reborrow().get(i);
         w.set_name(p.name.as_str());
         w.set_character(p.character.as_deref().unwrap_or_default());
-        w.set_kind(match p.kind {
-            pharos_core::PersonKind::GuestStar => CreditKind::GuestStar,
-            _ => CreditKind::Actor,
-        });
-        if let Some(thumb) = p
-            .thumb_url
-            .as_deref()
-            .filter(|u| crate::portrait::is_proxied(u))
-        {
-            let tag = pharos_jellyfin_api::dto::person_image_tag_for(thumb);
-            w.set_image_url(format!("/Items/{}/Images/Primary?tag={tag}", p.wire_id).as_str());
+        w.set_kind(credit_kind(p.kind));
+        if let Some(url) = portrait_url(&p.wire_id, p.thumb_url.as_deref()) {
+            w.set_image_url(url.as_str());
+        }
+        if let Some(person) = WireId::parse(&p.wire_id) {
+            set_item_id(w.init_person_id(), person);
         }
     }
+}
+
+/// A person's photo on this origin, or `None`. Only a portrait the image route
+/// passes through from here gets one: the UI's CSP would block a redirect to
+/// anywhere else. The tag is the one the Jellyfin routes hand out for a
+/// person; portrait routes are not tag-checked (ADR-0073).
+fn portrait_url(wire_id: &str, thumb_url: Option<&str>) -> Option<String> {
+    let thumb = thumb_url.filter(|u| crate::portrait::is_proxied(u))?;
+    let tag = pharos_jellyfin_api::dto::person_image_tag_for(thumb);
+    Some(format!("/Items/{wire_id}/Images/Primary?tag={tag}"))
+}
+
+/// How many of a person's shows are projected at once: a long-running guest
+/// star can be in dozens, and each projection reads the store.
+const PERSON_SHOWS_AT_ONCE: usize = 8;
+
+fn credit_kind(kind: pharos_core::PersonKind) -> CreditKind {
+    match kind {
+        pharos_core::PersonKind::GuestStar => CreditKind::GuestStar,
+        _ => CreditKind::Actor,
+    }
+}
+
+/// `page` as the wire `Person`. `shows` holds, for each of `page.shows` in
+/// order, the show's own projection; a show that has none (withheld, or the
+/// store could not say) is named from its episodes instead.
+fn write_person(
+    out: person_result::Builder<'_>,
+    id: WireId,
+    page: &person::PersonPage,
+    shows: &[Option<(WireId, serde_json::Value)>],
+    server_id: &str,
+    key: &ImageTagKey,
+) {
+    let mut out = out.init_person();
+    set_item_id(out.reborrow().init_id(), id);
+    out.set_name(page.person.name.as_str());
+    if let Some(url) = portrait_url(&page.person.wire_id, page.person.thumb_url.as_deref()) {
+        out.set_image_url(url.as_str());
+    }
+    let mut films = out.reborrow().init_films(len(&page.films));
+    for (i, film) in (0..).zip(&page.films) {
+        write_appearance(films.reborrow().get(i), film, server_id, key);
+    }
+    let mut list = out.init_shows(len(&page.shows));
+    for (i, show) in (0..).zip(&page.shows) {
+        let mut w = list.reborrow().get(i);
+        match shows.get(i as usize).and_then(Option::as_ref) {
+            Some((series, dto)) => {
+                write_synth_summary(w.reborrow().init_series(), *series, dto, key)
+            }
+            None => {
+                let mut summary = w.reborrow().init_series();
+                if let Some(series) = WireId::parse(&show.series_id) {
+                    set_item_id(summary.reborrow().init_id(), series);
+                }
+                summary.set_kind(Kind::Series);
+                summary.set_name(show.series_name.as_str());
+            }
+        }
+        let mut characters = w.reborrow().init_characters(len(&show.characters));
+        for (j, name) in (0..).zip(&show.characters) {
+            characters.set(j, name.as_str());
+        }
+        let mut episodes = w.init_episodes(len(&show.episodes));
+        for (j, episode) in (0..).zip(&show.episodes) {
+            write_appearance(episodes.reborrow().get(j), episode, server_id, key);
+        }
+    }
+}
+
+fn write_appearance(
+    mut out: person_credit::Builder<'_>,
+    appearance: &person::Appearance,
+    server_id: &str,
+    key: &ImageTagKey,
+) {
+    write_item(
+        out.reborrow().init_item(),
+        &appearance.item,
+        appearance.user_data,
+        server_id,
+        key,
+    );
+    out.set_character(appearance.character.as_deref().unwrap_or_default());
+    out.set_kind(credit_kind(appearance.kind));
 }
 
 /// The text field `key` of a Jellyfin DTO, empty when absent.
