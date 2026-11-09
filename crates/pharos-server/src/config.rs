@@ -1114,6 +1114,26 @@ pub struct ObsConfig {
     /// their log shipper (journald-to-file, supervisor, etc.) populates.
     #[serde(default)]
     pub log_dir: Option<PathBuf>,
+    /// Where "Report a problem" documents are kept (016 FR-008). Unset, they
+    /// go under `<log_dir>/clientlog/reports`; with neither set, reports are
+    /// refused as unavailable rather than kept nowhere.
+    #[serde(default)]
+    pub report_dir: Option<PathBuf>,
+    /// Days a problem report is kept before the sweep deletes it.
+    #[serde(default = "default_report_retention_days")]
+    pub report_retention_days: u32,
+}
+
+impl ObsConfig {
+    /// The report directory in force: `report_dir`, else the clientlog area
+    /// under `log_dir`, else none.
+    pub fn resolved_report_dir(&self) -> Option<PathBuf> {
+        self.report_dir.clone().or_else(|| {
+            self.log_dir
+                .as_ref()
+                .map(|d| d.join("clientlog").join("reports"))
+        })
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -1207,6 +1227,10 @@ impl MediaConfig {
         }
         out
     }
+}
+
+fn default_report_retention_days() -> u32 {
+    crate::client_reports::DEFAULT_RETENTION_DAYS
 }
 
 fn default_sampling_ratio() -> f64 {
@@ -1947,6 +1971,23 @@ mod tests {
         assert_eq!(c.obs.log_level, "debug");
         assert_eq!(c.media.roots, vec![PathBuf::from("/srv/media")]);
         assert!(c.obs.otlp_endpoint.is_none());
+        assert_eq!(c.obs.report_retention_days, 30);
+        assert_eq!(c.obs.resolved_report_dir(), None);
+    }
+
+    #[test]
+    fn reports_default_under_the_log_dir_and_an_explicit_dir_wins() {
+        let mut c = Config::from_toml_str(SAMPLE).unwrap();
+        c.obs.log_dir = Some(PathBuf::from("/var/log/pharos"));
+        assert_eq!(
+            c.obs.resolved_report_dir(),
+            Some(PathBuf::from("/var/log/pharos/clientlog/reports"))
+        );
+        c.obs.report_dir = Some(PathBuf::from("/data/reports"));
+        assert_eq!(
+            c.obs.resolved_report_dir(),
+            Some(PathBuf::from("/data/reports"))
+        );
     }
 
     #[test]
