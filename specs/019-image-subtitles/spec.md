@@ -2,7 +2,7 @@
 
 **Feature Branch**: `feat/ui-image-subtitles`
 **Created**: 2026-11-03T18:50:00Z
-**Status**: Ready
+**Status**: Implemented (T1-T10 all done; ADR-0060; audited 2026-11-09)
 **Scope**: The native web player (`/ui/`, 013/017) draws DVD (`dvd_subtitle`), Blu-ray (`hdmv_pgs_subtitle`) and DVB (`dvb_subtitle`) image subtitles itself, over a direct-played video, instead of the server burning them into a transcode. jellyfin-web and every Jellyfin-wire client keep today's burn-in; their `SubtitleProfiles` handling is unchanged.
 
 ---
