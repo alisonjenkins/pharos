@@ -54,10 +54,10 @@ use crate::tvdb::{ReqwestTransport, TvdbEnricher};
 use pharos_cache::image_cache::ImageRole;
 use pharos_cache::ImageCache;
 use pharos_core::{
-    match_decide, ArtworkRole, DomainResult, GenreStore, LocalizedText, MatchDecidedBy,
-    MatchDecision, MatchOutcome, MediaItem, MediaKind, MediaStore, MetadataTranslationStore,
-    PersonStore, PreferenceStore, ProviderIds, SeriesMatchCandidate, SeriesMetadata,
-    SeriesMetadataStore, TranslationGap, TranslationOwner,
+    match_decide, ArtworkRole, DomainResult, GenreStore, LocalizedText, MatchDecision,
+    MatchOutcome, MediaItem, MediaKind, MediaStore, MetadataTranslationStore, PersonStore,
+    PreferenceStore, ProviderIds, SeriesMatchCandidate, SeriesMetadata, SeriesMetadataStore,
+    TranslationGap, TranslationOwner,
 };
 use pharos_scanner::metadata::nfo::ShowNfoEvidence;
 use pharos_scanner::FilenameProvider;
@@ -2330,18 +2330,8 @@ where
         cfg,
     )
     .await;
-    let fit_runner_up = if needs_episode_fit(&decision, cfg) {
-        apply_episode_fit(
-            store,
-            enricher,
-            provider,
-            bg_io,
-            cfg,
-            cand,
-            &mut decision,
-            lists,
-        )
-        .await
+    let fit_runner_up = if needs_episode_fit(&decision) {
+        apply_episode_fit(store, enricher, provider, bg_io, cand, &mut decision, lists).await
     } else {
         None
     };
@@ -2407,23 +2397,33 @@ pub(crate) const AMBIGUOUS_FLAG: &str = "ambiguous";
 /// once.
 type EpisodeLists = HashMap<(&'static str, String, Vec<u32>), Vec<EpisodeListing>>;
 
-/// The exact-name candidates over the floor, in the provider's order.
-fn exact_candidates<'a>(
-    decision: &'a MatchDecision,
-    cfg: &MetadataConfig,
-) -> Vec<&'a pharos_core::ScoredCandidate> {
-    decision
+/// The exact-name candidates scoring as the chosen one does, in the
+/// provider's order: shows of the same name that no folder or file year told
+/// apart. Empty unless the chosen candidate is one of them.
+fn exact_candidates(decision: &MatchDecision) -> Vec<&pharos_core::ScoredCandidate> {
+    let Some(chosen) = &decision.chosen else {
+        return Vec::new();
+    };
+    let tied = |c: &&pharos_core::ScoredCandidate| {
+        c.exact && (c.score - chosen.confidence).abs() <= f32::EPSILON
+    };
+    if !decision
         .candidates
         .iter()
-        .filter(|c| c.exact && c.score >= cfg.match_min_confidence)
-        .collect()
+        .filter(tied)
+        .any(|c| c.id == chosen.id)
+    {
+        return Vec::new();
+    }
+    decision.candidates.iter().filter(tied).collect()
 }
 
-/// B930 — the matcher fell back to provider order between two shows of the
-/// same exact name: no folder or file year told them apart.
-fn needs_episode_fit(decision: &MatchDecision, cfg: &MetadataConfig) -> bool {
-    decision.decided_by == Some(MatchDecidedBy::ProviderOrder)
-        && exact_candidates(decision, cfg).len() >= 2
+/// B930 — two or more shows match the name exactly and score alike, so the
+/// matcher fell back to provider order or to which of their names matched
+/// first (TVDB lists a remake as "Battlestar Galactica (2003)" with the bare
+/// name as an alias).
+fn needs_episode_fit(decision: &MatchDecision) -> bool {
+    exact_candidates(decision).len() >= 2
 }
 
 /// The show's local episodes, one per (season, episode), with the filename's
@@ -2480,7 +2480,6 @@ async fn apply_episode_fit<E, S>(
     enricher: &E,
     provider: &'static str,
     bg_io: &Arc<Semaphore>,
-    cfg: &MetadataConfig,
     cand: &SeriesMatchCandidate,
     decision: &mut MatchDecision,
     lists: &mut EpisodeLists,
@@ -2489,7 +2488,7 @@ where
     E: OnlineEnricher,
     S: pharos_core::SeriesIdentityStore,
 {
-    let exact = exact_candidates(decision, cfg);
+    let exact = exact_candidates(decision);
     let unscored = exact.len().saturating_sub(episode_fit::MAX_SCORED);
     let scored: Vec<(Candidate, f32)> = exact
         .into_iter()
@@ -5045,6 +5044,47 @@ mod tests {
             decision.contains("decided_by=\"episode_fit\""),
             "{decision}"
         );
+    }
+
+    /// B930 — TVDB titles the remake "Battlestar Galactica (2003)" with the
+    /// bare name as an alias, so the original wins on name position alone.
+    /// The episodes still decide.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_remake_matching_by_its_alias_is_decided_by_its_episodes() {
+        let s = store().await;
+        put_titled_episode(
+            &s,
+            1,
+            "/tv/Battlestar Galactica",
+            (4, 1),
+            "He That Believeth in Me",
+        )
+        .await;
+        let (_td, cache) = cache();
+        let mut tvdb = FakeEnricher::tvdb()
+            .with_detail(enriched_overview("A rag-tag fleet."))
+            .with_list("71173", &[(1, 1, "Saga of a Star World")])
+            .with_list("73545", &[(4, 1, "He That Believeth in Me")]);
+        tvdb.search = vec![
+            SearchCandidate {
+                id: "71173".into(),
+                title: "Battlestar Galactica".into(),
+                year: Some(1978),
+                aliases: Vec::new(),
+            },
+            SearchCandidate {
+                id: "73545".into(),
+                title: "Battlestar Galactica (2003)".into(),
+                year: Some(2003),
+                aliases: vec!["Battlestar Galactica".into()],
+            },
+        ];
+
+        series_pass(&s, &cache, &tvdb).await;
+
+        let row = series_row(&s, "/tv/Battlestar Galactica").await;
+        assert_eq!(row.match_external_id.as_deref(), Some("73545"));
+        assert_eq!(row.match_flag, None);
     }
 
     /// V891 — when the episodes fit both shows about as well, the best guess
