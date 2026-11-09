@@ -3694,6 +3694,9 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
     let mut picks = use_signal(|| preplay::picks_for(id, *pending.peek()));
     // A version picked in the player; until then the device's stored pick.
     let mut version_pick = use_signal(|| None::<String>);
+    // Set by a version switch: `picks` then name the primary's streams, for
+    // the next negotiation to map onto the new file.
+    let picks_in_primary = use_hook(|| Rc::new(Cell::new(false)));
     use_effect(move || pending.set(None));
     // What the connection has shown about this video, kept across the
     // reloads its own decisions cause; the cap it asks for rides the next
@@ -3815,6 +3818,7 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
     let negotiated_gen = use_hook(|| Rc::new(Cell::new(0u32)));
     let negotiated_at = Rc::clone(&negotiated_gen);
     let gap_notify = Rc::clone(&notify);
+    let carry_flag = Rc::clone(&picks_in_primary);
     let mut playing = use_resource(move || {
         connected();
         let api = ctx.api.peek().clone();
@@ -3822,6 +3826,7 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
         negotiated_at.set(grant_gen);
         let resume_from = Rc::clone(&resume_from);
         let notify = Rc::clone(&gap_notify);
+        let picks_in_primary = Rc::clone(&carry_flag);
         let started_over = Rc::clone(&started_over);
         let asked = picks();
         let picked_here = version_pick();
@@ -3880,6 +3885,15 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
                     (&detail.audio_tracks, &detail.subtitle_tracks),
                     (&primary_tracks.0, &primary_tracks.1),
                 );
+                let asked = if picks_in_primary.replace(false) {
+                    let own = track_map.choices_to_own(asked);
+                    platform::info(&format!(
+                        "pharos: version tracks carried item={id} version={version:?} primary={asked:?} own={own:?}"
+                    ));
+                    own
+                } else {
+                    asked
+                };
                 // Every start of an episode comes through here: from its
                 // title page, the next-episode button, up next and the
                 // episode turn alike.
@@ -4193,10 +4207,18 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
                         on_renegotiate: move |next| picks.set(next),
                         on_version: {
                             let (last_ms, notify) = (Rc::clone(&last_ms), Rc::clone(&notify));
+                            let picks_in_primary = Rc::clone(&picks_in_primary);
                             move |to: String| {
-                                let from = match playing.peek().as_ref() {
-                                    Some(Some(Ok(p))) => p.0.version.clone(),
-                                    _ => return,
+                                let (from, carried) = match playing.peek().as_ref() {
+                                    Some(Some(Ok(p))) => {
+                                        (p.0.version.clone(), p.0.track_map.choices_to_primary(p.0.asked()))
+                                    }
+                                    _ => {
+                                        platform::warn(&format!(
+                                            "pharos: version switch dropped item={id} to={to:?} reason=no playback"
+                                        ));
+                                        return;
+                                    }
                                 };
                                 if to == from {
                                     return;
@@ -4208,8 +4230,9 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
                                 ));
                                 store_setting(&versions::version_key(id), &to);
                                 notify("Switching version…".to_owned());
-                                // The last file's streams name nothing in this one.
-                                picks.set(TrackPicks::default());
+                                // The last file's indexes name other streams in this one.
+                                picks_in_primary.set(true);
+                                picks.set(carried);
                                 version_pick.set(Some(to));
                             }
                         },
