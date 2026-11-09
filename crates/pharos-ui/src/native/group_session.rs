@@ -792,14 +792,14 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
             .client
             .create(item, position_ms, self.sink(epoch))
             .await;
-        self.began(made)
+        self.began(epoch, made).await
     }
 
     /// Join the group `id`.
     pub async fn join(&self, id: &str) -> Result<GroupSummary, GroupError> {
         let epoch = self.prepare(None).await;
         let made = self.client.join(id, self.sink(epoch)).await;
-        self.began(made)
+        self.began(epoch, made).await
     }
 
     /// The membership was lost while the viewer is still in the group: the
@@ -840,7 +840,7 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
             self.inner.borrow_mut().active = false;
             let epoch = self.prepare(None).await;
             let made = self.client.join(&id, self.sink(epoch)).await;
-            let error = match self.began(made) {
+            let error = match self.began(epoch, made).await {
                 Ok(_) => break Ok(()),
                 Err(e) => e,
             };
@@ -944,8 +944,36 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
         epoch
     }
 
-    fn began(&self, made: Result<GroupSummary, GroupError>) -> Result<GroupSummary, GroupError> {
+    /// The answer to the call that began membership `epoch`. If the viewer
+    /// left, or began another membership, while it was in flight (B1005),
+    /// the answer is stale: it must not put them back in the group. A server
+    /// that already took the seat is told to drop it, unless a newer
+    /// membership began, whose seat that `leave` would end.
+    async fn began(
+        &self,
+        epoch: u64,
+        made: Result<GroupSummary, GroupError>,
+    ) -> Result<GroupSummary, GroupError> {
         let summary = made?;
+        let stale = {
+            let inner = self.inner.borrow();
+            // `prepare` resets `leaving`, so it is set only while no newer
+            // membership has begun.
+            (inner.epoch != epoch).then_some(inner.leaving && !inner.active)
+        };
+        if let Some(left) = stale {
+            self.env.info(&format!(
+                "pharos: group join answer superseded group={} left={left}",
+                summary.id
+            ));
+            if left {
+                if let Err(e) = self.client.leave().await {
+                    self.env
+                        .warn(&format!("pharos: leaving the group failed: {}", e.0));
+                }
+            }
+            return Err(GroupError("The join was superseded".into()));
+        }
         let epoch = {
             let mut inner = self.inner.borrow_mut();
             // An `Ended` that raced the answer leaves nothing to run.
@@ -2677,6 +2705,83 @@ mod tests {
         let view = rig.session.view();
         assert!(!view.active);
         assert_eq!(view.ended, None);
+    }
+
+    /// B1005: a join held in flight by a push to the sink, as the server's
+    /// pushes can reach a member before the answer does.
+    fn hold_join(groups: &FakeGroups) {
+        groups.push_on_join(vec![GroupUpdate::Item {
+            item: ItemRef::Real(7),
+            playlist_item_id: "pl-7".into(),
+            position_ms: 0,
+            playing: false,
+        }]);
+    }
+
+    fn poll_once<T>(f: &mut std::pin::Pin<Box<impl std::future::Future<Output = T>>>) -> bool {
+        let mut cx = std::task::Context::from_waker(futures_util::task::noop_waker_ref());
+        std::future::Future::poll(f.as_mut(), &mut cx).is_ready()
+    }
+
+    /// B1005: Leave pressed while a join is in flight finds the session not
+    /// yet active and sends nothing; the answer must not put the viewer back,
+    /// and the seat the server took is dropped. Disarm check: began ignoring
+    /// the epoch leaves the session active and sends no leave.
+    #[test]
+    fn leaving_while_a_join_is_in_flight_drops_the_seat_it_takes() {
+        let groups = FakeGroups::with_groups(vec![summary()]);
+        let session = Session::new(groups.clone(), TestEnv::default());
+        hold_join(&groups);
+        let mut joined = Box::pin(session.join("g1"));
+        assert!(!poll_once(&mut joined));
+        let _ = session.leave().now_or_never();
+        assert!(groups.calls().iter().all(|c| c != "leave"));
+        assert!(poll_once(&mut joined));
+        assert!(!session.view().active);
+        assert_eq!(groups.calls(), ["join(g1)", "leave"]);
+    }
+
+    /// B1005: the same for a rejoin, which also reads as `superseded`, not
+    /// as rejoined.
+    #[test]
+    fn leaving_while_a_rejoin_is_in_flight_drops_the_seat_it_takes() {
+        let rig = rig();
+        hold_join(&rig.groups);
+        let mut rejoined = Box::pin(rig.session.rejoin("reconnect"));
+        assert!(!poll_once(&mut rejoined));
+        let _ = rig.session.leave().now_or_never();
+        assert!(poll_once(&mut rejoined));
+        assert!(!rig.session.view().active);
+        assert_eq!(calls_with(&rig, "leave").len(), 1);
+        let logs = rig.env.logs.borrow().clone();
+        assert!(
+            logs.iter().any(|l| l.contains("cause=superseded")),
+            "{logs:#?}"
+        );
+        assert!(
+            logs.iter().all(|l| !l.contains("group rejoined")),
+            "{logs:#?}"
+        );
+    }
+
+    /// B1005: an answer to a join that a newer join replaced is ignored, and
+    /// no leave is sent: it would end the newer seat.
+    #[test]
+    fn a_join_answer_after_a_newer_join_began_is_ignored() {
+        let groups = FakeGroups::with_groups(vec![summary()]);
+        let session = Session::new(groups.clone(), TestEnv::default());
+        hold_join(&groups);
+        let mut first = Box::pin(session.join("g1"));
+        assert!(!poll_once(&mut first));
+        hold_join(&groups);
+        let mut second = Box::pin(session.join("g1"));
+        assert!(!poll_once(&mut second));
+        assert!(poll_once(&mut first));
+        assert!(groups.calls().iter().all(|c| c != "leave"));
+        assert!(!session.view().active);
+        assert!(poll_once(&mut second));
+        assert!(session.view().active);
+        assert!(groups.calls().iter().all(|c| c != "leave"));
     }
 
     #[test]
