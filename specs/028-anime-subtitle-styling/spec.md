@@ -2,7 +2,7 @@
 
 **Feature Branch**: `docs/anime-subtitle-styling-spec`
 **Created**: 2026-11-06T00:30:00Z
-**Status**: Draft
+**Status**: Slices 1-6 built on main (crates/pharos-styling, signals op, director, store, serving, Effects setting, tier drop; B601-B606); open: T028-14 (styling-report tool), T028-22 (G08 run), ADR-0067 still Proposed (audited 2026-11-09)
 **Scope**: Phases 0 and 1 of the project design "AI-generated animated anime subtitles" (`docs/design/animated-anime-subtitles.md` on branch `claude/project-thread-62gk21`; §3 effect plan and library, §8a device tiers, §10 phases), which Alison approved. For a video with an English text subtitle track, the server works out ahead of time how each line should look, from signals it already has or can read in the same pass. It then writes that as plain ASS v4+ and serves it as an extra track, "English (Pharos styled)". No machine learning is used in these phases. Clients only draw.
 **Decision record**: ADR-0067. **Backlog**: B600 (phase 0), B601-B606. **Verification**: V530, V531 (phase 0), V532-V539.
 **Depends on**: spec 026 (`pharos-subs`, its ASS parser on main; its renderer will draw this output once slice 3 lands), ADR-0057 (JASSUB draws it until then), 024's `audio_analysis` job pattern, T86 media segments.
