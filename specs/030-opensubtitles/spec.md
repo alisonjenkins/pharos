@@ -2,7 +2,7 @@
 
 **Feature Branch**: `feat/opensubtitles-provider`
 **Created**: 2026-11-07T00:00:00Z
-**Status**: Slices 1 and 2 landed
+**Status**: Implemented — slices 1 and 2 landed (#925); T030-01..10 all done (audited 2026-11-09)
 **Scope**: Search OpenSubtitles.com for subtitles from the Jellyfin "Search for subtitles" dialog, download the chosen one to the cache volume, and (slice 2) fetch missing subtitles in the background after a scan.
 **Decision record**: ADR-0069. **Task**: T76 (the two RemoteSearch endpoints, today stubs). **Verification**: V562-V571.
 **Depends on**: `SubtitleCache` and the cache PVC conventions (`[server].subtitle_cache_dir`), `discover_sidecars` (external subtitle streams), the TMDB/TVDB secret handling in `config.rs`.
