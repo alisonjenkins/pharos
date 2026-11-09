@@ -5414,8 +5414,13 @@ fn Player(
             if let Some(next) = up_next_to.get() {
                 let total = total_ms(&state, p.detail.item.runtime_ms);
                 let from = up_next_at(&p.detail.segments, total);
+                // Leaving the group (no entry) keeps this player's Cancel.
                 let entry = session().map(|s| s.playlist_item_id()).unwrap_or_default();
-                let was = up_next_entry.replace(entry.clone());
+                let was = if entry.is_empty() {
+                    String::new()
+                } else {
+                    up_next_entry.replace(entry.clone())
+                };
                 if !was.is_empty() && was != entry {
                     platform::info(&format!(
                         "pharos: up next: reset reason=group_entry from={was} to={entry}"

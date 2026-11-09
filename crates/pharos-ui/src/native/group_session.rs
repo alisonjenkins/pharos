@@ -1811,6 +1811,11 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
             return false;
         }
         let playlist_item_id = self.inner.borrow().state.playlist_item_id.clone();
+        // Before the group's item arrives the server would hold whatever it
+        // plays, not the entry this viewer cancelled on.
+        if playlist_item_id.is_empty() {
+            return false;
+        }
         let client = self.client.clone();
         self.command(format!("hold_next({playlist_item_id})"), async move {
             client.hold_next(playlist_item_id).await
@@ -4501,6 +4506,10 @@ mod tests {
     #[test]
     fn a_cancelled_up_next_holds_the_end_for_the_group() {
         let rig = rig();
+        assert!(
+            !rig.session.hold_next(),
+            "no entry yet: the cancel stays here"
+        );
         on_entry(&rig, 7, "pl-7");
         assert!(!rig.session.next_held());
         assert!(rig.session.hold_next());
