@@ -2,7 +2,7 @@
 
 **Feature Branch**: `feat/rust-hls-engine`
 **Created**: 2026-11-07T23:10:00Z
-**Status**: Draft
+**Status**: Slices 1-4 and telemetry built on main (opt-in per-device engine, hls.js stays default; #951, #960, #966, #969, #973, #975, #977, #988); open: slice 0 baseline (T031-01..03), T031-12 wasm size CI, T031-13 e2e, T031-16 MediaSource rebuild for the Rust engine, T031-23 disarm, T031-43..45, slice 5 flip (ADR-0071 still Proposed). Audited 2026-11-09
 **Scope**: The native web UI (`/ui/`, 013/017) and the Android TV WebView (025) play HLS through a Pharos-owned engine: a pure-Rust crate, `pharos-hls`, driven by a Media Source Extensions adapter in `pharos-ui`. It sits behind the existing `PlaybackEngine` trait and a per-device setting; the vendored hls.js (ADR-0035) stays the default and the fallback until this spec's parity table and budgets are met. Safari's native HLS, direct play and jellyfin-web are unchanged.
 **Decision record**: ADR-0071. **Bugs reserved**: B680-B699, B751-B760 (slice 3 recovery). **Verification**: V630-V649, V701-V710 (slice 3 recovery).
 
