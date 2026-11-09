@@ -4480,7 +4480,10 @@ pub fn audio_tap(media_id: &str) -> Result<Box<dyn super::visualiser::AudioTap>,
     let origin = web_sys::window()
         .and_then(|w| w.location().origin().ok())
         .unwrap_or_default();
-    super::resume::routable(&src, &origin)?;
+    // A source fetched with CORS (the TV app's songs, B1032) can be analysed
+    // from another origin; one fetched without it reads as silence.
+    let cors = media.cross_origin().as_deref() == Some("anonymous");
+    super::resume::routable(&src, &origin, cors)?;
     let js = |e: JsValue| format!("{e:?}");
     let context = web_sys::AudioContext::new().map_err(js)?;
     let source = context.create_media_element_source(&media).map_err(js)?;
