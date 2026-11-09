@@ -58,12 +58,13 @@ pub trait Checker: Send + Sync {
     fn check(
         &self,
         path: PathBuf,
+        duration_ms: u64,
     ) -> impl std::future::Future<Output = Result<PictureAnalysis, PoolError>> + Send;
 }
 
 impl Checker for LibavWorkerPool {
-    async fn check(&self, path: PathBuf) -> Result<PictureAnalysis, PoolError> {
-        self.picture_check(path).await
+    async fn check(&self, path: PathBuf, duration_ms: u64) -> Result<PictureAnalysis, PoolError> {
+        self.picture_check(path, duration_ms).await
     }
 }
 
@@ -258,7 +259,9 @@ pub async fn run_pass<S: MediaStore, C: Checker>(
         // Hold the gate for the decode only.
         let result = {
             let _permit = BgPermit::acquire(bg_io).await;
-            checker.check(it.path.clone()).await
+            checker
+                .check(it.path.clone(), it.probe.duration_ms.unwrap_or(0))
+                .await
         };
         let elapsed = started.elapsed();
         let (stored, outcome) = verdict(&result);
@@ -366,7 +369,7 @@ mod tests {
     }
 
     impl Checker for Fake {
-        async fn check(&self, path: PathBuf) -> Result<PictureAnalysis, PoolError> {
+        async fn check(&self, path: PathBuf, _: u64) -> Result<PictureAnalysis, PoolError> {
             let name = path.file_name().unwrap().to_string_lossy().into_owned();
             self.calls.lock().unwrap().push(name.clone());
             match self.script.get(&name) {
