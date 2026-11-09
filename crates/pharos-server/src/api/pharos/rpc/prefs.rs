@@ -27,11 +27,20 @@ pub(super) const DESCRIPTION_LANGUAGE: &str = "description.language";
 /// Absent means the user has seen none.
 pub(super) const WHATS_NEW_SEEN: &str = "whats_new.seen";
 
+/// The user's saved mixes (spec 024, B898): one capnp `SavedMixes` message
+/// the client writes whole. Must match `pharos_client::mix::SAVED_KEY`.
+pub(super) const MIX_SAVED: &str = "mix.saved";
+
 /// Digits a [`WHATS_NEW_SEEN`] value may hold: room for a u32 counter.
 const MAX_WHATS_NEW_DIGITS: usize = 9;
 
 /// Keys a client may read and write; any other key is refused.
-const ALLOWED_KEYS: &[&str] = &[DIAGNOSTICS_OPT_IN, DESCRIPTION_LANGUAGE, WHATS_NEW_SEEN];
+const ALLOWED_KEYS: &[&str] = &[
+    DIAGNOSTICS_OPT_IN,
+    DESCRIPTION_LANGUAGE,
+    WHATS_NEW_SEEN,
+    MIX_SAVED,
+];
 
 /// Largest value one pref may hold: a toggle or a small settings document,
 /// never a blob, and a bound on what one user can make the database keep.

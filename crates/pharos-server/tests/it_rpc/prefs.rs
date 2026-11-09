@@ -258,3 +258,24 @@ async fn whats_new_seen_holds_only_an_entry_number() {
         "{text}"
     );
 }
+
+/// B898: the saved-mix list the native UI writes under the client's own
+/// key is stored and read back whole. Disarm check: with `MIX_SAVED` taken
+/// off `ALLOWED_KEYS`, `set` is refused as an unknown key and this fails.
+#[actix_web::test]
+async fn saved_mixes_are_kept_under_the_clients_key() {
+    use pharos_client::mix::{decode_saved, encode_saved, presets, SAVED_KEY};
+    let fx = seed_rich().await;
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let prefs = prefs_for(&fx, &fx.user_token).await;
+            let mixes = presets();
+            let bytes = encode_saved(&mixes);
+            set(&prefs, SAVED_KEY, &bytes).await.expect("stored");
+            let Got::Value(back) = get(&prefs, SAVED_KEY).await else {
+                panic!("saved mixes not read back");
+            };
+            assert_eq!(decode_saved(&back).expect("decodes"), mixes);
+        })
+        .await;
+}
