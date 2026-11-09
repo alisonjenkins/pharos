@@ -1,6 +1,6 @@
 # 008-remote-sources — play a URL as if it were a library file
 
-**Status**: designed 2026-08-01; implemented and merged 2026-08-01; no live verification against a real site is recorded
+**Status**: designed 2026-08-01; implemented and merged 2026-08-01 (da7b458e..01d1c301; hardened 7e800e8e, 5a69d09a 2026-11-02); no live verification against a real site is recorded; the "spec 009" UI follow-up was never written (009 is ui-foundation; a `views/remote.rs` exists in pharos-ui)
 **Depends on**: 007 (`pharos_cache::generation()` and the client-visible `g=`,
 whose limits this spec has to work around), the HLS transcode path generally.
 **New ids**: V132–, B179–.
