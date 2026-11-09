@@ -648,6 +648,9 @@ fn AdminPane(access_token: String, server_base: String, current_user_id: String)
     let deep_errors = use_signal::<Vec<(String, String)>>(Vec::new);
     // Bumped by the poll below to re-load the tab while a deep check is in progress.
     let integrity_tick = use_signal(|| 0u32);
+    // Identifies the one pending poll timer; every load supersedes the last,
+    // so reloads and clicks never stack timer chains.
+    let integrity_poll_gen = use_signal(|| 0u32);
     // Reads every file's verdict, so it runs only while its tab is open.
     let integrity_resource = {
         let base = server_base.clone();
@@ -656,6 +659,7 @@ fn AdminPane(access_token: String, server_base: String, current_user_id: String)
         let mut queued_signal = integrity_queued;
         let mut deep_queued_signal = deep_queued;
         let mut tick_signal = integrity_tick;
+        let mut poll_gen_signal = integrity_poll_gen;
         use_resource(move || {
             let _bust = reload_signal.read();
             let _tick = tick_signal.read();
@@ -663,6 +667,8 @@ fn AdminPane(access_token: String, server_base: String, current_user_id: String)
             let base = base.clone();
             let token = token.clone();
             async move {
+                let generation = poll_gen_signal.peek().wrapping_add(1);
+                poll_gen_signal.set(generation);
                 if open {
                     let report = fetch_integrity_report(&base, &token).await;
                     // The server now says which rows are pending; holding the
@@ -672,12 +678,14 @@ fn AdminPane(access_token: String, server_base: String, current_user_id: String)
                         deep_queued_signal.set(Vec::new());
                     }
                     // Closing the tab re-runs this resource with `open` false,
-                    // which ends the loop; so does nothing being in progress.
+                    // which supersedes the timer; so does nothing being in progress.
                     if crate::views::admin::deep_poll_wanted(&report) {
                         spawn(async move {
                             sleep_ms(DEEP_CHECK_POLL_MS).await;
-                            let n = *tick_signal.peek();
-                            tick_signal.set(n.wrapping_add(1));
+                            if crate::views::admin::poll_due(generation, *poll_gen_signal.peek()) {
+                                let n = *tick_signal.peek();
+                                tick_signal.set(n.wrapping_add(1));
+                            }
                         });
                     }
                     Some(report)
