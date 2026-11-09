@@ -1944,6 +1944,9 @@ pub(crate) enum RepairReason {
     OtherShow,
     /// The episode aired outside its show's run.
     OutsideRun,
+    /// B986 — the matched show's whole run is shorter than the show's local
+    /// seasons could span: a miniseries matched for a series.
+    RunTooShort,
     /// The unyeared file's episode title is a same-named show's of another
     /// year, so it splits off (V893).
     EpisodeTitles,
@@ -1957,6 +1960,7 @@ impl RepairReason {
             Self::Split => "split",
             Self::OtherShow => "other_show",
             Self::OutsideRun => "outside_run",
+            Self::RunTooShort => "run_too_short",
             Self::EpisodeTitles => "episode_titles",
         }
     }
@@ -2021,6 +2025,7 @@ impl Survey {
                 RepairReason::Split,
                 RepairReason::OtherShow,
                 RepairReason::OutsideRun,
+                RepairReason::RunTooShort,
                 RepairReason::EpisodeTitles,
             ] {
                 let n = counts.get(&(kind, reason)).copied().unwrap_or(0);
@@ -2143,6 +2148,27 @@ where
                 _ => (None, None),
             };
             window = run_window(listing.iter().flatten().filter_map(|l| l.aired), series_run);
+            let too_short = m.match_source.as_deref() == Some("search")
+                && window.is_some_and(|w| run_too_short(w, &rows));
+            if too_short && !survey.reask.contains_key(&cand.series_key) {
+                tracing::info!(
+                    series_key = %cand.series_key,
+                    provider,
+                    match_id = show_id,
+                    reason = RepairReason::RunTooShort.label(),
+                    run_first = window.map(|(first, _)| first),
+                    run_last = window.and_then(|(_, last)| last),
+                    seasons = regular_seasons(&rows),
+                    candidates = "",
+                    "series identity repair: re-ask"
+                );
+                survey
+                    .reask
+                    .insert(cand.series_key.clone(), RepairReason::RunTooShort);
+            }
+            // A re-asked show's episodes wait for its new match: the pin's
+            // run is no measure of them (B986).
+            let window = window.filter(|_| !too_short);
             if let Some((first, last)) = window {
                 let mut agreed: Vec<&str> = Vec::new();
                 for row in &rows {
@@ -2194,6 +2220,27 @@ where
 /// hold it until their next probe.
 fn aired(row: &pharos_core::SeriesEpisodeRow) -> Option<i64> {
     row.premiere_date.filter(|&d| d != 0)
+}
+
+/// B986 — a run this short is one event (a film, a miniseries, a special),
+/// never a show with seasons apart.
+const SHORT_RUN_SECS: i64 = 30 * 86_400;
+
+/// The show's distinct local seasons, specials (season 0) aside.
+fn regular_seasons(rows: &[pharos_core::SeriesEpisodeRow]) -> usize {
+    rows.iter()
+        .filter_map(|r| r.season.filter(|&s| s > 0))
+        .collect::<std::collections::BTreeSet<_>>()
+        .len()
+}
+
+/// B986 — whether a show with two or more local seasons is matched to a show
+/// that ran under [`SHORT_RUN_SECS`] from first to last air date.
+fn run_too_short(
+    (first, last): (i64, Option<i64>),
+    rows: &[pharos_core::SeriesEpisodeRow],
+) -> bool {
+    last.is_some_and(|last| last - first < SHORT_RUN_SECS) && regular_seasons(rows) >= 2
 }
 
 /// B985 — whether the episode title the file names is the one stored for
@@ -7030,6 +7077,59 @@ mod tests {
             .find(|l| l.contains("outside the run, titles agree"))
             .unwrap_or_else(|| panic!("no titles-agree line in {text}"));
         assert!(line.contains("episodes=1"), "{line}");
+    }
+
+    /// B986 — a four-season show matched to its pilot miniseries (a run of
+    /// two days) is re-asked as `run_too_short`, and its episodes are not
+    /// selected against the miniseries meanwhile; a one-season show on a
+    /// short run is left alone.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_series_matched_to_a_miniseries_is_re_asked() {
+        use crate::online_enrich::SeriesRun;
+        let s = store().await;
+        const BSG03: &str = "/tv/Battlestar Galactica (2003)";
+        const MINI: &str = "/tv/Band of Brothers";
+        let mut id = 0;
+        for season in 1..=4 {
+            id += 1;
+            put_titled_episode(&s, id, BSG03, (season, 1), "Sometimes a Great Notion").await;
+            let mut item = s.get(id).await.unwrap();
+            item.title = "Night 1".into();
+            // 2005-01-14 onwards, a season a year.
+            item.metadata.premiere_date = Some(1_105_660_800 + i64::from(season) * 31_536_000);
+            s.put(item).await.unwrap();
+        }
+        put_titled_episode(&s, 9, MINI, (1, 1), "Currahee").await;
+        pin(&s, BSG03, "71365", NOW).await;
+        pin(&s, MINI, "74205", NOW).await;
+        let night = |first: i64, last: i64| SeriesRun {
+            first: Some(first),
+            last: Some(last),
+            ongoing: false,
+        };
+        let tvdb = FakeEnricher::tvdb()
+            // 2003-12-08 .. 2003-12-09
+            .with_aired_list("71365", &[(1, 1, 1_070_841_600), (1, 2, 1_070_928_000)])
+            .with_run("71365", night(1_070_841_600, 1_070_928_000))
+            .with_aired_list("74205", &[(1, 1, 1_000_598_400)])
+            .with_run("74205", night(1_000_598_400, 1_003_622_400));
+        let providers = SeriesProviders::<FakeEnricher, FakeEnricher> {
+            tvdb: Some(&tvdb),
+            tmdb: None,
+        };
+
+        let survey = survey_series_identity(&s, &providers, &sem(4), &MetadataConfig::default())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            survey.reask.get(BSG03),
+            Some(&RepairReason::RunTooShort),
+            "{:?}",
+            survey.reask
+        );
+        assert!(!survey.reask.contains_key(MINI), "{:?}", survey.reask);
+        assert_eq!(survey.episodes, []);
     }
 
     /// A dry run surveys again when the survey revision moved under the same
