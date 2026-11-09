@@ -65,23 +65,35 @@ are ready.
    per-device default (Decision 5) and the remembered choice in
    `localStorage`. Guards: Dioxus render tests; a Playwright case over a
    seeded half-SBS fixture.
-3. **Flat-screen eye crop (US2)**, about 1 day. `native/stereo.rs`
-   (`eye_rect` with unit tests over all five formats, V292); the watch page
-   wraps the `<video>` in a clipping box sized by `eye_rect`; "Both eyes"
-   toggle; text tracks set to `hidden` and their active cues drawn in an
-   overlay while cropped. B350 and V290 land in the baseline here. Guard: the
-   V290 Playwright case measuring the picture's aspect, and a cue-position
-   check.
-4. **WebXR stereo (US3)**, about 1.5 days. ADR for WebXR (its own commit);
-   web-sys XR bindings, which need `--cfg=web_sys_unstable_apis` in the
-   flake's and dx's RUSTFLAGS; "Watch in VR" button shown after
-   `isSessionSupported("immersive-vr")`; `requestSession` called inside the
-   click handler with nothing awaited first (user activation); layers path
-   via `XRMediaBinding`, fallback quad per eye through `render/`; controller
-   select toggles play, squeeze leaves; telemetry events. Guards: unit tests
-   of the layout mapping and the fallback's per-eye UV rects; a Playwright
-   check that the button is absent without WebXR; a manual Quest check
-   recorded in the PR.
+3. **Flat-screen eye crop (US2, FR-005, FR-010, FR-011, FR-013)**, about 1
+   day. Amended 2026-11-09 with the spec's ids. `native/stereo.rs` gains
+   `Eye` geometry (V921: the eye's rect in the frame and its picture size,
+   unit-tested over all five packings) and `ViewMode` (`OneEye` default,
+   `BothEyes`, stored under `pharos.player.stereo`, V922). The watch page sets
+   `data-stereo` and `--pharos-eye-aspect` on `.pharos-video-frame`; pharos.css
+   lays the `<video>` at the eye's contained box and stretches and clips it
+   (spec Decision 6), so the DOM is unchanged. Geometry readers switched to
+   the eye: `subs_web.rs` content box, `cue_box_for`, image subtitles, the
+   episode turn snapshot (B961). A "3D: one eye / both eyes" row in the
+   player's settings menu. The spec amendment and baseline rows (B960, B961,
+   V920 to V922) land here. Guards: unit tests; the V920 Playwright case over
+   seeded half-SBS and full-SBS fixtures measuring the drawn picture.
+4. **WebXR stereo (US3, FR-007, FR-008, V923)**, about 1.5 days. ADR 0088
+   (its own commit); a `wasm_bindgen` extern block for `navigator.xr`,
+   `XRSession`, `XRMediaBinding` and `XRWebGLBinding` (spec Decision 7);
+   "Watch in VR" shown after `isSessionSupported("immersive-vr")`;
+   `requestSession` called inside the click handler with nothing awaited
+   first (user activation); layers path via `XRMediaBinding.createQuadLayer`
+   with the layout from the eye function, fallback quad per eye through
+   `render/`; controller select toggles play, squeeze leaves; telemetry
+   events. Guards: unit tests of the layout mapping and the fallback's per-eye
+   UV rects; a Playwright check that the button is absent without WebXR; a
+   manual Quest check, with exact steps, recorded in the PR.
+5. **Android TV (US4, FR-012)**, about half a day, after #1002 merges. The
+   TV shares the watch page, so the crop should need no TV code; this PR
+   checks it on the G08 (dropped frames against the 2D version), adds the
+   mode row to the TV's settings if the shared menu does not reach it, and
+   records the result in the spec.
 
 ## Signals
 
@@ -96,9 +108,13 @@ are ready.
 
 ## Risks
 
-- **WebXR bindings are unstable in web-sys.** The cfg flag applies to the whole
-  crate graph. If it breaks other crates, the XR calls go through a small
-  `wasm_bindgen` extern block instead.
+- **WebXR bindings are unstable in web-sys.** Settled 2026-11-09: a small
+  `wasm_bindgen` extern block, no cfg flag (spec Decision 7).
+- **JASSUB with a full packing**: JASSUB fits its canvas to the element's
+  box and the frame's `videoWidth`/`videoHeight`. For half packings that is
+  the eye; for full SBS or TAB it is half the eye's height or width. Fixed by
+  passing the eye size if JASSUB takes one, else noted as a known gap (ASS in
+  a full-packed 3D rip is rare).
 - **Steam Frame support is unknown** (spec Decision 4); feature detection
   keeps it safe either way.
 - **Schema collisions** with #596 and 020: settled by rebasing PR 1 last
