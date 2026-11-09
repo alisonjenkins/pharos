@@ -187,6 +187,7 @@ mod tests {
             season: s,
             episode: e,
             title: Some(title.into()),
+            aired: None,
         }
     }
 

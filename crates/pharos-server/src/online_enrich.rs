@@ -104,6 +104,8 @@ pub struct EpisodeListing {
     pub season: u32,
     pub episode: u32,
     pub title: Option<String>,
+    /// First aired, unix seconds at UTC midnight: bounds the show's run.
+    pub aired: Option<i64>,
 }
 
 /// A single online metadata/artwork provider (TMDB, TVDB, ...). The
