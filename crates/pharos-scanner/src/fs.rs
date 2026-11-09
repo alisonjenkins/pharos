@@ -2765,7 +2765,7 @@ fn song_copy_key(path: &Path) -> Option<CopyBucket> {
         return None;
     }
     let ext = path.extension()?.to_str()?.to_ascii_lowercase();
-    if !SONG_EXTENSIONS.contains(&ext.as_str()) {
+    if !SONG_EXTENSIONS.contains(&ext.as_str()) || is_theme_sidecar(path) {
         return None;
     }
     let stem = fold_release_name(path.file_stem()?.to_str()?);
@@ -2782,6 +2782,23 @@ fn song_copy_key(path: &Path) -> Option<CopyBucket> {
         .collect();
     folders.first().filter(|album| !album.is_empty())?;
     (!stem.is_empty()).then_some(CopyBucket::Song { folders, stem })
+}
+
+/// A show's or film's theme song (`theme.mp3`, or a file under
+/// `theme-music/`): it belongs to the title folder it sits in, and two
+/// shows of one name (`The Flash`, `The Flash (2014)`) are not copies.
+fn is_theme_sidecar(path: &Path) -> bool {
+    let named = |p: &Path, n: &str| {
+        p.file_stem()
+            .and_then(|s| s.to_str())
+            .is_some_and(|s| s.eq_ignore_ascii_case(n))
+    };
+    named(path, "theme")
+        || path.ancestors().skip(1).any(|p| {
+            p.file_name()
+                .and_then(|s| s.to_str())
+                .is_some_and(|s| s.eq_ignore_ascii_case("theme-music"))
+        })
 }
 
 /// `(show folder, season, first episode, last episode)` for an episode file
@@ -7727,6 +7744,20 @@ mod tests {
             song_copy_key(Path::new("/m/a/album (320 kbps)/01_intro [web].flac")),
         );
         assert_ne!(song_copy_key(Path::new("/m/A/Album/01 Intro.flac")), None);
+    }
+
+    /// A theme song belongs to its title folder: two shows of one name are
+    /// not copies of each other (`The Flash`, `The Flash (2014)`).
+    #[test]
+    fn a_theme_song_is_never_a_copy() {
+        let groups = group_editions(vec![
+            PathBuf::from("/tv/The Flash/theme.mp3"),
+            PathBuf::from("/tv/The Flash (2014)/theme.mp3"),
+            PathBuf::from("/tv/Cosmos/theme-music/Main Title.mp3"),
+            PathBuf::from("/tv/Cosmos (2014)/theme-music/Main Title.mp3"),
+        ]);
+        assert_eq!(groups.len(), 4, "{groups:?}");
+        assert!(groups.iter().all(|(_, alts)| alts.is_empty()));
     }
 
     /// A song has no picture, so its copies never send the scan to the store
