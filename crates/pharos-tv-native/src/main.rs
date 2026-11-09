@@ -22,6 +22,8 @@ mod net;
 // Pure, so it builds and is tested on the host too.
 #[cfg_attr(not(target_os = "android"), allow(dead_code))]
 mod feeder;
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+mod ts;
 #[cfg(target_os = "android")]
 mod video;
 mod screens;
