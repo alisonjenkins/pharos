@@ -14,6 +14,10 @@
 //! bounded `Semaphore` caps concurrent in-flight ops (and thus live
 //! workers). On any channel error / EOF / timeout the worker is dropped
 //! (its `Child` has `kill_on_drop`) rather than returned to the idle set.
+//!
+//! A worker left idle for the pool's idle timeout is shut down (ADR-0085,
+//! B913); the next op spawns a fresh one. Every spawn and exit is counted in
+//! `pharos_libav_worker_lifecycle_total{event,reason}`.
 
 use crate::protocol::{
     read_frame, write_frame, JobId, TinyOp, WorkerCmd, WorkerError, WorkerEvent,
@@ -21,12 +25,13 @@ use crate::protocol::{
 use crate::worker::proc::spawn_worker_proc;
 use pharos_core::ProbeInfo;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::process::Child;
 use tokio::sync::{Mutex, Semaphore};
+use tokio::time::Instant;
 
 const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Tiny ops are bounded work (decode a header / one frame / a few seconds
@@ -39,6 +44,15 @@ const DEFAULT_OP_TIMEOUT: Duration = Duration::from_secs(60);
 /// wall-clock ceiling, sized to still catch a genuinely hung decode.
 const DEFAULT_HEAVY_OP_TIMEOUT: Duration = Duration::from_secs(900);
 const DEFAULT_MAX_WORKERS: usize = 4;
+/// How long a resident worker may sit idle before it is shut down (V874).
+/// Scans and sweeps issue ops back to back, so they keep their workers;
+/// a lone request after a minute of quiet pays one spawn (~32 ms).
+pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+/// Overrides [`DEFAULT_IDLE_TIMEOUT`] for pools built by
+/// [`LibavWorkerPool::with_discovered_bin`]; `0` keeps workers resident.
+pub const IDLE_TIMEOUT_ENV: &str = "PHAROS_LIBAV_WORKER_IDLE_SECS";
+/// Time an idle worker gets to read `Shutdown` before it is killed.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
 
 /// A worker spawning or leaving the pool, as the `event` and `reason`
 /// labels of `pharos_libav_worker_lifecycle_total`.
@@ -87,6 +101,28 @@ fn record(ev: Lifecycle) {
         "reason" => ev.reason(),
     )
     .increment(1);
+}
+
+/// The idle timeout for discovered pools: `IDLE_TIMEOUT_ENV` if it parses,
+/// else the default. `None` keeps workers resident.
+fn idle_timeout_from(raw: Option<&str>) -> Option<Duration> {
+    let Some(raw) = raw else {
+        return Some(DEFAULT_IDLE_TIMEOUT);
+    };
+    match raw.trim().parse::<u64>() {
+        Ok(0) => None,
+        Ok(secs) => Some(Duration::from_secs(secs)),
+        Err(e) => {
+            tracing::warn!(
+                env = IDLE_TIMEOUT_ENV,
+                value = raw,
+                error = %e,
+                default_s = DEFAULT_IDLE_TIMEOUT.as_secs(),
+                "libav worker idle timeout unparseable; using the default"
+            );
+            Some(DEFAULT_IDLE_TIMEOUT)
+        }
+    }
 }
 
 /// Short label for logs.
@@ -153,6 +189,8 @@ struct PooledWorker {
     wr: OwnedWriteHalf,
     // Kept for `kill_on_drop`: dropping the worker reaps the child.
     _child: Child,
+    /// When it last went back to the idle set.
+    idle_since: Instant,
 }
 
 #[derive(Debug)]
@@ -161,9 +199,13 @@ struct Inner {
     handshake_timeout: Duration,
     op_timeout: Duration,
     heavy_op_timeout: Duration,
+    /// Most recently used last, so the oldest age out first.
     idle: Mutex<Vec<PooledWorker>>,
     permits: Semaphore,
     next_job: AtomicU64,
+    idle_timeout: Option<Duration>,
+    /// Set while a reaper task is watching `idle`; cleared under its lock.
+    reaper_running: AtomicBool,
 }
 
 /// A cheap-to-clone handle to the resident libav-worker pool.
@@ -187,6 +229,8 @@ impl LibavWorkerPool {
                 idle: Mutex::new(Vec::new()),
                 permits: Semaphore::new(max),
                 next_job: AtomicU64::new(1),
+                idle_timeout: None,
+                reaper_running: AtomicBool::new(false),
             }),
         }
     }
@@ -198,7 +242,22 @@ impl LibavWorkerPool {
         let max = std::thread::available_parallelism()
             .map(|n| n.get().min(8))
             .unwrap_or(DEFAULT_MAX_WORKERS);
-        Self::new(bin, max)
+        let idle = idle_timeout_from(std::env::var(IDLE_TIMEOUT_ENV).ok().as_deref());
+        Self::new(bin, max).with_idle_timeout(idle)
+    }
+
+    /// Shut down workers idle for `d` (`None`: keep them resident). Only
+    /// effective before the pool is cloned.
+    pub fn with_idle_timeout(mut self, d: Option<Duration>) -> Self {
+        if let Some(inner) = Arc::get_mut(&mut self.inner) {
+            inner.idle_timeout = d;
+        }
+        self
+    }
+
+    /// Workers resident and idle right now.
+    pub async fn idle_workers(&self) -> usize {
+        self.inner.idle.lock().await.len()
     }
 
     /// Override the per-op timeout. Only effective before the pool is
@@ -583,7 +642,9 @@ impl LibavWorkerPool {
         match self.exchange(&mut worker, job_id, op, op_timeout).await {
             Ok(ev) => {
                 // Healthy → reuse.
+                worker.idle_since = Instant::now();
                 self.inner.idle.lock().await.push(worker);
+                self.ensure_reaper();
                 match ev {
                     WorkerEvent::Failed { error, .. } => Err(PoolError::Op(error)),
                     other => Ok(other),
@@ -622,7 +683,19 @@ impl LibavWorkerPool {
             rd,
             wr,
             _child: child,
+            idle_since: Instant::now(),
         })
+    }
+
+    /// Start the reaper if the pool has an idle timeout and none is running.
+    fn ensure_reaper(&self) {
+        let Some(timeout) = self.inner.idle_timeout else {
+            return;
+        };
+        if self.inner.reaper_running.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        tokio::spawn(reap_idle(Arc::downgrade(&self.inner), timeout));
     }
 
     /// Send the op and read frames until the terminal reply for `job_id`,
@@ -676,6 +749,46 @@ impl LibavWorkerPool {
     }
 }
 
+/// Shut down workers idle for `timeout`, sleeping until the oldest one is
+/// due. Ends when the idle set is empty (the next return restarts it) or the
+/// pool is gone.
+async fn reap_idle(pool: Weak<Inner>, timeout: Duration) {
+    loop {
+        let Some(inner) = pool.upgrade() else {
+            return;
+        };
+        let (expired, next_due) = {
+            let mut idle = inner.idle.lock().await;
+            let now = Instant::now();
+            let (expired, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut *idle)
+                .into_iter()
+                .partition(|w| now.duration_since(w.idle_since) >= timeout);
+            *idle = kept;
+            let next_due = idle.iter().map(|w| w.idle_since + timeout).min();
+            if next_due.is_none() {
+                inner.reaper_running.store(false, Ordering::Release);
+            }
+            (expired, next_due)
+        };
+        drop(inner);
+        for mut w in expired {
+            let _ =
+                tokio::time::timeout(SHUTDOWN_GRACE, write_frame(&mut w.wr, &WorkerCmd::Shutdown))
+                    .await;
+            drop(w);
+            record(Lifecycle::ReapedIdle);
+            tracing::debug!(
+                idle_s = timeout.as_secs(),
+                "libav worker shut down after idle timeout"
+            );
+        }
+        match next_due {
+            Some(at) => tokio::time::sleep_until(at).await,
+            None => return,
+        }
+    }
+}
+
 fn expect_done(ev: WorkerEvent) -> Result<u64, PoolError> {
     match ev {
         WorkerEvent::Done { out_bytes, .. } => Ok(out_bytes),
@@ -698,5 +811,16 @@ mod tests {
             .map(|l| (l.event(), l.reason()))
             .collect();
         assert_eq!(pairs.len(), Lifecycle::ALL.len());
+    }
+
+    #[test]
+    fn idle_timeout_defaults_and_zero_keeps_workers() {
+        assert_eq!(idle_timeout_from(None), Some(DEFAULT_IDLE_TIMEOUT));
+        assert_eq!(idle_timeout_from(Some("0")), None);
+        assert_eq!(
+            idle_timeout_from(Some(" 300 ")),
+            Some(Duration::from_secs(300))
+        );
+        assert_eq!(idle_timeout_from(Some("soon")), Some(DEFAULT_IDLE_TIMEOUT));
     }
 }
