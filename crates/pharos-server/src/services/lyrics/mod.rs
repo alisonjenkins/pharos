@@ -450,9 +450,17 @@ pub async fn for_item(
                 .unwrap_or(align::Lookup::Unavailable);
             match lookup {
                 align::Lookup::Ready(aligned) => {
-                    for (line, new_words) in lyrics.lines.iter_mut().zip(aligned) {
+                    // The aligner moved the song's lines onto the singing
+                    // (B936) before it found the words, so the lines move
+                    // with them, enhanced-LRC word times included.
+                    for (line, new_words) in lyrics.lines.iter_mut().zip(aligned.lines.iter()) {
+                        line.start_ms = line.start_ms.map(|ms| aligned.shift(ms));
                         if line.words.is_empty() {
-                            line.words = new_words;
+                            line.words.clone_from(new_words);
+                        } else {
+                            for w in &mut line.words {
+                                w.start_ms = aligned.shift(w.start_ms);
+                            }
                         }
                     }
                 }
