@@ -4,7 +4,7 @@
 
 ## Slice 0 - Baseline (measurements only, no player change)
 
-- [ ] T031-01 Corpus: record master, media playlists, init and first media segments for an H.264 CMAF film, a VP9 film and an audio-only item from a dev server into `crates/pharos-hls/tests/corpus/` (small clips only, under 2 MB in all).
+- [ ] T031-01 Corpus: record master, media playlists, init and first media segments for an H.264 CMAF film, a VP9 film and an audio-only item from a dev server into `crates/pharos-hls/tests/corpus/` (small clips only, under 2 MB in all). (audited 2026-11-09: no `crates/pharos-hls/tests/` dir; open)
 - [ ] T031-02 Playwright harness that plays one stream for N seconds on a named engine and writes JSON: time to first frame, seek-to-playing time, buffered ranges every second, long tasks, JS heap. Runs in Chromium and Firefox, muted.
 - [ ] T031-03 hls.js baseline on Chromium, Firefox, Quest, Steam Frame and the G08 (device runs by hand via CDP/WebView debugging); results table appended to this file with ISO 8601 UTC timestamps.
 
@@ -32,7 +32,7 @@ Notes from slice 2 (2026-11-08T00:40:00Z): with #949's `PHAROS_FIREFOX_LIBAV` on
 
 - [x] T031-14 Retries with backoff and per-device deadlines (V637). The deadlines (desktop 10 s first byte, 60 s load; TV and phone 15 s, 90 s) are provisional until the slice 0 baseline (T031-03) measures them.
 - [x] T031-15 Gap jumping and stall nudges, each counted and logged (V701, V702). The 1 s jump bound is provisional.
-- [ ] T031-16 MediaSource rebuild on media error under `RecoveryBudget` (V638); failure-path symmetry tests with a disarm check (V640).
+- [ ] T031-16 MediaSource rebuild on media error under `RecoveryBudget` (V638); failure-path symmetry tests with a disarm check (V640). (audited 2026-11-09: `RecoveryBudget` is wired only to the hls.js error handler in `native/web.rs`; the Rust engine has no MediaSource rebuild; open)
 
 ## Slice 4 - Adapt (V644-V649)
 
