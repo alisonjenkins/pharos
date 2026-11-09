@@ -22,7 +22,8 @@ use super::platform::{
 use super::playback::{
     abr_ladder, check_master, forward_buffer_ms, pick_audio_uri, plan_hls, ranges_to_ms,
     rung_label, segment_deadlines, with_abr, AbrSwitchReport, FragmentLoad, HlsFallbackCause,
-    OnFatal, OnFragment, PlaybackEngine, SegmentFailureReport, SegmentRecovery, StallReport,
+    MediaRecovery, MediaRecoveryReport, MediaVerdict, OnFatal, OnFragment, PlaybackEngine,
+    SegmentFailureReport, SegmentRecovery, StallReport,
 };
 
 /// The cold-encode time is the slowest time-to-first-byte over this many recent
@@ -98,13 +99,14 @@ impl TrackRunner {
         segments: Vec<Segment>,
         source_buffer: web_sys::SourceBuffer,
         policy: RetryPolicy,
+        generation: u64,
     ) -> Self {
         Self {
             init_uri,
             segments,
             source_buffer,
             controller: None,
-            generation: 0,
+            generation,
             queue: VecDeque::new(),
             running: None,
             retries: Retries::new(policy),
@@ -137,6 +139,12 @@ struct Session {
     trace: super::hls_trace::PlayTrace,
     watchdog: Watchdog,
     stall_timer: Option<StallTimer>,
+    recovery: MediaRecovery,
+    /// The first request generation of the next tracks: a rebuild carries the
+    /// count on, so a backoff timer from the old MediaSource never matches.
+    generation_floor: u64,
+    /// The element was playing when the MediaSource was rebuilt.
+    resume_play: bool,
 }
 
 /// The watchdog's interval; dropping it clears the interval (V642).
@@ -207,6 +215,9 @@ impl PlaybackEngine for RustHls {
             trace: super::hls_trace::PlayTrace::new(now_ms_u64(), start_ms),
             watchdog: Watchdog::new(),
             stall_timer: None,
+            recovery: MediaRecovery::new(),
+            generation_floor: 0,
+            resume_play: false,
         }));
 
         let weak = Rc::downgrade(&session);
@@ -335,10 +346,17 @@ fn finish_track_cleanup((sb, controller, listeners): TrackCleanup) {
 }
 
 async fn load(weak: Weak<RefCell<Session>>) {
-    let Some((url, start_ms)) = weak.upgrade().and_then(|s| {
+    let Some((url, start_ms, epoch, generation)) = weak.upgrade().and_then(|s| {
         let mut s = s.borrow_mut();
         s.on_source_open = None;
-        (!s.dead).then(|| (s.url.clone(), s.start_ms))
+        (!s.dead).then(|| {
+            (
+                s.url.clone(),
+                s.start_ms,
+                s.recovery.epoch(),
+                s.generation_floor,
+            )
+        })
     }) else {
         return;
     };
@@ -479,15 +497,21 @@ async fn load(weak: Weak<RefCell<Session>>) {
     let policy = RetryPolicy::with_deadlines(deadlines);
     let audio_runner = match (audio_sb, audio_pl.as_ref(), audio_init.flatten()) {
         (Some(sb), Some(apl), Some(init_uri)) => {
-            let mut runner = TrackRunner::new(init_uri, apl.segments.clone(), sb, policy);
+            let mut runner =
+                TrackRunner::new(init_uri, apl.segments.clone(), sb, policy, generation);
             wire_source_buffer(&weak, Track::Audio, &mut runner);
             Some(runner)
         }
         _ => None,
     };
 
-    let mut video_runner =
-        TrackRunner::new(video_init_uri, video_pl.segments.clone(), video_sb, policy);
+    let mut video_runner = TrackRunner::new(
+        video_init_uri,
+        video_pl.segments.clone(),
+        video_sb,
+        policy,
+        generation,
+    );
     wire_source_buffer(&weak, Track::Video, &mut video_runner);
 
     let seg_count = video_pl.segments.len();
@@ -506,9 +530,9 @@ async fn load(weak: Weak<RefCell<Session>>) {
     }
 
     let video_listeners = wire_video(&weak, &video);
-    {
+    let resume_play = {
         let mut s = session.borrow_mut();
-        if s.dead {
+        if s.dead || s.recovery.epoch() != epoch {
             drop(s);
             for (name, listener) in video_listeners {
                 let _ = video
@@ -524,6 +548,10 @@ async fn load(weak: Weak<RefCell<Session>>) {
         s.video_track = Some(video_runner);
         s.audio_track = audio_runner;
         s.video_listeners = video_listeners;
+        std::mem::take(&mut s.resume_play)
+    };
+    if resume_play {
+        let _ = video.play();
     }
 
     let audio_label = plan.audio_mime.as_deref().unwrap_or("none");
@@ -535,7 +563,7 @@ async fn load(weak: Weak<RefCell<Session>>) {
     pump(&session);
     start_stall_watch(&session);
     drop(session);
-    prepare_abr(weak, master, playing).await;
+    prepare_abr(weak, master, playing, epoch).await;
 }
 
 /// Fetches every other rung's media playlist and turns quality switching on
@@ -546,6 +574,7 @@ async fn prepare_abr(
     weak: Weak<RefCell<Session>>,
     master: Master,
     playing: (String, Vec<Segment>),
+    epoch: u32,
 ) {
     let (playing_uri, playing_segments) = playing;
     let ladder = abr_ladder(&master);
@@ -638,7 +667,8 @@ async fn prepare_abr(
         return;
     };
     let mut s = session.borrow_mut();
-    if s.dead {
+    // A rebuild since this load started runs its own `prepare_abr`.
+    if s.dead || s.recovery.epoch() != epoch {
         return;
     }
     let on_rung = s.video_track.as_ref().is_some_and(|t| {
@@ -940,9 +970,9 @@ fn emit_trace(reports: Vec<super::hls_trace::Report>) {
     }
 }
 
-/// The `<video>`'s own error (a decode failure, an unsupported sample):
-/// logged and reported with the browser's code and message. Recovery from it
-/// is spec 031 slice 3, so this only makes it visible.
+/// The `<video>`'s own error. A decode failure is a media error, which
+/// rebuilds the MediaSource (V638); any other code is logged and reported
+/// with the browser's code and message.
 fn report_video_error(session: &Rc<RefCell<Session>>) {
     let (video, url) = {
         let s = session.borrow();
@@ -951,9 +981,19 @@ fn report_video_error(session: &Rc<RefCell<Session>>) {
         }
         (s.video.clone(), s.url.clone())
     };
-    let (code, message) = video
-        .error()
-        .map_or((0, String::new()), |e| (e.code(), e.message()));
+    // A rebuild swaps the source, which clears the element's error: an
+    // event queued from before it has nothing left to say.
+    let Some((code, message)) = video.error().map(|e| (e.code(), e.message())) else {
+        return;
+    };
+    if code == web_sys::MediaError::MEDIA_ERR_DECODE {
+        fail_media(
+            &Rc::downgrade(session),
+            "videoDecodeError",
+            &format!("code={code} {message}"),
+        );
+        return;
+    }
     warn(&format!(
         "pharos: playback error engine=rust type=mediaError details=videoError code={code} message={message} action=report url={url}"
     ));
@@ -1145,15 +1185,27 @@ fn pump(session: &Rc<RefCell<Session>>) {
     let Some((play_ms, buffered)) = snapshot_state(session) else {
         return;
     };
-    let actions = {
+    let (actions, resumed, url) = {
         let mut s = session.borrow_mut();
         if s.dead {
             return;
         }
-        s.planner
+        let resumed = if s.video.paused() {
+            None
+        } else {
+            s.recovery.on_play_head(play_ms, now_ms_u64())
+        };
+        let actions = s
+            .planner
             .as_mut()
-            .map_or_else(Vec::new, |p| p.tick(play_ms, &buffered))
+            .map_or_else(Vec::new, |p| p.tick(play_ms, &buffered));
+        (actions, resumed, s.url.clone())
     };
+    if let Some(r) = resumed {
+        let report = MediaRecoveryReport::Resumed(r);
+        info(&report.line(&url));
+        report_event(report.event(current_path()));
+    }
     execute_actions(session, actions);
 }
 
@@ -1772,36 +1824,144 @@ fn fail_manifest(
     on_fatal(format!("the stream failed (networkError: {reason})"));
 }
 
+/// A media error: rebuild the MediaSource at the play head while the media
+/// budget lasts, then fail (V638). Every outcome is logged and reported in
+/// the shape hls.js's error line has (V640).
 fn fail_media(weak: &Weak<RefCell<Session>>, details: &str, message: &str) {
-    let Some((url, on_fatal)) = weak.upgrade().and_then(|session| {
-        let out = {
-            let mut s = session.borrow_mut();
-            if s.dead {
-                return None;
-            }
-            s.dead = true;
-            (s.url.clone(), Rc::clone(&s.on_fatal))
-        };
-        finish_trace(&session, super::hls_trace::Flush::Fatal);
-        Some(out)
-    }) else {
+    let Some(session) = weak.upgrade() else {
         return;
     };
-    warn(&format!(
-        "pharos: playback error engine=rust type=mediaError details={details} message={message} fatal=true action=fail attempt=0 url={url}"
-    ));
-    report_event(ClientEvent {
-        kind: ClientEventKind::PlaybackError,
-        level: ClientLevel::Error,
-        route: current_path(),
-        fields: vec![
-            ("engine", "rust".to_owned()),
-            ("type", "mediaError".to_owned()),
-            ("details", details.to_owned()),
-            ("message", message.to_owned()),
-            ("action", "fail".to_owned()),
-            ("attempt", "0".to_owned()),
-        ],
+    let (verdict, at_ms, url, on_fatal) = {
+        let mut s = session.borrow_mut();
+        if s.dead {
+            return;
+        }
+        let at_ms = seconds_to_ms(s.video.current_time());
+        let epoch = s.recovery.epoch();
+        let verdict = s.recovery.on_error(epoch, details, at_ms, now_ms_u64());
+        if let MediaVerdict::Fail { .. } = verdict {
+            s.dead = true;
+        }
+        (verdict, at_ms, s.url.clone(), Rc::clone(&s.on_fatal))
+    };
+    let report = MediaRecoveryReport::Error {
+        details: details.to_owned(),
+        message: message.to_owned(),
+        verdict,
+        at_ms,
+    };
+    warn(&report.line(&url));
+    match verdict {
+        MediaVerdict::Stale => {}
+        MediaVerdict::Rebuild { .. } => {
+            report_event(report.event(current_path()));
+            rebuild(&session, at_ms);
+        }
+        MediaVerdict::Fail { .. } => {
+            finish_trace(&session, super::hls_trace::Flush::Fatal);
+            report_event(report.event(current_path()));
+            on_fatal(format!("the stream failed (mediaError: {message})"));
+        }
+    }
+}
+
+/// Tears down the MediaSource and its tracks and opens a new one at `at_ms`,
+/// as hls.js's `recoverMediaError` detaches and attaches the media. The
+/// `<video>`, its session, telemetry and the media budget stay.
+fn rebuild(session: &Rc<RefCell<Session>>, at_ms: u64) {
+    let media_source = match web_sys::MediaSource::new() {
+        Ok(m) => m,
+        Err(e) => {
+            fail_rebuild(session, &js_message(&e));
+            return;
+        }
+    };
+    let object_url = match web_sys::Url::create_object_url_with_source(&media_source) {
+        Ok(u) => u,
+        Err(e) => {
+            fail_rebuild(session, &js_message(&e));
+            return;
+        }
+    };
+    let weak = Rc::downgrade(session);
+    let on_open = EventListener::new(move |_| {
+        let next = Weak::clone(&weak);
+        wasm_bindgen_futures::spawn_local(async move {
+            load(next).await;
+        });
     });
-    on_fatal(format!("the stream failed (mediaError: {message})"));
+    let once = web_sys::AddEventListenerOptions::new();
+    once.set_once(true);
+    let _ = media_source.add_event_listener_with_callback_and_add_event_listener_options(
+        "sourceopen",
+        on_open.as_ref().unchecked_ref(),
+        &once,
+    );
+
+    let (video, video_listeners, cleanups, stall_timer, old_url) = {
+        let mut guard = session.borrow_mut();
+        let s = &mut *guard;
+        let video = s.video.clone();
+        s.resume_play = !video.paused();
+        let floor = [s.video_track.as_ref(), s.audio_track.as_ref()]
+            .into_iter()
+            .flatten()
+            .map(|t| t.generation)
+            .max()
+            .unwrap_or(0);
+        s.generation_floor = s.generation_floor.max(floor).saturating_add(1);
+        let cleanups: Vec<TrackCleanup> = [s.video_track.take(), s.audio_track.take()]
+            .into_iter()
+            .flatten()
+            .map(take_track_cleanup)
+            .collect();
+        s.planner = None;
+        s.abr = None;
+        s.eos_pending = false;
+        s.start_ms = at_ms;
+        s.watchdog = Watchdog::new();
+        s.media_source = media_source;
+        s.on_source_open = Some(on_open);
+        let old_url = s.object_url.replace(object_url.clone());
+        (
+            video,
+            std::mem::take(&mut s.video_listeners),
+            cleanups,
+            s.stall_timer.take(),
+            old_url,
+        )
+    };
+    drop(stall_timer);
+    for (name, listener) in video_listeners {
+        let _ = video.remove_event_listener_with_callback(name, listener.as_ref().unchecked_ref());
+    }
+    for cleanup in cleanups {
+        finish_track_cleanup(cleanup);
+    }
+    video.set_src(&object_url);
+    if let Some(url) = old_url {
+        let _ = web_sys::Url::revoke_object_url(&url);
+    }
+}
+
+fn fail_rebuild(session: &Rc<RefCell<Session>>, reason: &str) {
+    let (on_fatal, url, at_ms) = {
+        let mut s = session.borrow_mut();
+        s.dead = true;
+        (
+            Rc::clone(&s.on_fatal),
+            s.url.clone(),
+            seconds_to_ms(s.video.current_time()),
+        )
+    };
+    let report = MediaRecoveryReport::Error {
+        details: "rebuildFailed".to_owned(),
+        message: reason.to_owned(),
+        verdict: MediaVerdict::Fail { attempt: 0 },
+        at_ms,
+    };
+    warn(&report.line(&url));
+    report_event(report.event(current_path()));
+    finish_trace(session, super::hls_trace::Flush::Fatal);
+    on_fatal(format!("the stream failed (mediaError: {reason})"));
 }
