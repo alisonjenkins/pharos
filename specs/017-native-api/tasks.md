@@ -104,7 +104,7 @@ method may exist without it (V173), so it precedes every story.
 - [x] T025 (live drop: every revoke path announces on `services::auth::Revocations` and the user's open connections re-check at once, `it_rpc/revocation.rs` + `revocation_sites.rs`; login and `Session.logout` in `it_rpc/login.rs`; the cookie in `it_rpc/session.rs`; native Quick Connect in `it_rpc/quick_connect.rs` over `services::auth::quick_connect_login`) Test + impl: `Bootstrap.login` and Quick Connect return a `Session` and device token; logout/revoke drops live connections and clears the cookie — **COMMIT**
 - [x] T025a Test + impl (first PR of phase 3b; #463 security review): an open `Session` notices its token being revoked. Re-validate the token on a bounded interval and on the device-revoke/logout path, and close live connections with close cause `revoked`; `pharos_rpc_closed_total{cause="revoked"}` + log. The whole-slice security review checks this landed — **COMMIT** — Done as the re-check timer in `rpc/socket.rs` (`revalidate_secs`, default 60) with `it_rpc/revocation.rs`; the immediate close on logout/revoke rides on T025
 - [x] T026 (connection caps: unauthenticated server-wide, per user, auth deadline, decode limits; calls in flight per connection, `MAX_CALLS_IN_FLIGHT`; the subscription cap is T026a) [P] Limits (FR-010): per-connection message size, call concurrency, subscription count; `pharos_rpc_limit_total{limit}` + log naming the value; tests in `it_rpc/limits.rs` — **COMMIT**
-- [ ] T026a Test + impl with `Events` (FR-010): cap subscriptions per connection; the one past the cap answers `limit` `subscriptions` and counts under `pharos_rpc_limit_total`; test in `it_rpc/limits.rs` — **COMMIT**
+- [x] T026a (done: `MAX_SUBSCRIPTIONS_PER_CONNECTION` 8 in `rpc/events.rs`, V1002) Test + impl with `Events` (FR-010): cap subscriptions per connection; the one past the cap answers `limit` `subscriptions` and counts under `pharos_rpc_limit_total`; test in `it_rpc/limits.rs` — **COMMIT**
 - [x] T027 [P] `pharos_rpc_bytes_total{direction}` and `pharos_rpc_client_schema_total{version}`, `Unimplemented` counter by method; tests — **COMMIT** — Bytes counted in `rpc::serve` (`it_rpc/traffic.rs`); client schema from the new `CallContext.schemaVersion` (schema version 2), once per connection, bucketed `unset`/version/`newer` (`it_instrument/client_schema.rs`); Unimplemented is `pharos_rpc_calls_total{outcome="unimplemented"}` by interface and method (`it_instrument/instrument.rs` `a_method_without_a_handler_is_counted_unimplemented`). Also from T021/T022: the trace-parent hook (`obs::rpc_trace_parent`) and the zeroed call series are installed at startup when the API is served
 - [x] T028 ADR for Cap'n Proto RPC's threading model (R2) and the session-cookie flow (R6), `docs/adr/0029-*.md` + README row — **COMMIT** — ADR-0029
 
@@ -137,11 +137,11 @@ Each extraction is one commit: service + its unit test, Jellyfin handler rewired
 
 **Independent test**: subscribe, mark an item played from a second connection, receive one `userData` event with the next `seq`.
 
-- [ ] T041 [US2] Test: per-user `seq`, replay after `afterSeq`, `resync` when older than the window (data-model §Events)
-- [ ] T042 [US2] `services/events.rs`: services publish to the existing fan-out; per-user bounded replay window (10 000 events / 15 min) — **COMMIT**
-- [ ] T043 [US2] `rpc/events.rs` `Events.subscribe` with `EventSink`; `pharos_rpc_subscriptions{topic}`, `pharos_rpc_events_total{topic,outcome}`, `pharos_rpc_event_lag_seconds{topic}`; tests with disarm — **COMMIT**
+- [x] T041 (done: `services::events::tests`, V1000) [US2] Test: per-user `seq`, replay after `afterSeq`, `resync` when older than the window (data-model §Events)
+- [x] T042 (done: `EventLog` reads the existing `/socket` bus from the first subscribe, ADR-0094, V1004) [US2] `services/events.rs`: services publish to the existing fan-out; per-user bounded replay window (10 000 events / 15 min) — **COMMIT**
+- [x] T043 (done: it_rpc `events.rs`, each test disarm-checked, V1001, V1003) [US2] `rpc/events.rs` `Events.subscribe` with `EventSink`; `pharos_rpc_subscriptions{topic}`, `pharos_rpc_events_total{topic,outcome}`, `pharos_rpc_event_lag_seconds{topic}`; tests with disarm — **COMMIT**
 - [ ] T044 [US2] Multi-replica distribution per ADR-0016 (postgres arm; run `just test-postgres`) — **COMMIT**
-- [ ] T045 [US2] Capability lifecycle counts (issued / released / revoked by type) and a leak test — **COMMIT**
+- [ ] T045 (partial: `pharos_rpc_capabilities_total{type="subscription",transition}` and the leak check in it_rpc `events.rs`; the other capability types are not counted yet) [US2] Capability lifecycle counts (issued / released / revoked by type) and a leak test — **COMMIT**
 
 ---
 
