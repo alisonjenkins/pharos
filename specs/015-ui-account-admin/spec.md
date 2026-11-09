@@ -2,7 +2,7 @@
 
 **Feature directory**: `specs/015-ui-account-admin/`
 **Created**: 2026-11-01
-**Status**: partially built (audited 2026-11-09): sign-in, account/password/avatar, Quick Connect approve, Manage (users, libraries, devices, activity, tasks, plugins, logs, API keys, branding, duplicates, integrity) shipped; metadata editing, dashboard overview, first-run sheet open. See Progress
+**Status**: partially built (audited 2026-11-09): sign-in, account/password/avatar, Quick Connect approve, Manage (users, libraries, devices, activity, tasks, plugins, logs, API keys, branding, duplicates, integrity, metadata) shipped; metadata editing slice 1 built (fields), images/people/genres editing, dashboard overview, first-run sheet open. See Progress
 **Input**: "… support all the things Jellyfin's UI does … tailored to the Pharos
 server (there are some things we might drop)." (Alison, 2026-11-01)
 **Depends on**: 009–011; server rows T67, T68, T69, T70, T73, T74, T76
@@ -115,7 +115,7 @@ deletion from this view are later stories.
 
 - US1 sign-in: partial. Native sign-in takes name and password; Quick Connect approval is at `/settings/approve-device` (native/approve_device.rs). Guest Quick Connect and the saved-server picker (views/quick_connect.rs, views/server_picker.rs) exist only in the legacy app used when the native API is off, not on the native sign-in screen.
 - US2 profile and preferences: partial. Avatar + password + language in native/account_settings.rs (`/settings/account`); Appearance, Playback (native/playback_settings.rs), Privacy routes exist. No dedicated Home, Subtitles-defaults, Audio-defaults or Reading preference pages found.
-- US3 metadata editing: not started in pharos-ui (no item-edit, image manager or identify view found).
+- US3 metadata editing: slice 1 built (2026-11-09, ADR-0097, V1030–V1032, migration 0078). Manage ▸ Metadata finds a film, episode, song, book or show and edits its title, sort title, overview, tagline, year, premiere date, parental rating and scores (a show: overview, premiere date, rating, score, genres); each edited field is locked against rescans and online refreshes until unlocked. Server: `GET`/`POST /admin/items/{id}/metadata`, and Jellyfin `POST /Items/{id}` through the same service. Identify already existed (`RemoteSearch/Movie|Series|Apply`; show identity hand fixes are spec 033, #1117). Open: item genres, tags, people and studios (join tables the scanner relinks), the image manager (upload, delete, reorder), refresh-mode choice, subtitle and lyrics management, `LockedFields` in Jellyfin item answers, and an Edit link from a title page.
 - US4 dashboard overview: not started (no dashboard view; admin tabs show lists only; no uptime/sessions/transcode-device screen).
 - US5 users: done as legacy admin pane (views/admin.rs `UsersPane`, `AdminUserRow`), served via native `/manage` (native/manage.rs). Parental controls / session limits / feature flags not verified.
 - US6 libraries: partial (views/admin.rs `LibrariesPane`); folder picker, scan-now and last-scan result not verified.
