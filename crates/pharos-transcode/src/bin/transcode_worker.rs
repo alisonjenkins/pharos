@@ -528,6 +528,10 @@ fn handle_tiny(
             Ok(features) => WorkerEvent::AudioFeaturesResult { job_id, features },
             Err(e) => frame_err(job_id, e),
         },
+        TinyOp::PictureCheck { input } => match libav::picture_area::picture_area(&input) {
+            Ok(analysis) => WorkerEvent::PictureCheckResult { job_id, analysis },
+            Err(e) => frame_err(job_id, e),
+        },
         TinyOp::SubtitleSignals {
             input,
             audio_stream,

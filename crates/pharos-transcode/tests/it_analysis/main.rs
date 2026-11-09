@@ -9,6 +9,7 @@ mod common;
 
 mod fingerprint_detect;
 mod intro_alignment_recall;
+mod picture_area_scan;
 mod subtitle_burn_ass;
 mod subtitle_burn_per_eye;
 mod subtitle_images_extract;
