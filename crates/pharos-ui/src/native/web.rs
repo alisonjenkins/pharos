@@ -433,18 +433,36 @@ pub fn media_state(video_id: &str) -> MediaState {
     })
 }
 
-/// The shape of the picture `video` shows: its decoded frame, or one eye of
-/// it while its frame carries a 3D crop (`data-packing`, V921).
+/// The shape of the picture `video` shows: its decoded frame, one eye of it
+/// while its frame carries a 3D crop (`data-packing`, V921), or the picture
+/// inside baked-in black bars while it carries a bar crop (`data-crop`,
+/// B1017).
 pub(super) fn picture_size(video: &web_sys::HtmlMediaElement) -> (u32, u32) {
-    let packing = video
-        .parent_element()
+    picture_of(video).1
+}
+
+/// Where the picture `video` shows sits in its decoded frame (fractions),
+/// and its shape: the one reader of the frame's `data-packing` and
+/// `data-crop`, for [`picture_size`] and the transition snapshot.
+pub(super) fn picture_of(
+    video: &web_sys::HtmlMediaElement,
+) -> (super::stereo::FrameRect, (u32, u32)) {
+    let frame = video.parent_element();
+    let packing = frame
+        .as_ref()
         .and_then(|f| f.get_attribute("data-packing"))
         .and_then(|a| super::stereo::parse_packing(&a));
-    super::stereo::eye_size(
+    let bars = frame
+        .as_ref()
+        .and_then(|f| f.get_attribute("data-crop"))
+        .and_then(|a| super::bars::parse_crop(&a));
+    let (w, h) = super::stereo::eye_size(
         packing,
         video_dimension(video, "videoWidth"),
         video_dimension(video, "videoHeight"),
-    )
+    );
+    let rect = bars.unwrap_or_else(|| super::stereo::eye_rect(packing, super::stereo::Eye::Left));
+    (rect, super::bars::shown_size(bars, w, h))
 }
 
 /// A `<video>`'s `videoWidth` or `videoHeight`, read off the element so the

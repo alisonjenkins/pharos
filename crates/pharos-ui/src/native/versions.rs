@@ -5,6 +5,7 @@
 
 use pharos_client::api::{ItemRef, Stereo, Version, VersionAudio};
 
+use super::bars::Crop;
 use super::stereo::packing_label;
 
 /// The `localStorage` key holding the version last picked for `title`.
@@ -117,6 +118,21 @@ pub fn playing_stereo(versions: &[Version], version: &str) -> Option<Stereo> {
         .and_then(|v| v.stereo)
 }
 
+/// Where the picture sits in the playing version's frame when the file has
+/// black bars baked into it (B1017).
+pub fn playing_picture(versions: &[Version], version: &str) -> Option<Crop> {
+    versions
+        .iter()
+        .find(|v| {
+            if version.is_empty() {
+                v.primary
+            } else {
+                v.id == version
+            }
+        })
+        .and_then(|v| Crop::of(v.picture, v.width, v.height))
+}
+
 /// How far a version's runtime may stray from the primary's and still be
 /// taken as the same cut: a container's rounding and a trailing black frame
 /// stay inside it (spec 034 US4, V904).
@@ -224,6 +240,7 @@ fn file_size(bytes: u64) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::expect_used)]
     use super::*;
 
     fn timed(id: &str, duration_ms: u64) -> Version {
@@ -267,6 +284,32 @@ mod tests {
             primary: id.is_empty(),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn the_playing_picture_is_the_picked_versions_bars() {
+        let bars = Version {
+            width: 1920,
+            height: 1080,
+            picture: Some(pharos_client::api::PictureArea {
+                x: 240,
+                y: 0,
+                width: 1440,
+                height: 1080,
+            }),
+            ..version("", "", None)
+        };
+        let clean = Version {
+            width: 1920,
+            height: 1080,
+            ..version("remaster", "Remaster", None)
+        };
+        let versions = [bars, clean];
+        let crop = playing_picture(&versions, "").expect("the primary has bars");
+        assert_eq!((crop.rect.x, crop.rect.w), (0.125, 0.75));
+        assert_eq!(crop.aspect, 4.0 / 3.0);
+        assert_eq!(playing_picture(&versions, "remaster"), None);
+        assert_eq!(playing_picture(&versions, "gone"), None);
     }
 
     #[test]

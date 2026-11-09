@@ -12,7 +12,6 @@ use wasm_bindgen::{JsCast as _, JsValue};
 use web_sys::{Document, Element, Event, HtmlCanvasElement, HtmlElement, HtmlVideoElement};
 
 use super::platform::{info, now_ms, warn};
-use super::stereo;
 use super::turn::{face_transform, Direction, Step, Turn, FADE_MS, GIVE_UP_MS, START_DEG, TURN_MS};
 use super::watch_view::VIDEO_ID;
 
@@ -286,13 +285,9 @@ fn build(doc: &Document, outgoing: Option<HtmlCanvasElement>, dir: Direction) ->
 }
 
 fn snapshot(video: &HtmlVideoElement) -> Option<HtmlCanvasElement> {
-    // A 3D version cropped to one eye turns as that eye (B961).
-    let packing = video
-        .parent_element()
-        .and_then(|f| f.get_attribute("data-packing"))
-        .and_then(|a| stereo::parse_packing(&a));
-    let eye = stereo::eye_rect(packing, stereo::Eye::Left);
-    let (vw, vh) = stereo::eye_size(packing, video.video_width(), video.video_height());
+    // A 3D version cropped to one eye turns as that eye (B961), and a
+    // picture cropped out of baked-in bars as that picture (B1017).
+    let (eye, (vw, vh)) = super::platform::picture_of(video);
     let w = vw.min(SNAPSHOT_MAX_WIDTH);
     let h = (u64::from(vh) * u64::from(w) / u64::from(vw.max(1))).max(1);
     let h = u32::try_from(h).ok()?;
