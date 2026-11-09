@@ -1107,6 +1107,7 @@ impl<P: Prober> FsScanner<P> {
                     sig,
                     fp,
                     existed,
+                    stale_match: None,
                 });
                 if batch_items.len() >= self.put_batch_size {
                     self.flush_probe_writes(
@@ -1460,6 +1461,13 @@ impl<P: Prober> FsScanner<P> {
         if items.is_empty() {
             return Ok(());
         }
+        for (item, written) in items.iter().zip(followups.iter_mut()) {
+            if written.existed {
+                if let Ok(prior) = store.get(item.id).await {
+                    written.stale_match = stale_match(&prior, item);
+                }
+            }
+        }
         let batch_err = store.put_batch(items).await.err();
         // `put_batch` writes every item it can but reports only the first
         // error, so ask per item which rows exist now: the ones that landed
@@ -1514,7 +1522,21 @@ impl<P: Prober> FsScanner<P> {
             sig,
             fp,
             existed,
+            stale_match,
         } = written;
+        if let Some((reason, provider)) = stale_match {
+            tracing::info!(
+                media.id = %item_id,
+                path = %item_path.display(),
+                reason,
+                provider,
+                "reset a row's online match that no longer fits it",
+            );
+            metrics::counter!("pharos_scan_match_reset_total", "reason" => reason).increment(1);
+            store
+                .set_item_match(item_id, &provider, "", "none", None, 0)
+                .await?;
+        }
         // 004-books — a book's cover lives inside the file, so it has no
         // sidecar path to record and is extracted + cached here instead.
         self.store_book_cover(store, item_id, item_kind, &item_path)
@@ -1901,6 +1923,31 @@ struct WrittenItem {
     sig: Option<(i64, u64)>,
     fp: Option<Fingerprint>,
     existed: bool,
+    /// Why the row's online match no longer fits it ([`stale_match`]).
+    stale_match: Option<(&'static str, String)>,
+}
+
+/// B1024 — why a re-probed row's stored online match no longer fits it, with
+/// the provider to reset: its kind changed (a film now read as an episode,
+/// V966), or its match came from an NFO id the NFO no longer gives (a set
+/// aside NFO, V968). `put` leaves the match columns alone, so without this the
+/// old film's record would keep coming back.
+fn stale_match(prior: &MediaItem, now: &MediaItem) -> Option<(&'static str, String)> {
+    let provider = prior.match_provider.clone()?;
+    if prior.kind != now.kind {
+        return Some(("kind_changed", provider));
+    }
+    if prior.match_source.as_deref() != Some("nfo_id") {
+        return None;
+    }
+    let ids = &now.metadata.provider_ids;
+    let given = match provider.as_str() {
+        "tmdb" => ids.tmdb.as_deref(),
+        "tvdb" => ids.tvdb.as_deref(),
+        "imdb" => ids.imdb.as_deref(),
+        _ => return None,
+    };
+    (given != prior.match_external_id.as_deref()).then_some(("nfo_id_gone", provider))
 }
 
 /// LIB-D7 — the entity side-effects [`merge_metadata_into_item`] hands
@@ -10795,8 +10842,9 @@ mod tests {
         assert_eq!(counted, 1, "one marked folder on the second walk");
     }
 
-    /// B1023 / V982 — a film row the show-folder rule now calls an episode is
-    /// re-probed though its file is unchanged.
+    /// B1023 / V982, B1024 / V983 — a film row the show-folder rule now calls
+    /// an episode is re-probed though its file is unchanged, and the film's
+    /// online match on it is reset so the episode is matched afresh.
     #[tokio::test]
     async fn an_unchanged_film_under_a_new_show_folder_becomes_an_episode() {
         let recorder = metrics_util::debugging::DebuggingRecorder::new();
@@ -10812,6 +10860,10 @@ mod tests {
         s.scan_into(td.path(), &store).await.unwrap();
         let id = stable_id(&td.path().join(file));
         assert_eq!(store.get(id).await.unwrap().kind, MediaKind::Movie);
+        store
+            .set_item_match(id, "tmdb", "1234", "nfo_id", None, 100)
+            .await
+            .unwrap();
 
         touch(td.path(), "TV/Dragon Ball/tvshow.nfo").await;
         let out = s.scan_into(td.path(), &store).await.unwrap();
@@ -10819,6 +10871,8 @@ mod tests {
         let item = store.get(id).await.unwrap();
         assert_eq!(item.kind, MediaKind::Episode);
         assert_eq!(item.series.map(|s| s.episode_number), Some(Some(63)));
+        assert_eq!(item.match_source.as_deref(), Some("none"));
+        assert_eq!(item.match_external_id.as_deref(), Some(""));
         assert_eq!(
             out.skipped, 1,
             "the unchanged film beside it is still skipped"
@@ -10844,5 +10898,55 @@ mod tests {
                 .sum()
         };
         assert_eq!(counter("pharos_scan_reprobe_total", "kind_changed"), 1);
+        assert_eq!(counter("pharos_scan_match_reset_total", "kind_changed"), 1);
+    }
+
+    /// B1024 / V983 — which stored matches a re-probe resets.
+    #[test]
+    fn a_match_that_no_longer_fits_its_row_is_stale() {
+        let film = |source: &str, tmdb: Option<&str>| {
+            let mut item = MediaItem {
+                kind: MediaKind::Movie,
+                match_provider: Some("tmdb".into()),
+                match_external_id: Some("8587".into()),
+                match_source: Some(source.into()),
+                ..Default::default()
+            };
+            item.metadata.provider_ids.tmdb = tmdb.map(Into::into);
+            item
+        };
+        let now = |kind, tmdb: Option<&str>| {
+            let mut item = MediaItem {
+                kind,
+                ..Default::default()
+            };
+            item.metadata.provider_ids.tmdb = tmdb.map(Into::into);
+            item
+        };
+        let reason = |prior: &MediaItem, now: &MediaItem| stale_match(prior, now).map(|(r, _)| r);
+        assert_eq!(
+            reason(&film("nfo_id", Some("8587")), &now(MediaKind::Movie, None)),
+            Some("nfo_id_gone")
+        );
+        assert_eq!(
+            reason(
+                &film("nfo_id", Some("8587")),
+                &now(MediaKind::Movie, Some("8587"))
+            ),
+            None
+        );
+        assert_eq!(
+            reason(&film("search", None), &now(MediaKind::Movie, None)),
+            None,
+            "a searched match owes nothing to the NFO"
+        );
+        assert_eq!(
+            reason(&film("manual", None), &now(MediaKind::Episode, None)),
+            Some("kind_changed")
+        );
+        assert_eq!(
+            reason(&now(MediaKind::Movie, None), &now(MediaKind::Episode, None)),
+            None
+        );
     }
 }
