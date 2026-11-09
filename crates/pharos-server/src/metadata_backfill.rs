@@ -60,6 +60,7 @@ use pharos_core::{
     TranslationGap, TranslationOwner,
 };
 use pharos_scanner::metadata::nfo::ShowNfoEvidence;
+use pharos_scanner::series_split::RepairMode;
 use pharos_scanner::FilenameProvider;
 use std::collections::HashMap;
 
@@ -276,6 +277,18 @@ where
                 series_work = series_had_work;
             }
             Err(e) => tracing::warn!(error = %e, "T9-series metadata backfill: pass aborted"),
+        }
+    }
+
+    // V940 — episodes whose show's match changed are rebuilt against the new
+    // match before the item pass, which would only fill their empty fields.
+    if tvdb.is_some() || tmdb.is_some() {
+        match reconcile_pass(store, bg_io, cache, tmdb, tvdb, cfg, now).await {
+            Ok((n, pending)) => {
+                series_enriched += n;
+                series_work |= pending;
+            }
+            Err(e) => tracing::warn!(error = %e, "series identity repair: reconcile pass aborted"),
         }
     }
 
@@ -954,6 +967,204 @@ where
             .await?;
     }
     Ok(true)
+}
+
+/// The provider and id a stored show match names, if it names one.
+fn stored_match(m: &SeriesMetadata) -> Option<(&str, &str)> {
+    if m.match_source.as_deref() == Some("none") {
+        return None;
+    }
+    Some((
+        m.match_provider.as_deref()?,
+        m.match_external_id.as_deref()?,
+    ))
+}
+
+/// Spec 033 (V940) — before a show's stored match changes automatically,
+/// durably mark its episodes for reconciliation against the new one. Marked
+/// first, so a crash between the two writes leaves them marked rather than
+/// stranded on the old show's text. A show with no row yet has nothing to
+/// reconcile; `new` is `None` for a show matched to nothing.
+async fn mark_if_match_changed<S>(
+    store: &S,
+    series_key: &str,
+    new: Option<(&str, &str)>,
+    now: i64,
+) -> DomainResult<()>
+where
+    S: SeriesMetadataStore + pharos_core::SeriesIdentityStore,
+{
+    let key = series_key.to_string();
+    let Some(prior) = store
+        .series_metadata_by_keys(std::slice::from_ref(&key))
+        .await?
+        .remove(&key)
+    else {
+        return Ok(());
+    };
+    let old = stored_match(&prior);
+    if old == new {
+        return Ok(());
+    }
+    let marked = store.mark_series_reconcile(series_key, now).await?;
+    metrics::counter!("pharos_series_reconcile_marked_total", "reason" => "match_changed")
+        .increment(marked);
+    tracing::info!(
+        series_key,
+        old_provider = old.map(|(p, _)| p),
+        old_id = old.map(|(_, id)| id),
+        new_provider = new.map(|(p, _)| p),
+        new_id = new.map(|(_, id)| id),
+        marked,
+        "series identity repair: show match changed, episodes marked for reconciliation"
+    );
+    Ok(())
+}
+
+/// Spec 033 (V940) — rebuild the episodes marked for reconciliation against
+/// their show's current match: reset their provider-derived fields to local
+/// evidence, delete their stored translations, then enrich them from the
+/// pinned match. Only under `series_identity_repair = "apply"`; a dry run
+/// counts what is pending and changes nothing. A mark clears only once the
+/// episode's enrichment finished (a record, or `none`); a transient miss
+/// marks it again with `now`, behind the rest, for a later pass. Returns
+/// (rebuilt, anything pending).
+async fn reconcile_pass<Tm, Tv, S>(
+    store: &S,
+    bg_io: &Arc<Semaphore>,
+    cache: &ImageCache,
+    tmdb: Option<&Tm>,
+    tvdb: Option<&Tv>,
+    cfg: &MetadataConfig,
+    now: i64,
+) -> DomainResult<(usize, bool)>
+where
+    Tm: OnlineEnricher,
+    Tv: OnlineEnricher,
+    S: MediaStore
+        + GenreStore
+        + PersonStore
+        + MetadataTranslationStore
+        + SeriesMetadataStore
+        + pharos_core::SeriesIdentityStore,
+{
+    let mode = cfg.series_identity_repair;
+    let pending = store.series_reconcile_pending(cfg.max_per_pass).await?;
+    #[allow(clippy::cast_precision_loss)]
+    metrics::gauge!("pharos_series_reconcile_pending", "mode" => mode.label())
+        .set(pending.len() as f64);
+    if pending.is_empty() {
+        return Ok((0, false));
+    }
+    if mode == RepairMode::DryRun {
+        tracing::debug!(
+            pending = pending.len(),
+            "series identity repair: episodes would be rebuilt (dry run)"
+        );
+        return Ok((0, false));
+    }
+    let mut rebuilt = 0usize;
+    for (id, marked_at) in pending {
+        match reconcile_one(store, bg_io, cache, tmdb, tvdb, cfg, id, marked_at, now).await {
+            Ok(true) => rebuilt += 1,
+            Ok(false) => {}
+            Err(e) => {
+                tracing::warn!(error = %e, media.id = id, "series identity repair: episode rebuild failed")
+            }
+        }
+        tokio::time::sleep(REQUEST_SPACING).await;
+    }
+    Ok((rebuilt, true))
+}
+
+/// Rebuild one marked episode. `Ok(true)` when it was rebuilt and its mark
+/// cleared.
+#[allow(clippy::too_many_arguments)]
+async fn reconcile_one<Tm, Tv, S>(
+    store: &S,
+    bg_io: &Arc<Semaphore>,
+    cache: &ImageCache,
+    tmdb: Option<&Tm>,
+    tvdb: Option<&Tv>,
+    cfg: &MetadataConfig,
+    id: pharos_core::MediaId,
+    marked_at: i64,
+    now: i64,
+) -> DomainResult<bool>
+where
+    Tm: OnlineEnricher,
+    Tv: OnlineEnricher,
+    S: MediaStore
+        + GenreStore
+        + PersonStore
+        + MetadataTranslationStore
+        + SeriesMetadataStore
+        + pharos_core::SeriesIdentityStore,
+{
+    let item = match store.get(id).await {
+        Ok(item) => item,
+        // The row is gone, and its mark with it.
+        Err(pharos_core::DomainError::NotFound(_)) => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    // An episode's own manual match is never rebuilt (the store never marks
+    // one; this covers an Identify that landed after the mark).
+    if item.match_source.as_deref() == Some("manual") {
+        store.clear_series_reconcile(id, marked_at).await?;
+        return Ok(false);
+    }
+    let old_title = item.title.clone();
+    let mut item = tokio::task::spawn_blocking(move || {
+        let mut item = item;
+        tokio::runtime::Handle::current()
+            .block_on(pharos_scanner::fs::reset_to_local_metadata(&mut item));
+        item
+    })
+    .await
+    .map_err(|e| pharos_core::DomainError::Backend(format!("local metadata reset: {e}")))?;
+    let translations = store
+        .delete_translations(&TranslationOwner::Item(id))
+        .await?;
+    // The old show's stills: the row and the cached bytes behind it, so the
+    // image route falls back to a local still or a frame grab until the new
+    // match's art is cached.
+    let art = store.delete_provider_artwork(id).await?;
+    for (role, _) in &art {
+        if let Some(role) = ImageRole::from_str_ci(role) {
+            if let Err(e) = cache.remove(id, role, item.kind, 0).await {
+                tracing::warn!(
+                    error = %e,
+                    media.id = id,
+                    role = ?role,
+                    "series identity repair: cached provider art not removed"
+                );
+            }
+        }
+    }
+    store.put(item.clone()).await?;
+    item.match_source = None;
+    let hit = enrich_one(store, bg_io, cache, tmdb, tvdb, cfg, item, now).await?;
+    if !art.is_empty() {
+        store.bump_art_version(id).await?;
+    }
+    let after = store.get(id).await?;
+    let done = hit || matches!(after.match_source.as_deref(), Some("none" | "manual"));
+    if done {
+        store.clear_series_reconcile(id, marked_at).await?;
+    } else {
+        store.mark_reconcile_items(&[id], now).await?;
+    }
+    tracing::info!(
+        media.id = id,
+        old_title = %old_title,
+        new_title = %after.title,
+        match_source = after.match_source.as_deref(),
+        translations_deleted = translations,
+        art_deleted = art.len(),
+        done,
+        "series identity repair: episode rebuilt"
+    );
+    Ok(done)
 }
 
 /// The show an episode's folder (or split group) is matched to, if any.
@@ -1836,6 +2047,7 @@ where
         } else {
             "tvdb"
         };
+        mark_if_match_changed(store, &cand.series_key, None, now).await?;
         store
             .upsert_series_metadata(SeriesMetadata {
                 series_key: cand.series_key.clone(),
@@ -1857,6 +2069,13 @@ where
     }
 
     let flagged = hit.decision.ambiguous;
+    mark_if_match_changed(
+        store,
+        &cand.series_key,
+        Some((hit.provider, hit.external_id.as_str())),
+        now,
+    )
+    .await?;
     let provider_ids = match hit.provider {
         "tmdb" => ProviderIds {
             tmdb: Some(hit.external_id.clone()),
@@ -2617,6 +2836,7 @@ async fn cache_series_art<E: OnlineEnricher>(
 mod tests {
     use super::*;
     use crate::musicbrainz::AlbumArt;
+    use pharos_core::SeriesIdentityStore as _;
     use pharos_core::{MediaItem, SearchCandidate};
     use std::collections::HashMap;
 
@@ -5202,6 +5422,294 @@ mod tests {
         assert_eq!(row.match_external_id.as_deref(), Some("71173"));
         assert_eq!(row.match_flag.as_deref(), Some(AMBIGUOUS_FLAG));
         assert_eq!(row.match_runner_up_id.as_deref(), Some("73545"));
+    }
+
+    const BSG: &str = "/tv/Battlestar Galactica";
+
+    fn apply_cfg() -> MetadataConfig {
+        MetadataConfig {
+            series_identity_repair: RepairMode::Apply,
+            ..MetadataConfig::default()
+        }
+    }
+
+    async fn pin(s: &SqliteStore, key: &str, id: &str, refreshed_at: i64) {
+        s.upsert_series_metadata(SeriesMetadata {
+            series_key: key.into(),
+            series_name: key.rsplit('/').next().unwrap_or(key).into(),
+            match_provider: Some("tvdb".into()),
+            match_external_id: Some(id.into()),
+            match_source: Some("search".into()),
+            metadata_refreshed_at: Some(refreshed_at),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    }
+
+    async fn pending_ids(s: &SqliteStore) -> Vec<u64> {
+        s.series_reconcile_pending(100)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect()
+    }
+
+    /// V940 — a show re-asked onto another match marks its episodes for
+    /// reconciliation before the new match is written. An episode's own
+    /// manual match is not marked.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_changed_show_match_marks_its_episodes() {
+        use metrics_util::debugging::DebuggingRecorder;
+        let recorder = DebuggingRecorder::new();
+        let snap = pharos_test_metrics::snapshotter(&recorder);
+        let _metrics = metrics::set_default_local_recorder(&recorder);
+        let s = store().await;
+        put_titled_episode(&s, 1, BSG, (1, 1), "33").await;
+        put_titled_episode(&s, 2, BSG, (2, 1), "Valley of Darkness").await;
+        s.set_item_match(2, "tvdb", "1", "manual", None, NOW)
+            .await
+            .unwrap();
+        // Stored long ago, so the TTL re-asks it.
+        pin(&s, BSG, "71173", 0).await;
+        let (_td, cache) = cache();
+        let tvdb = bsg_search(FakeEnricher::tvdb())
+            .with_list("71173", &[(1, 1, "Saga of a Star World")])
+            .with_list("73545", &[(1, 1, "33"), (2, 1, "Valley of Darkness")]);
+
+        series_pass(&s, &cache, &tvdb).await;
+
+        assert_eq!(
+            series_row(&s, BSG).await.match_external_id.as_deref(),
+            Some("73545")
+        );
+        assert_eq!(pending_ids(&s).await, [1]);
+        assert_eq!(
+            counter_value(
+                &snap,
+                "pharos_series_reconcile_marked_total",
+                &[("reason", "match_changed")]
+            ),
+            1
+        );
+
+        // The same answer again marks nothing more.
+        s.clear_series_reconcile(1, NOW).await.unwrap();
+        pin(&s, BSG, "73545", 0).await;
+        series_pass(&s, &cache, &tvdb).await;
+        assert!(pending_ids(&s).await.is_empty());
+    }
+
+    /// V940 — under `apply`, a marked episode is rebuilt: what the old show's
+    /// record wrote is reset, its stored translations deleted, and it is read
+    /// from its show's current match. The mark then clears.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_marked_episode_is_rebuilt_against_its_shows_match() {
+        let s = store().await;
+        put_titled_episode(&s, 1, BSG, (1, 1), "33").await;
+        let mut item = s.get(1).await.unwrap();
+        item.title = "Saga of a Star World".into();
+        item.metadata.overview = Some("The 1978 pilot.".into());
+        item.metadata.premiere_date = Some(275_184_000);
+        item.metadata.provider_ids.tvdb = Some("71173".into());
+        s.put(item).await.unwrap();
+        s.set_item_match(1, "tvdb", "71173", "search", None, NOW)
+            .await
+            .unwrap();
+        s.upsert_translations(
+            &TranslationOwner::Item(1),
+            &[LocalizedText {
+                language: "deu".into(),
+                title: Some("Die Saga".into()),
+                ..LocalizedText::default()
+            }],
+            NOW,
+        )
+        .await
+        .unwrap();
+        pin(&s, BSG, "73545", NOW).await;
+        s.mark_series_reconcile(BSG, NOW).await.unwrap();
+        let (_td, cache) = cache();
+        let record = EnrichedMetadata {
+            title: Some("33".into()),
+            overview: Some("The fleet jumps every 33 minutes.".into()),
+            premiere_date: Some(1_097_712_000),
+            ..EnrichedMetadata::default()
+        };
+        let tvdb = FakeEnricher::tvdb().with_detail(record);
+
+        let (n, pending) = reconcile_pass(
+            &s,
+            &sem(4),
+            &cache,
+            None::<&FakeEnricher>,
+            Some(&tvdb),
+            &apply_cfg(),
+            NOW + 10,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!((n, pending), (1, true));
+        assert_eq!(tvdb.fetched(), ["73545"], "read from the pinned show");
+        let got = s.get(1).await.unwrap();
+        assert_ne!(got.title, "Saga of a Star World");
+        assert_eq!(
+            got.metadata.overview.as_deref(),
+            Some("The fleet jumps every 33 minutes.")
+        );
+        assert_eq!(got.metadata.premiere_date, Some(1_097_712_000));
+        assert_eq!(got.metadata.provider_ids.tvdb.as_deref(), Some("73545"));
+        assert!(s
+            .translations_for(&[TranslationOwner::Item(1)], &["deu".into()], false)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(pending_ids(&s).await.is_empty());
+    }
+
+    /// V940 — a rebuild drops the stills the old show's record cached (the
+    /// row and the file), so the episode no longer serves the old show's
+    /// still; the new match's still replaces it when its record has one, and
+    /// a local sidecar stays.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_rebuilt_episode_drops_the_old_shows_still() {
+        let s = store().await;
+        let (_td, cache) = cache();
+        let mut old_paths = Vec::new();
+        for id in [1, 2] {
+            put_titled_episode(&s, id, BSG, (1, id as u32), "33").await;
+            let old = cache
+                .upload(
+                    id,
+                    ImageRole::Primary,
+                    MediaKind::Episode,
+                    0,
+                    b"remake still",
+                )
+                .await
+                .unwrap();
+            s.set_artwork(id, "Primary", "tvdb", &old.to_string_lossy())
+                .await
+                .unwrap();
+            old_paths.push(old);
+            s.set_artwork(
+                id,
+                "Backdrop",
+                "local",
+                "/tv/Battlestar Galactica/fanart.jpg",
+            )
+            .await
+            .unwrap();
+            s.mark_reconcile_items(&[id], NOW).await.unwrap();
+        }
+        pin(&s, BSG, "73545", NOW).await;
+        let before = s.get(1).await.unwrap().art_version;
+        let bare = FakeEnricher::tvdb().with_detail(EnrichedMetadata {
+            title: Some("33".into()),
+            ..EnrichedMetadata::default()
+        });
+
+        reconcile_one(
+            &s,
+            &sem(4),
+            &cache,
+            None::<&FakeEnricher>,
+            Some(&bare),
+            &apply_cfg(),
+            1,
+            NOW,
+            NOW + 1,
+        )
+        .await
+        .unwrap();
+
+        let rows = s.artwork_for(1).await.unwrap();
+        assert!(
+            rows.iter().all(|(_, source, _)| source == "local"),
+            "old show's still row kept: {rows:?}"
+        );
+        assert_eq!(rows.len(), 1, "the local sidecar stays");
+        assert!(!old_paths[0].exists(), "old show's cached still kept");
+        assert!(s.get(1).await.unwrap().art_version > before);
+
+        let mut with_still = FakeEnricher::tvdb().with_detail(EnrichedMetadata {
+            title: Some("Water".into()),
+            artwork: vec![RemoteArt {
+                role: ArtworkRole::Primary,
+                url: "https://tvdb.example/2004-still.jpg".into(),
+            }],
+            ..EnrichedMetadata::default()
+        });
+        with_still.image_bytes = Some(b"2004 still".to_vec());
+        reconcile_one(
+            &s,
+            &sem(4),
+            &cache,
+            None::<&FakeEnricher>,
+            Some(&with_still),
+            &apply_cfg(),
+            2,
+            NOW,
+            NOW + 1,
+        )
+        .await
+        .unwrap();
+        let (_, source, locator) = s
+            .artwork_for(2)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|(role, _, _)| role == "Primary")
+            .expect("new still recorded");
+        assert_eq!(source, "tvdb");
+        assert_eq!(std::fs::read(locator).unwrap(), b"2004 still");
+    }
+
+    /// A dry run rebuilds nothing and keeps the mark; a transient miss under
+    /// `apply` keeps it too, moved behind the rest.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_marked_episode_waits_in_a_dry_run_and_after_a_transient_miss() {
+        let s = store().await;
+        put_titled_episode(&s, 1, BSG, (1, 1), "33").await;
+        let mut item = s.get(1).await.unwrap();
+        item.metadata.overview = Some("The 1978 pilot.".into());
+        s.put(item).await.unwrap();
+        pin(&s, BSG, "73545", NOW).await;
+        s.mark_series_reconcile(BSG, NOW).await.unwrap();
+        let (_td, cache) = cache();
+        let tvdb = FakeEnricher::tvdb();
+        let pass = |cfg: MetadataConfig, now: i64| {
+            let (s, cache, tvdb) = (&s, &cache, &tvdb);
+            async move {
+                reconcile_pass(
+                    s,
+                    &sem(4),
+                    cache,
+                    None::<&FakeEnricher>,
+                    Some(tvdb),
+                    &cfg,
+                    now,
+                )
+                .await
+                .unwrap()
+            }
+        };
+
+        assert_eq!(pass(MetadataConfig::default(), NOW + 1).await, (0, false));
+        assert!(tvdb.fetched().is_empty());
+        assert_eq!(
+            s.get(1).await.unwrap().metadata.overview.as_deref(),
+            Some("The 1978 pilot.")
+        );
+        assert_eq!(s.series_reconcile_pending(10).await.unwrap(), [(1, NOW)]);
+
+        assert_eq!(pass(apply_cfg(), NOW + 2).await, (0, true));
+        assert_eq!(
+            s.series_reconcile_pending(10).await.unwrap(),
+            [(1, NOW + 2)]
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
