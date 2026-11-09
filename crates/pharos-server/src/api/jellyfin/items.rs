@@ -2178,12 +2178,10 @@ async fn playback_info(
     body: Option<web::Json<PlaybackInfoBody>>,
 ) -> Result<impl Responder, actix_web::Error> {
     let id_str = path.into_inner();
-    // The HLS master/variant playlists and every segment authenticate via an
-    // `api_key` query param — hls.js fetches them with no auth header, so the
-    // TranscodingUrl handed to the client MUST carry the caller's token or the
-    // very first `master.m3u8` request 401s and playback dies with a fatal
-    // `manifestLoadError`. Recover the bearer that authenticated THIS request.
-    let api_key = crate::api::jellyfin::auth_extractor::extract_token(&req).unwrap_or_default();
+    // The token that authenticated THIS request: the play session it mints
+    // ends with it (B256). It never goes into a URL: the PlaySessionId every
+    // transcode, subtitle and font URL carries is their credential (V1050).
+    let token = crate::api::jellyfin::auth_extractor::extract_token(&req).unwrap_or_default();
     let id: u64 = pharos_jellyfin_api::dto::parse_item_id(&id_str)
         .ok_or_else(|| error::ErrorBadRequest("invalid id"))?;
     // Canonical wire form regardless of which shape the caller sent —
@@ -2273,7 +2271,7 @@ async fn playback_info(
     // The session ends with the token that negotiated it (B256).
     let holder = pharos_core::SessionHolder {
         user_id: user.0.id,
-        token_id: pharos_core::TokenStore::token_id(&state.stores, &api_key),
+        token_id: pharos_core::TokenStore::token_id(&state.stores, &token),
     };
     let is_video = matches!(item.kind, MediaKind::Movie | MediaKind::Episode);
     let probe = &item.probe;
@@ -2366,7 +2364,6 @@ async fn playback_info(
             item_wire_id: &id_str,
             source_param: &source_param,
             play_session_id: &play_session_id,
-            api_key: Some(&api_key),
             audio_stream_index,
             explicit_subtitle_index,
             is_web_client,
@@ -2794,23 +2791,21 @@ async fn playback_info(
 
     // V189 — subtitle and font files answer only an authenticated request,
     // and a `<track>` or font fetch cannot send a header: their URLs carry
-    // the caller's own token, as the transcode URLs above do.
-    if !api_key.is_empty() {
-        for source in &mut media_sources {
-            let streams = source
-                .media_streams
-                .iter_mut()
-                .filter_map(|s| s.delivery_url.as_mut());
-            let fonts = source
-                .media_attachments
-                .iter_mut()
-                .map(|a| &mut a.delivery_url);
-            for url in streams.chain(fonts) {
-                let sep = if url.contains('?') { '&' } else { '?' };
-                url.push(sep);
-                url.push_str("api_key=");
-                url.push_str(&api_key);
-            }
+    // the play session as the transcode URLs do, never the token (V1050).
+    for source in &mut media_sources {
+        let streams = source
+            .media_streams
+            .iter_mut()
+            .filter_map(|s| s.delivery_url.as_mut());
+        let fonts = source
+            .media_attachments
+            .iter_mut()
+            .map(|a| &mut a.delivery_url);
+        for url in streams.chain(fonts) {
+            let sep = if url.contains('?') { '&' } else { '?' };
+            url.push(sep);
+            url.push_str("PlaySessionId=");
+            url.push_str(&play_session_id);
         }
     }
     // P4 — top-level resume offset. jellyfin-web reads this when it didn't keep

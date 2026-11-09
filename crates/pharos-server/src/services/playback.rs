@@ -855,9 +855,9 @@ pub struct DeliveryRequest<'a> {
     pub item_wire_id: &'a str,
     /// `&MediaSourceId=…` when one edition was asked for, else empty.
     pub source_param: &'a str,
+    /// The URL's credential: the transcode routes accept it in place of a
+    /// token (V1050), so no URL carries one.
     pub play_session_id: &'a str,
-    /// The Jellyfin API puts the token in the URL; the native API does not.
-    pub api_key: Option<&'a str>,
     pub audio_stream_index: Option<String>,
     pub explicit_subtitle_index: Option<i64>,
     pub is_web_client: bool,
@@ -881,10 +881,6 @@ pub struct Delivery {
 /// master for video, the universal endpoint for audio.
 pub fn delivery(n: &Negotiated, r: &DeliveryRequest<'_>) -> Delivery {
     let renditions = renditions(n, r);
-    let api_key = r
-        .api_key
-        .map(|k| format!("&api_key={k}"))
-        .unwrap_or_default();
     let (id, psid, source) = (r.item_wire_id, r.play_session_id, r.source_param);
     let transcoding_url = match (&n.decision, n.is_video) {
         (Decision::DirectPlay, _) => None,
@@ -893,14 +889,14 @@ pub fn delivery(n: &Negotiated, r: &DeliveryRequest<'_>) -> Delivery {
         // client's own isTypeSupported pick; the PlaySessionId lets the
         // segment handlers reuse the registered decision (P9, B77).
         (Decision::VideoRemux { .. }, _) | (_, true) => Some(format!(
-            "/videos/{id}/master.m3u8?PlaySessionId={psid}{api_key}&renditions={}{}{}{}{source}",
+            "/videos/{id}/master.m3u8?PlaySessionId={psid}&renditions={}{}{}{}{source}",
             renditions.join(","),
             stream_selection(n, r),
             video_bitrate_param(n),
             r.size_limits.query_suffix(),
         )),
         (_, false) => Some(format!(
-            "/audio/{id}/universal?PlaySessionId={psid}{api_key}{source}"
+            "/audio/{id}/universal?PlaySessionId={psid}{source}"
         )),
     }
     .filter(|_| r.transcoding)
@@ -1644,7 +1640,6 @@ pub async fn grant(
                 item_wire_id: &item_wire_id,
                 source_param: &source_param,
                 play_session_id: &play_session_id,
-                api_key: None,
                 audio_stream_index: audio.index.map(|i| i.to_string()),
                 explicit_subtitle_index: requested_subtitle,
                 is_web_client: false,

@@ -314,12 +314,14 @@ async fn playback_info_video_transcode_emits_url_for_non_ts_container_profile() 
         url.is_some_and(|u| u.contains("master.m3u8")),
         "video transcode must emit an HLS master URL, got {v}"
     );
-    // hls.js fetches the master playlist with NO auth header, so the token
-    // MUST ride in the URL as `api_key` — otherwise the first manifest load
-    // 401s and playback dies with a fatal manifestLoadError.
+    // hls.js fetches the master playlist with NO auth header, so the URL
+    // carries its credential: the PlaySessionId, never the token (V1050).
+    let psid = v["PlaySessionId"].as_str().unwrap_or_default();
     assert!(
-        url.is_some_and(|u| u.contains(&format!("api_key={}", token.0.expose()))),
-        "TranscodingUrl must embed the caller's token as api_key, got {v}"
+        url.is_some_and(
+            |u| u.contains(&format!("PlaySessionId={psid}")) && !u.contains(token.0.expose())
+        ),
+        "TranscodingUrl must carry the PlaySessionId and not the token, got {v}"
     );
     assert_eq!(ms["TranscodingSubProtocol"].as_str(), Some("hls"), "{v}");
 }
@@ -395,8 +397,8 @@ async fn playback_info_vp9_profile_gets_progressive_webm() {
         "expected VP9 fMP4 HLS, got {v}"
     );
     assert!(
-        url.contains(&format!("api_key={}", token.0.expose())),
-        "VP9 HLS URL needs api_key: {v}"
+        !url.contains(token.0.expose()) && url.contains("PlaySessionId="),
+        "VP9 HLS URL carries the PlaySessionId, not the token (V1050): {v}"
     );
     assert_eq!(
         ms["TranscodingSubProtocol"].as_str(),
