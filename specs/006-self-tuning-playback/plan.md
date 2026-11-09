@@ -3,7 +3,8 @@
 **Status (audited 2026-11-09)**: Tasks 1-10 are all implemented and merged on main
 (phase 1 PR #188; 2a 5ed8021e; 2b 62fe90f5, 076d190f, be1d8c74, 0a129edb, 3fa916c9).
 The step checkboxes below were never ticked and are not a progress record. Gate A
-and Gate B are recorded as passed in spec.md; the Task 10 "verify by query" step
+(the shadow-mode gauge read before Task 4) has no recorded result: spec.md records a
+measurement taken after phase 1 shipped, not the shadow-mode read. Gate B is unchanged; the Task 10 "verify by query" step
 for phases 2a/2b has no recorded result.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development
