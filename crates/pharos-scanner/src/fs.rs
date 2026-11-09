@@ -599,6 +599,7 @@ impl<P: Prober> FsScanner<P> {
         store: &S,
     ) -> DomainResult<ScanOutcome> {
         let _exclusive = scan_exclusively().await;
+        forget_show_nfos();
         let started = std::time::Instant::now();
         // Boxed: `scan_run`'s future is a deep stack of store futures, and
         // inlining it into every caller's async block pushes the server's
@@ -3872,8 +3873,36 @@ pub fn show_folder_of(path: &Path) -> Option<PathBuf> {
     path.ancestors()
         .skip(1)
         .take(SHOW_NFO_DEPTH)
-        .find(|p| p.join("tvshow.nfo").is_file())
+        .find(|p| holds_show_nfo(p))
         .map(Path::to_path_buf)
+}
+
+/// Folders already asked whether they hold `tvshow.nfo`, so a scan stats each
+/// folder once rather than three times for every file in it. Cleared when a
+/// scan starts ([`forget_show_nfos`]), so a `tvshow.nfo` added since is seen.
+static SHOW_NFO_FOLDERS: std::sync::LazyLock<std::sync::Mutex<HashMap<PathBuf, bool>>> =
+    std::sync::LazyLock::new(Default::default);
+
+fn holds_show_nfo(dir: &Path) -> bool {
+    let cached = SHOW_NFO_FOLDERS
+        .lock()
+        .ok()
+        .and_then(|m| m.get(dir).copied());
+    if let Some(held) = cached {
+        return held;
+    }
+    let held = dir.join("tvshow.nfo").is_file();
+    if let Ok(mut m) = SHOW_NFO_FOLDERS.lock() {
+        m.insert(dir.to_path_buf(), held);
+    }
+    held
+}
+
+/// Drop what [`holds_show_nfo`] remembered.
+pub(crate) fn forget_show_nfos() {
+    if let Ok(mut m) = SHOW_NFO_FOLDERS.lock() {
+        m.clear();
+    }
 }
 
 /// Whether a video is an episode: by its name or season folder
