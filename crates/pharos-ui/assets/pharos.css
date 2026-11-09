@@ -4828,6 +4828,9 @@ body:has(.pharos-stage.is-mini) .pharos-main {
   margin: 0;
 }
 .pharos-settings-page .pharos-manage-dismiss {
+  /* A 44 px target: it is the only way to close the status line. */
+  min-width: 2.75rem;
+  min-height: 2.75rem;
   padding: 0.1rem 0.55rem;
   border: 0;
   background: none;
