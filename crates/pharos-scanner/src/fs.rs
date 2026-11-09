@@ -2718,7 +2718,8 @@ static BRACKET_RE: std::sync::LazyLock<Option<regex::Regex>> =
 
 /// `name` folded as [`fold_name`] does, after dropping each bracketed tag
 /// that holds only a year or format words (`[FLAC]`, `(2001)`,
-/// `(320 kbps)`, `[24-96]`). Any other bracket stays, so `Album [CD2]`,
+/// `(320 kbps)`, `[24-96]`). Any other bracket stays, as does a lone number
+/// (`Interlude (2)`), so `Album [CD2]`,
 /// `Album (Deluxe)`, `Song [Live]` and `Song (Remix v2)` are their own.
 fn fold_release_name(name: &str) -> String {
     let Some(re) = BRACKET_RE.as_ref() else {
@@ -2726,12 +2727,19 @@ fn fold_release_name(name: &str) -> String {
     };
     let kept = re.replace_all(name, |caps: &regex::Captures<'_>| {
         let inner = caps.get(1).map_or("", |m| m.as_str());
-        let tag = words(inner).iter().all(|w| {
-            SONG_FORMAT_WORDS.contains(&w.as_str())
-                || (w.len() == 4
-                    && (w.starts_with("19") || w.starts_with("20"))
-                    && w.parse::<u32>().is_ok())
-        });
+        let inner = words(inner);
+        let is_year = |w: &String| {
+            w.len() == 4 && (w.starts_with("19") || w.starts_with("20")) && w.parse::<u32>().is_ok()
+        };
+        // A lone number is a track's own `(1)` or `(2)`, not a rate or depth.
+        let lone_number = matches!(
+            inner.as_slice(),
+            [w] if w.chars().all(|c| c.is_ascii_digit()) && !is_year(w)
+        );
+        let tag = !lone_number
+            && inner
+                .iter()
+                .all(|w| SONG_FORMAT_WORDS.contains(&w.as_str()) || is_year(w));
         if tag {
             " ".to_string()
         } else {
@@ -7582,6 +7590,14 @@ mod tests {
         assert_ne!(key("/m/A/Single/Song [Live].flac"), song);
         assert_ne!(key("/m/A/Single/Song (Remix v2).flac"), song);
         assert_ne!(key("/m/A/Single/Song (Web Version).flac"), song);
+        assert_ne!(
+            key("/m/A/Album/Interlude (1).flac"),
+            key("/m/A/Album/Interlude (2).flac"),
+        );
+        assert_eq!(
+            key("/m/A/Album/Song [FLAC 44.1].flac"),
+            key("/m/A/Album/Song.mp3"),
+        );
         assert_eq!(key("/m/A/Single/Song [FLAC 24-96].flac"), song);
         assert_eq!(key("/m/A/Single (2001) [WEB]/Song.mp3"), song);
         assert_ne!(
