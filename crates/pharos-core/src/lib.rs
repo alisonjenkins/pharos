@@ -2629,6 +2629,13 @@ pub struct MediaProbe {
     // bincode, which cannot decode a skipped field.
     #[serde(default)]
     pub audio_analysis: Option<AudioAnalysis>,
+    /// The picture area found by the background black-bar check, written by
+    /// the sweep (never by the prober or `put`). `None` until the file has
+    /// been checked, and again once it changes. Read it through
+    /// [`MediaProbe::picture_area`].
+    // No `skip_serializing_if`: bincode over the worker pipe (see above).
+    #[serde(default)]
+    pub picture_check: Option<PictureCheck>,
 }
 
 impl MediaProbe {
@@ -2647,6 +2654,32 @@ impl MediaProbe {
     pub fn tempo_source(&self) -> Option<TempoSource> {
         self.audio_analysis?.tempo_source
     }
+}
+
+impl MediaProbe {
+    /// The picture inside baked-in black bars, when the check found bars.
+    /// `None` for an unchecked file and for a file with no bars.
+    pub fn picture_area(&self) -> Option<PictureArea> {
+        self.picture_check?.area
+    }
+}
+
+/// A rectangle of the decoded frame that holds the picture, in pixels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct PictureArea {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// One black-bar check result. `area: None` is a check that found no bars (or
+/// could not tell): it is kept so the file is not decoded again on every pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct PictureCheck {
+    /// The detector version that produced this; an older one is redone.
+    pub version: u32,
+    pub area: Option<PictureArea>,
 }
 
 /// Spec 024 — where a song's tempo came from.
@@ -4010,6 +4043,30 @@ pub trait MediaStore: Send + Sync {
             match self.get(id).await {
                 Ok(mut item) => {
                     item.probe.audio_analysis = Some(analysis);
+                    self.put(item).await
+                }
+                Err(DomainError::NotFound(_)) => Ok(()),
+                Err(e) => Err(e),
+            }
+        }
+    }
+
+    /// Store one file's black-bar check, against the file signature
+    /// `(mtime, size)` the check read. Same contract as
+    /// [`put_audio_analysis`](Self::put_audio_analysis): a read returns it in
+    /// [`MediaProbe::picture_check`] only while the row's scan signature still
+    /// matches, `put` never writes it, and a missing row is a no-op.
+    fn put_picture_check(
+        &self,
+        id: MediaId,
+        check: PictureCheck,
+        signature: (i64, u64),
+    ) -> impl std::future::Future<Output = DomainResult<()>> + Send {
+        async move {
+            let _ = signature;
+            match self.get(id).await {
+                Ok(mut item) => {
+                    item.probe.picture_check = Some(check);
                     self.put(item).await
                 }
                 Err(DomainError::NotFound(_)) => Ok(()),

@@ -46,7 +46,9 @@ const MEDIA_COLUMNS: &str = "id, path, title, kind, size_bytes, duration_ms, con
     book_series_index, book_isbn, alternate_sources_json, video_3d_format, \
     imdb_rating, rt_tomatometer, \
     bpm_mille, tempo_source, energy_mille, audio_analysis_version, \
-    audio_analysis_mtime, audio_analysis_size, file_mtime, file_size_seen";
+    audio_analysis_mtime, audio_analysis_size, file_mtime, file_size_seen, \
+    picture_check_version, picture_x, picture_y, picture_w, picture_h, \
+    picture_check_mtime, picture_check_size";
 use futures_util::TryStreamExt;
 use sqlx::PgPool;
 use std::str::FromStr;
@@ -1005,6 +1007,36 @@ impl MediaStore for PostgresStore {
         .bind(analysis.tempo_source.map(pharos_core::TempoSource::label))
         .bind(analysis.energy_mille.map(i64::from))
         .bind(i64::from(analysis.version))
+        .bind(signature.0)
+        .bind(size_i64)
+        .bind(id_i64)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| DomainError::Backend(e.to_string()))?;
+        Ok(())
+    }
+
+    /// One `UPDATE` of the picture check columns; `put` never writes them.
+    #[tracing::instrument(skip(self, check), fields(media.id = %id))]
+    async fn put_picture_check(
+        &self,
+        id: MediaId,
+        check: pharos_core::PictureCheck,
+        signature: (i64, u64),
+    ) -> DomainResult<()> {
+        let id_i64 = media_id_i64(id)?;
+        let size_i64 = i64::try_from(signature.1)
+            .map_err(|e| DomainError::Backend(format!("size overflow: {e}")))?;
+        sqlx::query(
+            "UPDATE media_items SET picture_check_version = $1, picture_x = $2, picture_y = $3, \
+             picture_w = $4, picture_h = $5, picture_check_mtime = $6, picture_check_size = $7 \
+             WHERE id = $8",
+        )
+        .bind(i64::from(check.version))
+        .bind(check.area.map(|a| i64::from(a.x)))
+        .bind(check.area.map(|a| i64::from(a.y)))
+        .bind(check.area.map(|a| i64::from(a.width)))
+        .bind(check.area.map(|a| i64::from(a.height)))
         .bind(signature.0)
         .bind(size_i64)
         .bind(id_i64)
@@ -4079,6 +4111,14 @@ struct MediaRow {
     audio_analysis_size: Option<i64>,
     file_mtime: Option<i64>,
     file_size_seen: Option<i64>,
+    // Picture check (black bars), checked against the scan signature above.
+    picture_check_version: Option<i64>,
+    picture_x: Option<i64>,
+    picture_y: Option<i64>,
+    picture_w: Option<i64>,
+    picture_h: Option<i64>,
+    picture_check_mtime: Option<i64>,
+    picture_check_size: Option<i64>,
 }
 
 impl SeriesMetadataStore for PostgresStore {
@@ -4627,6 +4667,19 @@ impl MediaRow {
                     version: self.audio_analysis_version,
                     analysed_mtime: self.audio_analysis_mtime,
                     analysed_size: self.audio_analysis_size,
+                    file_mtime: self.file_mtime,
+                    file_size: self.file_size_seen,
+                },
+            ),
+            picture_check: crate::picture_check_row::decode(
+                crate::picture_check_row::PictureColumns {
+                    version: self.picture_check_version,
+                    x: self.picture_x,
+                    y: self.picture_y,
+                    width: self.picture_w,
+                    height: self.picture_h,
+                    checked_mtime: self.picture_check_mtime,
+                    checked_size: self.picture_check_size,
                     file_mtime: self.file_mtime,
                     file_size: self.file_size_seen,
                 },

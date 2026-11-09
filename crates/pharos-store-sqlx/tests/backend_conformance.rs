@@ -2646,6 +2646,99 @@ where
         .unwrap();
 
     // -----------------------------------------------------------------
+    // Picture check (black bars): written by `put_picture_check` only, kept
+    // across a re-`put`, valid only while the file signature matches.
+    // -----------------------------------------------------------------
+    let episode: MediaId = (UserId::new().0.as_u128() as u64) >> 2;
+    let mut item = media_item(episode, "bars");
+    item.path = format!("/media/conformance/bars-{episode}.mkv").into();
+    MediaStore::put(&store, item.clone()).await.unwrap();
+    assert_eq!(
+        MediaStore::get(&store, episode)
+            .await
+            .unwrap()
+            .probe
+            .picture_check,
+        None,
+        "new file is unchecked"
+    );
+    let bars = pharos_core::PictureCheck {
+        version: 1,
+        area: Some(pharos_core::PictureArea {
+            x: 242,
+            y: 0,
+            width: 1436,
+            height: 1080,
+        }),
+    };
+    MediaStore::put_picture_check(&store, episode, bars, (1_700_000_000, 4_096))
+        .await
+        .unwrap();
+    let got = MediaStore::get(&store, episode).await.unwrap().probe;
+    assert_eq!(got.picture_check, Some(bars));
+    assert_eq!(got.picture_area(), bars.area);
+    let listed = MediaStore::list(&store).await.unwrap();
+    assert_eq!(
+        listed
+            .iter()
+            .find(|i| i.id == episode)
+            .unwrap()
+            .probe
+            .picture_check,
+        Some(bars),
+        "the list path decodes the same columns"
+    );
+    MediaStore::put(&store, item.clone()).await.unwrap();
+    assert_eq!(
+        MediaStore::get(&store, episode)
+            .await
+            .unwrap()
+            .probe
+            .picture_check,
+        Some(bars),
+        "put never writes the picture columns"
+    );
+    let scan = MediaStore::begin_scan(&store, std::path::Path::new("/media/conformance"))
+        .await
+        .unwrap();
+    MediaStore::mark_seen(&store, episode, scan, 1_700_000_000, 4_096)
+        .await
+        .unwrap();
+    assert_eq!(
+        MediaStore::get(&store, episode)
+            .await
+            .unwrap()
+            .probe
+            .picture_check,
+        Some(bars)
+    );
+    MediaStore::mark_seen(&store, episode, scan, 1_700_000_060, 4_096)
+        .await
+        .unwrap();
+    assert_eq!(
+        MediaStore::get(&store, episode)
+            .await
+            .unwrap()
+            .probe
+            .picture_check,
+        None,
+        "a changed file reads as unchecked"
+    );
+    let no_bars = pharos_core::PictureCheck {
+        version: 1,
+        area: None,
+    };
+    MediaStore::put_picture_check(&store, episode, no_bars, (1_700_000_060, 4_096))
+        .await
+        .unwrap();
+    let got = MediaStore::get(&store, episode).await.unwrap().probe;
+    assert_eq!(got.picture_check, Some(no_bars), "no bars is stored too");
+    assert_eq!(got.picture_area(), None);
+    MediaStore::put_picture_check(&store, episode + 1, bars, (1, 1))
+        .await
+        .unwrap();
+
+    // -----------------------------------------------------------------
     // Spec 028 — subtitle styling: one row per item, replaced by a new
     // source choice, plan_json left out of the index, gone with the item.
     // Last, because the cascade check sweeps the whole conformance root.

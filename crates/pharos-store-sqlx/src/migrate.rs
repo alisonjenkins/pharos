@@ -517,7 +517,9 @@ const MEDIA_MIGRATE_COLUMNS: &str = "id, path, title, kind, \
     title_fold, attachments_json, probe_schema_version, video_3d_format, \
     alternate_sources_json, has_3d, \
     bpm_mille, tempo_source, energy_mille, audio_analysis_version, \
-    audio_analysis_mtime, audio_analysis_size";
+    audio_analysis_mtime, audio_analysis_size, \
+    picture_check_version, picture_x, picture_y, picture_w, picture_h, \
+    picture_check_mtime, picture_check_size";
 
 #[derive(sqlx::FromRow)]
 struct MediaItemRow {
@@ -582,13 +584,20 @@ struct MediaItemRow {
     audio_analysis_version: Option<i64>,
     audio_analysis_mtime: Option<i64>,
     audio_analysis_size: Option<i64>,
+    picture_check_version: Option<i64>,
+    picture_x: Option<i64>,
+    picture_y: Option<i64>,
+    picture_w: Option<i64>,
+    picture_h: Option<i64>,
+    picture_check_mtime: Option<i64>,
+    picture_check_size: Option<i64>,
     sort_name: Option<String>,
 }
 
 /// media_items can be ~15k rows in a real deployment; each row is bound
 /// individually inside the one enclosing transaction rather than built as
 /// a giant multi-row VALUES list, which keeps the per-row bind list a
-/// manageable fixed 61-placeholder statement while still batching the
+/// manageable fixed 67-placeholder statement while still batching the
 /// whole copy as a single round of prepared-statement reuse.
 async fn copy_media_items(
     sp: &SqlitePool,
@@ -608,7 +617,7 @@ async fn copy_media_items(
         "INSERT INTO media_items ({MEDIA_MIGRATE_COLUMNS}, sort_name) VALUES \
          ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,\
          $24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40,$41,$42,$43,$44,\
-         $45,$46,$47,$48,$49,$50,$51,$52,$53,$54,$55,$56,$57,$58,$59,$60,$61)"
+         $45,$46,$47,$48,$49,$50,$51,$52,$53,$54,$55,$56,$57,$58,$59,$60,$61,$62,$63,$64,$65,$66,$67)"
     );
     for row in rows {
         let sort_name = row
@@ -675,6 +684,13 @@ async fn copy_media_items(
             .bind(row.audio_analysis_version)
             .bind(row.audio_analysis_mtime)
             .bind(row.audio_analysis_size)
+            .bind(row.picture_check_version)
+            .bind(row.picture_x)
+            .bind(row.picture_y)
+            .bind(row.picture_w)
+            .bind(row.picture_h)
+            .bind(row.picture_check_mtime)
+            .bind(row.picture_check_size)
             .bind(sort_name)
             .execute(&mut **tx)
             .await

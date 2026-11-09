@@ -204,6 +204,7 @@ pub fn probe(path: &Path) -> Result<ProbeInfo, ProbeError> {
             video_3d_format: v.video_3d_format,
             // Written by the audio analysis sweep, never by the prober.
             audio_analysis: None,
+            picture_check: None,
         },
     })
 }
