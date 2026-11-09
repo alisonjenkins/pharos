@@ -14,6 +14,7 @@ pub mod art;
 pub mod backdrop;
 pub mod bars;
 pub mod browse;
+pub mod check_match;
 pub mod damage;
 pub mod depth;
 pub mod diagnostics;
