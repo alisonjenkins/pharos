@@ -123,6 +123,7 @@ fn opts() -> SegmentOpts {
         stereo_output: Default::default(),
         tonemap: Default::default(),
         output_size: None,
+        output_scale_reason: None,
     }
 }
 
