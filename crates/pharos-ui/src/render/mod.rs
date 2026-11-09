@@ -123,6 +123,19 @@ impl Fallback {
             Fallback::NoCanvas => "no_canvas",
         }
     }
+
+    /// The fallback a [`Fallback::label`] names, for one reported across a
+    /// process boundary (the TV page's visualiser); a shader's log does not
+    /// cross, and an unknown label reads as no WebGL2.
+    pub fn from_label(label: &str) -> Fallback {
+        match label {
+            "reduced_motion" => Fallback::ReducedMotion,
+            "context_lost" => Fallback::ContextLost,
+            "shader" => Fallback::Shader(String::new()),
+            "no_canvas" => Fallback::NoCanvas,
+            _ => Fallback::NoWebgl2,
+        }
+    }
 }
 
 /// A surface drawing `program` on the canvas with id `canvas_id`, or why
@@ -164,6 +177,20 @@ pub fn open_subtitles(canvas_id: &str) -> Result<Box<dyn subtitles::SubtitleComp
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_fallback_reads_back_from_its_label() {
+        for f in [
+            Fallback::ReducedMotion,
+            Fallback::NoWebgl2,
+            Fallback::ContextLost,
+            Fallback::Shader(String::new()),
+            Fallback::NoCanvas,
+        ] {
+            assert_eq!(Fallback::from_label(f.label()), f);
+        }
+        assert_eq!(Fallback::from_label("bogus"), Fallback::NoWebgl2);
+    }
 
     #[test]
     fn reduced_motion_wins_before_any_gpu_is_asked() {
