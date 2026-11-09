@@ -247,6 +247,9 @@ compat-dioxus-full native="on" port="8096" config="playwright.dioxus.config.ts":
     for n in $(seq 0 20); do
       printf '[%02d:%02d.00]Carefree line %d\n' $((n * 2 / 60)) $((n * 2 % 60)) "$n"
     done > "$TMP/media/05-carefree.lrc"
+    # A long EPUB whose words are unique tokens, and a Kindle file the scanner
+    # cannot convert (DRM stand-in), for the reader's spec (023: V352, V353).
+    nix develop --command node compat-playwright/tools/make-reader-books.cjs "$TMP/media/Books"
     NATIVE_BLOCK=""
     if [[ "{{ native }}" == "on" ]]; then
       NATIVE_BLOCK=$(cat <<NATIVE
@@ -290,6 +293,11 @@ compat-dioxus-full native="on" port="8096" config="playwright.dioxus.config.ts":
     path = "$TMP/media/Stereo"
     name = "Stereo"
     kind = "movies"
+
+    [[media.libraries]]
+    path = "$TMP/media/Books"
+    name = "Reader Books"
+    kind = "books"
 
     [database]
     url = "sqlite://$TMP/pharos.db?mode=rwc"
