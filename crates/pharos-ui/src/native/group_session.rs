@@ -120,11 +120,14 @@ pub trait GroupPlayer {
     fn pause(&self);
     fn seek_ms(&self, ms: u64);
     fn set_rate(&self, rate: f64);
-    /// What the viewer calls the stream `index` of this kind, for the activity lines.
+    /// What the viewer calls the stream `index` of this kind, for the activity
+    /// lines. Indexes here are the primary file's, as the group's (ADR-0089).
     fn track_label(&self, kind: TrackKind, index: u32) -> Option<String>;
-    /// The audio and subtitle stream indexes of the item playing.
+    /// The audio and subtitle streams of the version playing, as the primary
+    /// file's indexes.
     fn stream_indexes(&self) -> (Vec<u32>, Vec<u32>);
-    /// Switch the player's audio and subtitle, as its own menus do.
+    /// Switch the player's audio and subtitle, as its own menus do; `picks`
+    /// name the primary file's streams.
     fn apply_tracks(&self, picks: TrackPicks);
 }
 
