@@ -810,6 +810,13 @@ impl PersonStore for AnyStore {
         }
     }
 
+    async fn actors_named(&self, words: &[String], limit: u32) -> DomainResult<Vec<Person>> {
+        match self {
+            AnyStore::Sqlite(s) => s.actors_named(words, limit).await,
+            AnyStore::Postgres(p) => p.actors_named(words, limit).await,
+        }
+    }
+
     async fn person_details(&self, wire_id: &str) -> DomainResult<Option<PersonDetails>> {
         match self {
             AnyStore::Sqlite(s) => s.person_details(wire_id).await,

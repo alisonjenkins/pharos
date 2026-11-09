@@ -1326,9 +1326,24 @@ where
         sort_order: Some(0),
         ..person
     };
-    PersonStore::link_item_people(&store, item_id, &[person.clone(), guest])
-        .await
-        .unwrap();
+    let director = PersonRef {
+        name: "Conformance Director".into(),
+        kind: PersonKind::Director,
+        role: Some("Director".into()),
+        ..Default::default()
+    };
+    let accented = PersonRef {
+        name: "Élodie Conformance".into(),
+        kind: PersonKind::GuestStar,
+        ..Default::default()
+    };
+    PersonStore::link_item_people(
+        &store,
+        item_id,
+        &[person.clone(), guest, director, accented],
+    )
+    .await
+    .unwrap();
     let person_counts = PersonStore::people_with_counts(&store).await.unwrap();
     assert!(person_counts
         .iter()
@@ -1369,6 +1384,41 @@ where
             .unwrap()
             .is_empty()
     );
+    // Actors are found by every word of their name, crew left out.
+    let named = |words: &[&str], limit| {
+        let words: Vec<String> = words.iter().map(|w| (*w).to_owned()).collect();
+        let store = &store;
+        async move {
+            PersonStore::actors_named(store, &words, limit)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|p| p.name)
+                .collect::<Vec<_>>()
+        }
+    };
+    assert_eq!(
+        named(&["conformance"], 10).await,
+        [
+            "Conformance Actor",
+            "Conformance Guest",
+            "Élodie Conformance"
+        ],
+        "the director is not an actor"
+    );
+    assert!(
+        named(&["élodie"], 10)
+            .await
+            .contains(&"Élodie Conformance".to_owned()),
+        "a capital outside ASCII is still found"
+    );
+    assert_eq!(named(&["GUEST", "conf"], 10).await, ["Conformance Guest"]);
+    assert_eq!(named(&["conformance"], 1).await.len(), 1);
+    assert!(
+        named(&["conf%"], 10).await.is_empty(),
+        "a % is matched literally"
+    );
+    assert!(named(&[], 10).await.is_empty());
     // A person's provider details are kept, and replaced whole.
     // A fresh id per run, so a persistent postgres starts with none kept.
     let lead = person_wire_id(&format!("Details Probe {}", UserId::new().0.simple()));

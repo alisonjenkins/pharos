@@ -803,6 +803,21 @@ fn push_user_data_clauses(
     }
 }
 
+/// What `LOWER(name) LIKE` can find of a lowercased `word`: SQLite, and
+/// Postgres under the C locale, fold only ASCII case, so a word with other letters is cut to its longest
+/// ASCII run ("élodie" to "lodie"), which every name holding the word also
+/// holds. A word with no ASCII letters (a script without case) stays whole.
+pub(crate) fn ascii_needle(word: &str) -> String {
+    if word.is_ascii() {
+        return word.to_owned();
+    }
+    word.split(|c: char| !c.is_ascii_alphanumeric())
+        .max_by_key(|run| run.len())
+        .filter(|run| !run.is_empty())
+        .unwrap_or(word)
+        .to_owned()
+}
+
 /// Escape LIKE wildcards in a user search term so `%`/`_` are literal. The
 /// query MUST use `ESCAPE '\'`.
 pub(crate) fn like_escape(s: &str) -> String {
