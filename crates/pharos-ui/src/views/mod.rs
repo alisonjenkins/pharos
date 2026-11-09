@@ -17,7 +17,9 @@ pub mod remote;
 pub mod search;
 pub mod server_picker;
 
-pub use admin::{AdminAction, AdminTab, AdminView, AdminViewProps, CreateUserAttempt};
+pub use admin::{
+    AdminAction, AdminTab, AdminView, AdminViewProps, CreateUserAttempt, DeepSearchState,
+};
 pub use app_state::{AppRoute, RootApp};
 pub use detail::{DetailAction, ItemDetailView};
 pub use group::{GroupAction, GroupMember, GroupSessionPanel, GroupSnapshot};
