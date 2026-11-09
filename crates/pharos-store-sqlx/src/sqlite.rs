@@ -2163,6 +2163,61 @@ impl PersonStore for SqliteStore {
     }
 
     #[tracing::instrument(skip(self))]
+    async fn actors_named(&self, words: &[String], limit: u32) -> DomainResult<Vec<Person>> {
+        if words.is_empty() {
+            return Ok(Vec::new());
+        }
+        let clauses: Vec<String> = (1..=words.len())
+            .map(|_| "LOWER(p.name) LIKE ? ESCAPE '\\'".to_owned())
+            .collect();
+        // Only placeholders are interpolated; every word is bound.
+        let sql = format!(
+            "SELECT p.id, p.name, p.sort_name, p.wire_id, p.provider_ids, p.thumb_url \
+             FROM people p \
+             WHERE {} AND EXISTS (SELECT 1 FROM item_people ip \
+                 WHERE ip.person_id = p.id AND ip.person_kind IN ('Actor', 'GuestStar')) \
+             ORDER BY LENGTH(p.name), p.name LIMIT ?",
+            clauses.join(" AND "),
+        );
+        let mut query = sqlx::query_as::<
+            _,
+            (
+                i64,
+                String,
+                Option<String>,
+                String,
+                Option<String>,
+                Option<String>,
+            ),
+        >(sqlx::AssertSqlSafe(sql));
+        for word in words {
+            query = query.bind(format!(
+                "%{}%",
+                crate::media_query::like_escape(&crate::media_query::ascii_needle(
+                    &word.to_lowercase()
+                ))
+            ));
+        }
+        let rows = query
+            .bind(i64::from(limit))
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| DomainError::Backend(e.to_string()))?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(id, name, sort_name, wire_id, provider_ids, thumb_url)| Person {
+                    id,
+                    name,
+                    sort_name,
+                    wire_id,
+                    provider_ids,
+                    thumb_url,
+                },
+            )
+            .collect())
+    }
+
     async fn person_details(&self, wire_id: &str) -> DomainResult<Option<PersonDetails>> {
         let row = sqlx::query_as::<
             _,

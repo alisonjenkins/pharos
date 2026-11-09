@@ -1088,6 +1088,17 @@ pub trait PersonStore: Send + Sync {
         wire_id: &str,
     ) -> impl std::future::Future<Output = DomainResult<Vec<(MediaId, ItemPerson)>>> + Send;
 
+    /// Up to `limit` people with an acting credit (`Actor` or `GuestStar`)
+    /// whose name holds every one of `words` (compared lowercased), shortest
+    /// name first. Nothing when `words` is empty. A database may fold only
+    /// ASCII case, so a word with other letters is matched by its ASCII part
+    /// and more names may come back: callers check each name.
+    fn actors_named(
+        &self,
+        words: &[String],
+        limit: u32,
+    ) -> impl std::future::Future<Output = DomainResult<Vec<Person>>> + Send;
+
     /// The provider details kept for the person whose `wire_id` matches;
     /// `None` when none were ever fetched.
     fn person_details(
