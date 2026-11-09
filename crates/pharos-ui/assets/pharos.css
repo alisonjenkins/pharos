@@ -5663,6 +5663,57 @@ body:has(.pharos-stage.is-mini) .pharos-main {
   margin-inline-start: auto;
 }
 
+/* Admin > Show identity: one card per folder, match or hand fix. */
+.pharos-admin-identity-summary,
+.pharos-admin-identity-hint {
+  margin: 0;
+  color: var(--px-color-fg-muted);
+}
+.pharos-admin-section-identity h3 {
+  margin: 0.6rem 0 0;
+}
+.pharos-admin-identity-card {
+  display: grid;
+  gap: 0.35rem;
+  min-width: 0;
+  padding: 1rem 1.2rem;
+  border: var(--px-border) solid var(--px-color-border);
+  border-radius: calc(var(--px-radius) * 1.5);
+  background: var(--px-color-surface);
+}
+.pharos-admin-identity-card h4 {
+  margin: 0;
+  font-size: 1rem;
+  overflow-wrap: anywhere;
+}
+.pharos-admin-identity-card[data-status="pending"] {
+  border-left: 3px solid var(--px-color-accent);
+}
+.pharos-admin-identity-status {
+  margin: 0;
+  font-weight: 600;
+}
+.pharos-admin-identity-facts,
+.pharos-admin-identity-count {
+  margin: 0;
+  color: var(--px-color-fg-muted);
+  font-size: var(--px-type-step--1);
+}
+.pharos-admin-identity-groups {
+  margin: 0;
+  padding-inline-start: 1.2rem;
+  overflow-wrap: anywhere;
+}
+.pharos-admin-identity-moves summary {
+  cursor: pointer;
+  color: var(--px-color-fg-muted);
+}
+.pharos-admin-identity-moves ul {
+  margin: 0.3rem 0 0;
+  padding-inline-start: 1.2rem;
+  overflow-wrap: anywhere;
+}
+
 @media (max-width: 48rem) {
   .pharos-manage .pharos-settings-link {
     width: auto;
