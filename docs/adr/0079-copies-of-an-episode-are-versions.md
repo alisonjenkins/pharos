@@ -43,7 +43,7 @@ keeps its own row. Films are not grouped by this rule.
 
 - One row per episode: watched state, Next Up, resume and search see one
   item, Jellyfin clients get the copies as PlaybackInfo MediaSources, and
-  pharos-ui offers them in its Version picker (schema 28).
+  pharos-ui offers them in its Version picker (schema 29).
 - The first scan after deploy deletes the copies' rows. Played, favourite,
   play count and resume carry over; anything else keyed on the deleted id
   (playlist entries, a stored audio or subtitle choice, whose stream indexes
