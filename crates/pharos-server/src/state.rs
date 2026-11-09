@@ -260,6 +260,9 @@ pub struct AppState {
     /// Directory pharos surfaces log files from for the
     /// `/System/Logs` admin endpoint. None disables the surface.
     pub log_dir: Option<PathBuf>,
+    /// "Report a problem" documents (016 US5). None refuses reports as
+    /// unavailable.
+    pub client_reports: Option<crate::client_reports::ReportStore>,
     /// Resolved directories the dashboard storage panel reports disk
     /// usage for (`GET /System/Info/Storage`). Set from config at boot.
     pub storage_folders: StorageFolders,
@@ -778,6 +781,7 @@ impl AppState {
             media_roots: Vec::new(),
             library_set: Arc::new(std::sync::RwLock::new(Vec::new())),
             log_dir: None,
+            client_reports: None,
             storage_folders: StorageFolders::default(),
             quick_connect: crate::quick_connect::QuickConnectRegistry::spawn(),
             server_id: Uuid::new_v4().simple().to_string(),
@@ -856,6 +860,15 @@ impl AppState {
         self
     }
 
+    /// Builder: attach the store "Report a problem" documents are kept in.
+    pub fn with_client_reports(
+        mut self,
+        store: Option<crate::client_reports::ReportStore>,
+    ) -> Self {
+        self.client_reports = store;
+        self
+    }
+
     /// Builder: set the directories the dashboard storage panel reports
     /// disk usage for (`GET /System/Info/Storage`).
     pub fn with_storage_folders(mut self, folders: StorageFolders) -> Self {
@@ -910,6 +923,7 @@ impl AppState {
             media_roots: Vec::new(),
             library_set: Arc::new(std::sync::RwLock::new(Vec::new())),
             log_dir: None,
+            client_reports: None,
             storage_folders: StorageFolders::default(),
             quick_connect: crate::quick_connect::QuickConnectRegistry::spawn(),
             server_id,
