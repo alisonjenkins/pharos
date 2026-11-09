@@ -467,6 +467,7 @@ pub fn ReaderScreen(id: ItemRef) -> Element {
     });
 
     let current = *settings.read();
+    let page_background = view_settings(current).theme.background;
     let shown = phase.read().clone();
     let label = percent_label(*fraction.read());
     let width = format!("width: {}%", super::reader::percent(*fraction.read()));
@@ -510,7 +511,15 @@ pub fn ReaderScreen(id: ItemRef) -> Element {
                     "Aa"
                 }
             }
-            div { class: "pharos-reader-host", id: HOST_ID }
+            // The page theme fills the stage; the host, one measure wide at
+            // the text size, sits in its middle.
+            div { class: "pharos-reader-stage", style: "background: {page_background}",
+                div {
+                    class: "pharos-reader-host",
+                    id: HOST_ID,
+                    style: "font-size: {current.font_px}px",
+                }
+            }
             div {
                 class: "pharos-reader-progress",
                 role: "progressbar",
