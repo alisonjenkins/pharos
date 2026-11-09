@@ -2,7 +2,7 @@
 
 **Feature directory**: `specs/016-ui-observability/`
 **Created**: 2026-11-01
-**Status**: draft (`/speckit-specify` stage; next: `/speckit-clarify`)
+**Status**: partially built (audited 2026-11-09): client event submit with per-user opt-in and server re-emit to Loki/Prometheus shipped; trace propagation, spans, reports, overlay, anonymous channel, dashboard open
 **Input**: "A key thing that will help us with development, I want UI side
 observability to enable us to debug from both server and client side so we
 never have to guess what a problem is." (Alison, 2026-11-01)
@@ -285,3 +285,16 @@ produces one event.
 
 Third-party RUM/APM services. Session replay (screen recording). Telemetry from
 jellyfin-web or native apps (server-side signals already cover them).
+
+## Progress (audited 2026-11-09)
+
+- US1 one trace click to encoder: partial. `CallContext.traceparent` exists on the wire (crates/pharos-client/src/lib.rs, pharos.capnp `CallContext`); no per-action context minted in pharos-ui and no `ClientSpan` handling in the server found.
+- US2 events to Loki and Prometheus: done for events. `Telemetry.submit` (crates/pharos-server/src/api/pharos/rpc/telemetry.rs, commits 00e23971, 7edeea9c opt-in gate) logs `pharos_client_events_total` and counts `pharos_client_events_dropped_total{reason}`; pharos-ui reports through `report_event` (native/web.rs). Series is named `pharos_client_events_*`, not the `pharos_ui_events_total` of FR-007. `ClientSpan` OTLP forwarding not found.
+- US3 failures say why with the value: partial (playback, renderer-fallback and group events carry fields: 1c91356d, a3ab2907); wasm panic hook not found.
+- US4 playback explainable: partial (`playbackStart`, `playbackResume`, `playbackSummary` event kinds; Rust HLS engine tracker dc50e9eb, a3ab2907).
+- US5 Report a problem: not started (`Telemetry.report` is in the schema but the server has no `report` handler; no UI).
+- US6 debug overlay: not started.
+- US7 server-side view of clients: not started.
+- US8 performance and UX timings: not started.
+- US9 privacy and control: partial (per-user opt-in gate server and UI, ADR "per-user prefs store and the telemetry opt-in gate" 541f7184); admin anonymous pre-login channel (`submitAnonymous` in schema, FR-005a) not implemented server-side as far as found.
+- FR-014 Grafana dashboard and FR-015 docs/observability.md UI section: not started.
