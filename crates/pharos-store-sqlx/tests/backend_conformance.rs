@@ -3033,6 +3033,25 @@ where
     assert_eq!(store.mark_reconcile_items(&[new.id], 400).await.unwrap(), 0);
     assert!(store.series_reconcile_pending(10).await.unwrap().is_empty());
 
+    MediaStore::set_artwork(&store, old.id, "Primary", "tvdb", "/cache/old-still.jpg")
+        .await
+        .unwrap();
+    MediaStore::set_artwork(&store, old.id, "Thumb", "local", "/tv/x-thumb.jpg")
+        .await
+        .unwrap();
+    assert_eq!(
+        store.delete_provider_artwork(old.id).await.unwrap(),
+        vec![("Primary".to_string(), "/cache/old-still.jpg".to_string())]
+    );
+    assert_eq!(
+        MediaStore::artwork_for(&store, old.id).await.unwrap(),
+        vec![(
+            "Thumb".to_string(),
+            "local".to_string(),
+            "/tv/x-thumb.jpg".to_string()
+        )]
+    );
+
     assert_eq!(store.readmit_series(&[]).await.unwrap(), 0);
     assert_eq!(
         store.readmit_series(&[FOLDER.to_string()]).await.unwrap(),

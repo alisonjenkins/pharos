@@ -831,6 +831,13 @@ impl SeriesIdentityStore for AnyStore {
             AnyStore::Postgres(p) => p.readmit_series(keys).await,
         }
     }
+
+    async fn delete_provider_artwork(&self, id: MediaId) -> DomainResult<Vec<(String, String)>> {
+        match self {
+            AnyStore::Sqlite(s) => s.delete_provider_artwork(id).await,
+            AnyStore::Postgres(p) => p.delete_provider_artwork(id).await,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------

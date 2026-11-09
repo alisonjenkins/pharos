@@ -1792,6 +1792,16 @@ pub trait SeriesIdentityStore: Send + Sync {
     ) -> impl std::future::Future<Output = DomainResult<u64>> + Send {
         async { Ok(0) }
     }
+
+    /// Delete `id`'s artwork rows that a provider wrote (any source but
+    /// `local`), returning each deleted `(role, locator)` so the caller can
+    /// remove the cached file. Local sidecar rows stay.
+    fn delete_provider_artwork(
+        &self,
+        _id: MediaId,
+    ) -> impl std::future::Future<Output = DomainResult<Vec<(String, String)>>> + Send {
+        async { Ok(Vec::new()) }
+    }
 }
 
 /// A provider's title and description for one show or episode in one

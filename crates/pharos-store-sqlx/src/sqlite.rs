@@ -3960,6 +3960,18 @@ impl SeriesIdentityStore for SqliteStore {
             .map_err(|e| DomainError::Backend(e.to_string()))?;
         Ok(res.rows_affected())
     }
+
+    async fn delete_provider_artwork(&self, id: MediaId) -> DomainResult<Vec<(String, String)>> {
+        let id_i64 =
+            i64::try_from(id).map_err(|e| DomainError::Backend(format!("id overflow: {e}")))?;
+        sqlx::query_as::<_, (String, String)>(
+            "DELETE FROM artwork WHERE item_id = ? AND source <> 'local' RETURNING role, locator",
+        )
+        .bind(id_i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| DomainError::Backend(e.to_string()))
+    }
 }
 
 impl MediaRow {
