@@ -153,6 +153,7 @@ async fn seed_with_token(fixture: &Path) -> (web::Data<AppState>, String) {
     let token = stores.issue(uid, "t").await.unwrap();
     stores
         .put(MediaItem {
+            locked: Default::default(),
             id: 7,
             path: fixture.to_path_buf(),
             title: "m".into(),

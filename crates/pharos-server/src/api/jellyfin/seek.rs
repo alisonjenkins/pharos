@@ -384,6 +384,7 @@ mod tests {
 
     fn item(container: Option<&str>, video_codec: Option<&str>, path: &str) -> MediaItem {
         MediaItem {
+            locked: Default::default(),
             id: 1,
             path: path.into(),
             title: "t".into(),

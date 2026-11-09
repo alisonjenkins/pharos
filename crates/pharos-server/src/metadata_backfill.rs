@@ -1294,6 +1294,7 @@ where
     };
     store
         .upsert_series_metadata(SeriesMetadata {
+            locked: Default::default(),
             series_key: key,
             series_name: prior
                 .as_ref()
@@ -3007,6 +3008,7 @@ where
     };
     store
         .upsert_series_metadata(SeriesMetadata {
+            locked: Default::default(),
             series_key: cand.series_key.clone(),
             series_name: cand.series_name.clone(),
             match_provider: Some(hit.provider.into()),

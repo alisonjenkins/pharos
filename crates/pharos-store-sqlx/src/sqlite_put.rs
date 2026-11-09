@@ -36,9 +36,9 @@ const _: () = assert!(MAX_ROWS_PER_STATEMENT * PUT_COLUMN_COUNT <= 32_766);
 /// `created_at` keeps the value already stored (rows that predate migration
 /// 0010 have none, hence the COALESCE).
 pub(crate) const PUT_CONFLICT_UPDATE: &str = "path = excluded.path,
-    title = excluded.title,
-    title_fold = excluded.title_fold,
-    sort_name = excluded.sort_name,
+    title = CASE WHEN (media_items.locked_fields & 1) <> 0 THEN media_items.title ELSE excluded.title END,
+    title_fold = CASE WHEN (media_items.locked_fields & 1) <> 0 THEN media_items.title_fold ELSE excluded.title_fold END,
+    sort_name = CASE WHEN (media_items.locked_fields & 3) <> 0 THEN media_items.sort_name ELSE excluded.sort_name END,
     kind = excluded.kind,
     size_bytes = excluded.size_bytes,
     duration_ms = excluded.duration_ms,
@@ -68,13 +68,13 @@ pub(crate) const PUT_CONFLICT_UPDATE: &str = "path = excluded.path,
     color_space = excluded.color_space,
     audio_tracks_json = excluded.audio_tracks_json,
     attachments_json = excluded.attachments_json,
-    community_rating = excluded.community_rating,
-    critic_rating = excluded.critic_rating,
-    official_rating = excluded.official_rating,
-    production_year = excluded.production_year,
-    premiere_date = excluded.premiere_date,
-    overview = excluded.overview,
-    tagline = excluded.tagline,
+    community_rating = CASE WHEN (media_items.locked_fields & 128) <> 0 THEN media_items.community_rating ELSE excluded.community_rating END,
+    critic_rating = CASE WHEN (media_items.locked_fields & 256) <> 0 THEN media_items.critic_rating ELSE excluded.critic_rating END,
+    official_rating = CASE WHEN (media_items.locked_fields & 64) <> 0 THEN media_items.official_rating ELSE excluded.official_rating END,
+    production_year = CASE WHEN (media_items.locked_fields & 16) <> 0 THEN media_items.production_year ELSE excluded.production_year END,
+    premiere_date = CASE WHEN (media_items.locked_fields & 32) <> 0 THEN media_items.premiere_date ELSE excluded.premiere_date END,
+    overview = CASE WHEN (media_items.locked_fields & 4) <> 0 THEN media_items.overview ELSE excluded.overview END,
+    tagline = CASE WHEN (media_items.locked_fields & 8) <> 0 THEN media_items.tagline ELSE excluded.tagline END,
     provider_ids = excluded.provider_ids,
     production_locations_json = excluded.production_locations_json,
     original_language = excluded.original_language,
@@ -263,6 +263,12 @@ mod tests {
                 "series_key = CASE WHEN excluded.series_key IS NOT NULL".to_string()
             } else if col == "series_year" {
                 "series_year = CASE WHEN excluded.series_key IS NULL".to_string()
+            } else if let Some(bits) = crate::metadata_edit::item_column_guard(col) {
+                // ADR-0097: an admin-locked column keeps its stored value.
+                format!(
+                    "{col} = CASE WHEN (media_items.locked_fields & {bits}) <> 0 \
+                     THEN media_items.{col} ELSE excluded.{col} END"
+                )
             } else {
                 format!("{col} = excluded.{col}")
             };

@@ -98,6 +98,10 @@ pub(crate) mod series_meta_row;
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
 mod ratings;
 
+/// Admin metadata edits and their field locks (ADR-0097).
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+mod metadata_edit;
+
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
 mod subtitle_styling;
 

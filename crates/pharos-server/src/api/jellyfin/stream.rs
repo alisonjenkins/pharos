@@ -1402,6 +1402,7 @@ mod tests {
 
     fn item_with_bitrate(bitrate_bps: Option<u64>, size_bytes: Option<u64>) -> MediaItem {
         MediaItem {
+            locked: Default::default(),
             id: 1,
             path: "/no/such".into(),
             title: "t".into(),

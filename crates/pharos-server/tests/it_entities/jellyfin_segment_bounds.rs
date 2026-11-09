@@ -44,6 +44,7 @@ async fn seed() -> (web::Data<AppState>, String) {
     let token = stores.issue(uid, "t").await.unwrap();
     stores
         .put(MediaItem {
+            locked: Default::default(),
             id: 42,
             // No real file — the bounds guard 404s before any transcode reads it.
             path: "/nonexistent/clip.webm".into(),

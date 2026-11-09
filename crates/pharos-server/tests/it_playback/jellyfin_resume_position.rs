@@ -35,6 +35,7 @@ async fn seed(played: bool, position_ticks: u64) -> (web::Data<AppState>, String
     let token = stores.issue(uid, "t").await.unwrap();
     stores
         .put(MediaItem {
+            locked: Default::default(),
             id: 7,
             path: "/fake/path.mkv".into(),
             title: "Resume Test".into(),
@@ -220,6 +221,7 @@ async fn playback_info_emits_zero_when_no_user_data_row_exists() {
     let token = stores.issue(uid, "t").await.unwrap();
     stores
         .put(MediaItem {
+            locked: Default::default(),
             id: 9,
             path: "/fake/never-played.mkv".into(),
             title: "Never Played".into(),
@@ -293,6 +295,7 @@ async fn resume_list_filters_by_media_types() {
     ] {
         stores
             .put(MediaItem {
+                locked: Default::default(),
                 id,
                 path: format!("/m/{id}").into(),
                 title: title.into(),

@@ -25,6 +25,7 @@ async fn fresh() -> SqliteStore {
 
 fn item(id: u64, title: &str, overview: Option<&str>, kind: MediaKind) -> MediaItem {
     MediaItem {
+        locked: Default::default(),
         id,
         path: format!("/m/{id}.mkv").into(),
         title: title.to_string(),

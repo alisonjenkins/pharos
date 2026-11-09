@@ -187,6 +187,7 @@ fn arb_item() -> impl Strategy<Value = MediaItem> {
         arb_series(),
     )
         .prop_map(|(id, path, title, kind, probe, series)| MediaItem {
+            locked: Default::default(),
             id,
             path: format!("/m/{path}.bin").into(),
             title,

@@ -45,6 +45,7 @@ async fn seed() -> (web::Data<AppState>, String) {
 
     stores
         .put(MediaItem {
+            locked: Default::default(),
             id: 42,
             path: BOOK_PATH.into(),
             title: "Dune".into(),
@@ -74,6 +75,7 @@ async fn seed() -> (web::Data<AppState>, String) {
     // gate itself can only be tested on a non-book item.
     stores
         .put(MediaItem {
+            locked: Default::default(),
             id: 43,
             path: "/media/Movies/Alien.mkv".into(),
             title: "Alien".into(),

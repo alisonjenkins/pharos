@@ -54,6 +54,7 @@ async fn seed(dir: &std::path::Path) -> (web::Data<AppState>, String, std::path:
 
     stores
         .put(MediaItem {
+            locked: Default::default(),
             id: 42,
             path: path.clone(),
             title: "Dune".into(),
@@ -262,6 +263,7 @@ async fn download_is_not_restricted_to_books() {
     state
         .stores
         .put(MediaItem {
+            locked: Default::default(),
             id: 43,
             path: movie_path,
             title: "Alien".into(),
