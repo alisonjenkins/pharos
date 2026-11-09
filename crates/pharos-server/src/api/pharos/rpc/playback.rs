@@ -104,6 +104,7 @@ impl server::playback::Handler for Playback {
                     stream_url: grant.stream_url,
                     audio: grant.audio_stream_index,
                     subtitle: grant.subtitle_stream_index,
+                    remembers_tracks: grant.remembers_tracks,
                     reported_ms: Cell::new(None),
                     stopped: Cell::new(false),
                 };
@@ -221,6 +222,9 @@ struct Grant {
     stream_url: String,
     audio: Option<u32>,
     subtitle: Option<u32>,
+    /// False for a version: its stream indexes are not the primary's, so its
+    /// reports leave the item's remembered tracks alone.
+    remembers_tracks: bool,
     /// The position of the last report, which a stop on release saves.
     reported_ms: Cell<Option<u64>>,
     /// Set by `stop`: the playback has ended and a release has nothing to do.
@@ -236,6 +240,11 @@ struct Playing {
 
 impl Grant {
     fn at(&self, position_ms: u64, is_paused: bool, playing: Playing) -> Report<'_> {
+        let playing = if self.remembers_tracks {
+            playing
+        } else {
+            Playing::default()
+        };
         Report {
             play_session_id: Some(&self.play_session_id),
             item_wire_id: Some(&self.item_wire_id),

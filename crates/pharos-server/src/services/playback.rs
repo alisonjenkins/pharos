@@ -1062,11 +1062,17 @@ pub async fn pick_audio(
     // What this user last played THIS item with. An explicit choice they made
     // outranks any language rule — it is the same person, saying the same
     // thing, one session later.
-    let remembered = state
+    let mut remembered = state
         .stores
         .get_user_data(user.id, item.id)
         .await
         .unwrap_or_default();
+    // A remembered index names a stream of the primary file; in a version
+    // (another file, another stream layout) it can name another track.
+    if item.edition.is_some() {
+        remembered.audio_stream_index = None;
+        remembered.subtitle_stream_index = None;
+    }
     let remembered_audio = track_prefs
         .remember_audio
         .then_some(remembered.audio_stream_index)
@@ -1398,6 +1404,9 @@ pub struct Grant {
     pub audio_stream_index: Option<u32>,
     /// The subtitle it starts with; `None` is off.
     pub subtitle_stream_index: Option<u32>,
+    /// Whether the tracks this playback reports may be remembered for the
+    /// item: only the primary file's, whose stream indexes they name.
+    pub remembers_tracks: bool,
 }
 
 #[derive(Debug)]
@@ -1678,6 +1687,7 @@ pub async fn grant(
         stream_url,
         audio_stream_index: audio.index,
         subtitle_stream_index: styled_pick.or(subtitle),
+        remembers_tracks: item.edition.is_none(),
     })
 }
 
