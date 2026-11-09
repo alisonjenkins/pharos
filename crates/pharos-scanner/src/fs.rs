@@ -2971,8 +2971,9 @@ fn name_height(stem: &str) -> Option<u32> {
     }
 }
 
-/// What sets `copy` apart from `primary` by name: the differing tail of the
-/// stem (`HDTV-1080p Proper`), else its container (`AVI`), else its folder.
+/// What sets `copy` apart from `primary` by name: the words its stem adds
+/// (`WEBDL-1080p`), else its container (`AVI`), else the nearest folder whose
+/// name differs (`Season 3`), else its own resolution tag, else `Copy`.
 fn copy_label(primary: &Path, copy: &Path) -> String {
     let stem = |p: &Path| {
         p.file_stem()
@@ -2981,22 +2982,20 @@ fn copy_label(primary: &Path, copy: &Path) -> String {
             .to_string()
     };
     let (a, b) = (stem(primary), stem(copy));
-    let common = a
-        .char_indices()
-        .zip(b.chars())
-        .find(|((_, x), y)| x != y)
-        .map_or(a.len().min(b.len()), |((i, _), _)| i);
-    // Back up to a word start so `WEBDL-1080p` is not cut to `EBDL-1080p`.
-    let start = b
-        .get(..common)
-        .and_then(|head| head.rfind([' ', '.', '-', '_', '[', '(']))
-        .map_or(0, |i| i + 1);
-    let tail = b
-        .get(start..)
-        .unwrap_or("")
-        .trim_matches(|c: char| c.is_whitespace() || "-_.[]()".contains(c));
-    if !tail.is_empty() && a != b {
-        return tail.to_string();
+    let words = |s: &str| -> Vec<String> {
+        s.split(|c: char| c.is_whitespace() || "._[](){},".contains(c))
+            .filter(|w| w.chars().any(char::is_alphanumeric))
+            .map(str::to_string)
+            .collect()
+    };
+    let have: std::collections::HashSet<String> =
+        words(&a).iter().map(|w| w.to_lowercase()).collect();
+    let added: Vec<String> = words(&b)
+        .into_iter()
+        .filter(|w| !have.contains(&w.to_lowercase()))
+        .collect();
+    if !added.is_empty() {
+        return added.join(" ");
     }
     let ext = |p: &Path| {
         p.extension()
@@ -3008,11 +3007,22 @@ fn copy_label(primary: &Path, copy: &Path) -> String {
             return e;
         }
     }
-    copy.parent()
-        .and_then(|p| p.file_name())
-        .and_then(|s| s.to_str())
-        .unwrap_or("Copy")
-        .to_string()
+    let (mut pa, mut pb) = (primary.parent(), copy.parent());
+    while let (Some(x), Some(y)) = (pa, pb) {
+        match (
+            x.file_name().and_then(|s| s.to_str()),
+            y.file_name().and_then(|s| s.to_str()),
+        ) {
+            (Some(nx), Some(ny)) if nx != ny => return ny.to_string(),
+            (Some(_), Some(_)) => (pa, pb) = (x.parent(), y.parent()),
+            _ => break,
+        }
+    }
+    words(&b)
+        .into_iter()
+        .rev()
+        .find(|w| name_height(w).is_some())
+        .unwrap_or_else(|| "Copy".to_string())
 }
 
 /// Heuristic: does `path` look like a TV episode?
@@ -7306,6 +7316,42 @@ mod tests {
             "mkv outranks avi as primary"
         );
         assert_eq!(names(&bsg.1), ["AVI"]);
+    }
+
+    #[test]
+    fn a_copy_label_names_what_sets_it_apart_not_a_clipped_tail() {
+        let label = |a: &str, b: &str| copy_label(Path::new(a), Path::new(b));
+        assert_eq!(
+            label(
+                "/m/Transformers Age of Extinction/Transformers - Age of Extinction (2014) WEBDL-1080p.mkv",
+                "/m/Transformers Age of Extinction (2014)/Transformers Age of Extinction (2014) Bluray-1080p.mkv",
+            ),
+            "Bluray-1080p"
+        );
+        assert_eq!(
+            label(
+                "/tv/Grimm/Season 1/Grimm - S01E09 - Of Mouse and Man WEBDL-1080p.mkv",
+                "/tv/Grimm/Season 01/Grimm - S01E09 - Of Mouse and Man.mkv",
+            ),
+            "Season 01",
+            "a copy that adds no words is named by its folder"
+        );
+        assert_eq!(
+            label(
+                "/m/Music/System of a Down/Hypnotize/01 Attack.mp3",
+                "/m/Music/System Of A Down/Hypnotize/01 - Attack.mp3",
+            ),
+            "System Of A Down",
+            "the nearest folder that differs, not the shared album folder"
+        );
+        assert_eq!(
+            label(
+                "/m/Shawshank (1994)/Shawshank (1994) Bluray-1080p Proper.mkv",
+                "/m/Shawshank (1994)/Shawshank (1994) Bluray-1080p.mkv",
+            ),
+            "Bluray-1080p"
+        );
+        assert_eq!(label("/m/A/Song.mp3", "/m/A/song.mp3"), "Copy");
     }
 
     #[test]
