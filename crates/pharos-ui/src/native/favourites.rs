@@ -146,6 +146,16 @@ pub fn FavouritesView(favourites: Favourites) -> Element {
                     p { class: "pharos-muted", "{note}" }
                 }
             }
+            // Every episode read so far folded into a favourite show, and the
+            // server holds more: say so rather than drop the rail unseen.
+            for rail in favourites.rails.iter().filter(|rail| rail.items.is_empty() && rail.more_note().is_some()) {
+                section { key: "{title_of(rail.kind)}", class: "pharos-rail",
+                    h2 { class: "pharos-rail-title", "{title_of(rail.kind)}" }
+                    p { class: "pharos-muted",
+                        "The first {rail.loaded} belong to the shows above; there are more."
+                    }
+                }
+            }
         }
     }
 }
@@ -270,6 +280,27 @@ mod tests {
         ]));
         assert!(html.contains("Pilot") && !html.contains("E1"), "{html}");
         assert!(!html.contains("Showing the first"), "{html}");
+    }
+
+    /// When every episode read folds into a favourite show and the server
+    /// holds more, the rail still says there are more.
+    #[test]
+    fn an_episode_rail_folded_away_still_says_there_are_more() {
+        let mut episodes = page(vec![item(3, ItemKind::Episode, "E1", Some("Frieren"))]);
+        episodes.total = 400;
+        let html = render(Favourites::new(vec![
+            (
+                ItemKind::Series,
+                page(vec![item(2, ItemKind::Series, "Frieren", None)]),
+            ),
+            (ItemKind::Episode, episodes),
+        ]));
+        assert!(
+            html.contains(">Episodes<")
+                && html.contains("The first 1 belong to the shows above; there are more."),
+            "{html}"
+        );
+        assert!(!html.contains("Nothing here yet"), "{html}");
     }
 
     #[test]
