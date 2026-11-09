@@ -272,6 +272,28 @@ async fn resume_replays_after_seq_and_resyncs_outside_the_window() {
         .await;
 }
 
+/// A cursor above the head (another run's, or another replica's) resyncs to
+/// the head, and the next live event still arrives.
+/// Disarm check: without the pump moving its cursor to the resync's head,
+/// the live event is filtered out and `next` times out.
+#[actix_web::test]
+async fn a_cursor_above_the_head_resyncs_and_then_hears_live_events() {
+    let fx = seed_rich().await;
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let s = session_for(&connect(&fx), &fx.user_token).await;
+            let (_sub, mut rx) = subscribe(&s, &[], 0).await.unwrap();
+            played(&fx, 1, true, false);
+            let head = next(&mut rx).await.seq();
+
+            let (_ahead, mut ahead_rx) = subscribe(&s, &[], u64::MAX / 2).await.unwrap();
+            assert_eq!(next(&mut ahead_rx).await, Got::Resync { seq: head });
+            played(&fx, 2, true, true);
+            assert_eq!(next(&mut ahead_rx).await.seq(), head + 1);
+        })
+        .await;
+}
+
 /// A subscriber gets only the topics it asked for, and an unknown topic is
 /// refused `invalid`.
 /// Disarm check: with the topic filter removed from the pump, the user data

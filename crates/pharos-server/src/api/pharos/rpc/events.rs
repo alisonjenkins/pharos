@@ -449,6 +449,9 @@ async fn pump(mut p: Pump, catchup: Catchup, _held: Held) {
         let next = match resync.take() {
             Some(head) => {
                 pending.clear();
+                // The client refetches up to `head`; a cursor above it (another
+                // run's) must not mask the live events that follow.
+                p.last = head;
                 Next::Resync(head)
             }
             None => {
