@@ -797,7 +797,7 @@ mod tests {
         }
     }
 
-    /// V852: Escape in the full video player shrinks it to the mini bar or
+    /// V854: Escape in the full video player shrinks it to the mini bar or
     /// floating window, as it leaves the music player; elsewhere it is the
     /// browser's (a menu, a dialog, leaving fullscreen).
     #[test]

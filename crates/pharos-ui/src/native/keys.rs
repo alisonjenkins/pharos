@@ -173,7 +173,7 @@ pub fn KeyLayer(route: Route, on_palette: EventHandler) -> Element {
                 return false;
             }
             // In browser fullscreen Escape only leaves it; the next one
-            // shrinks the player (V852).
+            // shrinks the player (V854).
             if key == "Escape" && platform::leave_fullscreen_on_escape() {
                 reset();
                 return true;
