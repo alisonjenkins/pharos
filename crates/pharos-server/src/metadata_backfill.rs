@@ -1931,7 +1931,7 @@ where
                 picked += 1;
             }
         }
-        if rows.iter().any(|r| r.premiere_date.is_some()) {
+        if rows.iter().any(|r| aired(r).is_some()) {
             let seasons: Vec<u32> = rows
                 .iter()
                 .filter_map(|r| r.season)
@@ -1952,7 +1952,7 @@ where
             window = run_window(listing.iter().flatten().filter_map(|l| l.aired), series_run);
             if let Some((first, last)) = window {
                 for row in &rows {
-                    let outside = row.premiere_date.is_some_and(|d| {
+                    let outside = aired(row).is_some_and(|d| {
                         d < first - RUN_SLACK_SECS
                             || last.is_some_and(|last| d > last + RUN_SLACK_SECS)
                     });
@@ -1978,6 +1978,13 @@ where
         tokio::time::sleep(REQUEST_SPACING).await;
     }
     Ok(survey)
+}
+
+/// B984 — a row's stored air date, with unix second 0 read as none: rows
+/// imported before the NFO parser dropped the `1970-01-01` placeholder still
+/// hold it until their next probe.
+fn aired(row: &pharos_core::SeriesEpisodeRow) -> Option<i64> {
+    row.premiere_date.filter(|&d| d != 0)
 }
 
 /// B982 — the show's episode listing and its series-level run.
@@ -6687,6 +6694,43 @@ mod tests {
             .unwrap();
 
         assert_eq!(survey.episodes, [(4, RepairReason::OutsideRun)]);
+    }
+
+    /// B984 — an episode stored with air date 0 (an NFO's `1970-01-01`
+    /// placeholder) is no evidence of airing outside its show's run.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_air_date_of_zero_is_not_outside_the_run() {
+        use crate::online_enrich::SeriesRun;
+        let s = store().await;
+        const ONE_PIECE: &str = "/tv/One Piece";
+        put_titled_episode(&s, 1, ONE_PIECE, (10, 1), "Emergency Announcement").await;
+        put_titled_episode(&s, 2, ONE_PIECE, (1, 1), "I'm Luffy!").await;
+        for (id, aired) in [(1, 0), (2, 940_377_600)] {
+            let mut item = s.get(id).await.unwrap();
+            item.metadata.premiere_date = Some(aired);
+            s.put(item).await.unwrap();
+        }
+        pin(&s, ONE_PIECE, "81797", NOW).await;
+        let tvdb = FakeEnricher::tvdb()
+            .with_aired_list("81797", &[(1, 1, 940_377_600)])
+            .with_run(
+                "81797",
+                SeriesRun {
+                    first: Some(940_377_600),
+                    last: Some(1_762_041_600),
+                    ongoing: true,
+                },
+            );
+        let providers = SeriesProviders::<FakeEnricher, FakeEnricher> {
+            tvdb: Some(&tvdb),
+            tmdb: None,
+        };
+
+        let survey = survey_series_identity(&s, &providers, &sem(4), &MetadataConfig::default())
+            .await
+            .unwrap();
+
+        assert_eq!(survey.episodes, []);
     }
 
     /// A dry run surveys again when the survey revision moved under the same
