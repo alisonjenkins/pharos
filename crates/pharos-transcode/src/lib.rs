@@ -24,6 +24,7 @@ pub mod integrity;
 pub mod libav;
 pub mod options;
 pub mod output_size;
+pub mod picture_area;
 #[cfg(unix)]
 pub mod probe;
 pub mod protocol;
