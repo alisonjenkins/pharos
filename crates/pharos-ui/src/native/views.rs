@@ -1475,6 +1475,7 @@ mod tests {
             critic_rating: None,
             artist: None,
             stereo: None,
+            damaged: false,
         }
     }
 
@@ -1538,6 +1539,7 @@ mod tests {
             album: None,
             cast: Vec::new(),
             versions: Vec::new(),
+            damage: None,
         };
         let answer = vec![
             MemberSeen {
@@ -2293,6 +2295,7 @@ mod tests {
             album: None,
             cast: Vec::new(),
             versions: vec![copy("", 720, ""), copy("season-1", 1080, path)],
+            damage: None,
         };
         let viewer = detail("");
         let html = render(move || {
@@ -2342,6 +2345,7 @@ mod tests {
                 version("", None),
                 version("3d-hsbs", Some(Stereo::HalfSideBySide)),
             ],
+            damage: None,
         };
         let html = render(move || {
             rsx! { TitleView { detail: detail.clone(), version: "3d-hsbs".to_string() } }
@@ -2374,6 +2378,7 @@ mod tests {
             album: None,
             cast: Vec::new(),
             versions: Vec::new(),
+            damage: None,
         };
         let html = render(move || rsx! { TitleView { detail: detail.clone() } });
         assert!(
@@ -2413,6 +2418,7 @@ mod tests {
             album: None,
             cast: Vec::new(),
             versions: Vec::new(),
+            damage: None,
         };
         let html = render(move || rsx! { TitleView { detail: detail.clone() } });
         assert!(html.contains(">Resume<"), "{html}");
@@ -2436,6 +2442,7 @@ mod tests {
             album: None,
             cast: Vec::new(),
             versions: Vec::new(),
+            damage: None,
         };
         let html = render(move || rsx! { TitleView { detail: detail.clone() } });
         assert!(html.contains(">Mark unwatched<"), "{html}");
@@ -2500,6 +2507,7 @@ mod tests {
             album: None,
             cast: Vec::new(),
             versions: Vec::new(),
+            damage: None,
         };
         let html = render(move || rsx! { TitleView { detail: detail.clone(), in_group: true } });
         assert!(html.contains(">Resume for the group<"), "{html}");
@@ -2529,6 +2537,7 @@ mod tests {
                 album: None,
                 cast: Vec::new(),
                 versions: Vec::new(),
+                damage: None,
             };
             let html = render(move || rsx! { TitleView { detail: detail.clone() } });
             assert_eq!(html.contains(">Watch together<"), shown, "{kind:?}: {html}");
@@ -2555,6 +2564,7 @@ mod tests {
                 album: None,
                 cast: Vec::new(),
                 versions: Vec::new(),
+                damage: None,
             }
         };
         let outro = Segment {
@@ -2594,6 +2604,7 @@ mod tests {
             album: None,
             cast: Vec::new(),
             versions: Vec::new(),
+            damage: None,
         };
         let html = render(move || rsx! { TitleView { detail: detail.clone() } });
         assert!(
@@ -2635,6 +2646,7 @@ mod tests {
                 credit("Sam Guest", "Stranger", CreditKind::GuestStar, None),
                 credit("No Role", "", CreditKind::Actor, None),
             ],
+            damage: None,
         };
         let html = render(move || rsx! { TitleView { detail: detail.clone() } });
         let (Some(cast), Some(guests)) = (
@@ -2679,6 +2691,7 @@ mod tests {
                 credit("Old Server", None),
             ],
             versions: Vec::new(),
+            damage: None,
         };
         let html = render(move || rsx! { TitleView { detail: detail.clone() } });
         let link = html
@@ -2706,6 +2719,7 @@ mod tests {
             album: None,
             versions: Vec::new(),
             cast: vec![],
+            damage: None,
         };
         let html = render(move || rsx! { TitleView { detail: detail.clone() } });
         assert!(!html.contains("pharos-cast"), "{html}");
@@ -2917,6 +2931,7 @@ mod tests {
             album: None,
             cast: Vec::new(),
             versions: Vec::new(),
+            damage: None,
         };
         let page = render(move || rsx! { TitleView { detail: detail.clone() } });
         assert!(
@@ -2958,6 +2973,7 @@ mod tests {
             album: None,
             cast: Vec::new(),
             versions: Vec::new(),
+            damage: None,
         };
         let page = render(move || rsx! { TitleView { detail: detail.clone() } });
         assert!(page.contains("pharos-art-song"), "{page}");
