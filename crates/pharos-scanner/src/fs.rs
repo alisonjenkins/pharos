@@ -3519,6 +3519,36 @@ mod tests {
             ids.sort_unstable();
             Ok(ids)
         }
+        async fn credits_for_person(
+            &self,
+            wire_id: &str,
+        ) -> DomainResult<Vec<(MediaId, pharos_core::ItemPerson)>> {
+            let links = self
+                .item_people
+                .lock()
+                .map_err(|e| DomainError::Backend(e.to_string()))?;
+            let mut credits: Vec<(MediaId, pharos_core::ItemPerson)> = links
+                .iter()
+                .flat_map(|(id, people)| people.iter().map(move |p| (*id, p)))
+                .filter(|(_, p)| pharos_core::person_wire_id(&p.name) == wire_id)
+                .map(|(id, p)| {
+                    (
+                        id,
+                        pharos_core::ItemPerson {
+                            name: p.name.clone(),
+                            wire_id: wire_id.to_string(),
+                            role: p.role.clone(),
+                            character: p.character.clone(),
+                            kind: p.kind,
+                            sort_order: p.sort_order,
+                            thumb_url: p.thumb.clone(),
+                        },
+                    )
+                })
+                .collect();
+            credits.sort_by_key(|(id, _)| *id);
+            Ok(credits)
+        }
         async fn people_needing_images(
             &self,
             limit: i64,

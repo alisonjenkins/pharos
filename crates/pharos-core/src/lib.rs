@@ -1062,6 +1062,14 @@ pub trait PersonStore: Send + Sync {
         &self,
         items: &[MediaId],
     ) -> impl std::future::Future<Output = DomainResult<Vec<(MediaId, ItemPerson)>>> + Send;
+
+    /// Every credit of the person whose `wire_id` matches, each paired with
+    /// the item that carries it, in item order: what a person's page lists.
+    /// Empty when no person row carries that wire id.
+    fn credits_for_person(
+        &self,
+        wire_id: &str,
+    ) -> impl std::future::Future<Output = DomainResult<Vec<(MediaId, ItemPerson)>>> + Send;
 }
 
 /// LIB-C3 — a studio entity row (one per distinct production/network
