@@ -5967,3 +5967,142 @@ body:has(.pharos-stage.is-mini) .pharos-main {
   font-size: var(--px-type-step--1);
   text-align: center;
 }
+
+/* The book reader (spec 023): the whole viewport, above the shell. The page
+   itself is quire-web's host; the bars and panels are drawn over its edges
+   so opening one never resizes the page (a resize would lay the text out
+   again). Nothing here animates: the reader also runs on TVs and headsets. */
+.pharos-reader {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  background: var(--px-color-bg);
+  color: var(--px-color-fg);
+  outline: none;
+}
+body:has(.pharos-reader) {
+  overflow: hidden;
+}
+.pharos-reader-top {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.5rem 0.75rem;
+  border-bottom: var(--px-border) solid var(--px-color-border);
+}
+.pharos-reader-title {
+  flex: 1;
+  min-width: 0;
+  margin: 0;
+  overflow: hidden;
+  font-size: 1.05rem;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.pharos-reader .pharos-control:hover,
+.pharos-reader .pharos-control:focus-visible {
+  background: var(--px-color-surface-raised);
+}
+.pharos-reader .pharos-control:focus-visible {
+  outline: 2px solid var(--px-color-focus);
+}
+.pharos-reader .pharos-control[aria-pressed="true"] {
+  background: var(--px-color-accent);
+  color: var(--px-color-accent-fg);
+}
+.pharos-reader .pharos-control:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+.pharos-reader-host {
+  min-height: 0;
+  min-width: 0;
+  position: relative;
+}
+.pharos-reader-progress {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  min-height: 1.75rem;
+  padding: 0 0.75rem;
+  border-top: var(--px-border) solid var(--px-color-border);
+  font-size: var(--px-type-step--1);
+  font-variant-numeric: tabular-nums;
+}
+.pharos-reader-progress-bar {
+  position: absolute;
+  inset: 0 auto 0 0;
+  background: var(--px-color-progress);
+  opacity: 0.25;
+}
+.pharos-reader-progress-label {
+  position: relative;
+}
+.pharos-reader-note {
+  position: absolute;
+  inset: 3rem 0 2rem;
+  display: grid;
+  align-content: center;
+  justify-items: center;
+  gap: 1rem;
+  margin: 0;
+  padding: 1rem;
+  text-align: center;
+  background: var(--px-color-bg);
+}
+.pharos-reader-note p {
+  margin: 0;
+  max-width: 32rem;
+}
+.pharos-reader-panel {
+  position: absolute;
+  inset: 3rem 0 2rem auto;
+  width: min(24rem, 100%);
+  overflow-y: auto;
+  padding: 0.75rem;
+  background: var(--px-color-overlay);
+  border-left: var(--px-border) solid var(--px-color-border);
+}
+.pharos-reader-panel ul {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.pharos-reader-toc-row {
+  width: 100%;
+  padding: 0.5rem;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.pharos-reader-toc-row:hover,
+.pharos-reader-toc-row:focus-visible {
+  background: var(--px-color-surface-raised);
+}
+.pharos-reader-setting {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.25rem;
+  padding: 0.5rem 0;
+}
+.pharos-reader-setting > span:first-child {
+  flex: 0 0 100%;
+  color: var(--px-color-fg-muted);
+  font-size: var(--px-type-step--1);
+}
+.pharos-reader-size {
+  min-width: 2.5rem;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+.pharos-reader-locked {
+  margin: 0;
+  color: var(--px-color-fg-muted);
+}
