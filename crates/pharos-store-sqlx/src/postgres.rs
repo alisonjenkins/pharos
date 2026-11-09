@@ -1250,13 +1250,19 @@ impl MediaStore for PostgresStore {
         Ok(())
     }
 
-    #[tracing::instrument(skip(self), fields(media.from = %from, media.into = %into))]
-    async fn merge_user_data(&self, from: MediaId, into: MediaId) -> DomainResult<()> {
+    #[tracing::instrument(skip(self), fields(media.from = %from, media.into = %into, resume = ?resume))]
+    async fn merge_user_data(
+        &self,
+        from: MediaId,
+        into: MediaId,
+        resume: pharos_core::FoldResume,
+    ) -> DomainResult<()> {
         let (from, into) = (media_id_i64(from)?, media_id_i64(into)?);
         sqlx::query(
             "INSERT INTO user_data (user_id, item_id, played, play_count, \
              last_played_position_ticks, is_favorite, last_played_at) \
-             SELECT user_id, $2, played, play_count, last_played_position_ticks, \
+             SELECT user_id, $2, played, play_count, \
+             CASE WHEN $3::boolean THEN last_played_position_ticks ELSE 0 END, \
              is_favorite, last_played_at FROM user_data \
              WHERE item_id = $1 AND EXISTS (SELECT 1 FROM media_items WHERE id = $2) \
              ON CONFLICT (user_id, item_id) DO UPDATE SET \
@@ -1264,13 +1270,14 @@ impl MediaStore for PostgresStore {
              play_count = GREATEST(user_data.play_count, excluded.play_count), \
              is_favorite = GREATEST(user_data.is_favorite, excluded.is_favorite), \
              last_played_position_ticks = CASE \
-             WHEN excluded.last_played_at > user_data.last_played_at \
+             WHEN $3::boolean AND excluded.last_played_at > user_data.last_played_at \
              THEN excluded.last_played_position_ticks \
              ELSE user_data.last_played_position_ticks END, \
              last_played_at = GREATEST(user_data.last_played_at, excluded.last_played_at)",
         )
         .bind(from)
         .bind(into)
+        .bind(resume == pharos_core::FoldResume::Carry)
         .execute(&self.pool)
         .await
         .map_err(|e| DomainError::Backend(e.to_string()))?;
