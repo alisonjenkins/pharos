@@ -1664,8 +1664,10 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
         // A player still owing its ready is loading what the group asked for,
         // and its playhead sits at the target until the seek lands: correcting
         // it seeks again and restarts the load, every ~2 s on a slow link
-        // (B1016). The ready's own hold puts it where the group is.
+        // (B1016). The ready's own hold puts it where the group is; a player
+        // that loaded with no event left to carry the ready says it here.
         if owes_ready {
+            self.ready_if_loaded();
             return;
         }
         if player.paused() {
@@ -3715,6 +3717,38 @@ mod tests {
         }
         assert_eq!(seeks(&rig), ["seek(94852)"]);
         assert!(rig.env.kinds().is_empty(), "{:?}", rig.env.kinds());
+    }
+
+    /// B1016/V975: a player that loaded the group's seek with no event left
+    /// to carry its ready (attached after its `canplay`) says ready from the
+    /// drift check instead of sitting uncorrected.
+    #[test]
+    fn a_loaded_player_owing_a_ready_says_it_from_the_drift_check() {
+        let rig = playing_rig();
+        rig.env.now.set(101_000);
+        rig.session.deliver(GroupUpdate::Seek {
+            at_server_ms: 101_000,
+            position_ms: 94_852,
+            by: None,
+        });
+        rig.env.settle();
+        rig.env.now.set(102_000);
+        rig.session.check_drift();
+        rig.env.settle();
+        assert!(rig.env.logged("pharos: group ready sent").is_empty());
+        // Loaded 2 s behind the group: the hold moves it there once...
+        rig.player.has_data.set(true);
+        rig.env.now.set(103_000);
+        rig.session.check_drift();
+        rig.env.settle();
+        assert_eq!(seeks(&rig), ["seek(94852)", "seek(96852)"]);
+        assert!(rig.env.logged("pharos: group ready sent").is_empty());
+        // ...and the next tick, landed, says ready.
+        rig.env.now.set(104_000);
+        rig.session.check_drift();
+        rig.env.settle();
+        assert_eq!(rig.env.logged("pharos: group ready sent").len(), 1);
+        assert_eq!(seeks(&rig).len(), 2);
     }
 
     /// B1016/V975: a drift hard seek still loading is not seeked again inside
