@@ -796,11 +796,15 @@ const inText = (t) => !!t && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/
 const takes = new Set(["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", " "]);
 // OK that commits a remote scrub (B907) must not also click the focused
 // button, on its first press or while it is held.
+// A left or right in the player starts or moves a scrub before its class
+// has rendered, so a press inside the settle window (900 ms) counts too.
 let okCommits = false;
+let lastSeekKey = -1e9;
 addEventListener("keyup", (e) => { if (e.key === "Enter") okCommits = false; });
 addEventListener("keydown", (e) => {
   const text = inText(e.target);
-  if (e.key === "Enter" && !e.repeat) okCommits = !!document.querySelector(".pharos-seek.is-scrubbing");
+  if (!text && (e.key === "ArrowLeft" || e.key === "ArrowRight") && e.target.closest && e.target.closest('#pharos-player')) lastSeekKey = performance.now();
+  if (e.key === "Enter" && !e.repeat) okCommits = !!document.querySelector(".pharos-seek.is-scrubbing") || performance.now() - lastSeekKey < 900;
   if (e.key === "Enter" && okCommits) e.preventDefault();
   // A held arrow repeats (the player's scrub speeds up on it): the WebView
   // must not move the focus on the repeats either. Rust hears the first.

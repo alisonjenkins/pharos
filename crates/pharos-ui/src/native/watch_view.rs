@@ -494,8 +494,14 @@ pub fn WatchView(
     let item = (item_id, title.clone(), title_detail.clone());
     use_effect(use_reactive!(|item| {
         let _ = &item;
-        if scrub.peek().is_some() {
+        let open = *scrub.peek();
+        if let Some(s) = open {
             scrub.set(None);
+            platform::info(&scrub::end_line(
+                &s,
+                scrub::End::Cancelled,
+                platform::now_ms(),
+            ));
         }
     }));
     let end_scrub = move |end: scrub::End| {
