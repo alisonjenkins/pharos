@@ -758,6 +758,12 @@ pub fn AdminPane(
         })
     };
     let new_api_key_secret = use_signal::<Option<String>>(|| None);
+    // Sound-format lists saved since the last device load, and the device
+    // whose save is in flight: one save per device at a time, each built on
+    // the last, so two quick toggles cannot overwrite each other.
+    let device_deny_saved =
+        use_signal::<std::collections::HashMap<String, Vec<String>>>(Default::default);
+    let device_saving = use_signal::<Option<String>>(|| None);
     // Dismiss hides the open tab's load error too; the next tab, reload or
     // action shows it again if it is still there.
     let fetch_err_hidden = use_signal(|| false);
@@ -775,9 +781,17 @@ pub fn AdminPane(
         let deep_search_signal = deep_search;
         let mut deep_search_gen_signal = deep_search_gen;
         let mut fetch_err_hidden_signal = fetch_err_hidden;
+        let mut device_deny_saved_signal = device_deny_saved;
+        let mut device_saving_signal = device_saving;
         move |action: AdminAction| {
             let token = access_token.peek().clone();
             let base = server_base.clone();
+            if let AdminAction::SetDeviceAudioDeny { device_id, .. } = &action {
+                if device_saving_signal.peek().is_some() {
+                    return;
+                }
+                device_saving_signal.set(Some(device_id.clone()));
+            }
             if action == AdminAction::DismissStatus {
                 status_signal.set(None);
                 fetch_err_hidden_signal.set(true);
@@ -935,12 +949,16 @@ pub fn AdminPane(
                     }
                     AdminAction::SetDeviceAudioDeny { device_id, codecs } => {
                         match set_device_audio_deny(&base, &token, &device_id, &codecs).await {
-                            Ok(()) => status_signal
-                                .set(Some(format!("Saved the sound formats for {subject}."))),
+                            Ok(()) => {
+                                device_deny_saved_signal.write().insert(device_id, codecs);
+                                status_signal
+                                    .set(Some(format!("Saved the sound formats for {subject}.")));
+                            }
                             Err(e) => status_signal.set(Some(format!(
                                 "Couldn't save the sound formats for {subject}: {e}"
                             ))),
                         }
+                        device_saving_signal.set(None);
                     }
                     AdminAction::SaveBranding(cfg) => {
                         match save_branding(&base, &token, &cfg).await {
@@ -1029,7 +1047,9 @@ pub fn AdminPane(
         _ => Vec::new(),
     };
     let devices: Vec<DeviceEntry> = match devices_resource.read_unchecked().as_ref() {
-        Some(Ok(v)) => v.clone(),
+        Some(Ok(v)) => {
+            crate::views::admin::with_saved_audio_deny(v.clone(), &device_deny_saved.read())
+        }
         _ => Vec::new(),
     };
     let activity: Vec<ActivityEntry> = match activity_resource.read_unchecked().as_ref() {
@@ -1097,6 +1117,7 @@ pub fn AdminPane(
             deep_queued: deep_queued,
             deep_errors: deep_errors,
             deep_search: deep_search,
+            device_saving: device_saving.read().clone(),
         }
     }
 }
