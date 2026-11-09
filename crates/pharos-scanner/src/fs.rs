@@ -1821,10 +1821,16 @@ impl<P: Prober> FsScanner<P> {
                 }
                 // Promote video-kind items to Episode when the path
                 // looks like a TV layout. Audio stays as classified.
-                let kind = if matches!(info.kind, MediaKind::Movie) && is_episode_path(&path) {
+                let kind = if matches!(info.kind, MediaKind::Movie) && is_episode_file(&path) {
+                    let reason = if is_episode_path(&path) {
+                        "name_or_season_folder"
+                    } else {
+                        "show_folder_nfo"
+                    };
                     tracing::debug!(
                         path = %path.display(),
-                        "scanner: video promoted to an episode by its name or season folder"
+                        reason,
+                        "scanner: video promoted to an episode"
                     );
                     MediaKind::Episode
                 } else {
@@ -1834,7 +1840,7 @@ impl<P: Prober> FsScanner<P> {
                 // goes through here, so 3D resolution happens once.
                 resolve_item_3d_format(&path, kind, &mut probe);
                 let series = if matches!(kind, MediaKind::Episode) {
-                    parse_series_info(&path)
+                    episode_series_info(&path)
                 } else {
                     None
                 };
@@ -2970,7 +2976,7 @@ impl FoldGuard {
 /// a film's folder also holds its extras; with neither, it is no copy of
 /// anything, since a title alone would merge remakes.
 fn film_copy_key(path: &Path) -> Option<(String, u32)> {
-    if is_episode_path(path) {
+    if is_episode_file(path) {
         return None;
     }
     let ext = path.extension()?.to_str()?.to_ascii_lowercase();
@@ -3303,10 +3309,10 @@ fn is_theme_sidecar(path: &Path) -> bool {
 /// `(show folder, season, first episode, last episode)` for an episode file
 /// whose name carries both numbers; `None` keeps the file out of copy grouping.
 fn episode_copy_key(path: &Path) -> Option<EpisodeSpan> {
-    if !is_episode_path(path) {
+    if !is_episode_file(path) {
         return None;
     }
-    let info = parse_series_info(path)?;
+    let info = episode_series_info(path)?;
     let first = info.episode_number?;
     let name = path.file_name()?.to_str()?;
     let last = episode_span_end(name)
@@ -3729,6 +3735,78 @@ pub fn is_episode_path(path: &Path) -> bool {
         }
     }
     false
+}
+
+/// How far above a video the scanner looks for a show's `tvshow.nfo`: the
+/// file's own folder, a season or extras folder, and a disc folder in that.
+const SHOW_NFO_DEPTH: usize = 3;
+
+/// The show folder a video sits in, marked by the `tvshow.nfo` that Kodi,
+/// Jellyfin and Sonarr write at a show's root.
+pub fn show_folder_of(path: &Path) -> Option<PathBuf> {
+    path.ancestors()
+        .skip(1)
+        .take(SHOW_NFO_DEPTH)
+        .find(|p| p.join("tvshow.nfo").is_file())
+        .map(Path::to_path_buf)
+}
+
+/// Whether a video is an episode: by its name or season folder
+/// ([`is_episode_path`]), or by the show folder it sits in.
+pub fn is_episode_file(path: &Path) -> bool {
+    is_episode_path(path) || show_folder_of(path).is_some()
+}
+
+/// A folder of a show's bonus material (`Extras`, `Chuck Extras`,
+/// `Featurettes`, `Special Features`, `Bonus`).
+fn is_extras_dir(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    let words: Vec<&str> = lower
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .collect();
+    words
+        .iter()
+        .any(|w| matches!(*w, "extras" | "featurettes" | "bonus" | "bonuses"))
+        || words.windows(2).any(|w| w == ["special", "features"])
+}
+
+/// [`parse_series_info`] for a file under a show folder: the show is the
+/// folder holding `tvshow.nfo`, not a sub-folder between it and the file
+/// (`SAO II/`, `Chuck Extras/`), and a file in an extras folder is a special
+/// with no episode number, since its name carries none of the show's.
+pub fn episode_series_info(path: &Path) -> Option<SeriesInfo> {
+    let mut info = parse_series_info(path)?;
+    let Some(show) = show_folder_of(path) else {
+        return Some(info);
+    };
+    let extras = path
+        .ancestors()
+        .skip(1)
+        .take_while(|p| *p != show)
+        .filter_map(|p| p.file_name()?.to_str())
+        .any(is_extras_dir);
+    if extras {
+        info.season_number = Some(0);
+        info.episode_number = None;
+    }
+    let folder = show.to_string_lossy().into_owned();
+    if info.series_folder.as_deref() != Some(folder.as_str()) {
+        let name = show.file_name().and_then(|s| s.to_str()).unwrap_or(&folder);
+        info.series_year = parse_folder_year(name);
+        info.series_name = match info.series_year {
+            Some(_) => strip_trailing_year(name).to_string(),
+            None => name.to_string(),
+        };
+        tracing::debug!(
+            path = %path.display(),
+            show = %folder,
+            parsed = ?info.series_folder,
+            "scanner: episode keyed to the show folder holding tvshow.nfo"
+        );
+        info.series_folder = Some(folder);
+    }
+    Some(info)
 }
 
 /// B587 — whether `name` holds a Kodi `1x16` episode token: one or two
@@ -10259,5 +10337,83 @@ mod tests {
             ep_item.probe.video_3d_format,
             Some(Video3DFormat::HalfTopAndBottom)
         );
+    }
+
+    /// B1016 / V975 — a video under a show folder (one holding `tvshow.nfo`)
+    /// is an episode of that show even when its name has no `S01E02` and no
+    /// season folder sits between: loose absolute-numbered files, a sub-folder
+    /// named for a later season, an extras folder. Each was stored as a film
+    /// and matched to whatever its sidecar NFO said.
+    #[tokio::test]
+    async fn a_video_under_a_show_folder_is_an_episode_of_that_show() {
+        let td = TempDir::new().unwrap();
+        let root = td.path();
+        write_file(root, "TV/Dragon Ball/tvshow.nfo", b"<tvshow/>").await;
+        touch(
+            root,
+            "TV/Dragon Ball/[a-s]_dragon_ball_-_063_-_the_return_of_goku__rs2_[1AE8566B].mkv",
+        )
+        .await;
+        write_file(root, "TV/SAO II [Season 2] [480p]/tvshow.nfo", b"<tvshow/>").await;
+        touch(
+            root,
+            "TV/SAO II [Season 2] [480p]/SAO II/SAO II - 14 L@mBerT.mp4",
+        )
+        .await;
+        touch(
+            root,
+            "TV/SAO II [Season 2] [480p]/SAO II/SAO II - 14.5 L@mBerT.mp4",
+        )
+        .await;
+        write_file(root, "TV/Chuck/tvshow.nfo", b"<tvshow/>").await;
+        touch(
+            root,
+            "TV/Chuck/Chuck Extras/CHUCK Season 2 DVD Bloopers [www[1].keepvid.com].mp4",
+        )
+        .await;
+        touch(root, "TV/No Nfo/loose - 07 - title.mkv").await;
+        touch(root, "Movies/Heat (1995)/Heat (1995).mkv").await;
+
+        let items = FsScanner::new(FakeProber::default())
+            .scan(root)
+            .await
+            .unwrap();
+        let find = |needle: &str| {
+            items
+                .iter()
+                .find(|i| i.path.to_string_lossy().contains(needle))
+                .unwrap_or_else(|| panic!("{needle} not scanned"))
+        };
+        let shape = |needle: &str| {
+            let item = find(needle);
+            let series = item.series.as_ref();
+            (
+                item.kind,
+                series.map(|s| s.series_name.clone()),
+                series.and_then(|s| s.season_number),
+                series.and_then(|s| s.episode_number),
+            )
+        };
+        let episode = |name: &str, season, episode| {
+            (MediaKind::Episode, Some(name.to_string()), season, episode)
+        };
+
+        assert_eq!(shape("_063_"), episode("Dragon Ball", Some(1), Some(63)));
+        assert_eq!(
+            shape("SAO II - 14 "),
+            episode("SAO II [Season 2] [480p]", Some(1), Some(14))
+        );
+        assert_eq!(
+            shape("SAO II - 14.5"),
+            episode("SAO II [Season 2] [480p]", None, None),
+            "a half-numbered recap is not episode 14"
+        );
+        assert_eq!(shape("Bloopers"), episode("Chuck", Some(0), None));
+        assert_eq!(
+            find("loose - 07").kind,
+            MediaKind::Movie,
+            "no tvshow.nfo, no season folder"
+        );
+        assert_eq!(find("Heat (1995)").kind, MediaKind::Movie);
     }
 }
