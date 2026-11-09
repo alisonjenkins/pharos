@@ -3,6 +3,8 @@
 //! loads [`Favourites`] and this draws it, so it renders under `dioxus-ssr`.
 
 use dioxus::prelude::*;
+use std::collections::HashSet;
+
 use pharos_client::api::{Item, ItemKind, Page};
 
 use super::views::Rail;
@@ -37,35 +39,73 @@ pub struct FavouriteRail {
 }
 
 impl FavouriteRail {
-    /// The note under a rail the server holds more of than it sent.
+    /// The note under a rail the server holds more of than it sent. An
+    /// episode rail's total counts episodes folded into their shows, so it
+    /// only says there are more.
     pub fn more_note(&self) -> Option<String> {
-        (self.total as usize > self.loaded)
-            .then(|| format!("Showing the first {} of {}.", self.loaded, self.total))
+        if self.total as usize <= self.loaded {
+            return None;
+        }
+        let shown = self.items.len();
+        Some(if self.kind == ItemKind::Episode {
+            format!("Showing the first {shown}; there are more.")
+        } else {
+            format!("Showing the first {shown} of {}.", self.total)
+        })
     }
+}
+
+/// How many more pages of episodes the page asks for when the first ones
+/// all fold into favourite shows (a whole show marked a favourite fills
+/// the first page with its own episodes).
+pub const MAX_EPISODE_TOP_UPS: u32 = 4;
+
+/// The names of the favourite shows among `pages`.
+pub fn show_names(pages: &[(ItemKind, Page)]) -> HashSet<String> {
+    pages
+        .iter()
+        .filter(|(kind, _)| *kind == ItemKind::Series)
+        .flat_map(|(_, page)| page.items.iter().map(|s| s.name.clone()))
+        .collect()
+}
+
+/// Whether an episode stands on its own rather than under a favourite show.
+pub fn stands_alone(shows: &HashSet<String>, episode: &Item) -> bool {
+    !matches!(&episode.series_name, Some(s) if shows.contains(s))
+}
+
+/// Whether the episode page should ask for its next page: it holds fewer
+/// than [`PER_KIND`] episodes that stand alone and the server has more.
+pub fn wants_more_episodes(shows: &HashSet<String>, episodes: &Page) -> bool {
+    let alone = episodes
+        .items
+        .iter()
+        .filter(|ep| stands_alone(shows, ep))
+        .count();
+    alone < PER_KIND as usize && (episodes.items.len() as u32) < episodes.total
 }
 
 impl Favourites {
     /// The pages as loaded, with the episodes of a favourite show left out:
     /// marking a show marks every episode, and the show's own tile already
-    /// stands for them.
+    /// stands for them. At most [`PER_KIND`] of each kind are kept.
     pub fn new(pages: Vec<(ItemKind, Page)>) -> Self {
-        let shows: std::collections::HashSet<String> = pages
-            .iter()
-            .filter(|(kind, _)| *kind == ItemKind::Series)
-            .flat_map(|(_, page)| page.items.iter().map(|s| s.name.clone()))
-            .collect();
+        let shows = show_names(&pages);
         let rails = pages
             .into_iter()
             .map(|(kind, page)| {
                 let loaded = page.items.len();
                 let mut items = page.items;
                 if kind == ItemKind::Episode {
-                    items.retain(|ep| !matches!(&ep.series_name, Some(s) if shows.contains(s)));
+                    items.retain(|ep| stands_alone(&shows, ep));
                 }
+                let cut = items.len() > PER_KIND as usize;
+                items.truncate(PER_KIND as usize);
                 FavouriteRail {
                     kind,
                     items,
-                    loaded,
+                    // Episodes past the cut were loaded but not shown.
+                    loaded: if cut { 0 } else { loaded },
                     total: page.total,
                 }
             })
@@ -201,6 +241,45 @@ mod tests {
         assert!(
             !html.contains("Showing the first"),
             "a folded episode is no missing one: {html}"
+        );
+    }
+
+    /// B1084: a favourite show's episodes filling the first page do not
+    /// hide a lone favourite episode further on: the page asks for more
+    /// while fewer than a rail's worth stand alone and the server has more.
+    #[test]
+    fn episodes_folded_into_shows_ask_for_the_next_page() {
+        let shows: HashSet<String> = ["Frieren".to_owned()].into();
+        let mut first = page(vec![
+            item(3, ItemKind::Episode, "E1", Some("Frieren")),
+            item(4, ItemKind::Episode, "E2", Some("Frieren")),
+        ]);
+        first.total = 3;
+        assert!(wants_more_episodes(&shows, &first));
+        first
+            .items
+            .push(item(5, ItemKind::Episode, "Pilot", Some("Firefly")));
+        assert!(!wants_more_episodes(&shows, &first), "all loaded");
+
+        let html = render(Favourites::new(vec![
+            (
+                ItemKind::Series,
+                page(vec![item(2, ItemKind::Series, "Frieren", None)]),
+            ),
+            (ItemKind::Episode, first),
+        ]));
+        assert!(html.contains("Pilot") && !html.contains("E1"), "{html}");
+        assert!(!html.contains("Showing the first"), "{html}");
+    }
+
+    #[test]
+    fn a_cut_episode_rail_says_there_are_more() {
+        let mut episodes = page(vec![item(5, ItemKind::Episode, "Pilot", Some("Firefly"))]);
+        episodes.total = 400;
+        let html = render(Favourites::new(vec![(ItemKind::Episode, episodes)]));
+        assert!(
+            html.contains("Showing the first 1; there are more."),
+            "{html}"
         );
     }
 

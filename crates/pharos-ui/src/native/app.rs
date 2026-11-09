@@ -3624,16 +3624,40 @@ fn FavouritesScreen() -> Element {
             let loads = favourites::KINDS.map(|(kind, _)| {
                 let (api, call) = (&api, &call);
                 async move {
-                    api.favorites(call, kind, favourites::PER_KIND)
+                    api.favorites(call, kind, 0, favourites::PER_KIND)
                         .await
                         .map(|page| (kind, page))
                 }
             });
-            let rails = futures_util::future::join_all(loads)
-                .await
-                .into_iter()
-                .collect::<Result<Vec<_>, _>>();
-            Some(settle_load(ctx.machine, rails).map(Favourites::new))
+            let loaded = async {
+                let mut pages = futures_util::future::join_all(loads)
+                    .await
+                    .into_iter()
+                    .collect::<Result<Vec<_>, _>>()?;
+                // A show marked a favourite fills the first episode page
+                // with its own episodes, which fold into its tile (B1084).
+                let shows = favourites::show_names(&pages);
+                if let Some((_, episodes)) = pages
+                    .iter_mut()
+                    .find(|(kind, _)| *kind == ItemKind::Episode)
+                {
+                    for _ in 0..favourites::MAX_EPISODE_TOP_UPS {
+                        if !favourites::wants_more_episodes(&shows, episodes) {
+                            break;
+                        }
+                        let start = episodes.items.len() as u32;
+                        let next = api
+                            .favorites(&call, ItemKind::Episode, start, favourites::PER_KIND)
+                            .await?;
+                        if next.items.is_empty() {
+                            break;
+                        }
+                        episodes.items.extend(next.items);
+                    }
+                }
+                Ok(pages)
+            };
+            Some(settle_load(ctx.machine, loaded.await).map(Favourites::new))
         }
     });
     let state = page.read();
