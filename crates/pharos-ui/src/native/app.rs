@@ -22,6 +22,7 @@ use super::approve_device;
 use super::backdrop::{self, Backdrop};
 use super::browse::{self, Neighbours};
 use super::diagnostics;
+use super::favourites::{self, Favourites, FavouritesView};
 use super::find::{self, Find, DEBOUNCE_MS, RESULT_LIMIT};
 use super::group_app::{Together, VideoPlayer};
 use super::group_session::{GroupPlayer, GroupView, Ui};
@@ -2019,6 +2020,7 @@ fn Screen(route: Route) -> Element {
         // Remounted per title so the version pick is read for each one.
         Route::Title(id) => remount_on(&id.to_string(), rsx! { TitleScreen { id } }),
         Route::Person(id) => rsx! { PersonScreen { id } },
+        Route::Favourites => rsx! { FavouritesScreen {} },
         // The stage beside the screen draws the player (spec 020).
         Route::Watch(_) => rsx! {},
         Route::Read(id) => remount_on(&id.to_string(), reader_screen(id)),
@@ -3616,6 +3618,66 @@ fn PersonScreen(id: ItemRef) -> Element {
             shown,
             EventHandler::new(move |()| page.restart()),
             |page: &PersonPage| rsx! { PersonView { page: page.clone() } },
+        )}
+    }
+}
+
+/// The viewer's favourites, one query per kind, sent together (B1083). A
+/// mark anywhere reloads it.
+#[component]
+fn FavouritesScreen() -> Element {
+    let ctx = use_context::<Ctx>();
+    let mut page = use_resource(move || {
+        let api = ctx.api.read().clone();
+        let _ = (ctx.marks)();
+        async move {
+            let api = api?;
+            let call = call("favourites", "load");
+            let loads = favourites::KINDS.map(|(kind, _)| {
+                let (api, call) = (&api, &call);
+                async move {
+                    api.favorites(call, kind, 0, favourites::PER_KIND)
+                        .await
+                        .map(|page| (kind, page))
+                }
+            });
+            let loaded = async {
+                let mut pages = futures_util::future::join_all(loads)
+                    .await
+                    .into_iter()
+                    .collect::<Result<Vec<_>, _>>()?;
+                // A show marked a favourite fills the first episode page
+                // with its own episodes, which fold into its tile (B1084).
+                let shows = favourites::show_names(&pages);
+                if let Some((_, episodes)) = pages
+                    .iter_mut()
+                    .find(|(kind, _)| *kind == ItemKind::Episode)
+                {
+                    for _ in 0..favourites::MAX_EPISODE_TOP_UPS {
+                        if !favourites::wants_more_episodes(&shows, episodes) {
+                            break;
+                        }
+                        let start = episodes.items.len() as u32;
+                        let next = api
+                            .favorites(&call, ItemKind::Episode, start, favourites::PER_KIND)
+                            .await?;
+                        if next.items.is_empty() {
+                            break;
+                        }
+                        episodes.items.extend(next.items);
+                    }
+                }
+                Ok(pages)
+            };
+            Some(settle_load(ctx.machine, loaded.await).map(Favourites::new))
+        }
+    });
+    let state = page.read();
+    rsx! {
+        {loaded_or_retry(
+            state.as_ref().and_then(Option::as_ref),
+            EventHandler::new(move |()| page.restart()),
+            |favourites: &Favourites| rsx! { FavouritesView { favourites: favourites.clone() } },
         )}
     }
 }

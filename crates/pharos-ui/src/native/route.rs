@@ -32,6 +32,8 @@ pub enum Route {
     Privacy,
     /// `/find`, where the search screen was: opens the palette over home.
     Find,
+    /// The viewer's favourites, a rail per kind, `/favourites` (B1083).
+    Favourites,
     /// Watch together (014): the groups to join, `/together`.
     Together,
     /// An invite link to one group, `/together/{id}`. The id is as the
@@ -69,6 +71,7 @@ impl Route {
             ["manage"] => Route::Manage,
             ["find"] => Route::Find,
             ["settings"] | ["settings", "appearance"] => Route::Appearance,
+            ["favourites"] => Route::Favourites,
             ["together"] => Route::Together,
             ["together", g] if is_group_id(g) => Route::TogetherGroup((*g).to_owned()),
             ["settings", "account"] => Route::Account,
@@ -96,6 +99,7 @@ impl Route {
             Route::Playback => format!("{MOUNT}/settings/playback"),
             Route::Privacy => format!("{MOUNT}/settings/privacy"),
             Route::Find => format!("{MOUNT}/find"),
+            Route::Favourites => format!("{MOUNT}/favourites"),
             Route::Together => format!("{MOUNT}/together"),
             Route::TogetherGroup(id) => format!("{MOUNT}/together/{id}"),
             Route::NotFound(path) => path.clone(),
@@ -131,6 +135,7 @@ impl Route {
             Route::Playback => Some("Playback"),
             Route::Privacy => Some("Privacy"),
             Route::Find => Some("Search"),
+            Route::Favourites => Some("Favourites"),
             Route::Together | Route::TogetherGroup(_) => Some("Watch together"),
             Route::NotFound(_) => Some("Not found"),
         };
@@ -157,6 +162,7 @@ impl Route {
             Route::Playback => "playback",
             Route::Privacy => "privacy",
             Route::Find => "find",
+            Route::Favourites => "favourites",
             Route::Together => "together",
             Route::TogetherGroup(_) => "together_group",
             Route::NotFound(_) => "not_found",
@@ -197,6 +203,7 @@ mod tests {
             Route::Playback,
             Route::Privacy,
             Route::Find,
+            Route::Favourites,
             Route::Together,
             Route::TogetherGroup("0a1b-2c_3d".into()),
         ] {

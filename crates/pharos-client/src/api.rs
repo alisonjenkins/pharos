@@ -831,13 +831,14 @@ impl NativeApi {
         }
     }
 
-    /// The first `limit` of the signed-in user's favourites of one `kind`,
+    /// `limit` of the signed-in user's favourites of one `kind` from `start`,
     /// across every library, by name. A series counts while every episode
     /// in it is a favourite, which is what marking the series writes.
     pub async fn favorites(
         &self,
         call: &CallInfo,
         kind: ItemKind,
+        start: u32,
         limit: u32,
     ) -> Result<Page, ClientError> {
         let Some(kind) = wire_kind(kind) else {
@@ -851,6 +852,7 @@ impl NativeApi {
             q.reborrow().init_kinds(1).set(0, kind);
             q.set_sort_by("SortName");
             q.reborrow().init_filters(1).set(0, "IsFavorite");
+            q.set_start(start);
             q.set_limit(limit);
         }
         let reply = req.send().promise.await?;
