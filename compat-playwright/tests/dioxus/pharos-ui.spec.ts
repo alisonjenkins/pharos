@@ -4094,6 +4094,54 @@ test.describe("pharos Dioxus UI stage", () => {
     await expect(page.locator(".pharos-stage.is-floating, .pharos-stage.is-mini")).toBeVisible();
   });
 
+  // Films and episodes have a queue of their own (V853): a film added from
+  // its page waits in the player's queue and Next plays it before the next
+  // episode, taking it out of the queue.
+  test("a queued film plays next from the video player's queue", async ({ page, request }) => {
+    test.setTimeout(120_000);
+    const probe = await request.get(`${PHAROS_URL}/pharos/session`, {
+      headers: { Accept: "application/json" },
+    });
+    test.skip(probe.status() !== 405, `native API is not enabled (status ${probe.status()})`);
+    await signIn(page);
+
+    await openFirstHit(page, "Bulk 001");
+    await expect(page).toHaveURL(/\/ui\/title\//);
+    const film = page.url().match(/\/title\/([^/?#]+)/)![1];
+    await page.getByRole("button", { name: /^Add .*Bulk 001 to the queue$/ }).click();
+    await expect(page.locator(".pharos-queue-note")).toHaveText(/added to the queue/);
+
+    await openFirstHit(page, "Playwright");
+    await page.getByRole("link", { name: /^(Play|Resume)$/ }).click();
+    await expect(page.locator(".pharos-stage.is-full .pharos-watch video")).toBeVisible({
+      timeout: 15_000,
+    });
+    await page.mouse.move(20, 20);
+    const toggle = page.locator(".pharos-watch-top").getByRole("button", { name: "Queue, 1 video" });
+    await toggle.click();
+    const panel = page.locator(".pharos-watch #pharos-queue");
+    await expect(panel).toBeVisible();
+    await expect(panel.locator(".pharos-queue-entry")).toHaveText(/Bulk 001/);
+
+    // Esc in the queue closes it, not the player.
+    await panel.getByRole("button", { name: /Bulk 001/ }).first().focus();
+    await page.keyboard.press("Escape");
+    await expect(panel).toHaveCount(0);
+    await expect(page.locator(".pharos-stage.is-full .pharos-watch")).toBeVisible();
+
+    await page.mouse.move(40, 40);
+    await page.getByRole("button", { name: "Next in the queue" }).click();
+    await expect(page).toHaveURL(new RegExp(`/ui/watch/${film}`));
+    await expect(page.locator(".pharos-stage.is-full .pharos-watch video")).toBeVisible({
+      timeout: 15_000,
+    });
+    await page.mouse.move(20, 20);
+    await expect(
+      page.locator(".pharos-watch-top").getByRole("button", { name: "Queue", exact: true }),
+    ).toBeVisible();
+    await expect(page.locator(".pharos-watch #pharos-queue .pharos-queue-entry")).toHaveCount(0);
+  });
+
   // The floating window resizes from a top corner, away from the edge it
   // sits nearest, keeping the opposite bottom corner put (B583).
   test("the floating window resizes by its corner handle and the arrow keys", async ({
