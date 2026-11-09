@@ -732,6 +732,10 @@ fn parse_season_episodes(body: &str) -> Option<Vec<crate::online_enrich::Episode
                         .map(str::trim)
                         .filter(|t| !t.is_empty())
                         .map(str::to_string),
+                    aired: ep
+                        .get("air_date")
+                        .and_then(|x| x.as_str())
+                        .and_then(pharos_core::parse_ymd_to_unix),
                 })
             })
             .collect(),
@@ -912,7 +916,7 @@ mod tests {
     #[test]
     fn parses_a_seasons_episode_list() {
         let body = r#"{"season_number":2,"episodes":[
-            {"season_number":2,"episode_number":1,"name":"The Man Who Saved Central City"},
+            {"season_number":2,"episode_number":1,"name":"The Man Who Saved Central City","air_date":"2015-10-06"},
             {"season_number":2,"episode_number":2,"name":" "},
             {"season_number":2,"name":"no number"}
         ]}"#;
@@ -924,11 +928,13 @@ mod tests {
                     season: 2,
                     episode: 1,
                     title: Some("The Man Who Saved Central City".into()),
+                    aired: Some(1_444_089_600),
                 },
                 crate::online_enrich::EpisodeListing {
                     season: 2,
                     episode: 2,
                     title: None,
+                    aired: None,
                 },
             ]
         );

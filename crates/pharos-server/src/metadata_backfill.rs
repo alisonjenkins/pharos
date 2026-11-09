@@ -2781,6 +2781,7 @@ mod tests {
                     season,
                     episode,
                     title: Some(title.to_string()),
+                    aired: None,
                 })
                 .collect();
             self.lists.insert(id.to_string(), list);
