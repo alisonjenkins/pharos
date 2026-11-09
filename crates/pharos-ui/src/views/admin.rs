@@ -975,6 +975,13 @@ pub fn any_deep_active(checks: &[DeepCheck]) -> bool {
     checks.iter().any(deep_is_active)
 }
 
+/// Whether the tab should re-load itself: a deep check is waiting or decoding.
+pub fn deep_poll_wanted(report: &Result<IntegrityReport, String>) -> bool {
+    report
+        .as_ref()
+        .is_ok_and(|r| any_deep_active(&r.deep_checks))
+}
+
 fn deep_is_active(c: &DeepCheck) -> bool {
     matches!(c.state.as_str(), "queued" | "running")
 }
@@ -1684,6 +1691,16 @@ mod tests {
         assert_eq!(deep_timing(&deep("1", "queued")), None);
         assert!(any_deep_active(&[deep("1", "clean"), deep("2", "running")]));
         assert!(!any_deep_active(&[deep("1", "clean"), deep("2", "failed")]));
+        let with = |s: &str| {
+            Ok(IntegrityReport {
+                deep_checks: vec![deep("1", s)],
+                ..IntegrityReport::default()
+            })
+        };
+        assert!(deep_poll_wanted(&with("running")));
+        assert!(deep_poll_wanted(&with("queued")));
+        assert!(!deep_poll_wanted(&with("clean")));
+        assert!(!deep_poll_wanted(&Err("boom".into())));
         assert!(deep_in_progress(&[deep("1", "queued")], "1"));
         assert!(!deep_in_progress(&[deep("1", "queued")], "2"));
     }
