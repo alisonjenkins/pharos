@@ -117,7 +117,7 @@ pub struct Controls {
     pub view_mode: ViewMode,
     /// Where the picture sits in the playing version's frame when the file
     /// has black bars baked into it (B1017): the player crops to it.
-    pub picture: Option<FrameRect>,
+    pub picture: Option<bars::Crop>,
     /// Whether this browser can enter immersive VR (V923).
     pub vr: bool,
     /// The item's versions as (id, label), the primary's id empty; the
@@ -698,10 +698,15 @@ pub fn WatchView(
     let crop = stereo::cropped(c.packing, c.view_mode);
     // Baked-in black bars are cropped away (B1017, V976), but never from a
     // 3D frame: its eye is the crop, and VR shows the whole frame.
-    let bars = c.picture.filter(|_| c.packing.is_none());
+    let cropped_bars = c.picture.filter(|_| c.packing.is_none());
+    let bars = cropped_bars.map(|b| b.rect);
     let (eye_w, eye_h) = stereo::eye_size(crop, media.video_width, media.video_height);
     let (eye_w, eye_h) = bars::shown_size(bars, eye_w, eye_h);
-    let eye_aspect = (eye_w > 0 && eye_h > 0).then(|| f64::from(eye_w) / f64::from(eye_h));
+    // Until the video knows its size, a cropped picture takes the shape the
+    // version's own size gives, not a guess.
+    let eye_aspect = (eye_w > 0 && eye_h > 0)
+        .then(|| f64::from(eye_w) / f64::from(eye_h))
+        .or(cropped_bars.map(|b| b.aspect));
     let video_style = match (crop, bars) {
         (Some(_), _) => eye_aspect.map(|a| format!("--pharos-eye-aspect: {a:.6}")),
         (None, Some(r)) => Some(match eye_aspect {
@@ -1424,7 +1429,7 @@ fn ImageSubtitles(
     // The picture's display aspect (one eye's, while cropped); the canvas
     // until the metadata is known.
     let (aw, ah) = match picture {
-        (0, _) | (_, 0) => (w, h),
+        (0, _) | (_, 0) => bars::shown_size(crop, w, h),
         size => size,
     };
     rsx! {
@@ -1951,18 +1956,35 @@ mod tests {
         }
     }
 
+    fn bewitched() -> bars::Crop {
+        bars::Crop {
+            rect: FrameRect {
+                x: 0.125,
+                y: 0.0,
+                w: 0.75,
+                h: 1.0,
+            },
+            aspect: 4.0 / 3.0,
+        }
+    }
+
+    #[test]
+    fn a_cropped_picture_has_its_shape_before_the_video_knows_its_size() {
+        let mut c = controls();
+        c.media.video_width = 0;
+        c.media.video_height = 0;
+        c.picture = Some(bewitched());
+        let html = render(c);
+        assert!(html.contains("--pharos-eye-aspect: 1.333333"), "{html}");
+    }
+
     #[test]
     fn baked_in_black_bars_are_cropped_to_the_picture() {
         let mut c = controls();
         c.media.video_width = 1920;
         c.media.video_height = 1080;
         // Bewitched: a 4:3 picture pillarboxed in 1920x1080 (B1017).
-        c.picture = Some(FrameRect {
-            x: 0.125,
-            y: 0.0,
-            w: 0.75,
-            h: 1.0,
-        });
+        c.picture = Some(bewitched());
         let html = render(c.clone());
         assert!(
             html.contains(r#"data-crop="0.125000 0.000000 0.750000 1.000000""#),
@@ -1986,12 +2008,7 @@ mod tests {
         c.media.video_width = 3840;
         c.media.video_height = 1080;
         c.packing = Some(Stereo::FullSideBySide);
-        c.picture = Some(FrameRect {
-            x: 0.125,
-            y: 0.0,
-            w: 0.75,
-            h: 1.0,
-        });
+        c.picture = Some(bewitched());
         let html = render(c.clone());
         assert!(!html.contains("data-crop"), "{html}");
         assert!(html.contains("--pharos-eye-aspect: 1.777778"), "{html}");

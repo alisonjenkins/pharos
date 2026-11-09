@@ -36,6 +36,47 @@ pub fn picture_rect(area: Option<PictureArea>, width: u32, height: u32) -> Optio
     })
 }
 
+/// A picture to crop to: where it sits in the frame, and its shape from the
+/// version's own size, for the first frames before the `<video>` knows its
+/// size (the coded size: an anamorphic file is off until then).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Crop {
+    pub rect: FrameRect,
+    pub aspect: f64,
+}
+
+impl Crop {
+    /// The crop for a version `width` x `height` whose picture is `area`.
+    pub fn of(area: Option<PictureArea>, width: u32, height: u32) -> Option<Crop> {
+        let rect = picture_rect(area, width, height)?;
+        let (w, h) = shown_size(Some(rect), width, height);
+        (w > 0 && h > 0).then(|| Crop {
+            rect,
+            aspect: f64::from(w) / f64::from(h),
+        })
+    }
+
+    /// The crop while the server burns a subtitle into the picture: the
+    /// bars above and below stay, since a burned cue may sit in them (a
+    /// disc's subtitle in a letterbox bar); the side bars still go.
+    pub fn keeping_rows(self) -> Crop {
+        let rect = FrameRect {
+            y: 0.0,
+            h: 1.0,
+            ..self.rect
+        };
+        Crop {
+            rect,
+            aspect: self.aspect * self.rect.h,
+        }
+    }
+
+    /// Whether it crops anything at all.
+    pub fn crops(self) -> bool {
+        self.rect.w < 1.0 || self.rect.h < 1.0
+    }
+}
+
 /// The frame's `data-crop` value: the picture's fractions, `x y w h`.
 pub fn crop_attr(r: FrameRect) -> String {
     format!("{:.6} {:.6} {:.6} {:.6}", r.x, r.y, r.w, r.h)
@@ -152,6 +193,40 @@ mod tests {
         };
         assert_eq!(picture_rect(Some(empty), 1920, 1080), None);
         assert_eq!(shown_size(None, 1920, 1080), (1920, 1080));
+    }
+
+    #[test]
+    fn a_burned_subtitle_keeps_the_bars_above_and_below() {
+        // Windowboxed: bars on all four sides.
+        let area = PictureArea {
+            x: 240,
+            y: 60,
+            width: 1440,
+            height: 960,
+        };
+        let crop = Crop::of(Some(area), 1920, 1080).expect("cropped");
+        assert!(close(crop.aspect, 1.5), "{crop:?}");
+        let kept = crop.keeping_rows();
+        assert!(
+            close(kept.rect.x, 0.125) && close(kept.rect.w, 0.75),
+            "{kept:?}"
+        );
+        assert!(
+            close(kept.rect.y, 0.0) && close(kept.rect.h, 1.0),
+            "{kept:?}"
+        );
+        assert!(close(kept.aspect, 1440.0 / 1080.0), "{kept:?}");
+        assert!(kept.crops());
+        // A letterbox alone has nothing left to crop once the rows stay.
+        let letterbox = PictureArea {
+            x: 0,
+            y: 140,
+            width: 1920,
+            height: 800,
+        };
+        let crop = Crop::of(Some(letterbox), 1920, 1080).expect("cropped");
+        assert!(crop.crops());
+        assert!(!crop.keeping_rows().crops());
     }
 
     #[test]

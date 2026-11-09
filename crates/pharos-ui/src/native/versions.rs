@@ -5,7 +5,8 @@
 
 use pharos_client::api::{ItemRef, Stereo, Version, VersionAudio};
 
-use super::stereo::{packing_label, FrameRect};
+use super::bars::Crop;
+use super::stereo::packing_label;
 
 /// The `localStorage` key holding the version last picked for `title`.
 pub fn version_key(title: ItemRef) -> String {
@@ -118,8 +119,8 @@ pub fn playing_stereo(versions: &[Version], version: &str) -> Option<Stereo> {
 }
 
 /// Where the picture sits in the playing version's frame when the file has
-/// black bars baked into it (B1017), as fractions of the frame.
-pub fn playing_picture(versions: &[Version], version: &str) -> Option<FrameRect> {
+/// black bars baked into it (B1017).
+pub fn playing_picture(versions: &[Version], version: &str) -> Option<Crop> {
     versions
         .iter()
         .find(|v| {
@@ -129,7 +130,7 @@ pub fn playing_picture(versions: &[Version], version: &str) -> Option<FrameRect>
                 v.id == version
             }
         })
-        .and_then(|v| super::bars::picture_rect(v.picture, v.width, v.height))
+        .and_then(|v| Crop::of(v.picture, v.width, v.height))
 }
 
 /// How far a version's runtime may stray from the primary's and still be
@@ -304,8 +305,9 @@ mod tests {
             ..version("remaster", "Remaster", None)
         };
         let versions = [bars, clean];
-        let r = playing_picture(&versions, "").expect("the primary has bars");
-        assert_eq!((r.x, r.w), (0.125, 0.75));
+        let crop = playing_picture(&versions, "").expect("the primary has bars");
+        assert_eq!((crop.rect.x, crop.rect.w), (0.125, 0.75));
+        assert_eq!(crop.aspect, 4.0 / 3.0);
         assert_eq!(playing_picture(&versions, "remaster"), None);
         assert_eq!(playing_picture(&versions, "gone"), None);
     }

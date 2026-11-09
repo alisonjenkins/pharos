@@ -438,6 +438,15 @@ pub fn media_state(video_id: &str) -> MediaState {
 /// inside baked-in black bars while it carries a bar crop (`data-crop`,
 /// B1017).
 pub(super) fn picture_size(video: &web_sys::HtmlMediaElement) -> (u32, u32) {
+    picture_of(video).1
+}
+
+/// Where the picture `video` shows sits in its decoded frame (fractions),
+/// and its shape: the one reader of the frame's `data-packing` and
+/// `data-crop`, for [`picture_size`] and the transition snapshot.
+pub(super) fn picture_of(
+    video: &web_sys::HtmlMediaElement,
+) -> (super::stereo::FrameRect, (u32, u32)) {
     let frame = video.parent_element();
     let packing = frame
         .as_ref()
@@ -452,7 +461,8 @@ pub(super) fn picture_size(video: &web_sys::HtmlMediaElement) -> (u32, u32) {
         video_dimension(video, "videoWidth"),
         video_dimension(video, "videoHeight"),
     );
-    super::bars::shown_size(bars, w, h)
+    let rect = bars.unwrap_or_else(|| super::stereo::eye_rect(packing, super::stereo::Eye::Left));
+    (rect, super::bars::shown_size(bars, w, h))
 }
 
 /// A `<video>`'s `videoWidth` or `videoHeight`, read off the element so the

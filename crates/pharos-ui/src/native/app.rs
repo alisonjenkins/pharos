@@ -5867,7 +5867,16 @@ fn Player(
         live_position: Some(position),
         subtitle_size: sub_size(),
         packing: versions::playing_stereo(&p.detail.versions, &p.version),
-        picture: versions::playing_picture(&p.detail.versions, &p.version),
+        // A burned subtitle may sit in a letterbox bar, so those stay (V977).
+        picture: versions::playing_picture(&p.detail.versions, &p.version)
+            .map(|crop| {
+                if p.burned() {
+                    crop.keeping_rows()
+                } else {
+                    crop
+                }
+            })
+            .filter(|crop| crop.crops()),
         view_mode: view_mode(),
         vr: vr().unwrap_or(false),
         versions: p
