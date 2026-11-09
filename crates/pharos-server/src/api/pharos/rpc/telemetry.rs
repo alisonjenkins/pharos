@@ -1,4 +1,5 @@
-//! `Telemetry.submit`: a signed-in client's events and spans. Each event is
+//! `Telemetry.submit`: a signed-in client's events and spans. `report` and the
+//! stored-report calls live in `report.rs`. Each event is
 //! logged at its level and counted; spans have no sink yet, so they are only
 //! counted in a debug line. Every batch is bounded, and every string a client
 //! sends is cut and redacted before it reaches a log line (V8).
@@ -159,6 +160,38 @@ impl server::telemetry::Handler for Telemetry {
         out.set_ok(());
         Ok(())
     }
+
+    async fn report(
+        self: Rc<Self>,
+        params: pharos_capnp::telemetry::ReportParams,
+        results: &mut pharos_capnp::telemetry::ReportResults,
+    ) -> Result<(), capnp::Error> {
+        super::report::report(Rc::clone(&self.session), params, results).await
+    }
+
+    async fn list_reports(
+        self: Rc<Self>,
+        params: pharos_capnp::telemetry::ListReportsParams,
+        results: &mut pharos_capnp::telemetry::ListReportsResults,
+    ) -> Result<(), capnp::Error> {
+        super::report::list_reports(Rc::clone(&self.session), params, results).await
+    }
+
+    async fn get_report(
+        self: Rc<Self>,
+        params: pharos_capnp::telemetry::GetReportParams,
+        results: &mut pharos_capnp::telemetry::GetReportResults,
+    ) -> Result<(), capnp::Error> {
+        super::report::get_report(Rc::clone(&self.session), params, results).await
+    }
+
+    async fn delete_report(
+        self: Rc<Self>,
+        params: pharos_capnp::telemetry::DeleteReportParams,
+        results: &mut pharos_capnp::telemetry::DeleteReportResults,
+    ) -> Result<(), capnp::Error> {
+        super::report::delete_report(Rc::clone(&self.session), params, results).await
+    }
 }
 
 /// Why a batch's events were dropped: the `reason` label of
@@ -278,14 +311,14 @@ fn render_fields(
     Ok(out.join(" "))
 }
 
-fn is_credential_key(key: &str) -> bool {
+pub(super) fn is_credential_key(key: &str) -> bool {
     let lower = key.to_ascii_lowercase();
     CREDENTIAL_KEYS.iter().any(|k| lower.contains(k))
 }
 
 /// Whether `value` looks like a credential: an auth scheme or a token marker,
 /// or one long run of token characters with a digit in it.
-fn looks_like_credential(value: &str) -> bool {
+pub(super) fn looks_like_credential(value: &str) -> bool {
     let lower = value.to_ascii_lowercase();
     let scheme = ["bearer ", "basic "].iter().any(|s| lower.starts_with(s));
     if scheme || CREDENTIAL_MARKERS.iter().any(|m| lower.contains(m)) {
