@@ -32,6 +32,7 @@ pub mod keymap;
 pub mod keys;
 pub mod letters;
 pub mod listen;
+pub mod live;
 pub mod lyrics;
 pub mod machine;
 pub mod manage;
