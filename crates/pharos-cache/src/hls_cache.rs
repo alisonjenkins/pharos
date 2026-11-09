@@ -269,6 +269,10 @@ pub struct SegmentIdentity {
     stereo_output: pharos_transcode::StereoOutput,
     /// HDR sources are tonemapped to SDR, which changes the pixels.
     tonemap: pharos_transcode::Tonemap,
+    /// A downscaled transcode is different pixels. `None` (the source size)
+    /// adds nothing to the file name, so every unscaled segment keeps the name
+    /// it had before downscaling existed.
+    output_size: Option<pharos_transcode::OutputSize>,
 }
 
 const NO_SUBTITLE: i32 = -1;
@@ -1789,6 +1793,7 @@ impl SegmentIdentity {
             source_gen,
             stereo_output: opts.stereo_output,
             tonemap: opts.tonemap,
+            output_size: opts.output_size,
         }
     }
 
@@ -1811,6 +1816,7 @@ impl SegmentIdentity {
             source_gen,
             stereo_output,
             tonemap,
+            output_size,
         } = self;
         // A local item contributes NOTHING here, so every existing cache
         // filename is byte-identical to what it was before this field existed
@@ -1841,8 +1847,11 @@ impl SegmentIdentity {
             pharos_transcode::Tonemap::Off => "",
             pharos_transcode::Tonemap::HdrToSdr => "_tm",
         };
+        let size = output_size
+            .map(|s| format!("_{}x{}", s.width(), s.height()))
+            .unwrap_or_default();
         format!(
-            "{seg_index}-a{audio_index}-s{sub}-v{}-b{}-c{codec_tag}{gen}{stereo}{tonemap}.ts",
+            "{seg_index}-a{audio_index}-s{sub}-v{}-b{}-c{codec_tag}{gen}{stereo}{tonemap}{size}.ts",
             br(*video_bitrate_kbps),
             br(*audio_bitrate_kbps),
         )
@@ -4238,6 +4247,7 @@ impl HlsSegmentCache {
             source_gen: SourceGen::LOCAL,
             stereo_output: pharos_transcode::StereoOutput::Preserve,
             tonemap: Default::default(),
+            output_size: None,
         })
     }
 
@@ -10675,6 +10685,34 @@ mod tests {
     }
 
     #[test]
+    fn segment_identity_output_size_distinguishes_cache_and_etag() {
+        let plain = ident_opts(
+            Some(SegmentVideo::H264),
+            Some(SegmentAudio::Aac),
+            SegmentContainer::Mpegts,
+            Some(4_000_000),
+            Some(128_000),
+        );
+        let mut scaled = plain.clone();
+        scaled.output_size = pharos_transcode::OutputSize::new(1920, 1080);
+        let mut other = plain.clone();
+        other.output_size = pharos_transcode::OutputSize::new(1280, 720);
+        let id = |o: &SegmentOpts| SegmentIdentity::new(1, 5, Some(1), None, o, SourceGen::LOCAL);
+        let (k_plain, k_scaled, k_other) = (id(&plain), id(&scaled), id(&other));
+
+        assert_eq!(k_plain.filename(), "5-a1-soff-v4000-b128-c28.ts");
+        assert!(
+            k_scaled.filename().ends_with("_1920x1080.ts"),
+            "{}",
+            k_scaled.filename()
+        );
+        for (a, b) in [(&k_plain, &k_scaled), (&k_scaled, &k_other)] {
+            assert_ne!(a.cache_relative_path(), b.cache_relative_path());
+            assert_ne!(a.etag(), b.etag());
+        }
+    }
+
+    #[test]
     fn segment_identity_stereo_output_distinguishes_cache_and_etag() {
         let mut opts_preserve = ident_opts(
             Some(SegmentVideo::H264),
@@ -10906,6 +10944,7 @@ mod tests {
                     source_gen: SourceGen::LOCAL,
                     stereo_output: pharos_transcode::StereoOutput::Preserve,
                     tonemap: Default::default(),
+                    output_size: None,
                 },
                 body.len() as u64,
             )
