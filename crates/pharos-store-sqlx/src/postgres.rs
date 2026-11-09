@@ -4489,6 +4489,23 @@ impl SeriesIdentityStore for PostgresStore {
         Ok(res.rows_affected())
     }
 
+    async fn mark_reconcile_paths(&self, paths: &[String], at: i64) -> DomainResult<u64> {
+        if paths.is_empty() {
+            return Ok(0);
+        }
+        let res = sqlx::query(
+            "UPDATE media_items SET series_reconcile_pending = $1 \
+             WHERE kind = 'episode' AND path = ANY($2) \
+               AND (match_source IS NULL OR match_source <> 'manual')",
+        )
+        .bind(at)
+        .bind(paths)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| DomainError::Backend(e.to_string()))?;
+        Ok(res.rows_affected())
+    }
+
     async fn series_reconcile_pending(&self, limit: i64) -> DomainResult<Vec<(MediaId, i64)>> {
         let rows: Vec<(i64, i64)> = sqlx::query_as(
             "SELECT id, series_reconcile_pending FROM media_items \

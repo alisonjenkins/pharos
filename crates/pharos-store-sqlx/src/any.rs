@@ -811,6 +811,13 @@ impl SeriesIdentityStore for AnyStore {
         }
     }
 
+    async fn mark_reconcile_paths(&self, paths: &[String], at: i64) -> DomainResult<u64> {
+        match self {
+            AnyStore::Sqlite(s) => s.mark_reconcile_paths(paths, at).await,
+            AnyStore::Postgres(p) => p.mark_reconcile_paths(paths, at).await,
+        }
+    }
+
     async fn series_reconcile_pending(&self, limit: i64) -> DomainResult<Vec<(MediaId, i64)>> {
         match self {
             AnyStore::Sqlite(s) => s.series_reconcile_pending(limit).await,

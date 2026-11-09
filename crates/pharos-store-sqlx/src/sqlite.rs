@@ -3906,6 +3906,28 @@ impl SeriesIdentityStore for SqliteStore {
         Ok(changed)
     }
 
+    async fn mark_reconcile_paths(&self, paths: &[String], at: i64) -> DomainResult<u64> {
+        let mut changed = 0_u64;
+        for chunk in paths.chunks(500) {
+            let placeholders = vec!["?"; chunk.len()].join(",");
+            let sql = format!(
+                "UPDATE media_items SET series_reconcile_pending = ? \
+                 WHERE kind = 'episode' AND path IN ({placeholders}) \
+                   AND (match_source IS NULL OR match_source <> 'manual')"
+            );
+            let mut q = sqlx::query(sqlx::AssertSqlSafe(sql)).bind(at);
+            for path in chunk {
+                q = q.bind(path);
+            }
+            let res = q
+                .execute(&self.pool)
+                .await
+                .map_err(|e| DomainError::Backend(e.to_string()))?;
+            changed = changed.saturating_add(res.rows_affected());
+        }
+        Ok(changed)
+    }
+
     async fn series_reconcile_pending(&self, limit: i64) -> DomainResult<Vec<(MediaId, i64)>> {
         let rows: Vec<(i64, i64)> = sqlx::query_as(
             "SELECT id, series_reconcile_pending FROM media_items \
