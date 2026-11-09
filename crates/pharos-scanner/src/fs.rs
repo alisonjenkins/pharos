@@ -6388,6 +6388,65 @@ mod tests {
         assert!(store.reconcile_marked.lock().unwrap().is_empty());
     }
 
+    /// V896 — a hand fix is the admin's decision, not the scanner's, so a dry
+    /// run writes it: a file an admin row moved takes that row's key and is
+    /// marked for a rebuild, while the scanner's own split stays held.
+    #[tokio::test]
+    async fn a_dry_run_scan_writes_an_admins_move_but_not_its_own_split() {
+        let td = TempDir::new().unwrap();
+        write_flash(td.path()).await;
+        let folder = td.path().join("The Flash").to_string_lossy().into_owned();
+        let moved = td
+            .path()
+            .join("The Flash/Season 1/The Flash (2014) - S01E02.mkv")
+            .to_string_lossy()
+            .into_owned();
+        let store = MemStore::default();
+        store
+            .overrides
+            .lock()
+            .unwrap()
+            .push(pharos_core::SeriesOverride {
+                id: 1,
+                series_folder: folder.clone(),
+                path: Some(moved.clone()),
+                target_key: "/tv/Elsewhere".into(),
+                target_name: Some("Elsewhere".into()),
+                target_year: Some(2014),
+                source: pharos_core::OverrideSource::Admin,
+                created_by: Some("ali".into()),
+                created_at: 1,
+            });
+        let scanner = FsScanner::new(FakeProber::default());
+        scanner.scan_into(td.path(), &store).await.unwrap();
+        // A second pass finds nothing more to write.
+        scanner.scan_into(td.path(), &store).await.unwrap();
+
+        let key_of = |name: &str| {
+            store
+                .inner
+                .lock()
+                .unwrap()
+                .values()
+                .find(|i| i.path.to_string_lossy().ends_with(name))
+                .and_then(|i| i.series.clone())
+                .map(|s| (s.series_key, s.series_year))
+        };
+        assert_eq!(
+            key_of("(2014) - S01E02.mkv"),
+            Some((Some("/tv/Elsewhere".into()), Some(2014)))
+        );
+        for unsplit in ["(1990) - S01E01.mkv", "(2014) - S01E01.mkv"] {
+            assert_eq!(key_of(unsplit), Some((None, None)), "{unsplit}");
+        }
+        assert_eq!(*store.reconcile_marked.lock().unwrap(), [moved]);
+        assert_eq!(
+            store.overrides.lock().unwrap().len(),
+            1,
+            "no owner row in a dry run"
+        );
+    }
+
     /// Spec 033 §6.2: the default dry run counts the split it would make and
     /// writes nothing.
     #[tokio::test]
