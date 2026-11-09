@@ -4720,11 +4720,13 @@ body:has(.pharos-stage.is-mini) .pharos-main {
   }
 }
 /* The floating window sizes its own strip: resized narrow on a wide screen
-   (down to 240px), the queue button pushed Close out of the window (B900). */
+   (down to 240px), the queue button pushed Close out of the window (B900).
+   Previous goes only below the default 20rem width: at 20rem the title
+   still has about 54px beside it, and each rem narrower takes 16px. */
 .pharos-stage.is-floating {
   container: pharos-stage / inline-size;
 }
-@container pharos-stage (max-width: 21rem) {
+@container pharos-stage (max-width: 19rem) {
   .pharos-stage-transport [aria-label="Previous"] {
     display: none;
   }
