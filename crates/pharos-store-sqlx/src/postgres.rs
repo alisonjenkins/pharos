@@ -2141,9 +2141,9 @@ impl PersonStore for PostgresStore {
              FROM people p \
              WHERE {} AND EXISTS (SELECT 1 FROM item_people ip \
                  WHERE ip.person_id = p.id AND ip.person_kind IN ('Actor', 'GuestStar')) \
-             ORDER BY LENGTH(p.name), p.name LIMIT {}",
+             ORDER BY LENGTH(p.name), p.name LIMIT ${}",
             clauses.join(" AND "),
-            format!("${}", words.len() + 1),
+            words.len() + 1,
         );
         let mut query = sqlx::query_as::<
             _,
