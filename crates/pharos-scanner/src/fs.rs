@@ -2114,8 +2114,8 @@ fn record_edition_drift(
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Fold {
     copy: PathBuf,
-    into: Vec<PathBuf>,
-    resume: pharos_core::FoldResume,
+    /// Each item, and whether the copy's resume point carries into it.
+    into: Vec<(PathBuf, pharos_core::FoldResume)>,
 }
 
 /// Every file of `groups` that is a version of another and no item of its
@@ -2123,7 +2123,7 @@ struct Fold {
 /// (a double episode that is the primary of an episode no single covers)
 /// keeps its row and its state, so it folds nowhere: folding it each pass
 /// would re-mark an episode its viewer had marked unwatched. Resume carries
-/// only between files of the same episode span.
+/// only into an item of the same episode span as the copy.
 fn folded_copies(groups: &[(PathBuf, Vec<(String, PathBuf)>)]) -> Vec<Fold> {
     let items: HashSet<&Path> = groups.iter().map(|(p, _)| p.as_path()).collect();
     let mut folds: BTreeMap<&Path, Vec<&Path>> = BTreeMap::new();
@@ -2138,15 +2138,20 @@ fn folded_copies(groups: &[(PathBuf, Vec<(String, PathBuf)>)]) -> Vec<Fold> {
         .into_iter()
         .map(|(copy, into)| {
             let span = |p: &Path| episode_copy_key(p).map(|(_, _, first, last)| (first, last));
-            let same_span = into.iter().all(|p| span(p) == span(copy));
+            let own = span(copy);
             Fold {
                 copy: copy.to_path_buf(),
-                into: into.into_iter().map(Path::to_path_buf).collect(),
-                resume: if same_span {
-                    pharos_core::FoldResume::Carry
-                } else {
-                    pharos_core::FoldResume::Drop
-                },
+                into: into
+                    .into_iter()
+                    .map(|p| {
+                        let resume = if span(p) == own {
+                            pharos_core::FoldResume::Carry
+                        } else {
+                            pharos_core::FoldResume::Drop
+                        };
+                        (p.to_path_buf(), resume)
+                    })
+                    .collect(),
             }
         })
         .collect()
@@ -2170,7 +2175,7 @@ async fn settle_copies<S: MediaStore>(
         };
         let mut written = Vec::with_capacity(fold.into.len());
         let mut unwritten = None;
-        for primary in &fold.into {
+        for (primary, resume) in &fold.into {
             let into = match store.id_at_path(primary).await? {
                 Some(into) => store
                     .scan_state(into)
@@ -2180,7 +2185,7 @@ async fn settle_copies<S: MediaStore>(
                 None => None,
             };
             match into {
-                Some(into) => written.push(into),
+                Some(into) => written.push((into, *resume)),
                 None => unwritten = Some(primary),
             }
         }
@@ -2199,13 +2204,13 @@ async fn settle_copies<S: MediaStore>(
             );
             continue;
         }
-        for into in written.into_iter().filter(|into| *into != from) {
-            store.merge_user_data(from, into, fold.resume).await?;
+        for (into, resume) in written.into_iter().filter(|(into, _)| *into != from) {
+            store.merge_user_data(from, into, resume).await?;
             tracing::info!(
                 from = %from,
                 into = %into,
                 version = %fold.copy.display(),
-                resume = ?fold.resume,
+                resume = ?resume,
                 "folded a copy's row into the item it is now a version of",
             );
         }
@@ -7054,8 +7059,10 @@ mod tests {
             folded_copies(&groups),
             vec![Fold {
                 copy: double,
-                into: vec![e01, e02],
-                resume: pharos_core::FoldResume::Drop,
+                into: vec![
+                    (e01, pharos_core::FoldResume::Drop),
+                    (e02, pharos_core::FoldResume::Drop),
+                ],
             }]
         );
     }
@@ -7073,8 +7080,31 @@ mod tests {
             Some(vec![sd.as_path()])
         );
         assert_eq!(
-            folded_copies(&groups).first().map(|f| f.resume),
+            folded_copies(&groups)
+                .first()
+                .and_then(|f| f.into.first())
+                .map(|(_, resume)| *resume),
             Some(pharos_core::FoldResume::Carry)
+        );
+    }
+
+    /// A copy folding into items of different spans carries its resume
+    /// point only into the one whose span it shares.
+    #[test]
+    fn a_copy_carries_its_resume_only_into_an_item_of_its_span() {
+        let e01 = PathBuf::from("/tv/Foo/Season 01/Foo S01E01.mkv");
+        let hd = PathBuf::from("/tv/Foo/Season 01/Foo S01E01-E02 WEBDL-1080p.mkv");
+        let sd = PathBuf::from("/tv/Foo/Season 1/Foo S01E01-E02 HDTV-720p.mkv");
+        let groups = group_editions(vec![e01.clone(), hd.clone(), sd.clone()]);
+        assert_eq!(
+            folded_copies(&groups),
+            vec![Fold {
+                copy: sd,
+                into: vec![
+                    (e01, pharos_core::FoldResume::Drop),
+                    (hd, pharos_core::FoldResume::Carry),
+                ],
+            }]
         );
     }
 
