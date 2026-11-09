@@ -988,10 +988,19 @@ struct DamagedFileDto {
     read_errors: u64,
     scanned_ms: u64,
     declared_ms: Option<u64>,
+    /// Where in the media the damage is, merged into spans.
+    ranges: Vec<DamageRangeDto>,
     /// Unix seconds. `None` for a verdict recorded before the memo kept it.
     checked_at: Option<i64>,
     /// An admin asked for a re-read and the new verdict is not in yet.
     recheck_pending: bool,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct DamageRangeDto {
+    start_ms: u64,
+    end_ms: u64,
 }
 
 /// What a person calls a file, so an admin list reads "Series · S01E02 ·
@@ -1073,6 +1082,14 @@ async fn damaged_files(
             read_errors: r.read_errors,
             scanned_ms: r.scanned_ms,
             declared_ms: r.declared_ms,
+            ranges: r
+                .damage_ranges()
+                .into_iter()
+                .map(|d| DamageRangeDto {
+                    start_ms: d.start_ms,
+                    end_ms: d.end_ms,
+                })
+                .collect(),
         });
     }
     Ok(web::Json(out))

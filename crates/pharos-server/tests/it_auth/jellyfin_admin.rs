@@ -1065,6 +1065,11 @@ async fn an_admin_can_list_damaged_files_including_one_with_no_resolvable_path()
     assert_eq!(thor["FirstFaultMs"], 5_582_400);
     assert_eq!(thor["ScannedMs"], 5_582_400);
     assert_eq!(thor["DeclaredMs"], 7_800_000);
+    assert_eq!(
+        thor["Ranges"],
+        serde_json::json!([{"StartMs": 5_582_400, "EndMs": 7_800_000}]),
+        "a verdict without spans that stops short marks the missing tail: {v}"
+    );
 
     let gone = arr
         .iter()
