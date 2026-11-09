@@ -262,7 +262,7 @@ pub struct Detail {
     /// regulars ranked across its episodes.
     pub cast: Vec<Credit>,
     /// A film or episode's files, the primary first; empty for anything
-    /// else, and from a server older than schema 28.
+    /// else, and from a server older than schema 29.
     pub versions: Vec<Version>,
 }
 
