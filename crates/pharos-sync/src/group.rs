@@ -3258,6 +3258,12 @@ impl GroupHandle {
                             .filter(|(_, m)| m.connected && silent_ms(m) > MEMBER_TTL_MS)
                             .map(|(id, m)| (*id, silent_ms(m)))
                             .collect();
+                        // A sole member is never removed for silence: that
+                        // ends the group under a host waiting for guests. Its
+                        // socket closing still frees its gates, and
+                        // GROUP_ABANDONED_MS reaps it if nobody returns.
+                        let sole = state.members.len() == 1;
+                        let ghosts = if sole { Vec::new() } else { ghosts };
                         let pruned_any = !ghosts.is_empty();
                         for (id, silent) in ghosts {
                             // Carry the values the verdict was reached ON.
@@ -5095,6 +5101,27 @@ mod tests {
             snap.participants,
             vec!["alive".to_string()],
             "ghost pruned, pinger survives"
+        );
+    }
+
+    /// B1006 — a group whose only member is its host is never ended by the
+    /// silence prune: a host waiting for guests (hidden tab, slow rejoin) that
+    /// stays quiet past MEMBER_TTL_MS keeps the group and the seat.
+    /// Disarm check: with the prune also taking a sole member, the actor ends
+    /// and the snapshot answers `None`.
+    #[tokio::test(start_paused = true)]
+    async fn a_sole_host_silent_past_the_ttl_keeps_its_group() {
+        let (h, sinks) = spawn_group();
+        let host = MemberId::new();
+        let _rx = join(&h, &sinks, host, "host").await;
+        for _ in 0..8 {
+            tokio::time::advance(Duration::from_millis(MEMBER_PRUNE_TICK_MS)).await;
+            let _ = h.snapshot().await;
+        }
+        assert_eq!(
+            h.snapshot().await.map(|g| g.participants),
+            Some(vec!["host".to_string()]),
+            "the host alone stays seated"
         );
     }
 
