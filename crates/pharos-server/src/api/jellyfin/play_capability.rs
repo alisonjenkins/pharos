@@ -198,9 +198,11 @@ fn path_media_id(req: &HttpRequest) -> Option<MediaId> {
         .and_then(pharos_jellyfin_api::dto::parse_item_id)
 }
 
-/// Marks a token-authenticated playlist request whose PlaySessionId is this
-/// user's live session for the item, so the URLs it embeds drop the token.
-/// Reads the in-memory registry only: the token itself authorized the request.
+/// Marks a token-authenticated playlist request whose PlaySessionId is a
+/// session this same token negotiated for the item, so the URLs it embeds
+/// drop the token. Reads the in-memory registry only: the token itself
+/// authorized the request. A session another token holds (one since revoked,
+/// say) stays unbound, so the playlist keeps the live token it was given.
 async fn bind_if_live(state: &AppState, req: &HttpRequest, media_id: MediaId, user: &User) {
     let Some(cap) = super::ci_query::values(req.query_string(), "PlaySessionId")
         .find(|v| !v.is_empty())
@@ -208,12 +210,20 @@ async fn bind_if_live(state: &AppState, req: &HttpRequest, media_id: MediaId, us
     else {
         return;
     };
+    let Some(token) = auth_extractor::media_token(Some(state), req).await else {
+        return;
+    };
+    let token_id = pharos_core::TokenStore::token_id(&state.stores, &token);
     match state
         .transcode_sessions
         .get(PlaySessionId::from(cap.as_str()))
         .await
     {
-        Ok(Some(s)) if s.media_id == media_id && s.holder.user_id == user.id => {
+        Ok(Some(s))
+            if s.media_id == media_id
+                && s.holder.user_id == user.id
+                && s.holder.token_id == token_id =>
+        {
             req.extensions_mut().insert(CapabilityBound);
         }
         Ok(_) => {}
