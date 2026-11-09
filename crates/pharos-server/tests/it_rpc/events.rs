@@ -2,6 +2,7 @@
 //! changes to their sink with a per-user `seq`, replays after `afterSeq`, and
 //! resyncs from outside the window.
 
+use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -47,7 +48,7 @@ impl Got {
     }
 }
 
-struct TestSink(mpsc::UnboundedSender<Got>);
+struct TestSink(mpsc::UnboundedSender<Got>, Rc<RefCell<Vec<usize>>>);
 
 impl server::event_sink::Handler for TestSink {
     async fn push(
@@ -55,7 +56,9 @@ impl server::event_sink::Handler for TestSink {
         params: event_sink::PushParams,
         results: &mut event_sink::PushResults,
     ) -> Result<(), capnp::Error> {
-        for e in params.get()?.get_events()? {
+        let events = params.get()?.get_events()?;
+        self.1.borrow_mut().push(events.len() as usize);
+        for e in events {
             let seq = e.get_seq();
             let got = match e.which()? {
                 event::UserData(u) => {
@@ -95,18 +98,32 @@ impl server::event_sink::Handler for TestSink {
     }
 }
 
+type Sub = (capnp::capability::Client, mpsc::UnboundedReceiver<Got>);
+
 /// A subscription, or the refusal's `Error.kind` name.
 async fn subscribe(
     session: &session::Client,
     topics: &[&str],
     after_seq: u64,
-) -> Result<(capnp::capability::Client, mpsc::UnboundedReceiver<Got>), String> {
+) -> Result<Sub, String> {
+    subscribe_sized(session, topics, after_seq, Rc::default()).await
+}
+
+/// [`subscribe`], recording the size of each push into `sizes`.
+async fn subscribe_sized(
+    session: &session::Client,
+    topics: &[&str],
+    after_seq: u64,
+    sizes: Rc<RefCell<Vec<usize>>>,
+) -> Result<Sub, String> {
     let events = session.events_request().send().pipeline.get_events();
     let (tx, rx) = mpsc::unbounded_channel();
     let mut req = events.subscribe_request();
     req.get().init_ctx();
-    req.get()
-        .set_sink(server::event_sink::client(TestSink(tx), &Connection::new()));
+    req.get().set_sink(server::event_sink::client(
+        TestSink(tx, sizes),
+        &Connection::new(),
+    ));
     let mut list = req.get().init_topics(u32::try_from(topics.len()).unwrap());
     for (i, t) in (0u32..).zip(topics) {
         list.set(i, *t);
@@ -439,6 +456,142 @@ async fn socket_only_announcements_are_not_events() {
             let _ = fx.state.bus.send(SocketBroadcast::SessionsChanged);
             let _ = fx.state.bus.send(SocketBroadcast::CastChanged);
             quiet(&mut rx).await;
+        })
+        .await;
+}
+
+fn played_payload(id: u64) -> pharos_server::services::events::Payload {
+    pharos_server::services::events::Payload::UserData {
+        id: pharos_jellyfin_api::dto::WireId::Real(id),
+        state: pharos_server::services::events::UserState {
+            played: true,
+            favorite: false,
+            position_ms: 0,
+            play_count: 1,
+        },
+    }
+}
+
+/// A burst past the live channel's capacity lags the subscriber, which
+/// catches up from the window: every event arrives once, in `seq` order, in
+/// pushes of at most 256; a resume from far back is split the same way.
+/// Disarm check: with the `try_recv` lag arm only breaking (no catch-up),
+/// events go missing; with the batch cap applied only to the top-up, a push
+/// of 600 arrives.
+#[actix_web::test]
+async fn a_burst_past_the_live_channel_arrives_whole_in_bounded_pushes() {
+    let fx = seed_rich().await;
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let s = session_for(&connect(&fx), &fx.user_token).await;
+            let sizes = Rc::<RefCell<Vec<usize>>>::default();
+            let (_sub, mut rx) = subscribe_sized(&s, &[], 0, Rc::clone(&sizes))
+                .await
+                .unwrap();
+            let head = fx.state.events.head(fx.user_id).unwrap();
+            // No await between publishes: the pump cannot read until all 600
+            // are in, far past its channel's 256.
+            fx.state
+                .events
+                .publish(fx.user_id, (1..=600).map(played_payload).collect());
+            let mut seqs = Vec::new();
+            for _ in 0..600 {
+                seqs.push(next(&mut rx).await.seq());
+            }
+            assert_eq!(seqs, (head + 1..=head + 600).collect::<Vec<_>>());
+            quiet(&mut rx).await;
+            assert!(
+                sizes.borrow().iter().all(|n| *n <= 256),
+                "{:?}",
+                sizes.borrow()
+            );
+
+            let resumed = Rc::<RefCell<Vec<usize>>>::default();
+            let (_again, mut rx) = subscribe_sized(&s, &[], head, Rc::clone(&resumed))
+                .await
+                .unwrap();
+            for _ in 0..600 {
+                next(&mut rx).await;
+            }
+            assert!(
+                resumed.borrow().iter().all(|n| *n <= 256),
+                "{:?}",
+                resumed.borrow()
+            );
+            assert!(resumed.borrow().len() >= 3);
+        })
+        .await;
+}
+
+/// A user whose policy hides a library hears that the library changed but
+/// not the ids of its hidden items, and gets no scan progress; an
+/// unrestricted user gets both.
+/// Disarm check: with `Pump::scoped` returning the batch as it is, the
+/// hidden id and the task reach the restricted user.
+#[actix_web::test]
+async fn library_ids_are_scoped_to_what_the_user_may_see() {
+    use pharos_core::{UserPolicy, UserStore as _};
+    let fx = seed_rich().await;
+    fx.state
+        .stores
+        .set_policy(
+            fx.user_id,
+            UserPolicy {
+                enable_all_folders: false,
+                enabled_folders: vec![fx.lib_b_wire.clone()],
+                ..UserPolicy::default()
+            },
+        )
+        .await
+        .unwrap();
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let mine = session_for(&connect(&fx), &fx.user_token).await;
+            let admin = session_for(&connect(&fx), &fx.admin_token).await;
+            let (_sub, mut rx) = subscribe(&mine, &[], 0).await.unwrap();
+            let (_asub, mut arx) = subscribe(&admin, &[], 0).await.unwrap();
+            fx.state
+                .notify_library_delta(&[fx.rich_item_id, fx.other_item_id], &[]);
+            fx.state.notify_refresh_progress("lib", 50.0);
+            match next(&mut rx).await {
+                Got::Library { added, .. } => assert_eq!(added, vec![fx.other_item_id]),
+                other => panic!("expected the library change, got {other:?}"),
+            }
+            quiet(&mut rx).await;
+            match next(&mut arx).await {
+                Got::Library { added, .. } => {
+                    assert_eq!(added, vec![fx.rich_item_id, fx.other_item_id]);
+                }
+                other => panic!("expected the library change, got {other:?}"),
+            }
+            assert!(matches!(next(&mut arx).await, Got::Task { .. }));
+        })
+        .await;
+}
+
+/// Logging out stops the session's subscriptions at once, idle or not, so
+/// their slots are free for whoever signs in next on the connection.
+/// Disarm check: without `stop_token` in `ConnectionCtx::end_token`, the
+/// subscribe after signing in again is refused `limit`.
+#[actix_web::test]
+async fn logging_out_frees_the_sessions_subscription_slots() {
+    use pharos_server::api::pharos::rpc::events::MAX_SUBSCRIPTIONS_PER_CONNECTION;
+    let fx = seed_rich().await;
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let client = connect(&fx);
+            let s = session_for(&client, &fx.user_token).await;
+            let mut held = Vec::new();
+            for _ in 0..MAX_SUBSCRIPTIONS_PER_CONNECTION {
+                held.push(subscribe(&s, &[], 0).await.unwrap());
+            }
+            let mut req = s.logout_request();
+            req.get().init_ctx();
+            req.send().promise.await.unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let admin = session_for(&client, &fx.admin_token).await;
+            let again = subscribe(&admin, &[], 0).await;
+            assert!(again.is_ok(), "{:?}", again.err());
         })
         .await;
 }
