@@ -1,9 +1,8 @@
-//! Dioxus admin UI mirroring `api::jellyfin::admin` endpoints (T50, T58).
-//!
-//! Phase 1 (T50): user list with delete + create form + library refresh.
-//! Phase 2 (T58): tabbed dashboard — Users, Libraries (VirtualFolders),
-//! Devices, Activity log. Tabs that read a server-side empty stub still
-//! render so the UI is in place when entries land.
+//! The Manage pages (T50, T58): the admin dashboard over the
+//! `api::jellyfin::admin` endpoints. A sidebar of sections beside the one
+//! shown, in the settings pages' frame, so Manage looks like the rest of the
+//! app (B921). Pure: the parent fetches, and these views render under
+//! `dioxus-ssr`.
 
 use crate::client::{
     ActivityEntry, AdminUser, ApiKey, BrandingConfig, DamagedFile, DeepCheck, DeviceEntry,
@@ -63,6 +62,8 @@ pub enum AdminAction {
     LibraryRefresh,
     Refresh,
     SelectTab(AdminTab),
+    /// The status line's Dismiss.
+    DismissStatus,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -82,7 +83,7 @@ pub enum AdminTab {
 }
 
 impl AdminTab {
-    fn label(self) -> &'static str {
+    pub fn label(self) -> &'static str {
         match self {
             Self::Users => "Users",
             Self::Libraries => "Libraries",
@@ -112,7 +113,39 @@ impl AdminTab {
             Self::Branding => "branding",
         }
     }
-    fn all() -> [AdminTab; 11] {
+    /// One line under the page title on what the page is for.
+    fn lede(self) -> &'static str {
+        match self {
+            Self::Users => "Who can sign in, and who can manage the server.",
+            Self::Libraries => "The folders pharos watches for media.",
+            Self::Duplicates => "Films held more than once, to compare before you remove a copy.",
+            Self::Integrity => "Files the background check found damaged, and deep checks.",
+            Self::Devices => "Every app and device that has signed in.",
+            Self::Activity => "Recent sign-ins, playback and server events.",
+            Self::ScheduledTasks => "Jobs the server runs on its own.",
+            Self::Plugins => "Plugins the server has loaded.",
+            Self::Logs => "The server's log files.",
+            Self::ApiKeys => "Keys that let other apps use this server without a user.",
+            Self::Branding => "The server's name and the words on the sign-in page.",
+        }
+    }
+    /// The icon's SVG path, on the settings sidebar's 24-unit stroked grid.
+    fn icon(self) -> &'static str {
+        match self {
+            Self::Users => "M9 11a4 4 0 1 0 0-8a4 4 0 0 0 0 8zM2 21c.8-3.6 3.6-6 7-6s6.2 2.4 7 6M16 3.5a4 4 0 0 1 0 7M18 15c2 .8 3.4 2.9 4 6",
+            Self::Libraries => "M4 4h4v16H4zM10 4h4v16h-4zM16.5 4.5l3.8-1 4 15.5-3.8 1z",
+            Self::Duplicates => "M8 8h12v12H8zM4 16V4h12",
+            Self::Integrity => "M12 3l9 16H3zM12 10v4M12 17v.5",
+            Self::Devices => "M3 5h18v12H3zM8 21h8M12 17v4",
+            Self::Activity => "M3 12h4l3-8 4 16 3-8h4",
+            Self::ScheduledTasks => "M12 21a9 9 0 1 0 0-18a9 9 0 0 0 0 18zM12 7v5l3 2",
+            Self::Plugins => "M9 3v5M15 3v5M6 8h12v4a6 6 0 0 1-12 0zM12 18v3",
+            Self::Logs => "M6 3h9l4 4v14H6zM14 3v5h5M9 12h7M9 16h7",
+            Self::ApiKeys => "M8 15a4 4 0 1 0 0-8a4 4 0 0 0 0 8zM12 11h9M18 11v3M21 11v3",
+            Self::Branding => "M4 20l4-1L19 8l-3-3L5 16zM14 7l3 3",
+        }
+    }
+    pub fn all() -> [AdminTab; 11] {
         [
             Self::Users,
             Self::Libraries,
@@ -137,6 +170,10 @@ pub struct AdminViewProps {
     pub on_action: EventHandler<AdminAction>,
     #[props(default)]
     pub active_tab: AdminTab,
+    /// The open tab's listing has not answered yet: it shows "Loading…"
+    /// rather than an empty list.
+    #[props(default)]
+    pub loading: bool,
     #[props(default)]
     pub libraries: Vec<LibraryFolder>,
     #[props(default)]
@@ -193,320 +230,620 @@ pub struct DeepSearchState {
     pub error: Option<String>,
 }
 
+const PANEL_ID: &str = "manage-panel";
+const HEADING_ID: &str = "manage-heading";
+
 #[component]
 pub fn AdminView(props: AdminViewProps) -> Element {
-    let new_name = use_signal(String::new);
-    let new_password = use_signal(String::new);
-    let mut new_name_sig = new_name;
-    let mut new_password_sig = new_password;
     let active_tab = props.active_tab;
-
+    let on_action = props.on_action;
+    let loading = props.loading;
     rsx! {
         div {
-            class: "pharos-admin",
+            class: "pharos-settings pharos-manage pharos-admin",
             "data-tab": "{active_tab.class_suffix()}",
-            header { class: "pharos-admin-header", h2 { "Admin" } }
-
-            nav {
-                class: "pharos-admin-tabs",
-                for t in AdminTab::all() {
-                    button {
-                        key: "{t.class_suffix()}",
-                        class: if t == active_tab {
-                            "pharos-admin-tab on"
-                        } else {
-                            "pharos-admin-tab off"
-                        },
-                        onclick: {
-                            let on_action = props.on_action;
-                            move |_| on_action.call(AdminAction::SelectTab(t))
-                        },
-                        "{t.label()}"
+            nav { class: "pharos-settings-nav pharos-admin-tabs", aria_label: "Manage",
+                p { class: "pharos-settings-title", "Manage" }
+                ul {
+                    for t in AdminTab::all() {
+                        li { key: "{t.class_suffix()}",
+                            button {
+                                r#type: "button",
+                                class: "pharos-settings-link pharos-admin-tab",
+                                "data-tab": "{t.class_suffix()}",
+                                aria_current: if t == active_tab { "page" },
+                                aria_controls: PANEL_ID,
+                                onclick: move |_| on_action.call(AdminAction::SelectTab(t)),
+                                svg {
+                                    class: "pharos-settings-icon",
+                                    view_box: "0 0 24 24",
+                                    "aria-hidden": "true",
+                                    path { d: t.icon() }
+                                }
+                                span { "{t.label()}" }
+                            }
+                        }
                     }
                 }
             }
-
-            if let Some(msg) = props.status.as_ref() {
-                p { class: "pharos-admin-status", "{msg}" }
-            }
-
-            match active_tab {
-                AdminTab::Users => rsx! {
-                    section {
-                        class: "pharos-admin-section pharos-admin-section-users",
-                        div {
-                            class: "pharos-admin-actions",
+            section {
+                id: PANEL_ID,
+                class: "pharos-settings-page pharos-manage-page pharos-admin-section pharos-admin-section-{active_tab.class_suffix()}",
+                aria_labelledby: HEADING_ID,
+                header { class: "pharos-manage-head",
+                    div { class: "pharos-manage-title",
+                        h2 { id: HEADING_ID, "{active_tab.label()}" }
+                        p { class: "pharos-settings-lede", "{active_tab.lede()}" }
+                    }
+                    div { class: "pharos-manage-tools",
+                        if active_tab == AdminTab::Libraries {
                             button {
+                                r#type: "button",
                                 class: "pharos-admin-refresh-library",
-                                onclick: {
-                                    let on_action = props.on_action;
-                                    move |_| on_action.call(AdminAction::LibraryRefresh)
-                                },
-                                "Library Refresh"
-                            }
-                            button {
-                                class: "pharos-admin-reload",
-                                onclick: {
-                                    let on_action = props.on_action;
-                                    move |_| on_action.call(AdminAction::Refresh)
-                                },
-                                "Reload"
+                                onclick: move |_| on_action.call(AdminAction::LibraryRefresh),
+                                "Scan all libraries"
                             }
                         }
-
-                        h3 { "Users" }
-                        ul {
-                            class: "pharos-admin-user-list",
-                            for user in props.users.iter().cloned() {
-                                AdminUserRow {
-                                    key: "{user.id}",
-                                    disable_delete: user.id == props.current_user_id,
-                                    is_self: user.id == props.current_user_id,
-                                    user: user.clone(),
-                                    on_action: props.on_action,
-                                }
-                            }
+                        button {
+                            r#type: "button",
+                            class: "pharos-admin-reload",
+                            title: "Load this page again",
+                            onclick: move |_| on_action.call(AdminAction::Refresh),
+                            "Reload"
                         }
+                    }
+                }
+                if let Some(msg) = props.status.as_ref() {
+                    div { class: "pharos-admin-status", role: "status",
+                        p { "{msg}" }
+                        button {
+                            r#type: "button",
+                            class: "pharos-manage-dismiss",
+                            aria_label: "Dismiss",
+                            onclick: move |_| on_action.call(AdminAction::DismissStatus),
+                            "×"
+                        }
+                    }
+                }
+                if loading {
+                    p { class: "pharos-loading", "Loading…" }
+                } else {
+                    match active_tab {
+                        AdminTab::Users => rsx! {
+                            UsersPane {
+                                users: props.users.clone(),
+                                current_user_id: props.current_user_id.clone(),
+                                on_action,
+                            }
+                        },
+                        AdminTab::Libraries => rsx! { LibrariesPane { libraries: props.libraries.clone() } },
+                        AdminTab::Devices => rsx! { DevicesPane { devices: props.devices.clone() } },
+                        AdminTab::Activity => rsx! { ActivityPane { entries: props.activity.clone() } },
+                        AdminTab::ScheduledTasks => rsx! { TasksPane { tasks: props.scheduled_tasks.clone() } },
+                        AdminTab::Duplicates => rsx! {
+                            DuplicatesSection { films: props.duplicates.clone() }
+                        },
+                        AdminTab::Integrity => rsx! {
+                            IntegritySection {
+                                report: props.integrity.clone(),
+                                queued: props.integrity_queued.clone(),
+                                errors: props.integrity_errors.clone(),
+                                deep_queued: props.deep_queued.clone(),
+                                deep_errors: props.deep_errors.clone(),
+                                deep_search: props.deep_search.clone(),
+                                on_action,
+                            }
+                        },
+                        AdminTab::Plugins => rsx! { PluginsPane { plugins: props.plugins.clone() } },
+                        AdminTab::Logs => rsx! { LogsPane { logs: props.logs.clone() } },
+                        AdminTab::ApiKeys => rsx! {
+                            ApiKeysPane {
+                                keys: props.api_keys.clone(),
+                                new_secret: props.new_api_key_secret.clone(),
+                                on_action,
+                            }
+                        },
+                        AdminTab::Branding => rsx! {
+                            BrandingPane { branding: props.branding.clone(), on_action }
+                        },
+                    }
+                }
+            }
+        }
+    }
+}
 
-                        h3 { "New user" }
+/// `9 users · 5 admins`.
+fn users_summary(users: &[AdminUser]) -> String {
+    let admins = users.iter().filter(|u| u.is_admin).count();
+    let noun = if users.len() == 1 { "user" } else { "users" };
+    let admin_noun = if admins == 1 { "admin" } else { "admins" };
+    format!("{} {noun} · {admins} {admin_noun}", users.len())
+}
+
+#[component]
+fn UsersPane(
+    users: Vec<AdminUser>,
+    current_user_id: String,
+    on_action: EventHandler<AdminAction>,
+) -> Element {
+    let mut new_name = use_signal(String::new);
+    let mut new_password = use_signal(String::new);
+    let name_empty = new_name.read().trim().is_empty();
+    rsx! {
+        if users.is_empty() {
+            p { class: "pharos-empty", "No users yet." }
+        } else {
+            p { class: "pharos-manage-count", "{users_summary(&users)}" }
+            ul { class: "pharos-manage-cards pharos-admin-user-list",
+                for user in users.iter().cloned() {
+                    AdminUserRow {
+                        key: "{user.id}",
+                        is_self: user.id == current_user_id,
+                        user,
+                        on_action,
+                    }
+                }
+            }
+        }
+        section { class: "pharos-settings-group pharos-manage-form-card", aria_labelledby: "manage-new-user",
+            h3 { id: "manage-new-user", "Add a user" }
+            form {
+                class: "pharos-admin-create pharos-manage-form",
+                onsubmit: move |ev: FormEvent| {
+                    ev.prevent_default();
+                    let name = new_name.read().trim().to_string();
+                    if name.is_empty() {
+                        return;
+                    }
+                    let password = new_password.read().clone();
+                    on_action.call(AdminAction::CreateUser(CreateUserAttempt { name, password }));
+                    new_name.set(String::new());
+                    new_password.set(String::new());
+                },
+                label { class: "pharos-manage-field",
+                    span { "Name" }
+                    input {
+                        class: "pharos-admin-new-name",
+                        r#type: "text",
+                        autocomplete: "off",
+                        required: true,
+                        value: "{new_name.read()}",
+                        oninput: move |ev| new_name.set(ev.value()),
+                    }
+                }
+                label { class: "pharos-manage-field",
+                    span { "Password" }
+                    input {
+                        class: "pharos-admin-new-password",
+                        r#type: "password",
+                        autocomplete: "new-password",
+                        value: "{new_password.read()}",
+                        oninput: move |ev| new_password.set(ev.value()),
+                    }
+                }
+                button { r#type: "submit", disabled: name_empty, "Add user" }
+            }
+            p { class: "pharos-setting-help pharos-manage-form-help",
+                "New users are not admins. Turn on Admin on their card to let them manage the server."
+            }
+        }
+    }
+}
+
+/// What a user card has open below its actions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UserCardOpen {
+    Nothing,
+    ResetPassword,
+    ConfirmDelete,
+}
+
+/// The element focus moves to when a user card goes from `from` to `to`.
+fn focus_target(user_id: &str, from: UserCardOpen, to: UserCardOpen) -> Option<String> {
+    match (from, to) {
+        (_, UserCardOpen::ResetPassword) => Some(format!("manage-reset-{user_id}")),
+        (_, UserCardOpen::ConfirmDelete) => Some(format!("manage-keep-{user_id}")),
+        (UserCardOpen::ResetPassword, UserCardOpen::Nothing) => {
+            Some(format!("manage-reset-open-{user_id}"))
+        }
+        (UserCardOpen::ConfirmDelete, UserCardOpen::Nothing) => {
+            Some(format!("manage-delete-{user_id}"))
+        }
+        (UserCardOpen::Nothing, UserCardOpen::Nothing) => None,
+    }
+}
+
+#[derive(PartialEq, Clone, Props)]
+struct AdminUserRowProps {
+    user: AdminUser,
+    /// The signed-in admin's own card: no Delete, no admin switch (an admin
+    /// cannot lock themselves out from here), and their own password is
+    /// changed in Settings, which asks for the current one.
+    is_self: bool,
+    on_action: EventHandler<AdminAction>,
+}
+
+#[component]
+fn AdminUserRow(props: AdminUserRowProps) -> Element {
+    let mut open = use_signal(|| UserCardOpen::Nothing);
+    let mut reset_pw = use_signal(String::new);
+    let on_action = props.on_action;
+    let user = props.user.clone();
+    let is_admin = user.is_admin;
+    let is_self = props.is_self;
+    let id = user.id.clone();
+    let name = user.name.clone();
+    let switch_id = format!("manage-admin-{}", user.id);
+    let id_for_policy = id.clone();
+    let id_for_reset = id.clone();
+    let id_for_delete = id.clone();
+    let open_now = *open.read();
+    // Opens or closes a panel, and focus goes with it: into what opened (so
+    // Esc reaches it), back to the button that opened it on close.
+    let id_for_focus = id.clone();
+    let show = use_callback(move |next: UserCardOpen| {
+        let from = *open.peek();
+        open.set(next);
+        if let Some(target) = focus_target(&id_for_focus, from, next) {
+            crate::native::focus_after_render(target);
+        }
+    });
+    rsx! {
+        li {
+            class: "pharos-manage-card pharos-admin-user",
+            "data-user-id": "{id}",
+            div { class: "pharos-manage-user-head",
+                span { class: "pharos-avatar pharos-manage-avatar", "aria-hidden": "true",
+                    {crate::native::account::initials(&name)}
+                }
+                div { class: "pharos-manage-user-who",
+                    h3 { class: "pharos-admin-user-name", "{name}" }
+                    p { class: "pharos-manage-badges",
+                        if is_admin {
+                            span { class: "pharos-manage-badge is-admin", "Admin" }
+                        } else {
+                            span { class: "pharos-manage-badge", "User" }
+                        }
+                        if is_self {
+                            span { class: "pharos-manage-badge is-you", "You" }
+                        }
+                    }
+                }
+            }
+            div { class: "pharos-manage-user-row pharos-admin-user-policy",
+                span { id: "{switch_id}", "Admin" }
+                button {
+                    r#type: "button",
+                    class: "pharos-switch",
+                    role: "switch",
+                    aria_checked: "{is_admin}",
+                    aria_labelledby: "{switch_id}",
+                    disabled: is_self,
+                    title: if is_self { "You can't remove your own admin rights" },
+                    onclick: move |_| on_action.call(AdminAction::SetUserPolicy {
+                        user_id: id_for_policy.clone(),
+                        is_admin: !is_admin,
+                    }),
+                }
+            }
+            if is_self {
+                p { class: "pharos-setting-help",
+                    "This is you. Change your own password in Settings, under Account."
+                }
+            } else {
+                div { class: "pharos-manage-card-actions",
+                    button {
+                        r#type: "button",
+                        id: "manage-reset-open-{id}",
+                        class: "pharos-admin-user-reset-open",
+                        aria_expanded: "{open_now == UserCardOpen::ResetPassword}",
+                        onclick: move |_| {
+                            reset_pw.set(String::new());
+                            show(if open_now == UserCardOpen::ResetPassword {
+                                UserCardOpen::Nothing
+                            } else {
+                                UserCardOpen::ResetPassword
+                            });
+                        },
+                        "Reset password"
+                    }
+                    button {
+                        r#type: "button",
+                        id: "manage-delete-{id}",
+                        class: "pharos-danger pharos-admin-user-delete",
+                        aria_expanded: "{open_now == UserCardOpen::ConfirmDelete}",
+                        onclick: move |_| show(if open_now == UserCardOpen::ConfirmDelete {
+                            UserCardOpen::Nothing
+                        } else {
+                            UserCardOpen::ConfirmDelete
+                        }),
+                        "Delete"
+                    }
+                }
+                match open_now {
+                    UserCardOpen::Nothing => rsx! {},
+                    UserCardOpen::ResetPassword => rsx! {
                         form {
-                            class: "pharos-admin-create",
-                            onsubmit: {
-                                let on_action = props.on_action;
-                                move |ev: FormEvent| {
-                                    ev.prevent_default();
-                                    let name = new_name_sig.read().clone();
-                                    let password = new_password_sig.read().clone();
-                                    if name.is_empty() {
-                                        return;
-                                    }
-                                    on_action.call(AdminAction::CreateUser(CreateUserAttempt {
-                                        name,
-                                        password,
-                                    }));
-                                    new_name_sig.set(String::new());
-                                    new_password_sig.set(String::new());
+                            class: "pharos-manage-inline pharos-admin-user-reset",
+                            onsubmit: move |ev: FormEvent| {
+                                ev.prevent_default();
+                                let pw = reset_pw.read().clone();
+                                if pw.is_empty() {
+                                    return;
+                                }
+                                on_action.call(AdminAction::ResetUserPassword {
+                                    user_id: id_for_reset.clone(),
+                                    new_password: pw,
+                                });
+                                reset_pw.set(String::new());
+                                show(UserCardOpen::Nothing);
+                            },
+                            onkeydown: move |ev: KeyboardEvent| {
+                                if ev.key() == Key::Named(NamedKey::Escape) {
+                                    show(UserCardOpen::Nothing);
                                 }
                             },
-                            input {
-                                class: "pharos-admin-new-name",
-                                r#type: "text",
-                                placeholder: "Username",
-                                value: "{new_name.read()}",
-                                oninput: move |ev| new_name_sig.set(ev.value()),
+                            label { class: "pharos-manage-field",
+                                span { "New password for {name}" }
+                                input {
+                                    class: "pharos-admin-user-reset-input",
+                                    r#type: "password",
+                                    autocomplete: "new-password",
+                                    id: "manage-reset-{id}",
+                                    value: "{reset_pw.read()}",
+                                    oninput: move |ev| reset_pw.set(ev.value()),
+                                }
                             }
-                            input {
-                                class: "pharos-admin-new-password",
-                                r#type: "password",
-                                placeholder: "Password",
-                                value: "{new_password.read()}",
-                                oninput: move |ev| new_password_sig.set(ev.value()),
-                            }
-                            button { r#type: "submit", "Create" }
-                        }
-                    }
-                },
-                AdminTab::Libraries => rsx! {
-                    section {
-                        class: "pharos-admin-section pharos-admin-section-libraries",
-                        h3 { "Libraries" }
-                        if props.libraries.is_empty() {
-                            p { class: "pharos-empty", "No libraries configured" }
-                        } else {
-                            ul {
-                                class: "pharos-admin-library-list",
-                                for lib in props.libraries.iter() {
-                                    li {
-                                        class: "pharos-admin-library",
-                                        key: "{lib.item_id}",
-                                        span { class: "pharos-admin-library-name", "{lib.name}" }
-                                        span {
-                                            class: "pharos-admin-library-kind",
-                                            "{lib.collection_type}"
-                                        }
-                                        ul {
-                                            class: "pharos-admin-library-locations",
-                                            for loc in lib.locations.iter() {
-                                                li {
-                                                    key: "{loc}",
-                                                    "{loc}"
-                                                }
-                                            }
-                                        }
-                                    }
+                            div { class: "pharos-manage-inline-actions",
+                                button {
+                                    r#type: "button",
+                                    onclick: move |_| show(UserCardOpen::Nothing),
+                                    "Cancel"
+                                }
+                                button {
+                                    r#type: "submit",
+                                    class: "pharos-admin-user-reset-submit",
+                                    disabled: reset_pw.read().is_empty(),
+                                    "Set password"
                                 }
                             }
                         }
+                    },
+                    UserCardOpen::ConfirmDelete => rsx! {
+                        div {
+                            class: "pharos-manage-inline pharos-manage-confirm",
+                            role: "group",
+                            aria_label: "Confirm delete",
+                            onkeydown: move |ev: KeyboardEvent| {
+                                if ev.key() == Key::Named(NamedKey::Escape) {
+                                    show(UserCardOpen::Nothing);
+                                }
+                            },
+                            p {
+                                "Delete {name}? Their sign-ins, watch history and settings go with them. This can't be undone."
+                            }
+                            div { class: "pharos-manage-inline-actions",
+                                button {
+                                    r#type: "button",
+                                    id: "manage-keep-{id}",
+                                    onclick: move |_| show(UserCardOpen::Nothing),
+                                    "Keep {name}"
+                                }
+                                button {
+                                    r#type: "button",
+                                    class: "pharos-danger is-strong pharos-admin-user-delete-confirm",
+                                    onclick: move |_| {
+                                        open.set(UserCardOpen::Nothing);
+                                        on_action.call(AdminAction::DeleteUser(id_for_delete.clone()));
+                                    },
+                                    "Delete {name}"
+                                }
+                            }
+                        }
+                    },
+                }
+            }
+        }
+    }
+}
+
+/// `movies` → `Films`, Jellyfin's collection types in the app's words.
+fn library_kind(collection_type: &str) -> &str {
+    match collection_type {
+        "movies" => "Films",
+        "tvshows" => "TV",
+        "music" => "Music",
+        "books" => "Books",
+        "musicvideos" => "Music videos",
+        "homevideos" => "Home videos",
+        "boxsets" => "Collections",
+        "" | "mixed" => "Mixed",
+        other => other,
+    }
+}
+
+#[component]
+fn LibrariesPane(libraries: Vec<LibraryFolder>) -> Element {
+    rsx! {
+        if libraries.is_empty() {
+            p { class: "pharos-empty", "No libraries configured" }
+        } else {
+            ul { class: "pharos-manage-cards pharos-admin-library-list",
+                for lib in libraries.iter() {
+                    li { class: "pharos-manage-card pharos-admin-library", key: "{lib.item_id}",
+                        div { class: "pharos-manage-card-title",
+                            h3 { class: "pharos-admin-library-name", "{lib.name}" }
+                            span {
+                                class: "pharos-manage-badge pharos-admin-library-kind",
+                                "data-kind": "{lib.collection_type}",
+                                "{library_kind(&lib.collection_type)}"
+                            }
+                        }
+                        ul { class: "pharos-manage-paths pharos-admin-library-locations",
+                            for loc in lib.locations.iter() {
+                                li { key: "{loc}", code { "{loc}" } }
+                            }
+                        }
                     }
-                },
-                AdminTab::Devices => rsx! {
-                    section {
-                        class: "pharos-admin-section pharos-admin-section-devices",
-                        h3 { "Devices" }
-                        if props.devices.is_empty() {
-                            p { class: "pharos-empty", "No devices have connected" }
-                        } else {
-                            table {
-                                class: "pharos-admin-device-table",
-                                thead {
-                                    tr {
-                                        th { "Device" }
-                                        th { "App" }
-                                        th { "Last user" }
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn DevicesPane(devices: Vec<DeviceEntry>) -> Element {
+    rsx! {
+        if devices.is_empty() {
+            p { class: "pharos-empty", "No devices have connected" }
+        } else {
+            div { class: "pharos-manage-table-wrap",
+                table { class: "pharos-manage-table pharos-admin-device-table",
+                    thead {
+                        tr {
+                            th { scope: "col", "Device" }
+                            th { scope: "col", "App" }
+                            th { scope: "col", "Last user" }
+                        }
+                    }
+                    tbody {
+                        for d in devices.iter() {
+                            tr { key: "{d.id}",
+                                td { class: "pharos-manage-strong", "{d.name}" }
+                                td { "{d.app_name}" }
+                                td { "{d.last_user_name}" }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn ActivityPane(entries: Vec<ActivityEntry>) -> Element {
+    rsx! {
+        if entries.is_empty() {
+            p { class: "pharos-empty", "No activity recorded" }
+        } else {
+            ol { class: "pharos-manage-list pharos-admin-activity-list",
+                for e in entries.iter() {
+                    li { class: "pharos-manage-list-row pharos-admin-activity", key: "{e.id}",
+                        span {
+                            class: "pharos-manage-badge pharos-admin-activity-severity",
+                            "data-severity": "{e.severity.to_ascii_lowercase()}",
+                            "{e.severity}"
+                        }
+                        div { class: "pharos-manage-list-text",
+                            span { class: "pharos-manage-strong pharos-admin-activity-name", "{e.name}" }
+                            if !e.short_overview.is_empty() {
+                                span { class: "pharos-admin-activity-overview", "{e.short_overview}" }
+                            }
+                        }
+                        time {
+                            class: "pharos-manage-when pharos-admin-activity-date",
+                            datetime: "{e.date_iso}",
+                            "{when_label(&e.date_iso)}"
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn TasksPane(tasks: Vec<ScheduledTask>) -> Element {
+    rsx! {
+        if tasks.is_empty() {
+            p { class: "pharos-empty", "No scheduled tasks registered" }
+        } else {
+            div { class: "pharos-manage-table-wrap",
+                table { class: "pharos-manage-table pharos-admin-tasks-table",
+                    thead {
+                        tr {
+                            th { scope: "col", "Task" }
+                            th { scope: "col", "Category" }
+                            th { scope: "col", "State" }
+                            th { scope: "col", "Last run" }
+                        }
+                    }
+                    tbody {
+                        for t in tasks.iter() {
+                            tr { key: "{t.id}",
+                                td { class: "pharos-manage-strong", "{t.name}" }
+                                td { "{t.category}" }
+                                td { class: "pharos-admin-task-state",
+                                    span {
+                                        class: "pharos-manage-badge",
+                                        "data-state": "{t.state.to_ascii_lowercase()}",
+                                        "{t.state}"
                                     }
                                 }
-                                tbody {
-                                    for d in props.devices.iter() {
-                                        tr {
-                                            key: "{d.id}",
-                                            td { "{d.name}" }
-                                            td { "{d.app_name}" }
-                                            td { "{d.last_user_name}" }
-                                        }
-                                    }
+                                td { class: "pharos-manage-when",
+                                    time { datetime: "{t.last_execution_iso}", "{when_label(&t.last_execution_iso)}" }
                                 }
                             }
                         }
                     }
-                },
-                AdminTab::Activity => rsx! {
-                    section {
-                        class: "pharos-admin-section pharos-admin-section-activity",
-                        h3 { "Activity log" }
-                        if props.activity.is_empty() {
-                            p { class: "pharos-empty", "No activity recorded" }
-                        } else {
-                            ul {
-                                class: "pharos-admin-activity-list",
-                                for e in props.activity.iter() {
-                                    li {
-                                        class: "pharos-admin-activity",
-                                        key: "{e.id}",
-                                        span { class: "pharos-admin-activity-date", "{e.date_iso}" }
-                                        span { class: "pharos-admin-activity-severity", "{e.severity}" }
-                                        span { class: "pharos-admin-activity-name", "{e.name}" }
-                                        if !e.short_overview.is_empty() {
-                                            span {
-                                                class: "pharos-admin-activity-overview",
-                                                "{e.short_overview}"
-                                            }
-                                        }
-                                    }
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn PluginsPane(plugins: Vec<PluginEntry>) -> Element {
+    rsx! {
+        if plugins.is_empty() {
+            p { class: "pharos-empty", "No plugins installed" }
+        } else {
+            ul { class: "pharos-manage-list pharos-admin-plugin-list",
+                for p in plugins.iter() {
+                    li { class: "pharos-manage-list-row pharos-admin-plugin", key: "{p.id}",
+                        div { class: "pharos-manage-list-text",
+                            span { class: "pharos-manage-strong pharos-admin-plugin-name", "{p.name}" }
+                            span { class: "pharos-admin-plugin-version", "Version {p.version}" }
+                        }
+                        if !p.status.is_empty() {
+                            span { class: "pharos-manage-badge pharos-admin-plugin-status", "{p.status}" }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn LogsPane(logs: Vec<LogEntry>) -> Element {
+    rsx! {
+        if logs.is_empty() {
+            p { class: "pharos-empty", "No log files" }
+        } else {
+            div { class: "pharos-manage-table-wrap",
+                table { class: "pharos-manage-table pharos-admin-log-list",
+                    thead {
+                        tr {
+                            th { scope: "col", "File" }
+                            th { scope: "col", "Size" }
+                            th { scope: "col", "Modified" }
+                        }
+                    }
+                    tbody {
+                        for l in logs.iter() {
+                            tr { class: "pharos-admin-log", key: "{l.name}",
+                                td { class: "pharos-manage-strong pharos-admin-log-name", code { "{l.name}" } }
+                                td { class: "pharos-admin-log-size", title: "{l.size_bytes} bytes", "{bytes_label(l.size_bytes)}" }
+                                td { class: "pharos-manage-when pharos-admin-log-date",
+                                    time { datetime: "{l.date_modified_iso}", "{when_label(&l.date_modified_iso)}" }
                                 }
                             }
                         }
                     }
-                },
-                AdminTab::ScheduledTasks => rsx! {
-                    section {
-                        class: "pharos-admin-section pharos-admin-section-scheduledtasks",
-                        h3 { "Scheduled tasks" }
-                        if props.scheduled_tasks.is_empty() {
-                            p { class: "pharos-empty", "No scheduled tasks registered" }
-                        } else {
-                            table {
-                                class: "pharos-admin-tasks-table",
-                                thead {
-                                    tr {
-                                        th { "Task" }
-                                        th { "Category" }
-                                        th { "State" }
-                                        th { "Last run" }
-                                    }
-                                }
-                                tbody {
-                                    for t in props.scheduled_tasks.iter() {
-                                        tr {
-                                            key: "{t.id}",
-                                            td { "{t.name}" }
-                                            td { "{t.category}" }
-                                            td { class: "pharos-admin-task-state", "{t.state}" }
-                                            td { "{t.last_execution_iso}" }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                },
-                AdminTab::Duplicates => rsx! {
-                    DuplicatesSection { films: props.duplicates.clone() }
-                },
-                AdminTab::Integrity => rsx! {
-                    IntegritySection {
-                        report: props.integrity.clone(),
-                        queued: props.integrity_queued.clone(),
-                        errors: props.integrity_errors.clone(),
-                        deep_queued: props.deep_queued.clone(),
-                        deep_errors: props.deep_errors.clone(),
-                        deep_search: props.deep_search.clone(),
-                        on_action: props.on_action,
-                    }
-                },
-                AdminTab::Plugins => rsx! {
-                    section {
-                        class: "pharos-admin-section pharos-admin-section-plugins",
-                        h3 { "Plugins" }
-                        if props.plugins.is_empty() {
-                            p { class: "pharos-empty", "No plugins installed" }
-                        } else {
-                            ul {
-                                class: "pharos-admin-plugin-list",
-                                for p in props.plugins.iter() {
-                                    li {
-                                        class: "pharos-admin-plugin",
-                                        key: "{p.id}",
-                                        span { class: "pharos-admin-plugin-name", "{p.name}" }
-                                        span { class: "pharos-admin-plugin-version", " · v{p.version}" }
-                                        if !p.status.is_empty() {
-                                            span { class: "pharos-admin-plugin-status", " ({p.status})" }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                },
-                AdminTab::Logs => rsx! {
-                    section {
-                        class: "pharos-admin-section pharos-admin-section-logs",
-                        h3 { "Log files" }
-                        if props.logs.is_empty() {
-                            p { class: "pharos-empty", "No log files" }
-                        } else {
-                            ul {
-                                class: "pharos-admin-log-list",
-                                for l in props.logs.iter() {
-                                    li {
-                                        class: "pharos-admin-log",
-                                        key: "{l.name}",
-                                        span { class: "pharos-admin-log-name", "{l.name}" }
-                                        span { class: "pharos-admin-log-size", " · {l.size_bytes} B" }
-                                        if !l.date_modified_iso.is_empty() {
-                                            span {
-                                                class: "pharos-admin-log-date",
-                                                " · {l.date_modified_iso}"
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                },
-                AdminTab::ApiKeys => rsx! {
-                    ApiKeysPane {
-                        keys: props.api_keys.clone(),
-                        new_secret: props.new_api_key_secret.clone(),
-                        on_action: props.on_action,
-                    }
-                },
-                AdminTab::Branding => rsx! {
-                    BrandingPane {
-                        branding: props.branding.clone(),
-                        on_action: props.on_action,
-                    }
-                },
+                }
             }
         }
     }
@@ -519,61 +856,77 @@ fn ApiKeysPane(
     on_action: EventHandler<AdminAction>,
 ) -> Element {
     let mut new_name = use_signal(String::new);
-    let mut name_for_submit = new_name;
+    let name_empty = new_name.read().trim().is_empty();
     rsx! {
-        section {
-            class: "pharos-admin-section pharos-admin-section-apikeys",
-            h3 { "API keys" }
-            if let Some(secret) = new_secret.as_ref() {
-                p {
-                    class: "pharos-admin-apikey-new",
-                    "New key (copy now — won't be shown again): "
-                    code { class: "pharos-admin-apikey-value", "{secret}" }
+        if let Some(secret) = new_secret.as_ref() {
+            div { class: "pharos-manage-secret pharos-admin-apikey-new", role: "status",
+                p { class: "pharos-manage-strong", "Copy this key now. It won't be shown again." }
+                input {
+                    class: "pharos-admin-apikey-value",
+                    r#type: "text",
+                    readonly: true,
+                    aria_label: "New API key",
+                    value: "{secret}",
+                    onfocus: move |_| {
+                        #[cfg(feature = "web")]
+                        select_focused();
+                    },
                 }
             }
+        }
+        if keys.is_empty() {
+            p { class: "pharos-empty", "No API keys issued" }
+        } else {
+            ul { class: "pharos-manage-list pharos-admin-apikey-list",
+                for k in keys.iter().cloned() {
+                    ApiKeyRow { key: "{k.id}", entry: k, on_action }
+                }
+            }
+        }
+        section { class: "pharos-settings-group pharos-manage-form-card", aria_labelledby: "manage-new-key",
+            h3 { id: "manage-new-key", "Issue a key" }
             form {
-                class: "pharos-admin-apikey-create",
-                onsubmit: {
-                    let on_action = on_action;
-                    move |ev: FormEvent| {
-                        ev.prevent_default();
-                        let name = name_for_submit.read().clone();
-                        let trimmed = name.trim().to_string();
-                        if trimmed.is_empty() {
-                            return;
-                        }
-                        on_action.call(AdminAction::CreateApiKey { app_name: trimmed });
-                        name_for_submit.set(String::new());
+                class: "pharos-admin-apikey-create pharos-manage-form",
+                onsubmit: move |ev: FormEvent| {
+                    ev.prevent_default();
+                    let trimmed = new_name.read().trim().to_string();
+                    if trimmed.is_empty() {
+                        return;
                     }
+                    on_action.call(AdminAction::CreateApiKey { app_name: trimmed });
+                    new_name.set(String::new());
                 },
-                input {
-                    class: "pharos-admin-apikey-name",
-                    r#type: "text",
-                    placeholder: "App name",
-                    value: "{new_name.read()}",
-                    oninput: move |ev| new_name.set(ev.value()),
+                label { class: "pharos-manage-field",
+                    span { "App name" }
+                    input {
+                        class: "pharos-admin-apikey-name",
+                        r#type: "text",
+                        autocomplete: "off",
+                        value: "{new_name.read()}",
+                        oninput: move |ev| new_name.set(ev.value()),
+                    }
                 }
                 button {
                     class: "pharos-admin-apikey-create-submit",
                     r#type: "submit",
+                    disabled: name_empty,
                     "Issue key"
                 }
             }
-            if keys.is_empty() {
-                p { class: "pharos-empty", "No API keys issued" }
-            } else {
-                ul {
-                    class: "pharos-admin-apikey-list",
-                    for k in keys.iter().cloned() {
-                        ApiKeyRow {
-                            key: "{k.id}",
-                            entry: k,
-                            on_action: on_action,
-                        }
-                    }
-                }
-            }
         }
+    }
+}
+
+/// Selects the text of the focused field, so the new key copies whole.
+#[cfg(feature = "web")]
+fn select_focused() {
+    use wasm_bindgen::JsCast;
+    if let Some(input) = web_sys::window()
+        .and_then(|w| w.document())
+        .and_then(|d| d.active_element())
+        .and_then(|e| e.dyn_into::<web_sys::HtmlInputElement>().ok())
+    {
+        input.select();
     }
 }
 
@@ -587,59 +940,55 @@ fn BrandingPane(branding: BrandingConfig, on_action: EventHandler<AdminAction>) 
         }
     });
     let d = draft.read().clone();
+    let changed = d != branding;
     rsx! {
-        section {
-            class: "pharos-admin-section pharos-admin-section-branding",
-            h3 { "Branding" }
-            form {
-                class: "pharos-admin-branding-form",
-                onsubmit: move |ev: FormEvent| {
-                    ev.prevent_default();
-                    on_action.call(AdminAction::SaveBranding(draft.read().clone()));
-                },
-                label {
-                    class: "pharos-admin-branding-row",
-                    "Server name: "
-                    input {
-                        class: "pharos-admin-branding-name",
-                        r#type: "text",
-                        value: "{d.server_name}",
-                        oninput: move |ev| {
-                            let mut c = draft.read().clone();
-                            c.server_name = ev.value();
-                            draft.set(c);
-                        },
-                    }
+        form {
+            class: "pharos-settings-group pharos-manage-form-card pharos-admin-branding-form",
+            onsubmit: move |ev: FormEvent| {
+                ev.prevent_default();
+                on_action.call(AdminAction::SaveBranding(draft.read().clone()));
+            },
+            label { class: "pharos-manage-field pharos-admin-branding-row",
+                span { "Server name" }
+                input {
+                    class: "pharos-admin-branding-name",
+                    r#type: "text",
+                    value: "{d.server_name}",
+                    oninput: move |ev| draft.write().server_name = ev.value(),
                 }
-                label {
-                    class: "pharos-admin-branding-row",
-                    "Login disclaimer: "
-                    textarea {
-                        class: "pharos-admin-branding-disclaimer",
-                        value: "{d.login_disclaimer}",
-                        oninput: move |ev| {
-                            let mut c = draft.read().clone();
-                            c.login_disclaimer = ev.value();
-                            draft.set(c);
-                        },
-                    }
+            }
+            label { class: "pharos-manage-field pharos-admin-branding-row",
+                span { "Sign-in message" }
+                small { class: "pharos-setting-help", "Shown under the sign-in form." }
+                textarea {
+                    class: "pharos-admin-branding-disclaimer",
+                    rows: "3",
+                    value: "{d.login_disclaimer}",
+                    oninput: move |ev| draft.write().login_disclaimer = ev.value(),
                 }
-                label {
-                    class: "pharos-admin-branding-row",
-                    "Custom CSS: "
-                    textarea {
-                        class: "pharos-admin-branding-css",
-                        value: "{d.custom_css}",
-                        oninput: move |ev| {
-                            let mut c = draft.read().clone();
-                            c.custom_css = ev.value();
-                            draft.set(c);
-                        },
-                    }
+            }
+            label { class: "pharos-manage-field pharos-admin-branding-row",
+                span { "Custom CSS" }
+                small { class: "pharos-setting-help", "Added to every page of the Jellyfin web client." }
+                textarea {
+                    class: "pharos-admin-branding-css",
+                    rows: "8",
+                    spellcheck: "false",
+                    value: "{d.custom_css}",
+                    oninput: move |ev| draft.write().custom_css = ev.value(),
+                }
+            }
+            div { class: "pharos-manage-inline-actions",
+                button {
+                    r#type: "button",
+                    disabled: !changed,
+                    onclick: move |_| draft.set(branding.clone()),
+                    "Discard changes"
                 }
                 button {
                     class: "pharos-admin-branding-save",
                     r#type: "submit",
+                    disabled: !changed,
                     "Save"
                 }
             }
@@ -649,116 +998,102 @@ fn BrandingPane(branding: BrandingConfig, on_action: EventHandler<AdminAction>) 
 
 #[component]
 fn ApiKeyRow(entry: ApiKey, on_action: EventHandler<AdminAction>) -> Element {
+    let mut confirming = use_signal(|| false);
     let id_for_revoke = entry.id.clone();
+    let keep_id = format!("manage-revoke-keep-{}", entry.id);
+    let revoke_id = format!("manage-revoke-{}", entry.id);
+    let keep_id_for_open = keep_id.clone();
+    let revoke_id_for_keep = revoke_id.clone();
+    let revoke_id_for_esc = revoke_id.clone();
     rsx! {
-        li {
-            class: "pharos-admin-apikey",
-            "data-apikey-id": "{entry.id}",
-            span { class: "pharos-admin-apikey-app", "{entry.app_name}" }
-            if !entry.date_created_iso.is_empty() {
-                span {
-                    class: "pharos-admin-apikey-date",
-                    " · issued {entry.date_created_iso}"
+        li { class: "pharos-manage-list-row pharos-admin-apikey", "data-apikey-id": "{entry.id}",
+            div { class: "pharos-manage-list-text",
+                span { class: "pharos-manage-strong pharos-admin-apikey-app", "{entry.app_name}" }
+                if !entry.date_created_iso.is_empty() {
+                    span { class: "pharos-admin-apikey-date",
+                        "Issued "
+                        time { datetime: "{entry.date_created_iso}", "{when_label(&entry.date_created_iso)}" }
+                    }
                 }
             }
-            button {
-                class: "pharos-admin-apikey-revoke",
-                onclick: move |_| on_action.call(AdminAction::RevokeApiKey {
-                    key_id: id_for_revoke.clone(),
-                }),
-                "Revoke"
+            if confirming() {
+                div {
+                    class: "pharos-manage-inline-actions",
+                    role: "group",
+                    aria_label: "Confirm revoke",
+                    onkeydown: move |ev: KeyboardEvent| {
+                        if ev.key() == Key::Named(NamedKey::Escape) {
+                            confirming.set(false);
+                            crate::native::focus_after_render(revoke_id_for_esc.clone());
+                        }
+                    },
+                    button {
+                        r#type: "button",
+                        id: "{keep_id}",
+                        onclick: move |_| {
+                            confirming.set(false);
+                            crate::native::focus_after_render(revoke_id_for_keep.clone());
+                        },
+                        "Keep"
+                    }
+                    button {
+                        r#type: "button",
+                        class: "pharos-danger is-strong pharos-admin-apikey-revoke-confirm",
+                        onclick: move |_| {
+                            confirming.set(false);
+                            on_action.call(AdminAction::RevokeApiKey { key_id: id_for_revoke.clone() });
+                        },
+                        "Revoke {entry.app_name}"
+                    }
+                }
+            } else {
+                button {
+                    r#type: "button",
+                    id: "{revoke_id}",
+                    class: "pharos-danger pharos-admin-apikey-revoke",
+                    onclick: move |_| {
+                        confirming.set(true);
+                        crate::native::focus_after_render(keep_id_for_open.clone());
+                    },
+                    "Revoke"
+                }
             }
         }
     }
 }
 
-#[derive(PartialEq, Clone, Props)]
-struct AdminUserRowProps {
-    user: AdminUser,
-    disable_delete: bool,
-    /// True when the row represents the currently signed-in admin —
-    /// disables `Delete` + flips the password reset form into a
-    /// self-change shape (needs current pw — phase 3).
-    is_self: bool,
-    on_action: EventHandler<AdminAction>,
+/// `2026-11-09 08:12` from an ISO-8601 timestamp, the UTC wall clock to the
+/// minute; anything that is not one is shown as it came, an empty one as a
+/// dash.
+fn when_label(iso: &str) -> String {
+    let iso = iso.trim();
+    if iso.is_empty() || iso.starts_with("0001-01-01") {
+        return UNKNOWN.to_string();
+    }
+    let bytes = iso.as_bytes();
+    let shaped = bytes.len() >= 16
+        && bytes[4] == b'-'
+        && bytes[7] == b'-'
+        && matches!(bytes[10], b'T' | b' ')
+        && bytes[13] == b':';
+    // `get` keeps a stray multi-byte character from panicking the render.
+    match (shaped, iso.get(..10), iso.get(11..16)) {
+        (true, Some(day), Some(time)) => format!("{day} {time}"),
+        _ => iso.to_string(),
+    }
 }
 
-#[component]
-fn AdminUserRow(props: AdminUserRowProps) -> Element {
-    let admin_marker = if props.user.is_admin { " (admin)" } else { "" };
-    let id_for_delete = props.user.id.clone();
-    let id_for_policy = props.user.id.clone();
-    let id_for_reset = props.user.id.clone();
-    let user_is_admin = props.user.is_admin;
-    let mut reset_pw = use_signal(String::new);
-    let mut reset_pw_for_submit = reset_pw;
-    rsx! {
-        li {
-            class: "pharos-admin-user",
-            span { class: "pharos-admin-user-name", "{props.user.name}{admin_marker}" }
-            label {
-                class: "pharos-admin-user-policy",
-                input {
-                    r#type: "checkbox",
-                    checked: user_is_admin,
-                    onchange: {
-                        let on_action = props.on_action;
-                        move |ev: FormEvent| {
-                            let new_admin = ev.value() == "true" || ev.value() == "on";
-                            on_action.call(AdminAction::SetUserPolicy {
-                                user_id: id_for_policy.clone(),
-                                is_admin: new_admin,
-                            });
-                        }
-                    },
-                }
-                " admin"
-            }
-            form {
-                class: "pharos-admin-user-reset",
-                onsubmit: {
-                    let on_action = props.on_action;
-                    move |ev: FormEvent| {
-                        ev.prevent_default();
-                        let pw = reset_pw_for_submit.read().clone();
-                        if pw.is_empty() {
-                            return;
-                        }
-                        on_action.call(AdminAction::ResetUserPassword {
-                            user_id: id_for_reset.clone(),
-                            new_password: pw,
-                        });
-                        reset_pw_for_submit.set(String::new());
-                    }
-                },
-                input {
-                    class: "pharos-admin-user-reset-input",
-                    r#type: "password",
-                    placeholder: if props.is_self { "Reset (current pw needed)" } else { "Reset password" },
-                    value: "{reset_pw.read()}",
-                    oninput: move |ev| reset_pw.set(ev.value()),
-                    // Self-reset still requires current pw — the bare
-                    // admin reset form skips it. Disable submit on the
-                    // self row to point users at the prefs view.
-                    disabled: props.is_self,
-                }
-                button {
-                    class: "pharos-admin-user-reset-submit",
-                    r#type: "submit",
-                    disabled: props.is_self,
-                    "Reset"
-                }
-            }
-            button {
-                class: "pharos-admin-user-delete",
-                disabled: props.disable_delete,
-                onclick: {
-                    let on_action = props.on_action;
-                    move |_| on_action.call(AdminAction::DeleteUser(id_for_delete.clone()))
-                },
-                if props.disable_delete { "you" } else { "Delete" }
-            }
-        }
+/// A byte count in the largest unit that keeps it above one.
+fn bytes_label(bytes: u64) -> String {
+    let b = bytes as f64;
+    if b >= GIB {
+        format!("{:.1} GiB", b / GIB)
+    } else if b >= MIB {
+        format!("{:.1} MiB", b / MIB)
+    } else if b >= KIB {
+        format!("{:.0} KiB", b / KIB)
+    } else {
+        format!("{bytes} B")
     }
 }
 
@@ -768,8 +1103,7 @@ fn AdminUserRow(props: AdminUserRowProps) -> Element {
 fn DuplicatesSection(films: Option<Result<Vec<DuplicateFilm>, String>>) -> Element {
     rsx! {
         section {
-            class: "pharos-admin-section pharos-admin-section-duplicates",
-            h3 { "Duplicate films" }
+            class: "pharos-manage-stack pharos-admin-section-duplicates",
             match films {
                 None => rsx! { p { class: "pharos-loading", "Looking for duplicates…" } },
                 Some(Err(e)) => rsx! { p { class: "pharos-error", "Could not list duplicates: {e}" } },
@@ -844,8 +1178,7 @@ fn IntegritySection(
 ) -> Element {
     rsx! {
         section {
-            class: "pharos-admin-section pharos-admin-section-integrity",
-            h3 { "Damaged files" }
+            class: "pharos-manage-stack pharos-admin-section-integrity",
             match report {
                 None => rsx! { p { class: "pharos-loading", "Checking on the files…" } },
                 Some(Err(e)) => rsx! { p { class: "pharos-error", "Could not list damaged files: {e}" } },
@@ -916,27 +1249,29 @@ fn DamagedRow(
             if let Some(secs) = file.checked_at {
                 p { class: "pharos-admin-integrity-checked", "Checked {date_label(secs)}" }
             }
-            if queued {
-                button { class: "pharos-admin-integrity-recheck", disabled: true, "Queued" }
-            } else {
-                button {
-                    class: "pharos-admin-integrity-recheck",
-                    onclick: move |_| on_action.call(AdminAction::RecheckDamaged {
-                        media_id: id.clone(),
-                    }),
-                    "Re-check"
-                }
-            }
-            if can_deep {
-                if deep_running {
-                    button { class: "pharos-admin-integrity-deep", disabled: true, "Deep check running…" }
+            div { class: "pharos-manage-card-actions",
+                if queued {
+                    button { class: "pharos-admin-integrity-recheck", disabled: true, "Queued" }
                 } else {
                     button {
-                        class: "pharos-admin-integrity-deep",
-                        onclick: move |_| on_action.call(AdminAction::DeepCheck {
-                            media_id: deep_id.clone(),
+                        class: "pharos-admin-integrity-recheck",
+                        onclick: move |_| on_action.call(AdminAction::RecheckDamaged {
+                            media_id: id.clone(),
                         }),
-                        "Deep check"
+                        "Re-check"
+                    }
+                }
+                if can_deep {
+                    if deep_running {
+                        button { class: "pharos-admin-integrity-deep", disabled: true, "Deep check running…" }
+                    } else {
+                        button {
+                            class: "pharos-admin-integrity-deep",
+                            onclick: move |_| on_action.call(AdminAction::DeepCheck {
+                                media_id: deep_id.clone(),
+                            }),
+                            "Deep check"
+                        }
                     }
                 }
             }
@@ -1370,6 +1705,118 @@ mod tests {
             AdminView(p)
         }
         let _ = _f;
+    }
+
+    #[test]
+    fn times_show_the_minute_and_odd_values_pass_through() {
+        assert_eq!(when_label("2026-11-09T08:12:44.123Z"), "2026-11-09 08:12");
+        assert_eq!(when_label("2026-11-09 08:12:44"), "2026-11-09 08:12");
+        assert_eq!(when_label(""), "—");
+        assert_eq!(when_label("0001-01-01T00:00:00Z"), "—");
+        assert_eq!(when_label("yesterday"), "yesterday");
+        assert_eq!(when_label("2026-11-09T08:1€:00"), "2026-11-09T08:1€:00");
+    }
+
+    #[test]
+    fn byte_counts_pick_a_unit() {
+        assert_eq!(bytes_label(512), "512 B");
+        assert_eq!(bytes_label(12_345), "12 KiB");
+        assert_eq!(bytes_label(5 * 1024 * 1024 + 1024 * 512), "5.5 MiB");
+        assert_eq!(bytes_label(3 * 1024 * 1024 * 1024), "3.0 GiB");
+    }
+
+    #[test]
+    fn libraries_and_user_counts_read_plainly() {
+        assert_eq!(library_kind("movies"), "Films");
+        assert_eq!(library_kind("tvshows"), "TV");
+        assert_eq!(library_kind(""), "Mixed");
+        assert_eq!(library_kind("podcasts"), "podcasts");
+        let user = |admin: bool| AdminUser {
+            id: "u".into(),
+            name: "u".into(),
+            is_admin: admin,
+        };
+        assert_eq!(users_summary(&[user(true)]), "1 user · 1 admin");
+        assert_eq!(
+            users_summary(&[user(true), user(false), user(true)]),
+            "3 users · 2 admins"
+        );
+    }
+
+    #[test]
+    fn focus_follows_what_a_user_card_opens_and_returns_on_close() {
+        use UserCardOpen::*;
+        let at = |from, to| focus_target("u1", from, to);
+        assert_eq!(
+            at(Nothing, ConfirmDelete).as_deref(),
+            Some("manage-keep-u1")
+        );
+        assert_eq!(
+            at(Nothing, ResetPassword).as_deref(),
+            Some("manage-reset-u1")
+        );
+        assert_eq!(
+            at(ConfirmDelete, Nothing).as_deref(),
+            Some("manage-delete-u1")
+        );
+        assert_eq!(
+            at(ResetPassword, Nothing).as_deref(),
+            Some("manage-reset-open-u1")
+        );
+        assert_eq!(at(Nothing, Nothing), None);
+    }
+
+    #[test]
+    fn every_tab_has_a_lede_and_an_icon() {
+        for tab in AdminTab::all() {
+            assert!(!tab.lede().is_empty(), "{tab:?}");
+            assert!(!tab.icon().is_empty(), "{tab:?}");
+        }
+    }
+
+    /// The page on `tab`, `loading` or not, as HTML.
+    fn render_tab(tab: AdminTab, loading: bool) -> String {
+        let mut dom = VirtualDom::new_with_props(
+            |(tab, loading): (AdminTab, bool)| {
+                rsx! {
+                    AdminView {
+                        users: Vec::new(),
+                        current_user_id: String::new(),
+                        status: None,
+                        on_action: |_| {},
+                        active_tab: tab,
+                        loading,
+                    }
+                }
+            },
+            (tab, loading),
+        );
+        dom.rebuild_in_place();
+        dioxus_ssr::render(&dom)
+    }
+
+    #[test]
+    fn a_loading_tab_says_so_instead_of_empty() {
+        let html = render_tab(AdminTab::Devices, true);
+        assert!(html.contains("Loading…"), "{html}");
+        assert!(!html.contains("No devices"), "{html}");
+        assert!(render_tab(AdminTab::Devices, false).contains("No devices"));
+    }
+
+    #[test]
+    fn libraries_offer_the_scan_and_other_tabs_do_not() {
+        assert!(render_tab(AdminTab::Libraries, false).contains("Scan all libraries"));
+        assert!(!render_tab(AdminTab::Users, false).contains("Scan all libraries"));
+    }
+
+    #[test]
+    fn the_open_tab_is_the_current_page_in_the_sidebar() {
+        let html = render_tab(AdminTab::Logs, false);
+        assert_eq!(html.matches(r#"aria-current="page""#).count(), 1, "{html}");
+        assert!(
+            html.contains(r#"data-tab="logs" aria-current="page""#),
+            "{html}"
+        );
     }
 
     #[test]
