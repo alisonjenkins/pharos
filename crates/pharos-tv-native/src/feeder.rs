@@ -94,6 +94,16 @@ pub struct Feeder {
     segment: usize,
     sample: usize,
     scratch: Vec<u8>,
+    /// The stream's AAC track, until the audio player takes it.
+    audio: Option<AudioTrack>,
+}
+
+/// The AAC frames of a TS stream: the first segment's, then each later
+/// segment's as the demux thread reaches it.
+pub struct AudioTrack {
+    pub config: ts::AdtsConfig,
+    pub first: Vec<ts::AccessUnit>,
+    pub rest: std::sync::mpsc::Receiver<Vec<ts::AccessUnit>>,
 }
 
 fn resolve(dir: &Path, uri: &str) -> PathBuf {
@@ -195,6 +205,7 @@ impl Feeder {
             segment: 0,
             sample: 0,
             scratch: Vec::new(),
+            audio: None,
         })
     }
 
@@ -202,7 +213,10 @@ impl Feeder {
     /// `RESOLUTION`; the decoder reads the true size from the SPS.
     pub fn from_ts(first: Vec<u8>, supply: Segments, size: Option<(u32, u32)>) -> Result<Self, String> {
         let mut demux = ts::Demux::default();
-        let units = demux.access_units(&first).map_err(|e| format!("segment 0: {e}"))?;
+        let ts::Demuxed {
+            video: units,
+            audio,
+        } = demux.demux(&first).map_err(|e| format!("segment 0: {e}"))?;
         let (codec, hevc) = match demux.stream_type() {
             Some(ts::STREAM_AVC) => (Codec::Avc, false),
             Some(ts::STREAM_HEVC) => (Codec::Hevc, true),
@@ -216,11 +230,19 @@ impl Feeder {
         let (width, height) = size.unwrap_or((1920, 1080));
         let width = u16::try_from(width).map_err(|_| format!("width {width}"))?;
         let height = u16::try_from(height).map_err(|_| format!("height {height}"))?;
+        let config = audio.first().and_then(|a| ts::AdtsConfig::parse(&a.data));
         log::info!(
-            "video: source=ts codec={} {width}x{height} units={}",
+            "video: source=ts codec={} {width}x{height} units={} audio={config:?}",
             codec.mime(),
             units.len()
         );
+        let (audio_tx, audio_rx) = std::sync::mpsc::channel();
+        let video_rx = spawn_demux(demux, supply, config.map(|_| audio_tx))?;
+        let track = config.map(|config| AudioTrack {
+            config,
+            first: audio,
+            rest: audio_rx,
+        });
         Ok(Self {
             format: Format {
                 codec,
@@ -229,14 +251,21 @@ impl Feeder {
                 csd,
                 max_input: input_size(width, height),
             },
-            container: Container::Ts(spawn_demux(demux, supply)?),
+            container: Container::Ts(video_rx),
             supply: Box::new(|| None),
             current: Some(Current::Ts(units)),
             replay: None,
             segment: 0,
             sample: 0,
             scratch: Vec::new(),
+            audio: track,
         })
+    }
+
+    /// The AAC track, for the audio player; `None` after the first call or
+    /// for a stream without one.
+    pub fn take_audio(&mut self) -> Option<AudioTrack> {
+        self.audio.take()
     }
 
     pub fn format(&self) -> &Format {
@@ -358,6 +387,7 @@ impl Feeder {
 fn spawn_demux(
     mut demux: ts::Demux,
     mut supply: Segments,
+    mut audio: Option<std::sync::mpsc::Sender<Vec<ts::AccessUnit>>>,
 ) -> Result<std::sync::mpsc::Receiver<Result<Vec<ts::AccessUnit>, String>>, String> {
     let (tx, rx) = std::sync::mpsc::sync_channel(2);
     std::thread::Builder::new()
@@ -366,7 +396,15 @@ fn spawn_demux(
             let mut segment = 1u64;
             while let Some(bytes) = supply() {
                 let started = std::time::Instant::now();
-                let units = bytes.and_then(|b| demux.access_units(&b));
+                let units = bytes.and_then(|b| demux.demux(&b)).map(|d| {
+                    // A player that has gone, or never came, drops the audio.
+                    if let Some(tx) = &audio {
+                        if tx.send(d.audio).is_err() {
+                            audio = None;
+                        }
+                    }
+                    d.video
+                });
                 let failed = units.is_err();
                 log::info!(
                     "bench demux segment={segment} ms={}",
