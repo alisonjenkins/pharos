@@ -139,7 +139,7 @@ Each extraction is one commit: service + its unit test, Jellyfin handler rewired
 
 - [x] T041 (done: `services::events::tests`, V1000) [US2] Test: per-user `seq`, replay after `afterSeq`, `resync` when older than the window (data-model §Events)
 - [x] T042 (done: `EventLog` reads the existing `/socket` bus from the first subscribe, ADR-0094, V1004) [US2] `services/events.rs`: services publish to the existing fan-out; per-user bounded replay window (10 000 events / 15 min) — **COMMIT**
-- [x] T043 (done: it_rpc `events.rs`, each test disarm-checked, V1001, V1003) [US2] `rpc/events.rs` `Events.subscribe` with `EventSink`; `pharos_rpc_subscriptions{topic}`, `pharos_rpc_events_total{topic,outcome}`, `pharos_rpc_event_lag_seconds{topic}`; tests with disarm — **COMMIT**
+- [x] T043 (done: it_rpc `events.rs`, each test disarm-checked, V1001, V1003, V1005) [US2] `rpc/events.rs` `Events.subscribe` with `EventSink`; `pharos_rpc_subscriptions{topic}`, `pharos_rpc_events_total{topic,outcome}`, `pharos_rpc_event_lag_seconds{topic}`; tests with disarm — **COMMIT**
 - [ ] T044 [US2] Multi-replica distribution per ADR-0016 (postgres arm; run `just test-postgres`) — **COMMIT**
 - [ ] T045 (partial: `pharos_rpc_capabilities_total{type="subscription",transition}` and the leak check in it_rpc `events.rs`; the other capability types are not counted yet) [US2] Capability lifecycle counts (issued / released / revoked by type) and a leak test — **COMMIT**
 
