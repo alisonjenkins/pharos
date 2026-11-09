@@ -375,6 +375,7 @@ async fn run_tiny(
             job_id,
             error: WorkerError::Other(format!("tiny op task join: {e}")),
         });
+    let ev = pharos_transcode::protocol::fit_reply(job_id, ev);
     let _ = write_frame(wr, &ev).await;
 }
 

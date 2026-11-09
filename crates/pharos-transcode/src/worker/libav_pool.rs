@@ -20,7 +20,8 @@
 //! `pharos_libav_worker_lifecycle_total{event,reason}`.
 
 use crate::protocol::{
-    read_frame, write_frame, JobId, TinyOp, WorkerCmd, WorkerError, WorkerEvent,
+    read_frame, write_frame, FrameError, JobId, TinyOp, WorkerCmd, WorkerError, WorkerEvent,
+    REPLY_TOO_LARGE,
 };
 use crate::worker::proc::spawn_worker_proc;
 use pharos_core::ProbeInfo;
@@ -123,6 +124,23 @@ fn idle_timeout_from(raw: Option<&str>) -> Option<Duration> {
             Some(DEFAULT_IDLE_TIMEOUT)
         }
     }
+}
+
+/// Count an op whose request or reply did not fit in one frame, as
+/// `pharos_libav_frame_too_large_total{direction,op}` (B914).
+fn record_too_large(direction: &'static str, op: &'static str, detail: &str) {
+    metrics::counter!(
+        "pharos_libav_frame_too_large_total",
+        "direction" => direction,
+        "op" => op,
+    )
+    .increment(1);
+    tracing::warn!(
+        direction,
+        op,
+        detail,
+        "libav op frame too large; op failed, worker kept"
+    );
 }
 
 /// Short label for logs.
@@ -637,10 +655,20 @@ impl LibavWorkerPool {
         } else {
             self.inner.op_timeout
         };
+        let name = op_name(&op);
         let mut worker = self.checkout().await?;
 
         match self.exchange(&mut worker, job_id, op, op_timeout).await {
             Ok(ev) => {
+                if let WorkerEvent::Failed {
+                    error: WorkerError::Other(msg),
+                    ..
+                } = &ev
+                {
+                    if msg.starts_with(REPLY_TOO_LARGE) {
+                        record_too_large("reply", name, msg);
+                    }
+                }
                 // Healthy → reuse.
                 worker.idle_since = Instant::now();
                 self.inner.idle.lock().await.push(worker);
@@ -649,6 +677,13 @@ impl LibavWorkerPool {
                     WorkerEvent::Failed { error, .. } => Err(PoolError::Op(error)),
                     other => Ok(other),
                 }
+            }
+            // Refused before sending: the worker never saw the op.
+            Err(e @ PoolError::Op(_)) => {
+                worker.idle_since = Instant::now();
+                self.inner.idle.lock().await.push(worker);
+                self.ensure_reaper();
+                Err(e)
             }
             Err(e) => {
                 // Broken channel → drop the worker (kill_on_drop reaps it).
@@ -708,9 +743,17 @@ impl LibavWorkerPool {
         op: TinyOp,
         op_timeout: Duration,
     ) -> Result<WorkerEvent, PoolError> {
-        write_frame(&mut worker.wr, &WorkerCmd::Tiny { job_id, op })
-            .await
-            .map_err(|e| PoolError::Dead(format!("send op: {e}")))?;
+        let name = op_name(&op);
+        match write_frame(&mut worker.wr, &WorkerCmd::Tiny { job_id, op }).await {
+            Ok(()) => {}
+            // Refused before a byte was written: the channel is intact.
+            Err(e @ FrameError::TooLarge(_)) => {
+                let detail = format!("request {e}");
+                record_too_large("request", name, &detail);
+                return Err(PoolError::Op(WorkerError::Other(detail)));
+            }
+            Err(e) => return Err(PoolError::Dead(format!("send op: {e}"))),
+        }
 
         let deadline = tokio::time::Instant::now() + op_timeout;
         loop {

@@ -170,3 +170,82 @@ async fn the_pool_carries_the_op_through_a_worker() {
     assert!(s.lines[0].loudness_lufs.unwrap() - s.lines[1].loudness_lufs.unwrap() >= 15.0);
     assert!(near(&s.cuts_ms, 5300, 50));
 }
+
+fn counter(
+    snap: &pharos_test_metrics::CumulativeSnapshotter,
+    name: &str,
+    labels: &[(&str, &str)],
+) -> u64 {
+    use metrics_util::debugging::DebugValue;
+    snap.snapshot()
+        .into_vec()
+        .iter()
+        .filter(|(k, ..)| {
+            k.key().name() == name
+                && labels
+                    .iter()
+                    .all(|(lk, lv)| k.key().labels().any(|l| l.key() == *lk && l.value() == *lv))
+        })
+        .map(|(.., v)| match v {
+            DebugValue::Counter(c) => *c,
+            _ => 0,
+        })
+        .sum()
+}
+
+/// B914: a request that cannot fit in a frame fails the op, is counted with
+/// its op, and leaves the worker idle for the next op instead of killing it.
+#[tokio::test]
+async fn an_oversized_request_fails_the_op_and_keeps_the_worker() {
+    if !ffmpeg_available() {
+        eprintln!("skipping: ffmpeg not on PATH");
+        return;
+    }
+    let recorder = metrics_util::debugging::DebuggingRecorder::new();
+    let snap = pharos_test_metrics::snapshotter(&recorder);
+    let _guard = metrics::set_default_local_recorder(&recorder);
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("fixture.mkv");
+    fixture(&input);
+    let bin = PathBuf::from(env!("CARGO_BIN_EXE_transcode-worker"));
+    let pool = LibavWorkerPool::new(bin, 1).with_op_timeout(Duration::from_secs(60));
+    pool.subtitle_signals(input.clone(), None, LINES.to_vec())
+        .await
+        .expect("warm the worker");
+
+    let huge: Vec<(u64, u64)> = (0..100_000u64).map(|i| (i, i + 1)).collect();
+    let err = pool
+        .fingerprint_multi(input.clone(), huge)
+        .await
+        .expect_err("oversized request");
+    assert!(err.to_string().contains("frame too large"), "{err}");
+    assert_eq!(pool.idle_workers().await, 1, "worker was discarded");
+    assert_eq!(
+        counter(
+            &snap,
+            "pharos_libav_frame_too_large_total",
+            &[("direction", "request"), ("op", "fingerprint_multi")]
+        ),
+        1
+    );
+
+    pool.subtitle_signals(input, None, LINES.to_vec())
+        .await
+        .expect("same worker serves the next op");
+    assert_eq!(
+        counter(
+            &snap,
+            "pharos_libav_worker_lifecycle_total",
+            &[("event", "spawned")]
+        ),
+        1
+    );
+    assert_eq!(
+        counter(
+            &snap,
+            "pharos_libav_worker_lifecycle_total",
+            &[("reason", "broken")]
+        ),
+        0
+    );
+}
