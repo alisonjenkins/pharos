@@ -168,23 +168,17 @@ mod tests {
     }
 
     #[test]
-    fn a_short_video_is_never_crossed_in_a_blink() {
-        let ten_min = 600_000;
-        let mut s = press(None, true, false, 0, ten_min, 0.0);
-        for i in 1..=200 {
-            s = press(
-                Some(s),
-                true,
-                true,
-                0,
-                ten_min,
-                10_000.0 + f64::from(i) * 50.0,
-            );
+    fn a_held_key_is_capped_so_the_video_is_not_crossed_in_a_blink() {
+        // 30 min: the cap is 1_800_000 / 6_000 = 300x, below a long hold's 480x.
+        let duration = 1_800_000;
+        let mut s = press(None, true, false, 0, duration, 0.0);
+        let mut last = s.target_ms;
+        for i in 1..=120 {
+            last = s.target_ms;
+            s = press(Some(s), true, true, 0, duration, f64::from(i) * 50.0);
         }
-        // 10 s of 480x would be 80 min; the cap holds it to 10 min / 6 s.
-        assert!(s.target_ms <= ten_min);
-        let per_ms = hold_speed(10_000.0).min(ten_min as f64 / MIN_CROSSING_MS);
-        assert!((per_ms - 100.0).abs() < 1e-9);
+        assert!(s.target_ms < duration, "the clamp must not hide the cap");
+        assert_eq!(s.target_ms - last, 15_000, "300x over 50 ms, not 480x");
     }
 
     #[test]
