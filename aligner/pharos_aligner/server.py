@@ -12,6 +12,7 @@ import threading
 import time
 from typing import Any, Callable
 
+from pharos_aligner.offset import estimate, shift
 from pharos_aligner.plan import parse_request, resolve, stamps, window
 from pharos_aligner.text import words
 
@@ -139,7 +140,43 @@ class AlignerHandler(http.server.BaseHTTPRequestHandler):
             decoder = self.get_decoder()
             aligner = self.get_aligner()
 
+            def align_wide(pcm: bytes, tokens: list[str]) -> list[tuple[int, int]]:
+                try:
+                    return aligner.align(pcm, tokens, lead_star=True)
+                except (RuntimeError, ValueError):
+                    logger.warning("path=%s offset probe failed", rel_path, exc_info=True)
+                    return []
+
+            probe_timed_out = False
+
+            def decode_probe(start_ms: int, end_ms: int) -> bytes:
+                # A probe is optional: a window ffmpeg cannot decode costs it
+                # the offset, not the song its word times. After one timeout
+                # the rest are skipped, so seven of them cannot outlast the
+                # server's whole-song budget.
+                nonlocal probe_timed_out
+                if probe_timed_out:
+                    return b""
+                try:
+                    return decoder(full_path, start_ms, end_ms)
+                except subprocess.TimeoutExpired:
+                    probe_timed_out = True
+                    logger.warning("path=%s offset probe decode timed out; skipping the rest", rel_path)
+                    return b""
+                except subprocess.CalledProcessError:
+                    logger.warning("path=%s offset probe decode failed", rel_path, exc_info=True)
+                    return b""
+
             with ALIGN_LOCK:
+                found = estimate(lines, decode_probe, align_wide)
+                logger.info(
+                    "path=%s offset_ms=%d probes=%s reason=%s",
+                    rel_path,
+                    found.offset_ms,
+                    found.probes,
+                    found.reason,
+                )
+                lines = shift(lines, found.offset_ms)
                 out_lines: list[dict[str, Any]] = []
                 words_aligned = 0
                 for index, line in enumerate(lines):
@@ -170,13 +207,14 @@ class AlignerHandler(http.server.BaseHTTPRequestHandler):
             self._send_json(500, {"error": "internal error"})
             return
 
-        self._send_json(200, {"lines": out_lines})
+        self._send_json(200, {"lines": out_lines, "offset_ms": found.offset_ms})
         duration_ms = int((time.monotonic() - start_time) * 1000)
         logger.info(
-            "path=%s lines=%d words_aligned=%d duration_ms=%d",
+            "path=%s lines=%d words_aligned=%d offset_ms=%d duration_ms=%d",
             rel_path,
             len(lines),
             words_aligned,
+            found.offset_ms,
             duration_ms,
         )
 
