@@ -522,13 +522,52 @@ pub async fn reconcile<S: SeriesIdentityStore>(
     }
     set_repair_rows("series_key", mode, root_prefix, updates.len());
     set_repair_rows("owner_row", mode, root_prefix, plan.new_owners.len());
+    let (changed, _) =
+        write_updates(store, plan, &by_path, updates, root_prefix, mode, now).await?;
+    Ok(changed)
+}
+
+/// Spec 033 §7 (V896) — [`reconcile`] for the one folder a hand fix changed,
+/// leaving the per-root gauges to the next scan pass. Returns the paths whose
+/// key moved, each marked for a rebuild.
+pub async fn reconcile_folder<S: SeriesIdentityStore>(
+    store: &S,
+    plan: &SeriesPlan,
+    folder: &str,
+    mode: RepairMode,
+    now: i64,
+) -> DomainResult<Vec<String>> {
+    let stored: Vec<SeriesIdentityRow> = store
+        .series_identity_rows(folder)
+        .await?
+        .into_iter()
+        .filter(|r| r.series_folder.as_deref() == Some(folder))
+        .collect();
+    let updates = diff(plan, &stored);
+    let by_path: HashMap<&str, &SeriesIdentityRow> =
+        stored.iter().map(|r| (r.path.as_str(), r)).collect();
+    let (_, moved) = write_updates(store, plan, &by_path, updates, folder, mode, now).await?;
+    Ok(moved)
+}
+
+/// Write `updates` (in dry run only the admin-placed ones, V896), and mark
+/// the rows whose key moved. Returns the rows changed and the moved paths.
+async fn write_updates<S: SeriesIdentityStore>(
+    store: &S,
+    plan: &SeriesPlan,
+    by_path: &HashMap<&str, &SeriesIdentityRow>,
+    updates: Vec<SeriesKeyUpdate>,
+    root_prefix: &str,
+    mode: RepairMode,
+    now: i64,
+) -> DomainResult<(u64, Vec<String>)> {
     let updates = if mode == RepairMode::DryRun {
         let held: Vec<SeriesKeyUpdate> = updates
             .into_iter()
             .filter(|u| plan.admin_placed.contains(Path::new(&u.path)))
             .collect();
         if held.is_empty() {
-            return Ok(0);
+            return Ok((0, Vec::new()));
         }
         tracing::info!(
             root = root_prefix,
@@ -560,7 +599,7 @@ pub async fn reconcile<S: SeriesIdentityStore>(
             "series identity repair: rows moved to another series key, marked for reconciliation"
         );
     }
-    Ok(changed)
+    Ok((changed, moved))
 }
 
 /// Rows the last complete pass of `root` found to differ: written in

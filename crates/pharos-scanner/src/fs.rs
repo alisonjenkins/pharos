@@ -6447,6 +6447,77 @@ mod tests {
         );
     }
 
+    /// Spec 033 §7 — a hand fix re-plans just its folder from the stored
+    /// rows: the admin's move is written (in a dry run too) and returned as
+    /// moved, while a neighbouring folder sharing its name's prefix is left
+    /// alone.
+    #[tokio::test]
+    async fn a_hand_fix_reconciles_only_its_own_folder() {
+        use crate::series_split::{self as split, RepairMode};
+        let td = TempDir::new().unwrap();
+        write_flash(td.path()).await;
+        write_file(
+            td.path(),
+            "The Flash 2/Season 1/The Flash 2 (2014) - S01E01.mkv",
+            b"x",
+        )
+        .await;
+        write_file(
+            td.path(),
+            "The Flash 2/Season 1/The Flash 2 (1990) - S01E01.mkv",
+            b"y",
+        )
+        .await;
+        let store = MemStore::default();
+        FsScanner::new(FakeProber::default())
+            .scan_into(td.path(), &store)
+            .await
+            .unwrap();
+        let folder = td.path().join("The Flash").to_string_lossy().into_owned();
+        let moved = td
+            .path()
+            .join("The Flash/Season 1/The Flash (2014) - S01E02.mkv")
+            .to_string_lossy()
+            .into_owned();
+        store
+            .overrides
+            .lock()
+            .unwrap()
+            .push(pharos_core::SeriesOverride {
+                id: 1,
+                series_folder: folder.clone(),
+                path: Some(moved.clone()),
+                target_key: "/tv/Elsewhere".into(),
+                target_name: None,
+                target_year: Some(2014),
+                source: pharos_core::OverrideSource::Admin,
+                created_by: Some("ali".into()),
+                created_at: 1,
+            });
+        let paths: Vec<PathBuf> =
+            pharos_core::SeriesIdentityStore::series_identity_rows(&store, &folder)
+                .await
+                .unwrap()
+                .into_iter()
+                .filter(|r| r.series_folder.as_deref() == Some(folder.as_str()))
+                .map(|r| PathBuf::from(r.path))
+                .collect();
+        let folders = split::folders_of(&paths);
+        let ctx = split::context(&store, &folders).await.unwrap();
+        let plan = split::plan(&folders, &ctx, 2);
+
+        let got = split::reconcile_folder(&store, &plan, &folder, RepairMode::DryRun, 3)
+            .await
+            .unwrap();
+
+        assert_eq!(got, std::slice::from_ref(&moved));
+        assert_eq!(*store.reconcile_marked.lock().unwrap(), [moved]);
+        assert!(keys_of(&store)
+            .iter()
+            .filter(|(name, ..)| name.starts_with("The Flash 2 "))
+            .all(|(_, k, y)| k.is_none() && y.is_none()));
+    }
+
     /// Spec 033 §6.2: the default dry run counts the split it would make and
     /// writes nothing.
     #[tokio::test]
