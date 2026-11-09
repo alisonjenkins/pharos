@@ -13,6 +13,7 @@ use pharos_core::{
 };
 
 use super::bootstrap::{qc_denial, token_denial};
+use super::events::{Events, SubscriptionCount};
 use super::group::Group;
 use super::library::Library;
 use super::playback::Playback;
@@ -87,6 +88,11 @@ impl Session {
     /// still live.
     pub(super) fn owner(&self) -> UserId {
         self.user.id
+    }
+
+    /// The `Events` subscriptions open on this session's connection.
+    pub(super) fn subscriptions(&self) -> &SubscriptionCount {
+        &self.ctx.subscriptions
     }
 
     pub(super) fn conn(&self) -> Rc<Connection> {
@@ -247,6 +253,19 @@ impl server::session::Handler for Session {
         results
             .get()
             .set_playback(server::playback::client(Playback::new(self), &conn));
+        Ok(())
+    }
+
+    /// Never refused, like `library`; `subscribe` checks the session itself.
+    async fn events(
+        self: Rc<Self>,
+        _params: wire::EventsParams,
+        results: &mut wire::EventsResults,
+    ) -> Result<(), capnp::Error> {
+        let conn = Rc::clone(&self.conn);
+        results
+            .get()
+            .set_events(server::events::client(Events::new(self), &conn));
         Ok(())
     }
 

@@ -16,6 +16,7 @@ mod connect;
 mod connection_close;
 mod damage;
 mod detail_subtitle_scripts;
+mod events;
 mod gate;
 mod group;
 mod library;
