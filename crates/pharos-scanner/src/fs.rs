@@ -3732,6 +3732,35 @@ fn is_sidecar_noise(path: &Path) -> bool {
         .is_some_and(|n| n.starts_with('.'))
 }
 
+/// A release's sample clip: a video under a `Sample` folder, or one whose
+/// name ends in `sample` (`Heat.1995.sample.mkv`, `Heat (Sample).mkv`).
+/// Indexed, each showed up as another copy of its film.
+fn is_release_sample(relative: &Path) -> bool {
+    let video = relative
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| FILM_EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()));
+    if !video {
+        return false;
+    }
+    let in_sample_dir = relative.parent().is_some_and(|dir| {
+        dir.components().any(|c| {
+            c.as_os_str().to_str().is_some_and(|n| {
+                n.eq_ignore_ascii_case("sample") || n.eq_ignore_ascii_case("samples")
+            })
+        })
+    });
+    in_sample_dir
+        || relative
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .is_some_and(|stem| SAMPLE_STEM_RE.as_ref().is_some_and(|re| re.is_match(stem)))
+}
+
+/// A file stem that ends in the word `sample`, bare or bracketed.
+static SAMPLE_STEM_RE: std::sync::LazyLock<Option<regex::Regex>> =
+    std::sync::LazyLock::new(|| regex::Regex::new(r"(?i)(?:^|[ ._\-(\[])sample[)\]]?$").ok());
+
 /// Result of a filesystem [`walk`]: the recognised media file paths, plus a
 /// count of entries walkdir could not read this pass. A non-zero `errors`
 /// means the listing is *incomplete* — the caller must not treat a missing
@@ -3771,6 +3800,12 @@ async fn walk(root: PathBuf, exts: HashSet<String>) -> DomainResult<WalkOutcome>
                 continue;
             }
             if is_sidecar_noise(e.path()) {
+                continue;
+            }
+            if is_release_sample(e.path().strip_prefix(&root).unwrap_or(e.path())) {
+                tracing::debug!(path = %e.path().display(), "walk: skipping a release sample");
+                metrics::counter!("pharos_scan_skipped_files_total", "reason" => "sample")
+                    .increment(1);
                 continue;
             }
             let lower = e
@@ -7774,6 +7809,28 @@ mod tests {
             key("/m/Heat (1995).mkv"),
             "an edition in brackets with no release group stays apart"
         );
+    }
+
+    /// V961: a release's sample clip is never indexed (B1002).
+    #[test]
+    fn a_release_sample_is_not_walked() {
+        for sample in [
+            "Black Panther (2018)/Sample/black.panther.2018.1080p.bluray.x264-sparks.sample.mkv",
+            "X/Final Destination 3 2006 BluRay 720p DTS x264-MgB (Sample).mkv",
+            "X/Final.Destination.5.2011.1080p.BluRay.x264.AC3-ETRG.Sample.mp4",
+            "The Golem (2018)/Sample.mkv",
+            "Heat (1995)/Heat (1995)-sample.mkv",
+        ] {
+            assert!(is_release_sample(Path::new(sample)), "{sample}");
+        }
+        for kept in [
+            "Heat (1995)/Heat (1995) Bluray-1080p.mkv",
+            "Samples (2020)/Samples (2020).mkv",
+            "Music/Artist/Album/03 - Sample.flac",
+            "Sample Size (2019)/Sample Size (2019).mkv",
+        ] {
+            assert!(!is_release_sample(Path::new(kept)), "{kept}");
+        }
     }
 
     /// V846: a film's extras, cuts, parts and a show named by episode number
