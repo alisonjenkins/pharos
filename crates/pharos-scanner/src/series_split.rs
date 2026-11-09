@@ -19,7 +19,7 @@ use pharos_core::{
     SeriesOverride,
 };
 
-use crate::fs::{name_show_name_and_year, parse_series_info};
+use crate::fs::name_show_name_and_year;
 
 /// Separates a folder from the year in a split group's key. A unit separator
 /// never occurs in a path.
@@ -58,7 +58,7 @@ pub fn split_key(folder: &str, year: u32) -> String {
 
 /// The show year an episode file states (V890), and where it came from.
 pub fn stated_show_year(path: &Path) -> Option<u32> {
-    let info = parse_series_info(path)?;
+    let info = crate::fs::episode_series_info(path)?;
     let name = path.file_name()?.to_str()?;
     let from_name = name_show_name_and_year(name).and_then(|(show, year)| {
         (pharos_core::title_similarity(show, &info.series_name) >= SAME_SHOW_NAME).then_some(year)
@@ -689,6 +689,20 @@ mod tests {
         let folders = folders_of(std::slice::from_ref(&file));
         let key = show.to_string_lossy().into_owned();
         assert_eq!(folders.keys().collect::<Vec<_>>(), [&key]);
+    }
+
+    /// A year a nested episode's name states is read against the show
+    /// folder's name, not the sub-folder it sits in.
+    #[test]
+    fn a_nested_episode_states_its_year_against_its_show() {
+        let td = tempfile::TempDir::new().unwrap();
+        let show = td.path().join("Cosmos");
+        std::fs::create_dir_all(show.join("Alternate")).unwrap();
+        std::fs::write(show.join("tvshow.nfo"), b"<tvshow/>").unwrap();
+        let file = show.join("Alternate/Cosmos (1980) - S01E01.mkv");
+        let folders = folders_of(std::slice::from_ref(&file));
+        let key = show.to_string_lossy().into_owned();
+        assert_eq!(folders.get(&key), Some(&vec![(file, Some(1980))]));
     }
 
     #[test]
