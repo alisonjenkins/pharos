@@ -41,7 +41,8 @@ as a bitstream, set by an admin and never inferred.
   whether it applied.
 - **Interface:** `POST /Devices/Options?id=` takes `NoDirectPlayAudioCodecs`
   (pharos extension; absent leaves it, `[]` clears it; names are lowercased,
-  deduplicated, at most 16 of 1–16 `[a-z0-9_-]`). `/Devices` lists it on each
+  deduplicated, at most 16 of 1–16 `[a-z0-9_-]`; `aac` is refused because every
+  conversion path, the HLS segment encoder included, produces AAC). `/Devices` lists it on each
   element that has one. Manage → Devices shows toggles for Dolby Digital,
   Dolby Digital Plus, Dolby TrueHD and DTS. Admin only, like the rest of
   `/Devices`.
