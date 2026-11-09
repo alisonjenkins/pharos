@@ -3,7 +3,7 @@
 //! decode, and supply its init and media segments to the feeder.
 //!
 //! Segments are fetched on their own thread, [`AHEAD`] in front of the
-//! decoder, with the device token in a header and never in a URL. Video
+//! decoder, with the device token in the `X-Emby-Token` header (the server reads it there, not as a bearer) and never in a URL. Video
 //! only: the audio rendition comes with the AAudio step.
 
 use crate::feeder::{Segments, feedable};
@@ -49,7 +49,7 @@ impl Http {
             }
             let mut req = self.client.get(url);
             if let Some(token) = &self.token {
-                req = req.bearer_auth(token);
+                req = req.header("X-Emby-Token", token);
             }
             let started = std::time::Instant::now();
             let result = self.rt.block_on(async {
