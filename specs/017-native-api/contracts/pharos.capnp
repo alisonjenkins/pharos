@@ -12,7 +12,7 @@ annotation secret(field, param) :Void;
 
 # Bumped when the schema changes; served as ServerInfo.schemaVersion so a client
 # can tell which methods a server knows (FR-009).
-const schemaVersion :UInt32 = 32;
+const schemaVersion :UInt32 = 34;
 
 # ---- ids and shared types -------------------------------------------------
 struct ItemId {                # mirrors pharos_jellyfin_api::WireId
@@ -276,7 +276,7 @@ struct Version {
   # Where the picture sits in the coded frame, in pixels, when the file has
   # black bars baked into it (a 4:3 show stored pillarboxed in 1920x1080):
   # the player crops to it. pictureWidth 0 = no bars found, or not checked
-  # yet. Since schemaVersion 32.
+  # yet. Since schemaVersion 34.
   pictureX @14 :UInt32; pictureY @15 :UInt32;
   pictureWidth @16 :UInt32; pictureHeight @17 :UInt32;
 }

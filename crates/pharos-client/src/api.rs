@@ -134,7 +134,7 @@ pub struct Version {
     pub duration_ms: u64,
     /// Where the picture sits inside the frame when the file has black bars
     /// baked into it; `None` when it has none, or the server has not looked
-    /// (or is older than schemaVersion 32).
+    /// (or is older than schemaVersion 34).
     pub picture: Option<PictureArea>,
 }
 
