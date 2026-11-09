@@ -9,7 +9,10 @@ use pharos_api::pharos_capnp::{
     LibraryKind as WireKind, SegmentKind, Stereo3d, StereoFilter, SubtitleDelivery,
 };
 use pharos_api::{server, Denial};
-use pharos_core::{LibraryKind, MediaItem, MediaKind, MediaProbe, UserItemData, Video3DFormat};
+use pharos_core::{
+    BookFormat, BookMeta, LibraryKind, MediaItem, MediaKind, MediaProbe, ReadPosition,
+    ReadPositionStore as _, UserItemData, Video3DFormat,
+};
 use pharos_jellyfin_api::dto::{BaseItemDto, WireId};
 use pharos_jellyfin_api::image_tag_sig::ImageTagKey;
 
@@ -106,6 +109,7 @@ impl server::library::Handler for Library {
                     start: 0,
                 }
             });
+        let reads = Reads::of(state, &user, listing_rows(&listed)).await;
         write_listing(
             results.get().init_result(),
             listed,
@@ -113,6 +117,7 @@ impl server::library::Handler for Library {
             &state.server_id,
             &state.image_tag_key,
             &DamagedIds::of(state),
+            &reads,
         );
         Ok(())
     }
@@ -135,6 +140,7 @@ impl server::library::Handler for Library {
         };
         let state = &self.session.state;
         let listed = library::resume(state, &user, &kinds, 0, limit).await;
+        let reads = Reads::of(state, &user, listing_rows(&listed)).await;
         write_listing(
             results.get().init_result(),
             listed,
@@ -142,6 +148,7 @@ impl server::library::Handler for Library {
             &state.server_id,
             &state.image_tag_key,
             &DamagedIds::of(state),
+            &reads,
         );
         Ok(())
     }
@@ -191,6 +198,7 @@ impl server::library::Handler for Library {
             listed.as_ref().ok().map(|p| (p.items.len(), p.total)),
             query.start_index,
         );
+        let reads = Reads::of(state, &user, listing_rows(&listed)).await;
         write_listing(
             results.get().init_result(),
             listed,
@@ -198,6 +206,7 @@ impl server::library::Handler for Library {
             &state.server_id,
             &state.image_tag_key,
             &DamagedIds::of(state),
+            &reads,
         );
         Ok(())
     }
@@ -365,6 +374,7 @@ impl server::library::Handler for Library {
                         &state.server_id,
                         &state.image_tag_key,
                         &DamagedIds::of(state),
+                        &Reads::default(),
                     );
                     return Ok(());
                 }
@@ -391,6 +401,7 @@ impl server::library::Handler for Library {
                     &state.server_id,
                     &state.image_tag_key,
                     &DamagedIds::of(state),
+                    &Reads::default(),
                 );
                 return Ok(());
             }
@@ -487,7 +498,20 @@ impl server::library::Handler for Library {
             }
         }
         let dto = BaseItemDto::from_domain_with_user_data(&item, &state.server_id, user_data);
+        let read = match &item.book {
+            Some(_) => match state.stores.get_read_position(user.id, item.id).await {
+                Ok(position) => position,
+                Err(e) => {
+                    tracing::warn!(media.id = item.id, error = %e, "native detail: read position unavailable");
+                    None
+                }
+            },
+            None => None,
+        };
         let mut out = results.get().init_result().init_detail();
+        if let Some(book) = &item.book {
+            write_book(out.reborrow().init_book(), book);
+        }
         let mut summary = out.reborrow().init_summary();
         write_item(
             summary.reborrow(),
@@ -497,6 +521,9 @@ impl server::library::Handler for Library {
             &state.image_tag_key,
             &DamagedIds::of(state),
         );
+        if let (Some(position), Ok(state)) = (&read, summary.reborrow().get_user_state()) {
+            write_read_state(state, position);
+        }
         // A film sits straight under its library, as Jellyfin's detail says,
         // so the UI can name the library above it.
         if !summary.has_parent_id() {
@@ -691,12 +718,14 @@ impl server::library::Handler for Library {
         };
         let state = &self.session.state;
         let home = library::home(state, &user, latest, resume, next_up).await;
+        let reads = Reads::of_home(state, &user, &home).await;
         write_home(
             results.get().init_result(),
             home,
             &state.server_id,
             &state.image_tag_key,
             &DamagedIds::of(state),
+            &reads,
         );
         Ok(())
     }
@@ -717,6 +746,7 @@ impl server::library::Handler for Library {
         };
         let state = &self.session.state;
         let listed = library::next_up(state, &user, None, limit).await;
+        let reads = Reads::of(state, &user, listing_rows(&listed)).await;
         write_listing(
             results.get().init_result(),
             listed,
@@ -724,6 +754,7 @@ impl server::library::Handler for Library {
             &state.server_id,
             &state.image_tag_key,
             &DamagedIds::of(state),
+            &reads,
         );
         Ok(())
     }
@@ -796,6 +827,7 @@ fn write_home(
     server_id: &str,
     key: &ImageTagKey,
     damaged: &DamagedIds,
+    reads: &Reads,
 ) {
     let home = match home {
         Ok(home) => home,
@@ -831,6 +863,7 @@ fn write_home(
             server_id,
             key,
             damaged,
+            reads,
         );
     }
     write_items(
@@ -839,6 +872,7 @@ fn write_home(
         server_id,
         key,
         damaged,
+        reads,
     );
     write_items(
         out.reborrow()
@@ -847,6 +881,15 @@ fn write_home(
         server_id,
         key,
         damaged,
+        reads,
+    );
+    write_items(
+        out.reborrow().init_reading(len_u32(&home.reading.items)),
+        &home.reading.items,
+        server_id,
+        key,
+        damaged,
+        reads,
     );
     write_items(
         out.init_next_up(len_u32(&home.next_up.items)),
@@ -854,6 +897,7 @@ fn write_home(
         server_id,
         key,
         damaged,
+        reads,
     );
 }
 
@@ -871,17 +915,109 @@ fn write_items(
     server_id: &str,
     key: &ImageTagKey,
     damaged: &DamagedIds,
+    reads: &Reads,
 ) {
     for (i, (item, user_data)) in (0..out.len()).zip(items) {
+        let mut summary = out.reborrow().get(i);
         write_item(
-            out.reborrow().get(i),
+            summary.reborrow(),
             item,
             *user_data,
             server_id,
             key,
             damaged,
         );
+        if let Some(position) = reads.get(item.id) {
+            if let Ok(state) = summary.get_user_state() {
+                write_read_state(state, position);
+            }
+        }
     }
+}
+
+/// Listed items with the user's play state.
+fn listing_rows(listed: &Result<ListPage, ListError>) -> &Rows {
+    listed.as_ref().map_or(&[], |page| page.items.as_slice())
+}
+
+/// The saved read positions of the books in a listing, fetched in one query
+/// so a list of books costs one round trip, not one per book. A failed read
+/// is logged and leaves the books unread rather than failing the listing.
+#[derive(Default)]
+pub(super) struct Reads(std::collections::HashMap<u64, ReadPosition>);
+
+impl Reads {
+    async fn of(state: &AppState, user: &pharos_core::User, rows: &Rows) -> Self {
+        let books: Vec<u64> = rows
+            .iter()
+            .filter(|(item, _)| item.kind == MediaKind::Book)
+            .map(|(item, _)| item.id)
+            .collect();
+        Self::fetch(state, user, books).await
+    }
+
+    async fn of_home(
+        state: &AppState,
+        user: &pharos_core::User,
+        home: &Result<library::Home, ListError>,
+    ) -> Self {
+        let Ok(home) = home else {
+            return Self::default();
+        };
+        let books: Vec<u64> = home
+            .rails
+            .iter()
+            .flat_map(|(_, rows)| rows.iter())
+            .chain(&home.resume.items)
+            .chain(&home.reading.items)
+            .filter(|(item, _)| item.kind == MediaKind::Book)
+            .map(|(item, _)| item.id)
+            .collect();
+        Self::fetch(state, user, books).await
+    }
+
+    async fn fetch(state: &AppState, user: &pharos_core::User, mut books: Vec<u64>) -> Self {
+        books.sort_unstable();
+        books.dedup();
+        if books.is_empty() {
+            return Self::default();
+        }
+        match state.stores.read_positions_bulk(user.id, &books).await {
+            Ok(positions) => Self(
+                books
+                    .into_iter()
+                    .zip(positions)
+                    .filter_map(|(id, position)| Some((id, position?)))
+                    .collect(),
+            ),
+            Err(e) => {
+                tracing::warn!(error = %e, books = books.len(), "native library: read positions unavailable");
+                Self::default()
+            }
+        }
+    }
+
+    fn get(&self, id: u64) -> Option<&ReadPosition> {
+        self.0.get(&id)
+    }
+}
+
+/// A book's saved position on its `UserState`.
+pub(super) fn write_read_state(mut out: user_state::Builder<'_>, position: &ReadPosition) {
+    out.set_read_locator(position.locator.as_str());
+    out.set_read_fraction(position.fraction);
+}
+
+fn write_book(mut out: pharos_api::pharos_capnp::book_info::Builder<'_>, book: &BookMeta) {
+    use pharos_api::pharos_capnp::BookFormat as Wire;
+    out.set_format(match book.format {
+        BookFormat::Epub => Wire::Epub,
+        BookFormat::Pdf => Wire::Pdf,
+        BookFormat::Comic => Wire::Comic,
+        BookFormat::Unreadable => Wire::Unreadable,
+    });
+    out.set_author(book.author.as_deref().unwrap_or_default());
+    out.set_page_count(book.page_count.unwrap_or(0));
 }
 
 fn list_error_detail(e: &ListError) -> String {
@@ -928,6 +1064,7 @@ fn write_listing(
     server_id: &str,
     key: &ImageTagKey,
     damaged: &DamagedIds,
+    reads: &Reads,
 ) {
     let listed = match listed {
         Ok(listed) => listed,
@@ -949,6 +1086,7 @@ fn write_listing(
         server_id,
         key,
         damaged,
+        reads,
     );
 }
 
