@@ -667,15 +667,6 @@ pub fn WatchView(
                             }
                         }
                     }
-                    button {
-                        class: "pharos-control pharos-shrink",
-                        r#type: "button",
-                        "data-key-action": "shrink",
-                        aria_label: "Shrink",
-                        title: "Shrink to a small window",
-                        onclick: move |_| on_control.call(Control::Shrink),
-                        Icon { path: ICON_FLOAT }
-                    }
                     if !members.is_empty() {
                         MemberStrip { members, on_leave, seen, own_tracks: own_track_members, activity }
                     }
@@ -779,6 +770,18 @@ pub fn WatchView(
                             quality: c.quality.clone(),
                             height: media.video_height,
                             on_pick: move |control| on_control.call(control),
+                        }
+                        // The window-size controls sit together at the end of
+                        // the row, smallest to largest: a small window, picture
+                        // in picture, then fullscreen (B907).
+                        button {
+                            class: "pharos-control pharos-shrink",
+                            r#type: "button",
+                            "data-key-action": "shrink",
+                            aria_label: "Shrink",
+                            title: "Shrink to a small window",
+                            onclick: move |_| on_control.call(Control::Shrink),
+                            Icon { path: ICON_FLOAT }
                         }
                         if platform::pip_supported() {
                             button {
@@ -1925,6 +1928,25 @@ mod tests {
         assert!(player.is_some() && top > player, "{html}");
         assert!(html.contains(r#"aria-label="Back""#), "{html}");
         assert!(html.contains("Pilot"), "{html}");
+    }
+
+    /// V855: Shrink sits with Picture in picture and Fullscreen at the end of
+    /// the bottom row, smallest first, not alone in the top bar.
+    #[test]
+    fn the_window_size_controls_are_grouped_smallest_first() {
+        let html = render(controls());
+        let top = html.find(r#"class="pharos-watch-top""#).expect("top bar");
+        let row = html.find(r#"class="pharos-control-row""#).expect("control row");
+        let shrink = html.find(r#"aria-label="Shrink""#).expect("shrink");
+        let fullscreen = html.find(r#"aria-label="Fullscreen""#).expect("fullscreen");
+        assert!(top < row && row < shrink && shrink < fullscreen, "{html}");
+        let between = &html[shrink + 1..fullscreen];
+        let controls_between = between.matches("aria-label=").count();
+        // Only Picture in picture may come between them.
+        assert!(controls_between <= 1, "{html}");
+        if controls_between == 1 {
+            assert!(between.contains(r#"aria-label="Picture in picture""#), "{html}");
+        }
     }
 
     #[test]
