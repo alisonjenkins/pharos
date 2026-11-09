@@ -2569,14 +2569,16 @@ fn group_copies(
     out
 }
 
-/// The key a film file's own name gives it (`Heat (1995) Bluray-1080p.mkv`
-/// is `heat 1995`): every word of the name, lower-cased, less the words that
-/// say how the copy was made ([`FILM_RELEASE_WORDS`], resolutions, channel
-/// layouts, the 3D packing). Whatever else the name says stays in the key, so
-/// a trailer, a sample, a cut, a part or an episode of a show named by number
-/// is its own title. A name with no year is no copy of anything, since a
-/// title alone would merge remakes; a folder's name is not used, since a
-/// film's folder also holds its extras.
+/// The key a film file's name gives it (`Heat (1995) Bluray-1080p.mkv` is
+/// `("heat", 1995)`): the name's words, lower-cased, less its year, the words
+/// that say how the copy was made ([`FILM_RELEASE_WORDS`], resolutions,
+/// channel layouts, the 3D packing) and a leading or trailing article
+/// (`The Thing`, `Thing, The`). Whatever else the name says stays in the key,
+/// so a trailer, a sample, a cut, a part or an episode of a show named by
+/// number is its own title. A name with no year takes its folder's year only
+/// when it names the folder's title (`Thing, The (1982)/The Thing.mkv`), since
+/// a film's folder also holds its extras; with neither, it is no copy of
+/// anything, since a title alone would merge remakes.
 fn film_copy_key(path: &Path) -> Option<(String, u32)> {
     if is_episode_path(path) {
         return None;
@@ -2586,19 +2588,74 @@ fn film_copy_key(path: &Path) -> Option<(String, u32)> {
         return None;
     }
     let stem = path.file_stem()?.to_str()?;
-    let year = crate::metadata::filename::parse_filename(stem, true).year?;
-    let stem = match CHANNELS_RE.as_ref() {
-        Some(re) => re.replace_all(stem, " "),
-        None => stem.into(),
+    let year_of = |name: &str| crate::metadata::filename::parse_filename(name, true).year;
+    let (title, year) = match year_of(stem) {
+        Some(year) => (film_title(stem, year), year),
+        None => {
+            let folder = path.parent()?.file_name()?.to_str()?;
+            let year = year_of(folder)?;
+            let title = film_title(folder, year);
+            (film_title(stem, year) == title).then_some((title, year))?
+        }
     };
-    let key = words(&stem)
+    (!title.is_empty()).then(|| (title.join(" "), year))
+}
+
+/// A release group at the end of a name: hyphenated and bracketed
+/// (`-[RARBG]`), a bracketed domain (`[YTS.AG]`), or a scene `-GROUP` straight
+/// after an encode word (`x264-SPARKS`). A plain trailing bracket
+/// (`[Extended]`) is an edition and stays.
+static RELEASE_GROUP_RE: std::sync::LazyLock<Option<regex::Regex>> = std::sync::LazyLock::new(
+    || {
+        regex::Regex::new(
+            r"(?i)(?:-\s*\[[^\[\]]*\]\s*$|[-. ]*\[[^\[\]]*\.[^\[\]]*\]\s*$|(?P<enc>x26[45]|h\.?26[45]|hevc|xvid|divx|av1|\d{3,4}p|bluray|web-?dl|webrip|hdtv|aac|ac3|dts|atmos)-[a-z0-9.]+$)",
+        )
+        .ok()
+    },
+);
+
+/// `name` less a trailing release group (see [`RELEASE_GROUP_RE`]), repeated
+/// while one is left (`x264-[YTS.AG]`).
+fn strip_release_group(name: &str) -> String {
+    let mut name = name.trim().to_string();
+    let Some(re) = RELEASE_GROUP_RE.as_ref() else {
+        return name;
+    };
+    while let Some(caps) = re.captures(&name) {
+        let (Some(all), enc) = (caps.get(0), caps.name("enc")) else {
+            break;
+        };
+        let cut = enc.map_or(all.start(), |e| e.end());
+        let next = name.get(..cut).unwrap_or("").trim_end().to_string();
+        if next.len() == name.len() {
+            break;
+        }
+        name = next;
+    }
+    name
+}
+
+/// A film name's title words: [`film_copy_key`]'s words less the year, the
+/// release words and an article at either end.
+fn film_title(name: &str, year: u32) -> Vec<String> {
+    let name = strip_release_group(name);
+    let name = match CHANNELS_RE.as_ref() {
+        Some(re) => re.replace_all(&name, " "),
+        None => name.into(),
+    };
+    let year = year.to_string();
+    let mut title: Vec<String> = words(&name)
         .into_iter()
-        .filter(|w| !is_film_release_word(w))
-        .collect::<Vec<_>>()
-        .join(" ");
-    let year_word = year.to_string();
-    let titled = key.split(' ').any(|w| w != year_word);
-    titled.then_some((key, year))
+        .filter(|w| *w != year && !is_film_release_word(w))
+        .collect();
+    let article = |w: &String| matches!(w.as_str(), "the" | "a" | "an");
+    if title.len() > 1 && title.first().is_some_and(article) {
+        title.remove(0);
+    }
+    if title.len() > 1 && title.last().is_some_and(article) {
+        title.pop();
+    }
+    title
 }
 
 /// Words of a film's name that say how a copy was made, not what it holds.
@@ -7628,12 +7685,66 @@ mod tests {
         assert_eq!(film_copy_key(Path::new("/f/The Matrix.mkv")), None);
     }
 
+    /// V846: a name with no year takes its folder's year when it names the
+    /// folder's title, and a title's article may lead or trail.
+    #[test]
+    fn a_film_named_without_a_year_takes_its_folders() {
+        let thing = film_copy_key(Path::new(
+            "/m/The Thing (1982)/The Thing (1982) Bluray-1080p.mkv",
+        ));
+        assert_eq!(thing, Some(("thing".to_string(), 1982)));
+        assert_eq!(
+            film_copy_key(Path::new("/m/Thing, The (1982)/The Thing.mkv")),
+            thing
+        );
+        assert_eq!(
+            film_copy_key(Path::new(
+                "/m/X-Men Apocalypse (2016)/X-Men - Apocalypse (2016) 3D HSBS.mkv"
+            )),
+            film_copy_key(Path::new(
+                "/m/X-Men - Apocalypse (2016)/X-Men Apocalypse (2016).mkv"
+            )),
+        );
+        assert_eq!(
+            film_copy_key(Path::new(
+                "/m/X-Men Apocalypse (2016) [3D] [HSBS] [YTS.AG]/X-Men.Apocalypse.2016.3D.HSBS.BluRay.x264-[YTS.AG].mp4"
+            )),
+            film_copy_key(Path::new(
+                "/m/X-Men Apocalypse (2016)/X-Men - Apocalypse (2016) WEBDL-1080p.mkv"
+            )),
+            "a release group is how a copy was made"
+        );
+        assert_eq!(
+            film_copy_key(Path::new("/m/Heat.1995.1080p.BluRay.x264-SPARKS.mkv")),
+            Some(("heat".to_string(), 1995))
+        );
+        assert_ne!(
+            film_copy_key(Path::new("/m/Heat (1995) [Extended].mkv")),
+            Some(("heat".to_string(), 1995)),
+            "a plain bracket is an edition, not a release group"
+        );
+        for extra in [
+            "trailer.mkv",
+            "The Thing - Behind the Scenes.mkv",
+            "Thing.mkv.part",
+        ] {
+            let key = film_copy_key(&Path::new("/m/Thing, The (1982)").join(extra));
+            assert_ne!(key, thing, "{extra}");
+        }
+        assert_eq!(film_copy_key(Path::new("/m/Untitled/The Thing.mkv")), None);
+        assert_ne!(
+            film_copy_key(Path::new("/m/The Thing (2011)/The Thing.mkv")),
+            thing,
+            "a remake's folder year keeps it apart"
+        );
+    }
+
     /// V846: a film's extras, cuts, parts and a show named by episode number
     /// are never copies of the film; a 3D rip of a cut is a copy of that cut.
     #[test]
     fn a_film_name_that_says_more_than_its_release_is_its_own_title() {
         let film = film_copy_key(Path::new("/f/Heat (1995)/Heat (1995) Bluray-1080p.mkv"));
-        assert_eq!(film, Some(("heat 1995".to_string(), 1995)));
+        assert_eq!(film, Some(("heat".to_string(), 1995)));
         for other in [
             "Heat (1995)-trailer.mkv",
             "Heat (1995)-sample.mkv",
