@@ -149,6 +149,19 @@ async fn negotiate_at(
     audio: Choice,
     subtitle: Choice,
 ) -> Result<(playback_grant::Client, Decided), String> {
+    negotiate_version(schema_version, session, id, caps, audio, subtitle, "").await
+}
+
+/// `negotiate_at` for one of the item's versions; `""` plays the primary.
+async fn negotiate_version(
+    schema_version: u32,
+    session: &session::Client,
+    id: WireId,
+    caps: &Capabilities,
+    audio: Choice,
+    subtitle: Choice,
+    version: &str,
+) -> Result<(playback_grant::Client, Decided), String> {
     let playback = session.playback_request().send().pipeline.get_playback();
     let mut req = playback.negotiate_request();
     let mut p = req.get();
@@ -163,6 +176,7 @@ async fn negotiate_at(
     set_caps(p.reborrow().init_caps(), caps);
     set_choice(p.reborrow().init_audio(), audio);
     set_choice(p.reborrow().init_subtitle(), subtitle);
+    p.set_version(version);
     let reply = req.send().promise.await.expect("negotiate");
     match reply.get().unwrap().get_result().unwrap().which().unwrap() {
         negotiate_result::Grant(grant) => {
@@ -814,6 +828,105 @@ async fn the_decision_names_its_tracks_and_reports_remember_a_switch() {
     .await
     .unwrap();
     assert_eq!(again.subtitle, Some(3), "{again:?}");
+}
+
+/// A remembered track index names a stream of the primary file, so a
+/// version (another file, another stream layout) starts on its own default,
+/// and its reports leave the item's remembered tracks alone.
+/// Disarm check: with `pick_audio` keeping the remembered index for a
+/// version, the version starts on track 2; with `Grant::at` passing a
+/// version's tracks, the report overwrites the remembered 2.
+#[actix_web::test]
+async fn a_version_neither_uses_nor_overwrites_remembered_tracks() {
+    use pharos_core::{AlternateMediaSource, AudioTrack};
+
+    let (server, fx) = crate::revocation::start().await;
+    seed_playable(&fx).await;
+    let mut item = pharos_core::MediaStore::get(&fx.state.stores, MOVIE)
+        .await
+        .unwrap();
+    let tracks = vec![
+        AudioTrack {
+            stream_index: 1,
+            codec: Some("aac".into()),
+            is_default: true,
+            ..AudioTrack::default()
+        },
+        AudioTrack {
+            stream_index: 2,
+            codec: Some("aac".into()),
+            ..AudioTrack::default()
+        },
+    ];
+    item.probe.audio_tracks = tracks.clone();
+    let copy = item.probe.clone();
+    item.probe.alternate_sources = vec![AlternateMediaSource {
+        id: "copy".into(),
+        path: "/libA/copy/native.mp4".into(),
+        name: Some("Copy".into()),
+        probe: Some(Box::new(copy)),
+        ..Default::default()
+    }];
+    fx.state.stores.put(item).await.unwrap();
+    let mut data = fx
+        .state
+        .stores
+        .get_user_data(fx.user_id, MOVIE)
+        .await
+        .unwrap();
+    data.audio_stream_index = Some(2);
+    fx.state
+        .stores
+        .set_user_data(fx.user_id, MOVIE, data)
+        .await
+        .unwrap();
+    let (client, _closed) = crate::revocation::connect(&server).await;
+    let session = crate::revocation::signed_in(&client, &fx.user_token).await;
+    let direct = caps(&["h264"], &["aac"], &["mp4"]);
+    let schema = pharos_api::pharos_capnp::SCHEMA_VERSION;
+
+    let (_grant, primary) = negotiate(
+        &session,
+        WireId::Real(MOVIE),
+        &direct,
+        Choice::Default,
+        Choice::Default,
+    )
+    .await
+    .unwrap();
+    assert_eq!(primary.audio, Some(2), "{primary:?}");
+
+    let (grant, version) = negotiate_version(
+        schema,
+        &session,
+        WireId::Real(MOVIE),
+        &direct,
+        Choice::Default,
+        Choice::Default,
+        "copy",
+    )
+    .await
+    .unwrap();
+    assert_eq!(version.audio, Some(1), "{version:?}");
+
+    let mut req = grant.report_request();
+    req.get().init_ctx();
+    req.get().set_position_ms(5_000);
+    set_choice(req.get().init_audio(), Choice::Index(1));
+    set_choice(req.get().init_subtitle(), Choice::Off);
+    let reply = req.send().promise.await.expect("report");
+    read_done(reply.get().unwrap().get_result().unwrap()).unwrap();
+    let data = fx
+        .state
+        .stores
+        .get_user_data(fx.user_id, MOVIE)
+        .await
+        .unwrap();
+    assert_eq!(
+        (data.audio_stream_index, data.subtitle_stream_index),
+        (Some(2), None)
+    );
+    assert_eq!(data.last_played_position_ticks, 5_000 * 10_000);
 }
 
 /// MOVIE with a `dvd_subtitle` at stream 3 and an ASS at stream 4.
