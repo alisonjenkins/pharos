@@ -5815,6 +5815,100 @@ body:has(.pharos-stage.is-mini) .pharos-main {
   overflow-wrap: anywhere;
 }
 
+.pharos-admin-metadata-search {
+  display: grid;
+  gap: 0.5rem;
+  padding: 1rem 1.2rem;
+  border: var(--px-border) solid var(--px-color-border);
+  border-radius: calc(var(--px-radius) * 1.5);
+  background: var(--px-color-surface);
+}
+.pharos-admin-metadata-search label {
+  display: grid;
+  gap: 0.35rem;
+  font-weight: 600;
+}
+.pharos-admin-metadata-search input[type="search"] {
+  box-sizing: border-box;
+  width: 100%;
+  max-width: 28rem;
+  padding: 0.6rem 0.8rem;
+  border: var(--px-border) solid var(--px-color-border);
+  border-radius: var(--px-radius);
+  background: var(--px-color-bg);
+  color: var(--px-color-fg);
+  font: inherit;
+  font-weight: 400;
+}
+.pharos-admin-metadata-hits {
+  display: grid;
+  gap: 0.25rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.pharos-admin-metadata-hit {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.25rem 0.5rem;
+  padding: 0.35rem 0;
+}
+.pharos-admin-metadata-hit .pharos-admin-metadata-open {
+  margin-inline-start: auto;
+}
+.pharos-admin-metadata-empty {
+  margin: 0;
+  color: var(--px-color-fg-muted);
+}
+.pharos-admin-metadata-form {
+  display: grid;
+  gap: 1rem;
+  padding: 1rem 1.2rem;
+}
+.pharos-admin-metadata-form > h4 {
+  margin: 0;
+}
+.pharos-admin-metadata-field {
+  display: grid;
+  gap: 0.35rem;
+  justify-items: start;
+}
+.pharos-admin-metadata-field > label {
+  font-weight: 600;
+}
+.pharos-admin-metadata-field input,
+.pharos-admin-metadata-field textarea {
+  box-sizing: border-box;
+  width: 100%;
+  max-width: 36rem;
+  padding: 0.6rem 0.8rem;
+  border: var(--px-border) solid var(--px-color-border);
+  border-radius: var(--px-radius);
+  background: var(--px-color-bg);
+  color: var(--px-color-fg);
+  font: inherit;
+}
+.pharos-admin-metadata-field [aria-invalid="true"] {
+  border-color: var(--px-color-danger);
+}
+.pharos-admin-metadata-field p {
+  margin: 0;
+}
+.pharos-admin-metadata-locked {
+  margin-inline-start: 0.4rem;
+  padding: 0.05rem 0.45rem;
+  border: var(--px-border) solid var(--px-color-border);
+  border-radius: var(--px-radius);
+  color: var(--px-color-fg-muted);
+  font-size: 0.8rem;
+  font-weight: 400;
+}
+.pharos-admin-metadata-unlock-note,
+.pharos-admin-metadata-unchanged {
+  color: var(--px-color-fg-muted);
+}
+
 @media (max-width: 48rem) {
   .pharos-manage .pharos-settings-link {
     width: auto;
@@ -6306,4 +6400,12 @@ body:has(.pharos-reader) {
   justify-content: space-between;
   align-items: center;
   gap: 1rem;
+}
+
+/* Spec 015 US3: the metadata form's fields, disabled while a save is in flight. */
+.pharos-admin-metadata-fields {
+  border: 0;
+  margin: 0;
+  padding: 0;
+  min-width: 0;
 }

@@ -14,17 +14,18 @@
 use crate::api_types::{ItemKind, LibraryItem, LoggedInUser};
 use crate::client::{
     ActivityEntry, AdminUser, ApiKey, BrandingConfig, DeviceEntry, DuplicateFilm, FixDone,
-    IntegrityReport, ItemChapter, ItemDetail, LibraryFolder, LiveChannel, LiveProgram,
-    LocalizationCulture, LogEntry, PluginEntry, QuickConnectInitiate, RemoteSession, ScheduledTask,
-    SearchHint, SeriesIdentity, ShowCandidate, UserConfiguration,
+    IntegrityReport, ItemChapter, ItemDetail, ItemMetadata, LibraryFolder, LiveChannel,
+    LiveProgram, LocalizationCulture, LogEntry, MetadataSaveError, PluginEntry,
+    QuickConnectInitiate, RemoteSession, ScheduledTask, SearchHint, SeriesIdentity, ShowCandidate,
+    UserConfiguration,
 };
 use crate::views::admin::{fix_summary, PICK_PROMPT};
 use crate::views::server_picker::{load_saved_servers, save_servers};
 use crate::views::{
     AdminAction, AdminTab, AdminView, CreateUserAttempt, DeepSearchState, DetailAction,
     IdentitySearchState, ItemDetailView, LibraryView, LiveTvAction, LiveTvStatus, LiveTvView,
-    LoginAttempt, LoginForm, PickPrompt, PlayerView, PrefsAction, PrefsTab, PrefsView,
-    QuickConnectAuthorizeAction, QuickConnectAuthorizeView, QuickConnectGuestAction,
+    LoginAttempt, LoginForm, MetadataState, PickPrompt, PlayerView, PrefsAction, PrefsTab,
+    PrefsView, QuickConnectAuthorizeAction, QuickConnectAuthorizeView, QuickConnectGuestAction,
     QuickConnectGuestStatus, QuickConnectGuestView, RemoteAction, RemoteControlView, SavedServer,
     SearchStatus, SearchView, ServerPickerAction, ServerPickerView,
 };
@@ -668,6 +669,9 @@ pub fn AdminPane(
     let deep_search = use_signal(DeepSearchState::default);
     // Identifies the newest keystroke so an older search never lands.
     let deep_search_gen = use_signal(|| 0u32);
+    let metadata_search = use_signal(DeepSearchState::default);
+    let metadata_search_gen = use_signal(|| 0u32);
+    let metadata = use_signal(MetadataState::default);
     // Reads every file's verdict, so it runs only while its tab is open.
     let integrity_resource = {
         let base = server_base.clone();
@@ -807,6 +811,9 @@ pub fn AdminPane(
         let mut deep_errors_signal = deep_errors;
         let deep_search_signal = deep_search;
         let deep_search_gen_signal = deep_search_gen;
+        let metadata_search_signal = metadata_search;
+        let metadata_search_gen_signal = metadata_search_gen;
+        let metadata_signal = metadata;
         let mut fetch_err_hidden_signal = fetch_err_hidden;
         let mut identity_search_signal = identity_search;
         let mut identity_prompt_signal = identity_prompt;
@@ -867,6 +874,92 @@ pub fn AdminPane(
                     deep_search_signal,
                     deep_search_gen_signal,
                 );
+                return;
+            }
+            if let AdminAction::MetadataSearch { term } = action {
+                debounced_hit_search(
+                    base,
+                    token,
+                    term,
+                    metadata_search_signal,
+                    metadata_search_gen_signal,
+                );
+                return;
+            }
+            if let AdminAction::MetadataOpen { id } = action {
+                let mut state = metadata_signal;
+                // A save in flight would replace the reopened form when it
+                // answers, losing whatever was typed into it meanwhile.
+                if state.peek().saving {
+                    status_signal.set(Some("Wait for the save to finish.".into()));
+                    return;
+                }
+                state.with_mut(|s| {
+                    s.opening = Some(id.clone());
+                    s.open = None;
+                    s.error = None;
+                    s.refusals.clear();
+                });
+                spawn(async move {
+                    let found = fetch_item_metadata(&base, &token, &id).await;
+                    // A newer pick supersedes this one.
+                    if state.peek().opening.as_deref() != Some(id.as_str()) {
+                        return;
+                    }
+                    state.with_mut(|s| {
+                        s.opening = None;
+                        match found {
+                            Ok(view) => {
+                                s.open = Some(view);
+                                s.rev = s.rev.wrapping_add(1);
+                                s.saving = false;
+                            }
+                            Err(e) => s.error = Some(e),
+                        }
+                    });
+                });
+                return;
+            }
+            if let AdminAction::MetadataSave { id, fields, unlock } = action {
+                let mut state = metadata_signal;
+                let name = state
+                    .peek()
+                    .open
+                    .as_ref()
+                    .map_or_else(|| id.clone(), |m| m.name.clone());
+                state.with_mut(|s| {
+                    s.saving = true;
+                    s.refusals.clear();
+                });
+                spawn(async move {
+                    let result = save_item_metadata(&base, &token, &id, &fields, &unlock).await;
+                    state.with_mut(|s| s.saving = false);
+                    match result {
+                        Ok(view) => {
+                            let saved = view.name.clone();
+                            // The admin may have opened another item meanwhile.
+                            if state.peek().open.as_ref().is_some_and(|m| m.id == id) {
+                                state.with_mut(|s| {
+                                    s.open = Some(view);
+                                    s.rev = s.rev.wrapping_add(1);
+                                    s.refusals.clear();
+                                });
+                            }
+                            status_signal.set(Some(format!("Saved {saved}.")));
+                        }
+                        Err(MetadataSaveError::Refused { field, reason }) => {
+                            if state.peek().open.as_ref().is_some_and(|m| m.id == id) {
+                                state.with_mut(|s| s.refusals = vec![(field, reason)]);
+                            } else {
+                                status_signal
+                                    .set(Some(format!("Couldn't save {name}: {field}: {reason}")));
+                            }
+                        }
+                        Err(e) => {
+                            status_signal.set(Some(format!("Couldn't save {name}: {e}")));
+                        }
+                    }
+                });
                 return;
             }
             spawn(async move {
@@ -1067,6 +1160,9 @@ pub fn AdminPane(
                     }
                     AdminAction::SelectTab(_)
                     | AdminAction::DeepSearch { .. }
+                    | AdminAction::MetadataSearch { .. }
+                    | AdminAction::MetadataOpen { .. }
+                    | AdminAction::MetadataSave { .. }
                     | AdminAction::DismissStatus => {
                         unreachable!("handled above")
                     }
@@ -1089,7 +1185,10 @@ pub fn AdminPane(
         AdminTab::Logs => logs_resource.read_unchecked().is_none(),
         AdminTab::ApiKeys => api_keys_resource.read_unchecked().is_none(),
         AdminTab::Branding => branding_resource.read_unchecked().is_none(),
-        AdminTab::Duplicates | AdminTab::Integrity | AdminTab::ShowIdentity => false,
+        AdminTab::Duplicates
+        | AdminTab::Integrity
+        | AdminTab::ShowIdentity
+        | AdminTab::Metadata => false,
     };
     // A listing that failed says why on the open tab, not as an empty list.
     let tab_error = match *active_tab.read() {
@@ -1129,7 +1228,10 @@ pub fn AdminPane(
             .read_unchecked()
             .as_ref()
             .and_then(|r| r.as_ref().err().cloned()),
-        AdminTab::Duplicates | AdminTab::Integrity | AdminTab::ShowIdentity => None,
+        AdminTab::Duplicates
+        | AdminTab::Integrity
+        | AdminTab::ShowIdentity
+        | AdminTab::Metadata => None,
     };
     let fetch_err = tab_error.map(|e| {
         format!(
@@ -1172,6 +1274,8 @@ pub fn AdminPane(
     let deep_queued = deep_queued.read().clone();
     let deep_errors = deep_errors.read().clone();
     let deep_search = deep_search.read().clone();
+    let metadata_search = metadata_search.read().clone();
+    let metadata = metadata.read().clone();
     let plugins: Vec<PluginEntry> = match plugins_resource.read_unchecked().as_ref() {
         Some(Ok(v)) => v.clone(),
         _ => Vec::new(),
@@ -1225,6 +1329,8 @@ pub fn AdminPane(
             deep_errors: deep_errors,
             deep_search: deep_search,
             device_saving: device_saving.read().clone(),
+            metadata_search: metadata_search,
+            metadata: metadata,
         }
     }
 }
@@ -2887,6 +2993,42 @@ async fn fetch_live_programs(
     _hours: u32,
 ) -> Result<Vec<LiveProgram>, String> {
     Err("live_programs is only wired in the web build".into())
+}
+
+#[cfg(feature = "web")]
+async fn fetch_item_metadata(base: &str, token: &str, id: &str) -> Result<ItemMetadata, String> {
+    crate::client::web::fetch_item_metadata(base, token, id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(not(feature = "web"))]
+async fn fetch_item_metadata(_base: &str, _token: &str, _id: &str) -> Result<ItemMetadata, String> {
+    Err("fetch_item_metadata is only wired in the web build".into())
+}
+
+#[cfg(feature = "web")]
+async fn save_item_metadata(
+    base: &str,
+    token: &str,
+    id: &str,
+    fields: &[(String, serde_json::Value)],
+    unlock: &[String],
+) -> Result<ItemMetadata, MetadataSaveError> {
+    crate::client::web::save_item_metadata(base, token, id, fields, unlock).await
+}
+
+#[cfg(not(feature = "web"))]
+async fn save_item_metadata(
+    _base: &str,
+    _token: &str,
+    _id: &str,
+    _fields: &[(String, serde_json::Value)],
+    _unlock: &[String],
+) -> Result<ItemMetadata, MetadataSaveError> {
+    Err(MetadataSaveError::Failed(
+        "save_item_metadata is only wired in the web build".into(),
+    ))
 }
 
 /// Runs a title search after the typing pauses, writing the hits into
