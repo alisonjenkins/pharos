@@ -915,6 +915,30 @@ input:focus-visible {
   background: var(--px-color-accent);
   color: var(--px-color-accent-fg);
 }
+/* A damaged file (B940): bottom right, clear of Watched, 3D and the
+   ratings in the bottom-left corner. */
+.pharos-badge-damaged {
+  top: auto;
+  bottom: 0.6rem;
+  background: var(--px-color-warning);
+  color: var(--px-color-bg);
+}
+.pharos-episode-damaged {
+  align-self: flex-start;
+  padding: 0.1rem 0.45rem;
+  font-size: 0.75rem;
+  font-weight: 600;
+  border-radius: 9999px;
+  background: var(--px-color-warning);
+  color: var(--px-color-bg);
+}
+.pharos-damage-line {
+  margin: 0.25rem 0;
+  color: var(--px-color-warning);
+}
+.pharos-damage-mark {
+  font-weight: 700;
+}
 
 /* Outside scores: chips under a title's facts, and small ones in a
    poster's bottom-left corner, above the progress bar. */
