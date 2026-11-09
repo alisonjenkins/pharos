@@ -158,6 +158,31 @@ pub fn direct_media_url(base: &str, url: &str, token: &str) -> String {
     format!("{url}{join}api_key={encoded}")
 }
 
+/// The script that starts page visualiser run `id` drawing `style`, once
+/// the wasm module (`window.__pharosVis`) is loaded. A run its owner already
+/// stopped (`"gone"`) does not start; a fallback comes back as a
+/// `visualiser` bridge message (B1032, V992).
+pub fn visualiser_start_js(id: u64, style: &str) -> String {
+    let style = serde_json::Value::String(style.to_owned());
+    format!(
+        r#"const all = window.__pharosVisRuns = window.__pharosVisRuns || {{}};
+if (all[{id}] === "gone") {{ delete all[{id}]; return false; }}
+all[{id}] = window.__pharosVis.start({style}, (reason) =>
+  window.__pharosSend && window.__pharosSend({{ t: "visualiser", id: {id}, reason: String(reason) }}));
+return true;"#
+    )
+}
+
+/// The script that stops page visualiser run `id`, or marks it `"gone"` so
+/// a start still on its way does nothing.
+pub fn visualiser_stop_js(id: u64) -> String {
+    format!(
+        r#"const all = window.__pharosVisRuns = window.__pharosVisRuns || {{}};
+const run = all[{id}];
+if (run && run.stop) {{ run.stop(); run.free(); delete all[{id}]; }} else {{ all[{id}] = "gone"; }}"#
+    )
+}
+
 /// How long before a media token expires the app asks for the next one, so
 /// a song started just before expiry still loads.
 pub const MEDIA_TOKEN_MARGIN_MS: u64 = 15 * 60 * 1000;
@@ -246,6 +271,9 @@ pub enum Bridge {
         #[serde(flatten)]
         event: HlsEvent,
     },
+    /// The page's visualiser run `id` could not draw: the
+    /// `render::Fallback` label why.
+    Visualiser { id: u64, reason: String },
     /// A directly played media element's `error`: its `MediaError` code and
     /// message.
     #[serde(rename = "mediaerror")]
@@ -434,6 +462,31 @@ mod tests {
             "const every = v instanceof HTMLVideoElement ? 1000 : 250;"
         );
         const { assert!(AUDIO_TICK_MS * 4 <= VIDEO_TICK_MS) };
+    }
+
+    #[test]
+    fn a_page_visualiser_starts_stops_and_skips_a_stopped_run() {
+        let start = visualiser_start_js(3, "plasma");
+        assert!(
+            start.contains(r#"window.__pharosVis.start("plasma","#),
+            "{start}"
+        );
+        assert!(start.contains(r#"if (all[3] === "gone")"#), "{start}");
+        assert!(start.contains(r#"t: "visualiser", id: 3"#), "{start}");
+        let stop = visualiser_stop_js(3);
+        assert!(
+            stop.contains("run.stop(); run.free(); delete all[3];"),
+            "{stop}"
+        );
+        assert!(stop.contains(r#"all[3] = "gone""#), "{stop}");
+        let v = serde_json::json!({"t": "visualiser", "id": 3, "reason": "no_webgl2"});
+        assert_eq!(
+            parse_bridge(&v),
+            Some(Bridge::Visualiser {
+                id: 3,
+                reason: "no_webgl2".into()
+            })
+        );
     }
 
     #[test]
