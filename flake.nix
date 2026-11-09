@@ -841,6 +841,15 @@
             runHook preInstall
             mkdir -p $out
             cp -r target/dx/pharos-ui-web/release/web/public/. $out/
+            # dx preloads the JS glue as a classic script, but loads it as a
+            # module; Firefox fetches it twice and warns the preload went
+            # unused. modulepreload is the matching hint (V890).
+            sed -i 's|<link rel="preload" as="script" \(href="[^"]*\.js"\) crossorigin>|<link rel="modulepreload" \1>|g' $out/index.html
+            if grep -q 'rel="preload" as="script"' $out/index.html \
+              || ! grep -q 'rel="modulepreload"' $out/index.html; then
+              echo "pharosUiBundle: index.html still preloads the JS glue as a classic script" >&2
+              exit 1
+            fi
             # dx logs a failed wasm-opt and carries on; DWARF left in the wasm
             # is the sign it never ran (V206).
             for wasm in $out/assets/*.wasm; do
