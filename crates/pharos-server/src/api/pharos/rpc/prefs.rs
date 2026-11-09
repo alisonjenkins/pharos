@@ -27,7 +27,7 @@ pub(super) const DESCRIPTION_LANGUAGE: &str = "description.language";
 /// Absent means the user has seen none.
 pub(super) const WHATS_NEW_SEEN: &str = "whats_new.seen";
 
-/// The user's saved mixes (spec 024, B898): one capnp `SavedMixes` message
+/// The user's saved mixes (spec 024, B902): one capnp `SavedMixes` message
 /// the client writes whole. Must match `pharos_client::mix::SAVED_KEY`.
 pub(super) const MIX_SAVED: &str = "mix.saved";
 

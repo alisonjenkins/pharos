@@ -1595,7 +1595,7 @@ fn NativeApp(route: Route) -> Element {
     use_context_provider(|| MixCtx(mix));
     // Bumped when a saved mix is stored, so every list of them reloads.
     use_context_provider(|| mixes::SavedRev(Signal::new(0)));
-    // Whether the queue is docked beside the compact player (B896).
+    // Whether the queue is docked beside the compact player (B900).
     use_context_provider(|| QueueDock(Signal::new(super::listen::dock_shown())));
     mixes::use_top_up(api, queue, mix);
     use_context_provider(|| {
@@ -5544,7 +5544,7 @@ fn Player(
         }
     };
     let compact = view != View::Full;
-    // The queue docked beside the compact player (B896/V845), shared by the
+    // The queue docked beside the compact player (B900/V849), shared by the
     // stage's players so a song handing over keeps it open.
     let own_dock = use_signal(|| false);
     let mut dock = try_use_context::<QueueDock>().map_or(own_dock, |d| d.0);

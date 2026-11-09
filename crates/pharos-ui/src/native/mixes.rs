@@ -53,7 +53,7 @@ pub struct ActiveMix {
 
 /// Counts the saved-mix lists stored this session, provided at the app's
 /// root: a list shown elsewhere (the Playlists tab) reloads when it moves,
-/// so a mix saved or deleted from the queue panel shows there too (B897).
+/// so a mix saved or deleted from the queue panel shows there too (B901).
 #[derive(Clone, Copy)]
 pub struct SavedRev(pub Signal<u32>);
 
@@ -638,7 +638,7 @@ pub fn MixBar(playing: Option<ItemRef>) -> Element {
     }
 }
 
-/// Where a mix on a music library's Playlists tab comes from (B897/V846).
+/// Where a mix on a music library's Playlists tab comes from (B901/V850).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShelfKind {
     /// One every first-party client offers.
@@ -720,7 +720,7 @@ pub fn describe(spec: &MixSpec) -> String {
         .join(" · ")
 }
 
-/// A music library's Playlists tab (B897/V846): every mix the listener can
+/// A music library's Playlists tab (B901/V850): every mix the listener can
 /// start, presets first, then their saved ones. A tile starts its mix and
 /// opens the player on the first song, so a mix is picked before the
 /// player, not only from its queue panel.
@@ -1563,7 +1563,7 @@ mod tests {
         assert!(html.contains("This mix has run out of songs."), "{html}");
     }
 
-    /// B897/V846: the Playlists tab lists the presets first, then the
+    /// B901/V850: the Playlists tab lists the presets first, then the
     /// listener's saved mixes in their saved order.
     #[test]
     fn the_shelf_lists_presets_then_saved_mixes() {
@@ -1621,7 +1621,7 @@ mod tests {
         );
     }
 
-    /// B897/V846: every preset is on the Playlists tab before any player
+    /// B901/V850: every preset is on the Playlists tab before any player
     /// opens, each a button that says what it picks.
     #[test]
     fn the_playlists_tab_shows_every_preset_as_a_play_button() {

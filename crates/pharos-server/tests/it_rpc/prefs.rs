@@ -259,7 +259,7 @@ async fn whats_new_seen_holds_only_an_entry_number() {
     );
 }
 
-/// B898: the saved-mix list the native UI writes under the client's own
+/// B902: the saved-mix list the native UI writes under the client's own
 /// key is stored and read back whole. Disarm check: with `MIX_SAVED` taken
 /// off `ALLOWED_KEYS`, `set` is refused as an unknown key and this fails.
 #[actix_web::test]

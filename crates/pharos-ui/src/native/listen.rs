@@ -61,7 +61,7 @@ const QUEUE_SHOWN: &str = "shown";
 pub const QUEUE_PANEL_ID: &str = "pharos-queue";
 
 /// Device-local: whether the listener docked the queue beside the mini bar
-/// or floating window (B896/V845). It starts closed, so the page keeps the
+/// or floating window (B900/V849). It starts closed, so the page keeps the
 /// room.
 const DOCK_KEY: &str = "pharos.stage.queue";
 
@@ -183,7 +183,7 @@ pub fn ListenView(
     #[props(default)]
     compact: bool,
     /// This screen's slot is the one in sight. A song handing over mounts
-    /// two screens; only the one in sight draws the queue panel (V845).
+    /// two screens; only the one in sight draws the queue panel (V849).
     #[props(default = true)]
     in_sight: bool,
     /// The `<audio>` element's id: [`VIDEO_ID`], or another while this song
@@ -383,7 +383,7 @@ pub fn ListenView(
                 }
             }
             // Not while the screen is out of sight: the compact player docks
-            // its own (B896/V845), and two panels would share element ids.
+            // its own (B900/V849), and two panels would share element ids.
             if show_queue() && !compact && in_sight {
                 QueuePanel { queue: queue.clone(), shuffled, on_queue, playing }
             }

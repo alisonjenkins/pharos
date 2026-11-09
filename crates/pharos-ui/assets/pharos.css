@@ -4247,7 +4247,7 @@ body::before {
 .pharos-mix-new {
   color: var(--px-color-accent);
 }
-/* A music library's Playlists tab (B897/V846): one tile per mix. */
+/* A music library's Playlists tab (B901/V850): one tile per mix. */
 .pharos-mix-tiles {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(10rem, 1fr));
@@ -4495,7 +4495,7 @@ body:has(.pharos-stage.is-mini) .pharos-main {
   flex: 1;
   min-width: 0;
 }
-/* The queue docked beside the compact player (B896/V845): a panel on the
+/* The queue docked beside the compact player (B900/V849): a panel on the
    right, above the mini bar or along the right edge beside the floating
    window, so what plays next shows on every page. */
 .pharos-queue-dock {
@@ -4720,7 +4720,7 @@ body:has(.pharos-stage.is-mini) .pharos-main {
   }
 }
 /* The floating window sizes its own strip: resized narrow on a wide screen
-   (down to 240px), the queue button pushed Close out of the window (B896). */
+   (down to 240px), the queue button pushed Close out of the window (B900). */
 .pharos-stage.is-floating {
   container: pharos-stage / inline-size;
 }
