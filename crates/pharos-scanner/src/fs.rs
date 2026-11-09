@@ -599,10 +599,7 @@ impl<P: Prober> FsScanner<P> {
         let groups = group_editions(paths);
         // A file now grouped under another may still hold its own row from an
         // earlier pass; that row is swept, so its viewers' state moves first.
-        let folded: Vec<(PathBuf, PathBuf)> = groups
-            .iter()
-            .flat_map(|(primary, alts)| alts.iter().map(|(_, alt)| (alt.clone(), primary.clone())))
-            .collect();
+        let folded = folded_copies(&groups);
         let mut outcome = ScanOutcome::default();
         let mut seen = 0i64;
 
@@ -2106,56 +2103,105 @@ fn record_edition_drift(
     metrics::counter!("pharos_scan_reprobe_total", "reason" => reason.label()).increment(1);
 }
 
+/// A file grouped this pass as a version of `into`, whose own row (if it
+/// still has one) hands its viewers' state over before the sweep.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Fold {
+    copy: PathBuf,
+    into: Vec<PathBuf>,
+    resume: pharos_core::FoldResume,
+}
+
+/// Every file of `groups` that is a version of another and no item of its
+/// own, with each item it is now a version of. A file that is still an item
+/// (a double episode that is the primary of an episode no single covers)
+/// keeps its row and its state, so it folds nowhere: folding it each pass
+/// would re-mark an episode its viewer had marked unwatched. Resume carries
+/// only between files of the same episode span.
+fn folded_copies(groups: &[(PathBuf, Vec<(String, PathBuf)>)]) -> Vec<Fold> {
+    let items: HashSet<&Path> = groups.iter().map(|(p, _)| p.as_path()).collect();
+    let mut folds: BTreeMap<&Path, Vec<&Path>> = BTreeMap::new();
+    for (primary, alts) in groups {
+        for (_, alt) in alts {
+            if !items.contains(alt.as_path()) {
+                folds.entry(alt).or_default().push(primary);
+            }
+        }
+    }
+    folds
+        .into_iter()
+        .map(|(copy, into)| {
+            let span = |p: &Path| episode_copy_key(p).map(|(_, _, first, last)| (first, last));
+            let same_span = into.iter().all(|p| span(p) == span(copy));
+            Fold {
+                copy: copy.to_path_buf(),
+                into: into.into_iter().map(Path::to_path_buf).collect(),
+                resume: if same_span {
+                    pharos_core::FoldResume::Carry
+                } else {
+                    pharos_core::FoldResume::Drop
+                },
+            }
+        })
+        .collect()
+}
+
 /// Settle each file now grouped as a version of another before the sweep.
-/// When the primary was written this pass, the copy's old row hands each
-/// viewer's played, resume and favourite state to it (idempotent: the store
-/// keeps the furthest state) and is then swept. When it was not (its probe
-/// failed, or it is known bad), the copy keeps its own row, so a playable
-/// copy never vanishes behind an unplayable primary.
+/// When every item it is now a version of was written this pass, the copy's
+/// old row hands each viewer's played, resume and favourite state to each of
+/// them (idempotent: the store keeps the furthest state) and is then swept.
+/// When one was not (its probe failed, or it is known bad), the copy keeps
+/// its own row, so a playable copy never vanishes behind an unplayable
+/// primary.
 async fn settle_copies<S: MediaStore>(
     store: &S,
     scan_id: i64,
-    folded: &[(PathBuf, PathBuf)],
+    folded: &[Fold],
 ) -> DomainResult<()> {
-    for (alt, primary) in folded {
-        let Some(from) = store.id_at_path(alt).await? else {
+    for fold in folded {
+        let Some(from) = store.id_at_path(&fold.copy).await? else {
             continue;
         };
-        let into = match store.id_at_path(primary).await? {
-            Some(into) => store
-                .scan_state(into)
-                .await?
-                .filter(|s| s.last_seen_scan_id == scan_id)
-                .map(|_| into),
-            None => None,
-        };
-        match into {
-            Some(into) if into != from => {
-                store
-                    .merge_user_data(from, into, pharos_core::FoldResume::Carry)
-                    .await?;
-                tracing::info!(
-                    from = %from,
-                    into = %into,
-                    version = %alt.display(),
-                    "folded a copy's row into the item it is now a version of",
-                );
+        let mut written = Vec::with_capacity(fold.into.len());
+        let mut unwritten = None;
+        for primary in &fold.into {
+            let into = match store.id_at_path(primary).await? {
+                Some(into) => store
+                    .scan_state(into)
+                    .await?
+                    .filter(|s| s.last_seen_scan_id == scan_id)
+                    .map(|_| into),
+                None => None,
+            };
+            match into {
+                Some(into) => written.push(into),
+                None => unwritten = Some(primary),
             }
-            Some(_) => {}
-            None => {
-                let Ok(meta) = tokio::fs::metadata(alt).await else {
-                    continue;
-                };
-                store
-                    .mark_seen(from, scan_id, mtime_secs(&meta), meta.len())
-                    .await?;
-                tracing::warn!(
-                    row = %from,
-                    version = %alt.display(),
-                    primary = %primary.display(),
-                    "kept a copy as its own item: the file it groups under was not written this pass",
-                );
-            }
+        }
+        if let Some(primary) = unwritten {
+            let Ok(meta) = tokio::fs::metadata(&fold.copy).await else {
+                continue;
+            };
+            store
+                .mark_seen(from, scan_id, mtime_secs(&meta), meta.len())
+                .await?;
+            tracing::warn!(
+                row = %from,
+                version = %fold.copy.display(),
+                primary = %primary.display(),
+                "kept a copy as its own item: the file it groups under was not written this pass",
+            );
+            continue;
+        }
+        for into in written.into_iter().filter(|into| *into != from) {
+            store.merge_user_data(from, into, fold.resume).await?;
+            tracing::info!(
+                from = %from,
+                into = %into,
+                version = %fold.copy.display(),
+                resume = ?fold.resume,
+                "folded a copy's row into the item it is now a version of",
+            );
         }
     }
     Ok(())
@@ -2168,6 +2214,12 @@ async fn settle_copies<S: MediaStore>(
 /// remain stand-alone items (the edition tag is preserved in the
 /// title).
 pub(crate) fn group_editions(paths: Vec<PathBuf>) -> Vec<(PathBuf, Vec<(String, PathBuf)>)> {
+    group_episode_copies(group_by_edition(paths))
+}
+
+/// P41's half of [`group_editions`]: editions under their primaries, before
+/// copies of one episode are folded together.
+fn group_by_edition(paths: Vec<PathBuf>) -> Vec<(PathBuf, Vec<(String, PathBuf)>)> {
     // Index primaries by (parent_dir, lowercase_title). BTreeMap so
     // iteration order is deterministic, which matters for tests +
     // for the deterministic stable_id seed.
@@ -2220,47 +2272,117 @@ pub(crate) fn group_editions(paths: Vec<PathBuf>) -> Vec<(PathBuf, Vec<(String, 
     for path in orphan_alts {
         out.push((path, Vec::new()));
     }
-    group_episode_copies(out)
+    out
 }
 
+/// A span longer than this is a misparse (`S01E01-E99`), not a file that
+/// holds that many episodes, so it is left out of copy grouping.
+const MAX_EPISODE_SPAN: u32 = 8;
+
+/// `(show folder, season, first episode, last episode)` of an episode file.
+type EpisodeSpan = (String, u32, u32, u32);
+
+/// A primary file and its `(label, path)` versions.
+type Group = (PathBuf, Vec<(String, PathBuf)>);
+
 /// Fold copies of one episode into a single group: files under the same show
-/// folder that parse to the same season and episode span (`Season 01` and
-/// `Season 1` both holding S01E02, or a `.avi` beside its `.mkv` re-rip). The
-/// best-ranked file stays primary; the others become versions labelled by what
-/// tells them apart in their names. A 2D file always outranks a 3D one (V721).
+/// folder that cover the same season and episode (`Season 01` and `Season 1`
+/// both holding S01E02, a `.avi` beside its `.mkv` re-rip, or a double
+/// `S01E01-E02` beside a single `S01E01`). A file spanning several episodes is
+/// a copy of each one it covers. Each episode's best-ranked file is its
+/// primary (see [`CopyRank`]); the others become its versions, labelled by
+/// what tells them apart in their names. A file stays its own item while it is
+/// the primary of any episode it covers, so a double with a single for E01 but
+/// none for E02 is a version of E01 and the item for E02 (V721, V844).
 fn group_episode_copies(
     groups: Vec<(PathBuf, Vec<(String, PathBuf)>)>,
 ) -> Vec<(PathBuf, Vec<(String, PathBuf)>)> {
-    type Key = (String, u32, u32, u32);
-    type Group = (PathBuf, Vec<(String, PathBuf)>);
-    let mut by_episode: BTreeMap<Key, Vec<Group>> = BTreeMap::new();
-    let mut out = Vec::with_capacity(groups.len());
-    for group in groups {
-        match episode_copy_key(&group.0) {
-            Some(key) => by_episode.entry(key).or_default().push(group),
-            None => out.push(group),
+    let spans: Vec<Option<EpisodeSpan>> = groups.iter().map(|g| episode_copy_key(&g.0)).collect();
+    let mut by_episode: BTreeMap<(String, u32, u32), Vec<usize>> = BTreeMap::new();
+    for (i, span) in spans.iter().enumerate() {
+        if let Some((show, season, first, last)) = span {
+            for episode in *first..=*last {
+                by_episode
+                    .entry((show.clone(), *season, episode))
+                    .or_default()
+                    .push(i);
+            }
         }
     }
-    for mut copies in by_episode.into_values() {
-        copies.sort_by(|a, b| {
-            copy_rank(&a.0)
-                .cmp(&copy_rank(&b.0))
-                .then_with(|| a.0.cmp(&b.0))
-        });
-        let mut copies = copies.into_iter();
-        let Some((primary, mut alts)) = copies.next() else {
+    // Each episode's primary, and the copies it gathers in episode order.
+    let mut is_item = vec![false; groups.len()];
+    let mut gathered: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    for ((show, season, episode), members) in &by_episode {
+        let rank = |i: &usize| {
+            let span = spans.get(*i).and_then(Option::as_ref);
+            let path = groups.get(*i).map(|g| g.0.as_path());
+            (CopyRank::of(path, span), *i)
+        };
+        if let [only] = members.as_slice() {
+            if let Some(flag) = is_item.get_mut(*only) {
+                *flag = true;
+            }
+            continue;
+        }
+        let Some(&primary) = members.iter().min_by_key(|i| rank(i)) else {
             continue;
         };
-        for (path, editions) in copies {
-            let label = copy_label(&primary, &path);
+        if let Some(flag) = is_item.get_mut(primary) {
+            *flag = true;
+        }
+        let ranked: Vec<_> = members.iter().map(rank).collect();
+        let decided_by = CopyRank::decided_by(&ranked);
+        metrics::counter!("pharos_scan_copy_primary_total", "decided_by" => decided_by.label())
+            .increment(1);
+        tracing::debug!(
+            show = %show,
+            season,
+            episode,
+            primary = %groups.get(primary).map_or_else(String::new, |g| g.0.display().to_string()),
+            decided_by = decided_by.label(),
+            candidates = ?ranked.iter().map(|(r, i)| (groups.get(*i).map(|g| g.0.display().to_string()), r)).collect::<Vec<_>>(),
+            "chose the primary of an episode's copies",
+        );
+        let entry = gathered.entry(primary).or_default();
+        for &member in members {
+            if member != primary && !entry.contains(&member) {
+                entry.push(member);
+            }
+        }
+    }
+    let mut out = Vec::with_capacity(groups.len());
+    let mut taken: Vec<Option<Group>> = groups.into_iter().map(Some).collect();
+    let paths: Vec<PathBuf> = taken
+        .iter()
+        .map(|g| g.as_ref().map(|g| g.0.clone()).unwrap_or_default())
+        .collect();
+    for i in 0..taken.len() {
+        let covered = spans.get(i).is_some_and(Option::is_some);
+        if covered && !is_item.get(i).copied().unwrap_or(false) {
+            continue;
+        }
+        let Some((primary, mut alts)) = taken.get_mut(i).and_then(Option::take) else {
+            continue;
+        };
+        for &copy in gathered.get(&i).map(Vec::as_slice).unwrap_or_default() {
+            let Some(path) = paths.get(copy) else {
+                continue;
+            };
+            let label = copy_label(&primary, path);
             tracing::debug!(
                 primary = %primary.display(),
                 copy = %path.display(),
                 label = %label,
                 "grouped a copy of an episode as a version",
             );
-            alts.push((label, path));
-            alts.extend(editions);
+            alts.push((label, path.clone()));
+            // A copy that is no item of its own brings its editions along,
+            // to the first item it folds into.
+            if !is_item.get(copy).copied().unwrap_or(false) {
+                if let Some((_, editions)) = taken.get_mut(copy).and_then(Option::take) {
+                    alts.extend(editions);
+                }
+            }
         }
         out.push((primary, alts));
     }
@@ -2269,7 +2391,7 @@ fn group_episode_copies(
 
 /// `(show folder, season, first episode, last episode)` for an episode file
 /// whose name carries both numbers; `None` keeps the file out of copy grouping.
-fn episode_copy_key(path: &Path) -> Option<(String, u32, u32, u32)> {
+fn episode_copy_key(path: &Path) -> Option<EpisodeSpan> {
     if !is_episode_path(path) {
         return None;
     }
@@ -2279,6 +2401,9 @@ fn episode_copy_key(path: &Path) -> Option<(String, u32, u32, u32)> {
     let last = episode_span_end(name)
         .filter(|l| *l > first)
         .unwrap_or(first);
+    if last.saturating_sub(first) >= MAX_EPISODE_SPAN {
+        return None;
+    }
     Some((info.series_folder?, info.season_number?, first, last))
 }
 
@@ -2298,32 +2423,93 @@ fn episode_span_end(name: &str) -> Option<u32> {
         .ok()
 }
 
-/// Lower ranks first: a 2D file before a 3D one (so a 3D copy never becomes the
-/// primary over a 2D copy), then containers that direct-play broadly before
-/// legacy ones.
-fn copy_rank(path: &Path) -> (u8, u8) {
-    let stem = path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or_default();
-    let is_3d = crate::metadata::filename::parse_video_3d_format(stem)
-        .0
-        .is_some()
-        || split_edition_tag(stem)
-            .and_then(|(_, edition)| parse_3d_edition(edition))
-            .is_some();
-    let ext = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(str::to_ascii_lowercase);
-    let container = match ext.as_deref() {
-        Some("mkv") => 0,
-        Some("mp4") => 1,
-        Some("m4v") => 2,
-        Some("webm") => 3,
-        _ => 4,
-    };
-    (u8::from(is_3d), container)
+/// How one copy of an episode ranks for its primary, best first: a 2D file
+/// before a 3D one (so a 3D copy never becomes the primary over a 2D copy), a
+/// file of just that episode before one spanning several (it starts where the
+/// episode does), then containers that direct-play broadly before legacy
+/// ones, then the path.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct CopyRank {
+    is_3d: bool,
+    spans_more: bool,
+    container: u8,
+    path: PathBuf,
+}
+
+/// Which rule chose an episode's primary: the `decided_by` values of
+/// `pharos_scan_copy_primary_total`, a dashboard contract: do not rename them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CopyDecision {
+    TwoD,
+    SingleEpisode,
+    Container,
+    Path,
+}
+
+impl CopyDecision {
+    #[cfg(test)]
+    pub(crate) const ALL: [Self; 4] =
+        [Self::TwoD, Self::SingleEpisode, Self::Container, Self::Path];
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::TwoD => "2d",
+            Self::SingleEpisode => "single_episode",
+            Self::Container => "container",
+            Self::Path => "path",
+        }
+    }
+}
+
+impl CopyRank {
+    fn of(path: Option<&Path>, span: Option<&EpisodeSpan>) -> Self {
+        let path = path.unwrap_or_else(|| Path::new(""));
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default();
+        let is_3d = crate::metadata::filename::parse_video_3d_format(stem)
+            .0
+            .is_some()
+            || split_edition_tag(stem)
+                .and_then(|(_, edition)| parse_3d_edition(edition))
+                .is_some();
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(str::to_ascii_lowercase);
+        let container = match ext.as_deref() {
+            Some("mkv") => 0,
+            Some("mp4") => 1,
+            Some("m4v") => 2,
+            Some("webm") => 3,
+            _ => 4,
+        };
+        Self {
+            is_3d,
+            spans_more: span.is_some_and(|(_, _, first, last)| last > first),
+            container,
+            path: path.to_path_buf(),
+        }
+    }
+
+    /// The first rule on which the best of `ranked` beats the runner-up.
+    fn decided_by<T>(ranked: &[(Self, T)]) -> CopyDecision {
+        let mut sorted: Vec<&Self> = ranked.iter().map(|(r, _)| r).collect();
+        sorted.sort();
+        let (Some(best), Some(next)) = (sorted.first(), sorted.get(1)) else {
+            return CopyDecision::Path;
+        };
+        if best.is_3d != next.is_3d {
+            CopyDecision::TwoD
+        } else if best.spans_more != next.spans_more {
+            CopyDecision::SingleEpisode
+        } else if best.container != next.container {
+            CopyDecision::Container
+        } else {
+            CopyDecision::Path
+        }
+    }
 }
 
 /// What sets `copy` apart from `primary` by name: the differing tail of the
@@ -6664,17 +6850,142 @@ mod tests {
     }
 
     #[test]
-    fn different_episodes_shows_and_spans_stay_apart() {
+    fn different_episodes_shows_and_seasons_stay_apart() {
         let groups = group_editions(vec![
             PathBuf::from("/tv/Foo/Season 01/Foo S01E01.mkv"),
-            PathBuf::from("/tv/Foo/Season 01/Foo S01E01-E02.mkv"),
             PathBuf::from("/tv/Foo/Season 01/Foo S01E02.mkv"),
             PathBuf::from("/tv/Foo/Season 02/Foo S02E01.mkv"),
             PathBuf::from("/tv/Bar/Season 01/Bar S01E01.mkv"),
             PathBuf::from("/films/Heat (1995).mkv"),
         ]);
-        assert_eq!(groups.len(), 6);
+        assert_eq!(groups.len(), 5);
         assert!(groups.iter().all(|(_, alts)| alts.is_empty()));
+    }
+
+    fn group_of<'a>(
+        groups: &'a [(PathBuf, Vec<(String, PathBuf)>)],
+        primary: &Path,
+    ) -> Option<&'a [(String, PathBuf)]> {
+        groups
+            .iter()
+            .find(|(p, _)| p == primary)
+            .map(|(_, alts)| alts.as_slice())
+    }
+
+    fn alt_paths(alts: &[(String, PathBuf)]) -> Vec<&Path> {
+        alts.iter().map(|(_, p)| p.as_path()).collect()
+    }
+
+    /// V844: a double episode is a copy of each episode it covers. With a
+    /// single for E01 and none for E02, it is a version of E01 and stays the
+    /// item that holds E02.
+    #[test]
+    fn a_double_episode_is_a_version_of_each_episode_it_covers() {
+        let e01 = PathBuf::from("/tv/Foo/Season 01/Foo S01E01.mkv");
+        let double = PathBuf::from("/tv/Foo/Season 01/Foo S01E01-E02.mkv");
+        let groups = group_editions(vec![e01.clone(), double.clone()]);
+        assert_eq!(groups.len(), 2, "{groups:?}");
+        assert_eq!(
+            group_of(&groups, &e01).map(alt_paths),
+            Some(vec![double.as_path()])
+        );
+        assert_eq!(group_of(&groups, &double), Some(&[][..]));
+        assert!(
+            folded_copies(&groups).is_empty(),
+            "a double that is still an item keeps its row and its state"
+        );
+    }
+
+    /// V844: with a single for both episodes the double is no item of its
+    /// own: it is a version of both, and its row folds into each without its
+    /// resume point, which is in the double's timeline.
+    #[test]
+    fn a_double_with_both_singles_folds_into_both() {
+        let e01 = PathBuf::from("/tv/Foo/Season 01/Foo S01E01.mkv");
+        let e02 = PathBuf::from("/tv/Foo/Season 01/Foo S01E02.mkv");
+        let double = PathBuf::from("/tv/Foo/Season 01/Foo S01E01-E02 Bluray-2160p.mkv");
+        let groups = group_editions(vec![double.clone(), e01.clone(), e02.clone()]);
+        assert_eq!(groups.len(), 2, "{groups:?}");
+        assert_eq!(
+            group_of(&groups, &e01).map(alt_paths),
+            Some(vec![double.as_path()])
+        );
+        assert_eq!(
+            group_of(&groups, &e02).map(alt_paths),
+            Some(vec![double.as_path()])
+        );
+        assert_eq!(
+            folded_copies(&groups),
+            vec![Fold {
+                copy: double,
+                into: vec![e01, e02],
+                resume: pharos_core::FoldResume::Drop,
+            }]
+        );
+    }
+
+    /// A single episode stays primary over a better double: the double starts
+    /// at the episode before, and is offered as a version.
+    #[test]
+    fn a_single_episode_outranks_a_better_double() {
+        let single = PathBuf::from("/tv/Foo/Season 01/Foo S01E02 HDTV-480p.avi");
+        let double = PathBuf::from("/tv/Foo/Season 01/Foo S01E01-E02 Bluray-2160p.mkv");
+        let groups = group_editions(vec![double.clone(), single.clone()]);
+        assert_eq!(
+            group_of(&groups, &single).map(alt_paths),
+            Some(vec![double.as_path()])
+        );
+    }
+
+    /// The `decided_by` labels are a dashboard contract: stable and distinct.
+    #[test]
+    fn copy_decision_labels_are_distinct() {
+        let labels: HashSet<&str> = CopyDecision::ALL.iter().map(|d| d.label()).collect();
+        assert_eq!(labels.len(), CopyDecision::ALL.len());
+    }
+
+    /// Each episode with several copies records which rule chose its
+    /// primary, so a dashboard can tell a quality pick from a tie broken by
+    /// path.
+    #[test]
+    fn choosing_a_primary_counts_the_rule_that_decided() {
+        use metrics_util::debugging::DebuggingRecorder;
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = pharos_test_metrics::snapshotter(&recorder);
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        group_editions(vec![
+            PathBuf::from("/tv/Foo/Season 01/Foo S01E03.mkv"),
+            PathBuf::from("/tv/Foo/Season 1/Foo S01E03.mkv"),
+            PathBuf::from("/tv/Foo/Season 01/Foo S01E04.mkv"),
+            PathBuf::from("/tv/Foo/Season 1/Foo S01E04.avi"),
+            PathBuf::from("/tv/Foo/Season 01/Foo S01E05.mkv"),
+        ]);
+        let mut seen: Vec<(String, u64)> = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter_map(|(k, _, _, value)| {
+                let key = k.key();
+                let metrics_util::debugging::DebugValue::Counter(n) = value else {
+                    return None;
+                };
+                (key.name() == "pharos_scan_copy_primary_total").then(|| {
+                    let label = key
+                        .labels()
+                        .find(|l| l.key() == "decided_by")
+                        .map(|l| l.value().to_string())
+                        .unwrap_or_default();
+                    (label, n)
+                })
+            })
+            .collect();
+        seen.sort();
+        assert_eq!(
+            seen,
+            [("container".to_string(), 1), ("path".to_string(), 1)],
+            "one count per episode with copies, none for a lone episode"
+        );
     }
 
     /// V721: a 3D copy never becomes the primary over a 2D copy, even when
@@ -6716,6 +7027,55 @@ mod tests {
             *store.merged.lock().unwrap(),
             vec![(old_id, item.id, pharos_core::FoldResume::Carry)]
         );
+    }
+
+    /// V844: a double that is still the item for E02 keeps its row and is
+    /// never folded into E01, so E01's state is its own.
+    #[tokio::test]
+    async fn a_double_that_is_still_an_item_keeps_its_row() {
+        let td = TempDir::new().unwrap();
+        write_file(td.path(), "Show/Season 01/Show S01E01-E02.mkv", b"double").await;
+        let store = MemStore::default();
+        let scanner = FsScanner::new(FakeProber::default());
+        scanner.scan_into(td.path(), &store).await.unwrap();
+        write_file(td.path(), "Show/Season 01/Show S01E01.mkv", b"single").await;
+        scanner.scan_into(td.path(), &store).await.unwrap();
+        scanner.scan_into(td.path(), &store).await.unwrap();
+
+        let items = store.list().await.unwrap();
+        assert_eq!(items.len(), 2, "{items:?}");
+        let single = items
+            .iter()
+            .find(|i| i.path.ends_with("Show S01E01.mkv"))
+            .unwrap();
+        assert_eq!(single.probe.alternate_sources.len(), 1);
+        assert!(single.probe.alternate_sources[0]
+            .path
+            .ends_with("Show S01E01-E02.mkv"));
+        assert!(store.merged.lock().unwrap().is_empty());
+    }
+
+    /// V844: once both episodes have a single, the double's row folds into
+    /// each of them without its resume point, and is swept.
+    #[tokio::test]
+    async fn a_double_with_both_singles_hands_its_state_to_both() {
+        let td = TempDir::new().unwrap();
+        write_file(td.path(), "Show/Season 01/Show S01E01-E02.mkv", b"double").await;
+        let store = MemStore::default();
+        let scanner = FsScanner::new(FakeProber::default());
+        scanner.scan_into(td.path(), &store).await.unwrap();
+        let double = store.list().await.unwrap()[0].id;
+        write_file(td.path(), "Show/Season 01/Show S01E01.mkv", b"single one").await;
+        write_file(td.path(), "Show/Season 01/Show S01E02.mkv", b"single two").await;
+        scanner.scan_into(td.path(), &store).await.unwrap();
+
+        let items = store.list().await.unwrap();
+        assert_eq!(items.len(), 2, "the double's own row is swept: {items:?}");
+        let merged = store.merged.lock().unwrap().clone();
+        assert_eq!(merged.len(), 2, "{merged:?}");
+        assert!(merged.iter().all(|(from, into, resume)| *from == double
+            && items.iter().any(|i| i.id == *into)
+            && *resume == pharos_core::FoldResume::Drop));
     }
 
     #[tokio::test]
