@@ -2357,11 +2357,7 @@ fn record_edition_drift(
 /// video that [`is_episode_path`] does not already call an episode, so the
 /// row read happens only for the few files the rule changed.
 async fn kind_drift<S: MediaStore>(store: &S, row: MediaId, primary: &Path) -> bool {
-    let video = primary
-        .extension()
-        .and_then(|e| e.to_str())
-        .is_some_and(|e| FILM_EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()));
-    if !video || is_episode_path(primary) || show_folder_of(primary).is_none() {
+    if is_episode_path(primary) || !is_show_folder_video(primary) {
         return false;
     }
     let stored = match store.get(row).await {
@@ -4013,6 +4009,15 @@ pub(crate) fn forget_show_nfos() {
 /// ([`is_episode_path`]), or by the show folder it sits in.
 pub fn is_episode_file(path: &Path) -> bool {
     is_episode_path(path) || show_folder_of(path).is_some()
+}
+
+/// A video that is an episode only by the show folder above it.
+pub(crate) fn is_show_folder_video(path: &Path) -> bool {
+    let video = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| FILM_EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()));
+    video && show_folder_of(path).is_some()
 }
 
 /// A folder of a show's bonus material (`Extras`, `Chuck Extras`,
