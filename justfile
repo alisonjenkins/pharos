@@ -304,6 +304,8 @@ compat-dioxus-full native="on" port="8096" config="playwright.dioxus.config.ts":
     mkdir -p "$TMP/media/Stereo" "$TMP/media/TV/Playwright Show/Season 1"
     ln "$TMP/media/06-test-av-confirm.webm" "$TMP/media/Stereo/Stereo Film (2009).webm"
     ln "$TMP/media/06-test-av-confirm.webm" "$TMP/media/Stereo/Stereo Film (2009) - 3D.HSBS.webm"
+    # A lone full side-by-side film, for the one-eye crop's aspect (V920).
+    ln "$TMP/media/06-test-av-confirm.webm" "$TMP/media/Stereo/Stereo Wide (2011) - 3D.FSBS.webm"
     cp "$TMP/media/TV/Playwright Show/Season 01/Playwright Show - S01E02.webm" \
       "$TMP/media/TV/Playwright Show/Season 1/Playwright Show - S01E02.webm"
     echo "compat-dioxus-full: ui bundle $UI_SRC, served from $UI_DIR"
