@@ -290,3 +290,84 @@ async fn detail_carries_the_cast_and_a_series_ranks_its_regulars() {
     // img.example is not a provider host: the CSP would block its redirect.
     assert_eq!(series.cast[1].image_url, None);
 }
+
+/// A person's page as the UI reads it from a cast credit: the credit names
+/// the person, and their page lists the film and the show's episodes they act
+/// in, with who they play, leaving out what they only directed. An id that
+/// names nobody is refused as not found.
+/// Disarm check: with `write_cast` not setting `personId`, `lead.person` is
+/// `None` and the page cannot be asked for.
+#[actix_web::test]
+async fn a_cast_credit_opens_the_page_of_what_that_person_appears_in() {
+    use pharos_client::api::CreditKind;
+    use pharos_core::{PersonKind, PersonRef, PersonStore as _};
+
+    let (api, fx, _server) = api().await;
+    crate::library::seed_tv_library(&fx).await;
+    let call = CallInfo::default();
+    let acting = |kind, character: &str| PersonRef {
+        name: "Lead Actor".into(),
+        kind,
+        character: Some(character.into()),
+        ..PersonRef::default()
+    };
+    let directing = PersonRef {
+        name: "Lead Actor".into(),
+        kind: PersonKind::Director,
+        role: Some("Director".into()),
+        ..PersonRef::default()
+    };
+    let links = [
+        (101, vec![acting(PersonKind::Actor, "Pilot")]),
+        (102, vec![directing]),
+        (602, vec![acting(PersonKind::Actor, "Captain")]),
+        (601, vec![acting(PersonKind::GuestStar, "Captain")]),
+    ];
+    for (id, people) in links {
+        fx.state.stores.link_item_people(id, &people).await.unwrap();
+    }
+
+    let episode = api
+        .detail(&call, ItemRef::Real(602))
+        .await
+        .expect("episode");
+    let lead = episode.cast.first().expect("lead credit");
+    let id = lead.person.expect("the credit names the person");
+
+    let page = api.person(&call, id).await.expect("person");
+    assert_eq!(page.name, "Lead Actor");
+    assert_eq!(page.id, Some(id));
+    let films: Vec<_> = page
+        .films
+        .iter()
+        .map(|f| (f.item.name.as_str(), f.character.as_str()))
+        .collect();
+    assert_eq!(films, [("Alpha", "Pilot")], "Beta is only directed");
+    let [show] = page.shows.as_slice() else {
+        panic!("one show: {:?}", page.shows);
+    };
+    assert_eq!(show.series.name, "Show");
+    assert_eq!(show.series.kind, ItemKind::Series);
+    assert_eq!(show.characters, ["Captain"]);
+    let episodes: Vec<_> = show.episodes.iter().map(|e| (e.item.id, e.kind)).collect();
+    assert_eq!(
+        episodes,
+        [
+            (ItemRef::Real(601), CreditKind::GuestStar),
+            (ItemRef::Real(602), CreditKind::Actor),
+        ]
+    );
+
+    let nobody = pharos_core::person_wire_id("Nobody At All");
+    let nobody = pharos_jellyfin_api::dto::WireId::parse(&nobody).expect("wire id");
+    let pharos_jellyfin_api::dto::WireId::Synth(n) = nobody else {
+        panic!("a person's id is synthesised");
+    };
+    for nobody in [ItemRef::Synth(n), ItemRef::Real(101)] {
+        let err = api.person(&call, nobody).await.unwrap_err();
+        assert!(
+            matches!(&err, ClientError::Api { kind, .. } if *kind == "notFound"),
+            "{nobody}: {err:?}"
+        );
+    }
+}
