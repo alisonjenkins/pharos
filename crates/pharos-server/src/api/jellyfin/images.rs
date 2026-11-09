@@ -867,33 +867,36 @@ pub(crate) async fn resolve_synth_image_item(
     match state.synth_image_cached(id_str) {
         Some(Some(item_id)) => match state.stores.get(item_id).await {
             Ok(item) => return Some(item),
-            Err(error) => stale = Some((item_id, error)),
+            Err(pharos_core::DomainError::NotFound(_)) => stale = Some(item_id),
+            Err(error) => {
+                tracing::warn!(synth_id = id_str, item_id, %error, "could not load a group's image representative");
+                return None;
+            }
         },
         Some(None) => return None,
         None => {}
     }
     // A memoised representative outlives the library generation, so a scan
     // that folds or sweeps its row leaves the tile blank until it is re-picked.
-    if let Some((item_id, error)) = stale {
+    if let Some(item_id) = stale {
         tracing::info!(
             synth_id = id_str,
             item_id,
-            %error,
             "re-picked a group's image representative: its memoised row is gone",
         );
         metrics::counter!("pharos_synth_image_repick_total").increment(1);
-        state.synth_image_forget(id_str);
+        state.synth_image_forget(id_str, item_id);
     }
     // Cold miss: warm the ENTIRE synth-id → representative map in one scan,
     // serialised so a grid's burst of concurrent poster requests doesn't each
     // run its own multi-second `list()`. Peers wait here, then hit the memo.
     let mut confirmed_at = state.synth_image_warm.lock().await;
     match state.synth_image_cached(id_str) {
-        Some(Some(item_id)) => {
-            if let Ok(item) = state.stores.get(item_id).await {
-                return Some(item);
-            }
-        }
+        Some(Some(item_id)) => match state.stores.get(item_id).await {
+            Ok(item) => return Some(item),
+            Err(pharos_core::DomainError::NotFound(_)) => state.synth_image_forget(id_str, item_id),
+            Err(_) => return None,
+        },
         Some(None) => return None,
         None => {}
     }

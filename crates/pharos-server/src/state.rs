@@ -552,12 +552,16 @@ impl AppState {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// Drop one memoised synth-id resolution, so the next lookup re-picks it.
-    pub fn synth_image_forget(&self, id: &str) {
-        self.synth_image_ids
+    /// Drop a memoised synth-id resolution to `item_id`, so the next lookup
+    /// re-picks it; a newer pick made meanwhile is kept.
+    pub fn synth_image_forget(&self, id: &str, item_id: u64) {
+        let mut map = self
+            .synth_image_ids
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(id);
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if map.get(id) == Some(&Some(item_id)) {
+            map.remove(id);
+        }
     }
 
     /// Record a synth-id → representative item id resolution.
