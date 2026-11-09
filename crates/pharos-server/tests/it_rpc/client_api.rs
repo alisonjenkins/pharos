@@ -560,7 +560,8 @@ async fn a_3d_edition_is_badged_listed_filtered_and_played() {
 async fn versions_describe_their_files_and_show_paths_to_admins_only() {
     use pharos_client::api::VersionAudio;
     use pharos_core::{
-        AlternateMediaSource, AudioTrack, MediaItem, MediaKind, MediaProbe, SubtitleTrack,
+        AlternateMediaSource, AudioTrack, MediaItem, MediaKind, MediaProbe, PictureArea,
+        PictureCheck, SubtitleTrack,
     };
 
     const EPISODE: u64 = 311;
@@ -574,6 +575,15 @@ async fn versions_describe_their_files_and_show_paths_to_admins_only() {
         container: Some("mkv".into()),
         size_bytes: Some(9_000),
         duration_ms: Some(1_441_000),
+        picture_check: Some(PictureCheck {
+            version: 1,
+            area: Some(PictureArea {
+                x: 0,
+                y: 138,
+                width: 3840,
+                height: 1884,
+            }),
+        }),
         audio_tracks: vec![
             AudioTrack {
                 codec: Some("eac3".into()),
@@ -639,6 +649,22 @@ async fn versions_describe_their_files_and_show_paths_to_admins_only() {
     )
     .await
     .unwrap();
+    pharos_core::MediaStore::put_picture_check(
+        &fx.state.stores,
+        EPISODE,
+        PictureCheck {
+            version: 1,
+            area: Some(PictureArea {
+                x: 242,
+                y: 0,
+                width: 1436,
+                height: 1080,
+            }),
+        },
+        (1, 1),
+    )
+    .await
+    .unwrap();
     pharos_core::LibraryStore::backfill_library_ids(&fx.state.stores)
         .await
         .unwrap();
@@ -698,6 +724,18 @@ async fn versions_describe_their_files_and_show_paths_to_admins_only() {
         (primary.duration_ms, copy.duration_ms, avi.duration_ms),
         (1_400_000, 1_441_000, 1_399_000)
     );
+    // Where the picture sits, for the player to crop to; none where unchecked.
+    let area = |x, y, width, height| {
+        Some(pharos_client::api::PictureArea {
+            x,
+            y,
+            width,
+            height,
+        })
+    };
+    assert_eq!(primary.picture, area(242, 0, 1436, 1080));
+    assert_eq!(copy.picture, area(0, 138, 3840, 1884));
+    assert_eq!(avi.picture, None);
     assert!(
         admin.subtitle_tracks.is_empty(),
         "{:?}",
