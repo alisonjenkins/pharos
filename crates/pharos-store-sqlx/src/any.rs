@@ -802,6 +802,13 @@ impl PersonStore for AnyStore {
             AnyStore::Postgres(p) => p.actor_credits_for_items(items).await,
         }
     }
+
+    async fn credits_for_person(&self, wire_id: &str) -> DomainResult<Vec<(MediaId, ItemPerson)>> {
+        match self {
+            AnyStore::Sqlite(s) => s.credits_for_person(wire_id).await,
+            AnyStore::Postgres(p) => p.credits_for_person(wire_id).await,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------

@@ -2080,6 +2080,52 @@ impl PersonStore for PostgresStore {
             )
             .collect())
     }
+
+    #[tracing::instrument(skip(self))]
+    async fn credits_for_person(&self, wire_id: &str) -> DomainResult<Vec<(MediaId, ItemPerson)>> {
+        let rows = sqlx::query_as::<
+            _,
+            (
+                i64,
+                String,
+                String,
+                String,
+                Option<String>,
+                String,
+                Option<i32>,
+                Option<String>,
+            ),
+        >(
+            "SELECT ip.item_id, p.name, p.wire_id, ip.role, ip.character, ip.person_kind, \
+                 ip.sort_order, p.thumb_url \
+             FROM item_people ip JOIN people p ON p.id = ip.person_id \
+             WHERE p.wire_id = $1 \
+             ORDER BY ip.item_id, ip.role",
+        )
+        .bind(wire_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| DomainError::Backend(e.to_string()))?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(item, name, wire_id, role, character, kind, sort_order, thumb_url)| {
+                    (
+                        item.max(0) as MediaId,
+                        ItemPerson {
+                            name,
+                            wire_id,
+                            role: Some(role).filter(|r| !r.is_empty()),
+                            character,
+                            kind: PersonKind::parse(&kind),
+                            sort_order: sort_order.map(|n| n.max(0) as u32),
+                            thumb_url,
+                        },
+                    )
+                },
+            )
+            .collect())
+    }
 }
 
 impl StudioStore for PostgresStore {
