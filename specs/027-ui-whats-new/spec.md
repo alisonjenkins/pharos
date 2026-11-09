@@ -1,6 +1,6 @@
 # 027 — First-run setup and what's new after sign-in
 
-- **Status:** slice 1 built (branch `feat/ui-whats-new`).
+- **Status:** slice 1 implemented on main (audited 2026-11-09: 734e2836, 2ccd18fc, 6d4865e9, 11b6fc28; PR #843 batch AF/AG, ADR-0065); later slices (more setup pages, changelog from release notes) not started. Owned elsewhere (What's-New wizard).
 - **Date:** 2026-11-05
 - **Asked by:** Alison: a wizard on login when settings were added since the
   viewer last logged in, demoing each option live so they can pick, plus "a
