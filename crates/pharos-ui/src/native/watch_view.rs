@@ -8,11 +8,12 @@ use dioxus::html::input_data::MouseButton;
 use dioxus::prelude::*;
 use pharos_client::api::{Chapter, Damage, Item, ItemRef, Segment, Stereo, Track, Trickplay};
 
+use super::bars;
 use super::keymap::{self, Mode, Transport};
 use super::keys;
 use super::quality::{self, QualityView};
 use super::scrub::{self, Scrub};
-use super::stereo::{self, ViewMode};
+use super::stereo::{self, FrameRect, ViewMode};
 
 use super::art::Art;
 use super::damage::{in_span, PlayerDamageNote};
@@ -119,6 +120,9 @@ pub struct Controls {
     /// The playing version's 3D packing, and how this device shows it.
     pub packing: Option<Stereo>,
     pub view_mode: ViewMode,
+    /// Where the picture sits in the playing version's frame when the file
+    /// has black bars baked into it (B1017): the player crops to it.
+    pub picture: Option<bars::Crop>,
     /// Whether this browser can enter immersive VR (V923).
     pub vr: bool,
     /// The item's versions as (id, label), the primary's id empty; the
@@ -721,8 +725,25 @@ pub fn WatchView(
     // A packed 3D version on a flat screen shows one eye (V920); everything
     // that fits to the picture fits to that eye (V921).
     let crop = stereo::cropped(c.packing, c.view_mode);
+    // Baked-in black bars are cropped away (B1017, V976), but never from a
+    // 3D frame: its eye is the crop, and VR shows the whole frame.
+    let cropped_bars = c.picture.filter(|_| c.packing.is_none());
+    let bars = cropped_bars.map(|b| b.rect);
     let (eye_w, eye_h) = stereo::eye_size(crop, media.video_width, media.video_height);
-    let eye_aspect = (eye_w > 0 && eye_h > 0).then(|| f64::from(eye_w) / f64::from(eye_h));
+    let (eye_w, eye_h) = bars::shown_size(bars, eye_w, eye_h);
+    // Until the video knows its size, a cropped picture takes the shape the
+    // version's own size gives, not a guess.
+    let eye_aspect = (eye_w > 0 && eye_h > 0)
+        .then(|| f64::from(eye_w) / f64::from(eye_h))
+        .or(cropped_bars.map(|b| b.aspect));
+    let video_style = match (crop, bars) {
+        (Some(_), _) => eye_aspect.map(|a| format!("--pharos-eye-aspect: {a:.6}")),
+        (None, Some(r)) => Some(match eye_aspect {
+            Some(a) => format!("--pharos-eye-aspect: {a:.6}; {}", bars::crop_style(r)),
+            None => bars::crop_style(r),
+        }),
+        (None, None) => None,
+    };
     // A list of at most one, so a new track's key mounts a new overlay.
     // The headset's trigger plays and pauses through the player, so a group's
     // play stays the group's.
@@ -771,14 +792,13 @@ pub fn WatchView(
                 div {
                     class: "pharos-video-frame",
                     "data-packing": crop.map(stereo::packing_attr),
+                    "data-crop": bars.map(bars::crop_attr),
                     video {
                         id: VIDEO_ID,
                         class: "pharos-video",
                         // On the video, not the frame: the frame's style
                         // carries the JASSUB lift the player sets.
-                        style: eye_aspect
-                            .filter(|_| crop.is_some())
-                            .map(|a| format!("--pharos-eye-aspect: {a:.6}")),
+                        style: video_style,
                         "data-item-id": item_id.map(|id| id.to_string()),
                         autoplay,
                         playsinline: true,
@@ -834,6 +854,7 @@ pub fn WatchView(
                         key: "{url}",
                         url: url.clone(),
                         picture: (eye_w, eye_h),
+                        crop: bars,
                         pos,
                     }
                 }
@@ -1387,9 +1408,15 @@ fn TrackMode(in_group: bool, own_tracks: bool, on_change: EventHandler<bool>) ->
 /// An image subtitle drawn over the picture (spec 019): the cues of the
 /// manifest at `url`, fetched again while the server is still extracting
 /// them. The canvas box matches the picture's `object-fit: contain` box, so
-/// an anamorphic canvas stretches with the picture.
+/// an anamorphic canvas stretches with the picture. While the picture is
+/// cropped to `crop` (B1017), each cue is moved onto it and kept inside it.
 #[component]
-fn ImageSubtitles(url: String, picture: (u32, u32), pos: Position) -> Element {
+fn ImageSubtitles(
+    url: String,
+    picture: (u32, u32),
+    crop: Option<FrameRect>,
+    pos: Position,
+) -> Element {
     let mut cues = use_signal(ImageCues::default);
     use_future(move || {
         let url = url.clone();
@@ -1432,7 +1459,7 @@ fn ImageSubtitles(url: String, picture: (u32, u32), pos: Position) -> Element {
     // The picture's display aspect (one eye's, while cropped); the canvas
     // until the metadata is known.
     let (aw, ah) = match picture {
-        (0, _) | (_, 0) => (w, h),
+        (0, _) | (_, 0) => bars::shown_size(crop, w, h),
         size => size,
     };
     rsx! {
@@ -1440,13 +1467,24 @@ fn ImageSubtitles(url: String, picture: (u32, u32), pos: Position) -> Element {
             div {
                 class: "pharos-image-subs-canvas",
                 style: "width: min(100cqw, calc(100cqh * {aw} / {ah})); aspect-ratio: {aw} / {ah};",
-                for cue in cues_at(&cues, pos.now()) {
+                for (cue, at) in cues_at(&cues, pos.now()).map(|cue| {
+                    let at = bars::cue_in_picture(
+                        FrameRect {
+                            x: share(cue.x, w) / 100.0,
+                            y: share(cue.y, h) / 100.0,
+                            w: share(cue.width, w) / 100.0,
+                            h: share(cue.height, h) / 100.0,
+                        },
+                        crop,
+                    );
+                    (cue, at)
+                }) {
                     img {
                         key: "{cue.url}",
                         class: "pharos-image-sub",
                         src: "{cue.url}",
                         alt: "",
-                        style: "left: {share(cue.x, w)}%; top: {share(cue.y, h)}%; width: {share(cue.width, w)}%; height: {share(cue.height, h)}%;",
+                        style: "left: {at.x * 100.0}%; top: {at.y * 100.0}%; width: {at.w * 100.0}%; height: {at.h * 100.0}%;",
                     }
                 }
             }
@@ -1946,6 +1984,66 @@ mod tests {
             c.packing = packing;
             assert!(!render(c.clone()).contains("Watch in VR"), "{packing:?}");
         }
+    }
+
+    fn bewitched() -> bars::Crop {
+        bars::Crop {
+            rect: FrameRect {
+                x: 0.125,
+                y: 0.0,
+                w: 0.75,
+                h: 1.0,
+            },
+            aspect: 4.0 / 3.0,
+        }
+    }
+
+    #[test]
+    fn a_cropped_picture_has_its_shape_before_the_video_knows_its_size() {
+        let mut c = controls();
+        c.media.video_width = 0;
+        c.media.video_height = 0;
+        c.picture = Some(bewitched());
+        let html = render(c);
+        assert!(html.contains("--pharos-eye-aspect: 1.333333"), "{html}");
+    }
+
+    #[test]
+    fn baked_in_black_bars_are_cropped_to_the_picture() {
+        let mut c = controls();
+        c.media.video_width = 1920;
+        c.media.video_height = 1080;
+        // Bewitched: a 4:3 picture pillarboxed in 1920x1080 (B1017).
+        c.picture = Some(bewitched());
+        let html = render(c.clone());
+        assert!(
+            html.contains(r#"data-crop="0.125000 0.000000 0.750000 1.000000""#),
+            "{html}"
+        );
+        // The video takes the picture's 4:3 shape, not the frame's 16:9.
+        assert!(html.contains("--pharos-eye-aspect: 1.333333"), "{html}");
+        assert!(
+            html.contains("--pharos-crop-transform: scale(1.333333"),
+            "{html}"
+        );
+        c.picture = None;
+        let html = render(c);
+        assert!(!html.contains("data-crop"), "{html}");
+        assert!(!html.contains("--pharos-crop"), "{html}");
+    }
+
+    #[test]
+    fn a_3d_frame_is_never_cropped_for_bars() {
+        let mut c = controls();
+        c.media.video_width = 3840;
+        c.media.video_height = 1080;
+        c.packing = Some(Stereo::FullSideBySide);
+        c.picture = Some(bewitched());
+        let html = render(c.clone());
+        assert!(!html.contains("data-crop"), "{html}");
+        assert!(html.contains("--pharos-eye-aspect: 1.777778"), "{html}");
+        c.view_mode = ViewMode::BothEyes;
+        assert!(!render(c).contains("data-crop"), "the frame is shown whole");
     }
 
     #[test]

@@ -12,6 +12,7 @@ pub mod appearance;
 pub mod approve_device;
 pub mod art;
 pub mod backdrop;
+pub mod bars;
 pub mod browse;
 pub mod damage;
 pub mod depth;
