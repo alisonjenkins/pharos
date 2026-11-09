@@ -24,6 +24,7 @@ use pharos_client::api::{ClientEvent, ClientEventKind, ClientLevel, ItemRef, Lyr
 use crate::render::{self, Fallback, Frame, Surface};
 
 pub const CANVAS_ID: &str = "pharos-visualiser";
+#[cfg_attr(all(feature = "mobile", target_os = "android"), allow(dead_code))]
 const PREFERS_REDUCED_MOTION: &str = "(prefers-reduced-motion: reduce)";
 /// How often the theme colours are re-read, so a theme change mid-song
 /// retints without a style lookup every frame.
@@ -93,6 +94,7 @@ impl PartialEq for Tap {
     }
 }
 
+#[cfg_attr(all(feature = "mobile", target_os = "android"), allow(dead_code))]
 impl Tap {
     /// Route the media element `media_id` through an analyser once it is
     /// playing and the page has had a gesture; one attempt per screen. Asked
@@ -935,6 +937,18 @@ fn Visualiser(
     media_id: &'static str,
     on_fallback: EventHandler<Fallback>,
 ) -> Element {
+    // On the TV the page draws: this crate, built to wasm, runs the same
+    // loop there (B1032). Dropped with this component, it stops.
+    #[cfg(all(feature = "mobile", target_os = "android"))]
+    {
+        let _ = (program, &tap);
+        use_hook(move || {
+            Rc::new(platform::page_visualiser(style.label(), move |reason| {
+                on_fallback.call(Fallback::from_label(&reason));
+            }))
+        });
+    }
+    #[cfg(not(all(feature = "mobile", target_os = "android")))]
     use_effect(move || {
         let tap = tap.clone();
         spawn(async move {
@@ -961,8 +975,36 @@ fn Visualiser(
     }
 }
 
+/// The visualiser for `style_label` on this page's canvas, drawn until it
+/// fails: what the TV app's page runs, this crate built to wasm, while the
+/// native app shows the music screen (B1032, V992). `Ok` when the style
+/// draws nothing.
+#[cfg(all(feature = "web", target_arch = "wasm32"))]
+pub async fn run_page_visualiser(style_label: &str) -> Result<(), Fallback> {
+    let style = Style::parse(Some(style_label));
+    let Some(program) = style.program() else {
+        return Ok(());
+    };
+    let outcome = match render::open(
+        CANVAS_ID,
+        program,
+        platform::prefers(PREFERS_REDUCED_MOTION),
+    ) {
+        Ok(surface) => {
+            report(style, None);
+            draw(surface, &Tap::default()).await
+        }
+        Err(f) => Err(f),
+    };
+    if let Err(f) = &outcome {
+        report(style, Some(f));
+    }
+    outcome
+}
+
 /// Log the renderer decision and send it as client events (016
 /// `renderer_mode`, and `webgl_context_lost` when that is the reason).
+#[cfg_attr(all(feature = "mobile", target_os = "android"), allow(dead_code))]
 fn report(style: Style, fallback: Option<&Fallback>) {
     let (line, events) = renderer_signals(style, fallback);
     platform::info(&line);
@@ -971,6 +1013,7 @@ fn report(style: Style, fallback: Option<&Fallback>) {
     }
 }
 
+#[cfg_attr(all(feature = "mobile", target_os = "android"), allow(dead_code))]
 fn renderer_signals(style: Style, fallback: Option<&Fallback>) -> (String, Vec<ClientEvent>) {
     let (mode, reason) = match fallback {
         None => ("webgl2", "none"),
@@ -1009,6 +1052,7 @@ fn renderer_signals(style: Style, fallback: Option<&Fallback>) -> (String, Vec<C
 /// Draw every animation frame until the component unmounts (which drops
 /// this future) or the surface fails. A paused song keeps its last frame,
 /// so a headset spends no GPU time on a still picture.
+#[cfg_attr(all(feature = "mobile", target_os = "android"), allow(dead_code))]
 async fn draw(
     mut surface: Box<dyn Surface>,
     tap: &Tap,
