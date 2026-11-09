@@ -28,10 +28,9 @@ pub(crate) fn is_size_key(key: &str) -> bool {
 
 fn qs_edge(qs: &str, keys: &[&str]) -> Option<u32> {
     // The tightest of the keys that parse: `MaxWidth=1920&Width=1280` is 1280.
-    qs.split('&')
-        .filter_map(|kv| kv.split_once('='))
-        .filter(|(k, _)| keys.iter().any(|w| k.eq_ignore_ascii_case(w)))
-        .filter_map(|(_, v)| v.parse::<u32>().ok())
+    keys.iter()
+        .flat_map(|k| super::ci_query::values(qs, k))
+        .filter_map(|v| v.parse::<u32>().ok())
         .filter(|n| *n > 0)
         .min()
 }
