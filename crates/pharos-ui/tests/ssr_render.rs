@@ -1413,6 +1413,9 @@ fn privacy_page_with(diagnostics: bool) -> Element {
             diagnostics,
             diagnostics_key: 0,
             on_diagnostics: |_| {},
+            reports: Vec::new(),
+            on_report: |_| {},
+            on_delete_report: |_| {},
         }
     }
 }
