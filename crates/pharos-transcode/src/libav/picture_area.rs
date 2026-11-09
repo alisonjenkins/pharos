@@ -21,23 +21,22 @@ const SAMPLE_PERCENTS: [u64; 7] = [10, 20, 30, 40, 50, 60, 70];
 /// source reaches the 8-bit sink by the plain depth reduction.
 const LUMA_FILTER: &str = "extractplanes=y";
 
-pub fn picture_area(src: &Path) -> Result<PictureAnalysis, FrameError> {
+/// `duration_ms` is the runtime the scan read, so the file is opened once;
+/// with 0 the container is opened first to read its own.
+pub fn picture_area(src: &Path, duration_ms: u64) -> Result<PictureAnalysis, FrameError> {
     crate::libav::init().map_err(|e| FrameError::Other(format!("libav init: {e}")))?;
-    // Only a container libav cannot make sense of is the file's fault; an I/O
-    // error says nothing about the file, so it stays `Other` and is retried.
-    let duration_us = {
-        let ictx = format::input(src).map_err(|e| match e {
-            ffmpeg::Error::InvalidData
-            | ffmpeg::Error::DemuxerNotFound
-            | ffmpeg::Error::StreamNotFound => FrameError::BadInput(format!("open: {e}")),
-            other => FrameError::Other(format!("open: {other}")),
-        })?;
-        ictx.duration()
+    // The sampler's own open calls every failure the file's fault, which
+    // would store a passing NFS error as "undecodable". A file that cannot
+    // even be stat'ed says nothing about its picture: `Other`, retried.
+    std::fs::metadata(src).map_err(|e| FrameError::Other(format!("stat: {e}")))?;
+    let duration_ms = if duration_ms > 0 {
+        duration_ms
+    } else {
+        container_duration_ms(src)?
     };
-    if duration_us <= 0 {
+    if duration_ms == 0 {
         return Ok(PictureAnalysis::nothing_decoded());
     }
-    let duration_ms = u64::try_from(duration_us / 1000).unwrap_or(0);
     let targets = SAMPLE_PERCENTS
         .iter()
         .map(|p| duration_ms.saturating_mul(*p) / 100);
@@ -53,4 +52,20 @@ pub fn picture_area(src: &Path) -> Result<PictureAnalysis, FrameError> {
         Ok(true)
     })?;
     Ok(analyse(&planes))
+}
+
+/// The container's own runtime, for a file the scan has no runtime for.
+fn container_duration_ms(src: &Path) -> Result<u64, FrameError> {
+    // Only a container libav cannot make sense of is the file's fault; an I/O
+    // error says nothing about the file, so it stays `Other` and is retried.
+    let duration_us = {
+        let ictx = format::input(src).map_err(|e| match e {
+            ffmpeg::Error::InvalidData
+            | ffmpeg::Error::DemuxerNotFound
+            | ffmpeg::Error::StreamNotFound => FrameError::BadInput(format!("open: {e}")),
+            other => FrameError::Other(format!("open: {other}")),
+        })?;
+        ictx.duration()
+    };
+    Ok(u64::try_from(duration_us / 1000).unwrap_or(0))
 }

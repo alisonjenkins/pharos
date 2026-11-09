@@ -496,10 +496,12 @@ impl LibavWorkerPool {
     pub async fn picture_check(
         &self,
         input: impl Into<PathBuf>,
+        duration_ms: u64,
     ) -> Result<crate::picture_area::PictureAnalysis, PoolError> {
         let ev = self
             .run(TinyOp::PictureCheck {
                 input: input.into(),
+                duration_ms,
             })
             .await?;
         match ev {

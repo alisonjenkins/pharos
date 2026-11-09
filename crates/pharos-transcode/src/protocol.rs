@@ -290,7 +290,12 @@ pub enum TinyOp {
     /// picture → `WorkerEvent::PictureCheckResult`. Seven seeks, so it is
     /// NFS-bound like the other seek-sampling ops. Last, so bincode's variant
     /// indices of the older ops stay the same.
-    PictureCheck { input: PathBuf },
+    PictureCheck {
+        input: PathBuf,
+        /// The file's runtime from the scan, so the worker opens the file
+        /// once; 0 makes it read the container's own.
+        duration_ms: u64,
+    },
 }
 
 /// Scheduler → worker.
