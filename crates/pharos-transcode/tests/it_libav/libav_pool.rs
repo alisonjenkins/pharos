@@ -440,3 +440,126 @@ async fn bench_cold_vs_warm_worker() {
         med(&mut warm_img)
     );
 }
+
+/// Live `transcode-worker` children of this test process (nextest runs each
+/// test in a process of its own).
+fn live_workers() -> usize {
+    let me = std::process::id().to_string();
+    std::fs::read_dir("/proc")
+        .unwrap()
+        .flatten()
+        .filter_map(|e| std::fs::read_to_string(e.path().join("stat")).ok())
+        .filter(|stat| {
+            let Some((head, rest)) = stat.rsplit_once(") ") else {
+                return false;
+            };
+            // State Z is a reaped-but-unwaited zombie, not a live worker.
+            let mut f = rest.split(' ');
+            let state = f.next();
+            head.ends_with("(transcode-worke")
+                && f.next() == Some(me.as_str())
+                && state != Some("Z")
+        })
+        .count()
+}
+
+async fn wait_for_live_workers(want: usize) -> usize {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let n = live_workers();
+        if n == want || tokio::time::Instant::now() >= deadline {
+            return n;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+fn lifecycle_count(
+    snap: &pharos_test_metrics::CumulativeSnapshotter,
+    event: &str,
+    reason: &str,
+) -> u64 {
+    use metrics_util::debugging::DebugValue;
+    snap.snapshot()
+        .into_vec()
+        .iter()
+        .filter(|(k, ..)| {
+            let key = k.key();
+            key.name() == "pharos_libav_worker_lifecycle_total"
+                && key
+                    .labels()
+                    .any(|l| l.key() == "event" && l.value() == event)
+                && key
+                    .labels()
+                    .any(|l| l.key() == "reason" && l.value() == reason)
+        })
+        .map(|(.., v)| match v {
+            DebugValue::Counter(c) => *c,
+            _ => 0,
+        })
+        .sum()
+}
+
+/// B913/V874: a worker idle for the idle timeout exits, and the next op
+/// spawns a fresh one; both are counted.
+#[tokio::test]
+async fn an_idle_worker_is_shut_down_and_the_next_op_respawns_it() {
+    if !ffmpeg_available() {
+        eprintln!("skipping: ffmpeg not on PATH");
+        return;
+    }
+    let recorder = metrics_util::debugging::DebuggingRecorder::new();
+    let snap = pharos_test_metrics::snapshotter(&recorder);
+    let _guard = metrics::set_default_local_recorder(&recorder);
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("fixture.webm");
+    synth_fixture(&input);
+    let pool =
+        LibavWorkerPool::new(worker_bin(), 2).with_idle_timeout(Some(Duration::from_millis(300)));
+
+    pool.probe(input.clone()).await.expect("first probe");
+    assert_eq!(pool.idle_workers().await, 1);
+    assert_eq!(wait_for_live_workers(1).await, 1);
+
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert_eq!(
+        pool.idle_workers().await,
+        0,
+        "idle worker was not shut down"
+    );
+    assert_eq!(
+        wait_for_live_workers(0).await,
+        0,
+        "worker process still running"
+    );
+    assert_eq!(lifecycle_count(&snap, "exited", "idle_timeout"), 1);
+
+    pool.probe(input).await.expect("probe after the reap");
+    assert_eq!(pool.idle_workers().await, 1);
+    assert_eq!(lifecycle_count(&snap, "spawned", "no_idle_worker"), 2);
+}
+
+/// A worker in use within the timeout is kept; without a timeout none exits.
+#[tokio::test]
+async fn busy_or_unbounded_workers_stay_resident() {
+    if !ffmpeg_available() {
+        eprintln!("skipping: ffmpeg not on PATH");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("fixture.webm");
+    synth_fixture(&input);
+
+    let busy =
+        LibavWorkerPool::new(worker_bin(), 1).with_idle_timeout(Some(Duration::from_millis(400)));
+    for _ in 0..4 {
+        busy.probe(input.clone()).await.expect("probe");
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+    assert_eq!(busy.idle_workers().await, 1, "worker reaped while in use");
+
+    let resident = LibavWorkerPool::new(worker_bin(), 1).with_idle_timeout(None);
+    resident.probe(input).await.expect("probe");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(resident.idle_workers().await, 1);
+}
