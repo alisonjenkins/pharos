@@ -348,6 +348,10 @@ these):
   record did not arrive. `none` goes with `no_match`.
 - `{namespace="pharos"} |= "series match"` with `query=… year=… candidates=[…]
   chosen=… runner_up=… margin=…` on every decision, matched or not.
+- `{namespace="pharos"} |= "series episode fit"` with `scores=[id:score…]
+  nfo_vote=… chosen=… runner_up=… margin=… unscored=… flagged=…` whenever
+  §3 step 2 scored a show; `|= "episode list unavailable"` when a list could
+  not be fetched and the provider's choice was kept, flagged.
 - `sum by (reason) (pharos_series_folder_split_total)`: a gauge each complete
   scan pass of a root sets to the folders it splits under that root (labels
   `reason` = `stated_years`, `root`), in both modes.
