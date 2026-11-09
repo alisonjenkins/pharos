@@ -45,6 +45,11 @@ pub fn register(cfg: &mut web::ServiceConfig) {
         // Container-integrity sweep results — "which files are damaged",
         // not just a count.
         .route("/admin/integrity/damaged", web::get().to(damaged_files))
+        .route("/admin/integrity/status", web::get().to(integrity_status))
+        .route(
+            "/admin/integrity/{id}/recheck",
+            web::post().to(integrity_recheck),
+        )
         .route(
             "/admin/media/duplicates",
             web::get().to(super::duplicates::duplicate_movies),
@@ -977,9 +982,17 @@ struct DamagedFileDto {
     read_errors: u64,
     scanned_ms: u64,
     declared_ms: Option<u64>,
-    // No `recorded_at`: `integrity_memo::Entry` carries `mtime`/`size` (the
-    // FILE's own stat, used to invalidate the verdict) and the report, but no
-    // timestamp of when the scan itself ran — there is nothing to surface.
+    /// What a person calls the file, so the admin list reads "Series ·
+    /// S01E02 · Name" rather than a path. All `None` when the row is gone.
+    kind: Option<&'static str>,
+    name: Option<String>,
+    series_name: Option<String>,
+    season_number: Option<u32>,
+    episode_number: Option<u32>,
+    /// Unix seconds. `None` for a verdict recorded before the memo kept it.
+    checked_at: Option<i64>,
+    /// An admin asked for a re-read and the new verdict is not in yet.
+    recheck_pending: bool,
 }
 
 async fn damaged_files(
@@ -1001,15 +1014,26 @@ async fn damaged_files(
         // still surface — see the doc comment above. Any OTHER error
         // (store unreachable) is the server's problem and 500s the whole
         // request rather than silently dropping entries one by one.
-        let path = match pharos_core::MediaStore::get(&state.stores, id).await {
-            Ok(item) => Some(item.path.to_string_lossy().into_owned()),
+        let item = match pharos_core::MediaStore::get(&state.stores, id).await {
+            Ok(item) => Some(item),
             Err(pharos_core::DomainError::NotFound(_)) => None,
             Err(e) => return Err(error::ErrorInternalServerError(e.to_string())),
         };
+        let series = item.as_ref().and_then(|i| i.series.as_ref());
         let r = &entry.report;
         out.push(DamagedFileDto {
             media_id: id.to_string(),
-            path,
+            path: item.as_ref().map(|i| i.path.to_string_lossy().into_owned()),
+            kind: item.as_ref().map(|i| i.kind.as_str()),
+            name: item.as_ref().map(|i| i.title.clone()),
+            series_name: series.map(|s| s.series_name.clone()),
+            season_number: series.and_then(|s| s.season_number),
+            episode_number: series.and_then(|s| s.episode_number),
+            checked_at: entry.checked_at,
+            recheck_pending: state
+                .integrity_sweep
+                .as_ref()
+                .is_some_and(|s| s.is_queued(id)),
             verdict: r.label(),
             first_fault: r.first_fault.clone(),
             first_fault_ms: r.first_fault_ms,
@@ -1021,6 +1045,106 @@ async fn damaged_files(
         });
     }
     Ok(web::Json(out))
+}
+
+/// `GET /admin/integrity/status` — how far the sweep has got: files in
+/// scope, files with a verdict, files damaged, re-checks waiting.
+///
+/// `Checked` counts any verdict for the id, whatever state the file was in
+/// then: a `stat` per file to confirm each is current would be thousands of
+/// NFS round trips per page view. A changed file therefore counts as checked
+/// until the sweep reaches it again.
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct IntegrityStatusDto {
+    eligible: usize,
+    checked: usize,
+    damaged: usize,
+    queued: usize,
+    /// Files in a format nothing here can verify (rar comics, DRM-locked
+    /// Kindle files). Left out of `Eligible`, so "all checked" is reachable.
+    not_checkable: usize,
+}
+
+async fn integrity_status(
+    state: web::Data<AppState>,
+    user: AuthUser,
+) -> Result<impl Responder, actix_web::Error> {
+    require_admin(&user)?;
+    let (Some(memo), Some(sweep)) = (
+        state.integrity_memo.as_ref(),
+        state.integrity_sweep.as_ref(),
+    ) else {
+        return Err(error::ErrorServiceUnavailable(
+            "no integrity sweep on this build/platform (needs unix + the ffmpeg-lib backend)",
+        ));
+    };
+    let items = pharos_core::MediaStore::list(&state.stores)
+        .await
+        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    let (mut eligible, mut checked, mut not_checkable) = (0usize, 0usize, 0usize);
+    for it in items
+        .iter()
+        .filter(|it| crate::integrity_sweep::scannable(it))
+    {
+        if sweep.is_not_checkable(it.id) {
+            not_checkable += 1;
+            continue;
+        }
+        eligible += 1;
+        if memo.has(it.id) {
+            checked += 1;
+        }
+    }
+    Ok(web::Json(IntegrityStatusDto {
+        eligible,
+        checked,
+        damaged: memo.damaged().len(),
+        queued: sweep.queued_len(),
+        not_checkable,
+    }))
+}
+
+/// `POST /admin/integrity/{id}/recheck` — read this one file again, now.
+///
+/// 202: queued, and the sweep is woken. The old verdict stays listed, with
+/// `RecheckPending`, until the new one lands. 404 for an id the library does
+/// not hold; 400 for one the sweep cannot read (a remote origin).
+async fn integrity_recheck(
+    state: web::Data<AppState>,
+    user: AuthUser,
+    path: web::Path<String>,
+) -> Result<impl Responder, actix_web::Error> {
+    require_admin(&user)?;
+    let Some(sweep) = state.integrity_sweep.as_ref() else {
+        return Err(error::ErrorServiceUnavailable(
+            "no integrity sweep on this build/platform (needs unix + the ffmpeg-lib backend)",
+        ));
+    };
+    let raw = path.into_inner();
+    let id: u64 = raw
+        .parse()
+        .map_err(|_| error::ErrorBadRequest(format!("not a media id: {raw:?}")))?;
+    let item = match pharos_core::MediaStore::get(&state.stores, id).await {
+        Ok(item) => item,
+        Err(pharos_core::DomainError::NotFound(_)) => {
+            return Err(error::ErrorNotFound(format!("no media item {id}")))
+        }
+        Err(e) => return Err(error::ErrorInternalServerError(e.to_string())),
+    };
+    if !crate::integrity_sweep::scannable(&item) {
+        return Err(error::ErrorBadRequest(format!(
+            "media item {id} is not a local file and cannot be checked"
+        )));
+    }
+    let newly = sweep.request(id);
+    tracing::info!(
+        item = id,
+        path = %item.path.display(),
+        already_queued = !newly,
+        "integrity re-check requested",
+    );
+    Ok(HttpResponse::Accepted().finish())
 }
 
 /// `POST /Library/Refresh` — Jellyfin's "Scan All Libraries" (the dashboard
