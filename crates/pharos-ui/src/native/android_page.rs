@@ -559,11 +559,59 @@ pub fn spawn_detached(fut: impl std::future::Future<Output = ()> + 'static) {
     spawn_forever(fut);
 }
 
-/// The host has no DOM to observe.
-pub struct SentinelWatch;
+/// A browse grid's scroll sentinel, watched by an `IntersectionObserver` in
+/// the page (B1028); the observer is disconnected on drop.
+pub struct SentinelWatch {
+    watch: u64,
+    stopped: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
 
-pub fn watch_sentinel(_ids: &[&str], _on_visible: impl FnMut() + 'static) -> Option<SentinelWatch> {
-    None
+impl Drop for SentinelWatch {
+    fn drop(&mut self) {
+        self.stopped
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        run(tv_page::unwatch_sentinel_js(self.watch));
+    }
+}
+
+/// Call `on_visible` each time one of the elements with `ids` comes into
+/// view, as the browser's observer does, so a grid loads its next page on
+/// scroll instead of only from "Show more".
+pub fn watch_sentinel(
+    ids: &[&str],
+    mut on_visible: impl FnMut() + 'static,
+) -> Option<SentinelWatch> {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    static NEXT_SENTINEL: AtomicU64 = AtomicU64::new(0);
+    let watch = NEXT_SENTINEL.fetch_add(1, Ordering::Relaxed);
+    let script = tv_page::watch_sentinel_js(watch, ids);
+    let stopped = std::sync::Arc::new(AtomicBool::new(false));
+    let live = stopped.clone();
+    spawn_detached(async move {
+        let mut seen = document::eval(&script);
+        let mut fired = 0u32;
+        loop {
+            match seen.recv::<bool>().await {
+                Ok(true) => {
+                    if live.load(Ordering::Relaxed) {
+                        continue;
+                    }
+                    fired = fired.saturating_add(1);
+                    log::debug!("pharos: sentinel seen watch={watch} fired={fired}");
+                    on_visible();
+                }
+                Ok(false) => break,
+                Err(e) => {
+                    log::warn!(
+                        "pharos: sentinel watch failed watch={watch} fired={fired} error={e}"
+                    );
+                    return;
+                }
+            }
+        }
+        log::debug!("pharos: sentinel watch ended watch={watch} fired={fired}");
+    });
+    Some(SentinelWatch { watch, stopped })
 }
 
 pub struct ShiftWheel;

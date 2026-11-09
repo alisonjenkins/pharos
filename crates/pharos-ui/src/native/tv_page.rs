@@ -197,6 +197,41 @@ return true;
 /// Script: scroll the page back to its top.
 pub const SCROLL_TO_TOP_JS: &str = "window.scrollTo(0, 0);";
 
+/// Script: watch the elements with `ids` for coming into view, sending
+/// `true` each time one does, until [`unwatch_sentinel_js`] for the same
+/// `watch` sends `false` and ends it (B1028). Sends `false` at once when
+/// none of them is in the page, or when the watch was dropped before this
+/// ran.
+pub fn watch_sentinel_js(watch: u64, ids: &[&str]) -> String {
+    let ids = serde_json::Value::from(ids.to_vec());
+    format!(
+        r#"
+const all = window.__pharosSentinels || (window.__pharosSentinels = {{}});
+if (all[{watch}] === "gone") {{ delete all[{watch}]; dioxus.send(false); return; }}
+const els = {ids}.map((id) => document.getElementById(id)).filter(Boolean);
+if (!els.length) {{ dioxus.send(false); return; }}
+let end;
+const done = new Promise((r) => {{ end = r; }});
+const seen = new IntersectionObserver((es) => {{
+  if (es.some((e) => e.isIntersecting)) dioxus.send(true);
+}});
+els.forEach((el) => seen.observe(el));
+all[{watch}] = () => {{ seen.disconnect(); delete all[{watch}]; dioxus.send(false); end(); }};
+await done;
+"#
+    )
+}
+
+/// Script: end the sentinel watch `watch`, or mark it gone when its script
+/// has not run yet.
+pub fn unwatch_sentinel_js(watch: u64) -> String {
+    format!(
+        "const all = window.__pharosSentinels || (window.__pharosSentinels = {{}}); \
+         const stop = all[{watch}]; \
+         if (typeof stop === \"function\") stop(); else all[{watch}] = \"gone\";"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -215,6 +250,22 @@ mod tests {
             js.contains("return false") && js.contains("return true"),
             "{js}"
         );
+    }
+
+    #[test]
+    fn a_sentinel_watch_observes_every_id_and_ends_on_unwatch() {
+        let js = watch_sentinel_js(7, &["pharos-more-sentinel", "pharos-more-end"]);
+        assert!(
+            js.contains(r#"["pharos-more-sentinel","pharos-more-end"].map"#),
+            "{js}"
+        );
+        assert!(js.contains("new IntersectionObserver"), "{js}");
+        assert!(js.contains("dioxus.send(true)"), "{js}");
+        assert!(js.contains("all[7] = () =>"), "{js}");
+        assert!(js.contains(r#"all[7] === "gone""#), "{js}");
+        let stop = unwatch_sentinel_js(7);
+        assert!(stop.contains("const stop = all[7]"), "{stop}");
+        assert!(stop.contains(r#"all[7] = "gone""#), "{stop}");
     }
 
     #[test]
