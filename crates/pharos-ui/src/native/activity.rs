@@ -49,6 +49,8 @@ pub enum Action {
     },
     /// A command to the group failed or timed out, so the group did not hear it.
     CommandFailed,
+    /// A member cancelled "Up next", so the group stays on this episode.
+    HeldNext,
 }
 
 /// An event and who caused it.
@@ -95,6 +97,7 @@ pub fn line(event: &Event) -> String {
             format!("{} is following the group's tracks", subject(who))
         }
         Action::CommandFailed => "Couldn't reach the group. Try again.".to_owned(),
+        Action::HeldNext => format!("{} cancelled Up next", subject(who)),
         Action::PickNotShared { kind } => format!(
             "Couldn't change the group's {}; changed yours",
             match kind {
@@ -261,6 +264,7 @@ mod tests {
                 by("Sam", Action::OwnTracks { on: false }),
                 "Sam is following the group's tracks",
             ),
+            (by("Sam", Action::HeldNext), "Sam cancelled Up next"),
         ];
         for (event, want) in cases {
             assert_eq!(line(&event), want, "{event:?}");

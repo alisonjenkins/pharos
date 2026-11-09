@@ -5410,6 +5410,15 @@ fn Player(
             if let Some(next) = up_next_to.get() {
                 let total = total_ms(&state, p.detail.item.runtime_ms);
                 let from = up_next_at(&p.detail.segments, total);
+                // Another member cancelled it: this episode plays to its end
+                // here too, rather than this player moving the group on.
+                if !up_next.peek().is_cancelled() && session().is_some_and(|s| s.next_held()) {
+                    platform::info(&format!(
+                        "pharos: up next: cancelled reason=group at={}ms of={total}ms from={from:?}",
+                        state.position_ms
+                    ));
+                    up_next.write().cancel();
+                }
                 let step = up_next.write().step(state.position_ms, from, total);
                 if let Some(why) = up_next.peek().moves_on(step, event) {
                     platform::info(&format!(
@@ -5590,6 +5599,10 @@ fn Player(
                     }
                 }
                 Control::CancelNext => {
+                    let shared = session().is_some_and(|s| s.hold_next());
+                    platform::info(&format!(
+                        "pharos: up next: cancelled reason=viewer shared={shared}"
+                    ));
                     up_next.write().cancel();
                     up_next_step.set(UpNextStep::Hidden);
                 }
