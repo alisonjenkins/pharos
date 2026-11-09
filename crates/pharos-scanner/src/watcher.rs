@@ -342,6 +342,8 @@ where
     };
 
     let _exclusive = crate::fs::scan_exclusively().await;
+    // A `tvshow.nfo` written since the last scan must count for this batch.
+    crate::fs::forget_show_nfos();
     let scan_id = store.begin_scan(root).await?;
     let mut outcome = ScanOutcome::default();
     let mut touched_media = false;
