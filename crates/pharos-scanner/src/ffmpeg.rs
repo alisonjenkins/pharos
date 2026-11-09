@@ -601,6 +601,7 @@ pub fn parse_ffprobe_output(stdout: &[u8]) -> DomainResult<ProbeInfo> {
             video_3d_format,
             // Written by the audio analysis sweep, never by the prober.
             audio_analysis: None,
+            picture_check: None,
         },
     })
 }

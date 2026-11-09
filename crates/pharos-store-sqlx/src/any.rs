@@ -271,6 +271,18 @@ impl MediaStore for AnyStore {
         }
     }
 
+    async fn put_picture_check(
+        &self,
+        id: MediaId,
+        check: pharos_core::PictureCheck,
+        signature: (i64, u64),
+    ) -> DomainResult<()> {
+        match self {
+            AnyStore::Sqlite(s) => s.put_picture_check(id, check, signature).await,
+            AnyStore::Postgres(p) => p.put_picture_check(id, check, signature).await,
+        }
+    }
+
     async fn begin_scan(&self, root: &std::path::Path) -> DomainResult<i64> {
         match self {
             AnyStore::Sqlite(s) => s.begin_scan(root).await,
