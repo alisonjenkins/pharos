@@ -737,8 +737,9 @@ impl Tonemap {
     }
 
     /// The software filters, comma-joined, or `None` when off: PQ/HLG to
-    /// linear light at 100 nit, BT.709 primaries, Hable curve, BT.709 limited
-    /// range. Needs `zscale` (libzimg) in the ffmpeg build.
+    /// linear light with SDR white at [`CPU_TONEMAP_REFERENCE_WHITE_NITS`],
+    /// BT.709 primaries, Mobius curve, BT.709 limited range. Needs `zscale`
+    /// (libzimg) in the ffmpeg build.
     ///
     /// The primaries conversion rides the first `zscale` (one pass over the
     /// frame, not two) and both passes skip error-diffusion dither: the float
@@ -748,8 +749,9 @@ impl Tonemap {
         match self {
             Self::Off => None,
             Self::HdrToSdr => Some(format!(
-                "zscale=t=linear:npl=100:p=bt709:dither=none,format=gbrpf32le,\
-                 tonemap=tonemap=hable:desat=0,\
+                "zscale=t=linear:npl={CPU_TONEMAP_REFERENCE_WHITE_NITS}:p=bt709:dither=none,\
+                 format=gbrpf32le,\
+                 tonemap=tonemap=mobius:param={CPU_TONEMAP_MOBIUS_KNEE}:desat=0,\
                  zscale=t=bt709:m=bt709:r=tv:dither=none,format={}",
                 match out {
                     TonemapOutput::Yuv420p => "yuv420p",
@@ -774,6 +776,15 @@ impl Tonemap {
         }
     }
 }
+
+/// SDR reference white of the CPU chain, BT.2408 diffuse white. It matches
+/// the 203 nit libplacebo assumes on the GPU route (ADR-0091).
+pub const CPU_TONEMAP_REFERENCE_WHITE_NITS: u32 = 203;
+
+/// Linear knee of the CPU chain's Mobius curve. With Hable at 203 nit the CPU
+/// output was darker than the GPU route's; Mobius at this knee measured close
+/// to BT.2390 (ADR-0091: mean luma 124.0 against 121.5 on a grey gradient).
+pub const CPU_TONEMAP_MOBIUS_KNEE: &str = "0.35";
 
 /// libplacebo's tonemapping curve for the GPU route.
 pub const GPU_TONEMAP_CURVE: &str = "bt.2390";
