@@ -242,6 +242,16 @@ pub struct PersonPage {
     pub films: Vec<Appearance>,
     /// The show they are in most first.
     pub shows: Vec<ShowAppearances>,
+    pub biography: Option<String>,
+    /// `YYYY-MM-DD`.
+    pub birth_date: Option<String>,
+    /// `YYYY-MM-DD`.
+    pub death_date: Option<String>,
+    pub birth_place: Option<String>,
+    /// Their IMDb id (`nm` and digits).
+    pub imdb_id: Option<String>,
+    /// Their Wikidata item (`Q` and digits).
+    pub wikidata_id: Option<String>,
 }
 
 /// One item a person appears in, and who they play there.
@@ -1135,6 +1145,12 @@ impl PharosApi for NativeApi {
                     id: Some(read_item_ref(p.get_id()?)?),
                     name: text(p.get_name())?,
                     image_url: Some(text(p.get_image_url())?).filter(|u| !u.is_empty()),
+                    biography: known(p.get_biography())?,
+                    birth_date: known(p.get_birth_date())?,
+                    death_date: known(p.get_death_date())?,
+                    birth_place: known(p.get_birth_place())?,
+                    imdb_id: known(p.get_imdb_id())?,
+                    wikidata_id: known(p.get_wikidata_id())?,
                     films: p
                         .get_films()?
                         .iter()
@@ -1431,6 +1447,11 @@ fn read_tracks(
 
 pub(crate) fn text(t: capnp::Result<capnp::text::Reader<'_>>) -> Result<String, capnp::Error> {
     Ok(t?.to_string()?)
+}
+
+/// `t`, or `None` when it is empty (unknown).
+fn known(t: capnp::Result<capnp::text::Reader<'_>>) -> Result<Option<String>, capnp::Error> {
+    Ok(Some(text(t)?).filter(|s| !s.is_empty()))
 }
 
 fn len(list: &[String]) -> u32 {
