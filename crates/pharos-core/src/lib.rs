@@ -832,7 +832,104 @@ fn year_factor(q: Option<u32>, c: Option<u32>) -> f32 {
 /// nothing about which one is meant.
 const PREFIX_NEAR_TIE: f32 = 0.03;
 
-/// Best-scoring candidate over `min_confidence`, else None. A candidate's
+/// Lead over the runner-up below which a match is ambiguous (spec 033 §3): a
+/// rival that matches the name the same way and scores within this of the
+/// winner is as good a reading of the evidence.
+pub const AMBIGUOUS_MATCH_MARGIN: f32 = 0.2;
+
+/// Which rule picked [`MatchDecision::chosen`] over the runner-up. A metric
+/// label (`pharos_series_match_total{decided_by}`), so the strings in
+/// [`label`](Self::label) are a dashboard contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MatchDecidedBy {
+    /// Only one candidate cleared the confidence floor.
+    SoleCandidate,
+    /// The chosen name fits the query better: an exact name over a prefix
+    /// match, an earlier exact name (title before alias), or a closer name.
+    Name,
+    /// The names fit equally; the year agreement separated them.
+    Year,
+    /// Several subtitles of one franchise tied; the earliest premiere won.
+    EarliestPremiere,
+    /// Nothing separated the candidates; the provider's order did (B930).
+    ProviderOrder,
+    /// The candidates' episode lists were compared with the files' (V891).
+    EpisodeFit,
+    /// The `tvshow.nfo` ids broke the tie (V891).
+    NfoVote,
+}
+
+impl MatchDecidedBy {
+    /// Stable, bounded metric label.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::SoleCandidate => "sole_candidate",
+            Self::Name => "name",
+            Self::Year => "year",
+            Self::EarliestPremiere => "earliest_premiere",
+            Self::ProviderOrder => "provider_order",
+            Self::EpisodeFit => "episode_fit",
+            Self::NfoVote => "nfo_vote",
+        }
+    }
+}
+
+/// One search candidate as [`match_decide`] scored it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScoredCandidate {
+    pub id: String,
+    pub title: String,
+    pub year: Option<u32>,
+    /// `title_similarity × year_factor`, the confidence it would match at.
+    pub score: f32,
+    /// One of its names equals the query after normalization.
+    pub exact: bool,
+}
+
+/// Everything [`match_decide`] weighed, for the `series match` decision log.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MatchDecision {
+    /// Every candidate, in the provider's order.
+    pub candidates: Vec<ScoredCandidate>,
+    pub chosen: Option<MatchOutcome>,
+    /// The best other candidate over the floor.
+    pub runner_up: Option<MatchOutcome>,
+    /// `None` exactly when nothing was chosen.
+    pub decided_by: Option<MatchDecidedBy>,
+    /// The runner-up matches the name the same way (both exactly, or both
+    /// not) and trails by less than [`AMBIGUOUS_MATCH_MARGIN`].
+    pub ambiguous: bool,
+}
+
+impl MatchDecision {
+    /// Chosen score minus the runner-up's. Negative when an exact name beat a
+    /// prefix match that scored higher.
+    pub fn margin(&self) -> Option<f32> {
+        Some(self.chosen.as_ref()?.confidence - self.runner_up.as_ref()?.confidence)
+    }
+}
+
+/// Best-scoring candidate over `min_confidence`, else None. See
+/// [`match_decide`] for the rules; this is its `chosen`.
+pub fn match_best(
+    query_title: &str,
+    query_year: Option<u32>,
+    candidates: &[SearchCandidate],
+    min_confidence: f32,
+) -> Option<MatchOutcome> {
+    match_decide(query_title, query_year, candidates, min_confidence).chosen
+}
+
+/// A candidate's fit, kept apart so the decision can say which part decided.
+struct Fit<'a> {
+    c: &'a SearchCandidate,
+    exact_at: Option<usize>,
+    similarity: f32,
+    year_factor: f32,
+    score: f32,
+}
+
+/// Pick the best candidate over `min_confidence` and say why. A candidate's
 /// title similarity is the best over its title and aliases; score = that ×
 /// year factor. Among candidates over `min_confidence`, one whose name equals
 /// the query (after normalization) outranks any that only shares a prefix with
@@ -848,53 +945,118 @@ const PREFIX_NEAR_TIE: f32 = 0.03;
 /// extends with a subtitle, and the folder that carries just that name is
 /// almost always the original ("Code Geass" is the 2006 series, not the 2024
 /// Rozé of the Recapture). Remaining ties resolve to the earliest candidate.
-pub fn match_best(
+pub fn match_decide(
     query_title: &str,
     query_year: Option<u32>,
     candidates: &[SearchCandidate],
     min_confidence: f32,
-) -> Option<MatchOutcome> {
+) -> MatchDecision {
     let query = normalize_title(query_title);
-    // (index of the first name that equals the query, score, candidate)
-    let mut best: Option<(Option<usize>, f32, &SearchCandidate)> = None;
-    let mut inexact: Vec<(f32, &SearchCandidate)> = Vec::new();
-    for c in candidates {
-        let names = || std::iter::once(&c.title).chain(&c.aliases);
-        let exact_at = names().position(|n| normalize_title(n) == query);
-        let similarity = names()
-            .map(|n| title_similarity(query_title, n))
-            .fold(0.0_f32, f32::max);
-        let score = similarity * year_factor(query_year, c.year);
-        if score < min_confidence {
+    let fits: Vec<Fit<'_>> = candidates
+        .iter()
+        .map(|c| {
+            let names = || std::iter::once(&c.title).chain(&c.aliases);
+            let exact_at = names().position(|n| normalize_title(n) == query);
+            let similarity = names()
+                .map(|n| title_similarity(query_title, n))
+                .fold(0.0_f32, f32::max);
+            let year_factor = year_factor(query_year, c.year);
+            Fit {
+                c,
+                exact_at,
+                similarity,
+                year_factor,
+                score: similarity * year_factor,
+            }
+        })
+        .collect();
+    let over: Vec<usize> = (0..fits.len())
+        .filter(|&i| fits.get(i).is_some_and(|f| f.score >= min_confidence))
+        .collect();
+    let fit = |i: usize| fits.get(i);
+
+    let mut best: Option<usize> = None;
+    for &i in &over {
+        let (Some(f), b) = (fit(i), best.and_then(fit)) else {
             continue;
-        }
-        let beats = match &best {
+        };
+        let beats = match b {
             None => true,
-            Some((best_at, best_score, _)) => match (exact_at, best_at) {
+            Some(b) => match (f.exact_at, b.exact_at) {
                 (Some(_), None) => true,
                 (None, Some(_)) => false,
-                (Some(at), Some(best_at)) if at != *best_at => at < *best_at,
-                _ => score > *best_score,
+                (Some(at), Some(best_at)) if at != best_at => at < best_at,
+                _ => f.score > b.score,
             },
         };
         if beats {
-            best = Some((exact_at, score, c));
-        }
-        if exact_at.is_none() {
-            inexact.push((score, c));
+            best = Some(i);
         }
     }
-    if let Some((None, top, _)) = best {
-        best = inexact
+    let mut franchise_tie = false;
+    if let Some(top) = best.and_then(fit).filter(|f| f.exact_at.is_none()) {
+        let top = top.score;
+        let near: Vec<usize> = over
+            .iter()
+            .copied()
+            .filter(|&i| {
+                fit(i).is_some_and(|f| f.exact_at.is_none() && f.score >= top - PREFIX_NEAR_TIE)
+            })
+            .collect();
+        franchise_tie = near.len() > 1;
+        best = near
             .into_iter()
-            .filter(|(score, _)| *score >= top - PREFIX_NEAR_TIE)
-            .min_by_key(|(_, c)| c.year.unwrap_or(u32::MAX))
-            .map(|(score, c)| (None, score, c));
+            .min_by_key(|&i| fit(i).and_then(|f| f.c.year).unwrap_or(u32::MAX));
     }
-    best.map(|(_, confidence, c)| MatchOutcome {
-        id: c.id.clone(),
-        confidence,
-    })
+
+    let runner = best.and_then(|b| {
+        over.iter()
+            .copied()
+            .filter(|&i| i != b)
+            .fold(None::<usize>, |acc, i| match (acc.and_then(fit), fit(i)) {
+                (Some(a), Some(f)) if f.score <= a.score => acc,
+                _ => Some(i),
+            })
+    });
+    let decided_by = best.and_then(fit).map(|chosen| match runner.and_then(fit) {
+        None => MatchDecidedBy::SoleCandidate,
+        Some(_) if franchise_tie => MatchDecidedBy::EarliestPremiere,
+        Some(r) if chosen.exact_at != r.exact_at => MatchDecidedBy::Name,
+        Some(r) if chosen.similarity > r.similarity => MatchDecidedBy::Name,
+        Some(r) if chosen.year_factor > r.year_factor => MatchDecidedBy::Year,
+        Some(_) => MatchDecidedBy::ProviderOrder,
+    });
+    let outcome = |i: usize| {
+        fit(i).map(|f| MatchOutcome {
+            id: f.c.id.clone(),
+            confidence: f.score,
+        })
+    };
+    let chosen = best.and_then(outcome);
+    let runner_up = runner.and_then(outcome);
+    let ambiguous = match (best.and_then(fit), runner.and_then(fit)) {
+        (Some(c), Some(r)) => {
+            c.exact_at.is_some() == r.exact_at.is_some()
+                && c.score - r.score < AMBIGUOUS_MATCH_MARGIN
+        }
+        _ => false,
+    };
+    MatchDecision {
+        candidates: fits
+            .iter()
+            .map(|f| ScoredCandidate {
+                id: f.c.id.clone(),
+                title: f.c.title.clone(),
+                year: f.c.year,
+                score: f.score,
+                exact: f.exact_at.is_some(),
+            })
+            .collect(),
+        chosen,
+        runner_up,
+        decided_by,
+        ambiguous,
+    }
 }
 
 /// Parse a bare `YYYY-MM-DD` date (TMDB/TVDB style) to unix seconds at UTC
