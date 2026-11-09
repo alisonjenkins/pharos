@@ -500,7 +500,10 @@ pub fn render() -> String {
                 process.collect();
             }
             #[cfg(target_os = "linux")]
-            collect_allocator_stats();
+            {
+                collect_allocator_stats();
+                crate::child_memory::collect();
+            }
             h.render()
         }
         _ => String::new(),
@@ -615,6 +618,22 @@ mod tests {
             "process_threads",
         ] {
             assert!(body.contains(name), "missing {name}; rendered:\n{body}");
+        }
+    }
+
+    /// The workers' memory must reach /metrics even with none running, so
+    /// a query over it has a series from startup (B911).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn child_memory_is_rendered_on_every_scrape() {
+        init("info", None).unwrap();
+        let body = render();
+        for name in ["pharos_child_processes", "pharos_child_anon_bytes"] {
+            assert!(
+                body.lines()
+                    .any(|l| l.starts_with(&format!("{name}{{process=\"transcode-worker\"}}"))),
+                "missing {name}; rendered:\n{body}"
+            );
         }
     }
 
