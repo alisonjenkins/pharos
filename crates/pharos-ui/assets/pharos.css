@@ -4713,6 +4713,16 @@ body:has(.pharos-stage.is-mini) .pharos-main {
     display: none;
   }
 }
+/* The floating window sizes its own strip: resized narrow on a wide screen
+   (down to 240px), the queue button pushed Close out of the window (B896). */
+.pharos-stage.is-floating {
+  container: pharos-stage / inline-size;
+}
+@container pharos-stage (max-width: 21rem) {
+  .pharos-stage-transport [aria-label="Previous"] {
+    display: none;
+  }
+}
 /* Admin > Duplicates: paths wrap, the short facts beside them do not. */
 .pharos-admin-duplicate-versions th {
   text-align: start;
