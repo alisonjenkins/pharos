@@ -265,6 +265,11 @@ async fn a_season_or_series_marks_every_episode_in_it() {
 
 /// Whether `Library.detail` says `id` is watched.
 async fn detail_played(session: &session::Client, id: WireId) -> bool {
+    detail_marks(session, id).await.0
+}
+
+/// What `Library.detail` says of `id`: (watched, favourite).
+async fn detail_marks(session: &session::Client, id: WireId) -> (bool, bool) {
     use pharos_api::pharos_capnp::detail_result;
     let library = session.library_request().send().pipeline.get_library();
     let mut req = library.detail_request();
@@ -277,10 +282,47 @@ async fn detail_played(session: &session::Client, id: WireId) -> bool {
     match reply.get().unwrap().get_result().unwrap().which().unwrap() {
         detail_result::Detail(d) => {
             let summary = d.unwrap().get_summary().unwrap();
-            summary.has_user_state() && summary.get_user_state().unwrap().get_played()
+            if !summary.has_user_state() {
+                return (false, false);
+            }
+            let state = summary.get_user_state().unwrap();
+            (state.get_played(), state.get_favorite())
         }
         detail_result::Error(_) => panic!("detail {id}"),
     }
+}
+
+/// B1080: a show or season marked a favourite says so on its detail, while
+/// every episode in it is one; un-marking one episode takes the mark off.
+/// Disarm check: with `synth_marks` leaving `favorite` false, the show's
+/// detail says it is no favourite right after it was marked.
+#[actix_web::test]
+async fn a_series_marked_favourite_says_so_on_its_detail() {
+    use pharos_jellyfin_api::dto::{season_id_for_key, series_id_for_key};
+    let (server, fx) = crate::revocation::start().await;
+    let (client, _closed) = crate::revocation::connect(&server).await;
+    let session = crate::revocation::signed_in(&client, &fx.user_token).await;
+    crate::library::seed_tv_library(&fx).await;
+
+    let show = WireId::parse(&series_id_for_key(Some("/libTV/Show"), "Show")).unwrap();
+    let season = WireId::parse(&season_id_for_key(Some("/libTV/Show"), "Show", 1)).unwrap();
+    assert_eq!(detail_marks(&session, show).await, (false, false));
+    assert_eq!(
+        wire_set(&session, show, Set::Favorite(true)).await,
+        Ok((false, true, 0, 0))
+    );
+    assert_eq!(detail_marks(&session, show).await, (false, true));
+    assert_eq!(detail_marks(&session, season).await, (false, true));
+
+    assert!(wire_set(&session, WireId::Real(603), Set::Favorite(false))
+        .await
+        .is_ok());
+    assert_eq!(
+        detail_marks(&session, show).await,
+        (false, false),
+        "season 2's episode is no longer a favourite"
+    );
+    assert_eq!(detail_marks(&session, season).await, (false, true));
 }
 
 /// Pipelined writes to one item both land: a native client can send
