@@ -10,6 +10,7 @@
 //! [`AppState`] (research R2).
 
 mod bootstrap;
+pub mod events;
 mod group;
 mod library;
 pub mod limits;
@@ -76,6 +77,11 @@ pub fn record_state(cfg: &NativeApiConfig) {
     metrics::gauge!("pharos_native_api_enabled").set(f64::from(u8::from(cfg.enabled)));
     if cfg.enabled {
         pharos_api::register_metrics();
+        crate::services::events::register_metrics();
+        for transition in ["issued", "released"] {
+            metrics::counter!(events::CAPABILITIES_TOTAL, "type" => "subscription", "transition" => transition)
+                .absolute(0);
+        }
         pharos_api::set_trace_parent_hook(crate::obs::rpc_trace_parent);
         metrics::counter!(
             "pharos_rpc_auth_deadline_extended_total",
@@ -149,6 +155,8 @@ pub struct ConnectionCtx {
     /// exported on a connection are not reliably dropped when it closes, so
     /// whatever must happen on the close (a membership's seat) registers here.
     on_close: RefCell<Vec<Box<dyn FnOnce()>>>,
+    /// `Events` subscriptions open on this connection, for the cap (T026a).
+    subscriptions: events::SubscriptionCount,
 }
 
 /// The media token lifetime of a connection nobody configured: the config
@@ -177,6 +185,7 @@ impl ConnectionCtx {
             signed_out: tokio::sync::Notify::new(),
             extend_auth: tokio::sync::Notify::new(),
             on_close: RefCell::new(Vec::new()),
+            subscriptions: events::SubscriptionCount::default(),
         }))
     }
 
