@@ -3,7 +3,7 @@
 - **Status:** Reviewed by Alison 2026-11-09T17:27Z (open questions answered, §8). No code yet.
 - **Date:** 2026-11-09T14:30:00Z
 - **ADR:** [0086](../../docs/adr/0086-series-identity-is-decided-from-reconciled-evidence.md)
-- **Claimed ids:** B930–B934, V890–V895 (entries go into
+- **Claimed ids:** B930–B934, V890–V896 (entries go into
   `001-pharos-baseline/bugs.md` / `invariants.md` with the fix, not before).
 
 ## Problem
@@ -204,7 +204,7 @@ the series wire id.
    folder key (the 1990 group), since the group that keeps the key is the one
    with no stated year. Episode-level state does not move.
 
-### 7. Fixing shows and files by hand: the Show identity page (V895)
+### 7. Fixing shows and files by hand: the Show identity page (V896)
 
 Alison (2026-11-09): "we need to have a way to remap them somehow and fix them."
 A new admin page, Manage → **Show identity**, lists every show that needs a
@@ -284,7 +284,7 @@ re-fetches, and nothing else changing match.
 | V892 | An episode's provider metadata comes only from its series' pinned match; an episode NFO id naming another series is set aside. |
 | V893 | A bare folder whose files state different show years is split by stated year; the unyeared group keeps the folder key. |
 | V894 | Copies fold only within one series key, with equal stated show years and equal provider series ids where both are known. |
-| V895 | A hand fix of a show or its files is an override the scanner applies after its own split and before the copy fold; a rescan never undoes it. |
+| V896 | A hand fix of a show or its files is an override the scanner applies after its own split and before the copy fold; a rescan never undoes it. |
 
 ## Out of scope
 
