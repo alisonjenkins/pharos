@@ -369,21 +369,30 @@ fn admin_view_renders_user_rows_with_self_delete_disabled() {
     let html = render_root(admin_with_users);
     assert!(html.contains("boss"), "{html}");
     assert!(html.contains("alice"), "{html}");
-    assert!(html.contains("(admin)"), "{html}");
-    // The current user (id=1) renders a `you` button (disabled),
-    // the other renders a `Delete` button (enabled).
+    assert!(html.contains("2 users · 1 admin"), "{html}");
+    // B921: the signed-in admin's own card is marked You, has no Delete or
+    // password reset, and its admin switch is off-limits.
+    let own =
+        &html[html.find(r#"data-user-id="1""#).unwrap()..html.find(r#"data-user-id="2""#).unwrap()];
+    assert!(own.contains(">You<") && own.contains(">Admin<"), "{own}");
+    assert!(!own.contains("pharos-admin-user-delete"), "{own}");
+    assert!(!own.contains("Reset password"), "{own}");
     assert!(
-        html.contains(">you<"),
-        "self-delete not rendered as 'you': {html}"
+        own.contains(r#"role="switch" aria-checked="true""#),
+        "{own}"
     );
-    assert!(html.contains(">Delete<"), "{html}");
-    // T50 phase 2: admin-toggle checkbox + password reset form per row.
+    assert!(own.contains("disabled=true"), "{own}");
+    // Everyone else's card offers Delete and Reset password, behind a
+    // confirm and a form that open on press, and a live admin switch.
+    let other = &html[html.find(r#"data-user-id="2""#).unwrap()..];
+    assert!(other.contains("pharos-admin-user-delete"), "{other}");
+    assert!(other.contains(">Reset password<"), "{other}");
+    assert!(!other.contains("pharos-manage-confirm"), "{other}");
+    assert!(
+        other.contains(r#"role="switch" aria-checked="false""#),
+        "{other}"
+    );
     assert!(html.contains("pharos-admin-user-policy"), "{html}");
-    assert!(html.contains("pharos-admin-user-reset"), "{html}");
-    // Self-row's reset input is disabled (points user at prefs view).
-    // Non-self row carries the standard placeholder.
-    assert!(html.contains("Reset password"), "{html}");
-    assert!(html.contains("Reset (current pw needed)"), "{html}");
 }
 
 #[test]
@@ -556,7 +565,10 @@ fn admin_view_logs_tab_renders_log_list() {
     assert!(html.contains(r#"data-tab="logs""#), "{html}");
     assert!(html.contains("pharos-admin-section-logs"), "{html}");
     assert!(html.contains("pharos.log"), "{html}");
-    assert!(html.contains("12345"), "{html}");
+    assert!(
+        html.contains("12345 bytes") && html.contains(">12 KiB<"),
+        "{html}"
+    );
 }
 
 fn admin_apikeys_with_new_secret() -> Element {
@@ -598,6 +610,11 @@ fn admin_view_apikeys_tab_surfaces_new_secret_and_revoke_button() {
     assert!(html.contains("pharos-admin-apikey-new"), "{html}");
     assert!(html.contains("secret-token-xyz"), "{html}");
     assert!(html.contains("pharos-admin-apikey-revoke"), "{html}");
+    // V881: Revoke asks first; the confirm is not shown until pressed.
+    assert!(
+        !html.contains("pharos-admin-apikey-revoke-confirm"),
+        "{html}"
+    );
     assert!(html.contains("cli"), "{html}");
     assert!(html.contains("2026-05-28T08:00:00Z"), "{html}");
 }

@@ -272,7 +272,7 @@ fn Authenticated(user: Signal<Option<LoggedInUser>>, route: Signal<AppRoute>) ->
                 }
             },
             AppRoute::Admin => rsx! {
-                AdminPane {
+                LegacyAdminPane {
                     access_token: access_token.clone(),
                     server_base: server_base_from_window(),
                     current_user_id: current_user_id.clone(),
@@ -562,76 +562,87 @@ fn DetailPane(
     }
 }
 
+/// The older app's Manage, signed in with its own token.
 #[component]
-fn AdminPane(access_token: String, server_base: String, current_user_id: String) -> Element {
+fn LegacyAdminPane(access_token: String, server_base: String, current_user_id: String) -> Element {
+    let token = use_signal(|| access_token);
+    rsx! { AdminPane { access_token: token, server_base, current_user_id } }
+}
+
+#[component]
+pub fn AdminPane(
+    access_token: Signal<String>,
+    server_base: String,
+    current_user_id: String,
+) -> Element {
     let reload = use_signal(|| 0u32);
     let status = use_signal::<Option<String>>(|| None);
     let active_tab = use_signal::<AdminTab>(AdminTab::default);
     let users_resource = {
         let base = server_base.clone();
-        let token = access_token.clone();
+        let token = access_token;
         let reload_signal = reload;
         use_resource(move || {
             let _bust = reload_signal.read();
             let base = base.clone();
-            let token = token.clone();
+            let token = token.peek().clone();
             async move { fetch_admin_users(&base, &token).await }
         })
     };
     let libraries_resource = {
         let base = server_base.clone();
-        let token = access_token.clone();
+        let token = access_token;
         let reload_signal = reload;
         use_resource(move || {
             let _bust = reload_signal.read();
             let base = base.clone();
-            let token = token.clone();
+            let token = token.peek().clone();
             async move { fetch_virtual_folders(&base, &token).await }
         })
     };
     let devices_resource = {
         let base = server_base.clone();
-        let token = access_token.clone();
+        let token = access_token;
         let reload_signal = reload;
         use_resource(move || {
             let _bust = reload_signal.read();
             let base = base.clone();
-            let token = token.clone();
+            let token = token.peek().clone();
             async move { fetch_devices(&base, &token).await }
         })
     };
     let activity_resource = {
         let base = server_base.clone();
-        let token = access_token.clone();
+        let token = access_token;
         let reload_signal = reload;
         use_resource(move || {
             let _bust = reload_signal.read();
             let base = base.clone();
-            let token = token.clone();
+            let token = token.peek().clone();
             async move { fetch_activity_entries(&base, &token).await }
         })
     };
     let scheduled_tasks_resource = {
         let base = server_base.clone();
-        let token = access_token.clone();
+        let token = access_token;
         let reload_signal = reload;
         use_resource(move || {
             let _bust = reload_signal.read();
             let base = base.clone();
-            let token = token.clone();
+            let token = token.peek().clone();
             async move { fetch_scheduled_tasks(&base, &token).await }
         })
     };
     // Grouping walks every film, so it runs only while its tab is open.
     let duplicates_resource = {
         let base = server_base.clone();
-        let token = access_token.clone();
+        let token = access_token;
         let reload_signal = reload;
         use_resource(move || {
             let _bust = reload_signal.read();
             let open = *active_tab.read() == AdminTab::Duplicates;
             let base = base.clone();
-            let token = token.clone();
+            let token = token.peek().clone();
             async move {
                 if open {
                     Some(fetch_duplicate_films(&base, &token).await)
@@ -658,7 +669,7 @@ fn AdminPane(access_token: String, server_base: String, current_user_id: String)
     // Reads every file's verdict, so it runs only while its tab is open.
     let integrity_resource = {
         let base = server_base.clone();
-        let token = access_token.clone();
+        let token = access_token;
         let reload_signal = reload;
         let mut queued_signal = integrity_queued;
         let mut deep_queued_signal = deep_queued;
@@ -669,7 +680,7 @@ fn AdminPane(access_token: String, server_base: String, current_user_id: String)
             let _tick = tick_signal.read();
             let open = *active_tab.read() == AdminTab::Integrity;
             let base = base.clone();
-            let token = token.clone();
+            let token = token.peek().clone();
             async move {
                 let generation = poll_gen_signal.peek().wrapping_add(1);
                 poll_gen_signal.set(generation);
@@ -704,52 +715,54 @@ fn AdminPane(access_token: String, server_base: String, current_user_id: String)
     };
     let plugins_resource = {
         let base = server_base.clone();
-        let token = access_token.clone();
+        let token = access_token;
         let reload_signal = reload;
         use_resource(move || {
             let _bust = reload_signal.read();
             let base = base.clone();
-            let token = token.clone();
+            let token = token.peek().clone();
             async move { fetch_plugins(&base, &token).await }
         })
     };
     let logs_resource = {
         let base = server_base.clone();
-        let token = access_token.clone();
+        let token = access_token;
         let reload_signal = reload;
         use_resource(move || {
             let _bust = reload_signal.read();
             let base = base.clone();
-            let token = token.clone();
+            let token = token.peek().clone();
             async move { fetch_logs(&base, &token).await }
         })
     };
     let api_keys_resource = {
         let base = server_base.clone();
-        let token = access_token.clone();
+        let token = access_token;
         let reload_signal = reload;
         use_resource(move || {
             let _bust = reload_signal.read();
             let base = base.clone();
-            let token = token.clone();
+            let token = token.peek().clone();
             async move { fetch_api_keys(&base, &token).await }
         })
     };
     let branding_resource = {
         let base = server_base.clone();
-        let token = access_token.clone();
+        let token = access_token;
         let reload_signal = reload;
         use_resource(move || {
             let _bust = reload_signal.read();
             let base = base.clone();
-            let token = token.clone();
+            let token = token.peek().clone();
             async move { fetch_branding(&base, &token).await }
         })
     };
     let new_api_key_secret = use_signal::<Option<String>>(|| None);
+    // Dismiss hides the open tab's load error too; the next tab, reload or
+    // action shows it again if it is still there.
+    let fetch_err_hidden = use_signal(|| false);
 
     let action_handler = {
-        let access_token = access_token.clone();
         let server_base = server_base.clone();
         let mut reload_signal = reload;
         let mut status_signal = status;
@@ -761,13 +774,42 @@ fn AdminPane(access_token: String, server_base: String, current_user_id: String)
         let mut deep_errors_signal = deep_errors;
         let deep_search_signal = deep_search;
         let mut deep_search_gen_signal = deep_search_gen;
+        let mut fetch_err_hidden_signal = fetch_err_hidden;
         move |action: AdminAction| {
-            let token = access_token.clone();
+            let token = access_token.peek().clone();
             let base = server_base.clone();
-            if let AdminAction::SelectTab(t) = action {
-                active_tab_signal.set(t);
+            if action == AdminAction::DismissStatus {
+                status_signal.set(None);
+                fetch_err_hidden_signal.set(true);
                 return;
             }
+            fetch_err_hidden_signal.set(false);
+            if let AdminAction::SelectTab(t) = action {
+                active_tab_signal.set(t);
+                status_signal.set(None);
+                return;
+            }
+            // Names, not ids, in what the status line says.
+            let name_of = |id: &str| -> String {
+                users_resource
+                    .peek()
+                    .as_ref()
+                    .and_then(|r| r.as_ref().ok())
+                    .and_then(|users| users.iter().find(|u| u.id == id))
+                    .map_or_else(|| id.to_string(), |u| u.name.clone())
+            };
+            let subject = match &action {
+                AdminAction::DeleteUser(id)
+                | AdminAction::SetUserPolicy { user_id: id, .. }
+                | AdminAction::ResetUserPassword { user_id: id, .. } => name_of(id),
+                AdminAction::RevokeApiKey { key_id } => api_keys_resource
+                    .peek()
+                    .as_ref()
+                    .and_then(|r| r.as_ref().ok())
+                    .and_then(|keys| keys.iter().find(|k| k.id == *key_id))
+                    .map_or_else(|| key_id.clone(), |k| k.app_name.clone()),
+                _ => String::new(),
+            };
             if let AdminAction::DeepSearch { term } = action {
                 let generation = deep_search_gen_signal.peek().wrapping_add(1);
                 deep_search_gen_signal.set(generation);
@@ -813,55 +855,62 @@ fn AdminPane(access_token: String, server_base: String, current_user_id: String)
                 match action {
                     AdminAction::Refresh => {}
                     AdminAction::LibraryRefresh => match library_refresh(&base, &token).await {
-                        Ok(()) => status_signal.set(Some("Library refresh broadcast".into())),
-                        Err(e) => status_signal.set(Some(format!("Refresh failed: {e}"))),
+                        Ok(()) => status_signal.set(Some(
+                            "Scanning every library for new and changed files.".into(),
+                        )),
+                        Err(e) => status_signal.set(Some(format!("Couldn't start the scan: {e}"))),
                     },
                     AdminAction::CreateUser(CreateUserAttempt { name, password }) => {
                         match create_user(&base, &token, &name, &password).await {
-                            Ok(()) => status_signal.set(Some(format!("Created {name}"))),
-                            Err(e) => status_signal.set(Some(format!("Create failed: {e}"))),
+                            Ok(()) => status_signal.set(Some(format!("Added {name}."))),
+                            Err(e) => status_signal.set(Some(format!("Couldn't add {name}: {e}"))),
                         }
                     }
                     AdminAction::DeleteUser(id) => match delete_user(&base, &token, &id).await {
-                        Ok(()) => status_signal.set(Some(format!("Deleted {id}"))),
-                        Err(e) => status_signal.set(Some(format!("Delete failed: {e}"))),
+                        Ok(()) => status_signal.set(Some(format!("Deleted {subject}."))),
+                        Err(e) => {
+                            status_signal.set(Some(format!("Couldn't delete {subject}: {e}")))
+                        }
                     },
                     AdminAction::SetUserPolicy { user_id, is_admin } => {
                         match set_user_policy(&base, &token, &user_id, is_admin).await {
-                            Ok(()) => status_signal.set(Some(format!(
-                                "{user_id} is now {}",
-                                if is_admin { "admin" } else { "non-admin" }
+                            Ok(()) => status_signal.set(Some(if is_admin {
+                                format!("{subject} is now an admin.")
+                            } else {
+                                format!("{subject} is no longer an admin.")
+                            })),
+                            Err(e) => status_signal.set(Some(format!(
+                                "Couldn't change {subject}'s admin rights: {e}"
                             ))),
-                            Err(e) => status_signal.set(Some(format!("Policy update failed: {e}"))),
                         }
                     }
                     AdminAction::ResetUserPassword {
                         user_id,
                         new_password,
                     } => match reset_user_password(&base, &token, &user_id, &new_password).await {
-                        Ok(()) => status_signal.set(Some(format!("Password reset for {user_id}"))),
-                        Err(e) => status_signal.set(Some(format!("Password reset failed: {e}"))),
+                        Ok(()) => {
+                            status_signal.set(Some(format!("Set a new password for {subject}.")))
+                        }
+                        Err(e) => status_signal
+                            .set(Some(format!("Couldn't set {subject}'s password: {e}"))),
                     },
                     AdminAction::CreateApiKey { app_name } => {
                         match create_api_key(&base, &token, &app_name).await {
                             Ok(secret) => {
                                 new_secret_signal.set(Some(secret));
-                                status_signal.set(Some(format!("Issued API key '{app_name}'")));
+                                status_signal.set(Some(format!("Issued a key for {app_name}.")));
                             }
-                            Err(e) => {
-                                status_signal.set(Some(format!("API-key creation failed: {e}")))
-                            }
+                            Err(e) => status_signal.set(Some(format!("Couldn't issue a key: {e}"))),
                         }
                     }
                     AdminAction::RevokeApiKey { key_id } => {
                         match revoke_api_key(&base, &token, &key_id).await {
                             Ok(()) => {
                                 new_secret_signal.set(None);
-                                status_signal.set(Some(format!("Revoked {key_id}")));
+                                status_signal.set(Some(format!("Revoked the key for {subject}.")));
                             }
-                            Err(e) => {
-                                status_signal.set(Some(format!("API-key revoke failed: {e}")))
-                            }
+                            Err(e) => status_signal
+                                .set(Some(format!("Couldn't revoke the key for {subject}: {e}"))),
                         }
                     }
                     AdminAction::RecheckDamaged { media_id } => {
@@ -880,11 +929,13 @@ fn AdminPane(access_token: String, server_base: String, current_user_id: String)
                     }
                     AdminAction::SaveBranding(cfg) => {
                         match save_branding(&base, &token, &cfg).await {
-                            Ok(()) => status_signal.set(Some("Branding saved".into())),
-                            Err(e) => status_signal.set(Some(format!("Branding save failed: {e}"))),
+                            Ok(()) => status_signal.set(Some("Saved.".into())),
+                            Err(e) => status_signal.set(Some(format!("Couldn't save: {e}"))),
                         }
                     }
-                    AdminAction::SelectTab(_) | AdminAction::DeepSearch { .. } => {
+                    AdminAction::SelectTab(_)
+                    | AdminAction::DeepSearch { .. }
+                    | AdminAction::DismissStatus => {
                         unreachable!("handled above")
                     }
                 }
@@ -894,11 +945,69 @@ fn AdminPane(access_token: String, server_base: String, current_user_id: String)
         }
     };
 
-    let value = users_resource.read_unchecked();
-    let (users, fetch_err) = match value.as_ref() {
-        None => (Vec::<AdminUser>::new(), Some("loading…".to_string())),
-        Some(Ok(v)) => (v.clone(), None),
-        Some(Err(e)) => (Vec::new(), Some(e.clone())),
+    // The open tab's listing has not answered yet. Duplicates and Damaged
+    // files say so themselves.
+    let loading = match *active_tab.read() {
+        AdminTab::Users => users_resource.read_unchecked().is_none(),
+        AdminTab::Libraries => libraries_resource.read_unchecked().is_none(),
+        AdminTab::Devices => devices_resource.read_unchecked().is_none(),
+        AdminTab::Activity => activity_resource.read_unchecked().is_none(),
+        AdminTab::ScheduledTasks => scheduled_tasks_resource.read_unchecked().is_none(),
+        AdminTab::Plugins => plugins_resource.read_unchecked().is_none(),
+        AdminTab::Logs => logs_resource.read_unchecked().is_none(),
+        AdminTab::ApiKeys => api_keys_resource.read_unchecked().is_none(),
+        AdminTab::Branding => branding_resource.read_unchecked().is_none(),
+        AdminTab::Duplicates | AdminTab::Integrity => false,
+    };
+    // A listing that failed says why on the open tab, not as an empty list.
+    let tab_error = match *active_tab.read() {
+        AdminTab::Users => users_resource
+            .read_unchecked()
+            .as_ref()
+            .and_then(|r| r.as_ref().err().cloned()),
+        AdminTab::Libraries => libraries_resource
+            .read_unchecked()
+            .as_ref()
+            .and_then(|r| r.as_ref().err().cloned()),
+        AdminTab::Devices => devices_resource
+            .read_unchecked()
+            .as_ref()
+            .and_then(|r| r.as_ref().err().cloned()),
+        AdminTab::Activity => activity_resource
+            .read_unchecked()
+            .as_ref()
+            .and_then(|r| r.as_ref().err().cloned()),
+        AdminTab::ScheduledTasks => scheduled_tasks_resource
+            .read_unchecked()
+            .as_ref()
+            .and_then(|r| r.as_ref().err().cloned()),
+        AdminTab::Plugins => plugins_resource
+            .read_unchecked()
+            .as_ref()
+            .and_then(|r| r.as_ref().err().cloned()),
+        AdminTab::Logs => logs_resource
+            .read_unchecked()
+            .as_ref()
+            .and_then(|r| r.as_ref().err().cloned()),
+        AdminTab::ApiKeys => api_keys_resource
+            .read_unchecked()
+            .as_ref()
+            .and_then(|r| r.as_ref().err().cloned()),
+        AdminTab::Branding => branding_resource
+            .read_unchecked()
+            .as_ref()
+            .and_then(|r| r.as_ref().err().cloned()),
+        AdminTab::Duplicates | AdminTab::Integrity => None,
+    };
+    let fetch_err = tab_error.map(|e| {
+        format!(
+            "Couldn't load {}: {e}",
+            active_tab.read().label().to_lowercase()
+        )
+    });
+    let users: Vec<AdminUser> = match users_resource.read_unchecked().as_ref() {
+        Some(Ok(v)) => v.clone(),
+        _ => Vec::new(),
     };
     let libraries: Vec<LibraryFolder> = match libraries_resource.read_unchecked().as_ref() {
         Some(Ok(v)) => v.clone(),
@@ -940,7 +1049,12 @@ fn AdminPane(access_token: String, server_base: String, current_user_id: String)
         Some(Ok(v)) => v.clone(),
         _ => BrandingConfig::default(),
     };
-    let combined_status = fetch_err.or_else(|| status.read().clone());
+    // What an action just did outranks a load error, so its result always
+    // shows.
+    let combined_status = status
+        .read()
+        .clone()
+        .or_else(|| fetch_err.filter(|_| !*fetch_err_hidden.read()));
     let tab_now = *active_tab.read();
     let new_secret_now = new_api_key_secret.read().clone();
 
@@ -951,6 +1065,7 @@ fn AdminPane(access_token: String, server_base: String, current_user_id: String)
             status: combined_status,
             on_action: action_handler,
             active_tab: tab_now,
+            loading: loading,
             libraries: libraries,
             devices: devices,
             activity: activity,

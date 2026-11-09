@@ -55,6 +55,16 @@ pub mod playback;
 pub mod playback_settings;
 /// For the non-native player's `<video>` (V455).
 pub use platform::lift_cues_as_shown;
+
+/// Moves keyboard focus to the element `id` once the render that adds it has
+/// landed: for a confirm or form a button opens, and back to that button when
+/// it closes.
+pub fn focus_after_render(id: String) {
+    dioxus::prelude::spawn(async move {
+        platform::sleep_ms(0).await;
+        platform::focus_by_id(&id);
+    });
+}
 pub mod preplay;
 pub mod privacy;
 pub mod quality;
