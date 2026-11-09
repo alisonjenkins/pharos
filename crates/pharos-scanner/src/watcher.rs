@@ -267,6 +267,12 @@ impl Batch {
     fn absorb(&mut self, ev: &Event) {
         match ev.kind {
             EventKind::Create(_) | EventKind::Modify(notify::event::ModifyKind::Data(_)) => {
+                // A new `.ignore` hides rows already indexed, which only the
+                // full scan's sweep removes (V961).
+                if ev.paths.iter().any(|p| crate::fs::is_ignore_marker(p)) {
+                    tracing::info!(paths = ?ev.paths, "watch: .ignore marker created; reconciling");
+                    self.needs_reconcile = true;
+                }
                 self.touched.extend(ev.paths.iter().cloned());
             }
             // A rename is delivered as a Modify(Name) (and/or Remove); both
