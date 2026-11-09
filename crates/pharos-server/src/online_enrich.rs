@@ -90,6 +90,11 @@ pub struct EnrichedMetadata {
     /// as a neighbour's rather than this episode's in another language.
     /// Empty from providers that do not list a season.
     pub neighbour_titles: Vec<String>,
+    /// An episode record's show on THIS provider: the series id an episode
+    /// NFO's id read through to (B584), or the series id it was fetched
+    /// under. What spec 033 compares with the folder's pinned show match.
+    /// `None` from a movie or series-level record.
+    pub series_id: Option<String>,
 }
 
 /// A single online metadata/artwork provider (TMDB, TVDB, ...). The

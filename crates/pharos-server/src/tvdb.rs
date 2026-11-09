@@ -482,6 +482,7 @@ impl<T: TvdbTransport> TvdbClient<T> {
             }
         }
         md.texts = texts;
+        md.series_id = Some(series_id.to_string());
         Ok((md, failed))
     }
 
@@ -1917,6 +1918,11 @@ mod tests {
         assert_eq!(md.title.as_deref(), Some("The Naked Now"));
         assert_eq!(md.provider_id.as_deref(), Some("102"));
         assert_eq!(
+            md.series_id.as_deref(),
+            Some("71470"),
+            "spec 033 compares the series the id read through to, not the id"
+        );
+        assert_eq!(
             t.paths()[..2],
             ["/episodes/103", "/series/71470/episodes/default"]
         );
@@ -1964,6 +1970,7 @@ mod tests {
         let c = TvdbClient::with_transport("key".into(), t.clone());
         let md = c.get_episode("71470", 1, 3, None).await.expect("record");
         assert_eq!(md.provider_id.as_deref(), Some("103"));
+        assert_eq!(md.series_id.as_deref(), Some("71470"));
         c.get_episode("71470", 1, 4, None).await.expect("record");
         let asked = t.paths().iter().filter(|p| *p == "/episodes/71470").count();
         assert_eq!(asked, 1, "a series id is asked about once");
