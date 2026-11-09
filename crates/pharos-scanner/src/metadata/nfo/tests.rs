@@ -907,3 +907,28 @@ async fn a_dead_nfo_art_path_gives_way_to_the_show_folders_image() {
         Some(&ArtworkSource::LocalFile(dir.path().join("fanart.jpg")))
     );
 }
+
+#[test]
+fn show_nfo_evidence_reads_ids_and_year_of_this_show_only() {
+    let dir = tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("tvshow.nfo"),
+        r#"<tvshow><title>The Flash</title><year>2014</year>
+           <uniqueid type="tvdb">279121</uniqueid><uniqueid type="tmdb">60735</uniqueid></tvshow>"#,
+    )
+    .unwrap();
+    assert_eq!(
+        show_nfo_evidence(dir.path(), "The Flash", None),
+        Some(ShowNfoEvidence {
+            tvdb: Some("279121".into()),
+            tmdb: Some("60735".into()),
+            year: Some(2014),
+        })
+    );
+    // B558 — an NFO naming another show is no evidence for this one.
+    assert_eq!(show_nfo_evidence(dir.path(), "Arrow", None), None);
+    assert_eq!(
+        show_nfo_evidence(&dir.path().join("missing"), "The Flash", None),
+        None
+    );
+}
