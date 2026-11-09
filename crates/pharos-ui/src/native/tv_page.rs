@@ -524,7 +524,7 @@ mod tests {
             script,
             "const every = v instanceof HTMLVideoElement ? 1000 : 250;"
         );
-        assert!(AUDIO_TICK_MS * 4 <= VIDEO_TICK_MS);
+        const { assert!(AUDIO_TICK_MS * 4 <= VIDEO_TICK_MS) };
     }
 
     #[test]
