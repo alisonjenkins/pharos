@@ -227,7 +227,7 @@ impl Narrow {
 }
 
 /// `s` with everything but unreserved URL characters percent-encoded.
-fn encode_component(s: &str) -> String {
+pub(crate) fn encode_component(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
         if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) {

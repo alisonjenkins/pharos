@@ -1116,12 +1116,180 @@ input:focus-visible {
   color: var(--px-color-fg-muted);
   font-size: 0.9rem;
 }
+.pharos-cast-link {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  max-width: 100%;
+  color: inherit;
+  text-decoration: none;
+  border-radius: var(--px-radius);
+}
+.pharos-cast-link:hover .pharos-cast-name {
+  text-decoration: underline;
+}
+
+/* A person's page: photo and links, then films and shows. */
+.pharos-person {
+  display: flex;
+  gap: 2rem;
+  align-items: center;
+}
+.pharos-person-photo {
+  flex: 0 0 10rem;
+}
+.pharos-person-photo img,
+.pharos-person-initials {
+  display: block;
+  width: 10rem;
+  height: 10rem;
+  border-radius: 50%;
+  object-fit: cover;
+  background: var(--px-color-surface);
+}
+.pharos-person-initials {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 3rem;
+  font-weight: 600;
+  color: var(--px-color-fg-muted);
+  user-select: none;
+}
+.pharos-person-body {
+  min-width: 0;
+}
+.pharos-person-body h2 {
+  margin: 0 0 0.5rem;
+  font-size: 2rem;
+}
+.pharos-person-links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  margin: 1rem 0 0;
+  padding: 0;
+  list-style: none;
+}
+.pharos-person-section {
+  margin-top: 2rem;
+}
+.pharos-person-section h3 {
+  margin: 0 0 0.75rem;
+  font-size: 1.25rem;
+}
+.pharos-person-grid {
+  display: grid;
+  gap: 1rem;
+  grid-template-columns: repeat(auto-fill, minmax(9rem, 1fr));
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.pharos-person-grid > li {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+.pharos-person-character {
+  margin: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--px-color-fg-muted);
+  font-size: 0.9rem;
+}
+.pharos-person-shows {
+  display: flex;
+  flex-direction: column;
+  gap: 1.5rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.pharos-person-show {
+  display: flex;
+  gap: 1.25rem;
+  align-items: flex-start;
+}
+.pharos-person-show-poster {
+  flex: 0 0 9rem;
+  min-width: 0;
+}
+.pharos-person-show-body {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.pharos-person-show-name {
+  margin: 0 0 0.25rem;
+  font-size: 1.1rem;
+}
+.pharos-person-show-name a {
+  color: inherit;
+  text-decoration: none;
+}
+.pharos-person-show-name a:hover {
+  text-decoration: underline;
+}
+.pharos-person-show-body > .pharos-person-character {
+  margin-bottom: 0.5rem;
+  white-space: normal;
+}
+.pharos-person-episodes summary {
+  cursor: pointer;
+  font-weight: 600;
+  padding: 0.25rem 0;
+}
+.pharos-person-episodes ol {
+  margin: 0.25rem 0 0;
+  padding: 0;
+  list-style: none;
+}
+.pharos-person-episode {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0 0.75rem;
+  padding: 0.4rem 0.5rem;
+  border-radius: var(--px-radius);
+  color: inherit;
+  text-decoration: none;
+}
+.pharos-person-episode:hover {
+  background: var(--px-color-surface);
+}
+.pharos-person-episode-number {
+  flex: 0 0 auto;
+  font-variant-numeric: tabular-nums;
+  color: var(--px-color-fg-muted);
+}
+.pharos-person-episode-name {
+  min-width: 0;
+}
+.pharos-person-guest {
+  font-size: 0.8rem;
+  padding: 0 0.4rem;
+  border: 1px solid var(--px-color-border);
+  border-radius: 999px;
+  color: var(--px-color-fg-muted);
+}
 
 
 @media (max-width: 40rem) {
   .pharos-title {
     flex-direction: column;
     gap: 1.5rem;
+  }
+  .pharos-person {
+    flex-direction: column;
+    gap: 1rem;
+    text-align: center;
+  }
+  .pharos-person-links {
+    justify-content: center;
+  }
+  .pharos-person-show-poster {
+    flex-basis: 6rem;
   }
   .pharos-title-art {
     flex: none;

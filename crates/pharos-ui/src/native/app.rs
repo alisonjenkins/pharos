@@ -9,7 +9,7 @@ use dioxus::core::spawn_forever;
 use dioxus::prelude::*;
 use futures_util::StreamExt as _;
 use pharos_client::api::{
-    Detail, Home, Item, ItemKind, ItemRef, NativeApi, NativeGrant, PharosApi as _,
+    Detail, Home, Item, ItemKind, ItemRef, NativeApi, NativeGrant, PersonPage, PharosApi as _,
     PlaybackGrant as _, StartTracks, TrackChoice, TrackPicks,
 };
 use pharos_client::{CallInfo, ClientError};
@@ -29,6 +29,7 @@ use super::listen::{ListenView, QueuePanel};
 use super::machine::{Event, Machine, Phase};
 use super::mixes::{self, ActiveMix, MixCtx};
 use super::palette::{self, Row};
+use super::person::PersonView;
 use super::platform::{self, OpenError};
 use super::playback::{
     choose_engine, crossfade_ms, device_class, engine_verdict, fade_volume, format_tier_drop,
@@ -1943,6 +1944,7 @@ fn Screen(route: Route) -> Element {
         Route::Home => rsx! { HomeScreen {} },
         Route::Browse(id) => rsx! { BrowseScreen { id } },
         Route::Title(id) => rsx! { TitleScreen { id } },
+        Route::Person(id) => rsx! { PersonScreen { id } },
         // The stage beside the screen draws the player (spec 020).
         Route::Watch(_) => rsx! {},
         Route::SignIn => rsx! { Redirect { to: Route::Home } },
@@ -3468,6 +3470,41 @@ fn TitleScreen(id: ItemRef) -> Element {
                     }
                 }
             },
+        )}
+    }
+}
+
+/// Someone in a cast, and what they appear in. Follows `id` like
+/// [`TitleScreen`], since one person's page can stay mounted as another opens.
+#[component]
+fn PersonScreen(id: ItemRef) -> Element {
+    let ctx = use_context::<Ctx>();
+    let mut page = use_resource(use_reactive!(|(id,)| {
+        let api = ctx.api.read().clone();
+        let _ = (ctx.marks)();
+        async move {
+            let api = api?;
+            Some((
+                id,
+                settle_load(ctx.machine, api.person(&call("person", "load"), id).await),
+            ))
+        }
+    }));
+    let state = page.read();
+    let shown = state
+        .as_ref()
+        .and_then(Option::as_ref)
+        .filter(|(asked, _)| *asked == id)
+        .map(|(_, result)| result);
+    use_page_name(
+        id,
+        shown.and_then(|r| r.as_ref().ok()).map(|p| p.name.clone()),
+    );
+    rsx! {
+        {loaded_or_retry(
+            shown,
+            EventHandler::new(move |()| page.restart()),
+            |page: &PersonPage| rsx! { PersonView { page: page.clone() } },
         )}
     }
 }

@@ -1119,17 +1119,32 @@ fn CastRail(title: String, cast: Vec<Credit>) -> Element {
             ul { class: "pharos-cast-list",
                 for (i, c) in cast.into_iter().enumerate() {
                     li { key: "{i}", class: "pharos-cast-member",
-                        match &c.image_url {
-                            Some(src) => rsx! { img { class: "pharos-cast-photo", src: "{src}", alt: "", loading: "lazy", decoding: "async" } },
-                            None => rsx! { div { class: "pharos-cast-photo pharos-cast-initials", aria_hidden: "true", "{initials(&c.name)}" } },
-                        }
-                        span { class: "pharos-cast-name", title: "{c.name}", "{c.name}" }
-                        if !c.character.is_empty() {
-                            span { class: "pharos-cast-character", title: "{c.character}", "{c.character}" }
+                        match c.person {
+                            Some(id) => rsx! {
+                                Link { to: Route::Person(id), class: "pharos-cast-link", CastFace { credit: c.clone() } }
+                            },
+                            // A server older than schemaVersion 28 names no one to open.
+                            None => rsx! { CastFace { credit: c.clone() } },
                         }
                     }
                 }
             }
+        }
+    }
+}
+
+/// A cast member's photo (or initials), name and character.
+#[component]
+fn CastFace(credit: Credit) -> Element {
+    let c = credit;
+    rsx! {
+        match &c.image_url {
+            Some(src) => rsx! { img { class: "pharos-cast-photo", src: "{src}", alt: "", loading: "lazy", decoding: "async" } },
+            None => rsx! { div { class: "pharos-cast-photo pharos-cast-initials", aria_hidden: "true", "{initials(&c.name)}" } },
+        }
+        span { class: "pharos-cast-name", title: "{c.name}", "{c.name}" }
+        if !c.character.is_empty() {
+            span { class: "pharos-cast-character", title: "{c.character}", "{c.character}" }
         }
     }
 }
@@ -2474,6 +2489,42 @@ mod tests {
             "initials stand in for a missing photo: {html}"
         );
         assert!(html[guests..].contains("Sam Guest") && html[guests..].contains("Stranger"));
+    }
+
+    #[test]
+    fn a_cast_member_the_server_names_opens_their_page() {
+        let credit = |name: &str, person| Credit {
+            name: name.into(),
+            character: "Captain".into(),
+            kind: CreditKind::Actor,
+            image_url: None,
+            person,
+        };
+        let detail = Detail {
+            item: item(ItemKind::Movie),
+            overview: String::new(),
+            genres: vec![],
+            chapters: vec![],
+            audio_tracks: vec![],
+            subtitle_tracks: vec![],
+            trickplay: vec![],
+            segments: vec![],
+            fonts: Vec::new(),
+            artists: Vec::new(),
+            album: None,
+            cast: vec![
+                credit("Jane Lead", Some(ItemRef::Synth(77))),
+                credit("Old Server", None),
+            ],
+        };
+        let html = render(move || rsx! { TitleView { detail: detail.clone() } });
+        let link = html
+            .find(r#"href="/ui/person/s77""#)
+            .expect("a link to the page");
+        let jane = html.find("Jane Lead").expect("jane");
+        let old = html.find("Old Server").expect("old");
+        assert!(link < jane && jane < old, "{html}");
+        assert_eq!(html.matches("/ui/person/").count(), 1, "{html}");
     }
 
     #[test]
