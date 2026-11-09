@@ -182,7 +182,7 @@ async fn joining_a_missing_group_is_not_found() {
 /// member joining later starts on the pick.
 /// Disarm check: with `read_update` reading no `by`, the pause assertion fails.
 #[actix_web::test]
-async fn a_client_sets_tracks_follows_and_sees_who_paused() {
+async fn a_client_sets_tracks_holds_the_end_follows_and_sees_who_paused() {
     let rig = rig().await;
     let a = group(&rig, &rig.fx.admin_token).await;
     let b = group(&rig, &rig.fx.user_token).await;
@@ -223,6 +223,14 @@ async fn a_client_sets_tracks_follows_and_sees_who_paused() {
             by: a_id.clone(),
         }
     );
+
+    a_member.hold_next(&a_call, "").await.expect("hold next");
+    let held_by = until(&mut b_seen, |u| match u {
+        GroupUpdate::NextHeld { by, .. } => Some(by.clone()),
+        _ => None,
+    })
+    .await;
+    assert_eq!(held_by, a_id, "held by");
 
     b_member
         .follow_tracks(&b_call, false)

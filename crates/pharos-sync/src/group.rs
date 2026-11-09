@@ -414,6 +414,13 @@ pub enum GroupMsg {
         /// The queue entry the pick was made on; `None` skips the stale check.
         playlist_item_id: Option<String>,
     },
+    /// The sender cancelled "Up next" on queue entry `playlist_item_id`: the
+    /// group keeps watching its end, so every member's countdown stops
+    /// (B1027). `None` skips the stale check.
+    HoldNext {
+        sender: MemberId,
+        playlist_item_id: Option<String>,
+    },
     /// `follow` false puts the member on its own tracks ("Just me"): group
     /// track changes are announced as before but are not meant for it. `true`
     /// puts it back on the group's.
@@ -633,6 +640,11 @@ pub enum RemoteCommand {
         member_id: MemberId,
         follow: bool,
     },
+    HoldNext {
+        sender: MemberId,
+        #[serde(default)]
+        playlist_item_id: Option<String>,
+    },
     SetIgnoreWait {
         member_id: MemberId,
         ignore: bool,
@@ -837,6 +849,13 @@ impl RemoteCommand {
             RemoteCommand::FollowTracks { member_id, follow } => {
                 GroupMsg::FollowTracks { member_id, follow }
             }
+            RemoteCommand::HoldNext {
+                sender,
+                playlist_item_id,
+            } => GroupMsg::HoldNext {
+                sender,
+                playlist_item_id,
+            },
             RemoteCommand::SetIgnoreWait { member_id, ignore } => {
                 GroupMsg::SetIgnoreWait { member_id, ignore }
             }
@@ -1438,6 +1457,39 @@ fn record_tracks_outcome(outcome: TracksOutcome) {
     metrics::counter!("pharos_group_tracks_total", "outcome" => outcome.label()).increment(1);
 }
 
+/// What became of a member's "keep watching the end" (B1027). The label set
+/// is the contract for `pharos_group_next_hold_total`, asserted in
+/// `next_hold_outcome_labels_are_distinct_and_stable`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NextHoldOutcome {
+    /// The hold was recorded and announced to every member.
+    Applied,
+    /// The sender is not in the group's roster.
+    NotInGroup,
+    /// The playing entry was already held.
+    Unchanged,
+    /// The hold names an entry the group has since moved on from (B37).
+    Stale,
+    /// The group plays nothing, so there is no end to hold.
+    NoItem,
+}
+
+impl NextHoldOutcome {
+    pub fn label(self) -> &'static str {
+        match self {
+            NextHoldOutcome::Applied => "applied",
+            NextHoldOutcome::NotInGroup => "not_in_group",
+            NextHoldOutcome::Unchanged => "unchanged",
+            NextHoldOutcome::Stale => "stale",
+            NextHoldOutcome::NoItem => "no_item",
+        }
+    }
+}
+
+fn record_next_hold_outcome(outcome: NextHoldOutcome) {
+    metrics::counter!("pharos_group_next_hold_total", "outcome" => outcome.label()).increment(1);
+}
+
 /// The playback state a member was hydrated with when it joined, reconnected,
 /// or acked late. Bounded label set — asserted distinct in
 /// `hydrate_states_have_distinct_labels`.
@@ -1632,6 +1684,9 @@ struct GroupState {
     /// The queue entry `tracks` was chosen for; a different playing entry
     /// clears them (the new item's streams differ).
     tracks_pli: Option<String>,
+    /// The queue entry whose end the group keeps watching, and who asked
+    /// (B1027). Only meaningful while that entry plays. Not persisted.
+    next_held: Option<(String, MemberId)>,
     /// `Some` while the readiness gate is open (group is `Waiting`).
     waiting: Option<WaitingGate>,
     /// Display name shown in the join dialog (set from `/SyncPlay/New`).
@@ -1670,6 +1725,7 @@ impl GroupState {
             queue_broadcast: true,
             tracks: GroupTracks::default(),
             tracks_pli: None,
+            next_held: None,
             waiting: None,
             group_name: "Watch Party".to_string(),
             delivery,
@@ -1792,8 +1848,23 @@ impl GroupState {
                     last_update_unix_ms: self.queue.updated_unix_ms,
                 },
             );
+            if let Some((pli, by)) = self.held_next() {
+                self.send_one(
+                    member_id,
+                    ServerMsg::NextHeld {
+                        playlist_item_id: pli.to_string(),
+                        by,
+                    },
+                );
+            }
         }
         self.send_playback_state(member_id);
+    }
+
+    /// The hold on the playing entry's end, if it is held (B1027).
+    fn held_next(&self) -> Option<(&str, MemberId)> {
+        let (pli, by) = self.next_held.as_ref()?;
+        (Some(pli.as_str()) == self.current_playlist_item_id()).then_some((pli.as_str(), *by))
     }
 
     /// Send just the live playback command (Play, or Seek+Pause) to a single
@@ -3479,6 +3550,7 @@ fn msg_member(msg: &GroupMsg) -> Option<MemberId> {
         | GroupMsg::ResyncMember { member_id, .. } => Some(*member_id),
         GroupMsg::LeaderPlay { sender, .. }
         | GroupMsg::SetTracks { sender, .. }
+        | GroupMsg::HoldNext { sender, .. }
         | GroupMsg::LeaderPause { sender }
         | GroupMsg::LeaderSeek { sender, .. }
         | GroupMsg::Unpause { sender }
@@ -3659,6 +3731,32 @@ fn add_member(
     // the group's current position. Adding a member NEVER mutates
     // `playing_index` (A6: a join must not advance the group).
     state.send_catch_up(member_id);
+}
+
+/// Hold the playing entry's end for the group and announce it (B1027).
+fn hold_next(
+    state: &mut GroupState,
+    sender: MemberId,
+    playlist_item_id: &Option<String>,
+) -> NextHoldOutcome {
+    if !state.members.contains_key(&sender) {
+        return NextHoldOutcome::NotInGroup;
+    }
+    if state.pli_is_stale(playlist_item_id) {
+        return NextHoldOutcome::Stale;
+    }
+    let Some(current) = state.current_playlist_item_id().map(str::to_string) else {
+        return NextHoldOutcome::NoItem;
+    };
+    if state.held_next().is_some() {
+        return NextHoldOutcome::Unchanged;
+    }
+    state.next_held = Some((current.clone(), sender));
+    state.broadcast(ServerMsg::NextHeld {
+        playlist_item_id: current,
+        by: sender,
+    });
+    NextHoldOutcome::Applied
 }
 
 async fn handle(state: &mut GroupState, msg: GroupMsg) {
@@ -4394,6 +4492,20 @@ async fn handle(state: &mut GroupState, msg: GroupMsg) {
             state.broadcast(ServerMsg::Tracks {
                 tracks: state.tracks.clone(),
             });
+        }
+        GroupMsg::HoldNext {
+            sender,
+            playlist_item_id,
+        } => {
+            let outcome = hold_next(state, sender, &playlist_item_id);
+            tracing::info!(
+                group = %state.id, member = %sender,
+                sent = playlist_item_id.as_deref().unwrap_or(""),
+                current = state.current_playlist_item_id().unwrap_or(""),
+                outcome = outcome.label(),
+                "syncplay: up next hold"
+            );
+            record_next_hold_outcome(outcome);
         }
         GroupMsg::FollowTracks { member_id, follow } => {
             let Some(rec) = state.members.get_mut(&member_id) else {
@@ -6472,6 +6584,133 @@ mod tests {
         assert_eq!(count("unchanged"), 1, "{snap:?}");
         assert_eq!(count("stale"), 1, "{snap:?}");
         assert_eq!(count("not_in_group"), 1, "{snap:?}");
+    }
+
+    #[test]
+    fn next_hold_outcome_labels_are_distinct_and_stable() {
+        let all = [
+            (NextHoldOutcome::Applied, "applied"),
+            (NextHoldOutcome::NotInGroup, "not_in_group"),
+            (NextHoldOutcome::Unchanged, "unchanged"),
+            (NextHoldOutcome::Stale, "stale"),
+            (NextHoldOutcome::NoItem, "no_item"),
+        ];
+        let mut seen = HashSet::new();
+        for (outcome, label) in all {
+            assert_eq!(outcome.label(), label);
+            assert!(seen.insert(label), "{label} repeated");
+        }
+    }
+
+    async fn next_held(rx: &mut mpsc::Receiver<ServerMsg>) -> Option<(String, MemberId)> {
+        let m = recv_matching(rx, Duration::from_millis(500), |m| {
+            matches!(m, ServerMsg::NextHeld { .. })
+        })
+        .await?;
+        let ServerMsg::NextHeld {
+            playlist_item_id,
+            by,
+        } = m
+        else {
+            unreachable!()
+        };
+        Some((playlist_item_id, by))
+    }
+
+    /// V986: one member's "keep watching the end" reaches every member,
+    /// naming the entry and who held it; holding it again announces nothing.
+    #[tokio::test]
+    async fn a_next_hold_reaches_every_member_once() {
+        let (h, sinks, mut rx1, m1) = fresh().await;
+        let plis = seed_queue(&h, m1, &mut rx1).await;
+        let (m2, mut rx2) = add_member(&h, &sinks, "second").await;
+        h.tx.send(GroupMsg::HoldNext {
+            sender: m2,
+            playlist_item_id: Some(plis[0].clone()),
+        })
+        .await
+        .unwrap();
+        assert_eq!(next_held(&mut rx1).await, Some((plis[0].clone(), m2)));
+        assert_eq!(next_held(&mut rx2).await, Some((plis[0].clone(), m2)));
+
+        h.tx.send(GroupMsg::HoldNext {
+            sender: m1,
+            playlist_item_id: Some(plis[0].clone()),
+        })
+        .await
+        .unwrap();
+        assert_eq!(next_held(&mut rx1).await, None);
+    }
+
+    /// V986: a member joining or coming back while the end is held is told so
+    /// with its catch-up; once the group moves on the hold is over.
+    #[tokio::test]
+    async fn a_joiner_learns_of_the_hold_until_the_group_moves_on() {
+        let (h, sinks, mut rx1, m1) = fresh().await;
+        let plis = seed_queue(&h, m1, &mut rx1).await;
+        h.tx.send(GroupMsg::HoldNext {
+            sender: m1,
+            playlist_item_id: None,
+        })
+        .await
+        .unwrap();
+        let (_m2, mut rx2) = add_member(&h, &sinks, "late").await;
+        assert_eq!(next_held(&mut rx2).await, Some((plis[0].clone(), m1)));
+
+        h.tx.send(GroupMsg::NextItem {
+            sender: m1,
+            playlist_item_id: Some(plis[0].clone()),
+        })
+        .await
+        .unwrap();
+        let (_m3, mut rx3) = add_member(&h, &sinks, "later").await;
+        assert_eq!(next_held(&mut rx3).await, None);
+    }
+
+    /// V986, ODD: every outcome of a hold is counted under its own label.
+    #[tokio::test]
+    async fn every_next_hold_outcome_is_counted_under_its_label() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = pharos_test_metrics::snapshotter(&recorder);
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        let (h, _sinks, mut rx1, m1) = fresh().await;
+        let hold = async |sender: MemberId, pli: Option<&str>| {
+            h.tx.send(GroupMsg::HoldNext {
+                sender,
+                playlist_item_id: pli.map(str::to_string),
+            })
+            .await
+            .unwrap();
+        };
+        hold(m1, None).await; // no item
+        let plis = seed_queue(&h, m1, &mut rx1).await;
+        hold(m1, Some(&plis[1])).await; // stale
+        hold(MemberId::new(), Some(&plis[0])).await; // not in group
+        hold(m1, Some(&plis[0])).await; // applied
+        hold(m1, Some(&plis[0])).await; // unchanged
+        let _ = snapshot_of(&h).await;
+
+        let snap = snapshotter.snapshot().into_vec();
+        let count = |outcome: &str| -> u64 {
+            snap.iter()
+                .filter(|(ck, _, _, _)| ck.key().name() == "pharos_group_next_hold_total")
+                .filter(|(ck, _, _, _)| {
+                    ck.key()
+                        .labels()
+                        .any(|l| l.key() == "outcome" && l.value() == outcome)
+                })
+                .map(|(_, _, _, v)| match v {
+                    DebugValue::Counter(n) => *n,
+                    _ => 0,
+                })
+                .sum()
+        };
+        for outcome in ["no_item", "stale", "not_in_group", "applied", "unchanged"] {
+            assert_eq!(count(outcome), 1, "{outcome}: {snap:?}");
+        }
     }
 
     #[tokio::test]

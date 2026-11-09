@@ -12,7 +12,7 @@ annotation secret(field, param) :Void;
 
 # Bumped when the schema changes; served as ServerInfo.schemaVersion so a client
 # can tell which methods a server knows (FR-009).
-const schemaVersion :UInt32 = 31;
+const schemaVersion :UInt32 = 33;
 
 # ---- ids and shared types -------------------------------------------------
 struct ItemId {                # mirrors pharos_jellyfin_api::WireId
@@ -547,6 +547,12 @@ interface Membership {
   # playing one, so two members' autoplay at an episode's end moves it once.
   # Empty skips that check. Since schemaVersion 23.
   setItem   @11 (ctx :CallContext, item :ItemId, positionMs :UInt64, playlistItemId :Text) -> (result :Done);
+  # Keep watching the end of queue entry `playlistItemId` (B1027): every
+  # member's "Up next" stops counting on it and none plays the next item by
+  # itself; each member is told with a `nextHeld` update, a late joiner with
+  # its catch-up. Ends when the group moves to another entry. Empty skips the
+  # stale-entry check. Since schemaVersion 33.
+  holdNext  @12 (ctx :CallContext, playlistItemId :Text) -> (result :Done);
 }
 # For a film or episode `played` and `positionPct` (0-100, the resume point)
 # apply. For a series or season `playedCount` of `totalCount` episodes (the ones
@@ -566,9 +572,11 @@ struct GroupUpdate {
     item    @6 :ItemAt;                # the group moved to another item
     ended   @7 :EndReason;
     tracks  @8 :GroupTracks;           # the group's audio or subtitle changed
+    nextHeld @9 :NextHeld;             # a member kept watching the end (holdNext)
   }
   # `by` is the member id that caused it; "" when the group did (all ready).
   struct At { atServerMs @0 :UInt64; positionMs @1 :UInt64; by @2 :Text; }
   struct ItemAt { item @0 :ItemId; playlistItemId @1 :Text; positionMs @2 :UInt64; playing @3 :Bool; }
+  struct NextHeld { playlistItemId @0 :Text; by @1 :Text; }
 }
 interface GroupSink { update @0 (ctx :CallContext, update :GroupUpdate) -> (result :Done); }

@@ -288,6 +288,10 @@ enum Seen {
         subtitle: String,
         by: String,
     },
+    NextHeld {
+        playlist_item_id: String,
+        by: String,
+    },
 }
 
 /// A track choice as "unset", "off" or the stream index.
@@ -404,6 +408,13 @@ impl server::group_sink::Handler for TestSink {
                     by: text(t.get_by()),
                 }
             }
+            group_update::NextHeld(h) => {
+                let h = h?;
+                Seen::NextHeld {
+                    playlist_item_id: text(h.get_playlist_item_id()),
+                    by: text(h.get_by()),
+                }
+            }
         };
         let _ = self.0.send(seen);
         let _ = results;
@@ -461,8 +472,10 @@ async fn until_polled<T>(
     .expect("an update within 3 s")
 }
 
+/// A call from `device`, by a client built against this schema.
 fn set_device(session_ctx: pharos_api::pharos_capnp::call_context::Builder<'_>, device: &str) {
     let mut ctx = session_ctx;
+    ctx.set_schema_version(pharos_api::pharos_capnp::SCHEMA_VERSION);
     ctx.reborrow().init_device().set_value(device);
 }
 
@@ -500,11 +513,30 @@ async fn join(
     id: &str,
     sink: group_sink::Client,
 ) -> Result<membership::Client, String> {
+    join_at(
+        session,
+        device,
+        id,
+        sink,
+        pharos_api::pharos_capnp::SCHEMA_VERSION,
+    )
+    .await
+}
+
+/// [`join`] by a client built against `schema`.
+async fn join_at(
+    session: &session::Client,
+    device: &str,
+    id: &str,
+    sink: group_sink::Client,
+    schema: u32,
+) -> Result<membership::Client, String> {
     let group = session.group_request().send().pipeline.get_group();
     let mut req = group.join_request();
     {
         let mut p = req.get();
         set_device(p.reborrow().init_ctx(), device);
+        p.reborrow().get_ctx().unwrap().set_schema_version(schema);
         p.reborrow().init_id().set_value(id);
         p.set_sink(sink);
     }
@@ -905,6 +937,61 @@ async fn a_tracks_pick_from_another_queue_entry_is_dropped() {
     })
     .await;
     assert_eq!(audio, "3");
+}
+
+/// V986: one member keeping the end of an episode tells every member, naming
+/// who held it, and a late joiner hears it with its catch-up.
+/// Disarm check: with `translate` dropping `ServerMsg::NextHeld`, B's sink
+/// never sees it and this times out.
+#[actix_web::test]
+async fn a_next_hold_reaches_the_group_and_a_late_joiner() {
+    let rig = rig().await;
+    let mut pair = playing_pair(&rig).await;
+    let a_id =
+        pharos_sync::hub::member_id_for_device(&format!("{}:dev-a", rig.fx.admin_id.0.simple()))
+            .to_string();
+    command!(pair.a, hold_next_request, set_playlist_item_id("")).unwrap();
+    let held = |s: &Seen| match s {
+        Seen::NextHeld {
+            playlist_item_id,
+            by,
+        } => Some((playlist_item_id.clone(), by.clone())),
+        _ => None,
+    };
+    let (pli, by) = until(&mut pair.b_seen, held).await;
+    assert!(!pli.is_empty());
+    assert_eq!(by, a_id);
+
+    let gid = only_group(&rig).await;
+    let c_session = rig.session(&rig.fx.user_token).await;
+    let (c_sink, mut c_seen) = sink();
+    let _c = join(&c_session, "dev-c", &gid, c_sink).await.unwrap();
+    assert_eq!(until(&mut c_seen, held).await, (pli, a_id));
+}
+
+/// V986: a member whose client predates `nextHeld` is never sent one, so it
+/// keeps hearing the group: an update it cannot read fails the sink call,
+/// which stops its pump.
+/// Disarm check: with `Reads::takes` always true, C hears no pause.
+#[actix_web::test]
+async fn an_older_client_is_not_sent_the_hold_and_keeps_hearing_the_group() {
+    let rig = rig().await;
+    let pair = playing_pair(&rig).await;
+    let gid = only_group(&rig).await;
+    let c_session = rig.session(&rig.fx.user_token).await;
+    let (c_sink, mut c_seen) = sink();
+    let _c = join_at(&c_session, "dev-c", &gid, c_sink, 32)
+        .await
+        .unwrap();
+    settle(&mut c_seen).await;
+    command!(pair.a, hold_next_request, set_playlist_item_id("")).unwrap();
+    command!(pair.a, pause_request).unwrap();
+    let first = until(&mut c_seen, |s| match s {
+        Seen::NextHeld { .. } | Seen::Pause { .. } => Some(s.clone()),
+        _ => None,
+    })
+    .await;
+    assert!(matches!(first, Seen::Pause { .. }), "{first:?}");
 }
 
 /// V396: "Just me" is announced to the group as a member update, shows in the
