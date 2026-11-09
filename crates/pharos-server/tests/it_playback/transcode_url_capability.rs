@@ -27,7 +27,7 @@ const PROFILE_TRANSCODE: &str = r#"{"DeviceProfile":{
 
 const UA_ANDROID_TV: &str = "Jellyfin Android TV/0.19.9 via jellyfin-sdk-kotlin (OkHttp/4.12.0)";
 
-async fn seed() -> (web::Data<AppState>, String) {
+async fn seed() -> (web::Data<AppState>, String, UserId) {
     let stores = Stores::connect("sqlite::memory:").await.unwrap();
     let auth = BuiltinAuth::new(stores.clone());
     let hash = auth.hash_password(&SecretString::new("p")).unwrap();
@@ -89,7 +89,7 @@ async fn seed() -> (web::Data<AppState>, String) {
             .unwrap();
     }
     let state = web::Data::new(AppState::new(stores, "t".into()));
-    (state, token.0.expose().to_string())
+    (state, token.0.expose().to_string(), uid)
 }
 
 macro_rules! init_app {
@@ -147,7 +147,7 @@ fn transcoding_url(v: &serde_json::Value) -> String {
 
 #[actix_web::test]
 async fn transcoding_urls_carry_the_play_session_not_the_token() {
-    let (state, token) = seed().await;
+    let (state, token, _) = seed().await;
     let app = init_app!(state);
     for id in [1, 2] {
         let v = playback_info!(&app, token.as_str(), id);
@@ -161,7 +161,7 @@ async fn transcoding_urls_carry_the_play_session_not_the_token() {
 
 #[actix_web::test]
 async fn subtitle_delivery_urls_carry_the_play_session_not_the_token() {
-    let (state, token) = seed().await;
+    let (state, token, _) = seed().await;
     let app = init_app!(state);
     let v = playback_info!(&app, token.as_str(), 1);
     let psid = v["PlaySessionId"].as_str().unwrap();
@@ -182,7 +182,7 @@ async fn subtitle_delivery_urls_carry_the_play_session_not_the_token() {
 
 #[actix_web::test]
 async fn a_tokenless_master_and_its_variant_play_on_the_play_session() {
-    let (state, token) = seed().await;
+    let (state, token, _) = seed().await;
     let app = init_app!(state);
     let url = transcoding_url(&playback_info!(&app, token.as_str(), 1));
     let (status, master) = bare_get!(&app, &url);
@@ -201,7 +201,7 @@ async fn a_tokenless_master_and_its_variant_play_on_the_play_session() {
 
 #[actix_web::test]
 async fn a_tokenless_universal_audio_url_passes_auth() {
-    let (state, token) = seed().await;
+    let (state, token, _) = seed().await;
     let app = init_app!(state);
     let url = transcoding_url(&playback_info!(&app, token.as_str(), 2));
     assert!(
@@ -215,7 +215,7 @@ async fn a_tokenless_universal_audio_url_passes_auth() {
 
 #[actix_web::test]
 async fn an_unknown_or_foreign_play_session_is_refused() {
-    let (state, token) = seed().await;
+    let (state, token, _) = seed().await;
     let app = init_app!(state);
     let v = playback_info!(&app, token.as_str(), 1);
     let psid = v["PlaySessionId"].as_str().unwrap();
@@ -234,7 +234,7 @@ async fn an_unknown_or_foreign_play_session_is_refused() {
 
 #[actix_web::test]
 async fn a_revoked_holder_ends_the_capability() {
-    let (state, token) = seed().await;
+    let (state, token, _) = seed().await;
     let app = init_app!(state.clone());
     let url = transcoding_url(&playback_info!(&app, token.as_str(), 1));
     state.stores.revoke(&token).await.unwrap();
@@ -244,7 +244,7 @@ async fn a_revoked_holder_ends_the_capability() {
 
 #[actix_web::test]
 async fn a_header_authed_master_with_its_play_session_embeds_no_token() {
-    let (state, token) = seed().await;
+    let (state, token, _) = seed().await;
     let app = init_app!(state);
     let url = transcoding_url(&playback_info!(&app, token.as_str(), 1));
     let body = test::call_and_read_body(
@@ -264,7 +264,7 @@ async fn a_header_authed_master_with_its_play_session_embeds_no_token() {
 async fn a_master_without_a_live_play_session_still_hands_its_token_on() {
     // A client that builds its own master URL and names no registered
     // session keeps working: its segments still need the token it sent.
-    let (state, token) = seed().await;
+    let (state, token, _) = seed().await;
     let app = init_app!(state);
     let body = test::call_and_read_body(
         &app,
@@ -282,12 +282,20 @@ async fn each_credential_is_counted() {
     use metrics_util::debugging::{DebugValue, DebuggingRecorder};
     let rec = DebuggingRecorder::new();
     let _g = metrics::set_default_local_recorder(&rec);
-    let (state, token) = seed().await;
-    let app = init_app!(state);
+    let (state, token, _) = seed().await;
+    let app = init_app!(state.clone());
     let url = transcoding_url(&playback_info!(&app, token.as_str(), 1));
     let _ = bare_get!(&app, &url);
     let _ = bare_get!(&app, "/videos/1/master.m3u8?PlaySessionId=nope");
     let _ = bare_get!(&app, &format!("/videos/1/master.m3u8?api_key={token}"));
+    let psid = url
+        .split(['?', '&'])
+        .find_map(|kv| kv.strip_prefix("PlaySessionId="))
+        .unwrap()
+        .to_string();
+    let _ = bare_get!(&app, &format!("/videos/2/master.m3u8?PlaySessionId={psid}"));
+    state.stores.revoke(&token).await.unwrap();
+    let _ = bare_get!(&app, &url);
     let rows = pharos_test_metrics::snapshotter(&rec).snapshot().into_vec();
     let count = |name: &str, key: &str, value: &str| {
         rows.iter()
@@ -324,4 +332,93 @@ async fn each_credential_is_counted() {
         count("pharos_play_capability_total", "outcome", "no_session"),
         1
     );
+    assert_eq!(
+        count("pharos_play_capability_total", "outcome", "wrong_item"),
+        1
+    );
+    assert_eq!(
+        count("pharos_play_capability_total", "outcome", "holder_ended"),
+        1
+    );
+}
+
+#[actix_web::test]
+async fn a_capability_answers_to_the_holders_current_policy() {
+    // The capability names the user; what they may see is read on each use,
+    // so a library taken away after PlaybackInfo hides the item (V187), with
+    // no token and with a stale cookie alike.
+    let (state, token, uid) = seed().await;
+    // A real sidecar, so the subtitle route serves 200 until the policy moves.
+    let dir = tempfile::tempdir().unwrap();
+    let video = dir.path().join("subbed.mkv");
+    std::fs::write(&video, b"x").unwrap();
+    std::fs::write(
+        dir.path().join("subbed.eng.vtt"),
+        b"WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nhi\n",
+    )
+    .unwrap();
+    state
+        .stores
+        .put(MediaItem {
+            id: 3,
+            path: video,
+            title: "Subbed".into(),
+            kind: MediaKind::Movie,
+            probe: MediaProbe {
+                duration_ms: Some(60_000),
+                container: Some("mkv".into()),
+                video_codec: Some("hevc".into()),
+                audio_codec: Some("ac3".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let app = init_app!(state.clone());
+    let v = playback_info!(&app, token.as_str(), 3);
+    let master = transcoding_url(&v);
+    let sub = v["MediaSources"][0]["MediaStreams"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find_map(|s| s["DeliveryUrl"].as_str())
+        .unwrap_or_else(|| panic!("expected the sidecar's DeliveryUrl: {v}"))
+        .to_string();
+    let cases = [
+        (&master, false),
+        (&master, true),
+        (&sub, false),
+        (&sub, true),
+    ];
+    let get = |uri: &str, stale_cookie: bool| {
+        let mut req = test::TestRequest::get().uri(uri);
+        if stale_cookie {
+            req = req.insert_header(("Cookie", "JellyfinAuth=0123456789abcdef0123456789abcdef"));
+        }
+        req.to_request()
+    };
+    for (uri, cookie) in cases {
+        let status = test::call_service(&app, get(uri, cookie)).await.status();
+        assert!(
+            status == StatusCode::OK,
+            "{uri} stale_cookie={cookie}: {status}"
+        );
+    }
+    state
+        .stores
+        .set_policy(
+            uid,
+            UserPolicy {
+                enable_all_folders: false,
+                enabled_folders: vec![],
+                ..UserPolicy::default()
+            },
+        )
+        .await
+        .unwrap();
+    for (uri, cookie) in cases {
+        let status = test::call_service(&app, get(uri, cookie)).await.status();
+        assert_eq!(status, StatusCode::NOT_FOUND, "{uri} stale_cookie={cookie}");
+    }
 }
