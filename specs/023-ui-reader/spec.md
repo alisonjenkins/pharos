@@ -2,7 +2,7 @@
 
 **Feature directory**: `specs/023-ui-reader/`
 **Created**: 2026-11-04T00:55:00Z
-**Status**: draft
+**Status**: slices 1 and 3 merged; 2 and 4 in progress (2026-11-09)
 **Input**: "We cannot currently read any of the books, if possible please again
 make it so we have something in Rust + WASM for doing that" and "Make sure that
 is its own re-usable crate as that is a nice thing that I might want to use
