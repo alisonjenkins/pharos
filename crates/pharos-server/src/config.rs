@@ -696,6 +696,11 @@ pub struct ServerConfig {
     /// this plus the in-flight drain. Default `10`.
     #[serde(default = "default_drain_grace_secs")]
     pub drain_grace_secs: u64,
+    /// actix-web worker threads (ADR-0083). Each costs ~5.6 MiB of heap for
+    /// its own copy of the route table. Unset or `0`: one per CPU, capped at
+    /// 16, where the 2026-11-09 benchmark stopped gaining throughput.
+    #[serde(default)]
+    pub http_workers: Option<usize>,
     /// Default video-bitrate ceiling (bps) applied to a TRANSCODE when the
     /// client connects from a REMOTE (non-private, non-loopback) address.
     ///
@@ -1754,6 +1759,17 @@ mod tests {
             parse("transcode_vaapi_gpu_resident = true")
                 .expect("parses")
                 .transcode_vaapi_gpu_resident
+        );
+    }
+
+    #[test]
+    fn http_workers_is_unset_unless_given() {
+        let parse =
+            |extra: &str| toml::from_str::<ServerConfig>(&format!("bind = \"0.0.0.0:1\"\n{extra}"));
+        assert_eq!(parse("").expect("parses").http_workers, None);
+        assert_eq!(
+            parse("http_workers = 4").expect("parses").http_workers,
+            Some(4)
         );
     }
 

@@ -17,6 +17,7 @@ pub mod config;
 pub mod dlna;
 pub mod group_ops;
 pub mod health;
+pub mod http_workers;
 #[cfg(all(unix, feature = "ffmpeg-lib"))]
 pub mod integrity_backfill;
 pub mod integrity_deep;
