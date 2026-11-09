@@ -51,7 +51,22 @@ pub fn picture_area(src: &Path, duration_ms: u64) -> Result<PictureAnalysis, Fra
         });
         Ok(true)
     })?;
+    sampled_all(planes.len())?;
     Ok(analyse(&planes))
+}
+
+/// Every sample point inside the runtime lands on a keyframe, so fewer
+/// frames than points means a seek or a read stopped the sampler early: it
+/// keeps what it has, which would store a verdict from a partial sample. Not
+/// the file's fault as far as anyone can tell: `Other`, retried next pass.
+fn sampled_all(frames: usize) -> Result<(), FrameError> {
+    if frames < SAMPLE_PERCENTS.len() {
+        return Err(FrameError::Other(format!(
+            "sampled {frames} of {} frames: a seek or read stopped early",
+            SAMPLE_PERCENTS.len()
+        )));
+    }
+    Ok(())
 }
 
 /// The container's own runtime, for a file the scan has no runtime for.
@@ -68,4 +83,20 @@ fn container_duration_ms(src: &Path) -> Result<u64, FrameError> {
         ictx.duration()
     };
     Ok(u64::try_from(duration_us / 1000).unwrap_or(0))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_sample_cut_short_is_retried_not_judged() {
+        assert!(sampled_all(SAMPLE_PERCENTS.len()).is_ok());
+        for short in [0, 1, SAMPLE_PERCENTS.len() - 1] {
+            assert!(
+                matches!(sampled_all(short), Err(FrameError::Other(_))),
+                "{short} frames"
+            );
+        }
+    }
 }
