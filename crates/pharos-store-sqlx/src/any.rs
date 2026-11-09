@@ -10,9 +10,9 @@ use pharos_core::{
     AuthResult, AuthToken, Collection, CollectionCount, CollectionStore, DomainResult,
     EntityCounts, Fingerprint, GenreCount, GenreStore, IssuedToken, ItemPerson, Library,
     LibraryKind, LibraryStore, MediaFacets, MediaId, MediaItem, MediaQuery, MediaStore,
-    PersistedSyncGroup, PersistedTranscodeSession, Person, PersonCount, PersonRef, PersonStore,
-    PlaybackProgress, Playlist, PlaylistEntry, PlaylistStore, PreferenceStore, ResolvedToken,
-    ScanState, SearchQuery, SecretString, SeriesMatchCandidate, SeriesMetadata,
+    PersistedSyncGroup, PersistedTranscodeSession, Person, PersonCount, PersonDetails, PersonRef,
+    PersonStore, PlaybackProgress, Playlist, PlaylistEntry, PlaylistStore, PreferenceStore,
+    ResolvedToken, ScanState, SearchQuery, SecretString, SeriesMatchCandidate, SeriesMetadata,
     SeriesMetadataStore, Studio, StudioCount, StudioStore, SyncGroupStore, Tag, TagCount, TagStore,
     TokenId, TokenRecord, TokenScope, TokenSelector, TokenStore, TranscodeSessionStore,
     UserDataStore, UserId, UserItemData, UserPolicy, UserRecord, UserStore,
@@ -807,6 +807,20 @@ impl PersonStore for AnyStore {
         match self {
             AnyStore::Sqlite(s) => s.credits_for_person(wire_id).await,
             AnyStore::Postgres(p) => p.credits_for_person(wire_id).await,
+        }
+    }
+
+    async fn person_details(&self, wire_id: &str) -> DomainResult<Option<PersonDetails>> {
+        match self {
+            AnyStore::Sqlite(s) => s.person_details(wire_id).await,
+            AnyStore::Postgres(p) => p.person_details(wire_id).await,
+        }
+    }
+
+    async fn put_person_details(&self, wire_id: &str, details: &PersonDetails) -> DomainResult<()> {
+        match self {
+            AnyStore::Sqlite(s) => s.put_person_details(wire_id, details).await,
+            AnyStore::Postgres(p) => p.put_person_details(wire_id, details).await,
         }
     }
 }
