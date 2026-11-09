@@ -2430,6 +2430,7 @@ mod tests {
     #[test]
     fn an_episode_lists_its_cast_then_its_guest_stars() {
         let credit = |name: &str, character: &str, kind, image: Option<&str>| Credit {
+            person: None,
             name: name.into(),
             character: character.into(),
             kind,

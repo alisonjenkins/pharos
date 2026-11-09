@@ -226,6 +226,40 @@ pub struct Credit {
     pub kind: CreditKind,
     /// The person's photo on this server, `None` when there is none.
     pub image_url: Option<String>,
+    /// What [`PharosApi::person`] takes; `None` from a server older than
+    /// schemaVersion 28.
+    pub person: Option<ItemRef>,
+}
+
+/// Someone in a cast, and what they appear in that the viewer may see.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct PersonPage {
+    pub id: Option<ItemRef>,
+    pub name: String,
+    /// Their photo on this server, `None` when there is none.
+    pub image_url: Option<String>,
+    /// Newest first.
+    pub films: Vec<Appearance>,
+    /// The show they are in most first.
+    pub shows: Vec<ShowAppearances>,
+}
+
+/// One item a person appears in, and who they play there.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Appearance {
+    pub item: Item,
+    /// Empty when the credit names no one.
+    pub character: String,
+    pub kind: CreditKind,
+}
+
+/// The episodes of one show a person appears in, in season order.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ShowAppearances {
+    pub series: Item,
+    /// Who they play in it, most episodes first.
+    pub characters: Vec<String>,
+    pub episodes: Vec<Appearance>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -444,6 +478,8 @@ pub trait PharosApi {
     /// most `limit` (0 is the server's default page).
     async fn search(&self, call: &CallInfo, text: &str, limit: u32) -> Result<Page, ClientError>;
     async fn detail(&self, call: &CallInfo, id: ItemRef) -> Result<Detail, ClientError>;
+    /// The person `id` names (a [`Credit::person`]) and what they appear in.
+    async fn person(&self, call: &CallInfo, id: ItemRef) -> Result<PersonPage, ClientError>;
     async fn lyrics(
         &self,
         call: &CallInfo,
@@ -1029,6 +1065,11 @@ impl PharosApi for NativeApi {
                                     kind,
                                     image_url: Some(text(c.get_image_url())?)
                                         .filter(|u| !u.is_empty()),
+                                    person: if c.has_person_id() {
+                                        Some(read_item_ref(c.get_person_id()?)?)
+                                    } else {
+                                        None
+                                    },
                                 })
                             })())
                         })
@@ -1036,6 +1077,66 @@ impl PharosApi for NativeApi {
                 })
             }
             detail_result::Error(e) => Err(ClientError::from_api(e?)),
+        }
+    }
+
+    async fn person(&self, call: &CallInfo, id: ItemRef) -> Result<PersonPage, ClientError> {
+        use pharos_api::pharos_capnp::{person_credit, person_result};
+        // A credit kind newer than this build still lists the item: being on
+        // the page matters more than the label.
+        fn appearance(a: person_credit::Reader<'_>) -> Result<Appearance, capnp::Error> {
+            Ok(Appearance {
+                item: read_item(a.get_item()?)?,
+                character: text(a.get_character())?,
+                kind: read_credit_kind(a.get_kind()).unwrap_or_default(),
+            })
+        }
+        let mut req = self.library.person_request();
+        {
+            let mut p = req.get();
+            call.write(p.reborrow().init_ctx());
+            set_item_ref(p.init_id(), id);
+        }
+        let reply = req.send().promise.await?;
+        match reply
+            .get()?
+            .get_result()?
+            .which()
+            .map_err(capnp::Error::from)?
+        {
+            person_result::Person(p) => {
+                let p = p?;
+                Ok(PersonPage {
+                    id: Some(read_item_ref(p.get_id()?)?),
+                    name: text(p.get_name())?,
+                    image_url: Some(text(p.get_image_url())?).filter(|u| !u.is_empty()),
+                    films: p
+                        .get_films()?
+                        .iter()
+                        .map(appearance)
+                        .collect::<Result<_, capnp::Error>>()?,
+                    shows: p
+                        .get_shows()?
+                        .iter()
+                        .map(|s| {
+                            Ok(ShowAppearances {
+                                series: read_item(s.get_series()?)?,
+                                characters: s.get_characters()?.iter().map(text).collect::<Result<
+                                    _,
+                                    capnp::Error,
+                                >>(
+                                )?,
+                                episodes: s
+                                    .get_episodes()?
+                                    .iter()
+                                    .map(appearance)
+                                    .collect::<Result<_, capnp::Error>>()?,
+                            })
+                        })
+                        .collect::<Result<_, capnp::Error>>()?,
+                })
+            }
+            person_result::Error(e) => Err(ClientError::from_api(e?)),
         }
     }
 
