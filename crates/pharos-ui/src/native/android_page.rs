@@ -414,6 +414,18 @@ pub fn exit_vr() {}
 
 pub fn select_field(_id: &str) {}
 
+/// Move the focus to `to` when it is inside `within` (B1031): the compact
+/// player's picture hands it to the stage bar.
+pub fn focus_out_of(within: &str, to: &str) {
+    run(format!(
+        "const a = document.activeElement; const w = document.getElementById({}); \
+         const t = document.getElementById({}); \
+         if (a && w && t && w.contains(a)) t.focus({{preventScroll: true}});",
+        js_str(within),
+        js_str(to)
+    ));
+}
+
 pub fn focus_by_id(id: &str) {
     run(format!(
         "const el = document.getElementById({}); if (el) el.focus();",

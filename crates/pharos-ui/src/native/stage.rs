@@ -24,6 +24,13 @@ const VIEW_KEY: &str = "pharos.stage.view";
 const WIDTH_KEY: &str = "pharos.stage.width";
 /// The floating window's drag handle.
 const STRIP_CLASS: &str = "pharos-stage-strip";
+/// The stage bar's Expand button, where a TV's focus lands as the player
+/// goes compact (B1031).
+pub const STAGE_EXPAND_ID: &str = "pharos-stage-expand";
+/// Whether the D-pad's spatial focus is the only way round the page (a TV):
+/// the floating window's strip is then no focus stop, as its arrows would
+/// move the window rather than the focus (B1031).
+const REMOTE_FOCUS: bool = cfg!(target_os = "android");
 /// How far an arrow key moves the floating window, in px (FR-007).
 pub const KEY_STEP_PX: f64 = 16.0;
 /// The narrowest the floating window resizes to, in px: the strip's
@@ -491,6 +498,20 @@ struct Drag {
     from: Spot,
 }
 
+/// Whether the strip is a focus stop whose arrows move the window: the
+/// floating window's, unless the arrows are a TV's only way between
+/// controls (B1031).
+fn strip_movable(floating: bool, remote_focus: bool) -> bool {
+    floating && !remote_focus
+}
+
+/// Whether the floating window shows its resize grip: not on a TV, where
+/// the grip would be one more focus stop over the picture whose arrows
+/// resize the window rather than move the focus (B1031).
+pub fn grip_shown(floating: bool) -> bool {
+    floating && !REMOTE_FOCUS
+}
+
 /// The compact player's chrome: the title strip (the drag handle of the
 /// floating window), the transport and a thin progress line. Drawn by the
 /// player over its own media element, which stays where it is.
@@ -541,7 +562,7 @@ pub fn StageBar(
     };
     let on_strip_key = move |evt: KeyboardEvent| {
         // Only on the strip itself; a focused button keeps its own keys.
-        if !floating || !platform::key_on_itself(&evt, STRIP_CLASS) {
+        if !strip_movable(floating, REMOTE_FOCUS) || !platform::key_on_itself(&evt, STRIP_CLASS) {
             return;
         }
         let delta = match evt.key() {
@@ -562,8 +583,8 @@ pub fn StageBar(
             "data-view": view.label(),
             div {
                 class: STRIP_CLASS,
-                tabindex: if floating { "0" } else { "-1" },
-                aria_label: if floating { "Move the player with the arrow keys" },
+                tabindex: if strip_movable(floating, REMOTE_FOCUS) { "0" } else { "-1" },
+                aria_label: if strip_movable(floating, REMOTE_FOCUS) { "Move the player with the arrow keys" },
                 onkeydown: on_strip_key,
                 onpointerdown: move |evt: PointerEvent| {
                     // The strip's buttons are not handles.
@@ -669,6 +690,7 @@ pub fn StageBar(
                     button {
                         class: "pharos-stage-button",
                         r#type: "button",
+                        id: STAGE_EXPAND_ID,
                         aria_label: "Expand",
                         "data-key-action": "full-player",
                         title: "Expand to the full screen",
@@ -1156,6 +1178,36 @@ mod tests {
             !open.contains("pharos-queue-count"),
             "no badge for none: {open}"
         );
+    }
+
+    /// B1031/V990: the focus a TV's compact player hands over lands on the
+    /// stage bar's Expand button, which opens the full player.
+    #[test]
+    fn the_stage_bar_names_its_expand_button() {
+        let html = bar(None);
+        let id = format!(r#"id="{STAGE_EXPAND_ID}""#);
+        let named = html.split('<').any(|tag| {
+            tag.starts_with("button") && tag.contains(r#"aria-label="Expand""#) && tag.contains(&id)
+        });
+        assert!(named, "{html}");
+    }
+
+    /// B1031/V990: on a TV the floating strip is no focus stop, so its
+    /// arrows move the focus between the bar's buttons, not the window.
+    #[test]
+    fn a_remote_never_moves_the_floating_window() {
+        assert!(strip_movable(true, false), "a keyboard still moves it");
+        assert!(!strip_movable(true, true));
+        assert!(!strip_movable(false, false));
+        assert!(!strip_movable(false, true));
+    }
+
+    /// B1031/V990: a TV's floating window has no resize grip to trap the
+    /// D-pad; a keyboard's and a pointer's keep theirs.
+    #[test]
+    fn only_a_keyboard_or_pointer_gets_the_resize_grip() {
+        assert_eq!(grip_shown(true), !REMOTE_FOCUS);
+        assert!(!grip_shown(false));
     }
 
     #[test]
