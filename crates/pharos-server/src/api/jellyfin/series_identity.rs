@@ -254,7 +254,8 @@ async fn splits<S: SeriesIdentityStore>(
             None => (from_key.clone(), row.series_year),
         };
         let (groups, moves) = folders.entry(folder).or_default();
-        if key != from_key || year != row.series_year {
+        // A row whose only change is its stated year stays in its group (B981).
+        if key != from_key {
             moves.push(PendingMoveDto {
                 path: row.path.clone(),
                 from_key,
