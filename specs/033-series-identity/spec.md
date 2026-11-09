@@ -357,10 +357,12 @@ these):
   written, so a settled library reads 0; in `dry_run` they stay pending and
   read the same each pass.
 - `sum by (reason) (increase(pharos_episode_metadata_rejected_total[1d]))`,
-  `reason` ∈ `nfo_other_series | search_other_series | outside_run |
-  title_mismatch`, log carrying path, NFO id, the series the record was read
-  from and the pinned id. `search_other_series` is B933. Until §4 lands the
-  count is observation only (the record is still applied).
+  `reason` ∈ `nfo_other_series | outside_run | title_mismatch`, log carrying
+  path, NFO id, the series the record was read from and the pinned id.
+  `nfo_other_series` records are set aside (§4); `title_mismatch` is
+  observation only. The first instrumentation also counted
+  `search_other_series` (B933); §4 removes the per-episode search, so that
+  label is gone.
 - `sum by (decided_by) (pharos_scan_copy_primaries)` gains
   `decided_by="refused_other_series"` for V894.
 - `{namespace="pharos"} |= "series identity repair"`: one info line per folder
