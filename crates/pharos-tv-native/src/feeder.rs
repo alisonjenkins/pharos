@@ -4,7 +4,7 @@
 //! (spec 032 decision 4) instead of `AMediaExtractor`.
 //!
 //! `setprop debug.pharos.video <dir>` with an `index.m3u8` in `<dir>` picks
-//! this source. Network fetches come later; the planner already plans them.
+//! this source; `hls_net` supplies the same feeder from the server.
 
 use pharos_hls::annexb::{self, ParameterSets};
 use pharos_hls::fmp4::{self, CodecConfig, Sample, TrackKind};
@@ -14,8 +14,6 @@ use std::path::{Path, PathBuf};
 /// The playlist a feeder directory must hold.
 pub const PLAYLIST: &str = "index.m3u8";
 
-/// Headroom over the largest sample for the codec's input buffers.
-const INPUT_HEADROOM: usize = 64 * 1024;
 
 pub enum Codec {
     Avc,
@@ -29,6 +27,16 @@ impl Codec {
             Self::Hevc => "video/hevc",
         }
     }
+}
+
+/// The codecs the feeder turns into Annex B, by HLS `CODECS` prefix.
+const FEEDABLE: &[&str] = &["avc1", "avc3", "hvc1", "hev1"];
+
+/// Whether a variant's `CODECS` name a video codec the feeder can feed.
+pub fn feedable(codecs: &[String]) -> bool {
+    codecs
+        .iter()
+        .any(|c| FEEDABLE.iter().any(|p| c.starts_with(p)))
 }
 
 /// What `AMediaFormat` needs to configure the decoder.
@@ -48,11 +56,23 @@ pub enum Next {
     End,
 }
 
+/// Where the feeder's media segments come from, in playback order: `None`
+/// at the end of the stream. A network source blocks until the next
+/// segment arrives.
+pub type Segments = Box<dyn FnMut() -> Option<Result<Vec<u8>, String>> + Send>;
+
 pub struct Feeder {
     format: Format,
     timescale: u32,
+    track_id: u32,
     length_size: u8,
-    segments: Vec<(Vec<u8>, Vec<Sample>)>,
+    defaults: Vec<fmp4::TrackDefaults>,
+    supply: Segments,
+    /// The segment being fed and its video samples.
+    current: Option<(Vec<u8>, Vec<Sample>)>,
+    /// Segments read before `rewind` may start again; kept only for a
+    /// directory source, whose files are already in memory.
+    replay: Option<Vec<Vec<u8>>>,
     segment: usize,
     sample: usize,
     scratch: Vec<u8>,
@@ -66,11 +86,19 @@ fn read(path: &Path) -> Result<Vec<u8>, String> {
     std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))
 }
 
+/// The input buffer a decoder needs for a picture this size: half a byte a
+/// pixel covers any intra frame at the bitrates the server sends, and
+/// segments arrive one at a time, so the largest sample is not known ahead.
+fn input_size(width: u16, height: u16) -> usize {
+    (usize::from(width) * usize::from(height) / 2).max(512 * 1024)
+}
+
 impl Feeder {
     pub fn is_feeder_dir(path: &str) -> bool {
         Path::new(path).join(PLAYLIST).is_file()
     }
 
+    /// A directory holding `index.m3u8`, its init and its segments.
     pub fn open(dir: &str) -> Result<Self, String> {
         let dir = Path::new(dir);
         let text = String::from_utf8(read(&dir.join(PLAYLIST))?)
@@ -79,8 +107,21 @@ impl Feeder {
         let media = playlist::parse_media(&text, &base).map_err(|e| format!("{PLAYLIST}: {e}"))?;
         let map = media.init_uri.as_deref().ok_or("playlist has no EXT-X-MAP")?;
         let init = read(&resolve(dir, map))?;
-        let defaults = fmp4::track_defaults(&init).map_err(|e| format!("init: {e}"))?;
-        let entries = fmp4::sample_entries(&init).map_err(|e| format!("init: {e}"))?;
+        let files = media
+            .segments
+            .iter()
+            .map(|seg| read(&resolve(dir, &seg.uri)))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut feeder = Self::from_init(&init, Box::new(|| None))?;
+        feeder.replay = Some(files);
+        feeder.rewind();
+        Ok(feeder)
+    }
+
+    /// An init segment and a supplier of media segments.
+    pub fn from_init(init: &[u8], supply: Segments) -> Result<Self, String> {
+        let defaults = fmp4::track_defaults(init).map_err(|e| format!("init: {e}"))?;
+        let entries = fmp4::sample_entries(init).map_err(|e| format!("init: {e}"))?;
         let entry = entries
             .iter()
             .find(|e| matches!(e.kind, TrackKind::Video { .. }))
@@ -101,7 +142,7 @@ impl Feeder {
                 return Err(format!(
                     "video codec {} ({other:?}) not fed yet",
                     String::from_utf8_lossy(&entry.format)
-                ))
+                ));
             }
         };
         let csd = match codec {
@@ -111,31 +152,26 @@ impl Feeder {
             }
             Codec::Hevc => vec![sets.hevc_csd()],
         };
-
-        let mut segments = Vec::with_capacity(media.segments.len());
-        let mut largest = 0usize;
-        for seg in &media.segments {
-            let bytes = read(&resolve(dir, &seg.uri))?;
-            let samples: Vec<Sample> = fmp4::samples(&bytes, &defaults)
-                .map_err(|e| format!("{}: {e}", seg.uri))?
-                .into_iter()
-                .filter(|s| s.track_id == entry.track_id)
-                .collect();
-            largest = samples.iter().map(|s| s.size as usize).fold(largest, usize::max);
-            segments.push((bytes, samples));
-        }
-        let count: usize = segments.iter().map(|(_, s)| s.len()).sum();
         log::info!(
-            "video: source=fmp4 codec={} {width}x{height} track={} segments={} samples={count} largest={largest}",
+            "video: source=fmp4 codec={} {width}x{height} track={}",
             codec.mime(),
             entry.track_id,
-            segments.len(),
         );
         Ok(Self {
-            format: Format { codec, width, height, csd, max_input: largest + INPUT_HEADROOM },
+            format: Format {
+                codec,
+                width,
+                height,
+                csd,
+                max_input: input_size(width, height),
+            },
             timescale: entry.timescale,
+            track_id: entry.track_id,
             length_size: sets.length_size,
-            segments,
+            defaults,
+            supply,
+            current: None,
+            replay: None,
             segment: 0,
             sample: 0,
             scratch: Vec::new(),
@@ -146,20 +182,46 @@ impl Feeder {
         &self.format
     }
 
+    /// Start again from the first segment. Only a directory source can; a
+    /// network source ends instead.
     pub fn rewind(&mut self) {
+        if let Some(files) = self.replay.clone() {
+            let mut queue = files.into_iter();
+            self.supply = Box::new(move || queue.next().map(Ok));
+        }
+        self.current = None;
         self.segment = 0;
         self.sample = 0;
+    }
+
+    /// Parse the next segment from the supplier; false at the end.
+    fn advance(&mut self) -> Result<bool, String> {
+        let Some(bytes) = (self.supply)() else {
+            return Ok(false);
+        };
+        let bytes = bytes?;
+        let samples: Vec<Sample> = fmp4::samples(&bytes, &self.defaults)
+            .map_err(|e| format!("segment {}: {e}", self.segment))?
+            .into_iter()
+            .filter(|s| s.track_id == self.track_id)
+            .collect();
+        self.current = Some((bytes, samples));
+        self.sample = 0;
+        Ok(true)
     }
 
     /// Writes the next sample into `buf` as Annex B.
     pub fn next(&mut self, buf: &mut [u8]) -> Result<Next, String> {
         loop {
-            let Some((bytes, samples)) = self.segments.get(self.segment) else {
-                return Ok(Next::End);
+            let Some((bytes, samples)) = &self.current else {
+                if !self.advance()? {
+                    return Ok(Next::End);
+                }
+                continue;
             };
             let Some(sample) = samples.get(self.sample) else {
+                self.current = None;
                 self.segment += 1;
-                self.sample = 0;
                 continue;
             };
             let data = sample.data(bytes).ok_or("sample outside its segment")?;
@@ -171,9 +233,10 @@ impl Feeder {
                 return Ok(Next::TooBig { need: len });
             };
             dst.copy_from_slice(&self.scratch);
+            let (pts, key) = (sample.presentation_time(), sample.sync);
             self.sample += 1;
-            let pts_us = fmp4::to_ms(sample.presentation_time().saturating_mul(1_000), self.timescale);
-            return Ok(Next::Sample { len, pts_us, key: sample.sync });
+            let pts_us = fmp4::to_ms(pts.saturating_mul(1_000), self.timescale);
+            return Ok(Next::Sample { len, pts_us, key });
         }
     }
 }
@@ -183,7 +246,7 @@ mod tests {
     // Panicking on unexpected results is the intended failure mode in tests.
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-    use super::{Codec, Feeder, Next, PLAYLIST};
+    use super::{Codec, Feeder, Next, PLAYLIST, feedable};
 
     /// The ffmpeg H.264 fixture of `pharos-hls`, laid out as a feeder directory.
     fn fixture_dir() -> std::path::PathBuf {
@@ -200,6 +263,21 @@ mod tests {
         )
         .unwrap();
         dir
+    }
+
+    fn codecs(list: &[&str]) -> Vec<String> {
+        list.iter().map(|c| (*c).to_owned()).collect()
+    }
+
+    #[test]
+    fn feeds_h264_and_hevc_only() {
+        assert!(feedable(&codecs(&["avc1.640028", "mp4a.40.2"])));
+        assert!(feedable(&codecs(&["hvc1.2.4.L150.90"])));
+        assert!(feedable(&codecs(&["hev1.1.6.L120.90"])));
+        assert!(!feedable(&codecs(&["vp09.00.40.08"])));
+        assert!(!feedable(&codecs(&["av01.0.08M.08"])));
+        assert!(!feedable(&codecs(&["mp4a.40.2"])));
+        assert!(!feedable(&[]));
     }
 
     #[test]

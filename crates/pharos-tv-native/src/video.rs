@@ -19,7 +19,43 @@ use std::time::{Duration, Instant};
 pub fn path() -> Option<String> {
     android_properties::getprop("debug.pharos.video")
         .value()
-        .filter(|p| p.starts_with('/'))
+        .filter(|p| p.starts_with('/') || p.starts_with(PLAY))
+}
+
+/// `debug.pharos.video play:<item id>` plays that item from the server.
+const PLAY: &str = "play:";
+
+/// The item `debug.pharos.video` asks to play from the server, if any.
+pub fn play_item() -> Option<pharos_client::api::ItemRef> {
+    path()?.strip_prefix(PLAY)?.trim().parse().ok()
+}
+
+/// Whether the video fills the window (a server playback) rather than the
+/// slice 0 probe's rectangle.
+pub fn full_window() -> bool {
+    path().is_some_and(|p| p.starts_with(PLAY))
+}
+
+static STREAM: std::sync::Mutex<Option<Result<String, String>>> = std::sync::Mutex::new(None);
+static STREAM_READY: std::sync::Condvar = std::sync::Condvar::new();
+
+/// The live connection hands over the decision's stream URL, or why there
+/// is none.
+pub fn set_stream(url: Result<String, String>) {
+    if let Ok(mut slot) = STREAM.lock() {
+        *slot = Some(url);
+        STREAM_READY.notify_all();
+    }
+}
+
+fn wait_stream() -> Result<String, String> {
+    let mut slot = STREAM.lock().map_err(|_| "stream lock poisoned")?;
+    loop {
+        if let Some(url) = slot.take() {
+            return url;
+        }
+        slot = STREAM_READY.wait(slot).map_err(|_| "stream lock poisoned")?;
+    }
 }
 
 /// One poll of the decoder's queues.
@@ -75,8 +111,16 @@ impl Source {
     /// # Safety
     /// The returned format must be deleted with `AMediaFormat_delete`.
     unsafe fn open(path: &str) -> Result<(Self, *mut sys::AMediaFormat, String), String> {
-        if crate::feeder::Feeder::is_feeder_dir(path) {
-            let feeder = crate::feeder::Feeder::open(path)?;
+        let from_server = path.starts_with(PLAY);
+        if from_server || crate::feeder::Feeder::is_feeder_dir(path) {
+            let feeder = if from_server {
+                let url = wait_stream()?;
+                let stream = crate::hls_net::open(&crate::live::server(), &url)?;
+                log::info!("video: playing {} from the server", stream.variant);
+                crate::feeder::Feeder::from_init(&stream.init, stream.segments)?
+            } else {
+                crate::feeder::Feeder::open(path)?
+            };
             let f = feeder.format();
             let format = sys::AMediaFormat_new();
             if format.is_null() {
@@ -265,6 +309,10 @@ fn run(window: &NativeWindow, path: &str) -> Result<(), String> {
                 let idx = idx as usize;
                 if info.flags & sys::AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM as u32 != 0 {
                     sys::AMediaCodec_releaseOutputBuffer(codec, idx, false);
+                    if path.starts_with(PLAY) {
+                        log::info!("bench video end shown={shown} dropped={dropped}");
+                        return Ok(());
+                    }
                     loops += 1;
                     source.rewind();
                     check(sys::AMediaCodec_flush(codec), "flush")?;

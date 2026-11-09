@@ -222,8 +222,23 @@ fn child_layer(
     if parent.is_null() || !env.call_method(&parent, "isValid", "()Z", &[])?.z()? {
         return Ok(false);
     }
-    let width = VIDEO_RECT.right - VIDEO_RECT.left;
-    let height = VIDEO_RECT.bottom - VIDEO_RECT.top;
+    // A server playback fills the window: the decoder's buffer, at the
+    // source's own size (4K stays 4K), is scaled to it by the compositor.
+    let rect = if crate::video::full_window() {
+        let w = env.call_method(&decor, "getWidth", "()I", &[])?.i()?;
+        let h = env.call_method(&decor, "getHeight", "()I", &[])?.i()?;
+        log::info!("hole: full window {w}x{h}");
+        ARect {
+            left: 0,
+            top: 0,
+            right: w,
+            bottom: h,
+        }
+    } else {
+        VIDEO_RECT
+    };
+    let width = rect.right - rect.left;
+    let height = rect.bottom - rect.top;
     let builder = env.new_object("android/view/SurfaceControl$Builder", "()V", &[])?;
     let name = env.new_string("pharos-video-hole")?;
     const B: &str = "Landroid/view/SurfaceControl$Builder;";
@@ -253,10 +268,10 @@ fn child_layer(
         "android/graphics/Rect",
         "(IIII)V",
         &[
-            JValue::Int(VIDEO_RECT.left),
-            JValue::Int(VIDEO_RECT.top),
-            JValue::Int(VIDEO_RECT.right),
-            JValue::Int(VIDEO_RECT.bottom),
+            JValue::Int(rect.left),
+            JValue::Int(rect.top),
+            JValue::Int(rect.right),
+            JValue::Int(rect.bottom),
         ],
     )?;
     let txn = env.new_object("android/view/SurfaceControl$Transaction", "()V", &[])?;

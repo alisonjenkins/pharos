@@ -135,6 +135,34 @@ async fn run(
     );
     tx.unbounded_send(Event::Ready { home, grid })
         .map_err(|_| "ui gone".to_owned())?;
+    if let Some(id) = crate::video::play_item() {
+        // Negotiated off the UI thread: the probe may still be listing.
+        let caps = tokio::task::spawn_blocking(|| {
+            crate::codecs::caps(std::time::Duration::from_secs(3))
+        })
+        .await
+        .map_err(|e| format!("caps: {e}"))?;
+        let started = std::time::Instant::now();
+        let url = match api.play(&info, id, &caps, Default::default()).await {
+            Ok((decision, _grant)) => {
+                log::info!(
+                    "bench play_ms={} method={} block={} downgrade={} url={}",
+                    started.elapsed().as_millis(),
+                    decision.method,
+                    decision.direct_play_block,
+                    decision.downgrade,
+                    decision.stream_url.split('?').next().unwrap_or_default(),
+                );
+                if decision.is_hls() {
+                    Ok(decision.stream_url)
+                } else {
+                    Err(format!("not HLS: {}", decision.method))
+                }
+            }
+            Err(e) => Err(format!("play {id}: {e}")),
+        };
+        crate::video::set_stream(url);
+    }
     while let Some(command) = commands.next().await {
         match command {
             Command::Detail(id) => {

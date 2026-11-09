@@ -10,6 +10,8 @@ use dioxus::prelude::*;
 #[cfg(target_os = "android")]
 mod codecs;
 #[cfg(target_os = "android")]
+mod hls_net;
+#[cfg(target_os = "android")]
 mod hole;
 #[cfg(target_os = "android")]
 mod launch;

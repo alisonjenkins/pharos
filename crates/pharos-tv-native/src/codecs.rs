@@ -13,6 +13,25 @@ use jni::objects::{JObject, JObjectArray, JString, JValue};
 use pharos_client::api::Capabilities;
 use pharos_ui::native::decoders::{self, DecoderInfo};
 
+/// The capabilities the probe found, for the playback negotiation.
+static CAPS: std::sync::OnceLock<Capabilities> = std::sync::OnceLock::new();
+
+/// The probe's capabilities, waiting up to `wait` for it to finish; the CDD
+/// fallback if it has not.
+pub fn caps(wait: std::time::Duration) -> Capabilities {
+    let until = std::time::Instant::now() + wait;
+    loop {
+        if let Some(c) = CAPS.get() {
+            return c.clone();
+        }
+        if std::time::Instant::now() >= until {
+            log::warn!("decoder probe not done; negotiating with the fallback");
+            return decoders::capabilities(&[], false);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
 /// `MediaCodecList.REGULAR_CODECS`: the codecs usable for ordinary playback,
 /// not the tunneled or secure-only variants `ALL_CODECS` adds.
 const REGULAR_CODECS: i32 = 0;
@@ -45,6 +64,7 @@ pub fn probe(app: &AndroidApp) -> Capabilities {
         caps.audio_codecs,
         list.len()
     );
+    let _ = CAPS.set(caps.clone());
     caps
 }
 
