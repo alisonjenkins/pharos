@@ -44,6 +44,9 @@ cd "$root" || exit 1
 target_dir=${CARGO_TARGET_DIR:-$root/target}
 out=${PHAROS_ANDROID_APK_OUT:-$target_dir/pharos-tv-$profile.apk}
 
+echo "android-apk: building the page visualiser" >&2
+nix develop -c sh scripts/tv-visualiser.sh
+
 echo "android-apk: building ($profile)" >&2
 nix develop .#android -c dx build --platform android --package pharos-ui \
   --bin pharos-tv --features mobile --target armv7-linux-androideabi \
