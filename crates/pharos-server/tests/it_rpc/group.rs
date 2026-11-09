@@ -1180,6 +1180,34 @@ async fn a_closed_connection_releases_its_membership() {
     let _ = until(&mut a_seen, |s| matches!(s, Seen::Left(_)).then_some(())).await;
 }
 
+/// B1006: the host alone in its group keeps the seat past the grace, so a
+/// rejoin that outlasts it (a restarted server loading its groups) still
+/// finds the group.
+/// Disarm check: with `lose_seat` removing the sole member, the group ends and
+/// `registry.list()` is empty, so this fails.
+#[actix_web::test]
+async fn a_sole_host_whose_connection_dropped_keeps_its_group_past_the_grace() {
+    let rig = rig().await;
+    let session = rig.session(&rig.fx.admin_token).await;
+    let (sink_a, _seen) = sink();
+    let host = create(&session, "dev-a", MOVIE, 5_000, sink_a)
+        .await
+        .unwrap();
+    assert_eq!(member_count(&rig).await, 1);
+    drop(host);
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    assert_eq!(
+        rig.deps.registry.list().await.unwrap().len(),
+        1,
+        "the host's group outlives the grace"
+    );
+    assert_eq!(
+        member_count(&rig).await,
+        1,
+        "and still holds the host's seat"
+    );
+}
+
 /// A reconnect inside the grace (the same device joining again) takes the
 /// seat over: the old drop's removal does not remove the new membership.
 /// Disarm check: with the removal skipping the generation fence, the member

@@ -909,6 +909,15 @@ async fn lose_seat(
     }
     // A newer registration of the device bumped the generation.
     if let Some(group) = deps.hub.remove_if_current_gen(&key, gen) {
+        // A sole member is the host waiting in a group for guests: removing
+        // it ends the group, and its rejoin can take longer than the grace
+        // (a restarted server answers notFound until it loads the group). The
+        // group keeps the seat, off every gate, until the abandonment reaps it.
+        if group.snapshot().await.is_some_and(|g| g.member_count == 1) {
+            deps.sinks.remove(member_id, gen);
+            tracing::info!(device_id = %key, %member_id, group = %group.group_id, "syncplay: native sole member kept after its connection stayed gone");
+            return;
+        }
         let _ = group.tx.send(GroupMsg::RemoveMember { member_id }).await;
         deps.sinks.remove(member_id, gen);
         metrics::counter!(
