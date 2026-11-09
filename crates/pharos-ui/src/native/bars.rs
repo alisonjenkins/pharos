@@ -1,4 +1,4 @@
-//! Black bars baked into a file's picture (B1017, V976-V978): a 4:3 show
+//! Black bars baked into a file's picture (B1017, V976, V977, V991): a 4:3 show
 //! stored pillarboxed in a 1920x1080 frame, say. The server finds where the
 //! picture sits in the frame once per file and sends it with each version;
 //! the watch page crops the frame to it, so the picture fills the player
