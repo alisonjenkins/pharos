@@ -326,6 +326,10 @@ async fn seed_playwright_user(cfg: &Config) -> Result<(), AppError> {
     Ok(())
 }
 
+/// How often expired problem reports are swept; retention is in days, so
+/// an hour late is harmless.
+const REPORT_EXPIRY_PERIOD: std::time::Duration = std::time::Duration::from_secs(3600);
+
 /// Seed users who have opted in to sending diagnostics (spec 016), so the
 /// watch-together e2e tests can see their client events reach the server.
 /// `playwright` keeps the default (off).
@@ -2128,6 +2132,40 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
         state = state.with_live_tv(backend);
     }
     state = state.with_log_dir(cfg.obs.log_dir.clone());
+    let report_store = cfg.obs.resolved_report_dir().map(|dir| {
+        pharos_server::client_reports::ReportStore::new(dir, cfg.obs.report_retention_days)
+    });
+    match &report_store {
+        Some(store) => {
+            tracing::info!(
+                dir = %store.dir().display(),
+                retention_days = cfg.obs.report_retention_days,
+                "client problem reports enabled"
+            );
+            let store = store.clone();
+            let is_leader = state.is_bg_leader.clone();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(REPORT_EXPIRY_PERIOD);
+                loop {
+                    tick.tick().await;
+                    if !is_leader.load(std::sync::atomic::Ordering::Relaxed) {
+                        continue;
+                    }
+                    if let Err(e) = store.expire(std::time::SystemTime::now()).await {
+                        tracing::warn!(
+                            dir = %store.dir().display(),
+                            error = %e,
+                            "client report expiry sweep failed"
+                        );
+                    }
+                }
+            });
+        }
+        None => tracing::info!(
+            "client problem reports disabled: neither [obs].report_dir nor [obs].log_dir is set"
+        ),
+    }
+    state = state.with_client_reports(report_store);
     // Dashboard storage panel (`GET /System/Info/Storage`) — report disk
     // usage for the real configured cache/transcode/subtitle/log/web dirs.
     // `program_data` is left unset (the handler falls back to the advertised
