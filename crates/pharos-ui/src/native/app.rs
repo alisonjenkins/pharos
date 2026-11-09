@@ -3626,7 +3626,7 @@ fn FavouritesScreen() -> Element {
                 async move {
                     api.favorites(call, kind, favourites::PER_KIND)
                         .await
-                        .map(|page| (kind, page.items))
+                        .map(|page| (kind, page))
                 }
             });
             let rails = futures_util::future::join_all(loads)
