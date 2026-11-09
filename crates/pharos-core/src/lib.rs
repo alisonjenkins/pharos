@@ -4359,6 +4359,48 @@ pub trait UserDataStore: Send + Sync {
     ) -> impl std::future::Future<Output = DomainResult<Vec<MediaId>>> + Send;
 }
 
+/// Where a user left off in a book (023): the reader's opaque locator and the
+/// whole-book fraction, 0 to 1. Kept apart from [`UserItemData`] so it never
+/// shares a field with `last_played_position_ticks` (V354).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReadPosition {
+    pub locator: String,
+    pub fraction: f32,
+    /// Unix seconds of the last save.
+    pub updated_at: i64,
+}
+
+pub trait ReadPositionStore: Send + Sync {
+    fn get_read_position(
+        &self,
+        user: UserId,
+        item: MediaId,
+    ) -> impl std::future::Future<Output = DomainResult<Option<ReadPosition>>> + Send;
+
+    /// One entry per requested item, in order; `None` where nothing is saved.
+    fn read_positions_bulk(
+        &self,
+        user: UserId,
+        items: &[MediaId],
+    ) -> impl std::future::Future<Output = DomainResult<Vec<Option<ReadPosition>>>> + Send;
+
+    /// Insert or replace the position for `(user, item)`.
+    fn set_read_position(
+        &self,
+        user: UserId,
+        item: MediaId,
+        position: ReadPosition,
+    ) -> impl std::future::Future<Output = DomainResult<()>> + Send;
+
+    /// Items with a saved fraction above 0 that the user has not marked
+    /// played, newest save first: drives "Continue reading".
+    fn part_read_items(
+        &self,
+        user: UserId,
+        limit: u32,
+    ) -> impl std::future::Future<Output = DomainResult<Vec<MediaId>>> + Send;
+}
+
 /// Per-user free-form preferences (UserConfiguration + display
 /// preferences). Stored as JSON strings — the schema lives in
 /// jellyfin-web's UserConfigurationDto and varies by version, so
