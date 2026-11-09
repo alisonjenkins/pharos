@@ -50,6 +50,20 @@ impl<T: DeserializeOwned> FromRequest for CiQuery<T> {
     }
 }
 
+/// Every value of `key` in a raw query string, in order, matching the key
+/// case-insensitively. Empty values are yielded as `""`; callers decide whether
+/// that means absent.
+///
+/// The one place a hand-rolled `qs.split('&')` lookup belongs: the size,
+/// bitrate and capability-token readers all sit on it, so they agree on casing
+/// and on what a repeated key means.
+pub(crate) fn values<'a>(qs: &'a str, key: &'a str) -> impl Iterator<Item = &'a str> + 'a {
+    qs.split('&')
+        .filter_map(|kv| kv.split_once('='))
+        .filter(move |(k, _)| k.eq_ignore_ascii_case(key))
+        .map(|(_, v)| v)
+}
+
 /// Rewrite the KEY of every `key=value` pair to snake_case, leaving the (still
 /// percent-encoded) value verbatim so no double-decode occurs.
 ///
@@ -129,6 +143,18 @@ fn to_snake_case(key: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn values_match_the_key_case_insensitively_and_keep_order() {
+        let qs = "a=1&MaxWidth=1920&maxwidth=&MAXWIDTH=1280&flag&b=2";
+        assert_eq!(
+            values(qs, "MaxWidth").collect::<Vec<_>>(),
+            ["1920", "", "1280"]
+        );
+        assert_eq!(values(qs, "b").collect::<Vec<_>>(), ["2"]);
+        assert_eq!(values(qs, "missing").count(), 0);
+        assert_eq!(values("", "a").count(), 0);
+    }
 
     #[test]
     fn snake_cases_keys_preserves_values() {
