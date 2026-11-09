@@ -1224,7 +1224,11 @@ mod tests {
         files: Vec<DamagedFile>,
         status: IntegrityStatus,
     ) -> Option<Result<IntegrityReport, String>> {
-        Some(Ok(IntegrityReport { status, files }))
+        Some(Ok(IntegrityReport {
+            status,
+            files,
+            deep_checks: vec![],
+        }))
     }
 
     #[test]
