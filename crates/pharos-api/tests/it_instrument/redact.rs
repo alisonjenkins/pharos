@@ -24,6 +24,8 @@ const QC_SECRET: &str = "qc-poll-secret-abcdef";
 const FIELD_SECRET: &str = "clientfield-secret-xyz";
 const MEDIA_TOKEN: &str = "mediatok-9876543210-secret";
 const MANAGE_TOKEN: &str = "managetok-1357924680-secret";
+const REPORT_NOTE: &str = "reportnote-secret-subtitles-vanished";
+const REPORT_BUNDLE: &str = "{\"breadcrumbs\":[\"reportbundle-secret\"]}";
 
 /// Echoes secrets back in its results so both directions are exercised.
 struct Boot;
@@ -79,6 +81,15 @@ impl server::telemetry::Handler for TelemetryBoot {
         results: &mut telemetry::SubmitResults,
     ) -> impl Future<Output = Result<(), capnp::Error>> {
         results.get().init_result().set_ok(());
+        std::future::ready(Ok(()))
+    }
+
+    fn report(
+        self: Rc<Self>,
+        _params: telemetry::ReportParams,
+        results: &mut telemetry::ReportResults,
+    ) -> impl Future<Output = Result<(), capnp::Error>> {
+        results.get().init_result().set_report_id("ABCD-EFGH");
         std::future::ready(Ok(()))
     }
 }
@@ -204,6 +215,12 @@ fn call_all() -> Observed {
             r.get().init_spans(0);
             r.send().promise.await.unwrap();
 
+            let mut r = tel.report_request();
+            fill_ctx(r.get().init_ctx());
+            r.get().set_note(REPORT_NOTE);
+            r.get().set_bundle(REPORT_BUNDLE.as_bytes());
+            r.send().promise.await.unwrap();
+
             let grant: playback_grant::Client =
                 server::playback_grant::client(GrantBoot, &Connection::new());
             let mut r = grant.decision_request();
@@ -231,13 +248,14 @@ fn call_all() -> Observed {
 
 /// Each method listed here is called by `call_all`. A `$secret` added to
 /// another method fails this until the test calls it too.
-const COVERED: [(&str, &str); 10] = [
+const COVERED: [(&str, &str); 11] = [
     ("bootstrap", "resume"),
     ("bootstrap", "login"),
     ("bootstrap", "quick_connect_initiate"),
     ("bootstrap", "quick_connect_poll"),
     ("bootstrap", "submit_anonymous"),
     ("telemetry", "submit"),
+    ("telemetry", "report"),
     ("playback_grant", "decision"),
     ("session", "change_password"),
     ("session", "media_token"),
@@ -262,6 +280,8 @@ fn secrets_never_reach_logs_or_spans() {
         FIELD_SECRET,
         MEDIA_TOKEN,
         MANAGE_TOKEN,
+        REPORT_NOTE,
+        "reportbundle-secret",
     ] {
         assert!(
             !o.logs.contains(secret),
@@ -278,7 +298,7 @@ fn secrets_never_reach_logs_or_spans() {
         .collect();
     assert_eq!(
         payloads.len(),
-        20,
+        22,
         "a request and a response per call:\n{}",
         o.logs
     );
