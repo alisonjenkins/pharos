@@ -71,7 +71,10 @@ pub fn press(
                 speed = speed.min((rest / MIN_CROSSING_MS).max(hold_speed(0.0)));
             }
             let dt = (now - s.last_press).max(0.0);
-            (s.hold_start, (speed * dt).round() as u64)
+            // Floored, so a press never moves more than the speed allows:
+            // rounding half up adds a little each repeat, and over a fast
+            // remote's hundreds of repeats that crosses short of the floor.
+            (s.hold_start, (speed * dt).floor() as u64)
         }
         None => (now, TAP_STEP_MS),
     };
@@ -184,16 +187,16 @@ mod tests {
             s = press(Some(s), true, true, 0, duration, f64::from(i) * 50.0);
         }
         assert!(s.target_ms < duration, "the clamp must not hide the cap");
-        assert_eq!(s.target_ms - last, 14_917, "298.3x over 50 ms, not 480x");
+        assert_eq!(s.target_ms - last, 14_916, "298.3x over 50 ms, not 480x");
     }
 
-    /// Real milliseconds a hold from 0, repeating every 50 ms, takes to
+    /// Real milliseconds a hold from 0, repeating every `every` ms, takes to
     /// reach the end of a video `duration` long.
-    fn crossing_ms(duration: u64) -> f64 {
+    fn crossing_ms(duration: u64, every: f64) -> f64 {
         let mut s = press(None, true, false, 0, duration, 0.0);
         let mut now = 0.0;
         while s.target_ms < duration {
-            now += 50.0;
+            now += every;
             s = press(Some(s), true, true, 0, duration, now);
         }
         now
@@ -201,11 +204,16 @@ mod tests {
 
     #[test]
     fn the_crossing_floor_holds_from_130_seconds_up() {
-        for duration in [130_000, 300_000, 1_800_000, HOUR, 4 * HOUR] {
-            let t = crossing_ms(duration);
-            assert!(t >= MIN_CROSSING_MS, "{duration} ms crossed in {t} ms");
+        for duration in [130_000, 130_300, 300_000, 1_800_000, HOUR, 4 * HOUR] {
+            for every in [10.0, 33.0, 50.0] {
+                let t = crossing_ms(duration, every);
+                assert!(
+                    t >= MIN_CROSSING_MS,
+                    "{duration} ms crossed in {t} ms at {every} ms repeats"
+                );
+            }
         }
-        let t = crossing_ms(120_000);
+        let t = crossing_ms(120_000, 50.0);
         assert!(
             t < MIN_CROSSING_MS,
             "under 130 s the tap and the 20x floor win: {t} ms"
