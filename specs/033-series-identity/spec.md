@@ -1,9 +1,9 @@
 # Spec 033 — Telling apart same-named series
 
-- **Status:** Draft, for review. No code yet.
+- **Status:** Reviewed by Alison 2026-11-09T17:27Z (open questions answered, §8). No code yet.
 - **Date:** 2026-11-09T14:30:00Z
 - **ADR:** [0086](../../docs/adr/0086-series-identity-is-decided-from-reconciled-evidence.md)
-- **Claimed ids:** B930–B934, V890–V894 (entries go into
+- **Claimed ids:** B930–B934, V890–V895 (entries go into
   `001-pharos-baseline/bugs.md` / `invariants.md` with the fix, not before).
 
 ## Problem
@@ -102,8 +102,8 @@ told apart by `ProductionYear` as LIB-C11 already does for two folders.
 
 Every split is logged with the folder, the groups, their counts and the reason
 (`series folder split folder=… groups=[none:4, 2014:62] reason=stated_years`),
-and counted. The Manage → Integrity page lists split folders so the files can be
-moved into their own folders if Alison prefers.
+and counted. Every split folder is listed on the Show identity page (§7), where
+a wrong split is fixed by hand.
 
 ### 3. Matching a show (V891)
 
@@ -120,12 +120,13 @@ B558 trusts it).
    - share of filename episode titles that match the candidate's titles at the
      same position;
    - a vote, not a veto, for the candidate the NFO ids name.
-3. The best candidate wins when it leads the runner-up by a clear margin
-   (proposed 0.2 on a 0–1 scale). Otherwise the show is stored as
-   `match_source = 'ambiguous'` with both candidates logged: it shows its local
-   name and files, no provider text, and appears on Manage → Integrity with an
-   Identify button (the existing `RemoteSearch/Apply` path, which writes
-   `match_source = 'manual'`). A manual match is never re-asked.
+3. The best candidate always wins, so the show shows its best guess. When it
+   leads the runner-up by less than a clear margin (proposed 0.2 on a 0–1
+   scale), the match is also **flagged**: `series_metadata.match_flag =
+   'ambiguous'` with the runner-up's provider id and both scores, logged. A
+   flagged show carries a "Check match" badge for admins on its title page and
+   is listed on the Show identity page (§7) until it is fixed or confirmed.
+   A manual match (`match_source = 'manual'`) is never re-asked.
 
 Bump `TV_MATCH_VERSION` to 2 so stored matches are re-asked; see §6 for how the
 re-ask is limited.
@@ -178,7 +179,9 @@ the series wire id.
    series_name)`, which is exactly today's key, so no wire id changes on
    deploy. The scanner writes the split key on the next pass. Queries that
    pivot on `series_folder` move to `series_key`; `series_metadata.series_key`
-   is already the same value.
+   is already the same value. The same migration adds nullable
+   `series_metadata.match_flag`, `match_runner_up_id` and
+   `match_runner_up_score` for §3's flag.
 2. **Dry run first**: `[metadata] series_identity_repair = "dry_run"` (default)
    logs, per series, what the next pass would change (split groups, old and new
    match, episodes whose metadata would be re-fetched) and counts it, without
@@ -201,6 +204,49 @@ the series wire id.
    folder key (the 1990 group), since the group that keeps the key is the one
    with no stated year. Episode-level state does not move.
 
+### 7. Fixing shows and files by hand: the Show identity page (V895)
+
+Alison (2026-11-09): "we need to have a way to remap them somehow and fix them."
+A new admin page, Manage → **Show identity**, lists every show that needs a
+look, newest first, with the reason in words:
+
+- a folder the scanner split, with each group's year and file count;
+- a flagged match (§3), with the guess and the runner-up side by side (name,
+  year, poster, episode count);
+- episodes whose provider data was rejected (§4), with the reason and value.
+
+Each entry offers:
+
+1. **Pick the show** — search the providers and pick a match (the existing
+   Identify path, `RemoteSearch/Apply`, which writes `match_source = 'manual'`),
+   or confirm the guess, which clears the flag.
+2. **Move files** — tick episodes of a folder and send them to another group:
+   one of the folder's groups, any other show in the library, or a new show
+   (name, year, and optionally a provider pick). This is how a wrong split is
+   undone or a missed one is made.
+3. **Keep together** — undo a split for the whole folder.
+
+Hand fixes are stored as **overrides**, never by editing the scanned rows, so
+a rescan cannot undo them: a new table `series_overrides` (path or folder,
+target series key, target name and year, who, when; migration 0074, verify
+free). The scanner applies overrides after its own split and before #1055's
+fold, so the fold sees the final grouping. Each change re-fetches the affected
+episodes' metadata straight away (§4) and keeps every row and its user data.
+Overrides are listed on the page and can be removed, which returns the files to
+what the scanner decides.
+
+Signal: `sum by (action) (increase(pharos_series_override_total[1d]))`,
+`action` ∈ `pick_show | confirm | move_files | keep_together | remove`, and a
+log line naming the admin, paths and old and new series keys.
+
+### 8. Decisions (Alison, 2026-11-09T17:27Z)
+
+1. Split mixed folders automatically, with a way to remap and fix them (§2, §7).
+2. Yes, the server may re-match BSG and The Flash and re-fetch metadata on about
+   180 episode rows once `"apply"` is set. Nothing is deleted.
+3. A show the matcher can't decide between shows its best guess with a flag,
+   and can be fixed (§3, §7).
+
 ## Signals (ODD)
 
 The bug today, by query (no metric yet, so the first implementation commit adds
@@ -218,6 +264,7 @@ these):
 - `sum by (decided_by) (pharos_scan_copy_primaries)` gains
   `decided_by="refused_other_series"` for V894.
 - `{namespace="pharos"} |= "series identity repair"` for each dry-run line.
+- `sum by (action) (increase(pharos_series_override_total[1d]))` for §7.
 
 After deploy, success is: the dry-run lines list BSG → 2004 (tvdb id of the
 2004 series), The Flash split 4 + 62, Cosmos 13 and Life on Mars 16 episode
@@ -237,15 +284,7 @@ re-fetches, and nothing else changing match.
 | V892 | An episode's provider metadata comes only from its series' pinned match; an episode NFO id naming another series is set aside. |
 | V893 | A bare folder whose files state different show years is split by stated year; the unyeared group keeps the folder key. |
 | V894 | Copies fold only within one series key, with equal stated show years and equal provider series ids where both are known. |
-
-## Open questions for Alison
-
-1. Split The Flash folder automatically (this design), or only flag it on
-   Manage → Integrity and leave the files where they are?
-2. OK for the server, once deployed with `"apply"`, to re-match BSG/The Flash
-   and re-fetch metadata on about 180 episode rows? Nothing is deleted.
-3. An ambiguous show with no clear winner shows local names only until picked.
-   Acceptable, or would you rather it took the best guess and was flagged?
+| V895 | A hand fix of a show or its files is an override the scanner applies after its own split and before the copy fold; a rescan never undoes it. |
 
 ## Out of scope
 
