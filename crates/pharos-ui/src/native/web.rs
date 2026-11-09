@@ -433,6 +433,20 @@ pub fn media_state(video_id: &str) -> MediaState {
     })
 }
 
+/// The shape of the picture `video` shows: its decoded frame, or one eye of
+/// it while its frame carries a 3D crop (`data-packing`, V921).
+pub(super) fn picture_size(video: &web_sys::HtmlMediaElement) -> (u32, u32) {
+    let packing = video
+        .parent_element()
+        .and_then(|f| f.get_attribute("data-packing"))
+        .and_then(|a| super::stereo::parse_packing(&a));
+    super::stereo::eye_size(
+        packing,
+        video_dimension(video, "videoWidth"),
+        video_dimension(video, "videoHeight"),
+    )
+}
+
 /// A `<video>`'s `videoWidth` or `videoHeight`, read off the element so the
 /// media element binding is all this needs.
 fn video_dimension(v: &web_sys::HtmlMediaElement, name: &str) -> u32 {
@@ -811,14 +825,13 @@ fn cue_box_for(video_id: &str) -> CueBox {
     else {
         return none;
     };
+    // The on-screen box: a 3D crop stretches the element past its eye along
+    // one axis, so the narrower fit below is the eye's.
     let rect = video.get_bounding_client_rect();
-    let natural = |key: &str| {
-        js_sys::Reflect::get(&video, &key.into())
-            .ok()
-            .and_then(|v| v.as_f64())
-            .unwrap_or(0.0)
-    };
-    let (picture_w, picture_h) = (natural("videoWidth"), natural("videoHeight"));
+    let (picture_w, picture_h) = video
+        .dyn_ref::<web_sys::HtmlMediaElement>()
+        .map_or((0, 0), picture_size);
+    let (picture_w, picture_h) = (f64::from(picture_w), f64::from(picture_h));
     let width = if picture_w > 0.0 && picture_h > 0.0 {
         rect.width().min(rect.height() * picture_w / picture_h)
     } else {

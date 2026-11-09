@@ -1470,6 +1470,34 @@ body:has(.pharos-stage.is-full) .pharos-status-note {
   width: 100%;
   height: 100%;
 }
+/* A packed 3D version on a flat screen shows one eye (spec 022, V920). The
+   video is laid out at the eye's contained box, so everything fitted to the
+   element sees the eye; the whole frame is drawn into it, stretched twice
+   along the packing's axis from its start edge, and clipped to the first
+   half, which is the left eye. The DOM is unchanged, so MSE is undisturbed. */
+.pharos-video-frame[data-packing] {
+  container-type: size;
+  overflow: hidden;
+  background: black; /* not themed: the letterbox around video is black in every theme */
+}
+.pharos-video-frame[data-packing] > .pharos-video {
+  position: absolute;
+  inset: 0;
+  margin: auto;
+  width: min(100cqw, 100cqh * var(--pharos-eye-aspect, 1.777778));
+  height: min(100cqh, 100cqw / var(--pharos-eye-aspect, 1.777778));
+  object-fit: fill;
+}
+.pharos-video-frame:is([data-packing="hsbs"], [data-packing="fsbs"]) > .pharos-video {
+  transform-origin: left center;
+  scale: 2 1;
+  clip-path: inset(0 50% 0 0);
+}
+.pharos-video-frame:is([data-packing="htab"], [data-packing="ftab"]) > .pharos-video {
+  transform-origin: center top;
+  scale: 1 2;
+  clip-path: inset(0 0 50% 0);
+}
 /* Text subtitles drawn by pharos-subs (spec 026): a WebGL canvas over the
    whole frame; the renderer places the cue inside the picture's box and above
    the control bar. The `<track>` is hidden while this draws; the `::cue`
