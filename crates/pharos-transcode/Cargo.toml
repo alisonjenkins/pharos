@@ -32,6 +32,11 @@ xxhash-rust.workspace = true
 ffmpeg-the-third = { version = "6", optional = true }
 workspace-hack = { version = "0.1", path = "../../workspace-hack" }
 
+# The worker's libav ops left freed memory in glibc arenas (B911). Unprefixed,
+# so libav's own allocations move to jemalloc too, as in the server (ADR-0074).
+[target.'cfg(target_os = "linux")'.dependencies]
+tikv-jemallocator.workspace = true
+
 [features]
 # Default is the in-process libav (FFI) backend — the hybrid: tiny ops run
 # in-process via the worker pool; video-segment/live transcode still spawns

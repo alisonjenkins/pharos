@@ -170,6 +170,7 @@ linux-raw-sys = { version = "0.12", default-features = false, features = ["auxve
 rustix = { version = "1", features = ["fs", "param", "process", "system", "thread"] }
 simdutf8 = { version = "0.1", features = ["aarch64_neon", "public_imp"] }
 sync_wrapper = { version = "1", default-features = false, features = ["futures"] }
+tikv-jemalloc-sys = { version = "0.7", features = ["background_threads", "stats", "unprefixed_malloc_on_supported_platforms"] }
 tower = { version = "0.5", default-features = false, features = ["balance", "buffer", "limit", "load-shed", "retry", "timeout"] }
 
 [target.x86_64-unknown-linux-gnu.build-dependencies]
@@ -188,6 +189,7 @@ linux-raw-sys = { version = "0.12", default-features = false, features = ["auxve
 rustix = { version = "1", features = ["fs", "param", "process", "system", "thread"] }
 simdutf8 = { version = "0.1", features = ["aarch64_neon", "public_imp"] }
 sync_wrapper = { version = "1", default-features = false, features = ["futures"] }
+tikv-jemalloc-sys = { version = "0.7", features = ["background_threads", "stats", "unprefixed_malloc_on_supported_platforms"] }
 tower = { version = "0.5", default-features = false, features = ["balance", "buffer", "limit", "load-shed", "retry", "timeout"] }
 
 [target.aarch64-unknown-linux-gnu.build-dependencies]
