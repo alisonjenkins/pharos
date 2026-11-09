@@ -98,6 +98,9 @@ scan_probe_concurrency = {{ $s.scanProbeConcurrency | int64 }}
 library_watch_enabled = {{ $s.libraryWatchEnabled }}
 library_poll_interval_secs = {{ $s.libraryPollIntervalSecs | int64 }}
 drain_grace_secs = {{ $s.drainGraceSecs | int64 }}
+{{- with $s.httpWorkers }}
+http_workers = {{ . | int64 }}
+{{- end }}
 {{- with $s.trustedProxies }}
 trusted_proxies = [{{ range $i, $p := . }}{{ if $i }}, {{ end }}{{ $p | quote }}{{ end }}]
 {{- end }}
