@@ -387,11 +387,76 @@ impl<T: TvdbTransport> TvdbClient<T> {
         &self,
         series_id: &str,
     ) -> Option<Vec<crate::online_enrich::EpisodeListing>> {
-        let body = self
-            .record_body(&format!("/series/{series_id}/episodes/default"))
-            .await
-            .ok()?;
+        let body = self.episodes_body(series_id).await.ok()?;
         parse_episode_list(&body)
+    }
+
+    /// Every page of `/series/{id}/episodes/default` as one body: TVDB v4
+    /// pages the list (about 500 episodes a page), so a long show's later
+    /// episodes are only on page 1 onwards (B983). A failed later page fails
+    /// the whole read, as a list missing its tail would read as "no such
+    /// episode".
+    async fn episodes_body(&self, series_id: &str) -> Result<String, TextsFetch> {
+        let path = format!("/series/{series_id}/episodes/default");
+        let first = self.record_body(&path).await?;
+        let Ok(mut merged) = serde_json::from_str::<serde_json::Value>(&first) else {
+            return Ok(first);
+        };
+        let mut pages = 1usize;
+        while has_next_page(&merged) {
+            if pages >= MAX_EPISODE_PAGES {
+                tracing::warn!(
+                    series_id,
+                    pages,
+                    "tvdb episode list longer than the page cap; later episodes left out"
+                );
+                break;
+            }
+            let body = match self.record_body(&format!("{path}?page={pages}")).await {
+                Ok(body) => body,
+                Err(miss) => {
+                    tracing::warn!(
+                        series_id,
+                        page = pages,
+                        outcome = ?miss,
+                        "tvdb episode list page failed; the list is not used"
+                    );
+                    return Err(TextsFetch::Failed);
+                }
+            };
+            let next: serde_json::Value =
+                serde_json::from_str(&body).map_err(|_| TextsFetch::Failed)?;
+            let more = next
+                .get("data")
+                .and_then(|d| d.get("episodes"))
+                .and_then(|e| e.as_array())
+                .cloned()
+                .unwrap_or_default();
+            if let Some(list) = merged
+                .get_mut("data")
+                .and_then(|d| d.get_mut("episodes"))
+                .and_then(|e| e.as_array_mut())
+            {
+                list.extend(more);
+            }
+            if let (Some(links), Some(next_links)) = (merged.get_mut("links"), next.get("links")) {
+                *links = next_links.clone();
+            }
+            pages += 1;
+        }
+        if pages > 1 {
+            tracing::info!(
+                series_id,
+                pages,
+                episodes = merged
+                    .get("data")
+                    .and_then(|d| d.get("episodes"))
+                    .and_then(|e| e.as_array())
+                    .map_or(0, Vec::len),
+                "tvdb episode list read across pages"
+            );
+        }
+        Ok(merged.to_string())
     }
 
     async fn episode_record(
@@ -404,9 +469,7 @@ impl<T: TvdbTransport> TvdbClient<T> {
     ) -> Result<(EnrichedMetadata, bool), TextsFetch> {
         let series_id = self.episode_series(series_id, season, episode).await?;
         let series_id = series_id.as_str();
-        let body = self
-            .record_body(&format!("/series/{series_id}/episodes/default"))
-            .await?;
+        let body = self.episodes_body(series_id).await?;
         let Some(mut md) = parse_episode_detail(&body, season, episode, name) else {
             // Only a readable list that lacks the episode is "no such
             // record"; a body that is not a list (cut off in transit, say)
@@ -791,6 +854,19 @@ pub(crate) fn decode_entities(text: &str) -> String {
 /// Longest reference body [`decode_entities`] looks for (`#x10FFFF`), so a
 /// stray `&` far from any `;` is not scanned to the end of an overview.
 const MAX_ENTITY_LEN: usize = 8;
+
+/// Most `/episodes/default` pages read for one show: 20 pages of about 500
+/// is 10 000 episodes, past the longest show TVDB lists.
+const MAX_EPISODE_PAGES: usize = 20;
+
+/// Whether a `/episodes/default` body names a next page (`links.next`, a
+/// URL, or null on the last page).
+fn has_next_page(body: &serde_json::Value) -> bool {
+    body.get("links")
+        .and_then(|l| l.get("next"))
+        .and_then(|n| n.as_str())
+        .is_some_and(|s| !s.is_empty())
+}
 
 fn entity_char(name: &str) -> Option<char> {
     match name {
@@ -1895,6 +1971,57 @@ mod tests {
 
     /// TVDB's season of The Next Generation, which now counts the two-part
     /// pilot once: every later episode sits one number below the files'.
+    /// B983: TVDB pages `/episodes/default`. A long show's episodes after
+    /// the first page (One Piece's after about 500) are read from page 1
+    /// onwards, for the list and for one episode's record.
+    #[tokio::test]
+    async fn a_paged_episode_list_is_read_to_its_last_page() {
+        const PAGE0: &str = r#"{"data":{"episodes":[
+            {"id":1,"seasonNumber":1,"number":1,"name":"Romance Dawn","aired":"1999-10-20"}]},
+            "links":{"next":"https://api4.thetvdb.com/v4/series/81797/episodes/default?page=1"}}"#;
+        const PAGE1: &str = r#"{"data":{"episodes":[
+            {"id":1050,"seasonNumber":21,"number":1,"name":"Honor","aired":"2023-01-29"}]},
+            "links":{"next":null}}"#;
+        let transport = || {
+            FakeTransport::new()
+                .push_login("jwt")
+                .route("/series/81797/episodes/default", 200, PAGE0)
+                .route("/series/81797/episodes/default?page=1", 200, PAGE1)
+        };
+        let t = transport();
+        let c = TvdbClient::with_transport("key".into(), t.clone());
+        let list = c.episode_list("81797").await.expect("a list");
+        assert_eq!(
+            list.iter()
+                .map(|l| (l.season, l.episode))
+                .collect::<Vec<_>>(),
+            [(1, 1), (21, 1)]
+        );
+        assert_eq!(
+            t.paths(),
+            [
+                "/series/81797/episodes/default",
+                "/series/81797/episodes/default?page=1"
+            ]
+        );
+
+        let c = TvdbClient::with_transport("key".into(), transport());
+        let md = c
+            .get_episode("81797", 21, 1, Some("Honor"))
+            .await
+            .expect("the episode on the second page");
+        assert_eq!(md.title.as_deref(), Some("Honor"));
+
+        // A failed later page fails the read: a list cut short would say the
+        // later episodes do not exist.
+        let t = FakeTransport::new()
+            .push_login("jwt")
+            .route("/series/81797/episodes/default", 200, PAGE0)
+            .route("/series/81797/episodes/default?page=1", 500, "");
+        let c = TvdbClient::with_transport("key".into(), t);
+        assert!(c.episode_list("81797").await.is_none());
+    }
+
     const TNG_S1: &str = r#"{"data":{"episodes":[
         {"id":101,"seasonNumber":1,"number":1,"name":"Encounter at Farpoint"},
         {"id":102,"seasonNumber":1,"number":2,"name":"The Naked Now","overview":"An infection."},
