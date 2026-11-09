@@ -178,6 +178,9 @@ pub struct AppState {
     /// Read by `GET /admin/integrity/damaged` — the one place "a number
     /// stating corruption" becomes "which files".
     pub integrity_memo: Option<std::sync::Arc<crate::integrity_memo::IntegrityMemo>>,
+    /// The integrity sweep's re-check queue and its not-checkable set. `None`
+    /// exactly when `integrity_memo` is: both come from the one spawn.
+    pub integrity_sweep: Option<std::sync::Arc<crate::integrity_sweep::IntegritySweep>>,
     /// Spec 028 — queue of the video a viewer just opened, ahead of the
     /// subtitle styling backfill. `None` where the job is not spawned (no
     /// `ffmpeg-lib`, tests).
@@ -735,6 +738,7 @@ impl AppState {
             images: None,
             hls: None,
             integrity_memo: None,
+            integrity_sweep: None,
             subtitle_styling: None,
             transcode_scheduler: None,
             remote: None,
@@ -862,6 +866,7 @@ impl AppState {
             images: None,
             hls: None,
             integrity_memo: None,
+            integrity_sweep: None,
             subtitle_styling: None,
             transcode_scheduler: None,
             remote: None,
@@ -1126,6 +1131,14 @@ impl AppState {
         memo: std::sync::Arc<crate::integrity_memo::IntegrityMemo>,
     ) -> Self {
         self.integrity_memo = Some(memo);
+        self
+    }
+
+    pub fn with_integrity_sweep(
+        mut self,
+        sweep: std::sync::Arc<crate::integrity_sweep::IntegritySweep>,
+    ) -> Self {
+        self.integrity_sweep = Some(sweep);
         self
     }
 

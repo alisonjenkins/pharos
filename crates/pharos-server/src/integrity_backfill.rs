@@ -30,10 +30,29 @@
 //! worse than none. The cost is bounded by memoisation instead — see
 //! [`crate::integrity_memo`]. A library is read once, not once per pass.
 //!
+//! # Books
+//!
+//! Books are read too, but not through libav: an archive or PDF has no stream
+//! to demux. [`pharos_scanner::book::integrity`] walks every entry or page and
+//! its verdict is folded into the same [`IntegrityReport`] — parts read become
+//! `packets`, broken parts `read_errors` — so one memo, one damaged list and
+//! one metric cover every kind of media. A format nothing here can verify (rar
+//! comics, DRM-locked Kindle files) is `not_checkable`: remembered for the
+//! life of the process so it is not re-opened every pass, and never recorded
+//! as clean.
+//!
+//! # Re-checking on request
+//!
+//! An admin can ask for one file to be read again ([`crate::integrity_sweep::IntegritySweep::request`]).
+//! The request wakes the sweep, jumps the queue, and ignores the memo for that
+//! file, while the old verdict stays listed until the new one replaces it.
+//!
 //! # Signals
 //!
 //! ```text
-//! pharos_media_integrity_total{verdict}   clean | damaged | short | unreadable | error
+//! pharos_media_integrity_total{verdict,kind}
+//!     verdict: clean | damaged | short | unreadable | not_checkable | error
+//!     kind:    movie | episode | audio | book
 //! pharos_media_integrity_seconds          per-file scan duration
 //! pharos_media_damaged_files              gauge: files currently known damaged
 //! ```
@@ -44,8 +63,13 @@
 
 use crate::bg_io::BgPermit;
 use crate::integrity_memo::IntegrityMemo;
+use crate::integrity_sweep::{
+    book_report, count_verdict, pass_order, reader_for, scannable, Found, IntegritySweep, Reader,
+};
 use crate::state::Stores;
 use pharos_core::{MediaItem, MediaStore};
+use pharos_scanner::book::integrity::BookCheck;
+use pharos_transcode::integrity::IntegrityReport;
 use pharos_transcode::worker::LibavWorkerPool;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -68,6 +92,11 @@ const PASS_INTERVAL: Duration = Duration::from_secs(3600);
 /// passes that each bank their results.
 const MAX_PER_PASS: usize = 200;
 
+/// The longest the sweep waits on one book. A 512 MiB PDF (the check's size
+/// cap) inflates in well under a minute; ten is room for a slow NFS read, not
+/// for a decompression bomb.
+const BOOK_CHECK_TIMEOUT: Duration = Duration::from_secs(600);
+
 struct Ctx {
     /// Background-work leadership (T85). Gates the sweep so replicas do not
     /// duplicate it.
@@ -76,6 +105,7 @@ struct Ctx {
     bg_io: Arc<Semaphore>,
     pool: LibavWorkerPool,
     memo: Arc<IntegrityMemo>,
+    sweep: Arc<IntegritySweep>,
 }
 
 /// Spawn the integrity sweep. Fire-and-forget: a failure aborts only this
@@ -86,6 +116,7 @@ pub fn spawn(
     bg_io: Arc<Semaphore>,
     pool: LibavWorkerPool,
     memo: Arc<IntegrityMemo>,
+    sweep: Arc<IntegritySweep>,
 ) {
     tracing::info!(
         memo = %memo.path().display(),
@@ -98,6 +129,7 @@ pub fn spawn(
         bg_io,
         pool,
         memo,
+        sweep,
     }));
 }
 
@@ -123,38 +155,71 @@ async fn run_sweep(ctx: Ctx) {
             Ok(items) => run_pass(&ctx, &items).await,
             Err(e) => tracing::warn!(error = %e, "integrity sweep: item list failed"),
         }
-        tokio::time::sleep(PASS_INTERVAL).await;
+        // A re-check request cuts the wait short; `Notify` keeps the wake-up
+        // if it lands while a pass is still running.
+        tokio::select! {
+            () = tokio::time::sleep(PASS_INTERVAL) => {}
+            () = ctx.sweep.woken() => {}
+        }
     }
 }
 
-/// Whether this item can be read end to end at all.
-///
-/// Remote origins (008) have a synthetic path that is not a file, so opening it
-/// is ENOENT. That failure would not be self-limiting: the memo keys on a
-/// `stat` that never succeeds, so nothing is ever recorded and the item is
-/// retried on every pass, each attempt taking a background-I/O permit away
-/// from live playback (V134).
-fn scannable(it: &MediaItem) -> bool {
-    // Only what libav can open. A book is never probed by ffmpeg (004-books
-    // FR-001) and cannot pass an integrity demux; scanning one fails on every
-    // pass, and a failure is deliberately not memoised (see `run_pass`), so
-    // each ebook cost a background-I/O permit and a WARN every pass forever —
-    // 19 002 lines in the week to 2026-09-06.
-    let is_av = matches!(
-        it.kind,
-        pharos_core::MediaKind::Movie
-            | pharos_core::MediaKind::Episode
-            | pharos_core::MediaKind::Audio
-    );
-    is_av && it.origin().local().is_some()
+/// What one file's read produced.
+enum Outcome {
+    Report(IntegrityReport),
+    NotCheckable(String),
+}
+
+/// Read one file end to end with the reader its kind needs.
+async fn scan_one(ctx: &Ctx, it: &MediaItem) -> Result<Outcome, String> {
+    if reader_for(it.kind) == Reader::Book {
+        let path = it.path.clone();
+        let task =
+            tokio::task::spawn_blocking(move || pharos_scanner::book::integrity::check(&path));
+        // A blocking read cannot be cancelled, but the sweep and its permit
+        // must not wait on it forever. Past the bound the thread finishes on
+        // its own, and the file is not checkable in this state: retrying it
+        // every pass would strand another thread each time.
+        let Ok(joined) = tokio::time::timeout(BOOK_CHECK_TIMEOUT, task).await else {
+            return Ok(Outcome::NotCheckable(format!(
+                "book check took over {}s",
+                BOOK_CHECK_TIMEOUT.as_secs()
+            )));
+        };
+        let checked = match joined {
+            Ok(opened) => opened.map_err(|e| format!("book could not be opened: {e}"))?,
+            // A reader that panics on this file will panic on every pass; record it once.
+            Err(e) if e.is_panic() => {
+                return Ok(Outcome::NotCheckable(format!("book reader panicked: {e}")));
+            }
+            Err(e) => return Err(format!("book check task failed: {e}")),
+        };
+        return Ok(match checked {
+            BookCheck::Checked(b) => Outcome::Report(book_report(b)),
+            BookCheck::NotCheckable(why) => Outcome::NotCheckable(why),
+        });
+    }
+    ctx.pool
+        .integrity(it.path.clone())
+        .await
+        .map(Outcome::Report)
+        .map_err(|e| e.to_string())
 }
 
 async fn run_pass(ctx: &Ctx, items: &[MediaItem]) {
     let mut scanned = 0usize;
     let mut damaged_this_pass = 0usize;
 
-    for it in items {
-        if scanned >= MAX_PER_PASS {
+    let queued = ctx.sweep.queued_ids();
+    // A requested id that is no longer in the library has nothing to read.
+    for id in &queued {
+        if !items.iter().any(|it| it.id == *id) {
+            ctx.sweep.done(*id);
+        }
+    }
+
+    for (it, requested) in pass_order(items, &queued) {
+        if !requested && scanned >= MAX_PER_PASS {
             tracing::info!(
                 cap = MAX_PER_PASS,
                 "integrity sweep: pass cap reached; remaining files continue next pass"
@@ -162,13 +227,15 @@ async fn run_pass(ctx: &Ctx, items: &[MediaItem]) {
             break;
         }
         if !scannable(it) {
+            ctx.sweep.done(it.id);
             continue;
         }
         let sig = tokio::fs::metadata(&it.path)
             .await
             .ok()
             .map(|m| (mtime_secs(&m), m.len()));
-        if ctx.memo.is_scanned(it.id, sig) {
+        if !requested && (ctx.memo.is_scanned(it.id, sig) || ctx.sweep.is_not_checkable(it.id, sig))
+        {
             continue;
         }
 
@@ -179,19 +246,27 @@ async fn run_pass(ctx: &Ctx, items: &[MediaItem]) {
         // than competing with it.
         let outcome = {
             let _permit = BgPermit::acquire(&ctx.bg_io).await;
-            ctx.pool.integrity(it.path.clone()).await
+            scan_one(ctx, it).await
         };
+        let kind = it.kind.as_str();
         let elapsed = started.elapsed();
         metrics::histogram!("pharos_media_integrity_seconds").record(elapsed.as_secs_f64());
         scanned += 1;
 
         match outcome {
-            Ok(report) => {
-                metrics::counter!(
-                    "pharos_media_integrity_total",
-                    "verdict" => report.label(),
-                )
-                .increment(1);
+            Ok(Outcome::NotCheckable(why)) => {
+                count_verdict("not_checkable", it.kind);
+                tracing::info!(
+                    item = %it.id,
+                    path = %it.path.display(),
+                    kind,
+                    reason = %why,
+                    "integrity sweep: file cannot be verified; not counted as clean",
+                );
+                ctx.sweep.settle(&ctx.memo, it.id, sig, Found::NotCheckable);
+            }
+            Ok(Outcome::Report(report)) => {
+                count_verdict(report.label(), it.kind);
                 if report.is_damaged() {
                     damaged_this_pass += 1;
                     // The failure path states as much as the success path
@@ -200,6 +275,7 @@ async fn run_pass(ctx: &Ctx, items: &[MediaItem]) {
                     tracing::warn!(
                         item = %it.id,
                         path = %it.path.display(),
+                        kind,
                         verdict = report.label(),
                         first_fault_ms = report.first_fault_ms,
                         first_fault = report.first_fault.as_deref().unwrap_or("unspecified"),
@@ -220,7 +296,8 @@ async fn run_pass(ctx: &Ctx, items: &[MediaItem]) {
                         "integrity sweep: clean",
                     );
                 }
-                ctx.memo.record(it.id, sig, report);
+                ctx.sweep
+                    .settle(&ctx.memo, it.id, sig, Found::Report(report));
             }
             Err(e) => {
                 // The scan itself failed — a worker died, timed out, or the
@@ -228,18 +305,24 @@ async fn run_pass(ctx: &Ctx, items: &[MediaItem]) {
                 // an infrastructure failure is not a verdict about the file,
                 // and writing one would mark a healthy file unexamined-forever
                 // on a single transient fault.
-                metrics::counter!(
-                    "pharos_media_integrity_total",
-                    "verdict" => "error",
-                )
-                .increment(1);
+                count_verdict("error", it.kind);
                 tracing::warn!(
                     item = %it.id,
                     path = %it.path.display(),
+                    kind,
                     error = %e,
                     "integrity sweep: scan failed; will retry next pass",
                 );
             }
+        }
+        // Only a request this pass took ends here. One made while this file
+        // was already being read asks about bytes that may have changed since
+        // the read began, so it stays for the next pass. A failed read ends
+        // the request too: the admin sees the old verdict without the pending
+        // flag, and the log line above says why, rather than a row that stays
+        // Queued while the same fault repeats every pass.
+        if requested {
+            ctx.sweep.done(it.id);
         }
     }
 
@@ -267,55 +350,6 @@ fn mtime_secs(m: &std::fs::Metadata) -> i64 {
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
-}
-
-#[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
-mod tests {
-    use super::*;
-    use pharos_core::MediaKind;
-
-    fn local(path: &str) -> MediaItem {
-        MediaItem {
-            id: 1,
-            kind: MediaKind::Episode,
-            path: path.into(),
-            title: "ep".into(),
-            ..Default::default()
-        }
-    }
-
-    /// V134 — a remote origin (008) has a synthetic path that is not a file, so
-    /// the scan would fail on it forever: nothing is ever recorded, so nothing
-    /// is ever skipped, and every pass spends a background-I/O permit on it.
-    /// The sweep must not offer one to the pool at all.
-    /// A book has no A/V stream for libav to demux, so the scan fails on it
-    /// every pass; and because a scan FAILURE is deliberately never memoised,
-    /// every ebook in the library was re-attempted every pass, forever.
-    #[test]
-    fn a_book_is_never_offered_to_the_integrity_scan() {
-        let mut book = local("/books/Essentialism.azw3");
-        book.kind = MediaKind::Book;
-        assert!(
-            !scannable(&book),
-            "a book cannot pass a libav demux; scanning it can only ever fail"
-        );
-        let mut audio = local("/music/track.flac");
-        audio.kind = MediaKind::Audio;
-        assert!(
-            scannable(&audio),
-            "audio is a real stream and stays in scope"
-        );
-    }
-
-    #[test]
-    fn a_remote_origin_is_never_read_from_disk() {
-        assert!(scannable(&local("/tv/Show/s01e01.mkv")));
-        assert!(
-            !scannable(&local("ytdlp://youtube/dQw4w9WgXcQ")),
-            "a synthetic path is not a file; scanning it can only ever fail"
-        );
-    }
 }
 
 #[cfg(test)]

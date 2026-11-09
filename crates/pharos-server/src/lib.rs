@@ -20,6 +20,7 @@ pub mod health;
 #[cfg(all(unix, feature = "ffmpeg-lib"))]
 pub mod integrity_backfill;
 pub mod integrity_memo;
+pub mod integrity_sweep;
 pub mod item_list_cache;
 pub mod library_watch;
 pub mod local_time;

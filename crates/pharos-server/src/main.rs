@@ -1910,17 +1910,22 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
     #[cfg(all(unix, feature = "ffmpeg-lib"))]
     {
         let integrity_memo = integrity_memo_for(&cfg);
+        let integrity_sweep =
+            std::sync::Arc::new(pharos_server::integrity_sweep::IntegritySweep::default());
         pharos_server::integrity_backfill::spawn(
             state.stores.clone(),
             state.is_bg_leader.clone(),
             state.bg_io.clone(),
             libav_pool.clone(),
             integrity_memo.clone(),
+            integrity_sweep.clone(),
         );
         // GET /admin/integrity/damaged reads this — the only way "N files
         // are damaged" turns into which ones without a debug pod on the
         // cache PVC.
-        state = state.with_integrity_memo(integrity_memo);
+        state = state
+            .with_integrity_memo(integrity_memo)
+            .with_integrity_sweep(integrity_sweep);
     }
     // Spec 024 — tempo and energy for every song, for the mix rules. One song
     // at a time behind the background-I/O gate; a song is decoded once.
