@@ -15,14 +15,17 @@ carry to all media pharos manages, the best quality copy playing by default.
 ## Decision
 
 An audio file (`flac`, `mp3`, `opus`, `m4a`, `ogg`, `wav`) that is not an
-episode is a copy of every other with the same file stem under the same two
-folders above it (album and artist, or disc and album). Each of the three
-names is folded to lower-case letters and digits after dropping release
-tags: any `[..]` or `{..}`, and a `(..)` holding only a year or a format
-word (`FLAC`, `320 kbps`, `24-bit`, `24-96`, `WEB`). Other parentheses
-(`Deluxe`, `Live`, `CD 2`) stay part of the name. The bigger file is the
+episode is a copy of every other with the same file stem under the same
+three folders above it (album, artist and the folder above, or disc, album
+and artist). Each name is folded to lower-case letters and digits after
+dropping each bracketed tag (`[..]`, `(..)` or `{..}`) whose every word is a
+format, bit depth, rate or year (`[FLAC]`, `(2001)`, `(320 kbps)`,
+`[24-96]`). Any other bracket stays part of the name, so `[Live]`, `[CD2]`,
+`(Deluxe)` and `(Remix v2)` keep their songs apart. A song is never ranked
+as a 3D rip. The bigger file is the
 primary, as for episodes and films (copies of one song run the same length,
-so size stands for bitrate, and a lossless file is bigger than a lossy one).
+so size stands for bitrate, and a lossless file is almost always bigger
+than a lossy one; a `.wav` beside its `.flac` wins, which plays the same).
 The others are `alternate_sources`, and a copy's row folds its play count,
 favourite and resume into the item (`FoldResume::Carry`).
 
@@ -50,6 +53,9 @@ scan after it arrived and needs a store read per song on every scan.
   renamed folders, but only known after the probe, as above.
 - Rank lossless first, then bitrate: size orders them the same way for one
   song without reading the store.
+- Drop every `[..]` and `{..}` and keep two folders (the first cut): merged
+  live takes, instrumentals and discs, and two artists' compilations with a
+  disc folder.
 
 ## References
 
