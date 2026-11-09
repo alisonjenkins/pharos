@@ -34,6 +34,7 @@ fn mp4_h264_aac_profile() -> DeviceProfile {
         max_static_bitrate: None,
         codec_profiles: vec![],
         subtitle_profiles: vec![],
+        denied_audio_codecs: vec![],
     }
 }
 
