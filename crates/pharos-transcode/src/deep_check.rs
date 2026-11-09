@@ -20,6 +20,10 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 /// transcodes for viewers need; it is on demand and nobody is waiting on it.
 pub const DECODE_THREADS: &str = "2";
 
+/// `nice` value of the decoder: the lowest priority there is.
+#[cfg(unix)]
+const NICENESS: libc::c_int = 19;
+
 /// What decoding a whole file found.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DeepReport {
@@ -60,30 +64,41 @@ pub async fn decode_check(
     path: &Path,
     timeout: Duration,
 ) -> Result<DeepReport, DeepError> {
-    let mut child = tokio::process::Command::new(ffmpeg)
-        .args([
-            "-nostdin",
-            "-hide_banner",
-            "-nostats",
-            "-v",
-            "error",
-            "-progress",
-            "pipe:1",
-            "-threads",
-            DECODE_THREADS,
-            "-i",
-        ])
-        .arg(path)
-        .args(["-map", "0:v?", "-map", "0:a?", "-f", "null", "-"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|source| DeepError::Spawn {
-            bin: ffmpeg.to_string(),
-            source,
-        })?;
+    let mut cmd = tokio::process::Command::new(ffmpeg);
+    cmd.args([
+        "-nostdin",
+        "-hide_banner",
+        "-nostats",
+        "-v",
+        "error",
+        "-progress",
+        "pipe:1",
+        "-threads",
+        DECODE_THREADS,
+        "-i",
+    ])
+    .arg(path)
+    .args(["-map", "0:v?", "-map", "0:a?", "-f", "null", "-"])
+    .stdin(Stdio::null())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .kill_on_drop(true);
+    // Lowest CPU priority: a decode that runs for an hour must give way to
+    // the transcodes viewers are waiting on. Best effort; a failure leaves
+    // the default priority.
+    #[cfg(unix)]
+    // SAFETY: setpriority is a single syscall, async-signal-safe, and
+    // touches no memory of the parent.
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::setpriority(libc::PRIO_PROCESS as _, 0, NICENESS);
+            Ok(())
+        });
+    }
+    let mut child = cmd.spawn().map_err(|source| DeepError::Spawn {
+        bin: ffmpeg.to_string(),
+        source,
+    })?;
 
     let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
         return Err(DeepError::Failed {
