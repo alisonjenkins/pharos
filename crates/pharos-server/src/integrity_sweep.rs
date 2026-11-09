@@ -16,8 +16,10 @@ use tokio::sync::Notify;
 #[derive(Debug, Default)]
 pub struct IntegritySweep {
     /// In request order. An id leaves only once its new verdict is recorded,
-    /// so "queued" stays true for the whole wait.
-    queued: Mutex<Vec<u64>>,
+    /// so "queued" stays true for the whole wait. The flag marks an id asked
+    /// for again while already queued: the read under way may have started
+    /// before the file was replaced, so the id must outlive one `done`.
+    queued: Mutex<Vec<(u64, bool)>>,
     wake: Notify,
     /// Keyed to the file's `(mtime, size)`, so a replaced file is tried again.
     not_checkable: Mutex<HashMap<u64, Option<(i64, u64)>>>,
@@ -25,23 +27,23 @@ pub struct IntegritySweep {
 
 impl IntegritySweep {
     /// Queue `id` to be read again and wake the sweep. `false` when it was
-    /// already queued.
+    /// already queued; it is then read once more after the read it is
+    /// waiting on.
     pub fn request(&self, id: u64) -> bool {
         let added = self
             .queued
             .lock()
             .map(|mut q| {
-                if q.contains(&id) {
+                if let Some(entry) = q.iter_mut().find(|(q, _)| *q == id) {
+                    entry.1 = true;
                     false
                 } else {
-                    q.push(id);
+                    q.push((id, false));
                     true
                 }
             })
             .unwrap_or(false);
-        if added {
-            self.wake.notify_one();
-        }
+        self.wake.notify_one();
         added
     }
 
@@ -52,7 +54,10 @@ impl IntegritySweep {
     }
 
     pub fn is_queued(&self, id: u64) -> bool {
-        self.queued.lock().map(|q| q.contains(&id)).unwrap_or(false)
+        self.queued
+            .lock()
+            .map(|q| q.iter().any(|(q, _)| *q == id))
+            .unwrap_or(false)
     }
 
     pub fn queued_len(&self) -> usize {
@@ -60,12 +65,23 @@ impl IntegritySweep {
     }
 
     pub fn queued_ids(&self) -> Vec<u64> {
-        self.queued.lock().map(|q| q.clone()).unwrap_or_default()
+        self.queued
+            .lock()
+            .map(|q| q.iter().map(|(id, _)| *id).collect())
+            .unwrap_or_default()
     }
 
+    /// The read this request waited on is in. An id asked for again during
+    /// that read stays queued, once, for the next pass.
     pub fn done(&self, id: u64) {
         if let Ok(mut q) = self.queued.lock() {
-            q.retain(|q| *q != id);
+            if let Some(pos) = q.iter().position(|(q, _)| *q == id) {
+                if let Some(entry) = q.get_mut(pos).filter(|e| e.1) {
+                    entry.1 = false;
+                } else {
+                    q.remove(pos);
+                }
+            }
         }
     }
 
@@ -292,11 +308,24 @@ mod tests {
         assert_eq!(order, vec![(3, true), (1, false), (2, false), (4, false)]);
     }
 
+    /// A second click after replacing a file, while the first re-check's
+    /// read is under way, must get its own read: the one under way may have
+    /// opened the old bytes.
+    #[test]
+    fn a_request_made_during_the_read_gets_a_read_of_its_own() {
+        let sweep = IntegritySweep::default();
+        assert!(sweep.request(9));
+        assert!(!sweep.request(9), "already queued, so asked again");
+        sweep.done(9);
+        assert!(sweep.is_queued(9), "the second ask is still owed a read");
+        sweep.done(9);
+        assert!(!sweep.is_queued(9));
+    }
+
     #[test]
     fn a_request_is_queued_once_and_cleared_when_read() {
         let sweep = IntegritySweep::default();
         assert!(sweep.request(5));
-        assert!(!sweep.request(5), "already waiting");
         assert!(sweep.is_queued(5));
         assert_eq!(sweep.queued_len(), 1);
         sweep.done(5);
