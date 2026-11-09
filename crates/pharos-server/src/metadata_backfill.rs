@@ -44,7 +44,7 @@ use crate::online_enrich::{
     TextsFetch,
 };
 use crate::series_identity::{
-    episode_series_conflict, log_series_match, record_episode_rejected, record_series_match,
+    log_series_match, record_episode_rejected, record_series_match, EpisodeRejectReason,
     SeriesMatchOutcome,
 };
 use crate::state::Stores;
@@ -531,6 +531,7 @@ where
     let ids_cleared = trusted != item.metadata.provider_ids;
     item.metadata.provider_ids = trusted;
     let provider_ids = item.metadata.provider_ids.clone();
+    let mut nfo_rejected: Option<NfoRejection> = None;
     let (matched_provider, resolved) = match item.kind {
         MediaKind::Movie => match tmdb {
             Some(t) => (
@@ -555,6 +556,54 @@ where
                 return Ok(false);
             }
         },
+        // V892 — an episode takes its record only from its show's pinned
+        // match. Its own manual match (Identify) is the one exception.
+        MediaKind::Episode if item.match_source.as_deref() != Some("manual") => {
+            let pinned = pinned_show(store, &item).await?;
+            let target = pinned.as_ref().and_then(|p| {
+                let provider = match p.match_provider.as_deref()? {
+                    "tvdb" => "tvdb",
+                    "tmdb" => "tmdb",
+                    _ => return None,
+                };
+                matches!(p.match_source.as_deref(), Some("search" | "manual"))
+                    .then_some((provider, p.match_external_id.as_deref()?))
+            });
+            match target {
+                // The show is matched to nothing: so is the episode, until the
+                // show's match changes.
+                None => {
+                    let provider = match pinned.as_ref().and_then(|p| p.match_provider.as_deref()) {
+                        Some("tmdb") => "tmdb",
+                        _ => "tvdb",
+                    };
+                    (provider, Resolved::NoMatch)
+                }
+                Some((provider, show_id)) => {
+                    let at = PinnedFetch {
+                        show_id,
+                        confidence: pinned.as_ref().and_then(|p| p.match_confidence),
+                        season,
+                        episode,
+                        name: name.as_deref(),
+                    };
+                    let (resolved, rejected) = match (provider, tvdb, tmdb) {
+                        ("tvdb", Some(t), _) => {
+                            resolve_pinned(t, &at, provider_ids.tvdb.as_deref(), bg_io).await
+                        }
+                        ("tmdb", _, Some(t)) => {
+                            resolve_pinned(t, &at, provider_ids.tmdb.as_deref(), bg_io).await
+                        }
+                        _ => {
+                            record_enrich(item.kind, EnrichOutcome::Skipped);
+                            return Ok(false);
+                        }
+                    };
+                    nfo_rejected = rejected;
+                    (provider, resolved)
+                }
+            }
+        }
         MediaKind::Episode => {
             if let Some(t) = tvdb {
                 (
@@ -687,22 +736,18 @@ where
             enriched,
         } => (external_id, source, confidence, *enriched),
     };
-    if item.kind == MediaKind::Episode {
-        observe_episode_series(
-            store,
-            &item,
-            matched_provider,
-            source,
-            &external_id,
-            &enriched,
-        )
-        .await;
+    if let Some(rejected) = &nfo_rejected {
+        set_aside_nfo(&mut item, rejected, matched_provider);
+    } else if item.kind == MediaKind::Episode && source == "search" {
+        observe_title_fit(&item, &enriched, matched_provider, &external_id);
     }
 
     // Fold the record onto the item (local data always wins — apply_enrichment
     // only fills gaps), then stamp the matched provider id if we hadn't one.
     let counts = store.item_entity_counts(item.id).await?;
-    let moved = reidentified(&item, &enriched) || nfo_names_another(&item, &enriched);
+    let moved = nfo_rejected.is_some()
+        || reidentified(&item, &enriched)
+        || nfo_names_another(&item, &enriched);
     if moved {
         adopt_reidentified(&mut item, &enriched);
     }
@@ -906,57 +951,152 @@ where
     Ok(true)
 }
 
-/// Spec 033 — whether `item`'s provider record belongs to another show than
-/// the one its folder is matched to. Observation only: the record is still
-/// applied (V892 sets it aside once episodes inherit their show's match). A
-/// failed lookup of the pinned match observes nothing.
-async fn observe_episode_series<S: SeriesMetadataStore>(
+/// The show an episode's folder (or split group) is matched to, if any.
+async fn pinned_show<S: SeriesMetadataStore>(
     store: &S,
     item: &MediaItem,
-    provider: &str,
-    source: &str,
-    external_id: &str,
-    enriched: &EnrichedMetadata,
-) {
+) -> DomainResult<Option<SeriesMetadata>> {
     let Some(series) = item.series.as_ref() else {
-        return;
+        return Ok(None);
     };
     let key = series.series_key().to_string();
-    let pinned = match store
+    Ok(store
         .series_metadata_by_keys(std::slice::from_ref(&key))
-        .await
-    {
-        Ok(mut found) => found.remove(&key),
-        Err(e) => {
-            tracing::debug!(error = %e, series_key = %key, "series identity: pinned match unreadable");
-            return;
+        .await?
+        .remove(&key))
+}
+
+/// Where in its pinned show an episode is looked up.
+struct PinnedFetch<'a> {
+    show_id: &'a str,
+    confidence: Option<f32>,
+    season: Option<u32>,
+    episode: Option<u32>,
+    name: Option<&'a str>,
+}
+
+/// An episode NFO id whose record belongs to another show (V892).
+struct NfoRejection {
+    nfo_id: String,
+    record_series: Option<String>,
+    pinned_series: String,
+}
+
+/// V892 — resolve an episode inside its show's pinned match. An NFO id for
+/// the pinned provider is used only when its record says it is an episode
+/// of the pinned show; otherwise the record is set aside (returned as the
+/// rejection) and the episode is looked up by number in the pinned show.
+async fn resolve_pinned<E: OnlineEnricher>(
+    enricher: &E,
+    at: &PinnedFetch<'_>,
+    nfo_id: Option<&str>,
+    bg_io: &Arc<Semaphore>,
+) -> (Resolved, Option<NfoRejection>) {
+    let mut rejected = None;
+    if let Some(nfo_id) = nfo_id {
+        let record = {
+            let _permit = BgPermit::acquire(bg_io).await;
+            enricher
+                .fetch(MediaKind::Episode, nfo_id, at.season, at.episode, at.name)
+                .await
+        };
+        match record {
+            Some(e) if e.series_id.as_deref() == Some(at.show_id) => {
+                return (
+                    Resolved::Hit {
+                        external_id: nfo_id.to_string(),
+                        source: "nfo_id",
+                        confidence: None,
+                        enriched: Box::new(e),
+                    },
+                    None,
+                );
+            }
+            Some(e) => {
+                rejected = Some(NfoRejection {
+                    nfo_id: nfo_id.to_string(),
+                    record_series: e.series_id,
+                    pinned_series: at.show_id.to_string(),
+                });
+            }
+            // No record for the id: nothing to compare, so the number decides.
+            None => {}
         }
+    }
+    let record = {
+        let _permit = BgPermit::acquire(bg_io).await;
+        enricher
+            .fetch(
+                MediaKind::Episode,
+                at.show_id,
+                at.season,
+                at.episode,
+                at.name,
+            )
+            .await
     };
-    let Some(reason) = episode_series_conflict(
-        provider,
-        source,
-        enriched.series_id.as_deref(),
-        pinned.as_ref(),
-    ) else {
-        return;
+    let resolved = match record {
+        Some(e) => Resolved::Hit {
+            external_id: at.show_id.to_string(),
+            source: "search",
+            confidence: at.confidence,
+            enriched: Box::new(e),
+        },
+        None => Resolved::Transient {
+            external_id: at.show_id.to_string(),
+            source: "search",
+            confidence: at.confidence,
+        },
     };
-    record_episode_rejected(reason);
+    (resolved, rejected)
+}
+
+/// V892 — drop what a rejected episode NFO put on `item`: its provider ids
+/// (another show's) and, through the caller's re-identified path, its text
+/// and still.
+fn set_aside_nfo(item: &mut MediaItem, rejected: &NfoRejection, provider: &str) {
+    record_episode_rejected(EpisodeRejectReason::NfoOtherSeries);
     tracing::info!(
         media.id = item.id,
         path = %item.path.display(),
-        series_key = %key,
         provider,
-        source,
-        external_id,
-        record_series_id = enriched.series_id.as_deref().unwrap_or_default(),
-        pinned_series_id = pinned
-            .as_ref()
-            .and_then(|p| p.match_external_id.as_deref())
-            .unwrap_or_default(),
-        reason = reason.label(),
-        "episode metadata names another series than its show's match; would set aside (V892)"
+        nfo_id = %rejected.nfo_id,
+        record_series_id = rejected.record_series.as_deref().unwrap_or_default(),
+        pinned_series_id = %rejected.pinned_series,
+        reason = EpisodeRejectReason::NfoOtherSeries.label(),
+        "episode NFO names another series than its show's match; set aside"
+    );
+    item.metadata.provider_ids = ProviderIds::default();
+    item.metadata.community_rating = None;
+}
+
+/// V892 — an episode placed in its pinned show by number whose file names a
+/// different episode than the record there, and none of its neighbours.
+/// Observation only: the number still decides.
+fn observe_title_fit(item: &MediaItem, enriched: &EnrichedMetadata, provider: &str, show_id: &str) {
+    let (Some(name), Some(record)) = (episode_name(item), enriched.title.as_deref()) else {
+        return;
+    };
+    let fits = |t: &str| pharos_core::title_similarity(&name, t) >= SAME_SHOW_EPISODE_TITLE;
+    if fits(record) || enriched.neighbour_titles.iter().any(|t| fits(t)) {
+        return;
+    }
+    record_episode_rejected(EpisodeRejectReason::TitleMismatch);
+    tracing::info!(
+        media.id = item.id,
+        path = %item.path.display(),
+        provider,
+        pinned_series_id = show_id,
+        file_title = %name,
+        record_title = record,
+        reason = EpisodeRejectReason::TitleMismatch.label(),
+        "episode's file title is not its record's in the pinned show"
     );
 }
+
+/// Lowest [`pharos_core::title_similarity`] at which a file's episode title
+/// is the record's (spec 033 §2's bar).
+const SAME_SHOW_EPISODE_TITLE: f32 = 0.8;
 
 /// FR1 — true when `id`'s row is currently `match_source = "manual"`
 /// (case-insensitive). Used immediately before every terminal
@@ -2250,6 +2390,7 @@ mod tests {
     use super::*;
     use crate::musicbrainz::AlbumArt;
     use pharos_core::{MediaItem, SearchCandidate};
+    use std::collections::HashMap;
 
     /// A remote item searches by TITLE, a local one by FILENAME.
     ///
@@ -2334,6 +2475,10 @@ mod tests {
         provider: &'static str,
         search: Vec<SearchCandidate>,
         detail: Option<EnrichedMetadata>,
+        /// Records by the id fetched; any other id gets `detail`.
+        detail_for: HashMap<String, EnrichedMetadata>,
+        /// Every id `fetch` was asked for, in order.
+        fetched: Arc<std::sync::Mutex<Vec<String>>>,
         image_bytes: Option<Vec<u8>>,
         texts: TextsFetch,
         asked: Arc<std::sync::Mutex<Vec<Vec<String>>>>,
@@ -2345,6 +2490,8 @@ mod tests {
                 provider: "tmdb",
                 search: Vec::new(),
                 detail: None,
+                detail_for: HashMap::new(),
+                fetched: Default::default(),
                 image_bytes: None,
                 texts: TextsFetch::Failed,
                 asked: Default::default(),
@@ -2356,6 +2503,8 @@ mod tests {
                 provider: "tvdb",
                 search: Vec::new(),
                 detail: None,
+                detail_for: HashMap::new(),
+                fetched: Default::default(),
                 image_bytes: None,
                 texts: TextsFetch::Failed,
                 asked: Default::default(),
@@ -2378,6 +2527,15 @@ mod tests {
         fn with_detail(mut self, detail: EnrichedMetadata) -> Self {
             self.detail = Some(detail);
             self
+        }
+
+        fn with_detail_for(mut self, id: &str, detail: EnrichedMetadata) -> Self {
+            self.detail_for.insert(id.to_string(), detail);
+            self
+        }
+
+        fn fetched(&self) -> Vec<String> {
+            self.fetched.lock().unwrap().clone()
         }
 
         fn with_image_bytes(mut self, bytes: Vec<u8>) -> Self {
@@ -2420,12 +2578,16 @@ mod tests {
         async fn fetch(
             &self,
             _kind: MediaKind,
-            _id: &str,
+            id: &str,
             _season: Option<u32>,
             _episode: Option<u32>,
             _name: Option<&str>,
         ) -> Option<EnrichedMetadata> {
-            self.detail.clone()
+            self.fetched.lock().unwrap().push(id.to_string());
+            self.detail_for
+                .get(id)
+                .cloned()
+                .or_else(|| self.detail.clone())
         }
         async fn fetch_image_bytes(&self, _url: &str) -> Option<Vec<u8>> {
             self.image_bytes.clone()
@@ -3323,6 +3485,7 @@ mod tests {
         item.metadata.overview = Some("Tasha Yar is kidnapped.".into());
         item.metadata.provider_ids.tvdb = Some("71470".into());
         s.put(item).await.unwrap();
+        pin_series(s, "/tv/Star Trek The Next Generation", "71470").await;
         s.set_artwork(
             900_570,
             "Thumb",
@@ -3348,6 +3511,7 @@ mod tests {
             overview: Some("An infection.".into()),
             episode_number: Some(number),
             neighbour_titles: vec!["Encounter at Farpoint".into(), "Code of Honor".into()],
+            series_id: Some("71470".into()),
             artwork: vec![RemoteArt {
                 role: ArtworkRole::Primary,
                 url: "https://artworks.thetvdb.com/naked-now.jpg".into(),
@@ -4515,7 +4679,7 @@ mod tests {
         store
             .upsert_series_metadata(SeriesMetadata {
                 series_key: key.into(),
-                series_name: "Cosmos".into(),
+                series_name: key.rsplit('/').next().unwrap_or(key).into(),
                 match_provider: Some("tvdb".into()),
                 match_external_id: Some(id.into()),
                 match_source: Some("search".into()),
@@ -4526,7 +4690,11 @@ mod tests {
             .unwrap();
     }
 
-    async fn cosmos_episode_with_record_of(record_series: &str) -> (u64, LogBuf) {
+    /// A Cosmos (1980) episode whose NFO id's record belongs to show
+    /// `record_series`; the folder is pinned to the 1980 show (74995).
+    async fn cosmos_episode_with_record_of(
+        record_series: &str,
+    ) -> (u64, LogBuf, MediaItem, Vec<String>) {
         use metrics_util::debugging::DebuggingRecorder;
         let recorder = DebuggingRecorder::new();
         let snap = pharos_test_metrics::snapshotter(&recorder);
@@ -4537,7 +4705,7 @@ mod tests {
         let mut item = MediaItem {
             id: 7,
             path: "/tv/Cosmos/Season 01/Cosmos - S01E01.mkv".into(),
-            title: "The Shores of the Cosmic Ocean".into(),
+            title: "Standing Up in the Milky Way".into(),
             kind: MediaKind::Episode,
             series: Some(pharos_core::SeriesInfo {
                 series_name: "Cosmos".into(),
@@ -4549,15 +4717,32 @@ mod tests {
             }),
             ..MediaItem::default()
         };
-        // A Jellyfin episode NFO's own TVDB id, of the 2014 remake's episode.
+        item.metadata.overview = Some("The 2014 premiere.".into());
+        // A Jellyfin episode NFO's own TVDB id, of the remake's episode.
         item.metadata.provider_ids.tvdb = Some("4777210".into());
+        item.metadata.provider_ids.imdb = Some("tt2395695".into());
         s.put(item.clone()).await.unwrap();
         let (_td, cache) = cache();
-        let tvdb = FakeEnricher::tvdb().with_detail(EnrichedMetadata {
-            title: Some("Standing Up in the Milky Way".into()),
-            series_id: Some(record_series.into()),
-            ..EnrichedMetadata::default()
-        });
+        let tvdb = FakeEnricher::tvdb()
+            .with_detail_for(
+                "4777210",
+                EnrichedMetadata {
+                    title: Some("Standing Up in the Milky Way".into()),
+                    overview: Some("The 2014 premiere.".into()),
+                    series_id: Some(record_series.into()),
+                    ..EnrichedMetadata::default()
+                },
+            )
+            .with_detail_for(
+                "74995",
+                EnrichedMetadata {
+                    title: Some("The Shores of the Cosmic Ocean".into()),
+                    overview: Some("Sagan's 1980 premiere.".into()),
+                    episode_number: Some((1, 1)),
+                    series_id: Some("74995".into()),
+                    ..EnrichedMetadata::default()
+                },
+            );
         enrich_one(
             &s,
             &sem(4),
@@ -4575,16 +4760,27 @@ mod tests {
             "pharos_episode_metadata_rejected_total",
             &[("reason", "nfo_other_series")],
         );
-        (n, logs)
+        (n, logs, s.get(7).await.unwrap(), tvdb.fetched())
     }
 
-    /// Spec 033 B931 — the Cosmos (1980) folder is matched to the 1980 show,
-    /// but its episode NFOs carry the 2014 remake's ids. The record is still
-    /// applied (V892 changes that), and the disagreement is counted and logged.
+    /// Spec 033 V892 (B931) — the Cosmos (1980) folder is matched to the 1980
+    /// show, but its episode NFOs carry the 2014 remake's ids. The NFO's
+    /// record is set aside with its text and ids, the episode is read from
+    /// the pinned show by number, and the rejection is counted and logged.
     #[tokio::test(flavor = "current_thread")]
-    async fn an_episode_record_of_another_series_is_counted_and_logged() {
-        let (n, logs) = cosmos_episode_with_record_of("260586").await;
+    async fn an_episode_nfo_of_another_series_is_set_aside() {
+        let (n, logs, ep, fetched) = cosmos_episode_with_record_of("260586").await;
         assert_eq!(n, 1);
+        assert_eq!(fetched, vec!["4777210", "74995"]);
+        assert_eq!(ep.title, "The Shores of the Cosmic Ocean");
+        assert_eq!(
+            ep.metadata.overview.as_deref(),
+            Some("Sagan's 1980 premiere.")
+        );
+        assert_eq!(ep.metadata.provider_ids.imdb, None, "the remake's ids go");
+        assert_ne!(ep.metadata.provider_ids.tvdb.as_deref(), Some("4777210"));
+        assert_eq!(ep.match_source.as_deref(), Some("search"));
+        assert_eq!(ep.match_external_id.as_deref(), Some("74995"));
         let text = logs.text();
         let line = text
             .lines()
@@ -4592,8 +4788,8 @@ mod tests {
             .unwrap_or_else(|| panic!("no rejection line in {text}"));
         for want in [
             "record_series_id=\"260586\"",
-            "pinned_series_id=\"74995\"",
-            "external_id=\"4777210\"",
+            "pinned_series_id=74995",
+            "nfo_id=4777210",
             "reason=\"nfo_other_series\"",
             "Cosmos - S01E01.mkv",
         ] {
@@ -4602,8 +4798,196 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn an_episode_record_of_its_own_show_is_not_counted() {
-        let (n, _) = cosmos_episode_with_record_of("74995").await;
+    async fn an_episode_nfo_of_its_own_show_is_used() {
+        let (n, _, ep, fetched) = cosmos_episode_with_record_of("74995").await;
         assert_eq!(n, 0);
+        assert_eq!(fetched, vec!["4777210"]);
+        assert_eq!(ep.match_source.as_deref(), Some("nfo_id"));
+        assert_eq!(ep.metadata.provider_ids.tvdb.as_deref(), Some("4777210"));
+    }
+
+    /// V892 (B933) — an episode never searches on its own: it is read from
+    /// its show's pinned match by number, whatever a search would say.
+    #[tokio::test]
+    async fn an_episode_is_read_from_its_shows_pinned_match_not_searched() {
+        let s = store().await;
+        put_bare_episode(&s, 41, "Dune: Prophecy", "/tv/Dune Prophecy").await;
+        pin_series(&s, "/tv/Dune Prophecy", "432109").await;
+        let (_td, cache) = cache();
+        let tvdb = FakeEnricher::tvdb()
+            .with_search(vec![("999", "Les Rivières pourpres", None)])
+            .with_detail(EnrichedMetadata {
+                title: Some("Twice Born".into()),
+                series_id: Some("432109".into()),
+                ..EnrichedMetadata::default()
+            });
+        let item = s.get(41).await.unwrap();
+        assert!(enrich_one(
+            &s,
+            &sem(4),
+            &cache,
+            None::<&FakeEnricher>,
+            Some(&tvdb),
+            &MetadataConfig::default(),
+            item,
+            NOW,
+        )
+        .await
+        .unwrap());
+        assert_eq!(tvdb.fetched(), vec!["432109"]);
+        let ep = s.get(41).await.unwrap();
+        assert_eq!(ep.match_external_id.as_deref(), Some("432109"));
+    }
+
+    /// V892 — a show pinned on TMDB (TVDB had no match) has its episodes read
+    /// from TMDB even when TVDB is configured.
+    #[tokio::test]
+    async fn an_episode_uses_its_shows_pinned_provider() {
+        let s = store().await;
+        put_bare_episode(&s, 42, "Death Note", "/tv/Death Note").await;
+        s.upsert_series_metadata(SeriesMetadata {
+            series_key: "/tv/Death Note".into(),
+            series_name: "Death Note".into(),
+            match_provider: Some("tmdb".into()),
+            match_external_id: Some("13916".into()),
+            match_source: Some("search".into()),
+            metadata_refreshed_at: Some(NOW),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let (_td, cache) = cache();
+        let tvdb = FakeEnricher::tvdb().with_detail(EnrichedMetadata::default());
+        let tmdb = FakeEnricher::tmdb().with_detail(EnrichedMetadata {
+            title: Some("Rebirth".into()),
+            series_id: Some("13916".into()),
+            ..EnrichedMetadata::default()
+        });
+        let item = s.get(42).await.unwrap();
+        enrich_one(
+            &s,
+            &sem(4),
+            &cache,
+            Some(&tmdb),
+            Some(&tvdb),
+            &MetadataConfig::default(),
+            item,
+            NOW,
+        )
+        .await
+        .unwrap();
+        assert!(tvdb.fetched().is_empty());
+        assert_eq!(tmdb.fetched(), vec!["13916"]);
+        let ep = s.get(42).await.unwrap();
+        assert_eq!(ep.match_provider.as_deref(), Some("tmdb"));
+    }
+
+    /// V892 — a show matched to nothing has its episodes matched to nothing,
+    /// without a provider call.
+    #[tokio::test]
+    async fn an_episode_of_an_unmatched_show_is_matched_to_nothing() {
+        let s = store().await;
+        put_bare_episode(&s, 43, "Home Movies", "/tv/Home Movies").await;
+        s.upsert_series_metadata(SeriesMetadata {
+            series_key: "/tv/Home Movies".into(),
+            series_name: "Home Movies".into(),
+            match_provider: Some("tvdb".into()),
+            match_source: Some("none".into()),
+            metadata_refreshed_at: Some(NOW),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let (_td, cache) = cache();
+        let tvdb = FakeEnricher::tvdb().with_search(vec![("1", "Home Movies", None)]);
+        let item = s.get(43).await.unwrap();
+        assert!(!enrich_one(
+            &s,
+            &sem(4),
+            &cache,
+            None::<&FakeEnricher>,
+            Some(&tvdb),
+            &MetadataConfig::default(),
+            item,
+            NOW,
+        )
+        .await
+        .unwrap());
+        assert!(tvdb.fetched().is_empty());
+        assert_eq!(
+            s.get(43).await.unwrap().match_source.as_deref(),
+            Some("none")
+        );
+    }
+
+    /// V892 — an episode waits for its show: it is not eligible until the
+    /// show has a match row, and then it is.
+    #[tokio::test]
+    async fn an_episode_waits_until_its_show_is_matched() {
+        let s = store().await;
+        put_bare_episode(&s, 44, "Cosmos", "/tv/Cosmos").await;
+        let eligible = |items: Vec<MediaItem>| items.iter().any(|i| i.id == 44);
+        assert!(!eligible(s.items_needing_match(100, NOW).await.unwrap()));
+        pin_series(&s, "/tv/Cosmos", "74995").await;
+        assert!(eligible(s.items_needing_match(100, NOW).await.unwrap()));
+    }
+
+    /// V892 — a file whose episode title is neither its record's nor a
+    /// neighbour's in the pinned show is counted and logged; the number
+    /// still decides.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_episode_titled_unlike_its_record_is_counted() {
+        use metrics_util::debugging::DebuggingRecorder;
+        let recorder = DebuggingRecorder::new();
+        let snap = pharos_test_metrics::snapshotter(&recorder);
+        let _metrics = metrics::set_default_local_recorder(&recorder);
+        let (logs, _log) = log_capture();
+        let s = store().await;
+        let item = MediaItem {
+            id: 45,
+            path: "/tv/The Flash/Season 01/The Flash - S01E01 - Pilot.mkv".into(),
+            title: "Pilot".into(),
+            kind: MediaKind::Episode,
+            series: Some(pharos_core::SeriesInfo {
+                series_name: "The Flash".into(),
+                season_number: Some(1),
+                episode_number: Some(1),
+                series_folder: Some("/tv/The Flash".into()),
+                series_year: None,
+                series_key: None,
+            }),
+            ..MediaItem::default()
+        };
+        s.put(item).await.unwrap();
+        pin_series(&s, "/tv/The Flash", "279121").await;
+        let (_td, cache) = cache();
+        let tvdb = FakeEnricher::tvdb().with_detail(EnrichedMetadata {
+            title: Some("City of Heroes".into()),
+            neighbour_titles: vec!["Fastest Man Alive".into()],
+            series_id: Some("279121".into()),
+            ..EnrichedMetadata::default()
+        });
+        let item = s.get(45).await.unwrap();
+        enrich_one(
+            &s,
+            &sem(4),
+            &cache,
+            None::<&FakeEnricher>,
+            Some(&tvdb),
+            &MetadataConfig::default(),
+            item,
+            NOW,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            counter_value(
+                &snap,
+                "pharos_episode_metadata_rejected_total",
+                &[("reason", "title_mismatch")]
+            ),
+            1
+        );
+        assert!(logs.text().contains("file_title=Pilot"), "{}", logs.text());
     }
 }
