@@ -12,10 +12,11 @@ use pharos_core::{
     LibraryKind, LibraryStore, MediaFacets, MediaId, MediaItem, MediaQuery, MediaStore,
     PersistedSyncGroup, PersistedTranscodeSession, Person, PersonCount, PersonDetails, PersonRef,
     PersonStore, PlaybackProgress, Playlist, PlaylistEntry, PlaylistStore, PreferenceStore,
-    ResolvedToken, ScanState, SearchQuery, SecretString, SeriesMatchCandidate, SeriesMetadata,
-    SeriesMetadataStore, Studio, StudioCount, StudioStore, SyncGroupStore, Tag, TagCount, TagStore,
-    TokenId, TokenRecord, TokenScope, TokenSelector, TokenStore, TranscodeSessionStore,
-    UserDataStore, UserId, UserItemData, UserPolicy, UserRecord, UserStore,
+    ResolvedToken, ScanState, SearchQuery, SecretString, SeriesIdentityRow, SeriesIdentityStore,
+    SeriesKeyUpdate, SeriesMatchCandidate, SeriesMetadata, SeriesMetadataStore, SeriesOverride,
+    Studio, StudioCount, StudioStore, SyncGroupStore, Tag, TagCount, TagStore, TokenId,
+    TokenRecord, TokenScope, TokenSelector, TokenStore, TranscodeSessionStore, UserDataStore,
+    UserId, UserItemData, UserPolicy, UserRecord, UserStore,
 };
 
 #[derive(Clone)]
@@ -730,6 +731,52 @@ impl SeriesMetadataStore for AnyStore {
         match self {
             AnyStore::Sqlite(s) => s.series_metadata_by_keys(keys).await,
             AnyStore::Postgres(p) => p.series_metadata_by_keys(keys).await,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
+// SeriesIdentityStore
+// ---------------------------------------------------------------------
+impl SeriesIdentityStore for AnyStore {
+    async fn series_overrides(&self, folders: &[String]) -> DomainResult<Vec<SeriesOverride>> {
+        match self {
+            AnyStore::Sqlite(s) => s.series_overrides(folders).await,
+            AnyStore::Postgres(p) => p.series_overrides(folders).await,
+        }
+    }
+
+    async fn insert_series_override(&self, o: SeriesOverride) -> DomainResult<bool> {
+        match self {
+            AnyStore::Sqlite(s) => s.insert_series_override(o).await,
+            AnyStore::Postgres(p) => p.insert_series_override(o).await,
+        }
+    }
+
+    async fn series_identity_rows(
+        &self,
+        root_prefix: &str,
+    ) -> DomainResult<Vec<SeriesIdentityRow>> {
+        match self {
+            AnyStore::Sqlite(s) => s.series_identity_rows(root_prefix).await,
+            AnyStore::Postgres(p) => p.series_identity_rows(root_prefix).await,
+        }
+    }
+
+    async fn set_series_keys(&self, updates: &[SeriesKeyUpdate]) -> DomainResult<u64> {
+        match self {
+            AnyStore::Sqlite(s) => s.set_series_keys(updates).await,
+            AnyStore::Postgres(p) => p.set_series_keys(updates).await,
+        }
+    }
+
+    async fn series_premiere_years(
+        &self,
+        keys: &[String],
+    ) -> DomainResult<std::collections::HashMap<String, u32>> {
+        match self {
+            AnyStore::Sqlite(s) => s.series_premiere_years(keys).await,
+            AnyStore::Postgres(p) => p.series_premiere_years(keys).await,
         }
     }
 }
