@@ -326,7 +326,7 @@ where
     let mut outcome = ScanOutcome::default();
     let mut touched_media = false;
     for path in paths {
-        if !is_media_file(&path, exts) {
+        if !is_media_file(&path, exts) || crate::fs::in_ignored_folder(&path, root) {
             continue;
         }
         // Skip directories / vanished entries: a create event for a new
