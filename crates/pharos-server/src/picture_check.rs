@@ -612,6 +612,12 @@ mod tests {
         let (stored, outcome) = verdict(&Ok(analysis(PictureVerdict::Undetermined, 1)));
         assert_eq!(outcome, Outcome::Undetermined);
         assert!(stored.is_some(), "frames decoded but too dark: remembered");
+        // A seek or read that stopped the sampler early comes back as the
+        // worker's `Other` (libav::picture_area::sampled_all): not stored.
+        let cut_short = Err(PoolError::Op(WorkerError::Other(
+            "sampled 2 of 7 frames: a seek or read stopped early".into(),
+        )));
+        assert_eq!(verdict(&cut_short), (None, Outcome::Error));
     }
 
     #[test]
