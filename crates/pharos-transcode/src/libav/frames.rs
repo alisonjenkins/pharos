@@ -142,6 +142,17 @@ where
         .ok_or_else(|| FrameError::BadInput("no video stream".into()))?;
     let stream_index = stream.index();
     let time_base = stream.time_base();
+    // Targets count from the video's own first timestamp, as `-ss` does: a
+    // transport stream's clock rarely starts at 0, and from 0 every target
+    // short of that origin lands on the opening frame. Unknown reads as 0.
+    let origin_us = match stream.start_time() {
+        ffi::AV_NOPTS_VALUE => 0,
+        t if time_base.denominator() > 0 => {
+            (i128::from(t) * i128::from(time_base.numerator()) * i128::from(ffi::AV_TIME_BASE)
+                / i128::from(time_base.denominator())) as i64
+        }
+        _ => 0,
+    };
     let params = stream.parameters();
 
     let ctx = codec::context::Context::from_parameters(params)
@@ -203,7 +214,8 @@ where
 
     for target_ms in seek_targets_ms {
         // Seek to the keyframe at/<= target (AV_TIME_BASE units, like `-ss`).
-        let ts = (target_ms as i128 * ffi::AV_TIME_BASE as i128 / 1000) as i64;
+        let ts =
+            origin_us.saturating_add((target_ms as i128 * ffi::AV_TIME_BASE as i128 / 1000) as i64);
         if ictx.seek(ts, ..=ts).is_err() {
             break; // unseekable / past end — stop cleanly, keep what we have
         }
