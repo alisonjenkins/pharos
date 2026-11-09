@@ -4612,6 +4612,9 @@ fn Player(
     });
     let mut up_next = use_signal(UpNext::default);
     let mut up_next_step = use_signal(|| UpNextStep::Hidden);
+    // The group's queue entry the countdown belongs to: a group moving to
+    // another entry of the same item keeps this player, not its Cancel.
+    let up_next_entry = use_hook(|| Rc::new(RefCell::new(String::new())));
     let advanced = use_hook(|| Rc::new(Cell::new(false)));
     // An ASS subtitle drawn from its script (ADR-0057), and the pick it is
     // for; its WebVTT stays on screen until the renderer is ready.
@@ -5310,6 +5313,7 @@ fn Player(
 
     let on_media = {
         let (advance, up_next_to) = (advance.clone(), Rc::clone(&up_next_to));
+        let up_next_entry = Rc::clone(&up_next_entry);
         let (p, clock, last_ms, switched) = (
             Rc::clone(&p),
             Rc::clone(&clock),
@@ -5422,6 +5426,28 @@ fn Player(
             if let Some(next) = up_next_to.get() {
                 let total = total_ms(&state, p.detail.item.runtime_ms);
                 let from = up_next_at(&p.detail.segments, total);
+                // Leaving the group (no entry) keeps this player's Cancel.
+                let entry = session().map(|s| s.playlist_item_id()).unwrap_or_default();
+                let was = if entry.is_empty() {
+                    String::new()
+                } else {
+                    up_next_entry.replace(entry.clone())
+                };
+                if !was.is_empty() && was != entry {
+                    platform::info(&format!(
+                        "pharos: up next: reset reason=group_entry from={was} to={entry}"
+                    ));
+                    up_next.set(UpNext::default());
+                }
+                // Another member cancelled it: this episode plays to its end
+                // here too, rather than this player moving the group on.
+                if !up_next.peek().is_cancelled() && session().is_some_and(|s| s.next_held()) {
+                    platform::info(&format!(
+                        "pharos: up next: cancelled reason=group at={}ms of={total}ms from={from:?}",
+                        state.position_ms
+                    ));
+                    up_next.write().cancel();
+                }
                 let step = up_next.write().step(state.position_ms, from, total);
                 if let Some(why) = up_next.peek().moves_on(step, event) {
                     platform::info(&format!(
@@ -5602,6 +5628,10 @@ fn Player(
                     }
                 }
                 Control::CancelNext => {
+                    let shared = session().is_some_and(|s| s.hold_next());
+                    platform::info(&format!(
+                        "pharos: up next: cancelled reason=viewer shared={shared}"
+                    ));
                     up_next.write().cancel();
                     up_next_step.set(UpNextStep::Hidden);
                 }

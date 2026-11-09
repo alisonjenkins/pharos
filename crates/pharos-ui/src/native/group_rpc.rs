@@ -163,6 +163,13 @@ fn update(u: GroupUpdate) -> together::GroupUpdate {
             tracks: tracks(&t),
             by: by(Some(t.by)),
         },
+        GroupUpdate::NextHeld {
+            playlist_item_id,
+            by: who,
+        } => U::NextHeld {
+            playlist_item_id,
+            by: by(Some(who)),
+        },
         GroupUpdate::Ended => U::Ended,
     }
 }
@@ -374,6 +381,13 @@ impl GroupClient for Groups {
     ) -> Result<(), GroupError> {
         let m = self.membership()?;
         m.set_item(&self.call, item, position_ms, &playlist_item_id)
+            .await
+            .map_err(group_error)
+    }
+
+    async fn hold_next(&self, playlist_item_id: String) -> Result<(), GroupError> {
+        let m = self.membership()?;
+        m.hold_next(&self.call, &playlist_item_id)
             .await
             .map_err(group_error)
     }

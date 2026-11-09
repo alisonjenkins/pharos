@@ -2203,6 +2203,10 @@ impl UpNext {
         self.cancelled = true;
     }
 
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled
+    }
+
     /// Why the player should move on to the next episode after `event`,
     /// which left the card at `step`; `None` to stay.
     pub fn moves_on(&self, step: UpNextStep, event: MediaEvent) -> Option<&'static str> {

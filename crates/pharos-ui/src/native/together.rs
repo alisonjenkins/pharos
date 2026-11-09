@@ -300,6 +300,12 @@ pub enum GroupUpdate {
         tracks: GroupTracksView,
         by: Option<String>,
     },
+    /// `by` kept the group watching the end of queue entry
+    /// `playlist_item_id`: no member's "Up next" plays on from it (B1027).
+    NextHeld {
+        playlist_item_id: String,
+        by: Option<String>,
+    },
     /// The group is over for this member, for whatever reason.
     Ended,
 }
@@ -353,6 +359,9 @@ pub trait GroupClient {
     ) -> Result<(), GroupError>;
     /// `false` puts this member on their own tracks ("Just me").
     async fn follow_tracks(&self, follow: bool) -> Result<(), GroupError>;
+    /// Keep the group watching the end of entry `playlist_item_id`: every
+    /// member's "Up next" stops (B1027). The group drops it if it has moved on.
+    async fn hold_next(&self, playlist_item_id: String) -> Result<(), GroupError>;
     /// Move the group to `item` from `position_ms` (014 US9).
     /// `playlist_item_id` is the entry this member moves from: the group
     /// drops the move if it has already left it.
@@ -392,6 +401,7 @@ pub struct FakeGroups {
     refuse_seek: Rc<Cell<bool>>,
     refuse_tracks: Rc<Cell<bool>>,
     refuse_set_item: Rc<Cell<bool>>,
+    refuse_hold_next: Rc<Cell<bool>>,
     hold_buffering: Rc<Cell<bool>>,
     buffering_gates: Rc<RefCell<Vec<BufferingGate>>>,
     join_pushes: Rc<RefCell<Vec<GroupUpdate>>>,
@@ -442,6 +452,11 @@ impl FakeGroups {
     /// Makes every `set_tracks` fail, as a dropped connection would.
     pub fn refuse_tracks(&self) {
         self.refuse_tracks.set(true);
+    }
+
+    /// Makes every `hold_next` fail, as a server before schemaVersion 33 would.
+    pub fn refuse_hold_next(&self) {
+        self.refuse_hold_next.set(true);
     }
 
     /// Makes every `set_item` fail, as a server before schemaVersion 23 would.
@@ -680,6 +695,21 @@ impl GroupClient for FakeGroups {
         };
         self.push(&GroupUpdate::Tracks {
             tracks,
+            by: Some(Self::me().id),
+        });
+        Ok(())
+    }
+
+    async fn hold_next(&self, playlist_item_id: String) -> Result<(), GroupError> {
+        self.log(format!("hold_next({playlist_item_id})"));
+        if self.refuse_hold_next.get() {
+            return Err(GroupError("Refused".into()));
+        }
+        if self.with_joined(|_| ()).is_none() {
+            return Err(GroupError("Not in a group".into()));
+        }
+        self.push(&GroupUpdate::NextHeld {
+            playlist_item_id,
             by: Some(Self::me().id),
         });
         Ok(())
