@@ -2473,6 +2473,7 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
                 native_limits.clone(),
             ))
     })
+    .workers(pharos_server::http_workers::choose(cfg.server.http_workers))
     .bind(&cfg.server.bind)?
     // Phase B3 — we own the SIGTERM/SIGINT → graceful-drain sequencing
     // below, so actix must not install its own signal handlers (which would
