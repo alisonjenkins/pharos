@@ -1078,13 +1078,6 @@ pub fn toggle_fullscreen() {
     enter_page_fullscreen_for("key");
 }
 
-/// Puts the whole page in fullscreen, from a play click: the player is not
-/// mounted yet, and the gesture is gone once it is. The page stays fullscreen
-/// across the players the stage mounts, so the next episode keeps it.
-pub fn enter_page_fullscreen() {
-    enter_page_fullscreen_for("play");
-}
-
 fn enter_page_fullscreen_for(reason: &'static str) {
     let Some(document) = web_sys::window().and_then(|w| w.document()) else {
         return;
@@ -1122,7 +1115,7 @@ extern "C" {
     fn request_fullscreen(this: &FsElement) -> Result<js_sys::Promise, JsValue>;
 }
 
-/// Leaves the page fullscreen a play click or the F key started; a
+/// Leaves the page fullscreen the F key or the Fullscreen button started; a
 /// fullscreen on another element is left alone.
 pub fn exit_page_fullscreen() {
     let Some(document) = web_sys::window().and_then(|w| w.document()) else {
@@ -1213,11 +1206,6 @@ pub async fn copy_text(text: &str) -> bool {
 /// window (`document.pictureInPictureEnabled`; missing in Firefox).
 pub fn pip_supported() -> bool {
     pip_document().and_then(|d| d.picture_in_picture_enabled()) == Some(true)
-}
-
-/// Whether a video is in the browser's picture-in-picture window.
-pub fn pip_active() -> bool {
-    pip_document().is_some_and(|d| d.picture_in_picture_element().is_some())
 }
 
 /// Hands the video `id` to the browser's picture-in-picture window, or

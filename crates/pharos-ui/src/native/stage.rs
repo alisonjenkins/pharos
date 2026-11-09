@@ -6,7 +6,7 @@
 //! view (a class) rather than unmounting the player and its stream.
 
 use dioxus::prelude::*;
-use pharos_client::api::{ItemKind, ItemRef};
+use pharos_client::api::ItemRef;
 
 use super::listen::{Icon, ICON_FLOAT, ICON_PIP, ICON_QUEUE_NEXT, QUEUE_PANEL_ID};
 use super::platform;
@@ -444,28 +444,6 @@ fn store(key: &str, value: &str) {
     }
 }
 
-/// Whether a play started by a click opens the page in browser fullscreen:
-/// a film or an episode does, unless it plays in the floating window or the
-/// mini bar, or a video is in picture-in-picture. Music never does.
-pub fn plays_fullscreen(kind: ItemKind, compact_shown: bool, pip: bool) -> bool {
-    matches!(kind, ItemKind::Movie | ItemKind::Episode) && !compact_shown && !pip
-}
-
-/// Called from a play click, before it navigates: the browser only grants
-/// fullscreen inside the click, and the player mounts after it.
-pub fn fullscreen_for_play(kind: ItemKind, stage: Option<StageCtx>) {
-    let compact = stage.is_some_and(|StageCtx(s)| s.peek().compact_shown());
-    let pip = platform::pip_active();
-    let full = plays_fullscreen(kind, compact, pip);
-    platform::info(&format!(
-        "pharos: fullscreen play kind={kind:?} compact={compact} pip={pip} verdict={}",
-        if full { "enter" } else { "skip" }
-    ));
-    if full {
-        platform::enter_page_fullscreen();
-    }
-}
-
 /// The app's stage, provided by the page root.
 #[derive(Clone, Copy)]
 pub struct StageCtx(pub Signal<Stage>);
@@ -877,16 +855,6 @@ const ICON_CLOSE: &str = "M19 6.4 17.6 5 12 10.6 6.4 5 5 6.4 10.6 12 5 17.6 6.4 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn films_and_episodes_open_fullscreen_unless_compact_or_pip() {
-        for kind in [ItemKind::Movie, ItemKind::Episode] {
-            assert!(plays_fullscreen(kind, false, false));
-            assert!(!plays_fullscreen(kind, true, false));
-            assert!(!plays_fullscreen(kind, false, true));
-        }
-        assert!(!plays_fullscreen(ItemKind::Audio, false, false));
-    }
 
     const VIEWPORT: (f64, f64) = (1000.0, 800.0);
     const WINDOW: (f64, f64) = (320.0, 220.0);

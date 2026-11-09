@@ -113,7 +113,7 @@ pub fn Root() -> Element {
     // and a play while it is compact stays where the listener is.
     let mut stage = use_signal(Stage::restore);
     use_context_provider(|| StageCtx(stage));
-    // A play click put the page in fullscreen; the player leaving the full
+    // The F key put the page in fullscreen; the player leaving the full
     // view (Back, the floating window, Close) takes it out again.
     let shown_full = use_memo(move || {
         let s = stage.read();
