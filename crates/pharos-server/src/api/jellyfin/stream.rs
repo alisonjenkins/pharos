@@ -754,6 +754,7 @@ async fn stream_transcoded_webm(
         video_3d_format: item.probe.video_3d_format,
         stereo_output,
         tonemap: super::hls::source_tonemap(&item.probe),
+        output_size: None,
     };
     tracing::info!(
         media.id = item.id,

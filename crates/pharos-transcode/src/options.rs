@@ -480,6 +480,11 @@ pub struct TranscodeOptions {
     pub video_3d_format: Option<pharos_core::Video3DFormat>,
     /// Target stereoscopic output mode (preserve or downmix to 2D mono).
     pub stereo_output: StereoOutput,
+    /// Downscale the output to this size (spec 035). `None` encodes at source
+    /// size. Part of the rendition (a different size is a different `avcC`),
+    /// and absent from the serialised form when `None` so an unscaled
+    /// rendition's key does not move.
+    pub output_size: Option<crate::output_size::OutputSize>,
 }
 
 /// What the spawn arg builder needs to synthesize a filler segment: the
@@ -533,6 +538,8 @@ struct TranscodeOptionsBinary {
     stereo_output: StereoOutput,
     #[serde(default)]
     tonemap: Tonemap,
+    #[serde(default)]
+    output_size: Option<crate::output_size::OutputSize>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -566,6 +573,8 @@ struct TranscodeOptionsJson {
     stereo_output: StereoOutput,
     #[serde(default, skip_serializing_if = "Tonemap::is_off")]
     tonemap: Tonemap,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    output_size: Option<crate::output_size::OutputSize>,
 }
 
 macro_rules! impl_transcode_options_shim {
@@ -594,6 +603,7 @@ macro_rules! impl_transcode_options_shim {
                     video_3d_format: o.video_3d_format,
                     stereo_output: o.stereo_output,
                     tonemap: o.tonemap,
+                    output_size: o.output_size,
                 }
             }
         }
@@ -622,6 +632,7 @@ macro_rules! impl_transcode_options_shim {
                     video_3d_format: o.video_3d_format,
                     stereo_output: o.stereo_output,
                     tonemap: o.tonemap,
+                    output_size: o.output_size,
                     filler: None,
                 }
             }
@@ -682,6 +693,7 @@ impl Default for TranscodeOptions {
             video_3d_format: None,
             stereo_output: StereoOutput::Preserve,
             tonemap: Tonemap::Off,
+            output_size: None,
             filler: None,
         }
     }
@@ -765,14 +777,20 @@ impl Tonemap {
     /// tonemaps and converts to BT.709 limited-range NV12 on the GPU, the frame
     /// is read back, and `hwupload=derive_device=vaapi` hands it to the VAAPI
     /// encoder. It takes Vulkan frames, so only the GPU-tonemap argv may use it.
-    pub fn gpu_filters(self) -> Option<String> {
+    pub fn gpu_filters(self, size: Option<crate::output_size::OutputSize>) -> Option<String> {
         match self {
             Self::Off => None,
-            Self::HdrToSdr => Some(format!(
-                "libplacebo=tonemapping={GPU_TONEMAP_CURVE}:colorspace=bt709:\
-                 color_primaries=bt709:color_trc=bt709:range=tv:format=nv12,\
-                 hwdownload,format=nv12,hwupload=derive_device=vaapi"
-            )),
+            Self::HdrToSdr => {
+                // libplacebo scales in the same pass as the tonemap.
+                let scale = size
+                    .map(|s| format!(":{}", s.libplacebo_options()))
+                    .unwrap_or_default();
+                Some(format!(
+                    "libplacebo=tonemapping={GPU_TONEMAP_CURVE}:colorspace=bt709:\
+                     color_primaries=bt709:color_trc=bt709:range=tv:format=nv12{scale},\
+                     hwdownload,format=nv12,hwupload=derive_device=vaapi"
+                ))
+            }
         }
     }
 }
@@ -1094,6 +1112,7 @@ mod tests {
             video_3d_format: None,
             stereo_output: StereoOutput::Preserve,
             tonemap: Default::default(),
+            output_size: None,
         };
         assert_eq!(o.start_position_seconds(), Some(3.0));
         assert_eq!(o.duration_seconds(), Some(5.0));
@@ -1124,6 +1143,7 @@ mod tests {
             video_3d_format: None,
             stereo_output: StereoOutput::Preserve,
             tonemap: Default::default(),
+            output_size: None,
         };
         assert_eq!(o.start_position_seconds(), None);
     }
@@ -1175,6 +1195,7 @@ mod tests {
             video_3d_format: None,
             stereo_output: StereoOutput::Preserve,
             tonemap: Default::default(),
+            output_size: None,
         }
     }
 
@@ -1341,6 +1362,7 @@ mod tests {
             video_3d_format: None,
             stereo_output: StereoOutput::Preserve,
             tonemap: Default::default(),
+            output_size: None,
         };
         let mut named = base.clone();
         named.source_video_codec = Some(SourceCodec::Av1);
