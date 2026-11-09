@@ -36,7 +36,8 @@ evidence, and make every episode inherit it:
    file with no year splits off only when its own episode titles fit a
    same-named rival better. The group holding the folder's stored match (else
    the largest) keeps the plain folder key, so the show users know keeps its
-   wire id and series-level state. Split keys are
+   wire id and series-level state; that choice is persisted at the first split
+   so later scans never move it. Split keys are
    `"{folder}\u{1f}{YYYY}"`, stored in a new `media_items.series_key` column
    backfilled to today's key (V893).
 3. **No silent tie-break**: two exact-name candidates without a separating year
@@ -48,7 +49,7 @@ evidence, and make every episode inherit it:
    per-episode series search goes, and an episode NFO id naming another series
    is set aside with its text and stills (V892, extends V468).
 5. **Copies never fold across series**: #1055's fold also requires one series
-   key, equal stated show years and equal provider series ids where both are
+   key, no two different known stated years and equal provider series ids where both are
    known, and their filename episode titles agree where both have one. In a
    flagged or split series, numbers alone never fold two rows (V894).
 6. **Hand fixes are overrides**: an admin Show identity page picks a show,
@@ -60,7 +61,9 @@ evidence, and make every episode inherit it:
    evidence (the version gate no longer re-admits every searched show) and
    rebuilds episodes whose provider show disagrees with their series or whose
    premiere date falls outside its run. The rebuild resets provider-derived
-   fields, because enrichment only fills empty ones. No row is deleted.
+   fields (enrichment only fills empty ones) and deletes the episode's stored
+   translations. An episode's own manual match is never rebuilt; a conflict is
+   listed for the admin. No row is deleted.
 
 ## Consequences
 
