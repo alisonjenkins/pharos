@@ -2647,6 +2647,7 @@ fn film_title(name: &str, year: u32) -> Vec<String> {
         None => name.into(),
     };
     let year = year.to_string();
+    let name = strip_cut(&name, &year);
     let mut title: Vec<String> = words(&name)
         .into_iter()
         .filter(|w| *w != year && !is_film_release_word(w))
@@ -2660,6 +2661,28 @@ fn film_title(name: &str, year: u32) -> Vec<String> {
     }
     title
 }
+
+/// `name` less the cut its tail names after `year` (`Director's Cut`,
+/// `{edition-Extended}`, `IMAX`), so each cut of a film is a
+/// version of it. A cut word before the year is part of the title.
+fn strip_cut<'a>(name: &'a str, year: &str) -> std::borrow::Cow<'a, str> {
+    let Some(at) = name.rfind(year) else {
+        return name.into();
+    };
+    let (head, tail) = name.split_at(at);
+    match CUT_RE.as_ref() {
+        Some(re) if re.is_match(tail) => format!("{head}{}", re.replace_all(tail, " ")).into(),
+        _ => name.into(),
+    }
+}
+
+/// A cut or edition a film's name may state after its year.
+static CUT_RE: std::sync::LazyLock<Option<regex::Regex>> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(
+        r"(?i)\{edition-[^{}]*\}|\b(?:director'?s|extended|theatrical|ultimate|final|collector'?s|special|anniversary|unrated|uncut|uncensored|remastered|imax|criterion|redux)(?:[ ._-]+(?:cut|edition|version|extended|uncut))*\b(?:[ ._-]+(?:cut|edition|version))?",
+    )
+    .ok()
+});
 
 /// Words of a film's name that say how a copy was made, not what it holds.
 const FILM_RELEASE_WORDS: &[&str] = &[
@@ -7713,8 +7736,26 @@ mod tests {
             PathBuf::from("/films/Untitled/Heat.mkv"),
             PathBuf::from("/music/Heat (1995)/Heat (1995).flac"),
         ]);
-        assert_eq!(groups.len(), 7, "{groups:?}");
-        assert!(groups.iter().all(|(_, alts)| alts.is_empty()));
+        assert_eq!(groups.len(), 6, "{groups:?}");
+        let heat = groups
+            .iter()
+            .find(|(p, _)| p == Path::new("/films/Heat (1995)/Heat (1995).mkv"))
+            .map(|(_, alts)| alts.clone());
+        assert_eq!(
+            heat,
+            Some(vec![(
+                "Director's Cut".to_string(),
+                PathBuf::from("/films/Other/Heat (1995) - Director's Cut.mkv")
+            )]),
+            "a cut is a version of its film (V962)"
+        );
+        let others = groups
+            .iter()
+            .filter(|(p, _)| !p.ends_with("Heat (1995).mkv"));
+        assert!(
+            others.into_iter().all(|(_, alts)| alts.is_empty()),
+            "{groups:?}"
+        );
     }
 
     #[test]
@@ -7759,11 +7800,6 @@ mod tests {
             film_copy_key(Path::new("/m/Heat.1995.1080p.BluRay.x264-SPARKS.mkv")),
             Some(("heat".to_string(), 1995))
         );
-        assert_ne!(
-            film_copy_key(Path::new("/m/Heat (1995) [Extended].mkv")),
-            Some(("heat".to_string(), 1995)),
-            "a plain bracket is an edition, not a release group"
-        );
         for extra in [
             "trailer.mkv",
             "The Thing - Behind the Scenes.mkv",
@@ -7804,11 +7840,6 @@ mod tests {
             key("/m/x/Captain.America.The.Winter.Soldier.2014.720p.BluRay.x264.DTS-WiKi.mkv"),
             key("/m/y/Captain America - The Winter Soldier (2014) Bluray-1080p.mkv"),
         );
-        assert_ne!(
-            key("/m/Heat (1995) [Director's Cut].mkv"),
-            key("/m/Heat (1995).mkv"),
-            "an edition in brackets with no release group stays apart"
-        );
     }
 
     /// V961: a release's sample clip is never indexed (B1002).
@@ -7845,13 +7876,10 @@ mod tests {
             "Heat.1995.sample.mkv",
             "Heat (1995) - Behind the Scenes.mkv",
             "Heat (1995) Extras.mkv",
-            "Heat (1995) Director's Cut.mkv",
-            "Heat (1995) {edition-Director's Cut}.mkv",
-            "Heat (1995) Remastered.mkv",
-            "Heat (1995) IMAX.mkv",
             "Heat (1995) - part1.mkv",
             "Heat (1995) - part2.mkv",
             "Heat (1995) cd1.avi",
+            "Heat (1995) cd2.avi",
         ] {
             let key = film_copy_key(&Path::new("/f/Heat (1995)").join(other));
             assert_ne!(key, film, "{other}");
@@ -7860,13 +7888,26 @@ mod tests {
             film_copy_key(Path::new("/f/Heat (1995) - part1.mkv")),
             film_copy_key(Path::new("/f/Heat (1995) - part2.mkv")),
         );
-        assert_eq!(
-            film_copy_key(Path::new("/f/Heat (1995) - Director's Cut - 3D.HSBS.mkv")),
-            film_copy_key(Path::new("/g/Heat (1995) - Director's Cut.mkv")),
-        );
+        // V962: a cut or an edition is a version of the film.
+        for cut in [
+            "Heat (1995) Director's Cut.mkv",
+            "Heat (1995) - Director's Cut - 3D.HSBS.mkv",
+            "Heat.1995.Directors.Cut.1080p.BluRay.x264-SPARKS.mkv",
+            "Heat (1995) {edition-Director's Cut}.mkv",
+            "Heat (1995) Remastered.mkv",
+            "Heat (1995) IMAX.mkv",
+            "Heat (1995) Unrated Extended Cut.mkv",
+            "Heat (1995) [Extended].mkv",
+        ] {
+            let key = film_copy_key(&Path::new("/f/Heat (1995)").join(cut));
+            assert_eq!(key, film, "{cut}");
+        }
         assert_ne!(
-            film_copy_key(Path::new("/f/Heat (1995) - Director's Cut - 3D.HSBS.mkv")),
-            film,
+            film_copy_key(Path::new(
+                "/f/The Final Cut (2004)/The Final Cut (2004).mkv"
+            )),
+            None,
+            "a cut word before the year is the title",
         );
         assert_eq!(
             film_copy_key(Path::new(
