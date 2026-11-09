@@ -3313,6 +3313,7 @@ mod tests {
                 episode_number: Some(3),
                 series_folder: Some("/tv/Star Trek The Next Generation".into()),
                 series_year: None,
+                series_key: None,
             }),
             ..MediaItem::default()
         };
@@ -3539,6 +3540,7 @@ mod tests {
                 episode_number: Some(id as u32),
                 series_folder: Some(folder.into()),
                 series_year: Some(1997),
+                series_key: None,
             }),
             ..MediaItem::default()
         };
@@ -3973,6 +3975,7 @@ mod tests {
                 episode_number: Some(1),
                 series_folder: Some("/tv/Dragon Ball".into()),
                 series_year: Some(1986),
+                series_key: None,
             }),
             metadata: pharos_core::MediaMetadata {
                 overview: Some("ブルマが…".into()),
@@ -4401,6 +4404,7 @@ mod tests {
                 episode_number: Some(id as u32),
                 series_folder: Some(folder.into()),
                 series_year: None,
+                series_key: None,
             }),
             ..MediaItem::default()
         };
@@ -4538,6 +4542,7 @@ mod tests {
                 episode_number: Some(1),
                 series_folder: Some("/tv/Cosmos".into()),
                 series_year: None,
+                series_key: None,
             }),
             ..MediaItem::default()
         };

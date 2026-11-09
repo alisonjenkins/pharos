@@ -286,6 +286,7 @@ async fn seed_shows() -> (web::Data<AppState>, String, UserId) {
             episode_number: Some(epn),
             series_folder: Some(format!("/tv/{folder}")),
             series_year: None,
+            series_key: None,
         }),
         ..Default::default()
     };
@@ -411,6 +412,7 @@ async fn episode_list_sorts_by_air_order_not_title() {
                     episode_number: Some(epn),
                     series_folder: Some("/tv/Buffy".into()),
                     series_year: None,
+                    series_key: None,
                 }),
                 ..Default::default()
             })
@@ -1355,6 +1357,7 @@ async fn next_up_keeps_same_name_shows_in_distinct_folders_separate() {
                     episode_number: Some(ep),
                     series_folder: Some(folder.into()),
                     series_year: Some(year),
+                    series_key: None,
                 }),
                 ..Default::default()
             })

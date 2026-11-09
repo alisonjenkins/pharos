@@ -1984,6 +1984,7 @@ where
         episode_number: Some(1),
         series_folder: Some("/media/conformance/Conformance Show (2001)".into()),
         series_year: Some(2001),
+        series_key: None,
     });
     MediaStore::put(&store, ep).await.unwrap();
 

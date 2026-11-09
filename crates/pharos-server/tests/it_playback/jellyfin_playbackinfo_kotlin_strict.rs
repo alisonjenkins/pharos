@@ -221,6 +221,7 @@ async fn playback_info_and_item_dto_serialize_video_3d_format_strictly() {
                         episode_number: Some(1),
                         series_folder: None,
                         series_year: None,
+                        series_key: None,
                     })
                 } else {
                     None

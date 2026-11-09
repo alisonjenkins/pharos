@@ -87,6 +87,7 @@ async fn seed(rows: Vec<Row>) -> (web::Data<AppState>, String) {
                     episode_number: Some(1),
                     series_folder: Some(format!("/tv/{name}")),
                     series_year: Some(year),
+                    series_key: None,
                 }),
                 probe: pharos_core::MediaProbe {
                     album: r.album.map(|(a, _)| a.to_string()),

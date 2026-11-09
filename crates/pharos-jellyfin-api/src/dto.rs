@@ -1957,7 +1957,7 @@ impl BaseItemDto {
                 .as_ref()
                 .and_then(|s| {
                     s.season_number
-                        .map(|n| season_id_for_key(s.series_folder.as_deref(), &s.series_name, n))
+                        .map(|n| season_id_for_key(s.identity_folder(), &s.series_name, n))
                 })
                 .or_else(|| item.probe.album.as_deref().map(album_id_for)),
             album: item.probe.album.clone(),
@@ -1976,10 +1976,10 @@ impl BaseItemDto {
             series_id: item
                 .series
                 .as_ref()
-                .map(|s| series_id_for_key(s.series_folder.as_deref(), &s.series_name)),
+                .map(|s| series_id_for_key(s.identity_folder(), &s.series_name)),
             season_id: item.series.as_ref().and_then(|s| {
                 s.season_number
-                    .map(|n| season_id_for_key(s.series_folder.as_deref(), &s.series_name, n))
+                    .map(|n| season_id_for_key(s.identity_folder(), &s.series_name, n))
             }),
             season_name: item
                 .series
@@ -3442,6 +3442,7 @@ mod tests {
                 episode_number: Some(1),
                 series_folder: Some(folder.into()),
                 series_year: Some(year),
+                series_key: None,
             }),
             ..Default::default()
         };

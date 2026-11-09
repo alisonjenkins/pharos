@@ -458,6 +458,7 @@ async fn seed_show() -> (web::Data<AppState>, String, UserId) {
                     episode_number: Some(ep),
                     series_folder: Some("/tv/Buffy".into()),
                     series_year: None,
+                    series_key: None,
                 }),
                 ..Default::default()
             })

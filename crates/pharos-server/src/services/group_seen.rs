@@ -263,7 +263,7 @@ async fn resolve(state: &AppState, ids: &[WireId]) -> Result<Vec<(WireId, Target
         let Some(series) = item.series.as_ref() else {
             continue;
         };
-        let folder = series.series_folder.as_deref();
+        let folder = series.identity_folder();
         let series_key = series_id_for_key(folder, &series.series_name);
         if synth.contains(&series_key) {
             episodes.entry(series_key).or_default().push(item.id);
