@@ -94,3 +94,31 @@ def test_idle_unload_secs_rejects_negative() -> None:
 
     with pytest.raises(ValueError):
         idle_unload_secs("-1")
+
+
+def test_freed_memory_is_trimmed_even_where_find_library_finds_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The service image has no ldconfig, gcc or ld, so find_library("c")
+    # returns None there; the trim must not depend on it.
+    import ctypes.util
+
+    from pharos_aligner.model import _release_freed_memory
+
+    monkeypatch.setattr(ctypes.util, "find_library", lambda _name: None)
+    assert _release_freed_memory() is True
+
+
+def test_unload_logs_the_anon_memory_it_freed_and_whether_it_trimmed(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    clock = FakeClock()
+    aligner = CountingAligner(idle_unload_s=1, clock=clock)
+    aligner.align(b"\0" * 4, ["a"])
+    clock.now += 2
+    with caplog.at_level("INFO", logger="pharos_aligner"):
+        assert aligner.unload_if_idle()
+    line = next(r.getMessage() for r in caplog.records if "unloaded" in r.getMessage())
+    assert "anon_before_mib=" in line
+    assert "anon_after_mib=" in line
+    assert "trimmed=True" in line

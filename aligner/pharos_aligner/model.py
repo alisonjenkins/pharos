@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import ctypes
-import ctypes.util
 import gc
 import logging
 import threading
@@ -21,17 +20,30 @@ STAR = "*"
 Clock = Callable[[], float]
 
 
-def _release_freed_memory() -> None:
-    """Hand glibc's freed heap pages back to the kernel."""
+def _release_freed_memory() -> bool:
+    """Hand glibc's freed heap pages back to the kernel; True if the trim ran."""
     # The weights' smaller tensors sit in malloc arenas, which glibc keeps
-    # after free; without a trim the unload barely moves RSS.
-    name = ctypes.util.find_library("c")
-    if name is None:
-        return
+    # after free; without a trim the unload barely moves RSS. libc is already
+    # loaded, so look the symbol up in the process itself: find_library("c")
+    # needs ldconfig or a compiler, and the service image has neither.
     try:
-        ctypes.CDLL(name).malloc_trim(0)
-    except (OSError, AttributeError):
-        logger.debug("malloc_trim unavailable", exc_info=True)
+        ctypes.CDLL(None).malloc_trim(0)
+    except (OSError, AttributeError) as e:
+        logger.warning("malloc_trim unavailable; freed heap stays resident: %s", e)
+        return False
+    return True
+
+
+def _anon_mib() -> int | None:
+    """This process's anonymous memory in MiB, or None off Linux."""
+    try:
+        with open("/proc/self/smaps_rollup", encoding="ascii") as f:
+            for line in f:
+                if line.startswith("Anonymous:"):
+                    return int(line.split()[1]) // 1024
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
 
 
 class Aligner:
@@ -81,9 +93,17 @@ class Aligner:
             self._model = None
             self._tokenizer = None
             self._aligner = None
+            anon_before = _anon_mib()
             gc.collect()
-            _release_freed_memory()
-        logger.info("model unloaded after %d s idle", int(idle_s))
+            trimmed = _release_freed_memory()
+            anon_after = _anon_mib()
+        logger.info(
+            "model unloaded after %d s idle anon_before_mib=%s anon_after_mib=%s trimmed=%s",
+            int(idle_s),
+            anon_before,
+            anon_after,
+            trimmed,
+        )
         return True
 
     def align(self, pcm_f32le: bytes, tokens: list[str]) -> list[tuple[int, int]]:
