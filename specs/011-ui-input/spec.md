@@ -124,7 +124,7 @@ controls). Gamepad as a spatial-navigation source `[NEEDS CLARIFICATION: in v1?]
 Largely re-scoped by spec 029 (keyboard modes), owned elsewhere. Evidence is `crates/pharos-ui/src/native/`.
 
 - US1 spatial navigation: partial. Tab/arrow focus with a focus ring and `?`-style which-key help; no per-route focus tree with named zones (FR-001) found.
-- US2 command palette: done. Ctrl+K palette (`palette.rs`, b8995022 replacing the find screen; #549, #881 recent searches, #892, #898 word search with typos).
+- US2 command palette: partial. Ctrl+K palette (`palette.rs`, b8995022 replacing the find screen; #549, #881 recent searches, #892, #898 word search with typos); action search and execution (e.g. switch theme) are missing.
 - US3 single-key actions: done (`keymap.rs` `BINDINGS`, `keys.rs`; #871, #888).
 - US4 player keys: done (#607 wheel volume/seek, #879 k/j volume, #888 player keys from anywhere, #890 keys survive sliders).
 - US5 mouse efficiency: partial (hover on cards, `oncontextmenu` shortcuts in `listen.rs`, wheel/Shift-click on players).
