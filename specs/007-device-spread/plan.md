@@ -1,5 +1,11 @@
 # 007 Device Spread — Implementation Plan
 
+**Status (audited 2026-11-09)**: Tasks 1-4 and 6 merged 2026-08-01 (see spec.md
+Status); Task 5 (class-preferred ordering) was built then reverted and must NOT be
+re-done as written (`vp9_lands_on_vaapi_hardware`). Step checkboxes below were
+never ticked. Open: Task 6 Step 6, verify by query after deploy (device_in_use
+non-zero on >1 device under concurrent load; second rendition's queue_wait_seconds).
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development
 > (recommended) or superpowers:executing-plans to implement this plan task-by-task.
 > Steps use checkbox (`- [ ]`) syntax for tracking.
