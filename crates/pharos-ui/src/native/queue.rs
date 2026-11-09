@@ -553,6 +553,7 @@ mod tests {
             critic_rating: None,
             artist: None,
             stereo: None,
+            damaged: false,
         }
     }
 
