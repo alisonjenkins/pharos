@@ -643,6 +643,60 @@ fn min_opt(a: Option<u64>, b: Option<u64>) -> Option<u64> {
     }
 }
 
+/// Set the downscale target on a re-encoded segment (spec 035). See
+/// [`super::output_size::plan_output_size`] for what `bitrate_capped` means.
+fn apply_output_size(
+    opts: &mut SegmentOpts,
+    probe: &pharos_core::MediaProbe,
+    limits: pharos_transcode::SizeLimits,
+    bitrate_capped: bool,
+) {
+    let planned = if opts.video.is_some() {
+        super::output_size::plan_output_size(
+            probe,
+            opts.stereo_output,
+            limits,
+            opts.video_bitrate_bps,
+            bitrate_capped,
+        )
+    } else {
+        None
+    };
+    opts.output_size = planned.map(|(size, _)| size);
+    opts.output_scale_reason = planned.map(|(_, reason)| reason);
+}
+
+/// The size bounds and the `bitrate_capped` flag a `main`-rung or variant
+/// segment is planned with. ONE function for [`serve_segment`] and the
+/// cold-start prewarm: a prewarm that plans differently keys segments the
+/// client never asks for (V92).
+fn output_size_bounds(
+    requested: pharos_transcode::SizeLimits,
+    session_cap: Option<u64>,
+    url_cap: Option<u64>,
+    rung_height: Option<u32>,
+) -> (pharos_transcode::SizeLimits, bool) {
+    let capped = session_cap.is_some() || url_cap.is_some();
+    match rung_height {
+        Some(h) => (requested.capped_height(h), true),
+        None => (requested, capped),
+    }
+}
+
+/// A CMAF ladder rung also bounds the frame by its own height, and its
+/// bitrate is a client-visible cap. Re-plans after the rung bitrate is set.
+fn apply_rung_output_size(
+    opts: &mut SegmentOpts,
+    probe: &pharos_core::MediaProbe,
+    qs: &str,
+    rung: Option<Variant>,
+) {
+    if let Some(r) = rung {
+        let limits = super::output_size::qs_size_limits(qs).capped_height(r.height());
+        apply_output_size(opts, probe, limits, true);
+    }
+}
+
 /// Fix (Lace incident): parse a `VideoBitrate=` ceiling from a request query
 /// string. PlaybackInfo bakes it into the transcode URL for remote clients and
 /// `playback_qs` rides it master → variant → segment, so the cap survives a
@@ -702,6 +756,60 @@ fn select_master_video(qs: &str) -> MasterVideo {
     MasterVideo::H264
 }
 
+/// What the master advertises for the client's size bounds (spec 035): the
+/// frame the `main` rendition is ACTUALLY encoded at, and the bounds the ladder
+/// rungs are held to.
+#[derive(Clone, Copy)]
+struct MasterSize {
+    /// `None` when the source size is unknown.
+    main: Option<(u32, u32)>,
+    limits: pharos_transcode::SizeLimits,
+}
+
+impl MasterSize {
+    /// Plans the `main` rendition exactly as the segment route will: the same
+    /// bounds and the same `capped` rule ([`output_size_bounds`]). Cosmetic for
+    /// a packed-3D source (the master does not know the layout), which is
+    /// planned as flat.
+    fn of(item: &HlsItem, limits: pharos_transcode::SizeLimits, bitrate_cap: Option<u64>) -> Self {
+        let main = item.width.zip(item.height).map(|(w, h)| {
+            let probe = pharos_core::MediaProbe {
+                width: Some(w),
+                height: Some(h),
+                ..Default::default()
+            };
+            let (limits, capped) = output_size_bounds(limits, bitrate_cap, None, None);
+            super::output_size::plan_output_size(
+                &probe,
+                pharos_transcode::StereoOutput::Preserve,
+                limits,
+                Some(effective_video_bitrate(
+                    bitrate_cap,
+                    item.source_bitrate_bps,
+                )),
+                capped,
+            )
+            .map_or((w, h), |(s, _)| (s.width(), s.height()))
+        });
+        Self { main, limits }
+    }
+
+    fn main_resolution(self) -> String {
+        self.main
+            .map(|(w, h)| format!(",RESOLUTION={w}x{h}"))
+            .unwrap_or_default()
+    }
+
+    /// A ladder rung taller (or wider) than the client's bounds would be a
+    /// variant the client cannot use; leave it out of the master.
+    fn admits(self, rung_w: Option<u32>, rung_h: u32) -> bool {
+        self.limits.max_height().map_or(true, |m| rung_h <= m)
+            && rung_w
+                .zip(self.limits.max_width())
+                .map_or(true, |(w, m)| w <= m)
+    }
+}
+
 /// Append the H.264/mpegts master rungs: the backwards-compat `main` rung + the
 /// resolution ladder, all advertising the avc1+aac CODECS the segments carry.
 fn push_h264_rungs(
@@ -710,6 +818,7 @@ fn push_h264_rungs(
     qs: &str,
     item: &HlsItem,
     bitrate_cap: Option<u64>,
+    size: MasterSize,
 ) {
     let codecs = hls_output_codecs_string(
         item.video_codec.as_deref(),
@@ -721,21 +830,19 @@ fn push_h264_rungs(
         .zip(item.height)
         .map(|(w, h)| w as f64 / h as f64);
     let baseline_bw = effective_video_bitrate(bitrate_cap, item.source_bitrate_bps) + 128_000;
-    let baseline_res = match (item.width, item.height) {
-        (Some(w), Some(h)) => format!(",RESOLUTION={w}x{h}"),
-        _ => String::new(),
-    };
+    let baseline_res = size.main_resolution();
     body.push_str(&format!(
         "#EXT-X-STREAM-INF:BANDWIDTH={baseline_bw},CODECS=\"{codecs}\"{baseline_res}\n\
          /Videos/{id}/main.m3u8?{qs}\n"
     ));
     for v in Variant::ladder_for(item.height, bitrate_cap) {
         let target_h = v.height();
-        let resolution = match aspect_w {
-            Some(ratio) => {
-                let target_w = (ratio * target_h as f64).round() as u32 & !1;
-                format!(",RESOLUTION={target_w}x{target_h}")
-            }
+        let target_w = aspect_w.map(|ratio| (ratio * target_h as f64).round() as u32 & !1);
+        if !size.admits(target_w, target_h) {
+            continue;
+        }
+        let resolution = match target_w {
+            Some(target_w) => format!(",RESOLUTION={target_w}x{target_h}"),
             None => String::new(),
         };
         body.push_str(&format!(
@@ -751,16 +858,13 @@ fn push_h264_rungs(
 /// `EXT-X-STREAM-INF` advertising the vp09+opus CODECS, pointing at the fMP4
 /// `/vp9` surface. Shared by the standalone `vp9_master` route and the unified
 /// master.
-fn push_vp9_rungs(body: &mut String, id: &str, qs: &str, item: &HlsItem) {
+fn push_vp9_rungs(body: &mut String, id: &str, qs: &str, item: &HlsItem, size: MasterSize) {
     let bitrate = target_video_bitrate(item.source_bitrate_bps) + 128_000;
     body.push_str(&format!(
         "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"Audio\",DEFAULT=YES,\
          AUTOSELECT=YES,URI=\"/videos/{id}/vp9/audio.m3u8?{qs}\"\n"
     ));
-    let resolution = match (item.width, item.height) {
-        (Some(w), Some(h)) => format!(",RESOLUTION={w}x{h}"),
-        _ => String::new(),
-    };
+    let resolution = size.main_resolution();
     body.push_str(&format!(
         "#EXT-X-STREAM-INF:BANDWIDTH={bitrate},CODECS=\"{VP9_HLS_CODECS}\",AUDIO=\"aud\"{resolution}\n\
          /videos/{id}/vp9/main.m3u8?{qs}\n"
@@ -791,6 +895,7 @@ fn push_h264_cmaf_rungs(
     item: &HlsItem,
     abr: bool,
     bitrate_cap: Option<u64>,
+    size: MasterSize,
 ) {
     // Without `abr=1` the source rung ignores the cap, as it always has: the
     // master must stay byte-identical for hls.js (V644).
@@ -802,10 +907,7 @@ fn push_h264_cmaf_rungs(
         "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"Audio\",DEFAULT=YES,\
          AUTOSELECT=YES,URI=\"/videos/{id}/vp9/audio.m3u8?{qs}\"\n"
     ));
-    let resolution = match (item.width, item.height) {
-        (Some(w), Some(h)) => format!(",RESOLUTION={w}x{h}"),
-        _ => String::new(),
-    };
+    let resolution = size.main_resolution();
     body.push_str(&format!(
         "#EXT-X-STREAM-INF:BANDWIDTH={bitrate},CODECS=\"{codecs}\",AUDIO=\"aud\"{resolution}\n\
          /videos/{id}/h264cmaf/main.m3u8?{qs}\n"
@@ -819,11 +921,12 @@ fn push_h264_cmaf_rungs(
         .map(|(w, h)| w as f64 / h as f64);
     for v in Variant::cmaf_ladder(item.height, item.source_bitrate_bps, bitrate_cap) {
         let target_h = v.height();
-        let resolution = match aspect_w {
-            Some(ratio) => {
-                let target_w = (ratio * target_h as f64).round() as u32 & !1;
-                format!(",RESOLUTION={target_w}x{target_h}")
-            }
+        let target_w = aspect_w.map(|ratio| (ratio * target_h as f64).round() as u32 & !1);
+        if !size.admits(target_w, target_h) {
+            continue;
+        }
+        let resolution = match target_w {
+            Some(target_w) => format!(",RESOLUTION={target_w}x{target_h}"),
             None => String::new(),
         };
         body.push_str(&format!(
@@ -918,6 +1021,11 @@ async fn master_playlist(
 
     // Exactly one codec's rungs — never both. The h264 family shares one muxed
     // audio model across its ladder; the vp9 rung owns its demuxed audio group.
+    let size = MasterSize::of(
+        &item,
+        super::output_size::qs_size_limits(req.query_string()),
+        bitrate_cap,
+    );
     match video {
         MasterVideo::H264 if demuxed_h264 => push_h264_cmaf_rungs(
             &mut body,
@@ -926,9 +1034,10 @@ async fn master_playlist(
             &item,
             qs_abr(req.query_string()),
             bitrate_cap,
+            size,
         ),
-        MasterVideo::H264 => push_h264_rungs(&mut body, &id, &qs, &item, bitrate_cap),
-        MasterVideo::Vp9 => push_vp9_rungs(&mut body, &id, &qs, &item),
+        MasterVideo::H264 => push_h264_rungs(&mut body, &id, &qs, &item, bitrate_cap, size),
+        MasterVideo::Vp9 => push_vp9_rungs(&mut body, &id, &qs, &item, size),
     }
     Ok(HttpResponse::Ok()
         .content_type("application/vnd.apple.mpegurl")
@@ -967,7 +1076,6 @@ fn parse_start_time_ticks_qs(qs: &str) -> u64 {
 /// Returns `None` when no PSID was supplied OR the session has no
 /// bitrate cap recorded.
 async fn extract_session_bitrate_cap(state: &AppState, req: &HttpRequest) -> Option<u64> {
-    use crate::api::jellyfin::device_profile::Decision;
     let psid = req
         .query_string()
         .split('&')
@@ -980,11 +1088,17 @@ async fn extract_session_bitrate_cap(state: &AppState, req: &HttpRequest) -> Opt
         .await
         .ok()
         .flatten()?;
-    match session.decision {
+    decision_video_cap(&session.decision)
+}
+
+/// The video bitrate ceiling a negotiated transcode carries.
+fn decision_video_cap(decision: &crate::api::jellyfin::device_profile::Decision) -> Option<u64> {
+    use crate::api::jellyfin::device_profile::Decision;
+    match decision {
         Decision::Transcode {
             max_video_bitrate_bps,
             ..
-        } => max_video_bitrate_bps,
+        } => *max_video_bitrate_bps,
         _ => None,
     }
 }
@@ -1272,6 +1386,21 @@ async fn serve_segment(
         opts.video_bitrate_bps,
     ) {
         opts.video_bitrate_bps = Some(cur.min(cap).clamp(HLS_MIN_BITRATE_BPS, HLS_MAX_BITRATE_BPS));
+    }
+    // Spec 035 — downscale to the client's MaxWidth/MaxHeight, to the ladder
+    // rung's own height, and to the rung the capped bitrate can carry. After
+    // every bitrate decision above: the bitrate picks the rung.
+    {
+        let (limits, capped) = output_size_bounds(
+            super::output_size::qs_size_limits(req.query_string()),
+            session_cap,
+            qs_video_bitrate_cap(req.query_string()),
+            match variant {
+                Some(AnyVariant::Video(vv)) => Some(vv.height()),
+                _ => None,
+            },
+        );
+        apply_output_size(&mut opts, &item.probe, limits, capped);
     }
 
     // B51 — the client's ACTUAL subtitle pick (codec-relative, pre-gate), so
@@ -1779,6 +1908,7 @@ fn build_segment_opts(
                     stereo_output: pharos_transcode::StereoOutput::Preserve,
                     tonemap: source_tonemap(&item.probe),
                     output_size: None,
+                    output_scale_reason: None,
                 };
             }
             // P9/B45 — VideoRemux (video codec compatible, container/audio
@@ -1817,6 +1947,7 @@ fn build_segment_opts(
                     stereo_output: pharos_transcode::StereoOutput::Preserve,
                     tonemap: source_tonemap(&item.probe),
                     output_size: None,
+                    output_scale_reason: None,
                 };
             }
             _ => {}
@@ -1855,6 +1986,7 @@ fn build_segment_opts(
         stereo_output: pharos_transcode::StereoOutput::Preserve,
         tonemap: source_tonemap(&item.probe),
         output_size: None,
+        output_scale_reason: None,
     }
 }
 
@@ -2133,6 +2265,10 @@ fn playback_qs(req: &HttpRequest) -> String {
                 parts.push(format!("VideoBitrate={v}"));
             } else if k.eq_ignore_ascii_case("StereoMode") {
                 parts.push(format!("StereoMode={v}"));
+            } else if super::output_size::is_size_key(k) {
+                // The client's frame bound rides master -> variant -> segment
+                // so every rung is scaled to it.
+                parts.push(format!("{k}={v}"));
             } else if k.eq_ignore_ascii_case("MediaSourceId") {
                 // The edition the master was built from; without it the
                 // variant and its segments would read the item's own file.
@@ -2179,7 +2315,16 @@ async fn vp9_master(
     // with the unified master via `push_vp9_rungs`.
     let mut body = String::new();
     body.push_str("#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-INDEPENDENT-SEGMENTS\n");
-    push_vp9_rungs(&mut body, &id, &qs, &item);
+    let bitrate_cap = min_opt(
+        extract_session_bitrate_cap(&state, &req).await,
+        qs_video_bitrate_cap(req.query_string()),
+    );
+    let size = MasterSize::of(
+        &item,
+        super::output_size::qs_size_limits(req.query_string()),
+        bitrate_cap,
+    );
+    push_vp9_rungs(&mut body, &id, &qs, &item, size);
     Ok(HttpResponse::Ok()
         .content_type("application/vnd.apple.mpegurl")
         .insert_header(playlist_cache_control(true))
@@ -2734,6 +2879,7 @@ async fn h264cmaf_init_for(
     )
     .await;
     opts.video_bitrate_bps = cmaf_rung_bitrate(opts.video_bitrate_bps, rung);
+    apply_rung_output_size(&mut opts, &item.probe, req.query_string(), rung);
     {
         let (start_secs, dur_secs) = segment_time_range(0, item.probe.frame_rate_mille);
         gate_image_sub_burn(&state, &item, &mut opts, start_secs, dur_secs).await;
@@ -2832,6 +2978,7 @@ async fn h264cmaf_segment_for(
     )
     .await;
     opts.video_bitrate_bps = cmaf_rung_bitrate(opts.video_bitrate_bps, rung);
+    apply_rung_output_size(&mut opts, &item.probe, req.query_string(), rung);
     let wanted_burn = opts.burn_subtitle_stream_index;
     {
         let (start_secs, dur_secs) = segment_time_range(seg, item.probe.frame_rate_mille);
@@ -3297,6 +3444,7 @@ pub(super) fn prewarm_cold_start(
     audio_stream_index: Option<u32>,
     subtitle_stream_index: Option<u32>,
     video_bitrate_cap: Option<u64>,
+    size_limits: pharos_transcode::SizeLimits,
     resume_ticks: u64,
     demuxed_cmaf: bool,
     media_source_id: Option<String>,
@@ -3351,6 +3499,7 @@ pub(super) fn prewarm_cold_start(
         let Some(base) = base else {
             return;
         };
+        let session_cap = decision_video_cap(&session.decision);
         for seg in base..(base + COLD_START_PREWARM_SEGS).min(total_segs) {
             let state = state.clone();
             let item = item.clone();
@@ -3395,6 +3544,12 @@ pub(super) fn prewarm_cold_start(
                     }
                     opts
                 };
+                // serve_segment's downscale, planned by the same function from
+                // the same inputs: the URL's MaxWidth/MaxHeight and the session
+                // and URL bitrate caps.
+                let (limits, capped) =
+                    output_size_bounds(size_limits, session_cap, video_bitrate_cap, None);
+                apply_output_size(&mut opts, &item.probe, limits, capped);
                 // Same per-segment burn gating serve_segment applies before the
                 // cache read (the burn index is part of the key).
                 gate_image_sub_burn(&state, &item, &mut opts, start_secs, dur_secs).await;
@@ -3740,6 +3895,12 @@ async fn fmp4_segment_opts(
     if let Some(so) = qs_stereo_output(req.query_string()) {
         opts.stereo_output = so;
     }
+    apply_output_size(
+        &mut opts,
+        &item.probe,
+        super::output_size::qs_size_limits(req.query_string()),
+        cap.is_some(),
+    );
     opts
 }
 
@@ -3853,6 +4014,7 @@ fn fmp4_segment_opts_resolved(
         stereo_output: pharos_transcode::StereoOutput::Preserve,
         tonemap: source_tonemap(&item.probe),
         output_size: None,
+        output_scale_reason: None,
     }
 }
 
@@ -5601,6 +5763,71 @@ mod tests {
         assert!(s.contains("BANDWIDTH=3128000"), "{s}");
     }
 
+    async fn master_for(probe: pharos_core::MediaProbe, query: &str, web: bool) -> String {
+        let (state, token) = seed_with_probe(probe).await;
+        let app = test::init_service(App::new().app_data(state).configure(register)).await;
+        let mut req =
+            test::TestRequest::get().uri(&format!("/videos/9/master.m3u8?api_key={token}{query}"));
+        if web {
+            req = req.insert_header((
+                actix_web::http::header::USER_AGENT,
+                "Mozilla/5.0 (X11; Linux x86_64) Firefox/152.0",
+            ));
+        }
+        let body = test::call_and_read_body(&app, req.to_request()).await;
+        String::from_utf8(body.to_vec()).unwrap()
+    }
+
+    fn probe_4k() -> pharos_core::MediaProbe {
+        pharos_core::MediaProbe {
+            duration_ms: Some(10_000),
+            width: Some(3840),
+            height: Some(2160),
+            bitrate_bps: Some(20_000_000),
+            ..Default::default()
+        }
+    }
+
+    #[actix_web::test]
+    async fn the_master_advertises_the_size_the_main_rendition_is_encoded_at() {
+        let s = master_for(probe_4k(), "&MaxWidth=1920", false).await;
+        let main_inf = s
+            .lines()
+            .zip(s.lines().skip(1))
+            .find(|(_, u)| u.contains("/Videos/9/main.m3u8"))
+            .map(|(inf, _)| inf)
+            .unwrap();
+        assert!(main_inf.contains("RESOLUTION=1920x1080"), "{s}");
+        // And never the 4K source.
+        assert!(!s.contains("RESOLUTION=3840x2160"), "{s}");
+    }
+
+    #[actix_web::test]
+    async fn the_master_drops_rungs_taller_than_max_height() {
+        let s = master_for(probe_4k(), "&MaxHeight=720", false).await;
+        for name in ["1080p", "1440p", "2160p"] {
+            assert!(!s.contains(&format!("variants/{name}.m3u8")), "{name}: {s}");
+        }
+        for name in ["720p", "480p"] {
+            assert!(s.contains(&format!("variants/{name}.m3u8")), "{name}: {s}");
+        }
+        assert!(
+            s.contains("RESOLUTION=1280x720"),
+            "main is bounded too: {s}"
+        );
+        // Unbounded: the master is what it was.
+        let all = master_for(probe_4k(), "", false).await;
+        assert!(all.contains("RESOLUTION=3840x2160"), "{all}");
+    }
+
+    #[actix_web::test]
+    async fn the_cmaf_master_advertises_the_bounded_size_too() {
+        let s = master_for(probe_4k(), "&renditions=h264&abr=1&MaxHeight=720", true).await;
+        assert!(s.contains("RESOLUTION=1280x720"), "{s}");
+        assert!(!s.contains("RESOLUTION=3840x2160"), "{s}");
+        assert!(!s.contains("h264cmaf/1080p/"), "{s}");
+    }
+
     #[actix_web::test]
     async fn variant_playlist_unknown_name_404s() {
         let (state, token) = seed().await;
@@ -6096,6 +6323,95 @@ mod prewarm_edition_tests {
         );
     }
 
+    /// The prewarm exists to be READ. A bounded client's segment request must
+    /// land on the file the prewarm wrote: same size, same name, no second
+    /// encode. (The unbounded prewarm used to key the full-size name and the
+    /// client's `MaxWidth` request missed it.)
+    #[actix_web::test]
+    async fn the_cold_start_prewarm_writes_the_name_a_bounded_request_reads() {
+        let td = tempfile::TempDir::new().unwrap();
+        let (state, root, _edition) = seed(td.path()).await;
+        let session = crate::transcode_sessions::TranscodeSession {
+            media_id: 7,
+            decision: crate::api::jellyfin::device_profile::Decision::Transcode {
+                target_container: "ts".into(),
+                target_video_codec: Some("h264".into()),
+                target_audio_codec: Some("aac".into()),
+                max_video_bitrate_bps: None,
+            },
+            source_probe: MediaProbe::default(),
+            burn_subtitle_indices: Default::default(),
+            holder: pharos_core::SessionHolder {
+                user_id: pharos_core::UserId::new(),
+                token_id: "test-token-id".into(),
+            },
+        };
+        // What PlaybackInfo does with `MaxWidth=1280`: bake it into the URL the
+        // prewarm and the client both read.
+        let url = "/videos/7/master.m3u8?PlaySessionId=ps-bound&renditions=h264&MaxWidth=1280";
+        prewarm_cold_start(
+            &state,
+            session,
+            "ps-bound",
+            None,
+            None,
+            None,
+            super::super::output_size::qs_size_limits(url),
+            0,
+            true,
+            None,
+        );
+        let want = COLD_START_PREWARM_SEGS as usize;
+        let warmed_names = warmed(&root, want).await;
+        assert_eq!(warmed_names.len(), want, "{warmed_names:?}");
+        assert!(
+            warmed_names.iter().all(|n| n.ends_with("_1280x720.ts")),
+            "every prewarmed segment is keyed by the bounded size: {warmed_names:?}"
+        );
+
+        // The client's own request, through the production request-side builder.
+        let item = super::super::media_source::load_named(
+            &state,
+            super::super::media_source::Route::Hls,
+            7,
+            None,
+        )
+        .await
+        .unwrap();
+        let req = actix_web::test::TestRequest::get()
+            .uri("/videos/7/h264cmaf/main/0.m4s?PlaySessionId=ps-bound&MaxWidth=1280")
+            .to_http_request();
+        let opts = fmp4_segment_opts(&state, &req, &item, 0, SegmentVideo::H264, None, None).await;
+        assert_eq!(
+            opts.output_size,
+            pharos_transcode::OutputSize::new(1280, 720),
+            "the request plans the size the prewarm did"
+        );
+        state
+            .hls
+            .as_ref()
+            .unwrap()
+            .segment_bytes_keyed(
+                item.id,
+                0,
+                opts.audio_source_stream_index,
+                opts.burn_subtitle_stream_index,
+                &item.path,
+                item.edition.as_deref(),
+                &opts,
+                JobClass::Interactive,
+                StreamKey::of("ps-bound"),
+                PlayheadSeed::StatesTheStart,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            warmed(&root, want + 1).await.len(),
+            want,
+            "the request read a prewarmed file instead of encoding its own"
+        );
+    }
+
     #[actix_web::test]
     async fn a_cold_start_warms_the_edition_playback_info_negotiated() {
         let td = tempfile::TempDir::new().unwrap();
@@ -6125,6 +6441,7 @@ mod prewarm_edition_tests {
             None,
             None,
             None,
+            pharos_transcode::SizeLimits::default(),
             0,
             true,
             Some(format!(

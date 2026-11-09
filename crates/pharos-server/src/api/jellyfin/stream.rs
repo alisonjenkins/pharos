@@ -726,6 +726,14 @@ async fn stream_transcoded_webm(
     let sub_rel = parse_query_u32(qs, "SubtitleStreamIndex")
         .and_then(|abs| codec_relative_index(&sub_abs, abs));
     let stereo_output = progressive_stereo_output(qs);
+    let planned = super::output_size::plan_output_size(
+        &item.probe,
+        stereo_output,
+        super::output_size::qs_size_limits(qs),
+        Some(cap),
+        parse_max_streaming_bitrate(qs).is_some(),
+    );
+    let output_size = planned.map(|(size, _)| size);
     let opts = TranscodeOptions {
         source_frame_rate: None,
         container: Container::WebM,
@@ -754,7 +762,7 @@ async fn stream_transcoded_webm(
         video_3d_format: item.probe.video_3d_format,
         stereo_output,
         tonemap: super::hls::source_tonemap(&item.probe),
-        output_size: None,
+        output_size,
     };
     tracing::info!(
         media.id = item.id,
@@ -765,6 +773,11 @@ async fn stream_transcoded_webm(
         burn = sub_rel.is_some(),
         "progressive webm transcode starting"
     );
+    // A progressive stream has no cache: every request starts a transcode, so
+    // this is where its downscale is counted.
+    if let Some((_, reason)) = planned {
+        super::output_size::count_scaled(reason);
+    }
     // Route through the load-balancing scheduler (crash-isolated worker,
     // spread across every GPU + CPU). Inline ffmpeg is only a last-resort
     // fallback when the scheduler genuinely declines (pool saturated).

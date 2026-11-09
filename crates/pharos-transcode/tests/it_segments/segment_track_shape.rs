@@ -132,6 +132,7 @@ fn encode_video_only_segment(src: &Path, dir: &Path, seg: u32) -> PathBuf {
         stereo_output: Default::default(),
         tonemap: Default::default(),
         output_size: None,
+        output_scale_reason: None,
     };
     let out = dir.join(format!("seg{seg}.m4s"));
     let args = ffmpeg_transcode_args(

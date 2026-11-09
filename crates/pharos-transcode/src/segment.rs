@@ -210,6 +210,10 @@ pub struct SegmentOpts {
     /// Skipped when `None` so unscaled options serialise exactly as before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_size: Option<crate::output_size::OutputSize>,
+    /// Why `output_size` was chosen, for the `pharos_transcode_output_scaled_total`
+    /// label. Bookkeeping, not identity: it is not serialised, hashed or keyed.
+    #[serde(skip)]
+    pub output_scale_reason: Option<crate::output_size::ScaleReason>,
 }
 
 /// A segment's audio once it is SETTLED.
@@ -375,6 +379,7 @@ mod tests {
             stereo_output: crate::options::StereoOutput::Mono2D,
             tonemap: Default::default(),
             output_size: None,
+            output_scale_reason: None,
         };
         let slice = crate::options::MuxedAudio {
             path: std::path::PathBuf::from("/cache/continuous.m4a"),
@@ -453,6 +458,7 @@ mod tests {
             stereo_output: crate::options::StereoOutput::Preserve,
             tonemap: Default::default(),
             output_size: None,
+            output_scale_reason: None,
         };
         let argv = |r: &ResolvedSegment| {
             crate::ffmpeg_transcode_args(

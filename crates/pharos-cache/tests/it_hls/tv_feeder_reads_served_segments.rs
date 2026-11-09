@@ -91,6 +91,7 @@ fn video_opts(seg: u32) -> SegmentOpts {
         stereo_output: Default::default(),
         tonemap: Default::default(),
         output_size: None,
+        output_scale_reason: None,
     }
 }
 

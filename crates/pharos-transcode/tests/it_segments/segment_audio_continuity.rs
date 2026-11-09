@@ -170,6 +170,7 @@ fn encode_segment(src: &Path, cont_audio: &Path, dir: &Path, seg: u32) -> PathBu
         stereo_output: Default::default(),
         tonemap: Default::default(),
         output_size: None,
+        output_scale_reason: None,
     };
     let out = dir.join(format!("seg{seg}.ts"));
     let args = ffmpeg_transcode_args(
