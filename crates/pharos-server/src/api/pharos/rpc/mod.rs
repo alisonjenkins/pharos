@@ -155,8 +155,9 @@ pub struct ConnectionCtx {
     /// exported on a connection are not reliably dropped when it closes, so
     /// whatever must happen on the close (a membership's seat) registers here.
     on_close: RefCell<Vec<Box<dyn FnOnce()>>>,
-    /// `Events` subscriptions open on this connection, for the cap (T026a).
-    subscriptions: events::SubscriptionCount,
+    /// `Events` subscriptions open on this connection: the cap (T026a), and
+    /// stopping them on logout and close.
+    pub(crate) subscriptions: events::Subscriptions,
 }
 
 /// The media token lifetime of a connection nobody configured: the config
@@ -185,7 +186,7 @@ impl ConnectionCtx {
             signed_out: tokio::sync::Notify::new(),
             extend_auth: tokio::sync::Notify::new(),
             on_close: RefCell::new(Vec::new()),
-            subscriptions: events::SubscriptionCount::default(),
+            subscriptions: events::Subscriptions::default(),
         }))
     }
 
@@ -214,6 +215,7 @@ impl ConnectionCtx {
 
     /// The connection has closed: runs the registered hooks, once.
     pub(crate) fn closed(&self) {
+        self.subscriptions.stop_all();
         let hooks = std::mem::take(&mut *self.on_close.borrow_mut());
         for hook in hooks {
             hook();
@@ -242,6 +244,7 @@ impl ConnectionCtx {
         if !ended.iter().any(|t| t == token) {
             ended.push(token.to_owned());
         }
+        self.subscriptions.stop_token(token);
         if resumed.is_empty() {
             self.limits.sign_out(&mut self.slot.borrow_mut());
             // Only the sign-out itself re-arms the deadline: a repeat logout

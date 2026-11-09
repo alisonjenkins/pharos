@@ -31,9 +31,10 @@ use crate::state::SocketBroadcast;
 pub const REPLAY_EVENTS: usize = 10_000;
 /// How long a user stream keeps an event for replay (data-model §Events).
 pub const REPLAY_AGE: Duration = Duration::from_secs(15 * 60);
-/// Live events buffered for subscribers before the slowest one lags. A lagged
-/// subscriber loses nothing: it catches up from the replay window.
-const LIVE_CAPACITY: usize = 1024;
+/// Live events a user's channel buffers before that user's slowest
+/// subscriber lags. A lagged subscriber loses nothing: it catches up from the
+/// replay window. Each subscribed user's channel holds this many slots.
+const LIVE_CAPACITY: usize = 256;
 
 /// `pharos_rpc_events_total{topic,outcome}`.
 pub const EVENTS_TOTAL: &str = "pharos_rpc_events_total";
@@ -87,8 +88,9 @@ pub enum Outcome {
     Dropped,
     /// The sink answered it with an error.
     Rejected,
-    /// A subscriber was told to refetch: its `afterSeq` was outside the
-    /// window, or the bus outran this log.
+    /// A resync was decided: a subscriber's `afterSeq` was outside the
+    /// window, or the bus outran this log (once for all streams). Its push
+    /// counts under `topic="resync"` with the push's own outcome.
     Resync,
     /// A bus announcement this log could not read (it names the value in a
     /// WARN).
@@ -181,6 +183,9 @@ struct Stream {
     /// Events up to and including this `seq` can no longer be replayed.
     pruned_through: u64,
     window: VecDeque<Event>,
+    /// This user's live events; one channel per user, so a burst for one
+    /// user never wakes or lags another's subscribers.
+    live: broadcast::Sender<Event>,
 }
 
 impl Stream {
@@ -189,10 +194,11 @@ impl Stream {
             head: floor,
             pruned_through: floor,
             window: VecDeque::new(),
+            live: broadcast::channel(LIVE_CAPACITY).0,
         }
     }
 
-    fn push(&mut self, payload: Arc<Payload>, now: Instant, bounds: Bounds) -> Event {
+    fn push(&mut self, payload: Arc<Payload>, now: Instant, bounds: Bounds) {
         self.head = self.head.saturating_add(1);
         let event = Event {
             seq: self.head,
@@ -201,7 +207,7 @@ impl Stream {
         };
         self.window.push_back(event.clone());
         self.prune(now, bounds);
-        event
+        let _ = self.live.send(event);
     }
 
     fn prune(&mut self, now: Instant, bounds: Bounds) {
@@ -255,7 +261,6 @@ struct Bounds {
 /// Every user stream on this server, and the live channel subscribers follow.
 pub struct EventLog {
     streams: Mutex<HashMap<UserId, Stream>>,
-    live: broadcast::Sender<(UserId, Event)>,
     bounds: Bounds,
     started: Once,
 }
@@ -285,10 +290,8 @@ fn wall_micros() -> u64 {
 impl EventLog {
     /// A log whose streams keep `events` events for at most `age`.
     pub fn with_window(events: usize, age: Duration) -> Self {
-        let (live, _) = broadcast::channel(LIVE_CAPACITY);
         Self {
             streams: Mutex::new(HashMap::new()),
-            live,
             bounds: Bounds { events, age },
             started: Once::new(),
         }
@@ -399,8 +402,7 @@ impl EventLog {
             return;
         };
         for payload in payloads {
-            let event = stream.push(Arc::new(payload), now, self.bounds);
-            let _ = self.live.send((user, event));
+            stream.push(Arc::new(payload), now, self.bounds);
         }
     }
 
@@ -409,45 +411,47 @@ impl EventLog {
         let now = Instant::now();
         let payload = Arc::new(payload);
         let mut streams = self.lock();
-        for (user, stream) in streams.iter_mut() {
-            let event = stream.push(Arc::clone(&payload), now, self.bounds);
-            let _ = self.live.send((*user, event));
+        for stream in streams.values_mut() {
+            stream.push(Arc::clone(&payload), now, self.bounds);
         }
     }
 
     /// Where `user` resumes after `after`, and the live channel from that
     /// point on. Both are taken under one lock, so no event falls between
     /// them. Makes the user's stream if they have none.
-    pub fn subscribe(
-        &self,
-        user: UserId,
-        after: u64,
-    ) -> (Catchup, broadcast::Receiver<(UserId, Event)>) {
+    pub fn subscribe(&self, user: UserId, after: u64) -> (Catchup, broadcast::Receiver<Event>) {
         let mut streams = self.lock();
-        let rx = self.live.subscribe();
         let stream = streams
             .entry(user)
             .or_insert_with(|| Stream::new(wall_micros()));
         stream.prune(Instant::now(), self.bounds);
-        (stream.since(after), rx)
+        let rx = stream.live.subscribe();
+        (counted(stream.since(after)), rx)
     }
 
-    /// Where `user` resumes after `after`, for a subscriber that lagged the
-    /// live channel. Its receiver stays as it is: what it still holds is
-    /// skipped by `seq`.
+    /// Where `user` resumes after `after`, for a subscriber that lagged its
+    /// live channel. What its receiver still holds is skipped by `seq`.
     pub fn catch_up(&self, user: UserId, after: u64) -> Catchup {
         let mut streams = self.lock();
         let stream = streams
             .entry(user)
             .or_insert_with(|| Stream::new(wall_micros()));
         stream.prune(Instant::now(), self.bounds);
-        stream.since(after)
+        counted(stream.since(after))
     }
 
     /// The last `seq` of `user`'s stream, `None` when they have none.
     pub fn head(&self, user: UserId) -> Option<u64> {
         self.lock().get(&user).map(|s| s.head)
     }
+}
+
+/// Counts a resync where it is decided: once per subscriber told to refetch.
+fn counted(catchup: Catchup) -> Catchup {
+    if matches!(catchup, Catchup::Resync { .. }) {
+        count("resync", Outcome::Resync, 1);
+    }
+    catchup
 }
 
 fn parse_user(simple: &str) -> Option<UserId> {
@@ -595,6 +599,20 @@ mod tests {
             log.subscribe(user(2), 5).0,
             Catchup::Resync { .. }
         ));
+    }
+
+    #[test]
+    fn a_users_live_channel_carries_only_their_events() {
+        let log = EventLog::default();
+        let (_, mut mine) = log.subscribe(user(1), 0);
+        let (_, _theirs) = log.subscribe(user(2), 0);
+        log.publish(user(2), vec![played(1)]);
+        assert!(
+            mine.try_recv().is_err(),
+            "another user's event woke this one"
+        );
+        log.publish(user(1), vec![played(2)]);
+        assert!(mine.try_recv().is_ok());
     }
 
     #[test]

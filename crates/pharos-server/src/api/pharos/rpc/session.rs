@@ -13,7 +13,7 @@ use pharos_core::{
 };
 
 use super::bootstrap::{qc_denial, token_denial};
-use super::events::{Events, SubscriptionCount};
+use super::events::{Events, Subscriptions};
 use super::group::Group;
 use super::library::Library;
 use super::playback::Playback;
@@ -91,7 +91,7 @@ impl Session {
     }
 
     /// The `Events` subscriptions open on this session's connection.
-    pub(super) fn subscriptions(&self) -> &SubscriptionCount {
+    pub(super) fn subscriptions(&self) -> &Subscriptions {
         &self.ctx.subscriptions
     }
 
