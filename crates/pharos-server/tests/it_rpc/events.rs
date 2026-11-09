@@ -48,7 +48,10 @@ impl Got {
     }
 }
 
-struct TestSink(mpsc::UnboundedSender<Got>, Rc<RefCell<Vec<usize>>>);
+/// Records each push's size; the first push waits for `Gate` when one is set.
+struct TestSink(mpsc::UnboundedSender<Got>, Rc<RefCell<Vec<usize>>>, Gate);
+
+type Gate = Rc<RefCell<Option<tokio::sync::oneshot::Receiver<()>>>>;
 
 impl server::event_sink::Handler for TestSink {
     async fn push(
@@ -56,6 +59,10 @@ impl server::event_sink::Handler for TestSink {
         params: event_sink::PushParams,
         results: &mut event_sink::PushResults,
     ) -> Result<(), capnp::Error> {
+        let gate = self.2.borrow_mut().take();
+        if let Some(gate) = gate {
+            let _ = gate.await;
+        }
         let events = params.get()?.get_events()?;
         self.1.borrow_mut().push(events.len() as usize);
         for e in events {
@@ -116,12 +123,23 @@ async fn subscribe_sized(
     after_seq: u64,
     sizes: Rc<RefCell<Vec<usize>>>,
 ) -> Result<Sub, String> {
+    subscribe_gated(session, topics, after_seq, sizes, Gate::default()).await
+}
+
+/// [`subscribe_sized`] with a sink whose first push waits for `gate`.
+async fn subscribe_gated(
+    session: &session::Client,
+    topics: &[&str],
+    after_seq: u64,
+    sizes: Rc<RefCell<Vec<usize>>>,
+    gate: Gate,
+) -> Result<Sub, String> {
     let events = session.events_request().send().pipeline.get_events();
     let (tx, rx) = mpsc::unbounded_channel();
     let mut req = events.subscribe_request();
     req.get().init_ctx();
     req.get().set_sink(server::event_sink::client(
-        TestSink(tx, sizes),
+        TestSink(tx, sizes, gate),
         &Connection::new(),
     ));
     let mut list = req.get().init_topics(u32::try_from(topics.len()).unwrap());
@@ -541,6 +559,62 @@ async fn a_burst_past_the_live_channel_arrives_whole_in_bounded_pushes() {
                 resumed.borrow()
             );
             assert!(resumed.borrow().len() >= 3);
+        })
+        .await;
+}
+
+/// A subscriber whose sink is still busy when its live channel overflows
+/// catches up from the window: every wanted event arrives once, in `seq`
+/// order, in pushes of at most 256, and the library events it filtered out
+/// on the way cause no `resync`.
+/// Disarm check: with the recv lag arm only breaking (no catch-up), events
+/// go missing and `next` times out.
+#[actix_web::test]
+async fn a_blocked_sink_lags_and_catches_up_without_a_resync() {
+    let fx = seed_rich().await;
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let s = session_for(&connect(&fx), &fx.user_token).await;
+            let sizes = Rc::<RefCell<Vec<usize>>>::default();
+            let (open, gate) = tokio::sync::oneshot::channel();
+            let (_sub, mut rx) = subscribe_gated(
+                &s,
+                &["userData"],
+                0,
+                Rc::clone(&sizes),
+                Rc::new(RefCell::new(Some(gate))),
+            )
+            .await
+            .unwrap();
+            let head = fx.state.events.head(fx.user_id).unwrap();
+            fx.state.events.publish(fx.user_id, vec![played_payload(1)]);
+            // Let the pump take that event and block in the sink.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let library = || pharos_server::services::events::Payload::Library {
+                added: Vec::new(),
+                removed: Vec::new(),
+            };
+            let burst = (2..=600)
+                .flat_map(|id| [library(), played_payload(id)])
+                .collect();
+            fx.state.events.publish(fx.user_id, burst);
+            open.send(()).unwrap();
+
+            let mut seqs = Vec::new();
+            for _ in 0..600 {
+                let got = next(&mut rx).await;
+                assert!(!matches!(got, Got::Resync { .. }), "{got:?}");
+                seqs.push(got.seq());
+            }
+            let mut want = vec![head + 1];
+            want.extend((1..=599).map(|n| head + 1 + 2 * n));
+            assert_eq!(seqs, want);
+            quiet(&mut rx).await;
+            assert!(
+                sizes.borrow().iter().all(|n| *n <= 256),
+                "{:?}",
+                sizes.borrow()
+            );
         })
         .await;
 }
