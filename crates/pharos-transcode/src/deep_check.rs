@@ -108,7 +108,12 @@ pub async fn decode_check(
     };
     let run = async {
         let mut progress = BufReader::new(stdout).lines();
-        let mut errors = BufReader::new(stderr).lines();
+        // Bytes, not `lines()`: a non-UTF-8 line (a file name, a codec's own
+        // text) would end `lines()` and leave the rest of stderr unread.
+        // `read_until` keeps a partial line in `err_buf` across `select!`.
+        let mut errors = BufReader::new(stderr);
+        let mut err_buf = Vec::new();
+        let mut err_read: Option<std::io::Error> = None;
         let mut report = DeepReport::default();
         let (mut out_done, mut err_done) = (false, false);
         while !(out_done && err_done) {
@@ -121,28 +126,41 @@ pub async fn decode_check(
                     }
                     _ => out_done = true,
                 },
-                line = errors.next_line(), if !err_done => match line {
-                    Ok(Some(l)) if !l.trim().is_empty() => {
-                        report.errors = report.errors.saturating_add(1);
-                        if report.first_error.is_none() {
-                            report.first_error = Some(l);
-                            report.first_error_ms = report.decoded_ms;
+                read = errors.read_until(b'\n', &mut err_buf), if !err_done => match read {
+                    Ok(0) => err_done = true,
+                    Ok(_) => {
+                        let l = String::from_utf8_lossy(&err_buf).trim_end().to_string();
+                        err_buf.clear();
+                        if !l.trim().is_empty() {
+                            report.errors = report.errors.saturating_add(1);
+                            if report.first_error.is_none() {
+                                report.first_error = Some(l);
+                                report.first_error_ms = report.decoded_ms;
+                            }
                         }
                     }
-                    Ok(Some(_)) => {}
-                    _ => err_done = true,
+                    Err(e) => {
+                        err_read = Some(e);
+                        err_done = true;
+                    }
                 },
             }
         }
         let status = child.wait().await;
-        (report, status)
+        (report, status, err_read)
     };
-    let (report, status) =
+    let (report, status, err_read) =
         tokio::time::timeout(timeout, run)
             .await
             .map_err(|_| DeepError::TimedOut {
                 secs: timeout.as_secs(),
             })?;
+    if let Some(e) = err_read {
+        return Err(DeepError::Failed {
+            status: format!("reading ffmpeg's stderr failed: {e}"),
+            stderr: report.first_error.unwrap_or_default(),
+        });
+    }
     match status {
         Ok(s) if !s.success() && report.errors == 0 => Err(DeepError::Failed {
             status: s.to_string(),
@@ -261,6 +279,67 @@ mod tests {
             .unwrap();
         assert!(r.errors > 0, "{r:?}");
         assert!(r.first_error.is_some());
+    }
+
+    /// A stand-in `ffmpeg`: a shell script in `dir` running `body`.
+    #[cfg(unix)]
+    fn fake_ffmpeg(dir: &Path, body: &str) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = dir.join("ffmpeg");
+        std::fs::write(&bin, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        bin.to_string_lossy().into_owned()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_decode_past_the_time_bound_is_stopped_and_killed() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let pid_file = dir.path().join("pid");
+        let bin = fake_ffmpeg(
+            dir.path(),
+            &format!("echo $$ > '{}'\nexec sleep 30", pid_file.display()),
+        );
+        let err = decode_check(&bin, Path::new("/x.mkv"), Duration::from_millis(500))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DeepError::TimedOut { .. }), "{err}");
+        let pid: i32 = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        // kill_on_drop sends SIGKILL; give the kernel a moment to deliver it.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            // SAFETY: signal 0 only checks that the process exists.
+            let alive = unsafe { libc::kill(pid, 0) } == 0
+                && !std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                    .is_ok_and(|s| s.contains(") Z "));
+            if !alive {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "ffmpeg {pid} still running"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_line_that_is_not_utf8_is_counted_and_reading_goes_on() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let bin = fake_ffmpeg(
+            dir.path(),
+            "printf 'bad \\377\\376 name\\nsecond error\\n' >&2",
+        );
+        let r = decode_check(&bin, Path::new("/x.mkv"), Duration::from_secs(10))
+            .await
+            .unwrap();
+        assert_eq!(r.errors, 2, "{r:?}");
+        assert!(r.first_error.unwrap().starts_with("bad "));
     }
 
     #[tokio::test]
