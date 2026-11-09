@@ -894,6 +894,37 @@ pub fn parse_integrity_status_response(bytes: &[u8]) -> Result<IntegrityStatus, 
     serde_json::from_slice(bytes).map_err(|e| ClientError::Parse(e.to_string()))
 }
 
+/// `/Admin/Integrity/Deep` row: one on-demand full-decode run. Results live in
+/// server memory and are lost on restart.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct DeepCheck {
+    pub media_id: String,
+    pub path: Option<String>,
+    /// `movie`, `episode` or `audio`.
+    pub kind: Option<String>,
+    pub name: Option<String>,
+    pub series_name: Option<String>,
+    pub season_number: Option<u32>,
+    pub episode_number: Option<u32>,
+    /// `queued`, `running`, `clean`, `damaged` or `failed`.
+    pub state: String,
+    pub errors: u64,
+    pub first_error: Option<String>,
+    pub first_error_ms: Option<u64>,
+    /// Unix seconds.
+    pub requested_at: i64,
+    /// Unix seconds.
+    pub finished_at: Option<i64>,
+    pub elapsed_secs: Option<u64>,
+    /// Why a `failed` run could not finish.
+    pub detail: Option<String>,
+}
+
+pub fn parse_deep_checks_response(bytes: &[u8]) -> Result<Vec<DeepCheck>, ClientError> {
+    serde_json::from_slice(bytes).map_err(|e| ClientError::Parse(e.to_string()))
+}
+
 /// T58 phase 3 — `/Auth/Keys` row.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ApiKey {
@@ -1773,6 +1804,47 @@ pub mod web {
         Ok(())
     }
 
+    pub async fn list_deep_checks(base: &str, token: &str) -> Result<Vec<DeepCheck>, ClientError> {
+        let resp = Request::get(&format!("{base}/Admin/Integrity/Deep"))
+            .header("X-Emby-Token", token)
+            .send()
+            .await
+            .map_err(|e| ClientError::Http(e.to_string()))?;
+        if !resp.ok() {
+            return Err(ClientError::Status(resp.status()));
+        }
+        let bytes = resp
+            .binary()
+            .await
+            .map_err(|e| ClientError::Http(e.to_string()))?;
+        parse_deep_checks_response(&bytes)
+    }
+
+    /// Queues a full decode of the file; the server answers 202 and refuses
+    /// with the reason as text (404, 400, 503), which is returned as `Http`.
+    pub async fn request_deep_check(
+        base: &str,
+        token: &str,
+        media_id: &str,
+    ) -> Result<(), ClientError> {
+        let resp = Request::post(&format!(
+            "{base}/Admin/Integrity/{}/Deep",
+            urlencode(media_id)
+        ))
+        .header("X-Emby-Token", token)
+        .send()
+        .await
+        .map_err(|e| ClientError::Http(e.to_string()))?;
+        if !resp.ok() {
+            let status = resp.status();
+            return match resp.text().await {
+                Ok(t) if !t.trim().is_empty() => Err(ClientError::Http(t.trim().to_string())),
+                _ => Err(ClientError::Status(status)),
+            };
+        }
+        Ok(())
+    }
+
     pub async fn list_logs(base: &str, token: &str) -> Result<Vec<LogEntry>, ClientError> {
         let resp = Request::get(&format!("{base}/System/Logs"))
             .header("X-Emby-Token", token)
@@ -2245,6 +2317,33 @@ mod tests {
         assert!(!v[1].recheck_pending, "a missing RecheckPending is false");
         assert!(parse_damaged_files_response(b"[]").unwrap().is_empty());
         assert!(parse_damaged_files_response(b"{").is_err());
+    }
+
+    #[test]
+    fn parse_deep_checks_reads_nulls_and_missing_fields() {
+        let body = br#"[
+            {"MediaId":"123","Path":"/m/Heat.mkv","Kind":"movie","Name":"Heat",
+             "SeriesName":null,"SeasonNumber":null,"EpisodeNumber":null,
+             "State":"damaged","Errors":4,"FirstError":"Invalid NAL unit size",
+             "FirstErrorMs":2533000,"RequestedAt":1762214400,"FinishedAt":1762215000,
+             "ElapsedSecs":600,"Detail":null},
+            {"MediaId":"9","Path":null,"Kind":null,"Name":null,"State":"queued",
+             "Errors":0,"FirstError":null,"FirstErrorMs":null,"RequestedAt":1762216000,
+             "FinishedAt":null,"ElapsedSecs":null,"Detail":null}
+        ]"#;
+        let v = parse_deep_checks_response(body).unwrap();
+        assert_eq!(v.len(), 2);
+        assert_eq!(v[0].state, "damaged");
+        assert_eq!(v[0].errors, 4);
+        assert_eq!(v[0].first_error_ms, Some(2_533_000));
+        assert_eq!(v[0].finished_at, Some(1_762_215_000));
+        assert_eq!(v[0].elapsed_secs, Some(600));
+        assert_eq!(v[1].path, None);
+        assert_eq!(v[1].finished_at, None);
+        assert_eq!(v[1].series_name, None, "a missing SeriesName is None");
+        assert_eq!(v[1].requested_at, 1_762_216_000);
+        assert!(parse_deep_checks_response(b"[]").unwrap().is_empty());
+        assert!(parse_deep_checks_response(b"{").is_err());
     }
 
     #[test]
