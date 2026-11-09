@@ -50,6 +50,40 @@ use quick_xml::Reader;
 
 pub(crate) mod identity;
 
+/// Spec 033 (V890) — what a show folder's `tvshow.nfo` says the show is.
+/// Evidence for the show matcher, never its identity: the NFOs in the
+/// deployed library are wrong as often as the search.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ShowNfoEvidence {
+    pub tvdb: Option<String>,
+    pub tmdb: Option<String>,
+    pub year: Option<u32>,
+}
+
+/// Read `series_folder/tvshow.nfo` as [`ShowNfoEvidence`]. `None` when it is
+/// absent, unreadable, names no id or year, or names another show than
+/// `series_name` (B558: then it is no evidence for this show at all).
+pub fn show_nfo_evidence(
+    series_folder: &Path,
+    series_name: &str,
+    series_year: Option<u32>,
+) -> Option<ShowNfoEvidence> {
+    let path = series_folder.join("tvshow.nfo");
+    let bytes = std::fs::read(&path).ok()?;
+    let names = identity::parse_names(&bytes)?;
+    let titles = [&names.title, &names.original_title];
+    if identity::names_another_show(series_name, series_year, titles.into_iter().flatten()) {
+        return None;
+    }
+    let parsed = parse_nfo(&bytes, &path).ok()?;
+    let out = ShowNfoEvidence {
+        tvdb: parsed.provider_ids.tvdb,
+        tmdb: parsed.provider_ids.tmdb,
+        year: parsed.production_year,
+    };
+    (out != ShowNfoEvidence::default()).then_some(out)
+}
+
 /// Merge priority for the NFO source — the highest local source. A
 /// user-authored `<title>`/`<plot>`/`<rating>` beats the filename provider
 /// (priority 10) and any future online provider, so local curation wins.
