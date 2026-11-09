@@ -133,6 +133,19 @@ pub struct Version {
     /// The file's runtime; 0 when unknown (or from a server before
     /// schemaVersion 31).
     pub duration_ms: u64,
+    /// Where the picture sits inside the frame when the file has black bars
+    /// baked into it; `None` when it has none, or the server has not looked
+    /// (or is older than schemaVersion 34).
+    pub picture: Option<PictureArea>,
+}
+
+/// A rectangle of a [`Version`]'s coded frame, in its pixels.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PictureArea {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
 }
 
 /// One audio stream of a [`Version`].
@@ -1917,6 +1930,12 @@ fn read_version(v: pharos_api::pharos_capnp::version::Reader<'_>) -> Result<Vers
         path: text(v.get_path())?,
         damaged: v.get_damaged(),
         duration_ms: v.get_duration_ms(),
+        picture: (v.get_picture_width() > 0 && v.get_picture_height() > 0).then(|| PictureArea {
+            x: v.get_picture_x(),
+            y: v.get_picture_y(),
+            width: v.get_picture_width(),
+            height: v.get_picture_height(),
+        }),
     })
 }
 
