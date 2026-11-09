@@ -2678,6 +2678,7 @@ mod tests {
                 credit("Jane Lead", Some(ItemRef::Synth(77))),
                 credit("Old Server", None),
             ],
+            versions: Vec::new(),
         };
         let html = render(move || rsx! { TitleView { detail: detail.clone() } });
         let link = html
