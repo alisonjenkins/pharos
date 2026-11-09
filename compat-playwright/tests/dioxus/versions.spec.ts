@@ -4,8 +4,9 @@ import { test, expect, type APIRequestContext, type Page } from "@playwright/tes
 // filter, and a title with more than one version offers a Version picker
 // whose pick is what the watch page plays. V721 (B771): two copies of an
 // episode are one episode with two versions. The seed (`just
-// compat-dioxus-full`) adds "Stereo Film (2009)" with a `- 3D.HSBS` edition
-// and a second copy of Playwright Show S01E02 under `Season 1/`.
+// compat-dioxus-full`) adds "Stereo Film (2009)" with a `- 3D.HSBS` edition,
+// a lone full side-by-side "Stereo Wide (2011)" (V920) and a second copy of
+// Playwright Show S01E02 under `Season 1/`.
 
 const PHAROS_URL = process.env.PHAROS_URL ?? "http://127.0.0.1:8096";
 const TEST_USER = process.env.PHAROS_TEST_USER ?? "playwright";
@@ -79,6 +80,10 @@ test.describe("versions and 3D (spec 022)", () => {
         timeout: 20_000,
       })
       .not.toBe("");
+    // The half side-by-side edition plays as one eye (V920).
+    await expect(page.locator(".pharos-video-frame")).toHaveAttribute("data-packing", "hsbs", {
+      timeout: 20_000,
+    });
   });
 
   test("the 3D filter keeps a library to its 3D titles and badges them", async ({
@@ -91,9 +96,46 @@ test.describe("versions and 3D (spec 022)", () => {
     await expect(filter).toBeVisible({ timeout: 15_000 });
     await filter.selectOption({ label: "3D only" });
     const tiles = page.locator("ul.pharos-grid .pharos-poster");
-    await expect(tiles).toHaveCount(1, { timeout: 15_000 });
-    await expect(tiles.first()).toContainText("Stereo Film");
-    await expect(tiles.first().locator(".pharos-badge-3d")).toHaveText("3D");
+    await expect(tiles).toHaveCount(2, { timeout: 15_000 });
+    await expect(tiles.filter({ hasText: "Stereo Film" })).toHaveCount(1);
+    await expect(tiles.locator(".pharos-badge-3d")).toHaveText(["3D", "3D"]);
+  });
+
+  // V920 (B960): a packed version on a flat screen shows one eye at the eye's
+  // shape, until "3D: both eyes" is picked.
+  test("a full side-by-side film plays as one eye", async ({ page, request }) => {
+    await signIn(page, request);
+    await openFromSearch(page, "Stereo Wide", "Stereo Wide");
+    await page.getByRole("link", { name: /^(Play|Resume)$/ }).click();
+    const frame = page.locator(".pharos-video-frame");
+    await expect(frame).toHaveAttribute("data-packing", "fsbs", { timeout: 20_000 });
+    const video = page.locator("#pharos-video");
+    await expect.poll(() => video.evaluate((v: HTMLVideoElement) => v.videoWidth), {
+      timeout: 20_000,
+    }).toBeGreaterThan(0);
+    const box = () =>
+      video.evaluate((v: HTMLVideoElement) => ({
+        laidW: v.offsetWidth,
+        laidH: v.offsetHeight,
+        drawnW: v.getBoundingClientRect().width,
+        frameW: v.videoWidth,
+        frameH: v.videoHeight,
+      }));
+    // Laid out at one eye's shape, drawn twice as wide and clipped to half.
+    await expect.poll(async () => {
+      const b = await box();
+      // A full packing's eye is half the frame's width.
+      const eye = b.frameW / 2 / b.frameH;
+      return Math.abs(b.laidW / b.laidH - eye) < 0.02 && Math.abs(b.drawnW - 2 * b.laidW) < 2;
+    }, { timeout: 10_000 }).toBe(true);
+
+    await page.locator(".pharos-player").hover();
+    await page.getByRole("combobox", { name: "3D view" }).selectOption("both-eyes");
+    await expect(frame).not.toHaveAttribute("data-packing", /.*/);
+    // Kept on this device only (V922).
+    expect(
+      await page.evaluate(() => localStorage.getItem("pharos.player.stereo")),
+      ).toBe("both-eyes");
   });
 
   test("two copies of an episode are one episode with two versions", async ({
