@@ -43,14 +43,15 @@ use crate::online_enrich::{
     apply_enrichment, download_and_cache_art, EnrichedMetadata, OnlineEnricher, RemoteArt,
     TextsFetch,
 };
+use crate::series_identity::{log_series_match, record_series_match, SeriesMatchOutcome};
 use crate::state::Stores;
 use crate::tmdb::TmdbEnricher;
 use crate::tvdb::{ReqwestTransport, TvdbEnricher};
 use pharos_cache::image_cache::ImageRole;
 use pharos_cache::ImageCache;
 use pharos_core::{
-    match_best, ArtworkRole, DomainResult, GenreStore, LocalizedText, MediaItem, MediaKind,
-    MediaStore, MetadataTranslationStore, PersonStore, PreferenceStore, ProviderIds,
+    match_decide, ArtworkRole, DomainResult, GenreStore, LocalizedText, MatchDecision, MediaItem,
+    MediaKind, MediaStore, MetadataTranslationStore, PersonStore, PreferenceStore, ProviderIds,
     SeriesMatchCandidate, SeriesMetadata, SeriesMetadataStore, TranslationGap, TranslationOwner,
 };
 use pharos_scanner::FilenameProvider;
@@ -1113,11 +1114,10 @@ async fn resolve<E: OnlineEnricher>(
     let (external_id, source, confidence) = if let Some(id) = nfo_id {
         (id, "nfo_id", None)
     } else {
-        let candidates = {
-            let _permit = BgPermit::acquire(bg_io).await;
-            enricher.search(kind, title, year).await
-        };
-        match match_best(title, year, &candidates, cfg.match_min_confidence) {
+        match search_decide(enricher, kind, title, year, bg_io, cfg)
+            .await
+            .chosen
+        {
             Some(o) => (o.id, "search", Some(o.confidence)),
             None => return Resolved::NoMatch,
         }
@@ -1141,6 +1141,23 @@ async fn resolve<E: OnlineEnricher>(
             confidence,
         },
     }
+}
+
+/// Search `enricher` and decide among its candidates with
+/// [`pharos_core::match_decide`].
+async fn search_decide<E: OnlineEnricher>(
+    enricher: &E,
+    kind: MediaKind,
+    title: &str,
+    year: Option<u32>,
+    bg_io: &Arc<Semaphore>,
+    cfg: &MetadataConfig,
+) -> MatchDecision {
+    let candidates = {
+        let _permit = BgPermit::acquire(bg_io).await;
+        enricher.search(kind, title, year).await
+    };
+    match_decide(title, year, &candidates, cfg.match_min_confidence)
 }
 
 /// Insert `art` into `chosen` keyed by its role. When a role is already
@@ -1558,11 +1575,11 @@ where
     // A provider BLIP is not a provider saying no. If any attempt was
     // transient we leave the row untouched for the next pass rather than
     // freezing the show as `none` for the whole TTL.
-    let mut transient = false;
+    let mut transient = None;
     if let Some(tv) = providers.tvdb {
         match resolve_series(tv, "tvdb", bg_io, cache, cfg, &cand).await {
             SeriesAttempt::Hit(h) => outcome = Some(h),
-            SeriesAttempt::Transient => transient = true,
+            SeriesAttempt::Transient(d) => transient = Some(d),
             SeriesAttempt::NoMatch => {}
         }
     }
@@ -1574,13 +1591,23 @@ where
                     outcome = Some(h);
                     fell_back = true;
                 }
-                SeriesAttempt::Transient => transient = true,
+                SeriesAttempt::Transient(d) => transient = Some(d),
                 SeriesAttempt::NoMatch => {}
             }
         }
     }
-    if outcome.is_none() && transient {
+    // One count per show, with the final outcome over every provider asked
+    // (a TVDB miss then a TMDB hit is one `matched`).
+    if let Some(hit) = &outcome {
+        record_series_match(
+            SeriesMatchOutcome::of(&hit.decision),
+            hit.decision.decided_by,
+        );
+    } else if let Some(d) = &transient {
+        record_series_match(SeriesMatchOutcome::Transient, d.decided_by);
         return Ok(false);
+    } else {
+        record_series_match(SeriesMatchOutcome::NoMatch, None);
     }
     let Some(hit) = outcome else {
         // Every configured provider searched and found nothing over the
@@ -2026,6 +2053,7 @@ pub(crate) fn adopt_default_text(
 
 /// One provider's answer for a show, with its artwork already cached.
 struct SeriesHit {
+    decision: MatchDecision,
     provider: &'static str,
     external_id: String,
     confidence: Option<f32>,
@@ -2040,7 +2068,7 @@ struct SeriesHit {
 enum SeriesAttempt {
     Hit(Box<SeriesHit>),
     NoMatch,
-    Transient,
+    Transient(MatchDecision),
 }
 
 /// Search `enricher` for `cand` and, on a confident hit, cache the show's
@@ -2053,34 +2081,39 @@ async fn resolve_series<E: OnlineEnricher>(
     cfg: &MetadataConfig,
     cand: &SeriesMatchCandidate,
 ) -> SeriesAttempt {
-    // Reuse the item resolver: kind=Episode + season/episode=None routes to the
-    // provider's SERIES-level search+fetch (TvdbEnricher: search_series →
-    // get_series; TmdbEnricher: search_tv → tv_detail). No nfo id for a
-    // synthesised show, so it always searches.
-    let resolved = resolve(
+    // kind=Episode + season/episode=None routes to the provider's SERIES-level
+    // search+fetch (TvdbEnricher: search_series → get_series; TmdbEnricher:
+    // search_tv → tv_detail). No nfo id for a synthesised show, so it always
+    // searches.
+    let decision = search_decide(
         enricher,
         MediaKind::Episode,
-        provider,
         &cand.series_name,
         cand.series_year,
-        None,
-        None,
-        None,
-        &ProviderIds::default(),
         bg_io,
         cfg,
     )
     .await;
-    let (external_id, confidence, enriched) = match resolved {
-        Resolved::NoMatch => return SeriesAttempt::NoMatch,
-        Resolved::Transient { .. } => return SeriesAttempt::Transient,
-        Resolved::Hit {
-            external_id,
-            confidence,
-            enriched,
-            ..
-        } => (external_id, confidence, *enriched),
+    log_series_match(
+        provider,
+        &cand.series_key,
+        &cand.series_name,
+        cand.series_year,
+        &decision,
+    );
+    let Some(chosen) = decision.chosen.clone() else {
+        return SeriesAttempt::NoMatch;
     };
+    let enriched = {
+        let _permit = BgPermit::acquire(bg_io).await;
+        enricher
+            .fetch(MediaKind::Episode, &chosen.id, None, None, None)
+            .await
+    };
+    let Some(enriched) = enriched else {
+        return SeriesAttempt::Transient(decision);
+    };
+    let (external_id, confidence) = (chosen.id, Some(chosen.confidence));
     let poster_locator = cache_series_art(
         cache,
         enricher,
@@ -2102,6 +2135,7 @@ async fn resolve_series<E: OnlineEnricher>(
     )
     .await;
     SeriesAttempt::Hit(Box::new(SeriesHit {
+        decision,
         provider,
         external_id,
         confidence,
@@ -4226,5 +4260,181 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(show.len(), 1);
+    }
+
+    /// Spec 033 — a log buffer for the decision lines. Each nextest test runs
+    /// in its own process, so a thread-scoped subscriber sees every callsite.
+    #[derive(Clone, Default)]
+    struct LogBuf(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogBuf {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuf {
+        type Writer = LogBuf;
+        fn make_writer(&'a self) -> LogBuf {
+            self.clone()
+        }
+    }
+
+    impl LogBuf {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+    }
+
+    fn log_capture() -> (LogBuf, tracing::subscriber::DefaultGuard) {
+        let buf = LogBuf::default();
+        let sub = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+        (buf, tracing::subscriber::set_default(sub))
+    }
+
+    /// Counter value for `name` with exactly these `labels` (0 when absent).
+    fn counter_value(
+        snap: &pharos_test_metrics::CumulativeSnapshotter,
+        name: &str,
+        labels: &[(&str, &str)],
+    ) -> u64 {
+        use metrics_util::debugging::DebugValue;
+        snap.snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(k, ..)| k.key().name() == name)
+            .filter(|(k, ..)| {
+                labels
+                    .iter()
+                    .all(|(n, v)| k.key().labels().any(|l| l.key() == *n && l.value() == *v))
+            })
+            .map(|(.., v)| match v {
+                DebugValue::Counter(c) => c,
+                _ => 0,
+            })
+            .sum()
+    }
+
+    async fn put_bare_episode(store: &SqliteStore, id: u64, series: &str, folder: &str) {
+        let item = MediaItem {
+            id,
+            path: format!("{folder}/{series} (2003) - S01E{id:02}.mkv").into(),
+            title: format!("{series} ep {id}"),
+            kind: MediaKind::Episode,
+            series: Some(pharos_core::SeriesInfo {
+                series_name: series.into(),
+                season_number: Some(1),
+                episode_number: Some(id as u32),
+                series_folder: Some(folder.into()),
+                series_year: None,
+            }),
+            ..MediaItem::default()
+        };
+        store.put(item).await.unwrap();
+    }
+
+    /// Spec 033 B930 — a bare `Battlestar Galactica` folder searches with no
+    /// year, two shows carry the name, and the provider's order picks the
+    /// 1978 one. The decision is counted as ambiguous, decided by provider
+    /// order, and logged with both candidates.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_same_named_show_decided_by_provider_order_is_counted_and_logged() {
+        use metrics_util::debugging::DebuggingRecorder;
+        let recorder = DebuggingRecorder::new();
+        let snap = pharos_test_metrics::snapshotter(&recorder);
+        let _metrics = metrics::set_default_local_recorder(&recorder);
+        let (logs, _log) = log_capture();
+
+        let s = store().await;
+        put_bare_episode(&s, 1, "Battlestar Galactica", "/tv/Battlestar Galactica").await;
+        let (_td, cache) = cache();
+        let tvdb = FakeEnricher::tvdb()
+            .with_search(vec![
+                ("71173", "Battlestar Galactica", Some(1978)),
+                ("73545", "Battlestar Galactica", Some(2003)),
+            ])
+            .with_detail(enriched_overview("A rag-tag fleet."));
+
+        enrich_series_pass(
+            &s,
+            &sem(4),
+            &cache,
+            Some(&tvdb),
+            None::<&FakeEnricher>,
+            &MetadataConfig::default(),
+            NOW,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            counter_value(
+                &snap,
+                "pharos_series_match_total",
+                &[("outcome", "ambiguous"), ("decided_by", "provider_order")]
+            ),
+            1
+        );
+        assert_eq!(
+            counter_value(&snap, "pharos_series_match_total", &[]),
+            1,
+            "one count per show"
+        );
+        let text = logs.text();
+        let line = text
+            .lines()
+            .find(|l| l.contains("series match"))
+            .unwrap_or_else(|| panic!("no decision line in {text}"));
+        for want in [
+            "query=\"Battlestar Galactica\"",
+            "chosen=\"71173\"",
+            "runner_up=\"73545\"",
+            "margin=0.0",
+            "decided_by=\"provider_order\"",
+            "outcome=\"ambiguous\"",
+        ] {
+            assert!(line.contains(want), "{want} missing from {line}");
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_show_with_no_candidate_is_counted_as_no_match() {
+        use metrics_util::debugging::DebuggingRecorder;
+        let recorder = DebuggingRecorder::new();
+        let snap = pharos_test_metrics::snapshotter(&recorder);
+        let _metrics = metrics::set_default_local_recorder(&recorder);
+        let s = store().await;
+        put_episode(&s, 1, "Obscure Show", "/tv/Obscure Show").await;
+        let (_td, cache) = cache();
+        let tvdb = FakeEnricher::tvdb().with_search(vec![("1", "Something Else", None)]);
+        let tmdb = FakeEnricher::tmdb();
+        enrich_series_pass(
+            &s,
+            &sem(4),
+            &cache,
+            Some(&tvdb),
+            Some(&tmdb),
+            &MetadataConfig::default(),
+            NOW,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            counter_value(
+                &snap,
+                "pharos_series_match_total",
+                &[("outcome", "no_match"), ("decided_by", "none")]
+            ),
+            1,
+            "two providers asked, one show counted"
+        );
     }
 }
