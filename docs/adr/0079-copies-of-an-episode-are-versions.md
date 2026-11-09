@@ -1,6 +1,6 @@
 # ADR-0079: Copies of one episode are versions of one item
 
-- **Status:** Accepted
+- **Status:** Accepted; superseded in part by ADR-0080 (films are grouped)
 - **Date:** 2026-11-08T12:00:00Z
 - **Deciders:** Alison Jenkins
 
