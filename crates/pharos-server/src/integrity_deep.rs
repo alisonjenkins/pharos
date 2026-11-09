@@ -163,7 +163,7 @@ impl DeepChecks {
                 Some(e.to_string()),
             ),
         };
-        metrics::counter!("pharos_media_deep_check_total", "outcome" => state.label()).increment(1);
+        count_outcome(state);
         match state {
             DeepState::Damaged => tracing::warn!(
                 item = id,
@@ -207,6 +207,11 @@ impl DeepChecks {
             }
         }
     }
+}
+
+/// One finished check, by outcome (`clean`, `damaged`, `failed`).
+fn count_outcome(state: DeepState) {
+    metrics::counter!("pharos_media_deep_check_total", "outcome" => state.label()).increment(1);
 }
 
 fn now_secs() -> i64 {
@@ -302,5 +307,29 @@ mod tests {
             "nothing has finished, so nothing may be dropped"
         );
         drop(hold);
+    }
+
+    #[test]
+    fn a_finished_check_is_counted_by_outcome() {
+        use metrics_util::debugging::DebuggingRecorder;
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = pharos_test_metrics::snapshotter(&recorder);
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        count_outcome(DeepState::Damaged);
+        count_outcome(DeepState::Failed);
+        let seen: Vec<String> = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(k, ..)| k.key().name() == "pharos_media_deep_check_total")
+            .filter_map(|(k, ..)| {
+                k.key()
+                    .labels()
+                    .find(|l| l.key() == "outcome")
+                    .map(|l| l.value().to_string())
+            })
+            .collect();
+        assert!(seen.contains(&"damaged".to_string()), "{seen:?}");
+        assert!(seen.contains(&"failed".to_string()), "{seen:?}");
     }
 }
