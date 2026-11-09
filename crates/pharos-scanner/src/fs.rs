@@ -4317,6 +4317,23 @@ const RELEASE_PROMO_STEMS: &[&str] = &["ETRG", "RARBG", "YIFY", "YTS", "YTS.AG",
 static SAMPLE_STEM_RE: std::sync::LazyLock<Option<regex::Regex>> =
     std::sync::LazyLock::new(|| regex::Regex::new(r"(?i)(?:^|[ ._\-(\[])sample[)\]]?$").ok());
 
+/// Jellyfin's marker file: a folder holding `.ignore` is left out of the
+/// library with everything beneath it, so a `To Sort/` of unsorted rips
+/// stays off the shelves until it is sorted.
+pub const IGNORE_MARKER: &str = ".ignore";
+
+fn is_ignored_dir(dir: &Path) -> bool {
+    dir.join(IGNORE_MARKER).is_file()
+}
+
+/// Whether `path` sits in a folder under `root` that holds [`IGNORE_MARKER`].
+pub fn in_ignored_folder(path: &Path, root: &Path) -> bool {
+    path.ancestors()
+        .skip(1)
+        .take_while(|p| p.starts_with(root))
+        .any(is_ignored_dir)
+}
+
 /// Result of a filesystem [`walk`]: the recognised media file paths, plus a
 /// count of entries walkdir could not read this pass. A non-zero `errors`
 /// means the listing is *incomplete* — the caller must not treat a missing
@@ -4329,62 +4346,81 @@ struct WalkOutcome {
 /// Recursive walk inside `spawn_blocking`. Returns paths of files whose
 /// lowercased extension is in `exts`, plus how many entries were unreadable.
 async fn walk(root: PathBuf, exts: HashSet<String>) -> DomainResult<WalkOutcome> {
-    tokio::task::spawn_blocking(move || -> DomainResult<WalkOutcome> {
-        let mut out = Vec::new();
-        let mut errors = 0usize;
-        for entry in walkdir::WalkDir::new(&root).follow_links(false) {
-            // V6 — a per-entry walk error (a file an *arr import is moving
-            // mid-scan → EPERM/ENOENT on one path, or a subtree we lack
-            // permission to descend into) must never abort the whole library
-            // scan. walkdir keeps iterating after an errored entry, so log it
-            // and skip just that one; every readable file still gets indexed.
-            // NFS readdir returns DT_UNKNOWN, so walkdir stats each entry —
-            // a file being replaced mid-scan surfaces here, not just at probe.
-            let e = match entry {
-                Ok(e) => e,
-                Err(err) => {
-                    errors += 1;
-                    tracing::warn!(
-                        path = ?err.path(),
-                        error = %err,
-                        "walk: skipping unreadable entry",
-                    );
+    let (outcome, ignored_folders) =
+        tokio::task::spawn_blocking(move || -> DomainResult<(WalkOutcome, u64)> {
+            let mut out = Vec::new();
+            let mut errors = 0usize;
+            let mut ignored_folders = 0u64;
+            let entries = walkdir::WalkDir::new(&root)
+                .follow_links(false)
+                .into_iter()
+                .filter_entry(|e| {
+                    let ignored = e.file_type().is_dir() && is_ignored_dir(e.path());
+                    if ignored {
+                        tracing::info!(
+                            path = %e.path().display(),
+                            "walk: folder holds .ignore; leaving it out of the library"
+                        );
+                        ignored_folders += 1;
+                    }
+                    !ignored
+                });
+            for entry in entries {
+                // V6 — a per-entry walk error (a file an *arr import is moving
+                // mid-scan → EPERM/ENOENT on one path, or a subtree we lack
+                // permission to descend into) must never abort the whole library
+                // scan. walkdir keeps iterating after an errored entry, so log it
+                // and skip just that one; every readable file still gets indexed.
+                // NFS readdir returns DT_UNKNOWN, so walkdir stats each entry —
+                // a file being replaced mid-scan surfaces here, not just at probe.
+                let e = match entry {
+                    Ok(e) => e,
+                    Err(err) => {
+                        errors += 1;
+                        tracing::warn!(
+                            path = ?err.path(),
+                            error = %err,
+                            "walk: skipping unreadable entry",
+                        );
+                        continue;
+                    }
+                };
+                if !e.file_type().is_file() {
                     continue;
                 }
-            };
-            if !e.file_type().is_file() {
-                continue;
-            }
-            if is_sidecar_noise(e.path()) {
-                continue;
-            }
-            if is_release_promo(e.path()) {
-                tracing::debug!(path = %e.path().display(), "walk: skipping a release group's promo clip");
-                metrics::counter!("pharos_scan_skipped_files_total", "reason" => "promo")
-                    .increment(1);
-                continue;
-            }
-            if is_release_sample(e.path().strip_prefix(&root).unwrap_or(e.path())) {
-                tracing::debug!(path = %e.path().display(), "walk: skipping a release sample");
-                metrics::counter!("pharos_scan_skipped_files_total", "reason" => "sample")
-                    .increment(1);
-                continue;
-            }
-            let lower = e
-                .path()
-                .extension()
-                .and_then(|s| s.to_str())
-                .map(|s| s.to_ascii_lowercase());
-            if let Some(ext) = lower {
-                if exts.contains(&ext) {
-                    out.push(e.into_path());
+                if is_sidecar_noise(e.path()) {
+                    continue;
+                }
+                if is_release_promo(e.path()) {
+                    tracing::debug!(path = %e.path().display(), "walk: skipping a release group's promo clip");
+                    metrics::counter!("pharos_scan_skipped_files_total", "reason" => "promo")
+                        .increment(1);
+                    continue;
+                }
+                if is_release_sample(e.path().strip_prefix(&root).unwrap_or(e.path())) {
+                    tracing::debug!(path = %e.path().display(), "walk: skipping a release sample");
+                    metrics::counter!("pharos_scan_skipped_files_total", "reason" => "sample")
+                        .increment(1);
+                    continue;
+                }
+                let lower = e
+                    .path()
+                    .extension()
+                    .and_then(|s| s.to_str())
+                    .map(|s| s.to_ascii_lowercase());
+                if let Some(ext) = lower {
+                    if exts.contains(&ext) {
+                        out.push(e.into_path());
+                    }
                 }
             }
-        }
-        Ok(WalkOutcome { files: out, errors })
-    })
-    .await
-    .map_err(|e| DomainError::Backend(format!("walk join: {e}")))?
+            Ok((WalkOutcome { files: out, errors }, ignored_folders))
+        })
+        .await
+        .map_err(|e| DomainError::Backend(format!("walk join: {e}")))??;
+    // Counted out here: the walk's blocking thread has no task-local recorder.
+    metrics::counter!("pharos_scan_ignored_folders_total").increment(ignored_folders);
+    Ok(outcome)
 }
 
 #[cfg(test)]
@@ -10278,5 +10314,57 @@ mod tests {
             "no tvshow.nfo, no season folder"
         );
         assert_eq!(find("Heat (1995)").kind, MediaKind::Movie);
+    }
+
+    /// B1010 / V969 — a folder holding Jellyfin's `.ignore` is left out of
+    /// the library: `To Sort/` held unsorted disc rips listed as films named
+    /// `title_t00`. Marking it after a scan sweeps the rows it gave.
+    #[tokio::test]
+    async fn a_folder_holding_dot_ignore_is_left_out() {
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = pharos_test_metrics::snapshotter(&recorder);
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        let td = TempDir::new().unwrap();
+        touch(td.path(), "To Sort/SG1_S9V2_E/title_t00.mkv").await;
+        touch(td.path(), "Movies/Heat (1995)/Heat (1995).mkv").await;
+        let store = MemStore::default();
+        let s = FsScanner::new(FakeProber::default());
+        let first = s.scan_into(td.path(), &store).await.unwrap();
+        assert_eq!(first.added.len(), 2);
+
+        touch(td.path(), "To Sort/.ignore").await;
+        let second = s.scan_into(td.path(), &store).await.unwrap();
+        let rip = stable_id(&td.path().join("To Sort/SG1_S9V2_E/title_t00.mkv"));
+        assert_eq!(second.removed, [rip], "the marked folder's row is swept");
+        assert!(store
+            .get(stable_id(
+                &td.path().join("Movies/Heat (1995)/Heat (1995).mkv")
+            ))
+            .await
+            .is_ok());
+        assert!(in_ignored_folder(
+            &td.path().join("To Sort/SG1_S9V2_E/title_t00.mkv"),
+            td.path()
+        ));
+        assert!(!in_ignored_folder(
+            &td.path().join("Movies/Heat (1995)/Heat (1995).mkv"),
+            td.path()
+        ));
+
+        let counted: u64 = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter_map(|(ck, _, _, v)| match v {
+                metrics_util::debugging::DebugValue::Counter(n)
+                    if ck.key().name() == "pharos_scan_ignored_folders_total" =>
+                {
+                    Some(n)
+                }
+                _ => None,
+            })
+            .sum();
+        assert_eq!(counted, 1, "one marked folder on the second walk");
     }
 }
