@@ -240,6 +240,13 @@ pub enum ServerMsg {
         member_id: MemberId,
         own_tracks: bool,
     },
+    /// `by` kept watching the end of queue entry `playlist_item_id`: no
+    /// member's "Up next" plays the next item from it by itself (B1027).
+    /// Native only.
+    NextHeld {
+        playlist_item_id: String,
+        by: MemberId,
+    },
     LeaderChange {
         leader: MemberId,
     },
@@ -317,6 +324,7 @@ impl ServerMsg {
             ServerMsg::Seek { .. } => "seek",
             ServerMsg::Tracks { .. } => "tracks",
             ServerMsg::MemberTracks { .. } => "member_tracks",
+            ServerMsg::NextHeld { .. } => "next_held",
             ServerMsg::LeaderChange { .. } => "leader_change",
             ServerMsg::MemberJoined { .. } => "member_joined",
             ServerMsg::MemberLeft { .. } => "member_left",
