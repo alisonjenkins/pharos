@@ -294,7 +294,8 @@ async fn detail_carries_the_cast_and_a_series_ranks_its_regulars() {
 /// A person's page as the UI reads it from a cast credit: the credit names
 /// the person, and their page lists the film and the show's episodes they act
 /// in, with who they play, leaving out what they only directed. An id that
-/// names nobody is refused as not found.
+/// names nobody is refused as not found. What is kept about them (their
+/// biography, dates and ids) comes with the page.
 /// Disarm check: with `write_cast` not setting `personId`, `lead.person` is
 /// `None` and the page cannot be asked for.
 #[actix_web::test]
@@ -334,8 +335,31 @@ async fn a_cast_credit_opens_the_page_of_what_that_person_appears_in() {
     let lead = episode.cast.first().expect("lead credit");
     let id = lead.person.expect("the credit names the person");
 
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let kept = pharos_core::PersonDetails {
+        biography: Some("Born by the sea.".into()),
+        birth_date: Some("1956-07-09".into()),
+        imdb_id: Some("nm0000158".into()),
+        wikidata_id: Some("Q2263".into()),
+        fetched_at: i64::try_from(now).unwrap(),
+        ..pharos_core::PersonDetails::default()
+    };
+    fx.state
+        .stores
+        .put_person_details(&pharos_core::person_wire_id("Lead Actor"), &kept)
+        .await
+        .unwrap();
+
     let page = api.person(&call, id).await.expect("person");
     assert_eq!(page.name, "Lead Actor");
+    assert_eq!(page.biography.as_deref(), Some("Born by the sea."));
+    assert_eq!(page.birth_date.as_deref(), Some("1956-07-09"));
+    assert_eq!(page.death_date, None, "an unknown date is not an empty one");
+    assert_eq!(page.imdb_id.as_deref(), Some("nm0000158"));
+    assert_eq!(page.wikidata_id.as_deref(), Some("Q2263"));
     assert_eq!(page.id, Some(id));
     let films: Vec<_> = page
         .films
