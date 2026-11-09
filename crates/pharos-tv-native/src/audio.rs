@@ -288,9 +288,17 @@ impl Output {
             return Ok(());
         };
         // SAFETY: `scratch` holds `frames` interleaved i16 frames.
-        let n = unsafe { stream.write(self.scratch.as_ptr().cast(), frames, 1_000_000_000) }
-            .map_err(|e| format!("aaudio write: {e}"))?;
-        self.written += i64::from(n);
+        // ndk 0.9 reads any non-zero result as an error, so a write of n
+        // frames comes back as `Err(__Unknown(n))`; a real error is negative.
+        let n = match unsafe { stream.write(self.scratch.as_ptr().cast(), frames, 1_000_000_000) }
+        {
+            Ok(n) => i64::from(n),
+            Err(e) => match i32::from(e) {
+                n if n >= 0 => i64::from(n),
+                _ => return Err(format!("aaudio write: {e}")),
+            },
+        };
+        self.written += n;
         self.publish_clock();
         Ok(())
     }
