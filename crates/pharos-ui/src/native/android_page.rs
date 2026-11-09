@@ -1580,8 +1580,9 @@ addEventListener("popstate", (e) => {
 window.__pharosSend = send;
 // Media events do not bubble, but a capturing listener on the document
 // hears every media element's. `timeupdate` stops here: Dioxus would hold
-// the page for each of its four a second, so Rust hears one a second as a
-// tick instead.
+// the page for each of its four a second, so Rust hears it as a tick: once
+// a second for a video, four times for a song, whose karaoke wipe and line
+// changes need them (B1030).
 const ticked = {};
 const media = (e) => {
   const v = e.target;
@@ -1590,7 +1591,8 @@ const media = (e) => {
   if (e.type === 'timeupdate') {
     e.stopPropagation();
     const now = performance.now();
-    if (now - (ticked[v.id] || 0) < 1000) return;
+    const every = v instanceof HTMLVideoElement ? __VIDEO_TICK_MS__ : __AUDIO_TICK_MS__;
+    if (now - (ticked[v.id] || 0) < every) return;
     ticked[v.id] = now;
     tick = true;
   }
@@ -1628,8 +1630,12 @@ fn install_bridge() {
             js_str(&start)
         ))
         .await;
-        let mut bridge = document::eval(BRIDGE_JS);
-        log::info!("pharos: bridge installed");
+        let mut bridge = document::eval(&tv_page::bridge_script(BRIDGE_JS));
+        log::info!(
+            "pharos: bridge installed video_tick_ms={} audio_tick_ms={}",
+            tv_page::VIDEO_TICK_MS,
+            tv_page::AUDIO_TICK_MS
+        );
         loop {
             match bridge.recv::<serde_json::Value>().await {
                 Ok(value) => match tv_page::parse_bridge(&value) {
