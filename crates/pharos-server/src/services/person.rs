@@ -172,6 +172,32 @@ async fn load(state: &AppState, user: &User, wire_id: &str) -> Result<PersonPage
     })
 }
 
+/// Whether the person `wire_id` acts in something `user` may see: what
+/// decides that their page is not withheld.
+pub async fn acts_in_sight(
+    state: &AppState,
+    user: &User,
+    wire_id: &str,
+) -> Result<bool, pharos_core::DomainError> {
+    let credits = state.stores.credits_for_person(wire_id).await?;
+    let acting: std::collections::HashSet<u64> = credits
+        .iter()
+        .filter(|(_, c)| acts(c))
+        .map(|(id, _)| *id)
+        .collect();
+    if acting.is_empty() || crate::services::library::hides_nothing(&user.policy) {
+        return Ok(!acting.is_empty());
+    }
+    let mut mq = pharos_core::MediaQuery {
+        person_wire_id: Some(wire_id.to_owned()),
+        kinds: vec![MediaKind::Movie, MediaKind::Episode],
+        ..pharos_core::MediaQuery::default()
+    };
+    crate::api::jellyfin::items::apply_policy_scope(&mut mq, &user.policy, &state.parental_ratings);
+    let ids = state.stores.query_ids(&mq).await?;
+    Ok(ids.iter().any(|id| acting.contains(id)))
+}
+
 /// Whether a credit is an acting one: the page lists what they act in.
 fn acts(credit: &ItemPerson) -> bool {
     matches!(credit.kind, PersonKind::Actor | PersonKind::GuestStar)

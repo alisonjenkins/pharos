@@ -217,3 +217,64 @@ async fn the_page_carries_the_providers_details_and_keeps_them() {
     assert_eq!(outcome("no_provider_id"), 1);
     assert_eq!(outcome("not_found"), 1);
 }
+
+/// Search offers the actors whose name holds the words typed, leaving out
+/// crew and anyone who acts only in what the viewer may not see.
+/// Disarm check: with `acts_in_sight` skipped in `services::search`, the
+/// restricted viewer is offered Lead Actor.
+#[actix_web::test]
+async fn search_offers_actors_the_viewer_may_see() {
+    use pharos_server::services::search::{self, Hit};
+    let fx = seed_rich().await;
+    crate::library::seed_movies(&fx).await;
+    let credit = |name: &str, kind| PersonRef {
+        name: name.into(),
+        kind,
+        character: Some("Pilot".into()),
+        ..PersonRef::default()
+    };
+    fx.state
+        .stores
+        .link_item_people(101, &[credit("Lead Actor", PersonKind::Actor)])
+        .await
+        .unwrap();
+    fx.state
+        .stores
+        .link_item_people(
+            201,
+            &[
+                credit("Second Lead", PersonKind::Actor),
+                credit("Lead Director", PersonKind::Director),
+            ],
+        )
+        .await
+        .unwrap();
+    let user = pharos_server::services::auth::user_for_token(&fx.state.stores, &fx.user_token)
+        .await
+        .unwrap();
+    let restricted = pharos_core::User {
+        policy: UserPolicy {
+            enable_all_folders: false,
+            enabled_folders: vec![fx.lib_b_wire.clone()],
+            ..UserPolicy::default()
+        },
+        ..user.clone()
+    };
+    let people = |hits: Vec<Hit>| -> Vec<String> {
+        hits.into_iter()
+            .filter_map(|hit| match hit {
+                Hit::Person(_, p) => Some(p.name),
+                _ => None,
+            })
+            .collect()
+    };
+
+    let all = search::search(&fx.state, &user, "lead", 0).await.unwrap();
+    assert_eq!(people(all), ["Lead Actor", "Second Lead"]);
+    let some = search::search(&fx.state, &restricted, "lead", 0)
+        .await
+        .unwrap();
+    assert_eq!(people(some), ["Second Lead"]);
+    let short = search::search(&fx.state, &user, "le", 0).await.unwrap();
+    assert!(people(short).is_empty(), "two letters look for no one");
+}

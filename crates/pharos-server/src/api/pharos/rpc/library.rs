@@ -368,7 +368,7 @@ impl server::library::Handler for Library {
             .iter()
             .filter_map(|hit| match hit {
                 Hit::Stored(item) => Some(item.as_ref().clone()),
-                Hit::Group(..) => None,
+                Hit::Group(..) | Hit::Person(..) => None,
             })
             .collect();
         let page = QueryPage {
@@ -397,6 +397,9 @@ impl server::library::Handler for Library {
             match hit {
                 Hit::Group(id, dto) => {
                     write_synth_summary(items.reborrow().get(i), *id, dto, &state.image_tag_key)
+                }
+                Hit::Person(id, person) => {
+                    write_person_summary(items.reborrow().get(i), *id, person)
                 }
                 Hit::Stored(item) => write_item(
                     items.reborrow().get(i),
@@ -1309,6 +1312,22 @@ fn portrait_url(wire_id: &str, thumb_url: Option<&str>) -> Option<String> {
 /// How many of a person's shows are projected at once: a long-running guest
 /// star can be in dozens, and each projection reads the store.
 const PERSON_SHOWS_AT_ONCE: usize = 8;
+
+/// A person as a search row: their name and photo, kind `person`.
+fn write_person_summary(
+    mut summary: item_summary::Builder<'_>,
+    id: WireId,
+    person: &pharos_core::Person,
+) {
+    set_item_id(summary.reborrow().init_id(), id);
+    summary.set_kind(Kind::Person);
+    summary.set_name(person.name.as_str());
+    if let Some(url) = portrait_url(&person.wire_id, person.thumb_url.as_deref()) {
+        let mut image = summary.reborrow().init_images(1).get(0);
+        image.set_kind("Primary");
+        image.set_url(url.as_str());
+    }
+}
 
 fn credit_kind(kind: pharos_core::PersonKind) -> CreditKind {
     match kind {
