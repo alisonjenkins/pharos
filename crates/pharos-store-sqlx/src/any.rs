@@ -856,6 +856,41 @@ impl SeriesIdentityStore for AnyStore {
             AnyStore::Postgres(p) => p.delete_provider_artwork(id).await,
         }
     }
+
+    async fn all_series_overrides(&self) -> DomainResult<Vec<SeriesOverride>> {
+        match self {
+            AnyStore::Sqlite(s) => s.all_series_overrides().await,
+            AnyStore::Postgres(p) => p.all_series_overrides().await,
+        }
+    }
+
+    async fn replace_admin_override(&self, o: SeriesOverride) -> DomainResult<i64> {
+        match self {
+            AnyStore::Sqlite(s) => s.replace_admin_override(o).await,
+            AnyStore::Postgres(p) => p.replace_admin_override(o).await,
+        }
+    }
+
+    async fn delete_series_override(&self, id: i64) -> DomainResult<Option<SeriesOverride>> {
+        match self {
+            AnyStore::Sqlite(s) => s.delete_series_override(id).await,
+            AnyStore::Postgres(p) => p.delete_series_override(id).await,
+        }
+    }
+
+    async fn flagged_series_keys(&self) -> DomainResult<Vec<String>> {
+        match self {
+            AnyStore::Sqlite(s) => s.flagged_series_keys().await,
+            AnyStore::Postgres(p) => p.flagged_series_keys().await,
+        }
+    }
+
+    async fn clear_manual_matches(&self, ids: &[MediaId]) -> DomainResult<Vec<(MediaId, String)>> {
+        match self {
+            AnyStore::Sqlite(s) => s.clear_manual_matches(ids).await,
+            AnyStore::Postgres(p) => p.clear_manual_matches(ids).await,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------
