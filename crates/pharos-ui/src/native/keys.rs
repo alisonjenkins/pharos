@@ -172,6 +172,12 @@ pub fn KeyLayer(route: Route, on_palette: EventHandler) -> Element {
             if dialog_owns(key, platform::dialog_open()) {
                 return false;
             }
+            // In browser fullscreen Escape only leaves it; the next one
+            // shrinks the player (V852).
+            if key == "Escape" && platform::leave_fullscreen_on_escape() {
+                reset();
+                return true;
+            }
             let mut keys = chord.peek().clone();
             keys.push(key.to_owned());
             let typed: Vec<&str> = keys.iter().map(String::as_str).collect();

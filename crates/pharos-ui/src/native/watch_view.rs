@@ -607,6 +607,7 @@ pub fn WatchView(
                     button {
                         class: "pharos-control pharos-shrink",
                         r#type: "button",
+                        "data-key-action": "shrink",
                         aria_label: "Shrink",
                         title: "Shrink to a small window",
                         onclick: move |_| on_control.call(Control::Shrink),
