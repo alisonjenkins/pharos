@@ -358,10 +358,12 @@ mod tests {
             Route::PlaybackInfo,
             Route::Subtitles,
             Route::Prewarm,
+            Route::NativeDetail,
+            Route::Negotiate,
         ]
         .map(Route::label)
         .into();
-        assert_eq!(rt.len(), 5);
+        assert_eq!(rt.len(), 7);
     }
 
     #[test]
