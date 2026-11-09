@@ -1935,6 +1935,12 @@ fn write_version_facts(
     v.set_size_bytes(probe.size_bytes.unwrap_or_default());
     v.set_duration_ms(probe.duration_ms.unwrap_or_default());
     v.set_container(probe.container.as_deref().unwrap_or_default());
+    if let Some(area) = probe.picture_area() {
+        v.set_picture_x(area.x);
+        v.set_picture_y(area.y);
+        v.set_picture_width(area.width);
+        v.set_picture_height(area.height);
+    }
     if admin {
         v.set_path(path.to_string_lossy().as_ref());
     }
