@@ -531,6 +531,7 @@ pub fn HomeView(home: Home) -> Element {
     let empty = home.rails.is_empty()
         && home.resume.is_empty()
         && home.listening.is_empty()
+        && home.reading.is_empty()
         && home.next_up.is_empty();
     let mut rails: Vec<&HomeRail> = home.rails.iter().collect();
     rails.sort_by_key(|rail| rail_rank(rail.library.library_kind));
@@ -538,6 +539,10 @@ pub fn HomeView(home: Home) -> Element {
     let music = rail_rank(Some(LibraryKind::Music));
     let split = rails.partition_point(|rail| rail_rank(rail.library.library_kind) < music);
     let (before_music, from_music) = rails.split_at(split);
+    // Books to resume sit just before the book libraries.
+    let books = rail_rank(Some(LibraryKind::Books));
+    let split = from_music.partition_point(|rail| rail_rank(rail.library.library_kind) < books);
+    let (music_rails, from_books) = from_music.split_at(split);
     rsx! {
         div { class: "pharos-home",
             if empty {
@@ -555,7 +560,13 @@ pub fn HomeView(home: Home) -> Element {
             if !home.listening.is_empty() {
                 Rail { title: "Continue listening", items: home.listening.clone() }
             }
-            for rail in from_music {
+            for rail in music_rails {
+                LibraryRail { key: "{rail.library.id}", rail: (*rail).clone() }
+            }
+            if !home.reading.is_empty() {
+                Rail { title: "Continue reading", items: home.reading.clone(), read: true }
+            }
+            for rail in from_books {
                 LibraryRail { key: "{rail.library.id}", rail: (*rail).clone() }
             }
         }
@@ -589,7 +600,14 @@ fn rail_rank(kind: Option<LibraryKind>) -> u8 {
 
 /// A titled row of posters; `link` makes the title open the full listing.
 #[component]
-pub fn Rail(title: String, link: Option<Route>, items: Vec<Item>) -> Element {
+pub fn Rail(
+    title: String,
+    link: Option<Route>,
+    items: Vec<Item>,
+    /// Tiles open the reader, not the title page.
+    #[props(default)]
+    read: bool,
+) -> Element {
     rsx! {
         section { class: "pharos-rail",
             h2 { class: "pharos-rail-title",
@@ -600,7 +618,7 @@ pub fn Rail(title: String, link: Option<Route>, items: Vec<Item>) -> Element {
             }
             ul { class: "pharos-rail-items",
                 for item in items {
-                    li { key: "{item.id}", PosterTile { item: item.clone() } }
+                    li { key: "{item.id}", PosterTile { item: item.clone(), read } }
                 }
             }
         }
@@ -922,12 +940,22 @@ pub fn open_route(item: &Item) -> Route {
 }
 
 #[component]
-pub fn PosterTile(item: Item) -> Element {
+pub fn PosterTile(
+    item: Item,
+    /// Opens the reader, for a book part read.
+    #[props(default)]
+    read: bool,
+) -> Element {
+    let to = if read {
+        Route::Read(item.id)
+    } else {
+        open_route(&item)
+    };
     let name = display_name(&item);
     let sub = sub_lines(&item);
     let progress = progress_percent(&item);
     rsx! {
-        Link { to: open_route(&item), class: "pharos-poster",
+        Link { to, class: "pharos-poster",
             div { class: "pharos-poster-art",
                 onpointermove: move |evt| depth::tilt(&evt),
                 onpointerleave: move |evt| depth::untilt(&evt),
@@ -2213,8 +2241,10 @@ mod tests {
         next.id = ItemRef::Real(99);
         let mut song = item(ItemKind::Audio);
         song.id = ItemRef::Real(98);
+        let mut book = item(ItemKind::Book);
+        book.id = ItemRef::Real(97);
         let home = Home {
-            reading: vec![],
+            reading: vec![book],
             rails: vec![
                 rail(1, "Media", Some(LibraryKind::Mixed)),
                 rail(2, "Books", Some(LibraryKind::Books)),
@@ -2238,12 +2268,14 @@ mod tests {
             "Movies",
             "Continue listening",
             "Music",
+            "Continue reading",
             "Books",
             "Media",
         ];
         for pair in order.windows(2) {
             assert!(at(pair[0]) < at(pair[1]), "{} before {}", pair[0], pair[1]);
         }
+        assert!(html.contains(r#"href="/ui/read/97""#), "{html}");
     }
 
     #[test]
