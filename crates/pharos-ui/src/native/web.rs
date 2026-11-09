@@ -1081,7 +1081,7 @@ pub fn escape_claimed() -> bool {
 
 /// Leaves browser fullscreen when the page is in it, for an Escape the
 /// browser passed on rather than keeping (headless Chromium does): that
-/// Escape leaves fullscreen and does nothing else (V852).
+/// Escape leaves fullscreen and does nothing else (V854).
 pub fn leave_fullscreen_on_escape() -> bool {
     let Some(document) = web_sys::window().and_then(|w| w.document()) else {
         return false;
