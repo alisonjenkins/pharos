@@ -3,7 +3,7 @@
 //! title has more than one file (a 3D edition, a cut, a second rip); a new
 //! fact about a version extends [`version_label`].
 
-use pharos_client::api::{ItemRef, Version, VersionAudio};
+use pharos_client::api::{ItemRef, Stereo, Version, VersionAudio};
 
 use super::stereo::packing_label;
 
@@ -99,6 +99,21 @@ pub fn chosen_version<'a>(versions: &'a [Version], stored: Option<&str>) -> &'a 
         .map_or("", |v| v.id.as_str())
 }
 
+/// The 3D packing of the version playing: `version` as [`chosen_version`]
+/// names it (`""` is the primary).
+pub fn playing_stereo(versions: &[Version], version: &str) -> Option<Stereo> {
+    versions
+        .iter()
+        .find(|v| {
+            if version.is_empty() {
+                v.primary
+            } else {
+                v.id == version
+            }
+        })
+        .and_then(|v| v.stereo)
+}
+
 /// `4K`, `1080p`, or the height in lines; `None` when unknown. A scope or
 /// cropped frame is named by its width, so a 1920×800 film still reads 1080p.
 fn resolution(width: u32, height: u32) -> Option<String> {
@@ -176,8 +191,6 @@ fn file_size(bytes: u64) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use pharos_client::api::Stereo;
-
     use super::*;
 
     fn version(id: &str, name: &str, stereo: Option<Stereo>) -> Version {
@@ -188,6 +201,22 @@ mod tests {
             primary: id.is_empty(),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn the_playing_packing_is_the_picked_versions_or_the_primarys() {
+        let versions = [
+            version("", "", None),
+            version("3d-hsbs", "3D", Some(Stereo::HalfSideBySide)),
+        ];
+        assert_eq!(playing_stereo(&versions, ""), None);
+        assert_eq!(
+            playing_stereo(&versions, "3d-hsbs"),
+            Some(Stereo::HalfSideBySide)
+        );
+        assert_eq!(playing_stereo(&versions, "gone"), None);
+        let lone = [version("", "", Some(Stereo::FullTopAndBottom))];
+        assert_eq!(playing_stereo(&lone, ""), Some(Stereo::FullTopAndBottom));
     }
 
     #[test]
