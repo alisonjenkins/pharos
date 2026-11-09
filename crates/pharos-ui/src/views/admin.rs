@@ -4,6 +4,7 @@
 //! app (B921). Pure: the parent fetches, and these views render under
 //! `dioxus-ssr`.
 
+use crate::client::{series_item_ref, FlaggedMatch, HandFix, SplitFolder, SplitGroup};
 use crate::client::{
     ActivityEntry, AdminUser, ApiKey, BrandingConfig, DamageRange, DamagedFile, DeepCheck,
     DeviceEntry, DuplicateFilm, FilmVersion, IntegrityReport, IntegrityStatus, LibraryFolder,
@@ -1254,13 +1255,215 @@ fn ShowIdentitySection(identity: Option<Result<SeriesIdentity, String>>) -> Elem
                 None => rsx! { p { class: "pharos-loading", "Looking at the shows…" } },
                 Some(Err(e)) => rsx! { p { class: "pharos-error", "Could not read the show identity: {e}" } },
                 Some(Ok(identity)) => rsx! {
-                    p { class: "pharos-admin-identity-summary",
-                        "{identity.splits.len()} split folders · {identity.flagged.len()} matches to check · {identity.overrides.len()} hand fixes"
+                    p { class: "pharos-admin-identity-summary", "{identity_summary(&identity)}" }
+                    if !identity.splits.is_empty() {
+                        h3 { "Split folders" }
+                        p { class: "pharos-admin-identity-hint",
+                            "One folder holds files for more than one show. Each group below becomes its own show."
+                        }
+                        for f in identity.splits.iter() {
+                            SplitCard { key: "{f.folder}", folder: f.clone(), repair_mode: identity.repair_mode.clone() }
+                        }
+                    }
+                    if !identity.flagged.is_empty() {
+                        h3 { "Matches to check" }
+                        p { class: "pharos-admin-identity-hint",
+                            "The matcher chose a show but another was nearly as good."
+                        }
+                        for m in identity.flagged.iter() {
+                            FlaggedCard { key: "{m.series_key}", m: m.clone() }
+                        }
+                    }
+                    if !identity.overrides.is_empty() {
+                        h3 { "Hand fixes" }
+                        p { class: "pharos-admin-identity-hint",
+                            "Fixes made by hand, which the scanner keeps to."
+                        }
+                        for o in identity.overrides.iter() {
+                            HandFixRow { key: "{o.id}", fix: o.clone() }
+                        }
                     }
                 },
             }
         }
     }
+}
+
+#[component]
+fn SplitCard(folder: SplitFolder, repair_mode: String) -> Element {
+    let status = split_status_label(&folder, &repair_mode);
+    rsx! {
+        article {
+            class: "pharos-admin-identity-card",
+            "data-status": "{folder.status}",
+            h4 { title: "{folder.folder}", "{folder_name(&folder.folder)}" }
+            p { class: "pharos-admin-identity-status", "{status}" }
+            ul { class: "pharos-admin-identity-groups",
+                for g in folder.groups.iter() {
+                    li { key: "{g.series_key}",
+                        "{group_label(g)}"
+                        span { class: "pharos-admin-identity-count", " · {files_label(g.paths.len())}" }
+                    }
+                }
+            }
+            if !folder.moves.is_empty() {
+                details { class: "pharos-admin-identity-moves",
+                    summary { "{files_label(folder.moves.len())} still to move" }
+                    ul {
+                        for m in folder.moves.iter() {
+                            li { key: "{m.path}",
+                                span { class: "pharos-admin-integrity-path", title: "{m.path}", "{folder_name(&m.path)}" }
+                                " → {key_label(&m.to_key, m.to_year)}"
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn FlaggedCard(m: FlaggedMatch) -> Element {
+    let href =
+        series_item_ref(&m.series_id).map(|id| crate::native::route::Route::Browse(id).path());
+    let reason = flagged_reason(&m);
+    rsx! {
+        article { class: "pharos-admin-identity-card",
+            h4 {
+                match href {
+                    Some(href) => rsx! { a { href: "{href}", "{m.name}" } },
+                    None => rsx! { "{m.name}" },
+                }
+            }
+            p { class: "pharos-admin-identity-status", "{reason}" }
+            p { class: "pharos-admin-identity-facts", "{flagged_facts(&m)}" }
+        }
+    }
+}
+
+#[component]
+fn HandFixRow(fix: HandFix) -> Element {
+    rsx! {
+        article { class: "pharos-admin-identity-card",
+            h4 { title: "{fix.folder}", "{folder_name(&fix.folder)}" }
+            p { class: "pharos-admin-identity-status", "{hand_fix_words(&fix)}" }
+            p { class: "pharos-admin-identity-facts", "{hand_fix_origin(&fix)}" }
+        }
+    }
+}
+
+/// The separator between a folder and its year in a split series key.
+const KEY_YEAR_SEP: char = '\u{1f}';
+
+/// The last part of a path: a folder's own name. The full path goes in a
+/// tooltip.
+fn folder_name(path: &str) -> &str {
+    let trimmed = path.trim_end_matches('/');
+    trimmed
+        .rsplit('/')
+        .next()
+        .filter(|n| !n.is_empty())
+        .unwrap_or(path)
+}
+
+/// A series key as people say it: "Folder name (YEAR)". The key is the
+/// folder, a unit separator and the year; `year` fills in a key without one.
+fn key_label(key: &str, year: Option<u32>) -> String {
+    let (folder, from_key) = match key.split_once(KEY_YEAR_SEP) {
+        Some((folder, y)) => (folder, y.parse::<u32>().ok()),
+        None => (key, None),
+    };
+    match from_key.or(year) {
+        Some(y) => format!("{} ({y})", folder_name(folder)),
+        None => folder_name(folder).to_owned(),
+    }
+}
+
+fn group_label(g: &SplitGroup) -> String {
+    key_label(&g.series_key, g.year)
+}
+
+fn files_label(n: usize) -> String {
+    format!("{n} {}", if n == 1 { "file" } else { "files" })
+}
+
+/// `applied`, or `pending` with when the scanner will do it: after the
+/// switch to apply under `dry_run`, at the next scan under `apply`.
+fn split_status_label(folder: &SplitFolder, repair_mode: &str) -> String {
+    if folder.status == "applied" {
+        return "applied".to_owned();
+    }
+    match repair_mode {
+        "dry_run" => "pending (dry run)".to_owned(),
+        "apply" => "pending (next scan)".to_owned(),
+        _ => "pending".to_owned(),
+    }
+}
+
+fn flagged_reason(m: &FlaggedMatch) -> String {
+    match (m.runner_up_id.as_deref(), m.runner_up_score) {
+        (Some(id), Some(score)) => format!(
+            "Close call: another show ({id}) scored {score:.2}, nearly as well as the match."
+        ),
+        (Some(id), None) => format!("Close call: another show ({id}) was nearly as good."),
+        _ => "Close call between two shows.".to_owned(),
+    }
+}
+
+fn flagged_facts(m: &FlaggedMatch) -> String {
+    let mut parts = Vec::new();
+    if let (Some(p), Some(id)) = (m.provider.as_deref(), m.external_id.as_deref()) {
+        parts.push(format!("Matched to {p} {id}"));
+    }
+    if let Some(secs) = m.premiere_date {
+        parts.push(format!("premiered {}", date_label(secs)));
+    }
+    parts.join(" · ")
+}
+
+fn hand_fix_words(fix: &HandFix) -> String {
+    if fix.keeps_together {
+        return "Kept together as one show.".to_owned();
+    }
+    let target = match fix.target_name.as_deref() {
+        Some(name) => match fix.target_year {
+            Some(y) => format!("{name} ({y})"),
+            None => name.to_owned(),
+        },
+        None => key_label(&fix.target_key, fix.target_year),
+    };
+    match fix.path.as_deref() {
+        Some(path) => format!("{} goes to {target}.", folder_name(path)),
+        None => format!("The folder goes to {target}."),
+    }
+}
+
+fn hand_fix_origin(fix: &HandFix) -> String {
+    let who = match (fix.source.as_str(), fix.created_by.as_deref()) {
+        (_, Some(user)) => format!("Set by {user}"),
+        ("scanner", None) => "Set by the scanner".to_owned(),
+        _ => "Set by an admin".to_owned(),
+    };
+    format!("{who} on {}", date_label(fix.created_at))
+}
+
+fn identity_summary(i: &SeriesIdentity) -> String {
+    if i.splits.is_empty() && i.flagged.is_empty() && i.overrides.is_empty() {
+        return "Nothing needs a look.".to_owned();
+    }
+    let pending = i.splits.iter().filter(|f| f.status != "applied").count();
+    format!(
+        "{} split {} ({pending} pending) · {} to check · {} by hand",
+        i.splits.len(),
+        if i.splits.len() == 1 {
+            "folder"
+        } else {
+            "folders"
+        },
+        i.flagged.len(),
+        i.overrides.len()
+    )
 }
 
 /// No delete on purpose: the owner decides what to do with a damaged file
@@ -2916,5 +3119,121 @@ mod tests {
         assert_eq!(civil_from_days(0), (1970, 1, 1));
         assert_eq!(civil_from_days(-1), (1969, 12, 31));
         assert_eq!(civil_from_days(19_782), (2024, 2, 29));
+    }
+
+    fn identity_page() -> SeriesIdentity {
+        let key = |year: u32| format!("/tv/Cosmos{KEY_YEAR_SEP}{year}");
+        SeriesIdentity {
+            repair_mode: "dry_run".into(),
+            splits: vec![
+                SplitFolder {
+                    folder: "/tv/Cosmos".into(),
+                    status: "pending".into(),
+                    groups: vec![
+                        SplitGroup {
+                            series_key: key(1980),
+                            year: Some(1980),
+                            paths: vec!["/tv/Cosmos/a.mkv".into()],
+                        },
+                        SplitGroup {
+                            series_key: key(2014),
+                            year: Some(2014),
+                            paths: vec!["/tv/Cosmos/b.mkv".into(), "/tv/Cosmos/c.mkv".into()],
+                        },
+                    ],
+                    moves: vec![crate::client::PendingMove {
+                        path: "/tv/Cosmos/b.mkv".into(),
+                        from_key: "/tv/Cosmos".into(),
+                        from_year: None,
+                        to_key: key(2014),
+                        to_year: Some(2014),
+                    }],
+                },
+                SplitFolder {
+                    folder: "/tv/Fate".into(),
+                    status: "applied".into(),
+                    ..SplitFolder::default()
+                },
+            ],
+            flagged: vec![FlaggedMatch {
+                series_key: "Fate".into(),
+                series_id: "000000000000002a000000000000002a".into(),
+                name: "Fate".into(),
+                provider: Some("tvdb".into()),
+                external_id: Some("81".into()),
+                premiere_date: Some(1_100_000_000),
+                runner_up_id: Some("82".into()),
+                runner_up_score: Some(0.8),
+            }],
+            overrides: vec![HandFix {
+                id: 7,
+                folder: "/tv/Cosmos".into(),
+                keeps_together: true,
+                source: "admin".into(),
+                created_by: Some("ali".into()),
+                created_at: 1_700_000_000,
+                ..HandFix::default()
+            }],
+        }
+    }
+
+    #[test]
+    fn a_split_key_reads_as_folder_name_and_year_without_the_separator() {
+        let key = format!("/tv/Cosmos{KEY_YEAR_SEP}2014");
+        assert_eq!(key_label(&key, None), "Cosmos (2014)");
+        assert_eq!(key_label("/tv/Cosmos", Some(1980)), "Cosmos (1980)");
+        assert_eq!(key_label("Cosmos", None), "Cosmos");
+        assert_eq!(folder_name("/tv/Cosmos/"), "Cosmos");
+        assert_eq!(folder_name("/"), "/");
+    }
+
+    #[test]
+    fn a_pending_split_says_when_it_lands() {
+        let pending = SplitFolder {
+            status: "pending".into(),
+            ..SplitFolder::default()
+        };
+        assert_eq!(split_status_label(&pending, "dry_run"), "pending (dry run)");
+        assert_eq!(split_status_label(&pending, "apply"), "pending (next scan)");
+        let applied = SplitFolder {
+            status: "applied".into(),
+            ..SplitFolder::default()
+        };
+        assert_eq!(split_status_label(&applied, "apply"), "applied");
+    }
+
+    #[test]
+    fn the_page_lists_splits_flagged_matches_and_hand_fixes_in_words() {
+        let html = dioxus_ssr::render_element(rsx! {
+            ShowIdentitySection { identity: Some(Ok(identity_page())) }
+        });
+        assert!(
+            html.contains("Cosmos (1980)") && html.contains("Cosmos (2014)"),
+            "{html}"
+        );
+        assert!(html.contains("2 files"), "{html}");
+        assert!(
+            html.contains("pending (dry run)") && html.contains("applied"),
+            "{html}"
+        );
+        assert!(html.contains("title=\"/tv/Cosmos\""), "{html}");
+        assert!(html.contains("1 file still to move"), "{html}");
+        assert!(html.contains("href=\"/ui/browse/s42\""), "{html}");
+        assert!(html.contains("scored 0.80"), "{html}");
+        assert!(html.contains("Kept together as one show."), "{html}");
+        assert!(html.contains("Set by ali on 2023-11-14"), "{html}");
+        assert!(!html.contains('\u{1f}'), "{html}");
+    }
+
+    #[test]
+    fn an_empty_identity_says_nothing_needs_a_look() {
+        let html = dioxus_ssr::render_element(rsx! {
+            ShowIdentitySection { identity: Some(Ok(SeriesIdentity::default())) }
+        });
+        assert!(html.contains("Nothing needs a look."), "{html}");
+        let failed = dioxus_ssr::render_element(rsx! {
+            ShowIdentitySection { identity: Some(Err("status 500".to_string())) }
+        });
+        assert!(failed.contains("status 500"), "{failed}");
     }
 }

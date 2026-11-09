@@ -1028,6 +1028,19 @@ pub struct FlaggedMatch {
     pub runner_up_score: Option<f32>,
 }
 
+/// The Series item ref a show's 32-hex id names: the 63-bit hash the
+/// server repeats in both halves. `None` for any other id.
+pub fn series_item_ref(series_id: &str) -> Option<pharos_client::api::ItemRef> {
+    let hex = series_id.trim();
+    if hex.len() != 32 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let (hi, lo) = hex.split_at(16);
+    let hash = u64::from_str_radix(lo, 16).ok()?;
+    let same = u64::from_str_radix(hi, 16).ok()? == hash;
+    (same && hash != 0).then_some(pharos_client::api::ItemRef::Synth(hash))
+}
+
 /// A hand fix already on record: where files were sent, or a folder kept
 /// together.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
@@ -2823,6 +2836,20 @@ mod tests {
             "no such file"
         );
         assert_eq!(rejection(502, "").to_string(), "status 502");
+    }
+
+    #[test]
+    fn a_series_id_names_its_synth_item() {
+        use pharos_client::api::ItemRef;
+        assert_eq!(
+            series_item_ref("000000000000002a000000000000002a"),
+            Some(ItemRef::Synth(42))
+        );
+        // A library item, a halves mismatch and junk are not shows.
+        assert_eq!(series_item_ref("0000000000000000000000000000002a"), None);
+        assert_eq!(series_item_ref("000000000000002a000000000000002b"), None);
+        assert_eq!(series_item_ref("zz"), None);
+        assert_eq!(series_item_ref("+00000000000002a+00000000000002a"), None);
     }
 
     #[test]
