@@ -773,7 +773,7 @@ pub fn WatchView(
                         }
                         // The window-size controls sit together at the end of
                         // the row, smallest to largest: a small window, picture
-                        // in picture, then fullscreen (B907).
+                        // in picture, then fullscreen (B904).
                         button {
                             class: "pharos-control pharos-shrink",
                             r#type: "button",
@@ -1930,7 +1930,7 @@ mod tests {
         assert!(html.contains("Pilot"), "{html}");
     }
 
-    /// V855: Shrink sits with Picture in picture and Fullscreen at the end of
+    /// V714: Shrink sits with Picture in picture and Fullscreen at the end of
     /// the bottom row, smallest first, not alone in the top bar.
     #[test]
     fn the_window_size_controls_are_grouped_smallest_first() {
