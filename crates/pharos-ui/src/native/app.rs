@@ -3814,12 +3814,14 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
     // The API generation the latest negotiation started on.
     let negotiated_gen = use_hook(|| Rc::new(Cell::new(0u32)));
     let negotiated_at = Rc::clone(&negotiated_gen);
+    let gap_notify = Rc::clone(&notify);
     let mut playing = use_resource(move || {
         connected();
         let api = ctx.api.peek().clone();
         let grant_gen = *api_gen.peek();
         negotiated_at.set(grant_gen);
         let resume_from = Rc::clone(&resume_from);
+        let notify = Rc::clone(&gap_notify);
         let started_over = Rc::clone(&started_over);
         let asked = picks();
         let picked_here = version_pick();
@@ -3934,6 +3936,21 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
                     // the group is: this member's own resume point would land
                     // after the group's catch-up seek and carry it away (B664).
                     let group_start = together.current().and_then(|s| s.start_for(id));
+                    if let Some(gap_ms) = versions::runtime_gap_ms(&detail.versions, &version) {
+                        let ms = |id: &str| {
+                            detail.versions.iter().find(|v| v.id == id).map_or(0, |v| v.duration_ms)
+                        };
+                        let primary = detail.versions.iter().find(|v| v.primary).map_or("", |v| v.id.as_str());
+                        platform::info(&format!(
+                            "pharos: version runtime_gap item={id} version={version:?} primary_ms={} version_ms={} gap_ms={gap_ms} grouped={}",
+                            ms(primary),
+                            ms(&version),
+                            group_start.is_some()
+                        ));
+                        if group_start.is_some() {
+                            notify(versions::runtime_gap_notice(gap_ms));
+                        }
+                    }
                     let start_ms = match (resume_from.get(), group_start) {
                         (0, Some(at)) => {
                             platform::info(&format!(
