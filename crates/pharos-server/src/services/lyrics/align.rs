@@ -22,7 +22,9 @@ use super::{Lyrics, WordStamp};
 /// word times cached from an older aligner are asked for again.
 /// 2: star tokens stop words smearing across instrumental breaks.
 /// 3: lyrics timed for another cut are shifted onto the audio first (B936).
-const ALIGN_VERSION: u32 = 3;
+/// 4: answers an older aligner gave under version 3, cached with no offset,
+///    are asked for again (B1007).
+const ALIGN_VERSION: u32 = 4;
 
 /// Time alignment of a whole song can take on CPU; a worker may run up to this
 /// long before timing out.
@@ -318,8 +320,7 @@ impl Aligner {
         }
 
         let body = resp.text().await.map_err(|e| format!("body: {e}"))?;
-        let aligned = parse_answer(&body, job.lines.len())
-            .ok_or_else(|| "invalid aligner response".to_string())?;
+        let aligned = parse_answer(&body, job.lines.len())?;
         tracing::info!(
             media.id = job.id,
             lines = job.lines.len(),
@@ -438,12 +439,16 @@ impl Aligner {
 }
 
 /// Parse the aligner service's JSON response, rejecting line count mismatches.
-fn parse_answer(body: &str, n_lines: usize) -> Option<Aligned> {
+/// The error names what was wrong, e.g. serde's "missing field `offset_ms`"
+/// from an aligner older than the offset search.
+fn parse_answer(body: &str, n_lines: usize) -> Result<Aligned, String> {
     #[derive(Deserialize)]
     struct Reply {
         lines: Vec<ReplyLine>,
-        /// Absent from an aligner older than the offset search.
-        #[serde(default)]
+        /// Required: an aligner older than the offset search sends none, and
+        /// caching its answer would pin the song's words to a guess of no
+        /// offset until ALIGN_VERSION next changes (B1007). Rejecting it
+        /// fails the job, which is retried after `RETRY_AFTER`.
         offset_ms: i64,
     }
 
@@ -458,12 +463,16 @@ fn parse_answer(body: &str, n_lines: usize) -> Option<Aligned> {
         start_ms: u64,
     }
 
-    let reply: Reply = serde_json::from_str(body).ok()?;
+    let reply: Reply =
+        serde_json::from_str(body).map_err(|e| format!("invalid aligner response: {e}"))?;
     if reply.lines.len() != n_lines {
-        return None;
+        return Err(format!(
+            "invalid aligner response: {} lines for {n_lines} asked",
+            reply.lines.len()
+        ));
     }
 
-    Some(Aligned {
+    Ok(Aligned {
         lines: reply
             .lines
             .into_iter()
@@ -765,6 +774,7 @@ mod tests {
     #[test]
     fn parse_answer_validates_and_rejects_line_count_mismatch() {
         let valid_json = r#"{
+            "offset_ms": 0,
             "lines": [
                 {
                     "words": [
@@ -778,10 +788,7 @@ mod tests {
             ]
         }"#;
 
-        let parsed = parse_answer(valid_json, 2).expect("parses correctly");
-        // An aligner from before the offset search sends none.
-        assert_eq!(parsed.offset_ms, 0);
-        let parsed = parsed.lines;
+        let parsed = parse_answer(valid_json, 2).expect("parses correctly").lines;
         assert_eq!(parsed.len(), 2);
         assert_eq!(parsed[0].len(), 2);
         assert_eq!(
@@ -801,11 +808,14 @@ mod tests {
         assert!(parsed[1].is_empty());
 
         // Line count mismatch rejected.
-        assert_eq!(parse_answer(valid_json, 1), None);
-        assert_eq!(parse_answer(valid_json, 3), None);
+        assert_eq!(
+            parse_answer(valid_json, 1),
+            Err("invalid aligner response: 2 lines for 1 asked".into())
+        );
+        assert!(parse_answer(valid_json, 3).is_err());
 
         // Malformed JSON rejected.
-        assert_eq!(parse_answer("not json", 2), None);
+        assert!(parse_answer("not json", 2).is_err());
     }
     #[test]
     fn the_aligner_s_offset_is_read_and_moves_line_starts_but_never_below_zero() {
@@ -819,6 +829,13 @@ mod tests {
         };
         assert_eq!(early.shift(10_000), 7_500);
         assert_eq!(early.shift(1_000), 0);
+    }
+
+    #[test]
+    fn an_answer_from_an_aligner_without_the_offset_search_is_not_kept() {
+        let old = r#"{"lines": [{"words": [{"at": 0, "start_ms": 5}]}]}"#;
+        let err = parse_answer(old, 1).expect_err("no offset_ms");
+        assert!(err.contains("missing field `offset_ms`"), "{err}");
     }
 
     #[test]
