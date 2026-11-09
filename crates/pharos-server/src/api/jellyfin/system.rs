@@ -904,6 +904,10 @@ async fn devices_list(
             .await
             .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
         for t in tokens {
+            // A media or manage token is part of a session already listed.
+            if crate::api::pharos::rpc::is_child_token_device(&t.device_id) {
+                continue;
+            }
             // Operator-set custom name (POST /Devices/Options), else the id.
             let display_name = state
                 .stores

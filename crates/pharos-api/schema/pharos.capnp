@@ -136,6 +136,11 @@ interface Session {
   # cannot send the session cookie (025, ADR 0058). Valid only on GET/HEAD
   # media and image endpoints; expires within server-configured TTL.
   mediaToken @14 (ctx :CallContext) -> (result :MediaTokenResult);
+  # A short-lived token for the web UI's Manage pages, which call the admin
+  # endpoints of the Jellyfin API with a header (ADR 0082). Admins only: any
+  # other user is refused notPermitted. Full scope, issued as a child of this
+  # session's token, so signing out ends it; lives one hour at most.
+  manageToken @15 (ctx :CallContext) -> (result :MediaTokenResult);
   # Capability getters return a capability, never fail; a revoked session makes
   # every call on the returned capability fail with Error.kind.revoked.
   # Sessions, Queue, RemoteSources arrive with specs 013/014 (append-only).

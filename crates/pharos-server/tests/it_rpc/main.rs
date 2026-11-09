@@ -21,6 +21,7 @@ mod library;
 mod limits;
 mod login;
 mod lyrics;
+mod manage_token;
 mod media_token;
 mod mix;
 mod password;

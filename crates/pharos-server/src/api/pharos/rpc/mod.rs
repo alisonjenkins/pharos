@@ -19,6 +19,7 @@ mod playback;
 mod prefs;
 pub use prefs::MAX_PREF_VALUE_BYTES;
 mod session;
+pub use session::is_child_token_device;
 pub mod socket;
 mod telemetry;
 mod user_data;
