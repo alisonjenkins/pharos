@@ -1,6 +1,6 @@
 # 024 — Dynamic music mixes
 
-- **Status:** Slice 1 (engine + native API) in progress; slice 2 (UI) next.
+- **Status:** slices 1 and 2 implemented (audited 2026-11-09): engine and `Library.mix` (773882aa, ADR-0048), SavedMixes (f1ca3d84), UI mix bar, shelf, rule editor, queue top-up and reasons (4548a322, 6a2941de, 5829c110, native/mixes.rs); slice 3 (similar-artists source, store pushdown) not started
 - **Date:** 2026-11-04
 - **Asked by:** Alison, "an Amarok-style auto playlist generator (or better)".
 - **Ids:** B440–B444, V380–V384 (taken: B440, B441, V380–V382). ADR-0048.
