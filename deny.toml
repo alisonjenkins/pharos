@@ -102,6 +102,27 @@ ignore = [
     # them.
     "RUSTSEC-2025-0057",
     "RUSTSEC-2024-0370",
+    # RUSTSEC-2026-0459 (CVE-2026-119375) — SQLite < 3.54.0 can return
+    # uninitialised page-cache memory when it opens a database together with
+    # a crafted sibling `-wal` file of a different page size. libsqlite3-sys
+    # 0.30.1 bundles an affected SQLite (sqlx's `sqlite` feature builds the
+    # bundled source). The fix is libsqlite3-sys >= 0.39, but sqlx-sqlite
+    # 0.9.0, the latest release, pins `^0.30.1`, so `cargo update` cannot
+    # lift it and it needs an sqlx release.
+    #
+    # Ignored on REACHABILITY: the attacker has to write the database file
+    # and its `-wal` and get pharos to open them. pharos opens exactly one
+    # SQLite file, its own, at `SqliteConnectOptions::from_str(url)` in
+    # `pharos-store-sqlx/src/sqlite.rs`, with `url` always
+    # `cfg.database.url` (every `Stores::connect*` / `SqliteStore::connect`
+    # call in `pharos-server/src/main.rs`; the rest are `sqlite::memory:`
+    # in tests). It never opens a user-supplied or uploaded `.db`. Anyone who
+    # can plant a `-wal` beside that file can already rewrite the database
+    # itself, which is strictly worse than reading stale bytes. This stops
+    # holding the moment pharos opens a SQLite file from anywhere else (for
+    # example importing a Jellyfin `library.db`): then fix it first. Drop
+    # the entry when an sqlx release depends on libsqlite3-sys >= 0.39.
+    "RUSTSEC-2026-0459",
 ]
 
 [licenses]
