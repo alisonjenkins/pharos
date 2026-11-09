@@ -636,6 +636,16 @@ impl pharos_core::MetadataTranslationStore for AnyStore {
             }
         }
     }
+
+    async fn delete_translations(
+        &self,
+        owner: &pharos_core::TranslationOwner,
+    ) -> DomainResult<u64> {
+        match self {
+            AnyStore::Sqlite(s) => s.delete_translations(owner).await,
+            AnyStore::Postgres(p) => p.delete_translations(owner).await,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -784,6 +794,41 @@ impl SeriesIdentityStore for AnyStore {
         match self {
             AnyStore::Sqlite(s) => s.series_premiere_years(keys).await,
             AnyStore::Postgres(p) => p.series_premiere_years(keys).await,
+        }
+    }
+
+    async fn mark_series_reconcile(&self, series_key: &str, at: i64) -> DomainResult<u64> {
+        match self {
+            AnyStore::Sqlite(s) => s.mark_series_reconcile(series_key, at).await,
+            AnyStore::Postgres(p) => p.mark_series_reconcile(series_key, at).await,
+        }
+    }
+
+    async fn mark_reconcile_items(&self, ids: &[MediaId], at: i64) -> DomainResult<u64> {
+        match self {
+            AnyStore::Sqlite(s) => s.mark_reconcile_items(ids, at).await,
+            AnyStore::Postgres(p) => p.mark_reconcile_items(ids, at).await,
+        }
+    }
+
+    async fn series_reconcile_pending(&self, limit: i64) -> DomainResult<Vec<(MediaId, i64)>> {
+        match self {
+            AnyStore::Sqlite(s) => s.series_reconcile_pending(limit).await,
+            AnyStore::Postgres(p) => p.series_reconcile_pending(limit).await,
+        }
+    }
+
+    async fn clear_series_reconcile(&self, id: MediaId, at: i64) -> DomainResult<bool> {
+        match self {
+            AnyStore::Sqlite(s) => s.clear_series_reconcile(id, at).await,
+            AnyStore::Postgres(p) => p.clear_series_reconcile(id, at).await,
+        }
+    }
+
+    async fn readmit_series(&self, keys: &[String]) -> DomainResult<u64> {
+        match self {
+            AnyStore::Sqlite(s) => s.readmit_series(keys).await,
+            AnyStore::Postgres(p) => p.readmit_series(keys).await,
         }
     }
 }

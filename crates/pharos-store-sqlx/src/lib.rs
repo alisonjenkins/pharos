@@ -230,7 +230,7 @@ pub(crate) fn root_like_pattern(root: &str) -> String {
 
 /// Civil year (UTC) of a Unix timestamp in seconds (Howard Hinnant's
 /// `civil_from_days`).
-pub(crate) fn unix_year(secs: i64) -> Option<u32> {
+pub fn unix_year(secs: i64) -> Option<u32> {
     let z = secs.div_euclid(86_400).checked_add(719_468)?;
     let era = if z >= 0 { z } else { z.checked_sub(146_096)? } / 146_097;
     let doe = z - era * 146_097;

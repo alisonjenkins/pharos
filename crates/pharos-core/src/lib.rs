@@ -1676,9 +1676,15 @@ pub struct SeriesIdentityRow {
 /// episode-fit score.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SeriesEpisodeRow {
+    pub id: MediaId,
     pub path: String,
     pub season: Option<u32>,
     pub episode: Option<u32>,
+    /// Stored air date, unix seconds.
+    pub premiere_date: Option<i64>,
+    pub match_source: Option<String>,
+    pub match_provider: Option<String>,
+    pub match_external_id: Option<String>,
 }
 
 /// Spec 033 — one row's new identity. `series_key: None` returns the row to
@@ -1742,6 +1748,49 @@ pub trait SeriesIdentityStore: Send + Sync {
     ) -> impl std::future::Future<Output = DomainResult<std::collections::HashMap<String, u32>>> + Send
     {
         async { Ok(std::collections::HashMap::new()) }
+    }
+
+    /// Mark every non-manual episode of `series_key` for reconciliation at `at`; returns rows changed.
+    fn mark_series_reconcile(
+        &self,
+        _series_key: &str,
+        _at: i64,
+    ) -> impl std::future::Future<Output = DomainResult<u64>> + Send {
+        async { Ok(0) }
+    }
+
+    /// Mark every non-manual episode in `ids` for reconciliation at `at`; returns rows changed.
+    fn mark_reconcile_items(
+        &self,
+        _ids: &[MediaId],
+        _at: i64,
+    ) -> impl std::future::Future<Output = DomainResult<u64>> + Send {
+        async { Ok(0) }
+    }
+
+    /// Episode `(id, mark)` pairs pending reconciliation, ordered by mark then id, at most `limit`.
+    fn series_reconcile_pending(
+        &self,
+        _limit: i64,
+    ) -> impl std::future::Future<Output = DomainResult<Vec<(MediaId, i64)>>> + Send {
+        async { Ok(Vec::new()) }
+    }
+
+    /// Clear `id`'s reconciliation mark only when it still equals `at`; returns whether a row changed.
+    fn clear_series_reconcile(
+        &self,
+        _id: MediaId,
+        _at: i64,
+    ) -> impl std::future::Future<Output = DomainResult<bool>> + Send {
+        async { Ok(false) }
+    }
+
+    /// Re-admit searched or unmatched `series_metadata` rows in `keys` by clearing `metadata_refreshed_at`.
+    fn readmit_series(
+        &self,
+        _keys: &[String],
+    ) -> impl std::future::Future<Output = DomainResult<u64>> + Send {
+        async { Ok(0) }
     }
 }
 
@@ -1816,6 +1865,14 @@ pub trait MetadataTranslationStore: Send + Sync {
         missing_cutoff: i64,
         limit: i64,
     ) -> impl std::future::Future<Output = DomainResult<Vec<TranslationGap>>> + Send;
+
+    /// Delete every stored row of `owner`; returns how many.
+    fn delete_translations(
+        &self,
+        _owner: &TranslationOwner,
+    ) -> impl std::future::Future<Output = DomainResult<u64>> + Send {
+        async { Ok(0) }
+    }
 }
 
 /// What a ratings lookup is for: a stored film, or a show by its
