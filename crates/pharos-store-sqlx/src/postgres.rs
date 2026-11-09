@@ -37,7 +37,7 @@ const MEDIA_COLUMNS: &str = "id, path, title, kind, size_bytes, duration_ms, con
     video_profile, video_level, pixel_format, color_primaries, color_transfer, color_space, \
     audio_tracks_json, community_rating, critic_rating, official_rating, production_year, \
     premiere_date, overview, tagline, provider_ids, production_locations_json, trailers_json, \
-    series_folder, series_year, track_number, disc_number, release_year, \
+    series_folder, series_year, series_key, track_number, disc_number, release_year, \
     synopsis, content_rating, network, release_date, has_primary_art, \
     match_provider, match_external_id, match_source, match_confidence, metadata_refreshed_at, \
     original_language, art_version, \
@@ -668,7 +668,8 @@ impl crate::ServerConfigStore for PostgresStore {
     #[tracing::instrument(skip(self))]
     async fn distinct_series_keys(&self) -> Result<Vec<(Option<String>, String)>, StoreError> {
         let rows = sqlx::query_as::<_, (Option<String>, String)>(
-            "SELECT DISTINCT series_folder, series_name FROM media_items \
+            "SELECT DISTINCT CASE WHEN series_folder IS NULL THEN NULL \
+             ELSE COALESCE(series_key, series_folder) END, series_name FROM media_items \
              WHERE series_name IS NOT NULL",
         )
         .fetch_all(&self.pool)
@@ -684,7 +685,9 @@ impl crate::ServerConfigStore for PostgresStore {
         // which 500'd every /Items?ParentId=<season> (B19). Decode i32,
         // widen after.
         let rows = sqlx::query_as::<_, (Option<String>, String, i32)>(
-            "SELECT DISTINCT series_folder, series_name, season_number FROM media_items \
+            "SELECT DISTINCT CASE WHEN series_folder IS NULL THEN NULL \
+             ELSE COALESCE(series_key, series_folder) END, series_name, season_number \
+             FROM media_items \
              WHERE series_name IS NOT NULL AND season_number IS NOT NULL",
         )
         .fetch_all(&self.pool)
@@ -4033,6 +4036,7 @@ struct MediaRow {
     trailers_json: Option<String>,
     series_folder: Option<String>,
     series_year: Option<i32>,
+    series_key: Option<String>,
     track_number: Option<i32>,
     disc_number: Option<i32>,
     release_year: Option<i32>,
@@ -4088,11 +4092,11 @@ impl SeriesMetadataStore for PostgresStore {
         let rows: Vec<(String, String, Option<i64>)> = sqlx::query_as(
             "SELECT s.series_key, s.series_name, s.series_year \
              FROM ( \
-               SELECT COALESCE(series_folder, series_name) AS series_key, \
+               SELECT COALESCE(series_key, series_folder, series_name) AS series_key, \
                       MIN(series_name) AS series_name, MAX(series_year)::bigint AS series_year \
                FROM media_items \
                WHERE kind = 'episode' AND series_name IS NOT NULL AND series_name <> '' \
-               GROUP BY COALESCE(series_folder, series_name) \
+               GROUP BY COALESCE(series_key, series_folder, series_name) \
              ) s \
              LEFT JOIN series_metadata sm ON sm.series_key = s.series_key \
              WHERE (sm.match_source IS NULL OR sm.match_source IN ('search','none')) \
@@ -4285,6 +4289,7 @@ impl MediaRow {
             episode_number: self.episode_number.and_then(|v| u32::try_from(v).ok()),
             series_folder: self.series_folder,
             series_year: self.series_year.and_then(|v| u32::try_from(v).ok()),
+            series_key: self.series_key,
         });
         let metadata = MediaMetadata {
             community_rating: self.community_rating,

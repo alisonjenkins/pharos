@@ -289,6 +289,7 @@ async fn latest_orders_ties_by_id_and_scopes_to_kinds_and_series() {
             episode_number: Some(1),
             series_folder: Some(format!("/libA/{show}")),
             series_year: None,
+            series_key: None,
         }),
         ..MediaItem::default()
     };
@@ -479,6 +480,7 @@ async fn native_latest_agrees_with_the_jellyfin_latest_route() {
                 episode_number: Some(2),
                 series_folder: Some("/libA/Show".into()),
                 series_year: Some(2001),
+                series_key: None,
             }),
             ..pharos_core::MediaItem::default()
         })
@@ -782,6 +784,7 @@ async fn seed_shows(fx: &crate::common::Fixture) {
             episode_number: Some(ep),
             series_folder: Some(format!("/{lib}/{show}")),
             series_year: None,
+            series_key: None,
         }),
         ..MediaItem::default()
     };
@@ -1426,6 +1429,7 @@ pub(crate) async fn seed_tv_library(fx: &crate::common::Fixture) -> String {
                     episode_number: Some(ep),
                     series_folder: Some(format!("/libTV/{show}")),
                     series_year: None,
+                    series_key: None,
                 }),
                 ..MediaItem::default()
             })

@@ -106,6 +106,7 @@ fn episode(id: u64) -> MediaItem {
             episode_number: Some((id % 24) as u32),
             series_folder: Some(format!("/media/tv/Show {}", id / 24)),
             series_year: Some(2020),
+            series_key: None,
         }),
         created_at: Some(1_700_000_000 + id as i64),
         metadata: MediaMetadata::default(),

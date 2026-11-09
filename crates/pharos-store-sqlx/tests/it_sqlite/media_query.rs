@@ -44,6 +44,7 @@ fn synth_item(id: u64) -> MediaItem {
             episode_number: Some((id % 20) as u32 + 1),
             series_folder: Some(format!("/tv/show-{}", id % 10)),
             series_year: Some(2000 + (id % 25) as u32),
+            series_key: None,
         })
     } else {
         None
@@ -838,6 +839,7 @@ async fn seed_residual(s: &SqliteStore) {
             episode_number: Some(ep),
             series_folder: Some("/tv/Show".into()),
             series_year: Some(2020),
+            series_key: None,
         });
         e.path = format!("/tv/Show/Season 1/e{ep}.mkv").into();
         s.put(e).await.unwrap();

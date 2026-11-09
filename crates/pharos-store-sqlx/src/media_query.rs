@@ -530,7 +530,7 @@ fn push_series_clause(
         Some(f) => {
             params.push(Param::Text(f.to_string()));
             let p = ph(params.len());
-            clauses.push(format!("series_folder = {p}"));
+            clauses.push(format!("COALESCE(series_key, series_folder) = {p}"));
         }
         None => {
             // Legacy: no folder recorded. Match by name, and only rows that

@@ -240,7 +240,7 @@ pub fn arrange(
         match appearance.item.series.as_ref() {
             Some(series) if appearance.item.kind == MediaKind::Episode => {
                 let series_id = pharos_jellyfin_api::dto::series_id_for_key(
-                    series.series_folder.as_deref(),
+                    series.identity_folder(),
                     &series.series_name,
                 );
                 match shows.iter_mut().find(|s| s.series_id == series_id) {
@@ -337,6 +337,7 @@ mod tests {
                 episode_number: Some(number),
                 series_folder: Some(format!("/tv/{show}")),
                 series_year: None,
+                series_key: None,
             }),
             ..MediaItem::default()
         }
