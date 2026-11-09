@@ -3549,6 +3549,19 @@ mod tests {
             credits.sort_by_key(|(id, _)| *id);
             Ok(credits)
         }
+        async fn person_details(
+            &self,
+            _wire_id: &str,
+        ) -> DomainResult<Option<pharos_core::PersonDetails>> {
+            Ok(None)
+        }
+        async fn put_person_details(
+            &self,
+            _wire_id: &str,
+            _details: &pharos_core::PersonDetails,
+        ) -> DomainResult<()> {
+            Ok(())
+        }
         async fn people_needing_images(
             &self,
             limit: i64,
