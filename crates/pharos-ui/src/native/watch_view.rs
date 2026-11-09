@@ -315,6 +315,12 @@ pub(super) fn scrub_key(t: Option<Transport>, key: &Key, scrubbing: bool) -> Scr
     }
 }
 
+/// A control that moves playback itself, so an open scrub preview is
+/// dropped rather than left to seek back to its target (B907).
+fn drops_preview(control: &Control) -> bool {
+    matches!(control, Control::Seek(_))
+}
+
 /// What the viewer asked for.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Control {
@@ -593,6 +599,12 @@ pub fn WatchView(
         let Some(control) = control else {
             return;
         };
+        // Another seek (a digit, a skip) wins over an open preview: its
+        // settle timer must not seek back to the old target.
+        if SCRUB_KEYS && drops_preview(&control) {
+            let mut end_scrub = end_scrub;
+            end_scrub(scrub::End::Cancelled);
+        }
         evt.prevent_default();
         on_control.call(control);
     };
@@ -777,7 +789,7 @@ pub fn WatchView(
                                 "⏭"
                             }
                         }
-                        TimeLabels { segments: c.segments.clone(), pos, total }
+                        TimeLabels { segments: c.segments.clone(), pos, total, scrub: SCRUB_KEYS.then_some(scrub) }
                         Volume { media, on_control }
                         span { class: "pharos-control-spacer" }
                         TrackMode { in_group, own_tracks, on_change: on_own_tracks }
@@ -851,11 +863,18 @@ fn SkipButton(segments: Vec<Segment>, pos: Position, on_control: EventHandler<Co
 }
 
 /// "12:03 / 45:00" and "Ends at 10:42 PM": the labels that move with the
-/// position.
+/// position, or with a remote scrub's target while one is open (B907).
 #[component]
-fn TimeLabels(segments: Vec<Segment>, pos: Position, total: u64) -> Element {
+fn TimeLabels(
+    segments: Vec<Segment>,
+    pos: Position,
+    total: u64,
+    #[props(default)] scrub: Option<Signal<Option<Scrub>>>,
+) -> Element {
     use_ends_at_refresh();
-    let at = pos.now();
+    let at = scrub
+        .and_then(|s| s())
+        .map_or_else(|| pos.now(), |s| s.target_ms);
     let ends = ends_at(left_to_watch(&segments, at, total));
     rsx! {
         span { class: "pharos-time", "{clock(at)} / {clock(total)}" }
@@ -2417,6 +2436,28 @@ mod tests {
             "the thumbnail and time are the target's, not playback's: {html}"
         );
         assert!(html.contains(r#"aria-valuetext="5:10""#), "{html}");
+    }
+
+    #[test]
+    fn a_scrub_shows_its_target_in_the_time_label() {
+        let mut dom = VirtualDom::new(|| {
+            let pos = Position::at(60_000);
+            let scrub =
+                use_signal(|| Some(scrub::press(None, true, false, 300_000, 3_600_000, 0.0)));
+            rsx! {
+                TimeLabels { segments: Vec::new(), pos, total: 3_600_000, scrub: Some(scrub) }
+            }
+        });
+        dom.rebuild_in_place();
+        let html = dioxus_ssr::render(&dom);
+        assert!(html.contains("5:10 / 1:00:00"), "{html}");
+    }
+
+    #[test]
+    fn another_seek_drops_an_open_preview() {
+        assert!(drops_preview(&Control::Seek(0)));
+        assert!(!drops_preview(&Control::TogglePlay));
+        assert!(!drops_preview(&Control::Fullscreen));
     }
 
     #[test]
