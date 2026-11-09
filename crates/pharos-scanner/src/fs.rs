@@ -3246,6 +3246,31 @@ fn title_words(name: &str, year: Option<u32>) -> Vec<String> {
     title
 }
 
+/// Words that make a file a film's extra, not a copy of it: a scene tail
+/// keeps them (`Heat.1995.Trailer.720p` is no copy of `Heat (1995)`).
+const EXTRA_WORDS: &[&str] = &[
+    "trailer",
+    "teaser",
+    "featurette",
+    "featurettes",
+    "behind",
+    "scenes",
+    "deleted",
+    "interview",
+    "interviews",
+    "extra",
+    "extras",
+    "bonus",
+    "making",
+    "short",
+    "clip",
+    "preview",
+    "outtakes",
+    "bloopers",
+    "gag",
+    "reel",
+];
+
 /// The disc or part a scene tail names (`cd2`, `CD 2`, `Part 2`): the one
 /// thing after the year in a release name that tells two files' contents
 /// apart. The rest of such a tail (`3Li BluRay 720p`, `Eng NL Subs`,
@@ -3258,7 +3283,7 @@ fn disc_words(tail: &[String]) -> Vec<String> {
         let joined = ["cd", "disc", "disk", "part", "pt"]
             .iter()
             .any(|m| w.strip_prefix(m).is_some_and(numbered));
-        if joined {
+        if joined || EXTRA_WORDS.contains(&w.as_str()) {
             out.push(w.clone());
         } else if marker(w) && tail.get(i + 1).is_some_and(|n| numbered(n)) {
             out.extend(tail.get(i..=i + 1).into_iter().flatten().cloned());
@@ -9156,6 +9181,15 @@ mod tests {
             (
                 "/m/Heat (1995)/Heat (1995) Bluray-1080p.mkv",
                 "/m/Heat (1995)/Heat (1995) Part 2 Bluray-1080p.mkv",
+            ),
+            // B1025 / V984
+            (
+                "/m/Heat (1995)/Heat (1995) Bluray-1080p.mkv",
+                "/m/Heat (1995)/Heat.1995.Trailer.720p.mkv",
+            ),
+            (
+                "/m/Heat (1995)/Heat (1995) Bluray-1080p.mkv",
+                "/m/Heat (1995)/Heat.1995.Behind.The.Scenes.1080p.WEB.mkv",
             ),
         ] {
             let groups = group_editions(vec![PathBuf::from(a), PathBuf::from(b)]);
