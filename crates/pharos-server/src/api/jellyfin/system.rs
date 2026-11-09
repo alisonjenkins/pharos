@@ -917,7 +917,10 @@ async fn devices_list(
                 .flatten()
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| t.device_id.clone());
+            let no_direct_play_audio_codecs =
+                crate::services::playback::denied_audio_codecs(&state, &t.device_id).await;
             items.push(DeviceInfoLite {
+                no_direct_play_audio_codecs,
                 id: t.device_id,
                 name: display_name,
                 app_name: "Jellyfin",
@@ -944,6 +947,10 @@ struct DeviceInfoLite {
     last_user_id: String,
     last_user_name: String,
     date_last_activity: &'static str,
+    /// Pharos extension (T130): audio codecs this device is never sent as a
+    /// direct play. Absent when none are set, so the element stays Jellyfin's.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    no_direct_play_audio_codecs: Vec<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1013,11 +1020,17 @@ async fn delete_device(
 #[serde(rename_all = "PascalCase", default)]
 struct DeviceOptionsBody {
     custom_name: Option<String>,
+    /// Pharos extension (T130): audio codecs this device must not direct-play,
+    /// though its profile claims them. Absent leaves the list as it is; an
+    /// empty list clears it.
+    no_direct_play_audio_codecs: Option<Vec<String>>,
 }
 
 /// `POST /Devices/Options?id={deviceId}` — persist an operator-set display
-/// name for a device (shown in the devices list). Stored via named_config
-/// (`devname:{id}`). Empty name clears the override.
+/// name for a device (shown in the devices list), stored via named_config
+/// (`devname:{id}`), and its audio codec deny list
+/// (`devaudionodirect:{id}`). Each field is written only when the body
+/// carries it; an empty name clears the override.
 async fn device_options(
     state: web::Data<AppState>,
     user: AuthUser,
@@ -1031,14 +1044,42 @@ async fn device_options(
         q.id.as_deref()
             .filter(|s| !s.is_empty())
             .ok_or_else(|| error::ErrorBadRequest("missing id"))?;
-    let name = body
-        .and_then(|b| b.into_inner().custom_name)
-        .unwrap_or_default();
-    state
-        .stores
-        .set_named_config(&format!("devname:{device_id}"), name.trim())
-        .await
-        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    let body = body.map(web::Json::into_inner).unwrap_or_default();
+    // Validated before anything is written, so a bad list never lands half a body.
+    let denied = body
+        .no_direct_play_audio_codecs
+        .as_deref()
+        .map(crate::services::playback::normalise_denied_audio_codecs)
+        .transpose()
+        .map_err(|e| {
+            tracing::info!(device.id = device_id, error = %e, "device audio deny list refused");
+            error::ErrorBadRequest(e.to_string())
+        })?;
+    if let Some(name) = body.custom_name {
+        state
+            .stores
+            .set_named_config(&format!("devname:{device_id}"), name.trim())
+            .await
+            .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    }
+    if let Some(denied) = denied {
+        let json = serde_json::to_string(&denied)
+            .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+        state
+            .stores
+            .set_named_config(
+                &crate::services::playback::denied_audio_codecs_key(device_id),
+                &json,
+            )
+            .await
+            .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+        tracing::info!(
+            device.id = device_id,
+            by.user = %user.0.name,
+            denied = ?denied,
+            "device audio deny list set"
+        );
+    }
     Ok(HttpResponse::NoContent().finish())
 }
 
