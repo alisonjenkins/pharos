@@ -2,8 +2,10 @@
 //! the answer is kept in memory for the admin page to show.
 //!
 //! Never in the background (Alison, 2026-11-09: "on demand only"). One check
-//! runs at a time, behind a background-I/O permit so it stands down while
-//! someone is watching (V34), with two decoder threads and a time bound.
+//! runs at a time; it starts only when the background-I/O gate lets it (so a
+//! check asked for during playback waits for it, V34), and then decodes on two
+//! threads at the lowest CPU priority, within a time bound. At most
+//! [`MAX_WAITING`] checks may be waiting or running.
 //!
 //! Results are not persisted. A deep check is a question an admin asks about a
 //! file that plays badly, answered while they wait; losing the answers on a
@@ -31,6 +33,10 @@ use tokio::sync::Semaphore;
 
 /// Results kept, newest first. The page lists them; older ones are dropped.
 pub const MAX_RESULTS: usize = 50;
+
+/// Checks that may be waiting or running at once. Each can take an hour, so a
+/// longer queue would not drain in a day, and each holds a task.
+pub const MAX_WAITING: usize = 20;
 
 /// The longest one decode may run. A 4K film at two threads decodes in well
 /// under this; a file that takes longer is not one an admin is waiting on.
@@ -80,6 +86,10 @@ pub struct DeepEntry {
 pub enum Requested {
     Queued,
     AlreadyInProgress,
+    /// [`MAX_WAITING`] checks are already waiting or running.
+    QueueFull,
+    /// The results lock was poisoned by a panic; nothing can be queued.
+    Unavailable,
 }
 
 #[derive(Debug)]
@@ -115,10 +125,13 @@ impl DeepChecks {
         let id = item.id;
         {
             let Ok(mut r) = self.results.lock() else {
-                return Requested::AlreadyInProgress;
+                return Requested::Unavailable;
             };
             if r.iter().any(|e| e.id == id && e.state.in_progress()) {
                 return Requested::AlreadyInProgress;
+            }
+            if r.iter().filter(|e| e.state.in_progress()).count() >= MAX_WAITING {
+                return Requested::QueueFull;
             }
             r.push_front(DeepEntry {
                 id,
@@ -148,7 +161,12 @@ impl DeepChecks {
         let Ok(_turn) = self.one_at_a_time.acquire().await else {
             return;
         };
-        let _permit = BgPermit::acquire(&self.bg_io).await;
+        // Wait for the background-I/O gate to START, so a check queued during
+        // playback waits for it to end, but do not hold the slot for the
+        // hours a decode can take: that would keep one of the few slots the
+        // regulator leaves during playback and stall every other metered job.
+        // The decoder runs at the lowest CPU priority instead.
+        drop(BgPermit::acquire(&self.bg_io).await);
         self.update(id, |e| e.state = DeepState::Running);
         let started = Instant::now();
         let outcome = decode_check(&self.ffmpeg, &path, DECODE_TIMEOUT).await;
@@ -292,18 +310,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn old_results_are_dropped_but_in_progress_ones_are_kept() {
+    async fn the_queue_is_bounded_and_in_progress_checks_are_kept() {
         let checks = Arc::new(DeepChecks::new(
             "/nonexistent/ffmpeg",
             Arc::new(Semaphore::new(4)),
         ));
         let hold = checks.one_at_a_time.clone().acquire_owned().await.unwrap();
-        for id in 0..(MAX_RESULTS as u64 + 5) {
-            checks.request(&item(id, "/x.mkv"));
+        for id in 0..(MAX_WAITING as u64) {
+            assert_eq!(checks.request(&item(id, "/x.mkv")), Requested::Queued);
         }
         assert_eq!(
+            checks.request(&item(999, "/x.mkv")),
+            Requested::QueueFull,
+            "the queue is bounded"
+        );
+        assert_eq!(
             checks.list().len(),
-            MAX_RESULTS + 5,
+            MAX_WAITING,
             "nothing has finished, so nothing may be dropped"
         );
         drop(hold);
@@ -331,5 +354,26 @@ mod tests {
             .collect();
         assert!(seen.contains(&"damaged".to_string()), "{seen:?}");
         assert!(seen.contains(&"failed".to_string()), "{seen:?}");
+    }
+
+    /// Finished results past the cap are dropped oldest first.
+    #[tokio::test]
+    async fn finished_results_past_the_cap_are_dropped_oldest_first() {
+        let checks = Arc::new(DeepChecks::new(
+            "/nonexistent/ffmpeg",
+            Arc::new(Semaphore::new(4)),
+        ));
+        for id in 0..(MAX_RESULTS as u64 + 3) {
+            checks.request(&item(id, "/x.mkv"));
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while checks.list().iter().any(|e| e.state.in_progress()) {
+                assert!(Instant::now() < deadline, "check {id} never finished");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+        let ids: Vec<u64> = checks.list().iter().map(|e| e.id).collect();
+        assert_eq!(ids.len(), MAX_RESULTS);
+        assert_eq!(ids.first(), Some(&(MAX_RESULTS as u64 + 2)), "newest first");
+        assert!(!ids.contains(&0) && !ids.contains(&2), "oldest dropped");
     }
 }
