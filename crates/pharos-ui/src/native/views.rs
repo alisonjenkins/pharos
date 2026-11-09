@@ -44,22 +44,18 @@ pub struct MarkPlayed(pub EventHandler<(ItemRef, bool, String)>);
 pub struct MarkFavorite(pub EventHandler<(ItemRef, bool, String)>);
 
 /// A button that marks `id` a favourite, or takes the mark off when
-/// `favorite`. `aria-pressed` carries the state, so the label stays put.
+/// `favorite`. `aria-pressed` carries the state, so the label stays put and
+/// nothing names the opposite action.
 #[component]
 pub fn FavoriteToggle(id: ItemRef, favorite: bool, #[props(default)] name: String) -> Element {
     let mark = use_context::<MarkFavorite>();
-    let (star, label) = if favorite {
-        ("\u{2605}", "Remove from favourites")
-    } else {
-        ("\u{2606}", "Add to favourites")
-    };
+    let star = if favorite { "\u{2605}" } else { "\u{2606}" };
     rsx! {
         button {
             r#type: "button",
             class: if favorite { "pharos-button pharos-button-secondary pharos-favorite on" } else { "pharos-button pharos-button-secondary pharos-favorite" },
             "data-key-action": "favorite",
             aria_pressed: if favorite { "true" } else { "false" },
-            title: label,
             onclick: move |_| mark.0.call((id, !favorite, name.clone())),
             span { aria_hidden: "true", "{star} " }
             "Favourite"
@@ -2528,14 +2524,13 @@ mod tests {
         assert!(
             html.contains(r#"data-key-action="favorite""#)
                 && html.contains(r#"aria-pressed="false""#)
-                && html.contains(r#"title="Add to favourites""#),
+                && html.contains(">Favourite<"),
             "{html}"
         );
         let on = detail(true);
         let html = render(move || rsx! { TitleView { detail: on.clone() } });
         assert!(
-            html.contains(r#"aria-pressed="true""#)
-                && html.contains(r#"title="Remove from favourites""#),
+            html.contains(r#"aria-pressed="true""#) && html.contains("pharos-favorite on"),
             "{html}"
         );
     }
