@@ -4495,7 +4495,7 @@ body:has(.pharos-stage.is-mini) .pharos-main {
   flex: 1;
   min-width: 0;
 }
-/* The queue docked beside the compact player (B900/V849): a panel on the
+/* The queue docked beside the compact player (B900/V852): a panel on the
    right, above the mini bar or along the right edge beside the floating
    window, so what plays next shows on every page. */
 .pharos-queue-dock {

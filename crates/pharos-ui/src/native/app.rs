@@ -5544,7 +5544,7 @@ fn Player(
         }
     };
     let compact = view != View::Full;
-    // The queue docked beside the compact player (B900/V849), shared by the
+    // The queue docked beside the compact player (B900/V852), shared by the
     // stage's players so a song handing over keeps it open.
     let own_dock = use_signal(|| false);
     let mut dock = try_use_context::<QueueDock>().map_or(own_dock, |d| d.0);
