@@ -20,11 +20,12 @@ use crate::client::{
 };
 use crate::views::server_picker::{load_saved_servers, save_servers};
 use crate::views::{
-    AdminAction, AdminTab, AdminView, CreateUserAttempt, DetailAction, ItemDetailView, LibraryView,
-    LiveTvAction, LiveTvStatus, LiveTvView, LoginAttempt, LoginForm, PlayerView, PrefsAction,
-    PrefsTab, PrefsView, QuickConnectAuthorizeAction, QuickConnectAuthorizeView,
-    QuickConnectGuestAction, QuickConnectGuestStatus, QuickConnectGuestView, RemoteAction,
-    RemoteControlView, SavedServer, SearchStatus, SearchView, ServerPickerAction, ServerPickerView,
+    AdminAction, AdminTab, AdminView, CreateUserAttempt, DeepSearchState, DetailAction,
+    ItemDetailView, LibraryView, LiveTvAction, LiveTvStatus, LiveTvView, LoginAttempt, LoginForm,
+    PlayerView, PrefsAction, PrefsTab, PrefsView, QuickConnectAuthorizeAction,
+    QuickConnectAuthorizeView, QuickConnectGuestAction, QuickConnectGuestStatus,
+    QuickConnectGuestView, RemoteAction, RemoteControlView, SavedServer, SearchStatus, SearchView,
+    ServerPickerAction, ServerPickerView,
 };
 use dioxus::prelude::*;
 
@@ -651,6 +652,9 @@ fn AdminPane(access_token: String, server_base: String, current_user_id: String)
     // Identifies the one pending poll timer; every load supersedes the last,
     // so reloads and clicks never stack timer chains.
     let integrity_poll_gen = use_signal(|| 0u32);
+    let deep_search = use_signal(DeepSearchState::default);
+    // Identifies the newest keystroke so an older search never lands.
+    let deep_search_gen = use_signal(|| 0u32);
     // Reads every file's verdict, so it runs only while its tab is open.
     let integrity_resource = {
         let base = server_base.clone();
@@ -682,7 +686,10 @@ fn AdminPane(access_token: String, server_base: String, current_user_id: String)
                     if crate::views::admin::deep_poll_wanted(&report) {
                         spawn(async move {
                             sleep_ms(DEEP_CHECK_POLL_MS).await;
-                            if crate::views::admin::poll_due(generation, *poll_gen_signal.peek()) {
+                            if crate::views::admin::generation_current(
+                                generation,
+                                *poll_gen_signal.peek(),
+                            ) {
                                 let n = *tick_signal.peek();
                                 tick_signal.set(n.wrapping_add(1));
                             }
@@ -752,11 +759,54 @@ fn AdminPane(access_token: String, server_base: String, current_user_id: String)
         let mut errors_signal = integrity_errors;
         let mut deep_queued_signal = deep_queued;
         let mut deep_errors_signal = deep_errors;
+        let deep_search_signal = deep_search;
+        let mut deep_search_gen_signal = deep_search_gen;
         move |action: AdminAction| {
             let token = access_token.clone();
             let base = server_base.clone();
             if let AdminAction::SelectTab(t) = action {
                 active_tab_signal.set(t);
+                return;
+            }
+            if let AdminAction::DeepSearch { term } = action {
+                let generation = deep_search_gen_signal.peek().wrapping_add(1);
+                deep_search_gen_signal.set(generation);
+                let mut search = deep_search_signal;
+                let current = search.peek().clone();
+                if term.trim().is_empty() {
+                    search.set(DeepSearchState::default());
+                    return;
+                }
+                search.set(DeepSearchState {
+                    query: term.clone(),
+                    loading: true,
+                    ..current
+                });
+                let gen_signal = deep_search_gen_signal;
+                spawn(async move {
+                    sleep_ms(DEEP_SEARCH_DEBOUNCE_MS).await;
+                    if !crate::views::admin::generation_current(generation, *gen_signal.peek()) {
+                        return;
+                    }
+                    let found = fetch_search_hints(&base, &token, &term).await;
+                    if !crate::views::admin::generation_current(generation, *gen_signal.peek()) {
+                        return;
+                    }
+                    search.set(match found {
+                        Ok(hits) => DeepSearchState {
+                            query: term,
+                            hits,
+                            loading: false,
+                            error: None,
+                        },
+                        Err(e) => DeepSearchState {
+                            query: term,
+                            hits: Vec::new(),
+                            loading: false,
+                            error: Some(e),
+                        },
+                    });
+                });
                 return;
             }
             spawn(async move {
@@ -834,7 +884,9 @@ fn AdminPane(access_token: String, server_base: String, current_user_id: String)
                             Err(e) => status_signal.set(Some(format!("Branding save failed: {e}"))),
                         }
                     }
-                    AdminAction::SelectTab(_) => unreachable!("handled above"),
+                    AdminAction::SelectTab(_) | AdminAction::DeepSearch { .. } => {
+                        unreachable!("handled above")
+                    }
                 }
                 let n = *reload_signal.read();
                 reload_signal.set(n.wrapping_add(1));
@@ -871,6 +923,7 @@ fn AdminPane(access_token: String, server_base: String, current_user_id: String)
     let integrity_errors = integrity_errors.read().clone();
     let deep_queued = deep_queued.read().clone();
     let deep_errors = deep_errors.read().clone();
+    let deep_search = deep_search.read().clone();
     let plugins: Vec<PluginEntry> = match plugins_resource.read_unchecked().as_ref() {
         Some(Ok(v)) => v.clone(),
         _ => Vec::new(),
@@ -913,6 +966,7 @@ fn AdminPane(access_token: String, server_base: String, current_user_id: String)
             integrity_errors: integrity_errors,
             deep_queued: deep_queued,
             deep_errors: deep_errors,
+            deep_search: deep_search,
         }
     }
 }
@@ -2104,6 +2158,9 @@ async fn recheck_damaged_file(_base: &str, _token: &str, _media_id: &str) -> Res
 
 /// How often the Damaged files tab re-loads while a deep check is in progress.
 const DEEP_CHECK_POLL_MS: u32 = 5_000;
+
+/// Wait for typing to pause before searching for a file to deep check.
+const DEEP_SEARCH_DEBOUNCE_MS: u32 = 350;
 
 #[cfg(feature = "web")]
 async fn request_deep_check(base: &str, token: &str, media_id: &str) -> Result<(), String> {

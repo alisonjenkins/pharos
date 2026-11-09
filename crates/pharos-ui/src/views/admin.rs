@@ -8,7 +8,7 @@
 use crate::client::{
     ActivityEntry, AdminUser, ApiKey, BrandingConfig, DamagedFile, DeepCheck, DeviceEntry,
     DuplicateFilm, FilmVersion, IntegrityReport, IntegrityStatus, LibraryFolder, LogEntry,
-    PluginEntry, ScheduledTask,
+    PluginEntry, ScheduledTask, SearchHint,
 };
 use dioxus::prelude::*;
 
@@ -55,6 +55,10 @@ pub enum AdminAction {
     /// Queue a full decode of one file; slow, and one file runs at a time.
     DeepCheck {
         media_id: String,
+    },
+    /// The "Deep check another file" box changed.
+    DeepSearch {
+        term: String,
     },
     LibraryRefresh,
     Refresh,
@@ -175,6 +179,18 @@ pub struct AdminViewProps {
     /// Deep check failures by media id, shown on the row.
     #[props(default)]
     pub deep_errors: Vec<(String, String)>,
+    /// The "Deep check another file" box and its hits.
+    #[props(default)]
+    pub deep_search: DeepSearchState,
+}
+
+/// What the "Deep check another file" box shows.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DeepSearchState {
+    pub query: String,
+    pub hits: Vec<SearchHint>,
+    pub loading: bool,
+    pub error: Option<String>,
 }
 
 #[component]
@@ -423,6 +439,7 @@ pub fn AdminView(props: AdminViewProps) -> Element {
                         errors: props.integrity_errors.clone(),
                         deep_queued: props.deep_queued.clone(),
                         deep_errors: props.deep_errors.clone(),
+                        deep_search: props.deep_search.clone(),
                         on_action: props.on_action,
                     }
                 },
@@ -822,6 +839,7 @@ fn IntegritySection(
     errors: Vec<(String, String)>,
     deep_queued: Vec<String>,
     deep_errors: Vec<(String, String)>,
+    deep_search: DeepSearchState,
     on_action: EventHandler<AdminAction>,
 ) -> Element {
     rsx! {
@@ -845,7 +863,13 @@ fn IntegritySection(
                             on_action: on_action,
                         }
                     }
-                    DeepChecksSection { checks: report.deep_checks.clone() }
+                    DeepChecksSection {
+                        checks: report.deep_checks.clone(),
+                        queued: deep_queued.clone(),
+                        errors: deep_errors.clone(),
+                        search: deep_search.clone(),
+                        on_action: on_action,
+                    }
                 },
             }
         }
@@ -927,7 +951,13 @@ fn DamagedRow(
 }
 
 #[component]
-fn DeepChecksSection(checks: Result<Vec<DeepCheck>, String>) -> Element {
+fn DeepChecksSection(
+    checks: Result<Vec<DeepCheck>, String>,
+    queued: Vec<String>,
+    errors: Vec<(String, String)>,
+    search: DeepSearchState,
+    on_action: EventHandler<AdminAction>,
+) -> Element {
     let (checks, failure) = match checks {
         Ok(v) => (v, None),
         Err(e) => (Vec::new(), Some(e)),
@@ -936,6 +966,39 @@ fn DeepChecksSection(checks: Result<Vec<DeepCheck>, String>) -> Element {
         section {
             class: "pharos-admin-integrity-deep-checks",
             h4 { "Deep checks" }
+            div {
+                class: "pharos-admin-integrity-deep-search",
+                label {
+                    "Deep check another file"
+                    input {
+                        class: "pharos-admin-integrity-deep-search-input",
+                        r#type: "search",
+                        placeholder: "Part of a title",
+                        autocomplete: "off",
+                        value: "{search.query}",
+                        oninput: move |ev| on_action.call(AdminAction::DeepSearch { term: ev.value() }),
+                    }
+                }
+                if search.loading {
+                    p { class: "pharos-loading", "Searching…" }
+                } else if let Some(e) = search.error.as_deref() {
+                    p { class: "pharos-error", "Could not search: {e}" }
+                } else if !search.query.trim().is_empty() && deep_candidates(&search.hits).is_empty() {
+                    p { class: "pharos-admin-integrity-deep-empty", "No video or audio files match." }
+                }
+                ul {
+                    class: "pharos-admin-integrity-deep-hits",
+                    for h in deep_candidates(&search.hits) {
+                        DeepHitRow {
+                            key: "{h.id}",
+                            hit: h.clone(),
+                            running: queued.contains(&h.id) || deep_in_progress(&checks, &h.id),
+                            error: errors.iter().find(|(id, _)| *id == h.id).map(|(_, e)| e.clone()),
+                            on_action: on_action,
+                        }
+                    }
+                }
+            }
             if let Some(e) = failure {
                 p { class: "pharos-error", "Could not list deep checks: {e}" }
             } else if checks.is_empty() {
@@ -981,6 +1044,49 @@ pub fn any_deep_active(checks: &[DeepCheck]) -> bool {
     checks.iter().any(deep_is_active)
 }
 
+/// Most hits the box offers at once.
+const DEEP_SEARCH_LIMIT: usize = 8;
+
+/// Hits a deep check can decode: video and audio only, never books, folders
+/// or series.
+fn deep_candidates(hits: &[SearchHint]) -> Vec<&SearchHint> {
+    hits.iter()
+        .filter(|h| matches!(h.media_type.as_str(), "Movie" | "Episode" | "Audio"))
+        .take(DEEP_SEARCH_LIMIT)
+        .collect()
+}
+
+#[component]
+fn DeepHitRow(
+    hit: SearchHint,
+    running: bool,
+    error: Option<String>,
+    on_action: EventHandler<AdminAction>,
+) -> Element {
+    let id = hit.id.clone();
+    rsx! {
+        li {
+            class: "pharos-admin-integrity-deep-hit",
+            span { class: "pharos-admin-integrity-kind", "{hit.kind.label()} · " }
+            span { "{hit.name}" }
+            if running {
+                button { class: "pharos-admin-integrity-deep", disabled: true, "Deep check running…" }
+            } else {
+                button {
+                    class: "pharos-admin-integrity-deep",
+                    onclick: move |_| on_action.call(AdminAction::DeepCheck {
+                        media_id: id.clone(),
+                    }),
+                    "Deep check"
+                }
+            }
+            if let Some(e) = error {
+                p { class: "pharos-error", "Could not start the deep check: {e}" }
+            }
+        }
+    }
+}
+
 /// The deep results, empty when the server could not list them.
 fn deep_list(report: &IntegrityReport) -> &[DeepCheck] {
     report.deep_checks.as_ref().map_or(&[], Vec::as_slice)
@@ -992,7 +1098,7 @@ pub fn deep_poll_wanted(report: &Result<IntegrityReport, String>) -> bool {
 }
 
 /// A poll timer may re-load the tab only if no newer load has superseded it.
-pub fn poll_due(scheduled: u32, current: u32) -> bool {
+pub fn generation_current(scheduled: u32, current: u32) -> bool {
     scheduled == current
 }
 
@@ -1256,6 +1362,7 @@ fn civil_from_days(days: i64) -> (i64, i64, i64) {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::api_types::ItemKind;
 
     #[test]
     fn admin_view_module_exports_present() {
@@ -1385,6 +1492,45 @@ mod tests {
         render_integrity_deep(report, queued, errors, vec![], vec![])
     }
 
+    fn render_deep_search(
+        search: DeepSearchState,
+        deep_queued: Vec<String>,
+        deep_errors: Vec<(String, String)>,
+    ) -> String {
+        let mut dom = VirtualDom::new_with_props(
+            |(search, deep_queued, deep_errors): (
+                DeepSearchState,
+                Vec<String>,
+                Vec<(String, String)>,
+            )| {
+                rsx! {
+                    IntegritySection {
+                        report: deep_report(vec![], vec![]),
+                        queued: vec![],
+                        errors: vec![],
+                        deep_queued,
+                        deep_errors,
+                        deep_search: search,
+                        on_action: |_| {},
+                    }
+                }
+            },
+            (search, deep_queued, deep_errors),
+        );
+        dom.rebuild_in_place();
+        dioxus_ssr::render(&dom)
+    }
+
+    fn hit(id: &str, name: &str, media_type: &str) -> SearchHint {
+        SearchHint {
+            id: id.into(),
+            name: name.into(),
+            kind: ItemKind::from_jellyfin_type(media_type),
+            media_type: media_type.into(),
+            matched_term: String::new(),
+        }
+    }
+
     fn render_integrity_deep(
         report: Option<Result<IntegrityReport, String>>,
         queued: Vec<String>,
@@ -1408,6 +1554,7 @@ mod tests {
                         errors,
                         deep_queued,
                         deep_errors,
+                        deep_search: DeepSearchState::default(),
                         on_action: |_| {},
                     }
                 }
@@ -1672,6 +1819,76 @@ mod tests {
     }
 
     #[test]
+    fn the_search_box_lists_video_and_audio_hits_with_a_deep_check_button() {
+        let html = render_deep_search(
+            DeepSearchState {
+                query: "heat".into(),
+                hits: vec![
+                    hit("1", "Heat", "Movie"),
+                    hit("2", "Heat Wave", "Episode"),
+                    hit("3", "Heat Song", "Audio"),
+                ],
+                ..DeepSearchState::default()
+            },
+            vec![],
+            vec![],
+        );
+        assert!(html.contains("Deep check another file"), "{html}");
+        for name in ["Heat", "Heat Wave", "Heat Song"] {
+            assert!(html.contains(name), "{name}: {html}");
+        }
+        assert_eq!(html.matches(">Deep check<").count(), 3, "{html}");
+    }
+
+    #[test]
+    fn the_search_box_never_offers_books_folders_or_series() {
+        let html = render_deep_search(
+            DeepSearchState {
+                query: "heat".into(),
+                hits: vec![
+                    hit("1", "Heat Book", "Book"),
+                    hit("2", "Heat Shows", "Series"),
+                    hit("3", "Heat Folder", "Folder"),
+                ],
+                ..DeepSearchState::default()
+            },
+            vec![],
+            vec![],
+        );
+        assert!(!html.contains("Heat Book"), "{html}");
+        assert!(!html.contains("Heat Shows"), "{html}");
+        assert!(!html.contains("Heat Folder"), "{html}");
+        assert!(!html.contains(">Deep check<"), "{html}");
+        assert!(html.contains("No video or audio files match."), "{html}");
+    }
+
+    #[test]
+    fn the_search_box_offers_at_most_eight_and_shows_running_and_errors() {
+        let many: Vec<SearchHint> = (0..12)
+            .map(|i| hit(&i.to_string(), &format!("Film {i}"), "Movie"))
+            .collect();
+        let html = render_deep_search(
+            DeepSearchState {
+                query: "film".into(),
+                hits: many,
+                ..DeepSearchState::default()
+            },
+            vec!["0".into()],
+            vec![(
+                "1".into(),
+                "too many deep checks are waiting; try again when some finish".into(),
+            )],
+        );
+        assert!(html.contains("Film 7"), "{html}");
+        assert!(!html.contains("Film 8"), "{html}");
+        assert!(html.contains("Deep check running…"), "{html}");
+        assert!(
+            html.contains("Could not start the deep check: too many deep checks are waiting"),
+            "{html}"
+        );
+    }
+
+    #[test]
     fn the_deep_checks_section_words_each_state() {
         let checks = vec![
             deep("1", "queued"),
@@ -1741,8 +1958,11 @@ mod tests {
         assert!(deep_poll_wanted(&with("queued")));
         assert!(!deep_poll_wanted(&with("clean")));
         assert!(!deep_poll_wanted(&Err("boom".into())));
-        assert!(poll_due(3, 3));
-        assert!(!poll_due(2, 3), "a superseded timer must not re-load");
+        assert!(generation_current(3, 3));
+        assert!(
+            !generation_current(2, 3),
+            "a superseded timer must not re-load"
+        );
         assert!(deep_in_progress(&[deep("1", "queued")], "1"));
         assert!(!deep_in_progress(&[deep("1", "queued")], "2"));
     }

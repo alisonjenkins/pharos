@@ -4634,6 +4634,19 @@ body:has(.pharos-stage.is-mini) .pharos-main {
 .pharos-admin-integrity-deep-empty {
   color: var(--px-color-fg-muted);
 }
+.pharos-admin-integrity-deep-search label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+.pharos-admin-integrity-deep-hits {
+  list-style: none;
+  margin: 0.5rem 0;
+  padding: 0;
+}
+.pharos-admin-integrity-deep-hit {
+  padding: 0.25rem 0;
+}
 
 /* What's new (spec 027): a dialog over the page after sign-in, never while
    something plays (V495). */
