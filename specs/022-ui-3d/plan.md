@@ -52,7 +52,7 @@ Each is one PR of atomic commits, reviewed with /review, fixed, fixups
 squashed, then handed to the merge queue. SyncPlay PRs merge first when both
 are ready.
 
-1. **Native API carries 3D (FR-001 to FR-004, FR-009)**, about 1 day. Done (2026-11-08, schema 28, B770/V720; the ids V291/B351 below were never landed).
+1. **Native API carries 3D (FR-001 to FR-004, FR-009)**, about 1 day. Done (2026-11-08, schema 29, B770/V720; the ids V291/B351 below were never landed).
    Schema and contract copy; `rpc/library.rs` writes `stereo` and
    `versions`, reads `ItemQuery.stereo` into the store's `is_3d`;
    `GrantRequest` gains `edition: Option<&str>`, resolved like the Jellyfin
