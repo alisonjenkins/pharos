@@ -3,8 +3,8 @@
 //! drift apart.
 
 use pharos_core::{
-    DomainError, ItemPerson, LibraryKind, MediaItem, MediaKind, MediaStore as _, PersonKind, User,
-    UserDataStore as _, UserItemData, UserPolicy,
+    DomainError, ItemPerson, LibraryKind, MediaItem, MediaKind, MediaStore as _, PersonKind,
+    ReadPositionStore as _, User, UserDataStore as _, UserItemData, UserPolicy,
 };
 
 use crate::services::access::ItemHidden;
@@ -109,6 +109,12 @@ pub enum KindFilter {
 }
 
 impl KindFilter {
+    /// Whether this filter names `kind`. `Unset` names none, so a listing
+    /// that must opt in to a kind (books in `resume`) does not for it.
+    pub fn names(&self, kind: MediaKind) -> bool {
+        matches!(self, KindFilter::Kinds(wanted) if wanted.contains(&kind))
+    }
+
     /// `items` with only the kinds this filter keeps.
     pub fn keep(&self, items: Vec<MediaItem>) -> Vec<MediaItem> {
         match self {
@@ -208,9 +214,14 @@ pub struct ListPage {
     pub start: u32,
 }
 
+/// The most part-read books `resume` considers (FR-012).
+const PART_READ_MAX: u32 = 200;
+
 /// The items `user` has started and not finished, of the kinds `kinds`
 /// keeps, in the store's resume order, each with the user's play state.
 /// `start` and `limit` page the list; `total` counts every match (B164).
+/// When `kinds` names books it also lists those with a saved read position
+/// that are not played (FR-012), newest activity first among the rest.
 pub async fn resume(
     state: &AppState,
     user: &User,
@@ -223,6 +234,28 @@ pub async fn resume(
         .resumable_items(user.id)
         .await
         .map_err(ListError::Store)?;
+    // When each part-read book was last read, to order it among the rest.
+    let mut read_at: std::collections::HashMap<u64, i64> = std::collections::HashMap::new();
+    if kinds.names(MediaKind::Book) {
+        let books = state
+            .stores
+            .part_read_items(user.id, PART_READ_MAX)
+            .await
+            .map_err(ListError::Store)?;
+        let positions = state
+            .stores
+            .read_positions_bulk(user.id, &books)
+            .await
+            .map_err(ListError::Store)?;
+        for (id, position) in books.iter().zip(positions) {
+            if let Some(position) = position {
+                read_at.insert(*id, position.updated_at);
+                if !ids.contains(id) {
+                    ids.push(*id);
+                }
+            }
+        }
+    }
     crate::services::access::retain_visible(state, user, &mut ids, |id| *id, "resume")
         .await
         .map_err(ListError::Hidden)?;
@@ -232,7 +265,26 @@ pub async fn resume(
         .get_many(&ids)
         .await
         .map_err(ListError::Store)?;
-    let items = kinds.keep(items);
+    let mut items = kinds.keep(items);
+    if !read_at.is_empty() {
+        let all: Vec<u64> = items.iter().map(|i| i.id).collect();
+        let played_at = state
+            .stores
+            .user_data_bulk(user.id, &all)
+            .await
+            .map_err(ListError::Store)?;
+        let when = |id: u64, last_played_at: i64| {
+            read_at.get(&id).copied().unwrap_or(0).max(last_played_at)
+        };
+        let mut stamped: Vec<(i64, MediaItem)> = items
+            .into_iter()
+            .zip(played_at)
+            .map(|(item, data)| (when(item.id, data.last_played_at), item))
+            .collect();
+        // Stable, so equal stamps keep the store's resume order.
+        stamped.sort_by_key(|(at, _)| std::cmp::Reverse(*at));
+        items = stamped.into_iter().map(|(_, item)| item).collect();
+    }
     let total = u32::try_from(items.len()).unwrap_or(u32::MAX);
     let start = start.min(total);
     let end = limit.map_or(total, |n| start.saturating_add(n)).min(total);
@@ -1124,12 +1176,14 @@ pub const WATCHING_KINDS: [MediaKind; 2] = [MediaKind::Movie, MediaKind::Episode
 
 /// Everything the home page shows, in one answer: each library the user
 /// may see with its newest items, the films and episodes to resume, the
-/// music to resume, and what is next up.
+/// music to resume, the books part read, and what is next up.
 #[derive(Debug)]
 pub struct Home {
     pub rails: Vec<(LibraryView, Vec<(MediaItem, UserItemData)>)>,
     pub resume: ListPage,
     pub listening: ListPage,
+    /// Books part read (FR-012).
+    pub reading: ListPage,
     pub next_up: ListPage,
 }
 
@@ -1153,6 +1207,8 @@ pub async fn home(
     let watching = KindFilter::Kinds(WATCHING_KINDS.to_vec());
     let audio = KindFilter::Kinds(vec![MediaKind::Audio]);
     let listening = resume(state, user, &audio, 0, resume_n);
+    let books = KindFilter::Kinds(vec![MediaKind::Book]);
+    let reading = resume(state, user, &books, 0, resume_n);
     let resume = resume(state, user, &watching, 0, resume_n);
     let next_up = next_up(
         state,
@@ -1160,12 +1216,13 @@ pub async fn home(
         None,
         Some(next_up_limit.unwrap_or(HOME_NEXT_UP_DEFAULT)),
     );
-    let (rails, resume, listening, next_up) =
-        futures_util::try_join!(rails, resume, listening, next_up)?;
+    let (rails, resume, listening, reading, next_up) =
+        futures_util::try_join!(rails, resume, listening, reading, next_up)?;
     Ok(Home {
         rails,
         resume,
         listening,
+        reading,
         next_up,
     })
 }
