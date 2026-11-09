@@ -5556,6 +5556,9 @@ fn Player(
     );
     // Which side the floating window is on, so the dock takes the other.
     let window_right = use_memo(move || stage.read().spot.x > 0.5)();
+    // And which half, so the dock keeps to the same edge (the top holds the
+    // page's navigation).
+    let window_low = use_memo(move || stage.read().spot.y > 0.5)();
     let on_queue = EventHandler::new(move |action: QueueAction| {
         // In a group the group picks the song.
         if matches!(action, QueueAction::Play(_)) && !queued {
@@ -5684,6 +5687,7 @@ fn Player(
                     class: "pharos-queue-dock",
                     "data-view": view.label(),
                     "data-side": if view == View::Floating && window_right { "left" } else { "right" },
+                    "data-edge": if view == View::Floating && window_low { "bottom" } else { "top" },
                     QueuePanel {
                         queue: queue.read().upcoming().to_vec(),
                         shuffled: queue.read().shuffled(),

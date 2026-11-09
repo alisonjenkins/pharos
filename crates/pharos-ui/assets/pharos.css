@@ -4511,6 +4511,12 @@ body:has(.pharos-stage.is-mini) .pharos-main {
   bottom: auto;
   top: 4.5rem;
 }
+/* Beside a window in the lower half, the dock keeps to the bottom too, so
+   it leaves the page's navigation along the top clear. */
+.pharos-queue-dock[data-view="floating"][data-edge="bottom"] {
+  top: auto;
+  bottom: 1rem;
+}
 /* The floating window is on the right: the dock takes the left, so it
    never covers the window or its Queue button. */
 .pharos-queue-dock[data-side="left"] {
