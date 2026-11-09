@@ -476,6 +476,7 @@ impl GroupState {
                 // first item (no previous one) keeps what `Joined` brought.
                 if !self.playlist_item_id.is_empty() && self.playlist_item_id != playlist_item_id {
                     self.tracks = GroupTracksView::default();
+                    self.next_held = None;
                 }
                 self.playlist_item_id = playlist_item_id;
                 self.item = Some(item);
@@ -1815,6 +1816,17 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
             client.hold_next(playlist_item_id).await
         });
         true
+    }
+
+    /// The queue entry the group plays; empty out of a group or before its
+    /// first item. A player's "Up next" belongs to one entry (B1027).
+    pub fn playlist_item_id(&self) -> String {
+        let inner = self.inner.borrow();
+        if inner.active {
+            inner.state.playlist_item_id.clone()
+        } else {
+            String::new()
+        }
     }
 
     /// A member kept the group watching the end of what the stage shows, so
@@ -4520,6 +4532,12 @@ mod tests {
         assert!(rig.session.next_held());
         on_entry(&rig, 8, "pl-8");
         assert!(!rig.session.next_held());
+        assert_eq!(rig.session.playlist_item_id(), "pl-8");
+        on_entry(&rig, 7, "pl-7");
+        assert!(
+            !rig.session.next_held(),
+            "back on the held entry, it counts again"
+        );
     }
 
     #[test]
