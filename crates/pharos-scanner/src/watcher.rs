@@ -147,6 +147,7 @@ where
         + StudioStore
         + CollectionStore
         + TagStore
+        + pharos_core::SeriesIdentityStore
         + Send
         + Sync
         + 'static,
@@ -201,6 +202,7 @@ async fn watch_loop<P, S>(
         + StudioStore
         + CollectionStore
         + TagStore
+        + pharos_core::SeriesIdentityStore
         + Send
         + Sync
         + 'static,
@@ -299,6 +301,7 @@ where
         + StudioStore
         + CollectionStore
         + TagStore
+        + pharos_core::SeriesIdentityStore
         + Send
         + Sync
         + 'static,
@@ -644,6 +647,8 @@ mod tests {
     // LIB-C4 — watcher tests don't assert on the genre join, so this is a
     // lightweight in-memory mirror sufficient to satisfy the scan_into /
     // update_path bound.
+    impl pharos_core::SeriesIdentityStore for MemStore {}
+
     impl pharos_core::GenreStore for MemStore {
         async fn upsert_genre(&self, name: &str) -> DomainResult<i64> {
             Ok(i64::from_str_radix(&pharos_core::genre_wire_id(name)[..15], 16).unwrap_or(0))

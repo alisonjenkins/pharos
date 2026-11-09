@@ -11,6 +11,7 @@ pub mod fs;
 pub mod libav_prober;
 pub mod metadata;
 pub mod probe_memo;
+pub mod series_split;
 #[cfg(feature = "watch")]
 pub mod watcher;
 
