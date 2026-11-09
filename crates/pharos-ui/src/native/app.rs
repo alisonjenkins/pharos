@@ -5457,17 +5457,21 @@ fn Player(
                     ));
                     up_next.write().cancel();
                 }
-                let step = up_next.write().step(state.position_ms, from, total);
-                if let Some(why) = up_next.peek().moves_on(step, event) {
-                    platform::info(&format!(
-                        "pharos: up next: playing {next} ({why}) at={}ms of={total}ms from={from:?}",
-                        state.position_ms
-                    ));
-                    advance(next);
-                    return;
-                }
-                if *up_next_step.peek() != step {
-                    up_next_step.set(step);
+                // Still at the old entry's end: the group has already moved
+                // on, so no countdown or end from there may move it again.
+                if !up_next_reset.get() {
+                    let step = up_next.write().step(state.position_ms, from, total);
+                    if let Some(why) = up_next.peek().moves_on(step, event) {
+                        platform::info(&format!(
+                            "pharos: up next: playing {next} ({why}) at={}ms of={total}ms from={from:?}",
+                            state.position_ms
+                        ));
+                        advance(next);
+                        return;
+                    }
+                    if *up_next_step.peek() != step {
+                        up_next_step.set(step);
+                    }
                 }
             }
             if event == MediaEvent::Changed && !burned {
