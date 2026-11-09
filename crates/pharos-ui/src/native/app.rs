@@ -235,9 +235,11 @@ fn plays_in_place(mut stage: Signal<Stage>, to: &Route) -> bool {
 }
 
 /// How often, and how many times, to ask again for word times the aligner is
-/// still working out (B499): a song takes it a minute or three on a CPU.
-const ALIGN_ASK_MS: u32 = 20_000;
-const ALIGN_ASKS: u32 = 15;
+/// still working out (B499): a song takes it a minute or three on a CPU. An
+/// ask is a cache read on the server, and every second between the answer
+/// being ready and the next ask is a second of guessed fill (B937).
+const ALIGN_ASK_MS: u32 = 5_000;
+const ALIGN_ASKS: u32 = 60;
 
 const PREFERS_DARK: &str = "(prefers-color-scheme: dark)";
 const PREFERS_MORE_CONTRAST: &str = "(prefers-contrast: more)";
