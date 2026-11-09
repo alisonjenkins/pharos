@@ -4618,6 +4618,22 @@ body:has(.pharos-stage.is-mini) .pharos-main {
 .pharos-admin-integrity-path {
   overflow-wrap: anywhere;
 }
+.pharos-admin-integrity-deep {
+  margin-left: 0.5rem;
+}
+.pharos-admin-integrity-deep-checks {
+  margin-top: 1.5rem;
+}
+.pharos-admin-integrity-deep-check {
+  padding: 0.5rem 0;
+  border-bottom: 1px solid var(--px-color-border);
+}
+.pharos-admin-integrity-deep-check h5 {
+  margin: 0 0 0.25rem;
+}
+.pharos-admin-integrity-deep-empty {
+  color: var(--px-color-fg-muted);
+}
 
 /* What's new (spec 027): a dialog over the page after sign-in, never while
    something plays (V495). */

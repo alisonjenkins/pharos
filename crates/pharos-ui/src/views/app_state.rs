@@ -644,12 +644,15 @@ fn AdminPane(access_token: String, server_base: String, current_user_id: String)
     // own `RecheckPending` arrives with the next load.
     let integrity_queued = use_signal::<Vec<String>>(Vec::new);
     let integrity_errors = use_signal::<Vec<(String, String)>>(Vec::new);
+    let deep_queued = use_signal::<Vec<String>>(Vec::new);
+    let deep_errors = use_signal::<Vec<(String, String)>>(Vec::new);
     // Reads every file's verdict, so it runs only while its tab is open.
     let integrity_resource = {
         let base = server_base.clone();
         let token = access_token.clone();
         let reload_signal = reload;
         let mut queued_signal = integrity_queued;
+        let mut deep_queued_signal = deep_queued;
         use_resource(move || {
             let _bust = reload_signal.read();
             let open = *active_tab.read() == AdminTab::Integrity;
@@ -662,6 +665,7 @@ fn AdminPane(access_token: String, server_base: String, current_user_id: String)
                     // local mark past this would keep a finished row Queued.
                     if report.is_ok() {
                         queued_signal.set(Vec::new());
+                        deep_queued_signal.set(Vec::new());
                     }
                     Some(report)
                 } else {
@@ -725,6 +729,8 @@ fn AdminPane(access_token: String, server_base: String, current_user_id: String)
         let mut new_secret_signal = new_api_key_secret;
         let mut queued_signal = integrity_queued;
         let mut errors_signal = integrity_errors;
+        let mut deep_queued_signal = deep_queued;
+        let mut deep_errors_signal = deep_errors;
         move |action: AdminAction| {
             let token = access_token.clone();
             let base = server_base.clone();
@@ -794,6 +800,13 @@ fn AdminPane(access_token: String, server_base: String, current_user_id: String)
                             Err(e) => errors_signal.write().push((media_id, e)),
                         }
                     }
+                    AdminAction::DeepCheck { media_id } => {
+                        deep_errors_signal.write().retain(|(id, _)| *id != media_id);
+                        match request_deep_check(&base, &token, &media_id).await {
+                            Ok(()) => deep_queued_signal.write().push(media_id),
+                            Err(e) => deep_errors_signal.write().push((media_id, e)),
+                        }
+                    }
                     AdminAction::SaveBranding(cfg) => {
                         match save_branding(&base, &token, &cfg).await {
                             Ok(()) => status_signal.set(Some("Branding saved".into())),
@@ -835,6 +848,8 @@ fn AdminPane(access_token: String, server_base: String, current_user_id: String)
     let integrity = integrity_resource.read_unchecked().clone().flatten();
     let integrity_queued = integrity_queued.read().clone();
     let integrity_errors = integrity_errors.read().clone();
+    let deep_queued = deep_queued.read().clone();
+    let deep_errors = deep_errors.read().clone();
     let plugins: Vec<PluginEntry> = match plugins_resource.read_unchecked().as_ref() {
         Some(Ok(v)) => v.clone(),
         _ => Vec::new(),
@@ -875,6 +890,8 @@ fn AdminPane(access_token: String, server_base: String, current_user_id: String)
             integrity: integrity,
             integrity_queued: integrity_queued,
             integrity_errors: integrity_errors,
+            deep_queued: deep_queued,
+            deep_errors: deep_errors,
         }
     }
 }
@@ -2062,6 +2079,18 @@ async fn recheck_damaged_file(base: &str, token: &str, media_id: &str) -> Result
 #[cfg(not(feature = "web"))]
 async fn recheck_damaged_file(_base: &str, _token: &str, _media_id: &str) -> Result<(), String> {
     Err("recheck_damaged_file is only wired in the web build".into())
+}
+
+#[cfg(feature = "web")]
+async fn request_deep_check(base: &str, token: &str, media_id: &str) -> Result<(), String> {
+    crate::client::web::request_deep_check(base, token, media_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(not(feature = "web"))]
+async fn request_deep_check(_base: &str, _token: &str, _media_id: &str) -> Result<(), String> {
+    Err("request_deep_check is only wired in the web build".into())
 }
 
 #[cfg(feature = "web")]
