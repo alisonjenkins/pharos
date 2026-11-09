@@ -1354,6 +1354,21 @@ where
         .await
         .unwrap()
         .is_empty());
+    // A person's page lists their credits with who they play, guest spots included.
+    let guest_credits =
+        PersonStore::credits_for_person(&store, &person_wire_id("Conformance Guest"))
+            .await
+            .unwrap();
+    assert_eq!(guest_credits.len(), 1, "{guest_credits:?}");
+    assert_eq!(guest_credits[0].0, item_id);
+    assert_eq!(guest_credits[0].1.kind, PersonKind::GuestStar);
+    assert_eq!(guest_credits[0].1.character.as_deref(), Some("Stranger"));
+    assert!(
+        PersonStore::credits_for_person(&store, &person_wire_id("Nobody Credited"))
+            .await
+            .unwrap()
+            .is_empty()
+    );
 
     StudioStore::link_item_studios(&store, item_id, &["Conformance Studio".to_string()])
         .await
