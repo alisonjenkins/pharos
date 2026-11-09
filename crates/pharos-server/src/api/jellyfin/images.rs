@@ -2350,6 +2350,7 @@ mod tests {
                     episode_number: Some(1),
                     series_folder: Some("/tv/Bones".into()),
                     series_year: None,
+                    series_key: None,
                 }),
                 ..Default::default()
             })
@@ -2384,6 +2385,7 @@ mod tests {
                 episode_number: Some(n),
                 series_folder: Some("/tv/Bones".into()),
                 series_year: None,
+                series_key: None,
             }),
             ..Default::default()
         };
