@@ -127,6 +127,9 @@ pub struct Version {
     pub container: String,
     /// The file on the server's disk; the server sends it to admins only.
     pub path: String,
+    /// The file's runtime; 0 when unknown (or from a server before
+    /// schemaVersion 30).
+    pub duration_ms: u64,
 }
 
 /// One audio stream of a [`Version`].
@@ -1761,6 +1764,7 @@ fn read_version(v: pharos_api::pharos_capnp::version::Reader<'_>) -> Result<Vers
         size_bytes: v.get_size_bytes(),
         container: text(v.get_container())?,
         path: text(v.get_path())?,
+        duration_ms: v.get_duration_ms(),
     })
 }
 

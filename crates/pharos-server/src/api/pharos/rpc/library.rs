@@ -1825,6 +1825,7 @@ fn write_versions(
                     video_codec: alt.video_codec.clone(),
                     audio_codec: alt.audio_codec.clone(),
                     size_bytes: alt.size_bytes,
+                    duration_ms: alt.duration_ms,
                     container: alt.container.clone(),
                     ..MediaProbe::default()
                 };
@@ -1848,6 +1849,7 @@ fn write_version_facts(
         other => other.label(),
     });
     v.set_size_bytes(probe.size_bytes.unwrap_or_default());
+    v.set_duration_ms(probe.duration_ms.unwrap_or_default());
     v.set_container(probe.container.as_deref().unwrap_or_default());
     if admin {
         v.set_path(path.to_string_lossy().as_ref());

@@ -12,7 +12,7 @@ annotation secret(field, param) :Void;
 
 # Bumped when the schema changes; served as ServerInfo.schemaVersion so a client
 # can tell which methods a server knows (FR-009).
-const schemaVersion :UInt32 = 29;
+const schemaVersion :UInt32 = 30;
 
 # ---- ids and shared types -------------------------------------------------
 struct ItemId {                # mirrors pharos_jellyfin_api::WireId
@@ -269,6 +269,7 @@ struct Version {
   sizeBytes @9 :UInt64;
   container @10 :Text;
   path @11 :Text;
+  durationMs @12 :UInt64;           # the file's runtime; 0 when unknown. Since schemaVersion 30.
 }
 struct VersionAudio { language @0 :Text; codec @1 :Text; channels @2 :UInt32; }
 # A font the file embeds, for a renderer drawing an ASS subtitle (spec 026).

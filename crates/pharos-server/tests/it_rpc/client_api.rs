@@ -573,6 +573,7 @@ async fn versions_describe_their_files_and_show_paths_to_admins_only() {
         color_transfer: Some("smpte2084".into()),
         container: Some("mkv".into()),
         size_bytes: Some(9_000),
+        duration_ms: Some(1_441_000),
         audio_tracks: vec![
             AudioTrack {
                 codec: Some("eac3".into()),
@@ -603,6 +604,7 @@ async fn versions_describe_their_files_and_show_paths_to_admins_only() {
         audio_channels: Some(2),
         container: Some("mkv".into()),
         size_bytes: Some(4_000),
+        duration_ms: Some(1_400_000),
         alternate_sources: vec![
             AlternateMediaSource {
                 id: "season-1".into(),
@@ -617,6 +619,7 @@ async fn versions_describe_their_files_and_show_paths_to_admins_only() {
                 name: Some("AVI".into()),
                 video_codec: Some("mpeg4".into()),
                 size_bytes: Some(700),
+                duration_ms: Some(1_399_000),
                 probe: None,
                 ..Default::default()
             },
@@ -690,6 +693,11 @@ async fn versions_describe_their_files_and_show_paths_to_admins_only() {
     assert_eq!(langs, [("eng", 6), ("jpn", 2)]);
     assert_eq!(copy.path, "/libA/Show/Season 1/Show - S01E02.mkv");
     assert_eq!((avi.video_codec.as_str(), avi.size_bytes), ("mpeg4", 700));
+    // Spec 034 US4: each version's own runtime, for the runtime check.
+    assert_eq!(
+        (primary.duration_ms, copy.duration_ms, avi.duration_ms),
+        (1_400_000, 1_441_000, 1_399_000)
+    );
     assert!(
         admin.subtitle_tracks.is_empty(),
         "{:?}",
