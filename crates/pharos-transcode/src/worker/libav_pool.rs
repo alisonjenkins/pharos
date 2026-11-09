@@ -40,6 +40,55 @@ const DEFAULT_OP_TIMEOUT: Duration = Duration::from_secs(60);
 const DEFAULT_HEAVY_OP_TIMEOUT: Duration = Duration::from_secs(900);
 const DEFAULT_MAX_WORKERS: usize = 4;
 
+/// A worker spawning or leaving the pool, as the `event` and `reason`
+/// labels of `pharos_libav_worker_lifecycle_total`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Lifecycle {
+    /// No idle worker was free for an op.
+    Spawned,
+    /// Spawning or the handshake failed.
+    SpawnFailed,
+    /// Idle for the idle timeout.
+    ReapedIdle,
+    /// Died, hung or spoke out of protocol mid-op.
+    DiscardedBroken,
+}
+
+impl Lifecycle {
+    pub const ALL: [Lifecycle; 4] = [
+        Lifecycle::Spawned,
+        Lifecycle::SpawnFailed,
+        Lifecycle::ReapedIdle,
+        Lifecycle::DiscardedBroken,
+    ];
+
+    pub const fn event(self) -> &'static str {
+        match self {
+            Lifecycle::Spawned => "spawned",
+            Lifecycle::SpawnFailed => "spawn_failed",
+            Lifecycle::ReapedIdle | Lifecycle::DiscardedBroken => "exited",
+        }
+    }
+
+    pub const fn reason(self) -> &'static str {
+        match self {
+            Lifecycle::Spawned => "no_idle_worker",
+            Lifecycle::SpawnFailed => "spawn_error",
+            Lifecycle::ReapedIdle => "idle_timeout",
+            Lifecycle::DiscardedBroken => "broken",
+        }
+    }
+}
+
+fn record(ev: Lifecycle) {
+    metrics::counter!(
+        "pharos_libav_worker_lifecycle_total",
+        "event" => ev.event(),
+        "reason" => ev.reason(),
+    )
+    .increment(1);
+}
+
 /// Short label for logs.
 fn op_name(op: &TinyOp) -> &'static str {
     match op {
@@ -543,6 +592,7 @@ impl LibavWorkerPool {
             Err(e) => {
                 // Broken channel → drop the worker (kill_on_drop reaps it).
                 drop(worker);
+                record(Lifecycle::DiscardedBroken);
                 Err(e)
             }
         }
@@ -553,14 +603,21 @@ impl LibavWorkerPool {
         if let Some(w) = self.inner.idle.lock().await.pop() {
             return Ok(w);
         }
-        let (child, rd, wr, _handshake) = spawn_worker_proc(
+        let spawned = spawn_worker_proc(
             &self.inner.worker_bin,
             self.inner.handshake_timeout,
             false,
             crate::stage_timing::StageTimingMode::Off,
         )
-        .await
-        .map_err(|e| PoolError::Spawn(e.to_string()))?;
+        .await;
+        let (child, rd, wr, _handshake) = match spawned {
+            Ok(w) => w,
+            Err(e) => {
+                record(Lifecycle::SpawnFailed);
+                return Err(PoolError::Spawn(e.to_string()));
+            }
+        };
+        record(Lifecycle::Spawned);
         Ok(PooledWorker {
             rd,
             wr,
@@ -628,4 +685,18 @@ fn expect_done(ev: WorkerEvent) -> Result<u64, PoolError> {
 
 fn unexpected(ev: WorkerEvent) -> PoolError {
     PoolError::Dead(format!("unexpected reply: {ev:?}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lifecycle_label_pairs_are_distinct() {
+        let pairs: std::collections::HashSet<_> = Lifecycle::ALL
+            .iter()
+            .map(|l| (l.event(), l.reason()))
+            .collect();
+        assert_eq!(pairs.len(), Lifecycle::ALL.len());
+    }
 }
