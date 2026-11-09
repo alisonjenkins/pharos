@@ -37,11 +37,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::bg_io::BgPermit;
 use crate::config::MetadataConfig;
+use crate::episode_fit::{self, Candidate, LocalEpisode};
 use crate::metadata_language::{record_translation, TranslationOutcome, DEFAULT_LANGUAGE};
 use crate::musicbrainz::{AlbumArtResolver, MusicBrainzClient};
 use crate::online_enrich::{
-    apply_enrichment, download_and_cache_art, EnrichedMetadata, OnlineEnricher, RemoteArt,
-    TextsFetch,
+    apply_enrichment, download_and_cache_art, EnrichedMetadata, EpisodeListing, OnlineEnricher,
+    RemoteArt, TextsFetch,
 };
 use crate::series_identity::{
     log_series_match, record_episode_rejected, record_series_match, EpisodeRejectReason,
@@ -53,11 +54,14 @@ use crate::tvdb::{ReqwestTransport, TvdbEnricher};
 use pharos_cache::image_cache::ImageRole;
 use pharos_cache::ImageCache;
 use pharos_core::{
-    match_decide, ArtworkRole, DomainResult, GenreStore, LocalizedText, MatchDecision, MediaItem,
-    MediaKind, MediaStore, MetadataTranslationStore, PersonStore, PreferenceStore, ProviderIds,
-    SeriesMatchCandidate, SeriesMetadata, SeriesMetadataStore, TranslationGap, TranslationOwner,
+    match_decide, ArtworkRole, DomainResult, GenreStore, LocalizedText, MatchDecision,
+    MatchOutcome, MediaItem, MediaKind, MediaStore, MetadataTranslationStore, PersonStore,
+    PreferenceStore, ProviderIds, SeriesMatchCandidate, SeriesMetadata, SeriesMetadataStore,
+    TranslationGap, TranslationOwner,
 };
+use pharos_scanner::metadata::nfo::ShowNfoEvidence;
 use pharos_scanner::FilenameProvider;
+use std::collections::HashMap;
 
 /// Courtesy delay between items — well under either provider's published rate
 /// ceiling so a full backfill never trips limiting. This is on top of the
@@ -240,6 +244,7 @@ where
         + MetadataTranslationStore
         + PreferenceStore
         + pharos_core::UserStore
+        + pharos_core::SeriesIdentityStore
         + pharos_store_sqlx::ServerConfigStore,
 {
     // No provider configured → nothing to do (mirrors spawn's key gate).
@@ -1721,7 +1726,7 @@ async fn enrich_series_pass<Tv, Tm, S>(
 where
     Tv: OnlineEnricher,
     Tm: OnlineEnricher,
-    S: SeriesMetadataStore + MetadataTranslationStore,
+    S: SeriesMetadataStore + MetadataTranslationStore + pharos_core::SeriesIdentityStore,
 {
     let providers = SeriesProviders { tvdb, tmdb };
     let ttl_cutoff = now.saturating_sub(i64::from(cfg.refresh_ttl_days) * 86_400);
@@ -1732,9 +1737,11 @@ where
     // keeps draining rather than idling — see [`PassStats::had_work`].
     let had_work = !candidates.is_empty();
     let mut enriched = 0usize;
+    let mut lists = EpisodeLists::new();
     for cand in candidates {
         // V6 — one bad show never aborts the pass; log it and carry on.
-        match enrich_one_series(store, bg_io, cache, &providers, cfg, cand, now).await {
+        let one = enrich_one_series(store, bg_io, cache, &providers, cfg, cand, now, &mut lists);
+        match one.await {
             Ok(true) => enriched += 1,
             Ok(false) => {}
             Err(e) => tracing::warn!(error = %e, "T9-series metadata backfill: show failed"),
@@ -1761,6 +1768,7 @@ struct SeriesProviders<'a, Tv, Tm> {
 /// match, `Ok(false)` when it marked the show `none` (no confident hit) or hit
 /// a transient miss (left for the next pass). Local data can't be clobbered —
 /// a show has no curated local metadata, so this simply writes the record.
+#[allow(clippy::too_many_arguments)]
 async fn enrich_one_series<Tv, Tm, S>(
     store: &S,
     bg_io: &Arc<Semaphore>,
@@ -1769,11 +1777,12 @@ async fn enrich_one_series<Tv, Tm, S>(
     cfg: &MetadataConfig,
     cand: SeriesMatchCandidate,
     now: i64,
+    lists: &mut EpisodeLists,
 ) -> DomainResult<bool>
 where
     Tv: OnlineEnricher,
     Tm: OnlineEnricher,
-    S: SeriesMetadataStore + MetadataTranslationStore,
+    S: SeriesMetadataStore + MetadataTranslationStore + pharos_core::SeriesIdentityStore,
 {
     // B125 — TVDB first (it is the show-shaped provider), then TMDB. 44 of the
     // deployed library's 178 shows were marked `none` by TVDB alone, almost all
@@ -1786,7 +1795,7 @@ where
     // freezing the show as `none` for the whole TTL.
     let mut transient = None;
     if let Some(tv) = providers.tvdb {
-        match resolve_series(tv, "tvdb", bg_io, cache, cfg, &cand).await {
+        match resolve_series(store, tv, "tvdb", bg_io, cache, cfg, &cand, lists).await {
             SeriesAttempt::Hit(h) => outcome = Some(h),
             SeriesAttempt::Transient(d) => transient = Some(d),
             SeriesAttempt::NoMatch => {}
@@ -1795,7 +1804,7 @@ where
     let mut fell_back = false;
     if outcome.is_none() {
         if let Some(tm) = providers.tmdb {
-            match resolve_series(tm, "tmdb", bg_io, cache, cfg, &cand).await {
+            match resolve_series(store, tm, "tmdb", bg_io, cache, cfg, &cand, lists).await {
                 SeriesAttempt::Hit(h) => {
                     outcome = Some(h);
                     fell_back = true;
@@ -1847,6 +1856,7 @@ where
         );
     }
 
+    let flagged = hit.decision.ambiguous;
     let provider_ids = match hit.provider {
         "tmdb" => ProviderIds {
             tmdb: Some(hit.external_id.clone()),
@@ -1883,9 +1893,13 @@ where
             backdrop_locator: hit.backdrop_locator,
             // The upsert never writes the ratings columns.
             ratings: Default::default(),
-            match_flag: None,
-            match_runner_up_id: None,
-            match_runner_up_score: None,
+            // V891 — every upsert writes the flag, so a clear decision on a
+            // later pass clears it.
+            match_flag: flagged.then(|| AMBIGUOUS_FLAG.to_string()),
+            match_runner_up_id: flagged
+                .then(|| hit.decision.runner_up.as_ref().map(|r| r.id.clone()))
+                .flatten(),
+            match_runner_up_score: flagged.then_some(hit.runner_up_score).flatten(),
         })
         .await?;
     store_texts(
@@ -2266,6 +2280,9 @@ pub(crate) fn adopt_default_text(
 /// One provider's answer for a show, with its artwork already cached.
 struct SeriesHit {
     decision: MatchDecision,
+    /// The runner-up's score in the deciding rule: its episode fit when the
+    /// episodes decided, else its match confidence.
+    runner_up_score: Option<f32>,
     provider: &'static str,
     external_id: String,
     confidence: Option<f32>,
@@ -2285,19 +2302,26 @@ enum SeriesAttempt {
 
 /// Search `enricher` for `cand` and, on a confident hit, cache the show's
 /// poster + backdrop.
-async fn resolve_series<E: OnlineEnricher>(
+#[allow(clippy::too_many_arguments)]
+async fn resolve_series<E, S>(
+    store: &S,
     enricher: &E,
     provider: &'static str,
     bg_io: &Arc<Semaphore>,
     cache: &ImageCache,
     cfg: &MetadataConfig,
     cand: &SeriesMatchCandidate,
-) -> SeriesAttempt {
+    lists: &mut EpisodeLists,
+) -> SeriesAttempt
+where
+    E: OnlineEnricher,
+    S: pharos_core::SeriesIdentityStore,
+{
     // kind=Episode + season/episode=None routes to the provider's SERIES-level
     // search+fetch (TvdbEnricher: search_series → get_series; TmdbEnricher:
     // search_tv → tv_detail). No nfo id for a synthesised show, so it always
     // searches.
-    let decision = search_decide(
+    let mut decision = search_decide(
         enricher,
         MediaKind::Episode,
         &cand.series_name,
@@ -2306,6 +2330,11 @@ async fn resolve_series<E: OnlineEnricher>(
         cfg,
     )
     .await;
+    let fit_runner_up = if needs_episode_fit(&decision) {
+        apply_episode_fit(store, enricher, provider, bg_io, cand, &mut decision, lists).await
+    } else {
+        None
+    };
     log_series_match(
         provider,
         &cand.series_key,
@@ -2346,8 +2375,11 @@ async fn resolve_series<E: OnlineEnricher>(
         &enriched,
     )
     .await;
+    let runner_up_score =
+        fit_runner_up.or_else(|| decision.runner_up.as_ref().map(|r| r.confidence));
     SeriesAttempt::Hit(Box::new(SeriesHit {
         decision,
+        runner_up_score,
         provider,
         external_id,
         confidence,
@@ -2355,6 +2387,199 @@ async fn resolve_series<E: OnlineEnricher>(
         poster_locator,
         backdrop_locator,
     }))
+}
+
+/// Spec 033 (V891) — `series_metadata.match_flag` of a close call.
+pub(crate) const AMBIGUOUS_FLAG: &str = "ambiguous";
+
+/// Episode lists fetched this pass, by provider, show id and the seasons
+/// asked: shows that share candidates (two Battlestar Galactica folders) ask
+/// once.
+type EpisodeLists = HashMap<(&'static str, String, Vec<u32>), Vec<EpisodeListing>>;
+
+/// The exact-name candidates scoring as the chosen one does, in the
+/// provider's order: shows of the same name that no folder or file year told
+/// apart. Empty unless the chosen candidate is one of them.
+fn exact_candidates(decision: &MatchDecision) -> Vec<&pharos_core::ScoredCandidate> {
+    let Some(chosen) = &decision.chosen else {
+        return Vec::new();
+    };
+    let tied = |c: &&pharos_core::ScoredCandidate| {
+        c.exact && (c.score - chosen.confidence).abs() <= f32::EPSILON
+    };
+    if !decision
+        .candidates
+        .iter()
+        .filter(tied)
+        .any(|c| c.id == chosen.id)
+    {
+        return Vec::new();
+    }
+    decision.candidates.iter().filter(tied).collect()
+}
+
+/// B930 — two or more shows match the name exactly and score alike, so the
+/// matcher fell back to provider order or to which of their names matched
+/// first (TVDB lists a remake as "Battlestar Galactica (2003)" with the bare
+/// name as an alias).
+fn needs_episode_fit(decision: &MatchDecision) -> bool {
+    exact_candidates(decision).len() >= 2
+}
+
+/// The show's local episodes, one per (season, episode), with the filename's
+/// episode title.
+fn local_episodes(rows: Vec<pharos_core::SeriesEpisodeRow>) -> Vec<LocalEpisode> {
+    let mut by_number = std::collections::BTreeMap::new();
+    for row in rows {
+        let (Some(season), Some(episode)) = (row.season, row.episode) else {
+            continue;
+        };
+        let title = std::path::Path::new(&row.path)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .and_then(pharos_scanner::metadata::filename::episode_title);
+        let slot = by_number.entry((season, episode)).or_insert(None);
+        if slot.is_none() {
+            *slot = title;
+        }
+    }
+    by_number
+        .into_iter()
+        .map(|((season, episode), title)| LocalEpisode {
+            season,
+            episode,
+            title,
+        })
+        .collect()
+}
+
+/// What the show folder's `tvshow.nfo` says, when the key is a folder.
+async fn show_nfo(cand: &SeriesMatchCandidate) -> Option<ShowNfoEvidence> {
+    let folder = cand
+        .series_key
+        .split(pharos_scanner::series_split::SPLIT_KEY_SEPARATOR)
+        .next()
+        .filter(|f| std::path::Path::new(f).is_absolute())?
+        .to_string();
+    let (name, year) = (cand.series_name.clone(), cand.series_year);
+    tokio::task::spawn_blocking(move || {
+        pharos_scanner::metadata::nfo::show_nfo_evidence(std::path::Path::new(&folder), &name, year)
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+/// Spec 033 (V891) — replace a provider-order tie-break with the candidate
+/// whose episodes fit the local files best, and flag a close call. Returns
+/// the runner-up's score when the episodes decided. A list that cannot be
+/// fetched leaves the provider's choice in place, flagged.
+#[allow(clippy::too_many_arguments)]
+async fn apply_episode_fit<E, S>(
+    store: &S,
+    enricher: &E,
+    provider: &'static str,
+    bg_io: &Arc<Semaphore>,
+    cand: &SeriesMatchCandidate,
+    decision: &mut MatchDecision,
+    lists: &mut EpisodeLists,
+) -> Option<f32>
+where
+    E: OnlineEnricher,
+    S: pharos_core::SeriesIdentityStore,
+{
+    let exact = exact_candidates(decision);
+    let unscored = exact.len().saturating_sub(episode_fit::MAX_SCORED);
+    let scored: Vec<(Candidate, f32)> = exact
+        .into_iter()
+        .take(episode_fit::MAX_SCORED)
+        .map(|c| {
+            (
+                Candidate {
+                    id: c.id.clone(),
+                    year: c.year,
+                },
+                c.score,
+            )
+        })
+        .collect();
+    let rows = match store.series_episodes(&cand.series_key).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!(error = %e, series_key = %cand.series_key, "series episode fit: local episodes unreadable");
+            Vec::new()
+        }
+    };
+    let local = local_episodes(rows);
+    let seasons: Vec<u32> = local
+        .iter()
+        .map(|l| l.season)
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let mut fits = Vec::with_capacity(scored.len());
+    for (c, _) in &scored {
+        let key = (provider, c.id.clone(), seasons.clone());
+        if !lists.contains_key(&key) {
+            let listing = {
+                let _permit = BgPermit::acquire(bg_io).await;
+                enricher.episode_list(&c.id, &seasons).await
+            };
+            match listing {
+                Some(l) => {
+                    lists.insert(key.clone(), l);
+                }
+                None => {
+                    decision.ambiguous = true;
+                    tracing::warn!(
+                        provider,
+                        series_key = %cand.series_key,
+                        candidate = %c.id,
+                        "series episode fit: episode list unavailable; provider order kept, flagged"
+                    );
+                    return None;
+                }
+            }
+        }
+        fits.push(lists.get(&key).map_or(0.0, |l| episode_fit::fit(&local, l)));
+    }
+    let nfo = show_nfo(cand).await;
+    let candidates: Vec<Candidate> = scored.iter().map(|(c, _)| c.clone()).collect();
+    let vote = episode_fit::nfo_vote(provider, &candidates, nfo.as_ref());
+    let verdict = episode_fit::decide(&fits, vote)?;
+    let outcome = |at: Option<usize>| {
+        let (c, score) = scored.get(at?)?;
+        Some(MatchOutcome {
+            id: c.id.clone(),
+            confidence: *score,
+        })
+    };
+    decision.chosen = outcome(Some(verdict.chosen));
+    decision.runner_up = outcome(verdict.runner_up);
+    decision.decided_by = Some(verdict.decided_by);
+    decision.ambiguous = verdict.close || unscored > 0;
+    let scores: Vec<String> = candidates
+        .iter()
+        .zip(&verdict.scores)
+        .map(|(c, s)| format!("{}:{s:.3}", c.id))
+        .collect();
+    let runner_up_score = verdict.runner_up.and_then(|at| verdict.score(at));
+    tracing::info!(
+        provider,
+        series_key = %cand.series_key,
+        local_episodes = local.len(),
+        titled = local.iter().filter(|l| l.title.is_some()).count(),
+        scores = ?scores,
+        nfo_vote = vote.and_then(|at| candidates.get(at)).map(|c| c.id.as_str()),
+        chosen = decision.chosen.as_ref().map(|c| c.id.as_str()),
+        runner_up = decision.runner_up.as_ref().map(|c| c.id.as_str()),
+        margin = verdict.score(verdict.chosen).zip(runner_up_score).map(|(a, b)| a - b),
+        unscored,
+        flagged = decision.ambiguous,
+        decided_by = verdict.decided_by.label(),
+        "series episode fit"
+    );
+    runner_up_score
 }
 
 /// Download the show's artwork of role `want` (if the record offers it) and
@@ -2485,6 +2710,10 @@ mod tests {
         image_bytes: Option<Vec<u8>>,
         texts: TextsFetch,
         asked: Arc<std::sync::Mutex<Vec<Vec<String>>>>,
+        /// Episode lists by show id; any other id has none.
+        lists: HashMap<String, Vec<EpisodeListing>>,
+        /// Every id `episode_list` was asked for, in order.
+        listed: Arc<std::sync::Mutex<Vec<String>>>,
     }
 
     impl FakeEnricher {
@@ -2498,6 +2727,8 @@ mod tests {
                 image_bytes: None,
                 texts: TextsFetch::Failed,
                 asked: Default::default(),
+                lists: HashMap::new(),
+                listed: Default::default(),
             }
         }
 
@@ -2511,6 +2742,8 @@ mod tests {
                 image_bytes: None,
                 texts: TextsFetch::Failed,
                 asked: Default::default(),
+                lists: HashMap::new(),
+                listed: Default::default(),
             }
         }
 
@@ -2539,6 +2772,23 @@ mod tests {
 
         fn fetched(&self) -> Vec<String> {
             self.fetched.lock().unwrap().clone()
+        }
+
+        fn with_list(mut self, id: &str, episodes: &[(u32, u32, &str)]) -> Self {
+            let list = episodes
+                .iter()
+                .map(|&(season, episode, title)| EpisodeListing {
+                    season,
+                    episode,
+                    title: Some(title.to_string()),
+                })
+                .collect();
+            self.lists.insert(id.to_string(), list);
+            self
+        }
+
+        fn listed(&self) -> Vec<String> {
+            self.listed.lock().unwrap().clone()
         }
 
         fn with_image_bytes(mut self, bytes: Vec<u8>) -> Self {
@@ -2613,6 +2863,10 @@ mod tests {
         ) -> TextsFetch {
             self.asked.lock().unwrap().push(languages.to_vec());
             self.texts.clone()
+        }
+        async fn episode_list(&self, id: &str, _seasons: &[u32]) -> Option<Vec<EpisodeListing>> {
+            self.listed.lock().unwrap().push(id.to_string());
+            self.lists.get(id).cloned()
         }
     }
 
@@ -4643,6 +4897,310 @@ mod tests {
         ] {
             assert!(line.contains(want), "{want} missing from {line}");
         }
+    }
+
+    /// One episode file of `folder`, named `"{series} - S..E.. - {title}"`.
+    async fn put_titled_episode(
+        store: &SqliteStore,
+        id: u64,
+        folder: &str,
+        (season, episode): (u32, u32),
+        title: &str,
+    ) {
+        let series = folder.rsplit('/').next().unwrap_or(folder);
+        let item = MediaItem {
+            id,
+            path: format!(
+                "{folder}/Season {season}/{series} - S{season:02}E{episode:02} - {title}.mkv"
+            )
+            .into(),
+            title: title.into(),
+            kind: MediaKind::Episode,
+            series: Some(pharos_core::SeriesInfo {
+                series_name: series.into(),
+                season_number: Some(season),
+                episode_number: Some(episode),
+                series_folder: Some(folder.into()),
+                series_year: None,
+                series_key: None,
+            }),
+            ..MediaItem::default()
+        };
+        store.put(item).await.unwrap();
+    }
+
+    fn bsg_search(tvdb: FakeEnricher) -> FakeEnricher {
+        tvdb.with_search(vec![
+            ("71173", "Battlestar Galactica", Some(1978)),
+            ("73545", "Battlestar Galactica", Some(2003)),
+        ])
+        .with_detail(enriched_overview("A rag-tag fleet."))
+    }
+
+    async fn series_row(s: &SqliteStore, key: &str) -> SeriesMetadata {
+        s.series_metadata_by_keys(&[key.to_string()])
+            .await
+            .unwrap()
+            .remove(key)
+            .unwrap_or_else(|| panic!("no series row for {key}"))
+    }
+
+    async fn series_pass(s: &SqliteStore, cache: &ImageCache, tvdb: &FakeEnricher) {
+        enrich_series_pass(
+            s,
+            &sem(4),
+            cache,
+            Some(tvdb),
+            None::<&FakeEnricher>,
+            &MetadataConfig::default(),
+            NOW,
+        )
+        .await
+        .unwrap();
+    }
+
+    /// Spec 033 V891 / B930 — two shows named exactly "Battlestar Galactica"
+    /// and no year: the one whose episodes the folder holds wins, not the
+    /// provider's first. Counted and logged as decided by episode fit, and
+    /// each show's list is fetched once per pass however many folders ask.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_same_named_show_is_decided_by_its_episodes() {
+        use metrics_util::debugging::DebuggingRecorder;
+        let recorder = DebuggingRecorder::new();
+        let snap = pharos_test_metrics::snapshotter(&recorder);
+        let _metrics = metrics::set_default_local_recorder(&recorder);
+        let (logs, _log) = log_capture();
+
+        let s = store().await;
+        for (id, season, title) in [
+            (1, 1, "33"),
+            (2, 2, "Valley of Darkness"),
+            (3, 4, "He That Believeth in Me"),
+        ] {
+            put_titled_episode(&s, id, "/tv/Battlestar Galactica", (season, 1), title).await;
+            put_titled_episode(&s, id + 10, "/tv2/Battlestar Galactica", (season, 1), title).await;
+        }
+        let (_td, cache) = cache();
+        let tvdb = bsg_search(FakeEnricher::tvdb())
+            .with_list(
+                "71173",
+                &[
+                    (1, 1, "Saga of a Star World"),
+                    (1, 2, "Lost Planet of the Gods"),
+                ],
+            )
+            .with_list(
+                "73545",
+                &[
+                    (1, 1, "33"),
+                    (2, 1, "Valley of Darkness"),
+                    (3, 1, "Occupation"),
+                    (4, 1, "He That Believeth in Me"),
+                ],
+            );
+
+        series_pass(&s, &cache, &tvdb).await;
+
+        for key in ["/tv/Battlestar Galactica", "/tv2/Battlestar Galactica"] {
+            let row = series_row(&s, key).await;
+            assert_eq!(row.match_external_id.as_deref(), Some("73545"), "{key}");
+            assert_eq!(row.match_flag, None, "a clear fit is not flagged");
+            assert_eq!(row.match_runner_up_id, None);
+        }
+        let mut listed = tvdb.listed();
+        listed.sort();
+        assert_eq!(listed, ["71173", "73545"], "one list per show per pass");
+        assert!(!tvdb.fetched().contains(&"71173".to_string()));
+        assert_eq!(
+            counter_value(
+                &snap,
+                "pharos_series_match_total",
+                &[("outcome", "matched"), ("decided_by", "episode_fit")]
+            ),
+            2
+        );
+        let text = logs.text();
+        let line = text
+            .lines()
+            .find(|l| l.contains("series episode fit"))
+            .unwrap_or_else(|| panic!("no episode fit line in {text}"));
+        for want in [
+            "chosen=\"73545\"",
+            "runner_up=\"71173\"",
+            "local_episodes=3",
+            "titled=3",
+            "flagged=false",
+            "decided_by=\"episode_fit\"",
+            "73545:1.000",
+            "71173:0.167",
+        ] {
+            assert!(line.contains(want), "{want} missing from {line}");
+        }
+        let decision = text
+            .lines()
+            .find(|l| l.contains("series match"))
+            .unwrap_or_else(|| panic!("no decision line in {text}"));
+        assert!(
+            decision.contains("decided_by=\"episode_fit\""),
+            "{decision}"
+        );
+    }
+
+    /// B930 — TVDB titles the remake "Battlestar Galactica (2003)" with the
+    /// bare name as an alias, so the original wins on name position alone.
+    /// The episodes still decide.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_remake_matching_by_its_alias_is_decided_by_its_episodes() {
+        let s = store().await;
+        put_titled_episode(
+            &s,
+            1,
+            "/tv/Battlestar Galactica",
+            (4, 1),
+            "He That Believeth in Me",
+        )
+        .await;
+        let (_td, cache) = cache();
+        let mut tvdb = FakeEnricher::tvdb()
+            .with_detail(enriched_overview("A rag-tag fleet."))
+            .with_list("71173", &[(1, 1, "Saga of a Star World")])
+            .with_list("73545", &[(4, 1, "He That Believeth in Me")]);
+        tvdb.search = vec![
+            SearchCandidate {
+                id: "71173".into(),
+                title: "Battlestar Galactica".into(),
+                year: Some(1978),
+                aliases: Vec::new(),
+            },
+            SearchCandidate {
+                id: "73545".into(),
+                title: "Battlestar Galactica (2003)".into(),
+                year: Some(2003),
+                aliases: vec!["Battlestar Galactica".into()],
+            },
+        ];
+
+        series_pass(&s, &cache, &tvdb).await;
+
+        let row = series_row(&s, "/tv/Battlestar Galactica").await;
+        assert_eq!(row.match_external_id.as_deref(), Some("73545"));
+        assert_eq!(row.match_flag, None);
+    }
+
+    /// V891 — when the episodes fit both shows about as well, the best guess
+    /// is still used, but flagged with its runner-up for an admin.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_close_episode_fit_is_flagged_with_its_runner_up() {
+        use metrics_util::debugging::DebuggingRecorder;
+        let recorder = DebuggingRecorder::new();
+        let snap = pharos_test_metrics::snapshotter(&recorder);
+        let _metrics = metrics::set_default_local_recorder(&recorder);
+        let s = store().await;
+        put_titled_episode(&s, 1, "/tv/Battlestar Galactica", (1, 1), "Pilot").await;
+        let (_td, cache) = cache();
+        let tvdb = bsg_search(FakeEnricher::tvdb())
+            .with_list("71173", &[(1, 1, "Pilot")])
+            .with_list("73545", &[(1, 1, "Pilot")]);
+
+        series_pass(&s, &cache, &tvdb).await;
+
+        let row = series_row(&s, "/tv/Battlestar Galactica").await;
+        assert_eq!(row.match_external_id.as_deref(), Some("71173"));
+        assert_eq!(row.match_flag.as_deref(), Some(AMBIGUOUS_FLAG));
+        assert_eq!(row.match_runner_up_id.as_deref(), Some("73545"));
+        assert_eq!(row.match_runner_up_score, Some(1.0));
+        assert_eq!(
+            counter_value(
+                &snap,
+                "pharos_series_match_total",
+                &[("outcome", "ambiguous"), ("decided_by", "episode_fit")]
+            ),
+            1
+        );
+    }
+
+    /// V890 — `tvshow.nfo` is one vote: it decides between even fits, and the
+    /// call stays flagged because the episodes did not decide it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_show_nfo_votes_between_even_episode_fits() {
+        let show = TempDir::new().unwrap();
+        let folder = show.path().join("Battlestar Galactica");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(
+            folder.join("tvshow.nfo"),
+            r#"<tvshow><title>Battlestar Galactica</title><uniqueid type="tvdb">73545</uniqueid></tvshow>"#,
+        )
+        .unwrap();
+        let folder = folder.to_string_lossy().into_owned();
+        let s = store().await;
+        put_titled_episode(&s, 1, &folder, (1, 1), "Pilot").await;
+        let (_td, cache) = cache();
+        let tvdb = bsg_search(FakeEnricher::tvdb())
+            .with_list("71173", &[(1, 1, "Pilot")])
+            .with_list("73545", &[(1, 1, "Pilot")]);
+        let (logs, _log) = log_capture();
+
+        series_pass(&s, &cache, &tvdb).await;
+
+        let row = series_row(&s, &folder).await;
+        assert_eq!(row.match_external_id.as_deref(), Some("73545"));
+        assert_eq!(row.match_flag.as_deref(), Some(AMBIGUOUS_FLAG));
+        assert_eq!(row.match_runner_up_id.as_deref(), Some("71173"));
+        let text = logs.text();
+        assert!(
+            text.lines().any(|l| l.contains("series episode fit")
+                && l.contains("nfo_vote=\"73545\"")
+                && l.contains("decided_by=\"nfo_vote\"")),
+            "{text}"
+        );
+    }
+
+    /// V891 — more same-named shows than were scored: the best of the scored
+    /// three is used and flagged, since an unscored one may fit better.
+    #[tokio::test(flavor = "current_thread")]
+    async fn more_same_named_shows_than_scored_is_flagged() {
+        let s = store().await;
+        put_titled_episode(&s, 1, "/tv/Cosmos", (1, 1), "Shores").await;
+        let (_td, cache) = cache();
+        let tvdb = FakeEnricher::tvdb()
+            .with_search(vec![
+                ("1", "Cosmos", None),
+                ("2", "Cosmos", None),
+                ("3", "Cosmos", None),
+                ("4", "Cosmos", None),
+            ])
+            .with_detail(enriched_overview("Space."))
+            .with_list("1", &[(2, 1, "x")])
+            .with_list("2", &[(1, 1, "Shores")])
+            .with_list("3", &[(3, 1, "y")])
+            .with_list("4", &[(1, 1, "Shores")]);
+
+        series_pass(&s, &cache, &tvdb).await;
+
+        let row = series_row(&s, "/tv/Cosmos").await;
+        assert_eq!(row.match_external_id.as_deref(), Some("2"));
+        assert_eq!(row.match_flag.as_deref(), Some(AMBIGUOUS_FLAG));
+        assert!(
+            !tvdb.listed().contains(&"4".to_string()),
+            "only three scored"
+        );
+    }
+
+    /// A list the provider cannot give leaves the provider's choice in place,
+    /// flagged rather than silently trusted.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_unavailable_episode_list_keeps_the_choice_and_flags_it() {
+        let s = store().await;
+        put_titled_episode(&s, 1, "/tv/Battlestar Galactica", (1, 1), "33").await;
+        let (_td, cache) = cache();
+        let tvdb = bsg_search(FakeEnricher::tvdb()).with_list("73545", &[(1, 1, "33")]);
+
+        series_pass(&s, &cache, &tvdb).await;
+
+        let row = series_row(&s, "/tv/Battlestar Galactica").await;
+        assert_eq!(row.match_external_id.as_deref(), Some("71173"));
+        assert_eq!(row.match_flag.as_deref(), Some(AMBIGUOUS_FLAG));
+        assert_eq!(row.match_runner_up_id.as_deref(), Some("73545"));
     }
 
     #[tokio::test(flavor = "current_thread")]

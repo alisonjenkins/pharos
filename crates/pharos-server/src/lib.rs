@@ -17,6 +17,7 @@ pub mod cli;
 pub mod client_ip;
 pub mod config;
 pub mod dlna;
+pub(crate) mod episode_fit;
 pub mod group_ops;
 pub mod health;
 pub mod http_workers;
