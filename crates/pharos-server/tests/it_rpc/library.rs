@@ -3003,6 +3003,84 @@ async fn a_listing_keeps_to_watched_or_unwatched() {
     );
 }
 
+/// B1081: `IsFavorite` lists a series tile while every episode in it is a
+/// favourite, which is what marking the show writes; one favourite episode
+/// does not make its show one. `IsNotFavorite` lists the rest.
+/// Disarm check: with the favourite check in `virtual_shows_page` skipped,
+/// both series list under either filter.
+#[actix_web::test]
+async fn a_listing_keeps_to_favourite_series() {
+    use pharos_core::UserDataStore as _;
+
+    let (server, fx) = crate::revocation::start().await;
+    let (client, _closed) = crate::revocation::connect(&server).await;
+    let session = crate::revocation::signed_in(&client, &fx.user_token).await;
+    let tv = seed_tv_library(&fx).await;
+    let favourite = pharos_core::UserItemData {
+        is_favorite: true,
+        ..pharos_core::UserItemData::default()
+    };
+    let mark = |id: u64| {
+        let fx = &fx;
+        async move {
+            fx.state
+                .stores
+                .set_user_data(fx.user_id, id, favourite)
+                .await
+                .unwrap();
+        }
+    };
+    // Season 1 of "Show" only: its season 2 episode is no favourite.
+    mark(601).await;
+    mark(602).await;
+    assert!(
+        listed_in(&session, &tv, &[Kind::Series], "", &["IsFavorite"])
+            .await
+            .is_empty()
+    );
+    mark(603).await;
+    assert_eq!(
+        listed_in(&session, &tv, &[Kind::Series], "", &["IsFavorite"]).await,
+        ["Show"]
+    );
+    assert_eq!(
+        listed_in(&session, &tv, &[Kind::Series], "", &["IsNotFavorite"]).await,
+        ["Mature"]
+    );
+    // The Favourites page asks with no parent, one kind at a time.
+    let names = |page: Vec<serde_json::Value>| -> Vec<String> {
+        page.iter()
+            .map(|i| i["Name"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    let (_, shows) = wire_query(
+        &session,
+        None,
+        &[Kind::Series],
+        "SortName",
+        false,
+        "",
+        &["IsFavorite"],
+        0,
+        50,
+    )
+    .await;
+    assert_eq!(names(shows), ["Show"]);
+    let (total, episodes) = wire_query(
+        &session,
+        None,
+        &[Kind::Episode],
+        "SortName",
+        false,
+        "",
+        &["IsFavorite"],
+        0,
+        50,
+    )
+    .await;
+    assert_eq!(total, 3, "{:?}", names(episodes));
+}
+
 /// One `Library.index` call: each letter and where it starts, then genres.
 async fn wire_index(
     session: &session::Client,
