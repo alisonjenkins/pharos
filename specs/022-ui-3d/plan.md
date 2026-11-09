@@ -115,6 +115,11 @@ are ready.
   the eye; for full SBS or TAB it is half the eye's height or width. Fixed by
   passing the eye size if JASSUB takes one, else noted as a known gap (ASS in
   a full-packed 3D rip is rare).
+- **The browser's own cue box while cropped**: `::cue` is drawn inside the
+  stretched `<video>`, so a WebVTT cue would be stretched and off centre. Text
+  subtitles go through pharos-subs, which fits to the eye; the native cue path
+  is only its fallback (spec 026). If that fallback shows up on a 3D play, the
+  FR-006 overlay is the fix.
 - **Steam Frame support is unknown** (spec Decision 4); feature detection
   keeps it safe either way.
 - **Schema collisions** with #596 and 020: settled by rebasing PR 1 last
