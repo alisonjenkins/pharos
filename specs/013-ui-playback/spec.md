@@ -2,7 +2,7 @@
 
 **Feature directory**: `specs/013-ui-playback/`
 **Created**: 2026-11-01
-**Status**: draft (`/speckit-specify` stage; next: `/speckit-clarify`)
+**Status**: partly implemented 2026-11-02..09 (HLS player, tracks, trickplay, skips, queue, music, VR/3D, watch together); books reader, Live TV, explain-playback open (see Progress, audited 2026-11-09)
 **Input**: "It must support all the things Jellyfin's UI does and more."
 (Alison, 2026-11-01)
 **Depends on**: 009 (shell, mini-player slot, websocket), 011 (player keys),
@@ -168,3 +168,19 @@ snapshot plus `PlaySessionId` to the client-log endpoint.
 - Token expiry mid-stream; server restart mid-stream; seek past end.
 - 55 external subtitle tracks (BACKLOG 0a) — list lazily, fetch only the chosen one.
 - Tab hidden: keep audio, stop GPU work.
+
+## Progress (audited 2026-11-09)
+
+Evidence is `crates/pharos-ui/src/native/` (`watch_view.rs`, `hls_web.rs`, `playback.rs`, `listen.rs`, `queue.rs`, `lyrics.rs`, `subtitles.rs`, `stereo.rs`, `xr_web.rs`).
+
+- US1 any video plays: done, with a changed approach. HLS player (#519), recovery (#524), renegotiation (#586, ADR-0056), Rust HLS engine seam (#960, spec 031 owns), quality (`quality.rs`), codec decision on TV (#1046); ASS via JASSUB (ADR-0057). Capability probe lives in `playback.rs`/`host.rs`.
+- US2 controls: done (#563 tracks, volume, chapters; #588 whole-screen player; #606; #607).
+- US3 skip segments: done (`Segment` in `watch_view.rs`, skip button, Shift+click skip #607, #983 hit area).
+- US4 resume and progress: done (#519, `resume.rs`, #996 music resume).
+- US5 live TV: not started in the native UI (legacy pane only).
+- US6 read a book: not started in pharos-ui (spec 023, owned elsewhere).
+- US7 music player and queue: done (`listen.rs`, `queue.rs`, #632, #721 crossfade, prev/next, #876, lyrics #898).
+- US8 audiobooks/podcast-like audio: not started (no spoken-word specific UI found).
+- US9 VR: partial/done. `stereo.rs`, `xr_web.rs`, `render/webgl_xr.rs`, `stereo_quad.rs` (spec 022 3D plan, f26ba5b3).
+- US10 explain playback: partial. `preplay.rs` and `diagnostics.rs`/`hls_trace.rs` telemetry; no user-facing explain panel verified.
+- FR-004 trickplay: done (#563, 3D seek bar #827). FR-009 Media Session done; wake lock not found. FR-010 instrumentation: done (HLS telemetry #988, Telemetry.submit #552).
