@@ -84,7 +84,14 @@ pub struct Split {
     pub owner_year: u32,
     /// How the owner was chosen: `override`, `stored_match` or `largest`.
     pub owner_by: &'static str,
+    /// What split it: `stated_years` (the files' own years) or
+    /// `episode_titles` (a `scanner` row placed an unyeared file by its
+    /// episode title).
+    pub reason: &'static str,
 }
+
+/// The split reasons, the `reason` label of `pharos_series_folder_split_total`.
+pub const SPLIT_REASONS: [&str; 2] = ["stated_years", "episode_titles"];
 
 impl Split {
     /// `none:4, 2014:62`, for the log line.
@@ -140,12 +147,56 @@ pub fn folders_of(paths: &[PathBuf]) -> BTreeMap<String, Vec<(PathBuf, Option<u3
 
 /// The folders whose files state two or more years; the only ones whose
 /// stored match the plan needs.
-pub fn split_candidates(folders: &BTreeMap<String, Vec<(PathBuf, Option<u32>)>>) -> Vec<String> {
+pub fn split_candidates(
+    folders: &BTreeMap<String, Vec<(PathBuf, Option<u32>)>>,
+    overrides: &[SeriesOverride],
+) -> Vec<String> {
     folders
         .iter()
-        .filter(|(_, files)| distinct_years(files).len() > 1)
+        .filter(|(folder, files)| {
+            let (files, _) = with_title_evidence(folder, files, overrides);
+            distinct_years(&files).len() > 1
+        })
         .map(|(f, _)| f.clone())
         .collect()
+}
+
+/// V893 — `files` with each unyeared file a `scanner` path row places given
+/// that row's year, as if the file stated it: the server records a row when
+/// the file's episode title belongs to a same-named show of another year, so
+/// the folder splits by year and [`owner`] decides who keeps the plain key.
+/// A path an `admin` row names is left to that row. Returns whether any year
+/// came from a row.
+fn with_title_evidence(
+    folder: &str,
+    files: &[(PathBuf, Option<u32>)],
+    overrides: &[SeriesOverride],
+) -> (Vec<(PathBuf, Option<u32>)>, bool) {
+    let row_year = |path: &Path| {
+        let named = |source| {
+            overrides.iter().find(|o| {
+                o.series_folder == folder
+                    && o.source == source
+                    && o.path.as_deref().map(Path::new) == Some(path)
+            })
+        };
+        if named(OverrideSource::Admin).is_some() {
+            return None;
+        }
+        named(OverrideSource::Scanner).and_then(|o| o.target_year)
+    };
+    let mut by_title = false;
+    let files = files
+        .iter()
+        .map(|(path, year)| match (year, row_year(path)) {
+            (None, Some(y)) => {
+                by_title = true;
+                (path.clone(), Some(y))
+            }
+            _ => (path.clone(), *year),
+        })
+        .collect();
+    (files, by_title)
 }
 
 fn distinct_years(files: &[(PathBuf, Option<u32>)]) -> std::collections::BTreeSet<u32> {
@@ -161,6 +212,9 @@ pub fn plan(
     let mut out = SeriesPlan::default();
     for (folder, files) in folders {
         out.walked.insert(folder.clone());
+        let (stated, by_title) = with_title_evidence(folder, files, &ctx.overrides);
+        let own = files;
+        let files = &stated;
         let years = distinct_years(files);
         let mut assign = |path: &PathBuf, key: String, year: Option<u32>| {
             out.assignments.insert(
@@ -214,16 +268,23 @@ pub fn plan(
                     groups,
                     owner_year,
                     owner_by,
+                    reason: if by_title {
+                        "episode_titles"
+                    } else {
+                        "stated_years"
+                    },
                 });
             }
         }
-        place_by_override(folder, files, ctx, &mut out.assignments);
+        place_by_override(folder, own, ctx, &mut out.assignments);
     }
     out
 }
 
 /// A file a `series_overrides` row names goes where the row says, whatever
-/// its stated year; an `admin` row wins over a `scanner` one.
+/// its stated year; an `admin` row wins over a `scanner` one. A `scanner`
+/// row's year has already split the folder ([`with_title_evidence`]), so
+/// its key here only matters for a file that states a year of its own.
 fn place_by_override(
     folder: &str,
     files: &[(PathBuf, Option<u32>)],
@@ -241,7 +302,10 @@ fn place_by_override(
         let Some(path) = o.path.as_deref().map(Path::new) else {
             continue;
         };
-        if let Some((path, _)) = files.iter().find(|(p, _)| p == path) {
+        if let Some((path, year)) = files.iter().find(|(p, _)| p == path) {
+            if o.source == OverrideSource::Scanner && year.is_none() {
+                continue;
+            }
             assignments.insert(
                 path.clone(),
                 Assignment {
@@ -334,7 +398,7 @@ pub async fn context<S: SeriesIdentityStore>(
     for chunk in names.chunks(OVERRIDE_READ_CHUNK) {
         overrides.extend(store.series_overrides(chunk).await?);
     }
-    let candidates = split_candidates(folders);
+    let candidates = split_candidates(folders, &overrides);
     let premiere_years = if candidates.is_empty() {
         HashMap::new()
     } else {
@@ -362,17 +426,20 @@ pub async fn reconcile<S: SeriesIdentityStore>(
             groups = %format!("[{}]", split.groups_label()),
             owner_year = split.owner_year,
             owner_by = split.owner_by,
-            reason = "stated_years",
+            reason = split.reason,
             mode = mode.label(),
             "series folder split"
         );
     }
-    metrics::gauge!(
-        "pharos_series_folder_split_total",
-        "reason" => "stated_years",
-        "root" => root_prefix.to_string(),
-    )
-    .set(plan.splits.len() as f64);
+    for reason in SPLIT_REASONS {
+        let n = plan.splits.iter().filter(|s| s.reason == reason).count();
+        metrics::gauge!(
+            "pharos_series_folder_split_total",
+            "reason" => reason,
+            "root" => root_prefix.to_string(),
+        )
+        .set(n as f64);
+    }
     let stored = store.series_identity_rows(root_prefix).await?;
     let updates = diff(plan, &stored);
     let by_path: HashMap<&str, &SeriesIdentityRow> =
@@ -610,6 +677,89 @@ mod tests {
             }
         );
         assert!(p.splits.is_empty());
+    }
+
+    /// V893 — the server's `scanner` rows for the 1990 Season 01 files
+    /// (their episode titles are the 1990 show's) split a folder whose own
+    /// files state only 2014. The stored 1990 match keeps the plain key for
+    /// them; the 2014 files move to the split key.
+    #[test]
+    fn scanner_rows_from_episode_titles_split_a_one_year_folder() {
+        let pilot = "/tv/The Flash/Season 01/The Flash - S01E01 - Pilot.mkv";
+        let second = "/tv/The Flash/Season 01/The Flash - S01E02 - Out of Control.mkv";
+        let modern = "/tv/The Flash/Season 03/The Flash (2014) - S03E01.mkv";
+        let folders = folders_of(&paths(&[
+            pilot,
+            second,
+            modern,
+            "/tv/The Flash/Season 03/The Flash (2014) - S03E02.mkv",
+            "/tv/The Flash/Season 03/The Flash (2014) - S03E03.mkv",
+        ]));
+        let evidence = |path: &str| SeriesOverride {
+            id: 0,
+            series_folder: "/tv/The Flash".into(),
+            path: Some(path.into()),
+            target_key: split_key("/tv/The Flash", 1990),
+            target_name: None,
+            target_year: Some(1990),
+            source: OverrideSource::Scanner,
+            created_by: None,
+            created_at: 1,
+        };
+        let mut ctx = PlanContext {
+            overrides: vec![evidence(pilot), evidence(second)],
+            premiere_years: HashMap::from([("/tv/The Flash".to_string(), 1990)]),
+        };
+        assert_eq!(
+            split_candidates(&folders, &ctx.overrides),
+            ["/tv/The Flash"]
+        );
+        assert!(split_candidates(&folders, &[]).is_empty());
+
+        let p = plan(&folders, &ctx, 7);
+        assert_eq!(p.splits.len(), 1);
+        let split = &p.splits[0];
+        assert_eq!(
+            (split.owner_year, split.owner_by, split.reason),
+            (1990, "stored_match", "episode_titles")
+        );
+        assert_eq!(split.groups_label(), "1990:2, 2014:3");
+        let at = |path: &str| p.assignments[Path::new(path)].clone();
+        for path in [pilot, second] {
+            assert_eq!(
+                at(path),
+                Assignment {
+                    series_key: "/tv/The Flash".into(),
+                    series_year: Some(1990),
+                }
+            );
+        }
+        assert_eq!(
+            at(modern),
+            Assignment {
+                series_key: "/tv/The Flash\u{1f}2014".into(),
+                series_year: Some(2014),
+            }
+        );
+
+        // The owner row the server wrote with its evidence decides even after
+        // the folder's match moved to the 2014 show.
+        ctx.overrides.push(SeriesOverride {
+            path: None,
+            target_key: "/tv/The Flash".into(),
+            ..evidence(pilot)
+        });
+        ctx.premiere_years.insert("/tv/The Flash".to_string(), 2014);
+        let p = plan(&folders, &ctx, 7);
+        assert_eq!(
+            (p.splits[0].owner_year, p.splits[0].owner_by),
+            (1990, "override")
+        );
+        assert!(p.new_owners.is_empty());
+        assert_eq!(
+            p.assignments[Path::new(modern)].series_key,
+            "/tv/The Flash\u{1f}2014"
+        );
     }
 
     #[test]

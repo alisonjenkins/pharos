@@ -5982,6 +5982,14 @@ mod tests {
         assert_eq!(
             series_metric(
                 &snapshotter,
+                "pharos_series_folder_split_total",
+                &[("reason", "episode_titles")]
+            ),
+            Some(0.0)
+        );
+        assert_eq!(
+            series_metric(
+                &snapshotter,
                 "pharos_series_identity_repair_rows",
                 &[("change", "series_key"), ("mode", "apply")]
             ),
