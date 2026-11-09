@@ -300,9 +300,6 @@ async fn run_pass(ctx: &Ctx, items: &[MediaItem]) {
                 // an infrastructure failure is not a verdict about the file,
                 // and writing one would mark a healthy file unexamined-forever
                 // on a single transient fault.
-                // The re-check, if any, ends here too: the admin sees the old
-                // verdict without the pending flag, and the log says why.
-                ctx.sweep.done(it.id);
                 count_verdict("error", it.kind);
                 tracing::warn!(
                     item = %it.id,
@@ -312,6 +309,15 @@ async fn run_pass(ctx: &Ctx, items: &[MediaItem]) {
                     "integrity sweep: scan failed; will retry next pass",
                 );
             }
+        }
+        // Only a request this pass took ends here. One made while this file
+        // was already being read asks about bytes that may have changed since
+        // the read began, so it stays for the next pass. A failed read ends
+        // the request too: the admin sees the old verdict without the pending
+        // flag, and the log line above says why, rather than a row that stays
+        // Queued while the same fault repeats every pass.
+        if requested {
+            ctx.sweep.done(it.id);
         }
     }
 

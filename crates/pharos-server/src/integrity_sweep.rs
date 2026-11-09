@@ -122,7 +122,6 @@ impl IntegritySweep {
                 self.mark_not_checkable(id, sig);
             }
         }
-        self.done(id);
     }
 }
 
@@ -346,11 +345,9 @@ mod tests {
         let sig = Some((1, 2));
         sweep.settle(&memo, 9, sig, Found::Report(report(1)));
         assert_eq!(memo.damaged().len(), 1);
-        sweep.request(9);
         sweep.settle(&memo, 9, sig, Found::NotCheckable);
         assert!(memo.damaged().is_empty(), "the stale verdict is gone");
         assert!(sweep.is_not_checkable(9, sig));
-        assert!(!sweep.is_queued(9), "settling ends the re-check");
         sweep.settle(&memo, 9, sig, Found::Report(report(0)));
         assert!(!sweep.has_not_checkable(9));
         assert_eq!(memo.recorded_damaged(9), Some(false));
