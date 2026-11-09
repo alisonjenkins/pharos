@@ -2663,7 +2663,7 @@ fn film_title(name: &str, year: u32) -> Vec<String> {
 }
 
 /// `name` less the cut its tail names after `year` (`Director's Cut`,
-/// `{edition-Extended}`, `IMAX`), so each cut of a film is a
+/// `{edition-Extended}`, `IMAX`, a lone `cd1`), so each cut of a film is a
 /// version of it. A cut word before the year is part of the title.
 fn strip_cut<'a>(name: &'a str, year: &str) -> std::borrow::Cow<'a, str> {
     let Some(at) = name.rfind(year) else {
@@ -2676,10 +2676,11 @@ fn strip_cut<'a>(name: &'a str, year: &str) -> std::borrow::Cow<'a, str> {
     }
 }
 
-/// A cut or edition a film's name may state after its year.
+/// A cut or edition a film's name may state after its year, or a `cd1` that
+/// holds the whole film.
 static CUT_RE: std::sync::LazyLock<Option<regex::Regex>> = std::sync::LazyLock::new(|| {
     regex::Regex::new(
-        r"(?i)\{edition-[^{}]*\}|\b(?:director'?s|extended|theatrical|ultimate|final|collector'?s|special|anniversary|unrated|uncut|uncensored|remastered|imax|criterion|redux)(?:[ ._-]+(?:cut|edition|version|extended|uncut))*\b(?:[ ._-]+(?:cut|edition|version))?",
+        r"(?i)\{edition-[^{}]*\}|\b(?:director'?s|extended|theatrical|ultimate|final|collector'?s|special|anniversary|unrated|uncut|uncensored|remastered|imax|criterion|redux)(?:[ ._-]+(?:cut|edition|version|extended|uncut))*\b(?:[ ._-]+(?:cut|edition|version))?|\bcd ?0?1\b",
     )
     .ok()
 });
@@ -7878,7 +7879,6 @@ mod tests {
             "Heat (1995) Extras.mkv",
             "Heat (1995) - part1.mkv",
             "Heat (1995) - part2.mkv",
-            "Heat (1995) cd1.avi",
             "Heat (1995) cd2.avi",
         ] {
             let key = film_copy_key(&Path::new("/f/Heat (1995)").join(other));
@@ -7888,7 +7888,7 @@ mod tests {
             film_copy_key(Path::new("/f/Heat (1995) - part1.mkv")),
             film_copy_key(Path::new("/f/Heat (1995) - part2.mkv")),
         );
-        // V962: a cut or an edition is a version of the film.
+        // V962, V963: a cut, an edition or a lone cd1 is a version of the film.
         for cut in [
             "Heat (1995) Director's Cut.mkv",
             "Heat (1995) - Director's Cut - 3D.HSBS.mkv",
@@ -7898,6 +7898,7 @@ mod tests {
             "Heat (1995) IMAX.mkv",
             "Heat (1995) Unrated Extended Cut.mkv",
             "Heat (1995) [Extended].mkv",
+            "Heat (1995) cd1.avi",
         ] {
             let key = film_copy_key(&Path::new("/f/Heat (1995)").join(cut));
             assert_eq!(key, film, "{cut}");
