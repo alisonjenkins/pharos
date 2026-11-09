@@ -3504,6 +3504,8 @@ fn TitleScreen(id: ItemRef) -> Element {
                         version,
                         on_version: move |v: String| {
                             store_setting(&versions::version_key(id), &v);
+                            // Picks name the last file's streams; another starts afresh.
+                            pending.set(None);
                             picked.set(Some(v));
                         },
                     }
