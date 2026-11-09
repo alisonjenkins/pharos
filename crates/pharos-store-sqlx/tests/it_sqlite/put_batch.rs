@@ -66,6 +66,7 @@ fn rich(id: MediaId, n: usize) -> MediaItem {
                 episode_number: Some(n as u32),
                 series_folder: Some(format!("/pb/show{n}")),
                 series_year: Some(1999),
+                series_key: None,
             });
         }
         2 => {
@@ -230,7 +231,7 @@ async fn run<S: Inspect>(s: &S) {
     assert_batch_equals_singles(s, &[vec![v1], vec![v2]], "upsert over existing").await;
     assert_eq!(s.get(BASE + 300).await.unwrap().created_at, Some(100));
 
-    // More rows than one statement can carry (SQLite 500, Postgres 1000), with
+    // More rows than one statement can carry (SQLite 495, Postgres 990), with
     // a duplicate that straddles the statement boundary.
     let big: Vec<_> = (0..2300)
         .map(|n| rich(BASE + 10_000 + n as u64, n))
@@ -252,7 +253,7 @@ async fn run<S: Inspect>(s: &S) {
     if let Some(txs) = s.writer_transactions(BASE + 10_000, BASE + 12_300).await {
         assert_eq!(txs, 1, "the batch is one transaction, not a per-item retry");
     }
-    for n in [1_usize, 499, 500, 1_000, 1_001, 2_299] {
+    for n in [1_usize, 494, 495, 990, 991, 2_299] {
         let id = BASE + 10_000 + n as u64;
         assert_eq!(s.get(id).await.unwrap(), big[n], "row {n}");
     }

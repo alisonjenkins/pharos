@@ -206,7 +206,7 @@ fn priority_units(id: u64, items: &[MediaItem]) -> Vec<(MediaItem, bool)> {
     }
     let mut units = vec![(seed.clone(), true)];
     if let Some(s) = seed.series.as_ref() {
-        let sid = series_id_for_key(s.series_folder.as_deref(), &s.series_name);
+        let sid = series_id_for_key(s.identity_folder(), &s.series_name);
         let pos = |i: &MediaItem| {
             let si = i.series.as_ref();
             (
@@ -221,7 +221,7 @@ fn priority_units(id: u64, items: &[MediaItem]) -> Vec<(MediaItem, bool)> {
                 i.id != seed.id
                     && sweepable(i)
                     && i.series.as_ref().is_some_and(|si| {
-                        series_id_for_key(si.series_folder.as_deref(), &si.series_name) == sid
+                        series_id_for_key(si.identity_folder(), &si.series_name) == sid
                     })
             })
             .collect();
@@ -816,6 +816,7 @@ mod tests {
                 episode_number: Some(episode),
                 series_folder: Some(format!("/tv/{series}")),
                 series_year: None,
+                series_key: None,
             }),
             ..Default::default()
         }

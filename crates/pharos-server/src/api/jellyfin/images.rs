@@ -934,13 +934,13 @@ fn build_synth_image_map(state: &AppState, all: &[pharos_core::MediaItem]) {
                 s.episode_number.unwrap_or(0)
             );
             consider(
-                series_id_for_key(s.series_folder.as_deref(), &s.series_name),
+                series_id_for_key(s.identity_folder(), &s.series_name),
                 it.id,
                 key.clone(),
             );
             if let Some(n) = s.season_number {
                 consider(
-                    season_id_for_key(s.series_folder.as_deref(), &s.series_name, n),
+                    season_id_for_key(s.identity_folder(), &s.series_name, n),
                     it.id,
                     key,
                 );
@@ -1022,7 +1022,7 @@ async fn season_sidecar_path(
     let s = item.series.as_ref()?;
     let n = s.season_number?;
     let folder = s.series_folder.as_deref()?;
-    if !season_id_for_key(Some(folder), &s.series_name, n).eq_ignore_ascii_case(id_str) {
+    if !season_id_for_key(s.identity_folder(), &s.series_name, n).eq_ignore_ascii_case(id_str) {
         return None; // a series (or foreign) id — not this episode's season
     }
     let suffix = match role {
@@ -2612,6 +2612,7 @@ mod tests {
                 episode_number: Some(1),
                 series_folder: Some("/tv/Buffy (1997)".into()),
                 series_year: Some(1997),
+                series_key: None,
             }),
             ..Default::default()
         };
@@ -2679,6 +2680,7 @@ mod tests {
                 episode_number: Some(1),
                 series_folder: Some(series_key.into()),
                 series_year: Some(1986),
+                series_key: None,
             }),
             ..Default::default()
         };

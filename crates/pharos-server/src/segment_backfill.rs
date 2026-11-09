@@ -162,11 +162,7 @@ async fn analyze_all_seasons(ctx: &Ctx, items: &[MediaItem]) {
         };
         // Folder-keyed identity (falls back to name) so two same-named shows
         // don't merge — matches the wire-id scheme.
-        let key = format!(
-            "{}::{}",
-            s.series_folder.as_deref().unwrap_or(&s.series_name),
-            season
-        );
+        let key = format!("{}::{}", s.series_key(), season);
         seasons.entry(key).or_default().push(it);
     }
 

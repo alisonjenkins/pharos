@@ -296,6 +296,7 @@ async fn boot_server_3d() -> (TestServer, String, String, u64, u64) {
                 episode_number: Some(1),
                 series_folder: None,
                 series_year: None,
+                series_key: None,
             }),
             probe: MediaProbe {
                 duration_ms: Some(60_000),

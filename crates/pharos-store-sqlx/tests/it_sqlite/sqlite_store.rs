@@ -437,6 +437,7 @@ async fn series_folder_and_year_round_trip_through_store() {
         episode_number: Some(1),
         series_folder: Some("/tv/Cosmos (1980)".into()),
         series_year: Some(1980),
+        series_key: None,
     });
     s.put(it.clone()).await.unwrap();
     let got = s.get(9).await.unwrap();
@@ -1414,6 +1415,7 @@ fn episode_of(id: u64, series_name: &str, folder: Option<&str>, year: Option<u32
             episode_number: Some(id as u32),
             series_folder: folder.map(str::to_string),
             series_year: year,
+            series_key: None,
         }),
         ..Default::default()
     }

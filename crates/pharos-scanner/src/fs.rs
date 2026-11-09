@@ -3391,6 +3391,7 @@ pub fn parse_series_info(path: &Path) -> Option<SeriesInfo> {
         episode_number: episode,
         series_folder,
         series_year,
+        series_key: None,
     })
 }
 

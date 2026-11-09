@@ -2122,15 +2122,29 @@ pub struct SeriesInfo {
     /// name, surfaced as `ProductionYear` so same-name shows are
     /// distinguishable in clients. `None` when the folder carries no year.
     pub series_year: Option<u32>,
+    /// Spec 033 (V893) — the identity key a split folder's group was given
+    /// (`"{folder}\u{1f}{YYYY}"`), or the folder itself. `None` until the
+    /// scanner or the store says, which reads as the folder. Never a path:
+    /// file lookups (`tvshow.nfo`, folder art) use `series_folder`.
+    pub series_key: Option<String>,
 }
 
 impl SeriesInfo {
     /// LIB-C11 — the identity key the synthesised Series/Season wire ids
-    /// hash on. Prefers the stable, per-show-on-disk `series_folder`;
-    /// falls back to `series_name` for legacy rows lacking a folder so
-    /// pre-backfill client URLs keep resolving.
+    /// hash on. Prefers the split key, then the stable, per-show-on-disk
+    /// `series_folder`; falls back to `series_name` for legacy rows lacking a
+    /// folder so pre-backfill client URLs keep resolving.
     pub fn series_key(&self) -> &str {
-        self.series_folder.as_deref().unwrap_or(&self.series_name)
+        self.identity_folder().unwrap_or(&self.series_name)
+    }
+
+    /// The folder-shaped key the wire-id helpers take as their `folder`
+    /// argument: the split key, else the folder, and `None` for a legacy row
+    /// with no folder (whose key is its name, hashed the legacy way). A split
+    /// key is only ever given to a row that has a folder.
+    pub fn identity_folder(&self) -> Option<&str> {
+        let folder = self.series_folder.as_deref()?;
+        Some(self.series_key.as_deref().unwrap_or(folder))
     }
 }
 

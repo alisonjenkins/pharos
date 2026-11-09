@@ -20,17 +20,17 @@ pub(crate) const PUT_COLUMNS: &str = "id, path, title, kind, \
     audio_tracks_json, \
     community_rating, critic_rating, official_rating, production_year, \
     premiere_date, overview, tagline, provider_ids, \
-    series_folder, series_year, title_fold, attachments_json, \
+    series_folder, series_year, series_key, title_fold, attachments_json, \
     track_number, disc_number, release_year, \
     production_locations_json, trailers_json, \
     synopsis, content_rating, network, release_date, original_language, \
     book_format, book_page_count, book_author, book_publisher, \
     book_series, book_series_index, book_isbn, sort_name, alternate_sources_json, video_3d_format, has_3d";
 
-pub(crate) const PUT_COLUMN_COUNT: usize = 65;
+pub(crate) const PUT_COLUMN_COUNT: usize = 66;
 
 /// Rows per `INSERT`. Postgres caps bound parameters at 65535 per statement.
-pub(crate) const MAX_ROWS_PER_STATEMENT: usize = 1000;
+pub(crate) const MAX_ROWS_PER_STATEMENT: usize = 990;
 const _: () = assert!(MAX_ROWS_PER_STATEMENT * PUT_COLUMN_COUNT <= 65_535);
 
 /// `created_at` keeps the value already stored (rows that predate migration
@@ -76,7 +76,13 @@ pub(crate) const PUT_CONFLICT_UPDATE: &str = "path = EXCLUDED.path,
     tagline = EXCLUDED.tagline,
     provider_ids = EXCLUDED.provider_ids,
     series_folder = EXCLUDED.series_folder,
-    series_year = EXCLUDED.series_year,
+    series_year = CASE WHEN EXCLUDED.series_key IS NULL
+            AND media_items.series_folder IS NOT DISTINCT FROM EXCLUDED.series_folder
+        THEN COALESCE(media_items.series_year, EXCLUDED.series_year)
+        ELSE EXCLUDED.series_year END,
+    series_key = CASE WHEN EXCLUDED.series_key IS NOT NULL THEN EXCLUDED.series_key
+        WHEN media_items.series_folder IS NOT DISTINCT FROM EXCLUDED.series_folder THEN media_items.series_key
+        ELSE NULL END,
     attachments_json = EXCLUDED.attachments_json,
     track_number = EXCLUDED.track_number,
     disc_number = EXCLUDED.disc_number,
@@ -140,6 +146,10 @@ pub(crate) fn bind_item<'q>(q: Q<'q>, item: &'q MediaItem) -> DomainResult<Q<'q>
         .as_ref()
         .and_then(|s| s.series_folder.as_deref());
     let series_year = item.series.as_ref().and_then(|s| s.series_year);
+    // Spec 033 — `None` keeps a split key the row already holds (a writer
+    // that did not decide the grouping must not undo it); NULL reads as the
+    // folder.
+    let series_key = item.series.as_ref().and_then(|s| s.series_key.as_deref());
     let subtitle_tracks_json = crate::subtitle_track_json::encode(&p.subtitle_tracks);
     let attachments_json = crate::attachment_json::encode(&p.attachments);
     let chapters_json = crate::chapter_json::encode(&p.chapters);
@@ -199,6 +209,7 @@ pub(crate) fn bind_item<'q>(q: Q<'q>, item: &'q MediaItem) -> DomainResult<Q<'q>
         .bind(provider_ids_json)
         .bind(series_folder)
         .bind(series_year.map(|v| v as i32))
+        .bind(series_key)
         // LIB-B2 — Unicode-case-folded title for SQL search + SortName.
         .bind(item.title.to_lowercase())
         .bind(attachments_json)
@@ -257,6 +268,11 @@ mod tests {
         for col in columns().into_iter().filter(|c| *c != "id") {
             let assign = if col == "created_at" {
                 "created_at = COALESCE(media_items.created_at, EXCLUDED.created_at)".to_string()
+            } else if col == "series_key" {
+                // Spec 033: kept unless the writer names one; see the put.
+                "series_key = CASE WHEN EXCLUDED.series_key IS NOT NULL".to_string()
+            } else if col == "series_year" {
+                "series_year = CASE WHEN EXCLUDED.series_key IS NULL".to_string()
             } else {
                 format!("{col} = EXCLUDED.{col}")
             };

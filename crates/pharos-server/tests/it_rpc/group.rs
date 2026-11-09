@@ -1530,6 +1530,7 @@ async fn seed_show(rig: &Rig) {
                     episode_number: Some(ep),
                     series_folder: Some(SHOW_DIR.into()),
                     series_year: None,
+                    series_key: None,
                 }),
                 ..MediaItem::default()
             })

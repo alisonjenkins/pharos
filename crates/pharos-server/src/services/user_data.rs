@@ -178,11 +178,11 @@ pub async fn folder_items(
             let Some(series) = item.series.as_ref() else {
                 return false;
             };
-            if series_id_for_key(series.series_folder.as_deref(), &series.series_name) == id {
+            if series_id_for_key(series.identity_folder(), &series.series_name) == id {
                 return true;
             }
             series.season_number.is_some_and(|n| {
-                season_id_for_key(series.series_folder.as_deref(), &series.series_name, n) == id
+                season_id_for_key(series.identity_folder(), &series.series_name, n) == id
             })
         })
         .cloned()

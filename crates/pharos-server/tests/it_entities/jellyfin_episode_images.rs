@@ -34,6 +34,7 @@ fn episode(id: u64, series_dir: &Path, ep: u32) -> MediaItem {
             episode_number: Some(ep),
             series_folder: Some(series_dir.to_string_lossy().into_owned()),
             series_year: None,
+            series_key: None,
         }),
         ..Default::default()
     }

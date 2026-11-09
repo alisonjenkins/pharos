@@ -1931,7 +1931,7 @@ async fn shows_episodes(
         .filter(|(_, item)| matches!(item.kind, MediaKind::Episode))
         .filter(|(_, item)| {
             item.series.as_ref().is_some_and(|s| {
-                series_id_for_key(s.series_folder.as_deref(), &s.series_name) == series_id
+                series_id_for_key(s.identity_folder(), &s.series_name) == series_id
             })
         })
         .filter(|(_, item)| {
@@ -1940,7 +1940,7 @@ async fn shows_episodes(
             };
             item.series.as_ref().is_some_and(|s| {
                 s.season_number.is_some_and(|n| {
-                    season_id_for_key(s.series_folder.as_deref(), &s.series_name, n) == want
+                    season_id_for_key(s.identity_folder(), &s.series_name, n) == want
                 })
             })
         })
@@ -2038,7 +2038,7 @@ async fn shows_seasons(
         .filter(|item| matches!(item.kind, MediaKind::Episode))
         .filter(|item| {
             item.series.as_ref().is_some_and(|s| {
-                series_id_for_key(s.series_folder.as_deref(), &s.series_name) == series_id
+                series_id_for_key(s.identity_folder(), &s.series_name) == series_id
             })
         })
         .collect();
@@ -5665,13 +5665,13 @@ async fn item_ancestors(
         {
             if let Some(season) = series.season_number {
                 chain.push(season_id_for_key(
-                    series.series_folder.as_deref(),
+                    series.identity_folder(),
                     &series.series_name,
                     season,
                 ));
             }
             chain.push(series_id_for_key(
-                series.series_folder.as_deref(),
+                series.identity_folder(),
                 &series.series_name,
             ));
         }
@@ -5684,10 +5684,10 @@ async fn item_ancestors(
             let Some(series) = item.series.as_ref() else {
                 continue;
             };
-            let series_id = series_id_for_key(series.series_folder.as_deref(), &series.series_name);
-            let season_id = series.season_number.map(|n| {
-                season_id_for_key(series.series_folder.as_deref(), &series.series_name, n)
-            });
+            let series_id = series_id_for_key(series.identity_folder(), &series.series_name);
+            let season_id = series
+                .season_number
+                .map(|n| season_id_for_key(series.identity_folder(), &series.series_name, n));
             if season_id.as_deref() == Some(id_str) {
                 chain.push(series_id);
             } else if series_id != id_str {
@@ -5989,7 +5989,7 @@ pub(crate) async fn shows_matching(
     let mut shows: Vec<_> = episodes
         .into_iter()
         .filter_map(|e| e.series)
-        .map(|s| (s.series_folder, s.series_name))
+        .map(|s| (s.identity_folder().map(str::to_string), s.series_name))
         .collect();
     shows.sort();
     shows.dedup();
@@ -6220,7 +6220,7 @@ pub(crate) async fn virtual_shows_page(
         for (ep, ud) in episodes.iter().zip(user_data) {
             if let (Some(series), false) = (ep.series.as_ref(), ud.played) {
                 unplayed_series.insert(series_id_for_key(
-                    series.series_folder.as_deref(),
+                    series.identity_folder(),
                     &series.series_name,
                 ));
             }
@@ -6238,7 +6238,7 @@ pub(crate) async fn virtual_shows_page(
         let Some(series) = ep.series.as_ref() else {
             continue;
         };
-        let skey = series_id_for_key(series.series_folder.as_deref(), &series.series_name);
+        let skey = series_id_for_key(series.identity_folder(), &series.series_name);
         *series_eps.entry(skey.clone()).or_insert(0) += 1;
         if let Some(sn) = series.season_number {
             series_seasons.entry(skey).or_default().insert(sn);
@@ -6279,7 +6279,7 @@ pub(crate) async fn virtual_shows_page(
                         continue;
                     }
                 }
-                let skey = series_id_for_key(series.series_folder.as_deref(), &series.series_name);
+                let skey = series_id_for_key(series.identity_folder(), &series.series_name);
                 if want_played.is_some_and(|want| want == unplayed_series.contains(&skey)) {
                     continue;
                 }
@@ -6457,7 +6457,7 @@ fn series_dto(
     library: Option<String>,
 ) -> serde_json::Value {
     use crate::api::jellyfin::dto::{format_iso8601, series_id_for_key};
-    let id = series_id_for_key(series.series_folder.as_deref(), &series.series_name);
+    let id = series_id_for_key(series.identity_folder(), &series.series_name);
     // T9-series — fold in provider-sourced metadata when the enricher has
     // matched this show; a never-matched show renders the bare tile as before.
     let genres = meta.map(|m| m.genres.clone()).unwrap_or_default();
@@ -6537,11 +6537,7 @@ fn season_dto(
     episode_count: u32,
 ) -> serde_json::Value {
     use crate::api::jellyfin::dto::{season_id_for_key, series_id_for_key};
-    let id = season_id_for_key(
-        series.series_folder.as_deref(),
-        &series.series_name,
-        season_number,
-    );
+    let id = season_id_for_key(series.identity_folder(), &series.series_name, season_number);
     // B78/V38 — typed SeriesFolderDto (Season kind).
     let mut image_tags = std::collections::BTreeMap::new();
     image_tags.insert("Primary".to_string(), id.clone());
@@ -6554,7 +6550,7 @@ fn season_dto(
         can_play: false,
         series_name: Some(series.series_name.clone()),
         series_id: Some(series_id_for_key(
-            series.series_folder.as_deref(),
+            series.identity_folder(),
             &series.series_name,
         )),
         index_number: Some(season_number),
@@ -6583,7 +6579,7 @@ fn season_dto(
         child_count: Some(episode_count),
         recursive_item_count: Some(episode_count),
         parent_id: Some(series_id_for_key(
-            series.series_folder.as_deref(),
+            series.identity_folder(),
             &series.series_name,
         )),
         id,
@@ -8109,6 +8105,7 @@ mod series_dto_tests {
             episode_number: Some(1),
             series_folder: Some("/tv/Buffy (1997)".into()),
             series_year: Some(1997),
+            series_key: None,
         }
     }
 
@@ -8231,6 +8228,7 @@ mod synth_parent_tests {
                     episode_number: Some(1),
                     series_folder: Some(format!("/tv/{show}")),
                     series_year: None,
+                    series_key: None,
                 }),
                 ..Default::default()
             })

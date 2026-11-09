@@ -12,7 +12,7 @@ use pharos_core::{
 /// rows lead each half.
 const SERIES_DUE: &str = "SELECT sm.series_key, sm.series_name, sm.provider_ids, \
        CAST((SELECT MIN(m.series_year) FROM media_items m \
-         WHERE m.kind = 'episode' AND COALESCE(m.series_folder, m.series_name) = sm.series_key) AS BIGINT) \
+         WHERE m.kind = 'episode' AND COALESCE(m.series_key, m.series_folder, m.series_name) = sm.series_key) AS BIGINT) \
      FROM series_metadata sm \
      WHERE sm.ratings_fetched_at IS NULL OR sm.ratings_fetched_at < $1 \
      ORDER BY sm.ratings_fetched_at IS NOT NULL, sm.ratings_fetched_at, sm.series_key \

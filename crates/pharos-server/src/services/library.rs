@@ -301,9 +301,7 @@ pub async fn next_up(
         // B92 — canonicalise the dashed `SeriesId` the Android TV Series page
         // sends, else Next Up on that page comes back empty.
         if let Some(want) = series_id_want.as_deref() {
-            if series_id_for_key(series.series_folder.as_deref(), &series.series_name).as_str()
-                != want
-            {
+            if series_id_for_key(series.identity_folder(), &series.series_name).as_str() != want {
                 continue;
             }
         }
@@ -488,14 +486,14 @@ pub async fn restrict_to_parent(
     if items.iter().any(|i| {
         i.series
             .as_ref()
-            .is_some_and(|s| series_id_for_key(s.series_folder.as_deref(), &s.series_name) == pid)
+            .is_some_and(|s| series_id_for_key(s.identity_folder(), &s.series_name) == pid)
     }) {
         return items
             .iter()
             .filter(|i| {
-                i.series.as_ref().is_some_and(|s| {
-                    series_id_for_key(s.series_folder.as_deref(), &s.series_name) == pid
-                })
+                i.series
+                    .as_ref()
+                    .is_some_and(|s| series_id_for_key(s.identity_folder(), &s.series_name) == pid)
             })
             .cloned()
             .collect();
@@ -503,9 +501,8 @@ pub async fn restrict_to_parent(
     // 3) Season id → every episode in that (folder, season) pair.
     if items.iter().any(|i| {
         i.series.as_ref().is_some_and(|s| {
-            s.season_number.is_some_and(|n| {
-                season_id_for_key(s.series_folder.as_deref(), &s.series_name, n) == pid
-            })
+            s.season_number
+                .is_some_and(|n| season_id_for_key(s.identity_folder(), &s.series_name, n) == pid)
         })
     }) {
         return items
@@ -513,7 +510,7 @@ pub async fn restrict_to_parent(
             .filter(|i| {
                 i.series.as_ref().is_some_and(|s| {
                     s.season_number.is_some_and(|n| {
-                        season_id_for_key(s.series_folder.as_deref(), &s.series_name, n) == pid
+                        season_id_for_key(s.identity_folder(), &s.series_name, n) == pid
                     })
                 })
             })
