@@ -769,6 +769,9 @@ pub fn MixShelf() -> Element {
     });
     let in_group = together.as_ref().is_some_and(|t| t.view.read().active);
     let active = mix_ctx.and_then(|MixCtx(m)| m.read().clone());
+    // Nothing playing: the mix that is on failed before its first song, so
+    // its tile starts it again rather than opening an empty player.
+    let playing = stage.and_then(|StageCtx(s)| s.read().item);
     let state = saved();
     let mine = state.clone().and_then(Result::ok).unwrap_or_default();
     let tiles = shelf(&mine);
@@ -788,7 +791,7 @@ pub fn MixShelf() -> Element {
                         {
                             let on = is_active(active.as_ref(), &m);
                             let rules_id = format!("pharos-mix-rules-{i}");
-                            let is_on = on.is_some();
+                            let is_on = on.is_some() && playing.is_some();
                             let status = on.and_then(status_text);
                             let newer = m.newer.is_some();
                             let name = m.name.clone();
@@ -807,7 +810,6 @@ pub fn MixShelf() -> Element {
                                         // rather than starting it again, which
                                         // would cut off the song playing.
                                         if is_on {
-                                            let playing = stage.and_then(|StageCtx(s)| s.peek().item);
                                             if let (Some(id), Some(nav)) = (playing, nav) {
                                                 platform::info(&format!("pharos: mix shelf open mix={name:?}"));
                                                 nav.0.call(Route::Watch(id));
@@ -831,10 +833,8 @@ pub fn MixShelf() -> Element {
                                 }
                                 // Beside the button, not in it: a button's
                                 // content is not announced as a live region.
-                                if is_on {
-                                    span { class: "pharos-mix-tile-on", role: "status",
-                                        {status.unwrap_or_else(|| "Playing".to_owned())}
-                                    }
+                                if let Some(text) = status.or_else(|| is_on.then(|| "Playing".to_owned())) {
+                                    span { class: "pharos-mix-tile-on", role: "status", {text} }
                                 }
                             }
                         }
@@ -1708,30 +1708,56 @@ mod tests {
         );
     }
 
+    /// The shelf with Favourites on and `item` on the stage.
+    fn shelf_with_favourites_on(item: Option<ItemRef>) -> String {
+        let mut dom = VirtualDom::new_with_props(
+            |item: Option<ItemRef>| {
+                use_context_provider(|| QueueCtx(Signal::new(Queue::default())));
+                use_context_provider(|| {
+                    StageCtx(Signal::new(super::super::stage::Stage {
+                        item,
+                        ..Default::default()
+                    }))
+                });
+                let preset = presets()
+                    .into_iter()
+                    .find(|p| p.name == "Favourites")
+                    .unwrap();
+                use_context_provider(|| {
+                    MixCtx(Signal::new(Some(ActiveMix {
+                        name: preset.name.clone(),
+                        ..on(preset.spec.clone())
+                    })))
+                });
+                rsx! { MixShelf {} }
+            },
+            item,
+        );
+        dom.rebuild_in_place();
+        dioxus_ssr::render(&dom)
+    }
+
     /// A saved mix named like a preset is not marked as on when the preset is.
     #[test]
     fn only_the_tile_of_the_mix_that_is_on_says_so() {
-        let mut dom = VirtualDom::new(|| {
-            use_context_provider(|| QueueCtx(Signal::new(Queue::default())));
-            let preset = presets()
-                .into_iter()
-                .find(|p| p.name == "Favourites")
-                .unwrap();
-            use_context_provider(|| {
-                MixCtx(Signal::new(Some(ActiveMix {
-                    name: preset.name.clone(),
-                    ..on(preset.spec.clone())
-                })))
-            });
-            rsx! { MixShelf {} }
-        });
-        dom.rebuild_in_place();
-        let html = dioxus_ssr::render(&dom);
+        let html = shelf_with_favourites_on(Some(ItemRef::Real(7)));
         assert!(
             html.contains(r#"aria-label="Open the player for Favourites""#),
             "{html}"
         );
         assert_eq!(html.matches("pharos-mix-tile-on").count(), 1, "{html}");
+    }
+
+    /// A mix whose first request failed has no song to open: its tile
+    /// starts it again.
+    #[test]
+    fn the_mix_that_is_on_with_nothing_playing_can_be_started_again() {
+        let html = shelf_with_favourites_on(None);
+        assert!(
+            html.contains(r#"aria-label="Play the mix Favourites""#),
+            "{html}"
+        );
+        assert!(!html.contains("Open the player for"), "{html}");
     }
 
     #[test]
