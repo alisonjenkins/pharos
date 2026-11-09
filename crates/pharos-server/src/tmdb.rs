@@ -251,7 +251,9 @@ impl TmdbClient {
             return None;
         }
         let body = resp.text().await.ok()?;
-        parse_episode_detail(&body)
+        let mut md = parse_episode_detail(&body)?;
+        md.series_id = Some(series_id.to_string());
+        Some(md)
     }
 
     /// Download the raw bytes of an artwork/image URL (typically one built
