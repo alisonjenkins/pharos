@@ -2,9 +2,10 @@
 //!
 //! This is the URL every jellyfin-web reader constructs. `getItemDownloadUrl`
 //! builds `Items/{id}/Download?api_key=<token>` with **no `Authorization`
-//! header**, so query auth is not optional here — the existing extractor
-//! already accepts `api_key`, which is why this handler takes a plain
-//! [`AuthUser`].
+//! header**, so query auth is not optional here — [`MediaUser`] accepts
+//! `api_key`, and on a GET or HEAD also the `JellyfinAuth` and `pharos_media`
+//! cookies, so the native reader's credentialed same-origin `fetch` works
+//! without a token in the URL (023 FR-009, V191).
 //!
 //! Not restricted to books. Real Jellyfin's `/Download` serves any item and
 //! `CanDownload` is advertised generally; refusing anything but `Type=Book`
@@ -27,7 +28,7 @@ use actix_web::{error, http::header, web, HttpRequest, HttpResponse, Responder};
 
 use pharos_core::MediaStore;
 
-use super::auth_extractor::AuthUser;
+use super::auth_extractor::MediaUser;
 use crate::state::AppState;
 
 pub fn register(cfg: &mut web::ServiceConfig) {
@@ -90,7 +91,7 @@ fn disposition_for(source: &std::path::Path, served: &std::path::Path) -> String
 
 async fn download(
     state: web::Data<AppState>,
-    user: AuthUser,
+    user: MediaUser,
     req: HttpRequest,
     path: web::Path<String>,
 ) -> Result<impl Responder, actix_web::Error> {
