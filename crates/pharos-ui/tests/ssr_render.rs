@@ -788,12 +788,14 @@ fn search_idle_with_hits() -> Element {
             id: "1".into(),
             name: "Blade Runner".into(),
             kind: ItemKind::Movie,
+            media_type: "Movie".into(),
             matched_term: "blade".into(),
         },
         SearchHint {
             id: "2".into(),
             name: "Vangelis - Tales".into(),
             kind: ItemKind::Audio,
+            media_type: "Audio".into(),
             matched_term: "vang".into(),
         },
     ];

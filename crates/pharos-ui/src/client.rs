@@ -114,6 +114,9 @@ pub struct SearchHint {
     pub id: String,
     pub name: String,
     pub kind: ItemKind,
+    /// The server's own `Type`, which `kind` flattens (a book or a folder
+    /// becomes `Movie`).
+    pub media_type: String,
     pub matched_term: String,
 }
 
@@ -337,6 +340,7 @@ pub fn parse_search_hints_response(bytes: &[u8]) -> Result<Vec<SearchHint>, Clie
             id: h.id,
             name: h.name,
             kind: ItemKind::from_jellyfin_type(&h.kind),
+            media_type: h.kind,
             matched_term: h.matched_term,
         })
         .collect())
