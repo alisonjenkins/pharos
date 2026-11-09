@@ -294,7 +294,8 @@ async fn detail_carries_the_cast_and_a_series_ranks_its_regulars() {
 /// A person's page as the UI reads it from a cast credit: the credit names
 /// the person, and their page lists the film and the show's episodes they act
 /// in, with who they play, leaving out what they only directed. An id that
-/// names nobody is refused as not found. What is kept about them (their
+/// names nobody is refused as not found, and search offers the person by
+/// name with the same id. What is kept about them (their
 /// biography, dates and ids) comes with the page.
 /// Disarm check: with `write_cast` not setting `personId`, `lead.person` is
 /// `None` and the page cannot be asked for.
@@ -381,6 +382,14 @@ async fn a_cast_credit_opens_the_page_of_what_that_person_appears_in() {
             (ItemRef::Real(602), CreditKind::Actor),
         ]
     );
+
+    let found = api.search(&call, "lead actor", 0).await.expect("search");
+    let person = found
+        .items
+        .iter()
+        .find(|i| i.kind == ItemKind::Person)
+        .expect("search offers the actor");
+    assert_eq!((person.id, person.name.as_str()), (id, "Lead Actor"));
 
     let nobody = pharos_core::person_wire_id("Nobody At All");
     let nobody = pharos_jellyfin_api::dto::WireId::parse(&nobody).expect("wire id");
