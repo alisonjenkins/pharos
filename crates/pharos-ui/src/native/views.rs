@@ -925,6 +925,7 @@ pub fn PosterTile(item: Item) -> Element {
     let name = display_name(&item);
     let sub = sub_lines(&item);
     let progress = progress_percent(&item);
+    let rated = !ratings(item.kind, item.imdb_rating, item.critic_rating).is_empty();
     rsx! {
         Link { to: open_route(&item), class: "pharos-poster",
             div { class: "pharos-poster-art",
@@ -946,11 +947,22 @@ pub fn PosterTile(item: Item) -> Element {
                 if let Some(p) = progress {
                     div { class: "pharos-progress", style: "width: {p}%" }
                 }
-                Ratings { kind: item.kind, imdb: item.imdb_rating, critic: item.critic_rating, tile: true }
             }
             span { class: "pharos-poster-name", title: "{name}", "{name}" }
-            for line in sub {
-                span { class: "pharos-poster-sub", title: "{line}", "{line}" }
+            // Scores sit on the year line, off the art, where most posters
+            // put their title (B1015, V974). Only films and series have them,
+            // and their tiles have one sub line.
+            if rated {
+                div { class: "pharos-poster-meta",
+                    for line in sub {
+                        span { class: "pharos-poster-sub", title: "{line}", "{line}" }
+                    }
+                    Ratings { kind: item.kind, imdb: item.imdb_rating, critic: item.critic_rating, tile: true }
+                }
+            } else {
+                for line in sub {
+                    span { class: "pharos-poster-sub", title: "{line}", "{line}" }
+                }
             }
         }
     }
@@ -2951,6 +2963,23 @@ mod tests {
         unrated.name = "Unrated".into();
         let html = render(move || rsx! { PosterTile { item: unrated.clone() } });
         assert!(!html.contains("pharos-ratings-tile"), "{html}");
+    }
+
+    /// B1015 (V974): a tile's scores sit on the year line under the poster,
+    /// never on the art, where most posters put their title.
+    #[test]
+    fn a_poster_tiles_scores_sit_beside_the_year_not_on_the_art() {
+        let mut rated = item(ItemKind::Movie);
+        rated.name = "Die Hard".into();
+        rated.year = Some(1988);
+        rated.critic_rating = Some(94);
+        let html = render(move || rsx! { PosterTile { item: rated.clone() } });
+        let art = html.find("pharos-poster-art").expect("art");
+        let name = html.find("pharos-poster-name").expect("name");
+        let meta = html.find("pharos-poster-meta").expect("year line");
+        let ratings = html.find("pharos-ratings-tile").expect("ratings");
+        assert!(art < name && name < meta && meta < ratings, "{html}");
+        assert!(html[meta..ratings].contains(r#"title="1988""#), "{html}");
     }
 
     /// B800 (V750): a song's card names its artist, falling back to the

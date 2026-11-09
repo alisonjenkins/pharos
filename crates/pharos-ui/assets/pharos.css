@@ -915,8 +915,7 @@ input:focus-visible {
   background: var(--px-color-accent);
   color: var(--px-color-accent-fg);
 }
-/* A damaged file (B940): bottom right, clear of Watched, 3D and the
-   ratings in the bottom-left corner. */
+/* A damaged file (B940): bottom right, clear of Watched and 3D. */
 .pharos-badge-damaged {
   top: auto;
   bottom: 0.6rem;
@@ -940,8 +939,8 @@ input:focus-visible {
   font-weight: 700;
 }
 
-/* Outside scores: chips under a title's facts, and small ones in a
-   poster's bottom-left corner, above the progress bar. */
+/* Outside scores: chips under a title's facts, and small ones beside a
+   poster's year. */
 .pharos-ratings {
   display: flex;
   flex-wrap: wrap;
@@ -973,21 +972,40 @@ input:focus-visible {
 .pharos-rating-rotten .pharos-rating-source {
   color: #0ac855; /* not themed: Rotten Tomatoes' rotten green */
 }
+/* A tile's scores follow the year under the poster (B1015, V974): on the
+   art they covered the title most posters put in that corner. One line
+   only; chips that do not fit wrap out of sight, so the year stays. */
+.pharos-poster-meta {
+  display: flex;
+  align-items: baseline;
+  gap: 0.35rem;
+  min-width: 0;
+}
+.pharos-poster-meta .pharos-poster-sub {
+  flex: none;
+}
 .pharos-ratings-tile {
-  position: absolute;
-  left: 0.4rem;
-  bottom: 0.6rem;
-  /* Above the art's ::after sheen. */
-  z-index: 1;
+  flex: 1 1 0;
+  min-width: 0;
+  height: 1.25em;
+  overflow: hidden;
   margin: 0;
-  gap: 0.25rem;
-  pointer-events: none;
+  gap: 0 0.4rem;
+  font-size: 0.75rem;
+  line-height: 1.25;
+}
+/* The dot rides on the first chip, so it wraps away with it. */
+.pharos-ratings-tile .pharos-rating:first-child::before {
+  content: "· ";
+  font-weight: 400;
 }
 .pharos-ratings-tile .pharos-rating {
-  padding: 0.15rem 0.4rem;
-  font-size: 0.6875rem;
+  padding: 0;
+  font-size: inherit;
+  line-height: inherit;
   border: none;
-  background: var(--px-color-bg);
+  background: none;
+  color: var(--px-color-fg-muted);
 }
 
 .pharos-progress {
@@ -3950,7 +3968,8 @@ body::before {
 /* The art is transformed, so it paints above in-flow siblings; positioning
    the labels puts them back on top of its shadow. */
 .pharos-poster-name,
-.pharos-poster-sub {
+.pharos-poster-sub,
+.pharos-poster-meta {
   position: relative;
 }
 
