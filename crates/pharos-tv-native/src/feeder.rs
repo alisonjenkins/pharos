@@ -72,7 +72,9 @@ enum Container {
         defaults: Vec<fmp4::TrackDefaults>,
     },
     /// Muxed MPEG-TS, what the server sends a client that is not a browser.
-    Ts(ts::Demux),
+    /// Segments are demuxed on their own thread, ahead of the decoder, so a
+    /// segment boundary never holds up the decode loop.
+    Ts(std::sync::mpsc::Receiver<Result<Vec<ts::AccessUnit>, String>>),
 }
 
 /// The segment being fed.
@@ -227,8 +229,8 @@ impl Feeder {
                 csd,
                 max_input: input_size(width, height),
             },
-            container: Container::Ts(demux),
-            supply,
+            container: Container::Ts(spawn_demux(demux, supply)?),
+            supply: Box::new(|| None),
             current: Some(Current::Ts(units)),
             replay: None,
             segment: 0,
@@ -256,40 +258,42 @@ impl Feeder {
     /// Parse the next segment from the supplier; false at the end.
     fn advance(&mut self) -> Result<bool, String> {
         let waited = std::time::Instant::now();
-        let Some(bytes) = (self.supply)() else {
-            return Ok(false);
-        };
-        let bytes = bytes?;
-        let wait_ms = waited.elapsed().as_millis();
-        let demuxed = std::time::Instant::now();
         let segment = self.segment;
-        let bytes_len = bytes.len();
-        self.current = Some(match &mut self.container {
+        let (current, bytes_len, demux_ms) = match &mut self.container {
             Container::Fmp4 {
                 track_id, defaults, ..
             } => {
+                let Some(bytes) = (self.supply)() else {
+                    return Ok(false);
+                };
+                let bytes = bytes?;
+                let demuxed = std::time::Instant::now();
                 let samples: Vec<Sample> = fmp4::samples(&bytes, defaults)
                     .map_err(|e| format!("segment {segment}: {e}"))?
                     .into_iter()
                     .filter(|s| s.track_id == *track_id)
                     .collect();
-                Current::Fmp4(bytes, samples)
+                let len = bytes.len();
+                (Current::Fmp4(bytes, samples), len, demuxed.elapsed().as_millis())
             }
-            Container::Ts(demux) => Current::Ts(
-                demux
-                    .access_units(&bytes)
-                    .map_err(|e| format!("segment {segment}: {e}"))?,
-            ),
-        });
+            Container::Ts(units) => {
+                let Ok(units) = units.recv() else {
+                    return Ok(false);
+                };
+                let units = units.map_err(|e| format!("segment {segment}: {e}"))?;
+                let len = units.iter().map(|u| u.data.len()).sum();
+                (Current::Ts(units), len, 0)
+            }
+        };
+        let wait_ms = waited.elapsed().as_millis().saturating_sub(demux_ms);
+        self.current = Some(current);
         let units = match &self.current {
             Some(Current::Fmp4(_, samples)) => samples.len(),
             Some(Current::Ts(units)) => units.len(),
             None => 0,
         };
         log::info!(
-            "bench feeder segment={segment} bytes={} units={units} wait_ms={wait_ms} demux_ms={}",
-            bytes_len,
-            demuxed.elapsed().as_millis(),
+            "bench feeder segment={segment} bytes={bytes_len} units={units} wait_ms={wait_ms} demux_ms={demux_ms}",
         );
         self.sample = 0;
         Ok(true)
@@ -347,6 +351,35 @@ impl Feeder {
             return Ok(Next::Sample { len, pts_us, key });
         }
     }
+}
+
+/// Demuxes each segment `supply` yields on its own thread, two ahead of the
+/// decoder. The thread ends with the stream, or when the feeder is dropped.
+fn spawn_demux(
+    mut demux: ts::Demux,
+    mut supply: Segments,
+) -> Result<std::sync::mpsc::Receiver<Result<Vec<ts::AccessUnit>, String>>, String> {
+    let (tx, rx) = std::sync::mpsc::sync_channel(2);
+    std::thread::Builder::new()
+        .name("pharos-demux".into())
+        .spawn(move || {
+            let mut segment = 1u64;
+            while let Some(bytes) = supply() {
+                let started = std::time::Instant::now();
+                let units = bytes.and_then(|b| demux.access_units(&b));
+                let failed = units.is_err();
+                log::info!(
+                    "bench demux segment={segment} ms={}",
+                    started.elapsed().as_millis()
+                );
+                if tx.send(units).is_err() || failed {
+                    return;
+                }
+                segment += 1;
+            }
+        })
+        .map_err(|e| format!("demux thread: {e}"))?;
+    Ok(rx)
 }
 
 #[cfg(test)]
