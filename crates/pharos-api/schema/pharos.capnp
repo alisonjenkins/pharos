@@ -230,6 +230,13 @@ struct Person {
   imageUrl @2 :Text;                # the person's photo on this server, empty when there is none
   films @3 :List(PersonCredit);
   shows @4 :List(PersonShow);
+  # What a metadata provider says about them; each empty when unknown.
+  biography @5 :Text;
+  birthDate @6 :Text;               # YYYY-MM-DD
+  deathDate @7 :Text;               # YYYY-MM-DD
+  birthPlace @8 :Text;
+  imdbId @9 :Text;                  # nm and digits
+  wikidataId @10 :Text;             # Q and digits
 }
 # One item a person appears in, and who they play there (empty when the credit names no one).
 struct PersonCredit { item @0 :ItemSummary; character @1 :Text; kind @2 :CreditKind; }
