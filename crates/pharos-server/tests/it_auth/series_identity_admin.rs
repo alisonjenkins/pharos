@@ -139,6 +139,8 @@ async fn a_move_shows_on_the_overview_and_can_be_removed() {
     .await;
     let groups = &v["Splits"][0]["Groups"];
     assert_eq!(v["Splits"][0]["Folder"], FLASH, "{v}");
+    assert_eq!(v["Splits"][0]["Status"], "applied", "{v}");
+    assert_eq!(v["Splits"][0]["Moves"], serde_json::json!([]), "{v}");
     assert_eq!(groups.as_array().map(Vec::len), Some(2), "{v}");
     let over = &v["Overrides"][0];
     assert_eq!(over["Path"], moved.as_str(), "{v}");
@@ -176,4 +178,58 @@ async fn a_move_shows_on_the_overview_and_can_be_removed() {
     )
     .await;
     assert_eq!(resp.status().as_u16(), 404);
+}
+
+#[actix_web::test]
+async fn a_split_the_dry_run_holds_shows_as_pending_with_its_moves() {
+    let (state, token) = seed(true).await;
+    let folder = "/tv/Doctor Who";
+    for (id, year, episode) in [(10, 1963, 1), (11, 1963, 2), (12, 2005, 1)] {
+        MediaStore::put(
+            &state.stores,
+            MediaItem {
+                id,
+                path: format!("{folder}/Season 1/Doctor Who ({year}) - S01E0{episode}.mkv").into(),
+                title: format!("Episode {episode}"),
+                kind: MediaKind::Episode,
+                series: Some(SeriesInfo {
+                    series_name: "Doctor Who".into(),
+                    season_number: Some(1),
+                    episode_number: Some(episode),
+                    series_folder: Some(folder.into()),
+                    series_year: Some(year),
+                    series_key: None,
+                }),
+                ..MediaItem::default()
+            },
+        )
+        .await
+        .unwrap();
+    }
+    let app = app!(state);
+    let v: serde_json::Value = test::call_and_read_body_json(
+        &app,
+        test::TestRequest::get()
+            .uri("/admin/series-identity")
+            .insert_header(("X-Emby-Token", token.as_str()))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(v["RepairMode"], "dry_run", "{v}");
+    let split = &v["Splits"][0];
+    assert_eq!(split["Folder"], folder, "{v}");
+    assert_eq!(split["Status"], "pending", "{v}");
+    assert_eq!(split["Groups"].as_array().map(Vec::len), Some(2), "{v}");
+    let moved = format!("{folder}/Season 1/Doctor Who (2005) - S01E01.mkv");
+    assert_eq!(
+        split["Moves"],
+        serde_json::json!([{
+            "Path": moved,
+            "FromKey": folder,
+            "FromYear": 2005,
+            "ToKey": format!("{folder}\u{1f}2005"),
+            "ToYear": 2005,
+        }]),
+        "{v}"
+    );
 }
