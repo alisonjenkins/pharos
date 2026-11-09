@@ -13,9 +13,10 @@
 
 use crate::api_types::{ItemKind, LibraryItem, LoggedInUser};
 use crate::client::{
-    ActivityEntry, AdminUser, ApiKey, BrandingConfig, DeviceEntry, DuplicateFilm, ItemChapter,
-    ItemDetail, LibraryFolder, LiveChannel, LiveProgram, LocalizationCulture, LogEntry,
-    PluginEntry, QuickConnectInitiate, RemoteSession, ScheduledTask, SearchHint, UserConfiguration,
+    ActivityEntry, AdminUser, ApiKey, BrandingConfig, DeviceEntry, DuplicateFilm, IntegrityReport,
+    ItemChapter, ItemDetail, LibraryFolder, LiveChannel, LiveProgram, LocalizationCulture,
+    LogEntry, PluginEntry, QuickConnectInitiate, RemoteSession, ScheduledTask, SearchHint,
+    UserConfiguration,
 };
 use crate::views::server_picker::{load_saved_servers, save_servers};
 use crate::views::{
@@ -639,6 +640,27 @@ fn AdminPane(access_token: String, server_base: String, current_user_id: String)
             }
         })
     };
+    // Reads every file's verdict, so it runs only while its tab is open.
+    let integrity_resource = {
+        let base = server_base.clone();
+        let token = access_token.clone();
+        let reload_signal = reload;
+        use_resource(move || {
+            let _bust = reload_signal.read();
+            let open = *active_tab.read() == AdminTab::Integrity;
+            let base = base.clone();
+            let token = token.clone();
+            async move {
+                if open {
+                    Some(fetch_integrity_report(&base, &token).await)
+                } else {
+                    None
+                }
+            }
+        })
+    };
+    let integrity_queued = use_signal::<Vec<String>>(Vec::new);
+    let integrity_errors = use_signal::<Vec<(String, String)>>(Vec::new);
     let plugins_resource = {
         let base = server_base.clone();
         let token = access_token.clone();
@@ -692,6 +714,8 @@ fn AdminPane(access_token: String, server_base: String, current_user_id: String)
         let mut status_signal = status;
         let mut active_tab_signal = active_tab;
         let mut new_secret_signal = new_api_key_secret;
+        let mut queued_signal = integrity_queued;
+        let mut errors_signal = integrity_errors;
         move |action: AdminAction| {
             let token = access_token.clone();
             let base = server_base.clone();
@@ -755,10 +779,10 @@ fn AdminPane(access_token: String, server_base: String, current_user_id: String)
                         }
                     }
                     AdminAction::RecheckDamaged { media_id } => {
+                        errors_signal.write().retain(|(id, _)| *id != media_id);
                         match recheck_damaged_file(&base, &token, &media_id).await {
-                            Ok(()) => status_signal
-                                .set(Some(format!("Queued {media_id} to be re-checked"))),
-                            Err(e) => status_signal.set(Some(format!("Re-check failed: {e}"))),
+                            Ok(()) => queued_signal.write().push(media_id),
+                            Err(e) => errors_signal.write().push((media_id, e)),
                         }
                     }
                     AdminAction::SaveBranding(cfg) => {
@@ -799,6 +823,9 @@ fn AdminPane(access_token: String, server_base: String, current_user_id: String)
             _ => Vec::new(),
         };
     let duplicates = duplicates_resource.read_unchecked().clone().flatten();
+    let integrity = integrity_resource.read_unchecked().clone().flatten();
+    let integrity_queued = integrity_queued.read().clone();
+    let integrity_errors = integrity_errors.read().clone();
     let plugins: Vec<PluginEntry> = match plugins_resource.read_unchecked().as_ref() {
         Some(Ok(v)) => v.clone(),
         _ => Vec::new(),
@@ -836,6 +863,9 @@ fn AdminPane(access_token: String, server_base: String, current_user_id: String)
             new_api_key_secret: new_secret_now,
             branding: branding,
             duplicates: duplicates,
+            integrity: integrity,
+            integrity_queued: integrity_queued,
+            integrity_errors: integrity_errors,
         }
     }
 }
@@ -1979,6 +2009,27 @@ async fn revoke_api_key(base: &str, token: &str, key_id: &str) -> Result<(), Str
 #[cfg(not(feature = "web"))]
 async fn revoke_api_key(_base: &str, _token: &str, _key_id: &str) -> Result<(), String> {
     Err("revoke_api_key is only wired in the web build".into())
+}
+
+#[cfg(feature = "web")]
+async fn fetch_integrity_report(base: &str, token: &str) -> Result<IntegrityReport, String> {
+    use crate::client::{web, ClientError};
+    let describe = |e: ClientError| match e {
+        ClientError::Status(503) => {
+            "The integrity check isn't available on this server".to_string()
+        }
+        other => other.to_string(),
+    };
+    let status = web::integrity_status(base, token).await.map_err(describe)?;
+    let files = web::list_damaged_files(base, token)
+        .await
+        .map_err(describe)?;
+    Ok(IntegrityReport { status, files })
+}
+
+#[cfg(not(feature = "web"))]
+async fn fetch_integrity_report(_base: &str, _token: &str) -> Result<IntegrityReport, String> {
+    Err("integrity_status is only wired in the web build".into())
 }
 
 #[cfg(feature = "web")]
