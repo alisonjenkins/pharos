@@ -2754,6 +2754,7 @@ where
     S: pharos_core::MediaStore
         + pharos_core::SeriesMetadataStore
         + pharos_core::SeriesIdentityStore
+        + pharos_core::MetadataTranslationStore
         + Send
         + Sync,
 {
@@ -2936,9 +2937,14 @@ where
     assert_eq!(
         eps,
         vec![pharos_core::SeriesEpisodeRow {
+            id: old.id,
             path: old.path.to_string_lossy().into_owned(),
             season: Some(1),
             episode: Some(1),
+            premiere_date: None,
+            match_source: None,
+            match_provider: None,
+            match_external_id: None,
         }]
     );
     let eps = store.series_episodes(FOLDER).await.unwrap();
@@ -2994,6 +3000,92 @@ where
         ),
         (None, None, None)
     );
+
+    // V940 — episode reconciliation marks, re-admission, and translation deletion.
+    assert_eq!(store.mark_series_reconcile(&split, 100).await.unwrap(), 1);
+    assert_eq!(
+        store.series_reconcile_pending(10).await.unwrap(),
+        vec![(old.id, 100)]
+    );
+    MediaStore::put(&store, old.clone()).await.unwrap();
+    assert_eq!(
+        store.series_reconcile_pending(10).await.unwrap(),
+        vec![(old.id, 100)]
+    );
+    assert!(!store.clear_series_reconcile(old.id, 99).await.unwrap());
+    assert_eq!(
+        store.series_reconcile_pending(10).await.unwrap(),
+        vec![(old.id, 100)]
+    );
+    assert!(store.clear_series_reconcile(old.id, 100).await.unwrap());
+    assert!(store.series_reconcile_pending(10).await.unwrap().is_empty());
+
+    assert_eq!(store.mark_reconcile_items(&[], 200).await.unwrap(), 0);
+    assert_eq!(store.mark_reconcile_items(&[new.id], 200).await.unwrap(), 1);
+    assert_eq!(
+        store.series_reconcile_pending(10).await.unwrap(),
+        vec![(new.id, 200)]
+    );
+    assert!(store.clear_series_reconcile(new.id, 200).await.unwrap());
+    MediaStore::set_item_match(&store, new.id, "tvdb", "279121", "manual", None, 300)
+        .await
+        .unwrap();
+    assert_eq!(store.mark_reconcile_items(&[new.id], 400).await.unwrap(), 0);
+    assert!(store.series_reconcile_pending(10).await.unwrap().is_empty());
+
+    MediaStore::set_artwork(&store, old.id, "Primary", "tvdb", "/cache/old-still.jpg")
+        .await
+        .unwrap();
+    MediaStore::set_artwork(&store, old.id, "Thumb", "local", "/tv/x-thumb.jpg")
+        .await
+        .unwrap();
+    assert_eq!(
+        store.delete_provider_artwork(old.id).await.unwrap(),
+        vec![("Primary".to_string(), "/cache/old-still.jpg".to_string())]
+    );
+    assert_eq!(
+        MediaStore::artwork_for(&store, old.id).await.unwrap(),
+        vec![(
+            "Thumb".to_string(),
+            "local".to_string(),
+            "/tv/x-thumb.jpg".to_string()
+        )]
+    );
+
+    assert_eq!(store.readmit_series(&[]).await.unwrap(), 0);
+    assert_eq!(
+        store.readmit_series(&[FOLDER.to_string()]).await.unwrap(),
+        1
+    );
+
+    let owner = TranslationOwner::Item(old.id);
+    MetadataTranslationStore::upsert_translations(
+        &store,
+        &owner,
+        &[LocalizedText {
+            language: "eng".into(),
+            title: Some("x".into()),
+            ..Default::default()
+        }],
+        1,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        MetadataTranslationStore::delete_translations(&store, &owner)
+            .await
+            .unwrap(),
+        1
+    );
+    assert!(MetadataTranslationStore::translations_for(
+        &store,
+        std::slice::from_ref(&owner),
+        &["eng".to_string()],
+        true,
+    )
+    .await
+    .unwrap()
+    .is_empty());
 
     let sweep = MediaStore::begin_scan(&store, std::path::Path::new(ROOT))
         .await
