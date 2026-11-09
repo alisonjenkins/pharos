@@ -651,16 +651,39 @@ impl<P: Prober> FsScanner<P> {
             .await?;
         let series_folders = crate::series_split::folders_of(&paths);
         let root_prefix = root.to_string_lossy().into_owned();
+        // The split runs before the fold, so a split folder's groups are
+        // separate shows before their copies are grouped (V894).
         let series_plan = self
             .plan_series(store, &series_folders, &root_prefix)
             .instrument(tracing::info_span!("scan.series_plan"))
             .await;
+        let guard = match &series_plan {
+            Some((plan, ctx)) => {
+                let keys = FoldGuard::match_keys(&series_folders, plan);
+                let ambiguous = store.ambiguous_series(&keys).await.unwrap_or_else(|e| {
+                    tracing::warn!(
+                        error = %e,
+                        root = %root_prefix,
+                        "could not read which shows are flagged; folding them by split alone",
+                    );
+                    std::collections::HashSet::new()
+                });
+                FoldGuard::new(
+                    &series_folders,
+                    plan,
+                    ctx,
+                    ambiguous,
+                    self.series_identity_repair,
+                )
+            }
+            None => FoldGuard::default(),
+        };
         let groups = group_by_edition(paths);
         let facts = copy_facts(store, &copy_candidates(&groups))
             .instrument(tracing::info_span!("scan.copy_facts"))
             .await;
         let mut tally = CopyTally::default();
-        let groups = group_copies(groups, &facts, &mut tally);
+        let groups = group_copies_guarded(groups, &facts, &guard, &mut tally);
         tally.publish();
         // A file now grouped under another may still hold its own row from an
         // earlier pass; that row is swept, so its viewers' state moves first.
@@ -2628,11 +2651,24 @@ fn group_copies(
     facts: &HashMap<PathBuf, CopyFacts>,
     tally: &mut CopyTally,
 ) -> Vec<(PathBuf, Vec<(String, PathBuf)>)> {
+    group_copies_guarded(groups, facts, &FoldGuard::default(), tally)
+}
+
+/// [`group_copies`], with episode copies bucketed by the series key the
+/// split gives them and a copy that may be another show's kept as its own
+/// item (V894).
+fn group_copies_guarded(
+    groups: Vec<(PathBuf, Vec<(String, PathBuf)>)>,
+    facts: &HashMap<PathBuf, CopyFacts>,
+    guard: &FoldGuard,
+    tally: &mut CopyTally,
+) -> Vec<(PathBuf, Vec<(String, PathBuf)>)> {
     let spans: Vec<Option<EpisodeSpan>> = groups.iter().map(|g| episode_copy_key(&g.0)).collect();
     let mut covered = vec![false; groups.len()];
     let mut by_bucket: BTreeMap<CopyBucket, Vec<usize>> = BTreeMap::new();
     for (i, (path, _)) in groups.iter().enumerate() {
         for bucket in copy_buckets(path) {
+            let bucket = guard.rekey(path, bucket);
             by_bucket.entry(bucket).or_default().push(i);
             if let Some(flag) = covered.get_mut(i) {
                 *flag = true;
@@ -2670,9 +2706,52 @@ fn group_copies(
             candidates = ?ranked.iter().map(|(r, i)| (groups.get(*i).map(|g| g.0.display().to_string()), r)).collect::<Vec<_>>(),
             "chose the primary of a title's copies",
         );
-        let entry = gathered.entry(primary).or_default();
+        let primary_path = groups.get(primary).map(|g| g.0.as_path());
+        let mut kept = Vec::with_capacity(members.len());
         for &member in members {
-            if member != primary && !entry.contains(&member) {
+            if member == primary {
+                continue;
+            }
+            let refusal = match (guard.mode, bucket, primary_path, groups.get(member)) {
+                (Some(mode), CopyBucket::Episode { .. }, Some(a), Some((b, _))) => {
+                    guard.refusal(a, b).map(|reason| (mode, reason))
+                }
+                _ => None,
+            };
+            let Some((mode, reason)) = refusal else {
+                kept.push(member);
+                continue;
+            };
+            tally.record(CopyDecision::RefusedOtherSeries);
+            let primary_shown = primary_path.map_or_else(String::new, |p| p.display().to_string());
+            let copy_shown = groups
+                .get(member)
+                .map_or_else(String::new, |g| g.0.display().to_string());
+            if mode == crate::series_split::RepairMode::Apply {
+                if let Some(flag) = is_item.get_mut(member) {
+                    *flag = true;
+                }
+                tracing::info!(
+                    primary = %primary_shown,
+                    copy = %copy_shown,
+                    reason,
+                    mode = mode.label(),
+                    "refused to fold a copy that may be another show's episode",
+                );
+            } else {
+                tracing::info!(
+                    primary = %primary_shown,
+                    copy = %copy_shown,
+                    reason,
+                    mode = mode.label(),
+                    "would refuse to fold a copy that may be another show's episode; folded as before",
+                );
+                kept.push(member);
+            }
+        }
+        let entry = gathered.entry(primary).or_default();
+        for member in kept {
+            if !entry.contains(&member) {
                 entry.push(member);
             }
         }
@@ -2720,6 +2799,160 @@ fn unix_now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+}
+
+/// What the series split (V893) and the stored matches say about each
+/// episode file, for the copy fold (V894). The default guards nothing.
+#[derive(Debug, Default)]
+pub(crate) struct FoldGuard {
+    /// `None`: no checks. `DryRun`: log and count each copy that would be
+    /// kept apart, and fold it as before. `Apply`: keep it apart.
+    mode: Option<crate::series_split::RepairMode>,
+    /// Each file's series key, where the split plan assigned one.
+    keys: HashMap<PathBuf, String>,
+    /// Each file's stated show year (V893), where it states one.
+    stated: HashMap<PathBuf, u32>,
+    /// Files an `admin` per-path override placed (V896).
+    admin_placed: std::collections::HashSet<PathBuf>,
+    /// Series keys whose copies fold only on agreeing episode titles: a
+    /// split folder's keys and keys whose show match is flagged (V891).
+    guarded: std::collections::HashSet<String>,
+}
+
+/// Two filename episode titles at or above this similarity name one episode
+/// (spec 033 §5, the same bar V891 scores titles by).
+const SAME_EPISODE_TITLE: f32 = 0.8;
+
+impl FoldGuard {
+    pub(crate) fn new(
+        folders: &BTreeMap<String, Vec<(PathBuf, Option<u32>)>>,
+        plan: &crate::series_split::SeriesPlan,
+        ctx: &crate::series_split::PlanContext,
+        ambiguous: std::collections::HashSet<String>,
+        mode: crate::series_split::RepairMode,
+    ) -> Self {
+        let keys: HashMap<PathBuf, String> = plan
+            .assignments
+            .iter()
+            .map(|(p, a)| (p.clone(), a.series_key.clone()))
+            .collect();
+        let stated = folders
+            .values()
+            .flatten()
+            .filter_map(|(p, y)| Some((p.clone(), (*y)?)))
+            .collect();
+        let admin_placed = ctx
+            .overrides
+            .iter()
+            .filter(|o| o.source == pharos_core::OverrideSource::Admin)
+            .filter_map(|o| o.path.as_deref().map(PathBuf::from))
+            .collect();
+        let mut guarded = ambiguous;
+        for split in &plan.splits {
+            guarded.extend(
+                keys.values()
+                    .filter(|k| {
+                        k.as_str() == split.folder
+                            || k.strip_prefix(split.folder.as_str()).is_some_and(|rest| {
+                                rest.starts_with(crate::series_split::SPLIT_KEY_SEPARATOR)
+                            })
+                    })
+                    .cloned(),
+            );
+            guarded.insert(split.folder.clone());
+        }
+        Self {
+            mode: Some(mode),
+            keys,
+            stated,
+            admin_placed,
+            guarded,
+        }
+    }
+
+    /// The keys whose show match may be flagged: every folder walked and
+    /// every key the plan assigned.
+    pub(crate) fn match_keys(
+        folders: &BTreeMap<String, Vec<(PathBuf, Option<u32>)>>,
+        plan: &crate::series_split::SeriesPlan,
+    ) -> Vec<String> {
+        let mut keys: std::collections::BTreeSet<String> = folders.keys().cloned().collect();
+        keys.extend(plan.assignments.values().map(|a| a.series_key.clone()));
+        keys.into_iter().collect()
+    }
+
+    /// `bucket` with an episode's show folder replaced by its series key.
+    fn rekey(&self, path: &Path, bucket: CopyBucket) -> CopyBucket {
+        match (bucket, self.keys.get(path)) {
+            (
+                CopyBucket::Episode {
+                    season,
+                    first,
+                    last,
+                    ..
+                },
+                Some(key),
+            ) => {
+                let name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or_default();
+                let show = match name_show_year(name) {
+                    Some(year) => format!("{key}\u{1f}{year}"),
+                    None => key.clone(),
+                };
+                CopyBucket::Episode {
+                    show,
+                    season,
+                    first,
+                    last,
+                }
+            }
+            (bucket, _) => bucket,
+        }
+    }
+
+    fn key_of(&self, path: &Path) -> Option<String> {
+        self.keys
+            .get(path)
+            .cloned()
+            .or_else(|| parse_series_info(path)?.series_folder)
+    }
+
+    /// Why `copy` must not fold into `primary`, or `None` when it may.
+    fn refusal(&self, primary: &Path, copy: &Path) -> Option<&'static str> {
+        if let (Some(a), Some(b)) = (self.stated.get(primary), self.stated.get(copy)) {
+            if a != b {
+                return Some("years_differ");
+            }
+        }
+        if self.admin_placed.contains(primary) || self.admin_placed.contains(copy) {
+            return Some("admin_placed");
+        }
+        // An edition tag (` - 3D.HSBS`, ` - Extended`) names the copy, not
+        // the episode.
+        let title = |p: &Path| {
+            let stem = p.file_stem()?.to_str()?;
+            let stem = split_edition_tag(stem).map_or(stem, |(left, _)| left);
+            crate::metadata::filename::episode_title(stem)
+        };
+        let same_span = episode_copy_key(primary).map(|k| (k.2, k.3))
+            == episode_copy_key(copy).map(|k| (k.2, k.3));
+        let titles = same_span.then(|| (title(primary), title(copy)));
+        match titles {
+            Some((Some(a), Some(b))) => {
+                if pharos_core::title_similarity(&a, &b) < SAME_EPISODE_TITLE {
+                    Some("titles_differ")
+                } else {
+                    None
+                }
+            }
+            _ => [primary, copy]
+                .iter()
+                .any(|p| self.key_of(p).is_some_and(|k| self.guarded.contains(&k)))
+                .then_some("numbers_only"),
+        }
+    }
 }
 
 /// The key a film file's name gives it (`Heat (1995) Bluray-1080p.mkv` is
@@ -6064,6 +6297,54 @@ mod tests {
         assert_eq!(store.reconcile_marked.lock().unwrap().len(), 1);
     }
 
+    /// V894: a scan pass splits a folder before folding its copies, so
+    /// under `apply` two unyeared copies of one number in a split folder
+    /// stay two rows; a dry run folds them as before. Both count the copy
+    /// under `decided_by="refused_other_series"`.
+    #[tokio::test]
+    async fn a_scan_keeps_a_split_folders_number_only_copies_apart() {
+        use crate::series_split::RepairMode;
+        for mode in [RepairMode::Apply, RepairMode::DryRun] {
+            let recorder = metrics_util::debugging::DebuggingRecorder::new();
+            let snapshotter = pharos_test_metrics::snapshotter(&recorder);
+            let _guard = metrics::set_default_local_recorder(&recorder);
+            let td = TempDir::new().unwrap();
+            write_flash(td.path()).await;
+            write_file(td.path(), "The Flash/Season 1/The Flash - S01E03.mkv", b"d").await;
+            write_file(
+                td.path(),
+                "The Flash/Season 01/The Flash - S01E03.avi",
+                b"e",
+            )
+            .await;
+            let store = MemStore::default();
+            let scanner = FsScanner::new(FakeProber::default()).with_series_identity_repair(mode);
+            scanner.scan_into(td.path(), &store).await.unwrap();
+
+            let items = store.list().await.unwrap();
+            let e03: Vec<_> = items
+                .iter()
+                .filter(|i| {
+                    i.path.to_string_lossy().ends_with("S01E03.mkv")
+                        || i.path.to_string_lossy().ends_with("S01E03.avi")
+                })
+                .collect();
+            let rows = if mode == RepairMode::Apply { 2 } else { 1 };
+            assert_eq!(e03.len(), rows, "{mode:?}: {items:?}");
+            let versions: usize = e03.iter().map(|i| i.probe.alternate_sources.len()).sum();
+            assert_eq!(versions, 2 - rows, "{mode:?}");
+            assert_eq!(
+                series_metric(
+                    &snapshotter,
+                    "pharos_scan_copy_primaries",
+                    &[("decided_by", "refused_other_series")]
+                ),
+                Some(1.0),
+                "{mode:?}"
+            );
+        }
+    }
+
     /// Spec 033 §6.2: the default dry run counts the split it would make and
     /// writes nothing.
     #[tokio::test]
@@ -8791,6 +9072,187 @@ mod tests {
         assert_eq!(groups[0].0, two_d);
         assert_eq!(groups[0].1.len(), 1);
         assert_eq!(groups[0].1[0].1, three_d);
+    }
+
+    /// The fold guard a scan pass builds for `paths` (V894).
+    fn guard_for(
+        paths: &[PathBuf],
+        overrides: Vec<pharos_core::SeriesOverride>,
+        ambiguous: &[&str],
+    ) -> FoldGuard {
+        let folders = crate::series_split::folders_of(paths);
+        let ctx = crate::series_split::PlanContext {
+            overrides,
+            ..Default::default()
+        };
+        let plan = crate::series_split::plan(&folders, &ctx, 0);
+        let ambiguous = ambiguous.iter().map(|k| (*k).to_string()).collect();
+        FoldGuard::new(
+            &folders,
+            &plan,
+            &ctx,
+            ambiguous,
+            crate::series_split::RepairMode::Apply,
+        )
+    }
+
+    /// `paths` grouped behind `guard`, and the copies it kept apart.
+    fn guarded_groups(paths: &[PathBuf], guard: &FoldGuard) -> (Vec<Group>, u64) {
+        let mut tally = CopyTally::default();
+        let out = group_copies_guarded(
+            group_by_edition(paths.to_vec()),
+            &HashMap::new(),
+            guard,
+            &mut tally,
+        );
+        let refused = tally
+            .0
+            .get(&CopyDecision::RefusedOtherSeries)
+            .copied()
+            .unwrap_or(0);
+        (out, refused)
+    }
+
+    /// The Flash folder holding both shows, and two unyeared copies of one
+    /// episode number.
+    fn flash_with_copies(titles: [&str; 2]) -> Vec<PathBuf> {
+        let mut paths: Vec<PathBuf> = [
+            "/tv/The Flash/Season 1/The Flash (1990) - S01E01.mkv",
+            "/tv/The Flash/Season 3/The Flash (2014) - S03E01.mkv",
+            "/tv/The Flash/Season 3/The Flash (2014) - S03E02.mkv",
+        ]
+        .iter()
+        .map(PathBuf::from)
+        .collect();
+        paths.push(PathBuf::from(format!(
+            "/tv/The Flash/Season 1/The Flash - S01E02{}.mkv",
+            titles[0]
+        )));
+        paths.push(PathBuf::from(format!(
+            "/tv/The Flash/Season 01/The Flash - S01E02{}.avi",
+            titles[1]
+        )));
+        paths
+    }
+
+    /// V894: in a split folder, a matching season and episode number alone
+    /// never folds two copies; agreeing episode titles do.
+    #[test]
+    fn in_a_split_folder_numbers_alone_never_fold_copies() {
+        let paths = flash_with_copies(["", ""]);
+        let (out, refused) = guarded_groups(&paths, &guard_for(&paths, vec![], &[]));
+        assert_eq!(out.len(), 5, "{out:?}");
+        assert_eq!(refused, 1);
+        assert_eq!(
+            guard_for(&paths, vec![], &[]).refusal(&paths[3], &paths[4]),
+            Some("numbers_only")
+        );
+        // The same files with no split to guard them fold as before.
+        let (out, refused) = guarded_groups(&paths, &FoldGuard::default());
+        assert_eq!((out.len(), refused), (4, 0));
+
+        let titled = flash_with_copies([" - Out of Time", " - Out of Time"]);
+        let (out, refused) = guarded_groups(&titled, &guard_for(&titled, vec![], &[]));
+        assert_eq!((out.len(), refused), (4, 0), "{out:?}");
+    }
+
+    /// V894: a show whose match is flagged folds its copies only on agreeing
+    /// episode titles.
+    #[test]
+    fn a_flagged_shows_copies_fold_only_on_agreeing_titles() {
+        let bare = [
+            PathBuf::from("/tv/Cosmos/Season 1/Cosmos - S01E01.mkv"),
+            PathBuf::from("/tv/Cosmos/Season 01/Cosmos - S01E01.avi"),
+        ];
+        let folder = parse_series_info(&bare[0]).unwrap().series_folder.unwrap();
+        let (out, refused) = guarded_groups(&bare, &guard_for(&bare, vec![], &[&folder]));
+        assert_eq!((out.len(), refused), (2, 1));
+        let (out, refused) = guarded_groups(&bare, &guard_for(&bare, vec![], &[]));
+        assert_eq!((out.len(), refused), (1, 0));
+
+        let titled = [
+            PathBuf::from(
+                "/tv/Cosmos/Season 1/Cosmos - S01E01 - The Shores of the Cosmic Ocean.mkv",
+            ),
+            PathBuf::from(
+                "/tv/Cosmos/Season 01/Cosmos - S01E01 - The Shores of the Cosmic Ocean.avi",
+            ),
+        ];
+        let (out, refused) = guarded_groups(&titled, &guard_for(&titled, vec![], &[&folder]));
+        assert_eq!((out.len(), refused), (1, 0));
+    }
+
+    /// V894: two copies whose file names give different episode titles are
+    /// different episodes, in any show; an edition tag is no title.
+    #[test]
+    fn copies_titled_as_different_episodes_never_fold() {
+        let paths = [
+            PathBuf::from("/tv/Show/Season 1/Show - S01E02 - Pilot.mkv"),
+            PathBuf::from("/tv/Show/Season 01/Show - S01E02 - The Long Night.mp4"),
+        ];
+        let apply = FoldGuard {
+            mode: Some(crate::series_split::RepairMode::Apply),
+            ..FoldGuard::default()
+        };
+        let (out, refused) = guarded_groups(&paths, &apply);
+        assert_eq!((out.len(), refused), (2, 1));
+        assert_eq!(apply.refusal(&paths[0], &paths[1]), Some("titles_differ"));
+        // A dry run counts the copy it would keep apart and folds it.
+        let dry = FoldGuard {
+            mode: Some(crate::series_split::RepairMode::DryRun),
+            ..FoldGuard::default()
+        };
+        let (out, refused) = guarded_groups(&paths, &dry);
+        assert_eq!((out.len(), refused), (1, 1));
+        // No guard, no check: the stand-alone listing folds as before.
+        let (out, refused) = guarded_groups(&paths, &FoldGuard::default());
+        assert_eq!((out.len(), refused), (1, 0));
+        let tagged = [
+            PathBuf::from("/tv/Show/Season 1/Show - S01E02 - Pilot - 3D.HSBS.mkv"),
+            PathBuf::from("/tv/Show/Season 01/Show - S01E02 - Pilot.mp4"),
+        ];
+        assert_eq!(FoldGuard::default().refusal(&tagged[0], &tagged[1]), None);
+    }
+
+    /// V894/V896: a file an admin placed never folds with another copy.
+    #[test]
+    fn a_copy_an_admin_placed_never_folds() {
+        let paths = [
+            PathBuf::from("/tv/Show/Season 1/Show - S01E02 - Pilot.mkv"),
+            PathBuf::from("/tv/Show/Season 01/Show - S01E02 - Pilot.mp4"),
+        ];
+        let folder = parse_series_info(&paths[0]).unwrap().series_folder.unwrap();
+        let admin = pharos_core::SeriesOverride {
+            id: 1,
+            series_folder: folder.clone(),
+            path: Some(paths[1].to_string_lossy().into_owned()),
+            target_key: folder,
+            target_name: None,
+            target_year: None,
+            source: pharos_core::OverrideSource::Admin,
+            created_by: Some("admin".into()),
+            created_at: 0,
+        };
+        let guard = guard_for(&paths, vec![admin], &[]);
+        let (out, refused) = guarded_groups(&paths, &guard);
+        assert_eq!((out.len(), refused), (2, 1));
+        assert_eq!(guard.refusal(&paths[0], &paths[1]), Some("admin_placed"));
+    }
+
+    /// V894: two known stated show years that differ never fold, whatever
+    /// key the two files share.
+    #[test]
+    fn copies_stating_different_show_years_never_fold() {
+        let a = PathBuf::from("/tv/Show/Season 1/Show - S01E02 - Pilot.mkv");
+        let b = PathBuf::from("/tv/Show/Season 01/Show - S01E02 - Pilot.mp4");
+        let guard = FoldGuard {
+            mode: Some(crate::series_split::RepairMode::Apply),
+            stated: HashMap::from([(a.clone(), 1990), (b.clone(), 2014)]),
+            ..FoldGuard::default()
+        };
+        assert_eq!(guard.refusal(&a, &b), Some("years_differ"));
+        let (out, refused) = guarded_groups(&[a, b], &guard);
+        assert_eq!((out.len(), refused), (2, 1));
     }
 
     #[tokio::test]
