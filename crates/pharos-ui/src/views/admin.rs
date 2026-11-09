@@ -6,8 +6,9 @@
 //! render so the UI is in place when entries land.
 
 use crate::client::{
-    ActivityEntry, AdminUser, ApiKey, BrandingConfig, DeviceEntry, DuplicateFilm, FilmVersion,
-    LibraryFolder, LogEntry, PluginEntry, ScheduledTask,
+    ActivityEntry, AdminUser, ApiKey, BrandingConfig, DamagedFile, DeviceEntry, DuplicateFilm,
+    FilmVersion, IntegrityReport, IntegrityStatus, LibraryFolder, LogEntry, PluginEntry,
+    ScheduledTask,
 };
 use dioxus::prelude::*;
 
@@ -47,6 +48,10 @@ pub enum AdminAction {
     /// T65 / UI — save the branding form (ServerName + LoginDisclaimer
     /// + CustomCss) via POST /System/Configuration.
     SaveBranding(BrandingConfig),
+    /// Queue a damaged file to be read again by the integrity check.
+    RecheckDamaged {
+        media_id: String,
+    },
     LibraryRefresh,
     Refresh,
     SelectTab(AdminTab),
@@ -58,6 +63,7 @@ pub enum AdminTab {
     Users,
     Libraries,
     Duplicates,
+    Integrity,
     Devices,
     Activity,
     ScheduledTasks,
@@ -73,6 +79,7 @@ impl AdminTab {
             Self::Users => "Users",
             Self::Libraries => "Libraries",
             Self::Duplicates => "Duplicates",
+            Self::Integrity => "Damaged files",
             Self::Devices => "Devices",
             Self::Activity => "Activity",
             Self::ScheduledTasks => "Tasks",
@@ -87,6 +94,7 @@ impl AdminTab {
             Self::Users => "users",
             Self::Libraries => "libraries",
             Self::Duplicates => "duplicates",
+            Self::Integrity => "integrity",
             Self::Devices => "devices",
             Self::Activity => "activity",
             Self::ScheduledTasks => "scheduledtasks",
@@ -96,11 +104,12 @@ impl AdminTab {
             Self::Branding => "branding",
         }
     }
-    fn all() -> [AdminTab; 10] {
+    fn all() -> [AdminTab; 11] {
         [
             Self::Users,
             Self::Libraries,
             Self::Duplicates,
+            Self::Integrity,
             Self::Devices,
             Self::Activity,
             Self::ScheduledTasks,
@@ -146,6 +155,16 @@ pub struct AdminViewProps {
     /// listing has answered.
     #[props(default)]
     pub duplicates: Option<Result<Vec<DuplicateFilm>, String>>,
+    /// Integrity status and damaged files; `None` until the Damaged files
+    /// tab's listing has answered.
+    #[props(default)]
+    pub integrity: Option<Result<IntegrityReport, String>>,
+    /// Files whose Re-check was just requested from this page.
+    #[props(default)]
+    pub integrity_queued: Vec<String>,
+    /// Re-check failures by media id, shown on the row.
+    #[props(default)]
+    pub integrity_errors: Vec<(String, String)>,
 }
 
 #[component]
@@ -386,6 +405,14 @@ pub fn AdminView(props: AdminViewProps) -> Element {
                 },
                 AdminTab::Duplicates => rsx! {
                     DuplicatesSection { films: props.duplicates.clone() }
+                },
+                AdminTab::Integrity => rsx! {
+                    IntegritySection {
+                        report: props.integrity.clone(),
+                        queued: props.integrity_queued.clone(),
+                        errors: props.integrity_errors.clone(),
+                        on_action: props.on_action,
+                    }
                 },
                 AdminTab::Plugins => rsx! {
                     section {
@@ -774,6 +801,205 @@ fn DuplicatesSection(films: Option<Result<Vec<DuplicateFilm>, String>>) -> Eleme
     }
 }
 
+/// No delete on purpose: the owner decides what to do with a damaged file
+/// outside pharos, then asks for it to be checked again.
+#[component]
+fn IntegritySection(
+    report: Option<Result<IntegrityReport, String>>,
+    queued: Vec<String>,
+    errors: Vec<(String, String)>,
+    on_action: EventHandler<AdminAction>,
+) -> Element {
+    rsx! {
+        section {
+            class: "pharos-admin-section pharos-admin-section-integrity",
+            h3 { "Damaged files" }
+            match report {
+                None => rsx! { p { class: "pharos-loading", "Checking on the files…" } },
+                Some(Err(e)) => rsx! { p { class: "pharos-error", "Could not list damaged files: {e}" } },
+                Some(Ok(report)) => rsx! {
+                    p { class: "pharos-admin-integrity-summary", "{integrity_summary(&report.status)}" }
+                    for f in report.files.iter() {
+                        DamagedRow {
+                            key: "{f.media_id}",
+                            file: f.clone(),
+                            queued: f.recheck_pending || queued.contains(&f.media_id),
+                            error: errors.iter().find(|(id, _)| *id == f.media_id).map(|(_, e)| e.clone()),
+                            on_action: on_action,
+                        }
+                    }
+                },
+            }
+        }
+    }
+}
+
+#[component]
+fn DamagedRow(
+    file: DamagedFile,
+    queued: bool,
+    error: Option<String>,
+    on_action: EventHandler<AdminAction>,
+) -> Element {
+    let id = file.media_id.clone();
+    let breaks = file.first_fault_ms.map(break_label);
+    rsx! {
+        article {
+            class: "pharos-admin-integrity-file",
+            "data-verdict": "{file.verdict}",
+            h4 {
+                "{damaged_title(&file)}"
+                span { class: "pharos-admin-integrity-kind", " · {kind_label(file.kind.as_deref())}" }
+            }
+            p {
+                class: "pharos-admin-integrity-verdict",
+                "{verdict_words(&file.verdict)}"
+                if let Some(b) = breaks {
+                    span { " · {b}" }
+                }
+            }
+            if let Some(fault) = file.first_fault.as_deref() {
+                p { class: "pharos-admin-integrity-fault", "{fault}" }
+            }
+            match file.path.as_deref() {
+                Some(path) => rsx! { p { class: "pharos-admin-integrity-path", "{path}" } },
+                None => rsx! {
+                    p { class: "pharos-admin-integrity-path", "This file is no longer in the library." }
+                },
+            }
+            if let Some(secs) = file.checked_at {
+                p { class: "pharos-admin-integrity-checked", "Checked {date_label(secs)}" }
+            }
+            if queued {
+                button { class: "pharos-admin-integrity-recheck", disabled: true, "Queued" }
+            } else {
+                button {
+                    class: "pharos-admin-integrity-recheck",
+                    onclick: move |_| on_action.call(AdminAction::RecheckDamaged {
+                        media_id: id.clone(),
+                    }),
+                    "Re-check"
+                }
+            }
+            if let Some(e) = error {
+                p { class: "pharos-error", "Could not queue the re-check: {e}" }
+            }
+        }
+    }
+}
+
+fn integrity_summary(s: &IntegrityStatus) -> String {
+    let complete = s.checked >= s.eligible;
+    if s.damaged == 0 {
+        return if complete {
+            "Every file has been checked. Nothing is damaged.".to_string()
+        } else {
+            format!(
+                "Nothing damaged so far ({} of {} files checked). Checking continues in the background.",
+                thousands(s.checked),
+                thousands(s.eligible)
+            )
+        };
+    }
+    let mut line = format!(
+        "Checked {} of {} files · {} damaged",
+        thousands(s.checked),
+        thousands(s.eligible),
+        thousands(s.damaged)
+    );
+    if s.queued > 0 {
+        line.push_str(&format!(
+            " · {} waiting to be re-checked",
+            thousands(s.queued)
+        ));
+    }
+    line.push('.');
+    if !complete {
+        line.push_str(" Checking continues in the background.");
+    }
+    line
+}
+
+fn thousands(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+fn file_name_of(path: &str) -> &str {
+    path.rsplit(['/', '\\']).next().unwrap_or(path)
+}
+
+/// `Series · S01E02 · Name` for an episode, the name for everything else,
+/// the file name when the library has no name for it.
+fn damaged_title(f: &DamagedFile) -> String {
+    let named = f.name.as_deref().filter(|n| !n.is_empty());
+    let title = if f.kind.as_deref() == Some("episode") {
+        let code = match (f.season_number, f.episode_number) {
+            (Some(s), Some(e)) => Some(format!("S{s:02}E{e:02}")),
+            _ => None,
+        };
+        let parts: Vec<String> = [
+            f.series_name.clone().filter(|n| !n.is_empty()),
+            code,
+            named.map(str::to_string),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        (!parts.is_empty()).then(|| parts.join(" · "))
+    } else {
+        named.map(str::to_string)
+    };
+    title
+        .or_else(|| f.path.as_deref().map(|p| file_name_of(p).to_string()))
+        .unwrap_or_else(|| format!("File {}", f.media_id))
+}
+
+fn kind_label(kind: Option<&str>) -> &'static str {
+    match kind {
+        Some("movie") => "Movie",
+        Some("episode") => "Episode",
+        Some("audio") => "Audio",
+        Some("book") => "Book",
+        _ => "File",
+    }
+}
+
+fn verdict_words(verdict: &str) -> &'static str {
+    match verdict {
+        "short" => "Shorter than it claims",
+        "unreadable" => "Can't be read",
+        _ => "Damaged",
+    }
+}
+
+/// `h:mm:ss`, hours unpadded.
+fn hms(ms: u64) -> String {
+    let total = ms / 1_000;
+    format!(
+        "{}:{:02}:{:02}",
+        total / 3_600,
+        total % 3_600 / 60,
+        total % 60
+    )
+}
+
+fn break_label(ms: u64) -> String {
+    format!("Breaks at {}", hms(ms))
+}
+
+fn date_label(secs: i64) -> String {
+    let (y, m, d) = civil_from_days(secs.div_euclid(86_400));
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
 const UNKNOWN: &str = "—";
 
 fn duplicates_summary(films: &[DuplicateFilm]) -> String {
@@ -830,8 +1056,7 @@ fn added_label(v: &FilmVersion) -> String {
     let Some(secs) = v.date_added else {
         return UNKNOWN.to_string();
     };
-    let (y, m, d) = civil_from_days(secs.div_euclid(86_400));
-    format!("{y:04}-{m:02}-{d:02}")
+    date_label(secs)
 }
 
 /// Howard Hinnant's days-to-civil: days since 1970-01-01 to (year, month, day).
@@ -901,7 +1126,10 @@ mod tests {
         assert_eq!(AdminTab::Branding.class_suffix(), "branding");
         assert_eq!(AdminTab::Duplicates.label(), "Duplicates");
         assert_eq!(AdminTab::Duplicates.class_suffix(), "duplicates");
-        assert_eq!(AdminTab::all().len(), 10);
+        assert_eq!(AdminTab::Integrity.label(), "Damaged files");
+        assert_eq!(AdminTab::Integrity.class_suffix(), "integrity");
+        assert_eq!(AdminTab::all().len(), 11);
+        assert_eq!(AdminTab::all()[3], AdminTab::Integrity);
     }
 
     fn version(id: &str, width: u32, height: u32) -> FilmVersion {
@@ -945,6 +1173,246 @@ mod tests {
         let html =
             dioxus_ssr::render_element(rsx! { DuplicatesSection { films: Some(Ok(vec![])) } });
         assert!(html.contains("more than once"), "{html}");
+    }
+
+    fn damaged(id: &str) -> DamagedFile {
+        DamagedFile {
+            media_id: id.into(),
+            verdict: "damaged".into(),
+            ..DamagedFile::default()
+        }
+    }
+
+    fn episode() -> DamagedFile {
+        DamagedFile {
+            path: Some("/tv/Show/S01E02.mkv".into()),
+            first_fault: Some("Invalid data found when processing input".into()),
+            first_fault_ms: Some(2_533_000),
+            kind: Some("episode".into()),
+            name: Some("Pilot".into()),
+            series_name: Some("Show".into()),
+            season_number: Some(1),
+            episode_number: Some(2),
+            checked_at: Some(1_762_214_400),
+            ..damaged("123")
+        }
+    }
+
+    fn render_integrity(
+        report: Option<Result<IntegrityReport, String>>,
+        queued: Vec<String>,
+        errors: Vec<(String, String)>,
+    ) -> String {
+        type Input = (
+            Option<Result<IntegrityReport, String>>,
+            Vec<String>,
+            Vec<(String, String)>,
+        );
+        let mut dom = VirtualDom::new_with_props(
+            |(report, queued, errors): Input| {
+                rsx! {
+                    IntegritySection { report, queued, errors, on_action: |_| {} }
+                }
+            },
+            (report, queued, errors),
+        );
+        dom.rebuild_in_place();
+        dioxus_ssr::render(&dom)
+    }
+
+    fn report(
+        files: Vec<DamagedFile>,
+        status: IntegrityStatus,
+    ) -> Option<Result<IntegrityReport, String>> {
+        Some(Ok(IntegrityReport { status, files }))
+    }
+
+    #[test]
+    fn the_damaged_tab_lists_each_file_with_its_title_and_break_time() {
+        let status = IntegrityStatus {
+            eligible: 9_700,
+            checked: 4_120,
+            damaged: 2,
+            queued: 0,
+        };
+        let other = DamagedFile {
+            verdict: "short".into(),
+            kind: Some("movie".into()),
+            name: Some("Heat".into()),
+            ..damaged("7")
+        };
+        let html = render_integrity(report(vec![episode(), other], status), vec![], vec![]);
+        assert!(html.contains("Show · S01E02 · Pilot"), "{html}");
+        assert!(html.contains("Breaks at 0:42:13"), "{html}");
+        assert!(
+            html.contains("Invalid data found when processing input"),
+            "{html}"
+        );
+        assert!(html.contains("/tv/Show/S01E02.mkv"), "{html}");
+        assert!(html.contains("Checked 2025-11-04"), "{html}");
+        assert!(
+            html.contains("Heat") && html.contains("Shorter than it claims"),
+            "{html}"
+        );
+        assert!(html.contains("Checked 4,120 of 9,700 files"), "{html}");
+        assert!(html.contains("Re-check"), "{html}");
+        assert!(!html.to_lowercase().contains("delete"), "{html}");
+    }
+
+    #[test]
+    fn the_damaged_tab_says_everything_is_fine_when_checking_is_complete() {
+        let status = IntegrityStatus {
+            eligible: 10,
+            checked: 10,
+            damaged: 0,
+            queued: 0,
+        };
+        let html = render_integrity(report(vec![], status), vec![], vec![]);
+        assert!(
+            html.contains("Every file has been checked. Nothing is damaged."),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn the_damaged_tab_says_checking_continues_when_incomplete() {
+        let status = IntegrityStatus {
+            eligible: 10,
+            checked: 4,
+            damaged: 0,
+            queued: 0,
+        };
+        let html = render_integrity(report(vec![], status), vec![], vec![]);
+        assert!(html.contains("Nothing damaged so far"), "{html}");
+        assert!(html.contains("in the background"), "{html}");
+    }
+
+    #[test]
+    fn a_pending_or_just_requested_recheck_shows_queued() {
+        let status = IntegrityStatus {
+            eligible: 10,
+            checked: 10,
+            damaged: 2,
+            queued: 1,
+        };
+        let pending = DamagedFile {
+            recheck_pending: true,
+            ..damaged("1")
+        };
+        let html = render_integrity(report(vec![pending, damaged("2")], status), vec![], vec![]);
+        assert_eq!(html.matches(">Queued<").count(), 1, "{html}");
+        assert!(html.contains("1 waiting to be re-checked"), "{html}");
+        let html = render_integrity(
+            report(vec![damaged("1"), damaged("2")], status),
+            vec!["2".into()],
+            vec![],
+        );
+        assert_eq!(html.matches(">Queued<").count(), 1, "{html}");
+    }
+
+    #[test]
+    fn a_failed_recheck_shows_its_error_on_that_row_only() {
+        let status = IntegrityStatus {
+            eligible: 2,
+            checked: 2,
+            damaged: 2,
+            queued: 0,
+        };
+        let html = render_integrity(
+            report(vec![damaged("1"), damaged("2")], status),
+            vec![],
+            vec![("2".into(), "status 404".into())],
+        );
+        assert_eq!(html.matches("status 404").count(), 1, "{html}");
+    }
+
+    #[test]
+    fn a_file_gone_from_the_library_says_so() {
+        let status = IntegrityStatus {
+            eligible: 1,
+            checked: 1,
+            damaged: 1,
+            queued: 0,
+        };
+        let html = render_integrity(report(vec![damaged("5")], status), vec![], vec![]);
+        assert!(html.contains("no longer in the library"), "{html}");
+    }
+
+    #[test]
+    fn the_damaged_tab_shows_loading_and_errors() {
+        let html = render_integrity(None, vec![], vec![]);
+        assert!(html.contains("pharos-loading"), "{html}");
+        let html = render_integrity(Some(Err("it broke".into())), vec![], vec![]);
+        assert!(html.contains("it broke"), "{html}");
+    }
+
+    #[test]
+    fn titles_fall_back_from_name_to_file_name() {
+        assert_eq!(damaged_title(&episode()), "Show · S01E02 · Pilot");
+        let no_code = DamagedFile {
+            season_number: None,
+            ..episode()
+        };
+        assert_eq!(damaged_title(&no_code), "Show · Pilot");
+        let movie = DamagedFile {
+            kind: Some("movie".into()),
+            name: Some("Heat".into()),
+            ..damaged("1")
+        };
+        assert_eq!(damaged_title(&movie), "Heat");
+        let bare = DamagedFile {
+            path: Some("/m/dir/Heat (1995).mkv".into()),
+            ..damaged("1")
+        };
+        assert_eq!(damaged_title(&bare), "Heat (1995).mkv");
+        let bare_episode = DamagedFile {
+            kind: Some("episode".into()),
+            ..bare
+        };
+        assert_eq!(damaged_title(&bare_episode), "Heat (1995).mkv");
+        assert_eq!(damaged_title(&damaged("9")), "File 9");
+    }
+
+    #[test]
+    fn times_verdicts_and_counts_read_plainly() {
+        assert_eq!(hms(2_533_000), "0:42:13");
+        assert_eq!(hms(3_725_999), "1:02:05");
+        assert_eq!(hms(0), "0:00:00");
+        assert_eq!(break_label(61_000), "Breaks at 0:01:01");
+        assert_eq!(verdict_words("damaged"), "Damaged");
+        assert_eq!(verdict_words("short"), "Shorter than it claims");
+        assert_eq!(verdict_words("unreadable"), "Can't be read");
+        assert_eq!(verdict_words("surprise"), "Damaged");
+        assert_eq!(kind_label(Some("audio")), "Audio");
+        assert_eq!(kind_label(None), "File");
+        assert_eq!(thousands(0), "0");
+        assert_eq!(thousands(999), "999");
+        assert_eq!(thousands(1_000), "1,000");
+        assert_eq!(thousands(1_234_567), "1,234,567");
+    }
+
+    #[test]
+    fn the_summary_names_damage_and_waiting_files() {
+        let s = IntegrityStatus {
+            eligible: 9_700,
+            checked: 4_120,
+            damaged: 3,
+            queued: 2,
+        };
+        assert_eq!(
+            integrity_summary(&s),
+            "Checked 4,120 of 9,700 files · 3 damaged · 2 waiting to be re-checked. Checking continues in the background."
+        );
+        let done = IntegrityStatus {
+            eligible: 5,
+            checked: 5,
+            damaged: 1,
+            queued: 0,
+        };
+        assert_eq!(
+            integrity_summary(&done),
+            "Checked 5 of 5 files · 1 damaged."
+        );
     }
 
     #[test]

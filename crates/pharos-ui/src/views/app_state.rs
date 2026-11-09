@@ -754,6 +754,13 @@ fn AdminPane(access_token: String, server_base: String, current_user_id: String)
                             }
                         }
                     }
+                    AdminAction::RecheckDamaged { media_id } => {
+                        match recheck_damaged_file(&base, &token, &media_id).await {
+                            Ok(()) => status_signal
+                                .set(Some(format!("Queued {media_id} to be re-checked"))),
+                            Err(e) => status_signal.set(Some(format!("Re-check failed: {e}"))),
+                        }
+                    }
                     AdminAction::SaveBranding(cfg) => {
                         match save_branding(&base, &token, &cfg).await {
                             Ok(()) => status_signal.set(Some("Branding saved".into())),
@@ -1972,6 +1979,18 @@ async fn revoke_api_key(base: &str, token: &str, key_id: &str) -> Result<(), Str
 #[cfg(not(feature = "web"))]
 async fn revoke_api_key(_base: &str, _token: &str, _key_id: &str) -> Result<(), String> {
     Err("revoke_api_key is only wired in the web build".into())
+}
+
+#[cfg(feature = "web")]
+async fn recheck_damaged_file(base: &str, token: &str, media_id: &str) -> Result<(), String> {
+    crate::client::web::recheck_damaged_file(base, token, media_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(not(feature = "web"))]
+async fn recheck_damaged_file(_base: &str, _token: &str, _media_id: &str) -> Result<(), String> {
+    Err("recheck_damaged_file is only wired in the web build".into())
 }
 
 #[cfg(feature = "web")]
