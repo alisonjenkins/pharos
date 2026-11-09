@@ -1,7 +1,10 @@
 # 006-self-tuning-playback — measure the hardware instead of guessing it
 
 **Status**: designed 2026-07-31; **phase 1 shipped and validated in production
-2026-07-31**; phases 2a and 2b implemented, pending deploy.
+2026-07-31**; phases 2a (5ed8021e) and 2b (076d190f, be1d8c74, 3fa916c9) merged
+to main 2026-07-31; no production read of the 2a/2b signals
+(`queue_outcome_total`, `promotion_total`, `queue_distance`) is recorded here
+(audited 2026-11-09).
 **Depends on**: B177/V125 (`background_alongside_client`, `peer_jobs`
 instrumentation), B108/V58 (`background_headroom`, defer-and-rank)
 
