@@ -11,14 +11,15 @@
 
 use pharos_core::{
     collection_wire_id, genre_wire_id, person_wire_id, studio_wire_id, tag_wire_id,
-    CollectionStore, DetectedSegment, ExternalRatings, FoldResume, GenreStore, LibraryKind,
-    LibraryStore, LocalizedText, MediaId, MediaItem, MediaKind, MediaMetadata, MediaProbe,
-    MediaQuery, MediaSegmentKind, MediaSegmentStore, MediaStore, MetadataTranslationStore,
-    PersistedSyncGroup, PersistedTranscodeSession, PersonKind, PersonRef, PersonStore,
-    PlaylistStore, PreferenceStore, RatingsStore, RatingsTarget, SecretString, SeriesInfo,
-    SeriesMetadata, SeriesMetadataStore, StudioStore, SubtitleStyling, SubtitleStylingStore,
-    SyncGroupStore, TagStore, TokenStore, TranscodeSessionStore, TranslationOwner, UserDataStore,
-    UserId, UserItemData, UserPolicy, UserPrefStore, UserRecord, UserStore, SEGMENT_SCHEMA_VERSION,
+    CollectionStore, DetectedSegment, EditTarget, EditableField, ExternalRatings, FoldResume,
+    GenreStore, LibraryKind, LibraryStore, LocalizedText, LockedFields, MediaId, MediaItem,
+    MediaKind, MediaMetadata, MediaProbe, MediaQuery, MediaSegmentKind, MediaSegmentStore,
+    MediaStore, MetadataEdit, MetadataEditStore, MetadataTranslationStore, PersistedSyncGroup,
+    PersistedTranscodeSession, PersonKind, PersonRef, PersonStore, PlaylistStore, PreferenceStore,
+    RatingsStore, RatingsTarget, SecretString, SeriesInfo, SeriesMetadata, SeriesMetadataStore,
+    StudioStore, SubtitleStyling, SubtitleStylingStore, SyncGroupStore, TagStore, TokenStore,
+    TranscodeSessionStore, TranslationOwner, UserDataStore, UserId, UserItemData, UserPolicy,
+    UserPrefStore, UserRecord, UserStore, SEGMENT_SCHEMA_VERSION,
 };
 use pharos_store_sqlx::RuntimeConfig;
 
@@ -43,6 +44,7 @@ fn media_item(id: MediaId, title: &str) -> MediaItem {
         match_confidence: None,
         metadata_refreshed_at: None,
         edition: None,
+        locked: LockedFields::NONE,
     }
 }
 
@@ -3575,6 +3577,180 @@ async fn fresh_postgres_url(shared: &str, arm: &str) -> String {
     format!("{base}/{db}")
 }
 
+async fn series_row<S: SeriesMetadataStore>(store: &S, key: &str) -> SeriesMetadata {
+    store
+        .series_metadata_by_keys(&[key.to_string()])
+        .await
+        .unwrap()
+        .remove(key)
+        .unwrap()
+}
+
+/// ADR-0097 / V1030: an admin edit is written, locked, and kept by the
+/// scan's put and the series enricher's upsert until it is unlocked.
+async fn run_metadata_edit_conformance<S>(store: S)
+where
+    S: MediaStore + SeriesMetadataStore + MetadataEditStore,
+{
+    const ID: MediaId = 8_870_001;
+    let scanned = |overview: &str| {
+        let mut item = media_item(ID, "Scanned Title");
+        item.metadata.overview = Some(overview.into());
+        item.metadata.tagline = Some("Scanned tagline".into());
+        item.metadata.production_year = Some(1998);
+        item
+    };
+    MediaStore::put(&store, scanned("Scanned overview"))
+        .await
+        .unwrap();
+
+    let edit = MetadataEdit {
+        title: Some("Edited Title".into()),
+        overview: Some(Some("Admin overview".into())),
+        tagline: Some(None),
+        community_rating: Some(Some(7.5)),
+        premiere_date: Some(Some(900_000_000)),
+        ..Default::default()
+    };
+    let locked = store
+        .edit_metadata(&EditTarget::Item(ID), &edit)
+        .await
+        .unwrap();
+    assert_eq!(locked, edit.fields());
+    let got = MediaStore::get(&store, ID).await.unwrap();
+    assert_eq!(got.title, "Edited Title");
+    assert_eq!(got.metadata.overview.as_deref(), Some("Admin overview"));
+    assert_eq!(got.metadata.tagline, None, "a cleared field stays cleared");
+    assert_eq!(got.metadata.community_rating, Some(7.5));
+    assert_eq!(got.metadata.premiere_date, Some(900_000_000));
+    assert_eq!(got.locked, edit.fields());
+    assert_eq!(
+        store.stored_sort_name(ID).await.unwrap().as_deref(),
+        Some(pharos_core::sort_name("Edited Title").as_str()),
+        "an unlocked sort title follows a new title"
+    );
+
+    // A rescan writes everything it found except the locked columns.
+    let mut rescan = scanned("Rescanned overview");
+    rescan.metadata.production_year = Some(1999);
+    rescan.metadata.community_rating = Some(3.0);
+    MediaStore::put(&store, rescan.clone()).await.unwrap();
+    let got = MediaStore::get(&store, ID).await.unwrap();
+    assert_eq!(got.title, "Edited Title");
+    assert_eq!(got.metadata.overview.as_deref(), Some("Admin overview"));
+    assert_eq!(got.metadata.tagline, None);
+    assert_eq!(got.metadata.community_rating, Some(7.5));
+    assert_eq!(
+        got.metadata.production_year,
+        Some(1999),
+        "unlocked fields refresh"
+    );
+    assert_eq!(got.locked, edit.fields(), "a put never touches the locks");
+    assert_eq!(
+        store.stored_sort_name(ID).await.unwrap().as_deref(),
+        Some(pharos_core::sort_name("Edited Title").as_str()),
+        "the sort title stays with the locked title, not the rescan's"
+    );
+    MediaStore::put_batch(&store, &[rescan.clone()])
+        .await
+        .unwrap();
+    assert_eq!(
+        MediaStore::get(&store, ID).await.unwrap().title,
+        "Edited Title",
+        "the batch put keeps locks too"
+    );
+
+    // Unlocking keeps the value until the next scan writes its own.
+    let unlock: LockedFields = [EditableField::Overview].into_iter().collect();
+    let locked = store
+        .edit_metadata(
+            &EditTarget::Item(ID),
+            &MetadataEdit {
+                unlock,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(!locked.contains(EditableField::Overview));
+    assert!(locked.contains(EditableField::Title));
+    let got = MediaStore::get(&store, ID).await.unwrap();
+    assert_eq!(got.metadata.overview.as_deref(), Some("Admin overview"));
+    MediaStore::put(&store, rescan).await.unwrap();
+    let got = MediaStore::get(&store, ID).await.unwrap();
+    assert_eq!(got.metadata.overview.as_deref(), Some("Rescanned overview"));
+    assert_eq!(got.title, "Edited Title");
+
+    let sort = MetadataEdit {
+        sort_name: Some(Some("title, edited".into())),
+        ..Default::default()
+    };
+    store
+        .edit_metadata(&EditTarget::Item(ID), &sort)
+        .await
+        .unwrap();
+    MediaStore::put(&store, scanned("x")).await.unwrap();
+    assert_eq!(
+        store.stored_sort_name(ID).await.unwrap().as_deref(),
+        Some("title, edited"),
+        "a locked sort title survives a rescan"
+    );
+
+    let missing = store
+        .edit_metadata(&EditTarget::Item(8_870_999), &edit)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(missing, pharos_core::DomainError::NotFound(_)),
+        "{missing:?}"
+    );
+
+    // A show with no metadata row gets one; the enricher keeps what is locked.
+    let show = EditTarget::Series {
+        key: "conformance-edit-show".into(),
+        name: "Edit Show".into(),
+    };
+    let series_edit = MetadataEdit {
+        overview: Some(Some("Admin show overview".into())),
+        genres: Some(vec!["Drama".into()]),
+        ..Default::default()
+    };
+    let locked = store.edit_metadata(&show, &series_edit).await.unwrap();
+    assert_eq!(locked, series_edit.fields());
+    let key = "conformance-edit-show".to_string();
+    let row = series_row(&store, &key).await;
+    assert_eq!(row.series_name, "Edit Show");
+    assert_eq!(row.overview.as_deref(), Some("Admin show overview"));
+    assert_eq!(row.genres, vec!["Drama".to_string()]);
+    assert_eq!(row.locked, series_edit.fields());
+    store
+        .upsert_series_metadata(SeriesMetadata {
+            series_key: key.clone(),
+            series_name: "Edit Show".into(),
+            match_source: Some("search".into()),
+            overview: Some("Provider overview".into()),
+            genres: vec!["Comedy".into()],
+            community_rating: Some(8.0),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let row = series_row(&store, &key).await;
+    assert_eq!(row.overview.as_deref(), Some("Admin show overview"));
+    assert_eq!(row.genres, vec!["Drama".to_string()]);
+    assert_eq!(
+        row.community_rating,
+        Some(8.0),
+        "unlocked show fields refresh"
+    );
+    assert_eq!(row.match_source.as_deref(), Some("search"));
+    assert_eq!(
+        row.locked,
+        series_edit.fields(),
+        "the upsert never touches the locks"
+    );
+}
+
 #[cfg(feature = "sqlite")]
 #[tokio::test]
 async fn sqlite_read_position_conformance() {
@@ -3582,6 +3758,15 @@ async fn sqlite_read_position_conformance() {
         .await
         .expect("connect in-memory sqlite");
     run_read_position_conformance(s).await;
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn sqlite_metadata_edit_conformance() {
+    let s = pharos_store_sqlx::sqlite::SqliteStore::connect("sqlite::memory:")
+        .await
+        .expect("connect in-memory sqlite");
+    run_metadata_edit_conformance(s).await;
 }
 
 #[cfg(feature = "postgres")]
@@ -3596,6 +3781,20 @@ async fn postgres_read_position_conformance() {
         .await
         .expect("connect postgres");
     run_read_position_conformance(p).await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn postgres_metadata_edit_conformance() {
+    let Ok(url) = std::env::var("PHAROS_TEST_POSTGRES_URL") else {
+        eprintln!("SKIP postgres_metadata_edit_conformance: PHAROS_TEST_POSTGRES_URL unset");
+        return;
+    };
+    let url = fresh_postgres_url(&url, "metadata_edit").await;
+    let p = pharos_store_sqlx::postgres::PostgresStore::connect(&url)
+        .await
+        .expect("connect postgres");
+    run_metadata_edit_conformance(p).await;
 }
 
 #[cfg(feature = "sqlite")]

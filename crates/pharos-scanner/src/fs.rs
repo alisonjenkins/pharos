@@ -1772,6 +1772,7 @@ impl<P: Prober> FsScanner<P> {
         // a book does not have.
         let size_bytes = std::fs::metadata(path).ok().map(|m| m.len());
         Some(MediaItem {
+            locked: Default::default(),
             id: stable_id(path),
             path: path.to_path_buf(),
             title,
@@ -1866,6 +1867,7 @@ impl<P: Prober> FsScanner<P> {
                     None
                 };
                 Some(MediaItem {
+                    locked: Default::default(),
                     id: stable_id(&path),
                     path,
                     title,

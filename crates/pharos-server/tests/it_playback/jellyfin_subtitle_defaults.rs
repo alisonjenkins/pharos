@@ -42,6 +42,7 @@ async fn seed(tracks: Vec<SubtitleTrack>) -> (web::Data<AppState>, String) {
     let token = stores.issue(uid, "t").await.unwrap();
     stores
         .put(MediaItem {
+            locked: Default::default(),
             id: 9,
             path: "/no/such.mkv".into(),
             title: "m".into(),

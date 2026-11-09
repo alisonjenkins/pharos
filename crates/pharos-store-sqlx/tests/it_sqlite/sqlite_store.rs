@@ -1457,6 +1457,7 @@ async fn series_needing_match_enumerates_distinct_shows_from_episodes() {
 async fn series_metadata_upsert_then_by_keys_roundtrips() {
     let s = fresh().await;
     let meta = SeriesMetadata {
+        locked: Default::default(),
         original_language: Some("ja".into()),
         series_key: "/tv/Buffy (1997)".into(),
         series_name: "Buffy the Vampire Slayer".into(),

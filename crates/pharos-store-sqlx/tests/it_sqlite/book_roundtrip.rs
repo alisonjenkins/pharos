@@ -16,6 +16,7 @@ use pharos_core::{
 
 fn book(id: MediaId, title: &str, book: Option<BookMeta>) -> MediaItem {
     MediaItem {
+        locked: Default::default(),
         id,
         path: format!("/media/books/{id}.epub").into(),
         title: title.into(),

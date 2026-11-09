@@ -88,6 +88,7 @@ async fn silent_video_emits_no_audio_stream_in_playback_info() {
         ..Default::default()
     };
     let (state, token) = seed_with_items(vec![MediaItem {
+        locked: Default::default(),
         id: 1,
         path: "/m/silent.webm".into(),
         title: "silent".into(),
@@ -133,6 +134,7 @@ async fn container_alias_is_a_single_known_token() {
         ..Default::default()
     };
     let (state, token) = seed_with_items(vec![MediaItem {
+        locked: Default::default(),
         id: 2,
         path: "/m/x.webm".into(),
         title: "x".into(),
@@ -192,6 +194,7 @@ async fn direct_play_omits_transcoding_sub_protocol() {
         ..Default::default()
     };
     let (state, token) = seed_with_items(vec![MediaItem {
+        locked: Default::default(),
         id: 3,
         path: "/m/x.webm".into(),
         title: "x".into(),
@@ -255,6 +258,7 @@ async fn direct_play_omits_transcoding_sub_protocol() {
 async fn synth_ids_route_via_items_endpoint() {
     let probe = MediaProbe::default();
     let items = vec![MediaItem {
+        locked: Default::default(),
         id: 100,
         path: "/m/TV/Show/Season 1/s01e01.mkv".into(),
         title: "S01E01".into(),
@@ -327,6 +331,7 @@ async fn item_dto_keys_are_pascal_case() {
         ..Default::default()
     };
     let (state, token) = seed_with_items(vec![MediaItem {
+        locked: Default::default(),
         id: 5,
         path: "/m/x.webm".into(),
         title: "x".into(),
@@ -398,6 +403,7 @@ async fn embedded_subtitle_tracks_surface_with_delivery_url() {
         ..Default::default()
     };
     let (state, token) = seed_with_items(vec![MediaItem {
+        locked: Default::default(),
         id: 6,
         path: "/m/x.mkv".into(),
         title: "x".into(),

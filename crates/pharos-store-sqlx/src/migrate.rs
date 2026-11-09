@@ -592,12 +592,14 @@ struct MediaItemRow {
     picture_check_mtime: Option<i64>,
     picture_check_size: Option<i64>,
     sort_name: Option<String>,
+    /// ADR-0097: admin edits cannot be fetched again, so their locks move too.
+    locked_fields: i64,
 }
 
 /// media_items can be ~15k rows in a real deployment; each row is bound
 /// individually inside the one enclosing transaction rather than built as
 /// a giant multi-row VALUES list, which keeps the per-row bind list a
-/// manageable fixed 68-placeholder statement while still batching the
+/// manageable fixed 69-placeholder statement while still batching the
 /// whole copy as a single round of prepared-statement reuse.
 async fn copy_media_items(
     sp: &SqlitePool,
@@ -606,18 +608,19 @@ async fn copy_media_items(
     // `SqliteStore::connect` always runs the migrations, so the source has the
     // column; rows the background backfill has not reached yet are NULL and
     // get their sort name derived from the title below.
-    let select_sql =
-        format!("SELECT {MEDIA_MIGRATE_COLUMNS}, sort_name FROM media_items ORDER BY id");
+    let select_sql = format!(
+        "SELECT {MEDIA_MIGRATE_COLUMNS}, sort_name, locked_fields FROM media_items ORDER BY id"
+    );
     let rows: Vec<MediaItemRow> = sqlx::query_as(sqlx::AssertSqlSafe(select_sql))
         .fetch_all(sp)
         .await
         .map_err(StoreError::Sqlx)?;
     let n = rows.len() as u64;
     let insert_sql = format!(
-        "INSERT INTO media_items ({MEDIA_MIGRATE_COLUMNS}, sort_name) VALUES \
+        "INSERT INTO media_items ({MEDIA_MIGRATE_COLUMNS}, sort_name, locked_fields) VALUES \
          ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,\
          $24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40,$41,$42,$43,$44,\
-         $45,$46,$47,$48,$49,$50,$51,$52,$53,$54,$55,$56,$57,$58,$59,$60,$61,$62,$63,$64,$65,$66,$67,$68)"
+         $45,$46,$47,$48,$49,$50,$51,$52,$53,$54,$55,$56,$57,$58,$59,$60,$61,$62,$63,$64,$65,$66,$67,$68,$69)"
     );
     for row in rows {
         let sort_name = row
@@ -692,6 +695,7 @@ async fn copy_media_items(
             .bind(row.picture_check_mtime)
             .bind(row.picture_check_size)
             .bind(sort_name)
+            .bind(row.locked_fields)
             .execute(&mut **tx)
             .await
             .map_err(StoreError::Sqlx)?;

@@ -106,6 +106,7 @@ async fn seed(fixture: PathBuf, cache_dir: &Path) -> (web::Data<AppState>, Strin
     ];
     stores
         .put(MediaItem {
+            locked: Default::default(),
             id: 42,
             path: fixture,
             title: "clip".into(),

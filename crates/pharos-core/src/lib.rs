@@ -6,6 +6,7 @@ pub mod client_ids;
 pub mod ensemble;
 pub mod fuzzy;
 pub mod language;
+pub mod metadata_edit;
 pub mod origin;
 pub mod parental_rank;
 pub mod secret;
@@ -26,6 +27,9 @@ pub use auth::{
 };
 pub use client_ids::{ClientDeviceId, PlaySessionId};
 pub use ensemble::ensemble_cast;
+pub use metadata_edit::{
+    EditRejected, EditTarget, EditableField, LockedFields, MetadataEdit, MetadataEditStore,
+};
 pub use origin::{LocalPath, Origin, RemoteRef, RemoteRefError, REMOTE_SCHEME};
 pub use secret::{secret_prefix, SecretString};
 pub use video_3d::{Detect3DSource, ParseVideo3DFormatError, Video3DFormat};
@@ -116,6 +120,9 @@ pub struct MediaItem {
     /// this value carries, when a playback request selected one. Never
     /// persisted: a store read always yields the primary, with `None`.
     pub edition: Option<String>,
+    /// The fields an admin edited, which no scan or refresh overwrites
+    /// (ADR-0097). Written only by [`MetadataEditStore::edit_metadata`].
+    pub locked: LockedFields,
 }
 
 impl MediaItem {
@@ -1563,6 +1570,9 @@ pub struct SeriesMetadata {
     pub match_runner_up_id: Option<String>,
     /// That candidate's score in the decision that flagged the match.
     pub match_runner_up_score: Option<f32>,
+    /// The fields an admin edited, which the enricher's upsert keeps
+    /// (ADR-0097). Written only by [`MetadataEditStore::edit_metadata`].
+    pub locked: LockedFields,
 }
 
 /// T9-series — one distinct show that needs (or is due for re-)enrichment,

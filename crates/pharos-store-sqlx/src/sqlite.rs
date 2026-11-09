@@ -32,7 +32,7 @@ const MEDIA_COLUMNS: &str = "id, path, title, kind, size_bytes, duration_ms, con
     bpm_mille, tempo_source, energy_mille, audio_analysis_version, \
     audio_analysis_mtime, audio_analysis_size, file_mtime, file_size_seen, \
     picture_check_version, picture_x, picture_y, picture_w, picture_h, \
-    picture_check_mtime, picture_check_size";
+    picture_check_mtime, picture_check_size, locked_fields";
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations/sqlite");
 
@@ -3536,6 +3536,10 @@ struct MediaRow {
     picture_h: Option<i64>,
     picture_check_mtime: Option<i64>,
     picture_check_size: Option<i64>,
+    /// ADR-0097 admin lock mask. Defaulted so a hand-written column list
+    /// that predates it still decodes.
+    #[sqlx(default)]
+    locked_fields: i64,
 }
 
 impl SeriesMetadataStore for SqliteStore {
@@ -3618,11 +3622,16 @@ impl SeriesMetadataStore for SqliteStore {
                  match_source = excluded.match_source, \
                  match_confidence = excluded.match_confidence, \
                  metadata_refreshed_at = excluded.metadata_refreshed_at, \
-                 overview = excluded.overview, \
-                 community_rating = excluded.community_rating, \
-                 premiere_date = excluded.premiere_date, \
-                 official_rating = excluded.official_rating, \
-                 genres = excluded.genres, \
+                 overview = CASE WHEN (series_metadata.locked_fields & 4) <> 0 \
+                     THEN series_metadata.overview ELSE excluded.overview END, \
+                 community_rating = CASE WHEN (series_metadata.locked_fields & 128) <> 0 \
+                     THEN series_metadata.community_rating ELSE excluded.community_rating END, \
+                 premiere_date = CASE WHEN (series_metadata.locked_fields & 32) <> 0 \
+                     THEN series_metadata.premiere_date ELSE excluded.premiere_date END, \
+                 official_rating = CASE WHEN (series_metadata.locked_fields & 64) <> 0 \
+                     THEN series_metadata.official_rating ELSE excluded.official_rating END, \
+                 genres = CASE WHEN (series_metadata.locked_fields & 512) <> 0 \
+                     THEN series_metadata.genres ELSE excluded.genres END, \
                  studios = excluded.studios, \
                  provider_ids = excluded.provider_ids, \
                  poster_locator = excluded.poster_locator, \
@@ -4356,6 +4365,7 @@ impl MediaRow {
             match_confidence: self.match_confidence,
             metadata_refreshed_at: self.metadata_refreshed_at,
             edition: None,
+            locked: pharos_core::LockedFields::from_bits(self.locked_fields),
         })
     }
 }

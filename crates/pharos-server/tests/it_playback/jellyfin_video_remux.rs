@@ -154,6 +154,7 @@ async fn playback_info_for_remux_emits_transcoding_url_and_target_container() {
     let token = stores.issue(uid, "t").await.unwrap();
     stores
         .put(MediaItem {
+            locked: Default::default(),
             id: 11,
             path: "/nonexistent.mkv".into(),
             title: "MKV Movie".into(),
@@ -254,6 +255,7 @@ async fn playback_info_video_transcode_emits_url_for_non_ts_container_profile() 
     let token = stores.issue(uid, "t").await.unwrap();
     stores
         .put(MediaItem {
+            locked: Default::default(),
             id: 12,
             path: "/legacy.avi".into(),
             title: "AVI Movie".into(),

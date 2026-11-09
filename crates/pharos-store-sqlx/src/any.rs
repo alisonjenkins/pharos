@@ -662,6 +662,29 @@ impl pharos_core::MetadataTranslationStore for AnyStore {
 }
 
 // ---------------------------------------------------------------------
+// MetadataEditStore
+// ---------------------------------------------------------------------
+impl pharos_core::MetadataEditStore for AnyStore {
+    async fn edit_metadata(
+        &self,
+        target: &pharos_core::EditTarget,
+        edit: &pharos_core::MetadataEdit,
+    ) -> DomainResult<pharos_core::LockedFields> {
+        match self {
+            AnyStore::Sqlite(s) => s.edit_metadata(target, edit).await,
+            AnyStore::Postgres(p) => p.edit_metadata(target, edit).await,
+        }
+    }
+
+    async fn stored_sort_name(&self, id: pharos_core::MediaId) -> DomainResult<Option<String>> {
+        match self {
+            AnyStore::Sqlite(s) => s.stored_sort_name(id).await,
+            AnyStore::Postgres(p) => p.stored_sort_name(id).await,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
 // RatingsStore
 // ---------------------------------------------------------------------
 impl pharos_core::RatingsStore for AnyStore {
