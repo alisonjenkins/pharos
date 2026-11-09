@@ -8,7 +8,16 @@ use pharos_transcode::picture_area::PictureVerdict;
 use std::process::Command;
 
 fn make_source(dir: &std::path::Path, filter: &str) -> std::path::PathBuf {
-    let out = dir.join("src.mkv");
+    make_source_with(dir, filter, "src.mkv", &[])
+}
+
+fn make_source_with(
+    dir: &std::path::Path,
+    filter: &str,
+    name: &str,
+    extra: &[&str],
+) -> std::path::PathBuf {
+    let out = dir.join(name);
     let st = Command::new("ffmpeg")
         .args(["-v", "error"])
         .args([
@@ -19,6 +28,7 @@ fn make_source(dir: &std::path::Path, filter: &str) -> std::path::PathBuf {
         ])
         .args(["-vf", filter])
         .args(["-c:v", "libx264", "-preset", "ultrafast", "-g", "10", "-y"])
+        .args(extra)
         .arg(&out)
         .status()
         .expect("spawn ffmpeg (run inside the devShell)");
@@ -50,6 +60,29 @@ fn a_pillarboxed_file_reports_its_picture_area() {
         }
         other => panic!("expected bars, got {other:?} ({a:?})"),
     }
+}
+
+/// A transport stream's clock rarely starts at zero (a broadcast recording
+/// can start hours in). The sample points are a share of the runtime from
+/// the file's own start: measured from zero, every one falls before the
+/// first frame and the check reads the opening (here black) frame seven
+/// times instead of the programme.
+#[test]
+fn the_sample_points_count_from_the_files_own_start() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = make_source_with(
+        dir.path(),
+        "scale=480:360,pad=640:360:80:0:black,drawbox=c=black:t=fill:enable='lt(t,9)'",
+        "src.ts",
+        &["-output_ts_offset", "100"],
+    );
+
+    let a = pharos_transcode::libav::picture_area::picture_area(&src, 30_000).expect("check");
+
+    assert!(
+        matches!(a.verdict, PictureVerdict::Bars(_)),
+        "sampled the programme, not its opening: {a:?}"
+    );
 }
 
 #[test]
