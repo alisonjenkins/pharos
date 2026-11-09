@@ -176,10 +176,10 @@ fn gpu_route_matches_the_cpu_chain_on_a_real_gpu() {
     );
     assert_eq!(gf, cf, "the routes must produce the same frame count");
     assert_eq!(gf, 4 * 24, "every source frame comes out");
-    // The routes differ on purpose: libplacebo (BT.2390, 203 nit reference
-    // white) lands ~40 levels brighter than the zscale chain (hable, 100 nit);
-    // measured and recorded in ADR-0072. This bound only catches an output that
-    // is not tonemapped at all or is black.
+    // The routes differ by design: libplacebo (BT.2390, 203 nit reference
+    // white) against the zscale chain (mobius, 203 nit, ADR-0091). This bound
+    // is loose; it only catches an output that is not tonemapped at all or is
+    // black.
     assert!(
         (40.0..220.0).contains(&gmean) && gmax > 100,
         "implausible GPU luma: mean {gmean:.1} max {gmax}"

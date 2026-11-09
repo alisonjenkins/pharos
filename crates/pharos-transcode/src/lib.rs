@@ -2789,8 +2789,8 @@ mod tests {
         assert!(!joined.contains("-pix_fmt"), "{joined}");
     }
 
-    const TONEMAP_CORE: &str = "zscale=t=linear:npl=100:p=bt709:dither=none,format=gbrpf32le,\
-         tonemap=tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv:dither=none";
+    const TONEMAP_CORE: &str = "zscale=t=linear:npl=203:p=bt709:dither=none,format=gbrpf32le,\
+         tonemap=tonemap=mobius:param=0.35:desat=0,zscale=t=bt709:m=bt709:r=tv:dither=none";
 
     fn vf_of(device: crate::protocol::DeviceId, o: &TranscodeOptions) -> Option<String> {
         let a = build_args_for_device(
@@ -2814,6 +2814,15 @@ mod tests {
     fn tonemap_software_ends_in_yuv420p_before_the_encoder() {
         let vf = vf_of(crate::protocol::DeviceId::Cpu, &hdr_opts()).expect("-vf");
         assert_eq!(vf, format!("{TONEMAP_CORE},format=yuv420p"));
+    }
+
+    #[test]
+    fn tonemap_cpu_chain_uses_the_bt2408_reference_white_of_the_gpu_route() {
+        let vf = vf_of(crate::protocol::DeviceId::Cpu, &hdr_opts()).expect("-vf");
+        assert_eq!(crate::options::CPU_TONEMAP_REFERENCE_WHITE_NITS, 203);
+        assert!(vf.contains("zscale=t=linear:npl=203:"), "{vf}");
+        assert!(!vf.contains("npl=100"), "{vf}");
+        assert!(vf.contains("tonemap=tonemap=mobius:param=0.35:"), "{vf}");
     }
 
     #[test]
