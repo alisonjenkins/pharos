@@ -3106,6 +3106,231 @@ where
     .unwrap()
     .is_empty());
 
+    const SHOW_A: &str = "/tv/Show A";
+    const SHOW_A_EP: &str = "/tv/Show A/S01E01.mkv";
+    const SHOW_B: &str = "/tv/Show B";
+    assert!(store
+        .insert_series_override(SeriesOverride {
+            id: 0,
+            series_folder: SHOW_A.into(),
+            path: None,
+            target_key: SHOW_A.into(),
+            target_name: Some("Show A".into()),
+            target_year: Some(2005),
+            source: OverrideSource::Scanner,
+            created_by: None,
+            created_at: 1_700_000_010,
+        })
+        .await
+        .unwrap());
+    let first_folder_admin = store
+        .replace_admin_override(SeriesOverride {
+            id: 0,
+            series_folder: SHOW_A.into(),
+            path: None,
+            target_key: format!("{SHOW_A}\u{1f}2005"),
+            target_name: Some("Show A (2005)".into()),
+            target_year: Some(2005),
+            source: OverrideSource::Scanner,
+            created_by: Some("alice".into()),
+            created_at: 1_700_000_020,
+        })
+        .await
+        .unwrap();
+    let second_folder_admin = store
+        .replace_admin_override(SeriesOverride {
+            id: 999,
+            series_folder: SHOW_A.into(),
+            path: None,
+            target_key: format!("{SHOW_A}\u{1f}2020"),
+            target_name: Some("Show A (2020)".into()),
+            target_year: Some(2020),
+            source: OverrideSource::Scanner,
+            created_by: Some("bob".into()),
+            created_at: 1_700_000_030,
+        })
+        .await
+        .unwrap();
+    assert_ne!(first_folder_admin, second_folder_admin);
+
+    let all_overrides = store.all_series_overrides().await.unwrap();
+    let show_a_folder_admin: Vec<&SeriesOverride> = all_overrides
+        .iter()
+        .filter(|o| {
+            o.series_folder == SHOW_A && o.path.is_none() && o.source == OverrideSource::Admin
+        })
+        .collect();
+    assert_eq!(show_a_folder_admin.len(), 1);
+    assert_eq!(show_a_folder_admin[0].id, second_folder_admin);
+    assert_eq!(
+        show_a_folder_admin[0].target_key,
+        format!("{SHOW_A}\u{1f}2020")
+    );
+    assert!(all_overrides.iter().any(|o| {
+        o.series_folder == SHOW_A && o.path.is_none() && o.source == OverrideSource::Scanner
+    }));
+
+    store
+        .replace_admin_override(SeriesOverride {
+            id: 0,
+            series_folder: SHOW_A.into(),
+            path: Some(SHOW_A_EP.into()),
+            target_key: format!("{SHOW_A}\u{1f}2005"),
+            target_name: None,
+            target_year: Some(2005),
+            source: OverrideSource::Admin,
+            created_by: Some("alice".into()),
+            created_at: 1_700_000_040,
+        })
+        .await
+        .unwrap();
+    let path_admin_id = store
+        .replace_admin_override(SeriesOverride {
+            id: 0,
+            series_folder: SHOW_A.into(),
+            path: Some(SHOW_A_EP.into()),
+            target_key: format!("{SHOW_A}\u{1f}2020"),
+            target_name: None,
+            target_year: Some(2020),
+            source: OverrideSource::Admin,
+            created_by: Some("bob".into()),
+            created_at: 1_700_000_050,
+        })
+        .await
+        .unwrap();
+
+    let all_overrides = store.all_series_overrides().await.unwrap();
+    let show_a_path_admin: Vec<&SeriesOverride> = all_overrides
+        .iter()
+        .filter(|o| {
+            o.series_folder == SHOW_A
+                && o.path.as_deref() == Some(SHOW_A_EP)
+                && o.source == OverrideSource::Admin
+        })
+        .collect();
+    assert_eq!(show_a_path_admin.len(), 1);
+    assert_eq!(show_a_path_admin[0].id, path_admin_id);
+    assert_eq!(
+        show_a_path_admin[0].target_key,
+        format!("{SHOW_A}\u{1f}2020")
+    );
+    assert!(all_overrides
+        .windows(2)
+        .all(|w| (w[0].created_at, w[0].id) >= (w[1].created_at, w[1].id)));
+    let show_a_times: Vec<i64> = all_overrides
+        .iter()
+        .filter(|o| o.series_folder == SHOW_A)
+        .map(|o| o.created_at)
+        .collect();
+    assert_eq!(
+        show_a_times,
+        vec![1_700_000_050, 1_700_000_030, 1_700_000_010]
+    );
+
+    let deleted = store
+        .delete_series_override(path_admin_id)
+        .await
+        .unwrap()
+        .expect("path override exists");
+    assert_eq!(deleted.id, path_admin_id);
+    assert_eq!(deleted.path.as_deref(), Some(SHOW_A_EP));
+    assert_eq!(
+        store.delete_series_override(path_admin_id).await.unwrap(),
+        None
+    );
+    assert!(store
+        .all_series_overrides()
+        .await
+        .unwrap()
+        .iter()
+        .all(|o| o.id != path_admin_id));
+
+    SeriesMetadataStore::upsert_series_metadata(
+        &store,
+        pharos_core::SeriesMetadata {
+            series_key: SHOW_A.into(),
+            series_name: "Show A".into(),
+            match_source: Some("search".into()),
+            match_flag: Some("ambiguous".into()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    SeriesMetadataStore::upsert_series_metadata(
+        &store,
+        pharos_core::SeriesMetadata {
+            series_key: SHOW_B.into(),
+            series_name: "Show B".into(),
+            match_source: Some("search".into()),
+            match_flag: None,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        store.flagged_series_keys().await.unwrap(),
+        vec![SHOW_A.to_string()]
+    );
+    SeriesMetadataStore::upsert_series_metadata(
+        &store,
+        pharos_core::SeriesMetadata {
+            series_key: SHOW_A.into(),
+            series_name: "Show A".into(),
+            match_source: Some("search".into()),
+            match_flag: None,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let manual_ep = ep(9_300_003, "The Flash - S01E02.mkv", Some(2014));
+    let search_ep = ep(9_300_004, "The Flash - S01E03.mkv", Some(2014));
+    MediaStore::put(&store, manual_ep.clone()).await.unwrap();
+    MediaStore::put(&store, search_ep.clone()).await.unwrap();
+    MediaStore::set_item_match(
+        &store,
+        manual_ep.id,
+        "tvdb",
+        "123",
+        "manual",
+        Some(1.0),
+        600,
+    )
+    .await
+    .unwrap();
+    MediaStore::set_item_match(
+        &store,
+        search_ep.id,
+        "tvdb",
+        "456",
+        "search",
+        Some(0.9),
+        600,
+    )
+    .await
+    .unwrap();
+    assert!(store.clear_manual_matches(&[]).await.unwrap().is_empty());
+    assert_eq!(
+        store
+            .clear_manual_matches(&[search_ep.id, manual_ep.id])
+            .await
+            .unwrap(),
+        vec![(manual_ep.id, "123".to_string())]
+    );
+    let got_manual = MediaStore::get(&store, manual_ep.id).await.unwrap();
+    assert_eq!(got_manual.match_source, None);
+    assert_eq!(got_manual.match_provider, None);
+    assert_eq!(got_manual.match_external_id, None);
+    assert_eq!(got_manual.match_confidence, None);
+    let got_search = MediaStore::get(&store, search_ep.id).await.unwrap();
+    assert_eq!(got_search.match_source.as_deref(), Some("search"));
+    assert_eq!(got_search.match_provider.as_deref(), Some("tvdb"));
+    assert_eq!(got_search.match_external_id.as_deref(), Some("456"));
+    assert_eq!(got_search.match_confidence, Some(0.9));
+
     let sweep = MediaStore::begin_scan(&store, std::path::Path::new(ROOT))
         .await
         .unwrap();

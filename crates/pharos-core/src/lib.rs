@@ -1744,6 +1744,46 @@ pub trait SeriesIdentityStore: Send + Sync {
         async { Ok(false) }
     }
 
+    /// Every override, newest first (spec 033 §7).
+    fn all_series_overrides(
+        &self,
+    ) -> impl std::future::Future<Output = DomainResult<Vec<SeriesOverride>>> + Send {
+        async { Ok(Vec::new()) }
+    }
+
+    /// Write `o` as the `admin` row for its folder (folder-wide) or path,
+    /// replacing any admin row there; `scanner` rows are kept. Returns its id.
+    fn replace_admin_override(
+        &self,
+        _o: SeriesOverride,
+    ) -> impl std::future::Future<Output = DomainResult<i64>> + Send {
+        async { Ok(0) }
+    }
+
+    /// Delete override `id`, returning it as it was; `None` when absent.
+    fn delete_series_override(
+        &self,
+        _id: i64,
+    ) -> impl std::future::Future<Output = DomainResult<Option<SeriesOverride>>> + Send {
+        async { Ok(None) }
+    }
+
+    /// Every show whose stored match is flagged ambiguous (V891), by key.
+    fn flagged_series_keys(
+        &self,
+    ) -> impl std::future::Future<Output = DomainResult<Vec<String>>> + Send {
+        async { Ok(Vec::new()) }
+    }
+
+    /// Clear the own manual match of each of `ids` that has one, returning
+    /// `(id, its external id)` for each row cleared, by id.
+    fn clear_manual_matches(
+        &self,
+        _ids: &[MediaId],
+    ) -> impl std::future::Future<Output = DomainResult<Vec<(MediaId, String)>>> + Send {
+        async { Ok(Vec::new()) }
+    }
+
     /// The stored identity of every episode under `root_prefix`.
     fn series_identity_rows(
         &self,
