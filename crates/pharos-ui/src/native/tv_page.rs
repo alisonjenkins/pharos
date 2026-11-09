@@ -495,6 +495,30 @@ pub fn script_takes(key: &str) -> bool {
     )
 }
 
+/// The browse grid whose children are the tiles, as `web` finds them.
+const GRID: &str = ".pharos-browse .pharos-grid";
+
+/// Script: scroll the browse tile at `at` to the top of the page and focus
+/// its link, so the remote's next press starts from the section jumped to
+/// (B1028). Answers whether the tile was in the page.
+pub fn scroll_to_tile_js(at: u32) -> String {
+    format!(
+        r#"
+const grid = document.querySelector({grid});
+const tile = grid ? grid.children[{at}] : null;
+if (!tile) return false;
+tile.scrollIntoView(true);
+const link = tile.querySelector("a[href], button, [tabindex]") || tile;
+if (link.focus) link.focus({{ preventScroll: true }});
+return true;
+"#,
+        grid = serde_json::Value::String(GRID.to_owned()),
+    )
+}
+
+/// Script: scroll the page back to its top.
+pub const SCROLL_TO_TOP_JS: &str = "window.scrollTo(0, 0);";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -638,6 +662,22 @@ mod tests {
                 code: 4,
                 message: "MEDIA_ELEMENT_ERROR: Format error".into(),
             })
+        );
+    }
+
+    #[test]
+    fn a_jump_scrolls_the_grid_tile_and_focuses_it() {
+        let js = scroll_to_tile_js(42);
+        assert!(
+            js.contains(r#"document.querySelector(".pharos-browse .pharos-grid")"#),
+            "{js}"
+        );
+        assert!(js.contains("grid.children[42]"), "{js}");
+        assert!(js.contains("scrollIntoView(true)"), "{js}");
+        assert!(js.contains("focus({ preventScroll: true })"), "{js}");
+        assert!(
+            js.contains("return false") && js.contains("return true"),
+            "{js}"
         );
     }
 
