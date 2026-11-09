@@ -5501,6 +5501,8 @@ dependencies = [
  "pharos-client",
  "pharos-hls",
  "pharos-subs",
+ "quire",
+ "quire-web",
  "reqwest",
  "rustls",
  "serde",
