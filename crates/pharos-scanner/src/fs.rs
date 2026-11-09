@@ -3781,6 +3781,27 @@ fn is_release_sample(relative: &Path) -> bool {
             .is_some_and(|stem| SAMPLE_STEM_RE.as_ref().is_some_and(|re| re.is_match(stem)))
 }
 
+/// A release group's advert clip packed beside its films (`ETRG.mp4`):
+/// a video named only for the group.
+fn is_release_promo(path: &Path) -> bool {
+    let video = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| FILM_EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()));
+    video
+        && path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .is_some_and(|stem| {
+                RELEASE_PROMO_STEMS
+                    .iter()
+                    .any(|g| stem.eq_ignore_ascii_case(g))
+            })
+}
+
+/// Release groups known to pack an advert clip named after themselves.
+const RELEASE_PROMO_STEMS: &[&str] = &["ETRG", "RARBG", "YIFY", "YTS", "YTS.AG", "YTS.MX"];
+
 /// A file stem that ends in the word `sample`, bare or bracketed.
 static SAMPLE_STEM_RE: std::sync::LazyLock<Option<regex::Regex>> =
     std::sync::LazyLock::new(|| regex::Regex::new(r"(?i)(?:^|[ ._\-(\[])sample[)\]]?$").ok());
@@ -3824,6 +3845,12 @@ async fn walk(root: PathBuf, exts: HashSet<String>) -> DomainResult<WalkOutcome>
                 continue;
             }
             if is_sidecar_noise(e.path()) {
+                continue;
+            }
+            if is_release_promo(e.path()) {
+                tracing::debug!(path = %e.path().display(), "walk: skipping a release group's promo clip");
+                metrics::counter!("pharos_scan_skipped_files_total", "reason" => "promo")
+                    .increment(1);
                 continue;
             }
             if is_release_sample(e.path().strip_prefix(&root).unwrap_or(e.path())) {
@@ -7841,6 +7868,19 @@ mod tests {
             key("/m/x/Captain.America.The.Winter.Soldier.2014.720p.BluRay.x264.DTS-WiKi.mkv"),
             key("/m/y/Captain America - The Winter Soldier (2014) Bluray-1080p.mkv"),
         );
+    }
+
+    /// V961: a release group's promo clip is never indexed.
+    #[test]
+    fn a_release_promo_is_not_walked() {
+        assert!(is_release_promo(Path::new(
+            "/m/Final Destination 3 (2006)/ETRG.mp4"
+        )));
+        assert!(is_release_promo(Path::new("/m/X/RARBG.mkv")));
+        assert!(!is_release_promo(Path::new("/m/X/RARBG.txt")));
+        assert!(!is_release_promo(Path::new(
+            "/m/Yify (2020)/Yify Story (2020).mkv"
+        )));
     }
 
     /// V961: a release's sample clip is never indexed (B1002).
