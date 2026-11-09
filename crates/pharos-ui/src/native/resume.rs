@@ -28,23 +28,22 @@ pub fn rests(paused_at_ms: f64, now_ms: f64) -> bool {
 /// Whether a media element playing `src` on a page at `origin` can be routed
 /// through Web Audio (V682): a cross-origin source without CORS would play
 /// silence once routed, and WebKit's native HLS feeds a
-/// `MediaElementAudioSourceNode` silence, so both are left unrouted. The
-/// error names the refused source.
-pub fn routable(src: &str, origin: &str) -> Result<(), String> {
+/// `MediaElementAudioSourceNode` silence, so both are left unrouted. A
+/// source fetched with CORS (`cors`: the TV app's songs, B1032) is readable
+/// from another origin. The error names the refused source's path only: the
+/// query can carry a media token.
+pub fn routable(src: &str, origin: &str, cors: bool) -> Result<(), String> {
     let same_origin = src.starts_with("blob:")
         || (!origin.is_empty()
             && src
                 .strip_prefix(origin)
                 .is_some_and(|rest| rest.is_empty() || rest.starts_with('/')));
-    if !same_origin {
-        return Err(format!("cross-origin source {src}"));
+    let path = src.split('?').next().unwrap_or_default();
+    if !same_origin && !cors {
+        return Err(format!("cross-origin source {path}"));
     }
-    if src
-        .split('?')
-        .next()
-        .is_some_and(|path| path.ends_with(".m3u8"))
-    {
-        return Err(format!("native HLS source {src}"));
+    if path.ends_with(".m3u8") {
+        return Err(format!("native HLS source {path}"));
     }
     Ok(())
 }
@@ -653,20 +652,38 @@ mod tests {
     fn only_same_origin_and_mse_sources_are_routed() {
         let origin = "https://pharos.example";
         assert_eq!(
-            routable("https://pharos.example/audio/1/universal?x=1", origin),
+            routable("https://pharos.example/audio/1/universal?x=1", origin, false),
             Ok(())
         );
-        assert_eq!(routable("https://pharos.example", origin), Ok(()));
-        assert_eq!(routable("blob:https://pharos.example/0b1c", origin), Ok(()));
-        let refused = |src: &str| routable(src, origin).expect_err(src);
+        assert_eq!(routable("https://pharos.example", origin, false), Ok(()));
+        assert_eq!(
+            routable("blob:https://pharos.example/0b1c", origin, false),
+            Ok(())
+        );
+        let refused = |src: &str| routable(src, origin, false).expect_err(src);
         assert!(refused("https://cdn.example/a.mp3").contains("cross-origin source"));
         // A host that only starts with the origin is another origin.
         assert!(refused("https://pharos.example.evil/a.mp3").contains("cross-origin"));
         assert!(refused("https://pharos.example/v/main.m3u8?t=1").contains("native HLS"));
         assert!(
-            routable("https://pharos.example/a.mp3", "").is_err(),
+            routable("https://pharos.example/a.mp3", "", false).is_err(),
             "no origin, no route"
         );
+    }
+
+    #[test]
+    fn a_cors_source_is_routed_and_a_refusal_keeps_its_query_out() {
+        let origin = "https://pharos.example";
+        assert_eq!(
+            routable("https://media.example/audio/1/stream?api_key=t0k", origin, true),
+            Ok(())
+        );
+        let refused = routable("https://media.example/a.mp3?api_key=t0k", origin, false)
+            .expect_err("no CORS");
+        assert!(!refused.contains("t0k"), "{refused}");
+        let hls = routable("https://media.example/v/main.m3u8?api_key=t0k", origin, true)
+            .expect_err("native HLS");
+        assert!(hls.contains("native HLS") && !hls.contains("t0k"), "{hls}");
     }
 
     #[test]
