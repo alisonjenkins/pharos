@@ -260,14 +260,41 @@ pub enum KeyAction {
     Escape,
 }
 
-/// The reader's meaning of `key`; Ctrl and Cmd presses are the browser's.
-pub fn key_action(key: &str, ctrl: bool, meta: bool) -> Option<KeyAction> {
-    if ctrl || meta {
+/// What a key press came from, as far as the reader cares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyTarget {
+    /// The page, or nothing in particular.
+    Page,
+    /// A button or link, which takes Space (and Enter) to activate itself.
+    Control,
+    /// A text field or select, which takes every key for itself.
+    Field,
+}
+
+/// A key press and its modifiers.
+#[derive(Debug, Clone, Copy)]
+pub struct KeyPress<'a> {
+    pub key: &'a str,
+    pub ctrl: bool,
+    pub meta: bool,
+    pub alt: bool,
+    pub shift: bool,
+    pub target: KeyTarget,
+}
+
+/// The reader's meaning of a press. Ctrl, Cmd and Alt presses are the
+/// browser's (Alt+Arrow is back and forward), and a control keeps the keys
+/// that activate it so the toolbar works from the keyboard.
+pub fn key_action(press: KeyPress<'_>) -> Option<KeyAction> {
+    if press.ctrl || press.meta || press.alt || press.target == KeyTarget::Field {
         return None;
     }
-    match key {
-        "ArrowRight" | "PageDown" | " " => Some(KeyAction::Next),
+    match press.key {
+        "ArrowRight" | "PageDown" => Some(KeyAction::Next),
         "ArrowLeft" | "PageUp" => Some(KeyAction::Prev),
+        " " if press.target == KeyTarget::Control => None,
+        " " if press.shift => Some(KeyAction::Prev),
+        " " => Some(KeyAction::Next),
         "Escape" => Some(KeyAction::Escape),
         _ => None,
     }
@@ -492,18 +519,70 @@ mod tests {
         );
     }
 
+    fn press(key: &str) -> KeyPress<'_> {
+        KeyPress {
+            key,
+            ctrl: false,
+            meta: false,
+            alt: false,
+            shift: false,
+            target: KeyTarget::Page,
+        }
+    }
+
     #[test]
     fn keys_turn_pages() {
         for k in ["ArrowRight", "PageDown", " "] {
-            assert_eq!(key_action(k, false, false), Some(KeyAction::Next), "{k}");
+            assert_eq!(key_action(press(k)), Some(KeyAction::Next), "{k}");
         }
         for k in ["ArrowLeft", "PageUp"] {
-            assert_eq!(key_action(k, false, false), Some(KeyAction::Prev), "{k}");
+            assert_eq!(key_action(press(k)), Some(KeyAction::Prev), "{k}");
         }
-        assert_eq!(key_action("Escape", false, false), Some(KeyAction::Escape));
-        assert_eq!(key_action("ArrowRight", true, false), None);
-        assert_eq!(key_action("ArrowRight", false, true), None);
-        assert_eq!(key_action("a", false, false), None);
+        assert_eq!(key_action(press("Escape")), Some(KeyAction::Escape));
+        assert_eq!(key_action(press("a")), None);
+        assert_eq!(key_action(press("Enter")), None);
+    }
+
+    #[test]
+    fn shift_space_turns_back() {
+        let back = KeyPress {
+            shift: true,
+            ..press(" ")
+        };
+        assert_eq!(key_action(back), Some(KeyAction::Prev));
+    }
+
+    #[test]
+    fn the_browsers_own_chords_are_left_alone() {
+        for (ctrl, meta, alt) in [
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+        ] {
+            let chord = KeyPress {
+                ctrl,
+                meta,
+                alt,
+                ..press("ArrowRight")
+            };
+            assert_eq!(key_action(chord), None, "{ctrl} {meta} {alt}");
+        }
+    }
+
+    #[test]
+    fn a_focused_control_keeps_space_and_a_field_keeps_everything() {
+        let on = |key, target| KeyPress {
+            target,
+            ..press(key)
+        };
+        assert_eq!(key_action(on(" ", KeyTarget::Control)), None);
+        assert_eq!(
+            key_action(on("ArrowRight", KeyTarget::Control)),
+            Some(KeyAction::Next)
+        );
+        for k in [" ", "ArrowRight", "Escape"] {
+            assert_eq!(key_action(on(k, KeyTarget::Field)), None, "{k}");
+        }
     }
 
     #[test]

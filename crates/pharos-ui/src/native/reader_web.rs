@@ -15,14 +15,17 @@ use gloo_net::http::Request;
 use pharos_client::api::{BookFormat, ItemRef, NativeApi, PharosApi as _};
 use quire::{Locator, Publication, Target};
 use quire_web::{Action, Font, Settings, Start, Theme, View};
+use wasm_bindgen::closure::Closure;
+use wasm_bindgen::JsCast as _;
 
 use super::app::{call, this_device, Ctx};
 use super::keymap::Mode;
 use super::platform;
 use super::reader::{
     check_size, download_href, flatten_toc, key_action, margin_label, percent_label, save_key,
-    saved_fraction, saved_locator, size_cap, too_big_message, KeyAction, PageTheme, ReaderSettings,
-    SaveGate, SizeVerdict, TocRow, Typeface, LINE_HEIGHTS, MARGINS, SETTINGS_KEY,
+    saved_fraction, saved_locator, size_cap, too_big_message, KeyAction, KeyPress, KeyTarget,
+    PageTheme, ReaderSettings, SaveGate, SizeVerdict, TocRow, Typeface, LINE_HEIGHTS, MARGINS,
+    SETTINGS_KEY,
 };
 use super::route::Route;
 use super::views::{display_name, Nav};
@@ -275,6 +278,61 @@ async fn open_book(
     Ok(Opened { core, toc })
 }
 
+/// A page-wide `keydown` listener that reports the press and what it came
+/// from; a taken press is not the browser's too. Removed on drop.
+struct KeyWatch(Closure<dyn FnMut(web_sys::KeyboardEvent)>);
+
+impl KeyWatch {
+    fn new(mut on_press: impl FnMut(KeyPress<'_>) -> bool + 'static) -> Self {
+        let listener =
+            Closure::<dyn FnMut(web_sys::KeyboardEvent)>::new(move |e: web_sys::KeyboardEvent| {
+                let target = e
+                    .target()
+                    .and_then(|t| t.dyn_into::<web_sys::Element>().ok())
+                    .map_or(KeyTarget::Page, |el| {
+                        if el
+                            .closest("input, select, textarea")
+                            .ok()
+                            .flatten()
+                            .is_some()
+                        {
+                            KeyTarget::Field
+                        } else if el.closest("button, a").ok().flatten().is_some() {
+                            KeyTarget::Control
+                        } else {
+                            KeyTarget::Page
+                        }
+                    });
+                let key = e.key();
+                let press = KeyPress {
+                    key: &key,
+                    ctrl: e.ctrl_key(),
+                    meta: e.meta_key(),
+                    alt: e.alt_key(),
+                    shift: e.shift_key(),
+                    target,
+                };
+                if on_press(press) {
+                    e.prevent_default();
+                }
+            });
+        if let Some(window) = web_sys::window() {
+            let _ = window
+                .add_event_listener_with_callback("keydown", listener.as_ref().unchecked_ref());
+        }
+        Self(listener)
+    }
+}
+
+impl Drop for KeyWatch {
+    fn drop(&mut self) {
+        if let Some(window) = web_sys::window() {
+            let _ = window
+                .remove_event_listener_with_callback("keydown", self.0.as_ref().unchecked_ref());
+        }
+    }
+}
+
 fn leave(nav: Nav, id: ItemRef) {
     if !platform::go_back() {
         nav.0.call(Route::Title(id));
@@ -412,11 +470,11 @@ pub fn ReaderScreen(id: ItemRef) -> Element {
         move || {
             let key_alive = alive.clone();
             let key_core = core.clone();
-            let keys = platform::on_key(move |key, ctrl, meta| {
+            let keys = KeyWatch::new(move |press| {
                 if !key_alive.get() || platform::dialog_open() {
                     return false;
                 }
-                let Some(action) = key_action(key, ctrl, meta) else {
+                let Some(action) = key_action(press) else {
                     return false;
                 };
                 if action == KeyAction::Escape {
