@@ -15,6 +15,7 @@ pub mod admission;
 pub mod audio_features;
 pub mod backend;
 pub mod capability;
+pub mod deep_check;
 pub mod device;
 pub mod fingerprint;
 pub mod hwaccel;
