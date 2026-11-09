@@ -2,7 +2,7 @@
 
 **Feature Branch**: `feat/ui-subtitle-renderer`
 **Created**: 2026-11-05T21:30:00Z
-**Status**: Ready
+**Status**: Slices 0 and 1 built on main (#843, #849, #883, #876; ADR-0064 Accepted); slices 2-5 not started, JASSUB still in use for ASS (audited 2026-11-09)
 **Scope**: The native web UI (`/ui/`, 013/017), the Android TV app (025, WebView first) and later phone and native-video clients draw every text subtitle (SRT, WebVTT, ASS/SSA, embedded or sidecar) with one Rust crate, `pharos-subs`, instead of the browser's `<track>`/`::cue` and the vendored JASSUB. Image subtitles (019) and jellyfin-web are unchanged.
 **Decision record**: ADR-0064. **Backlog**: B572-B577. **Verification**: V485-V490.
 
@@ -141,3 +141,14 @@ Image subtitles (019, already drawn by the player); jellyfin-web; editing or aut
 1. Is 800 KB gzip achievable with `harfrust` + `skrifa`? Slice 1 measures it first; if not, the budget is revisited with Alison before more code.
 2. Does the G08 WebView expose wasm SIMD and `OffscreenCanvas`? Only affects speed paths, not correctness; checked in slice 1's first V485 run.
 3. Whether to take parts of `rassa` (MIT, a young pure-Rust libass rewrite) rather than write them: its parser may be usable; its renderer is not (it links FreeType and fontconfig, so it cannot build for `wasm32-unknown-unknown`).
+
+## Progress (audited 2026-11-09)
+
+| Slice | State | Evidence |
+|---|---|---|
+| 0 (B572) fonts, sidecar ASS | done | `services/font_subset.rs`, route `/videos/{id}/subtitles/{index}/fonts/{n}` in `api/jellyfin/subtitles.rs`; af32bded (sidecar `.ass`/`.ssa` listed under real codec), 30157997 |
+| 1 (B573) plain tier | partial | `crates/pharos-subs` (parse, raster, shaping, `Renderer`, benches), `render/subtitles.rs` + `render/webgl_subs.rs` GPU quads, `native/subs_web.rs`, `RustSubs` adapter, `pharos_subtitle_render_fallback_total` in `native/subtitles.rs`; no dedicated Web Worker found, no G08 V485 run, no `pharos_subtitle_render_ms` metric |
+| 2 (B574) static typesetting | not started | no `\pos`, `\org`, `\clip`, rotation handling in `pharos-subs` renderer; no conformance corpus (`crates/pharos-subs/tests/corpus/` absent, V486) |
+| 3 (B575) animation | not started | no `\move`, `\t`, `\k`, `\blur` in renderer |
+| 4 (B576) retire JASSUB | not started | `assets/vendor/jassub/` still present |
+| 5 (B577) server pre-render | not started | none |
