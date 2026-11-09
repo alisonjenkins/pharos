@@ -1227,7 +1227,7 @@ impl<P: Prober> FsScanner<P> {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
             let plan = split::plan(folders, &ctx, now);
-            split::reconcile(store, &plan, root_prefix, mode)
+            split::reconcile(store, &plan, root_prefix, mode, now)
                 .await
                 .map(|changed| (changed, plan.splits.len()))
         }
@@ -3958,6 +3958,8 @@ mod tests {
         merged: Mutex<Vec<(MediaId, MediaId, pharos_core::FoldResume)>>,
         // Spec 033 — series_overrides mirror.
         overrides: Mutex<Vec<pharos_core::SeriesOverride>>,
+        /// Paths `mark_reconcile_paths` marked, in order.
+        reconcile_marked: Mutex<Vec<String>>,
     }
 
     impl MediaStore for MemStore {
@@ -4914,6 +4916,14 @@ mod tests {
             }
             Ok(n)
         }
+
+        async fn mark_reconcile_paths(&self, paths: &[String], _at: i64) -> DomainResult<u64> {
+            self.reconcile_marked
+                .lock()
+                .unwrap()
+                .extend(paths.iter().cloned());
+            Ok(paths.len() as u64)
+        }
     }
 
     // LIB-C6 — minimal in-memory TagStore so the scanner's link-on-write
@@ -5798,6 +5808,18 @@ mod tests {
         let owners = store.overrides.lock().unwrap().clone();
         assert_eq!(owners.len(), 1);
         assert_eq!(owners[0].target_year, Some(2014));
+        // V940: only the row whose key moved is marked for a rebuild.
+        let marked = store.reconcile_marked.lock().unwrap().clone();
+        assert_eq!(marked.len(), 1, "{marked:?}");
+        assert!(marked[0].ends_with("The Flash (1990) - S01E01.mkv"));
+        assert_eq!(
+            series_metric(
+                &snapshotter,
+                "pharos_series_reconcile_marked_total",
+                &[("reason", "key_changed")]
+            ),
+            Some(1.0)
+        );
         assert_eq!(
             series_metric(
                 &snapshotter,
@@ -5828,6 +5850,7 @@ mod tests {
         scanner.scan_into(td.path(), &store).await.unwrap();
         assert_eq!(keys_of(&store), before);
         assert_eq!(store.overrides.lock().unwrap().len(), 1);
+        assert_eq!(store.reconcile_marked.lock().unwrap().len(), 1);
     }
 
     /// Spec 033 §6.2: the default dry run counts the split it would make and
