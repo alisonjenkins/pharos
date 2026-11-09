@@ -20,6 +20,7 @@ use super::palette::Row;
 use super::platform;
 use super::playback::{ends_at_label, left_to_watch, start_ms, Left};
 use super::queue::video_kind;
+use super::reader;
 use super::route::Route;
 use super::seen::{self, MemberSeen};
 use super::together::can_watch_together;
@@ -1077,6 +1078,28 @@ pub fn TitleView(
                             if resume { "Resume" } else { "Play" }
                         }
                     }
+                    if let Some(book) = detail.book.as_ref() {
+                        match reader::book_action(book, detail.read_position.as_ref()) {
+                            reader::BookAction::Read(label) => rsx! {
+                                Link {
+                                    to: Route::Read(item.id),
+                                    class: "pharos-button",
+                                    id: MAIN_ACTION,
+                                    key_action: "play",
+                                    "{label}"
+                                }
+                            },
+                            reader::BookAction::Closed(line) => rsx! {
+                                p { class: "pharos-reader-locked", "{line}" }
+                            },
+                        }
+                        a {
+                            class: "pharos-button pharos-button-secondary",
+                            href: reader::download_href(item.id),
+                            download: "",
+                            "Download"
+                        }
+                    }
                     if item.kind.playable() && resume {
                         {
                             let id = item.id;
@@ -1460,6 +1483,7 @@ pub fn progress_percent(item: &Item) -> Option<u64> {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
+    use pharos_client::api::{Book, BookFormat, ReadPosition};
 
     fn item(kind: ItemKind) -> Item {
         Item {
@@ -2714,6 +2738,62 @@ mod tests {
             "{html}"
         );
         assert!(html.contains(r#"href="/ui/browse/1""#), "{html}");
+    }
+
+    fn book_page(format: BookFormat, position: Option<f32>) -> String {
+        let detail = Detail {
+            book: Some(Book {
+                format,
+                author: "Ada".into(),
+                page_count: 0,
+            }),
+            read_position: position.map(|fraction| ReadPosition {
+                locator: "epub1:1:0".into(),
+                fraction,
+            }),
+            item: item(ItemKind::Book),
+            overview: String::new(),
+            genres: vec![],
+            chapters: vec![],
+            audio_tracks: vec![],
+            subtitle_tracks: vec![],
+            trickplay: vec![],
+            segments: vec![],
+            fonts: Vec::new(),
+            artists: Vec::new(),
+            album: None,
+            cast: Vec::new(),
+            versions: Vec::new(),
+            damage: None,
+        };
+        render(move || rsx! { TitleView { detail: detail.clone() } })
+    }
+
+    /// V353: a book that cannot be opened has no Read action and says why.
+    #[test]
+    fn an_epub_offers_read_and_continue() {
+        let html = book_page(BookFormat::Epub, None);
+        assert!(html.contains(r#"href="/ui/read/1""#), "{html}");
+        assert!(html.contains(">Read<"), "{html}");
+        assert!(html.contains(r#"href="/Items/1/Download""#), "{html}");
+        let html = book_page(BookFormat::Epub, Some(0.42));
+        assert!(html.contains("Continue reading · 42%"), "{html}");
+    }
+
+    #[test]
+    fn a_locked_book_has_no_read_action_and_says_why() {
+        let html = book_page(BookFormat::Unreadable, Some(0.5));
+        assert!(!html.contains("/read/") && !html.contains("Read"), "{html}");
+        assert!(html.contains("locked to a Kindle device"), "{html}");
+        assert!(html.contains(r#"href="/Items/1/Download""#), "{html}");
+    }
+
+    #[test]
+    fn a_pdf_says_reading_is_coming_and_offers_the_download() {
+        let html = book_page(BookFormat::Pdf, None);
+        assert!(!html.contains("/read/"), "{html}");
+        assert!(html.contains("PDF reading is coming"), "{html}");
+        assert!(html.contains(r#"href="/Items/1/Download""#), "{html}");
     }
 
     #[test]
