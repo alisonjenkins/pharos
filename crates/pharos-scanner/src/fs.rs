@@ -4601,6 +4601,13 @@ pub fn in_ignored_folder(path: &Path, root: &Path) -> bool {
         .any(is_ignored_dir)
 }
 
+/// Whether `path` is an [`IGNORE_MARKER`] itself: creating one hides rows
+/// already indexed, so the watcher must reconcile rather than add.
+#[cfg_attr(not(feature = "watch"), allow(dead_code))]
+pub(crate) fn is_ignore_marker(path: &Path) -> bool {
+    path.file_name() == Some(std::ffi::OsStr::new(IGNORE_MARKER))
+}
+
 /// Whether the full walk leaves `path` out: under a `.ignore` folder, a
 /// release sample or a release group's promo clip (V961, V969, V972).
 #[cfg_attr(not(feature = "watch"), allow(dead_code))]
@@ -10877,5 +10884,17 @@ mod tests {
             assert!(walk_skips(&root.join(skipped), root), "{skipped}");
         }
         assert!(!walk_skips(&root.join("Heat (1995)/Heat (1995).mkv"), root));
+    }
+
+    #[test]
+    fn a_created_ignore_marker_is_told_apart() {
+        assert!(is_ignore_marker(Path::new("/lib/To Sort/.ignore")));
+        for other in [
+            "/lib/To Sort/x.ignore",
+            "/lib/.ignore/x.mkv",
+            "/lib/To Sort",
+        ] {
+            assert!(!is_ignore_marker(Path::new(other)), "{other}");
+        }
     }
 }
