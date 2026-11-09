@@ -384,7 +384,7 @@ async fn unknown_and_extra_elements_are_ignored() {
 /// Directly exercise the date helper for a couple of known epochs.
 #[test]
 fn date_parsing_known_values() {
-    assert_eq!(parse_date_unix("1970-01-01"), Some(0));
+    assert_eq!(parse_date_unix("1970-01-02"), Some(86_400));
     assert_eq!(parse_date_unix("2000-01-01"), Some(946_684_800));
     assert_eq!(parse_date_unix("1999-03-31"), Some(922_838_400));
     // With a time component and `T` separator.
@@ -392,6 +392,34 @@ fn date_parsing_known_values() {
     // Garbage -> None, never panics.
     assert_eq!(parse_date_unix("not-a-date"), None);
     assert_eq!(parse_date_unix(""), None);
+}
+
+/// B984 — an episode NFO's `1970-01-01` placeholder is no date, and gives
+/// no year either.
+#[tokio::test]
+async fn an_epoch_placeholder_air_date_is_no_date() {
+    let dir = tempdir().unwrap();
+    let season = dir.path().join("One Piece/Season 10");
+    std::fs::create_dir_all(&season).unwrap();
+    let media = season.join("One Piece - S10E01 - 196 - Emergency Announcement.mkv");
+    std::fs::write(
+        season.join("One Piece - S10E01 - 196 - Emergency Announcement.nfo"),
+        "<episodedetails><title>Emergency Announcement</title>\
+         <aired>1970-01-01</aired></episodedetails>",
+    )
+    .unwrap();
+    let p = probe();
+    let req = MetadataRequest {
+        path: &media,
+        kind: MediaKind::Episode,
+        probe: &p,
+        series: None,
+    };
+    let r = NfoProvider::new().fetch(&req).await.unwrap();
+    assert_eq!(r.title.as_deref(), Some("Emergency Announcement"));
+    assert_eq!(r.premiere_date, None);
+    assert_eq!(r.production_year, None);
+    assert_eq!(parse_date_unix("1970-01-01T00:00:00"), None);
 }
 
 /// A `<uniqueid>` with no type but a `tt…` value is recognised as IMDb;
