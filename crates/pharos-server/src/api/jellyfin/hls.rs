@@ -703,10 +703,9 @@ fn apply_rung_output_size(
 /// GC'd session and reaches the remux re-encode paths (which carry no cap in
 /// the registered Decision). `0` / unparseable → `None`.
 fn qs_video_bitrate_cap(qs: &str) -> Option<u64> {
-    qs.split('&')
-        .filter_map(|kv| kv.split_once('='))
-        .find(|(k, _)| k.eq_ignore_ascii_case("VideoBitrate"))
-        .and_then(|(_, v)| v.parse::<u64>().ok())
+    super::ci_query::values(qs, "VideoBitrate")
+        .next()
+        .and_then(|v| v.parse::<u64>().ok())
         .filter(|n| *n > 0)
 }
 

@@ -501,26 +501,16 @@ fn parse_audio_codec_list(qs: &str) -> Vec<String> {
 }
 
 fn parse_max_streaming_bitrate(qs: &str) -> Option<u64> {
-    for kv in qs.split('&') {
-        if let Some((k, v)) = kv.split_once('=') {
-            if k.eq_ignore_ascii_case("MaxStreamingBitrate") {
-                return v.parse::<u64>().ok();
-            }
-        }
-    }
-    None
+    super::ci_query::values(qs, "MaxStreamingBitrate")
+        .next()
+        .and_then(|v| v.parse::<u64>().ok())
 }
 
 /// First value of query key `key` (case-insensitive), empty values skipped.
 fn query_value_ci(qs: &str, key: &str) -> Option<String> {
-    for kv in qs.split('&') {
-        if let Some((k, v)) = kv.split_once('=') {
-            if k.eq_ignore_ascii_case(key) && !v.is_empty() {
-                return Some(v.to_string());
-            }
-        }
-    }
-    None
+    super::ci_query::values(qs, key)
+        .find(|v| !v.is_empty())
+        .map(str::to_string)
 }
 
 /// B75 — authorize a direct-play `/videos/{id}/stream` request. Two accepted
