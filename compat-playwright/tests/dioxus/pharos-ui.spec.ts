@@ -4017,10 +4017,10 @@ test.describe("pharos Dioxus UI stage", () => {
     expect(plays(lines), "expanding keeps the stream").toBe(2);
   });
 
-  // A play click asks for fullscreen itself (B582): the browser only grants
-  // it inside the click, and the player mounts after. The whole page goes
-  // fullscreen, so the next episode's new player keeps it.
-  test("a film or episode opens fullscreen, but not into the floating window or for a song", async ({
+  // A video opens full-window, inside the browser window rather than in
+  // browser fullscreen (B903), and Esc shrinks it to the compact player so
+  // the library can be browsed while it plays on (V852).
+  test("a video opens full-window, and Esc shrinks it to the compact player", async ({
     page,
     request,
   }) => {
@@ -4029,8 +4029,16 @@ test.describe("pharos Dioxus UI stage", () => {
       headers: { Accept: "application/json" },
     });
     test.skip(probe.status() !== 405, `native API is not enabled (status ${probe.status()})`);
-    const fullscreen = () =>
-      page.evaluate(() => document.fullscreenElement === document.documentElement);
+    const fullscreen = () => page.evaluate(() => document.fullscreenElement !== null);
+    const fillsWindow = () =>
+      page.evaluate(() => {
+        const stage = document.querySelector(".pharos-stage.is-full .pharos-watch");
+        if (!stage) return false;
+        const r = stage.getBoundingClientRect();
+        return (
+          Math.round(r.width) === window.innerWidth && Math.round(r.height) === window.innerHeight
+        );
+      });
     await signIn(page);
 
     await openFirstHit(page, "Playwright");
@@ -4039,25 +4047,26 @@ test.describe("pharos Dioxus UI stage", () => {
     await expect(page.locator(".pharos-stage.is-full .pharos-watch video")).toBeVisible({
       timeout: 15_000,
     });
-    await expect.poll(fullscreen, { message: "a film opens fullscreen" }).toBe(true);
+    await expect.poll(fillsWindow, { message: "a video fills the window" }).toBe(true);
+    expect(await fullscreen(), "a video is not in browser fullscreen").toBe(false);
 
-    // Shrinking to the floating window leaves fullscreen.
-    await page.mouse.move(20, 20);
-    await page.locator(".pharos-watch-top").getByRole("button", { name: "Shrink" }).click();
-    await expect(page.locator(".pharos-stage.is-floating")).toBeVisible();
-    await expect.poll(fullscreen, { message: "the floating window is not fullscreen" }).toBe(false);
-
-    // A play into the floating window stays there, out of fullscreen.
-    await openFirstHit(page, "Playwright");
-    await page.getByRole("link", { name: /^(Play|Resume)$/ }).click();
-    await expect(page.locator(".pharos-stage.is-floating .pharos-watch video")).toBeVisible({
-      timeout: 15_000,
-    });
-    expect(await fullscreen(), "a play into the floating window").toBe(false);
+    // Esc shrinks it; the library shows with the film still playing.
+    await page.keyboard.press("Escape");
+    await expect(page.locator(".pharos-stage.is-floating, .pharos-stage.is-mini")).toBeVisible();
+    await expect(page).not.toHaveURL(/\/ui\/watch\//);
+    await expect(page.locator(".pharos-shell")).toBeVisible();
+    await expect
+      .poll(() =>
+        page.evaluate(() => {
+          const v = document.querySelector<HTMLVideoElement>(".pharos-stage video");
+          return v !== null && !v.ended && v.readyState > 0;
+        }),
+      )
+      .toBe(true);
     await page.locator(".pharos-stage-bar").getByRole("button", { name: "Close" }).click();
     await expect(page.locator(".pharos-stage")).toHaveCount(0);
 
-    // An episode's Play on its show page; Back leaves fullscreen.
+    // An episode's Play on its show page opens full-window too.
     await page.locator(".pharos-brand").click();
     await page.locator("section.pharos-rail h2 a", { hasText: /^TV$/ }).click();
     await page.locator("ul.pharos-grid .pharos-poster-name", { hasText: "Playwright Show" }).click();
@@ -4065,19 +4074,24 @@ test.describe("pharos Dioxus UI stage", () => {
     await expect(page.locator(".pharos-stage.is-full .pharos-watch video")).toBeVisible({
       timeout: 15_000,
     });
-    await expect.poll(fullscreen, { message: "an episode opens fullscreen" }).toBe(true);
-    await page.mouse.move(20, 20);
-    await page.locator(".pharos-watch-top").getByRole("button", { name: "Back", exact: true }).click();
-    await expect.poll(fullscreen, { message: "Back leaves fullscreen" }).toBe(false);
-    await page.locator(".pharos-stage-bar").getByRole("button", { name: "Close" }).click();
+    await expect.poll(fillsWindow, { message: "an episode fills the window" }).toBe(true);
+    expect(await fullscreen(), "an episode is not in browser fullscreen").toBe(false);
 
-    // A song opens its own screen, never fullscreen.
-    await openFirstHit(page, "carefree");
-    await page.getByRole("link", { name: /^(Play|Resume)$/ }).click();
-    await expect(page.locator(".pharos-stage.is-full .pharos-listen")).toBeVisible({
-      timeout: 15_000,
-    });
-    expect(await fullscreen(), "a song").toBe(false);
+    // A menu claims Esc first: the open key help closes, the player stays.
+    await page.keyboard.press("?");
+    await expect(page.locator(".pharos-key-help")).toBeVisible();
+    await page.keyboard.press("Escape");
+    await expect(page.locator(".pharos-key-help")).toHaveCount(0);
+    await expect(page.locator(".pharos-stage.is-full .pharos-watch")).toBeVisible();
+
+    // In browser fullscreen the first Esc only leaves it, the next shrinks.
+    await page.keyboard.press("f");
+    await expect.poll(fullscreen, { message: "f enters fullscreen" }).toBe(true);
+    await page.keyboard.press("Escape");
+    await expect.poll(fullscreen, { message: "Esc leaves fullscreen" }).toBe(false);
+    await expect(page.locator(".pharos-stage.is-full .pharos-watch")).toBeVisible();
+    await page.keyboard.press("Escape");
+    await expect(page.locator(".pharos-stage.is-floating, .pharos-stage.is-mini")).toBeVisible();
   });
 
   // The floating window resizes from a top corner, away from the edge it
