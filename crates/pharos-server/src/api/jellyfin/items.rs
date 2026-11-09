@@ -2319,7 +2319,7 @@ async fn playback_info(
         .and_then(|v| v.to_str().ok())
         .is_some_and(|ua| ua.contains("Mozilla"));
 
-    profile.denied_audio_codecs = playback::denied_audio_codecs_for_token(&state, &api_key).await;
+    profile.denied_audio_codecs = playback::denied_audio_codecs_for_token(&state, &token).await;
     let negotiated = playback::negotiate(
         &state,
         &item,
