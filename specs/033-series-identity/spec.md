@@ -373,6 +373,16 @@ these):
   a pass would change (or changed), with the row count; the per-row lines
   (`series identity repair: row`) are debug.
 - `sum by (action) (increase(pharos_series_override_total[1d]))` for §7.
+- `sum by (kind, reason, mode) (pharos_series_identity_repair_selected)`: the
+  §6 step 3 survey's selection, `kind` ∈ `show | episode`, `reason` ∈
+  `exact_rival | year_mismatch | split | other_show | outside_run`, with
+  `|= "series identity repair: survey"` (and a `re-ask` / `episodes to
+  rebuild` line per show).
+- `sum by (reason) (increase(pharos_series_reconcile_marked_total[1d]))`,
+  `reason="match_changed"`, with `|= "series identity repair: show match
+  changed"`; `pharos_series_reconcile_pending{mode}` is the backlog, which
+  `apply` drains to 0 and `dry_run` leaves standing; each rebuild logs
+  `|= "series identity repair: episode rebuilt"`.
 
 After deploy, success is: the dry-run lines list BSG → 2004 (tvdb id of the
 2004 series), The Flash split 4 + 62, Cosmos 13 and Life on Mars 16 episode
@@ -393,6 +403,7 @@ re-fetches, and nothing else changing match.
 | V893 | Any folder whose files state different show years is split by stated year; an unyeared file splits off only on its own episode-title evidence (recorded as a `scanner` override); the group within one year of the stored match's premiere year (else the largest) keeps the folder key. |
 | V894 | Copies fold only within one series key, with no two different known stated years (and never when filename-stated years differ, whatever the folder year says), equal provider series ids where both are known, agreeing filename episode titles where both have one, and neither row placed by an admin override unless explicitly merged; in a flagged or split series, numbers alone never fold. |
 | V896 | A hand fix of a show or its files is an override the scanner applies after its own split and before the copy fold; a rescan never undoes it, and the copy fold never merges a row an admin override placed unless the admin explicitly merges that pair. |
+| V940 | An automatic change of a show's match durably marks its episodes, and under `apply` each is rebuilt from local evidence and the new match until it completes; matcher version 2 re-asks only shows with conflicting evidence, and a dry run logs that once and keeps the version at 1. |
 
 ## Out of scope
 
