@@ -2404,13 +2404,23 @@ enum CopyBucket {
         first: u32,
         last: u32,
     },
+    /// A film by its cleaned, case-folded title and its year.
+    Film { title: String, year: u32 },
 }
 
+/// The containers a film is held in: an audio file or a book is never a
+/// copy of a film.
+const FILM_EXTENSIONS: &[&str] = &["mkv", "mp4", "mov", "avi", "webm", "m4v"];
+
 /// The buckets `path` is a copy in: for an episode file each episode it
-/// covers, or for a span past [`MAX_EPISODE_SPAN`] only its exact span.
+/// covers, or for a span past [`MAX_EPISODE_SPAN`] only its exact span; for a
+/// film its title and year.
 fn copy_buckets(path: &Path) -> Vec<CopyBucket> {
     let Some((show, season, first, last)) = episode_copy_key(path) else {
-        return Vec::new();
+        return film_copy_key(path)
+            .map(|(title, year)| CopyBucket::Film { title, year })
+            .into_iter()
+            .collect();
     };
     if last.saturating_sub(first) >= MAX_EPISODE_SPAN {
         return vec![CopyBucket::Episode {
@@ -2533,6 +2543,43 @@ fn group_copies(
         out.push((primary, alts));
     }
     out
+}
+
+/// The title and year a film file's own name states (`Heat (1995)
+/// Bluray-1080p.mkv`), case-folded to letters and digits. A name with no year
+/// is no copy of anything: a title alone would merge remakes, and a folder's
+/// name is not used, since a film's folder also holds its trailer and sample.
+/// An edition (`Heat (1995) - Director's Cut`) is its own title; a 3D rip of
+/// the film is a copy of it.
+fn film_copy_key(path: &Path) -> Option<(String, u32)> {
+    if is_episode_path(path) {
+        return None;
+    }
+    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+    if !FILM_EXTENSIONS.contains(&ext.as_str()) {
+        return None;
+    }
+    let stem = path.file_stem()?.to_str()?;
+    if let Some((_, edition)) = split_edition_tag(stem) {
+        parse_3d_edition(edition)?;
+    }
+    let parsed = crate::metadata::filename::parse_filename(stem, true);
+    let year = parsed.year?;
+    let title = parsed
+        .title?
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() {
+                c.to_lowercase().next().unwrap_or(c)
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    (!title.is_empty()).then_some((title, year))
 }
 
 /// `(show folder, season, first episode, last episode)` for an episode file
@@ -7188,6 +7235,54 @@ mod tests {
             Some(vec![b.as_path()])
         );
         assert_eq!(group_of(&groups, &e03), Some(&[][..]));
+    }
+
+    /// V846: copies of one film are one item, the best quality primary.
+    #[test]
+    fn copies_of_a_film_are_one_item() {
+        let sd = PathBuf::from("/films/Heat (1995) [720p]/Heat.1995.720p.HDTV.mkv");
+        let hd = PathBuf::from("/films/Heat (1995)/Heat (1995) Bluray-1080p.mkv");
+        let three_d = PathBuf::from("/films/3D/Heat (1995) - 3D.HSBS.mkv");
+        let groups = group_editions(vec![sd.clone(), hd.clone(), three_d.clone()]);
+        assert_eq!(groups.len(), 1, "{groups:?}");
+        assert_eq!(groups[0].0, hd);
+        assert_eq!(
+            alt_paths(&groups[0].1),
+            vec![sd.as_path(), three_d.as_path()]
+        );
+        assert_eq!(
+            folded_copies(&groups)
+                .iter()
+                .flat_map(|f| f.into.iter().map(|(_, r)| *r))
+                .collect::<Vec<_>>(),
+            [pharos_core::FoldResume::Carry; 2]
+        );
+    }
+
+    /// V846: a film groups only with files whose own names state the same
+    /// title and year; editions, other years, songs and trailers stay apart.
+    #[test]
+    fn a_film_groups_only_with_its_own_title_and_year() {
+        let groups = group_editions(vec![
+            PathBuf::from("/films/Dune (1984)/Dune (1984).mkv"),
+            PathBuf::from("/films/Dune (2021)/Dune (2021).mkv"),
+            PathBuf::from("/films/Heat (1995)/Heat (1995).mkv"),
+            PathBuf::from("/films/Heat (1995)/trailer.mkv"),
+            PathBuf::from("/films/Other/Heat (1995) - Director's Cut.mkv"),
+            PathBuf::from("/films/Untitled/Heat.mkv"),
+            PathBuf::from("/music/Heat (1995)/Heat (1995).flac"),
+        ]);
+        assert_eq!(groups.len(), 7, "{groups:?}");
+        assert!(groups.iter().all(|(_, alts)| alts.is_empty()));
+    }
+
+    #[test]
+    fn a_film_key_folds_case_and_punctuation() {
+        assert_eq!(
+            film_copy_key(Path::new("/f/The.Matrix.1999.1080p.BluRay.mkv")),
+            film_copy_key(Path::new("/g/The Matrix (1999) WEBDL-720p.mp4")),
+        );
+        assert_eq!(film_copy_key(Path::new("/f/The Matrix.mkv")), None);
     }
 
     /// V845: the highest-quality copy is the primary: the taller picture
