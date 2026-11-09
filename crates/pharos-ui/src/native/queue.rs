@@ -10,7 +10,7 @@
 //! It lives for the tab, in the app's context, so it survives moving between
 //! pages and from song to song.
 //!
-//! Films, episodes and music videos have a queue of their own (B904/V853),
+//! Films, episodes and music videos have a queue of their own (B906/V853),
 //! the same [`Queue`] held as [`VideoQueueCtx`]: only what the viewer added,
 //! played after the video on screen and before its next episode.
 
@@ -216,7 +216,7 @@ pub const RESTART_AFTER_MS: u64 = 3_000;
 #[derive(Clone, Copy)]
 pub struct QueueCtx(pub Signal<Queue>);
 
-/// The app-wide video queue (B904/V853), provided by the app's root, and
+/// The app-wide video queue (B906/V853), provided by the app's root, and
 /// whether its panel is open in the player, kept from video to video.
 #[derive(Clone, Copy)]
 pub struct VideoQueueCtx(pub Signal<Queue>, pub Signal<bool>);
