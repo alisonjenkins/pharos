@@ -2976,6 +2976,12 @@ where
     assert_eq!(got.match_flag.as_deref(), Some("ambiguous"));
     assert_eq!(got.match_runner_up_id.as_deref(), Some("78650"));
     assert_eq!(got.match_runner_up_score, Some(0.25));
+    let keys = [FOLDER.to_string(), split.clone()];
+    assert_eq!(
+        store.ambiguous_series(&keys).await.unwrap(),
+        std::collections::HashSet::from([FOLDER.to_string()])
+    );
+    assert!(store.ambiguous_series(&[]).await.unwrap().is_empty());
     SeriesMetadataStore::upsert_series_metadata(
         &store,
         pharos_core::SeriesMetadata {
@@ -3000,6 +3006,7 @@ where
         ),
         (None, None, None)
     );
+    assert!(store.ambiguous_series(&keys).await.unwrap().is_empty());
 
     // V940 — episode reconciliation marks, re-admission, and translation deletion.
     assert_eq!(store.mark_series_reconcile(&split, 100).await.unwrap(), 1);

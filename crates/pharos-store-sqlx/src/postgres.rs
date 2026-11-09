@@ -4449,6 +4449,24 @@ impl SeriesIdentityStore for PostgresStore {
             .collect())
     }
 
+    async fn ambiguous_series(
+        &self,
+        keys: &[String],
+    ) -> DomainResult<std::collections::HashSet<String>> {
+        if keys.is_empty() {
+            return Ok(std::collections::HashSet::new());
+        }
+        let rows: Vec<String> = sqlx::query_scalar(
+            "SELECT series_key FROM series_metadata \
+             WHERE series_key = ANY($1) AND match_flag = 'ambiguous'",
+        )
+        .bind(keys)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| DomainError::Backend(e.to_string()))?;
+        Ok(rows.into_iter().collect())
+    }
+
     #[tracing::instrument(skip(self))]
     async fn mark_series_reconcile(&self, series_key: &str, at: i64) -> DomainResult<u64> {
         let res = sqlx::query(
