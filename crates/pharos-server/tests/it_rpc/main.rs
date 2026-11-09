@@ -24,6 +24,7 @@ mod lyrics;
 mod media_token;
 mod mix;
 mod password;
+mod person;
 mod playback;
 mod prefs;
 mod quick_connect;

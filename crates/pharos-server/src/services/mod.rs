@@ -10,6 +10,7 @@ pub mod library;
 pub mod lyrics;
 pub mod metadata_text;
 pub mod mix;
+pub mod person;
 pub mod play_state;
 pub mod playback;
 pub mod search;
