@@ -3455,6 +3455,32 @@ where
     );
 }
 
+/// A database of its own for one postgres conformance arm, dropped and
+/// recreated each run. The arms run side by side (nextest runs each test in its
+/// own process) and each asserts on whole-table state, such as "newest three
+/// items" or "the runtime config is still the default", so one shared database
+/// let one arm's rows land in another's view mid-assertion, and a retry saw
+/// the first try's rows.
+#[cfg(feature = "postgres")]
+async fn fresh_postgres_url(shared: &str, arm: &str) -> String {
+    use sqlx::Connection;
+    let (base, _) = shared.rsplit_once('/').expect("postgres url has a db path");
+    let db = format!("pharos_conformance_{arm}");
+    let mut admin = sqlx::postgres::PgConnection::connect(&format!("{base}/postgres"))
+        .await
+        .expect("connect postgres admin db");
+    // DROP/CREATE DATABASE cannot run inside a transaction.
+    sqlx::query(sqlx::AssertSqlSafe(format!("DROP DATABASE IF EXISTS {db}")))
+        .execute(&mut admin)
+        .await
+        .expect("drop conformance db");
+    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {db}")))
+        .execute(&mut admin)
+        .await
+        .expect("create conformance db");
+    format!("{base}/{db}")
+}
+
 #[cfg(feature = "sqlite")]
 #[tokio::test]
 async fn sqlite_read_position_conformance() {
@@ -3471,6 +3497,7 @@ async fn postgres_read_position_conformance() {
         eprintln!("SKIP postgres_read_position_conformance: PHAROS_TEST_POSTGRES_URL unset");
         return;
     };
+    let url = fresh_postgres_url(&url, "read_position").await;
     let p = pharos_store_sqlx::postgres::PostgresStore::connect(&url)
         .await
         .expect("connect postgres");
@@ -3493,6 +3520,7 @@ async fn postgres_series_identity_conformance() {
         eprintln!("SKIP postgres_series_identity_conformance: PHAROS_TEST_POSTGRES_URL unset");
         return;
     };
+    let url = fresh_postgres_url(&url, "series_identity").await;
     let p = pharos_store_sqlx::postgres::PostgresStore::connect(&url)
         .await
         .expect("connect postgres");
@@ -3515,6 +3543,7 @@ async fn postgres_conformance() {
         eprintln!("SKIP postgres_conformance: PHAROS_TEST_POSTGRES_URL unset");
         return;
     };
+    let url = fresh_postgres_url(&url, "main").await;
     let p = pharos_store_sqlx::postgres::PostgresStore::connect_with(
         &url,
         pharos_store_sqlx::PoolConfig {
