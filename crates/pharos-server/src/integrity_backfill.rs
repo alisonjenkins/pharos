@@ -186,9 +186,14 @@ async fn scan_one(ctx: &Ctx, it: &MediaItem) -> Result<Outcome, String> {
                 BOOK_CHECK_TIMEOUT.as_secs()
             )));
         };
-        let checked = joined
-            .map_err(|e| format!("book check task failed: {e}"))?
-            .map_err(|e| format!("book could not be opened: {e}"))?;
+        let checked = match joined {
+            Ok(opened) => opened.map_err(|e| format!("book could not be opened: {e}"))?,
+            // A reader that panics on this file will panic on every pass; record it once.
+            Err(e) if e.is_panic() => {
+                return Ok(Outcome::NotCheckable(format!("book reader panicked: {e}")));
+            }
+            Err(e) => return Err(format!("book check task failed: {e}")),
+        };
         return Ok(match checked {
             BookCheck::Checked(b) => Outcome::Report(book_report(b)),
             BookCheck::NotCheckable(why) => Outcome::NotCheckable(why),
