@@ -108,6 +108,18 @@ pub struct EpisodeListing {
     pub aired: Option<i64>,
 }
 
+/// Spec 033 (B982) — a show's whole run by the provider's series record, so
+/// a run window does not depend on which seasons the provider listed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SeriesRun {
+    /// First aired, unix seconds at UTC midnight.
+    pub first: Option<i64>,
+    /// Last aired, unix seconds at UTC midnight.
+    pub last: Option<i64>,
+    /// The provider says the show is still airing, so its run has no end yet.
+    pub ongoing: bool,
+}
+
 /// A single online metadata/artwork provider (TMDB, TVDB, ...). The
 /// orchestrator (T9) drives this generically: search to resolve a
 /// candidate id, then fetch the full record for that id. Implementations
@@ -189,6 +201,13 @@ pub trait OnlineEnricher: Send + Sync {
         seasons: &[u32],
     ) -> impl Future<Output = Option<Vec<EpisodeListing>>> + Send {
         let _ = (id, seasons);
+        async { None }
+    }
+
+    /// Spec 033 (B982) — show `id`'s first and last air dates by its series
+    /// record. `None` when the request failed or the provider has no record.
+    fn series_run(&self, id: &str) -> impl Future<Output = Option<SeriesRun>> + Send {
+        let _ = id;
         async { None }
     }
 }
