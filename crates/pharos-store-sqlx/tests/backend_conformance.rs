@@ -1245,7 +1245,40 @@ where
     let fresh = UserDataStore::get_user_data(&store, uid, fresh_id)
         .await
         .unwrap();
-    assert_eq!((fresh.play_count, fresh.last_played_position_ticks), (5, 0));
+    assert_eq!(
+        (
+            fresh.play_count,
+            fresh.last_played_position_ticks,
+            fresh.last_played_at
+        ),
+        (5, 0, 0)
+    );
+    // A copy that shares the item's timeline, played before the double,
+    // still carries its resume point in.
+    let single_copy_id: MediaId = 9_004;
+    MediaStore::put(&store, media_item(single_copy_id, "Fresh Episode Copy"))
+        .await
+        .unwrap();
+    let single_copy = UserItemData {
+        play_count: 1,
+        last_played_position_ticks: 4_000,
+        last_played_at: 1_700_001_500,
+        ..Default::default()
+    };
+    UserDataStore::set_user_data(&store, uid, single_copy_id, single_copy)
+        .await
+        .unwrap();
+    MediaStore::merge_user_data(&store, single_copy_id, fresh_id, FoldResume::Carry)
+        .await
+        .unwrap();
+    let carried = UserDataStore::get_user_data(&store, uid, fresh_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        (carried.last_played_position_ticks, carried.last_played_at),
+        (4_000, 1_700_001_500),
+        "a dropped double's play time must not outrank a later carried copy"
+    );
 
     // -----------------------------------------------------------------
     // 6. PreferenceStore
