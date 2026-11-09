@@ -27,9 +27,9 @@ pub fn program_for(theme: &Theme) -> Option<Program> {
 
 /// Whether the backdrop runs behind `route`: not behind the watch page,
 /// whose video covers the whole screen, so the shader would burn GPU time
-/// nobody can see (B808).
+/// nobody can see (B808). The same holds behind the full-screen reader.
 pub fn runs_behind(route: &Route) -> bool {
-    !matches!(route, Route::Watch(_))
+    !matches!(route, Route::Watch(_) | Route::Read(_))
 }
 
 /// The theme colours the shader tints with.
@@ -311,6 +311,7 @@ mod tests {
         use pharos_client::api::ItemRef;
         let item = ItemRef::Real(42);
         assert!(!runs_behind(&Route::Watch(item)));
+        assert!(!runs_behind(&Route::Read(item)));
         for route in [Route::Home, Route::Together] {
             assert!(runs_behind(&route), "{route:?}");
         }

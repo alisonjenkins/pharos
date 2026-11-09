@@ -154,30 +154,22 @@ impl ReaderSettings {
     pub fn line_height(self) -> f64 {
         f64::from(self.line_height_x10) / 10.0
     }
+}
 
-    /// The next line height, round to the first after the last.
-    pub fn next_line_height(self) -> Self {
-        Self {
-            line_height_x10: cycle(&LINE_HEIGHTS, self.line_height_x10),
-            ..self
-        }
-    }
-
-    /// The next margin, round to the first after the last.
-    pub fn next_margin(self) -> Self {
-        Self {
-            margin_px: cycle(&MARGINS, self.margin_px),
-            ..self
-        }
+/// A name for a margin step.
+pub fn margin_label(px: u32) -> &'static str {
+    match px {
+        0..=20 => "None",
+        21..=50 => "Narrow",
+        51..=90 => "Medium",
+        _ => "Wide",
     }
 }
 
-fn cycle(steps: &[u32], value: u32) -> u32 {
-    let at = steps.iter().position(|s| *s == value).unwrap_or(0);
-    steps
-        .get(at.saturating_add(1) % steps.len().max(1))
-        .copied()
-        .unwrap_or(value)
+/// What the save gate compares: a place and how far through it is, so
+/// reaching the end of the book is sent even from a place already saved.
+pub fn save_key(locator: &str, fraction: f32) -> String {
+    format!("{locator}@{fraction:.3}")
 }
 
 /// Whether the page is a weak device (a TV, a headset or a phone), whose
@@ -399,16 +391,16 @@ mod tests {
     }
 
     #[test]
-    fn line_height_and_margin_cycle_through_their_steps() {
-        let mut s = ReaderSettings::default();
-        let mut seen = vec![s.line_height_x10];
-        for _ in 0..LINE_HEIGHTS.len() {
-            s = s.next_line_height();
-            seen.push(s.line_height_x10);
-        }
-        assert_eq!(seen, [15, 17, 20, 13, 15]);
+    fn line_height_reads_as_a_ratio_and_margins_have_names() {
         assert!((ReaderSettings::default().line_height() - 1.5).abs() < f64::EPSILON);
-        assert_eq!(ReaderSettings::default().next_margin().margin_px, 72);
+        let names: Vec<&str> = MARGINS.iter().map(|m| margin_label(*m)).collect();
+        assert_eq!(names, ["None", "Narrow", "Medium", "Wide"]);
+    }
+
+    #[test]
+    fn the_same_place_at_a_new_fraction_is_a_new_save() {
+        assert_ne!(save_key("epub1:2:0", 0.5), save_key("epub1:2:0", 1.0));
+        assert_eq!(save_key("epub1:2:0", 0.5), save_key("epub1:2:0", 0.5));
     }
 
     #[test]
