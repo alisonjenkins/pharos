@@ -192,6 +192,8 @@ pub struct GroupState {
     pub log: ActivityLog,
     /// The queue entry the group is on, which readiness reports carry.
     pub playlist_item_id: String,
+    /// The queue entry whose end a member kept the group watching (B1027).
+    next_held: Option<String>,
     pub ended: Option<String>,
     /// The group's updates so far.
     activity: u64,
@@ -419,6 +421,7 @@ impl GroupState {
                 push(TrackKind::Subtitles, tracks.subtitle, self.tracks.subtitle);
                 events
             }
+            GroupUpdate::NextHeld { by, .. } => vec![by_member(by, activity::Action::HeldNext)],
             GroupUpdate::Joined(_) | GroupUpdate::Item { .. } | GroupUpdate::Ended => Vec::new(),
         }
     }
@@ -473,6 +476,7 @@ impl GroupState {
                 // first item (no previous one) keeps what `Joined` brought.
                 if !self.playlist_item_id.is_empty() && self.playlist_item_id != playlist_item_id {
                     self.tracks = GroupTracksView::default();
+                    self.next_held = None;
                 }
                 self.playlist_item_id = playlist_item_id;
                 self.item = Some(item);
@@ -547,6 +551,12 @@ impl GroupState {
                 self.tracks = tracks;
                 Vec::new()
             }
+            GroupUpdate::NextHeld {
+                playlist_item_id, ..
+            } => {
+                self.next_held = Some(playlist_item_id);
+                Vec::new()
+            }
             GroupUpdate::Ended => {
                 self.ended = Some("This group has ended".to_owned());
                 self.id = None;
@@ -564,6 +574,13 @@ impl GroupState {
             playing,
         });
         self.last_command_ms = Some(now_ms);
+    }
+
+    /// A member kept the group watching the end of the entry it is on, so no
+    /// "Up next" plays on from it (B1027).
+    pub fn holds_next(&self) -> bool {
+        !self.playlist_item_id.is_empty()
+            && self.next_held.as_deref() == Some(self.playlist_item_id.as_str())
     }
 
     pub fn view(&self, active: bool) -> GroupView {
@@ -1794,6 +1811,44 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
             client.seek(position_ms).await
         });
         true
+    }
+
+    /// The viewer cancelled "Up next": the group keeps watching this entry's
+    /// end, so every member's countdown stops too (B1027). `false` when the
+    /// group does not drive the stage, where the cancel is this player's.
+    pub fn hold_next(&self) -> bool {
+        if !self.drives() {
+            return false;
+        }
+        let playlist_item_id = self.inner.borrow().state.playlist_item_id.clone();
+        // Before the group's item arrives the server would hold whatever it
+        // plays, not the entry this viewer cancelled on.
+        if playlist_item_id.is_empty() {
+            return false;
+        }
+        let client = self.client.clone();
+        self.command(format!("hold_next({playlist_item_id})"), async move {
+            client.hold_next(playlist_item_id).await
+        });
+        true
+    }
+
+    /// The queue entry the group plays; empty out of a group or before its
+    /// first item. A player's "Up next" belongs to one entry (B1027).
+    pub fn playlist_item_id(&self) -> String {
+        let inner = self.inner.borrow();
+        if inner.active {
+            inner.state.playlist_item_id.clone()
+        } else {
+            String::new()
+        }
+    }
+
+    /// A member kept the group watching the end of what the stage shows, so
+    /// this player's "Up next" must not play on (B1027).
+    pub fn next_held(&self) -> bool {
+        let inner = self.inner.borrow();
+        inner.active && inner.state.drives_stage() && inner.state.holds_next()
     }
 
     /// Sends a group command after every earlier one has been answered: two
@@ -4529,6 +4584,63 @@ mod tests {
         assert_eq!(
             calls_with(&rig, "set_tracks"),
             ["set_tracks(Index(2),Unset,pl-7)"]
+        );
+    }
+
+    fn on_entry(rig: &Rig, item: u64, playlist_item_id: &str) {
+        rig.session.deliver(GroupUpdate::Item {
+            item: ItemRef::Real(item),
+            playlist_item_id: playlist_item_id.into(),
+            position_ms: 0,
+            playing: true,
+        });
+    }
+
+    /// V986: cancelling "Up next" in a group holds the end for the group,
+    /// naming the entry the viewer is on; out of a group it stays local.
+    #[test]
+    fn a_cancelled_up_next_holds_the_end_for_the_group() {
+        let rig = rig();
+        assert!(
+            !rig.session.hold_next(),
+            "no entry yet: the cancel stays here"
+        );
+        on_entry(&rig, 7, "pl-7");
+        assert!(!rig.session.next_held());
+        assert!(rig.session.hold_next());
+        rig.env.settle();
+        assert_eq!(calls_with(&rig, "hold_next"), ["hold_next(pl-7)"]);
+        assert!(rig.session.next_held(), "the group's update came back");
+        assert_eq!(rig.session.view().log.lines(), ["ME cancelled Up next"]);
+
+        let alone = Session::new(FakeGroups::default(), TestEnv::default());
+        assert!(!alone.hold_next());
+        assert!(!alone.next_held());
+    }
+
+    /// V986: another member's hold stops this player's "Up next" on that
+    /// entry only: once the group moves on, the next episode counts again.
+    #[test]
+    fn another_members_hold_lasts_until_the_group_moves_on() {
+        let rig = rig();
+        on_entry(&rig, 7, "pl-7");
+        rig.session.deliver(GroupUpdate::NextHeld {
+            playlist_item_id: "pl-6".into(),
+            by: Some("me".into()),
+        });
+        assert!(!rig.session.next_held(), "a hold on an entry already left");
+        rig.session.deliver(GroupUpdate::NextHeld {
+            playlist_item_id: "pl-7".into(),
+            by: Some("me".into()),
+        });
+        assert!(rig.session.next_held());
+        on_entry(&rig, 8, "pl-8");
+        assert!(!rig.session.next_held());
+        assert_eq!(rig.session.playlist_item_id(), "pl-8");
+        on_entry(&rig, 7, "pl-7");
+        assert!(
+            !rig.session.next_held(),
+            "back on the held entry, it counts again"
         );
     }
 
