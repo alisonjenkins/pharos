@@ -979,10 +979,13 @@ pub fn on_page_hide(_on_hide: impl FnMut() + 'static) -> PageHide {
 /// direct stream plays from the server with the media token (B1029, V988).
 pub async fn engine(kind: Engine) -> Result<Box<dyn PlaybackEngine>, String> {
     match kind {
-        Engine::Direct => Ok(Box::new(DirectMedia {
-            token: wait_for_media_token().await?,
-            ..DirectMedia::default()
-        })),
+        Engine::Direct => {
+            // `DirectMedia` implements `Drop`, so struct-update syntax
+            // cannot move the rest out of a default value (E0509).
+            let mut engine = DirectMedia::default();
+            engine.token = wait_for_media_token().await?;
+            Ok(Box::new(engine))
+        }
         Engine::HlsJs | Engine::NativeHls | Engine::RustHls => {
             if kind != Engine::HlsJs {
                 log::info!(
