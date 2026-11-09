@@ -240,6 +240,7 @@ mod tests {
                 imdb_rating: None,
                 critic_rating: None,
                 stereo: None,
+                damaged: false,
             },
             overview: String::new(),
             genres: Vec::new(),
@@ -253,6 +254,7 @@ mod tests {
             album: None,
             cast: Vec::new(),
             versions: Vec::new(),
+            damage: None,
         }
     }
 
