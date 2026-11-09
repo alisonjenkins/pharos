@@ -1126,9 +1126,28 @@ where
     let translations = store
         .delete_translations(&TranslationOwner::Item(id))
         .await?;
+    // The old show's stills: the row and the cached bytes behind it, so the
+    // image route falls back to a local still or a frame grab until the new
+    // match's art is cached.
+    let art = store.delete_provider_artwork(id).await?;
+    for (role, _) in &art {
+        if let Some(role) = ImageRole::from_str_ci(role) {
+            if let Err(e) = cache.remove(id, role, item.kind, 0).await {
+                tracing::warn!(
+                    error = %e,
+                    media.id = id,
+                    role = ?role,
+                    "series identity repair: cached provider art not removed"
+                );
+            }
+        }
+    }
     store.put(item.clone()).await?;
     item.match_source = None;
     let hit = enrich_one(store, bg_io, cache, tmdb, tvdb, cfg, item, now).await?;
+    if !art.is_empty() {
+        store.bump_art_version(id).await?;
+    }
     let after = store.get(id).await?;
     let done = hit || matches!(after.match_source.as_deref(), Some("none" | "manual"));
     if done {
@@ -1142,6 +1161,7 @@ where
         new_title = %after.title,
         match_source = after.match_source.as_deref(),
         translations_deleted = translations,
+        art_deleted = art.len(),
         done,
         "series identity repair: episode rebuilt"
     );
@@ -5909,6 +5929,104 @@ mod tests {
             .unwrap()
             .is_empty());
         assert!(pending_ids(&s).await.is_empty());
+    }
+
+    /// V940 — a rebuild drops the stills the old show's record cached (the
+    /// row and the file), so the episode no longer serves the old show's
+    /// still; the new match's still replaces it when its record has one, and
+    /// a local sidecar stays.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_rebuilt_episode_drops_the_old_shows_still() {
+        let s = store().await;
+        let (_td, cache) = cache();
+        let mut old_paths = Vec::new();
+        for id in [1, 2] {
+            put_titled_episode(&s, id, BSG, (1, id as u32), "33").await;
+            let old = cache
+                .upload(
+                    id,
+                    ImageRole::Primary,
+                    MediaKind::Episode,
+                    0,
+                    b"remake still",
+                )
+                .await
+                .unwrap();
+            s.set_artwork(id, "Primary", "tvdb", &old.to_string_lossy())
+                .await
+                .unwrap();
+            old_paths.push(old);
+            s.set_artwork(
+                id,
+                "Backdrop",
+                "local",
+                "/tv/Battlestar Galactica/fanart.jpg",
+            )
+            .await
+            .unwrap();
+            s.mark_reconcile_items(&[id], NOW).await.unwrap();
+        }
+        pin(&s, BSG, "73545", NOW).await;
+        let before = s.get(1).await.unwrap().art_version;
+        let bare = FakeEnricher::tvdb().with_detail(EnrichedMetadata {
+            title: Some("33".into()),
+            ..EnrichedMetadata::default()
+        });
+
+        reconcile_one(
+            &s,
+            &sem(4),
+            &cache,
+            None::<&FakeEnricher>,
+            Some(&bare),
+            &apply_cfg(),
+            1,
+            NOW,
+            NOW + 1,
+        )
+        .await
+        .unwrap();
+
+        let rows = s.artwork_for(1).await.unwrap();
+        assert!(
+            rows.iter().all(|(_, source, _)| source == "local"),
+            "old show's still row kept: {rows:?}"
+        );
+        assert_eq!(rows.len(), 1, "the local sidecar stays");
+        assert!(!old_paths[0].exists(), "old show's cached still kept");
+        assert!(s.get(1).await.unwrap().art_version > before);
+
+        let mut with_still = FakeEnricher::tvdb().with_detail(EnrichedMetadata {
+            title: Some("Water".into()),
+            artwork: vec![RemoteArt {
+                role: ArtworkRole::Primary,
+                url: "https://tvdb.example/2004-still.jpg".into(),
+            }],
+            ..EnrichedMetadata::default()
+        });
+        with_still.image_bytes = Some(b"2004 still".to_vec());
+        reconcile_one(
+            &s,
+            &sem(4),
+            &cache,
+            None::<&FakeEnricher>,
+            Some(&with_still),
+            &apply_cfg(),
+            2,
+            NOW,
+            NOW + 1,
+        )
+        .await
+        .unwrap();
+        let (_, source, locator) = s
+            .artwork_for(2)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|(role, _, _)| role == "Primary")
+            .expect("new still recorded");
+        assert_eq!(source, "tvdb");
+        assert_eq!(std::fs::read(locator).unwrap(), b"2004 still");
     }
 
     /// A dry run rebuilds nothing and keeps the mark; a transient miss under
