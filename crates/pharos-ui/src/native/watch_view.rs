@@ -489,6 +489,15 @@ pub fn WatchView(
     // A remote scrub under way (B907): the seek bar previews its target and
     // the seek happens once, when it ends.
     let mut scrub = use_signal(|| None::<Scrub>);
+    // A preview belongs to its item: one still open when the next episode
+    // starts must not seek it to the old target.
+    let item = (title.clone(), title_detail.clone());
+    use_effect(use_reactive!(|item| {
+        let _ = &item;
+        if scrub.peek().is_some() {
+            scrub.set(None);
+        }
+    }));
     let end_scrub = move |end: scrub::End| {
         let Some(s) = *scrub.peek() else {
             return;
@@ -734,7 +743,7 @@ pub fn WatchView(
                         controls: controls.clone(),
                         total,
                         on_control,
-                        scrub_ms: scrub().map(|s| s.target_ms),
+                        scrub: Some(scrub),
                     }
                     div { class: "pharos-control-row",
                         button {
@@ -903,12 +912,13 @@ fn SeekBar(
     controls: Controls,
     total: u64,
     on_control: EventHandler<Control>,
-    /// A remote scrub's target (B907): the knob and the preview sit there
-    /// until it is committed.
+    /// A remote scrub (B907): the knob and the preview sit at its target
+    /// until it is committed. Read here, so a press re-renders the bar alone.
     #[props(default)]
-    scrub_ms: Option<u64>,
+    scrub: Option<Signal<Option<Scrub>>>,
 ) -> Element {
     let c = &controls;
+    let scrub_ms = scrub.and_then(|s| s()).map(|s| s.target_ms);
     let live = Position::of(c).now();
     let at = scrub_ms.unwrap_or(live);
     let played = percent(at, total);
@@ -2385,8 +2395,10 @@ mod tests {
         let mut dom = VirtualDom::new_with_props(
             |controls: Controls| {
                 let total = controls.total_ms();
+                let scrub =
+                    use_signal(|| Some(scrub::press(None, true, false, 300_000, total, 0.0)));
                 rsx! {
-                    SeekBar { controls, total, on_control: |_| {}, scrub_ms: Some(310_000) }
+                    SeekBar { controls, total, on_control: |_| {}, scrub: Some(scrub) }
                 }
             },
             c,

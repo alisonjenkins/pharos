@@ -798,6 +798,9 @@ addEventListener("keydown", (e) => {
   if (e.repeat) return;
   const text = inText(e.target);
   if (!text && takes.has(e.key)) e.preventDefault();
+  // OK during a remote scrub commits it (B907); the focused button must
+  // not also be clicked.
+  if (e.key === "Enter" && document.querySelector(".pharos-seek.is-scrubbing")) e.preventDefault();
   send({ t: "key", key: e.key, ctrl: e.ctrlKey, meta: e.metaKey, text });
 });
 addEventListener("popstate", () => send({ t: "pop", path: location.pathname + location.search }));
