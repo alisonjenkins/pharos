@@ -439,6 +439,7 @@ where
         .build();
     let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
         .with_sampler(sampler_for(sampling_ratio))
+        .with_id_generator(crate::client_spans::ClientIdGenerator::default())
         .with_batch_exporter(exporter)
         .with_resource(resource)
         .build();
