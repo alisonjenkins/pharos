@@ -61,7 +61,9 @@ exporter. Only opted-in users' spans are forwarded (US9).
 - Two reports racing past the cap check can overshoot it by the number in
   flight; acceptable for a per-user cap of 20.
 - Deployments must set `[obs].log_dir` or `[obs].report_dir` for reports to be
-  kept. The home-cluster chart needs that as a follow-up.
+  kept. The chart already defaults `config.obs.logDir` to
+  `/var/lib/pharos/cache/logs`, so a chart deploy keeps them on the cache PVC
+  under `clientlog/reports`; recreating that PVC loses them.
 - The forced-id generator relies on the SDK asking the generator for exactly
   one span id (and one trace id for a root) per span start; an SDK upgrade
   that changes that fails `client_spans` tests rather than mis-parenting
