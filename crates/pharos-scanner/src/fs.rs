@@ -3549,6 +3549,13 @@ mod tests {
             credits.sort_by_key(|(id, _)| *id);
             Ok(credits)
         }
+        async fn actors_named(
+            &self,
+            _words: &[String],
+            _limit: u32,
+        ) -> DomainResult<Vec<pharos_core::Person>> {
+            Ok(Vec::new())
+        }
         async fn person_details(
             &self,
             _wire_id: &str,
