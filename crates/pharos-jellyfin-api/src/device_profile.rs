@@ -215,8 +215,6 @@ impl Decision {
 }
 
 impl DeviceProfile {
-    /// This profile with every `VideoRangeType` condition removed, for a
-    /// server that does not enforce dynamic range.
     /// Whether `codec` is on this device's deny list (case-insensitive).
     pub fn denies_audio(&self, codec: Option<&str>) -> bool {
         codec.is_some_and(|c| {
@@ -234,6 +232,8 @@ impl DeviceProfile {
             .map(str::to_string)
     }
 
+    /// This profile with every `VideoRangeType` condition removed, for a
+    /// server that does not enforce dynamic range.
     pub fn without_video_range_conditions(&self) -> Self {
         let mut stripped = self.clone();
         for cp in &mut stripped.codec_profiles {
