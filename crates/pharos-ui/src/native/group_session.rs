@@ -1664,7 +1664,7 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
         // A player still owing its ready is loading what the group asked for,
         // and its playhead sits at the target until the seek lands: correcting
         // it seeks again and restarts the load, every ~2 s on a slow link
-        // (B1016). The ready's own hold puts it where the group is; a player
+        // (B1019). The ready's own hold puts it where the group is; a player
         // that loaded with no event left to carry the ready says it here.
         if owes_ready {
             self.ready_if_loaded();
@@ -3696,7 +3696,7 @@ mod tests {
             .collect()
     }
 
-    /// B1016/V975: after a group seek, a player whose seek has not landed
+    /// B1019/V978: after a group seek, a player whose seek has not landed
     /// (slow direct play: the playhead stays on the target, no `seeked`) is
     /// left to load. The drift check used to hard-seek it every ~2 s, which
     /// restarted the load each time and kept "Waiting for the server…" up.
@@ -3719,7 +3719,7 @@ mod tests {
         assert!(rig.env.kinds().is_empty(), "{:?}", rig.env.kinds());
     }
 
-    /// B1016/V975: a player that loaded the group's seek with no event left
+    /// B1019/V978: a player that loaded the group's seek with no event left
     /// to carry its ready (attached after its `canplay`) says ready from the
     /// drift check instead of sitting uncorrected.
     #[test]
@@ -3751,7 +3751,7 @@ mod tests {
         assert_eq!(seeks(&rig).len(), 2);
     }
 
-    /// B1016/V975: a drift hard seek still loading is not seeked again inside
+    /// B1019/V978: a drift hard seek still loading is not seeked again inside
     /// the self-seek grace; past it, a player still far off is.
     #[test]
     fn a_hard_seek_still_loading_is_not_repeated_inside_the_grace() {
