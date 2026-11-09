@@ -2565,20 +2565,7 @@ fn film_copy_key(path: &Path) -> Option<(String, u32)> {
     }
     let parsed = crate::metadata::filename::parse_filename(stem, true);
     let year = parsed.year?;
-    let title = parsed
-        .title?
-        .chars()
-        .map(|c| {
-            if c.is_alphanumeric() {
-                c.to_lowercase().next().unwrap_or(c)
-            } else {
-                ' '
-            }
-        })
-        .collect::<String>()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
+    let title = fold_name(&parsed.title?);
     (!title.is_empty()).then_some((title, year))
 }
 
