@@ -304,3 +304,50 @@ async fn download_is_not_restricted_to_books() {
     );
     assert_eq!(test::read_body(resp).await.as_ref(), b"not a book");
 }
+
+/// 023 FR-009: the native reader's credentialed same-origin `fetch` carries
+/// only the `pharos_media` cookie (its session token is HttpOnly), so that
+/// cookie alone must serve the bytes on GET and HEAD, and a cookie holding no
+/// live token must not.
+/// Disarm check: with the route back on `AuthUser`, the cookie is ignored and
+/// both answer 401.
+#[actix_web::test]
+async fn the_media_cookie_alone_serves_the_bytes() {
+    use pharos_server::api::jellyfin::auth_extractor::MEDIA_COOKIE;
+    let td = TempDir::new().unwrap();
+    let (state, token, _) = seed(td.path()).await;
+    let app = test::init_service(app(state)).await;
+    let cookie = |value: &str| actix_web::cookie::Cookie::new(MEDIA_COOKIE, value.to_owned());
+
+    let resp = test::call_service(
+        &app,
+        test::TestRequest::get()
+            .uri("/Items/42/Download")
+            .cookie(cookie(&token))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(test::read_body(resp).await.as_ref(), payload().as_slice());
+
+    let head = test::call_service(
+        &app,
+        test::TestRequest::default()
+            .method(actix_web::http::Method::HEAD)
+            .uri("/Items/42/Download")
+            .cookie(cookie(&token))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(head.status(), StatusCode::OK);
+
+    let stale = test::call_service(
+        &app,
+        test::TestRequest::get()
+            .uri("/Items/42/Download")
+            .cookie(cookie("not-a-token"))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(stale.status(), StatusCode::UNAUTHORIZED);
+}
