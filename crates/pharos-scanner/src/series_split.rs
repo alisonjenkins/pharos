@@ -413,12 +413,15 @@ pub async fn context<S: SeriesIdentityStore>(
 /// Write (in [`RepairMode::Apply`]) or log (in dry run) every difference
 /// between `plan` and the rows stored under `root_prefix`. Returns the rows
 /// changed. A dry run finds the same differences every pass, so its
-/// per-row lines are debug and its per-folder line is the info one.
+/// per-row lines are debug and its per-folder line is the info one. A row
+/// whose key moved is marked at `now` for the server to rebuild against its
+/// new show's match (V940): its text came from the old key's show.
 pub async fn reconcile<S: SeriesIdentityStore>(
     store: &S,
     plan: &SeriesPlan,
     root_prefix: &str,
     mode: RepairMode,
+    now: i64,
 ) -> DomainResult<u64> {
     for split in &plan.splits {
         tracing::info!(
@@ -483,7 +486,28 @@ pub async fn reconcile<S: SeriesIdentityStore>(
     for o in &plan.new_owners {
         store.insert_series_override(o.clone()).await?;
     }
-    store.set_series_keys(&updates).await
+    let changed = store.set_series_keys(&updates).await?;
+    let moved: Vec<String> = updates
+        .iter()
+        .filter(|u| {
+            by_path
+                .get(u.path.as_str())
+                .map_or(true, |old| old.series_key != u.series_key)
+        })
+        .map(|u| u.path.clone())
+        .collect();
+    if !moved.is_empty() {
+        let marked = store.mark_reconcile_paths(&moved, now).await?;
+        metrics::counter!("pharos_series_reconcile_marked_total", "reason" => "key_changed")
+            .increment(marked);
+        tracing::info!(
+            root = root_prefix,
+            moved = moved.len(),
+            marked,
+            "series identity repair: rows moved to another series key, marked for reconciliation"
+        );
+    }
+    Ok(changed)
 }
 
 /// Rows the last complete pass of `root` found to differ: written in
