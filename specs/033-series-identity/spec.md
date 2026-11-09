@@ -99,6 +99,12 @@ series-level user data (favourite, played):
    show users already know keeps its id;
 2. else the group with the most episodes.
 
+The choice is made once, at the folder's first split, and persisted as a
+scanner-written row in `series_overrides` (§7, `source = 'scanner'`). Later
+scans reuse it even if another group grows larger or the match goes away, so
+series state never hops between shows. A hand override (`source = 'admin'`)
+replaces it.
+
 Every other group gets the key `"{folder}\u{1f}{YYYY}"` (unit separator, which
 never occurs in a path), or `"{folder}\u{1f}none"` for an unyeared group that
 does not keep the plain key, with `series_year` set to its year.
@@ -169,8 +175,9 @@ together with its show's when the show is re-matched.
 
 #1055 folds copies that share one show folder, season and episode. With this
 design the rule becomes: copies fold only when they share the **series key**
-(after the §2 split) **and** their stated show years are equal (both absent
-counts as equal) **and**, when both rows carry a provider series id, those ids
+(after the §2 split) **and** their stated show years do not conflict (two
+different known years conflict; one known and one absent do not, since §2
+keeps an unyeared file with the yeared group) **and**, when both rows carry a provider series id, those ids
 are equal **and** the evidence does not say they are different episodes: when
 both file names carry an episode title, the titles match (similarity ≥ 0.8).
 Matching season/episode numbers alone fold only in a series that is neither
@@ -229,8 +236,15 @@ the series wire id.
    overview, premiere date, community rating, provider ids, the episode still)
    to what local evidence alone says, then enriches from the pinned match.
    Local data that passes the checks (a sidecar, an NFO that names the right
-   show) is re-read and so kept. Probe data, user data and the row id do not
-   change. In the deployed
+   show) is re-read and so kept. The episode's rows in the translations table
+   (`MetadataTranslationStore`) are deleted in the same step, so no language's
+   text from the old show survives a fetch that omits that language. Probe
+   data, user data and the row id do not change.
+
+   An episode with its own manual match (`match_source = 'manual'`) is the
+   exception to §4's pinned-show rule: repair never rebuilds it. A conflicting
+   manual match is kept and listed on the Show identity page (§7) with both
+   shows, for the admin to keep or move. In the deployed
    library that is about 176 rows (BSG 81, Flash 66, Cosmos 13, Life on Mars
    16) plus the 6 B933 rows.
 5. **Series-level state of split rows**: the 62 Flash 2014 rows get a new series
@@ -265,8 +279,9 @@ Each entry offers:
 
 Hand fixes are stored as **overrides**, never by editing the scanned rows, so
 a rescan cannot undo them: a new table `series_overrides` (path or folder,
-target series key, target name and year, who, when; migration 0074, verify
-free). The scanner applies overrides after its own split and before #1055's
+target series key, target name and year, `source` = `admin` or `scanner`,
+who, when; migration 0074, verify free). `scanner` rows only record §2's
+folder-key owner; an `admin` row always wins over one. The scanner applies overrides after its own split and before #1055's
 fold, so the fold sees the final grouping. Each change rebuilds the affected
 episodes' metadata straight away (§6 step 4) and keeps every row and its user
 data. A moved episode's own manual match (`match_source = 'manual'`, which
@@ -325,7 +340,7 @@ re-fetches, and nothing else changing match.
 | V891 | Two exact-name candidates with no folder or file year between them are decided by episode fit, never by provider order; the best guess is used and a close call is flagged for an admin. |
 | V892 | An episode's provider metadata comes only from its series' pinned match; an episode NFO id naming another series is set aside. |
 | V893 | A bare folder whose files state different show years is split by stated year; an unyeared file splits off only on its own episode-title evidence; the group holding the stored match (else the largest) keeps the folder key. |
-| V894 | Copies fold only within one series key, with equal stated show years, equal provider series ids where both are known and agreeing filename episode titles where both have one; in a flagged or split series, numbers alone never fold. |
+| V894 | Copies fold only within one series key, with no two different known stated years, equal provider series ids where both are known and agreeing filename episode titles where both have one; in a flagged or split series, numbers alone never fold. |
 | V896 | A hand fix of a show or its files is an override the scanner applies after its own split and before the copy fold; a rescan never undoes it. |
 
 ## Out of scope
