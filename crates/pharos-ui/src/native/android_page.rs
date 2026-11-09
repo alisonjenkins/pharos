@@ -1303,6 +1303,9 @@ const start = {start_s};
 if (start > 0) v.addEventListener("loadedmetadata", () => {{ v.currentTime = start; }}, {{ once: true }});
 v.setAttribute({mark}, "direct");
 v.__pharosGen = {generation};
+// Fetched with CORS (the server allows any origin), so the page's
+// visualiser can analyse the sound (B1032).
+v.crossOrigin = "anonymous";
 v.src = {url};
 "#,
             id = js_str(&id),
@@ -1473,6 +1476,98 @@ pub fn audio_tap(_media_id: &str) -> Result<Box<dyn super::visualiser::AudioTap>
     Err(NO_BROWSER.into())
 }
 
+/// The visualiser module: this crate's `pharos-tv-visualiser` bin, built to
+/// wasm with its wasm-bindgen glue by `scripts/tv-visualiser.sh`.
+const VISUALISER_JS: &str = include_str!("../../assets/generated/tv-visualiser.js");
+const VISUALISER_WASM_B64: &str = include_str!("../../assets/generated/tv-visualiser.wasm.b64");
+
+static NEXT_VISUALISER: AtomicU64 = AtomicU64::new(1);
+
+/// The music visualiser for `style`, drawn by the page (B1032, V992): this
+/// app's Rust runs outside the WebView, where the canvas and the sound are.
+/// `on_fallback` hears why it cannot draw; dropping it stops it.
+pub struct PageVisualiser {
+    id: u64,
+    listener: u64,
+}
+
+pub fn page_visualiser(style: &str, on_fallback: impl FnMut(String) + 'static) -> PageVisualiser {
+    let id = NEXT_VISUALISER.fetch_add(1, Ordering::Relaxed);
+    let listener = listen(Listener::Visualiser(id, Box::new(on_fallback)));
+    let style = style.to_owned();
+    log::info!("pharos: visualiser page run={id} style={style} action=start");
+    spawn_detached(async move {
+        let started = match load_visualiser().await {
+            Ok(()) => document::eval(&tv_page::visualiser_start_js(id, &style))
+                .join::<bool>()
+                .await
+                .map_err(|e| e.to_string()),
+            Err(e) => Err(e),
+        };
+        match started {
+            Ok(true) => log::info!("pharos: visualiser page run={id} outcome=started"),
+            Ok(false) => log::info!("pharos: visualiser page run={id} outcome=stopped_first"),
+            Err(e) => {
+                log::warn!("pharos: visualiser page run={id} outcome=failed error={e}");
+                on_bridge(Bridge::Visualiser {
+                    id,
+                    reason: crate::render::Fallback::NoWebgl2.label().to_owned(),
+                });
+            }
+        }
+    });
+    PageVisualiser { id, listener }
+}
+
+impl Drop for PageVisualiser {
+    fn drop(&mut self) {
+        unlisten(self.listener);
+        log::info!("pharos: visualiser page run={} action=stop", self.id);
+        run(tv_page::visualiser_stop_js(self.id));
+    }
+}
+
+/// Load the visualiser module into the page once; concurrent callers share
+/// the one load.
+async fn load_visualiser() -> Result<(), String> {
+    let script = format!(
+        r#"if (!window.__pharosVisLoad) {{
+  window.__pharosVisLoad = (async () => {{
+    const s = document.createElement("script");
+    s.textContent = {glue} + "
+window.__pharosVisInit = wasm_bindgen;";
+    document.head.append(s);
+    const b = atob({wasm});
+    const bytes = new Uint8Array(b.length);
+    for (let i = 0; i < b.length; i++) bytes[i] = b.charCodeAt(i);
+    await window.__pharosVisInit({{ module_or_path: bytes }});
+    window.__pharosVis = window.__pharosVisInit;
+    return true;
+  }})();
+  window.__pharosVisLoad.catch(() => {{ window.__pharosVisLoad = null; }});
+}}
+return await window.__pharosVisLoad;"#,
+        glue = js_str(VISUALISER_JS),
+        wasm = js_str(VISUALISER_WASM_B64.trim()),
+    );
+    let at = now_ms();
+    match document::eval(&script).join::<bool>().await {
+        Ok(true) => {
+            log::info!(
+                "pharos: visualiser module outcome=loaded wasm_b64_bytes={} took_ms={:.0}",
+                VISUALISER_WASM_B64.len(),
+                now_ms() - at
+            );
+            Ok(())
+        }
+        Ok(false) => Err("the visualiser module loaded nothing".into()),
+        Err(e) => {
+            log::warn!("pharos: visualiser module outcome=failed error={e}");
+            Err(format!("visualiser module: {e}"))
+        }
+    }
+}
+
 pub fn media_playing(id: &str) -> bool {
     media(id).is_some_and(|(m, _)| m.src && !m.paused)
 }
@@ -1562,6 +1657,8 @@ enum Listener {
     Tick(Box<dyn FnMut(&str)>),
     /// A directly played media element's `error`, for the element `id`.
     MediaError(String, Box<dyn FnMut(u16, String)>),
+    /// Page visualiser run `id` could not draw: the fallback's label.
+    Visualiser(u64, Box<dyn FnMut(String)>),
 }
 
 fn listen(listener: Listener) -> u64 {
@@ -1909,6 +2006,18 @@ fn on_bridge(message: Bridge) {
                     if let Listener::Hls(on, f) = &mut f.0 {
                         if *on == id {
                             f(event.clone());
+                        }
+                    }
+                }
+            }
+        }
+        Bridge::Visualiser { id, reason } => {
+            log::info!("pharos: visualiser page run={id} outcome=fallback reason={reason}");
+            for f in &listeners {
+                if let Ok(mut f) = f.try_lock() {
+                    if let Listener::Visualiser(on, f) = &mut f.0 {
+                        if *on == id {
+                            f(reason.clone());
                         }
                     }
                 }
