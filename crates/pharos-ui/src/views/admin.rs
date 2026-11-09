@@ -5,9 +5,9 @@
 //! `dioxus-ssr`.
 
 use crate::client::{
-    ActivityEntry, AdminUser, ApiKey, BrandingConfig, DamagedFile, DeepCheck, DeviceEntry,
-    DuplicateFilm, FilmVersion, IntegrityReport, IntegrityStatus, LibraryFolder, LogEntry,
-    PluginEntry, ScheduledTask, SearchHint,
+    ActivityEntry, AdminUser, ApiKey, BrandingConfig, DamageRange, DamagedFile, DeepCheck,
+    DeviceEntry, DuplicateFilm, FilmVersion, IntegrityReport, IntegrityStatus, LibraryFolder,
+    LogEntry, PluginEntry, ScheduledTask, SearchHint,
 };
 use dioxus::prelude::*;
 
@@ -1184,6 +1184,14 @@ fn IntegritySection(
                 Some(Err(e)) => rsx! { p { class: "pharos-error", "Could not list damaged files: {e}" } },
                 Some(Ok(report)) => rsx! {
                     p { class: "pharos-admin-integrity-summary", "{integrity_summary(&report.status)}" }
+                    if !report.files.is_empty() {
+                        a {
+                            class: "pharos-button pharos-admin-integrity-export",
+                            href: "{csv_data_url(&damaged_csv(&report.files))}",
+                            download: "pharos-damaged-files.csv",
+                            "Export CSV"
+                        }
+                    }
                     for f in report.files.iter() {
                         DamagedRow {
                             key: "{f.media_id}",
@@ -1221,7 +1229,14 @@ fn DamagedRow(
     let id = file.media_id.clone();
     let deep_id = file.media_id.clone();
     let can_deep = file.kind.as_deref() != Some("book");
-    let breaks = file.first_fault_ms.map(break_label);
+    let breaks = if file.ranges.is_empty() {
+        file.first_fault_ms.map(break_label)
+    } else {
+        Some(format!(
+            "Damaged at {}",
+            ranges_label(&file.ranges, ", ", 5)
+        ))
+    };
     rsx! {
         article {
             class: "pharos-admin-integrity-file",
@@ -1615,6 +1630,127 @@ fn break_label(ms: u64) -> String {
     format!("Breaks at {}", hms(ms))
 }
 
+/// `0:10:00–0:19:00` per span, a lone time for a span a packet wide, at most
+/// `max` spans then how many more.
+fn ranges_label(ranges: &[DamageRange], sep: &str, max: usize) -> String {
+    let mut parts: Vec<String> = ranges
+        .iter()
+        .take(max)
+        .map(|r| {
+            if r.end_ms / 1_000 > r.start_ms / 1_000 {
+                format!("{}–{}", hms(r.start_ms), hms(r.end_ms))
+            } else {
+                hms(r.start_ms)
+            }
+        })
+        .collect();
+    if ranges.len() > max {
+        parts.push(format!("{} more", ranges.len() - max));
+    }
+    parts.join(sep)
+}
+
+const DAMAGED_CSV_HEADER: [&str; 12] = [
+    "Title",
+    "Kind",
+    "Series",
+    "Season",
+    "Episode",
+    "Name",
+    "Path",
+    "Problem",
+    "Damaged at",
+    "Reader said",
+    "Checked (UTC)",
+    "Media id",
+];
+
+/// The damaged list as RFC 4180 CSV, one row per file, for finding each file
+/// again to re-rip or re-download it.
+pub(crate) fn damaged_csv(files: &[DamagedFile]) -> String {
+    let mut out = String::new();
+    push_csv_row(&mut out, DAMAGED_CSV_HEADER.iter().map(|h| h.to_string()));
+    for f in files {
+        let opt = |v: Option<u32>| v.map(|n| n.to_string()).unwrap_or_default();
+        let damaged_at = if f.ranges.is_empty() {
+            f.first_fault_ms.map(hms).unwrap_or_default()
+        } else {
+            ranges_label(&f.ranges, "; ", usize::MAX)
+        };
+        push_csv_row(
+            &mut out,
+            [
+                damaged_title(f),
+                kind_label(f.kind.as_deref()).to_string(),
+                f.series_name.clone().unwrap_or_default(),
+                opt(f.season_number),
+                opt(f.episode_number),
+                f.name.clone().unwrap_or_default(),
+                f.path.clone().unwrap_or_default(),
+                verdict_words(&f.verdict).to_string(),
+                damaged_at,
+                f.first_fault.clone().unwrap_or_default(),
+                f.checked_at.map(utc_label).unwrap_or_default(),
+                f.media_id.clone(),
+            ]
+            .into_iter(),
+        );
+    }
+    out
+}
+
+fn push_csv_row(out: &mut String, cells: impl Iterator<Item = String>) {
+    for (i, cell) in cells.enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str(&csv_cell(&cell));
+    }
+    out.push_str("\r\n");
+}
+
+/// Quoted when it holds a separator, quote or line break. A cell a
+/// spreadsheet would run as a formula gets a leading `'`, since file names
+/// are whatever the disk holds.
+fn csv_cell(cell: &str) -> String {
+    let guarded = if cell.starts_with(['=', '+', '-', '@', '\t', '\r']) {
+        format!("'{cell}")
+    } else {
+        cell.to_string()
+    };
+    if guarded.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", guarded.replace('"', "\"\""))
+    } else {
+        guarded
+    }
+}
+
+/// A `data:` URL a download link can carry, with a BOM so a spreadsheet
+/// opens the UTF-8 titles as UTF-8.
+fn csv_data_url(csv: &str) -> String {
+    let mut out = String::from("data:text/csv;charset=utf-8,%EF%BB%BF");
+    for b in csv.bytes() {
+        if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+/// `2026-11-09T17:35:43Z`.
+fn utc_label(secs: i64) -> String {
+    let rem = secs.rem_euclid(86_400);
+    format!(
+        "{}T{:02}:{:02}:{:02}Z",
+        date_label(secs),
+        rem / 3_600,
+        rem % 3_600 / 60,
+        rem % 60
+    )
+}
+
 fn date_label(secs: i64) -> String {
     let (y, m, d) = civil_from_days(secs.div_euclid(86_400));
     format!("{y:04}-{m:02}-{d:02}")
@@ -1715,6 +1851,97 @@ mod tests {
         assert_eq!(when_label("0001-01-01T00:00:00Z"), "—");
         assert_eq!(when_label("yesterday"), "yesterday");
         assert_eq!(when_label("2026-11-09T08:1€:00"), "2026-11-09T08:1€:00");
+    }
+
+    #[test]
+    fn the_damaged_csv_names_each_file_and_where_it_breaks() {
+        let files = vec![
+            DamagedFile {
+                media_id: "123".into(),
+                path: Some("/tv/Show, The/S01E02.mkv".into()),
+                verdict: "damaged".into(),
+                first_fault: Some("0x00 \"invalid\" byte".into()),
+                kind: Some("episode".into()),
+                name: Some("Pilot".into()),
+                series_name: Some("Show, The".into()),
+                season_number: Some(1),
+                episode_number: Some(2),
+                checked_at: Some(1_794_245_743),
+                ranges: vec![
+                    DamageRange {
+                        start_ms: 600_000,
+                        end_ms: 1_140_000,
+                    },
+                    DamageRange {
+                        start_ms: 3_723_000,
+                        end_ms: 3_723_040,
+                    },
+                ],
+                ..Default::default()
+            },
+            DamagedFile {
+                media_id: "9".into(),
+                path: Some("=HYPERLINK(\"x\").mkv".into()),
+                verdict: "short".into(),
+                first_fault_ms: Some(5_000),
+                ..Default::default()
+            },
+        ];
+        let csv = damaged_csv(&files);
+        let lines: Vec<&str> = csv.split("\r\n").collect();
+        assert_eq!(
+            lines[0],
+            "Title,Kind,Series,Season,Episode,Name,Path,Problem,Damaged at,Reader said,Checked (UTC),Media id"
+        );
+        assert!(
+            lines[1].contains(r#""/tv/Show, The/S01E02.mkv""#),
+            "a comma is quoted: {}",
+            lines[1]
+        );
+        assert!(lines[1].contains(",1,2,Pilot,"), "{}", lines[1]);
+        assert!(
+            lines[1].contains("0:10:00–0:19:00; 1:02:03"),
+            "every span, a packet-wide one as one time: {}",
+            lines[1]
+        );
+        assert!(
+            lines[1].contains(r#""0x00 ""invalid"" byte""#),
+            "{}",
+            lines[1]
+        );
+        assert!(
+            lines[1].ends_with(",2026-11-09T17:35:43Z,123"),
+            "{}",
+            lines[1]
+        );
+        assert!(
+            lines[2].contains(r#""'=HYPERLINK(""x"").mkv""#),
+            "a formula is defused: {}",
+            lines[2]
+        );
+        assert!(
+            lines[2].contains(",0:00:05,"),
+            "no spans falls back to the first fault: {}",
+            lines[2]
+        );
+        assert_eq!(lines.len(), 4, "one row per file and a final line end");
+
+        let url = csv_data_url("a,b\r\n");
+        assert_eq!(url, "data:text/csv;charset=utf-8,%EF%BB%BFa%2Cb%0D%0A");
+    }
+
+    #[test]
+    fn a_long_list_of_spans_is_cut_short_on_screen() {
+        let spans: Vec<DamageRange> = (0..8)
+            .map(|i| DamageRange {
+                start_ms: i * 60_000,
+                end_ms: i * 60_000 + 5_000,
+            })
+            .collect();
+        assert_eq!(
+            ranges_label(&spans, ", ", 2),
+            "0:00:00–0:00:05, 0:01:00–0:01:05, 6 more"
+        );
     }
 
     #[test]
@@ -2173,6 +2400,37 @@ mod tests {
             vec![],
         );
         assert_eq!(html.matches(">Deep check<").count(), 1, "{html}");
+    }
+
+    #[test]
+    fn the_damaged_tab_offers_a_csv_and_shows_each_rows_spans() {
+        let file = DamagedFile {
+            ranges: vec![DamageRange {
+                start_ms: 600_000,
+                end_ms: 1_140_000,
+            }],
+            ..damaged("1")
+        };
+        let html = render_integrity_deep(
+            deep_report(vec![file], vec![]),
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+        );
+        assert!(
+            html.contains("download=\"pharos-damaged-files.csv\""),
+            "{html}"
+        );
+        assert!(
+            html.contains("href=\"data:text/csv;charset=utf-8,"),
+            "{html}"
+        );
+        assert!(html.contains("Damaged at 0:10:00–0:19:00"), "{html}");
+
+        let none =
+            render_integrity_deep(deep_report(vec![], vec![]), vec![], vec![], vec![], vec![]);
+        assert!(!none.contains("Export CSV"), "nothing to export: {none}");
     }
 
     #[test]
