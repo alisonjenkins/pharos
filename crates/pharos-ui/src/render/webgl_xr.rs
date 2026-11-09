@@ -9,7 +9,7 @@ use web_sys::{
 };
 
 use super::stereo_quad::{FRAGMENT, VERTEX};
-use super::webgl::link;
+use super::webgl::{linear_texture, link};
 use super::Fallback;
 
 /// Two triangles covering the square from -1 to 1.
@@ -53,18 +53,7 @@ impl EyeQuads {
         gl.enable_vertex_attrib_array(at);
         gl.vertex_attrib_pointer_with_i32(at, 2, Gl::FLOAT, false, 0, 0);
         gl.bind_vertex_array(None);
-        let texture = gl
-            .create_texture()
-            .ok_or_else(|| Fallback::Shader("create texture".to_owned()))?;
-        gl.bind_texture(Gl::TEXTURE_2D, Some(&texture));
-        for (k, v) in [
-            (Gl::TEXTURE_MIN_FILTER, Gl::LINEAR),
-            (Gl::TEXTURE_MAG_FILTER, Gl::LINEAR),
-            (Gl::TEXTURE_WRAP_S, Gl::CLAMP_TO_EDGE),
-            (Gl::TEXTURE_WRAP_T, Gl::CLAMP_TO_EDGE),
-        ] {
-            gl.tex_parameteri(Gl::TEXTURE_2D, k, v as i32);
-        }
+        let texture = linear_texture(&gl)?;
         let uniform = |name: &str| gl.get_uniform_location(&program, name);
         Ok(EyeQuads {
             projection: uniform("u_projection"),
