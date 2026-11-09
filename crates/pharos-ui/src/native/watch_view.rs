@@ -6,12 +6,13 @@
 use dioxus::html::geometry::WheelDelta;
 use dioxus::html::input_data::MouseButton;
 use dioxus::prelude::*;
-use pharos_client::api::{Chapter, Item, ItemRef, Segment, Track, Trickplay};
+use pharos_client::api::{Chapter, Item, ItemRef, Segment, Stereo, Track, Trickplay};
 
 use super::keymap::{self, Mode, Transport};
 use super::keys;
 use super::quality::{self, QualityView};
 use super::scrub::{self, Scrub};
+use super::stereo::{self, ViewMode};
 
 use super::art::Art;
 use super::listen::{Icon, QueuePanel, ICON_FLOAT, ICON_PIP, ICON_QUEUE_NEXT, QUEUE_PANEL_ID};
@@ -106,6 +107,9 @@ pub struct Controls {
     pub quality: QualityView,
     /// The subtitle text size, as the Playback page keeps it.
     pub subtitle_size: SubtitleSize,
+    /// The playing version's 3D packing, and how this device shows it.
+    pub packing: Option<Stereo>,
+    pub view_mode: ViewMode,
 }
 
 /// Where playback is. Reading it with `now` in a component's body
@@ -342,6 +346,8 @@ pub enum Control {
     Quality(u64),
     /// Draw subtitles at this size (the Playback page's choice).
     SubtitleSize(SubtitleSize),
+    /// Show a packed 3D version as one eye or the whole frame.
+    ViewMode(ViewMode),
     /// Forget the cap Auto lowered itself to.
     ResetAutoQuality,
     /// Hand the video to the browser's picture-in-picture window (spec 020).
@@ -669,6 +675,11 @@ pub fn WatchView(
         .filter(|t| t.vtt_url.is_some())
         .map(|t| (text_track_id(t.index), t.clone()))
         .collect();
+    // A packed 3D version on a flat screen shows one eye (V920); everything
+    // that fits to the picture fits to that eye (V921).
+    let crop = stereo::cropped(c.packing, c.view_mode);
+    let (eye_w, eye_h) = stereo::eye_size(crop, media.video_width, media.video_height);
+    let eye_aspect = (eye_w > 0 && eye_h > 0).then(|| f64::from(eye_w) / f64::from(eye_h));
     // A list of at most one, so a new track's key mounts a new overlay.
     let image_cues: Option<String> = c
         .subtitles
@@ -694,10 +705,17 @@ pub fn WatchView(
                 },
                 // The styled subtitle renderer lays its canvas after the
                 // video, so the video sits alone where Dioxus never diffs.
-                div { class: "pharos-video-frame",
+                div {
+                    class: "pharos-video-frame",
+                    "data-packing": crop.map(stereo::packing_attr),
                     video {
                         id: VIDEO_ID,
                         class: "pharos-video",
+                        // On the video, not the frame: the frame's style
+                        // carries the JASSUB lift the player sets.
+                        style: eye_aspect
+                            .filter(|_| crop.is_some())
+                            .map(|a| format!("--pharos-eye-aspect: {a:.6}")),
                         "data-item-id": item_id.map(|id| id.to_string()),
                         autoplay,
                         playsinline: true,
@@ -749,7 +767,12 @@ pub fn WatchView(
                     }
                 }
                 for url in image_cues {
-                    ImageSubtitles { key: "{url}", url: url.clone(), media, pos }
+                    ImageSubtitles {
+                        key: "{url}",
+                        url: url.clone(),
+                        picture: (eye_w, eye_h),
+                        pos,
+                    }
                 }
                 div { class: "pharos-watch-top",
                     button {
@@ -899,6 +922,11 @@ pub fn WatchView(
                         SubtitleSizePicker {
                             show: !c.subtitles.is_empty(),
                             size: c.subtitle_size,
+                            on_pick: move |control| on_control.call(control),
+                        }
+                        ViewModePicker {
+                            show: stereo::cropped(c.packing, ViewMode::OneEye).is_some(),
+                            mode: c.view_mode,
                             on_pick: move |control| on_control.call(control),
                         }
                         QualityPicker {
@@ -1256,7 +1284,7 @@ fn TrackMode(in_group: bool, own_tracks: bool, on_change: EventHandler<bool>) ->
 /// them. The canvas box matches the picture's `object-fit: contain` box, so
 /// an anamorphic canvas stretches with the picture.
 #[component]
-fn ImageSubtitles(url: String, media: MediaState, pos: Position) -> Element {
+fn ImageSubtitles(url: String, picture: (u32, u32), pos: Position) -> Element {
     let mut cues = use_signal(ImageCues::default);
     use_future(move || {
         let url = url.clone();
@@ -1296,8 +1324,9 @@ fn ImageSubtitles(url: String, media: MediaState, pos: Position) -> Element {
     if w == 0 || h == 0 {
         return rsx! {};
     }
-    // The picture's display aspect; the canvas until the metadata is known.
-    let (aw, ah) = match (media.video_width, media.video_height) {
+    // The picture's display aspect (one eye's, while cropped); the canvas
+    // until the metadata is known.
+    let (aw, ah) = match picture {
         (0, _) | (_, 0) => (w, h),
         size => size,
     };
@@ -1389,6 +1418,36 @@ fn SubtitleSizePicker(show: bool, size: SubtitleSize, on_pick: EventHandler<Cont
                     value: "{each.as_str()}",
                     selected: each == size,
                     "Size: {each.label()}"
+                }
+            }
+        }
+    }
+}
+
+/// The 3D menu, for a packed version: one eye, or the whole frame for a 3D
+/// TV that unpacks it.
+#[component]
+fn ViewModePicker(show: bool, mode: ViewMode, on_pick: EventHandler<Control>) -> Element {
+    let wake = try_use_context::<Wake>();
+    if !show {
+        return rsx! {};
+    }
+    rsx! {
+        select {
+            class: "pharos-track-picker pharos-view-mode-picker",
+            aria_label: "3D view",
+            title: "3D view",
+            onkeydown: move |evt| menu_key(evt, wake),
+            onchange: move |evt: FormEvent| {
+                on_pick.call(Control::ViewMode(ViewMode::parse(&evt.value())));
+                platform::focus_by_id(PLAYER_ID);
+            },
+            for each in ViewMode::ALL {
+                option {
+                    key: "{each.as_str()}",
+                    value: "{each.as_str()}",
+                    selected: each == mode,
+                    "{each.label()}"
                 }
             }
         }
@@ -1713,6 +1772,37 @@ mod tests {
         }
         c.subtitles.clear();
         assert!(!render(c).contains("pharos-subtitle-size-picker"));
+    }
+
+    #[test]
+    fn a_packed_version_is_cropped_to_one_eye_unless_both_eyes_is_picked() {
+        let mut c = controls();
+        c.media.video_width = 3840;
+        c.media.video_height = 1080;
+        c.packing = Some(Stereo::FullSideBySide);
+        let html = render(c.clone());
+        assert!(html.contains(r#"data-packing="fsbs""#), "{html}");
+        // The eye is 16:9, not the frame's 32:9 (V920, V921).
+        assert!(html.contains("--pharos-eye-aspect: 1.777778"), "{html}");
+        assert!(html.contains("pharos-view-mode-picker"), "{html}");
+        c.view_mode = ViewMode::BothEyes;
+        let html = render(c.clone());
+        assert!(!html.contains("data-packing"), "{html}");
+        assert!(html.contains("pharos-view-mode-picker"), "{html}");
+    }
+
+    #[test]
+    fn a_2d_or_mvc_version_is_never_cropped_and_offers_no_3d_menu() {
+        for packing in [None, Some(Stereo::Mvc)] {
+            let mut c = controls();
+            c.packing = packing;
+            let html = render(c);
+            assert!(!html.contains("data-packing"), "{packing:?}: {html}");
+            assert!(
+                !html.contains("pharos-view-mode-picker"),
+                "{packing:?}: {html}"
+            );
+        }
     }
 
     #[test]
