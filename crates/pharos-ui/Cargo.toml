@@ -36,6 +36,13 @@ name = "pharos-ui-web"
 path = "src/bin/web.rs"
 required-features = ["web"]
 
+# The TV app page's visualiser (B1032): built to wasm by
+# `scripts/tv-visualiser.sh`, carried in the APK.
+[[bin]]
+name = "pharos-tv-visualiser"
+path = "src/bin/tv_visualiser.rs"
+required-features = ["web"]
+
 [dependencies]
 dioxus.workspace = true
 dioxus-web = { workspace = true, optional = true }
