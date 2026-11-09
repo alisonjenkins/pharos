@@ -63,17 +63,17 @@ pub fn check(path: &Path) -> std::io::Result<BookCheck> {
         .unwrap_or_default();
     if let Some(container) = ComicContainer::for_path(path) {
         return match container {
-            ComicContainer::Zip => check_zip(path).map(BookCheck::Checked),
+            ComicContainer::Zip => check_zip(path),
             ComicContainer::Tar => check_tar(path).map(BookCheck::Checked),
-            ComicContainer::SevenZ => check_7z(path).map(BookCheck::Checked),
+            ComicContainer::SevenZ => check_7z(path),
             ComicContainer::Rar => Ok(BookCheck::NotCheckable(
                 "rar archives have no reader in pharos".into(),
             )),
         };
     }
     match ext.as_str() {
-        "epub" | "zip" => check_zip(path).map(BookCheck::Checked),
-        "pdf" => check_pdf(path).map(BookCheck::Checked),
+        "epub" | "zip" => check_zip(path),
+        "pdf" => check_pdf(path),
         "mobi" | "azw" | "azw3" => check_kindle(path),
         other => Ok(BookCheck::NotCheckable(format!(
             "no integrity reader for .{other}"
@@ -114,11 +114,30 @@ impl BookIntegrity {
     }
 }
 
-fn check_zip(path: &Path) -> std::io::Result<BookIntegrity> {
+/// A zip error that says the reader here cannot decode the entry, not that the
+/// bytes are bad: encryption, or a method this build leaves out (only deflate
+/// is compiled in). Calling those damaged would send someone to re-acquire a
+/// good book.
+fn zip_not_checkable(e: &zip::result::ZipError) -> bool {
+    use zip::result::ZipError;
+    matches!(
+        e,
+        ZipError::UnsupportedArchive(_)
+            | ZipError::CompressionMethodNotSupported(_)
+            | ZipError::InvalidPassword
+    )
+}
+
+fn check_zip(path: &Path) -> std::io::Result<BookCheck> {
     let file = std::fs::File::open(path)?;
     let mut zip = match zip::ZipArchive::new(file) {
         Ok(z) => z,
-        Err(e) => return Ok(unreadable(format!("zip directory: {e}"))),
+        Err(e) if zip_not_checkable(&e) => return Ok(BookCheck::NotCheckable(format!("zip: {e}"))),
+        Err(e) => {
+            return Ok(BookCheck::Checked(unreadable(format!(
+                "zip directory: {e}"
+            ))))
+        }
     };
     let mut out = BookIntegrity {
         complete: true,
@@ -128,15 +147,36 @@ fn check_zip(path: &Path) -> std::io::Result<BookIntegrity> {
         match zip.by_index(i) {
             Ok(entry) => {
                 let name = entry.name().map(|n| n.into_owned()).unwrap_or_default();
+                // The entry opens either way; the refusal comes on read, as
+                // an I/O error indistinguishable from a bad CRC.
+                let method = entry.compression();
+                if entry.encrypted()
+                    || !matches!(
+                        method,
+                        zip::CompressionMethod::Stored | zip::CompressionMethod::Deflated
+                    )
+                {
+                    return Ok(BookCheck::NotCheckable(format!(
+                        "zip entry {name}: {method:?}{} is not readable here",
+                        if entry.encrypted() {
+                            ", encrypted,"
+                        } else {
+                            ""
+                        }
+                    )));
+                }
                 match drain(entry) {
                     Ok(()) => out.ok(),
                     Err(e) => out.fault(&name, e),
                 }
             }
+            Err(e) if zip_not_checkable(&e) => {
+                return Ok(BookCheck::NotCheckable(format!("zip entry {i}: {e}")))
+            }
             Err(e) => out.fault(&format!("entry {i}"), e),
         }
     }
-    Ok(out)
+    Ok(BookCheck::Checked(out))
 }
 
 fn check_tar(path: &Path) -> std::io::Result<BookIntegrity> {
@@ -173,11 +213,30 @@ fn check_tar(path: &Path) -> std::io::Result<BookIntegrity> {
     Ok(out)
 }
 
-fn check_7z(path: &Path) -> std::io::Result<BookIntegrity> {
+/// A 7z error that names a limit of this reader (a password, a codec left
+/// out of the build), not damage in the file.
+fn sevenz_not_checkable(e: &sevenz_rust2::Error) -> bool {
+    use sevenz_rust2::Error as E;
+    matches!(
+        e,
+        E::PasswordRequired
+            | E::MaybeBadPassword(_)
+            | E::UnsupportedCompressionMethod(_)
+            | E::Unsupported(_)
+            | E::UnsupportedVersion { .. }
+            | E::ExternalUnsupported
+            | E::MaxMemLimited { .. }
+    )
+}
+
+fn check_7z(path: &Path) -> std::io::Result<BookCheck> {
     let file = std::fs::File::open(path)?;
     let mut reader = match sevenz_rust2::ArchiveReader::new(file, sevenz_rust2::Password::empty()) {
         Ok(r) => r,
-        Err(e) => return Ok(unreadable(format!("7z header: {e}"))),
+        Err(e) if sevenz_not_checkable(&e) => {
+            return Ok(BookCheck::NotCheckable(format!("7z: {e}")))
+        }
+        Err(e) => return Ok(BookCheck::Checked(unreadable(format!("7z header: {e}")))),
     };
     let mut out = BookIntegrity {
         complete: true,
@@ -190,22 +249,44 @@ fn check_7z(path: &Path) -> std::io::Result<BookIntegrity> {
         }
         Ok(true)
     });
-    // A solid 7z block that fails mid-stream aborts the walk; the entries
-    // after it were never reached.
-    if let Err(e) = walked {
-        out.fault("7z stream", e);
+    match walked {
+        Ok(()) => {}
+        Err(e) if sevenz_not_checkable(&e) => {
+            return Ok(BookCheck::NotCheckable(format!("7z: {e}")))
+        }
+        // A solid 7z block that fails mid-stream aborts the walk; the entries
+        // after it were never reached.
+        Err(e) => out.fault("7z stream", e),
     }
-    Ok(out)
+    Ok(BookCheck::Checked(out))
 }
 
-fn check_pdf(path: &Path) -> std::io::Result<BookIntegrity> {
+/// The largest PDF the check loads. lopdf reads the whole document into
+/// memory, and a scanned book past this is better left unchecked than allowed
+/// to push the server toward its memory limit.
+pub const MAX_PDF_BYTES: u64 = 512 * 1024 * 1024;
+
+fn check_pdf(path: &Path) -> std::io::Result<BookCheck> {
     // Open first, so a missing file is a storage error and not a verdict.
-    std::fs::File::open(path)?;
+    let size = std::fs::File::open(path)?.metadata()?.len();
+    if size > MAX_PDF_BYTES {
+        return Ok(BookCheck::NotCheckable(format!(
+            "{size} bytes is over the {MAX_PDF_BYTES}-byte limit for a PDF check"
+        )));
+    }
     let doc = match lopdf::Document::load(path) {
         Ok(d) => d,
-        Err(e) => return Ok(unreadable(format!("pdf structure: {e}"))),
+        Err(e) => {
+            return Ok(BookCheck::Checked(unreadable(format!(
+                "pdf structure: {e}"
+            ))))
+        }
     };
-    let encrypted = doc.is_encrypted();
+    // Its streams are ciphertext until decrypted, so inflating them proves
+    // nothing, and passing every page unread would call it clean.
+    if doc.is_encrypted() {
+        return Ok(BookCheck::NotCheckable("encrypted PDF".into()));
+    }
     let mut out = BookIntegrity {
         complete: true,
         ..Default::default()
@@ -219,12 +300,6 @@ fn check_pdf(path: &Path) -> std::io::Result<BookIntegrity> {
                         .get_object(id)
                         .and_then(lopdf::Object::as_stream)
                         .map_err(|e| e.to_string())?;
-                    // Encrypted streams are ciphertext until lopdf decrypts them,
-                    // and lopdf decrypts lazily; inflating them raw would call
-                    // every encrypted PDF damaged.
-                    if encrypted {
-                        return Ok(());
-                    }
                     let first = stream.filters().ok().and_then(|f| f.first().copied());
                     if first == Some(b"FlateDecode".as_slice()) {
                         inflate(&stream.content).map_err(|e| format!("FlateDecode: {e}"))?;
@@ -236,7 +311,7 @@ fn check_pdf(path: &Path) -> std::io::Result<BookIntegrity> {
             Err(e) => out.fault(&format!("page {number}"), e),
         }
     }
-    Ok(out)
+    Ok(BookCheck::Checked(out))
 }
 
 /// Inflate a zlib stream to nowhere. Streaming into a sink, so a decompression
@@ -258,8 +333,11 @@ fn check_kindle(path: &Path) -> std::io::Result<BookCheck> {
             ..Default::default()
         }),
         Err(KindleError::Drm(d)) => BookCheck::NotCheckable(format!("DRM-protected: {d}")),
+        // The file opened a moment ago, so an I/O error inside boko is a
+        // short read of its records (a truncated file), not the storage.
+        // Returning `Err` would retry it every pass without ever listing it.
         Err(KindleError::Unopenable(d)) => {
-            return Err(std::io::Error::other(format!("unopenable: {d}")))
+            BookCheck::Checked(unreadable(format!("read failed: {d}")))
         }
         Err(KindleError::Malformed(d)) => BookCheck::Checked(unreadable(format!("malformed: {d}"))),
         // An export failure can be a gap in the converter as easily as damage
@@ -411,6 +489,38 @@ mod tests {
         };
         assert_eq!(r.faults, 0, "{r:?}");
         assert!(r.parts >= 1);
+    }
+
+    #[test]
+    fn a_zip_this_build_cannot_decode_is_not_checkable_rather_than_damaged() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("book.cbz");
+        write_zip(&path, &[("001.jpg", PAGE)], zip::CompressionMethod::Stored);
+        // Rewrite the method field (stored = 0) in both the local header and
+        // the central directory to 12 (bzip2), which this build leaves out.
+        let mut bytes = std::fs::read(&path).unwrap();
+        for sig in [&b"PK\x03\x04"[..], &b"PK\x01\x02"[..]] {
+            let at = bytes.windows(4).position(|w| w == sig).unwrap();
+            let method = at + if sig[2] == 3 { 8 } else { 10 };
+            bytes[method] = 12;
+        }
+        std::fs::write(&path, bytes).unwrap();
+        assert!(
+            matches!(check(&path).unwrap(), BookCheck::NotCheckable(_)),
+            "an unsupported method is a limit of this reader, not damage"
+        );
+    }
+
+    #[test]
+    fn a_truncated_kindle_file_is_unreadable_not_retried_forever() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("book.azw3");
+        std::fs::write(&path, b"BOOKMOBI").unwrap();
+        match check(&path) {
+            Ok(BookCheck::Checked(r)) => assert!(r.faults > 0, "{r:?}"),
+            Ok(BookCheck::NotCheckable(why)) => panic!("an 8-byte azw3 is not intact: {why}"),
+            Err(e) => panic!("an opened file must get a verdict, not a retry: {e}"),
+        }
     }
 
     #[test]
