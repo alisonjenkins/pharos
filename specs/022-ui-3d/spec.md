@@ -2,9 +2,11 @@
 
 **Feature directory**: `specs/022-ui-3d/`
 **Created**: 2026-11-03T23:45:00Z
-**Status**: in progress. US1 shipped in #1055 (B770, V720, V722). US2, US3
-and US4 remain; the 2026-11-09 amendment below renumbers their ids and adds
-Android TV.
+**Status**: in progress (audited 2026-11-09). US1 shipped in #1055 (B770, V720, V722).
+US2 (flat eye crop, ce3609cd, d7051088, 1b97a31d) and US3 (WebXR, 8d8af2f6,
+e358962d, ADR-0088) are on main; the headset-only checks were not verifiable
+here. US4 (Android TV on the G08) is open. The 2026-11-09 amendment below
+renumbers their ids and adds Android TV.
 **Input**: "We also need support for 3D movies" (Alison, 2026-11-03). The
 headsets in use are a Meta Quest and a Steam Frame. "Also we need to implement
 3d support still" (Alison, 2026-11-09): 3D files must play in 3D, not only be

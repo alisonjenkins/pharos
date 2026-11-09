@@ -66,7 +66,7 @@ are ready.
    `localStorage`. Guards: Dioxus render tests; a Playwright case over a
    seeded half-SBS fixture.
 3. **Flat-screen eye crop (US2, FR-005, FR-010, FR-011, FR-013)**, about 1
-   day. Amended 2026-11-09 with the spec's ids. `native/stereo.rs` gains
+   day. Done (audited 2026-11-09: d7051088, ce3609cd, 1b97a31d). Amended 2026-11-09 with the spec's ids. `native/stereo.rs` gains
    `Eye` geometry (V921: the eye's rect in the frame and its picture size,
    unit-tested over all five packings) and `ViewMode` (`OneEye` default,
    `BothEyes`, stored under `pharos.player.stereo`, V922). The watch page sets
@@ -78,7 +78,7 @@ are ready.
    player's settings menu. The spec amendment and baseline rows (B960, B961,
    V920 to V922) land here. Guards: unit tests; the V920 Playwright case over
    seeded half-SBS and full-SBS fixtures measuring the drawn picture.
-4. **WebXR stereo (US3, FR-007, FR-008, V923)**, about 1.5 days. As built
+4. **WebXR stereo (US3, FR-007, FR-008, V923)**, about 1.5 days. Done on main (8d8af2f6, e358962d, a34ce530, ADR-0088); Quest hand check not recorded. As built
    (2026-11-09): the layers path via `js_sys::Reflect` in `xr_web.rs`, then
    the WebGL fallback as a follow-up PR (`render/stereo_quad.rs`,
    `render/webgl_xr.rs`; `layers` is an optional feature); outcomes are
@@ -94,7 +94,7 @@ are ready.
    events. Guards: unit tests of the layout mapping and the fallback's per-eye
    UV rects; a Playwright check that the button is absent without WebXR; a
    manual Quest check, with exact steps, recorded in the PR.
-5. **Android TV (US4, FR-012)**, about half a day, after #1002 merges. The
+5. **Android TV (US4, FR-012)**, about half a day, after #1002 merges. Not started (audited 2026-11-09; #1002 still open). The
    TV shares the watch page, so the crop should need no TV code; this PR
    checks it on the G08 (dropped frames against the 2D version), adds the
    mode row to the TV's settings if the shared menu does not reach it, and
