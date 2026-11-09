@@ -154,7 +154,7 @@ floating player plays the new title there, as any play does (spec 020 FR-001)
 ## Progress (audited 2026-11-09)
 
 - US1 start or join a group: done (tasks T001-T013, T043, T049-T051; native Group/Membership in `crates/pharos-server/src/api/pharos/rpc/group.rs`, UI in `crates/pharos-ui/src/native/together*.rs`).
-- US2 in-group experience: partial (T014, T024, T025, T026, T041; chat and reactions deferred to their own plan, not in the native `Group` interface; the group queue (members add and reorder items, vote-skip) is also deferred per plan.md and is remaining P1 work).
+- US2 in-group experience: partial (T014, T024, T025, T026, T041; chat and reactions deferred to their own plan, not in the native `Group` interface; the group queue (members add and reorder items, vote-skip) is also deferred per plan.md and is remaining P1 work; the member strip shows names and buffering only, with no per-member avatar or drift indicator (`together.rs` `Member` has no such fields)).
 - US3 remote control other sessions: not started on the native API (no remote-control interface in `pharos.capnp`; only the legacy `views/remote.rs` stub over `/Sessions/...`); no task exists.
 - US4 watch a URL: not started in pharos-ui (no remote-items call in `crates/pharos-ui/src/native`); no task exists.
 - US5 group-aware everywhere: partial (Together page lists groups; no card badge / "Join group" on detail verified); no task exists.
