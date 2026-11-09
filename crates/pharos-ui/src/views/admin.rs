@@ -62,6 +62,20 @@ pub enum AdminAction {
     DeepSearch {
         term: String,
     },
+    /// The Metadata tab's search box changed.
+    MetadataSearch {
+        term: String,
+    },
+    /// Load the editable metadata of a search hit (an item or a show id).
+    MetadataOpen {
+        id: String,
+    },
+    /// Write the changed fields and hand the `unlock` fields back to the scanner.
+    MetadataSave {
+        id: String,
+        fields: Vec<(String, serde_json::Value)>,
+        unlock: Vec<String>,
+    },
     LibraryRefresh,
     Refresh,
     SelectTab(AdminTab),
@@ -157,6 +171,7 @@ pub enum AdminTab {
     Duplicates,
     Integrity,
     ShowIdentity,
+    Metadata,
     Devices,
     Activity,
     ScheduledTasks,
@@ -174,6 +189,7 @@ impl AdminTab {
             Self::Duplicates => "Duplicates",
             Self::Integrity => "Damaged files",
             Self::ShowIdentity => "Show identity",
+            Self::Metadata => "Metadata",
             Self::Devices => "Devices",
             Self::Activity => "Activity",
             Self::ScheduledTasks => "Tasks",
@@ -190,6 +206,7 @@ impl AdminTab {
             Self::Duplicates => "duplicates",
             Self::Integrity => "integrity",
             Self::ShowIdentity => "showidentity",
+            Self::Metadata => "metadata",
             Self::Devices => "devices",
             Self::Activity => "activity",
             Self::ScheduledTasks => "scheduledtasks",
@@ -209,6 +226,7 @@ impl AdminTab {
             Self::ShowIdentity => {
                 "Folders split into several shows, matches to check, and the fixes made by hand."
             }
+            Self::Metadata => "Fix a title, year, rating or description the scanner got wrong.",
             Self::Devices => "Every app and device that has signed in.",
             Self::Activity => "Recent sign-ins, playback and server events.",
             Self::ScheduledTasks => "Jobs the server runs on its own.",
@@ -226,6 +244,7 @@ impl AdminTab {
             Self::Duplicates => "M8 8h12v12H8zM4 16V4h12",
             Self::Integrity => "M12 3l9 16H3zM12 10v4M12 17v.5",
             Self::ShowIdentity => "M4 5h16v11H4zM8 20h8M12 16v4M9 10l2 2l4-4",
+            Self::Metadata => "M4 6h16M4 12h10M4 18h7M17 14l3 3l-3 3",
             Self::Devices => "M3 5h18v12H3zM8 21h8M12 17v4",
             Self::Activity => "M3 12h4l3-8 4 16 3-8h4",
             Self::ScheduledTasks => "M12 21a9 9 0 1 0 0-18a9 9 0 0 0 0 18zM12 7v5l3 2",
@@ -235,13 +254,14 @@ impl AdminTab {
             Self::Branding => "M4 20l4-1L19 8l-3-3L5 16zM14 7l3 3",
         }
     }
-    pub fn all() -> [AdminTab; 12] {
+    pub fn all() -> [AdminTab; 13] {
         [
             Self::Users,
             Self::Libraries,
             Self::Duplicates,
             Self::Integrity,
             Self::ShowIdentity,
+            Self::Metadata,
             Self::Devices,
             Self::Activity,
             Self::ScheduledTasks,
@@ -323,6 +343,12 @@ pub struct AdminViewProps {
     /// The device whose sound formats are being saved; its toggles wait.
     #[props(default)]
     pub device_saving: Option<String>,
+    /// The Metadata tab's search box and its hits.
+    #[props(default)]
+    pub metadata_search: DeepSearchState,
+    /// The item open in the Metadata tab's form.
+    #[props(default)]
+    pub metadata: MetadataState,
 }
 
 /// What the pick form shows for the group or match it was opened on.
@@ -349,6 +375,21 @@ pub struct DeepSearchState {
     pub query: String,
     pub hits: Vec<SearchHint>,
     pub loading: bool,
+    pub error: Option<String>,
+}
+
+/// What the Metadata tab's form shows around the item being edited.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct MetadataState {
+    /// The hit whose metadata is being loaded.
+    pub opening: Option<String>,
+    pub open: Option<ItemMetadata>,
+    /// Bumped whenever `open` is replaced, so the form starts from the new values.
+    pub rev: u32,
+    pub saving: bool,
+    /// (field, reason) the server refused on the last save.
+    pub refusals: Vec<(String, String)>,
+    /// Why the item could not be opened.
     pub error: Option<String>,
 }
 
@@ -467,6 +508,13 @@ pub fn AdminView(props: AdminViewProps) -> Element {
                                 identity: props.series_identity.clone(),
                                 search: props.identity_search.clone(),
                                 prompt: props.identity_prompt.clone(),
+                                on_action,
+                            }
+                        },
+                        AdminTab::Metadata => rsx! {
+                            MetadataSection {
+                                search: props.metadata_search.clone(),
+                                state: props.metadata.clone(),
                                 on_action,
                             }
                         },
@@ -2167,6 +2215,354 @@ fn DeepHitRow(
     }
 }
 
+/// Most hits the Metadata box offers at once.
+const METADATA_SEARCH_LIMIT: usize = 8;
+
+/// Hits with metadata to edit: films, episodes, shows, songs and books, never
+/// folders or collections.
+fn metadata_candidates(hits: &[SearchHint]) -> Vec<&SearchHint> {
+    hits.iter()
+        .filter(|h| {
+            matches!(
+                h.media_type.as_str(),
+                "Movie" | "Episode" | "Series" | "Audio" | "Book"
+            )
+        })
+        .take(METADATA_SEARCH_LIMIT)
+        .collect()
+}
+
+#[component]
+fn MetadataSection(
+    search: DeepSearchState,
+    state: MetadataState,
+    on_action: EventHandler<AdminAction>,
+) -> Element {
+    let hits = metadata_candidates(&search.hits);
+    let form_key = state
+        .open
+        .as_ref()
+        .map(|m| format!("{}-{}", m.id, state.rev));
+    rsx! {
+        section {
+            class: "pharos-manage-stack pharos-admin-section-metadata",
+            div {
+                class: "pharos-admin-metadata-search",
+                label {
+                    "Find a title"
+                    input {
+                        class: "pharos-admin-metadata-search-input",
+                        r#type: "search",
+                        placeholder: "Part of a title",
+                        autocomplete: "off",
+                        value: "{search.query}",
+                        oninput: move |ev| on_action.call(AdminAction::MetadataSearch { term: ev.value() }),
+                    }
+                }
+                if search.loading {
+                    p { class: "pharos-loading", "Searching…" }
+                } else if let Some(e) = search.error.as_deref() {
+                    p { class: "pharos-error", "Could not search: {e}" }
+                } else if !search.query.trim().is_empty() && hits.is_empty() {
+                    p {
+                        class: "pharos-admin-metadata-empty",
+                        "No films, episodes, shows, songs or books match."
+                    }
+                }
+                ul {
+                    class: "pharos-admin-metadata-hits",
+                    for h in hits {
+                        MetadataHitRow {
+                            key: "{h.id}",
+                            hit: h.clone(),
+                            opening: state.opening.as_deref() == Some(h.id.as_str()),
+                            on_action: on_action,
+                        }
+                    }
+                }
+            }
+            if state.opening.is_some() {
+                p { class: "pharos-loading", "Opening…" }
+            }
+            if let Some(e) = state.error.as_deref() {
+                p { class: "pharos-error", "Could not open it: {e}" }
+            }
+            if let (Some(meta), Some(key)) = (state.open.clone(), form_key) {
+                MetadataForm {
+                    key: "{key}",
+                    meta,
+                    refusals: state.refusals.clone(),
+                    saving: state.saving,
+                    on_action: on_action,
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn MetadataHitRow(hit: SearchHint, opening: bool, on_action: EventHandler<AdminAction>) -> Element {
+    let id = hit.id.clone();
+    rsx! {
+        li {
+            class: "pharos-admin-metadata-hit",
+            span { class: "pharos-admin-integrity-kind", "{hit.media_type} · " }
+            span { "{hit.name}" }
+            button {
+                r#type: "button",
+                class: "pharos-admin-metadata-open",
+                aria_label: "Edit {hit.name}",
+                disabled: opening,
+                onclick: move |_| on_action.call(AdminAction::MetadataOpen { id: id.clone() }),
+                "Edit"
+            }
+        }
+    }
+}
+
+/// The reason to show beside `field`: the form's own check first, then the
+/// server's refusal.
+fn field_error(
+    local: &[(String, String)],
+    refused: &[(String, String)],
+    field: &str,
+) -> Option<String> {
+    local
+        .iter()
+        .chain(refused)
+        .find(|(f, _)| f == field)
+        .map(|(_, reason)| reason.clone())
+}
+
+#[component]
+fn MetadataForm(
+    meta: ItemMetadata,
+    refusals: Vec<(String, String)>,
+    saving: bool,
+    on_action: EventHandler<AdminAction>,
+) -> Element {
+    let mut drafts = use_signal({
+        let meta = meta.clone();
+        move || {
+            meta.editable
+                .iter()
+                .map(|f| (f.clone(), metadata_draft(&meta, f)))
+                .collect::<Vec<_>>()
+        }
+    });
+    let mut unlocks = use_signal(Vec::<String>::new);
+    let mut local_errors = use_signal(Vec::<(String, String)>::new);
+    let mut unchanged = use_signal(|| false);
+    let planned = meta.clone();
+    let rest: Vec<(String, String)> = refusals
+        .iter()
+        .filter(|(f, _)| !meta.editable.contains(f))
+        .cloned()
+        .collect();
+    rsx! {
+        form {
+            class: "pharos-admin-metadata-form pharos-manage-form-card",
+            novalidate: true,
+            onsubmit: move |ev: FormEvent| {
+                ev.prevent_default();
+                match plan_metadata_save(&planned, &drafts.read(), &unlocks.read()) {
+                    Err(errors) => {
+                        unchanged.set(false);
+                        local_errors.set(errors);
+                    }
+                    Ok(save) if save.is_empty() => {
+                        local_errors.set(Vec::new());
+                        unchanged.set(true);
+                    }
+                    Ok(save) => {
+                        local_errors.set(Vec::new());
+                        unchanged.set(false);
+                        on_action.call(AdminAction::MetadataSave {
+                            id: planned.id.clone(),
+                            fields: save.fields,
+                            unlock: save.unlock,
+                        });
+                    }
+                }
+            },
+            h4 {
+                "{meta.name}"
+                span { class: "pharos-admin-integrity-kind", " · {meta.kind}" }
+            }
+            for (field, reason) in rest {
+                p { class: "pharos-error", "{field}: {reason}" }
+            }
+            // Disabled while saving: the answer resets the form, so an edit
+            // typed meanwhile would be lost.
+            fieldset {
+                class: "pharos-admin-metadata-fields",
+                disabled: saving,
+            for field in meta.editable.iter().cloned() {
+                MetadataField {
+                    key: "{field}",
+                    name: field.clone(),
+                    locked: meta.is_locked(&field),
+                    value: drafts
+                        .read()
+                        .iter()
+                        .find(|(f, _)| *f == field)
+                        .map(|(_, v)| v.clone())
+                        .unwrap_or_default(),
+                    unlocking: unlocks.read().contains(&field),
+                    error: field_error(&local_errors.read(), &refusals, &field),
+                    on_input: {
+                        let field = field.clone();
+                        move |text: String| {
+                            for d in drafts.write().iter_mut().filter(|(f, _)| *f == field) {
+                                d.1 = text.clone();
+                            }
+                        }
+                    },
+                    on_toggle_unlock: {
+                        let field = field.clone();
+                        move |_| {
+                            let mut list = unlocks.write();
+                            if let Some(i) = list.iter().position(|f| *f == field) {
+                                list.remove(i);
+                            } else {
+                                list.push(field.clone());
+                            }
+                        }
+                    },
+                }
+            }
+            }
+            div { class: "pharos-manage-card-actions",
+                button {
+                    r#type: "submit",
+                    class: "pharos-admin-metadata-save",
+                    disabled: saving,
+                    if saving { "Saving…" } else { "Save" }
+                }
+                if unchanged() {
+                    span { class: "pharos-admin-metadata-unchanged", role: "status", "Nothing has changed." }
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn MetadataField(
+    name: String,
+    locked: bool,
+    value: String,
+    unlocking: bool,
+    error: Option<String>,
+    on_input: EventHandler<String>,
+    on_toggle_unlock: EventHandler<()>,
+) -> Element {
+    let input_id = format!("metadata-{name}");
+    let error_id = format!("metadata-{name}-error");
+    let label = field_label(&name).to_string();
+    let invalid = error.is_some().then_some("true");
+    let described_by = error.is_some().then(|| error_id.clone());
+    let kind = field_kind(&name);
+    rsx! {
+        div {
+            class: "pharos-admin-metadata-field",
+            "data-field": "{name}",
+            "data-locked": "{locked}",
+            label {
+                r#for: "{input_id}",
+                "{label}"
+                if locked {
+                    span { class: "pharos-admin-metadata-locked", " Locked" }
+                }
+            }
+            match kind {
+                FieldKind::Long => rsx! {
+                    textarea {
+                        id: "{input_id}",
+                        rows: "5",
+                        aria_invalid: invalid,
+                        aria_describedby: described_by.clone(),
+                        value: "{value}",
+                        oninput: move |ev| on_input.call(ev.value()),
+                    }
+                },
+                FieldKind::Year => rsx! {
+                    input {
+                        id: "{input_id}",
+                        r#type: "number",
+                        step: "1",
+                        min: "{YEAR_MIN}",
+                        max: "{YEAR_MAX}",
+                        aria_invalid: invalid,
+                        aria_describedby: described_by.clone(),
+                        value: "{value}",
+                        oninput: move |ev| on_input.call(ev.value()),
+                    }
+                },
+                FieldKind::Rating => rsx! {
+                    input {
+                        id: "{input_id}",
+                        r#type: "number",
+                        step: "any",
+                        min: "0",
+                        max: if name == "CriticRating" { "100" } else { "10" },
+                        aria_invalid: invalid,
+                        aria_describedby: described_by.clone(),
+                        value: "{value}",
+                        oninput: move |ev| on_input.call(ev.value()),
+                    }
+                },
+                FieldKind::Date => rsx! {
+                    input {
+                        id: "{input_id}",
+                        r#type: "date",
+                        aria_invalid: invalid,
+                        aria_describedby: described_by.clone(),
+                        value: "{value}",
+                        oninput: move |ev| on_input.call(ev.value()),
+                    }
+                },
+                FieldKind::List => rsx! {
+                    input {
+                        id: "{input_id}",
+                        r#type: "text",
+                        placeholder: "Comma-separated",
+                        aria_invalid: invalid,
+                        aria_describedby: described_by.clone(),
+                        value: "{value}",
+                        oninput: move |ev| on_input.call(ev.value()),
+                    }
+                },
+                FieldKind::Text => rsx! {
+                    input {
+                        id: "{input_id}",
+                        r#type: "text",
+                        aria_invalid: invalid,
+                        aria_describedby: described_by.clone(),
+                        value: "{value}",
+                        oninput: move |ev| on_input.call(ev.value()),
+                    }
+                },
+            }
+            if locked {
+                button {
+                    r#type: "button",
+                    class: "pharos-admin-metadata-unlock",
+                    aria_pressed: "{unlocking}",
+                    onclick: move |_| on_toggle_unlock.call(()),
+                    if unlocking { "Keep locked" } else { "Unlock" }
+                }
+                if unlocking {
+                    span { class: "pharos-admin-metadata-unlock-note", "Handed back to the scanner on save." }
+                }
+            }
+            if let Some(e) = error {
+                p { class: "pharos-error", id: "{error_id}", "{e}" }
+            }
+        }
+    }
+}
+
 /// The deep results, empty when the server could not list them.
 fn deep_list(report: &IntegrityReport) -> &[DeepCheck] {
     report.deep_checks.as_ref().map_or(&[], Vec::as_slice)
@@ -3236,6 +3632,208 @@ mod tests {
         );
     }
 
+    fn render_metadata(search: DeepSearchState, state: MetadataState) -> String {
+        let mut dom = VirtualDom::new_with_props(
+            |(search, state): (DeepSearchState, MetadataState)| {
+                rsx! {
+                    MetadataSection { search, state, on_action: |_| {} }
+                }
+            },
+            (search, state),
+        );
+        dom.rebuild_in_place();
+        dioxus_ssr::render(&dom)
+    }
+
+    fn open_state(meta: ItemMetadata) -> MetadataState {
+        MetadataState {
+            open: Some(meta),
+            ..MetadataState::default()
+        }
+    }
+
+    #[test]
+    fn the_metadata_tab_renders_the_search_box() {
+        let html = render_tab(AdminTab::Metadata, false);
+        assert!(html.contains("Find a title"), "{html}");
+        assert!(
+            html.contains("pharos-admin-metadata-search-input"),
+            "{html}"
+        );
+        assert!(!html.contains("<form"), "no item is open yet: {html}");
+    }
+
+    #[test]
+    fn the_metadata_search_offers_editable_kinds_only_with_an_edit_button() {
+        let html = render_metadata(
+            DeepSearchState {
+                query: "al".into(),
+                hits: vec![
+                    hit("1", "Alien", "Movie"),
+                    hit("2", "Alias", "Series"),
+                    hit("3", "Al Song", "Audio"),
+                    hit("4", "Al Book", "Book"),
+                    hit("5", "Al Pilot", "Episode"),
+                    hit("6", "Al Folder", "Folder"),
+                ],
+                ..DeepSearchState::default()
+            },
+            MetadataState::default(),
+        );
+        for name in ["Alien", "Alias", "Al Song", "Al Book", "Al Pilot"] {
+            assert!(html.contains(name), "{name}: {html}");
+        }
+        assert!(!html.contains("Al Folder"), "{html}");
+        assert_eq!(html.matches(">Edit<").count(), 5, "{html}");
+    }
+
+    #[test]
+    fn the_metadata_search_says_when_nothing_matches() {
+        let html = render_metadata(
+            DeepSearchState {
+                query: "zzz".into(),
+                hits: vec![hit("6", "Zzz Folder", "Folder")],
+                ..DeepSearchState::default()
+            },
+            MetadataState::default(),
+        );
+        assert!(html.contains("No films, episodes, shows"), "{html}");
+    }
+
+    #[test]
+    fn the_form_has_a_labelled_input_for_every_editable_field() {
+        let html = render_metadata(DeepSearchState::default(), open_state(alien()));
+        for f in alien().editable {
+            assert!(
+                html.contains(&format!("id=\"metadata-{f}\"")),
+                "{f}: {html}"
+            );
+            assert!(
+                html.contains(&format!("for=\"metadata-{f}\"")),
+                "{f}: {html}"
+            );
+        }
+        assert!(
+            html.contains("<textarea rows=\"5\" id=\"metadata-Overview\""),
+            "{html}"
+        );
+        assert!(html.contains("Production year"), "{html}");
+        assert!(html.contains("type=\"date\""), "{html}");
+        assert_eq!(html.matches("type=\"number\"").count(), 3, "{html}");
+        assert!(html.contains(">Save<"), "{html}");
+    }
+
+    #[test]
+    fn locked_fields_carry_a_marker_and_an_unlock_button() {
+        let html = render_metadata(DeepSearchState::default(), open_state(alien()));
+        assert_eq!(
+            html.matches("pharos-admin-metadata-locked").count(),
+            1,
+            "{html}"
+        );
+        assert_eq!(html.matches(">Unlock<").count(), 1, "{html}");
+        let overview = html.split("data-field=\"Overview\"").nth(1).unwrap();
+        let overview = overview.split("data-field=\"Tagline\"").next().unwrap();
+        assert!(
+            overview.contains(" Locked") && overview.contains(">Unlock<"),
+            "{overview}"
+        );
+    }
+
+    #[test]
+    fn a_show_form_has_the_show_fields_and_a_genres_list_input() {
+        let show = ItemMetadata {
+            target: "series".into(),
+            kind: "Series".into(),
+            name: "Show".into(),
+            fields: serde_json::from_value(serde_json::json!({
+                "Overview": "x", "Genres": ["Drama", "Sci-Fi"]
+            }))
+            .unwrap(),
+            editable: [
+                "Overview",
+                "PremiereDate",
+                "OfficialRating",
+                "CommunityRating",
+                "Genres",
+            ]
+            .map(String::from)
+            .to_vec(),
+            locked: vec![],
+            ..alien()
+        };
+        let html = render_metadata(DeepSearchState::default(), open_state(show));
+        assert!(html.contains("id=\"metadata-Genres\""), "{html}");
+        assert!(html.contains("Drama, Sci-Fi"), "{html}");
+        assert!(!html.contains("id=\"metadata-Title\""), "{html}");
+        assert!(!html.contains(">Unlock<"), "{html}");
+    }
+
+    #[test]
+    fn a_refusal_shows_its_reason_beside_the_named_field() {
+        let reason = "ProductionYear 19999 is outside 1850..=2200";
+        let html = render_metadata(
+            DeepSearchState::default(),
+            MetadataState {
+                refusals: vec![("ProductionYear".into(), reason.into())],
+                ..open_state(alien())
+            },
+        );
+        let year = html.split("data-field=\"ProductionYear\"").nth(1).unwrap();
+        let year = year.split("data-field=\"PremiereDate\"").next().unwrap();
+        assert!(year.contains(reason), "{html}");
+        assert!(year.contains("aria-invalid=\"true\""), "{html}");
+        assert_eq!(html.matches(reason).count(), 1, "{html}");
+    }
+
+    #[test]
+    fn a_refusal_for_an_unknown_field_still_shows() {
+        let html = render_metadata(
+            DeepSearchState::default(),
+            MetadataState {
+                refusals: vec![("Rank".into(), "Rank is not editable".into())],
+                ..open_state(alien())
+            },
+        );
+        assert!(html.contains("Rank: Rank is not editable"), "{html}");
+    }
+
+    #[test]
+    fn the_save_button_says_when_a_save_is_running() {
+        let html = render_metadata(
+            DeepSearchState::default(),
+            MetadataState {
+                saving: true,
+                ..open_state(alien())
+            },
+        );
+        assert!(html.contains("Saving…"), "{html}");
+        assert!(html.contains("disabled"), "{html}");
+        assert!(
+            html.contains(r#"<fieldset class="pharos-admin-metadata-fields" disabled"#),
+            "the fields are locked while the save runs: {html}"
+        );
+        let idle = render_metadata(DeepSearchState::default(), open_state(alien()));
+        assert!(
+            !idle.contains("<fieldset class=\"pharos-admin-metadata-fields\" disabled"),
+            "{idle}"
+        );
+    }
+
+    #[test]
+    fn opening_and_open_errors_are_said() {
+        let html = render_metadata(
+            DeepSearchState::default(),
+            MetadataState {
+                opening: Some("1".into()),
+                error: Some("no such item".into()),
+                ..MetadataState::default()
+            },
+        );
+        assert!(html.contains("Opening…"), "{html}");
+        assert!(html.contains("Could not open it: no such item"), "{html}");
+    }
+
     /// The page on `tab`, `loading` or not, as HTML.
     fn render_tab(tab: AdminTab, loading: bool) -> String {
         let mut dom = VirtualDom::new_with_props(
@@ -3325,9 +3923,12 @@ mod tests {
         assert_eq!(AdminTab::Integrity.class_suffix(), "integrity");
         assert_eq!(AdminTab::ShowIdentity.label(), "Show identity");
         assert_eq!(AdminTab::ShowIdentity.class_suffix(), "showidentity");
-        assert_eq!(AdminTab::all().len(), 12);
+        assert_eq!(AdminTab::all().len(), 13);
         assert_eq!(AdminTab::all()[3], AdminTab::Integrity);
         assert_eq!(AdminTab::all()[4], AdminTab::ShowIdentity);
+        assert_eq!(AdminTab::Metadata.label(), "Metadata");
+        assert_eq!(AdminTab::Metadata.class_suffix(), "metadata");
+        assert_eq!(AdminTab::all()[5], AdminTab::Metadata);
     }
 
     fn version(id: &str, width: u32, height: u32) -> FilmVersion {
