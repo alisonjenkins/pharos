@@ -10,6 +10,7 @@ pub mod api;
 #[cfg(target_arch = "wasm32")]
 pub mod browser;
 pub mod byte_stream;
+pub mod events;
 pub mod group;
 pub mod mix;
 
