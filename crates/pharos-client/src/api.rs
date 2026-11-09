@@ -10,10 +10,10 @@ use pharos_api::pharos_capnp::{
     avatar_result, capabilities, decision_result, detail_result, done, home_result, index_result,
     item_id, item_query, item_summary, items_result, library, lyrics_result, me_result,
     media_token_result, negotiate_result, opt_u16, opt_u32, playback, playback_grant, pref_result,
-    prefs, session, start_tracks_result, stream_choice, telemetry, track, user_data,
-    user_state_result, BookFormat as WireBookFormat, CreditKind as WireCreditKind, Kind,
-    LibraryKind as WireLibraryKind, SegmentKind as WireSegmentKind, Stereo3d as WireStereo,
-    StereoFilter, SubtitleDelivery,
+    prefs, report_document_result, report_list_result, report_result, session, start_tracks_result,
+    stream_choice, telemetry, track, user_data, user_state_result, BookFormat as WireBookFormat,
+    CreditKind as WireCreditKind, Kind, LibraryKind as WireLibraryKind,
+    SegmentKind as WireSegmentKind, Stereo3d as WireStereo, StereoFilter, SubtitleDelivery,
 };
 pub use pharos_api::pharos_capnp::{EventKind as ClientEventKind, Level as ClientLevel};
 pub use pharos_api::PASSWORD_CHANGED_REVOKE_FAILED;
@@ -721,6 +721,17 @@ pub struct Me {
     pub avatar_url: Option<String>,
 }
 
+/// One stored problem report as `Telemetry.listReports` lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReportSummary {
+    /// The id the user pastes, `XXXX-XXXX`.
+    pub id: String,
+    pub received_wall_ms: u64,
+    pub user_name: String,
+    pub note: String,
+    pub bytes: u64,
+}
+
 /// One client event for `Telemetry.submit`, in plain Rust types.
 #[derive(Debug, Clone)]
 pub struct ClientEvent {
@@ -1099,6 +1110,110 @@ impl NativeApi {
                     f.set_value(value);
                 }
             }
+        }
+        let reply = req.send().promise.await?;
+        match reply
+            .get()?
+            .get_result()?
+            .which()
+            .map_err(capnp::Error::from)?
+        {
+            done::Ok(()) => Ok(()),
+            done::Error(e) => Err(ClientError::from_api(e?)),
+        }
+    }
+
+    /// Sends a "Report a problem": the user's `note` and the `bundle` JSON
+    /// object the user was shown. Returns the report's id. Since schema 35.
+    pub async fn report_problem(
+        &self,
+        call: &CallInfo,
+        note: &str,
+        bundle: &[u8],
+    ) -> Result<String, ClientError> {
+        let mut req = self.telemetry.report_request();
+        {
+            let mut p = req.get();
+            call.write(p.reborrow().init_ctx());
+            p.set_note(note);
+            p.set_bundle(bundle);
+        }
+        let reply = req.send().promise.await?;
+        match reply
+            .get()?
+            .get_result()?
+            .which()
+            .map_err(capnp::Error::from)?
+        {
+            report_result::ReportId(id) => Ok(text(id)?),
+            report_result::Error(e) => Err(ClientError::from_api(e?)),
+        }
+    }
+
+    /// The signed-in user's stored reports, newest first; with `everyone`
+    /// (admins only) every user's.
+    pub async fn list_reports(
+        &self,
+        call: &CallInfo,
+        everyone: bool,
+    ) -> Result<Vec<ReportSummary>, ClientError> {
+        let mut req = self.telemetry.list_reports_request();
+        {
+            let mut p = req.get();
+            call.write(p.reborrow().init_ctx());
+            p.set_everyone(everyone);
+        }
+        let reply = req.send().promise.await?;
+        match reply
+            .get()?
+            .get_result()?
+            .which()
+            .map_err(capnp::Error::from)?
+        {
+            report_list_result::Reports(rows) => rows?
+                .iter()
+                .map(|r| {
+                    Ok(ReportSummary {
+                        id: text(r.get_id())?,
+                        received_wall_ms: r.get_received_wall_ms(),
+                        user_name: text(r.get_user_name())?,
+                        note: text(r.get_note())?,
+                        bytes: r.get_bytes(),
+                    })
+                })
+                .collect::<Result<_, capnp::Error>>()
+                .map_err(ClientError::from),
+            report_list_result::Error(e) => Err(ClientError::from_api(e?)),
+        }
+    }
+
+    /// One stored report's JSON document.
+    pub async fn get_report(&self, call: &CallInfo, id: &str) -> Result<Vec<u8>, ClientError> {
+        let mut req = self.telemetry.get_report_request();
+        {
+            let mut p = req.get();
+            call.write(p.reborrow().init_ctx());
+            p.set_id(id);
+        }
+        let reply = req.send().promise.await?;
+        match reply
+            .get()?
+            .get_result()?
+            .which()
+            .map_err(capnp::Error::from)?
+        {
+            report_document_result::Document(d) => Ok(d?.to_vec()),
+            report_document_result::Error(e) => Err(ClientError::from_api(e?)),
+        }
+    }
+
+    /// Deletes one stored report.
+    pub async fn delete_report(&self, call: &CallInfo, id: &str) -> Result<(), ClientError> {
+        let mut req = self.telemetry.delete_report_request();
+        {
+            let mut p = req.get();
+            call.write(p.reborrow().init_ctx());
+            p.set_id(id);
         }
         let reply = req.send().promise.await?;
         match reply
