@@ -15,32 +15,53 @@
 /// The `nice` a background op runs at: the lowest priority there is.
 pub const BACKGROUND_NICENESS: i32 = 19;
 
-/// What [`run_at_lowest_priority`] got: `f`'s result and the `nice` it ran
-/// at, or the error that left it at the inherited one.
+/// What a lowest-priority op got: `f`'s result and the `nice` it ran at,
+/// or the error that left it at the inherited one.
 #[derive(Debug)]
 pub struct Ran<T> {
     pub value: T,
     pub niceness: Result<i32, String>,
 }
 
-/// Run `f` on a new thread at [`BACKGROUND_NICENESS`] and wait for it. A
-/// panic in `f` is passed on as `Err`.
-pub fn run_at_lowest_priority<T, F>(f: F) -> std::thread::Result<Ran<T>>
+/// Start `f` on a new thread at [`BACKGROUND_NICENESS`]; the receiver gets
+/// its result, or the panic's message. `Err` when no thread could start.
+pub fn spawn_at_lowest_priority<T, F>(
+    f: F,
+) -> std::io::Result<tokio::sync::oneshot::Receiver<Result<Ran<T>, String>>>
 where
     T: Send + 'static,
     F: FnOnce() -> T + Send + 'static,
 {
+    let (tx, rx) = tokio::sync::oneshot::channel();
     std::thread::Builder::new()
         .name("bg-lowest".into())
         .spawn(move || {
             let niceness = lower_this_thread();
-            Ran {
-                value: f(),
-                niceness,
-            }
-        })
-        .map_err(|e| Box::new(e.to_string()) as Box<dyn std::any::Any + Send>)?
-        .join()
+            let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f))
+                .map(|value| Ran { value, niceness })
+                .map_err(|p| panic_message(p.as_ref()));
+            let _ = tx.send(ran);
+        })?;
+    Ok(rx)
+}
+
+/// [`spawn_at_lowest_priority`], waited for on this thread.
+pub fn run_at_lowest_priority<T, F>(f: F) -> Result<Ran<T>, String>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    spawn_at_lowest_priority(f)
+        .map_err(|e| format!("spawn op thread: {e}"))?
+        .blocking_recv()
+        .map_err(|_| "op thread ended without an answer".to_string())?
+}
+
+fn panic_message(p: &(dyn std::any::Any + Send)) -> String {
+    p.downcast_ref::<&str>()
+        .map(|s| (*s).to_string())
+        .or_else(|| p.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "non-string panic".into())
 }
 
 /// This thread's `nice`, on Linux.
@@ -111,7 +132,8 @@ mod tests {
     }
 
     #[test]
-    fn a_panic_in_the_op_comes_back_as_an_error() {
-        assert!(run_at_lowest_priority(|| -> () { panic!("boom") }).is_err());
+    fn a_panic_in_the_op_comes_back_with_its_message() {
+        let err = run_at_lowest_priority(|| -> () { panic!("boom {}", 7) }).unwrap_err();
+        assert_eq!(err, "boom 7");
     }
 }

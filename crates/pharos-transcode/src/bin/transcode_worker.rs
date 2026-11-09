@@ -322,31 +322,40 @@ async fn run_tiny(
     use pharos_transcode::worker::priority;
     // Trickplay sheets are background work for the whole library: they run
     // at the lowest CPU priority so playback's encodes win (B908, V856).
-    let background = matches!(op, TinyOp::Trickplay { .. });
-    let ev = tokio::task::spawn_blocking(move || {
-        if !background {
-            return handle_tiny(job_id, op);
-        }
-        match priority::run_at_lowest_priority(move || handle_tiny(job_id, op)) {
-            Ok(ran) => {
-                if let Err(e) = ran.niceness {
-                    eprintln!(
-                        "transcode-worker: trickplay priority not lowered, ran at the default: {e}"
-                    );
-                }
-                ran.value
-            }
-            Err(_) => WorkerEvent::Failed {
+    if matches!(op, TinyOp::Trickplay { .. }) {
+        let ev = match priority::spawn_at_lowest_priority(move || handle_tiny(job_id, op)) {
+            Err(e) => WorkerEvent::Failed {
                 job_id,
-                error: WorkerError::Other("trickplay op thread panicked".into()),
+                error: WorkerError::Other(format!("trickplay op thread spawn: {e}")),
             },
-        }
-    })
-    .await
-    .unwrap_or_else(|e| WorkerEvent::Failed {
-        job_id,
-        error: WorkerError::Other(format!("tiny op task join: {e}")),
-    });
+            Ok(rx) => match rx.await {
+                Ok(Ok(ran)) => {
+                    if let Err(e) = ran.niceness {
+                        eprintln!(
+                            "transcode-worker: trickplay priority not lowered job_id={job_id}, ran at the default: {e}"
+                        );
+                    }
+                    ran.value
+                }
+                Ok(Err(panic)) => WorkerEvent::Failed {
+                    job_id,
+                    error: WorkerError::Other(format!("trickplay op panicked: {panic}")),
+                },
+                Err(_) => WorkerEvent::Failed {
+                    job_id,
+                    error: WorkerError::Other("trickplay op thread ended without an answer".into()),
+                },
+            },
+        };
+        let _ = write_frame(wr, &ev).await;
+        return;
+    }
+    let ev = tokio::task::spawn_blocking(move || handle_tiny(job_id, op))
+        .await
+        .unwrap_or_else(|e| WorkerEvent::Failed {
+            job_id,
+            error: WorkerError::Other(format!("tiny op task join: {e}")),
+        });
     let _ = write_frame(wr, &ev).await;
 }
 
