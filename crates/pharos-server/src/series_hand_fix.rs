@@ -84,8 +84,9 @@ pub(crate) struct MoveTarget {
 pub(crate) struct HandFixDone {
     /// Paths whose series key moved.
     pub moved: Vec<String>,
-    /// Episodes rebuilt against their show's match.
-    pub rebuilt: usize,
+    /// Episodes marked to be rebuilt against their show's match, which
+    /// [`rebuild_paced`] does after the answer.
+    pub rebuild: Vec<MediaId>,
 }
 
 /// Everything a hand fix needs: the store, the providers for a pick and the
@@ -93,12 +94,10 @@ pub(crate) struct HandFixDone {
 pub(crate) struct HandFixer<'a, S, Tm, Tv> {
     pub store: &'a S,
     pub bg_io: &'a Arc<Semaphore>,
-    /// Without an image cache nothing is rebuilt; the moved episodes stay
-    /// marked for the background pass.
+    /// A pick needs it to store the show's art.
     pub cache: Option<&'a ImageCache>,
     pub tmdb: Option<&'a Tm>,
     pub tvdb: Option<&'a Tv>,
-    pub cfg: &'a MetadataConfig,
     /// The configured repair mode: a fix's own rows are written in either,
     /// the scanner's own changes to the folder only under `apply`.
     pub mode: RepairMode,
@@ -164,10 +163,10 @@ where
             });
         };
         let ids: Vec<MediaId> = episodes.iter().map(|e| e.id).collect();
-        let rebuilt = if pinned.old.as_deref() == Some(pinned.new.as_str()) {
-            0
+        let rebuild = if pinned.old.as_deref() == Some(pinned.new.as_str()) {
+            Vec::new()
         } else {
-            self.rebuild(&ids).await?
+            self.mark(ids.clone()).await?
         };
         count(action);
         tracing::info!(
@@ -177,12 +176,12 @@ where
             old = pinned.old.as_deref().unwrap_or("none"),
             new = %pinned.new,
             episodes = ids.len(),
-            rebuilt,
+            to_rebuild = rebuild.len(),
             "series hand fix"
         );
         Ok(HandFixDone {
             moved: Vec::new(),
-            rebuilt,
+            rebuild,
         })
     }
 
@@ -235,7 +234,7 @@ where
         let moved = self.replan(folder).await?;
         let ids = self.ids_of(folder, &moved).await?;
         let cleared = self.store.clear_manual_matches(&ids).await?;
-        let rebuilt = self.rebuild(&ids).await?;
+        let rebuild = self.mark(ids).await?;
         count(HandFix::MoveFiles);
         tracing::info!(
             admin = self.admin,
@@ -246,10 +245,10 @@ where
             new_key = %target_key,
             moved = moved.len(),
             cleared_manual = ?cleared,
-            rebuilt,
+            to_rebuild = rebuild.len(),
             "series hand fix"
         );
-        Ok(HandFixDone { moved, rebuilt })
+        Ok(HandFixDone { moved, rebuild })
     }
 
     /// Keep `folder` one show whatever years its files state.
@@ -268,7 +267,7 @@ where
             .await?;
         let moved = self.replan(folder).await?;
         let ids = self.ids_of(folder, &moved).await?;
-        let rebuilt = self.rebuild(&ids).await?;
+        let rebuild = self.mark(ids).await?;
         count(HandFix::KeepTogether);
         tracing::info!(
             admin = self.admin,
@@ -276,10 +275,10 @@ where
             folder,
             new_key = folder,
             moved = moved.len(),
-            rebuilt,
+            to_rebuild = rebuild.len(),
             "series hand fix"
         );
-        Ok(HandFixDone { moved, rebuilt })
+        Ok(HandFixDone { moved, rebuild })
     }
 
     /// Remove override `id`, returning its files to what the scanner decides.
@@ -310,7 +309,7 @@ where
             }
         }
         let ids = self.ids_of(folder, &moved).await?;
-        let rebuilt = self.rebuild(&ids).await?;
+        let rebuild = self.mark(ids).await?;
         count(HandFix::Remove);
         tracing::info!(
             admin = self.admin,
@@ -321,10 +320,10 @@ where
             source = row.source.as_str(),
             old_key = %row.target_key,
             moved = moved.len(),
-            rebuilt,
+            to_rebuild = rebuild.len(),
             "series hand fix"
         );
-        Ok(HandFixDone { moved, rebuilt })
+        Ok(HandFixDone { moved, rebuild })
     }
 
     async fn folder_rows(
@@ -384,18 +383,67 @@ where
         Ok(ids)
     }
 
-    async fn rebuild(&self, ids: &[MediaId]) -> Result<usize, HandFixError> {
-        let Some(cache) = self.cache else {
-            return Ok(0);
-        };
-        if ids.is_empty() {
-            return Ok(0);
+    /// Mark `ids` for a rebuild now, so a restart before [`rebuild_paced`]
+    /// finishes leaves them to the background pass under `apply`.
+    async fn mark(&self, ids: Vec<MediaId>) -> Result<Vec<MediaId>, HandFixError> {
+        if !ids.is_empty() {
+            self.store.mark_reconcile_items(&ids, self.now).await?;
         }
-        Ok(rebuild_now(
-            self.store, self.bg_io, cache, self.tmdb, self.tvdb, self.cfg, ids, self.now,
-        )
-        .await?)
+        Ok(ids)
     }
+}
+
+/// Gap between two episodes [`rebuild_paced`] rebuilds: the background
+/// pass's spacing, so a pick on a long show is no burst at the provider.
+const REBUILD_SPACING: std::time::Duration = std::time::Duration::from_millis(120);
+
+/// Rebuild the episodes a hand fix marked, one at a time and spaced, after
+/// the fix has answered: a pick on a show of 1000 episodes takes minutes.
+/// One whose show has no match yet, or whose record did not arrive, stays
+/// marked. Logs one line when done.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn rebuild_paced<S, Tm, Tv>(
+    store: &S,
+    bg_io: &Arc<Semaphore>,
+    cache: &ImageCache,
+    tmdb: Option<&Tm>,
+    tvdb: Option<&Tv>,
+    cfg: &MetadataConfig,
+    ids: &[MediaId],
+    admin: &str,
+) where
+    S: MediaStore
+        + GenreStore
+        + PersonStore
+        + MetadataTranslationStore
+        + SeriesMetadataStore
+        + SeriesIdentityStore,
+    Tm: OnlineEnricher,
+    Tv: OnlineEnricher,
+{
+    let (mut rebuilt, mut deferred, mut failed) = (0usize, 0usize, 0usize);
+    for (i, &id) in ids.iter().enumerate() {
+        if i > 0 {
+            tokio::time::sleep(REBUILD_SPACING).await;
+        }
+        let now = crate::metadata_backfill::now_secs();
+        match rebuild_now(store, bg_io, cache, tmdb, tvdb, cfg, &[id], now).await {
+            Ok(0) => deferred += 1,
+            Ok(_) => rebuilt += 1,
+            Err(e) => {
+                failed += 1;
+                tracing::warn!(error = %e, media.id = id, admin, "series hand fix: episode rebuild failed");
+            }
+        }
+    }
+    tracing::info!(
+        admin,
+        episodes = ids.len(),
+        rebuilt,
+        deferred,
+        failed,
+        "series hand fix: episodes rebuilt"
+    );
 }
 
 /// A show's display name from its key: the folder's last segment, without a
@@ -460,7 +508,6 @@ mod tests {
     fn fixer<'a>(
         s: &'a SqliteStore,
         bg_io: &'a Arc<Semaphore>,
-        cfg: &'a MetadataConfig,
         mode: RepairMode,
     ) -> HandFixer<'a, SqliteStore, TmdbEnricher, TvdbEnricher<ReqwestTransport>> {
         HandFixer {
@@ -469,7 +516,6 @@ mod tests {
             cache: None,
             tmdb: None,
             tvdb: None,
-            cfg,
             mode,
             admin: "ali",
             now: 100,
@@ -554,8 +600,8 @@ mod tests {
         s.set_item_match(3, "tvdb", "279121", "manual", None, 1)
             .await
             .unwrap();
-        let (bg, cfg) = (Arc::new(Semaphore::new(1)), MetadataConfig::default());
-        let f = fixer(&s, &bg, &cfg, RepairMode::DryRun);
+        let bg = Arc::new(Semaphore::new(1));
+        let f = fixer(&s, &bg, RepairMode::DryRun);
         let moved = path("The Flash - S01E03 - City of Heroes.mkv");
 
         let done = f
@@ -596,7 +642,7 @@ mod tests {
         assert!(line.contains(&format!("new_key={new_key}")), "{line}");
 
         for mode in [RepairMode::DryRun, RepairMode::Apply] {
-            fixer(&s, &bg, &cfg, mode).replan(FLASH).await.unwrap();
+            fixer(&s, &bg, mode).replan(FLASH).await.unwrap();
             assert_eq!(keys(&s).await, want, "{mode:?}");
         }
     }
@@ -606,8 +652,8 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn removing_a_move_or_keeping_together_returns_the_file() {
         let s = flash().await;
-        let (bg, cfg) = (Arc::new(Semaphore::new(1)), MetadataConfig::default());
-        let f = fixer(&s, &bg, &cfg, RepairMode::DryRun);
+        let bg = Arc::new(Semaphore::new(1));
+        let f = fixer(&s, &bg, RepairMode::DryRun);
         let moved = path("The Flash - S01E02 - Out of Control.mkv");
         let target = MoveTarget {
             year: Some(1990),
@@ -627,7 +673,7 @@ mod tests {
         f.move_files(FLASH, std::slice::from_ref(&moved), target)
             .await
             .unwrap();
-        let apply = fixer(&s, &bg, &cfg, RepairMode::Apply);
+        let apply = fixer(&s, &bg, RepairMode::Apply);
         apply.keep_together(FLASH).await.unwrap();
         // The admin's own per-path row still places its file.
         assert_eq!(
@@ -642,8 +688,8 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn a_hand_fix_that_cannot_be_made_names_why() {
         let s = flash().await;
-        let (bg, cfg) = (Arc::new(Semaphore::new(1)), MetadataConfig::default());
-        let f = fixer(&s, &bg, &cfg, RepairMode::DryRun);
+        let bg = Arc::new(Semaphore::new(1));
+        let f = fixer(&s, &bg, RepairMode::DryRun);
         let year = MoveTarget {
             year: Some(2014),
             ..MoveTarget::default()
