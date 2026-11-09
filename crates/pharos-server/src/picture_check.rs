@@ -132,6 +132,10 @@ pub fn verdict(result: &Result<PictureAnalysis, PoolError>) -> (Option<PictureCh
         Ok(a) => match a.verdict {
             PictureVerdict::Bars(area) => (stored(Some(area)), Outcome::Bars),
             PictureVerdict::NoBars | PictureVerdict::Implausible => (stored(None), Outcome::None),
+            // No frame decoded at all: a seek that failed on a passing read
+            // error looks the same as an unseekable file, and says nothing
+            // about the picture, so it is tried again next pass.
+            PictureVerdict::Undetermined if a.sampled_frames == 0 => (None, Outcome::Undetermined),
             PictureVerdict::Undetermined => (stored(None), Outcome::Undetermined),
         },
         // The file's fault: remember it.
@@ -596,6 +600,18 @@ mod tests {
         assert!(needs_check(&item));
         item.path = "ytdlp://youtube/abc".into();
         assert!(!needs_check(&item), "a remote origin is not a file");
+    }
+
+    #[test]
+    fn a_check_that_decoded_nothing_is_retried_not_stored() {
+        let nothing = PictureAnalysis {
+            sampled_frames: 0,
+            ..analysis(PictureVerdict::Undetermined, 0)
+        };
+        assert_eq!(verdict(&Ok(nothing)), (None, Outcome::Undetermined));
+        let (stored, outcome) = verdict(&Ok(analysis(PictureVerdict::Undetermined, 1)));
+        assert_eq!(outcome, Outcome::Undetermined);
+        assert!(stored.is_some(), "frames decoded but too dark: remembered");
     }
 
     #[test]
