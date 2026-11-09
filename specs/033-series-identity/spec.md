@@ -348,7 +348,14 @@ these):
   record did not arrive. `none` goes with `no_match`.
 - `{namespace="pharos"} |= "series match"` with `query=… year=… candidates=[…]
   chosen=… runner_up=… margin=…` on every decision, matched or not.
-- `sum by (reason) (pharos_series_folder_split_total)`.
+- `sum by (reason) (pharos_series_folder_split_total)`: a gauge each complete
+  scan pass of a root sets to the folders it splits under that root (labels
+  `reason` = `stated_years`, `root`), in both modes.
+- `sum by (change, mode) (pharos_series_identity_repair_rows)`, a gauge per
+  `root`, `change` ∈ `series_key | owner_row`, `mode` ∈ `dry_run | apply`: the
+  rows the root's last complete pass found to differ. In `apply` they were
+  written, so a settled library reads 0; in `dry_run` they stay pending and
+  read the same each pass.
 - `sum by (reason) (increase(pharos_episode_metadata_rejected_total[1d]))`,
   `reason` ∈ `nfo_other_series | search_other_series | outside_run |
   title_mismatch`, log carrying path, NFO id, the series the record was read
@@ -356,7 +363,9 @@ these):
   count is observation only (the record is still applied).
 - `sum by (decided_by) (pharos_scan_copy_primaries)` gains
   `decided_by="refused_other_series"` for V894.
-- `{namespace="pharos"} |= "series identity repair"` for each dry-run line.
+- `{namespace="pharos"} |= "series identity repair"`: one info line per folder
+  a pass would change (or changed), with the row count; the per-row lines
+  (`series identity repair: row`) are debug.
 - `sum by (action) (increase(pharos_series_override_total[1d]))` for §7.
 
 After deploy, success is: the dry-run lines list BSG → 2004 (tvdb id of the
