@@ -2675,6 +2675,7 @@ mod tests {
             critic_rating: None,
             artist: None,
             stereo: None,
+            damaged: false,
         };
         let mut c = controls();
         c.up_next = Some(UpNextCard::of(Some(&next), 7_200, 15_000));

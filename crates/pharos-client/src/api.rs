@@ -127,6 +127,8 @@ pub struct Version {
     pub container: String,
     /// The file on the server's disk; the server sends it to admins only.
     pub path: String,
+    /// The integrity check found this file damaged.
+    pub damaged: bool,
 }
 
 /// One audio stream of a [`Version`].
@@ -169,6 +171,9 @@ pub struct Item {
     pub artist: Option<String>,
     /// Its 3D packing, or its first 3D version's when it is itself 2D.
     pub stereo: Option<Stereo>,
+    /// The integrity check found its file damaged; [`Detail::damage`] says
+    /// where. False from a server older than schemaVersion 30.
+    pub damaged: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -264,6 +269,29 @@ pub struct Detail {
     /// A film or episode's files, the primary first; empty for anything
     /// else, and from a server older than schema 29.
     pub versions: Vec<Version>,
+    /// What is wrong with the file this detail describes; `None` when
+    /// nothing is known to be.
+    pub damage: Option<Damage>,
+}
+
+/// What the integrity check found wrong with one file.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Damage {
+    /// `damaged`, `short` or `unreadable`.
+    pub verdict: String,
+    /// The reader's own words for the first fault; empty when it gave none.
+    pub reason: String,
+    /// The damaged spans on the player's timeline, in media order.
+    pub ranges: Vec<DamageSpan>,
+    /// When the file was read, in unix seconds.
+    pub checked_at: Option<i64>,
+}
+
+/// One damaged span, in ms. A span one packet wide has `start_ms == end_ms`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DamageSpan {
+    pub start_ms: u64,
+    pub end_ms: u64,
 }
 
 /// Someone who appears in an item, and who they play.
@@ -1187,6 +1215,7 @@ impl PharosApi for NativeApi {
                         .iter()
                         .map(read_version)
                         .collect::<Result<_, capnp::Error>>()?,
+                    damage: read_damage(d.get_damage()?)?,
                 })
             }
             detail_result::Error(e) => Err(ClientError::from_api(e?)),
@@ -1722,6 +1751,7 @@ pub(crate) fn read_item(item: item_summary::Reader<'_>) -> Result<Item, capnp::E
         critic_rating: read_opt_u16(item.get_critic_rating()?)?,
         artist: Some(text(item.get_artist())?).filter(|a| !a.is_empty()),
         stereo: read_stereo(item.get_stereo()),
+        damaged: item.get_damaged(),
     })
 }
 
@@ -1735,6 +1765,28 @@ fn read_stereo(stereo: Result<WireStereo, capnp::NotInSchema>) -> Option<Stereo>
         WireStereo::FullTopAndBottom => Some(Stereo::FullTopAndBottom),
         WireStereo::Mvc => Some(Stereo::Mvc),
     }
+}
+
+fn read_damage(
+    d: pharos_api::pharos_capnp::damage::Reader<'_>,
+) -> Result<Option<Damage>, capnp::Error> {
+    let verdict = text(d.get_verdict())?;
+    if verdict.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(Damage {
+        verdict,
+        reason: text(d.get_reason())?,
+        ranges: d
+            .get_ranges()?
+            .iter()
+            .map(|r| DamageSpan {
+                start_ms: r.get_start_ms(),
+                end_ms: r.get_end_ms(),
+            })
+            .collect(),
+        checked_at: Some(d.get_checked_at()).filter(|t| *t > 0),
+    }))
 }
 
 fn read_version(v: pharos_api::pharos_capnp::version::Reader<'_>) -> Result<Version, capnp::Error> {
@@ -1761,6 +1813,7 @@ fn read_version(v: pharos_api::pharos_capnp::version::Reader<'_>) -> Result<Vers
         size_bytes: v.get_size_bytes(),
         container: text(v.get_container())?,
         path: text(v.get_path())?,
+        damaged: v.get_damaged(),
     })
 }
 
