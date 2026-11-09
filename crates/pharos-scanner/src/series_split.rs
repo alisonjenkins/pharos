@@ -212,6 +212,29 @@ pub fn plan(
     let mut out = SeriesPlan::default();
     for (folder, files) in folders {
         out.walked.insert(folder.clone());
+        let together = ctx
+            .overrides
+            .iter()
+            .any(|o| o.series_folder == *folder && o.keeps_together());
+        if together {
+            // V896: an admin kept the folder one show. Its files keep the plain
+            // key; only an admin's own per-path rows still move a file.
+            let years = distinct_years(files);
+            let year = (years.len() == 1)
+                .then(|| years.iter().next().copied())
+                .flatten();
+            for (path, _) in files {
+                out.assignments.insert(
+                    path.clone(),
+                    Assignment {
+                        series_key: folder.clone(),
+                        series_year: year,
+                    },
+                );
+            }
+            place_by_override(folder, files, ctx, true, &mut out.assignments);
+            continue;
+        }
         let (stated, by_title) = with_title_evidence(folder, files, &ctx.overrides);
         let own = files;
         let files = &stated;
@@ -276,7 +299,7 @@ pub fn plan(
                 });
             }
         }
-        place_by_override(folder, own, ctx, &mut out.assignments);
+        place_by_override(folder, own, ctx, false, &mut out.assignments);
     }
     out
 }
@@ -285,16 +308,20 @@ pub fn plan(
 /// its stated year; an `admin` row wins over a `scanner` one. A `scanner`
 /// row's year has already split the folder ([`with_title_evidence`]), so
 /// its key here only matters for a file that states a year of its own.
+/// `admin_only` leaves `scanner` rows out, for a folder an admin kept
+/// together.
 fn place_by_override(
     folder: &str,
     files: &[(PathBuf, Option<u32>)],
     ctx: &PlanContext,
+    admin_only: bool,
     assignments: &mut HashMap<PathBuf, Assignment>,
 ) {
     let mut rows: Vec<&SeriesOverride> = ctx
         .overrides
         .iter()
         .filter(|o| o.series_folder == folder && o.path.is_some())
+        .filter(|o| !admin_only || o.source == OverrideSource::Admin)
         .collect();
     // Scanner rows first, so an admin row for the same path lands last.
     rows.sort_by_key(|o| o.source == OverrideSource::Admin);
@@ -715,6 +742,57 @@ mod tests {
             }
         );
         assert!(p.splits.is_empty());
+    }
+
+    /// V896 — an admin's "keep together" row keeps a folder stating two
+    /// show years one show: no split, every file on the plain key, no new
+    /// owner row, and a file the scanner's own evidence moved stays. An
+    /// admin's per-path row still moves its file.
+    #[test]
+    fn an_admin_keep_together_row_keeps_a_two_year_folder_one_show() {
+        let old = "/tv/The Flash/Season 1/The Flash (1990) - S01E01.mkv";
+        let unyeared = "/tv/The Flash/Season 1/The Flash - S01E02 - Out of Control.mkv";
+        let moved = "/tv/The Flash/Season 1/The Flash - S01E03 - Watching the Detectives.mkv";
+        let folders = folders_of(&paths(&[
+            old,
+            unyeared,
+            moved,
+            "/tv/The Flash/Season 3/The Flash (2014) - S03E01.mkv",
+        ]));
+        let together = SeriesOverride::keep_together("/tv/The Flash", Some("ali".into()), 5);
+        assert!(together.keeps_together());
+        let scanner_row = SeriesOverride {
+            path: Some(unyeared.into()),
+            target_key: split_key("/tv/The Flash", 1990),
+            target_year: Some(1990),
+            source: OverrideSource::Scanner,
+            ..together.clone()
+        };
+        assert!(!scanner_row.keeps_together());
+        let admin_move = SeriesOverride {
+            path: Some(moved.into()),
+            target_key: "/tv/The Flash (Elsewhere)".into(),
+            target_year: Some(1990),
+            ..together.clone()
+        };
+        let ctx = PlanContext {
+            overrides: vec![together, scanner_row, admin_move],
+            premiere_years: HashMap::new(),
+        };
+        let p = plan(&folders, &ctx, 7);
+        assert!(p.splits.is_empty(), "{:?}", p.splits);
+        assert!(p.new_owners.is_empty());
+        let at = |path: &str| p.assignments[Path::new(path)].clone();
+        for path in [old, unyeared] {
+            assert_eq!(
+                at(path),
+                Assignment {
+                    series_key: "/tv/The Flash".into(),
+                    series_year: None,
+                }
+            );
+        }
+        assert_eq!(at(moved).series_key, "/tv/The Flash (Elsewhere)");
     }
 
     /// V893 — the server's `scanner` rows for the 1990 Season 01 files
