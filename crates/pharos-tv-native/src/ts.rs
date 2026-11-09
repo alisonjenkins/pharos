@@ -355,7 +355,10 @@ mod tests {
     fn reads_a_server_segment() {
         let path = std::env::var("PHAROS_TS_SEGMENT").unwrap();
         let mut demux = Demux::default();
-        let units = demux.access_units(&std::fs::read(path).unwrap()).unwrap();
+        let bytes = std::fs::read(path).unwrap();
+        let started = std::time::Instant::now();
+        let units = demux.access_units(&bytes).unwrap();
+        println!("demux bytes={} ms={:.2}", bytes.len(), started.elapsed().as_secs_f64() * 1e3);
         let keys = units.iter().filter(|u| u.key).count();
         println!(
             "type={:?} units={} keys={keys} first_pts_us={} csd={:?}",
