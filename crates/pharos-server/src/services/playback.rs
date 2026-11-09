@@ -35,7 +35,14 @@ pub enum DeniedCodecsError {
     TooMany { count: usize },
     #[error("codec {codec:?} is not a codec name (1-16 of a-z, 0-9, _ or -)")]
     BadName { codec: String },
+    /// Every conversion path ends in AAC (the HLS segment encoder makes AAC
+    /// whatever target the negotiator names), so denying it cannot be honoured.
+    #[error("{CONVERSION_AUDIO_CODEC} is what turned-off codecs are converted to, so it cannot be turned off")]
+    ConversionTarget,
 }
+
+/// The codec a denied one is converted to.
+pub const CONVERSION_AUDIO_CODEC: &str = "aac";
 
 /// A deny list as stored: lowercased, trimmed, deduplicated and sorted, so the
 /// same set always reads back the same. Blank entries are dropped.
@@ -52,6 +59,9 @@ pub fn normalise_denied_audio_codecs(codecs: &[String]) -> Result<Vec<String>, D
                 .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
     }) {
         return Err(DeniedCodecsError::BadName { codec: bad.clone() });
+    }
+    if set.contains(CONVERSION_AUDIO_CODEC) {
+        return Err(DeniedCodecsError::ConversionTarget);
     }
     if set.len() > MAX_DENIED_AUDIO_CODECS {
         return Err(DeniedCodecsError::TooMany { count: set.len() });
