@@ -3693,6 +3693,7 @@ impl SeriesMetadataStore for SqliteStore {
 type EpisodeEvidenceRow = (
     i64,
     String,
+    String,
     Option<i64>,
     Option<i64>,
     Option<i64>,
@@ -4001,8 +4002,8 @@ impl SeriesIdentityStore for SqliteStore {
 
     async fn series_episodes(&self, series_key: &str) -> DomainResult<Vec<SeriesEpisodeRow>> {
         let rows: Vec<EpisodeEvidenceRow> = sqlx::query_as(
-            "SELECT id, path, season_number, episode_number, premiere_date, match_source, \
-                    match_provider, match_external_id FROM media_items \
+            "SELECT id, path, title, season_number, episode_number, premiere_date, \
+                    match_source, match_provider, match_external_id FROM media_items \
              WHERE kind = 'episode' AND COALESCE(series_key, series_folder, series_name) = ?",
         )
         .bind(series_key)
@@ -4016,12 +4017,13 @@ impl SeriesIdentityStore for SqliteStore {
                     id: u64::try_from(r.0)
                         .map_err(|e| DomainError::Backend(format!("id negative: {e}")))?,
                     path: r.1,
-                    season: num(r.2),
-                    episode: num(r.3),
-                    premiere_date: r.4,
-                    match_source: r.5,
-                    match_provider: r.6,
-                    match_external_id: r.7,
+                    title: r.2,
+                    season: num(r.3),
+                    episode: num(r.4),
+                    premiere_date: r.5,
+                    match_source: r.6,
+                    match_provider: r.7,
+                    match_external_id: r.8,
                 })
             })
             .collect()
