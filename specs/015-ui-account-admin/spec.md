@@ -2,7 +2,7 @@
 
 **Feature directory**: `specs/015-ui-account-admin/`
 **Created**: 2026-11-01
-**Status**: draft (`/speckit-specify` stage; next: `/speckit-clarify`)
+**Status**: partially built (audited 2026-11-09): sign-in, account/password/avatar, Quick Connect approve, Manage (users, libraries, devices, activity, tasks, plugins, logs, API keys, branding, duplicates, integrity) shipped; metadata editing, dashboard overview, first-run sheet open. See Progress
 **Input**: "… support all the things Jellyfin's UI does … tailored to the Pharos
 server (there are some things we might drop)." (Alison, 2026-11-01)
 **Depends on**: 009–011; server rows T67, T68, T69, T70, T73, T74, T76
@@ -110,3 +110,16 @@ deletion from this view are later stories.
 - Last admin cannot remove their own admin flag or delete themselves.
 - Library path not readable by the server: shown with the server's reason
   (`pharos_source_unreadable_total{reason}`).
+
+## Progress (audited 2026-11-09)
+
+- US1 sign in: done (crates/pharos-ui/src/views/login.rs, views/quick_connect.rs, native/approve_device.rs `/settings/approve-device`, Route::SignIn). Multiple saved servers via views/server_picker.rs.
+- US2 profile and preferences: partial. Avatar + password + language in native/account_settings.rs (`/settings/account`); Appearance, Playback (native/playback_settings.rs), Privacy routes exist. No dedicated Home, Subtitles-defaults, Audio-defaults or Reading preference pages found.
+- US3 metadata editing: not started in pharos-ui (no item-edit, image manager or identify view found).
+- US4 dashboard overview: not started (no dashboard view; admin tabs show lists only; no uptime/sessions/transcode-device screen).
+- US5 users: done as legacy admin pane (views/admin.rs `UsersPane`, `AdminUserRow`), served via native `/manage` (native/manage.rs). Parental controls / session limits / feature flags not verified.
+- US6 libraries: partial (views/admin.rs `LibrariesPane`); folder picker, scan-now and last-scan result not verified.
+- US7 operations: partial (Tasks, Logs, Activity, Devices, API keys tabs in views/admin.rs; cache tools, transcode devices, DLNA status not found).
+- US8 first run: not started (no first-run sheet in pharos-ui).
+- US9 media management: Duplicates (`DuplicatesSection`) and Damaged files / deep checks (`IntegritySection`, `DeepChecksSection`, #1057) done; episodes, music and deletion remain later stories.
+- FR-004 migration onto 009-011 tokens: Manage pages still the views/admin.rs panes, not migrated.
