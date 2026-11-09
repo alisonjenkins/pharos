@@ -22,6 +22,9 @@ mod audio_analysis_row;
 mod auth_sqlite;
 
 #[cfg(feature = "sqlite")]
+mod read_position_sqlite;
+
+#[cfg(feature = "sqlite")]
 mod user_data_sqlite;
 
 #[cfg(feature = "sqlite")]

@@ -3112,6 +3112,146 @@ where
     MediaStore::sweep_unseen(&store, sweep, ROOT).await.unwrap();
 }
 
+/// `ReadPositionStore` (023): the contract that keeps a book's reading
+/// position apart from its playback state (V354) and drives "Continue
+/// reading".
+async fn run_read_position_conformance<S>(store: S)
+where
+    S: pharos_core::MediaStore
+        + pharos_core::UserStore
+        + pharos_core::UserDataStore
+        + pharos_core::ReadPositionStore
+        + Send
+        + Sync,
+{
+    use pharos_core::ReadPosition;
+    let uid = user_record("reader");
+    let uid = {
+        let id = uid.id;
+        UserStore::create(&store, uid).await.unwrap();
+        id
+    };
+    let other = user_record("other");
+    let other = {
+        let id = other.id;
+        UserStore::create(&store, other).await.unwrap();
+        id
+    };
+    let (a, b, c): (MediaId, MediaId, MediaId) = (8_101, 8_102, 8_103);
+    for (id, title) in [(a, "Book A"), (b, "Book B"), (c, "Book C")] {
+        MediaStore::put(&store, media_item(id, title))
+            .await
+            .unwrap();
+    }
+    let pos = |locator: &str, fraction: f32, updated_at: i64| ReadPosition {
+        locator: locator.into(),
+        fraction,
+        updated_at,
+    };
+
+    assert_eq!(store.get_read_position(uid, a).await.unwrap(), None);
+    assert_eq!(
+        store.read_positions_bulk(uid, &[a, b]).await.unwrap(),
+        vec![None, None]
+    );
+    assert!(store
+        .read_positions_bulk(uid, &[])
+        .await
+        .unwrap()
+        .is_empty());
+
+    store
+        .set_read_position(uid, a, pos("epub:2:10", 0.25, 100))
+        .await
+        .unwrap();
+    store
+        .set_read_position(uid, b, pos("epub:0:0", 0.5, 300))
+        .await
+        .unwrap();
+    store
+        .set_read_position(uid, c, pos("epub:1:1", 0.0, 400))
+        .await
+        .unwrap();
+    store
+        .set_read_position(other, a, pos("epub:9:9", 0.9, 500))
+        .await
+        .unwrap();
+    assert_eq!(
+        store.get_read_position(uid, a).await.unwrap(),
+        Some(pos("epub:2:10", 0.25, 100))
+    );
+    // A second save replaces the first.
+    store
+        .set_read_position(uid, a, pos("epub:3:0", 0.75, 200))
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .read_positions_bulk(uid, &[c, a, 9_999_999])
+            .await
+            .unwrap(),
+        vec![
+            Some(pos("epub:1:1", 0.0, 400)),
+            Some(pos("epub:3:0", 0.75, 200)),
+            None
+        ]
+    );
+
+    // Part read: fraction above 0, newest save first, one user's own.
+    assert_eq!(store.part_read_items(uid, 10).await.unwrap(), vec![b, a]);
+    assert_eq!(store.part_read_items(uid, 1).await.unwrap(), vec![b]);
+    assert_eq!(store.part_read_items(other, 10).await.unwrap(), vec![a]);
+
+    // Saving a position does not touch the playback state, and a played book
+    // drops out of the list without losing its position.
+    assert_eq!(
+        UserDataStore::get_user_data(&store, uid, a).await.unwrap(),
+        UserItemData::default()
+    );
+    UserDataStore::set_user_data(
+        &store,
+        uid,
+        b,
+        UserItemData {
+            played: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(store.part_read_items(uid, 10).await.unwrap(), vec![a]);
+    assert!(store.get_read_position(uid, b).await.unwrap().is_some());
+    assert_eq!(
+        UserDataStore::get_user_data(&store, uid, b)
+            .await
+            .unwrap()
+            .last_played_position_ticks,
+        0
+    );
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn sqlite_read_position_conformance() {
+    let s = pharos_store_sqlx::sqlite::SqliteStore::connect("sqlite::memory:")
+        .await
+        .expect("connect in-memory sqlite");
+    run_read_position_conformance(s).await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn postgres_read_position_conformance() {
+    let Ok(url) = std::env::var("PHAROS_TEST_POSTGRES_URL") else {
+        eprintln!("SKIP postgres_read_position_conformance: PHAROS_TEST_POSTGRES_URL unset");
+        return;
+    };
+    let p = pharos_store_sqlx::postgres::PostgresStore::connect(&url)
+        .await
+        .expect("connect postgres");
+    run_read_position_conformance(p).await;
+}
+
 #[cfg(feature = "sqlite")]
 #[tokio::test]
 async fn sqlite_series_identity_conformance() {
