@@ -178,10 +178,32 @@ pub fn ManageScreen() -> Element {
     let state = use_signal(|| TokenState::Asking);
     let token = use_signal(String::new);
     let why = use_signal(String::new);
+    let task = use_signal(|| None::<dioxus::core::Task>);
     let start = move || {
-        spawn(keep_token(ctx.api, ctx.machine, held, state, token, why));
+        let mut task = task;
+        let next = spawn(keep_token(ctx.api, ctx.machine, held, state, token, why));
+        if let Some(old) = task.replace(Some(next)) {
+            old.cancel();
+        }
     };
     use_hook(start);
+    // A new connection may be another account (a sign-in in another tab):
+    // the token this screen holds is the old session's, so drop it and ask
+    // the new session before the pages send anything else (V880).
+    let mut first = use_signal(|| true);
+    use_effect(move || {
+        let _ = ctx.api.read();
+        if *first.peek() {
+            first.set(false);
+            return;
+        }
+        platform::info("pharos: manage token restart reason=connection_changed");
+        let (mut held, mut token, mut state) = (held, token, state);
+        held.set(None);
+        token.set(String::new());
+        state.set(TokenState::Asking);
+        start();
+    });
     // `None` while the lookup runs, `Some(None)` when it failed. The pages
     // wait for it: without the admin's own id their card would offer Delete
     // and the admin switch (V881).
