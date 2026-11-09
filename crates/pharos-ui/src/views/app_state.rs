@@ -804,7 +804,7 @@ pub fn AdminPane(
         let mut deep_queued_signal = deep_queued;
         let mut deep_errors_signal = deep_errors;
         let deep_search_signal = deep_search;
-        let mut deep_search_gen_signal = deep_search_gen;
+        let deep_search_gen_signal = deep_search_gen;
         let mut fetch_err_hidden_signal = fetch_err_hidden;
         let mut identity_search_signal = identity_search;
         let mut identity_prompt_signal = identity_prompt;
@@ -858,44 +858,13 @@ pub fn AdminPane(
                 _ => String::new(),
             };
             if let AdminAction::DeepSearch { term } = action {
-                let generation = deep_search_gen_signal.peek().wrapping_add(1);
-                deep_search_gen_signal.set(generation);
-                let mut search = deep_search_signal;
-                let current = search.peek().clone();
-                if term.trim().is_empty() {
-                    search.set(DeepSearchState::default());
-                    return;
-                }
-                search.set(DeepSearchState {
-                    query: term.clone(),
-                    loading: true,
-                    ..current
-                });
-                let gen_signal = deep_search_gen_signal;
-                spawn(async move {
-                    sleep_ms(DEEP_SEARCH_DEBOUNCE_MS).await;
-                    if !crate::views::admin::generation_current(generation, *gen_signal.peek()) {
-                        return;
-                    }
-                    let found = fetch_search_hints(&base, &token, &term).await;
-                    if !crate::views::admin::generation_current(generation, *gen_signal.peek()) {
-                        return;
-                    }
-                    search.set(match found {
-                        Ok(hits) => DeepSearchState {
-                            query: term,
-                            hits,
-                            loading: false,
-                            error: None,
-                        },
-                        Err(e) => DeepSearchState {
-                            query: term,
-                            hits: Vec::new(),
-                            loading: false,
-                            error: Some(e),
-                        },
-                    });
-                });
+                debounced_hit_search(
+                    base,
+                    token,
+                    term,
+                    deep_search_signal,
+                    deep_search_gen_signal,
+                );
                 return;
             }
             spawn(async move {
@@ -2920,6 +2889,54 @@ async fn fetch_live_programs(
     _hours: u32,
 ) -> Result<Vec<LiveProgram>, String> {
     Err("live_programs is only wired in the web build".into())
+}
+
+/// Runs a title search after the typing pauses, writing the hits into
+/// `search`. `generation` identifies the newest keystroke so an older search
+/// never lands over a newer one.
+fn debounced_hit_search(
+    base: String,
+    token: String,
+    term: String,
+    mut search: Signal<DeepSearchState>,
+    mut generation_signal: Signal<u32>,
+) {
+    let generation = generation_signal.peek().wrapping_add(1);
+    generation_signal.set(generation);
+    let current = search.peek().clone();
+    if term.trim().is_empty() {
+        search.set(DeepSearchState::default());
+        return;
+    }
+    search.set(DeepSearchState {
+        query: term.clone(),
+        loading: true,
+        ..current
+    });
+    spawn(async move {
+        sleep_ms(DEEP_SEARCH_DEBOUNCE_MS).await;
+        if !crate::views::admin::generation_current(generation, *generation_signal.peek()) {
+            return;
+        }
+        let found = fetch_search_hints(&base, &token, &term).await;
+        if !crate::views::admin::generation_current(generation, *generation_signal.peek()) {
+            return;
+        }
+        search.set(match found {
+            Ok(hits) => DeepSearchState {
+                query: term,
+                hits,
+                loading: false,
+                error: None,
+            },
+            Err(e) => DeepSearchState {
+                query: term,
+                hits: Vec::new(),
+                loading: false,
+                error: Some(e),
+            },
+        });
+    });
 }
 
 #[cfg(feature = "web")]
