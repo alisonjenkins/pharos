@@ -12,7 +12,7 @@ use super::activity::TrackKind;
 use super::group_session::{Env, GroupPlayer, GroupView, Seat, Session, Ui};
 use super::platform;
 use super::together::{group_api, Groups};
-use super::track_follow::TrackPicks;
+use super::track_follow::{TrackMap, TrackPicks};
 
 /// The one session type the app uses.
 pub type AppSession = Session<Groups, AppEnv>;
@@ -60,6 +60,11 @@ pub struct VideoPlayer {
     /// The item's audio and subtitle streams.
     pub audio: Vec<Track>,
     pub subtitles: Vec<Track>,
+    /// The group names the primary file's streams; this lines the version
+    /// playing up with them (ADR-0089).
+    pub map: TrackMap,
+    /// The version playing, for the logs (empty: the primary).
+    pub version: String,
     /// Where the group's track picks go: the player screen switches tracks
     /// there, inside the Dioxus runtime.
     pub tracks: Coroutine<TrackPicks>,
@@ -98,9 +103,12 @@ impl GroupPlayer for VideoPlayer {
         platform::set_rate(self.id, rate);
     }
 
+    /// As the primary's indexes: the group's picks name those.
     fn stream_indexes(&self) -> (Vec<u32>, Vec<u32>) {
-        let indexes = |tracks: &[Track]| tracks.iter().map(|t| t.index).collect();
-        (indexes(&self.audio), indexes(&self.subtitles))
+        (
+            self.map.primary_indexes(TrackKind::Audio),
+            self.map.primary_indexes(TrackKind::Subtitles),
+        )
     }
 
     fn track_label(&self, kind: TrackKind, index: u32) -> Option<String> {
@@ -108,7 +116,8 @@ impl GroupPlayer for VideoPlayer {
             TrackKind::Audio => &self.audio,
             TrackKind::Subtitles => &self.subtitles,
         };
-        let track = tracks.iter().find(|t| t.index == index)?;
+        let own = self.map.to_own(kind, index)?;
+        let track = tracks.iter().find(|t| t.index == own)?;
         [&track.title, &track.language]
             .into_iter()
             .find(|s| !s.is_empty())
@@ -116,7 +125,28 @@ impl GroupPlayer for VideoPlayer {
     }
 
     fn apply_tracks(&self, picks: TrackPicks) {
-        self.tracks.send(picks);
+        let own = self.map.picks_to_own(picks);
+        let dropped = [
+            (
+                TrackKind::Audio,
+                picks.audio.filter(|_| own.audio.is_none()),
+            ),
+            (
+                TrackKind::Subtitles,
+                picks.subtitle.flatten().filter(|_| own.subtitle.is_none()),
+            ),
+        ];
+        for (kind, index) in dropped {
+            if let Some(index) = index {
+                platform::info(&format!(
+                    "pharos: group tracks unmapped kind={kind:?} index={index} version={:?}",
+                    self.version
+                ));
+            }
+        }
+        if own.audio.is_some() || own.subtitle.is_some() {
+            self.tracks.send(own);
+        }
     }
 }
 
