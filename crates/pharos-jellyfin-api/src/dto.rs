@@ -2018,13 +2018,7 @@ impl BaseItemDto {
             overview: item.metadata.overview.clone(),
             taglines: item.metadata.tagline.iter().cloned().collect(),
             community_rating: item.metadata.community_rating,
-            // B341 — an OMDb Tomatometer outranks an NFO <criticrating>.
-            critic_rating: item
-                .metadata
-                .ratings
-                .tomatometer
-                .map(f32::from)
-                .or(item.metadata.critic_rating),
+            critic_rating: shown_critic_rating(item),
             official_rating: item.metadata.official_rating.clone(),
             // LIB-C11 — fall back to the series folder's parsed year so
             // same-name shows (Cosmos 1980 vs 2014) are distinguishable
@@ -2316,6 +2310,23 @@ pub fn series_id_for(name: &str) -> String {
     use xxhash_rust::xxh3::xxh3_64;
     let h = xxh3_64(format!("series:{name}").as_bytes()) & 0x7FFFFFFFFFFFFFFF;
     format!("{h:016x}{h:016x}")
+}
+
+/// The critic rating an item answer carries. An admin's locked rating
+/// (ADR-0097, a cleared one included) outranks everything; otherwise an
+/// OMDb Tomatometer outranks an NFO `<criticrating>` (B341).
+pub fn shown_critic_rating(item: &pharos_core::MediaItem) -> Option<f32> {
+    if item
+        .locked
+        .contains(pharos_core::EditableField::CriticRating)
+    {
+        return item.metadata.critic_rating;
+    }
+    item.metadata
+        .ratings
+        .tomatometer
+        .map(f32::from)
+        .or(item.metadata.critic_rating)
 }
 
 /// LIB-C11 — stable 32-hex Series id keyed on the show's FOLDER path when
@@ -2922,6 +2933,24 @@ pub fn build_media_attachments(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    /// ADR-0097 — an admin's locked critic rating, a cleared one included,
+    /// is what the item answer shows; unlocked, the Tomatometer still wins.
+    #[test]
+    fn a_locked_critic_rating_outranks_the_tomatometer() {
+        let mut item = pharos_core::MediaItem::default();
+        item.metadata.ratings.tomatometer = Some(90);
+        item.metadata.critic_rating = Some(70.0);
+        assert_eq!(shown_critic_rating(&item), Some(90.0));
+        item.locked.insert(pharos_core::EditableField::CriticRating);
+        assert_eq!(shown_critic_rating(&item), Some(70.0));
+        item.metadata.critic_rating = None;
+        assert_eq!(
+            shown_critic_rating(&item),
+            None,
+            "a locked clear stays clear"
+        );
+    }
 
     /// ADR-0062 — jellyfin-web saves back the configuration it read, so the
     /// description language must survive the typed GET or the next save of

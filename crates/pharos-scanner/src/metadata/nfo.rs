@@ -778,9 +778,9 @@ fn normalise_certification(text: &str) -> String {
 /// Parse a Kodi date (`YYYY-MM-DD`, optionally with a time) into
 /// unix-seconds (UTC midnight of that date). Pure integer arithmetic — no
 /// chrono dependency. Returns `None` on an unparseable / out-of-range date.
-/// `pub(crate)` so the `embedded` provider reuses it for a container's raw
-/// `release_date` tag (B90).
-pub(crate) fn parse_date_unix(text: &str) -> Option<i64> {
+/// Public so the admin metadata editor and the `embedded` provider (a container's raw
+/// `release_date` tag, B90) read dates the same way.
+pub fn parse_date_unix(text: &str) -> Option<i64> {
     if is_epoch_placeholder(text) {
         return None;
     }

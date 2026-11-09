@@ -9,6 +9,7 @@ pub mod font_subset;
 pub mod group_seen;
 pub mod library;
 pub mod lyrics;
+pub mod metadata_edit;
 pub mod metadata_text;
 pub mod mix;
 pub mod person;

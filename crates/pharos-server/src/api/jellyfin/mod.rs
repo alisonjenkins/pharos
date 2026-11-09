@@ -14,6 +14,7 @@ pub mod item_ops;
 pub mod items;
 pub mod live_tv;
 pub(crate) mod media_source;
+mod metadata_edit;
 pub(crate) mod output_size;
 pub mod play_capability;
 pub mod playlists;
@@ -59,6 +60,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
     series_identity::register(cfg);
     items::register(cfg);
     item_ops::register(cfg);
+    metadata_edit::register(cfg);
     download::register(cfg);
     playlists::register(cfg);
     live_tv::register(cfg);
