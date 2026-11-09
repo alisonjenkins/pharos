@@ -5997,7 +5997,16 @@ body:has(.pharos-reader) {
   opacity: 0.4;
   cursor: default;
 }
+.pharos-reader-stage {
+  display: flex;
+  justify-content: center;
+  min-height: 0;
+  position: relative;
+}
+/* A line of about 40 characters' width at the text size (the host's own
+   font-size, set inline), centred; the stage behind it wears the page theme. */
 .pharos-reader-host {
+  flex: 0 1 40em;
   min-height: 0;
   min-width: 0;
   position: relative;
