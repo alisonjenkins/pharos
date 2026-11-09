@@ -1828,8 +1828,8 @@ const TV_MATCH_SURVEY_DRY_RUN_KEY: &str = "tv_match_survey_dry_run";
 /// Bump when [`survey_series_identity`] selects differently, so the next
 /// dry run surveys again under the same matcher version. `apply` records
 /// only [`TV_MATCH_VERSION`]. r2: B982/B983 run window. r3: B984 date 0,
-/// B985 title agreement.
-const SURVEY_REVISION: u32 = 3;
+/// B985 title agreement. r4: B986 run too short.
+const SURVEY_REVISION: u32 = 4;
 
 /// What [`TV_MATCH_SURVEY_DRY_RUN_KEY`] holds once a dry run surveyed `version`.
 fn dry_run_marker(version: &str) -> String {
