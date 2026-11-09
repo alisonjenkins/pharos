@@ -232,6 +232,9 @@ pub struct FsScanner<P: Prober> {
     /// forever — see [`crate::probe_memo`]. `None` (CLI scans, tests) keeps the
     /// old behaviour of retrying everything.
     probe_memo: Option<Arc<crate::probe_memo::ProbeMemo>>,
+    /// Spec 033 — whether a full pass writes the series split it decides, or
+    /// only logs it (`[metadata] series_identity_repair`).
+    series_identity_repair: crate::series_split::RepairMode,
     /// 004-books (T063) — where a book's extracted cover BYTES are written.
     ///
     /// A cover lives INSIDE the book file, so unlike every other artwork source
@@ -313,6 +316,7 @@ impl<P: Prober> FsScanner<P> {
             progress: None,
             cancel: None,
             probe_memo: None,
+            series_identity_repair: crate::series_split::RepairMode::DryRun,
             cover_sink: None,
         }
     }
@@ -331,6 +335,7 @@ impl<P: Prober> FsScanner<P> {
             progress: None,
             cancel: None,
             probe_memo: None,
+            series_identity_repair: crate::series_split::RepairMode::DryRun,
             cover_sink: None,
         }
     }
@@ -381,6 +386,14 @@ impl<P: Prober> FsScanner<P> {
     /// checkpoint (per group in phase 1, per probe result in phase 3) and skips
     /// the deletion sweep so a partial run never prunes unvisited files. The
     /// server wires this to the `DELETE /ScheduledTasks/Running/{id}` flag.
+    /// Spec 033 — write the series split a full pass decides
+    /// ([`RepairMode::Apply`](crate::series_split::RepairMode::Apply)) or only
+    /// log it (the default).
+    pub fn with_series_identity_repair(mut self, mode: crate::series_split::RepairMode) -> Self {
+        self.series_identity_repair = mode;
+        self
+    }
+
     pub fn with_cancel(mut self, flag: Arc<std::sync::atomic::AtomicBool>) -> Self {
         self.cancel = Some(flag);
         self
@@ -545,7 +558,13 @@ impl<P: Prober> FsScanner<P> {
     /// `pharos_scan_items_total{result}` for every run.
     #[tracing::instrument(skip(self, store), fields(root = %root.display()))]
     pub async fn scan_into<
-        S: MediaStore + GenreStore + PersonStore + StudioStore + CollectionStore + TagStore,
+        S: MediaStore
+            + GenreStore
+            + PersonStore
+            + StudioStore
+            + CollectionStore
+            + TagStore
+            + pharos_core::SeriesIdentityStore,
     >(
         &self,
         root: &Path,
@@ -583,7 +602,13 @@ impl<P: Prober> FsScanner<P> {
     }
 
     async fn scan_run<
-        S: MediaStore + GenreStore + PersonStore + StudioStore + CollectionStore + TagStore,
+        S: MediaStore
+            + GenreStore
+            + PersonStore
+            + StudioStore
+            + CollectionStore
+            + TagStore
+            + pharos_core::SeriesIdentityStore,
     >(
         &self,
         root: &Path,
@@ -596,6 +621,7 @@ impl<P: Prober> FsScanner<P> {
         } = walk(root.to_path_buf(), self.extensions.clone())
             .instrument(tracing::info_span!("scan.walk"))
             .await?;
+        let series_folders = crate::series_split::folders_of(&paths);
         let groups = group_by_edition(paths);
         let facts = copy_facts(store, &copy_candidates(&groups))
             .instrument(tracing::info_span!("scan.copy_facts"))
@@ -1076,7 +1102,11 @@ impl<P: Prober> FsScanner<P> {
         // A fold is final only on the pass whose sweep removes the copy's row;
         // folding on a pass that keeps the row would repeat the merge next
         // pass and re-mark watched what a viewer since marked unwatched.
+        let root_prefix = root.to_string_lossy();
         if !cancelled && walk_errors == 0 {
+            self.settle_series_identity(store, &series_folders, &root_prefix)
+                .instrument(tracing::info_span!("scan.series_identity"))
+                .await;
             settle_copies(store, scan_id, &folded).await?;
         } else if !folded.is_empty() {
             tracing::info!(
@@ -1087,7 +1117,6 @@ impl<P: Prober> FsScanner<P> {
                 "kept copies' rows unfolded: this pass does not sweep",
             );
         }
-        let root_prefix = root.to_string_lossy();
         let swept = if cancelled {
             tracing::info!(scan_id, "scan cancelled mid-run; skipping deletion sweep");
             Vec::new()
@@ -1152,6 +1181,44 @@ impl<P: Prober> FsScanner<P> {
         Ok(outcome)
     }
 
+    /// Spec 033 — split folders whose files state different show years and
+    /// write (or, in dry run, log) each file's series key. Runs only on a
+    /// complete walk: a partial listing could see one group of a split
+    /// folder and undo the split.
+    async fn settle_series_identity<S: pharos_core::SeriesIdentityStore>(
+        &self,
+        store: &S,
+        folders: &std::collections::BTreeMap<String, Vec<(PathBuf, Option<u32>)>>,
+        root_prefix: &str,
+    ) {
+        use crate::series_split as split;
+        let mode = self.series_identity_repair;
+        let result = async {
+            let ctx = split::context(store, folders).await?;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
+            let plan = split::plan(folders, &ctx, now);
+            split::reconcile(store, &plan, root_prefix, mode)
+                .await
+                .map(|changed| (changed, plan.splits.len()))
+        }
+        .await;
+        // Never fatal: the copy fold and the deletion sweep still run.
+        match result {
+            Ok((0, _)) => {}
+            Ok((changed, splits)) => {
+                tracing::info!(changed, splits, "series keys written");
+            }
+            Err(e) => tracing::warn!(
+                error = %e,
+                root = root_prefix,
+                mode = mode.label(),
+                "series identity pass failed; keys left as stored",
+            ),
+        }
+    }
+
     /// LIB-A8 — incremental update for a *single* path, the unit a
     /// filesystem watcher delivers (one created/modified file at a time).
     /// Mirrors the per-file branch of [`scan_into`] — stat, `scan_state`
@@ -1169,7 +1236,13 @@ impl<P: Prober> FsScanner<P> {
     /// failure on the one file is logged and yields [`PathUpdate::Skipped`]
     /// (V6: a bad file never aborts the watcher loop).
     pub async fn update_path<
-        S: MediaStore + GenreStore + PersonStore + StudioStore + CollectionStore + TagStore,
+        S: MediaStore
+            + GenreStore
+            + PersonStore
+            + StudioStore
+            + CollectionStore
+            + TagStore
+            + pharos_core::SeriesIdentityStore,
     >(
         &self,
         path: &Path,
@@ -1255,7 +1328,13 @@ impl<P: Prober> FsScanner<P> {
     /// Write the buffered probe results with one `put_batch`, then run each
     /// item's follow-up writes (their rows exist now).
     async fn flush_probe_writes<
-        S: MediaStore + GenreStore + PersonStore + StudioStore + CollectionStore + TagStore,
+        S: MediaStore
+            + GenreStore
+            + PersonStore
+            + StudioStore
+            + CollectionStore
+            + TagStore
+            + pharos_core::SeriesIdentityStore,
     >(
         &self,
         store: &S,
@@ -1326,7 +1405,13 @@ impl<P: Prober> FsScanner<P> {
 
     /// Everything a probed item needs once its row exists.
     async fn finish_written_item<
-        S: MediaStore + GenreStore + PersonStore + StudioStore + CollectionStore + TagStore,
+        S: MediaStore
+            + GenreStore
+            + PersonStore
+            + StudioStore
+            + CollectionStore
+            + TagStore
+            + pharos_core::SeriesIdentityStore,
     >(
         &self,
         store: &S,
@@ -1413,7 +1498,13 @@ impl<P: Prober> FsScanner<P> {
     /// `fp` is reused when already computed during move-detect.
     #[tracing::instrument(skip(self, store, sig, fp), fields(media.path = %path.display()))]
     async fn probe_put_one<
-        S: MediaStore + GenreStore + PersonStore + StudioStore + CollectionStore + TagStore,
+        S: MediaStore
+            + GenreStore
+            + PersonStore
+            + StudioStore
+            + CollectionStore
+            + TagStore
+            + pharos_core::SeriesIdentityStore,
     >(
         &self,
         path: &Path,
@@ -2845,6 +2936,17 @@ fn name_show_year(name: &str) -> Option<u32> {
         .last()
 }
 
+/// Spec 033 (V890) — the show name and year an episode's file name states
+/// before its episode number (`Battlestar Galactica (2003) - S01E01` gives
+/// `("Battlestar Galactica", 2003)`). The name is what precedes the year, so a
+/// caller can check that the year is this show's.
+pub(crate) fn name_show_name_and_year(name: &str) -> Option<(&str, u32)> {
+    let token = EPISODE_TOKEN_RE.as_ref()?.find(name)?;
+    let head = name.get(..token.start())?;
+    let year = SHOW_YEAR_RE.as_ref()?.captures_iter(head).last()?.get(1)?;
+    Some((head.get(..year.start())?, year.as_str().parse().ok()?))
+}
+
 static EP_SPAN_RE: std::sync::LazyLock<Option<regex::Regex>> = std::sync::LazyLock::new(|| {
     regex::Regex::new(r"(?i)s\d{1,4}e\d{1,4}(?:[-_ ]?e(\d{1,4})|-(\d{1,3})\b)+").ok()
 });
@@ -3770,6 +3872,8 @@ mod tests {
         alternate_sources_calls: AtomicUsize,
         // Every `merge_user_data(from, into, resume)` call, in order.
         merged: Mutex<Vec<(MediaId, MediaId, pharos_core::FoldResume)>>,
+        // Spec 033 — series_overrides mirror.
+        overrides: Mutex<Vec<pharos_core::SeriesOverride>>,
     }
 
     impl MediaStore for MemStore {
@@ -4656,6 +4760,78 @@ mod tests {
         }
     }
 
+    impl pharos_core::SeriesIdentityStore for MemStore {
+        async fn series_overrides(
+            &self,
+            folders: &[String],
+        ) -> DomainResult<Vec<pharos_core::SeriesOverride>> {
+            Ok(self
+                .overrides
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|o| folders.contains(&o.series_folder))
+                .cloned()
+                .collect())
+        }
+
+        async fn insert_series_override(
+            &self,
+            o: pharos_core::SeriesOverride,
+        ) -> DomainResult<bool> {
+            let mut all = self.overrides.lock().unwrap();
+            if all.iter().any(|x| {
+                x.source == o.source
+                    && x.path == o.path
+                    && (o.path.is_some() || x.series_folder == o.series_folder)
+            }) {
+                return Ok(false);
+            }
+            all.push(o);
+            Ok(true)
+        }
+
+        async fn series_identity_rows(
+            &self,
+            root_prefix: &str,
+        ) -> DomainResult<Vec<pharos_core::SeriesIdentityRow>> {
+            Ok(self
+                .inner
+                .lock()
+                .unwrap()
+                .values()
+                .filter(|i| i.path.starts_with(root_prefix))
+                .filter_map(|i| {
+                    let s = i.series.as_ref()?;
+                    Some(pharos_core::SeriesIdentityRow {
+                        path: i.path.to_string_lossy().into_owned(),
+                        series_folder: s.series_folder.clone(),
+                        series_key: s.series_key.clone(),
+                        series_year: s.series_year,
+                    })
+                })
+                .collect())
+        }
+
+        async fn set_series_keys(
+            &self,
+            updates: &[pharos_core::SeriesKeyUpdate],
+        ) -> DomainResult<u64> {
+            let mut n = 0;
+            for item in self.inner.lock().unwrap().values_mut() {
+                let Some(u) = updates.iter().find(|u| Path::new(&u.path) == item.path) else {
+                    continue;
+                };
+                if let Some(s) = item.series.as_mut() {
+                    s.series_key.clone_from(&u.series_key);
+                    s.series_year = u.series_year;
+                    n += 1;
+                }
+            }
+            Ok(n)
+        }
+    }
+
     // LIB-C6 — minimal in-memory TagStore so the scanner's link-on-write
     // path (NFO <tag> + filename quality tokens) can be exercised without
     // the sqlx store. Tags are a Vec per item; add/remove mutate in place.
@@ -5454,6 +5630,149 @@ mod tests {
                 _ => None,
             })
             .unwrap_or(0)
+    }
+
+    fn series_metric(
+        snap: &pharos_test_metrics::CumulativeSnapshotter,
+        name: &str,
+        labels: &[(&str, &str)],
+    ) -> Option<f64> {
+        use metrics_util::debugging::DebugValue;
+        snap.snapshot()
+            .into_vec()
+            .into_iter()
+            .find_map(|(ck, _, _, v)| {
+                let key = ck.key();
+                let hit = key.name() == name
+                    && labels
+                        .iter()
+                        .all(|(k, want)| key.labels().any(|l| l.key() == *k && l.value() == *want));
+                match v {
+                    DebugValue::Counter(n) if hit => Some(n as f64),
+                    DebugValue::Gauge(g) if hit => Some(g.into_inner()),
+                    _ => None,
+                }
+            })
+    }
+
+    async fn write_flash(td: &Path) {
+        write_file(td, "The Flash/Season 1/The Flash (1990) - S01E01.mkv", b"a").await;
+        write_file(td, "The Flash/Season 1/The Flash (2014) - S01E01.mkv", b"b").await;
+        write_file(td, "The Flash/Season 1/The Flash (2014) - S01E02.mkv", b"c").await;
+    }
+
+    fn keys_of(store: &MemStore) -> Vec<(String, Option<String>, Option<u32>)> {
+        let mut out: Vec<_> = store
+            .inner
+            .lock()
+            .unwrap()
+            .values()
+            .filter_map(|i| {
+                let s = i.series.as_ref()?;
+                Some((
+                    i.path.file_name()?.to_string_lossy().into_owned(),
+                    s.series_key.as_ref().map(|k| {
+                        k.rsplit_once('\u{1f}')
+                            .map_or_else(|| "folder".to_string(), |(_, y)| y.to_string())
+                    }),
+                    s.series_year,
+                ))
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// V893: a folder whose files state two show years is two shows; in
+    /// apply mode the scan gives the smaller group its own key and remembers
+    /// which group keeps the folder's.
+    #[tokio::test]
+    async fn an_applied_scan_splits_a_folder_stating_two_show_years() {
+        use crate::series_split::RepairMode;
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = pharos_test_metrics::snapshotter(&recorder);
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let td = TempDir::new().unwrap();
+        write_flash(td.path()).await;
+        let store = MemStore::default();
+        let scanner =
+            FsScanner::new(FakeProber::default()).with_series_identity_repair(RepairMode::Apply);
+        scanner.scan_into(td.path(), &store).await.unwrap();
+
+        assert_eq!(
+            keys_of(&store),
+            vec![
+                (
+                    "The Flash (1990) - S01E01.mkv".into(),
+                    Some("1990".into()),
+                    Some(1990)
+                ),
+                ("The Flash (2014) - S01E01.mkv".into(), None, Some(2014)),
+                ("The Flash (2014) - S01E02.mkv".into(), None, Some(2014)),
+            ]
+        );
+        let owners = store.overrides.lock().unwrap().clone();
+        assert_eq!(owners.len(), 1);
+        assert_eq!(owners[0].target_year, Some(2014));
+        assert_eq!(
+            series_metric(
+                &snapshotter,
+                "pharos_series_folder_split_total",
+                &[("reason", "stated_years")]
+            ),
+            Some(1.0)
+        );
+        assert_eq!(
+            series_metric(
+                &snapshotter,
+                "pharos_series_identity_repair_rows",
+                &[("change", "series_key"), ("mode", "apply")]
+            ),
+            Some(3.0)
+        );
+
+        // A second pass changes nothing and keeps the remembered owner.
+        let before = keys_of(&store);
+        scanner.scan_into(td.path(), &store).await.unwrap();
+        assert_eq!(keys_of(&store), before);
+        assert_eq!(store.overrides.lock().unwrap().len(), 1);
+    }
+
+    /// Spec 033 §6.2: the default dry run counts the split it would make and
+    /// writes nothing.
+    #[tokio::test]
+    async fn a_dry_run_scan_counts_the_split_and_writes_nothing() {
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = pharos_test_metrics::snapshotter(&recorder);
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let td = TempDir::new().unwrap();
+        write_flash(td.path()).await;
+        let store = MemStore::default();
+        FsScanner::new(FakeProber::default())
+            .scan_into(td.path(), &store)
+            .await
+            .unwrap();
+
+        assert!(keys_of(&store)
+            .iter()
+            .all(|(_, k, y)| k.is_none() && y.is_none()));
+        assert!(store.overrides.lock().unwrap().is_empty());
+        assert_eq!(
+            series_metric(
+                &snapshotter,
+                "pharos_series_folder_split_total",
+                &[("reason", "stated_years")]
+            ),
+            Some(1.0)
+        );
+        assert_eq!(
+            series_metric(
+                &snapshotter,
+                "pharos_series_identity_repair_rows",
+                &[("change", "series_key"), ("mode", "dry_run")]
+            ),
+            Some(3.0)
+        );
     }
 
     #[tokio::test]
