@@ -326,6 +326,10 @@ The page talks to the server over REST, `/admin/series-identity/*` behind
 interface is out of scope. A fix's own rows take effect in either repair
 mode; the re-plan it triggers otherwise follows the configured mode, so under
 `"dry_run"` the scanner's own split of the same folder stays held.
+The page's split list comes from the scanner's plan over the stored rows,
+not only the stored keys: each folder is marked `applied` (its rows match the
+plan) or `pending` with the rows still to move, so a dry run's held splits and
+would-move files are visible before the switch to `"apply"`.
 
 Signal: `sum by (action) (increase(pharos_series_override_total[1d]))`,
 `action` ∈ `pick_show | confirm | move_files | keep_together | remove`, and a
