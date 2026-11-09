@@ -3602,6 +3602,8 @@ struct Playing {
     detail: Detail,
     /// The version playing, so a renewed grant stays on that file (empty: the primary).
     version: String,
+    /// Its streams against the primary's, which the group's picks name.
+    track_map: track_follow::TrackMap,
     /// The tracks the server started this playback on.
     audio: Option<u32>,
     subtitle: Option<u32>,
@@ -3860,20 +3862,29 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
                 }
                 // The chosen file's tracks and fonts are its own, so its detail
                 // is fetched once more; the primary's stands when it plays.
+                let primary_tracks = (
+                    primary.audio_tracks.clone(),
+                    primary.subtitle_tracks.clone(),
+                );
                 let detail = if version.is_empty() {
                     primary
                 } else {
                     api.detail_version(&info, id, &version).await?
                 };
+                let track_map = track_follow::TrackMap::new(
+                    (&detail.audio_tracks, &detail.subtitle_tracks),
+                    (&primary_tracks.0, &primary_tracks.1),
+                );
                 // Every start of an episode comes through here: from its
                 // title page, the next-episode button, up next and the
                 // episode turn alike.
                 let asked = show_tracks::show_of(&detail).map_or(asked, |series| {
+                    // The group names the primary's streams (ADR-0089).
                     let followed = together.current().and_then(|s| {
-                        let audio: Vec<u32> = detail.audio_tracks.iter().map(|t| t.index).collect();
-                        let subtitles: Vec<u32> =
-                            detail.subtitle_tracks.iter().map(|t| t.index).collect();
+                        let audio = track_map.primary_indexes(activity::TrackKind::Audio);
+                        let subtitles = track_map.primary_indexes(activity::TrackKind::Subtitles);
                         s.tracks_followed(&audio, &subtitles)
+                            .map(|picks| track_map.picks_to_own(picks))
                     });
                     show_tracks::start_picks(
                         followed.as_ref(),
@@ -3884,11 +3895,11 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
                 });
                 let caps = negotiation_capabilities(detail.item.kind, auto);
                 let (decision, grant) = api.play(&info, id, &version, &caps, asked).await?;
-                Ok::<_, ClientError>((detail, version, decision, grant, asked))
+                Ok::<_, ClientError>((detail, version, decision, grant, asked, track_map))
             }
             .await;
             Some(
-                settle(ctx.machine, result).and_then(|(detail, version, decision, grant, asked)| {
+                settle(ctx.machine, result).and_then(|(detail, version, decision, grant, asked, track_map)| {
                     let (mse_engine, engine_reason) = mse_engine_choice();
                     let picked = choose_engine(
                         decision.is_hls(),
@@ -3950,6 +3961,7 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
                         grant_gen: Cell::new(grant_gen),
                         detail,
                         version,
+                        track_map,
                         audio: decision.audio,
                         subtitle: decision.subtitle,
                         asked_audio: match asked.audio {
@@ -4786,11 +4798,14 @@ fn Player(
             p.detail.audio_tracks.clone(),
             p.detail.subtitle_tracks.clone(),
         );
+        let (map, version) = (p.track_map.clone(), p.version.clone());
         move || {
             let video: Rc<dyn GroupPlayer> = Rc::new(VideoPlayer {
                 id: VIDEO_ID,
                 audio,
                 subtitles,
+                map,
+                version,
                 tracks: group_tracks,
             });
             together.attach(item, Rc::clone(&video));
@@ -5397,6 +5412,18 @@ fn Player(
             if retiring.get() {
                 return;
             }
+            // A menu pick as the primary's stream, which the group names
+            // (ADR-0089); one the primary lacks stays on this player.
+            let to_group = |kind: activity::TrackKind, own: u32| {
+                let mapped = p.track_map.to_primary(kind, own);
+                if mapped.is_none() {
+                    platform::info(&format!(
+                        "pharos: group tracks unmapped kind={kind:?} index={own} version={:?} dir=send",
+                        p.version
+                    ));
+                }
+                mapped
+            };
             // In a group the viewer's play, pause and seek are the group's.
             let seek = |ms: u64| {
                 watch.0.borrow_mut().seeking(now_ms_u64());
@@ -5640,7 +5667,8 @@ fn Player(
                         show_tracks::keep(series, |s| show_tracks::chose_audio(s, tracks, index));
                     }
                     let Some(index) = track_follow::audio_pick_here(p.audio, index, |index| {
-                        session().is_some_and(|s| s.pick_audio(index))
+                        to_group(activity::TrackKind::Audio, index)
+                            .is_some_and(|i| session().is_some_and(|s| s.pick_audio(i)))
                     }) else {
                         return;
                     };
@@ -5656,7 +5684,11 @@ fn Player(
                         show_tracks::keep(series, |s| show_tracks::chose_subtitle(s, tracks, to));
                     }
                     let here = track_follow::subtitle_pick_here(*subtitle.peek(), to, |to| {
-                        session().is_some_and(|s| s.pick_subtitle(to))
+                        let to = match to {
+                            None => Some(None),
+                            Some(i) => to_group(activity::TrackKind::Subtitles, i).map(Some),
+                        };
+                        to.is_some_and(|to| session().is_some_and(|s| s.pick_subtitle(to)))
                     });
                     if !here {
                         return;
