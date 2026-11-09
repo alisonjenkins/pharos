@@ -6,7 +6,7 @@
 use dioxus::html::geometry::WheelDelta;
 use dioxus::html::input_data::MouseButton;
 use dioxus::prelude::*;
-use pharos_client::api::{Chapter, Item, ItemRef, Segment, Track, Trickplay};
+use pharos_client::api::{Chapter, Damage, Item, ItemRef, Segment, Track, Trickplay};
 
 use super::keymap::{self, Mode, Transport};
 use super::keys;
@@ -14,6 +14,7 @@ use super::quality::{self, QualityView};
 use super::scrub::{self, Scrub};
 
 use super::art::Art;
+use super::damage::{in_span, PlayerDamageNote};
 use super::listen::{Icon, QueuePanel, ICON_FLOAT, ICON_PIP, ICON_QUEUE_NEXT, QUEUE_PANEL_ID};
 use super::platform;
 use super::playback::{
@@ -82,6 +83,9 @@ pub struct Controls {
     pub runtime_ms: u64,
     pub chapters: Vec<Chapter>,
     pub segments: Vec<Segment>,
+    /// What is wrong with the file, when the integrity check found it
+    /// damaged: its spans are marked on the seek bar.
+    pub damage: Option<Damage>,
     /// The sprite set the seek-bar preview draws from.
     pub preview: Option<Trickplay>,
     /// Where the pointer is over the seek bar.
@@ -836,6 +840,9 @@ pub fn WatchView(
                     }
                 }
                 ActivityToast { line: toast }
+                if let Some(damage) = c.damage.clone() {
+                    PlayerDamageNote { damage }
+                }
                 if let Some(card) = c.up_next.clone() {
                     UpNext { card, on_control }
                 } else {
@@ -1058,8 +1065,14 @@ fn SeekBar(
             .map(|ch| ch.name.clone())
             .filter(|n| !n.is_empty());
         let thumb = c.preview.as_ref().and_then(|set| thumb_at(set, ms));
-        (percent(ms, total), clock(ms), chapter, thumb)
+        let damaged = c.damage.as_ref().is_some_and(|d| in_span(&d.ranges, ms));
+        (percent(ms, total), clock(ms), chapter, thumb, damaged)
     });
+    let damaged_spans = c
+        .damage
+        .as_ref()
+        .map(|d| d.ranges.clone())
+        .unwrap_or_default();
     rsx! {
         div {
             id: SEEK_ID,
@@ -1086,6 +1099,13 @@ fn SeekBar(
                     }
                 }
                 span { class: "pharos-seek-played", style: "width: {played}%" }
+                for (i, s) in damaged_spans.iter().enumerate() {
+                    span {
+                        key: "damage-{i}",
+                        class: "pharos-seek-damage",
+                        style: "left: {percent(s.start_ms, total)}%; width: {percent(s.end_ms, total) - percent(s.start_ms, total)}%",
+                    }
+                }
                 for (i, ch) in c.chapters.iter().enumerate().filter(|(_, ch)| ch.start_ms > 0) {
                     span {
                         key: "{i}",
@@ -1098,7 +1118,7 @@ fn SeekBar(
                 }
             }
             span { class: "pharos-seek-knob", style: "left: {played}%" }
-            if let Some((at, time, chapter, thumb)) = hover {
+            if let Some((at, time, chapter, thumb, damaged)) = hover {
                 div { class: "pharos-seek-preview", style: "left: {at}%",
                     if let Some(t) = thumb {
                         div {
@@ -1108,6 +1128,9 @@ fn SeekBar(
                     }
                     if let Some(name) = chapter {
                         span { class: "pharos-seek-chapter-name", "{name}" }
+                    }
+                    if damaged {
+                        span { class: "pharos-seek-damage-name", "Damaged" }
                     }
                     span { class: "pharos-seek-time", "{time}" }
                 }
@@ -1838,6 +1861,47 @@ mod tests {
             html.contains(">Ends at ") && !html.contains("before credits"),
             "{html}"
         );
+    }
+
+    /// B938: a damaged file starts with a short note saying where, its spans
+    /// are marked on the seek bar, and the preview names one under the pointer.
+    #[test]
+    fn a_damaged_file_is_noted_and_its_spans_marked() {
+        use pharos_client::api::DamageSpan;
+        let clean = render(controls());
+        assert!(!clean.contains("pharos-player-damage"), "{clean}");
+        assert!(!clean.contains("pharos-seek-damage"), "{clean}");
+
+        let mut c = controls();
+        c.damage = Some(Damage {
+            verdict: "damaged".into(),
+            ranges: vec![DamageSpan {
+                start_ms: 300_000,
+                end_ms: 600_000,
+            }],
+            ..Damage::default()
+        });
+        c.hover_ms = Some(310_000);
+        let html = render(c.clone());
+        assert!(
+            html.contains("This file is damaged at 5:00–10:00. Playback may skip or stop there."),
+            "{html}"
+        );
+        let total = c.runtime_ms;
+        let left = percent(300_000, total);
+        let width = percent(600_000, total) - left;
+        assert!(
+            html.contains(&format!(
+                r#"class="pharos-seek-damage" style="left: {left}%; width: {width}%""#
+            )),
+            "{html}"
+        );
+        assert!(
+            html.contains(r#"<span class="pharos-seek-damage-name">Damaged</span>"#),
+            "{html}"
+        );
+        c.hover_ms = Some(900_000);
+        assert!(!render(c).contains("pharos-seek-damage-name"));
     }
 
     /// B569/V482: the knob rides the end of the fill, and a tick the video

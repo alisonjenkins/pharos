@@ -1707,6 +1707,38 @@ body:has(.pharos-stage.is-full) .pharos-status-note {
   color: #fff; /* not themed: controls sit on the video, whose colours no theme sets */
   pointer-events: none;
 }
+/* The note a damaged file starts with (B938): small, in a corner, and gone by
+   itself after ~8 s, so the video keeps the screen. The seek bar keeps the
+   spans marked after it fades. */
+.pharos-player-damage {
+  position: absolute;
+  right: 1rem;
+  top: 4.5rem;
+  max-width: min(26rem, calc(100% - 2rem));
+  padding: 0.35rem 0.75rem;
+  border-radius: 6px;
+  font-size: 0.85rem;
+  background: rgb(0 0 0 / 0.65); /* not themed: controls sit on the video, whose colours no theme sets */
+  color: #fff; /* not themed: controls sit on the video, whose colours no theme sets */
+  pointer-events: none;
+  animation: pharos-player-damage 9s ease forwards;
+}
+.pharos-player-damage .pharos-damage-mark {
+  color: rgb(255 196 92); /* not themed: controls sit on the video, whose colours no theme sets */
+}
+@keyframes pharos-player-damage {
+  0% {
+    opacity: 0;
+  }
+  4%,
+  88% {
+    opacity: 1;
+  }
+  100% {
+    opacity: 0;
+    visibility: hidden;
+  }
+}
 /* Centred over the video and outside the chrome that fades on idle, so a seek
    or mid-play stall shows work is happening after the controls hide (B551).
    The 300 ms fade-in keeps quick seeks inside the buffer from flashing it; the
@@ -2296,6 +2328,18 @@ body:has(.pharos-stage.is-full) .pharos-status-note {
 }
 .pharos-seek-segment {
   background: rgb(255 255 255 / 0.35); /* not themed: controls sit on the video, whose colours no theme sets */
+}
+/* Damaged spans sit over the played fill, and a span one packet wide still
+   shows as a sliver. */
+.pharos-seek-track > .pharos-seek-damage {
+  min-width: 3px;
+  border-radius: 1px;
+  background: rgb(255 176 32 / 0.9); /* not themed: controls sit on the video, whose colours no theme sets */
+  z-index: 1;
+}
+.pharos-seek-damage-name {
+  color: rgb(255 196 92); /* not themed: controls sit on the video, whose colours no theme sets */
+  font-weight: 600;
 }
 /* Light ticks with a dark rim stand out on the played fill and the groove
    alike, and stand a little proud of both. */
