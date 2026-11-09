@@ -803,6 +803,60 @@ impl NativeApi {
         }
     }
 
+    /// Marks `id` one of the signed-in user's favourites (`true`) or not; a
+    /// series or season marks every episode in it. Answers whether it is now
+    /// a favourite.
+    pub async fn set_favorite(
+        &self,
+        call: &CallInfo,
+        id: ItemRef,
+        favorite: bool,
+    ) -> Result<bool, ClientError> {
+        let mut req = self.user_data.set_favorite_request();
+        {
+            let mut p = req.get();
+            call.write(p.reborrow().init_ctx());
+            set_item_ref(p.reborrow().init_id(), id);
+            p.set_favorite(favorite);
+        }
+        let reply = req.send().promise.await?;
+        match reply
+            .get()?
+            .get_result()?
+            .which()
+            .map_err(capnp::Error::from)?
+        {
+            user_state_result::State(s) => Ok(s?.get_favorite()),
+            user_state_result::Error(e) => Err(ClientError::from_api(e?)),
+        }
+    }
+
+    /// The first `limit` of the signed-in user's favourites of one `kind`,
+    /// across every library, by name. A series counts while every episode
+    /// in it is a favourite, which is what marking the series writes.
+    pub async fn favorites(
+        &self,
+        call: &CallInfo,
+        kind: ItemKind,
+        limit: u32,
+    ) -> Result<Page, ClientError> {
+        let Some(kind) = wire_kind(kind) else {
+            return Ok(Page::default());
+        };
+        let mut req = self.library.query_request();
+        {
+            let mut p = req.get();
+            call.write(p.reborrow().init_ctx());
+            let mut q = p.init_q();
+            q.reborrow().init_kinds(1).set(0, kind);
+            q.set_sort_by("SortName");
+            q.reborrow().init_filters(1).set(0, "IsFavorite");
+            q.set_limit(limit);
+        }
+        let reply = req.send().promise.await?;
+        read_page(reply.get()?.get_result()?)
+    }
+
     /// Who is signed in.
     pub async fn me(&self, call: &CallInfo) -> Result<Me, ClientError> {
         let mut req = self.session.me_request();
