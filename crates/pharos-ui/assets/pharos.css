@@ -2884,6 +2884,23 @@ button.pharos-lyrics-line:focus-visible {
   transition: --pharos-wipe 250ms linear;
   filter: drop-shadow(0 0 14px var(--pharos-glow));
 }
+/* Over the top of the lyrics pane while the aligner is still timing the
+   words (B937): the fill meanwhile is an estimate. */
+.pharos-lyrics-timing {
+  position: absolute;
+  top: 5rem;
+  left: 50%;
+  translate: -50% 0;
+  z-index: 1;
+  margin: 0;
+  padding: 0.25rem 0.75rem;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--px-color-overlay) 70%, transparent);
+  color: var(--px-color-fg-muted);
+  font-size: 0.85rem;
+  white-space: nowrap;
+  pointer-events: none;
+}
 .pharos-listen-note {
   grid-column: 1 / -1;
   margin: 0;
@@ -2900,6 +2917,13 @@ button.pharos-lyrics-line:focus-visible {
   }
   .pharos-lyrics {
     inset: 9.5rem 0 14rem;
+  }
+  .pharos-lyrics-timing {
+    top: 10rem;
+    white-space: normal;
+    width: max-content;
+    max-width: calc(100% - 2rem);
+    text-align: center;
   }
   .pharos-listen-cover {
     width: 3.5rem;
