@@ -116,8 +116,13 @@ impl IntegrityMemo {
     }
 
     /// Whether this file, in this state, has already been read end to end.
+    ///
+    /// A damaged verdict recorded before damage spans existed does not count:
+    /// players mark those spans, and the few damaged files are cheap to read
+    /// again, unlike bumping [`INTEGRITY_SCAN_VERSION`] for the whole library.
     pub fn is_scanned(&self, id: u64, sig: Option<(i64, u64)>) -> bool {
-        self.get(id, sig).is_some()
+        self.get(id, sig)
+            .is_some_and(|e| !e.report.is_damaged() || e.report.ranges.is_some())
     }
 
     /// Record a verdict.
@@ -236,8 +241,43 @@ mod tests {
             first_fault: Some("[matroska,webm] invalid as first byte of an EBML number".into()),
             scanned_ms: 19_000,
             complete: true,
+            ranges: Some(vec![pharos_transcode::integrity::DamageRange {
+                start_ms: 2_870,
+                end_ms: 3_400,
+            }]),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn a_damaged_verdict_from_before_spans_is_read_again() {
+        let memo = IntegrityMemo::load("/nonexistent/memo.json", 1);
+        let legacy = IntegrityReport {
+            ranges: None,
+            ..damaged()
+        };
+        memo.record(1, Some((100, 500)), legacy);
+        memo.record(
+            2,
+            Some((100, 500)),
+            IntegrityReport {
+                ranges: None,
+                ..clean()
+            },
+        );
+        assert!(
+            !memo.is_scanned(1, Some((100, 500))),
+            "it needs its spans for the seek bar"
+        );
+        assert!(
+            memo.is_scanned(2, Some((100, 500))),
+            "a clean file has no spans to gain"
+        );
+        assert_eq!(
+            memo.damaged().len(),
+            1,
+            "still listed until the re-read lands"
+        );
     }
 
     /// The load-bearing difference from `probe_memo`: a CLEAN verdict must be
