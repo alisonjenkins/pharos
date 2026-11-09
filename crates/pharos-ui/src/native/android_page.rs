@@ -577,7 +577,10 @@ impl Drop for SentinelWatch {
 /// Call `on_visible` each time one of the elements with `ids` comes into
 /// view, as the browser's observer does, so a grid loads its next page on
 /// scroll instead of only from "Show more".
-pub fn watch_sentinel(ids: &[&str], mut on_visible: impl FnMut() + 'static) -> Option<SentinelWatch> {
+pub fn watch_sentinel(
+    ids: &[&str],
+    mut on_visible: impl FnMut() + 'static,
+) -> Option<SentinelWatch> {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     static NEXT_SENTINEL: AtomicU64 = AtomicU64::new(0);
     let watch = NEXT_SENTINEL.fetch_add(1, Ordering::Relaxed);
@@ -599,7 +602,9 @@ pub fn watch_sentinel(ids: &[&str], mut on_visible: impl FnMut() + 'static) -> O
                 }
                 Ok(false) => break,
                 Err(e) => {
-                    log::warn!("pharos: sentinel watch failed watch={watch} fired={fired} error={e}");
+                    log::warn!(
+                        "pharos: sentinel watch failed watch={watch} fired={fired} error={e}"
+                    );
                     return;
                 }
             }
