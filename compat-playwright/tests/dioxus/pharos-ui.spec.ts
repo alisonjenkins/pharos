@@ -2019,6 +2019,162 @@ test.describe("pharos Dioxus UI", () => {
       );
     });
 
+    // V638, V640, V1062 (spec 031 T16): a segment the browser cannot parse makes
+    // the Rust engine build a fresh MediaSource at the play head, as hls.js's
+    // recoverMediaError does. One bad copy costs one rebuild and playback
+    // goes on past it; a segment that is bad every time spends the budget,
+    // because no rebuild plays far enough to refill it, and then fails.
+    for (const always of [false, true]) {
+      test(`the Rust engine ${always ? "gives up on a segment that never parses" : "rebuilds the MediaSource after a corrupt segment"}`, async ({
+        page,
+        request,
+      }) => {
+        test.setTimeout(120_000);
+        const probe = await request.get(`${PHAROS_URL}/pharos/session`, {
+          headers: { Accept: "application/json" },
+        });
+        test.skip(
+          probe.status() !== 405,
+          `native API is not enabled (status ${probe.status()})`,
+        );
+        const auth = await request.post(
+          `${PHAROS_URL}/Users/AuthenticateByName`,
+          {
+            headers: {
+              "Content-Type": "application/json",
+              "X-Emby-Authorization": `MediaBrowser Client="playwright", Device="pw", DeviceId="pw-rebuild-${Date.now()}", Version="0"`,
+            },
+            data: { Username: TEST_USER, Pw: TEST_PASS },
+          },
+        );
+        test.skip(!auth.ok(), `pharos has no seeded test user (${TEST_USER})`);
+        const { AccessToken: token, User: user } = await auth.json();
+        const api = { "X-Emby-Token": token };
+        const fixture = async () =>
+          (
+            await (
+              await request.get(
+                `${PHAROS_URL}/Users/${user.Id}/Items?Recursive=true&IncludeItemTypes=Movie&Fields=Path,MediaSources`,
+                { headers: api },
+              )
+            ).json()
+          ).Items?.find((i: { Path?: string }) =>
+            i.Path?.endsWith("/fixture-1.webm"),
+          );
+        await expect
+          .poll(async () => (await fixture())?.MediaSources?.[0]?.Container, {
+            timeout: 30_000,
+          })
+          .toMatch(/webm/);
+        const movie = await fixture();
+        test.skip(!movie, "pharos has no seeded movie");
+        const nativeId = BigInt(`0x${movie.Id}`).toString();
+        await request.post(`${PHAROS_URL}/Sessions/Playing/Progress`, {
+          headers: api,
+          data: {
+            ItemId: movie.Id,
+            PlaySessionId: `pw-reset-${Date.now()}`,
+            PositionTicks: 0,
+            IsPaused: true,
+          },
+        });
+
+        await page.addInitScript(() => {
+          const canPlayType = HTMLMediaElement.prototype.canPlayType;
+          HTMLMediaElement.prototype.canPlayType = function (type: string) {
+            return /mpegurl|webm|matroska/i.test(type)
+              ? ""
+              : canPlayType.call(this, type);
+          };
+        });
+        const logs: string[] = [];
+        page.on("console", (m) => logs.push(m.text()));
+        // A real segment with an unknown top-level box type (Firefox rejects
+        // it, Chromium skips it) and then a child box claiming to be larger
+        // than its parent (Chromium rejects that). Random bytes may only
+        // read as a box still arriving. Firefox reports it through the
+        // element's decode error, Chromium through the SourceBuffer.
+        let corrupted = 0;
+        await page.route(
+          (url) => /\/h264cmaf\/(?:[^/]+\/)?2\.m4s$/.test(url.pathname),
+          async (route) => {
+            if (!always && corrupted > 0) {
+              await route.continue();
+              return;
+            }
+            const body = Buffer.from(await (await route.fetch()).body());
+            body.write("junk", 4, "latin1");
+            body.writeUInt32BE(0xffff_fff0, 8);
+            corrupted += 1;
+            await route.fulfill({
+              status: 200,
+              contentType: "video/mp4",
+              body,
+            });
+          },
+        );
+
+        await page.goto("/ui/");
+        await page.locator("#signin-name").fill(TEST_USER);
+        await page.locator("#signin-password").fill(TEST_PASS);
+        await page.getByRole("button", { name: "Sign in" }).click();
+        await expect(page.locator(".pharos-shell-bar")).toBeVisible({
+          timeout: 15_000,
+        });
+
+        await page.goto(`/ui/watch/${nativeId}?engine=rust`);
+        const errors = () =>
+          logs.filter((l) =>
+            l.includes("playback error engine=rust type=mediaError"),
+          );
+        const recovered = () =>
+          logs.filter((l) => l.includes("playback recovered engine=rust"));
+
+        if (!always) {
+          await expect.poll(() => errors().length, { timeout: 30_000 }).toBe(1);
+          expect(errors()[0]).toMatch(
+            /details=(?:bufferAppendError|videoDecodeError) .*fatal=true action=recover_media attempt=1 at_ms=\d+ /,
+          );
+          await expect
+            .poll(() => recovered().length, { timeout: 30_000 })
+            .toBe(1);
+          expect(recovered()[0]).toMatch(
+            /action=recover_media attempt=1 at_ms=\d+ took_ms=\d+ /,
+          );
+          const at = () =>
+            page.evaluate(() => {
+              const v = document.getElementById(
+                "pharos-video",
+              ) as HTMLVideoElement | null;
+              return v?.currentTime ?? 0;
+            });
+          await expect.poll(at, { timeout: 60_000 }).toBeGreaterThan(13);
+          expect(corrupted).toBe(1);
+          expect(errors()).toHaveLength(1);
+          expect(logs.filter((l) => l.includes("engine=rust fallback="))).toEqual(
+            [],
+          );
+          return;
+        }
+
+        await expect
+          .poll(() => errors().some((l) => l.includes("action=fail")), {
+            timeout: 60_000,
+          })
+          .toBe(true);
+        expect(
+          errors().map((l) => /action=(\S+) attempt=(\d+)/.exec(l)?.slice(1)),
+        ).toEqual([
+          ["recover_media", "1"],
+          ["recover_media", "2"],
+          ["recover_media", "3"],
+          ["fail", "3"],
+        ]);
+        expect(recovered()).toEqual([]);
+        expect(corrupted).toBe(4);
+      });
+    }
+
     // B733: after the back buffer is trimmed, a seek to just before where the
     // remaining data starts lands in a segment that is only partly buffered.
     // The Rust engine must fetch it again, not wait on data it never asks for.
