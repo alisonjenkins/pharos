@@ -256,16 +256,34 @@ where
             tracing::warn!(error = %e, "T9 metadata backfill: show matcher version check failed");
         }
     }
+    let mut series_enriched = 0usize;
+    let mut series_work = false;
+    // Series-container pass (the series-level record), first: an episode
+    // takes its record from its show's match (V892), so a show matched here
+    // lets its episodes enrich in the item pass below.
+    if tvdb.is_some() || tmdb.is_some() {
+        match enrich_series_pass(store, bg_io, cache, tvdb, tmdb, cfg, now).await {
+            Ok((n, series_had_work)) => {
+                if n > 0 {
+                    tracing::info!(enriched = n, "T9-series metadata backfill: shows enriched");
+                }
+                series_enriched = n;
+                series_work = series_had_work;
+            }
+            Err(e) => tracing::warn!(error = %e, "T9-series metadata backfill: pass aborted"),
+        }
+    }
+
     // Items whose last enrichment predates this cutoff (or never matched) are
     // eligible; `manual` rows are excluded by the query itself.
     let ttl_cutoff = now.saturating_sub(i64::from(cfg.refresh_ttl_days) * 86_400);
     let items = store
         .items_needing_match(cfg.max_per_pass, ttl_cutoff)
         .await?;
-    let mut enriched = 0usize;
+    let mut enriched = series_enriched;
     // Any eligible row (even one that resolves to `none`/transient) is work:
     // processing it advances the backlog, so the loop should keep draining.
-    let mut had_work = !items.is_empty();
+    let mut had_work = series_work || !items.is_empty();
     if !items.is_empty() {
         tracing::info!(total = items.len(), "T9 metadata backfill: enriching items");
         for item in items {
@@ -290,21 +308,6 @@ where
                 had_work |= audio_had_work;
             }
             Err(e) => tracing::warn!(error = %e, "musicbrainz album-art pass aborted"),
-        }
-    }
-
-    // Series-container pass (the series-level record). Runs even when no items
-    // needed matching: episodes and shows drain independently.
-    if tvdb.is_some() || tmdb.is_some() {
-        match enrich_series_pass(store, bg_io, cache, tvdb, tmdb, cfg, now).await {
-            Ok((n, series_had_work)) => {
-                if n > 0 {
-                    tracing::info!(enriched = n, "T9-series metadata backfill: shows enriched");
-                }
-                enriched += n;
-                had_work |= series_had_work;
-            }
-            Err(e) => tracing::warn!(error = %e, "T9-series metadata backfill: pass aborted"),
         }
     }
 

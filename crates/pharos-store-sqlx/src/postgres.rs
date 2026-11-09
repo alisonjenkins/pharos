@@ -1394,7 +1394,11 @@ impl MediaStore for PostgresStore {
             "SELECT {MEDIA_COLUMNS} FROM media_items \
              WHERE (match_source IS NULL OR match_source IN ('search','none','nfo_id')) \
                AND (metadata_refreshed_at IS NULL OR metadata_refreshed_at < $1) \
-               AND kind IN ('movie','episode') \
+               AND (kind = 'movie' \
+                    OR (kind = 'episode' AND EXISTS (SELECT 1 FROM series_metadata sm \
+                        WHERE sm.series_key = COALESCE(media_items.series_key, \
+                            media_items.series_folder, media_items.series_name) \
+                          AND sm.match_source IS NOT NULL))) \
              ORDER BY id ASC LIMIT $2"
         );
         let rows = sqlx::query_as::<_, MediaRow>(sqlx::AssertSqlSafe(sql))

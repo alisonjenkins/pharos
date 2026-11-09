@@ -2904,6 +2904,33 @@ where
     assert_eq!(years.get(FOLDER), Some(&2014));
     assert_eq!(years.get(&split), None);
 
+    // V892 — an episode waits for its show: eligible only once the show (by
+    // its identity key) has a match row.
+    let waiting = |items: &[MediaItem]| items.iter().any(|i| i.id == old.id);
+    let need = MediaStore::items_needing_match(&store, 1000, i64::MAX)
+        .await
+        .unwrap();
+    assert!(!waiting(&need), "the split 1990 group has no match row yet");
+    assert!(
+        need.iter().any(|i| i.id == new.id),
+        "the folder's show is matched"
+    );
+    SeriesMetadataStore::upsert_series_metadata(
+        &store,
+        pharos_core::SeriesMetadata {
+            series_key: split.clone(),
+            series_name: "The Flash".into(),
+            match_source: Some("none".into()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let need = MediaStore::items_needing_match(&store, 1000, i64::MAX)
+        .await
+        .unwrap();
+    assert!(waiting(&need));
+
     let sweep = MediaStore::begin_scan(&store, std::path::Path::new(ROOT))
         .await
         .unwrap();
