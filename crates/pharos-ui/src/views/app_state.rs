@@ -2166,7 +2166,11 @@ const DEEP_SEARCH_DEBOUNCE_MS: u32 = 350;
 async fn request_deep_check(base: &str, token: &str, media_id: &str) -> Result<(), String> {
     crate::client::web::request_deep_check(base, token, media_id)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| match e {
+            // The server's refusal is already a plain reason; drop the "http:" prefix.
+            crate::client::ClientError::Http(reason) => reason,
+            other => other.to_string(),
+        })
 }
 
 #[cfg(not(feature = "web"))]
