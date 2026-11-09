@@ -501,6 +501,27 @@ pub enum FrameError {
     Decode(String),
 }
 
+/// Start of the `WorkerError::Other` text a worker sends when its reply would
+/// not fit in a frame (B914); the pool counts it as a `reply` overflow.
+pub const REPLY_TOO_LARGE: &str = "reply frame too large";
+
+/// `ev` if it fits in one frame, else a `Failed` reply for `job_id` that
+/// names the size, so an oversized result fails the op instead of leaving
+/// the pool waiting out its timeout (B914).
+pub fn fit_reply(job_id: JobId, ev: WorkerEvent) -> WorkerEvent {
+    match bincode::serialized_size(&ev) {
+        Ok(n) if n <= u64::from(MAX_FRAME) => ev,
+        Ok(n) => WorkerEvent::Failed {
+            job_id,
+            error: WorkerError::Other(format!("{REPLY_TOO_LARGE}: {n} bytes (max {MAX_FRAME})")),
+        },
+        Err(e) => WorkerEvent::Failed {
+            job_id,
+            error: WorkerError::Other(format!("encode reply: {e}")),
+        },
+    }
+}
+
 /// Write one length-prefixed bincode frame. Flushes so the peer sees it
 /// promptly (control frames are latency-sensitive, not throughput).
 pub async fn write_frame<W, T>(w: &mut W, value: &T) -> Result<(), FrameError>
@@ -701,5 +722,34 @@ mod tests {
         assert!(!WorkerError::NoFrames(String::new()).is_transient());
         assert!(!WorkerError::UnsupportedCodec(String::new()).is_transient());
         assert!(!WorkerError::BadInput(String::new()).is_transient());
+    }
+
+    #[test]
+    fn a_reply_too_large_for_a_frame_becomes_a_failure_naming_its_size() {
+        let job_id = JobId(7);
+        let small = WorkerEvent::FingerprintResult {
+            job_id,
+            points: vec![1, 2, 3],
+        };
+        assert!(matches!(
+            fit_reply(job_id, small),
+            WorkerEvent::FingerprintResult { .. }
+        ));
+
+        let big = WorkerEvent::FingerprintResult {
+            job_id,
+            points: vec![0; MAX_FRAME as usize / 4 + 1],
+        };
+        match fit_reply(job_id, big) {
+            WorkerEvent::Failed {
+                job_id: j,
+                error: WorkerError::Other(msg),
+            } => {
+                assert_eq!(j, job_id);
+                assert!(msg.starts_with(REPLY_TOO_LARGE), "{msg}");
+                assert!(msg.contains("bytes"), "{msg}");
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
     }
 }
