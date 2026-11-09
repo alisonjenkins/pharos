@@ -90,7 +90,15 @@ pub async fn locate_group(
     group_id: GroupId,
 ) -> Result<GroupLocation, pharos_sync::registry::RegistryError> {
     if let Some(h) = registry.get(group_id).await? {
-        return Ok(GroupLocation::Live(h));
+        // A cached REMOTE handle is not live here: boot reconciliation caches
+        // one while the old pod holds the lock, and a join through it sends
+        // AddMember to an owner that may be gone. Re-elect through `Cold`,
+        // which hydrates if the lock is free and yields the remote handle
+        // again if the owner really is alive.
+        if registry.is_owned(group_id).await? || !has_usable_snapshot(stores, group_id).await {
+            return Ok(GroupLocation::Live(h));
+        }
+        return Ok(GroupLocation::Cold);
     }
     // A snapshot's `updated_at` only moves on mutation, so a party paused
     // for a day is stale while still live on its owner replica.
@@ -257,7 +265,12 @@ pub fn spawn_snapshot_janitor(stores: Stores) {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used)]
+
     use super::*;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::{Arc, Mutex};
 
     fn row(group_id: &str, updated_at: i64) -> PersistedSyncGroup {
         PersistedSyncGroup {
@@ -310,5 +323,141 @@ mod tests {
         let cutoff = recovery_cutoff();
         let after = now_unix_secs() - RECOVERY_WINDOW_SECS;
         assert!((before..=after).contains(&cutoff));
+    }
+
+    struct Own {
+        map: Arc<Mutex<Option<usize>>>,
+        me: usize,
+    }
+    impl pharos_sync::OwnershipSource for Own {
+        fn try_own(&self, _g: GroupId) -> Pin<Box<dyn Future<Output = bool> + Send + '_>> {
+            Box::pin(async move {
+                let mut m = self.map.lock().unwrap();
+                match *m {
+                    Some(o) if o != self.me => false,
+                    _ => {
+                        *m = Some(self.me);
+                        true
+                    }
+                }
+            })
+        }
+        fn release(&self, _g: GroupId) {}
+    }
+
+    #[derive(Clone)]
+    struct Snap(Arc<Mutex<Option<String>>>);
+    impl pharos_sync::GroupPersistence for Snap {
+        fn persist(&self, _g: GroupId, _e: u64, json: String) {
+            *self.0.lock().unwrap() = Some(json);
+        }
+        fn remove(&self, _g: GroupId) {}
+    }
+    impl pharos_sync::HydrationSource for Snap {
+        fn load(
+            &self,
+            _g: GroupId,
+        ) -> Pin<Box<dyn Future<Output = Option<(u64, String)>> + Send + '_>> {
+            let got = self.0.lock().unwrap().clone().map(|j| (1_000, j));
+            Box::pin(async move { got })
+        }
+    }
+
+    struct Nowhere;
+    impl pharos_sync::CommandSink for Nowhere {
+        fn submit(&self, _g: GroupId, _c: pharos_sync::group::RemoteCommand) {}
+    }
+
+    /// B1006 — a join before boot reconciliation owns the group. Rounds 0 and
+    /// 1 cached a remote handle while the old pod held the lock; the lock then
+    /// freed. `locate_group` must send the join through `Cold` (hydrate), not
+    /// treat the cached remote handle as live, or its AddMember reaches no
+    /// actor.
+    /// Disarm check: with the remote handle taken as `Live`, the first
+    /// assertion fails.
+    #[tokio::test]
+    async fn a_join_before_reconciliation_hydrates_instead_of_using_the_remote_handle() {
+        use pharos_core::{PersistedSyncGroup, SyncGroupStore};
+        let stores = Stores::connect("sqlite::memory:").await.unwrap();
+        let snap = Snap(Arc::new(Mutex::new(None)));
+        let gid = GroupId::new();
+        let member = pharos_sync::hub::member_id_for_device("dev");
+        let (reply, joined) = tokio::sync::oneshot::channel();
+        let actor = pharos_sync::group::GroupHandle::spawn_persistent(
+            gid,
+            1_000,
+            Arc::new(pharos_sync::LocalDelivery::new(
+                pharos_sync::MemberSinks::new(),
+            )),
+            Arc::new(snap.clone()),
+            None,
+        );
+        actor
+            .tx
+            .send(pharos_sync::group::GroupMsg::AddMember {
+                user: None,
+                member_id: member,
+                name: "m".into(),
+                reply,
+            })
+            .await
+            .unwrap();
+        joined.await.unwrap();
+        let state_json = loop {
+            if let Some(j) = snap.0.lock().unwrap().clone() {
+                break j;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        };
+        let now = now_unix_secs();
+        stores
+            .upsert_sync_group(
+                &PersistedSyncGroup {
+                    group_id: gid.to_string(),
+                    epoch_unix_ms: 1_000,
+                    state_json,
+                    updated_at: now,
+                },
+                now,
+            )
+            .await
+            .unwrap();
+
+        // The old pod (replica 2) holds the lock; this replica (1) caches a
+        // remote handle, as reconciliation round 0 did.
+        let owner = Arc::new(Mutex::new(Some(2usize)));
+        let registry = pharos_sync::GroupRegistry::spawn_distributed(
+            Arc::new(pharos_sync::LocalDelivery::new(
+                pharos_sync::MemberSinks::new(),
+            )),
+            pharos_sync::Distributed {
+                ownership: Arc::new(Own {
+                    map: owner.clone(),
+                    me: 1,
+                }),
+                hydration: Arc::new(snap.clone()),
+                commands: Arc::new(Nowhere),
+                persistence: Arc::new(snap),
+            },
+        );
+        let remote = registry.get_or_create(gid).await.unwrap();
+        assert!(remote.snapshot().await.is_none(), "setup: handle is remote");
+        *owner.lock().unwrap() = None;
+
+        let GroupLocation::Cold = locate_group(&stores, &registry, gid).await.unwrap() else {
+            panic!("a cached remote handle was taken as live");
+        };
+        let h = registry.get_or_create(gid).await.unwrap();
+        let (reply, joined) = tokio::sync::oneshot::channel();
+        h.tx.send(pharos_sync::group::GroupMsg::AddMember {
+            user: None,
+            member_id: member,
+            name: "m".into(),
+            reply,
+        })
+        .await
+        .unwrap();
+        joined.await.unwrap();
+        assert_eq!(h.snapshot().await.unwrap().member_count, 1);
     }
 }
