@@ -821,11 +821,24 @@ pub fn tile_in_view(_at: u32) -> bool {
     false
 }
 
-pub fn scroll_to_tile(_at: u32) -> bool {
-    false
+/// Scrolls the browse tile at `at` to the top of the page and focuses it
+/// (B1028). The page answers later, so this says `true`: the grid asks only
+/// for a tile it has rendered, and a miss is logged here instead.
+pub fn scroll_to_tile(at: u32) -> bool {
+    let script = tv_page::scroll_to_tile_js(at);
+    spawn_detached(async move {
+        match document::eval(&script).join::<bool>().await {
+            Ok(true) => log::debug!("pharos: grid jump tile={at} placed=true"),
+            Ok(false) => log::warn!("pharos: grid jump tile={at} placed=false reason=not_in_page"),
+            Err(e) => log::warn!("pharos: grid jump tile={at} placed=false error={e}"),
+        }
+    });
+    true
 }
 
-pub fn scroll_to_top() {}
+pub fn scroll_to_top() {
+    run(tv_page::SCROLL_TO_TOP_JS.to_owned());
+}
 
 pub fn tile_top(_at: u32) -> Option<f64> {
     None
