@@ -2687,8 +2687,10 @@ fn strip_trailing_cut(name: &str) -> String {
     let end = CUT_RE.as_ref().and_then(|re| {
         re.find_iter(name)
             .filter(|m| {
-                name.get(m.end()..)
-                    .is_some_and(|rest| rest.trim().is_empty())
+                name.get(m.end()..).is_some_and(|rest| {
+                    rest.trim_matches(|c: char| c.is_whitespace() || ")]}".contains(c))
+                        .is_empty()
+                })
             })
             .map(|m| m.start())
             .next()
@@ -7859,7 +7861,12 @@ mod tests {
             assert_ne!(key, thing, "{extra}");
         }
         assert_eq!(film_copy_key(Path::new("/m/Untitled/The Thing.mkv")), None);
-        for named in ["The Thing cd1.mp4", "The Thing Director’s Cut.mkv"] {
+        for named in [
+            "The Thing cd1.mp4",
+            "The Thing Director’s Cut.mkv",
+            "The Thing [Extended].mkv",
+            "The Thing (Director's Cut).mkv",
+        ] {
             let key = film_copy_key(&Path::new("/m/Thing, The (1982)").join(named));
             assert_eq!(key, thing, "{named}");
         }
