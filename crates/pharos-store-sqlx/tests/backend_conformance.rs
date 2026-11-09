@@ -2931,6 +2931,70 @@ where
         .unwrap();
     assert!(waiting(&need));
 
+    // V891 — a show's episodes by identity key, the local side of episode fit.
+    let eps = store.series_episodes(&split).await.unwrap();
+    assert_eq!(
+        eps,
+        vec![pharos_core::SeriesEpisodeRow {
+            path: old.path.to_string_lossy().into_owned(),
+            season: Some(1),
+            episode: Some(1),
+        }]
+    );
+    let eps = store.series_episodes(FOLDER).await.unwrap();
+    assert_eq!(eps.len(), 1);
+    assert_eq!(eps[0].path, new.path.to_string_lossy());
+    assert!(store.series_episodes("/nowhere").await.unwrap().is_empty());
+
+    // V891 — a flagged match round-trips, and the next upsert clears it.
+    let flagged = pharos_core::SeriesMetadata {
+        series_key: FOLDER.into(),
+        series_name: "The Flash".into(),
+        match_source: Some("search".into()),
+        match_flag: Some("ambiguous".into()),
+        match_runner_up_id: Some("78650".into()),
+        match_runner_up_score: Some(0.25),
+        ..Default::default()
+    };
+    SeriesMetadataStore::upsert_series_metadata(&store, flagged.clone())
+        .await
+        .unwrap();
+    let by_key = |m: std::collections::HashMap<String, pharos_core::SeriesMetadata>| {
+        m.get(FOLDER).cloned().unwrap()
+    };
+    let got = by_key(
+        SeriesMetadataStore::series_metadata_by_keys(&store, &[FOLDER.to_string()])
+            .await
+            .unwrap(),
+    );
+    assert_eq!(got.match_flag.as_deref(), Some("ambiguous"));
+    assert_eq!(got.match_runner_up_id.as_deref(), Some("78650"));
+    assert_eq!(got.match_runner_up_score, Some(0.25));
+    SeriesMetadataStore::upsert_series_metadata(
+        &store,
+        pharos_core::SeriesMetadata {
+            match_flag: None,
+            match_runner_up_id: None,
+            match_runner_up_score: None,
+            ..flagged
+        },
+    )
+    .await
+    .unwrap();
+    let got = by_key(
+        SeriesMetadataStore::series_metadata_by_keys(&store, &[FOLDER.to_string()])
+            .await
+            .unwrap(),
+    );
+    assert_eq!(
+        (
+            got.match_flag,
+            got.match_runner_up_id,
+            got.match_runner_up_score
+        ),
+        (None, None, None)
+    );
+
     let sweep = MediaStore::begin_scan(&store, std::path::Path::new(ROOT))
         .await
         .unwrap();
