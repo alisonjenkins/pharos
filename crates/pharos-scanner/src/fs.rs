@@ -2727,7 +2727,9 @@ fn group_copies_guarded(
             let copy_shown = groups
                 .get(member)
                 .map_or_else(String::new, |g| g.0.display().to_string());
-            if mode == crate::series_split::RepairMode::Apply {
+            // An admin's own placement holds in a dry run too: the scanner
+            // did not decide it, and folding it would merge user data (V896).
+            if mode == crate::series_split::RepairMode::Apply || reason == "admin_placed" {
                 if let Some(flag) = is_item.get_mut(member) {
                     *flag = true;
                 }
@@ -9255,7 +9257,8 @@ mod tests {
         assert_eq!(FoldGuard::default().refusal(&tagged[0], &tagged[1]), None);
     }
 
-    /// V894/V896: a file an admin placed never folds with another copy.
+    /// V894/V896: a file an admin placed never folds with another copy,
+    /// whatever `series_identity_repair` says.
     #[test]
     fn a_copy_an_admin_placed_never_folds() {
         let paths = [
@@ -9274,10 +9277,14 @@ mod tests {
             created_by: Some("admin".into()),
             created_at: 0,
         };
-        let guard = guard_for(&paths, vec![admin], &[]);
+        let mut guard = guard_for(&paths, vec![admin], &[]);
         let (out, refused) = guarded_groups(&paths, &guard);
         assert_eq!((out.len(), refused), (2, 1));
         assert_eq!(guard.refusal(&paths[0], &paths[1]), Some("admin_placed"));
+        // An admin's placement is kept apart in a dry run too.
+        guard.mode = Some(crate::series_split::RepairMode::DryRun);
+        let (out, refused) = guarded_groups(&paths, &guard);
+        assert_eq!((out.len(), refused), (2, 1));
     }
 
     /// V894: two known stated show years that differ never fold, whatever
