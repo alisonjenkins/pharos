@@ -14,6 +14,7 @@ mod client_api;
 mod client_group;
 mod connect;
 mod connection_close;
+mod damage;
 mod detail_subtitle_scripts;
 mod gate;
 mod group;
