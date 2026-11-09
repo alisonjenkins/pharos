@@ -2,7 +2,7 @@
 
 - **Status:** Draft, for review. No code yet.
 - **Date:** 2026-11-09T14:30:00Z
-- **ADR:** [0085](../../docs/adr/0085-series-identity-is-decided-from-reconciled-evidence.md)
+- **ADR:** [0086](../../docs/adr/0086-series-identity-is-decided-from-reconciled-evidence.md)
 - **Claimed ids:** B930–B934, V890–V894 (entries go into
   `001-pharos-baseline/bugs.md` / `invariants.md` with the fix, not before).
 
