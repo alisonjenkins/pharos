@@ -62,7 +62,8 @@ def estimate(lines: list[Line], decode: Decode, align_wide: AlignWide) -> Estima
         sung_ms = min(line.end_ms - line.start_ms, len(tokens) * CAP_MS_PER_WORD + CAP_EXTRA_MS)
         start = max(0, line.start_ms - SEARCH_MS)
         end = line.start_ms + sung_ms + SEARCH_MS
-        spans = align_wide(decode(start, end), tokens)
+        pcm = decode(start, end)
+        spans = align_wide(pcm, tokens) if pcm else []
         if not spans or spans[0] == (0, 0):
             probes.append(None)
             continue

@@ -147,8 +147,17 @@ class AlignerHandler(http.server.BaseHTTPRequestHandler):
                     logger.warning("path=%s offset probe failed", rel_path, exc_info=True)
                     return []
 
+            def decode_probe(start_ms: int, end_ms: int) -> bytes:
+                # A probe is optional: a window ffmpeg cannot decode costs it
+                # the offset, not the song its word times.
+                try:
+                    return decoder(full_path, start_ms, end_ms)
+                except subprocess.CalledProcessError:
+                    logger.warning("path=%s offset probe decode failed", rel_path, exc_info=True)
+                    return b""
+
             with ALIGN_LOCK:
-                found = estimate(lines, lambda s, e: decoder(full_path, s, e), align_wide)
+                found = estimate(lines, decode_probe, align_wide)
                 logger.info(
                     "path=%s offset_ms=%d probes=%s reason=%s",
                     rel_path,
