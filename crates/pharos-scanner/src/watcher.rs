@@ -267,10 +267,10 @@ impl Batch {
     fn absorb(&mut self, ev: &Event) {
         match ev.kind {
             EventKind::Create(_) | EventKind::Modify(notify::event::ModifyKind::Data(_)) => {
-                // A new `.ignore` hides rows already indexed, which only the
-                // full scan's sweep removes (V961).
-                if ev.paths.iter().any(|p| crate::fs::is_ignore_marker(p)) {
-                    tracing::info!(paths = ?ev.paths, "watch: .ignore marker created; reconciling");
+                // A new `.ignore` or `tvshow.nfo` reshapes rows already
+                // indexed, which only the full scan settles (V961, V982).
+                if ev.paths.iter().any(|p| crate::fs::reshapes_indexed_rows(p)) {
+                    tracing::info!(paths = ?ev.paths, "watch: folder marker written; reconciling");
                     self.needs_reconcile = true;
                 }
                 self.touched.extend(ev.paths.iter().cloned());
