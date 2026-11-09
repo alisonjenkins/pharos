@@ -4858,6 +4858,12 @@ body::before {
 .pharos-stage.is-floating .pharos-video {
   object-fit: contain;
 }
+/* A hair under opaque, so Chrome composites the small picture with the page
+   instead of promoting it to a hardware overlay: on Windows that overlay
+   left a stale, upside-down copy of its box in the WebGL backdrop (B1182). */
+.pharos-stage:not(.is-full) .pharos-video {
+  opacity: 0.999;
+}
 .pharos-stage.is-floating .pharos-stage-bar {
   order: 1;
 }

@@ -317,6 +317,26 @@ mod tests {
         }
     }
 
+    /// B1182: the video in the floating window or mini bar is a hair under
+    /// opaque, so Chrome never promotes it to a hardware overlay beside the
+    /// WebGL backdrop; the full view keeps its overlay.
+    #[test]
+    fn a_compact_video_stays_off_the_hardware_overlay() {
+        let sheet = include_str!("../../assets/pharos.css");
+        let rule = sheet
+            .split(".pharos-stage:not(.is-full) .pharos-video {")
+            .nth(1)
+            .and_then(|r| r.split('}').next())
+            .unwrap_or_default();
+        assert!(rule.contains("opacity: 0.999;"), "{rule}");
+        let full = sheet
+            .split(".pharos-stage.is-full .pharos-video {")
+            .nth(1)
+            .and_then(|r| r.split('}').next())
+            .unwrap_or_default();
+        assert!(!full.contains("opacity"), "{full}");
+    }
+
     #[test]
     fn only_a_shader_background_gets_a_program() {
         let mut t = shipped("High Contrast");
