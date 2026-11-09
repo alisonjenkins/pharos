@@ -1907,6 +1907,7 @@ where
         }
         let rows = store.series_episodes(&cand.series_key).await?;
         let mut picked = 0usize;
+        let mut window = None;
         for row in &rows {
             let own_search = row.match_source.as_deref() == Some("search")
                 && row.match_provider.as_deref() == Some(provider);
@@ -1922,24 +1923,24 @@ where
                 .collect::<std::collections::BTreeSet<_>>()
                 .into_iter()
                 .collect();
-            let listing = match provider {
+            let (listing, series_run) = match provider {
                 "tvdb" => match providers.tvdb {
-                    Some(t) => list_episodes(t, bg_io, show_id, &seasons).await,
-                    None => None,
+                    Some(t) => show_run(t, bg_io, show_id, &seasons).await,
+                    None => (None, None),
                 },
                 "tmdb" => match providers.tmdb {
-                    Some(t) => list_episodes(t, bg_io, show_id, &seasons).await,
-                    None => None,
+                    Some(t) => show_run(t, bg_io, show_id, &seasons).await,
+                    None => (None, None),
                 },
-                _ => None,
+                _ => (None, None),
             };
-            let aired = listing.iter().flatten().filter_map(|l| l.aired);
-            let run = aired.clone().min().zip(aired.max());
-            if let Some((first, last)) = run {
+            window = run_window(listing.iter().flatten().filter_map(|l| l.aired), series_run);
+            if let Some((first, last)) = window {
                 for row in &rows {
-                    let outside = row
-                        .premiere_date
-                        .is_some_and(|d| d < first - RUN_SLACK_SECS || d > last + RUN_SLACK_SECS);
+                    let outside = row.premiere_date.is_some_and(|d| {
+                        d < first - RUN_SLACK_SECS
+                            || last.is_some_and(|last| d > last + RUN_SLACK_SECS)
+                    });
                     let taken = survey.episodes.iter().any(|(id, _)| *id == row.id);
                     if outside && !taken {
                         survey.episodes.push((row.id, RepairReason::OutsideRun));
@@ -1954,12 +1955,43 @@ where
                 provider,
                 match_id = show_id,
                 episodes = picked,
+                run_first = window.map(|(first, _)| first),
+                run_last = window.and_then(|(_, last)| last),
                 "series identity repair: episodes to rebuild"
             );
         }
         tokio::time::sleep(REQUEST_SPACING).await;
     }
     Ok(survey)
+}
+
+/// B982 — the show's episode listing and its series-level run.
+async fn show_run<E: OnlineEnricher>(
+    enricher: &E,
+    bg_io: &Arc<Semaphore>,
+    show_id: &str,
+    seasons: &[u32],
+) -> (
+    Option<Vec<EpisodeListing>>,
+    Option<crate::online_enrich::SeriesRun>,
+) {
+    let listing = list_episodes(enricher, bg_io, show_id, seasons).await;
+    let _permit = BgPermit::acquire(bg_io).await;
+    (listing, enricher.series_run(show_id).await)
+}
+
+/// B982 — a show's run as `(first, last)` air dates: the span of its listed
+/// episodes widened to its series-level run, with no end while it is still
+/// airing. A listing covers only the seasons asked for, so an
+/// absolute-numbered or renumbered episode falls outside it.
+fn run_window(
+    listed: impl Iterator<Item = i64> + Clone,
+    series: Option<crate::online_enrich::SeriesRun>,
+) -> Option<(i64, Option<i64>)> {
+    let series = series.unwrap_or_default();
+    let first = listed.clone().min().into_iter().chain(series.first).min()?;
+    let last = listed.max().into_iter().chain(series.last).max();
+    Some((first, if series.ongoing { None } else { last }))
 }
 
 async fn list_episodes<E: OnlineEnricher>(
@@ -3553,6 +3585,8 @@ mod tests {
         listed: Arc<std::sync::Mutex<Vec<String>>>,
         /// How many searches were made.
         searched: Arc<std::sync::Mutex<usize>>,
+        /// Series runs by show id; any other id has none.
+        runs: HashMap<String, crate::online_enrich::SeriesRun>,
     }
 
     impl FakeEnricher {
@@ -3569,6 +3603,7 @@ mod tests {
                 lists: HashMap::new(),
                 listed: Default::default(),
                 searched: Default::default(),
+                runs: HashMap::new(),
             }
         }
 
@@ -3585,6 +3620,7 @@ mod tests {
                 lists: HashMap::new(),
                 listed: Default::default(),
                 searched: Default::default(),
+                runs: HashMap::new(),
             }
         }
 
@@ -3640,6 +3676,11 @@ mod tests {
                 })
                 .collect();
             self.lists.insert(id.to_string(), list);
+            self
+        }
+
+        fn with_run(mut self, id: &str, run: crate::online_enrich::SeriesRun) -> Self {
+            self.runs.insert(id.to_string(), run);
             self
         }
 
@@ -3728,6 +3769,9 @@ mod tests {
         async fn episode_list(&self, id: &str, _seasons: &[u32]) -> Option<Vec<EpisodeListing>> {
             self.listed.lock().unwrap().push(id.to_string());
             self.lists.get(id).cloned()
+        }
+        async fn series_run(&self, id: &str) -> Option<crate::online_enrich::SeriesRun> {
+            self.runs.get(id).copied()
         }
     }
 
@@ -6492,6 +6536,71 @@ mod tests {
         let mut pending = pending_ids(&s).await;
         pending.sort_unstable();
         assert_eq!(pending, [1, 2]);
+    }
+
+    /// B982 — the run window is the show's whole run, not the span of the
+    /// seasons the provider listed: an absolute-numbered episode of a show
+    /// still airing is no `outside_run`, while an ended show's run still
+    /// bounds a late episode.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_run_window_covers_a_shows_whole_run() {
+        use crate::online_enrich::SeriesRun;
+        let s = store().await;
+        const ONE_PIECE: &str = "/tv/One Piece";
+        const COSMOS: &str = "/tv/Cosmos";
+        put_titled_episode(&s, 1, ONE_PIECE, (1, 1), "I'm Luffy!").await;
+        put_titled_episode(&s, 2, ONE_PIECE, (1, 1050), "Honor Above All").await;
+        put_titled_episode(&s, 3, COSMOS, (1, 1), "The Shores of the Cosmic Ocean").await;
+        put_titled_episode(
+            &s,
+            4,
+            COSMOS,
+            (1, 2),
+            "Some of the Things That Molecules Do",
+        )
+        .await;
+        for (id, aired) in [
+            (1, 940_377_600),   // 1999-10-20
+            (2, 1_673_136_000), // 2023-01-08
+            (3, 339_033_600),   // 1980-09-28
+            (4, 1_394_323_200), // 2014-03-09
+        ] {
+            let mut item = s.get(id).await.unwrap();
+            item.metadata.premiere_date = Some(aired);
+            s.put(item).await.unwrap();
+        }
+        pin(&s, ONE_PIECE, "81797", NOW).await;
+        pin(&s, COSMOS, "74995", NOW).await;
+        let tvdb = FakeEnricher::tvdb()
+            // Season 1 as the provider numbers it: 1999-10-20 .. 2000-03-15.
+            .with_aired_list("81797", &[(1, 1, 940_377_600), (1, 8, 953_078_400)])
+            .with_run(
+                "81797",
+                SeriesRun {
+                    first: Some(940_377_600),
+                    last: Some(1_762_041_600),
+                    ongoing: true,
+                },
+            )
+            .with_aired_list("74995", &[(1, 1, 339_033_600)])
+            .with_run(
+                "74995",
+                SeriesRun {
+                    first: Some(339_033_600),
+                    last: Some(346_204_800), // 1980-12-21
+                    ongoing: false,
+                },
+            );
+        let providers = SeriesProviders::<FakeEnricher, FakeEnricher> {
+            tvdb: Some(&tvdb),
+            tmdb: None,
+        };
+
+        let survey = survey_series_identity(&s, &providers, &sem(4), &MetadataConfig::default())
+            .await
+            .unwrap();
+
+        assert_eq!(survey.episodes, [(4, RepairReason::OutsideRun)]);
     }
 
     const FLASH: &str = "/tv/The Flash";
