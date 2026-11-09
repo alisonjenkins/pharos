@@ -11,6 +11,7 @@ use pharos_client::ClientError;
 
 use super::account::initials;
 use super::art::{Art, POSTER_SIZES};
+use super::browse::{QueueButtons, QueueTarget};
 use super::depth;
 use super::find::SUGGEST_LIMIT;
 use super::keymap::Mode;
@@ -18,6 +19,7 @@ use super::keys::{use_arrival_focus, use_key_mode};
 use super::palette::Row;
 use super::platform;
 use super::playback::{ends_at_label, left_to_watch, start_ms, Left};
+use super::queue::video_kind;
 use super::route::Route;
 use super::seen::{self, MemberSeen};
 use super::together::can_watch_together;
@@ -1067,6 +1069,14 @@ pub fn TitleView(
                     }
                     if matches!(open_route(item), Route::Browse(_)) {
                         Link { to: Route::Browse(item.id), class: "pharos-button", "Open" }
+                    }
+                    if video_kind(item.kind) {
+                        QueueButtons {
+                            name: display_name(item),
+                            tracks: vec![item.clone()],
+                            album: None,
+                            kind: QueueTarget::VideoPage,
+                        }
                     }
                     if item.kind.playable() {
                         WatchedToggle { id: item.id, played: item.played, listen: item.kind == ItemKind::Audio, name: display_name(item) }

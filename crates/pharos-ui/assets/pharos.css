@@ -4131,10 +4131,26 @@ body::before {
   flex-wrap: wrap;
   margin: 0 0 1rem;
 }
-.pharos-queue-buttons[data-target="album_page"] .pharos-queue-button {
+/* A film's or episode's page: beside Play, in the same row (V853). */
+.pharos-queue-buttons[data-target="video_page"] {
+  flex-wrap: wrap;
+}
+/* Over the picture the muted count needs the panel's full text colour. */
+.pharos-watch .pharos-queue-total {
+  color: var(--px-color-fg);
+  opacity: 0.85;
+}
+.pharos-queue-buttons[data-target="album_page"] .pharos-queue-button,
+.pharos-queue-buttons[data-target="video_page"] .pharos-queue-button {
   padding: 0.45rem 0.9rem;
   border-color: var(--px-color-border);
   background: var(--px-color-surface);
+}
+/* Shaped like the Play and Mark watched buttons beside them. */
+.pharos-actions .pharos-queue-buttons[data-target="video_page"] .pharos-queue-button {
+  padding: 0.6rem 1.25rem;
+  border-radius: 4px;
+  font-weight: 600;
 }
 .pharos-track-item {
   display: flex;

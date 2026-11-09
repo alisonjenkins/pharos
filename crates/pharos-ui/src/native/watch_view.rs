@@ -13,12 +13,13 @@ use super::keys;
 use super::quality::{self, QualityView};
 
 use super::art::Art;
-use super::listen::{Icon, ICON_FLOAT, ICON_PIP};
+use super::listen::{Icon, QueuePanel, ICON_FLOAT, ICON_PIP, ICON_QUEUE_NEXT, QUEUE_PANEL_ID};
 use super::platform;
 use super::playback::{
     clock, cues_at, left_to_watch, percent, segment_at, share, skip_label, thumb_at, track_label,
     ImageCues, MediaEvent, MediaState, SubtitleSize,
 };
+use super::queue::{Entry, QueueAction};
 use super::seen::SeenRow;
 use super::together::Member;
 use super::together_view::{ActivityToast, InvitePanel, MemberStrip};
@@ -323,6 +324,39 @@ pub enum Control {
     ShowInvite(bool),
     /// Put the group's invite link on the clipboard.
     CopyInvite,
+    /// Open (`true`) or close the video queue (V853).
+    ShowQueue(bool),
+    /// Something the viewer did in the video queue.
+    Queue(QueueAction),
+}
+
+/// The video queue as the player shows it (V853): what waits, and whether
+/// its panel is open.
+#[derive(Debug, Clone, PartialEq)]
+pub struct VideoQueueView {
+    pub entries: Vec<Entry>,
+    pub shuffled: bool,
+    pub open: bool,
+}
+
+impl VideoQueueView {
+    /// Whether `next` is the queue's first, so Next plays from the queue
+    /// rather than the next episode.
+    pub fn plays_next(&self, next: Option<ItemRef>) -> bool {
+        next.is_some() && self.entries.first().map(|e| e.id) == next
+    }
+}
+
+/// The full player's queue button, for the focus to return to.
+const QUEUE_TOGGLE_ID: &str = "pharos-watch-queue-toggle";
+
+/// The queue button's name, with the count its badge shows.
+pub fn video_queue_label(count: usize) -> String {
+    match count {
+        0 => "Queue".to_owned(),
+        1 => "Queue, 1 video".to_owned(),
+        n => format!("Queue, {n} videos"),
+    }
 }
 
 /// The player. The engine gives the `<video>` its stream once mounted;
@@ -381,6 +415,10 @@ pub fn WatchView(
     /// What the last invite copy did, for the invite panel.
     #[props(default)]
     invite_note: Option<String>,
+    /// The video queue, where it can be used: not in a group, where the
+    /// group picks what plays (V853).
+    #[props(default)]
+    queue: Option<VideoQueueView>,
 ) -> Element {
     #[cfg(test)]
     BODY_RENDERS.with(|n| n.set(n.get() + 1));
@@ -429,16 +467,19 @@ pub fn WatchView(
             wake();
         }))
     });
-    // The open invite panel holds the chrome up.
+    // The open invite panel holds the chrome up, as the open queue does.
     let invite_open = invite_open && invite.is_some();
-    let class = match (media.paused, idle() && !invite_open) {
+    let queue_open = queue.as_ref().is_some_and(|q| q.open);
+    let held = invite_open || queue_open;
+    let next_queued = queue.as_ref().is_some_and(|q| q.plays_next(c.next));
+    let class = match (media.paused, idle() && !held) {
         (true, _) => "pharos-player is-paused",
         (false, true) => "pharos-player is-idle",
         (false, false) => "pharos-player",
     };
     // The Rust subtitle renderer lifts its text above the control bar while
     // the bar shows (spec 026 US1 #3): paused, or awake and not idle.
-    let controls_shown = media.paused || !(idle() && !invite_open);
+    let controls_shown = media.paused || !(idle() && !held);
     use_effect(use_reactive!(|controls_shown| {
         platform::set_subtitle_controls_visible(controls_shown);
     }));
@@ -604,6 +645,28 @@ pub fn WatchView(
                             span { class: "pharos-control-label", "Watch together" }
                         }
                     }
+                    if let Some(q) = queue.as_ref() {
+                        {
+                            let (count, open) = (q.entries.len(), q.open);
+                            rsx! {
+                                button {
+                                    id: QUEUE_TOGGLE_ID,
+                                    class: "pharos-control pharos-queue-toggle",
+                                    r#type: "button",
+                                    "data-key-action": "queue",
+                                    title: "Show or hide what plays next",
+                                    aria_label: video_queue_label(count),
+                                    aria_pressed: if open { "true" } else { "false" },
+                                    aria_controls: open.then_some(QUEUE_PANEL_ID),
+                                    onclick: move |_| on_control.call(Control::ShowQueue(!open)),
+                                    Icon { path: ICON_QUEUE_NEXT }
+                                    if count > 0 {
+                                        span { class: "pharos-queue-count", aria_hidden: "true", "{count}" }
+                                    }
+                                }
+                            }
+                        }
+                    }
                     button {
                         class: "pharos-control pharos-shrink",
                         r#type: "button",
@@ -635,6 +698,22 @@ pub fn WatchView(
                         on_close: move |_| on_control.call(Control::ShowInvite(false)),
                     }
                 }
+                if let Some(q) = queue.clone().filter(|q| q.open) {
+                    div { class: "pharos-watch-queue",
+                        QueuePanel {
+                            queue: q.entries,
+                            shuffled: q.shuffled,
+                            videos: true,
+                            on_queue: move |action| on_control.call(Control::Queue(action)),
+                            // Escape closes the queue, as it does the invite
+                            // panel, and puts the focus back on its button.
+                            on_escape: move |()| {
+                                on_control.call(Control::ShowQueue(false));
+                                platform::focus_by_id(QUEUE_TOGGLE_ID);
+                            },
+                        }
+                    }
+                }
                 ActivityToast { line: toast }
                 if let Some(card) = c.up_next.clone() {
                     UpNext { card, on_control }
@@ -664,7 +743,7 @@ pub fn WatchView(
                             button {
                                 class: "pharos-control",
                                 r#type: "button",
-                                aria_label: "Next episode",
+                                aria_label: if next_queued { "Next in the queue" } else { "Next episode" },
                                 onclick: move |_| on_control.call(Control::Play(id)),
                                 "⏭"
                             }
@@ -1932,6 +2011,72 @@ mod tests {
         );
         dom.rebuild_in_place();
         dioxus_ssr::render(&dom)
+    }
+
+    fn render_queue(queue: Option<VideoQueueView>, next: Option<ItemRef>) -> String {
+        let mut dom = VirtualDom::new_with_props(
+            |(queue, next): (Option<VideoQueueView>, Option<ItemRef>)| {
+                let mut c = controls();
+                c.next = next;
+                rsx! {
+                    WatchView {
+                        title: "Pilot",
+                        controls: c,
+                        on_media: |_| {},
+                        on_control: |_| {},
+                        queue,
+                    }
+                }
+            },
+            (queue, next),
+        );
+        dom.rebuild_in_place();
+        dioxus_ssr::render(&dom)
+    }
+
+    fn queued(open: bool) -> VideoQueueView {
+        let mut q = crate::native::queue::Queue::default();
+        q.add(vec![crate::native::queue::Track {
+            id: ItemRef::Real(8),
+            name: "Heat".to_owned(),
+            runtime_ms: 10_200_000,
+        }]);
+        VideoQueueView {
+            entries: q.upcoming().to_vec(),
+            shuffled: false,
+            open,
+        }
+    }
+
+    /// V853: the player has a queue button counting the queued videos; the
+    /// panel shows only once opened, and Next names the queue when it plays
+    /// from it. In a group (no queue) there is no button.
+    #[test]
+    fn the_player_offers_the_video_queue() {
+        let none = render_queue(None, None);
+        assert!(!none.contains("pharos-queue-toggle"), "{none}");
+        let closed = render_queue(Some(queued(false)), Some(ItemRef::Real(8)));
+        assert!(
+            closed.contains(r#"aria-label="Queue, 1 video""#),
+            "{closed}"
+        );
+        assert!(closed.contains(r#"aria-pressed="false""#), "{closed}");
+        assert!(!closed.contains(r#"id="pharos-queue""#), "{closed}");
+        assert!(
+            closed.contains(r#"aria-label="Next in the queue""#),
+            "{closed}"
+        );
+        let open = render_queue(Some(queued(true)), Some(ItemRef::Real(2)));
+        assert!(open.contains(r#"id="pharos-queue""#), "{open}");
+        assert!(open.contains("Heat"), "{open}");
+        assert!(open.contains("1 video"), "{open}");
+        assert!(
+            !open.contains("pharos-mix"),
+            "no mix bar for videos: {open}"
+        );
+        assert!(open.contains(r#"aria-label="Next episode""#), "{open}");
+        // An open queue holds the chrome up, as the invite panel does.
+        assert!(!open.contains("is-idle"), "{open}");
     }
 
     fn render_together_open() -> String {

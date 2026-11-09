@@ -47,7 +47,10 @@ use super::playback_settings;
 use super::preplay::{self, PlayPicks, TrackChoices};
 use super::privacy;
 use super::quality::{self, QualityView, Watch};
-use super::queue::{Queue, QueueAction, QueueCtx, Track, RESTART_AFTER_MS};
+use super::queue::{
+    video_kind, video_next_line, Queue, QueueAction, QueueCtx, Track, VideoQueueCtx,
+    RESTART_AFTER_MS,
+};
 use super::resume::{Item as ResumeItem, ResumeProbe, ResumeReport};
 use super::route::Route;
 use super::seen::{self, MemberSeen};
@@ -70,8 +73,8 @@ use super::views::{
     PlaybackFailure, SearchBox, Shell, SignInView, StatusView, TitleView, PALETTE_INPUT,
 };
 use super::watch_view::{
-    split_position, text_track_id, total_ms, Control, Controls, Skip, UpNextCard, WatchView,
-    OUTGOING_ID, SEEK_ID, VIDEO_ID,
+    split_position, text_track_id, total_ms, Control, Controls, Skip, UpNextCard, VideoQueueView,
+    WatchView, OUTGOING_ID, SEEK_ID, VIDEO_ID,
 };
 use super::whats_new::{self, Close, Gate, GateInputs, Pick, Unseen, WhatsNewBadge, WhatsNewView};
 use crate::theme::editor::{Draft, EffectField};
@@ -1589,6 +1592,8 @@ fn NativeApp(route: Route) -> Element {
     // The play queue lives as long as the app, across pages and songs.
     let queue = use_signal(Queue::default);
     use_context_provider(|| QueueCtx(queue));
+    // Films, episodes and music videos queue apart from songs (V853).
+    use_context_provider(|| VideoQueueCtx(Signal::new(Queue::default()), Signal::new(false)));
     // The mix that is on keeps the queue topped up (spec 024, B441).
     let mix = use_signal(|| None::<ActiveMix>);
     use_context_provider(|| MixCtx(mix));
@@ -3534,6 +3539,7 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
     let ctx = use_context::<Ctx>();
     let replace = use_context::<Replace>();
     let together = use_context::<Together>();
+    let group_view = together.view;
     let StageCtx(mut ctx_stage) = use_context::<StageCtx>();
     // A song that follows one handing over fades in as that one fades out.
     // Taken by the first player mounted, so a renegotiated one starts as is.
@@ -3613,6 +3619,23 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
                     platform::warn(&format!("pharos: episode neighbours unavailable: {e}"))
                 })
                 .ok()
+        }
+    });
+    // A queued video that starts leaves the video queue (V853), unless a
+    // group brought it here; the screen mounts once per play.
+    let video_queue = try_use_context::<VideoQueueCtx>();
+    use_effect(move || {
+        let Some(VideoQueueCtx(mut q, _)) = video_queue else {
+            return;
+        };
+        if group_view.peek().drives(id) {
+            return;
+        }
+        if q.write().take(id) {
+            platform::info(&format!(
+                "pharos: video queue started item={id} upcoming={}",
+                q.peek().upcoming().len()
+            ));
         }
     });
     // A song that starts takes itself out of the queue, or seeds it with the
@@ -3808,21 +3831,54 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
             )
         }
     });
-    // The next episode's name and still, for the "Up next" card. Only an
-    // episode shows one: a song's next track would cost a detail call for
-    // nothing.
+    // What plays after this video: the video queue's first, unless a group
+    // decides what plays (V853).
+    let video_next = use_memo(move || {
+        let video = matches!(
+            playing.read().as_ref(),
+            Some(Some(Ok(p))) if video_kind(p.0.kind)
+        );
+        let grouped = group_view.read().drives(id);
+        video_queue
+            .filter(|_| video && !grouped)
+            .and_then(|VideoQueueCtx(q, _)| q.read().next_besides(id))
+    });
+    // The decision, whenever its inputs change (V853).
+    use_effect(move || {
+        let video = matches!(
+            playing.read().as_ref(),
+            Some(Some(Ok(p))) if video_kind(p.0.kind)
+        );
+        let episode = near
+            .read()
+            .as_ref()
+            .and_then(|n| n.as_ref())
+            .and_then(|(n, _)| n.next);
+        if video {
+            platform::info(&video_next_line(
+                id,
+                video_next(),
+                episode,
+                group_view.read().drives(id),
+            ));
+        }
+    });
+    // The next video's name and still, for the "Up next" card: the queued
+    // video, else the next episode. A song's next track would cost a detail
+    // call for nothing.
     let upcoming = use_resource(move || {
         let api = ctx.api.read().clone();
         let episode = matches!(
             playing.read().as_ref(),
             Some(Some(Ok(p))) if p.0.kind == ItemKind::Episode
         );
-        let next = near
-            .read()
-            .as_ref()
-            .and_then(|n| n.as_ref())
-            .and_then(|(n, _)| n.next)
-            .filter(|_| episode);
+        let next = video_next().or_else(|| {
+            near.read()
+                .as_ref()
+                .and_then(|n| n.as_ref())
+                .and_then(|(n, _)| n.next)
+                .filter(|_| episode)
+        });
         async move {
             let (api, next) = (api?, next?);
             api.detail(&call("watch", "up next"), next)
@@ -3964,7 +4020,11 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
                     Player {
                         playing: p.clone(),
                         last_ms: LastMs(Rc::clone(&last_ms)),
-                        near: near.read().as_ref().and_then(|n| n.as_ref()).map(|n| n.0).unwrap_or_default(),
+                        near: {
+                            let mut n = near.read().as_ref().and_then(|n| n.as_ref()).map(|n| n.0).unwrap_or_default();
+                            n.next = video_next().or(n.next);
+                            n
+                        },
                         upcoming: upcoming.read().clone().flatten(),
                         on_renegotiate: move |next| picks.set(next),
                         on_notice: {
@@ -4344,6 +4404,7 @@ fn Player(
     let view = use_memo(move || stage.read().view)();
     let own_queue = use_signal(Queue::default);
     let mut queue = try_use_context::<QueueCtx>().map_or(own_queue, |q| q.0);
+    let video_queue = try_use_context::<VideoQueueCtx>();
     let audio = p.kind == ItemKind::Audio;
     let playing_id = p.detail.item.id;
     // A player that gives up must show why, not sit under the turn (V790).
@@ -5010,7 +5071,8 @@ fn Player(
     // handlers can outlive the render that made them, so they read it here.
     let up_next_to = use_hook(|| Rc::new(Cell::new(None::<ItemRef>)));
     // In a group, moving on moves the group (`advance`).
-    up_next_to.set(near.next.filter(|_| p.kind == ItemKind::Episode));
+    // A film's next is only ever a queued video (V853).
+    up_next_to.set(near.next.filter(|_| video_kind(p.kind)));
 
     let on_media = {
         let (advance, up_next_to) = (advance.clone(), Rc::clone(&up_next_to));
@@ -5324,6 +5386,39 @@ fn Player(
                         starting.set(false);
                     });
                 }
+                Control::ShowQueue(open) => {
+                    let Some(VideoQueueCtx(q, mut shown)) = video_queue else {
+                        return;
+                    };
+                    shown.set(open);
+                    platform::info(&format!(
+                        "pharos: video queue shown={open} upcoming={}",
+                        q.peek().upcoming().len()
+                    ));
+                }
+                Control::Queue(action) => {
+                    let Some(VideoQueueCtx(mut q, _)) = video_queue else {
+                        return;
+                    };
+                    let play = match action {
+                        QueueAction::Play(key) => q
+                            .peek()
+                            .upcoming()
+                            .iter()
+                            .find(|e| e.key == key)
+                            .map(|e| e.id),
+                        _ => None,
+                    };
+                    q.write().apply(action, seed());
+                    platform::info(&format!(
+                        "pharos: video queue action={} upcoming={}",
+                        action.label(),
+                        q.peek().upcoming().len()
+                    ));
+                    if let Some(id) = play {
+                        go(id);
+                    }
+                }
                 Control::ShowInvite(open) => {
                     let (mut invite_for, mut note) = (invite_for, invite_note);
                     note.set(None);
@@ -5510,7 +5605,13 @@ fn Player(
         next,
         up_next: match (up_next_step(), upcoming.as_ref()) {
             (UpNextStep::Counting { left_ms, of_ms }, next) => {
-                Some(UpNextCard::of(next, left_ms, of_ms))
+                // Only the card's own item: a group's next is not the queue's.
+                let next = next.filter(|n| Some(n.id) == up_next_to.get());
+                let mut card = UpNextCard::of(next, left_ms, of_ms);
+                if next.is_none() && p.kind != ItemKind::Episode {
+                    "Next".clone_into(&mut card.name);
+                }
+                Some(card)
             }
             _ => None,
         },
@@ -5723,6 +5824,14 @@ fn Player(
                 invite,
                 invite_open,
                 invite_note: invite_note(),
+                queue: video_queue.filter(|_| !grouped).map(|VideoQueueCtx(q, shown)| {
+                    let q = q.read();
+                    VideoQueueView {
+                        entries: q.upcoming().to_vec(),
+                        shuffled: q.shuffled(),
+                        open: shown() && !compact,
+                    }
+                }),
             }
         }
     }
