@@ -85,6 +85,7 @@ fn encode(src: &Path, dir: &Path, tonemap: Tonemap) -> PathBuf {
         stereo_output: Default::default(),
         tonemap,
         output_size: None,
+        output_scale_reason: None,
     };
     let out = dir.join(format!("seg-{}.m4s", tonemap.label()));
     let args = ffmpeg_transcode_args(

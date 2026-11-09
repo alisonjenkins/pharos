@@ -864,6 +864,9 @@ pub struct DeliveryRequest<'a> {
     pub resume_ticks: u64,
     /// The client's `EnableTranscoding` switch.
     pub transcoding: bool,
+    /// The client's `MaxWidth` / `MaxHeight`, baked into the master URL so the
+    /// cold-start prewarm and the segment requests plan the same output size.
+    pub size_limits: pharos_transcode::SizeLimits,
 }
 
 /// The segmented delivery of a negotiated playback.
@@ -890,10 +893,11 @@ pub fn delivery(n: &Negotiated, r: &DeliveryRequest<'_>) -> Delivery {
         // client's own isTypeSupported pick; the PlaySessionId lets the
         // segment handlers reuse the registered decision (P9, B77).
         (Decision::VideoRemux { .. }, _) | (_, true) => Some(format!(
-            "/videos/{id}/master.m3u8?PlaySessionId={psid}{api_key}&renditions={}{}{}{source}",
+            "/videos/{id}/master.m3u8?PlaySessionId={psid}{api_key}&renditions={}{}{}{}{source}",
             renditions.join(","),
             stream_selection(n, r),
             video_bitrate_param(n),
+            r.size_limits.query_suffix(),
         )),
         (_, false) => Some(format!(
             "/audio/{id}/universal?PlaySessionId={psid}{api_key}{source}"
@@ -1646,6 +1650,7 @@ pub async fn grant(
                 is_web_client: false,
                 resume_ticks,
                 transcoding: true,
+                size_limits: pharos_transcode::SizeLimits::default(),
             },
         )
         .transcoding_url

@@ -486,6 +486,13 @@ const FAILURE_REASONS: [&str; 8] = [
 /// event, and `rate()` / `increase()` cannot see that first event (so the
 /// first short or failed segment after a deploy never alerts).
 pub fn register_segment_metrics() {
+    for reason in pharos_transcode::ScaleReason::ALL {
+        metrics::counter!(
+            "pharos_transcode_output_scaled_total",
+            "reason" => reason.label(),
+        )
+        .increment(0);
+    }
     for stage in [DefectStage::Cached, DefectStage::Produced] {
         for defect in [
             SegmentDefect::Empty,
@@ -3599,6 +3606,16 @@ impl HlsSegmentCache {
             })
             .await
             .map_err(|e| counted("resolve_audio", e))?;
+        // A scaled transcode is starting: this is the one place a downscale is
+        // counted, so a cache hit, a coalesced requester and an init segment
+        // (none of which reach here) do not inflate it.
+        if let (Some(_), Some(reason)) = (opts.output_size, opts.output_scale_reason) {
+            metrics::counter!(
+                "pharos_transcode_output_scaled_total",
+                "reason" => reason.label(),
+            )
+            .increment(1);
+        }
         let mut attempt_opts = resolved.to_transcode_options();
         let mut timing = None;
         // A produced segment can be short of video frames while ffmpeg exits 0
@@ -6148,6 +6165,7 @@ mod tests {
             stereo_output: Default::default(),
             tonemap: Default::default(),
             output_size: None,
+            output_scale_reason: None,
         }
         .resolve_with(|_| {
             Ok::<_, ()>(pharos_transcode::options::MuxedAudio {
@@ -6187,6 +6205,7 @@ mod tests {
             stereo_output: Default::default(),
             tonemap: Default::default(),
             output_size: None,
+            output_scale_reason: None,
         }
     }
 
@@ -6705,6 +6724,7 @@ mod tests {
             stereo_output: Default::default(),
             tonemap: Default::default(),
             output_size: None,
+            output_scale_reason: None,
         }
     }
 
@@ -7347,6 +7367,61 @@ mod tests {
             );
             tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         }
+    }
+
+    fn scaled_total(snapshotter: &pharos_test_metrics::CumulativeSnapshotter, reason: &str) -> u64 {
+        snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(ck, ..)| {
+                ck.key().name() == "pharos_transcode_output_scaled_total"
+                    && ck
+                        .key()
+                        .labels()
+                        .any(|l| l.key() == "reason" && l.value() == reason)
+            })
+            .map(|(_, _, _, v)| match v {
+                metrics_util::debugging::DebugValue::Counter(n) => n,
+                _ => 0,
+            })
+            .sum()
+    }
+
+    /// `pharos_transcode_output_scaled_total` is "scaled transcodes STARTED": the
+    /// encode counts once, and a request served from the cache afterwards does
+    /// not count again.
+    #[test]
+    fn a_scaled_transcode_counts_once_and_a_cache_hit_does_not() {
+        let dir = TempDir::new().unwrap();
+        let (cache, encodes) = slow_test_cache(&dir, std::time::Duration::from_millis(10));
+        let mut opts = slow_opts();
+        opts.output_size = pharos_transcode::OutputSize::new(1920, 1080);
+        opts.output_scale_reason = Some(pharos_transcode::ScaleReason::MaxSize);
+
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = pharos_test_metrics::snapshotter(&recorder);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        metrics::with_local_recorder(&recorder, || {
+            rt.block_on(async {
+                for _ in 0..3 {
+                    cache
+                        .segment_bytes(51, 3, Path::new("/no/source"), &opts, JobClass::Interactive)
+                        .await
+                        .unwrap();
+                }
+            })
+        });
+        assert_eq!(
+            encode_count(&encodes),
+            1,
+            "precondition: one encode, two hits"
+        );
+        assert_eq!(scaled_total(&snapshotter, "max_size"), 1);
+        assert_eq!(scaled_total(&snapshotter, "bitrate"), 0);
     }
 
     /// The `pharos_segment_produced_total` series carrying `outcome=<want>`,
@@ -10417,6 +10492,7 @@ mod tests {
             stereo_output: Default::default(),
             tonemap: Default::default(),
             output_size: None,
+            output_scale_reason: None,
         }
     }
 
@@ -11216,6 +11292,7 @@ mod tests {
             stereo_output: Default::default(),
             tonemap: Default::default(),
             output_size: None,
+            output_scale_reason: None,
         };
         let got = cache
             .segment_bytes(7, 0, Path::new("/no/source"), &opts, JobClass::Interactive)
@@ -11246,6 +11323,7 @@ mod tests {
             stereo_output: Default::default(),
             tonemap: Default::default(),
             output_size: None,
+            output_scale_reason: None,
         };
         let res = cache
             .segment_bytes(8, 0, Path::new("/no/source"), &opts, JobClass::Interactive)
@@ -11341,6 +11419,7 @@ mod tests {
             stereo_output: Default::default(),
             tonemap: Default::default(),
             output_size: None,
+            output_scale_reason: None,
         };
         let source = Path::new("/media/stale.mkv");
         cache.note_source_unreadable(source, "stale_handle").await;
@@ -11386,6 +11465,7 @@ mod tests {
             stereo_output: Default::default(),
             tonemap: Default::default(),
             output_size: None,
+            output_scale_reason: None,
         };
         let _ = cache
             .segment_bytes(7, 0, Path::new("/no/source"), &opts, JobClass::Interactive)
@@ -11432,6 +11512,7 @@ mod tests {
                 stereo_output: Default::default(),
                 tonemap: Default::default(),
                 output_size: None,
+                output_scale_reason: None,
             };
             cache
                 .segment_bytes(9, 0, Path::new("/n"), &opts, JobClass::Interactive)
@@ -11458,6 +11539,7 @@ mod tests {
                 stereo_output: Default::default(),
                 tonemap: Default::default(),
                 output_size: None,
+                output_scale_reason: None,
             };
             cache
                 .segment_bytes(9, 0, Path::new("/n"), &opts, JobClass::Interactive)

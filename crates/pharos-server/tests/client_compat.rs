@@ -516,6 +516,7 @@ async fn three_d_playback_negotiation_and_stereo_mode_isolation() {
         stereo_output: stereo,
         tonemap: Default::default(),
         output_size: None,
+        output_scale_reason: None,
     };
 
     let key_preserve = SegmentIdentity::new(

@@ -2372,6 +2372,7 @@ async fn playback_info(
             is_web_client,
             resume_ticks,
             transcoding: switches.transcoding,
+            size_limits: super::output_size::qs_size_limits(req.query_string()),
         },
     );
     let renditions_param = renditions.join(",");
@@ -2583,6 +2584,9 @@ async fn playback_info(
             audio_idx,
             sub_idx,
             video_bitrate_cap,
+            // The bounds the URL carries, so the prewarmed segments are keyed
+            // by the size the client's own requests will plan.
+            super::output_size::qs_size_limits(url),
             // B136 — warm the segments playback will actually START on. This is
             // the same value that rides `start_position_ticks` in the response
             // (and, for native players, `StartTimeTicks` on the transcoding

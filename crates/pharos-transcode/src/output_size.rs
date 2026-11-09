@@ -130,6 +130,20 @@ impl SizeLimits {
         }
     }
 
+    /// The bounds as URL query parameters (`&MaxWidth=1280&MaxHeight=720`),
+    /// empty when there are none: what PlaybackInfo bakes into the transcoding
+    /// URL so the master, its variants and the segments all plan the same size.
+    pub fn query_suffix(&self) -> String {
+        let mut q = String::new();
+        if let Some(w) = self.max_width {
+            q.push_str(&format!("&MaxWidth={w}"));
+        }
+        if let Some(h) = self.max_height {
+            q.push_str(&format!("&MaxHeight={h}"));
+        }
+        q
+    }
+
     pub fn is_empty(&self) -> bool {
         self.max_width.is_none() && self.max_height.is_none()
     }
@@ -382,6 +396,16 @@ mod tests {
         let l = limits(None, Some(540));
         let (s, _) = plan_delivered(1920, 2160, 1920, 1080, l, None, 4).unwrap();
         assert_eq!((s.width(), s.height()), (960, 1080));
+    }
+
+    #[test]
+    fn bounds_round_trip_through_a_query_suffix() {
+        assert_eq!(SizeLimits::default().query_suffix(), "");
+        assert_eq!(
+            limits(Some(1280), Some(720)).query_suffix(),
+            "&MaxWidth=1280&MaxHeight=720"
+        );
+        assert_eq!(limits(None, Some(720)).query_suffix(), "&MaxHeight=720");
     }
 
     #[test]
