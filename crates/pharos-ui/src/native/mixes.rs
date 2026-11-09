@@ -685,7 +685,10 @@ fn rule_text(r: &Rule) -> String {
         Test::Tempo { min, max } => format!("{min}–{max} BPM"),
         Test::Energy { min, max } => format!("energy {min}–{max}%"),
     };
-    format!("{} {what}", r.weight.label())
+    match (r.weight, r.share) {
+        (Weight::Prefer, share @ 1..) => format!("{} {what} (about {share}%)", r.weight.label()),
+        _ => format!("{} {what}", r.weight.label()),
+    }
 }
 
 /// A song length as a tile says it: whole minutes as "4 min", else m:ss.
@@ -1729,6 +1732,22 @@ mod tests {
             "{html}"
         );
         assert_eq!(html.matches("pharos-mix-tile-on").count(), 1, "{html}");
+    }
+
+    #[test]
+    fn a_preferred_rule_says_its_share() {
+        let spec = MixSpec {
+            rules: vec![Rule {
+                weight: Weight::Prefer,
+                share: 60,
+                test: Test::AddedWithinDays(30),
+            }],
+            ..MixSpec::default()
+        };
+        assert_eq!(
+            describe(&spec),
+            "More added in the last 30 days (about 60%)"
+        );
     }
 
     #[test]
