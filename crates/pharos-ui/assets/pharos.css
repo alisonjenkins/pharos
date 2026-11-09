@@ -5419,6 +5419,11 @@ body:has(.pharos-stage.is-mini) .pharos-main {
   margin: 0;
   color: var(--px-color-fg-muted);
 }
+.pharos-admin-integrity-export {
+  justify-self: start;
+  align-self: flex-start;
+  text-decoration: none;
+}
 .pharos-admin-duplicate,
 .pharos-admin-integrity-file,
 .pharos-admin-integrity-deep-check {
