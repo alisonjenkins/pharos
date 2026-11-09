@@ -248,7 +248,17 @@ pub fn LyricsPanel(
         });
     }));
     let mut hold = move || held_until.set(platform::now_ms() + HOLD_MS);
+    // Outside the panel: its children are the lines, counted by index when
+    // the sung line is centred.
+    let timing = karaoke && lyrics.words_pending;
     rsx! {
+        if timing {
+            p {
+                class: "pharos-lyrics-timing",
+                role: "status",
+                "Timing the words… the fill is a guess until then"
+            }
+        }
         div {
             id: PANEL_ID,
             class: "pharos-lyrics",
@@ -597,6 +607,25 @@ mod tests {
         plain.synced = false;
         let plain = render_as(plain, 2_000, true);
         assert!(plain.contains(r#"data-karaoke="false""#), "{plain}");
+    }
+
+    #[test]
+    fn karaoke_says_so_while_the_words_are_still_being_timed() {
+        let mut l = synced(&[1_000, 3_000]);
+        l.words_pending = true;
+        let timing = render_as(l.clone(), 1_500, true);
+        assert_eq!(
+            timing.matches("pharos-lyrics-timing").count(),
+            1,
+            "{timing}"
+        );
+        assert!(timing.contains(r#"role="status""#), "{timing}");
+        // Lines only, no karaoke: the panel draws no fill to apologise for.
+        let lines_only = render_as(l.clone(), 1_500, false);
+        assert!(!lines_only.contains("pharos-lyrics-timing"), "{lines_only}");
+        l.words_pending = false;
+        let timed = render_as(l, 1_500, true);
+        assert!(!timed.contains("pharos-lyrics-timing"), "{timed}");
     }
 
     #[test]
