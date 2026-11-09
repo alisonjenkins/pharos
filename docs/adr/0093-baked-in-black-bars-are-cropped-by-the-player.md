@@ -32,7 +32,7 @@ player crop to it.
   row against the file signature and `PICTURE_CHECK_VERSION`, so it is redone
   only for a changed file or a new detector.
 - The native API's `Version` carries it as `pictureX/Y/Width/Height` in coded
-  pixels (schemaVersion 32), width 0 when there are no bars or the file is not
+  pixels (schemaVersion 34), width 0 when there are no bars or the file is not
   checked yet.
 - The web player crops with CSS, the way it already crops a 3D frame to one
   eye (V921): the video takes the picture's shape and the frame is stretched
@@ -48,7 +48,7 @@ player crop to it.
 - Jellyfin clients see no change: they get the whole frame as before.
 - ASS subtitles drawn by JASSUB fit the whole frame's shape inside the cropped
   picture, so they draw a little smaller on a cropped file. Text and image
-  subtitles fit the picture (V977, V978).
+  subtitles fit the picture (V977, V991).
 - A file whose dark opening frames all fall on the samples gets no area, and
   the player shows it uncropped, as before.
 
@@ -64,5 +64,5 @@ player crop to it.
 
 ## References
 
-- B1017, V976-V978 in `specs/001-pharos-baseline/`.
+- B1017, V976, V977 and V991 in `specs/001-pharos-baseline/`.
 - ADR-0050 (song analysis sweep), spec 022 / V921 (3D eye crop).
