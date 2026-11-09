@@ -73,8 +73,9 @@ use super::turn::{self, EpisodeTurn, EPISODE_TURN_KEY};
 use super::versions;
 use super::views::{
     open_route, reveal_palette_row, Busy, ErrorNote, FlashNote, GroupEndedNote, Hits, HomeView,
-    LoadError, LoadFailure, Loading, MarkPlayed, Nav, PaletteView, PlayFailure, PlayFromStart,
-    PlaybackFailure, SearchBox, Shell, SignInView, StatusView, TitleView, PALETTE_INPUT,
+    LoadError, LoadFailure, Loading, MarkFavorite, MarkPlayed, Nav, PaletteView, PlayFailure,
+    PlayFromStart, PlaybackFailure, SearchBox, Shell, SignInView, StatusView, TitleView,
+    PALETTE_INPUT,
 };
 use super::watch_view::{
     split_position, text_track_id, total_ms, Control, Controls, Skip, UpNextCard, VideoQueueView,
@@ -1557,6 +1558,67 @@ impl Flash {
     }
 }
 
+/// Which of an item's marks a [`mark_handler`] stores.
+#[derive(Clone, Copy)]
+enum Mark {
+    Played,
+    Favorite,
+}
+
+impl Mark {
+    fn label(self) -> &'static str {
+        match self {
+            Mark::Played => "played",
+            Mark::Favorite => "favorite",
+        }
+    }
+}
+
+/// Stores one kind of mark for `(item, on, name)`, one per item at a time
+/// (a second click before the reload would record a second play), says in
+/// the flash line when the server refuses, and reloads the screen either
+/// way: a season that failed part way through has some episodes marked, and
+/// the screen shows what is stored.
+fn mark_handler(
+    mark: Mark,
+    api: Signal<Option<NativeApi>>,
+    machine: Signal<Machine>,
+    flash: Flash,
+    mut marks: Signal<u32>,
+) -> EventHandler<(ItemRef, bool, String)> {
+    let marking = Rc::new(RefCell::new(std::collections::HashSet::<ItemRef>::new()));
+    EventHandler::new(move |(id, on, name): (ItemRef, bool, String)| {
+        let Some(api) = api.peek().clone() else {
+            return;
+        };
+        let what = mark.label();
+        if !marking.borrow_mut().insert(id) {
+            platform::info(&format!(
+                "pharos: mark {id} {what}={on} skipped: one in flight"
+            ));
+            return;
+        }
+        let marking = Rc::clone(&marking);
+        spawn(async move {
+            let call = call("mark", what);
+            let result = match mark {
+                Mark::Played => api.set_played(&call, id, on).await,
+                Mark::Favorite => api.set_favorite(&call, id, on).await,
+            };
+            if let Err(e) = settle(machine, result) {
+                platform::warn(&format!("pharos: marking {id} {what}={on} failed: {e}"));
+                let line = match mark {
+                    Mark::Played => super::views::mark_failure_line(&name, on, &e),
+                    Mark::Favorite => super::views::favorite_failure_line(&name, on, &e),
+                };
+                flash.say(line, true);
+            }
+            marking.borrow_mut().remove(&id);
+            marks += 1;
+        });
+    })
+}
+
 #[component]
 fn NativeApp(route: Route) -> Element {
     let mut machine = use_signal(Machine::new);
@@ -1566,7 +1628,7 @@ fn NativeApp(route: Route) -> Element {
     // A page loaded before a deploy reconnects to the newer server, which may
     // send values this build cannot read: it asks to be reloaded.
     let outdated = use_signal(|| false);
-    let mut marks = use_signal(|| 0u32);
+    let marks = use_signal(|| 0u32);
     let flash = Flash {
         line: use_signal(|| None),
         generation: use_signal(|| 0),
@@ -1635,38 +1697,8 @@ fn NativeApp(route: Route) -> Element {
     // Whether the queue is docked beside the compact player (B900).
     use_context_provider(|| QueueDock(Signal::new(super::listen::dock_shown())));
     mixes::use_top_up(api, queue, mix);
-    use_context_provider(|| {
-        let marking = Rc::new(RefCell::new(std::collections::HashSet::<ItemRef>::new()));
-        MarkPlayed(EventHandler::new(
-            move |(id, played, name): (ItemRef, bool, String)| {
-                let Some(api) = api.peek().clone() else {
-                    return;
-                };
-                // One mark per item at a time: a second click before the reload
-                // would record a second play.
-                if !marking.borrow_mut().insert(id) {
-                    platform::info(&format!(
-                        "pharos: mark {id} played={played} skipped: one in flight"
-                    ));
-                    return;
-                }
-                let marking = Rc::clone(&marking);
-                spawn(async move {
-                    let result = api.set_played(&call("mark", "played"), id, played).await;
-                    if let Err(e) = settle(machine, result) {
-                        platform::warn(&format!(
-                            "pharos: marking {id} played={played} failed: {e}"
-                        ));
-                        flash.say(super::views::mark_failure_line(&name, played, &e), true);
-                    }
-                    marking.borrow_mut().remove(&id);
-                    // Reload either way: a season that failed part way through
-                    // has some episodes marked, and the screen shows what is stored.
-                    marks += 1;
-                });
-            },
-        ))
-    });
+    use_context_provider(|| MarkPlayed(mark_handler(Mark::Played, api, machine, flash, marks)));
+    use_context_provider(|| MarkFavorite(mark_handler(Mark::Favorite, api, machine, flash, marks)));
     let search = Search {
         text: use_signal(String::new),
         find: use_signal(Find::default),

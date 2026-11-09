@@ -1065,6 +1065,7 @@ input:focus-visible {
 }
 .pharos-actions {
   display: flex;
+  flex-wrap: wrap;
   gap: 0.75rem;
   margin: 1.5rem 0;
 }
@@ -1119,6 +1120,13 @@ input:focus-visible {
   border: 1px solid var(--px-color-border);
   font: inherit;
   font-weight: 600;
+}
+/* A favourite mark (B1082): the star takes the accent while it is one. */
+.pharos-favorite.on {
+  border-color: var(--px-color-accent);
+}
+.pharos-favorite.on span {
+  color: var(--px-color-accent);
 }
 .pharos-overview {
   max-width: 60ch;

@@ -33,7 +33,8 @@ use super::seen::{self, MemberSeen};
 use super::together_view::{InThisGroup, SeenDots};
 use super::views::{
     display_name, episode_label, is_placeholder_episode_name, progress_percent, runtime,
-    ArtPlaceholder, Link, MarkPlayed, PosterTile, Ratings, WatchedToggle, MAIN_ACTION,
+    ArtPlaceholder, FavoriteToggle, Link, MarkPlayed, PosterTile, Ratings, WatchedToggle,
+    MAIN_ACTION,
 };
 use pharos_client::mix::radio;
 
@@ -1496,6 +1497,13 @@ fn Hero(
                                 id: d.item.id,
                                 played: d.item.played,
                                 what: "show",
+                                name: d.item.name.clone(),
+                            }
+                        }
+                        if let Some(d) = detail.as_ref().filter(|_| mark) {
+                            FavoriteToggle {
+                                id: d.item.id,
+                                favorite: d.item.favorite,
                                 name: d.item.name.clone(),
                             }
                         }
@@ -3115,6 +3123,11 @@ mod tests {
             "{html}"
         );
         assert!(html.contains(">Mark show watched<"), "{html}");
+        assert!(
+            html.contains(r#"data-key-action="favorite""#)
+                && html.contains(r#"aria-pressed="false""#),
+            "the show can be made a favourite (B1082): {html}"
+        );
 
         pilot.played = true;
         let all = show(vec![pilot, second]);
@@ -3147,6 +3160,11 @@ mod tests {
                 use_context_provider(|| Nav(EventHandler::new(|_: Route| {})));
                 use_context_provider(|| {
                     MarkPlayed(EventHandler::new(|_: (ItemRef, bool, String)| {}))
+                });
+                use_context_provider(|| {
+                    super::super::views::MarkFavorite(EventHandler::new(
+                        |_: (ItemRef, bool, String)| {},
+                    ))
                 });
                 body()
             },
