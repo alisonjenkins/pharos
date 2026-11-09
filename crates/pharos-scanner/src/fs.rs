@@ -3052,14 +3052,33 @@ fn strip_release_group(name: &str) -> String {
 /// A film name's title words: [`film_copy_key`]'s words less the year, the
 /// release words and an article at either end.
 fn film_title(name: &str, year: u32) -> Vec<String> {
-    let name = strip_release_group(name);
+    title_words(name, Some(year))
+}
+
+fn title_words(name: &str, year: Option<u32>) -> Vec<String> {
+    // `_` is a word character to the cut and group patterns: a scene name
+    // spelt with underscores would keep both.
+    let name = strip_release_group(&name.replace('_', " "));
     let name = match CHANNELS_RE.as_ref() {
         Some(re) => re.replace_all(&name, " "),
         None => name.into(),
     };
-    let year = year.to_string();
-    let name = strip_cut(&name, &year);
-    let mut title: Vec<String> = words(&name)
+    let year = year.map(|y| y.to_string()).unwrap_or_default();
+    let name = if year.is_empty() {
+        name
+    } else {
+        strip_cut(&name, &year).into_owned().into()
+    };
+    let mut all = words(&name);
+    if let Some(at) = all.iter().rposition(|w| !year.is_empty() && *w == year) {
+        let tail = all.split_off(at + 1);
+        if tail.iter().any(|w| is_film_release_word(w)) {
+            all.extend(disc_words(&tail));
+        } else {
+            all.extend(tail);
+        }
+    }
+    let mut title: Vec<String> = all
         .into_iter()
         .filter(|w| *w != year && !is_film_release_word(w))
         .collect();
@@ -3070,7 +3089,32 @@ fn film_title(name: &str, year: u32) -> Vec<String> {
     if title.len() > 1 && title.last().is_some_and(article) {
         title.pop();
     }
+    // `The Hobbit The Battle…` and `The.Hobbit.Battle…` name one film.
+    if title.len() > 1 {
+        title.retain(|w| w != "the");
+    }
     title
+}
+
+/// The disc or part a scene tail names (`cd2`, `CD 2`, `Part 2`): the one
+/// thing after the year in a release name that tells two files' contents
+/// apart. The rest of such a tail (`3Li BluRay 720p`, `Eng NL Subs`,
+/// `DTS-HD MA-LTT`) says only how the copy was made.
+fn disc_words(tail: &[String]) -> Vec<String> {
+    let numbered = |w: &str| w.bytes().all(|b| b.is_ascii_digit()) && !w.is_empty();
+    let marker = |w: &str| matches!(w, "cd" | "disc" | "disk" | "part" | "pt");
+    let mut out = Vec::new();
+    for (i, w) in tail.iter().enumerate() {
+        let joined = ["cd", "disc", "disk", "part", "pt"]
+            .iter()
+            .any(|m| w.strip_prefix(m).is_some_and(numbered));
+        if joined {
+            out.push(w.clone());
+        } else if marker(w) && tail.get(i + 1).is_some_and(|n| numbered(n)) {
+            out.extend(tail.get(i..=i + 1).into_iter().flatten().cloned());
+        }
+    }
+    out
 }
 
 /// `name` less the cut its tail names after `year` (`Director's Cut`,
@@ -8757,6 +8801,52 @@ mod tests {
             others.into_iter().all(|(_, alts)| alts.is_empty()),
             "{groups:?}"
         );
+    }
+
+    /// B1011 / V970 — doubles prod still showed after #1094: a scene tail
+    /// after the year (`DTS-HD.MA.7.1-LTT`, `MKV.AC3.DTS.Eng.NL.Subs`, a group
+    /// mid-tail `3Li BluRay 720p`), underscores and an inner `The`. A disc or
+    /// part in such a tail still tells two files apart.
+    #[test]
+    fn the_film_doubles_left_after_the_first_fold_are_copies() {
+        for (primary, copy) in [
+            (
+                "/m/Everest (2015)/Everest (2015) Bluray-1080p.mkv",
+                "/m/Everest.2015.BluRay.1080p.x264.DTS-HD.MA.7.1-LTT/Everest.2015.BluRay.1080p.x264.DTS-HD.MA.7.1-LTT.mkv",
+            ),
+            (
+                "/m/Johnny English Reborn (2011)/Johnny English Reborn (2011) WEBRip-1080p.mkv",
+                "/m/Johnny.English.Reborn.2011.1080p.MKV.AC3.DTS.Eng.NL.Subs/Johnny.English.Reborn.2011.1080p.MKV.AC3.DTS.Eng.NL.Subs.mkv",
+            ),
+            (
+                "/m/Lara Croft Tomb Raider (2001)/Lara Croft - Tomb Raider (2001) WEBDL-1080p.mkv",
+                "/m/Lara Croft Tomb Raider 2001 BluRay 720p DTS x264-3Li/Lara Croft Tomb Raider 2001 3Li BluRay 720p.mkv",
+            ),
+            (
+                "/m/Superbad (2007)/Superbad (2007) Bluray-1080p.mkv",
+                "/m/Superbad 2007 Unrated Extended 1080p BluRay/Superbad_2007_Unrated_Extended_1080p_BluRay_BHD264_AAC51_MP4-FASM.mp4",
+            ),
+            (
+                "/m/Hobbit The Battle of the Five Armies, The (2014)/The Hobbit - The Battle of the Five Armies (2014) WEBDL-1080p.mkv",
+                "/m/The.Hobbit.Battle.Of.The.Five.Armies.2014.1080p.WEBRip.x264-tomcat12[ETRG]/The.Hobbit.Battle.Of.The.Five.Armies.2014.1080p.WEBRip.x264-tomcat12[ETRG].mp4",
+            ),
+        ] {
+            let groups = group_editions(vec![PathBuf::from(primary), PathBuf::from(copy)]);
+            assert_eq!(groups.len(), 1, "{copy} is a copy of {primary}: {groups:?}");
+        }
+        for (a, b) in [
+            (
+                "/m/Final Destination (2000)/Final Destination (2000) BluRay cd1.mkv",
+                "/m/Final Destination (2000)/Final Destination (2000) BluRay cd2.mkv",
+            ),
+            (
+                "/m/Heat (1995)/Heat (1995) Bluray-1080p.mkv",
+                "/m/Heat (1995)/Heat (1995) Part 2 Bluray-1080p.mkv",
+            ),
+        ] {
+            let groups = group_editions(vec![PathBuf::from(a), PathBuf::from(b)]);
+            assert_eq!(groups.len(), 2, "{b} stays apart from {a}: {groups:?}");
+        }
     }
 
     /// B1014 / V973 — a letterboxed rip ranks by its width's 16:9 class, so a
