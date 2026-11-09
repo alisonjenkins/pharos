@@ -940,6 +940,9 @@ pub fn PosterTile(item: Item) -> Element {
                 if item.stereo.is_some() {
                     span { class: "pharos-badge pharos-badge-3d", title: "Has a 3D version", "3D" }
                 }
+                if item.damaged {
+                    span { class: "pharos-badge pharos-badge-damaged", title: "The file is damaged", "Damaged" }
+                }
                 if let Some(p) = progress {
                     div { class: "pharos-progress", style: "width: {p}%" }
                 }
@@ -1044,6 +1047,9 @@ pub fn TitleView(
                     p { class: "pharos-muted", "{facts}" }
                 }
                 Ratings { kind: item.kind, imdb: item.imdb_rating, critic: item.critic_rating, tile: false }
+                if let Some(damage) = detail.damage.clone() {
+                    super::damage::DamageLine { damage }
+                }
                 div { class: "pharos-actions",
                     if item.kind.playable() && detail.versions.len() > 1 {
                         label { class: "pharos-filter",
@@ -2265,6 +2271,78 @@ mod tests {
             tile.contains("pharos-badge-3d") && tile.contains(">3D<"),
             "{tile}"
         );
+    }
+
+    /// B940: a damaged file is badged on its tile and its title page says
+    /// where it breaks, and the damaged copy is named in the version picker.
+    #[test]
+    fn a_damaged_title_is_badged_and_says_where() {
+        use pharos_client::api::{Damage, DamageSpan, Version};
+        let mut movie = item(ItemKind::Movie);
+        let clean = render({
+            let movie = movie.clone();
+            move || rsx! { PosterTile { item: movie.clone() } }
+        });
+        assert!(!clean.contains("pharos-badge-damaged"), "{clean}");
+        movie.damaged = true;
+        let tile = render({
+            let movie = movie.clone();
+            move || rsx! { PosterTile { item: movie.clone() } }
+        });
+        assert!(
+            tile.contains("pharos-badge-damaged") && tile.contains(">Damaged<"),
+            "{tile}"
+        );
+
+        let detail = Detail {
+            item: movie,
+            overview: String::new(),
+            genres: vec![],
+            chapters: vec![],
+            audio_tracks: vec![],
+            subtitle_tracks: vec![],
+            trickplay: vec![],
+            segments: vec![],
+            fonts: Vec::new(),
+            artists: Vec::new(),
+            album: None,
+            cast: Vec::new(),
+            versions: vec![
+                Version {
+                    primary: true,
+                    height: 1080,
+                    width: 1920,
+                    damaged: true,
+                    ..Default::default()
+                },
+                Version {
+                    id: "copy".into(),
+                    height: 720,
+                    width: 1280,
+                    ..Default::default()
+                },
+            ],
+            damage: Some(Damage {
+                verdict: "damaged".into(),
+                reason: "invalid as first byte of an EBML number".into(),
+                ranges: vec![DamageSpan {
+                    start_ms: 600_000,
+                    end_ms: 1_140_000,
+                }],
+                checked_at: None,
+            }),
+        };
+        let html = render(move || rsx! { TitleView { detail: detail.clone() } });
+        assert!(
+            html.contains("This file is damaged at 10:00–19:00. Playback may skip or stop there."),
+            "{html}"
+        );
+        assert!(
+            html.contains(r#"title="invalid as first byte of an EBML number""#),
+            "{html}"
+        );
+        assert!(html.contains(">1080p · Damaged</option>"), "{html}");
+        assert!(html.contains(">720p</option>"), "{html}");
     }
 
     /// Two copies of an episode: the picker names each by its file, and the

@@ -1814,6 +1814,9 @@ fn EpisodeRow(episode: Item, #[props(default)] seen: Vec<seen::SeenRow>) -> Elem
                         if let Some(l) = length { "{l}" }
                         if episode.played { " · Watched" }
                     }
+                    if episode.damaged {
+                        span { class: "pharos-episode-damaged", title: "The file is damaged", "Damaged" }
+                    }
                     SeenDots { rows: seen }
                 }
             }
