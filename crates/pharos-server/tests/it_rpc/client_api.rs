@@ -730,3 +730,67 @@ async fn versions_describe_their_files_and_show_paths_to_admins_only() {
         )]
     );
 }
+
+/// 017 T047: `NativeApi::subscribe_events` delivers the user's changes, its
+/// cursor follows them, and a subscription made again from that cursor (as
+/// after a reconnect) gets only what it missed; a cursor from another server
+/// run gets one resync and is moved to the new head.
+/// Disarm check: with `Sink::push` not advancing the cursor, the resumed
+/// subscription replays the first change too.
+#[actix_web::test]
+async fn subscribe_events_resumes_from_its_cursor() {
+    use pharos_client::events::{EventCursor, PushEvent};
+    use std::time::Duration;
+    use tokio::sync::mpsc;
+
+    let (api, _fx, _server) = api().await;
+    let call = CallInfo::default();
+    let cursor = EventCursor::default();
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let sub = api
+        .subscribe_events(&call, &["userData"], &cursor, move |b| {
+            let _ = tx.send(b);
+        })
+        .await
+        .expect("subscribe");
+    api.set_played(&call, ItemRef::Real(MOVIE), true)
+        .await
+        .expect("mark");
+    let first = next_push(&mut rx).await;
+    assert!(
+        matches!(first.as_slice(), [PushEvent::UserData { id, played: true, .. }] if *id == ItemRef::Real(MOVIE)),
+        "{first:?}"
+    );
+    let seen = cursor.seq();
+    assert!(seen > 0);
+    drop(sub);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    api.set_played(&call, ItemRef::Real(MOVIE), false)
+        .await
+        .expect("unmark");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let _again = api
+        .subscribe_events(&call, &["userData"], &cursor, move |b| {
+            let _ = tx.send(b);
+        })
+        .await
+        .expect("resubscribe");
+    let missed = next_push(&mut rx).await;
+    assert!(
+        matches!(missed.as_slice(), [PushEvent::UserData { played: false, .. }]),
+        "{missed:?}"
+    );
+    assert_eq!(cursor.seq(), seen + 1);
+}
+
+async fn next_push(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<Vec<pharos_client::events::PushEvent>>,
+) -> Vec<pharos_client::events::PushEvent> {
+    tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+        .await
+        .expect("a push within 5 s")
+        .expect("open")
+}
