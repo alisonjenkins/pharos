@@ -158,8 +158,8 @@ const BROWSE: Modes = Modes::Only(&[Mode::Browse]);
 const MUSIC: Modes = Modes::Only(&[Mode::Music]);
 const QUEUE: Modes = Modes::Only(&[Mode::Queue]);
 const LISTENING: Modes = Modes::Only(&[Mode::Music, Mode::Queue]);
-/// Escape is the music player's way back to the library.
-const NOT_MUSIC: Modes = Modes::Only(&[Mode::Browse, Mode::Detail, Mode::Player, Mode::Queue]);
+/// Escape is each full player's way back to the library.
+const NOT_PLAYING: Modes = Modes::Only(&[Mode::Browse, Mode::Detail, Mode::Queue]);
 const DETAIL: Modes = Modes::Only(&[Mode::Detail]);
 const PLAYERS: Modes = Modes::Only(&[Mode::Player, Mode::Music]);
 const VIDEO: Modes = Modes::Only(&[Mode::Player]);
@@ -487,6 +487,14 @@ pub const BINDINGS: &[Binding] = &[
         MUSIC,
         A::Press("shrink"),
     ),
+    // The video goes on in the mini bar or floating window (B903).
+    bind(
+        &["Escape"],
+        "Shrink to the mini bar or floating player",
+        G::Play,
+        VIDEO,
+        A::Press("shrink"),
+    ),
     bind(
         &["Backspace"],
         "Back to the library",
@@ -573,7 +581,7 @@ pub const BINDINGS: &[Binding] = &[
         &["Escape"],
         "Back, or close",
         G::General,
-        NOT_MUSIC,
+        NOT_PLAYING,
         A::Native,
     ),
 ];
@@ -776,6 +784,24 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// V852: Escape in the full video player shrinks it to the mini bar or
+    /// floating window, as it leaves the music player; elsewhere it is the
+    /// browser's (a menu, a dialog, leaving fullscreen).
+    #[test]
+    fn escape_shrinks_the_full_video_player() {
+        assert_eq!(
+            resolve(Mode::Player, &["Escape"]),
+            Resolved::Run(Action::Press("shrink"))
+        );
+        for mode in [Mode::Browse, Mode::Detail, Mode::Queue] {
+            assert_eq!(
+                resolve(mode, &["Escape"]),
+                Resolved::Run(Action::Native),
+                "{mode:?}"
+            );
         }
     }
 

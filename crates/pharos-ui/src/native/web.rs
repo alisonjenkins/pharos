@@ -1064,6 +1064,21 @@ pub fn focus_by_id(id: &str) {
     }
 }
 
+/// Leaves browser fullscreen when the page is in it, for an Escape the
+/// browser passed on rather than keeping (headless Chromium does): that
+/// Escape leaves fullscreen and does nothing else (V852).
+pub fn leave_fullscreen_on_escape() -> bool {
+    let Some(document) = web_sys::window().and_then(|w| w.document()) else {
+        return false;
+    };
+    if document.fullscreen_element().is_none() {
+        return false;
+    }
+    document.exit_fullscreen();
+    info("pharos: fullscreen action=exit target=page reason=escape");
+    true
+}
+
 /// Leaves fullscreen, or puts the whole page in it. The page, not the player
 /// element: a track or quality change replaces the player node, and an
 /// element's fullscreen would end with it (B816).

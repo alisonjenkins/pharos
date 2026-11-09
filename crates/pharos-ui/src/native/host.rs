@@ -221,6 +221,10 @@ pub async fn copy_text(_text: &str) -> bool {
 
 pub fn exit_page_fullscreen() {}
 
+pub fn leave_fullscreen_on_escape() -> bool {
+    false
+}
+
 pub fn pip_supported() -> bool {
     false
 }
