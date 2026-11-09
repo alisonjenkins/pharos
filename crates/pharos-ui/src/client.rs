@@ -842,6 +842,58 @@ pub fn parse_duplicate_films_response(bytes: &[u8]) -> Result<Vec<DuplicateFilm>
     serde_json::from_slice(bytes).map_err(|e| ClientError::Parse(e.to_string()))
 }
 
+/// `/Admin/Integrity/Damaged` row: a file the integrity scan found
+/// damaged, short or unreadable.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct DamagedFile {
+    pub media_id: String,
+    pub path: Option<String>,
+    /// `damaged`, `short` or `unreadable`.
+    pub verdict: String,
+    pub first_fault: Option<String>,
+    pub first_fault_ms: Option<u64>,
+    pub demux_errors: u64,
+    pub corrupt_packets: u64,
+    pub read_errors: u64,
+    pub scanned_ms: u64,
+    pub declared_ms: Option<u64>,
+    /// `movie`, `episode`, `audio` or `book`.
+    pub kind: Option<String>,
+    pub name: Option<String>,
+    pub series_name: Option<String>,
+    pub season_number: Option<u32>,
+    pub episode_number: Option<u32>,
+    /// Unix seconds.
+    pub checked_at: Option<i64>,
+    pub recheck_pending: bool,
+}
+
+/// `/Admin/Integrity/Status`: how far the background check has got.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct IntegrityStatus {
+    pub eligible: u64,
+    pub checked: u64,
+    pub damaged: u64,
+    pub queued: u64,
+}
+
+/// Both integrity answers the Damaged files tab shows together.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct IntegrityReport {
+    pub status: IntegrityStatus,
+    pub files: Vec<DamagedFile>,
+}
+
+pub fn parse_damaged_files_response(bytes: &[u8]) -> Result<Vec<DamagedFile>, ClientError> {
+    serde_json::from_slice(bytes).map_err(|e| ClientError::Parse(e.to_string()))
+}
+
+pub fn parse_integrity_status_response(bytes: &[u8]) -> Result<IntegrityStatus, ClientError> {
+    serde_json::from_slice(bytes).map_err(|e| ClientError::Parse(e.to_string()))
+}
+
 /// T58 phase 3 — `/Auth/Keys` row.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ApiKey {
@@ -1666,6 +1718,61 @@ pub mod web {
         parse_duplicate_films_response(&bytes)
     }
 
+    pub async fn list_damaged_files(
+        base: &str,
+        token: &str,
+    ) -> Result<Vec<DamagedFile>, ClientError> {
+        let resp = Request::get(&format!("{base}/Admin/Integrity/Damaged"))
+            .header("X-Emby-Token", token)
+            .send()
+            .await
+            .map_err(|e| ClientError::Http(e.to_string()))?;
+        if !resp.ok() {
+            return Err(ClientError::Status(resp.status()));
+        }
+        let bytes = resp
+            .binary()
+            .await
+            .map_err(|e| ClientError::Http(e.to_string()))?;
+        parse_damaged_files_response(&bytes)
+    }
+
+    pub async fn integrity_status(base: &str, token: &str) -> Result<IntegrityStatus, ClientError> {
+        let resp = Request::get(&format!("{base}/Admin/Integrity/Status"))
+            .header("X-Emby-Token", token)
+            .send()
+            .await
+            .map_err(|e| ClientError::Http(e.to_string()))?;
+        if !resp.ok() {
+            return Err(ClientError::Status(resp.status()));
+        }
+        let bytes = resp
+            .binary()
+            .await
+            .map_err(|e| ClientError::Http(e.to_string()))?;
+        parse_integrity_status_response(&bytes)
+    }
+
+    /// Queues the file to be read again; the server answers 202.
+    pub async fn recheck_damaged_file(
+        base: &str,
+        token: &str,
+        media_id: &str,
+    ) -> Result<(), ClientError> {
+        let resp = Request::post(&format!(
+            "{base}/Admin/Integrity/{}/Recheck",
+            urlencode(media_id)
+        ))
+        .header("X-Emby-Token", token)
+        .send()
+        .await
+        .map_err(|e| ClientError::Http(e.to_string()))?;
+        if !resp.ok() {
+            return Err(ClientError::Status(resp.status()));
+        }
+        Ok(())
+    }
+
     pub async fn list_logs(base: &str, token: &str) -> Result<Vec<LogEntry>, ClientError> {
         let resp = Request::get(&format!("{base}/System/Logs"))
             .header("X-Emby-Token", token)
@@ -2109,6 +2216,54 @@ mod tests {
         assert_eq!(v[0].versions[0].height, Some(1080));
         assert_eq!(v[0].versions[1].path, "/m/Heat.avi");
         assert_eq!(v[0].versions[1].size_bytes, None);
+    }
+
+    #[test]
+    fn parse_damaged_files_reads_nulls_and_missing_fields() {
+        let body = br#"[
+            {"MediaId":"123","Path":"/tv/Show/S01E02.mkv","Verdict":"damaged",
+             "FirstFault":"Invalid data found","FirstFaultMs":2533000,"DemuxErrors":3,
+             "CorruptPackets":4,"ReadErrors":0,"ScannedMs":600000,"DeclaredMs":2700000,
+             "Kind":"episode","Name":"Pilot","SeriesName":"Show","SeasonNumber":1,
+             "EpisodeNumber":2,"CheckedAt":1762214400,"RecheckPending":true},
+            {"MediaId":"9","Path":null,"Verdict":"unreadable","FirstFault":null,
+             "FirstFaultMs":null,"DemuxErrors":0,"CorruptPackets":0,"ReadErrors":7,
+             "ScannedMs":0,"DeclaredMs":null,"Kind":null,"Name":null,"SeriesName":null,
+             "SeasonNumber":null,"EpisodeNumber":null,"CheckedAt":null}
+        ]"#;
+        let v = parse_damaged_files_response(body).unwrap();
+        assert_eq!(v.len(), 2);
+        assert_eq!(v[0].media_id, "123");
+        assert_eq!(v[0].first_fault_ms, Some(2_533_000));
+        assert_eq!(v[0].series_name.as_deref(), Some("Show"));
+        assert_eq!(v[0].episode_number, Some(2));
+        assert!(v[0].recheck_pending);
+        assert_eq!(v[1].path, None);
+        assert_eq!(v[1].verdict, "unreadable");
+        assert_eq!(v[1].read_errors, 7);
+        assert_eq!(v[1].checked_at, None);
+        assert!(!v[1].recheck_pending, "a missing RecheckPending is false");
+        assert!(parse_damaged_files_response(b"[]").unwrap().is_empty());
+        assert!(parse_damaged_files_response(b"{").is_err());
+    }
+
+    #[test]
+    fn parse_integrity_status_reads_the_four_counts() {
+        let v = parse_integrity_status_response(
+            br#"{"Eligible":9700,"Checked":4120,"Damaged":3,"Queued":2}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            v,
+            IntegrityStatus {
+                eligible: 9700,
+                checked: 4120,
+                damaged: 3,
+                queued: 2
+            }
+        );
+        let partial = parse_integrity_status_response(br#"{"Eligible":5}"#).unwrap();
+        assert_eq!((partial.eligible, partial.queued), (5, 0));
     }
 
     #[test]
