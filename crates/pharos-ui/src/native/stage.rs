@@ -505,6 +505,13 @@ fn strip_movable(floating: bool, remote_focus: bool) -> bool {
     floating && !remote_focus
 }
 
+/// Whether the floating window shows its resize grip: not on a TV, where
+/// the grip would be one more focus stop over the picture whose arrows
+/// resize the window rather than move the focus (B1031).
+pub fn grip_shown(floating: bool) -> bool {
+    floating && !REMOTE_FOCUS
+}
+
 /// The compact player's chrome: the title strip (the drag handle of the
 /// floating window), the transport and a thin progress line. Drawn by the
 /// player over its own media element, which stays where it is.
@@ -1193,6 +1200,14 @@ mod tests {
         assert!(!strip_movable(true, true));
         assert!(!strip_movable(false, false));
         assert!(!strip_movable(false, true));
+    }
+
+    /// B1031/V990: a TV's floating window has no resize grip to trap the
+    /// D-pad; a keyboard's and a pointer's keep theirs.
+    #[test]
+    fn only_a_keyboard_or_pointer_gets_the_resize_grip() {
+        assert_eq!(grip_shown(true), !REMOTE_FOCUS);
+        assert!(!grip_shown(false));
     }
 
     #[test]

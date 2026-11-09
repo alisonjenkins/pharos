@@ -2089,7 +2089,7 @@ fn StageView() -> Element {
                     WatchScreen { id, slot }
                 }
             }
-            if floating {
+            if super::stage::grip_shown(floating) {
                 StageGrip {}
             }
         }
