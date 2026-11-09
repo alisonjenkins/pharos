@@ -365,7 +365,7 @@ pub fn extract_token(req: &HttpRequest) -> Option<String> {
 }
 
 /// The token from a Jellyfin auth header, ignoring `api_key`.
-fn extract_header_token(req: &HttpRequest) -> Option<String> {
+pub(crate) fn extract_header_token(req: &HttpRequest) -> Option<String> {
     let h = req.headers();
 
     if let Some(v) = h.get("X-Emby-Token").and_then(|v| v.to_str().ok()) {
