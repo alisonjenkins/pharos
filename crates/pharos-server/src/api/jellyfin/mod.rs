@@ -19,6 +19,7 @@ pub mod playlists;
 pub mod remote_subtitles;
 pub mod search;
 pub mod seek;
+mod series_identity;
 pub mod sessions;
 pub mod socket;
 pub mod stream;
@@ -54,6 +55,7 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
     // not collide with a more-specific bearer-only `/users/{id}` (the
     // actix router matches by registration order on duplicate specificity).
     admin::register(cfg);
+    series_identity::register(cfg);
     items::register(cfg);
     item_ops::register(cfg);
     download::register(cfg);
