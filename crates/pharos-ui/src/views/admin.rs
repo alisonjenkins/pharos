@@ -4,7 +4,9 @@
 //! app (B921). Pure: the parent fetches, and these views render under
 //! `dioxus-ssr`.
 
-use crate::client::{series_item_ref, FlaggedMatch, HandFix, SplitFolder, SplitGroup};
+use crate::client::{
+    series_item_ref, FixDone, FlaggedMatch, HandFix, ShowCandidate, SplitFolder, SplitGroup,
+};
 use crate::client::{
     ActivityEntry, AdminUser, ApiKey, BrandingConfig, DamageRange, DamagedFile, DeepCheck,
     DeviceEntry, DuplicateFilm, FilmVersion, IntegrityReport, IntegrityStatus, LibraryFolder,
@@ -65,6 +67,39 @@ pub enum AdminAction {
     SelectTab(AdminTab),
     /// The status line's Dismiss.
     DismissStatus,
+    /// Search the providers for the show a group or flagged match is.
+    IdentitySearch {
+        series_key: String,
+        name: String,
+        year: Option<u32>,
+    },
+    /// Make a candidate the show for `series_key`.
+    IdentityPick {
+        series_key: String,
+        provider: String,
+        id: String,
+    },
+    /// Keep the flagged guess as the show.
+    IdentityConfirm {
+        series_key: String,
+    },
+    /// Send `paths` of `folder` to an existing group (`target_key`) or a
+    /// new one (`target_name` and `target_year`).
+    IdentityMove {
+        folder: String,
+        paths: Vec<String>,
+        target_key: Option<String>,
+        target_name: Option<String>,
+        target_year: Option<u32>,
+    },
+    /// Undo a folder's split.
+    IdentityKeepTogether {
+        folder: String,
+    },
+    /// Remove a hand fix.
+    IdentityRemove {
+        id: i64,
+    },
     /// Replace one device's audio direct-play deny list (T130).
     SetDeviceAudioDeny {
         device_id: String,
@@ -247,6 +282,12 @@ pub struct AdminViewProps {
     /// identity tab's listing has answered.
     #[props(default)]
     pub series_identity: Option<Result<SeriesIdentity, String>>,
+    /// The pick form's search: whose it is, and what it found.
+    #[props(default)]
+    pub identity_search: IdentitySearchState,
+    /// A group just made by a move that still needs its show picked.
+    #[props(default)]
+    pub identity_prompt: Option<PickPrompt>,
     /// Files whose Re-check was just requested from this page.
     #[props(default)]
     pub integrity_queued: Vec<String>,
@@ -262,6 +303,24 @@ pub struct AdminViewProps {
     /// The "Deep check another file" box and its hits.
     #[props(default)]
     pub deep_search: DeepSearchState,
+}
+
+/// What the pick form shows for the group or match it was opened on.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct IdentitySearchState {
+    /// The series key the search was made for; other forms stay empty.
+    pub series_key: String,
+    pub loading: bool,
+    pub hits: Vec<ShowCandidate>,
+    pub error: Option<String>,
+}
+
+/// The group a move just made in `folder`, by year: its show still has to
+/// be picked before its episodes can be rebuilt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PickPrompt {
+    pub folder: String,
+    pub year: Option<u32>,
 }
 
 /// What the "Deep check another file" box shows.
@@ -378,7 +437,12 @@ pub fn AdminView(props: AdminViewProps) -> Element {
                             }
                         },
                         AdminTab::ShowIdentity => rsx! {
-                            ShowIdentitySection { identity: props.series_identity.clone() }
+                            ShowIdentitySection {
+                                identity: props.series_identity.clone(),
+                                search: props.identity_search.clone(),
+                                prompt: props.identity_prompt.clone(),
+                                on_action,
+                            }
                         },
                         AdminTab::Plugins => rsx! { PluginsPane { plugins: props.plugins.clone() } },
                         AdminTab::Logs => rsx! { LogsPane { logs: props.logs.clone() } },
@@ -1248,7 +1312,12 @@ fn DuplicatesSection(films: Option<Result<Vec<DuplicateFilm>, String>>) -> Eleme
 }
 
 #[component]
-fn ShowIdentitySection(identity: Option<Result<SeriesIdentity, String>>) -> Element {
+fn ShowIdentitySection(
+    identity: Option<Result<SeriesIdentity, String>>,
+    search: IdentitySearchState,
+    prompt: Option<PickPrompt>,
+    on_action: EventHandler<AdminAction>,
+) -> Element {
     rsx! {
         section { class: "pharos-manage-stack pharos-admin-section-identity",
             match identity {
@@ -1262,7 +1331,14 @@ fn ShowIdentitySection(identity: Option<Result<SeriesIdentity, String>>) -> Elem
                             "One folder holds files for more than one show. Each group below becomes its own show."
                         }
                         for f in identity.splits.iter() {
-                            SplitCard { key: "{f.folder}", folder: f.clone(), repair_mode: identity.repair_mode.clone() }
+                            SplitCard {
+                                key: "{f.folder}",
+                                folder: f.clone(),
+                                repair_mode: identity.repair_mode.clone(),
+                                search: search.clone(),
+                                prompt: prompt.clone().filter(|p| p.folder == f.folder),
+                                on_action,
+                            }
                         }
                     }
                     if !identity.flagged.is_empty() {
@@ -1271,7 +1347,7 @@ fn ShowIdentitySection(identity: Option<Result<SeriesIdentity, String>>) -> Elem
                             "The matcher chose a show but another was nearly as good."
                         }
                         for m in identity.flagged.iter() {
-                            FlaggedCard { key: "{m.series_key}", m: m.clone() }
+                            FlaggedCard { key: "{m.series_key}", m: m.clone(), search: search.clone(), on_action }
                         }
                     }
                     if !identity.overrides.is_empty() {
@@ -1280,7 +1356,7 @@ fn ShowIdentitySection(identity: Option<Result<SeriesIdentity, String>>) -> Elem
                             "Fixes made by hand, which the scanner keeps to."
                         }
                         for o in identity.overrides.iter() {
-                            HandFixRow { key: "{o.id}", fix: o.clone() }
+                            HandFixRow { key: "{o.id}", fix: o.clone(), on_action }
                         }
                     }
                 },
@@ -1290,19 +1366,106 @@ fn ShowIdentitySection(identity: Option<Result<SeriesIdentity, String>>) -> Elem
 }
 
 #[component]
-fn SplitCard(folder: SplitFolder, repair_mode: String) -> Element {
+fn SplitCard(
+    folder: SplitFolder,
+    repair_mode: String,
+    search: IdentitySearchState,
+    prompt: Option<PickPrompt>,
+    on_action: EventHandler<AdminAction>,
+) -> Element {
     let status = split_status_label(&folder, &repair_mode);
+    let mut ticked = use_signal(Vec::<String>::new);
+    let mut picking = use_signal(|| None::<String>);
+    // "" is the new group; anything else is a group's series key.
+    let mut target = use_signal(String::new);
+    let mut new_name = use_signal(|| folder_name(&folder.folder).to_owned());
+    let mut new_year = use_signal(String::new);
+    let ticked_now: Vec<String> = ticked
+        .read()
+        .iter()
+        .filter(|p| folder.groups.iter().any(|g| g.paths.contains(p)))
+        .cloned()
+        .collect();
+    let target_now = target.read().clone();
+    let year_now = new_year.read().trim().to_owned();
+    let new_year_value = year_now.parse::<u32>().ok();
+    let new_group_ok = !new_name.read().trim().is_empty() && new_year_value.is_some();
+    let can_move = !ticked_now.is_empty()
+        && if target_now.is_empty() {
+            new_group_ok
+        } else {
+            true
+        };
+    let prompted_key = prompt.as_ref().and_then(|p| {
+        folder
+            .groups
+            .iter()
+            .find(|g| g.year == p.year)
+            .map(|g| g.series_key.clone())
+    });
+    let move_folder = folder.folder.clone();
+    let keep_folder = folder.folder.clone();
+    let move_paths = ticked_now.clone();
     rsx! {
         article {
             class: "pharos-admin-identity-card",
             "data-status": "{folder.status}",
             h4 { title: "{folder.folder}", "{folder_name(&folder.folder)}" }
             p { class: "pharos-admin-identity-status", "{status}" }
-            ul { class: "pharos-admin-identity-groups",
-                for g in folder.groups.iter() {
-                    li { key: "{g.series_key}",
+            for g in folder.groups.iter() {
+                div { key: "{g.series_key}", class: "pharos-admin-identity-group",
+                    p { class: "pharos-admin-identity-group-head",
                         "{group_label(g)}"
                         span { class: "pharos-admin-identity-count", " · {files_label(g.paths.len())}" }
+                    }
+                    if prompted_key.as_deref() == Some(g.series_key.as_str()) {
+                        p { class: "pharos-admin-identity-prompt", role: "status", "{PICK_PROMPT}" }
+                    }
+                    ul { class: "pharos-admin-identity-files",
+                        for path in g.paths.iter() {
+                            li { key: "{path}",
+                                label {
+                                    input {
+                                        r#type: "checkbox",
+                                        checked: ticked.read().contains(path),
+                                        onchange: {
+                                            let path = path.clone();
+                                            move |ev: FormEvent| {
+                                                let mut list = ticked.write();
+                                                list.retain(|p| *p != path);
+                                                if ev.checked() {
+                                                    list.push(path.clone());
+                                                }
+                                            }
+                                        },
+                                    }
+                                    span { class: "pharos-admin-integrity-path", title: "{path}", " {folder_name(path)}" }
+                                }
+                            }
+                        }
+                    }
+                    {
+                        let key = g.series_key.clone();
+                        let open = picking.read().as_deref() == Some(g.series_key.as_str())
+                            || prompted_key.as_deref() == Some(g.series_key.as_str());
+                        rsx! {
+                            if open {
+                                PickForm {
+                                    series_key: key.clone(),
+                                    default_name: folder_name(&folder.folder).to_owned(),
+                                    default_year: g.year,
+                                    search: search.clone(),
+                                    on_action,
+                                }
+                            } else {
+                                button {
+                                    r#type: "button",
+                                    class: "pharos-admin-identity-pick-open",
+                                    onclick: move |_| picking.set(Some(key.clone())),
+                                    "Pick the show…"
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -1319,15 +1482,176 @@ fn SplitCard(folder: SplitFolder, repair_mode: String) -> Element {
                     }
                 }
             }
+            if !folder.groups.is_empty() {
+            form {
+                class: "pharos-admin-identity-move pharos-manage-inline",
+                onsubmit: move |ev: FormEvent| {
+                    ev.prevent_default();
+                    if !can_move {
+                        return;
+                    }
+                    let to_new = target.read().is_empty();
+                    on_action.call(AdminAction::IdentityMove {
+                        folder: move_folder.clone(),
+                        paths: move_paths.clone(),
+                        target_key: (!to_new).then(|| target.read().clone()),
+                        target_name: to_new.then(|| new_name.read().trim().to_owned()),
+                        target_year: to_new.then_some(new_year_value).flatten(),
+                    });
+                    ticked.set(Vec::new());
+                },
+                label { class: "pharos-manage-field",
+                    span { "Send ticked files to" }
+                    select {
+                        aria_label: "Send ticked files to",
+                        onchange: move |ev| target.set(ev.value()),
+                        for g in folder.groups.iter() {
+                            option { key: "{g.series_key}", value: "{g.series_key}", selected: target_now == g.series_key, "{group_label(g)}" }
+                        }
+                        option { value: "", selected: target_now.is_empty(), "A new group…" }
+                    }
+                }
+                if target_now.is_empty() {
+                    label { class: "pharos-manage-field",
+                        span { "Show name" }
+                        input {
+                            r#type: "text",
+                            autocomplete: "off",
+                            value: "{new_name.read()}",
+                            oninput: move |ev| new_name.set(ev.value()),
+                        }
+                    }
+                    label { class: "pharos-manage-field",
+                        span { "Year" }
+                        input {
+                            r#type: "text",
+                            inputmode: "numeric",
+                            autocomplete: "off",
+                            value: "{new_year.read()}",
+                            oninput: move |ev| new_year.set(ev.value()),
+                        }
+                    }
+                }
+                button { r#type: "submit", disabled: !can_move,
+                    "Move {files_label(ticked_now.len())}"
+                }
+            }
+            }
+            if folder.groups.len() > 1 {
+                div { class: "pharos-manage-card-actions",
+                    button {
+                        r#type: "button",
+                        class: "pharos-admin-identity-keep",
+                        onclick: move |_| on_action.call(AdminAction::IdentityKeepTogether {
+                            folder: keep_folder.clone(),
+                        }),
+                        "Keep together"
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Search by name and optional year, then pick a candidate.
+#[component]
+fn PickForm(
+    series_key: String,
+    default_name: String,
+    default_year: Option<u32>,
+    search: IdentitySearchState,
+    on_action: EventHandler<AdminAction>,
+) -> Element {
+    let mut name = use_signal(|| default_name.clone());
+    let mut year = use_signal(|| default_year.map(|y| y.to_string()).unwrap_or_default());
+    let mine = search.series_key == series_key;
+    let key_for_search = series_key.clone();
+    let key_for_pick = series_key.clone();
+    rsx! {
+        div { class: "pharos-admin-identity-pick",
+            form {
+                class: "pharos-manage-inline",
+                onsubmit: move |ev: FormEvent| {
+                    ev.prevent_default();
+                    let n = name.read().trim().to_owned();
+                    if n.is_empty() {
+                        return;
+                    }
+                    on_action.call(AdminAction::IdentitySearch {
+                        series_key: key_for_search.clone(),
+                        name: n,
+                        year: year.read().trim().parse::<u32>().ok(),
+                    });
+                },
+                label { class: "pharos-manage-field",
+                    span { "Show name" }
+                    input {
+                        r#type: "text",
+                        autocomplete: "off",
+                        value: "{name.read()}",
+                        oninput: move |ev| name.set(ev.value()),
+                    }
+                }
+                label { class: "pharos-manage-field",
+                    span { "Year (optional)" }
+                    input {
+                        r#type: "text",
+                        inputmode: "numeric",
+                        autocomplete: "off",
+                        value: "{year.read()}",
+                        oninput: move |ev| year.set(ev.value()),
+                    }
+                }
+                button { r#type: "submit", "Search" }
+            }
+            if mine && search.loading {
+                p { class: "pharos-loading", "Searching…" }
+            }
+            if mine {
+                if let Some(e) = search.error.as_deref() {
+                    p { class: "pharos-error", "Could not search: {e}" }
+                }
+            }
+            if mine && !search.loading && search.error.is_none() && search.hits.is_empty() {
+                p { class: "pharos-admin-identity-hint", "Search for the show by name to see candidates." }
+            }
+            if mine {
+                ul { class: "pharos-admin-identity-hits",
+                    for h in search.hits.iter() {
+                        li { key: "{h.provider}-{h.id}",
+                            span { "{candidate_label(h)}" }
+                            button {
+                                r#type: "button",
+                                onclick: {
+                                    let (provider, id) = (h.provider.clone(), h.id.clone());
+                                    let key = key_for_pick.clone();
+                                    move |_| on_action.call(AdminAction::IdentityPick {
+                                        series_key: key.clone(),
+                                        provider: provider.clone(),
+                                        id: id.clone(),
+                                    })
+                                },
+                                "This is the show"
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 }
 
 #[component]
-fn FlaggedCard(m: FlaggedMatch) -> Element {
+fn FlaggedCard(
+    m: FlaggedMatch,
+    search: IdentitySearchState,
+    on_action: EventHandler<AdminAction>,
+) -> Element {
     let href =
         series_item_ref(&m.series_id).map(|id| crate::native::route::Route::Browse(id).path());
     let reason = flagged_reason(&m);
+    let mut picking = use_signal(|| false);
+    let confirm_key = m.series_key.clone();
     rsx! {
         article { class: "pharos-admin-identity-card",
             h4 {
@@ -1338,18 +1662,89 @@ fn FlaggedCard(m: FlaggedMatch) -> Element {
             }
             p { class: "pharos-admin-identity-status", "{reason}" }
             p { class: "pharos-admin-identity-facts", "{flagged_facts(&m)}" }
+            div { class: "pharos-manage-card-actions",
+                button {
+                    r#type: "button",
+                    class: "pharos-admin-identity-confirm",
+                    onclick: move |_| on_action.call(AdminAction::IdentityConfirm {
+                        series_key: confirm_key.clone(),
+                    }),
+                    "Confirm this match"
+                }
+                if !*picking.read() {
+                    button {
+                        r#type: "button",
+                        class: "pharos-admin-identity-pick-open",
+                        onclick: move |_| picking.set(true),
+                        "Pick another show…"
+                    }
+                }
+            }
+            if *picking.read() {
+                PickForm {
+                    series_key: m.series_key.clone(),
+                    default_name: m.name.clone(),
+                    default_year: None,
+                    search: search.clone(),
+                    on_action,
+                }
+            }
         }
     }
 }
 
 #[component]
-fn HandFixRow(fix: HandFix) -> Element {
+fn HandFixRow(fix: HandFix, on_action: EventHandler<AdminAction>) -> Element {
+    let id = fix.id;
     rsx! {
         article { class: "pharos-admin-identity-card",
             h4 { title: "{fix.folder}", "{folder_name(&fix.folder)}" }
             p { class: "pharos-admin-identity-status", "{hand_fix_words(&fix)}" }
             p { class: "pharos-admin-identity-facts", "{hand_fix_origin(&fix)}" }
+            div { class: "pharos-manage-card-actions",
+                button {
+                    r#type: "button",
+                    class: "pharos-admin-identity-remove",
+                    onclick: move |_| on_action.call(AdminAction::IdentityRemove { id }),
+                    "Remove"
+                }
+            }
         }
+    }
+}
+
+/// Shown on a group a move just made until its show is picked.
+pub const PICK_PROMPT: &str = "Pick the show for this group so its episodes can be rebuilt";
+
+fn candidate_label(c: &ShowCandidate) -> String {
+    match c.year {
+        Some(y) => format!("{} ({y}) · {} {}", c.name, c.provider, c.id),
+        None => format!("{} · {} {}", c.name, c.provider, c.id),
+    }
+}
+
+/// What a fix did, for the status line: "Moved 3 files; rebuilding 12
+/// episodes in the background."
+pub fn fix_summary(done: &FixDone) -> String {
+    let moved =
+        (!done.moved.is_empty()).then(|| format!("Moved {}", files_label(done.moved.len())));
+    let rebuilding = (done.rebuilding > 0).then(|| {
+        let noun = if done.rebuilding == 1 {
+            "episode"
+        } else {
+            "episodes"
+        };
+        format!("rebuilding {} {noun} in the background", done.rebuilding)
+    });
+    match (moved, rebuilding) {
+        (Some(m), Some(r)) => format!("{m}; {r}."),
+        (Some(m), None) => format!("{m}."),
+        (None, Some(r)) => {
+            let mut cap = r.chars();
+            let first = cap.next().map(|c| c.to_uppercase().collect::<String>());
+            format!("{}{}.", first.unwrap_or_default(), cap.as_str())
+        }
+        (None, None) => "Done; nothing needed rebuilding.".to_owned(),
     }
 }
 
@@ -3121,6 +3516,28 @@ mod tests {
         assert_eq!(civil_from_days(19_782), (2024, 2, 29));
     }
 
+    /// The Show identity page as HTML.
+    fn render_identity(
+        identity: Option<Result<SeriesIdentity, String>>,
+        search: IdentitySearchState,
+        prompt: Option<PickPrompt>,
+    ) -> String {
+        let mut dom = VirtualDom::new_with_props(
+            |(identity, search, prompt): (
+                Option<Result<SeriesIdentity, String>>,
+                IdentitySearchState,
+                Option<PickPrompt>,
+            )| {
+                rsx! {
+                    ShowIdentitySection { identity, search, prompt, on_action: |_| {} }
+                }
+            },
+            (identity, search, prompt),
+        );
+        dom.rebuild_in_place();
+        dioxus_ssr::render(&dom)
+    }
+
     fn identity_page() -> SeriesIdentity {
         let key = |year: u32| format!("/tv/Cosmos{KEY_YEAR_SEP}{year}");
         SeriesIdentity {
@@ -3204,9 +3621,11 @@ mod tests {
 
     #[test]
     fn the_page_lists_splits_flagged_matches_and_hand_fixes_in_words() {
-        let html = dioxus_ssr::render_element(rsx! {
-            ShowIdentitySection { identity: Some(Ok(identity_page())) }
-        });
+        let html = render_identity(
+            Some(Ok(identity_page())),
+            IdentitySearchState::default(),
+            None,
+        );
         assert!(
             html.contains("Cosmos (1980)") && html.contains("Cosmos (2014)"),
             "{html}"
@@ -3222,18 +3641,141 @@ mod tests {
         assert!(html.contains("scored 0.80"), "{html}");
         assert!(html.contains("Kept together as one show."), "{html}");
         assert!(html.contains("Set by ali on 2023-11-14"), "{html}");
-        assert!(!html.contains('\u{1f}'), "{html}");
+        // The key rides in an attribute value; no text node shows it.
+        let shown = html
+            .split('<')
+            .filter_map(|t| t.split_once('>'))
+            .map(|(_, text)| text);
+        assert!(shown.into_iter().all(|t| !t.contains('\u{1f}')), "{html}");
+    }
+
+    #[test]
+    fn a_fix_says_what_it_moved_and_what_it_rebuilds() {
+        let done = |moved: usize, rebuilding| FixDone {
+            moved: (0..moved).map(|i| format!("/p{i}")).collect(),
+            rebuilding,
+        };
+        assert_eq!(
+            fix_summary(&done(3, 12)),
+            "Moved 3 files; rebuilding 12 episodes in the background."
+        );
+        assert_eq!(
+            fix_summary(&done(1, 1)),
+            "Moved 1 file; rebuilding 1 episode in the background."
+        );
+        assert_eq!(
+            fix_summary(&done(0, 4)),
+            "Rebuilding 4 episodes in the background."
+        );
+        assert_eq!(fix_summary(&done(2, 0)), "Moved 2 files.");
+        assert_eq!(fix_summary(&done(0, 0)), "Done; nothing needed rebuilding.");
+    }
+
+    #[test]
+    fn a_move_to_a_new_group_prompts_for_its_show_until_one_is_picked() {
+        let render = |prompt: Option<PickPrompt>| {
+            render_identity(
+                Some(Ok(identity_page())),
+                IdentitySearchState::default(),
+                prompt,
+            )
+        };
+        let prompted = render(Some(PickPrompt {
+            folder: "/tv/Cosmos".into(),
+            year: Some(2014),
+        }));
+        assert!(prompted.contains(PICK_PROMPT), "{prompted}");
+        // The group's pick form is already open, with its name filled in.
+        assert!(prompted.contains("Year (optional)"), "{prompted}");
+        let quiet = render(None);
+        assert!(!quiet.contains(PICK_PROMPT), "{quiet}");
+        assert!(!quiet.contains("Year (optional)"), "{quiet}");
+        // A prompt for another folder leaves this one alone.
+        let other = render(Some(PickPrompt {
+            folder: "/tv/Else".into(),
+            year: Some(2014),
+        }));
+        assert!(!other.contains(PICK_PROMPT), "{other}");
+    }
+
+    #[test]
+    fn each_entry_offers_its_actions() {
+        let html = render_identity(
+            Some(Ok(identity_page())),
+            IdentitySearchState::default(),
+            None,
+        );
+        assert!(html.contains("Keep together"), "{html}");
+        assert!(html.contains("Confirm this match"), "{html}");
+        assert!(html.contains("Pick another show"), "{html}");
+        assert!(html.contains("Pick the show"), "{html}");
+        assert!(html.contains("Send ticked files to"), "{html}");
+        assert!(html.contains("A new group"), "{html}");
+        assert!(html.contains("pharos-admin-identity-remove"), "{html}");
+        // One group alone has nothing to keep together.
+        let single = SeriesIdentity {
+            splits: vec![SplitFolder {
+                folder: "/tv/One".into(),
+                status: "applied".into(),
+                groups: vec![SplitGroup::default()],
+                ..SplitFolder::default()
+            }],
+            ..SeriesIdentity::default()
+        };
+        let html = render_identity(Some(Ok(single)), IdentitySearchState::default(), None);
+        assert!(!html.contains("Keep together"), "{html}");
+    }
+
+    #[test]
+    fn the_pick_form_lists_only_its_own_search() {
+        let hit = ShowCandidate {
+            provider: "tvdb".into(),
+            id: "81".into(),
+            name: "Cosmos".into(),
+            year: Some(1980),
+        };
+        let render = |series_key: &str| {
+            let search = IdentitySearchState {
+                series_key: series_key.to_string(),
+                hits: vec![hit.clone()],
+                ..IdentitySearchState::default()
+            };
+            let mut dom = VirtualDom::new_with_props(
+                |search: IdentitySearchState| {
+                    rsx! {
+                        PickForm {
+                            series_key: "/tv/Cosmos\u{1f}1980".to_string(),
+                            default_name: "Cosmos".to_string(),
+                            default_year: Some(1980),
+                            search,
+                            on_action: |_| {},
+                        }
+                    }
+                },
+                search,
+            );
+            dom.rebuild_in_place();
+            dioxus_ssr::render(&dom)
+        };
+        let mine = render("/tv/Cosmos\u{1f}1980");
+        assert!(mine.contains("Cosmos (1980) · tvdb 81"), "{mine}");
+        assert!(mine.contains("This is the show"), "{mine}");
+        assert!(!render("/tv/Other").contains("This is the show"));
     }
 
     #[test]
     fn an_empty_identity_says_nothing_needs_a_look() {
-        let html = dioxus_ssr::render_element(rsx! {
-            ShowIdentitySection { identity: Some(Ok(SeriesIdentity::default())) }
-        });
+        let html = render_identity(
+            Some(Ok(SeriesIdentity::default())),
+            IdentitySearchState::default(),
+            None,
+        );
         assert!(html.contains("Nothing needs a look."), "{html}");
-        let failed = dioxus_ssr::render_element(rsx! {
-            ShowIdentitySection { identity: Some(Err("status 500".to_string())) }
-        });
+        let failed = render_identity(
+            Some(Err("status 500".to_string())),
+            IdentitySearchState::default(),
+            None,
+        );
         assert!(failed.contains("status 500"), "{failed}");
     }
 }
