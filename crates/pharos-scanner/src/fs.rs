@@ -1073,8 +1073,19 @@ impl<P: Prober> FsScanner<P> {
         // incomplete walk — sweeping would prune every not-yet-seen file. Skip
         // it; a later full scan reconciles genuine deletions.
         let cancelled = is_cancelled();
-        if !cancelled {
+        // A fold is final only on the pass whose sweep removes the copy's row;
+        // folding on a pass that keeps the row would repeat the merge next
+        // pass and re-mark watched what a viewer since marked unwatched.
+        if !cancelled && walk_errors == 0 {
             settle_copies(store, scan_id, &folded).await?;
+        } else if !folded.is_empty() {
+            tracing::info!(
+                scan_id,
+                cancelled,
+                walk_errors,
+                copies = folded.len(),
+                "kept copies' rows unfolded: this pass does not sweep",
+            );
         }
         let root_prefix = root.to_string_lossy();
         let swept = if cancelled {
