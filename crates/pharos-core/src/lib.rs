@@ -1608,6 +1608,118 @@ pub trait SeriesMetadataStore: Send + Sync {
     fn readmit_searched_tv(&self) -> impl std::future::Future<Output = DomainResult<u64>> + Send;
 }
 
+/// Spec 033 — who wrote a [`SeriesOverride`]. A `Scanner` row records a
+/// decision the scanner made once and must not remake (which group of a split
+/// folder keeps the plain folder key); an `Admin` row is a hand fix and always
+/// wins over a `Scanner` row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OverrideSource {
+    Scanner,
+    Admin,
+}
+
+impl OverrideSource {
+    /// The `series_overrides.source` value.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Scanner => "scanner",
+            Self::Admin => "admin",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "scanner" => Some(Self::Scanner),
+            "admin" => Some(Self::Admin),
+            _ => None,
+        }
+    }
+}
+
+/// Spec 033 (V893, V896) — a grouping decision a rescan must not undo: the
+/// files of `series_folder` (one file when `path` is set) belong to
+/// `target_key`. A folder-wide `Scanner` row whose `target_key` is the folder
+/// itself names the group that keeps the plain key, by `target_year`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeriesOverride {
+    pub id: i64,
+    pub series_folder: String,
+    pub path: Option<String>,
+    pub target_key: String,
+    pub target_name: Option<String>,
+    pub target_year: Option<u32>,
+    pub source: OverrideSource,
+    pub created_by: Option<String>,
+    pub created_at: i64,
+}
+
+/// Spec 033 — an episode row's identity as stored: what the scanner diffs its
+/// split plan against.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeriesIdentityRow {
+    pub path: String,
+    pub series_folder: Option<String>,
+    /// `None` reads as the folder.
+    pub series_key: Option<String>,
+    pub series_year: Option<u32>,
+}
+
+/// Spec 033 — one row's new identity. `series_key: None` returns the row to
+/// its folder's key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeriesKeyUpdate {
+    pub path: String,
+    pub series_key: Option<String>,
+    pub series_year: Option<u32>,
+}
+
+/// Spec 033 — the store side of deciding which show a file belongs to. Every
+/// method has a do-nothing default so in-memory test stores need not care;
+/// the sqlx stores implement them all.
+pub trait SeriesIdentityStore: Send + Sync {
+    /// Every override for these folders.
+    fn series_overrides(
+        &self,
+        _folders: &[String],
+    ) -> impl std::future::Future<Output = DomainResult<Vec<SeriesOverride>>> + Send {
+        async { Ok(Vec::new()) }
+    }
+
+    /// Insert `o`, unless a row for the same folder (folder-wide) or path and
+    /// source exists, which is kept. Returns whether a row was inserted.
+    fn insert_series_override(
+        &self,
+        _o: SeriesOverride,
+    ) -> impl std::future::Future<Output = DomainResult<bool>> + Send {
+        async { Ok(false) }
+    }
+
+    /// The stored identity of every episode under `root_prefix`.
+    fn series_identity_rows(
+        &self,
+        _root_prefix: &str,
+    ) -> impl std::future::Future<Output = DomainResult<Vec<SeriesIdentityRow>>> + Send {
+        async { Ok(Vec::new()) }
+    }
+
+    /// Write each row's key and year. Returns how many rows changed.
+    fn set_series_keys(
+        &self,
+        _updates: &[SeriesKeyUpdate],
+    ) -> impl std::future::Future<Output = DomainResult<u64>> + Send {
+        async { Ok(0) }
+    }
+
+    /// The premiere year of each stored show match, by series key.
+    fn series_premiere_years(
+        &self,
+        _keys: &[String],
+    ) -> impl std::future::Future<Output = DomainResult<std::collections::HashMap<String, u32>>> + Send
+    {
+        async { Ok(std::collections::HashMap::new()) }
+    }
+}
+
 /// A provider's title and description for one show or episode in one
 /// language (ADR-0062). `title` and `overview` both `None` records a language
 /// the provider was asked for and does not have, so it is not asked again on
