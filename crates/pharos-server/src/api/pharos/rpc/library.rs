@@ -1334,6 +1334,15 @@ fn write_person(
     if let Some(url) = portrait_url(&page.person.wire_id, page.person.thumb_url.as_deref()) {
         out.set_image_url(url.as_str());
     }
+    if let Some(d) = &page.details {
+        let text = |v: &Option<String>| v.clone().unwrap_or_default();
+        out.set_biography(text(&d.biography).as_str());
+        out.set_birth_date(text(&d.birth_date).as_str());
+        out.set_death_date(text(&d.death_date).as_str());
+        out.set_birth_place(text(&d.birth_place).as_str());
+        out.set_imdb_id(text(&d.imdb_id).as_str());
+        out.set_wikidata_id(text(&d.wikidata_id).as_str());
+    }
     let mut films = out.reborrow().init_films(len(&page.films));
     for (i, film) in (0..).zip(&page.films) {
         write_appearance(films.reborrow().get(i), film, server_id, key);
