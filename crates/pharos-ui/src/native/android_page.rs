@@ -798,12 +798,15 @@ const takes = new Set(["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", " "]);
 // button, on its first press or while it is held.
 // A left or right in the player starts or moves a scrub before its class
 // has rendered, so a press inside the settle window (900 ms) counts too.
+// The keys the player binds to a 10 s seek (keymap.rs), each of which
+// starts a scrub.
+const seekKeys = new Set(["ArrowLeft", "ArrowRight", "h", "l"]);
 let okCommits = false;
 let lastSeekKey = -1e9;
 addEventListener("keyup", (e) => { if (e.key === "Enter") okCommits = false; });
 addEventListener("keydown", (e) => {
   const text = inText(e.target);
-  if (!text && !e.ctrlKey && !e.metaKey && !document.querySelector('.pharos-invite') && (e.key === "ArrowLeft" || e.key === "ArrowRight") && e.target.closest && e.target.closest('#pharos-player')) lastSeekKey = performance.now();
+  if (!text && !e.ctrlKey && !e.metaKey && !document.querySelector('.pharos-invite') && seekKeys.has(e.key) && e.target.closest && e.target.closest('#pharos-player')) lastSeekKey = performance.now();
   if (e.key === "Enter" && !e.repeat) okCommits = !!document.querySelector(".pharos-seek.is-scrubbing") || performance.now() - lastSeekKey < 900;
   if (e.key === "Enter" && okCommits) e.preventDefault();
   // A held arrow repeats (the player's scrub speeds up on it): the WebView
