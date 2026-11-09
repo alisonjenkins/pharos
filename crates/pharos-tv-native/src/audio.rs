@@ -16,7 +16,7 @@ use ndk::audio::{
     Clockid,
 };
 use ndk_sys as sys;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 /// Monotonic time minus media time, in ns, once AAudio has reported a
@@ -49,6 +49,16 @@ pub fn wait_ready(wait: Duration) -> bool {
     false
 }
 
+/// Bumped to end the running audio player: each player runs while the
+/// generation it started with is current.
+static GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// Ends the running audio player, if any.
+pub fn stop() {
+    GENERATION.fetch_add(1, Ordering::AcqRel);
+    READY.store(false, Ordering::Release);
+}
+
 pub fn enabled() -> bool {
     android_properties::getprop("debug.pharos.audio")
         .value()
@@ -63,15 +73,19 @@ fn gain() -> f32 {
 }
 
 pub fn play(track: AudioTrack) {
+    let generation = GENERATION.load(Ordering::Acquire);
     EXPECTED.store(true, Ordering::Release);
     READY.store(false, Ordering::Release);
     let spawned = std::thread::Builder::new()
         .name("pharos-audio".into())
         .spawn(move || {
-            if let Err(e) = run(track) {
+            if let Err(e) = run(track, generation) {
                 log::warn!("audio: {e}");
             }
-            EXPECTED.store(false, Ordering::Release);
+            // A newer player owns the flag once the generation has moved.
+            if GENERATION.load(Ordering::Acquire) == generation {
+                EXPECTED.store(false, Ordering::Release);
+            }
         });
     if let Err(e) = spawned {
         log::warn!("audio: thread: {e}");
@@ -108,7 +122,7 @@ impl Frames {
     }
 }
 
-fn run(track: AudioTrack) -> Result<(), String> {
+fn run(track: AudioTrack, generation: u64) -> Result<(), String> {
     let config = track.config;
     let mut frames = Frames {
         current: track.first.into_iter(),
@@ -169,6 +183,10 @@ fn run(track: AudioTrack) -> Result<(), String> {
         let mut input_done = false;
         let mut report = Instant::now();
         loop {
+            if GENERATION.load(Ordering::Acquire) != generation {
+                log::info!("bench audio stopped written={}", out.written);
+                return Ok(());
+            }
             if !input_done {
                 input_done = !feed(codec, &mut frames);
             }
