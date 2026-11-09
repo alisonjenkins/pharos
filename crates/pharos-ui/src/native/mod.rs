@@ -62,6 +62,7 @@ pub mod queue;
 pub mod rails;
 pub mod resume;
 pub mod route;
+pub mod scrub;
 pub mod seen;
 pub mod settings;
 pub mod show_tracks;
