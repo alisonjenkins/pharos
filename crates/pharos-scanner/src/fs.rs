@@ -3041,7 +3041,7 @@ impl FoldGuard {
         self.keys
             .get(path)
             .cloned()
-            .or_else(|| parse_series_info(path)?.series_folder)
+            .or_else(|| episode_series_info(path)?.series_folder)
     }
 
     /// Why `copy` must not fold into `primary`, or `None` when it may.
@@ -9727,6 +9727,23 @@ mod tests {
             titles[1]
         )));
         paths
+    }
+
+    /// V894, V975: a flagged show's guard covers the copies a show folder
+    /// makes episodes, keyed by that show folder, not the sub-folder they sit in.
+    #[test]
+    fn a_flagged_shows_guard_covers_its_show_folder_copies() {
+        let td = TempDir::new().unwrap();
+        let show = td.path().join("Sword Art Online II");
+        std::fs::create_dir_all(show.join("SAO II")).unwrap();
+        std::fs::write(show.join("tvshow.nfo"), b"<tvshow/>").unwrap();
+        let paths = vec![
+            show.join("SAO II/SAO II - 14 L@mBerT.mp4"),
+            show.join("SAO II/SAO II - 14 [1080p].mkv"),
+        ];
+        let key = show.to_string_lossy().into_owned();
+        let guard = guard_for(&paths, vec![], &[key.as_str()]);
+        assert_eq!(guard.refusal(&paths[0], &paths[1]), Some("numbers_only"));
     }
 
     /// V894: in a split folder, a matching season and episode number alone
