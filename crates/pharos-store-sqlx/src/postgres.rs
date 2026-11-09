@@ -24,11 +24,11 @@ use pharos_core::{
     MediaMetadata, MediaProbe, MediaQuery, MediaStore, OverrideSource, PersistedSyncGroup,
     PersistedTranscodeSession, Person, PersonCount, PersonDetails, PersonKind, PersonRef,
     PersonStore, PlaybackProgress, Playlist, PlaylistEntry, PlaylistStore, PreferenceStore,
-    ResolvedToken, ScanState, SecretString, SeriesEpisodeRow, SeriesIdentityRow,
-    SeriesIdentityStore, SeriesInfo, SeriesKeyUpdate, SeriesMatchCandidate, SeriesMetadata,
-    SeriesMetadataStore, SeriesOverride, Studio, StudioCount, StudioStore, SyncGroupStore, Tag,
-    TagCount, TagStore, TokenId, TokenScope, TokenSelector, TokenStore, TranscodeSessionStore,
-    UserDataStore, UserId, UserItemData, UserPolicy, UserRecord, UserStore,
+    ReadPosition, ReadPositionStore, ResolvedToken, ScanState, SecretString, SeriesEpisodeRow,
+    SeriesIdentityRow, SeriesIdentityStore, SeriesInfo, SeriesKeyUpdate, SeriesMatchCandidate,
+    SeriesMetadata, SeriesMetadataStore, SeriesOverride, Studio, StudioCount, StudioStore,
+    SyncGroupStore, Tag, TagCount, TagStore, TokenId, TokenScope, TokenSelector, TokenStore,
+    TranscodeSessionStore, UserDataStore, UserId, UserItemData, UserPolicy, UserRecord, UserStore,
 };
 
 const MEDIA_COLUMNS: &str = "id, path, title, kind, size_bytes, duration_ms, container, \
@@ -3975,6 +3975,115 @@ impl UserDataStore for PostgresStore {
              ORDER BY last_played_at DESC",
         )
         .bind(id_bytes)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| DomainError::Backend(e.to_string()))?;
+        rows.into_iter()
+            .map(|(id,)| {
+                u64::try_from(id).map_err(|e| DomainError::Backend(format!("id negative: {e}")))
+            })
+            .collect()
+    }
+}
+
+impl ReadPositionStore for PostgresStore {
+    #[tracing::instrument(skip(self), fields(user.id = %user.0, media.id = %item))]
+    async fn get_read_position(
+        &self,
+        user: UserId,
+        item: MediaId,
+    ) -> DomainResult<Option<ReadPosition>> {
+        let row: Option<(String, f32, i64)> = sqlx::query_as(
+            "SELECT locator, fraction, updated_at FROM read_positions
+             WHERE user_id = $1 AND item_id = $2",
+        )
+        .bind(user.0.as_bytes().to_vec())
+        .bind(media_id_i64(item)?)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| DomainError::Backend(e.to_string()))?;
+        Ok(row.map(|(locator, fraction, updated_at)| ReadPosition {
+            locator,
+            fraction,
+            updated_at,
+        }))
+    }
+
+    #[tracing::instrument(skip(self, items), fields(user.id = %user.0, count = items.len()))]
+    async fn read_positions_bulk(
+        &self,
+        user: UserId,
+        items: &[MediaId],
+    ) -> DomainResult<Vec<Option<ReadPosition>>> {
+        if items.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ids_i64: Vec<i64> = items
+            .iter()
+            .map(|id| media_id_i64(*id))
+            .collect::<DomainResult<_>>()?;
+        let rows: Vec<(i64, String, f32, i64)> = sqlx::query_as(
+            "SELECT item_id, locator, fraction, updated_at FROM read_positions
+             WHERE user_id = $1 AND item_id = ANY($2)",
+        )
+        .bind(user.0.as_bytes().to_vec())
+        .bind(&ids_i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| DomainError::Backend(e.to_string()))?;
+        let mut by_id: std::collections::HashMap<i64, ReadPosition> = rows
+            .into_iter()
+            .map(|(id, locator, fraction, updated_at)| {
+                (
+                    id,
+                    ReadPosition {
+                        locator,
+                        fraction,
+                        updated_at,
+                    },
+                )
+            })
+            .collect();
+        Ok(ids_i64.iter().map(|id| by_id.remove(id)).collect())
+    }
+
+    #[tracing::instrument(skip(self, position), fields(user.id = %user.0, media.id = %item))]
+    async fn set_read_position(
+        &self,
+        user: UserId,
+        item: MediaId,
+        position: ReadPosition,
+    ) -> DomainResult<()> {
+        sqlx::query(
+            "INSERT INTO read_positions (user_id, item_id, locator, fraction, updated_at)
+             VALUES ($1, $2, $3, $4, $5)
+             ON CONFLICT (user_id, item_id) DO UPDATE SET
+               locator = EXCLUDED.locator,
+               fraction = EXCLUDED.fraction,
+               updated_at = EXCLUDED.updated_at",
+        )
+        .bind(user.0.as_bytes().to_vec())
+        .bind(media_id_i64(item)?)
+        .bind(position.locator)
+        .bind(position.fraction)
+        .bind(position.updated_at)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| DomainError::Backend(e.to_string()))?;
+        Ok(())
+    }
+
+    #[tracing::instrument(skip(self), fields(user.id = %user.0, limit))]
+    async fn part_read_items(&self, user: UserId, limit: u32) -> DomainResult<Vec<MediaId>> {
+        let rows: Vec<(i64,)> = sqlx::query_as(
+            "SELECT r.item_id FROM read_positions r
+             LEFT JOIN user_data d ON d.user_id = r.user_id AND d.item_id = r.item_id
+             WHERE r.user_id = $1 AND r.fraction > 0 AND COALESCE(d.played, 0) = 0
+             ORDER BY r.updated_at DESC
+             LIMIT $2",
+        )
+        .bind(user.0.as_bytes().to_vec())
+        .bind(i64::from(limit))
         .fetch_all(&self.pool)
         .await
         .map_err(|e| DomainError::Backend(e.to_string()))?;
