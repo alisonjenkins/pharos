@@ -11,7 +11,9 @@
 pub const TAP_STEP_MS: u64 = 10_000;
 /// Keys still this long commit the preview.
 pub const SETTLE_MS: u32 = 900;
-/// A held key never crosses the whole video in less than this.
+/// A held key never crosses the whole video in less than this, except a
+/// video under 130 s: from its start, the opening 10 s tap plus the rest at
+/// the 20x floor already cross it sooner.
 const MIN_CROSSING_MS: f64 = 6_000.0;
 
 /// A preview under way.
@@ -63,10 +65,16 @@ pub fn press(
         Some(s) => {
             let mut speed = hold_speed(now - s.hold_start);
             if duration_ms > 0 {
-                speed = speed.min((duration_ms as f64 / MIN_CROSSING_MS).max(hold_speed(0.0)));
+                // What the hold has left to cross once the opening tap has
+                // moved 10 s, in no less than MIN_CROSSING_MS.
+                let rest = duration_ms.saturating_sub(TAP_STEP_MS) as f64;
+                speed = speed.min((rest / MIN_CROSSING_MS).max(hold_speed(0.0)));
             }
             let dt = (now - s.last_press).max(0.0);
-            (s.hold_start, (speed * dt).round() as u64)
+            // Floored, so a press never moves more than the speed allows:
+            // rounding half up adds a little each repeat, and over a fast
+            // remote's hundreds of repeats that crosses short of the floor.
+            (s.hold_start, (speed * dt).floor() as u64)
         }
         None => (now, TAP_STEP_MS),
     };
@@ -169,7 +177,8 @@ mod tests {
 
     #[test]
     fn a_held_key_is_capped_so_the_video_is_not_crossed_in_a_blink() {
-        // 30 min: the cap is 1_800_000 / 6_000 = 300x, below a long hold's 480x.
+        // 30 min: the cap is (1_800_000 - 10_000) / 6_000 = 298.3x, below a
+        // long hold's 480x.
         let duration = 1_800_000;
         let mut s = press(None, true, false, 0, duration, 0.0);
         let mut last = s.target_ms;
@@ -178,7 +187,37 @@ mod tests {
             s = press(Some(s), true, true, 0, duration, f64::from(i) * 50.0);
         }
         assert!(s.target_ms < duration, "the clamp must not hide the cap");
-        assert_eq!(s.target_ms - last, 15_000, "300x over 50 ms, not 480x");
+        assert_eq!(s.target_ms - last, 14_916, "298.3x over 50 ms, not 480x");
+    }
+
+    /// Real milliseconds a hold from 0, repeating every `every` ms, takes to
+    /// reach the end of a video `duration` long.
+    fn crossing_ms(duration: u64, every: f64) -> f64 {
+        let mut s = press(None, true, false, 0, duration, 0.0);
+        let mut now = 0.0;
+        while s.target_ms < duration {
+            now += every;
+            s = press(Some(s), true, true, 0, duration, now);
+        }
+        now
+    }
+
+    #[test]
+    fn the_crossing_floor_holds_from_130_seconds_up() {
+        for duration in [130_000, 130_300, 300_000, 1_800_000, HOUR, 4 * HOUR] {
+            for every in [10.0, 33.0, 50.0] {
+                let t = crossing_ms(duration, every);
+                assert!(
+                    t >= MIN_CROSSING_MS,
+                    "{duration} ms crossed in {t} ms at {every} ms repeats"
+                );
+            }
+        }
+        let t = crossing_ms(120_000, 50.0);
+        assert!(
+            t < MIN_CROSSING_MS,
+            "under 130 s the tap and the 20x floor win: {t} ms"
+        );
     }
 
     #[test]

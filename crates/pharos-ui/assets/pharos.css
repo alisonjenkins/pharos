@@ -2133,6 +2133,14 @@ body:has(.pharos-stage.is-full) .pharos-status-note {
 .pharos-controls:has(.pharos-seek-preview) {
   z-index: 2;
 }
+/* B907: a remote scrub shows its thumbnail at full size, readable from
+   the sofa, and the knob at the preview's target. */
+.pharos-seek.is-scrubbing .pharos-seek-thumb {
+  zoom: 1;
+}
+.pharos-seek.is-scrubbing .pharos-seek-knob {
+  transform: scale(1);
+}
 /* On a phone the control row wraps to two or three lines (track, size and
    quality menus), so a fixed `bottom` lands the button on the menus (B838).
    It sits top right under the title bar instead, clear of every row. */
