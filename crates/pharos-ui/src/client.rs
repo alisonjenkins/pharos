@@ -1122,6 +1122,91 @@ pub fn move_body(
     .to_string()
 }
 
+/// `/Admin/Items/{id}/Metadata`: the fields an admin may edit on one item or
+/// show, with their current values.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct ItemMetadata {
+    pub id: String,
+    /// `item` or `series`.
+    pub target: String,
+    pub kind: String,
+    pub name: String,
+    /// Current value by field name; a missing or `null` entry is unset.
+    pub fields: serde_json::Map<String, serde_json::Value>,
+    /// Field names the admin may change, in display order.
+    pub editable: Vec<String>,
+    /// Editable fields the scanner no longer overwrites.
+    pub locked: Vec<String>,
+}
+
+impl ItemMetadata {
+    pub fn is_locked(&self, field: &str) -> bool {
+        self.locked.iter().any(|f| f == field)
+    }
+}
+
+pub fn parse_item_metadata_response(bytes: &[u8]) -> Result<ItemMetadata, ClientError> {
+    serde_json::from_slice(bytes).map_err(|e| ClientError::Parse(e.to_string()))
+}
+
+/// Why a metadata save did not go through.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MetadataSaveError {
+    /// The server named the field it refused and why.
+    Refused {
+        field: String,
+        reason: String,
+    },
+    Failed(String),
+}
+
+impl std::fmt::Display for MetadataSaveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Refused { field, reason } => write!(f, "{field}: {reason}"),
+            Self::Failed(e) => f.write_str(e),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct MetadataRefusalDto {
+    field: String,
+    reason: String,
+}
+
+/// Reads a refused save: a 400 carrying `{"Field","Reason"}` names the field,
+/// anything else is a plain failure worded from the body or the status.
+pub fn parse_metadata_save_error(status: u16, body: &[u8]) -> MetadataSaveError {
+    if status == 400 {
+        if let Ok(r) = serde_json::from_slice::<MetadataRefusalDto>(body) {
+            return MetadataSaveError::Refused {
+                field: r.field,
+                reason: r.reason,
+            };
+        }
+    }
+    let text = String::from_utf8_lossy(body);
+    let text = text.trim();
+    MetadataSaveError::Failed(if text.is_empty() {
+        format!("status {status}")
+    } else {
+        text.to_string()
+    })
+}
+
+/// The POST body: only the fields that changed (written and locked), and the
+/// fields handed back to the scanner.
+pub fn build_metadata_save_body(
+    fields: &[(String, serde_json::Value)],
+    unlock: &[String],
+) -> String {
+    let fields: serde_json::Map<String, serde_json::Value> = fields.iter().cloned().collect();
+    serde_json::json!({ "Fields": fields, "Unlock": unlock }).to_string()
+}
+
 /// T58 phase 3 — `/Auth/Keys` row.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ApiKey {
@@ -2195,6 +2280,55 @@ pub mod web {
         Ok(())
     }
 
+    pub async fn fetch_item_metadata(
+        base: &str,
+        token: &str,
+        id: &str,
+    ) -> Result<ItemMetadata, ClientError> {
+        let resp = Request::get(&format!("{base}/Admin/Items/{}/Metadata", urlencode(id)))
+            .header("X-Emby-Token", token)
+            .send()
+            .await
+            .map_err(|e| ClientError::Http(e.to_string()))?;
+        if !resp.ok() {
+            let status = resp.status();
+            return match resp.text().await {
+                Ok(t) if !t.trim().is_empty() => Err(ClientError::Http(t.trim().to_string())),
+                _ => Err(ClientError::Status(status)),
+            };
+        }
+        let bytes = resp
+            .binary()
+            .await
+            .map_err(|e| ClientError::Http(e.to_string()))?;
+        parse_item_metadata_response(&bytes)
+    }
+
+    /// Writes the changed fields and answers with the item's new view.
+    pub async fn save_item_metadata(
+        base: &str,
+        token: &str,
+        id: &str,
+        fields: &[(String, serde_json::Value)],
+        unlock: &[String],
+    ) -> Result<ItemMetadata, MetadataSaveError> {
+        let failed = |e: String| MetadataSaveError::Failed(e);
+        let resp = Request::post(&format!("{base}/Admin/Items/{}/Metadata", urlencode(id)))
+            .header("X-Emby-Token", token)
+            .header("Content-Type", "application/json")
+            .body(build_metadata_save_body(fields, unlock))
+            .map_err(|e| failed(e.to_string()))?
+            .send()
+            .await
+            .map_err(|e| failed(e.to_string()))?;
+        let status = resp.status();
+        let bytes = resp.binary().await.map_err(|e| failed(e.to_string()))?;
+        if !(200..300).contains(&status) {
+            return Err(parse_metadata_save_error(status, &bytes));
+        }
+        parse_item_metadata_response(&bytes).map_err(|e| failed(e.to_string()))
+    }
+
     pub async fn list_logs(base: &str, token: &str) -> Result<Vec<LogEntry>, ClientError> {
         let resp = Request::get(&format!("{base}/System/Logs"))
             .header("X-Emby-Token", token)
@@ -2661,6 +2795,85 @@ mod tests {
         assert_eq!(v[0].versions[0].height, Some(1080));
         assert_eq!(v[0].versions[1].path, "/m/Heat.avi");
         assert_eq!(v[0].versions[1].size_bytes, None);
+    }
+
+    #[test]
+    fn parse_item_metadata_reads_fields_editable_and_locked() {
+        let body = br#"{"Id":"abc","Target":"item","Kind":"Movie","Name":"Alien",
+            "Fields":{"Title":"Alien","SortName":null,"ProductionYear":1979,"CommunityRating":8.5},
+            "Editable":["Title","SortName","ProductionYear"],"Locked":["Title"]}"#;
+        let m = parse_item_metadata_response(body).unwrap();
+        assert_eq!((m.id.as_str(), m.target.as_str()), ("abc", "item"));
+        assert_eq!(m.name, "Alien");
+        assert_eq!(m.editable, ["Title", "SortName", "ProductionYear"]);
+        assert!(m.is_locked("Title") && !m.is_locked("SortName"));
+        assert_eq!(m.fields["ProductionYear"], serde_json::json!(1979));
+        assert!(m.fields["SortName"].is_null());
+    }
+
+    #[test]
+    fn parse_item_metadata_reads_a_show_with_genres() {
+        let body = br#"{"Id":"s1","Target":"series","Kind":"Series","Name":"Show",
+            "Fields":{"Genres":["Drama","Sci-Fi"]},"Editable":["Genres"]}"#;
+        let m = parse_item_metadata_response(body).unwrap();
+        assert_eq!(m.fields["Genres"], serde_json::json!(["Drama", "Sci-Fi"]));
+        assert!(m.locked.is_empty());
+    }
+
+    #[test]
+    fn parse_item_metadata_rejects_non_json() {
+        assert!(matches!(
+            parse_item_metadata_response(b"nope"),
+            Err(ClientError::Parse(_))
+        ));
+    }
+
+    #[test]
+    fn a_400_with_field_and_reason_is_a_refusal_of_that_field() {
+        let body =
+            br#"{"Field":"ProductionYear","Reason":"ProductionYear 19999 is outside 1850..=2200"}"#;
+        assert_eq!(
+            parse_metadata_save_error(400, body),
+            MetadataSaveError::Refused {
+                field: "ProductionYear".into(),
+                reason: "ProductionYear 19999 is outside 1850..=2200".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn other_save_failures_carry_the_body_or_the_status() {
+        assert_eq!(
+            parse_metadata_save_error(404, b" no such item \n"),
+            MetadataSaveError::Failed("no such item".into())
+        );
+        assert_eq!(
+            parse_metadata_save_error(500, b""),
+            MetadataSaveError::Failed("status 500".into())
+        );
+        assert_eq!(
+            parse_metadata_save_error(400, b"not json"),
+            MetadataSaveError::Failed("not json".into())
+        );
+    }
+
+    #[test]
+    fn the_save_body_holds_only_the_given_fields_and_unlocks() {
+        let body = build_metadata_save_body(
+            &[
+                ("Title".into(), serde_json::json!("Alien")),
+                ("Tagline".into(), serde_json::Value::Null),
+            ],
+            &["Overview".to_string()],
+        );
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({"Fields":{"Title":"Alien","Tagline":null},"Unlock":["Overview"]})
+        );
+        let empty: serde_json::Value =
+            serde_json::from_str(&build_metadata_save_body(&[], &[])).unwrap();
+        assert_eq!(empty, serde_json::json!({"Fields":{},"Unlock":[]}));
     }
 
     #[test]
