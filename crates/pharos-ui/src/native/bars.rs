@@ -135,7 +135,7 @@ pub fn crop_style(r: FrameRect) -> String {
 /// coordinates and kept inside it, so a cue the disc placed in a bar is
 /// still seen.
 pub fn cue_in_picture(cue: FrameRect, crop: Option<FrameRect>) -> FrameRect {
-    let Some(c) = crop else {
+    let Some(c) = crop.filter(|c| c.w > 0.0 && c.h > 0.0) else {
         return cue;
     };
     let w = (cue.w / c.w).min(1.0);
