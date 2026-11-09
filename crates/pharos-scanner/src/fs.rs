@@ -2290,14 +2290,11 @@ fn group_by_edition(paths: Vec<PathBuf>) -> Vec<(PathBuf, Vec<(String, PathBuf)>
 /// The files of `groups` that share an episode with another file: only these
 /// are ranked, so only these are looked up.
 fn copy_candidates(groups: &[(PathBuf, Vec<(String, PathBuf)>)]) -> Vec<PathBuf> {
-    let mut by_episode: BTreeMap<(String, u32, u32), Vec<&Path>> = BTreeMap::new();
+    let mut by_episode: BTreeMap<CopyBucket, Vec<&Path>> = BTreeMap::new();
     for (primary, _) in groups {
-        if let Some((show, season, first, last)) = episode_copy_key(primary) {
-            for episode in first..=last {
-                by_episode
-                    .entry((show.clone(), season, episode))
-                    .or_default()
-                    .push(primary);
+        if let Some(span) = episode_copy_key(primary) {
+            for bucket in copy_buckets(&span) {
+                by_episode.entry(bucket).or_default().push(primary);
             }
         }
     }
@@ -2372,12 +2369,28 @@ pub(crate) struct CopyFacts {
     pub(crate) size: Option<u64>,
 }
 
-/// A span longer than this is a misparse (`S01E01-E99`), not a file that
-/// holds that many episodes, so it is left out of copy grouping.
+/// A span longer than this is a season pack or a misparse (`S01E01-E99`),
+/// so it groups only with files of exactly its span, as before V844.
 const MAX_EPISODE_SPAN: u32 = 8;
 
 /// `(show folder, season, first episode, last episode)` of an episode file.
 type EpisodeSpan = (String, u32, u32, u32);
+
+/// One bucket of copies: `(show folder, season, first, last)`, where `first`
+/// and `last` are one episode, or a long span's own ends.
+type CopyBucket = (String, u32, u32, u32);
+
+/// The buckets a file of `span` is a copy in: each episode it covers, or for
+/// a span past [`MAX_EPISODE_SPAN`] only its exact span.
+fn copy_buckets(span: &EpisodeSpan) -> Vec<CopyBucket> {
+    let (show, season, first, last) = span;
+    if last.saturating_sub(*first) >= MAX_EPISODE_SPAN {
+        return vec![(show.clone(), *season, *first, *last)];
+    }
+    (*first..=*last)
+        .map(|episode| (show.clone(), *season, episode, episode))
+        .collect()
+}
 
 /// A primary file and its `(label, path)` versions.
 type Group = (PathBuf, Vec<(String, PathBuf)>);
@@ -2396,21 +2409,18 @@ fn group_episode_copies(
     facts: &HashMap<PathBuf, CopyFacts>,
 ) -> Vec<(PathBuf, Vec<(String, PathBuf)>)> {
     let spans: Vec<Option<EpisodeSpan>> = groups.iter().map(|g| episode_copy_key(&g.0)).collect();
-    let mut by_episode: BTreeMap<(String, u32, u32), Vec<usize>> = BTreeMap::new();
+    let mut by_episode: BTreeMap<CopyBucket, Vec<usize>> = BTreeMap::new();
     for (i, span) in spans.iter().enumerate() {
-        if let Some((show, season, first, last)) = span {
-            for episode in *first..=*last {
-                by_episode
-                    .entry((show.clone(), *season, episode))
-                    .or_default()
-                    .push(i);
+        if let Some(span) = span {
+            for bucket in copy_buckets(span) {
+                by_episode.entry(bucket).or_default().push(i);
             }
         }
     }
     // Each episode's primary, and the copies it gathers in episode order.
     let mut is_item = vec![false; groups.len()];
     let mut gathered: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
-    for ((show, season, episode), members) in &by_episode {
+    for ((show, season, episode, _), members) in &by_episode {
         let rank = |i: &usize| {
             let span = spans.get(*i).and_then(Option::as_ref);
             let path = groups.get(*i).map(|g| g.0.as_path());
@@ -2499,9 +2509,6 @@ fn episode_copy_key(path: &Path) -> Option<EpisodeSpan> {
     let last = episode_span_end(name)
         .filter(|l| *l > first)
         .unwrap_or(first);
-    if last.saturating_sub(first) >= MAX_EPISODE_SPAN {
-        return None;
-    }
     Some((info.series_folder?, info.season_number?, first, last))
 }
 
@@ -7106,6 +7113,22 @@ mod tests {
                 ],
             }]
         );
+    }
+
+    /// A season pack groups only with packs of exactly its span: it is no
+    /// copy of each of its ten episodes.
+    #[test]
+    fn a_long_span_groups_only_with_its_exact_span() {
+        let a = PathBuf::from("/tv/Foo/Season 01/Foo S01E01-E10.mkv");
+        let b = PathBuf::from("/tv/Foo/Season 1/Foo S01E01-E10.mkv");
+        let e03 = PathBuf::from("/tv/Foo/Season 01/Foo S01E03.mkv");
+        let groups = group_editions(vec![a.clone(), b.clone(), e03.clone()]);
+        assert_eq!(groups.len(), 2, "{groups:?}");
+        assert_eq!(
+            group_of(&groups, &a).map(alt_paths),
+            Some(vec![b.as_path()])
+        );
+        assert_eq!(group_of(&groups, &e03), Some(&[][..]));
     }
 
     /// V845: the highest-quality copy is the primary: the taller picture
