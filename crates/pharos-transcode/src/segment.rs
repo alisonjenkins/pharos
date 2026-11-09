@@ -206,6 +206,10 @@ pub struct SegmentOpts {
     /// window and bitrate produce different pixels with it on.
     #[serde(default)]
     pub tonemap: crate::options::Tonemap,
+    /// Downscale target; part of the segment's identity (different pixels).
+    /// Skipped when `None` so unscaled options serialise exactly as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_size: Option<crate::output_size::OutputSize>,
 }
 
 /// A segment's audio once it is SETTLED.
@@ -335,6 +339,7 @@ impl ResolvedSegment {
             video_3d_format: s.video_3d_format,
             stereo_output: s.stereo_output,
             tonemap: s.tonemap,
+            output_size: s.output_size,
         }
     }
 }
@@ -369,6 +374,7 @@ mod tests {
             video_3d_format: Some(pharos_core::Video3DFormat::HalfSideBySide),
             stereo_output: crate::options::StereoOutput::Mono2D,
             tonemap: Default::default(),
+            output_size: None,
         };
         let slice = crate::options::MuxedAudio {
             path: std::path::PathBuf::from("/cache/continuous.m4a"),
@@ -446,6 +452,7 @@ mod tests {
             video_3d_format: None,
             stereo_output: crate::options::StereoOutput::Preserve,
             tonemap: Default::default(),
+            output_size: None,
         };
         let argv = |r: &ResolvedSegment| {
             crate::ffmpeg_transcode_args(

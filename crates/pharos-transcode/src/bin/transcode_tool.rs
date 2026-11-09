@@ -176,6 +176,7 @@ fn tool_opts(out: &std::path::Path) -> pharos_transcode::options::TranscodeOptio
         video_3d_format: None,
         stereo_output: Default::default(),
         tonemap: Default::default(),
+        output_size: None,
     }
 }
 

@@ -50,6 +50,7 @@ fn hdr_job() -> TranscodeOptions {
         video_3d_format: None,
         stereo_output: Default::default(),
         tonemap: Tonemap::HdrToSdr,
+        output_size: None,
         filler: None,
     }
 }
