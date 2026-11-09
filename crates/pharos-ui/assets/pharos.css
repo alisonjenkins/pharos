@@ -4595,6 +4595,30 @@ body:has(.pharos-stage.is-mini) .pharos-main {
   overflow-wrap: anywhere;
 }
 
+/* Admin > Damaged files: one block per file; long paths wrap. */
+.pharos-admin-integrity-file {
+  padding: 0.75rem 0;
+  border-bottom: 1px solid var(--px-color-border);
+}
+.pharos-admin-integrity-file h4 {
+  margin: 0 0 0.25rem;
+}
+.pharos-admin-integrity-kind,
+.pharos-admin-integrity-fault,
+.pharos-admin-integrity-path,
+.pharos-admin-integrity-checked {
+  color: var(--px-color-fg-muted);
+}
+.pharos-admin-integrity-fault,
+.pharos-admin-integrity-path,
+.pharos-admin-integrity-checked {
+  margin: 0.125rem 0;
+  font-size: 0.85em;
+}
+.pharos-admin-integrity-path {
+  overflow-wrap: anywhere;
+}
+
 /* What's new (spec 027): a dialog over the page after sign-in, never while
    something plays (V495). */
 .pharos-whats-new-backdrop {
