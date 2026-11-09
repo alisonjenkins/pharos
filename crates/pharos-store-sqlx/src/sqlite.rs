@@ -3862,6 +3862,30 @@ impl SeriesIdentityStore for SqliteStore {
             .collect())
     }
 
+    async fn ambiguous_series(
+        &self,
+        keys: &[String],
+    ) -> DomainResult<std::collections::HashSet<String>> {
+        let mut out = std::collections::HashSet::new();
+        for chunk in keys.chunks(500) {
+            let placeholders = vec!["?"; chunk.len()].join(",");
+            let sql = format!(
+                "SELECT series_key FROM series_metadata \
+                 WHERE series_key IN ({placeholders}) AND match_flag = 'ambiguous'"
+            );
+            let mut q = sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(sql));
+            for k in chunk {
+                q = q.bind(k);
+            }
+            out.extend(
+                q.fetch_all(&self.pool)
+                    .await
+                    .map_err(|e| DomainError::Backend(e.to_string()))?,
+            );
+        }
+        Ok(out)
+    }
+
     #[tracing::instrument(skip(self))]
     async fn mark_series_reconcile(&self, series_key: &str, at: i64) -> DomainResult<u64> {
         let res = sqlx::query(
