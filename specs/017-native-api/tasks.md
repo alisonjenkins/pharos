@@ -148,10 +148,10 @@ Each extraction is one commit: service + its unit test, Jellyfin handler rewired
 ## Phase 6: US1 — client core (`pharos-client`)
 
 - [x] T046 (done: c1300109; byte-stream-generic connect_stream in place of a Transport trait; flake pharosUiBundle has pkgs.capnproto) [US1] Add `pkgs.capnproto` to `pharosUiBundle`'s `nativeBuildInputs` in `flake.nix` once `pharos-ui` depends on `pharos-api`. Create `crates/pharos-client` (hakari final-exclude) with the `Transport` trait; native TCP transport used by `it_rpc` — **COMMIT**
-- [ ] T047 [US1] Connection, resume, reconnect with backoff + resubscribe; typed `Disconnected` for in-flight calls — **COMMIT**
+- [x] T047 (done: reconnect with backoff is pharos-ui's `machine`; resubscribe from the last seq is `pharos_client::events::EventCursor` + `native/live.rs`, it_rpc `client_api::subscribe_events_resumes_from_its_cursor`, V1006) [US1] Connection, resume, reconnect with backoff + resubscribe; typed `Disconnected` for in-flight calls — **COMMIT**
 - [ ] T048 [US1] Client-side call instrumentation (V173 client half): interface, method, latency, outcome, bytes, call_id, trace id — **COMMIT**
 - [ ] T049 [US1] Browser WebSocket transport (`cfg(wasm)`), arraybuffer byte stream; Playwright spec in `just compat-dioxus` for login + reload resume + no token in `localStorage` (quickstart §4); the cookie-blocked edge case surfaces a message and logs the browser's reason — **COMMIT**
-- [ ] T050 [US1] Query cache primitives and event dispatch — **COMMIT**
+- [ ] T050 (partial: event dispatch done in `native/live.rs`, reloading the screens an event touches, V1006; the keyed query cache, 009 FR-003, is not built) [US1] Query cache primitives and event dispatch — **COMMIT**
 - [ ] T051 [US1] FR-012 guard: a test fails if a view added after this spec reaches the REST adapter — **COMMIT**
 
 ---
