@@ -1228,7 +1228,12 @@ where
         .await
         .unwrap();
     assert_eq!(folded.play_count, 5);
-    assert_eq!(folded.last_played_position_ticks, 7_000);
+    assert_eq!(
+        (folded.last_played_position_ticks, folded.last_played_at),
+        (7_000, 1_700_001_000),
+        "the play time stays the item's own, so a later fold of a copy that \
+         shares its timeline still compares against it"
+    );
     // Into an item with no state of its own, the position starts at zero.
     let fresh_id: MediaId = 9_003;
     MediaStore::put(&store, media_item(fresh_id, "Fresh Episode"))
