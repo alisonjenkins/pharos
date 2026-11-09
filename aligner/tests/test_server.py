@@ -16,7 +16,7 @@ from pharos_aligner.server import create_server
 class FakeAligner:
     """Fake aligner returning evenly spaced spans per token."""
 
-    def align(self, pcm_f32le: bytes, tokens: list[str]) -> list[tuple[int, int]]:
+    def align(self, pcm_f32le: bytes, tokens: list[str], lead_star: bool = False) -> list[tuple[int, int]]:
         if not tokens:
             return []
         step = 100
@@ -160,10 +160,10 @@ def _post(base_url: str, payload: dict) -> urllib.request.Request:
 class RaisingOnLongLines(FakeAligner):
     """Raises as torchaudio does when a line's text outruns its window."""
 
-    def align(self, pcm_f32le: bytes, tokens: list[str]) -> list[tuple[int, int]]:
+    def align(self, pcm_f32le: bytes, tokens: list[str], lead_star: bool = False) -> list[tuple[int, int]]:
         if len(tokens) > 2:
             raise RuntimeError("targets length is too long for CTC")
-        return super().align(pcm_f32le, tokens)
+        return super().align(pcm_f32le, tokens, lead_star)
 
 
 def test_post_align_a_failing_line_leaves_the_others(tmp_path: Path) -> None:
@@ -203,3 +203,25 @@ def test_post_align_missing_ffmpeg_is_500_not_404(tmp_path: Path) -> None:
         server.shutdown()
         server.server_close()
         thread.join(timeout=5)
+
+
+def test_post_align_reports_the_whole_song_offset_and_aligns_the_shifted_lines(
+    running_server: tuple[str, Path],
+) -> None:
+    base_url, media_root = running_server
+    (media_root / "song.mp3").write_bytes(b"x")
+    # FakeAligner puts every first word at the start of its window, so each
+    # wide probe finds its line SEARCH_MS early.
+    payload = {
+        "path": "song.mp3",
+        "lines": [
+            {"start_ms": 20_000, "end_ms": 30_000, "text": "one line sung here"},
+            {"start_ms": 30_000, "end_ms": 40_000, "text": "another line sung there"},
+            {"start_ms": 40_000, "end_ms": 50_000, "text": "the last line sung"},
+        ],
+    }
+    with urllib.request.urlopen(_post(base_url, payload)) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    assert data["offset_ms"] == -8_000
+    # The first line's window now opens MARGIN_MS before 12 000 ms.
+    assert data["lines"][0]["words"][0] == {"at": 0, "start_ms": 11_750}
