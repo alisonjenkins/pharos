@@ -932,3 +932,79 @@ fn show_nfo_evidence_reads_ids_and_year_of_this_show_only() {
         None
     );
 }
+
+/// B1009 / V968 — a film's NFO whose year is not the year its file names is
+/// another film's: Jellyfin wrote the 1994 *Lion King* into the 2019 one's
+/// folder. A year one off, or no year on the file or folder, keeps the NFO.
+#[tokio::test]
+async fn a_movie_nfo_naming_another_year_is_set_aside() {
+    let recorder = metrics_util::debugging::DebuggingRecorder::new();
+    let snapshotter = pharos_test_metrics::snapshotter(&recorder);
+    let _guard = metrics::set_default_local_recorder(&recorder);
+    let nfo = |year: u32| {
+        format!(
+            "<movie><title>The Lion King</title><year>{year}</year><tmdbid>8587</tmdbid></movie>"
+        )
+    };
+    let fetch = |folder: &'static str, file: &'static str, year: u32| async move {
+        let dir = tempdir().unwrap();
+        let folder = dir.path().join(folder);
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("movie.nfo"), nfo(year)).unwrap();
+        let media = folder.join(file);
+        let p = probe();
+        let req = MetadataRequest {
+            path: &media,
+            kind: MediaKind::Movie,
+            probe: &p,
+            series: None,
+        };
+        NfoProvider::new()
+            .fetch(&req)
+            .await
+            .unwrap()
+            .production_year
+    };
+
+    assert_eq!(
+        fetch(
+            "The Lion King (2019)",
+            "The Lion King (2019) Bluray-1080p.mp4",
+            1994
+        )
+        .await,
+        None
+    );
+    assert_eq!(
+        fetch("The Lion King (2019)", "lion.king.mp4", 1994).await,
+        None
+    );
+    assert_eq!(
+        fetch("The Lion King (1994)", "The Lion King (1994).mkv", 1994).await,
+        Some(1994)
+    );
+    assert_eq!(
+        fetch("Heat (1995)", "Heat (1995).mkv", 1996).await,
+        Some(1996)
+    );
+    assert_eq!(fetch("Lion King", "lion.king.mkv", 1994).await, Some(1994));
+
+    let set_aside: u64 = snapshotter
+        .snapshot()
+        .into_vec()
+        .into_iter()
+        .filter_map(|(ck, _, _, v)| match v {
+            metrics_util::debugging::DebugValue::Counter(n)
+                if ck.key().name() == "pharos_nfo_set_aside_total"
+                    && ck
+                        .key()
+                        .labels()
+                        .any(|l| l.key() == "reason" && l.value() == "film_year") =>
+            {
+                Some(n)
+            }
+            _ => None,
+        })
+        .sum();
+    assert_eq!(set_aside, 2, "each set-aside NFO is counted once");
+}
