@@ -12,11 +12,12 @@ use pharos_core::{
     LibraryKind, LibraryStore, MediaFacets, MediaId, MediaItem, MediaQuery, MediaStore,
     PersistedSyncGroup, PersistedTranscodeSession, Person, PersonCount, PersonDetails, PersonRef,
     PersonStore, PlaybackProgress, Playlist, PlaylistEntry, PlaylistStore, PreferenceStore,
-    ResolvedToken, ScanState, SearchQuery, SecretString, SeriesEpisodeRow, SeriesIdentityRow,
-    SeriesIdentityStore, SeriesKeyUpdate, SeriesMatchCandidate, SeriesMetadata,
-    SeriesMetadataStore, SeriesOverride, Studio, StudioCount, StudioStore, SyncGroupStore, Tag,
-    TagCount, TagStore, TokenId, TokenRecord, TokenScope, TokenSelector, TokenStore,
-    TranscodeSessionStore, UserDataStore, UserId, UserItemData, UserPolicy, UserRecord, UserStore,
+    ReadPosition, ReadPositionStore, ResolvedToken, ScanState, SearchQuery, SecretString,
+    SeriesEpisodeRow, SeriesIdentityRow, SeriesIdentityStore, SeriesKeyUpdate,
+    SeriesMatchCandidate, SeriesMetadata, SeriesMetadataStore, SeriesOverride, Studio, StudioCount,
+    StudioStore, SyncGroupStore, Tag, TagCount, TagStore, TokenId, TokenRecord, TokenScope,
+    TokenSelector, TokenStore, TranscodeSessionStore, UserDataStore, UserId, UserItemData,
+    UserPolicy, UserRecord, UserStore,
 };
 
 #[derive(Clone)]
@@ -1506,6 +1507,52 @@ impl SyncGroupStore for AnyStore {
         match self {
             AnyStore::Sqlite(s) => s.prune_sync_groups(cutoff_unix_secs).await,
             AnyStore::Postgres(p) => p.prune_sync_groups(cutoff_unix_secs).await,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
+// ReadPositionStore
+// ---------------------------------------------------------------------
+impl ReadPositionStore for AnyStore {
+    async fn get_read_position(
+        &self,
+        user: UserId,
+        item: MediaId,
+    ) -> DomainResult<Option<ReadPosition>> {
+        match self {
+            AnyStore::Sqlite(s) => s.get_read_position(user, item).await,
+            AnyStore::Postgres(p) => p.get_read_position(user, item).await,
+        }
+    }
+
+    async fn read_positions_bulk(
+        &self,
+        user: UserId,
+        items: &[MediaId],
+    ) -> DomainResult<Vec<Option<ReadPosition>>> {
+        match self {
+            AnyStore::Sqlite(s) => s.read_positions_bulk(user, items).await,
+            AnyStore::Postgres(p) => p.read_positions_bulk(user, items).await,
+        }
+    }
+
+    async fn set_read_position(
+        &self,
+        user: UserId,
+        item: MediaId,
+        position: ReadPosition,
+    ) -> DomainResult<()> {
+        match self {
+            AnyStore::Sqlite(s) => s.set_read_position(user, item, position).await,
+            AnyStore::Postgres(p) => p.set_read_position(user, item, position).await,
+        }
+    }
+
+    async fn part_read_items(&self, user: UserId, limit: u32) -> DomainResult<Vec<MediaId>> {
+        match self {
+            AnyStore::Sqlite(s) => s.part_read_items(user, limit).await,
+            AnyStore::Postgres(p) => p.part_read_items(user, limit).await,
         }
     }
 }
