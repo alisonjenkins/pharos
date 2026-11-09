@@ -10,7 +10,7 @@ use pharos_client::ClientError;
 use super::app::{call, AccountMe, Ctx};
 use super::machine::{Event, Machine};
 use super::platform;
-use crate::views::AdminPane;
+use crate::views::{AdminPane, AdminTab};
 
 /// How long before a manage token ends the screen asks for the next one.
 const REFRESH_EARLY_MS: u64 = 5 * 60 * 1000;
@@ -40,6 +40,20 @@ pub fn local_expiry(expires_at_ms: u64, now_ms: u64) -> u64 {
 /// new connection.
 #[derive(Clone, Copy)]
 pub struct HeldManageToken(pub Signal<Option<MediaToken>>);
+
+/// The Manage tab to open on, set by a link elsewhere in the app (the
+/// Check match badge) and taken by the next Manage screen.
+#[derive(Clone, Copy)]
+pub struct ManageTab(pub Signal<Option<AdminTab>>);
+
+/// The flagged shows' item refs, asked for once by the first show page an
+/// admin opens (`list` stays `None` until answered), and forgotten when
+/// Manage closes, since a fix there changes the answer.
+#[derive(Clone, Copy)]
+pub struct FlaggedShows {
+    pub list: Signal<Option<Vec<pharos_client::api::ItemRef>>>,
+    pub asked: Signal<bool>,
+}
 
 /// When to ask for the next token, or `None` to ask now: five minutes
 /// before the held one ends, but never sooner than thirty seconds after
@@ -79,7 +93,7 @@ impl TokenState {
     }
 }
 
-fn now_ms() -> u64 {
+pub(super) fn now_ms() -> u64 {
     u64::try_from(platform::unix_ms()).unwrap_or(0)
 }
 
@@ -175,6 +189,24 @@ pub fn ManageScreen() -> Element {
     let account = use_context::<AccountMe>();
     let local = use_signal(|| None::<MediaToken>);
     let held = try_use_context::<HeldManageToken>().map_or(local, |h| h.0);
+    let manage_tab = try_use_context::<ManageTab>();
+    let initial_tab = use_hook(|| {
+        manage_tab.and_then(|tab| {
+            let mut tab = tab.0;
+            let wanted = *tab.peek();
+            tab.set(None);
+            wanted
+        })
+    })
+    .unwrap_or_default();
+    let flagged_shows = try_use_context::<FlaggedShows>();
+    use_drop(move || {
+        if let Some(flagged) = flagged_shows {
+            let (mut list, mut asked) = (flagged.list, flagged.asked);
+            list.set(None);
+            asked.set(false);
+        }
+    });
     let state = use_signal(|| TokenState::Asking);
     let token = use_signal(String::new);
     let why = use_signal(String::new);
@@ -261,6 +293,7 @@ pub fn ManageScreen() -> Element {
                 access_token: token,
                 server_base: platform::page_origin(),
                 current_user_id: me_id,
+                initial_tab,
             }
         },
     }

@@ -575,10 +575,13 @@ pub fn AdminPane(
     access_token: Signal<String>,
     server_base: String,
     current_user_id: String,
+    /// The tab to open on; the first (Users) when not given.
+    #[props(default)]
+    initial_tab: AdminTab,
 ) -> Element {
     let reload = use_signal(|| 0u32);
     let status = use_signal::<Option<String>>(|| None);
-    let active_tab = use_signal::<AdminTab>(AdminTab::default);
+    let active_tab = use_signal::<AdminTab>(move || initial_tab);
     let users_resource = {
         let base = server_base.clone();
         let token = access_token;

@@ -1580,9 +1580,19 @@ fn NativeApp(route: Route) -> Element {
     // One manage token per connection, reused each time Manage opens (B920).
     let mut held_manage = use_signal(|| None);
     use_context_provider(|| super::manage::HeldManageToken(held_manage));
+    let manage_tab = use_signal(|| None::<crate::views::AdminTab>);
+    use_context_provider(|| super::manage::ManageTab(manage_tab));
+    let mut flagged_list = use_signal(|| None);
+    let mut flagged_asked = use_signal(|| false);
+    use_context_provider(|| super::manage::FlaggedShows {
+        list: flagged_list,
+        asked: flagged_asked,
+    });
     use_effect(move || {
         let _ = api.read();
         held_manage.set(None);
+        flagged_list.set(None);
+        flagged_asked.set(false);
     });
     // A reloaded tab joins the group it was in again (B665): the server kept
     // its seat for the socket-loss grace, and the group's item brings the

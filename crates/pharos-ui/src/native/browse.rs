@@ -1551,6 +1551,9 @@ pub fn ShowView(show: Show, #[props(default)] seen: Vec<MemberSeen>) -> Element 
                 mark: true,
                 next: next_episode(&show.episodes.items).cloned(),
             }
+            if let Some(series) = series {
+                super::check_match::CheckMatchBadge { series }
+            }
             if show.seasons.len() > 1 {
                 nav { class: "pharos-tabs", aria_label: "Seasons", "data-key-tabs": "seasons",
                     for season in show.seasons.iter() {

@@ -5663,6 +5663,11 @@ body:has(.pharos-stage.is-mini) .pharos-main {
   margin-inline-start: auto;
 }
 
+.pharos-check-match {
+  justify-self: start;
+  text-decoration: none;
+}
+
 /* Admin > Show identity: one card per folder, match or hand fix. */
 .pharos-admin-identity-summary,
 .pharos-admin-identity-hint {
