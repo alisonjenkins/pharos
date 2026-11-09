@@ -354,7 +354,10 @@ these):
   not be fetched and the provider's choice was kept, flagged.
 - `sum by (reason) (pharos_series_folder_split_total)`: a gauge each complete
   scan pass of a root sets to the folders it splits under that root (labels
-  `reason` = `stated_years`, `root`), in both modes.
+  `reason` ∈ `stated_years | episode_titles`, `root`), in both modes.
+- `{namespace="pharos"} |= "episode title names a same-named show"`: one
+  line per unyeared file §2's episode-title evidence moves, with both shows'
+  listed titles and scores (V941).
 - `sum by (change, mode) (pharos_series_identity_repair_rows)`, a gauge per
   `root`, `change` ∈ `series_key | owner_row`, `mode` ∈ `dry_run | apply`: the
   rows the root's last complete pass found to differ. In `apply` they were
@@ -375,11 +378,12 @@ these):
 - `sum by (action) (increase(pharos_series_override_total[1d]))` for §7.
 - `sum by (kind, reason, mode) (pharos_series_identity_repair_selected)`: the
   §6 step 3 survey's selection, `kind` ∈ `show | episode`, `reason` ∈
-  `exact_rival | year_mismatch | split | other_show | outside_run`, with
+  `exact_rival | year_mismatch | split | other_show | outside_run |
+  episode_titles`, with
   `|= "series identity repair: survey"` (and a `re-ask` / `episodes to
   rebuild` line per show).
 - `sum by (reason) (increase(pharos_series_reconcile_marked_total[1d]))`,
-  `reason="match_changed"`, with `|= "series identity repair: show match
+  `reason` ∈ `match_changed | key_changed` (a row the split moved), with `|= "series identity repair: show match
   changed"`; `pharos_series_reconcile_pending{mode}` is the backlog, which
   `apply` drains to 0 and `dry_run` leaves standing; each rebuild logs
   `|= "series identity repair: episode rebuilt"`.
@@ -404,6 +408,7 @@ re-fetches, and nothing else changing match.
 | V894 | Copies fold only within one series key, with no two different known stated years (and never when filename-stated years differ, whatever the folder year says), equal provider series ids where both are known, agreeing filename episode titles where both have one, and neither row placed by an admin override unless explicitly merged; in a flagged or split series, numbers alone never fold. |
 | V896 | A hand fix of a show or its files is an override the scanner applies after its own split and before the copy fold; a rescan never undoes it, and the copy fold never merges a row an admin override placed unless the admin explicitly merges that pair. |
 | V940 | An automatic change of a show's match durably marks its episodes, and under `apply` each is rebuilt from local evidence and the new match until it completes; matcher version 2 re-asks only shows with conflicting evidence, and a dry run logs that once and keeps the version at 1. |
+| V941 | A folder stating one show year whose unyeared files' episode titles name a same-named show of another year gets `scanner` rows for those files and its owner row from the survey, and is not re-asked or rebuilt before the scan splits it. |
 
 ## Out of scope
 
