@@ -7,7 +7,7 @@
 use crate::client::{
     ActivityEntry, AdminUser, ApiKey, BrandingConfig, DamageRange, DamagedFile, DeepCheck,
     DeviceEntry, DuplicateFilm, FilmVersion, IntegrityReport, IntegrityStatus, LibraryFolder,
-    LogEntry, PluginEntry, ScheduledTask, SearchHint,
+    LogEntry, PluginEntry, ScheduledTask, SearchHint, SeriesIdentity,
 };
 use dioxus::prelude::*;
 
@@ -103,6 +103,7 @@ pub enum AdminTab {
     Libraries,
     Duplicates,
     Integrity,
+    ShowIdentity,
     Devices,
     Activity,
     ScheduledTasks,
@@ -119,6 +120,7 @@ impl AdminTab {
             Self::Libraries => "Libraries",
             Self::Duplicates => "Duplicates",
             Self::Integrity => "Damaged files",
+            Self::ShowIdentity => "Show identity",
             Self::Devices => "Devices",
             Self::Activity => "Activity",
             Self::ScheduledTasks => "Tasks",
@@ -134,6 +136,7 @@ impl AdminTab {
             Self::Libraries => "libraries",
             Self::Duplicates => "duplicates",
             Self::Integrity => "integrity",
+            Self::ShowIdentity => "showidentity",
             Self::Devices => "devices",
             Self::Activity => "activity",
             Self::ScheduledTasks => "scheduledtasks",
@@ -150,6 +153,9 @@ impl AdminTab {
             Self::Libraries => "The folders pharos watches for media.",
             Self::Duplicates => "Films held more than once, to compare before you remove a copy.",
             Self::Integrity => "Files the background check found damaged, and deep checks.",
+            Self::ShowIdentity => {
+                "Folders split into several shows, matches to check, and the fixes made by hand."
+            }
             Self::Devices => "Every app and device that has signed in.",
             Self::Activity => "Recent sign-ins, playback and server events.",
             Self::ScheduledTasks => "Jobs the server runs on its own.",
@@ -166,6 +172,7 @@ impl AdminTab {
             Self::Libraries => "M4 4h4v16H4zM10 4h4v16h-4zM16.5 4.5l3.8-1 4 15.5-3.8 1z",
             Self::Duplicates => "M8 8h12v12H8zM4 16V4h12",
             Self::Integrity => "M12 3l9 16H3zM12 10v4M12 17v.5",
+            Self::ShowIdentity => "M4 5h16v11H4zM8 20h8M12 16v4M9 10l2 2l4-4",
             Self::Devices => "M3 5h18v12H3zM8 21h8M12 17v4",
             Self::Activity => "M3 12h4l3-8 4 16 3-8h4",
             Self::ScheduledTasks => "M12 21a9 9 0 1 0 0-18a9 9 0 0 0 0 18zM12 7v5l3 2",
@@ -175,12 +182,13 @@ impl AdminTab {
             Self::Branding => "M4 20l4-1L19 8l-3-3L5 16zM14 7l3 3",
         }
     }
-    pub fn all() -> [AdminTab; 11] {
+    pub fn all() -> [AdminTab; 12] {
         [
             Self::Users,
             Self::Libraries,
             Self::Duplicates,
             Self::Integrity,
+            Self::ShowIdentity,
             Self::Devices,
             Self::Activity,
             Self::ScheduledTasks,
@@ -234,6 +242,10 @@ pub struct AdminViewProps {
     /// tab's listing has answered.
     #[props(default)]
     pub integrity: Option<Result<IntegrityReport, String>>,
+    /// What needs a look in the series identity; `None` until the Show
+    /// identity tab's listing has answered.
+    #[props(default)]
+    pub series_identity: Option<Result<SeriesIdentity, String>>,
     /// Files whose Re-check was just requested from this page.
     #[props(default)]
     pub integrity_queued: Vec<String>,
@@ -363,6 +375,9 @@ pub fn AdminView(props: AdminViewProps) -> Element {
                                 deep_search: props.deep_search.clone(),
                                 on_action,
                             }
+                        },
+                        AdminTab::ShowIdentity => rsx! {
+                            ShowIdentitySection { identity: props.series_identity.clone() }
                         },
                         AdminTab::Plugins => rsx! { PluginsPane { plugins: props.plugins.clone() } },
                         AdminTab::Logs => rsx! { LogsPane { logs: props.logs.clone() } },
@@ -1224,6 +1239,23 @@ fn DuplicatesSection(films: Option<Result<Vec<DuplicateFilm>, String>>) -> Eleme
                                 }
                             }
                         }
+                    }
+                },
+            }
+        }
+    }
+}
+
+#[component]
+fn ShowIdentitySection(identity: Option<Result<SeriesIdentity, String>>) -> Element {
+    rsx! {
+        section { class: "pharos-manage-stack pharos-admin-section-identity",
+            match identity {
+                None => rsx! { p { class: "pharos-loading", "Looking at the shows…" } },
+                Some(Err(e)) => rsx! { p { class: "pharos-error", "Could not read the show identity: {e}" } },
+                Some(Ok(identity)) => rsx! {
+                    p { class: "pharos-admin-identity-summary",
+                        "{identity.splits.len()} split folders · {identity.flagged.len()} matches to check · {identity.overrides.len()} hand fixes"
                     }
                 },
             }
@@ -2204,8 +2236,11 @@ mod tests {
         assert_eq!(AdminTab::Duplicates.class_suffix(), "duplicates");
         assert_eq!(AdminTab::Integrity.label(), "Damaged files");
         assert_eq!(AdminTab::Integrity.class_suffix(), "integrity");
-        assert_eq!(AdminTab::all().len(), 11);
+        assert_eq!(AdminTab::ShowIdentity.label(), "Show identity");
+        assert_eq!(AdminTab::ShowIdentity.class_suffix(), "showidentity");
+        assert_eq!(AdminTab::all().len(), 12);
         assert_eq!(AdminTab::all()[3], AdminTab::Integrity);
+        assert_eq!(AdminTab::all()[4], AdminTab::ShowIdentity);
     }
 
     fn version(id: &str, width: u32, height: u32) -> FilmVersion {
