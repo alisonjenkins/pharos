@@ -103,8 +103,8 @@ pub fn subtitle_pick_here(
 
 /// How the streams of the version playing line up with the item's primary
 /// file, whose indexes the group's picks name (ADR-0089, V902). Two streams
-/// match when they share language, forced and hearing-impaired flags and
-/// stand at the same place among the streams of their file that share them.
+/// match when they share language, forced and hearing-impaired flags: first
+/// those whose title, codec and channels agree too, then the rest in order.
 /// On the primary every stream matches itself.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TrackMap {
@@ -175,30 +175,39 @@ fn track_key(t: &Track) -> (String, bool, bool) {
     )
 }
 
-/// Each stream of `own` with the stream of `primary` sharing its key and its
-/// place among the streams with that key.
+/// Pairs each stream of `own` with one of `primary` sharing its key. A stream
+/// whose title, codec and channels also agree is paired first, so a
+/// commentary ahead of the main track in one file still finds its twin; the
+/// rest pair in order among the unpaired streams with that key.
 fn pair(own: &[Track], primary: &[Track]) -> Vec<(u32, u32)> {
-    let ranked = |tracks: &[Track]| -> Vec<((String, bool, bool), usize, u32)> {
-        let mut seen: Vec<(String, bool, bool)> = Vec::new();
-        tracks
-            .iter()
-            .map(|t| {
-                let key = track_key(t);
-                let rank = seen.iter().filter(|k| **k == key).count();
-                seen.push(key.clone());
-                (key, rank, t.index)
-            })
-            .collect()
+    let same = |a: &Track, b: &Track| {
+        track_key(a) == track_key(b)
+            && a.title == b.title
+            && a.codec.eq_ignore_ascii_case(&b.codec)
+            && a.channels == b.channels
     };
-    let primary = ranked(primary);
-    ranked(own)
-        .into_iter()
-        .filter_map(|(key, rank, index)| {
-            primary
+    let mut taken = vec![false; primary.len()];
+    let mut paired: Vec<Option<u32>> = vec![None; own.len()];
+    let mut claim = |matches: &dyn Fn(&Track, &Track) -> bool, paired: &mut Vec<Option<u32>>| {
+        for (slot, o) in paired.iter_mut().zip(own) {
+            if slot.is_some() {
+                continue;
+            }
+            let hit = primary
                 .iter()
-                .find(|(k, r, _)| *k == key && *r == rank)
-                .map(|(_, _, p)| (index, *p))
-        })
+                .zip(taken.iter_mut())
+                .find(|(p, used)| !**used && matches(o, p));
+            if let Some((p, used)) = hit {
+                *used = true;
+                *slot = Some(p.index);
+            }
+        }
+    };
+    claim(&same, &mut paired);
+    claim(&|a, b| track_key(a) == track_key(b), &mut paired);
+    own.iter()
+        .zip(paired)
+        .filter_map(|(o, p)| p.map(|p| (o.index, p)))
         .collect()
 }
 
@@ -407,6 +416,33 @@ mod tests {
                 subtitle: None
             }
         );
+    }
+
+    /// A commentary ahead of the main track pairs by title and codec, not by place.
+    #[test]
+    fn a_commentary_first_does_not_take_the_main_tracks_place() {
+        let main = Track {
+            codec: "eac3".into(),
+            channels: 6,
+            ..track(1, "eng")
+        };
+        let commentary = Track {
+            title: "Commentary".into(),
+            codec: "aac".into(),
+            channels: 2,
+            ..track(1, "eng")
+        };
+        let primary = [main.clone()];
+        let rip = [
+            Track {
+                index: 1,
+                ..commentary
+            },
+            Track { index: 2, ..main },
+        ];
+        let map = TrackMap::new((&rip, &[]), (&primary, &[]));
+        assert_eq!(map.to_own(TrackKind::Audio, 1), Some(2));
+        assert_eq!(map.to_primary(TrackKind::Audio, 1), None);
     }
 
     #[test]
