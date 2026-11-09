@@ -1661,6 +1661,33 @@ pub struct SeriesOverride {
     pub created_at: i64,
 }
 
+impl SeriesOverride {
+    /// An admin's "keep together" for `folder` (V896): the folder is one show
+    /// whatever years its files state. Told apart from an owner row by having
+    /// no `target_year`.
+    pub fn keep_together(folder: &str, by: Option<String>, at: i64) -> Self {
+        Self {
+            id: 0,
+            series_folder: folder.to_string(),
+            path: None,
+            target_key: folder.to_string(),
+            target_name: None,
+            target_year: None,
+            source: OverrideSource::Admin,
+            created_by: by,
+            created_at: at,
+        }
+    }
+
+    /// Whether this row is a [`Self::keep_together`].
+    pub fn keeps_together(&self) -> bool {
+        self.source == OverrideSource::Admin
+            && self.path.is_none()
+            && self.target_key == self.series_folder
+            && self.target_year.is_none()
+    }
+}
+
 /// Spec 033 — an episode row's identity as stored: what the scanner diffs its
 /// split plan against.
 #[derive(Debug, Clone, PartialEq, Eq)]
