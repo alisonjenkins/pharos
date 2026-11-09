@@ -646,6 +646,8 @@ fn AdminPane(access_token: String, server_base: String, current_user_id: String)
     let integrity_errors = use_signal::<Vec<(String, String)>>(Vec::new);
     let deep_queued = use_signal::<Vec<String>>(Vec::new);
     let deep_errors = use_signal::<Vec<(String, String)>>(Vec::new);
+    // Bumped by the poll below to re-load the tab while a deep check is in progress.
+    let integrity_tick = use_signal(|| 0u32);
     // Reads every file's verdict, so it runs only while its tab is open.
     let integrity_resource = {
         let base = server_base.clone();
@@ -653,8 +655,10 @@ fn AdminPane(access_token: String, server_base: String, current_user_id: String)
         let reload_signal = reload;
         let mut queued_signal = integrity_queued;
         let mut deep_queued_signal = deep_queued;
+        let mut tick_signal = integrity_tick;
         use_resource(move || {
             let _bust = reload_signal.read();
+            let _tick = tick_signal.read();
             let open = *active_tab.read() == AdminTab::Integrity;
             let base = base.clone();
             let token = token.clone();
@@ -666,6 +670,15 @@ fn AdminPane(access_token: String, server_base: String, current_user_id: String)
                     if report.is_ok() {
                         queued_signal.set(Vec::new());
                         deep_queued_signal.set(Vec::new());
+                    }
+                    // Closing the tab re-runs this resource with `open` false,
+                    // which ends the loop; so does nothing being in progress.
+                    if crate::views::admin::deep_poll_wanted(&report) {
+                        spawn(async move {
+                            sleep_ms(DEEP_CHECK_POLL_MS).await;
+                            let n = *tick_signal.peek();
+                            tick_signal.set(n.wrapping_add(1));
+                        });
                     }
                     Some(report)
                 } else {
@@ -2080,6 +2093,9 @@ async fn recheck_damaged_file(base: &str, token: &str, media_id: &str) -> Result
 async fn recheck_damaged_file(_base: &str, _token: &str, _media_id: &str) -> Result<(), String> {
     Err("recheck_damaged_file is only wired in the web build".into())
 }
+
+/// How often the Damaged files tab re-loads while a deep check is in progress.
+const DEEP_CHECK_POLL_MS: u32 = 5_000;
 
 #[cfg(feature = "web")]
 async fn request_deep_check(base: &str, token: &str, media_id: &str) -> Result<(), String> {
