@@ -175,6 +175,24 @@ pub fn media_token_wait_ms(expires_at_ms: u64, now_ms: u64) -> u64 {
         .max(MEDIA_TOKEN_MIN_WAIT_MS)
 }
 
+/// How often the page's bridge passes a video's `timeupdate` on to Rust:
+/// each one re-renders the player, which costs the TV's CPU while it
+/// decodes video.
+pub const VIDEO_TICK_MS: u32 = 1000;
+
+/// How often it passes a song's on (B1030, V989): the karaoke wipe moves and
+/// the sung line changes on each, so once a second left a line up to a
+/// second late and the wipe stepping. The web's `timeupdate` comes about as
+/// often.
+pub const AUDIO_TICK_MS: u32 = 250;
+
+/// The bridge script `template` with its tick intervals filled in.
+pub fn bridge_script(template: &str) -> String {
+    template
+        .replace("__VIDEO_TICK_MS__", &VIDEO_TICK_MS.to_string())
+        .replace("__AUDIO_TICK_MS__", &AUDIO_TICK_MS.to_string())
+}
+
 /// The container list a TV build declares: one no file has, so the server
 /// never offers direct play (an empty list would mean "any"). A file played
 /// straight from the server cannot seek here: the Android WebView applies a
@@ -495,6 +513,18 @@ mod tests {
         // Inside the margin, or already expired: soon, but never at once.
         assert_eq!(media_token_wait_ms(2_000, 1_000), MEDIA_TOKEN_MIN_WAIT_MS);
         assert_eq!(media_token_wait_ms(0, 1_000), MEDIA_TOKEN_MIN_WAIT_MS);
+    }
+
+    #[test]
+    fn a_song_ticks_four_times_as_often_as_a_video() {
+        let script = bridge_script(
+            "const every = v instanceof HTMLVideoElement ? __VIDEO_TICK_MS__ : __AUDIO_TICK_MS__;",
+        );
+        assert_eq!(
+            script,
+            "const every = v instanceof HTMLVideoElement ? 1000 : 250;"
+        );
+        assert!(AUDIO_TICK_MS * 4 <= VIDEO_TICK_MS);
     }
 
     #[test]
