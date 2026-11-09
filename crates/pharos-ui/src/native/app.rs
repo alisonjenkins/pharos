@@ -4709,6 +4709,9 @@ fn Player(
     // The group's queue entry the countdown belongs to: a group moving to
     // another entry of the same item keeps this player, not its Cancel.
     let up_next_entry = use_hook(|| Rc::new(RefCell::new(String::new())));
+    // A new entry's countdown starts over only once the player has left the
+    // old end, so events from there cannot move the group on (B1027).
+    let up_next_reset = use_hook(|| Rc::new(Cell::new(false)));
     let advanced = use_hook(|| Rc::new(Cell::new(false)));
     // An ASS subtitle drawn from its script (ADR-0057), and the pick it is
     // for; its WebVTT stays on screen until the renderer is ready.
@@ -5407,7 +5410,7 @@ fn Player(
 
     let on_media = {
         let (advance, up_next_to) = (advance.clone(), Rc::clone(&up_next_to));
-        let up_next_entry = Rc::clone(&up_next_entry);
+        let (up_next_entry, up_next_reset) = (Rc::clone(&up_next_entry), Rc::clone(&up_next_reset));
         let (p, clock, last_ms, switched) = (
             Rc::clone(&p),
             Rc::clone(&clock),
@@ -5528,8 +5531,14 @@ fn Player(
                     up_next_entry.replace(entry.clone())
                 };
                 if !was.is_empty() && was != entry {
+                    up_next_reset.set(true);
+                }
+                let before_end = from.map_or(true, |f| state.position_ms < f.at_ms);
+                if up_next_reset.get() && before_end {
+                    up_next_reset.set(false);
                     platform::info(&format!(
-                        "pharos: up next: reset reason=group_entry from={was} to={entry}"
+                        "pharos: up next: reset reason=group_entry entry={entry} at={}ms",
+                        state.position_ms
                     ));
                     up_next.set(UpNext::default());
                 }
@@ -5542,17 +5551,21 @@ fn Player(
                     ));
                     up_next.write().cancel();
                 }
-                let step = up_next.write().step(state.position_ms, from, total);
-                if let Some(why) = up_next.peek().moves_on(step, event) {
-                    platform::info(&format!(
-                        "pharos: up next: playing {next} ({why}) at={}ms of={total}ms from={from:?}",
-                        state.position_ms
-                    ));
-                    advance(next);
-                    return;
-                }
-                if *up_next_step.peek() != step {
-                    up_next_step.set(step);
+                // Still at the old entry's end: the group has already moved
+                // on, so no countdown or end from there may move it again.
+                if !up_next_reset.get() {
+                    let step = up_next.write().step(state.position_ms, from, total);
+                    if let Some(why) = up_next.peek().moves_on(step, event) {
+                        platform::info(&format!(
+                            "pharos: up next: playing {next} ({why}) at={}ms of={total}ms from={from:?}",
+                            state.position_ms
+                        ));
+                        advance(next);
+                        return;
+                    }
+                    if *up_next_step.peek() != step {
+                        up_next_step.set(step);
+                    }
                 }
             }
             if event == MediaEvent::Changed && !burned {
