@@ -4751,24 +4751,460 @@ body:has(.pharos-stage.is-mini) .pharos-main {
     display: none;
   }
 }
-/* Admin > Duplicates: paths wrap, the short facts beside them do not. */
-.pharos-admin-duplicate-versions th {
+/* Manage (B921): the admin pages in the settings frame. */
+.pharos-manage .pharos-settings-link {
+  width: 100%;
+  border-top: 0;
+  border-right: 0;
+  border-bottom: 0;
+  background: none;
+  font: inherit;
+  font-size: 1.05rem;
   text-align: start;
+  cursor: pointer;
+}
+.pharos-manage .pharos-settings-link[aria-current="page"] {
+  background: var(--px-color-surface);
+}
+.pharos-manage-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
+}
+.pharos-manage-title {
+  display: grid;
+  gap: 0.35rem;
+  min-width: 0;
+}
+.pharos-manage-title .pharos-settings-lede {
+  margin: 0;
+}
+.pharos-manage-tools {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+.pharos-settings-page .pharos-danger {
+  border-color: color-mix(in srgb, var(--px-color-danger) 55%, var(--px-color-border));
+  color: var(--px-color-danger);
+}
+.pharos-settings-page .pharos-danger:hover {
+  background: color-mix(in srgb, var(--px-color-danger) 16%, var(--px-color-surface-raised));
+}
+.pharos-settings-page .pharos-danger.is-strong {
+  border-color: var(--px-color-danger);
+  background: var(--px-color-danger);
+  color: var(--px-color-bg);
+  font-weight: 600;
+}
+.pharos-settings-page button[type="submit"]:disabled,
+.pharos-settings-page button:disabled {
+  cursor: not-allowed;
+}
+
+/* The status line: what the last action did. */
+.pharos-admin-status {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.7rem 0.6rem 0.7rem 1rem;
+  border: var(--px-border) solid var(--px-color-border);
+  border-left: 3px solid var(--px-color-accent);
+  border-radius: var(--px-radius);
+  background: var(--px-color-surface);
+}
+.pharos-admin-status p {
+  margin: 0;
+}
+.pharos-settings-page .pharos-manage-dismiss {
+  /* A 44 px target: it is the only way to close the status line. */
+  min-width: 2.75rem;
+  min-height: 2.75rem;
+  padding: 0.1rem 0.55rem;
+  border: 0;
+  background: none;
+  color: var(--px-color-fg-muted);
+  font-size: 1.25rem;
+  line-height: 1;
+}
+
+.pharos-manage-count {
+  margin: 0;
+  color: var(--px-color-fg-muted);
+  font-size: var(--px-type-step--1);
+}
+.pharos-manage-strong {
+  color: var(--px-color-fg);
+  font-weight: 600;
+}
+.pharos-manage-when {
+  color: var(--px-color-fg-muted);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+/* Cards: users and libraries. */
+.pharos-manage-cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 19rem), 1fr));
+  align-items: start;
+  gap: 1rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.pharos-manage-card {
+  display: grid;
+  align-content: start;
+  gap: 0.9rem;
+  min-width: 0;
+  padding: 1.1rem 1.2rem;
+  border: var(--px-border) solid var(--px-color-border);
+  border-radius: calc(var(--px-radius) * 1.5);
+  background: var(--px-color-surface);
+}
+.pharos-manage-card h3 {
+  margin: 0;
+  font-size: 1.05rem;
+  overflow-wrap: anywhere;
+}
+.pharos-manage-card-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+.pharos-manage-user-head {
+  display: flex;
+  align-items: center;
+  gap: 0.85rem;
+  min-width: 0;
+}
+.pharos-manage-avatar {
+  display: grid;
+  flex: none;
+  place-items: center;
+  width: 2.75rem;
+  height: 2.75rem;
+  border-radius: 50%;
+  background: color-mix(in srgb, var(--px-color-accent) 22%, var(--px-color-surface-raised));
+  color: var(--px-color-fg);
+  font-size: 1rem;
+}
+.pharos-manage-user-who {
+  display: grid;
+  gap: 0.3rem;
+  min-width: 0;
+}
+.pharos-manage-badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+  margin: 0;
+}
+.pharos-manage-badge {
+  display: inline-block;
+  padding: 0.12rem 0.55rem;
+  border: var(--px-border) solid var(--px-color-border);
+  border-radius: 1rem;
+  color: var(--px-color-fg-muted);
+  font-size: 0.78rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+}
+.pharos-manage-badge.is-admin {
+  border-color: transparent;
+  background: color-mix(in srgb, var(--px-color-accent) 22%, transparent);
+  color: var(--px-color-fg);
+}
+.pharos-manage-badge.is-you {
+  border-color: var(--px-color-accent);
+  color: var(--px-color-accent);
+}
+.pharos-manage-badge[data-severity="error"],
+.pharos-manage-badge[data-severity="fatal"],
+.pharos-manage-badge[data-state="failed"] {
+  border-color: var(--px-color-danger);
+  color: var(--px-color-danger);
+}
+.pharos-manage-badge[data-severity="warn"],
+.pharos-manage-badge[data-severity="warning"] {
+  border-color: var(--px-color-warning);
+  color: var(--px-color-warning);
+}
+.pharos-manage-badge[data-state="running"] {
+  border-color: var(--px-color-success);
+  color: var(--px-color-success);
+}
+.pharos-manage-user-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.6rem 0;
+  border-top: var(--px-border) solid var(--px-color-border);
+  border-bottom: var(--px-border) solid var(--px-color-border);
+}
+.pharos-manage-card .pharos-setting-help {
+  margin: 0;
+}
+.pharos-manage-card-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+.pharos-manage-inline {
+  display: grid;
+  gap: 0.75rem;
+  padding: 0.9rem;
+  border-radius: var(--px-radius);
+  background: var(--px-color-bg);
+}
+.pharos-manage-inline p {
+  margin: 0;
+  line-height: 1.45;
+}
+.pharos-manage-confirm {
+  border: var(--px-border) solid color-mix(in srgb, var(--px-color-danger) 55%, var(--px-color-border));
+}
+.pharos-manage-inline-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 0.5rem;
+}
+.pharos-settings-page .pharos-manage-inline-actions button[type="submit"] {
+  justify-self: auto;
+}
+
+/* Forms: Add a user, Issue a key, Branding. */
+.pharos-manage-form-card {
+  gap: 1rem;
+  padding: 1.1rem 1.4rem 1.3rem;
+}
+.pharos-manage-form-card h3 {
+  margin: 0;
+  font-size: 1rem;
+}
+.pharos-manage-form {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 0.9rem;
+}
+.pharos-manage-form .pharos-manage-field {
+  flex: 1 1 13rem;
+}
+.pharos-manage-field {
+  display: grid;
+  gap: 0.35rem;
+  min-width: 0;
+  color: var(--px-color-fg-muted);
+  font-size: var(--px-type-step--1);
+}
+.pharos-manage-field > span {
+  color: var(--px-color-fg);
+  font-weight: 600;
+}
+.pharos-manage-field input,
+.pharos-manage-field textarea {
+  width: 100%;
+  font-size: 1rem;
+}
+.pharos-admin-branding-css {
+  font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+  font-size: 0.9rem;
+}
+.pharos-manage-form-help {
+  margin: 0;
+}
+
+/* Paths and rows. */
+.pharos-manage-paths {
+  display: grid;
+  gap: 0.35rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.pharos-manage-paths code,
+.pharos-manage-table code {
+  font-size: 0.85rem;
+  overflow-wrap: anywhere;
+  color: var(--px-color-fg-muted);
+}
+.pharos-manage-list {
+  display: grid;
+  margin: 0;
+  padding: 0;
+  border: var(--px-border) solid var(--px-color-border);
+  border-radius: calc(var(--px-radius) * 1.5);
+  background: var(--px-color-surface);
+  list-style: none;
+  overflow: hidden;
+}
+.pharos-manage-list-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.6rem 1rem;
+  padding: 0.85rem 1.2rem;
+}
+.pharos-manage-list-row + .pharos-manage-list-row {
+  border-top: var(--px-border) solid var(--px-color-border);
+}
+.pharos-manage-list-text {
+  display: grid;
+  flex: 1 1 14rem;
+  gap: 0.2rem;
+  min-width: 0;
+  color: var(--px-color-fg-muted);
+  font-size: var(--px-type-step--1);
+  overflow-wrap: anywhere;
+}
+.pharos-manage-list-text .pharos-manage-strong {
+  font-size: 1rem;
+}
+
+/* Tables scroll sideways on a phone rather than squeeze. */
+.pharos-manage-table-wrap {
+  overflow-x: auto;
+  border: var(--px-border) solid var(--px-color-border);
+  border-radius: calc(var(--px-radius) * 1.5);
+  background: var(--px-color-surface);
+}
+.pharos-manage-table {
+  width: 100%;
+  border-collapse: collapse;
+}
+.pharos-manage-table th,
+.pharos-manage-table td {
+  padding: 0.75rem 1rem;
+  text-align: start;
+  vertical-align: top;
+}
+.pharos-manage-table th {
+  color: var(--px-color-fg-muted);
+  font-size: 0.8rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+.pharos-manage-table tbody tr {
+  border-top: var(--px-border) solid var(--px-color-border);
+}
+.pharos-manage-table tbody tr:hover {
+  background: color-mix(in srgb, var(--px-color-fg) 4%, transparent);
+}
+
+.pharos-manage-secret {
+  display: grid;
+  gap: 0.6rem;
+  padding: 1rem 1.2rem;
+  border: var(--px-border) solid var(--px-color-success);
+  border-radius: calc(var(--px-radius) * 1.5);
+  background: color-mix(in srgb, var(--px-color-success) 10%, var(--px-color-surface));
+}
+.pharos-manage-secret p {
+  margin: 0;
+}
+.pharos-settings-page .pharos-manage-secret input {
+  width: 100%;
+  font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+}
+
+.pharos-manage-gate {
+  display: grid;
+  justify-items: start;
+  gap: 0.75rem;
+  max-width: 36rem;
+}
+.pharos-manage-gate h2 {
+  margin: 0;
+}
+
+/* A tab's cards, one above the other. */
+.pharos-manage-stack {
+  display: grid;
+  gap: 1rem;
+  min-width: 0;
+}
+
+/* Admin > Duplicates: one card per film; paths wrap, the short facts beside
+   them do not. */
+.pharos-admin-duplicates-summary,
+.pharos-admin-integrity-summary {
+  margin: 0;
+  color: var(--px-color-fg-muted);
+}
+.pharos-admin-duplicate,
+.pharos-admin-integrity-file,
+.pharos-admin-integrity-deep-check {
+  display: grid;
+  gap: 0.35rem;
+  min-width: 0;
+  padding: 1rem 1.2rem;
+  border: var(--px-border) solid var(--px-color-border);
+  border-radius: calc(var(--px-radius) * 1.5);
+  background: var(--px-color-surface);
+}
+.pharos-admin-duplicate h4,
+.pharos-admin-integrity-file h4,
+.pharos-admin-integrity-deep-check h5 {
+  margin: 0;
+  font-size: 1rem;
+  overflow-wrap: anywhere;
+}
+.pharos-admin-duplicate-year,
+.pharos-admin-duplicate-match {
+  color: var(--px-color-fg-muted);
+}
+.pharos-admin-duplicate-match {
+  margin: 0;
+  font-size: var(--px-type-step--1);
+}
+.pharos-admin-duplicate-versions {
+  display: block;
+  overflow-x: auto;
+  margin-top: 0.4rem;
+  border-collapse: collapse;
+}
+.pharos-admin-duplicate-versions th,
+.pharos-admin-duplicate-versions td {
+  padding: 0.45rem 0.9rem 0.45rem 0;
+  text-align: start;
+  vertical-align: top;
+}
+.pharos-admin-duplicate-versions th {
+  color: var(--px-color-fg-muted);
+  font-size: 0.78rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+.pharos-admin-duplicate-versions tbody tr {
+  border-top: var(--px-border) solid var(--px-color-border);
 }
 .pharos-admin-duplicate-versions td:not(.pharos-admin-duplicate-path) {
   white-space: nowrap;
 }
 .pharos-admin-duplicate-versions td.pharos-admin-duplicate-path {
+  min-width: 14rem;
   overflow-wrap: anywhere;
+  font-size: 0.9rem;
 }
 
-/* Admin > Damaged files: one block per file; long paths wrap. */
-.pharos-admin-integrity-file {
-  padding: 0.75rem 0;
-  border-bottom: 1px solid var(--px-color-border);
+/* Admin > Damaged files: one card per file; long paths wrap. */
+.pharos-admin-integrity-file[data-verdict] {
+  border-left: 3px solid var(--px-color-danger);
 }
-.pharos-admin-integrity-file h4 {
-  margin: 0 0 0.25rem;
+.pharos-admin-integrity-verdict {
+  margin: 0;
+  font-weight: 600;
 }
 .pharos-admin-integrity-kind,
 .pharos-admin-integrity-fault,
@@ -4776,43 +5212,109 @@ body:has(.pharos-stage.is-mini) .pharos-main {
 .pharos-admin-integrity-checked {
   color: var(--px-color-fg-muted);
 }
+.pharos-admin-integrity-kind {
+  font-weight: 400;
+}
 .pharos-admin-integrity-fault,
 .pharos-admin-integrity-path,
 .pharos-admin-integrity-checked {
-  margin: 0.125rem 0;
-  font-size: 0.85em;
+  margin: 0;
+  font-size: var(--px-type-step--1);
 }
 .pharos-admin-integrity-path {
   overflow-wrap: anywhere;
+  font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
 }
-.pharos-admin-integrity-deep {
-  margin-left: 0.5rem;
+.pharos-admin-integrity-file .pharos-manage-card-actions {
+  margin-top: 0.4rem;
 }
 .pharos-admin-integrity-deep-checks {
-  margin-top: 1.5rem;
+  display: grid;
+  gap: 0.9rem;
+  margin-top: 1rem;
 }
-.pharos-admin-integrity-deep-check {
-  padding: 0.5rem 0;
-  border-bottom: 1px solid var(--px-color-border);
+.pharos-admin-integrity-deep-checks > h4 {
+  margin: 0;
+  font-size: 1.1rem;
 }
-.pharos-admin-integrity-deep-check h5 {
-  margin: 0 0 0.25rem;
+.pharos-admin-integrity-deep-check[data-state="damaged"],
+.pharos-admin-integrity-deep-check[data-state="failed"] {
+  border-left: 3px solid var(--px-color-danger);
+}
+.pharos-admin-integrity-deep-check[data-state="clean"] {
+  border-left: 3px solid var(--px-color-success);
+}
+.pharos-admin-integrity-deep-check p {
+  margin: 0;
 }
 .pharos-admin-integrity-deep-empty {
+  margin: 0;
   color: var(--px-color-fg-muted);
 }
+.pharos-admin-integrity-deep-search {
+  display: grid;
+  gap: 0.5rem;
+  padding: 1rem 1.2rem;
+  border: var(--px-border) solid var(--px-color-border);
+  border-radius: calc(var(--px-radius) * 1.5);
+  background: var(--px-color-surface);
+}
 .pharos-admin-integrity-deep-search label {
-  display: flex;
-  flex-direction: column;
-  gap: 0.25rem;
+  display: grid;
+  gap: 0.35rem;
+  font-weight: 600;
+}
+.pharos-admin-integrity-deep-search input[type="search"] {
+  box-sizing: border-box;
+  width: 100%;
+  max-width: 28rem;
+  padding: 0.6rem 0.8rem;
+  border: var(--px-border) solid var(--px-color-border);
+  border-radius: var(--px-radius);
+  background: var(--px-color-bg);
+  color: var(--px-color-fg);
+  font: inherit;
+  font-weight: 400;
 }
 .pharos-admin-integrity-deep-hits {
-  list-style: none;
-  margin: 0.5rem 0;
+  display: grid;
+  gap: 0.25rem;
+  margin: 0;
   padding: 0;
+  list-style: none;
 }
 .pharos-admin-integrity-deep-hit {
-  padding: 0.25rem 0;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.25rem 0.5rem;
+  padding: 0.35rem 0;
+}
+.pharos-admin-integrity-deep-hit .pharos-admin-integrity-deep {
+  margin-inline-start: auto;
+}
+
+@media (max-width: 48rem) {
+  .pharos-manage .pharos-settings-link {
+    width: auto;
+    border-bottom: 3px solid transparent;
+    font-size: 0.95rem;
+    padding: 0.6rem 0.8rem;
+  }
+  .pharos-manage .pharos-settings-link[aria-current="page"] {
+    border-bottom-color: var(--px-color-accent);
+  }
+}
+@media (max-width: 40rem) {
+  .pharos-manage-card,
+  .pharos-manage-list-row,
+  .pharos-admin-duplicate,
+  .pharos-admin-integrity-file {
+    padding: 0.9rem 1rem;
+  }
+  .pharos-manage-form > button {
+    flex: 1 1 100%;
+  }
 }
 
 /* What's new (spec 027): a dialog over the page after sign-in, never while
