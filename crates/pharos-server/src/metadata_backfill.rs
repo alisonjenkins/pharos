@@ -1892,8 +1892,11 @@ where
                 continue;
             }
         }
+        let rows = store.series_episodes(&cand.series_key).await?;
         if m.match_source.as_deref() == Some("search") {
-            let reason = show_conflict(store, providers, bg_io, cfg, cand, m, provider).await?;
+            let stated = stated_year(cand, &rows);
+            let reason =
+                show_conflict(store, providers, bg_io, cfg, cand, stated, m, provider).await?;
             if let Some(reason) = reason {
                 tracing::info!(
                     series_key = %cand.series_key,
@@ -1905,7 +1908,6 @@ where
                 survey.reask.insert(cand.series_key.clone(), reason);
             }
         }
-        let rows = store.series_episodes(&cand.series_key).await?;
         let mut picked = 0usize;
         for row in &rows {
             let own_search = row.match_source.as_deref() == Some("search")
@@ -2196,13 +2198,32 @@ async fn title_moves<E: OnlineEnricher>(
     }))
 }
 
+/// The show year a show's own episode files state (V893), when they agree on
+/// one; else the stored year. The stored column is written by the scan's
+/// split pass, which may not have run (or, in a dry run, written) before the
+/// survey reaches the show (B980).
+fn stated_year(cand: &SeriesMatchCandidate, rows: &[pharos_core::SeriesEpisodeRow]) -> Option<u32> {
+    let years: std::collections::BTreeSet<u32> = rows
+        .iter()
+        .filter_map(|r| {
+            pharos_scanner::series_split::stated_show_year(std::path::Path::new(&r.path))
+        })
+        .collect();
+    match years.len() {
+        1 => years.into_iter().next(),
+        _ => cand.series_year,
+    }
+}
+
 /// Why a searched show's stored match conflicts with its evidence, if it does.
+#[allow(clippy::too_many_arguments)]
 async fn show_conflict<Tv, Tm, S>(
     store: &S,
     providers: &SeriesProviders<'_, Tv, Tm>,
     bg_io: &Arc<Semaphore>,
     cfg: &MetadataConfig,
     cand: &SeriesMatchCandidate,
+    stated: Option<u32>,
     stored: &SeriesMetadata,
     provider: &str,
 ) -> DomainResult<Option<RepairReason>>
@@ -2224,7 +2245,7 @@ where
         return Ok(Some(RepairReason::Split));
     }
     let premiered = stored.premiere_date.and_then(pharos_store_sqlx::unix_year);
-    if let (Some(stated), Some(premiered)) = (cand.series_year, premiered) {
+    if let (Some(stated), Some(premiered)) = (stated, premiered) {
         if stated.abs_diff(premiered) > 1 {
             return Ok(Some(RepairReason::YearMismatch));
         }
@@ -2232,29 +2253,13 @@ where
     let decision = match provider {
         "tvdb" => match providers.tvdb {
             Some(t) => Some(
-                search_decide(
-                    t,
-                    MediaKind::Episode,
-                    &cand.series_name,
-                    cand.series_year,
-                    bg_io,
-                    cfg,
-                )
-                .await,
+                search_decide(t, MediaKind::Episode, &cand.series_name, stated, bg_io, cfg).await,
             ),
             None => None,
         },
         "tmdb" => match providers.tmdb {
             Some(t) => Some(
-                search_decide(
-                    t,
-                    MediaKind::Episode,
-                    &cand.series_name,
-                    cand.series_year,
-                    bg_io,
-                    cfg,
-                )
-                .await,
+                search_decide(t, MediaKind::Episode, &cand.series_name, stated, bg_io, cfg).await,
             ),
             None => None,
         },
@@ -6492,6 +6497,53 @@ mod tests {
         let mut pending = pending_ids(&s).await;
         pending.sort_unstable();
         assert_eq!(pending, [1, 2]);
+    }
+
+    /// B980: a bare folder whose files state `Battlestar Galactica (2003)`
+    /// but whose rows hold no stored year yet (the scan's split pass has not
+    /// written it) is still re-asked when its match premiered in 1978.
+    #[tokio::test]
+    async fn the_survey_reads_a_shows_year_from_its_files_not_the_stored_column() {
+        let (logs, _log) = log_capture();
+        let s = store().await;
+        for (id, ep) in [(1u64, 1u32), (2, 2)] {
+            put_titled_episode(&s, id, BSG, (1, ep), "Part").await;
+            let mut item = s.get(id).await.unwrap();
+            item.path =
+                format!("{BSG}/Season 1/Battlestar Galactica (2003) - S01E{ep:02} - Part {ep}.mkv")
+                    .into();
+            s.put(item).await.unwrap();
+        }
+        assert_eq!(
+            s.series_needing_match(10, i64::MAX).await.unwrap()[0].series_year,
+            None,
+            "the stored column is empty"
+        );
+        pin(&s, BSG, "71173", NOW).await;
+        let mut row = series_row(&s, BSG).await;
+        // 1978-09-17
+        row.premiere_date = Some(274_838_400);
+        s.upsert_series_metadata(row).await.unwrap();
+        set_version(&s, TV_MATCH_VERSION_KEY, "1").await;
+        // No exact-name rival: the 2003 show is titled with its year.
+        let tvdb = FakeEnricher::tvdb()
+            .with_search(vec![
+                ("71173", "Battlestar Galactica", Some(1978)),
+                ("73545", "Battlestar Galactica (2003)", Some(2003)),
+            ])
+            .with_detail(enriched_overview("A rag-tag fleet."));
+
+        gate(&s, &tvdb, &MetadataConfig::default()).await;
+
+        let text = logs.text();
+        let survey = text
+            .lines()
+            .find(|l| l.contains("series identity repair: survey"))
+            .unwrap_or_else(|| panic!("no survey line in {text}"));
+        assert!(
+            survey.contains("Battlestar Galactica:year_mismatch"),
+            "{survey}"
+        );
     }
 
     const FLASH: &str = "/tv/The Flash";
