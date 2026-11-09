@@ -56,6 +56,10 @@ pub struct Entry {
     /// know where the damage starts and what the demuxer called it, and this
     /// file is the only place that survives the scan.
     pub report: IntegrityReport,
+    /// When the scan ran, in unix seconds. Absent on entries written before
+    /// this field existed; those stay valid rather than forcing a re-read.
+    #[serde(default)]
+    pub checked_at: Option<i64>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -130,9 +134,19 @@ impl IntegrityMemo {
                     mtime,
                     size,
                     report,
+                    checked_at: now_secs(),
                 },
             );
         }
+    }
+
+    /// Whether any verdict is recorded for this id, whatever state the file
+    /// was in. For progress counts, where a `stat` per file is too dear.
+    pub fn has(&self, id: u64) -> bool {
+        self.doc
+            .read()
+            .map(|d| d.entries.contains_key(&id))
+            .unwrap_or(false)
     }
 
     /// Every file currently recorded as damaged, newest verdict wins. This is
@@ -180,6 +194,13 @@ impl IntegrityMemo {
     pub fn path(&self) -> &Path {
         &self.path
     }
+}
+
+fn now_secs() -> Option<i64> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|d| i64::try_from(d.as_secs()).ok())
 }
 
 #[cfg(test)]
@@ -284,6 +305,30 @@ mod tests {
             "a newer scan version must re-read every file"
         );
         assert!(newer.is_empty());
+    }
+
+    #[test]
+    fn a_verdict_records_when_it_was_made() {
+        let memo = IntegrityMemo::load("/nonexistent/memo.json", 1);
+        memo.record(1, Some((100, 500)), clean());
+        let at = memo.get(1, Some((100, 500))).unwrap().checked_at.unwrap();
+        assert!(at > 1_700_000_000, "a real clock reading: {at}");
+    }
+
+    /// Memos on disk today carry no `checked_at`. They must load as they are:
+    /// failing to parse would discard every verdict and re-read the library.
+    #[test]
+    fn a_memo_written_before_checked_at_still_loads() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("integrity.json");
+        std::fs::write(
+            &path,
+            r#"{"integrity_scan_version":1,"entries":{"7":{"mtime":1,"size":2,"report":{"packets":3,"corrupt_packets":0,"read_errors":0,"demux_errors":0,"first_fault_ms":null,"first_fault":null,"scanned_ms":4,"declared_ms":null,"complete":true}}}}"#,
+        )
+        .unwrap();
+        let memo = IntegrityMemo::load(&path, 1);
+        let e = memo.get(7, Some((1, 2))).expect("old entry survives");
+        assert_eq!(e.checked_at, None);
     }
 
     #[test]
