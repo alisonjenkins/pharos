@@ -280,6 +280,34 @@ impl<P: Prober> std::fmt::Debug for FsScanner<P> {
     }
 }
 
+/// Spec 033 (V940) — reset an episode's provider-derived fields (title,
+/// overview, premiere date, community rating, provider ids) to what local
+/// evidence alone says: the default resolver (NFO ▸ sidecar ▸ filename) over
+/// its file, as a scan reads it, so an enrichment that only fills empty
+/// fields starts from local data again. Probe data, linked entities (genres,
+/// people) and artwork are left as stored. Reads files: call it off the
+/// async reactor.
+pub async fn reset_to_local_metadata(item: &mut MediaItem) {
+    let meta = {
+        let req = MetadataRequest {
+            path: &item.path,
+            kind: item.kind,
+            probe: &item.probe,
+            series: item.series.as_ref(),
+        };
+        default_resolver().resolve(&req).await
+    };
+    if let Some(stem) = item.path.file_stem().and_then(|s| s.to_str()) {
+        item.title = stem.to_string();
+    }
+    let md = &mut item.metadata;
+    md.overview = None;
+    md.premiere_date = None;
+    md.community_rating = None;
+    md.provider_ids = pharos_core::ProviderIds::default();
+    let _ = merge_metadata_into_item(item, meta);
+}
+
 /// LIB-D7 — the default local-first provider set wired into every
 /// production scanner: the Kodi NFO reader (highest priority — a
 /// user-curated `.nfo` wins), sidecar artwork detection, embedded
@@ -3833,6 +3861,62 @@ async fn walk(root: PathBuf, exts: HashSet<String>) -> DomainResult<WalkOutcome>
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    /// Spec 033 (V940) — a reset drops what an enrichment wrote and keeps
+    /// what the files say.
+    #[tokio::test]
+    async fn reset_to_local_metadata_keeps_the_files_and_drops_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        let show = dir.path().join("Cosmos");
+        std::fs::create_dir_all(&show).unwrap();
+        let with_nfo = show.join("Cosmos - S01E01.mkv");
+        std::fs::write(&with_nfo, b"").unwrap();
+        std::fs::write(
+            show.join("Cosmos - S01E01.nfo"),
+            "<episodedetails><title>The Shores of the Cosmic Ocean</title>\
+             <showtitle>Cosmos</showtitle><plot>Sagan.</plot></episodedetails>",
+        )
+        .unwrap();
+        let stale = |path: &std::path::Path| {
+            let mut item = MediaItem {
+                path: path.to_path_buf(),
+                title: "Standing Up in the Milky Way".into(),
+                kind: MediaKind::Episode,
+                series: Some(SeriesInfo {
+                    series_name: "Cosmos".into(),
+                    season_number: Some(1),
+                    episode_number: Some(1),
+                    series_folder: Some(show.to_string_lossy().into_owned()),
+                    series_year: None,
+                    series_key: None,
+                }),
+                ..MediaItem::default()
+            };
+            item.metadata.overview = Some("Tyson.".into());
+            item.metadata.premiere_date = Some(1_394_323_200);
+            item.metadata.community_rating = Some(9.1);
+            item.metadata.provider_ids.tvdb = Some("4847410".into());
+            item
+        };
+        let mut item = stale(&with_nfo);
+        reset_to_local_metadata(&mut item).await;
+        assert_eq!(item.title, "The Shores of the Cosmic Ocean");
+        assert_eq!(item.metadata.overview.as_deref(), Some("Sagan."));
+        assert_eq!(item.metadata.premiere_date, None);
+        assert_eq!(item.metadata.community_rating, None);
+        assert_eq!(
+            item.metadata.provider_ids,
+            pharos_core::ProviderIds::default()
+        );
+
+        let bare = show.join("Cosmos - S01E02 - One Voice in the Cosmic Fugue.mkv");
+        std::fs::write(&bare, b"").unwrap();
+        let mut item = stale(&bare);
+        reset_to_local_metadata(&mut item).await;
+        assert_ne!(item.title, "Standing Up in the Milky Way");
+        assert_eq!(item.metadata.overview, None);
+        assert_eq!(item.metadata.provider_ids.tvdb, None);
+    }
 
     use super::*;
     use pharos_core::{MediaId, MediaKind, ProbeInfo, ScanState};
