@@ -894,13 +894,22 @@ pub(crate) async fn resolve_synth_image_item(
     match state.synth_image_cached(id_str) {
         Some(Some(item_id)) => match state.stores.get(item_id).await {
             Ok(item) => return Some(item),
-            Err(pharos_core::DomainError::NotFound(_)) => state.synth_image_forget(id_str, item_id),
+            Err(pharos_core::DomainError::NotFound(_)) => {
+                state.synth_image_forget(id_str, item_id);
+                stale = Some(item_id);
+            }
             Err(_) => return None,
         },
         Some(None) => return None,
         None => {}
     }
-    let all = state.list_items_fresh().await.ok()?;
+    // The cached list can still hold a row a scan just swept, within one
+    // library generation, so a re-pick reads the store.
+    let all = if stale.is_some() {
+        std::sync::Arc::new(state.stores.list().await.ok()?)
+    } else {
+        state.list_items_fresh().await.ok()?
+    };
     build_synth_image_map(state, &all);
     if let Some(Some(item_id)) = state.synth_image_cached(id_str) {
         return all.iter().find(|it| it.id == item_id).cloned();
@@ -2354,6 +2363,49 @@ mod tests {
             .expect("a show whose memoised episode was folded keeps a poster");
         assert_eq!(tags.get("Primary").map(String::as_str), Some("602"));
         assert_eq!(state.synth_image_cached(&synth), Some(Some(602)));
+    }
+
+    #[actix_web::test]
+    async fn a_re_pick_never_reads_a_cached_list_holding_the_swept_row() {
+        // B1000 — the item-list cache can hold a swept row until the library
+        // generation moves, so a re-pick from it chose the same gone row.
+        use crate::api::jellyfin::dto::series_id_for_key;
+        use pharos_core::{MediaItem, MediaKind, MediaStore, SeriesInfo};
+        let cache_dir = tempfile::tempdir().unwrap();
+        let state = seed_state_with_cache(cache_dir.path()).await;
+        let episode = |id: u64, n: u32| MediaItem {
+            id,
+            path: format!("/tv/Bones/Season 01/Bones S01E0{n}.mkv").into(),
+            title: format!("Bones S01E0{n}"),
+            kind: MediaKind::Episode,
+            series: Some(SeriesInfo {
+                series_name: "Bones".into(),
+                season_number: Some(1),
+                episode_number: Some(n),
+                series_folder: Some("/tv/Bones".into()),
+                series_year: None,
+            }),
+            ..Default::default()
+        };
+        state.stores.put(episode(701, 1)).await.unwrap();
+        state.stores.put(episode(702, 2)).await.unwrap();
+        let synth = series_id_for_key(Some("/tv/Bones"), "Bones");
+        let warmed = synth_primary_tag(&state, &synth).await.unwrap();
+        assert_eq!(warmed.get("Primary").map(String::as_str), Some("701"));
+
+        let scan = state
+            .stores
+            .begin_scan(std::path::Path::new("/tv"))
+            .await
+            .unwrap();
+        state.stores.mark_seen(702, scan, 0, 0).await.unwrap();
+        let swept = state.stores.sweep_unseen(scan, "/tv").await.unwrap();
+        assert_eq!(swept, vec![701]);
+
+        let tags = synth_primary_tag(&state, &synth)
+            .await
+            .expect("the show keeps a poster after its representative is swept");
+        assert_eq!(tags.get("Primary").map(String::as_str), Some("702"));
     }
 
     #[actix_web::test]
