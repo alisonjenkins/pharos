@@ -20,7 +20,7 @@ runs before each push (CLAUDE.md).
 
 ## Phase 1: shared dispatch (server, no behaviour change)
 
-- [ ] T001 Move `dispatch_checked`, `recover_and_apply`, the `SyncPlayAccess`
+- [x] T001 (done: ff69a5d4, 16dd2623) Move `dispatch_checked`, `recover_and_apply`, the `SyncPlayAccess`
   guard and the V201 visibility checks (`may_join`, `may_see_queue`,
   `may_queue`, with their `pharos_syncplay_group_hidden_total` counting) out of `crates/pharos-server/src/api/jellyfin/syncplay.rs` into a
   surface-neutral module (`crates/pharos-server/src/group_ops.rs`) taking a
@@ -29,53 +29,53 @@ runs before each push (CLAUDE.md).
 
 ## Phase 2: native `Group` interface (server)
 
-- [ ] T010 Schema: append `Session.group`, `Group`, `Membership`, `GroupSink`,
+- [x] T010 (done: f39427e2) Schema: append `Session.group`, `Group`, `Membership`, `GroupSink`,
   `GroupUpdate`, the result structs and the three `EventKind` additions from
   plan.md §Contract (with the kind→label match in `rpc/telemetry.rs` and 016
   `contracts/events.md`) to
   `crates/pharos-api/schema/pharos.capnp` and its copy in
   `specs/017-native-api/contracts/`; bump `schemaVersion` to 6. Schema-compat
   test (017 FR-009) passes.
-- [ ] T011 [US1] `crates/pharos-server/src/api/pharos/rpc/group.rs`: `list`
+- [x] T011 (done: 8f39eca5) [US1] `crates/pharos-server/src/api/pharos/rpc/group.rs`: `list`
   and `clock`, plus the `Session.group` getter. `it_rpc/group.rs`: list shows
   a group a Jellyfin client made; `clock` answers the server time; a user
   without `SyncPlayAccess` is refused `notPermitted`; a user who may not see
   an item in a group's queue does not see the group in `list` and cannot
   `join` it, and `pharos_syncplay_group_hidden_total` counts both (V201).
-- [ ] T012 [US1] `create` and `join`: register the member in `SessionHub`
+- [x] T012 (done: f9affdd6) [US1] `create` and `join`: register the member in `SessionHub`
   under `ctx.device`, pump its `ServerMsg` stream into the `GroupSink`; no
   device answers `invalid{ctx.device}`. Test: native A creates, native B joins,
   B's sink sees `joined` then A as a member.
-- [ ] T013 [US1] `Membership` commands map to `GroupMsg` through T001's path.
+- [x] T013 (done: 16dd2623) [US1] `Membership` commands map to `GroupMsg` through T001's path.
   Tests: A pauses, B's sink gets `pause` with A's position; a Jellyfin member
   in the same group gets a `SyncPlayCommand` for it (V20); `leave` ends with
   `ended{left}`; joining a dissolved group answers `notFound`, never a new
   group (spec edge case). `ping` refreshes the member past the 150 s ghost
   TTL; `clockReport` reaches `ObserveClock`; a stale `playlistItemId` on
   `ready` is ignored as for a Jellyfin member (B37).
-- [ ] T014 [US2] Buffering and member updates reach the sink (`member` with
+- [x] T014 (done: b3af639f, f906029c) [US2] Buffering and member updates reach the sink (`member` with
   `buffering`), and dropping `Membership` is a socket loss, not a leave (V65).
 
 ## Phase 3: pharos-ui
 
-- [ ] T020 [P] `pharos-client` wrappers for `Group` and `Membership`, and a
+- [x] T020 (done: c9a0558d) [P] `pharos-client` wrappers for `Group` and `Membership`, and a
   `GroupSink` server whose updates land on a channel.
-- [ ] T021 [P] Clock sync: median-of-9 offset from `clock` round trips; pure
+- [x] T021 (done: 7a7b62e2) [P] Clock sync: median-of-9 offset from `clock` round trips; pure
   function with unit tests.
-- [ ] T022 Drift policy (plan.md clarification 8) as a pure function from
+- [x] T022 (done: 113c011c) Drift policy (plan.md clarification 8) as a pure function from
   expected and actual position to `Hold | Rate(f64) | Seek(ms)`, unit tested
   at each threshold.
-- [ ] T023 [US1] "Watch together" on the detail page creates a group and opens
+- [x] T023 (done: 11f46ccd) [US1] "Watch together" on the detail page creates a group and opens
   the watch page in group mode; `/together` lists groups; `/together/{id}`
   joins, or shows "This group has ended".
-- [ ] T024 [US2] Member strip on the watch page overlay: names, who is
+- [x] T024 (done: 11f46ccd) [US2] Member strip on the watch page overlay: names, who is
   buffering, a Leave button. Player controls send group commands while joined.
 - [x] T025 FR-005: the group store reports `groupDrift`, `groupHardSeek` and
   `groupWait` (kinds added in T010); test names the disarm.
 - [x] T026 [US1] Two-browser Playwright test on `sync-oracle.ts`: A creates,
   B opens the invite link, both play in sync, A pauses and B pauses, A seeks
   and B converges. The player's `<video>` carries `data-item-id`.
-- [ ] T028 [US1] Mixed group in Playwright: a pharos-ui browser and a
+- [x] T028 (done: 9f4bacbf) [US1] Mixed group in Playwright: a pharos-ui browser and a
   jellyfin-web browser in one group (either creates), held in sync by
   `sync-oracle.ts` through play, pause and seek (V20).
 - [ ] T029 SC-001: `just compat-syncplay` gains a pharos-ui member and holds
@@ -150,3 +150,5 @@ runs before each push (CLAUDE.md).
   (B761, V711). Playwright, direct, hls.js and Rust HLS engines in Chromium
   and Firefox: no seeking, waiting or pause event in the 6 s after Watch
   together.
+
+<!-- audited 2026-11-09: T027 open (views/group.rs stub still present, not marked superseded); T029 open (compat-syncplay has no pharos-ui member; no 10-minute mixed run) -->
