@@ -64,6 +64,19 @@ pub fn scan_integrity(src: &Path) -> Result<IntegrityReport, FrameError> {
         (d > 0).then(|| (d as i128 * 1000 / ffmpeg::ffi::AV_TIME_BASE as i128) as u64)
     };
 
+    // Positions are reported on the player's timeline, which starts at the
+    // container's first timestamp. MPEG-TS rips rarely start at 0, and a span
+    // left in raw pts would be marked minutes away from the damage.
+    let origin_ms = {
+        // SAFETY: `ictx` owns a live, opened format context.
+        let st = unsafe { (*ictx.as_ptr()).start_time };
+        if st == ffmpeg::ffi::AV_NOPTS_VALUE || st <= 0 {
+            0
+        } else {
+            (st as i128 * 1000 / ffmpeg::ffi::AV_TIME_BASE as i128) as u64
+        }
+    };
+
     let capture = super::logbridge::ErrorCapture::open();
     let mut report = IntegrityReport {
         declared_ms,
@@ -91,7 +104,7 @@ pub fn scan_integrity(src: &Path) -> Result<IntegrityReport, FrameError> {
                     .and_then(|ts| {
                         time_bases
                             .get(stream.index())
-                            .map(|&(num, den)| to_ms(ts, num, den))
+                            .map(|&(num, den)| to_ms(ts, num, den).saturating_sub(origin_ms))
                     })
                     .unwrap_or(report.scanned_ms);
                 report.scanned_ms = report.scanned_ms.max(pos_ms);

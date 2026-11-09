@@ -209,3 +209,55 @@ fn a_wholly_shredded_body_terminates_rather_than_spinning() {
         "scan took {elapsed:?} — the read-error bounds are not stopping it"
     );
 }
+
+/// MPEG-TS starts its clock well past zero (1.4 s by default, often hours on
+/// a broadcast rip). Spans are on the player's timeline, so a hole halfway
+/// through a 20 s file is marked near 10 s, not near 10 s plus the offset.
+#[test]
+fn spans_are_on_the_players_timeline_for_a_container_that_starts_late() {
+    if !ffmpeg_available() {
+        eprintln!("skipping: ffmpeg not on PATH");
+        return;
+    }
+    let dir = tempfile::tempdir().expect("tempdir");
+    let input = dir.path().join("late.ts");
+    let status = Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=duration=20:size=320x240:rate=25",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-g",
+            "25",
+            "-output_ts_offset",
+            "600",
+        ])
+        .arg(&input)
+        .status()
+        .expect("spawn ffmpeg fixture");
+    assert!(status.success(), "fixture generation failed");
+    punch_hole(&input, 64 * 1024);
+
+    let report = pharos_transcode::libav::integrity::scan_integrity(&input).expect("scan ok");
+    let first = report
+        .ranges
+        .as_ref()
+        .and_then(|r| r.first().copied())
+        .unwrap_or_else(|| panic!("a hole in a TS body must leave a span: {report:?}"));
+    assert!(
+        (4_000..=16_000).contains(&first.start_ms),
+        "the hole is near the middle of 20 s, not at the raw 600 s clock: {report:?}"
+    );
+    assert!(
+        report.scanned_ms <= 21_000,
+        "scanned_ms is on the same timeline: {report:?}"
+    );
+}
