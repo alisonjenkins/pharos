@@ -797,6 +797,7 @@ pub fn PaletteView(
     on_key: EventHandler<KeyboardEvent>,
     on_pick: EventHandler<()>,
     on_close: EventHandler<()>,
+    on_command: EventHandler<super::palette::Command>,
 ) -> Element {
     let active_id = active.map(|at| option_id("palette", at));
     use_modal_hold(".pharos-palette");
@@ -879,6 +880,21 @@ pub fn PaletteView(
                                                 }
                                             }
                                         }
+                                        Row::Command(command) => rsx! {
+                                            // Runs in place: the list's click would only close it.
+                                            button {
+                                                class: "pharos-search-hit pharos-palette-again",
+                                                r#type: "button",
+                                                onclick: move |evt: MouseEvent| {
+                                                    evt.stop_propagation();
+                                                    on_command.call(command);
+                                                },
+                                                span { class: "pharos-search-text",
+                                                    span { class: "pharos-search-name", "{command.label()}" }
+                                                    span { class: "pharos-muted", "{command.detail()}" }
+                                                }
+                                            }
+                                        },
                                         Row::Recent(item) | Row::Title(item) => rsx! { SearchHit { item: item.clone() } },
                                     }
                                 }
@@ -2119,6 +2135,7 @@ mod tests {
                     on_key: |_| {},
                     on_pick: |_| {},
                     on_close: |_| {},
+                    on_command: |_| {},
                 }
             }
         });
@@ -2150,6 +2167,7 @@ mod tests {
                         on_key: |_| {},
                         on_pick: |_| {},
                         on_close: |_| {},
+                        on_command: |_| {},
                     }
                 }
             })
@@ -2179,6 +2197,7 @@ mod tests {
                     on_key: |_| {},
                     on_pick: |_| {},
                     on_close: |_| {},
+                    on_command: |_| {},
                 }
             }
         });

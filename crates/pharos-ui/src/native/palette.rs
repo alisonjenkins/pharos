@@ -23,10 +23,34 @@ pub struct Place {
     pub route: Route,
 }
 
+/// A command the palette runs rather than a screen it opens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Command {
+    ReportProblem,
+}
+
+impl Command {
+    pub fn label(self) -> &'static str {
+        match self {
+            Command::ReportProblem => "Report a problem",
+        }
+    }
+
+    pub fn detail(self) -> &'static str {
+        match self {
+            Command::ReportProblem => "Shows what would be sent first",
+        }
+    }
+}
+
+/// Every command, in the order the palette lists them.
+pub const COMMANDS: &[Command] = &[Command::ReportProblem];
+
 /// One row of the palette, in the group it is listed under.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Row {
     Place(Place),
+    Command(Command),
     /// A term searched for before; picking it searches again.
     Search(String),
     /// Something the user was part way through.
@@ -40,7 +64,7 @@ impl Row {
     pub fn route(&self) -> Option<Route> {
         match self {
             Row::Place(place) => Some(place.route.clone()),
-            Row::Search(_) => None,
+            Row::Search(_) | Row::Command(_) => None,
             Row::Recent(item) | Row::Title(item) => Some(open_route(item)),
         }
     }
@@ -48,6 +72,7 @@ impl Row {
     pub fn group(&self) -> &'static str {
         match self {
             Row::Place(_) => "Go to",
+            Row::Command(_) => "Actions",
             Row::Search(_) => "Recent searches",
             Row::Recent(_) => "Continue",
             Row::Title(_) => "Titles",
@@ -110,6 +135,7 @@ pub fn rows(
             .cloned()
             .map(Row::Search)
             .chain(places.iter().cloned().map(Row::Place))
+            .chain(COMMANDS.iter().copied().map(Row::Command))
             .chain(recent.iter().take(RECENT_LIMIT).cloned().map(Row::Recent))
             .collect();
     }
@@ -118,6 +144,13 @@ pub fn rows(
         .filter(|place| place.label.to_lowercase().contains(&term))
         .cloned()
         .map(Row::Place)
+        .chain(
+            COMMANDS
+                .iter()
+                .copied()
+                .filter(|c| c.label().to_lowercase().contains(&term))
+                .map(Row::Command),
+        )
         .chain(
             hits.into_iter()
                 .flat_map(|page| page.items.iter().cloned().map(Row::Title)),
@@ -190,6 +223,7 @@ mod tests {
             .map(|row| match row {
                 Row::Place(place) => place.label.clone(),
                 Row::Search(term) => term.clone(),
+                Row::Command(command) => command.label().to_owned(),
                 Row::Recent(item) | Row::Title(item) => item.name.clone(),
             })
             .collect()
@@ -218,7 +252,7 @@ mod tests {
             .map(|n| item(n, ItemKind::Movie, &format!("R{n}")))
             .collect();
         let rows = rows(&[], &places, &recent, "  ", None);
-        assert_eq!(rows.len(), places.len() + RECENT_LIMIT);
+        assert_eq!(rows.len(), places.len() + COMMANDS.len() + RECENT_LIMIT);
         assert!(matches!(rows.last(), Some(Row::Recent(_))));
     }
 
@@ -235,6 +269,20 @@ mod tests {
         assert_eq!(labels(&rows), ["Music", "Music Box"]);
         assert_eq!(rows[1].route(), Some(Route::Title(ItemRef::Real(7))));
         assert_eq!(rows[1].group(), "Titles");
+    }
+
+    #[test]
+    fn the_report_command_is_listed_and_found_by_name_and_runs_no_route() {
+        let places = places(&[]);
+        let blank = rows(&[], &places, &[], "", None);
+        let at = blank.len().min(places.len());
+        assert_eq!(blank[at], Row::Command(Command::ReportProblem));
+        assert_eq!(blank[at].group(), "Actions");
+        assert_eq!(blank[at].route(), None);
+        assert_eq!(
+            labels(&rows(&[], &places, &[], "problem", None)),
+            ["Report a problem"]
+        );
     }
 
     #[test]

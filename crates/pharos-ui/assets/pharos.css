@@ -6173,3 +6173,43 @@ body:has(.pharos-reader) {
   margin: 0;
   color: var(--px-color-fg-muted);
 }
+
+/* Report a problem (spec 016 US5): reuses the What's new dialog's frame. */
+.pharos-report-note {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+.pharos-report-note textarea {
+  box-sizing: border-box;
+  width: 100%;
+  padding: 0.6rem 0.75rem;
+  border: 1px solid var(--px-color-border);
+  border-radius: var(--px-radius);
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  resize: vertical;
+}
+.pharos-report-preview {
+  max-height: 40vh;
+  margin: 0.5rem 0 0;
+  overflow: auto;
+  font-size: 0.8rem;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.pharos-report-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.pharos-report-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 1rem;
+}

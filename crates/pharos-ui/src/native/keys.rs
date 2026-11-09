@@ -191,6 +191,7 @@ pub fn KeyLayer(route: Route, on_palette: EventHandler) -> Element {
                     platform::forward_to_player(key)
                 }
                 Resolved::Run(action) => {
+                    super::report::note(&format!("key {}", typed.join(" ")));
                     reset();
                     run(action)
                 }
