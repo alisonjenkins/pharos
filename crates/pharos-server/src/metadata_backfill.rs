@@ -1178,6 +1178,197 @@ where
     Ok(done)
 }
 
+/// Spec 033 §7 (V896) — rebuild `ids` against their show's current match
+/// now, whatever `series_identity_repair` says: a hand fix is the admin's
+/// resolution, not the scanner's. Each is marked first, so one whose show has
+/// no match yet, or whose record did not arrive, stays marked for the
+/// background pass. Returns how many were rebuilt.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn rebuild_now<Tm, Tv, S>(
+    store: &S,
+    bg_io: &Arc<Semaphore>,
+    cache: &ImageCache,
+    tmdb: Option<&Tm>,
+    tvdb: Option<&Tv>,
+    cfg: &MetadataConfig,
+    ids: &[pharos_core::MediaId],
+    now: i64,
+) -> DomainResult<usize>
+where
+    Tm: OnlineEnricher,
+    Tv: OnlineEnricher,
+    S: MediaStore
+        + GenreStore
+        + PersonStore
+        + MetadataTranslationStore
+        + SeriesMetadataStore
+        + pharos_core::SeriesIdentityStore,
+{
+    store.mark_reconcile_items(ids, now).await?;
+    let mut rebuilt = 0usize;
+    for &id in ids {
+        if reconcile_one(store, bg_io, cache, tmdb, tvdb, cfg, id, now, now).await? {
+            rebuilt += 1;
+        }
+    }
+    Ok(rebuilt)
+}
+
+/// What [`pin_series_by_hand`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HandPin {
+    /// The match before, as `provider:id`; `None` when there was none.
+    pub old: Option<String>,
+    pub new: String,
+}
+
+/// Spec 033 §7 (V896) — an admin's pick of `series_key`'s show, or with
+/// `pick: None` their confirmation of the stored match. Either way the row
+/// becomes `match_source = 'manual'` with its ambiguity flag cleared, so
+/// `series_needing_match` never re-admits it. A pick fetches the show's
+/// record and art and marks its episodes when the match moved. `Ok(None)`
+/// when there is nothing to confirm, or the pick's record did not arrive.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn pin_series_by_hand<Tm, Tv, S>(
+    store: &S,
+    bg_io: &Arc<Semaphore>,
+    cache: &ImageCache,
+    tmdb: Option<&Tm>,
+    tvdb: Option<&Tv>,
+    series_key: &str,
+    series_name: &str,
+    pick: Option<(&str, &str)>,
+    now: i64,
+) -> DomainResult<Option<HandPin>>
+where
+    Tm: OnlineEnricher,
+    Tv: OnlineEnricher,
+    S: SeriesMetadataStore + MetadataTranslationStore + pharos_core::SeriesIdentityStore,
+{
+    let key = series_key.to_string();
+    let prior = store
+        .series_metadata_by_keys(std::slice::from_ref(&key))
+        .await?
+        .remove(&key);
+    let old = prior
+        .as_ref()
+        .and_then(stored_match)
+        .map(|(p, id)| format!("{p}:{id}"));
+    let Some((provider, external_id)) = pick else {
+        let Some(mut row) = prior.filter(|m| stored_match(m).is_some()) else {
+            return Ok(None);
+        };
+        let new = old.clone().unwrap_or_default();
+        row.match_source = Some("manual".into());
+        row.match_flag = None;
+        row.match_runner_up_id = None;
+        row.match_runner_up_score = None;
+        store.upsert_series_metadata(row).await?;
+        return Ok(Some(HandPin { old, new }));
+    };
+    let enriched = match provider {
+        "tvdb" => match tvdb {
+            Some(e) => hand_pick_record(e, bg_io, cache, series_key, external_id).await,
+            None => None,
+        },
+        "tmdb" => match tmdb {
+            Some(e) => hand_pick_record(e, bg_io, cache, series_key, external_id).await,
+            None => None,
+        },
+        _ => None,
+    };
+    let Some((enriched, poster_locator, backdrop_locator)) = enriched else {
+        return Ok(None);
+    };
+    mark_if_match_changed(store, series_key, Some((provider, external_id)), now).await?;
+    let provider_ids = match provider {
+        "tmdb" => ProviderIds {
+            tmdb: Some(external_id.to_string()),
+            ..Default::default()
+        },
+        _ => ProviderIds {
+            tvdb: Some(external_id.to_string()),
+            tmdb: enriched.also_tmdb_id.clone(),
+            ..Default::default()
+        },
+    };
+    store
+        .upsert_series_metadata(SeriesMetadata {
+            series_key: key,
+            series_name: prior
+                .as_ref()
+                .map_or_else(|| series_name.to_string(), |m| m.series_name.clone()),
+            match_provider: Some(provider.into()),
+            match_external_id: Some(external_id.into()),
+            match_source: Some("manual".into()),
+            match_confidence: None,
+            metadata_refreshed_at: Some(now),
+            overview: enriched.overview.clone(),
+            community_rating: enriched.community_rating,
+            premiere_date: enriched.premiere_date,
+            official_rating: enriched.official_rating.clone(),
+            original_language: enriched.original_language.clone(),
+            genres: enriched.genres.clone(),
+            studios: Vec::new(),
+            provider_ids,
+            poster_locator,
+            backdrop_locator,
+            ratings: Default::default(),
+            match_flag: None,
+            match_runner_up_id: None,
+            match_runner_up_score: None,
+        })
+        .await?;
+    store_texts(
+        store,
+        &TranslationOwner::Series(series_key.to_string()),
+        &enriched.texts,
+        now,
+    )
+    .await;
+    Ok(Some(HandPin {
+        old,
+        new: format!("{provider}:{external_id}"),
+    }))
+}
+
+/// The show record an admin picked, with its poster and backdrop cached.
+async fn hand_pick_record<E: OnlineEnricher>(
+    enricher: &E,
+    bg_io: &Arc<Semaphore>,
+    cache: &ImageCache,
+    series_key: &str,
+    external_id: &str,
+) -> Option<(EnrichedMetadata, Option<String>, Option<String>)> {
+    let enriched = {
+        let _permit = BgPermit::acquire(bg_io).await;
+        enricher
+            .fetch(MediaKind::Episode, external_id, None, None, None)
+            .await
+    }?;
+    let poster = cache_series_art(
+        cache,
+        enricher,
+        bg_io,
+        series_key,
+        ArtworkRole::Primary,
+        ImageRole::Primary,
+        &enriched,
+    )
+    .await;
+    let backdrop = cache_series_art(
+        cache,
+        enricher,
+        bg_io,
+        series_key,
+        ArtworkRole::Backdrop,
+        ImageRole::Backdrop,
+        &enriched,
+    )
+    .await;
+    Some((enriched, poster, backdrop))
+}
+
 /// The show an episode's folder (or split group) is matched to, if any.
 async fn pinned_show<S: SeriesMetadataStore>(
     store: &S,
@@ -6727,6 +6918,153 @@ mod tests {
             Some("1"),
             "a dry run never records the matcher version"
         );
+    }
+
+    async fn flagged_pin(s: &SqliteStore, key: &str, id: &str) {
+        s.upsert_series_metadata(SeriesMetadata {
+            series_key: key.into(),
+            series_name: key.rsplit('/').next().unwrap_or(key).into(),
+            match_provider: Some("tvdb".into()),
+            match_external_id: Some(id.into()),
+            match_source: Some("search".into()),
+            metadata_refreshed_at: Some(NOW),
+            match_flag: Some(AMBIGUOUS_FLAG.into()),
+            match_runner_up_id: Some("71173".into()),
+            match_runner_up_score: Some(0.85),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    }
+
+    async fn hand_pin(
+        s: &SqliteStore,
+        cache: &ImageCache,
+        tvdb: &FakeEnricher,
+        pick: Option<(&str, &str)>,
+    ) -> Option<HandPin> {
+        pin_series_by_hand(
+            s,
+            &sem(4),
+            cache,
+            None::<&FakeEnricher>,
+            Some(tvdb),
+            BSG,
+            "Battlestar Galactica",
+            pick,
+            NOW + 10,
+        )
+        .await
+        .unwrap()
+    }
+
+    /// Spec 033 §7 (V896) — confirming a flagged guess keeps the match,
+    /// clears the flag and makes it manual, so the refresh TTL never
+    /// re-admits it; there is nothing to confirm on an unmatched show.
+    #[tokio::test(flavor = "current_thread")]
+    async fn confirming_a_flagged_show_makes_its_match_manual() {
+        let s = store().await;
+        let (_td, cache) = cache();
+        let tvdb = FakeEnricher::tvdb();
+        assert_eq!(hand_pin(&s, &cache, &tvdb, None).await, None);
+        put_titled_episode(&s, 1, BSG, (1, 1), "33").await;
+        flagged_pin(&s, BSG, "73545").await;
+
+        let pin = hand_pin(&s, &cache, &tvdb, None).await;
+
+        assert_eq!(
+            pin,
+            Some(HandPin {
+                old: Some("tvdb:73545".into()),
+                new: "tvdb:73545".into(),
+            })
+        );
+        let row = series_row(&s, BSG).await;
+        assert_eq!(row.match_source.as_deref(), Some("manual"));
+        assert_eq!(row.match_external_id.as_deref(), Some("73545"));
+        assert_eq!(row.match_flag, None);
+        assert_eq!(row.match_runner_up_id, None);
+        assert!(s
+            .series_needing_match(10, i64::MAX)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(tvdb.fetched().is_empty(), "a confirm fetches nothing");
+        assert!(pending_ids(&s).await.is_empty(), "the match did not move");
+    }
+
+    /// Spec 033 §7 (V896) — picking another show writes its record as a
+    /// manual match with the flag cleared and marks the show's episodes,
+    /// since their text came from the old show.
+    #[tokio::test(flavor = "current_thread")]
+    async fn picking_a_show_by_hand_pins_it_and_marks_its_episodes() {
+        let s = store().await;
+        let (_td, cache) = cache();
+        put_titled_episode(&s, 1, BSG, (1, 1), "33").await;
+        flagged_pin(&s, BSG, "71173").await;
+        let tvdb = FakeEnricher::tvdb().with_detail(enriched_overview("A rag-tag fleet."));
+
+        let pin = hand_pin(&s, &cache, &tvdb, Some(("tvdb", "73545"))).await;
+
+        assert_eq!(
+            pin,
+            Some(HandPin {
+                old: Some("tvdb:71173".into()),
+                new: "tvdb:73545".into(),
+            })
+        );
+        assert_eq!(tvdb.fetched(), ["73545"]);
+        let row = series_row(&s, BSG).await;
+        assert_eq!(row.match_source.as_deref(), Some("manual"));
+        assert_eq!(row.match_external_id.as_deref(), Some("73545"));
+        assert_eq!(row.overview.as_deref(), Some("A rag-tag fleet."));
+        assert_eq!(row.match_flag, None);
+        assert_eq!(pending_ids(&s).await, [1]);
+
+        let missing = FakeEnricher::tvdb();
+        assert_eq!(
+            hand_pin(&s, &cache, &missing, Some(("tvdb", "1"))).await,
+            None,
+            "a record that did not arrive writes nothing"
+        );
+        assert_eq!(
+            series_row(&s, BSG).await.match_external_id.as_deref(),
+            Some("73545")
+        );
+    }
+
+    /// Spec 033 §7 — a hand fix rebuilds its episodes at once, even in a
+    /// dry run, where the background pass rebuilds nothing.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_hand_fix_rebuilds_its_episodes_in_a_dry_run() {
+        let s = store().await;
+        let (_td, cache) = cache();
+        put_titled_episode(&s, 1, BSG, (1, 1), "33").await;
+        let mut item = s.get(1).await.unwrap();
+        item.metadata.overview = Some("The 1978 pilot.".into());
+        s.put(item).await.unwrap();
+        pin(&s, BSG, "73545", NOW).await;
+        let tvdb = FakeEnricher::tvdb().with_detail(enriched_overview("The 2004 pilot."));
+
+        let rebuilt = rebuild_now(
+            &s,
+            &sem(4),
+            &cache,
+            None::<&FakeEnricher>,
+            Some(&tvdb),
+            &MetadataConfig::default(),
+            &[1],
+            NOW,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(rebuilt, 1);
+        assert_eq!(
+            s.get(1).await.unwrap().metadata.overview.as_deref(),
+            Some("The 2004 pilot.")
+        );
+        assert!(pending_ids(&s).await.is_empty());
     }
 
     const FLASH: &str = "/tv/The Flash";
