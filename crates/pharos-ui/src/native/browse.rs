@@ -1822,7 +1822,7 @@ fn EpisodeMark(id: ItemRef, label: String, played: bool) -> Element {
 enum MusicTab {
     Artists,
     Albums,
-    /// The mixes the listener can start (B897/V846).
+    /// The mixes the listener can start (B901/V850).
     Playlists,
 }
 

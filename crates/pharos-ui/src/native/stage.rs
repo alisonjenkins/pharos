@@ -483,12 +483,12 @@ pub enum StageAction {
     Place(Spot),
     /// Remember where the floating window is (a drag or key move ended).
     Keep,
-    /// Dock or undock the queue beside the compact player (B896/V845).
+    /// Dock or undock the queue beside the compact player (B900/V849).
     Queue,
 }
 
 /// Whether the queue is docked beside the compact player, shared by every
-/// player on the stage so a song handing over keeps it (B896/V845).
+/// player on the stage so a song handing over keeps it (B900/V849).
 #[derive(Clone, Copy)]
 pub struct QueueDock(pub Signal<bool>);
 
@@ -536,7 +536,7 @@ pub fn StageBar(
     /// (B815).
     #[props(default)]
     live_position: Option<Signal<u64>>,
-    /// Music's queue button (B896/V845); none for a video.
+    /// Music's queue button (B900/V849); none for a video.
     #[props(default)]
     queue: Option<QueueButton>,
 ) -> Element {
@@ -1163,7 +1163,7 @@ mod tests {
         dioxus_ssr::render(&dom)
     }
 
-    /// B896/V845: music's mini bar has a queue button that counts what
+    /// B900/V849: music's mini bar has a queue button that counts what
     /// waits and says whether the docked queue is open; a video's has none.
     #[test]
     fn the_mini_bar_offers_the_queue_for_music_only() {
