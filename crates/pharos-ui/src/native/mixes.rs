@@ -697,6 +697,12 @@ fn length(secs: u32) -> String {
     }
 }
 
+/// The mix that is on, when it is this tile's: by name and rules, since a
+/// saved mix may share a preset's name.
+pub fn is_active<'a>(active: Option<&'a ActiveMix>, m: &SavedMix) -> Option<&'a ActiveMix> {
+    active.filter(|a| a.name == m.name && a.spec == m.spec)
+}
+
 /// What the Playlists tab logs when a tile starts its mix.
 pub fn shelf_start_line(name: &str, kind: ShelfKind) -> String {
     format!("pharos: mix shelf start mix={name:?} kind={}", kind.label())
@@ -771,15 +777,14 @@ pub fn MixShelf() -> Element {
                 }
             }
             ul { class: "pharos-mix-tiles",
-                for (kind, m) in tiles {
+                for (i, (kind, m)) in tiles.into_iter().enumerate() {
                     li {
                         key: "{kind.label()}-{m.name}",
                         class: "pharos-mix-tile",
                         "data-kind": kind.label(),
                         {
-                            // By name and rules: a saved mix may share a
-                            // preset's name.
-                            let on = active.as_ref().filter(|a| a.name == m.name && a.spec == m.spec);
+                            let on = is_active(active.as_ref(), &m);
+                            let rules_id = format!("pharos-mix-rules-{i}");
                             let is_on = on.is_some();
                             let status = on.and_then(status_text);
                             let newer = m.newer.is_some();
@@ -793,6 +798,7 @@ pub fn MixShelf() -> Element {
                                     disabled: in_group || newer,
                                     title: if newer { "Made with a newer Pharos app" } else { "" },
                                     aria_label: if is_on { format!("Open the player for {}", m.name) } else { format!("Play the mix {}", m.name) },
+                                    aria_describedby: "{rules_id}",
                                     onclick: move |_| {
                                         // The mix that is on opens the player
                                         // rather than starting it again, which
@@ -818,11 +824,13 @@ pub fn MixShelf() -> Element {
                                         Icon { path: ICON_MIX }
                                     }
                                     span { class: "pharos-mix-tile-name", "{m.name}" }
-                                    span { class: "pharos-muted pharos-mix-tile-rules", {describe(&m.spec)} }
-                                    if on.is_some() {
-                                        span { class: "pharos-mix-tile-on", role: "status",
-                                            {status.unwrap_or_else(|| "Playing".to_owned())}
-                                        }
+                                    span { id: "{rules_id}", class: "pharos-muted pharos-mix-tile-rules", {describe(&m.spec)} }
+                                }
+                                // Beside the button, not in it: a button's
+                                // content is not announced as a live region.
+                                if is_on {
+                                    span { class: "pharos-mix-tile-on", role: "status",
+                                        {status.unwrap_or_else(|| "Playing".to_owned())}
                                     }
                                 }
                             }
@@ -1721,5 +1729,26 @@ mod tests {
             "{html}"
         );
         assert_eq!(html.matches("pharos-mix-tile-on").count(), 1, "{html}");
+    }
+
+    #[test]
+    fn a_saved_mix_named_like_a_preset_is_not_the_preset() {
+        let preset = presets()
+            .into_iter()
+            .find(|p| p.name == "Favourites")
+            .unwrap();
+        let playing = ActiveMix {
+            name: preset.name.clone(),
+            ..on(preset.spec.clone())
+        };
+        let mine = SavedMix::new("Favourites", MixSpec::default());
+        assert!(is_active(Some(&playing), &mine).is_none());
+        assert!(is_active(Some(&playing), &preset).is_some());
+        let same = SavedMix::new("Favourites", preset.spec.clone());
+        assert!(
+            is_active(Some(&playing), &same).is_some(),
+            "same name and rules is the same mix"
+        );
+        assert!(is_active(None, &preset).is_none());
     }
 }
