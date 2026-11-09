@@ -30,6 +30,7 @@ mod person;
 mod playback;
 mod prefs;
 mod quick_connect;
+mod read_position;
 mod revocation;
 mod revocation_sites;
 mod session;
