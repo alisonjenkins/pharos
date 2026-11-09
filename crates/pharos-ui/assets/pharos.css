@@ -1163,6 +1163,24 @@ input:focus-visible {
   margin: 0 0 0.5rem;
   font-size: 2rem;
 }
+.pharos-person:has(.pharos-person-bio) {
+  align-items: flex-start;
+}
+.pharos-person-life {
+  margin: 0 0 0.25rem;
+}
+.pharos-person-bio {
+  max-width: 48rem;
+  margin-top: 1rem;
+  line-height: 1.5;
+}
+.pharos-person-bio p {
+  margin: 0 0 0.75rem;
+}
+.pharos-person-bio summary {
+  cursor: pointer;
+  color: var(--px-color-fg-muted);
+}
 .pharos-person-links {
   display: flex;
   flex-wrap: wrap;
@@ -1287,6 +1305,9 @@ input:focus-visible {
   }
   .pharos-person-links {
     justify-content: center;
+  }
+  .pharos-person-bio {
+    text-align: start;
   }
   .pharos-person-show-poster {
     flex-basis: 6rem;
