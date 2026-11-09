@@ -42,8 +42,8 @@ on `AppState`, fed by a single reader of the existing bus:
   logged with its value and counted `undecodable`.
 - Topics on the wire are `userData`, `library` and `task`; an empty list means
   all of them, and `resync` always arrives. A connection holds at most 8
-  subscriptions (`limit subscriptions`). A pump stops once its session logged
-  out on the connection.
+  subscriptions (`limit subscriptions`). `Session.logout` stops that
+  session's pumps at once, and a connection's close stops all of them.
 
 ## Consequences
 
@@ -60,6 +60,12 @@ on `AppState`, fed by a single reader of the existing bus:
   events. Two things guard against that: the `undecodable` counter, and the
   unit test `a_user_data_announcement_becomes_typed_events`, which builds a
   real DTO.
+- Each subscribed user has their own live channel (256 slots), so one user's
+  burst cannot lag another's subscribers. A lagged subscriber refills from the
+  window, and no push carries more than 256 events.
+- Library changes reach every stream, but a user whose policy hides
+  anything gets only the ids `retain_visible` allows them, and no scan
+  progress. This is stricter than `/socket`, which broadcasts every id.
 - Sessions, group and activity events (data-model §Events) are not in the
   schema's `Event` union yet. They need a schema bump of their own.
 
