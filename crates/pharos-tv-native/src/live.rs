@@ -5,7 +5,9 @@
 use futures_channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
 use pharos_client::CallInfo;
 use futures_util::StreamExt;
-use pharos_client::api::{Detail, Home, ItemRef, LibraryKind, NativeApi, Page, PharosApi};
+use pharos_client::api::{
+    Detail, Home, ItemRef, LibraryKind, NativeApi, NativeGrant, Page, PharosApi,
+};
 use pharos_ui::native::{android, tv_page};
 use std::sync::Mutex;
 
@@ -21,6 +23,12 @@ pub enum Event {
 /// What the screens ask the connection for.
 pub enum Command {
     Detail(ItemRef),
+    /// Negotiate a playback and hand its stream to the player.
+    Play(ItemRef),
+    /// Release the playback. The grant is dropped without a stop or a
+    /// progress report, so the server ends the session and leaves the
+    /// stored position alone (the spike writes no user data).
+    Stop,
 }
 
 /// Posters the grid loads: spec 032's state (b) needs at least 100.
@@ -137,39 +145,22 @@ async fn run(
         .map_err(|_| "ui gone".to_owned())?;
     // The playback grant: the server ends the play session, and answers its
     // segments 410 Gone, the moment the grant is released, so it is held
-    // for as long as this connection runs.
-    let mut _grant = None;
+    // until the player stops.
+    let mut grant: Option<NativeGrant> = None;
     if let Some(id) = crate::video::play_item() {
-        // Negotiated off the UI thread: the probe may still be listing.
-        let caps = tokio::task::spawn_blocking(|| {
-            crate::codecs::caps(std::time::Duration::from_secs(3))
-        })
-        .await
-        .map_err(|e| format!("caps: {e}"))?;
-        let started = std::time::Instant::now();
-        let url = match api.play(&info, id, &caps, Default::default()).await {
-            Ok((decision, grant)) => {
-                _grant = Some(grant);
-                log::info!(
-                    "bench play_ms={} method={} block={} downgrade={} url={}",
-                    started.elapsed().as_millis(),
-                    decision.method,
-                    decision.direct_play_block,
-                    decision.downgrade,
-                    decision.stream_url.split('?').next().unwrap_or_default(),
-                );
-                if decision.is_hls() {
-                    Ok(decision.stream_url)
-                } else {
-                    Err(format!("not HLS: {}", decision.method))
-                }
-            }
-            Err(e) => Err(format!("play {id}: {e}")),
-        };
-        crate::video::set_stream(url);
+        grant = negotiate(&api, &info, id).await;
     }
     while let Some(command) = commands.next().await {
         match command {
+            Command::Play(id) => {
+                drop(grant.take());
+                grant = negotiate(&api, &info, id).await;
+            }
+            Command::Stop => {
+                if grant.take().is_some() {
+                    log::info!("live: playback released");
+                }
+            }
             Command::Detail(id) => {
                 let started = std::time::Instant::now();
                 let event = match api.detail(&info, id).await {
@@ -187,4 +178,45 @@ async fn run(
         }
     }
     Ok(())
+}
+
+/// Negotiates `id` with the decoder probe's capabilities and hands the
+/// stream URL, or why there is none, to the player.
+async fn negotiate(api: &NativeApi, info: &CallInfo, id: ItemRef) -> Option<NativeGrant> {
+    // Negotiated off the UI thread: the probe may still be listing.
+    let caps = match tokio::task::spawn_blocking(|| {
+        crate::codecs::caps(std::time::Duration::from_secs(3))
+    })
+    .await
+    {
+        Ok(caps) => caps,
+        Err(e) => {
+            crate::video::set_stream(id, Err(format!("caps: {e}")));
+            return None;
+        }
+    };
+    let started = std::time::Instant::now();
+    match api.play(info, id, &caps, Default::default()).await {
+        Ok((decision, grant)) => {
+            log::info!(
+                "bench play_ms={} method={} block={} downgrade={} url={}",
+                started.elapsed().as_millis(),
+                decision.method,
+                decision.direct_play_block,
+                decision.downgrade,
+                decision.stream_url.split('?').next().unwrap_or_default(),
+            );
+            if decision.is_hls() {
+                crate::video::set_stream(id, Ok(decision.stream_url));
+                Some(grant)
+            } else {
+                crate::video::set_stream(id, Err(format!("not HLS: {}", decision.method)));
+                None
+            }
+        }
+        Err(e) => {
+            crate::video::set_stream(id, Err(format!("play {id}: {e}")));
+            None
+        }
+    }
 }

@@ -28,14 +28,28 @@ extern "Kotlin" {
 /// The Kotlin class, by its binary name for `ClassLoader.loadClass`.
 const VIDEO_HOLE_CLASS: &str = "com.alisonjenkins.pharos.tvnative.video.VideoHole";
 
+fn prop() -> Option<String> {
+    android_properties::getprop("debug.pharos.hole").value()
+}
+
+/// The hole's mode. Unset, or `none`, is mode 3 for the player the UI
+/// starts; `0` turns the hole off.
 fn mode() -> Option<String> {
-    android_properties::getprop("debug.pharos.hole")
-        .value()
-        .filter(|v| matches!(v.as_str(), "1" | "2" | "3"))
+    match prop().as_deref() {
+        Some(m @ ("1" | "2" | "3")) => Some(m.to_owned()),
+        Some("0") => None,
+        _ => Some("3".to_owned()),
+    }
 }
 
 pub fn enabled() -> bool {
     mode().is_some()
+}
+
+/// The slice 0 probe page and its 16:9 rect: only when `debug.pharos.hole`
+/// is set to a mode by hand, so earlier runs repeat as they were.
+pub fn probe_page() -> bool {
+    matches!(prop().as_deref(), Some("1" | "2" | "3"))
 }
 
 /// `android.graphics.PixelFormat.TRANSLUCENT`.
@@ -308,7 +322,8 @@ fn child_layer(
         format!("({SC})V"),
         &[JValue::Object(&child)],
     )?;
-    if let Some(path) = crate::video::path() {
+    let path = crate::video::path();
+    if path.is_some() || !probe_page() {
         // A canvas fill would connect the Surface as a CPU producer and the
         // decoder could not connect after it, so a video gets no fill.
         // SAFETY: `env` and `surface` are live for this call; the window
@@ -319,7 +334,12 @@ fn child_layer(
                 surface.as_raw().cast(),
             )
         } {
-            Some(window) => crate::video::play(window, path),
+            Some(window) => {
+                crate::video::set_window(window.clone());
+                if let Some(path) = path {
+                    crate::video::play(window, path);
+                }
+            }
             None => log::warn!("hole: ANativeWindow_fromSurface returned null"),
         }
     } else {

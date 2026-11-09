@@ -14,6 +14,7 @@ use ndk::native_window::NativeWindow;
 use ndk_sys as sys;
 use std::ffi::CStr;
 use std::os::fd::AsRawFd;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 pub fn path() -> Option<String> {
@@ -27,35 +28,96 @@ const PLAY: &str = "play:";
 
 /// The item `debug.pharos.video` asks to play from the server, if any.
 pub fn play_item() -> Option<pharos_client::api::ItemRef> {
-    path()?.strip_prefix(PLAY)?.trim().parse().ok()
+    item_of(&path()?)
 }
 
-/// Whether the video fills the window (a server playback) rather than the
-/// slice 0 probe's rectangle.
+fn item_of(path: &str) -> Option<pharos_client::api::ItemRef> {
+    path.strip_prefix(PLAY)?.trim().parse().ok()
+}
+
+/// Whether the video fills the window (a server playback, or the player the
+/// UI starts) rather than the slice 0 probe's rectangle.
 pub fn full_window() -> bool {
-    path().is_some_and(|p| p.starts_with(PLAY))
+    path().is_some_and(|p| p.starts_with(PLAY)) || !crate::hole::probe_page()
 }
 
-static STREAM: std::sync::Mutex<Option<Result<String, String>>> = std::sync::Mutex::new(None);
+type StreamSlot = Option<(pharos_client::api::ItemRef, Result<String, String>)>;
+static STREAM: std::sync::Mutex<StreamSlot> = std::sync::Mutex::new(None);
 static STREAM_READY: std::sync::Condvar = std::sync::Condvar::new();
 
-/// The live connection hands over the decision's stream URL, or why there
-/// is none.
-pub fn set_stream(url: Result<String, String>) {
+/// The live connection hands over the decision's stream URL for `id`, or
+/// why there is none.
+pub fn set_stream(id: pharos_client::api::ItemRef, url: Result<String, String>) {
     if let Ok(mut slot) = STREAM.lock() {
-        *slot = Some(url);
+        *slot = Some((id, url));
         STREAM_READY.notify_all();
     }
 }
 
-fn wait_stream() -> Result<String, String> {
+/// Waits for `id`'s stream; a stale answer for an earlier item is skipped,
+/// and a stop ends the wait.
+fn wait_stream(id: pharos_client::api::ItemRef) -> Result<String, String> {
     let mut slot = STREAM.lock().map_err(|_| "stream lock poisoned")?;
     loop {
-        if let Some(url) = slot.take() {
-            return url;
+        if STOP.load(Ordering::Acquire) {
+            return Err("stopped".into());
         }
-        slot = STREAM_READY.wait(slot).map_err(|_| "stream lock poisoned")?;
+        if let Some((for_id, url)) = slot.take() {
+            if for_id == id {
+                return url;
+            }
+        }
+        slot = STREAM_READY
+            .wait_timeout(slot, Duration::from_millis(100))
+            .map_err(|_| "stream lock poisoned")?
+            .0;
     }
+}
+
+/// The hole layer's Surface, kept for players the UI starts.
+static WINDOW: std::sync::Mutex<Option<NativeWindow>> = std::sync::Mutex::new(None);
+/// Set to end the running player; cleared when one starts.
+static STOP: AtomicBool = AtomicBool::new(false);
+static RUNNING: AtomicBool = AtomicBool::new(false);
+
+/// Keeps the hole layer's Surface for [`start`].
+pub fn set_window(window: NativeWindow) {
+    if let Ok(mut slot) = WINDOW.lock() {
+        *slot = Some(window);
+    }
+}
+
+/// Whether a hole layer is ready to play into.
+pub fn can_play() -> bool {
+    WINDOW.lock().is_ok_and(|w| w.is_some())
+}
+
+/// Plays `id` from the server into the hole layer, ending any player that
+/// is running. The live connection negotiates it ([`crate::live::Command::Play`]).
+pub fn start(id: pharos_client::api::ItemRef) {
+    stop();
+    // Off the UI thread: the old player may take a moment to wind down.
+    let spawned = std::thread::Builder::new().name("pharos-start".into()).spawn(move || {
+        let until = Instant::now() + Duration::from_secs(2);
+        while RUNNING.load(Ordering::Acquire) && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        STOP.store(false, Ordering::Release);
+        let Some(window) = WINDOW.lock().ok().and_then(|w| w.clone()) else {
+            log::warn!("video: no hole layer to play into");
+            return;
+        };
+        play(window, format!("{PLAY}{id}"));
+    });
+    if let Err(e) = spawned {
+        log::warn!("video: start thread: {e}");
+    }
+}
+
+/// Ends the running player and its audio.
+pub fn stop() {
+    STOP.store(true, Ordering::Release);
+    crate::audio::stop();
 }
 
 /// One poll of the decoder's queues.
@@ -66,14 +128,19 @@ const LATE: Duration = Duration::from_millis(40);
 const REPORT_EVERY: Duration = Duration::from_secs(2);
 
 pub fn play(window: NativeWindow, path: String) {
+    // Set before the thread starts, so a `start` straight after waits for it.
+    RUNNING.store(true, Ordering::Release);
     let spawned = std::thread::Builder::new()
         .name("pharos-video".into())
         .spawn(move || {
             if let Err(e) = run(&window, &path) {
                 log::warn!("video: {e} path={path}");
             }
+            crate::audio::stop();
+            RUNNING.store(false, Ordering::Release);
         });
     if let Err(e) = spawned {
+        RUNNING.store(false, Ordering::Release);
         log::warn!("video: thread: {e}");
     }
 }
@@ -114,7 +181,8 @@ impl Source {
         let from_server = path.starts_with(PLAY);
         if from_server || crate::feeder::Feeder::is_feeder_dir(path) {
             let mut feeder = if from_server {
-                let url = wait_stream()?;
+                let id = item_of(path).ok_or("play: not an item id")?;
+                let url = wait_stream(id)?;
                 let stream = crate::hls_net::open(&crate::live::server(), &url)?;
                 log::info!("video: playing {} from the server", stream.variant);
                 match stream.packaging {
@@ -310,6 +378,10 @@ fn run(window: &NativeWindow, path: &str) -> Result<(), String> {
         let mut input_done = false;
         let mut report = Instant::now();
         loop {
+            if STOP.load(Ordering::Acquire) {
+                log::info!("bench video stopped shown={shown} dropped={dropped}");
+                return Ok(());
+            }
             if !input_done {
                 input_done = !source.feed(codec)?;
             }

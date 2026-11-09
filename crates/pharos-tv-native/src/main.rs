@@ -134,7 +134,7 @@ fn HoleProbe() -> Element {
 #[cfg(target_os = "android")]
 fn root() -> Element {
     // Constant for the process, so the hooks below run in the same order.
-    if hole::enabled() {
+    if hole::probe_page() {
         return rsx! { HoleProbe {} };
     }
     let mut data = use_signal(Data::fixture);
