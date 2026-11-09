@@ -286,6 +286,14 @@ impl Drop for PopState {
 }
 
 /// A window `keydown` listener for Escape, removed on drop.
+/// The browser's Back is history the page does not hold: a guard is never
+/// asked, so Back leaves as it always has.
+pub struct BackWatch;
+
+pub fn on_back(_on_back: impl FnMut() -> bool + 'static) -> BackWatch {
+    BackWatch
+}
+
 pub struct EscapeWatch(Closure<dyn FnMut(web_sys::KeyboardEvent)>);
 
 impl Drop for EscapeWatch {

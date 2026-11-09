@@ -561,6 +561,20 @@ pub fn WatchView(
             on_control.call(Control::Seek(s.target_ms));
         }
     };
+    // The WebView app's Back is a history pop, not a key: while a preview
+    // is open it drops the preview and stays in the player, as Escape does.
+    let _back = use_hook(|| {
+        SCRUB_KEYS.then(|| {
+            let mut end_scrub = end_scrub;
+            std::rc::Rc::new(platform::on_back(move || {
+                if scrub.peek().is_none() {
+                    return false;
+                }
+                end_scrub(scrub::End::Cancelled);
+                true
+            }))
+        })
+    });
     let on_key = move |evt: KeyboardEvent| {
         wake();
         // Ctrl/Cmd chords are the browser's and the palette's (Ctrl+K):

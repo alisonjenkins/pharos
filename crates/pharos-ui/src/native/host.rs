@@ -78,6 +78,12 @@ pub fn on_escape(_on_escape: impl FnMut() + 'static) -> EscapeWatch {
     EscapeWatch
 }
 
+pub struct BackWatch;
+
+pub fn on_back(_on_back: impl FnMut() -> bool + 'static) -> BackWatch {
+    BackWatch
+}
+
 pub struct PopState;
 
 pub fn on_pop_state(_on_path: impl FnMut(String) + 'static) -> PopState {
