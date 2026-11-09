@@ -75,6 +75,7 @@ fn requests(token: &str) -> Vec<test::TestRequest> {
     let auth = ("X-Emby-Token", token.to_string());
     vec![
         test::TestRequest::get().uri("/admin/series-identity"),
+        test::TestRequest::get().uri("/admin/series-identity/flagged"),
         test::TestRequest::get().uri("/admin/series-identity/search?Name=Flash"),
         test::TestRequest::post()
             .uri("/admin/series-identity/pick")
@@ -232,4 +233,57 @@ async fn a_split_the_dry_run_holds_shows_as_pending_with_its_moves() {
         }]),
         "{v}"
     );
+}
+
+#[actix_web::test]
+async fn a_flagged_show_is_named_by_its_series_item_id() {
+    use pharos_core::{SeriesMetadata, SeriesMetadataStore};
+    let (state, token) = seed(true).await;
+    SeriesMetadataStore::upsert_series_metadata(
+        &state.stores,
+        SeriesMetadata {
+            series_key: FLASH.into(),
+            series_name: "The Flash".into(),
+            match_provider: Some("tvdb".into()),
+            match_external_id: Some("279121".into()),
+            match_source: Some("search".into()),
+            match_flag: Some("ambiguous".into()),
+            match_runner_up_id: Some("78650".into()),
+            match_runner_up_score: Some(0.7),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let app = app!(state);
+    let auth = ("X-Emby-Token", token.as_str());
+    let series: serde_json::Value = test::call_and_read_body_json(
+        &app,
+        test::TestRequest::get()
+            .uri("/Items?IncludeItemTypes=Series&Recursive=true")
+            .insert_header(auth)
+            .to_request(),
+    )
+    .await;
+    let id = series["Items"][0]["Id"].clone();
+    assert!(id.is_string(), "{series}");
+
+    let flagged: serde_json::Value = test::call_and_read_body_json(
+        &app,
+        test::TestRequest::get()
+            .uri("/admin/series-identity/flagged")
+            .insert_header(auth)
+            .to_request(),
+    )
+    .await;
+    assert_eq!(flagged["SeriesIds"], serde_json::json!([id]), "{flagged}");
+    let v: serde_json::Value = test::call_and_read_body_json(
+        &app,
+        test::TestRequest::get()
+            .uri("/admin/series-identity")
+            .insert_header(auth)
+            .to_request(),
+    )
+    .await;
+    assert_eq!(v["Flagged"][0]["SeriesId"], id, "{v}");
 }

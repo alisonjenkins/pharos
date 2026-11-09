@@ -21,6 +21,7 @@ use crate::tvdb::{ReqwestTransport, TvdbClient, TvdbEnricher};
 
 pub(super) fn register(cfg: &mut web::ServiceConfig) {
     cfg.route("/admin/series-identity", web::get().to(overview))
+        .route("/admin/series-identity/flagged", web::get().to(flagged_ids))
         .route("/admin/series-identity/search", web::get().to(search))
         .route("/admin/series-identity/pick", web::post().to(pick))
         .route("/admin/series-identity/confirm", web::post().to(confirm))
@@ -87,6 +88,8 @@ struct GroupDto {
 #[serde(rename_all = "PascalCase")]
 struct FlaggedDto {
     series_key: String,
+    /// The show's item id, for a link to its title page.
+    series_id: String,
     name: String,
     provider: Option<String>,
     external_id: Option<String>,
@@ -119,6 +122,49 @@ struct DoneDto {
     rebuilding: usize,
 }
 
+/// The flagged shows' stored matches, in the store's order.
+async fn flagged(state: &AppState) -> Result<Vec<pharos_core::SeriesMetadata>, actix_web::Error> {
+    let keys = state
+        .stores
+        .flagged_series_keys()
+        .await
+        .map_err(internal("reading flagged shows"))?;
+    let mut stored = state
+        .stores
+        .series_metadata_by_keys(&keys)
+        .await
+        .map_err(internal("reading flagged shows"))?;
+    Ok(keys.iter().filter_map(|k| stored.remove(k)).collect())
+}
+
+/// The Series item id of a show's identity key, as the item routes mint it
+/// (a key that is only the show's name is a row with no folder).
+fn series_id(series_key: &str, name: &str) -> String {
+    let folder = (series_key != name).then_some(series_key);
+    pharos_jellyfin_api::dto::series_id_for_key(folder, name)
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct FlaggedIdsDto {
+    series_ids: Vec<String>,
+}
+
+/// The item ids of flagged shows, for the title page's "Check match" badge
+/// (spec 033 §3); cheap, unlike the overview's whole-library plan.
+async fn flagged_ids(
+    state: web::Data<AppState>,
+    user: AuthUser,
+) -> Result<impl Responder, actix_web::Error> {
+    require_admin(&user)?;
+    let series_ids = flagged(&state)
+        .await?
+        .iter()
+        .map(|m| series_id(&m.series_key, &m.series_name))
+        .collect();
+    Ok(web::Json(FlaggedIdsDto { series_ids }))
+}
+
 fn internal(context: &str) -> impl Fn(pharos_core::DomainError) -> actix_web::Error + '_ {
     move |e| error::ErrorInternalServerError(format!("{context}: {e}"))
 }
@@ -136,20 +182,11 @@ async fn overview(
     let splits = splits(&state.stores, rows, crate::metadata_backfill::now_secs())
         .await
         .map_err(internal("planning folder splits"))?;
-    let keys = state
-        .stores
-        .flagged_series_keys()
-        .await
-        .map_err(internal("reading flagged shows"))?;
-    let mut stored = state
-        .stores
-        .series_metadata_by_keys(&keys)
-        .await
-        .map_err(internal("reading flagged shows"))?;
-    let flagged = keys
-        .iter()
-        .filter_map(|k| stored.remove(k))
+    let flagged = flagged(&state)
+        .await?
+        .into_iter()
         .map(|m| FlaggedDto {
+            series_id: series_id(&m.series_key, &m.series_name),
             series_key: m.series_key,
             name: m.series_name,
             provider: m.match_provider,
