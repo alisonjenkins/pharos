@@ -2,7 +2,7 @@
 
 **Feature Branch**: `main` (pre-existing system, retro-specified)
 **Created**: 2026-07-27 (migrated from `SPEC.md` §G/§I/§V)
-**Status**: Live in production; 81 of 100 tasks complete, 19 open (see `tasks.md`)
+**Status**: Live in production; audited 2026-11-09 — register has 126 rows (T1…T146 with gaps): 111 done, 4 partial (T51, T58, T59, T88), 11 open (T11-T14 Plex, T20, T75, T84, T91, T106, T145; T146 and T112/T117/T128/T130 are tracked in Open work only); see `tasks.md`
 
 This is the baseline specification for pharos as a whole, not a single increment.
 It was migrated from the cavekit `SPEC.md` when the project moved to spec-kit.
