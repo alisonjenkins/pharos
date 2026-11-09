@@ -422,3 +422,25 @@ async fn a_capability_answers_to_the_holders_current_policy() {
         assert_eq!(status, StatusCode::NOT_FOUND, "{uri} stale_cookie={cookie}");
     }
 }
+
+#[actix_web::test]
+async fn a_playlist_on_another_tokens_session_keeps_its_own_token() {
+    // The user signs in again after the token that negotiated the session was
+    // revoked: the dead session must not strip the new token from the
+    // playlist's URLs, or every child request would 401.
+    let (state, token, uid) = seed().await;
+    let app = init_app!(state.clone());
+    let url = transcoding_url(&playback_info!(&app, token.as_str(), 1));
+    let fresh = state.stores.issue(uid, "t2").await.unwrap();
+    let fresh = fresh.0.expose().to_string();
+    state.stores.revoke(&token).await.unwrap();
+    let body = test::call_and_read_body(
+        &app,
+        test::TestRequest::get()
+            .uri(&format!("{url}&api_key={fresh}"))
+            .to_request(),
+    )
+    .await;
+    let master = String::from_utf8_lossy(&body);
+    assert!(master.contains(&format!("api_key={fresh}")), "{master}");
+}
