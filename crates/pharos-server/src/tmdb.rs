@@ -168,6 +168,43 @@ impl TmdbClient {
         parse_movie_detail(&body)
     }
 
+    /// Fetch a TMDB person's biography, dates and external ids by their
+    /// TMDB person id.
+    pub(crate) async fn person_detail(
+        &self,
+        id: &str,
+    ) -> Result<crate::person_details::Fetched, crate::person_details::DetailsMiss> {
+        use crate::person_details::DetailsMiss;
+        let resp = self
+            .http
+            .get(format!("{API_BASE}/person/{id}"))
+            .query(&[
+                ("api_key", self.api_key.as_str()),
+                ("append_to_response", "external_ids"),
+            ])
+            .send()
+            .await
+            .map_err(|error| {
+                let error = error.without_url();
+                tracing::warn!(tmdb.person = id, %error, "tmdb person: request failed");
+                DetailsMiss::Transport
+            })?;
+        match resp.status() {
+            s if s == reqwest::StatusCode::NOT_FOUND => return Err(DetailsMiss::NotFound),
+            s if !s.is_success() => return Err(DetailsMiss::Status(s.as_u16())),
+            _ => {}
+        }
+        let body = resp.text().await.map_err(|error| {
+            let error = error.without_url();
+            tracing::warn!(tmdb.person = id, %error, "tmdb person: body unreadable");
+            DetailsMiss::Transport
+        })?;
+        parse_person_detail(&body).ok_or_else(|| {
+            tracing::warn!(tmdb.person = id, bytes = body.len(), head = %body.chars().take(120).collect::<String>(), "tmdb person: body is not a person record");
+            DetailsMiss::Decode
+        })
+    }
+
     /// Fetch a TMDB TV series' detail record by id.
     pub(crate) async fn tv_detail(
         &self,
@@ -369,6 +406,28 @@ fn parse_profile_path(body: &str) -> Option<String> {
         .as_array()?
         .iter()
         .find_map(|r| r.get("profile_path")?.as_str().map(str::to_string))
+}
+
+/// Parse a TMDB `/person/{id}?append_to_response=external_ids` body. `None`
+/// when the body is not a JSON object.
+pub(crate) fn parse_person_detail(body: &str) -> Option<crate::person_details::Fetched> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    v.as_object()?;
+    let text = |v: Option<&serde_json::Value>| {
+        v?.as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+    };
+    let ids = v.get("external_ids");
+    Some(crate::person_details::Fetched {
+        biography: text(v.get("biography")),
+        birth_date: text(v.get("birthday")),
+        death_date: text(v.get("deathday")),
+        birth_place: text(v.get("place_of_birth")),
+        imdb_id: text(v.get("imdb_id")).or_else(|| text(ids.and_then(|i| i.get("imdb_id")))),
+        wikidata_id: text(ids.and_then(|i| i.get("wikidata_id"))),
+    })
 }
 
 /// Extract the leading `YYYY` from a TMDB `release_date` / `first_air_date`
@@ -1104,5 +1163,30 @@ mod tests {
         assert_eq!(people[0].name, "Actor 0");
         assert_eq!(people[29].name, "Actor 29");
         assert_eq!(people[29].sort_order, Some(29));
+    }
+
+    #[test]
+    fn a_person_record_gives_their_details_and_external_ids() {
+        let body = r#"{"id":31,"name":"Jane Doe","biography":"Born by the sea.",
+            "birthday":"1956-07-09","deathday":null,"place_of_birth":"Concord, California, USA",
+            "imdb_id":"nm0000158","external_ids":{"imdb_id":"nm0000158","wikidata_id":"Q2263"}}"#;
+        let fetched = parse_person_detail(body).unwrap();
+        assert_eq!(fetched.biography.as_deref(), Some("Born by the sea."));
+        assert_eq!(fetched.birth_date.as_deref(), Some("1956-07-09"));
+        assert_eq!(fetched.death_date, None);
+        assert_eq!(
+            fetched.birth_place.as_deref(),
+            Some("Concord, California, USA")
+        );
+        assert_eq!(fetched.imdb_id.as_deref(), Some("nm0000158"));
+        assert_eq!(fetched.wikidata_id.as_deref(), Some("Q2263"));
+        let blank_top = r#"{"imdb_id":"","external_ids":{"imdb_id":"nm0000158"}}"#;
+        assert_eq!(
+            parse_person_detail(blank_top).unwrap().imdb_id.as_deref(),
+            Some("nm0000158"),
+            "an empty top-level id does not hide the external one"
+        );
+        assert_eq!(parse_person_detail("[]"), None);
+        assert_eq!(parse_person_detail("not json"), None);
     }
 }

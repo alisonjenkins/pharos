@@ -39,6 +39,8 @@ pub struct PersonPage {
     pub films: Vec<Appearance>,
     /// The show they are in most first.
     pub shows: Vec<ShowAppearances>,
+    /// Their biography and external ids, as a metadata provider knows them.
+    pub details: Option<pharos_core::PersonDetails>,
 }
 
 /// Why there is no page to show.
@@ -161,10 +163,12 @@ async fn load(state: &AppState, user: &User, wire_id: &str) -> Result<PersonPage
             .chain(std::iter::repeat(UserItemData::default())),
     );
     let (films, shows) = arrange(&credits, seen);
+    let details = crate::person_details::current(state, &person).await;
     Ok(PersonPage {
         person,
         films,
         shows,
+        details,
     })
 }
 
