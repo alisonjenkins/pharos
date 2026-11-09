@@ -133,8 +133,11 @@ test.describe("pharos Dioxus UI", () => {
     const errors: string[] = [];
     page.on("pageerror", (e) => errors.push(`pageerror: ${e.message}`));
     page.on("requestfailed", (r) => {
-      // Ignore favicon misses + cancellations.
-      if (!r.url().includes("favicon")) {
+      // Ignore favicon misses + cancellations. With the native API off the
+      // app's `/pharos/session` probe is cancelled when Manage falls back
+      // to the older app, which is expected.
+      const cancelled = r.failure()?.errorText === "net::ERR_ABORTED";
+      if (!r.url().includes("favicon") && !cancelled) {
         errors.push(`requestfailed: ${r.url()} — ${r.failure()?.errorText}`);
       }
     });
