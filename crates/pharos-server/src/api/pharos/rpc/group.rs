@@ -1067,7 +1067,14 @@ impl Membership {
             return Ok(());
         }
         end_owned_cast(&self.session.state, user.id, self.member_id).await;
-        if let Some(group) = hub.detach_group(&self.key) {
+        let detached = hub.detach_group(&self.key);
+        tracing::info!(
+            device_id = %self.key, member_id = %self.member_id,
+            group = %detached.as_ref().map_or_else(|| "none".to_owned(), |g| g.group_id.to_string()),
+            detached = detached.is_some(),
+            "syncplay: native member left on request"
+        );
+        if let Some(group) = detached {
             let _ = group
                 .tx
                 .send(GroupMsg::RemoveMember {
