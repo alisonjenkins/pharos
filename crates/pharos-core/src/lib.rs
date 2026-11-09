@@ -1555,6 +1555,14 @@ pub struct SeriesMetadata {
     /// The show's IMDb and Rotten Tomatoes scores. Written only by
     /// [`RatingsStore::set_ratings`]; an upsert leaves them alone.
     pub ratings: ExternalRatings,
+    /// Spec 033 (V891): `"ambiguous"` when the match was a close call between
+    /// same-named shows, for an admin to check. Every upsert writes it, so a
+    /// later clear decision (or a manual match) clears it.
+    pub match_flag: Option<String>,
+    /// The candidate the flagged match beat, on `match_provider`.
+    pub match_runner_up_id: Option<String>,
+    /// That candidate's score in the decision that flagged the match.
+    pub match_runner_up_score: Option<f32>,
 }
 
 /// T9-series — one distinct show that needs (or is due for re-)enrichment,
@@ -1664,6 +1672,15 @@ pub struct SeriesIdentityRow {
     pub series_year: Option<u32>,
 }
 
+/// Spec 033 (V891) — one stored episode of a show, the local side of an
+/// episode-fit score.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeriesEpisodeRow {
+    pub path: String,
+    pub season: Option<u32>,
+    pub episode: Option<u32>,
+}
+
 /// Spec 033 — one row's new identity. `series_key: None` returns the row to
 /// its folder's key.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1708,6 +1725,14 @@ pub trait SeriesIdentityStore: Send + Sync {
         _updates: &[SeriesKeyUpdate],
     ) -> impl std::future::Future<Output = DomainResult<u64>> + Send {
         async { Ok(0) }
+    }
+
+    /// Every stored episode whose identity key is `series_key`.
+    fn series_episodes(
+        &self,
+        _series_key: &str,
+    ) -> impl std::future::Future<Output = DomainResult<Vec<SeriesEpisodeRow>>> + Send {
+        async { Ok(Vec::new()) }
     }
 
     /// The premiere year of each stored show match, by series key.
