@@ -1,8 +1,8 @@
 //! MPEG-TS video demux (spec 032 slice 3): the server sends native clients
 //! muxed MPEG-TS, not fMP4 (`is_web_client` in the server's `hls.rs` keeps
 //! fMP4 for browsers), and its `main` rung carries the title at source
-//! resolution. This pulls the video elementary stream's access units out of
-//! one segment for the feeder; audio is dropped until the AAudio step.
+//! resolution. This pulls the video access units and the AAC frames out of
+//! one segment, for the video feeder and the audio player.
 //!
 //! H.264 and HEVC in TS are already Annex B with their parameter sets in
 //! band, so an access unit goes to the decoder as it is.
@@ -15,6 +15,8 @@ const PAT_PID: u16 = 0;
 /// ISO 13818-1 `stream_type` values the feeder decodes.
 pub const STREAM_AVC: u8 = 0x1b;
 pub const STREAM_HEVC: u8 = 0x24;
+/// AAC in ADTS.
+pub const STREAM_AAC: u8 = 0x0f;
 
 /// One coded picture, with its presentation time.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -24,12 +26,21 @@ pub struct AccessUnit {
     pub data: Vec<u8>,
 }
 
+/// One segment's elementary streams.
+#[derive(Debug, Default)]
+pub struct Demuxed {
+    pub video: Vec<AccessUnit>,
+    /// AAC frames, one ADTS frame each, header included; `key` is always true.
+    pub audio: Vec<AccessUnit>,
+}
+
 /// The PIDs found so far; kept across segments, since a segment that misses
 /// its PAT or PMT still carries the same streams.
 #[derive(Debug, Default)]
 pub struct Demux {
     pmt_pid: Option<u16>,
     video: Option<(u16, u8)>,
+    audio: Option<u16>,
 }
 
 impl Demux {
@@ -38,12 +49,18 @@ impl Demux {
         self.video.map(|(_, t)| t)
     }
 
-    /// Every video access unit in `segment`, in decode order. A PES still
-    /// open at the segment's end is complete: the server's segmenter cuts
-    /// on access units.
+    /// Every video access unit in `segment`, in decode order.
     pub fn access_units(&mut self, segment: &[u8]) -> Result<Vec<AccessUnit>, String> {
-        let mut out = Vec::new();
-        let mut pes: Option<Vec<u8>> = None;
+        Ok(self.demux(segment)?.video)
+    }
+
+    /// Every video access unit and AAC frame in `segment`, in decode order.
+    /// A PES still open at the segment's end is complete: the server's
+    /// segmenter cuts on access units.
+    pub fn demux(&mut self, segment: &[u8]) -> Result<Demuxed, String> {
+        let mut out = Demuxed::default();
+        let mut video: Option<Vec<u8>> = None;
+        let mut audio: Option<Vec<u8>> = None;
         for (n, pkt) in segment.chunks(PACKET).enumerate() {
             if pkt.len() < PACKET {
                 break;
@@ -67,44 +84,132 @@ impl Demux {
             if pid == PAT_PID && start {
                 self.pmt_pid = pat(payload).or(self.pmt_pid);
             } else if Some(pid) == self.pmt_pid && start {
-                self.video = pmt(payload).or(self.video);
+                if let Some((v, a)) = pmt(payload) {
+                    self.video = v.or(self.video);
+                    self.audio = a.or(self.audio);
+                }
             } else if Some(pid) == self.video.map(|(p, _)| p) {
                 if start {
-                    if let Some(done) = pes.take() {
-                        out.extend(self.unit(&done)?);
+                    if let Some(done) = video.replace(payload.to_vec()) {
+                        out.video.extend(self.unit(&done)?);
                     }
-                    pes = Some(payload.to_vec());
-                } else if let Some(buf) = pes.as_mut() {
+                } else if let Some(buf) = video.as_mut() {
+                    buf.extend_from_slice(payload);
+                }
+            } else if Some(pid) == self.audio {
+                if start {
+                    if let Some(done) = audio.replace(payload.to_vec()) {
+                        adts_frames(&done, &mut out.audio)?;
+                    }
+                } else if let Some(buf) = audio.as_mut() {
                     buf.extend_from_slice(payload);
                 }
             }
         }
-        if let Some(done) = pes {
-            out.extend(self.unit(&done)?);
+        if let Some(done) = video {
+            out.video.extend(self.unit(&done)?);
+        }
+        if let Some(done) = audio {
+            adts_frames(&done, &mut out.audio)?;
         }
         Ok(out)
     }
 
     fn unit(&self, pes: &[u8]) -> Result<Option<AccessUnit>, String> {
-        if pes.len() < 9 || pes[..3] != [0, 0, 1] {
-            return Err("PES without a start code".into());
-        }
-        let header = 9 + usize::from(pes[8]);
-        if pes[7] & 0x80 == 0 {
-            // No PTS: nothing a decoder can schedule.
+        let Some((pts_us, data)) = pes_payload(pes)? else {
             return Ok(None);
-        }
-        let pts = timestamp(pes.get(9..14).ok_or("PES header cut short")?);
-        let data = pes.get(header..).ok_or("PES header overruns")?.to_vec();
+        };
         let hevc = self.stream_type() == Some(STREAM_HEVC);
-        let key = nal_types(&data, hevc).any(|t| is_key(t, hevc));
+        let key = nal_types(data, hevc).any(|t| is_key(t, hevc));
         Ok(Some(AccessUnit {
-            // 90 kHz to µs.
-            pts_us: pts * 100 / 9,
+            pts_us,
             key,
-            data,
+            data: data.to_vec(),
         }))
     }
+}
+
+/// A PES packet's presentation time in µs and its payload; `None` without a
+/// PTS, which leaves nothing a decoder can schedule.
+fn pes_payload(pes: &[u8]) -> Result<Option<(u64, &[u8])>, String> {
+    if pes.len() < 9 || pes[..3] != [0, 0, 1] {
+        return Err("PES without a start code".into());
+    }
+    let header = 9 + usize::from(pes[8]);
+    if pes[7] & 0x80 == 0 {
+        return Ok(None);
+    }
+    let pts = timestamp(pes.get(9..14).ok_or("PES header cut short")?);
+    let data = pes.get(header..).ok_or("PES header overruns")?;
+    // 90 kHz to µs.
+    Ok(Some((pts * 100 / 9, data)))
+}
+
+/// ADTS `sampling_frequency_index` to Hz.
+const ADTS_RATES: [u32; 13] = [
+    96_000, 88_200, 64_000, 48_000, 44_100, 32_000, 24_000, 22_050, 16_000, 12_000, 11_025, 8_000,
+    7_350,
+];
+
+/// What an ADTS header says about the stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AdtsConfig {
+    /// MPEG-4 audio object type (2 for AAC LC).
+    pub object_type: u8,
+    pub rate_index: u8,
+    pub sample_rate: u32,
+    pub channels: u8,
+}
+
+impl AdtsConfig {
+    pub fn parse(frame: &[u8]) -> Option<Self> {
+        if frame.len() < 7 || frame[0] != 0xff || frame[1] & 0xf0 != 0xf0 {
+            return None;
+        }
+        let rate_index = (frame[2] >> 2) & 0x0f;
+        Some(Self {
+            object_type: (frame[2] >> 6) + 1,
+            rate_index,
+            sample_rate: *ADTS_RATES.get(usize::from(rate_index))?,
+            channels: ((frame[2] & 1) << 2) | (frame[3] >> 6),
+        })
+    }
+
+    /// The two-byte `AudioSpecificConfig` a decoder takes as csd-0.
+    pub fn audio_specific_config(&self) -> [u8; 2] {
+        let v = (u16::from(self.object_type) << 11)
+            | (u16::from(self.rate_index) << 7)
+            | (u16::from(self.channels) << 3);
+        v.to_be_bytes()
+    }
+}
+
+/// The raw AAC payload of an ADTS frame, after its 7- or 9-byte header.
+pub fn adts_payload(frame: &[u8]) -> &[u8] {
+    let header = if frame.get(1).is_some_and(|b| b & 1 == 0) { 9 } else { 7 };
+    frame.get(header..).unwrap_or_default()
+}
+
+/// Splits an AAC PES into its ADTS frames, each timed from the PES's PTS at
+/// 1024 samples a raw data block.
+fn adts_frames(pes: &[u8], out: &mut Vec<AccessUnit>) -> Result<(), String> {
+    let Some((pts_us, mut data)) = pes_payload(pes)? else {
+        return Ok(());
+    };
+    let mut samples = 0u64;
+    while data.len() >= 7 {
+        let config = AdtsConfig::parse(data).ok_or("audio PES: lost ADTS sync")?;
+        let len = (usize::from(data[3] & 3) << 11) | (usize::from(data[4]) << 3) | usize::from(data[5] >> 5);
+        let frame = data.get(..len).filter(|_| len >= 7).ok_or("audio PES: ADTS frame cut short")?;
+        out.push(AccessUnit {
+            pts_us: pts_us + samples * 1_000_000 / u64::from(config.sample_rate),
+            key: true,
+            data: frame.to_vec(),
+        });
+        samples += 1024 * (u64::from(data[6] & 3) + 1);
+        data = &data[len..];
+    }
+    Ok(())
 }
 
 /// The first program's PMT PID.
@@ -117,22 +222,26 @@ fn pat(payload: &[u8]) -> Option<u16> {
     })
 }
 
-/// The first H.264 or HEVC stream's PID and type.
-fn pmt(payload: &[u8]) -> Option<(u16, u8)> {
+/// The first H.264 or HEVC stream's PID and type, and the first AAC (ADTS)
+/// stream's PID.
+fn pmt(payload: &[u8]) -> Option<(Option<(u16, u8)>, Option<u16>)> {
     let table = section(payload)?;
     let end = section_end(table)?;
     let info = (usize::from(table.get(10)? & 0x0f) << 8) | usize::from(*table.get(11)?);
     let mut at = 12 + info;
+    let (mut video, mut audio) = (None, None);
     while at + 5 <= end {
         let kind = table[at];
         let pid = (u16::from(table[at + 1] & 0x1f) << 8) | u16::from(table[at + 2]);
         let es_info = (usize::from(table[at + 3] & 0x0f) << 8) | usize::from(table[at + 4]);
-        if kind == STREAM_AVC || kind == STREAM_HEVC {
-            return Some((pid, kind));
+        if (kind == STREAM_AVC || kind == STREAM_HEVC) && video.is_none() {
+            video = Some((pid, kind));
+        } else if kind == STREAM_AAC && audio.is_none() {
+            audio = Some(pid);
         }
         at += 5 + es_info;
     }
-    None
+    Some((video, audio))
 }
 
 /// The section after the pointer field.
@@ -303,16 +412,48 @@ mod tests {
     }
 
     #[test]
-    fn pulls_each_video_access_unit_with_its_time_and_drops_audio() {
+    fn pulls_each_video_access_unit_with_its_time() {
         let mut demux = Demux::default();
         let units = demux.access_units(&segment(STREAM_AVC)).unwrap();
         assert_eq!(demux.stream_type(), Some(STREAM_AVC));
-        assert_eq!(units.len(), 2, "two video access units, no audio");
+        assert_eq!(units.len(), 2, "two video access units");
         assert_eq!(units[0].data, idr(), "a PES split over three packets is whole");
         assert!(units[0].key);
         assert_eq!(units[0].pts_us, 1_400_000, "126000 at 90 kHz");
         assert!(!units[1].key);
         assert_eq!(units[1].pts_us, 1_441_666);
+    }
+
+    /// An AAC LC, 48 kHz, stereo ADTS frame of `len` bytes.
+    fn adts(len: usize) -> Vec<u8> {
+        let mut f = vec![
+            0xff,
+            0xf1,
+            0x4c,
+            0x80 | ((len >> 11) & 3) as u8,
+            (len >> 3) as u8,
+            (((len & 7) << 5) | 0x1f) as u8,
+            0xfc,
+        ];
+        f.resize(len, 0x21);
+        f
+    }
+
+    #[test]
+    fn splits_an_audio_pes_into_timed_adts_frames() {
+        let mut seg = pat_packet();
+        seg.extend(pmt_packet(STREAM_AVC));
+        let pes = [adts(150), adts(220)].concat();
+        seg.extend(pes_packets(AUDIO_PID, 90_000, &pes));
+        let out = Demux::default().demux(&seg).unwrap();
+        assert_eq!(out.audio.len(), 2);
+        assert_eq!(out.audio[0].data, adts(150));
+        assert_eq!(out.audio[0].pts_us, 1_000_000);
+        assert_eq!(out.audio[1].pts_us, 1_021_333, "1024 samples at 48 kHz later");
+        let config = AdtsConfig::parse(&out.audio[0].data).unwrap();
+        assert_eq!((config.object_type, config.sample_rate, config.channels), (2, 48_000, 2));
+        assert_eq!(config.audio_specific_config(), [0x11, 0x90]);
+        assert_eq!(adts_payload(&out.audio[0].data).len(), 143);
     }
 
     #[test]
@@ -357,7 +498,13 @@ mod tests {
         let mut demux = Demux::default();
         let bytes = std::fs::read(path).unwrap();
         let started = std::time::Instant::now();
-        let units = demux.access_units(&bytes).unwrap();
+        let Demuxed { video: units, audio } = demux.demux(&bytes).unwrap();
+        println!(
+            "audio frames={} first_pts_us={:?} config={:?}",
+            audio.len(),
+            audio.first().map(|a| a.pts_us),
+            audio.first().and_then(|a| AdtsConfig::parse(&a.data))
+        );
         println!("demux bytes={} ms={:.2}", bytes.len(), started.elapsed().as_secs_f64() * 1e3);
         let keys = units.iter().filter(|u| u.key).count();
         println!(
