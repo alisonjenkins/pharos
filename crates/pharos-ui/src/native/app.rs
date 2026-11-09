@@ -3671,6 +3671,9 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
     // Set by a version switch: `picks` then name the primary's streams, for
     // the next negotiation to map onto the new file.
     let picks_in_primary = use_hook(|| Rc::new(Cell::new(false)));
+    // The version whose runtime gap was last told, so a renegotiation on the
+    // same file does not tell it again.
+    let gap_told = use_hook(|| Rc::new(RefCell::new(None::<String>)));
     use_effect(move || pending.set(None));
     // What the connection has shown about this video, kept across the
     // reloads its own decisions cause; the cap it asks for rides the next
@@ -3801,6 +3804,7 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
         let resume_from = Rc::clone(&resume_from);
         let notify = Rc::clone(&gap_notify);
         let picks_in_primary = Rc::clone(&carry_flag);
+        let gap_told = Rc::clone(&gap_told);
         let started_over = Rc::clone(&started_over);
         let asked = picks();
         let picked_here = version_pick();
@@ -3935,7 +3939,9 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
                             ms(&version),
                             group_start.is_some()
                         ));
-                        if group_start.is_some() {
+                        let told = gap_told.borrow().as_deref() == Some(version.as_str());
+                        if group_start.is_some() && !told {
+                            gap_told.replace(Some(version.clone()));
                             notify(versions::runtime_gap_notice(gap_ms));
                         }
                     }
