@@ -120,8 +120,17 @@ pub(crate) async fn require_bearer(
     route: &'static str,
 ) -> Result<pharos_core::User, actix_web::Error> {
     let token = auth_extractor::media_token(Some(state), req).await;
+    // A playback's subtitle and font URLs carry its PlaySessionId, not a
+    // token (V1050).
+    if token.is_none() {
+        if let Some(media_id) = pharos_jellyfin_api::dto::parse_item_id(id) {
+            if let Some(user) = play_capability::capability_user(state, req, media_id).await? {
+                return Ok(user);
+            }
+        }
+    }
     let pattern = req.match_pattern();
-    let user = crate::services::access::authenticate(
+    match crate::services::access::authenticate(
         state,
         token.as_deref(),
         id,
@@ -130,9 +139,22 @@ pub(crate) async fn require_bearer(
         pattern.as_deref(),
     )
     .await
-    .map_err(access_error)?;
-    auth_extractor::note_header_credential(req);
-    Ok(user)
+    {
+        Ok(user) => {
+            auth_extractor::note_header_credential(req);
+            Ok(user)
+        }
+        // A stale cookie must not shadow a live capability.
+        Err(crate::services::access::ItemHidden::Unauthenticated) if token.is_some() => {
+            let capability = match pharos_jellyfin_api::dto::parse_item_id(id) {
+                Some(media_id) => play_capability::capability_user(state, req, media_id).await?,
+                None => None,
+            };
+            capability
+                .ok_or_else(|| access_error(crate::services::access::ItemHidden::Unauthenticated))
+        }
+        Err(hidden) => Err(access_error(hidden)),
+    }
 }
 
 /// The bearer of an image request, or `None` for an anonymous one. Image
