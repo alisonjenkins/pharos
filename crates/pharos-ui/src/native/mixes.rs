@@ -22,6 +22,7 @@ use super::listen::Icon;
 use super::platform;
 use super::queue::{Queue, QueueAction, QueueCtx, Source, Track};
 use super::route::Route;
+use super::stage::StageCtx;
 use super::views::Nav;
 
 /// Fewer upcoming songs than this and the mix asks for more.
@@ -48,6 +49,18 @@ pub struct ActiveMix {
     pub play_first: bool,
     /// Why the mix picked each song, as the server said.
     pub reasons: HashMap<ItemRef, Vec<String>>,
+}
+
+/// Counts the saved-mix lists stored this session, provided at the app's
+/// root: a list shown elsewhere (the Playlists tab) reloads when it moves,
+/// so a mix saved or deleted from the queue panel shows there too (B897).
+#[derive(Clone, Copy)]
+pub struct SavedRev(pub Signal<u32>);
+
+fn bump(rev: Option<SavedRev>) {
+    if let Some(SavedRev(mut r)) = rev {
+        *r.write() += 1;
+    }
 }
 
 /// The app-wide mix, provided beside the queue at the app's root.
@@ -353,6 +366,7 @@ pub fn MixBar(playing: Option<ItemRef>) -> Element {
     let mut edits = use_signal(|| 0u64);
     let mut saved = use_signal(|| None::<Vec<SavedMix>>);
     let mut load_error = use_signal(|| None::<String>);
+    let rev = try_use_context::<SavedRev>();
     // `playing` is None in a SyncPlay group, where the group picks the
     // songs: no mix there.
     let (Some(MixCtx(mut mix)), Some(QueueCtx(mut queue)), Some(_)) = (
@@ -414,11 +428,14 @@ pub fn MixBar(playing: Option<ItemRef>) -> Element {
         saved.set(Some(list.clone()));
         spawn(async move {
             match store_saved(&api, &list).await {
-                Ok(()) => platform::info(&format!(
-                    "pharos: mix saved mix={:?} total={}",
-                    m.name,
-                    list.len()
-                )),
+                Ok(()) => {
+                    platform::info(&format!(
+                        "pharos: mix saved mix={:?} total={}",
+                        m.name,
+                        list.len()
+                    ));
+                    bump(rev);
+                }
                 Err(e) => {
                     platform::warn(&format!("pharos: mix not saved mix={:?} error={e}", m.name));
                     roll_back(saved, &list, before);
@@ -445,10 +462,13 @@ pub fn MixBar(playing: Option<ItemRef>) -> Element {
         list.retain(|s| s.name != name);
         saved.set(Some(list.clone()));
         spawn(async move {
-            if let Err(e) = store_saved(&api, &list).await {
-                platform::warn(&format!("pharos: mix not deleted mix={name:?} error={e}"));
-                roll_back(saved, &list, before);
-                say(not_deleted_line(&name, &e));
+            match store_saved(&api, &list).await {
+                Ok(()) => bump(rev),
+                Err(e) => {
+                    platform::warn(&format!("pharos: mix not deleted mix={name:?} error={e}"));
+                    roll_back(saved, &list, before);
+                    say(not_deleted_line(&name, &e));
+                }
             }
         });
     };
@@ -614,6 +634,235 @@ pub fn MixBar(playing: Option<ItemRef>) -> Element {
                     },
                 }
             })}
+        }
+    }
+}
+
+/// Where a mix on a music library's Playlists tab comes from (B897/V846).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShelfKind {
+    /// One every first-party client offers.
+    Preset,
+    /// One the listener saved.
+    Saved,
+}
+
+impl ShelfKind {
+    /// The log and test label; stable.
+    pub fn label(self) -> &'static str {
+        match self {
+            ShelfKind::Preset => "preset",
+            ShelfKind::Saved => "saved",
+        }
+    }
+}
+
+/// The mixes the Playlists tab offers, in order: the presets, then the
+/// listener's own as saved.
+pub fn shelf(saved: &[SavedMix]) -> Vec<(ShelfKind, SavedMix)> {
+    presets()
+        .into_iter()
+        .map(|m| (ShelfKind::Preset, m))
+        .chain(saved.iter().cloned().map(|m| (ShelfKind::Saved, m)))
+        .collect()
+}
+
+/// One rule as a tile says it, value included.
+fn rule_text(r: &Rule) -> String {
+    let what = match &r.test {
+        Test::Genre(s) | Test::Artist(s) | Test::Album(s) => s.clone(),
+        Test::Years { from, to } if from == to => from.to_string(),
+        Test::Years { from, to } => format!("{from}–{to}"),
+        Test::Favorite => "favourites".to_owned(),
+        Test::NeverPlayed => "never played".to_owned(),
+        Test::PlayCount { min, max } if *max == u32::MAX => format!("played {min}+ times"),
+        Test::PlayCount { min, max } => format!("played {min}–{max} times"),
+        Test::NotPlayedForDays(d) => format!("not played for {d} days"),
+        Test::PlayedWithinDays(d) => format!("played in the last {d} days"),
+        Test::AddedWithinDays(d) => format!("added in the last {d} days"),
+        Test::LengthSecs { min, max } => format!("{}–{} long", length(*min), length(*max)),
+        Test::LikeSeed => "like the last song".to_owned(),
+        Test::Tempo { min, max } => format!("{min}–{max} BPM"),
+        Test::Energy { min, max } => format!("energy {min}–{max}%"),
+    };
+    format!("{} {what}", r.weight.label())
+}
+
+/// A song length as a tile says it: whole minutes as "4 min", else m:ss.
+fn length(secs: u32) -> String {
+    if secs % 60 == 0 {
+        format!("{} min", secs / 60)
+    } else {
+        format!("{}:{:02}", secs / 60, secs % 60)
+    }
+}
+
+/// The mix that is on, when it is this tile's: by name and rules, since a
+/// saved mix may share a preset's name.
+pub fn is_active<'a>(active: Option<&'a ActiveMix>, m: &SavedMix) -> Option<&'a ActiveMix> {
+    active.filter(|a| a.name == m.name && a.spec == m.spec)
+}
+
+/// What the Playlists tab logs when a tile starts its mix.
+pub fn shelf_start_line(name: &str, kind: ShelfKind) -> String {
+    format!("pharos: mix shelf start mix={name:?} kind={}", kind.label())
+}
+
+/// What a mix picks, in a line: its rules in order, or any song.
+pub fn describe(spec: &MixSpec) -> String {
+    if spec.rules.is_empty() {
+        return "Any song".to_owned();
+    }
+    spec.rules
+        .iter()
+        .map(rule_text)
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
+/// A music library's Playlists tab (B897/V846): every mix the listener can
+/// start, presets first, then their saved ones. A tile starts its mix and
+/// opens the player on the first song, so a mix is picked before the
+/// player, not only from its queue panel.
+#[component]
+pub fn MixShelf() -> Element {
+    let ctx = try_use_context::<Ctx>();
+    let together = try_use_context::<Together>();
+    let mix_ctx = try_use_context::<MixCtx>();
+    let queue_ctx = try_use_context::<QueueCtx>();
+    let stage = try_use_context::<StageCtx>();
+    let nav = try_use_context::<Nav>();
+    let rev = try_use_context::<SavedRev>();
+    let mut saved = use_signal(|| None::<Result<Vec<SavedMix>, String>>);
+    let mut attempt = use_signal(|| 0u32);
+    // Counts loads, so only the newest one's answer is kept.
+    let mut loads = use_signal(|| 0u64);
+    use_effect(move || {
+        let tries = attempt();
+        // A list stored from the queue panel reloads this one.
+        let _ = rev.map(|SavedRev(r)| r());
+        // Read, not peeked: the list loads once the API connects.
+        let Some(api) = ctx.and_then(|c| c.api.read().clone()) else {
+            return;
+        };
+        let load = *loads.peek() + 1;
+        loads.set(load);
+        spawn(async move {
+            let got = load_saved(&api).await;
+            if *loads.peek() != load {
+                return;
+            }
+            match &got {
+                Ok(list) => platform::info(&format!(
+                    "pharos: mix shelf loaded saved={} attempt={tries}",
+                    list.len()
+                )),
+                Err(e) => platform::warn(&format!(
+                    "pharos: mix shelf saved list unavailable attempt={tries} error={e}"
+                )),
+            }
+            saved.set(Some(got));
+        });
+    });
+    let in_group = together.as_ref().is_some_and(|t| t.view.read().active);
+    let active = mix_ctx.and_then(|MixCtx(m)| m.read().clone());
+    let state = saved();
+    let mine = state.clone().and_then(Result::ok).unwrap_or_default();
+    let tiles = shelf(&mine);
+    rsx! {
+        section { class: "pharos-mix-shelf", aria_label: "Playlists",
+            if in_group {
+                p { class: "pharos-muted pharos-mix-shelf-note",
+                    "In a Together group the group picks the songs, so mixes are off."
+                }
+            }
+            ul { class: "pharos-mix-tiles",
+                for (i, (kind, m)) in tiles.into_iter().enumerate() {
+                    li {
+                        key: "{kind.label()}-{m.name}",
+                        class: "pharos-mix-tile",
+                        "data-kind": kind.label(),
+                        {
+                            let on = is_active(active.as_ref(), &m);
+                            let rules_id = format!("pharos-mix-rules-{i}");
+                            let is_on = on.is_some();
+                            let status = on.and_then(status_text);
+                            let newer = m.newer.is_some();
+                            let name = m.name.clone();
+                            let spec = m.spec.clone();
+                            rsx! {
+                                button {
+                                    class: "pharos-mix-tile-play",
+                                    r#type: "button",
+                                    "data-key-action": "play",
+                                    disabled: in_group || newer,
+                                    title: if newer { "Made with a newer Pharos app" } else { "" },
+                                    aria_label: if is_on { format!("Open the player for {}", m.name) } else { format!("Play the mix {}", m.name) },
+                                    aria_describedby: "{rules_id}",
+                                    onclick: move |_| {
+                                        // The mix that is on opens the player
+                                        // rather than starting it again, which
+                                        // would cut off the song playing.
+                                        if is_on {
+                                            let playing = stage.and_then(|StageCtx(s)| s.peek().item);
+                                            if let (Some(id), Some(nav)) = (playing, nav) {
+                                                platform::info(&format!("pharos: mix shelf open mix={name:?}"));
+                                                nav.0.call(Route::Watch(id));
+                                            }
+                                            return;
+                                        }
+                                        let (Some(MixCtx(mut mix)), Some(QueueCtx(mut queue))) = (mix_ctx, queue_ctx) else {
+                                            platform::warn(&format!(
+                                                "pharos: mix shelf start refused mix={name:?} reason=no_queue"
+                                            ));
+                                            return;
+                                        };
+                                        platform::info(&shelf_start_line(&name, kind));
+                                        start(&mut queue.write(), &mut mix.write(), name.clone(), spec.clone(), true);
+                                    },
+                                    span { class: "pharos-mix-tile-art", aria_hidden: "true",
+                                        Icon { path: ICON_MIX }
+                                    }
+                                    span { class: "pharos-mix-tile-name", "{m.name}" }
+                                    span { id: "{rules_id}", class: "pharos-muted pharos-mix-tile-rules", {describe(&m.spec)} }
+                                }
+                                // Beside the button, not in it: a button's
+                                // content is not announced as a live region.
+                                if is_on {
+                                    span { class: "pharos-mix-tile-on", role: "status",
+                                        {status.unwrap_or_else(|| "Playing".to_owned())}
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            match state {
+                None => rsx! {
+                    p { class: "pharos-muted pharos-mix-shelf-note", "Loading your mixes…" }
+                },
+                Some(Err(e)) => rsx! {
+                    div { class: "pharos-mix-shelf-note", role: "alert",
+                        p { "Couldn't load your saved mixes: {e}" }
+                        button {
+                            class: "pharos-chip",
+                            r#type: "button",
+                            onclick: move |_| {
+                                saved.set(None);
+                                *attempt.write() += 1;
+                            },
+                            "Try again"
+                        }
+                    }
+                },
+                Some(Ok(list)) if list.is_empty() => rsx! {
+                    p { class: "pharos-muted pharos-mix-shelf-note",
+                        "Mixes you make with New mix in the player's queue show here too."
+                    }
+                },
+                Some(Ok(_)) => rsx! {},
+            }
         }
     }
 }
@@ -1312,5 +1561,194 @@ mod tests {
         assert!(html.contains("Mix: Test"), "{html}");
         assert!(html.contains("Stop mix"), "{html}");
         assert!(html.contains("This mix has run out of songs."), "{html}");
+    }
+
+    /// B897/V846: the Playlists tab lists the presets first, then the
+    /// listener's saved mixes in their saved order.
+    #[test]
+    fn the_shelf_lists_presets_then_saved_mixes() {
+        let mine = vec![
+            SavedMix::new("Late night", MixSpec::default()),
+            SavedMix::new("Gym", MixSpec::default()),
+        ];
+        let tiles = shelf(&mine);
+        let names: Vec<(&str, &str)> = tiles
+            .iter()
+            .map(|(k, m)| (k.label(), m.name.as_str()))
+            .collect();
+        let presets = presets().len();
+        assert_eq!(tiles.len(), presets + 2);
+        assert!(
+            names[..presets].iter().all(|(k, _)| *k == "preset"),
+            "{names:?}"
+        );
+        assert_eq!(
+            names[presets..],
+            [("saved", "Late night"), ("saved", "Gym")]
+        );
+        assert_ne!(ShelfKind::Preset.label(), ShelfKind::Saved.label());
+    }
+
+    #[test]
+    fn a_mix_is_described_by_its_rules_with_their_values() {
+        assert_eq!(describe(&MixSpec::default()), "Any song");
+        let spec = MixSpec {
+            rules: vec![
+                Rule {
+                    weight: Weight::Require,
+                    share: 0,
+                    test: Test::Genre("Trip-hop".into()),
+                },
+                Rule {
+                    weight: Weight::Avoid,
+                    share: 0,
+                    test: Test::PlayCount {
+                        min: 5,
+                        max: u32::MAX,
+                    },
+                },
+                Rule {
+                    weight: Weight::Prefer,
+                    share: 0,
+                    test: Test::NotPlayedForDays(90),
+                },
+            ],
+            ..MixSpec::default()
+        };
+        assert_eq!(
+            describe(&spec),
+            "Only Trip-hop · Less played 5+ times · More not played for 90 days"
+        );
+    }
+
+    /// B897/V846: every preset is on the Playlists tab before any player
+    /// opens, each a button that says what it picks.
+    #[test]
+    fn the_playlists_tab_shows_every_preset_as_a_play_button() {
+        let mut dom = VirtualDom::new(|| {
+            use_context_provider(|| QueueCtx(Signal::new(Queue::default())));
+            use_context_provider(|| MixCtx(Signal::new(None)));
+            rsx! { MixShelf {} }
+        });
+        dom.rebuild_in_place();
+        let html = dioxus_ssr::render(&dom);
+        for preset in presets() {
+            assert!(
+                html.contains(&format!(r#"aria-label="Play the mix {}""#, preset.name)),
+                "{} missing: {html}",
+                preset.name
+            );
+            assert!(html.contains(&describe(&preset.spec)), "{html}");
+        }
+        assert!(html.contains("Loading your mixes"), "{html}");
+        assert!(
+            !html.contains("pharos-mix-tile-on"),
+            "nothing is playing: {html}"
+        );
+    }
+
+    #[test]
+    fn the_mix_that_is_on_says_so_on_its_tile() {
+        let mut dom = VirtualDom::new(|| {
+            use_context_provider(|| QueueCtx(Signal::new(Queue::default())));
+            use_context_provider(|| {
+                let preset = presets()
+                    .into_iter()
+                    .find(|p| p.name == "Favourites")
+                    .unwrap();
+                MixCtx(Signal::new(Some(ActiveMix {
+                    name: preset.name,
+                    asking: true,
+                    ..on(preset.spec)
+                })))
+            });
+            rsx! { MixShelf {} }
+        });
+        dom.rebuild_in_place();
+        let html = dioxus_ssr::render(&dom);
+        assert_eq!(html.matches("pharos-mix-tile-on").count(), 1, "{html}");
+        assert!(html.contains("Finding songs…"), "{html}");
+    }
+
+    #[test]
+    fn a_tile_logs_the_mix_it_starts_and_where_it_came_from() {
+        assert_eq!(
+            shelf_start_line("Deep cuts", ShelfKind::Preset),
+            "pharos: mix shelf start mix=\"Deep cuts\" kind=preset"
+        );
+        assert_eq!(
+            shelf_start_line("Gym", ShelfKind::Saved),
+            "pharos: mix shelf start mix=\"Gym\" kind=saved"
+        );
+    }
+
+    #[test]
+    fn single_years_and_odd_lengths_read_plainly() {
+        let one = |test| MixSpec {
+            rules: vec![Rule {
+                weight: Weight::Require,
+                share: 0,
+                test,
+            }],
+            ..MixSpec::default()
+        };
+        assert_eq!(
+            describe(&one(Test::Years {
+                from: 1999,
+                to: 1999
+            })),
+            "Only 1999"
+        );
+        assert_eq!(
+            describe(&one(Test::LengthSecs { min: 30, max: 240 })),
+            "Only 0:30–4 min long"
+        );
+    }
+
+    /// A saved mix named like a preset is not marked as on when the preset is.
+    #[test]
+    fn only_the_tile_of_the_mix_that_is_on_says_so() {
+        let mut dom = VirtualDom::new(|| {
+            use_context_provider(|| QueueCtx(Signal::new(Queue::default())));
+            let preset = presets()
+                .into_iter()
+                .find(|p| p.name == "Favourites")
+                .unwrap();
+            use_context_provider(|| {
+                MixCtx(Signal::new(Some(ActiveMix {
+                    name: preset.name.clone(),
+                    ..on(preset.spec.clone())
+                })))
+            });
+            rsx! { MixShelf {} }
+        });
+        dom.rebuild_in_place();
+        let html = dioxus_ssr::render(&dom);
+        assert!(
+            html.contains(r#"aria-label="Open the player for Favourites""#),
+            "{html}"
+        );
+        assert_eq!(html.matches("pharos-mix-tile-on").count(), 1, "{html}");
+    }
+
+    #[test]
+    fn a_saved_mix_named_like_a_preset_is_not_the_preset() {
+        let preset = presets()
+            .into_iter()
+            .find(|p| p.name == "Favourites")
+            .unwrap();
+        let playing = ActiveMix {
+            name: preset.name.clone(),
+            ..on(preset.spec.clone())
+        };
+        let mine = SavedMix::new("Favourites", MixSpec::default());
+        assert!(is_active(Some(&playing), &mine).is_none());
+        assert!(is_active(Some(&playing), &preset).is_some());
+        let same = SavedMix::new("Favourites", preset.spec.clone());
+        assert!(
+            is_active(Some(&playing), &same).is_some(),
+            "same name and rules is the same mix"
+        );
+        assert!(is_active(None, &preset).is_none());
     }
 }
