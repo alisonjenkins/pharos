@@ -1628,9 +1628,20 @@ pub(crate) const TV_MATCH_VERSION: u32 = 2;
 /// episode search matches is recorded.
 const TV_MATCH_VERSION_KEY: &str = "tv_match_version";
 
-/// Key recording the [`TV_MATCH_VERSION`] whose survey a dry run has already
-/// logged, so a dry run surveys once per version rather than every pass.
+/// Key recording the [`dry_run_marker`] whose survey a dry run has already
+/// logged, so a dry run surveys once per version and survey revision rather
+/// than every pass.
 const TV_MATCH_SURVEY_DRY_RUN_KEY: &str = "tv_match_survey_dry_run";
+
+/// Bump when [`survey_series_identity`] selects differently, so the next
+/// dry run surveys again under the same matcher version. `apply` records
+/// only [`TV_MATCH_VERSION`]. r2: B982/B983 run window.
+const SURVEY_REVISION: u32 = 2;
+
+/// What [`TV_MATCH_SURVEY_DRY_RUN_KEY`] holds once a dry run surveyed `version`.
+fn dry_run_marker(version: &str) -> String {
+    format!("{version}.r{SURVEY_REVISION}")
+}
 
 /// Re-ask stored matches once the matcher that chose them has changed.
 ///
@@ -1684,13 +1695,14 @@ where
             .map_err(config);
     };
     let mode = cfg.series_identity_repair;
+    let marker = dry_run_marker(&want);
     if mode == RepairMode::DryRun
         && store
             .load_named_config(TV_MATCH_SURVEY_DRY_RUN_KEY)
             .await
             .map_err(config)?
             .as_deref()
-            == Some(want.as_str())
+            == Some(marker.as_str())
     {
         return Ok(());
     }
@@ -1698,7 +1710,7 @@ where
     survey.record(mode, &from, &want);
     if mode == RepairMode::DryRun {
         return store
-            .set_named_config(TV_MATCH_SURVEY_DRY_RUN_KEY, &want)
+            .set_named_config(TV_MATCH_SURVEY_DRY_RUN_KEY, &marker)
             .await
             .map_err(config);
     }
@@ -6503,8 +6515,8 @@ mod tests {
             Some("1")
         );
         assert_eq!(
-            version(&s, TV_MATCH_SURVEY_DRY_RUN_KEY).await.as_deref(),
-            Some("2")
+            version(&s, TV_MATCH_SURVEY_DRY_RUN_KEY).await,
+            Some(dry_run_marker("2"))
         );
         assert!(s
             .series_needing_match(10, NOW - 1)
@@ -6623,6 +6635,46 @@ mod tests {
             .unwrap();
 
         assert_eq!(survey.episodes, [(4, RepairReason::OutsideRun)]);
+    }
+
+    /// A dry run surveys again when the survey revision moved under the same
+    /// matcher version (a marker from before revisions, or another revision),
+    /// and not while the marker is current.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_dry_run_surveys_again_after_a_survey_revision_bump() {
+        let s = store().await;
+        put_titled_episode(&s, 1, BSG, (1, 1), "33").await;
+        pin(&s, BSG, "73545", NOW).await;
+        set_version(&s, TV_MATCH_VERSION_KEY, "1").await;
+        let tvdb = bsg_search(FakeEnricher::tvdb());
+        let current = dry_run_marker(&TV_MATCH_VERSION.to_string());
+
+        for stale in ["2", "2.r1"] {
+            set_version(&s, TV_MATCH_SURVEY_DRY_RUN_KEY, stale).await;
+            let searches = tvdb.searched();
+            gate(&s, &tvdb, &MetadataConfig::default()).await;
+            assert!(
+                tvdb.searched() > searches,
+                "marker {stale} was not re-surveyed"
+            );
+            assert_eq!(
+                version(&s, TV_MATCH_SURVEY_DRY_RUN_KEY).await,
+                Some(current.clone())
+            );
+        }
+
+        let searches = tvdb.searched();
+        gate(&s, &tvdb, &MetadataConfig::default()).await;
+        assert_eq!(
+            tvdb.searched(),
+            searches,
+            "a current marker surveys nothing"
+        );
+        assert_eq!(
+            version(&s, TV_MATCH_VERSION_KEY).await.as_deref(),
+            Some("1"),
+            "a dry run never records the matcher version"
+        );
     }
 
     const FLASH: &str = "/tv/The Flash";
