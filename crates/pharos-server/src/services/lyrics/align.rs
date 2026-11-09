@@ -21,7 +21,8 @@ use super::{Lyrics, WordStamp};
 /// Bumped when the aligner's answers change for the same song and lines, so
 /// word times cached from an older aligner are asked for again.
 /// 2: star tokens stop words smearing across instrumental breaks.
-const ALIGN_VERSION: u32 = 2;
+/// 3: lyrics timed for another cut are shifted onto the audio first (B936).
+const ALIGN_VERSION: u32 = 3;
 
 /// Time alignment of a whole song can take on CPU; a worker may run up to this
 /// long before timing out.
@@ -43,11 +44,28 @@ struct Job {
     key: String,
 }
 
+/// The aligner's answer for a song: word stamps per line, and how far it
+/// found the song's lyric stamps to be off from the audio (B936).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Aligned {
+    pub lines: Vec<Vec<WordStamp>>,
+    /// Added to every line's start to land it on the singing; positive when
+    /// the lyrics were early.
+    pub offset_ms: i64,
+}
+
+impl Aligned {
+    /// Move a line start by the song's offset, keeping it at or after zero.
+    pub fn shift(&self, start_ms: u64) -> u64 {
+        start_ms.saturating_add_signed(self.offset_ms)
+    }
+}
+
 /// Outcome of looking up aligned word stamps for a song.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Lookup {
     /// Word timestamps are ready for every line.
-    Ready(Vec<Vec<WordStamp>>),
+    Ready(Aligned),
     /// Alignment is queued or currently in flight.
     Pending,
     /// Alignment cannot be performed or the queue is full.
@@ -61,7 +79,7 @@ pub struct AlignCache {
 }
 
 /// Word stamps per line, keyed by item id, with the key they were aligned for.
-type Remembered = HashMap<u64, (String, Vec<Vec<WordStamp>>)>;
+type Remembered = HashMap<u64, (String, Aligned)>;
 
 enum CacheBackend {
     Disk(PathBuf),
@@ -72,6 +90,8 @@ enum CacheBackend {
 struct WordsRecord {
     key: String,
     lines: Vec<Vec<WordEntry>>,
+    #[serde(default)]
+    offset_ms: i64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -93,7 +113,7 @@ impl AlignCache {
     }
 
     /// Retrieve cached word stamps for `id` matching `key`, if present.
-    pub fn get(&self, id: u64, key: &str) -> Option<Vec<Vec<WordStamp>>> {
+    pub fn get(&self, id: u64, key: &str) -> Option<Aligned> {
         match &*self.backend {
             CacheBackend::Disk(dir) => {
                 let path = dir.join(format!("{id}.words.json"));
@@ -115,8 +135,8 @@ impl AlignCache {
                 if record.key != key {
                     return None;
                 }
-                Some(
-                    record
+                Some(Aligned {
+                    lines: record
                         .lines
                         .into_iter()
                         .map(|line| {
@@ -128,7 +148,8 @@ impl AlignCache {
                                 .collect()
                         })
                         .collect(),
-                )
+                    offset_ms: record.offset_ms,
+                })
             }
             CacheBackend::Memory(mem) => {
                 let map = match mem.lock() {
@@ -145,13 +166,15 @@ impl AlignCache {
     }
 
     /// Persist word stamps for `id` under `key`.
-    pub fn put(&self, id: u64, key: String, lines: Vec<Vec<WordStamp>>) {
+    pub fn put(&self, id: u64, key: String, aligned: Aligned) {
         match &*self.backend {
             CacheBackend::Disk(dir) => {
                 let path = dir.join(format!("{id}.words.json"));
                 let record = WordsRecord {
                     key,
-                    lines: lines
+                    offset_ms: aligned.offset_ms,
+                    lines: aligned
+                        .lines
                         .iter()
                         .map(|line| {
                             line.iter()
@@ -172,7 +195,7 @@ impl AlignCache {
                     Ok(m) => m,
                     Err(poisoned) => poisoned.into_inner(),
                 };
-                map.insert(id, (key, lines));
+                map.insert(id, (key, aligned));
             }
         }
     }
@@ -295,10 +318,16 @@ impl Aligner {
         }
 
         let body = resp.text().await.map_err(|e| format!("body: {e}"))?;
-        let words = parse_answer(&body, job.lines.len())
+        let aligned = parse_answer(&body, job.lines.len())
             .ok_or_else(|| "invalid aligner response".to_string())?;
+        tracing::info!(
+            media.id = job.id,
+            lines = job.lines.len(),
+            offset_ms = aligned.offset_ms,
+            "lyrics: aligned"
+        );
 
-        self.cache.put(job.id, job.key.clone(), words);
+        self.cache.put(job.id, job.key.clone(), aligned);
         Ok(())
     }
 
@@ -362,9 +391,9 @@ impl Aligner {
             let _ = write!(key, "{byte:02x}");
         }
 
-        if let Some(words) = self.cache.get(item.id, &key) {
-            if words.len() == job_lines.len() {
-                return Lookup::Ready(words);
+        if let Some(aligned) = self.cache.get(item.id, &key) {
+            if aligned.lines.len() == job_lines.len() {
+                return Lookup::Ready(aligned);
             }
         }
 
@@ -409,10 +438,13 @@ impl Aligner {
 }
 
 /// Parse the aligner service's JSON response, rejecting line count mismatches.
-fn parse_answer(body: &str, n_lines: usize) -> Option<Vec<Vec<WordStamp>>> {
+fn parse_answer(body: &str, n_lines: usize) -> Option<Aligned> {
     #[derive(Deserialize)]
     struct Reply {
         lines: Vec<ReplyLine>,
+        /// Absent from an aligner older than the offset search.
+        #[serde(default)]
+        offset_ms: i64,
     }
 
     #[derive(Deserialize)]
@@ -431,8 +463,8 @@ fn parse_answer(body: &str, n_lines: usize) -> Option<Vec<Vec<WordStamp>>> {
         return None;
     }
 
-    Some(
-        reply
+    Some(Aligned {
+        lines: reply
             .lines
             .into_iter()
             .map(|l| {
@@ -445,7 +477,8 @@ fn parse_answer(body: &str, n_lines: usize) -> Option<Vec<Vec<WordStamp>>> {
                     .collect()
             })
             .collect(),
-    )
+        offset_ms: reply.offset_ms,
+    })
 }
 
 #[cfg(test)]
@@ -626,13 +659,14 @@ mod tests {
                 start_ms: 3000,
             }],
         ];
-        aligner.cache.put(item.id, job.key.clone(), stamps.clone());
+        let aligned = Aligned {
+            lines: stamps,
+            offset_ms: 0,
+        };
+        aligner.cache.put(item.id, job.key.clone(), aligned.clone());
 
         // 4. Ready returned once cache is written.
-        assert_eq!(
-            aligner.words_for(&item, &lyrics),
-            Lookup::Ready(stamps.clone())
-        );
+        assert_eq!(aligner.words_for(&item, &lyrics), Lookup::Ready(aligned));
 
         // Remove from pending as background task would do.
         aligner.pending.lock().unwrap().remove(&item.id);
@@ -712,9 +746,13 @@ mod tests {
             }],
         ];
 
+        let aligned = Aligned {
+            lines: stamps,
+            offset_ms: -3_700,
+        };
         assert_eq!(cache.get(10, "key_a"), None);
-        cache.put(10, "key_a".into(), stamps.clone());
-        assert_eq!(cache.get(10, "key_a"), Some(stamps));
+        cache.put(10, "key_a".into(), aligned.clone());
+        assert_eq!(cache.get(10, "key_a"), Some(aligned));
         assert_eq!(cache.get(10, "key_b"), None);
         assert_eq!(cache.get(11, "key_a"), None);
 
@@ -741,6 +779,9 @@ mod tests {
         }"#;
 
         let parsed = parse_answer(valid_json, 2).expect("parses correctly");
+        // An aligner from before the offset search sends none.
+        assert_eq!(parsed.offset_ms, 0);
+        let parsed = parsed.lines;
         assert_eq!(parsed.len(), 2);
         assert_eq!(parsed[0].len(), 2);
         assert_eq!(
@@ -765,5 +806,30 @@ mod tests {
 
         // Malformed JSON rejected.
         assert_eq!(parse_answer("not json", 2), None);
+    }
+    #[test]
+    fn the_aligner_s_offset_is_read_and_moves_line_starts_but_never_below_zero() {
+        let body = r#"{"lines": [{"words": []}], "offset_ms": 3700}"#;
+        let late = parse_answer(body, 1).expect("parses");
+        assert_eq!(late.offset_ms, 3_700);
+        assert_eq!(late.shift(37_420), 41_120);
+        let early = Aligned {
+            lines: Vec::new(),
+            offset_ms: -2_500,
+        };
+        assert_eq!(early.shift(10_000), 7_500);
+        assert_eq!(early.shift(1_000), 0);
+    }
+
+    #[test]
+    fn a_words_cache_entry_from_before_the_offset_reads_as_no_offset() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("7.words.json"),
+            r#"{"key":"k","lines":[[{"at":0,"start_ms":5}]]}"#,
+        )
+        .unwrap();
+        let cache = AlignCache::new(Some(dir.path().to_path_buf()));
+        assert_eq!(cache.get(7, "k").map(|a| a.offset_ms), Some(0));
     }
 }
