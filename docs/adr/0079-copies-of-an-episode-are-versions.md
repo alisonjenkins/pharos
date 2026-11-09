@@ -18,16 +18,23 @@ ADR 0048 in #643, which never merged and whose number has since been taken.
 
 ## Decision
 
-We will group copies at scan time, at the end of `group_editions`: files
-under one show folder that parse to the same season and episode span become
-one item. The best-ranked copy is the primary (a 2D file before a 3D one,
-then container rank, then path) and each other copy an
-`AlternateMediaSource` named by what its file name adds. A copy's old row is
-swept like any file that stopped being an item, after
-`MediaStore::merge_user_data` moves its viewers' played, play count,
-favourite and resume state onto the primary, keeping the furthest state of
-the two. When the primary was not written in that pass (its probe failed),
-the copy keeps its own row. Films are not grouped by this rule.
+We will group copies at scan time, after `group_by_edition`: files under one
+show folder that cover the same season and episode are copies of it, and a
+file spanning several episodes (`S01E01-E02`) is a copy of each one it
+covers. Each episode's best-ranked copy is its primary: a 2D file before a
+3D one, then a file of just that episode before a span, then the taller
+picture (a stored probe's height, else the one its name states), then the
+bigger file, then container rank, then path. Each other copy is an
+`AlternateMediaSource` of that primary, named by what its file name adds. A
+span stays its own item while it is the primary of any episode it covers.
+
+A copy that is no item of its own has its old row swept like any file that
+stopped being an item, after `MediaStore::merge_user_data` moves its
+viewers' played, play count, favourite and resume state onto each item it
+is now a version of, keeping the furthest state. A span folds into a single
+episode without its resume point (`FoldResume::Drop`). When an item it
+groups under was not written in that pass (its probe failed), the copy
+keeps its own row. Films are not grouped by this rule.
 
 ## Consequences
 
@@ -42,6 +49,14 @@ the copy keeps its own row. Films are not grouped by this rule.
   full scan, as editions already did.
 - A version's image subtitles burn and it lists no embedded fonts, because
   those routes read the primary file only.
+- A span that is still an item (E01-E02 with a single for E01 only) lists
+  beside the single E01, and its version of E01 starts at E01's start: no
+  chapter offset is taken for E02.
+- A copy whose height is learnt only from its first probe can become the
+  primary on the next scan. The item then takes the new primary's id, and
+  its state moves with it as for any fold.
+- `pharos_scan_copy_primary_total{decided_by}` counts which rule picked each
+  primary, so a tie broken by path shows apart from a quality pick.
 - Undoing this means a rescan with the rule removed; the folded rows come
   back with fresh ids and without the state that moved.
 
