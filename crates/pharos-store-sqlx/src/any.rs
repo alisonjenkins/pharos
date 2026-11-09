@@ -343,10 +343,15 @@ impl MediaStore for AnyStore {
         }
     }
 
-    async fn merge_user_data(&self, from: MediaId, into: MediaId) -> DomainResult<()> {
+    async fn merge_user_data(
+        &self,
+        from: MediaId,
+        into: MediaId,
+        resume: pharos_core::FoldResume,
+    ) -> DomainResult<()> {
         match self {
-            AnyStore::Sqlite(s) => s.merge_user_data(from, into).await,
-            AnyStore::Postgres(p) => p.merge_user_data(from, into).await,
+            AnyStore::Sqlite(s) => s.merge_user_data(from, into, resume).await,
+            AnyStore::Postgres(p) => p.merge_user_data(from, into, resume).await,
         }
     }
 

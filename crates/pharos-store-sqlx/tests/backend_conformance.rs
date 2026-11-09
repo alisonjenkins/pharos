@@ -11,14 +11,14 @@
 
 use pharos_core::{
     collection_wire_id, genre_wire_id, person_wire_id, studio_wire_id, tag_wire_id,
-    CollectionStore, DetectedSegment, ExternalRatings, GenreStore, LibraryKind, LibraryStore,
-    LocalizedText, MediaId, MediaItem, MediaKind, MediaMetadata, MediaProbe, MediaQuery,
-    MediaSegmentKind, MediaSegmentStore, MediaStore, MetadataTranslationStore, PersistedSyncGroup,
-    PersistedTranscodeSession, PersonKind, PersonRef, PersonStore, PlaylistStore, PreferenceStore,
-    RatingsStore, RatingsTarget, SecretString, SeriesInfo, SeriesMetadata, SeriesMetadataStore,
-    StudioStore, SubtitleStyling, SubtitleStylingStore, SyncGroupStore, TagStore, TokenStore,
-    TranscodeSessionStore, TranslationOwner, UserDataStore, UserId, UserItemData, UserPolicy,
-    UserPrefStore, UserRecord, UserStore, SEGMENT_SCHEMA_VERSION,
+    CollectionStore, DetectedSegment, ExternalRatings, FoldResume, GenreStore, LibraryKind,
+    LibraryStore, LocalizedText, MediaId, MediaItem, MediaKind, MediaMetadata, MediaProbe,
+    MediaQuery, MediaSegmentKind, MediaSegmentStore, MediaStore, MetadataTranslationStore,
+    PersistedSyncGroup, PersistedTranscodeSession, PersonKind, PersonRef, PersonStore,
+    PlaylistStore, PreferenceStore, RatingsStore, RatingsTarget, SecretString, SeriesInfo,
+    SeriesMetadata, SeriesMetadataStore, StudioStore, SubtitleStyling, SubtitleStylingStore,
+    SyncGroupStore, TagStore, TokenStore, TranscodeSessionStore, TranslationOwner, UserDataStore,
+    UserId, UserItemData, UserPolicy, UserPrefStore, UserRecord, UserStore, SEGMENT_SCHEMA_VERSION,
 };
 use pharos_store_sqlx::RuntimeConfig;
 
@@ -1185,10 +1185,10 @@ where
     UserDataStore::set_user_data(&store, uid, copy_id, copy)
         .await
         .unwrap();
-    MediaStore::merge_user_data(&store, copy_id, item_id)
+    MediaStore::merge_user_data(&store, copy_id, item_id, FoldResume::Carry)
         .await
         .unwrap();
-    MediaStore::merge_user_data(&store, copy_id, item_id)
+    MediaStore::merge_user_data(&store, copy_id, item_id, FoldResume::Carry)
         .await
         .unwrap();
     let merged = UserDataStore::get_user_data(&store, uid, item_id)
@@ -1203,9 +1203,44 @@ where
         (7_000, 1_700_001_000)
     );
     // Into a row that does not exist: nothing is written.
-    MediaStore::merge_user_data(&store, copy_id, 9_999)
+    MediaStore::merge_user_data(&store, copy_id, 9_999, FoldResume::Carry)
         .await
         .unwrap();
+    // A double episode folded into one of its episodes: its later position
+    // is in another timeline, so the item keeps its own.
+    let double_id: MediaId = 9_002;
+    MediaStore::put(&store, media_item(double_id, "Double Episode"))
+        .await
+        .unwrap();
+    let double = UserItemData {
+        play_count: 5,
+        last_played_position_ticks: 99_000,
+        last_played_at: 1_700_002_000,
+        ..Default::default()
+    };
+    UserDataStore::set_user_data(&store, uid, double_id, double)
+        .await
+        .unwrap();
+    MediaStore::merge_user_data(&store, double_id, item_id, FoldResume::Drop)
+        .await
+        .unwrap();
+    let folded = UserDataStore::get_user_data(&store, uid, item_id)
+        .await
+        .unwrap();
+    assert_eq!(folded.play_count, 5);
+    assert_eq!(folded.last_played_position_ticks, 7_000);
+    // Into an item with no state of its own, the position starts at zero.
+    let fresh_id: MediaId = 9_003;
+    MediaStore::put(&store, media_item(fresh_id, "Fresh Episode"))
+        .await
+        .unwrap();
+    MediaStore::merge_user_data(&store, double_id, fresh_id, FoldResume::Drop)
+        .await
+        .unwrap();
+    let fresh = UserDataStore::get_user_data(&store, uid, fresh_id)
+        .await
+        .unwrap();
+    assert_eq!((fresh.play_count, fresh.last_played_position_ticks), (5, 0));
 
     // -----------------------------------------------------------------
     // 6. PreferenceStore

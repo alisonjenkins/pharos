@@ -2131,7 +2131,9 @@ async fn settle_copies<S: MediaStore>(
         };
         match into {
             Some(into) if into != from => {
-                store.merge_user_data(from, into).await?;
+                store
+                    .merge_user_data(from, into, pharos_core::FoldResume::Carry)
+                    .await?;
                 tracing::info!(
                     from = %from,
                     into = %into,
@@ -3065,8 +3067,8 @@ mod tests {
         reject_ids: Mutex<HashSet<MediaId>>,
         // Number of `alternate_sources` reads, to prove the skip path avoids them.
         alternate_sources_calls: AtomicUsize,
-        // Every `merge_user_data(from, into)` call, in order.
-        merged: Mutex<Vec<(MediaId, MediaId)>>,
+        // Every `merge_user_data(from, into, resume)` call, in order.
+        merged: Mutex<Vec<(MediaId, MediaId, pharos_core::FoldResume)>>,
     }
 
     impl MediaStore for MemStore {
@@ -3342,11 +3344,16 @@ mod tests {
                 .insert(id, fp);
             Ok(())
         }
-        async fn merge_user_data(&self, from: MediaId, into: MediaId) -> DomainResult<()> {
+        async fn merge_user_data(
+            &self,
+            from: MediaId,
+            into: MediaId,
+            resume: pharos_core::FoldResume,
+        ) -> DomainResult<()> {
             self.merged
                 .lock()
                 .map_err(|e| DomainError::Backend(e.to_string()))?
-                .push((from, into));
+                .push((from, into, resume));
             Ok(())
         }
 
@@ -6705,7 +6712,10 @@ mod tests {
         assert!(item.path.ends_with(newer));
         assert_eq!(item.probe.alternate_sources.len(), 1);
         assert!(item.probe.alternate_sources[0].path.ends_with(older));
-        assert_eq!(*store.merged.lock().unwrap(), vec![(old_id, item.id)]);
+        assert_eq!(
+            *store.merged.lock().unwrap(),
+            vec![(old_id, item.id, pharos_core::FoldResume::Carry)]
+        );
     }
 
     #[tokio::test]
