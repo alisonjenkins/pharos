@@ -28,7 +28,7 @@ class CountingAligner(Aligner):
         self.loads += 1
         return object(), object(), object()
 
-    def _align_loaded(self, pcm_f32le: bytes, tokens: list[str]) -> list[tuple[int, int]]:
+    def _align_loaded(self, pcm_f32le: bytes, tokens: list[str], lead_star: bool) -> list[tuple[int, int]]:
         return [(0, 0) for _ in tokens]
 
 
