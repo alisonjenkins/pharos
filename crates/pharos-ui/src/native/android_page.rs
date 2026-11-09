@@ -404,7 +404,7 @@ pub async fn vr_supported() -> bool {
 
 pub fn enter_vr(
     _id: &str,
-    _layout: &'static str,
+    _packing: pharos_client::api::Stereo,
     _screen: (f64, f64),
     _on_select: std::rc::Rc<dyn Fn()>,
 ) {

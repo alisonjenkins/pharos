@@ -705,12 +705,13 @@ pub fn WatchView(
     });
     use_drop(platform::exit_vr);
     let vr =
-        c.vr.then(|| stereo::xr_layout(c.packing))
+        c.vr.then_some(c.packing)
             .flatten()
-            .map(|layout| {
+            .filter(|p| stereo::xr_layout(Some(*p)).is_some())
+            .map(|packing| {
                 let (w, h) = stereo::eye_size(c.packing, media.video_width, media.video_height);
                 (
-                    layout,
+                    packing,
                     (stereo::VR_SCREEN_WIDTH_M, stereo::vr_screen_height(w, h)),
                 )
             });
@@ -965,7 +966,7 @@ pub fn WatchView(
                             mode: c.view_mode,
                             on_pick: move |control| on_control.call(control),
                         }
-                        if let Some((layout, screen)) = vr {
+                        if let Some((packing, screen)) = vr {
                             button {
                                 class: "pharos-control pharos-watch-vr",
                                 r#type: "button",
@@ -975,7 +976,7 @@ pub fn WatchView(
                                 onclick: move |_| {
                                     platform::enter_vr(
                                         VIDEO_ID,
-                                        layout,
+                                        packing,
                                         screen,
                                         std::rc::Rc::new(move || xr_select.send(())),
                                     );

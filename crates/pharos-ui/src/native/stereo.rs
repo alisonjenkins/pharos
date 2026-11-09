@@ -169,6 +169,34 @@ pub fn xr_layout(stereo: Option<Stereo>) -> Option<&'static str> {
     }
 }
 
+/// How a VR session shows the video (ADR 0088).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum XrPath {
+    /// The compositor draws the `<video>` as a media quad layer.
+    Layers,
+    /// The page draws one quad per eye through WebGL2.
+    Webgl,
+}
+
+impl XrPath {
+    /// The media layer when the session granted `layers` and the browser has
+    /// `XRMediaBinding`; the page's own drawing otherwise.
+    pub fn choose(layers_granted: bool, media_binding: bool) -> XrPath {
+        if layers_granted && media_binding {
+            XrPath::Layers
+        } else {
+            XrPath::Webgl
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            XrPath::Layers => "layers",
+            XrPath::Webgl => "webgl",
+        }
+    }
+}
+
 /// How far in front of the viewer the virtual screen floats, in metres.
 pub const VR_SCREEN_DISTANCE_M: f64 = 3.0;
 /// The virtual screen's width in metres: about a 60 degree view at
@@ -276,6 +304,14 @@ mod tests {
         );
         assert_eq!(xr_layout(Some(Stereo::Mvc)), None);
         assert_eq!(xr_layout(None), None);
+    }
+
+    #[test]
+    fn only_granted_layers_with_a_media_binding_take_the_layers_path() {
+        assert_eq!(XrPath::choose(true, true), XrPath::Layers);
+        assert_eq!(XrPath::choose(true, false), XrPath::Webgl);
+        assert_eq!(XrPath::choose(false, true), XrPath::Webgl);
+        assert_eq!(XrPath::choose(false, false), XrPath::Webgl);
     }
 
     #[test]
