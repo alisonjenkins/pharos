@@ -1114,6 +1114,16 @@ where
         store.clear_series_reconcile(id, marked_at).await?;
         return Ok(false);
     }
+    // A row the scanner moved to a key with no match row yet waits, behind
+    // the rest, until the series pass has matched its new show.
+    if item.kind == MediaKind::Episode && pinned_show(store, &item).await?.is_none() {
+        store.mark_reconcile_items(&[id], now).await?;
+        tracing::debug!(
+            media.id = id,
+            "series identity repair: episode's show has no match yet, rebuild deferred"
+        );
+        return Ok(false);
+    }
     let old_title = item.title.clone();
     let mut item = tokio::task::spawn_blocking(move || {
         let mut item = item;
@@ -6180,6 +6190,48 @@ mod tests {
         let mut pending = pending_ids(&s).await;
         pending.sort_unstable();
         assert_eq!(pending, [1, 2]);
+    }
+
+    const FLASH: &str = "/tv/The Flash";
+
+    /// A row the scanner moved to a key with no match row yet is not rebuilt:
+    /// it stays marked, behind the rest, until its new show is matched.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_moved_episode_waits_for_its_new_shows_match() {
+        let s = store().await;
+        put_titled_episode(&s, 1, FLASH, (3, 1), "The Flash Reborn").await;
+        let mut item = s.get(1).await.unwrap();
+        item.metadata.overview = Some("2014 text".into());
+        if let Some(series) = item.series.as_mut() {
+            series.series_key = Some(format!("{FLASH}\u{1f}2014"));
+        }
+        s.put(item).await.unwrap();
+        s.mark_reconcile_items(&[1], NOW).await.unwrap();
+        let (_td, cache) = cache();
+        let tvdb = FakeEnricher::tvdb();
+
+        let (n, pending) = reconcile_pass(
+            &s,
+            &sem(4),
+            &cache,
+            None::<&FakeEnricher>,
+            Some(&tvdb),
+            &apply_cfg(),
+            NOW + 5,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!((n, pending), (0, true));
+        assert!(tvdb.fetched().is_empty());
+        assert_eq!(
+            s.get(1).await.unwrap().metadata.overview.as_deref(),
+            Some("2014 text")
+        );
+        assert_eq!(
+            s.series_reconcile_pending(10).await.unwrap(),
+            [(1, NOW + 5)]
+        );
     }
 
     /// The pre-B557 install with no version recorded still re-admits every
