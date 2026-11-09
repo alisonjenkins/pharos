@@ -600,7 +600,9 @@ impl<P: Prober> FsScanner<P> {
         let facts = copy_facts(store, &copy_candidates(&groups))
             .instrument(tracing::info_span!("scan.copy_facts"))
             .await;
-        let groups = group_episode_copies(groups, &facts);
+        let mut tally = CopyTally::default();
+        let groups = group_episode_copies(groups, &facts, &mut tally);
+        tally.publish();
         // A file now grouped under another may still hold its own row from an
         // earlier pass; that row is swept, so its viewers' state moves first.
         let folded = folded_copies(&groups);
@@ -1901,7 +1903,7 @@ impl<P: Prober + Clone + 'static> Scanner for FsScanner<P> {
             .map(|(p, _)| p)
             .collect();
         let sizes = copy_sizes(&candidates).await;
-        let groups = group_episode_copies(groups, &sizes);
+        let groups = group_episode_copies(groups, &sizes, &mut CopyTally::default());
         let mut items = Vec::with_capacity(groups.len());
         for (primary, alts) in groups {
             if let Some(item) = self.probe_with_alternates(primary, alts).await {
@@ -2230,7 +2232,11 @@ async fn settle_copies<S: MediaStore>(
 /// title).
 #[cfg(test)]
 pub(crate) fn group_editions(paths: Vec<PathBuf>) -> Vec<(PathBuf, Vec<(String, PathBuf)>)> {
-    group_episode_copies(group_by_edition(paths), &HashMap::new())
+    group_episode_copies(
+        group_by_edition(paths),
+        &HashMap::new(),
+        &mut CopyTally::default(),
+    )
 }
 
 /// P41's half of [`group_editions`]: editions under their primaries, before
@@ -2421,6 +2427,7 @@ type Group = (PathBuf, Vec<(String, PathBuf)>);
 fn group_episode_copies(
     groups: Vec<(PathBuf, Vec<(String, PathBuf)>)>,
     facts: &HashMap<PathBuf, CopyFacts>,
+    tally: &mut CopyTally,
 ) -> Vec<(PathBuf, Vec<(String, PathBuf)>)> {
     let spans: Vec<Option<EpisodeSpan>> = groups.iter().map(|g| episode_copy_key(&g.0)).collect();
     let mut by_episode: BTreeMap<CopyBucket, Vec<usize>> = BTreeMap::new();
@@ -2454,8 +2461,7 @@ fn group_episode_copies(
         }
         let ranked: Vec<_> = members.iter().map(rank).collect();
         let decided_by = CopyRank::decided_by(&ranked);
-        metrics::counter!("pharos_scan_copy_primary_total", "decided_by" => decided_by.label())
-            .increment(1);
+        tally.record(decided_by);
         tracing::debug!(
             show = %show,
             season,
@@ -2559,8 +2565,8 @@ struct CopyRank {
 }
 
 /// Which rule chose an episode's primary: the `decided_by` values of
-/// `pharos_scan_copy_primary_total`, a dashboard contract: do not rename them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// `pharos_scan_copy_primaries`, a dashboard contract: do not rename them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum CopyDecision {
     TwoD,
     SingleEpisode,
@@ -2571,7 +2577,6 @@ pub(crate) enum CopyDecision {
 }
 
 impl CopyDecision {
-    #[cfg(test)]
     pub(crate) const ALL: [Self; 6] = [
         Self::TwoD,
         Self::SingleEpisode,
@@ -2589,6 +2594,28 @@ impl CopyDecision {
             Self::Size => "size",
             Self::Container => "container",
             Self::Path => "path",
+        }
+    }
+}
+
+/// How many episodes with copies each rule decided in one scan pass.
+#[derive(Debug, Default)]
+pub(crate) struct CopyTally(HashMap<CopyDecision, u64>);
+
+impl CopyTally {
+    fn record(&mut self, decision: CopyDecision) {
+        let n = self.0.entry(decision).or_default();
+        *n = n.saturating_add(1);
+    }
+
+    /// Sets `pharos_scan_copy_primaries{decided_by}` to this pass's counts,
+    /// every label included, so a gauge reads the library as last scanned
+    /// whatever the scan rate.
+    fn publish(&self) {
+        for decision in CopyDecision::ALL {
+            let n = self.0.get(&decision).copied().unwrap_or(0);
+            metrics::gauge!("pharos_scan_copy_primaries", "decided_by" => decision.label())
+                .set(n as f64);
         }
     }
 }
@@ -7172,7 +7199,11 @@ mod tests {
                 },
             ),
         ]);
-        let groups = group_episode_copies(group_by_edition(vec![sd.clone(), hd.clone()]), &facts);
+        let groups = group_episode_copies(
+            group_by_edition(vec![sd.clone(), hd.clone()]),
+            &facts,
+            &mut CopyTally::default(),
+        );
         assert_eq!(groups[0].0, sd);
 
         // Same height: the bigger file, which at one length is the higher bitrate.
@@ -7194,8 +7225,11 @@ mod tests {
                 },
             ),
         ]);
-        let groups =
-            group_episode_copies(group_by_edition(vec![small.clone(), big.clone()]), &facts);
+        let groups = group_episode_copies(
+            group_by_edition(vec![small.clone(), big.clone()]),
+            &facts,
+            &mut CopyTally::default(),
+        );
         assert_eq!(groups[0].0, big);
         assert_eq!(alt_paths(&groups[0].1), vec![small.as_path()]);
     }
@@ -7238,47 +7272,59 @@ mod tests {
         assert_eq!(labels.len(), CopyDecision::ALL.len());
     }
 
-    /// Each episode with several copies records which rule chose its
-    /// primary, so a dashboard can tell a quality pick from a tie broken by
-    /// path.
+    /// A scan pass reports, for every rule, how many episodes with copies it
+    /// decided, so a dashboard can tell a quality pick from a tie broken by
+    /// path. A lone episode is not counted.
     #[test]
-    fn choosing_a_primary_counts_the_rule_that_decided() {
-        use metrics_util::debugging::DebuggingRecorder;
+    fn a_scan_pass_reports_the_rule_that_chose_each_primary() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
         let recorder = DebuggingRecorder::new();
         let snapshotter = pharos_test_metrics::snapshotter(&recorder);
         let _guard = metrics::set_default_local_recorder(&recorder);
 
-        group_editions(vec![
-            PathBuf::from("/tv/Foo/Season 01/Foo S01E03.mkv"),
-            PathBuf::from("/tv/Foo/Season 1/Foo S01E03.mkv"),
-            PathBuf::from("/tv/Foo/Season 01/Foo S01E04.mkv"),
-            PathBuf::from("/tv/Foo/Season 1/Foo S01E04.avi"),
-            PathBuf::from("/tv/Foo/Season 01/Foo S01E05.mkv"),
-        ]);
+        let mut tally = CopyTally::default();
+        group_episode_copies(
+            group_by_edition(vec![
+                PathBuf::from("/tv/Foo/Season 01/Foo S01E03.mkv"),
+                PathBuf::from("/tv/Foo/Season 1/Foo S01E03.mkv"),
+                PathBuf::from("/tv/Foo/Season 01/Foo S01E04.mkv"),
+                PathBuf::from("/tv/Foo/Season 1/Foo S01E04.avi"),
+                PathBuf::from("/tv/Foo/Season 01/Foo S01E05.mkv"),
+            ]),
+            &HashMap::new(),
+            &mut tally,
+        );
+        tally.publish();
         let mut seen: Vec<(String, u64)> = snapshotter
             .snapshot()
             .into_vec()
             .into_iter()
             .filter_map(|(k, _, _, value)| {
                 let key = k.key();
-                let metrics_util::debugging::DebugValue::Counter(n) = value else {
+                let DebugValue::Gauge(n) = value else {
                     return None;
                 };
-                (key.name() == "pharos_scan_copy_primary_total").then(|| {
+                (key.name() == "pharos_scan_copy_primaries").then(|| {
                     let label = key
                         .labels()
                         .find(|l| l.key() == "decided_by")
                         .map(|l| l.value().to_string())
                         .unwrap_or_default();
-                    (label, n)
+                    (label, n.into_inner() as u64)
                 })
             })
             .collect();
         seen.sort();
         assert_eq!(
             seen,
-            [("container".to_string(), 1), ("path".to_string(), 1)],
-            "one count per episode with copies, none for a lone episode"
+            [
+                ("2d".to_string(), 0),
+                ("container".to_string(), 1),
+                ("height".to_string(), 0),
+                ("path".to_string(), 1),
+                ("single_episode".to_string(), 0),
+                ("size".to_string(), 0),
+            ]
         );
     }
 
