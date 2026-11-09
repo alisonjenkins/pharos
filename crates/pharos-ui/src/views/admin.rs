@@ -132,6 +132,23 @@ pub fn toggled_codecs(current: &[String], codec: &str) -> Vec<String> {
     next
 }
 
+/// `devices` with each list this page saved since the last load put in place
+/// of the loaded one, so a toggle made before the reload lands builds on it.
+pub fn with_saved_audio_deny(
+    devices: Vec<DeviceEntry>,
+    saved: &std::collections::HashMap<String, Vec<String>>,
+) -> Vec<DeviceEntry> {
+    devices
+        .into_iter()
+        .map(|mut d| {
+            if let Some(list) = saved.get(&d.id) {
+                d.no_direct_play_audio_codecs = list.clone();
+            }
+            d
+        })
+        .collect()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AdminTab {
     #[default]
@@ -303,6 +320,9 @@ pub struct AdminViewProps {
     /// The "Deep check another file" box and its hits.
     #[props(default)]
     pub deep_search: DeepSearchState,
+    /// The device whose sound formats are being saved; its toggles wait.
+    #[props(default)]
+    pub device_saving: Option<String>,
 }
 
 /// What the pick form shows for the group or match it was opened on.
@@ -419,7 +439,13 @@ pub fn AdminView(props: AdminViewProps) -> Element {
                             }
                         },
                         AdminTab::Libraries => rsx! { LibrariesPane { libraries: props.libraries.clone() } },
-                        AdminTab::Devices => rsx! { DevicesPane { devices: props.devices.clone(), on_action } },
+                        AdminTab::Devices => rsx! {
+                            DevicesPane {
+                                devices: props.devices.clone(),
+                                saving: props.device_saving.clone(),
+                                on_action,
+                            }
+                        },
                         AdminTab::Activity => rsx! { ActivityPane { entries: props.activity.clone() } },
                         AdminTab::ScheduledTasks => rsx! { TasksPane { tasks: props.scheduled_tasks.clone() } },
                         AdminTab::Duplicates => rsx! {
@@ -803,7 +829,11 @@ fn LibrariesPane(libraries: Vec<LibraryFolder>) -> Element {
 }
 
 #[component]
-fn DevicesPane(devices: Vec<DeviceEntry>, on_action: EventHandler<AdminAction>) -> Element {
+fn DevicesPane(
+    devices: Vec<DeviceEntry>,
+    saving: Option<String>,
+    on_action: EventHandler<AdminAction>,
+) -> Element {
     rsx! {
         if devices.is_empty() {
             p { class: "pharos-empty", "No devices have connected" }
@@ -833,12 +863,14 @@ fn DevicesPane(devices: Vec<DeviceEntry>, on_action: EventHandler<AdminAction>) 
                                         class: "pharos-manage-badges pharos-admin-device-audio",
                                         role: "group",
                                         aria_label: "Sound formats converted for {d.name}",
+                                        "aria-busy": "{saving.as_deref() == Some(d.id.as_str())}",
                                         for (codec, label) in DENIABLE_AUDIO_CODECS {
                                             {
                                                 let denied = d
                                                     .no_direct_play_audio_codecs
                                                     .iter()
                                                     .any(|c| c.eq_ignore_ascii_case(codec));
+                                                let busy = saving.as_deref() == Some(d.id.as_str());
                                                 let device_id = d.id.clone();
                                                 let current = d.no_direct_play_audio_codecs.clone();
                                                 rsx! {
@@ -847,6 +879,7 @@ fn DevicesPane(devices: Vec<DeviceEntry>, on_action: EventHandler<AdminAction>) 
                                                         r#type: "button",
                                                         class: "pharos-manage-badge pharos-admin-device-codec",
                                                         "aria-pressed": "{denied}",
+                                                        disabled: busy,
                                                         onclick: move |_| {
                                                             on_action.call(AdminAction::SetDeviceAudioDeny {
                                                                 device_id: device_id.clone(),
@@ -2710,6 +2743,66 @@ mod tests {
             toggled_codecs(&own(&["opus"]), "ac3"),
             own(&["ac3", "opus"])
         );
+    }
+
+    #[test]
+    fn a_saved_list_replaces_the_loaded_one_until_the_next_load() {
+        let loaded = vec![
+            DeviceEntry {
+                id: "tv".into(),
+                ..Default::default()
+            },
+            DeviceEntry {
+                id: "pc".into(),
+                no_direct_play_audio_codecs: vec!["dts".into()],
+                ..Default::default()
+            },
+        ];
+        let saved = std::collections::HashMap::from([("tv".to_string(), vec!["eac3".to_string()])]);
+        let merged = with_saved_audio_deny(loaded, &saved);
+        assert_eq!(
+            merged[0].no_direct_play_audio_codecs,
+            vec!["eac3".to_string()]
+        );
+        assert_eq!(
+            merged[1].no_direct_play_audio_codecs,
+            vec!["dts".to_string()]
+        );
+        // A second toggle on the TV builds on the saved list, not the loaded one.
+        assert_eq!(
+            toggled_codecs(&merged[0].no_direct_play_audio_codecs, "ac3"),
+            vec!["ac3".to_string(), "eac3".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_device_being_saved_has_its_toggles_disabled() {
+        let mut dom = VirtualDom::new(|| {
+            rsx! {
+                AdminView {
+                    users: Vec::new(),
+                    current_user_id: String::new(),
+                    status: None,
+                    on_action: |_| {},
+                    active_tab: AdminTab::Devices,
+                    device_saving: Some("tv".to_string()),
+                    devices: vec![
+                        DeviceEntry { id: "tv".into(), name: "TV".into(), ..Default::default() },
+                        DeviceEntry { id: "pc".into(), name: "PC".into(), ..Default::default() },
+                    ],
+                }
+            }
+        });
+        dom.rebuild_in_place();
+        let html = dioxus_ssr::render(&dom);
+        let row = |name: &str| {
+            html.split("<tr")
+                .find(|r| r.contains(&format!(">{name}</td>")))
+                .unwrap_or_default()
+                .to_string()
+        };
+        assert_eq!(row("TV").matches("disabled").count(), 4, "{html}");
+        assert!(!row("PC").contains("disabled"), "{html}");
     }
 
     #[test]
