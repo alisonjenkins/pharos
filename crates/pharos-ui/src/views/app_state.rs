@@ -16,7 +16,7 @@ use crate::client::{
     ActivityEntry, AdminUser, ApiKey, BrandingConfig, DeviceEntry, DuplicateFilm, IntegrityReport,
     ItemChapter, ItemDetail, LibraryFolder, LiveChannel, LiveProgram, LocalizationCulture,
     LogEntry, PluginEntry, QuickConnectInitiate, RemoteSession, ScheduledTask, SearchHint,
-    UserConfiguration,
+    SeriesIdentity, UserConfiguration,
 };
 use crate::views::server_picker::{load_saved_servers, save_servers};
 use crate::views::{
@@ -713,6 +713,25 @@ pub fn AdminPane(
             }
         })
     };
+    // Plans every folder on the server, so it runs only while its tab is open.
+    let identity_resource = {
+        let base = server_base.clone();
+        let token = access_token;
+        let reload_signal = reload;
+        use_resource(move || {
+            let _bust = reload_signal.read();
+            let open = *active_tab.read() == AdminTab::ShowIdentity;
+            let base = base.clone();
+            let token = token.peek().clone();
+            async move {
+                if open {
+                    Some(fetch_series_identity(&base, &token).await)
+                } else {
+                    None
+                }
+            }
+        })
+    };
     let plugins_resource = {
         let base = server_base.clone();
         let token = access_token;
@@ -957,7 +976,7 @@ pub fn AdminPane(
         AdminTab::Logs => logs_resource.read_unchecked().is_none(),
         AdminTab::ApiKeys => api_keys_resource.read_unchecked().is_none(),
         AdminTab::Branding => branding_resource.read_unchecked().is_none(),
-        AdminTab::Duplicates | AdminTab::Integrity => false,
+        AdminTab::Duplicates | AdminTab::Integrity | AdminTab::ShowIdentity => false,
     };
     // A listing that failed says why on the open tab, not as an empty list.
     let tab_error = match *active_tab.read() {
@@ -997,7 +1016,7 @@ pub fn AdminPane(
             .read_unchecked()
             .as_ref()
             .and_then(|r| r.as_ref().err().cloned()),
-        AdminTab::Duplicates | AdminTab::Integrity => None,
+        AdminTab::Duplicates | AdminTab::Integrity | AdminTab::ShowIdentity => None,
     };
     let fetch_err = tab_error.map(|e| {
         format!(
@@ -1028,6 +1047,7 @@ pub fn AdminPane(
         };
     let duplicates = duplicates_resource.read_unchecked().clone().flatten();
     let integrity = integrity_resource.read_unchecked().clone().flatten();
+    let series_identity = identity_resource.read_unchecked().clone().flatten();
     let integrity_queued = integrity_queued.read().clone();
     let integrity_errors = integrity_errors.read().clone();
     let deep_queued = deep_queued.read().clone();
@@ -1077,6 +1097,7 @@ pub fn AdminPane(
             branding: branding,
             duplicates: duplicates,
             integrity: integrity,
+            series_identity: series_identity,
             integrity_queued: integrity_queued,
             integrity_errors: integrity_errors,
             deep_queued: deep_queued,
@@ -2257,6 +2278,18 @@ async fn fetch_integrity_report(base: &str, token: &str) -> Result<IntegrityRepo
 #[cfg(not(feature = "web"))]
 async fn fetch_integrity_report(_base: &str, _token: &str) -> Result<IntegrityReport, String> {
     Err("integrity_status is only wired in the web build".into())
+}
+
+#[cfg(feature = "web")]
+async fn fetch_series_identity(base: &str, token: &str) -> Result<SeriesIdentity, String> {
+    crate::client::web::series_identity(base, token)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(not(feature = "web"))]
+async fn fetch_series_identity(_base: &str, _token: &str) -> Result<SeriesIdentity, String> {
+    Err("series_identity is only wired in the web build".into())
 }
 
 #[cfg(feature = "web")]
