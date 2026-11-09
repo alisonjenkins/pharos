@@ -20,9 +20,9 @@ use super::app::{call, this_device, Ctx};
 use super::keymap::Mode;
 use super::platform;
 use super::reader::{
-    check_size, flatten_toc, key_action, margin_label, percent_label, save_key, saved_fraction,
-    saved_locator, size_cap, too_big_message, KeyAction, PageTheme, ReaderSettings, SaveGate,
-    SizeVerdict, TocRow, Typeface, LINE_HEIGHTS, MARGINS, SETTINGS_KEY,
+    check_size, download_href, flatten_toc, key_action, margin_label, percent_label, save_key,
+    saved_fraction, saved_locator, size_cap, too_big_message, KeyAction, PageTheme, ReaderSettings,
+    SaveGate, SizeVerdict, TocRow, Typeface, LINE_HEIGHTS, MARGINS, SETTINGS_KEY,
 };
 use super::route::Route;
 use super::views::{display_name, Nav};
@@ -173,7 +173,7 @@ struct Opened {
 async fn fetch_book(id: ItemRef) -> Result<Vec<u8>, String> {
     let cap = size_cap(this_device(), &platform::user_agent());
     let controller = web_sys::AbortController::new().map_err(|e| format!("{e:?}"))?;
-    let response = Request::get(&format!("/Items/{id}/Download"))
+    let response = Request::get(&download_href(id))
         .abort_signal(Some(&controller.signal()))
         .send()
         .await
@@ -524,7 +524,7 @@ pub fn ReaderScreen(id: ItemRef) -> Element {
                         p { "{message}" }
                         a {
                             class: "pharos-button",
-                            href: "/Items/{id}/Download",
+                            href: download_href(id),
                             download: "",
                             "Download"
                         }
