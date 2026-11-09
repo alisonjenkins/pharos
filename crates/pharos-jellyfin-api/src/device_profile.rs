@@ -33,6 +33,12 @@ pub struct DeviceProfile {
     pub codec_profiles: Vec<CodecProfileDto>,
     #[serde(default)]
     pub subtitle_profiles: Vec<SubtitleProfileDto>,
+    /// Audio codecs this device must never be handed as a bitstream, though
+    /// its profile claims them (T130, V1010). Set by the server from the
+    /// device's own setting, never read from the wire: a client cannot send
+    /// it, and an absent list changes nothing.
+    #[serde(skip)]
+    pub denied_audio_codecs: Vec<String>,
 }
 
 #[derive(Debug, Default, Deserialize, Clone)]
@@ -211,6 +217,23 @@ impl Decision {
 impl DeviceProfile {
     /// This profile with every `VideoRangeType` condition removed, for a
     /// server that does not enforce dynamic range.
+    /// Whether `codec` is on this device's deny list (case-insensitive).
+    pub fn denies_audio(&self, codec: Option<&str>) -> bool {
+        codec.is_some_and(|c| {
+            self.denied_audio_codecs
+                .iter()
+                .any(|d| d.eq_ignore_ascii_case(c))
+        })
+    }
+
+    /// The first codec in `csv` this device has not denied.
+    fn first_allowed_audio(&self, csv: &str) -> Option<String> {
+        csv.split(',')
+            .map(str::trim)
+            .find(|s| !s.is_empty() && !self.denies_audio(Some(s)))
+            .map(str::to_string)
+    }
+
     pub fn without_video_range_conditions(&self) -> Self {
         let mut stripped = self.clone();
         for cp in &mut stripped.codec_profiles {
@@ -505,6 +528,9 @@ pub enum DirectPlayBlock {
     /// A profile accepts the container and video codec but not the audio
     /// codec. This is the audio-remux shape.
     AudioCodec { source: String },
+    /// A profile accepts the audio codec, but this device's own setting says
+    /// not to direct-play it (T130): its decoder mis-handles what it claims.
+    AudioCodecDenied { source: String },
     /// Container and both codecs match, but the source exceeds the client's
     /// declared bitrate ceiling.
     Bitrate { source_bps: u64, cap_bps: u64 },
@@ -539,6 +565,7 @@ impl DirectPlayBlock {
             Self::Container { .. } => "container",
             Self::VideoCodec { .. } => "video_codec",
             Self::AudioCodec { .. } => "audio_codec",
+            Self::AudioCodecDenied { .. } => "audio_codec_denied",
             Self::Bitrate { .. } => "bitrate",
             Self::CodecCondition => "codec_condition",
             Self::VideoRange { .. } => "video_range",
@@ -555,15 +582,16 @@ impl DirectPlayBlock {
             Self::Container { .. } => 1,
             Self::VideoCodec { .. } => 2,
             Self::AudioCodec { .. } => 3,
-            Self::Bitrate { .. } => 4,
-            Self::CodecCondition => 5,
-            Self::VideoRange { .. } => 6,
+            Self::AudioCodecDenied { .. } => 4,
+            Self::Bitrate { .. } => 5,
+            Self::CodecCondition => 6,
+            Self::VideoRange { .. } => 7,
             // Ranked above every client-side reason: it is not a negotiation
             // outcome at all, so if it applies it is the whole answer and must
             // not be masked by a profile that also happened to reject the
             // container.
-            Self::RemoteSource { .. } => 7,
-            Self::NotBlocked => 8,
+            Self::RemoteSource { .. } => 8,
+            Self::NotBlocked => 9,
         }
     }
 }
@@ -580,6 +608,9 @@ impl std::fmt::Display for DirectPlayBlock {
             }
             Self::VideoCodec { source } => write!(f, "video codec {source} not accepted"),
             Self::AudioCodec { source } => write!(f, "audio codec {source} not accepted"),
+            Self::AudioCodecDenied { source } => {
+                write!(f, "audio codec {source} turned off for this device")
+            }
             Self::Bitrate {
                 source_bps,
                 cap_bps,
@@ -640,6 +671,7 @@ pub fn negotiate_explained(
         }
     };
     let named = |codec: Option<&str>| codec.unwrap_or("unknown").to_string();
+    let audio_denied = profile.denies_audio(source.audio_codec.as_deref());
 
     let profile_3d_ok = codec_profile_3d_passes(&profile.codec_profiles, source);
     if !profile_3d_ok {
@@ -667,7 +699,8 @@ pub fn negotiate_explained(
             continue;
         }
         let video_ok = matches_codec(&p.video_codec, source.video_codec.as_deref());
-        let audio_ok = matches_codec(&p.audio_codec, source.audio_codec.as_deref());
+        let audio_accepted = matches_codec(&p.audio_codec, source.audio_codec.as_deref());
+        let audio_ok = audio_accepted && !audio_denied;
         if video_ok && audio_ok && !over_bitrate {
             // P27 — clause-based codec restrictions. When the profile
             // pins e.g. VideoLevel ≤ 41 and the source is Level 51,
@@ -691,9 +724,16 @@ pub fn negotiate_explained(
                 },
                 &mut block,
             );
-        } else if !audio_ok {
+        } else if !audio_accepted {
             note(
                 DirectPlayBlock::AudioCodec {
+                    source: named(source.audio_codec.as_deref()),
+                },
+                &mut block,
+            );
+        } else if !audio_ok {
+            note(
+                DirectPlayBlock::AudioCodecDenied {
                     source: named(source.audio_codec.as_deref()),
                 },
                 &mut block,
@@ -753,7 +793,8 @@ pub fn negotiate_explained(
             }
             let target_container = pick_first_csv(&p.container)
                 .unwrap_or_else(|| default_container(source.is_video).into());
-            let audio_ok = matches_codec(&p.audio_codec, source.audio_codec.as_deref());
+            let audio_ok =
+                matches_codec(&p.audio_codec, source.audio_codec.as_deref()) && !audio_denied;
             return (
                 Decision::VideoRemux {
                     target_container,
@@ -782,7 +823,12 @@ pub fn negotiate_explained(
                 } else {
                     pick_first_csv(&tp.video_codec)
                 },
-                target_audio_codec: pick_first_csv(&tp.audio_codec),
+                // A denied codec is never a target: an e-ac3 transcode would
+                // hand the device the very bitstream it was told to avoid.
+                target_audio_codec: profile.first_allowed_audio(&tp.audio_codec).or_else(|| {
+                    pick_first_csv(&tp.audio_codec)
+                        .map(|_| default_audio_target(source.is_video).to_string())
+                }),
                 max_video_bitrate_bps: bitrate_cap,
             },
             block,
@@ -806,6 +852,14 @@ pub fn negotiate_explained(
         },
         block,
     )
+}
+
+fn default_audio_target(is_video: bool) -> &'static str {
+    if is_video {
+        "aac"
+    } else {
+        "mp3"
+    }
 }
 
 fn default_container(is_video: bool) -> &'static str {
@@ -1243,6 +1297,9 @@ mod tests {
             DirectPlayBlock::VideoRange {
                 source: "HDR10".into(),
             },
+            DirectPlayBlock::AudioCodecDenied {
+                source: "eac3".into(),
+            },
         ];
         let labels: std::collections::BTreeSet<_> = all.iter().map(|b| b.label()).collect();
         assert_eq!(labels.len(), all.len());
@@ -1251,6 +1308,126 @@ mod tests {
         assert!(all[5].to_string().contains('2'));
         assert!(all[7].to_string().contains("dQw4w9WgXcQ"));
         assert!(all[8].to_string().contains("HDR10"));
+        assert!(all[9].to_string().contains("eac3"));
+    }
+
+    /// The A Beautiful Mind shape (T130): h264 + E-AC-3 in Matroska, to a TV
+    /// whose profile honestly lists eac3.
+    fn mkv_h264_eac3_source() -> SourceMedia {
+        SourceMedia {
+            container: "mkv".into(),
+            video_codec: Some("h264".into()),
+            audio_codec: Some("eac3".into()),
+            bitrate_bps: Some(8_000_000),
+            is_video: true,
+            ..Default::default()
+        }
+    }
+
+    fn tv_profile(audio: &str, denied: &[&str]) -> DeviceProfile {
+        DeviceProfile {
+            direct_play_profiles: vec![dp("mkv,mp4", "h264,hevc", audio, "Video")],
+            transcoding_profiles: vec![tp("ts", "h264", "eac3,ac3,aac", "Video")],
+            denied_audio_codecs: denied.iter().map(|c| (*c).to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_denied_audio_codec_audio_remuxes_and_says_why() {
+        let server = ServerCodecSupport::default();
+        let source = mkv_h264_eac3_source();
+        // Control: without the setting the TV direct-plays the file.
+        let (d, block) = negotiate_explained(&tv_profile("aac,ac3,eac3", &[]), &source, &server);
+        assert_eq!(d, Decision::DirectPlay);
+        assert_eq!(block, DirectPlayBlock::NotBlocked);
+
+        let (d, block) =
+            negotiate_explained(&tv_profile("aac,ac3,eac3", &["EAC3"]), &source, &server);
+        assert_eq!(
+            d,
+            Decision::AudioRemux {
+                target_audio_codec: "aac".into()
+            }
+        );
+        assert_eq!(
+            block,
+            DirectPlayBlock::AudioCodecDenied {
+                source: "eac3".into()
+            }
+        );
+    }
+
+    /// An empty AudioCodec means "any"; the deny still wins over it.
+    #[test]
+    fn a_denied_codec_is_refused_by_an_any_audio_profile() {
+        let (d, block) = negotiate_explained(
+            &tv_profile("", &["eac3"]),
+            &mkv_h264_eac3_source(),
+            &ServerCodecSupport::default(),
+        );
+        assert!(matches!(d, Decision::AudioRemux { .. }), "{d:?}");
+        assert_eq!(block.label(), "audio_codec_denied");
+    }
+
+    #[test]
+    fn denying_another_codec_leaves_this_one_direct() {
+        let (d, _) = negotiate_explained(
+            &tv_profile("aac,ac3,eac3", &["ac3", "truehd"]),
+            &mkv_h264_eac3_source(),
+            &ServerCodecSupport::default(),
+        );
+        assert_eq!(d, Decision::DirectPlay);
+    }
+
+    #[test]
+    fn a_container_remux_re_encodes_a_denied_audio_codec() {
+        let mut profile = tv_profile("aac,eac3", &["eac3"]);
+        profile.direct_play_profiles = vec![dp("mp4", "h264", "aac,eac3", "Video")];
+        let (d, _) = negotiate_explained(
+            &profile,
+            &mkv_h264_eac3_source(),
+            &ServerCodecSupport::default(),
+        );
+        assert_eq!(
+            d,
+            Decision::VideoRemux {
+                target_container: "mp4".into(),
+                target_audio_codec: Some("aac".into()),
+            }
+        );
+    }
+
+    /// A transcode must not pick the denied codec as its audio target, or the
+    /// device gets the same bitstream by another route.
+    #[test]
+    fn a_transcode_never_targets_a_denied_audio_codec() {
+        let mut profile = tv_profile("aac,eac3", &["eac3"]);
+        profile.direct_play_profiles = vec![dp("mp4", "av1", "aac", "Video")];
+        let target = |p: &DeviceProfile| match negotiate(
+            p,
+            &mkv_h264_eac3_source(),
+            &ServerCodecSupport::default(),
+        ) {
+            Decision::Transcode {
+                target_audio_codec, ..
+            } => target_audio_codec,
+            other => panic!("expected transcode, got {other:?}"),
+        };
+        assert_eq!(target(&profile), Some("ac3".into()));
+        profile.denied_audio_codecs = vec!["eac3".into(), "ac3".into(), "aac".into()];
+        assert_eq!(target(&profile), Some("aac".into()), "all denied → aac");
+        profile.denied_audio_codecs.clear();
+        assert_eq!(target(&profile), Some("eac3".into()), "control");
+    }
+
+    /// The list is the server's correction; a client cannot set it.
+    #[test]
+    fn the_deny_list_is_never_read_from_the_wire() {
+        let p: DeviceProfile =
+            serde_json::from_str(r#"{"DeniedAudioCodecs":["aac"],"denied_audio_codecs":["aac"]}"#)
+                .unwrap();
+        assert!(p.denied_audio_codecs.is_empty());
     }
 
     #[test]

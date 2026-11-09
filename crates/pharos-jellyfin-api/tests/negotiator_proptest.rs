@@ -78,6 +78,7 @@ fn profile_strat() -> impl Strategy<Value = DeviceProfile> {
             max_static_bitrate: None,
             codec_profiles: vec![],
             subtitle_profiles: vec![],
+            denied_audio_codecs: vec![],
         })
 }
 
