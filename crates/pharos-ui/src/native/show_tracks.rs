@@ -255,6 +255,8 @@ mod tests {
             cast: Vec::new(),
             versions: Vec::new(),
             damage: None,
+            book: None,
+            read_position: None,
         }
     }
 
