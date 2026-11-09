@@ -113,7 +113,7 @@ deletion from this view are later stories.
 
 ## Progress (audited 2026-11-09)
 
-- US1 sign in: done (crates/pharos-ui/src/views/login.rs, views/quick_connect.rs, native/approve_device.rs `/settings/approve-device`, Route::SignIn). Multiple saved servers via views/server_picker.rs.
+- US1 sign-in: partial. Native sign-in takes name and password; Quick Connect approval is at `/settings/approve-device` (native/approve_device.rs). Guest Quick Connect and the saved-server picker (views/quick_connect.rs, views/server_picker.rs) exist only in the legacy app used when the native API is off, not on the native sign-in screen.
 - US2 profile and preferences: partial. Avatar + password + language in native/account_settings.rs (`/settings/account`); Appearance, Playback (native/playback_settings.rs), Privacy routes exist. No dedicated Home, Subtitles-defaults, Audio-defaults or Reading preference pages found.
 - US3 metadata editing: not started in pharos-ui (no item-edit, image manager or identify view found).
 - US4 dashboard overview: not started (no dashboard view; admin tabs show lists only; no uptime/sessions/transcode-device screen).
