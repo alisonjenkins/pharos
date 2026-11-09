@@ -50,7 +50,7 @@ evidence, and make every episode inherit it:
 6. **Hand fixes are overrides**: an admin Show identity page picks a show,
    confirms a flagged guess, moves files between shows or undoes a split; each
    fix is stored in `series_overrides` and applied by the scanner after its
-   split and before the copy fold, so a rescan never undoes it (V895).
+   split and before the copy fold, so a rescan never undoes it (V896).
 7. **Repair by dry run, then apply**: `[metadata] series_identity_repair`
    defaults to `"dry_run"`; `"apply"` re-matches only shows with conflicting
    evidence and re-fetches only episodes whose provider show disagrees with
