@@ -23,6 +23,7 @@
 
 pub mod comic;
 pub mod epub;
+pub mod integrity;
 pub mod kindle;
 pub mod pdf;
 

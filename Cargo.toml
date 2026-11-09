@@ -78,6 +78,9 @@ quick-xml = "0.42"
 # (R7). An epub IS a zip, so `zip` covers epub and cbz both.
 zip = { version = "9", default-features = false, features = ["deflate"] }
 sevenz-rust2 = { version = "0.25", default-features = false }
+# The integrity check inflates PDF FlateDecode streams itself: lopdf's own
+# decoder logs a corrupt stream and returns what it got, which hides damage.
+flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
 # `.cbt` is a TAR of images. `tar` is pure Rust like the two above, so the
 # no-C-library rule that permanently rules out `.cbr` (R7) does not apply here
 # — a cbt is read for real rather than recorded as unsupported.

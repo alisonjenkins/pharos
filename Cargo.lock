@@ -5273,6 +5273,7 @@ version = "0.0.0"
 dependencies = [
  "boko",
  "criterion",
+ "flate2",
  "futures-util",
  "libc",
  "lopdf",
