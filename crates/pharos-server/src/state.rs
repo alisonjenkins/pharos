@@ -329,6 +329,8 @@ pub struct AppState {
     /// here so the admin spawn reads the configured value without
     /// re-parsing the toml config.
     pub scan_rate_limit_ms: u64,
+    /// Spec 033 — `[metadata] series_identity_repair` for background scans.
+    pub series_identity_repair: pharos_scanner::series_split::RepairMode,
     /// #11 — probe fan-out cap for background `/Library/Refresh` scans. 0 keeps
     /// the scanner's conservative default (leaves shared-storage I/O headroom).
     pub scan_probe_concurrency: usize,
@@ -785,6 +787,7 @@ impl AppState {
             remote_default_bitrate_bps: 0,
             enforce_video_range: false,
             scan_rate_limit_ms: 0,
+            series_identity_repair: pharos_scanner::series_split::RepairMode::DryRun,
             scan_probe_concurrency: 0,
             ffmpeg: default_ffmpeg_backend(),
             portraits: Arc::new(crate::portrait::HttpPortraits::new()),
@@ -915,6 +918,7 @@ impl AppState {
             remote_default_bitrate_bps: 0,
             enforce_video_range: false,
             scan_rate_limit_ms: 0,
+            series_identity_repair: pharos_scanner::series_split::RepairMode::DryRun,
             scan_probe_concurrency: 0,
             ffmpeg: default_ffmpeg_backend(),
             portraits: Arc::new(crate::portrait::HttpPortraits::new()),
@@ -1053,6 +1057,15 @@ impl AppState {
     /// P43 builder — apply the configured per-probe rate-limit for
     /// background library refresh. Capped at 5 seconds so a typo
     /// can't make a refresh run effectively forever.
+    /// Spec 033 builder — whether background scans write the series split.
+    pub fn with_series_identity_repair(
+        mut self,
+        mode: pharos_scanner::series_split::RepairMode,
+    ) -> Self {
+        self.series_identity_repair = mode;
+        self
+    }
+
     pub fn with_scan_rate_limit_ms(mut self, ms: u64) -> Self {
         self.scan_rate_limit_ms = ms.min(5_000);
         self

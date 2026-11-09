@@ -202,12 +202,14 @@ async fn scan(cfg: &Config, force: bool) -> Result<(), AppError> {
         .with_rate_limit_ms(cfg.server.scan_rate_limit_ms)
         .with_probe_concurrency_opt(cfg.server.scan_probe_concurrency)
         .with_probe_memo(cli_memo.clone())
+        .with_series_identity_repair(cfg.metadata.series_identity_repair)
         .with_force(force);
     #[cfg(not(all(unix, feature = "ffmpeg-lib")))]
     let scanner = FsScanner::new(FfmpegProber::new())
         .with_rate_limit_ms(cfg.server.scan_rate_limit_ms)
         .with_probe_concurrency_opt(cfg.server.scan_probe_concurrency)
         .with_probe_memo(cli_memo.clone())
+        .with_series_identity_repair(cfg.metadata.series_identity_repair)
         .with_force(force);
     // 004-books — the CLI scan writes book covers too. Without this a
     // `pharos scan` would index books with no tiles and the next server-side
@@ -2140,6 +2142,7 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
     state = state.with_remote_default_bitrate_bps(cfg.server.remote_default_bitrate_bps);
     state = state.with_enforce_video_range(cfg.server.enforce_video_range);
     state = state.with_scan_rate_limit_ms(cfg.server.scan_rate_limit_ms);
+    state = state.with_series_identity_repair(cfg.metadata.series_identity_repair);
     state = state.with_scan_probe_concurrency(cfg.server.scan_probe_concurrency);
     let trusted_proxies =
         pharos_server::client_ip::TrustedProxies::parse(&cfg.server.trusted_proxies)
@@ -2190,6 +2193,7 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
             rate_limit_ms: cfg.server.scan_rate_limit_ms,
         };
         let rate_limit_ms = cfg.server.scan_rate_limit_ms;
+        let series_identity_repair = cfg.metadata.series_identity_repair;
         let probe_concurrency = cfg.server.scan_probe_concurrency;
         // Adaptive backpressure — the periodic incremental rescan draws its
         // probe reads through the same shared I/O gate the server shrinks
@@ -2215,12 +2219,14 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
                     .with_rate_limit_ms(rate_limit_ms)
                     .with_probe_concurrency_opt(probe_concurrency)
                     .with_probe_memo(scan_memo.clone())
+                    .with_series_identity_repair(series_identity_repair)
                     .with_io_gate(io_gate.clone());
             #[cfg(not(all(unix, feature = "ffmpeg-lib")))]
             let s = pharos_scanner::FsScanner::new(pharos_scanner::FfmpegProber::new())
                 .with_rate_limit_ms(rate_limit_ms)
                 .with_probe_concurrency_opt(probe_concurrency)
                 .with_probe_memo(scan_memo.clone())
+                .with_series_identity_repair(series_identity_repair)
                 .with_io_gate(io_gate.clone());
             match cover_sink.clone() {
                 Some(sink) => s.with_cover_sink(sink),

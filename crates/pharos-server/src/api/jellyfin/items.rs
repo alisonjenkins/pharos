@@ -7569,6 +7569,7 @@ pub(crate) fn spawn_scan_tracked(
                 .with_rate_limit_ms(state.scan_rate_limit_ms)
                 .with_probe_concurrency_opt(state.scan_probe_concurrency)
                 .with_io_gate(state.bg_io.clone())
+                .with_series_identity_repair(state.series_identity_repair)
                 .with_force(force)
                 .with_progress(sink.clone())
                 .with_cancel(cancel_flag.clone());
@@ -7577,6 +7578,7 @@ pub(crate) fn spawn_scan_tracked(
                     .with_rate_limit_ms(state.scan_rate_limit_ms)
                     .with_probe_concurrency_opt(state.scan_probe_concurrency)
                     .with_io_gate(state.bg_io.clone())
+                    .with_series_identity_repair(state.series_identity_repair)
                     .with_force(force)
                     .with_progress(sink.clone())
                     .with_cancel(cancel_flag.clone());
