@@ -1750,6 +1750,15 @@ pub trait SeriesIdentityStore: Send + Sync {
         async { Ok(std::collections::HashMap::new()) }
     }
 
+    /// The keys in `keys` whose stored show match is flagged ambiguous (V891).
+    fn ambiguous_series(
+        &self,
+        _keys: &[String],
+    ) -> impl std::future::Future<Output = DomainResult<std::collections::HashSet<String>>> + Send
+    {
+        async { Ok(std::collections::HashSet::new()) }
+    }
+
     /// Mark every non-manual episode of `series_key` for reconciliation at `at`; returns rows changed.
     fn mark_series_reconcile(
         &self,

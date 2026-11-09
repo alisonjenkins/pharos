@@ -797,6 +797,16 @@ impl SeriesIdentityStore for AnyStore {
         }
     }
 
+    async fn ambiguous_series(
+        &self,
+        keys: &[String],
+    ) -> DomainResult<std::collections::HashSet<String>> {
+        match self {
+            AnyStore::Sqlite(s) => s.ambiguous_series(keys).await,
+            AnyStore::Postgres(p) => p.ambiguous_series(keys).await,
+        }
+    }
+
     async fn mark_series_reconcile(&self, series_key: &str, at: i64) -> DomainResult<u64> {
         match self {
             AnyStore::Sqlite(s) => s.mark_series_reconcile(series_key, at).await,
