@@ -640,11 +640,16 @@ fn AdminPane(access_token: String, server_base: String, current_user_id: String)
             }
         })
     };
+    // Rows the admin queued from this page, shown as Queued until the server's
+    // own `RecheckPending` arrives with the next load.
+    let integrity_queued = use_signal::<Vec<String>>(Vec::new);
+    let integrity_errors = use_signal::<Vec<(String, String)>>(Vec::new);
     // Reads every file's verdict, so it runs only while its tab is open.
     let integrity_resource = {
         let base = server_base.clone();
         let token = access_token.clone();
         let reload_signal = reload;
+        let mut queued_signal = integrity_queued;
         use_resource(move || {
             let _bust = reload_signal.read();
             let open = *active_tab.read() == AdminTab::Integrity;
@@ -652,15 +657,19 @@ fn AdminPane(access_token: String, server_base: String, current_user_id: String)
             let token = token.clone();
             async move {
                 if open {
-                    Some(fetch_integrity_report(&base, &token).await)
+                    let report = fetch_integrity_report(&base, &token).await;
+                    // The server now says which rows are pending; holding the
+                    // local mark past this would keep a finished row Queued.
+                    if report.is_ok() {
+                        queued_signal.set(Vec::new());
+                    }
+                    Some(report)
                 } else {
                     None
                 }
             }
         })
     };
-    let integrity_queued = use_signal::<Vec<String>>(Vec::new);
-    let integrity_errors = use_signal::<Vec<(String, String)>>(Vec::new);
     let plugins_resource = {
         let base = server_base.clone();
         let token = access_token.clone();
@@ -2020,10 +2029,13 @@ async fn fetch_integrity_report(base: &str, token: &str) -> Result<IntegrityRepo
         }
         other => other.to_string(),
     };
-    let status = web::integrity_status(base, token).await.map_err(describe)?;
-    let files = web::list_damaged_files(base, token)
-        .await
-        .map_err(describe)?;
+    let (status, files) = futures_util::future::join(
+        web::integrity_status(base, token),
+        web::list_damaged_files(base, token),
+    )
+    .await;
+    let status = status.map_err(describe)?;
+    let files = files.map_err(describe)?;
     Ok(IntegrityReport { status, files })
 }
 
