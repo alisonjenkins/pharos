@@ -5704,6 +5704,44 @@ body:has(.pharos-stage.is-mini) .pharos-main {
   padding-inline-start: 1.2rem;
   overflow-wrap: anywhere;
 }
+.pharos-admin-identity-group {
+  display: grid;
+  gap: 0.35rem;
+  padding-top: 0.5rem;
+  border-top: var(--px-border) solid var(--px-color-border);
+}
+.pharos-admin-identity-group-head {
+  margin: 0;
+  font-weight: 600;
+}
+.pharos-admin-identity-prompt {
+  margin: 0;
+  color: var(--px-color-accent);
+  font-weight: 600;
+}
+.pharos-admin-identity-files,
+.pharos-admin-identity-hits {
+  display: grid;
+  gap: 0.2rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.pharos-admin-identity-hits li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.25rem 0.5rem;
+}
+.pharos-admin-identity-hits li button {
+  margin-inline-start: auto;
+}
+.pharos-admin-identity-pick-open {
+  justify-self: start;
+}
+.pharos-admin-identity-move {
+  margin-top: 0.4rem;
+}
 .pharos-admin-identity-moves summary {
   cursor: pointer;
   color: var(--px-color-fg-muted);
