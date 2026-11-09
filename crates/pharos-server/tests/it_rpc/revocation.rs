@@ -63,6 +63,11 @@ pub(crate) async fn start_drawing_images(
     serve(fx, NonZeroU32::MIN)
 }
 
+/// A server over an already-configured `fx`.
+pub(crate) fn serve_fixture(fx: Fixture) -> (actix_test::TestServer, Fixture) {
+    serve(fx, NonZeroU32::MIN)
+}
+
 fn serve(fx: Fixture, revalidate_secs: NonZeroU32) -> (actix_test::TestServer, Fixture) {
     let state = fx.state.clone();
     let limits = rpc::limits::ConnectionLimits::default();
