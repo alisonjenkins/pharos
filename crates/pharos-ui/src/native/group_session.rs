@@ -1661,10 +1661,16 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
         if loading {
             return;
         }
+        // A player still owing its ready is loading what the group asked for,
+        // and its playhead sits at the target until the seek lands: correcting
+        // it seeks again and restarts the load, every ~2 s on a slow link
+        // (B1016). The ready's own hold puts it where the group is.
+        if owes_ready {
+            return;
+        }
         if player.paused() {
-            // A player still owing its ready is loading what the group asked
-            // for; one at its end has nothing left to play.
-            if !owes_ready && !player.ended() {
+            // One at its end has nothing left to play.
+            if !player.ended() {
                 self.resume_paused(&player, expected, since, now);
             }
             return;
@@ -1681,6 +1687,8 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
             Correction::Hold if nudged_before => self.set_rate(&player, 1.0),
             Correction::Hold => {}
             Correction::Rate(rate) => self.set_rate(&player, rate),
+            // Our last seek has not played yet: seeking again restarts it.
+            Correction::Seek(_) if self.inner.borrow().within_self_seek_grace(now) => {}
             Correction::Seek(to) => {
                 self.set_rate(&player, 1.0);
                 self.inner.borrow_mut().self_seek_ms = Some(now);
@@ -3674,6 +3682,59 @@ mod tests {
             rig.player.log.borrow().last().map(String::as_str),
             Some("seek(20000)")
         );
+    }
+
+    fn seeks(rig: &Rig) -> Vec<String> {
+        rig.player
+            .log
+            .borrow()
+            .iter()
+            .filter(|l| l.starts_with("seek("))
+            .cloned()
+            .collect()
+    }
+
+    /// B1016/V975: after a group seek, a player whose seek has not landed
+    /// (slow direct play: the playhead stays on the target, no `seeked`) is
+    /// left to load. The drift check used to hard-seek it every ~2 s, which
+    /// restarted the load each time and kept "Waiting for the server…" up.
+    #[test]
+    fn a_player_loading_the_groups_seek_is_not_seeked_again() {
+        let rig = playing_rig();
+        rig.env.now.set(101_000);
+        rig.session.deliver(GroupUpdate::Seek {
+            at_server_ms: 101_000,
+            position_ms: 94_852,
+            by: None,
+        });
+        rig.env.settle();
+        assert_eq!(seeks(&rig), ["seek(94852)"]);
+        for now in (102_000..=120_000).step_by(1_000) {
+            rig.env.now.set(now);
+            rig.session.check_drift();
+        }
+        assert_eq!(seeks(&rig), ["seek(94852)"]);
+        assert!(rig.env.kinds().is_empty(), "{:?}", rig.env.kinds());
+    }
+
+    /// B1016/V975: a drift hard seek still loading is not seeked again inside
+    /// the self-seek grace; past it, a player still far off is.
+    #[test]
+    fn a_hard_seek_still_loading_is_not_repeated_inside_the_grace() {
+        let rig = playing_rig();
+        rig.env.now.set(110_000);
+        rig.player.position.set(15_000);
+        rig.session.check_drift();
+        assert_eq!(seeks(&rig), ["seek(20000)"]);
+        // The seek has not landed: the playhead stays on its target.
+        for now in (111_000..=114_000).step_by(1_000) {
+            rig.env.now.set(now);
+            rig.session.check_drift();
+        }
+        assert_eq!(seeks(&rig), ["seek(20000)"]);
+        rig.env.now.set(115_000);
+        rig.session.check_drift();
+        assert_eq!(seeks(&rig), ["seek(20000)", "seek(25000)"]);
     }
 
     #[test]
