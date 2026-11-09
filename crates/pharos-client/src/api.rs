@@ -744,6 +744,18 @@ impl NativeApi {
         }
     }
 
+    /// Live push of the signed-in user's changes: see
+    /// [`crate::events::subscribe`].
+    pub async fn subscribe_events(
+        &self,
+        call: &CallInfo,
+        topics: &[&str],
+        cursor: &crate::events::EventCursor,
+        on_events: impl Fn(Vec<crate::events::PushEvent>) + 'static,
+    ) -> Result<crate::events::EventSubscription, ClientError> {
+        crate::events::subscribe(&self.session, call, topics, cursor, on_events).await
+    }
+
     /// Marks `id` watched or not for the signed-in user; a series or season
     /// marks every episode in it. Unwatched also forgets where it was left.
     /// Answers whether it is now watched.
