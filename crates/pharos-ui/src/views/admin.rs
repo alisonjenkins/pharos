@@ -6,9 +6,9 @@
 //! render so the UI is in place when entries land.
 
 use crate::client::{
-    ActivityEntry, AdminUser, ApiKey, BrandingConfig, DamagedFile, DeviceEntry, DuplicateFilm,
-    FilmVersion, IntegrityReport, IntegrityStatus, LibraryFolder, LogEntry, PluginEntry,
-    ScheduledTask,
+    ActivityEntry, AdminUser, ApiKey, BrandingConfig, DamagedFile, DeepCheck, DeviceEntry,
+    DuplicateFilm, FilmVersion, IntegrityReport, IntegrityStatus, LibraryFolder, LogEntry,
+    PluginEntry, ScheduledTask,
 };
 use dioxus::prelude::*;
 
@@ -50,6 +50,10 @@ pub enum AdminAction {
     SaveBranding(BrandingConfig),
     /// Queue a damaged file to be read again by the integrity check.
     RecheckDamaged {
+        media_id: String,
+    },
+    /// Queue a full decode of one file; slow, and one file runs at a time.
+    DeepCheck {
         media_id: String,
     },
     LibraryRefresh,
@@ -165,6 +169,12 @@ pub struct AdminViewProps {
     /// Re-check failures by media id, shown on the row.
     #[props(default)]
     pub integrity_errors: Vec<(String, String)>,
+    /// Files whose Deep check was just requested from this page.
+    #[props(default)]
+    pub deep_queued: Vec<String>,
+    /// Deep check failures by media id, shown on the row.
+    #[props(default)]
+    pub deep_errors: Vec<(String, String)>,
 }
 
 #[component]
@@ -411,6 +421,8 @@ pub fn AdminView(props: AdminViewProps) -> Element {
                         report: props.integrity.clone(),
                         queued: props.integrity_queued.clone(),
                         errors: props.integrity_errors.clone(),
+                        deep_queued: props.deep_queued.clone(),
+                        deep_errors: props.deep_errors.clone(),
                         on_action: props.on_action,
                     }
                 },
@@ -808,6 +820,8 @@ fn IntegritySection(
     report: Option<Result<IntegrityReport, String>>,
     queued: Vec<String>,
     errors: Vec<(String, String)>,
+    deep_queued: Vec<String>,
+    deep_errors: Vec<(String, String)>,
     on_action: EventHandler<AdminAction>,
 ) -> Element {
     rsx! {
@@ -825,9 +839,13 @@ fn IntegritySection(
                             file: f.clone(),
                             queued: f.recheck_pending || queued.contains(&f.media_id),
                             error: errors.iter().find(|(id, _)| *id == f.media_id).map(|(_, e)| e.clone()),
+                            deep_running: deep_queued.contains(&f.media_id)
+                                || deep_in_progress(&report.deep_checks, &f.media_id),
+                            deep_error: deep_errors.iter().find(|(id, _)| *id == f.media_id).map(|(_, e)| e.clone()),
                             on_action: on_action,
                         }
                     }
+                    DeepChecksSection { checks: report.deep_checks.clone() }
                 },
             }
         }
@@ -839,9 +857,13 @@ fn DamagedRow(
     file: DamagedFile,
     queued: bool,
     error: Option<String>,
+    deep_running: bool,
+    deep_error: Option<String>,
     on_action: EventHandler<AdminAction>,
 ) -> Element {
     let id = file.media_id.clone();
+    let deep_id = file.media_id.clone();
+    let can_deep = file.kind.as_deref() != Some("book");
     let breaks = file.first_fault_ms.map(break_label);
     rsx! {
         article {
@@ -881,10 +903,117 @@ fn DamagedRow(
                     "Re-check"
                 }
             }
+            if can_deep {
+                if deep_running {
+                    button { class: "pharos-admin-integrity-deep", disabled: true, "Deep check running…" }
+                } else {
+                    button {
+                        class: "pharos-admin-integrity-deep",
+                        onclick: move |_| on_action.call(AdminAction::DeepCheck {
+                            media_id: deep_id.clone(),
+                        }),
+                        "Deep check"
+                    }
+                }
+            }
             if let Some(e) = error {
                 p { class: "pharos-error", "Could not queue the re-check: {e}" }
             }
+            if let Some(e) = deep_error {
+                p { class: "pharos-error", "Could not start the deep check: {e}" }
+            }
         }
+    }
+}
+
+#[component]
+fn DeepChecksSection(checks: Vec<DeepCheck>) -> Element {
+    rsx! {
+        section {
+            class: "pharos-admin-integrity-deep-checks",
+            h4 { "Deep checks" }
+            if checks.is_empty() {
+                p {
+                    class: "pharos-admin-integrity-deep-empty",
+                    "A deep check decodes a whole file to find damage inside the picture or sound. It takes minutes and runs one file at a time, so use it on a file that plays badly."
+                }
+            }
+            for c in checks.iter() {
+                article {
+                    key: "{c.media_id}-{c.requested_at}",
+                    class: "pharos-admin-integrity-deep-check",
+                    "data-state": "{c.state}",
+                    h5 { "{deep_title(c)}" }
+                    p {
+                        class: "pharos-admin-integrity-verdict",
+                        "{deep_state_words(c)}"
+                        if let Some(ms) = c.first_error_ms {
+                            span { " · {break_label(ms)}" }
+                        }
+                    }
+                    if let Some(e) = c.first_error.as_deref() {
+                        p { class: "pharos-admin-integrity-fault", "{e}" }
+                    }
+                    if let Some(line) = deep_timing(c) {
+                        p { class: "pharos-admin-integrity-checked", "{line}" }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// True while the file has a deep check waiting or decoding.
+pub fn deep_in_progress(checks: &[DeepCheck], media_id: &str) -> bool {
+    checks
+        .iter()
+        .any(|c| c.media_id == media_id && deep_is_active(c))
+}
+
+/// True while any deep check is waiting or decoding.
+pub fn any_deep_active(checks: &[DeepCheck]) -> bool {
+    checks.iter().any(deep_is_active)
+}
+
+fn deep_is_active(c: &DeepCheck) -> bool {
+    matches!(c.state.as_str(), "queued" | "running")
+}
+
+fn deep_state_words(c: &DeepCheck) -> String {
+    match c.state.as_str() {
+        "queued" => "Waiting".to_string(),
+        "running" => "Decoding…".to_string(),
+        "clean" => "No damage found".to_string(),
+        "damaged" => {
+            let noun = if c.errors == 1 { "error" } else { "errors" };
+            format!("Damaged: {} decode {noun}", thousands(c.errors))
+        }
+        "failed" => match c.detail.as_deref().filter(|d| !d.is_empty()) {
+            Some(d) => format!("Couldn't run: {d}"),
+            None => "Couldn't run".to_string(),
+        },
+        other => format!("Unknown state: {other}"),
+    }
+}
+
+/// `Took 4m 12s · Finished 2026-11-04`, whichever parts the run has.
+fn deep_timing(c: &DeepCheck) -> Option<String> {
+    let parts: Vec<String> = [
+        c.elapsed_secs
+            .map(|s| format!("Took {}", duration_label(s))),
+        c.finished_at.map(|s| format!("Finished {}", date_label(s))),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    (!parts.is_empty()).then(|| parts.join(" · "))
+}
+
+fn duration_label(secs: u64) -> String {
+    match secs {
+        0..=59 => format!("{secs}s"),
+        60..=3_599 => format!("{}m {:02}s", secs / 60, secs % 60),
+        _ => format!("{}h {:02}m", secs / 3_600, secs % 3_600 / 60),
     }
 }
 
@@ -939,14 +1068,43 @@ fn file_name_of(path: &str) -> &str {
 /// `Series · S01E02 · Name` for an episode, the name for everything else,
 /// the file name when the library has no name for it.
 fn damaged_title(f: &DamagedFile) -> String {
-    let named = f.name.as_deref().filter(|n| !n.is_empty());
-    let title = if f.kind.as_deref() == Some("episode") {
-        let code = match (f.season_number, f.episode_number) {
+    media_title(
+        &f.media_id,
+        f.kind.as_deref(),
+        f.name.as_deref(),
+        f.series_name.as_deref(),
+        (f.season_number, f.episode_number),
+        f.path.as_deref(),
+    )
+}
+
+fn deep_title(c: &DeepCheck) -> String {
+    media_title(
+        &c.media_id,
+        c.kind.as_deref(),
+        c.name.as_deref(),
+        c.series_name.as_deref(),
+        (c.season_number, c.episode_number),
+        c.path.as_deref(),
+    )
+}
+
+fn media_title(
+    media_id: &str,
+    kind: Option<&str>,
+    name: Option<&str>,
+    series_name: Option<&str>,
+    numbers: (Option<u32>, Option<u32>),
+    path: Option<&str>,
+) -> String {
+    let named = name.filter(|n| !n.is_empty());
+    let title = if kind == Some("episode") {
+        let code = match numbers {
             (Some(s), Some(e)) => Some(format!("S{s:02}E{e:02}")),
             _ => None,
         };
         let parts: Vec<String> = [
-            f.series_name.clone().filter(|n| !n.is_empty()),
+            series_name.filter(|n| !n.is_empty()).map(str::to_string),
             code,
             named.map(str::to_string),
         ]
@@ -958,8 +1116,8 @@ fn damaged_title(f: &DamagedFile) -> String {
         named.map(str::to_string)
     };
     title
-        .or_else(|| f.path.as_deref().map(|p| file_name_of(p).to_string()))
-        .unwrap_or_else(|| format!("File {}", f.media_id))
+        .or_else(|| path.map(|p| file_name_of(p).to_string()))
+        .unwrap_or_else(|| format!("File {media_id}"))
 }
 
 fn kind_label(kind: Option<&str>) -> &'static str {
@@ -1203,18 +1361,37 @@ mod tests {
         queued: Vec<String>,
         errors: Vec<(String, String)>,
     ) -> String {
+        render_integrity_deep(report, queued, errors, vec![], vec![])
+    }
+
+    fn render_integrity_deep(
+        report: Option<Result<IntegrityReport, String>>,
+        queued: Vec<String>,
+        errors: Vec<(String, String)>,
+        deep_queued: Vec<String>,
+        deep_errors: Vec<(String, String)>,
+    ) -> String {
         type Input = (
             Option<Result<IntegrityReport, String>>,
             Vec<String>,
             Vec<(String, String)>,
+            Vec<String>,
+            Vec<(String, String)>,
         );
         let mut dom = VirtualDom::new_with_props(
-            |(report, queued, errors): Input| {
+            |(report, queued, errors, deep_queued, deep_errors): Input| {
                 rsx! {
-                    IntegritySection { report, queued, errors, on_action: |_| {} }
+                    IntegritySection {
+                        report,
+                        queued,
+                        errors,
+                        deep_queued,
+                        deep_errors,
+                        on_action: |_| {},
+                    }
                 }
             },
-            (report, queued, errors),
+            (report, queued, errors, deep_queued, deep_errors),
         );
         dom.rebuild_in_place();
         dioxus_ssr::render(&dom)
@@ -1340,6 +1517,175 @@ mod tests {
         };
         let html = render_integrity(report(vec![damaged("5")], status), vec![], vec![]);
         assert!(html.contains("no longer in the library"), "{html}");
+    }
+
+    fn deep(id: &str, state: &str) -> DeepCheck {
+        DeepCheck {
+            media_id: id.into(),
+            state: state.into(),
+            requested_at: 1_762_214_400,
+            ..DeepCheck::default()
+        }
+    }
+
+    fn deep_report(
+        files: Vec<DamagedFile>,
+        deep_checks: Vec<DeepCheck>,
+    ) -> Option<Result<IntegrityReport, String>> {
+        Some(Ok(IntegrityReport {
+            status: IntegrityStatus {
+                eligible: 5,
+                checked: 5,
+                damaged: files.len() as u64,
+                queued: 0,
+            },
+            files,
+            deep_checks,
+        }))
+    }
+
+    #[test]
+    fn each_damaged_row_offers_a_deep_check_except_books() {
+        let book = DamagedFile {
+            kind: Some("book".into()),
+            ..damaged("2")
+        };
+        let html = render_integrity_deep(
+            deep_report(vec![damaged("1"), book], vec![]),
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+        );
+        assert_eq!(html.matches(">Deep check<").count(), 1, "{html}");
+    }
+
+    #[test]
+    fn a_row_shows_deep_check_running_while_queued_or_decoding() {
+        for state in ["queued", "running"] {
+            let html = render_integrity_deep(
+                deep_report(vec![damaged("1")], vec![deep("1", state)]),
+                vec![],
+                vec![],
+                vec![],
+                vec![],
+            );
+            assert!(html.contains("Deep check running…"), "{state}: {html}");
+            assert!(!html.contains(">Deep check<"), "{state}: {html}");
+        }
+        let html = render_integrity_deep(
+            deep_report(vec![damaged("1")], vec![]),
+            vec![],
+            vec![],
+            vec!["1".into()],
+            vec![],
+        );
+        assert!(html.contains("Deep check running…"), "{html}");
+        let done = render_integrity_deep(
+            deep_report(vec![damaged("1")], vec![deep("1", "clean")]),
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+        );
+        assert!(
+            done.contains(">Deep check<"),
+            "a finished run can be repeated: {done}"
+        );
+    }
+
+    #[test]
+    fn a_deep_check_error_shows_on_its_row() {
+        let html = render_integrity_deep(
+            deep_report(vec![damaged("1")], vec![]),
+            vec![],
+            vec![],
+            vec![],
+            vec![("1".into(), "books have no frames to decode".into())],
+        );
+        assert!(
+            html.contains("Could not start the deep check: books have no frames to decode"),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn the_deep_checks_section_explains_itself_when_empty() {
+        let html = render_integrity_deep(
+            deep_report(vec![damaged("1")], vec![]),
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+        );
+        assert!(html.contains("Deep checks"), "{html}");
+        assert!(html.contains("decodes a whole file"), "{html}");
+        assert!(html.contains("takes minutes"), "{html}");
+        assert!(html.contains("one file at a time"), "{html}");
+    }
+
+    #[test]
+    fn the_deep_checks_section_words_each_state() {
+        let checks = vec![
+            deep("1", "queued"),
+            deep("2", "running"),
+            deep("3", "clean"),
+            DeepCheck {
+                errors: 4,
+                first_error: Some("Invalid NAL unit size".into()),
+                first_error_ms: Some(2_533_000),
+                elapsed_secs: Some(252),
+                finished_at: Some(1_762_214_400),
+                name: Some("Heat".into()),
+                kind: Some("movie".into()),
+                ..deep("4", "damaged")
+            },
+            DeepCheck {
+                detail: Some("ffmpeg is not installed".into()),
+                ..deep("5", "failed")
+            },
+        ];
+        let html =
+            render_integrity_deep(deep_report(vec![], checks), vec![], vec![], vec![], vec![]);
+        for want in [
+            "Waiting",
+            "Decoding…",
+            "No damage found",
+            "Damaged: 4 decode errors",
+            "Breaks at 0:42:13",
+            "Invalid NAL unit size",
+            "Took 4m 12s",
+            "Finished 2025-11-04",
+            "Couldn&#39;t run: ffmpeg is not installed",
+            "Heat",
+            "File 1",
+        ] {
+            assert!(html.contains(want), "missing {want:?}: {html}");
+        }
+        assert!(!html.contains("decodes a whole file"), "{html}");
+    }
+
+    #[test]
+    fn deep_state_wording_handles_edges() {
+        assert_eq!(
+            deep_state_words(&DeepCheck {
+                errors: 1,
+                ..deep("1", "damaged")
+            }),
+            "Damaged: 1 decode error"
+        );
+        assert_eq!(deep_state_words(&deep("1", "failed")), "Couldn't run");
+        assert_eq!(
+            deep_state_words(&deep("1", "weird")),
+            "Unknown state: weird"
+        );
+        assert_eq!(duration_label(7), "7s");
+        assert_eq!(duration_label(3_725), "1h 02m");
+        assert_eq!(deep_timing(&deep("1", "queued")), None);
+        assert!(any_deep_active(&[deep("1", "clean"), deep("2", "running")]));
+        assert!(!any_deep_active(&[deep("1", "clean"), deep("2", "failed")]));
+        assert!(deep_in_progress(&[deep("1", "queued")], "1"));
+        assert!(!deep_in_progress(&[deep("1", "queued")], "2"));
     }
 
     #[test]
