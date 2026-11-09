@@ -12,7 +12,7 @@ annotation secret(field, param) :Void;
 
 # Bumped when the schema changes; served as ServerInfo.schemaVersion so a client
 # can tell which methods a server knows (FR-009).
-const schemaVersion :UInt32 = 30;
+const schemaVersion :UInt32 = 31;
 
 # ---- ids and shared types -------------------------------------------------
 struct ItemId {                # mirrors pharos_jellyfin_api::WireId
@@ -272,6 +272,7 @@ struct Version {
   container @10 :Text;
   path @11 :Text;
   damaged @12 :Bool;                # the integrity check found this file damaged. Since schemaVersion 30.
+  durationMs @13 :UInt64;           # the file's runtime; 0 when unknown. Since schemaVersion 31.
 }
 # What the integrity check found wrong with one file. `verdict` is empty when
 # the file is not known to be damaged, else damaged, short or unreadable.

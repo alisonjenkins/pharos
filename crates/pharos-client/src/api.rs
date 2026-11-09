@@ -129,6 +129,9 @@ pub struct Version {
     pub path: String,
     /// The integrity check found this file damaged.
     pub damaged: bool,
+    /// The file's runtime; 0 when unknown (or from a server before
+    /// schemaVersion 31).
+    pub duration_ms: u64,
 }
 
 /// One audio stream of a [`Version`].
@@ -1814,6 +1817,7 @@ fn read_version(v: pharos_api::pharos_capnp::version::Reader<'_>) -> Result<Vers
         container: text(v.get_container())?,
         path: text(v.get_path())?,
         damaged: v.get_damaged(),
+        duration_ms: v.get_duration_ms(),
     })
 }
 
