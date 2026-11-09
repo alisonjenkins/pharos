@@ -4601,11 +4601,14 @@ pub fn in_ignored_folder(path: &Path, root: &Path) -> bool {
         .any(is_ignored_dir)
 }
 
-/// Whether `path` is an [`IGNORE_MARKER`] itself: creating one hides rows
-/// already indexed, so the watcher must reconcile rather than add.
+/// Whether writing `path` changes rows already indexed beside it: an
+/// [`IGNORE_MARKER`] hides them, a `tvshow.nfo` turns films into episodes.
+/// The watcher must reconcile for these rather than add.
 #[cfg_attr(not(feature = "watch"), allow(dead_code))]
-pub(crate) fn is_ignore_marker(path: &Path) -> bool {
-    path.file_name() == Some(std::ffi::OsStr::new(IGNORE_MARKER))
+pub(crate) fn reshapes_indexed_rows(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n == IGNORE_MARKER || n.eq_ignore_ascii_case("tvshow.nfo"))
 }
 
 /// Whether the full walk leaves `path` out: under a `.ignore` folder, a
@@ -10887,14 +10890,17 @@ mod tests {
     }
 
     #[test]
-    fn a_created_ignore_marker_is_told_apart() {
-        assert!(is_ignore_marker(Path::new("/lib/To Sort/.ignore")));
+    fn a_marker_that_reshapes_indexed_rows_is_told_apart() {
+        for marker in ["/lib/To Sort/.ignore", "/lib/TV/Dragon Ball/tvshow.nfo"] {
+            assert!(reshapes_indexed_rows(Path::new(marker)), "{marker}");
+        }
         for other in [
             "/lib/To Sort/x.ignore",
             "/lib/.ignore/x.mkv",
             "/lib/To Sort",
+            "/lib/Heat (1995)/movie.nfo",
         ] {
-            assert!(!is_ignore_marker(Path::new(other)), "{other}");
+            assert!(!reshapes_indexed_rows(Path::new(other)), "{other}");
         }
     }
 }
