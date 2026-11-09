@@ -12,7 +12,7 @@ annotation secret(field, param) :Void;
 
 # Bumped when the schema changes; served as ServerInfo.schemaVersion so a client
 # can tell which methods a server knows (FR-009).
-const schemaVersion :UInt32 = 29;
+const schemaVersion :UInt32 = 30;
 
 # ---- ids and shared types -------------------------------------------------
 struct ItemId {                # mirrors pharos_jellyfin_api::WireId
@@ -79,6 +79,7 @@ struct ItemSummary {
   criticRating @13 :OptU16;    # Rotten Tomatoes Tomatometer, a percentage
   artist @14 :Text;            # a song's artists for its card, joined; empty for anything else. Since schemaVersion 25.
   stereo @15 :Stereo3d;        # the primary's packing, else the first 3D version's. Since schemaVersion 29.
+  damaged @16 :Bool;           # the integrity check found this file damaged; Library.detail says where. Since schemaVersion 30.
 }
 
 struct ItemPage { items @0 :List(ItemSummary); total @1 :UInt32; start @2 :UInt32; }
@@ -223,6 +224,7 @@ struct ItemDetail {
   album @10 :Text;                  # a song's album name; empty when it has none
   cast @11 :List(Credit);           # billed order; a series or season ranks its regulars across episodes
   versions @12 :List(Version);      # a film or episode's files, the primary first; empty for anything else. Since schemaVersion 29.
+  damage @13 :Damage;               # what is wrong with the file this detail describes; verdict empty when nothing is known. Since schemaVersion 30.
 }
 # Someone who appears in the item. `imageUrl` is the person's photo on this
 # server, empty when there is none.
@@ -269,7 +271,18 @@ struct Version {
   sizeBytes @9 :UInt64;
   container @10 :Text;
   path @11 :Text;
+  damaged @12 :Bool;                # the integrity check found this file damaged. Since schemaVersion 30.
 }
+# What the integrity check found wrong with one file. `verdict` is empty when
+# the file is not known to be damaged, else damaged, short or unreadable.
+# `reason` is the reader's own words for the first fault, possibly empty.
+# `ranges` are the damaged spans on the player's timeline, in
+# media order; a span one packet wide has startMs == endMs.
+struct Damage {
+  verdict @0 :Text; reason @1 :Text; ranges @2 :List(DamageRange);
+  checkedAt @3 :Int64;              # unix seconds; 0 = unknown
+}
+struct DamageRange { startMs @0 :UInt64; endMs @1 :UInt64; }
 struct VersionAudio { language @0 :Text; codec @1 :Text; channels @2 :UInt32; }
 # A font the file embeds, for a renderer drawing an ASS subtitle (spec 026).
 # url holds `{subtitle}`, the index of the subtitle track the font is fetched
