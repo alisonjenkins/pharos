@@ -177,6 +177,25 @@ impl IntegrityMemo {
             .collect()
     }
 
+    /// The ids of every file recorded as damaged.
+    pub fn damaged_ids(&self) -> std::collections::HashSet<u64> {
+        let Ok(d) = self.doc.read() else {
+            return Default::default();
+        };
+        d.entries
+            .iter()
+            .filter(|(_, e)| e.report.is_damaged())
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
+    /// This file's recorded verdict, whatever state the file was in when it
+    /// was read: like the damaged list, it stands until the sweep reads the
+    /// file again.
+    pub fn verdict(&self, id: u64) -> Option<Entry> {
+        self.doc.read().ok()?.entries.get(&id).cloned()
+    }
+
     /// How many files have been scanned.
     pub fn len(&self) -> usize {
         self.doc.read().map(|d| d.entries.len()).unwrap_or(0)
