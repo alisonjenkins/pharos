@@ -863,21 +863,39 @@ pub(crate) async fn resolve_synth_image_item(
     // and each full `list()` scans the whole library. Cache the synth-id →
     // item-id mapping (including negatives) so only the first request per group
     // pays the scan.
-    if let Some(cached) = state.synth_image_cached(id_str) {
-        return match cached {
-            Some(item_id) => state.stores.get(item_id).await.ok(),
-            None => None,
-        };
+    let mut stale = None;
+    match state.synth_image_cached(id_str) {
+        Some(Some(item_id)) => match state.stores.get(item_id).await {
+            Ok(item) => return Some(item),
+            Err(error) => stale = Some((item_id, error)),
+        },
+        Some(None) => return None,
+        None => {}
+    }
+    // A memoised representative outlives the library generation, so a scan
+    // that folds or sweeps its row leaves the tile blank until it is re-picked.
+    if let Some((item_id, error)) = stale {
+        tracing::info!(
+            synth_id = id_str,
+            item_id,
+            %error,
+            "re-picked a group's image representative: its memoised row is gone",
+        );
+        metrics::counter!("pharos_synth_image_repick_total").increment(1);
+        state.synth_image_forget(id_str);
     }
     // Cold miss: warm the ENTIRE synth-id → representative map in one scan,
     // serialised so a grid's burst of concurrent poster requests doesn't each
     // run its own multi-second `list()`. Peers wait here, then hit the memo.
     let mut confirmed_at = state.synth_image_warm.lock().await;
-    if let Some(cached) = state.synth_image_cached(id_str) {
-        return match cached {
-            Some(item_id) => state.stores.get(item_id).await.ok(),
-            None => None,
-        };
+    match state.synth_image_cached(id_str) {
+        Some(Some(item_id)) => {
+            if let Ok(item) = state.stores.get(item_id).await {
+                return Some(item);
+            }
+        }
+        Some(None) => return None,
+        None => {}
     }
     let all = state.list_items_fresh().await.ok()?;
     build_synth_image_map(state, &all);
@@ -2295,6 +2313,44 @@ mod tests {
             .await
             .expect("a cover that landed after the memo warmed must be picked up");
         assert_eq!(tags.get("Primary").map(String::as_str), Some("2"));
+    }
+
+    #[actix_web::test]
+    async fn a_memoised_representative_whose_row_is_gone_is_re_picked() {
+        // B1000 — the copy fold deleted the rows of Bones' S01 .avi copies,
+        // one of them the show's memoised representative; the memo keeps
+        // positives across library generations, so the show tile lost its
+        // poster until a restart.
+        use crate::api::jellyfin::dto::series_id_for_key;
+        use pharos_core::{MediaItem, MediaKind, MediaStore, SeriesInfo};
+        let cache_dir = tempfile::tempdir().unwrap();
+        let state = seed_state_with_cache(cache_dir.path()).await;
+        state
+            .stores
+            .put(MediaItem {
+                id: 602,
+                path: "/tv/Bones/Season 01/Bones S01E01.mkv".into(),
+                title: "Bones S01E01".into(),
+                kind: MediaKind::Episode,
+                series: Some(SeriesInfo {
+                    series_name: "Bones".into(),
+                    season_number: Some(1),
+                    episode_number: Some(1),
+                    series_folder: Some("/tv/Bones".into()),
+                    series_year: None,
+                }),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let synth = series_id_for_key(Some("/tv/Bones"), "Bones");
+        state.synth_image_remember(&synth, Some(601));
+
+        let tags = synth_primary_tag(&state, &synth)
+            .await
+            .expect("a show whose memoised episode was folded keeps a poster");
+        assert_eq!(tags.get("Primary").map(String::as_str), Some("602"));
+        assert_eq!(state.synth_image_cached(&synth), Some(Some(602)));
     }
 
     #[actix_web::test]
