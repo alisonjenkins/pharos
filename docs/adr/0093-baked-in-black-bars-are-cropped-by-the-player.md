@@ -1,6 +1,6 @@
 # ADR-0093: Baked-in black bars are found once per file and cropped by the player
 
-- **Status:** Proposed
+- **Status:** Accepted (Alison, 2026-11-09)
 - **Date:** 2026-11-09T21:40:00Z
 - **Deciders:** Alison Jenkins
 
