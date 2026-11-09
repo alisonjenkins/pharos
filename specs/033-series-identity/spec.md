@@ -83,21 +83,32 @@ then only as matching evidence (§3), never as identity.
 
 ### 2. Splitting a folder that holds two shows (V893)
 
-When a bare folder's files state two or more different years, or some state a
-year and others state none, the folder is **split by stated year**:
+A bare folder is **split by stated year** when its files state two or more
+different years. Files that state no year are not split off for that alone: a
+folder of `Show (2020) - S01E01.mkv` and `S01E02.mkv` is one show. An unyeared
+file joins the folder's yeared group unless its own evidence fits another
+same-named show better: its filename episode title matches that show's episode
+at the same season/episode (similarity ≥ 0.8) and does not match the yeared
+show's. An unyeared file with no title to compare stays with the yeared group,
+and the folder is flagged (§7) when the same-named rival exists.
 
-- the files with no stated year keep the plain folder key, so its wire ids and
-  series-level user data (favourite, played) do not move;
-- each stated-year group gets the key `"{folder}\u{1f}{YYYY}"` (unit separator,
-  which never occurs in a path) and `series_year = YYYY`;
-- an unyeared file whose name carries an episode title that matches an episode
-  of one yeared group's matched show (same season/episode, similarity ≥ 0.8)
-  joins that group instead. This keeps a stray `S03E05 - Title.mkv` with the
-  2014 show without a rename.
+Which group keeps the plain folder key, and with it the series wire id and the
+series-level user data (favourite, played):
 
-A folder whose files all state one year (BSG) is not split. For the deployed
-library this splits exactly one folder, `The Flash`: 4 files stay on the folder
-key (1990), 62 move to `…\u{1f}2014`. The UI shows two "The Flash" tiles,
+1. the group whose show is the folder's stored `series_metadata` match, so the
+   show users already know keeps its id;
+2. else the group with the most episodes.
+
+Every other group gets the key `"{folder}\u{1f}{YYYY}"` (unit separator, which
+never occurs in a path), or `"{folder}\u{1f}none"` for an unyeared group that
+does not keep the plain key, with `series_year` set to its year.
+
+A folder whose files all state one year (BSG) is not split, so it keeps its key
+and its state. For the deployed
+library this splits exactly one folder, `The Flash`: its 4 Season 01 files carry
+1990 episode titles, so they split from the 62 `(2014)` files. The stored match
+is the 1990 show, so the 4 files keep the folder key and the 62 move to
+`…\u{1f}2014`. The UI shows two "The Flash" tiles,
 told apart by `ProductionYear` as LIB-C11 already does for two folders.
 
 Every split is logged with the folder, the groups, their counts and the reason
@@ -112,14 +123,17 @@ the stated or consensus year, the local season list with episode counts, up to
 ten filename episode titles, and the `tvshow.nfo` provider ids and year (when
 B558 trusts it).
 
-1. A year (folder, consensus, or trusted NFO) goes into the search as today.
-2. With no year, if two or more candidates match the name exactly, the matcher
-   no longer tie-breaks by provider order. It fetches each exact candidate's
+1. A year from the folder or the files' consensus goes into the search as
+   today and separates same-named candidates. A year that comes only from
+   `tvshow.nfo` does not separate them: it is one more vote in step 2, since
+   the NFOs in this library are wrong as often as right.
+2. If two or more candidates match the name exactly and no folder or file year
+   separates them, the matcher no longer tie-breaks by provider order. It fetches each exact candidate's
    season/episode list (at most 3 candidates, cached) and scores them:
    - share of local (season, episode) pairs the candidate has;
    - share of filename episode titles that match the candidate's titles at the
      same position;
-   - a vote, not a veto, for the candidate the NFO ids name.
+   - a vote, not a veto, for the candidate the NFO ids or NFO year name.
 3. The best candidate always wins, so the show shows its best guess. When it
    leads the runner-up by less than a clear margin (proposed 0.2 on a 0–1
    scale), the match is also **flagged**: `series_metadata.match_flag =
@@ -128,8 +142,9 @@ B558 trusts it).
    is listed on the Show identity page (§7) until it is fixed or confirmed.
    A manual match (`match_source = 'manual'`) is never re-asked.
 
-Bump `TV_MATCH_VERSION` to 2 so stored matches are re-asked; see §6 for how the
-re-ask is limited.
+Bump `TV_MATCH_VERSION` to 2 so stored matches are re-asked, but only after
+the version gate is changed (§6 step 3): today `readmit_stale_tv_matches`
+re-admits every searched show and episode on any version change.
 
 ### 4. Episodes inherit the show's match (V892)
 
@@ -156,7 +171,12 @@ together with its show's when the show is re-matched.
 design the rule becomes: copies fold only when they share the **series key**
 (after the §2 split) **and** their stated show years are equal (both absent
 counts as equal) **and**, when both rows carry a provider series id, those ids
-are equal. The split runs before the fold in a scan pass, so a split folder's
+are equal **and** the evidence does not say they are different episodes: when
+both file names carry an episode title, the titles match (similarity ≥ 0.8).
+Matching season/episode numbers alone fold only in a series that is neither
+flagged (§3) nor split (§2); in a flagged or split series, copies with no
+provider id or title to compare are kept as separate rows and listed on the
+Show identity page (§7) instead. The split runs before the fold in a scan pass, so a split folder's
 groups are separate shows before #1055 looks at them. A refused fold is logged
 with both paths and the reason and counted under its own `decided_by` label.
 
@@ -187,22 +207,37 @@ the series wire id.
    match, episodes whose metadata would be re-fetched) and counts it, without
    writing. `"apply"` makes the writes. The live switch to `"apply"` is a
    home-cluster PR that needs Alison's OK, like the artwork enforcement.
-3. **Re-match only shows with conflicting evidence**: with `TV_MATCH_VERSION`
-   at 2, a stored search match is re-asked only when its show has an exact-name
+3. **Re-match only shows with conflicting evidence**: `readmit_stale_tv_matches`
+   no longer calls `readmit_searched_tv` (which re-admits every searched show
+   and episode) on a version change. At version 2 it runs the conflict filter
+   below, re-admits only what it selects, and only in `"apply"`; in
+   `"dry_run"` it logs the selection and leaves the stored version key at 1, so
+   switching to `"apply"` later still runs it. A stored search match is
+   re-asked only when its show has an exact-name
    rival, or its matched premiere year differs from the stated year by more
    than one, or the folder was split. Manual matches are kept. In the deployed
    library this re-asks BSG and The Flash (and checks the other bare-folder
    remakes, which keep their match).
 4. **Re-fetch episodes whose show id disagrees**: an episode whose stored
    provider ids belong to a show other than its series' pinned match, or whose
-   premiere date falls outside the pinned show's run, is cleared
-   (`metadata_refreshed_at = NULL`) and re-enriched by §4. In the deployed
+   premiere date falls outside the pinned show's run (whether or not its
+   provider show can be identified), is **rebuilt**, not just re-admitted:
+   `apply_enrichment` only fills empty fields, so clearing
+   `metadata_refreshed_at` alone would keep the wrong title, plot and air date.
+   The rebuild re-runs the local resolver (NFO ▸ sidecar ▸ filename) with the
+   rejected NFO set aside, which resets the provider-derived fields (title,
+   overview, premiere date, community rating, provider ids, the episode still)
+   to what local evidence alone says, then enriches from the pinned match.
+   Local data that passes the checks (a sidecar, an NFO that names the right
+   show) is re-read and so kept. Probe data, user data and the row id do not
+   change. In the deployed
    library that is about 176 rows (BSG 81, Flash 66, Cosmos 13, Life on Mars
    16) plus the 6 B933 rows.
 5. **Series-level state of split rows**: the 62 Flash 2014 rows get a new series
    wire id. A favourite or played mark set on "The Flash" series stays with the
-   folder key (the 1990 group), since the group that keeps the key is the one
-   with no stated year. Episode-level state does not move.
+   folder key, which the 1990 group keeps because it holds the stored match
+   (§2). Episode-level state does not move. A folder that is not split keeps
+   its key and state.
 
 ### 7. Fixing shows and files by hand: the Show identity page (V896)
 
@@ -219,7 +254,9 @@ Each entry offers:
 
 1. **Pick the show** — search the providers and pick a match (the existing
    Identify path, `RemoteSearch/Apply`, which writes `match_source = 'manual'`),
-   or confirm the guess, which clears the flag.
+   or confirm the guess, which clears the flag and also writes
+   `match_source = 'manual'`, so `series_needing_match` never re-admits it
+   after the refresh TTL.
 2. **Move files** — tick episodes of a folder and send them to another group:
    one of the folder's groups, any other show in the library, or a new show
    (name, year, and optionally a provider pick). This is how a wrong split is
@@ -230,8 +267,13 @@ Hand fixes are stored as **overrides**, never by editing the scanned rows, so
 a rescan cannot undo them: a new table `series_overrides` (path or folder,
 target series key, target name and year, who, when; migration 0074, verify
 free). The scanner applies overrides after its own split and before #1055's
-fold, so the fold sees the final grouping. Each change re-fetches the affected
-episodes' metadata straight away (§4) and keeps every row and its user data.
+fold, so the fold sees the final grouping. Each change rebuilds the affected
+episodes' metadata straight away (§6 step 4) and keeps every row and its user
+data. A moved episode's own manual match (`match_source = 'manual'`, which
+`items_needing_match` skips) is cleared by the move and the episode is rebuilt
+directly against the destination show, outside the queue, so no metadata from
+the old show survives. The move is the admin's resolution; the log line names
+the cleared manual id.
 Overrides are listed on the page and can be removed, which returns the files to
 what the scanner decides.
 
@@ -279,11 +321,11 @@ re-fetches, and nothing else changing match.
 | B932 | One show folder holding two shows (The Flash 1990 Season 01 and 2014 Seasons 03–09) was one series with one match. |
 | B933 | The per-episode series search attached unrelated shows' episodes (Dune - Prophecy S01E06, Knight Rider (2008) S01E02/E04, Star Trek - Starfleet Academy S01E02/E04/E05). |
 | B934 | Reserved for an issue found while implementing. |
-| V890 | A show's year comes from folder ▸ filename `Show (YYYY)` prefix ▸ release folder, per file, with the folder taking its files' consensus; `tvshow.nfo` year is evidence only. |
-| V891 | Two exact-name candidates with no year between them are decided by episode fit, or stored as `ambiguous` for a manual pick; never by provider order. |
+| V890 | A show's year comes from folder ▸ filename `Show (YYYY)` prefix ▸ release folder, per file, with the folder taking its files' consensus; a `tvshow.nfo` year is a vote only and never separates same-named candidates. |
+| V891 | Two exact-name candidates with no folder or file year between them are decided by episode fit, never by provider order; the best guess is used and a close call is flagged for an admin. |
 | V892 | An episode's provider metadata comes only from its series' pinned match; an episode NFO id naming another series is set aside. |
-| V893 | A bare folder whose files state different show years is split by stated year; the unyeared group keeps the folder key. |
-| V894 | Copies fold only within one series key, with equal stated show years and equal provider series ids where both are known. |
+| V893 | A bare folder whose files state different show years is split by stated year; an unyeared file splits off only on its own episode-title evidence; the group holding the stored match (else the largest) keeps the folder key. |
+| V894 | Copies fold only within one series key, with equal stated show years, equal provider series ids where both are known and agreeing filename episode titles where both have one; in a flagged or split series, numbers alone never fold. |
 | V896 | A hand fix of a show or its files is an override the scanner applies after its own split and before the copy fold; a rescan never undoes it. |
 
 ## Out of scope
