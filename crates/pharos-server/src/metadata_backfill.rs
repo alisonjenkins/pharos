@@ -258,7 +258,8 @@ where
     if tvdb.is_some() || tmdb.is_some() {
         // Non-fatal: a config store that cannot be read or written must not
         // stop enrichment. The next pass tries again.
-        if let Err(e) = readmit_stale_tv_matches(store).await {
+        let providers = SeriesProviders { tvdb, tmdb };
+        if let Err(e) = readmit_stale_tv_matches(store, &providers, bg_io, cfg, now).await {
             tracing::warn!(error = %e, "T9 metadata backfill: show matcher version check failed");
         }
     }
@@ -1609,43 +1610,370 @@ fn upsert_art(
 ///
 /// 1 (B557): TVDB hits scored by their English translation and aliases, an
 /// exact name ahead of a prefix match, a franchise name to the original.
-pub(crate) const TV_MATCH_VERSION: u32 = 1;
+/// 2 (spec 033, B930): same-named shows told apart by their episodes (V891).
+/// Re-asks only what [`survey_series_identity`] selects, never every show.
+pub(crate) const TV_MATCH_VERSION: u32 = 2;
 
 /// Key under which the [`TV_MATCH_VERSION`] that produced the stored show and
 /// episode search matches is recorded.
 const TV_MATCH_VERSION_KEY: &str = "tv_match_version";
 
-/// Re-admit every searched show and episode once the matcher that chose them
-/// has changed. Unlike album art, an ABSENT record is stale too: every search
+/// Key recording the [`TV_MATCH_VERSION`] whose survey a dry run has already
+/// logged, so a dry run surveys once per version rather than every pass.
+const TV_MATCH_SURVEY_DRY_RUN_KEY: &str = "tv_match_survey_dry_run";
+
+/// Re-ask stored matches once the matcher that chose them has changed.
+///
+/// An ABSENT record re-admits every searched show and episode: every search
 /// match made before this key existed came from the matcher B557 replaced,
 /// which handed 29 of the deployed library's shows to a fan work, an abridged
 /// parody or the wrong entry of a franchise. A fresh install has no searched
-/// rows, so re-admitting there costs nothing. NFO and manual matches are not
-/// touched. One config read per pass once the versions agree.
-async fn readmit_stale_tv_matches<S>(store: &S) -> DomainResult<()>
+/// rows, so re-admitting there costs nothing.
+///
+/// From version 1 on, only what [`survey_series_identity`] selects is asked
+/// again (V940), and only under `series_identity_repair = "apply"`, which
+/// then records the new version. A dry run logs and counts the selection once
+/// per version and leaves the version key alone, so switching to `"apply"`
+/// still runs it. NFO and manual matches are not touched. One or two config
+/// reads per pass once settled.
+async fn readmit_stale_tv_matches<Tv, Tm, S>(
+    store: &S,
+    providers: &SeriesProviders<'_, Tv, Tm>,
+    bg_io: &Arc<Semaphore>,
+    cfg: &MetadataConfig,
+    now: i64,
+) -> DomainResult<()>
 where
-    S: SeriesMetadataStore + pharos_store_sqlx::ServerConfigStore,
+    Tv: OnlineEnricher,
+    Tm: OnlineEnricher,
+    S: SeriesMetadataStore
+        + pharos_core::SeriesIdentityStore
+        + pharos_store_sqlx::ServerConfigStore,
 {
+    let config =
+        |e: pharos_store_sqlx::StoreError| pharos_core::DomainError::Backend(e.to_string());
     let want = TV_MATCH_VERSION.to_string();
     let have = store
         .load_named_config(TV_MATCH_VERSION_KEY)
         .await
-        .map_err(|e| pharos_core::DomainError::Backend(e.to_string()))?;
+        .map_err(config)?;
     if have.as_deref() == Some(want.as_str()) {
         return Ok(());
     }
-    let readmitted = store.readmit_searched_tv().await?;
+    let Some(from) = have else {
+        let readmitted = store.readmit_searched_tv().await?;
+        tracing::info!(
+            readmitted,
+            from = "none",
+            to = want.as_str(),
+            "T9 metadata backfill: show matcher version changed, re-matching searched shows and episodes"
+        );
+        return store
+            .set_named_config(TV_MATCH_VERSION_KEY, &want)
+            .await
+            .map_err(config);
+    };
+    let mode = cfg.series_identity_repair;
+    if mode == RepairMode::DryRun
+        && store
+            .load_named_config(TV_MATCH_SURVEY_DRY_RUN_KEY)
+            .await
+            .map_err(config)?
+            .as_deref()
+            == Some(want.as_str())
+    {
+        return Ok(());
+    }
+    let survey = survey_series_identity(store, providers, bg_io, cfg).await?;
+    survey.record(mode, &from, &want);
+    if mode == RepairMode::DryRun {
+        return store
+            .set_named_config(TV_MATCH_SURVEY_DRY_RUN_KEY, &want)
+            .await
+            .map_err(config);
+    }
+    let keys: Vec<String> = survey.reask.keys().cloned().collect();
+    let readmitted = store.readmit_series(&keys).await?;
+    let ids: Vec<pharos_core::MediaId> = survey.episodes.iter().map(|(id, _)| *id).collect();
+    let marked = store.mark_reconcile_items(&ids, now).await?;
     tracing::info!(
         readmitted,
-        from = have.as_deref().unwrap_or("none"),
+        marked,
+        from = from.as_str(),
         to = want.as_str(),
-        "T9 metadata backfill: show matcher version changed, re-matching searched shows and episodes"
+        "series identity repair: show matcher version changed, re-asking the surveyed shows"
     );
     store
         .set_named_config(TV_MATCH_VERSION_KEY, &want)
         .await
-        .map_err(|e| pharos_core::DomainError::Backend(e.to_string()))?;
-    Ok(())
+        .map_err(config)
+}
+
+/// Why the version-2 survey selected a show to re-ask or an episode to
+/// rebuild. A metric label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum RepairReason {
+    /// Another show matches the name exactly and no year separates them.
+    ExactRival,
+    /// The matched show premiered more than a year from the stated year.
+    YearMismatch,
+    /// The folder is split, or a hand fix names it.
+    Split,
+    /// The episode's own old search matched another show than its series'.
+    OtherShow,
+    /// The episode aired outside its show's run.
+    OutsideRun,
+}
+
+impl RepairReason {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::ExactRival => "exact_rival",
+            Self::YearMismatch => "year_mismatch",
+            Self::Split => "split",
+            Self::OtherShow => "other_show",
+            Self::OutsideRun => "outside_run",
+        }
+    }
+}
+
+/// Slack on each side of a show's run before an episode's air date counts as
+/// outside it: a special or a pilot can air apart from its season, but not
+/// the year or more that separates a show from its remake.
+const RUN_SLACK_SECS: i64 = 180 * 86_400;
+
+/// What the version-2 survey selected: shows to re-ask (search matches only)
+/// and episodes to rebuild against their show's match.
+#[derive(Debug, Default)]
+pub(crate) struct Survey {
+    pub reask: std::collections::BTreeMap<String, RepairReason>,
+    pub episodes: Vec<(pharos_core::MediaId, RepairReason)>,
+}
+
+impl Survey {
+    /// The `series identity repair: survey` line and the selection gauges.
+    fn record(&self, mode: RepairMode, from: &str, to: &str) {
+        let mut counts: std::collections::BTreeMap<(&str, RepairReason), usize> =
+            std::collections::BTreeMap::new();
+        for reason in self.reask.values() {
+            *counts.entry(("show", *reason)).or_default() += 1;
+        }
+        for (_, reason) in &self.episodes {
+            *counts.entry(("episode", *reason)).or_default() += 1;
+        }
+        for kind in ["show", "episode"] {
+            for reason in [
+                RepairReason::ExactRival,
+                RepairReason::YearMismatch,
+                RepairReason::Split,
+                RepairReason::OtherShow,
+                RepairReason::OutsideRun,
+            ] {
+                let n = counts.get(&(kind, reason)).copied().unwrap_or(0);
+                #[allow(clippy::cast_precision_loss)]
+                metrics::gauge!(
+                    "pharos_series_identity_repair_selected",
+                    "kind" => kind,
+                    "reason" => reason.label(),
+                    "mode" => mode.label(),
+                )
+                .set(n as f64);
+            }
+        }
+        let reask: Vec<String> = self
+            .reask
+            .iter()
+            .map(|(k, r)| format!("{k}:{}", r.label()))
+            .collect();
+        tracing::info!(
+            mode = mode.label(),
+            from,
+            to,
+            shows = self.reask.len(),
+            episodes = self.episodes.len(),
+            reask = ?reask,
+            "series identity repair: survey"
+        );
+    }
+}
+
+/// Spec 033 §6 (V940) — the stored matches with conflicting evidence. A
+/// searched show is re-asked when its folder is split or named by a hand fix,
+/// when its match premiered more than a year from its stated year, or when a
+/// fresh search finds another show of the exact name no year separates. An
+/// episode is rebuilt when its own old search matched another show than its
+/// series' pinned one, or when it aired outside that show's run (by the
+/// show's episode list). Manual shows are left alone. One search per searched
+/// show and one episode list per matched show with dated episodes.
+async fn survey_series_identity<Tv, Tm, S>(
+    store: &S,
+    providers: &SeriesProviders<'_, Tv, Tm>,
+    bg_io: &Arc<Semaphore>,
+    cfg: &MetadataConfig,
+) -> DomainResult<Survey>
+where
+    Tv: OnlineEnricher,
+    Tm: OnlineEnricher,
+    S: SeriesMetadataStore + pharos_core::SeriesIdentityStore,
+{
+    let shows = store.series_needing_match(i64::MAX, i64::MAX).await?;
+    let keys: Vec<String> = shows.iter().map(|c| c.series_key.clone()).collect();
+    let stored = store.series_metadata_by_keys(&keys).await?;
+    let mut survey = Survey::default();
+    for cand in &shows {
+        let Some(m) = stored.get(&cand.series_key) else {
+            continue;
+        };
+        let Some((provider, show_id)) = stored_match(m) else {
+            continue;
+        };
+        if m.match_source.as_deref() == Some("search") {
+            let reason = show_conflict(store, providers, bg_io, cfg, cand, m, provider).await?;
+            if let Some(reason) = reason {
+                tracing::info!(
+                    series_key = %cand.series_key,
+                    provider,
+                    match_id = show_id,
+                    reason = reason.label(),
+                    "series identity repair: re-ask"
+                );
+                survey.reask.insert(cand.series_key.clone(), reason);
+            }
+        }
+        let rows = store.series_episodes(&cand.series_key).await?;
+        let mut picked = 0usize;
+        for row in &rows {
+            let own_search = row.match_source.as_deref() == Some("search")
+                && row.match_provider.as_deref() == Some(provider);
+            if own_search && row.match_external_id.as_deref() != Some(show_id) {
+                survey.episodes.push((row.id, RepairReason::OtherShow));
+                picked += 1;
+            }
+        }
+        if rows.iter().any(|r| r.premiere_date.is_some()) {
+            let seasons: Vec<u32> = rows
+                .iter()
+                .filter_map(|r| r.season)
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            let listing = match provider {
+                "tvdb" => match providers.tvdb {
+                    Some(t) => list_episodes(t, bg_io, show_id, &seasons).await,
+                    None => None,
+                },
+                "tmdb" => match providers.tmdb {
+                    Some(t) => list_episodes(t, bg_io, show_id, &seasons).await,
+                    None => None,
+                },
+                _ => None,
+            };
+            let aired = listing.iter().flatten().filter_map(|l| l.aired);
+            let run = aired.clone().min().zip(aired.max());
+            if let Some((first, last)) = run {
+                for row in &rows {
+                    let outside = row
+                        .premiere_date
+                        .is_some_and(|d| d < first - RUN_SLACK_SECS || d > last + RUN_SLACK_SECS);
+                    let taken = survey.episodes.iter().any(|(id, _)| *id == row.id);
+                    if outside && !taken {
+                        survey.episodes.push((row.id, RepairReason::OutsideRun));
+                        picked += 1;
+                    }
+                }
+            }
+        }
+        if picked > 0 {
+            tracing::info!(
+                series_key = %cand.series_key,
+                provider,
+                match_id = show_id,
+                episodes = picked,
+                "series identity repair: episodes to rebuild"
+            );
+        }
+        tokio::time::sleep(REQUEST_SPACING).await;
+    }
+    Ok(survey)
+}
+
+async fn list_episodes<E: OnlineEnricher>(
+    enricher: &E,
+    bg_io: &Arc<Semaphore>,
+    show_id: &str,
+    seasons: &[u32],
+) -> Option<Vec<EpisodeListing>> {
+    let _permit = BgPermit::acquire(bg_io).await;
+    enricher.episode_list(show_id, seasons).await
+}
+
+/// Why a searched show's stored match conflicts with its evidence, if it does.
+async fn show_conflict<Tv, Tm, S>(
+    store: &S,
+    providers: &SeriesProviders<'_, Tv, Tm>,
+    bg_io: &Arc<Semaphore>,
+    cfg: &MetadataConfig,
+    cand: &SeriesMatchCandidate,
+    stored: &SeriesMetadata,
+    provider: &str,
+) -> DomainResult<Option<RepairReason>>
+where
+    Tv: OnlineEnricher,
+    Tm: OnlineEnricher,
+    S: pharos_core::SeriesIdentityStore,
+{
+    let mut parts = cand
+        .series_key
+        .split(pharos_scanner::series_split::SPLIT_KEY_SEPARATOR);
+    let folder = parts.next().unwrap_or_default().to_string();
+    let split = parts.next().is_some()
+        || !store
+            .series_overrides(std::slice::from_ref(&folder))
+            .await?
+            .is_empty();
+    if split {
+        return Ok(Some(RepairReason::Split));
+    }
+    let premiered = stored.premiere_date.and_then(pharos_store_sqlx::unix_year);
+    if let (Some(stated), Some(premiered)) = (cand.series_year, premiered) {
+        if stated.abs_diff(premiered) > 1 {
+            return Ok(Some(RepairReason::YearMismatch));
+        }
+    }
+    let decision = match provider {
+        "tvdb" => match providers.tvdb {
+            Some(t) => Some(
+                search_decide(
+                    t,
+                    MediaKind::Episode,
+                    &cand.series_name,
+                    cand.series_year,
+                    bg_io,
+                    cfg,
+                )
+                .await,
+            ),
+            None => None,
+        },
+        "tmdb" => match providers.tmdb {
+            Some(t) => Some(
+                search_decide(
+                    t,
+                    MediaKind::Episode,
+                    &cand.series_name,
+                    cand.series_year,
+                    bg_io,
+                    cfg,
+                )
+                .await,
+            ),
+            None => None,
+        },
+        _ => None,
+    };
+    Ok(decision
+        .filter(needs_episode_fit)
+        .map(|_| RepairReason::ExactRival))
 }
 
 /// Key under which the album-art matcher version that produced the CURRENT
@@ -2934,6 +3262,8 @@ mod tests {
         lists: HashMap<String, Vec<EpisodeListing>>,
         /// Every id `episode_list` was asked for, in order.
         listed: Arc<std::sync::Mutex<Vec<String>>>,
+        /// How many searches were made.
+        searched: Arc<std::sync::Mutex<usize>>,
     }
 
     impl FakeEnricher {
@@ -2949,6 +3279,7 @@ mod tests {
                 asked: Default::default(),
                 lists: HashMap::new(),
                 listed: Default::default(),
+                searched: Default::default(),
             }
         }
 
@@ -2964,6 +3295,7 @@ mod tests {
                 asked: Default::default(),
                 lists: HashMap::new(),
                 listed: Default::default(),
+                searched: Default::default(),
             }
         }
 
@@ -3008,6 +3340,24 @@ mod tests {
             self
         }
 
+        fn with_aired_list(mut self, id: &str, episodes: &[(u32, u32, i64)]) -> Self {
+            let list = episodes
+                .iter()
+                .map(|&(season, episode, aired)| EpisodeListing {
+                    season,
+                    episode,
+                    title: None,
+                    aired: Some(aired),
+                })
+                .collect();
+            self.lists.insert(id.to_string(), list);
+            self
+        }
+
+        fn searched(&self) -> usize {
+            *self.searched.lock().unwrap()
+        }
+
         fn listed(&self) -> Vec<String> {
             self.listed.lock().unwrap().clone()
         }
@@ -3047,6 +3397,7 @@ mod tests {
             _title: &str,
             _year: Option<u32>,
         ) -> Vec<SearchCandidate> {
+            *self.searched.lock().unwrap() += 1;
             self.search.clone()
         }
         async fn fetch(
@@ -3096,6 +3447,17 @@ mod tests {
             overview: Some(overview.to_string()),
             ..EnrichedMetadata::default()
         }
+    }
+
+    /// The version gate with no provider configured, as a dry run.
+    async fn readmit(s: &SqliteStore) {
+        let providers = SeriesProviders::<FakeEnricher, FakeEnricher> {
+            tvdb: None,
+            tmdb: None,
+        };
+        readmit_stale_tv_matches(s, &providers, &sem(1), &MetadataConfig::default(), NOW)
+            .await
+            .unwrap();
     }
 
     async fn store() -> SqliteStore {
@@ -4414,7 +4776,7 @@ mod tests {
             .is_empty());
         assert!(s.items_needing_match(10, NOW - 1).await.unwrap().is_empty());
 
-        readmit_stale_tv_matches(&s).await.unwrap();
+        readmit(&s).await;
 
         let shows = s.series_needing_match(10, NOW - 1).await.unwrap();
         assert_eq!(shows.len(), 1, "the searched show is eligible again");
@@ -4431,7 +4793,7 @@ mod tests {
         s.set_item_match(1, "tvdb", "76666", "search", Some(0.85), NOW)
             .await
             .unwrap();
-        readmit_stale_tv_matches(&s).await.unwrap();
+        readmit(&s).await;
         assert!(s.items_needing_match(10, NOW - 1).await.unwrap().is_empty());
     }
 
@@ -4449,7 +4811,7 @@ mod tests {
         s.set_item_match(1, "tvdb", "374456", "search", Some(0.83), NOW)
             .await
             .unwrap();
-        readmit_stale_tv_matches(&s).await.unwrap();
+        readmit(&s).await;
         let (_td, cache) = cache();
         let tvdb = FakeEnricher::tvdb()
             .with_search(vec![("76666", "Dragon Ball", Some(1997))])
@@ -4488,7 +4850,7 @@ mod tests {
         s.set_item_match(1, "tvdb", "374456", "search", Some(0.83), NOW)
             .await
             .unwrap();
-        readmit_stale_tv_matches(&s).await.unwrap();
+        readmit(&s).await;
         let (_td, cache) = cache();
         let tvdb = FakeEnricher::tvdb().with_search(vec![]);
 
@@ -5709,6 +6071,129 @@ mod tests {
         assert_eq!(
             s.series_reconcile_pending(10).await.unwrap(),
             [(1, NOW + 2)]
+        );
+    }
+
+    async fn set_version(s: &SqliteStore, key: &str, v: &str) {
+        pharos_store_sqlx::ServerConfigStore::set_named_config(s, key, v)
+            .await
+            .unwrap();
+    }
+
+    async fn version(s: &SqliteStore, key: &str) -> Option<String> {
+        pharos_store_sqlx::ServerConfigStore::load_named_config(s, key)
+            .await
+            .unwrap()
+    }
+
+    async fn gate(s: &SqliteStore, tvdb: &FakeEnricher, cfg: &MetadataConfig) {
+        let providers = SeriesProviders::<FakeEnricher, FakeEnricher> {
+            tvdb: Some(tvdb),
+            tmdb: None,
+        };
+        readmit_stale_tv_matches(s, &providers, &sem(4), cfg, NOW)
+            .await
+            .unwrap();
+    }
+
+    /// Spec 033 §6 step 3 (V940) — at version 2 only shows with conflicting
+    /// evidence are re-asked, and only under `apply`. A dry run surveys once,
+    /// logs the selection, and leaves the version at 1 so `apply` still runs.
+    /// Episodes are picked when their own old search found another show, or
+    /// when they aired outside their show's run.
+    #[tokio::test(flavor = "current_thread")]
+    async fn version_two_re_asks_only_shows_with_conflicting_evidence() {
+        let (logs, _log) = log_capture();
+        let s = store().await;
+        // BSG: an exact-name rival. Its episode 1's own search found 71173,
+        // its episode 2 aired in 2014, long after the show's run.
+        put_titled_episode(&s, 1, BSG, (1, 1), "33").await;
+        put_titled_episode(&s, 2, BSG, (1, 2), "Water").await;
+        s.set_item_match(1, "tvdb", "71173", "search", None, NOW)
+            .await
+            .unwrap();
+        let mut late = s.get(2).await.unwrap();
+        late.metadata.premiere_date = Some(1_394_323_200);
+        s.put(late).await.unwrap();
+        pin(&s, BSG, "73545", NOW).await;
+        // Firefly: one candidate, the match it has. Left alone.
+        put_titled_episode(&s, 3, "/tv/Firefly", (1, 1), "Serenity").await;
+        pin(&s, "/tv/Firefly", "78874", NOW).await;
+        set_version(&s, TV_MATCH_VERSION_KEY, "1").await;
+        let tvdb = bsg_search(FakeEnricher::tvdb()).with_aired_list(
+            "73545",
+            // 2004-10-18 .. 2005-01-24
+            &[(1, 1, 1_098_057_600), (1, 2, 1_106_524_800)],
+        );
+
+        gate(&s, &tvdb, &MetadataConfig::default()).await;
+
+        assert_eq!(
+            version(&s, TV_MATCH_VERSION_KEY).await.as_deref(),
+            Some("1")
+        );
+        assert_eq!(
+            version(&s, TV_MATCH_SURVEY_DRY_RUN_KEY).await.as_deref(),
+            Some("2")
+        );
+        assert!(s
+            .series_needing_match(10, NOW - 1)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(pending_ids(&s).await.is_empty());
+        let text = logs.text();
+        let survey = text
+            .lines()
+            .find(|l| l.contains("series identity repair: survey"))
+            .unwrap_or_else(|| panic!("no survey line in {text}"));
+        for want in [
+            "mode=\"dry_run\"",
+            "shows=1",
+            "episodes=2",
+            "Battlestar Galactica:exact_rival",
+        ] {
+            assert!(survey.contains(want), "{want} missing from {survey}");
+        }
+        let searches = tvdb.searched();
+        gate(&s, &tvdb, &MetadataConfig::default()).await;
+        assert_eq!(
+            tvdb.searched(),
+            searches,
+            "a dry run surveys once per version"
+        );
+
+        gate(&s, &tvdb, &apply_cfg()).await;
+
+        assert_eq!(
+            version(&s, TV_MATCH_VERSION_KEY).await.as_deref(),
+            Some("2")
+        );
+        let reask: Vec<String> = s
+            .series_needing_match(10, NOW - 1)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|c| c.series_key)
+            .collect();
+        assert_eq!(reask, [BSG]);
+        let mut pending = pending_ids(&s).await;
+        pending.sort_unstable();
+        assert_eq!(pending, [1, 2]);
+    }
+
+    /// The pre-B557 install with no version recorded still re-admits every
+    /// searched show, as version 1 did.
+    #[tokio::test]
+    async fn an_unrecorded_matcher_version_still_re_admits_every_searched_show() {
+        let s = store().await;
+        put_episode(&s, 1, "Firefly", "/tv/Firefly").await;
+        pin(&s, "/tv/Firefly", "78874", NOW).await;
+        readmit(&s).await;
+        assert_eq!(s.series_needing_match(10, NOW - 1).await.unwrap().len(), 1);
+        assert_eq!(
+            version(&s, TV_MATCH_VERSION_KEY).await.as_deref(),
+            Some("2")
         );
     }
 
