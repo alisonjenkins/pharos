@@ -2,7 +2,7 @@
 
 - **Status:** Proposed
 - **Date:** 2026-11-09T14:30:00Z
-- **Deciders:** Alison (pending review)
+- **Deciders:** Alison (open questions answered 2026-11-09T17:27Z)
 
 ## Context
 
@@ -38,15 +38,20 @@ evidence, and make every episode inherit it:
    backfilled to today's key (V893).
 3. **No silent tie-break**: two exact-name candidates without a separating year
    are scored by episode fit (season/episode coverage, filename titles, an NFO
-   vote) and either win by a clear margin or are stored as `ambiguous` for a
-   manual Identify. Manual matches are never re-asked (V891).
+   vote). The best one is used, and when it does not lead by a clear margin the
+   match is flagged for an admin to check. Manual matches are never re-asked
+   (V891).
 4. **Episodes take metadata only from their series' pinned match**; the
    per-episode series search goes, and an episode NFO id naming another series
    is set aside with its text and stills (V892, extends V468).
 5. **Copies never fold across series**: #1055's fold also requires one series
    key, equal stated show years and equal provider series ids where both are
    known (V894).
-6. **Repair by dry run, then apply**: `[metadata] series_identity_repair`
+6. **Hand fixes are overrides**: an admin Show identity page picks a show,
+   confirms a flagged guess, moves files between shows or undoes a split; each
+   fix is stored in `series_overrides` and applied by the scanner after its
+   split and before the copy fold, so a rescan never undoes it (V895).
+7. **Repair by dry run, then apply**: `[metadata] series_identity_repair`
    defaults to `"dry_run"`; `"apply"` re-matches only shows with conflicting
    evidence and re-fetches only episodes whose provider show disagrees with
    their series. No row is deleted.
@@ -75,7 +80,9 @@ evidence, and make every episode inherit it:
 - **Prefer the newer show on a tie.** Swaps which half of the pairs is wrong.
 - **Never split; only flag mixed folders.** Simpler and touches no wire ids, but
   leaves The Flash's 62 2014 episodes under one 1990 match until the files are
-  moved. Kept as the fallback if Alison prefers it (spec 033, open question 1).
+  moved. Alison chose the split with hand remapping (2026-11-09).
+- **Leave an undecided show unmatched until picked.** Alison chose a flagged
+  best guess instead (2026-11-09).
 
 ## References
 
