@@ -12,6 +12,8 @@ pub enum Route {
     Browse(ItemRef),
     Title(ItemRef),
     Watch(ItemRef),
+    /// A book, full screen, `/read/{id}`.
+    Read(ItemRef),
     /// Someone in a cast: what they appear in, `/person/{id}`.
     Person(ItemRef),
     SignIn,
@@ -61,6 +63,7 @@ impl Route {
             ["browse", s] => id(s).map_or_else(|| not_found(path), Route::Browse),
             ["title", s] => id(s).map_or_else(|| not_found(path), Route::Title),
             ["watch", s] => id(s).map_or_else(|| not_found(path), Route::Watch),
+            ["read", s] => id(s).map_or_else(|| not_found(path), Route::Read),
             ["person", s] => id(s).map_or_else(|| not_found(path), Route::Person),
             ["signin"] => Route::SignIn,
             ["manage"] => Route::Manage,
@@ -83,6 +86,7 @@ impl Route {
             Route::Browse(id) => format!("{MOUNT}/browse/{id}"),
             Route::Title(id) => format!("{MOUNT}/title/{id}"),
             Route::Watch(id) => format!("{MOUNT}/watch/{id}"),
+            Route::Read(id) => format!("{MOUNT}/read/{id}"),
             Route::Person(id) => format!("{MOUNT}/person/{id}"),
             Route::SignIn => format!("{MOUNT}/signin"),
             Route::Manage => format!("{MOUNT}/manage"),
@@ -101,9 +105,11 @@ impl Route {
     /// The item the page shows, if it shows one.
     pub fn item(&self) -> Option<ItemRef> {
         match self {
-            Route::Browse(id) | Route::Title(id) | Route::Watch(id) | Route::Person(id) => {
-                Some(*id)
-            }
+            Route::Browse(id)
+            | Route::Title(id)
+            | Route::Watch(id)
+            | Route::Read(id)
+            | Route::Person(id) => Some(*id),
             _ => None,
         }
     }
@@ -113,7 +119,11 @@ impl Route {
     pub fn page_title(&self, name: Option<&str>) -> String {
         let page = match self {
             Route::Home | Route::SignIn => None,
-            Route::Browse(_) | Route::Title(_) | Route::Watch(_) | Route::Person(_) => name,
+            Route::Browse(_)
+            | Route::Title(_)
+            | Route::Watch(_)
+            | Route::Read(_)
+            | Route::Person(_) => name,
             Route::Manage => Some("Manage"),
             Route::Appearance => Some("Appearance"),
             Route::Account => Some("Account"),
@@ -137,6 +147,7 @@ impl Route {
             Route::Browse(_) => "browse",
             Route::Title(_) => "title",
             Route::Watch(_) => "watch",
+            Route::Read(_) => "read",
             Route::Person(_) => "person",
             Route::SignIn => "signin",
             Route::Manage => "manage",
@@ -176,6 +187,7 @@ mod tests {
             Route::Browse(ItemRef::Synth(9)),
             Route::Title(ItemRef::Real(42)),
             Route::Watch(ItemRef::Real(42)),
+            Route::Read(ItemRef::Real(42)),
             Route::Person(ItemRef::Synth(77)),
             Route::SignIn,
             Route::Manage,
@@ -201,6 +213,20 @@ mod tests {
         // Still loading: the app's name, never the last page's.
         assert_eq!(title.page_title(None), "Pharos");
         assert_eq!(Route::Home.page_title(Some("Alien")), "Pharos");
+    }
+
+    #[test]
+    fn the_reader_has_its_own_path_name_and_item() {
+        let read = Route::Read(ItemRef::Real(9));
+        assert_eq!(read.path(), "/ui/read/9");
+        assert_eq!(Route::parse("/ui/read/9/"), read);
+        assert_eq!(read.name(), "read");
+        assert_eq!(read.item(), Some(ItemRef::Real(9)));
+        assert_eq!(read.page_title(Some("Dune")), "Dune · Pharos");
+        assert_eq!(
+            Route::parse("/read/abc"),
+            Route::NotFound("/read/abc".into())
+        );
     }
 
     #[test]

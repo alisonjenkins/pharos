@@ -1989,6 +1989,7 @@ fn Screen(route: Route) -> Element {
         Route::Person(id) => rsx! { PersonScreen { id } },
         // The stage beside the screen draws the player (spec 020).
         Route::Watch(_) => rsx! {},
+        Route::Read(id) => remount_on(&id.to_string(), reader_screen(id)),
         Route::SignIn => rsx! { Redirect { to: Route::Home } },
         Route::Manage => rsx! { super::manage::ManageScreen {} },
         Route::Appearance => {
@@ -2007,6 +2008,17 @@ fn Screen(route: Route) -> Element {
         Route::TogetherGroup(id) => rsx! { InviteScreen { id } },
         Route::NotFound(path) => rsx! { ErrorNote { message: format!("Nothing at {path}.") } },
     }
+}
+
+/// The reader draws with `quire-web`, which only the browser build has.
+#[cfg(all(feature = "web", target_arch = "wasm32"))]
+fn reader_screen(id: ItemRef) -> Element {
+    rsx! { super::reader_web::ReaderScreen { id } }
+}
+
+#[cfg(not(all(feature = "web", target_arch = "wasm32")))]
+fn reader_screen(_id: ItemRef) -> Element {
+    rsx! { ErrorNote { message: "Books open in the browser app." } }
 }
 
 /// Where a player sits on the stage.
