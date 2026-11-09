@@ -2939,6 +2939,7 @@ where
         vec![pharos_core::SeriesEpisodeRow {
             id: old.id,
             path: old.path.to_string_lossy().into_owned(),
+            title: old.title.clone(),
             season: Some(1),
             episode: Some(1),
             premiere_date: None,

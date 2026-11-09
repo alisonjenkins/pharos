@@ -1678,6 +1678,8 @@ pub struct SeriesIdentityRow {
 pub struct SeriesEpisodeRow {
     pub id: MediaId,
     pub path: String,
+    /// Stored episode title (the provider's, or the local resolver's).
+    pub title: String,
     pub season: Option<u32>,
     pub episode: Option<u32>,
     /// Stored air date, unix seconds.
