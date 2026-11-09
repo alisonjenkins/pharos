@@ -208,9 +208,20 @@ pub fn Root() -> Element {
         }
     });
     use_context_provider(|| Together::new(group_view, group_error, group_ui));
+    let pictures = use_signal(|| 0_u32);
+    use_context_provider(|| backdrop::CompactPictures(pictures));
+    let picture_up = pictures() > 0;
+    use_effect(use_reactive!(|(picture_up,)| {
+        if picture_up && !matches!(*route.peek(), Route::Watch(_)) {
+            platform::info(&format!(
+                "pharos: backdrop off reason=compact_video pictures={}",
+                *pictures.peek()
+            ));
+        }
+    }));
     let route = route();
     rsx! {
-        if backdrop::runs_behind(&route) {
+        if backdrop::runs_behind(&route, pictures()) {
             Backdrop {}
         }
         NativeApp { route }
@@ -4625,6 +4636,7 @@ fn Player(
     let mut queue = try_use_context::<QueueCtx>().map_or(own_queue, |q| q.0);
     let video_queue = try_use_context::<VideoQueueCtx>();
     let audio = p.kind == ItemKind::Audio;
+    backdrop::use_compact_picture(!audio && view != View::Full && !slot.hidden());
     let playing_id = p.detail.item.id;
     // A player that gives up must show why, not sit under the turn (V790).
     use_effect(move || {

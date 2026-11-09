@@ -25,11 +25,45 @@ pub fn program_for(theme: &Theme) -> Option<Program> {
     }
 }
 
-/// Whether the backdrop runs behind `route`: not behind the watch page,
-/// whose video covers the whole screen, so the shader would burn GPU time
-/// nobody can see (B808).
-pub fn runs_behind(route: &Route) -> bool {
-    !matches!(route, Route::Watch(_))
+/// Whether the backdrop runs behind `route` while `compact_pictures`
+/// players show a video in the floating window or the mini bar. Not behind
+/// the watch page, whose video covers the whole screen, so the shader would
+/// burn GPU time nobody can see (B808). Not beside a compact video either:
+/// Chrome on Windows left a stale or garbled copy of the video's box,
+/// flipped upside down, in the backdrop's canvas (B1020).
+pub fn runs_behind(route: &Route, compact_pictures: u32) -> bool {
+    !matches!(route, Route::Watch(_)) && compact_pictures == 0
+}
+
+/// How many players show a video outside the full view. A count, not a
+/// flag: the next episode's player mounts before the last one unmounts.
+#[derive(Clone, Copy)]
+pub struct CompactPictures(pub Signal<u32>);
+
+/// Counts this player in [`CompactPictures`] while it `shows` a video
+/// outside the full view, and lets go when it unmounts.
+pub fn use_compact_picture(shows: bool) {
+    let count = try_use_context::<CompactPictures>().map(|c| c.0);
+    let counted = use_hook(|| std::rc::Rc::new(std::cell::Cell::new(false)));
+    let on_drop = std::rc::Rc::clone(&counted);
+    use_effect(use_reactive!(|(shows,)| {
+        let Some(mut count) = count else {
+            return;
+        };
+        if counted.get() != shows {
+            counted.set(shows);
+            let n = *count.peek();
+            count.set(if shows { n + 1 } else { n.saturating_sub(1) });
+        }
+    }));
+    use_drop(move || {
+        if let Some(mut count) = count {
+            if on_drop.get() {
+                let n = *count.peek();
+                count.set(n.saturating_sub(1));
+            }
+        }
+    });
 }
 
 /// The theme colours the shader tints with.
@@ -310,10 +344,91 @@ mod tests {
     fn the_backdrop_stays_off_the_watch_page_only() {
         use pharos_client::api::ItemRef;
         let item = ItemRef::Real(42);
-        assert!(!runs_behind(&Route::Watch(item)));
+        assert!(!runs_behind(&Route::Watch(item), 0));
         for route in [Route::Home, Route::Together] {
-            assert!(runs_behind(&route), "{route:?}");
+            assert!(runs_behind(&route, 0), "{route:?}");
         }
+    }
+
+    /// B1020: no backdrop beside a video in the floating window or mini bar.
+    #[test]
+    fn the_backdrop_stays_off_beside_a_compact_video() {
+        for route in [Route::Home, Route::Together] {
+            assert!(!runs_behind(&route, 1), "{route:?}");
+            assert!(!runs_behind(&route, 2), "{route:?}");
+        }
+    }
+
+    /// B1020: each player counts once while it shows a compact video, and
+    /// the count drops back when it stops or unmounts, also when the next
+    /// episode's player mounts before the last one goes.
+    #[test]
+    fn compact_pictures_count_each_player_until_it_goes() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        use dioxus::dioxus_core::NoOpMutations;
+        use futures_util::FutureExt as _;
+
+        #[derive(Clone)]
+        struct Shown(Rc<RefCell<(Vec<u32>, bool)>>);
+        impl PartialEq for Shown {
+            fn eq(&self, _: &Self) -> bool {
+                false
+            }
+        }
+
+        #[component]
+        fn Picture(shows: bool) -> Element {
+            use_compact_picture(shows);
+            rsx! {}
+        }
+
+        #[component]
+        fn Harness(shown: Shown, seen: Rc<RefCell<u32>>) -> Element {
+            let count = use_signal(|| 0_u32);
+            use_context_provider(|| CompactPictures(count));
+            *seen.borrow_mut() = count();
+            let (keys, shows) = shown.0.borrow().clone();
+            rsx! {
+                for key in keys {
+                    Picture { key: "{key}", shows }
+                }
+            }
+        }
+
+        let shown = Shown(Rc::new(RefCell::new((vec![1], true))));
+        let seen = Rc::new(RefCell::new(u32::MAX));
+        let mut dom = VirtualDom::new_with_props(
+            Harness,
+            HarnessProps {
+                shown: shown.clone(),
+                seen: Rc::clone(&seen),
+            },
+        );
+        dom.rebuild_in_place();
+        let set = |dom: &mut VirtualDom, keys: Vec<u32>, shows: bool| {
+            *shown.0.borrow_mut() = (keys, shows);
+            dom.mark_dirty(ScopeId::APP);
+            for _ in 0..8 {
+                dom.render_immediate(&mut NoOpMutations);
+                if dom.wait_for_work().now_or_never().is_none() {
+                    break;
+                }
+            }
+            dom.render_immediate(&mut NoOpMutations);
+        };
+        set(&mut dom, vec![1], true);
+        assert_eq!(*seen.borrow(), 1, "one floating video");
+        set(&mut dom, vec![1, 2], true);
+        assert_eq!(*seen.borrow(), 2, "the next episode mounted beside it");
+        set(&mut dom, vec![2], true);
+        assert_eq!(*seen.borrow(), 1, "the last episode unmounted");
+        set(&mut dom, vec![2], false);
+        assert_eq!(*seen.borrow(), 0, "back to the full view");
+        set(&mut dom, vec![2], true);
+        set(&mut dom, vec![], true);
+        assert_eq!(*seen.borrow(), 0, "the player closed while compact");
     }
 
     #[test]
