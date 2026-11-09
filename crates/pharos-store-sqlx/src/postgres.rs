@@ -1263,7 +1263,7 @@ impl MediaStore for PostgresStore {
              last_played_position_ticks, is_favorite, last_played_at) \
              SELECT user_id, $2, played, play_count, \
              CASE WHEN $3::boolean THEN last_played_position_ticks ELSE 0 END, \
-             is_favorite, last_played_at FROM user_data \
+             is_favorite, CASE WHEN $3::boolean THEN last_played_at ELSE 0 END FROM user_data \
              WHERE item_id = $1 AND EXISTS (SELECT 1 FROM media_items WHERE id = $2) \
              ON CONFLICT (user_id, item_id) DO UPDATE SET \
              played = GREATEST(user_data.played, excluded.played), \
