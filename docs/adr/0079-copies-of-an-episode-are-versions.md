@@ -23,7 +23,8 @@ show folder that cover the same season and episode are copies of it, and a
 file spanning several episodes (`S01E01-E02`) is a copy of each one it
 covers. Each episode's best-ranked copy is its primary: a 2D file before a
 3D one, then a file of just that episode before a span, then the taller
-picture (a stored probe's height, else the one its name states), then the
+picture (the one its names state, or a stored probe's where a name states
+none), then the
 bigger file, then container rank, then path. Each other copy is an
 `AlternateMediaSource` of that primary, named by what its file name adds. A
 span stays its own item while it is the primary of any episode it covers.
@@ -31,8 +32,10 @@ span stays its own item while it is the primary of any episode it covers.
 A copy that is no item of its own has its old row swept like any file that
 stopped being an item, after `MediaStore::merge_user_data` moves its
 viewers' played, play count, favourite and resume state onto each item it
-is now a version of, keeping the furthest state. A span folds into a single
-episode without its resume point (`FoldResume::Drop`). When an item it
+is now a version of, keeping the furthest state. Resume carries only into
+an item of the copy's own span (`FoldResume::Drop` otherwise). A span of
+more than eight episodes is a season pack and groups only with its exact
+span. When an item it
 groups under was not written in that pass (its probe failed), the copy
 keeps its own row. Films are not grouped by this rule.
 
@@ -55,8 +58,9 @@ keeps its own row. Films are not grouped by this rule.
 - A copy whose height is learnt only from its first probe can become the
   primary on the next scan. The item then takes the new primary's id, and
   its state moves with it as for any fold.
-- `pharos_scan_copy_primary_total{decided_by}` counts which rule picked each
-  primary, so a tie broken by path shows apart from a quality pick.
+- `pharos_scan_copy_primaries{decided_by}` gives, per scan, how many
+  primaries each rule picked, so a tie broken by path shows apart from a
+  quality pick.
 - Undoing this means a rescan with the rule removed; the folded rows come
   back with fresh ids and without the state that moved.
 
