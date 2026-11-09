@@ -223,6 +223,13 @@ pub(crate) fn to_remote_command(msg: GroupMsg) -> Option<RemoteCommand> {
         GroupMsg::FollowTracks { member_id, follow } => {
             RemoteCommand::FollowTracks { member_id, follow }
         }
+        GroupMsg::HoldNext {
+            sender,
+            playlist_item_id,
+        } => RemoteCommand::HoldNext {
+            sender,
+            playlist_item_id,
+        },
         GroupMsg::SetIgnoreWait { member_id, ignore } => {
             RemoteCommand::SetIgnoreWait { member_id, ignore }
         }
@@ -412,6 +419,10 @@ mod tests {
             sender,
             audio: TrackChoice::Index(2),
             subtitle: TrackChoice::Off,
+            playlist_item_id: Some("pli-1".into()),
+        });
+        survives_the_bus(|| GroupMsg::HoldNext {
+            sender,
             playlist_item_id: Some("pli-1".into()),
         });
         survives_the_bus(|| GroupMsg::FollowTracks {

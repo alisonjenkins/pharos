@@ -182,6 +182,7 @@ pub fn intent_for(msg: &ServerMsg, clock: ClockPair) -> Option<GroupIntent> {
         | ServerMsg::MemberLeft { .. }
         | ServerMsg::Tracks { .. }
         | ServerMsg::MemberTracks { .. }
+        | ServerMsg::NextHeld { .. }
         | ServerMsg::StateUpdate { .. }
         | ServerMsg::Error { .. }
         | ServerMsg::NotInGroup
