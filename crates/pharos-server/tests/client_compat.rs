@@ -515,6 +515,7 @@ async fn three_d_playback_negotiation_and_stereo_mode_isolation() {
         video_3d_format: Some(Video3DFormat::HalfSideBySide),
         stereo_output: stereo,
         tonemap: Default::default(),
+        output_size: None,
     };
 
     let key_preserve = SegmentIdentity::new(

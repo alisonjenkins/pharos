@@ -406,6 +406,7 @@ fn gpu_tonemap_trial_args(
         video_3d_format: None,
         stereo_output: StereoOutput::Preserve,
         tonemap: Tonemap::HdrToSdr,
+        output_size: None,
     };
     crate::ffmpeg_transcode_args_pipeline(
         &sample.to_string_lossy(),

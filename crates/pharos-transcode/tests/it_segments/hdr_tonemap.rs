@@ -84,6 +84,7 @@ fn encode(src: &Path, dir: &Path, tonemap: Tonemap) -> PathBuf {
         video_3d_format: None,
         stereo_output: Default::default(),
         tonemap,
+        output_size: None,
     };
     let out = dir.join(format!("seg-{}.m4s", tonemap.label()));
     let args = ffmpeg_transcode_args(

@@ -6137,6 +6137,7 @@ mod tests {
             video_3d_format: None,
             stereo_output: Default::default(),
             tonemap: Default::default(),
+            output_size: None,
         }
         .resolve_with(|_| {
             Ok::<_, ()>(pharos_transcode::options::MuxedAudio {
@@ -6175,6 +6176,7 @@ mod tests {
             video_3d_format: None,
             stereo_output: Default::default(),
             tonemap: Default::default(),
+            output_size: None,
         }
     }
 
@@ -6692,6 +6694,7 @@ mod tests {
             video_3d_format: None,
             stereo_output: Default::default(),
             tonemap: Default::default(),
+            output_size: None,
         }
     }
 
@@ -10403,6 +10406,7 @@ mod tests {
             video_3d_format: None,
             stereo_output: Default::default(),
             tonemap: Default::default(),
+            output_size: None,
         }
     }
 
@@ -11172,6 +11176,7 @@ mod tests {
             video_3d_format: None,
             stereo_output: Default::default(),
             tonemap: Default::default(),
+            output_size: None,
         };
         let got = cache
             .segment_bytes(7, 0, Path::new("/no/source"), &opts, JobClass::Interactive)
@@ -11201,6 +11206,7 @@ mod tests {
             video_3d_format: None,
             stereo_output: Default::default(),
             tonemap: Default::default(),
+            output_size: None,
         };
         let res = cache
             .segment_bytes(8, 0, Path::new("/no/source"), &opts, JobClass::Interactive)
@@ -11295,6 +11301,7 @@ mod tests {
             video_3d_format: None,
             stereo_output: Default::default(),
             tonemap: Default::default(),
+            output_size: None,
         };
         let source = Path::new("/media/stale.mkv");
         cache.note_source_unreadable(source, "stale_handle").await;
@@ -11339,6 +11346,7 @@ mod tests {
             video_3d_format: None,
             stereo_output: Default::default(),
             tonemap: Default::default(),
+            output_size: None,
         };
         let _ = cache
             .segment_bytes(7, 0, Path::new("/no/source"), &opts, JobClass::Interactive)
@@ -11384,6 +11392,7 @@ mod tests {
                 video_3d_format: None,
                 stereo_output: Default::default(),
                 tonemap: Default::default(),
+                output_size: None,
             };
             cache
                 .segment_bytes(9, 0, Path::new("/n"), &opts, JobClass::Interactive)
@@ -11409,6 +11418,7 @@ mod tests {
                 video_3d_format: None,
                 stereo_output: Default::default(),
                 tonemap: Default::default(),
+                output_size: None,
             };
             cache
                 .segment_bytes(9, 0, Path::new("/n"), &opts, JobClass::Interactive)
