@@ -4313,9 +4313,11 @@ fn is_release_promo(path: &Path) -> bool {
 /// Release groups known to pack an advert clip named after themselves.
 const RELEASE_PROMO_STEMS: &[&str] = &["ETRG", "RARBG", "YIFY", "YTS", "YTS.AG", "YTS.MX"];
 
-/// A file stem that ends in the word `sample`, bare or bracketed.
-static SAMPLE_STEM_RE: std::sync::LazyLock<Option<regex::Regex>> =
-    std::sync::LazyLock::new(|| regex::Regex::new(r"(?i)(?:^|[ ._\-(\[])sample[)\]]?$").ok());
+/// A file stem that starts with `sample-`, or ends in the word `sample`, bare
+/// or bracketed.
+static SAMPLE_STEM_RE: std::sync::LazyLock<Option<regex::Regex>> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r"(?i)^sample[._\-]|(?:^|[ ._\-(\[])sample[)\]]?$").ok()
+});
 
 /// Jellyfin's marker file: a folder holding `.ignore` is left out of the
 /// library with everything beneath it, so a `To Sort/` of unsorted rips
@@ -8862,6 +8864,8 @@ mod tests {
             "X/Final.Destination.5.2011.1080p.BluRay.x264.AC3-ETRG.Sample.mp4",
             "The Golem (2018)/Sample.mkv",
             "Heat (1995)/Heat (1995)-sample.mkv",
+            // B1013 / V972
+            "X/sample-The Last Starfighter (1984) 25th Anniversary Ed.mkv",
         ] {
             assert!(is_release_sample(Path::new(sample)), "{sample}");
         }
