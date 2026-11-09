@@ -74,5 +74,5 @@ keeps its own row. Films are not grouped by this rule.
 
 ## References
 
-- `crates/pharos-scanner/src/fs.rs` (`group_episode_copies`, `settle_copies`)
+- `crates/pharos-scanner/src/fs.rs` (`group_by_edition`, `group_copies`, `settle_copies`)
 - B771, V721 in `specs/001-pharos-baseline/`
