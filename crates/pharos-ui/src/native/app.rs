@@ -1593,6 +1593,8 @@ fn NativeApp(route: Route) -> Element {
     // The mix that is on keeps the queue topped up (spec 024, B441).
     let mix = use_signal(|| None::<ActiveMix>);
     use_context_provider(|| MixCtx(mix));
+    // Bumped when a saved mix is stored, so every list of them reloads.
+    use_context_provider(|| mixes::SavedRev(Signal::new(0)));
     // Whether the queue is docked beside the compact player (B896).
     use_context_provider(|| QueueDock(Signal::new(super::listen::dock_shown())));
     mixes::use_top_up(api, queue, mix);
