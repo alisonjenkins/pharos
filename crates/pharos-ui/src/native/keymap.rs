@@ -16,6 +16,8 @@ pub enum Mode {
     Music,
     /// The music full player's queue.
     Queue,
+    /// The book reader, whose page-turn keys are its own.
+    Reader,
 }
 
 impl Mode {
@@ -27,6 +29,7 @@ impl Mode {
             Mode::Player => "Player",
             Mode::Music => "Music player",
             Mode::Queue => "Queue",
+            Mode::Reader => "Reading",
         }
     }
 }
@@ -757,12 +760,13 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
 
-    const ALL: [Mode; 5] = [
+    const ALL: [Mode; 6] = [
         Mode::Browse,
         Mode::Detail,
         Mode::Player,
         Mode::Music,
         Mode::Queue,
+        Mode::Reader,
     ];
 
     /// V510: within a mode no two bindings share a sequence, and no binding
@@ -980,6 +984,26 @@ mod tests {
         assert_eq!(
             resolve(Mode::Player, &["ArrowLeft"]),
             resolve(Mode::Player, &["h"])
+        );
+    }
+
+    /// 023: the reader turns pages on these keys itself, so the layer must
+    /// neither move focus on them nor take the press.
+    #[test]
+    fn the_reader_leaves_its_page_turn_keys_unbound() {
+        for key in [
+            "ArrowLeft",
+            "ArrowRight",
+            "PageUp",
+            "PageDown",
+            " ",
+            "Escape",
+        ] {
+            assert_eq!(resolve(Mode::Reader, &[key]), Resolved::Unbound, "{key}");
+        }
+        assert_eq!(
+            resolve(Mode::Reader, &["g", "h"]),
+            Resolved::Run(Action::Go(Place::Home))
         );
     }
 
