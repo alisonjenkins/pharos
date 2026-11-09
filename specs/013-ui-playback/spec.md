@@ -175,7 +175,7 @@ Evidence is `crates/pharos-ui/src/native/` (`watch_view.rs`, `hls_web.rs`, `play
 
 - US1 any video plays: done, with a changed approach. HLS player (#519), recovery (#524), renegotiation (#586, ADR-0056), Rust HLS engine seam (#960, spec 031 owns), quality (`quality.rs`), codec decision on TV (#1046); ASS via JASSUB (ADR-0057). Capability probe lives in `playback.rs`/`host.rs`.
 - US2 controls: done (#563 tracks, volume, chapters; #588 whole-screen player; #606; #607).
-- US3 skip segments: done (`Segment` in `watch_view.rs`, skip button, Shift+click skip #607, #983 hit area).
+- US3 skip segments: partial; no per-segment ask/auto/never preference, the skip button always asks (`Segment` in `watch_view.rs`, skip button, Shift+click skip #607, #983 hit area).
 - US4 resume and progress: done (#519, `resume.rs`, #996 music resume).
 - US5 live TV: not started in the native UI (legacy pane only).
 - US6 read a book: not started in pharos-ui (spec 023, owned elsewhere).
