@@ -76,7 +76,7 @@ evidence, and make every episode inherit it:
   show, once, cached.
 - Risk: a stray unyeared file in a yeared folder could split off as its own
   show; the filename-title check re-joins it when it names an episode of the
-  yeared show, and every split is logged and listed on Manage → Integrity.
+  yeared show, and every split is logged and listed on Manage → Show identity.
 - Follow-up: the split Flash 2014 group gets a new series wire id; series-level
   favourites stay with the unyeared group.
 
