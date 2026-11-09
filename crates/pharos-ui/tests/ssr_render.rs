@@ -440,6 +440,7 @@ fn admin_devices_tab() -> Element {
                 name: "Pixel 9".into(),
                 app_name: "Finamp".into(),
                 last_user_name: "ali".into(),
+                no_direct_play_audio_codecs: Vec::new(),
             }],
             on_action: move |_| {},
         }

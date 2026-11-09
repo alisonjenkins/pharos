@@ -5419,6 +5419,32 @@ body:has(.pharos-stage.is-mini) .pharos-main {
   margin: 0;
 }
 
+/* Devices: the sound formats converted for a device (T130). */
+.pharos-manage-hint {
+  margin: 0 0 1rem;
+  max-width: 60ch;
+  color: var(--px-color-fg-muted);
+}
+.pharos-admin-device-audio {
+  min-width: 17rem;
+}
+.pharos-admin-device-codec {
+  background: transparent;
+  font: inherit;
+  font-size: 0.78rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+.pharos-admin-device-codec[aria-pressed="true"] {
+  border-color: transparent;
+  background: color-mix(in srgb, var(--px-color-accent) 22%, transparent);
+  color: var(--px-color-fg);
+}
+.pharos-admin-device-codec:focus-visible {
+  outline: 2px solid var(--px-color-accent);
+  outline-offset: 2px;
+}
+
 /* Paths and rows. */
 .pharos-manage-paths {
   display: grid;
