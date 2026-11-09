@@ -18,6 +18,7 @@ mod mix;
 pub mod origin;
 mod playback;
 mod prefs;
+mod report;
 pub use prefs::MAX_PREF_VALUE_BYTES;
 mod session;
 pub use session::is_child_token_device;
