@@ -5701,6 +5701,7 @@ fn Player(
         runtime_ms: p.detail.item.runtime_ms,
         chapters: p.detail.chapters.clone(),
         segments: p.detail.segments.clone(),
+        damage: p.detail.damage.clone(),
         preview: preview_set(&p.detail.trickplay).cloned(),
         hover_ms: hover_ms(),
         audio: p.detail.audio_tracks.clone(),
