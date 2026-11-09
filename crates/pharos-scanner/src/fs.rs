@@ -8,7 +8,7 @@ use pharos_core::{
     MetadataRequest, MetadataResult, PersonStore, Prober, ScanOutcome, Scanner, SeriesInfo,
     StudioStore, TagStore, Video3DFormat,
 };
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::Instrument as _;
@@ -596,7 +596,11 @@ impl<P: Prober> FsScanner<P> {
         } = walk(root.to_path_buf(), self.extensions.clone())
             .instrument(tracing::info_span!("scan.walk"))
             .await?;
-        let groups = group_editions(paths);
+        let groups = group_by_edition(paths);
+        let facts = copy_facts(store, &copy_candidates(&groups))
+            .instrument(tracing::info_span!("scan.copy_facts"))
+            .await;
+        let groups = group_episode_copies(groups, &facts);
         // A file now grouped under another may still hold its own row from an
         // earlier pass; that row is swept, so its viewers' state moves first.
         let folded = folded_copies(&groups);
@@ -1891,7 +1895,9 @@ impl<P: Prober + Clone + 'static> Scanner for FsScanner<P> {
         let paths = walk(root.to_path_buf(), self.extensions.clone())
             .await?
             .files;
-        let groups = group_editions(paths);
+        let groups = group_by_edition(paths);
+        let sizes = copy_sizes(&copy_candidates(&groups)).await;
+        let groups = group_episode_copies(groups, &sizes);
         let mut items = Vec::with_capacity(groups.len());
         for (primary, alts) in groups {
             if let Some(item) = self.probe_with_alternates(primary, alts).await {
@@ -2213,8 +2219,9 @@ async fn settle_copies<S: MediaStore>(
 /// alternates of the primary. Files without a matching primary
 /// remain stand-alone items (the edition tag is preserved in the
 /// title).
+#[cfg(test)]
 pub(crate) fn group_editions(paths: Vec<PathBuf>) -> Vec<(PathBuf, Vec<(String, PathBuf)>)> {
-    group_episode_copies(group_by_edition(paths))
+    group_episode_copies(group_by_edition(paths), &HashMap::new())
 }
 
 /// P41's half of [`group_editions`]: editions under their primaries, before
@@ -2275,6 +2282,91 @@ fn group_by_edition(paths: Vec<PathBuf>) -> Vec<(PathBuf, Vec<(String, PathBuf)>
     out
 }
 
+/// The files of `groups` that share an episode with another file: only these
+/// are ranked, so only these are looked up.
+fn copy_candidates(groups: &[(PathBuf, Vec<(String, PathBuf)>)]) -> Vec<PathBuf> {
+    let mut by_episode: BTreeMap<(String, u32, u32), Vec<&Path>> = BTreeMap::new();
+    for (primary, _) in groups {
+        if let Some((show, season, first, last)) = episode_copy_key(primary) {
+            for episode in first..=last {
+                by_episode
+                    .entry((show.clone(), season, episode))
+                    .or_default()
+                    .push(primary);
+            }
+        }
+    }
+    let mut out: Vec<PathBuf> = by_episode
+        .into_values()
+        .filter(|members| members.len() > 1)
+        .flatten()
+        .map(Path::to_path_buf)
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Each candidate's size on disk; a file that cannot be stat'ed ranks as if
+/// empty.
+async fn copy_sizes(candidates: &[PathBuf]) -> HashMap<PathBuf, CopyFacts> {
+    let mut out = HashMap::with_capacity(candidates.len());
+    for path in candidates {
+        let size = tokio::fs::metadata(path).await.ok().map(|m| m.len());
+        out.insert(path.clone(), CopyFacts { height: None, size });
+    }
+    out
+}
+
+/// [`copy_sizes`] plus each candidate's height as last probed: from its own
+/// row, or from the row it was folded into as a version. A store fault leaves
+/// the heights unknown (ranking falls back to the file names) rather than
+/// failing the scan.
+async fn copy_facts<S: MediaStore>(
+    store: &S,
+    candidates: &[PathBuf],
+) -> HashMap<PathBuf, CopyFacts> {
+    let mut out = copy_sizes(candidates).await;
+    for path in candidates {
+        let row = match store.id_at_path(path).await {
+            Ok(Some(row)) => row,
+            Ok(None) => continue,
+            Err(err) => {
+                tracing::warn!(path = %path.display(), error = %err, "could not look up a copy's row to rank it");
+                continue;
+            }
+        };
+        let item = match store.get(row).await {
+            Ok(item) => item,
+            Err(err) => {
+                tracing::warn!(path = %path.display(), row = %row, error = %err, "could not read a copy's row to rank it");
+                continue;
+            }
+        };
+        let mut heights = vec![(item.path.clone(), item.probe.height)];
+        heights.extend(
+            item.probe
+                .alternate_sources
+                .iter()
+                .map(|alt| (alt.path.clone(), alt.probe.as_ref().and_then(|p| p.height))),
+        );
+        for (at, height) in heights {
+            if let (Some(facts), Some(height)) = (out.get_mut(&at), height) {
+                facts.height.get_or_insert(height);
+            }
+        }
+    }
+    out
+}
+
+/// What is known of a file's picture before this pass probes it: the height
+/// a stored probe recorded, and its size on disk. Ranks copies of one episode.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct CopyFacts {
+    pub(crate) height: Option<u32>,
+    pub(crate) size: Option<u64>,
+}
+
 /// A span longer than this is a misparse (`S01E01-E99`), not a file that
 /// holds that many episodes, so it is left out of copy grouping.
 const MAX_EPISODE_SPAN: u32 = 8;
@@ -2296,6 +2388,7 @@ type Group = (PathBuf, Vec<(String, PathBuf)>);
 /// none for E02 is a version of E01 and the item for E02 (V721, V844).
 fn group_episode_copies(
     groups: Vec<(PathBuf, Vec<(String, PathBuf)>)>,
+    facts: &HashMap<PathBuf, CopyFacts>,
 ) -> Vec<(PathBuf, Vec<(String, PathBuf)>)> {
     let spans: Vec<Option<EpisodeSpan>> = groups.iter().map(|g| episode_copy_key(&g.0)).collect();
     let mut by_episode: BTreeMap<(String, u32, u32), Vec<usize>> = BTreeMap::new();
@@ -2316,7 +2409,7 @@ fn group_episode_copies(
         let rank = |i: &usize| {
             let span = spans.get(*i).and_then(Option::as_ref);
             let path = groups.get(*i).map(|g| g.0.as_path());
-            (CopyRank::of(path, span), *i)
+            (CopyRank::of(path, span, facts), *i)
         };
         if let [only] = members.as_slice() {
             if let Some(flag) = is_item.get_mut(*only) {
@@ -2426,12 +2519,15 @@ fn episode_span_end(name: &str) -> Option<u32> {
 /// How one copy of an episode ranks for its primary, best first: a 2D file
 /// before a 3D one (so a 3D copy never becomes the primary over a 2D copy), a
 /// file of just that episode before one spanning several (it starts where the
-/// episode does), then containers that direct-play broadly before legacy
-/// ones, then the path.
+/// episode does), then the taller picture, then the bigger file (copies of one
+/// episode run the same length, so size stands for bitrate), then containers
+/// that direct-play broadly before legacy ones, then the path.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct CopyRank {
     is_3d: bool,
     spans_more: bool,
+    height: std::cmp::Reverse<u32>,
+    size: std::cmp::Reverse<u64>,
     container: u8,
     path: PathBuf,
 }
@@ -2442,19 +2538,29 @@ struct CopyRank {
 pub(crate) enum CopyDecision {
     TwoD,
     SingleEpisode,
+    Height,
+    Size,
     Container,
     Path,
 }
 
 impl CopyDecision {
     #[cfg(test)]
-    pub(crate) const ALL: [Self; 4] =
-        [Self::TwoD, Self::SingleEpisode, Self::Container, Self::Path];
+    pub(crate) const ALL: [Self; 6] = [
+        Self::TwoD,
+        Self::SingleEpisode,
+        Self::Height,
+        Self::Size,
+        Self::Container,
+        Self::Path,
+    ];
 
     pub(crate) fn label(self) -> &'static str {
         match self {
             Self::TwoD => "2d",
             Self::SingleEpisode => "single_episode",
+            Self::Height => "height",
+            Self::Size => "size",
             Self::Container => "container",
             Self::Path => "path",
         }
@@ -2462,7 +2568,14 @@ impl CopyDecision {
 }
 
 impl CopyRank {
-    fn of(path: Option<&Path>, span: Option<&EpisodeSpan>) -> Self {
+    /// `path`'s rank: its height from a stored probe, else its name
+    /// (`1080p`, `4K`); a copy whose height is unknown ranks below one whose
+    /// height is known.
+    fn of(
+        path: Option<&Path>,
+        span: Option<&EpisodeSpan>,
+        facts: &HashMap<PathBuf, CopyFacts>,
+    ) -> Self {
         let path = path.unwrap_or_else(|| Path::new(""));
         let stem = path
             .file_stem()
@@ -2485,9 +2598,12 @@ impl CopyRank {
             Some("webm") => 3,
             _ => 4,
         };
+        let known = facts.get(path).copied().unwrap_or_default();
         Self {
             is_3d,
             spans_more: span.is_some_and(|(_, _, first, last)| last > first),
+            height: std::cmp::Reverse(known.height.or_else(|| name_height(stem)).unwrap_or(0)),
+            size: std::cmp::Reverse(known.size.unwrap_or(0)),
             container,
             path: path.to_path_buf(),
         }
@@ -2504,11 +2620,31 @@ impl CopyRank {
             CopyDecision::TwoD
         } else if best.spans_more != next.spans_more {
             CopyDecision::SingleEpisode
+        } else if best.height != next.height {
+            CopyDecision::Height
+        } else if best.size != next.size {
+            CopyDecision::Size
         } else if best.container != next.container {
             CopyDecision::Container
         } else {
             CopyDecision::Path
         }
+    }
+}
+
+static HEIGHT_RE: std::sync::LazyLock<Option<regex::Regex>> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r"(?i)(?:^|[^a-z0-9])(?:(4320|2160|1440|1080|720|576|480|360)[pi]|(4k|uhd|8k))(?:$|[^a-z0-9])").ok()
+});
+
+/// The picture height a release name states (`WEBDL-1080p`, `[2160p]`, `4K`).
+fn name_height(stem: &str) -> Option<u32> {
+    let caps = HEIGHT_RE.as_ref()?.captures(stem)?;
+    if let Some(lines) = caps.get(1) {
+        return lines.as_str().parse().ok();
+    }
+    match caps.get(2)?.as_str().to_ascii_lowercase().as_str() {
+        "8k" => Some(4320),
+        _ => Some(2160),
     }
 }
 
@@ -6924,6 +7060,79 @@ mod tests {
         );
     }
 
+    /// Two doubles of the same span are one item, the better one primary, and
+    /// the other's resume point carries over.
+    #[test]
+    fn two_doubles_of_one_span_are_one_item() {
+        let sd = PathBuf::from("/tv/Foo/Season 01/Foo S01E01-E02 HDTV-720p.mkv");
+        let hd = PathBuf::from("/tv/Foo/Season 1/Foo S01E01-E02 WEBDL-1080p.mkv");
+        let groups = group_editions(vec![sd.clone(), hd.clone()]);
+        assert_eq!(groups.len(), 1, "{groups:?}");
+        assert_eq!(
+            group_of(&groups, &hd).map(alt_paths),
+            Some(vec![sd.as_path()])
+        );
+        assert_eq!(
+            folded_copies(&groups).first().map(|f| f.resume),
+            Some(pharos_core::FoldResume::Carry)
+        );
+    }
+
+    /// V845: the highest-quality copy is the primary: the taller picture
+    /// first, as a stored probe or else the file name states it, then the
+    /// bigger file.
+    #[test]
+    fn the_best_quality_copy_is_the_primary() {
+        let sd = PathBuf::from("/tv/Foo/Season 01/Foo S01E03 - Pilot HDTV-720p.mkv");
+        let hd = PathBuf::from("/tv/Foo/Season 1/Foo S01E03 - Pilot WEBDL-1080p.mkv");
+        let groups = group_editions(vec![sd.clone(), hd.clone()]);
+        assert_eq!(groups[0].0, hd, "the name's 1080p beats its 720p");
+
+        // A stored probe beats the name: this "720p" file is really 2160 tall.
+        let facts = HashMap::from([
+            (
+                sd.clone(),
+                CopyFacts {
+                    height: Some(2160),
+                    size: Some(1),
+                },
+            ),
+            (
+                hd.clone(),
+                CopyFacts {
+                    height: None,
+                    size: Some(2),
+                },
+            ),
+        ]);
+        let groups = group_episode_copies(group_by_edition(vec![sd.clone(), hd.clone()]), &facts);
+        assert_eq!(groups[0].0, sd);
+
+        // Same height: the bigger file, which at one length is the higher bitrate.
+        let small = PathBuf::from("/tv/Foo/Season 01/Foo S01E03 - Pilot.mkv");
+        let big = PathBuf::from("/tv/Foo/Season 1/Foo S01E03 - Pilot.mkv");
+        let facts = HashMap::from([
+            (
+                small.clone(),
+                CopyFacts {
+                    height: Some(1080),
+                    size: Some(900),
+                },
+            ),
+            (
+                big.clone(),
+                CopyFacts {
+                    height: Some(1080),
+                    size: Some(4_000),
+                },
+            ),
+        ]);
+        let groups =
+            group_episode_copies(group_by_edition(vec![small.clone(), big.clone()]), &facts);
+        assert_eq!(groups[0].0, big);
+        assert_eq!(alt_paths(&groups[0].1), vec![small.as_path()]);
+    }
+
     /// A single episode stays primary over a better double: the double starts
     /// at the episode before, and is offered as a version.
     #[test]
@@ -6935,6 +7144,22 @@ mod tests {
             group_of(&groups, &single).map(alt_paths),
             Some(vec![double.as_path()])
         );
+    }
+
+    #[test]
+    fn a_release_name_states_its_height() {
+        for (stem, height) in [
+            ("Show - S01E01 - Pilot WEBDL-1080p", Some(1080)),
+            ("Film (2017) [2160p] WEB-DL", Some(2160)),
+            ("Film.2017.4K.HDR", Some(2160)),
+            ("Show S01E01 HDTV-720p Proper", Some(720)),
+            ("Show S01E01 1080i", Some(1080)),
+            ("Show S01E01", None),
+            ("Room 1080", None),
+            ("x1080p", None),
+        ] {
+            assert_eq!(name_height(stem), height, "{stem}");
+        }
     }
 
     /// The `decided_by` labels are a dashboard contract: stable and distinct.
@@ -7076,6 +7301,59 @@ mod tests {
         assert!(merged.iter().all(|(from, into, resume)| *from == double
             && items.iter().any(|i| i.id == *into)
             && *resume == pharos_core::FoldResume::Drop));
+    }
+
+    /// V845: a copy's height comes from its stored probe, on its own row or
+    /// on the row it was folded into.
+    #[tokio::test]
+    async fn copy_facts_read_stored_heights() {
+        let td = TempDir::new().unwrap();
+        write_file(td.path(), "a.mkv", b"12345").await;
+        let (a, b, c) = (
+            td.path().join("a.mkv"),
+            td.path().join("b.mkv"),
+            td.path().join("c.mkv"),
+        );
+        let store = MemStore::default();
+        let mut item = MediaItem {
+            id: 1,
+            path: a.clone(),
+            ..Default::default()
+        };
+        item.probe.height = Some(720);
+        item.probe.alternate_sources.push(AlternateMediaSource {
+            id: "b".into(),
+            path: b.clone(),
+            container: None,
+            video_codec: None,
+            audio_codec: None,
+            bitrate_bps: None,
+            size_bytes: None,
+            duration_ms: None,
+            name: None,
+            video_3d_format: None,
+            probe: Some(Box::new(pharos_core::MediaProbe {
+                height: Some(2160),
+                ..Default::default()
+            })),
+        });
+        store.put(item).await.unwrap();
+        let facts = copy_facts(&store, &[a.clone(), b.clone(), c.clone()]).await;
+        assert_eq!(
+            facts.get(&a),
+            Some(&CopyFacts {
+                height: Some(720),
+                size: Some(5)
+            })
+        );
+        assert_eq!(
+            facts.get(&b),
+            Some(&CopyFacts {
+                height: Some(2160),
+                size: None
+            })
+        );
+        assert_eq!(facts.get(&c), Some(&CopyFacts::default()));
     }
 
     #[tokio::test]
