@@ -862,6 +862,8 @@ pub struct DamagedFile {
     pub read_errors: u64,
     pub scanned_ms: u64,
     pub declared_ms: Option<u64>,
+    /// Where in the media the damage is; empty for a book.
+    pub ranges: Vec<DamageRange>,
     /// `movie`, `episode`, `audio` or `book`.
     pub kind: Option<String>,
     pub name: Option<String>,
@@ -871,6 +873,14 @@ pub struct DamagedFile {
     /// Unix seconds.
     pub checked_at: Option<i64>,
     pub recheck_pending: bool,
+}
+
+/// One damaged span of a file, in ms on the player's timeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct DamageRange {
+    pub start_ms: u64,
+    pub end_ms: u64,
 }
 
 /// `/Admin/Integrity/Status`: how far the background check has got.
@@ -2318,7 +2328,8 @@ mod tests {
              "FirstFault":"Invalid data found","FirstFaultMs":2533000,"DemuxErrors":3,
              "CorruptPackets":4,"ReadErrors":0,"ScannedMs":600000,"DeclaredMs":2700000,
              "Kind":"episode","Name":"Pilot","SeriesName":"Show","SeasonNumber":1,
-             "EpisodeNumber":2,"CheckedAt":1762214400,"RecheckPending":true},
+             "EpisodeNumber":2,"CheckedAt":1762214400,"RecheckPending":true,
+             "Ranges":[{"StartMs":2533000,"EndMs":2541000}]},
             {"MediaId":"9","Path":null,"Verdict":"unreadable","FirstFault":null,
              "FirstFaultMs":null,"DemuxErrors":0,"CorruptPackets":0,"ReadErrors":7,
              "ScannedMs":0,"DeclaredMs":null,"Kind":null,"Name":null,"SeriesName":null,
@@ -2331,6 +2342,14 @@ mod tests {
         assert_eq!(v[0].series_name.as_deref(), Some("Show"));
         assert_eq!(v[0].episode_number, Some(2));
         assert!(v[0].recheck_pending);
+        assert_eq!(
+            v[0].ranges,
+            vec![DamageRange {
+                start_ms: 2_533_000,
+                end_ms: 2_541_000
+            }]
+        );
+        assert!(v[1].ranges.is_empty(), "a server without spans sends none");
         assert_eq!(v[1].path, None);
         assert_eq!(v[1].verdict, "unreadable");
         assert_eq!(v[1].read_errors, 7);
