@@ -140,13 +140,22 @@ impl IntegrityMemo {
         }
     }
 
-    /// Whether any verdict is recorded for this id, whatever state the file
-    /// was in. For progress counts, where a `stat` per file is too dear.
-    pub fn has(&self, id: u64) -> bool {
+    /// Drop this file's verdict, if any. Persisted at the sweep's next save.
+    pub fn forget(&self, id: u64) {
+        if let Ok(mut d) = self.doc.write() {
+            d.entries.remove(&id);
+        }
+    }
+
+    /// The recorded verdict's damaged flag for this id, whatever state the
+    /// file was in; `None` when there is no verdict. For progress counts.
+    pub fn recorded_damaged(&self, id: u64) -> Option<bool> {
         self.doc
             .read()
-            .map(|d| d.entries.contains_key(&id))
-            .unwrap_or(false)
+            .ok()?
+            .entries
+            .get(&id)
+            .map(|e| e.report.is_damaged())
     }
 
     /// Every file currently recorded as damaged, newest verdict wins. This is
