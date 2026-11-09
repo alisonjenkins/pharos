@@ -15,6 +15,7 @@ pub mod items;
 pub mod live_tv;
 pub(crate) mod media_source;
 pub(crate) mod output_size;
+pub mod play_capability;
 pub mod playlists;
 pub mod remote_subtitles;
 pub mod search;

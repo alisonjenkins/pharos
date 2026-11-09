@@ -7,7 +7,7 @@
 //! the `MediaStore` from elsewhere must validate root-prefix at the
 //! call site; tracked in §B if violated.
 
-use crate::{api::jellyfin::auth_extractor::MediaUser, state::AppState};
+use crate::{api::jellyfin::play_capability::PlaybackUser, state::AppState};
 use actix_web::{
     body::MessageBody,
     error,
@@ -316,7 +316,7 @@ fn not_modified(req: &HttpRequest, file_modified: std::time::SystemTime) -> bool
 /// ffmpeg to the first acceptable target (typically AAC).
 async fn audio_universal(
     state: web::Data<AppState>,
-    user: MediaUser,
+    user: PlaybackUser,
     req: HttpRequest,
     path: web::Path<StreamPath>,
 ) -> Result<HttpResponse, actix_web::Error> {
@@ -507,12 +507,6 @@ fn parse_max_streaming_bitrate(qs: &str) -> Option<u64> {
 }
 
 /// First value of query key `key` (case-insensitive), empty values skipped.
-fn query_value_ci(qs: &str, key: &str) -> Option<String> {
-    super::ci_query::values(qs, key)
-        .find(|v| !v.is_empty())
-        .map(str::to_string)
-}
-
 /// B75 — authorize a direct-play `/videos/{id}/stream` request. Two accepted
 /// credentials:
 ///
@@ -558,53 +552,11 @@ async fn authorize_media(
     // 2. Capability token forwarded by a native app (tag == our ETag): a
     //    session for this item whose holder's token is still live and who may
     //    still see it (B256). A capability outlives neither.
-    let qs = req.query_string();
-    for key in ["tag", "PlaySessionId"] {
-        if let Some(cap) = query_value_ci(qs, key) {
-            match state
-                .transcode_sessions
-                .get_stored(&pharos_core::PlaySessionId::from(cap))
-                .await
-            {
-                Ok(Some(session)) if session.media_id == media_id => {
-                    return capability_holder_allowed(state, &session.holder, media_id).await;
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    tracing::warn!(media.id = media_id, error = %e, "stream capability: session store unavailable");
-                    return Err(error::ErrorServiceUnavailable("session store unavailable"));
-                }
-            }
-        }
-    }
-    Err(error::ErrorUnauthorized("missing token"))
-}
-
-/// Whether a session's holder may still stream `media_id`: their token is
-/// live, their account enabled, and the library policy lets them see it now.
-async fn capability_holder_allowed(
-    state: &AppState,
-    holder: &pharos_core::SessionHolder,
-    media_id: pharos_core::MediaId,
-) -> Result<(), actix_web::Error> {
-    use crate::services::auth::{user_for_token_id, TokenRefusal};
-    match user_for_token_id(&state.stores, &holder.token_id).await {
-        Ok(user) if user.id == holder.user_id => {
+    match super::play_capability::capability_user(state, req, media_id).await? {
+        Some(user) => {
             crate::api::jellyfin::require_item_access(state, &user, media_id, "stream").await
         }
-        Ok(_) => Err(error::ErrorUnauthorized("session holder mismatch")),
-        Err(TokenRefusal::Unavailable(detail)) => {
-            tracing::warn!(media.id = media_id, error = %detail, "stream capability: token store unavailable");
-            Err(error::ErrorServiceUnavailable("token store unavailable"))
-        }
-        Err(refusal) => {
-            tracing::info!(
-                media.id = media_id,
-                reason = refusal.label(),
-                "stream capability: holder's token no longer live"
-            );
-            Err(error::ErrorUnauthorized("session ended"))
-        }
+        None => Err(error::ErrorUnauthorized("missing token")),
     }
 }
 
