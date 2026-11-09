@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use super::admin::require_admin;
 use crate::api::jellyfin::auth_extractor::AuthUser;
 use crate::online_enrich::OnlineEnricher;
-use crate::series_hand_fix::{HandFixDone, HandFixError, HandFixer, MoveTarget};
+use crate::series_hand_fix::{rebuild_paced, HandFixError, HandFixer, MoveTarget};
 use crate::state::AppState;
 use crate::tmdb::{TmdbClient, TmdbEnricher};
 use crate::tvdb::{ReqwestTransport, TvdbClient, TvdbEnricher};
@@ -85,20 +85,13 @@ struct OverrideDto {
     created_at: i64,
 }
 
+/// What a fix changed: the paths it moved, and how many episodes it marked
+/// to be rebuilt after this answer.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "PascalCase")]
 struct DoneDto {
     moved: Vec<String>,
-    rebuilt: usize,
-}
-
-impl From<HandFixDone> for DoneDto {
-    fn from(d: HandFixDone) -> Self {
-        Self {
-            moved: d.moved,
-            rebuilt: d.rebuilt,
-        }
-    }
+    rebuilding: usize,
 }
 
 fn internal(context: &str) -> impl Fn(pharos_core::DomainError) -> actix_web::Error + '_ {
@@ -283,7 +276,11 @@ enum Op {
 
 /// Run one hand fix with the server's providers, cache and repair mode, as
 /// `user`, and answer with what it changed.
-async fn fix(state: &AppState, user: &AuthUser, op: Op) -> Result<HttpResponse, actix_web::Error> {
+async fn fix(
+    state: &web::Data<AppState>,
+    user: &AuthUser,
+    op: Op,
+) -> Result<HttpResponse, actix_web::Error> {
     require_admin(user)?;
     let (tmdb, tvdb) = providers(state);
     let fixer = HandFixer {
@@ -292,7 +289,6 @@ async fn fix(state: &AppState, user: &AuthUser, op: Op) -> Result<HttpResponse, 
         cache: state.images.as_ref(),
         tmdb: tmdb.as_ref(),
         tvdb: tvdb.as_ref(),
-        cfg: &state.metadata_config,
         mode: state.metadata_config.series_identity_repair,
         admin: user.0.name.as_str(),
         now: crate::metadata_backfill::now_secs(),
@@ -316,7 +312,16 @@ async fn fix(state: &AppState, user: &AuthUser, op: Op) -> Result<HttpResponse, 
         Op::Remove { id } => fixer.remove(id).await,
     };
     match done {
-        Ok(done) => Ok(HttpResponse::Ok().json(DoneDto::from(done))),
+        Ok(done) => {
+            let answer = DoneDto {
+                moved: done.moved,
+                rebuilding: done.rebuild.len(),
+            };
+            if !done.rebuild.is_empty() {
+                rebuild_after(state.clone(), done.rebuild, user.0.name.clone());
+            }
+            Ok(HttpResponse::Ok().json(answer))
+        }
         Err(e) => {
             tracing::warn!(admin = %user.0.name, error = %e, "series hand fix refused");
             Err(match e {
@@ -327,6 +332,33 @@ async fn fix(state: &AppState, user: &AuthUser, op: Op) -> Result<HttpResponse, 
             })
         }
     }
+}
+
+/// Rebuild a fix's episodes on the request's worker after it answered.
+/// Without an image cache they stay marked for the background pass.
+fn rebuild_after(state: web::Data<AppState>, ids: Vec<pharos_core::MediaId>, admin: String) {
+    actix_web::rt::spawn(async move {
+        let Some(cache) = state.images.as_ref() else {
+            tracing::warn!(
+                admin = %admin,
+                episodes = ids.len(),
+                "series hand fix: no image cache, episodes left marked"
+            );
+            return;
+        };
+        let (tmdb, tvdb) = providers(&state);
+        rebuild_paced(
+            &state.stores,
+            &state.bg_io,
+            cache,
+            tmdb.as_ref(),
+            tvdb.as_ref(),
+            &state.metadata_config,
+            &ids,
+            &admin,
+        )
+        .await;
+    });
 }
 
 #[derive(Debug, Deserialize)]
