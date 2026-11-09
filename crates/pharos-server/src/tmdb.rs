@@ -256,6 +256,26 @@ impl TmdbClient {
         Some(md)
     }
 
+    /// Spec 033 (V891) — the episodes TMDB lists for one season of a show.
+    pub(crate) async fn season_episodes(
+        &self,
+        series_id: &str,
+        season: u32,
+    ) -> Option<Vec<crate::online_enrich::EpisodeListing>> {
+        let resp = self
+            .http
+            .get(format!("{API_BASE}/tv/{series_id}/season/{season}"))
+            .query(&[("api_key", self.api_key.as_str())])
+            .send()
+            .await
+            .ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let body = resp.text().await.ok()?;
+        parse_season_episodes(&body)
+    }
+
     /// Download the raw bytes of an artwork/image URL (typically one built
     /// from an `IMAGE_BASE_ORIGINAL` + `*_path` pair in an
     /// [`crate::online_enrich::EnrichedMetadata`]). `None` on any
@@ -333,6 +353,19 @@ impl crate::online_enrich::OnlineEnricher for TmdbEnricher {
 
     fn supports(&self, _kind: pharos_core::MediaKind) -> bool {
         true
+    }
+
+    /// One request per season: TMDB has no whole-show episode list.
+    async fn episode_list(
+        &self,
+        id: &str,
+        seasons: &[u32],
+    ) -> Option<Vec<crate::online_enrich::EpisodeListing>> {
+        let mut out = Vec::new();
+        for &season in seasons {
+            out.extend(self.0.season_episodes(id, season).await?);
+        }
+        Some(out)
     }
 
     async fn search(
@@ -678,6 +711,33 @@ pub(crate) fn parse_tmdb_images(body: &str) -> Vec<crate::online_enrich::RemoteI
 /// B125: an episode's still IS its poster in Jellyfin, and filing it under
 /// Thumb left the episode with no Primary at all, so the image route fell
 /// through to extracting an arbitrary video frame).
+fn parse_season_episodes(body: &str) -> Option<Vec<crate::online_enrich::EpisodeListing>> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    let episodes = v.get("episodes")?.as_array()?;
+    let num = |ep: &serde_json::Value, k: &str| {
+        ep.get(k)
+            .and_then(|x| x.as_u64())
+            .and_then(|x| u32::try_from(x).ok())
+    };
+    Some(
+        episodes
+            .iter()
+            .filter_map(|ep| {
+                Some(crate::online_enrich::EpisodeListing {
+                    season: num(ep, "season_number")?,
+                    episode: num(ep, "episode_number")?,
+                    title: ep
+                        .get("name")
+                        .and_then(|x| x.as_str())
+                        .map(str::trim)
+                        .filter(|t| !t.is_empty())
+                        .map(str::to_string),
+                })
+            })
+            .collect(),
+    )
+}
+
 pub(crate) fn parse_episode_detail(body: &str) -> Option<crate::online_enrich::EnrichedMetadata> {
     use crate::online_enrich::{EnrichedMetadata, RemoteArt};
     use pharos_core::ArtworkRole;
@@ -848,6 +908,33 @@ pub(crate) fn parse_tmdb_credits(v: &serde_json::Value) -> Vec<pharos_core::Pers
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
+
+    #[test]
+    fn parses_a_seasons_episode_list() {
+        let body = r#"{"season_number":2,"episodes":[
+            {"season_number":2,"episode_number":1,"name":"The Man Who Saved Central City"},
+            {"season_number":2,"episode_number":2,"name":" "},
+            {"season_number":2,"name":"no number"}
+        ]}"#;
+        let got = parse_season_episodes(body).unwrap();
+        assert_eq!(
+            got,
+            vec![
+                crate::online_enrich::EpisodeListing {
+                    season: 2,
+                    episode: 1,
+                    title: Some("The Man Who Saved Central City".into()),
+                },
+                crate::online_enrich::EpisodeListing {
+                    season: 2,
+                    episode: 2,
+                    title: None,
+                },
+            ]
+        );
+        assert!(parse_season_episodes("{}").is_none());
+        assert!(parse_season_episodes("nope").is_none());
+    }
 
     #[test]
     fn parses_first_result_profile_path() {
