@@ -31,7 +31,7 @@ pub(crate) const MAX_TITLES: usize = 10;
 
 /// Lowest [`title_similarity`] at which a filename title names the listed
 /// episode: the threshold B558 and the episode title check use.
-const SAME_TITLE: f32 = 0.8;
+pub(crate) const SAME_TITLE: f32 = 0.8;
 
 /// One local episode file of the show being matched.
 #[derive(Debug, Clone, PartialEq, Eq)]
