@@ -299,6 +299,9 @@ fn run(window: &NativeWindow, path: &str) -> Result<(), String> {
         let mut base_ns = now_ns();
         let mut first_pts: Option<i64> = None;
         let (mut shown, mut dropped, mut loops) = (0u64, 0u64, 0u64);
+        // Worst lateness of a decoded frame in this report window, to tell a
+        // decoder or feeder stall (one long gap) from steady slowness.
+        let mut late_max_ms = i64::MIN;
         let mut input_done = false;
         let mut report = Instant::now();
         loop {
@@ -333,7 +336,9 @@ fn run(window: &NativeWindow, path: &str) -> Result<(), String> {
                     pts
                 });
                 let due = base_ns + (pts - first) * 1_000;
-                if now_ns() - due > LATE.as_nanos() as i64 {
+                let late = now_ns() - due;
+                late_max_ms = late_max_ms.max(late / 1_000_000);
+                if late > LATE.as_nanos() as i64 {
                     sys::AMediaCodec_releaseOutputBuffer(codec, idx, false);
                     dropped += 1;
                 } else {
@@ -342,7 +347,10 @@ fn run(window: &NativeWindow, path: &str) -> Result<(), String> {
                 }
             }
             if report.elapsed() >= REPORT_EVERY {
-                log::info!("bench video shown={shown} dropped={dropped} loops={loops}");
+                log::info!(
+                    "bench video shown={shown} dropped={dropped} loops={loops} late_max_ms={late_max_ms}"
+                );
+                late_max_ms = i64::MIN;
                 report = Instant::now();
             }
         }

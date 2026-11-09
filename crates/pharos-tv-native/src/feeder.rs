@@ -255,11 +255,15 @@ impl Feeder {
 
     /// Parse the next segment from the supplier; false at the end.
     fn advance(&mut self) -> Result<bool, String> {
+        let waited = std::time::Instant::now();
         let Some(bytes) = (self.supply)() else {
             return Ok(false);
         };
         let bytes = bytes?;
+        let wait_ms = waited.elapsed().as_millis();
+        let demuxed = std::time::Instant::now();
         let segment = self.segment;
+        let bytes_len = bytes.len();
         self.current = Some(match &mut self.container {
             Container::Fmp4 {
                 track_id, defaults, ..
@@ -277,6 +281,16 @@ impl Feeder {
                     .map_err(|e| format!("segment {segment}: {e}"))?,
             ),
         });
+        let units = match &self.current {
+            Some(Current::Fmp4(_, samples)) => samples.len(),
+            Some(Current::Ts(units)) => units.len(),
+            None => 0,
+        };
+        log::info!(
+            "bench feeder segment={segment} bytes={} units={units} wait_ms={wait_ms} demux_ms={}",
+            bytes_len,
+            demuxed.elapsed().as_millis(),
+        );
         self.sample = 0;
         Ok(true)
     }
