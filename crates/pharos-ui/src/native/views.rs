@@ -20,7 +20,6 @@ use super::platform;
 use super::playback::{ends_at_label, left_to_watch, start_ms, Left};
 use super::route::Route;
 use super::seen::{self, MemberSeen};
-use super::stage::{fullscreen_for_play, StageCtx};
 use super::together::can_watch_together;
 use super::together_view::InThisGroup;
 
@@ -81,10 +80,6 @@ pub fn Link(
     to: Route,
     class: Option<String>,
     #[props(default)] current: bool,
-    /// What the link plays, for a play link: a film or an episode opens in
-    /// fullscreen.
-    #[props(default)]
-    plays: Option<ItemKind>,
     #[props(default)] id: Option<String>,
     /// The key action that presses this link (spec 029), such as `play`.
     #[props(default)]
@@ -92,7 +87,6 @@ pub fn Link(
     children: Element,
 ) -> Element {
     let nav = use_context::<Nav>();
-    let stage = try_use_context::<StageCtx>();
     let href = to.path();
     rsx! {
         a {
@@ -104,9 +98,6 @@ pub fn Link(
             onclick: move |evt: MouseEvent| {
                 if evt.modifiers().is_empty() {
                     evt.prevent_default();
-                    if let Some(kind) = plays {
-                        fullscreen_for_play(kind, stage);
-                    }
                     nav.0.call(to.clone());
                 }
             },
@@ -994,7 +985,6 @@ pub fn TitleView(
     use_ends_at_refresh();
     use_key_mode(Mode::Detail);
     use_arrival_focus(detail.item.id, MAIN_ACTION);
-    let stage = try_use_context::<StageCtx>();
     let item = &detail.item;
     let group_rows = if seen.is_empty() {
         Vec::new()
@@ -1040,7 +1030,6 @@ pub fn TitleView(
                         Link {
                             to: Route::Watch(item.id),
                             class: "pharos-button",
-                            plays: item.kind,
                             id: MAIN_ACTION,
                             key_action: "play",
                             if resume { "Resume" } else { "Play" }
@@ -1049,16 +1038,12 @@ pub fn TitleView(
                     if item.kind.playable() && resume {
                         {
                             let id = item.id;
-                            let kind = item.kind;
                             rsx! {
                                 button {
                                     class: "pharos-button pharos-button-secondary",
                                     r#type: "button",
                                     "data-key-action": "restart",
-                                    onclick: move |_| {
-                                        fullscreen_for_play(kind, stage);
-                                        on_play_from_start.call(id);
-                                    },
+                                    onclick: move |_| on_play_from_start.call(id),
                                     "Play from start"
                                 }
                             }

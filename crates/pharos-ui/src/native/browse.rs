@@ -1448,7 +1448,6 @@ fn Hero(
                             Link {
                                 to: Route::Watch(ep.id),
                                 class: "pharos-button",
-                                plays: ItemKind::Episode,
                                 id: MAIN_ACTION,
                                 key_action: "play",
                                 {next_label(ep)}
@@ -1784,7 +1783,6 @@ fn EpisodeRow(episode: Item, #[props(default)] seen: Vec<seen::SeenRow>) -> Elem
             Link {
                 to: Route::Watch(episode.id),
                 class: "pharos-button pharos-episode-play",
-                plays: ItemKind::Episode,
                 key_action: "play",
                 if progress.is_some() { "Resume" } else { "Play" }
             }
