@@ -244,3 +244,19 @@ async fn aac_cannot_be_turned_off() {
         .get("NoDirectPlayAudioCodecs")
         .is_none());
 }
+
+/// A body that does not parse is refused, not read as "no fields" and
+/// answered as if it had been saved.
+#[actix_web::test]
+async fn a_malformed_body_is_refused() {
+    let fx = setup().await;
+    assert_eq!(
+        set_options(&fx, "tv", r#"{"NoDirectPlayAudioCodecs":"eac3"}"#).await,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        set_options(&fx, "tv", "{not json").await,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(set_options(&fx, "tv", "").await, StatusCode::NO_CONTENT);
+}
