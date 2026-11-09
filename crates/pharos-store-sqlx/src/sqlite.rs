@@ -3,8 +3,8 @@ use pharos_core::{
     Collection, CollectionCount, CollectionStore, DomainError, DomainResult, EntityCounts,
     ExternalRatings, Fingerprint, Genre, GenreCount, GenreStore, ItemPerson, Library, LibraryKind,
     LibraryStore, MediaId, MediaItem, MediaKind, MediaMetadata, MediaProbe, MediaQuery, MediaStore,
-    Person, PersonCount, PersonKind, PersonRef, PersonStore, Playlist, PlaylistEntry,
-    PlaylistStore, ScanState, SeriesInfo, SeriesMatchCandidate, SeriesMetadata,
+    Person, PersonCount, PersonDetails, PersonKind, PersonRef, PersonStore, Playlist,
+    PlaylistEntry, PlaylistStore, ScanState, SeriesInfo, SeriesMatchCandidate, SeriesMetadata,
     SeriesMetadataStore, Studio, StudioCount, StudioStore, Tag, TagCount, TagStore, UserId,
 };
 use sqlx::{
@@ -2160,6 +2160,69 @@ impl PersonStore for SqliteStore {
                 },
             )
             .collect())
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn person_details(&self, wire_id: &str) -> DomainResult<Option<PersonDetails>> {
+        let row = sqlx::query_as::<
+            _,
+            (
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                i64,
+            ),
+        >(
+            "SELECT biography, birth_date, death_date, birth_place, imdb_id, wikidata_id, \
+                 fetched_at \
+             FROM person_details WHERE wire_id = ?",
+        )
+        .bind(wire_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| DomainError::Backend(e.to_string()))?;
+        Ok(row.map(
+            |(biography, birth_date, death_date, birth_place, imdb_id, wikidata_id, fetched_at)| {
+                PersonDetails {
+                    biography,
+                    birth_date,
+                    death_date,
+                    birth_place,
+                    imdb_id,
+                    wikidata_id,
+                    fetched_at,
+                }
+            },
+        ))
+    }
+
+    #[tracing::instrument(skip(self, details))]
+    async fn put_person_details(&self, wire_id: &str, details: &PersonDetails) -> DomainResult<()> {
+        sqlx::query(
+            "INSERT INTO person_details \
+                 (wire_id, biography, birth_date, death_date, birth_place, imdb_id, wikidata_id, \
+                  fetched_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?) \
+             ON CONFLICT (wire_id) DO UPDATE SET biography = excluded.biography, \
+                 birth_date = excluded.birth_date, death_date = excluded.death_date, \
+                 birth_place = excluded.birth_place, imdb_id = excluded.imdb_id, \
+                 wikidata_id = excluded.wikidata_id, fetched_at = excluded.fetched_at",
+        )
+        .bind(wire_id)
+        .bind(details.biography.as_deref())
+        .bind(details.birth_date.as_deref())
+        .bind(details.death_date.as_deref())
+        .bind(details.birth_place.as_deref())
+        .bind(details.imdb_id.as_deref())
+        .bind(details.wikidata_id.as_deref())
+        .bind(details.fetched_at)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| DomainError::Backend(e.to_string()))?;
+        Ok(())
     }
 }
 

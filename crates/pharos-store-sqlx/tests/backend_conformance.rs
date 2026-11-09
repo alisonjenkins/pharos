@@ -1369,6 +1369,39 @@ where
             .unwrap()
             .is_empty()
     );
+    // A person's provider details are kept, and replaced whole.
+    // A fresh id per run, so a persistent postgres starts with none kept.
+    let lead = person_wire_id(&format!("Details Probe {}", UserId::new().0.simple()));
+    assert_eq!(
+        PersonStore::person_details(&store, &lead).await.unwrap(),
+        None
+    );
+    let details = pharos_core::PersonDetails {
+        biography: Some("Born by the sea.".into()),
+        birth_date: Some("1970-01-02".into()),
+        imdb_id: Some("nm0000001".into()),
+        wikidata_id: Some("Q42".into()),
+        fetched_at: 1_700_000_000,
+        ..Default::default()
+    };
+    PersonStore::put_person_details(&store, &lead, &details)
+        .await
+        .unwrap();
+    assert_eq!(
+        PersonStore::person_details(&store, &lead).await.unwrap(),
+        Some(details)
+    );
+    let nothing = pharos_core::PersonDetails {
+        fetched_at: 1_800_000_000,
+        ..Default::default()
+    };
+    PersonStore::put_person_details(&store, &lead, &nothing)
+        .await
+        .unwrap();
+    assert_eq!(
+        PersonStore::person_details(&store, &lead).await.unwrap(),
+        Some(nothing)
+    );
 
     StudioStore::link_item_studios(&store, item_id, &["Conformance Studio".to_string()])
         .await

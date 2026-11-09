@@ -944,6 +944,23 @@ pub struct Person {
     pub thumb_url: Option<String>,
 }
 
+/// What a metadata provider says about a person, kept so their page does
+/// not ask again. Every field `None` records that the provider had nothing.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PersonDetails {
+    pub biography: Option<String>,
+    /// `YYYY-MM-DD`, as the provider gives it.
+    pub birth_date: Option<String>,
+    pub death_date: Option<String>,
+    pub birth_place: Option<String>,
+    /// `nm` and digits.
+    pub imdb_id: Option<String>,
+    /// `Q` and digits.
+    pub wikidata_id: Option<String>,
+    /// Unix seconds.
+    pub fetched_at: i64,
+}
+
 /// LIB-C2 — one person plus how many items credit them, for the
 /// `/Persons` list (jellyfin-web shows the cast tile; the count drives
 /// "appears in N items").
@@ -1070,6 +1087,20 @@ pub trait PersonStore: Send + Sync {
         &self,
         wire_id: &str,
     ) -> impl std::future::Future<Output = DomainResult<Vec<(MediaId, ItemPerson)>>> + Send;
+
+    /// The provider details kept for the person whose `wire_id` matches;
+    /// `None` when none were ever fetched.
+    fn person_details(
+        &self,
+        wire_id: &str,
+    ) -> impl std::future::Future<Output = DomainResult<Option<PersonDetails>>> + Send;
+
+    /// Keep `details` for `wire_id`, replacing any kept before.
+    fn put_person_details(
+        &self,
+        wire_id: &str,
+        details: &PersonDetails,
+    ) -> impl std::future::Future<Output = DomainResult<()>> + Send;
 }
 
 /// LIB-C3 — a studio entity row (one per distinct production/network
