@@ -6265,11 +6265,14 @@ mod prewarm_edition_tests {
     /// whatever is there after the timeout.
     async fn warmed(root: &Path, want: usize) -> Vec<String> {
         let mut names = Vec::new();
+        // Only finished segments count: an encode in flight is a
+        // `{name}.{n}.ts.tmp` until its rename, and a slow runner can show
+        // `want` of those before any segment lands.
         for _ in 0..200 {
             names = std::fs::read_dir(root.join("7"))
                 .map(|d| {
                     d.filter_map(|e| e.ok()?.file_name().into_string().ok())
-                        .filter(|n| !n.ends_with(".prov.json"))
+                        .filter(|n| !n.ends_with(".prov.json") && !n.ends_with(".tmp"))
                         .collect()
                 })
                 .unwrap_or_default();
