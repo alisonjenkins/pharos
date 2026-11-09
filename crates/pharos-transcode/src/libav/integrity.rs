@@ -67,8 +67,12 @@ pub fn scan_integrity(src: &Path) -> Result<IntegrityReport, FrameError> {
     let capture = super::logbridge::ErrorCapture::open();
     let mut report = IntegrityReport {
         declared_ms,
+        ranges: Some(Vec::new()),
         ..Default::default()
     };
+    // Set from a fault until the next packet that reads cleanly, which is
+    // where that span of damage ends.
+    let mut in_fault = false;
     let mut consecutive_errors: u32 = 0;
     // Errors already accounted for, so a rise can be attributed to the media
     // position the scan had reached when it happened.
@@ -92,9 +96,11 @@ pub fn scan_integrity(src: &Path) -> Result<IntegrityReport, FrameError> {
                     .unwrap_or(report.scanned_ms);
                 report.scanned_ms = report.scanned_ms.max(pos_ms);
 
+                let mut faulted = false;
                 if packet.is_corrupt() {
                     report.corrupt_packets += 1;
                     note_fault(&mut report, pos_ms, "packet flagged corrupt");
+                    faulted = true;
                 }
 
                 // A logged fault carries no timestamp of its own. The furthest
@@ -105,13 +111,23 @@ pub fn scan_integrity(src: &Path) -> Result<IntegrityReport, FrameError> {
                 if logged > logged_seen {
                     logged_seen = logged;
                     first_logged_ms.get_or_insert(pos_ms);
+                    faulted = true;
                 }
+
+                if faulted {
+                    report.note_range(pos_ms);
+                } else if in_fault {
+                    report.close_range(pos_ms);
+                }
+                in_fault = faulted;
             }
             Err(e) => {
                 report.read_errors += 1;
                 consecutive_errors += 1;
                 let at = report.scanned_ms;
                 note_fault(&mut report, at, &e.to_string());
+                report.note_range(at);
+                in_fault = true;
                 if report.read_errors >= MAX_READ_ERRORS
                     || consecutive_errors >= MAX_CONSECUTIVE_READ_ERRORS
                 {
@@ -133,6 +149,11 @@ fn finish(
     capture: &super::logbridge::ErrorCapture,
     first_logged_ms: Option<u64>,
 ) {
+    if report.is_short() || !report.complete {
+        let end = report.declared_ms.unwrap_or(report.scanned_ms);
+        report.note_range(report.scanned_ms);
+        report.close_range(end);
+    }
     let (count, first) = capture.errors();
     report.demux_errors = count;
     if count > 0 && report.first_fault.is_none() {

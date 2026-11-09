@@ -82,6 +82,11 @@ fn an_intact_container_scans_clean() {
     assert!(report.complete, "the scan must reach EOF: {report:?}");
     assert!(report.packets > 0, "no packets demuxed: {report:?}");
     assert_eq!(report.label(), "clean");
+    assert_eq!(
+        report.ranges,
+        Some(Vec::new()),
+        "a current verdict always carries spans"
+    );
     // 20 s of media, allowing container slack at the tail.
     assert!(
         report.scanned_ms >= 19_000,
@@ -140,6 +145,22 @@ fn a_hole_punched_mid_file_is_reported_with_its_position() {
         matches!(report.label(), "damaged" | "unreadable"),
         "label = {}",
         report.label()
+    );
+
+    let ranges = report.ranges.clone().unwrap_or_default();
+    assert!(
+        !ranges.is_empty(),
+        "a player marks these spans on its seek bar: {report:?}"
+    );
+    let span_end = report
+        .declared_ms
+        .unwrap_or(report.scanned_ms)
+        .max(report.scanned_ms);
+    assert!(
+        ranges
+            .iter()
+            .all(|r| r.start_ms <= r.end_ms && r.end_ms <= span_end),
+        "spans must lie inside the media: {ranges:?}"
     );
 }
 

@@ -55,7 +55,28 @@ pub struct IntegrityReport {
     /// under [`MAX_READ_ERRORS`] or [`MAX_CONSECUTIVE_READ_ERRORS`] — the file
     /// is damaged past the point where reading more of it tells us anything.
     pub complete: bool,
+    /// Where in the media the damage is, merged into spans a player can mark
+    /// on its seek bar. `None` on a verdict recorded before ranges existed; a
+    /// damaged one of those is read again so it gains them.
+    #[serde(default)]
+    pub ranges: Option<Vec<DamageRange>>,
 }
+
+/// One span of damaged media, in ms. A fault the demuxer could place no more
+/// precisely than one packet gives `start_ms == end_ms`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DamageRange {
+    pub start_ms: u64,
+    pub end_ms: u64,
+}
+
+/// Faults closer together than this are one span: a viewer sees one broken
+/// stretch, not forty marks a frame apart.
+pub const RANGE_MERGE_GAP_MS: u64 = 2_000;
+
+/// Spans kept per file. A file with more is damaged throughout, and the last
+/// span is stretched to cover the rest rather than growing the memo.
+pub const MAX_RANGES: usize = 64;
 
 /// Total non-EOF read errors after which the scan stops.
 ///
@@ -83,6 +104,60 @@ pub const MAX_SHORTFALL_RATIO: f64 = 0.25;
 pub const MIN_SHORTFALL_MS: u64 = 5_000;
 
 impl IntegrityReport {
+    /// Note a fault at `at_ms`, joining it to the last span when it is near.
+    pub fn note_range(&mut self, at_ms: u64) {
+        let ranges = self.ranges.get_or_insert_with(Vec::new);
+        let full = ranges.len() >= MAX_RANGES;
+        match ranges.last_mut() {
+            Some(last) if full || at_ms <= last.end_ms.saturating_add(RANGE_MERGE_GAP_MS) => {
+                last.start_ms = last.start_ms.min(at_ms);
+                last.end_ms = last.end_ms.max(at_ms);
+            }
+            _ => ranges.push(DamageRange {
+                start_ms: at_ms,
+                end_ms: at_ms,
+            }),
+        }
+    }
+
+    /// Stretch the last span to `to_ms`: the first clean packet after a fault
+    /// is where the damage visibly ends.
+    pub fn close_range(&mut self, to_ms: u64) {
+        if let Some(last) = self.ranges.as_mut().and_then(|r| r.last_mut()) {
+            last.end_ms = last.end_ms.max(to_ms);
+        }
+    }
+
+    /// The spans to show for this verdict. A verdict recorded before spans
+    /// existed falls back to its first fault, or to the missing tail of a
+    /// short body, so an old damaged entry still marks something.
+    pub fn damage_ranges(&self) -> Vec<DamageRange> {
+        if !self.is_damaged() {
+            return Vec::new();
+        }
+        if let Some(r) = self.ranges.as_ref().filter(|r| !r.is_empty()) {
+            return r.clone();
+        }
+        if self.is_short() || !self.complete {
+            let end = self
+                .declared_ms
+                .unwrap_or(self.scanned_ms)
+                .max(self.scanned_ms);
+            return vec![DamageRange {
+                start_ms: self.scanned_ms,
+                end_ms: end,
+            }];
+        }
+        self.first_fault_ms
+            .map(|at| {
+                vec![DamageRange {
+                    start_ms: at,
+                    end_ms: at,
+                }]
+            })
+            .unwrap_or_default()
+    }
+
     /// How much of the declared duration was never demuxed, in ms.
     pub fn shortfall_ms(&self) -> u64 {
         self.declared_ms
@@ -281,5 +356,72 @@ mod tests {
             s.contains("Invalid data found when processing input"),
             "the demuxer's own words must survive to the log line: {s}"
         );
+    }
+
+    #[test]
+    fn faults_close_together_are_one_span_and_far_apart_are_two() {
+        let mut r = IntegrityReport::default();
+        r.note_range(10_000);
+        r.note_range(11_000);
+        r.close_range(11_500);
+        r.note_range(60_000);
+        assert_eq!(
+            r.ranges.unwrap(),
+            vec![
+                DamageRange {
+                    start_ms: 10_000,
+                    end_ms: 11_500
+                },
+                DamageRange {
+                    start_ms: 60_000,
+                    end_ms: 60_000
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn spans_stop_growing_at_the_cap_and_the_last_one_stretches() {
+        let mut r = IntegrityReport::default();
+        for i in 0..(MAX_RANGES as u64 + 10) {
+            r.note_range(i * 10_000);
+        }
+        let ranges = r.ranges.unwrap();
+        assert_eq!(ranges.len(), MAX_RANGES);
+        assert_eq!(
+            ranges.last().unwrap().end_ms,
+            (MAX_RANGES as u64 + 9) * 10_000
+        );
+    }
+
+    #[test]
+    fn an_old_verdict_without_spans_still_marks_its_first_fault() {
+        let r = IntegrityReport {
+            read_errors: 1,
+            first_fault_ms: Some(2_870),
+            complete: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            r.damage_ranges(),
+            vec![DamageRange {
+                start_ms: 2_870,
+                end_ms: 2_870
+            }]
+        );
+        let short = IntegrityReport {
+            declared_ms: Some(20_000),
+            scanned_ms: 1_000,
+            complete: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            short.damage_ranges(),
+            vec![DamageRange {
+                start_ms: 1_000,
+                end_ms: 20_000
+            }]
+        );
+        assert!(IntegrityReport::default().damage_ranges().is_empty());
     }
 }
