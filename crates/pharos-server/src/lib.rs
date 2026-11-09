@@ -40,6 +40,8 @@ pub mod opensubtitles;
 pub mod parental;
 pub mod person_details;
 pub mod person_image_backfill;
+#[cfg(all(unix, feature = "ffmpeg-lib"))]
+pub mod picture_check;
 pub mod portrait;
 pub mod prefetch_registry;
 pub mod progress_writes;

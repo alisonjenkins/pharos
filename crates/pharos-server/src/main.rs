@@ -1947,6 +1947,15 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
         state.bg_io.clone(),
         libav_pool.clone(),
     );
+    // Black bars baked into a film's or episode's picture, found once per
+    // file so the client can crop to the picture. Same gate as above.
+    #[cfg(all(unix, feature = "ffmpeg-lib"))]
+    pharos_server::picture_check::spawn(
+        state.stores.clone(),
+        state.is_bg_leader.clone(),
+        state.bg_io.clone(),
+        libav_pool.clone(),
+    );
     // Spec 028 — direct and store the effect plan of every anime subtitle
     // track, one item at a time behind the same gate.
     #[cfg(all(unix, feature = "ffmpeg-lib"))]
