@@ -1894,12 +1894,13 @@ where
         }
         if m.match_source.as_deref() == Some("search") {
             let reason = show_conflict(store, providers, bg_io, cfg, cand, m, provider).await?;
-            if let Some(reason) = reason {
+            if let Some((reason, candidates)) = reason {
                 tracing::info!(
                     series_key = %cand.series_key,
                     provider,
                     match_id = show_id,
                     reason = reason.label(),
+                    candidates = %candidates,
                     "series identity repair: re-ask"
                 );
                 survey.reask.insert(cand.series_key.clone(), reason);
@@ -2237,7 +2238,7 @@ async fn show_conflict<Tv, Tm, S>(
     cand: &SeriesMatchCandidate,
     stored: &SeriesMetadata,
     provider: &str,
-) -> DomainResult<Option<RepairReason>>
+) -> DomainResult<Option<(RepairReason, String)>>
 where
     Tv: OnlineEnricher,
     Tm: OnlineEnricher,
@@ -2253,12 +2254,12 @@ where
             .await?
             .is_empty();
     if split {
-        return Ok(Some(RepairReason::Split));
+        return Ok(Some((RepairReason::Split, String::new())));
     }
     let premiered = stored.premiere_date.and_then(pharos_store_sqlx::unix_year);
     if let (Some(stated), Some(premiered)) = (cand.series_year, premiered) {
         if stated.abs_diff(premiered) > 1 {
-            return Ok(Some(RepairReason::YearMismatch));
+            return Ok(Some((RepairReason::YearMismatch, String::new())));
         }
     }
     let decision = match provider {
@@ -2294,7 +2295,20 @@ where
     };
     Ok(decision
         .filter(needs_episode_fit)
-        .map(|_| RepairReason::ExactRival))
+        .map(|d| (RepairReason::ExactRival, exact_candidates_label(&d))))
+}
+
+/// The exact-name candidates a search tied on, as `id (year) score` joined
+/// by `, `, so a re-ask line names the rivals it saw.
+fn exact_candidates_label(decision: &MatchDecision) -> String {
+    exact_candidates(decision)
+        .iter()
+        .map(|c| match c.year {
+            Some(year) => format!("{} ({year}) {:.2}", c.id, c.score),
+            None => format!("{} (no year) {:.2}", c.id, c.score),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Key under which the album-art matcher version that produced the CURRENT
@@ -6511,6 +6525,14 @@ mod tests {
         ] {
             assert!(survey.contains(want), "{want} missing from {survey}");
         }
+        let reask = text
+            .lines()
+            .find(|l| l.contains("series identity repair: re-ask"))
+            .unwrap_or_else(|| panic!("no re-ask line in {text}"));
+        assert!(
+            reask.contains("candidates=71173 (1978) 0.85, 73545 (2003) 0.85"),
+            "exact-name candidates missing from {reask}"
+        );
         let searches = tvdb.searched();
         gate(&s, &tvdb, &MetadataConfig::default()).await;
         assert_eq!(
