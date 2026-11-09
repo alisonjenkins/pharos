@@ -4018,7 +4018,7 @@ test.describe("pharos Dioxus UI stage", () => {
   });
 
   // A video opens full-window, inside the browser window rather than in
-  // browser fullscreen (B903), and Esc shrinks it to the compact player so
+  // browser fullscreen (B905), and Esc shrinks it to the compact player so
   // the library can be browsed while it plays on (V854).
   test("a video opens full-window, and Esc shrinks it to the compact player", async ({
     page,
