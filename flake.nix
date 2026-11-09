@@ -843,7 +843,7 @@
             cp -r target/dx/pharos-ui-web/release/web/public/. $out/
             # dx preloads the JS glue as a classic script, but loads it as a
             # module; Firefox fetches it twice and warns the preload went
-            # unused. modulepreload is the matching hint (V890).
+            # unused. modulepreload is the matching hint (V895).
             sed -i 's|<link rel="preload" as="script" \(href="[^"]*\.js"\) crossorigin>|<link rel="modulepreload" \1>|g' $out/index.html
             if grep -q 'rel="preload" as="script"' $out/index.html \
               || ! grep -q 'rel="modulepreload"' $out/index.html; then
