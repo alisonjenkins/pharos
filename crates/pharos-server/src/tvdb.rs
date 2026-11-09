@@ -848,6 +848,10 @@ fn parse_episode_list(body: &str) -> Option<Vec<crate::online_enrich::EpisodeLis
                     season,
                     episode,
                     title: text_field(ep, "name"),
+                    aired: ep
+                        .get("aired")
+                        .and_then(|x| x.as_str())
+                        .and_then(pharos_core::parse_ymd_to_unix),
                 })
             })
             .collect(),
@@ -1665,7 +1669,7 @@ mod tests {
     #[tokio::test]
     async fn tvdb_episode_list_reads_every_listed_episode() {
         let body = r#"{"data":{"episodes":[
-          {"seasonNumber":1,"number":1,"name":"Pilot"},
+          {"seasonNumber":1,"number":1,"name":"Pilot","aired":"2011-04-17"},
           {"seasonNumber":1,"number":2,"name":""},
           {"seasonNumber":2,"number":1,"name":"Back"},
           {"seasonNumber":2,"name":"No number"}
@@ -1685,6 +1689,8 @@ mod tests {
             pairs,
             vec![(1, 1, Some("Pilot")), (1, 2, None), (2, 1, Some("Back"))]
         );
+        assert_eq!(got[0].aired, Some(1_302_998_400), "2011-04-17T00:00:00Z");
+        assert_eq!(got[1].aired, None);
     }
 
     #[tokio::test]
