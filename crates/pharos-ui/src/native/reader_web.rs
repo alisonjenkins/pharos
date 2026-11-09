@@ -234,7 +234,17 @@ async fn open_book(
         .map_err(|e| format!("The reader could not start: {e}"))?;
     view.on_action(on_action);
     let opened = match saved {
-        Some(at) => view.go_to(at).await,
+        Some(at) => match view.go_to(at).await {
+            Ok(()) => Ok(()),
+            // A book replaced by one with fewer sections leaves a place that
+            // is not in it; open at the start rather than never.
+            Err(e) => {
+                platform::warn(&format!(
+                    "pharos: reader saved place unusable item={id} locator={at} error={e}; opening at the start"
+                ));
+                view.open(0, Start::Beginning).await
+            }
+        },
         None => view.open(0, Start::Beginning).await,
     };
     if let Err(e) = opened {
