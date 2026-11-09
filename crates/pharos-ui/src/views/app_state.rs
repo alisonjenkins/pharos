@@ -2069,7 +2069,7 @@ async fn fetch_integrity_report(base: &str, token: &str) -> Result<IntegrityRepo
     .await;
     let status = status.map_err(describe)?;
     let files = files.map_err(describe)?;
-    let deep_checks = deep_checks.map_err(describe)?;
+    let deep_checks = deep_checks.map_err(|e| e.to_string());
     Ok(IntegrityReport {
         status,
         files,

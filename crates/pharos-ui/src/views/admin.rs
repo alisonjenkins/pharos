@@ -840,7 +840,7 @@ fn IntegritySection(
                             queued: f.recheck_pending || queued.contains(&f.media_id),
                             error: errors.iter().find(|(id, _)| *id == f.media_id).map(|(_, e)| e.clone()),
                             deep_running: deep_queued.contains(&f.media_id)
-                                || deep_in_progress(&report.deep_checks, &f.media_id),
+                                || deep_in_progress(deep_list(&report), &f.media_id),
                             deep_error: deep_errors.iter().find(|(id, _)| *id == f.media_id).map(|(_, e)| e.clone()),
                             on_action: on_action,
                         }
@@ -927,12 +927,18 @@ fn DamagedRow(
 }
 
 #[component]
-fn DeepChecksSection(checks: Vec<DeepCheck>) -> Element {
+fn DeepChecksSection(checks: Result<Vec<DeepCheck>, String>) -> Element {
+    let (checks, failure) = match checks {
+        Ok(v) => (v, None),
+        Err(e) => (Vec::new(), Some(e)),
+    };
     rsx! {
         section {
             class: "pharos-admin-integrity-deep-checks",
             h4 { "Deep checks" }
-            if checks.is_empty() {
+            if let Some(e) = failure {
+                p { class: "pharos-error", "Could not list deep checks: {e}" }
+            } else if checks.is_empty() {
                 p {
                     class: "pharos-admin-integrity-deep-empty",
                     "A deep check decodes a whole file to find damage inside the picture or sound. It takes minutes and runs one file at a time, so use it on a file that plays badly."
@@ -975,11 +981,14 @@ pub fn any_deep_active(checks: &[DeepCheck]) -> bool {
     checks.iter().any(deep_is_active)
 }
 
+/// The deep results, empty when the server could not list them.
+fn deep_list(report: &IntegrityReport) -> &[DeepCheck] {
+    report.deep_checks.as_ref().map_or(&[], Vec::as_slice)
+}
+
 /// Whether the tab should re-load itself: a deep check is waiting or decoding.
 pub fn deep_poll_wanted(report: &Result<IntegrityReport, String>) -> bool {
-    report
-        .as_ref()
-        .is_ok_and(|r| any_deep_active(&r.deep_checks))
+    report.as_ref().is_ok_and(|r| any_deep_active(deep_list(r)))
 }
 
 fn deep_is_active(c: &DeepCheck) -> bool {
@@ -1411,7 +1420,7 @@ mod tests {
         Some(Ok(IntegrityReport {
             status,
             files,
-            deep_checks: vec![],
+            deep_checks: Ok(vec![]),
         }))
     }
 
@@ -1547,7 +1556,7 @@ mod tests {
                 queued: 0,
             },
             files,
-            deep_checks,
+            deep_checks: Ok(deep_checks),
         }))
     }
 
@@ -1632,6 +1641,32 @@ mod tests {
     }
 
     #[test]
+    fn a_deep_check_fault_leaves_the_rest_of_the_tab_intact() {
+        let report = Ok(IntegrityReport {
+            status: IntegrityStatus {
+                eligible: 5,
+                checked: 5,
+                damaged: 1,
+                queued: 0,
+            },
+            files: vec![damaged("1")],
+            deep_checks: Err("this replica does not run deep checks".into()),
+        });
+        let html = render_integrity_deep(Some(report.clone()), vec![], vec![], vec![], vec![]);
+        assert!(html.contains("Checked 5 of 5 files"), "{html}");
+        assert!(
+            html.contains("File 1"),
+            "the damaged list still shows: {html}"
+        );
+        assert!(
+            html.contains("Could not list deep checks: this replica does not run deep checks"),
+            "{html}"
+        );
+        assert!(!html.contains("decodes a whole file"), "{html}");
+        assert!(!deep_poll_wanted(&report));
+    }
+
+    #[test]
     fn the_deep_checks_section_words_each_state() {
         let checks = vec![
             deep("1", "queued"),
@@ -1693,7 +1728,7 @@ mod tests {
         assert!(!any_deep_active(&[deep("1", "clean"), deep("2", "failed")]));
         let with = |s: &str| {
             Ok(IntegrityReport {
-                deep_checks: vec![deep("1", s)],
+                deep_checks: Ok(vec![deep("1", s)]),
                 ..IntegrityReport::default()
             })
         };

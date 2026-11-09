@@ -880,11 +880,23 @@ pub struct IntegrityStatus {
 }
 
 /// The integrity answers the Damaged files tab shows together.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IntegrityReport {
     pub status: IntegrityStatus,
     pub files: Vec<DamagedFile>,
-    pub deep_checks: Vec<DeepCheck>,
+    /// Its own result so a replica that cannot run deep checks still shows
+    /// the status and the damaged list.
+    pub deep_checks: Result<Vec<DeepCheck>, String>,
+}
+
+impl Default for IntegrityReport {
+    fn default() -> Self {
+        Self {
+            status: IntegrityStatus::default(),
+            files: Vec::new(),
+            deep_checks: Ok(Vec::new()),
+        }
+    }
 }
 
 pub fn parse_damaged_files_response(bytes: &[u8]) -> Result<Vec<DamagedFile>, ClientError> {
@@ -1812,7 +1824,11 @@ pub mod web {
             .await
             .map_err(|e| ClientError::Http(e.to_string()))?;
         if !resp.ok() {
-            return Err(ClientError::Status(resp.status()));
+            let status = resp.status();
+            return match resp.text().await {
+                Ok(t) if !t.trim().is_empty() => Err(ClientError::Http(t.trim().to_string())),
+                _ => Err(ClientError::Status(status)),
+            };
         }
         let bytes = resp
             .binary()
