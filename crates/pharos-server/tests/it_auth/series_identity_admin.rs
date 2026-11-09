@@ -198,7 +198,9 @@ async fn a_split_the_dry_run_holds_shows_as_pending_with_its_moves() {
                     season_number: Some(1),
                     episode_number: Some(episode),
                     series_folder: Some(folder.into()),
-                    series_year: Some(year),
+                    // Not yet written by a scan: the owner group's rows
+                    // change only their year, which is no move.
+                    series_year: None,
                     series_key: None,
                 }),
                 ..MediaItem::default()
@@ -227,7 +229,7 @@ async fn a_split_the_dry_run_holds_shows_as_pending_with_its_moves() {
         serde_json::json!([{
             "Path": moved,
             "FromKey": folder,
-            "FromYear": 2005,
+            "FromYear": null,
             "ToKey": format!("{folder}\u{1f}2005"),
             "ToYear": 2005,
         }]),
