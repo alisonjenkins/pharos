@@ -7,13 +7,14 @@ was diagnosable. It must survive the fix intact.
 ## Metric
 
 ```
-pharos_segment_detect_total{kind, outcome}
+pharos_segment_detect_total{kind, outcome, consensus}
 ```
 
 | Label | Domain | Source |
 |-------|--------|--------|
 | `kind` | `Intro` \| `Outro` | the window being analysed |
 | `outcome` | `emitted` \| `no_span` \| `few_agreeing` \| `low_confidence` | `Verdict::label()` |
+| `consensus` | `endpoints` \| `overlap` \| `none` | `Consensus::label()`, `none` unless emitted (T106, B1060) |
 
 - Incremented once per **episode per kind** per analysis pass.
 - The label set is a dashboard contract: bounded, stable, and sourced only from
@@ -29,6 +30,7 @@ segment backfill: season detection verdicts
   season=<library path>::<season>
   kind=Intro|Outro
   episodes=<n> emitted=<n> low_confidence=<n> few_agreeing=<n> no_span=<n>
+  emitted_by_overlap=<n>
   dropped="<id>:<outcome>(<matched> matched/<agreeing> agreeing/conf <x.xx>) …"
 ```
 
