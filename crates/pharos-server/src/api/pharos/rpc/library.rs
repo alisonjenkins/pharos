@@ -22,6 +22,7 @@ use crate::services::library::{
 };
 use crate::services::person::{self, PersonError};
 use crate::services::search::Hit;
+use crate::services::user_data::FolderMarks;
 use crate::services::{lyrics, mix, segments, watch};
 use crate::state::AppState;
 
@@ -443,14 +444,15 @@ impl server::library::Handler for Library {
             synth @ WireId::Synth(_) => {
                 match synth_detail(state, &user, synth, "detail").await {
                     Ok(dto) => {
-                        let played = synth_played(state, &user, synth, &dto).await;
+                        let marks = synth_marks(state, &user, synth, &dto).await;
                         let cast = synth_cast(state, synth, &dto).await;
                         let mut out = results.get().init_result().init_detail();
                         write_synth_detail(out.reborrow(), synth, &dto, &state.image_tag_key);
                         write_cast(out.reborrow().init_cast(len(&cast)), &cast);
-                        if played {
+                        if marks != FolderMarks::default() {
                             let data = UserItemData {
-                                played,
+                                played: marks.played,
+                                is_favorite: marks.favorite,
                                 ..UserItemData::default()
                             };
                             write_user_state(out.get_summary()?.init_user_state(), data);
@@ -1307,23 +1309,24 @@ async fn synth_detail(
     }
 }
 
-/// Whether `user` has watched all of synthesised series or season `id`;
-/// false for any other kind. A store that cannot say leaves it unwatched:
-/// the page still opens, and marking it is still offered.
-async fn synth_played(
+/// What `user` has marked on synthesised series or season `id`: watched
+/// once every episode is, a favourite while every episode is (B1080);
+/// neither for any other kind. A store that cannot say leaves both off: the
+/// page still opens, and marking it is still offered.
+async fn synth_marks(
     state: &AppState,
     user: &pharos_core::User,
     id: WireId,
     dto: &serde_json::Value,
-) -> bool {
+) -> FolderMarks {
     if !matches!(synth_kind(dto), Kind::Series | Kind::Season) {
-        return false;
+        return FolderMarks::default();
     }
-    crate::services::user_data::folder_played(state, user, &id.to_string())
+    crate::services::user_data::folder_marks(state, user, &id.to_string())
         .await
         .unwrap_or_else(|e| {
-            tracing::warn!(item.id = %id, error = ?e, "detail: watched state unavailable");
-            false
+            tracing::warn!(item.id = %id, error = ?e, "detail: watched and favourite state unavailable");
+            FolderMarks::default()
         })
 }
 

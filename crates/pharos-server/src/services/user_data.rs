@@ -193,12 +193,18 @@ pub async fn folder_items(
     Ok(items)
 }
 
-/// Whether `user` has played every item under synthesised series or season
-/// `id` that they may see; false when they may see none.
-pub async fn folder_played(state: &AppState, user: &User, id: &str) -> Result<bool, DetailError> {
+/// What `user` has marked on synthesised series or season `id`, from one
+/// bulk read: played once they have played every item under it they may
+/// see, a favourite while every one is a favourite (marking the folder marks
+/// each, B1080). Both false when they may see none.
+pub async fn folder_marks(
+    state: &AppState,
+    user: &User,
+    id: &str,
+) -> Result<FolderMarks, DetailError> {
     let items = folder_items(state, user, id).await?;
     if items.is_empty() {
-        return Ok(false);
+        return Ok(FolderMarks::default());
     }
     let ids: Vec<_> = items.iter().map(|i| i.id).collect();
     let data = state
@@ -206,7 +212,26 @@ pub async fn folder_played(state: &AppState, user: &User, id: &str) -> Result<bo
         .user_data_bulk(user.id, &ids)
         .await
         .map_err(DetailError::Store)?;
-    Ok(data.iter().all(|d| d.played))
+    Ok(FolderMarks::of(&data))
+}
+
+/// A series or season's marks, as [`folder_marks`] answers them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FolderMarks {
+    pub played: bool,
+    pub favorite: bool,
+}
+
+impl FolderMarks {
+    /// The marks of a folder holding items with `data`: each true only
+    /// when every item has it, so an empty folder has neither.
+    pub fn of(data: &[UserItemData]) -> Self {
+        let all = |f: fn(&UserItemData) -> bool| !data.is_empty() && data.iter().all(f);
+        Self {
+            played: all(|d| d.played),
+            favorite: all(|d| d.is_favorite),
+        }
+    }
 }
 
 /// Applies `change` to `user`'s state on every item under synthesised
@@ -285,6 +310,36 @@ async fn write_one(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A folder is watched, or a favourite, only when every item in it is
+    /// (B1080); an empty one is neither.
+    #[test]
+    fn folder_marks_need_every_item() {
+        let item = |played, is_favorite| UserItemData {
+            played,
+            is_favorite,
+            ..UserItemData::default()
+        };
+        assert_eq!(FolderMarks::of(&[]), FolderMarks::default());
+        assert_eq!(
+            FolderMarks::of(&[item(true, true), item(true, true)]),
+            FolderMarks {
+                played: true,
+                favorite: true
+            }
+        );
+        assert_eq!(
+            FolderMarks::of(&[item(true, true), item(false, false)]),
+            FolderMarks::default()
+        );
+        assert_eq!(
+            FolderMarks::of(&[item(true, false), item(true, true)]),
+            FolderMarks {
+                played: true,
+                favorite: false
+            }
+        );
+    }
 
     /// Writes to different items do not wait on each other, and a lock
     /// nobody holds is forgotten.
