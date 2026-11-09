@@ -24,7 +24,7 @@
 
 use crate::bg_io::BgPermit;
 use pharos_core::MediaItem;
-use pharos_transcode::deep_check::{decode_check, DeepReport};
+use pharos_transcode::deep_check::{decode_check, DeepError, DeepReport};
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -171,7 +171,10 @@ impl DeepChecks {
         let started = Instant::now();
         let outcome = decode_check(&self.ffmpeg, &path, DECODE_TIMEOUT).await;
         let elapsed = started.elapsed();
-        metrics::histogram!("pharos_media_deep_check_seconds").record(elapsed.as_secs_f64());
+        // Decode time only: a spawn failure decoded nothing.
+        if !matches!(outcome, Err(DeepError::Spawn { .. })) {
+            metrics::histogram!("pharos_media_deep_check_seconds").record(elapsed.as_secs_f64());
+        }
         let (state, report, detail) = match outcome {
             Ok(r) if r.is_damaged() => (DeepState::Damaged, r, None),
             Ok(r) => (DeepState::Clean, r, None),
@@ -332,28 +335,42 @@ mod tests {
         drop(hold);
     }
 
-    #[test]
-    fn a_finished_check_is_counted_by_outcome() {
+    /// `run` itself emits the outcome counter, and no decode-time sample
+    /// when ffmpeg never started.
+    #[tokio::test]
+    async fn a_finished_check_is_counted_by_outcome() {
         use metrics_util::debugging::DebuggingRecorder;
         let recorder = DebuggingRecorder::new();
         let snapshotter = pharos_test_metrics::snapshotter(&recorder);
         let _guard = metrics::set_default_local_recorder(&recorder);
-        count_outcome(DeepState::Damaged);
-        count_outcome(DeepState::Failed);
-        let seen: Vec<String> = snapshotter
+        let checks = DeepChecks::new("/nonexistent/ffmpeg", Arc::new(Semaphore::new(4)));
+        checks.run(1, PathBuf::from("/x.mkv")).await;
+        let names: Vec<(String, Option<String>)> = snapshotter
             .snapshot()
             .into_vec()
             .into_iter()
-            .filter(|(k, ..)| k.key().name() == "pharos_media_deep_check_total")
-            .filter_map(|(k, ..)| {
-                k.key()
+            .map(|(k, ..)| {
+                let outcome = k
+                    .key()
                     .labels()
                     .find(|l| l.key() == "outcome")
-                    .map(|l| l.value().to_string())
+                    .map(|l| l.value().to_string());
+                (k.key().name().to_string(), outcome)
             })
             .collect();
-        assert!(seen.contains(&"damaged".to_string()), "{seen:?}");
-        assert!(seen.contains(&"failed".to_string()), "{seen:?}");
+        assert!(
+            names.contains(&(
+                "pharos_media_deep_check_total".to_string(),
+                Some("failed".to_string())
+            )),
+            "{names:?}"
+        );
+        assert!(
+            !names
+                .iter()
+                .any(|(n, _)| n == "pharos_media_deep_check_seconds"),
+            "a spawn failure decoded nothing: {names:?}"
+        );
     }
 
     /// Finished results past the cap are dropped oldest first.
