@@ -270,6 +270,9 @@ pub struct AppState {
     /// a library refresh stay buffered; slow consumers see a Lagged
     /// signal which `socket.rs` translates into "drop + re-subscribe".
     pub bus: broadcast::Sender<SocketBroadcast>,
+    /// Per-user event streams for the native API's `Events.subscribe`, fed
+    /// from [`Self::bus`] once someone subscribes (ADR-0094).
+    pub events: Arc<crate::services::events::EventLog>,
     /// 009 — what the cast service knows, so configured TVs can be listed as
     /// sessions. `None` (the default) keeps `/Sessions` exactly as it was.
     pub cast_directory: Option<Arc<dyn crate::cast_sessions::CastDirectory>>,
@@ -783,6 +786,7 @@ impl AppState {
             server_name,
             version: env!("CARGO_PKG_VERSION"),
             bus,
+            events: Arc::default(),
             cast_directory: None,
             cast: crate::cast_service::CastRuntime::inert(),
             sync: crate::group_ops::SyncRuntime::default(),
@@ -914,6 +918,7 @@ impl AppState {
             server_name,
             version: env!("CARGO_PKG_VERSION"),
             bus,
+            events: Arc::default(),
             cast_directory: None,
             cast: crate::cast_service::CastRuntime::inert(),
             sync: crate::group_ops::SyncRuntime::default(),
