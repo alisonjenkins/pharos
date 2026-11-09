@@ -11,6 +11,7 @@ be held twice as well: `Heat (1995)/Heat (1995) Bluray-1080p.mkv` beside
 `Heat (1995) [720p]/Heat (1995) HDTV-720p.mkv`, each listed as its own film
 with its own watched state. Alison asked that the pattern carry to all media
 pharos manages, with the best quality copy played by default.
+
 ## Decision
 
 A video file (`mkv`, `mp4`, `mov`, `avi`, `webm`, `m4v`) that is not an
