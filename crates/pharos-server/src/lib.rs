@@ -15,6 +15,7 @@ pub mod cast_sessions;
 pub mod child_memory;
 pub mod cli;
 pub mod client_ip;
+pub mod client_reports;
 pub mod config;
 pub mod dlna;
 pub(crate) mod episode_fit;
