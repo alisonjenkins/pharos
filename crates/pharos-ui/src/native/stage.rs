@@ -8,7 +8,7 @@
 use dioxus::prelude::*;
 use pharos_client::api::{ItemKind, ItemRef};
 
-use super::listen::{Icon, ICON_FLOAT, ICON_PIP};
+use super::listen::{Icon, ICON_FLOAT, ICON_PIP, ICON_QUEUE_NEXT, QUEUE_PANEL_ID};
 use super::platform;
 use super::playback::MediaState;
 use super::route::Route;
@@ -483,6 +483,16 @@ pub enum StageAction {
     Place(Spot),
     /// Remember where the floating window is (a drag or key move ended).
     Keep,
+    /// Dock or undock the queue beside the compact player (B896/V845).
+    Queue,
+}
+
+/// The compact player's queue button: how many songs wait, and whether the
+/// docked queue is open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueueButton {
+    pub count: usize,
+    pub open: bool,
 }
 
 /// A drag in progress: where the pointer and the window started.
@@ -513,6 +523,9 @@ pub fn StageBar(
     /// (B815).
     #[props(default)]
     live_position: Option<Signal<u64>>,
+    /// Music's queue button (B896/V845); none for a video.
+    #[props(default)]
+    queue: Option<QueueButton>,
 ) -> Element {
     let media = MediaState {
         position_ms: live_position.map_or(media.position_ms, |s| s()),
@@ -633,6 +646,24 @@ pub fn StageBar(
                         Icon { path: ICON_NEXT }
                     }
                 }
+                if let Some(q) = queue {
+                    div { class: "pharos-stage-extra",
+                        button {
+                            class: "pharos-stage-button pharos-stage-queue",
+                            r#type: "button",
+                            "data-key-action": "queue",
+                            aria_label: queue_label(q.count),
+                            title: "Show or hide what plays next",
+                            aria_pressed: if q.open { "true" } else { "false" },
+                            aria_controls: q.open.then_some(QUEUE_PANEL_ID),
+                            onclick: move |_| on_action.call(StageAction::Queue),
+                            Icon { path: ICON_QUEUE_NEXT }
+                            if q.count > 0 {
+                                span { class: "pharos-queue-count", aria_hidden: "true", "{q.count}" }
+                            }
+                        }
+                    }
+                }
                 if pip {
                     div { class: "pharos-stage-extra",
                         button {
@@ -690,6 +721,16 @@ pub fn StageBar(
                 span { style: "width: {played:.2}%" }
             }
         }
+    }
+}
+
+/// The queue button's name, with how many songs wait so a screen reader
+/// hears the count the badge shows.
+pub fn queue_label(count: usize) -> String {
+    match count {
+        0 => "Queue".to_owned(),
+        1 => "Queue, 1 song".to_owned(),
+        n => format!("Queue, {n} songs"),
     }
 }
 
@@ -1081,5 +1122,68 @@ mod tests {
         let again = stage.key();
         stage.follow(&Route::Watch(ItemRef::Real(7)));
         assert_eq!(stage.key(), again, "the same route mounts nothing new");
+    }
+
+    fn bar(queue: Option<QueueButton>) -> String {
+        let mut dom = VirtualDom::new_with_props(
+            move |()| {
+                use_context_provider(|| StageCtx(Signal::new(Stage::default())));
+                rsx! {
+                    StageBar {
+                        view: View::Mini,
+                        title: "Teardrop".to_owned(),
+                        image: None,
+                        media: MediaState::default(),
+                        runtime_ms: 330_000,
+                        pip: false,
+                        previous: None,
+                        next: None,
+                        error: None,
+                        on_action: |_| {},
+                        queue,
+                    }
+                }
+            },
+            (),
+        );
+        dom.rebuild_in_place();
+        dioxus_ssr::render(&dom)
+    }
+
+    /// B896/V845: music's mini bar has a queue button that counts what
+    /// waits and says whether the docked queue is open; a video's has none.
+    #[test]
+    fn the_mini_bar_offers_the_queue_for_music_only() {
+        assert!(!bar(None).contains("pharos-stage-queue"));
+        let closed = bar(Some(QueueButton {
+            count: 3,
+            open: false,
+        }));
+        assert!(
+            closed.contains(r#"aria-label="Queue, 3 songs""#),
+            "{closed}"
+        );
+        assert!(closed.contains(r#"aria-pressed="false""#), "{closed}");
+        assert!(
+            !closed.contains("aria-controls"),
+            "no panel to point at: {closed}"
+        );
+        let open = bar(Some(QueueButton {
+            count: 0,
+            open: true,
+        }));
+        assert!(open.contains(r#"aria-label="Queue""#), "{open}");
+        assert!(open.contains(r#"aria-controls="pharos-queue""#), "{open}");
+        assert!(
+            !open.contains("pharos-queue-count"),
+            "no badge for none: {open}"
+        );
+    }
+
+    #[test]
+    fn the_queue_button_names_its_count() {
+        assert_eq!(queue_label(0), "Queue");
+        assert_eq!(queue_label(1), "Queue, 1 song");
+        assert_eq!(queue_label(12), "Queue, 12 songs");
     }
 }

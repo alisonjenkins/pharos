@@ -4418,6 +4418,52 @@ body:has(.pharos-stage.is-mini) .pharos-main {
   flex: 1;
   min-width: 0;
 }
+/* The queue docked beside the compact player (B896/V845): a panel on the
+   right, above the mini bar or along the right edge beside the floating
+   window, so what plays next shows on every page. */
+.pharos-queue-dock {
+  position: fixed;
+  z-index: 21;
+  right: 1rem;
+  bottom: calc(4rem + 0.75rem);
+  display: flex;
+  width: min(22rem, calc(100vw - 2rem));
+  max-height: min(32rem, calc(100vh - 9rem));
+}
+.pharos-queue-dock[data-view="floating"] {
+  bottom: auto;
+  top: 4.5rem;
+}
+.pharos-queue-dock .pharos-queue {
+  position: relative;
+  top: auto;
+  right: auto;
+  width: 100%;
+  max-height: 100%;
+}
+/* Over a page rather than the visualiser: an opaque card, so the songs
+   read over posters. */
+.pharos-queue-dock .pharos-queue::before {
+  background: var(--px-color-surface-raised);
+  border: var(--px-border) solid var(--px-color-border);
+  box-shadow: 0 0.75rem 2rem color-mix(in srgb, var(--px-color-bg) 70%, transparent);
+}
+.pharos-stage-queue {
+  position: relative;
+}
+.pharos-stage-queue .pharos-queue-count {
+  position: absolute;
+  top: 0;
+  right: 0;
+  min-width: 1rem;
+  padding: 0 0.2rem;
+  border-radius: 999px;
+  background: var(--px-color-accent);
+  color: var(--px-color-accent-fg);
+  font-size: 0.65rem;
+  line-height: 1rem;
+  text-align: center;
+}
 .pharos-stage-bar {
   display: flex;
   flex-direction: column;

@@ -25,7 +25,7 @@ use super::diagnostics;
 use super::find::{self, Find, DEBOUNCE_MS, RESULT_LIMIT};
 use super::group_app::{Together, VideoPlayer};
 use super::group_session::{GroupPlayer, GroupView, Ui};
-use super::listen::ListenView;
+use super::listen::{ListenView, QueuePanel};
 use super::machine::{Event, Machine, Phase};
 use super::mixes::{self, ActiveMix, MixCtx};
 use super::palette::{self, Row};
@@ -54,7 +54,8 @@ use super::seen::{self, MemberSeen};
 use super::settings::{Section, SettingsLayout};
 use super::show_tracks;
 use super::stage::{
-    Handoff, Stage, StageAction, StageBar, StageClose, StageCtx, StageGrip, View, STAGE_ID,
+    Handoff, QueueButton, Stage, StageAction, StageBar, StageClose, StageCtx, StageGrip, View,
+    STAGE_ID,
 };
 use super::subtitles::{track_mode, FallbackReason, RustState, TrackMode};
 use super::together::{
@@ -5539,6 +5540,34 @@ fn Player(
         }
     };
     let compact = view != View::Full;
+    // The queue docked beside the compact player (B896/V845). Stored, so a
+    // song that mounts a new player keeps it open.
+    let mut dock = use_signal(super::listen::dock_shown);
+    let on_queue = EventHandler::new(move |action: QueueAction| {
+        // In a group the group picks the song.
+        if matches!(action, QueueAction::Play(_)) && !queued {
+            platform::info("pharos: queue action=play refused reason=group");
+            return;
+        }
+        let play = match action {
+            QueueAction::Play(key) => queue
+                .peek()
+                .upcoming()
+                .iter()
+                .find(|e| e.key == key)
+                .map(|e| e.id),
+            _ => None,
+        };
+        queue.write().apply(action, seed());
+        platform::info(&format!(
+            "pharos: queue action={} upcoming={}",
+            action.label(),
+            queue.peek().upcoming().len()
+        ));
+        if let Some(id) = play {
+            go(id);
+        }
+    });
     let on_action = {
         let mut on_control = on_control.clone();
         move |action: StageAction| {
@@ -5567,6 +5596,16 @@ fn Player(
                 }
                 StageAction::Place(to) => stage.write().place(to),
                 StageAction::Keep => stage.peek().keep_spot(),
+                StageAction::Queue => {
+                    let open = !*dock.peek();
+                    dock.set(open);
+                    super::listen::store_dock(open);
+                    platform::info(&format!(
+                        "pharos: stage queue shown={open} view={} upcoming={}",
+                        view.label(),
+                        queue.peek().upcoming().len()
+                    ));
+                }
             }
         }
     };
@@ -5621,6 +5660,21 @@ fn Player(
                 next,
                 error: failed().map(|f| f.line()).or_else(|| group.ended.clone()),
                 on_action,
+                queue: audio.then(|| QueueButton {
+                    count: queue.read().upcoming().len(),
+                    open: dock(),
+                }),
+            }
+            // Only the playing slot's: a song handing over shows one queue.
+            if audio && dock() && matches!(slot, Slot::Current { .. }) {
+                div { class: "pharos-queue-dock", "data-view": view.label(),
+                    QueuePanel {
+                        queue: queue.read().upcoming().to_vec(),
+                        shuffled: queue.read().shuffled(),
+                        on_queue,
+                        playing: queued.then_some(playing_id),
+                    }
+                }
             }
         } else {
             if let Some(failure) = failed() {
@@ -5672,28 +5726,7 @@ fn Player(
                 playing: queued.then_some(playing_id),
                 queue: queue.read().upcoming().to_vec(),
                 shuffled: queue.read().shuffled(),
-                on_queue: move |action: QueueAction| {
-                    // In a group the group picks the song.
-                    if matches!(action, QueueAction::Play(_)) && !queued {
-                        platform::info("pharos: queue action=play refused reason=group");
-                        return;
-                    }
-                    let play = match action {
-                        QueueAction::Play(key) => {
-                            queue.peek().upcoming().iter().find(|e| e.key == key).map(|e| e.id)
-                        }
-                        _ => None,
-                    };
-                    queue.write().apply(action, seed());
-                    platform::info(&format!(
-                        "pharos: queue action={} upcoming={}",
-                        action.label(),
-                        queue.peek().upcoming().len()
-                    ));
-                    if let Some(id) = play {
-                        go(id);
-                    }
-                },
+                on_queue,
                 on_media,
                 on_control,
             }
