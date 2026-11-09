@@ -60,6 +60,23 @@ const QUEUE_KEY: &str = "pharos.listen.queue";
 const QUEUE_SHOWN: &str = "shown";
 pub const QUEUE_PANEL_ID: &str = "pharos-queue";
 
+/// Device-local: whether the listener docked the queue beside the mini bar
+/// or floating window (B896/V845). It starts closed, so the page keeps the
+/// room.
+const DOCK_KEY: &str = "pharos.stage.queue";
+
+/// Whether the queue is docked beside the compact player on this device.
+pub fn dock_shown() -> bool {
+    platform::stored_theme(DOCK_KEY).ok().flatten().as_deref() == Some(QUEUE_SHOWN)
+}
+
+/// Remember whether the queue is docked beside the compact player.
+pub fn store_dock(shown: bool) {
+    if let Err(e) = platform::store_theme(DOCK_KEY, if shown { QUEUE_SHOWN } else { "hidden" }) {
+        platform::warn(&format!("pharos: docked queue choice not stored error={e}"));
+    }
+}
+
 /// The analyser on this screen's media element. Web Audio routes an element
 /// once, so it outlives style changes and is shared with each visualiser.
 #[derive(Clone, Default)]
@@ -165,6 +182,10 @@ pub fn ListenView(
     /// screen is out of sight, so it draws no visualiser.
     #[props(default)]
     compact: bool,
+    /// This screen's slot is the one in sight. A song handing over mounts
+    /// two screens; only the one in sight draws the queue panel (V845).
+    #[props(default = true)]
+    in_sight: bool,
     /// The `<audio>` element's id: [`VIDEO_ID`], or another while this song
     /// hands over to the next.
     #[props(default = VIDEO_ID)]
@@ -336,7 +357,7 @@ pub fn ListenView(
                         r#type: "button",
                         title: "Show or hide what plays next",
                         aria_pressed: if show_queue() { "true" } else { "false" },
-                        aria_controls: show_queue().then_some(QUEUE_PANEL_ID),
+                        aria_controls: (show_queue() && !compact && in_sight).then_some(QUEUE_PANEL_ID),
                         onclick: move |_| toggle_queue(),
                         Icon { path: ICON_QUEUE_NEXT }
                         "Queue"
@@ -361,7 +382,9 @@ pub fn ListenView(
                     karaoke: karaoke(),
                 }
             }
-            if show_queue() {
+            // Not while the screen is out of sight: the compact player docks
+            // its own (B896/V845), and two panels would share element ids.
+            if show_queue() && !compact && in_sight {
                 QueuePanel { queue: queue.clone(), shuffled, on_queue, playing }
             }
             div { class: "pharos-listen-body",
@@ -530,7 +553,7 @@ const CLEAR_NOTE_ID: &str = "pharos-queue-clear-note";
 /// skip to it, drag a row (or use its arrows) to move it, shuffle, remove
 /// or clear.
 #[component]
-fn QueuePanel(
+pub(super) fn QueuePanel(
     queue: Vec<Entry>,
     shuffled: bool,
     on_queue: EventHandler<QueueAction>,

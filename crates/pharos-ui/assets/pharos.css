@@ -4418,6 +4418,64 @@ body:has(.pharos-stage.is-mini) .pharos-main {
   flex: 1;
   min-width: 0;
 }
+/* The queue docked beside the compact player (B896/V845): a panel on the
+   right, above the mini bar or along the right edge beside the floating
+   window, so what plays next shows on every page. */
+.pharos-queue-dock {
+  position: fixed;
+  z-index: 21;
+  right: 1rem;
+  bottom: calc(4rem + 0.75rem);
+  display: flex;
+  width: min(22rem, calc(100vw - 2rem));
+  max-height: min(32rem, calc(100vh - 9rem));
+}
+.pharos-queue-dock[data-view="floating"] {
+  bottom: auto;
+  top: 4.5rem;
+}
+/* Beside a window in the lower half, the dock keeps to the bottom too, so
+   it leaves the page's navigation along the top clear. */
+.pharos-queue-dock[data-view="floating"][data-edge="bottom"] {
+  top: auto;
+  bottom: 1rem;
+}
+/* The floating window is on the right: the dock takes the left, so it
+   never covers the window or its Queue button. */
+.pharos-queue-dock[data-side="left"] {
+  right: auto;
+  left: 1rem;
+}
+.pharos-queue-dock .pharos-queue {
+  position: relative;
+  top: auto;
+  right: auto;
+  width: 100%;
+  max-height: 100%;
+}
+/* Over a page rather than the visualiser: an opaque card, so the songs
+   read over posters. */
+.pharos-queue-dock .pharos-queue::before {
+  background: var(--px-color-surface-raised);
+  border: var(--px-border) solid var(--px-color-border);
+  box-shadow: 0 0.75rem 2rem color-mix(in srgb, var(--px-color-bg) 70%, transparent);
+}
+.pharos-stage-queue {
+  position: relative;
+}
+.pharos-stage-queue .pharos-queue-count {
+  position: absolute;
+  top: 0;
+  right: 0;
+  min-width: 1rem;
+  padding: 0 0.2rem;
+  border-radius: 999px;
+  background: var(--px-color-accent);
+  color: var(--px-color-accent-fg);
+  font-size: 0.65rem;
+  line-height: 1rem;
+  text-align: center;
+}
 .pharos-stage-bar {
   display: flex;
   flex-direction: column;
@@ -4581,6 +4639,16 @@ body:has(.pharos-stage.is-mini) .pharos-main {
   }
   .pharos-stage.is-mini .pharos-stage-transport [aria-label="Previous"],
   .pharos-stage.is-floating .pharos-stage-transport [aria-label="Previous"] {
+    display: none;
+  }
+}
+/* The floating window sizes its own strip: resized narrow on a wide screen
+   (down to 240px), the queue button pushed Close out of the window (B896). */
+.pharos-stage.is-floating {
+  container: pharos-stage / inline-size;
+}
+@container pharos-stage (max-width: 21rem) {
+  .pharos-stage-transport [aria-label="Previous"] {
     display: none;
   }
 }
