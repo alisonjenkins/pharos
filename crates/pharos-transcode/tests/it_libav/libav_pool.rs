@@ -258,3 +258,185 @@ async fn pool_extracts_image_subtitles_across_the_worker_boundary() {
     assert!(out.join("manifest.json").is_file());
     assert!(out.join("0.png").is_file() && out.join("1.png").is_file());
 }
+
+/// Resident memory a pooled worker keeps after heavy ops. Measurement only:
+/// `PHAROS_BENCH_CLIP=<video> cargo nextest run --release --run-ignored only
+/// -E 'test(bench_worker_rss_after_heavy_ops)' --no-capture`.
+#[tokio::test]
+#[ignore = "benchmark"]
+async fn bench_worker_rss_after_heavy_ops() {
+    let Some(clip) = std::env::var_os("PHAROS_BENCH_CLIP").map(PathBuf::from) else {
+        return;
+    };
+    let bin = std::env::var_os("PHAROS_BENCH_WORKER").map_or_else(worker_bin, PathBuf::from);
+    let dir = tempfile::tempdir().unwrap();
+    let pool = LibavWorkerPool::new(bin, 1);
+    let worker_kib = |field: &str| -> u64 {
+        let me = std::process::id().to_string();
+        for e in std::fs::read_dir("/proc").unwrap().flatten() {
+            let stat = std::fs::read_to_string(e.path().join("stat")).unwrap_or_default();
+            let after = stat.rsplit_once(") ").map_or("", |(_, r)| r);
+            if after.split(' ').nth(1) == Some(me.as_str()) && stat.contains("(transcode-worke") {
+                let roll = std::fs::read_to_string(e.path().join("smaps_rollup")).unwrap();
+                return roll
+                    .lines()
+                    .find(|l| l.starts_with(field))
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .and_then(|v| v.parse().ok())
+                    .unwrap();
+            }
+        }
+        0
+    };
+    let idle_s: u64 = std::env::var("PHAROS_BENCH_IDLE_S")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2);
+    pool.probe(&clip).await.unwrap();
+    println!(
+        "BENCH after-first-probe anon_kib {}",
+        worker_kib("Anonymous:")
+    );
+    tokio::time::sleep(Duration::from_secs(idle_s)).await;
+    println!(
+        "BENCH probe-only+idle anon_kib {}",
+        worker_kib("Anonymous:")
+    );
+    for round in 0..4 {
+        let mut times = Vec::new();
+        let t = std::time::Instant::now();
+        pool.probe(&clip).await.unwrap();
+        times.push(("probe", t.elapsed()));
+        let t = std::time::Instant::now();
+        let out = dir.path().join(format!("img{round}.jpg"));
+        pool.extract_image(&clip, Some(30_000), 640, 3, &out)
+            .await
+            .unwrap();
+        times.push(("image", t.elapsed()));
+        let t = std::time::Instant::now();
+        let tdir = dir.path().join(format!("tp{round}"));
+        std::fs::create_dir_all(&tdir).unwrap();
+        pool.trickplay(&clip, 10_000, 320, 10, 18, 1, 5, &tdir)
+            .await
+            .unwrap();
+        times.push(("trickplay", t.elapsed()));
+        let t = std::time::Instant::now();
+        pool.audio_features(&clip, 30_000, 30_000).await.unwrap();
+        times.push(("audio_features", t.elapsed()));
+        let t = std::time::Instant::now();
+        pool.fingerprint(&clip, 0, 120_000).await.unwrap();
+        times.push(("fingerprint", t.elapsed()));
+        let t = std::time::Instant::now();
+        pool.waveform(&clip, 4800, 1000).await.unwrap();
+        times.push(("waveform", t.elapsed()));
+        tokio::time::sleep(Duration::from_secs(idle_s)).await;
+        let ms: Vec<String> = times
+            .iter()
+            .map(|(n, d)| format!("{n}={:.1}", d.as_secs_f64() * 1e3))
+            .collect();
+        println!(
+            "BENCH round {round} anon_kib {} rss_kib {} ms {}",
+            worker_kib("Anonymous:"),
+            worker_kib("Rss:"),
+            ms.join(" ")
+        );
+    }
+    let mut probe = Vec::new();
+    let mut image = Vec::new();
+    for i in 0..30 {
+        let t = std::time::Instant::now();
+        pool.probe(&clip).await.unwrap();
+        probe.push(t.elapsed());
+        let t = std::time::Instant::now();
+        let out = dir.path().join(format!("burst{i}.jpg"));
+        pool.extract_image(&clip, Some(30_000), 640, 3, &out)
+            .await
+            .unwrap();
+        image.push(t.elapsed());
+    }
+    probe.sort();
+    image.sort();
+    println!(
+        "BENCH burst p50 probe {:?} image {:?}; anon_kib now {}",
+        probe[15],
+        image[15],
+        worker_kib("Anonymous:")
+    );
+    let mut tp = Vec::new();
+    let mut fp = Vec::new();
+    for i in 0..10 {
+        let tdir = dir.path().join(format!("tpb{i}"));
+        std::fs::create_dir_all(&tdir).unwrap();
+        let t = std::time::Instant::now();
+        pool.trickplay(&clip, 10_000, 320, 10, 18, 1, 5, &tdir)
+            .await
+            .unwrap();
+        tp.push(t.elapsed());
+        let t = std::time::Instant::now();
+        pool.fingerprint(&clip, 0, 120_000).await.unwrap();
+        fp.push(t.elapsed());
+    }
+    tp.sort();
+    fp.sort();
+    println!(
+        "BENCH heavy p50 trickplay {:?} fingerprint {:?}",
+        tp[5], fp[5]
+    );
+    tokio::time::sleep(Duration::from_secs(idle_s)).await;
+    println!("BENCH burst+idle anon_kib {}", worker_kib("Anonymous:"));
+}
+
+/// Cold-start cost of a resident worker: first op on a fresh pool (spawn +
+/// handshake + libav init + op) against the same op on the warm worker.
+/// Measurement only; run with `--run-ignored only --no-capture` in release.
+#[tokio::test]
+#[ignore = "benchmark"]
+async fn bench_cold_vs_warm_worker() {
+    if !ffmpeg_available() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let clip = dir.path().join("clip.webm");
+    synth_fixture(&clip);
+    let mut cold_probe = Vec::new();
+    let mut warm_probe = Vec::new();
+    let mut cold_img = Vec::new();
+    let mut warm_img = Vec::new();
+    for i in 0..20 {
+        let pool = LibavWorkerPool::new(worker_bin(), 1);
+        let t = std::time::Instant::now();
+        pool.probe(&clip).await.unwrap();
+        cold_probe.push(t.elapsed());
+        let t = std::time::Instant::now();
+        pool.probe(&clip).await.unwrap();
+        warm_probe.push(t.elapsed());
+        drop(pool);
+        let pool = LibavWorkerPool::new(worker_bin(), 1);
+        let out = dir.path().join(format!("a{i}.jpg"));
+        let t = std::time::Instant::now();
+        pool.extract_image(&clip, Some(500), 320, 3, &out)
+            .await
+            .unwrap();
+        cold_img.push(t.elapsed());
+        let out = dir.path().join(format!("b{i}.jpg"));
+        let t = std::time::Instant::now();
+        pool.extract_image(&clip, Some(500), 320, 3, &out)
+            .await
+            .unwrap();
+        warm_img.push(t.elapsed());
+    }
+    let med = |v: &mut Vec<Duration>| {
+        v.sort();
+        (v[v.len() / 2], v[v.len() * 9 / 10])
+    };
+    println!(
+        "BENCH probe cold p50/p90 {:?} warm {:?}",
+        med(&mut cold_probe),
+        med(&mut warm_probe)
+    );
+    println!(
+        "BENCH image cold p50/p90 {:?} warm {:?}",
+        med(&mut cold_img),
+        med(&mut warm_img)
+    );
+}
