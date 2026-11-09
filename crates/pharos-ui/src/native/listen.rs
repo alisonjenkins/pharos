@@ -558,15 +558,24 @@ pub(super) fn QueuePanel(
     shuffled: bool,
     on_queue: EventHandler<QueueAction>,
     #[props(default)] playing: Option<ItemRef>,
+    /// The video queue's panel (V853): it counts videos and has no mix.
+    #[props(default)]
+    videos: bool,
+    /// Escape outside the Clear confirm, for a panel that closes on it (the
+    /// video player's). The panel stops the key going further up, so its
+    /// holder cannot hear it itself.
+    #[props(default)]
+    on_escape: Option<EventHandler<()>>,
 ) -> Element {
     // The row being dragged, by key, and the position it would drop at.
     let mut dragging = use_signal(|| None::<u64>);
     let mut over = use_signal(|| None::<usize>);
     let total = queue.len();
+    let noun = if videos { "video" } else { "song" };
     let count = match total {
         0 => String::new(),
-        1 => "1 song".to_owned(),
-        n => format!("{n} songs"),
+        1 => format!("1 {noun}"),
+        n => format!("{n} {noun}s"),
     };
     let mut end_drag = move || {
         dragging.set(None);
@@ -635,6 +644,12 @@ pub(super) fn QueuePanel(
                     evt.prevent_default();
                     evt.stop_propagation();
                     cancel();
+                } else if key == Key::Named(NamedKey::Escape) && !platform::escape_claimed() {
+                    // The key help and fullscreen take Escape first.
+                    if let Some(on_escape) = on_escape {
+                        evt.prevent_default();
+                        on_escape.call(());
+                    }
                 }
             },
             div { class: "pharos-queue-head",
@@ -662,7 +677,9 @@ pub(super) fn QueuePanel(
                     }
                 }
             }
-            MixBar { playing }
+            if !videos {
+                MixBar { playing }
+            }
             if asking {
                 div {
                     class: "pharos-queue-confirm",
@@ -693,7 +710,11 @@ pub(super) fn QueuePanel(
             }
             if queue.is_empty() {
                 p { class: "pharos-muted pharos-queue-empty",
-                    "Nothing queued. Use Play next or Add to queue on any song or album."
+                    if videos {
+                        "Nothing queued. Use Play next or Add to queue on any film or episode."
+                    } else {
+                        "Nothing queued. Use Play next or Add to queue on any song or album."
+                    }
                 }
             }
             ol { class: "pharos-queue-list",

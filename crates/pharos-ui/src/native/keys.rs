@@ -250,12 +250,12 @@ pub fn KeyLayer(route: Route, on_palette: EventHandler) -> Element {
     }
 }
 
-/// `mode`, or the queue's while the focus is in the music player's queue:
+/// `mode`, or the queue's while the focus is in the music or video queue:
 /// read at each key, since a removed row takes the focus without a
 /// `focusout`.
 fn focus_mode(mode: Mode) -> Mode {
     match mode {
-        Mode::Music | Mode::Queue if platform::focus_in_area("queue") => Mode::Queue,
+        Mode::Music | Mode::Queue | Mode::Player if platform::focus_in_area("queue") => Mode::Queue,
         Mode::Queue => Mode::Music,
         m => m,
     }
