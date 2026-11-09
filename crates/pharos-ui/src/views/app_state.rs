@@ -2029,14 +2029,22 @@ async fn fetch_integrity_report(base: &str, token: &str) -> Result<IntegrityRepo
         }
         other => other.to_string(),
     };
-    let (status, files) = futures_util::future::join(
-        web::integrity_status(base, token),
-        web::list_damaged_files(base, token),
+    let ((status, files), deep_checks) = futures_util::future::join(
+        futures_util::future::join(
+            web::integrity_status(base, token),
+            web::list_damaged_files(base, token),
+        ),
+        web::list_deep_checks(base, token),
     )
     .await;
     let status = status.map_err(describe)?;
     let files = files.map_err(describe)?;
-    Ok(IntegrityReport { status, files })
+    let deep_checks = deep_checks.map_err(describe)?;
+    Ok(IntegrityReport {
+        status,
+        files,
+        deep_checks,
+    })
 }
 
 #[cfg(not(feature = "web"))]

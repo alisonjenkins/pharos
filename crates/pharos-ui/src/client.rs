@@ -879,11 +879,12 @@ pub struct IntegrityStatus {
     pub queued: u64,
 }
 
-/// Both integrity answers the Damaged files tab shows together.
+/// The integrity answers the Damaged files tab shows together.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct IntegrityReport {
     pub status: IntegrityStatus,
     pub files: Vec<DamagedFile>,
+    pub deep_checks: Vec<DeepCheck>,
 }
 
 pub fn parse_damaged_files_response(bytes: &[u8]) -> Result<Vec<DamagedFile>, ClientError> {
