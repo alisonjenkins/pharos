@@ -1936,7 +1936,9 @@ mod tests {
     fn the_window_size_controls_are_grouped_smallest_first() {
         let html = render(controls());
         let top = html.find(r#"class="pharos-watch-top""#).expect("top bar");
-        let row = html.find(r#"class="pharos-control-row""#).expect("control row");
+        let row = html
+            .find(r#"class="pharos-control-row""#)
+            .expect("control row");
         let shrink = html.find(r#"aria-label="Shrink""#).expect("shrink");
         let fullscreen = html.find(r#"aria-label="Fullscreen""#).expect("fullscreen");
         assert!(top < row && row < shrink && shrink < fullscreen, "{html}");
@@ -1945,7 +1947,10 @@ mod tests {
         // Only Picture in picture may come between them.
         assert!(controls_between <= 1, "{html}");
         if controls_between == 1 {
-            assert!(between.contains(r#"aria-label="Picture in picture""#), "{html}");
+            assert!(
+                between.contains(r#"aria-label="Picture in picture""#),
+                "{html}"
+            );
         }
     }
 
