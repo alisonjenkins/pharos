@@ -2142,16 +2142,32 @@ where
             };
             window = run_window(listing.iter().flatten().filter_map(|l| l.aired), series_run);
             if let Some((first, last)) = window {
+                let mut agreed: Vec<&str> = Vec::new();
                 for row in &rows {
                     let outside = aired(row).is_some_and(|d| {
                         d < first - RUN_SLACK_SECS
                             || last.is_some_and(|last| d > last + RUN_SLACK_SECS)
                     });
                     let taken = survey.episodes.iter().any(|(id, _)| *id == row.id);
-                    if outside && !taken {
+                    if !outside || taken {
+                        continue;
+                    }
+                    if file_title_agrees(row) {
+                        agreed.push(&row.path);
+                    } else {
                         survey.episodes.push((row.id, RepairReason::OutsideRun));
                         picked += 1;
                     }
+                }
+                if let Some(sample) = agreed.first() {
+                    tracing::info!(
+                        series_key = %cand.series_key,
+                        provider,
+                        match_id = show_id,
+                        episodes = agreed.len(),
+                        sample = %sample,
+                        "series identity repair: outside the run, titles agree, not marked"
+                    );
                 }
             }
         }
@@ -2176,6 +2192,26 @@ where
 /// hold it until their next probe.
 fn aired(row: &pharos_core::SeriesEpisodeRow) -> Option<i64> {
     row.premiere_date.filter(|&d| d != 0)
+}
+
+/// B985 — whether the episode title the file names is the one stored for
+/// it: then the episode is right and only its date is odd. A file naming no
+/// title cannot vouch for its row, nor can a stored title the local resolver
+/// took from the file name itself (`Naruto - S03E33 - …`): it would agree with
+/// any file, right or wrong show.
+fn file_title_agrees(row: &pharos_core::SeriesEpisodeRow) -> bool {
+    use pharos_scanner::metadata::filename::episode_title;
+    if episode_title(&row.title).is_some() {
+        return false;
+    }
+    let stored = &row.title;
+    std::path::Path::new(&row.path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .and_then(episode_title)
+        .is_some_and(|file| {
+            pharos_core::title_similarity(&file, stored) >= crate::episode_fit::SAME_TITLE
+        })
 }
 
 /// B982 — the show's episode listing and its series-level run.
@@ -6699,6 +6735,8 @@ mod tests {
             .unwrap();
         let mut late = s.get(2).await.unwrap();
         late.metadata.premiere_date = Some(1_394_323_200);
+        // Another show's episode: its stored title is not the file's (B985).
+        late.title = "Scattered".into();
         s.put(late).await.unwrap();
         pin(&s, BSG, "73545", NOW).await;
         // Firefly: one candidate, the match it has. Left alone.
@@ -6851,6 +6889,10 @@ mod tests {
         ] {
             let mut item = s.get(id).await.unwrap();
             item.metadata.premiere_date = Some(aired);
+            if id == 4 {
+                // The 2014 remake's episode on a 1980 file (B931, B985).
+                item.title = "Hiding in the Light".into();
+            }
             s.put(item).await.unwrap();
         }
         pin(&s, ONE_PIECE, "81797", NOW).await;
@@ -6922,6 +6964,69 @@ mod tests {
             .unwrap();
 
         assert_eq!(survey.episodes, []);
+    }
+
+    /// B985 — an episode dated outside its show's run whose file names the
+    /// title stored for it is the right episode with an odd date (a later
+    /// release, a re-air); only a disagreeing or untitled file is marked.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_outside_run_episode_whose_title_agrees_is_not_marked() {
+        use crate::online_enrich::SeriesRun;
+        let (logs, _log) = log_capture();
+        let s = store().await;
+        const GT: &str = "/tv/Dragon Ball GT";
+        put_titled_episode(&s, 1, GT, (2, 1), "Pan's Gambit").await;
+        put_titled_episode(&s, 2, GT, (2, 2), "Unexpected Power").await;
+        put_titled_episode(&s, 3, GT, (2, 3), "untitled").await;
+        put_titled_episode(&s, 4, GT, (1, 1), "A Grand Wish").await;
+        put_titled_episode(&s, 5, GT, (2, 5), "A Secret Revealed").await;
+        for (id, aired) in [
+            (1, 1_334_016_000), // 2012-04-10
+            (2, 1_334_016_000),
+            (3, 1_334_016_000),
+            (4, 823_651_200), // 1996-02-07
+            (5, 1_334_016_000),
+        ] {
+            let mut item = s.get(id).await.unwrap();
+            item.metadata.premiere_date = Some(aired);
+            match id {
+                2 => item.title = "Deal of Pay".into(),
+                3 => item.path = format!("{GT}/Season 2/Dragon Ball GT - S02E03.mkv").into(),
+                // The local resolver's title, taken from the file name.
+                5 => item.title = "Dragon Ball GT - S02E05 - A Secret Revealed".into(),
+                _ => {}
+            }
+            s.put(item).await.unwrap();
+        }
+        pin(&s, GT, "79275", NOW).await;
+        let tvdb = FakeEnricher::tvdb()
+            .with_aired_list("79275", &[(1, 1, 823_651_200)])
+            .with_run(
+                "79275",
+                SeriesRun {
+                    first: Some(823_651_200),
+                    last: Some(879_897_600), // 1997-11-19
+                    ongoing: false,
+                },
+            );
+        let providers = SeriesProviders::<FakeEnricher, FakeEnricher> {
+            tvdb: Some(&tvdb),
+            tmdb: None,
+        };
+
+        let survey = survey_series_identity(&s, &providers, &sem(4), &MetadataConfig::default())
+            .await
+            .unwrap();
+
+        let mut marked: Vec<u64> = survey.episodes.iter().map(|(id, _)| *id).collect();
+        marked.sort_unstable();
+        assert_eq!(marked, [2, 3, 5]);
+        let text = logs.text();
+        let line = text
+            .lines()
+            .find(|l| l.contains("outside the run, titles agree"))
+            .unwrap_or_else(|| panic!("no titles-agree line in {text}"));
+        assert!(line.contains("episodes=1"), "{line}");
     }
 
     /// A dry run surveys again when the survey revision moved under the same
