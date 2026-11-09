@@ -321,6 +321,12 @@ names the cleared manual id.
 Overrides are listed on the page and can be removed, which returns the files to
 what the scanner decides.
 
+The page talks to the server over REST, `/admin/series-identity/*` behind
+`require_admin`, like the other Manage tabs; the Cap'n Proto `Admin`
+interface is out of scope. A fix's own rows take effect in either repair
+mode; the re-plan it triggers otherwise follows the configured mode, so under
+`"dry_run"` the scanner's own split of the same folder stays held.
+
 Signal: `sum by (action) (increase(pharos_series_override_total[1d]))`,
 `action` ∈ `pick_show | confirm | move_files | keep_together | remove`, and a
 log line naming the admin, paths and old and new series keys.
