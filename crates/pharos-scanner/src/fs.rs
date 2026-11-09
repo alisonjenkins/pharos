@@ -3034,11 +3034,10 @@ fn copy_label(primary: &Path, copy: &Path) -> String {
             .map(str::to_string)
             .collect()
     };
-    let have: std::collections::HashSet<String> =
-        words(&a).iter().map(|w| w.to_lowercase()).collect();
+    let have: std::collections::HashSet<String> = words(&a).iter().map(|w| fold_name(w)).collect();
     let added: Vec<String> = words(&b)
         .into_iter()
-        .filter(|w| !have.contains(&w.to_lowercase()))
+        .filter(|w| !have.contains(&fold_name(w)))
         .collect();
     if !added.is_empty() {
         return added.join(" ");
@@ -7389,6 +7388,14 @@ mod tests {
             ),
             "System Of A Down",
             "the nearest folder that differs, not the shared album folder"
+        );
+        assert_eq!(
+            label(
+                "/m/Music/SOAD/Hypnotize/10 She’s Like Heroin.mp3",
+                "/m/Music/Soad/Hypnotize/10 - She's Like Heroin.mp3",
+            ),
+            "Soad",
+            "a curly and a straight apostrophe are one word"
         );
         assert_eq!(
             label(
