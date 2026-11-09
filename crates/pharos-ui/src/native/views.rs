@@ -921,6 +921,7 @@ pub fn open_route(item: &Item) -> Route {
         | ItemKind::Artist
         | ItemKind::Collection
         | ItemKind::Playlist => Route::Browse(item.id),
+        ItemKind::Person => Route::Person(item.id),
         _ => Route::Title(item.id),
     }
 }
@@ -2599,6 +2600,10 @@ mod tests {
                 "{kind:?}"
             );
         }
+        assert!(
+            matches!(open_route(&item(ItemKind::Person)), Route::Person(_)),
+            "an actor found by search opens their page"
+        );
     }
 
     #[test]
