@@ -2105,6 +2105,84 @@ impl MediaRecovery {
     }
 }
 
+/// One media-error decision of the Rust engine, or the rebuilt MediaSource
+/// playing again: the failure and the success side of V638 in one shape
+/// (V640).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MediaRecoveryReport {
+    Error {
+        details: String,
+        message: String,
+        verdict: MediaVerdict,
+        at_ms: u64,
+    },
+    Resumed(MediaResumed),
+}
+
+impl MediaRecoveryReport {
+    pub fn line(&self, url: &str) -> String {
+        match self {
+            Self::Error {
+                details,
+                message,
+                verdict,
+                at_ms,
+            } => format!(
+                "pharos: playback error engine=rust type=mediaError details={details} message={message} fatal=true action={} attempt={} at_ms={at_ms} url={url}",
+                verdict.label(),
+                verdict.attempt(),
+            ),
+            Self::Resumed(r) => format!(
+                "pharos: playback recovered engine=rust type=mediaError action=recover_media attempt={} at_ms={} took_ms={} url={url}",
+                r.attempt, r.at_ms, r.took_ms
+            ),
+        }
+    }
+
+    pub fn event(&self, route: String) -> ClientEvent {
+        let (level, fields) = match self {
+            Self::Error {
+                details,
+                message,
+                verdict,
+                at_ms,
+            } => (
+                match verdict {
+                    MediaVerdict::Stale => ClientLevel::Warn,
+                    MediaVerdict::Rebuild { .. } | MediaVerdict::Fail { .. } => ClientLevel::Error,
+                },
+                vec![
+                    ("engine", "rust".to_owned()),
+                    ("type", "mediaError".to_owned()),
+                    ("details", details.clone()),
+                    ("message", message.clone()),
+                    ("action", verdict.label().to_owned()),
+                    ("attempt", verdict.attempt().to_string()),
+                    ("at_ms", at_ms.to_string()),
+                ],
+            ),
+            Self::Resumed(r) => (
+                ClientLevel::Info,
+                vec![
+                    ("engine", "rust".to_owned()),
+                    ("type", "mediaError".to_owned()),
+                    ("details", "recovered".to_owned()),
+                    ("action", Recovery::RecoverMedia.label().to_owned()),
+                    ("attempt", r.attempt.to_string()),
+                    ("at_ms", r.at_ms.to_string()),
+                    ("took_ms", r.took_ms.to_string()),
+                ],
+            ),
+        };
+        ClientEvent {
+            kind: ClientEventKind::PlaybackError,
+            level,
+            route,
+            fields,
+        }
+    }
+}
+
 /// Where Play starts: the stored position of a started, unfinished item.
 pub fn start_ms(position_ms: u64, played: bool) -> u64 {
     if played {
@@ -4705,6 +4783,49 @@ mod tests {
             r.on_error(epoch, "bufferStalledError", 45_000, 200),
             MediaVerdict::Rebuild { attempt: 1 }
         );
+    }
+
+    // V640: the rebuild, the give-up and the resume each log and report
+    // the same fields, with the attempt and the play head.
+    #[test]
+    fn media_recovery_is_logged_and_reported_on_both_sides() {
+        let rebuild = MediaRecoveryReport::Error {
+            details: "bufferAppendError".to_owned(),
+            message: "video SourceBuffer error".to_owned(),
+            verdict: MediaVerdict::Rebuild { attempt: 1 },
+            at_ms: 42_000,
+        };
+        assert_eq!(
+            rebuild.line("/m.m3u8"),
+            "pharos: playback error engine=rust type=mediaError details=bufferAppendError message=video SourceBuffer error fatal=true action=recover_media attempt=1 at_ms=42000 url=/m.m3u8"
+        );
+        let e = rebuild.event("/ui/watch/1".to_owned());
+        assert_eq!(e.kind, ClientEventKind::PlaybackError);
+        assert_eq!(e.level, ClientLevel::Error);
+        let keys: Vec<_> = e.fields.iter().map(|(k, _)| *k).collect();
+        assert_eq!(
+            keys,
+            ["engine", "type", "details", "message", "action", "attempt", "at_ms"]
+        );
+        let fail = MediaRecoveryReport::Error {
+            details: "bufferAppendError".to_owned(),
+            message: "video SourceBuffer error".to_owned(),
+            verdict: MediaVerdict::Fail { attempt: 3 },
+            at_ms: 42_000,
+        };
+        assert!(fail.line("u").contains("action=fail attempt=3 at_ms=42000"));
+        let resumed = MediaRecoveryReport::Resumed(MediaResumed {
+            attempt: 1,
+            at_ms: 42_300,
+            took_ms: 1_800,
+        });
+        assert_eq!(
+            resumed.line("u"),
+            "pharos: playback recovered engine=rust type=mediaError action=recover_media attempt=1 at_ms=42300 took_ms=1800 url=u"
+        );
+        let e = resumed.event(String::new());
+        assert_eq!(e.level, ClientLevel::Info);
+        assert!(e.fields.contains(&("action", "recover_media".to_owned())));
     }
 
     #[test]
