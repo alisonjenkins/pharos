@@ -1524,19 +1524,7 @@ impl<P: Prober> FsScanner<P> {
             existed,
             stale_match,
         } = written;
-        if let Some((reason, provider)) = stale_match {
-            tracing::info!(
-                media.id = %item_id,
-                path = %item_path.display(),
-                reason,
-                provider,
-                "reset a row's online match that no longer fits it",
-            );
-            metrics::counter!("pharos_scan_match_reset_total", "reason" => reason).increment(1);
-            store
-                .set_item_match(item_id, &provider, "", "none", None, 0)
-                .await?;
-        }
+        reset_stale_match(store, item_id, &item_path, stale_match).await?;
         // 004-books — a book's cover lives inside the file, so it has no
         // sidecar path to record and is extracted + cached here instead.
         self.store_book_cover(store, item_id, item_kind, &item_path)
@@ -1647,7 +1635,16 @@ impl<P: Prober> FsScanner<P> {
             tags,
         } = merge_metadata_into_item(&mut item, meta);
         let item_kind = item.kind;
+        let stale = match existing {
+            Some(_) => store
+                .get(item_id)
+                .await
+                .ok()
+                .and_then(|prior| stale_match(&prior, &item)),
+            None => None,
+        };
         store.put(item).await?;
+        reset_stale_match(store, item_id, path, stale).await?;
         // 004-books — the watched create/modify path extracts + caches a book
         // cover the same way a full scan does, or a book added by the watcher
         // would be the only one without a tile.
@@ -1925,6 +1922,30 @@ struct WrittenItem {
     existed: bool,
     /// Why the row's online match no longer fits it ([`stale_match`]).
     stale_match: Option<(&'static str, String)>,
+}
+
+/// Clear a row's online match that [`stale_match`] found no longer fits it,
+/// so the matcher asks again.
+async fn reset_stale_match<S: MediaStore>(
+    store: &S,
+    id: MediaId,
+    path: &Path,
+    stale: Option<(&'static str, String)>,
+) -> DomainResult<()> {
+    let Some((reason, provider)) = stale else {
+        return Ok(());
+    };
+    tracing::info!(
+        media.id = %id,
+        path = %path.display(),
+        reason,
+        provider,
+        "reset a row's online match that no longer fits it",
+    );
+    metrics::counter!("pharos_scan_match_reset_total", "reason" => reason).increment(1);
+    store
+        .set_item_match(id, &provider, "", "none", None, 0)
+        .await
 }
 
 /// B1024 — why a re-probed row's stored online match no longer fits it, with
@@ -10820,6 +10841,39 @@ mod tests {
         };
         assert_eq!(counter("pharos_scan_reprobe_total", "kind_changed"), 1);
         assert_eq!(counter("pharos_scan_match_reset_total", "kind_changed"), 1);
+    }
+
+    /// B1024 / V983 — a watched write that turns a film row into an episode
+    /// resets its online match too, as the full scan does.
+    #[tokio::test]
+    async fn a_watched_film_turned_episode_loses_its_film_match() {
+        let td = TempDir::new().unwrap();
+        let file = "TV/Dragon Ball/[a-s]_dragon_ball_-_063_-_the_return_of_goku.mkv";
+        touch(td.path(), file).await;
+        let store = MemStore::default();
+        let s = FsScanner::new(FakeProber::default());
+        s.scan_into(td.path(), &store).await.unwrap();
+        let id = stable_id(&td.path().join(file));
+        store
+            .set_item_match(id, "tmdb", "1234", "nfo_id", None, 100)
+            .await
+            .unwrap();
+
+        touch(td.path(), "TV/Dragon Ball/tvshow.nfo").await;
+        forget_show_nfos();
+        // A modify event: the file's signature changes, so it is re-probed.
+        tokio::fs::write(td.path().join(file), b"remuxed")
+            .await
+            .unwrap();
+        let scan_id = store.begin_scan(td.path()).await.unwrap();
+        s.update_path(&td.path().join(file), &store, scan_id)
+            .await
+            .unwrap();
+
+        let item = store.get(id).await.unwrap();
+        assert_eq!(item.kind, MediaKind::Episode);
+        assert_eq!(item.match_source.as_deref(), Some("none"));
+        assert_eq!(item.match_external_id.as_deref(), Some(""));
     }
 
     /// B1024 / V983 — which stored matches a re-probe resets.
