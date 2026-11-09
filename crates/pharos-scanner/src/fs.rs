@@ -650,6 +650,11 @@ impl<P: Prober> FsScanner<P> {
             .instrument(tracing::info_span!("scan.walk"))
             .await?;
         let series_folders = crate::series_split::folders_of(&paths);
+        let root_prefix = root.to_string_lossy().into_owned();
+        let series_plan = self
+            .plan_series(store, &series_folders, &root_prefix)
+            .instrument(tracing::info_span!("scan.series_plan"))
+            .await;
         let groups = group_by_edition(paths);
         let facts = copy_facts(store, &copy_candidates(&groups))
             .instrument(tracing::info_span!("scan.copy_facts"))
@@ -1130,9 +1135,8 @@ impl<P: Prober> FsScanner<P> {
         // A fold is final only on the pass whose sweep removes the copy's row;
         // folding on a pass that keeps the row would repeat the merge next
         // pass and re-mark watched what a viewer since marked unwatched.
-        let root_prefix = root.to_string_lossy();
         if !cancelled && walk_errors == 0 {
-            self.settle_series_identity(store, &series_folders, &root_prefix)
+            self.settle_series_identity(store, series_plan.as_ref(), &root_prefix)
                 .instrument(tracing::info_span!("scan.series_identity"))
                 .await;
             settle_copies(store, scan_id, &folded).await?;
@@ -1209,29 +1213,53 @@ impl<P: Prober> FsScanner<P> {
         Ok(outcome)
     }
 
-    /// Spec 033 — split folders whose files state different show years and
-    /// write (or, in dry run, log) each file's series key. Runs only on a
-    /// complete walk: a partial listing could see one group of a split
-    /// folder and undo the split.
-    async fn settle_series_identity<S: pharos_core::SeriesIdentityStore>(
+    /// Spec 033 — the split plan for a walk's episode folders (V893), from
+    /// the store's overrides and stored matches. A failed read is logged and
+    /// plans nothing, so keys stay as stored and the copy fold runs unguarded.
+    async fn plan_series<S: pharos_core::SeriesIdentityStore>(
         &self,
         store: &S,
         folders: &std::collections::BTreeMap<String, Vec<(PathBuf, Option<u32>)>>,
         root_prefix: &str,
+    ) -> Option<(
+        crate::series_split::SeriesPlan,
+        crate::series_split::PlanContext,
+    )> {
+        use crate::series_split as split;
+        match split::context(store, folders).await {
+            Ok(ctx) => Some((split::plan(folders, &ctx, unix_now()), ctx)),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    root = root_prefix,
+                    mode = self.series_identity_repair.label(),
+                    "series identity pass failed; keys left as stored",
+                );
+                None
+            }
+        }
+    }
+
+    /// Write (or, in dry run, log) each file's series key from the split
+    /// plan. Runs only on a complete walk: a partial listing could see one
+    /// group of a split folder and undo the split.
+    async fn settle_series_identity<S: pharos_core::SeriesIdentityStore>(
+        &self,
+        store: &S,
+        planned: Option<&(
+            crate::series_split::SeriesPlan,
+            crate::series_split::PlanContext,
+        )>,
+        root_prefix: &str,
     ) {
         use crate::series_split as split;
         let mode = self.series_identity_repair;
-        let result = async {
-            let ctx = split::context(store, folders).await?;
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
-            let plan = split::plan(folders, &ctx, now);
-            split::reconcile(store, &plan, root_prefix, mode, now)
-                .await
-                .map(|changed| (changed, plan.splits.len()))
-        }
-        .await;
+        let Some((plan, _)) = planned else {
+            return;
+        };
+        let result = split::reconcile(store, plan, root_prefix, mode, unix_now())
+            .await
+            .map(|changed| (changed, plan.splits.len()));
         // Never fatal: the copy fold and the deletion sweep still run.
         match result {
             Ok((0, _)) => {}
@@ -2686,6 +2714,12 @@ fn group_copies(
         out.push((primary, alts));
     }
     out
+}
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
 }
 
 /// The key a film file's name gives it (`Heat (1995) Bluray-1080p.mkv` is
