@@ -102,8 +102,8 @@ pub(crate) fn foreign_nfos(req: &MetadataRequest<'_>) -> ForeignNfos {
 const FILM_YEAR_SLACK: u32 = 1;
 
 /// B1009 — whether a film's NFO describes another film: its `<year>` is more
-/// than [`FILM_YEAR_SLACK`] from the year the file's name, else its folder's
-/// name, states. Jellyfin wrote the 1994 *The Lion King* into
+/// than [`FILM_YEAR_SLACK`] from every year the file's name and its folder's
+/// name state (B1026: a year in the title is no evidence on its own). Jellyfin wrote the 1994 *The Lion King* into
 /// `The Lion King (2019)/movie.nfo`, and its tmdb id then matched the remake
 /// to the original. A name or NFO with no year is not evidence either way.
 pub(crate) fn names_another_year(
@@ -117,11 +117,21 @@ pub(crate) fn names_another_year(
     let year_of = |name: Option<&std::ffi::OsStr>| {
         crate::metadata::filename::parse_filename(name?.to_str()?, true).year
     };
-    let folder = || year_of(media.parent().and_then(Path::file_name));
-    let Some(file_year) = year_of(media.file_stem()).or_else(folder) else {
+    // A title can hold a year (`Blade Runner 2049`), so the NFO is foreign
+    // only when it agrees with neither the file's year nor the folder's.
+    let stated: Vec<u32> = [
+        year_of(media.file_stem()),
+        year_of(media.parent().and_then(Path::file_name)),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    let Some(&file_year) = stated.first() else {
         return false;
     };
-    let foreign = nfo_year.abs_diff(file_year) > FILM_YEAR_SLACK;
+    let foreign = stated
+        .iter()
+        .all(|y| nfo_year.abs_diff(*y) > FILM_YEAR_SLACK);
     if foreign {
         tracing::info!(
             path = %media.display(),

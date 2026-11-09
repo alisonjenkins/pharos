@@ -988,6 +988,13 @@ async fn a_movie_nfo_naming_another_year_is_set_aside() {
         Some(1996)
     );
     assert_eq!(fetch("Lion King", "lion.king.mkv", 1994).await, Some(1994));
+    // B1026 / V985 — two years off is the first set aside; a year in the
+    // title does not outvote the folder's.
+    assert_eq!(fetch("Heat (1995)", "Heat (1995).mkv", 1997).await, None);
+    assert_eq!(
+        fetch("Blade Runner 2049 (2017)", "Blade Runner 2049.mkv", 2017).await,
+        Some(2017)
+    );
 
     let set_aside: u64 = snapshotter
         .snapshot()
@@ -1006,5 +1013,5 @@ async fn a_movie_nfo_naming_another_year_is_set_aside() {
             _ => None,
         })
         .sum();
-    assert_eq!(set_aside, 2, "each set-aside NFO is counted once");
+    assert_eq!(set_aside, 3, "each set-aside NFO is counted once");
 }
