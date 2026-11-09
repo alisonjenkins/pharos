@@ -117,6 +117,10 @@ pub struct SeriesPlan {
     pub splits: Vec<Split>,
     /// Owner rows to remember, for folders split for the first time.
     pub new_owners: Vec<SeriesOverride>,
+    /// Files whose assignment an `admin` row decided (V896): a keep-together
+    /// folder's files and each admin per-path row's file. A dry run writes
+    /// these, as the decision is the admin's, not the scanner's.
+    pub admin_placed: std::collections::BTreeSet<PathBuf>,
 }
 
 /// What the store already knows about the folders in a walk.
@@ -231,8 +235,9 @@ pub fn plan(
                         series_year: year,
                     },
                 );
+                out.admin_placed.insert(path.clone());
             }
-            place_by_override(folder, files, ctx, true, &mut out.assignments);
+            place_by_override(folder, files, ctx, true, &mut out);
             continue;
         }
         let (stated, by_title) = with_title_evidence(folder, files, &ctx.overrides);
@@ -299,7 +304,7 @@ pub fn plan(
                 });
             }
         }
-        place_by_override(folder, own, ctx, false, &mut out.assignments);
+        place_by_override(folder, own, ctx, false, &mut out);
     }
     out
 }
@@ -315,7 +320,7 @@ fn place_by_override(
     files: &[(PathBuf, Option<u32>)],
     ctx: &PlanContext,
     admin_only: bool,
-    assignments: &mut HashMap<PathBuf, Assignment>,
+    out: &mut SeriesPlan,
 ) {
     let mut rows: Vec<&SeriesOverride> = ctx
         .overrides
@@ -333,13 +338,16 @@ fn place_by_override(
             if o.source == OverrideSource::Scanner && year.is_none() {
                 continue;
             }
-            assignments.insert(
+            out.assignments.insert(
                 path.clone(),
                 Assignment {
                     series_key: o.target_key.clone(),
                     series_year: o.target_year,
                 },
             );
+            if o.source == OverrideSource::Admin {
+                out.admin_placed.insert(path.clone());
+            }
         }
     }
 }
@@ -438,7 +446,8 @@ pub async fn context<S: SeriesIdentityStore>(
 }
 
 /// Write (in [`RepairMode::Apply`]) or log (in dry run) every difference
-/// between `plan` and the rows stored under `root_prefix`. Returns the rows
+/// between `plan` and the rows stored under `root_prefix`; a dry run still
+/// writes the rows an admin placed ([`SeriesPlan::admin_placed`]). Returns the rows
 /// changed. A dry run finds the same differences every pass, so its
 /// per-row lines are debug and its per-folder line is the info one. A row
 /// whose key moved is marked at `now` for the server to rebuild against its
@@ -513,12 +522,27 @@ pub async fn reconcile<S: SeriesIdentityStore>(
     }
     set_repair_rows("series_key", mode, root_prefix, updates.len());
     set_repair_rows("owner_row", mode, root_prefix, plan.new_owners.len());
-    if mode == RepairMode::DryRun {
-        return Ok(0);
-    }
-    for o in &plan.new_owners {
-        store.insert_series_override(o.clone()).await?;
-    }
+    let updates = if mode == RepairMode::DryRun {
+        let held: Vec<SeriesKeyUpdate> = updates
+            .into_iter()
+            .filter(|u| plan.admin_placed.contains(Path::new(&u.path)))
+            .collect();
+        if held.is_empty() {
+            return Ok(0);
+        }
+        tracing::info!(
+            root = root_prefix,
+            rows = held.len(),
+            mode = mode.label(),
+            "series identity repair: hand fixes written, the scanner's own changes held"
+        );
+        held
+    } else {
+        for o in &plan.new_owners {
+            store.insert_series_override(o.clone()).await?;
+        }
+        updates
+    };
     let changed = store.set_series_keys(&updates).await?;
     let moved: Vec<String> = updates
         .iter()
