@@ -1768,6 +1768,15 @@ pub trait SeriesIdentityStore: Send + Sync {
         async { Ok(0) }
     }
 
+    /// Mark every non-manual episode at one of `paths` for reconciliation at `at`; returns rows changed.
+    fn mark_reconcile_paths(
+        &self,
+        _paths: &[String],
+        _at: i64,
+    ) -> impl std::future::Future<Output = DomainResult<u64>> + Send {
+        async { Ok(0) }
+    }
+
     /// Episode `(id, mark)` pairs pending reconciliation, ordered by mark then id, at most `limit`.
     fn series_reconcile_pending(
         &self,
