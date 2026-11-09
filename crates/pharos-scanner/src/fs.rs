@@ -601,7 +601,7 @@ impl<P: Prober> FsScanner<P> {
             .instrument(tracing::info_span!("scan.copy_facts"))
             .await;
         let mut tally = CopyTally::default();
-        let groups = group_episode_copies(groups, &facts, &mut tally);
+        let groups = group_copies(groups, &facts, &mut tally);
         tally.publish();
         // A file now grouped under another may still hold its own row from an
         // earlier pass; that row is swept, so its viewers' state moves first.
@@ -1903,7 +1903,7 @@ impl<P: Prober + Clone + 'static> Scanner for FsScanner<P> {
             .map(|(p, _)| p)
             .collect();
         let sizes = copy_sizes(&candidates).await;
-        let groups = group_episode_copies(groups, &sizes, &mut CopyTally::default());
+        let groups = group_copies(groups, &sizes, &mut CopyTally::default());
         let mut items = Vec::with_capacity(groups.len());
         for (primary, alts) in groups {
             if let Some(item) = self.probe_with_alternates(primary, alts).await {
@@ -2232,7 +2232,7 @@ async fn settle_copies<S: MediaStore>(
 /// title).
 #[cfg(test)]
 pub(crate) fn group_editions(paths: Vec<PathBuf>) -> Vec<(PathBuf, Vec<(String, PathBuf)>)> {
-    group_episode_copies(
+    group_copies(
         group_by_edition(paths),
         &HashMap::new(),
         &mut CopyTally::default(),
@@ -2303,12 +2303,10 @@ fn group_by_edition(paths: Vec<PathBuf>) -> Vec<(PathBuf, Vec<(String, PathBuf)>
 /// asked for stored heights, so a library named `WEBDL-1080p` style costs no
 /// reads.
 fn copy_candidates(groups: &[(PathBuf, Vec<(String, PathBuf)>)]) -> Vec<(PathBuf, bool)> {
-    let mut by_episode: BTreeMap<CopyBucket, Vec<&Path>> = BTreeMap::new();
+    let mut by_bucket: BTreeMap<CopyBucket, Vec<&Path>> = BTreeMap::new();
     for (primary, _) in groups {
-        if let Some(span) = episode_copy_key(primary) {
-            for bucket in copy_buckets(&span) {
-                by_episode.entry(bucket).or_default().push(primary);
-            }
+        for bucket in copy_buckets(primary) {
+            by_bucket.entry(bucket).or_default().push(primary);
         }
     }
     let named = |p: &Path| {
@@ -2318,7 +2316,7 @@ fn copy_candidates(groups: &[(PathBuf, Vec<(String, PathBuf)>)]) -> Vec<(PathBuf
             .is_some()
     };
     let mut out: BTreeMap<PathBuf, bool> = BTreeMap::new();
-    for members in by_episode.into_values().filter(|m| m.len() > 1) {
+    for members in by_bucket.into_values().filter(|m| m.len() > 1) {
         let unnamed = !members.iter().all(|p| named(p));
         for path in members {
             let flag = out.entry(path.to_path_buf()).or_default();
@@ -2396,26 +2394,46 @@ const MAX_EPISODE_SPAN: u32 = 8;
 /// `(show folder, season, first episode, last episode)` of an episode file.
 type EpisodeSpan = (String, u32, u32, u32);
 
-/// One bucket of copies: `(show folder, season, first, last)`, where `first`
-/// and `last` are one episode, or a long span's own ends.
-type CopyBucket = (String, u32, u32, u32);
+/// One title that several files can be copies of.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum CopyBucket {
+    /// `first` and `last` are one episode, or a long span's own ends.
+    Episode {
+        show: String,
+        season: u32,
+        first: u32,
+        last: u32,
+    },
+}
 
-/// The buckets a file of `span` is a copy in: each episode it covers, or for
-/// a span past [`MAX_EPISODE_SPAN`] only its exact span.
-fn copy_buckets(span: &EpisodeSpan) -> Vec<CopyBucket> {
-    let (show, season, first, last) = span;
-    if last.saturating_sub(*first) >= MAX_EPISODE_SPAN {
-        return vec![(show.clone(), *season, *first, *last)];
+/// The buckets `path` is a copy in: for an episode file each episode it
+/// covers, or for a span past [`MAX_EPISODE_SPAN`] only its exact span.
+fn copy_buckets(path: &Path) -> Vec<CopyBucket> {
+    let Some((show, season, first, last)) = episode_copy_key(path) else {
+        return Vec::new();
+    };
+    if last.saturating_sub(first) >= MAX_EPISODE_SPAN {
+        return vec![CopyBucket::Episode {
+            show,
+            season,
+            first,
+            last,
+        }];
     }
-    (*first..=*last)
-        .map(|episode| (show.clone(), *season, episode, episode))
+    (first..=last)
+        .map(|episode| CopyBucket::Episode {
+            show: show.clone(),
+            season,
+            first: episode,
+            last: episode,
+        })
         .collect()
 }
 
 /// A primary file and its `(label, path)` versions.
 type Group = (PathBuf, Vec<(String, PathBuf)>);
 
-/// Fold copies of one episode into a single group: files under the same show
+/// Fold copies of one title into a single group: files under the same show
 /// folder that cover the same season and episode (`Season 01` and `Season 1`
 /// both holding S01E02, a `.avi` beside its `.mkv` re-rip, or a double
 /// `S01E01-E02` beside a single `S01E01`). A file spanning several episodes is
@@ -2424,24 +2442,26 @@ type Group = (PathBuf, Vec<(String, PathBuf)>);
 /// what tells them apart in their names. A file stays its own item while it is
 /// the primary of any episode it covers, so a double with a single for E01 but
 /// none for E02 is a version of E01 and the item for E02 (V721, V844).
-fn group_episode_copies(
+fn group_copies(
     groups: Vec<(PathBuf, Vec<(String, PathBuf)>)>,
     facts: &HashMap<PathBuf, CopyFacts>,
     tally: &mut CopyTally,
 ) -> Vec<(PathBuf, Vec<(String, PathBuf)>)> {
     let spans: Vec<Option<EpisodeSpan>> = groups.iter().map(|g| episode_copy_key(&g.0)).collect();
-    let mut by_episode: BTreeMap<CopyBucket, Vec<usize>> = BTreeMap::new();
-    for (i, span) in spans.iter().enumerate() {
-        if let Some(span) = span {
-            for bucket in copy_buckets(span) {
-                by_episode.entry(bucket).or_default().push(i);
+    let mut covered = vec![false; groups.len()];
+    let mut by_bucket: BTreeMap<CopyBucket, Vec<usize>> = BTreeMap::new();
+    for (i, (path, _)) in groups.iter().enumerate() {
+        for bucket in copy_buckets(path) {
+            by_bucket.entry(bucket).or_default().push(i);
+            if let Some(flag) = covered.get_mut(i) {
+                *flag = true;
             }
         }
     }
-    // Each episode's primary, and the copies it gathers in episode order.
+    // Each bucket's primary, and the copies it gathers in bucket order.
     let mut is_item = vec![false; groups.len()];
     let mut gathered: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
-    for ((show, season, episode, _), members) in &by_episode {
+    for (bucket, members) in &by_bucket {
         let rank = |i: &usize| {
             let span = spans.get(*i).and_then(Option::as_ref);
             let path = groups.get(*i).map(|g| g.0.as_path());
@@ -2463,13 +2483,11 @@ fn group_episode_copies(
         let decided_by = CopyRank::decided_by(&ranked);
         tally.record(decided_by);
         tracing::debug!(
-            show = %show,
-            season,
-            episode,
+            bucket = ?bucket,
             primary = %groups.get(primary).map_or_else(String::new, |g| g.0.display().to_string()),
             decided_by = decided_by.label(),
             candidates = ?ranked.iter().map(|(r, i)| (groups.get(*i).map(|g| g.0.display().to_string()), r)).collect::<Vec<_>>(),
-            "chose the primary of an episode's copies",
+            "chose the primary of a title's copies",
         );
         let entry = gathered.entry(primary).or_default();
         for &member in members {
@@ -2485,7 +2503,7 @@ fn group_episode_copies(
         .map(|g| g.as_ref().map(|g| g.0.clone()).unwrap_or_default())
         .collect();
     for i in 0..taken.len() {
-        let covered = spans.get(i).is_some_and(Option::is_some);
+        let covered = covered.get(i).copied().unwrap_or(false);
         if covered && !is_item.get(i).copied().unwrap_or(false) {
             continue;
         }
@@ -2501,7 +2519,7 @@ fn group_episode_copies(
                 primary = %primary.display(),
                 copy = %path.display(),
                 label = %label,
-                "grouped a copy of an episode as a version",
+                "grouped a copy of a title as a version",
             );
             alts.push((label, path.clone()));
             // A copy that is no item of its own brings its editions along,
@@ -7199,7 +7217,7 @@ mod tests {
                 },
             ),
         ]);
-        let groups = group_episode_copies(
+        let groups = group_copies(
             group_by_edition(vec![sd.clone(), hd.clone()]),
             &facts,
             &mut CopyTally::default(),
@@ -7225,7 +7243,7 @@ mod tests {
                 },
             ),
         ]);
-        let groups = group_episode_copies(
+        let groups = group_copies(
             group_by_edition(vec![small.clone(), big.clone()]),
             &facts,
             &mut CopyTally::default(),
@@ -7283,7 +7301,7 @@ mod tests {
         let _guard = metrics::set_default_local_recorder(&recorder);
 
         let mut tally = CopyTally::default();
-        group_episode_copies(
+        group_copies(
             group_by_edition(vec![
                 PathBuf::from("/tv/Foo/Season 01/Foo S01E03.mkv"),
                 PathBuf::from("/tv/Foo/Season 1/Foo S01E03.mkv"),
