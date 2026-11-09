@@ -832,12 +832,13 @@ impl<P: Prober> FsScanner<P> {
                             // or resized edition must re-put the row, or its
                             // alternate_sources and has_3d go stale.
                             match edition_drift_for(store, row, state.has_editions, &alts).await? {
-                                None => {
+                                None if !kind_drift(store, row, &primary).await => {
                                     seen_batch.push((row, mtime, size));
                                     seen += 1;
                                     outcome.skipped += 1;
                                     continue;
                                 }
+                                None => {}
                                 Some((reason, edition)) => {
                                     record_edition_drift(
                                         row, &primary, reason, &edition, "reprobed",
@@ -2301,6 +2302,39 @@ fn record_edition_drift(
         "edition set changed since the stored row was written",
     );
     metrics::counter!("pharos_scan_reprobe_total", "reason" => reason.label()).increment(1);
+}
+
+/// B1023 — whether an unchanged file's stored row is a film the show folder
+/// above it now makes an episode (V966's rule, which a schema bump would
+/// otherwise have to re-probe the whole library to apply). Asked only of a
+/// video that [`is_episode_path`] does not already call an episode, so the
+/// row read happens only for the few files the rule changed.
+async fn kind_drift<S: MediaStore>(store: &S, row: MediaId, primary: &Path) -> bool {
+    let video = primary
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| FILM_EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()));
+    if !video || is_episode_path(primary) || show_folder_of(primary).is_none() {
+        return false;
+    }
+    let stored = match store.get(row).await {
+        Ok(item) => item.kind,
+        Err(err) => {
+            tracing::warn!(media.id = %row, path = %primary.display(), error = %err, "could not read a row to check its kind");
+            return false;
+        }
+    };
+    let drifted = stored != MediaKind::Episode;
+    if drifted {
+        tracing::info!(
+            media.id = %row,
+            path = %primary.display(),
+            stored = stored.as_str(),
+            "a film row sits under a show folder; re-probing it as an episode",
+        );
+        metrics::counter!("pharos_scan_reprobe_total", "reason" => "kind_changed").increment(1);
+    }
+    drifted
 }
 
 /// A file grouped this pass as a version of `into`, whose own row (if it
@@ -10622,5 +10656,56 @@ mod tests {
             })
             .sum();
         assert_eq!(counted, 1, "one marked folder on the second walk");
+    }
+
+    /// B1023 / V982 — a film row the show-folder rule now calls an episode is
+    /// re-probed though its file is unchanged.
+    #[tokio::test]
+    async fn an_unchanged_film_under_a_new_show_folder_becomes_an_episode() {
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = pharos_test_metrics::snapshotter(&recorder);
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        let td = TempDir::new().unwrap();
+        let file = "TV/Dragon Ball/[a-s]_dragon_ball_-_063_-_the_return_of_goku.mkv";
+        touch(td.path(), file).await;
+        touch(td.path(), "Movies/Heat (1995)/Heat (1995).mkv").await;
+        let store = MemStore::default();
+        let s = FsScanner::new(FakeProber::default());
+        s.scan_into(td.path(), &store).await.unwrap();
+        let id = stable_id(&td.path().join(file));
+        assert_eq!(store.get(id).await.unwrap().kind, MediaKind::Movie);
+
+        touch(td.path(), "TV/Dragon Ball/tvshow.nfo").await;
+        let out = s.scan_into(td.path(), &store).await.unwrap();
+
+        let item = store.get(id).await.unwrap();
+        assert_eq!(item.kind, MediaKind::Episode);
+        assert_eq!(item.series.map(|s| s.episode_number), Some(Some(63)));
+        assert_eq!(
+            out.skipped, 1,
+            "the unchanged film beside it is still skipped"
+        );
+
+        let counter = |name: &str, reason: &str| -> u64 {
+            snapshotter
+                .snapshot()
+                .into_vec()
+                .into_iter()
+                .filter_map(|(ck, _, _, v)| match v {
+                    metrics_util::debugging::DebugValue::Counter(n)
+                        if ck.key().name() == name
+                            && ck
+                                .key()
+                                .labels()
+                                .any(|l| l.key() == "reason" && l.value() == reason) =>
+                    {
+                        Some(n)
+                    }
+                    _ => None,
+                })
+                .sum()
+        };
+        assert_eq!(counter("pharos_scan_reprobe_total", "kind_changed"), 1);
     }
 }
