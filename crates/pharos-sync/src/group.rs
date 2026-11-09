@@ -2055,6 +2055,19 @@ impl GroupState {
             last_update_unix_ms: self.queue.updated_unix_ms,
         });
         self.clear_tracks_if_item_changed();
+        self.clear_hold_if_item_changed();
+    }
+
+    /// A hold is for one visit to an entry: once another entry plays it is
+    /// over, so coming back to the held entry counts down again (B1027).
+    fn clear_hold_if_item_changed(&mut self) {
+        if self
+            .next_held
+            .as_ref()
+            .is_some_and(|(pli, _)| Some(pli.as_str()) != self.current_playlist_item_id())
+        {
+            self.next_held = None;
+        }
     }
 
     /// The group's tracks were chosen for one queue entry; once another plays
@@ -6665,6 +6678,40 @@ mod tests {
         .unwrap();
         let (_m3, mut rx3) = add_member(&h, &sinks, "later").await;
         assert_eq!(next_held(&mut rx3).await, None);
+    }
+
+    /// V986: a hold is for one visit to the entry; going back to it after
+    /// the group moved on counts down again.
+    #[tokio::test]
+    async fn a_hold_does_not_come_back_with_its_entry() {
+        let (h, sinks, mut rx1, m1) = fresh().await;
+        let plis = seed_queue(&h, m1, &mut rx1).await;
+        h.tx.send(GroupMsg::HoldNext {
+            sender: m1,
+            playlist_item_id: Some(plis[0].clone()),
+        })
+        .await
+        .unwrap();
+        h.tx.send(GroupMsg::NextItem {
+            sender: m1,
+            playlist_item_id: Some(plis[0].clone()),
+        })
+        .await
+        .unwrap();
+        h.tx.send(GroupMsg::PreviousItem {
+            sender: m1,
+            playlist_item_id: Some(plis[1].clone()),
+        })
+        .await
+        .unwrap();
+        let snap = snapshot_of(&h).await;
+        assert_eq!(
+            snap.current_item_id.as_deref(),
+            Some("10"),
+            "back on the held entry"
+        );
+        let (_m2, mut rx2) = add_member(&h, &sinks, "late").await;
+        assert_eq!(next_held(&mut rx2).await, None);
     }
 
     /// V986, ODD: every outcome of a hold is counted under its own label.
