@@ -1837,9 +1837,11 @@ impl SegmentIdentity {
         // Off adds nothing, so every SDR segment keeps the name it had; an HDR
         // source cached before tonemapping existed holds untonemapped pixels
         // under the bare name and is never read for a tonemapped request.
+        // `_tm2`: the 203 nit reference white (ADR-0091); `_tm` entries hold the
+        // darker 100 nit picture and are never read again.
         let tonemap = match tonemap {
             pharos_transcode::Tonemap::Off => "",
-            pharos_transcode::Tonemap::HdrToSdr => "_tm",
+            pharos_transcode::Tonemap::HdrToSdr => "_tm2",
         };
         format!(
             "{seg_index}-a{audio_index}-s{sub}-v{}-b{}-c{codec_tag}{gen}{stereo}{tonemap}.ts",
@@ -10662,7 +10664,7 @@ mod tests {
             key_sdr.filename()
         );
         assert!(
-            key_hdr.filename().ends_with("_tm.ts"),
+            key_hdr.filename().ends_with("_tm2.ts"),
             "{}",
             key_hdr.filename()
         );
@@ -12531,6 +12533,42 @@ mod tests {
         assert!(sidecar_new.exists(), "newer segment's sidecar must stay");
         assert_eq!(cache.entry_count().await, 1);
         assert_eq!(cache.total_bytes().await, 400);
+    }
+
+    /// ADR-0091 renamed tonemapped segments `_tm` -> `_tm2`, so no key ever
+    /// names an old `_tm` file again. The cap walks the disk, not the LRU, so
+    /// an orphaned `_tm` file (not in the in-memory LRU after a restart) must
+    /// still be counted and reclaimed oldest-first.
+    #[tokio::test]
+    async fn enforce_cap_reclaims_orphaned_pre_adr_0091_tm_segments() {
+        let td = TempDir::new().unwrap();
+        let cache = HlsSegmentCache::new(td.path(), 600);
+        let mut opts = segment_opts();
+        opts.tonemap = pharos_transcode::Tonemap::HdrToSdr;
+        let key = SegmentIdentity::new(3, 0, None, None, &opts, SourceGen::LOCAL);
+        let seg_new = cache.segment_path_keyed(key);
+        let name_new = seg_new.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name_new.ends_with("_tm2.ts"), "{name_new}");
+        let seg_old = seg_new.with_file_name(name_new.replace("_tm2.ts", "_tm.ts"));
+        assert_ne!(seg_old, seg_new);
+
+        tokio::fs::create_dir_all(seg_new.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&seg_old, vec![0u8; 400]).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        tokio::fs::write(&seg_new, vec![0u8; 400]).await.unwrap();
+        cache.record(key, 400).await;
+
+        let future = SystemTime::now() + Duration::from_secs(3600);
+        let report = cache.enforce_cap_at(future, JANITOR_GRACE).await;
+        assert_eq!(report.scanned_bytes, 800);
+        assert_eq!(report.evicted_files, 1);
+        assert!(
+            !seg_old.exists(),
+            "the orphaned `_tm` file must be reclaimed"
+        );
+        assert!(seg_new.exists(), "the live `_tm2` segment must stay");
     }
 
     #[tokio::test]
