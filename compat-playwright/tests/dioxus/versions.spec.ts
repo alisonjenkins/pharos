@@ -130,6 +130,9 @@ test.describe("versions and 3D (spec 022)", () => {
     }, { timeout: 10_000 }).toBe(true);
 
     await page.locator(".pharos-player").hover();
+    // V923: headless Chromium has no immersive VR, so no VR button.
+    await expect(page.getByRole("combobox", { name: "3D view" })).toBeVisible();
+    await expect(page.getByRole("button", { name: "Watch in VR" })).toHaveCount(0);
     await page.getByRole("combobox", { name: "3D view" }).selectOption("both-eyes");
     await expect(frame).not.toHaveAttribute("data-packing", /.*/);
     // Kept on this device only (V922).
