@@ -742,6 +742,9 @@ fn parse_year(text: &str) -> Option<u32> {
 
 /// `YYYY` from a `YYYY-MM-DD` (or `YYYY/MM/DD`) date string.
 fn year_from_date(text: &str) -> Option<u32> {
+    if is_epoch_placeholder(text) {
+        return None;
+    }
     let y: u32 = text.get(..4)?.parse().ok()?;
     (1800..3000).contains(&y).then_some(y)
 }
@@ -778,6 +781,9 @@ fn normalise_certification(text: &str) -> String {
 /// `pub(crate)` so the `embedded` provider reuses it for a container's raw
 /// `release_date` tag (B90).
 pub(crate) fn parse_date_unix(text: &str) -> Option<i64> {
+    if is_epoch_placeholder(text) {
+        return None;
+    }
     // Take the date portion before any whitespace/`T`.
     let date = text.split(|c: char| c == 'T' || c.is_whitespace()).next()?;
     let mut parts = date.split(['-', '/', '.']);
@@ -788,6 +794,15 @@ pub(crate) fn parse_date_unix(text: &str) -> Option<i64> {
         return None;
     }
     Some(days_from_civil(y, m, d) * 86_400)
+}
+
+/// B984 — `1970-01-01` is what a writer puts for an unknown air date (an
+/// unaired anime episode's NFO carries it with `<year>1970</year>`); read as a
+/// date it is unix second 0 and lands decades outside the show's run.
+fn is_epoch_placeholder(text: &str) -> bool {
+    text.split(|c: char| c == 'T' || c.is_whitespace())
+        .next()
+        .is_some_and(|d| matches!(d.trim(), "1970-01-01" | "1970/01/01" | "1970.01.01"))
 }
 
 /// Days since the unix epoch (1970-01-01) for a proleptic-Gregorian date,
