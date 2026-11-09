@@ -277,7 +277,8 @@ struct Pump {
 
 /// What the pump sends next.
 enum Next {
-    Events(Vec<Event>),
+    /// The events, and the highest `seq` they cover.
+    Events(Vec<Event>, u64),
     Resync(u64),
 }
 
@@ -298,12 +299,15 @@ impl Pump {
         }
     }
 
-    fn wants(&self, event: &Event) -> bool {
-        event.seq > self.last
-            && event
-                .payload
-                .topic()
-                .map_or(true, |t| self.topics.contains(&t))
+    fn wants_topic(&self, event: &Event) -> bool {
+        event
+            .payload
+            .topic()
+            .map_or(true, |t| self.topics.contains(&t))
+    }
+
+    fn take(&self, pending: &mut VecDeque<Event>) -> (Vec<Event>, u64) {
+        take_batch(pending, self.last, |e| self.wants_topic(e))
     }
 
     /// The ids of `ids` that `user` may see; none without a user, or when
@@ -372,6 +376,32 @@ impl Pump {
     }
 }
 
+/// The next push's events from `pending`, oldest first: each `seq` once and
+/// above `last` (a catch-up can overlap what the receiver still holds), those
+/// `wanted`, at most [`MAX_BATCH`]. Also the highest `seq` taken, kept or
+/// filtered, which the cursor moves to.
+fn take_batch(
+    pending: &mut VecDeque<Event>,
+    last: u64,
+    wanted: impl Fn(&Event) -> bool,
+) -> (Vec<Event>, u64) {
+    let mut reached = last;
+    let mut batch = Vec::new();
+    while batch.len() < MAX_BATCH {
+        let Some(event) = pending.pop_front() else {
+            break;
+        };
+        if event.seq <= reached {
+            continue;
+        }
+        reached = event.seq;
+        if wanted(&event) {
+            batch.push(event);
+        }
+    }
+    (batch, reached)
+}
+
 /// Sends `catchup`, then every live event on the subscription's topics, to
 /// its sink in `seq` order, at most [`MAX_BATCH`] per `push` and one `push`
 /// in flight at a time.
@@ -422,20 +452,31 @@ async fn pump(mut p: Pump, catchup: Catchup, _held: Held) {
                 Next::Resync(head)
             }
             None => {
-                let take = pending.len().min(MAX_BATCH);
-                Next::Events(pending.drain(..take).filter(|e| p.wants(e)).collect())
+                let (batch, reached) = p.take(&mut pending);
+                Next::Events(batch, reached)
             }
         };
-        let batch = match next {
-            Next::Resync(head) => vec![Event {
-                seq: head,
-                at: std::time::Instant::now(),
-                payload: Arc::new(Payload::Resync),
-            }],
-            Next::Events(batch) if batch.is_empty() => continue,
-            Next::Events(batch) => match p.scoped(batch).await {
-                Ok(batch) if batch.is_empty() => continue,
-                Ok(batch) => batch,
+        let (batch, reached) = match next {
+            Next::Resync(head) => (
+                vec![Event {
+                    seq: head,
+                    at: std::time::Instant::now(),
+                    payload: Arc::new(Payload::Resync),
+                }],
+                head,
+            ),
+            // Nothing for this subscriber, but the cursor still moves, so a
+            // later lag catches up from here rather than resyncing.
+            Next::Events(batch, reached) if batch.is_empty() => {
+                p.last = reached;
+                continue;
+            }
+            Next::Events(batch, reached) => match p.scoped(batch).await {
+                Ok(batch) if batch.is_empty() => {
+                    p.last = reached;
+                    continue;
+                }
+                Ok(batch) => (batch, reached),
                 Err(stop) => break stop,
             },
         };
@@ -455,7 +496,7 @@ async fn pump(mut p: Pump, catchup: Catchup, _held: Held) {
                     metrics::histogram!(EVENT_LAG_SECONDS, "topic" => topic)
                         .record(event.at.elapsed().as_secs_f64());
                 }
-                p.last = batch.iter().map(|e| e.seq).fold(p.last, u64::max);
+                p.last = p.last.max(reached);
             }
             Err(e) => {
                 for event in &batch {
@@ -547,5 +588,58 @@ fn write_event(mut out: event::Builder<'_>, event: &Event) {
             task.set_state(*state);
         }
         Payload::Resync => out.set_resync(()),
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    fn ev(seq: u64, payload: Payload) -> Event {
+        Event {
+            seq,
+            at: std::time::Instant::now(),
+            payload: Arc::new(payload),
+        }
+    }
+
+    fn lib(seq: u64) -> Event {
+        ev(
+            seq,
+            Payload::Library {
+                added: vec![],
+                removed: vec![],
+            },
+        )
+    }
+
+    #[test]
+    fn a_catch_up_overlapping_the_receiver_is_sent_once_in_order() {
+        // The window's replay, then what the receiver still held.
+        let mut pending: VecDeque<Event> = [5, 6, 7, 6, 7, 8].map(lib).into();
+        let (batch, reached) = take_batch(&mut pending, 4, |_| true);
+        assert_eq!(
+            batch.iter().map(|e| e.seq).collect::<Vec<_>>(),
+            [5, 6, 7, 8]
+        );
+        assert_eq!(reached, 8);
+    }
+
+    #[test]
+    fn a_batch_is_capped_and_the_rest_waits() {
+        let mut pending: VecDeque<Event> = (1..=600).map(lib).collect();
+        let (batch, reached) = take_batch(&mut pending, 0, |_| true);
+        assert_eq!(batch.len(), MAX_BATCH);
+        assert_eq!(reached, 256);
+        assert_eq!(pending.front().unwrap().seq, 257);
+    }
+
+    #[test]
+    fn filtered_events_still_move_the_cursor() {
+        let mut pending: VecDeque<Event> = (10..=12).map(lib).collect();
+        let (batch, reached) = take_batch(&mut pending, 9, |_| false);
+        assert!(batch.is_empty());
+        assert_eq!(reached, 12);
     }
 }
