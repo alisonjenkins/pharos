@@ -845,9 +845,9 @@
             # module; Firefox fetches it twice and warns the preload went
             # unused. modulepreload is the matching hint (V895).
             sed -i 's|<link rel="preload" as="script" \(href="[^"]*\.js"\) crossorigin>|<link rel="modulepreload" \1>|g' $out/index.html
-            if grep -q 'rel="preload" as="script"' $out/index.html \
+            if grep -Eq '<link[^>]*(rel="preload"[^>]*as="script"|as="script"[^>]*rel="preload")' $out/index.html \
               || ! grep -q 'rel="modulepreload"' $out/index.html; then
-              echo "pharosUiBundle: index.html still preloads the JS glue as a classic script" >&2
+              echo "pharosUiBundle: index.html preloads a script as a classic script, or has no modulepreload" >&2
               exit 1
             fi
             # dx logs a failed wasm-opt and carries on; DWARF left in the wasm
