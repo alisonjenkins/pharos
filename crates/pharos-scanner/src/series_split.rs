@@ -135,10 +135,11 @@ pub struct PlanContext {
 pub fn folders_of(paths: &[PathBuf]) -> BTreeMap<String, Vec<(PathBuf, Option<u32>)>> {
     let mut folders: BTreeMap<String, Vec<(PathBuf, Option<u32>)>> = BTreeMap::new();
     for path in paths {
-        if !crate::fs::is_episode_path(path) {
+        if !crate::fs::is_episode_path(path) && !crate::fs::is_show_folder_video(path) {
             continue;
         }
-        let Some(folder) = parse_series_info(path).and_then(|i| i.series_folder) else {
+        let Some(folder) = crate::fs::episode_series_info(path).and_then(|i| i.series_folder)
+        else {
             continue;
         };
         folders
@@ -674,6 +675,20 @@ mod tests {
             )),
             None
         );
+    }
+
+    /// V975 — a video that is an episode only by the show folder above it is
+    /// planned under that folder, not under the sub-folder it sits in.
+    #[test]
+    fn a_show_folder_episode_is_planned_under_its_show() {
+        let td = tempfile::TempDir::new().unwrap();
+        let show = td.path().join("Sword Art Online II");
+        std::fs::create_dir_all(show.join("SAO II")).unwrap();
+        std::fs::write(show.join("tvshow.nfo"), b"<tvshow/>").unwrap();
+        let file = show.join("SAO II/SAO II - 14 L@mBerT.mp4");
+        let folders = folders_of(std::slice::from_ref(&file));
+        let key = show.to_string_lossy().into_owned();
+        assert_eq!(folders.keys().collect::<Vec<_>>(), [&key]);
     }
 
     #[test]
