@@ -3647,6 +3647,19 @@ impl SeriesMetadataStore for SqliteStore {
     }
 }
 
+/// `(id, path, season, episode, premiere_date, match_source, match_provider,
+/// match_external_id)` of one episode row.
+type EpisodeEvidenceRow = (
+    i64,
+    String,
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
 impl SeriesIdentityStore for SqliteStore {
     #[tracing::instrument(skip(self, folders), fields(folders = folders.len()))]
     async fn series_overrides(&self, folders: &[String]) -> DomainResult<Vec<SeriesOverride>> {
@@ -3795,8 +3808,9 @@ impl SeriesIdentityStore for SqliteStore {
     }
 
     async fn series_episodes(&self, series_key: &str) -> DomainResult<Vec<SeriesEpisodeRow>> {
-        let rows: Vec<(String, Option<i64>, Option<i64>)> = sqlx::query_as(
-            "SELECT path, season_number, episode_number FROM media_items \
+        let rows: Vec<EpisodeEvidenceRow> = sqlx::query_as(
+            "SELECT id, path, season_number, episode_number, premiere_date, match_source, \
+                    match_provider, match_external_id FROM media_items \
              WHERE kind = 'episode' AND COALESCE(series_key, series_folder, series_name) = ?",
         )
         .bind(series_key)
@@ -3804,14 +3818,21 @@ impl SeriesIdentityStore for SqliteStore {
         .await
         .map_err(|e| DomainError::Backend(e.to_string()))?;
         let num = |n: Option<i64>| n.and_then(|n| u32::try_from(n).ok());
-        Ok(rows
-            .into_iter()
-            .map(|(path, season, episode)| SeriesEpisodeRow {
-                path,
-                season: num(season),
-                episode: num(episode),
+        rows.into_iter()
+            .map(|r| {
+                Ok(SeriesEpisodeRow {
+                    id: u64::try_from(r.0)
+                        .map_err(|e| DomainError::Backend(format!("id negative: {e}")))?,
+                    path: r.1,
+                    season: num(r.2),
+                    episode: num(r.3),
+                    premiere_date: r.4,
+                    match_source: r.5,
+                    match_provider: r.6,
+                    match_external_id: r.7,
+                })
             })
-            .collect())
+            .collect()
     }
 
     #[tracing::instrument(skip(self, keys), fields(keys = keys.len()))]
@@ -3839,6 +3860,117 @@ impl SeriesIdentityStore for SqliteStore {
             .into_iter()
             .filter_map(|(k, secs)| Some((k, crate::unix_year(secs)?)))
             .collect())
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn mark_series_reconcile(&self, series_key: &str, at: i64) -> DomainResult<u64> {
+        let res = sqlx::query(
+            "UPDATE media_items SET series_reconcile_pending = ? \
+             WHERE kind = 'episode' \
+               AND COALESCE(series_key, series_folder, series_name) = ? \
+               AND (match_source IS NULL OR match_source <> 'manual')",
+        )
+        .bind(at)
+        .bind(series_key)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| DomainError::Backend(e.to_string()))?;
+        Ok(res.rows_affected())
+    }
+
+    #[tracing::instrument(skip(self, ids), fields(ids = ids.len()))]
+    async fn mark_reconcile_items(&self, ids: &[MediaId], at: i64) -> DomainResult<u64> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let mut changed = 0_u64;
+        for chunk in ids.chunks(500) {
+            let placeholders = vec!["?"; chunk.len()].join(",");
+            let sql = format!(
+                "UPDATE media_items SET series_reconcile_pending = ? \
+                 WHERE kind = 'episode' AND id IN ({placeholders}) \
+                   AND (match_source IS NULL OR match_source <> 'manual')"
+            );
+            let mut q = sqlx::query(sqlx::AssertSqlSafe(sql)).bind(at);
+            for &id in chunk {
+                let id_i64 = i64::try_from(id)
+                    .map_err(|e| DomainError::Backend(format!("id overflow: {e}")))?;
+                q = q.bind(id_i64);
+            }
+            let res = q
+                .execute(&self.pool)
+                .await
+                .map_err(|e| DomainError::Backend(e.to_string()))?;
+            changed = changed.saturating_add(res.rows_affected());
+        }
+        Ok(changed)
+    }
+
+    async fn series_reconcile_pending(&self, limit: i64) -> DomainResult<Vec<(MediaId, i64)>> {
+        let rows: Vec<(i64, i64)> = sqlx::query_as(
+            "SELECT id, series_reconcile_pending FROM media_items \
+             WHERE series_reconcile_pending IS NOT NULL \
+             ORDER BY series_reconcile_pending, id LIMIT ?",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| DomainError::Backend(e.to_string()))?;
+        rows.into_iter()
+            .map(|(id, mark)| {
+                let id = u64::try_from(id)
+                    .map_err(|e| DomainError::Backend(format!("id negative: {e}")))?;
+                Ok((id, mark))
+            })
+            .collect()
+    }
+
+    async fn clear_series_reconcile(&self, id: MediaId, at: i64) -> DomainResult<bool> {
+        let id_i64 =
+            i64::try_from(id).map_err(|e| DomainError::Backend(format!("id overflow: {e}")))?;
+        let res = sqlx::query(
+            "UPDATE media_items SET series_reconcile_pending = NULL \
+             WHERE id = ? AND series_reconcile_pending = ?",
+        )
+        .bind(id_i64)
+        .bind(at)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| DomainError::Backend(e.to_string()))?;
+        Ok(res.rows_affected() == 1)
+    }
+
+    #[tracing::instrument(skip(self, keys), fields(keys = keys.len()))]
+    async fn readmit_series(&self, keys: &[String]) -> DomainResult<u64> {
+        if keys.is_empty() {
+            return Ok(0);
+        }
+        let placeholders = vec!["?"; keys.len()].join(",");
+        let sql = format!(
+            "UPDATE series_metadata SET metadata_refreshed_at = NULL \
+             WHERE series_key IN ({placeholders}) AND match_source IN ('search', 'none')"
+        );
+        let mut q = sqlx::query(sqlx::AssertSqlSafe(sql));
+        for k in keys {
+            q = q.bind(k);
+        }
+        let res = q
+            .execute(&self.pool)
+            .await
+            .map_err(|e| DomainError::Backend(e.to_string()))?;
+        Ok(res.rows_affected())
+    }
+
+    async fn delete_provider_artwork(&self, id: MediaId) -> DomainResult<Vec<(String, String)>> {
+        let id_i64 =
+            i64::try_from(id).map_err(|e| DomainError::Backend(format!("id overflow: {e}")))?;
+        sqlx::query_as::<_, (String, String)>(
+            "DELETE FROM artwork WHERE item_id = ? AND source <> 'local' RETURNING role, locator",
+        )
+        .bind(id_i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| DomainError::Backend(e.to_string()))
     }
 }
 

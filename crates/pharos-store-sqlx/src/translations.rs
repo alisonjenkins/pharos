@@ -241,6 +241,19 @@ macro_rules! impl_translation_store {
                         .map_err(backend)?;
                 Ok(gaps(provider, language, series, episodes))
             }
+
+            async fn delete_translations(&self, owner: &TranslationOwner) -> DomainResult<u64> {
+                let (kind, key) = owner_parts(owner);
+                let res = sqlx::query(
+                    "DELETE FROM metadata_translations WHERE owner_kind = $1 AND owner_key = $2",
+                )
+                .bind(kind)
+                .bind(key.as_str())
+                .execute(self.pool())
+                .await
+                .map_err(backend)?;
+                Ok(res.rows_affected())
+            }
         }
     };
 }
