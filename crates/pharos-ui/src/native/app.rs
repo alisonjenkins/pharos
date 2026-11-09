@@ -53,6 +53,7 @@ use super::queue::{
     video_kind, video_next_line, Queue, QueueAction, QueueCtx, Track, VideoQueueCtx,
     RESTART_AFTER_MS,
 };
+use super::report;
 use super::resume::{Item as ResumeItem, ResumeProbe, ResumeReport};
 use super::route::Route;
 use super::seen::{self, MemberSeen};
@@ -160,6 +161,7 @@ pub fn Root() -> Element {
     });
     use_effect(move || {
         let at = route();
+        super::report::note(&format!("route {}", at.path()));
         let mut next = stage.peek().clone();
         if let Some(view) = next.follow(&at) {
             platform::info(&format!(
@@ -1712,6 +1714,8 @@ fn NativeApp(route: Route) -> Element {
     use_context_provider(|| search);
     let mut palette = Palette(use_signal(|| false));
     use_context_provider(|| palette);
+    let mut report_open = ReportOpen(use_signal(|| false));
+    use_context_provider(|| report_open);
     super::keys::provide_key_mode();
     let whats_new_state = use_whats_new_state();
     use_context_provider(|| whats_new_state);
@@ -1719,8 +1723,15 @@ fn NativeApp(route: Route) -> Element {
         Rc::new(platform::on_key(move |key, ctrl, meta| {
             // Signed out there is no palette to open: leave the key alone
             // rather than open one that pops up right after sign-in.
-            let toggle = palette::is_toggle(key, ctrl, meta) && api.peek().is_some();
+            let signed_in = api.peek().is_some();
+            if report::is_shortcut(key, ctrl, meta) && signed_in {
+                report::note("key ctrl+shift+d: report a problem");
+                report_open.0.set(true);
+                return true;
+            }
+            let toggle = palette::is_toggle(key, ctrl, meta) && signed_in;
             if toggle {
+                report::note("key ctrl+k: palette");
                 let opening = !*palette.0.peek();
                 if opening {
                     search.clear();
@@ -1876,6 +1887,7 @@ fn NativeApp(route: Route) -> Element {
                                 return;
                             }
                             machine.write().apply(Event::SignOutSubmitted);
+                            report::forget();
                             spawn(async move {
                                 let reply = platform::sign_out().await;
                                 machine.write().apply(Event::SignOutAnswered(reply));
@@ -1905,6 +1917,9 @@ fn NativeApp(route: Route) -> Element {
                 WhatsNew { route }
                 if (palette.0)() {
                     PaletteScreen {}
+                }
+                if (report_open.0)() {
+                    ReportScreen {}
                 }
             }
         };
@@ -2205,6 +2220,65 @@ impl Search {
 #[derive(Clone, Copy)]
 struct Palette(Signal<bool>);
 
+/// Whether the "Report a problem" sheet is open (016 US5).
+#[derive(Clone, Copy)]
+struct ReportOpen(Signal<bool>);
+
+/// The sheet over the page. What it will send is captured and rendered once,
+/// when it opens, and Send posts those very bytes.
+#[component]
+fn ReportScreen() -> Element {
+    let ctx = use_context::<Ctx>();
+    let mut open = use_context::<ReportOpen>().0;
+    let preview = use_hook(|| report::render(&report::ReportContext::capture()));
+    let mut note = use_signal(String::new);
+    let mut sending = use_signal(|| false);
+    let mut result = use_signal(|| None::<Result<String, String>>);
+    rsx! {
+        report::ReportView {
+            open: true,
+            note: note(),
+            preview: preview.clone(),
+            sending: sending(),
+            result: result(),
+            on_note: move |text: String| note.set(text),
+            on_send: move |_| {
+                if *sending.peek() {
+                    return;
+                }
+                let Some(api) = ctx.api.peek().clone() else {
+                    result.set(Some(Err("not signed in".to_owned())));
+                    return;
+                };
+                sending.set(true);
+                let bytes = preview.clone().into_bytes();
+                let text = note.peek().clone();
+                spawn(async move {
+                    let size = bytes.len();
+                    let sent = api
+                        .report_problem(&call("telemetry", "report"), &text, &bytes)
+                        .await;
+                    let outcome = settle(ctx.machine, sent);
+                    match &outcome {
+                        Ok(id) => platform::info(&format!("pharos: report sent id={id} bytes={size}")),
+                        Err(e) => platform::warn(&format!("pharos: report failed bytes={size} error={e}")),
+                    }
+                    sending.set(false);
+                    result.set(Some(outcome));
+                });
+            },
+            on_close: move |_| open.set(false),
+            on_copy: move |id: String| {
+                spawn(async move {
+                    if !platform::copy_text(&id).await {
+                        platform::warn(&format!("pharos: report id {id} not copied: clipboard refused"));
+                    }
+                });
+            },
+        }
+    }
+}
+
 /// An old `/find` link: the palette took the find screen's place.
 #[component]
 fn FindRedirect() -> Element {
@@ -2301,6 +2375,14 @@ fn PaletteScreen() -> Element {
         _ => None,
     };
     let mut close = move || palette.0.set(false);
+    let mut report_open = use_context::<ReportOpen>().0;
+    let mut run_command = move |command: palette::Command| {
+        report::note(&format!("palette: {}", command.label()));
+        close();
+        match command {
+            palette::Command::ReportProblem => report_open.set(true),
+        }
+    };
     let on_key = move |evt: KeyboardEvent| match evt.key() {
         Key::Named(NamedKey::ArrowDown) | Key::Named(NamedKey::ArrowUp) => {
             evt.prevent_default();
@@ -2316,6 +2398,7 @@ fn PaletteScreen() -> Element {
                     active.set(Some(0));
                     search.edit(ctx, term);
                 }
+                Some(Row::Command(command)) => run_command(command),
                 Some(row) => {
                     if let Some(route) = row.route() {
                         remember();
@@ -2350,6 +2433,7 @@ fn PaletteScreen() -> Element {
                 close();
             },
             on_close: move |_| close(),
+            on_command: run_command,
         }
     }
 }
@@ -2948,8 +3032,49 @@ fn PrivacyScreen() -> Element {
             }
         }
     });
+    let mut report_open = use_context::<ReportOpen>();
+    let mut reports = use_signal(Vec::new);
+    let mut reload = use_signal(|| 0_u32);
+    // Read again after the sheet closes: a report just sent is in the list.
+    use_resource(move || async move {
+        let _ = reload();
+        if (report_open.0)() {
+            return;
+        }
+        let Some(api) = ctx.api.peek().clone() else {
+            return;
+        };
+        let listed = api
+            .list_reports(&call("telemetry", "list_reports"), false)
+            .await;
+        match settle(ctx.machine, listed) {
+            Ok(rows) => reports.set(rows),
+            Err(e) => notify(
+                notice,
+                format!("Could not load your problem reports: {e}"),
+                true,
+            ),
+        }
+    });
     rsx! {
         privacy::PrivacyView {
+            reports: reports.read().clone(),
+            on_report: move |()| {
+                report::note("settings: report a problem");
+                report_open.0.set(true);
+            },
+            on_delete_report: move |id: String| {
+                let Some(api) = ctx.api.peek().clone() else {
+                    return;
+                };
+                spawn(async move {
+                    let deleted = api.delete_report(&call("telemetry", "delete_report"), &id).await;
+                    if let Err(e) = settle(ctx.machine, deleted) {
+                        notify(notice, format!("Could not delete report {id}: {e}"), true);
+                    }
+                    reload.with_mut(|n| *n = n.wrapping_add(1));
+                });
+            },
             notice: notice.read().clone(),
             diagnostics: diagnostics(),
             diagnostics_key: diagnostics_gen(),

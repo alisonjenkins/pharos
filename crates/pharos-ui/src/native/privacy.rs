@@ -4,7 +4,10 @@
 
 use dioxus::prelude::*;
 
+use pharos_client::api::ReportSummary;
+
 use super::appearance::Notice;
+use super::report::ReportList;
 
 #[component]
 pub fn PrivacyView(
@@ -12,6 +15,9 @@ pub fn PrivacyView(
     diagnostics: bool,
     diagnostics_key: u32,
     on_diagnostics: EventHandler<bool>,
+    reports: Vec<ReportSummary>,
+    on_report: EventHandler<()>,
+    on_delete_report: EventHandler<String>,
 ) -> Element {
     rsx! {
         section { class: "pharos-settings-page pharos-privacy-page",
@@ -46,6 +52,21 @@ pub fn PrivacyView(
                     }
                 }
             }
+            h3 { "Report a problem" }
+            div { class: "pharos-settings-group pharos-reports",
+                p { class: "pharos-setting-help",
+                    "Sends this server a short trail of recent screens and errors, after showing you exactly what it holds. Nothing is sent until you press Send, whatever the switch above says. The server keeps a report for 30 days."
+                }
+                button {
+                    id: "report-problem",
+                    class: "pharos-button",
+                    r#type: "button",
+                    onclick: move |_| on_report.call(()),
+                    "Report a problem"
+                }
+                h4 { "Your problem reports" }
+                ReportList { reports, on_delete: on_delete_report }
+            }
         }
     }
 }
@@ -63,6 +84,15 @@ mod tests {
                         diagnostics,
                         diagnostics_key: 0,
                         on_diagnostics: |_| {},
+                        reports: vec![ReportSummary {
+                            id: "K7QM-2XRT".into(),
+                            received_wall_ms: 1_700_000_000_000,
+                            user_name: "me".into(),
+                            note: "it froze".into(),
+                            bytes: 1200,
+                        }],
+                        on_report: |_| {},
+                        on_delete_report: |_| {},
                     }
                 }
             },
@@ -102,5 +132,16 @@ mod tests {
     fn the_diagnostics_box_is_a_switch() {
         let html = page(false);
         assert!(diagnostics_box(&html).contains("role=\"switch\""), "{html}");
+    }
+
+    #[test]
+    fn the_page_offers_a_report_and_lists_the_users_reports_with_delete() {
+        let html = page(false);
+        assert!(html.contains("id=\"report-problem\""), "{html}");
+        assert!(html.contains("Your problem reports"), "{html}");
+        assert!(html.contains("K7QM-2XRT"), "{html}");
+        assert!(html.contains("2023-11-14 22:13 UTC"), "{html}");
+        assert!(html.contains("it froze"), "{html}");
+        assert!(html.contains(">Delete<"), "{html}");
     }
 }
