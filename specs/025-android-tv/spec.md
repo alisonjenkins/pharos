@@ -1,6 +1,6 @@
 # 025 — Android TV app (Dioxus, pure Rust)
 
-- **Status:** draft. Slice 0 done (`spike-0.md`, go for slice 1, qualified); slice 1 in progress.
+- **Status:** draft, partly built (audited 2026-11-09). Slice 0 done (`spike-0.md`); slice 1 partial (`native/android.rs`, manifest, `nix run .#android-apk`; #766, #997): WebView playback is still open, `native/android_page.rs::engine` errors for every engine on main (#1002 open for video); slice 2 largely done (`tv_page.rs`, `tv_auth.rs`, ten-foot UI #966); slice 3 (JNI MediaCodec playback) not started here, taken up by spec 032. NOT superseded: 032 is a second app and this one stays the default until 032 passes parity.
 - **Date:** 2026-11-04
 - **Asked by:** Alison, "I want to go the Rust route with Dioxus, it keeps it
   more like the Web version + means we don't have the heavy weight Java BS".
