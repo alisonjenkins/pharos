@@ -2645,7 +2645,7 @@ impl CopyRank {
 }
 
 static HEIGHT_RE: std::sync::LazyLock<Option<regex::Regex>> = std::sync::LazyLock::new(|| {
-    regex::Regex::new(r"(?i)(?:^|[^a-z0-9])(?:(4320|2160|1440|1080|720|576|480|360)[pi]|(4k|uhd|8k))(?:$|[^a-z0-9])").ok()
+    regex::Regex::new(r"(?i)(?:^|[^a-z0-9])(?:(4320|2160|1440|1080|720|576|480|360)[pi](?:\d{2,3})?|(4k|uhd|8k))(?:$|[^a-z0-9])").ok()
 });
 
 /// The picture height a release name states (`WEBDL-1080p`, `[2160p]`, `4K`).
@@ -7207,6 +7207,8 @@ mod tests {
             ("Film.2017.4K.HDR", Some(2160)),
             ("Show S01E01 HDTV-720p Proper", Some(720)),
             ("Show S01E01 1080i", Some(1080)),
+            ("Show S01E01 WEB-DL 1080p60", Some(1080)),
+            ("Film 2160p50 HDR", Some(2160)),
             ("Show S01E01", None),
             ("Room 1080", None),
             ("x1080p", None),
