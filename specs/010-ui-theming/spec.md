@@ -2,7 +2,7 @@
 
 **Feature directory**: `specs/010-ui-theming/`
 **Created**: 2026-11-01
-**Status**: planned 2026-11-02 (next: `/speckit-tasks`)
+**Status**: phases 1-2 implemented 2026-11-02 (#528, #530); server-side Prefs storage, admin defaults, share-by-URL open (see Progress, audited 2026-11-09)
 **Input**: "Take inspiration from UIs like Netflix + Kali's prettiest themes …
 themeable by the user." (Alison, 2026-11-01)
 **Depends on**: 009 (design tokens FR-007, GPU layer FR-005)
@@ -153,3 +153,17 @@ high-contrast theme from `prefers-contrast: more`.
 ## Out of scope
 
 Arbitrary user CSS or shader code. Per-library themes.
+
+## Progress (audited 2026-11-09)
+
+Evidence is `crates/pharos-ui/src/theme/`, `native/appearance.rs`, `themes/`.
+
+- US1 pick a theme: done (#528 engine + seven shipped themes in `crates/pharos-ui/themes/`; #530 Appearance gallery).
+- US2 tweak a theme: done (#530; `theme/editor.rs` with live contrast rows).
+- US3 follow the user: partial. Device-local via `localStorage` (305d757a); server-side Prefs storage (plan phase 3) not found.
+- US4 share themes: partial. File export/import and paste import in `appearance.rs`; import from URL not verified.
+- US5 server default and login theme (FR-008): not started (no admin default/login theme found).
+- US6 accessibility guard: done for contrast (`theme/contrast.rs`, editor shows failing pairs); axe run depends on 009 US6 and is open.
+- US7 follow the OS: done (`theme/device.rs` `auto` theme from prefers-color-scheme and prefers-contrast, 305d757a).
+- FR-007 effects budget: partial; animated shader backdrops (#564) and reduced-motion guards exist; frame-time scale-down not confirmed.
+- ADR-0036 records TOML themes over a token model.
