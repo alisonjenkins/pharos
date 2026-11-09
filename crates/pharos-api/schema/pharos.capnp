@@ -12,7 +12,7 @@ annotation secret(field, param) :Void;
 
 # Bumped when the schema changes; served as ServerInfo.schemaVersion so a client
 # can tell which methods a server knows (FR-009).
-const schemaVersion :UInt32 = 34;
+const schemaVersion :UInt32 = 35;
 
 # ---- ids and shared types -------------------------------------------------
 struct ItemId {                # mirrors pharos_jellyfin_api::WireId
@@ -490,9 +490,22 @@ struct ClientSpan {
   attrs @8 :List(TelemetryEvent.Field);
 }
 struct ReportResult { union { reportId @0 :Text; error @1 :Error; } }
+struct ReportSummary {         # one stored problem report, without its bundle. Since schemaVersion 35.
+  id @0 :Text; receivedWallMs @1 :UInt64; userName @2 :Text; note @3 :Text; bytes @4 :UInt64;
+}
+struct ReportListResult { union { reports @0 :List(ReportSummary); error @1 :Error; } }
+struct ReportDocumentResult { union { document @0 :Data; error @1 :Error; } }   # the stored JSON document
 interface Telemetry {
   submit @0 (ctx :CallContext, events :List(TelemetryEvent), spans :List(ClientSpan)) -> (result :Done);
-  report @1 (ctx :CallContext, note :Text, bundle :Data) -> (result :ReportResult);
+  # "Report a problem" (016 US5): sent only when the user presses it, whatever the
+  # diagnostics opt-in. `bundle` is a UTF-8 JSON object (contracts/report-bundle.md).
+  report @1 (ctx :CallContext, note :Text $secret, bundle :Data $secret) -> (result :ReportResult);
+  # The caller's own reports, or with `everyone` (admins only) every user's. Since schemaVersion 35.
+  listReports @2 (ctx :CallContext, everyone :Bool) -> (result :ReportListResult);
+  # One report's document: its reporter or an admin. Since schemaVersion 35.
+  getReport @3 (ctx :CallContext, id :Text) -> (result :ReportDocumentResult);
+  # Deletes one report: its reporter or an admin. Since schemaVersion 35.
+  deleteReport @4 (ctx :CallContext, id :Text) -> (result :Done);
 }
 struct CountResult { union { count @0 :UInt32; error @1 :Error; } }
 interface Admin {
