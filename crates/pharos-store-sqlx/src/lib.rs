@@ -228,6 +228,35 @@ pub(crate) fn root_like_pattern(root: &str) -> String {
     out
 }
 
+/// Civil year (UTC) of a Unix timestamp in seconds (Howard Hinnant's
+/// `civil_from_days`).
+pub(crate) fn unix_year(secs: i64) -> Option<u32> {
+    let z = secs.div_euclid(86_400).checked_add(719_468)?;
+    let era = if z >= 0 { z } else { z.checked_sub(146_096)? } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if m <= 2 { y + 1 } else { y };
+    u32::try_from(year).ok()
+}
+
+#[cfg(test)]
+mod unix_year_tests {
+    use super::unix_year;
+
+    #[test]
+    fn converts_unix_seconds_to_utc_civil_year() {
+        assert_eq!(unix_year(0), Some(1970));
+        assert_eq!(unix_year(1_078_876_800), Some(2004));
+        assert_eq!(unix_year(867_715_200), Some(1997));
+        assert_eq!(unix_year(-1), Some(1969));
+        assert_eq!(unix_year(-214_704_000), Some(1963));
+    }
+}
+
 /// Pass attempts before the `sort_name` backfill gives up until the next start.
 pub(crate) const SORT_NAME_BACKFILL_ATTEMPTS: u32 = 5;
 

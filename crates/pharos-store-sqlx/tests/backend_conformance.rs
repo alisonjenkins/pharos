@@ -2746,6 +2746,192 @@ where
     );
 }
 
+/// Spec 033 — the series split's store contract: a put keeps a key the
+/// split wrote, the split's writes land, overrides are kept once, and the
+/// match pass sees a split folder as two shows.
+async fn run_series_identity_conformance<S>(store: S)
+where
+    S: pharos_core::MediaStore
+        + pharos_core::SeriesMetadataStore
+        + pharos_core::SeriesIdentityStore
+        + Send
+        + Sync,
+{
+    use pharos_core::{OverrideSource, SeriesKeyUpdate, SeriesOverride};
+    const ROOT: &str = "/media/series-identity";
+    const FOLDER: &str = "/media/series-identity/The Flash";
+    let split = format!("{FOLDER}\u{1f}1990");
+    let ep = |id: u64, file: &str, year: Option<u32>| {
+        let mut item = media_item(MediaId::from(id), file);
+        item.path = format!("{FOLDER}/Season 1/{file}").into();
+        item.kind = MediaKind::Episode;
+        item.series = Some(SeriesInfo {
+            series_name: "The Flash".into(),
+            season_number: Some(1),
+            episode_number: Some(1),
+            series_folder: Some(FOLDER.into()),
+            series_year: year,
+            series_key: None,
+        });
+        item
+    };
+    let old = ep(9_300_001, "The Flash (1990) - S01E01.mkv", None);
+    let new = ep(9_300_002, "The Flash (2014) - S01E01.mkv", None);
+    MediaStore::put(&store, old.clone()).await.unwrap();
+    MediaStore::put(&store, new.clone()).await.unwrap();
+
+    let mut rows = store.series_identity_rows(ROOT).await.unwrap();
+    rows.sort_by(|a, b| a.path.cmp(&b.path));
+    assert_eq!(rows.len(), 2);
+    assert!(rows
+        .iter()
+        .all(|r| r.series_key.is_none() && r.series_year.is_none()));
+    assert!(store
+        .series_identity_rows("/media/elsewhere")
+        .await
+        .unwrap()
+        .is_empty());
+
+    let updates = [
+        SeriesKeyUpdate {
+            path: rows[0].path.clone(),
+            series_key: Some(split.clone()),
+            series_year: Some(1990),
+        },
+        SeriesKeyUpdate {
+            path: rows[1].path.clone(),
+            series_key: None,
+            series_year: Some(2014),
+        },
+    ];
+    assert_eq!(store.set_series_keys(&updates).await.unwrap(), 2);
+    assert_eq!(
+        store.set_series_keys(&updates).await.unwrap(),
+        0,
+        "idempotent"
+    );
+
+    // A re-probe writes no key and the folder's (absent) year; the split's
+    // key and stated year stay.
+    MediaStore::put(&store, old.clone()).await.unwrap();
+    MediaStore::put_batch(&store, std::slice::from_ref(&new))
+        .await
+        .unwrap();
+    let got = MediaStore::get(&store, old.id).await.unwrap();
+    let series = got.series.unwrap();
+    assert_eq!(series.series_key.as_deref(), Some(split.as_str()));
+    assert_eq!(series.series_year, Some(1990));
+    let got = MediaStore::get(&store, new.id).await.unwrap();
+    assert_eq!(got.series.unwrap().series_year, Some(2014));
+
+    // A moved file (new folder) loses the old folder's split.
+    let mut moved = old.clone();
+    if let Some(s) = moved.series.as_mut() {
+        s.series_folder = Some(format!("{ROOT}/The Flash (1990)"));
+        s.series_year = Some(1990);
+    }
+    MediaStore::put(&store, moved).await.unwrap();
+    let got = MediaStore::get(&store, old.id).await.unwrap();
+    assert_eq!(got.series.unwrap().series_key, None);
+    MediaStore::put(&store, old.clone()).await.unwrap();
+    store.set_series_keys(&[updates[0].clone()]).await.unwrap();
+
+    // The match pass sees two shows, each with its own year.
+    let need = SeriesMetadataStore::series_needing_match(&store, 1000, i64::MAX)
+        .await
+        .unwrap();
+    let year_of = |key: &str| {
+        need.iter()
+            .find(|c| c.series_key == key)
+            .map(|c| c.series_year)
+    };
+    assert_eq!(year_of(FOLDER), Some(Some(2014)));
+    assert_eq!(year_of(&split), Some(Some(1990)));
+
+    // Overrides: one owner row per folder and source.
+    let owner = SeriesOverride {
+        id: 0,
+        series_folder: FOLDER.into(),
+        path: None,
+        target_key: FOLDER.into(),
+        target_name: None,
+        target_year: Some(2014),
+        source: OverrideSource::Scanner,
+        created_by: None,
+        created_at: 1_700_000_000,
+    };
+    assert!(store.insert_series_override(owner.clone()).await.unwrap());
+    assert!(!store
+        .insert_series_override(SeriesOverride {
+            target_year: Some(1990),
+            ..owner.clone()
+        })
+        .await
+        .unwrap());
+    assert!(store
+        .insert_series_override(SeriesOverride {
+            source: OverrideSource::Admin,
+            created_by: Some("admin".into()),
+            ..owner.clone()
+        })
+        .await
+        .unwrap());
+    let all = store.series_overrides(&[FOLDER.to_string()]).await.unwrap();
+    assert_eq!(all.len(), 2);
+    assert_eq!(all[0].target_year, Some(2014));
+    assert_eq!(all[0].source, OverrideSource::Scanner);
+    assert_eq!(all[1].source, OverrideSource::Admin);
+    assert!(store.series_overrides(&[]).await.unwrap().is_empty());
+
+    // The stored match's premiere year, by key.
+    SeriesMetadataStore::upsert_series_metadata(
+        &store,
+        pharos_core::SeriesMetadata {
+            series_key: FOLDER.into(),
+            series_name: "The Flash".into(),
+            match_source: Some("search".into()),
+            // 2014-10-07T00:00:00Z
+            premiere_date: Some(1_412_640_000),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let years = store
+        .series_premiere_years(&[FOLDER.to_string(), split.clone()])
+        .await
+        .unwrap();
+    assert_eq!(years.get(FOLDER), Some(&2014));
+    assert_eq!(years.get(&split), None);
+
+    let sweep = MediaStore::begin_scan(&store, std::path::Path::new(ROOT))
+        .await
+        .unwrap();
+    MediaStore::sweep_unseen(&store, sweep, ROOT).await.unwrap();
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn sqlite_series_identity_conformance() {
+    let s = pharos_store_sqlx::sqlite::SqliteStore::connect("sqlite::memory:")
+        .await
+        .expect("connect in-memory sqlite");
+    run_series_identity_conformance(s).await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn postgres_series_identity_conformance() {
+    let Ok(url) = std::env::var("PHAROS_TEST_POSTGRES_URL") else {
+        eprintln!("SKIP postgres_series_identity_conformance: PHAROS_TEST_POSTGRES_URL unset");
+        return;
+    };
+    let p = pharos_store_sqlx::postgres::PostgresStore::connect(&url)
+        .await
+        .expect("connect postgres");
+    run_series_identity_conformance(p).await;
+}
+
 #[cfg(feature = "sqlite")]
 #[tokio::test]
 async fn sqlite_conformance() {

@@ -21,13 +21,14 @@ use pharos_core::{
     AuthError, AuthResult, AuthToken, Collection, CollectionCount, CollectionStore, DomainError,
     DomainResult, EntityCounts, ExternalRatings, Fingerprint, Genre, GenreCount, GenreStore,
     IssuedToken, ItemPerson, Library, LibraryKind, LibraryStore, MediaId, MediaItem, MediaKind,
-    MediaMetadata, MediaProbe, MediaQuery, MediaStore, PersistedSyncGroup,
+    MediaMetadata, MediaProbe, MediaQuery, MediaStore, OverrideSource, PersistedSyncGroup,
     PersistedTranscodeSession, Person, PersonCount, PersonDetails, PersonKind, PersonRef,
     PersonStore, PlaybackProgress, Playlist, PlaylistEntry, PlaylistStore, PreferenceStore,
-    ResolvedToken, ScanState, SecretString, SeriesInfo, SeriesMatchCandidate, SeriesMetadata,
-    SeriesMetadataStore, Studio, StudioCount, StudioStore, SyncGroupStore, Tag, TagCount, TagStore,
-    TokenId, TokenScope, TokenSelector, TokenStore, TranscodeSessionStore, UserDataStore, UserId,
-    UserItemData, UserPolicy, UserRecord, UserStore,
+    ResolvedToken, ScanState, SecretString, SeriesIdentityRow, SeriesIdentityStore, SeriesInfo,
+    SeriesKeyUpdate, SeriesMatchCandidate, SeriesMetadata, SeriesMetadataStore, SeriesOverride,
+    Studio, StudioCount, StudioStore, SyncGroupStore, Tag, TagCount, TagStore, TokenId, TokenScope,
+    TokenSelector, TokenStore, TranscodeSessionStore, UserDataStore, UserId, UserItemData,
+    UserPolicy, UserRecord, UserStore,
 };
 
 const MEDIA_COLUMNS: &str = "id, path, title, kind, size_bytes, duration_ms, container, \
@@ -4215,6 +4216,184 @@ impl SeriesMetadataStore for PostgresStore {
                 let m: SeriesMetadata = r.into();
                 (m.series_key.clone(), m)
             })
+            .collect())
+    }
+}
+
+/// A `series_overrides` row as postgres decodes it (`target_year` is INT4).
+type OverrideRow = (
+    i64,
+    String,
+    Option<String>,
+    String,
+    Option<String>,
+    Option<i32>,
+    String,
+    Option<String>,
+    i64,
+);
+
+/// `(path, series_folder, series_key, series_year)` of one episode row.
+type IdentityRow = (String, Option<String>, Option<String>, Option<i32>);
+
+impl SeriesIdentityStore for PostgresStore {
+    #[tracing::instrument(skip(self, folders), fields(folders = folders.len()))]
+    async fn series_overrides(&self, folders: &[String]) -> DomainResult<Vec<SeriesOverride>> {
+        if folders.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows: Vec<OverrideRow> = sqlx::query_as(
+            "SELECT id, series_folder, path, target_key, target_name, target_year, source, \
+                    created_by, created_at \
+             FROM series_overrides WHERE series_folder = ANY($1) ORDER BY id",
+        )
+        .bind(folders)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| DomainError::Backend(e.to_string()))?;
+        Ok(rows
+            .into_iter()
+            .filter_map(
+                |(
+                    id,
+                    series_folder,
+                    path,
+                    target_key,
+                    target_name,
+                    target_year,
+                    source,
+                    created_by,
+                    created_at,
+                )| {
+                    Some(SeriesOverride {
+                        id,
+                        series_folder,
+                        path,
+                        target_key,
+                        target_name,
+                        target_year: target_year.and_then(|y| u32::try_from(y).ok()),
+                        source: OverrideSource::parse(&source)?,
+                        created_by,
+                        created_at,
+                    })
+                },
+            )
+            .collect())
+    }
+
+    #[tracing::instrument(skip(self, o), fields(folder = %o.series_folder, target = %o.target_key))]
+    async fn insert_series_override(&self, o: SeriesOverride) -> DomainResult<bool> {
+        let target_year = o
+            .target_year
+            .map(|y| {
+                i32::try_from(y).map_err(|e| DomainError::Backend(format!("year overflow: {e}")))
+            })
+            .transpose()?;
+        let res = sqlx::query(
+            "INSERT INTO series_overrides \
+                 (series_folder, path, target_key, target_name, target_year, source, created_by, \
+                  created_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(&o.series_folder)
+        .bind(&o.path)
+        .bind(&o.target_key)
+        .bind(&o.target_name)
+        .bind(target_year)
+        .bind(o.source.as_str())
+        .bind(&o.created_by)
+        .bind(o.created_at)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| DomainError::Backend(e.to_string()))?;
+        Ok(res.rows_affected() == 1)
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn series_identity_rows(
+        &self,
+        root_prefix: &str,
+    ) -> DomainResult<Vec<SeriesIdentityRow>> {
+        let like = crate::root_like_pattern(root_prefix);
+        let rows: Vec<IdentityRow> = sqlx::query_as(
+            "SELECT path, series_folder, series_key, series_year \
+             FROM media_items \
+             WHERE kind = 'episode' AND series_name IS NOT NULL AND path LIKE $1 ESCAPE '\\'",
+        )
+        .bind(like)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| DomainError::Backend(e.to_string()))?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(path, series_folder, series_key, series_year)| SeriesIdentityRow {
+                    path,
+                    series_folder,
+                    series_key,
+                    series_year: series_year.and_then(|y| u32::try_from(y).ok()),
+                },
+            )
+            .collect())
+    }
+
+    #[tracing::instrument(skip(self, updates), fields(updates = updates.len()))]
+    async fn set_series_keys(&self, updates: &[SeriesKeyUpdate]) -> DomainResult<u64> {
+        if updates.is_empty() {
+            return Ok(0);
+        }
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| DomainError::Backend(e.to_string()))?;
+        let mut changed = 0_u64;
+        for u in updates {
+            let year = u
+                .series_year
+                .map(|y| {
+                    i32::try_from(y)
+                        .map_err(|e| DomainError::Backend(format!("year overflow: {e}")))
+                })
+                .transpose()?;
+            let res = sqlx::query(
+                "UPDATE media_items SET series_key = $1, series_year = $2 \
+                 WHERE path = $3 AND (series_key IS DISTINCT FROM $1 OR series_year IS DISTINCT FROM $2)",
+            )
+            .bind(&u.series_key)
+            .bind(year)
+            .bind(&u.path)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| DomainError::Backend(e.to_string()))?;
+            changed = changed.saturating_add(res.rows_affected());
+        }
+        tx.commit()
+            .await
+            .map_err(|e| DomainError::Backend(e.to_string()))?;
+        Ok(changed)
+    }
+
+    #[tracing::instrument(skip(self, keys), fields(keys = keys.len()))]
+    async fn series_premiere_years(
+        &self,
+        keys: &[String],
+    ) -> DomainResult<std::collections::HashMap<String, u32>> {
+        if keys.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT series_key, premiere_date FROM series_metadata \
+             WHERE series_key = ANY($1) AND premiere_date IS NOT NULL",
+        )
+        .bind(keys)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| DomainError::Backend(e.to_string()))?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|(k, secs)| Some((k, crate::unix_year(secs)?)))
             .collect())
     }
 }
