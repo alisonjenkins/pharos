@@ -5,7 +5,7 @@
 **Revised**: 2026-11-04T14:30:00Z (the play queue landed as B435–B437; Alison
 chose the floating window, the mini-player bar, the swap button and a
 confirmed Clear queue)
-**Status**: ready
+**Status**: implemented (audited 2026-11-09): US1 and US2 (ece15388, native/stage.rs, ADR-0052, ADR-0053), US3 (listen.rs confirm, Playwright pharos-ui.spec.ts), US4 (375ebd22) all on main
 **Input**: "The player should enable us to explore the library while playback
 continues, for example we might want to go explore the music library while
 listening to music still to queue more tracks into a queue or maybe make a
