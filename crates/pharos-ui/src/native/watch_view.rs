@@ -11,6 +11,7 @@ use pharos_client::api::{Chapter, Item, ItemRef, Segment, Track, Trickplay};
 use super::keymap::{self, Mode, Transport};
 use super::keys;
 use super::quality::{self, QualityView};
+use super::scrub::{self, Scrub};
 
 use super::art::Art;
 use super::listen::{Icon, ICON_FLOAT, ICON_PIP};
@@ -39,6 +40,10 @@ const ICON_TOGETHER: &str = "M16 11a3 3 0 1 0 0-6 3 3 0 0 0 0 6Zm-8 0a3 3 0 1 0 
 
 /// How far the arrow keys and skip buttons seek.
 pub(super) const SEEK_STEP_MS: u64 = 10_000;
+/// Whether left and right preview a seek with its thumbnail and commit it
+/// on OK or a pause (B907), as a TV remote wants, instead of seeking 10 s
+/// at once as a keyboard does.
+const SCRUB_KEYS: bool = cfg!(target_os = "android");
 /// How far the up and down keys move the volume.
 const VOLUME_STEP: f64 = 0.1;
 /// How often a playing picture checks for a still pointer.
@@ -280,6 +285,36 @@ pub(super) fn next_audio(tracks: &[Track], pick: Option<u32>) -> Option<Control>
     Some(Control::Audio(next.index))
 }
 
+/// What a key does to a remote scrub (B907): left or right moves the
+/// preview, OK or play commits it, Back drops it; any other key, and every
+/// key while no preview is under way that is not left or right, passes on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ScrubKey {
+    Press { forward: bool },
+    Commit,
+    Cancel,
+    Pass,
+}
+
+pub(super) fn scrub_key(t: Option<Transport>, key: &Key, scrubbing: bool) -> ScrubKey {
+    match t {
+        Some(Transport::SeekForward) => return ScrubKey::Press { forward: true },
+        Some(Transport::SeekBack) => return ScrubKey::Press { forward: false },
+        _ => {}
+    }
+    if !scrubbing {
+        return ScrubKey::Pass;
+    }
+    match key {
+        Key::Named(NamedKey::Enter | NamedKey::MediaPlay | NamedKey::MediaPlayPause) => {
+            ScrubKey::Commit
+        }
+        Key::Named(NamedKey::Escape | NamedKey::GoBack | NamedKey::BrowserBack) => ScrubKey::Cancel,
+        _ if t == Some(Transport::TogglePlay) => ScrubKey::Commit,
+        _ => ScrubKey::Pass,
+    }
+}
+
 /// What the viewer asked for.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Control {
@@ -451,6 +486,19 @@ pub fn WatchView(
     );
     let segments = c.segments.clone();
     let up_next_shown = c.up_next.is_some();
+    // A remote scrub under way (B907): the seek bar previews its target and
+    // the seek happens once, when it ends.
+    let mut scrub = use_signal(|| None::<Scrub>);
+    let end_scrub = move |end: scrub::End| {
+        let Some(s) = *scrub.peek() else {
+            return;
+        };
+        scrub.set(None);
+        platform::info(&scrub::end_line(&s, end, platform::now_ms()));
+        if end != scrub::End::Cancelled {
+            on_control.call(Control::Seek(s.target_ms));
+        }
+    };
     let on_key = move |evt: KeyboardEvent| {
         wake();
         // Ctrl/Cmd chords are the browser's and the palette's (Ctrl+K):
@@ -469,7 +517,48 @@ pub fn WatchView(
             return;
         }
         // Shift+P / Shift+N are page-wide (B562), not the player's own.
-        let control = match keymap::transport(Mode::Player, &evt.key().to_string()) {
+        let transport = keymap::transport(Mode::Player, &evt.key().to_string());
+        if SCRUB_KEYS {
+            let mut end_scrub = end_scrub;
+            let scrubbing = scrub.peek().is_some();
+            match scrub_key(transport, &evt.key(), scrubbing) {
+                ScrubKey::Press { forward } => {
+                    evt.prevent_default();
+                    let now = platform::now_ms();
+                    let prev = *scrub.peek();
+                    let next = scrub::press(
+                        prev,
+                        forward,
+                        evt.is_auto_repeating(),
+                        pos.peek(),
+                        total,
+                        now,
+                    );
+                    scrub.set(Some(next));
+                    spawn(async move {
+                        platform::sleep_ms(scrub::SETTLE_MS).await;
+                        if (*scrub.peek()).map(|s| s.last_press) == Some(now) {
+                            end_scrub(scrub::End::Settled);
+                        }
+                    });
+                    return;
+                }
+                ScrubKey::Commit => {
+                    evt.prevent_default();
+                    evt.stop_propagation();
+                    end_scrub(scrub::End::Confirmed);
+                    return;
+                }
+                ScrubKey::Cancel => {
+                    evt.prevent_default();
+                    evt.stop_propagation();
+                    end_scrub(scrub::End::Cancelled);
+                    return;
+                }
+                ScrubKey::Pass => {}
+            }
+        }
+        let control = match transport {
             Some(Transport::Fullscreen) => Some(Control::Fullscreen),
             Some(Transport::NextSubtitle) => next_subtitle(&tracks.0, tracks.1),
             Some(Transport::NextAudio) => next_audio(&tracks.2, tracks.3),
@@ -641,7 +730,12 @@ pub fn WatchView(
                     SkipButton { segments: c.segments.clone(), pos, on_control }
                 }
                 div { class: "pharos-controls",
-                    SeekBar { controls: controls.clone(), total, on_control }
+                    SeekBar {
+                        controls: controls.clone(),
+                        total,
+                        on_control,
+                        scrub_ms: scrub().map(|s| s.target_ms),
+                    }
                     div { class: "pharos-control-row",
                         button {
                             class: "pharos-control",
@@ -805,11 +899,25 @@ fn UpNext(card: UpNextCard, on_control: EventHandler<Control>) -> Element {
 /// Played and buffered progress, chapter ticks, skippable spans and the
 /// trickplay preview under the pointer.
 #[component]
-fn SeekBar(controls: Controls, total: u64, on_control: EventHandler<Control>) -> Element {
+fn SeekBar(
+    controls: Controls,
+    total: u64,
+    on_control: EventHandler<Control>,
+    /// A remote scrub's target (B907): the knob and the preview sit there
+    /// until it is committed.
+    #[props(default)]
+    scrub_ms: Option<u64>,
+) -> Element {
     let c = &controls;
-    let at = Position::of(c).now();
+    let live = Position::of(c).now();
+    let at = scrub_ms.unwrap_or(live);
     let played = percent(at, total);
-    let hover = c.hover_ms.map(|ms| {
+    let class = if scrub_ms.is_some() {
+        "pharos-seek is-scrubbing"
+    } else {
+        "pharos-seek"
+    };
+    let hover = scrub_ms.or(c.hover_ms).map(|ms| {
         let chapter = c
             .chapters
             .iter()
@@ -823,7 +931,7 @@ fn SeekBar(controls: Controls, total: u64, on_control: EventHandler<Control>) ->
     rsx! {
         div {
             id: SEEK_ID,
-            class: "pharos-seek",
+            class,
             role: "slider",
             aria_label: "Seek",
             aria_valuemin: 0,
@@ -2228,6 +2336,69 @@ mod tests {
         let html = render(c);
         assert!(!html.contains("Skip intro"), "{html}");
         assert!(!html.contains(r#"aria-label="Audio""#), "{html}");
+    }
+
+    #[test]
+    fn remote_keys_drive_a_scrub_and_pass_the_rest_on() {
+        let t = |k: &str| keymap::transport(Mode::Player, k);
+        let right = Key::Named(NamedKey::ArrowRight);
+        let left = Key::Named(NamedKey::ArrowLeft);
+        let enter = Key::Named(NamedKey::Enter);
+        let back = Key::Named(NamedKey::Escape);
+        let space = Key::Character(" ".into());
+        assert_eq!(
+            scrub_key(t("ArrowRight"), &right, false),
+            ScrubKey::Press { forward: true }
+        );
+        assert_eq!(
+            scrub_key(t("ArrowLeft"), &left, true),
+            ScrubKey::Press { forward: false }
+        );
+        // With no preview, OK, play and Back keep their usual jobs.
+        for k in [&enter, &back, &space] {
+            assert_eq!(
+                scrub_key(t(&k.to_string()), k, false),
+                ScrubKey::Pass,
+                "{k}"
+            );
+        }
+        assert_eq!(scrub_key(t("Enter"), &enter, true), ScrubKey::Commit);
+        assert_eq!(scrub_key(t(" "), &space, true), ScrubKey::Commit);
+        assert_eq!(scrub_key(t("Escape"), &back, true), ScrubKey::Cancel);
+        let m = Key::Character("m".into());
+        assert_eq!(scrub_key(t("m"), &m, true), ScrubKey::Pass);
+    }
+
+    #[test]
+    fn a_scrub_previews_its_target_on_the_seek_bar() {
+        let mut c = controls();
+        c.media.position_ms = 60_000;
+        c.preview = Some(Trickplay {
+            width: 320,
+            height: 180,
+            interval_ms: 10_000,
+            thumb_count: 120,
+            tile_count: 2,
+            grid: 10,
+            tile_url: "/videos/7/trickplay/320/{tile}.jpg".into(),
+        });
+        let mut dom = VirtualDom::new_with_props(
+            |controls: Controls| {
+                let total = controls.total_ms();
+                rsx! {
+                    SeekBar { controls, total, on_control: |_| {}, scrub_ms: Some(310_000) }
+                }
+            },
+            c,
+        );
+        dom.rebuild_in_place();
+        let html = dioxus_ssr::render(&dom);
+        assert!(html.contains("pharos-seek is-scrubbing"), "{html}");
+        assert!(
+            html.contains("background-position: -320px -540px") && html.contains("5:10"),
+            "the thumbnail and time are the target's, not playback's: {html}"
+        );
+        assert!(html.contains(r#"aria-valuetext="5:10""#), "{html}");
     }
 
     #[test]
