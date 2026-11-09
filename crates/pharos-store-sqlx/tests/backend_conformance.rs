@@ -3032,6 +3032,18 @@ where
         .unwrap();
     assert_eq!(store.mark_reconcile_items(&[new.id], 400).await.unwrap(), 0);
     assert!(store.series_reconcile_pending(10).await.unwrap().is_empty());
+    let by_path = [
+        old.path.to_string_lossy().into_owned(),
+        new.path.to_string_lossy().into_owned(),
+        "/tv/nowhere.mkv".to_string(),
+    ];
+    assert_eq!(store.mark_reconcile_paths(&[], 450).await.unwrap(), 0);
+    assert_eq!(store.mark_reconcile_paths(&by_path, 500).await.unwrap(), 1);
+    assert_eq!(
+        store.series_reconcile_pending(10).await.unwrap(),
+        vec![(old.id, 500)]
+    );
+    assert!(store.clear_series_reconcile(old.id, 500).await.unwrap());
 
     MediaStore::set_artwork(&store, old.id, "Primary", "tvdb", "/cache/old-still.jpg")
         .await
