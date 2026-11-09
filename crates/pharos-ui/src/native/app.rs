@@ -4468,6 +4468,7 @@ fn Player(
     let start_paused = use_hook(|| was_paused.0.get());
     let mut sub_size = use_signal(stored_subtitle_size);
     let mut view_mode = use_signal(stored_view_mode);
+    let vr = use_resource(platform::vr_supported);
     let mut failed = use_signal(|| None::<PlayFailure>);
     let saved_volume = use_hook(last_volume);
     let mut media = use_signal(|| MediaState::at_volume(saved_volume.map(|(v, m, _)| (v, m))));
@@ -5754,6 +5755,7 @@ fn Player(
         subtitle_size: sub_size(),
         packing: versions::playing_stereo(&p.detail.versions, &p.version),
         view_mode: view_mode(),
+        vr: vr().unwrap_or(false),
         quality: QualityView {
             manual: manual_cap,
             auto: auto_cap,

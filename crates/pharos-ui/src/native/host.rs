@@ -241,6 +241,21 @@ pub fn pip_supported() -> bool {
 
 pub fn toggle_pip(_id: &str) {}
 
+/// No WebXR here (spec 022 US3).
+pub async fn vr_supported() -> bool {
+    false
+}
+
+pub fn enter_vr(
+    _id: &str,
+    _layout: &'static str,
+    _screen: (f64, f64),
+    _on_select: std::rc::Rc<dyn Fn()>,
+) {
+}
+
+pub fn exit_vr() {}
+
 pub fn select_field(_id: &str) {}
 
 pub fn focus_by_id(_id: &str) {}
