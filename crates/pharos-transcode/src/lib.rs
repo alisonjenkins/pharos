@@ -23,6 +23,7 @@ pub mod integrity;
 #[cfg(unix)]
 pub mod libav;
 pub mod options;
+pub mod output_size;
 #[cfg(unix)]
 pub mod probe;
 pub mod protocol;
@@ -47,6 +48,7 @@ pub use options::{
     per_eye_layout, stereo_mono_filter, AudioCodec, Container, FillerSpec, MuxedAudio, Output3D,
     RenditionKey, SourceCodec, StereoOutput, Tonemap, TonemapOutput, TranscodeOptions, VideoCodec,
 };
+pub use output_size::{OutputSize, ScaleReason, SizeLimits};
 pub use segment::{
     AudioDelivery, ContinuousAudio, SegmentAudio, SegmentContainer, SegmentOpts, SegmentVideo,
 };
