@@ -43,7 +43,10 @@ use crate::online_enrich::{
     apply_enrichment, download_and_cache_art, EnrichedMetadata, OnlineEnricher, RemoteArt,
     TextsFetch,
 };
-use crate::series_identity::{log_series_match, record_series_match, SeriesMatchOutcome};
+use crate::series_identity::{
+    episode_series_conflict, log_series_match, record_episode_rejected, record_series_match,
+    SeriesMatchOutcome,
+};
 use crate::state::Stores;
 use crate::tmdb::TmdbEnricher;
 use crate::tvdb::{ReqwestTransport, TvdbEnricher};
@@ -468,7 +471,7 @@ pub(crate) async fn enrich_one<Tm, Tv, S>(
 where
     Tm: OnlineEnricher,
     Tv: OnlineEnricher,
-    S: MediaStore + GenreStore + PersonStore + MetadataTranslationStore,
+    S: MediaStore + GenreStore + PersonStore + MetadataTranslationStore + SeriesMetadataStore,
 {
     let stem = search_stem(&item);
     let name = episode_name(&item);
@@ -681,6 +684,17 @@ where
             enriched,
         } => (external_id, source, confidence, *enriched),
     };
+    if item.kind == MediaKind::Episode {
+        observe_episode_series(
+            store,
+            &item,
+            matched_provider,
+            source,
+            &external_id,
+            &enriched,
+        )
+        .await;
+    }
 
     // Fold the record onto the item (local data always wins — apply_enrichment
     // only fills gaps), then stamp the matched provider id if we hadn't one.
@@ -889,6 +903,58 @@ where
     Ok(true)
 }
 
+/// Spec 033 — whether `item`'s provider record belongs to another show than
+/// the one its folder is matched to. Observation only: the record is still
+/// applied (V892 sets it aside once episodes inherit their show's match). A
+/// failed lookup of the pinned match observes nothing.
+async fn observe_episode_series<S: SeriesMetadataStore>(
+    store: &S,
+    item: &MediaItem,
+    provider: &str,
+    source: &str,
+    external_id: &str,
+    enriched: &EnrichedMetadata,
+) {
+    let Some(series) = item.series.as_ref() else {
+        return;
+    };
+    let key = series.series_key().to_string();
+    let pinned = match store
+        .series_metadata_by_keys(std::slice::from_ref(&key))
+        .await
+    {
+        Ok(mut found) => found.remove(&key),
+        Err(e) => {
+            tracing::debug!(error = %e, series_key = %key, "series identity: pinned match unreadable");
+            return;
+        }
+    };
+    let Some(reason) = episode_series_conflict(
+        provider,
+        source,
+        enriched.series_id.as_deref(),
+        pinned.as_ref(),
+    ) else {
+        return;
+    };
+    record_episode_rejected(reason);
+    tracing::info!(
+        media.id = item.id,
+        path = %item.path.display(),
+        series_key = %key,
+        provider,
+        source,
+        external_id,
+        record_series_id = enriched.series_id.as_deref().unwrap_or_default(),
+        pinned_series_id = pinned
+            .as_ref()
+            .and_then(|p| p.match_external_id.as_deref())
+            .unwrap_or_default(),
+        reason = reason.label(),
+        "episode metadata names another series than its show's match; would set aside (V892)"
+    );
+}
+
 /// FR1 — true when `id`'s row is currently `match_source = "manual"`
 /// (case-insensitive). Used immediately before every terminal
 /// `set_item_match` write in [`enrich_one`] to detect a concurrent manual
@@ -1011,7 +1077,7 @@ pub(crate) async fn apply_manual_match<Tm, Tv, S>(
 where
     Tm: OnlineEnricher,
     Tv: OnlineEnricher,
-    S: MediaStore + GenreStore + PersonStore + MetadataTranslationStore,
+    S: MediaStore + GenreStore + PersonStore + MetadataTranslationStore + SeriesMetadataStore,
 {
     store
         .set_item_match(id, provider, external_id, "manual", None, now)
@@ -4436,5 +4502,100 @@ mod tests {
             1,
             "two providers asked, one show counted"
         );
+    }
+
+    async fn pin_series(store: &SqliteStore, key: &str, id: &str) {
+        store
+            .upsert_series_metadata(SeriesMetadata {
+                series_key: key.into(),
+                series_name: "Cosmos".into(),
+                match_provider: Some("tvdb".into()),
+                match_external_id: Some(id.into()),
+                match_source: Some("search".into()),
+                metadata_refreshed_at: Some(NOW),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+    }
+
+    async fn cosmos_episode_with_record_of(record_series: &str) -> (u64, LogBuf) {
+        use metrics_util::debugging::DebuggingRecorder;
+        let recorder = DebuggingRecorder::new();
+        let snap = pharos_test_metrics::snapshotter(&recorder);
+        let _metrics = metrics::set_default_local_recorder(&recorder);
+        let (logs, _log) = log_capture();
+        let s = store().await;
+        pin_series(&s, "/tv/Cosmos", "74995").await;
+        let mut item = MediaItem {
+            id: 7,
+            path: "/tv/Cosmos/Season 01/Cosmos - S01E01.mkv".into(),
+            title: "The Shores of the Cosmic Ocean".into(),
+            kind: MediaKind::Episode,
+            series: Some(pharos_core::SeriesInfo {
+                series_name: "Cosmos".into(),
+                season_number: Some(1),
+                episode_number: Some(1),
+                series_folder: Some("/tv/Cosmos".into()),
+                series_year: None,
+            }),
+            ..MediaItem::default()
+        };
+        // A Jellyfin episode NFO's own TVDB id, of the 2014 remake's episode.
+        item.metadata.provider_ids.tvdb = Some("4777210".into());
+        s.put(item.clone()).await.unwrap();
+        let (_td, cache) = cache();
+        let tvdb = FakeEnricher::tvdb().with_detail(EnrichedMetadata {
+            title: Some("Standing Up in the Milky Way".into()),
+            series_id: Some(record_series.into()),
+            ..EnrichedMetadata::default()
+        });
+        enrich_one(
+            &s,
+            &sem(4),
+            &cache,
+            None::<&FakeEnricher>,
+            Some(&tvdb),
+            &MetadataConfig::default(),
+            item,
+            NOW,
+        )
+        .await
+        .unwrap();
+        let n = counter_value(
+            &snap,
+            "pharos_episode_metadata_rejected_total",
+            &[("reason", "nfo_other_series")],
+        );
+        (n, logs)
+    }
+
+    /// Spec 033 B931 — the Cosmos (1980) folder is matched to the 1980 show,
+    /// but its episode NFOs carry the 2014 remake's ids. The record is still
+    /// applied (V892 changes that), and the disagreement is counted and logged.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_episode_record_of_another_series_is_counted_and_logged() {
+        let (n, logs) = cosmos_episode_with_record_of("260586").await;
+        assert_eq!(n, 1);
+        let text = logs.text();
+        let line = text
+            .lines()
+            .find(|l| l.contains("names another series"))
+            .unwrap_or_else(|| panic!("no rejection line in {text}"));
+        for want in [
+            "record_series_id=\"260586\"",
+            "pinned_series_id=\"74995\"",
+            "external_id=\"4777210\"",
+            "reason=\"nfo_other_series\"",
+            "Cosmos - S01E01.mkv",
+        ] {
+            assert!(line.contains(want), "{want} missing from {line}");
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_episode_record_of_its_own_show_is_not_counted() {
+        let (n, _) = cosmos_episode_with_record_of("74995").await;
+        assert_eq!(n, 0);
     }
 }
