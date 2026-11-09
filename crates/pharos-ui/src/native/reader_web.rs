@@ -98,6 +98,10 @@ impl Saver {
             return;
         }
         self.gate.borrow_mut().sent(&key, now);
+        platform::info(&format!(
+            "pharos: reader save item={} locator={locator} fraction={fraction:.3} forced={forced}",
+            self.id
+        ));
         let (api, id, locator) = (self.api.clone(), self.id, locator.to_owned());
         platform::spawn_detached(async move {
             if let Err(e) = api
@@ -359,14 +363,16 @@ pub fn ReaderScreen(id: ItemRef) -> Element {
                 .await;
                 match opened {
                     Ok(o) if alive.get() => {
+                        let at = o.core.view.locator();
                         *weak.borrow_mut() = Rc::downgrade(&o.core);
                         toc.set(o.toc);
                         *core.borrow_mut() = Some(o.core);
                         phase.set(Phase::Reading);
                         platform::info(&format!(
-                            "pharos: reader opened item={id} format=epub bytes={length} ms={:.0} resumed={}",
+                            "pharos: reader opened item={id} format=epub bytes={length} ms={:.0} resumed={} at={}",
                             platform::now_ms() - began,
-                            saved.is_some()
+                            saved.is_some(),
+                            at
                         ));
                     }
                     Ok(o) => o.core.view.unmount(),
