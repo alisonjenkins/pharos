@@ -2,7 +2,7 @@
 
 **Feature directory**: `specs/017-native-api/`
 **Created**: 2026-11-01
-**Status**: clarified, planned and tasked (`/speckit-tasks` 2026-11-01); implementation starts at tasks.md Phase 1
+**Status**: implemented in large part (schemaVersion 31; Bootstrap, Session, Library, UserData, Playback, Prefs, Telemetry, Admin, Group, Membership live; pharos-client + browser transport); open: Events.subscribe (T041-T045, T026a), schema-compat gate (T054-T055), rpc CLI/tap (T052-T053), SC-002 bench (T040), docs and Angie (T057-T059), T061/T062/T064/T070 (audited 2026-11-09)
 **Input**: "We will still maintain compatibility with the Jellyfin clients,
 however Pharos was always meant to be the next gen. We will be having our own
 API endpoints but reusing the code we have written for the Jellyfin clients
