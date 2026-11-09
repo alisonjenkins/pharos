@@ -136,6 +136,45 @@ pub fn server_url(base: &str, path_and_query: &str) -> String {
     format!("{base}{path_and_query}")
 }
 
+/// A direct stream's `url` as the server's own address, carrying the
+/// Media-scoped `token` (ADR-0058) as `api_key`: an `<audio>` element cannot
+/// send a header, and loaded straight from the server (not through the page
+/// proxy) the server answers its `Range` requests itself, so it seeks.
+pub fn direct_media_url(base: &str, url: &str, token: &str) -> String {
+    let url = if url.starts_with('/') {
+        server_url(base, url)
+    } else {
+        url.to_owned()
+    };
+    let join = if url.contains('?') { '&' } else { '?' };
+    let mut encoded = String::with_capacity(token.len());
+    for b in token.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            encoded.push(char::from(b));
+        } else {
+            encoded.push_str(&format!("%{b:02X}"));
+        }
+    }
+    format!("{url}{join}api_key={encoded}")
+}
+
+/// How long before a media token expires the app asks for the next one, so
+/// a song started just before expiry still loads.
+pub const MEDIA_TOKEN_MARGIN_MS: u64 = 15 * 60 * 1000;
+
+/// The shortest wait between media-token requests, so a server answering
+/// with an already-expired token is not asked in a tight loop.
+pub const MEDIA_TOKEN_MIN_WAIT_MS: u64 = 30 * 1000;
+
+/// How long to wait before asking for the next media token, for one that
+/// expires at `expires_at_ms`, at `now_ms`.
+pub fn media_token_wait_ms(expires_at_ms: u64, now_ms: u64) -> u64 {
+    expires_at_ms
+        .saturating_sub(now_ms)
+        .saturating_sub(MEDIA_TOKEN_MARGIN_MS)
+        .max(MEDIA_TOKEN_MIN_WAIT_MS)
+}
+
 /// The container list a TV build declares: one no file has, so the server
 /// never offers direct play (an empty list would mean "any"). A file played
 /// straight from the server cannot seek here: the Android WebView applies a
@@ -188,6 +227,16 @@ pub enum Bridge {
         id: String,
         #[serde(flatten)]
         event: HlsEvent,
+    },
+    /// A directly played media element's `error`: its `MediaError` code and
+    /// message.
+    #[serde(rename = "mediaerror")]
+    MediaError {
+        id: String,
+        #[serde(default)]
+        code: u16,
+        #[serde(default)]
+        message: String,
     },
 }
 
@@ -327,6 +376,49 @@ pub fn script_takes(key: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_direct_stream_loads_from_the_server_with_the_media_token() {
+        let base = "https://media.example";
+        assert_eq!(
+            direct_media_url(base, "/audio/ab/universal?PlaySessionId=p", "t0k"),
+            "https://media.example/audio/ab/universal?PlaySessionId=p&api_key=t0k"
+        );
+        assert_eq!(
+            direct_media_url(base, "/audio/ab/stream", "a+b/c"),
+            "https://media.example/audio/ab/stream?api_key=a%2Bb%2Fc"
+        );
+        assert_eq!(
+            direct_media_url(base, "https://other.example/x?y=1", "t"),
+            "https://other.example/x?y=1&api_key=t"
+        );
+    }
+
+    #[test]
+    fn the_next_media_token_is_asked_for_before_this_one_expires() {
+        let six_h = 6 * 60 * 60 * 1000;
+        assert_eq!(
+            media_token_wait_ms(1_000 + six_h, 1_000),
+            six_h - MEDIA_TOKEN_MARGIN_MS
+        );
+        // Inside the margin, or already expired: soon, but never at once.
+        assert_eq!(media_token_wait_ms(2_000, 1_000), MEDIA_TOKEN_MIN_WAIT_MS);
+        assert_eq!(media_token_wait_ms(0, 1_000), MEDIA_TOKEN_MIN_WAIT_MS);
+    }
+
+    #[test]
+    fn a_media_error_reads_from_the_bridge() {
+        let v = serde_json::json!({"t": "mediaerror", "id": "pharos-video", "code": 4,
+            "message": "MEDIA_ELEMENT_ERROR: Format error"});
+        assert_eq!(
+            parse_bridge(&v),
+            Some(Bridge::MediaError {
+                id: "pharos-video".into(),
+                code: 4,
+                message: "MEDIA_ELEMENT_ERROR: Format error".into(),
+            })
+        );
+    }
 
     #[test]
     fn a_stored_https_server_wins_and_anything_else_falls_back() {
