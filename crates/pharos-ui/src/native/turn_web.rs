@@ -12,6 +12,7 @@ use wasm_bindgen::{JsCast as _, JsValue};
 use web_sys::{Document, Element, Event, HtmlCanvasElement, HtmlElement, HtmlVideoElement};
 
 use super::platform::{info, now_ms, warn};
+use super::stereo;
 use super::turn::{face_transform, Direction, Step, Turn, FADE_MS, GIVE_UP_MS, START_DEG, TURN_MS};
 use super::watch_view::VIDEO_ID;
 
@@ -57,10 +58,17 @@ thread_local! {
 extern "C" {
     #[wasm_bindgen(js_name = CanvasRenderingContext2D)]
     type Ctx2d;
+    /// `drawImage(image, sx, sy, sw, sh, dx, dy, dw, dh)`: `source` is the
+    /// part of the frame drawn, `x`..`h` where.
     #[wasm_bindgen(method, catch, js_name = drawImage)]
-    fn draw_image(
+    #[allow(clippy::too_many_arguments)]
+    fn draw_image_part(
         this: &Ctx2d,
         image: &HtmlVideoElement,
+        sx: f64,
+        sy: f64,
+        sw: f64,
+        sh: f64,
         x: f64,
         y: f64,
         w: f64,
@@ -278,7 +286,13 @@ fn build(doc: &Document, outgoing: Option<HtmlCanvasElement>, dir: Direction) ->
 }
 
 fn snapshot(video: &HtmlVideoElement) -> Option<HtmlCanvasElement> {
-    let (vw, vh) = (video.video_width(), video.video_height());
+    // A 3D version cropped to one eye turns as that eye (B961).
+    let packing = video
+        .parent_element()
+        .and_then(|f| f.get_attribute("data-packing"))
+        .and_then(|a| stereo::parse_packing(&a));
+    let eye = stereo::eye_rect(packing, stereo::Eye::Left);
+    let (vw, vh) = stereo::eye_size(packing, video.video_width(), video.video_height());
     let w = vw.min(SNAPSHOT_MAX_WIDTH);
     let h = (u64::from(vh) * u64::from(w) / u64::from(vw.max(1))).max(1);
     let h = u32::try_from(h).ok()?;
@@ -290,7 +304,22 @@ fn snapshot(video: &HtmlVideoElement) -> Option<HtmlCanvasElement> {
     canvas.set_width(w);
     canvas.set_height(h);
     let ctx = canvas.get_context("2d").ok()??.unchecked_into::<Ctx2d>();
-    if let Err(e) = ctx.draw_image(video, 0.0, 0.0, f64::from(w), f64::from(h)) {
+    let (fw, fh) = (
+        f64::from(video.video_width()),
+        f64::from(video.video_height()),
+    );
+    let drawn = ctx.draw_image_part(
+        video,
+        eye.x * fw,
+        eye.y * fh,
+        eye.w * fw,
+        eye.h * fh,
+        0.0,
+        0.0,
+        f64::from(w),
+        f64::from(h),
+    );
+    if let Err(e) = drawn {
         warn(&format!("pharos: turn snapshot failed error={e:?}"));
         return None;
     }
