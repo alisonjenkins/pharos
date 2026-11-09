@@ -2602,13 +2602,14 @@ fn film_copy_key(path: &Path) -> Option<(String, u32)> {
 }
 
 /// A release group at the end of a name: hyphenated and bracketed
-/// (`-[RARBG]`), a bracketed domain (`[YTS.AG]`), or a scene `-GROUP` straight
-/// after an encode word (`x264-SPARKS`). A plain trailing bracket
+/// (`-[RARBG]`), a bracketed domain (`[YTS.AG]`), a scene `-GROUP` straight
+/// after an encode word (`x264-SPARKS`, `x264-MgB [ETRG]`), or a `.GROUP`
+/// straight after a codec (`x264.Deceit`). A plain trailing bracket
 /// (`[Extended]`) is an edition and stays.
 static RELEASE_GROUP_RE: std::sync::LazyLock<Option<regex::Regex>> = std::sync::LazyLock::new(
     || {
         regex::Regex::new(
-            r"(?i)(?:-\s*\[[^\[\]]*\]\s*$|[-. ]*\[[^\[\]]*\.[^\[\]]*\]\s*$|(?P<enc>x26[45]|h\.?26[45]|hevc|xvid|divx|av1|\d{3,4}p|bluray|web-?dl|webrip|hdtv|aac|ac3|dts|atmos)-[a-z0-9.]+$)",
+            r"(?i)(?:-\s*\[[^\[\]]*\]\s*$|[-. ]*\[[^\[\]]*\.[^\[\]]*\]\s*$|(?P<enc>x26[45]|h\.?26[45]|hevc|xvid|divx|av1|\d{3,4}p|bluray|web-?dl|webrip|hdtv|aac|ac3|dts|atmos)-[a-z0-9.]+(?:\s*\[[^\[\]]*\])?$|(?P<codec>x26[45]|h\.?26[45]|hevc|xvid|divx)\.[a-z0-9]+$)",
         )
         .ok()
     },
@@ -2625,7 +2626,9 @@ fn strip_release_group(name: &str) -> String {
         let (Some(all), enc) = (caps.get(0), caps.name("enc")) else {
             break;
         };
-        let cut = enc.map_or(all.start(), |e| e.end());
+        let cut = enc
+            .or_else(|| caps.name("codec"))
+            .map_or(all.start(), |e| e.end());
         let next = name.get(..cut).unwrap_or("").trim_end().to_string();
         if next.len() == name.len() {
             break;
@@ -2720,6 +2723,9 @@ const FILM_RELEASE_WORDS: &[&str] = &[
     "mp3",
     "proper",
     "repack",
+    "yify",
+    "yts",
+    "rarbg",
     "3d",
     "sbs",
     "hsbs",
@@ -7736,6 +7742,37 @@ mod tests {
             film_copy_key(Path::new("/m/The Thing (2011)/The Thing.mkv")),
             thing,
             "a remake's folder year keeps it apart"
+        );
+    }
+
+    /// V960: a scene name's release group and codec tail never keep a copy
+    /// apart from its film (B1001).
+    #[test]
+    fn a_scene_release_name_is_a_copy_of_its_film() {
+        let key = |p: &str| film_copy_key(Path::new(p));
+        let beowulf = key("/m/Beowulf (2007)/Beowulf (2007) Bluray-1080p.mkv");
+        assert_eq!(beowulf, Some(("beowulf".to_string(), 2007)));
+        assert_eq!(
+            key("/m/Beowulf (2007) [1080p]/Beowulf.2007.1080p.BrRip.x264.Deceit.mp4"),
+            beowulf
+        );
+        let fd3 = key("/m/Final Destination 3 (2006)/Final Destination 3 (2006) WEBDL-1080p.mkv");
+        assert_eq!(fd3, Some(("final destination 3".to_string(), 2006)));
+        for copy in [
+            "/m/x/Final Destination 3 2006 BluRay 720p DTS x264-MgB [ETRG].mkv",
+            "/m/x/Final.Destination.3.2006.1080p.BluRay.x264.AC3-ETRG.mp4",
+            "/m/x/Final Destination 3 2006 1080p YIFY.mp4",
+        ] {
+            assert_eq!(key(copy), fd3, "{copy}");
+        }
+        assert_eq!(
+            key("/m/x/Captain.America.The.Winter.Soldier.2014.720p.BluRay.x264.DTS-WiKi.mkv"),
+            key("/m/y/Captain America - The Winter Soldier (2014) Bluray-1080p.mkv"),
+        );
+        assert_ne!(
+            key("/m/Heat (1995) [Director's Cut].mkv"),
+            key("/m/Heat (1995).mkv"),
+            "an edition in brackets with no release group stays apart"
         );
     }
 
