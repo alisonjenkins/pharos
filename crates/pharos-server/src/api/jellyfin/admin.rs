@@ -976,9 +976,10 @@ struct DamagedFileDto {
     /// and jellyfin-web's own DTOs already carry ids as strings for exactly
     /// this reason (see `wire_id`/`item_id` throughout `items.rs`).
     media_id: String,
-    /// `None` when the id no longer resolves in the media store — see this
-    /// function's doc comment. Never used to drop the entry.
-    path: Option<String>,
+    /// `Path` is `None` when the id no longer resolves in the media store —
+    /// see this function's doc comment. Never used to drop the entry.
+    #[serde(flatten)]
+    file: FileNaming,
     verdict: &'static str,
     first_fault: Option<String>,
     first_fault_ms: Option<u64>,
@@ -987,17 +988,53 @@ struct DamagedFileDto {
     read_errors: u64,
     scanned_ms: u64,
     declared_ms: Option<u64>,
-    /// What a person calls the file, so the admin list reads "Series ·
-    /// S01E02 · Name" rather than a path. All `None` when the row is gone.
+    /// Unix seconds. `None` for a verdict recorded before the memo kept it.
+    checked_at: Option<i64>,
+    /// An admin asked for a re-read and the new verdict is not in yet.
+    recheck_pending: bool,
+}
+
+/// What a person calls a file, so an admin list reads "Series · S01E02 ·
+/// Name" rather than a path. Every field is `None` when the row is gone.
+#[derive(Debug, Default, serde::Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct FileNaming {
+    path: Option<String>,
     kind: Option<&'static str>,
     name: Option<String>,
     series_name: Option<String>,
     season_number: Option<u32>,
     episode_number: Option<u32>,
-    /// Unix seconds. `None` for a verdict recorded before the memo kept it.
-    checked_at: Option<i64>,
-    /// An admin asked for a re-read and the new verdict is not in yet.
-    recheck_pending: bool,
+}
+
+impl FileNaming {
+    fn of(item: Option<&pharos_core::MediaItem>) -> Self {
+        let Some(item) = item else {
+            return Self::default();
+        };
+        let series = item.series.as_ref();
+        Self {
+            path: Some(item.path.to_string_lossy().into_owned()),
+            kind: Some(item.kind.as_str()),
+            name: Some(item.title.clone()),
+            series_name: series.map(|s| s.series_name.clone()),
+            season_number: series.and_then(|s| s.season_number),
+            episode_number: series.and_then(|s| s.episode_number),
+        }
+    }
+}
+
+/// The library rows for `ids`, in one store call. An id with no row is
+/// simply absent: the lists that use this still show it, unnamed. Any other
+/// store error fails the request rather than dropping entries one by one.
+async fn items_by_id(
+    state: &AppState,
+    ids: &[u64],
+) -> Result<std::collections::HashMap<u64, pharos_core::MediaItem>, actix_web::Error> {
+    let items = pharos_core::MediaStore::get_many(&state.stores, ids)
+        .await
+        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    Ok(items.into_iter().map(|i| (i.id, i)).collect())
 }
 
 async fn damaged_files(
@@ -1013,27 +1050,16 @@ async fn damaged_files(
     // The memo is a HashMap; sort so the listing is stable between requests.
     let mut damaged = memo.damaged();
     damaged.sort_unstable_by_key(|(id, _)| *id);
+    // A row that is gone (`NotFound`) is exactly the case this route exists
+    // to still surface — see the doc comment above.
+    let ids: Vec<u64> = damaged.iter().map(|(id, _)| *id).collect();
+    let items = items_by_id(&state, &ids).await?;
     let mut out = Vec::with_capacity(damaged.len());
     for (id, entry) in damaged {
-        // `NotFound` (row gone) is exactly the case this route exists to
-        // still surface — see the doc comment above. Any OTHER error
-        // (store unreachable) is the server's problem and 500s the whole
-        // request rather than silently dropping entries one by one.
-        let item = match pharos_core::MediaStore::get(&state.stores, id).await {
-            Ok(item) => Some(item),
-            Err(pharos_core::DomainError::NotFound(_)) => None,
-            Err(e) => return Err(error::ErrorInternalServerError(e.to_string())),
-        };
-        let series = item.as_ref().and_then(|i| i.series.as_ref());
         let r = &entry.report;
         out.push(DamagedFileDto {
             media_id: id.to_string(),
-            path: item.as_ref().map(|i| i.path.to_string_lossy().into_owned()),
-            kind: item.as_ref().map(|i| i.kind.as_str()),
-            name: item.as_ref().map(|i| i.title.clone()),
-            series_name: series.map(|s| s.series_name.clone()),
-            season_number: series.and_then(|s| s.season_number),
-            episode_number: series.and_then(|s| s.episode_number),
+            file: FileNaming::of(items.get(&id)),
             checked_at: entry.checked_at,
             recheck_pending: state
                 .integrity_sweep
@@ -1129,8 +1155,18 @@ async fn integrity_recheck(
     state: web::Data<AppState>,
     user: AuthUser,
     path: web::Path<String>,
-) -> Result<impl Responder, actix_web::Error> {
+) -> Result<HttpResponse, actix_web::Error> {
     require_admin(&user)?;
+    let raw = path.into_inner();
+    let answer = integrity_recheck_inner(&state, &raw).await;
+    log_refusal("integrity re-check", &raw, &answer);
+    answer
+}
+
+async fn integrity_recheck_inner(
+    state: &AppState,
+    raw: &str,
+) -> Result<HttpResponse, actix_web::Error> {
     let Some(sweep) = state.integrity_sweep.as_ref() else {
         return Err(error::ErrorServiceUnavailable(
             "no integrity sweep on this build/platform (needs unix + the ffmpeg-lib backend)",
@@ -1143,7 +1179,6 @@ async fn integrity_recheck(
             "this replica does not run the integrity sweep; try again",
         ));
     }
-    let raw = path.into_inner();
     let id: u64 = raw
         .parse()
         .map_err(|_| error::ErrorBadRequest(format!("not a media id: {raw:?}")))?;
@@ -1175,12 +1210,8 @@ async fn integrity_recheck(
 #[serde(rename_all = "PascalCase")]
 struct DeepCheckDto {
     media_id: String,
-    path: Option<String>,
-    kind: Option<&'static str>,
-    name: Option<String>,
-    series_name: Option<String>,
-    season_number: Option<u32>,
-    episode_number: Option<u32>,
+    #[serde(flatten)]
+    file: FileNaming,
     state: &'static str,
     errors: u64,
     first_error: Option<String>,
@@ -1201,22 +1232,20 @@ async fn deep_checks(
             "deep checks are not set up on this server",
         ));
     };
-    let mut out = Vec::new();
-    for e in deep.list() {
-        let item = match pharos_core::MediaStore::get(&state.stores, e.id).await {
-            Ok(item) => Some(item),
-            Err(pharos_core::DomainError::NotFound(_)) => None,
-            Err(err) => return Err(error::ErrorInternalServerError(err.to_string())),
-        };
-        let series = item.as_ref().and_then(|i| i.series.as_ref());
+    if !state.is_bg_leader() {
+        tracing::info!("deep check list refused: this replica is not the background leader");
+        return Err(error::ErrorServiceUnavailable(
+            "this replica does not run deep checks; try again",
+        ));
+    }
+    let entries = deep.list();
+    let ids: Vec<u64> = entries.iter().map(|e| e.id).collect();
+    let items = items_by_id(&state, &ids).await?;
+    let mut out = Vec::with_capacity(entries.len());
+    for e in entries {
         out.push(DeepCheckDto {
             media_id: e.id.to_string(),
-            path: item.as_ref().map(|i| i.path.to_string_lossy().into_owned()),
-            kind: item.as_ref().map(|i| i.kind.as_str()),
-            name: item.as_ref().map(|i| i.title.clone()),
-            series_name: series.map(|s| s.series_name.clone()),
-            season_number: series.and_then(|s| s.season_number),
-            episode_number: series.and_then(|s| s.episode_number),
+            file: FileNaming::of(items.get(&e.id)),
             state: e.state.label(),
             errors: e.report.errors,
             first_error: e.report.first_error,
@@ -1240,8 +1269,31 @@ async fn deep_check_request(
     state: web::Data<AppState>,
     user: AuthUser,
     path: web::Path<String>,
-) -> Result<impl Responder, actix_web::Error> {
+) -> Result<HttpResponse, actix_web::Error> {
     require_admin(&user)?;
+    let raw = path.into_inner();
+    let answer = deep_check_request_inner(&state, &raw).await;
+    log_refusal("deep check", &raw, &answer);
+    answer
+}
+
+/// The refusal side of an admin integrity request states as much as the
+/// acceptance does: which id, which answer, and why (ODD symmetry).
+fn log_refusal(what: &str, raw_id: &str, answer: &Result<HttpResponse, actix_web::Error>) {
+    if let Err(e) = answer {
+        tracing::info!(
+            media_id = raw_id,
+            status = e.as_response_error().status_code().as_u16(),
+            reason = %e,
+            "{what} refused",
+        );
+    }
+}
+
+async fn deep_check_request_inner(
+    state: &AppState,
+    raw: &str,
+) -> Result<HttpResponse, actix_web::Error> {
     let Some(deep) = state.integrity_deep.as_ref() else {
         return Err(error::ErrorServiceUnavailable(
             "deep checks are not set up on this server",
@@ -1249,10 +1301,9 @@ async fn deep_check_request(
     };
     if !state.is_bg_leader() {
         return Err(error::ErrorServiceUnavailable(
-            "this replica does not run integrity checks; try again",
+            "this replica does not run deep checks; try again",
         ));
     }
-    let raw = path.into_inner();
     let id: u64 = raw
         .parse()
         .map_err(|_| error::ErrorBadRequest(format!("not a media id: {raw:?}")))?;
@@ -1273,11 +1324,25 @@ async fn deep_check_request(
             "media item {id} is not a local file and cannot be checked"
         )));
     }
+    use crate::integrity_deep::{Requested, MAX_WAITING};
     let requested = deep.request(&item);
+    match requested {
+        Requested::QueueFull => {
+            return Err(error::ErrorTooManyRequests(format!(
+                "too many deep checks are waiting ({MAX_WAITING}); try again when some finish"
+            )))
+        }
+        Requested::Unavailable => {
+            return Err(error::ErrorInternalServerError(
+                "the deep check queue is unavailable after an internal fault; restart the server",
+            ))
+        }
+        Requested::Queued | Requested::AlreadyInProgress => {}
+    }
     tracing::info!(
         item = id,
         path = %item.path.display(),
-        already_in_progress = requested == crate::integrity_deep::Requested::AlreadyInProgress,
+        already_in_progress = requested == Requested::AlreadyInProgress,
         "deep check requested",
     );
     Ok(HttpResponse::Accepted().finish())
