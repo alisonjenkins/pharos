@@ -395,7 +395,7 @@ mod tests {
         assert!(sweep.has_not_checkable(3));
     }
 
-    /// The signal B895 names is `sum by (kind, verdict)`; renaming a label
+    /// The signal B899 names is `sum by (kind, verdict)`; renaming a label
     /// breaks that query silently, so the labels are pinned here.
     #[test]
     fn a_verdict_is_counted_by_verdict_and_kind() {
