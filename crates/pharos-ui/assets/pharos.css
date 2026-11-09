@@ -1120,6 +1120,13 @@ input:focus-visible {
   font: inherit;
   font-weight: 600;
 }
+/* A favourite mark (B1082): the star takes the accent while it is one. */
+.pharos-favorite.on {
+  border-color: var(--px-color-accent);
+}
+.pharos-favorite.on span {
+  color: var(--px-color-accent);
+}
 .pharos-overview {
   max-width: 60ch;
   line-height: 1.5;

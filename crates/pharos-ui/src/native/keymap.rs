@@ -254,6 +254,13 @@ pub const BINDINGS: &[Binding] = &[
         DETAIL,
         A::Press("watched"),
     ),
+    bind(
+        &["f"],
+        "Add to or remove from favourites",
+        G::Page,
+        DETAIL,
+        A::Press("favorite"),
+    ),
     bind(&["["], "Previous season", G::Page, DETAIL, A::Season(-1)),
     bind(&["]"], "Next season", G::Page, DETAIL, A::Season(1)),
     bind(
@@ -1037,6 +1044,10 @@ mod tests {
         assert_eq!(
             resolve(Mode::Detail, &["w"]),
             Resolved::Run(Action::Press("watched"))
+        );
+        assert_eq!(
+            resolve(Mode::Detail, &["f"]),
+            Resolved::Run(Action::Press("favorite"))
         );
         assert_eq!(
             resolve(Mode::Detail, &["]"]),

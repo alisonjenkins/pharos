@@ -73,8 +73,9 @@ use super::turn::{self, EpisodeTurn, EPISODE_TURN_KEY};
 use super::versions;
 use super::views::{
     open_route, reveal_palette_row, Busy, ErrorNote, FlashNote, GroupEndedNote, Hits, HomeView,
-    LoadError, LoadFailure, Loading, MarkPlayed, Nav, PaletteView, PlayFailure, PlayFromStart,
-    PlaybackFailure, SearchBox, Shell, SignInView, StatusView, TitleView, PALETTE_INPUT,
+    LoadError, LoadFailure, Loading, MarkFavorite, MarkPlayed, Nav, PaletteView, PlayFailure,
+    PlayFromStart, PlaybackFailure, SearchBox, Shell, SignInView, StatusView, TitleView,
+    PALETTE_INPUT,
 };
 use super::watch_view::{
     split_position, text_track_id, total_ms, Control, Controls, Skip, UpNextCard, VideoQueueView,
@@ -1662,6 +1663,40 @@ fn NativeApp(route: Route) -> Element {
                     marking.borrow_mut().remove(&id);
                     // Reload either way: a season that failed part way through
                     // has some episodes marked, and the screen shows what is stored.
+                    marks += 1;
+                });
+            },
+        ))
+    });
+    use_context_provider(|| {
+        let marking = Rc::new(RefCell::new(std::collections::HashSet::<ItemRef>::new()));
+        MarkFavorite(EventHandler::new(
+            move |(id, favorite, name): (ItemRef, bool, String)| {
+                let Some(api) = api.peek().clone() else {
+                    return;
+                };
+                // One mark per item at a time, as for watched.
+                if !marking.borrow_mut().insert(id) {
+                    platform::info(&format!(
+                        "pharos: mark {id} favorite={favorite} skipped: one in flight"
+                    ));
+                    return;
+                }
+                let marking = Rc::clone(&marking);
+                spawn(async move {
+                    let result = api
+                        .set_favorite(&call("mark", "favorite"), id, favorite)
+                        .await;
+                    if let Err(e) = settle(machine, result) {
+                        platform::warn(&format!(
+                            "pharos: marking {id} favorite={favorite} failed: {e}"
+                        ));
+                        flash.say(
+                            super::views::favorite_failure_line(&name, favorite, &e),
+                            true,
+                        );
+                    }
+                    marking.borrow_mut().remove(&id);
                     marks += 1;
                 });
             },
