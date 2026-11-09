@@ -2979,6 +2979,15 @@ mod tests {
         let meta = html.find("pharos-poster-meta").expect("year line");
         let ratings = html.find("pharos-ratings-tile").expect("ratings");
         assert!(art < name && name < meta && meta < ratings, "{html}");
+        // The art's element has closed before the ratings start: every div
+        // opened from the art onwards is closed again by then.
+        let art_open = html[..art].rfind("<div").expect("art div");
+        let between = &html[art_open..ratings];
+        assert_eq!(
+            between.matches("<div").count(),
+            between.matches("</div>").count() + 1,
+            "ratings must sit outside the art, inside only the year line: {html}"
+        );
         assert!(html[meta..ratings].contains(r#"title="1988""#), "{html}");
     }
 
