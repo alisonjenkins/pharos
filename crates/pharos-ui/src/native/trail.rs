@@ -118,6 +118,13 @@ mod tests {
                 cast: Vec::new(),
             })
         }
+        async fn person(
+            &self,
+            _: &CallInfo,
+            _: ItemRef,
+        ) -> Result<pharos_client::api::PersonPage, ClientError> {
+            Err(missing())
+        }
         async fn lyrics(
             &self,
             _: &CallInfo,
