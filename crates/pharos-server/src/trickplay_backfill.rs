@@ -304,14 +304,14 @@ async fn run_sweep(ctx: GenCtx) {
                 continue;
             }
         };
-        let mut general: Vec<&MediaItem> = items.iter().filter(|i| sweepable(i)).collect();
-        general.sort_by_key(|i| std::cmp::Reverse(i.created_at.unwrap_or(i64::MIN)));
-        tracing::info!(videos = general.len(), "trickplay sweep: pass starting");
+        let order = sweep_order(&items);
+        drop(items);
+        tracing::info!(videos = order.len(), "trickplay sweep: pass starting");
         let mut done_before = 0usize;
-        for item in general.iter() {
+        for &id in &order {
             if ctx
                 .cache
-                .is_generated(item.id, *ctx.widths.first().unwrap_or(&320))
+                .is_generated(id, *ctx.widths.first().unwrap_or(&320))
                 .await
             {
                 done_before += 1;
@@ -321,8 +321,20 @@ async fn run_sweep(ctx: GenCtx) {
             already_generated = done_before,
             "trickplay sweep: coverage before pass"
         );
-        for chunk in general.chunks(SWEEP_CONCURRENCY) {
-            let batch = chunk.iter().map(|item| generate_item(item, &ctx, false));
+        for chunk in order.chunks(SWEEP_CONCURRENCY) {
+            let items = match ctx.stores.get_many(chunk).await {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        first_id = chunk.first().copied().unwrap_or_default(),
+                        count = chunk.len(),
+                        "trickplay sweep: chunk fetch failed; skipped this pass"
+                    );
+                    continue;
+                }
+            };
+            let batch = items.iter().map(|item| generate_item(item, &ctx, false));
             futures_util::future::join_all(batch).await;
         }
         tracing::info!("trickplay sweep: pass complete");
@@ -393,6 +405,20 @@ async fn file_sig(path: &std::path::Path) -> Option<FileSig> {
 /// unwanted: trickplay and poster extraction are whole-file decodes, and doing
 /// one over the network on a bulk sweep is exactly the traffic the resolver
 /// exists to avoid.
+/// B910 — the general sweep's work list: local videos, newest first (ties
+/// keep list order). Only ids are kept: a pass takes over an hour on the live
+/// library and then sleeps, and holding the items for all of it kept a whole
+/// second copy of the library (~47 MiB on 15.6k items) resident.
+fn sweep_order(items: &[MediaItem]) -> Vec<u64> {
+    let mut order: Vec<(i64, u64)> = items
+        .iter()
+        .filter(|i| sweepable(i))
+        .map(|i| (i.created_at.unwrap_or(i64::MIN), i.id))
+        .collect();
+    order.sort_by_key(|&(created_at, _)| std::cmp::Reverse(created_at));
+    order.into_iter().map(|(_, id)| id).collect()
+}
+
 fn sweepable(item: &MediaItem) -> bool {
     is_video(item) && item.origin().local().is_some()
 }
@@ -808,6 +834,25 @@ mod tests {
     /// follows in watch order — episodes after the seed ascending (that's
     /// what plays next), then the earlier ones closest-first. Other series
     /// and movies never ride along.
+    #[test]
+    fn sweep_order_is_local_videos_newest_first_as_ids() {
+        use pharos_core::MediaKind;
+        let at = |mut i: MediaItem, created: Option<i64>| {
+            i.created_at = created;
+            i
+        };
+        let mut song = movie(4);
+        song.kind = MediaKind::Audio;
+        let items = vec![
+            at(movie(1), Some(10)),
+            at(ep(2, "s", 1, 1), Some(30)),
+            at(movie(3), None),
+            at(song, Some(99)),
+            at(movie(5), Some(30)),
+        ];
+        assert_eq!(sweep_order(&items), vec![2, 5, 1, 3]);
+    }
+
     #[test]
     fn priority_units_orders_series_by_watch_proximity() {
         let items = vec![
