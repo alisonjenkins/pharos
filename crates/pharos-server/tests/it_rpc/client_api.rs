@@ -835,3 +835,41 @@ async fn next_push(
         .expect("a push within 5 s")
         .expect("open")
 }
+
+/// "Report a problem" as the UI drives it: send, list, read back, delete.
+#[actix_web::test]
+async fn a_problem_report_round_trips_through_the_client() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = pharos_server::client_reports::ReportStore::new(dir.path().to_path_buf(), 30);
+    let fx = crate::common::seed_rich_with(|s| s.with_client_reports(Some(store))).await;
+    let (server, fx) = crate::revocation::serve_fixture(fx);
+    let (client, _closed) = crate::revocation::connect(&server).await;
+    let session = crate::revocation::signed_in(&client, &fx.user_token).await;
+    let api = NativeApi::new(&session);
+    let call = CallInfo::default();
+
+    let id = api
+        .report_problem(&call, "the seek bar froze", br#"{"route":"/play/7"}"#)
+        .await
+        .expect("report");
+    let listed = api.list_reports(&call, false).await.expect("list");
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].id, id);
+    assert_eq!(listed[0].note, "the seek bar froze");
+    let doc: serde_json::Value =
+        serde_json::from_slice(&api.get_report(&call, &id).await.expect("get")).unwrap();
+    assert_eq!(doc["bundle"]["route"], "/play/7");
+    let everyone = api.list_reports(&call, true).await;
+    assert!(
+        matches!(
+            everyone,
+            Err(ClientError::Api {
+                kind: "notPermitted",
+                ..
+            })
+        ),
+        "{everyone:?}"
+    );
+    api.delete_report(&call, &id).await.expect("delete");
+    assert!(api.list_reports(&call, false).await.unwrap().is_empty());
+}
