@@ -159,6 +159,31 @@ pub fn eye_rect(stereo: Option<Stereo>, eye: Eye) -> FrameRect {
     }
 }
 
+/// The WebXR layer layout that shows each eye its own half of a frame
+/// packed as `stereo` (V923: only these get "Watch in VR").
+pub fn xr_layout(stereo: Option<Stereo>) -> Option<&'static str> {
+    match stereo.and_then(split) {
+        Some((Axis::Across, _)) => Some("stereo-left-right"),
+        Some((Axis::Down, _)) => Some("stereo-top-bottom"),
+        None => None,
+    }
+}
+
+/// How far in front of the viewer the virtual screen floats, in metres.
+pub const VR_SCREEN_DISTANCE_M: f64 = 3.0;
+/// The virtual screen's width in metres: about a 60 degree view at
+/// [`VR_SCREEN_DISTANCE_M`], a seat a few rows back in a cinema.
+pub const VR_SCREEN_WIDTH_M: f64 = 3.5;
+
+/// The virtual screen's height in metres for one eye's `width` x `height`
+/// picture (from [`eye_size`]); 16:9 until the picture's size is known.
+pub fn vr_screen_height(eye_width: u32, eye_height: u32) -> f64 {
+    if eye_width == 0 || eye_height == 0 {
+        return VR_SCREEN_WIDTH_M * 9.0 / 16.0;
+    }
+    VR_SCREEN_WIDTH_M * f64::from(eye_height) / f64::from(eye_width)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -229,6 +254,36 @@ mod tests {
             assert_eq!(cropped(Some(s), ViewMode::BothEyes), None, "{s:?}");
         }
         assert_eq!(cropped(None, ViewMode::OneEye), None);
+    }
+
+    #[test]
+    fn only_a_splitting_packing_gets_a_vr_layout() {
+        assert_eq!(
+            xr_layout(Some(Stereo::HalfSideBySide)),
+            Some("stereo-left-right")
+        );
+        assert_eq!(
+            xr_layout(Some(Stereo::FullSideBySide)),
+            Some("stereo-left-right")
+        );
+        assert_eq!(
+            xr_layout(Some(Stereo::HalfTopAndBottom)),
+            Some("stereo-top-bottom")
+        );
+        assert_eq!(
+            xr_layout(Some(Stereo::FullTopAndBottom)),
+            Some("stereo-top-bottom")
+        );
+        assert_eq!(xr_layout(Some(Stereo::Mvc)), None);
+        assert_eq!(xr_layout(None), None);
+    }
+
+    #[test]
+    fn the_vr_screen_has_the_eyes_shape() {
+        let h = vr_screen_height(1920, 1080);
+        assert!((VR_SCREEN_WIDTH_M / h - 16.0 / 9.0).abs() < 1e-9);
+        assert!((vr_screen_height(0, 0) - vr_screen_height(1920, 1080)).abs() < 1e-9);
+        assert!((VR_SCREEN_WIDTH_M / vr_screen_height(1440, 1080) - 4.0 / 3.0).abs() < 1e-9);
     }
 
     #[test]
