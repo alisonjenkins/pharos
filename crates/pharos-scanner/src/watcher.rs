@@ -326,15 +326,26 @@ where
     let mut paths: Vec<PathBuf> = batch.touched;
     paths.sort_unstable();
     paths.dedup();
+    // The `.ignore` ancestor checks stat the disk: keep them off the async
+    // worker and outside the scan lock.
+    let paths = {
+        let root = root.to_path_buf();
+        let exts = exts.clone();
+        tokio::task::spawn_blocking(move || {
+            paths
+                .into_iter()
+                .filter(|p| is_media_file(p, &exts) && !crate::fs::walk_skips(p, &root))
+                .collect::<Vec<_>>()
+        })
+        .await
+        .map_err(|e| pharos_core::DomainError::Backend(format!("watch path filter join: {e}")))?
+    };
 
     let _exclusive = crate::fs::scan_exclusively().await;
     let scan_id = store.begin_scan(root).await?;
     let mut outcome = ScanOutcome::default();
     let mut touched_media = false;
     for path in paths {
-        if !is_media_file(&path, exts) || crate::fs::walk_skips(&path, root) {
-            continue;
-        }
         // Skip directories / vanished entries: a create event for a new
         // subdir carries the dir path. `update_path` would stat-fail and
         // skip anyway, but filtering here avoids a needless probe attempt.
