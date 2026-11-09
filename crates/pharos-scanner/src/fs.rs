@@ -2589,13 +2589,12 @@ const SONG_EXTENSIONS: &[&str] = &["flac", "mp3", "opus", "m4a", "ogg", "wav"];
 /// year or a format (`(2001)`, `(FLAC)`, `(320 kbps)`, `(24-96)`). Other
 /// parentheses stay, so `Album (Deluxe)`, `Album (CD 2)` and `Song (Live)`
 /// are their own.
-static RELEASE_TAG_RE: std::sync::LazyLock<Option<regex::Regex>> =
-    std::sync::LazyLock::new(|| {
-        regex::Regex::new(
+static RELEASE_TAG_RE: std::sync::LazyLock<Option<regex::Regex>> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(
             r"(?i)\[[^\]]*\]|\{[^}]*\}|\((?:\s*\d{4}\s*|[^)]*\b(?:flac|alac|mp3|aac|ogg|opus|wav|lossless|hi-?res|\d{3}\s*k(?:bps)?|v[02]|\d{2}\s*-?\s*bit|\d{2}\s*-\s*\d{2,3}|web)\b[^)]*)\)",
         )
         .ok()
-    });
+});
 
 /// `name` folded as [`fold_name`] does, its release tags dropped first.
 fn fold_release_name(name: &str) -> String {
@@ -7362,10 +7361,7 @@ mod tests {
         );
         assert_eq!(groups.len(), 1, "{groups:?}");
         assert_eq!(groups[0].0, flac);
-        assert_eq!(
-            alt_paths(&groups[0].1),
-            vec![mp3.as_path(), ogg.as_path()]
-        );
+        assert_eq!(alt_paths(&groups[0].1), vec![mp3.as_path(), ogg.as_path()]);
         assert_eq!(tally.0.get(&CopyDecision::Size), Some(&1));
         assert_eq!(
             folded_copies(&groups)
