@@ -4091,7 +4091,9 @@ pub trait MediaStore: Send + Sync {
 
     /// Items eligible for online enrichment: `match_source` NULL or in
     /// (`search`,`none`,`nfo_id`), not refreshed since `ttl_cutoff`, kind
-    /// movie/episode, ascending id, capped at `limit`. Excludes `manual` only —
+    /// movie/episode, ascending id, capped at `limit`. An episode is eligible
+    /// only once its show has a `series_metadata` row (V892: it takes its
+    /// record from the show's match). Excludes `manual` only —
     /// a user's explicit pick is never revisited, while an NFO id merely
     /// settles WHICH record the item is and short-circuits the search on every
     /// refresh, so re-admitting one re-fetches that record without
