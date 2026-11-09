@@ -1896,7 +1896,11 @@ impl<P: Prober + Clone + 'static> Scanner for FsScanner<P> {
             .await?
             .files;
         let groups = group_by_edition(paths);
-        let sizes = copy_sizes(&copy_candidates(&groups)).await;
+        let candidates: Vec<PathBuf> = copy_candidates(&groups)
+            .into_iter()
+            .map(|(p, _)| p)
+            .collect();
+        let sizes = copy_sizes(&candidates).await;
         let groups = group_episode_copies(groups, &sizes);
         let mut items = Vec::with_capacity(groups.len());
         for (primary, alts) in groups {
@@ -2288,8 +2292,11 @@ fn group_by_edition(paths: Vec<PathBuf>) -> Vec<(PathBuf, Vec<(String, PathBuf)>
 }
 
 /// The files of `groups` that share an episode with another file: only these
-/// are ranked, so only these are looked up.
-fn copy_candidates(groups: &[(PathBuf, Vec<(String, PathBuf)>)]) -> Vec<PathBuf> {
+/// are ranked, so only these are stat'ed. Each is flagged when some copy of
+/// one of its episodes states no height in its name: only then is the store
+/// asked for stored heights, so a library named `WEBDL-1080p` style costs no
+/// reads.
+fn copy_candidates(groups: &[(PathBuf, Vec<(String, PathBuf)>)]) -> Vec<(PathBuf, bool)> {
     let mut by_episode: BTreeMap<CopyBucket, Vec<&Path>> = BTreeMap::new();
     for (primary, _) in groups {
         if let Some(span) = episode_copy_key(primary) {
@@ -2298,15 +2305,21 @@ fn copy_candidates(groups: &[(PathBuf, Vec<(String, PathBuf)>)]) -> Vec<PathBuf>
             }
         }
     }
-    let mut out: Vec<PathBuf> = by_episode
-        .into_values()
-        .filter(|members| members.len() > 1)
-        .flatten()
-        .map(Path::to_path_buf)
-        .collect();
-    out.sort();
-    out.dedup();
-    out
+    let named = |p: &Path| {
+        p.file_stem()
+            .and_then(|s| s.to_str())
+            .and_then(name_height)
+            .is_some()
+    };
+    let mut out: BTreeMap<PathBuf, bool> = BTreeMap::new();
+    for members in by_episode.into_values().filter(|m| m.len() > 1) {
+        let unnamed = !members.iter().all(|p| named(p));
+        for path in members {
+            let flag = out.entry(path.to_path_buf()).or_default();
+            *flag |= unnamed;
+        }
+    }
+    out.into_iter().collect()
 }
 
 /// Each candidate's size on disk; a file that cannot be stat'ed ranks as if
@@ -2320,16 +2333,17 @@ async fn copy_sizes(candidates: &[PathBuf]) -> HashMap<PathBuf, CopyFacts> {
     out
 }
 
-/// [`copy_sizes`] plus each candidate's height as last probed: from its own
-/// row, or from the row it was folded into as a version. A store fault leaves
-/// the heights unknown (ranking falls back to the file names) rather than
-/// failing the scan.
+/// [`copy_sizes`] plus the height each flagged candidate was last probed at:
+/// from its own row, or from the row it was folded into as a version. A store
+/// fault leaves the heights unknown (ranking falls back to the file names)
+/// rather than failing the scan.
 async fn copy_facts<S: MediaStore>(
     store: &S,
-    candidates: &[PathBuf],
+    candidates: &[(PathBuf, bool)],
 ) -> HashMap<PathBuf, CopyFacts> {
-    let mut out = copy_sizes(candidates).await;
-    for path in candidates {
+    let paths: Vec<PathBuf> = candidates.iter().map(|(p, _)| p.clone()).collect();
+    let mut out = copy_sizes(&paths).await;
+    for (path, _) in candidates.iter().filter(|(_, look_up)| *look_up) {
         let row = match store.id_at_path(path).await {
             Ok(Some(row)) => row,
             Ok(None) => continue,
@@ -7358,6 +7372,40 @@ mod tests {
             && *resume == pharos_core::FoldResume::Drop));
     }
 
+    /// The store is asked for heights only where a copy's name states none.
+    #[test]
+    fn heights_are_looked_up_only_where_names_cannot_rank() {
+        let groups = group_by_edition(vec![
+            PathBuf::from("/tv/Foo/Season 01/Foo S01E01 HDTV-720p.mkv"),
+            PathBuf::from("/tv/Foo/Season 1/Foo S01E01 WEBDL-1080p.mkv"),
+            PathBuf::from("/tv/Foo/Season 01/Foo S01E02.mkv"),
+            PathBuf::from("/tv/Foo/Season 1/Foo S01E02 WEBDL-1080p.mkv"),
+            PathBuf::from("/tv/Foo/Season 01/Foo S01E03.mkv"),
+        ]);
+        let flags: Vec<(String, bool)> = copy_candidates(&groups)
+            .into_iter()
+            .map(|(p, f)| (p.display().to_string(), f))
+            .collect();
+        assert_eq!(
+            flags,
+            [
+                (
+                    "/tv/Foo/Season 01/Foo S01E01 HDTV-720p.mkv".to_string(),
+                    false
+                ),
+                ("/tv/Foo/Season 01/Foo S01E02.mkv".to_string(), true),
+                (
+                    "/tv/Foo/Season 1/Foo S01E01 WEBDL-1080p.mkv".to_string(),
+                    false
+                ),
+                (
+                    "/tv/Foo/Season 1/Foo S01E02 WEBDL-1080p.mkv".to_string(),
+                    true
+                ),
+            ]
+        );
+    }
+
     /// V845: a copy's height comes from its stored probe, on its own row or
     /// on the row it was folded into.
     #[tokio::test]
@@ -7393,7 +7441,11 @@ mod tests {
             })),
         });
         store.put(item).await.unwrap();
-        let facts = copy_facts(&store, &[a.clone(), b.clone(), c.clone()]).await;
+        let facts = copy_facts(
+            &store,
+            &[(a.clone(), true), (b.clone(), true), (c.clone(), true)],
+        )
+        .await;
         assert_eq!(
             facts.get(&a),
             Some(&CopyFacts {
