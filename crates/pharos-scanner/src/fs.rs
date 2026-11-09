@@ -2661,19 +2661,19 @@ fn episode_copy_key(path: &Path) -> Option<EpisodeSpan> {
 }
 
 static EP_SPAN_RE: std::sync::LazyLock<Option<regex::Regex>> = std::sync::LazyLock::new(|| {
-    regex::Regex::new(r"(?i)s\d{1,4}e\d{1,4}(?:[-_ ]?e(\d{1,4}))+").ok()
+    regex::Regex::new(r"(?i)s\d{1,4}e\d{1,4}(?:[-_ ]?e(\d{1,4})|-(\d{1,3})\b)+").ok()
 });
 
-/// The last episode of a multi-episode name (`S01E01-E02`, `S01E01E02`), so a
-/// double episode never groups with a single one.
+/// The last episode of a multi-episode name (`S01E01-E02`, `S01E01E02`,
+/// `S01E01-02`); a bare `-NN` takes at most three digits and a word end, so
+/// `S01E01-1080p` is no span.
 fn episode_span_end(name: &str) -> Option<u32> {
-    EP_SPAN_RE
-        .as_ref()?
-        .captures(name)?
-        .get(1)?
-        .as_str()
-        .parse()
-        .ok()
+    let caps = EP_SPAN_RE.as_ref()?.captures(name)?;
+    [caps.get(1), caps.get(2)]
+        .into_iter()
+        .flatten()
+        .filter_map(|m| m.as_str().parse().ok())
+        .max()
 }
 
 /// How one copy of an episode ranks for its primary, best first: a 2D file
@@ -7282,6 +7282,45 @@ mod tests {
                 ],
             }]
         );
+    }
+
+    /// V844: `S01E01-02` is a double like `S01E01-E02`, so it never takes
+    /// over E01 from a single; a release tag after a dash is no span.
+    #[test]
+    fn a_bare_dash_range_is_a_span() {
+        assert_eq!(episode_span_end("Foo S01E01-02.mkv"), Some(2));
+        assert_eq!(episode_span_end("Foo S01E01-E02.mkv"), Some(2));
+        assert_eq!(episode_span_end("Foo S01E01E02-03.mkv"), Some(3));
+        assert_eq!(episode_span_end("Foo S01E01-1080p.mkv"), None);
+        assert_eq!(episode_span_end("Foo S01E01-720p.mkv"), None);
+        let single = PathBuf::from("/tv/Foo/Season 01/Foo S01E01.mkv");
+        let double = PathBuf::from("/tv/Foo/Season 01/Foo S01E01-02.mkv");
+        let facts = HashMap::from([
+            (
+                single.clone(),
+                CopyFacts {
+                    height: Some(1080),
+                    size: Some(1),
+                },
+            ),
+            (
+                double.clone(),
+                CopyFacts {
+                    height: Some(1080),
+                    size: Some(2),
+                },
+            ),
+        ]);
+        let groups = group_copies(
+            group_by_edition(vec![single.clone(), double.clone()]),
+            &facts,
+            &mut CopyTally::default(),
+        );
+        assert_eq!(
+            group_of(&groups, &single).map(alt_paths),
+            Some(vec![double.as_path()])
+        );
+        assert_eq!(group_of(&groups, &double), Some(&[][..]));
     }
 
     /// A season pack groups only with packs of exactly its span: it is no
