@@ -780,7 +780,10 @@ async fn subscribe_events_resumes_from_its_cursor() {
         .expect("resubscribe");
     let missed = next_push(&mut rx).await;
     assert!(
-        matches!(missed.as_slice(), [PushEvent::UserData { played: false, .. }]),
+        matches!(
+            missed.as_slice(),
+            [PushEvent::UserData { played: false, .. }]
+        ),
         "{missed:?}"
     );
     assert_eq!(cursor.seq(), seen + 1);
