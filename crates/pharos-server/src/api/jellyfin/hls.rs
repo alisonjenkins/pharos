@@ -4544,6 +4544,7 @@ mod tests {
         let token = stores.issue(uid, "t").await.unwrap();
         stores
             .put(MediaItem {
+                locked: Default::default(),
                 id: 9,
                 path: "/nonexistent.mkv".into(),
                 title: "m".into(),
@@ -5219,6 +5220,7 @@ mod tests {
 
     fn item_with_video_codec(codec: Option<&str>) -> pharos_core::MediaItem {
         pharos_core::MediaItem {
+            locked: Default::default(),
             id: 1,
             path: "/x".into(),
             title: "t".into(),

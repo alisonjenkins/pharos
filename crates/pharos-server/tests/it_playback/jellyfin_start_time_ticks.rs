@@ -59,6 +59,7 @@ async fn seed(
 
     stores
         .put(MediaItem {
+            locked: Default::default(),
             id: 7,
             path: path.clone(),
             title: "fake".into(),

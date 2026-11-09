@@ -76,6 +76,7 @@ fn episode(id: u64) -> MediaItem {
         ..Default::default()
     };
     MediaItem {
+        locked: Default::default(),
         id,
         path: format!(
             "/media/tv/Show {}/Season 01/Show {} - S01E{:02}.mkv",

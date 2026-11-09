@@ -197,6 +197,7 @@ async fn seed() -> (web::Data<AppState>, String, UserId) {
     for r in &rows {
         stores
             .put(MediaItem {
+                locked: Default::default(),
                 id: r.id,
                 path: r.path.into(),
                 title: r.title.into(),

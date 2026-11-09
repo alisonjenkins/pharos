@@ -108,6 +108,7 @@ async fn seed(src: PathBuf, cache_dir: &Path) -> (web::Data<AppState>, String) {
     let token = stores.issue(uid, "t").await.unwrap();
     stores
         .put(MediaItem {
+            locked: Default::default(),
             id: 42,
             path: src,
             title: "uhd".into(),

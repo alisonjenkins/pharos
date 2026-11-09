@@ -22,6 +22,7 @@ use std::collections::HashMap;
 
 fn media_item(id: MediaId, title: &str, kind: MediaKind) -> MediaItem {
     MediaItem {
+        locked: Default::default(),
         id,
         path: format!("/media/migrate/{id}.mkv").into(),
         title: title.into(),

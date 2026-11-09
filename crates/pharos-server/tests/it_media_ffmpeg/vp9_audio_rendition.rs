@@ -132,6 +132,7 @@ async fn seed_with_duration(
     let token = stores.issue(uid, "t").await.unwrap();
     stores
         .put(MediaItem {
+            locked: Default::default(),
             id: 42,
             path: fixture,
             title: "s".into(),

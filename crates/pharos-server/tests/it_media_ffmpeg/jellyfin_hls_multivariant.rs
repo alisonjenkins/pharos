@@ -79,6 +79,7 @@ async fn seed_with_fixture_bitrate(
     let token = stores.issue(uid, "t").await.unwrap();
     stores
         .put(MediaItem {
+            locked: Default::default(),
             id: 42,
             path: fixture_path,
             title: "fixture".into(),

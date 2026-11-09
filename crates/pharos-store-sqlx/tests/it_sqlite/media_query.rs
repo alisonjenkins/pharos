@@ -50,6 +50,7 @@ fn synth_item(id: u64) -> MediaItem {
         None
     };
     MediaItem {
+        locked: Default::default(),
         id,
         path: format!("/media/root-{}/file-{id:06}.mkv", id % 3).into(),
         // Title intentionally NOT id-sorted: zero-padded reversed-ish so

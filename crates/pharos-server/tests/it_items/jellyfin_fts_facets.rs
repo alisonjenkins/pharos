@@ -37,6 +37,7 @@ async fn seed() -> (web::Data<AppState>, String) {
     let mk =
         |id: u64, title: &str, overview: Option<&str>, kind: MediaKind, year: u32, rating: &str| {
             MediaItem {
+                locked: Default::default(),
                 id,
                 path: format!("/m/{id}.mkv").into(),
                 title: title.into(),

@@ -44,6 +44,7 @@ async fn seed() -> (web::Data<AppState>, String) {
     // the probe is blank — the DTO has real data it could have leaked.
     stores
         .put(MediaItem {
+            locked: Default::default(),
             id: 42,
             path: "/media/Books/Dune.epub".into(),
             title: "Dune".into(),
@@ -77,6 +78,7 @@ async fn seed() -> (web::Data<AppState>, String) {
     // not about the endpoint having gone inert for everything.
     stores
         .put(MediaItem {
+            locked: Default::default(),
             id: 43,
             path: "/media/Movies/Alien.mkv".into(),
             title: "Alien".into(),
