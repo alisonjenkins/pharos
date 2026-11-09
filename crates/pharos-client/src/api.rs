@@ -713,6 +713,31 @@ impl NativeApi {
         }
     }
 
+    /// A short-lived Full token for the Manage pages, which call the admin
+    /// endpoints of the Jellyfin API with it as `X-Emby-Token` (ADR-0082).
+    /// Admins only: anyone else is refused `notPermitted`. It stops working
+    /// at `expires_at_ms` or when this session ends; ask again before then.
+    pub async fn manage_token(&self, call: &CallInfo) -> Result<MediaToken, ClientError> {
+        let mut req = self.session.manage_token_request();
+        call.write(req.get().init_ctx());
+        let reply = req.send().promise.await?;
+        match reply
+            .get()?
+            .get_result()?
+            .which()
+            .map_err(capnp::Error::from)?
+        {
+            media_token_result::Token(t) => {
+                let t = t?;
+                Ok(MediaToken {
+                    token: text(t.get_token())?,
+                    expires_at_ms: t.get_expires_at_ms(),
+                })
+            }
+            media_token_result::Error(e) => Err(ClientError::from_api(e?)),
+        }
+    }
+
     /// Removes the signed-in user's avatar.
     pub async fn remove_avatar(&self, call: &CallInfo) -> Result<(), ClientError> {
         let mut req = self.session.remove_avatar_request();
