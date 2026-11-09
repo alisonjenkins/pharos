@@ -4161,7 +4161,7 @@ test.describe("pharos Dioxus UI stage", () => {
       timeout: 15_000,
     });
     await page.mouse.move(20, 20);
-    await page.locator(".pharos-watch-top").getByRole("button", { name: "Shrink" }).click();
+    await page.locator(".pharos-watch .pharos-controls").getByRole("button", { name: "Shrink" }).click();
     const stage = page.locator(".pharos-stage.is-floating");
     await expect(stage).toBeVisible();
     const grip = stage.getByRole("button", { name: "Resize the player with the arrow keys" });
@@ -4208,7 +4208,7 @@ test.describe("pharos Dioxus UI stage", () => {
       timeout: 15_000,
     });
     await page.mouse.move(20, 20);
-    await page.locator(".pharos-watch-top").getByRole("button", { name: "Shrink" }).click();
+    await page.locator(".pharos-watch .pharos-controls").getByRole("button", { name: "Shrink" }).click();
     await expect.poll(async () => (await stage.boundingBox())!.width).toBeCloseTo(width, 0);
     await page.locator(".pharos-stage-bar").getByRole("button", { name: "Close" }).click();
 
@@ -4233,7 +4233,7 @@ test.describe("pharos Dioxus UI stage", () => {
       timeout: 15_000,
     });
     await page.mouse.move(20, 20);
-    await page.locator(".pharos-watch-top").getByRole("button", { name: "Shrink" }).click();
+    await page.locator(".pharos-watch .pharos-controls").getByRole("button", { name: "Shrink" }).click();
     await page.setViewportSize({ width: 320, height: 640 });
     // Every button of the bar lies wholly inside the stage, which clips.
     const clipped = () =>
@@ -4273,7 +4273,7 @@ test.describe("pharos Dioxus UI stage", () => {
       timeout: 15_000,
     });
     await page.mouse.move(20, 20);
-    await page.locator(".pharos-watch-top").getByRole("button", { name: "Shrink" }).click();
+    await page.locator(".pharos-watch .pharos-controls").getByRole("button", { name: "Shrink" }).click();
     await expect(page.locator(".pharos-stage.is-floating")).toBeVisible();
     await page.setViewportSize({ width: 320, height: 180 });
     // Every visible button of the bar lies inside the viewport's height.
@@ -4334,7 +4334,7 @@ test.describe("pharos Dioxus UI stage", () => {
 
     // From the floating window, which keeps playing behind it.
     await page.mouse.move(20, 20);
-    await page.locator(".pharos-watch-top").getByRole("button", { name: "Shrink" }).click();
+    await page.locator(".pharos-watch .pharos-controls").getByRole("button", { name: "Shrink" }).click();
     await expect(page.locator(".pharos-stage.is-floating")).toBeVisible();
     await stagePip.click();
     await expect.poll(pipId).toBe("pharos-video");
@@ -4369,7 +4369,7 @@ test.describe("pharos Dioxus UI stage", () => {
     await expect(page.getByRole("button", { name: "Fullscreen" })).toHaveCount(1);
     await expect(page.getByRole("button", { name: "Picture in picture" })).toHaveCount(0);
     await page.mouse.move(20, 20);
-    await page.locator(".pharos-watch-top").getByRole("button", { name: "Shrink" }).click();
+    await page.locator(".pharos-watch .pharos-controls").getByRole("button", { name: "Shrink" }).click();
     await expect(page.locator(".pharos-stage.is-floating")).toBeVisible();
     await expect(page.getByRole("button", { name: "Picture in picture" })).toHaveCount(0);
   });
