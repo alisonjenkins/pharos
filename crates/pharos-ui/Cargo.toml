@@ -19,6 +19,7 @@ web = [
     "dep:wasm-bindgen-futures",
     "dep:js-sys",
     "dep:getrandom02",
+    "dep:quire-web",
 ]
 
 # 025: the Android TV app (`nix run .#android-apk`, or `dx build --platform
@@ -130,6 +131,10 @@ pharos-client = { path = "../pharos-client" }
 # 026: the pure-Rust subtitle renderer behind the SubtitleRenderer port.
 pharos-subs = { path = "../pharos-subs" }
 pharos-hls = { path = "../pharos-hls" }
+# 023: the book model (locators, table of contents) and, in the browser build,
+# its renderer. Neither knows pharos (V350).
+quire = { path = "../quire" }
+quire-web = { path = "../quire-web", optional = true }
 serde = { workspace = true }
 serde_json.workspace = true
 toml = { version = "1", default-features = false, features = ["parse", "display", "serde", "std"] }

@@ -73,6 +73,7 @@ pub mod privacy;
 pub mod quality;
 pub mod queue;
 pub mod rails;
+pub mod reader;
 pub mod resume;
 pub mod route;
 pub mod scrub;
