@@ -485,3 +485,76 @@ async fn opting_in_and_out_through_prefs_takes_effect_on_the_next_batch() {
         })
         .await;
 }
+
+/// Submits one batch of no events and `spans` (trace id, span id, parent id).
+async fn submit_spans(tel: &telemetry::Client, spans: &[(&str, &str, &str)]) -> Result<(), String> {
+    let mut req = tel.submit_request();
+    req.get().init_ctx();
+    req.get().init_events(0);
+    let mut list = req.get().init_spans(u32::try_from(spans.len()).unwrap());
+    for (i, (trace, span, parent)) in spans.iter().enumerate() {
+        let mut out = list.reborrow().get(u32::try_from(i).unwrap());
+        out.set_trace_id(trace);
+        out.set_span_id(span);
+        out.set_parent_span_id(parent);
+        out.set_name("ui.action play");
+        out.set_start_wall_ms(1_762_700_000_000);
+        out.set_duration_ms(120);
+        out.set_ok(true);
+    }
+    let reply = req.send().promise.await.expect("submit answers");
+    match reply.get().unwrap().get_result().unwrap().which().unwrap() {
+        done::Ok(()) => Ok(()),
+        done::Error(e) => Err(e
+            .unwrap()
+            .get_reason()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned()),
+    }
+}
+
+/// An opted-in user's well-formed spans are forwarded and counted, a span
+/// with a malformed id is counted as such, and a user who has not opted in
+/// gets none forwarded (US9). Disarm check: with the forwarding loop removed
+/// from `submit`, both counters read 0.
+#[actix_web::test]
+async fn client_spans_are_forwarded_only_when_opted_in_and_well_formed() {
+    const TRACE: &str = "0af7651916cd43dd8448eb211c80319c";
+    let fx = seed_rich().await;
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = pharos_test_metrics::snapshotter(&recorder);
+    let _metrics = metrics::set_default_local_recorder(&recorder);
+
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let client = connect(&fx);
+            let tel = telemetry_of(&session_for(&client, &fx.user_token).await).await;
+            let spans = [
+                (TRACE, "b7ad6b7169203331", ""),
+                (TRACE, "00f067aa0ba902b7", "b7ad6b7169203331"),
+                (TRACE, "not-a-span-id", ""),
+            ];
+            assert!(
+                submit_spans(&tel, &spans).await.is_err(),
+                "not opted in yet"
+            );
+            opt_in(&fx).await;
+            let tel = telemetry_of(&session_for(&client, &fx.user_token).await).await;
+            submit_spans(&tel, &spans).await.expect("accepted");
+        })
+        .await;
+
+    let forwarded = counter(
+        &snapshotter,
+        "pharos_client_spans_total",
+        &[("outcome", "forwarded")],
+    );
+    let invalid = counter(
+        &snapshotter,
+        "pharos_client_spans_total",
+        &[("outcome", "invalid_id")],
+    );
+    assert_eq!((forwarded, invalid), (2, 1));
+}
