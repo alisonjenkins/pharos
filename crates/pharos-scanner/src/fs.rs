@@ -2813,7 +2813,36 @@ fn episode_copy_key(path: &Path) -> Option<EpisodeSpan> {
     let last = episode_span_end(name)
         .filter(|l| *l > first)
         .unwrap_or(first);
-    Some((info.series_folder?, info.season_number?, first, last))
+    // Two shows of one name can share a folder (`Cosmos (1980) - S01E01`,
+    // `Cosmos (2014) - S01E01`): a year the name states before its episode
+    // number keeps them apart.
+    let show = match name_show_year(name) {
+        Some(year) => format!("{}\u{1f}{year}", info.series_folder?),
+        None => info.series_folder?,
+    };
+    Some((show, info.season_number?, first, last))
+}
+
+static SHOW_YEAR_RE: std::sync::LazyLock<Option<regex::Regex>> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r"(?:^|[^0-9])((?:19|20)\d{2})(?:[^0-9]|$)").ok()
+});
+
+static EPISODE_TOKEN_RE: std::sync::LazyLock<Option<regex::Regex>> =
+    std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"(?i)\bs\d{1,4}e\d{1,4}|\b\d{1,2}x\d{2,3}\b").ok()
+    });
+
+/// The year an episode's file name states for its show, before the episode
+/// number (`Battlestar Galactica (2004) - S01E01`); a year after it belongs to
+/// the episode's title.
+fn name_show_year(name: &str) -> Option<u32> {
+    let token = EPISODE_TOKEN_RE.as_ref()?.find(name)?;
+    let head = name.get(..token.start())?;
+    SHOW_YEAR_RE
+        .as_ref()?
+        .captures_iter(head)
+        .filter_map(|c| c.get(1)?.as_str().parse().ok())
+        .last()
 }
 
 static EP_SPAN_RE: std::sync::LazyLock<Option<regex::Regex>> = std::sync::LazyLock::new(|| {
@@ -7744,6 +7773,22 @@ mod tests {
             song_copy_key(Path::new("/m/a/album (320 kbps)/01_intro [web].flac")),
         );
         assert_ne!(song_copy_key(Path::new("/m/A/Album/01 Intro.flac")), None);
+    }
+
+    /// Two shows of one name in one folder, told apart by the year their
+    /// names state, are not copies of each other; copies of one still are.
+    #[test]
+    fn same_named_shows_of_different_years_are_not_copies() {
+        let groups = group_editions(vec![
+            PathBuf::from("/tv/Cosmos/Season 1/Cosmos (1980) - S01E01 - The Shores.mkv"),
+            PathBuf::from("/tv/Cosmos/Season 1/Cosmos (2014) - S01E01 - Standing Up.mkv"),
+            PathBuf::from("/tv/Cosmos/Season 01/Cosmos (2014) - S01E01 - Standing Up.avi"),
+            PathBuf::from("/tv/Foo/Season 1/Foo - S01E02 - 1969 HDTV-720p.mkv"),
+            PathBuf::from("/tv/Foo/Season 1/Foo - S01E02 - 1969 WEBDL-1080p.mkv"),
+        ]);
+        assert_eq!(groups.len(), 3, "{groups:?}");
+        assert_eq!(name_show_year("Foo - S01E02 - 1969.mkv"), None);
+        assert_eq!(name_show_year("BSG.2004.S01E01.mkv"), Some(2004));
     }
 
     /// A theme song belongs to its title folder: two shows of one name are
