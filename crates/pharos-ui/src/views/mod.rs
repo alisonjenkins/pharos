@@ -20,7 +20,7 @@ pub mod server_picker;
 pub use admin::{
     AdminAction, AdminTab, AdminView, AdminViewProps, CreateUserAttempt, DeepSearchState,
 };
-pub use app_state::{AppRoute, RootApp};
+pub use app_state::{AdminPane, AppRoute, RootApp};
 pub use detail::{DetailAction, ItemDetailView};
 pub use group::{GroupAction, GroupMember, GroupSessionPanel, GroupSnapshot};
 pub use library::{ItemTile, LibraryView};

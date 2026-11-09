@@ -33,6 +33,7 @@ pub mod letters;
 pub mod listen;
 pub mod lyrics;
 pub mod machine;
+pub mod manage;
 pub mod mixes;
 pub mod paging;
 pub mod palette;

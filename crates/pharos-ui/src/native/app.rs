@@ -85,8 +85,7 @@ use crate::theme::value::{Density, FontStack, Rgba};
 use crate::theme::{self, contrast, css, device, doc, format, Catalogue, Theme, ThemeError};
 use crate::views::RootApp;
 
-/// The page root: one route per URL, kept in step with history. `/manage`
-/// mounts the older REST panes and never opens the native socket.
+/// The page root: one route per URL, kept in step with history.
 #[component]
 pub fn Root() -> Element {
     let boot = use_hook(boot_theme);
@@ -206,14 +205,12 @@ pub fn Root() -> Element {
         }
     });
     use_context_provider(|| Together::new(group_view, group_error, group_ui));
-    match route() {
-        Route::Manage => rsx! { RootApp {} },
-        route => rsx! {
-            if backdrop::runs_behind(&route) {
-                Backdrop {}
-            }
-            NativeApp { route }
-        },
+    let route = route();
+    rsx! {
+        if backdrop::runs_behind(&route) {
+            Backdrop {}
+        }
+        NativeApp { route }
     }
 }
 
@@ -1492,7 +1489,7 @@ struct StartOver(Signal<Option<ItemRef>>);
 /// Who is signed in, as the account menu shows them; a screen that changes
 /// the avatar restarts it.
 #[derive(Clone, Copy)]
-pub(super) struct AccountMe(Resource<Option<pharos_client::api::Me>>);
+pub(super) struct AccountMe(pub(super) Resource<Option<pharos_client::api::Me>>);
 
 /// What screens share: the signed-in API (none until resumed) and the
 /// machine, so a `revoked` answer can send the app to sign-in.
@@ -1551,6 +1548,13 @@ fn NativeApp(route: Route) -> Element {
         api,
         machine,
         marks,
+    });
+    // One manage token per connection, reused each time Manage opens (B920).
+    let mut held_manage = use_signal(|| None);
+    use_context_provider(|| super::manage::HeldManageToken(held_manage));
+    use_effect(move || {
+        let _ = api.read();
+        held_manage.set(None);
     });
     // A reloaded tab joins the group it was in again (B665): the server kept
     // its seat for the socket-loss grace, and the group's item brings the
@@ -1778,6 +1782,11 @@ fn NativeApp(route: Route) -> Element {
 
     // Ready and reconnecting render through this one node, so a dropped
     // socket does not remount the screen (and its playing video).
+    // With the native API off there is no session to ask for a manage
+    // token, so Manage is the older app with its own sign-in.
+    if route == Route::Manage && matches!(machine.read().phase(), Phase::NotEnabled) {
+        return rsx! { RootApp {} };
+    }
     if machine.read().shows_screens() {
         let notice = {
             let m = machine.read();
@@ -1951,8 +1960,7 @@ fn Screen(route: Route) -> Element {
         // The stage beside the screen draws the player (spec 020).
         Route::Watch(_) => rsx! {},
         Route::SignIn => rsx! { Redirect { to: Route::Home } },
-        // `Root` mounts the older panes for this route.
-        Route::Manage => rsx! { Redirect { to: Route::Manage } },
+        Route::Manage => rsx! { super::manage::ManageScreen {} },
         Route::Appearance => {
             rsx! { SettingsLayout { current: Section::Appearance, AppearanceScreen {} } }
         }
