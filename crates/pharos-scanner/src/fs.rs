@@ -2491,8 +2491,9 @@ fn group_by_edition(paths: Vec<PathBuf>) -> Vec<(PathBuf, Vec<(String, PathBuf)>
 /// reads.
 fn copy_candidates(groups: &[(PathBuf, Vec<(String, PathBuf)>)]) -> Vec<(PathBuf, bool)> {
     let mut by_bucket: BTreeMap<CopyBucket, Vec<&Path>> = BTreeMap::new();
-    for (primary, _) in groups {
-        for bucket in copy_buckets(primary) {
+    let buckets = library_buckets(groups.iter().map(|g| g.0.as_path()));
+    for ((primary, _), buckets) in groups.iter().zip(buckets) {
+        for bucket in buckets {
             by_bucket.entry(bucket).or_default().push(primary);
         }
     }
@@ -2687,8 +2688,12 @@ fn group_copies_guarded(
     let spans: Vec<Option<EpisodeSpan>> = groups.iter().map(|g| episode_copy_key(&g.0)).collect();
     let mut covered = vec![false; groups.len()];
     let mut by_bucket: BTreeMap<CopyBucket, Vec<usize>> = BTreeMap::new();
-    for (i, (path, _)) in groups.iter().enumerate() {
-        for bucket in copy_buckets(path) {
+    let buckets = library_buckets(groups.iter().map(|g| g.0.as_path()));
+    for (i, buckets) in buckets.into_iter().enumerate() {
+        let Some((path, _)) = groups.get(i) else {
+            continue;
+        };
+        for bucket in buckets {
             let bucket = guard.rekey(path, bucket);
             by_bucket.entry(bucket).or_default().push(i);
             if let Some(flag) = covered.get_mut(i) {
@@ -2976,6 +2981,62 @@ impl FoldGuard {
     }
 }
 
+/// The title a film file gives when neither its name nor its folder's states
+/// a year (`The Secret Life of Pets/The Secret Life of Pets.avi`). Such a
+/// file joins a film of that title only when the library holds the title in
+/// a single year (see [`library_buckets`]).
+fn yearless_film_title(path: &Path) -> Option<String> {
+    if is_episode_file(path) {
+        return None;
+    }
+    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+    if !FILM_EXTENSIONS.contains(&ext.as_str()) {
+        return None;
+    }
+    let year_of = |name: &str| crate::metadata::filename::parse_filename(name, true).year;
+    let stem = path.file_stem()?.to_str()?;
+    let folder = path.parent()?.file_name()?.to_str()?;
+    if year_of(stem).is_some() || year_of(folder).is_some() {
+        return None;
+    }
+    let title = yearless_title(stem);
+    (!title.is_empty()).then(|| title.join(" "))
+}
+
+/// Each path's [`copy_buckets`], plus, for a film named with no year in a
+/// folder with none, the one year the rest of the library holds its title in.
+/// A title held in two years (a remake) leaves such a file apart, since
+/// nothing says which film it is.
+fn library_buckets<'a>(paths: impl Iterator<Item = &'a Path>) -> Vec<Vec<CopyBucket>> {
+    let paths: Vec<&Path> = paths.collect();
+    let mut out: Vec<Vec<CopyBucket>> = paths.iter().map(|p| copy_buckets(p)).collect();
+    let mut years: BTreeMap<String, std::collections::BTreeSet<u32>> = BTreeMap::new();
+    for bucket in out.iter().flatten() {
+        if let CopyBucket::Film { title, year } = bucket {
+            years.entry(title.clone()).or_default().insert(*year);
+        }
+    }
+    for (path, buckets) in paths.iter().zip(out.iter_mut()) {
+        if !buckets.is_empty() {
+            continue;
+        }
+        let Some(title) = yearless_film_title(path) else {
+            continue;
+        };
+        let held: Vec<u32> = years
+            .get(&title)
+            .map(|y| y.iter().copied().collect())
+            .unwrap_or_default();
+        if let [year] = held.as_slice() {
+            tracing::debug!(path = %path.display(), title, year, "a yearless film joined the one year its title is held in");
+            buckets.push(CopyBucket::Film { title, year: *year });
+        } else if held.len() > 1 {
+            tracing::debug!(path = %path.display(), title, years = ?held, "a yearless film kept apart: its title is held in several years");
+        }
+    }
+    out
+}
+
 /// The key a film file's name gives it (`Heat (1995) Bluray-1080p.mkv` is
 /// `("heat", 1995)`): the name's words, lower-cased, less its year, the words
 /// that say how the copy was made ([`FILM_RELEASE_WORDS`], resolutions,
@@ -3053,6 +3114,11 @@ fn strip_release_group(name: &str) -> String {
 /// release words and an article at either end.
 fn film_title(name: &str, year: u32) -> Vec<String> {
     title_words(name, Some(year))
+}
+
+/// [`film_title`] for a name with no year, which keeps any cut it states.
+fn yearless_title(name: &str) -> Vec<String> {
+    title_words(name, None)
 }
 
 fn title_words(name: &str, year: Option<u32>) -> Vec<String> {
@@ -8779,20 +8845,26 @@ mod tests {
             PathBuf::from("/films/Heat (1995)/trailer.mkv"),
             PathBuf::from("/films/Other/Heat (1995) - Director's Cut.mkv"),
             PathBuf::from("/films/Untitled/Heat.mkv"),
+            PathBuf::from("/films/Untitled/Dune.mkv"),
             PathBuf::from("/music/Heat (1995)/Heat (1995).flac"),
         ]);
         assert_eq!(groups.len(), 6, "{groups:?}");
         let heat = groups
             .iter()
             .find(|(p, _)| p == Path::new("/films/Heat (1995)/Heat (1995).mkv"))
-            .map(|(_, alts)| alts.clone());
+            .map(|(_, alts)| {
+                alt_paths(alts)
+                    .into_iter()
+                    .map(Path::to_path_buf)
+                    .collect::<Vec<_>>()
+            });
         assert_eq!(
             heat,
-            Some(vec![(
-                "Director's Cut".to_string(),
-                PathBuf::from("/films/Other/Heat (1995) - Director's Cut.mkv")
-            )]),
-            "a cut is a version of its film (V962)"
+            Some(vec![
+                PathBuf::from("/films/Untitled/Heat.mkv"),
+                PathBuf::from("/films/Other/Heat (1995) - Director's Cut.mkv"),
+            ]),
+            "a cut is a version of its film (V962); a yearless copy joins the one year its title is held in (V971)"
         );
         let others = groups
             .iter()
@@ -8847,6 +8919,40 @@ mod tests {
             let groups = group_editions(vec![PathBuf::from(a), PathBuf::from(b)]);
             assert_eq!(groups.len(), 2, "{b} stays apart from {a}: {groups:?}");
         }
+    }
+
+    /// B1012 / V971 — a copy named with no year, in a folder with none, joins
+    /// its title when the library holds that title in one year only; a title
+    /// held in two years (a remake) leaves it apart.
+    #[test]
+    fn a_yearless_copy_joins_the_one_year_its_title_is_held_in() {
+        for (primary, copy) in [
+            (
+                "/m/Secret Life of Pets, The (2016)/The Secret Life of Pets (2016) WEBRip-1080p.mkv",
+                "/m/The Secret Life of Pets/The Secret Life of Pets.avi",
+            ),
+            (
+                "/m/Transformers Age of Extinction/Transformers - Age of Extinction (2014) WEBDL-1080p.mkv",
+                "/m/Transformers Age of Extinction/Transformers Age of Extinction.mkv",
+            ),
+            (
+                "/m/Taken 3 (2015)/Taken 3.mkv",
+                "/m/Taken 3/Taken.3.1080p.BluRay.x265-n0m1.mkv",
+            ),
+        ] {
+            let groups = group_editions(vec![PathBuf::from(primary), PathBuf::from(copy)]);
+            assert_eq!(groups.len(), 1, "{copy} is a copy of {primary}: {groups:?}");
+        }
+        let groups = group_editions(vec![
+            PathBuf::from("/m/The Lion King (1994)/The Lion King (1994).mkv"),
+            PathBuf::from("/m/The Lion King (2019)/The Lion King (2019).mkv"),
+            PathBuf::from("/m/Lion King/The Lion King.mkv"),
+        ]);
+        assert_eq!(
+            groups.len(),
+            3,
+            "a remade title leaves a yearless copy apart: {groups:?}"
+        );
     }
 
     /// B1014 / V973 — a letterboxed rip ranks by its width's 16:9 class, so a
