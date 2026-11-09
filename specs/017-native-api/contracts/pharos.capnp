@@ -12,7 +12,7 @@ annotation secret(field, param) :Void;
 
 # Bumped when the schema changes; served as ServerInfo.schemaVersion so a client
 # can tell which methods a server knows (FR-009).
-const schemaVersion :UInt32 = 27;
+const schemaVersion :UInt32 = 28;
 
 # ---- ids and shared types -------------------------------------------------
 struct ItemId {                # mirrors pharos_jellyfin_api::WireId
@@ -201,6 +201,8 @@ interface Library {
   # wantWords is set by a client showing karaoke; it lets the server ask the aligner for word times.
   lyrics @9 (ctx :CallContext, id :ItemId, wantWords :Bool) -> (result :LyricsResult);
   mix @10 (ctx :CallContext, spec :MixSpec, recent :List(ItemId), count :UInt32) -> (result :MixResult);
+  # Someone in a cast, and what they appear in that the viewer may see. Since schemaVersion 28.
+  person @11 (ctx :CallContext, id :ItemId) -> (result :PersonResult);
 }
 struct ItemDetail {
   summary @0 :ItemSummary; overview @1 :Text; genres @2 :List(Text); chapters @3 :List(Chapter);
@@ -215,8 +217,35 @@ struct ItemDetail {
 }
 # Someone who appears in the item. `imageUrl` is the person's photo on this
 # server, empty when there is none.
-struct Credit { name @0 :Text; character @1 :Text; kind @2 :CreditKind; imageUrl @3 :Text; }
+struct Credit {
+  name @0 :Text; character @1 :Text; kind @2 :CreditKind; imageUrl @3 :Text;
+  personId @4 :ItemId;              # what Library.person takes. Since schemaVersion 28.
+}
 enum CreditKind { actor @0; guestStar @1; }
+# A person's page. `films` are newest first. `shows` hold one entry per show,
+# the show that gives them the most episodes first, each with its episodes in
+# season order. Only items the viewer may see are listed.
+struct Person {
+  id @0 :ItemId; name @1 :Text;
+  imageUrl @2 :Text;                # the person's photo on this server, empty when there is none
+  films @3 :List(PersonCredit);
+  shows @4 :List(PersonShow);
+  # What a metadata provider says about them; each empty when unknown.
+  biography @5 :Text;
+  birthDate @6 :Text;               # YYYY-MM-DD
+  deathDate @7 :Text;               # YYYY-MM-DD
+  birthPlace @8 :Text;
+  imdbId @9 :Text;                  # nm and digits
+  wikidataId @10 :Text;             # Q and digits
+}
+# One item a person appears in, and who they play there (empty when the credit names no one).
+struct PersonCredit { item @0 :ItemSummary; character @1 :Text; kind @2 :CreditKind; }
+struct PersonShow {
+  series @0 :ItemSummary;
+  characters @1 :List(Text);        # who they play in it, most episodes first
+  episodes @2 :List(PersonCredit);
+}
+struct PersonResult { union { person @0 :Person; error @1 :Error; } }
 # A font the file embeds, for a renderer drawing an ASS subtitle (spec 026).
 # url holds `{subtitle}`, the index of the subtitle track the font is fetched
 # for: the server cuts the font to the glyphs that track draws. A track that
