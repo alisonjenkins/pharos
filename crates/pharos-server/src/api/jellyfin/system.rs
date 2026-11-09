@@ -1035,7 +1035,7 @@ async fn device_options(
     state: web::Data<AppState>,
     user: AuthUser,
     q: CiQuery<DeviceIdQuery>,
-    body: Option<web::Json<DeviceOptionsBody>>,
+    body: web::Bytes,
 ) -> Result<impl Responder, actix_web::Error> {
     if !user.0.policy.admin {
         return Err(error::ErrorForbidden("admin required"));
@@ -1044,7 +1044,16 @@ async fn device_options(
         q.id.as_deref()
             .filter(|s| !s.is_empty())
             .ok_or_else(|| error::ErrorBadRequest("missing id"))?;
-    let body = body.map(web::Json::into_inner).unwrap_or_default();
+    // Only an empty body means "no fields"; a malformed one is refused rather
+    // than read as empty and answered 204 as if it had been saved.
+    let body: DeviceOptionsBody = if body.iter().all(u8::is_ascii_whitespace) {
+        DeviceOptionsBody::default()
+    } else {
+        serde_json::from_slice(&body).map_err(|e| {
+            tracing::info!(device.id = device_id, error = %e, "device options body refused");
+            error::ErrorBadRequest(format!("invalid body: {e}"))
+        })?
+    };
     // Validated before anything is written, so a bad list never lands half a body.
     let denied = body
         .no_direct_play_audio_codecs
