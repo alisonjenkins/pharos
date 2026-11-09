@@ -373,6 +373,37 @@ mod tests {
         );
     }
 
+    /// A decode that ran records its time and its outcome.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_decode_that_ran_records_its_time() {
+        use metrics_util::debugging::DebuggingRecorder;
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::TempDir::new().unwrap();
+        let bin = dir.path().join("ffmpeg");
+        std::fs::write(&bin, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = pharos_test_metrics::snapshotter(&recorder);
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let checks = DeepChecks::new(bin.to_str().unwrap(), Arc::new(Semaphore::new(4)));
+        checks.run(1, PathBuf::from("/x.mkv")).await;
+        let names: Vec<String> = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .map(|(k, ..)| k.key().name().to_string())
+            .collect();
+        assert!(
+            names.iter().any(|n| n == "pharos_media_deep_check_seconds"),
+            "{names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n == "pharos_media_deep_check_total"),
+            "{names:?}"
+        );
+    }
+
     /// Finished results past the cap are dropped oldest first.
     #[tokio::test]
     async fn finished_results_past_the_cap_are_dropped_oldest_first() {
