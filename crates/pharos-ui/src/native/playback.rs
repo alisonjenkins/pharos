@@ -1993,6 +1993,118 @@ impl RecoveryBudget {
     }
 }
 
+/// The play head must pass this far beyond where a rebuild started before
+/// the media budget refills. A loaded segment is not enough: a segment that
+/// fails to decode every time loads fine each time, and would rebuild forever.
+/// Longer than one segment (6 s) so the failing one is behind the play head.
+pub const MEDIA_REFILL_MS: u64 = 10_000;
+
+/// What to do about one Rust-engine media error (V638, V1062).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MediaVerdict {
+    /// The MediaSource this error came from was already rebuilt: one fault
+    /// fires several errors, and only the first one counts.
+    Stale,
+    /// Rebuild the MediaSource at the play head; `attempt` counts from 1.
+    Rebuild { attempt: u32 },
+    /// Give up: `attempt` recoveries already failed, or the error cannot be
+    /// recovered by a rebuild.
+    Fail { attempt: u32 },
+}
+
+impl MediaVerdict {
+    /// The `action` token, shared with hls.js's error line.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Stale => "stale",
+            Self::Rebuild { .. } => Recovery::RecoverMedia.label(),
+            Self::Fail { .. } => Recovery::Fail.label(),
+        }
+    }
+
+    pub fn attempt(self) -> u32 {
+        match self {
+            Self::Stale => 0,
+            Self::Rebuild { attempt } | Self::Fail { attempt } => attempt,
+        }
+    }
+}
+
+/// Playback got [`MEDIA_REFILL_MS`] past the last rebuild with no new media
+/// error: the rebuild fixed it. A head that merely moves is not enough, as the
+/// fault is often a segment buffered ahead that fails again on its refetch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MediaResumed {
+    pub attempt: u32,
+    pub at_ms: u64,
+    pub took_ms: u64,
+}
+
+/// Media-error recovery for the Rust engine: [`RecoveryBudget`]'s media
+/// budget, counted per MediaSource (`epoch`) and refilled only once the play
+/// head has moved [`MEDIA_REFILL_MS`] past the rebuild point.
+#[derive(Debug, Clone, Default)]
+pub struct MediaRecovery {
+    budget: RecoveryBudget,
+    epoch: u32,
+    /// Where and when the last rebuild started, until playback passes it.
+    rebuilt: Option<(u64, u64)>,
+}
+
+impl MediaRecovery {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The MediaSource generation errors are counted against.
+    pub fn epoch(&self) -> u32 {
+        self.epoch
+    }
+
+    /// A media error `details` from MediaSource `epoch` at play head `at_ms`.
+    pub fn on_error(&mut self, epoch: u32, details: &str, at_ms: u64, now_ms: u64) -> MediaVerdict {
+        if epoch != self.epoch {
+            return MediaVerdict::Stale;
+        }
+        // A codec the browser refuses is refused again by a new MediaSource.
+        if details == "bufferAddCodecError" {
+            return MediaVerdict::Fail {
+                attempt: self.budget.attempts("mediaError"),
+            };
+        }
+        match self.budget.on_fatal("mediaError", details) {
+            Recovery::RecoverMedia => {
+                self.epoch = self.epoch.saturating_add(1);
+                self.rebuilt = Some((at_ms, now_ms));
+                MediaVerdict::Rebuild {
+                    attempt: self.budget.attempts("mediaError"),
+                }
+            }
+            Recovery::StartLoad | Recovery::Fail => MediaVerdict::Fail {
+                attempt: self.budget.attempts("mediaError"),
+            },
+        }
+    }
+
+    /// The play head is at `at_ms` and moving. [`MEDIA_REFILL_MS`] past the
+    /// rebuild point, the rebuild counts as a recovery: the budget refills and
+    /// the recovery is reported, once.
+    pub fn on_play_head(&mut self, at_ms: u64, now_ms: u64) -> Option<MediaResumed> {
+        let (from_ms, started_ms) = self.rebuilt?;
+        if at_ms < from_ms.saturating_add(MEDIA_REFILL_MS) {
+            return None;
+        }
+        let attempt = self.budget.attempts("mediaError");
+        self.budget.progressed();
+        self.rebuilt = None;
+        Some(MediaResumed {
+            attempt,
+            at_ms,
+            took_ms: now_ms.saturating_sub(started_ms),
+        })
+    }
+}
+
 /// Where Play starts: the stored position of a started, unfinished item.
 pub fn start_ms(position_ms: u64, played: bool) -> u64 {
     if played {
@@ -4514,6 +4626,101 @@ mod tests {
             Recovery::RecoverMedia,
             "each kind has its own budget"
         );
+    }
+
+    // V638/V1062: one fault costs one rebuild, and only playback well past
+    // the rebuild point refills the budget, so a segment that never decodes
+    // gives up after MAX_RECOVERIES instead of rebuilding forever.
+    #[test]
+    fn a_media_error_rebuilds_once_per_mediasource_and_refills_only_on_playback() {
+        let mut r = MediaRecovery::new();
+        assert_eq!(
+            r.on_error(0, "bufferAppendError", 60_000, 1_000),
+            MediaVerdict::Rebuild { attempt: 1 }
+        );
+        assert_eq!(
+            r.on_error(0, "videoError", 60_000, 1_010),
+            MediaVerdict::Stale,
+            "the same fault's second error"
+        );
+        assert_eq!(r.epoch(), 1);
+        assert_eq!(r.on_play_head(60_000, 1_500), None, "not moving yet");
+        assert_eq!(
+            r.on_play_head(60_250, 2_000),
+            None,
+            "moving again is not recovered: the bad segment may still be ahead"
+        );
+
+        // The same segment fails again before playback gets past it.
+        for attempt in 2..=MAX_RECOVERIES {
+            let epoch = r.epoch();
+            assert_eq!(
+                r.on_error(epoch, "bufferAppendError", 60_500, 3_000),
+                MediaVerdict::Rebuild { attempt }
+            );
+        }
+        let epoch = r.epoch();
+        assert_eq!(
+            r.on_error(epoch, "bufferAppendError", 60_500, 4_000),
+            MediaVerdict::Fail {
+                attempt: MAX_RECOVERIES
+            }
+        );
+    }
+
+    #[test]
+    fn playback_well_past_a_rebuild_refills_the_media_budget() {
+        let mut r = MediaRecovery::new();
+        for _ in 0..MAX_RECOVERIES {
+            let epoch = r.epoch();
+            r.on_error(epoch, "bufferStalledError", 30_000, 0);
+        }
+        assert_eq!(r.on_play_head(30_000 + MEDIA_REFILL_MS - 1, 100), None);
+        let epoch = r.epoch();
+        assert!(matches!(
+            r.on_error(epoch, "bufferStalledError", 30_000, 200),
+            MediaVerdict::Fail { .. }
+        ));
+        let mut r = MediaRecovery::new();
+        for _ in 0..MAX_RECOVERIES {
+            let epoch = r.epoch();
+            r.on_error(epoch, "bufferStalledError", 30_000, 0);
+        }
+        assert_eq!(
+            r.on_play_head(30_000 + MEDIA_REFILL_MS, 100),
+            Some(MediaResumed {
+                attempt: MAX_RECOVERIES,
+                at_ms: 30_000 + MEDIA_REFILL_MS,
+                took_ms: 100,
+            }),
+            "the recovery is reported where the budget refills"
+        );
+        assert_eq!(
+            r.on_play_head(30_000 + MEDIA_REFILL_MS + 500, 600),
+            None,
+            "once"
+        );
+        let epoch = r.epoch();
+        assert_eq!(
+            r.on_error(epoch, "bufferStalledError", 45_000, 200),
+            MediaVerdict::Rebuild { attempt: 1 }
+        );
+    }
+
+    #[test]
+    fn a_refused_codec_fails_without_a_rebuild() {
+        let mut r = MediaRecovery::new();
+        assert_eq!(
+            r.on_error(0, "bufferAddCodecError", 0, 0),
+            MediaVerdict::Fail { attempt: 0 }
+        );
+        assert_eq!(r.epoch(), 0);
+        assert_eq!(
+            MediaVerdict::Rebuild { attempt: 1 }.label(),
+            "recover_media"
+        );
+        assert_eq!(MediaVerdict::Fail { attempt: 1 }.label(), "fail");
+        assert_ne!(MediaVerdict::Stale.label(), "fail");
     }
 
     #[test]
