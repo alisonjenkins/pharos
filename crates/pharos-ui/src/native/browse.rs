@@ -1822,9 +1822,12 @@ fn EpisodeMark(id: ItemRef, label: String, played: bool) -> Element {
 enum MusicTab {
     Artists,
     Albums,
+    /// The mixes the listener can start (B897/V846).
+    Playlists,
 }
 
-/// A music library: its artists or its albums, switched by tabs.
+/// A music library: its artists, its albums or its playlists, switched by
+/// tabs.
 #[component]
 pub fn MusicLibraryView(title: String, library: ItemRef, artists: Page, albums: Page) -> Element {
     let mut tab = use_signal(|| MusicTab::Artists);
@@ -1855,6 +1858,14 @@ pub fn MusicLibraryView(title: String, library: ItemRef, artists: Page, albums: 
                     onclick: move |_| tab.set(MusicTab::Albums),
                     "Albums"
                 }
+                button {
+                    r#type: "button",
+                    role: "tab",
+                    class: tab_class(MusicTab::Playlists),
+                    aria_selected: tab() == MusicTab::Playlists,
+                    onclick: move |_| tab.set(MusicTab::Playlists),
+                    "Playlists"
+                }
             }
             // Each tab pages through its own listing (B821); switching tabs
             // mounts the other grid, which starts from the page loaded.
@@ -1870,6 +1881,7 @@ pub fn MusicLibraryView(title: String, library: ItemRef, artists: Page, albums: 
                         }
                     },
                 ),
+                MusicTab::Playlists => rsx! { mixes::MixShelf {} },
                 MusicTab::Albums => remount_on(
                     "albums",
                     rsx! {

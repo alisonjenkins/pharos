@@ -4247,6 +4247,83 @@ body::before {
 .pharos-mix-new {
   color: var(--px-color-accent);
 }
+/* A music library's Playlists tab (B897/V846): one tile per mix. */
+.pharos-mix-tiles {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(10rem, 1fr));
+  gap: 1rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.pharos-mix-tile-play {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  width: 100%;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--px-color-fg);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.pharos-mix-tile-play:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+.pharos-mix-tile-art {
+  display: grid;
+  place-items: center;
+  aspect-ratio: 1;
+  border-radius: var(--px-radius);
+  background: linear-gradient(
+    135deg,
+    color-mix(in srgb, var(--px-color-accent) 60%, var(--px-color-surface)),
+    var(--px-color-surface-raised)
+  );
+  transition: transform 0.15s ease;
+}
+.pharos-mix-tile[data-kind="saved"] .pharos-mix-tile-art {
+  background: linear-gradient(
+    315deg,
+    color-mix(in srgb, var(--px-color-kind-music, var(--px-color-accent)) 60%, var(--px-color-surface)),
+    var(--px-color-surface-raised)
+  );
+}
+.pharos-mix-tile-art .pharos-icon {
+  width: 38%;
+  height: 38%;
+}
+.pharos-mix-tile-play:not(:disabled):hover .pharos-mix-tile-art {
+  transform: translateY(-2px);
+}
+.pharos-mix-tile-play:focus-visible {
+  outline: none;
+}
+.pharos-mix-tile-play:focus-visible .pharos-mix-tile-art {
+  outline: 3px solid var(--px-color-focus);
+  outline-offset: 2px;
+}
+.pharos-mix-tile-name {
+  font-weight: 600;
+}
+.pharos-mix-tile-rules {
+  font-size: 0.8rem;
+}
+.pharos-mix-tile-on {
+  color: var(--px-color-accent);
+  font-size: 0.8rem;
+}
+.pharos-mix-shelf-note {
+  margin: 1rem 0 0;
+}
+@media (prefers-reduced-motion: reduce) {
+  .pharos-mix-tile-art {
+    transition: none;
+  }
+}
 .pharos-queue-why {
   display: block;
   overflow: hidden;
