@@ -157,6 +157,7 @@ fn op_name(op: &TinyOp) -> &'static str {
         TinyOp::SrtToWebvtt { .. } => "srt_to_webvtt",
         TinyOp::Waveform { .. } => "waveform",
         TinyOp::AudioFeatures { .. } => "audio_features",
+        TinyOp::PictureCheck { .. } => "picture_check",
         TinyOp::SubtitleWindows { .. } => "subtitle_windows",
         TinyOp::SubtitleImages { .. } => "subtitle_images",
         TinyOp::Integrity { .. } => "integrity",
@@ -186,6 +187,8 @@ fn is_heavy_op(op: &TinyOp) -> bool {
             // One demux of the whole file for the keyframes, plus the audio
             // decode up to the last line.
             | TinyOp::SubtitleSignals { .. }
+            // Seven seeks and keyframe decodes, each a cold read on NFS.
+            | TinyOp::PictureCheck { .. }
     )
 }
 
@@ -484,6 +487,25 @@ impl LibavWorkerPool {
             .await?;
         match ev {
             WorkerEvent::AudioFeaturesResult { features, .. } => Ok(features),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// Find black bars baked into a video's picture, from keyframes sampled
+    /// across the file. See `crate::picture_area`.
+    pub async fn picture_check(
+        &self,
+        input: impl Into<PathBuf>,
+        duration_ms: u64,
+    ) -> Result<crate::picture_area::PictureAnalysis, PoolError> {
+        let ev = self
+            .run(TinyOp::PictureCheck {
+                input: input.into(),
+                duration_ms,
+            })
+            .await?;
+        match ev {
+            WorkerEvent::PictureCheckResult { analysis, .. } => Ok(analysis),
             other => Err(unexpected(other)),
         }
     }
@@ -840,6 +862,7 @@ impl LibavWorkerPool {
                 WorkerEvent::ProbeResult { job_id: j, .. }
                 | WorkerEvent::WaveformResult { job_id: j, .. }
                 | WorkerEvent::AudioFeaturesResult { job_id: j, .. }
+                | WorkerEvent::PictureCheckResult { job_id: j, .. }
                 | WorkerEvent::SubtitleWindowsResult { job_id: j, .. }
                 | WorkerEvent::IntegrityResult { job_id: j, .. }
                 | WorkerEvent::FingerprintResult { job_id: j, .. }
