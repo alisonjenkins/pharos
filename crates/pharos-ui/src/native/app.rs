@@ -54,8 +54,8 @@ use super::seen::{self, MemberSeen};
 use super::settings::{Section, SettingsLayout};
 use super::show_tracks;
 use super::stage::{
-    Handoff, QueueButton, Stage, StageAction, StageBar, StageClose, StageCtx, StageGrip, View,
-    STAGE_ID,
+    Handoff, QueueButton, QueueDock, Stage, StageAction, StageBar, StageClose, StageCtx, StageGrip,
+    View, STAGE_ID,
 };
 use super::subtitles::{track_mode, FallbackReason, RustState, TrackMode};
 use super::together::{
@@ -1593,6 +1593,8 @@ fn NativeApp(route: Route) -> Element {
     // The mix that is on keeps the queue topped up (spec 024, B441).
     let mix = use_signal(|| None::<ActiveMix>);
     use_context_provider(|| MixCtx(mix));
+    // Whether the queue is docked beside the compact player (B896).
+    use_context_provider(|| QueueDock(Signal::new(super::listen::dock_shown())));
     mixes::use_top_up(api, queue, mix);
     use_context_provider(|| {
         let marking = Rc::new(RefCell::new(std::collections::HashSet::<ItemRef>::new()));
@@ -5540,9 +5542,18 @@ fn Player(
         }
     };
     let compact = view != View::Full;
-    // The queue docked beside the compact player (B896/V845). Stored, so a
-    // song that mounts a new player keeps it open.
-    let mut dock = use_signal(super::listen::dock_shown);
+    // The queue docked beside the compact player (B896/V845), shared by the
+    // stage's players so a song handing over keeps it open.
+    let own_dock = use_signal(|| false);
+    let mut dock = try_use_context::<QueueDock>().map_or(own_dock, |d| d.0);
+    // Exactly one slot is in sight: the playing one, or the outgoing one
+    // while the next is negotiated. Only it docks a queue.
+    let in_sight = matches!(
+        slot,
+        Slot::Current { waiting: false, .. } | Slot::Outgoing(Handoff { ready: false, .. })
+    );
+    // Which side the floating window is on, so the dock takes the other.
+    let window_right = use_memo(move || stage.read().spot.x > 0.5)();
     let on_queue = EventHandler::new(move |action: QueueAction| {
         // In a group the group picks the song.
         if matches!(action, QueueAction::Play(_)) && !queued {
@@ -5600,10 +5611,10 @@ fn Player(
                     let open = !*dock.peek();
                     dock.set(open);
                     super::listen::store_dock(open);
-                    platform::info(&format!(
-                        "pharos: stage queue shown={open} view={} upcoming={}",
-                        view.label(),
-                        queue.peek().upcoming().len()
+                    platform::info(&super::stage::dock_line(
+                        open,
+                        view,
+                        queue.peek().upcoming().len(),
                     ));
                 }
             }
@@ -5665,9 +5676,12 @@ fn Player(
                     open: dock(),
                 }),
             }
-            // Only the playing slot's: a song handing over shows one queue.
-            if audio && dock() && matches!(slot, Slot::Current { .. }) {
-                div { class: "pharos-queue-dock", "data-view": view.label(),
+            // Only the slot in sight: a song handing over shows one queue.
+            if audio && dock() && in_sight {
+                div {
+                    class: "pharos-queue-dock",
+                    "data-view": view.label(),
+                    "data-side": if view == View::Floating && window_right { "left" } else { "right" },
                     QueuePanel {
                         queue: queue.read().upcoming().to_vec(),
                         shuffled: queue.read().shuffled(),
@@ -5704,6 +5718,7 @@ fn Player(
             ListenView {
                 // A retired song's screen is hidden; it draws no visualiser.
                 compact: compact || matches!(slot, Slot::Outgoing(Handoff { ready: true, .. })),
+                in_sight,
                 media_id: slot.media_id(),
                 title: p.title.clone(),
                 image: p.image.clone(),

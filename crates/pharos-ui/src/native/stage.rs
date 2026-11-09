@@ -487,6 +487,19 @@ pub enum StageAction {
     Queue,
 }
 
+/// Whether the queue is docked beside the compact player, shared by every
+/// player on the stage so a song handing over keeps it (B896/V845).
+#[derive(Clone, Copy)]
+pub struct QueueDock(pub Signal<bool>);
+
+/// What the stage logs when the docked queue opens or closes.
+pub fn dock_line(open: bool, view: View, upcoming: usize) -> String {
+    format!(
+        "pharos: stage queue shown={open} view={} upcoming={upcoming}",
+        view.label()
+    )
+}
+
 /// The compact player's queue button: how many songs wait, and whether the
 /// docked queue is open.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1185,5 +1198,17 @@ mod tests {
         assert_eq!(queue_label(0), "Queue");
         assert_eq!(queue_label(1), "Queue, 1 song");
         assert_eq!(queue_label(12), "Queue, 12 songs");
+    }
+
+    #[test]
+    fn the_docked_queue_logs_its_state_the_view_and_the_count() {
+        assert_eq!(
+            dock_line(true, View::Mini, 4),
+            "pharos: stage queue shown=true view=mini upcoming=4"
+        );
+        assert_eq!(
+            dock_line(false, View::Floating, 0),
+            "pharos: stage queue shown=false view=floating upcoming=0"
+        );
     }
 }

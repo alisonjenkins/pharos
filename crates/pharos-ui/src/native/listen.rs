@@ -182,6 +182,10 @@ pub fn ListenView(
     /// screen is out of sight, so it draws no visualiser.
     #[props(default)]
     compact: bool,
+    /// This screen's slot is the one in sight. A song handing over mounts
+    /// two screens; only the one in sight draws the queue panel (V845).
+    #[props(default = true)]
+    in_sight: bool,
     /// The `<audio>` element's id: [`VIDEO_ID`], or another while this song
     /// hands over to the next.
     #[props(default = VIDEO_ID)]
@@ -353,7 +357,7 @@ pub fn ListenView(
                         r#type: "button",
                         title: "Show or hide what plays next",
                         aria_pressed: if show_queue() { "true" } else { "false" },
-                        aria_controls: (show_queue() && !compact).then_some(QUEUE_PANEL_ID),
+                        aria_controls: (show_queue() && !compact && in_sight).then_some(QUEUE_PANEL_ID),
                         onclick: move |_| toggle_queue(),
                         Icon { path: ICON_QUEUE_NEXT }
                         "Queue"
@@ -380,7 +384,7 @@ pub fn ListenView(
             }
             // Not while the screen is out of sight: the compact player docks
             // its own (B896/V845), and two panels would share element ids.
-            if show_queue() && !compact {
+            if show_queue() && !compact && in_sight {
                 QueuePanel { queue: queue.clone(), shuffled, on_queue, playing }
             }
             div { class: "pharos-listen-body",

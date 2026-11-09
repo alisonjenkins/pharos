@@ -4511,6 +4511,12 @@ body:has(.pharos-stage.is-mini) .pharos-main {
   bottom: auto;
   top: 4.5rem;
 }
+/* The floating window is on the right: the dock takes the left, so it
+   never covers the window or its Queue button. */
+.pharos-queue-dock[data-side="left"] {
+  right: auto;
+  left: 1rem;
+}
 .pharos-queue-dock .pharos-queue {
   position: relative;
   top: auto;
