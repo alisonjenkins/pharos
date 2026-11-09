@@ -239,11 +239,17 @@ mod tests {
     #[test]
     fn a_jump_scrolls_the_grid_tile_and_focuses_it() {
         let js = scroll_to_tile_js(42);
-        assert!(js.contains(r#"document.querySelector(".pharos-browse .pharos-grid")"#), "{js}");
+        assert!(
+            js.contains(r#"document.querySelector(".pharos-browse .pharos-grid")"#),
+            "{js}"
+        );
         assert!(js.contains("grid.children[42]"), "{js}");
         assert!(js.contains("scrollIntoView(true)"), "{js}");
         assert!(js.contains("focus({ preventScroll: true })"), "{js}");
-        assert!(js.contains("return false") && js.contains("return true"), "{js}");
+        assert!(
+            js.contains("return false") && js.contains("return true"),
+            "{js}"
+        );
     }
 
     #[test]
