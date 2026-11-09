@@ -7,7 +7,7 @@
 
 use pharos_core::{MediaItem, MediaKind};
 use pharos_transcode::integrity::IntegrityReport;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use tokio::sync::Notify;
 
@@ -19,7 +19,8 @@ pub struct IntegritySweep {
     /// so "queued" stays true for the whole wait.
     queued: Mutex<Vec<u64>>,
     wake: Notify,
-    not_checkable: Mutex<HashSet<u64>>,
+    /// Keyed to the file's `(mtime, size)`, so a replaced file is tried again.
+    not_checkable: Mutex<HashMap<u64, Option<(i64, u64)>>>,
 }
 
 impl IntegritySweep {
@@ -68,18 +69,60 @@ impl IntegritySweep {
         }
     }
 
-    /// Whether this file was found to be in a format nothing here can verify.
-    pub fn is_not_checkable(&self, id: u64) -> bool {
+    /// Whether this file, in this state, was found to be in a format nothing
+    /// here can verify. An unstattable file never matches, as in the memo.
+    pub fn is_not_checkable(&self, id: u64, sig: Option<(i64, u64)>) -> bool {
+        sig.is_some()
+            && self
+                .not_checkable
+                .lock()
+                .map(|s| s.get(&id) == Some(&sig))
+                .unwrap_or(false)
+    }
+
+    /// Whether any not-checkable finding is held for this id, whatever state
+    /// the file was in. For progress counts, where a `stat` per file is too dear.
+    pub fn has_not_checkable(&self, id: u64) -> bool {
         self.not_checkable
             .lock()
-            .map(|s| s.contains(&id))
+            .map(|s| s.contains_key(&id))
             .unwrap_or(false)
     }
 
-    pub fn mark_not_checkable(&self, id: u64) {
+    pub fn mark_not_checkable(&self, id: u64, sig: Option<(i64, u64)>) {
         if let Ok(mut s) = self.not_checkable.lock() {
-            s.insert(id);
+            s.insert(id, sig);
         }
+    }
+
+    fn clear_not_checkable(&self, id: u64) {
+        if let Ok(mut s) = self.not_checkable.lock() {
+            s.remove(&id);
+        }
+    }
+
+    /// Record what a read found, in exactly one place: a verdict replaces any
+    /// earlier not-checkable finding, and a not-checkable finding drops any
+    /// earlier verdict, so a file is never listed as both, and a re-check
+    /// whose answer is "cannot verify" does not leave a stale "damaged" behind.
+    pub fn settle(
+        &self,
+        memo: &crate::integrity_memo::IntegrityMemo,
+        id: u64,
+        sig: Option<(i64, u64)>,
+        found: Found,
+    ) {
+        match found {
+            Found::Report(report) => {
+                self.clear_not_checkable(id);
+                memo.record(id, sig, report);
+            }
+            Found::NotCheckable => {
+                memo.forget(id);
+                self.mark_not_checkable(id, sig);
+            }
+        }
+        self.done(id);
     }
 }
 
@@ -146,6 +189,25 @@ pub fn pass_order<'a>(items: &'a [MediaItem], queued: &[u64]) -> Vec<(&'a MediaI
             .map(|it| (it, false)),
     );
     first
+}
+
+/// What a read found, as [`IntegritySweep::settle`] takes it.
+#[derive(Debug)]
+pub enum Found {
+    Report(IntegrityReport),
+    NotCheckable,
+}
+
+/// Count one read's result. Labels are a dashboard contract (bounded, asserted
+/// in a test): `verdict` is a `label()` word, `not_checkable` or `error`, and
+/// `kind` a `MediaKind::as_str`.
+pub fn count_verdict(verdict: &'static str, kind: MediaKind) {
+    metrics::counter!(
+        "pharos_media_integrity_total",
+        "verdict" => verdict,
+        "kind" => kind.as_str(),
+    )
+    .increment(1);
 }
 
 #[cfg(test)]
@@ -264,5 +326,80 @@ mod tests {
             !scannable(&local("ytdlp://youtube/dQw4w9WgXcQ")),
             "a synthetic path is not a file; scanning it can only ever fail"
         );
+    }
+
+    fn report(read_errors: u64) -> IntegrityReport {
+        IntegrityReport {
+            read_errors,
+            complete: true,
+            ..Default::default()
+        }
+    }
+
+    /// A re-check that comes back "cannot verify" must not leave the old
+    /// "damaged" verdict listed, and a later real verdict must clear the
+    /// not-checkable finding: a file is never both.
+    #[test]
+    fn a_file_is_never_both_damaged_and_not_checkable() {
+        let memo = crate::integrity_memo::IntegrityMemo::load("/nonexistent/m.json", 1);
+        let sweep = IntegritySweep::default();
+        let sig = Some((1, 2));
+        sweep.settle(&memo, 9, sig, Found::Report(report(1)));
+        assert_eq!(memo.damaged().len(), 1);
+        sweep.request(9);
+        sweep.settle(&memo, 9, sig, Found::NotCheckable);
+        assert!(memo.damaged().is_empty(), "the stale verdict is gone");
+        assert!(sweep.is_not_checkable(9, sig));
+        assert!(!sweep.is_queued(9), "settling ends the re-check");
+        sweep.settle(&memo, 9, sig, Found::Report(report(0)));
+        assert!(!sweep.has_not_checkable(9));
+        assert_eq!(memo.recorded_damaged(9), Some(false));
+    }
+
+    #[test]
+    fn a_replaced_file_is_tried_again_after_not_checkable() {
+        let sweep = IntegritySweep::default();
+        sweep.mark_not_checkable(3, Some((1, 2)));
+        assert!(sweep.is_not_checkable(3, Some((1, 2))));
+        assert!(!sweep.is_not_checkable(3, Some((5, 2))), "new mtime");
+        assert!(
+            !sweep.is_not_checkable(3, None),
+            "unstattable never matches"
+        );
+        assert!(sweep.has_not_checkable(3));
+    }
+
+    /// The signal B895 names is `sum by (kind, verdict)`; renaming a label
+    /// breaks that query silently, so the labels are pinned here.
+    #[test]
+    fn a_verdict_is_counted_by_verdict_and_kind() {
+        use metrics_util::debugging::DebuggingRecorder;
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = pharos_test_metrics::snapshotter(&recorder);
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        count_verdict("not_checkable", MediaKind::Book);
+        count_verdict(report(1).label(), MediaKind::Episode);
+        let seen: Vec<(String, String)> = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(k, ..)| k.key().name() == "pharos_media_integrity_total")
+            .map(|(k, ..)| {
+                let label = |n: &str| {
+                    k.key()
+                        .labels()
+                        .find(|l| l.key() == n)
+                        .map(|l| l.value().to_string())
+                        .unwrap_or_default()
+                };
+                (label("verdict"), label("kind"))
+            })
+            .collect();
+        for want in [("not_checkable", "book"), ("damaged", "episode")] {
+            assert!(
+                seen.contains(&(want.0.to_string(), want.1.to_string())),
+                "missing {want:?} in {seen:?}"
+            );
+        }
     }
 }

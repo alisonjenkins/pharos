@@ -64,7 +64,7 @@
 use crate::bg_io::BgPermit;
 use crate::integrity_memo::IntegrityMemo;
 use crate::integrity_sweep::{
-    book_report, pass_order, reader_for, scannable, IntegritySweep, Reader,
+    book_report, count_verdict, pass_order, reader_for, scannable, Found, IntegritySweep, Reader,
 };
 use crate::state::Stores;
 use pharos_core::{MediaItem, MediaStore};
@@ -91,6 +91,11 @@ const PASS_INTERVAL: Duration = Duration::from_secs(3600);
 /// uninterruptible sweep whose progress is lost on restart" into a sequence of
 /// passes that each bank their results.
 const MAX_PER_PASS: usize = 200;
+
+/// The longest the sweep waits on one book. A 512 MiB PDF (the check's size
+/// cap) inflates in well under a minute; ten is room for a slow NFS read, not
+/// for a decompression bomb.
+const BOOK_CHECK_TIMEOUT: Duration = Duration::from_secs(600);
 
 struct Ctx {
     /// Background-work leadership (T85). Gates the sweep so replicas do not
@@ -169,11 +174,21 @@ enum Outcome {
 async fn scan_one(ctx: &Ctx, it: &MediaItem) -> Result<Outcome, String> {
     if reader_for(it.kind) == Reader::Book {
         let path = it.path.clone();
-        let checked =
-            tokio::task::spawn_blocking(move || pharos_scanner::book::integrity::check(&path))
-                .await
-                .map_err(|e| format!("book check task failed: {e}"))?
-                .map_err(|e| format!("book could not be opened: {e}"))?;
+        let task =
+            tokio::task::spawn_blocking(move || pharos_scanner::book::integrity::check(&path));
+        // A blocking read cannot be cancelled, but the sweep and its permit
+        // must not wait on it forever. Past the bound the thread finishes on
+        // its own, and the file is not checkable in this state: retrying it
+        // every pass would strand another thread each time.
+        let Ok(joined) = tokio::time::timeout(BOOK_CHECK_TIMEOUT, task).await else {
+            return Ok(Outcome::NotCheckable(format!(
+                "book check took over {}s",
+                BOOK_CHECK_TIMEOUT.as_secs()
+            )));
+        };
+        let checked = joined
+            .map_err(|e| format!("book check task failed: {e}"))?
+            .map_err(|e| format!("book could not be opened: {e}"))?;
         return Ok(match checked {
             BookCheck::Checked(b) => Outcome::Report(book_report(b)),
             BookCheck::NotCheckable(why) => Outcome::NotCheckable(why),
@@ -210,14 +225,12 @@ async fn run_pass(ctx: &Ctx, items: &[MediaItem]) {
             ctx.sweep.done(it.id);
             continue;
         }
-        if !requested && ctx.sweep.is_not_checkable(it.id) {
-            continue;
-        }
         let sig = tokio::fs::metadata(&it.path)
             .await
             .ok()
             .map(|m| (mtime_secs(&m), m.len()));
-        if !requested && ctx.memo.is_scanned(it.id, sig) {
+        if !requested && (ctx.memo.is_scanned(it.id, sig) || ctx.sweep.is_not_checkable(it.id, sig))
+        {
             continue;
         }
 
@@ -230,7 +243,6 @@ async fn run_pass(ctx: &Ctx, items: &[MediaItem]) {
             let _permit = BgPermit::acquire(&ctx.bg_io).await;
             scan_one(ctx, it).await
         };
-        ctx.sweep.done(it.id);
         let kind = it.kind.as_str();
         let elapsed = started.elapsed();
         metrics::histogram!("pharos_media_integrity_seconds").record(elapsed.as_secs_f64());
@@ -238,12 +250,7 @@ async fn run_pass(ctx: &Ctx, items: &[MediaItem]) {
 
         match outcome {
             Ok(Outcome::NotCheckable(why)) => {
-                metrics::counter!(
-                    "pharos_media_integrity_total",
-                    "verdict" => "not_checkable",
-                    "kind" => kind,
-                )
-                .increment(1);
+                count_verdict("not_checkable", it.kind);
                 tracing::info!(
                     item = %it.id,
                     path = %it.path.display(),
@@ -251,15 +258,10 @@ async fn run_pass(ctx: &Ctx, items: &[MediaItem]) {
                     reason = %why,
                     "integrity sweep: file cannot be verified; not counted as clean",
                 );
-                ctx.sweep.mark_not_checkable(it.id);
+                ctx.sweep.settle(&ctx.memo, it.id, sig, Found::NotCheckable);
             }
             Ok(Outcome::Report(report)) => {
-                metrics::counter!(
-                    "pharos_media_integrity_total",
-                    "verdict" => report.label(),
-                    "kind" => kind,
-                )
-                .increment(1);
+                count_verdict(report.label(), it.kind);
                 if report.is_damaged() {
                     damaged_this_pass += 1;
                     // The failure path states as much as the success path
@@ -289,7 +291,8 @@ async fn run_pass(ctx: &Ctx, items: &[MediaItem]) {
                         "integrity sweep: clean",
                     );
                 }
-                ctx.memo.record(it.id, sig, report);
+                ctx.sweep
+                    .settle(&ctx.memo, it.id, sig, Found::Report(report));
             }
             Err(e) => {
                 // The scan itself failed — a worker died, timed out, or the
@@ -297,12 +300,10 @@ async fn run_pass(ctx: &Ctx, items: &[MediaItem]) {
                 // an infrastructure failure is not a verdict about the file,
                 // and writing one would mark a healthy file unexamined-forever
                 // on a single transient fault.
-                metrics::counter!(
-                    "pharos_media_integrity_total",
-                    "verdict" => "error",
-                    "kind" => kind,
-                )
-                .increment(1);
+                // The re-check, if any, ends here too: the admin sees the old
+                // verdict without the pending flag, and the log says why.
+                ctx.sweep.done(it.id);
+                count_verdict("error", it.kind);
                 tracing::warn!(
                     item = %it.id,
                     path = %it.path.display(),
