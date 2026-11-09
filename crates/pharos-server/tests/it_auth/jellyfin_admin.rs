@@ -1469,3 +1469,96 @@ async fn a_non_admin_cannot_see_integrity_status_or_queue_a_recheck() {
     .await;
     assert_eq!(resp.status().as_u16(), 403);
 }
+
+/// A deep check is asked for one file, refused for a book and on a follower,
+/// and its result (here: ffmpeg missing) is listed with the reason.
+#[actix_web::test]
+async fn an_admin_can_ask_for_a_deep_check_and_read_its_result() {
+    use pharos_core::{MediaItem, MediaKind, MediaStore};
+    use pharos_server::integrity_deep::DeepChecks;
+
+    let (state, token, _uid) = seed(true).await;
+    for (id, kind, path) in [
+        (20u64, MediaKind::Movie, "/m/film.mkv"),
+        (21, MediaKind::Book, "/b/book.epub"),
+    ] {
+        MediaStore::put(
+            &state.stores,
+            MediaItem {
+                id,
+                kind,
+                path: path.into(),
+                title: format!("item {id}"),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    }
+    let deep = std::sync::Arc::new(DeepChecks::new(
+        "/nonexistent/ffmpeg",
+        std::sync::Arc::new(tokio::sync::Semaphore::new(4)),
+    ));
+    let app_state = AppState::new(state.stores.clone(), "t".into()).with_integrity_deep(deep);
+    let leader = app_state.is_bg_leader.clone();
+    let app = test::init_service(build_app(web::Data::new(app_state))).await;
+    let post = |uri: &str| {
+        test::TestRequest::post()
+            .uri(uri)
+            .insert_header(("X-Emby-Token", token.as_str()))
+            .to_request()
+    };
+    let resp = test::call_service(&app, post("/admin/integrity/20/deep")).await;
+    assert_eq!(resp.status().as_u16(), 503, "a follower refuses");
+    leader.store(true, std::sync::atomic::Ordering::Relaxed);
+    let resp = test::call_service(&app, post("/Admin/Integrity/20/Deep")).await;
+    assert_eq!(resp.status().as_u16(), 202);
+    let resp = test::call_service(&app, post("/admin/integrity/21/deep")).await;
+    assert_eq!(resp.status().as_u16(), 400, "a book has no frames");
+    let resp = test::call_service(&app, post("/admin/integrity/999/deep")).await;
+    assert_eq!(resp.status().as_u16(), 404);
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let body = test::call_and_read_body(
+            &app,
+            test::TestRequest::get()
+                .uri("/admin/integrity/deep")
+                .insert_header(("X-Emby-Token", token.as_str()))
+                .to_request(),
+        )
+        .await;
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let e = &v[0];
+        assert_eq!(e["MediaId"], "20", "{v}");
+        assert_eq!(e["Name"], "item 20");
+        assert_eq!(e["Kind"], "movie");
+        if e["State"] == "failed" {
+            assert!(
+                e["Detail"].as_str().unwrap().contains("could not start"),
+                "{v}"
+            );
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "never finished: {v}");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+#[actix_web::test]
+async fn a_non_admin_cannot_ask_for_or_list_deep_checks() {
+    let (state, token, _uid) = seed(false).await;
+    let app = test::init_service(build_app(state)).await;
+    for req in [
+        test::TestRequest::get().uri("/admin/integrity/deep"),
+        test::TestRequest::post().uri("/admin/integrity/1/deep"),
+    ] {
+        let resp = test::call_service(
+            &app,
+            req.insert_header(("X-Emby-Token", token.as_str()))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status().as_u16(), 403);
+    }
+}
