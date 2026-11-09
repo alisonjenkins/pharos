@@ -1883,6 +1883,9 @@ where
             backdrop_locator: hit.backdrop_locator,
             // The upsert never writes the ratings columns.
             ratings: Default::default(),
+            match_flag: None,
+            match_runner_up_id: None,
+            match_runner_up_score: None,
         })
         .await?;
     store_texts(

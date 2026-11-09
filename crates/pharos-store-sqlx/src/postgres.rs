@@ -24,11 +24,11 @@ use pharos_core::{
     MediaMetadata, MediaProbe, MediaQuery, MediaStore, OverrideSource, PersistedSyncGroup,
     PersistedTranscodeSession, Person, PersonCount, PersonDetails, PersonKind, PersonRef,
     PersonStore, PlaybackProgress, Playlist, PlaylistEntry, PlaylistStore, PreferenceStore,
-    ResolvedToken, ScanState, SecretString, SeriesIdentityRow, SeriesIdentityStore, SeriesInfo,
-    SeriesKeyUpdate, SeriesMatchCandidate, SeriesMetadata, SeriesMetadataStore, SeriesOverride,
-    Studio, StudioCount, StudioStore, SyncGroupStore, Tag, TagCount, TagStore, TokenId, TokenScope,
-    TokenSelector, TokenStore, TranscodeSessionStore, UserDataStore, UserId, UserItemData,
-    UserPolicy, UserRecord, UserStore,
+    ResolvedToken, ScanState, SecretString, SeriesEpisodeRow, SeriesIdentityRow,
+    SeriesIdentityStore, SeriesInfo, SeriesKeyUpdate, SeriesMatchCandidate, SeriesMetadata,
+    SeriesMetadataStore, SeriesOverride, Studio, StudioCount, StudioStore, SyncGroupStore, Tag,
+    TagCount, TagStore, TokenId, TokenScope, TokenSelector, TokenStore, TranscodeSessionStore,
+    UserDataStore, UserId, UserItemData, UserPolicy, UserRecord, UserStore,
 };
 
 const MEDIA_COLUMNS: &str = "id, path, title, kind, size_bytes, duration_ms, container, \
@@ -4154,8 +4154,9 @@ impl SeriesMetadataStore for PostgresStore {
             "INSERT INTO series_metadata (series_key, series_name, match_provider, \
                  match_external_id, match_source, match_confidence, metadata_refreshed_at, \
                  overview, community_rating, premiere_date, official_rating, genres, studios, \
-                 provider_ids, poster_locator, backdrop_locator, original_language) \
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17) \
+                 provider_ids, poster_locator, backdrop_locator, original_language, \
+                 match_flag, match_runner_up_id, match_runner_up_score) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20) \
              ON CONFLICT(series_key) DO UPDATE SET \
                  series_name = excluded.series_name, \
                  match_provider = excluded.match_provider, \
@@ -4172,7 +4173,10 @@ impl SeriesMetadataStore for PostgresStore {
                  provider_ids = excluded.provider_ids, \
                  poster_locator = excluded.poster_locator, \
                  backdrop_locator = excluded.backdrop_locator, \
-                 original_language = excluded.original_language",
+                 original_language = excluded.original_language, \
+                 match_flag = excluded.match_flag, \
+                 match_runner_up_id = excluded.match_runner_up_id, \
+                 match_runner_up_score = excluded.match_runner_up_score",
         )
         .bind(&meta.series_key)
         .bind(&meta.series_name)
@@ -4191,6 +4195,9 @@ impl SeriesMetadataStore for PostgresStore {
         .bind(&meta.poster_locator)
         .bind(&meta.backdrop_locator)
         .bind(&meta.original_language)
+        .bind(&meta.match_flag)
+        .bind(&meta.match_runner_up_id)
+        .bind(meta.match_runner_up_score)
         .execute(&self.pool)
         .await
         .map_err(|e| DomainError::Backend(e.to_string()))?;
@@ -4377,6 +4384,26 @@ impl SeriesIdentityStore for PostgresStore {
             .await
             .map_err(|e| DomainError::Backend(e.to_string()))?;
         Ok(changed)
+    }
+
+    async fn series_episodes(&self, series_key: &str) -> DomainResult<Vec<SeriesEpisodeRow>> {
+        let rows: Vec<(String, Option<i32>, Option<i32>)> = sqlx::query_as(
+            "SELECT path, season_number, episode_number FROM media_items \
+             WHERE kind = 'episode' AND COALESCE(series_key, series_folder, series_name) = $1",
+        )
+        .bind(series_key)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| DomainError::Backend(e.to_string()))?;
+        let num = |n: Option<i32>| n.and_then(|n| u32::try_from(n).ok());
+        Ok(rows
+            .into_iter()
+            .map(|(path, season, episode)| SeriesEpisodeRow {
+                path,
+                season: num(season),
+                episode: num(episode),
+            })
+            .collect())
     }
 
     #[tracing::instrument(skip(self, keys), fields(keys = keys.len()))]

@@ -12,11 +12,11 @@ use pharos_core::{
     LibraryKind, LibraryStore, MediaFacets, MediaId, MediaItem, MediaQuery, MediaStore,
     PersistedSyncGroup, PersistedTranscodeSession, Person, PersonCount, PersonDetails, PersonRef,
     PersonStore, PlaybackProgress, Playlist, PlaylistEntry, PlaylistStore, PreferenceStore,
-    ResolvedToken, ScanState, SearchQuery, SecretString, SeriesIdentityRow, SeriesIdentityStore,
-    SeriesKeyUpdate, SeriesMatchCandidate, SeriesMetadata, SeriesMetadataStore, SeriesOverride,
-    Studio, StudioCount, StudioStore, SyncGroupStore, Tag, TagCount, TagStore, TokenId,
-    TokenRecord, TokenScope, TokenSelector, TokenStore, TranscodeSessionStore, UserDataStore,
-    UserId, UserItemData, UserPolicy, UserRecord, UserStore,
+    ResolvedToken, ScanState, SearchQuery, SecretString, SeriesEpisodeRow, SeriesIdentityRow,
+    SeriesIdentityStore, SeriesKeyUpdate, SeriesMatchCandidate, SeriesMetadata,
+    SeriesMetadataStore, SeriesOverride, Studio, StudioCount, StudioStore, SyncGroupStore, Tag,
+    TagCount, TagStore, TokenId, TokenRecord, TokenScope, TokenSelector, TokenStore,
+    TranscodeSessionStore, UserDataStore, UserId, UserItemData, UserPolicy, UserRecord, UserStore,
 };
 
 #[derive(Clone)]
@@ -767,6 +767,13 @@ impl SeriesIdentityStore for AnyStore {
         match self {
             AnyStore::Sqlite(s) => s.set_series_keys(updates).await,
             AnyStore::Postgres(p) => p.set_series_keys(updates).await,
+        }
+    }
+
+    async fn series_episodes(&self, series_key: &str) -> DomainResult<Vec<SeriesEpisodeRow>> {
+        match self {
+            AnyStore::Sqlite(s) => s.series_episodes(series_key).await,
+            AnyStore::Postgres(p) => p.series_episodes(series_key).await,
         }
     }
 

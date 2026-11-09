@@ -4,9 +4,10 @@ use pharos_core::{
     ExternalRatings, Fingerprint, Genre, GenreCount, GenreStore, ItemPerson, Library, LibraryKind,
     LibraryStore, MediaId, MediaItem, MediaKind, MediaMetadata, MediaProbe, MediaQuery, MediaStore,
     OverrideSource, Person, PersonCount, PersonDetails, PersonKind, PersonRef, PersonStore,
-    Playlist, PlaylistEntry, PlaylistStore, ScanState, SeriesIdentityRow, SeriesIdentityStore,
-    SeriesInfo, SeriesKeyUpdate, SeriesMatchCandidate, SeriesMetadata, SeriesMetadataStore,
-    SeriesOverride, Studio, StudioCount, StudioStore, Tag, TagCount, TagStore, UserId,
+    Playlist, PlaylistEntry, PlaylistStore, ScanState, SeriesEpisodeRow, SeriesIdentityRow,
+    SeriesIdentityStore, SeriesInfo, SeriesKeyUpdate, SeriesMatchCandidate, SeriesMetadata,
+    SeriesMetadataStore, SeriesOverride, Studio, StudioCount, StudioStore, Tag, TagCount, TagStore,
+    UserId,
 };
 use sqlx::{
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous},
@@ -3566,8 +3567,9 @@ impl SeriesMetadataStore for SqliteStore {
             "INSERT INTO series_metadata (series_key, series_name, match_provider, \
                  match_external_id, match_source, match_confidence, metadata_refreshed_at, \
                  overview, community_rating, premiere_date, official_rating, genres, studios, \
-                 provider_ids, poster_locator, backdrop_locator, original_language) \
-             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) \
+                 provider_ids, poster_locator, backdrop_locator, original_language, \
+                 match_flag, match_runner_up_id, match_runner_up_score) \
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) \
              ON CONFLICT(series_key) DO UPDATE SET \
                  series_name = excluded.series_name, \
                  match_provider = excluded.match_provider, \
@@ -3584,7 +3586,10 @@ impl SeriesMetadataStore for SqliteStore {
                  provider_ids = excluded.provider_ids, \
                  poster_locator = excluded.poster_locator, \
                  backdrop_locator = excluded.backdrop_locator, \
-                 original_language = excluded.original_language",
+                 original_language = excluded.original_language, \
+                 match_flag = excluded.match_flag, \
+                 match_runner_up_id = excluded.match_runner_up_id, \
+                 match_runner_up_score = excluded.match_runner_up_score",
         )
         .bind(&meta.series_key)
         .bind(&meta.series_name)
@@ -3603,6 +3608,9 @@ impl SeriesMetadataStore for SqliteStore {
         .bind(&meta.poster_locator)
         .bind(&meta.backdrop_locator)
         .bind(&meta.original_language)
+        .bind(&meta.match_flag)
+        .bind(&meta.match_runner_up_id)
+        .bind(meta.match_runner_up_score)
         .execute(&self.pool)
         .await
         .map_err(|e| DomainError::Backend(e.to_string()))?;
@@ -3784,6 +3792,26 @@ impl SeriesIdentityStore for SqliteStore {
             .await
             .map_err(|e| DomainError::Backend(e.to_string()))?;
         Ok(changed)
+    }
+
+    async fn series_episodes(&self, series_key: &str) -> DomainResult<Vec<SeriesEpisodeRow>> {
+        let rows: Vec<(String, Option<i64>, Option<i64>)> = sqlx::query_as(
+            "SELECT path, season_number, episode_number FROM media_items \
+             WHERE kind = 'episode' AND COALESCE(series_key, series_folder, series_name) = ?",
+        )
+        .bind(series_key)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| DomainError::Backend(e.to_string()))?;
+        let num = |n: Option<i64>| n.and_then(|n| u32::try_from(n).ok());
+        Ok(rows
+            .into_iter()
+            .map(|(path, season, episode)| SeriesEpisodeRow {
+                path,
+                season: num(season),
+                episode: num(episode),
+            })
+            .collect())
     }
 
     #[tracing::instrument(skip(self, keys), fields(keys = keys.len()))]
