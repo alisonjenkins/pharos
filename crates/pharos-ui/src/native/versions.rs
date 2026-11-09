@@ -99,6 +99,36 @@ pub fn chosen_version<'a>(versions: &'a [Version], stored: Option<&str>) -> &'a 
         .map_or("", |v| v.id.as_str())
 }
 
+/// How far a version's runtime may stray from the primary's and still be
+/// taken as the same cut: a container's rounding and a trailing black frame
+/// stay inside it (spec 034 US4, V899).
+pub const RUNTIME_TOLERANCE_MS: u64 = 2_000;
+
+/// How much longer (positive) or shorter `chosen` runs than the primary, when
+/// both runtimes are known and differ by more than [`RUNTIME_TOLERANCE_MS`].
+pub fn runtime_gap_ms(versions: &[Version], chosen: &str) -> Option<i64> {
+    let primary = versions.iter().find(|v| v.primary)?;
+    let version = versions.iter().find(|v| v.id == chosen)?;
+    if primary.duration_ms == 0 || version.duration_ms == 0 {
+        return None;
+    }
+    let gap = i64::try_from(version.duration_ms).ok()? - i64::try_from(primary.duration_ms).ok()?;
+    (gap.unsigned_abs() > RUNTIME_TOLERANCE_MS).then_some(gap)
+}
+
+/// What a member in a group is told about a version that runs `gap_ms`
+/// longer (or shorter) than the primary.
+pub fn runtime_gap_notice(gap_ms: i64) -> String {
+    let secs = gap_ms.unsigned_abs().div_ceil(1_000);
+    let amount = if secs < 120 {
+        format!("{secs} s")
+    } else {
+        format!("{} min", secs.div_ceil(60))
+    };
+    let way = if gap_ms > 0 { "longer" } else { "shorter" };
+    format!("This version runs {amount} {way} than the main one, so it may be out of step with the group.")
+}
+
 /// `4K`, `1080p`, or the height in lines; `None` when unknown. A scope or
 /// cropped frame is named by its width, so a 1920×800 film still reads 1080p.
 fn resolution(width: u32, height: u32) -> Option<String> {
@@ -179,6 +209,39 @@ mod tests {
     use pharos_client::api::Stereo;
 
     use super::*;
+
+    fn timed(id: &str, duration_ms: u64) -> Version {
+        Version {
+            id: id.into(),
+            primary: id.is_empty(),
+            duration_ms,
+            ..Default::default()
+        }
+    }
+
+    /// Spec 034 US4 (V899).
+    #[test]
+    fn a_version_that_runs_differently_is_told_apart_from_rounding() {
+        let versions = [
+            timed("", 8_400_000),
+            timed("3d", 8_440_000),
+            timed("rip", 8_401_500),
+        ];
+        assert_eq!(runtime_gap_ms(&versions, "3d"), Some(40_000));
+        assert_eq!(
+            runtime_gap_ms(&versions, "rip"),
+            None,
+            "inside the tolerance"
+        );
+        assert_eq!(runtime_gap_ms(&versions, ""), None, "the primary itself");
+        let unknown = [timed("", 8_400_000), timed("3d", 0)];
+        assert_eq!(runtime_gap_ms(&unknown, "3d"), None);
+        assert_eq!(
+            runtime_gap_notice(40_000),
+            "This version runs 40 s longer than the main one, so it may be out of step with the group."
+        );
+        assert!(runtime_gap_notice(-300_000).contains("5 min shorter"));
+    }
 
     fn version(id: &str, name: &str, stereo: Option<Stereo>) -> Version {
         Version {
