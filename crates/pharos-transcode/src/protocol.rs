@@ -286,6 +286,16 @@ pub enum TinyOp {
         /// The lines' `(start_ms, end_ms)`, one result per entry, in order.
         windows: Vec<(u64, u64)>,
     },
+    /// Sample a video file's keyframes and find black bars baked into the
+    /// picture → `WorkerEvent::PictureCheckResult`. Seven seeks, so it is
+    /// NFS-bound like the other seek-sampling ops. Last, so bincode's variant
+    /// indices of the older ops stay the same.
+    PictureCheck {
+        input: PathBuf,
+        /// The file's runtime from the scan, so the worker opens the file
+        /// once; 0 makes it read the container's own.
+        duration_ms: u64,
+    },
 }
 
 /// Scheduler → worker.
@@ -374,6 +384,11 @@ pub enum WorkerEvent {
     SubtitleSignalsResult {
         job_id: JobId,
         signals: crate::subtitle_signals::SubtitleSignals,
+    },
+    /// Reply to `TinyOp::PictureCheck`. Last, for the same reason.
+    PictureCheckResult {
+        job_id: JobId,
+        analysis: crate::picture_area::PictureAnalysis,
     },
 }
 
@@ -655,6 +670,21 @@ mod tests {
                 ],
             }),
             WorkerEvent::Accepted { job_id: JobId(1) },
+            WorkerEvent::PictureCheckResult {
+                job_id: JobId(4),
+                analysis: crate::picture_area::PictureAnalysis {
+                    verdict: crate::picture_area::PictureVerdict::Bars(pharos_core::PictureArea {
+                        x: 242,
+                        y: 0,
+                        width: 1436,
+                        height: 1080,
+                    }),
+                    width: 1920,
+                    height: 1080,
+                    usable_frames: 7,
+                    sampled_frames: 7,
+                },
+            },
             WorkerEvent::Progress {
                 job_id: JobId(1),
                 out_bytes: 4096,

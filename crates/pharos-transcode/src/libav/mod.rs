@@ -24,6 +24,8 @@ pub mod integrity;
 #[cfg(feature = "backend-lib")]
 pub(crate) mod logbridge;
 #[cfg(feature = "backend-lib")]
+pub mod picture_area;
+#[cfg(feature = "backend-lib")]
 pub mod probe;
 
 /// Initialise libav once and quiet its logging. Drop-in for `ffmpeg::init()`
