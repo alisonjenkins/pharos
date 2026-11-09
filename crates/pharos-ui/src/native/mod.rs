@@ -91,6 +91,8 @@ pub mod trail;
 pub mod turn;
 #[cfg(all(feature = "web", target_arch = "wasm32"))]
 mod turn_web;
+#[cfg(all(feature = "web", target_arch = "wasm32"))]
+mod xr_web;
 // 025: Android TV sign-in logic (backoff, QuickConnect steps); no I/O, builds everywhere.
 pub mod tv_auth;
 // 025: the Android TV app's page rules (history, proxy, bridge); no I/O.

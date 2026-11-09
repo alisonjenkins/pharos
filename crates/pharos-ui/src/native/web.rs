@@ -702,6 +702,7 @@ pub fn hide_text_track(video_id: &str, track_id: &str) {
 
 pub use super::subs_web::{rust_subtitles, RustSubtitles};
 pub use super::turn_web::{turn_begin, turn_cancel, turn_expect, turn_open, turn_ready};
+pub use super::xr_web::{enter_vr, exit_vr, vr_supported};
 
 /// The shared resize observer for the JASSUB canvases and its callback,
 /// kept alive together.

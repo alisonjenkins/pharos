@@ -110,6 +110,8 @@ pub struct Controls {
     /// The playing version's 3D packing, and how this device shows it.
     pub packing: Option<Stereo>,
     pub view_mode: ViewMode,
+    /// Whether this browser can enter immersive VR (V923).
+    pub vr: bool,
 }
 
 /// Where playback is. Reading it with `now` in a component's body
@@ -681,6 +683,25 @@ pub fn WatchView(
     let (eye_w, eye_h) = stereo::eye_size(crop, media.video_width, media.video_height);
     let eye_aspect = (eye_w > 0 && eye_h > 0).then(|| f64::from(eye_w) / f64::from(eye_h));
     // A list of at most one, so a new track's key mounts a new overlay.
+    // The headset's trigger plays and pauses through the player, so a group's
+    // play stays the group's.
+    let xr_select = use_coroutine(move |mut selects: UnboundedReceiver<()>| async move {
+        use futures_util::StreamExt as _;
+        while selects.next().await.is_some() {
+            on_control.call(Control::TogglePlay);
+        }
+    });
+    use_drop(platform::exit_vr);
+    let vr =
+        c.vr.then(|| stereo::xr_layout(c.packing))
+            .flatten()
+            .map(|layout| {
+                let (w, h) = stereo::eye_size(c.packing, media.video_width, media.video_height);
+                (
+                    layout,
+                    (stereo::VR_SCREEN_WIDTH_M, stereo::vr_screen_height(w, h)),
+                )
+            });
     let image_cues: Option<String> = c
         .subtitles
         .iter()
@@ -928,6 +949,24 @@ pub fn WatchView(
                             show: stereo::cropped(c.packing, ViewMode::OneEye).is_some(),
                             mode: c.view_mode,
                             on_pick: move |control| on_control.call(control),
+                        }
+                        if let Some((layout, screen)) = vr {
+                            button {
+                                class: "pharos-control pharos-watch-vr",
+                                r#type: "button",
+                                title: "Watch in VR",
+                                // Called in the click itself: a VR session
+                                // needs the click's user activation.
+                                onclick: move |_| {
+                                    platform::enter_vr(
+                                        VIDEO_ID,
+                                        layout,
+                                        screen,
+                                        std::rc::Rc::new(move || xr_select.send(())),
+                                    );
+                                },
+                                "Watch in VR"
+                            }
                         }
                         QualityPicker {
                             quality: c.quality.clone(),
@@ -1789,6 +1828,24 @@ mod tests {
         let html = render(c.clone());
         assert!(!html.contains("data-packing"), "{html}");
         assert!(html.contains("pharos-view-mode-picker"), "{html}");
+    }
+
+    #[test]
+    fn watch_in_vr_shows_only_for_a_split_packing_in_a_vr_browser() {
+        let mut c = controls();
+        c.packing = Some(Stereo::HalfTopAndBottom);
+        assert!(
+            !render(c.clone()).contains("Watch in VR"),
+            "no WebXR, no button"
+        );
+        c.vr = true;
+        assert!(render(c.clone()).contains("Watch in VR"));
+        c.view_mode = ViewMode::BothEyes;
+        assert!(render(c.clone()).contains("Watch in VR"), "any flat view");
+        for packing in [None, Some(Stereo::Mvc)] {
+            c.packing = packing;
+            assert!(!render(c.clone()).contains("Watch in VR"), "{packing:?}");
+        }
     }
 
     #[test]
