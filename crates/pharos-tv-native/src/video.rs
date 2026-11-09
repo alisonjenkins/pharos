@@ -113,7 +113,7 @@ impl Source {
     unsafe fn open(path: &str) -> Result<(Self, *mut sys::AMediaFormat, String), String> {
         let from_server = path.starts_with(PLAY);
         if from_server || crate::feeder::Feeder::is_feeder_dir(path) {
-            let feeder = if from_server {
+            let mut feeder = if from_server {
                 let url = wait_stream()?;
                 let stream = crate::hls_net::open(&crate::live::server(), &url)?;
                 log::info!("video: playing {} from the server", stream.variant);
@@ -128,6 +128,11 @@ impl Source {
             } else {
                 crate::feeder::Feeder::open(path)?
             };
+            if let Some(track) = feeder.take_audio() {
+                if crate::audio::enabled() {
+                    crate::audio::play(track);
+                }
+            }
             let f = feeder.format();
             let format = sys::AMediaFormat_new();
             if format.is_null() {
@@ -332,10 +337,16 @@ fn run(window: &NativeWindow, path: &str) -> Result<(), String> {
                 }
                 let pts = info.presentationTimeUs;
                 let first = *first_pts.get_or_insert_with(|| {
+                    // Picture follows sound: hold the first frame until the
+                    // audio clock runs, if there is audio.
+                    if crate::audio::wait_ready(Duration::from_secs(3)) {
+                        log::info!("video: paced to the audio clock");
+                    }
                     base_ns = now_ns() + 50_000_000;
                     pts
                 });
-                let due = base_ns + (pts - first) * 1_000;
+                let due = crate::audio::due_ns(pts)
+                    .unwrap_or(base_ns + (pts - first) * 1_000);
                 let late = now_ns() - due;
                 late_max_ms = late_max_ms.max(late / 1_000_000);
                 if late > LATE.as_nanos() as i64 {

@@ -8,6 +8,8 @@
 use dioxus::prelude::*;
 
 #[cfg(target_os = "android")]
+mod audio;
+#[cfg(target_os = "android")]
 mod codecs;
 #[cfg(target_os = "android")]
 mod hls_net;
