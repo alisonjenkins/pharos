@@ -5533,11 +5533,13 @@ fn Player(
                 if !was.is_empty() && was != entry {
                     up_next_reset.set(true);
                 }
+                // The group lands on the new entry with a seek; one that
+                // starts inside the card window lands there too.
                 let before_end = from.map_or(true, |f| state.position_ms < f.at_ms);
-                if up_next_reset.get() && before_end {
+                if up_next_reset.get() && (before_end || event == MediaEvent::Seeked) {
                     up_next_reset.set(false);
                     platform::info(&format!(
-                        "pharos: up next: reset reason=group_entry entry={entry} at={}ms",
+                        "pharos: up next: reset reason=group_entry entry={entry} at={}ms on={event:?}",
                         state.position_ms
                     ));
                     up_next.set(UpNext::default());
