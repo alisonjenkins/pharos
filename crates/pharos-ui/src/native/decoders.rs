@@ -70,9 +70,10 @@ const AUDIO_MIMES: &[(&str, &str)] = &[
 /// The capabilities to negotiate with, from the device's decoders.
 ///
 /// * Video: a codec is offered only when a **hardware** decoder takes at
-///   least [`MIN_VIDEO_SIZE`]. The TV's Cortex-A55 cores cannot decode 1080p
-///   VP9 or AV1 in software in real time, so offering a software decoder
-///   would trade a server transcode for a stuttering picture.
+///   least [`MIN_VIDEO_SIZE`]. A 32-bit TV SoC cannot be relied on to decode
+///   1080p VP9 or AV1 in software in real time, and Android ships software
+///   decoders for both on every device, so offering one would trade a server
+///   transcode for a stuttering picture.
 /// * Audio: any decoder, software included; audio decode is cheap.
 /// * Containers: [`NO_DIRECT_PLAY`] only. The native player plays HLS fMP4
 ///   through `pharos-hls`, so the server must never pick direct play of a
@@ -132,8 +133,8 @@ mod tests {
 
     const UHD: (u32, u32) = (4096, 2176);
 
-    /// The shape of a MediaTek TV's list: vendor decoders for H.264, HEVC
-    /// and VP9, Android's software AV1, and software audio.
+    /// A TV with vendor decoders for H.264, HEVC and VP9 but only Android's
+    /// software AV1, and software audio.
     fn mediatek_tv() -> Vec<DecoderInfo> {
         vec![
             dec("c2.mtk.avc.decoder", "video/avc", true, UHD),
@@ -155,6 +156,47 @@ mod tests {
             caps.video_codecs,
             ["h264", "hevc", "vp9"],
             "AV1 has only Android's software decoder, which the TV cannot run at 1080p"
+        );
+    }
+
+    /// The G08's own list (`dumpsys media.player`, 2026-11-09), cut to the
+    /// types the tables name: MediaTek hardware for every video codec,
+    /// AV1 included, beside Android's software ones; Dolby in hardware.
+    fn g08() -> Vec<DecoderInfo> {
+        let sw = |name: &str, mime: &str, size| dec(name, mime, false, size);
+        vec![
+            dec("c2.mtk.av1.decoder", "video/av01", true, (4096, 2304)),
+            sw("c2.android.av1.decoder", "video/av01", (1920, 1080)),
+            dec("c2.mtk.avc.decoder", "video/avc", true, (4096, 2304)),
+            sw("c2.android.avc.decoder", "video/avc", (4080, 4080)),
+            dec("c2.mtk.hevc.decoder", "video/hevc", true, (4096, 2304)),
+            dec(
+                "c2.mtk.vp9.decoder",
+                "video/x-vnd.on2.vp9",
+                true,
+                (4096, 2304),
+            ),
+            sw(
+                "c2.android.vp9.decoder",
+                "video/x-vnd.on2.vp9",
+                (2048, 2048),
+            ),
+            dec("c2.mtk.ac3.decoder", "audio/ac3", true, (0, 0)),
+            dec("c2.mtk.ac3.decoder", "audio/eac3", true, (0, 0)),
+            sw("c2.android.aac.decoder", "audio/mp4a-latm", (0, 0)),
+            sw("c2.android.flac.decoder", "audio/flac", (0, 0)),
+            sw("c2.android.mp3.decoder", "audio/mpeg", (0, 0)),
+            sw("c2.android.opus.decoder", "audio/opus", (0, 0)),
+        ]
+    }
+
+    #[test]
+    fn the_g08_is_offered_every_codec_the_server_sends() {
+        let caps = capabilities(&g08(), false);
+        assert_eq!(caps.video_codecs, ["h264", "hevc", "vp9", "av1"]);
+        assert_eq!(
+            caps.audio_codecs,
+            ["aac", "opus", "flac", "mp3", "ac3", "eac3"]
         );
     }
 
