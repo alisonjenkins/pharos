@@ -5,7 +5,10 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, Weak};
 
-use pharos_core::{DomainError, MediaItem, MediaStore, User, UserDataStore, UserId, UserItemData};
+use pharos_core::{
+    DomainError, MediaItem, MediaKind, MediaStore, ReadPosition, ReadPositionStore, User,
+    UserDataStore, UserId, UserItemData,
+};
 
 use crate::api::jellyfin::dto::UserItemDataDto;
 use crate::services::library::DetailError;
@@ -116,6 +119,135 @@ pub async fn set_favorite(
     favorite: bool,
 ) -> Result<(MediaItem, UserItemData), DetailError> {
     update(state, user, id, |d| apply_favorite(d, favorite)).await
+}
+
+/// The longest locator `set_read_position` stores, in bytes (FR-011).
+pub const MAX_READ_LOCATOR_BYTES: usize = 256;
+
+/// A saved fraction at or past this marks the book read.
+pub const READ_FINISHED_FRACTION: f32 = 0.99;
+
+/// Why `set_read_position` stored nothing (FR-011).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadRefusal {
+    NotBook,
+    Unreadable,
+    BadLocator,
+    BadFraction,
+}
+
+impl ReadRefusal {
+    /// The `outcome` label of `pharos_read_position_total`.
+    pub fn outcome(self) -> &'static str {
+        match self {
+            Self::NotBook => "not_book",
+            Self::Unreadable => "unreadable",
+            Self::BadLocator => "bad_locator",
+            Self::BadFraction => "bad_fraction",
+        }
+    }
+
+    /// The argument the caller got wrong, for the wire error.
+    pub fn field(self) -> &'static str {
+        match self {
+            Self::NotBook | Self::Unreadable => "id",
+            Self::BadLocator => "locator",
+            Self::BadFraction => "fraction",
+        }
+    }
+}
+
+/// Why `set_read_position` has no position to answer with.
+#[derive(Debug)]
+pub enum ReadError {
+    Refused(ReadRefusal),
+    Item(DetailError),
+}
+
+fn count_read_position(outcome: &'static str) {
+    metrics::counter!("pharos_read_position_total", "outcome" => outcome).increment(1);
+}
+
+/// Saves where `user` is in book `id`: the reader's opaque `locator` and the
+/// whole-book `fraction`. Stores nothing for an item that is not a readable
+/// book, a locator that is empty or over [`MAX_READ_LOCATOR_BYTES`], or a
+/// fraction that is not in 0 to 1 (V355). A fraction of
+/// [`READ_FINISHED_FRACTION`] or more also marks the book played; the resume
+/// position `last_played_position_ticks` is never written (V354). Answers the
+/// item, the user's play state and the position as stored.
+pub async fn set_read_position(
+    state: &AppState,
+    user: &User,
+    id: u64,
+    locator: &str,
+    fraction: f32,
+) -> Result<(MediaItem, UserItemData, ReadPosition), ReadError> {
+    if let Err(hidden) = crate::services::access::check_item(state, user, id, "read_position").await
+    {
+        count_read_position("hidden");
+        return Err(ReadError::Item(DetailError::Hidden(hidden)));
+    }
+    let item = state.stores.get(id).await.map_err(|e| {
+        ReadError::Item(match e {
+            DomainError::NotFound(_) => DetailError::NotFound,
+            other => DetailError::Store(other),
+        })
+    })?;
+    let refusal = match item.book.as_ref() {
+        _ if item.kind != MediaKind::Book => Some(ReadRefusal::NotBook),
+        Some(book) if !book.format.readable_by_client() => Some(ReadRefusal::Unreadable),
+        None => Some(ReadRefusal::NotBook),
+        Some(_) if locator.is_empty() || locator.len() > MAX_READ_LOCATOR_BYTES => {
+            Some(ReadRefusal::BadLocator)
+        }
+        Some(_) if !(fraction.is_finite() && (0.0..=1.0).contains(&fraction)) => {
+            Some(ReadRefusal::BadFraction)
+        }
+        Some(_) => None,
+    };
+    if let Some(refusal) = refusal {
+        count_read_position(refusal.outcome());
+        tracing::info!(
+            media.id = id,
+            user.id = %user.id.0,
+            reason = refusal.outcome(),
+            locator_bytes = locator.len(),
+            "read position refused, nothing stored"
+        );
+        return Err(ReadError::Refused(refusal));
+    }
+    let position = ReadPosition {
+        locator: locator.to_owned(),
+        fraction,
+        updated_at: crate::sync_recovery::now_unix_secs(),
+    };
+    state
+        .stores
+        .set_read_position(user.id, id, position.clone())
+        .await
+        .map_err(|e| ReadError::Item(DetailError::Store(e)))?;
+    let finished = fraction >= READ_FINISHED_FRACTION;
+    let data = if finished {
+        // Played without `apply_played`, which would zero the resume ticks.
+        let (_, data) = update(state, user, id, |d| {
+            if !d.played {
+                d.played = true;
+                d.play_count = d.play_count.saturating_add(1);
+                d.last_played_at = crate::sync_recovery::now_unix_secs();
+            }
+        })
+        .await
+        .map_err(ReadError::Item)?;
+        data
+    } else {
+        state
+            .stores
+            .get_user_data(user.id, id)
+            .await
+            .map_err(|e| ReadError::Item(DetailError::Store(e)))?
+    };
+    count_read_position(if finished { "finished" } else { "saved" });
+    Ok((item, data, position))
 }
 
 /// Applies `change` to `user`'s state on stored item `id`, if they may see
