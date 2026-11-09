@@ -44,6 +44,20 @@ Two-layer strategy:
 
 When `[obs].otlp_endpoint` is set, spans are additionally exported over **OTLP/gRPC** (`opentelemetry-otlp` + `tonic`, batch processor) to a collector — Tempo in the home cluster, and the Tilt dev stack wires one up automatically (see `docs/kubernetes.md`). The tracer provider lives in a `OnceLock` for the process lifetime so the batch exporter keeps flushing. When the endpoint is unset the OTLP layer is a no-op and deploys emit JSON logs to stdout only. `[obs].sampling_ratio` (default 1.0) thins traces STARTED here; a request carrying a sampled W3C `traceparent` is continued and always kept (parent-based). Image requests and scans open a span per phase (`image.*`, `scan.*`). Note: Tempo needs multiple Gi of memory — it OOM-crashlooped at a 512Mi limit (ADR-0013).
 
+## UI reports and client spans (spec 016)
+
+**From a report id to its traces.** A user who pressed "Report a problem" quotes an id like `K7QM-2XRT`:
+
+```logql
+{namespace="pharos"} |= "client problem report stored" |= "K7QM-2XRT"
+```
+
+The line carries `user`, `device`, `route` and `trace_ids` (comma-separated); open each trace id in Tempo. The full document (note, breadcrumbs, recent client events, bundle) is `<report_dir>/K7QM-2XRT.json`, also readable by the reporter or an admin through `Telemetry.getReport`. Reports live under `[obs].report_dir`, default `<log_dir>/clientlog/reports`, and are deleted after `[obs].report_retention_days` (default 30). With neither dir set, reports are refused and `pharos_ui_reports_total{outcome="no_store"}` rises.
+
+**Is reporting working?** `sum by (outcome) (increase(pharos_ui_reports_total[1d]))`; any outcome other than `stored` names why a report was lost. `increase(pharos_ui_reports_expired_total[1d])` shows the retention sweep.
+
+**Client spans.** An opted-in user's `ClientSpan`s are re-exported through the server's OTLP exporter under their own ids (ADR-0099), tagged `ui.source=pharos-ui`, so they share a trace with the server spans their calls caused. `sum by (outcome) (rate(pharos_client_spans_total[5m]))`: `invalid_id` means a client is sending malformed W3C ids.
+
 ## Where each invariant lives
 
 | Invariant | Implementation site |
