@@ -4369,7 +4369,148 @@ type EpisodeEvidenceRow = (
     Option<String>,
 );
 
+fn override_of(row: OverrideRow) -> Option<SeriesOverride> {
+    let (
+        id,
+        series_folder,
+        path,
+        target_key,
+        target_name,
+        target_year,
+        source,
+        created_by,
+        created_at,
+    ) = row;
+    Some(SeriesOverride {
+        id,
+        series_folder,
+        path,
+        target_key,
+        target_name,
+        target_year: target_year.and_then(|y| u32::try_from(y).ok()),
+        source: OverrideSource::parse(&source)?,
+        created_by,
+        created_at,
+    })
+}
+
+const OVERRIDE_COLUMNS: &str = "id, series_folder, path, target_key, target_name, target_year, \
+     source, created_by, created_at";
+
 impl SeriesIdentityStore for PostgresStore {
+    #[tracing::instrument(skip(self))]
+    async fn all_series_overrides(&self) -> DomainResult<Vec<SeriesOverride>> {
+        let rows: Vec<OverrideRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "SELECT {OVERRIDE_COLUMNS} FROM series_overrides ORDER BY created_at DESC, id DESC"
+        )))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| DomainError::Backend(e.to_string()))?;
+        Ok(rows.into_iter().filter_map(override_of).collect())
+    }
+
+    #[tracing::instrument(skip(self, o), fields(folder = %o.series_folder, target = %o.target_key))]
+    async fn replace_admin_override(&self, o: SeriesOverride) -> DomainResult<i64> {
+        let backend = |e: sqlx::Error| DomainError::Backend(e.to_string());
+        let target_year = o
+            .target_year
+            .map(|y| {
+                i32::try_from(y).map_err(|e| DomainError::Backend(format!("year overflow: {e}")))
+            })
+            .transpose()?;
+        let mut tx = self.pool.begin().await.map_err(backend)?;
+        sqlx::query(
+            "DELETE FROM series_overrides \
+             WHERE source = 'admin' AND series_folder = $1 AND path IS NOT DISTINCT FROM $2",
+        )
+        .bind(&o.series_folder)
+        .bind(&o.path)
+        .execute(&mut *tx)
+        .await
+        .map_err(backend)?;
+        let id: i64 = sqlx::query_scalar(
+            "INSERT INTO series_overrides \
+                 (series_folder, path, target_key, target_name, target_year, source, created_by, \
+                  created_at) \
+             VALUES ($1, $2, $3, $4, $5, 'admin', $6, $7) RETURNING id",
+        )
+        .bind(&o.series_folder)
+        .bind(&o.path)
+        .bind(&o.target_key)
+        .bind(&o.target_name)
+        .bind(target_year)
+        .bind(&o.created_by)
+        .bind(o.created_at)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(backend)?;
+        tx.commit().await.map_err(backend)?;
+        Ok(id)
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn delete_series_override(&self, id: i64) -> DomainResult<Option<SeriesOverride>> {
+        let row: Option<OverrideRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "DELETE FROM series_overrides WHERE id = $1 RETURNING {OVERRIDE_COLUMNS}"
+        )))
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| DomainError::Backend(e.to_string()))?;
+        Ok(row.and_then(override_of))
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn flagged_series_keys(&self) -> DomainResult<Vec<String>> {
+        sqlx::query_scalar(
+            "SELECT series_key FROM series_metadata WHERE match_flag = 'ambiguous' \
+             ORDER BY series_key",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| DomainError::Backend(e.to_string()))
+    }
+
+    #[tracing::instrument(skip(self, ids), fields(ids = ids.len()))]
+    async fn clear_manual_matches(&self, ids: &[MediaId]) -> DomainResult<Vec<(MediaId, String)>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let backend = |e: sqlx::Error| DomainError::Backend(e.to_string());
+        let ids: Vec<i64> = ids
+            .iter()
+            .map(|&id| media_id_i64(id))
+            .collect::<DomainResult<_>>()?;
+        let mut tx = self.pool.begin().await.map_err(backend)?;
+        let cleared: Vec<(i64, Option<String>)> = sqlx::query_as(
+            "SELECT id, match_external_id FROM media_items \
+             WHERE id = ANY($1) AND match_source = 'manual' ORDER BY id FOR UPDATE",
+        )
+        .bind(&ids)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(backend)?;
+        let manual: Vec<i64> = cleared.iter().map(|(id, _)| *id).collect();
+        sqlx::query(
+            "UPDATE media_items SET match_source = NULL, match_provider = NULL, \
+                 match_external_id = NULL, match_confidence = NULL \
+             WHERE id = ANY($1)",
+        )
+        .bind(&manual)
+        .execute(&mut *tx)
+        .await
+        .map_err(backend)?;
+        tx.commit().await.map_err(backend)?;
+        cleared
+            .into_iter()
+            .map(|(id, ext)| {
+                let id = MediaId::try_from(id)
+                    .map_err(|e| DomainError::Backend(format!("id out of range: {e}")))?;
+                Ok((id, ext.unwrap_or_default()))
+            })
+            .collect()
+    }
+
     #[tracing::instrument(skip(self, folders), fields(folders = folders.len()))]
     async fn series_overrides(&self, folders: &[String]) -> DomainResult<Vec<SeriesOverride>> {
         if folders.is_empty() {
