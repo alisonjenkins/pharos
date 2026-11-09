@@ -220,6 +220,7 @@ pub fn Shell(
                     Link { to: Route::Home, class: "pharos-brand", Brand {} }
                     nav { class: "pharos-shell-nav",
                         {search}
+                        Link { to: Route::Favourites, "Favourites" }
                         Link { to: Route::Together, "Together" }
                         {account}
                     }

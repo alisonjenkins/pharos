@@ -16,6 +16,7 @@ pub mod browse;
 pub mod damage;
 pub mod depth;
 pub mod diagnostics;
+pub mod favourites;
 pub mod find;
 pub mod group_app;
 // 014: the network Together client, shared by the browser and the TV app.

@@ -55,7 +55,8 @@ impl Row {
     }
 }
 
-/// Home, each library in the order given, then the settings screens.
+/// Home, each library in the order given, Favourites, then the settings
+/// screens.
 pub fn places(libraries: &[Item]) -> Vec<Place> {
     let home = Place {
         label: "Home".into(),
@@ -67,6 +68,11 @@ pub fn places(libraries: &[Item]) -> Vec<Place> {
         detail: "Library",
         route: Route::Browse(library.id),
     });
+    let favourites = Place {
+        label: "Favourites".into(),
+        detail: "Page",
+        route: Route::Favourites,
+    };
     let settings = [
         Place {
             label: "Appearance".into(),
@@ -81,6 +87,7 @@ pub fn places(libraries: &[Item]) -> Vec<Place> {
     ];
     std::iter::once(home)
         .chain(libraries)
+        .chain(std::iter::once(favourites))
         .chain(settings)
         .collect()
 }
@@ -189,14 +196,18 @@ mod tests {
     }
 
     #[test]
-    fn the_places_are_home_the_libraries_then_settings() {
+    fn the_places_are_home_the_libraries_favourites_then_settings() {
         let libraries = [
             item(4, ItemKind::Library, "Films"),
             item(5, ItemKind::Library, "TV"),
         ];
         let places = places(&libraries);
         let labels: Vec<_> = places.iter().map(|p| p.label.as_str()).collect();
-        assert_eq!(labels, ["Home", "Films", "TV", "Appearance", "Manage"]);
+        assert_eq!(
+            labels,
+            ["Home", "Films", "TV", "Favourites", "Appearance", "Manage"]
+        );
+        assert_eq!(places[3].route, Route::Favourites);
         assert_eq!(places[1].route, Route::Browse(ItemRef::Real(4)));
     }
 
