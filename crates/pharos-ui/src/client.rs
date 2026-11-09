@@ -18,6 +18,24 @@ pub enum ClientError {
     Parse(String),
     #[error("status {0}")]
     Status(u16),
+    /// The server refused and said why in the body (the series-identity
+    /// calls name the cause: unknown file, provider down).
+    #[error("{message}")]
+    Rejected { status: u16, message: String },
+}
+
+/// The error for a non-2xx answer: the body's text when it has any, else
+/// the bare status.
+pub fn rejection(status: u16, body: &str) -> ClientError {
+    let message = body.trim();
+    if message.is_empty() {
+        ClientError::Status(status)
+    } else {
+        ClientError::Rejected {
+            status,
+            message: message.to_owned(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -952,6 +970,145 @@ pub fn parse_deep_checks_response(bytes: &[u8]) -> Result<Vec<DeepCheck>, Client
     serde_json::from_slice(bytes).map_err(|e| ClientError::Parse(e.to_string()))
 }
 
+/// `/admin/series-identity`: what needs a look on the Show identity page
+/// (spec 033 §7).
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct SeriesIdentity {
+    /// `dry_run` or `apply`.
+    pub repair_mode: String,
+    pub splits: Vec<SplitFolder>,
+    pub flagged: Vec<FlaggedMatch>,
+    pub overrides: Vec<HandFix>,
+}
+
+/// A folder whose files sit, or would sit, under more than one show.
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct SplitFolder {
+    pub folder: String,
+    /// `applied`, or `pending` while the scanner still has rows to move.
+    pub status: String,
+    pub groups: Vec<SplitGroup>,
+    /// The rows a pending split would still move.
+    pub moves: Vec<PendingMove>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct SplitGroup {
+    pub series_key: String,
+    pub year: Option<u32>,
+    pub paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct PendingMove {
+    pub path: String,
+    pub from_key: String,
+    pub from_year: Option<u32>,
+    pub to_key: String,
+    pub to_year: Option<u32>,
+}
+
+/// A show match the matcher flagged as a close call.
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct FlaggedMatch {
+    pub series_key: String,
+    /// The show's item id, for a link to its page.
+    pub series_id: String,
+    pub name: String,
+    pub provider: Option<String>,
+    pub external_id: Option<String>,
+    /// Unix seconds.
+    pub premiere_date: Option<i64>,
+    pub runner_up_id: Option<String>,
+    pub runner_up_score: Option<f32>,
+}
+
+/// A hand fix already on record: where files were sent, or a folder kept
+/// together.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct HandFix {
+    pub id: i64,
+    pub folder: String,
+    pub path: Option<String>,
+    pub target_key: String,
+    pub target_name: Option<String>,
+    pub target_year: Option<u32>,
+    /// `admin` or `scanner`.
+    pub source: String,
+    pub keeps_together: bool,
+    pub created_by: Option<String>,
+    /// Unix seconds.
+    pub created_at: i64,
+}
+
+/// A show a provider offered for a pick.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct ShowCandidate {
+    pub provider: String,
+    pub id: String,
+    pub name: String,
+    pub year: Option<u32>,
+}
+
+/// What a fix changed: the paths it moved, and how many episodes it marked
+/// to be rebuilt in the background.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct FixDone {
+    pub moved: Vec<String>,
+    pub rebuilding: usize,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "PascalCase", default)]
+struct FlaggedIds {
+    series_ids: Vec<String>,
+}
+
+pub fn parse_series_identity_response(bytes: &[u8]) -> Result<SeriesIdentity, ClientError> {
+    serde_json::from_slice(bytes).map_err(|e| ClientError::Parse(e.to_string()))
+}
+
+pub fn parse_flagged_ids_response(bytes: &[u8]) -> Result<Vec<String>, ClientError> {
+    serde_json::from_slice::<FlaggedIds>(bytes)
+        .map(|f| f.series_ids)
+        .map_err(|e| ClientError::Parse(e.to_string()))
+}
+
+pub fn parse_show_candidates_response(bytes: &[u8]) -> Result<Vec<ShowCandidate>, ClientError> {
+    serde_json::from_slice(bytes).map_err(|e| ClientError::Parse(e.to_string()))
+}
+
+pub fn parse_fix_done_response(bytes: &[u8]) -> Result<FixDone, ClientError> {
+    serde_json::from_slice(bytes).map_err(|e| ClientError::Parse(e.to_string()))
+}
+
+/// The body of a Move: the files, and the group they go to (an existing
+/// one by key, or a new one by name and year).
+pub fn move_body(
+    folder: &str,
+    paths: &[String],
+    target_key: Option<&str>,
+    target_name: Option<&str>,
+    target_year: Option<u32>,
+) -> String {
+    serde_json::json!({
+        "Folder": folder,
+        "Paths": paths,
+        "TargetKey": target_key,
+        "TargetName": target_name,
+        "TargetYear": target_year,
+    })
+    .to_string()
+}
+
 /// T58 phase 3 — `/Auth/Keys` row.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ApiKey {
@@ -1831,6 +1988,145 @@ pub mod web {
         Ok(())
     }
 
+    /// One series-identity call; a refusal carries the server's words.
+    async fn series_identity_call(
+        base: &str,
+        token: &str,
+        method: gloo_net::http::Method,
+        path: &str,
+        body: Option<String>,
+    ) -> Result<Vec<u8>, ClientError> {
+        let req =
+            gloo_net::http::RequestBuilder::new(&format!("{base}/admin/series-identity{path}"))
+                .method(method)
+                .header("X-Emby-Token", token);
+        let resp = match body {
+            Some(b) => {
+                req.header("Content-Type", "application/json")
+                    .body(b)
+                    .map_err(|e| ClientError::Http(e.to_string()))?
+                    .send()
+                    .await
+            }
+            None => req.send().await,
+        }
+        .map_err(|e| ClientError::Http(e.to_string()))?;
+        if !resp.ok() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(rejection(status, &text));
+        }
+        resp.binary()
+            .await
+            .map_err(|e| ClientError::Http(e.to_string()))
+    }
+
+    pub async fn series_identity(base: &str, token: &str) -> Result<SeriesIdentity, ClientError> {
+        let bytes =
+            series_identity_call(base, token, gloo_net::http::Method::GET, "", None).await?;
+        parse_series_identity_response(&bytes)
+    }
+
+    pub async fn flagged_series_ids(base: &str, token: &str) -> Result<Vec<String>, ClientError> {
+        let bytes =
+            series_identity_call(base, token, gloo_net::http::Method::GET, "/flagged", None)
+                .await?;
+        parse_flagged_ids_response(&bytes)
+    }
+
+    pub async fn search_shows(
+        base: &str,
+        token: &str,
+        name: &str,
+        year: Option<u32>,
+    ) -> Result<Vec<ShowCandidate>, ClientError> {
+        let mut path = format!("/search?Name={}", urlencode(name));
+        if let Some(y) = year {
+            path.push_str(&format!("&Year={y}"));
+        }
+        let bytes =
+            series_identity_call(base, token, gloo_net::http::Method::GET, &path, None).await?;
+        parse_show_candidates_response(&bytes)
+    }
+
+    pub async fn pick_show(
+        base: &str,
+        token: &str,
+        series_key: &str,
+        provider: &str,
+        id: &str,
+    ) -> Result<FixDone, ClientError> {
+        let body = serde_json::json!({ "SeriesKey": series_key, "Provider": provider, "Id": id })
+            .to_string();
+        let bytes = series_identity_call(
+            base,
+            token,
+            gloo_net::http::Method::POST,
+            "/pick",
+            Some(body),
+        )
+        .await?;
+        parse_fix_done_response(&bytes)
+    }
+
+    pub async fn confirm_show(
+        base: &str,
+        token: &str,
+        series_key: &str,
+    ) -> Result<FixDone, ClientError> {
+        let body = serde_json::json!({ "SeriesKey": series_key }).to_string();
+        let bytes = series_identity_call(
+            base,
+            token,
+            gloo_net::http::Method::POST,
+            "/confirm",
+            Some(body),
+        )
+        .await?;
+        parse_fix_done_response(&bytes)
+    }
+
+    pub async fn move_files(base: &str, token: &str, body: String) -> Result<FixDone, ClientError> {
+        let bytes = series_identity_call(
+            base,
+            token,
+            gloo_net::http::Method::POST,
+            "/move",
+            Some(body),
+        )
+        .await?;
+        parse_fix_done_response(&bytes)
+    }
+
+    pub async fn keep_folder_together(
+        base: &str,
+        token: &str,
+        folder: &str,
+    ) -> Result<FixDone, ClientError> {
+        let body = serde_json::json!({ "Folder": folder }).to_string();
+        let bytes = series_identity_call(
+            base,
+            token,
+            gloo_net::http::Method::POST,
+            "/keep-together",
+            Some(body),
+        )
+        .await?;
+        parse_fix_done_response(&bytes)
+    }
+
+    pub async fn remove_hand_fix(base: &str, token: &str, id: i64) -> Result<FixDone, ClientError> {
+        let bytes = series_identity_call(
+            base,
+            token,
+            gloo_net::http::Method::DELETE,
+            &format!("/overrides/{id}"),
+            None,
+        )
+        .await?;
+        parse_fix_done_response(&bytes)
+    }
+
     pub async fn list_deep_checks(base: &str, token: &str) -> Result<Vec<DeepCheck>, ClientError> {
         let resp = Request::get(&format!("{base}/Admin/Integrity/Deep"))
             .header("X-Emby-Token", token)
@@ -2403,6 +2699,97 @@ mod tests {
         );
         let partial = parse_integrity_status_response(br#"{"Eligible":5}"#).unwrap();
         assert_eq!((partial.eligible, partial.queued), (5, 0));
+    }
+
+    #[test]
+    fn parse_series_identity_reads_all_three_lists() {
+        let body = br#"{
+            "RepairMode":"dry_run",
+            "Splits":[{"Folder":"/tv/Cosmos","Status":"pending",
+                "Groups":[{"SeriesKey":"/tv/Cosmos\u001f1980","Year":1980,"Paths":["/tv/Cosmos/a.mkv"]},
+                          {"SeriesKey":"/tv/Cosmos\u001f2014","Year":2014,"Paths":["/tv/Cosmos/b.mkv","/tv/Cosmos/c.mkv"]}],
+                "Moves":[{"Path":"/tv/Cosmos/b.mkv","FromKey":"/tv/Cosmos","FromYear":null,
+                          "ToKey":"/tv/Cosmos\u001f2014","ToYear":2014}]}],
+            "Flagged":[{"SeriesKey":"Fate","SeriesId":"00ff00ff00ff00ff00ff00ff00ff00ff","Name":"Fate",
+                "Provider":"tvdb","ExternalId":"81","PremiereDate":1100000000,
+                "RunnerUpId":"82","RunnerUpScore":0.8}],
+            "Overrides":[{"Id":7,"Folder":"/tv/Cosmos","Path":null,"TargetKey":"/tv/Cosmos",
+                "TargetName":null,"TargetYear":null,"Source":"admin","KeepsTogether":true,
+                "CreatedBy":"ali","CreatedAt":1700000000}]
+        }"#;
+        let v = parse_series_identity_response(body).unwrap();
+        assert_eq!(v.repair_mode, "dry_run");
+        assert_eq!(v.splits[0].status, "pending");
+        assert_eq!(v.splits[0].groups[1].paths.len(), 2);
+        assert_eq!(v.splits[0].groups[1].year, Some(2014));
+        assert_eq!(v.splits[0].moves[0].from_year, None);
+        assert_eq!(v.splits[0].moves[0].to_year, Some(2014));
+        assert_eq!(v.flagged[0].runner_up_id.as_deref(), Some("82"));
+        assert_eq!(v.flagged[0].premiere_date, Some(1_100_000_000));
+        assert!(v.overrides[0].keeps_together);
+        assert_eq!(v.overrides[0].created_by.as_deref(), Some("ali"));
+    }
+
+    #[test]
+    fn parse_series_identity_tolerates_an_empty_page() {
+        let v = parse_series_identity_response(br#"{"RepairMode":"apply"}"#).unwrap();
+        assert_eq!(v.repair_mode, "apply");
+        assert!(v.splits.is_empty() && v.flagged.is_empty() && v.overrides.is_empty());
+        assert!(parse_series_identity_response(b"{").is_err());
+    }
+
+    #[test]
+    fn parse_flagged_ids_reads_the_series_ids() {
+        let v = parse_flagged_ids_response(br#"{"SeriesIds":["aa","bb"]}"#).unwrap();
+        assert_eq!(v, ["aa", "bb"]);
+        assert!(parse_flagged_ids_response(b"{}").unwrap().is_empty());
+        assert!(parse_flagged_ids_response(b"[").is_err());
+    }
+
+    #[test]
+    fn parse_show_candidates_and_fix_done() {
+        let c = parse_show_candidates_response(
+            br#"[{"Provider":"tvdb","Id":"81","Name":"Cosmos","Year":1980},
+                 {"Provider":"tmdb","Id":"9","Name":"Cosmos","Year":null}]"#,
+        )
+        .unwrap();
+        assert_eq!((c[0].provider.as_str(), c[0].year), ("tvdb", Some(1980)));
+        assert_eq!(c[1].year, None);
+        let d = parse_fix_done_response(br#"{"Moved":["/a","/b"],"Rebuilding":12}"#).unwrap();
+        assert_eq!(
+            d,
+            FixDone {
+                moved: vec!["/a".into(), "/b".into()],
+                rebuilding: 12
+            }
+        );
+        assert!(parse_fix_done_response(b"x").is_err());
+    }
+
+    #[test]
+    fn move_body_names_an_existing_group_or_a_new_one() {
+        let paths = vec!["/a".to_string()];
+        let existing: serde_json::Value =
+            serde_json::from_str(&move_body("/tv/X", &paths, Some("k"), None, None)).unwrap();
+        assert_eq!(existing["TargetKey"], "k");
+        assert!(existing["TargetName"].is_null() && existing["TargetYear"].is_null());
+        let fresh: serde_json::Value =
+            serde_json::from_str(&move_body("/tv/X", &paths, None, Some("X"), Some(2014))).unwrap();
+        assert!(fresh["TargetKey"].is_null());
+        assert_eq!(
+            (fresh["TargetName"].as_str(), fresh["TargetYear"].as_u64()),
+            (Some("X"), Some(2014))
+        );
+        assert_eq!(fresh["Paths"][0], "/a");
+    }
+
+    #[test]
+    fn a_refusal_carries_the_servers_words() {
+        assert_eq!(
+            rejection(404, " no such file \n").to_string(),
+            "no such file"
+        );
+        assert_eq!(rejection(502, "").to_string(), "status 502");
     }
 
     #[test]
