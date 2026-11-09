@@ -255,3 +255,34 @@ def test_post_align_a_probe_that_cannot_be_decoded_costs_only_the_offset(tmp_pat
         server.shutdown()
         server.server_close()
         thread.join(timeout=5)
+
+
+def test_post_align_a_probe_that_times_out_skips_the_other_probes(tmp_path: Path) -> None:
+    (tmp_path / "song.mp3").write_bytes(b"x")
+    wide_calls: list[int] = []
+
+    def wide_windows_hang(path: str, start_ms: int, end_ms: int, rate: int = 16000) -> bytes:
+        if end_ms - start_ms > 10_000:
+            wide_calls.append(start_ms)
+            raise subprocess.TimeoutExpired("ffmpeg", 120)
+        return b"\0" * 64
+
+    server, thread, base_url = _serve(tmp_path, FakeAligner(), wide_windows_hang)
+    try:
+        payload = {
+            "path": "song.mp3",
+            "lines": [
+                {"start_ms": 20_000, "end_ms": 21_000, "text": "one line sung here"},
+                {"start_ms": 30_000, "end_ms": 31_000, "text": "another line sung there"},
+                {"start_ms": 40_000, "end_ms": 41_000, "text": "the last line sung"},
+            ],
+        }
+        with urllib.request.urlopen(_post(base_url, payload)) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        assert data["offset_ms"] == 0
+        assert all(line["words"] for line in data["lines"])
+        assert len(wide_calls) == 1
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)

@@ -147,11 +147,22 @@ class AlignerHandler(http.server.BaseHTTPRequestHandler):
                     logger.warning("path=%s offset probe failed", rel_path, exc_info=True)
                     return []
 
+            probe_timed_out = False
+
             def decode_probe(start_ms: int, end_ms: int) -> bytes:
                 # A probe is optional: a window ffmpeg cannot decode costs it
-                # the offset, not the song its word times.
+                # the offset, not the song its word times. After one timeout
+                # the rest are skipped, so seven of them cannot outlast the
+                # server's whole-song budget.
+                nonlocal probe_timed_out
+                if probe_timed_out:
+                    return b""
                 try:
                     return decoder(full_path, start_ms, end_ms)
+                except subprocess.TimeoutExpired:
+                    probe_timed_out = True
+                    logger.warning("path=%s offset probe decode timed out; skipping the rest", rel_path)
+                    return b""
                 except subprocess.CalledProcessError:
                     logger.warning("path=%s offset probe decode failed", rel_path, exc_info=True)
                     return b""
