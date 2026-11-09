@@ -3902,8 +3902,13 @@ pub fn audio_tap(media_id: &str) -> Result<Box<dyn super::visualiser::AudioTap>,
         .unwrap_or_default();
     let same_origin =
         src.starts_with("blob:") || web_sys::Url::new(&src).is_ok_and(|u| u.origin() == origin);
-    if !same_origin {
-        return Err(format!("cross-origin source {src}"));
+    // A source fetched with CORS (the TV app's songs, B1032) can be analysed
+    // from another origin; one fetched without it reads as silence.
+    let cors = media.cross_origin().as_deref() == Some("anonymous");
+    // The query can carry a media token: never log it.
+    let path = src.split('?').next().unwrap_or_default();
+    if !same_origin && !cors {
+        return Err(format!("cross-origin source {path}"));
     }
     // WebKit's native HLS feeds a MediaElementAudioSourceNode silence, so a
     // routed element would go quiet; leave it unrouted and draw idle.
@@ -3912,7 +3917,7 @@ pub fn audio_tap(media_id: &str) -> Result<Box<dyn super::visualiser::AudioTap>,
         .next()
         .is_some_and(|path| path.ends_with(".m3u8"))
     {
-        return Err(format!("native HLS source {src}"));
+        return Err(format!("native HLS source {path}"));
     }
     let js = |e: JsValue| format!("{e:?}");
     let context = web_sys::AudioContext::new().map_err(js)?;
