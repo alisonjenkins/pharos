@@ -96,8 +96,10 @@ pub async fn open(call: &CallInfo) -> Result<Open, OpenError> {
     match android::resume(&client, &closed, call, &token).await {
         Ok(session) => {
             log::info!("pharos: open server={base} signed_in=true");
+            let api = NativeApi::new(&session);
+            spawn_forever(keep_media_token(api.clone()));
             Ok(Open {
-                api: NativeApi::new(&session),
+                api,
                 conn: Connection { closed },
                 server_schema,
             })
@@ -985,11 +987,15 @@ pub fn on_page_hide(_on_hide: impl FnMut() + 'static) -> PageHide {
 }
 
 /// hls.js for every HLS stream; the Rust engine (spec 031) is the web
-/// build's, so it hands over to hls.js here. Direct play is refused (see
-/// `tv_page::NO_DIRECT_PLAY`); `capabilities` keeps the server from asking.
+/// build's, so it hands over to hls.js here. Video never direct-plays
+/// (`tv_page::NO_DIRECT_PLAY`), but a song's stream is a plain file, so a
+/// direct stream plays from the server with the media token (B1029, V988).
 pub async fn engine(kind: Engine) -> Result<Box<dyn PlaybackEngine>, String> {
     match kind {
-        Engine::Direct => Err("the TV app plays HLS streams only for now".into()),
+        Engine::Direct => Ok(Box::new(DirectMedia {
+            token: wait_for_media_token().await?,
+            ..DirectMedia::default()
+        })),
         Engine::HlsJs | Engine::NativeHls | Engine::RustHls => {
             if kind != Engine::HlsJs {
                 log::info!(
@@ -1042,6 +1048,7 @@ struct HlsJs {
     generation: u64,
 }
 
+/// Attach generations, shared by hls.js and direct players.
 static NEXT_HLS: AtomicU64 = AtomicU64::new(1);
 
 impl PlaybackEngine for HlsJs {
@@ -1157,6 +1164,169 @@ h.attachMedia(v);
             generation = self.generation,
         ));
         Ok(())
+    }
+}
+
+/// The Media-scoped token (ADR-0058) a directly played element's `src`
+/// carries, kept fresh by [`keep_media_token`] for the open session.
+static MEDIA_TOKEN: Mutex<Option<String>> = Mutex::new(None);
+
+/// Which `open` the running [`keep_media_token`] loop belongs to: a reconnect
+/// starts a new loop, and the old one, whose session is gone, stops.
+static MEDIA_TOKEN_SESSION: AtomicU64 = AtomicU64::new(0);
+
+/// Ask `api` for a media token now and again before each one expires (B1029, V988).
+async fn keep_media_token(api: NativeApi) {
+    let session = MEDIA_TOKEN_SESSION.fetch_add(1, Ordering::AcqRel) + 1;
+    let call = CallInfo::default();
+    while MEDIA_TOKEN_SESSION.load(Ordering::Acquire) == session {
+        let wait_ms = match api.media_token(&call).await {
+            Ok(t) => {
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let now = wall_clock_ms() as u64;
+                let wait = tv_page::media_token_wait_ms(t.expires_at_ms, now);
+                log::info!(
+                    "pharos: media token outcome=ok expires_in_s={} refresh_in_s={}",
+                    t.expires_at_ms.saturating_sub(now) / 1000,
+                    wait / 1000
+                );
+                *lock(&MEDIA_TOKEN) = Some(t.token);
+                wait
+            }
+            Err(e) => {
+                log::warn!(
+                    "pharos: media token outcome=failed error={e} retry_in_s={}",
+                    tv_page::MEDIA_TOKEN_MIN_WAIT_MS / 1000
+                );
+                tv_page::MEDIA_TOKEN_MIN_WAIT_MS
+            }
+        };
+        // Slept in steps, so a loop a reconnect replaced stops within one.
+        let mut left = wait_ms;
+        while left > 0 && MEDIA_TOKEN_SESSION.load(Ordering::Acquire) == session {
+            let step = left.min(tv_page::MEDIA_TOKEN_MIN_WAIT_MS);
+            #[allow(clippy::cast_possible_truncation)]
+            sleep_ms(step as u32).await;
+            left -= step;
+        }
+    }
+}
+
+/// How long a direct play waits for the first media token after sign-in.
+const MEDIA_TOKEN_WAIT_MS: u32 = 5_000;
+const MEDIA_TOKEN_POLL_MS: u32 = 100;
+
+/// The current media token, waiting up to [`MEDIA_TOKEN_WAIT_MS`] for the
+/// first one.
+async fn wait_for_media_token() -> Result<String, String> {
+    let mut waited = 0;
+    loop {
+        if let Some(token) = lock(&MEDIA_TOKEN).clone() {
+            return Ok(token);
+        }
+        if waited >= MEDIA_TOKEN_WAIT_MS {
+            log::warn!(
+                "pharos: engine picked=direct outcome=failed reason=no_media_token waited_ms={waited}"
+            );
+            return Err("the server gave this TV no media token to play with".into());
+        }
+        sleep_ms(MEDIA_TOKEN_POLL_MS).await;
+        waited += MEDIA_TOKEN_POLL_MS;
+    }
+}
+
+/// A song (or any direct stream) on its media element, loaded straight from
+/// the server with the media token in its `src` (B1029, V988): the element
+/// cannot send the device token, and through the page proxy it could not
+/// seek. The element's own `error` comes back through the bridge.
+#[derive(Default)]
+struct DirectMedia {
+    token: String,
+    media_id: String,
+    listener: Option<u64>,
+    /// Which attach set the element's `src`, so a late `Drop` cannot clear
+    /// the song a later attach put on the same element.
+    generation: u64,
+}
+
+impl PlaybackEngine for DirectMedia {
+    fn attach(
+        &mut self,
+        media_id: &str,
+        url: &str,
+        start_ms: u64,
+        on_fatal: super::playback::OnFatal,
+        _on_fragment: super::playback::OnFragment,
+    ) -> Result<(), String> {
+        let id = media_id.to_owned();
+        let log_url = url.split('?').next().unwrap_or_default().to_owned();
+        let on_error = {
+            let log_url = log_url.clone();
+            move |code: u16, message: String| {
+                log::warn!(
+                    "pharos: playback error engine=direct code={code} message={message} action=fail url={log_url}"
+                );
+                on_fatal(format!(
+                    "the TV could not play this stream (code {code}) {message}"
+                ));
+            }
+        };
+        if let Some(old) = self.listener.take() {
+            unlisten(old);
+        }
+        self.listener = Some(listen(Listener::MediaError(id.clone(), Box::new(on_error))));
+        self.media_id = id.clone();
+        self.generation = NEXT_HLS.fetch_add(1, Ordering::Relaxed);
+        lock(&MEDIA).remove(&id);
+        log::info!(
+            "pharos: playback attach engine=direct id={id} start_ms={start_ms} url={log_url}"
+        );
+        #[allow(clippy::cast_precision_loss)]
+        let start_s = start_ms as f64 / 1000.0;
+        run(format!(
+            r#"
+const id = {id};
+const v = document.getElementById(id);
+if (!v) throw new Error("no media element id=" + id);
+if (v.__pharosOnError) v.removeEventListener("error", v.__pharosOnError);
+v.__pharosOnError = () => {{
+  if (!v.getAttribute("src")) return;
+  const e = v.error;
+  window.__pharosSend && window.__pharosSend({{ t: "mediaerror", id,
+    code: e ? e.code : 0, message: e ? String(e.message || "") : "" }});
+}};
+v.addEventListener("error", v.__pharosOnError);
+const start = {start_s};
+if (start > 0) v.addEventListener("loadedmetadata", () => {{ v.currentTime = start; }}, {{ once: true }});
+v.setAttribute({mark}, "direct");
+v.__pharosGen = {generation};
+v.src = {url};
+"#,
+            id = js_str(&id),
+            mark = js_str(super::resume::ENGINE_MARK),
+            url = js_str(&tv_page::direct_media_url(&server(), url, &self.token)),
+            generation = self.generation,
+        ));
+        Ok(())
+    }
+}
+
+impl Drop for DirectMedia {
+    fn drop(&mut self) {
+        if let Some(listener) = self.listener.take() {
+            unlisten(listener);
+        }
+        if self.media_id.is_empty() {
+            return;
+        }
+        run(format!(
+            "const v = document.getElementById({}); \
+             if (v && v.__pharosGen === {}) {{ \
+             if (v.__pharosOnError) v.removeEventListener('error', v.__pharosOnError); \
+             v.pause(); v.removeAttribute('src'); v.load(); }}",
+            js_str(&self.media_id),
+            self.generation
+        ));
     }
 }
 
@@ -1387,6 +1557,8 @@ enum Listener {
     Hls(String, Box<dyn FnMut(tv_page::HlsEvent)>),
     /// A media element's `timeupdate`, with its id.
     Tick(Box<dyn FnMut(&str)>),
+    /// A directly played media element's `error`, for the element `id`.
+    MediaError(String, Box<dyn FnMut(u16, String)>),
 }
 
 fn listen(listener: Listener) -> u64 {
@@ -1728,6 +1900,17 @@ fn on_bridge(message: Bridge) {
                     if let Listener::Hls(on, f) = &mut f.0 {
                         if *on == id {
                             f(event.clone());
+                        }
+                    }
+                }
+            }
+        }
+        Bridge::MediaError { id, code, message } => {
+            for f in &listeners {
+                if let Ok(mut f) = f.try_lock() {
+                    if let Listener::MediaError(on, f) = &mut f.0 {
+                        if *on == id {
+                            f(code, message.clone());
                         }
                     }
                 }
