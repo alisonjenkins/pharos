@@ -5867,6 +5867,7 @@ fn Player(
         live_position: Some(position),
         subtitle_size: sub_size(),
         packing: versions::playing_stereo(&p.detail.versions, &p.version),
+        picture: versions::playing_picture(&p.detail.versions, &p.version),
         view_mode: view_mode(),
         vr: vr().unwrap_or(false),
         versions: p

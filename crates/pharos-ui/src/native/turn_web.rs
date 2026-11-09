@@ -286,13 +286,20 @@ fn build(doc: &Document, outgoing: Option<HtmlCanvasElement>, dir: Direction) ->
 }
 
 fn snapshot(video: &HtmlVideoElement) -> Option<HtmlCanvasElement> {
-    // A 3D version cropped to one eye turns as that eye (B961).
-    let packing = video
-        .parent_element()
+    // A 3D version cropped to one eye turns as that eye (B961), and a
+    // picture cropped out of baked-in bars as that picture (B1017).
+    let frame = video.parent_element();
+    let packing = frame
+        .as_ref()
         .and_then(|f| f.get_attribute("data-packing"))
         .and_then(|a| stereo::parse_packing(&a));
-    let eye = stereo::eye_rect(packing, stereo::Eye::Left);
+    let bars = frame
+        .as_ref()
+        .and_then(|f| f.get_attribute("data-crop"))
+        .and_then(|a| super::bars::parse_crop(&a));
+    let eye = bars.unwrap_or_else(|| stereo::eye_rect(packing, stereo::Eye::Left));
     let (vw, vh) = stereo::eye_size(packing, video.video_width(), video.video_height());
+    let (vw, vh) = super::bars::shown_size(bars, vw, vh);
     let w = vw.min(SNAPSHOT_MAX_WIDTH);
     let h = (u64::from(vh) * u64::from(w) / u64::from(vw.max(1))).max(1);
     let h = u32::try_from(h).ok()?;

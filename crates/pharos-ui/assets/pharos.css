@@ -1522,6 +1522,30 @@ body:has(.pharos-stage.is-full) .pharos-status-note {
   scale: 1 2;
   clip-path: inset(0 0 50% 0);
 }
+/* Black bars baked into the file (a 4:3 show stored pillarboxed in 16:9) are
+   cropped away (B1017, V977), laid out like a 3D eye: the video is sized to
+   the picture's own shape (`--pharos-eye-aspect`), the whole frame is drawn
+   stretched into it, and the transform and clip the player sets from the
+   picture's place in the frame move the picture over the element and hide
+   the bars. Everything fitted to the element sees only the picture. */
+.pharos-video-frame[data-crop] {
+  container-type: size;
+  overflow: hidden;
+  background: black; /* not themed: the letterbox around video is black in every theme */
+}
+/* `video.` outranks the floating and mini stages' full-box video rules, so
+   the crop holds there too. */
+.pharos-video-frame[data-crop] > video.pharos-video {
+  position: absolute;
+  inset: 0;
+  margin: auto;
+  width: min(100cqw, 100cqh * var(--pharos-eye-aspect, 1.333333));
+  height: min(100cqh, 100cqw / var(--pharos-eye-aspect, 1.333333));
+  object-fit: fill;
+  transform-origin: 0 0;
+  transform: var(--pharos-crop-transform, none);
+  clip-path: var(--pharos-crop-clip, none);
+}
 /* Text subtitles drawn by pharos-subs (spec 026): a WebGL canvas over the
    whole frame; the renderer places the cue inside the picture's box and above
    the control bar. The `<track>` is hidden while this draws; the `::cue`
