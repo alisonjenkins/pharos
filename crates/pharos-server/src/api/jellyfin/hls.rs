@@ -2239,8 +2239,13 @@ fn qs_stereo_output(qs: &str) -> Option<pharos_transcode::StereoOutput> {
 
 fn playback_qs(req: &HttpRequest) -> String {
     let mut parts: Vec<String> = Vec::new();
-    if let Some(t) = extract_token(req) {
-        parts.push(format!("api_key={t}"));
+    // A request bound to its play session hands that capability on through
+    // the PlaySessionId below; only an unbound one still needs its token
+    // copied into each URL (V1050).
+    if !play_capability::is_bound(req) {
+        if let Some(t) = extract_token(req) {
+            parts.push(format!("api_key={t}"));
+        }
     }
     for kv in req.query_string().split('&') {
         if let Some((k, v)) = kv.split_once('=') {
