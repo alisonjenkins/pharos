@@ -88,3 +88,132 @@ async fn the_page_keeps_to_the_policy_and_counts_each_outcome() {
     assert_eq!(outcome("not_found"), 1);
     assert_eq!(outcome("empty"), 0);
 }
+
+/// A provider that knows person `1`, fails on `2`, has lost `3`, and counts
+/// every ask.
+struct FakeDetails(std::sync::atomic::AtomicUsize);
+
+impl pharos_server::person_details::PersonDetailsSource for FakeDetails {
+    fn fetch<'a>(
+        &'a self,
+        tmdb_id: &'a str,
+    ) -> futures_util::future::BoxFuture<
+        'a,
+        Result<pharos_server::person_details::Fetched, pharos_server::person_details::DetailsMiss>,
+    > {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let answer = match tmdb_id {
+            "1" => Ok(pharos_server::person_details::Fetched {
+                biography: Some("Born by the sea.".into()),
+                birth_date: Some("1956-07-09".into()),
+                imdb_id: Some("nm0000158".into()),
+                wikidata_id: Some("Q2263".into()),
+                ..Default::default()
+            }),
+            "3" => Err(pharos_server::person_details::DetailsMiss::NotFound),
+            _ => Err(pharos_server::person_details::DetailsMiss::Transport),
+        };
+        Box::pin(async move { answer })
+    }
+}
+
+/// The page carries what the provider says about the person, asks once and
+/// then shows what it kept, and still shows the page when the provider
+/// fails or the person has no TMDB id. Each answer counts under
+/// `pharos_person_details_total{outcome}`.
+/// A provider that has lost someone leaves their kept details in place.
+/// Disarm check: with `put_person_details` skipped, the second visit asks
+/// again and `kept` stays 0; with the kept-on-not-found arm removed, Gone
+/// Actor's biography is wiped.
+#[actix_web::test]
+async fn the_page_carries_the_providers_details_and_keeps_them() {
+    let source = std::sync::Arc::new(FakeDetails(std::sync::atomic::AtomicUsize::new(0)));
+    let fx = crate::common::seed_rich_with({
+        let source = source.clone();
+        move |state| state.with_person_details_source(source)
+    })
+    .await;
+    crate::library::seed_movies(&fx).await;
+    let actor = |name: &str, tmdb: Option<&str>| PersonRef {
+        name: name.into(),
+        kind: PersonKind::Actor,
+        character: Some("Pilot".into()),
+        provider_ids: tmdb.map(Into::into),
+        ..PersonRef::default()
+    };
+    fx.state
+        .stores
+        .link_item_people(
+            101,
+            &[
+                actor("Known Actor", Some("tmdb:1")),
+                actor("Flaky Actor", Some("tmdb:2")),
+                actor("Local Actor", None),
+                actor("Gone Actor", Some("tmdb:3")),
+            ],
+        )
+        .await
+        .unwrap();
+    let user = pharos_server::services::auth::user_for_token(&fx.state.stores, &fx.user_token)
+        .await
+        .unwrap();
+    let id = pharos_core::person_wire_id;
+
+    let recorder = metrics_util::debugging::DebuggingRecorder::new();
+    let snapshotter = pharos_test_metrics::snapshotter(&recorder);
+    let _metrics = metrics::set_default_local_recorder(&recorder);
+
+    let known = person::page(&fx.state, &user, &id("Known Actor"))
+        .await
+        .unwrap();
+    let details = known.details.expect("details");
+    assert_eq!(details.biography.as_deref(), Some("Born by the sea."));
+    assert_eq!(details.imdb_id.as_deref(), Some("nm0000158"));
+    assert_eq!(details.wikidata_id.as_deref(), Some("Q2263"));
+    let again = person::page(&fx.state, &user, &id("Known Actor"))
+        .await
+        .unwrap();
+    assert_eq!(again.details.map(|d| d.biography), Some(details.biography));
+
+    let flaky = person::page(&fx.state, &user, &id("Flaky Actor"))
+        .await
+        .unwrap();
+    assert_eq!(flaky.details, None);
+    assert_eq!(flaky.films.len(), 1, "the page shows without the provider");
+    let local = person::page(&fx.state, &user, &id("Local Actor"))
+        .await
+        .unwrap();
+    assert_eq!(local.details, None);
+
+    // Stale kept details survive a provider that no longer has the person.
+    let stale = pharos_core::PersonDetails {
+        biography: Some("Kept from before.".into()),
+        fetched_at: 0,
+        ..pharos_core::PersonDetails::default()
+    };
+    fx.state
+        .stores
+        .put_person_details(&id("Gone Actor"), &stale)
+        .await
+        .unwrap();
+    let gone = person::page(&fx.state, &user, &id("Gone Actor"))
+        .await
+        .unwrap();
+    let gone = gone.details.expect("kept details");
+    assert_eq!(gone.biography.as_deref(), Some("Kept from before."));
+    assert!(gone.fetched_at > 0, "the refresh is recorded");
+
+    assert_eq!(source.0.load(std::sync::atomic::Ordering::SeqCst), 3);
+    let outcome = |o| {
+        counter(
+            &snapshotter,
+            "pharos_person_details_total",
+            &[("outcome", o)],
+        )
+    };
+    assert_eq!(outcome("fetched"), 1);
+    assert_eq!(outcome("kept"), 1);
+    assert_eq!(outcome("transport"), 1);
+    assert_eq!(outcome("no_provider_id"), 1);
+    assert_eq!(outcome("not_found"), 1);
+}

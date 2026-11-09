@@ -37,6 +37,7 @@ pub mod omdb;
 pub mod online_enrich;
 pub mod opensubtitles;
 pub mod parental;
+pub mod person_details;
 pub mod person_image_backfill;
 pub mod portrait;
 pub mod prefetch_registry;
