@@ -181,6 +181,8 @@ pub struct AppState {
     /// The integrity sweep's re-check queue and its not-checkable set. `None`
     /// exactly when `integrity_memo` is: both come from the one spawn.
     pub integrity_sweep: Option<std::sync::Arc<crate::integrity_sweep::IntegritySweep>>,
+    /// On-demand full decode checks. `None` where nothing set it up (tests).
+    pub integrity_deep: Option<std::sync::Arc<crate::integrity_deep::DeepChecks>>,
     /// Spec 028 — queue of the video a viewer just opened, ahead of the
     /// subtitle styling backfill. `None` where the job is not spawned (no
     /// `ffmpeg-lib`, tests).
@@ -739,6 +741,7 @@ impl AppState {
             hls: None,
             integrity_memo: None,
             integrity_sweep: None,
+            integrity_deep: None,
             subtitle_styling: None,
             transcode_scheduler: None,
             remote: None,
@@ -867,6 +870,7 @@ impl AppState {
             hls: None,
             integrity_memo: None,
             integrity_sweep: None,
+            integrity_deep: None,
             subtitle_styling: None,
             transcode_scheduler: None,
             remote: None,
@@ -1131,6 +1135,14 @@ impl AppState {
         memo: std::sync::Arc<crate::integrity_memo::IntegrityMemo>,
     ) -> Self {
         self.integrity_memo = Some(memo);
+        self
+    }
+
+    pub fn with_integrity_deep(
+        mut self,
+        deep: std::sync::Arc<crate::integrity_deep::DeepChecks>,
+    ) -> Self {
+        self.integrity_deep = Some(deep);
         self
     }
 
