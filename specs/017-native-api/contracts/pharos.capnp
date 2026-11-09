@@ -12,7 +12,7 @@ annotation secret(field, param) :Void;
 
 # Bumped when the schema changes; served as ServerInfo.schemaVersion so a client
 # can tell which methods a server knows (FR-009).
-const schemaVersion :UInt32 = 31;
+const schemaVersion :UInt32 = 32;
 
 # ---- ids and shared types -------------------------------------------------
 struct ItemId {                # mirrors pharos_jellyfin_api::WireId
@@ -58,6 +58,9 @@ struct Error {
 struct Done { union { ok @0 :Void; error @1 :Error; } }   # result for methods with no payload
 
 enum Kind { movie @0; episode @1; audio @2; book @3; series @4; season @5; album @6; artist @7; person @8; collection @9; playlist @10; channel @11; library @12; }
+# How a book can be read; mirrors pharos_core::BookFormat. `unreadable` is a file the reader cannot open. Since schemaVersion 32.
+enum BookFormat { epub @0; pdf @1; comic @2; unreadable @3; }
+struct BookInfo { format @0 :BookFormat; author @1 :Text; pageCount @2 :UInt32; }   # pageCount 0 = unknown
 # What a `library` item holds; mirrors pharos_core::LibraryKind.
 enum LibraryKind { mixed @0; movies @1; tvShows @2; music @3; books @4; }
 
@@ -67,7 +70,11 @@ enum Stereo3d { none @0; halfSideBySide @1; fullSideBySide @2; halfTopAndBottom 
 
 struct ImageRef { kind @0 :Text; tag @1 :Text; url @2 :Text; blurhash @3 :Text; }
 
-struct UserState { played @0 :Bool; favorite @1 :Bool; positionMs @2 :UInt64; playCount @3 :UInt32; }
+struct UserState {
+  played @0 :Bool; favorite @1 :Bool; positionMs @2 :UInt64; playCount @3 :UInt32;
+  readLocator @4 :Text;      # a book's saved reading position, opaque to the server; empty when unread. Since schemaVersion 32.
+  readFraction @5 :Float32;  # how far through the book, 0 to 1; 0 when unread. Since schemaVersion 32.
+}
 
 struct ItemSummary {
   id @0 :ItemId; kind @1 :Kind; name @2 :Text; year @3 :OptU16;
@@ -192,8 +199,8 @@ struct IndexResult { union { index @0 :ListIndex; error @1 :Error; } }
 # Home is aggregated server-side: pipelining only follows capabilities, not
 # data, so "views, then latest per view" cannot be one flight client-side.
 struct HomeRail { view @0 :ItemSummary; latest @1 :List(ItemSummary); }
-# `resume` holds films and episodes, `listening` music; `resumeLimit` sizes both.
-struct Home { rails @0 :List(HomeRail); resume @1 :List(ItemSummary); nextUp @2 :List(ItemSummary); listening @3 :List(ItemSummary); }
+# `resume` holds films and episodes, `listening` music, `reading` books part read (since schemaVersion 32); `resumeLimit` sizes both.
+struct Home { rails @0 :List(HomeRail); resume @1 :List(ItemSummary); nextUp @2 :List(ItemSummary); listening @3 :List(ItemSummary); reading @4 :List(ItemSummary); }
 struct HomeResult { union { home @0 :Home; error @1 :Error; } }
 
 interface Library {
@@ -225,6 +232,7 @@ struct ItemDetail {
   cast @11 :List(Credit);           # billed order; a series or season ranks its regulars across episodes
   versions @12 :List(Version);      # a film or episode's files, the primary first; empty for anything else. Since schemaVersion 29.
   damage @13 :Damage;               # what is wrong with the file this detail describes; verdict empty when nothing is known. Since schemaVersion 30.
+  book @14 :BookInfo;               # set only for a book. Since schemaVersion 32.
 }
 # Someone who appears in the item. `imageUrl` is the person's photo on this
 # server, empty when there is none.
@@ -384,6 +392,8 @@ struct SavedMixes { mixes @0 :List(SavedMix); }
 interface UserData {
   setPlayed @0 (ctx :CallContext, id :ItemId, played :Bool) -> (result :UserStateResult);
   setFavorite @1 (ctx :CallContext, id :ItemId, favorite :Bool) -> (result :UserStateResult);
+  # Refused with Error for a non-book, an unreadable book, a locator over 256 bytes or a fraction outside 0..1. Since schemaVersion 32.
+  setReadPosition @2 (ctx :CallContext, id :ItemId, locator :Text, fraction :Float32) -> (result :UserStateResult);
 }
 struct UserStateResult { union { state @0 :UserState; error @1 :Error; } }
 

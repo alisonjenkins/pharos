@@ -1544,6 +1544,8 @@ mod tests {
     #[test]
     fn a_title_in_a_group_says_who_has_seen_it() {
         let detail = Detail {
+            book: None,
+            read_position: None,
             item: item(ItemKind::Movie),
             overview: String::new(),
             genres: Vec::new(),
@@ -2159,6 +2161,7 @@ mod tests {
         movie.runtime_ms = 1000;
         movie.position_ms = 250;
         let home = Home {
+            reading: vec![],
             rails: vec![pharos_client::api::HomeRail {
                 library: lib,
                 latest: vec![movie.clone()],
@@ -2199,6 +2202,7 @@ mod tests {
         let mut song = item(ItemKind::Audio);
         song.id = ItemRef::Real(98);
         let home = Home {
+            reading: vec![],
             rails: vec![
                 rail(1, "Media", Some(LibraryKind::Mixed)),
                 rail(2, "Books", Some(LibraryKind::Books)),
@@ -2307,6 +2311,8 @@ mod tests {
         );
 
         let detail = Detail {
+            book: None,
+            read_position: None,
             item: movie,
             overview: String::new(),
             genres: vec![],
@@ -2372,6 +2378,8 @@ mod tests {
             ..Default::default()
         };
         let detail = |path: &str| Detail {
+            book: None,
+            read_position: None,
             item: item(ItemKind::Episode),
             overview: String::new(),
             genres: vec![],
@@ -2419,6 +2427,8 @@ mod tests {
             ..Default::default()
         };
         let detail = Detail {
+            book: None,
+            read_position: None,
             item: item(ItemKind::Movie),
             overview: String::new(),
             genres: vec![],
@@ -2455,6 +2465,8 @@ mod tests {
         let mut movie = item(ItemKind::Movie);
         movie.runtime_ms = 102 * 60_000;
         let detail = Detail {
+            book: None,
+            read_position: None,
             item: movie.clone(),
             overview: "A heist.".into(),
             genres: vec!["Crime".into()],
@@ -2495,6 +2507,8 @@ mod tests {
 
         movie.position_ms = 60_000;
         let detail = Detail {
+            book: None,
+            read_position: None,
             item: movie,
             overview: String::new(),
             genres: vec![],
@@ -2519,6 +2533,8 @@ mod tests {
         let mut watched = item(ItemKind::Episode);
         watched.played = true;
         let detail = Detail {
+            book: None,
+            read_position: None,
             item: watched,
             overview: String::new(),
             genres: vec![],
@@ -2584,6 +2600,8 @@ mod tests {
             ]
         );
         let detail = Detail {
+            book: None,
+            read_position: None,
             item: film,
             overview: String::new(),
             genres: vec![],
@@ -2614,6 +2632,8 @@ mod tests {
             (ItemKind::Album, false),
         ] {
             let detail = Detail {
+                book: None,
+                read_position: None,
                 item: item(kind),
                 overview: String::new(),
                 genres: vec![],
@@ -2641,6 +2661,8 @@ mod tests {
             let mut i = item(kind);
             i.runtime_ms = 42 * 60_000;
             Detail {
+                book: None,
+                read_position: None,
                 item: i,
                 overview: String::new(),
                 genres: vec![],
@@ -2681,6 +2703,8 @@ mod tests {
     #[test]
     fn a_series_title_opens_its_listing_instead_of_playing() {
         let detail = Detail {
+            book: None,
+            read_position: None,
             item: item(ItemKind::Series),
             overview: String::new(),
             genres: vec![],
@@ -2714,6 +2738,8 @@ mod tests {
             image_url: image.map(str::to_string),
         };
         let detail = Detail {
+            book: None,
+            read_position: None,
             item: item(ItemKind::Episode),
             overview: String::new(),
             genres: vec![],
@@ -2765,6 +2791,8 @@ mod tests {
             person,
         };
         let detail = Detail {
+            book: None,
+            read_position: None,
             item: item(ItemKind::Movie),
             overview: String::new(),
             genres: vec![],
@@ -2796,6 +2824,8 @@ mod tests {
     #[test]
     fn a_title_with_no_cast_draws_no_cast_rail() {
         let detail = Detail {
+            book: None,
+            read_position: None,
             item: item(ItemKind::Movie),
             overview: String::new(),
             genres: vec![],
@@ -3034,6 +3064,8 @@ mod tests {
         );
         song.played = false;
         let detail = Detail {
+            book: None,
+            read_position: None,
             item: song,
             overview: String::new(),
             genres: vec![],
@@ -3076,6 +3108,8 @@ mod tests {
             "{card}"
         );
         let detail = Detail {
+            book: None,
+            read_position: None,
             item: song,
             overview: String::new(),
             genres: vec![],
