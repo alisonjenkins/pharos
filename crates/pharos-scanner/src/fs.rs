@@ -2550,13 +2550,17 @@ async fn copy_facts<S: MediaStore>(
                 continue;
             }
         };
-        let mut heights = vec![(item.path.clone(), item.probe.height)];
-        heights.extend(
-            item.probe
-                .alternate_sources
-                .iter()
-                .map(|alt| (alt.path.clone(), alt.probe.as_ref().and_then(|p| p.height))),
-        );
+        let mut heights = vec![(
+            item.path.clone(),
+            picture_lines(item.probe.width, item.probe.height),
+        )];
+        heights.extend(item.probe.alternate_sources.iter().map(|alt| {
+            let probe = alt.probe.as_ref();
+            (
+                alt.path.clone(),
+                picture_lines(probe.and_then(|p| p.width), probe.and_then(|p| p.height)),
+            )
+        }));
         for (at, height) in heights {
             if let (Some(facts), Some(height)) = (out.get_mut(&at), height) {
                 facts.height.get_or_insert(height);
@@ -2564,6 +2568,17 @@ async fn copy_facts<S: MediaStore>(
         }
     }
     out
+}
+
+/// A picture's resolution class in lines: its height, or the height a 16:9
+/// frame of its width would have, whichever is more. A letterboxed 1920x800
+/// Blu-ray rip is a 1080-line copy, not one below a 1440x1080 one.
+fn picture_lines(width: Option<u32>, height: Option<u32>) -> Option<u32> {
+    let from_width = width.map(|w| w.saturating_mul(9) / 16);
+    match (height, from_width) {
+        (Some(h), Some(w)) => Some(h.max(w)),
+        (h, w) => h.or(w),
+    }
 }
 
 /// What is known of a file's picture before this pass probes it: the height
@@ -8742,6 +8757,18 @@ mod tests {
             others.into_iter().all(|(_, alts)| alts.is_empty()),
             "{groups:?}"
         );
+    }
+
+    /// B1014 / V973 — a letterboxed rip ranks by its width's 16:9 class, so a
+    /// 1920x800 Blu-ray is no lower than a 1440x1080 one.
+    #[test]
+    fn a_letterboxed_copy_ranks_by_its_width() {
+        assert_eq!(picture_lines(Some(1920), Some(800)), Some(1080));
+        assert_eq!(picture_lines(Some(1440), Some(1080)), Some(1080));
+        assert_eq!(picture_lines(Some(3840), Some(1600)), Some(2160));
+        assert_eq!(picture_lines(None, Some(720)), Some(720));
+        assert_eq!(picture_lines(Some(1280), None), Some(720));
+        assert_eq!(picture_lines(None, None), None);
     }
 
     #[test]
