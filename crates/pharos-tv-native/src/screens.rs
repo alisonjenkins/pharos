@@ -93,6 +93,13 @@ const RAIL_ROW_PX: usize = 362;
 /// Rows move by negative margins, not transforms: blitz-paint 0.2 does not
 /// apply a parent's transform to its children ("TODO: Implement nested
 /// transforms" in render.rs).
+/// While a video plays: every backdrop the theme paints is cleared, so the
+/// window is transparent over the video layer behind it.
+const PLAYING_CSS: &str = r#"
+html, body, .pharos-app { background: transparent !important; }
+body::before, body::after, .pharos-app::before, .pharos-app::after { display: none !important; }
+"#;
+
 const SPIKE_CSS: &str = r#"
 .pharos-tv-focus .pharos-poster-art {
   outline: 4px solid var(--px-color-accent);
@@ -142,7 +149,9 @@ impl Data {
 
 /// `notice` is shown over the screens: the QuickConnect code, or why the
 /// live server could not be reached. OK on a poster calls `on_open`; while
-/// `detail` is set its item page shows, and Back calls `on_back`.
+/// `detail` is set its item page shows, OK calls `on_play` and Back calls
+/// `on_back`. While `playing`, the page is clear so the video layer behind it
+/// shows, and Back calls `on_stop`.
 #[component]
 pub fn Spike(
     start: Screen,
@@ -151,6 +160,9 @@ pub fn Spike(
     #[props(default)] detail: Option<Detail>,
     #[props(default)] on_open: EventHandler<ItemRef>,
     #[props(default)] on_back: EventHandler<()>,
+    #[props(default)] playing: bool,
+    #[props(default)] on_play: EventHandler<ItemRef>,
+    #[props(default)] on_stop: EventHandler<()>,
 ) -> Element {
     let mut screen = use_signal(|| start);
     // (row, column) of the focused poster on the current screen.
@@ -167,6 +179,7 @@ pub fn Spike(
         }))
     });
     let has_detail = detail.is_some();
+    let detail_id = detail.as_ref().map(|d| d.item.id);
     let Data { rails, grid } = data;
     let rail_ids: Vec<Vec<ItemRef>> =
         rails.iter().map(|(_, items)| items.iter().map(|i| i.id).collect()).collect();
@@ -217,12 +230,24 @@ pub fn Spike(
                 last_key.set(Some(std::time::Instant::now()));
                 let (r, c) = focus();
                 let next = match key {
+                    Key::Named(NamedKey::BrowserBack) | Key::Named(NamedKey::GoBack) if playing => {
+                        on_stop.call(());
+                        (r, c)
+                    }
+                    _ if playing => (r, c),
                     Key::Named(NamedKey::ArrowUp) => (r.saturating_sub(1), c),
                     Key::Named(NamedKey::ArrowDown) => ((r + 1).min(rows.saturating_sub(1)), c),
                     Key::Named(NamedKey::ArrowLeft) => (r, c.saturating_sub(1)),
                     Key::Named(NamedKey::ArrowRight) => (r, c + 1),
                     Key::Named(NamedKey::BrowserBack) | Key::Named(NamedKey::GoBack) if has_detail => {
                         on_back.call(());
+                        (r, c)
+                    }
+                    Key::Named(NamedKey::Enter) if has_detail => {
+                        if let Some(id) = detail_id {
+                            log::info!("play {id}");
+                            on_play.call(id);
+                        }
                         (r, c)
                     }
                     _ if has_detail => (r, c),
@@ -261,7 +286,9 @@ pub fn Spike(
             // before Dioxus sets `tabindex`, so a `div` never takes focus. A
             // `button` is focussable by tag; keys bubble from it to the root.
             button { class: "pharos-tv-keysink", autofocus: true }
-            if let Some(detail) = detail {
+            if playing {
+                style { {PLAYING_CSS} }
+            } else if let Some(detail) = detail {
                 TitleView { detail, tracks: None }
             } else {
             match screen() {

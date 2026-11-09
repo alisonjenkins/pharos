@@ -140,6 +140,7 @@ fn root() -> Element {
     let mut data = use_signal(Data::fixture);
     let mut notice = use_signal(|| Some("Connecting…".to_owned()));
     let mut detail = use_signal(|| None::<pharos_client::api::Detail>);
+    let mut playing = use_signal(|| false);
     use_hook(|| {
         if let Some(mut events) = live::take_events() {
             spawn(async move {
@@ -168,6 +169,21 @@ fn root() -> Element {
             detail: detail(),
             on_open: move |id| live::send(live::Command::Detail(id)),
             on_back: move |()| detail.set(None),
+            playing: playing(),
+            on_play: move |id| {
+                if !video::can_play() {
+                    notice.set(Some("No video layer to play into".to_owned()));
+                    return;
+                }
+                playing.set(true);
+                video::start(id);
+                live::send(live::Command::Play(id));
+            },
+            on_stop: move |()| {
+                video::stop();
+                live::send(live::Command::Stop);
+                playing.set(false);
+            },
         }
     }
 }
