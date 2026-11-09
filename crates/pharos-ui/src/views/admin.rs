@@ -9,8 +9,8 @@ use crate::client::{
 };
 use crate::client::{
     ActivityEntry, AdminUser, ApiKey, BrandingConfig, DamageRange, DamagedFile, DeepCheck,
-    DeviceEntry, DuplicateFilm, FilmVersion, IntegrityReport, IntegrityStatus, LibraryFolder,
-    LogEntry, PluginEntry, ScheduledTask, SearchHint, SeriesIdentity,
+    DeviceEntry, DuplicateFilm, FilmVersion, IntegrityReport, IntegrityStatus, ItemMetadata,
+    LibraryFolder, LogEntry, PluginEntry, ScheduledTask, SearchHint, SeriesIdentity,
 };
 use dioxus::prelude::*;
 
@@ -2559,6 +2559,211 @@ fn civil_from_days(days: i64) -> (i64, i64, i64) {
     (y, m, d)
 }
 
+/// How a metadata field is typed into the form.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FieldKind {
+    Text,
+    Long,
+    Year,
+    Rating,
+    Date,
+    List,
+}
+
+fn field_kind(field: &str) -> FieldKind {
+    match field {
+        "Overview" => FieldKind::Long,
+        "ProductionYear" => FieldKind::Year,
+        "CommunityRating" | "CriticRating" => FieldKind::Rating,
+        "PremiereDate" => FieldKind::Date,
+        "Genres" => FieldKind::List,
+        _ => FieldKind::Text,
+    }
+}
+
+fn field_label(field: &str) -> &str {
+    match field {
+        "SortName" => "Sort name",
+        "ProductionYear" => "Production year",
+        "PremiereDate" => "Premiere date",
+        "OfficialRating" => "Official rating",
+        "CommunityRating" => "Community rating",
+        "CriticRating" => "Critic rating",
+        other => other,
+    }
+}
+
+/// The server refuses a title longer than this.
+const TITLE_MAX_CHARS: usize = 500;
+const YEAR_MIN: i64 = 1850;
+const YEAR_MAX: i64 = 2200;
+const COMMUNITY_RATING_MAX: f64 = 10.0;
+const CRITIC_RATING_MAX: f64 = 100.0;
+
+/// The field's current value as the form's input shows it.
+fn metadata_draft(meta: &ItemMetadata, field: &str) -> String {
+    use serde_json::Value;
+    match meta.fields.get(field) {
+        None | Some(Value::Null) => String::new(),
+        Some(Value::String(s)) if field_kind(field) == FieldKind::Date => {
+            s.chars().take(10).collect()
+        }
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>()
+            .join(", "),
+        Some(other) => other.to_string(),
+    }
+}
+
+/// What the input holds with stray spaces and empty list items dropped, so a
+/// field counts as changed only when its meaning changed.
+fn normalise_draft(kind: FieldKind, text: &str) -> String {
+    if kind == FieldKind::List {
+        text.split(',')
+            .map(str::trim)
+            .filter(|g| !g.is_empty())
+            .collect::<Vec<_>>()
+            .join(", ")
+    } else {
+        text.trim().to_string()
+    }
+}
+
+fn valid_date(text: &str) -> bool {
+    let mut parts = text.split('-');
+    let (Some(y), Some(m), Some(d), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+    let digits = |s: &str, len: usize| s.len() == len && s.bytes().all(|b| b.is_ascii_digit());
+    digits(y, 4)
+        && digits(m, 2)
+        && digits(d, 2)
+        && matches!(m.parse::<u8>(), Ok(1..=12))
+        && matches!(d.parse::<u8>(), Ok(1..=31))
+}
+
+/// The JSON the server takes for one changed field, or the reason the form
+/// refuses it. An empty input clears the field (a title cannot be cleared).
+fn parse_draft(field: &str, text: &str) -> Result<serde_json::Value, String> {
+    use serde_json::Value;
+    let kind = field_kind(field);
+    let text = normalise_draft(kind, text);
+    let label = field_label(field);
+    if field == "Title" {
+        if text.is_empty() {
+            return Err("Title can't be empty.".into());
+        }
+        if text.chars().count() > TITLE_MAX_CHARS {
+            return Err(format!(
+                "Title can be at most {TITLE_MAX_CHARS} characters."
+            ));
+        }
+    }
+    if text.is_empty() {
+        return Ok(if kind == FieldKind::List {
+            Value::Array(Vec::new())
+        } else {
+            Value::Null
+        });
+    }
+    match kind {
+        FieldKind::Text | FieldKind::Long => Ok(Value::String(text)),
+        FieldKind::Year => {
+            let year: i64 = text
+                .parse()
+                .map_err(|_| format!("{label} must be a whole number."))?;
+            if (YEAR_MIN..=YEAR_MAX).contains(&year) {
+                Ok(Value::from(year))
+            } else {
+                Err(format!(
+                    "{label} must be between {YEAR_MIN} and {YEAR_MAX}."
+                ))
+            }
+        }
+        FieldKind::Rating => {
+            let max = if field == "CriticRating" {
+                CRITIC_RATING_MAX
+            } else {
+                COMMUNITY_RATING_MAX
+            };
+            let n: f64 = text
+                .parse()
+                .map_err(|_| format!("{label} must be a number."))?;
+            if !(0.0..=max).contains(&n) {
+                return Err(format!("{label} must be between 0 and {max}."));
+            }
+            serde_json::Number::from_f64(n)
+                .map(Value::Number)
+                .ok_or_else(|| format!("{label} must be a number."))
+        }
+        FieldKind::Date => {
+            if valid_date(&text) {
+                Ok(Value::String(text))
+            } else {
+                Err(format!("{label} must look like 1979-05-25."))
+            }
+        }
+        FieldKind::List => Ok(Value::Array(
+            text.split(", ").map(|g| Value::String(g.into())).collect(),
+        )),
+    }
+}
+
+/// What a Save sends: the changed fields, and the locked fields to hand back
+/// to the scanner.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct MetadataSave {
+    pub fields: Vec<(String, serde_json::Value)>,
+    pub unlock: Vec<String>,
+}
+
+impl MetadataSave {
+    pub fn is_empty(&self) -> bool {
+        self.fields.is_empty() && self.unlock.is_empty()
+    }
+}
+
+/// Compares the form's inputs with the item's values. Only changed fields are
+/// sent; an unlocked field that is also edited is sent as an edit, which locks
+/// it again. A refused field comes back as (field, reason), mirroring the
+/// server's limits.
+fn plan_metadata_save(
+    meta: &ItemMetadata,
+    drafts: &[(String, String)],
+    unlocks: &[String],
+) -> Result<MetadataSave, Vec<(String, String)>> {
+    let mut save = MetadataSave::default();
+    let mut refused = Vec::new();
+    for field in &meta.editable {
+        let Some((_, text)) = drafts.iter().find(|(name, _)| name == field) else {
+            continue;
+        };
+        let kind = field_kind(field);
+        if normalise_draft(kind, text) == normalise_draft(kind, &metadata_draft(meta, field)) {
+            continue;
+        }
+        match parse_draft(field, text) {
+            Ok(value) => save.fields.push((field.clone(), value)),
+            Err(reason) => refused.push((field.clone(), reason)),
+        }
+    }
+    if !refused.is_empty() {
+        return Err(refused);
+    }
+    save.unlock = meta
+        .locked
+        .iter()
+        .filter(|f| unlocks.contains(f) && !save.fields.iter().any(|(name, _)| name == *f))
+        .cloned()
+        .collect();
+    Ok(save)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -2838,6 +3043,197 @@ mod tests {
         assert_eq!(pressed("Dolby Digital Plus"), Some(true), "{html}");
         assert_eq!(pressed("Dolby Digital"), Some(false), "{html}");
         assert_eq!(pressed("DTS"), Some(false), "{html}");
+    }
+
+    fn alien() -> ItemMetadata {
+        ItemMetadata {
+            id: "m1".into(),
+            target: "item".into(),
+            kind: "Movie".into(),
+            name: "Alien".into(),
+            fields: serde_json::from_value(serde_json::json!({
+                "Title": "Alien", "SortName": null, "Overview": "In space.",
+                "Tagline": null, "ProductionYear": 1979, "PremiereDate": "1979-05-25",
+                "OfficialRating": "R", "CommunityRating": 8.5, "CriticRating": null
+            }))
+            .unwrap(),
+            editable: [
+                "Title",
+                "SortName",
+                "Overview",
+                "Tagline",
+                "ProductionYear",
+                "PremiereDate",
+                "OfficialRating",
+                "CommunityRating",
+                "CriticRating",
+            ]
+            .map(String::from)
+            .to_vec(),
+            locked: vec!["Overview".into()],
+        }
+    }
+
+    fn drafts_of(meta: &ItemMetadata) -> Vec<(String, String)> {
+        meta.editable
+            .iter()
+            .map(|f| (f.clone(), metadata_draft(meta, f)))
+            .collect()
+    }
+
+    fn with_draft(
+        mut drafts: Vec<(String, String)>,
+        field: &str,
+        text: &str,
+    ) -> Vec<(String, String)> {
+        for d in drafts.iter_mut().filter(|(f, _)| f == field) {
+            d.1 = text.into();
+        }
+        drafts
+    }
+
+    #[test]
+    fn drafts_show_each_value_as_typed_text() {
+        let m = alien();
+        assert_eq!(metadata_draft(&m, "Title"), "Alien");
+        assert_eq!(metadata_draft(&m, "SortName"), "");
+        assert_eq!(metadata_draft(&m, "ProductionYear"), "1979");
+        assert_eq!(metadata_draft(&m, "CommunityRating"), "8.5");
+        let dated = ItemMetadata {
+            fields: serde_json::from_value(serde_json::json!({
+                "PremiereDate": "1979-05-25T00:00:00Z", "Genres": ["Drama", "Sci-Fi"]
+            }))
+            .unwrap(),
+            ..alien()
+        };
+        assert_eq!(metadata_draft(&dated, "PremiereDate"), "1979-05-25");
+        assert_eq!(metadata_draft(&dated, "Genres"), "Drama, Sci-Fi");
+    }
+
+    #[test]
+    fn an_untouched_form_saves_nothing() {
+        let m = alien();
+        let save = plan_metadata_save(&m, &drafts_of(&m), &[]).unwrap();
+        assert!(save.is_empty(), "{save:?}");
+    }
+
+    #[test]
+    fn only_changed_fields_are_sent() {
+        let m = alien();
+        let drafts = with_draft(drafts_of(&m), "Title", "Alien (Director's Cut)");
+        let drafts = with_draft(drafts, "Tagline", "In space no one can hear you scream.");
+        let drafts = with_draft(drafts, "OfficialRating", "");
+        let drafts = with_draft(drafts, "CriticRating", "93");
+        let save = plan_metadata_save(&m, &drafts, &[]).unwrap();
+        assert_eq!(
+            save.fields,
+            vec![
+                (
+                    "Title".to_string(),
+                    serde_json::json!("Alien (Director's Cut)")
+                ),
+                (
+                    "Tagline".to_string(),
+                    serde_json::json!("In space no one can hear you scream.")
+                ),
+                ("OfficialRating".to_string(), serde_json::Value::Null),
+                ("CriticRating".to_string(), serde_json::json!(93.0)),
+            ]
+        );
+        assert!(save.unlock.is_empty());
+    }
+
+    #[test]
+    fn whitespace_only_edits_do_not_count_as_changes() {
+        let m = alien();
+        let drafts = with_draft(drafts_of(&m), "Title", "  Alien ");
+        assert!(plan_metadata_save(&m, &drafts, &[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn unlocks_go_with_the_save_unless_the_field_is_also_edited() {
+        let m = alien();
+        let only_unlock = plan_metadata_save(&m, &drafts_of(&m), &["Overview".into()]).unwrap();
+        assert!(only_unlock.fields.is_empty());
+        assert_eq!(only_unlock.unlock, ["Overview"]);
+        let edited = with_draft(drafts_of(&m), "Overview", "A crew finds an egg.");
+        let both = plan_metadata_save(&m, &edited, &["Overview".into()]).unwrap();
+        assert_eq!(both.fields.len(), 1);
+        assert!(
+            both.unlock.is_empty(),
+            "an edit re-locks the field: {both:?}"
+        );
+        let not_locked = plan_metadata_save(&m, &drafts_of(&m), &["Title".into()]).unwrap();
+        assert!(not_locked.is_empty(), "Title was not locked");
+    }
+
+    #[test]
+    fn the_form_refuses_what_the_server_would_refuse() {
+        let m = alien();
+        let cases = [
+            ("Title", "   ".to_string(), "Title can't be empty."),
+            ("Title", "x".repeat(501), "at most 500"),
+            ("ProductionYear", "19999".into(), "between 1850 and 2200"),
+            ("ProductionYear", "1849".into(), "between 1850 and 2200"),
+            ("ProductionYear", "19x9".into(), "whole number"),
+            ("CommunityRating", "10.5".into(), "between 0 and 10"),
+            ("CommunityRating", "-1".into(), "between 0 and 10"),
+            ("CriticRating", "101".into(), "between 0 and 100"),
+            ("CriticRating", "abc".into(), "must be a number"),
+            ("PremiereDate", "25/05/1979".into(), "look like 1979-05-25"),
+            ("PremiereDate", "1979-13-01".into(), "look like 1979-05-25"),
+        ];
+        for (field, text, reason) in cases {
+            let drafts = with_draft(drafts_of(&m), field, &text);
+            let refused = plan_metadata_save(&m, &drafts, &[]).unwrap_err();
+            assert_eq!(refused.len(), 1, "{field} {text}");
+            assert_eq!(refused[0].0, field);
+            assert!(refused[0].1.contains(reason), "{field} {text}: {refused:?}");
+        }
+    }
+
+    #[test]
+    fn the_form_accepts_the_edges_of_each_limit() {
+        let m = alien();
+        for (field, text) in [
+            ("ProductionYear", "1850".to_string()),
+            ("ProductionYear", "2200".into()),
+            ("CommunityRating", "0".into()),
+            ("CommunityRating", "10".into()),
+            ("CriticRating", "100".into()),
+            ("Title", "x".repeat(500)),
+            ("PremiereDate", "2000-02-29".into()),
+        ] {
+            let drafts = with_draft(drafts_of(&m), field, &text);
+            assert!(
+                plan_metadata_save(&m, &drafts, &[]).is_ok(),
+                "{field} {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_show_sends_genres_as_a_list_and_clears_them_to_an_empty_one() {
+        let show = ItemMetadata {
+            target: "series".into(),
+            kind: "Series".into(),
+            fields: serde_json::from_value(serde_json::json!({"Genres": ["Drama"]})).unwrap(),
+            editable: vec!["Genres".into()],
+            locked: vec![],
+            ..alien()
+        };
+        let edited = vec![("Genres".to_string(), " Drama, ,Sci-Fi ".to_string())];
+        let save = plan_metadata_save(&show, &edited, &[]).unwrap();
+        assert_eq!(
+            save.fields,
+            vec![("Genres".to_string(), serde_json::json!(["Drama", "Sci-Fi"]))]
+        );
+        let cleared = vec![("Genres".to_string(), String::new())];
+        let save = plan_metadata_save(&show, &cleared, &[]).unwrap();
+        assert_eq!(
+            save.fields,
+            vec![("Genres".to_string(), serde_json::json!([]))]
+        );
     }
 
     /// The page on `tab`, `loading` or not, as HTML.
