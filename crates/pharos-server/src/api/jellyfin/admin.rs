@@ -1053,7 +1053,9 @@ async fn damaged_files(
 /// `Checked` counts any verdict for the id, whatever state the file was in
 /// then: a `stat` per file to confirm each is current would be thousands of
 /// NFS round trips per page view. A changed file therefore counts as checked
-/// until the sweep reaches it again.
+/// until the sweep reaches it again. Every count is over files the library
+/// holds now, so `Damaged` can be lower than the damaged list, which also
+/// keeps verdicts for files since removed.
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "PascalCase")]
 struct IntegrityStatusDto {
@@ -1079,27 +1081,34 @@ async fn integrity_status(
             "no integrity sweep on this build/platform (needs unix + the ffmpeg-lib backend)",
         ));
     };
-    let items = pharos_core::MediaStore::list(&state.stores)
+    // The shared cached list: this page must not cost a full store read.
+    let items = state
+        .list_items_cached()
         .await
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
-    let (mut eligible, mut checked, mut not_checkable) = (0usize, 0usize, 0usize);
+    let (mut eligible, mut checked, mut damaged, mut not_checkable) = (0, 0, 0, 0);
     for it in items
         .iter()
         .filter(|it| crate::integrity_sweep::scannable(it))
     {
-        if sweep.is_not_checkable(it.id) {
+        if sweep.has_not_checkable(it.id) {
             not_checkable += 1;
             continue;
         }
         eligible += 1;
-        if memo.has(it.id) {
-            checked += 1;
+        match memo.recorded_damaged(it.id) {
+            Some(true) => {
+                checked += 1;
+                damaged += 1;
+            }
+            Some(false) => checked += 1,
+            None => {}
         }
     }
     Ok(web::Json(IntegrityStatusDto {
         eligible,
         checked,
-        damaged: memo.damaged().len(),
+        damaged,
         queued: sweep.queued_len(),
         not_checkable,
     }))
@@ -1109,7 +1118,8 @@ async fn integrity_status(
 ///
 /// 202: queued, and the sweep is woken. The old verdict stays listed, with
 /// `RecheckPending`, until the new one lands. 404 for an id the library does
-/// not hold; 400 for one the sweep cannot read (a remote origin).
+/// not hold; 400 for one the sweep cannot read (a remote origin); 503 on a
+/// replica that is not the background leader.
 async fn integrity_recheck(
     state: web::Data<AppState>,
     user: AuthUser,
@@ -1121,6 +1131,13 @@ async fn integrity_recheck(
             "no integrity sweep on this build/platform (needs unix + the ffmpeg-lib backend)",
         ));
     };
+    // The queue is this process's, and only the background leader sweeps
+    // (T85). Accepting the request on a follower would queue it forever.
+    if !state.is_bg_leader() {
+        return Err(error::ErrorServiceUnavailable(
+            "this replica does not run the integrity sweep; try again",
+        ));
+    }
     let raw = path.into_inner();
     let id: u64 = raw
         .parse()

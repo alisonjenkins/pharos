@@ -1365,7 +1365,7 @@ async fn integrity_status_counts_checked_damaged_and_queued_files() {
         },
     );
     let sweep = std::sync::Arc::new(IntegritySweep::default());
-    sweep.mark_not_checkable(5);
+    sweep.mark_not_checkable(5, Some((1, 1)));
     sweep.request(2);
     let state = web::Data::new(
         AppState::new(state.stores.clone(), "t".into())
@@ -1411,14 +1411,14 @@ async fn an_admin_can_queue_a_recheck_and_unknown_or_remote_items_are_refused() 
         .unwrap();
     }
     let sweep = std::sync::Arc::new(IntegritySweep::default());
-    let state = web::Data::new(
-        AppState::new(state.stores.clone(), "t".into())
-            .with_integrity_memo(std::sync::Arc::new(IntegrityMemo::load(
-                "/nonexistent/integrity.json",
-                INTEGRITY_SCAN_VERSION,
-            )))
-            .with_integrity_sweep(sweep.clone()),
-    );
+    let app_state = AppState::new(state.stores.clone(), "t".into())
+        .with_integrity_memo(std::sync::Arc::new(IntegrityMemo::load(
+            "/nonexistent/integrity.json",
+            INTEGRITY_SCAN_VERSION,
+        )))
+        .with_integrity_sweep(sweep.clone());
+    let leader = app_state.is_bg_leader.clone();
+    let state = web::Data::new(app_state);
     let app = test::init_service(build_app(state)).await;
     let post = |uri: &str| {
         test::TestRequest::post()
@@ -1426,6 +1426,11 @@ async fn an_admin_can_queue_a_recheck_and_unknown_or_remote_items_are_refused() 
             .insert_header(("X-Emby-Token", token.as_str()))
             .to_request()
     };
+    // A follower does not sweep, so it must not take the request.
+    let resp = test::call_service(&app, post("/admin/integrity/10/recheck")).await;
+    assert_eq!(resp.status().as_u16(), 503, "a follower refuses");
+    assert!(!sweep.is_queued(10));
+    leader.store(true, std::sync::atomic::Ordering::Relaxed);
     let resp = test::call_service(&app, post("/admin/integrity/10/recheck")).await;
     assert_eq!(resp.status().as_u16(), 202);
     assert!(sweep.is_queued(10));
