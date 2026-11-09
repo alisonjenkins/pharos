@@ -4530,7 +4530,7 @@ fn is_sidecar_noise(path: &Path) -> bool {
 /// A release's sample clip: a video under a `Sample` folder, or one whose
 /// name ends in `sample` (`Heat.1995.sample.mkv`, `Heat (Sample).mkv`).
 /// Indexed, each showed up as another copy of its film.
-fn is_release_sample(relative: &Path) -> bool {
+pub(crate) fn is_release_sample(relative: &Path) -> bool {
     let video = relative
         .extension()
         .and_then(|e| e.to_str())
@@ -4554,7 +4554,7 @@ fn is_release_sample(relative: &Path) -> bool {
 
 /// A release group's advert clip packed beside its films (`ETRG.mp4`):
 /// a video named only for the group.
-fn is_release_promo(path: &Path) -> bool {
+pub(crate) fn is_release_promo(path: &Path) -> bool {
     let video = path
         .extension()
         .and_then(|e| e.to_str())
@@ -4594,6 +4594,15 @@ pub fn in_ignored_folder(path: &Path, root: &Path) -> bool {
         .skip(1)
         .take_while(|p| p.starts_with(root))
         .any(is_ignored_dir)
+}
+
+/// Whether the full walk leaves `path` out: under a `.ignore` folder, a
+/// release sample or a release group's promo clip (V961, V969, V972).
+#[cfg_attr(not(feature = "watch"), allow(dead_code))]
+pub(crate) fn walk_skips(path: &Path, root: &Path) -> bool {
+    in_ignored_folder(path, root)
+        || is_release_promo(path)
+        || is_release_sample(path.strip_prefix(root).unwrap_or(path))
 }
 
 /// Result of a filesystem [`walk`]: the recognised media file paths, plus a
@@ -10845,5 +10854,23 @@ mod tests {
             reason(&now(MediaKind::Movie, None), &now(MediaKind::Episode, None)),
             None
         );
+    }
+
+    /// V961, V969, V972 — a watch event never brings in what the walk skips.
+    #[test]
+    fn a_watch_event_skips_what_the_walk_skips() {
+        let td = TempDir::new().unwrap();
+        let root = td.path();
+        std::fs::create_dir_all(root.join("To Sort/SG1")).unwrap();
+        std::fs::write(root.join("To Sort/.ignore"), b"").unwrap();
+        for skipped in [
+            "To Sort/SG1/title_t00.mkv",
+            "Heat (1995)/Sample/heat.sample.mkv",
+            "X/sample-The Last Starfighter (1984).mkv",
+            "X/ETRG.mp4",
+        ] {
+            assert!(walk_skips(&root.join(skipped), root), "{skipped}");
+        }
+        assert!(!walk_skips(&root.join("Heat (1995)/Heat (1995).mkv"), root));
     }
 }
