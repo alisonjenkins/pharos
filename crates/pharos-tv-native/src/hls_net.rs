@@ -1,6 +1,8 @@
-//! fMP4 HLS from the server (spec 032 slice 3, player step 4): fetch the
-//! master the playback decision names, pick the first variant the feeder can
-//! decode, and supply its init and media segments to the feeder.
+//! HLS from the server (spec 032 slice 3, player step 4): fetch the master
+//! the playback decision names, take its first (best) variant the feeder can
+//! decode, and supply its segments to the feeder. The server sends a
+//! non-browser client muxed MPEG-TS, and fMP4 only to browsers, so both are
+//! read.
 //!
 //! Segments are fetched on their own thread, [`AHEAD`] in front of the
 //! decoder, with the device token in the `X-Emby-Token` header (the server reads it there, not as a bearer) and never in a URL. Video
@@ -15,9 +17,22 @@ const AHEAD: usize = 3;
 /// Fetch attempts per segment before the stream is given up.
 const ATTEMPTS: u32 = 4;
 
-/// What the player starts from: the init segment and the media segments.
+/// How the stream's segments are packaged.
+pub enum Packaging {
+    /// fMP4, with the init segment its `EXT-X-MAP` names.
+    Fmp4 { init: Vec<u8> },
+    /// Muxed MPEG-TS (no `EXT-X-MAP`): the first segment, which carries the
+    /// parameter sets, and the variant's `RESOLUTION`.
+    Ts {
+        first: Vec<u8>,
+        size: Option<(u32, u32)>,
+    },
+}
+
+/// What the player starts from: how it is packaged and the media segments
+/// after the ones `packaging` holds.
 pub struct Stream {
-    pub init: Vec<u8>,
+    pub packaging: Packaging,
     pub segments: Segments,
     pub variant: String,
 }
@@ -93,35 +108,51 @@ pub fn open(server: &str, stream_url: &str) -> Result<Stream, String> {
     let master_url = format!("{}{stream_url}", server.trim_end_matches('/'));
     let master = playlist::parse_master(&http.text(&master_url)?, &master_url)
         .map_err(|e| format!("master: {e}"))?;
-    let mut tried = Vec::new();
-    for variant in &master.variants {
-        if !feedable(&variant.codecs) {
-            tried.push(format!("{} (codecs {:?})", variant.uri, variant.codecs));
-            continue;
+    // Variants are listed best first, and the first is the title at its own
+    // resolution; never fall through to a smaller transcode rung.
+    let variant = master
+        .variants
+        .iter()
+        .find(|v| feedable(&v.codecs))
+        .ok_or_else(|| {
+            let seen: Vec<_> = master.variants.iter().map(|v| &v.codecs).collect();
+            format!("no variant the feeder can decode: {seen:?}")
+        })?;
+    let media = playlist::parse_media(&http.text(&variant.uri)?, &variant.uri)
+        .map_err(|e| format!("media playlist: {e}"))?;
+    log::info!(
+        "hls: variant codecs={:?} resolution={:?} bandwidth={} segments={} packaging={}",
+        variant.codecs,
+        variant.resolution,
+        variant.bandwidth,
+        media.segments.len(),
+        if media.init_uri.is_some() { "fmp4" } else { "ts" },
+    );
+    let path = variant.uri.split('?').next().unwrap_or_default().to_owned();
+    let (packaging, skip) = match media.init_uri.clone() {
+        Some(init_uri) => (
+            Packaging::Fmp4 {
+                init: http.get(&init_uri)?,
+            },
+            0,
+        ),
+        None => {
+            let first = media.segments.first().ok_or("media playlist has no segments")?;
+            (
+                Packaging::Ts {
+                    first: http.get(&first.uri)?,
+                    size: variant.resolution,
+                },
+                1,
+            )
         }
-        let media = playlist::parse_media(&http.text(&variant.uri)?, &variant.uri)
-            .map_err(|e| format!("media playlist: {e}"))?;
-        let Some(init_uri) = media.init_uri.clone() else {
-            // An MPEG-TS variant: the feeder reads fMP4 only.
-            tried.push(format!("{} (no EXT-X-MAP)", variant.uri));
-            continue;
-        };
-        log::info!(
-            "hls: variant codecs={:?} resolution={:?} bandwidth={} segments={}",
-            variant.codecs,
-            variant.resolution,
-            variant.bandwidth,
-            media.segments.len()
-        );
-        let init = http.get(&init_uri)?;
-        let segments = spawn_fetcher(http, media)?;
-        return Ok(Stream {
-            init,
-            segments: Box::new(move || segments.recv().ok()),
-            variant: variant.uri.split('?').next().unwrap_or_default().to_owned(),
-        });
-    }
-    Err(format!("no fMP4 variant the feeder can decode: {tried:?}"))
+    };
+    let segments = spawn_fetcher(http, media, skip)?;
+    Ok(Stream {
+        packaging,
+        segments: Box::new(move || segments.recv().ok()),
+        variant: path,
+    })
 }
 
 /// Fetches every segment in order on its own thread; the channel's bound
@@ -129,12 +160,13 @@ pub fn open(server: &str, stream_url: &str) -> Result<Stream, String> {
 fn spawn_fetcher(
     http: Http,
     media: MediaPlaylist,
+    skip: usize,
 ) -> Result<Receiver<Result<Vec<u8>, String>>, String> {
     let (tx, rx) = sync_channel(AHEAD);
     std::thread::Builder::new()
         .name("pharos-hls".into())
         .spawn(move || {
-            for seg in &media.segments {
+            for seg in media.segments.iter().skip(skip) {
                 let got = http.get(&seg.uri);
                 let failed = got.is_err();
                 if tx.send(got).is_err() || failed {

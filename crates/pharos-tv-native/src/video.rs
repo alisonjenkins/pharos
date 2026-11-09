@@ -117,7 +117,14 @@ impl Source {
                 let url = wait_stream()?;
                 let stream = crate::hls_net::open(&crate::live::server(), &url)?;
                 log::info!("video: playing {} from the server", stream.variant);
-                crate::feeder::Feeder::from_init(&stream.init, stream.segments)?
+                match stream.packaging {
+                    crate::hls_net::Packaging::Fmp4 { init } => {
+                        crate::feeder::Feeder::from_init(&init, stream.segments)?
+                    }
+                    crate::hls_net::Packaging::Ts { first, size } => {
+                        crate::feeder::Feeder::from_ts(first, stream.segments, size)?
+                    }
+                }
             } else {
                 crate::feeder::Feeder::open(path)?
             };

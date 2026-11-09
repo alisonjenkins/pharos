@@ -9,6 +9,8 @@
 use pharos_hls::annexb::{self, ParameterSets};
 use pharos_hls::fmp4::{self, CodecConfig, Sample, TrackKind};
 use pharos_hls::playlist;
+
+use crate::ts;
 use std::path::{Path, PathBuf};
 
 /// The playlist a feeder directory must hold.
@@ -61,15 +63,29 @@ pub enum Next {
 /// segment arrives.
 pub type Segments = Box<dyn FnMut() -> Option<Result<Vec<u8>, String>> + Send>;
 
+/// How the segments are laid out.
+enum Container {
+    Fmp4 {
+        timescale: u32,
+        track_id: u32,
+        length_size: u8,
+        defaults: Vec<fmp4::TrackDefaults>,
+    },
+    /// Muxed MPEG-TS, what the server sends a client that is not a browser.
+    Ts(ts::Demux),
+}
+
+/// The segment being fed.
+enum Current {
+    Fmp4(Vec<u8>, Vec<Sample>),
+    Ts(Vec<ts::AccessUnit>),
+}
+
 pub struct Feeder {
     format: Format,
-    timescale: u32,
-    track_id: u32,
-    length_size: u8,
-    defaults: Vec<fmp4::TrackDefaults>,
+    container: Container,
     supply: Segments,
-    /// The segment being fed and its video samples.
-    current: Option<(Vec<u8>, Vec<Sample>)>,
+    current: Option<Current>,
     /// Segments read before `rewind` may start again; kept only for a
     /// directory source, whose files are already in memory.
     replay: Option<Vec<Vec<u8>>>,
@@ -165,12 +181,55 @@ impl Feeder {
                 csd,
                 max_input: input_size(width, height),
             },
-            timescale: entry.timescale,
-            track_id: entry.track_id,
-            length_size: sets.length_size,
-            defaults,
+            container: Container::Fmp4 {
+                timescale: entry.timescale,
+                track_id: entry.track_id,
+                length_size: sets.length_size,
+                defaults,
+            },
             supply,
             current: None,
+            replay: None,
+            segment: 0,
+            sample: 0,
+            scratch: Vec::new(),
+        })
+    }
+
+    /// An MPEG-TS stream, from its first segment. `size` is the variant's
+    /// `RESOLUTION`; the decoder reads the true size from the SPS.
+    pub fn from_ts(first: Vec<u8>, supply: Segments, size: Option<(u32, u32)>) -> Result<Self, String> {
+        let mut demux = ts::Demux::default();
+        let units = demux.access_units(&first).map_err(|e| format!("segment 0: {e}"))?;
+        let (codec, hevc) = match demux.stream_type() {
+            Some(ts::STREAM_AVC) => (Codec::Avc, false),
+            Some(ts::STREAM_HEVC) => (Codec::Hevc, true),
+            other => return Err(format!("TS without H.264 or HEVC video ({other:?})")),
+        };
+        let key = units.iter().find(|u| u.key).ok_or("segment 0 has no key frame")?;
+        let csd = ts::csd(&key.data, hevc);
+        if csd.iter().any(Vec::is_empty) {
+            return Err("segment 0's key frame carries no parameter sets".into());
+        }
+        let (width, height) = size.unwrap_or((1920, 1080));
+        let width = u16::try_from(width).map_err(|_| format!("width {width}"))?;
+        let height = u16::try_from(height).map_err(|_| format!("height {height}"))?;
+        log::info!(
+            "video: source=ts codec={} {width}x{height} units={}",
+            codec.mime(),
+            units.len()
+        );
+        Ok(Self {
+            format: Format {
+                codec,
+                width,
+                height,
+                csd,
+                max_input: input_size(width, height),
+            },
+            container: Container::Ts(demux),
+            supply,
+            current: Some(Current::Ts(units)),
             replay: None,
             segment: 0,
             sample: 0,
@@ -200,12 +259,24 @@ impl Feeder {
             return Ok(false);
         };
         let bytes = bytes?;
-        let samples: Vec<Sample> = fmp4::samples(&bytes, &self.defaults)
-            .map_err(|e| format!("segment {}: {e}", self.segment))?
-            .into_iter()
-            .filter(|s| s.track_id == self.track_id)
-            .collect();
-        self.current = Some((bytes, samples));
+        let segment = self.segment;
+        self.current = Some(match &mut self.container {
+            Container::Fmp4 {
+                track_id, defaults, ..
+            } => {
+                let samples: Vec<Sample> = fmp4::samples(&bytes, defaults)
+                    .map_err(|e| format!("segment {segment}: {e}"))?
+                    .into_iter()
+                    .filter(|s| s.track_id == *track_id)
+                    .collect();
+                Current::Fmp4(bytes, samples)
+            }
+            Container::Ts(demux) => Current::Ts(
+                demux
+                    .access_units(&bytes)
+                    .map_err(|e| format!("segment {segment}: {e}"))?,
+            ),
+        });
         self.sample = 0;
         Ok(true)
     }
@@ -213,29 +284,52 @@ impl Feeder {
     /// Writes the next sample into `buf` as Annex B.
     pub fn next(&mut self, buf: &mut [u8]) -> Result<Next, String> {
         loop {
-            let Some((bytes, samples)) = &self.current else {
+            let Some(current) = &self.current else {
                 if !self.advance()? {
                     return Ok(Next::End);
                 }
                 continue;
             };
-            let Some(sample) = samples.get(self.sample) else {
-                self.current = None;
-                self.segment += 1;
-                continue;
+            let (pts_us, key) = match current {
+                Current::Fmp4(bytes, samples) => {
+                    let Container::Fmp4 {
+                        timescale,
+                        length_size,
+                        ..
+                    } = &self.container
+                    else {
+                        return Err("fMP4 segment in a TS stream".into());
+                    };
+                    let Some(sample) = samples.get(self.sample) else {
+                        self.current = None;
+                        self.segment += 1;
+                        continue;
+                    };
+                    let data = sample.data(bytes).ok_or("sample outside its segment")?;
+                    self.scratch.clear();
+                    annexb::to_annex_b(data, *length_size, &mut self.scratch).map_err(|e| {
+                        format!("segment {} sample {}: {e}", self.segment, self.sample)
+                    })?;
+                    let pts = sample.presentation_time();
+                    (fmp4::to_ms(pts.saturating_mul(1_000), *timescale), sample.sync)
+                }
+                Current::Ts(units) => {
+                    let Some(unit) = units.get(self.sample) else {
+                        self.current = None;
+                        self.segment += 1;
+                        continue;
+                    };
+                    self.scratch.clear();
+                    self.scratch.extend_from_slice(&unit.data);
+                    (unit.pts_us, unit.key)
+                }
             };
-            let data = sample.data(bytes).ok_or("sample outside its segment")?;
-            self.scratch.clear();
-            annexb::to_annex_b(data, self.length_size, &mut self.scratch)
-                .map_err(|e| format!("segment {} sample {}: {e}", self.segment, self.sample))?;
             let len = self.scratch.len();
             let Some(dst) = buf.get_mut(..len) else {
                 return Ok(Next::TooBig { need: len });
             };
             dst.copy_from_slice(&self.scratch);
-            let (pts, key) = (sample.presentation_time(), sample.sync);
             self.sample += 1;
-            let pts_us = fmp4::to_ms(pts.saturating_mul(1_000), self.timescale);
             return Ok(Next::Sample { len, pts_us, key });
         }
     }
