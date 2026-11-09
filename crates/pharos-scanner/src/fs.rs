@@ -2573,9 +2573,11 @@ fn group_copies(
 /// `("heat", 1995)`): the name's words, lower-cased, less its year, the words
 /// that say how the copy was made ([`FILM_RELEASE_WORDS`], resolutions,
 /// channel layouts, the 3D packing) and a leading or trailing article
-/// (`The Thing`, `Thing, The`). Whatever else the name says stays in the key,
-/// so a trailer, a sample, a cut, a part or an episode of a show named by
-/// number is its own title. A name with no year takes its folder's year only
+/// (`The Thing`, `Thing, The`). A cut or edition after the year and a lone
+/// `cd1` are dropped too, so each is a version of the film (V962, V963).
+/// Whatever else the name says stays in the key, so a trailer, a sample, a
+/// part or an episode of a show named by number is its own title. A name with
+/// no year takes its folder's year only
 /// when it names the folder's title (`Thing, The (1982)/The Thing.mkv`), since
 /// a film's folder also holds its extras; with neither, it is no copy of
 /// anything, since a title alone would merge remakes.
@@ -2595,7 +2597,9 @@ fn film_copy_key(path: &Path) -> Option<(String, u32)> {
             let folder = path.parent()?.file_name()?.to_str()?;
             let year = year_of(folder)?;
             let title = film_title(folder, year);
-            (film_title(stem, year) == title).then_some((title, year))?
+            let named = film_title(stem, year) == title;
+            let trimmed = || film_title(&strip_trailing_cut(stem), year) == title;
+            (named || trimmed()).then_some((title, year))?
         }
     };
     (!title.is_empty()).then(|| (title.join(" "), year))
@@ -2676,11 +2680,29 @@ fn strip_cut<'a>(name: &'a str, year: &str) -> std::borrow::Cow<'a, str> {
     }
 }
 
+/// `name` less a cut that ends it (`The Bourne Identity cd1`), for a name with
+/// no year to compare with its folder's title.
+fn strip_trailing_cut(name: &str) -> String {
+    let name = name.trim_end();
+    let end = CUT_RE.as_ref().and_then(|re| {
+        re.find_iter(name)
+            .filter(|m| {
+                name.get(m.end()..)
+                    .is_some_and(|rest| rest.trim().is_empty())
+            })
+            .map(|m| m.start())
+            .next()
+    });
+    end.and_then(|at| name.get(..at))
+        .unwrap_or(name)
+        .to_string()
+}
+
 /// A cut or edition a film's name may state after its year, or a `cd1` that
 /// holds the whole film.
 static CUT_RE: std::sync::LazyLock<Option<regex::Regex>> = std::sync::LazyLock::new(|| {
     regex::Regex::new(
-        r"(?i)\{edition-[^{}]*\}|\b(?:director'?s|extended|theatrical|ultimate|final|collector'?s|special|anniversary|unrated|uncut|uncensored|remastered|imax|criterion|redux)(?:[ ._-]+(?:cut|edition|version|extended|uncut))*\b(?:[ ._-]+(?:cut|edition|version))?|\bcd ?0?1\b",
+        r"(?i)\{edition-[^{}]*\}|\b(?:director['’]?s|extended|theatrical|ultimate|final|collector['’]?s|special|anniversary|unrated|uncut|uncensored|remastered|imax|criterion|redux)(?:[ ._-]+(?:cut|edition|version|extended|uncut))*\b(?:[ ._-]+(?:cut|edition|version))?|\bcd ?0?1\b",
     )
     .ok()
 });
@@ -7837,6 +7859,15 @@ mod tests {
             assert_ne!(key, thing, "{extra}");
         }
         assert_eq!(film_copy_key(Path::new("/m/Untitled/The Thing.mkv")), None);
+        for named in ["The Thing cd1.mp4", "The Thing Director’s Cut.mkv"] {
+            let key = film_copy_key(&Path::new("/m/Thing, The (1982)").join(named));
+            assert_eq!(key, thing, "{named}");
+        }
+        assert_eq!(
+            film_copy_key(Path::new("/m/The Final Cut (2004)/The Final Cut.mkv")),
+            Some(("final cut".to_string(), 2004)),
+            "a title that ends in a cut word still names its folder"
+        );
         assert_ne!(
             film_copy_key(Path::new("/m/The Thing (2011)/The Thing.mkv")),
             thing,
