@@ -340,6 +340,9 @@ pub struct AppState {
     pub ffmpeg: Arc<dyn FfmpegBackend>,
     /// Where provider-hosted cast portraits are fetched from (ADR-0076).
     pub portraits: Arc<dyn crate::portrait::PortraitSource>,
+    /// Where a person's biography and external ids are fetched from
+    /// (ADR-0084). `None` without a TMDB key: the page shows what is kept.
+    pub person_details: Option<Arc<dyn crate::person_details::PersonDetailsSource>>,
     /// Memoises a synthesised Series/Season/Artist/Album wire id → the
     /// representative member item id whose frame/cover is its poster. Without
     /// this, every synth-item image request would re-scan the whole library
@@ -785,6 +788,7 @@ impl AppState {
             scan_probe_concurrency: 0,
             ffmpeg: default_ffmpeg_backend(),
             portraits: Arc::new(crate::portrait::HttpPortraits::new()),
+            person_details: None,
             synth_image_ids: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             artwork_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             synth_image_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -914,6 +918,7 @@ impl AppState {
             scan_probe_concurrency: 0,
             ffmpeg: default_ffmpeg_backend(),
             portraits: Arc::new(crate::portrait::HttpPortraits::new()),
+            person_details: None,
             synth_image_ids: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             artwork_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             synth_image_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -1076,6 +1081,16 @@ impl AppState {
         source: Arc<dyn crate::portrait::PortraitSource>,
     ) -> Self {
         self.portraits = source;
+        self
+    }
+
+    /// Install the [`crate::person_details::PersonDetailsSource`] a person's
+    /// page asks for their biography and external ids.
+    pub fn with_person_details_source(
+        mut self,
+        source: Arc<dyn crate::person_details::PersonDetailsSource>,
+    ) -> Self {
+        self.person_details = Some(source);
         self
     }
 

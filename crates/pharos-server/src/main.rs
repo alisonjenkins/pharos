@@ -1967,6 +1967,9 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
     // `PHAROS_TMDB_API_KEY` (a k8s Secret env var), never config.toml.
     match cfg.tmdb.api_key.as_deref() {
         Some(key) if !key.is_empty() => {
+            state = state.with_person_details_source(std::sync::Arc::new(
+                pharos_server::tmdb::TmdbClient::new(key.to_string()),
+            ));
             pharos_server::person_image_backfill::spawn(
                 state.stores.clone(),
                 state.bg_io.clone(),
