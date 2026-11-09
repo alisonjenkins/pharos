@@ -32,13 +32,16 @@ evidence, and make every episode inherit it:
 1. **Stated show year per file**: folder `(YYYY)` ▸ file name `Show (YYYY)`
    prefix ▸ release folder; a bare folder takes its files' consensus.
    `tvshow.nfo`'s year and ids are evidence, never identity (V890).
-2. **Split a folder by stated year** when its files disagree; the unyeared
-   group keeps the plain folder key so existing wire ids hold. Split keys are
+2. **Split a folder by stated year** when its files state different years. A
+   file with no year splits off only when its own episode titles fit a
+   same-named rival better. The group holding the folder's stored match (else
+   the largest) keeps the plain folder key, so the show users know keeps its
+   wire id and series-level state. Split keys are
    `"{folder}\u{1f}{YYYY}"`, stored in a new `media_items.series_key` column
    backfilled to today's key (V893).
 3. **No silent tie-break**: two exact-name candidates without a separating year
-   are scored by episode fit (season/episode coverage, filename titles, an NFO
-   vote). The best one is used, and when it does not lead by a clear margin the
+   are scored by episode fit (season/episode coverage, filename titles, and the
+   NFO ids and year as one vote: an NFO year never separates candidates). The best one is used, and when it does not lead by a clear margin the
    match is flagged for an admin to check. Manual matches are never re-asked
    (V891).
 4. **Episodes take metadata only from their series' pinned match**; the
@@ -46,15 +49,18 @@ evidence, and make every episode inherit it:
    is set aside with its text and stills (V892, extends V468).
 5. **Copies never fold across series**: #1055's fold also requires one series
    key, equal stated show years and equal provider series ids where both are
-   known (V894).
+   known, and their filename episode titles agree where both have one. In a
+   flagged or split series, numbers alone never fold two rows (V894).
 6. **Hand fixes are overrides**: an admin Show identity page picks a show,
-   confirms a flagged guess, moves files between shows or undoes a split; each
+   confirms a flagged guess (stored as a manual match), moves files between shows or undoes a split; each
    fix is stored in `series_overrides` and applied by the scanner after its
    split and before the copy fold, so a rescan never undoes it (V896).
 7. **Repair by dry run, then apply**: `[metadata] series_identity_repair`
    defaults to `"dry_run"`; `"apply"` re-matches only shows with conflicting
-   evidence and re-fetches only episodes whose provider show disagrees with
-   their series. No row is deleted.
+   evidence (the version gate no longer re-admits every searched show) and
+   rebuilds episodes whose provider show disagrees with their series or whose
+   premiere date falls outside its run. The rebuild resets provider-derived
+   fields, because enrichment only fills empty ones. No row is deleted.
 
 ## Consequences
 
