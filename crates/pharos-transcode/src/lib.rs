@@ -23,6 +23,7 @@ pub mod integrity;
 #[cfg(unix)]
 pub mod libav;
 pub mod options;
+pub mod picture_area;
 #[cfg(unix)]
 pub mod probe;
 pub mod protocol;
