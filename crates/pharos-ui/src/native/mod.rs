@@ -78,6 +78,7 @@ pub mod rails;
 pub mod reader;
 #[cfg(all(feature = "web", target_arch = "wasm32"))]
 mod reader_web;
+pub mod report;
 pub mod resume;
 pub mod route;
 pub mod scrub;

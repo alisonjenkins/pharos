@@ -3537,6 +3537,8 @@ pub fn install_telemetry(api: &NativeApi) {
 /// Submits one client event without waiting for it, if opted in. Opted out,
 /// nothing is sent or held.
 pub fn report_event(event: ClientEvent) {
+    // Kept locally whatever the opt-in: it leaves only inside a pressed report.
+    super::report::record_event(&event);
     let opted = opted_in();
     let submit = TELEMETRY.with(|t| t.borrow_mut().sink.report(opted, event));
     if let Some((api, event)) = submit {
