@@ -447,11 +447,16 @@ pub async fn reconcile<S: SeriesIdentityStore>(
     let updates = diff(plan, &stored);
     let by_path: HashMap<&str, &SeriesIdentityRow> =
         stored.iter().map(|r| (r.path.as_str(), r)).collect();
-    let mut per_folder: BTreeMap<&str, usize> = BTreeMap::new();
+    // Per folder: rows that change, and of those the rows whose key moves.
+    let mut per_folder: BTreeMap<&str, (usize, usize)> = BTreeMap::new();
     for u in &updates {
-        let old = by_path.get(u.path.as_str());
+        let old = by_path.get(u.path.as_str()).copied();
         if let Some(folder) = old.and_then(|r| r.series_folder.as_deref()) {
-            *per_folder.entry(folder).or_default() += 1;
+            let entry = per_folder.entry(folder).or_default();
+            entry.0 += 1;
+            if moves_key(u, old) {
+                entry.1 += 1;
+            }
         }
         tracing::debug!(
             path = %u.path,
@@ -468,10 +473,11 @@ pub async fn reconcile<S: SeriesIdentityStore>(
         .iter()
         .map(|o| o.series_folder.as_str())
         .collect();
-    for (folder, rows) in &per_folder {
+    for (folder, (rows, keys_moved)) in &per_folder {
         tracing::info!(
             folder,
             rows,
+            keys_moved,
             split = plan.splits.iter().any(|s| s.folder == *folder),
             new_owner_row = owners.contains(folder),
             mode = mode.label(),
@@ -489,11 +495,7 @@ pub async fn reconcile<S: SeriesIdentityStore>(
     let changed = store.set_series_keys(&updates).await?;
     let moved: Vec<String> = updates
         .iter()
-        .filter(|u| {
-            by_path
-                .get(u.path.as_str())
-                .map_or(true, |old| old.series_key != u.series_key)
-        })
+        .filter(|u| moves_key(u, by_path.get(u.path.as_str()).copied()))
         .map(|u| u.path.clone())
         .collect();
     if !moved.is_empty() {
@@ -512,6 +514,18 @@ pub async fn reconcile<S: SeriesIdentityStore>(
 
 /// Rows the last complete pass of `root` found to differ: written in
 /// apply (so a steady library reads 0), still pending in dry run.
+/// Whether `u` gives its row another series key. A stored key equal to the
+/// folder and an update's `None` both mean the folder: rows backfilled by
+/// migration 0073 hold the folder itself, so comparing the raw columns took
+/// a year-only change for a move (B981).
+fn moves_key(u: &SeriesKeyUpdate, old: Option<&SeriesIdentityRow>) -> bool {
+    let Some(old) = old else {
+        return true;
+    };
+    let folder = old.series_folder.as_deref().unwrap_or_default();
+    old.series_key.as_deref().unwrap_or(folder) != u.series_key.as_deref().unwrap_or(folder)
+}
+
 fn set_repair_rows(change: &'static str, mode: RepairMode, root: &str, n: usize) {
     metrics::gauge!(
         "pharos_series_identity_repair_rows",
@@ -784,6 +798,36 @@ mod tests {
             p.assignments[Path::new(modern)].series_key,
             "/tv/The Flash\u{1f}2014"
         );
+    }
+
+    /// B981 — a row migration 0073 backfilled to its folder, whose only
+    /// change is the year its files now state, does not move key; a row
+    /// split off to another key does.
+    #[test]
+    fn a_year_only_change_is_no_key_move() {
+        let folder = "/tv/Forever (US)";
+        let backfilled = row("/tv/Forever (US)/S01E01.mkv", folder, Some(folder), None);
+        let year_only = SeriesKeyUpdate {
+            path: backfilled.path.clone(),
+            series_key: None,
+            series_year: Some(2014),
+        };
+        assert!(!moves_key(&year_only, Some(&backfilled)));
+        let unkeyed = row("/tv/Forever (US)/S01E02.mkv", folder, None, None);
+        assert!(!moves_key(&year_only, Some(&unkeyed)));
+        let split = SeriesKeyUpdate {
+            series_key: Some(split_key(folder, 1990)),
+            ..year_only.clone()
+        };
+        assert!(moves_key(&split, Some(&backfilled)));
+        let back = row(
+            "/tv/Forever (US)/S01E03.mkv",
+            folder,
+            Some(&split_key(folder, 1990)),
+            Some(1990),
+        );
+        assert!(moves_key(&year_only, Some(&back)));
+        assert!(moves_key(&year_only, None));
     }
 
     #[test]

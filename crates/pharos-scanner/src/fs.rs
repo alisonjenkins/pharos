@@ -6345,6 +6345,47 @@ mod tests {
         }
     }
 
+    /// B981: rows migration 0073 backfilled to their folder's key, whose
+    /// files now state one show year, get the year written under `apply`
+    /// and are not marked for a rebuild: their key did not move.
+    #[tokio::test]
+    async fn an_applied_year_only_change_marks_nothing_for_a_rebuild() {
+        use crate::series_split::RepairMode;
+        let td = TempDir::new().unwrap();
+        write_file(
+            td.path(),
+            "Forever (US)/Season 1/Forever (2014) - S01E01.mkv",
+            b"a",
+        )
+        .await;
+        write_file(
+            td.path(),
+            "Forever (US)/Season 1/Forever (2014) - S01E02.mkv",
+            b"b",
+        )
+        .await;
+        let store = MemStore::default();
+        FsScanner::new(FakeProber::default())
+            .scan_into(td.path(), &store)
+            .await
+            .unwrap();
+        for item in store.inner.lock().unwrap().values_mut() {
+            let s = item.series.as_mut().unwrap();
+            s.series_key = s.series_folder.clone();
+            s.series_year = None;
+        }
+
+        FsScanner::new(FakeProber::default())
+            .with_series_identity_repair(RepairMode::Apply)
+            .scan_into(td.path(), &store)
+            .await
+            .unwrap();
+
+        let years: Vec<_> = keys_of(&store).into_iter().map(|(_, _, y)| y).collect();
+        assert_eq!(years, [Some(2014), Some(2014)]);
+        assert!(store.reconcile_marked.lock().unwrap().is_empty());
+    }
+
     /// Spec 033 §6.2: the default dry run counts the split it would make and
     /// writes nothing.
     #[tokio::test]
