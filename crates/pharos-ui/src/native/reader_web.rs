@@ -172,13 +172,23 @@ struct Opened {
     toc: Vec<TocRow>,
 }
 
+/// Aborts the request when dropped, so leaving the screen mid-download (the
+/// future is dropped with it) stops the transfer.
+struct AbortOnDrop(web_sys::AbortController);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// The book's bytes, refused before the body is read when a weak device
 /// would hold too many of them.
 async fn fetch_book(id: ItemRef) -> Result<Vec<u8>, String> {
     let cap = size_cap(this_device(), &platform::user_agent());
-    let controller = web_sys::AbortController::new().map_err(|e| format!("{e:?}"))?;
+    let controller = AbortOnDrop(web_sys::AbortController::new().map_err(|e| format!("{e:?}"))?);
     let response = Request::get(&download_href(id))
-        .abort_signal(Some(&controller.signal()))
+        .abort_signal(Some(&controller.0.signal()))
         .send()
         .await
         .map_err(|e| format!("The download failed: {e}"))?;
@@ -199,7 +209,6 @@ async fn fetch_book(id: ItemRef) -> Result<Vec<u8>, String> {
             "pharos: reader size unknown item={id} (no Content-Length); opening"
         )),
         SizeVerdict::TooBig { bytes, cap } => {
-            controller.abort();
             platform::warn(&format!(
                 "pharos: reader refused item={id} bytes={bytes} cap={cap}"
             ));
