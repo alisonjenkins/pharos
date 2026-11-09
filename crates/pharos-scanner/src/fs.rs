@@ -2316,8 +2316,8 @@ fn copy_candidates(groups: &[(PathBuf, Vec<(String, PathBuf)>)]) -> Vec<(PathBuf
             .is_some()
     };
     let mut out: BTreeMap<PathBuf, bool> = BTreeMap::new();
-    for members in by_bucket.into_values().filter(|m| m.len() > 1) {
-        let unnamed = !members.iter().all(|p| named(p));
+    for (bucket, members) in by_bucket.into_iter().filter(|(_, m)| m.len() > 1) {
+        let unnamed = bucket.has_picture() && !members.iter().all(|p| named(p));
         for path in members {
             let flag = out.entry(path.to_path_buf()).or_default();
             *flag |= unnamed;
@@ -2406,6 +2406,17 @@ enum CopyBucket {
     },
     /// A film by its cleaned, case-folded title and its year.
     Film { title: String, year: u32 },
+    /// A song by its folded file stem and the two folders above it (album and
+    /// artist, or disc and album), release tags such as `[FLAC]` left out.
+    Song { folders: [String; 2], stem: String },
+}
+
+impl CopyBucket {
+    /// Whether a stored probe's picture height can rank this title's copies:
+    /// a song has no picture, so its copies are never looked up.
+    fn has_picture(&self) -> bool {
+        !matches!(self, Self::Song { .. })
+    }
 }
 
 /// The containers a film is held in: an audio file or a book is never a
@@ -2414,11 +2425,12 @@ const FILM_EXTENSIONS: &[&str] = &["mkv", "mp4", "mov", "avi", "webm", "m4v"];
 
 /// The buckets `path` is a copy in: for an episode file each episode it
 /// covers, or for a span past [`MAX_EPISODE_SPAN`] only its exact span; for a
-/// film its title and year.
+/// film its title and year; for a song its name and folders.
 fn copy_buckets(path: &Path) -> Vec<CopyBucket> {
     let Some((show, season, first, last)) = episode_copy_key(path) else {
         return film_copy_key(path)
             .map(|(title, year)| CopyBucket::Film { title, year })
+            .or_else(|| song_copy_key(path))
             .into_iter()
             .collect();
     };
@@ -2567,6 +2579,60 @@ fn film_copy_key(path: &Path) -> Option<(String, u32)> {
     let year = parsed.year?;
     let title = fold_name(&parsed.title?);
     (!title.is_empty()).then_some((title, year))
+}
+
+/// The containers a song is held in.
+const SONG_EXTENSIONS: &[&str] = &["flac", "mp3", "opus", "m4a", "ogg", "wav"];
+
+/// Release tags in a music folder or file name that say how a copy was
+/// ripped, not what it holds: any `[..]` or `{..}`, and a `(..)` holding a
+/// year or a format (`(2001)`, `(FLAC)`, `(320 kbps)`, `(24-96)`). Other
+/// parentheses stay, so `Album (Deluxe)`, `Album (CD 2)` and `Song (Live)`
+/// are their own.
+static RELEASE_TAG_RE: std::sync::LazyLock<Option<regex::Regex>> =
+    std::sync::LazyLock::new(|| {
+        regex::Regex::new(
+            r"(?i)\[[^\]]*\]|\{[^}]*\}|\((?:\s*\d{4}\s*|[^)]*\b(?:flac|alac|mp3|aac|ogg|opus|wav|lossless|hi-?res|\d{3}\s*k(?:bps)?|v[02]|\d{2}\s*-?\s*bit|\d{2}\s*-\s*\d{2,3}|web)\b[^)]*)\)",
+        )
+        .ok()
+    });
+
+/// `name` folded as [`fold_name`] does, its release tags dropped first.
+fn fold_release_name(name: &str) -> String {
+    match RELEASE_TAG_RE.as_ref() {
+        Some(re) => fold_name(&re.replace_all(name, " ")),
+        None => fold_name(name),
+    }
+}
+
+/// The bucket of a song file: its folded stem with the folded names of the
+/// two folders above it. Copies of a song sit beside each other
+/// (`01 Song.flac`, `01 Song.mp3`) or in a second rip of the album
+/// (`Album [FLAC]/`, `Album (320 kbps)/`); the file name alone would merge
+/// every artist's `01 Intro`. Tags are not read: they are only known once a
+/// file is probed, which runs after this.
+fn song_copy_key(path: &Path) -> Option<CopyBucket> {
+    if is_episode_path(path) {
+        return None;
+    }
+    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+    if !SONG_EXTENSIONS.contains(&ext.as_str()) {
+        return None;
+    }
+    let stem = fold_release_name(path.file_stem()?.to_str()?);
+    let parent = path.parent()?;
+    let folder = |p: Option<&Path>| {
+        p.and_then(Path::file_name)
+            .and_then(|s| s.to_str())
+            .map(fold_release_name)
+            .unwrap_or_default()
+    };
+    let album = folder(Some(parent));
+    let above = folder(parent.parent());
+    (!stem.is_empty() && !album.is_empty()).then_some(CopyBucket::Song {
+        folders: [album, above],
+        stem,
+    })
 }
 
 /// `(show folder, season, first episode, last episode)` for an episode file
@@ -7270,6 +7336,79 @@ mod tests {
             film_copy_key(Path::new("/g/The Matrix (1999) WEBDL-720p.mp4")),
         );
         assert_eq!(film_copy_key(Path::new("/f/The Matrix.mkv")), None);
+    }
+
+    /// V847: copies of one song, beside each other or in a second rip of the
+    /// album, are one item, the bigger (higher bitrate) file its primary.
+    #[test]
+    fn copies_of_a_song_are_one_item() {
+        let flac = PathBuf::from("/music/Artist/Album (2001) [FLAC]/01 - Song.flac");
+        let mp3 = PathBuf::from("/music/Artist/Album/01 - Song.mp3");
+        let ogg = PathBuf::from("/music/Artist/Album/01 - Song.ogg");
+        let size = |n| CopyFacts {
+            height: None,
+            size: Some(n),
+        };
+        let facts = HashMap::from([
+            (flac.clone(), size(30_000_000)),
+            (mp3.clone(), size(9_000_000)),
+            (ogg.clone(), size(5_000_000)),
+        ]);
+        let mut tally = CopyTally::default();
+        let groups = group_copies(
+            group_by_edition(vec![mp3.clone(), ogg.clone(), flac.clone()]),
+            &facts,
+            &mut tally,
+        );
+        assert_eq!(groups.len(), 1, "{groups:?}");
+        assert_eq!(groups[0].0, flac);
+        assert_eq!(
+            alt_paths(&groups[0].1),
+            vec![mp3.as_path(), ogg.as_path()]
+        );
+        assert_eq!(tally.0.get(&CopyDecision::Size), Some(&1));
+        assert_eq!(
+            folded_copies(&groups)
+                .iter()
+                .flat_map(|f| f.into.iter().map(|(_, r)| *r))
+                .collect::<Vec<_>>(),
+            [pharos_core::FoldResume::Carry; 2]
+        );
+    }
+
+    /// V847: a song groups only with files of its own name under the same two
+    /// folders, release tags aside; other songs, artists, editions and discs
+    /// stay apart.
+    #[test]
+    fn a_song_groups_only_with_its_own_name_and_folders() {
+        let groups = group_editions(vec![
+            PathBuf::from("/music/A/Album/01 Intro.flac"),
+            PathBuf::from("/music/B/Album/01 Intro.flac"),
+            PathBuf::from("/music/A/Album/02 Song.flac"),
+            PathBuf::from("/music/A/Album (Deluxe)/01 Intro.flac"),
+            PathBuf::from("/music/A/Album (CD 2)/01 Intro.flac"),
+            PathBuf::from("/music/A/Album/01 Intro (Live).flac"),
+            PathBuf::from("/music/A/Album/01 Intro.mkv"),
+        ]);
+        assert_eq!(groups.len(), 7, "{groups:?}");
+        assert_eq!(
+            song_copy_key(Path::new("/m/A/Album [MP3 320]/01 Intro.mp3")),
+            song_copy_key(Path::new("/m/a/album (320 kbps)/01_intro [web].flac")),
+        );
+        assert_ne!(song_copy_key(Path::new("/m/A/Album/01 Intro.flac")), None);
+    }
+
+    /// A song has no picture, so its copies never send the scan to the store
+    /// for a stored height.
+    #[test]
+    fn copies_of_a_song_are_never_looked_up() {
+        let groups = group_by_edition(vec![
+            PathBuf::from("/music/A/Album/01 Intro.flac"),
+            PathBuf::from("/music/A/Album/01 Intro.mp3"),
+        ]);
+        let candidates = copy_candidates(&groups);
+        assert_eq!(candidates.len(), 2);
+        assert!(candidates.iter().all(|(_, look_up)| !look_up));
     }
 
     /// V845: the highest-quality copy is the primary: the taller picture
