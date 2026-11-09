@@ -184,6 +184,8 @@ pub fn book_report(b: pharos_scanner::book::integrity::BookIntegrity) -> Integri
         read_errors: b.faults,
         first_fault: b.first_fault,
         complete: b.complete,
+        // A book has no timeline to mark; empty says the verdict is current.
+        ranges: Some(Vec::new()),
         ..Default::default()
     }
 }
