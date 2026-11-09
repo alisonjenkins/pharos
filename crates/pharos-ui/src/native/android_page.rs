@@ -712,7 +712,9 @@ pub fn info(message: &str) {
 /// No server to submit to on the host: client events are dropped.
 pub fn install_telemetry(_api: &NativeApi) {}
 
-pub fn report_event(_event: ClientEvent) {}
+pub fn report_event(event: ClientEvent) {
+    super::report::record_event(&event);
+}
 
 /// The host sends no client events, so diagnostics are never opted in.
 pub fn opted_in() -> bool {
