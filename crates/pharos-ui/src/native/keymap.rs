@@ -155,6 +155,8 @@ pub const PREFIXES: &[Prefix] = &[Prefix {
 
 const MOVING: Modes = Modes::Only(&[Mode::Browse, Mode::Detail, Mode::Queue]);
 const BROWSE: Modes = Modes::Only(&[Mode::Browse]);
+/// Where a song, an album, a film or an episode can be queued (V853).
+const QUEUEING: Modes = Modes::Only(&[Mode::Browse, Mode::Detail]);
 const MUSIC: Modes = Modes::Only(&[Mode::Music]);
 const QUEUE: Modes = Modes::Only(&[Mode::Queue]);
 const LISTENING: Modes = Modes::Only(&[Mode::Music, Mode::Queue]);
@@ -447,10 +449,16 @@ pub const BINDINGS: &[Binding] = &[
         &["a"],
         "Add to the end of the queue",
         G::Page,
-        BROWSE,
+        QUEUEING,
         A::Press("queue-end"),
     ),
-    bind(&["A"], "Play next", G::Page, BROWSE, A::Press("queue-next")),
+    bind(
+        &["A"],
+        "Play next",
+        G::Page,
+        QUEUEING,
+        A::Press("queue-next"),
+    ),
     bind(
         &["x"],
         "Start a mix like it",
@@ -503,6 +511,8 @@ pub const BINDINGS: &[Binding] = &[
         A::Press("shrink"),
     ),
     bind(&["q"], "Go to the queue", G::Page, MUSIC, A::Focus("queue")),
+    // The video queue, opened if it is closed (V853).
+    bind(&["q"], "Go to the queue", G::Page, VIDEO, A::Focus("queue")),
     bind(
         &["s"],
         "Shuffle on or off",
@@ -803,6 +813,28 @@ mod tests {
                 "{mode:?}"
             );
         }
+    }
+
+    /// V853: films and episodes queue from their pages as songs do from
+    /// the library, and q goes to the video player's queue.
+    #[test]
+    fn videos_queue_from_their_pages_and_q_finds_the_queue() {
+        for mode in [Mode::Browse, Mode::Detail] {
+            assert_eq!(
+                resolve(mode, &["a"]),
+                Resolved::Run(Action::Press("queue-end")),
+                "{mode:?}"
+            );
+            assert_eq!(
+                resolve(mode, &["A"]),
+                Resolved::Run(Action::Press("queue-next")),
+                "{mode:?}"
+            );
+        }
+        assert_eq!(
+            resolve(Mode::Player, &["q"]),
+            Resolved::Run(Action::Focus("queue"))
+        );
     }
 
     /// V512: the music player, its queue and the album pages share the

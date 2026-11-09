@@ -1064,6 +1064,21 @@ pub fn focus_by_id(id: &str) {
     }
 }
 
+/// Whether the page-wide key layer has its own use for Escape: the key
+/// help is open, or the page is in browser fullscreen. A panel that closes
+/// on Escape gives way to it.
+pub fn escape_claimed() -> bool {
+    let Some(document) = web_sys::window().and_then(|w| w.document()) else {
+        return false;
+    };
+    document.fullscreen_element().is_some()
+        || document
+            .query_selector(".pharos-key-help")
+            .ok()
+            .flatten()
+            .is_some()
+}
+
 /// Leaves browser fullscreen when the page is in it, for an Escape the
 /// browser passed on rather than keeping (headless Chromium does): that
 /// Escape leaves fullscreen and does nothing else (V852).
@@ -1939,7 +1954,8 @@ pub fn activate_focused() -> bool {
 }
 
 /// Click the control marked `data-key-action="<name>"`: the one in the
-/// focused `data-key-row` when there is one, else the page's first.
+/// focused `data-key-row` when there is one, else the page's first that is
+/// not marked `data-key-row-only`.
 pub fn press_key_action(name: &str) -> bool {
     let selector = format!("[data-key-action='{name}']");
     let in_row = focused()
@@ -1947,7 +1963,7 @@ pub fn press_key_action(name: &str) -> bool {
         .and_then(|row| row.query_selector(&selector).ok().flatten());
     let found = in_row.or_else(|| {
         document()?
-            .query_selector(&format!("main {selector}"))
+            .query_selector(&format!("main {selector}:not([data-key-row-only])"))
             .ok()
             .flatten()
     });

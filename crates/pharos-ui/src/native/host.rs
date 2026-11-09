@@ -225,6 +225,10 @@ pub fn leave_fullscreen_on_escape() -> bool {
     false
 }
 
+pub fn escape_claimed() -> bool {
+    false
+}
+
 pub fn pip_supported() -> bool {
     false
 }

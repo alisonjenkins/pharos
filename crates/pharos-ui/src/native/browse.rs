@@ -27,7 +27,7 @@ use super::machine::Event;
 use super::mixes::{self, MixCtx, ICON_MIX};
 use super::paging::{Chain, Pager, Trigger, SENTINEL_LEAD};
 use super::platform;
-use super::queue::{added_line, QueueCtx, Track};
+use super::queue::{added_line, video_kind, QueueCtx, Track, VideoQueueCtx};
 use super::route::Route;
 use super::seen::{self, MemberSeen};
 use super::together_view::{InThisGroup, SeenDots};
@@ -1780,6 +1780,12 @@ fn EpisodeRow(episode: Item, #[props(default)] seen: Vec<seen::SeenRow>) -> Elem
                 }
             }
             EpisodeMark { id: episode.id, label: label.clone(), played: episode.played }
+            QueueButtons {
+                name: label.clone(),
+                tracks: vec![episode.clone()],
+                album: None,
+                kind: QueueTarget::EpisodeRow,
+            }
             Link {
                 to: Route::Watch(episode.id),
                 class: "pharos-button pharos-episode-play",
@@ -2074,6 +2080,11 @@ pub enum QueueTarget {
     AlbumCard,
     /// An album's songs, on its own page: labelled buttons.
     AlbumPage,
+    /// A film or an episode on its own page, for the video queue (V853):
+    /// labelled buttons.
+    VideoPage,
+    /// An episode on its show's list, for the video queue: icons only.
+    EpisodeRow,
 }
 
 impl QueueTarget {
@@ -2082,6 +2093,22 @@ impl QueueTarget {
             QueueTarget::Song => "song",
             QueueTarget::AlbumCard => "album_card",
             QueueTarget::AlbumPage => "album_page",
+            QueueTarget::VideoPage => "video_page",
+            QueueTarget::EpisodeRow => "episode_row",
+        }
+    }
+
+    /// Whether it queues on the video queue rather than the music one.
+    pub fn video(self) -> bool {
+        matches!(self, QueueTarget::VideoPage | QueueTarget::EpisodeRow)
+    }
+
+    /// The note when nothing it named could be queued.
+    fn nothing(self, name: &str) -> String {
+        if self.video() {
+            format!("{name} cannot be queued.")
+        } else {
+            format!("{name} has no songs to queue.")
         }
     }
 }
@@ -2106,7 +2133,11 @@ pub fn QueueButtons(
         format!("Play {name} next"),
         format!("Add {name} to the queue"),
     );
-    let queue = try_use_context::<QueueCtx>();
+    let queue = if kind.video() {
+        try_use_context::<VideoQueueCtx>().map(|VideoQueueCtx(q, _)| q)
+    } else {
+        try_use_context::<QueueCtx>().map(|q| q.0)
+    };
     let ctx = try_use_context::<Ctx>();
     // A song row can also start a mix like it, playing at once (spec 024).
     // No mix in a SyncPlay group, where the group picks the songs.
@@ -2119,9 +2150,14 @@ pub fn QueueButtons(
         .flatten()
         .filter(|_| mix.is_some());
     let mix_label = format!("Start a mix like {name}");
-    let Some(QueueCtx(mut queue)) = queue else {
+    // In a group the group picks what plays, and the player ignores the
+    // video queue, so nothing offers to fill it (V853).
+    let Some(mut queue) = queue.filter(|_| !(kind.video() && in_group)) else {
         return rsx! {};
     };
+    // A row's buttons answer `a` and `A` only from that row: with the focus
+    // elsewhere on a show's page, they would queue its first episode.
+    let row_only = kind == QueueTarget::EpisodeRow;
     let put = move |place: Place| {
         let (tracks, name) = (tracks.clone(), name.clone());
         spawn(async move {
@@ -2142,11 +2178,19 @@ pub fn QueueButtons(
             let place_label = place.label();
             match found {
                 Ok(items) => {
-                    let songs: Vec<Track> = items
-                        .iter()
-                        .filter(|i| i.kind == ItemKind::Audio)
-                        .map(Track::from)
-                        .collect();
+                    let songs: Vec<Track> = if kind.video() {
+                        items
+                            .iter()
+                            .filter(|i| video_kind(i.kind))
+                            .map(Track::video)
+                            .collect()
+                    } else {
+                        items
+                            .iter()
+                            .filter(|i| i.kind == ItemKind::Audio)
+                            .map(Track::from)
+                            .collect()
+                    };
                     let count = songs.len();
                     platform::info(&added_line(place_label, target, count));
                     match place {
@@ -2154,7 +2198,7 @@ pub fn QueueButtons(
                         Place::End => queue.write().add(songs),
                     }
                     note.set(Some(match (place, count) {
-                        (_, 0) => format!("{name} has no songs to queue."),
+                        (_, 0) => kind.nothing(&name),
                         (Place::Next, _) => format!("{name} plays next."),
                         (Place::End, _) => format!("{name} added to the queue."),
                     }));
@@ -2175,7 +2219,7 @@ pub fn QueueButtons(
         });
     };
     let put_end = put.clone();
-    let labelled = kind == QueueTarget::AlbumPage;
+    let labelled = matches!(kind, QueueTarget::AlbumPage | QueueTarget::VideoPage);
     rsx! {
         div { class: "pharos-queue-buttons", "data-target": kind.label(),
             button {
@@ -2183,6 +2227,7 @@ pub fn QueueButtons(
                 r#type: "button",
                 title: "{next_label}",
                 "data-key-action": "queue-next",
+                "data-key-row-only": row_only.then_some("true"),
                 aria_label: "{next_label}",
                 onclick: move |evt: MouseEvent| {
                     evt.stop_propagation();
@@ -2197,6 +2242,7 @@ pub fn QueueButtons(
                 r#type: "button",
                 title: "{end_label}",
                 "data-key-action": "queue-end",
+                "data-key-row-only": row_only.then_some("true"),
                 aria_label: "{end_label}",
                 onclick: move |evt: MouseEvent| {
                     evt.stop_propagation();
