@@ -4082,6 +4082,13 @@ fn parse_episode_from_name(name: &str) -> Option<(Option<u32>, u32)> {
                 if next.is_ascii_digit() || matches!(next, b'i' | b'I' | b'p' | b'P') {
                     continue;
                 }
+                // A half-numbered recap (`SAO II - 14.5`) is not episode 14.
+                let half = name.as_bytes().get(e_match.end() + 1..e_match.end() + 3);
+                if next == b'.'
+                    && half.is_some_and(|h| h[0].is_ascii_digit() && !h[1].is_ascii_alphanumeric())
+                {
+                    continue;
+                }
             }
             let Ok(episode) = e_match.as_str().parse::<u32>() else {
                 continue;
@@ -7710,6 +7717,22 @@ mod tests {
         for (name, want) in cases {
             assert_eq!(parse_episode_from_name(name), Some(want), "{name}");
         }
+    }
+
+    /// B1008 / V967 — a half-numbered recap (`- 14.5`) is no episode 14, or
+    /// it folds in as a copy of 14; a release tag after `S01E03.` stays read.
+    #[test]
+    fn a_half_numbered_recap_is_not_its_whole_episode() {
+        assert_eq!(parse_episode_from_name("SAO II - 14.5 L@mBerT.mp4"), None);
+        assert_eq!(parse_episode_from_name("Show - 07.5.mkv"), None);
+        assert_eq!(
+            parse_episode_from_name("SAO II - 14 L@mBerT.mp4"),
+            Some((None, 14))
+        );
+        assert_eq!(
+            parse_episode_from_name("Person.of.Interest.S01E03.720p.HDTV.mkv"),
+            Some((Some(1), 3))
+        );
     }
 
     #[test]
