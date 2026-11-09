@@ -2,6 +2,7 @@
 //! the size cap on weak devices, when a position is saved, what each key
 //! does and how progress reads. No I/O; `reader_web.rs` draws it.
 
+use pharos_client::api::{Book, BookFormat, ItemRef, ReadPosition};
 use quire::{Locator, TocEntry};
 use serde::{Deserialize, Serialize};
 
@@ -277,7 +278,8 @@ pub fn percent(fraction: f64) -> u32 {
     if !fraction.is_finite() {
         return 0;
     }
-    (fraction.clamp(0.0, 1.0) * 100.0).floor() as u32
+    // The nudge keeps 0.42 stored as an f32 (0.41999998) from reading 41.
+    (fraction.clamp(0.0, 1.0) * 100.0 + 1e-4).floor() as u32
 }
 
 /// The progress line's text, such as `42%`.
@@ -304,6 +306,35 @@ pub fn saved_fraction(progress: f64, at_end: bool) -> f32 {
 /// Progress short of the last page stays under the finished mark, so only
 /// reaching the end marks a book read.
 const FINISHED_BELOW: f64 = FINISHED - 0.001;
+
+/// Where a book's bytes are, for the reader and for the Download link.
+pub fn download_href(id: ItemRef) -> String {
+    format!("/Items/{id}/Download")
+}
+
+/// What a book's title page offers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BookAction {
+    /// A Read button with this label.
+    Read(String),
+    /// No Read button, and this line says why (V353).
+    Closed(&'static str),
+}
+
+pub fn book_action(book: &Book, position: Option<&ReadPosition>) -> BookAction {
+    match book.format {
+        BookFormat::Epub => BookAction::Read(
+            position
+                .and_then(|p| continue_label(p.fraction))
+                .unwrap_or_else(|| "Read".to_owned()),
+        ),
+        BookFormat::Unreadable => {
+            BookAction::Closed("This book is locked to a Kindle device and cannot be opened here.")
+        }
+        BookFormat::Pdf => BookAction::Closed("PDF reading is coming."),
+        BookFormat::Comic => BookAction::Closed("Comic reading is coming."),
+    }
+}
 
 /// The saved locator, if it is one this reader wrote.
 pub fn saved_locator(text: &str) -> Option<Locator> {
@@ -509,6 +540,45 @@ mod tests {
         assert!((saved_fraction(0.5, false) - 0.5).abs() < f32::EPSILON);
         assert!((saved_fraction(0.1, true) - 1.0).abs() < f32::EPSILON);
         assert!((saved_fraction(f64::NAN, false)).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn the_title_page_offers_what_the_format_allows() {
+        let book = |format| Book {
+            format,
+            author: String::new(),
+            page_count: 0,
+        };
+        let at = |fraction| ReadPosition {
+            locator: "epub1:1:0".into(),
+            fraction,
+        };
+        assert_eq!(
+            book_action(&book(BookFormat::Epub), None),
+            BookAction::Read("Read".into())
+        );
+        assert_eq!(
+            book_action(&book(BookFormat::Epub), Some(&at(0.0))),
+            BookAction::Read("Read".into())
+        );
+        assert_eq!(
+            book_action(&book(BookFormat::Epub), Some(&at(0.5))),
+            BookAction::Read("Continue reading · 50%".into())
+        );
+        for format in [BookFormat::Unreadable, BookFormat::Pdf, BookFormat::Comic] {
+            assert!(
+                matches!(
+                    book_action(&book(format), Some(&at(0.5))),
+                    BookAction::Closed(_)
+                ),
+                "{format:?}"
+            );
+        }
+        assert!(matches!(
+            book_action(&book(BookFormat::Unreadable), None),
+            BookAction::Closed(line) if line.contains("Kindle")
+        ));
+        assert_eq!(download_href(ItemRef::Real(9)), "/Items/9/Download");
     }
 
     #[test]
