@@ -64,6 +64,36 @@ pub enum AdminAction {
     SelectTab(AdminTab),
     /// The status line's Dismiss.
     DismissStatus,
+    /// Replace one device's audio direct-play deny list (T130).
+    SetDeviceAudioDeny {
+        device_id: String,
+        codecs: Vec<String>,
+    },
+}
+
+/// The bitstream audio formats a device can be told not to direct-play,
+/// as (codec, label). These are the ones a TV or receiver claims and then
+/// mis-decodes; other codecs already in a device's list are kept.
+pub const DENIABLE_AUDIO_CODECS: [(&str, &str); 4] = [
+    ("ac3", "Dolby Digital"),
+    ("eac3", "Dolby Digital Plus"),
+    ("truehd", "Dolby TrueHD"),
+    ("dts", "DTS"),
+];
+
+/// `current` with `codec` added or taken out, sorted so the same set always
+/// saves the same.
+pub fn toggled_codecs(current: &[String], codec: &str) -> Vec<String> {
+    let mut next: Vec<String> = current
+        .iter()
+        .filter(|c| !c.eq_ignore_ascii_case(codec))
+        .cloned()
+        .collect();
+    if next.len() == current.len() {
+        next.push(codec.to_owned());
+    }
+    next.sort();
+    next
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -317,7 +347,7 @@ pub fn AdminView(props: AdminViewProps) -> Element {
                             }
                         },
                         AdminTab::Libraries => rsx! { LibrariesPane { libraries: props.libraries.clone() } },
-                        AdminTab::Devices => rsx! { DevicesPane { devices: props.devices.clone() } },
+                        AdminTab::Devices => rsx! { DevicesPane { devices: props.devices.clone(), on_action } },
                         AdminTab::Activity => rsx! { ActivityPane { entries: props.activity.clone() } },
                         AdminTab::ScheduledTasks => rsx! { TasksPane { tasks: props.scheduled_tasks.clone() } },
                         AdminTab::Duplicates => rsx! {
@@ -693,11 +723,15 @@ fn LibrariesPane(libraries: Vec<LibraryFolder>) -> Element {
 }
 
 #[component]
-fn DevicesPane(devices: Vec<DeviceEntry>) -> Element {
+fn DevicesPane(devices: Vec<DeviceEntry>, on_action: EventHandler<AdminAction>) -> Element {
     rsx! {
         if devices.is_empty() {
             p { class: "pharos-empty", "No devices have connected" }
         } else {
+            p { class: "pharos-manage-hint",
+                "If a device plays a sound format out of sync or not at all, turn it off here. "
+                "Pharos then converts that format for the device instead of sending it as it is."
+            }
             div { class: "pharos-manage-table-wrap",
                 table { class: "pharos-manage-table pharos-admin-device-table",
                     thead {
@@ -705,6 +739,7 @@ fn DevicesPane(devices: Vec<DeviceEntry>) -> Element {
                             th { scope: "col", "Device" }
                             th { scope: "col", "App" }
                             th { scope: "col", "Last user" }
+                            th { scope: "col", "Converted sound" }
                         }
                     }
                     tbody {
@@ -713,6 +748,38 @@ fn DevicesPane(devices: Vec<DeviceEntry>) -> Element {
                                 td { class: "pharos-manage-strong", "{d.name}" }
                                 td { "{d.app_name}" }
                                 td { "{d.last_user_name}" }
+                                td {
+                                    div {
+                                        class: "pharos-manage-badges pharos-admin-device-audio",
+                                        role: "group",
+                                        aria_label: "Sound formats converted for {d.name}",
+                                        for (codec, label) in DENIABLE_AUDIO_CODECS {
+                                            {
+                                                let denied = d
+                                                    .no_direct_play_audio_codecs
+                                                    .iter()
+                                                    .any(|c| c.eq_ignore_ascii_case(codec));
+                                                let device_id = d.id.clone();
+                                                let current = d.no_direct_play_audio_codecs.clone();
+                                                rsx! {
+                                                    button {
+                                                        key: "{codec}",
+                                                        r#type: "button",
+                                                        class: "pharos-manage-badge pharos-admin-device-codec",
+                                                        "aria-pressed": "{denied}",
+                                                        onclick: move |_| {
+                                                            on_action.call(AdminAction::SetDeviceAudioDeny {
+                                                                device_id: device_id.clone(),
+                                                                codecs: toggled_codecs(&current, codec),
+                                                            })
+                                                        },
+                                                        "{label}"
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -1999,6 +2066,55 @@ mod tests {
             assert!(!tab.lede().is_empty(), "{tab:?}");
             assert!(!tab.icon().is_empty(), "{tab:?}");
         }
+    }
+
+    #[test]
+    fn toggling_a_codec_adds_or_removes_it_and_keeps_the_rest() {
+        let own = |v: &[&str]| v.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+        assert_eq!(toggled_codecs(&[], "eac3"), own(&["eac3"]));
+        assert_eq!(
+            toggled_codecs(&own(&["opus", "eac3"]), "EAC3"),
+            own(&["opus"])
+        );
+        assert_eq!(
+            toggled_codecs(&own(&["opus"]), "ac3"),
+            own(&["ac3", "opus"])
+        );
+    }
+
+    #[test]
+    fn a_device_row_shows_which_sound_formats_are_converted() {
+        let mut dom = VirtualDom::new(|| {
+            rsx! {
+                AdminView {
+                    users: Vec::new(),
+                    current_user_id: String::new(),
+                    status: None,
+                    on_action: |_| {},
+                    active_tab: AdminTab::Devices,
+                    devices: vec![DeviceEntry {
+                        id: "tv".into(),
+                        name: "Living room TV".into(),
+                        no_direct_play_audio_codecs: vec!["eac3".into()],
+                        ..Default::default()
+                    }],
+                }
+            }
+        });
+        dom.rebuild_in_place();
+        let html = dioxus_ssr::render(&dom);
+        assert!(
+            html.contains("Sound formats converted for Living room TV"),
+            "{html}"
+        );
+        let pressed = |label: &str| {
+            html.split("<button")
+                .find(|b| b.contains(&format!(">{label}</button>")))
+                .map(|b| b.contains(r#"aria-pressed="true""#))
+        };
+        assert_eq!(pressed("Dolby Digital Plus"), Some(true), "{html}");
+        assert_eq!(pressed("Dolby Digital"), Some(false), "{html}");
+        assert_eq!(pressed("DTS"), Some(false), "{html}");
     }
 
     /// The page on `tab`, `loading` or not, as HTML.

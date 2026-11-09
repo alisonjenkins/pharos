@@ -808,6 +808,12 @@ pub fn AdminPane(
                     .and_then(|r| r.as_ref().ok())
                     .and_then(|keys| keys.iter().find(|k| k.id == *key_id))
                     .map_or_else(|| key_id.clone(), |k| k.app_name.clone()),
+                AdminAction::SetDeviceAudioDeny { device_id, .. } => devices_resource
+                    .peek()
+                    .as_ref()
+                    .and_then(|r| r.as_ref().ok())
+                    .and_then(|devices| devices.iter().find(|d| d.id == *device_id))
+                    .map_or_else(|| device_id.clone(), |d| d.name.clone()),
                 _ => String::new(),
             };
             if let AdminAction::DeepSearch { term } = action {
@@ -925,6 +931,15 @@ pub fn AdminPane(
                         match request_deep_check(&base, &token, &media_id).await {
                             Ok(()) => deep_queued_signal.write().push(media_id),
                             Err(e) => deep_errors_signal.write().push((media_id, e)),
+                        }
+                    }
+                    AdminAction::SetDeviceAudioDeny { device_id, codecs } => {
+                        match set_device_audio_deny(&base, &token, &device_id, &codecs).await {
+                            Ok(()) => status_signal
+                                .set(Some(format!("Saved the sound formats for {subject}."))),
+                            Err(e) => status_signal.set(Some(format!(
+                                "Couldn't save the sound formats for {subject}: {e}"
+                            ))),
                         }
                     }
                     AdminAction::SaveBranding(cfg) => {
@@ -2213,6 +2228,28 @@ async fn create_api_key(base: &str, token: &str, app_name: &str) -> Result<Strin
 #[cfg(not(feature = "web"))]
 async fn create_api_key(_base: &str, _token: &str, _app_name: &str) -> Result<String, String> {
     Err("create_api_key is only wired in the web build".into())
+}
+
+#[cfg(feature = "web")]
+async fn set_device_audio_deny(
+    base: &str,
+    token: &str,
+    device_id: &str,
+    codecs: &[String],
+) -> Result<(), String> {
+    crate::client::web::set_device_audio_deny(base, token, device_id, codecs)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(not(feature = "web"))]
+async fn set_device_audio_deny(
+    _base: &str,
+    _token: &str,
+    _device_id: &str,
+    _codecs: &[String],
+) -> Result<(), String> {
+    Err("set_device_audio_deny is only wired in the web build".into())
 }
 
 #[cfg(feature = "web")]
