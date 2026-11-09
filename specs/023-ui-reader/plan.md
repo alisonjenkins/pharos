@@ -137,9 +137,11 @@ Changes to slice 2 against the shape above:
   logs the item id and the reason. The UI logs open time, section parse
   failures and the book's size with the item id and format.
 
-Weak devices (TV, Quest, phones): how a book larger than memory comfortably
-holds is opened is put to Alison (whole book with a size cap, or chapter by
-chapter from the server); recorded here once decided.
+Weak devices (TV, Quest, phones): the whole book is fetched, and a book over
+64 MiB is refused there with the download offered; desktop has no cap
+("1 please", Alison, 2026-11-09, choosing this over loading chapter by
+chapter from the server). Wasm memory never shrinks once grown, and the
+library's largest EPUB is 214 MB.
 
 ## Testing
 
