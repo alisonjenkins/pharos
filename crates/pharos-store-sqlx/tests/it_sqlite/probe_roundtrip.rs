@@ -156,6 +156,7 @@ fn arb_probe() -> impl Strategy<Value = MediaProbe> {
                 video_3d_format,
                 // Not written by `put`; the sweep owns it (V385).
                 audio_analysis: None,
+                picture_check: None,
             },
         )
 }

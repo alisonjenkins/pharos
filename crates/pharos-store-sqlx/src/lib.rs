@@ -18,6 +18,10 @@ mod put_batch;
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
 mod audio_analysis_row;
 
+// The picture check columns, same shape.
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+mod picture_check_row;
+
 #[cfg(feature = "sqlite")]
 mod auth_sqlite;
 
