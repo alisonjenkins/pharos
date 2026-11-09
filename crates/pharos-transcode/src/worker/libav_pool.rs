@@ -126,6 +126,11 @@ fn idle_timeout_from(raw: Option<&str>) -> Option<Duration> {
     }
 }
 
+/// Subtitle-signal windows sent per op. A window is 16 bytes on the wire and
+/// a line's reply ~24, so 16 384 of them keep both frames under ~400 KiB,
+/// well inside `MAX_FRAME`; a longer track runs one pass per chunk (B914).
+pub const SIGNALS_WINDOWS_PER_OP: usize = 16_384;
+
 /// Count an op whose request or reply did not fit in one frame, as
 /// `pharos_libav_frame_too_large_total{direction,op}` (B914).
 fn record_too_large(direction: &'static str, op: &'static str, detail: &str) {
@@ -493,17 +498,81 @@ impl LibavWorkerPool {
         audio_stream: Option<u32>,
         windows: Vec<(u64, u64)>,
     ) -> Result<crate::subtitle_signals::SubtitleSignals, PoolError> {
-        let ev = self
-            .run(TinyOp::SubtitleSignals {
-                input: input.into(),
-                audio_stream,
-                windows,
-            })
-            .await?;
-        match ev {
-            WorkerEvent::SubtitleSignalsResult { signals, .. } => Ok(signals),
-            other => Err(unexpected(other)),
+        let input = input.into();
+        // Typeset-heavy tracks repeat spans; analyse each distinct one once.
+        let mut unique = windows.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        let chunks = unique.len().div_ceil(SIGNALS_WINDOWS_PER_OP);
+        if chunks > 1 {
+            tracing::info!(
+                lines = windows.len(),
+                unique = unique.len(),
+                chunks,
+                per_op = SIGNALS_WINDOWS_PER_OP,
+                "subtitle signals: windows split across passes to fit the frame"
+            );
         }
+        let mut merged: Option<crate::subtitle_signals::SubtitleSignals> = None;
+        let mut by_window: Vec<crate::subtitle_signals::LineSignals> =
+            Vec::with_capacity(unique.len());
+        for chunk in unique.chunks(SIGNALS_WINDOWS_PER_OP) {
+            let ev = self
+                .run(TinyOp::SubtitleSignals {
+                    input: input.clone(),
+                    audio_stream,
+                    windows: chunk.to_vec(),
+                })
+                .await?;
+            let mut sig = match ev {
+                WorkerEvent::SubtitleSignalsResult { signals, .. } => signals,
+                other => return Err(unexpected(other)),
+            };
+            if sig.lines.len() != chunk.len() {
+                return Err(PoolError::Dead(format!(
+                    "subtitle signals: {} lines for {} windows",
+                    sig.lines.len(),
+                    chunk.len()
+                )));
+            }
+            by_window.append(&mut sig.lines);
+            merged = Some(match merged {
+                None => sig,
+                Some(mut m) => {
+                    m.analysed_seconds = m.analysed_seconds.max(sig.analysed_seconds);
+                    m.read_errors = m.read_errors.max(sig.read_errors);
+                    m
+                }
+            });
+        }
+        let mut out = match merged {
+            Some(m) => m,
+            // No windows at all: one pass still reports keyframes and cuts.
+            None => {
+                let ev = self
+                    .run(TinyOp::SubtitleSignals {
+                        input,
+                        audio_stream,
+                        windows: Vec::new(),
+                    })
+                    .await?;
+                return match ev {
+                    WorkerEvent::SubtitleSignalsResult { signals, .. } => Ok(signals),
+                    other => Err(unexpected(other)),
+                };
+            }
+        };
+        out.lines = windows
+            .iter()
+            .map(|w| {
+                unique
+                    .binary_search(w)
+                    .ok()
+                    .and_then(|i| by_window.get(i).copied())
+                    .unwrap_or(crate::subtitle_signals::LineSignals::NONE)
+            })
+            .collect();
+        Ok(out)
     }
 
     /// Subtitle event windows — merged `(start_ms, end_ms)` intervals of

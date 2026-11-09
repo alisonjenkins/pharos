@@ -193,6 +193,61 @@ fn counter(
         .sum()
 }
 
+/// B914/V875: a track with more lines than one frame holds (79k on a live
+/// One Piece episode) is analysed in chunks, each line keeps its own
+/// signals, and the worker survives.
+#[tokio::test]
+async fn a_track_too_long_for_one_frame_is_analysed_in_chunks() {
+    if !ffmpeg_available() {
+        eprintln!("skipping: ffmpeg not on PATH");
+        return;
+    }
+    let recorder = metrics_util::debugging::DebuggingRecorder::new();
+    let snap = pharos_test_metrics::snapshotter(&recorder);
+    let _guard = metrics::set_default_local_recorder(&recorder);
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("fixture.mkv");
+    fixture(&input);
+    let bin = PathBuf::from(env!("CARGO_BIN_EXE_transcode-worker"));
+    let pool = LibavWorkerPool::new(bin, 1).with_op_timeout(Duration::from_secs(120));
+
+    let alone = pool
+        .subtitle_signals(input.clone(), None, LINES.to_vec())
+        .await
+        .expect("two lines");
+    // 70k distinct spans (more than one frame holds even deduplicated), each
+    // twice, after the two reference lines.
+    let distinct: Vec<(u64, u64)> = (0..70_000u64)
+        .map(|i| {
+            let start = i % 10_000;
+            (start, start + 100 + (i / 10_000) * 500)
+        })
+        .collect();
+    let mut windows = LINES.to_vec();
+    windows.extend(&distinct);
+    windows.extend(&distinct);
+    assert!(distinct.len() * 16 > pharos_transcode::protocol::MAX_FRAME as usize);
+
+    let s = pool
+        .subtitle_signals(input, None, windows.clone())
+        .await
+        .expect("long track");
+    assert_eq!(s.lines.len(), windows.len());
+    assert_eq!(&s.lines[..2], &alone.lines[..]);
+    assert_eq!(s.lines[2], s.lines[2 + distinct.len()]);
+    assert_eq!(s.cuts_ms, alone.cuts_ms);
+    assert_eq!(pool.idle_workers().await, 1);
+    assert_eq!(
+        counter(
+            &snap,
+            "pharos_libav_worker_lifecycle_total",
+            &[("reason", "broken")]
+        ),
+        0
+    );
+    assert_eq!(counter(&snap, "pharos_libav_frame_too_large_total", &[]), 0);
+}
+
 /// B914: a request that cannot fit in a frame fails the op, is counted with
 /// its op, and leaves the worker idle for the next op instead of killing it.
 #[tokio::test]
