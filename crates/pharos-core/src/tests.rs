@@ -1003,3 +1003,217 @@ fn sort_name_clamps_runs_longer_than_the_pad_width() {
 fn sort_name_folds_unicode_case_like_title_fold() {
     assert_eq!(sort_name("Émile"), "Émile".to_lowercase());
 }
+
+/// Spec 033 B930: two shows carry the name and no year separates them, so the
+/// provider's order picks one. The decision must say so, or the bug stays
+/// invisible.
+#[test]
+fn match_decide_names_a_provider_order_tie_as_ambiguous() {
+    let cands = vec![
+        cand("71173", "Battlestar Galactica", Some(1978), &[]),
+        cand("73545", "Battlestar Galactica", Some(2003), &[]),
+    ];
+    let d = match_decide("Battlestar Galactica", None, &cands, 0.7);
+    assert_eq!(d.chosen.as_ref().map(|c| c.id.as_str()), Some("71173"));
+    assert_eq!(d.runner_up.as_ref().map(|c| c.id.as_str()), Some("73545"));
+    assert_eq!(d.decided_by, Some(MatchDecidedBy::ProviderOrder));
+    assert!(d.ambiguous);
+    assert_eq!(d.margin(), Some(0.0));
+}
+
+#[test]
+fn match_decide_a_year_that_separates_two_names_is_not_ambiguous() {
+    let cands = vec![
+        cand("71173", "Battlestar Galactica", Some(1978), &[]),
+        cand("73545", "Battlestar Galactica", Some(2003), &[]),
+    ];
+    // A floor low enough that the 1978 show's far-off year still clears it.
+    let d = match_decide("Battlestar Galactica", Some(2003), &cands, 0.5);
+    assert_eq!(d.chosen.as_ref().map(|c| c.id.as_str()), Some("73545"));
+    assert_eq!(d.decided_by, Some(MatchDecidedBy::Year));
+    assert!(!d.ambiguous, "margin {:?}", d.margin());
+}
+
+#[test]
+fn match_decide_says_why_for_each_rule() {
+    let sole = [cand("1", "Buffy", Some(1997), &[])];
+    assert_eq!(
+        match_decide("Buffy", None, &sole, 0.7).decided_by,
+        Some(MatchDecidedBy::SoleCandidate)
+    );
+    let name = [
+        cand("374456", "Dragon Ball R&R", Some(2018), &[]),
+        cand("76666", "ドラゴンボール", Some(1986), &["Dragon Ball"]),
+    ];
+    let d = match_decide("Dragon Ball", None, &name, 0.7);
+    assert_eq!(d.decided_by, Some(MatchDecidedBy::Name));
+    assert!(!d.ambiguous, "an exact name over a prefix match is decided");
+    let abridged = [
+        cand("fan", "Dragon Ball Z Abridged", Some(1990), &[]),
+        cand("real", "ドラゴンボールZ", Some(1989), &["Dragon Ball Z"]),
+    ];
+    let d = match_decide("Dragon Ball Z", Some(1990), &abridged, 0.7);
+    assert_eq!(d.decided_by, Some(MatchDecidedBy::Name));
+    assert!(d.margin().is_some_and(|m| m < 0.0), "{:?}", d.margin());
+    let franchise = [
+        cand("443905", "x", Some(2024), &["Code Geass: Dakkan no Z"]),
+        cand(
+            "79525",
+            "y",
+            Some(2006),
+            &["Code Geass: Lelouch of the Rebellion"],
+        ),
+    ];
+    let d = match_decide("Code Geass", None, &franchise, 0.7);
+    assert_eq!(d.chosen.map(|c| c.id), Some("79525".into()));
+    assert_eq!(d.decided_by, Some(MatchDecidedBy::EarliestPremiere));
+    let none = [cand("9", "Completely Different", None, &[])];
+    let d = match_decide("The Thing", None, &none, 0.7);
+    assert_eq!((d.chosen, d.decided_by, d.ambiguous), (None, None, false));
+    assert_eq!(
+        d.candidates.len(),
+        1,
+        "a rejected candidate is still listed"
+    );
+}
+
+#[test]
+fn match_decided_by_labels_are_stable_and_distinct() {
+    use std::collections::BTreeSet;
+    let all = [
+        MatchDecidedBy::SoleCandidate,
+        MatchDecidedBy::Name,
+        MatchDecidedBy::Year,
+        MatchDecidedBy::EarliestPremiere,
+        MatchDecidedBy::ProviderOrder,
+        MatchDecidedBy::EpisodeFit,
+        MatchDecidedBy::NfoVote,
+    ];
+    let labels: BTreeSet<&str> = all.iter().map(|d| d.label()).collect();
+    assert_eq!(labels.len(), all.len());
+    assert_eq!(MatchDecidedBy::ProviderOrder.label(), "provider_order");
+    assert_eq!(MatchDecidedBy::EpisodeFit.label(), "episode_fit");
+}
+
+/// `match_best` before spec 033 split out [`match_decide`], kept verbatim so
+/// the split is shown to change no answer.
+fn match_best_before_033(
+    query_title: &str,
+    query_year: Option<u32>,
+    candidates: &[SearchCandidate],
+    min_confidence: f32,
+) -> Option<MatchOutcome> {
+    let query = normalize_title(query_title);
+    let mut best: Option<(Option<usize>, f32, &SearchCandidate)> = None;
+    let mut inexact: Vec<(f32, &SearchCandidate)> = Vec::new();
+    for c in candidates {
+        let names = || std::iter::once(&c.title).chain(&c.aliases);
+        let exact_at = names().position(|n| normalize_title(n) == query);
+        let similarity = names()
+            .map(|n| title_similarity(query_title, n))
+            .fold(0.0_f32, f32::max);
+        let score = similarity * year_factor(query_year, c.year);
+        if score < min_confidence {
+            continue;
+        }
+        let beats = match &best {
+            None => true,
+            Some((best_at, best_score, _)) => match (exact_at, best_at) {
+                (Some(_), None) => true,
+                (None, Some(_)) => false,
+                (Some(at), Some(best_at)) if at != *best_at => at < *best_at,
+                _ => score > *best_score,
+            },
+        };
+        if beats {
+            best = Some((exact_at, score, c));
+        }
+        if exact_at.is_none() {
+            inexact.push((score, c));
+        }
+    }
+    if let Some((None, top, _)) = best {
+        best = inexact
+            .into_iter()
+            .filter(|(score, _)| *score >= top - PREFIX_NEAR_TIE)
+            .min_by_key(|(_, c)| c.year.unwrap_or(u32::MAX))
+            .map(|(score, c)| (None, score, c));
+    }
+    best.map(|(_, confidence, c)| MatchOutcome {
+        id: c.id.clone(),
+        confidence,
+    })
+}
+
+#[test]
+fn match_best_answers_as_it_did_before_the_decision_was_split_out() {
+    let names = [
+        "Battlestar Galactica",
+        "Battlestar Galactica (2003)",
+        "Galactica",
+        "The Flash",
+        "Flash",
+        "Code Geass",
+        "Code Geass: Lelouch",
+        "Dragon Ball",
+        "Doctor Who",
+        "One Piece",
+        "Cosmos",
+    ];
+    let years = [
+        None,
+        Some(1978),
+        Some(1979),
+        Some(2003),
+        Some(2004),
+        Some(2014),
+    ];
+    let pool = [
+        cand("a", "Battlestar Galactica", Some(1978), &[]),
+        cand("b", "Battlestar Galactica", Some(2003), &["Galactica"]),
+        cand("c", "Battlestar Galactica (2003)", Some(2004), &[]),
+        cand("d", "The Flash", Some(1990), &[]),
+        cand("e", "The Flash", Some(2014), &["Flash"]),
+        cand(
+            "f",
+            "コードギアス",
+            Some(2006),
+            &["Code Geass: Lelouch of the Rebellion"],
+        ),
+        cand(
+            "g",
+            "コードギアス 奪還",
+            Some(2024),
+            &["Code Geass: Dakkan no Z"],
+        ),
+        cand("h", "Dragon Ball R&R", Some(2018), &[]),
+        cand("i", "ドラゴンボール", Some(1986), &["Dragon Ball"]),
+        cand("j", "Doctor Who", Some(1963), &[]),
+        cand("k", "Doctor Who (2005)", Some(2005), &[]),
+        cand("l", "ONE PIECE (2023)", Some(2023), &["One Piece"]),
+        cand("m", "ワンピース", Some(1999), &["One Piece"]),
+        cand("n", "Cosmos", None, &[]),
+        cand("o", "Cosmos: A Spacetime Odyssey", Some(2014), &["Cosmos"]),
+    ];
+    let mut checked = 0;
+    for name in names {
+        for year in years {
+            for start in 0..pool.len() {
+                for len in 1..=4 {
+                    let Some(slice) = pool.get(start..(start + len).min(pool.len())) else {
+                        continue;
+                    };
+                    for floor in [0.5, 0.7, 0.9] {
+                        assert_eq!(
+                            match_best(name, year, slice, floor),
+                            match_best_before_033(name, year, slice, floor),
+                            "{name} {year:?} {slice:?} {floor}"
+                        );
+                        checked += 1;
+                    }
+                }
+            }
+        }
+    }
+    assert!(checked > 1000);
+}
