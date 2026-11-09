@@ -6200,16 +6200,21 @@ pub(crate) async fn virtual_shows_page(
     let descending = first_sort_order_descending(q.sort_order.as_deref());
 
     // `Filters=IsPlayed` / `IsUnplayed` on series tiles: a series is played
-    // once every episode in it is. The episode query above is unpaged, so
-    // its user-data filter was left out and is applied here per series.
-    let want_played = q
+    // once every episode in it is. `IsFavorite` / `IsNotFavorite` the same
+    // way: marking a show a favourite marks every episode (B1081), so a show
+    // is a favourite while every episode it has is. The episode query above
+    // is unpaged, so its user-data filter was left out and is applied here
+    // per series, from one bulk read.
+    let wanted = q
         .filters
         .as_deref()
         .map(UserDataFilter::parse)
-        .and_then(|f| f.is_played)
         .filter(|_| matches!(mode, ShowFolderKind::Series));
+    let want_played = wanted.and_then(|f| f.is_played);
+    let want_favorite = wanted.and_then(|f| f.is_favorite);
     let mut unplayed_series: HashSet<String> = HashSet::new();
-    if want_played.is_some() {
+    let mut unfavoured_series: HashSet<String> = HashSet::new();
+    if want_played.is_some() || want_favorite.is_some() {
         let ids: Vec<u64> = episodes.iter().map(|e| e.id).collect();
         let user_data = state
             .stores
@@ -6217,11 +6222,15 @@ pub(crate) async fn virtual_shows_page(
             .await
             .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
         for (ep, ud) in episodes.iter().zip(user_data) {
-            if let (Some(series), false) = (ep.series.as_ref(), ud.played) {
-                unplayed_series.insert(series_id_for_key(
-                    series.identity_folder(),
-                    &series.series_name,
-                ));
+            let Some(series) = ep.series.as_ref() else {
+                continue;
+            };
+            let key = || series_id_for_key(series.identity_folder(), &series.series_name);
+            if !ud.played {
+                unplayed_series.insert(key());
+            }
+            if !ud.is_favorite {
+                unfavoured_series.insert(key());
             }
         }
     }
@@ -6280,6 +6289,9 @@ pub(crate) async fn virtual_shows_page(
                 }
                 let skey = series_id_for_key(series.identity_folder(), &series.series_name);
                 if want_played.is_some_and(|want| want == unplayed_series.contains(&skey)) {
+                    continue;
+                }
+                if want_favorite.is_some_and(|want| want == unfavoured_series.contains(&skey)) {
                     continue;
                 }
                 let meta = meta_map.get(series.series_key());
