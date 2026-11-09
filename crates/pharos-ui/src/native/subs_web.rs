@@ -107,7 +107,8 @@ impl Core {
         let w = (css_w * ratio).round().max(1.0) as u32;
         let h = (css_h * ratio).round().max(1.0) as u32;
         self.compositor.resize(w, h);
-        let content = content_box(w, h, self.video.video_width(), self.video.video_height());
+        let (pw, ph) = super::platform::picture_size(&self.video);
+        let content = content_box(w, h, pw, ph);
         let visible = CONTROLS_VISIBLE.with(Cell::get);
         let inset_css = if visible {
             let bottom = self.frame_box.get_bounding_client_rect().bottom();
@@ -528,6 +529,8 @@ pub async fn rust_subtitles(
             .ok()
             .map(|o| {
                 o.observe(&frame_box);
+                // A 3D view change resizes the video inside an unchanged frame.
+                o.observe(&video);
                 (o, cb)
             })
     };

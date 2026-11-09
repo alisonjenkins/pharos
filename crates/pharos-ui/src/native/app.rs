@@ -61,6 +61,7 @@ use super::stage::{
     Handoff, QueueButton, QueueDock, Stage, StageAction, StageBar, StageClose, StageCtx, StageGrip,
     View, STAGE_ID,
 };
+use super::stereo::{self, ViewMode};
 use super::subtitles::{track_mode, FallbackReason, RustState, TrackMode};
 use super::together::{
     can_watch_together, group_api, GroupClient as _, GroupError, GroupSummary, Groups,
@@ -557,6 +558,29 @@ fn set_subtitle_size(size: SubtitleSize) -> Result<(), String> {
     platform::relift_cues(VIDEO_ID);
     platform::info(&format!("pharos: subtitle_size set={}", size.as_str()));
     kept
+}
+
+/// How this device shows a packed 3D version (V922: kept on the device
+/// alone); one eye when nothing is kept.
+fn stored_view_mode() -> ViewMode {
+    match platform::stored_theme(stereo::VIEW_MODE_KEY) {
+        Ok(stored) => stored.as_deref().map_or(ViewMode::OneEye, ViewMode::parse),
+        Err(e) => {
+            platform::warn(&format!(
+                "pharos: stereo view storage read failed error={e}"
+            ));
+            ViewMode::OneEye
+        }
+    }
+}
+
+/// Keeps `mode` on this device. It applies for this player even when the
+/// browser refused to keep it.
+fn store_view_mode(mode: ViewMode) {
+    platform::info(&format!("pharos: stereo view set={}", mode.as_str()));
+    if let Err(e) = platform::store_theme(stereo::VIEW_MODE_KEY, mode.as_str()) {
+        platform::warn(&format!("pharos: stereo view not kept error={e}"));
+    }
 }
 
 fn store_subtitle_size(size: SubtitleSize) -> Result<(), String> {
@@ -4445,6 +4469,7 @@ fn Player(
     // Taken at mount: the video this one replaces was paused, or not.
     let start_paused = use_hook(|| was_paused.0.get());
     let mut sub_size = use_signal(stored_subtitle_size);
+    let mut view_mode = use_signal(stored_view_mode);
     let mut failed = use_signal(|| None::<PlayFailure>);
     let saved_volume = use_hook(last_volume);
     let mut media = use_signal(|| MediaState::at_volume(saved_volume.map(|(v, m, _)| (v, m))));
@@ -5426,6 +5451,10 @@ fn Player(
                     }
                     sub_size.set(size);
                 }
+                Control::ViewMode(mode) => {
+                    store_view_mode(mode);
+                    view_mode.set(mode);
+                }
                 Control::Quality(bps) => on_quality_pick.call(Some(bps)),
                 Control::ResetAutoQuality => on_quality_pick.call(None),
                 Control::PictureInPicture => platform::toggle_pip(VIDEO_ID),
@@ -5725,6 +5754,8 @@ fn Player(
         },
         live_position: Some(position),
         subtitle_size: sub_size(),
+        packing: versions::playing_stereo(&p.detail.versions, &p.version),
+        view_mode: view_mode(),
         quality: QualityView {
             manual: manual_cap,
             auto: auto_cap,
