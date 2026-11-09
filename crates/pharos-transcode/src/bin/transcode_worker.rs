@@ -10,6 +10,25 @@
 //! as the worker dying mid-job and retries elsewhere — the server process
 //! is never affected (V6).
 
+#[cfg(target_os = "linux")]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+/// Same build-time jemalloc options as the server: dirty pages go back about
+/// a second after an op ends, muzzy pages at once. `MALLOC_CONF` overrides.
+#[cfg(target_os = "linux")]
+#[unsafe(export_name = "malloc_conf")]
+static MALLOC_CONF: MallocConf =
+    MallocConf(c"background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:0".as_ptr());
+
+#[cfg(target_os = "linux")]
+#[repr(transparent)]
+struct MallocConf(*const std::ffi::c_char);
+
+// SAFETY: the pointer is to a 'static, immutable C string literal.
+#[cfg(target_os = "linux")]
+unsafe impl Sync for MallocConf {}
+
 #[cfg(unix)]
 fn main() {
     let rt = match tokio::runtime::Builder::new_current_thread()
