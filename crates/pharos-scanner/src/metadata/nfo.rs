@@ -136,6 +136,11 @@ impl MetadataProvider for NfoProvider {
             match std::fs::read(&candidate) {
                 Ok(bytes) => {
                     let mut parsed = parse_nfo(&bytes, &candidate)?;
+                    if req.kind == MediaKind::Movie
+                        && identity::names_another_year(req.path, &candidate, &parsed)
+                    {
+                        continue;
+                    }
                     locate_local_art(&mut parsed, &candidate);
                     if show_nfo {
                         drop_episode_fields(&mut parsed);
