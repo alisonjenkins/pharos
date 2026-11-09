@@ -2,7 +2,7 @@
 
 **Feature Branch**: `018-3d-media`
 **Created**: 2026-10-18T00:25:00Z
-**Status**: Ready
+**Status**: Implemented (T133-T145 done, T135 superseded by migration 0058_video_3d; audited 2026-11-09)
 **Scope**: Stereoscopic 3D detection from probe metadata and filename tags across movies and TV episodes, `Video3DFormat` wire exposure on Jellyfin DTOs, SQLite and PostgreSQL schema migration `0057` with `Is3D` filtering, DirectPlay passthrough by default, stereo-preserving and 2D left-eye conversion transcode pipelines (including thumbnail, trickplay, and subtitle burn-in safety), observability signals, and client compatibility verification.
 
 **Note (2026-11-01)**: landed after 3D edition grouping, which already added `media_items.video_3d_format` and `has_3d` in migration `0058_video_3d`. The planned `0057_video_3d_format` migration and its partial index were dropped, `Is3D` follows `has_3d` (primary file or any grouped edition), and the stream-detection re-probe is `PROBE_SCHEMA_VERSION = 8`.
