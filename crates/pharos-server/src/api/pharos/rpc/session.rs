@@ -391,6 +391,104 @@ impl server::session::Handler for Session {
         Ok(())
     }
 
+    /// A short-lived Full token for the web UI's Manage pages (B920, V880,
+    /// ADR-0082), which drive the admin endpoints of the Jellyfin API with a
+    /// header: the browser's session cookie is `HttpOnly`, and no cookie
+    /// authorizes a write (V191). Admins only. Issued as a child of this
+    /// session's token, so ending the session by any path ends it, and it
+    /// lives [`MANAGE_TOKEN_TTL_SECS`] at most.
+    async fn manage_token(
+        self: Rc<Self>,
+        _params: wire::ManageTokenParams,
+        results: &mut wire::ManageTokenResults,
+    ) -> Result<(), capnp::Error> {
+        let user = match self.current_user().await {
+            Ok(user) => user,
+            Err(denial) => {
+                let outcome = match denial {
+                    Denial::Unavailable { .. } => ManageTokenOutcome::StoreUnavailable,
+                    _ => ManageTokenOutcome::Rejected,
+                };
+                outcome.count();
+                tracing::info!(
+                    outcome = outcome.label(),
+                    denial = ?denial,
+                    "native manage token refused"
+                );
+                denial.write(results.get().init_result().init_error());
+                return Ok(());
+            }
+        };
+        if !user.policy.admin {
+            ManageTokenOutcome::NotAdmin.count();
+            tracing::info!(
+                user = %user.name,
+                outcome = ManageTokenOutcome::NotAdmin.label(),
+                "native manage token refused"
+            );
+            Denial::NotPermitted {
+                what: "manage is for admins",
+            }
+            .write(results.get().init_result().init_error());
+            return Ok(());
+        }
+        let parent = TokenId(self.state.stores.token_id(&self.token));
+        let issued = self
+            .state
+            .stores
+            .issue_child_with_ttl(
+                user.id,
+                MANAGE_TOKEN_DEVICE_ID,
+                MANAGE_TOKEN_TTL_SECS,
+                TokenScope::Full,
+                &parent,
+            )
+            .await;
+        let result = results.get().init_result();
+        match issued {
+            Ok(issued) => {
+                ManageTokenOutcome::Ok.count();
+                tracing::info!(
+                    user = %user.name,
+                    outcome = ManageTokenOutcome::Ok.label(),
+                    token_id = %issued.id.0.chars().take(8).collect::<String>(),
+                    ttl_secs = MANAGE_TOKEN_TTL_SECS,
+                    "native manage token issued"
+                );
+                let mut out = result.init_token();
+                out.set_token(issued.secret.0.expose());
+                out.set_expires_at_ms(
+                    u64::try_from(issued.expires_at)
+                        .unwrap_or(0)
+                        .saturating_mul(1000),
+                );
+            }
+            Err(e) => {
+                let outcome = match e {
+                    AuthError::Backend(_) => ManageTokenOutcome::StoreUnavailable,
+                    _ => ManageTokenOutcome::Rejected,
+                };
+                outcome.count();
+                tracing::warn!(
+                    user = %user.name,
+                    outcome = outcome.label(),
+                    error = %e,
+                    "native manage token refused"
+                );
+                match e {
+                    AuthError::InvalidToken => Denial::Revoked {
+                        reason: "session ended",
+                    },
+                    _ => Denial::Unavailable {
+                        dependency: "token store",
+                    },
+                }
+                .write(result.init_error());
+            }
+        }
+        Ok(())
+    }
+
     /// The user's own password (V361): see [`change_own_password`]. This
     /// session's token is kept, so the caller stays signed in here; the
     /// user's other sessions close.
@@ -601,6 +699,58 @@ impl MediaTokenOutcome {
     }
 }
 
+/// The device id every manage token is stored under, like
+/// [`MEDIA_TOKEN_DEVICE_ID`].
+const MANAGE_TOKEN_DEVICE_ID: &str = "pharos-native:manage";
+
+/// Whether `device_id` names a token issued as a child of a session (a media
+/// or manage token) rather than a device: the device list shows the session's
+/// own device, not one row per child (B920).
+pub fn is_child_token_device(device_id: &str) -> bool {
+    matches!(device_id, MEDIA_TOKEN_DEVICE_ID | MANAGE_TOKEN_DEVICE_ID)
+}
+
+/// How long a manage token lives: an hour, and the page asks for another
+/// before it ends. Short, because script on the page can read it.
+pub const MANAGE_TOKEN_TTL_SECS: i64 = 3_600;
+
+/// `pharos_manage_token_issued_total`. A dashboard contract: bounded, stable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ManageTokenOutcome {
+    /// A token was issued.
+    Ok,
+    /// The user is not an admin.
+    NotAdmin,
+    /// The token store could not answer.
+    StoreUnavailable,
+    /// The session was revoked or ended, or the store refused to issue.
+    Rejected,
+}
+
+impl ManageTokenOutcome {
+    #[cfg(test)]
+    pub(crate) const ALL: [ManageTokenOutcome; 4] = [
+        Self::Ok,
+        Self::NotAdmin,
+        Self::StoreUnavailable,
+        Self::Rejected,
+    ];
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::NotAdmin => "not_admin",
+            Self::StoreUnavailable => "store_unavailable",
+            Self::Rejected => "rejected",
+        }
+    }
+
+    fn count(self) {
+        metrics::counter!("pharos_manage_token_issued_total", "outcome" => self.label())
+            .increment(1);
+    }
+}
+
 /// Largest picture `setAvatar` takes. A WebSocket message is at most 1 MiB,
 /// and the web UI scales a photo down before it sends it.
 pub const NATIVE_MAX_AVATAR_BYTES: usize = 768 * 1024;
@@ -681,12 +831,18 @@ fn write_change_password_error(
 
 #[cfg(test)]
 mod tests {
-    use super::MediaTokenOutcome;
+    use super::{ManageTokenOutcome, MediaTokenOutcome};
 
     /// The outcome labels are a dashboard contract: fixed and distinct.
     #[test]
     fn media_token_outcome_labels_are_stable_and_distinct() {
         let labels: Vec<_> = MediaTokenOutcome::ALL.iter().map(|o| o.label()).collect();
         assert_eq!(labels, ["ok", "store_unavailable", "rejected"]);
+    }
+
+    #[test]
+    fn manage_token_outcome_labels_are_stable_and_distinct() {
+        let labels: Vec<_> = ManageTokenOutcome::ALL.iter().map(|o| o.label()).collect();
+        assert_eq!(labels, ["ok", "not_admin", "store_unavailable", "rejected"]);
     }
 }

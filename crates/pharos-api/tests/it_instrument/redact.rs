@@ -23,6 +23,7 @@ const DEVICE_TOKEN: &str = "devtok-0123456789-secret";
 const QC_SECRET: &str = "qc-poll-secret-abcdef";
 const FIELD_SECRET: &str = "clientfield-secret-xyz";
 const MEDIA_TOKEN: &str = "mediatok-9876543210-secret";
+const MANAGE_TOKEN: &str = "managetok-1357924680-secret";
 
 /// Echoes secrets back in its results so both directions are exercised.
 struct Boot;
@@ -34,8 +35,8 @@ struct TelemetryBoot;
 /// Answers `PlaybackGrant.decision` with an error, so the call completes.
 struct GrantBoot;
 
-/// Answers `Session.changePassword` ok and `Session.mediaToken` with a
-/// token, so both calls' payloads are logged.
+/// Answers `Session.changePassword` ok and `Session.mediaToken` and
+/// `Session.manageToken` with a token, so every call's payload is logged.
 struct SessionBoot;
 
 impl server::session::Handler for SessionBoot {
@@ -55,6 +56,17 @@ impl server::session::Handler for SessionBoot {
     ) -> impl Future<Output = Result<(), capnp::Error>> {
         let mut token = results.get().init_result().init_token();
         token.set_token(MEDIA_TOKEN);
+        token.set_expires_at_ms(1);
+        std::future::ready(Ok(()))
+    }
+
+    fn manage_token(
+        self: Rc<Self>,
+        _params: session::ManageTokenParams,
+        results: &mut session::ManageTokenResults,
+    ) -> impl Future<Output = Result<(), capnp::Error>> {
+        let mut token = results.get().init_result().init_token();
+        token.set_token(MANAGE_TOKEN);
         token.set_expires_at_ms(1);
         std::future::ready(Ok(()))
     }
@@ -208,6 +220,10 @@ fn call_all() -> Observed {
             let mut r = sess.media_token_request();
             fill_ctx(r.get().init_ctx());
             r.send().promise.await.unwrap();
+
+            let mut r = sess.manage_token_request();
+            fill_ctx(r.get().init_ctx());
+            r.send().promise.await.unwrap();
         });
     });
     o
@@ -215,7 +231,7 @@ fn call_all() -> Observed {
 
 /// Each method listed here is called by `call_all`. A `$secret` added to
 /// another method fails this until the test calls it too.
-const COVERED: [(&str, &str); 9] = [
+const COVERED: [(&str, &str); 10] = [
     ("bootstrap", "resume"),
     ("bootstrap", "login"),
     ("bootstrap", "quick_connect_initiate"),
@@ -225,6 +241,7 @@ const COVERED: [(&str, &str); 9] = [
     ("playback_grant", "decision"),
     ("session", "change_password"),
     ("session", "media_token"),
+    ("session", "manage_token"),
 ];
 
 #[test]
@@ -244,6 +261,7 @@ fn secrets_never_reach_logs_or_spans() {
         QC_SECRET,
         FIELD_SECRET,
         MEDIA_TOKEN,
+        MANAGE_TOKEN,
     ] {
         assert!(
             !o.logs.contains(secret),
@@ -260,7 +278,7 @@ fn secrets_never_reach_logs_or_spans() {
         .collect();
     assert_eq!(
         payloads.len(),
-        18,
+        20,
         "a request and a response per call:\n{}",
         o.logs
     );
