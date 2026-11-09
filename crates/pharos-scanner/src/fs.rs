@@ -7557,7 +7557,9 @@ mod tests {
             film,
         );
         assert_eq!(
-            film_copy_key(Path::new("/f/Heat.1995.2160p.UHD.BluRay.x265.HDR.DDP5.1.mkv")),
+            film_copy_key(Path::new(
+                "/f/Heat.1995.2160p.UHD.BluRay.x265.HDR.DDP5.1.mkv"
+            )),
             film,
         );
         assert_ne!(
