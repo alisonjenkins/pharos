@@ -2,6 +2,7 @@
 //! subtitle picks, and where a menu pick goes. Pure.
 
 pub use pharos_client::api::Track;
+use pharos_client::api::{TrackChoice as ApiChoice, TrackPicks as ApiPicks};
 pub use pharos_client::group::TrackChoice;
 
 use super::activity::TrackKind;
@@ -162,6 +163,31 @@ impl TrackMap {
                 None => Some(None),
                 Some(i) => self.to_own(TrackKind::Subtitles, i).map(Some),
             }),
+        }
+    }
+}
+
+impl TrackMap {
+    /// A playback's track choices as the primary's streams; a stream the
+    /// primary lacks is left to the server (`Default`).
+    pub fn choices_to_primary(&self, picks: ApiPicks) -> ApiPicks {
+        self.choices(picks, Self::to_primary)
+    }
+
+    /// The primary's track choices as this version's; see
+    /// [`Self::choices_to_primary`].
+    pub fn choices_to_own(&self, picks: ApiPicks) -> ApiPicks {
+        self.choices(picks, Self::to_own)
+    }
+
+    fn choices(&self, picks: ApiPicks, map: fn(&Self, TrackKind, u32) -> Option<u32>) -> ApiPicks {
+        let one = |kind, choice| match choice {
+            ApiChoice::Index(i) => map(self, kind, i).map_or(ApiChoice::Default, ApiChoice::Index),
+            other => other,
+        };
+        ApiPicks {
+            audio: one(TrackKind::Audio, picks.audio),
+            subtitle: one(TrackKind::Subtitles, picks.subtitle),
         }
     }
 }
@@ -443,6 +469,34 @@ mod tests {
         let map = TrackMap::new((&rip, &[]), (&primary, &[]));
         assert_eq!(map.to_own(TrackKind::Audio, 1), Some(2));
         assert_eq!(map.to_primary(TrackKind::Audio, 1), None);
+    }
+
+    /// Spec 034 US3: the viewer's picks survive a version switch.
+    #[test]
+    fn a_playbacks_choices_carry_through_the_primary() {
+        let map = two_versions();
+        let carried = map.choices_to_own(ApiPicks {
+            audio: ApiChoice::Index(2),
+            subtitle: ApiChoice::Index(4),
+        });
+        assert_eq!(
+            carried,
+            ApiPicks {
+                audio: ApiChoice::Index(1),
+                subtitle: ApiChoice::Default,
+            }
+        );
+        let off = ApiPicks {
+            audio: ApiChoice::Index(3),
+            subtitle: ApiChoice::Off,
+        };
+        assert_eq!(
+            map.choices_to_primary(off),
+            ApiPicks {
+                audio: ApiChoice::Default,
+                subtitle: ApiChoice::Off,
+            }
+        );
     }
 
     #[test]
