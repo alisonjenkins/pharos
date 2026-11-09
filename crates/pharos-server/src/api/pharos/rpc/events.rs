@@ -3,14 +3,16 @@
 //! [`crate::services::events`]; this is the wire half and the per-
 //! subscription pump.
 
-use std::cell::Cell;
-use std::collections::HashSet;
+use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
+use std::sync::Arc;
 
 use pharos_api::pharos_capnp::{done, event, event_sink, events as wire};
 use pharos_api::{server, Denial};
-use pharos_core::UserId;
+use pharos_core::{MediaId, UserId};
 use tokio::sync::broadcast;
+use tokio::task::AbortHandle;
 
 use super::library::set_item_id;
 use super::session::Session;
@@ -32,9 +34,67 @@ const MAX_BATCH: usize = 256;
 /// issued and released. Issued minus released is how many are alive.
 pub const CAPABILITIES_TOTAL: &str = "pharos_rpc_capabilities_total";
 
-/// How many subscriptions a connection holds; shared by its sessions.
-#[derive(Debug, Default)]
-pub struct SubscriptionCount(Cell<u32>);
+/// The subscriptions open on one connection, shared by its sessions: each
+/// pump's abort handle and the token its session was opened with.
+#[derive(Default)]
+pub struct Subscriptions {
+    next: Cell<u64>,
+    pumps: RefCell<HashMap<u64, (String, AbortHandle)>>,
+}
+
+impl Subscriptions {
+    fn len(&self) -> usize {
+        self.pumps.borrow().len()
+    }
+
+    fn reserve(&self) -> u64 {
+        let id = self.next.get();
+        self.next.set(id.wrapping_add(1));
+        id
+    }
+
+    fn insert(&self, id: u64, token: &str, pump: AbortHandle) {
+        self.pumps.borrow_mut().insert(id, (token.to_owned(), pump));
+    }
+
+    fn remove(&self, id: u64) {
+        self.pumps.borrow_mut().remove(&id);
+    }
+
+    /// Stops every subscription of sessions opened with `token`, after
+    /// `Session.logout` ended it on this connection.
+    pub(crate) fn stop_token(&self, token: &str) {
+        let stopping: Vec<AbortHandle> = self
+            .pumps
+            .borrow()
+            .values()
+            .filter(|(t, _)| t == token)
+            .map(|(_, pump)| pump.clone())
+            .collect();
+        if !stopping.is_empty() {
+            tracing::info!(
+                subscriptions = stopping.len(),
+                "native events: session logged out; stopping its subscriptions"
+            );
+        }
+        for pump in stopping {
+            pump.abort();
+        }
+    }
+
+    /// Stops every subscription, as the connection closes.
+    pub(crate) fn stop_all(&self) {
+        let stopping: Vec<AbortHandle> = self
+            .pumps
+            .borrow()
+            .values()
+            .map(|(_, pump)| pump.clone())
+            .collect();
+        for pump in stopping {
+            pump.abort();
+        }
+    }
+}
 
 pub(super) struct Events {
     session: Rc<Session>,
@@ -79,7 +139,7 @@ impl server::events::Handler for Events {
         let made = async {
             let user = self.session.current_user().await?;
             let topics = topics?;
-            let held = self.session.subscriptions().0.get();
+            let held = u32::try_from(self.session.subscriptions().len()).unwrap_or(u32::MAX);
             if held >= MAX_SUBSCRIPTIONS_PER_CONNECTION {
                 tracing::warn!(
                     user = %user.name,
@@ -96,7 +156,8 @@ impl server::events::Handler for Events {
             let log = &self.session.state.events;
             log.start(&self.session.state.bus);
             let (catchup, rx) = log.subscribe(user.id, after);
-            let held = Held::new(Rc::clone(&self.session), topics.clone());
+            let id = self.session.subscriptions().reserve();
+            let held = Held::new(Rc::clone(&self.session), id, topics.clone());
             tracing::info!(
                 user = %user.name,
                 after_seq = after,
@@ -105,16 +166,20 @@ impl server::events::Handler for Events {
                 "native events: subscribed"
             );
             let pump = actix_web::rt::spawn(pump(
-                Rc::clone(&self.session),
-                user.id,
-                topics,
-                sink,
+                Pump {
+                    session: Rc::clone(&self.session),
+                    user: user.id,
+                    topics,
+                    sink,
+                    rx,
+                    last: after,
+                },
                 catchup,
-                rx,
                 held,
             ));
-            let on_close = pump.abort_handle();
-            self.session.on_connection_close(move || on_close.abort());
+            self.session
+                .subscriptions()
+                .insert(id, &self.session.token, pump.abort_handle());
             Ok(Subscription { pump })
         }
         .await;
@@ -156,19 +221,22 @@ impl Drop for Subscription {
 /// released however the pump ends, aborted included.
 struct Held {
     session: Rc<Session>,
+    id: u64,
     topics: HashSet<Topic>,
 }
 
 impl Held {
-    fn new(session: Rc<Session>, topics: HashSet<Topic>) -> Self {
-        let count = &session.subscriptions().0;
-        count.set(count.get().saturating_add(1));
+    fn new(session: Rc<Session>, id: u64, topics: HashSet<Topic>) -> Self {
         for topic in &topics {
             metrics::gauge!(SUBSCRIPTIONS, "topic" => topic.label()).increment(1.0);
         }
         metrics::counter!(CAPABILITIES_TOTAL, "type" => "subscription", "transition" => "issued")
             .increment(1);
-        Self { session, topics }
+        Self {
+            session,
+            id,
+            topics,
+        }
     }
 
     fn topic_labels(&self) -> Vec<&'static str> {
@@ -180,8 +248,7 @@ impl Held {
 
 impl Drop for Held {
     fn drop(&mut self) {
-        let count = &self.session.subscriptions().0;
-        count.set(count.get().saturating_sub(1));
+        self.session.subscriptions().remove(self.id);
         for topic in &self.topics {
             metrics::gauge!(SUBSCRIPTIONS, "topic" => topic.label()).decrement(1.0);
         }
@@ -197,84 +264,185 @@ enum Stop {
     LogClosed,
 }
 
-/// Sends `catchup`, then every live event for `user` on `topics`, to `sink`
-/// in `seq` order, one `push` in flight at a time.
-async fn pump(
+/// One subscription's delivery state.
+struct Pump {
     session: Rc<Session>,
     user: UserId,
     topics: HashSet<Topic>,
     sink: event_sink::Client,
-    catchup: Catchup,
-    mut rx: broadcast::Receiver<(UserId, Event)>,
-    _held: Held,
-) {
-    let mut last = 0u64;
-    let mut pending: Vec<Event> = Vec::new();
-    let mut resync_at = None;
+    rx: broadcast::Receiver<Event>,
+    /// The highest `seq` the client has, or is told to resume from.
+    last: u64,
+}
+
+/// What the pump sends next.
+enum Next {
+    Events(Vec<Event>),
+    Resync(u64),
+}
+
+impl Pump {
+    /// Refills `pending` from the window after `last`, for a pump that lagged
+    /// its live channel; `None` unless the window no longer reaches back.
+    fn catch_up(&self, pending: &mut VecDeque<Event>) -> Option<u64> {
+        match self.session.state.events.catch_up(self.user, self.last) {
+            Catchup::Live { .. } => {
+                pending.clear();
+                None
+            }
+            Catchup::Replay(events) => {
+                *pending = events.into();
+                None
+            }
+            Catchup::Resync { head } => Some(head),
+        }
+    }
+
+    fn wants(&self, event: &Event) -> bool {
+        event.seq > self.last
+            && event
+                .payload
+                .topic()
+                .map_or(true, |t| self.topics.contains(&t))
+    }
+
+    /// The ids of `ids` that `user` may see; none without a user, or when
+    /// the access check fails.
+    async fn visible(&self, user: Option<&pharos_core::User>, ids: &[MediaId]) -> Vec<MediaId> {
+        let Some(user) = user else {
+            return Vec::new();
+        };
+        let mut ids = ids.to_vec();
+        match crate::services::access::retain_visible(
+            &self.session.state,
+            user,
+            &mut ids,
+            |id| *id,
+            "events",
+        )
+        .await
+        {
+            Ok(()) => ids,
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// Drops what this user may not see: library ids outside their access
+    /// (the change itself still arrives, as a bare "something changed") and,
+    /// for a user whose policy hides anything, scan progress, whose ids name
+    /// libraries.
+    async fn scoped(&self, batch: Vec<Event>) -> Result<Vec<Event>, Stop> {
+        let needs_scope = batch.iter().any(|e| {
+            matches!(&*e.payload, Payload::Task { .. })
+                || matches!(&*e.payload, Payload::Library { added, removed } if !added.is_empty() || !removed.is_empty())
+        });
+        if !needs_scope {
+            return Ok(batch);
+        }
+        // Without the policy (store down), assume it hides everything.
+        let user = match self.session.current_user().await {
+            Ok(user) => Some(user),
+            Err(Denial::Unavailable { .. }) => None,
+            Err(_) => return Err(Stop::LoggedOut),
+        };
+        if user
+            .as_ref()
+            .is_some_and(|u| crate::services::library::hides_nothing(&u.policy))
+        {
+            return Ok(batch);
+        }
+        let mut scoped = Vec::with_capacity(batch.len());
+        for event in batch {
+            match &*event.payload {
+                Payload::Task { .. } => {}
+                Payload::Library { added, removed } => {
+                    let payload = Payload::Library {
+                        added: self.visible(user.as_ref(), added).await,
+                        removed: self.visible(user.as_ref(), removed).await,
+                    };
+                    scoped.push(Event {
+                        payload: Arc::new(payload),
+                        ..event
+                    });
+                }
+                _ => scoped.push(event),
+            }
+        }
+        Ok(scoped)
+    }
+}
+
+/// Sends `catchup`, then every live event on the subscription's topics, to
+/// its sink in `seq` order, at most [`MAX_BATCH`] per `push` and one `push`
+/// in flight at a time.
+async fn pump(mut p: Pump, catchup: Catchup, _held: Held) {
+    let mut pending: VecDeque<Event> = VecDeque::new();
+    let mut resync = None;
     match catchup {
-        Catchup::Live { head } => last = head,
-        Catchup::Replay(events) => pending = events,
-        Catchup::Resync { head } => resync_at = Some(head),
+        Catchup::Live { head } => p.last = head,
+        Catchup::Replay(events) => pending = events.into(),
+        Catchup::Resync { head } => resync = Some(head),
     }
     let stop = loop {
-        if let Some(head) = resync_at.take() {
-            pending.clear();
-            pending.push(Event {
-                seq: head,
-                at: std::time::Instant::now(),
-                payload: std::sync::Arc::new(Payload::Resync),
-            });
-        }
-        if pending.is_empty() {
-            match rx.recv().await {
-                Ok((owner, event)) => {
-                    if owner == user {
-                        pending.push(event);
-                    }
-                }
+        if resync.is_none() && pending.is_empty() {
+            match p.rx.recv().await {
+                Ok(event) => pending.push_back(event),
                 Err(broadcast::error::RecvError::Lagged(missed)) => {
                     tracing::info!(
                         missed,
-                        after_seq = last,
+                        after_seq = p.last,
                         "native events: subscriber lagged; catching up from the window"
                     );
-                    match session.state.events.catch_up(user, last) {
-                        Catchup::Live { .. } => {}
-                        Catchup::Replay(events) => pending = events,
-                        Catchup::Resync { head } => resync_at = Some(head),
-                    }
+                    resync = p.catch_up(&mut pending);
                     continue;
                 }
                 Err(broadcast::error::RecvError::Closed) => break Stop::LogClosed,
             }
         }
-        while pending.len() < MAX_BATCH {
-            match rx.try_recv() {
-                Ok((owner, event)) => {
-                    if owner == user {
-                        pending.push(event);
+        if resync.is_none() {
+            while pending.len() < MAX_BATCH {
+                match p.rx.try_recv() {
+                    Ok(event) => pending.push_back(event),
+                    Err(broadcast::error::TryRecvError::Lagged(missed)) => {
+                        tracing::info!(
+                            missed,
+                            after_seq = p.last,
+                            "native events: subscriber lagged; catching up from the window"
+                        );
+                        resync = p.catch_up(&mut pending);
+                        break;
                     }
+                    Err(_) => break,
                 }
-                Err(broadcast::error::TryRecvError::Lagged(_)) => {
-                    // The window has everything after `last`; the receiver
-                    // reports the lag again on the next `recv`.
-                    break;
-                }
-                Err(_) => break,
             }
         }
-        let batch: Vec<Event> = std::mem::take(&mut pending)
-            .into_iter()
-            .filter(|e| e.seq > last)
-            .filter(|e| e.payload.topic().map_or(true, |t| topics.contains(&t)))
-            .collect();
-        if batch.is_empty() {
-            continue;
-        }
-        if session.ended().is_some() {
+        let next = match resync.take() {
+            Some(head) => {
+                pending.clear();
+                Next::Resync(head)
+            }
+            None => {
+                let take = pending.len().min(MAX_BATCH);
+                Next::Events(pending.drain(..take).filter(|e| p.wants(e)).collect())
+            }
+        };
+        let batch = match next {
+            Next::Resync(head) => vec![Event {
+                seq: head,
+                at: std::time::Instant::now(),
+                payload: Arc::new(Payload::Resync),
+            }],
+            Next::Events(batch) if batch.is_empty() => continue,
+            Next::Events(batch) => match p.scoped(batch).await {
+                Ok(batch) if batch.is_empty() => continue,
+                Ok(batch) => batch,
+                Err(stop) => break stop,
+            },
+        };
+        if p.session.ended().is_some() {
             break Stop::LoggedOut;
         }
-        match push(&sink, &batch).await {
+        match push(&p.sink, &batch).await {
             Ok(accepted) => {
                 let outcome = if accepted {
                     Outcome::Delivered
@@ -284,13 +452,10 @@ async fn pump(
                 for event in &batch {
                     let topic = topic_label(&event.payload);
                     count(topic, outcome, 1);
-                    if matches!(*event.payload, Payload::Resync) {
-                        count(topic, Outcome::Resync, 1);
-                    }
                     metrics::histogram!(EVENT_LAG_SECONDS, "topic" => topic)
                         .record(event.at.elapsed().as_secs_f64());
                 }
-                last = batch.iter().map(|e| e.seq).max().unwrap_or(last).max(last);
+                p.last = batch.iter().map(|e| e.seq).fold(p.last, u64::max);
             }
             Err(e) => {
                 for event in &batch {
@@ -300,6 +465,7 @@ async fn pump(
             }
         }
     };
+    let last = p.last;
     match stop {
         Stop::SinkGone(error) => {
             tracing::info!(last_seq = last, error = %error, "native events: sink gone; subscription ended");
