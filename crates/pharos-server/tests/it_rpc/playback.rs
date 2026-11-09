@@ -1530,3 +1530,39 @@ async fn start_tracks_answer_what_a_default_negotiation_would_play() {
     // A book has no tracks to play.
     assert!(start_tracks(&session, BOOK, &direct).await.is_err());
 }
+
+/// T130 / V1011: the native grant reads the deny list of the device its token
+/// was issued to, as PlaybackInfo does, so the two APIs agree.
+/// Disarm check: without the lookup in `playback::grant`, the second
+/// negotiation direct-plays.
+#[actix_web::test]
+async fn a_device_audio_deny_list_stops_a_native_direct_play() {
+    use pharos_store_sqlx::ServerConfigStore as _;
+    let (server, fx) = crate::revocation::start().await;
+    seed_playable(&fx).await;
+    let (client, _closed) = crate::revocation::connect(&server).await;
+    let session = crate::revocation::signed_in(&client, &fx.user_token).await;
+    let direct = caps(&["h264"], &["aac"], &["mp4"]);
+    let decide = || async {
+        negotiate(
+            &session,
+            WireId::Real(MOVIE),
+            &direct,
+            Choice::Default,
+            Choice::Default,
+        )
+        .await
+        .unwrap()
+        .1
+    };
+    assert_eq!(decide().await.method, "direct_play", "control");
+
+    fx.state
+        .stores
+        .set_named_config(&playback::denied_audio_codecs_key("test"), r#"["aac"]"#)
+        .await
+        .unwrap();
+    let denied = decide().await;
+    assert_ne!(denied.method, "direct_play");
+    assert_eq!(denied.block, "audio_codec_denied");
+}

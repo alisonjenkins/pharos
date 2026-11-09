@@ -19,6 +19,82 @@ use crate::api::jellyfin::subtitle_delivery::{decide_subtitle_delivery, Subtitle
 use crate::api::jellyfin::subtitles::is_image_subtitle_codec;
 use crate::state::AppState;
 
+/// The named-config key holding one device's audio codec deny list (T130).
+pub fn denied_audio_codecs_key(device_id: &str) -> String {
+    format!("devaudionodirect:{device_id}")
+}
+
+/// At most this many codecs per device: the real set is a handful of
+/// bitstream formats (ac3, eac3, truehd, dts), so more is a malformed request.
+pub const MAX_DENIED_AUDIO_CODECS: usize = 16;
+
+/// Why a deny list was refused, naming the offending value.
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+pub enum DeniedCodecsError {
+    #[error("{count} codecs given; at most {MAX_DENIED_AUDIO_CODECS} allowed")]
+    TooMany { count: usize },
+    #[error("codec {codec:?} is not a codec name (1-16 of a-z, 0-9, _ or -)")]
+    BadName { codec: String },
+}
+
+/// A deny list as stored: lowercased, trimmed, deduplicated and sorted, so the
+/// same set always reads back the same. Blank entries are dropped.
+pub fn normalise_denied_audio_codecs(codecs: &[String]) -> Result<Vec<String>, DeniedCodecsError> {
+    let set: BTreeSet<String> = codecs
+        .iter()
+        .map(|c| c.trim().to_ascii_lowercase())
+        .filter(|c| !c.is_empty())
+        .collect();
+    if let Some(bad) = set.iter().find(|c| {
+        c.len() > 16
+            || !c
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
+    }) {
+        return Err(DeniedCodecsError::BadName { codec: bad.clone() });
+    }
+    if set.len() > MAX_DENIED_AUDIO_CODECS {
+        return Err(DeniedCodecsError::TooMany { count: set.len() });
+    }
+    Ok(set.into_iter().collect())
+}
+
+/// The audio codecs `device_id` must not direct-play. Empty when none are set,
+/// and also when the stored value cannot be read: the client's own claim then
+/// stands, which is how it played before the setting existed.
+pub async fn denied_audio_codecs(state: &AppState, device_id: &str) -> Vec<String> {
+    use pharos_store_sqlx::ServerConfigStore as _;
+    let key = denied_audio_codecs_key(device_id);
+    let raw = match state.stores.load_named_config(&key).await {
+        Ok(Some(raw)) => raw,
+        Ok(None) => return Vec::new(),
+        Err(e) => {
+            tracing::warn!(device.id = device_id, error = %e, "device audio deny list unreadable");
+            return Vec::new();
+        }
+    };
+    match serde_json::from_str::<Vec<String>>(&raw) {
+        Ok(codecs) => codecs,
+        Err(e) => {
+            tracing::warn!(device.id = device_id, value = %raw, error = %e, "device audio deny list is not a JSON list");
+            Vec::new()
+        }
+    }
+}
+
+/// [`denied_audio_codecs`] for the device `token` was issued to.
+pub async fn denied_audio_codecs_for_token(state: &AppState, token: &str) -> Vec<String> {
+    use pharos_core::TokenStore as _;
+    match state.stores.device_for_token(token).await {
+        Ok(Some(device)) => denied_audio_codecs(state, &device).await,
+        Ok(None) => Vec::new(),
+        Err(e) => {
+            tracing::warn!(error = %e, "device lookup for the audio deny list failed");
+            Vec::new()
+        }
+    }
+}
+
 /// Which delivery paths a PlaybackInfo request allows; everything is allowed
 /// unless the body says `false`.
 #[derive(Debug, Clone, Copy)]
@@ -127,7 +203,7 @@ impl Negotiated {
 
     /// Counts the verdict, so "how many sessions are transcoding, and for what
     /// reason" is a query rather than a log trawl. Label cardinality is
-    /// bounded: 4 decisions × 8 block reasons × 5 downgrades (`none` plus the
+    /// bounded: 4 decisions × 10 block reasons × 5 downgrades (`none` plus the
     /// four in [`Negotiated::downgrade`]).
     pub fn record(&self) {
         metrics::counter!(
@@ -246,6 +322,16 @@ pub fn negotiate(state: &AppState, item: &MediaItem, req: &NegotiateRequest<'_>)
         }
         verdict
     };
+    if !profile.denied_audio_codecs.is_empty() {
+        tracing::info!(
+            media.id = item.id,
+            audio.codec = source.audio_codec.as_deref().unwrap_or("none"),
+            denied = ?profile.denied_audio_codecs,
+            applied = profile.denies_audio(source.audio_codec.as_deref()),
+            direct_play_block = %direct_play_block,
+            "device audio codec deny list consulted"
+        );
+    }
     // Which post-negotiation override (if any) replaced the negotiator's
     // decision. These fire AFTER `negotiate` and can turn a DirectPlay into a
     // transcode, so a log carrying only the negotiator's reason would name a
@@ -290,7 +376,7 @@ pub fn negotiate(state: &AppState, item: &MediaItem, req: &NegotiateRequest<'_>)
         source.video_codec.as_deref(),
         source.audio_codec.as_deref(),
         &profile.direct_play_profiles,
-    );
+    ) && !profile.denies_audio(source.audio_codec.as_deref());
     // B80 (Lace incident, 2026-07-16) — a browser's <video>/MSE cannot demux a
     // raw Matroska container. When the negotiator returned DirectPlay for a
     // Matroska source to a browser that CANNOT play the `video/webm` relabel
@@ -1579,9 +1665,10 @@ pub async fn grant(
         .as_deref()
         .map(|e| format!("&MediaSourceId={item_wire_id}-{e}"))
         .unwrap_or_default();
-    let profile = r
+    let mut profile = r
         .capabilities
         .profile(crate::services::watch::extracts_image_subtitles(state));
+    profile.denied_audio_codecs = denied_audio_codecs_for_token(state, r.token).await;
     let streams = crate::services::watch::streams(&item).await;
     let TrackPick {
         audio,
