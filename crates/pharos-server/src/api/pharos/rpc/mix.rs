@@ -129,6 +129,7 @@ pub(super) fn write_batch(
     mixed: &Mixed,
     server_id: &str,
     key: &ImageTagKey,
+    damaged: &super::library::DamagedIds,
 ) {
     let len = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
     out.set_pool(len(mixed.pool));
@@ -149,6 +150,7 @@ pub(super) fn write_batch(
             p.user_data,
             server_id,
             key,
+            damaged,
         );
         let mut reasons = pick.init_reasons(len(p.reasons.len()));
         for (j, why) in (0..).zip(&p.reasons) {

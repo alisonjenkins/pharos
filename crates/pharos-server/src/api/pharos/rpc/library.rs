@@ -112,6 +112,7 @@ impl server::library::Handler for Library {
             "latest",
             &state.server_id,
             &state.image_tag_key,
+            &DamagedIds::of(state),
         );
         Ok(())
     }
@@ -140,6 +141,7 @@ impl server::library::Handler for Library {
             "resume",
             &state.server_id,
             &state.image_tag_key,
+            &DamagedIds::of(state),
         );
         Ok(())
     }
@@ -195,6 +197,7 @@ impl server::library::Handler for Library {
             "query",
             &state.server_id,
             &state.image_tag_key,
+            &DamagedIds::of(state),
         );
         Ok(())
     }
@@ -361,6 +364,7 @@ impl server::library::Handler for Library {
                         "search",
                         &state.server_id,
                         &state.image_tag_key,
+                        &DamagedIds::of(state),
                     );
                     return Ok(());
                 }
@@ -386,6 +390,7 @@ impl server::library::Handler for Library {
                     "search",
                     &state.server_id,
                     &state.image_tag_key,
+                    &DamagedIds::of(state),
                 );
                 return Ok(());
             }
@@ -408,6 +413,7 @@ impl server::library::Handler for Library {
                     played.next().unwrap_or_default(),
                     &state.server_id,
                     &state.image_tag_key,
+                    &DamagedIds::of(state),
                 ),
             }
         }
@@ -489,6 +495,7 @@ impl server::library::Handler for Library {
             user_data,
             &state.server_id,
             &state.image_tag_key,
+            &DamagedIds::of(state),
         );
         // A film sits straight under its library, as Jellyfin's detail says,
         // so the UI can name the library above it.
@@ -555,12 +562,21 @@ impl server::library::Handler for Library {
             w.set_mime(f.mime.as_str());
             w.set_url(f.url.as_str());
         }
+        // Only the primary file is swept, so a version has no verdict of its own.
+        let verdict = state
+            .integrity_memo
+            .as_ref()
+            .and_then(|m| m.verdict(all.id))
+            .filter(|e| e.report.is_damaged());
         if has_versions {
-            write_versions(
-                out.reborrow().init_versions(version_count(&all)),
-                &all,
-                user.policy.admin,
-            );
+            let mut versions = out.reborrow().init_versions(version_count(&all));
+            write_versions(versions.reborrow(), &all, user.policy.admin);
+            if verdict.is_some() {
+                versions.get(0).set_damaged(true);
+            }
+        }
+        if let Some(entry) = verdict.as_ref().filter(|_| item.path == all.path) {
+            write_damage(out.reborrow().init_damage(), entry);
         }
         let segments: Vec<_> = segments::for_item(state, &item)
             .await
@@ -648,6 +664,7 @@ impl server::library::Handler for Library {
             &shows,
             &state.server_id,
             &state.image_tag_key,
+            &DamagedIds::of(state),
         );
         Ok(())
     }
@@ -679,6 +696,7 @@ impl server::library::Handler for Library {
             home,
             &state.server_id,
             &state.image_tag_key,
+            &DamagedIds::of(state),
         );
         Ok(())
     }
@@ -705,6 +723,7 @@ impl server::library::Handler for Library {
             "next_up",
             &state.server_id,
             &state.image_tag_key,
+            &DamagedIds::of(state),
         );
         Ok(())
     }
@@ -776,6 +795,7 @@ fn write_home(
     home: Result<library::Home, ListError>,
     server_id: &str,
     key: &ImageTagKey,
+    damaged: &DamagedIds,
 ) {
     let home = match home {
         Ok(home) => home,
@@ -805,13 +825,20 @@ fn write_home(
     for (i, (id, view, items)) in (0..count).zip(&rails) {
         let mut rail = list.reborrow().get(i);
         write_view(rail.reborrow().init_view(), *id, view, key);
-        write_items(rail.init_latest(len_u32(items)), items, server_id, key);
+        write_items(
+            rail.init_latest(len_u32(items)),
+            items,
+            server_id,
+            key,
+            damaged,
+        );
     }
     write_items(
         out.reborrow().init_resume(len_u32(&home.resume.items)),
         &home.resume.items,
         server_id,
         key,
+        damaged,
     );
     write_items(
         out.reborrow()
@@ -819,12 +846,14 @@ fn write_home(
         &home.listening.items,
         server_id,
         key,
+        damaged,
     );
     write_items(
         out.init_next_up(len_u32(&home.next_up.items)),
         &home.next_up.items,
         server_id,
         key,
+        damaged,
     );
 }
 
@@ -841,9 +870,17 @@ fn write_items(
     items: &Rows,
     server_id: &str,
     key: &ImageTagKey,
+    damaged: &DamagedIds,
 ) {
     for (i, (item, user_data)) in (0..out.len()).zip(items) {
-        write_item(out.reborrow().get(i), item, *user_data, server_id, key);
+        write_item(
+            out.reborrow().get(i),
+            item,
+            *user_data,
+            server_id,
+            key,
+            damaged,
+        );
     }
 }
 
@@ -868,6 +905,7 @@ async fn run_mix(
             &mixed,
             &state.server_id,
             &state.image_tag_key,
+            &DamagedIds::of(state),
         ),
         Err(mix::MixError::Invalid(e)) => {
             Denial::Invalid { field: e.label() }.write(out.init_error())
@@ -889,6 +927,7 @@ fn write_listing(
     method: &'static str,
     server_id: &str,
     key: &ImageTagKey,
+    damaged: &DamagedIds,
 ) {
     let listed = match listed {
         Ok(listed) => listed,
@@ -909,6 +948,7 @@ fn write_listing(
         &listed.items,
         server_id,
         key,
+        damaged,
     );
 }
 
@@ -1373,6 +1413,7 @@ fn write_person(
     shows: &[Option<(WireId, serde_json::Value)>],
     server_id: &str,
     key: &ImageTagKey,
+    damaged: &DamagedIds,
 ) {
     let mut out = out.init_person();
     set_item_id(out.reborrow().init_id(), id);
@@ -1391,7 +1432,7 @@ fn write_person(
     }
     let mut films = out.reborrow().init_films(len(&page.films));
     for (i, film) in (0..).zip(&page.films) {
-        write_appearance(films.reborrow().get(i), film, server_id, key);
+        write_appearance(films.reborrow().get(i), film, server_id, key, damaged);
     }
     let mut list = out.init_shows(len(&page.shows));
     for (i, show) in (0..).zip(&page.shows) {
@@ -1415,7 +1456,7 @@ fn write_person(
         }
         let mut episodes = w.init_episodes(len(&show.episodes));
         for (j, episode) in (0..).zip(&show.episodes) {
-            write_appearance(episodes.reborrow().get(j), episode, server_id, key);
+            write_appearance(episodes.reborrow().get(j), episode, server_id, key, damaged);
         }
     }
 }
@@ -1425,6 +1466,7 @@ fn write_appearance(
     appearance: &person::Appearance,
     server_id: &str,
     key: &ImageTagKey,
+    damaged: &DamagedIds,
 ) {
     write_item(
         out.reborrow().init_item(),
@@ -1432,6 +1474,7 @@ fn write_appearance(
         appearance.user_data,
         server_id,
         key,
+        damaged,
     );
     out.set_character(appearance.character.as_deref().unwrap_or_default());
     out.set_kind(credit_kind(appearance.kind));
@@ -1585,6 +1628,45 @@ pub(super) fn write_user_state(mut out: user_state::Builder<'_>, data: UserItemD
     out.set_play_count(data.play_count);
 }
 
+/// A damaged verdict as the player and title page show it.
+fn write_damage(
+    mut out: pharos_api::pharos_capnp::damage::Builder<'_>,
+    entry: &crate::integrity_memo::Entry,
+) {
+    let r = &entry.report;
+    out.set_verdict(r.label());
+    out.set_reason(r.first_fault.as_deref().unwrap_or_default());
+    out.set_checked_at(entry.checked_at.unwrap_or(0));
+    let ranges = r.damage_ranges();
+    let mut list = out.init_ranges(len(&ranges));
+    for (i, d) in (0..).zip(&ranges) {
+        let mut w = list.reborrow().get(i);
+        w.set_start_ms(d.start_ms);
+        w.set_end_ms(d.end_ms);
+    }
+}
+
+/// The ids the integrity check holds damaged, read once per call so a page of
+/// summaries does not take the memo's lock per item.
+#[derive(Debug, Default)]
+pub(super) struct DamagedIds(std::collections::HashSet<u64>);
+
+impl DamagedIds {
+    pub(super) fn of(state: &crate::state::AppState) -> Self {
+        Self(
+            state
+                .integrity_memo
+                .as_ref()
+                .map(|m| m.damaged_ids())
+                .unwrap_or_default(),
+        )
+    }
+
+    pub(super) fn contains(&self, id: u64) -> bool {
+        self.0.contains(&id)
+    }
+}
+
 /// One stored item as an `ItemSummary`. The display fields come from the
 /// Jellyfin projection, so the two APIs cannot disagree on a series name,
 /// year or index number.
@@ -1594,6 +1676,7 @@ pub(super) fn write_item(
     user_data: UserItemData,
     server_id: &str,
     key: &ImageTagKey,
+    damaged: &DamagedIds,
 ) {
     let dto = BaseItemDto::from_domain_with_user_data(item, server_id, user_data);
     set_item_id(out.reborrow().init_id(), WireId::Real(item.id));
@@ -1625,6 +1708,7 @@ pub(super) fn write_item(
         out.reborrow().init_parent_index_number().set_some(n);
     }
     out.set_stereo(wire_stereo(item_stereo(item)));
+    out.set_damaged(damaged.contains(item.id));
     if let Some(score) = dto.critic_rating.and_then(tomatometer) {
         out.reborrow().init_critic_rating().set_some(score);
     }
