@@ -310,14 +310,21 @@ The bug today, by query (no metric yet, so the first implementation commit adds
 these):
 
 - `sum by (outcome, decided_by) (increase(pharos_series_match_total[1d]))`,
-  `outcome` ∈ `matched | ambiguous | no_match | kept_manual`, `decided_by` ∈
-  `year | episode_fit | nfo_vote | sole_candidate`.
+  one count per show per pass. `outcome` ∈ `matched | ambiguous | no_match |
+  transient | kept_manual`, `decided_by` ∈ `sole_candidate | name | year |
+  earliest_premiere | provider_order | episode_fit | nfo_vote | none`.
+  `name`, `earliest_premiere` and `provider_order` are the rules the matcher
+  uses before this spec; `provider_order` is B930 itself, so it is counted
+  under its own label until §3 removes it. `transient` is a chosen match whose
+  record did not arrive. `none` goes with `no_match`.
 - `{namespace="pharos"} |= "series match"` with `query=… year=… candidates=[…]
   chosen=… runner_up=… margin=…` on every decision, matched or not.
 - `sum by (reason) (pharos_series_folder_split_total)`.
 - `sum by (reason) (increase(pharos_episode_metadata_rejected_total[1d]))`,
-  `reason` ∈ `nfo_other_series | outside_run | title_mismatch`, log carrying
-  path, NFO id, pinned id.
+  `reason` ∈ `nfo_other_series | search_other_series | outside_run |
+  title_mismatch`, log carrying path, NFO id, the series the record was read
+  from and the pinned id. `search_other_series` is B933. Until §4 lands the
+  count is observation only (the record is still applied).
 - `sum by (decided_by) (pharos_scan_copy_primaries)` gains
   `decided_by="refused_other_series"` for V894.
 - `{namespace="pharos"} |= "series identity repair"` for each dry-run line.
