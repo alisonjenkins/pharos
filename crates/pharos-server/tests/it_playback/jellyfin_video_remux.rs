@@ -318,6 +318,10 @@ async fn playback_info_video_transcode_emits_url_for_non_ts_container_profile() 
     // carries its credential: the PlaySessionId, never the token (V1050).
     let psid = v["PlaySessionId"].as_str().unwrap_or_default();
     assert!(
+        !psid.is_empty(),
+        "PlaybackInfo returned no PlaySessionId: {v}"
+    );
+    assert!(
         url.is_some_and(
             |u| u.contains(&format!("PlaySessionId={psid}")) && !u.contains(token.0.expose())
         ),
