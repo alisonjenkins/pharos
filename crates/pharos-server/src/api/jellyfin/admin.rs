@@ -50,6 +50,11 @@ pub fn register(cfg: &mut web::ServiceConfig) {
             "/admin/integrity/{id}/recheck",
             web::post().to(integrity_recheck),
         )
+        .route("/admin/integrity/deep", web::get().to(deep_checks))
+        .route(
+            "/admin/integrity/{id}/deep",
+            web::post().to(deep_check_request),
+        )
         .route(
             "/admin/media/duplicates",
             web::get().to(super::duplicates::duplicate_movies),
@@ -1160,6 +1165,120 @@ async fn integrity_recheck(
         path = %item.path.display(),
         already_queued = !newly,
         "integrity re-check requested",
+    );
+    Ok(HttpResponse::Accepted().finish())
+}
+
+/// `GET /admin/integrity/deep` — every deep check this process has run or is
+/// running, newest first, named as a person would name the file.
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct DeepCheckDto {
+    media_id: String,
+    path: Option<String>,
+    kind: Option<&'static str>,
+    name: Option<String>,
+    series_name: Option<String>,
+    season_number: Option<u32>,
+    episode_number: Option<u32>,
+    state: &'static str,
+    errors: u64,
+    first_error: Option<String>,
+    first_error_ms: Option<u64>,
+    requested_at: i64,
+    finished_at: Option<i64>,
+    elapsed_secs: Option<u64>,
+    detail: Option<String>,
+}
+
+async fn deep_checks(
+    state: web::Data<AppState>,
+    user: AuthUser,
+) -> Result<impl Responder, actix_web::Error> {
+    require_admin(&user)?;
+    let Some(deep) = state.integrity_deep.as_ref() else {
+        return Err(error::ErrorServiceUnavailable(
+            "deep checks are not set up on this server",
+        ));
+    };
+    let mut out = Vec::new();
+    for e in deep.list() {
+        let item = match pharos_core::MediaStore::get(&state.stores, e.id).await {
+            Ok(item) => Some(item),
+            Err(pharos_core::DomainError::NotFound(_)) => None,
+            Err(err) => return Err(error::ErrorInternalServerError(err.to_string())),
+        };
+        let series = item.as_ref().and_then(|i| i.series.as_ref());
+        out.push(DeepCheckDto {
+            media_id: e.id.to_string(),
+            path: item.as_ref().map(|i| i.path.to_string_lossy().into_owned()),
+            kind: item.as_ref().map(|i| i.kind.as_str()),
+            name: item.as_ref().map(|i| i.title.clone()),
+            series_name: series.map(|s| s.series_name.clone()),
+            season_number: series.and_then(|s| s.season_number),
+            episode_number: series.and_then(|s| s.episode_number),
+            state: e.state.label(),
+            errors: e.report.errors,
+            first_error: e.report.first_error,
+            first_error_ms: e.report.first_error_ms,
+            requested_at: e.requested_at,
+            finished_at: e.finished_at,
+            elapsed_secs: e.elapsed_secs,
+            detail: e.detail,
+        });
+    }
+    Ok(web::Json(out))
+}
+
+/// `POST /admin/integrity/{id}/deep` — decode this one file fully.
+///
+/// 202: queued (or already queued). 404 unknown id; 400 for a book (no frames
+/// to decode; the regular check already reads every part of it) or a remote
+/// origin; 503 where deep checks are not set up, or on a replica that is not
+/// the background leader, whose results the page would never see.
+async fn deep_check_request(
+    state: web::Data<AppState>,
+    user: AuthUser,
+    path: web::Path<String>,
+) -> Result<impl Responder, actix_web::Error> {
+    require_admin(&user)?;
+    let Some(deep) = state.integrity_deep.as_ref() else {
+        return Err(error::ErrorServiceUnavailable(
+            "deep checks are not set up on this server",
+        ));
+    };
+    if !state.is_bg_leader() {
+        return Err(error::ErrorServiceUnavailable(
+            "this replica does not run integrity checks; try again",
+        ));
+    }
+    let raw = path.into_inner();
+    let id: u64 = raw
+        .parse()
+        .map_err(|_| error::ErrorBadRequest(format!("not a media id: {raw:?}")))?;
+    let item = match pharos_core::MediaStore::get(&state.stores, id).await {
+        Ok(item) => item,
+        Err(pharos_core::DomainError::NotFound(_)) => {
+            return Err(error::ErrorNotFound(format!("no media item {id}")))
+        }
+        Err(e) => return Err(error::ErrorInternalServerError(e.to_string())),
+    };
+    if item.kind == pharos_core::MediaKind::Book {
+        return Err(error::ErrorBadRequest(
+            "books have no frames to decode; the regular check reads every part of a book",
+        ));
+    }
+    if !crate::integrity_sweep::scannable(&item) {
+        return Err(error::ErrorBadRequest(format!(
+            "media item {id} is not a local file and cannot be checked"
+        )));
+    }
+    let requested = deep.request(&item);
+    tracing::info!(
+        item = id,
+        path = %item.path.display(),
+        already_in_progress = requested == crate::integrity_deep::Requested::AlreadyInProgress,
+        "deep check requested",
     );
     Ok(HttpResponse::Accepted().finish())
 }
