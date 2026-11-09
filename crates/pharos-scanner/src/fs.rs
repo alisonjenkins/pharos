@@ -2417,9 +2417,10 @@ enum CopyBucket {
     },
     /// A film by its cleaned, case-folded title and its year.
     Film { title: String, year: u32 },
-    /// A song by its folded file stem and the two folders above it (album and
-    /// artist, or disc and album), release tags such as `[FLAC]` left out.
-    Song { folders: [String; 2], stem: String },
+    /// A song by its folded file stem and the folders above it (album and
+    /// artist, or disc, album and artist), release tags such as `[FLAC]` left
+    /// out.
+    Song { folders: Vec<String>, stem: String },
 }
 
 impl CopyBucket {
@@ -2568,12 +2569,14 @@ fn group_copies(
     out
 }
 
-/// The title and year a film file's own name states (`Heat (1995)
-/// Bluray-1080p.mkv`), case-folded to letters and digits. A name with no year
-/// is no copy of anything: a title alone would merge remakes, and a folder's
-/// name is not used, since a film's folder also holds its trailer and sample.
-/// An edition (`Heat (1995) - Director's Cut`) is its own title; a 3D rip of
-/// the film is a copy of it.
+/// The key a film file's own name gives it (`Heat (1995) Bluray-1080p.mkv`
+/// is `heat 1995`): every word of the name, lower-cased, less the words that
+/// say how the copy was made ([`FILM_RELEASE_WORDS`], resolutions, channel
+/// layouts, the 3D packing). Whatever else the name says stays in the key, so
+/// a trailer, a sample, a cut, a part or an episode of a show named by number
+/// is its own title. A name with no year is no copy of anything, since a
+/// title alone would merge remakes; a folder's name is not used, since a
+/// film's folder also holds its extras.
 fn film_copy_key(path: &Path) -> Option<(String, u32)> {
     if is_episode_path(path) {
         return None;
@@ -2583,40 +2586,168 @@ fn film_copy_key(path: &Path) -> Option<(String, u32)> {
         return None;
     }
     let stem = path.file_stem()?.to_str()?;
-    if let Some((_, edition)) = split_edition_tag(stem) {
-        parse_3d_edition(edition)?;
-    }
-    let parsed = crate::metadata::filename::parse_filename(stem, true);
-    let year = parsed.year?;
-    let title = fold_name(&parsed.title?);
-    (!title.is_empty()).then_some((title, year))
+    let year = crate::metadata::filename::parse_filename(stem, true).year?;
+    let stem = match CHANNELS_RE.as_ref() {
+        Some(re) => re.replace_all(stem, " "),
+        None => stem.into(),
+    };
+    let key = words(&stem)
+        .into_iter()
+        .filter(|w| !is_film_release_word(w))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let year_word = year.to_string();
+    let titled = key.split(' ').any(|w| w != year_word);
+    titled.then_some((key, year))
+}
+
+/// Words of a film's name that say how a copy was made, not what it holds.
+const FILM_RELEASE_WORDS: &[&str] = &[
+    "4k",
+    "8k",
+    "uhd",
+    "fhd",
+    "hd",
+    "sd",
+    "bluray",
+    "blu",
+    "ray",
+    "bdrip",
+    "brrip",
+    "bdremux",
+    "remux",
+    "bd",
+    "web",
+    "dl",
+    "webdl",
+    "webrip",
+    "hdtv",
+    "pdtv",
+    "dvdrip",
+    "dvd",
+    "hdrip",
+    "tvrip",
+    "x264",
+    "x265",
+    "h264",
+    "h265",
+    "h",
+    "264",
+    "265",
+    "hevc",
+    "avc",
+    "xvid",
+    "divx",
+    "av1",
+    "vp9",
+    "8bit",
+    "10bit",
+    "12bit",
+    "hdr",
+    "hdr10",
+    "hdr10plus",
+    "dv",
+    "dovi",
+    "sdr",
+    "aac",
+    "ac3",
+    "eac3",
+    "dts",
+    "ma",
+    "truehd",
+    "atmos",
+    "ddp",
+    "dd",
+    "flac",
+    "opus",
+    "mp3",
+    "proper",
+    "repack",
+    "3d",
+    "sbs",
+    "hsbs",
+    "fsbs",
+    "tab",
+    "htab",
+    "ftab",
+    "ou",
+    "hou",
+    "fou",
+    "mvc",
+    "half",
+    "full",
+];
+
+fn is_film_release_word(word: &str) -> bool {
+    FILM_RELEASE_WORDS.contains(&word) || RESOLUTION_RE.as_ref().is_some_and(|re| re.is_match(word))
+}
+
+/// `1080p`, `2160p`, `1080i`, with a frame rate (`1080p60`).
+static RESOLUTION_RE: std::sync::LazyLock<Option<regex::Regex>> =
+    std::sync::LazyLock::new(|| regex::Regex::new(r"^\d{3,4}[pi]\d{0,3}$").ok());
+
+/// An audio channel layout (`5.1`, `DDP5.1`, `AAC2.0`), taken out before the
+/// name is split into words, so its digits never read as a part number.
+static CHANNELS_RE: std::sync::LazyLock<Option<regex::Regex>> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r"(?i)\b(?:ddp?|aac|e?ac3|dts|truehd|atmos|opus|flac)?\d\.\d\b").ok()
+});
+
+/// `name`'s words: runs of letters and digits, lower-cased.
+fn words(name: &str) -> Vec<String> {
+    name.split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .map(str::to_lowercase)
+        .collect()
 }
 
 /// The containers a song is held in.
 const SONG_EXTENSIONS: &[&str] = &["flac", "mp3", "opus", "m4a", "ogg", "wav"];
 
-/// Release tags in a music folder or file name that say how a copy was
-/// ripped, not what it holds: any `[..]` or `{..}`, and a `(..)` holding a
-/// year or a format (`(2001)`, `(FLAC)`, `(320 kbps)`, `(24-96)`). Other
-/// parentheses stay, so `Album (Deluxe)`, `Album (CD 2)` and `Song (Live)`
-/// are their own.
-static RELEASE_TAG_RE: std::sync::LazyLock<Option<regex::Regex>> = std::sync::LazyLock::new(|| {
-    regex::Regex::new(
-            r"(?i)\[[^\]]*\]|\{[^}]*\}|\((?:\s*\d{4}\s*|[^)]*\b(?:flac|alac|mp3|aac|ogg|opus|wav|lossless|hi-?res|\d{3}\s*k(?:bps)?|v[02]|\d{2}\s*-?\s*bit|\d{2}\s*-\s*\d{2,3}|web)\b[^)]*)\)",
-        )
-        .ok()
-});
+/// Words a bracketed tag in a music name may hold for the tag to say only how
+/// the copy was ripped: formats, bit depths, sample and bit rates.
+const SONG_FORMAT_WORDS: &[&str] = &[
+    "flac", "alac", "mp3", "aac", "m4a", "ogg", "vorbis", "opus", "wav", "lossless", "hi", "res",
+    "hires", "web", "vbr", "cbr", "kbps", "khz", "bit", "16bit", "24bit", "32bit", "v0", "v2",
+    "128k", "192k", "256k", "320k", "128", "160", "192", "256", "320", "16", "24", "32", "44",
+    "48", "88", "96", "176", "1", "2",
+];
 
-/// `name` folded as [`fold_name`] does, its release tags dropped first.
+/// A bracketed group, `[..]`, `(..)` or `{..}`, with nothing bracketed inside.
+static BRACKET_RE: std::sync::LazyLock<Option<regex::Regex>> =
+    std::sync::LazyLock::new(|| regex::Regex::new(r"[\[({]([^\[\](){}]*)[\])}]").ok());
+
+/// `name` folded as [`fold_name`] does, after dropping each bracketed tag
+/// that holds only a year or format words (`[FLAC]`, `(2001)`,
+/// `(320 kbps)`, `[24-96]`). Any other bracket stays, so `Album [CD2]`,
+/// `Album (Deluxe)`, `Song [Live]` and `Song (Remix v2)` are their own.
 fn fold_release_name(name: &str) -> String {
-    match RELEASE_TAG_RE.as_ref() {
-        Some(re) => fold_name(&re.replace_all(name, " ")),
-        None => fold_name(name),
-    }
+    let Some(re) = BRACKET_RE.as_ref() else {
+        return fold_name(name);
+    };
+    let kept = re.replace_all(name, |caps: &regex::Captures<'_>| {
+        let inner = caps.get(1).map_or("", |m| m.as_str());
+        let tag = words(inner).iter().all(|w| {
+            SONG_FORMAT_WORDS.contains(&w.as_str())
+                || (w.len() == 4
+                    && (w.starts_with("19") || w.starts_with("20"))
+                    && w.parse::<u32>().is_ok())
+        });
+        if tag {
+            " ".to_string()
+        } else {
+            caps.get(0)
+                .map_or_else(String::new, |m| m.as_str().to_string())
+        }
+    });
+    fold_name(&kept)
 }
 
+/// How many folders above a song name it with the file: album and artist,
+/// or with a disc folder, disc, album and artist.
+const SONG_FOLDERS: usize = 3;
+
 /// The bucket of a song file: its folded stem with the folded names of the
-/// two folders above it. Copies of a song sit beside each other
+/// [`SONG_FOLDERS`] folders above it. Copies of a song sit beside each other
 /// (`01 Song.flac`, `01 Song.mp3`) or in a second rip of the album
 /// (`Album [FLAC]/`, `Album (320 kbps)/`); the file name alone would merge
 /// every artist's `01 Intro`. Tags are not read: they are only known once a
@@ -2630,19 +2761,19 @@ fn song_copy_key(path: &Path) -> Option<CopyBucket> {
         return None;
     }
     let stem = fold_release_name(path.file_stem()?.to_str()?);
-    let parent = path.parent()?;
-    let folder = |p: Option<&Path>| {
-        p.and_then(Path::file_name)
-            .and_then(|s| s.to_str())
-            .map(fold_release_name)
-            .unwrap_or_default()
-    };
-    let album = folder(Some(parent));
-    let above = folder(parent.parent());
-    (!stem.is_empty() && !album.is_empty()).then_some(CopyBucket::Song {
-        folders: [album, above],
-        stem,
-    })
+    let folders: Vec<String> = path
+        .ancestors()
+        .skip(1)
+        .take(SONG_FOLDERS)
+        .map(|p| {
+            p.file_name()
+                .and_then(|s| s.to_str())
+                .map(fold_release_name)
+                .unwrap_or_default()
+        })
+        .collect();
+    folders.first().filter(|album| !album.is_empty())?;
+    (!stem.is_empty()).then_some(CopyBucket::Song { folders, stem })
 }
 
 /// `(show folder, season, first episode, last episode)` for an episode file
@@ -2762,16 +2893,19 @@ impl CopyRank {
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or_default();
-        let is_3d = crate::metadata::filename::parse_video_3d_format(stem)
-            .0
-            .is_some()
-            || split_edition_tag(stem)
-                .and_then(|(_, edition)| parse_3d_edition(edition))
-                .is_some();
         let ext = path
             .extension()
             .and_then(|e| e.to_str())
             .map(str::to_ascii_lowercase);
+        // A song has no picture: `01 Tab.mp3` is no 3D packing.
+        let is_song = ext.as_deref().is_some_and(|e| SONG_EXTENSIONS.contains(&e));
+        let is_3d = !is_song
+            && (crate::metadata::filename::parse_video_3d_format(stem)
+                .0
+                .is_some()
+                || split_edition_tag(stem)
+                    .and_then(|(_, edition)| parse_3d_edition(edition))
+                    .is_some());
         let container = match ext.as_deref() {
             Some("mkv") => 0,
             Some("mp4") => 1,
@@ -7385,6 +7519,93 @@ mod tests {
             film_copy_key(Path::new("/g/The Matrix (1999) WEBDL-720p.mp4")),
         );
         assert_eq!(film_copy_key(Path::new("/f/The Matrix.mkv")), None);
+    }
+
+    /// V846: a film's extras, cuts, parts and a show named by episode number
+    /// are never copies of the film; a 3D rip of a cut is a copy of that cut.
+    #[test]
+    fn a_film_name_that_says_more_than_its_release_is_its_own_title() {
+        let film = film_copy_key(Path::new("/f/Heat (1995)/Heat (1995) Bluray-1080p.mkv"));
+        assert_eq!(film, Some(("heat 1995".to_string(), 1995)));
+        for other in [
+            "Heat (1995)-trailer.mkv",
+            "Heat (1995)-sample.mkv",
+            "Heat.1995.sample.mkv",
+            "Heat (1995) - Behind the Scenes.mkv",
+            "Heat (1995) Extras.mkv",
+            "Heat (1995) Director's Cut.mkv",
+            "Heat (1995) {edition-Director's Cut}.mkv",
+            "Heat (1995) Remastered.mkv",
+            "Heat (1995) IMAX.mkv",
+            "Heat (1995) - part1.mkv",
+            "Heat (1995) - part2.mkv",
+            "Heat (1995) cd1.avi",
+        ] {
+            let key = film_copy_key(&Path::new("/f/Heat (1995)").join(other));
+            assert_ne!(key, film, "{other}");
+        }
+        assert_ne!(
+            film_copy_key(Path::new("/f/Heat (1995) - part1.mkv")),
+            film_copy_key(Path::new("/f/Heat (1995) - part2.mkv")),
+        );
+        assert_eq!(
+            film_copy_key(Path::new("/f/Heat (1995) - Director's Cut - 3D.HSBS.mkv")),
+            film_copy_key(Path::new("/g/Heat (1995) - Director's Cut.mkv")),
+        );
+        assert_ne!(
+            film_copy_key(Path::new("/f/Heat (1995) - Director's Cut - 3D.HSBS.mkv")),
+            film,
+        );
+        assert_eq!(
+            film_copy_key(Path::new("/f/Heat.1995.2160p.UHD.BluRay.x265.HDR.DDP5.1.mkv")),
+            film,
+        );
+        assert_ne!(
+            film_copy_key(Path::new(
+                "/tv/Planet Earth (2006)/Planet Earth (2006) - 01 - From Pole to Pole.mkv"
+            )),
+            film_copy_key(Path::new(
+                "/tv/Planet Earth (2006)/Planet Earth (2006) - 02 - Mountains.mkv"
+            )),
+        );
+    }
+
+    /// V847: a bracket that says more than a format keeps songs, discs and
+    /// remixes apart, and a disc folder does not drop the artist.
+    #[test]
+    fn a_song_tag_that_names_a_version_or_disc_keeps_it_apart() {
+        let key = |p: &str| song_copy_key(Path::new(p));
+        let song = key("/m/A/Single/Song.flac");
+        assert_ne!(key("/m/A/Single/Song [Instrumental].flac"), song);
+        assert_ne!(key("/m/A/Single/Song [Live].flac"), song);
+        assert_ne!(key("/m/A/Single/Song (Remix v2).flac"), song);
+        assert_ne!(key("/m/A/Single/Song (Web Version).flac"), song);
+        assert_eq!(key("/m/A/Single/Song [FLAC 24-96].flac"), song);
+        assert_eq!(key("/m/A/Single (2001) [WEB]/Song.mp3"), song);
+        assert_ne!(
+            key("/m/A/Album [CD1]/01 Intro.flac"),
+            key("/m/A/Album [CD2]/01 Intro.flac"),
+        );
+        assert_ne!(
+            key("/m/A/Album {Deluxe}/01 Intro.flac"),
+            key("/m/A/Album/01 Intro.flac"),
+        );
+        assert_ne!(
+            key("/m/A/Greatest Hits/CD1/01 Intro.flac"),
+            key("/m/B/Greatest Hits/CD1/01 Intro.flac"),
+        );
+    }
+
+    /// A song's name is never read for a 3D packing, so `01 Tab.mp3` ranks by
+    /// size like any other song.
+    #[test]
+    fn a_song_is_never_ranked_as_3d() {
+        let small = PathBuf::from("/m/A/Album/01 Tab.mp3");
+        let big = PathBuf::from("/m/A/Album/01 Tab.flac");
+        let rank = CopyRank::of(Some(&big), None, &HashMap::new());
+        assert!(!rank.is_3d, "{rank:?}");
+        let rank = CopyRank::of(Some(&small), None, &HashMap::new());
+        assert!(!rank.is_3d, "{rank:?}");
     }
 
     /// V847: copies of one song, beside each other or in a second rip of the
