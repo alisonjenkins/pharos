@@ -425,6 +425,10 @@ pub struct MetadataConfig {
     /// rewrite. Default true.
     #[serde(default = "default_true")]
     pub fetch_translations: bool,
+    /// Spec 033 — `"dry_run"` (default) logs the series split and key
+    /// repairs a full scan decides; `"apply"` writes them.
+    #[serde(default)]
+    pub series_identity_repair: pharos_scanner::series_split::RepairMode,
 }
 
 fn default_refresh_ttl_days() -> u32 {
@@ -451,6 +455,7 @@ impl Default for MetadataConfig {
             match_min_confidence: default_match_min_confidence(),
             refresh_interval_secs: default_refresh_interval_secs(),
             fetch_translations: true,
+            series_identity_repair: pharos_scanner::series_split::RepairMode::DryRun,
         }
     }
 }
