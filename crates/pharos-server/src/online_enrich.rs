@@ -97,6 +97,15 @@ pub struct EnrichedMetadata {
     pub series_id: Option<String>,
 }
 
+/// Spec 033 (V891) — one episode a provider lists for a show, what an
+/// episode-fit score compares the local files against.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EpisodeListing {
+    pub season: u32,
+    pub episode: u32,
+    pub title: Option<String>,
+}
+
 /// A single online metadata/artwork provider (TMDB, TVDB, ...). The
 /// orchestrator (T9) drives this generically: search to resolve a
 /// candidate id, then fetch the full record for that id. Implementations
@@ -168,6 +177,17 @@ pub trait OnlineEnricher: Send + Sync {
     ) -> impl Future<Output = TextsFetch> + Send {
         let _ = (kind, id, season, episode, name, languages);
         async { TextsFetch::NotFound }
+    }
+    /// Spec 033 (V891) — the episodes the provider lists for show `id`, in
+    /// `seasons` where the provider is asked season by season. `None` when a
+    /// request failed or the provider has no such listing.
+    fn episode_list(
+        &self,
+        id: &str,
+        seasons: &[u32],
+    ) -> impl Future<Output = Option<Vec<EpisodeListing>>> + Send {
+        let _ = (id, seasons);
+        async { None }
     }
 }
 

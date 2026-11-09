@@ -381,6 +381,19 @@ impl<T: TvdbTransport> TvdbClient<T> {
     /// `/episodes/{id}/translations/{lang}`. The flag is true when one of
     /// those requests failed, so its language has no row. An episode the
     /// list does not hold is [`TextsFetch::NotFound`].
+    /// Spec 033 (V891) — every episode TVDB lists for `series_id` in its
+    /// default order. `None` on a failed request or a body that is not a list.
+    pub async fn episode_list(
+        &self,
+        series_id: &str,
+    ) -> Option<Vec<crate::online_enrich::EpisodeListing>> {
+        let body = self
+            .record_body(&format!("/series/{series_id}/episodes/default"))
+            .await
+            .ok()?;
+        parse_episode_list(&body)
+    }
+
     async fn episode_record(
         &self,
         series_id: &str,
@@ -823,6 +836,24 @@ fn parse_episode_series(body: &str) -> Result<Option<EpisodeOfSeries>, TextsFetc
 /// `YYYY-MM-DD`, TVDB v4's per-episode air-date field) via
 /// [`pharos_core::parse_ymd_to_unix`].
 /// Whether `body` is a readable episode list (`data.episodes` an array).
+fn parse_episode_list(body: &str) -> Option<Vec<crate::online_enrich::EpisodeListing>> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    let episodes = v.get("data")?.get("episodes")?.as_array()?;
+    Some(
+        episodes
+            .iter()
+            .filter_map(|ep| {
+                let (season, episode) = episode_number(ep)?;
+                Some(crate::online_enrich::EpisodeListing {
+                    season,
+                    episode,
+                    title: text_field(ep, "name"),
+                })
+            })
+            .collect(),
+    )
+}
+
 fn episode_list_readable(body: &str) -> bool {
     serde_json::from_str::<serde_json::Value>(body)
         .ok()
@@ -1452,6 +1483,13 @@ impl<T: TvdbTransport> crate::online_enrich::OnlineEnricher for TvdbEnricher<T> 
             },
         }
     }
+    async fn episode_list(
+        &self,
+        id: &str,
+        _seasons: &[u32],
+    ) -> Option<Vec<crate::online_enrich::EpisodeListing>> {
+        self.0.episode_list(id).await
+    }
 }
 
 #[cfg(test)]
@@ -1622,6 +1660,48 @@ mod tests {
         assert!(c.get_series("121361").await.is_some());
         assert!(c.get_series("121361").await.is_some());
         assert_eq!(t.login_count(), 2); // logged in once, re-logged once after 401
+    }
+
+    #[tokio::test]
+    async fn tvdb_episode_list_reads_every_listed_episode() {
+        let body = r#"{"data":{"episodes":[
+          {"seasonNumber":1,"number":1,"name":"Pilot"},
+          {"seasonNumber":1,"number":2,"name":""},
+          {"seasonNumber":2,"number":1,"name":"Back"},
+          {"seasonNumber":2,"name":"No number"}
+        ]}}"#;
+        let t = FakeTransport::new().push_login("jwt").route(
+            "/series/79216/episodes/default",
+            200,
+            body,
+        );
+        let c = TvdbClient::with_transport("key".into(), t);
+        let got = c.episode_list("79216").await.unwrap();
+        let pairs: Vec<_> = got
+            .iter()
+            .map(|e| (e.season, e.episode, e.title.as_deref()))
+            .collect();
+        assert_eq!(
+            pairs,
+            vec![(1, 1, Some("Pilot")), (1, 2, None), (2, 1, Some("Back"))]
+        );
+    }
+
+    #[tokio::test]
+    async fn tvdb_episode_list_is_none_when_the_request_fails() {
+        let t =
+            FakeTransport::new()
+                .push_login("jwt")
+                .route("/series/79216/episodes/default", 500, "");
+        let c = TvdbClient::with_transport("key".into(), t);
+        assert!(c.episode_list("79216").await.is_none());
+        let t = FakeTransport::new().push_login("jwt").route(
+            "/series/79216/episodes/default",
+            200,
+            "{\"data\":",
+        );
+        let c = TvdbClient::with_transport("key".into(), t);
+        assert!(c.episode_list("79216").await.is_none());
     }
 
     #[tokio::test]
