@@ -1630,6 +1630,10 @@ fn NativeApp(route: Route) -> Element {
     // send values this build cannot read: it asks to be reloaded.
     let outdated = use_signal(|| false);
     let marks = use_signal(|| 0u32);
+    // Bumped by a library change the server pushes; marks by a user data one.
+    let library_rev = use_signal(|| 0u32);
+    use_context_provider(|| super::live::LibraryRev(library_rev));
+    super::live::use_live_updates(api, marks, library_rev);
     let flash = Flash {
         line: use_signal(|| None),
         generation: use_signal(|| 0),
@@ -1768,6 +1772,7 @@ fn NativeApp(route: Route) -> Element {
     // keeps the last list until the new one arrives.
     let mut libraries = use_signal(Vec::<Item>::new);
     use_effect(move || {
+        let _ = library_rev();
         let Some(api) = api.read().clone() else {
             return;
         };
@@ -3270,8 +3275,13 @@ fn loaded_or_retry<T>(
 #[component]
 fn HomeScreen() -> Element {
     let ctx = use_context::<Ctx>();
+    let library = try_use_context::<super::live::LibraryRev>();
     let mut home = use_resource(move || {
         let api = ctx.api.read().clone();
+        // Continue Watching and Next Up follow watched marks; the rails
+        // follow the library.
+        let _ = (ctx.marks)();
+        let _ = library.map(|l| (l.0)());
         async move {
             let api = api?;
             Some(settle_load(
@@ -3291,11 +3301,13 @@ fn HomeScreen() -> Element {
 #[component]
 fn BrowseScreen(id: ItemRef) -> Element {
     let ctx = use_context::<Ctx>();
+    let library = try_use_context::<super::live::LibraryRev>();
     // The screen stays mounted when a tile or season tab opens another
     // parent, so the load follows `id` instead of running once.
     let mut listing = use_resource(use_reactive!(|(id,)| {
         let api = ctx.api.read().clone();
         let _ = (ctx.marks)();
+        let _ = library.map(|l| (l.0)());
         async move {
             let api = api?;
             let result = browse::load(&api, &call("browse", "load"), id, |line| {
