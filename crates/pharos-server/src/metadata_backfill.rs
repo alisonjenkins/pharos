@@ -1704,11 +1704,17 @@ where
     }
     let keys: Vec<String> = survey.reask.keys().cloned().collect();
     let readmitted = store.readmit_series(&keys).await?;
-    let ids: Vec<pharos_core::MediaId> = survey.episodes.iter().map(|(id, _)| *id).collect();
+    let mut ids: Vec<pharos_core::MediaId> = survey.episodes.iter().map(|(id, _)| *id).collect();
+    let mut rows_written = 0usize;
+    for split in &survey.title_splits {
+        rows_written += write_title_split(store, split, now).await?;
+        ids.extend(split.files.iter().map(|f| f.id));
+    }
     let marked = store.mark_reconcile_items(&ids, now).await?;
     tracing::info!(
         readmitted,
         marked,
+        override_rows = rows_written,
         from = from.as_str(),
         to = want.as_str(),
         "series identity repair: show matcher version changed, re-asking the surveyed shows"
@@ -1733,6 +1739,9 @@ pub(crate) enum RepairReason {
     OtherShow,
     /// The episode aired outside its show's run.
     OutsideRun,
+    /// The unyeared file's episode title is a same-named show's of another
+    /// year, so it splits off (V893).
+    EpisodeTitles,
 }
 
 impl RepairReason {
@@ -1743,6 +1752,7 @@ impl RepairReason {
             Self::Split => "split",
             Self::OtherShow => "other_show",
             Self::OutsideRun => "outside_run",
+            Self::EpisodeTitles => "episode_titles",
         }
     }
 }
@@ -1758,6 +1768,29 @@ const RUN_SLACK_SECS: i64 = 180 * 86_400;
 pub(crate) struct Survey {
     pub reask: std::collections::BTreeMap<String, RepairReason>,
     pub episodes: Vec<(pharos_core::MediaId, RepairReason)>,
+    /// Folders whose unyeared files belong to a same-named show by their
+    /// episode titles: split by `scanner` rows on the next scan, so neither
+    /// re-asked nor rebuilt until then.
+    pub title_splits: Vec<TitleSplit>,
+}
+
+/// Spec 033 §2 (V893) — a folder's unyeared files whose filename episode
+/// titles are a same-named show's of another year, not its own year's.
+#[derive(Debug)]
+pub(crate) struct TitleSplit {
+    pub folder: String,
+    /// The year whose group keeps the plain key: the one within a year of the
+    /// stored match's premiere, if any.
+    pub owner_year: Option<u32>,
+    pub files: Vec<TitleMove>,
+}
+
+/// One unyeared file and the show its episode title names.
+#[derive(Debug)]
+pub(crate) struct TitleMove {
+    pub id: pharos_core::MediaId,
+    pub path: String,
+    pub year: u32,
 }
 
 impl Survey {
@@ -1771,6 +1804,11 @@ impl Survey {
         for (_, reason) in &self.episodes {
             *counts.entry(("episode", *reason)).or_default() += 1;
         }
+        for split in &self.title_splits {
+            *counts
+                .entry(("episode", RepairReason::EpisodeTitles))
+                .or_default() += split.files.len();
+        }
         for kind in ["show", "episode"] {
             for reason in [
                 RepairReason::ExactRival,
@@ -1778,6 +1816,7 @@ impl Survey {
                 RepairReason::Split,
                 RepairReason::OtherShow,
                 RepairReason::OutsideRun,
+                RepairReason::EpisodeTitles,
             ] {
                 let n = counts.get(&(kind, reason)).copied().unwrap_or(0);
                 #[allow(clippy::cast_precision_loss)]
@@ -1801,6 +1840,7 @@ impl Survey {
             to,
             shows = self.reask.len(),
             episodes = self.episodes.len(),
+            title_splits = self.title_splits.len(),
             reask = ?reask,
             "series identity repair: survey"
         );
@@ -1837,6 +1877,21 @@ where
         let Some((provider, show_id)) = stored_match(m) else {
             continue;
         };
+        if m.match_source.as_deref() != Some("manual") {
+            if let Some(split) =
+                title_evidence(store, providers, bg_io, cfg, cand, m, provider).await?
+            {
+                tracing::info!(
+                    folder = %split.folder,
+                    files = split.files.len(),
+                    owner_year = split.owner_year,
+                    "series identity repair: split pending on episode titles, not re-asked"
+                );
+                survey.title_splits.push(split);
+                tokio::time::sleep(REQUEST_SPACING).await;
+                continue;
+            }
+        }
         if m.match_source.as_deref() == Some("search") {
             let reason = show_conflict(store, providers, bg_io, cfg, cand, m, provider).await?;
             if let Some(reason) = reason {
@@ -1915,6 +1970,230 @@ async fn list_episodes<E: OnlineEnricher>(
 ) -> Option<Vec<EpisodeListing>> {
     let _permit = BgPermit::acquire(bg_io).await;
     enricher.episode_list(show_id, seasons).await
+}
+
+/// Spec 033 §2 (V893) — record a [`TitleSplit`] as `scanner` override rows:
+/// one per moved file with its show's year, and the folder-wide owner row,
+/// so a later change of the folder's match cannot hand its plain key to the
+/// other show. Existing rows are kept. Returns the rows inserted.
+async fn write_title_split<S: pharos_core::SeriesIdentityStore>(
+    store: &S,
+    split: &TitleSplit,
+    now: i64,
+) -> DomainResult<usize> {
+    use pharos_core::{OverrideSource, SeriesOverride};
+    let row = |path: Option<String>, target_key: String, year: u32| SeriesOverride {
+        id: 0,
+        series_folder: split.folder.clone(),
+        path,
+        target_key,
+        target_name: None,
+        target_year: Some(year),
+        source: OverrideSource::Scanner,
+        created_by: None,
+        created_at: now,
+    };
+    let mut written = 0;
+    if let Some(year) = split.owner_year {
+        written += usize::from(
+            store
+                .insert_series_override(row(None, split.folder.clone(), year))
+                .await?,
+        );
+    }
+    for f in &split.files {
+        let key = pharos_scanner::series_split::split_key(&split.folder, f.year);
+        written += usize::from(
+            store
+                .insert_series_override(row(Some(f.path.clone()), key, f.year))
+                .await?,
+        );
+    }
+    Ok(written)
+}
+
+/// Spec 033 §2 (V893) — a folder whose files state one show year but also
+/// hold unyeared files with episode titles: each such title is compared with
+/// the stated year's show and with the exact-name shows of other years at
+/// the same season and episode. A file whose title names a rival's episode
+/// (similarity ≥ 0.8) and not its own year's show's belongs to that rival.
+/// Only these folders cost a search and the lists of the shows compared.
+async fn title_evidence<Tv, Tm, S>(
+    store: &S,
+    providers: &SeriesProviders<'_, Tv, Tm>,
+    bg_io: &Arc<Semaphore>,
+    cfg: &MetadataConfig,
+    cand: &SeriesMatchCandidate,
+    stored: &SeriesMetadata,
+    provider: &str,
+) -> DomainResult<Option<TitleSplit>>
+where
+    Tv: OnlineEnricher,
+    Tm: OnlineEnricher,
+    S: pharos_core::SeriesIdentityStore,
+{
+    let folder = cand.series_key.clone();
+    if folder.contains(pharos_scanner::series_split::SPLIT_KEY_SEPARATOR) {
+        return Ok(None);
+    }
+    let rows = store.series_episodes(&folder).await?;
+    let mut years = std::collections::BTreeSet::new();
+    let mut unyeared = Vec::new();
+    for row in &rows {
+        let path = std::path::Path::new(&row.path);
+        match pharos_scanner::series_split::stated_show_year(path) {
+            Some(y) => {
+                years.insert(y);
+            }
+            None => {
+                let title = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .and_then(pharos_scanner::metadata::filename::episode_title);
+                if let (Some(season), Some(episode), Some(title)) = (row.season, row.episode, title)
+                {
+                    unyeared.push((row, season, episode, title));
+                }
+            }
+        }
+    }
+    let stated = match (years.len(), years.first()) {
+        (1, Some(&y)) => y,
+        _ => return Ok(None),
+    };
+    if unyeared.is_empty() {
+        return Ok(None);
+    }
+    match provider {
+        "tvdb" => match providers.tvdb {
+            Some(t) => title_moves(t, provider, bg_io, cfg, cand, stored, stated, &unyeared).await,
+            None => Ok(None),
+        },
+        "tmdb" => match providers.tmdb {
+            Some(t) => title_moves(t, provider, bg_io, cfg, cand, stored, stated, &unyeared).await,
+            None => Ok(None),
+        },
+        _ => Ok(None),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn title_moves<E: OnlineEnricher>(
+    enricher: &E,
+    provider: &str,
+    bg_io: &Arc<Semaphore>,
+    cfg: &MetadataConfig,
+    cand: &SeriesMatchCandidate,
+    stored: &SeriesMetadata,
+    stated: u32,
+    unyeared: &[(&pharos_core::SeriesEpisodeRow, u32, u32, String)],
+) -> DomainResult<Option<TitleSplit>> {
+    let decision = search_decide(
+        enricher,
+        MediaKind::Episode,
+        &cand.series_name,
+        None,
+        bg_io,
+        cfg,
+    )
+    .await;
+    let exact: Vec<&pharos_core::ScoredCandidate> =
+        decision.candidates.iter().filter(|c| c.exact).collect();
+    let Some(own) = exact
+        .iter()
+        .filter(|c| c.year.is_some_and(|y| y.abs_diff(stated) <= 1))
+        .min_by_key(|c| c.year.map(|y| y.abs_diff(stated)))
+    else {
+        return Ok(None);
+    };
+    let rivals: Vec<(&str, u32)> = exact
+        .iter()
+        .filter_map(|c| Some((c.id.as_str(), c.year.filter(|y| y.abs_diff(stated) > 1)?)))
+        .take(episode_fit::MAX_SCORED)
+        .collect();
+    if rivals.is_empty() {
+        return Ok(None);
+    }
+    let seasons: Vec<u32> = unyeared
+        .iter()
+        .map(|(_, s, _, _)| *s)
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let Some(own_list) = list_episodes(enricher, bg_io, &own.id, &seasons).await else {
+        tracing::info!(
+            series_key = %cand.series_key,
+            provider,
+            show_id = %own.id,
+            "series identity repair: episode list unavailable, folder not split on episode titles"
+        );
+        return Ok(None);
+    };
+    let mut rival_lists = Vec::new();
+    for (id, year) in &rivals {
+        if let Some(list) = list_episodes(enricher, bg_io, id, &seasons).await {
+            rival_lists.push((*id, *year, list));
+        }
+    }
+    let listed = |list: &[EpisodeListing], s: u32, e: u32| {
+        list.iter()
+            .find(|l| l.season == s && l.episode == e)
+            .and_then(|l| l.title.clone())
+    };
+    let sim = |a: &str, b: Option<&str>| b.map_or(0.0, |b| pharos_core::title_similarity(a, b));
+    let mut files = Vec::new();
+    for (row, s, e, title) in unyeared {
+        let own_title = listed(&own_list, *s, *e);
+        let own_score = sim(title, own_title.as_deref());
+        if own_score >= episode_fit::SAME_TITLE {
+            continue;
+        }
+        let best = rival_lists
+            .iter()
+            .filter_map(|(id, year, list)| {
+                let t = listed(list, *s, *e);
+                let score = sim(title, t.as_deref());
+                (score >= episode_fit::SAME_TITLE).then_some((*id, *year, t, score))
+            })
+            .max_by(|a, b| a.3.total_cmp(&b.3));
+        let Some((rival_id, year, rival_title, rival_score)) = best else {
+            continue;
+        };
+        tracing::info!(
+            path = %row.path,
+            season = s,
+            episode = e,
+            title = %title,
+            own_id = %own.id,
+            own_title = own_title.as_deref(),
+            own_score,
+            rival_id,
+            rival_year = year,
+            rival_title = rival_title.as_deref(),
+            rival_score,
+            "series identity repair: file's episode title names a same-named show"
+        );
+        files.push(TitleMove {
+            id: row.id,
+            path: row.path.clone(),
+            year,
+        });
+    }
+    if files.is_empty() {
+        return Ok(None);
+    }
+    let premiered = stored.premiere_date.and_then(pharos_store_sqlx::unix_year);
+    let owner_year = premiered.and_then(|p| {
+        std::iter::once(stated)
+            .chain(files.iter().map(|f| f.year))
+            .filter(|y| y.abs_diff(p) <= 1)
+            .min_by_key(|y| y.abs_diff(p))
+    });
+    Ok(Some(TitleSplit {
+        folder: cand.series_key.clone(),
+        owner_year,
+        files,
+    }))
 }
 
 /// Why a searched show's stored match conflicts with its evidence, if it does.
@@ -5409,6 +5688,29 @@ mod tests {
             .sum()
     }
 
+    fn gauge_value(
+        snap: &pharos_test_metrics::CumulativeSnapshotter,
+        name: &str,
+        labels: &[(&str, &str)],
+    ) -> Option<f64> {
+        use metrics_util::debugging::DebugValue;
+        snap.snapshot()
+            .into_vec()
+            .into_iter()
+            .find_map(|(k, _, _, v)| {
+                let hit = k.key().name() == name
+                    && labels.iter().all(|(n, want)| {
+                        k.key()
+                            .labels()
+                            .any(|l| l.key() == *n && l.value() == *want)
+                    });
+                match v {
+                    DebugValue::Gauge(g) if hit => Some(g.into_inner()),
+                    _ => None,
+                }
+            })
+    }
+
     async fn put_bare_episode(store: &SqliteStore, id: u64, series: &str, folder: &str) {
         let item = MediaItem {
             id,
@@ -6193,6 +6495,131 @@ mod tests {
     }
 
     const FLASH: &str = "/tv/The Flash";
+
+    /// The Flash folder: an unyeared Season 1 file titled like the 1990 show's
+    /// pilot, a Season 3 file stating 2014, and the stored 1990 match.
+    async fn flash_folder(s: &SqliteStore) {
+        put_titled_episode(s, 1, FLASH, (1, 1), "Pilot").await;
+        let mut modern = MediaItem {
+            id: 2,
+            path: format!("{FLASH}/Season 3/The Flash (2014) - S03E01 - The Flash Reborn.mkv")
+                .into(),
+            title: "The Flash Reborn".into(),
+            kind: MediaKind::Episode,
+            ..MediaItem::default()
+        };
+        modern.series = Some(pharos_core::SeriesInfo {
+            series_name: "The Flash".into(),
+            season_number: Some(3),
+            episode_number: Some(1),
+            series_folder: Some(FLASH.into()),
+            series_year: None,
+            series_key: None,
+        });
+        s.put(modern).await.unwrap();
+        s.upsert_series_metadata(SeriesMetadata {
+            series_key: FLASH.into(),
+            series_name: "The Flash".into(),
+            match_provider: Some("tvdb".into()),
+            match_external_id: Some("78650".into()),
+            match_source: Some("search".into()),
+            premiere_date: Some(653_788_800), // 1990-09-20
+            metadata_refreshed_at: Some(NOW),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        set_version(s, TV_MATCH_VERSION_KEY, "1").await;
+    }
+
+    fn flash_tvdb() -> FakeEnricher {
+        FakeEnricher::tvdb()
+            .with_search(vec![
+                ("279121", "The Flash", Some(2014)),
+                ("78650", "The Flash", Some(1990)),
+            ])
+            .with_list("279121", &[(1, 1, "City of Heroes")])
+            .with_list("78650", &[(1, 1, "Pilot")])
+    }
+
+    /// Spec 033 §2 (V893, B932) — the survey finds the unyeared file whose
+    /// title is the 1990 show's pilot, not the 2014 show's. A dry run only
+    /// logs it; `apply` records the file's `scanner` row with 1990 and the
+    /// owner row keeping the folder key for the stored 1990 match, marks the
+    /// file, and neither re-asks the folder nor marks the 2014 file before
+    /// the scan has split them.
+    #[tokio::test(flavor = "current_thread")]
+    async fn episode_titles_split_off_a_same_named_shows_files() {
+        use metrics_util::debugging::DebuggingRecorder;
+        let recorder = DebuggingRecorder::new();
+        let snap = pharos_test_metrics::snapshotter(&recorder);
+        let _metrics = metrics::set_default_local_recorder(&recorder);
+        let (logs, _log) = log_capture();
+        let s = store().await;
+        flash_folder(&s).await;
+        let tvdb = flash_tvdb();
+
+        gate(&s, &tvdb, &MetadataConfig::default()).await;
+        assert!(s
+            .series_overrides(&[FLASH.into()])
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(pending_ids(&s).await.is_empty());
+        let text = logs.text();
+        let line = text
+            .lines()
+            .find(|l| l.contains("file's episode title names a same-named show"))
+            .unwrap_or_else(|| panic!("no title evidence line in {text}"));
+        for want in [
+            "rival_id=\"78650\"",
+            "rival_year=1990",
+            "own_title=\"City of Heroes\"",
+        ] {
+            assert!(line.contains(want), "{want} missing from {line}");
+        }
+        assert_eq!(
+            gauge_value(
+                &snap,
+                "pharos_series_identity_repair_selected",
+                &[
+                    ("kind", "episode"),
+                    ("reason", "episode_titles"),
+                    ("mode", "dry_run")
+                ]
+            ),
+            Some(1.0)
+        );
+
+        gate(&s, &tvdb, &apply_cfg()).await;
+        let mut rows = s.series_overrides(&[FLASH.into()]).await.unwrap();
+        rows.sort_by_key(|o| o.path.is_some());
+        let got: Vec<_> = rows
+            .iter()
+            .map(|o| (o.path.clone(), o.target_year, o.source))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (None, Some(1990), pharos_core::OverrideSource::Scanner),
+                (
+                    Some(format!("{FLASH}/Season 1/The Flash - S01E01 - Pilot.mkv")),
+                    Some(1990),
+                    pharos_core::OverrideSource::Scanner
+                ),
+            ]
+        );
+        assert_eq!(pending_ids(&s).await, [1]);
+        assert!(s
+            .series_needing_match(10, NOW - 1)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            version(&s, TV_MATCH_VERSION_KEY).await.as_deref(),
+            Some("2")
+        );
+    }
 
     /// A row the scanner moved to a key with no match row yet is not rebuilt:
     /// it stays marked, behind the rest, until its new show is matched.
