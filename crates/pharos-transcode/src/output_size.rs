@@ -121,6 +121,15 @@ impl SizeLimits {
         self.max_height
     }
 
+    /// The same box with the height bound lowered to `height` if that is
+    /// tighter (a ladder rung's own height).
+    pub fn capped_height(self, height: u32) -> Self {
+        Self {
+            max_height: Some(self.max_height.map_or(height, |h| h.min(height))),
+            ..self
+        }
+    }
+
     pub fn is_empty(&self) -> bool {
         self.max_width.is_none() && self.max_height.is_none()
     }
@@ -152,10 +161,10 @@ impl ScaleReason {
 /// the next rung. Deliberately low: it exists to stop a 4K encode at 1.5 Mbps
 /// (which no one can watch), not to second-guess a client that chose its rate.
 const BITRATE_LADDER: [(u32, u64); 5] = [
-    (2160, 8_000_000),
-    (1440, 5_000_000),
-    (1080, 2_500_000),
-    (720, 1_200_000),
+    (2160, 6_000_000),
+    (1440, 3_500_000),
+    (1080, 1_800_000),
+    (720, 900_000),
     (480, 0),
 ];
 
@@ -307,10 +316,10 @@ mod tests {
     fn a_starved_bitrate_picks_a_lower_rung() {
         for (bps, h) in [
             (12_000_000, None),
-            (8_000_000, None),
-            (6_000_000, Some(1440)),
-            (3_000_000, Some(1080)),
-            (1_500_000, Some(720)),
+            (6_000_000, None),
+            (4_000_000, Some(1440)),
+            (2_000_000, Some(1080)),
+            (1_000_000, Some(720)),
             (800_000, Some(480)),
         ] {
             let got = plan(3840, 2160, SizeLimits::default(), Some(bps), 2);
@@ -323,9 +332,19 @@ mod tests {
 
     #[test]
     fn the_client_box_beats_a_looser_bitrate_rung() {
-        let (s, r) = plan(3840, 2160, limits(None, Some(720)), Some(6_000_000), 2).unwrap();
+        let (s, r) = plan(3840, 2160, limits(None, Some(720)), Some(4_000_000), 2).unwrap();
         assert_eq!(s.height(), 720);
         assert_eq!(r, ScaleReason::MaxSize);
+    }
+
+    #[test]
+    fn a_rung_height_only_ever_tightens_the_box() {
+        let l = limits(None, Some(1080)).capped_height(720);
+        assert_eq!(plan(3840, 2160, l, None, 2).unwrap().0.height(), 720);
+        let l = limits(None, Some(480)).capped_height(720);
+        assert_eq!(plan(3840, 2160, l, None, 2).unwrap().0.height(), 480);
+        let l = SizeLimits::default().capped_height(1080);
+        assert_eq!(plan(3840, 2160, l, None, 2).unwrap().0.height(), 1080);
     }
 
     #[test]
