@@ -991,6 +991,11 @@ pub fn deep_poll_wanted(report: &Result<IntegrityReport, String>) -> bool {
     report.as_ref().is_ok_and(|r| any_deep_active(deep_list(r)))
 }
 
+/// A poll timer may re-load the tab only if no newer load has superseded it.
+pub fn poll_due(scheduled: u32, current: u32) -> bool {
+    scheduled == current
+}
+
 fn deep_is_active(c: &DeepCheck) -> bool {
     matches!(c.state.as_str(), "queued" | "running")
 }
@@ -1736,6 +1741,8 @@ mod tests {
         assert!(deep_poll_wanted(&with("queued")));
         assert!(!deep_poll_wanted(&with("clean")));
         assert!(!deep_poll_wanted(&Err("boom".into())));
+        assert!(poll_due(3, 3));
+        assert!(!poll_due(2, 3), "a superseded timer must not re-load");
         assert!(deep_in_progress(&[deep("1", "queued")], "1"));
         assert!(!deep_in_progress(&[deep("1", "queued")], "2"));
     }
