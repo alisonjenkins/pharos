@@ -1293,7 +1293,9 @@ impl MediaStore for SqliteStore {
              WHEN ?3 AND excluded.last_played_at > user_data.last_played_at \
              THEN excluded.last_played_position_ticks \
              ELSE user_data.last_played_position_ticks END, \
-             last_played_at = MAX(user_data.last_played_at, excluded.last_played_at)",
+             last_played_at = CASE WHEN ?3 \
+             THEN MAX(user_data.last_played_at, excluded.last_played_at) \
+             ELSE user_data.last_played_at END",
         )
         .bind(from)
         .bind(into)
