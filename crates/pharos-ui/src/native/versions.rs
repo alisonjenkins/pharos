@@ -42,6 +42,9 @@ pub fn version_label(version: &Version) -> String {
         parts.push(audio);
     }
     parts.extend(file_size(version.size_bytes));
+    if version.damaged {
+        parts.push("Damaged".to_owned());
+    }
     if parts.is_empty() {
         return "2D".to_owned();
     }
