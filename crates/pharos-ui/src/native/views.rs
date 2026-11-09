@@ -38,6 +38,42 @@ pub struct Nav(pub EventHandler<Route>);
 #[derive(Clone, Copy)]
 pub struct MarkPlayed(pub EventHandler<(ItemRef, bool, String)>);
 
+/// Marks an item one of the viewer's favourites (`true`) or not, provided
+/// by the app root: it stores the mark and reloads the screen. The name is
+/// what a failure says it could not mark.
+#[derive(Clone, Copy)]
+pub struct MarkFavorite(pub EventHandler<(ItemRef, bool, String)>);
+
+/// A button that marks `id` a favourite, or takes the mark off when
+/// `favorite`. `aria-pressed` carries the state, so the label stays put and
+/// nothing names the opposite action.
+#[component]
+pub fn FavoriteToggle(id: ItemRef, favorite: bool, #[props(default)] name: String) -> Element {
+    let mark = use_context::<MarkFavorite>();
+    let star = if favorite { "\u{2605}" } else { "\u{2606}" };
+    rsx! {
+        button {
+            r#type: "button",
+            class: if favorite { "pharos-button pharos-button-secondary pharos-favorite on" } else { "pharos-button pharos-button-secondary pharos-favorite" },
+            "data-key-action": "favorite",
+            aria_pressed: if favorite { "true" } else { "false" },
+            onclick: move |_| mark.0.call((id, !favorite, name.clone())),
+            span { aria_hidden: "true", "{star} " }
+            "Favourite"
+        }
+    }
+}
+
+/// What a favourite mark that the server refused says.
+pub fn favorite_failure_line(name: &str, favorite: bool, reason: &str) -> String {
+    let what = if name.is_empty() { "this" } else { name };
+    if favorite {
+        format!("Couldn't add {what} to favourites: {reason}")
+    } else {
+        format!("Couldn't remove {what} from favourites: {reason}")
+    }
+}
+
 /// Plays an item from 0 s whatever position was saved, provided by the app
 /// root.
 #[derive(Clone, Copy)]
@@ -1184,6 +1220,9 @@ pub fn TitleView(
                     if item.kind.playable() {
                         WatchedToggle { id: item.id, played: item.played, listen: item.kind == ItemKind::Audio, name: display_name(item) }
                     }
+                    if item.kind.playable() {
+                        FavoriteToggle { id: item.id, favorite: item.favorite, name: display_name(item) }
+                    }
                 }
                 if let Some(tracks) = tracks {
                     {tracks}
@@ -1691,6 +1730,9 @@ mod tests {
                 use_context_provider(|| Nav(EventHandler::new(|_: Route| {})));
                 use_context_provider(|| {
                     MarkPlayed(EventHandler::new(|_: (ItemRef, bool, String)| {}))
+                });
+                use_context_provider(|| {
+                    MarkFavorite(EventHandler::new(|_: (ItemRef, bool, String)| {}))
                 });
                 body()
             },
@@ -2513,6 +2555,60 @@ mod tests {
                 r#"<option value="3d-hsbs" selected=true>3D (half side-by-side)</option>"#
             ),
             "{html}"
+        );
+    }
+
+    /// B1082: a film, episode or song's title page offers a favourite
+    /// mark, pressed while it is one.
+    /// Disarm check: without the FavoriteToggle in TitleView, neither
+    /// button renders.
+    #[test]
+    fn a_title_offers_a_favourite_mark() {
+        let detail = |favorite: bool| {
+            let mut movie = item(ItemKind::Movie);
+            movie.favorite = favorite;
+            Detail {
+                item: movie,
+                overview: String::new(),
+                genres: vec![],
+                chapters: vec![],
+                audio_tracks: vec![],
+                subtitle_tracks: vec![],
+                trickplay: vec![],
+                segments: vec![],
+                fonts: Vec::new(),
+                artists: Vec::new(),
+                album: None,
+                cast: Vec::new(),
+                versions: Vec::new(),
+                damage: None,
+            }
+        };
+        let off = detail(false);
+        let html = render(move || rsx! { TitleView { detail: off.clone() } });
+        assert!(
+            html.contains(r#"data-key-action="favorite""#)
+                && html.contains(r#"aria-pressed="false""#)
+                && html.contains(">Favourite<"),
+            "{html}"
+        );
+        let on = detail(true);
+        let html = render(move || rsx! { TitleView { detail: on.clone() } });
+        assert!(
+            html.contains(r#"aria-pressed="true""#) && html.contains("pharos-favorite on"),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn a_refused_favourite_mark_names_the_item_and_the_reason() {
+        assert_eq!(
+            favorite_failure_line("Alien", true, "unavailable: db down"),
+            "Couldn't add Alien to favourites: unavailable: db down"
+        );
+        assert_eq!(
+            favorite_failure_line("", false, "x"),
+            "Couldn't remove this from favourites: x"
         );
     }
 

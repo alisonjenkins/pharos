@@ -305,6 +305,11 @@ mod tests {
                 use_context_provider(|| {
                     MarkPlayed(EventHandler::new(|_: (ItemRef, bool, String)| {}))
                 });
+                use_context_provider(|| {
+                    super::super::views::MarkFavorite(EventHandler::new(
+                        |_: (ItemRef, bool, String)| {},
+                    ))
+                });
                 rsx! { PersonView { page } }
             },
             page,
