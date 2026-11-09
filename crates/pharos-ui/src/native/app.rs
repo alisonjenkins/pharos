@@ -6108,6 +6108,7 @@ fn Player(
             }
         } else {
             WatchView {
+                compact,
                 title: heading.0,
                 title_detail: heading.1,
                 controls,

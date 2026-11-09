@@ -24,6 +24,7 @@ use super::playback::{
 };
 use super::queue::{Entry, QueueAction};
 use super::seen::SeenRow;
+use super::stage::STAGE_EXPAND_ID;
 use super::together::Member;
 use super::together_view::{ActivityToast, InvitePanel, MemberStrip};
 use super::views::{ends_at, episode_label, use_ends_at_refresh};
@@ -47,6 +48,10 @@ pub(super) const SEEK_STEP_MS: u64 = 10_000;
 /// on OK or a pause (B907), as a TV remote wants, instead of seeking 10 s
 /// at once as a keyboard does.
 const SCRUB_KEYS: bool = cfg!(target_os = "android");
+/// Whether the D-pad's spatial focus is the only way round the page, as on
+/// a TV remote with no Tab or pointer (B1031): the compact player's picture
+/// is then no focus stop, so the D-pad reaches the stage bar's buttons.
+const REMOTE_FOCUS: bool = cfg!(target_os = "android");
 /// How far the up and down keys move the volume.
 const VOLUME_STEP: f64 = 0.1;
 /// How often a playing picture checks for a still pointer.
@@ -301,6 +306,13 @@ pub(super) fn next_audio(tracks: &[Track], pick: Option<u32>) -> Option<Control>
     Some(Control::Audio(next.index))
 }
 
+/// Whether the picture is a focus stop that takes the transport keys: always
+/// in the full player, and in the compact one unless the D-pad's spatial
+/// focus is the only way to its stage bar (B1031).
+pub(super) fn picture_takes_keys(compact: bool, remote_focus: bool) -> bool {
+    !(compact && remote_focus)
+}
+
 /// What a key does to a remote scrub (B907): left or right moves the
 /// preview, OK or play commits it, Back drops it; any other key, and every
 /// key while no preview is under way that is not left or right, passes on.
@@ -426,6 +438,10 @@ pub fn video_queue_label(count: usize) -> String {
 #[component]
 pub fn WatchView(
     title: String,
+    /// The player is the floating window or the mini bar (spec 020), whose
+    /// stage bar carries the transport.
+    #[props(default)]
+    compact: bool,
     /// The line under the title: "S1 · E22 · Future Enemies", a film's year.
     #[props(default)]
     title_detail: Option<String>,
@@ -595,7 +611,20 @@ pub fn WatchView(
             }))
         })
     });
+    // On a TV the compact picture hands the focus to the stage bar's Expand
+    // button, and keeps none of the D-pad for itself (B1031): left and right
+    // seeking it would leave the bar's buttons out of reach.
+    let picture_keys = picture_takes_keys(compact, REMOTE_FOCUS);
+    use_effect(use_reactive!(|compact| {
+        if !picture_takes_keys(compact, REMOTE_FOCUS) {
+            platform::info("pharos: stage remote focus to=expand reason=compact");
+            platform::focus_out_of(PLAYER_ID, STAGE_EXPAND_ID);
+        }
+    }));
     let on_key = move |evt: KeyboardEvent| {
+        if !picture_keys {
+            return;
+        }
         wake();
         // Ctrl/Cmd chords are the browser's and the palette's (Ctrl+K):
         // a bare `k` raises the volume, the chord must not. After `g`, `h`
@@ -726,7 +755,7 @@ pub fn WatchView(
             div {
                 id: PLAYER_ID,
                 class,
-                tabindex: 0,
+                tabindex: if picture_keys { 0 } else { -1 },
                 onkeydown: on_key,
                 onpointermove: move |_| wake(),
                 onpointerdown: move |evt: PointerEvent| {
@@ -2835,6 +2864,18 @@ mod tests {
         let html = render(c);
         assert!(!html.contains("Skip intro"), "{html}");
         assert!(!html.contains(r#"aria-label="Audio""#), "{html}");
+    }
+
+    /// B1031/V990: a TV's compact picture takes no keys and is no focus
+    /// stop, so the D-pad reaches the mini bar's or floating window's
+    /// Expand button instead of seeking. The full player keeps its keys, and
+    /// a keyboard keeps them in the compact player too.
+    #[test]
+    fn a_remote_leaves_the_compact_picture_to_the_stage_bar() {
+        assert!(picture_takes_keys(false, true), "full player on a TV");
+        assert!(picture_takes_keys(false, false));
+        assert!(picture_takes_keys(true, false), "compact with a keyboard");
+        assert!(!picture_takes_keys(true, true), "compact on a TV");
     }
 
     #[test]

@@ -1071,6 +1071,22 @@ pub fn select_field(id: &str) {
     field.select();
 }
 
+/// Moves keyboard focus to `to` when it is inside `within` (B1031).
+pub fn focus_out_of(within: &str, to: &str) {
+    let Some(doc) = document() else {
+        return;
+    };
+    let Some(within) = doc.get_element_by_id(within) else {
+        return;
+    };
+    if doc
+        .active_element()
+        .is_some_and(|a| within.contains(Some(&*a)))
+    {
+        focus_by_id(to);
+    }
+}
+
 /// Moves keyboard focus to the element `id`, when it is there and focusable.
 pub fn focus_by_id(id: &str) {
     use wasm_bindgen::JsCast;
