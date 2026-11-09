@@ -2,15 +2,20 @@
 
 **Feature directory**: `specs/022-ui-3d/`
 **Created**: 2026-11-03T23:45:00Z
-**Status**: draft
+**Status**: in progress. US1 shipped in #1055 (B770, V720, V722). US2, US3
+and US4 remain; the 2026-11-09 amendment below renumbers their ids and adds
+Android TV.
 **Input**: "We also need support for 3D movies" (Alison, 2026-11-03). The
-headsets in use are a Meta Quest and a Steam Frame.
+headsets in use are a Meta Quest and a Steam Frame. "Also we need to implement
+3d support still" (Alison, 2026-11-09): 3D files must play in 3D, not only be
+labelled.
 **Depends on**: 018 (3D detection, `Video3DFormat`, `Is3D`, `StereoOutput`),
 3D edition grouping (#450, `AlternateMediaSource.video_3d_format`, `has_3d`),
 #479 (a playback picks a grouped edition), 017 (native API), ADR-0039
 (`render/` WebGL2 layer), 013 (watch page)
-**Ids**: bugs from B350, invariants from V290 (lower ids are allocated to
-work in flight)
+**Ids**: bugs from B960, invariants from V920, ADR from 0088 (amended
+2026-11-09; the ids first written here, B350 to B351 and V290 to V292, never
+reached the baseline and are retired)
 
 ## Problem
 
@@ -29,7 +34,7 @@ pharos-ui can use none of it, because the native API carries no 3D at all:
    2D file. The 3D rip cannot be reached from pharos-ui at all.
 3. A lone packed 3D file (one with no 2D sibling) plays as its raw frame: two
    squeezed pictures side by side, or one above the other. Nothing in the
-   watch page knows the frame is packed. This is B350.
+   watch page knows the frame is packed. This is B960.
 4. There is no way to watch in stereo on a headset. Quest Browser supports
    WebXR, so pharos-ui could show each eye its own half of the frame.
 
@@ -49,6 +54,15 @@ pharos-ui can use none of it, because the native API carries no 3D at all:
   (#479). The native path has no way in.
 - `pharos_playback_3d_decision_total{reason}` counts the server's stereo
   choice.
+- Since #1055 (2026-11-09): `ItemSummary.stereo`, `ItemDetail.versions` (each
+  with its `stereo`), `ItemQuery.stereo` and `negotiate(version)` exist; tiles
+  carry a 3D badge, grids a 3D filter, and the title page a Version picker
+  whose pick is remembered per title on the device (`versions::version_key`).
+  The watch page knows the playing version's packing but draws the whole
+  frame, so B960 still stands.
+- Text subtitles are drawn by pharos-subs on a WebGL canvas over the frame
+  (spec 026, `subs_web.rs`), placed by `content_box(frame, videoWidth,
+  videoHeight)`. The native `::cue` path is only its fallback.
 
 ## User stories
 
@@ -70,7 +84,7 @@ a "3D" chip that lists only those titles. The detail page names each version:
 ### US2: pick the 3D version and watch it on a flat screen (P1)
 
 On a title with both versions, the detail page offers a version choice next
-to Play, defaulting to 2D on a flat screen and to 3D in a headset browser.
+to Play (shipped in #1055; the primary plays until a version is picked).
 Playing a packed 3D version on a flat screen shows the left eye only, at the
 eye's own shape (a half-SBS 1920x1080 frame shows as one 16:9 picture, not a
 squeezed 8:9 one). A player control, "Both eyes", shows the raw frame for
@@ -87,6 +101,9 @@ the picture in both modes.
    aspect.
 4. Given a text subtitle on, its cue is centred under the visible picture,
    not under the middle of the packed frame.
+5. Given a full-SBS 3840x1080 file, the picture is 16:9, not 32:9.
+6. Given a 3D episode, the episode turn (B840) shows one eye on its faces, not
+   the packed frame.
 
 ### US3: watch in stereo on a headset (P1)
 
@@ -109,6 +126,33 @@ the same position.
    position.
 4. Given a browser with no WebXR, there is no "Watch in VR" button.
 5. Given an MVC version, there is no "Watch in VR" button (it plays in 2D).
+
+### US4: watch 3D on Android TV (P2)
+
+The TV app (spec 025) plays a packed 3D version as one eye, exactly as the
+desktop does, with the same "Both eyes" choice for a 3D TV that unpacks SBS or
+TAB itself. The TV's WebView draws the crop; the server is never asked for
+2D.
+
+**Acceptance** (on the G08, by hand, after #1002 lands):
+
+1. Given a half-SBS film, it plays on the TV as one 16:9 picture with no
+   dropped-frame rise over its 2D version (the player's quality readout).
+2. Given "Both eyes" chosen on the TV, the whole frame shows, and the choice
+   is kept on that TV only.
+
+## Devices and modes
+
+| Device | Default for a packed version | Other modes |
+|---|---|---|
+| Desktop browser | One eye | Both eyes |
+| Quest Browser | One eye, with "Watch in VR" | Both eyes; VR |
+| Steam Frame browser | One eye; "Watch in VR" only if it reports `immersive-vr` | Both eyes; VR if supported |
+| Android TV app | One eye | Both eyes |
+| Any device, MVC | 2D (base view) | none |
+
+"One eye" and "Both eyes" are one per-device setting, `pharos.player.stereo`.
+VR is a session the viewer enters from the player, never a stored default.
 
 ## Requirements
 
@@ -139,6 +183,20 @@ the same position.
 - **FR-009**: All schema changes are append-only (017 FR-009) and arrive in
   one PR with one `schemaVersion` bump. A client talking to an older server
   sees no 3D fields and behaves as today.
+- **FR-010**: Every reader of the picture's geometry goes through the one eye
+  function (V921) while a packed version plays: the crop's own box, the
+  pharos-subs content box (`subs_web.rs`), `cue_box_for` (`web.rs`), the image
+  subtitle box (`ImageSubtitles`), the JASSUB canvas fit and lift, and the
+  episode turn's snapshot (`turn_web.rs`). Server burn-in needs nothing: it is
+  drawn into each eye already (B291).
+- **FR-011**: The viewing mode is the device's own. It is stored only on the
+  device, never sent to the server and never carried by SyncPlay or Together
+  (V922); members of one group may watch the same version in different modes.
+- **FR-012**: The Android TV app uses the same crop as the desktop (US4). It
+  never sets `StereoMode=mono` for a 3D version.
+- **FR-013**: Picture-in-picture shows the whole frame (the browser draws it
+  outside the page's CSS); the player's full screen (the player element)
+  keeps the crop. The player never puts the `<video>` itself in full screen.
 
 ## Decisions
 
@@ -164,28 +222,55 @@ the same position.
    flat-screen crop and the server's Jellyfin path for VR player apps.
 5. **The default version follows the device.** On a headset browser
    (`immersive-vr` supported) the 3D version is preselected, elsewhere the 2D
-   one. The last choice per title is remembered on the device.
+   one. The last choice per title is remembered on the device. *As built in
+   #1055*: the primary plays until a version is picked; the headset default
+   lands with US3.
+6. **The crop is a transform, not a bigger element** (2026-11-09). The
+   `<video>` is laid out at the eye's contained box (`aspect-ratio` from the
+   eye function), drawn with `object-fit: fill`, stretched by `scale: 2 1`
+   (SBS) or `scale: 1 2` (TAB) from its start edge, and clipped to its own
+   first half by `clip-path`. Its layout box is then exactly the eye's
+   picture, so code that fits to the element (JASSUB, offsets) sees the eye,
+   and the DOM is unchanged (the video stays the frame's only diffed child).
+   `object-view-box` would be simpler but is Chromium-only.
+7. **WebXR goes through a small `wasm_bindgen` extern block**, not
+   `--cfg=web_sys_unstable_apis`: the flag would rebuild the whole crate graph
+   on CI and changes every crate's RUSTFLAGS.
+8. **Android TV crops on the client** (recommended to Alison 2026-11-09; the
+   other road is a server 2D transcode of every 3D play). If the G08 drops
+   frames under the crop, the fallback is `StereoMode=mono` for that device,
+   decided with Alison first.
 
 ## Invariants (to be added to the baseline)
 
-- **V290**: A packed 3D frame (SBS or TAB) is never drawn whole on a flat
-  screen unless the viewer turned "Both eyes" on. Guard: a Playwright case
-  measuring the drawn picture's aspect for a half-SBS fixture.
-- **V291**: A title badged 3D can play its 3D version from pharos-ui: the
-  version it names is in `ItemDetail.versions` and `negotiate` accepts its
-  id. Guard: an RPC integration test over a 2D primary with a 3D edition.
-- **V292**: The eye rectangle for each `Video3DFormat` is computed in one pure
-  function, used by the flat crop, the layers path and the WebGL path alike.
-  Guard: its unit tests over all five formats.
+- **V920** (was V290): A packed 3D frame (SBS or TAB) is never drawn whole on
+  a flat screen unless the viewer chose "Both eyes" (or uses picture-in-picture,
+  FR-013). Guard: a Playwright case measuring the drawn picture's aspect for a
+  half-SBS and a full-SBS fixture.
+- **V921** (was V292): The eye rectangle and the eye's aspect for each packing
+  are computed in one pure function (`native/stereo.rs`), used by the flat
+  crop, every geometry reader in FR-010, the layers path and the WebGL path
+  alike. Guard: its unit tests over all five packings.
+- **V922**: The 3D viewing mode is per device: it is read and written only
+  through the device's settings store, and no request, SyncPlay or Together
+  message carries it. Guard: the stereo round-trip tests, the Playwright
+  case reading it back from `localStorage`, and the SyncPlay wire tests
+  unchanged.
+- **V923**: "Watch in VR" shows only when `navigator.xr.isSessionSupported(
+  "immersive-vr")` resolved true and the playing version is SBS or TAB.
+  Guard: a Playwright case without WebXR finds no button; a unit test of the
+  packing gate.
+- V291 is covered by V720 (#1055).
 
 ## Bugs (to be added to the baseline)
 
-- **B350**: pharos-ui showed a packed 3D file as its raw frame, two squeezed
-  pictures, because the native API carried no 3D format. Fixed by FR-001 and
-  FR-005; guarded by V290.
-- **B351**: a 3D rip grouped as an edition of its 2D title could not be played
-  from pharos-ui, because the native API had no versions. Fixed by FR-002 and
-  FR-003; guarded by V291.
+- **B960** (was B350): pharos-ui showed a packed 3D version as its raw frame,
+  two squeezed pictures, though since #1055 it knew the version's packing.
+  Fixed by FR-005 and FR-010; guarded by V920.
+- **B961**: the episode turn snapshots the whole `<video>` frame, so a 3D
+  episode's turn shows both eyes side by side. Fixed by FR-010; guarded by
+  V921.
+- B351 is B770 (#1055).
 
 ## Out of scope
 
