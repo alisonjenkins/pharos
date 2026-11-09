@@ -135,6 +135,10 @@ async fn run(
     );
     tx.unbounded_send(Event::Ready { home, grid })
         .map_err(|_| "ui gone".to_owned())?;
+    // The playback grant: the server ends the play session, and answers its
+    // segments 410 Gone, the moment the grant is released, so it is held
+    // for as long as this connection runs.
+    let mut _grant = None;
     if let Some(id) = crate::video::play_item() {
         // Negotiated off the UI thread: the probe may still be listing.
         let caps = tokio::task::spawn_blocking(|| {
@@ -144,7 +148,8 @@ async fn run(
         .map_err(|e| format!("caps: {e}"))?;
         let started = std::time::Instant::now();
         let url = match api.play(&info, id, &caps, Default::default()).await {
-            Ok((decision, _grant)) => {
+            Ok((decision, grant)) => {
+                _grant = Some(grant);
                 log::info!(
                     "bench play_ms={} method={} block={} downgrade={} url={}",
                     started.elapsed().as_millis(),
