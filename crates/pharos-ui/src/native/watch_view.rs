@@ -106,6 +106,11 @@ pub struct Controls {
     pub quality: QualityView,
     /// The subtitle text size, as the Playback page keeps it.
     pub subtitle_size: SubtitleSize,
+    /// The item's versions as (id, label), the primary's id empty; the
+    /// Version control shows when there is more than one (spec 034 US3).
+    pub versions: Vec<(String, String)>,
+    /// The version playing.
+    pub version: String,
 }
 
 /// Where playback is. Reading it with `now` in a component's body
@@ -340,6 +345,9 @@ pub enum Control {
     Fullscreen,
     /// Limit the video to this many bits per second (0 is Auto).
     Quality(u64),
+    /// Play the version at this place in [`Controls::versions`] from here
+    /// (spec 034 US3).
+    Version(usize),
     /// Draw subtitles at this size (the Playback page's choice).
     SubtitleSize(SubtitleSize),
     /// Forget the cap Auto lowered itself to.
@@ -901,6 +909,11 @@ pub fn WatchView(
                             size: c.subtitle_size,
                             on_pick: move |control| on_control.call(control),
                         }
+                        VersionPicker {
+                            versions: c.versions.clone(),
+                            version: c.version.clone(),
+                            on_pick: move |control| on_control.call(control),
+                        }
                         QualityPicker {
                             quality: c.quality.clone(),
                             height: media.video_height,
@@ -1395,6 +1408,40 @@ fn SubtitleSizePicker(show: bool, size: SubtitleSize, on_pick: EventHandler<Cont
     }
 }
 
+/// The version menu: each file the item plays from, the one playing chosen.
+#[component]
+fn VersionPicker(
+    versions: Vec<(String, String)>,
+    version: String,
+    on_pick: EventHandler<Control>,
+) -> Element {
+    let wake = try_use_context::<Wake>();
+    if versions.len() < 2 {
+        return rsx! {};
+    }
+    rsx! {
+        select {
+            class: "pharos-track-picker pharos-version-picker",
+            aria_label: "Version",
+            onkeydown: move |evt| menu_key(evt, wake),
+            onchange: move |evt: FormEvent| {
+                if let Ok(i) = evt.value().parse::<usize>() {
+                    on_pick.call(Control::Version(i));
+                }
+                platform::focus_by_id(PLAYER_ID);
+            },
+            for (i, (id, label)) in versions.into_iter().enumerate() {
+                option {
+                    key: "{id}",
+                    value: "{i}",
+                    selected: id == version,
+                    "{label}"
+                }
+            }
+        }
+    }
+}
+
 /// The quality menu: Auto or a cap, shown as the state in force, with a
 /// reset while Auto has lowered itself.
 #[component]
@@ -1819,6 +1866,22 @@ mod tests {
             subtitle_pick: Some(3),
             ..Controls::default()
         }
+    }
+
+    /// Spec 034 US3: a title with a 3D version can be switched from the player.
+    #[test]
+    fn the_player_offers_the_version_menu_only_for_more_than_one() {
+        let mut c = controls();
+        assert!(!render(c.clone()).contains("aria-label=\"Version\""));
+        c.versions = vec![
+            (String::new(), "1080p · 4.2 GB".into()),
+            ("v3d".into(), "3D (half side-by-side) · 1080p".into()),
+        ];
+        c.version = "v3d".into();
+        let html = render(c);
+        assert!(html.contains("aria-label=\"Version\""), "{html}");
+        assert!(html.contains("value=\"1\" selected"), "{html}");
+        assert!(html.contains("3D (half side-by-side)"));
     }
 
     #[test]

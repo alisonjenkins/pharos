@@ -3666,6 +3666,8 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
     // them negotiates a new playback.
     let mut pending = use_context::<PlayPicks>().0;
     let mut picks = use_signal(|| preplay::picks_for(id, *pending.peek()));
+    // A version picked in the player; until then the device's stored pick.
+    let mut version_pick = use_signal(|| None::<String>);
     use_effect(move || pending.set(None));
     // What the connection has shown about this video, kept across the
     // reloads its own decisions cause; the cap it asks for rides the next
@@ -3794,6 +3796,7 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
         let resume_from = Rc::clone(&resume_from);
         let started_over = Rc::clone(&started_over);
         let asked = picks();
+        let picked_here = version_pick();
         let auto = auto_cap();
         // A song Previous went back to starts over (B464/V406), as does an
         // item Play from start was pressed on (B500). The press is spent only
@@ -3825,7 +3828,7 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
                 } else {
                     platform::turn_cancel(&id.to_string(), "not-video");
                 }
-                let stored = stored_version(id);
+                let stored = picked_here.or_else(|| stored_version(id));
                 let version =
                     versions::chosen_version(&primary.versions, stored.as_deref()).to_owned();
                 if primary.versions.len() > 1 {
@@ -4145,6 +4148,28 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
                         },
                         upcoming: upcoming.read().clone().flatten(),
                         on_renegotiate: move |next| picks.set(next),
+                        on_version: {
+                            let (last_ms, notify) = (Rc::clone(&last_ms), Rc::clone(&notify));
+                            move |to: String| {
+                                let from = match playing.peek().as_ref() {
+                                    Some(Some(Ok(p))) => p.0.version.clone(),
+                                    _ => return,
+                                };
+                                if to == from {
+                                    return;
+                                }
+                                platform::info(&format!(
+                                    "pharos: version switch item={id} from={from:?} to={to:?} at_ms={} grouped={}",
+                                    last_ms.get(),
+                                    group_view.peek().drives(id)
+                                ));
+                                store_setting(&versions::version_key(id), &to);
+                                notify("Switching version…".to_owned());
+                                // The last file's streams name nothing in this one.
+                                picks.set(TrackPicks::default());
+                                version_pick.set(Some(to));
+                            }
+                        },
                         on_notice: {
                             let notify = Rc::clone(&notify);
                             move |line: String| notify(line)
@@ -4376,6 +4401,8 @@ fn Player(
     near: Neighbours,
     upcoming: Option<Item>,
     on_renegotiate: EventHandler<TrackPicks>,
+    /// The viewer picked another version in the player (spec 034 US3).
+    on_version: EventHandler<String>,
     /// A line to show while the renegotiation replaces this player.
     on_notice: EventHandler<String>,
     /// The line the screen is showing over the picture, if any.
@@ -5452,6 +5479,11 @@ fn Player(
                     sub_size.set(size);
                 }
                 Control::Quality(bps) => on_quality_pick.call(Some(bps)),
+                Control::Version(i) => {
+                    if let Some(v) = p.detail.versions.get(i) {
+                        on_version.call(v.id.clone());
+                    }
+                }
                 Control::ResetAutoQuality => on_quality_pick.call(None),
                 Control::PictureInPicture => platform::toggle_pip(VIDEO_ID),
                 // The next-episode button while the card counts is Play now.
@@ -5755,6 +5787,13 @@ fn Player(
         },
         live_position: Some(position),
         subtitle_size: sub_size(),
+        versions: p
+            .detail
+            .versions
+            .iter()
+            .map(|v| (v.id.clone(), versions::version_label(v)))
+            .collect(),
+        version: p.version.clone(),
         quality: QualityView {
             manual: manual_cap,
             auto: auto_cap,
