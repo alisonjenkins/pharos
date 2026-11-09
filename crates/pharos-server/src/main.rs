@@ -1927,6 +1927,15 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
             .with_integrity_memo(integrity_memo)
             .with_integrity_sweep(integrity_sweep);
     }
+    // On-demand full decode checks (admin "Deep check"). Spawns the ffmpeg
+    // binary, so it is set up on every backend; it never runs unasked.
+    {
+        let deep = std::sync::Arc::new(pharos_server::integrity_deep::DeepChecks::new(
+            pharos_transcode::worker::exec::ffmpeg_bin(),
+            state.bg_io.clone(),
+        ));
+        state = state.with_integrity_deep(deep);
+    }
     // Spec 024 — tempo and energy for every song, for the mix rules. One song
     // at a time behind the background-I/O gate; a song is decoded once.
     #[cfg(all(unix, feature = "ffmpeg-lib"))]
