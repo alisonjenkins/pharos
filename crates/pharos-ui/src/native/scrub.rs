@@ -1,0 +1,238 @@
+//! Remote-control scrubbing for the TV player (B907, V855): left and right
+//! move a preview position with its trickplay thumbnail instead of seeking on
+//! every press. A tap moves 10 s; a held key moves faster the longer it is
+//! held. The preview is committed by OK or play, or once the keys have been
+//! still for [`SETTLE_MS`]; Back drops it and playback carries on unmoved.
+//!
+//! Pure state over a millisecond clock, so the TV builds (WebView and Blitz)
+//! and the tests share one rule.
+
+/// How far one tap moves the preview.
+pub const TAP_STEP_MS: u64 = 10_000;
+/// Keys still this long commit the preview.
+pub const SETTLE_MS: u32 = 900;
+/// A press this soon after the last one in the same direction continues a
+/// hold, when the platform does not mark key repeats.
+pub const HOLD_GAP_MS: f64 = 300.0;
+/// A held key never crosses the whole video in less than this.
+const MIN_CROSSING_MS: f64 = 6_000.0;
+
+/// A preview under way.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Scrub {
+    /// Where playback was when the preview began; Back returns here.
+    pub origin_ms: u64,
+    /// Where the preview is.
+    pub target_ms: u64,
+    pub forward: bool,
+    /// When the current hold began (the press that started it).
+    pub hold_start: f64,
+    /// When the last press arrived; the settle timer compares against it.
+    pub last_press: f64,
+    /// Presses in this preview, for the commit log.
+    pub presses: u32,
+}
+
+/// Video milliseconds a held key moves per real millisecond, `held_ms` into
+/// the hold: 20x for the first second, then 60x, 180x and 480x, as a held
+/// Netflix scrub speeds up.
+pub fn hold_speed(held_ms: f64) -> f64 {
+    match held_ms {
+        h if h < 1_000.0 => 20.0,
+        h if h < 2_500.0 => 60.0,
+        h if h < 4_500.0 => 180.0,
+        _ => 480.0,
+    }
+}
+
+/// The preview after one press of left (`forward == false`) or right.
+/// `repeat` is the platform's key-repeat flag; `position_ms` is playback's
+/// position, used when no preview is under way; `duration_ms` 0 means
+/// unknown, which leaves the end unbounded.
+pub fn press(
+    prev: Option<Scrub>,
+    forward: bool,
+    repeat: bool,
+    position_ms: u64,
+    duration_ms: u64,
+    now: f64,
+) -> Scrub {
+    let holding =
+        prev.filter(|s| s.forward == forward && (repeat || now - s.last_press <= HOLD_GAP_MS));
+    let base = prev.map_or(position_ms, |s| s.target_ms);
+    let (hold_start, by) = match holding {
+        Some(s) => {
+            let mut speed = hold_speed(now - s.hold_start);
+            if duration_ms > 0 {
+                speed = speed.min((duration_ms as f64 / MIN_CROSSING_MS).max(hold_speed(0.0)));
+            }
+            let dt = (now - s.last_press).max(0.0);
+            (s.hold_start, (speed * dt).round() as u64)
+        }
+        None => (now, TAP_STEP_MS),
+    };
+    let target = if forward {
+        let to = base.saturating_add(by);
+        if duration_ms > 0 {
+            to.min(duration_ms)
+        } else {
+            to
+        }
+    } else {
+        base.saturating_sub(by)
+    };
+    Scrub {
+        origin_ms: prev.map_or(position_ms, |s| s.origin_ms),
+        target_ms: target,
+        forward,
+        hold_start,
+        last_press: now,
+        presses: prev.map_or(0, |s| s.presses) + 1,
+    }
+}
+
+/// Why a preview ended, for the log line each end writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum End {
+    /// The keys were still for [`SETTLE_MS`].
+    Settled,
+    /// OK or play.
+    Confirmed,
+    /// Back: no seek.
+    Cancelled,
+}
+
+impl End {
+    pub fn label(self) -> &'static str {
+        match self {
+            End::Settled => "settled",
+            End::Confirmed => "confirmed",
+            End::Cancelled => "cancelled",
+        }
+    }
+}
+
+/// The log line a preview's end writes, so a scrub can be followed in the
+/// TV's logs: where it started and ended, how, after how many presses.
+pub fn end_line(s: &Scrub, end: End, now: f64) -> String {
+    format!(
+        "pharos: scrub {} from {} ms to {} ms after {} presses in {} ms",
+        end.label(),
+        s.origin_ms,
+        s.target_ms,
+        s.presses,
+        (now - s.hold_start).max(0.0).round() as u64,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const HOUR: u64 = 3_600_000;
+
+    #[test]
+    fn a_tap_moves_ten_seconds_from_playback() {
+        let s = press(None, true, false, 60_000, HOUR, 0.0);
+        assert_eq!((s.origin_ms, s.target_ms, s.presses), (60_000, 70_000, 1));
+        let s = press(Some(s), true, false, 99_999, HOUR, 1_000.0);
+        assert_eq!(
+            s.target_ms, 80_000,
+            "a second tap moves the preview, not playback"
+        );
+        let s = press(Some(s), false, false, 0, HOUR, 2_000.0);
+        assert_eq!((s.origin_ms, s.target_ms), (60_000, 70_000));
+    }
+
+    #[test]
+    fn a_held_key_speeds_up() {
+        // A remote repeating every 50 ms for six seconds.
+        let mut s = press(None, true, false, 0, 4 * HOUR, 0.0);
+        let mut moved = Vec::new();
+        let mut last = s.target_ms;
+        for tick in 1..=120u32 {
+            s = press(Some(s), true, true, 0, 4 * HOUR, f64::from(tick) * 50.0);
+            if tick % 20 == 0 {
+                moved.push(s.target_ms - last);
+                last = s.target_ms;
+            }
+        }
+        assert!(
+            moved.windows(2).all(|w| w[1] >= w[0]) && moved[5] > 10 * moved[0],
+            "each second of hold moves at least as far as the last: {moved:?}"
+        );
+        assert!(
+            moved[0] < 30_000,
+            "the first second stays fine-grained: {moved:?}"
+        );
+    }
+
+    #[test]
+    fn a_short_video_is_never_crossed_in_a_blink() {
+        let ten_min = 600_000;
+        let mut s = press(None, true, false, 0, ten_min, 0.0);
+        for i in 1..=200 {
+            s = press(
+                Some(s),
+                true,
+                true,
+                0,
+                ten_min,
+                10_000.0 + f64::from(i) * 50.0,
+            );
+        }
+        // 10 s of 480x would be 80 min; the cap holds it to 10 min / 6 s.
+        assert!(s.target_ms <= ten_min);
+        let per_ms = hold_speed(10_000.0).min(ten_min as f64 / MIN_CROSSING_MS);
+        assert!((per_ms - 100.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn the_preview_stays_inside_the_video() {
+        let s = press(None, false, false, 4_000, HOUR, 0.0);
+        assert_eq!(s.target_ms, 0);
+        let s = press(None, true, false, HOUR - 3_000, HOUR, 0.0);
+        assert_eq!(s.target_ms, HOUR);
+        let s = press(None, true, false, HOUR, 0, 0.0);
+        assert_eq!(
+            s.target_ms,
+            HOUR + TAP_STEP_MS,
+            "unknown length leaves the end open"
+        );
+    }
+
+    #[test]
+    fn turning_round_starts_a_new_hold() {
+        let mut s = press(None, true, false, 0, HOUR, 0.0);
+        for i in 1..=100 {
+            s = press(Some(s), true, true, 0, HOUR, f64::from(i) * 50.0);
+        }
+        let back = press(Some(s), false, true, 0, HOUR, 5_050.0);
+        assert_eq!(back.target_ms, s.target_ms - TAP_STEP_MS);
+        assert_eq!(back.hold_start, 5_050.0);
+    }
+
+    #[test]
+    fn without_a_repeat_flag_quick_presses_still_hold() {
+        let s = press(None, true, false, 0, HOUR, 0.0);
+        let quick = press(Some(s), true, false, 0, HOUR, 100.0);
+        assert_eq!(quick.target_ms, TAP_STEP_MS + 2_000, "20x over 100 ms");
+        let slow = press(Some(s), true, false, 0, HOUR, 400.0);
+        assert_eq!(slow.target_ms, 2 * TAP_STEP_MS, "a pause makes it a tap");
+    }
+
+    #[test]
+    fn the_end_line_names_how_and_where() {
+        let s = press(None, true, false, 60_000, HOUR, 0.0);
+        let line = end_line(&s, End::Cancelled, 1_200.0);
+        assert_eq!(
+            line,
+            "pharos: scrub cancelled from 60000 ms to 70000 ms after 1 presses in 1200 ms"
+        );
+        let labels = [End::Settled, End::Confirmed, End::Cancelled].map(End::label);
+        assert!(labels
+            .iter()
+            .enumerate()
+            .all(|(i, a)| labels[i + 1..].iter().all(|b| a != b)));
+    }
+}
