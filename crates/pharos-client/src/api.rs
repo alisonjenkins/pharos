@@ -11,8 +11,9 @@ use pharos_api::pharos_capnp::{
     item_id, item_query, item_summary, items_result, library, lyrics_result, me_result,
     media_token_result, negotiate_result, opt_u16, opt_u32, playback, playback_grant, pref_result,
     prefs, session, start_tracks_result, stream_choice, telemetry, track, user_data,
-    user_state_result, CreditKind as WireCreditKind, Kind, LibraryKind as WireLibraryKind,
-    SegmentKind as WireSegmentKind, Stereo3d as WireStereo, StereoFilter, SubtitleDelivery,
+    user_state_result, BookFormat as WireBookFormat, CreditKind as WireCreditKind, Kind,
+    LibraryKind as WireLibraryKind, SegmentKind as WireSegmentKind, Stereo3d as WireStereo,
+    StereoFilter, SubtitleDelivery,
 };
 pub use pharos_api::pharos_capnp::{EventKind as ClientEventKind, Level as ClientLevel};
 pub use pharos_api::PASSWORD_CHANGED_REVOKE_FAILED;
@@ -192,6 +193,8 @@ pub struct Home {
     pub resume: Vec<Item>,
     /// Music to resume.
     pub listening: Vec<Item>,
+    /// Books part read.
+    pub reading: Vec<Item>,
     pub next_up: Vec<Item>,
 }
 
@@ -275,6 +278,37 @@ pub struct Detail {
     /// What is wrong with the file this detail describes; `None` when
     /// nothing is known to be.
     pub damage: Option<Damage>,
+    /// A book's format, author and size; `None` for anything else, and from
+    /// a server older than schema 32.
+    pub book: Option<Book>,
+    /// Where the signed-in user left a book; `None` when unread.
+    pub read_position: Option<ReadPosition>,
+}
+
+/// How a book can be read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BookFormat {
+    Epub,
+    Pdf,
+    Comic,
+    /// A file the reader cannot open (DRM, an unsupported container).
+    Unreadable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Book {
+    pub format: BookFormat,
+    pub author: String,
+    /// 0 when unknown.
+    pub page_count: u32,
+}
+
+/// A book's saved reading position: an opaque locator and how far through
+/// the book it is, 0 to 1.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReadPosition {
+    pub locator: String,
+    pub fraction: f32,
 }
 
 /// What the integrity check found wrong with one file.
@@ -725,6 +759,37 @@ impl NativeApi {
         }
     }
 
+    /// Saves where `id`, a book, was left for the signed-in user. The server
+    /// refuses anything else, an unreadable book, a locator over 256 bytes
+    /// and a fraction outside 0 to 1. A fraction of 0.99 or more also marks
+    /// it read. Answers whether it is now read.
+    pub async fn set_read_position(
+        &self,
+        call: &CallInfo,
+        id: ItemRef,
+        locator: &str,
+        fraction: f32,
+    ) -> Result<bool, ClientError> {
+        let mut req = self.user_data.set_read_position_request();
+        {
+            let mut p = req.get();
+            call.write(p.reborrow().init_ctx());
+            set_item_ref(p.reborrow().init_id(), id);
+            p.set_locator(locator);
+            p.set_fraction(fraction);
+        }
+        let reply = req.send().promise.await?;
+        match reply
+            .get()?
+            .get_result()?
+            .which()
+            .map_err(capnp::Error::from)?
+        {
+            user_state_result::State(s) => Ok(s?.get_played()),
+            user_state_result::Error(e) => Err(ClientError::from_api(e?)),
+        }
+    }
+
     /// Who is signed in.
     pub async fn me(&self, call: &CallInfo) -> Result<Me, ClientError> {
         let mut req = self.session.me_request();
@@ -1014,6 +1079,7 @@ impl PharosApi for NativeApi {
                     rails,
                     resume: read_items(home.get_resume()?)?,
                     listening: read_items(home.get_listening()?)?,
+                    reading: read_items(home.get_reading()?)?,
                     next_up: read_items(home.get_next_up()?)?,
                 })
             }
@@ -1219,6 +1285,8 @@ impl PharosApi for NativeApi {
                         .map(read_version)
                         .collect::<Result<_, capnp::Error>>()?,
                     damage: read_damage(d.get_damage()?)?,
+                    book: read_book(&d)?,
+                    read_position: read_read_position(d.get_summary()?.get_user_state()?)?,
                 })
             }
             detail_result::Error(e) => Err(ClientError::from_api(e?)),
@@ -1768,6 +1836,37 @@ fn read_stereo(stereo: Result<WireStereo, capnp::NotInSchema>) -> Option<Stereo>
         WireStereo::FullTopAndBottom => Some(Stereo::FullTopAndBottom),
         WireStereo::Mvc => Some(Stereo::Mvc),
     }
+}
+
+fn read_book(
+    d: &pharos_api::pharos_capnp::item_detail::Reader<'_>,
+) -> Result<Option<Book>, capnp::Error> {
+    if !d.has_book() {
+        return Ok(None);
+    }
+    let b = d.get_book()?;
+    // A format newer than this build reads as unreadable: no Read action.
+    let format = match b.get_format() {
+        Ok(WireBookFormat::Epub) => BookFormat::Epub,
+        Ok(WireBookFormat::Pdf) => BookFormat::Pdf,
+        Ok(WireBookFormat::Comic) => BookFormat::Comic,
+        Ok(WireBookFormat::Unreadable) | Err(_) => BookFormat::Unreadable,
+    };
+    Ok(Some(Book {
+        format,
+        author: text(b.get_author())?,
+        page_count: b.get_page_count(),
+    }))
+}
+
+fn read_read_position(
+    state: pharos_api::pharos_capnp::user_state::Reader<'_>,
+) -> Result<Option<ReadPosition>, capnp::Error> {
+    let locator = text(state.get_read_locator())?;
+    Ok((!locator.is_empty()).then(|| ReadPosition {
+        locator,
+        fraction: state.get_read_fraction(),
+    }))
 }
 
 fn read_damage(
