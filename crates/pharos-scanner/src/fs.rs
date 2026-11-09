@@ -3128,16 +3128,19 @@ pub(crate) enum CopyDecision {
     Size,
     Container,
     Path,
+    /// A copy kept as its own item: it may be another show's episode (V894).
+    RefusedOtherSeries,
 }
 
 impl CopyDecision {
-    pub(crate) const ALL: [Self; 6] = [
+    pub(crate) const ALL: [Self; 7] = [
         Self::TwoD,
         Self::SingleEpisode,
         Self::Height,
         Self::Size,
         Self::Container,
         Self::Path,
+        Self::RefusedOtherSeries,
     ];
 
     pub(crate) fn label(self) -> &'static str {
@@ -3148,6 +3151,7 @@ impl CopyDecision {
             Self::Size => "size",
             Self::Container => "container",
             Self::Path => "path",
+            Self::RefusedOtherSeries => "refused_other_series",
         }
     }
 }
@@ -8735,6 +8739,7 @@ mod tests {
                 ("container".to_string(), 1),
                 ("height".to_string(), 0),
                 ("path".to_string(), 1),
+                ("refused_other_series".to_string(), 0),
                 ("single_episode".to_string(), 0),
                 ("size".to_string(), 0),
             ]
