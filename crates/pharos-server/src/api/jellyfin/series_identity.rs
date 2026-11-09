@@ -3,10 +3,12 @@
 //! hand fixes made) and the hand fixes themselves. REST behind
 //! `require_admin`, like every other Manage tab.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::path::PathBuf;
 
 use actix_web::{error, web, HttpResponse, Responder};
-use pharos_core::{SeriesIdentityStore, SeriesMetadataStore};
+use pharos_core::{SeriesIdentityStore, SeriesKeyUpdate, SeriesMetadataStore};
+use pharos_scanner::series_split as split;
 use serde::{Deserialize, Serialize};
 
 use super::admin::require_admin;
@@ -36,17 +38,40 @@ pub(super) fn register(cfg: &mut web::ServiceConfig) {
 #[derive(Debug, Serialize, PartialEq)]
 #[serde(rename_all = "PascalCase")]
 struct OverviewDto {
+    /// `dry_run` or `apply`: under `dry_run` a pending split waits for the
+    /// switch to apply, under `apply` for the next scan.
+    repair_mode: &'static str,
     splits: Vec<SplitDto>,
     flagged: Vec<FlaggedDto>,
     overrides: Vec<OverrideDto>,
 }
 
-/// A folder whose episodes sit under more than one series key.
+/// A folder whose episodes sit, or would sit once the scanner's plan is
+/// written, under more than one series key.
 #[derive(Debug, Serialize, PartialEq)]
 #[serde(rename_all = "PascalCase")]
 struct SplitDto {
     folder: String,
+    /// [`APPLIED`] when the stored rows already match the plan, else
+    /// [`PENDING`] with the rows still to change in `moves`.
+    status: &'static str,
+    /// The groups as the plan has them.
     groups: Vec<GroupDto>,
+    moves: Vec<PendingMoveDto>,
+}
+
+const APPLIED: &str = "applied";
+const PENDING: &str = "pending";
+
+/// One stored row the scanner's plan would change.
+#[derive(Debug, Serialize, PartialEq)]
+#[serde(rename_all = "PascalCase")]
+struct PendingMoveDto {
+    path: String,
+    from_key: String,
+    from_year: Option<u32>,
+    to_key: String,
+    to_year: Option<u32>,
 }
 
 #[derive(Debug, Serialize, PartialEq)]
@@ -108,38 +133,9 @@ async fn overview(
         .series_identity_rows("")
         .await
         .map_err(internal("reading episode identities"))?;
-    let mut folders: BTreeMap<String, BTreeMap<String, GroupDto>> = BTreeMap::new();
-    for row in rows {
-        let Some(folder) = row.series_folder else {
-            continue;
-        };
-        let key = row.series_key.unwrap_or_else(|| folder.clone());
-        folders
-            .entry(folder)
-            .or_default()
-            .entry(key.clone())
-            .or_insert_with(|| GroupDto {
-                series_key: key,
-                year: row.series_year,
-                paths: Vec::new(),
-            })
-            .paths
-            .push(row.path);
-    }
-    let splits = folders
-        .into_iter()
-        .filter(|(_, groups)| groups.len() > 1)
-        .map(|(folder, groups)| SplitDto {
-            folder,
-            groups: groups
-                .into_values()
-                .map(|mut g| {
-                    g.paths.sort();
-                    g
-                })
-                .collect(),
-        })
-        .collect();
+    let splits = splits(&state.stores, rows, crate::metadata_backfill::now_secs())
+        .await
+        .map_err(internal("planning folder splits"))?;
     let keys = state
         .stores
         .flagged_series_keys()
@@ -183,10 +179,82 @@ async fn overview(
         })
         .collect();
     Ok(web::Json(OverviewDto {
+        repair_mode: state.metadata_config.series_identity_repair.label(),
         splits,
         flagged,
         overrides,
     }))
+}
+
+/// Plan every stored row as a scan would and list the folders that split,
+/// applied or still pending (V896): under a dry run the plan is written only
+/// for admin-placed rows, so the page is where the rest shows.
+async fn splits<S: SeriesIdentityStore>(
+    store: &S,
+    rows: Vec<pharos_core::SeriesIdentityRow>,
+    now: i64,
+) -> pharos_core::DomainResult<Vec<SplitDto>> {
+    let paths: Vec<PathBuf> = rows.iter().map(|r| PathBuf::from(&r.path)).collect();
+    let walked = split::folders_of(&paths);
+    let ctx = split::context(store, &walked).await?;
+    let plan = split::plan(&walked, &ctx, now);
+    let mut pending: HashMap<String, SeriesKeyUpdate> = split::diff(&plan, &rows)
+        .into_iter()
+        .map(|u| (u.path.clone(), u))
+        .collect();
+    let mut folders: BTreeMap<String, (BTreeMap<String, GroupDto>, Vec<PendingMoveDto>)> =
+        BTreeMap::new();
+    for row in rows {
+        let Some(folder) = row.series_folder else {
+            continue;
+        };
+        let from_key = row.series_key.unwrap_or_else(|| folder.clone());
+        let (key, year) = match pending.remove(&row.path) {
+            Some(u) => (
+                u.series_key.unwrap_or_else(|| folder.clone()),
+                u.series_year,
+            ),
+            None => (from_key.clone(), row.series_year),
+        };
+        let (groups, moves) = folders.entry(folder).or_default();
+        if key != from_key || year != row.series_year {
+            moves.push(PendingMoveDto {
+                path: row.path.clone(),
+                from_key,
+                from_year: row.series_year,
+                to_key: key.clone(),
+                to_year: year,
+            });
+        }
+        groups
+            .entry(key.clone())
+            .or_insert_with(|| GroupDto {
+                series_key: key,
+                year,
+                paths: Vec::new(),
+            })
+            .paths
+            .push(row.path);
+    }
+    Ok(folders
+        .into_iter()
+        .filter(|(_, (groups, moves))| groups.len() > 1 || !moves.is_empty())
+        .map(|(folder, (groups, mut moves))| {
+            moves.sort_by(|a, b| a.path.cmp(&b.path));
+            SplitDto {
+                folder,
+                status: if moves.is_empty() { APPLIED } else { PENDING },
+                groups: groups
+                    .into_values()
+                    .map(|mut g| {
+                        g.paths.sort();
+                        g
+                    })
+                    .collect(),
+                moves,
+            }
+        })
+        .collect())
 }
 
 #[derive(Debug, Deserialize)]
