@@ -1098,6 +1098,8 @@ pub struct DeviceEntry {
     pub name: String,
     pub app_name: String,
     pub last_user_name: String,
+    /// Audio codecs this device is never sent as a direct play (T130).
+    pub no_direct_play_audio_codecs: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1111,6 +1113,8 @@ struct DeviceDto {
     app_name: String,
     #[serde(default)]
     last_user_name: String,
+    #[serde(default)]
+    no_direct_play_audio_codecs: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1132,8 +1136,14 @@ pub fn parse_devices_response(bytes: &[u8]) -> Result<Vec<DeviceEntry>, ClientEr
             name: d.name,
             app_name: d.app_name,
             last_user_name: d.last_user_name,
+            no_direct_play_audio_codecs: d.no_direct_play_audio_codecs,
         })
         .collect())
+}
+
+/// The `/Devices/Options` body that sets only a device's audio deny list.
+pub fn device_audio_deny_body(codecs: &[String]) -> String {
+    serde_json::json!({ "NoDirectPlayAudioCodecs": codecs }).to_string()
 }
 
 /// T58 — `/System/ActivityLog/Entries` row (jellyfin-web's Activity Log
@@ -1927,6 +1937,29 @@ pub mod web {
         parse_devices_response(&bytes)
     }
 
+    pub async fn set_device_audio_deny(
+        base: &str,
+        token: &str,
+        device_id: &str,
+        codecs: &[String],
+    ) -> Result<(), ClientError> {
+        let resp = Request::post(&format!(
+            "{base}/Devices/Options?id={}",
+            urlencode(device_id)
+        ))
+        .header("X-Emby-Token", token)
+        .header("Content-Type", "application/json")
+        .body(super::device_audio_deny_body(codecs))
+        .map_err(|e| ClientError::Http(e.to_string()))?
+        .send()
+        .await
+        .map_err(|e| ClientError::Http(e.to_string()))?;
+        if !resp.ok() {
+            return Err(ClientError::Status(resp.status()));
+        }
+        Ok(())
+    }
+
     pub async fn list_activity_entries(
         base: &str,
         token: &str,
@@ -2449,6 +2482,26 @@ mod tests {
         let v = parse_devices_response(body).unwrap();
         assert_eq!(v.len(), 2);
         assert_eq!(v[1].app_name, "Infuse");
+    }
+
+    #[test]
+    fn parse_devices_reads_the_audio_deny_list_and_defaults_it_empty() {
+        let body = br#"{"Items":[
+            {"Id":"tv","Name":"TV","NoDirectPlayAudioCodecs":["eac3"]},
+            {"Id":"pc","Name":"PC"}
+        ]}"#;
+        let v = parse_devices_response(body).unwrap();
+        assert_eq!(v[0].no_direct_play_audio_codecs, vec!["eac3".to_string()]);
+        assert!(v[1].no_direct_play_audio_codecs.is_empty());
+    }
+
+    /// The body names only the deny list, so saving it cannot touch the
+    /// device's custom name.
+    #[test]
+    fn the_audio_deny_body_carries_only_the_list() {
+        let v: serde_json::Value =
+            serde_json::from_str(&device_audio_deny_body(&["ac3".into()])).unwrap();
+        assert_eq!(v, serde_json::json!({ "NoDirectPlayAudioCodecs": ["ac3"] }));
     }
 
     #[test]
