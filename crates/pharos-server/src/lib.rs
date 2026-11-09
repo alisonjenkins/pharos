@@ -11,6 +11,8 @@ pub mod cast_adapter;
 pub mod cast_directory;
 pub mod cast_service;
 pub mod cast_sessions;
+#[cfg(target_os = "linux")]
+pub mod child_memory;
 pub mod cli;
 pub mod client_ip;
 pub mod config;
