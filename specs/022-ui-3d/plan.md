@@ -79,10 +79,11 @@ are ready.
    V920 to V922) land here. Guards: unit tests; the V920 Playwright case over
    seeded half-SBS and full-SBS fixtures measuring the drawn picture.
 4. **WebXR stereo (US3, FR-007, FR-008, V923)**, about 1.5 days. As built
-   (2026-11-09): the layers path only, via `js_sys::Reflect` in `xr_web.rs`;
-   outcomes are console lines until the 016 events come with the fallback;
-   the WebGL fallback and the headset's default 3D version (Decision 5) wait
-   on Alison. ADR 0088
+   (2026-11-09): the layers path via `js_sys::Reflect` in `xr_web.rs`, then
+   the WebGL fallback as a follow-up PR (`render/stereo_quad.rs`,
+   `render/webgl_xr.rs`; `layers` is an optional feature); outcomes are
+   console lines until the 016 events get their schema bump; the headset's
+   default 3D version (Decision 5) waits on Alison. ADR 0088
    (its own commit); a `wasm_bindgen` extern block for `navigator.xr`,
    `XRSession`, `XRMediaBinding` and `XRWebGLBinding` (spec Decision 7);
    "Watch in VR" shown after `isSessionSupported("immersive-vr")`;
