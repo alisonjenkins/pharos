@@ -151,8 +151,8 @@ open in jellyfin-web, refresh metadata / edit / identify (admin, 015), delete
 
 Evidence is `crates/pharos-ui/src/native/` (`views.rs`, `browse.rs`, `rails.rs`, `letters.rs`, `person.rs`, `palette.rs`).
 
-- US1 home: done. Continue watching / listening rows, library rails (#603, #605, #518).
-- US2 library pages: done. Sort, filter, jump by letter (#601, `letters.rs`), infinite paging (#587), sort in the URL (`browse.rs`).
+- US1 home: partial (rails cannot be reordered, hidden or added; `HomeView` order is fixed). Continue watching / listening rows, library rails (#603, #605, #518).
+- US2 library pages: partial (saved views missing). Sort, filter, jump by letter (#601, `letters.rs`), infinite paging (#587), sort in the URL (`browse.rs`).
 - US3 shows: done (#561 seasons; episode navigation #588; next-up/resume label).
 - US4 films and extras: partial. Title page, versions (`versions.rs`), ratings (#614); extras not verified.
 - US5 music: done (#561 artist/album, playlists tab, #632 full-window player, mixes #713).
