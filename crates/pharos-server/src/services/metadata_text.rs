@@ -13,8 +13,8 @@ use std::collections::HashMap;
 use crate::metadata_language::DescriptionLanguage;
 use crate::state::AppState;
 use pharos_core::{
-    LocalizedText, MediaId, MediaItem, MediaKind, MetadataTranslationStore, PreferenceStore,
-    SeriesMetadata, TranslationOwner, UserId,
+    EditableField, LocalizedText, MediaId, MediaItem, MediaKind, MetadataTranslationStore,
+    PreferenceStore, SeriesMetadata, TranslationOwner, UserId,
 };
 
 /// The stored `DescriptionLanguagePreference`, read on its own: a field the
@@ -188,7 +188,7 @@ pub async fn episode_overviews_in<'a, S: MetadataTranslationStore>(
     }
     let owners = items
         .into_iter()
-        .filter(|i| i.kind == MediaKind::Episode)
+        .filter(|i| i.kind == MediaKind::Episode && !i.locked.contains(EditableField::Overview))
         .map(|i| TranslationOwner::Item(i.id))
         .collect();
     rows_for(store, lang, owners)
@@ -225,9 +225,11 @@ pub async fn localize_series_in<S: MetadataTranslationStore>(
     if *lang == DescriptionLanguage::Default {
         return;
     }
+    // An admin's own text is shown in every language (ADR-0097).
     let owners = metas
-        .keys()
-        .map(|k| TranslationOwner::Series(k.clone()))
+        .iter()
+        .filter(|(_, m)| !m.locked.contains(EditableField::Overview))
+        .map(|(k, _)| TranslationOwner::Series(k.clone()))
         .collect();
     let rows = rows_for(store, lang, owners).await;
     for (key, meta) in metas.iter_mut() {
@@ -391,6 +393,36 @@ mod tests {
         assert_eq!(
             shown(&s, "OriginalLanguage").await,
             ("ブルマが…".into(), "悟空の冒険。".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn an_admin_edited_description_is_shown_in_every_language() {
+        let s = seeded().await;
+        let lang = DescriptionLanguage::parse("jpn");
+        let locked: pharos_core::LockedFields = [EditableField::Overview].into_iter().collect();
+        let mut items = [MediaItem {
+            locked,
+            ..episode(1, "Admin episode text.")
+        }];
+        localize_items_in(&s, &lang, items.iter_mut()).await;
+        assert_eq!(
+            items[0].metadata.overview.as_deref(),
+            Some("Admin episode text.")
+        );
+        let mut metas = HashMap::from([(
+            "/tv/Dragon Ball".to_string(),
+            SeriesMetadata {
+                series_key: "/tv/Dragon Ball".into(),
+                overview: Some("Admin show text.".into()),
+                locked,
+                ..Default::default()
+            },
+        )]);
+        localize_series_in(&s, &lang, &mut metas).await;
+        assert_eq!(
+            metas["/tv/Dragon Ball"].overview.as_deref(),
+            Some("Admin show text.")
         );
     }
 
