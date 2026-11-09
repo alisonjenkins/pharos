@@ -109,7 +109,11 @@ impl IntegrityReport {
         let ranges = self.ranges.get_or_insert_with(Vec::new);
         let full = ranges.len() >= MAX_RANGES;
         match ranges.last_mut() {
-            Some(last) if full || at_ms <= last.end_ms.saturating_add(RANGE_MERGE_GAP_MS) => {
+            Some(last)
+                if full
+                    || (at_ms.saturating_add(RANGE_MERGE_GAP_MS) >= last.start_ms
+                        && at_ms <= last.end_ms.saturating_add(RANGE_MERGE_GAP_MS)) =>
+            {
                 last.start_ms = last.start_ms.min(at_ms);
                 last.end_ms = last.end_ms.max(at_ms);
             }
@@ -138,24 +142,27 @@ impl IntegrityReport {
         if let Some(r) = self.ranges.as_ref().filter(|r| !r.is_empty()) {
             return r.clone();
         }
-        if self.is_short() || !self.complete {
-            let end = self
-                .declared_ms
-                .unwrap_or(self.scanned_ms)
-                .max(self.scanned_ms);
-            return vec![DamageRange {
-                start_ms: self.scanned_ms,
-                end_ms: end,
-            }];
+        let mut out = Vec::new();
+        let tail = self.is_short() || !self.complete;
+        if let Some(at) = self
+            .first_fault_ms
+            .filter(|at| !tail || *at < self.scanned_ms)
+        {
+            out.push(DamageRange {
+                start_ms: at,
+                end_ms: at,
+            });
         }
-        self.first_fault_ms
-            .map(|at| {
-                vec![DamageRange {
-                    start_ms: at,
-                    end_ms: at,
-                }]
-            })
-            .unwrap_or_default()
+        if tail {
+            out.push(DamageRange {
+                start_ms: self.scanned_ms,
+                end_ms: self
+                    .declared_ms
+                    .unwrap_or(self.scanned_ms)
+                    .max(self.scanned_ms),
+            });
+        }
+        out
     }
 
     /// How much of the declared duration was never demuxed, in ms.
@@ -365,6 +372,7 @@ mod tests {
         r.note_range(11_000);
         r.close_range(11_500);
         r.note_range(60_000);
+        r.note_range(0);
         assert_eq!(
             r.ranges.unwrap(),
             vec![
@@ -376,7 +384,12 @@ mod tests {
                     start_ms: 60_000,
                     end_ms: 60_000
                 },
-            ]
+                DamageRange {
+                    start_ms: 0,
+                    end_ms: 0
+                },
+            ],
+            "a fault before the last span starts a span of its own"
         );
     }
 
@@ -421,6 +434,28 @@ mod tests {
                 start_ms: 1_000,
                 end_ms: 20_000
             }]
+        );
+        let abandoned = IntegrityReport {
+            read_errors: 40,
+            first_fault_ms: Some(2_870),
+            scanned_ms: 50_000,
+            declared_ms: Some(600_000),
+            complete: false,
+            ..Default::default()
+        };
+        assert_eq!(
+            abandoned.damage_ranges(),
+            vec![
+                DamageRange {
+                    start_ms: 2_870,
+                    end_ms: 2_870
+                },
+                DamageRange {
+                    start_ms: 50_000,
+                    end_ms: 600_000
+                },
+            ],
+            "both the first fault and the unread tail are marked"
         );
         assert!(IntegrityReport::default().damage_ranges().is_empty());
     }

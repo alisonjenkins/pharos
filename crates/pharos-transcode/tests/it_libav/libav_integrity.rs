@@ -162,6 +162,47 @@ fn a_hole_punched_mid_file_is_reported_with_its_position() {
             .all(|r| r.start_ms <= r.end_ms && r.end_ms <= span_end),
         "spans must lie inside the media: {ranges:?}"
     );
+    assert!(
+        (4_000..=16_000).contains(&ranges[0].start_ms),
+        "the hole is halfway through 20 s of media: {report:?}"
+    );
+}
+
+/// A body cut off partway is the damage players meet as an early end: the
+/// whole missing tail is one span reaching the header's declared end.
+#[test]
+fn a_truncated_body_marks_its_missing_tail() {
+    if !ffmpeg_available() {
+        eprintln!("skipping: ffmpeg not on PATH");
+        return;
+    }
+    let dir = tempfile::tempdir().expect("tempdir");
+    let input = dir.path().join("cut.mkv");
+    synth_mkv(&input);
+    let size = std::fs::metadata(&input).expect("stat fixture").len();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&input)
+        .expect("open fixture")
+        .set_len(size * 2 / 5)
+        .expect("truncate");
+
+    let report = pharos_transcode::libav::integrity::scan_integrity(&input).expect("scan ok");
+    assert!(report.is_damaged(), "{report:?}");
+    let last = report
+        .ranges
+        .as_ref()
+        .and_then(|r| r.last().copied())
+        .unwrap_or_else(|| panic!("a cut body must leave a span: {report:?}"));
+    let declared = report.declared_ms.expect("mkv declares its duration");
+    assert_eq!(
+        last.end_ms, declared,
+        "the span reaches the declared end: {report:?}"
+    );
+    assert!(
+        last.start_ms <= report.scanned_ms && last.start_ms < declared,
+        "the span starts where reading stopped: {report:?}"
+    );
 }
 
 /// A demuxer wedged on an unparseable byte returns the same error forever
