@@ -106,18 +106,22 @@ class Aligner:
         )
         return True
 
-    def align(self, pcm_f32le: bytes, tokens: list[str]) -> list[tuple[int, int]]:
-        """Align tokens against 16kHz float32 PCM audio, returning (start_ms, end_ms) per word."""
+    def align(self, pcm_f32le: bytes, tokens: list[str], lead_star: bool = False) -> list[tuple[int, int]]:
+        """Align tokens against 16kHz float32 PCM audio, returning (start_ms, end_ms) per word.
+
+        `lead_star` lets music before the first word go unmatched, for a
+        window that starts well ahead of where the line may be sung.
+        """
         if not pcm_f32le or not tokens:
             return []
         with self._lock:
             try:
                 self._ensure_loaded()
-                return self._align_loaded(pcm_f32le, tokens)
+                return self._align_loaded(pcm_f32le, tokens, lead_star)
             finally:
                 self._last_used = self._clock()
 
-    def _align_loaded(self, pcm_f32le: bytes, tokens: list[str]) -> list[tuple[int, int]]:
+    def _align_loaded(self, pcm_f32le: bytes, tokens: list[str], lead_star: bool) -> list[tuple[int, int]]:
         waveform = torch.frombuffer(bytearray(pcm_f32le), dtype=torch.float32).unsqueeze(0)
         n_samples = waveform.size(1)
         if n_samples == 0:
@@ -135,12 +139,13 @@ class Aligner:
             # the lyrics, smearing the words across an instrumental break up
             # to the next line. None goes before the first word: a line is sung
             # from its stamp, and a leading star let the words drift late.
-            tokenized = self._tokenizer([*tokens, STAR])
+            lead = [STAR] if lead_star else []
+            tokenized = self._tokenizer([*lead, *tokens, STAR])
             # CTC needs a frame a character: a window too short for its text
             # cannot be aligned, and the aligner would raise.
             if sum(len(t) for t in tokenized) > num_frames:
                 return []
-            spans = self._aligner(emission[0], tokenized)[:-1]
+            spans = self._aligner(emission[0], tokenized)[len(lead) : -1]
 
         ratio = (n_samples / num_frames / 16000.0) * 1000.0
         result: list[tuple[int, int]] = []
