@@ -2,7 +2,8 @@ import { test, expect, type APIRequestContext, type Locator, type Page } from "@
 
 // T51 phase 3 — drive the pharos Dioxus UI (served at `/ui/` by
 // `[server].ui_dir`) end-to-end through a real Chromium: the native app
-// at `/ui/` and legacy management panes at `/ui/manage`.
+// at `/ui/` and its Manage screen at `/ui/manage` (the older app when the
+// native API is off).
 //
 // The native sign-in tests need `[server.native_api].enabled = true`, the
 // test origin in `allowed_origins`, and https; with the API off they skip.
@@ -119,7 +120,16 @@ test.describe("pharos Dioxus UI", () => {
     );
   });
 
-  test("legacy panes at /ui/manage: login form renders, sign-in button present", async ({ page }) => {
+  // Whether the server runs the native API: with it, `/ui/manage` is a
+  // screen of the native app (B921, ADR 0082); without it, the older app.
+  async function nativeApiOn(request: APIRequestContext): Promise<boolean> {
+    const probe = await request.get(`${PHAROS_URL}/pharos/session`, {
+      headers: { Accept: "application/json" },
+    });
+    return probe.status() === 405;
+  }
+
+  test("/ui/manage signed out asks to sign in", async ({ page, request }) => {
     const errors: string[] = [];
     page.on("pageerror", (e) => errors.push(`pageerror: ${e.message}`));
     page.on("requestfailed", (r) => {
@@ -131,25 +141,27 @@ test.describe("pharos Dioxus UI", () => {
 
     await page.goto("/ui/manage");
 
-    // App shell renders.
-    await expect(page.locator("header.pharos-banner h1")).toHaveText("pharos");
-
-    // Login form lands without an authed user.
-    await expect(page.locator("form")).toBeVisible();
-    await expect(page.locator('input[type="text"]')).toBeVisible();
-    await expect(page.locator('input[type="password"]')).toBeVisible();
+    if (await nativeApiOn(request)) {
+      // The native app's own sign-in, not a second one for Manage.
+      await expect(page.locator("form#signin")).toBeVisible({ timeout: 10_000 });
+      await expect(page.locator("#signin-name")).toBeVisible();
+      await expect(page.locator("#signin-password")).toBeVisible();
+    } else {
+      await expect(page.locator("header.pharos-banner h1")).toHaveText("pharos");
+      await expect(page.locator('input[type="text"]')).toBeVisible();
+      await expect(page.locator('input[type="password"]')).toBeVisible();
+      await expect(page.locator(".pharos-active-server")).toContainText("Connected to:");
+    }
     await expect(page.getByRole("button", { name: "Sign in" })).toBeVisible();
 
-    // Pre-login chrome surfaces the active server URL.
-    await expect(page.locator(".pharos-active-server")).toContainText(
-      "Connected to:",
-    );
-
-    // No console errors so far.
     expect(errors, errors.join("\n")).toEqual([]);
   });
 
-  test("legacy panes at /ui/manage: server-picker toggle reveals the picker form", async ({ page }) => {
+  test("legacy panes at /ui/manage: server-picker toggle reveals the picker form", async ({ page, request }) => {
+    test.skip(
+      await nativeApiOn(request),
+      "native API is on, so /ui/manage is the native app, which has no server picker",
+    );
     await page.goto("/ui/manage");
     await page.locator(".pharos-switch-server").click();
     await expect(page.locator(".pharos-server-picker")).toBeVisible();
@@ -163,7 +175,7 @@ test.describe("pharos Dioxus UI", () => {
     ).toHaveValue(new RegExp(PHAROS_URL.replace(/^https?:\/\//, "")));
   });
 
-  test("legacy panes at /ui/manage: login with seeded creds reaches the library nav", async ({ page }) => {
+  test("an admin signs in at /ui/manage and lands on Users", async ({ page, request }) => {
     const auth = await page.request.post(
       `${PHAROS_URL}/Users/AuthenticateByName`,
       {
@@ -180,18 +192,30 @@ test.describe("pharos Dioxus UI", () => {
     );
 
     await page.goto("/ui/manage");
-    await page.locator('input[type="text"]').fill(TEST_USER);
-    await page.locator('input[type="password"]').fill(TEST_PASS);
+
+    if (!(await nativeApiOn(request))) {
+      await page.locator('input[type="text"]').fill(TEST_USER);
+      await page.locator('input[type="password"]').fill(TEST_PASS);
+      await page.getByRole("button", { name: "Sign in" }).click();
+      await expect(page.locator(".pharos-nav-library")).toBeVisible({ timeout: 10_000 });
+      return;
+    }
+
+    await page.locator("#signin-name").fill(TEST_USER);
+    await page.locator("#signin-password").fill(TEST_PASS);
     await page.getByRole("button", { name: "Sign in" }).click();
 
-    // Authenticated chrome lights up — nav buttons rendered.
-    await expect(page.locator(".pharos-nav-library")).toBeVisible({
-      timeout: 10_000,
-    });
-    await expect(page.locator(".pharos-nav-search")).toBeVisible();
-    await expect(page.locator(".pharos-nav-livetv")).toBeVisible();
-    await expect(page.locator(".pharos-nav-prefs")).toBeVisible();
-    await expect(page.locator(".pharos-nav-remote")).toBeVisible();
+    // Manage opens under the app's own header, on the Users page, with the
+    // seeded admin's card marked as theirs (V881: no Delete, no switch).
+    await expect(page.locator(".pharos-shell-bar")).toBeVisible({ timeout: 15_000 });
+    await expect(page.locator("#manage-heading")).toHaveText("Users", { timeout: 15_000 });
+    await expect(
+      page.locator(".pharos-settings-nav").getByRole("button", { name: "Users" }),
+    ).toHaveAttribute("aria-current", "page");
+    const own = page.locator(".pharos-admin-user", { has: page.locator(".is-you") });
+    await expect(own).toHaveCount(1);
+    await expect(own.locator(".pharos-admin-user-delete")).toHaveCount(0);
+    await expect(own.getByRole("switch")).toBeDisabled();
   });
 
   test.describe("native app at /ui/", () => {

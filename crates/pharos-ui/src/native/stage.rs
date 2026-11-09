@@ -295,8 +295,6 @@ impl Stage {
                 self.set_item(*id);
                 self.view = View::Full;
             }
-            // Manage is another app: the player ends there (FR-009).
-            Route::Manage => self.close(),
             _ if self.item.is_some() && self.view == View::Full => self.view = self.compact,
             _ => {}
         }
@@ -990,12 +988,11 @@ mod tests {
     }
 
     #[test]
-    fn going_to_manage_ends_the_player() {
+    fn going_to_manage_keeps_the_player_compact() {
+        // Manage is a screen of this app now (B921), not another app.
         let mut stage = playing_full(7);
-        stage.follow(&Route::Home);
-        stage.follow(&Route::Manage);
-        assert_eq!(stage.item, None);
-        assert_eq!(stage.follow(&Route::Home), None);
+        assert_eq!(stage.follow(&Route::Manage), Some(stage.compact));
+        assert_eq!(stage.item, Some(ItemRef::Real(7)));
     }
 
     #[test]
