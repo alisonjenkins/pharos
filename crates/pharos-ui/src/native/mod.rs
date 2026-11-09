@@ -37,6 +37,7 @@ pub mod manage;
 pub mod mixes;
 pub mod paging;
 pub mod palette;
+pub mod person;
 #[cfg(not(any(
     all(feature = "web", target_arch = "wasm32"),
     all(feature = "mobile", target_os = "android")
