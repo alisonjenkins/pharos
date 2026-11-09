@@ -391,6 +391,16 @@ impl<T: TvdbTransport> TvdbClient<T> {
         parse_episode_list(&body)
     }
 
+    /// Spec 033 (B982) — the show's first and last air dates and whether it
+    /// is still airing, from the base `/series/{id}` record.
+    pub async fn series_run(&self, series_id: &str) -> Option<crate::online_enrich::SeriesRun> {
+        let body = self
+            .record_body(&format!("/series/{series_id}"))
+            .await
+            .ok()?;
+        parse_series_run(&body)
+    }
+
     /// Every page of `/series/{id}/episodes/default` as one body: TVDB v4
     /// pages the list (about 500 episodes a page), so a long show's later
     /// episodes are only on page 1 onwards (B983). A failed later page fails
@@ -932,6 +942,27 @@ fn parse_episode_list(body: &str) -> Option<Vec<crate::online_enrich::EpisodeLis
             })
             .collect(),
     )
+}
+
+/// `firstAired`/`lastAired` and `status.name` of a series record; any status
+/// but `Ended` (`Continuing`, `Upcoming`) is still airing.
+fn parse_series_run(body: &str) -> Option<crate::online_enrich::SeriesRun> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    let data = v.get("data")?;
+    let date = |key: &str| {
+        data.get(key)
+            .and_then(|x| x.as_str())
+            .and_then(pharos_core::parse_ymd_to_unix)
+    };
+    let status = data
+        .get("status")
+        .and_then(|s| s.get("name"))
+        .and_then(|n| n.as_str());
+    Some(crate::online_enrich::SeriesRun {
+        first: date("firstAired"),
+        last: date("lastAired"),
+        ongoing: status.is_some_and(|s| s != "Ended"),
+    })
 }
 
 fn episode_list_readable(body: &str) -> bool {
@@ -1570,6 +1601,9 @@ impl<T: TvdbTransport> crate::online_enrich::OnlineEnricher for TvdbEnricher<T> 
     ) -> Option<Vec<crate::online_enrich::EpisodeListing>> {
         self.0.episode_list(id).await
     }
+    async fn series_run(&self, id: &str) -> Option<crate::online_enrich::SeriesRun> {
+        self.0.series_run(id).await
+    }
 }
 
 #[cfg(test)]
@@ -1579,6 +1613,27 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
+
+    #[test]
+    fn a_series_records_run_reads_its_dates_and_status() {
+        let ended = r#"{"data":{"firstAired":"1978-09-17","lastAired":"1979-04-29","status":{"id":2,"name":"Ended"}}}"#;
+        assert_eq!(
+            parse_series_run(ended),
+            Some(crate::online_enrich::SeriesRun {
+                first: Some(274_838_400),
+                last: Some(294_192_000),
+                ongoing: false,
+            })
+        );
+        let airing = r#"{"data":{"firstAired":"1999-10-20","lastAired":"2025-11-02","status":{"id":1,"name":"Continuing"}}}"#;
+        assert!(parse_series_run(airing).unwrap().ongoing);
+        let bare = r#"{"data":{}}"#;
+        assert_eq!(
+            parse_series_run(bare),
+            Some(crate::online_enrich::SeriesRun::default())
+        );
+        assert_eq!(parse_series_run("not json"), None);
+    }
 
     #[test]
     fn login_request_body_is_the_apikey_object() {
