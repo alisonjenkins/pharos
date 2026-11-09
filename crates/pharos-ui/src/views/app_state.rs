@@ -13,19 +13,20 @@
 
 use crate::api_types::{ItemKind, LibraryItem, LoggedInUser};
 use crate::client::{
-    ActivityEntry, AdminUser, ApiKey, BrandingConfig, DeviceEntry, DuplicateFilm, IntegrityReport,
-    ItemChapter, ItemDetail, LibraryFolder, LiveChannel, LiveProgram, LocalizationCulture,
-    LogEntry, PluginEntry, QuickConnectInitiate, RemoteSession, ScheduledTask, SearchHint,
-    SeriesIdentity, UserConfiguration,
+    ActivityEntry, AdminUser, ApiKey, BrandingConfig, DeviceEntry, DuplicateFilm, FixDone,
+    IntegrityReport, ItemChapter, ItemDetail, LibraryFolder, LiveChannel, LiveProgram,
+    LocalizationCulture, LogEntry, PluginEntry, QuickConnectInitiate, RemoteSession, ScheduledTask,
+    SearchHint, SeriesIdentity, ShowCandidate, UserConfiguration,
 };
+use crate::views::admin::{fix_summary, PICK_PROMPT};
 use crate::views::server_picker::{load_saved_servers, save_servers};
 use crate::views::{
     AdminAction, AdminTab, AdminView, CreateUserAttempt, DeepSearchState, DetailAction,
-    ItemDetailView, LibraryView, LiveTvAction, LiveTvStatus, LiveTvView, LoginAttempt, LoginForm,
-    PlayerView, PrefsAction, PrefsTab, PrefsView, QuickConnectAuthorizeAction,
-    QuickConnectAuthorizeView, QuickConnectGuestAction, QuickConnectGuestStatus,
-    QuickConnectGuestView, RemoteAction, RemoteControlView, SavedServer, SearchStatus, SearchView,
-    ServerPickerAction, ServerPickerView,
+    IdentitySearchState, ItemDetailView, LibraryView, LiveTvAction, LiveTvStatus, LiveTvView,
+    LoginAttempt, LoginForm, PickPrompt, PlayerView, PrefsAction, PrefsTab, PrefsView,
+    QuickConnectAuthorizeAction, QuickConnectAuthorizeView, QuickConnectGuestAction,
+    QuickConnectGuestStatus, QuickConnectGuestView, RemoteAction, RemoteControlView, SavedServer,
+    SearchStatus, SearchView, ServerPickerAction, ServerPickerView,
 };
 use dioxus::prelude::*;
 
@@ -713,6 +714,8 @@ pub fn AdminPane(
             }
         })
     };
+    let identity_search = use_signal(IdentitySearchState::default);
+    let identity_prompt = use_signal::<Option<PickPrompt>>(|| None);
     // Plans every folder on the server, so it runs only while its tab is open.
     let identity_resource = {
         let base = server_base.clone();
@@ -794,6 +797,8 @@ pub fn AdminPane(
         let deep_search_signal = deep_search;
         let mut deep_search_gen_signal = deep_search_gen;
         let mut fetch_err_hidden_signal = fetch_err_hidden;
+        let mut identity_search_signal = identity_search;
+        let mut identity_prompt_signal = identity_prompt;
         move |action: AdminAction| {
             let token = access_token.peek().clone();
             let base = server_base.clone();
@@ -961,6 +966,103 @@ pub fn AdminPane(
                             ))),
                         }
                     }
+                    AdminAction::IdentitySearch {
+                        series_key,
+                        name,
+                        year,
+                    } => {
+                        identity_search_signal.set(IdentitySearchState {
+                            series_key: series_key.clone(),
+                            loading: true,
+                            ..IdentitySearchState::default()
+                        });
+                        let found = search_shows(&base, &token, &name, year).await;
+                        identity_search_signal.set(match found {
+                            Ok(hits) => IdentitySearchState {
+                                series_key,
+                                loading: false,
+                                hits,
+                                error: None,
+                            },
+                            Err(e) => IdentitySearchState {
+                                series_key,
+                                loading: false,
+                                hits: Vec::new(),
+                                error: Some(e),
+                            },
+                        });
+                    }
+                    AdminAction::IdentityPick {
+                        series_key,
+                        provider,
+                        id,
+                    } => match pick_show(&base, &token, &series_key, &provider, &id).await {
+                        Ok(done) => {
+                            identity_prompt_signal.set(None);
+                            identity_search_signal.set(IdentitySearchState::default());
+                            status_signal.set(Some(fix_summary(&done)));
+                        }
+                        Err(e) => status_signal.set(Some(format!("Couldn't pick that show: {e}"))),
+                    },
+                    AdminAction::IdentityConfirm { series_key } => {
+                        match confirm_show(&base, &token, &series_key).await {
+                            Ok(done) => status_signal.set(Some(fix_summary(&done))),
+                            Err(e) => {
+                                status_signal.set(Some(format!("Couldn't confirm the match: {e}")))
+                            }
+                        }
+                    }
+                    AdminAction::IdentityMove {
+                        folder,
+                        paths,
+                        target_key,
+                        target_name,
+                        target_year,
+                    } => {
+                        let new_group = target_name.is_some();
+                        let body = crate::client::move_body(
+                            &folder,
+                            &paths,
+                            target_key.as_deref(),
+                            target_name.as_deref(),
+                            target_year,
+                        );
+                        match move_files(&base, &token, body).await {
+                            Ok(done) => {
+                                let mut line = fix_summary(&done);
+                                if new_group {
+                                    // Its episodes wait until a show is picked.
+                                    line = format!("{line} {PICK_PROMPT}.");
+                                    identity_prompt_signal.set(Some(PickPrompt {
+                                        folder,
+                                        year: target_year,
+                                    }));
+                                }
+                                status_signal.set(Some(line));
+                            }
+                            Err(e) => {
+                                status_signal.set(Some(format!("Couldn't move the files: {e}")))
+                            }
+                        }
+                    }
+                    AdminAction::IdentityKeepTogether { folder } => {
+                        match keep_folder_together(&base, &token, &folder).await {
+                            Ok(done) => {
+                                identity_prompt_signal.set(None);
+                                status_signal.set(Some(fix_summary(&done)));
+                            }
+                            Err(e) => status_signal
+                                .set(Some(format!("Couldn't keep the folder together: {e}"))),
+                        }
+                    }
+                    AdminAction::IdentityRemove { id } => {
+                        match remove_hand_fix(&base, &token, id).await {
+                            Ok(done) => status_signal.set(Some(fix_summary(&done))),
+                            Err(e) => {
+                                status_signal.set(Some(format!("Couldn't remove the fix: {e}")))
+                            }
+                        }
+                    }
                     AdminAction::SaveBranding(cfg) => {
                         match save_branding(&base, &token, &cfg).await {
                             Ok(()) => status_signal.set(Some("Saved.".into())),
@@ -1063,6 +1165,8 @@ pub fn AdminPane(
     let duplicates = duplicates_resource.read_unchecked().clone().flatten();
     let integrity = integrity_resource.read_unchecked().clone().flatten();
     let series_identity = identity_resource.read_unchecked().clone().flatten();
+    let identity_search_now = identity_search.read().clone();
+    let identity_prompt_now = identity_prompt.read().clone();
     let integrity_queued = integrity_queued.read().clone();
     let integrity_errors = integrity_errors.read().clone();
     let deep_queued = deep_queued.read().clone();
@@ -1113,6 +1217,8 @@ pub fn AdminPane(
             duplicates: duplicates,
             integrity: integrity,
             series_identity: series_identity,
+            identity_search: identity_search_now,
+            identity_prompt: identity_prompt_now,
             integrity_queued: integrity_queued,
             integrity_errors: integrity_errors,
             deep_queued: deep_queued,
@@ -2327,6 +2433,100 @@ async fn fetch_series_identity(base: &str, token: &str) -> Result<SeriesIdentity
 #[cfg(not(feature = "web"))]
 async fn fetch_series_identity(_base: &str, _token: &str) -> Result<SeriesIdentity, String> {
     Err("series_identity is only wired in the web build".into())
+}
+
+#[cfg(feature = "web")]
+async fn search_shows(
+    base: &str,
+    token: &str,
+    name: &str,
+    year: Option<u32>,
+) -> Result<Vec<ShowCandidate>, String> {
+    crate::client::web::search_shows(base, token, name, year)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(not(feature = "web"))]
+async fn search_shows(
+    _base: &str,
+    _token: &str,
+    _name: &str,
+    _year: Option<u32>,
+) -> Result<Vec<ShowCandidate>, String> {
+    Err("search_shows is only wired in the web build".into())
+}
+
+#[cfg(feature = "web")]
+async fn pick_show(
+    base: &str,
+    token: &str,
+    series_key: &str,
+    provider: &str,
+    id: &str,
+) -> Result<FixDone, String> {
+    crate::client::web::pick_show(base, token, series_key, provider, id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(not(feature = "web"))]
+async fn pick_show(
+    _base: &str,
+    _token: &str,
+    _series_key: &str,
+    _provider: &str,
+    _id: &str,
+) -> Result<FixDone, String> {
+    Err("pick_show is only wired in the web build".into())
+}
+
+#[cfg(feature = "web")]
+async fn confirm_show(base: &str, token: &str, series_key: &str) -> Result<FixDone, String> {
+    crate::client::web::confirm_show(base, token, series_key)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(not(feature = "web"))]
+async fn confirm_show(_base: &str, _token: &str, _series_key: &str) -> Result<FixDone, String> {
+    Err("confirm_show is only wired in the web build".into())
+}
+
+#[cfg(feature = "web")]
+async fn move_files(base: &str, token: &str, body: String) -> Result<FixDone, String> {
+    crate::client::web::move_files(base, token, body)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(not(feature = "web"))]
+async fn move_files(_base: &str, _token: &str, _body: String) -> Result<FixDone, String> {
+    Err("move_files is only wired in the web build".into())
+}
+
+#[cfg(feature = "web")]
+async fn keep_folder_together(base: &str, token: &str, folder: &str) -> Result<FixDone, String> {
+    crate::client::web::keep_folder_together(base, token, folder)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(not(feature = "web"))]
+async fn keep_folder_together(_base: &str, _token: &str, _folder: &str) -> Result<FixDone, String> {
+    Err("keep_folder_together is only wired in the web build".into())
+}
+
+#[cfg(feature = "web")]
+async fn remove_hand_fix(base: &str, token: &str, id: i64) -> Result<FixDone, String> {
+    crate::client::web::remove_hand_fix(base, token, id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(not(feature = "web"))]
+async fn remove_hand_fix(_base: &str, _token: &str, _id: i64) -> Result<FixDone, String> {
+    Err("remove_hand_fix is only wired in the web build".into())
 }
 
 #[cfg(feature = "web")]
