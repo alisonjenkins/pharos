@@ -495,7 +495,7 @@ pub const BINDINGS: &[Binding] = &[
         MUSIC,
         A::Press("shrink"),
     ),
-    // The video goes on in the mini bar or floating window (B903).
+    // The video goes on in the mini bar or floating window (B905).
     bind(
         &["Escape"],
         "Shrink to the mini bar or floating player",
