@@ -6,7 +6,8 @@
 //! the host does.
 //!
 //! How it reaches the page (spec 025, "How the Android UI reads the DOM"):
-//! one long-lived script (`BRIDGE_JS`) sends keys, Back (`popstate`) and the
+//! one long-lived script (`BRIDGE_JS`) sends keys, Back (`popstate`, which
+//! an `on_back` guard may take before any route hears it) and the
 //! viewport into Rust, which keeps them in thread-locals read
 //! synchronously; reads made on a key press run as one batched
 //! `document::eval`; calls with no answer are a spawned eval. The page's
@@ -222,6 +223,23 @@ impl Drop for PopState {
 
 pub fn on_pop_state(on_path: impl FnMut(String) + 'static) -> PopState {
     PopState(listen(Listener::Pop(Box::new(on_path))))
+}
+
+/// A Back guard, removed on drop.
+pub struct BackWatch(u64);
+
+impl Drop for BackWatch {
+    fn drop(&mut self) {
+        unlisten(self.0);
+    }
+}
+
+/// Ask `on_back` first when the remote's Back arrives: answering `true`
+/// takes it, so the page stays where it is and no `popstate` listener hears
+/// it. The player's remote scrub uses this to drop its preview in place
+/// (B907) instead of leaving the player.
+pub fn on_back(on_back: impl FnMut() -> bool + 'static) -> BackWatch {
+    BackWatch(listen(Listener::Back(Box::new(on_back))))
 }
 
 /// The WebView answers `maybe` for HLS but does not play it well; hls.js
@@ -747,6 +765,8 @@ enum Listener {
     Mode(Box<dyn FnMut(&str) -> bool>),
     Escape(Box<dyn FnMut()>),
     Pop(Box<dyn FnMut(String)>),
+    /// Asked first on Back; `true` keeps the page where it is.
+    Back(Box<dyn FnMut() -> bool>),
 }
 
 fn listen(listener: Listener) -> u64 {
@@ -897,6 +917,25 @@ fn on_bridge(message: Bridge) {
             }
         }
         Bridge::Pop { path } => {
+            let mut kept = false;
+            for f in &listeners {
+                if let Ok(mut f) = f.try_borrow_mut() {
+                    if let Listener::Back(f) = &mut *f {
+                        kept |= f();
+                    }
+                }
+            }
+            if kept {
+                // The WebView has already gone back an entry: put the page
+                // that took Back back on top, so the next Back leaves it.
+                let here = current_path();
+                log::info!("pharos: back taken by the page path={here} popped_to={path}");
+                run(format!(
+                    "history.pushState('pharos', '', {});",
+                    js_str(&here)
+                ));
+                return;
+            }
             PATHS.with(|p| p.borrow_mut().popped_to(&path));
             for f in &listeners {
                 if let Ok(mut f) = f.try_borrow_mut() {
