@@ -231,3 +231,16 @@ async fn a_malformed_codec_is_refused_and_nothing_is_written() {
         "the name in the same body was not written"
     );
 }
+
+/// AAC is what every conversion produces, so it cannot be turned off.
+#[actix_web::test]
+async fn aac_cannot_be_turned_off() {
+    let fx = setup().await;
+    assert_eq!(
+        set_options(&fx, "tv", r#"{"NoDirectPlayAudioCodecs":["eac3","AAC"]}"#).await,
+        StatusCode::BAD_REQUEST
+    );
+    assert!(device(&devices(&fx).await, "tv")
+        .get("NoDirectPlayAudioCodecs")
+        .is_none());
+}
