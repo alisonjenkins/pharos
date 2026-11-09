@@ -140,6 +140,9 @@ config:
     # graceful stop. /readyz flips 503 immediately so the LB stops new traffic;
     # this window lets active segment/stream reads finish (zero-downtime deploy).
     drainGraceSecs: 10
+    # actix-web worker threads. Unset (or 0): one per CPU, capped at 16 (ADR-0083).
+    # Each worker holds its own ~5.6 MiB copy of the route table.
+    httpWorkers: 0
     # Reverse proxies whose X-Forwarded-For is believed, as IPs or CIDRs (the
     # header is client-controlled, so only a listed direct peer is trusted).
     # Empty: every client is its TCP peer, and the per-address login limit is
