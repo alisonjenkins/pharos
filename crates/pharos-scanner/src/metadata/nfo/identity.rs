@@ -97,6 +97,45 @@ pub(crate) fn foreign_nfos(req: &MetadataRequest<'_>) -> ForeignNfos {
     out
 }
 
+/// Years a film's NFO may sit from the year its file or folder states: a
+/// premiere and a release, or two regions' releases, can straddle a new year.
+const FILM_YEAR_SLACK: u32 = 1;
+
+/// B1009 — whether a film's NFO describes another film: its `<year>` is more
+/// than [`FILM_YEAR_SLACK`] from the year the file's name, else its folder's
+/// name, states. Jellyfin wrote the 1994 *The Lion King* into
+/// `The Lion King (2019)/movie.nfo`, and its tmdb id then matched the remake
+/// to the original. A name or NFO with no year is not evidence either way.
+pub(crate) fn names_another_year(
+    media: &Path,
+    nfo: &Path,
+    parsed: &pharos_core::MetadataResult,
+) -> bool {
+    let Some(nfo_year) = parsed.production_year else {
+        return false;
+    };
+    let year_of = |name: Option<&std::ffi::OsStr>| {
+        crate::metadata::filename::parse_filename(name?.to_str()?, true).year
+    };
+    let folder = || year_of(media.parent().and_then(Path::file_name));
+    let Some(file_year) = year_of(media.file_stem()).or_else(folder) else {
+        return false;
+    };
+    let foreign = nfo_year.abs_diff(file_year) > FILM_YEAR_SLACK;
+    if foreign {
+        tracing::info!(
+            path = %media.display(),
+            nfo = %nfo.display(),
+            nfo_year,
+            file_year,
+            nfo_title = parsed.title.as_deref().unwrap_or(""),
+            "nfo: movie NFO names another year; ignoring it and its art"
+        );
+        metrics::counter!("pharos_nfo_set_aside_total", "reason" => "film_year").increment(1);
+    }
+    foreign
+}
+
 /// True when the NFO offers at least one show name and none resembles
 /// `series_name`. An NFO with no show name at all is not evidence either way.
 /// A name whose region or year qualifier contradicts the show's is not the
