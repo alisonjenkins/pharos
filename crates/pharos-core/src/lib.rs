@@ -3321,7 +3321,10 @@ pub const SEGMENT_SCHEMA_VERSION: i64 = 1;
 /// agreeing-seconds share. Duration-only (4) regressed endings — a short true
 /// outro outweighed by a few long spurious matches — costing 78 outro rows
 /// library-wide while intros gained 66. Cheap half only.
-pub const SEGMENT_DETECT_VERSION: i64 = 5;
+/// 6 (T106, B1060): an episode the endpoint reading drops gets a second,
+/// overlap reading, so a fragmented match of one opening can agree. Adds
+/// segments only. Cheap half only.
+pub const SEGMENT_DETECT_VERSION: i64 = 6;
 
 /// A typed playback segment (Jellyfin `MediaSegmentType`). Intro/Outro drive
 /// jellyfin-web's Skip Intro / Skip Outro overlay.
