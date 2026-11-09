@@ -794,13 +794,18 @@ const inText = (t) => !!t && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/
 // Space too: the player's mode key toggles play, and the WebView would
 // click the focused button as well (it cannot wait for Rust's answer).
 const takes = new Set(["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", " "]);
+// OK that commits a remote scrub (B907) must not also click the focused
+// button, on its first press or while it is held.
+let okCommits = false;
+addEventListener("keyup", (e) => { if (e.key === "Enter") okCommits = false; });
 addEventListener("keydown", (e) => {
-  if (e.repeat) return;
   const text = inText(e.target);
+  if (e.key === "Enter" && !e.repeat) okCommits = !!document.querySelector(".pharos-seek.is-scrubbing");
+  if (e.key === "Enter" && okCommits) e.preventDefault();
+  // A held arrow repeats (the player's scrub speeds up on it): the WebView
+  // must not move the focus on the repeats either. Rust hears the first.
   if (!text && takes.has(e.key)) e.preventDefault();
-  // OK during a remote scrub commits it (B907); the focused button must
-  // not also be clicked.
-  if (e.key === "Enter" && document.querySelector(".pharos-seek.is-scrubbing")) e.preventDefault();
+  if (e.repeat) return;
   send({ t: "key", key: e.key, ctrl: e.ctrlKey, meta: e.metaKey, text });
 });
 addEventListener("popstate", () => send({ t: "pop", path: location.pathname + location.search }));

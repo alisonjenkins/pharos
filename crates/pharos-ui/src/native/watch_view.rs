@@ -491,7 +491,7 @@ pub fn WatchView(
     let mut scrub = use_signal(|| None::<Scrub>);
     // A preview belongs to its item: one still open when the next episode
     // starts must not seek it to the old target.
-    let item = (title.clone(), title_detail.clone());
+    let item = (item_id, title.clone(), title_detail.clone());
     use_effect(use_reactive!(|item| {
         let _ = &item;
         if scrub.peek().is_some() {
