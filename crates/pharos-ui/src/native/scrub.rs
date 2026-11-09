@@ -11,9 +11,6 @@
 pub const TAP_STEP_MS: u64 = 10_000;
 /// Keys still this long commit the preview.
 pub const SETTLE_MS: u32 = 900;
-/// A press this soon after the last one in the same direction continues a
-/// hold, when the platform does not mark key repeats.
-pub const HOLD_GAP_MS: f64 = 300.0;
 /// A held key never crosses the whole video in less than this.
 const MIN_CROSSING_MS: f64 = 6_000.0;
 
@@ -25,6 +22,8 @@ pub struct Scrub {
     /// Where the preview is.
     pub target_ms: u64,
     pub forward: bool,
+    /// When the first press of this preview arrived, for the log.
+    pub started_at: f64,
     /// When the current hold began (the press that started it).
     pub hold_start: f64,
     /// When the last press arrived; the settle timer compares against it.
@@ -46,7 +45,8 @@ pub fn hold_speed(held_ms: f64) -> f64 {
 }
 
 /// The preview after one press of left (`forward == false`) or right.
-/// `repeat` is the platform's key-repeat flag; `position_ms` is playback's
+/// `repeat` is the platform's key-repeat flag, the only sign of a hold: two
+/// quick taps are two taps, 10 s each. `position_ms` is playback's
 /// position, used when no preview is under way; `duration_ms` 0 means
 /// unknown, which leaves the end unbounded.
 pub fn press(
@@ -57,8 +57,7 @@ pub fn press(
     duration_ms: u64,
     now: f64,
 ) -> Scrub {
-    let holding =
-        prev.filter(|s| s.forward == forward && (repeat || now - s.last_press <= HOLD_GAP_MS));
+    let holding = prev.filter(|s| repeat && s.forward == forward);
     let base = prev.map_or(position_ms, |s| s.target_ms);
     let (hold_start, by) = match holding {
         Some(s) => {
@@ -83,6 +82,7 @@ pub fn press(
     };
     Scrub {
         origin_ms: prev.map_or(position_ms, |s| s.origin_ms),
+        started_at: prev.map_or(now, |s| s.started_at),
         target_ms: target,
         forward,
         hold_start,
@@ -121,7 +121,7 @@ pub fn end_line(s: &Scrub, end: End, now: f64) -> String {
         s.origin_ms,
         s.target_ms,
         s.presses,
-        (now - s.hold_start).max(0.0).round() as u64,
+        (now - s.started_at).max(0.0).round() as u64,
     )
 }
 
@@ -213,21 +213,30 @@ mod tests {
     }
 
     #[test]
-    fn without_a_repeat_flag_quick_presses_still_hold() {
+    fn quick_taps_are_taps_and_a_repeat_is_a_hold() {
         let s = press(None, true, false, 0, HOUR, 0.0);
-        let quick = press(Some(s), true, false, 0, HOUR, 100.0);
-        assert_eq!(quick.target_ms, TAP_STEP_MS + 2_000, "20x over 100 ms");
-        let slow = press(Some(s), true, false, 0, HOUR, 400.0);
-        assert_eq!(slow.target_ms, 2 * TAP_STEP_MS, "a pause makes it a tap");
+        let tap = press(Some(s), true, false, 0, HOUR, 100.0);
+        assert_eq!(
+            tap.target_ms,
+            2 * TAP_STEP_MS,
+            "a quick second tap is 10 s more"
+        );
+        let held = press(Some(s), true, true, 0, HOUR, 100.0);
+        assert_eq!(
+            held.target_ms,
+            TAP_STEP_MS + 2_000,
+            "a repeat moves 20x over 100 ms"
+        );
     }
 
     #[test]
     fn the_end_line_names_how_and_where() {
         let s = press(None, true, false, 60_000, HOUR, 0.0);
-        let line = end_line(&s, End::Cancelled, 1_200.0);
+        let s = press(Some(s), true, false, 60_000, HOUR, 1_000.0);
+        let line = end_line(&s, End::Cancelled, 1_900.0);
         assert_eq!(
-            line,
-            "pharos: scrub cancelled from 60000 ms to 70000 ms after 1 presses in 1200 ms"
+            line, "pharos: scrub cancelled from 60000 ms to 80000 ms after 2 presses in 1900 ms",
+            "the time is the whole preview's, not the last hold's"
         );
         let labels = [End::Settled, End::Confirmed, End::Cancelled].map(End::label);
         assert!(labels
