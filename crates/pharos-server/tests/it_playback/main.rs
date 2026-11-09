@@ -8,6 +8,7 @@ mod browser_codec_matrix;
 mod image_subtitle_routes;
 mod jellyfin_hls_softsubs;
 mod jellyfin_playbackinfo_client_switches;
+mod jellyfin_playbackinfo_device_audio_deny;
 mod jellyfin_playbackinfo_kotlin_strict;
 mod jellyfin_playbackinfo_native_directplay;
 mod jellyfin_playbackinfo_stream_selection;

@@ -2279,7 +2279,7 @@ async fn playback_info(
     // Consume the POST body once: the DeviceProfile drives negotiation, and
     // the track picks (present when jellyfin-web reloads for an audio/subtitle
     // switch) fall back into the transcode URL below.
-    let (profile, body_audio_index, body_subtitle_index, switches) = match body {
+    let (mut profile, body_audio_index, body_subtitle_index, switches) = match body {
         Some(b) => {
             let switches = playback_switches_from_body(&b);
             (
@@ -2319,6 +2319,7 @@ async fn playback_info(
         .and_then(|v| v.to_str().ok())
         .is_some_and(|ua| ua.contains("Mozilla"));
 
+    profile.denied_audio_codecs = playback::denied_audio_codecs_for_token(&state, &api_key).await;
     let negotiated = playback::negotiate(
         &state,
         &item,
