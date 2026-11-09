@@ -227,6 +227,23 @@ impl TmdbClient {
         parse_tv_detail(&body)
     }
 
+    /// Spec 033 (B982) — the show's first and last air dates and whether it
+    /// is still in production, from its `/tv/{id}` record.
+    pub(crate) async fn tv_run(&self, id: &str) -> Option<crate::online_enrich::SeriesRun> {
+        let resp = self
+            .http
+            .get(format!("{API_BASE}/tv/{id}"))
+            .query(&[("api_key", self.api_key.as_str())])
+            .send()
+            .await
+            .ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let body = resp.text().await.ok()?;
+        parse_tv_run(&body)
+    }
+
     /// Fetch a single TMDB TV episode's detail record by series id +
     /// season/episode number.
     pub(crate) async fn episode_detail(
@@ -366,6 +383,10 @@ impl crate::online_enrich::OnlineEnricher for TmdbEnricher {
             out.extend(self.0.season_episodes(id, season).await?);
         }
         Some(out)
+    }
+
+    async fn series_run(&self, id: &str) -> Option<crate::online_enrich::SeriesRun> {
+        self.0.tv_run(id).await
     }
 
     async fn search(
@@ -593,6 +614,22 @@ pub(crate) fn parse_movie_detail(body: &str) -> Option<crate::online_enrich::Enr
         provider_id: v.get("id").and_then(|x| x.as_i64()).map(|i| i.to_string()),
         artwork: art,
         ..EnrichedMetadata::default()
+    })
+}
+
+/// `first_air_date`/`last_air_date` and `in_production` of a TMDB `/tv/{id}`
+/// record.
+pub(crate) fn parse_tv_run(body: &str) -> Option<crate::online_enrich::SeriesRun> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    let date = |key: &str| {
+        v.get(key)
+            .and_then(|x| x.as_str())
+            .and_then(pharos_core::parse_ymd_to_unix)
+    };
+    Some(crate::online_enrich::SeriesRun {
+        first: date("first_air_date"),
+        last: date("last_air_date"),
+        ongoing: v.get("in_production").and_then(|x| x.as_bool()) == Some(true),
     })
 }
 
@@ -912,6 +949,24 @@ pub(crate) fn parse_tmdb_credits(v: &serde_json::Value) -> Vec<pharos_core::Pers
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
+
+    #[test]
+    fn a_tv_records_run_reads_its_dates_and_production() {
+        let airing =
+            r#"{"first_air_date":"1999-10-20","last_air_date":"2025-11-02","in_production":true}"#;
+        assert_eq!(
+            parse_tv_run(airing),
+            Some(crate::online_enrich::SeriesRun {
+                first: Some(940_377_600),
+                last: Some(1_762_041_600),
+                ongoing: true,
+            })
+        );
+        let ended =
+            r#"{"first_air_date":"1980-09-28","last_air_date":"1980-12-21","in_production":false}"#;
+        assert!(!parse_tv_run(ended).unwrap().ongoing);
+        assert_eq!(parse_tv_run("[]").map(|r| r.first), Some(None));
+    }
 
     #[test]
     fn parses_a_seasons_episode_list() {
