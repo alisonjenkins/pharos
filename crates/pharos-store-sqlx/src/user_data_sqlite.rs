@@ -23,6 +23,10 @@ fn media_id_i64(id: MediaId) -> DomainResult<i64> {
     i64::try_from(id).map_err(|e| DomainError::Backend(format!("id overflow: {e}")))
 }
 
+/// How many item ids one `user_data_bulk` query binds: under SQLite's
+/// 32766 host-parameter cap with the user id (B1087).
+const BULK_IDS_PER_QUERY: usize = 30_000;
+
 impl UserDataStore for SqliteStore {
     #[tracing::instrument(skip(self), fields(user.id = %user.0, media.id = %item))]
     async fn get_user_data(&self, user: UserId, item: MediaId) -> DomainResult<UserItemData> {
@@ -140,29 +144,33 @@ impl UserDataStore for SqliteStore {
             return Ok(Vec::new());
         }
         let id_bytes = user.0.as_bytes().to_vec();
-        // sqlx's macro `query!` can't bind a variadic IN — build the
-        // placeholder list dynamically. Inputs are u64s, no SQL
-        // injection risk.
-        let placeholders = std::iter::repeat("?")
-            .take(items.len())
-            .collect::<Vec<_>>()
-            .join(",");
-        let sql = format!(
-            "SELECT item_id, played, play_count, last_played_position_ticks,
-                    is_favorite, last_played_at, audio_stream_index, subtitle_stream_index
-             FROM user_data
-             WHERE user_id = ? AND item_id IN ({placeholders})"
-        );
-        let mut q = sqlx::query_as::<_, UserDataRowWithId>(sqlx::AssertSqlSafe(sql));
-        q = q.bind(id_bytes);
-        for id in items {
-            q = q.bind(media_id_i64(*id)?);
-        }
-        let rows = q.fetch_all(self.pool()).await.map_err(map_err)?;
         let mut by_id: std::collections::HashMap<i64, UserItemData> =
-            std::collections::HashMap::with_capacity(rows.len());
-        for (id, played, pc, pos, fav, lp, ai, si) in rows {
-            by_id.insert(id, row_to_data((played, pc, pos, fav, lp, ai, si)));
+            std::collections::HashMap::new();
+        // SQLite caps host parameters at 32766 (B1087), and a whole music
+        // library's tracks can pass that, so the ids go in chunks.
+        for chunk in items.chunks(BULK_IDS_PER_QUERY) {
+            // sqlx's macro `query!` can't bind a variadic IN — build the
+            // placeholder list dynamically. Inputs are u64s, no SQL
+            // injection risk.
+            let placeholders = std::iter::repeat("?")
+                .take(chunk.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT item_id, played, play_count, last_played_position_ticks,
+                        is_favorite, last_played_at, audio_stream_index, subtitle_stream_index
+                 FROM user_data
+                 WHERE user_id = ? AND item_id IN ({placeholders})"
+            );
+            let mut q = sqlx::query_as::<_, UserDataRowWithId>(sqlx::AssertSqlSafe(sql));
+            q = q.bind(id_bytes.clone());
+            for id in chunk {
+                q = q.bind(media_id_i64(*id)?);
+            }
+            let rows = q.fetch_all(self.pool()).await.map_err(map_err)?;
+            for (id, played, pc, pos, fav, lp, ai, si) in rows {
+                by_id.insert(id, row_to_data((played, pc, pos, fav, lp, ai, si)));
+            }
         }
         let mut out = Vec::with_capacity(items.len());
         for id in items {
@@ -453,6 +461,32 @@ mod tests {
         assert!(v[0].played);
         assert_eq!(v[1], UserItemData::default());
         assert_eq!(v[2], UserItemData::default());
+    }
+
+    /// B1087: more ids than SQLite binds in one statement still read, each
+    /// in its place. Disarm check: with one query for every id, this fails
+    /// with "too many SQL variables".
+    #[tokio::test]
+    async fn user_data_bulk_reads_past_the_parameter_cap() {
+        let (s, uid, _) = fixture().await;
+        let mut ids: Vec<u64> = (100_000..140_000).collect();
+        ids.push(7);
+        s.set_user_data(
+            uid,
+            7,
+            UserItemData {
+                is_favorite: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let v = s.user_data_bulk(uid, &ids).await.unwrap();
+        assert_eq!(v.len(), ids.len());
+        assert!(v[ids.len() - 1].is_favorite);
+        assert!(v[..ids.len() - 1]
+            .iter()
+            .all(|d| *d == UserItemData::default()));
     }
 
     #[tokio::test]
