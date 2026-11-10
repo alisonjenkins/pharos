@@ -808,6 +808,62 @@
           };
         };
 
+        # Spec 039 / ADR-0116: the Rust aligner, GPU pass included. Its own
+        # deps artifact, since Burn and wgpu are behind the `vulkan` feature
+        # and the server's artifact never compiles them.
+        alignerRsArgs = pharosCommonArgs // {
+          pname = "pharos-align";
+          cargoExtraArgs = "--package pharos-align --features vulkan";
+        };
+        alignerRsDeps = craneLib.buildDepsOnly alignerRsArgs;
+        alignerRs = craneLib.buildPackage (
+          alignerRsArgs
+          // {
+            cargoArtifacts = alignerRsDeps;
+            cargoExtraArgs = "--package pharos-align --features vulkan --bin pharos-aligner";
+            # The crate's suite runs in pharosTests; its GPU tests need a device.
+            doCheck = false;
+          }
+        );
+        alignerRsImage = pkgs.dockerTools.streamLayeredImage {
+          # Its own name until the cutover (T039-26), so the Python image's
+          # tags and the shadow deployment's never collide.
+          name = "pharos-aligner-rs";
+          tag = "latest";
+          architecture = if pkgs.stdenv.hostPlatform.isAarch64 then "arm64" else "amd64";
+          contents = [ alignerRs pkgs.cacert ];
+          # The cache directory exists and is writable without a volume; the
+          # chart mounts a persistent one over it (R14).
+          extraCommands = ''
+            mkdir -p etc tmp var/cache/pharos-aligner
+            printf 'root:x:0:0::/root:/sbin/nologin\npharos:x:1000:1000::/tmp:/sbin/nologin\n' > etc/passwd
+            printf 'root:x:0:\npharos:x:1000:\n' > etc/group
+            chmod 1777 tmp var/cache/pharos-aligner
+          '';
+          config = {
+            Entrypoint = [ "${alignerRs}/bin/pharos-aligner" ];
+            User = "1000:1000";
+            ExposedPorts = {
+              "8790/tcp" = { };
+            };
+            Env = [
+              "PHAROS_ALIGNER_MEDIA_ROOT=/var/lib/pharos/media"
+              "PHAROS_ALIGNER_WEIGHTS=${alignerWeights}"
+              "PHAROS_ALIGNER_FFMPEG=${pkgs.ffmpeg-headless}/bin/ffmpeg"
+              "PHAROS_ALIGNER_CACHE_DIR=/var/cache/pharos-aligner"
+              # wgpu dlopens libvulkan.so.1, which no FHS path holds here,
+              # and the loader then needs radv's manifest. Both names, as
+              # older loaders read only the first.
+              "LD_LIBRARY_PATH=${pkgs.vulkan-loader}/lib"
+              "VK_ICD_FILENAMES=${pkgs.mesa}/share/vulkan/icd.d/radeon_icd.x86_64.json"
+              "VK_DRIVER_FILES=${pkgs.mesa}/share/vulkan/icd.d/radeon_icd.x86_64.json"
+            ];
+            Labels = {
+              "org.opencontainers.image.source" = "https://github.com/alisonjenkins/pharos";
+            };
+          };
+        };
+
         # The pharos Dioxus UI compiled to a static WASM bundle via `dx`.
         # Built reproducibly in the nix sandbox: cargo deps are vendored from
         # Cargo.lock (offline), wasm-bindgen-cli is `wasmBindgenCli` above,
@@ -1299,6 +1355,8 @@
           pharosUiOci = pharosUiImage;
           inherit aligner alignerWeights;
           alignerOci = alignerImage;
+          inherit alignerRs;
+          alignerRsOci = alignerRsImage;
           pharosUiBundle = pharosUiBundle;
           testMediaOci = testMediaImage;
           testMediaTree = pharosTestMedia;
