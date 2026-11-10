@@ -167,6 +167,28 @@ fn bad_bodies_and_paths_are_400_and_a_missing_file_404() {
 }
 
 #[test]
+fn a_timestamp_past_the_limit_is_a_400_through_the_http_path() {
+    use pharos_align::plan::MAX_TIMESTAMP_MS;
+    let s = serve("late", silent(), None);
+    // No song duration is sent, so nothing but the check bounds the window.
+    let body = |start: i64| {
+        json!({"path": "song.mp3", "lines": [
+            {"start_ms": start, "end_ms": start, "text": "test song A"}
+        ]})
+    };
+    let late = MAX_TIMESTAMP_MS + 1;
+    assert_eq!(
+        post(s.addr, &body(late)),
+        (
+            400,
+            json!({"error": format!("start_ms cannot exceed {MAX_TIMESTAMP_MS} ms, got {late}")})
+        )
+    );
+    let (status, answer) = post(s.addr, &body(MAX_TIMESTAMP_MS));
+    assert_eq!(status, 200, "a timestamp at the limit is aligned: {answer}");
+}
+
+#[test]
 fn content_length_is_required_and_capped() {
     let s = serve("length", silent(), None);
     let chunked = "POST /align HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked";
