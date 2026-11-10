@@ -3250,9 +3250,10 @@ impl GroupHandle {
             prune_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             let mut listed = state.listing();
             loop {
-                // Clock, ping and snapshot traffic is frequent and changes
-                // nothing a list shows, so it skips the comparison below.
-                let mut quiet = false;
+                // Only a mutating message, or a prune that removed someone,
+                // can change what a list shows; clock, ping and snapshot
+                // traffic and the gate and buffering timeouts cannot.
+                let mut relist = false;
                 // Arm the readiness-gate timeout only while waiting, so a
                 // silent/wedged member can never block the group forever.
                 let deadline = state.waiting.as_ref().map(|w| w.deadline);
@@ -3272,7 +3273,7 @@ impl GroupHandle {
                             | GroupMsg::ObserveClock { .. }
                             | GroupMsg::MemberPing { .. });
                         handle(&mut state, msg).await;
-                        quiet = !mutates;
+                        relist = mutates;
                         if mutates {
                             state.persist();
                         }
@@ -3463,11 +3464,12 @@ impl GroupHandle {
                             state.members.clear();
                         }
                         if pruned_any || abandoned {
+                            relist = true;
                             state.persist();
                         }
                     }
                 }
-                if let Some(listing) = listing.as_ref().filter(|_| !quiet) {
+                if let Some(listing) = listing.as_ref().filter(|_| relist) {
                     let now = state.listing();
                     if now != listed {
                         listed = now;
