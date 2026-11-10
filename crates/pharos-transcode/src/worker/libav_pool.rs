@@ -127,7 +127,8 @@ fn idle_timeout_from(raw: Option<&str>) -> Option<Duration> {
 }
 
 /// Subtitle-signal windows sent per op. A window is 16 bytes on the wire and
-/// a line's reply ~24, so 16 384 of them keep both frames under ~400 KiB,
+/// a line's reply ~30 (signals plus bottom text), so 16 384 of them keep both
+/// frames under ~500 KiB,
 /// well inside `MAX_FRAME`; a longer track runs one pass per chunk (B914).
 pub const SIGNALS_WINDOWS_PER_OP: usize = 16_384;
 
@@ -538,6 +539,7 @@ impl LibavWorkerPool {
         let mut merged: Option<crate::subtitle_signals::SubtitleSignals> = None;
         let mut by_window: Vec<crate::subtitle_signals::LineSignals> =
             Vec::with_capacity(unique.len());
+        let mut text_by_window: Vec<Option<f32>> = Vec::with_capacity(unique.len());
         for chunk in unique.chunks(SIGNALS_WINDOWS_PER_OP) {
             let ev = self
                 .run(TinyOp::SubtitleSignals {
@@ -558,6 +560,9 @@ impl LibavWorkerPool {
                 )));
             }
             by_window.append(&mut sig.lines);
+            // A worker that reports no text check speaks for none of these.
+            sig.bottom_text.resize(chunk.len(), None);
+            text_by_window.append(&mut sig.bottom_text);
             merged = Some(match merged {
                 None => sig,
                 Some(mut m) => {
@@ -584,15 +589,18 @@ impl LibavWorkerPool {
                 };
             }
         };
+        let slot = |w: &(u64, u64)| unique.binary_search(w).ok();
         out.lines = windows
             .iter()
             .map(|w| {
-                unique
-                    .binary_search(w)
-                    .ok()
+                slot(w)
                     .and_then(|i| by_window.get(i).copied())
                     .unwrap_or(crate::subtitle_signals::LineSignals::NONE)
             })
+            .collect();
+        out.bottom_text = windows
+            .iter()
+            .map(|w| slot(w).and_then(|i| text_by_window.get(i).copied().flatten()))
             .collect();
         Ok(out)
     }
