@@ -100,7 +100,7 @@ update. IDs are placeholders; they become numbered `SPEC.md §T` tasks when sche
 | LIB-C8 | Overview / tagline / studios / genres as first-class DTO fields | S | C3,C4,C7 | ✓ |
 | LIB-C9 | Provider-id columns (tmdb/tvdb/imdb/mbid) + DTO `ProviderIds` | S | — | ✓ |
 | LIB-C10 | Synth-id ↔ entity `wire_id` mapping (exact ParentId resolution, no breakage) | M | C1–C4 | ✓ |
-| LIB-C11 | **Series/season entity keyed on folder path** (+ year + provider-id), not bare name — fixes same-name shows merging/interleaving (*Cosmos* 1980 vs 2014). Episodes group by series folder; year from `Show (YYYY)` folder or `tvshow.nfo` | M | C7,C9,D6 | ✓ |
+| LIB-C11 | **Series/season entity keyed on folder path** (+ year + provider-id), not bare name — fixes same-name shows merging/interleaving (*Show AV* 1980 vs 2014). Episodes group by series folder; year from `Show (YYYY)` folder or `tvshow.nfo` | M | C7,C9,D6 | ✓ |
 
 ### EPIC D — Local metadata (default provider)
 
@@ -163,9 +163,9 @@ extracted independently from t=0 and served against a seeked/PTS-rebased video.
 
 ## Notable design notes
 
-### Same-name series disambiguation (fixes the *Cosmos* interleave bug — LIB-C11)
-Jellyfin keys a series on its display name, so *Cosmos (1980, Carl Sagan)* and
-*Cosmos (2014, deGrasse Tyson)* collapse into one show with interleaved episodes —
+### Same-name series disambiguation (fixes the *Show AV* interleave bug — LIB-C11)
+Jellyfin keys a series on its display name, so *Show AV (1980, Carl Sagan)* and
+*Show AV (2014, deGrasse Tyson)* collapse into one show with interleaved episodes —
 and pharos has the same flaw today (`series_id_for(series_name)` hashes the name).
 The canonical `series` entity is keyed on the **series folder path** (the directory
 containing the `Season NN`/episode files), with `(name, year, provider_ids)` as
@@ -206,7 +206,7 @@ deliver segmented WebVTT aligned to the media sequence.
   substring matches.
 - **C**: migration backfill (one library per root); entity round-trips; `/Persons`
   `/Studios` `/Collections` pass `pharos-jellyfin-test-client`. **C11 regression**:
-  `Cosmos (1980)/` + `Cosmos (2014)/` each with `S01E01` → two distinct series ids,
+  `Show AV (1980)/` + `Show AV (2014)/` each with `S01E01` → two distinct series ids,
   no interleave, per-series year.
 - **D**: parse a real Kodi `movie.nfo`; sidecar tmpdir → `ArtworkRef`s; resolver
   merge precedence; end-to-end `.mkv + .nfo + poster.jpg` ⇒ DTO carries

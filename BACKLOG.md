@@ -56,7 +56,7 @@ exact native-client request (adb logcat / mitm) — do not guess.
     by TCL's `TGuardMemoryManager` under memory pressure (2.4 GB TV), then
     relaunched + killed again = the "3 crashes". No Java exception, no segfault.
   - Amplifier was B73 itself: it force-transcoded a source the TV can DIRECT-PLAY
-    (HEVC 1080p, "Alien", 16 Mbps + 55 external sub tracks). The needless
+    (HEVC 1080p, "Film AX", 16 Mbps + 55 external sub tracks). The needless
     HEVC→H.264 transcode + per-seek HLS teardown/realloc tipped the tight RAM
     over → OOM kill.
 - Why B73 existed: native apps send the `/videos/{id}/stream?static=true` request
@@ -76,12 +76,12 @@ exact native-client request (adb logcat / mitm) — do not guess.
 - **Bit-depth hardening** (`685ddd9`): `negotiate()` now enforces the
   `VideoBitDepth` CodecProfile condition (was silently permissive) so an
   8-bit-only decoder transcodes a 10-bit source instead of direct-playing garbage.
-- ON-DEVICE CONFIRM STILL NEEDED once deployed: play the "Alien"-style HEVC item,
+- ON-DEVICE CONFIRM STILL NEEDED once deployed: play the "Film AX"-style HEVC item,
   seek → must NOT crash (now direct-plays, in-place seek, zero transcode).
 
 ### 0a. FOLLOW-UP — sub-track sideload memory on tight TVs (parity gap, not a bug)
 - Even with direct-play, jellyfin-android-tv `VideoManager.setMediaStreamInfo`
-  attaches EVERY `DeliveryMethod=External` subtitle (55 for "Alien") into one
+  attaches EVERY `DeliveryMethod=External` subtitle (55 for "Film AX") into one
   ExoPlayer MergingMediaSource **upfront**. Real Jellyfin does the same (no cap),
   so this is upstream-parity, but it's real RAM on a 2.4 GB TV. If OOM persists
   after B75, consider capping advertised External subs for memory-constrained

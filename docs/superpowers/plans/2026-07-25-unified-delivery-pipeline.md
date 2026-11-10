@@ -196,11 +196,11 @@ the fix; (b) no GAP — audio is never missing; (c) overlap is bounded (< 100 ms
 
 - [ ] `just test`, clippy `--release --all-targets`, push, PR, rebase-merge.
 - [ ] After deploy: re-run the live measurement from the spec §1.2 against
-  Fringe S01E02 and confirm the audio ratio is an integer.
+  Show AW S01E02 and confirm the audio ratio is an integer.
 
 ## Task 10: Follow-up investigation (AFTER this ships)
 
-User report 2026-07-25: a **long hang on the same frame** in Fringe S01E02 at
+User report 2026-07-25: a **long hang on the same frame** in Show AW S01E02 at
 ~27:05, "particularly bad there". 27:05 = 1625 s → segment ~270 (1625 / 6.006).
 
 Distinct from the audio-continuity defect this plan fixes: a hang pinned to one
