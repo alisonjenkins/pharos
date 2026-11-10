@@ -799,8 +799,8 @@ const MIN_PREFIX_MATCH_CHARS: usize = 6;
 
 /// Subtitle/qualifier-tolerant similarity for the shape Levenshtein punishes:
 /// one canonical title extends the other with an appended tail — a provider
-/// subtitle (`Code Geass` ⊂ `Code Geass: Lelouch of the Rebellion`) or a local
-/// qualifier (`Forever` ⊂ `Forever (US)`). When the shorter normalized title
+/// subtitle (`Alpha Beta` ⊂ `Alpha Beta: Rebellion Arc`) or a local
+/// qualifier (`Show D` ⊂ `Show D (US)`). When the shorter normalized title
 /// is an exact whole-token prefix of the longer, the shared portion is a
 /// perfect match and only the dropped tail is uncertain, so it scores high
 /// (0.9 + a small credit for how much of the longer title the prefix covers)
@@ -950,18 +950,18 @@ struct Fit<'a> {
 /// title similarity is the best over its title and aliases; score = that ×
 /// year factor. Among candidates over `min_confidence`, one whose name equals
 /// the query (after normalization) outranks any that only shares a prefix with
-/// it, whatever the years: otherwise "Dragon Ball R&R" beats "Dragon Ball" when
+/// it, whatever the years: otherwise "Show A R&R" beats "Show A" when
 /// the real show's year is a year off (B557). An exact name whose year is far
 /// off falls under the floor and so cannot shut out a good prefix match
-/// ("Doctor Who" 1963 vs "Doctor Who (2005)"). When several candidates match
+/// ("Show C" 1963 vs "Show C (2005)"). When several candidates match
 /// exactly, the one matching by an earlier name wins: a provider lists a
 /// show's own title and translation before its aliases, and an alias is how
-/// the 2023 live-action ONE PIECE also answers to "One Piece". With no exact
+/// the newer live-action SHOW B also answers to "Show B". With no exact
 /// match, candidates within [`PREFIX_NEAR_TIE`] of the best score go to the
 /// earliest-premiered: the query is then a franchise name that every entry
 /// extends with a subtitle, and the folder that carries just that name is
-/// almost always the original ("Code Geass" is the 2006 series, not the 2024
-/// Rozé of the Recapture). Remaining ties resolve to the earliest candidate.
+/// almost always the original ("Alpha Beta" is the 2006 series, not the 2024
+/// Recapture Arc). Remaining ties resolve to the earliest candidate.
 pub fn match_decide(
     query_title: &str,
     query_year: Option<u32>,
@@ -2411,7 +2411,7 @@ pub trait LibraryStore: Send + Sync {
 ///
 /// LIB-C11 — series identity is keyed on the **show folder path**
 /// (`series_folder`), not the bare `series_name`, so two distinct shows
-/// that happen to share a name (`Cosmos (1980)` vs `Cosmos (2014)`) get
+/// that happen to share a name (`Show G (1980)` vs `Show G (2014)`) get
 /// distinct synthesised Series/Season wire ids and don't interleave
 /// their episodes. `series_folder` is the canonical filesystem path of
 /// the directory that holds the season dirs / episode files (captured by
@@ -3606,8 +3606,8 @@ pub enum SortKey {
     SeasonNumber,
     /// 004-books — `SeriesSortName` for a book: the shelf it belongs to
     /// (`book_series`). Distinct from [`SortKey::Name`] so a series of books
-    /// groups together whatever the individual titles are — "Dune Messiah"
-    /// alphabetises nowhere near "Children of Dune".
+    /// groups together whatever the individual titles are — "Book A Part 2"
+    /// alphabetises nowhere near "Part 1 of Book A".
     BookSeries,
     /// 004-books — the volume number within that series (`book_series_index`).
     /// An UNNUMBERED volume sorts LAST rather than as zero: unknown is not
