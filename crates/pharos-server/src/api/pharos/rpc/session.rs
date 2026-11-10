@@ -769,9 +769,9 @@ impl server::session::Handler for Session {
             .ok()
             .and_then(|r| r.to_str().ok())
             .unwrap_or_default()
-            .trim()
             .to_string();
-        if device_id.is_empty() {
+        // Compared as stored: `myDevices` answers ids untrimmed.
+        if device_id.trim().is_empty() {
             Denial::Invalid { field: "deviceId" }.write(results.get().init_result().init_error());
             return Ok(());
         }
