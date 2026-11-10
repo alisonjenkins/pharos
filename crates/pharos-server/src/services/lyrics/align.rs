@@ -24,7 +24,9 @@ use super::{Lyrics, WordStamp};
 /// 3: lyrics timed for another cut are shifted onto the audio first (B936).
 /// 4: answers an older aligner gave under version 3, cached with no offset,
 ///    are asked for again (B1007).
-const ALIGN_VERSION: u32 = 4;
+/// 5: a line's window opens 750 ms before its stamp, not 250 ms, so a stamp
+///    tapped late no longer pins its first word late.
+const ALIGN_VERSION: u32 = 5;
 
 /// Time alignment of a whole song can take on CPU; a worker may run up to this
 /// long before timing out.
