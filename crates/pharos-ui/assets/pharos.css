@@ -5466,6 +5466,10 @@ body:has(.pharos-stage.is-mini) .pharos-main {
   padding: 0;
   list-style: none;
 }
+.pharos-my-device .pharos-admin-device-audio {
+  flex: 1 1 100%;
+  min-width: 0;
+}
 .pharos-my-device + .pharos-my-device {
   border-top: var(--px-border) solid var(--px-color-border);
 }
