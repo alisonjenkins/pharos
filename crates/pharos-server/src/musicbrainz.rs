@@ -756,7 +756,7 @@ impl MusicBrainzClient {
             env!("CARGO_PKG_VERSION"),
             contact.trim()
         );
-        let http = reqwest::Client::builder()
+        let http = crate::http_client::builder()
             .user_agent(ua)
             // Split the budget: a dead host should fail fast, but a live
             // transfer needs room. One 20s WHOLE-request timeout meant a slow
@@ -767,7 +767,7 @@ impl MusicBrainzClient {
             // `ClientBuilder::build` only fails on TLS backend init, which
             // would already have failed for TMDB; fall back rather than panic
             // (V17 forbids `expect` here anyway).
-            .unwrap_or_else(|_| reqwest::Client::new());
+            .unwrap_or_else(|_| crate::http_client::client());
         Self {
             http,
             gate: Arc::new(RateGate::new()),

@@ -40,7 +40,7 @@ const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 impl ReqwestTransport {
     pub fn new() -> Self {
         Self {
-            http: reqwest::Client::builder()
+            http: crate::http_client::builder()
                 .timeout(REQUEST_TIMEOUT)
                 .build()
                 .unwrap_or_default(),
