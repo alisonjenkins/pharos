@@ -2549,6 +2549,13 @@ pub fn position_at(x: f64, width: f64, total_ms: u64) -> Option<u64> {
     Some((fraction * total_ms as f64) as u64)
 }
 
+/// The log line a click on the seek bar writes: where playback was and
+/// where the click sent it, so a seek from the bar can be told from a key's
+/// or a remote's in the console (T038-300).
+pub fn seek_bar_line(from_ms: u64, to_ms: u64) -> String {
+    format!("pharos: seek bar click from {from_ms} ms to {to_ms} ms")
+}
+
 /// "4:05", "1:02:03".
 pub fn clock(ms: u64) -> String {
     let s = ms / 1000;
@@ -3823,6 +3830,14 @@ mod tests {
         assert_eq!(position_at(400.0, 200.0, 120_000), Some(120_000));
         assert_eq!(position_at(10.0, 0.0, 120_000), None);
         assert_eq!(position_at(10.0, 200.0, 0), None);
+    }
+
+    #[test]
+    fn a_seek_bar_click_logs_where_it_went_from_and_to() {
+        assert_eq!(
+            seek_bar_line(12_000, 30_000),
+            "pharos: seek bar click from 12000 ms to 30000 ms"
+        );
     }
 
     #[test]
