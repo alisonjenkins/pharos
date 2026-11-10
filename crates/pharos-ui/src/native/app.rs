@@ -499,11 +499,27 @@ fn restore_queue() -> Queue {
             queue
         }
         Err(e) => {
+            let reason = match e {
+                super::queue::RestoreError::Unbound => "unbound",
+                _ => "invalid",
+            };
             platform::warn(&format!(
-                "pharos: queue restore failed reason=invalid error={e}"
+                "pharos: queue restore failed reason={reason} error={e}"
             ));
             Queue::default()
         }
+    }
+}
+
+/// Ties the queue to the signed-in user once known; a queue another user
+/// left (its stored copy not cleared at their sign-out) is dropped.
+fn claim_queue(mut queue: Signal<Queue>, user: &str) {
+    if queue.peek().owner() == Some(user) {
+        return;
+    }
+    let dropped = queue.write().claim(user);
+    if dropped {
+        platform::info("pharos: queue dropped reason=another-user");
     }
 }
 
@@ -1925,6 +1941,11 @@ fn NativeApp(route: Route) -> Element {
             if !names.peek().is_empty() {
                 names.write().clear();
             }
+            // The queue, kept for the tab (B1281), is not the next user's.
+            let mut queue = queue;
+            if *queue.peek() != Queue::default() {
+                queue.set(Queue::default());
+            }
         }
     });
     // Signing out ends the session, and the player with it; signing in
@@ -2029,6 +2050,7 @@ fn NativeApp(route: Route) -> Element {
             match api.me(&call("shell", "me")).await {
                 Ok(me) => {
                     reconcile_kept_books(&me.id);
+                    claim_queue(queue, &me.id);
                     Some(me)
                 }
                 Err(e) => {
@@ -2077,12 +2099,9 @@ fn NativeApp(route: Route) -> Element {
                             spawn(async move {
                                 let reply = platform::sign_out().await;
                                 machine.write().apply(Event::SignOutAnswered(reply));
-                                // Signed out: no kept book stays on the device,
-                                // and the queue (kept for the tab, B1281) does
-                                // not pass to whoever signs in next.
+                                // Signed out: no kept book stays on the device.
+                                // The queue is emptied by the sign-in effect.
                                 if matches!(machine.peek().phase(), Phase::SignIn { .. }) {
-                                    let mut queue = queue;
-                                    queue.set(Queue::default());
                                     forget_kept_books("sign-out").await;
                                 }
                             });
