@@ -12,13 +12,15 @@ use pharos_server::{
     api::jellyfin,
     auth::BuiltinAuth,
     middleware::LowercasePath,
-    services::play_state::StopOutcome,
+    services::play_state::{BelowMinimum, StopOutcome},
     state::{AppState, Stores},
 };
 
 const ITEM: u64 = 7;
 /// One hour, in ticks.
 const RUNTIME_TICKS: u64 = 36_000_000_000;
+/// Ten minutes, in ticks: past the minimum resume point of an hour's film.
+const TEN_MIN: u64 = 6_000_000_000;
 
 async fn seed() -> (web::Data<AppState>, String, UserId) {
     let stores = Stores::connect("sqlite::memory:").await.unwrap();
@@ -49,7 +51,8 @@ async fn seed() -> (web::Data<AppState>, String, UserId) {
         })
         .await
         .unwrap();
-    let state = web::Data::new(AppState::new(stores, "t".into()));
+    let min = pharos_server::services::play_state::MinResume::default();
+    let state = web::Data::new(AppState::new(stores, "t".into()).with_min_resume(min.pct, min.secs));
     (state, token.0.expose().to_string(), uid)
 }
 
@@ -107,6 +110,8 @@ fn stop_outcome_labels_are_distinct_and_stable() {
             ("store_error", "item_read"),
             ("store_error", "user_data_read"),
             ("store_error", "user_data_write"),
+            ("below_minimum", "video"),
+            ("below_minimum", "song"),
         ]
     );
 }
@@ -128,12 +133,20 @@ async fn each_stop_is_counted_by_what_it_stored() {
     let _metrics = metrics::set_default_local_recorder(&recorder);
     let id = item_wire();
 
-    // Five seconds into an hour-long film.
-    let five_s = format!(r#"{{"ItemId":"{id}","PositionTicks":50000000}}"#);
-    assert_eq!(stop!(app, token.as_str(), five_s), 204);
+    let at = |ticks: u64| format!(r#"{{"ItemId":"{id}","PositionTicks":{ticks}}}"#);
+    assert_eq!(stop!(app, token.as_str(), at(TEN_MIN)), 204);
     assert_eq!(stops(&snap, StopOutcome::Saved), 1);
     let stored = state.stores.get_user_data(uid, ITEM).await.unwrap();
-    assert_eq!(stored.last_played_position_ticks, 50_000_000);
+    assert_eq!(stored.last_played_position_ticks, TEN_MIN);
+
+    // Five seconds in is under the minimum: the ten-minute point stands.
+    assert_eq!(stop!(app, token.as_str(), at(50_000_000)), 204);
+    assert_eq!(
+        stops(&snap, StopOutcome::BelowMinimum(BelowMinimum::Video)),
+        1
+    );
+    let stored = state.stores.get_user_data(uid, ITEM).await.unwrap();
+    assert_eq!(stored.last_played_position_ticks, TEN_MIN);
 
     let near_end = format!(r#"{{"ItemId":"{id}","PositionTicks":{RUNTIME_TICKS}}}"#);
     assert_eq!(stop!(app, token.as_str(), near_end), 204);
@@ -171,7 +184,10 @@ async fn a_stop_whose_item_read_fails_is_counted() {
         .await
         .unwrap();
 
-    let body = format!(r#"{{"ItemId":"{}","PositionTicks":50000000}}"#, item_wire());
+    let body = format!(
+        r#"{{"ItemId":"{}","PositionTicks":{TEN_MIN}}}"#,
+        item_wire()
+    );
     assert_eq!(stop!(app, token.as_str(), body), 503);
     assert_eq!(stops(&snap, StopOutcome::ItemReadFailed), 1);
 }
@@ -207,7 +223,10 @@ async fn a_stop_whose_user_data_read_fails_is_counted() {
         .await
         .unwrap();
 
-    let body = format!(r#"{{"ItemId":"{}","PositionTicks":50000000}}"#, item_wire());
+    let body = format!(
+        r#"{{"ItemId":"{}","PositionTicks":{TEN_MIN}}}"#,
+        item_wire()
+    );
     assert_eq!(stop!(app, token.as_str(), body), 503);
     assert_eq!(stops(&snap, StopOutcome::UserDataReadFailed), 1);
     assert_eq!(stops(&snap, StopOutcome::Saved), 0);
@@ -235,8 +254,66 @@ async fn a_stop_whose_user_data_write_fails_is_counted() {
     .await
     .unwrap();
 
-    let body = format!(r#"{{"ItemId":"{}","PositionTicks":50000000}}"#, item_wire());
+    let body = format!(
+        r#"{{"ItemId":"{}","PositionTicks":{TEN_MIN}}}"#,
+        item_wire()
+    );
     assert_eq!(stop!(app, token.as_str(), body), 503);
     assert_eq!(stops(&snap, StopOutcome::UserDataWriteFailed), 1);
     assert_eq!(stops(&snap, StopOutcome::Saved), 0);
+}
+
+/// FR-107: a song stopped under a minute in, or a film a few seconds in,
+/// stores nothing, so neither shows in Continue Watching.
+#[actix_web::test]
+async fn a_stop_under_the_minimum_keeps_no_resume_point() {
+    const SONG: u64 = 8;
+    let (state, token, uid) = seed().await;
+    state
+        .stores
+        .put(MediaItem {
+            id: SONG,
+            path: "/fake/song.flac".into(),
+            title: "A Song".into(),
+            kind: MediaKind::Audio,
+            probe: MediaProbe {
+                duration_ms: Some(240_000),
+                ..Default::default()
+            },
+            ..MediaItem::default()
+        })
+        .await
+        .unwrap();
+    let app = test::init_service(
+        App::new()
+            .app_data(state.clone())
+            .wrap(LowercasePath)
+            .configure(jellyfin::configure),
+    )
+    .await;
+    let recorder = DebuggingRecorder::new();
+    let snap = pharos_test_metrics::snapshotter(&recorder);
+    let _metrics = metrics::set_default_local_recorder(&recorder);
+    let at = |item: u64, ticks: u64| {
+        let id = pharos_jellyfin_api::dto::WireId::Real(item).to_string();
+        format!(r#"{{"ItemId":"{id}","PositionTicks":{ticks}}}"#)
+    };
+
+    assert_eq!(stop!(app, token.as_str(), at(ITEM, 50_000_000)), 204);
+    assert_eq!(stop!(app, token.as_str(), at(SONG, 300_000_000)), 204);
+    assert_eq!(
+        stops(&snap, StopOutcome::BelowMinimum(BelowMinimum::Video)),
+        1
+    );
+    assert_eq!(
+        stops(&snap, StopOutcome::BelowMinimum(BelowMinimum::Song)),
+        1
+    );
+    assert_eq!(stops(&snap, StopOutcome::Saved), 0);
+    assert!(state.stores.resumable_items(uid).await.unwrap().is_empty());
+
+    // Ninety seconds into the song is past the minute.
+    assert_eq!(stop!(app, token.as_str(), at(SONG, 900_000_000)), 204);
+    assert_eq!(stops(&snap, StopOutcome::Saved), 1);
+    assert_eq!(state.stores.resumable_items(uid).await.unwrap(), vec![SONG]);
 }
