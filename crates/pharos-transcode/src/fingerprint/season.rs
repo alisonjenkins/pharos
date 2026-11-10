@@ -142,6 +142,94 @@ fn best_cluster(spans: &[Located], tol: f64) -> Option<(Span, u32, f64)> {
     best
 }
 
+/// T106 (B1060) — the region of an episode that at least `min_agreeing`
+/// located spans cover at once, for when a match FRAGMENTS. At the strict
+/// `max_bit_diff` one opening is often located as several sub-ranges of
+/// itself (one measured season: pair 2x3 locates 8.91..103.26, pair 2x5 only
+/// 66.36..94.84 inside it), and no two fragments share an endpoint, so
+/// [`best_cluster`] sees only singletons.
+///
+/// The region is where coverage reaches `min_agreeing`, never the union of
+/// the spans: a union of 8.17..63 and 8.91..103 is a Skip button that runs
+/// 40 s too long, while their common cover 8.91..63 is attested by both.
+/// Adjacent covered runs merge only when ONE located span bridges the gap, so
+/// two fragments of one opening join but unrelated runs do not chain.
+///
+/// A span votes for the region only when at least half of it lies inside, so
+/// one long spurious match sweeping across the region adds no weight. The
+/// returned seconds are the voters' overlap with the region.
+///
+/// Returns (region, voters, agreed seconds) for the region with the most
+/// agreed seconds that is at least `min_secs` and at most `max_secs` long.
+/// The cap matters because several bridging spans can chain runs into a
+/// region longer than any one comparison located.
+fn overlap_consensus(
+    spans: &[Located],
+    min_agreeing: u32,
+    min_secs: f64,
+    max_secs: f64,
+) -> Option<(Span, u32, f64)> {
+    let need = min_agreeing.max(1) as i64;
+    let mut edges: Vec<(f64, i64)> = spans
+        .iter()
+        .filter(|s| s.end > s.start)
+        .flat_map(|s| [(s.start, 1), (s.end, -1)])
+        .collect();
+    // Ends before starts at one instant: spans that only touch do not overlap.
+    edges.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+
+    let mut runs: Vec<Span> = Vec::new();
+    let mut depth = 0i64;
+    let mut open: Option<f64> = None;
+    for (t, step) in edges {
+        depth += step;
+        match open {
+            None if depth >= need => open = Some(t),
+            Some(start) if depth < need => {
+                if t > start {
+                    runs.push(Span { start, end: t });
+                }
+                open = None;
+            }
+            _ => {}
+        }
+    }
+
+    let mut merged: Vec<Span> = Vec::new();
+    for run in runs {
+        let bridged = merged.last().is_some_and(|prev| {
+            spans
+                .iter()
+                .any(|s| s.start <= prev.end && s.end >= run.start)
+        });
+        match merged.last_mut() {
+            Some(prev) if bridged => prev.end = run.end,
+            _ => merged.push(run),
+        }
+    }
+
+    let mut best: Option<(Span, u32, f64)> = None;
+    for region in merged
+        .into_iter()
+        .filter(|r| (min_secs..=max_secs).contains(&(r.end - r.start)))
+    {
+        let mut voters = 0u32;
+        let mut agreed = 0.0;
+        for s in spans {
+            let len = s.end - s.start;
+            let inside = s.end.min(region.end) - s.start.max(region.start);
+            if len > 0.0 && inside >= len / 2.0 {
+                voters += 1;
+                agreed += inside;
+            }
+        }
+        if best.as_ref().map_or(true, |(_, _, b)| agreed > *b) {
+            best = Some((region, voters, agreed));
+        }
+    }
+    best
+}
+
 /// Why an episode did or did not receive a segment. A bounded set — it is a
 /// metric label, so a new variant is a dashboard change, not a free addition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -170,6 +258,27 @@ impl Verdict {
     }
 }
 
+/// Which reading of the located spans produced an episode's consensus. A
+/// bounded set — it is a metric label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Consensus {
+    /// Enough spans agreed on BOTH endpoints within `cluster_tolerance_secs`.
+    Endpoints,
+    /// The endpoint reading failed, but enough spans covered one region of
+    /// the episode: a fragmented match of a single opening (T106, B1060).
+    Overlap,
+}
+
+impl Consensus {
+    /// Stable label for metrics. Renaming one breaks a dashboard silently.
+    pub fn label(self) -> &'static str {
+        match self {
+            Consensus::Endpoints => "endpoints",
+            Consensus::Overlap => "overlap",
+        }
+    }
+}
+
 /// One episode's full detection record — the inputs to the gate as well as its
 /// outcome, so a dropped episode can be explained rather than merely counted.
 #[derive(Debug, Clone, Copy)]
@@ -184,6 +293,8 @@ pub struct EpisodeVerdict {
     /// clustered.
     pub span: Option<Span>,
     pub verdict: Verdict,
+    /// The reading the emitted span came from; `None` unless `Emitted`.
+    pub consensus: Option<Consensus>,
 }
 
 /// Detect the shared span (intro OR credits — the caller picks the window)
@@ -250,6 +361,7 @@ pub fn detect_season_verbose(
                 confidence: 0.0,
                 span: None,
                 verdict: Verdict::NoSpan,
+                consensus: None,
             });
             continue;
         };
@@ -275,14 +387,37 @@ pub fn detect_season_verbose(
         //
         // `min_agreeing` still guards the other direction: one long spurious
         // match cannot carry an episode on its own.
-        let confidence = agreement_confidence(spans, agreed_secs, agreeing, matched);
-        let verdict = if agreeing < cfg.min_agreeing {
-            Verdict::FewAgreeing
-        } else if confidence < cfg.min_confidence {
-            Verdict::LowConfidence
-        } else {
-            Verdict::Emitted
+        let gate = |agreeing: u32, confidence: f64| {
+            if agreeing < cfg.min_agreeing {
+                Verdict::FewAgreeing
+            } else if confidence < cfg.min_confidence {
+                Verdict::LowConfidence
+            } else {
+                Verdict::Emitted
+            }
         };
+        let confidence = agreement_confidence(spans, agreed_secs, agreeing, matched);
+        let mut reading = (consensus, agreeing, confidence, gate(agreeing, confidence));
+        let mut method = Consensus::Endpoints;
+        // T106 — the overlap reading is a fallback only. An episode the
+        // endpoint reading emits keeps exactly its T102/T107 span, so this can
+        // add Skip buttons but never move or remove one. A dropped episode
+        // keeps the endpoint reading's reason, which is what explains it.
+        if reading.3 != Verdict::Emitted {
+            if let Some((region, voters, secs)) = overlap_consensus(
+                spans,
+                cfg.min_agreeing,
+                cfg.align.min_duration,
+                cfg.align.max_duration,
+            ) {
+                let conf = agreement_confidence(spans, secs, voters, matched);
+                if gate(voters, conf) == Verdict::Emitted {
+                    reading = (region, voters, conf, Verdict::Emitted);
+                    method = Consensus::Overlap;
+                }
+            }
+        }
+        let (consensus, agreeing, confidence, verdict) = reading;
         let off = eps[idx].window_offset_secs;
         out.push(EpisodeVerdict {
             id: eps[idx].id,
@@ -294,6 +429,7 @@ pub fn detect_season_verbose(
                 end: consensus.end + off,
             }),
             verdict,
+            consensus: (verdict == Verdict::Emitted).then_some(method),
         });
     }
     out
@@ -354,6 +490,13 @@ mod tests {
         ];
         let segs = detect_season(&eps, &SeasonConfig::default());
         assert_eq!(segs.len(), 4, "every episode gets a segment");
+        let verdicts = detect_season_verbose(&eps, &SeasonConfig::default());
+        assert!(
+            verdicts
+                .iter()
+                .all(|v| v.consensus == Some(Consensus::Endpoints)),
+            "an agreeing season keeps the endpoint reading: {verdicts:?}"
+        );
         for s in &segs {
             assert!(s.confidence >= 0.9, "high agreement, got {}", s.confidence);
             assert!((s.end_secs - s.start_secs) > 15.0);
@@ -567,6 +710,126 @@ mod tests {
                 s.confidence
             );
         }
+    }
+
+    fn located(spans: &[(f64, f64)]) -> Vec<Located> {
+        spans
+            .iter()
+            .map(|&(start, end)| Located { start, end })
+            .collect()
+    }
+
+    /// T106 (B1060) — the shape of the measured season. Two episodes carry the
+    /// whole opening; three carry only a different third of it, so every
+    /// comparison against those three locates a FRAGMENT of the opening and
+    /// no two fragments share an endpoint. By endpoints the full-opening
+    /// episodes get one agreeing comparison each and are dropped.
+    ///
+    /// Disarm by deleting the overlap fallback in `detect_season_verbose` and
+    /// this goes red with episodes 1 and 2 missing.
+    #[test]
+    fn a_fragmented_opening_still_gets_a_segment() {
+        let intro = intro_block(450); // ~111 s, a full title sequence
+        let slice = |from: usize, to: usize| intro[from..to].to_vec();
+        let eps = vec![
+            ep(1, 10, &intro, 0.0),
+            ep(2, 36, &intro, 0.0),
+            ep(3, 20, &slice(0, 140), 0.0),
+            ep(4, 28, &slice(150, 290), 0.0),
+            ep(5, 14, &slice(300, 450), 0.0),
+        ];
+        let verdicts = detect_season_verbose(&eps, &SeasonConfig::default());
+        let hop = sample_duration_secs();
+        for id in [1u64, 2] {
+            let v = verdicts.iter().find(|v| v.id == id).expect("a verdict");
+            assert_eq!(v.verdict, Verdict::Emitted, "episode {id}: {v:?}");
+            assert_eq!(v.consensus, Some(Consensus::Overlap), "episode {id}");
+            let span = v.span.expect("a span");
+            let head = if id == 1 { 10.0 } else { 36.0 } * hop;
+            assert!(
+                (span.start - head).abs() < 3.0 && (span.end - (head + 450.0 * hop)).abs() < 3.0,
+                "episode {id} must get the whole opening, not one fragment: {span:?}"
+            );
+        }
+    }
+
+    /// The hazard T106 names: a naive overlap-merge unions 8.17..63 with
+    /// 8.91..103 into a span neither comparison located. The region two spans
+    /// agree on is their common cover.
+    #[test]
+    fn overlap_consensus_is_the_common_cover_not_the_union() {
+        let spans = located(&[(8.17, 63.0), (8.91, 103.0)]);
+        let (region, voters, _) = overlap_consensus(&spans, 2, 15.0, 120.0).expect("a region");
+        assert_eq!(voters, 2);
+        assert!(
+            (region.start - 8.91).abs() < 1e-9 && (region.end - 63.0).abs() < 1e-9,
+            "got {region:?}"
+        );
+    }
+
+    /// Fragments that cover nothing in common are coincidences, not one
+    /// opening: no second is covered twice, so no region forms.
+    #[test]
+    fn scattered_fragments_form_no_overlap_region() {
+        let spans = located(&[(0.0, 17.3), (29.5, 48.0), (70.6, 94.1), (200.0, 230.0)]);
+        assert!(overlap_consensus(&spans, 2, 15.0, 120.0).is_none());
+    }
+
+    /// One long spurious span sweeping across a short shared region covers
+    /// it, but mostly lies outside it, so it adds no vote and the region stays
+    /// short of `min_agreeing`.
+    #[test]
+    fn a_long_span_sweeping_across_a_region_does_not_vote_for_it() {
+        let spans = located(&[(0.0, 120.0), (40.0, 60.0)]);
+        let (_, voters, _) = overlap_consensus(&spans, 2, 15.0, 120.0).expect("a covered region");
+        assert_eq!(voters, 1, "only the 20 s span lies inside 40..60");
+    }
+
+    /// Two covered runs join only through ONE span that bridges the gap.
+    #[test]
+    fn covered_runs_join_only_through_a_bridging_span() {
+        // Runs 10..30 and 50..80, both covered twice; no span spans 30..50.
+        let apart = located(&[(10.0, 30.0), (5.0, 32.0), (50.0, 80.0), (48.0, 85.0)]);
+        let (region, _, _) = overlap_consensus(&apart, 2, 15.0, 120.0).expect("a region");
+        assert!(region.start >= 48.0, "the runs must not chain: {region:?}");
+
+        let mut bridged = apart.clone();
+        bridged.push(Located {
+            start: 8.0,
+            end: 82.0,
+        });
+        let (region, _, _) = overlap_consensus(&bridged, 2, 15.0, 120.0).expect("a region");
+        assert!(
+            region.start <= 10.0 && region.end >= 80.0,
+            "one span covering the gap joins them: {region:?}"
+        );
+    }
+
+    /// Bridging spans can chain runs into a region longer than anything a
+    /// comparison located; past `max_secs` it is not an intro.
+    #[test]
+    fn a_chained_region_longer_than_the_cap_is_not_offered() {
+        // Three runs each covered twice (0..40, 60..100, 120..160), chained by
+        // two bridging spans into one 0..160 region.
+        let spans = located(&[
+            (0.0, 40.0),
+            (0.0, 40.0),
+            (60.0, 100.0),
+            (60.0, 100.0),
+            (120.0, 160.0),
+            (120.0, 160.0),
+            (30.0, 70.0),
+            (90.0, 130.0),
+        ]);
+        let (region, _, _) = overlap_consensus(&spans, 2, 15.0, 200.0).expect("a region");
+        assert!(
+            region.end - region.start > 120.0,
+            "precondition: chained {region:?}"
+        );
+        assert!(
+            overlap_consensus(&spans, 2, 15.0, 120.0).is_none(),
+            "a 160 s chain must not pass a 120 s cap"
+        );
     }
 
     #[test]
