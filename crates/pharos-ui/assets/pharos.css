@@ -389,7 +389,11 @@ input:focus-visible {
 .pharos-library-nav {
   display: flex;
   gap: 0.5rem;
-  margin-top: 0.75rem;
+  /* A scroll box clips what is drawn outside it, which cut the TV's focus
+     ring and glow (8px past the pill) to a broken circle (B1312/V1283):
+     the padding gives the ring room and the margin takes it back. */
+  padding: 12px;
+  margin: calc(0.75rem - 12px) -12px -12px;
   overflow-x: auto;
   scrollbar-width: none;
 }
