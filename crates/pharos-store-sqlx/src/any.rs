@@ -762,6 +762,23 @@ impl pharos_core::SubtitleStylingStore for AnyStore {
             AnyStore::Postgres(p) => p.subtitle_styling_index().await,
         }
     }
+
+    async fn put_subtitle_signals(&self, row: pharos_core::SubtitleSignalsRow) -> DomainResult<()> {
+        match self {
+            AnyStore::Sqlite(s) => s.put_subtitle_signals(row).await,
+            AnyStore::Postgres(p) => p.put_subtitle_signals(row).await,
+        }
+    }
+
+    async fn subtitle_signals(
+        &self,
+        item: MediaId,
+    ) -> DomainResult<Option<pharos_core::SubtitleSignalsRow>> {
+        match self {
+            AnyStore::Sqlite(s) => s.subtitle_signals(item).await,
+            AnyStore::Postgres(p) => p.subtitle_signals(item).await,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------
