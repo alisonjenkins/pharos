@@ -5467,6 +5467,13 @@ fn Player(
     // The leave in flight, which an Undo waits out so the old leave cannot
     // land after the new join and end it.
     let leaving = use_hook(|| Rc::new(RefCell::new(None::<LeaveInFlight>)));
+    // A new membership ends the chance to undo the last leave.
+    use_effect(move || {
+        let mut left_group = left_group;
+        if (together.view)().active && left_group.peek().is_some() {
+            left_group.set(None);
+        }
+    });
     let undo_shown = use_timed_note(
         left_group.read().as_deref().filter(|_| !group.active),
         activity::UNDO_LEAVE_MS,
