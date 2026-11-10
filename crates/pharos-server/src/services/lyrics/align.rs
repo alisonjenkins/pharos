@@ -652,6 +652,7 @@ mod tests {
     #[tokio::test]
     async fn the_primary_answer_is_stored_before_the_shadow_answers_and_never_replaced() {
         use crate::services::lyrics::shadow::tests::{body, counts, fake};
+        use crate::services::lyrics::shadow::SHADOW_VERSION;
         use metrics_util::debugging::DebuggingRecorder;
         use tokio::sync::oneshot;
 
@@ -671,7 +672,8 @@ mod tests {
         };
         let (primary_base, primary_got) = fake(200, body(&primary, 2), None).await;
         let (release, hold) = oneshot::channel();
-        let (shadow_base, shadow_got) = fake(200, body(&differing, 3), Some(hold)).await;
+        let (shadow_base, shadow_got) =
+            fake(200, body(&differing, SHADOW_VERSION), Some(hold)).await;
         let cache = AlignCache::new(None);
         let (tx, _rx) = mpsc::channel(1);
         let aligner = Aligner {

@@ -15,9 +15,11 @@ use super::align::{parse_answer, Aligned};
 /// shadow is configured.
 pub const SHADOW_TOTAL: &str = "pharos_lyrics_shadow_total";
 
-/// The only shadow `aligner_version` that can match: the Rust service's. A
-/// shadow URL pointed at the Python service (2) cannot pass the cutover gate.
-pub const SHADOW_VERSION: u32 = 3;
+/// The only shadow `aligner_version` that can match: the Rust service's once
+/// it answers each line's `score`. A shadow pointed at the Python service
+/// (2, or 4 with scores) or at a Rust service without scores (3) cannot pass
+/// the cutover gate.
+pub const SHADOW_VERSION: u32 = 5;
 
 /// How one song's comparison ended; `label()` is the metric's `outcome`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,7 +29,7 @@ pub enum Outcome {
     /// The answers differ; the log line names the first field that does.
     Mismatch,
     /// No usable answer: a refused connection, a non-2xx status, a body that
-    /// does not parse or has the wrong line count, or a version other than 3.
+    /// does not parse or has the wrong line count, or a version other than 5.
     Error,
     /// The shadow took longer than the primary's 600 s budget.
     Timeout,
@@ -424,7 +426,7 @@ pub(super) mod tests {
         let snapshotter = recorder.snapshotter();
         let _guard = metrics::set_default_local_recorder(&recorder);
         let primary = answer(-40, &[&[(0, 900), (4, 1300)]]);
-        let (base, sent) = fake(200, body(&primary, 3), None).await;
+        let (base, sent) = fake(200, body(&primary, SHADOW_VERSION), None).await;
         let shadow = Shadow::new(crate::http_client::client(), &base);
         let handle = shadow.spawn(7, br#"{"path":"a"}"#.to_vec(), primary.clone(), None);
         assert_eq!(handle.unwrap().await.unwrap(), Outcome::Match);
@@ -439,20 +441,27 @@ pub(super) mod tests {
         let _guard = metrics::set_default_local_recorder(&recorder);
         let primary = answer(0, &[&[(0, 900), (4, 1300)]]);
         let other = answer(0, &[&[(0, 900), (4, 1320)]]);
-        let (base, _sent) = fake(200, body(&other, 3), None).await;
+        let (base, _sent) = fake(200, body(&other, SHADOW_VERSION), None).await;
         assert_eq!(run(&base, &primary).await, Outcome::Mismatch);
         assert_eq!(counts(&snapshotter), vec![("mismatch".into(), 1)]);
     }
 
     #[tokio::test]
-    async fn an_equal_answer_from_a_version_2_shadow_is_an_error_not_a_match() {
+    async fn an_equal_answer_from_any_other_version_is_an_error_not_a_match() {
         let recorder = DebuggingRecorder::new();
         let snapshotter = recorder.snapshotter();
         let _guard = metrics::set_default_local_recorder(&recorder);
         let primary = answer(0, &[&[(0, 900)]]);
-        let (base, _sent) = fake(200, body(&primary, 2), None).await;
-        assert_eq!(run(&base, &primary).await, Outcome::Error);
-        assert_eq!(counts(&snapshotter), vec![("error".into(), 1)]);
+        // Python (2), the Rust service before scores (3), Python with them (4).
+        for version in [2, 3, 4] {
+            let (base, _sent) = fake(200, body(&primary, version), None).await;
+            assert_eq!(
+                run(&base, &primary).await,
+                Outcome::Error,
+                "version {version}"
+            );
+        }
+        assert_eq!(counts(&snapshotter), vec![("error".into(), 3)]);
     }
 
     #[tokio::test]
@@ -479,7 +488,7 @@ pub(super) mod tests {
         let _guard = metrics::set_default_local_recorder(&recorder);
         let primary = answer(0, &[&[(0, 900)]]);
         let (_release, hold) = oneshot::channel();
-        let (base, _sent) = fake(200, body(&primary, 3), Some(hold)).await;
+        let (base, _sent) = fake(200, body(&primary, SHADOW_VERSION), Some(hold)).await;
         let http = crate::http_client::builder()
             .timeout(Duration::from_millis(200))
             .build()
@@ -497,7 +506,7 @@ pub(super) mod tests {
         let _guard = metrics::set_default_local_recorder(&recorder);
         let primary = answer(0, &[&[(0, 900)]]);
         let (release, hold) = oneshot::channel();
-        let (base, sent) = fake(200, body(&primary, 3), Some(hold)).await;
+        let (base, sent) = fake(200, body(&primary, SHADOW_VERSION), Some(hold)).await;
         let shadow = Shadow::new(crate::http_client::client(), &base);
         let first = shadow
             .spawn(7, b"{}".to_vec(), primary.clone(), None)
@@ -516,7 +525,7 @@ pub(super) mod tests {
             vec![("match".into(), 1), ("skipped_busy".into(), 1)]
         );
         // The slot is free again once the first has finished.
-        let (base2, _sent) = fake(200, body(&primary, 3), None).await;
+        let (base2, _sent) = fake(200, body(&primary, SHADOW_VERSION), None).await;
         let again = Shadow {
             url: format!("{base2}/align"),
             ..shadow
