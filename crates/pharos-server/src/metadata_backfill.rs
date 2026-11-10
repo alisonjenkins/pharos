@@ -1269,14 +1269,32 @@ where
         return Ok(false);
     }
     let old_title = item.title.clone();
-    let mut item = tokio::task::spawn_blocking(move || {
+    let old_provider = item.match_provider.clone();
+    let new_provider = pinned_show(store, &item)
+        .await?
+        .and_then(|p| p.match_provider);
+    let (mut item, cleared) = tokio::task::spawn_blocking(move || {
         let mut item = item;
         tokio::runtime::Handle::current()
             .block_on(pharos_scanner::fs::reset_to_local_metadata(&mut item));
-        item
+        let cleared = clear_old_providers_show_id(
+            &mut item,
+            old_provider.as_deref(),
+            new_provider.as_deref(),
+        );
+        (item, cleared)
     })
     .await
     .map_err(|e| pharos_core::DomainError::Backend(format!("local metadata reset: {e}")))?;
+    if let (Some(old), false) = (cleared.provider, cleared.keys.is_empty()) {
+        record_old_ids_cleared(old, cleared.keys.len());
+        tracing::info!(
+            media.id = id,
+            old_provider = old,
+            cleared = ?cleared.keys,
+            "series identity repair: old provider's show id dropped from the rebuilt episode"
+        );
+    }
     let translations = store
         .delete_translations(&TranslationOwner::Item(id))
         .await?;
@@ -1536,6 +1554,70 @@ async fn hand_pick_record<E: OnlineEnricher>(
     )
     .await;
     Some((enriched, poster, backdrop))
+}
+
+/// What [`clear_old_providers_show_id`] dropped.
+struct ClearedIds {
+    provider: Option<&'static str>,
+    keys: Vec<&'static str>,
+}
+
+/// B993 — an episode rebuilt onto a show matched at another provider keeps
+/// no id of the old one that its show's `tvshow.nfo` folded onto it: that
+/// id is the show's old match, which the show pass already overrode. An id
+/// the episode's own NFO or tags give stays (it differs from the show's), as
+/// does every other provider's (imdb) and any id when the provider did not
+/// change.
+fn clear_old_providers_show_id(
+    item: &mut MediaItem,
+    old_provider: Option<&str>,
+    new_provider: Option<&str>,
+) -> ClearedIds {
+    let none = ClearedIds {
+        provider: None,
+        keys: Vec::new(),
+    };
+    let old = match old_provider {
+        Some("tmdb") => "tmdb",
+        Some("tvdb") => "tvdb",
+        _ => return none,
+    };
+    if new_provider.is_none() || new_provider == Some(old) {
+        return none;
+    }
+    let Some(series) = item.series.as_ref() else {
+        return none;
+    };
+    let Some(folder) = series.series_folder.as_deref() else {
+        return none;
+    };
+    let Some(shown) = pharos_scanner::metadata::nfo::show_nfo_evidence(
+        std::path::Path::new(folder),
+        &series.series_name,
+        series.series_year,
+    ) else {
+        return none;
+    };
+    let (slot, from_show) = if old == "tmdb" {
+        (&mut item.metadata.provider_ids.tmdb, shown.tmdb)
+    } else {
+        (&mut item.metadata.provider_ids.tvdb, shown.tvdb)
+    };
+    if from_show.is_none() || *slot != from_show {
+        return none;
+    }
+    *slot = None;
+    ClearedIds {
+        provider: Some(old),
+        keys: vec![old],
+    }
+}
+
+/// `pharos_series_reconcile_ids_cleared_total{provider}`: ids dropped by
+/// [`clear_old_providers_show_id`]. `provider` is `tmdb` or `tvdb`.
+fn record_old_ids_cleared(provider: &'static str, n: usize) {
+    metrics::counter!("pharos_series_reconcile_ids_cleared_total", "provider" => provider)
+        .increment(n as u64);
 }
 
 /// The show an episode's folder (or split group) is matched to, if any.
@@ -7412,6 +7494,162 @@ mod tests {
             .unwrap()
             .is_empty());
         assert!(pending_ids(&s).await.is_empty());
+    }
+
+    /// B993 — a show re-matched from one provider to another: the rebuilt
+    /// episode keeps no id of the old provider.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_rebuild_onto_another_provider_clears_the_old_providers_id() {
+        let s = store().await;
+        put_titled_episode(&s, 1, SHOW_B, (1, 1), "Opening").await;
+        let mut item = s.get(1).await.unwrap();
+        item.metadata.provider_ids.tmdb = Some("900001".into());
+        s.put(item).await.unwrap();
+        s.set_item_match(1, "tmdb", "900001", "search", None, NOW)
+            .await
+            .unwrap();
+        pin(&s, SHOW_B, "900002", NOW).await;
+        s.mark_series_reconcile(SHOW_B, NOW).await.unwrap();
+        let (_td, cache) = cache();
+        let tvdb = FakeEnricher::tvdb().with_detail(enriched_overview("A scattered crew."));
+
+        reconcile_pass(
+            &s,
+            &sem(4),
+            &cache,
+            None::<&FakeEnricher>,
+            Some(&tvdb),
+            &apply_cfg(),
+            NOW + 10,
+        )
+        .await
+        .unwrap();
+
+        let got = s.get(1).await.unwrap();
+        assert_eq!(got.metadata.provider_ids.tvdb.as_deref(), Some("900002"));
+        assert_eq!(got.metadata.provider_ids.tmdb, None);
+    }
+
+    /// Rebuilds one episode of a show folder holding `tvshow.nfo` (and an
+    /// episode NFO when given), stored as matched at `old_provider` with
+    /// `stored` ids, onto a show pinned at TVDB `900002`.
+    async fn rebuild_in_show_folder(
+        old_provider: &str,
+        show_nfo: &str,
+        episode_nfo: Option<&str>,
+        stored: ProviderIds,
+    ) -> (MediaItem, u64) {
+        use metrics_util::debugging::DebuggingRecorder;
+        let recorder = DebuggingRecorder::new();
+        let snap = pharos_test_metrics::snapshotter(&recorder);
+        let _metrics = metrics::set_default_local_recorder(&recorder);
+        let dir = tempfile::tempdir().unwrap();
+        let show = dir.path().join("Show B");
+        std::fs::create_dir_all(&show).unwrap();
+        std::fs::write(show.join("tvshow.nfo"), show_nfo).unwrap();
+        let folder = show.to_string_lossy().into_owned();
+        let s = store().await;
+        put_titled_episode(&s, 1, &folder, (1, 1), "Opening").await;
+        if let Some(nfo) = episode_nfo {
+            let ep = std::fs::read_dir(&show).unwrap().count();
+            assert_eq!(ep, 1, "only tvshow.nfo so far");
+            let path = s.get(1).await.unwrap().path;
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path.with_extension("nfo"), nfo).unwrap();
+        }
+        let mut item = s.get(1).await.unwrap();
+        item.metadata.provider_ids = stored;
+        s.put(item).await.unwrap();
+        let stamp = if old_provider == "tmdb" {
+            "900001"
+        } else {
+            "900002"
+        };
+        s.set_item_match(1, old_provider, stamp, "search", None, NOW)
+            .await
+            .unwrap();
+        pin(&s, &folder, "900002", NOW).await;
+        s.mark_series_reconcile(&folder, NOW).await.unwrap();
+        let (_td, cache) = cache();
+        let tvdb = FakeEnricher::tvdb().with_detail(enriched_overview("A scattered crew."));
+        reconcile_pass(
+            &s,
+            &sem(4),
+            &cache,
+            None::<&FakeEnricher>,
+            Some(&tvdb),
+            &apply_cfg(),
+            NOW + 10,
+        )
+        .await
+        .unwrap();
+        let cleared = counter_value(
+            &snap,
+            "pharos_series_reconcile_ids_cleared_total",
+            &[("provider", "tmdb")],
+        ) + counter_value(
+            &snap,
+            "pharos_series_reconcile_ids_cleared_total",
+            &[("provider", "tvdb")],
+        );
+        (s.get(1).await.unwrap(), cleared)
+    }
+
+    const SHOW_NFO_TMDB: &str = "<tvshow><title>Show B</title>\
+        <uniqueid type=\"tmdb\">900001</uniqueid>\
+        <uniqueid type=\"imdb\">tt900001</uniqueid></tvshow>";
+
+    /// B993 — the show's `tvshow.nfo` names the show's old TMDB id; a rebuild
+    /// onto a TVDB show must not copy it onto the episode as if the new
+    /// match's record had it. Counted once, imdb kept.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_rebuild_onto_another_provider_drops_the_show_nfo_id_of_the_old_one() {
+        let stored = ProviderIds {
+            tmdb: Some("900001".into()),
+            ..ProviderIds::default()
+        };
+        let (got, cleared) = rebuild_in_show_folder("tmdb", SHOW_NFO_TMDB, None, stored).await;
+
+        assert_eq!(got.metadata.provider_ids.tvdb.as_deref(), Some("900002"));
+        assert_eq!(got.metadata.provider_ids.tmdb, None);
+        assert_eq!(got.metadata.provider_ids.imdb.as_deref(), Some("tt900001"));
+        assert_eq!(
+            cleared, 1,
+            "counted in pharos_series_reconcile_ids_cleared_total"
+        );
+    }
+
+    /// B993 — an id the episode's own NFO gives is curated: it stays.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_rebuild_keeps_the_old_providers_id_its_own_episode_nfo_gives() {
+        let own = "<episodedetails><title>Opening</title>\
+            <uniqueid type=\"tmdb\">900055</uniqueid></episodedetails>";
+        let (got, cleared) = rebuild_in_show_folder(
+            "tmdb",
+            SHOW_NFO_TMDB,
+            Some(own),
+            ProviderIds {
+                tmdb: Some("900001".into()),
+                ..ProviderIds::default()
+            },
+        )
+        .await;
+
+        assert_eq!(got.metadata.provider_ids.tmdb.as_deref(), Some("900055"));
+        assert_eq!(cleared, 0);
+    }
+
+    /// B993 — a re-match at the same provider changes nothing here: the
+    /// show's NFO id for that provider is read as before.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_rebuild_at_the_same_provider_keeps_the_show_nfo_id() {
+        let nfo = "<tvshow><title>Show B</title>\
+            <uniqueid type=\"tvdb\">900002</uniqueid></tvshow>";
+        let (got, cleared) =
+            rebuild_in_show_folder("tvdb", nfo, None, ProviderIds::default()).await;
+
+        assert_eq!(got.metadata.provider_ids.tvdb.as_deref(), Some("900002"));
+        assert_eq!(cleared, 0);
     }
 
     /// V940 — a rebuild drops the stills the old show's record cached (the
