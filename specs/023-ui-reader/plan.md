@@ -98,7 +98,7 @@ item's bytes, the same class as images and streams under V191.
 | 2 | native API: `BookInfo`, `setReadPosition`, storage, reading row, Download on the media cookie | schema bump, sqlite + postgres migrations, it_rpc | V353 (server half), V354, V355 |
 | 3 | `quire-web`: mount, paginate, turn, settings, locator from and to the DOM; `quire-web` added to hakari `final-excludes` | crate + wasm-bindgen tests in headless Chromium | V352 (DOM half) |
 | 4 | pharos-ui reader: route, Read button, toc, settings panel, position sync, DRM and error states | UI + Playwright | V353, SC-004, B410 |
-| 5 | PDF: spike, then the chosen engine behind `quire`'s fixed-layout port | ADR-0047 amended | US5 |
+| 5 | PDF: `hayro` behind `quire`'s `FixedLayout` port, as `quire-pdf` and its own lazily loaded wasm module; canvas reader in pharos-ui | ADR-0047 amended | US5, V356–V358, B411 |
 | 6 | CBZ, when the library has a comic | | US6 |
 
 Slices 1 and 2 do not depend on each other and can be built in parallel.
@@ -142,6 +142,26 @@ Weak devices (TV, Quest, phones): the whole book is fetched, and a book over
 ("1 please", Alison, 2026-11-09, choosing this over loading chapter by
 chapter from the server). Wasm memory never shrinks once grown, and the
 library's largest EPUB is 214 MB.
+
+## Slice 5: PDF (built 2026-11-10)
+
+```text
+quire       FixedLayout { page_count, page_size, render(i, height_px) -> Raster }
+            PageLocator "pdf1:<page>" (from 1), page_progress = page / count
+quire-pdf   hayro adapter + wasm-bindgen QuirePdfDocument
+            (no pharos dependency, hakari final-exclude, own README)
+bundle      assets/pdf/{loader.js, quire_pdf.js, quire_pdf_bg.wasm}
+            built in flake.nix's pharosUiBundle from the vendored Cargo.lock
+pharos-ui   pdf_web.rs  loads the module on demand, canvas + one spare
+            reader.rs   layout caps, turns, taps, swipes, pdf1 saves (host tests)
+```
+
+Decisions and measured sizes are in ADR-0047. The module is 4.99 MB raw and
+1.86 MB gzip; the main wasm grew 23 KB raw (7 KB gzip) for the reader code. A page turn draws the next page
+ahead (one spare canvas); the position saves through the same debounce and
+page-hide flush as an EPUB. Left for later: offline reading (nothing stores
+the module or book yet), PDF outlines as a contents panel, text selection and
+search.
 
 ## Testing
 
