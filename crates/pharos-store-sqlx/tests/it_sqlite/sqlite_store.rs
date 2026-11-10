@@ -46,12 +46,7 @@ async fn match_columns_default_null_and_roundtrip() {
     // them (only a later `set_item_match`, T2), so a freshly-inserted
     // item round-trips them all as `None`.
     let s = fresh().await;
-    let it = item(
-        900001,
-        "/m/blade_runner.mkv",
-        "Blade Runner",
-        MediaKind::Movie,
-    );
+    let it = item(900001, "/m/blade_runner.mkv", "Film AB", MediaKind::Movie);
     s.put(it.clone()).await.unwrap();
     let got = s.get(900001).await.unwrap();
     assert_eq!(got.match_provider, None);
@@ -382,7 +377,7 @@ async fn metadata_roundtrips_through_store() {
     // LIB-C7/C8/C9 — descriptive metadata must survive put → get.
     use pharos_core::{MediaMetadata, ProviderIds};
     let s = fresh().await;
-    let mut it = item(7, "/m/matrix.mkv", "The Matrix", MediaKind::Movie);
+    let mut it = item(7, "/m/lattice.mkv", "The Glass Lattice", MediaKind::Movie);
     it.metadata = MediaMetadata {
         original_language: Some("ja".into()),
         community_rating: Some(8.7),
@@ -394,11 +389,11 @@ async fn metadata_roundtrips_through_store() {
         tagline: Some("Free your mind.".into()),
         provider_ids: ProviderIds {
             tmdb: Some("603".into()),
-            imdb: Some("tt0133093".into()),
+            imdb: Some("tt9300001".into()),
             ..Default::default()
         },
         production_locations: vec!["USA".into(), "Australia".into()],
-        trailers: vec!["https://youtu.be/m8e-FF8MsqU".into()],
+        trailers: vec!["https://youtu.be/abcDEF12345".into()],
         ratings: Default::default(),
     };
     s.put(it.clone()).await.unwrap();
@@ -607,39 +602,36 @@ async fn link_item_people_persists_credits_with_wire_id_and_detail() {
     s.put(item(1, "/m/a.mkv", "A", MediaKind::Movie))
         .await
         .unwrap();
-    let mut keanu = person("Keanu Reeves", PersonKind::Actor);
-    keanu.character = Some("Neo".into());
-    keanu.sort_order = Some(0);
-    keanu.thumb = Some("http://x/keanu.jpg".into());
-    let wachowski = person("Lana Wachowski", PersonKind::Director);
-    s.link_item_people(1, &[keanu, wachowski]).await.unwrap();
+    let mut star = person("Actor Q", PersonKind::Actor);
+    star.character = Some("Hero A".into());
+    star.sort_order = Some(0);
+    star.thumb = Some("http://x/actor.jpg".into());
+    let director_r = person("Director Q", PersonKind::Director);
+    s.link_item_people(1, &[star, director_r]).await.unwrap();
 
-    // /Persons list: name-ordered (Keanu < Lana), each carries the wire id.
+    // /Persons list: name-ordered (Actor Q < Director Q), each carries the wire id.
     let rows = s.people_with_counts().await.unwrap();
     let names: Vec<&str> = rows.iter().map(|p| p.person.name.as_str()).collect();
-    assert_eq!(names, vec!["Keanu Reeves", "Lana Wachowski"]);
+    assert_eq!(names, vec!["Actor Q", "Director Q"]);
     assert!(rows.iter().all(|p| p.item_count == 1));
-    let keanu_row = rows
-        .iter()
-        .find(|p| p.person.name == "Keanu Reeves")
-        .unwrap();
-    assert_eq!(keanu_row.person.wire_id, person_wire_id("Keanu Reeves"));
+    let star_row = rows.iter().find(|p| p.person.name == "Actor Q").unwrap();
+    assert_eq!(star_row.person.wire_id, person_wire_id("Actor Q"));
     assert_eq!(
-        keanu_row.person.thumb_url.as_deref(),
-        Some("http://x/keanu.jpg")
+        star_row.person.thumb_url.as_deref(),
+        Some("http://x/actor.jpg")
     );
 
     // people_for_item: NFO order, structured kind + character round-trip.
     let credits = s.people_for_item(1).await.unwrap();
     assert_eq!(credits.len(), 2);
-    assert_eq!(credits[0].name, "Keanu Reeves");
+    assert_eq!(credits[0].name, "Actor Q");
     assert_eq!(credits[0].kind, PersonKind::Actor);
-    assert_eq!(credits[0].character.as_deref(), Some("Neo"));
+    assert_eq!(credits[0].character.as_deref(), Some("Hero A"));
     assert_eq!(credits[1].kind, PersonKind::Director);
 
     // ParentId pivot: person wire id → the crediting item.
     let ids = s
-        .item_ids_for_person(&person_wire_id("Keanu Reeves"))
+        .item_ids_for_person(&person_wire_id("Actor Q"))
         .await
         .unwrap();
     assert_eq!(ids, vec![1]);
@@ -652,11 +644,11 @@ async fn link_item_people_persists_credits_with_wire_id_and_detail() {
 
     // person_by_wire_id resolves the single row.
     let p = s
-        .person_by_wire_id(&person_wire_id("Lana Wachowski"))
+        .person_by_wire_id(&person_wire_id("Director Q"))
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(p.name, "Lana Wachowski");
+    assert_eq!(p.name, "Director Q");
     assert!(s.person_by_wire_id("00").await.unwrap().is_none());
 }
 
@@ -1460,7 +1452,7 @@ async fn series_metadata_upsert_then_by_keys_roundtrips() {
         locked: Default::default(),
         original_language: Some("ja".into()),
         series_key: "/tv/Buffy (1997)".into(),
-        series_name: "Buffy the Vampire Slayer".into(),
+        series_name: "Show AB".into(),
         match_provider: Some("tvdb".into()),
         match_external_id: Some("70327".into()),
         match_source: Some("search".into()),

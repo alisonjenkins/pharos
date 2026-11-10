@@ -211,11 +211,11 @@ async fn search_term_substring_case_insensitive() {
     s.put(synth_item(1)).await.unwrap(); // "Title 99998"
     s.put(synth_item(2)).await.unwrap(); // "Title 99997"
     let mut weird = synth_item(3);
-    weird.title = "The Matrix Reloaded".into();
+    weird.title = "The Glass Lattice Reloaded".into();
     s.put(weird).await.unwrap();
 
     let q = MediaQuery {
-        search_term: Some("matrix".into()),
+        search_term: Some("lattice".into()),
         ..Default::default()
     };
     let (hits, total) = s.query(&q).await.unwrap();
@@ -277,7 +277,7 @@ async fn parent_genre_studio_person_tag_collection() {
 
     // People (link table carries role/kind; pivot is by person wire_id).
     let person = PersonRef {
-        name: "Keanu Reeves".into(),
+        name: "Actor Q".into(),
         kind: PersonKind::Actor,
         ..Default::default()
     };
@@ -289,7 +289,7 @@ async fn parent_genre_studio_person_tag_collection() {
         .unwrap();
     let qp = MediaQuery {
         parent: Some(ParentFilter::Person {
-            wire_id: person_wire_id("Keanu Reeves"),
+            wire_id: person_wire_id("Actor Q"),
         }),
         ..Default::default()
     };
