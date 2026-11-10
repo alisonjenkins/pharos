@@ -2780,6 +2780,13 @@ body:has(.pharos-stage.is-full .pharos-stage-slot:not([inert]) .pharos-connectio
   text-shadow: 0 1px 2px #000; /* not themed: controls sit on the video, whose colours no theme sets */
   white-space: nowrap;
 }
+/* B1277: a chapter name no wider than the width the preview is clamped by,
+   so a long one cannot reach past the bar's end either. */
+.pharos-seek-chapter-name {
+  max-width: calc(2 * var(--pharos-preview-half, 32px));
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
 .pharos-seek-thumb {
   border: 2px solid #fff; /* not themed: controls sit on the video, whose colours no theme sets */
   border-radius: 4px;
@@ -4466,6 +4473,18 @@ body::before {
 :root[data-device="tv"] .pharos-controls {
   padding-inline: 48px;
   padding-bottom: 27px;
+}
+/* The rest of the player's chrome keeps to the same area: the title bar,
+   and the skip and up-next cards over the controls, which rise by the
+   19px the controls' deeper foot adds. */
+:root[data-device="tv"] .pharos-watch-top {
+  padding: 27px 48px 2.5rem;
+}
+:root[data-device="tv"] .pharos-skip,
+:root[data-device="tv"] .pharos-up-next,
+:root[data-device="tv"] .pharos-up-next-pill {
+  right: 48px;
+  bottom: calc(5.5rem + 19px);
 }
 /* A TV's GPU is the weakest part of it (the G08 is a Mali on 2.4 GB). Each
    poster's translateZ(0) gave it its own compositor layer, hundreds on a
