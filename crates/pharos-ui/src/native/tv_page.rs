@@ -160,16 +160,27 @@ pub fn direct_media_url(base: &str, url: &str, token: &str) -> String {
 
 /// The script that starts page visualiser run `id` drawing `style`, once
 /// the wasm module (`window.__pharosVis`) is loaded. A run its owner already
-/// stopped (`"gone"`) does not start; a fallback comes back as a
-/// `visualiser` bridge message (B1032, V992).
+/// stopped (`"gone"`) does not start. The page reports every outcome itself
+/// as a `visualiser` bridge message: `started`, or the `render::Fallback`
+/// label with the error. The app runs it without waiting on its result,
+/// which the WebView can drop after the script ran (B1036, V996).
 pub fn visualiser_start_js(id: u64, style: &str) -> String {
     let style = serde_json::Value::String(style.to_owned());
     format!(
         r#"const all = window.__pharosVisRuns = window.__pharosVisRuns || {{}};
-if (all[{id}] === "gone") {{ delete all[{id}]; return false; }}
-all[{id}] = window.__pharosVis.start({style}, (reason) =>
-  window.__pharosSend && window.__pharosSend({{ t: "visualiser", id: {id}, reason: String(reason) }}));
-return true;"#
+const send = (reason, error) => window.__pharosSend &&
+  window.__pharosSend({{ t: "visualiser", id: {id}, reason: String(reason), error: String(error || "") }});
+(async () => {{
+  try {{
+    if (!window.__pharosVis && window.__pharosVisLoad) await window.__pharosVisLoad;
+    if (!window.__pharosVis) throw new Error("the visualiser module is not loaded");
+    if (all[{id}] === "gone") {{ delete all[{id}]; send("stopped_first"); return; }}
+    all[{id}] = window.__pharosVis.start({style}, (reason) => send(reason));
+    send("started");
+  }} catch (e) {{
+    send("no_webgl2", e && e.message ? e.message : e);
+  }}
+}})();"#
     )
 }
 
@@ -331,9 +342,14 @@ pub enum Bridge {
         #[serde(flatten)]
         event: HlsEvent,
     },
-    /// The page's visualiser run `id` could not draw: the
-    /// `render::Fallback` label why.
-    Visualiser { id: u64, reason: String },
+    /// The page's visualiser run `id`: `started`, `stopped_first`, or the
+    /// `render::Fallback` label why it could not draw, with the error.
+    Visualiser {
+        id: u64,
+        reason: String,
+        #[serde(default)]
+        error: String,
+    },
     /// A directly played media element's `error`: its `MediaError` code and
     /// message.
     #[serde(rename = "mediaerror")]
@@ -557,6 +573,10 @@ mod tests {
         );
         assert!(start.contains(r#"if (all[3] === "gone")"#), "{start}");
         assert!(start.contains(r#"t: "visualiser", id: 3"#), "{start}");
+        // The page reports a start and a failure itself (B1036, V996).
+        assert!(start.contains(r#"send("started")"#), "{start}");
+        assert!(start.contains(r#"send("no_webgl2", "#), "{start}");
+        assert!(start.contains("await window.__pharosVisLoad"), "{start}");
         let stop = visualiser_stop_js(3);
         assert!(
             stop.contains("run.stop(); run.free(); delete all[3];"),
@@ -568,8 +588,13 @@ mod tests {
             parse_bridge(&v),
             Some(Bridge::Visualiser {
                 id: 3,
-                reason: "no_webgl2".into()
+                reason: "no_webgl2".into(),
+                error: String::new(),
             })
+        );
+        let v = serde_json::json!({"t": "visualiser", "id": 3, "reason": "started", "error": ""});
+        assert!(
+            matches!(parse_bridge(&v), Some(Bridge::Visualiser { reason, .. }) if reason == "started")
         );
     }
 
