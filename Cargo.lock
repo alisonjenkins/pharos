@@ -5485,6 +5485,7 @@ version = "0.0.0"
 dependencies = [
  "actix-web",
  "gemm",
+ "libc",
  "memmap2",
  "metrics",
  "metrics-exporter-prometheus",

@@ -17,6 +17,7 @@ metrics-process.workspace = true
 opentelemetry.workspace = true
 opentelemetry-otlp.workspace = true
 opentelemetry_sdk.workspace = true
+libc = "0.2"
 rayon = "1"
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
