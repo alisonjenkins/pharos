@@ -26,7 +26,7 @@ const ORIGINAL_LANGUAGE: &str = "OriginalLanguage";
 /// preference first, then English and the languages the description
 /// selector offers. The audio preference alone may also be the title's
 /// original language.
-pub fn track_language_options(with_original: bool) -> Vec<(String, String)> {
+pub fn track_language_options(with_original: bool, stored: &str) -> Vec<(String, String)> {
     let mut out = vec![
         (String::new(), "No preference".to_owned()),
         ("eng".to_owned(), "English".to_owned()),
@@ -42,6 +42,12 @@ pub fn track_language_options(with_original: bool) -> Vec<(String, String)> {
             ORIGINAL_LANGUAGE.to_owned(),
             "The title's original language".to_owned(),
         ));
+    }
+    // jellyfin-web can store any language: show it so the page does not
+    // look unset while the server applies it.
+    let stored = stored.trim();
+    if !stored.is_empty() && !out.iter().any(|(v, _)| v == stored) {
+        out.push((stored.to_owned(), stored.to_owned()));
     }
     out
 }
@@ -97,8 +103,8 @@ pub fn PlaybackView(
     subtitle_mode: String,
     #[props(default)] on_subtitle_mode: EventHandler<String>,
 ) -> Element {
-    let audio_languages = track_language_options(true);
-    let subtitle_languages = track_language_options(false);
+    let audio_languages = track_language_options(true, &audio_language);
+    let subtitle_languages = track_language_options(false, &subtitle_language);
     let modes = SUBTITLE_MODES
         .iter()
         .map(|(value, label)| ((*value).to_owned(), (*label).to_owned()))
@@ -380,8 +386,8 @@ mod tests {
 
     #[test]
     fn only_the_audio_language_offers_the_titles_original() {
-        let audio = track_language_options(true);
-        let subtitles = track_language_options(false);
+        let audio = track_language_options(true, "");
+        let subtitles = track_language_options(false, "");
         assert_eq!(audio[0], (String::new(), "No preference".to_owned()));
         assert_eq!(subtitles[0], audio[0]);
         assert!(audio.iter().any(|(v, _)| v == ORIGINAL_LANGUAGE));
@@ -392,6 +398,14 @@ mod tests {
         unique.sort();
         unique.dedup();
         assert_eq!(values.len(), unique.len(), "values are distinct");
+    }
+
+    #[test]
+    fn a_stored_language_outside_the_list_is_still_offered() {
+        let audio = track_language_options(true, "swe");
+        assert_eq!(audio.last(), Some(&("swe".to_owned(), "swe".to_owned())));
+        let known = track_language_options(false, "eng");
+        assert_eq!(known.len(), track_language_options(false, "").len());
     }
 
     #[test]
