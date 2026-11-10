@@ -32,6 +32,7 @@ pub mod hls_trace;
 #[cfg(all(feature = "web", target_arch = "wasm32"))]
 mod hls_web;
 pub mod kept;
+pub mod kept_view;
 pub mod keymap;
 pub mod keys;
 pub mod letters;
