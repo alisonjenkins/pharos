@@ -429,7 +429,7 @@ pub(crate) async fn resolve_runtimes_ms(
                 .get(num)
                 .await
                 .ok()
-                .and_then(|item| item.probe.duration_ms),
+                .and_then(|item| item.probe.run_time_ms()),
             None => None,
         };
         out.push(runtime);
