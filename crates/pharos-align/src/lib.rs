@@ -7,6 +7,7 @@
 //! against the Python code by fixtures in `tests/fixtures`.
 
 pub mod ctc;
+pub mod line;
 pub mod text;
 pub mod tokens;
 
