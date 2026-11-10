@@ -1677,6 +1677,9 @@ fn NativeApp(route: Route) -> Element {
     let mut api = use_signal(|| None::<NativeApi>);
     let mut task = use_signal(|| None::<dioxus::core::Task>);
     let mut started = use_signal(|| None::<u32>);
+    // A connection attempt that has not answered in a while (a tunnel, where
+    // the browser still says it is online) lets kept books open meanwhile.
+    let mut slow_connect = use_signal(|| false);
     // A page loaded before a deploy reconnects to the newer server, which may
     // send values this build cannot read: it asks to be reloaded.
     let outdated = use_signal(|| false);
@@ -1906,6 +1909,15 @@ fn NativeApp(route: Route) -> Element {
         match phase {
             Phase::Connecting if *started.peek() != Some(epoch) => {
                 started.set(Some(epoch));
+                if kept_any() {
+                    spawn(async move {
+                        platform::sleep_ms(SLOW_CONNECT_MS).await;
+                        let m = machine.peek();
+                        if m.epoch() == epoch && *m.phase() == Phase::Connecting {
+                            slow_connect.set(true);
+                        }
+                    });
+                }
                 if let Some(old) = task.write().take() {
                     old.cancel();
                 }
@@ -1913,7 +1925,12 @@ fn NativeApp(route: Route) -> Element {
                 // so the screens keep what they loaded.
                 task.set(Some(spawn(connect(machine, api, outdated, epoch, delay))));
             }
-            Phase::Connecting | Phase::Ready => {}
+            Phase::Connecting => {}
+            Phase::Ready => {
+                if *slow_connect.peek() {
+                    slow_connect.set(false);
+                }
+            }
             _ => {
                 if let Some(old) = task.write().take() {
                     old.cancel();
@@ -2016,6 +2033,11 @@ fn NativeApp(route: Route) -> Element {
     match phase {
         Phase::Connecting | Phase::Ready => {
             let m = machine.read();
+            // Cut off from the server, kept books still open (spec 036 US3).
+            let cut_off = m.waiting().is_some() || platform_offline() || slow_connect();
+            if let Some(offline) = cut_off.then(|| offline_start(&route)).flatten() {
+                return offline;
+            }
             match m.waiting() {
                 Some(why) => rsx! {
                     StatusView {
@@ -2173,6 +2195,51 @@ fn on_this_device() -> Element {
             p { class: "pharos-settings-lede", "Keeping books to read offline works in the browser app." }
         }
     }
+}
+
+/// How long the first connection may take before kept books open without it.
+/// Short, because a phone in a tunnel reports itself online.
+const SLOW_CONNECT_MS: u32 = 3_000;
+
+/// Whether any book is kept on this device: one `localStorage` read, made
+/// only when a connection attempt starts.
+#[cfg(all(feature = "web", target_arch = "wasm32"))]
+fn kept_any() -> bool {
+    super::kept_web::read().is_some()
+}
+
+#[cfg(not(all(feature = "web", target_arch = "wasm32")))]
+fn kept_any() -> bool {
+    false
+}
+
+/// The app with no connection and books kept on the device: the list, or
+/// the reader when a kept book was asked for. `None` when nothing is kept,
+/// so the usual waiting page shows. Browser only; the cache is the browser's.
+#[cfg(all(feature = "web", target_arch = "wasm32"))]
+fn offline_start(route: &Route) -> Option<Element> {
+    let store = super::kept_web::read()?;
+    Some(match route {
+        Route::Read(id) if store.find(&id.to_string()).is_some() => {
+            remount_on(&id.to_string(), reader_screen(*id))
+        }
+        _ => rsx! { super::kept_web::OfflineHome {} },
+    })
+}
+
+#[cfg(not(all(feature = "web", target_arch = "wasm32")))]
+fn offline_start(_route: &Route) -> Option<Element> {
+    None
+}
+
+#[cfg(all(feature = "web", target_arch = "wasm32"))]
+fn platform_offline() -> bool {
+    super::kept_web::is_offline()
+}
+
+#[cfg(not(all(feature = "web", target_arch = "wasm32")))]
+fn platform_offline() -> bool {
+    false
 }
 
 /// The reader draws with `quire-web`, which only the browser build has.
