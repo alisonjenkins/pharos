@@ -71,8 +71,9 @@ async fn rig(sidecar_name: &str, body: &str) -> Rig {
     let source_index = sidecar_base_index(&item.probe);
     let source = pharos_styling::source::read(body).unwrap();
     let mut plan = pharos_styling::direct(&source.lines, &Default::default(), &[]).plan;
-    // A plan that styles line 0, so the tier and level change the script.
-    plan.lines = vec![pharos_styling::LineEffect {
+    // A plan that styles line 0, so the tier and level change the script,
+    // and gives line 1 a speaker, so speaker colours change it too.
+    let shout = pharos_styling::LineEffect {
         line: 0,
         intent: pharos_styling::Intent::Shout,
         intensity: 3,
@@ -82,7 +83,15 @@ async fn rig(sidecar_name: &str, body: &str) -> Rig {
         static_only: false,
         syllables: None,
         speaker: None,
-    }];
+    };
+    let spoken = pharos_styling::LineEffect {
+        line: 1,
+        intent: pharos_styling::Intent::Plain,
+        intensity: 0,
+        speaker: Some(0),
+        ..shout.clone()
+    };
+    plan.lines = vec![shout, spoken];
     let (source_mtime, source_size) = signature(&item.path);
     let (sidecar_mtime, sidecar_size) = signature(&sidecar);
     fx.state
@@ -217,6 +226,31 @@ async fn a_size_scales_the_dialogue_style() {
     );
     assert_eq!(get(&rig, &ass_uri(&rig, "?size=110")).await.0, 400);
     assert_eq!(get(&rig, &ass_uri(&rig, "?size=big")).await.0, 400);
+}
+
+/// `?speakers=1` draws a speaker's lines in their colour and is cached apart
+/// from the script without; off is the default.
+#[actix_web::test]
+async fn speaker_colours_are_a_switch_of_their_own() {
+    let rig = rig("Film.eng.ass", SCRIPT).await;
+    let speaker_lines = |body: &[u8]| {
+        String::from_utf8(body.to_vec())
+            .unwrap()
+            .lines()
+            .filter(|l| l.starts_with("Style: Speaker1,") || l.contains(",Speaker1,"))
+            .count()
+    };
+    let (_, _, off) = get(&rig, &ass_uri(&rig, "")).await;
+    let (_, _, zero) = get(&rig, &ass_uri(&rig, "?speakers=0")).await;
+    assert_eq!(off, zero, "off is the default");
+    assert_eq!(speaker_lines(&off), 0);
+    let (status, _, on) = get(&rig, &ass_uri(&rig, "?speakers=1")).await;
+    assert_eq!(status, 200);
+    // Its style and the one line it speaks.
+    assert_eq!(speaker_lines(&on), 2, "{}", String::from_utf8_lossy(&on));
+    let (_, _, again) = get(&rig, &ass_uri(&rig, "")).await;
+    assert_eq!(again, off, "the coloured script has its own cache slot");
+    assert_eq!(get(&rig, &ass_uri(&rig, "?speakers=yes")).await.0, 400);
 }
 
 /// V532: the same request twice gives the same bytes, from the cache and from
