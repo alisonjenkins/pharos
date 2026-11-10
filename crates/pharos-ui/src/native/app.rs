@@ -78,8 +78,8 @@ use super::versions;
 use super::views::{
     open_route, reveal_palette_row, Busy, ErrorNote, FlashNote, GroupEndedNote, Hits, HomeView,
     LoadError, LoadFailure, Loading, MarkFavorite, MarkPlayed, Nav, PaletteView, PlayFailure,
-    PlayFromStart, PlaybackFailure, SearchBox, Shell, SignInView, StatusView, TitleView,
-    PALETTE_INPUT,
+    PlayFromStart, PlaybackFailure, SearchBox, Shell, SignInView, StatusView, StoredMark,
+    TitleView, PALETTE_INPUT,
 };
 use super::watch_view::{
     split_position, text_track_id, total_ms, Control, Controls, Skip, UpNextCard, VideoQueueView,
@@ -1626,6 +1626,7 @@ fn mark_handler(
     machine: Signal<Machine>,
     flash: Flash,
     mut marks: Signal<u32>,
+    mut stored: Signal<Option<(ItemRef, bool)>>,
 ) -> EventHandler<(ItemRef, bool, String)> {
     let marking = Rc::new(RefCell::new(std::collections::HashSet::<ItemRef>::new()));
     EventHandler::new(move |(id, on, name): (ItemRef, bool, String)| {
@@ -1646,13 +1647,20 @@ fn mark_handler(
                 Mark::Played => api.set_played(&call, id, on).await,
                 Mark::Favorite => api.set_favorite(&call, id, on).await,
             };
-            if let Err(e) = settle(machine, result) {
-                platform::warn(&format!("pharos: marking {id} {what}={on} failed: {e}"));
-                let line = match mark {
-                    Mark::Played => super::views::mark_failure_line(&name, on, &e),
-                    Mark::Favorite => super::views::favorite_failure_line(&name, on, &e),
-                };
-                flash.say(line, true);
+            match settle(machine, result) {
+                Ok(now) => {
+                    if matches!(mark, Mark::Played) {
+                        stored.set(Some((id, now)));
+                    }
+                }
+                Err(e) => {
+                    platform::warn(&format!("pharos: marking {id} {what}={on} failed: {e}"));
+                    let line = match mark {
+                        Mark::Played => super::views::mark_failure_line(&name, on, &e),
+                        Mark::Favorite => super::views::favorite_failure_line(&name, on, &e),
+                    };
+                    flash.say(line, true);
+                }
             }
             marking.borrow_mut().remove(&id);
             marks += 1;
@@ -1757,8 +1765,27 @@ fn NativeApp(route: Route) -> Element {
     // Whether the queue is docked beside the compact player (B900).
     use_context_provider(|| QueueDock(Signal::new(super::listen::dock_shown())));
     mixes::use_top_up(api, queue, mix);
-    use_context_provider(|| MarkPlayed(mark_handler(Mark::Played, api, machine, flash, marks)));
-    use_context_provider(|| MarkFavorite(mark_handler(Mark::Favorite, api, machine, flash, marks)));
+    let stored = use_context_provider(|| StoredMark(Signal::new(None))).0;
+    use_context_provider(|| {
+        MarkPlayed(mark_handler(
+            Mark::Played,
+            api,
+            machine,
+            flash,
+            marks,
+            stored,
+        ))
+    });
+    use_context_provider(|| {
+        MarkFavorite(mark_handler(
+            Mark::Favorite,
+            api,
+            machine,
+            flash,
+            marks,
+            stored,
+        ))
+    });
     let search = Search {
         text: use_signal(String::new),
         find: use_signal(Find::default),
