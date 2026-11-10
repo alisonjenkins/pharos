@@ -41,6 +41,39 @@ impl Columns {
     }
 }
 
+/// Where a fixed-layout page sits in a frame: shrunk or grown to fit inside
+/// it, less `gutter` on every side, keeping its shape, and centred.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Fit {
+    pub scale: f64,
+    pub left: f64,
+    pub top: f64,
+}
+
+impl Fit {
+    pub fn of(page: (f64, f64), frame: (f64, f64), gutter: f64) -> Fit {
+        let (pw, ph) = page;
+        let (fw, fh) = frame;
+        let room_w = (fw - 2.0 * gutter).max(1.0);
+        let room_h = (fh - 2.0 * gutter).max(1.0);
+        let scale = if pw > 0.0 && ph > 0.0 && pw.is_finite() && ph.is_finite() {
+            (room_w / pw).min(room_h / ph)
+        } else {
+            1.0
+        };
+        let scale = if scale.is_finite() && scale > 0.0 {
+            scale
+        } else {
+            1.0
+        };
+        Fit {
+            scale,
+            left: ((fw - pw * scale) / 2.0).max(0.0),
+            top: ((fh - ph * scale) / 2.0).max(0.0),
+        }
+    }
+}
+
 fn clamp_page(n: f64) -> u32 {
     if n.is_nan() || n <= 0.0 {
         0
@@ -106,6 +139,31 @@ mod tests {
         assert_eq!(COLS.page_at(679.7), 1, "sub-pixel left of the edge");
         assert_eq!(COLS.page_at(-5.0), 0);
         assert_eq!(COLS.offset(2), -1360.0);
+    }
+
+    #[test]
+    fn a_fixed_page_fits_its_frame_and_is_centred() {
+        // A portrait page in a landscape frame is bounded by the height.
+        let f = Fit::of((600.0, 800.0), (1280.0, 800.0), 0.0);
+        assert_eq!(
+            f,
+            Fit {
+                scale: 1.0,
+                left: 340.0,
+                top: 0.0
+            }
+        );
+        // In a narrow frame, by the width, less the gutters.
+        let f = Fit::of((600.0, 800.0), (320.0, 800.0), 10.0);
+        assert!((f.scale - 0.5).abs() < 1e-9);
+        assert!((f.left - 10.0).abs() < 1e-9);
+        assert!((f.top - 200.0).abs() < 1e-9);
+        // A small page grows to fill the frame.
+        let f = Fit::of((100.0, 100.0), (400.0, 400.0), 0.0);
+        assert!((f.scale - 4.0).abs() < 1e-9);
+        // A degenerate page is drawn at its own size.
+        assert!((Fit::of((0.0, 0.0), (400.0, 400.0), 0.0).scale - 1.0).abs() < 1e-9);
+        assert!((Fit::of((f64::NAN, 1.0), (400.0, 400.0), 0.0).scale - 1.0).abs() < 1e-9);
     }
 
     #[test]
