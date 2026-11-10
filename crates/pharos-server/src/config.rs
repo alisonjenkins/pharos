@@ -380,6 +380,12 @@ pub struct LyricsConfig {
     /// Env: `PHAROS_LYRICS_ALIGNER_URL`.
     #[serde(default)]
     pub aligner_url: Option<String>,
+    /// Base URL of a second aligner that each finished song is also sent to,
+    /// after the primary's answer is stored, for a comparison that is logged
+    /// and counted; its answers are never stored or served (spec 039, R21).
+    /// Unset means no shadow. Env: `PHAROS_LYRICS_ALIGNER_SHADOW_URL`.
+    #[serde(default)]
+    pub aligner_shadow_url: Option<String>,
     /// The media directory as the aligner sees it, the same mount as the
     /// server's; item paths under it are sent relative to it, others are not
     /// aligned. Default `/var/lib/pharos/media`. Env:
@@ -1728,6 +1734,12 @@ impl Config {
                 self.lyrics.aligner_url = Some(v.to_string());
             }
         }
+        if let Ok(v) = std::env::var("PHAROS_LYRICS_ALIGNER_SHADOW_URL") {
+            let v = v.trim();
+            if !v.is_empty() {
+                self.lyrics.aligner_shadow_url = Some(v.to_string());
+            }
+        }
         if let Ok(v) = std::env::var("PHAROS_LYRICS_ALIGNER_MEDIA_ROOT") {
             let v = v.trim();
             if !v.is_empty() {
@@ -2227,10 +2239,15 @@ mod tests {
         let cfg = Config::from_toml_str(s).unwrap();
         assert!(!cfg.lyrics.online);
         assert_eq!(cfg.lyrics.aligner_url, None);
+        assert_eq!(cfg.lyrics.aligner_shadow_url, None, "no shadow by default");
         assert_eq!(cfg.lyrics.aligner_media_root, None);
 
         std::env::set_var("PHAROS_LYRICS_ONLINE", "true");
         std::env::set_var("PHAROS_LYRICS_ALIGNER_URL", "  http://aligner.lan:8790  ");
+        std::env::set_var(
+            "PHAROS_LYRICS_ALIGNER_SHADOW_URL",
+            " http://shadow.lan:8790 ",
+        );
         std::env::set_var("PHAROS_LYRICS_ALIGNER_MEDIA_ROOT", "  /srv/media  ");
 
         let cfg = cfg.apply_env();
@@ -2240,12 +2257,17 @@ mod tests {
             Some("http://aligner.lan:8790")
         );
         assert_eq!(
+            cfg.lyrics.aligner_shadow_url.as_deref(),
+            Some("http://shadow.lan:8790")
+        );
+        assert_eq!(
             cfg.lyrics.aligner_media_root.as_deref(),
             Some(Path::new("/srv/media"))
         );
 
         std::env::remove_var("PHAROS_LYRICS_ONLINE");
         std::env::remove_var("PHAROS_LYRICS_ALIGNER_URL");
+        std::env::remove_var("PHAROS_LYRICS_ALIGNER_SHADOW_URL");
         std::env::remove_var("PHAROS_LYRICS_ALIGNER_MEDIA_ROOT");
     }
 
@@ -2259,10 +2281,15 @@ mod tests {
             [lyrics]
             online = true
             aligner_url = "http://localhost:8790"
+            aligner_shadow_url = "http://localhost:8791"
             aligner_media_root = "/var/media"
         "#;
         let cfg = Config::from_toml_str(s).unwrap();
         assert!(cfg.lyrics.online);
+        assert_eq!(
+            cfg.lyrics.aligner_shadow_url.as_deref(),
+            Some("http://localhost:8791")
+        );
         assert_eq!(
             cfg.lyrics.aligner_url.as_deref(),
             Some("http://localhost:8790")
