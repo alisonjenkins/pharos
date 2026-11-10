@@ -32,8 +32,8 @@ impl Model for Even {
     }
 }
 
-struct Server {
-    addr: SocketAddr,
+pub struct Server {
+    pub addr: SocketAddr,
     root: PathBuf,
     handle: actix_web::dev::ServerHandle,
 }
@@ -45,7 +45,7 @@ impl Drop for Server {
     }
 }
 
-fn serve(name: &str, decoder: Decoder, gate: Option<mpsc::Receiver<()>>) -> Server {
+pub fn serve(name: &str, decoder: Decoder, gate: Option<mpsc::Receiver<()>>) -> Server {
     let root =
         std::env::temp_dir().join(format!("pharos-align-http-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
@@ -75,12 +75,12 @@ fn serve(name: &str, decoder: Decoder, gate: Option<mpsc::Receiver<()>>) -> Serv
     Server { addr, root, handle }
 }
 
-fn silent() -> Decoder {
+pub fn silent() -> Decoder {
     Box::new(|_: &Path, _, _| Ok(vec![0.0; 16]))
 }
 
 /// Sends `head` (request line and headers, no blank line) and `body`; the status and body back.
-fn raw(addr: SocketAddr, head: &str, body: &[u8]) -> (u16, Value) {
+pub fn raw(addr: SocketAddr, head: &str, body: &[u8]) -> (u16, Value) {
     let mut s = TcpStream::connect(addr).unwrap();
     s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
     s.write_all(format!("{head}\r\nConnection: close\r\n\r\n").as_bytes())
@@ -94,7 +94,7 @@ fn raw(addr: SocketAddr, head: &str, body: &[u8]) -> (u16, Value) {
     (status, serde_json::from_str(body).unwrap_or(Value::Null))
 }
 
-fn post(addr: SocketAddr, body: &Value) -> (u16, Value) {
+pub fn post(addr: SocketAddr, body: &Value) -> (u16, Value) {
     let bytes = serde_json::to_vec(body).unwrap();
     let head = format!(
         "POST /align HTTP/1.1\r\nHost: t\r\nContent-Length: {}",
