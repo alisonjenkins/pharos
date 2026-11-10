@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 use crate::plan::{EffectPlan, Intent, Karaoke, LineEffect, Placement};
 use crate::signals::{LineSignals, Segment, SegmentKind, SungLine, TrackSignals};
 use crate::source::SourceLine;
+use crate::speakers;
 use crate::text::unwrap_marks;
 use crate::timing;
 use crate::version::DIRECTOR_VERSION;
@@ -30,6 +31,8 @@ pub struct Direction {
     /// Median aligner score of the opening and ending lines, `None` when the
     /// aligner was not asked; what [`MIN_SUNG_SCORE`] is calibrated against.
     pub sung_score: Option<f32>,
+    /// Speakers given a palette slot.
+    pub speakers: usize,
 }
 
 /// Where a karaoke line's fill timings came from (B1212).
@@ -227,6 +230,7 @@ pub fn direct(lines: &[SourceLine], signals: &TrackSignals, segments: &[Segment]
 
     let sung_score = sung_score(&kinds, &signals.sung);
     let sung_track = sung_score.map(|s| s >= MIN_SUNG_SCORE);
+    let speakers = speakers::slots(lines);
 
     let mut out = Vec::with_capacity(lines.len());
     let mut counts: BTreeMap<Intent, usize> = BTreeMap::new();
@@ -236,6 +240,7 @@ pub fn direct(lines: &[SourceLine], signals: &TrackSignals, segments: &[Segment]
         let med = medians[class_of(kinds[i]) as usize];
         let mut fx = decide(line, kinds[i], audio[i], med, caps_track);
         fx.line = i;
+        fx.speaker = speakers[i];
         let sung = signals.sung.get(i).and_then(Option::as_ref);
         if let Some(timing) = time_karaoke(&mut fx, line, kinds[i], sung, sung_track) {
             *karaoke.entry(timing).or_insert(0) += 1;
@@ -266,6 +271,11 @@ pub fn direct(lines: &[SourceLine], signals: &TrackSignals, segments: &[Segment]
         bottom_text,
         karaoke,
         sung_score,
+        speakers: speakers
+            .iter()
+            .flatten()
+            .max()
+            .map_or(0, |&s| usize::from(s) + 1),
     }
 }
 
@@ -1696,6 +1706,21 @@ mod tests {
         assert_eq!(case("[boom]").run().reason, "rule=sfx");
         let plain = case("Hello again").run();
         assert!(plain.reason.starts_with("rule=plain"), "{}", plain.reason);
+    }
+
+    #[test]
+    fn recurring_speakers_get_slots_in_the_plan() {
+        let lines: Vec<SourceLine> = ["Ann", "Bo", "Ann", "Ann", ""]
+            .into_iter()
+            .map(|who| SourceLine {
+                speaker: (!who.is_empty()).then(|| who.to_owned()),
+                ..line("Hi")
+            })
+            .collect();
+        let d = direct(&lines, &TrackSignals::default(), &[]);
+        let slots: Vec<Option<u8>> = d.plan.lines.iter().map(|l| l.speaker).collect();
+        assert_eq!(slots, [Some(0), None, Some(0), Some(0), None]);
+        assert_eq!(d.speakers, 1);
     }
 
     #[test]
