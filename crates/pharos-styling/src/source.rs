@@ -14,7 +14,7 @@ pub enum SourceFormat {
 }
 
 /// One karaoke syllable: how long it is sung and the text it covers.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Syllable {
     pub dur_ms: u32,
     pub text: String,
