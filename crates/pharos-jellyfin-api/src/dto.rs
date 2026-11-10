@@ -3155,7 +3155,7 @@ mod tests {
 
     #[test]
     fn stream_display_title_composes_language_title_codec_channels() {
-        // Track with a title → "Language - Title" (the Code Geass case that
+        // Track with a title → "Language - Title" (the Show U case that
         // rendered "undefined").
         assert_eq!(
             stream_display_title(Some("jpn"), Some("TrueHD 5.1"), Some("truehd"), Some(6))
@@ -3382,7 +3382,7 @@ mod tests {
                 tagline: Some("a tagline".into()),
                 provider_ids: ProviderIds {
                     tmdb: Some("603".into()),
-                    imdb: Some("tt0133093".into()),
+                    imdb: Some("tt9300001".into()),
                     ..Default::default()
                 },
                 ..Default::default()
@@ -3400,7 +3400,7 @@ mod tests {
         assert_eq!(v["ProductionYear"], 1999);
         assert!(v["PremiereDate"].as_str().unwrap().starts_with("1999-03-"));
         assert_eq!(v["ProviderIds"]["Tmdb"], "603");
-        assert_eq!(v["ProviderIds"]["Imdb"], "tt0133093");
+        assert_eq!(v["ProviderIds"]["Imdb"], "tt9300001");
         assert!(v["ProviderIds"].get("Tvdb").is_none());
         // T67 — ExternalUrls derived from the provider ids. A Movie's TMDb link
         // is type-scoped to `/movie`; the IMDb link points at `/title`.
@@ -3417,7 +3417,7 @@ mod tests {
             .collect();
         assert!(urls.contains(&(
             "IMDb".into(),
-            "https://www.imdb.com/title/tt0133093/".into()
+            "https://www.imdb.com/title/tt9300001/".into()
         )));
         assert!(urls.contains(&(
             "TheMovieDb".into(),

@@ -1311,7 +1311,7 @@ mod tests {
         assert!(all[9].to_string().contains("eac3"));
     }
 
-    /// The A Beautiful Mind shape (T130): h264 + E-AC-3 in Matroska, to a TV
+    /// The Film AM shape (T130): h264 + E-AC-3 in Matroska, to a TV
     /// whose profile honestly lists eac3.
     fn mkv_h264_eac3_source() -> SourceMedia {
         SourceMedia {
