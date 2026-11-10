@@ -202,6 +202,20 @@ fn links_become_jumps_inert_or_external() {
     );
 }
 
+/// V1286: an old `<a name>` link target is found like an `id`, and an
+/// element's own id wins over its name.
+#[test]
+fn a_named_anchor_is_a_link_target() {
+    let p = book3(r#"<p><a name="old"></a>x<a id="mine" name="other">y</a><a name="  ">z</a></p>"#);
+    assert_eq!(
+        html(&p, 0),
+        concat!(
+            r#"<div data-quire-body="" class="b" lang="en"><p>"#,
+            r#"<a id="old"></a>x<a id="mine">y</a><a>z</a></p></div>"#
+        )
+    );
+}
+
 #[test]
 fn nothing_that_runs_or_fetches_survives() {
     let p = book3(concat!(
