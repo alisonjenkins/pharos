@@ -1914,6 +1914,7 @@ where
     for split in &survey.title_splits {
         rows_written += write_title_split(store, split, now).await?;
         ids.extend(split.files.iter().map(|f| f.id));
+        ids.extend(split.joiners.iter().copied());
     }
     let marked = store.mark_reconcile_items(&ids, now).await?;
     tracing::info!(
@@ -1992,6 +1993,9 @@ pub(crate) struct TitleSplit {
     /// stored match's premiere, if any.
     pub owner_year: Option<u32>,
     pub files: Vec<TitleMove>,
+    /// B987 — unyeared files that stay and join an owner of another year
+    /// than the folder's files state, while holding another show's episode.
+    pub joiners: Vec<pharos_core::MediaId>,
 }
 
 /// One unyeared file and the show its episode title names.
@@ -2017,6 +2021,7 @@ impl Survey {
             *counts
                 .entry(("episode", RepairReason::EpisodeTitles))
                 .or_default() += split.files.len();
+            *counts.entry(("episode", RepairReason::Split)).or_default() += split.joiners.len();
         }
         for kind in ["show", "episode"] {
             for reason in [
@@ -2472,10 +2477,12 @@ async fn title_moves<E: OnlineEnricher>(
     };
     let sim = |a: &str, b: Option<&str>| b.map_or(0.0, |b| pharos_core::title_similarity(a, b));
     let mut files = Vec::new();
+    let mut stays = Vec::new();
     for (row, s, e, title) in unyeared {
         let own_title = listed(&own_list, *s, *e);
         let own_score = sim(title, own_title.as_deref());
         if own_score >= episode_fit::SAME_TITLE {
+            stays.push((*row, *s, *e));
             continue;
         }
         let best = rival_lists
@@ -2487,6 +2494,7 @@ async fn title_moves<E: OnlineEnricher>(
             })
             .max_by(|a, b| a.3.total_cmp(&b.3));
         let Some((rival_id, year, rival_title, rival_score)) = best else {
+            stays.push((*row, *s, *e));
             continue;
         };
         tracing::info!(
@@ -2519,11 +2527,67 @@ async fn title_moves<E: OnlineEnricher>(
             .filter(|y| y.abs_diff(p) <= 1)
             .min_by_key(|y| y.abs_diff(p))
     });
+    let joiners = match owner_year {
+        Some(owner) if owner != stated => rival_lists
+            .iter()
+            .find(|(_, year, _)| *year == owner)
+            .map(|(id, year, list)| owner_joiners(cand, id, *year, list, &stays))
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    };
     Ok(Some(TitleSplit {
         folder: cand.series_key.clone(),
         owner_year,
         files,
+        joiners,
     }))
+}
+
+/// B987 — the unyeared files that stay in a title-split folder join its
+/// owner, whose show is not the year the folder's files state. A file whose
+/// stored episode disagrees with the owner's same episode (by title, or by an
+/// air date a remake's distance away) holds the other show's episode and is
+/// rebuilt from the owner. A file the owner lists no episode for is left.
+fn owner_joiners(
+    cand: &SeriesMatchCandidate,
+    owner_id: &str,
+    owner_year: u32,
+    owner_list: &[EpisodeListing],
+    stays: &[(&pharos_core::SeriesEpisodeRow, u32, u32)],
+) -> Vec<pharos_core::MediaId> {
+    let mut joiners = Vec::new();
+    for (row, s, e) in stays {
+        let Some(owner) = owner_list
+            .iter()
+            .find(|l| l.season == *s && l.episode == *e)
+        else {
+            continue;
+        };
+        let title_differs = owner.title.as_deref().is_some_and(|t| {
+            pharos_core::title_similarity(&row.title, t) < episode_fit::SAME_TITLE
+        });
+        let aired_differs = aired(row)
+            .zip(owner.aired)
+            .is_some_and(|(stored, owned)| stored.abs_diff(owned) > RUN_SLACK_SECS.unsigned_abs());
+        if !(title_differs || aired_differs) {
+            continue;
+        }
+        tracing::info!(
+            series_key = %cand.series_key,
+            path = %row.path,
+            season = s,
+            episode = e,
+            stored_title = %row.title,
+            stored_aired = aired(row),
+            owner_id,
+            owner_year,
+            owner_title = owner.title.as_deref(),
+            owner_aired = owner.aired,
+            "series identity repair: file joins the owner's show holding another show's episode"
+        );
+        joiners.push(row.id);
+    }
+    joiners
 }
 
 /// The show year a show's own episode files state (V893), when they agree on
@@ -3974,6 +4038,20 @@ mod tests {
                     episode,
                     title: Some(title.to_string()),
                     aired: None,
+                })
+                .collect();
+            self.lists.insert(id.to_string(), list);
+            self
+        }
+
+        fn with_dated_list(mut self, id: &str, episodes: &[(u32, u32, &str, i64)]) -> Self {
+            let list = episodes
+                .iter()
+                .map(|&(season, episode, title, aired)| EpisodeListing {
+                    season,
+                    episode,
+                    title: Some(title.to_string()),
+                    aired: Some(aired),
                 })
                 .collect();
             self.lists.insert(id.to_string(), list);
@@ -7444,6 +7522,116 @@ mod tests {
             version(&s, TV_MATCH_VERSION_KEY).await.as_deref(),
             Some("2")
         );
+    }
+
+    const SHOW_A: &str = "/tv/Show A";
+
+    /// A bare folder holding a 1991 show and its 2015 remake (B987):
+    /// S01E01 "Pilot" names both shows' pilots, so it does not move, but it
+    /// joins the 1991 owner while its stored episode may be the 2015 show's.
+    async fn remake_folder_with_pilot(s: &SqliteStore, pilot_aired: i64) {
+        put_titled_episode(s, 1, SHOW_A, (1, 1), "Pilot").await;
+        let mut pilot = s.get(1).await.unwrap();
+        pilot.metadata.premiere_date = Some(pilot_aired);
+        s.put(pilot).await.unwrap();
+        put_titled_episode(s, 3, SHOW_A, (1, 2), "The Old Second").await;
+        let mut modern = MediaItem {
+            id: 2,
+            path: format!("{SHOW_A}/Season 3/Show A (2015) - S03E01 - The New Start.mkv").into(),
+            title: "The New Start".into(),
+            kind: MediaKind::Episode,
+            ..MediaItem::default()
+        };
+        modern.series = Some(pharos_core::SeriesInfo {
+            series_name: "Show A".into(),
+            season_number: Some(3),
+            episode_number: Some(1),
+            series_folder: Some(SHOW_A.into()),
+            series_year: None,
+            series_key: None,
+        });
+        s.put(modern).await.unwrap();
+        s.upsert_series_metadata(SeriesMetadata {
+            series_key: SHOW_A.into(),
+            series_name: "Show A".into(),
+            match_provider: Some("tvdb".into()),
+            match_external_id: Some("900091".into()),
+            match_source: Some("search".into()),
+            premiere_date: Some(PILOT_1991),
+            metadata_refreshed_at: Some(NOW),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        set_version(s, TV_MATCH_VERSION_KEY, "1").await;
+    }
+
+    const PILOT_2015: i64 = 1_425_340_800; // 2015-03-03
+    const PILOT_1991: i64 = 670_550_400; // 1991-04-02
+
+    fn remake_tvdb_dated() -> FakeEnricher {
+        FakeEnricher::tvdb()
+            .with_search(vec![
+                ("900015", "Show A", Some(2015)),
+                ("900091", "Show A", Some(1991)),
+            ])
+            .with_dated_list(
+                "900015",
+                &[
+                    (1, 1, "Pilot", PILOT_2015),
+                    (1, 2, "The New Second", 1_425_945_600),
+                ],
+            )
+            .with_dated_list(
+                "900091",
+                &[
+                    (1, 1, "Pilot", PILOT_1991),
+                    (1, 2, "The Old Second", 671_155_200),
+                ],
+            )
+    }
+
+    /// B987 — a file that stays with a title split's owner, whose show is not
+    /// the year the folder's files state, holds the other show's episode: it
+    /// is marked with the moved files, and the dry run names it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_file_joining_the_owner_with_the_other_shows_episode_is_rebuilt() {
+        let (logs, _log) = log_capture();
+        let s = store().await;
+        remake_folder_with_pilot(&s, PILOT_2015).await;
+        let tvdb = remake_tvdb_dated();
+
+        gate(&s, &tvdb, &MetadataConfig::default()).await;
+        let text = logs.text();
+        let line = text
+            .lines()
+            .find(|l| l.contains("joins the owner's show holding another show's episode"))
+            .unwrap_or_else(|| panic!("no owner joiner line in {text}"));
+        for want in [
+            "S01E01 - Pilot.mkv",
+            "owner_id=\"900091\"",
+            "owner_year=1991",
+            &format!("stored_aired={PILOT_2015}"),
+            &format!("owner_aired={PILOT_1991}"),
+        ] {
+            assert!(line.contains(want), "{want} missing from {line}");
+        }
+
+        gate(&s, &tvdb, &apply_cfg()).await;
+        assert_eq!(pending_ids(&s).await, [1, 3]);
+    }
+
+    /// B987 — the same file already holding the owner's episode is left alone.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_file_joining_the_owner_with_its_episode_is_not_rebuilt() {
+        let (logs, _log) = log_capture();
+        let s = store().await;
+        remake_folder_with_pilot(&s, PILOT_1991).await;
+        let tvdb = remake_tvdb_dated();
+
+        gate(&s, &tvdb, &apply_cfg()).await;
+        assert_eq!(pending_ids(&s).await, [3]);
+        assert!(!logs.text().contains("joins the owner's show"));
     }
 
     /// A row the scanner moved to a key with no match row yet is not rebuilt:
