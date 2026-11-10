@@ -213,6 +213,14 @@ pub fn margin_label(px: u32) -> &'static str {
     }
 }
 
+/// Whether a save of the open place says anything new. Only a reader who
+/// has turned a page is somewhere the server may not have; an unmoved one
+/// would send the place they opened at under the time of opening, which
+/// could replace a newer place read on another device (spec 036 US4).
+pub fn save_is_news(turned: bool) -> bool {
+    turned
+}
+
 /// What the save gate compares: a place and how far through it is, so
 /// reaching the end of the book is sent even from a place already saved.
 pub fn save_key(locator: &str, fraction: f32) -> String {
@@ -772,6 +780,12 @@ mod tests {
             fraction: 0.5,
             read_at_ms,
         }
+    }
+
+    #[test]
+    fn only_a_reader_who_turned_a_page_has_a_place_to_save() {
+        assert!(!save_is_news(false));
+        assert!(save_is_news(true));
     }
 
     #[test]
