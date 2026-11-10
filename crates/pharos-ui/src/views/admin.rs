@@ -4136,15 +4136,15 @@ mod tests {
     #[test]
     fn the_duplicates_tab_lists_every_version_and_offers_no_delete() {
         let films = vec![DuplicateFilm {
-            title: "The Six Million Dollar Man: Wine, Women and War".into(),
-            production_year: Some(1973),
+            title: "Show S: The Long Night".into(),
+            production_year: Some(1971),
             provider_id: None,
             versions: vec![version("1", 1920, 1080), version("2", 720, 480)],
         }];
         let html =
             dioxus_ssr::render_element(rsx! { DuplicatesSection { films: Some(Ok(films)) } });
-        assert!(html.contains("Wine, Women and War"), "{html}");
-        assert!(html.contains("(1973)"), "{html}");
+        assert!(html.contains("The Long Night"), "{html}");
+        assert!(html.contains("(1971)"), "{html}");
         assert!(html.contains("Matched on title and year"), "{html}");
         assert!(
             html.contains("/m/1.mkv") && html.contains("/m/2.mkv"),
