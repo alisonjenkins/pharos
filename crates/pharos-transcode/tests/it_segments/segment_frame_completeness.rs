@@ -16,7 +16,7 @@
 //! 0**. That last line is why this reached production and stayed invisible:
 //! the exit-status gate, the minimum-byte floor, the cache and the ETag all
 //! read the segment as a success, and audio was still muxed in, so the file
-//! was not even empty. Measured on the source that surfaced it (Fringe S01E02,
+//! was not even empty. Measured on the source that surfaced it (Show AW S01E02,
 //! at the four timestamps reported as freezes): 9 of 43 sampled segments short
 //! of frames, two containing no video at all.
 //!

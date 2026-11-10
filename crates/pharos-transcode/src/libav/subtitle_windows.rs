@@ -4,7 +4,7 @@
 //! Image-subtitle burn-in (PGS/VOBSUB overlay, B40/B44) costs a full
 //! decode + composite + re-encode per HLS segment, which runs BELOW
 //! realtime for VP9 (~6-11 s per 6 s segment observed live). But a forced
-//! track (the Na'vi case) is SPARSE: most segments contain no subtitle
+//! track (the alien-language case) is SPARSE: most segments contain no subtitle
 //! event at all, so paying the overlay pipeline for them is pure waste.
 //! This scan reads the subtitle stream's PACKET timeline once (demux only,
 //! no decode — bounded by NFS read throughput, not CPU) so the segment
