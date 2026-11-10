@@ -103,12 +103,7 @@ pub(crate) fn classify<'a>(
     // may contain one (`3d-hsbs`), so split on the first.
     let alt = raw.split_once('-').and_then(|(item_part, edition)| {
         (pharos_jellyfin_api::dto::parse_item_id(item_part) == Some(item.id))
-            .then(|| {
-                item.probe
-                    .alternate_sources
-                    .iter()
-                    .find(|a| a.id == edition)
-            })
+            .then(|| item.probe.versions().find(|a| a.id == edition))
             .flatten()
     });
     match alt {
