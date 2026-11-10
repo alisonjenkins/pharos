@@ -56,6 +56,7 @@ fn serve(name: &str, decoder: Decoder, gate: Option<mpsc::Receiver<()>>) -> Serv
     let state = web::Data::new(AppState {
         engine: Arc::new(Engine::new(loader, decoder, None)),
         media_root: root.clone(),
+        metrics: None,
     });
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
@@ -116,6 +117,7 @@ fn healthz_and_unknown_routes() {
     assert_eq!(get(s.addr, "/healthz"), (200, json!({"ok": true})));
     assert_eq!(get(s.addr, "/nope"), (404, json!({"error": "not found"})));
     assert_eq!(get(s.addr, "/align").0, 404);
+    assert_eq!(get(s.addr, "/metrics").0, 200);
     let head = "POST /healthz HTTP/1.1\r\nHost: t\r\nContent-Length: 0";
     assert_eq!(raw(s.addr, head, b"").0, 404);
 }
