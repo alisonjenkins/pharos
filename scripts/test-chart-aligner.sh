@@ -64,6 +64,20 @@ else
   failed=1
 fi
 
+# The server is pointed at the shadow's Service only when there is one.
+server() {
+  helm template p "$chart" --show-only templates/deployment.yaml \
+    --set aligner.enabled=true --set aligner.image.tag=t "$@"
+}
+shadow_url='value: "http://p-pharos-aligner-shadow:'
+if grep -qF "$shadow_url" <<<"$(server --set aligner.shadow.enabled=true --set aligner.shadow.image.tag=s)" \
+  && ! grep -qF "PHAROS_LYRICS_ALIGNER_SHADOW_URL" <<<"$(server)"; then
+  echo "ok   the server asks the shadow only when it is enabled"
+else
+  echo "FAIL the server's shadow URL does not follow aligner.shadow.enabled" >&2
+  failed=1
+fi
+
 # The primary Service must not select the shadow's pods, or songs would
 # reach the shadow as answers.
 shadow="$(render --set aligner.shadow.enabled=true --set aligner.shadow.image.tag=s)"
