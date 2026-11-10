@@ -241,15 +241,15 @@ fn plays_in_place(mut stage: Signal<Stage>, to: &Route) -> bool {
     taken
 }
 
-/// How often, and how many times, to ask again for word times the aligner is
+/// How often to ask again for word times the aligner is
 /// still working out (B499). An ask is a cache read on the server, and every
 /// second between the answer being ready and the next ask is a second of
-/// guessed fill (B937). The asks cover 20 minutes: a song can wait behind
-/// another in the aligner's queue and then take up to the server's 10-minute
-/// timeout, and giving up sooner left the fill a guess for the whole song
-/// (B1163). Leaving the song stops the asks.
+/// guessed fill (B937). The asks go on for as long as the server says the
+/// words are pending: a song can wait behind others in the aligner's queue
+/// and then take minutes, and giving up after a fixed count left the fill a
+/// guess for the whole song (B1163). Leaving the song drops the task and
+/// stops the asks.
 const ALIGN_ASK_MS: u32 = 5_000;
-const ALIGN_ASKS: u32 = 240;
 
 const PREFERS_DARK: &str = "(prefers-color-scheme: dark)";
 const PREFERS_MORE_CONTRAST: &str = "(prefers-contrast: more)";
@@ -5050,7 +5050,7 @@ fn Player(
                 return;
             };
             spawn(async move {
-                for _ in 0..ALIGN_ASKS {
+                loop {
                     platform::sleep_ms(ALIGN_ASK_MS).await;
                     match api.lyrics(&call("watch", "lyrics"), id, true).await {
                         Ok(next) if next.words_pending => {}
@@ -5071,7 +5071,6 @@ fn Player(
                         }
                     }
                 }
-                platform::info("pharos: lyrics word times still pending, gave up");
             });
         }
     });
