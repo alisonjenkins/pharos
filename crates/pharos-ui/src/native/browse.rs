@@ -4851,6 +4851,46 @@ mod tests {
         }
     }
 
+    /// B1312/V1283: the library tabs' scroll box leaves room for the TV's
+    /// focus ring (3px outline 3px out, 8px glow), so it is not cut off.
+    /// Disarm check: drop the padding and the reach exceeds zero room.
+    #[test]
+    fn the_library_tabs_leave_room_for_the_tv_focus_ring() {
+        let sheet = include_str!("../../assets/pharos.css");
+        let rule = |selector: &str| {
+            let at = sheet
+                .find(&format!("{selector} {{"))
+                .unwrap_or_else(|| panic!("{selector}"));
+            let body = &sheet[at..];
+            body[..body.find('}').unwrap_or(body.len())].to_owned()
+        };
+        let px = |rule: &str, prop: &str| -> f64 {
+            rule.lines()
+                .find_map(|l| l.trim().strip_prefix(&format!("{prop}:")))
+                .and_then(|v| {
+                    v.trim()
+                        .trim_end_matches(';')
+                        .split_whitespace()
+                        .next()
+                        .map(str::to_owned)
+                })
+                .and_then(|v| v.trim_end_matches("px").parse().ok())
+                .unwrap_or(0.0)
+        };
+        let nav = rule(".pharos-library-nav");
+        let tv_ring = rule(":root[data-device=\"tv\"] :focus-visible:not(.pharos-poster, .pharos-player),\n:root[data-device=\"tv\"] .pharos-poster:focus-visible .pharos-poster-art");
+        let outline = 3.0 + px(&tv_ring, "outline-offset");
+        let glow = tv_ring
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("box-shadow: 0 0 0 "))
+            .and_then(|v| v.split("px").next())
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(f64::MAX);
+        let reach = outline.max(glow);
+        assert!(px(&nav, "padding") >= reach, "{nav}\nreach {reach}");
+        assert!(nav.contains("overflow-x: auto"), "{nav}");
+    }
+
     #[test]
     fn a_film_has_no_neighbours() {
         let fake = Fake::default();
