@@ -109,6 +109,18 @@ fn check_gpu(weights: &Path, adapter: &device::Adapter) -> Result<(), String> {
     std::panic::catch_unwind(run).unwrap_or_else(|_| Err("the GPU pass panicked".into()))
 }
 
+/// R20: compiled kernels persist under `PHAROS_ALIGNER_CACHE_DIR` when set.
+#[cfg(feature = "vulkan")]
+fn kernel_cache(dir: Option<&Path>) -> String {
+    match dir {
+        None => "off".into(),
+        Some(d) if pharos_align::forward::vulkan::use_kernel_cache(d) => d.display().to_string(),
+        Some(_) => "off_already_configured".into(),
+    }
+}
+
+/// R10 and R11: probe (unless forced to the CPU), choose, check the GPU,
+/// and log the outcome once.
 /// R10 and R11: probe (unless forced to the CPU), choose, check the GPU,
 /// and log the outcome once.
 fn choose_device(config: &Config) -> Result<device::Choice, String> {
@@ -121,6 +133,8 @@ fn choose_device(config: &Config) -> Result<device::Choice, String> {
     #[cfg(feature = "vulkan")]
     let choice = match &choice.device {
         device::Device::Vulkan(a) => {
+            let cache = kernel_cache(config.cache_dir.as_deref());
+            tracing::info!(kernel_cache = %cache, "GPU kernel cache");
             let checked = check_gpu(&config.weights, a);
             device::after_warmup(config.device, choice.clone(), checked)
                 .map_err(|e| e.to_string())?
