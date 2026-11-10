@@ -16,7 +16,7 @@ const HELD: u64 = 42;
 
 async fn library_with_held_row() -> (TempDir, std::path::PathBuf, Stores) {
     let td = TempDir::new().unwrap();
-    let epub = td.path().join("Dune.epub");
+    let epub = td.path().join("Book A.epub");
     write_epub(&epub);
     assert_ne!(HELD, stable_id(&epub));
     let stores = Stores::connect("sqlite::memory:").await.unwrap();

@@ -10,7 +10,7 @@
 //!
 //! The surprise worth knowing: with `PlayDefaultAudioTrack` on (Jellyfin's
 //! default), a track flagged `default` in the container BEATS the language
-//! preference. Aliens carries a Ukrainian AC-3 flagged default and an English
+//! preference. Film AW carries a Ukrainian AC-3 flagged default and an English
 //! DTS-HD MA that is not, so "prefer English" alone keeps playing Ukrainian —
 //! upstream's own test pins exactly this (`["eng"], preferDefaultTrack: true`
 //! selects the French default track). Turning that setting OFF is what makes
@@ -491,7 +491,7 @@ mod tests {
         }
     }
 
-    /// The Aliens case, which is why this exists: the container's only
+    /// The Film AW case, which is why this exists: the container's only
     /// default-flagged audio is a language the user does not speak. The
     /// preference alone does NOT rescue it — the user must also turn off
     /// "play default audio track regardless of language".

@@ -358,11 +358,11 @@ mod tests {
         ];
         let (films, shows) = arrange(
             &credits,
-            seen(vec![film(1, "Alien", 1979), film(2, "Aliens", 1986)]),
+            seen(vec![film(1, "Film AX", 1979), film(2, "Film AW", 1986)]),
         );
         assert!(shows.is_empty());
         let names: Vec<_> = films.iter().map(|f| f.item.title.as_str()).collect();
-        assert_eq!(names, ["Aliens", "Alien"]);
+        assert_eq!(names, ["Film AW", "Film AX"]);
         assert_eq!(films[1].character.as_deref(), Some("Ripley"));
         assert_eq!(films[0].character, None);
     }
@@ -432,7 +432,7 @@ mod tests {
             (1, credit(PersonKind::Actor, Some(" "))),
             (1, credit(PersonKind::Actor, Some("Ripley"))),
         ];
-        let (films, _) = arrange(&credits, seen(vec![film(1, "Alien", 1979)]));
+        let (films, _) = arrange(&credits, seen(vec![film(1, "Film AX", 1979)]));
         assert_eq!(films[0].character.as_deref(), Some("Ripley"));
     }
 

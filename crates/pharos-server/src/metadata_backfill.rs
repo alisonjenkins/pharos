@@ -4383,11 +4383,11 @@ mod tests {
 
         let local = MediaItem {
             id: 2,
-            path: "/media/Movies/Arrival (2016)/Arrival.2016.1080p.mkv".into(),
-            title: "Arrival".into(),
+            path: "/media/Movies/Film BC (2016)/Film BC.2016.1080p.mkv".into(),
+            title: "Film BC".into(),
             ..Default::default()
         };
-        assert_eq!(search_stem(&local), "Arrival.2016.1080p");
+        assert_eq!(search_stem(&local), "Film BC.2016.1080p");
     }
 
     use pharos_store_sqlx::sqlite::SqliteStore;
@@ -4949,7 +4949,7 @@ mod tests {
             &s,
             900_404,
             "Coldplay",
-            "A Rush Of Blood To The Head (Japan)",
+            "A Wave Of Static To The Ear (Japan)",
         )
         .await;
         // Stamped by a previous, worse query — same shape the shipped v1 wrote.
