@@ -763,18 +763,29 @@ mod tests {
             .collect()
     }
 
+    /// `/metrics` from a recorder of its own once `Aligner::start` has run
+    /// with `shadow_url`, never the process-global one, so tests sharing a
+    /// process cannot see each other's series. `start` registers on the
+    /// calling thread, which the local recorder covers.
+    fn rendered_after_start(shadow_url: Option<String>) -> String {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _aligner = metrics::with_local_recorder(&recorder, || {
+            Aligner::start(
+                "http://127.0.0.1:9".into(),
+                shadow_url,
+                PathBuf::from("/m"),
+                None,
+            )
+        });
+        handle.render()
+    }
+
     #[tokio::test]
     async fn every_shadow_series_is_rendered_at_zero_once_a_shadow_is_set() {
         use crate::services::lyrics::shadow::{Outcome, SHADOW_TOTAL};
 
-        crate::obs::init("info", None).unwrap();
-        let _aligner = Aligner::start(
-            "http://127.0.0.1:9".into(),
-            Some("http://127.0.0.1:9".into()),
-            PathBuf::from("/m"),
-            None,
-        );
-        let body = crate::obs::render();
+        let body = rendered_after_start(Some("http://127.0.0.1:9".into()));
         let series = shadow_series(&body);
         assert_eq!(
             series.len(),
@@ -795,9 +806,8 @@ mod tests {
 
     #[tokio::test]
     async fn no_shadow_series_is_rendered_without_a_shadow() {
-        crate::obs::init("info", None).unwrap();
-        let _aligner = Aligner::start("http://127.0.0.1:9".into(), None, PathBuf::from("/m"), None);
-        assert_eq!(shadow_series(&crate::obs::render()), Vec::<&str>::new());
+        let body = rendered_after_start(None);
+        assert_eq!(shadow_series(&body), Vec::<&str>::new());
     }
 
     #[tokio::test]
