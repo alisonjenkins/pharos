@@ -399,12 +399,12 @@ fn date_parsing_known_values() {
 #[tokio::test]
 async fn an_epoch_placeholder_air_date_is_no_date() {
     let dir = tempdir().unwrap();
-    let season = dir.path().join("One Piece/Season 10");
+    let season = dir.path().join("Show E/Season 10");
     std::fs::create_dir_all(&season).unwrap();
-    let media = season.join("One Piece - S10E01 - 196 - Emergency Announcement.mkv");
+    let media = season.join("Show E - S10E01 - 196 - The Old Second.mkv");
     std::fs::write(
-        season.join("One Piece - S10E01 - 196 - Emergency Announcement.nfo"),
-        "<episodedetails><title>Emergency Announcement</title>\
+        season.join("Show E - S10E01 - 196 - The Old Second.nfo"),
+        "<episodedetails><title>The Old Second</title>\
          <aired>1970-01-01</aired></episodedetails>",
     )
     .unwrap();
@@ -416,7 +416,7 @@ async fn an_epoch_placeholder_air_date_is_no_date() {
         series: None,
     };
     let r = NfoProvider::new().fetch(&req).await.unwrap();
-    assert_eq!(r.title.as_deref(), Some("Emergency Announcement"));
+    assert_eq!(r.title.as_deref(), Some("The Old Second"));
     assert_eq!(r.premiere_date, None);
     assert_eq!(r.production_year, None);
     assert_eq!(parse_date_unix("1970-01-01T00:00:00"), None);
@@ -941,22 +941,22 @@ fn show_nfo_evidence_reads_ids_and_year_of_this_show_only() {
     let dir = tempdir().unwrap();
     std::fs::write(
         dir.path().join("tvshow.nfo"),
-        r#"<tvshow><title>The Flash</title><year>2014</year>
-           <uniqueid type="tvdb">279121</uniqueid><uniqueid type="tmdb">60735</uniqueid></tvshow>"#,
+        r#"<tvshow><title>Show B</title><year>1996</year>
+           <uniqueid type="tvdb">900001</uniqueid><uniqueid type="tmdb">900002</uniqueid></tvshow>"#,
     )
     .unwrap();
     assert_eq!(
-        show_nfo_evidence(dir.path(), "The Flash", None),
+        show_nfo_evidence(dir.path(), "Show B", None),
         Some(ShowNfoEvidence {
-            tvdb: Some("279121".into()),
-            tmdb: Some("60735".into()),
-            year: Some(2014),
+            tvdb: Some("900001".into()),
+            tmdb: Some("900002".into()),
+            year: Some(1996),
         })
     );
     // B558 — an NFO naming another show is no evidence for this one.
     assert_eq!(show_nfo_evidence(dir.path(), "Arrow", None), None);
     assert_eq!(
-        show_nfo_evidence(&dir.path().join("missing"), "The Flash", None),
+        show_nfo_evidence(&dir.path().join("missing"), "Show B", None),
         None
     );
 }

@@ -3542,7 +3542,7 @@ fn song_copy_key(path: &Path) -> Option<CopyBucket> {
 
 /// A show's or film's theme song (`theme.mp3`, or a file under
 /// `theme-music/`): it belongs to the title folder it sits in, and two
-/// shows of one name (`The Flash`, `The Flash (2014)`) are not copies.
+/// shows of one name (`Show B`, `Show B (1996)`) are not copies.
 fn is_theme_sidecar(path: &Path) -> bool {
     let named = |p: &Path, n: &str| {
         p.file_stem()
@@ -3569,8 +3569,8 @@ fn episode_copy_key(path: &Path) -> Option<EpisodeSpan> {
     let last = episode_span_end(name)
         .filter(|l| *l > first)
         .unwrap_or(first);
-    // Two shows of one name can share a folder (`Cosmos (1980) - S01E01`,
-    // `Cosmos (2014) - S01E01`): a year the name states before its episode
+    // Two shows of one name can share a folder (`Show A (1961) - S01E01`,
+    // `Show A (1996) - S01E01`): a year the name states before its episode
     // number keeps them apart.
     let show = match name_show_year(name) {
         Some(year) => format!("{}\u{1f}{year}", info.series_folder?),
@@ -3589,7 +3589,7 @@ static EPISODE_TOKEN_RE: std::sync::LazyLock<Option<regex::Regex>> =
     });
 
 /// The year an episode's file name states for its show, before the episode
-/// number (`Battlestar Galactica (2004) - S01E01`); a year after it belongs to
+/// number (`Show C (1988) - S01E01`); a year after it belongs to
 /// the episode's title.
 fn name_show_year(name: &str) -> Option<u32> {
     let token = EPISODE_TOKEN_RE.as_ref()?.find(name)?;
@@ -3602,8 +3602,8 @@ fn name_show_year(name: &str) -> Option<u32> {
 }
 
 /// Spec 033 (V890) — the show name and year an episode's file name states
-/// before its episode number (`Battlestar Galactica (2003) - S01E01` gives
-/// `("Battlestar Galactica", 2003)`). The name is what precedes the year, so a
+/// before its episode number (`Show C (1987) - S01E01` gives
+/// `("Show C", 1987)`). The name is what precedes the year, so a
 /// caller can check that the year is this show's.
 pub(crate) fn name_show_name_and_year(name: &str) -> Option<(&str, u32)> {
     let token = EPISODE_TOKEN_RE.as_ref()?.find(name)?;
@@ -4259,7 +4259,7 @@ pub fn parse_series_info(path: &Path) -> Option<SeriesInfo> {
         .and_then(parse_folder_year)
         .or(release_year);
     // When a year was parsed, strip the trailing `(YYYY)` from the display
-    // name so the title stays clean ("Cosmos", not "Cosmos (1980)") while
+    // name so the title stays clean ("Show A", not "Show A (1961)") while
     // identity stays keyed on the full folder path.
     if series_year.is_some() {
         series_name = strip_trailing_year(&series_name).to_string();
@@ -4343,7 +4343,7 @@ fn strip_trailing_year(name: &str) -> &str {
 
 /// LIB-C11 — extract the release year from a `Show Name (YYYY)` folder
 /// convention. Matches a 4-digit year in trailing parentheses
-/// (`Cosmos (1980)` → `1980`). Returns `None` when the folder carries no
+/// (`Show A (1961)` → `1961`). Returns `None` when the folder carries no
 /// such marker. Restricted to a plausible 1800–2999 window so a
 /// parenthesised non-year (e.g. `(Uncut)`, `(1)`) doesn't masquerade.
 pub(crate) fn parse_folder_year(folder_name: &str) -> Option<u32> {
@@ -4743,23 +4743,23 @@ mod tests {
     #[tokio::test]
     async fn reset_to_local_metadata_keeps_the_files_and_drops_the_rest() {
         let dir = tempfile::tempdir().unwrap();
-        let show = dir.path().join("Cosmos");
+        let show = dir.path().join("Show A");
         std::fs::create_dir_all(&show).unwrap();
-        let with_nfo = show.join("Cosmos - S01E01.mkv");
+        let with_nfo = show.join("Show A - S01E01.mkv");
         std::fs::write(&with_nfo, b"").unwrap();
         std::fs::write(
-            show.join("Cosmos - S01E01.nfo"),
-            "<episodedetails><title>The Shores of the Cosmic Ocean</title>\
-             <showtitle>Cosmos</showtitle><plot>Sagan.</plot></episodedetails>",
+            show.join("Show A - S01E01.nfo"),
+            "<episodedetails><title>The Old Second</title>\
+             <showtitle>Show A</showtitle><plot>Overview.</plot></episodedetails>",
         )
         .unwrap();
         let stale = |path: &std::path::Path| {
             let mut item = MediaItem {
                 path: path.to_path_buf(),
-                title: "Standing Up in the Milky Way".into(),
+                title: "The New Start in the Milky Way".into(),
                 kind: MediaKind::Episode,
                 series: Some(SeriesInfo {
-                    series_name: "Cosmos".into(),
+                    series_name: "Show A".into(),
                     season_number: Some(1),
                     episode_number: Some(1),
                     series_folder: Some(show.to_string_lossy().into_owned()),
@@ -4776,8 +4776,8 @@ mod tests {
         };
         let mut item = stale(&with_nfo);
         reset_to_local_metadata(&mut item).await;
-        assert_eq!(item.title, "The Shores of the Cosmic Ocean");
-        assert_eq!(item.metadata.overview.as_deref(), Some("Sagan."));
+        assert_eq!(item.title, "The Old Second");
+        assert_eq!(item.metadata.overview.as_deref(), Some("Overview."));
         assert_eq!(item.metadata.premiere_date, None);
         assert_eq!(item.metadata.community_rating, None);
         assert_eq!(
@@ -4785,11 +4785,11 @@ mod tests {
             pharos_core::ProviderIds::default()
         );
 
-        let bare = show.join("Cosmos - S01E02 - One Voice in the Cosmic Fugue.mkv");
+        let bare = show.join("Show A - S01E02 - The Old Second.mkv");
         std::fs::write(&bare, b"").unwrap();
         let mut item = stale(&bare);
         reset_to_local_metadata(&mut item).await;
-        assert_ne!(item.title, "Standing Up in the Milky Way");
+        assert_ne!(item.title, "The New Start in the Milky Way");
         assert_eq!(item.metadata.overview, None);
         assert_eq!(item.metadata.provider_ids.tvdb, None);
     }
@@ -6625,10 +6625,10 @@ mod tests {
             })
     }
 
-    async fn write_flash(td: &Path) {
-        write_file(td, "The Flash/Season 1/The Flash (1990) - S01E01.mkv", b"a").await;
-        write_file(td, "The Flash/Season 1/The Flash (2014) - S01E01.mkv", b"b").await;
-        write_file(td, "The Flash/Season 1/The Flash (2014) - S01E02.mkv", b"c").await;
+    async fn write_show_b(td: &Path) {
+        write_file(td, "Show B/Season 1/Show B (1971) - S01E01.mkv", b"a").await;
+        write_file(td, "Show B/Season 1/Show B (1996) - S01E01.mkv", b"b").await;
+        write_file(td, "Show B/Season 1/Show B (1996) - S01E02.mkv", b"c").await;
     }
 
     fn keys_of(store: &MemStore) -> Vec<(String, Option<String>, Option<u32>)> {
@@ -6663,7 +6663,7 @@ mod tests {
         let snapshotter = pharos_test_metrics::snapshotter(&recorder);
         let _guard = metrics::set_default_local_recorder(&recorder);
         let td = TempDir::new().unwrap();
-        write_flash(td.path()).await;
+        write_show_b(td.path()).await;
         let store = MemStore::default();
         let scanner =
             FsScanner::new(FakeProber::default()).with_series_identity_repair(RepairMode::Apply);
@@ -6673,21 +6673,21 @@ mod tests {
             keys_of(&store),
             vec![
                 (
-                    "The Flash (1990) - S01E01.mkv".into(),
-                    Some("1990".into()),
-                    Some(1990)
+                    "Show B (1971) - S01E01.mkv".into(),
+                    Some("1971".into()),
+                    Some(1971)
                 ),
-                ("The Flash (2014) - S01E01.mkv".into(), None, Some(2014)),
-                ("The Flash (2014) - S01E02.mkv".into(), None, Some(2014)),
+                ("Show B (1996) - S01E01.mkv".into(), None, Some(1996)),
+                ("Show B (1996) - S01E02.mkv".into(), None, Some(1996)),
             ]
         );
         let owners = store.overrides.lock().unwrap().clone();
         assert_eq!(owners.len(), 1);
-        assert_eq!(owners[0].target_year, Some(2014));
+        assert_eq!(owners[0].target_year, Some(1996));
         // V940: only the row whose key moved is marked for a rebuild.
         let marked = store.reconcile_marked.lock().unwrap().clone();
         assert_eq!(marked.len(), 1, "{marked:?}");
-        assert!(marked[0].ends_with("The Flash (1990) - S01E01.mkv"));
+        assert!(marked[0].ends_with("Show B (1971) - S01E01.mkv"));
         assert_eq!(
             series_metric(
                 &snapshotter,
@@ -6741,14 +6741,9 @@ mod tests {
             let snapshotter = pharos_test_metrics::snapshotter(&recorder);
             let _guard = metrics::set_default_local_recorder(&recorder);
             let td = TempDir::new().unwrap();
-            write_flash(td.path()).await;
-            write_file(td.path(), "The Flash/Season 1/The Flash - S01E03.mkv", b"d").await;
-            write_file(
-                td.path(),
-                "The Flash/Season 01/The Flash - S01E03.avi",
-                b"e",
-            )
-            .await;
+            write_show_b(td.path()).await;
+            write_file(td.path(), "Show B/Season 1/Show B - S01E03.mkv", b"d").await;
+            write_file(td.path(), "Show B/Season 01/Show B - S01E03.avi", b"e").await;
             let store = MemStore::default();
             let scanner = FsScanner::new(FakeProber::default()).with_series_identity_repair(mode);
             scanner.scan_into(td.path(), &store).await.unwrap();
@@ -6786,13 +6781,13 @@ mod tests {
         let td = TempDir::new().unwrap();
         write_file(
             td.path(),
-            "Forever (US)/Season 1/Forever (2014) - S01E01.mkv",
+            "Forever (US)/Season 1/Forever (1996) - S01E01.mkv",
             b"a",
         )
         .await;
         write_file(
             td.path(),
-            "Forever (US)/Season 1/Forever (2014) - S01E02.mkv",
+            "Forever (US)/Season 1/Forever (1996) - S01E02.mkv",
             b"b",
         )
         .await;
@@ -6814,7 +6809,7 @@ mod tests {
             .unwrap();
 
         let years: Vec<_> = keys_of(&store).into_iter().map(|(_, _, y)| y).collect();
-        assert_eq!(years, [Some(2014), Some(2014)]);
+        assert_eq!(years, [Some(1996), Some(1996)]);
         assert!(store.reconcile_marked.lock().unwrap().is_empty());
     }
 
@@ -6824,11 +6819,11 @@ mod tests {
     #[tokio::test]
     async fn a_dry_run_scan_writes_an_admins_move_but_not_its_own_split() {
         let td = TempDir::new().unwrap();
-        write_flash(td.path()).await;
-        let folder = td.path().join("The Flash").to_string_lossy().into_owned();
+        write_show_b(td.path()).await;
+        let folder = td.path().join("Show B").to_string_lossy().into_owned();
         let moved = td
             .path()
-            .join("The Flash/Season 1/The Flash (2014) - S01E02.mkv")
+            .join("Show B/Season 1/Show B (1996) - S01E02.mkv")
             .to_string_lossy()
             .into_owned();
         let store = MemStore::default();
@@ -6842,7 +6837,7 @@ mod tests {
                 path: Some(moved.clone()),
                 target_key: "/tv/Elsewhere".into(),
                 target_name: Some("Elsewhere".into()),
-                target_year: Some(2014),
+                target_year: Some(1996),
                 source: pharos_core::OverrideSource::Admin,
                 created_by: Some("ali".into()),
                 created_at: 1,
@@ -6863,10 +6858,10 @@ mod tests {
                 .map(|s| (s.series_key, s.series_year))
         };
         assert_eq!(
-            key_of("(2014) - S01E02.mkv"),
-            Some((Some("/tv/Elsewhere".into()), Some(2014)))
+            key_of("(1996) - S01E02.mkv"),
+            Some((Some("/tv/Elsewhere".into()), Some(1996)))
         );
-        for unsplit in ["(1990) - S01E01.mkv", "(2014) - S01E01.mkv"] {
+        for unsplit in ["(1971) - S01E01.mkv", "(1996) - S01E01.mkv"] {
             assert_eq!(key_of(unsplit), Some((None, None)), "{unsplit}");
         }
         assert_eq!(*store.reconcile_marked.lock().unwrap(), [moved]);
@@ -6885,16 +6880,16 @@ mod tests {
     async fn a_hand_fix_reconciles_only_its_own_folder() {
         use crate::series_split::{self as split, RepairMode};
         let td = TempDir::new().unwrap();
-        write_flash(td.path()).await;
+        write_show_b(td.path()).await;
         write_file(
             td.path(),
-            "The Flash 2/Season 1/The Flash 2 (2014) - S01E01.mkv",
+            "Show B 2/Season 1/Show B 2 (1996) - S01E01.mkv",
             b"x",
         )
         .await;
         write_file(
             td.path(),
-            "The Flash 2/Season 1/The Flash 2 (1990) - S01E01.mkv",
+            "Show B 2/Season 1/Show B 2 (1971) - S01E01.mkv",
             b"y",
         )
         .await;
@@ -6903,10 +6898,10 @@ mod tests {
             .scan_into(td.path(), &store)
             .await
             .unwrap();
-        let folder = td.path().join("The Flash").to_string_lossy().into_owned();
+        let folder = td.path().join("Show B").to_string_lossy().into_owned();
         let moved = td
             .path()
-            .join("The Flash/Season 1/The Flash (2014) - S01E02.mkv")
+            .join("Show B/Season 1/Show B (1996) - S01E02.mkv")
             .to_string_lossy()
             .into_owned();
         store
@@ -6919,7 +6914,7 @@ mod tests {
                 path: Some(moved.clone()),
                 target_key: "/tv/Elsewhere".into(),
                 target_name: None,
-                target_year: Some(2014),
+                target_year: Some(1996),
                 source: pharos_core::OverrideSource::Admin,
                 created_by: Some("ali".into()),
                 created_at: 1,
@@ -6944,7 +6939,7 @@ mod tests {
         assert_eq!(*store.reconcile_marked.lock().unwrap(), [moved]);
         assert!(keys_of(&store)
             .iter()
-            .filter(|(name, ..)| name.starts_with("The Flash 2 "))
+            .filter(|(name, ..)| name.starts_with("Show B 2 "))
             .all(|(_, k, y)| k.is_none() && y.is_none()));
     }
 
@@ -6956,7 +6951,7 @@ mod tests {
         let snapshotter = pharos_test_metrics::snapshotter(&recorder);
         let _guard = metrics::set_default_local_recorder(&recorder);
         let td = TempDir::new().unwrap();
-        write_flash(td.path()).await;
+        write_show_b(td.path()).await;
         let store = MemStore::default();
         FsScanner::new(FakeProber::default())
             .scan_into(td.path(), &store)
@@ -8458,19 +8453,19 @@ mod tests {
     // wire ids diverge and their episodes don't interleave.
     #[test]
     fn same_name_shows_get_distinct_folders_and_years() {
-        let p80 = Path::new("/tv/Cosmos (1980)/Season 01/S01E01.mkv");
-        let p14 = Path::new("/tv/Cosmos (2014)/Season 01/S01E01.mkv");
-        let i80 = parse_series_info(p80).expect("series info 1980");
-        let i14 = parse_series_info(p14).expect("series info 2014");
+        let p80 = Path::new("/tv/Show A (1961)/Season 01/S01E01.mkv");
+        let p14 = Path::new("/tv/Show A (1996)/Season 01/S01E01.mkv");
+        let i80 = parse_series_info(p80).expect("series info 1961");
+        let i14 = parse_series_info(p14).expect("series info 1996");
 
         // Display name is identical (the bare show name)…
-        assert_eq!(i80.series_name, "Cosmos");
-        assert_eq!(i14.series_name, "Cosmos");
+        assert_eq!(i80.series_name, "Show A");
+        assert_eq!(i14.series_name, "Show A");
         // …but the folder identity + parsed year differ.
-        assert_eq!(i80.series_folder.as_deref(), Some("/tv/Cosmos (1980)"));
-        assert_eq!(i14.series_folder.as_deref(), Some("/tv/Cosmos (2014)"));
-        assert_eq!(i80.series_year, Some(1980));
-        assert_eq!(i14.series_year, Some(2014));
+        assert_eq!(i80.series_folder.as_deref(), Some("/tv/Show A (1961)"));
+        assert_eq!(i14.series_folder.as_deref(), Some("/tv/Show A (1996)"));
+        assert_eq!(i80.series_year, Some(1961));
+        assert_eq!(i14.series_year, Some(1996));
         assert_ne!(i80.series_key(), i14.series_key());
     }
 
@@ -8488,7 +8483,7 @@ mod tests {
         // Parenthesised non-year doesn't masquerade as a year.
         assert_eq!(parse_folder_year("Show (Uncut)"), None);
         assert_eq!(parse_folder_year("Show (1)"), None);
-        assert_eq!(parse_folder_year("Cosmos (1980)"), Some(1980));
+        assert_eq!(parse_folder_year("Show A (1961)"), Some(1961));
         assert_eq!(parse_folder_year("The Office (US) (2005)"), Some(2005));
     }
 
@@ -8888,8 +8883,8 @@ mod tests {
         let groups = group_editions(vec![
             PathBuf::from("/tv/Abbott/Season 5/Abbott - S05E19 - Trip WEBDL-1080p.mkv"),
             PathBuf::from("/tv/Abbott/Season 5/Abbott - S05E19 - Trip HDTV-1080p Proper.mkv"),
-            PathBuf::from("/tv/BSG/Season 01/BSG - S01E01 - 33.avi"),
-            PathBuf::from("/tv/BSG/Season 01/BSG - S01E01 - 33.mkv"),
+            PathBuf::from("/tv/Show C/Season 01/Show C - S01E01 - 33.avi"),
+            PathBuf::from("/tv/Show C/Season 01/Show C - S01E01 - 33.mkv"),
         ]);
         assert_eq!(groups.len(), 2);
         let abbott = groups
@@ -8900,13 +8895,16 @@ mod tests {
             .0
             .ends_with("Abbott - S05E19 - Trip HDTV-1080p Proper.mkv"));
         assert_eq!(names(&abbott.1), ["WEBDL-1080p"]);
-        let bsg = groups.iter().find(|g| g.0.starts_with("/tv/BSG")).unwrap();
+        let show_c = groups
+            .iter()
+            .find(|g| g.0.starts_with("/tv/Show C"))
+            .unwrap();
         assert_eq!(
-            bsg.0.extension().unwrap(),
+            show_c.0.extension().unwrap(),
             "mkv",
             "mkv outranks avi as primary"
         );
-        assert_eq!(names(&bsg.1), ["AVI"]);
+        assert_eq!(names(&show_c.1), ["AVI"]);
     }
 
     #[test]
@@ -9153,13 +9151,13 @@ mod tests {
     #[test]
     fn a_film_groups_only_with_its_own_title_and_year() {
         let groups = group_editions(vec![
-            PathBuf::from("/films/Dune (1984)/Dune (1984).mkv"),
-            PathBuf::from("/films/Dune (2021)/Dune (2021).mkv"),
+            PathBuf::from("/films/Film A (1971)/Film A (1971).mkv"),
+            PathBuf::from("/films/Film A (1996)/Film A (1996).mkv"),
             PathBuf::from("/films/Heat (1995)/Heat (1995).mkv"),
             PathBuf::from("/films/Heat (1995)/trailer.mkv"),
             PathBuf::from("/films/Other/Heat (1995) - Director's Cut.mkv"),
             PathBuf::from("/films/Untitled/Heat.mkv"),
-            PathBuf::from("/films/Untitled/Dune.mkv"),
+            PathBuf::from("/films/Untitled/Film A.mkv"),
             PathBuf::from("/music/Heat (1995)/Heat (1995).flac"),
         ]);
         assert_eq!(groups.len(), 6, "{groups:?}");
@@ -9594,26 +9592,26 @@ mod tests {
     #[test]
     fn same_named_shows_of_different_years_are_not_copies() {
         let groups = group_editions(vec![
-            PathBuf::from("/tv/Cosmos/Season 1/Cosmos (1980) - S01E01 - The Shores.mkv"),
-            PathBuf::from("/tv/Cosmos/Season 1/Cosmos (2014) - S01E01 - Standing Up.mkv"),
-            PathBuf::from("/tv/Cosmos/Season 01/Cosmos (2014) - S01E01 - Standing Up.avi"),
+            PathBuf::from("/tv/Show A/Season 1/Show A (1961) - S01E01 - The Old Shore.mkv"),
+            PathBuf::from("/tv/Show A/Season 1/Show A (1996) - S01E01 - The New Start.mkv"),
+            PathBuf::from("/tv/Show A/Season 01/Show A (1996) - S01E01 - The New Start.avi"),
             PathBuf::from("/tv/Foo/Season 1/Foo - S01E02 - 1969 HDTV-720p.mkv"),
             PathBuf::from("/tv/Foo/Season 1/Foo - S01E02 - 1969 WEBDL-1080p.mkv"),
         ]);
         assert_eq!(groups.len(), 3, "{groups:?}");
         assert_eq!(name_show_year("Foo - S01E02 - 1969.mkv"), None);
-        assert_eq!(name_show_year("BSG.2004.S01E01.mkv"), Some(2004));
+        assert_eq!(name_show_year("Show.C.1988.S01E01.mkv"), Some(1988));
     }
 
     /// A theme song belongs to its title folder: two shows of one name are
-    /// not copies of each other (`The Flash`, `The Flash (2014)`).
+    /// not copies of each other (`Show B`, `Show B (1996)`).
     #[test]
     fn a_theme_song_is_never_a_copy() {
         let groups = group_editions(vec![
-            PathBuf::from("/tv/The Flash/theme.mp3"),
-            PathBuf::from("/tv/The Flash (2014)/theme.mp3"),
-            PathBuf::from("/tv/Cosmos/theme-music/Main Title.mp3"),
-            PathBuf::from("/tv/Cosmos (2014)/theme-music/Main Title.mp3"),
+            PathBuf::from("/tv/Show B/theme.mp3"),
+            PathBuf::from("/tv/Show B (1996)/theme.mp3"),
+            PathBuf::from("/tv/Show A/theme-music/Main Title.mp3"),
+            PathBuf::from("/tv/Show A (1996)/theme-music/Main Title.mp3"),
         ]);
         assert_eq!(groups.len(), 4, "{groups:?}");
         assert!(groups.iter().all(|(_, alts)| alts.is_empty()));
@@ -9841,23 +9839,23 @@ mod tests {
         (out, refused)
     }
 
-    /// The Flash folder holding both shows, and two unyeared copies of one
+    /// Show B folder holding both shows, and two unyeared copies of one
     /// episode number.
-    fn flash_with_copies(titles: [&str; 2]) -> Vec<PathBuf> {
+    fn show_b_with_copies(titles: [&str; 2]) -> Vec<PathBuf> {
         let mut paths: Vec<PathBuf> = [
-            "/tv/The Flash/Season 1/The Flash (1990) - S01E01.mkv",
-            "/tv/The Flash/Season 3/The Flash (2014) - S03E01.mkv",
-            "/tv/The Flash/Season 3/The Flash (2014) - S03E02.mkv",
+            "/tv/Show B/Season 1/Show B (1971) - S01E01.mkv",
+            "/tv/Show B/Season 3/Show B (1996) - S03E01.mkv",
+            "/tv/Show B/Season 3/Show B (1996) - S03E02.mkv",
         ]
         .iter()
         .map(PathBuf::from)
         .collect();
         paths.push(PathBuf::from(format!(
-            "/tv/The Flash/Season 1/The Flash - S01E02{}.mkv",
+            "/tv/Show B/Season 1/Show B - S01E02{}.mkv",
             titles[0]
         )));
         paths.push(PathBuf::from(format!(
-            "/tv/The Flash/Season 01/The Flash - S01E02{}.avi",
+            "/tv/Show B/Season 01/Show B - S01E02{}.avi",
             titles[1]
         )));
         paths
@@ -9884,7 +9882,7 @@ mod tests {
     /// never folds two copies; agreeing episode titles do.
     #[test]
     fn in_a_split_folder_numbers_alone_never_fold_copies() {
-        let paths = flash_with_copies(["", ""]);
+        let paths = show_b_with_copies(["", ""]);
         let (out, refused) = guarded_groups(&paths, &guard_for(&paths, vec![], &[]));
         assert_eq!(out.len(), 5, "{out:?}");
         assert_eq!(refused, 1);
@@ -9896,7 +9894,7 @@ mod tests {
         let (out, refused) = guarded_groups(&paths, &FoldGuard::default());
         assert_eq!((out.len(), refused), (4, 0));
 
-        let titled = flash_with_copies([" - Out of Time", " - Out of Time"]);
+        let titled = show_b_with_copies([" - The Third Way", " - The Third Way"]);
         let (out, refused) = guarded_groups(&titled, &guard_for(&titled, vec![], &[]));
         assert_eq!((out.len(), refused), (4, 0), "{out:?}");
     }
@@ -9906,8 +9904,8 @@ mod tests {
     #[test]
     fn a_flagged_shows_copies_fold_only_on_agreeing_titles() {
         let bare = [
-            PathBuf::from("/tv/Cosmos/Season 1/Cosmos - S01E01.mkv"),
-            PathBuf::from("/tv/Cosmos/Season 01/Cosmos - S01E01.avi"),
+            PathBuf::from("/tv/Show A/Season 1/Show A - S01E01.mkv"),
+            PathBuf::from("/tv/Show A/Season 01/Show A - S01E01.avi"),
         ];
         let folder = parse_series_info(&bare[0]).unwrap().series_folder.unwrap();
         let (out, refused) = guarded_groups(&bare, &guard_for(&bare, vec![], &[&folder]));
@@ -9916,12 +9914,8 @@ mod tests {
         assert_eq!((out.len(), refused), (1, 0));
 
         let titled = [
-            PathBuf::from(
-                "/tv/Cosmos/Season 1/Cosmos - S01E01 - The Shores of the Cosmic Ocean.mkv",
-            ),
-            PathBuf::from(
-                "/tv/Cosmos/Season 01/Cosmos - S01E01 - The Shores of the Cosmic Ocean.avi",
-            ),
+            PathBuf::from("/tv/Show A/Season 1/Show A - S01E01 - The Old Second.mkv"),
+            PathBuf::from("/tv/Show A/Season 01/Show A - S01E01 - The Old Second.avi"),
         ];
         let (out, refused) = guarded_groups(&titled, &guard_for(&titled, vec![], &[&folder]));
         assert_eq!((out.len(), refused), (1, 0));
@@ -10819,10 +10813,10 @@ mod tests {
     async fn a_video_under_a_show_folder_is_an_episode_of_that_show() {
         let td = TempDir::new().unwrap();
         let root = td.path();
-        write_file(root, "TV/Dragon Ball/tvshow.nfo", b"<tvshow/>").await;
+        write_file(root, "TV/Show D/tvshow.nfo", b"<tvshow/>").await;
         touch(
             root,
-            "TV/Dragon Ball/[a-s]_dragon_ball_-_063_-_the_return_of_goku__rs2_[1AE8566B].mkv",
+            "TV/Show D/[a-s]_show_d_-_063_-_the_old_second__rs2_[1AE8566B].mkv",
         )
         .await;
         write_file(root, "TV/SAO II [Season 2] [480p]/tvshow.nfo", b"<tvshow/>").await;
@@ -10869,7 +10863,7 @@ mod tests {
             (MediaKind::Episode, Some(name.to_string()), season, episode)
         };
 
-        assert_eq!(shape("_063_"), episode("Dragon Ball", Some(1), Some(63)));
+        assert_eq!(shape("_063_"), episode("Show D", Some(1), Some(63)));
         assert_eq!(
             shape("SAO II - 14 "),
             episode("SAO II [Season 2] [480p]", Some(1), Some(14))
@@ -10950,7 +10944,7 @@ mod tests {
         let _guard = metrics::set_default_local_recorder(&recorder);
 
         let td = TempDir::new().unwrap();
-        let file = "TV/Dragon Ball/[a-s]_dragon_ball_-_063_-_the_return_of_goku.mkv";
+        let file = "TV/Show D/[a-s]_show_d_-_063_-_the_old_second.mkv";
         touch(td.path(), file).await;
         touch(td.path(), "Movies/Heat (1995)/Heat (1995).mkv").await;
         let store = MemStore::default();
@@ -10963,7 +10957,7 @@ mod tests {
             .await
             .unwrap();
 
-        touch(td.path(), "TV/Dragon Ball/tvshow.nfo").await;
+        touch(td.path(), "TV/Show D/tvshow.nfo").await;
         let out = s.scan_into(td.path(), &store).await.unwrap();
 
         let item = store.get(id).await.unwrap();
@@ -11004,7 +10998,7 @@ mod tests {
     #[tokio::test]
     async fn a_watched_film_turned_episode_loses_its_film_match() {
         let td = TempDir::new().unwrap();
-        let file = "TV/Dragon Ball/[a-s]_dragon_ball_-_063_-_the_return_of_goku.mkv";
+        let file = "TV/Show D/[a-s]_show_d_-_063_-_the_old_second.mkv";
         touch(td.path(), file).await;
         let store = MemStore::default();
         let s = FsScanner::new(FakeProber::default());
@@ -11015,7 +11009,7 @@ mod tests {
             .await
             .unwrap();
 
-        touch(td.path(), "TV/Dragon Ball/tvshow.nfo").await;
+        touch(td.path(), "TV/Show D/tvshow.nfo").await;
         forget_show_nfos();
         // A modify event: the file's signature changes, so it is re-probed.
         tokio::fs::write(td.path().join(file), b"remuxed")
@@ -11101,7 +11095,7 @@ mod tests {
 
     #[test]
     fn a_marker_that_reshapes_indexed_rows_is_told_apart() {
-        for marker in ["/lib/To Sort/.ignore", "/lib/TV/Dragon Ball/tvshow.nfo"] {
+        for marker in ["/lib/To Sort/.ignore", "/lib/TV/Show D/tvshow.nfo"] {
             assert!(reshapes_indexed_rows(Path::new(marker)), "{marker}");
         }
         for other in [
