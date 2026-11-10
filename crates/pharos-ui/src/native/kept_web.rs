@@ -128,7 +128,22 @@ pub async fn enforce(trigger: &str) {
         return;
     };
     let settings = settings();
-    for gone in plan_eviction(&store.books, &settings, now_ms()) {
+    let plan = plan_eviction(&store.books, &settings, now_ms());
+    if !plan.relabel.is_empty() {
+        // Read again: the record is the page's to write, with no wait between.
+        let mut store = read().unwrap_or(store);
+        for (id, reason) in &plan.relabel {
+            if let Some(book) = store.books.iter_mut().find(|b| b.id == *id) {
+                book.reason = *reason;
+                platform::info(&format!(
+                    "pharos: kept relabel item={id} reason={} trigger={trigger}",
+                    reason.word()
+                ));
+            }
+        }
+        write(&store);
+    }
+    for gone in plan.evict {
         match remove(&gone.id).await {
             Ok(()) if gone.why == Why::Expired => platform::info(&format!(
                 "pharos: kept expire item={} bytes={} trigger={trigger}",
