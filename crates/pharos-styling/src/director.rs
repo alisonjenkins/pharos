@@ -22,6 +22,40 @@ pub struct Direction {
     /// The dialogue loudness the rules measured against (lines outside an
     /// intro or outro), for the per-item log line.
     pub loudness: Loudness,
+    /// Lines per [`BottomText`] verdict; verdicts with no line are absent.
+    pub bottom_text: BTreeMap<BottomText, usize>,
+}
+
+/// What burned-in bottom text did to a line's placement (B1207).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum BottomText {
+    /// No keyframe was checked for the line.
+    Unchecked,
+    /// The picture under the line has no text at the bottom.
+    Clear,
+    /// Text at the bottom, so the line was lifted to the top.
+    Lifted,
+    /// Text at the bottom, but the line is typeset or already placed.
+    Kept,
+}
+
+impl BottomText {
+    pub const ALL: [BottomText; 4] = [
+        BottomText::Unchecked,
+        BottomText::Clear,
+        BottomText::Lifted,
+        BottomText::Kept,
+    ];
+
+    /// The metric label; a dashboard contract.
+    pub fn label(self) -> &'static str {
+        match self {
+            BottomText::Unchecked => "unchecked",
+            BottomText::Clear => "clear",
+            BottomText::Lifted => "lifted",
+            BottomText::Kept => "kept",
+        }
+    }
 }
 
 /// A class of lines' loudness: its median, its spread, and the factor the
@@ -154,6 +188,7 @@ pub fn direct(lines: &[SourceLine], signals: &TrackSignals, segments: &[Segment]
 
     let mut out = Vec::with_capacity(lines.len());
     let mut counts: BTreeMap<Intent, usize> = BTreeMap::new();
+    let mut bottom_text: BTreeMap<BottomText, usize> = BTreeMap::new();
     for (i, line) in lines.iter().enumerate() {
         let med = medians[class_of(kinds[i]) as usize];
         let mut fx = decide(line, kinds[i], audio[i], med, caps_track);
@@ -164,6 +199,9 @@ pub fn direct(lines: &[SourceLine], signals: &TrackSignals, segments: &[Segment]
             fx.static_only = true;
             fx.reason.push_str(" static=cut");
         }
+        let verdict =
+            dodge_bottom_text(&mut fx, line, signals.bottom_text.get(i).copied().flatten());
+        *bottom_text.entry(verdict).or_insert(0) += 1;
         *counts.entry(fx.intent).or_insert(0) += 1;
         out.push(fx);
     }
@@ -178,7 +216,27 @@ pub fn direct(lines: &[SourceLine], signals: &TrackSignals, segments: &[Segment]
             spread_lu: rest.spread,
             scale: rest.scale,
         },
+        bottom_text,
     }
+}
+
+/// Lifts a line to the top when text is burned into the bottom of the
+/// picture under it, so the two do not overprint (B1207). A typeset line, or
+/// one an effect already placed, keeps its spot.
+fn dodge_bottom_text(fx: &mut LineEffect, line: &SourceLine, share: Option<f32>) -> BottomText {
+    let Some(share) = share.filter(|s| s.is_finite()) else {
+        return BottomText::Unchecked;
+    };
+    if share <= 0.0 {
+        return BottomText::Clear;
+    }
+    if line.typeset || fx.placement != Placement::Default {
+        return BottomText::Kept;
+    }
+    fx.placement = Placement::Top;
+    fx.reason
+        .push_str(&format!(" place=top bottom_text={share:.3}"));
+    BottomText::Lifted
 }
 
 fn effect(intent: Intent, intensity: u8, reason: String) -> LineEffect {
@@ -779,6 +837,7 @@ mod tests {
                 &TrackSignals {
                     lines: sigs,
                     cuts_ms: self.cuts,
+                    bottom_text: vec![],
                 },
                 &self.segs,
             );
@@ -1028,6 +1087,7 @@ mod tests {
                 &TrackSignals {
                     lines: sigs,
                     cuts_ms: vec![],
+                    bottom_text: vec![],
                 },
                 &[],
             )
@@ -1075,6 +1135,7 @@ mod tests {
             &TrackSignals {
                 lines: sigs,
                 cuts_ms: vec![],
+                bottom_text: vec![],
             },
             &[],
         );
@@ -1099,6 +1160,7 @@ mod tests {
             &TrackSignals {
                 lines: sigs,
                 cuts_ms: vec![],
+                bottom_text: vec![],
             },
             &[],
         );
@@ -1114,6 +1176,7 @@ mod tests {
             &TrackSignals {
                 lines: vec![sig(-23.0), sig(-22.0), sig(-21.0)],
                 cuts_ms: vec![],
+                bottom_text: vec![],
             },
             &[],
         );
@@ -1124,6 +1187,7 @@ mod tests {
             &TrackSignals {
                 lines: vec![sig(-23.0)],
                 cuts_ms: vec![],
+                bottom_text: vec![],
             },
             &[],
         );
@@ -1134,6 +1198,7 @@ mod tests {
             &TrackSignals {
                 lines: vec![sig(-40.0), sig(-23.0), sig(-23.0)],
                 cuts_ms: vec![],
+                bottom_text: vec![],
             },
             &[],
         );
@@ -1216,6 +1281,7 @@ mod tests {
         let track = TrackSignals {
             lines: sigs,
             cuts_ms: vec![],
+            bottom_text: vec![],
         };
         let with = direct(&lines, &track, &intro);
         assert!(with.plan.lines.iter().all(|l| l.intent == Intent::Plain));
@@ -1290,6 +1356,55 @@ mod tests {
     }
 
     #[test]
+    fn a_line_over_burned_in_bottom_text_goes_to_the_top() {
+        let mut lines = vec![line("Hello"), line("Over here"), line("Again")];
+        lines[2].typeset = true;
+        let run = |shares: Vec<Option<f32>>| {
+            direct(
+                &lines,
+                &TrackSignals {
+                    bottom_text: shares,
+                    ..TrackSignals::default()
+                },
+                &[],
+            )
+        };
+        let bottom = |shares| run(shares).plan.lines;
+        let d = run(vec![Some(0.05), Some(0.0), Some(0.05)]);
+        let tally: Vec<_> = d.bottom_text.iter().map(|(v, n)| (v.label(), *n)).collect();
+        assert_eq!(tally, [("clear", 1), ("lifted", 1), ("kept", 1)]);
+        let fx = d.plan.lines;
+        assert_eq!(fx[0].placement, Placement::Top);
+        assert!(
+            fx[0].reason.ends_with(" place=top bottom_text=0.050"),
+            "{}",
+            fx[0].reason
+        );
+        assert_eq!(fx[1].placement, Placement::Default, "clean picture");
+        assert_eq!(
+            fx[2].placement,
+            Placement::Default,
+            "typeset keeps its spot"
+        );
+        for none in [vec![None, Some(f32::NAN)], vec![]] {
+            assert!(bottom(none)
+                .iter()
+                .all(|f| f.placement == Placement::Default));
+        }
+        assert_eq!(
+            run(vec![]).bottom_text.get(&BottomText::Unchecked),
+            Some(&3)
+        );
+    }
+
+    #[test]
+    fn bottom_text_labels_are_distinct() {
+        let labels: std::collections::BTreeSet<_> =
+            BottomText::ALL.iter().map(|v| v.label()).collect();
+        assert_eq!(labels.len(), BottomText::ALL.len());
+    }
+
+    #[test]
     fn typeset_lines_are_plain_and_pass_through() {
         let mut c = case("[boom]").dlu(15.0);
         c.line.typeset = true;
@@ -1338,6 +1453,7 @@ mod tests {
         let t = TrackSignals {
             lines: sigs,
             cuts_ms: vec![11_000],
+            bottom_text: vec![],
         };
         assert_eq!(direct(&lines, &t, &[]), direct(&lines, &t, &[]));
     }

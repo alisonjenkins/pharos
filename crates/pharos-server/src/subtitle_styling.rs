@@ -46,6 +46,8 @@
 //! pharos_subtitle_styling_pending                items needing work at the start of a pass
 //! pharos_subtitle_effect_total{intent,source}    one per styled line; source: rule (phase 1)
 //! pharos_subtitle_signals_total{source,outcome}  source: stored | measured; outcome: ok | failed
+//! pharos_subtitle_bottom_text_total{verdict}     one per styled line: unchecked | clear | lifted | kept
+//!                                                (text burned into the bottom of the picture, B1207)
 //! ```
 //!
 //! The signal pass is stored per item (B1202): a re-direct of an unchanged
@@ -69,7 +71,7 @@ use pharos_core::{
     MediaSegmentStore, MediaStore, SeriesMetadata, SeriesMetadataStore, SubtitleSignalsRow,
     SubtitleStyling, SubtitleStylingStore,
 };
-use pharos_styling::plan::Intent;
+use pharos_styling::plan::{Intent, Placement};
 use pharos_styling::signals::{LineSignals, Segment, SegmentKind, TrackSignals};
 use pharos_styling::DIRECTOR_VERSION;
 use pharos_transcode::protocol::WorkerError;
@@ -416,6 +418,8 @@ struct Report {
     loudness: Option<pharos_styling::director::Loudness>,
     /// Why a stored pass was not used, when there was one.
     signals_stale: Option<&'static str>,
+    /// Lines per bottom-text verdict, `verdict=n` (B1207).
+    bottom_text: String,
 }
 
 /// A stored signal pass: the windows it measured and what it found.
@@ -894,6 +898,7 @@ impl<S: JobStore, A: Signals, Q: TranscodeQueue> Styler<S, A, Q> {
         let track = TrackSignals {
             lines: sig.lines.iter().map(line_signals).collect(),
             cuts_ms: sig.cuts_ms,
+            bottom_text: sig.bottom_text,
         };
         let direction = pharos_styling::direct(&parsed.lines, &track, &segments);
         report.direct = Some(t.elapsed());
@@ -909,6 +914,12 @@ impl<S: JobStore, A: Signals, Q: TranscodeQueue> Styler<S, A, Q> {
             .counts
             .iter()
             .map(|(i, n)| format!("{}={n}", i.label()))
+            .collect::<Vec<_>>()
+            .join(" ");
+        report.bottom_text = direction
+            .bottom_text
+            .iter()
+            .map(|(v, n)| format!("{}={n}", v.label()))
             .collect::<Vec<_>>()
             .join(" ");
 
@@ -927,6 +938,13 @@ impl<S: JobStore, A: Signals, Q: TranscodeQueue> Styler<S, A, Q> {
                     .record(d.as_secs_f64());
             }
         }
+        for (verdict, n) in &direction.bottom_text {
+            metrics::counter!(
+                "pharos_subtitle_bottom_text_total",
+                "verdict" => verdict.label(),
+            )
+            .increment(*n as u64);
+        }
         for fx in &direction.plan.lines {
             metrics::counter!(
                 "pharos_subtitle_effect_total",
@@ -934,7 +952,7 @@ impl<S: JobStore, A: Signals, Q: TranscodeQueue> Styler<S, A, Q> {
                 "source" => EFFECT_SOURCE,
             )
             .increment(1);
-            if fx.intent != Intent::Plain {
+            if fx.intent != Intent::Plain || fx.placement != Placement::Default {
                 tracing::debug!(
                     item = task.item.id,
                     line = fx.line,
@@ -1102,6 +1120,7 @@ impl<S: JobStore, A: Signals, Q: TranscodeQueue> Styler<S, A, Q> {
                     dialogue_lufs = report.loudness.and_then(|l| l.median_lufs),
                     dialogue_spread_lu = report.loudness.and_then(|l| l.spread_lu),
                     loudness_scale = report.loudness.map(|l| l.scale),
+                    bottom_text = %report.bottom_text,
                     outcome = ended.outcome.label(),
                     stage = ended.stage.label(),
                     error = ended.error.as_deref(),
@@ -1456,7 +1475,10 @@ mod tests {
                         .collect(),
                     keyframes_ms: Vec::new(),
                     cuts_ms: Vec::new(),
-                    bottom_text: Vec::new(),
+                    // Text burned in under the first line only.
+                    bottom_text: (0..windows.len())
+                        .map(|i| Some(if i == 0 { 0.05 } else { 0.0 }))
+                        .collect(),
                     audio_stream,
                     channel: ChannelPick::Downmix,
                     analysed_seconds: 10.0,
@@ -1634,6 +1656,22 @@ mod tests {
         }
         assert_eq!(effects, 5, "plain lines are counted too");
         assert!(shout_rule);
+
+        // B1207: each line's bottom-text verdict is counted, and the line
+        // over burned-in text is lifted in the stored plan.
+        let mut verdicts = std::collections::BTreeMap::new();
+        for (ck, _, _, v) in snap.snapshot().into_vec() {
+            if ck.key().name() == "pharos_subtitle_bottom_text_total" {
+                let DebugValue::Counter(c) = v else { panic!() };
+                let verdict = ck.key().labels().next().unwrap().value().to_owned();
+                verdicts.insert(verdict, c);
+            }
+        }
+        assert_eq!(
+            verdicts,
+            std::collections::BTreeMap::from([("clear".to_owned(), 4), ("lifted".to_owned(), 1)])
+        );
+        assert_eq!(plan.lines[0].placement, Placement::Top);
     }
 
     /// FR-014 — a file the media cannot give us is remembered and not tried
