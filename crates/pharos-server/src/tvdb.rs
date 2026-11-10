@@ -22,6 +22,7 @@ use tokio::sync::RwLock;
 
 use crate::metadata_language::{record_translation, TranslationOutcome, DEFAULT_LANGUAGE};
 use crate::online_enrich::{EnrichedMetadata, RemoteArt, TextsFetch};
+use crate::tvdb_list_cache::PassListCache;
 use pharos_core::{ArtworkRole, LocalizedText, MediaKind, PersonKind, PersonRef, SearchCandidate};
 use serde::Serialize;
 
@@ -134,6 +135,8 @@ pub struct TvdbClient<T: TvdbTransport> {
     token: Arc<RwLock<Option<String>>>,
     /// Ids found to be no episode's (B584), so not asked about again.
     series_ids: Arc<RwLock<HashSet<String>>>,
+    /// Merged episode lists for the pass in progress (B989).
+    list_cache: PassListCache,
 }
 
 impl TvdbClient<ReqwestTransport> {
@@ -152,6 +155,28 @@ impl<T: TvdbTransport> TvdbClient<T> {
             transport,
             token: Arc::new(RwLock::new(None)),
             series_ids: Arc::new(RwLock::new(HashSet::new())),
+            list_cache: PassListCache::default(),
+        }
+    }
+
+    /// B989 — open a pass: from here an episode list is read once per
+    /// series, however many of its episodes the pass asks about. Pair with
+    /// [`end_pass`](Self::end_pass).
+    pub fn begin_pass(&self) {
+        self.list_cache.begin();
+    }
+
+    /// B989 — close the pass: drop every cached list and log what the cache
+    /// did. Nothing is kept between passes.
+    pub fn end_pass(&self) {
+        if let Some(stats) = self.list_cache.end() {
+            tracing::info!(
+                hits = stats.hits,
+                misses = stats.misses,
+                entries = stats.entries,
+                bytes = stats.bytes,
+                "tvdb episode list cache: pass over"
+            );
         }
     }
 
@@ -406,7 +431,19 @@ impl<T: TvdbTransport> TvdbClient<T> {
     /// episodes are only on page 1 onwards (B983). A failed later page fails
     /// the whole read, as a list missing its tail would read as "no such
     /// episode".
-    async fn episodes_body(&self, series_id: &str) -> Result<String, TextsFetch> {
+    async fn episodes_body(&self, series_id: &str) -> Result<Arc<str>, TextsFetch> {
+        if let Some(body) = self.list_cache.get(series_id) {
+            return Ok(body);
+        }
+        // Two concurrent misses for one series both fetch; the later insert
+        // replaces the earlier with the same body. Only a successful read is
+        // kept, so a failed page is never cached as success.
+        let body: Arc<str> = Arc::from(self.fetch_episodes_body(series_id).await?);
+        self.list_cache.insert(series_id, Arc::clone(&body));
+        Ok(body)
+    }
+
+    async fn fetch_episodes_body(&self, series_id: &str) -> Result<String, TextsFetch> {
         let path = format!("/series/{series_id}/episodes/default");
         let first = self.record_body(&path).await?;
         let Ok(mut merged) = serde_json::from_str::<serde_json::Value>(&first) else {
@@ -1504,6 +1541,14 @@ pub(crate) fn parse_translation(body: &str) -> Option<LocalizedText> {
 pub struct TvdbEnricher<T: TvdbTransport>(pub TvdbClient<T>);
 
 impl<T: TvdbTransport> crate::online_enrich::OnlineEnricher for TvdbEnricher<T> {
+    fn begin_pass(&self) {
+        self.0.begin_pass();
+    }
+
+    fn end_pass(&self) {
+        self.0.end_pass();
+    }
+
     fn provider(&self) -> &'static str {
         "tvdb"
     }
@@ -2075,6 +2120,133 @@ mod tests {
             .route("/series/81797/episodes/default?page=1", 500, "");
         let c = TvdbClient::with_transport("key".into(), t);
         assert!(c.episode_list("81797").await.is_none());
+    }
+
+    /// A show with a three-page episode list (invented ids): `per_page`
+    /// episodes a page, numbered in order in season 1.
+    fn three_page_show(series: &str, per_page: u32) -> FakeTransport {
+        let path = format!("/series/{series}/episodes/default");
+        let page = |n: u32, next: Option<u32>| {
+            let eps: Vec<String> = (0..per_page)
+                .map(|i| {
+                    let number = n * per_page + i + 1;
+                    format!(
+                        r#"{{"id":{},"seasonNumber":1,"number":{number},"name":"Part {number}"}}"#,
+                        910_500 + number
+                    )
+                })
+                .collect();
+            let next = next.map_or("null".to_string(), |p| {
+                format!(r#""https://api4.thetvdb.com/v4{path}?page={p}""#)
+            });
+            format!(
+                r#"{{"data":{{"episodes":[{}]}},"links":{{"next":{next}}}}}"#,
+                eps.join(",")
+            )
+        };
+        FakeTransport::new()
+            .push_login("jwt")
+            .route(&path, 200, &page(0, Some(1)))
+            .route(&format!("{path}?page=1"), 200, &page(1, Some(2)))
+            .route(&format!("{path}?page=2"), 200, &page(2, None))
+    }
+
+    fn list_requests(t: &FakeTransport, series: &str) -> usize {
+        let prefix = format!("/series/{series}/episodes/default");
+        t.paths().iter().filter(|p| p.starts_with(&prefix)).count()
+    }
+
+    /// B989: one pass reading ten episodes of a three-page show reads the
+    /// list once (3 requests), not once per episode (30). Without a pass
+    /// open the cache is off and the old cost comes back, which is what
+    /// makes this fail if the cache is disarmed.
+    #[tokio::test]
+    async fn a_pass_reads_a_shows_episode_list_once() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = pharos_test_metrics::snapshotter(&recorder);
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        let t = three_page_show("910001", 4);
+        let c = TvdbClient::with_transport("key".into(), t.clone());
+        for n in 1..=10 {
+            let md = c.get_episode("910001", 1, n, None).await.expect("episode");
+            assert_eq!(md.title.as_deref(), Some(format!("Part {n}").as_str()));
+        }
+        assert_eq!(list_requests(&t, "910001"), 30, "no pass, no cache");
+
+        let t = three_page_show("910001", 4);
+        let c = TvdbClient::with_transport("key".into(), t.clone());
+        c.begin_pass();
+        for n in 1..=10 {
+            let md = c.get_episode("910001", 1, n, None).await.expect("episode");
+            assert_eq!(md.title.as_deref(), Some(format!("Part {n}").as_str()));
+        }
+        c.end_pass();
+        assert_eq!(list_requests(&t, "910001"), 3, "list read once per pass");
+
+        let (mut hit, mut miss) = (0, 0);
+        for (ck, _, _, v) in snapshotter.snapshot().into_vec() {
+            if ck.key().name() != "pharos_tvdb_episode_list_cache_total" {
+                continue;
+            }
+            let outcome = ck
+                .key()
+                .labels()
+                .find(|l| l.key() == "outcome")
+                .map(|l| l.value().to_string());
+            if let (Some(o), DebugValue::Counter(n)) = (outcome, v) {
+                match o.as_str() {
+                    "hit" => hit += n,
+                    "miss" => miss += n,
+                    _ => {}
+                }
+            }
+        }
+        assert_eq!((hit, miss), (9, 1));
+    }
+
+    /// B989: the cache is dropped with its pass; the next pass reads again.
+    /// Also the translation path (`episode_record` with a language) shares
+    /// the pass's list.
+    #[tokio::test]
+    async fn the_next_pass_does_not_reuse_the_last_ones_list() {
+        let t = three_page_show("910002", 4);
+        let c = TvdbClient::with_transport("key".into(), t.clone());
+        c.begin_pass();
+        c.get_episode("910002", 1, 1, None).await.expect("episode");
+        c.episode_record("910002", 1, 2, None, &["fra".to_string()])
+            .await
+            .expect("record");
+        c.end_pass();
+        assert_eq!(list_requests(&t, "910002"), 3);
+        c.get_episode("910002", 1, 3, None).await.expect("episode");
+        assert_eq!(list_requests(&t, "910002"), 6, "closed pass keeps nothing");
+        c.begin_pass();
+        c.get_episode("910002", 1, 4, None).await.expect("episode");
+        assert_eq!(list_requests(&t, "910002"), 9, "new pass starts empty");
+        c.end_pass();
+    }
+
+    /// B989: a failed page is not cached as success: the pass asks again.
+    #[tokio::test]
+    async fn a_failed_page_is_not_cached() {
+        let path = "/series/910003/episodes/default";
+        let t = FakeTransport::new()
+            .push_login("jwt")
+            .route(
+                path,
+                200,
+                r#"{"data":{"episodes":[{"id":1,"seasonNumber":1,"number":1,"name":"A"}]},
+                    "links":{"next":"https://api4.thetvdb.com/v4/series/910003/episodes/default?page=1"}}"#,
+            )
+            .route(&format!("{path}?page=1"), 500, "");
+        let c = TvdbClient::with_transport("key".into(), t.clone());
+        c.begin_pass();
+        assert!(c.get_episode("910003", 1, 1, None).await.is_none());
+        assert!(c.get_episode("910003", 1, 1, None).await.is_none());
+        c.end_pass();
+        assert_eq!(list_requests(&t, "910003"), 4, "both reads went out");
     }
 
     const TNG_S1: &str = r#"{"data":{"episodes":[
