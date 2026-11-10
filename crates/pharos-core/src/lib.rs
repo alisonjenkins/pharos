@@ -3545,12 +3545,15 @@ pub trait MediaSegmentStore: Send + Sync {
 /// - `updated` — existing rows re-probed because their fs signature changed.
 /// - `removed` — rows swept because the backing file vanished from disk.
 /// - `skipped` — unchanged files (`mark_seen` only, probe skipped).
+/// - `walk_errors` — entries the walk could not read; above 0 the root was
+///   only partly scanned and its deletion sweep was skipped.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ScanOutcome {
     pub added: Vec<MediaId>,
     pub updated: Vec<MediaId>,
     pub removed: Vec<MediaId>,
     pub skipped: usize,
+    pub walk_errors: usize,
 }
 
 impl ScanOutcome {

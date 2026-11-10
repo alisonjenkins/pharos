@@ -390,6 +390,7 @@ async fn a_finished_scan_arrives_with_its_counts() {
             let tally = ScanTally {
                 roots: 2,
                 failed_roots: 1,
+                incomplete_roots: 0,
                 added: 5,
                 changed: 3,
                 removed: 2,

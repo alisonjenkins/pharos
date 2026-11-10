@@ -176,6 +176,9 @@ impl ScanOutcome {
 pub struct ScanTally {
     pub roots: usize,
     pub failed_roots: usize,
+    /// Roots scanned with some entries unreadable: read in part, with no
+    /// deletion sweep.
+    pub incomplete_roots: usize,
     pub added: usize,
     pub changed: usize,
     pub removed: usize,
@@ -184,7 +187,18 @@ pub struct ScanTally {
 impl ScanTally {
     #[must_use]
     pub fn outcome(&self, cancelled: bool) -> ScanOutcome {
-        ScanOutcome::of(cancelled, self.roots, self.failed_roots)
+        match ScanOutcome::of(cancelled, self.roots, self.failed_roots) {
+            // Read in part is not read in full.
+            ScanOutcome::Completed if self.incomplete_roots > 0 => ScanOutcome::Partial,
+            outcome => outcome,
+        }
+    }
+
+    /// Roots with anything left unread, failed or in part: the
+    /// `TaskProgress.failedRoots` count.
+    #[must_use]
+    pub fn unread_roots(&self) -> usize {
+        self.failed_roots + self.incomplete_roots
     }
 }
 
@@ -199,6 +213,7 @@ pub fn record_scan_end(tally: &ScanTally, outcome: ScanOutcome, elapsed: std::ti
             outcome = outcome.label(),
             roots = tally.roots,
             failed_roots = tally.failed_roots,
+            incomplete_roots = tally.incomplete_roots,
             added = tally.added,
             changed = tally.changed,
             removed = tally.removed,
@@ -210,6 +225,7 @@ pub fn record_scan_end(tally: &ScanTally, outcome: ScanOutcome, elapsed: std::ti
             outcome = outcome.label(),
             roots = tally.roots,
             failed_roots = tally.failed_roots,
+            incomplete_roots = tally.incomplete_roots,
             added = tally.added,
             changed = tally.changed,
             removed = tally.removed,
@@ -489,6 +505,29 @@ mod tests {
         assert_eq!(ScanOutcome::of(false, 3, 3), ScanOutcome::Failed);
         assert_eq!(ScanOutcome::of(true, 3, 3), ScanOutcome::Cancelled);
         assert_eq!(ScanOutcome::of(false, 0, 0), ScanOutcome::Completed);
+    }
+
+    /// B1285: a root read only in part (an unreadable subfolder) is not a
+    /// complete pass, and counts among the folders that could not be read.
+    /// Disarm check: without the `incomplete_roots` arm in `outcome`, the
+    /// first assertion goes red.
+    #[test]
+    fn a_root_read_in_part_makes_the_pass_partial() {
+        let tally = ScanTally {
+            roots: 2,
+            incomplete_roots: 1,
+            ..ScanTally::default()
+        };
+        assert_eq!(tally.outcome(false), ScanOutcome::Partial);
+        assert_eq!(tally.unread_roots(), 1);
+        assert_eq!(tally.outcome(true), ScanOutcome::Cancelled);
+        let both = ScanTally {
+            roots: 2,
+            failed_roots: 2,
+            incomplete_roots: 0,
+            ..ScanTally::default()
+        };
+        assert_eq!(both.outcome(false), ScanOutcome::Failed);
     }
 
     #[test]
