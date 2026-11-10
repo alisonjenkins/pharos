@@ -477,17 +477,18 @@ fn remember_skip(item: ItemRef, version: &str, from_ms: u64, to_ms: u64) {
     );
 }
 
-/// The tab's queue from before a reload, else an empty one. A record that
-/// cannot be read is logged with its reason and dropped.
-fn restore_queue() -> Queue {
+/// The tab's queue from before a reload, if one was read back; it is held
+/// until the signed-in user is known. A record that cannot be read is logged
+/// with its reason and dropped.
+fn restore_queue() -> Option<Queue> {
     let text = match platform::session_get(super::queue::QUEUE_KEY) {
         Ok(Some(text)) => text,
-        Ok(None) => return Queue::default(),
+        Ok(None) => return None,
         Err(e) => {
             platform::warn(&format!(
                 "pharos: queue restore failed reason=unreadable error={e}"
             ));
-            return Queue::default();
+            return None;
         }
     };
     match Queue::restore(&text) {
@@ -497,7 +498,7 @@ fn restore_queue() -> Queue {
                 queue.upcoming().len(),
                 queue.shuffled()
             ));
-            queue
+            Some(queue)
         }
         Err(e) => {
             let reason = match e {
@@ -507,19 +508,29 @@ fn restore_queue() -> Queue {
             platform::warn(&format!(
                 "pharos: queue restore failed reason={reason} error={e}"
             ));
-            Queue::default()
+            None
         }
     }
 }
 
 /// Ties the queue to the signed-in user once known; a queue another user
 /// left (its stored copy not cleared at their sign-out) is dropped.
-fn claim_queue(mut queue: Signal<Queue>, user: &str) {
+fn claim_queue(mut queue: Signal<Queue>, mut held: Signal<Option<Queue>>, user: &str) {
+    if let Some(saved) = held.write().take() {
+        if queue.write().adopt(saved, user) {
+            platform::info(&format!(
+                "pharos: queue adopted upcoming={}",
+                queue.peek().upcoming().len()
+            ));
+        } else {
+            platform::info("pharos: queue dropped reason=another-user-or-replaced");
+        }
+        return;
+    }
     if queue.peek().owner() == Some(user) {
         return;
     }
-    let dropped = queue.write().claim(user);
-    if dropped {
+    if queue.write().claim(user) {
         platform::info("pharos: queue dropped reason=another-user");
     }
 }
@@ -1851,9 +1862,17 @@ fn NativeApp(route: Route) -> Element {
     super::reader_web::use_pending_flush(api);
     // The play queue lives as long as the app, across pages and songs, and
     // is kept for the tab so a reload keeps it (FR-704).
-    let queue = use_signal(restore_queue);
+    // A queue read back is held until the signed-in user is known, so no
+    // song of another user's queue shows meanwhile (B1288); the stored copy
+    // is not overwritten while it is held.
+    let held = use_signal(restore_queue);
+    let queue = use_signal(Queue::default);
     use_context_provider(|| QueueCtx(queue));
-    use_effect(move || store_queue(&queue.read().save()));
+    use_effect(move || {
+        if held.read().is_none() {
+            store_queue(&queue.read().save());
+        }
+    });
     // Films, episodes and music videos queue apart from songs (V853).
     use_context_provider(|| VideoQueueCtx(Signal::new(Queue::default()), Signal::new(false)));
     // The mix that is on keeps the queue topped up (spec 024, B441).
@@ -1942,10 +1961,15 @@ fn NativeApp(route: Route) -> Element {
             if !names.peek().is_empty() {
                 names.write().clear();
             }
-            // The queue, kept for the tab (B1281), is not the next user's.
+            // The queue, kept for the tab (B1281), is not the next user's,
+            // nor is one still held from before a reload.
             let mut queue = queue;
             if *queue.peek() != Queue::default() {
                 queue.set(Queue::default());
+            }
+            let mut held = held;
+            if held.peek().is_some() {
+                held.set(None);
             }
         }
     });
@@ -2051,7 +2075,7 @@ fn NativeApp(route: Route) -> Element {
             match api.me(&call("shell", "me")).await {
                 Ok(me) => {
                     reconcile_kept_books(&me.id);
-                    claim_queue(queue, &me.id);
+                    claim_queue(queue, held, &me.id);
                     Some(me)
                 }
                 Err(e) => {
