@@ -4858,4 +4858,24 @@ mod tests {
         let n = run(neighbours(&fake, &CallInfo::default(), &film)).unwrap();
         assert_eq!(n, Neighbours::default());
     }
+
+    /// B1322/V1293: the TV draws no queue buttons on an album card, so the
+    /// remote's moves land on the tile itself; elsewhere they stay.
+    #[test]
+    fn the_tv_draws_no_queue_buttons_on_album_cards() {
+        let sheet = include_str!("../../assets/pharos.css");
+        let rule = |head: &str| {
+            sheet
+                .split(head)
+                .nth(1)
+                .and_then(|r| r.split('}').next())
+                .unwrap_or_default()
+                .to_owned()
+        };
+        let tv =
+            rule(":root[data-device=\"tv\"] .pharos-queue-buttons[data-target=\"album_card\"] {");
+        assert!(tv.contains("display: none"), "{tv}");
+        let web = rule("\n.pharos-queue-buttons[data-target=\"album_card\"] {");
+        assert!(!web.contains("display: none"), "{web}");
+    }
 }
