@@ -8,6 +8,7 @@ mod dvd_subtitle;
 mod common;
 
 mod fingerprint_detect;
+mod fragmented_intro_replay;
 mod intro_alignment_recall;
 mod picture_area_scan;
 mod subtitle_burn_ass;
