@@ -366,16 +366,26 @@ impl Placer {
         if cap == 0 {
             return false;
         }
-        // Peak overlap is always reached at some event's start.
-        cand.iter().all(|&(s, _)| {
-            let n = self
-                .animated
-                .iter()
-                .chain(&cand)
-                .filter(|&&(a, b)| a <= s && s < b)
-                .count();
-            n <= cap
-        })
+        // Peak overlap is always reached at some event's start: a candidate's,
+        // or an accepted event's that a candidate now covers.
+        let covered = |s: i64| cand.iter().any(|&(a, b)| a <= s && s < b);
+        cand.iter()
+            .map(|&(s, _)| s)
+            .chain(
+                self.animated
+                    .iter()
+                    .map(|&(s, _)| s)
+                    .filter(|&s| covered(s)),
+            )
+            .all(|s| {
+                let n = self
+                    .animated
+                    .iter()
+                    .chain(&cand)
+                    .filter(|&&(a, b)| a <= s && s < b)
+                    .count();
+                n <= cap
+            })
     }
 
     fn fits_rate(&self, evs: &[Event]) -> bool {
