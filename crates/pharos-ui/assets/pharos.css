@@ -2356,6 +2356,24 @@ body:has(.pharos-stage.is-full) .pharos-status-note {
 .pharos-control-spacer {
   flex: 1;
 }
+/* A finger needs 44px (T038-303): every player control, the menus and the
+   seek bar's hit area, whose track stays thin in the middle of it. The
+   play head shows whenever the chrome does, as there is no hover. */
+@media (pointer: coarse) {
+  .pharos-player .pharos-control {
+    min-width: 44px;
+    min-height: 44px;
+  }
+  .pharos-player .pharos-track-picker {
+    min-height: 44px;
+  }
+  .pharos-seek {
+    padding: 19px 0;
+  }
+  .pharos-seek .pharos-seek-knob {
+    transform: scale(1);
+  }
+}
 /* The menus and the window-size buttons sit in the row on a wide screen;
    on a narrow one they wait in a sheet behind the settings button
    (T038-302), so the row keeps play, time, seek and fullscreen on one
