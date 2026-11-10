@@ -127,7 +127,7 @@ type CacheKey = (u64, u32);
 /// every cached tile so it regenerates with the current code — the cache is
 /// otherwise keyed only by `(media_id, width)` and never re-derives a tile that
 /// already exists, so a stale tile from an older build would persist forever
-/// (observed: magenta-cast Code Geass sprites from a pre-fix build). Starts at
+/// (observed: magenta-cast Show U sprites from a pre-fix build). Starts at
 /// 1: since existing deployments have no marker, the first startup after this
 /// lands treats them as stale and regenerates once.
 const TRICKPLAY_GEN_VERSION: u32 = 1;

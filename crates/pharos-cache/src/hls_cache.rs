@@ -88,7 +88,7 @@ pub enum HlsCacheError {
 /// The three mean different things and want different fixes: `NeverStarted` is
 /// an ffmpeg that failed to spawn or died before its first segment,
 /// `Stalled` is a session that produced and then stopped advancing (finished,
-/// wedged, or — the Ghost in the Shell shape — merely slower than the stall
+/// wedged, or — the Film AH shape — merely slower than the stall
 /// budget under load), and `BudgetExhausted` is a session that kept advancing
 /// for the whole 30 s and still never reached the target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -443,7 +443,7 @@ fn record_source_unreadable(reason: &'static str) {
 
 /// Count one audio-rendition read wait. Emitted on BOTH outcomes: a counter
 /// that only fires on failure cannot answer "what fraction of waits 404?",
-/// which is the question the Ghost in the Shell stall actually posed.
+/// which is the question the Film AH stall actually posed.
 fn record_audio_wait(outcome: &'static str) {
     metrics::counter!("pharos_audio_wait_total", "outcome" => outcome).increment(1);
 }
@@ -2721,7 +2721,7 @@ impl HlsSegmentCache {
     /// Take a range of an item's cached segments out of service, KEEPING the
     /// bytes (T118).
     ///
-    /// Purging by hand three times in one evening (2026-08-16, Black Panther)
+    /// Purging by hand three times in one evening (2026-08-16, Film S)
     /// produced three re-encodes and not one retained sample: segment 827 was
     /// unlinked before anyone copied it, so the only trace of a fault that hit
     /// viewers three times is an md5 of bytes nobody can inspect. Every rule
@@ -5516,7 +5516,7 @@ impl HlsSegmentCache {
     /// This is an inter-segment interval, not a latency budget: a continuous
     /// audio session emits one 6 s segment at a time, so at 2× realtime it
     /// writes one every 3 s. The previous 3 s sat exactly on that cliff, and
-    /// any I/O contention pushed a HEALTHY session over it. Ghost in the Shell
+    /// any I/O contention pushed a HEALTHY session over it. Film AH
     /// (2026-07-25) did precisely that — the doubled video ladder saturated the
     /// same NFS stream, the audio session fell below one segment per 3 s, and
     /// the read declared a live session wedged, 404ing `a5.m4s` and `a48.m4s`
@@ -6625,7 +6625,7 @@ mod tests {
 
     /// T122 — a cached segment must say which encoder produced it.
     ///
-    /// Asked on 2026-08-16 whether a specific cached Black Panther segment came
+    /// Asked on 2026-08-16 whether a specific cached Film S segment came
     /// off NVENC or the CPU, the answer was that we could not tell: the device
     /// is on the INFO line and on a metric label, and both age out long before
     /// the file does. Corruption that clusters on one encoder is the first
@@ -12449,7 +12449,7 @@ mod tests {
         // client's AudioStreamIndex are the SAME bytes. Keying them apart minted
         // a second, byte-identical video ladder the moment a viewer switched
         // audio track, doubling GPU + NFS load mid-playback and dragging the
-        // encoder below realtime (Ghost in the Shell, 2026-07-25: 6 of 47
+        // encoder below realtime (Film AH, 2026-07-25: 6 of 47
         // segments encoded twice, each pair byte-for-byte equal).
         let opts = ident_opts(
             Some(SegmentVideo::Vp9),
