@@ -155,3 +155,68 @@ pub fn text_at(offset: u32, n: u32) -> String {
         .collect();
     String::from_utf16_lossy(&units)
 }
+
+/// A two-page fixed-layout book, in the shape a PDF-to-EPUB converter makes:
+/// each page a 500x700 box holding a block of colour where the artwork
+/// would be and text placed at exact points in a font shipped in the book.
+fn fixed_book() -> Vec<u8> {
+    let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    let o = zip::write::SimpleFileOptions::default();
+    let mut put = |name: &str, body: &[u8]| {
+        zip.start_file(name, o).unwrap();
+        zip.write_all(body).unwrap();
+    };
+    put(
+        "META-INF/container.xml",
+        br#"<container><rootfiles><rootfile full-path="c.opf" media-type="application/oebps-package+xml"/></rootfiles></container>"#,
+    );
+    put(
+        "c.opf",
+        br#"<package version="3.0"><metadata><meta property="rendition:layout">pre-paginated</meta></metadata><manifest><item id="p0" href="p0.xhtml" media-type="application/xhtml+xml"/><item id="p1" href="p1.xhtml" media-type="application/xhtml+xml"/></manifest><spine><itemref idref="p0"/><itemref idref="p1"/></spine></package>"#,
+    );
+    for i in 0..2 {
+        put(
+            &format!("p{i}.xhtml"),
+            format!(
+                r#"<html><head><meta name="viewport" content="width=500, height=700"/>
+<style>@font-face{{font-family:placed-hand;src:url('hand.ttf?reload=1') format('truetype')}}
+.t{{position:absolute;white-space:pre;font-family:placed-hand,serif}}</style></head>
+<body><div id="page" style="width:500px;height:700px;background-color:#fff">
+<div id="art" style="position:absolute;left:0;top:0;width:500px;height:350px;background-color:rgb(250,220,200)"></div>
+<div id="placed" class="t" style="left:40px;top:400px;font-size:30px;color:rgb(10,20,30)">Page {i} placed text</div>
+</div></body></html>"#
+            )
+            .as_bytes(),
+        );
+    }
+    // Not a real font: the check is that the face reaches the document.
+    put("hand.ttf", b"not a font");
+    zip.finish().unwrap().into_inner()
+}
+
+/// Mounts `bytes` (any EPUB; the fixed-layout test book when empty) and
+/// opens reading-order item `spine`.
+#[wasm_bindgen]
+pub async fn mount_book(bytes: Vec<u8>, spine: usize) -> Result<(), JsValue> {
+    let doc = web_sys::window().unwrap().document().unwrap();
+    let host = doc.get_element_by_id("host").unwrap();
+    let bytes = if bytes.is_empty() {
+        fixed_book()
+    } else {
+        bytes
+    };
+    let book = Rc::new(Publication::open_epub(bytes).map_err(|e| e.to_string())?);
+    let v = View::mount(&host, book, Settings::default()).map_err(|e| e.to_string())?;
+    VIEW.with(|cell| *cell.borrow_mut() = Some(v.clone()));
+    v.open(spine, Start::Beginning)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// `[page shown, pages, reading-order item]`.
+#[wasm_bindgen]
+pub fn where_now() -> Vec<u32> {
+    let v = view();
+    vec![v.page(), v.pages(), v.spine() as u32]
+}
