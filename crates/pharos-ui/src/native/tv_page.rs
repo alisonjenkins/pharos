@@ -278,10 +278,43 @@ pub const PLAYER_HOME: &str = ".pharos-control-row button, .pharos-listen-play";
 /// them, so Down never reached the transport (B1034).
 pub const REMOTE_SKIPS: &str = ".pharos-lyrics-line";
 
-/// The bridge script `template` with its tick intervals and player
-/// selectors filled in.
+/// The remote's Info key: from the page, to the docked player bar's play
+/// button (else its first control); from the bar, back to the control it
+/// came from. A long page is then no walk to the bar (B1222, V1182).
+pub const BAR_KEY_JS: &str = r#"
+addEventListener("keydown", (e) => {
+  if (!e.isTrusted || e.repeat || e.key !== "Info") return;
+  const bar = document.querySelector(".pharos-stage.is-mini");
+  if (!bar) return;
+  e.preventDefault();
+  e.stopImmediatePropagation();
+  const at = document.activeElement;
+  if (at && bar.contains(at)) {
+    const back = window.__pharosBeforeBar;
+    window.__pharosBeforeBar = null;
+    const ok = !!back && back.isConnected;
+    if (ok) {
+      back.focus({ preventScroll: true });
+      back.scrollIntoView({ block: "nearest" });
+    }
+    console.info("pharos: keys: mini bar left via=info back=" + ok);
+    return;
+  }
+  const shown = (el) => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+  const to = [...bar.querySelectorAll('__PLAYER_HOME__')].find(shown) ||
+    [...bar.querySelectorAll("button:not([disabled])")].find(shown);
+  if (!to) return;
+  window.__pharosBeforeBar = at && at !== document.body ? at : null;
+  to.focus({ preventScroll: true });
+  console.info("pharos: keys: mini bar reached via=info");
+}, true);
+"#;
+
+/// The bridge script `template` with its tick intervals, player selectors
+/// and Info key filled in.
 pub fn bridge_script(template: &str) -> String {
     template
+        .replace("__BAR_KEYS__", BAR_KEY_JS)
         .replace("__VIDEO_TICK_MS__", &VIDEO_TICK_MS.to_string())
         .replace("__AUDIO_TICK_MS__", &AUDIO_TICK_MS.to_string())
         .replace("__REMOTE_PLAYERS__", REMOTE_PLAYERS)
@@ -653,6 +686,12 @@ mod tests {
         );
         assert!(PLAYER_HOME.split(", ").any(|s| s == ".pharos-listen-play"));
         assert!(!bridge_script("__REMOTE_SKIPS__").contains("__"));
+        // B1222/V1182: the Info key's script is in the bridge, filled in.
+        let keys = bridge_script("__BAR_KEYS__");
+        assert!(keys.contains(r#"e.key !== "Info""#), "{keys}");
+        assert!(keys.contains(".pharos-stage.is-mini"), "{keys}");
+        assert!(keys.contains(".pharos-listen-play"), "{keys}");
+        assert!(!keys.contains("__PLAYER_HOME__"), "{keys}");
     }
 
     #[test]

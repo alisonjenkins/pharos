@@ -1672,6 +1672,7 @@ fn set_root_attribute(name: &str, value: &str) {
 /// is left to it, so the focused control is clicked.
 const BRIDGE_JS: &str = r#"
 const send = (v) => dioxus.send(v);
+__BAR_KEYS__
 // Not a <select>: OK opens its list, and the arrows have to move off it.
 const inText = (t) => !!t && (t.isContentEditable || /^(INPUT|TEXTAREA)$/.test(t.tagName));
 // Space too: the player's mode key toggles play, and the WebView would
