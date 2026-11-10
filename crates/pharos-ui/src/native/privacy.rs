@@ -55,7 +55,7 @@ pub fn PrivacyView(
             h3 { "Report a problem" }
             div { class: "pharos-settings-group pharos-reports",
                 p { class: "pharos-setting-help",
-                    "Sends this server a short trail of recent screens and errors, after showing you exactly what it holds. Nothing is sent until you press Send, whatever the switch above says. The server keeps a report for 30 days."
+                    "Sends this server a short trail of recent screens and errors, after showing you exactly what it holds. Nothing is sent until you press Send, whatever the switch above says. The server keeps a report for a limited time its admin sets."
                 }
                 button {
                     id: "report-problem",
