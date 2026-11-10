@@ -6,14 +6,14 @@
 //! when the first show page of an admin opens.
 
 use dioxus::prelude::*;
-use pharos_client::api::ItemRef;
+use pharos_client::api::{ItemRef, MediaToken};
 
 use super::app::{call, AccountMe, Ctx};
 use super::manage::{local_expiry, now_ms, FlaggedShows, HeldManageToken, ManageFocus, ManageTab};
 use super::platform;
 use super::route::Route;
 use super::views::Nav;
-use crate::client::series_item_ref;
+use crate::client::{series_item_ref, FixDone};
 use crate::views::AdminTab;
 
 /// The shows a flagged answer names; an id this build cannot read names
@@ -43,6 +43,98 @@ pub fn series_id_hex(series: ItemRef) -> Option<String> {
     match series {
         ItemRef::Synth(hash) => Some(format!("{hash:016x}{hash:016x}")),
         _ => None,
+    }
+}
+
+/// The held manage token if it is still live, else a fresh one, kept for
+/// the next caller. `Err("")` when there is no connection yet.
+async fn held_token(
+    ctx: Ctx,
+    mut held: Signal<Option<MediaToken>>,
+    action: &str,
+) -> Result<String, String> {
+    let Some(api) = ctx.api.peek().clone() else {
+        return Err(String::new());
+    };
+    let now = now_ms();
+    if let Some(t) = held.peek().clone().filter(|t| t.expires_at_ms > now) {
+        return Ok(t.token);
+    }
+    let mut t = api
+        .manage_token(&call("title", action))
+        .await
+        .map_err(|e| e.to_string())?;
+    t.expires_at_ms = local_expiry(t.expires_at_ms, now);
+    let token = t.token.clone();
+    held.set(Some(t));
+    Ok(token)
+}
+
+#[cfg(feature = "web")]
+async fn rebuild_one(base: &str, token: &str, id: u64) -> Result<FixDone, String> {
+    crate::client::web::rebuild_episodes(base, token, &[id])
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(not(feature = "web"))]
+async fn rebuild_one(_base: &str, _token: &str, _id: u64) -> Result<FixDone, String> {
+    Err("episodes are only rebuilt in the web build".into())
+}
+
+/// What the row says after a Re-match: the server's count, or its reason.
+pub fn rematch_status(done: Result<FixDone, String>) -> String {
+    match done {
+        Ok(done) if done.rebuilding == 0 => "Nothing to rebuild.".to_owned(),
+        Ok(_) => "Re-matching from this show in the background.".to_owned(),
+        Err(e) => format!("Couldn't re-match: {e}"),
+    }
+}
+
+/// "Re-match" on an episode row, for admins: rebuild this one episode from
+/// its show's stored match (V943), for an episode that kept another show's
+/// title or art after the show was fixed.
+#[component]
+pub fn RematchEpisode(id: ItemRef) -> Element {
+    let me = try_use_context::<AccountMe>();
+    let ctx = try_use_context::<Ctx>();
+    let held = try_use_context::<HeldManageToken>();
+    let mut status = use_signal(|| None::<String>);
+    let mut busy = use_signal(|| false);
+    let admin = me.is_some_and(|me| me.0.read().clone().flatten().is_some_and(|m| m.is_admin));
+    let (ItemRef::Real(media_id), Some(ctx), Some(held), true) = (id, ctx, held, admin) else {
+        return rsx! {};
+    };
+    rsx! {
+        button {
+            r#type: "button",
+            class: "pharos-button pharos-button-secondary pharos-episode-rematch",
+            title: "Rebuild this episode from its show's match",
+            "aria-label": "Re-match from this show",
+            disabled: *busy.read(),
+            onclick: move |_| {
+                if *busy.peek() {
+                    return;
+                }
+                busy.set(true);
+                spawn(async move {
+                    let done = match held_token(ctx, held.0, "rematch_token").await {
+                        Ok(token) => rebuild_one(&platform::page_origin(), &token, media_id).await,
+                        Err(e) if e.is_empty() => Err("not connected".to_owned()),
+                        Err(e) => Err(e),
+                    };
+                    if let Err(e) = &done {
+                        platform::warn(&format!("pharos: re-match of {media_id} refused: {e}"));
+                    }
+                    status.set(Some(rematch_status(done)));
+                    busy.set(false);
+                });
+            },
+            "Re-match"
+        }
+        if let Some(line) = status.read().as_ref() {
+            span { class: "pharos-muted pharos-episode-rematch-status", role: "status", "{line}" }
+        }
     }
 }
 
@@ -76,29 +168,19 @@ pub fn CheckMatchBadge(series: ItemRef) -> Element {
         if !is_admin() || flagged.asked.peek().to_owned() {
             return;
         }
-        let (mut list, mut asked, mut held) = (flagged.list, flagged.asked, held.0);
+        let (mut list, mut asked, held) = (flagged.list, flagged.asked, held.0);
         asked.set(true);
         spawn(async move {
-            let Some(api) = ctx.api.peek().clone() else {
-                asked.set(false);
-                return;
-            };
-            let now = now_ms();
-            let live = held.peek().clone().filter(|t| t.expires_at_ms > now);
-            let token = match live {
-                Some(t) => t.token,
-                None => match api.manage_token(&call("title", "flagged_token")).await {
-                    Ok(mut t) => {
-                        t.expires_at_ms = local_expiry(t.expires_at_ms, now);
-                        let token = t.token.clone();
-                        held.set(Some(t));
-                        token
-                    }
-                    Err(e) => {
+            let token = match held_token(ctx, held, "flagged_token").await {
+                Ok(token) => token,
+                Err(e) => {
+                    if e.is_empty() {
+                        asked.set(false);
+                    } else {
                         platform::warn(&format!("pharos: check match token refused: {e}"));
-                        return;
                     }
-                },
+                    return;
+                }
             };
             match fetch_flagged(&platform::page_origin(), &token).await {
                 Ok(ids) => list.set(Some(flagged_refs(&ids))),
@@ -176,6 +258,25 @@ mod tests {
         assert!(fix_identity_shown(true, Some(&list), ItemRef::Synth(43)));
         assert!(fix_identity_shown(true, None, ItemRef::Synth(42)));
         assert!(!fix_identity_shown(false, Some(&list), ItemRef::Synth(43)));
+    }
+
+    #[test]
+    fn a_rematch_says_what_the_server_did_or_why_it_refused() {
+        let done = |n| {
+            Ok(FixDone {
+                rebuilding: n,
+                ..FixDone::default()
+            })
+        };
+        assert_eq!(
+            rematch_status(done(1)),
+            "Re-matching from this show in the background."
+        );
+        assert_eq!(rematch_status(done(0)), "Nothing to rebuild.");
+        assert_eq!(
+            rematch_status(Err("item 9 is a Movie, not an episode".into())),
+            "Couldn't re-match: item 9 is a Movie, not an episode"
+        );
     }
 
     #[test]
