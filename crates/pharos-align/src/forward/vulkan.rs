@@ -4,8 +4,8 @@
 //! `[1, frames, channels]`, turned to `[1, channels, frames]` for the convs.
 
 use burn::tensor::activation::gelu;
-use burn::tensor::module::{attention, conv1d, layer_norm};
-use burn::tensor::ops::{AttentionModuleOptions, ConvOptions};
+use burn::tensor::module::{attention, layer_norm};
+use burn::tensor::ops::AttentionModuleOptions;
 use burn::tensor::{Device, Tensor, TensorData};
 
 use super::LOGITS;
@@ -108,7 +108,8 @@ pub struct VulkanModel {
     fe: Vec<FeConv>,
     fp_ln: Norm,
     fp: Linear,
-    pos_w: Tensor<3>,
+    /// Per tap, `[1, groups, 64 in, 64 out]`.
+    pos_taps: Vec<Tensor<4>>,
     pos_b: Tensor<1>,
     layers: Vec<Layer>,
     final_ln: Norm,
@@ -201,7 +202,20 @@ impl VulkanModel {
             .collect::<Result<Vec<_>, WeightsError>>()?;
         let cg = D / POS_G;
         let pos_name = "encoder.transformer.pos_conv_embed.conv.weight";
-        let pos_w = tensor(weights.get(pos_name, &[D, cg, POS_K])?, [D, cg, POS_K], dev);
+        let pw = weights.get(pos_name, &[D, cg, POS_K])?;
+        let pos_taps = (0..POS_K)
+            .map(|k| {
+                let mut m = vec![0f32; POS_G * cg * cg];
+                for g in 0..POS_G {
+                    for c in 0..cg {
+                        for o in 0..cg {
+                            m[(g * cg + c) * cg + o] = pw[((g * cg + o) * cg + c) * POS_K + k];
+                        }
+                    }
+                }
+                tensor(&m, [1, POS_G, cg, cg], dev)
+            })
+            .collect();
         let layers = (0..LAYERS)
             .map(|l| {
                 let p = format!("encoder.transformer.layers.{l}");
@@ -219,7 +233,7 @@ impl VulkanModel {
             fe,
             fp_ln: ln("encoder.feature_projection.layer_norm", FE_C)?,
             fp: linear("encoder.feature_projection.projection", D, FE_C)?,
-            pos_w,
+            pos_taps,
             pos_b: t1("encoder.transformer.pos_conv_embed.conv.bias", D)?,
             layers,
             final_ln: ln("encoder.transformer.layer_norm", D)?,
@@ -242,16 +256,20 @@ impl VulkanModel {
         let mut x = self.fp.apply(self.fp_ln.apply(x));
         let t = x.dims()[1];
 
-        // Grouped positional conv, pad 64 each side; the even kernel makes one
-        // frame too many, and the last is dropped.
-        let pos = conv1d(
-            x.clone().swap_dims(1, 2),
-            self.pos_w.clone(),
-            Some(self.pos_b.clone()),
-            ConvOptions::new([1], [POS_K / 2], [1], POS_G),
-        )
-        .narrow(2, 0, t);
-        x = x + gelu(pos).swap_dims(1, 2);
+        // Grouped positional conv, pad 64 each side, as one batched matmul
+        // over the 16 groups per tap; the even kernel's extra last frame is
+        // never computed. Burn's grouped conv1d was most of a window's time.
+        let cg = D / POS_G;
+        let pad = Tensor::zeros([1, POS_K / 2, D], &self.device);
+        let xp = Tensor::cat(vec![pad.clone(), x.clone(), pad], 1)
+            .reshape([1, t + POS_K, POS_G, cg])
+            .swap_dims(1, 2);
+        let mut pos: Tensor<4> = Tensor::zeros([1, POS_G, t, cg], &self.device);
+        for (k, w) in self.pos_taps.iter().enumerate() {
+            pos = pos + xp.clone().narrow(2, k, t).matmul(w.clone());
+        }
+        let pos = pos.swap_dims(1, 2).reshape([1, t, D]) + self.pos_b.clone().unsqueeze::<3>();
+        x = x + gelu(pos);
 
         let heads = |y: Tensor<3>| y.reshape([1, t, HEADS, HD]).swap_dims(1, 2);
         for l in &self.layers {
