@@ -250,7 +250,6 @@ async fn tvshow_structured_ratings_and_country_mpaa() {
     assert_eq!(r.community_rating, Some(9.4));
     // US:TV-MA -> TV-MA.
     assert_eq!(r.official_rating.as_deref(), Some("TV-MA"));
-    assert_eq!(r.provider_ids.tvdb.as_deref(), Some("81189"));
     assert!(r.genres.contains(&"Crime".to_string()));
 }
 
@@ -279,10 +278,10 @@ async fn episode_merges_show_nfo_underneath() {
     // Episode-level title/plot win.
     assert_eq!(r.title.as_deref(), Some("Pilot"));
     assert_eq!(r.overview.as_deref(), Some("Walter White starts cooking."));
-    // Show-level fields backfill: studio + rating + tvdb id from tvshow.nfo.
+    // Show-level fields backfill: studio + rating from tvshow.nfo (not its ids).
     assert_eq!(r.studios, vec!["AMC"]);
     assert_eq!(r.community_rating, Some(9.4));
-    assert_eq!(r.provider_ids.tvdb.as_deref(), Some("81189"));
+    assert_eq!(r.provider_ids.tvdb, None);
     // Genres union: episode "Drama" + show "Drama","Crime" (deduped).
     assert!(r.genres.contains(&"Drama".to_string()));
     assert!(r.genres.contains(&"Crime".to_string()));
@@ -314,7 +313,6 @@ async fn an_episode_without_its_own_nfo_is_not_titled_with_the_show() {
     assert_eq!(r.premiere_date, None);
     // Show-wide fields still apply to the episode.
     assert_eq!(r.studios, vec!["AMC"]);
-    assert_eq!(r.provider_ids.tvdb.as_deref(), Some("81189"));
 }
 
 #[tokio::test]
@@ -1031,4 +1029,95 @@ async fn a_movie_nfo_naming_another_year_is_set_aside() {
         })
         .sum();
     assert_eq!(set_aside, 3, "each set-aside NFO is counted once");
+}
+
+/// B995 — a `tvshow.nfo` naming show-level ids (typed, `<tvdbid>`, and the
+/// bare `<id>` read as tmdb).
+const SHOW_IDS_TVSHOW_NFO: &str = r#"<tvshow>
+  <title>Show X</title>
+  <id>900001</id>
+  <uniqueid type="tvdb">900002</uniqueid>
+  <uniqueid type="imdb">tt900001</uniqueid>
+  <studio>AMC</studio>
+</tvshow>"#;
+
+fn show_x_request<'a>(
+    dir: &tempfile::TempDir,
+    media: &'a std::path::Path,
+    series: &'a SeriesInfo,
+    p: &'a MediaProbe,
+) -> MetadataRequest<'a> {
+    let _ = dir;
+    MetadataRequest {
+        path: media,
+        kind: MediaKind::Episode,
+        probe: p,
+        series: Some(series),
+    }
+}
+
+/// B995 — a show-level id is not an episode id: an episode without ids of
+/// its own gains none from `tvshow.nfo`, though the show's other fields still
+/// reach it.
+#[tokio::test]
+async fn an_episode_gains_no_id_from_the_show_nfo() {
+    let dir = tempdir().unwrap();
+    let media = dir.path().join("Show X - S01E02 - The Copper Key.mkv");
+    std::fs::write(dir.path().join("tvshow.nfo"), SHOW_IDS_TVSHOW_NFO).unwrap();
+    let series = SeriesInfo {
+        series_name: "Show X".into(),
+        series_folder: Some(dir.path().to_string_lossy().into_owned()),
+        ..SeriesInfo::default()
+    };
+    let p = probe();
+    let req = show_x_request(&dir, &media, &series, &p);
+
+    let r = NfoProvider::new().fetch(&req).await.unwrap();
+
+    assert_eq!(r.provider_ids, ProviderIds::default());
+    assert_eq!(r.studios, vec!["AMC"]);
+}
+
+/// B995 — the ids an episode's own NFO gives stay, and the show's do not
+/// fill the slots it leaves empty.
+#[tokio::test]
+async fn an_episodes_own_nfo_ids_stay_and_the_shows_do_not_fill_the_gaps() {
+    let dir = tempdir().unwrap();
+    let media = dir.path().join("Show X - S01E02 - The Copper Key.mkv");
+    std::fs::write(
+        media.with_extension("nfo"),
+        "<episodedetails><title>The Copper Key</title>\
+         <uniqueid type=\"tvdb\">900055</uniqueid></episodedetails>",
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("tvshow.nfo"), SHOW_IDS_TVSHOW_NFO).unwrap();
+    let series = SeriesInfo {
+        series_name: "Show X".into(),
+        series_folder: Some(dir.path().to_string_lossy().into_owned()),
+        ..SeriesInfo::default()
+    };
+    let p = probe();
+    let req = show_x_request(&dir, &media, &series, &p);
+
+    let r = NfoProvider::new().fetch(&req).await.unwrap();
+
+    assert_eq!(
+        r.provider_ids,
+        ProviderIds {
+            tvdb: Some("900055".into()),
+            ..ProviderIds::default()
+        }
+    );
+}
+
+/// B995 — the show's own evidence still carries the ids to the series.
+#[test]
+fn the_show_nfo_evidence_still_names_the_shows_ids() {
+    let dir = tempdir().unwrap();
+    std::fs::write(dir.path().join("tvshow.nfo"), SHOW_IDS_TVSHOW_NFO).unwrap();
+
+    let got = show_nfo_evidence(dir.path(), "Show X", None).unwrap();
+
+    assert_eq!(got.tmdb.as_deref(), Some("900001"));
+    assert_eq!(got.tvdb.as_deref(), Some("900002"));
 }
