@@ -86,10 +86,13 @@ pub enum StopOutcome {
     UserDataReadFailed,
     /// The new play state could not be written.
     UserDataWriteFailed,
+    /// The position was under the minimum resume point (FR-107): nothing
+    /// stored, so an earlier resume point or played mark stands.
+    BelowMinimum(BelowMinimum),
 }
 
 impl StopOutcome {
-    pub const ALL: [StopOutcome; 7] = [
+    pub const ALL: [StopOutcome; 9] = [
         StopOutcome::Saved,
         StopOutcome::Finished,
         StopOutcome::NoItem,
@@ -97,6 +100,8 @@ impl StopOutcome {
         StopOutcome::ItemReadFailed,
         StopOutcome::UserDataReadFailed,
         StopOutcome::UserDataWriteFailed,
+        StopOutcome::BelowMinimum(BelowMinimum::Video),
+        StopOutcome::BelowMinimum(BelowMinimum::Song),
     ];
 
     /// `(outcome, reason)` as the metric labels them.
@@ -109,6 +114,7 @@ impl StopOutcome {
             StopOutcome::ItemReadFailed => ("store_error", "item_read"),
             StopOutcome::UserDataReadFailed => ("store_error", "user_data_read"),
             StopOutcome::UserDataWriteFailed => ("store_error", "user_data_write"),
+            StopOutcome::BelowMinimum(which) => ("below_minimum", which.label()),
         }
     }
 
@@ -368,8 +374,8 @@ pub async fn stop(state: &AppState, user: &User, r: Report<'_>) -> Result<(), Re
     };
     let position = r.position_ticks;
     let progress_key = ProgressKey::new(user.id, item_id, r.play_session_id);
-    let runtime = match state.stores.get(item_id).await {
-        Ok(item) => item.probe.run_time_ticks().unwrap_or(0),
+    let (kind, runtime) = match state.stores.get(item_id).await {
+        Ok(item) => (item.kind, item.probe.run_time_ticks().unwrap_or(0)),
         // Removed since it started playing: there is no row to store on.
         Err(pharos_core::DomainError::NotFound(_)) => {
             StopOutcome::ItemMissing.record();
@@ -390,6 +396,22 @@ pub async fn stop(state: &AppState, user: &User, r: Report<'_>) -> Result<(), Re
     let played_complement = 100u64.saturating_sub(state.played_threshold_pct as u64);
     let finished =
         runtime > 0 && position >= runtime.saturating_sub(runtime * played_complement / 100);
+    if let Some(which) = (!finished)
+        .then(|| state.min_resume.below(kind, runtime, position))
+        .flatten()
+    {
+        StopOutcome::BelowMinimum(which).record();
+        tracing::debug!(
+            item = item_id,
+            position,
+            runtime,
+            min = ?state.min_resume,
+            "playback stop: under the minimum resume point, nothing stored"
+        );
+        // The stop is final: a report held for this session must not store it either.
+        state.progress_writes.forget(&progress_key);
+        return Ok(());
+    }
     let mut data = match state.stores.get_user_data(user.id, item_id).await {
         Ok(data) => data,
         Err(error) => {
