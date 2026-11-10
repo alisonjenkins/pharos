@@ -994,8 +994,8 @@ async fn scoped_next_up_lists_the_first_or_the_resumed_episode() {
     }
 }
 
-/// FR-105: Next Up reads the viewer's started rows, never a bulk read keyed
-/// by every visible item.
+/// FR-105: Next Up reads the viewer's started rows, and a bulk read for its
+/// picks alone, never one keyed by every visible item.
 #[actix_web::test]
 async fn next_up_reads_the_viewers_rows_not_every_items() {
     use tracing_subscriber::prelude::*;
@@ -1007,12 +1007,73 @@ async fn next_up_reads_the_viewers_rows_not_every_items() {
     let calls = crate::store_calls::StoreCallLog::default();
     let _spans =
         tracing::subscriber::set_default(tracing_subscriber::registry().with(calls.clone()));
-    library::next_up(&fx.state, &user, None, None)
+    let page = library::next_up(&fx.state, &user, None, None)
         .await
         .unwrap();
     let made = calls.take();
     assert!(made.iter().any(|c| c == "started_items"), "{made:?}");
-    assert!(!made.iter().any(|c| c == "user_data_bulk"), "{made:?}");
+    let bulk: Vec<u64> = calls
+        .take_counts()
+        .into_iter()
+        .filter(|(m, _)| m == "user_data_bulk")
+        .map(|(_, n)| n)
+        .collect();
+    assert_eq!(bulk, [page.items.len() as u64], "only the picks are bound");
+}
+
+/// A pick keeps its own row: a favourite unplayed episode is listed as one.
+#[actix_web::test]
+async fn next_up_carries_the_picks_own_play_state() {
+    use pharos_core::UserDataStore as _;
+    let fx = seed_rich().await;
+    seed_one_show(&fx).await;
+    watch(&fx, 611, true, 0, 10).await;
+    let favourite = pharos_core::UserItemData {
+        is_favorite: true,
+        audio_stream_index: Some(2),
+        ..pharos_core::UserItemData::default()
+    };
+    fx.state
+        .stores
+        .set_user_data(fx.user_id, 612, favourite)
+        .await
+        .unwrap();
+    let user = pharos_server::services::auth::user_for_token(&fx.state.stores, &fx.user_token)
+        .await
+        .unwrap();
+    let page = library::next_up(&fx.state, &user, None, None)
+        .await
+        .unwrap();
+    assert_eq!(page.items.len(), 1);
+    assert_eq!(page.items[0].0.id, 612);
+    assert_eq!(page.items[0].1, favourite);
+}
+
+/// A Next Up that cannot read the viewer's rows is counted as an error.
+#[actix_web::test]
+async fn a_failed_next_up_is_counted() {
+    let fx = seed_rich().await;
+    let user = pharos_server::services::auth::user_for_token(&fx.state.stores, &fx.user_token)
+        .await
+        .unwrap();
+    let recorder = metrics_util::debugging::DebuggingRecorder::new();
+    let snap = pharos_test_metrics::snapshotter(&recorder);
+    let _metrics = metrics::set_default_local_recorder(&recorder);
+    #[cfg(feature = "postgres")]
+    let sqlite = match &fx.state.stores {
+        pharos_store_sqlx::any::AnyStore::Sqlite(s) => s,
+        pharos_store_sqlx::any::AnyStore::Postgres(_) => panic!("the fixture is sqlite"),
+    };
+    #[cfg(not(feature = "postgres"))]
+    let sqlite = &fx.state.stores;
+    sqlx::query("DROP TABLE user_data")
+        .execute(sqlite.pool())
+        .await
+        .unwrap();
+    assert!(library::next_up(&fx.state, &user, None, None)
+        .await
+        .is_err());
+    assert_eq!(next_up_count(&snap, "error"), 1);
 }
 
 fn next_up_count(snap: &pharos_test_metrics::CumulativeSnapshotter, outcome: &str) -> u64 {

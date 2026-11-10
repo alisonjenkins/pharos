@@ -390,7 +390,7 @@ async fn next_up_page(
     limit: Option<u32>,
 ) -> Result<(ListPage, usize), ListError> {
     use crate::api::jellyfin::dto::series_id_for_key;
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashMap;
     // B92 — the kotlin SDK sends `?SeriesId=` dashed; canonicalise once.
     let series_id_want =
         series_id.map(|s| crate::api::jellyfin::items::canonical_wire_id(s).into_owned());
@@ -429,26 +429,26 @@ async fn next_up_page(
             }
         }
     };
-    // LIB-C11 — the folder-keyed identity, so two same-name shows in
-    // distinct folders stay separate.
-    let key = |item: &MediaItem| item.series.as_ref().map(|s| s.series_key().to_string());
-    let started_series: HashSet<String> = all
-        .iter()
-        .filter(|i| rows.contains_key(&i.id) && in_scope(i))
-        .filter_map(key)
-        .collect();
-    let mut episodes: HashMap<String, Vec<&MediaItem>> = HashMap::new();
+    // LIB-C11 — bucket by the folder-keyed identity, so two same-name
+    // shows in distinct folders stay separate.
+    let mut episodes: HashMap<String, (bool, Vec<&MediaItem>)> = HashMap::new();
     for item in all.iter().filter(|i| in_scope(i)) {
-        let Some(k) = key(item) else { continue };
-        if series_id_want.is_some() || started_series.contains(&k) {
-            episodes.entry(k).or_default().push(item);
-        }
+        let Some(series) = item.series.as_ref() else {
+            continue;
+        };
+        let bucket = episodes.entry(series.series_key().to_string()).or_default();
+        bucket.0 |= rows.contains_key(&item.id);
+        bucket.1.push(item);
     }
+    let scoped = series_id_want.is_some();
+    let episodes: Vec<Vec<&MediaItem>> = episodes
+        .into_values()
+        .filter_map(|(started, eps)| (started || scoped).then_some(eps))
+        .collect();
     let considered = episodes.len();
     let data = |id: u64| rows.get(&id).copied().unwrap_or_default();
-    let scoped = series_id_want.is_some();
     let mut picks: Vec<(i64, &MediaItem)> = episodes
-        .into_values()
+        .into_iter()
         .filter_map(|mut eps| {
             eps.sort_by_key(|e| (airing_order(e), e.id));
             pick_next(&eps, &data, scoped)
@@ -464,9 +464,18 @@ async fn next_up_page(
         return Ok((empty, considered));
     }
     let total = u32::try_from(picks.len()).unwrap_or(u32::MAX);
+    // A pick is unplayed, so its row (favourite, chosen tracks) is rarely
+    // among the started ones: read it for the picks alone.
+    let pick_ids: Vec<u64> = picks.iter().map(|(_, i)| i.id).collect();
+    let pick_data = state
+        .stores
+        .user_data_bulk(user.id, &pick_ids)
+        .await
+        .map_err(ListError::Store)?;
     let mut items: Vec<(MediaItem, UserItemData)> = picks
         .into_iter()
-        .map(|(_, item)| (item.clone(), data(item.id)))
+        .zip(pick_data)
+        .map(|((_, item), data)| (item.clone(), data))
         .collect();
     crate::services::metadata_text::localize_items(
         state,
