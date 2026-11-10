@@ -314,6 +314,38 @@ pub async fn resume(
 /// How many series a "next up" listing covers when the caller names no limit.
 pub const NEXT_UP_DEFAULT: u32 = 100;
 
+/// What one Next Up listing came to. The `label()` strings are a dashboard
+/// contract for `pharos_next_up_total{outcome}`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NextUpOutcome {
+    /// At least one episode listed.
+    Listed,
+    /// Nothing to list.
+    Empty,
+    /// The listing could not be built.
+    Error,
+}
+
+impl NextUpOutcome {
+    pub const ALL: [NextUpOutcome; 3] = [
+        NextUpOutcome::Listed,
+        NextUpOutcome::Empty,
+        NextUpOutcome::Error,
+    ];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            NextUpOutcome::Listed => "listed",
+            NextUpOutcome::Empty => "empty",
+            NextUpOutcome::Error => "error",
+        }
+    }
+
+    fn record(self) {
+        metrics::counter!("pharos_next_up_total", "outcome" => self.label()).increment(1);
+    }
+}
+
 /// For each series `user` may see (or only `series_id`, a series wire id),
 /// the lowest-numbered episode the user has not played, ordered by series
 /// name, each with the user's play state. At most `limit` (at least 1);
@@ -324,6 +356,39 @@ pub async fn next_up(
     series_id: Option<&str>,
     limit: Option<u32>,
 ) -> Result<ListPage, ListError> {
+    let listed = next_up_page(state, user, series_id, limit).await;
+    match &listed {
+        Ok((page, considered)) => {
+            let outcome = if page.items.is_empty() {
+                NextUpOutcome::Empty
+            } else {
+                NextUpOutcome::Listed
+            };
+            outcome.record();
+            tracing::debug!(
+                user_id = %user.id.0.simple(),
+                scoped = series_id.is_some(),
+                considered,
+                kept = page.items.len(),
+                outcome = outcome.label(),
+                "next up listed"
+            );
+        }
+        Err(error) => {
+            NextUpOutcome::Error.record();
+            tracing::warn!(user_id = %user.id.0.simple(), ?error, "next up failed");
+        }
+    }
+    listed.map(|(page, _)| page)
+}
+
+/// [`next_up`]'s page, with the number of series it chose from.
+async fn next_up_page(
+    state: &AppState,
+    user: &User,
+    series_id: Option<&str>,
+    limit: Option<u32>,
+) -> Result<(ListPage, usize), ListError> {
     let all = state.list_items_cached().await.map_err(ListError::Store)?;
     let all = crate::services::access::visible_items(state, user, all, "next_up")
         .await
@@ -371,6 +436,7 @@ pub async fn next_up(
     }
     // Sort each bucket by (season_number, episode_number) ascending,
     // pick the head.
+    let considered = buckets.len();
     let mut picks: Vec<(usize, &MediaItem)> = buckets
         .into_values()
         .filter_map(|mut eps| {
@@ -417,11 +483,14 @@ pub async fn next_up(
         items.iter_mut().map(|(i, _)| i),
     )
     .await;
-    Ok(ListPage {
-        items,
-        total,
-        start: 0,
-    })
+    Ok((
+        ListPage {
+            items,
+            total,
+            start: 0,
+        },
+        considered,
+    ))
 }
 
 /// Most people a title page lists from its cast.
@@ -1648,6 +1717,12 @@ mod tests {
         .into_iter()
         .collect();
         assert_eq!(labels.len(), 5);
+    }
+
+    #[test]
+    fn next_up_outcome_labels_are_distinct_and_stable() {
+        let labels = super::NextUpOutcome::ALL.map(super::NextUpOutcome::label);
+        assert_eq!(labels, ["listed", "empty", "error"]);
     }
 
     #[test]
