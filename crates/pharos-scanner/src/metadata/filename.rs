@@ -704,8 +704,8 @@ mod tests {
             },
             // 4K alias → 2160p; dedupe a repeated source token.
             Case {
-                input: "Dune.2021.4K.UHD.BluRay.BluRay",
-                title: Some("Dune"),
+                input: "Film A.2021.4K.UHD.BluRay.BluRay",
+                title: Some("Film A"),
                 year: Some(2021),
                 tags: &["2160p", "BluRay"],
             },
@@ -786,16 +786,16 @@ mod tests {
     fn an_episode_title_is_what_follows_its_number() {
         let cases = [
             (
-                "Star Trek - The Next Generation - S03E07 - The Enemy WEBRip-1080p",
-                Some("The Enemy"),
+                "Show T - The Next Wave - S03E07 - The Rival WEBRip-1080p",
+                Some("The Rival"),
             ),
             (
-                "2 Broke Girls - S03E21 - And the Wedding Cake Cake Cake WEBDL-1080p",
-                Some("And the Wedding Cake Cake Cake"),
+                "2 Lucky Pals - S03E21 - And the Pie Pie Pie WEBDL-1080p",
+                Some("And the Pie Pie Pie"),
             ),
             (
-                "One Piece - S14E06 - 487 - The Insatiable Akainu! Lava Fists Pummel Luffy!",
-                Some("The Insatiable Akainu! Lava Fists Pummel Luffy!"),
+                "Show B - S14E06 - 487 - The Silent Harbour! Ice Fists Pummel the Captain!",
+                Some("The Silent Harbour! Ice Fists Pummel the Captain!"),
             ),
             ("Show - S01E01-E02 - Pilot [Bluray-1080p]", Some("Pilot")),
             (
@@ -841,10 +841,10 @@ mod tests {
             ("E01 - Pilot", Some("Pilot")),
             ("EP02 - The Return", Some("The Return")),
             (
-                "S03E07 - The Enemy (Director's Cut)",
-                Some("The Enemy (Director's Cut)"),
+                "S03E07 - The Rival (Director's Cut)",
+                Some("The Rival (Director's Cut)"),
             ),
-            ("Star Trek - S03E07 - WEBRip-720p", None),
+            ("Show T - S03E07 - WEBRip-720p", None),
         ];
         for (stem, want) in cases {
             assert_eq!(episode_title(stem).as_deref(), want, "{stem}");
@@ -855,22 +855,22 @@ mod tests {
     async fn fetch_episode_titles_it_from_the_name_not_the_show() {
         let probe = MediaProbe::default();
         let path = Path::new(
-            "/tv/Star Trek/Season 03/Star Trek - The Next Generation - S03E07 - The Enemy WEBRip-1080p.mkv",
+            "/tv/Show T/Season 03/Show T - The Next Wave - S03E07 - The Rival WEBRip-1080p.mkv",
         );
         let r = FilenameProvider::new()
             .fetch(&req(path, MediaKind::Episode, &probe))
             .await
             .unwrap();
-        assert_eq!(r.title.as_deref(), Some("The Enemy"));
+        assert_eq!(r.title.as_deref(), Some("The Rival"));
 
-        let absolute = Path::new("/tv/One Piece/One Piece - 487 - The Insatiable Akainu.mkv");
+        let absolute = Path::new("/tv/Show B/Show B - 487 - The Silent Harbour.mkv");
         let r = FilenameProvider::new()
             .fetch(&req(absolute, MediaKind::Episode, &probe))
             .await
             .unwrap();
         assert_eq!(
             r.title.as_deref(),
-            Some("One Piece - 487 - The Insatiable Akainu")
+            Some("Show B - 487 - The Silent Harbour")
         );
     }
 
@@ -1281,8 +1281,8 @@ mod tests {
 
     #[test]
     fn parse_video_3d_format_and_title_episodes() {
-        // Episode 1: Doctor Who
-        let ep1 = "Doctor Who - S07E14 - The Day of the Doctor [1080p.HTAB]";
+        // Episode 1: Show C
+        let ep1 = "Show C - S07E14 - The Day of the Visitor [1080p.HTAB]";
         let (fmt1, src1) = parse_video_3d_format(ep1);
         assert_eq!(fmt1, Some(Video3DFormat::HalfTopAndBottom));
         assert_eq!(src1, Some("filename"));
@@ -1290,7 +1290,7 @@ mod tests {
         let parsed1 = parse_filename(ep1, false);
         assert_eq!(
             parsed1.title.as_deref(),
-            Some("Doctor Who - S07E14 - The Day of the Doctor")
+            Some("Show C - S07E14 - The Day of the Visitor")
         );
         assert_eq!(parsed1.year, None);
         assert!(parsed1.tags.contains(&"1080p".to_string()));

@@ -245,15 +245,15 @@ mod tests {
     #[tokio::test]
     async fn an_epubs_descriptive_fields_become_ordinary_item_metadata() {
         let td = tempfile::tempdir().unwrap();
-        let p = td.path().join("Dune.epub");
+        let p = td.path().join("Book A.epub");
         write_epub(
             &p,
             r#"<package><metadata>
-              <dc:title>Dune</dc:title>
-              <dc:creator>Frank Herbert</dc:creator>
-              <dc:publisher>Chilton Books</dc:publisher>
+              <dc:title>Book A</dc:title>
+              <dc:creator>Author A</dc:creator>
+              <dc:publisher>Press A</dc:publisher>
               <dc:date>1965-08-01</dc:date>
-              <dc:description>A desert planet.</dc:description>
+              <dc:description>A dry planet.</dc:description>
             </metadata><manifest/></package>"#,
         );
 
@@ -263,8 +263,8 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(out.title.as_deref(), Some("Dune"));
-        assert_eq!(out.overview.as_deref(), Some("A desert planet."));
+        assert_eq!(out.title.as_deref(), Some("Book A"));
+        assert_eq!(out.overview.as_deref(), Some("A dry planet."));
         assert_eq!(
             out.production_year,
             Some(1965),
@@ -276,11 +276,11 @@ mod tests {
         );
         assert_eq!(
             out.studios,
-            vec!["Chilton Books".to_string()],
+            vec!["Press A".to_string()],
             "Jellyfin has no publisher field; Studios is where a client shows it"
         );
         assert_eq!(out.people.len(), 1);
-        assert_eq!(out.people[0].name, "Frank Herbert");
+        assert_eq!(out.people[0].name, "Author A");
         assert_eq!(out.people[0].kind, PersonKind::Writer);
     }
 

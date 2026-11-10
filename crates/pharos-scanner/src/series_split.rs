@@ -671,7 +671,7 @@ mod tests {
         // Another show's name prefix says nothing about this folder's show.
         assert_eq!(
             stated_show_year(Path::new(
-                "/tv/Show B/Season 1/Doctor Who (2005) - S01E01.mkv"
+                "/tv/Show B/Season 1/Lantern Tale (2005) - S01E01.mkv"
             )),
             None
         );
@@ -969,15 +969,15 @@ mod tests {
     /// split off to another key does.
     #[test]
     fn a_year_only_change_is_no_key_move() {
-        let folder = "/tv/Forever (US)";
-        let backfilled = row("/tv/Forever (US)/S01E01.mkv", folder, Some(folder), None);
+        let folder = "/tv/Show L (US)";
+        let backfilled = row("/tv/Show L (US)/S01E01.mkv", folder, Some(folder), None);
         let year_only = SeriesKeyUpdate {
             path: backfilled.path.clone(),
             series_key: None,
             series_year: Some(1996),
         };
         assert!(!moves_key(&year_only, Some(&backfilled)));
-        let unkeyed = row("/tv/Forever (US)/S01E02.mkv", folder, None, None);
+        let unkeyed = row("/tv/Show L (US)/S01E02.mkv", folder, None, None);
         assert!(!moves_key(&year_only, Some(&unkeyed)));
         let split = SeriesKeyUpdate {
             series_key: Some(split_key(folder, 1971)),
@@ -985,7 +985,7 @@ mod tests {
         };
         assert!(moves_key(&split, Some(&backfilled)));
         let back = row(
-            "/tv/Forever (US)/S01E03.mkv",
+            "/tv/Show L (US)/S01E03.mkv",
             folder,
             Some(&split_key(folder, 1971)),
             Some(1971),

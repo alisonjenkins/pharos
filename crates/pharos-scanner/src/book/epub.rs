@@ -505,15 +505,15 @@ mod tests {
     const OPF: &str = r#"<?xml version="1.0"?>
 <package xmlns="http://www.idpf.org/2007/opf" version="2.0" unique-identifier="uid">
   <metadata xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:opf="http://www.idpf.org/2007/opf">
-    <dc:title>Dune</dc:title>
-    <dc:creator opf:role="aut">Frank Herbert</dc:creator>
+    <dc:title>Book A</dc:title>
+    <dc:creator opf:role="aut">Author A</dc:creator>
     <dc:creator opf:role="ill">Someone Else</dc:creator>
-    <dc:publisher>Chilton Books</dc:publisher>
+    <dc:publisher>Press A</dc:publisher>
     <dc:date>1965-08-01</dc:date>
-    <dc:description>A desert planet.</dc:description>
+    <dc:description>A dry planet.</dc:description>
     <dc:identifier id="uid">urn:uuid:1234-not-an-isbn</dc:identifier>
-    <dc:identifier opf:scheme="ISBN">9780441013593</dc:identifier>
-    <meta name="calibre:series" content="Dune Chronicles"/>
+    <dc:identifier opf:scheme="ISBN">9780306406157</dc:identifier>
+    <meta name="calibre:series" content="Book A Cycle"/>
     <meta name="calibre:series_index" content="1.0"/>
     <meta name="cover" content="cover-img"/>
   </metadata>
@@ -526,25 +526,25 @@ mod tests {
     #[test]
     fn an_epubs_opf_metadata_is_read() {
         let td = tempfile::tempdir().unwrap();
-        let p = td.path().join("Dune.epub");
+        let p = td.path().join("Book A.epub");
         write_epub(&p, Some(CONTAINER), Some(("OEBPS/content.opf", OPF)));
 
         let meta = read_epub(&p).expect("a well-formed epub must parse");
-        assert_eq!(meta.title.as_deref(), Some("Dune"));
+        assert_eq!(meta.title.as_deref(), Some("Book A"));
         assert_eq!(
             meta.author.as_deref(),
-            Some("Frank Herbert"),
+            Some("Author A"),
             "the FIRST dc:creator is the author; the illustrator must not win"
         );
-        assert_eq!(meta.publisher.as_deref(), Some("Chilton Books"));
+        assert_eq!(meta.publisher.as_deref(), Some("Press A"));
         assert_eq!(meta.date.as_deref(), Some("1965-08-01"));
-        assert_eq!(meta.description.as_deref(), Some("A desert planet."));
+        assert_eq!(meta.description.as_deref(), Some("A dry planet."));
         assert_eq!(
             meta.isbn.as_deref(),
-            Some("9780441013593"),
+            Some("9780306406157"),
             "the UUID identifier must not be stored as an ISBN"
         );
-        assert_eq!(meta.series_name.as_deref(), Some("Dune Chronicles"));
+        assert_eq!(meta.series_name.as_deref(), Some("Book A Cycle"));
         assert_eq!(
             meta.series_index,
             Some(1),
@@ -560,7 +560,7 @@ mod tests {
         let bm = meta.to_book_meta();
         assert_eq!(bm.format, BookFormat::Epub);
         assert_eq!(bm.page_count, None);
-        assert_eq!(bm.author.as_deref(), Some("Frank Herbert"));
+        assert_eq!(bm.author.as_deref(), Some("Author A"));
     }
 
     #[test]
