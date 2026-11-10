@@ -18,8 +18,12 @@ pharos_segment_detect_total{kind, outcome, consensus}
 
 - Incremented once per **episode per kind** per analysis pass.
 - The label set is a dashboard contract: bounded, stable, and sourced only from
-  `Verdict::label()`. Adding a variant is a dashboard change and needs its own
-  justification — it is not a free side effect of a fix.
+  `Verdict::label()` and `Consensus::label()`. Adding a variant is a dashboard
+  change and needs its own justification — it is not a free side effect of a fix.
+- `consensus` exists so the overlap fallback (T106) is measurable on its own:
+  `sum by (kind, consensus) (pharos_segment_detect_total{outcome="emitted"})`
+  counts the Skip buttons it adds, which `outcome` alone cannot tell apart from
+  endpoint emissions.
 
 ## Log line
 
