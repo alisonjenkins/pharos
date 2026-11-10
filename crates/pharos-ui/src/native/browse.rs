@@ -5272,8 +5272,11 @@ mod tests {
             .and_then(|v| v.parse::<f64>().ok())
             .unwrap_or(f64::MAX);
         let reach = outline.max(glow);
-        assert!(px(&nav, "padding") >= reach, "{nav}\nreach {reach}");
-        assert!(nav.contains("overflow-x: auto"), "{nav}");
+        // The filter row scrolls sideways too (B1311).
+        for row in [nav, rule(".pharos-filters")] {
+            assert!(px(&row, "padding") >= reach, "{row}\nreach {reach}");
+            assert!(row.contains("overflow-x: auto"), "{row}");
+        }
     }
 
     #[test]
