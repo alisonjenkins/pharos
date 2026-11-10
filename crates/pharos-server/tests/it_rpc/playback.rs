@@ -1540,9 +1540,32 @@ async fn a_device_audio_deny_list_stops_a_native_direct_play() {
     use pharos_store_sqlx::ServerConfigStore as _;
     let (server, fx) = crate::revocation::start().await;
     seed_playable(&fx).await;
+    // AAC is the conversion codec and a saved deny entry for it is ignored
+    // (V1012), so deny the source's E-AC-3 instead.
+    fx.state
+        .stores
+        .put(MediaItem {
+            id: MOVIE,
+            path: "/libA/native.mp4".into(),
+            title: "Native".into(),
+            kind: MediaKind::Movie,
+            probe: MediaProbe {
+                duration_ms: Some(60_000),
+                width: Some(1920),
+                height: Some(1080),
+                bitrate_bps: Some(4_000_000),
+                container: Some("mp4".into()),
+                video_codec: Some("h264".into()),
+                audio_codec: Some("eac3".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .await
+        .unwrap();
     let (client, _closed) = crate::revocation::connect(&server).await;
     let session = crate::revocation::signed_in(&client, &fx.user_token).await;
-    let direct = caps(&["h264"], &["aac"], &["mp4"]);
+    let direct = caps(&["h264"], &["eac3"], &["mp4"]);
     let decide = || async {
         negotiate(
             &session,
@@ -1559,7 +1582,7 @@ async fn a_device_audio_deny_list_stops_a_native_direct_play() {
 
     fx.state
         .stores
-        .set_named_config(&playback::denied_audio_codecs_key("test"), r#"["aac"]"#)
+        .set_named_config(&playback::denied_audio_codecs_key("test"), r#"["eac3"]"#)
         .await
         .unwrap();
     let denied = decide().await;
