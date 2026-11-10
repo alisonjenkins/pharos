@@ -53,13 +53,13 @@ Id blocks (bugs and invariants are written with the fix):
 
 ## G4 — Player feedback
 
-- [ ] T038-400 Reproduce: a denial with no trace id, one caption for every wait (include a saturated encoder), Up Next over the ending without detected credits. Name the query that shows each.
-- [ ] T038-401 Trace id on every denial, shown in error panels (FR-404); verify by query.
-- [ ] T038-402 Server load hint for a queued play or seek (FR-402).
-- [ ] T038-403 Wait caption by cause (FR-401), using T038-402.
-- [ ] T038-404 [P] Failure panel hint by kind and Report a problem (FR-403); Back during first load (FR-408).
-- [ ] T038-405 [P] Up Next pill without detected credits (FR-405); Up Next in the small player (FR-406).
-- [ ] T038-406 Refused autoplay (FR-407); confirm with the browser video regression thread first.
+- [x] T038-400 Reproduce: a denial with no trace id, one caption for every wait (include a saturated encoder), Up Next over the ending without detected credits. Name the query that shows each.
+- [x] T038-401 Trace id on every denial, shown in error panels (FR-404); verify by query.
+- [x] T038-402 Server load hint for a queued play or seek (FR-402).
+- [x] T038-403 Wait caption by cause (FR-401), using T038-402.
+- [x] T038-404 [P] Failure panel hint by kind and Report a problem (FR-403); Back during first load (FR-408).
+- [x] T038-405 [P] Up Next pill without detected credits (FR-405); Up Next in the small player (FR-406).
+- [x] T038-406 Refused autoplay (FR-407); confirm with the browser video regression thread first.
 
 ## G5 — Watching together feedback
 
