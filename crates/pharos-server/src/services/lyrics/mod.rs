@@ -463,6 +463,7 @@ pub async fn for_item(
                             }
                         }
                     }
+                    start_lines_at_their_first_word(&mut lyrics.lines);
                 }
                 align::Lookup::Pending => {
                     words_pending = true;
@@ -472,6 +473,23 @@ pub async fn for_item(
         }
     }
     Ok(Some((lyrics, words_pending)))
+}
+
+/// The aligner may find a line's first word before its stamp (B1165); the
+/// player shows a line from its start, so a later start would show that word
+/// late. A line never moves before the one above it.
+fn start_lines_at_their_first_word(lines: &mut [LyricLine]) {
+    let mut floor = 0;
+    for line in lines {
+        if let (Some(start), Some(first)) = (line.start_ms, line.words.first()) {
+            if first.start_ms < start {
+                line.start_ms = Some(first.start_ms.max(floor));
+            }
+        }
+        if let Some(start) = line.start_ms {
+            floor = start;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -486,6 +504,32 @@ mod tests {
             text: text.to_owned(),
             words: Vec::new(),
         }
+    }
+
+    #[test]
+    fn a_line_starts_at_a_first_word_sung_before_its_stamp_but_not_before_the_line_above() {
+        let word = |start_ms| WordStamp { at: 0, start_ms };
+        let mut lines = vec![
+            LyricLine {
+                words: vec![word(9_400)],
+                ..line(Some(10_000), "early")
+            },
+            LyricLine {
+                words: vec![word(12_300)],
+                ..line(Some(12_000), "late")
+            },
+            LyricLine {
+                words: vec![word(11_000)],
+                ..line(Some(13_000), "too early")
+            },
+            line(Some(14_000), "no words"),
+        ];
+        start_lines_at_their_first_word(&mut lines);
+        let starts: Vec<_> = lines.iter().map(|l| l.start_ms).collect();
+        assert_eq!(
+            starts,
+            [Some(9_400), Some(12_000), Some(12_000), Some(14_000)]
+        );
     }
 
     #[test]
