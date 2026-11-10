@@ -6,17 +6,23 @@
 use std::path::PathBuf;
 
 use pharos_hls::fmp4::{decode_times, sample_entries, timescales, to_ms, CodecConfig, TrackKind};
-use pharos_hls::playlist::{parse_master, parse_media, MediaPlaylist};
+use pharos_hls::playlist::{parse_master, parse_media, MediaPlaylist, Unsupported};
 use pharos_hls::uri::resolve;
 
 const BASE: &str = "http://pharos.test/videos/00000000000000000000000000000001/master.m3u8";
 
 /// A recorded file, by the URI the playlists name it with.
 fn read(stream: &str, uri: &str) -> Vec<u8> {
+    // The path under `/videos/{item}/`, which is where the corpus keeps it.
     let path = uri
         .split('?')
         .next()
-        .and_then(|p| p.split("/videos/00000000000000000000000000000001/").nth(1))
+        .and_then(|p| {
+            p.to_ascii_lowercase()
+                .find("/videos/")
+                .map(|i| &p[i + "/videos/".len()..])
+        })
+        .and_then(|p| p.split_once('/').map(|(_, rest)| rest))
         .unwrap_or_else(|| panic!("{uri} is not a recorded stream path"));
     let file = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/corpus")
@@ -154,4 +160,40 @@ fn the_vp9_master_is_one_fmp4_rung_with_an_opus_group() {
         check_track(stream, &audio_pl),
         Some(CodecConfig::Opus(_))
     ));
+}
+
+// Music: the mp3 is served as muxed MPEG-TS, the source rung as MP3 and the
+// capped rungs as AAC, with no video. The Rust engine is fMP4-only, so this
+// is the stream it hands to hls.js.
+#[test]
+fn the_audio_only_master_is_a_muxed_ts_ladder_with_no_video() {
+    let stream = "audio-only";
+    let base = "http://pharos.test/videos/00000000000000003e29a6ec1c322978/master.m3u8";
+    let master = parse_master(&text(stream, base), base).unwrap();
+    assert_eq!(master.version, Some(3));
+    assert!(master.audio.is_empty(), "the audio is in the variants");
+    let codecs: Vec<_> = master.variants.iter().map(|v| v.codecs.join(",")).collect();
+    assert_eq!(codecs[0], "mp4a.40.34", "the source rung is MP3");
+    assert!(codecs[1..].iter().all(|c| c == "mp4a.40.2"), "{codecs:?}");
+    assert!(master.variants.iter().all(|v| v.resolution.is_none()));
+    for v in &master.variants {
+        let pl = parse_media(&text(stream, &v.uri), &v.uri).unwrap();
+        assert!(pl.vod && pl.ended, "{}", v.uri);
+        assert_eq!(pl.init_uri, None, "{}: TS has no init segment", v.uri);
+        assert!(pl
+            .segments
+            .iter()
+            .all(|s| s.uri.split('?').next().unwrap().ends_with(".ts")));
+        assert!(
+            !pl.unsupported.contains(&Unsupported::ByteRange),
+            "{}: {:?}",
+            v.uri,
+            pl.unsupported
+        );
+    }
+    // A TS packet starts with the 0x47 sync byte, every 188 bytes.
+    let first = parse_media(&text(stream, &master.variants[0].uri), base).unwrap();
+    let ts = read(stream, &first.segments[0].uri);
+    assert_eq!(ts.len() % 188, 0);
+    assert!(ts.chunks(188).all(|p| p[0] == 0x47));
 }
