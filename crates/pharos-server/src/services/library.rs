@@ -346,10 +346,10 @@ impl NextUpOutcome {
     }
 }
 
-/// For each series `user` may see (or only `series_id`, a series wire id),
-/// the lowest-numbered episode the user has not played, ordered by series
-/// name, each with the user's play state. At most `limit` (at least 1);
-/// `None` means [`NEXT_UP_DEFAULT`].
+/// For each series `user` has started and may see (or only `series_id`, a
+/// series wire id), the episode to watch next under ADR-0113, the series
+/// watched most recently first, each with the user's play state. At most
+/// `limit` (at least 1); `None` means [`NEXT_UP_DEFAULT`].
 pub async fn next_up(
     state: &AppState,
     user: &User,
@@ -389,93 +389,84 @@ async fn next_up_page(
     series_id: Option<&str>,
     limit: Option<u32>,
 ) -> Result<(ListPage, usize), ListError> {
+    use crate::api::jellyfin::dto::series_id_for_key;
+    use std::collections::{HashMap, HashSet};
+    // B92 — the kotlin SDK sends `?SeriesId=` dashed; canonicalise once.
+    let series_id_want =
+        series_id.map(|s| crate::api::jellyfin::items::canonical_wire_id(s).into_owned());
+    // FR-105 — the viewer's own rows say which series are started.
+    let started = state
+        .stores
+        .started_items(user.id, MediaKind::Episode)
+        .await
+        .map_err(ListError::Store)?;
+    let empty = ListPage {
+        items: Vec::new(),
+        total: 0,
+        start: 0,
+    };
+    if started.is_empty() && series_id_want.is_none() {
+        return Ok((empty, 0));
+    }
+    let rows: HashMap<u64, UserItemData> = started.into_iter().collect();
     let all = state.list_items_cached().await.map_err(ListError::Store)?;
     let all = crate::services::access::visible_items(state, user, all, "next_up")
         .await
         .map_err(ListError::Hidden)?;
-    let ids: Vec<u64> = all.iter().map(|i| i.id).collect();
-    let user_data = state
-        .stores
-        .user_data_bulk(user.id, &ids)
-        .await
-        .map_err(ListError::Store)?;
-    // Group episodes by series; pick the lowest unwatched per series.
-    use crate::api::jellyfin::dto::series_id_for_key;
-    use std::collections::HashMap;
-    // B92 — the kotlin SDK sends `?SeriesId=` dashed; canonicalise once.
-    let series_id_want =
-        series_id.map(|s| crate::api::jellyfin::items::canonical_wire_id(s).into_owned());
-    let mut buckets: HashMap<String, Vec<(usize, &MediaItem)>> = HashMap::new();
-    for (idx, item) in all.iter().enumerate() {
-        if !matches!(item.kind, MediaKind::Episode) {
-            continue;
-        }
+    // A Series-page request scopes to that series (`SeriesId`); the
+    // home-screen row leaves it unset and gets one pick per started series.
+    let in_scope = |item: &MediaItem| -> bool {
         let Some(series) = item.series.as_ref() else {
-            continue;
+            return false;
         };
-        // A Series-page request scopes to that series (`SeriesId`); the
-        // home-screen row leaves it unset and gets one pick per series.
-        // B92 — canonicalise the dashed `SeriesId` the Android TV Series page
-        // sends, else Next Up on that page comes back empty.
-        if let Some(want) = series_id_want.as_deref() {
-            if series_id_for_key(series.identity_folder(), &series.series_name).as_str() != want {
-                continue;
+        if !matches!(item.kind, MediaKind::Episode) {
+            return false;
+        }
+        match series_id_want.as_deref() {
+            None => true,
+            Some(want) => {
+                series_id_for_key(series.identity_folder(), &series.series_name).as_str() == want
             }
         }
-        // Skip already-played episodes.
-        if user_data.get(idx).copied().unwrap_or_default().played {
-            continue;
+    };
+    // LIB-C11 — the folder-keyed identity, so two same-name shows in
+    // distinct folders stay separate.
+    let key = |item: &MediaItem| item.series.as_ref().map(|s| s.series_key().to_string());
+    let started_series: HashSet<String> = all
+        .iter()
+        .filter(|i| rows.contains_key(&i.id) && in_scope(i))
+        .filter_map(key)
+        .collect();
+    let mut episodes: HashMap<String, Vec<&MediaItem>> = HashMap::new();
+    for item in all.iter().filter(|i| in_scope(i)) {
+        let Some(k) = key(item) else { continue };
+        if series_id_want.is_some() || started_series.contains(&k) {
+            episodes.entry(k).or_default().push(item);
         }
-        // LIB-C11 — bucket by the folder-keyed identity, not the bare
-        // name, so two same-name shows in distinct folders stay separate
-        // and don't interleave into one NextUp pick.
-        buckets
-            .entry(series.series_key().to_string())
-            .or_default()
-            .push((idx, item));
     }
-    // Sort each bucket by (season_number, episode_number) ascending,
-    // pick the head.
-    let considered = buckets.len();
-    let mut picks: Vec<(usize, &MediaItem)> = buckets
+    let considered = episodes.len();
+    let data = |id: u64| rows.get(&id).copied().unwrap_or_default();
+    let scoped = series_id_want.is_some();
+    let mut picks: Vec<(i64, &MediaItem)> = episodes
         .into_values()
         .filter_map(|mut eps| {
-            eps.sort_by_key(|(_, e)| {
-                let s = e.series.as_ref().and_then(|s| s.season_number).unwrap_or(0);
-                let n = e
-                    .series
-                    .as_ref()
-                    .and_then(|s| s.episode_number)
-                    .unwrap_or(0);
-                (s, n)
-            });
-            eps.into_iter().next()
+            eps.sort_by_key(|e| (airing_order(e), e.id));
+            pick_next(&eps, &data, scoped)
         })
         .collect();
-    // Stable series-name sort across the result set.
-    picks.sort_by(|a, b| {
-        let an =
-            a.1.series
-                .as_ref()
-                .map(|s| s.series_name.as_str())
-                .unwrap_or("");
-        let bn =
-            b.1.series
-                .as_ref()
-                .map(|s| s.series_name.as_str())
-                .unwrap_or("");
-        an.cmp(bn)
+    // FR-103 — the series watched most recently first; name breaks ties.
+    picks.sort_by(|(a_at, a), (b_at, b)| {
+        b_at.cmp(a_at)
+            .then_with(|| series_name(a).cmp(series_name(b)))
     });
     picks.truncate(limit.unwrap_or(NEXT_UP_DEFAULT).max(1) as usize);
+    if picks.is_empty() {
+        return Ok((empty, considered));
+    }
     let total = u32::try_from(picks.len()).unwrap_or(u32::MAX);
     let mut items: Vec<(MediaItem, UserItemData)> = picks
         .into_iter()
-        .map(|(idx, item)| {
-            (
-                item.clone(),
-                user_data.get(idx).copied().unwrap_or_default(),
-            )
-        })
+        .map(|(_, item)| (item.clone(), data(item.id)))
         .collect();
     crate::services::metadata_text::localize_items(
         state,
@@ -491,6 +482,69 @@ async fn next_up_page(
         },
         considered,
     ))
+}
+
+/// An episode's place in airing order: season, then episode number.
+fn airing_order(e: &MediaItem) -> (u32, u32) {
+    let series = e.series.as_ref();
+    (
+        series.and_then(|s| s.season_number).unwrap_or(0),
+        series.and_then(|s| s.episode_number).unwrap_or(0),
+    )
+}
+
+fn series_name(e: &MediaItem) -> &str {
+    e.series.as_ref().map_or("", |s| s.series_name.as_str())
+}
+
+fn is_special(e: &MediaItem) -> bool {
+    e.series.as_ref().and_then(|s| s.season_number) == Some(0)
+}
+
+/// The Next Up episode of one series, `eps` in airing order, with when the
+/// series was last played (ADR-0113). The anchor is the episode played or
+/// started most recently, the later in airing order on a tie. The pick is
+/// the first unplayed episode after it, a special only when the anchor is a
+/// special (FR-102). On the home rail a series with nothing started is not
+/// listed, and a pick already in progress is left to Continue Watching
+/// (FR-101, FR-104); a `scoped` (Series page) request lists the anchor
+/// itself when it is in progress, and an unstarted series' first episode.
+fn pick_next<'a>(
+    eps: &[&'a MediaItem],
+    data: &impl Fn(u64) -> UserItemData,
+    scoped: bool,
+) -> Option<(i64, &'a MediaItem)> {
+    let touched = |d: &UserItemData| d.played || d.last_played_position_ticks > 0;
+    let anchor = eps
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| touched(&data(e.id)))
+        .max_by_key(|(idx, e)| (data(e.id).last_played_at, *idx));
+    let Some((at_idx, anchor)) = anchor else {
+        if !scoped {
+            return None;
+        }
+        let first = eps
+            .iter()
+            .find(|e| !is_special(e) && !data(e.id).played)
+            .copied()?;
+        return Some((0, first));
+    };
+    let anchor_data = data(anchor.id);
+    let last_played_at = anchor_data.last_played_at;
+    if !anchor_data.played {
+        return scoped.then_some((last_played_at, *anchor));
+    }
+    let specials = is_special(anchor);
+    let next = eps
+        .iter()
+        .skip(at_idx.saturating_add(1))
+        .find(|e| (specials || !is_special(e)) && !data(e.id).played)
+        .copied()?;
+    if !scoped && data(next.id).last_played_position_ticks > 0 {
+        return None;
+    }
+    Some((last_played_at, next))
 }
 
 /// Most people a title page lists from its cast.
