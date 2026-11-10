@@ -9,6 +9,7 @@ description = "CTC forced alignment of lyric words to MMS_FA emissions, matching
 
 [dependencies]
 actix-web.workspace = true
+memmap2 = "0.9"
 metrics.workspace = true
 metrics-exporter-prometheus.workspace = true
 metrics-process.workspace = true
