@@ -552,6 +552,10 @@ pub enum DirectPlayBlock {
     /// "clients are sending nothing" from "this library is URL-backed" — the
     /// first is a compatibility problem to chase and the second is by design.
     RemoteSource { locator: String },
+    /// Spec 037 — the item is a film split across files, and a direct play
+    /// would read only its first part. Like `RemoteSource`, a fact about the
+    /// item for every client: it streams as one film through HLS (V1155).
+    SplitFilm { parts: u32 },
 }
 
 impl DirectPlayBlock {
@@ -570,6 +574,7 @@ impl DirectPlayBlock {
             Self::CodecCondition => "codec_condition",
             Self::VideoRange { .. } => "video_range",
             Self::RemoteSource { .. } => "remote_source",
+            Self::SplitFilm { .. } => "split_film",
         }
     }
 
@@ -590,7 +595,7 @@ impl DirectPlayBlock {
             // outcome at all, so if it applies it is the whole answer and must
             // not be masked by a profile that also happened to reject the
             // container.
-            Self::RemoteSource { .. } => 8,
+            Self::RemoteSource { .. } | Self::SplitFilm { .. } => 8,
             Self::NotBlocked => 9,
         }
     }
@@ -624,6 +629,12 @@ impl std::fmt::Display for DirectPlayBlock {
             }
             Self::RemoteSource { locator } => {
                 write!(f, "source {locator} is not a file; direct play impossible")
+            }
+            Self::SplitFilm { parts } => {
+                write!(
+                    f,
+                    "film is split across {parts} files; a direct play would read the first only"
+                )
             }
         }
     }
@@ -1300,6 +1311,7 @@ mod tests {
             DirectPlayBlock::AudioCodecDenied {
                 source: "eac3".into(),
             },
+            DirectPlayBlock::SplitFilm { parts: 3 },
         ];
         let labels: std::collections::BTreeSet<_> = all.iter().map(|b| b.label()).collect();
         assert_eq!(labels.len(), all.len());
