@@ -6,7 +6,7 @@
 //! parallel probe phase of `scan_into` and is fully deterministic.
 //!
 //! What it produces, from a movie stem like
-//! `"The Matrix (1999) [1080p] BluRay - Director's Cut"`:
+//! `"The Glass Lattice (1999) [1080p] BluRay - Director's Cut"`:
 //! - [`production_year`] from a trailing `(YYYY)` or a `.YYYY.` /
 //!   ` YYYY ` scene token (reusing the canonical 1800–2999 validation
 //!   shared with [`fs`]'s folder-year parser, so a stray `[1080p]` or
@@ -87,7 +87,7 @@ impl FilenameProvider {
         //    bracketed/parenthesised one anywhere in the stem. A
         //    *parenthesised* year is the canonical title delimiter, whereas
         //    a bare 4-digit token that's also a valid year may legitimately
-        //    be part of the title ("2001 A Space Odyssey", "Blade Runner
+        //    be part of the title ("2002 A Quiet Voyage", "Film AB
         //    2049").
         let paren_year: Option<u32> =
             fs::parse_folder_year(stem_no_edition).or_else(|| bracketed_year(stem_no_edition));
@@ -136,7 +136,7 @@ impl FilenameProvider {
             if let Some(y) = bare_year(word) {
                 // When a parenthesised year was found, ONLY the token equal
                 // to it delimits the title — an earlier in-title number that
-                // happens to be a valid year ("Blade Runner 2049 (2017)")
+                // happens to be a valid year ("Film AB 2049 (2017)")
                 // stays part of the title.
                 if let Some(py) = paren_year {
                     if idx > 0 && !boundary_hit && y == py {
@@ -572,7 +572,7 @@ fn quality_source_tag(word: &str) -> Option<String> {
 }
 
 /// Find a year wrapped in `(...)` or `[...]` anywhere in `stem`
-/// (`Blade Runner 2049 (2017) [2160p]` → `2017`). Returns the first such
+/// (`Film AB 2049 (2017) [2160p]` → `2017`). Returns the first such
 /// match. The plausible 1800–2999 window guards against `(1)` / `[1080p]`.
 fn bracketed_year(stem: &str) -> Option<u32> {
     let bytes = stem.as_bytes();
@@ -602,7 +602,7 @@ fn bracketed_year(stem: &str) -> Option<u32> {
 
 /// A bare 4-digit year token within the plausible 1800–2999 window.
 /// Mirrors the validation in [`fs::parse_folder_year`] but for a token
-/// that isn't parenthesised (`The.Matrix.1999.1080p`).
+/// that isn't parenthesised (`The.Glass.Lattice.1999.1080p`).
 fn bare_year(word: &str) -> Option<u32> {
     if word.len() != 4 || !word.bytes().all(|b| b.is_ascii_digit()) {
         return None;
@@ -646,28 +646,28 @@ mod tests {
         }
         let cases = [
             Case {
-                input: "The Matrix (1999)",
-                title: Some("The Matrix"),
+                input: "The Glass Lattice (1999)",
+                title: Some("The Glass Lattice"),
                 year: Some(1999),
                 tags: &[],
             },
             Case {
-                input: "The.Matrix.1999.1080p.BluRay.x264",
-                title: Some("The Matrix"),
+                input: "The.Glass.Lattice.1999.1080p.BluRay.x264",
+                title: Some("The Glass Lattice"),
                 year: Some(1999),
                 tags: &["1080p", "BluRay", "H264"],
             },
             Case {
-                input: "Blade Runner 2049 (2017) [2160p] WEB-DL",
-                title: Some("Blade Runner 2049"),
+                input: "Film AB 2049 (2017) [2160p] WEB-DL",
+                title: Some("Film AB 2049"),
                 year: Some(2017),
                 tags: &["2160p", "WEB-DL"],
             },
             // Edition trailing form: title stops before the edition; the
             // edition is reported separately, not in the title.
             Case {
-                input: "Apocalypse Now - Redux",
-                title: Some("Apocalypse Now"),
+                input: "Film AC - Redux",
+                title: Some("Film AC"),
                 year: None,
                 tags: &[],
             },
@@ -675,8 +675,8 @@ mod tests {
             // episode-ish token — bare 4-digit year still wins only when
             // in 1800–2999.
             Case {
-                input: "2001 A Space Odyssey (1968)",
-                title: Some("2001 A Space Odyssey"),
+                input: "2002 A Quiet Voyage (1968)",
+                title: Some("2002 A Quiet Voyage"),
                 year: Some(1968),
                 tags: &[],
             },
@@ -739,9 +739,9 @@ mod tests {
     /// `ParsedName::edition` (shared with `fs::split_edition_tag`).
     #[test]
     fn parse_stem_reports_edition() {
-        let parsed = FilenameProvider::parse_stem("Aliens - Director's Cut", true);
+        let parsed = FilenameProvider::parse_stem("Film AL - Director's Cut", true);
         assert_eq!(parsed.edition.as_deref(), Some("Director's Cut"));
-        assert_eq!(parsed.title.as_deref(), Some("Aliens"));
+        assert_eq!(parsed.title.as_deref(), Some("Film AL"));
     }
 
     fn req<'a>(path: &'a Path, kind: MediaKind, probe: &'a MediaProbe) -> MetadataRequest<'a> {
@@ -757,12 +757,12 @@ mod tests {
     async fn fetch_movie_populates_result() {
         let probe = MediaProbe::default();
         let provider = FilenameProvider::new();
-        let path = Path::new("/m/The.Matrix.1999.1080p.BluRay.mkv");
+        let path = Path::new("/m/The.Glass.Lattice.1999.1080p.BluRay.mkv");
         let r = provider
             .fetch(&req(path, MediaKind::Movie, &probe))
             .await
             .unwrap();
-        assert_eq!(r.title.as_deref(), Some("The Matrix"));
+        assert_eq!(r.title.as_deref(), Some("The Glass Lattice"));
         assert_eq!(r.production_year, Some(1999));
         assert!(r.tags.iter().any(|t| t == "1080p"));
         assert!(r.tags.iter().any(|t| t == "BluRay"));
@@ -806,7 +806,7 @@ mod tests {
                 "Charlotte - S01E01 - Charlotte's Web HDTV-720p",
                 Some("Charlotte's Web"),
             ),
-            ("Person.of.Interest.S01E03.720p.HDTV.x264-IMMERSE", None),
+            ("Show.Z.S01E03.720p.HDTV.x264-GRPD", None),
             ("Show - S01E04", None),
             ("Movie (1999)", None),
             // A dotted release tail in a spaced name, a 4K/UHD tag, and an
@@ -886,12 +886,12 @@ mod tests {
     async fn fetch_edition_becomes_tag() {
         let probe = MediaProbe::default();
         let provider = FilenameProvider::new();
-        let path = Path::new("/m/Apocalypse Now - Redux.mkv");
+        let path = Path::new("/m/Film AC - Redux.mkv");
         let r = provider
             .fetch(&req(path, MediaKind::Movie, &probe))
             .await
             .unwrap();
-        assert_eq!(r.title.as_deref(), Some("Apocalypse Now"));
+        assert_eq!(r.title.as_deref(), Some("Film AC"));
         assert!(r.tags.iter().any(|t| t == "Redux"));
     }
 
@@ -928,168 +928,168 @@ mod tests {
         let cases = [
             // HSBS variants
             Case {
-                input: "Avatar (2009) [1080p] HSBS",
+                input: "Film AE (2009) [1080p] HSBS",
                 format: Some(Video3DFormat::HalfSideBySide),
                 source: Some("filename"),
             },
             Case {
-                input: "Avatar.2009.H-SBS.1080p",
+                input: "Film AE.2009.H-SBS.1080p",
                 format: Some(Video3DFormat::HalfSideBySide),
                 source: Some("filename"),
             },
             Case {
-                input: "Avatar (2009) Half-SBS",
+                input: "Film AE (2009) Half-SBS",
                 format: Some(Video3DFormat::HalfSideBySide),
                 source: Some("filename"),
             },
             Case {
-                input: "Avatar.2009.Half.SBS.1080p",
+                input: "Film AE.2009.Half.SBS.1080p",
                 format: Some(Video3DFormat::HalfSideBySide),
                 source: Some("filename"),
             },
             Case {
-                input: "Avatar (2009) SBS 1080p",
+                input: "Film AE (2009) SBS 1080p",
                 format: Some(Video3DFormat::HalfSideBySide),
                 source: Some("filename"),
             },
             // FSBS variants
             Case {
-                input: "Avatar (2009) FSBS 1080p",
+                input: "Film AE (2009) FSBS 1080p",
                 format: Some(Video3DFormat::FullSideBySide),
                 source: Some("filename"),
             },
             Case {
-                input: "Avatar.2009.F-SBS.1080p",
+                input: "Film AE.2009.F-SBS.1080p",
                 format: Some(Video3DFormat::FullSideBySide),
                 source: Some("filename"),
             },
             Case {
-                input: "Avatar (2009) Full-SBS 1080p",
+                input: "Film AE (2009) Full-SBS 1080p",
                 format: Some(Video3DFormat::FullSideBySide),
                 source: Some("filename"),
             },
             Case {
-                input: "Avatar.2009.Full.SBS.1080p",
+                input: "Film AE.2009.Full.SBS.1080p",
                 format: Some(Video3DFormat::FullSideBySide),
                 source: Some("filename"),
             },
             // HTAB / TAB variants
             Case {
-                input: "Avatar.2009.HTAB.1080p",
+                input: "Film AE.2009.HTAB.1080p",
                 format: Some(Video3DFormat::HalfTopAndBottom),
                 source: Some("filename"),
             },
             Case {
-                input: "Avatar.2009.H-TAB.1080p",
+                input: "Film AE.2009.H-TAB.1080p",
                 format: Some(Video3DFormat::HalfTopAndBottom),
                 source: Some("filename"),
             },
             Case {
-                input: "Avatar.2009.Half-TAB.1080p",
+                input: "Film AE.2009.Half-TAB.1080p",
                 format: Some(Video3DFormat::HalfTopAndBottom),
                 source: Some("filename"),
             },
             Case {
-                input: "Avatar.2009.Half.TAB.1080p",
+                input: "Film AE.2009.Half.TAB.1080p",
                 format: Some(Video3DFormat::HalfTopAndBottom),
                 source: Some("filename"),
             },
             Case {
-                input: "Avatar (2009) TAB 1080p",
+                input: "Film AE (2009) TAB 1080p",
                 format: Some(Video3DFormat::HalfTopAndBottom),
                 source: Some("filename"),
             },
             // HOU / OU variants
             Case {
-                input: "Avatar.2009.HOU.1080p",
+                input: "Film AE.2009.HOU.1080p",
                 format: Some(Video3DFormat::HalfTopAndBottom),
                 source: Some("filename"),
             },
             Case {
-                input: "Avatar.2009.H-OU.1080p",
+                input: "Film AE.2009.H-OU.1080p",
                 format: Some(Video3DFormat::HalfTopAndBottom),
                 source: Some("filename"),
             },
             Case {
-                input: "Avatar.2009.Half-OU.1080p",
+                input: "Film AE.2009.Half-OU.1080p",
                 format: Some(Video3DFormat::HalfTopAndBottom),
                 source: Some("filename"),
             },
             Case {
-                input: "Avatar.2009.Half.OU.1080p",
+                input: "Film AE.2009.Half.OU.1080p",
                 format: Some(Video3DFormat::HalfTopAndBottom),
                 source: Some("filename"),
             },
             Case {
-                input: "Avatar (2009) OU 1080p",
+                input: "Film AE (2009) OU 1080p",
                 format: Some(Video3DFormat::HalfTopAndBottom),
                 source: Some("filename"),
             },
             // FTAB variants
             Case {
-                input: "Avatar.2009.FTAB.1080p",
+                input: "Film AE.2009.FTAB.1080p",
                 format: Some(Video3DFormat::FullTopAndBottom),
                 source: Some("filename"),
             },
             Case {
-                input: "Avatar.2009.F-TAB.1080p",
+                input: "Film AE.2009.F-TAB.1080p",
                 format: Some(Video3DFormat::FullTopAndBottom),
                 source: Some("filename"),
             },
             Case {
-                input: "Avatar (2009) Full-TAB 1080p",
+                input: "Film AE (2009) Full-TAB 1080p",
                 format: Some(Video3DFormat::FullTopAndBottom),
                 source: Some("filename"),
             },
             Case {
-                input: "Avatar.2009.Full.TAB.1080p",
+                input: "Film AE.2009.Full.TAB.1080p",
                 format: Some(Video3DFormat::FullTopAndBottom),
                 source: Some("filename"),
             },
             // FOU variants
             Case {
-                input: "Avatar.2009.FOU.1080p",
+                input: "Film AE.2009.FOU.1080p",
                 format: Some(Video3DFormat::FullTopAndBottom),
                 source: Some("filename"),
             },
             Case {
-                input: "Avatar.2009.F-OU.1080p",
+                input: "Film AE.2009.F-OU.1080p",
                 format: Some(Video3DFormat::FullTopAndBottom),
                 source: Some("filename"),
             },
             Case {
-                input: "Avatar.2009.Full-OU.1080p",
+                input: "Film AE.2009.Full-OU.1080p",
                 format: Some(Video3DFormat::FullTopAndBottom),
                 source: Some("filename"),
             },
             Case {
-                input: "Avatar.2009.Full.OU.1080p",
+                input: "Film AE.2009.Full.OU.1080p",
                 format: Some(Video3DFormat::FullTopAndBottom),
                 source: Some("filename"),
             },
             // MVC / BD3D / BluRay3D variants
             Case {
-                input: "Avatar (2009) MVC 1080p",
+                input: "Film AE (2009) MVC 1080p",
                 format: Some(Video3DFormat::Mvc),
                 source: Some("filename"),
             },
             Case {
-                input: "Avatar.2009.3D.MVC.1080p",
+                input: "Film AE.2009.3D.MVC.1080p",
                 format: Some(Video3DFormat::Mvc),
                 source: Some("filename"),
             },
             Case {
-                input: "Avatar.2009.3D-MVC.1080p",
+                input: "Film AE.2009.3D-MVC.1080p",
                 format: Some(Video3DFormat::Mvc),
                 source: Some("filename"),
             },
             Case {
-                input: "Avatar.2009.BD3D.1080p",
+                input: "Film AE.2009.BD3D.1080p",
                 format: Some(Video3DFormat::Mvc),
                 source: Some("filename"),
             },
             Case {
-                input: "Avatar (2009) BluRay3D 1080p",
+                input: "Film AE (2009) BluRay3D 1080p",
                 format: Some(Video3DFormat::Mvc),
                 source: Some("filename"),
             },
@@ -1101,18 +1101,18 @@ mod tests {
             },
             // Bare 3D
             Case {
-                input: "Avatar (2009) [3D] 1080p",
+                input: "Film AE (2009) [3D] 1080p",
                 format: None,
                 source: Some("unspecified_3d"),
             },
             // 2D Stems
             Case {
-                input: "The Matrix (1999) 1080p",
+                input: "The Glass Lattice (1999) 1080p",
                 format: None,
                 source: None,
             },
             Case {
-                input: "Inception.2010.1080p.BluRay.x264",
+                input: "Silent.Harbor.2010.1080p.BluRay.x264",
                 format: None,
                 source: None,
             },
@@ -1139,110 +1139,110 @@ mod tests {
         }
         let cases = [
             Case {
-                input: "Avatar (2009) HSBS",
-                title: Some("Avatar"),
+                input: "Film AE (2009) HSBS",
+                title: Some("Film AE"),
                 year: Some(2009),
                 tag: "HSBS",
             },
             Case {
-                input: "Avatar.2009.H-SBS.1080p",
-                title: Some("Avatar"),
+                input: "Film AE.2009.H-SBS.1080p",
+                title: Some("Film AE"),
                 year: Some(2009),
                 tag: "HSBS",
             },
             Case {
-                input: "Avatar (2009) Half-SBS",
-                title: Some("Avatar"),
+                input: "Film AE (2009) Half-SBS",
+                title: Some("Film AE"),
                 year: Some(2009),
                 tag: "HSBS",
             },
             Case {
-                input: "Avatar.2009.Half.SBS.1080p",
-                title: Some("Avatar"),
+                input: "Film AE.2009.Half.SBS.1080p",
+                title: Some("Film AE"),
                 year: Some(2009),
                 tag: "HSBS",
             },
             Case {
-                input: "Avatar (2009) SBS",
-                title: Some("Avatar"),
+                input: "Film AE (2009) SBS",
+                title: Some("Film AE"),
                 year: Some(2009),
                 tag: "SBS",
             },
             Case {
-                input: "Avatar.2009.FSBS.1080p",
-                title: Some("Avatar"),
+                input: "Film AE.2009.FSBS.1080p",
+                title: Some("Film AE"),
                 year: Some(2009),
                 tag: "FSBS",
             },
             Case {
-                input: "Avatar (2009) Full-SBS",
-                title: Some("Avatar"),
+                input: "Film AE (2009) Full-SBS",
+                title: Some("Film AE"),
                 year: Some(2009),
                 tag: "FSBS",
             },
             Case {
-                input: "Avatar.2009.Full.SBS.1080p",
-                title: Some("Avatar"),
+                input: "Film AE.2009.Full.SBS.1080p",
+                title: Some("Film AE"),
                 year: Some(2009),
                 tag: "FSBS",
             },
             Case {
-                input: "Avatar.2009.HTAB.1080p",
-                title: Some("Avatar"),
+                input: "Film AE.2009.HTAB.1080p",
+                title: Some("Film AE"),
                 year: Some(2009),
                 tag: "HTAB",
             },
             Case {
-                input: "Avatar (2009) TAB",
-                title: Some("Avatar"),
+                input: "Film AE (2009) TAB",
+                title: Some("Film AE"),
                 year: Some(2009),
                 tag: "TAB",
             },
             Case {
-                input: "Avatar.2009.HOU.1080p",
-                title: Some("Avatar"),
+                input: "Film AE.2009.HOU.1080p",
+                title: Some("Film AE"),
                 year: Some(2009),
                 tag: "HOU",
             },
             Case {
-                input: "Avatar (2009) OU",
-                title: Some("Avatar"),
+                input: "Film AE (2009) OU",
+                title: Some("Film AE"),
                 year: Some(2009),
                 tag: "OU",
             },
             Case {
-                input: "Avatar.2009.FTAB.1080p",
-                title: Some("Avatar"),
+                input: "Film AE.2009.FTAB.1080p",
+                title: Some("Film AE"),
                 year: Some(2009),
                 tag: "FTAB",
             },
             Case {
-                input: "Avatar (2009) Full-TAB",
-                title: Some("Avatar"),
+                input: "Film AE (2009) Full-TAB",
+                title: Some("Film AE"),
                 year: Some(2009),
                 tag: "FTAB",
             },
             Case {
-                input: "Avatar.2009.FOU.1080p",
-                title: Some("Avatar"),
+                input: "Film AE.2009.FOU.1080p",
+                title: Some("Film AE"),
                 year: Some(2009),
                 tag: "FOU",
             },
             Case {
-                input: "Avatar (2009) MVC",
-                title: Some("Avatar"),
+                input: "Film AE (2009) MVC",
+                title: Some("Film AE"),
                 year: Some(2009),
                 tag: "MVC",
             },
             Case {
-                input: "Avatar.2009.BD3D.1080p",
-                title: Some("Avatar"),
+                input: "Film AE.2009.BD3D.1080p",
+                title: Some("Film AE"),
                 year: Some(2009),
                 tag: "BD3D",
             },
             Case {
-                input: "Avatar (2009) BluRay3D",
-                title: Some("Avatar"),
+                input: "Film AE (2009) BluRay3D",
+                title: Some("Film AE"),
                 year: Some(2009),
                 tag: "BluRay3D",
             },
@@ -1253,8 +1253,8 @@ mod tests {
                 tag: "Anaglyph",
             },
             Case {
-                input: "Avatar (2009) 3D 1080p",
-                title: Some("Avatar"),
+                input: "Film AE (2009) 3D 1080p",
+                title: Some("Film AE"),
                 year: Some(2009),
                 tag: "3D",
             },
@@ -1325,50 +1325,56 @@ mod tests {
     #[test]
     fn test_has_explicit_full_or_half_3d_token() {
         assert_eq!(
-            has_explicit_full_or_half_3d_token("Avatar.FSBS.1080p"),
+            has_explicit_full_or_half_3d_token("Film AE.FSBS.1080p"),
             Some(Video3DFormat::FullSideBySide)
         );
         assert_eq!(
-            has_explicit_full_or_half_3d_token("Avatar.Full-SBS.1080p"),
+            has_explicit_full_or_half_3d_token("Film AE.Full-SBS.1080p"),
             Some(Video3DFormat::FullSideBySide)
         );
         assert_eq!(
-            has_explicit_full_or_half_3d_token("Avatar.HSBS.1080p"),
+            has_explicit_full_or_half_3d_token("Film AE.HSBS.1080p"),
             Some(Video3DFormat::HalfSideBySide)
         );
         assert_eq!(
-            has_explicit_full_or_half_3d_token("Avatar.Half-SBS.1080p"),
+            has_explicit_full_or_half_3d_token("Film AE.Half-SBS.1080p"),
             Some(Video3DFormat::HalfSideBySide)
         );
-        assert_eq!(has_explicit_full_or_half_3d_token("Avatar.SBS.1080p"), None);
         assert_eq!(
-            has_explicit_full_or_half_3d_token("Avatar.FTAB.1080p"),
+            has_explicit_full_or_half_3d_token("Film AE.SBS.1080p"),
+            None
+        );
+        assert_eq!(
+            has_explicit_full_or_half_3d_token("Film AE.FTAB.1080p"),
             Some(Video3DFormat::FullTopAndBottom)
         );
         assert_eq!(
-            has_explicit_full_or_half_3d_token("Avatar.Full-TAB.1080p"),
+            has_explicit_full_or_half_3d_token("Film AE.Full-TAB.1080p"),
             Some(Video3DFormat::FullTopAndBottom)
         );
         assert_eq!(
-            has_explicit_full_or_half_3d_token("Avatar.HTAB.1080p"),
+            has_explicit_full_or_half_3d_token("Film AE.HTAB.1080p"),
             Some(Video3DFormat::HalfTopAndBottom)
         );
         assert_eq!(
-            has_explicit_full_or_half_3d_token("Avatar.Half-TAB.1080p"),
+            has_explicit_full_or_half_3d_token("Film AE.Half-TAB.1080p"),
             Some(Video3DFormat::HalfTopAndBottom)
         );
-        assert_eq!(has_explicit_full_or_half_3d_token("Avatar.TAB.1080p"), None);
         assert_eq!(
-            has_explicit_full_or_half_3d_token("Avatar.FOU.1080p"),
+            has_explicit_full_or_half_3d_token("Film AE.TAB.1080p"),
+            None
+        );
+        assert_eq!(
+            has_explicit_full_or_half_3d_token("Film AE.FOU.1080p"),
             Some(Video3DFormat::FullTopAndBottom)
         );
         assert_eq!(
-            has_explicit_full_or_half_3d_token("Avatar.HOU.1080p"),
+            has_explicit_full_or_half_3d_token("Film AE.HOU.1080p"),
             Some(Video3DFormat::HalfTopAndBottom)
         );
-        assert_eq!(has_explicit_full_or_half_3d_token("Avatar.OU.1080p"), None);
+        assert_eq!(has_explicit_full_or_half_3d_token("Film AE.OU.1080p"), None);
         assert_eq!(
-            has_explicit_full_or_half_3d_token("Avatar.3D.MVC.1080p"),
+            has_explicit_full_or_half_3d_token("Film AE.3D.MVC.1080p"),
             None
         );
     }

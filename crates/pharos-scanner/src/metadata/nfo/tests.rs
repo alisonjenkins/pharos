@@ -8,11 +8,11 @@ use tempfile::tempdir;
 /// A trimmed but realistic Kodi `movie.nfo`.
 const MOVIE_NFO: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <movie>
-  <title>The Matrix</title>
-  <originaltitle>The Matrix</originaltitle>
+  <title>The Glass Lattice</title>
+  <originaltitle>The Glass Lattice</originaltitle>
   <tagline>Free your mind.</tagline>
   <plot>A computer hacker learns the true nature of his reality.</plot>
-  <outline>Neo discovers the Matrix.</outline>
+  <outline>Hero A discovers the Glass Lattice.</outline>
   <year>1999</year>
   <premiered>1999-03-31</premiered>
   <rating>8.7</rating>
@@ -24,20 +24,20 @@ const MOVIE_NFO: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"
   <tag>cyberpunk</tag>
   <country>USA</country>
   <country>Australia</country>
-  <trailer>plugin://plugin.video.youtube/?action=play_video&amp;videoid=m8e-FF8MsqU</trailer>
-  <set>The Matrix Collection</set>
-  <uniqueid type="tmdb">603</uniqueid>
-  <uniqueid type="imdb">tt0133093</uniqueid>
+  <trailer>plugin://plugin.video.youtube/?action=play_video&amp;videoid=abcDEF12345</trailer>
+  <set>The Glass Lattice Collection</set>
+  <uniqueid type="tmdb">930603</uniqueid>
+  <uniqueid type="imdb">tt9300001</uniqueid>
   <thumb aspect="poster">https://example.test/poster.jpg</thumb>
   <fanart>https://example.test/fanart.jpg</fanart>
-  <director>Lana Wachowski</director>
-  <director>Lilly Wachowski</director>
-  <credits>The Wachowskis</credits>
+  <director>Director Q</director>
+  <director>Director R</director>
+  <credits>The Directors Q</credits>
   <actor>
-    <name>Keanu Reeves</name>
-    <role>Neo</role>
+    <name>Actor Q</name>
+    <role>Hero A</role>
     <order>0</order>
-    <thumb>http://img/keanu.jpg</thumb>
+    <thumb>http://img/actor.jpg</thumb>
   </actor>
   <actor>
     <name>Laurence Fishburne</name>
@@ -50,7 +50,7 @@ const MOVIE_NFO: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"
 /// A `tvshow.nfo` with the structured `<ratings>` form and a country mpaa.
 const TVSHOW_NFO: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <tvshow>
-  <title>Breaking Bad</title>
+  <title>Show X</title>
   <plot>A chemistry teacher turns to crime.</plot>
   <premiered>2008-01-20</premiered>
   <mpaa>US:TV-MA</mpaa>
@@ -84,8 +84,8 @@ fn probe() -> MediaProbe {
 #[tokio::test]
 async fn movie_nfo_maps_all_common_fields() {
     let dir = tempdir().unwrap();
-    let media = dir.path().join("The Matrix (1999).mkv");
-    std::fs::write(dir.path().join("The Matrix (1999).nfo"), MOVIE_NFO).unwrap();
+    let media = dir.path().join("The Glass Lattice (1999).mkv");
+    std::fs::write(dir.path().join("The Glass Lattice (1999).nfo"), MOVIE_NFO).unwrap();
 
     let p = probe();
     let req = MetadataRequest {
@@ -96,7 +96,7 @@ async fn movie_nfo_maps_all_common_fields() {
     };
     let r = NfoProvider::new().fetch(&req).await.unwrap();
 
-    assert_eq!(r.title.as_deref(), Some("The Matrix"));
+    assert_eq!(r.title.as_deref(), Some("The Glass Lattice"));
     assert_eq!(r.tagline.as_deref(), Some("Free your mind."));
     assert_eq!(
         r.overview.as_deref(),
@@ -112,15 +112,15 @@ async fn movie_nfo_maps_all_common_fields() {
     assert_eq!(r.genres, vec!["Action", "Sci-Fi"]);
     assert_eq!(r.studios, vec!["Warner Bros."]);
     assert_eq!(r.tags, vec!["cyberpunk"]);
-    assert_eq!(r.collections, vec!["The Matrix Collection"]);
+    assert_eq!(r.collections, vec!["The Glass Lattice Collection"]);
     // T67 — repeated <country> → production_locations; <trailer> → trailers.
     assert_eq!(r.production_locations, vec!["USA", "Australia"]);
     assert_eq!(
         r.trailers,
-        vec!["plugin://plugin.video.youtube/?action=play_video&videoid=m8e-FF8MsqU"]
+        vec!["plugin://plugin.video.youtube/?action=play_video&videoid=abcDEF12345"]
     );
-    assert_eq!(r.provider_ids.tmdb.as_deref(), Some("603"));
-    assert_eq!(r.provider_ids.imdb.as_deref(), Some("tt0133093"));
+    assert_eq!(r.provider_ids.tmdb.as_deref(), Some("930603"));
+    assert_eq!(r.provider_ids.imdb.as_deref(), Some("tt9300001"));
 
     // Artwork: poster (Primary) + fanart (Backdrop) as URLs.
     assert!(r.artwork.iter().any(|a| a.role == ArtworkRole::Primary
@@ -132,20 +132,20 @@ async fn movie_nfo_maps_all_common_fields() {
     assert!(r
         .people
         .iter()
-        .any(|p| p.name == "Lana Wachowski" && p.kind == PersonKind::Director));
+        .any(|p| p.name == "Director Q" && p.kind == PersonKind::Director));
     assert!(r
         .people
         .iter()
-        .any(|p| p.name == "The Wachowskis" && p.kind == PersonKind::Writer));
+        .any(|p| p.name == "The Directors Q" && p.kind == PersonKind::Writer));
     let neo = r
         .people
         .iter()
-        .find(|p| p.name == "Keanu Reeves")
-        .expect("Keanu present");
+        .find(|p| p.name == "Actor Q")
+        .expect("Actor Q present");
     assert_eq!(neo.kind, PersonKind::Actor);
-    assert_eq!(neo.character.as_deref(), Some("Neo"));
+    assert_eq!(neo.character.as_deref(), Some("Hero A"));
     // LIB-C2 — the actor's <thumb> headshot URL is captured.
-    assert_eq!(neo.thumb.as_deref(), Some("http://img/keanu.jpg"));
+    assert_eq!(neo.thumb.as_deref(), Some("http://img/actor.jpg"));
     assert_eq!(neo.sort_order, Some(0));
 }
 
@@ -223,7 +223,7 @@ async fn movie_falls_back_to_movie_nfo_in_dir() {
         series: None,
     };
     let r = NfoProvider::new().fetch(&req).await.unwrap();
-    assert_eq!(r.title.as_deref(), Some("The Matrix"));
+    assert_eq!(r.title.as_deref(), Some("The Glass Lattice"));
 }
 
 #[tokio::test]
@@ -233,7 +233,7 @@ async fn tvshow_structured_ratings_and_country_mpaa() {
     // A request keyed by the series folder, no episode sibling.
     let media = dir.path().join("Episode.mkv");
     let series = SeriesInfo {
-        series_name: "Breaking Bad".into(),
+        series_name: "Show X".into(),
         series_folder: Some(dir.path().to_string_lossy().into_owned()),
         ..SeriesInfo::default()
     };
@@ -258,12 +258,12 @@ async fn tvshow_structured_ratings_and_country_mpaa() {
 async fn episode_merges_show_nfo_underneath() {
     let dir = tempdir().unwrap();
     // Episode sibling NFO + show-level tvshow.nfo.
-    let media = dir.path().join("Breaking Bad S01E01.mkv");
-    std::fs::write(dir.path().join("Breaking Bad S01E01.nfo"), EPISODE_NFO).unwrap();
+    let media = dir.path().join("Show X S01E01.mkv");
+    std::fs::write(dir.path().join("Show X S01E01.nfo"), EPISODE_NFO).unwrap();
     std::fs::write(dir.path().join("tvshow.nfo"), TVSHOW_NFO).unwrap();
 
     let series = SeriesInfo {
-        series_name: "Breaking Bad".into(),
+        series_name: "Show X".into(),
         series_folder: Some(dir.path().to_string_lossy().into_owned()),
         ..SeriesInfo::default()
     };
@@ -292,13 +292,11 @@ async fn episode_merges_show_nfo_underneath() {
 #[tokio::test]
 async fn an_episode_without_its_own_nfo_is_not_titled_with_the_show() {
     let dir = tempdir().unwrap();
-    let media = dir
-        .path()
-        .join("Breaking Bad - S01E02 - Cat's in the Bag.mkv");
+    let media = dir.path().join("Show X - S01E02 - The Copper Key.mkv");
     std::fs::write(dir.path().join("tvshow.nfo"), TVSHOW_NFO).unwrap();
 
     let series = SeriesInfo {
-        series_name: "Breaking Bad".into(),
+        series_name: "Show X".into(),
         series_folder: Some(dir.path().to_string_lossy().into_owned()),
         ..SeriesInfo::default()
     };
@@ -463,13 +461,13 @@ async fn nested_set_name_form_parses_into_collections() {
 <movie>
   <title>Movie</title>
   <set>
-    <name>The Matrix Collection</name>
+    <name>The Glass Lattice Collection</name>
     <overview>ignored</overview>
   </set>
-  <collection>Wachowski Films</collection>
+  <collection>Zed Films</collection>
   <actor>
-    <name>Keanu Reeves</name>
-    <role>Neo</role>
+    <name>Actor Q</name>
+    <role>Hero A</role>
   </actor>
 </movie>"#,
     )
@@ -484,12 +482,12 @@ async fn nested_set_name_form_parses_into_collections() {
     let r = NfoProvider::new().fetch(&req).await.unwrap();
     assert_eq!(
         r.collections,
-        vec!["The Matrix Collection", "Wachowski Films"],
+        vec!["The Glass Lattice Collection", "Zed Films"],
         "nested <set><name> + flat <collection>"
     );
     // The actor's nested <name> stays a person, not a collection.
-    assert!(r.people.iter().any(|pe| pe.name == "Keanu Reeves"));
-    assert!(!r.collections.iter().any(|c| c == "Keanu Reeves"));
+    assert!(r.people.iter().any(|pe| pe.name == "Actor Q"));
+    assert!(!r.collections.iter().any(|c| c == "Actor Q"));
 }
 
 /// B558 — trimmed from a deployed library: a scraper identified the
@@ -947,7 +945,7 @@ fn show_nfo_evidence_reads_ids_and_year_of_this_show_only() {
 }
 
 /// B1009 / V968 — a film's NFO whose year is not the year its file names is
-/// another film's: Jellyfin wrote the 1994 *Lion King* into the 2019 one's
+/// another film's: Jellyfin wrote the 1994 *Tall Meadow* into the 2019 one's
 /// folder. A year one off, or no year on the file or folder, keeps the NFO.
 #[tokio::test]
 async fn a_movie_nfo_naming_another_year_is_set_aside() {
@@ -956,7 +954,7 @@ async fn a_movie_nfo_naming_another_year_is_set_aside() {
     let _guard = metrics::set_default_local_recorder(&recorder);
     let nfo = |year: u32| {
         format!(
-            "<movie><title>The Lion King</title><year>{year}</year><tmdbid>8587</tmdbid></movie>"
+            "<movie><title>The Tall Meadow</title><year>{year}</year><tmdbid>930587</tmdbid></movie>"
         )
     };
     let fetch = |folder: &'static str, file: &'static str, year: u32| async move {
@@ -981,31 +979,34 @@ async fn a_movie_nfo_naming_another_year_is_set_aside() {
 
     assert_eq!(
         fetch(
-            "The Lion King (2019)",
-            "The Lion King (2019) Bluray-1080p.mp4",
+            "The Tall Meadow (2019)",
+            "The Tall Meadow (2019) Bluray-1080p.mp4",
             1994
         )
         .await,
         None
     );
     assert_eq!(
-        fetch("The Lion King (2019)", "lion.king.mp4", 1994).await,
+        fetch("The Tall Meadow (2019)", "tall.meadow.mp4", 1994).await,
         None
     );
     assert_eq!(
-        fetch("The Lion King (1994)", "The Lion King (1994).mkv", 1994).await,
+        fetch("The Tall Meadow (1994)", "The Tall Meadow (1994).mkv", 1994).await,
         Some(1994)
     );
     assert_eq!(
         fetch("Heat (1995)", "Heat (1995).mkv", 1996).await,
         Some(1996)
     );
-    assert_eq!(fetch("Lion King", "lion.king.mkv", 1994).await, Some(1994));
+    assert_eq!(
+        fetch("Tall Meadow", "tall.meadow.mkv", 1994).await,
+        Some(1994)
+    );
     // B1026 / V985 — two years off is the first set aside; a year in the
     // title does not outvote the folder's.
     assert_eq!(fetch("Heat (1995)", "Heat (1995).mkv", 1997).await, None);
     assert_eq!(
-        fetch("Blade Runner 2049 (2017)", "Blade Runner 2049.mkv", 2017).await,
+        fetch("Film AB 2049 (2017)", "Film AB 2049.mkv", 2017).await,
         Some(2017)
     );
 

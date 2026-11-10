@@ -23,7 +23,7 @@ use super::{predefined_entity, sibling_nfo};
 /// the episode's show. Above the online matcher's 0.7 default because this
 /// is a veto on local data that is otherwise authoritative; it still passes
 /// every legitimate variant in the deployed library (punctuation, a `: Sub
-/// title` the folder drops, `Mrs Browns Boys` for `Mrs Brown's Boys`).
+/// title` the folder drops, `Mrs Foxs Cubs` for `Mrs Fox's Cubs`).
 const SHOW_NAME_MIN_SIMILARITY: f32 = 0.8;
 
 /// Which of an episode's NFOs describe a different show.
@@ -103,8 +103,8 @@ const FILM_YEAR_SLACK: u32 = 1;
 
 /// B1009 — whether a film's NFO describes another film: its `<year>` is more
 /// than [`FILM_YEAR_SLACK`] from every year the file's name and its folder's
-/// name state (B1026: a year in the title is no evidence on its own). Jellyfin wrote the 1994 *The Lion King* into
-/// `The Lion King (2019)/movie.nfo`, and its tmdb id then matched the remake
+/// name state (B1026: a year in the title is no evidence on its own). Jellyfin wrote the 1994 *The Tall Meadow* into
+/// `The Tall Meadow (2019)/movie.nfo`, and its tmdb id then matched the remake
 /// to the original. A name or NFO with no year is not evidence either way.
 pub(crate) fn names_another_year(
     media: &Path,
@@ -117,7 +117,7 @@ pub(crate) fn names_another_year(
     let year_of = |name: Option<&std::ffi::OsStr>| {
         crate::metadata::filename::parse_filename(name?.to_str()?, true).year
     };
-    // A title can hold a year (`Blade Runner 2049`), so the NFO is foreign
+    // A title can hold a year (`Film AB 2049`), so the NFO is foreign
     // only when it agrees with neither the file's year nor the folder's.
     let stated: Vec<u32> = [
         year_of(media.file_stem()),
