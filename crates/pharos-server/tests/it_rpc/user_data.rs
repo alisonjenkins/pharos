@@ -325,6 +325,59 @@ async fn a_series_marked_favourite_says_so_on_its_detail() {
     assert_eq!(detail_marks(&session, season).await, (false, true));
 }
 
+/// B1085: marking an album or an artist a favourite marks every track under
+/// it, and its detail says it is one while every track is; un-marking one
+/// track takes the mark off the album and artist it is in.
+/// Disarm check: with `music_folder_items` finding no tracks, marking the
+/// album is refused as not found.
+#[actix_web::test]
+async fn an_album_or_artist_marked_favourite_marks_its_tracks() {
+    use pharos_jellyfin_api::dto::{album_id_for, artist_id_for};
+    let (server, fx) = crate::revocation::start().await;
+    let (client, _closed) = crate::revocation::connect(&server).await;
+    let session = crate::revocation::signed_in(&client, &fx.user_token).await;
+    crate::library::seed_music_libraries(&fx).await;
+    let favourite = |id: u64| {
+        let fx = &fx;
+        async move {
+            fx.state
+                .stores
+                .get_user_data(fx.user_id, id)
+                .await
+                .unwrap()
+                .is_favorite
+        }
+    };
+
+    let first = WireId::parse(&album_id_for("First")).unwrap();
+    let second = WireId::parse(&album_id_for("Second")).unwrap();
+    let alpha = WireId::parse(&artist_id_for("Alpha")).unwrap();
+    assert_eq!(detail_marks(&session, first).await, (false, false));
+    assert!(wire_set(&session, first, Set::Favorite(true)).await.is_ok());
+    assert_eq!(detail_marks(&session, first).await, (false, true));
+    for id in [701, 702, 703] {
+        assert!(favourite(id).await, "track {id} of the album");
+    }
+    assert!(!favourite(704).await, "another album's track");
+    assert_eq!(
+        detail_marks(&session, alpha).await,
+        (false, false),
+        "the artist's other album is no favourite"
+    );
+
+    assert!(wire_set(&session, alpha, Set::Favorite(true)).await.is_ok());
+    assert_eq!(detail_marks(&session, alpha).await, (false, true));
+    assert_eq!(detail_marks(&session, second).await, (false, true));
+    assert!(!favourite(705).await, "another artist's track");
+
+    assert!(wire_set(&session, WireId::Real(702), Set::Favorite(false))
+        .await
+        .is_ok());
+    assert_eq!(detail_marks(&session, first).await, (false, false));
+    assert_eq!(detail_marks(&session, alpha).await, (false, false));
+    assert_eq!(detail_marks(&session, second).await, (false, true));
+}
+
 /// Pipelined writes to one item both land: a native client can send
 /// setPlayed and setFavorite back to back, and the second must not write
 /// over the first with the state it read before the first was stored.

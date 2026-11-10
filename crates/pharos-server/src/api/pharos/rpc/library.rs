@@ -1447,9 +1447,9 @@ async fn synth_detail(
     }
 }
 
-/// What `user` has marked on synthesised series or season `id`: watched
-/// once every episode is, a favourite while every episode is (B1080);
-/// neither for any other kind. A store that cannot say leaves both off: the
+/// What `user` has marked on synthesised series, season, album or artist
+/// `id`: watched once every item under it is, a favourite while every one
+/// is (B1080, B1085); neither for any other kind. A store that cannot say leaves both off: the
 /// page still opens, and marking it is still offered.
 async fn synth_marks(
     state: &AppState,
@@ -1457,7 +1457,10 @@ async fn synth_marks(
     id: WireId,
     dto: &serde_json::Value,
 ) -> FolderMarks {
-    if !matches!(synth_kind(dto), Kind::Series | Kind::Season) {
+    if !matches!(
+        synth_kind(dto),
+        Kind::Series | Kind::Season | Kind::Album | Kind::Artist
+    ) {
         return FolderMarks::default();
     }
     crate::services::user_data::folder_marks(state, user, &id.to_string())
