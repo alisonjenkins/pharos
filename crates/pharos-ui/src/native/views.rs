@@ -1166,10 +1166,15 @@ pub fn PosterTile(
         open_route(&item)
     };
     let name = display_name(&item);
-    let play_label = play.then(|| format!("Play {name}"));
-    let info_label = format!("About {name}");
-    let info_to = open_route(&item);
     let sub = sub_lines(&item);
+    // The tile's own lines, so "Pilot" says which show and episode it is.
+    let named = std::iter::once(name.as_str())
+        .chain(sub.iter().map(String::as_str))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let play_label = play.then(|| format!("Play {named}"));
+    let info_label = format!("About {named}");
+    let info_to = open_route(&item);
     let progress = progress_percent(&item);
     let rated = !ratings(item.kind, item.imdb_rating, item.critic_rating).is_empty();
     rsx! {
@@ -3521,6 +3526,9 @@ mod tests {
     fn a_resume_tile_plays_at_once_and_its_info_control_opens_the_title() {
         let mut e = item(ItemKind::Episode);
         e.name = "Pilot".into();
+        e.series_name = Some("Show AA".into());
+        e.season = Some(1);
+        e.episode = Some(1);
         let id = e.id;
         let html = render(move || rsx! { PosterTile { item: e.clone(), play: true } });
         let watch = format!(r#"href="{}""#, Route::Watch(id).path());
@@ -3530,8 +3538,14 @@ mod tests {
             html.contains(&title),
             "the info control opens the title: {html}"
         );
-        assert!(html.contains(r#"aria-label="Play Pilot""#), "{html}");
-        assert!(html.contains(r#"aria-label="About Pilot""#), "{html}");
+        assert!(
+            html.contains(r#"aria-label="Play Pilot, Show AA, S1 · E1""#),
+            "{html}"
+        );
+        assert!(
+            html.contains(r#"aria-label="About Pilot, Show AA, S1 · E1""#),
+            "{html}"
+        );
         assert!(
             html.find(&watch) < html.find(&title),
             "info sits after the tile: {html}"
