@@ -198,6 +198,31 @@ impl IntegrityMemo {
         self.doc.read().ok()?.entries.get(&id).cloned()
     }
 
+    /// Where an unindexed file's media really ends, when a full read of it
+    /// found less than its header claims (B1198, V1158): past that point there is nothing
+    /// to encode, so the segment cache serves a filler at once rather than
+    /// asking the encoder for frames that do not exist. Only a read that ran
+    /// to end-of-file says where the media ends; one that gave up early does
+    /// not. The file state the read saw comes along, so a file replaced since
+    /// is encoded as normal.
+    pub fn known_end(&self, id: u64) -> Option<pharos_cache::KnownSourceEnd> {
+        let entry = self.verdict(id)?;
+        let report = &entry.report;
+        // Only an unindexed file: a seek into one reads it from byte 0 with
+        // the same demuxer the scan used, so where the scan stopped is where
+        // any encode stops too. An indexed file's demuxer can stop at a bad
+        // chunk the index then seeks past, and a filler there would replace
+        // real picture.
+        let ends_early = report.complete
+            && report.is_unindexed()
+            && report.declared_ms.is_some_and(|d| d > report.scanned_ms);
+        ends_early.then_some(pharos_cache::KnownSourceEnd {
+            end_ms: report.scanned_ms,
+            mtime_secs: entry.mtime,
+            size: entry.size,
+        })
+    }
+
     /// How many files have been scanned.
     pub fn len(&self) -> usize {
         self.doc.read().map(|d| d.entries.len()).unwrap_or(0)
@@ -299,6 +324,64 @@ mod tests {
             1,
             "still listed until the re-read lands"
         );
+    }
+
+    /// B1198/V1158: only a read of an unindexed file that reached end-of-file
+    /// and found less media than the header claims says where it ends.
+    #[test]
+    fn only_a_complete_read_short_of_the_header_gives_a_known_end() {
+        let memo = IntegrityMemo::load("/nonexistent/memo.json", 1);
+        let ends_early = IntegrityReport {
+            declared_ms: Some(30_000),
+            seek_index: Some(false),
+            ..clean()
+        };
+        memo.record(1, Some((100, 500)), ends_early.clone());
+        memo.record(
+            2,
+            Some((100, 500)),
+            IntegrityReport {
+                complete: false,
+                ..ends_early.clone()
+            },
+        );
+        memo.record(
+            3,
+            Some((100, 500)),
+            IntegrityReport {
+                declared_ms: Some(20_000),
+                ..ends_early.clone()
+            },
+        );
+        memo.record(
+            4,
+            Some((100, 500)),
+            IntegrityReport {
+                declared_ms: None,
+                ..ends_early.clone()
+            },
+        );
+        memo.record(
+            6,
+            Some((100, 500)),
+            IntegrityReport {
+                seek_index: None,
+                ..ends_early.clone()
+            },
+        );
+        assert_eq!(
+            memo.known_end(1),
+            Some(pharos_cache::KnownSourceEnd {
+                end_ms: 20_000,
+                mtime_secs: 100,
+                size: 500,
+            })
+        );
+        assert_eq!(memo.known_end(2), None, "a read that gave up early");
+        assert_eq!(memo.known_end(3), None, "all the media the header claims");
+        assert_eq!(memo.known_end(4), None, "no header duration");
+        assert_eq!(memo.known_end(5), None, "never read");
+        assert_eq!(memo.known_end(6), None, "a seekable file");
     }
 
     /// The load-bearing difference from `probe_memo`: a CLEAN verdict must be

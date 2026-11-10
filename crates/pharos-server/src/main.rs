@@ -1916,6 +1916,12 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
     #[cfg(all(unix, feature = "ffmpeg-lib"))]
     {
         let integrity_memo = integrity_memo_for(&cfg);
+        // A window past where the scan found a file's media ends is a filler
+        // straight away (B1198): asking the encoder for it only ever fails.
+        if let Some(hls) = state.hls.as_ref() {
+            let memo = integrity_memo.clone();
+            hls.set_source_end_hint(std::sync::Arc::new(move |id| memo.known_end(id)));
+        }
         let integrity_sweep =
             std::sync::Arc::new(pharos_server::integrity_sweep::IntegritySweep::default());
         pharos_server::integrity_backfill::spawn(
