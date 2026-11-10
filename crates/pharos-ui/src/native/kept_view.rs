@@ -222,6 +222,10 @@ fn KeptRow(
                         class: "pharos-button pharos-button-secondary",
                         r#type: "button",
                         aria_label: "Remove {name} now",
+                        // The pressed Remove is gone: keep keyboard focus here.
+                        onmounted: move |e: MountedEvent| async move {
+                            let _ = e.set_focus(true).await;
+                        },
                         onclick: {
                             let id = id.clone();
                             move |_| {
