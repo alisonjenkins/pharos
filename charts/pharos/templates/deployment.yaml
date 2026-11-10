@@ -111,6 +111,11 @@ spec:
             # ADR-0066: ask the aligner for karaoke word times.
             - name: PHAROS_LYRICS_ALIGNER_URL
               value: "http://{{ include "pharos.fullname" . }}-aligner:{{ .Values.aligner.port }}"
+            {{- if .Values.aligner.shadow.enabled }}
+            # Spec 039, R21: each song again to the shadow, only compared.
+            - name: PHAROS_LYRICS_ALIGNER_SHADOW_URL
+              value: "http://{{ include "pharos.fullname" . }}-aligner-shadow:{{ .Values.aligner.port }}"
+            {{- end }}
             {{- end }}
             {{- with .Values.extraEnv }}
             # Extra env (e.g. PHAROS_DATABASE_URL from a Secret so a generated
