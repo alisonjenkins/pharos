@@ -387,3 +387,75 @@ fn strip_titles(el: &mut El) {
         }
     }
 }
+
+/// A fixed-layout book in the shape a PDF-to-EPUB converter makes: one
+/// spine item per page, each a page-sized box with its artwork as an image
+/// and its text placed at exact points in a font shipped in the book.
+fn fixed_layout_book(item_props: &str, page_meta: &str) -> Publication {
+    let opf = format!(
+        r#"<?xml version="1.0"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0" prefix="rendition: http://www.idpf.org/vocab/rendition/#">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:title>Placed Pages</dc:title>
+    <meta property="rendition:layout">pre-paginated</meta>
+    <meta name="viewport" content="width=500, height=700"/>
+  </metadata>
+  <manifest>
+    <item id="p1" href="p1.xhtml" media-type="application/xhtml+xml"/>
+    <item id="p2" href="p2.xhtml" media-type="application/xhtml+xml"/>
+    <item id="font" href="fonts/hand.ttf" media-type="application/font-sfnt"/>
+  </manifest>
+  <spine><itemref idref="p1"/><itemref idref="p2" {item_props}/></spine>
+</package>"#
+    );
+    let page = |meta: &str| {
+        format!(
+            r#"<?xml version="1.0" encoding="utf-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><head><title>p</title>
+<style>@font-face{{font-family:hand;src:url('fonts/hand.ttf?reload=1') format('truetype')}}
+.t{{position:absolute;white-space:pre}}</style>{meta}</head>
+<body><div style="width:945.5px;height:1341px"><img src="bg.jpg" style="position:absolute"/>
+<div class="t" style="left:10px;top:20px;font-family:hand">Placed text</div></div></body></html>"#
+        )
+    };
+    Publication::open_epub(epub(&[
+        ("OEBPS/content.opf", &opf),
+        (
+            "OEBPS/p1.xhtml",
+            &page(r#"<meta name="viewport" content="width=945.5, height=1341"/>"#),
+        ),
+        ("OEBPS/p2.xhtml", &page(page_meta)),
+        ("OEBPS/fonts/hand.ttf", "ttf"),
+        ("OEBPS/bg.jpg", "jpeg"),
+    ]))
+    .unwrap()
+}
+
+#[test]
+fn a_pre_paginated_book_gives_each_section_its_page_size() {
+    let book = fixed_layout_book("", "");
+    assert!(book.metadata().fixed_layout);
+    assert!(book.spine().iter().all(|s| s.fixed));
+    let p1 = book.section(0).unwrap().page.unwrap();
+    assert_eq!((p1.width, p1.height), (945.5, 1341.0));
+    let p2 = book.section(1).unwrap().page.unwrap();
+    assert_eq!(
+        (p2.width, p2.height),
+        (500.0, 700.0),
+        "a page with no viewport of its own takes the package's"
+    );
+}
+
+#[test]
+fn a_reflowable_item_in_a_fixed_book_flows() {
+    let book = fixed_layout_book(r#"properties="rendition:layout-reflowable""#, "");
+    assert!(!book.spine()[1].fixed);
+    assert_eq!(book.section(1).unwrap().page, None);
+}
+
+#[test]
+fn a_viewport_in_a_reflowable_book_is_not_a_page() {
+    let book = book3(r#"<p>x</p>"#);
+    assert!(!book.metadata().fixed_layout);
+    assert_eq!(book.section(0).unwrap().page, None);
+}

@@ -2,6 +2,8 @@
 //! stylesheets that apply to it, and the text positions count in.
 
 use crate::css::{self, Css};
+use crate::epub;
+use crate::fixed::PageSize;
 use crate::path::{self, Href};
 use crate::xml::{self, Element, Node};
 
@@ -92,7 +94,7 @@ impl std::str::FromStr for Target {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Section {
     pub index: usize,
     /// Archive path of the source document.
@@ -101,6 +103,11 @@ pub struct Section {
     pub root: El,
     /// Stylesheets in document order: linked ones, then `<style>` elements.
     pub styles: Vec<Css>,
+    /// `Some` when the section is a fixed-layout page: its size in CSS
+    /// pixels, from its `<meta name="viewport">` or else the package's. A
+    /// renderer draws it as one page of that size, scaled to fit, and does
+    /// not flow it into columns.
+    pub page: Option<PageSize>,
 }
 
 impl Section {
@@ -419,9 +426,15 @@ pub(crate) struct Book<'a> {
 
 pub(crate) fn sanitise(doc: &Element, book: &Book<'_>) -> Section {
     let mut styles = Vec::new();
+    let mut viewport = None;
     if let Some(head) = doc.elements().find(|e| e.is("head")) {
         for e in head.descendants() {
-            if e.is("link")
+            if e.is("meta")
+                && e.attr("name")
+                    .is_some_and(|n| n.eq_ignore_ascii_case("viewport"))
+            {
+                viewport = viewport.or_else(|| e.attr("content").and_then(epub::parse_viewport));
+            } else if e.is("link")
                 && e.attr("rel").is_some_and(|r| {
                     r.to_ascii_lowercase()
                         .split_whitespace()
@@ -470,6 +483,7 @@ pub(crate) fn sanitise(doc: &Element, book: &Book<'_>) -> Section {
         path: book.path.to_owned(),
         root,
         styles,
+        page: viewport,
     }
 }
 
