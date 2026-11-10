@@ -63,6 +63,24 @@ impl FailureKind {
             Self::Network
         }
     }
+
+    /// A media error the Rust engine gave up on, by its hls.js-shaped
+    /// `details`: bytes that would not decode are damage, a codec the
+    /// browser refused is unplayable, and anything else (a stall with data
+    /// buffered, a SourceBuffer that would not remove) is neither, so it is
+    /// not offered a skip (V1219).
+    pub fn of_media_error(details: &str) -> Self {
+        match details {
+            "bufferAppendError"
+            | "bufferAppendingError"
+            | "fragParsingError"
+            | "videoDecodeError" => Self::Damaged,
+            "bufferAddCodecError"
+            | "manifestIncompatibleCodecsError"
+            | "bufferIncompatibleCodecsError" => Self::Unplayable,
+            _ => Self::Network,
+        }
+    }
 }
 
 /// Why playback stopped for good, and what kind of failure it was.
@@ -2937,6 +2955,23 @@ mod tests {
         assert!(up_next_pill(false, UP_NEXT_COUNTDOWN_MS + 1));
         assert!(!up_next_pill(false, UP_NEXT_COUNTDOWN_MS));
         assert!(!up_next_pill(true, 60_000));
+    }
+
+    /// 038 FR-403: the Rust engine's give-ups name the same culprit
+    /// hls.js's would; a refused codec or a stall is not called damage.
+    #[test]
+    fn a_rust_engine_media_failure_is_damage_only_when_bytes_would_not_decode() {
+        use FailureKind::{Damaged, Network, Unplayable};
+        for (details, want) in [
+            ("bufferAppendError", Damaged),
+            ("videoDecodeError", Damaged),
+            ("bufferAddCodecError", Unplayable),
+            ("bufferStalledError", Network),
+            ("bufferRemoveError", Network),
+            ("internalException", Network),
+        ] {
+            assert_eq!(FailureKind::of_media_error(details), want, "{details}");
+        }
     }
 
     /// 038 FR-403: a codec the browser lacks is the browser's limit, a
