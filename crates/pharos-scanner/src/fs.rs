@@ -2484,15 +2484,24 @@ fn hide_parts_held_whole(groups: Vec<Group>) -> (Vec<Group>, Vec<Fold>) {
     }
     let mut hidden: HashMap<usize, usize> = HashMap::new();
     for c in &candidates {
-        let whole = c.parts.iter().find_map(|&(i, _)| {
-            let film = crate::parts::without_marker(&groups.get(i)?.0)?;
-            copy_buckets(&film)
-                .iter()
-                .find_map(|b| held_by.get(b).copied())
-        });
-        let Some(whole) = whole else {
+        // Every part must name the same whole film, or the set is left to
+        // stacking: one part's viewers must not fold into another film.
+        let wholes: Vec<Option<usize>> = c
+            .parts
+            .iter()
+            .map(|&(i, _)| {
+                let film = crate::parts::without_marker(&groups.get(i)?.0)?;
+                copy_buckets(&film)
+                    .iter()
+                    .find_map(|b| held_by.get(b).copied())
+            })
+            .collect();
+        let Some(&Some(whole)) = wholes.first() else {
             continue;
         };
+        if wholes.iter().any(|w| *w != Some(whole)) {
+            continue;
+        }
         let value = groups
             .get(whole)
             .map(|g| g.0.display().to_string())
