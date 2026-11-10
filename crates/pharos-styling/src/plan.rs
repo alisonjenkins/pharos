@@ -104,6 +104,10 @@ pub struct LineEffect {
     /// has none (B1212); a source's own `\k` timings win over these.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub syllables: Option<Vec<Syllable>>,
+    /// The speaker's palette slot, from 0, when the speaker speaks enough
+    /// lines to be told apart by colour (speaker colours, opt-in).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speaker: Option<u8>,
     /// The line crosses a scene cut: keep the intent but draw the Low (still)
     /// form, so no animation runs across the cut (FR-011).
     #[serde(default)]
@@ -225,6 +229,7 @@ mod tests {
                     reason: "loud".into(),
                     static_only: false,
                     syllables: None,
+                    speaker: None,
                 },
                 LineEffect {
                     line: 4,
@@ -235,6 +240,7 @@ mod tests {
                     reason: String::new(),
                     static_only: false,
                     syllables: None,
+                    speaker: None,
                 },
             ],
         };
