@@ -46,6 +46,14 @@ const CAPS_RATIO: f32 = 0.8;
 const ATTACK_MAX_WORDS: usize = 3;
 /// Most words in a bracketed sound name.
 const SFX_MAX_WORDS: usize = 4;
+/// First-word stems that make a parenthesised line a sound cue rather than
+/// a thought: non-speech voices first, then common sounds.
+const SOUND_CUES: [&str; 38] = [
+    "laugh", "chuckl", "giggl", "snicker", "cackl", "chortl", "guffaw", "sigh", "gasp", "groan",
+    "grunt", "scream", "shriek", "sob", "crying", "cries", "cough", "sneez", "pant", "snor",
+    "yawn", "whimper", "growl", "roar", "cheer", "applau", "scoff", "snort", "sniff", "knock",
+    "bang", "crash", "thud", "ring", "buzz", "beep", "explo", "thunder",
+];
 const PHONE_DEVICES: [&str; 11] = [
     "phone",
     "telephone",
@@ -267,16 +275,30 @@ fn decide(
 }
 
 fn is_sfx(text: &str) -> bool {
-    if text.starts_with(['(', '（']) {
+    let inner = unwrap_marks(text);
+    // Parentheses usually hold a thought; only a sound cue there is a sound
+    // (B1203: `(laughs)` was drawn as a thought).
+    if text.starts_with(['(', '（']) && !is_sound_cue(inner) {
         return false;
     }
-    let inner = unwrap_marks(text);
     inner != text
         && !inner.is_empty()
         && inner.split_whitespace().count() <= SFX_MAX_WORDS
         && !inner.contains([',', '?', '.'])
         && !is_phone_tag(&inner.to_lowercase())
         && !is_whisper_tag(&inner.to_lowercase())
+}
+
+/// Whether a bracket's contents name a sound or a non-speech voice: its
+/// first word starts with a [`SOUND_CUES`] stem (`laughs`, `sighing`,
+/// `door creaks` has no stem and is not one; `knocking on door` is).
+fn is_sound_cue(inner: &str) -> bool {
+    let lower = inner.to_lowercase();
+    let Some(first) = lower.split_whitespace().next() else {
+        return false;
+    };
+    let first = first.trim_matches(|c: char| !c.is_alphabetic());
+    SOUND_CUES.iter().any(|stem| first.starts_with(stem))
 }
 
 fn has_narrator_tag(text: &str) -> bool {
@@ -571,7 +593,7 @@ mod tests {
     fn sfx() {
         assert_eq!(intent(case("[explosion]")), Intent::Sfx);
         assert_eq!(intent(case("*bang*")), Intent::Sfx);
-        assert_eq!(intent(case("(explosion)").silent()), Intent::Plain);
+        assert_eq!(intent(case("(explosion)").silent()), Intent::Sfx);
         assert_eq!(intent(case("[Hello] there")), Intent::Plain);
         assert_eq!(intent(case("[on phone]")), Intent::Phone);
         assert_eq!(intent(case("*bang!*")), Intent::Sfx);
@@ -585,6 +607,18 @@ mod tests {
             Intent::Plain
         );
         assert_eq!(intent(case("*It ends here.*").silent()), Intent::Plain);
+    }
+
+    /// B1203: a parenthesised sound is a sound, not a thought.
+    #[test]
+    fn a_parenthesised_sound_cue_is_a_sound() {
+        for cue in ["(sighs)", "(knocking on door)", "(EXPLOSION)", "（gasps）"] {
+            assert_eq!(intent(case(cue)), Intent::Sfx, "{cue}");
+        }
+        assert_eq!(intent(case("(What is that)")), Intent::Thought);
+        assert_eq!(intent(case("(sighs, then stops)")), Intent::Thought);
+        assert_eq!(intent(case("(Laughing at me, are you?)")), Intent::Thought);
+        assert_eq!(intent(case("(whispers)")), Intent::Whisper);
     }
 
     #[test]
