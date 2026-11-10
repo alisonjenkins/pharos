@@ -278,6 +278,10 @@ pub fn toggle_play(_video_id: &str) {}
 
 pub fn play(_video_id: &str) {}
 
+pub fn autoplay_blocked() -> bool {
+    false
+}
+
 pub fn pause(_video_id: &str) {}
 
 pub fn set_rate(_video_id: &str, _rate: f64) {}

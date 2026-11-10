@@ -184,6 +184,11 @@ pub trait GroupPlayer {
     /// Switch the player's audio and subtitle, as its own menus do; `picks`
     /// name the primary file's streams.
     fn apply_tracks(&self, picks: TrackPicks);
+    /// The browser refused to start this player until the viewer does
+    /// something (038 FR-407): a `play()` now would be refused again.
+    fn autoplay_blocked(&self) -> bool {
+        false
+    }
 }
 
 /// When an anchor was struck.
@@ -699,6 +704,9 @@ struct Inner {
     /// When the drift check last started a player it found paused while the
     /// group plays (B660), so a refused `play()` is not retried every tick.
     resumed_ms: Option<i64>,
+    /// The drift check is holding its resume for a gesture after a refused
+    /// autoplay (038 FR-407), so the hold is logged once.
+    gesture_wait: bool,
     /// The video waited within the grace of our own seek; it is reported as
     /// buffering only if it outlasts the grace.
     held_waiting: bool,
@@ -1803,6 +1811,19 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
     /// each second.
     fn resume_paused(&self, player: &Rc<dyn GroupPlayer>, expected: u64, since: u64, now: i64) {
         let settle = i64::try_from(SETTLE_AFTER_COMMAND_MS).unwrap_or(i64::MAX);
+        // A refused autoplay waits for the viewer's tap on "Tap to start";
+        // retrying in the background is refused each time (038 FR-407).
+        if player.autoplay_blocked() {
+            let first = !std::mem::replace(&mut self.inner.borrow_mut().gesture_wait, true);
+            if first {
+                self.env.info(&format!(
+                    "pharos: group resume held reason=autoplay_refused position_ms={} expected_ms={expected}",
+                    player.position_ms()
+                ));
+            }
+            return;
+        }
+        self.inner.borrow_mut().gesture_wait = false;
         {
             let mut inner = self.inner.borrow_mut();
             let recent = inner
@@ -2362,9 +2383,13 @@ mod tests {
         /// Audio and subtitle stream indexes of the item.
         streams: RefCell<(Vec<u32>, Vec<u32>)>,
         applied: RefCell<Vec<TrackPicks>>,
+        blocked: Cell<bool>,
     }
 
     impl GroupPlayer for TestPlayer {
+        fn autoplay_blocked(&self) -> bool {
+            self.blocked.get()
+        }
         fn position_ms(&self) -> u64 {
             self.position.get()
         }
@@ -3777,6 +3802,33 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    /// 038 FR-407, V1223: after a refused autoplay the drift check stops
+    /// starting the player in the background until a gesture lifts it, and
+    /// says so once. Disarm check: without the `autoplay_blocked` guard the
+    /// first assert sees `play`.
+    #[test]
+    fn a_refused_autoplay_holds_the_group_resume_until_a_gesture() {
+        let rig = playing_rig();
+        rig.player.paused.set(true);
+        rig.player.position.set(5_000);
+        rig.player.blocked.set(true);
+        for now in [110_000, 113_000, 116_000] {
+            rig.env.now.set(now);
+            rig.session.check_drift();
+        }
+        assert!(rig.player.log.borrow().is_empty(), "{:?}", rig.player.log.borrow());
+        assert_eq!(
+            rig.env
+                .logged("pharos: group resume held reason=autoplay_refused position_ms=5000")
+                .len(),
+            1
+        );
+        rig.player.blocked.set(false);
+        rig.env.now.set(120_000);
+        rig.session.check_drift();
+        assert!(rig.player.log.borrow().iter().any(|l| l == "play"), "{:?}", rig.player.log.borrow());
     }
 
     /// A player that stays paused (the browser refused the `play()`) is not
