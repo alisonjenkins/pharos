@@ -60,6 +60,18 @@ pub struct IntegrityReport {
     /// damaged one of those is read again so it gains them.
     #[serde(default)]
     pub ranges: Option<Vec<DamageRange>>,
+    /// Whether the container carries an index a seek can use (B1162, V1122).
+    /// `Some(false)` is an AVI with neither an `idx1` chunk nor an OpenDML
+    /// `indx`: every seek into it makes libav read the file from byte 0,
+    /// so a seek near the end of a long file can wait over a minute for its first
+    /// frame. `None` means not checked, either because the container keeps
+    /// its index somewhere libav reads lazily (Matroska cues, MP4 `moov`), or
+    /// because the verdict was recorded before this check existed.
+    ///
+    /// Always written: the worker sends this type as bincode, which has no
+    /// field names, so a field left out would shift every one after it.
+    #[serde(default)]
+    pub seek_index: Option<bool>,
 }
 
 /// One span of damaged media, in ms. A fault the demuxer could place no more
@@ -183,9 +195,18 @@ impl IntegrityReport {
         short >= MIN_SHORTFALL_MS && (short as f64 / declared as f64) > MAX_SHORTFALL_RATIO
     }
 
+    /// Whether a seek into this file has to read it from the start.
+    pub fn is_unindexed(&self) -> bool {
+        self.seek_index == Some(false)
+    }
+
     /// Whether anything was wrong with the container.
     pub fn is_damaged(&self) -> bool {
-        self.corrupt_packets > 0 || self.read_errors > 0 || self.demux_errors > 0 || self.is_short()
+        self.corrupt_packets > 0
+            || self.read_errors > 0
+            || self.demux_errors > 0
+            || self.is_short()
+            || self.is_unindexed()
     }
 
     /// Bounded, stable metric label. A dashboard contract — renaming one of
@@ -197,8 +218,10 @@ impl IntegrityReport {
             "unreadable"
         } else if self.corrupt_packets > 0 || self.read_errors > 0 || self.demux_errors > 0 {
             "damaged"
-        } else {
+        } else if self.is_short() {
             "short"
+        } else {
+            "unindexed"
         }
     }
 
@@ -206,6 +229,13 @@ impl IntegrityReport {
     pub fn summary(&self) -> String {
         if !self.is_damaged() {
             return format!("clean ({} packets, {} ms)", self.packets, self.scanned_ms);
+        }
+        if self.label() == "unindexed" {
+            return format!(
+                "unindexed: no seek index, so every seek reads the file from the start; \
+                 remux it (e.g. `ffmpeg -i in.avi -c copy out.mkv`) to fix ({} packets, {} ms)",
+                self.packets, self.scanned_ms,
+            );
         }
         if self.label() == "short" {
             return format!(
@@ -267,15 +297,21 @@ mod tests {
             complete: true,
             ..Default::default()
         };
+        let unindexed = IntegrityReport {
+            complete: true,
+            seek_index: Some(false),
+            ..Default::default()
+        };
         let labels = [
             clean.label(),
             damaged.label(),
             unreadable.label(),
             short.label(),
+            unindexed.label(),
         ];
         assert_eq!(
             labels,
-            ["clean", "damaged", "unreadable", "short"],
+            ["clean", "damaged", "unreadable", "short", "unindexed"],
             "metric labels are a dashboard contract"
         );
     }
@@ -473,5 +509,54 @@ mod tests {
             "both the first fault and the unread tail are marked"
         );
         assert!(IntegrityReport::default().damage_ranges().is_empty());
+    }
+
+    /// B1162 / V1122: an AVI with no index is reported, and says what to do.
+    /// Seeking into it reads the whole file up to the seek point, which is a
+    /// fault a viewer meets as a minute-long seek, so it is listed with the
+    /// damaged files rather than passing as clean.
+    #[test]
+    fn a_container_without_a_seek_index_is_reported_with_its_remedy() {
+        let r = IntegrityReport {
+            packets: 300_000,
+            scanned_ms: 5_880_000,
+            declared_ms: Some(5_880_000),
+            complete: true,
+            ranges: Some(Vec::new()),
+            seek_index: Some(false),
+            ..Default::default()
+        };
+        assert!(r.is_unindexed());
+        assert!(
+            r.is_damaged(),
+            "a minute-long seek is a fault a viewer meets"
+        );
+        assert_eq!(r.label(), "unindexed");
+        assert!(r.summary().contains("no seek index"), "{}", r.summary());
+        assert!(r.summary().contains("-c copy"), "{}", r.summary());
+        assert!(
+            r.damage_ranges().is_empty(),
+            "no span of the media is broken, so nothing is marked on the seek bar"
+        );
+
+        let indexed = IntegrityReport {
+            seek_index: Some(true),
+            ..r.clone()
+        };
+        assert!(!indexed.is_damaged());
+        let unchecked = IntegrityReport {
+            seek_index: None,
+            ..r
+        };
+        assert!(!unchecked.is_damaged(), "not checked is not a fault");
+    }
+
+    /// A verdict written to the memo before the check existed reads back as
+    /// unchecked.
+    #[test]
+    fn a_verdict_from_before_the_check_reads_as_unchecked() {
+        let old = r#"{"packets":3,"corrupt_packets":0,"read_errors":0,"demux_errors":0,"first_fault_ms":null,"first_fault":null,"scanned_ms":4,"declared_ms":null,"complete":true}"#;
+        let r: IntegrityReport = serde_json::from_str(old).unwrap();
+        assert_eq!(r.seek_index, None);
     }
 }
