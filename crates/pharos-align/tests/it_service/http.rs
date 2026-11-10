@@ -4,7 +4,7 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use pharos_align::audio::DecodeError;
-use pharos_align::service::{Decoder, ALIGNER_VERSION};
+use pharos_align::service::Decoder;
 use serde_json::{json, Value};
 
 use crate::common::{self, post, raw, serve, silent};
@@ -38,7 +38,9 @@ fn a_song_answers_with_its_words_offset_and_version() {
         json!({
             "lines": [{"words": [{"at": 0, "start_ms": 250}, {"at": 6, "start_ms": 350}, {"at": 11, "start_ms": 450}], "score": 0.813}],
             "offset_ms": 0,
-            "aligner_version": ALIGNER_VERSION,
+            // The contract's value, not the constant: the server holds the
+            // shadow to it (spec 039, R21).
+            "aligner_version": 5,
         })
     );
 }
