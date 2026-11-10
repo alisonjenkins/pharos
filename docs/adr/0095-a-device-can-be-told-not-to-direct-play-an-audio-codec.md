@@ -12,7 +12,7 @@ and that rule stays.
 
 T130 found the case it does not cover: a client whose claim is honest but
 whose decoder is not. A Google TV's profile lists E-AC-3, so pharos
-direct-plays A Beautiful Mind (h264 + E-AC-3 in Matroska) to it, and the TV's
+direct-plays Film AT (h264 + E-AC-3 in Matroska) to it, and the TV's
 own Dolby Digital Plus decoder plays the speech ahead of the picture. The same
 file on a laptop, where ffmpeg decodes the audio, is in sync. Turning off
 "Bitstream Dolby Digital" in the Jellyfin Android TV app fixes it on the

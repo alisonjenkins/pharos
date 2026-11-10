@@ -10,9 +10,9 @@
 pharos already serves `GET /MediaSegments/{itemId}` (T64), driving jellyfin-web
 ≥10.10's native **Skip Intro / Skip Outro** overlay. But T64 only derives
 segments from **labeled chapter markers** (`classify_chapter_title`) — a
-chapter titled "Opening"/"Credits"/etc. Real-world TV rips (Code Geass,
-Supergirl) carry no such chapters, so `/MediaSegments` returns empty and no
-skip button ever appears. Verified live 2026-07-14: Supergirl S01E01 + S01E03
+chapter titled "Opening"/"Credits"/etc. Real-world TV rips (Show B,
+Show A) carry no such chapters, so `/MediaSegments` returns empty and no
+skip button ever appears. Verified live 2026-07-14: Show A S01E01 + S01E03
 both return 0 segments.
 
 The gold-standard solution is the Jellyfin **intro-skipper** plugin
@@ -235,7 +235,7 @@ Departures:
   crate.
 - Alignment is not the verbatim port the ADR describes. Pharos's port of the
   plugin's seeded candidate-shift search found no candidate shifts on the
-  Mushoku Tensei S03 intros, so 1 of 10 pairs matched. Whether the plugin
+  Show Z S03 intros, so 1 of 10 pairs matched. Whether the plugin
   itself fails on that input was not tested. `specs/002-fix-skip-intro/` replaced it
   with a bounded exhaustive search over every shift in the windows' overlap
   (T008); the match, contiguity and bounds rules are unchanged.

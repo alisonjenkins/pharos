@@ -6,7 +6,7 @@
 
 ## Context
 
-Some files carry black bars inside the picture itself. Every Bewitched episode
+Some files carry black bars inside the picture itself. Every episode of one sitcom
 in the library is a 4:3 picture stored pillarboxed in a 1920x1080 frame
 (B1017). The file says nothing about it: square pixels, a 16:9 display aspect,
 no side data. A player that fits the frame to its window shows the baked-in
