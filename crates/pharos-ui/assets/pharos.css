@@ -5226,14 +5226,23 @@ body:has(.pharos-stage.is-mini) .pharos-main {
 .pharos-stage-play:hover:not(:disabled) {
   background: var(--px-color-accent);
 }
+/* The line stays 3px; a transparent border makes it a 15px target, and a
+   click on it seeks (T038-306). */
 .pharos-stage-progress {
+  box-sizing: content-box;
   height: 3px;
-  background: var(--px-color-overlay);
+  margin: -6px 0;
+  border-block: 6px solid transparent;
+  background: var(--px-color-overlay) padding-box;
+  cursor: pointer;
+  position: relative;
+  z-index: 1;
 }
 .pharos-stage-progress span {
   display: block;
   height: 100%;
   background: var(--px-color-accent);
+  pointer-events: none;
 }
 /* A narrow floating window keeps the transport and Full; the rest is in
    the bar. */

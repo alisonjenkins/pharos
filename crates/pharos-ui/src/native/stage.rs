@@ -10,7 +10,7 @@ use pharos_client::api::ItemRef;
 
 use super::listen::{Icon, ICON_FLOAT, ICON_PIP, ICON_QUEUE_NEXT, QUEUE_PANEL_ID};
 use super::platform;
-use super::playback::MediaState;
+use super::playback::{position_at, MediaState};
 use super::route::Route;
 use super::watch_view::Control;
 
@@ -728,7 +728,22 @@ pub fn StageBar(
                     }
                 }
             }
-            div { class: "pharos-stage-progress", aria_hidden: "true",
+            // A click or tap seeks there (T038-306). Hidden from a screen
+            // reader, which has the full player's seek slider.
+            div {
+                id: STAGE_PROGRESS_ID,
+                class: "pharos-stage-progress",
+                aria_hidden: "true",
+                onclick: move |evt: MouseEvent| {
+                    let width = platform::element_width(STAGE_PROGRESS_ID);
+                    if let Some(ms) = position_at(evt.element_coordinates().x, width, total) {
+                        platform::info(&format!(
+                            "pharos: stage progress seek from {} ms to {ms} ms",
+                            media.position_ms
+                        ));
+                        on_action.call(StageAction::Player(Control::Seek(ms)));
+                    }
+                },
                 span { style: "width: {played:.2}%" }
             }
         }
@@ -745,6 +760,8 @@ pub fn queue_label(count: usize) -> String {
     }
 }
 
+/// The compact player's progress line, which seeks on a click (T038-306).
+const STAGE_PROGRESS_ID: &str = "pharos-stage-progress";
 pub(super) const ICON_PLAY: &str = "M8 5v14l11-7L8 5Z";
 pub(super) const ICON_PAUSE: &str = "M7 5h3.5v14H7zM13.5 5H17v14h-3.5z";
 pub(super) const ICON_PREVIOUS: &str = "M6 6h2v12H6V6Zm3.5 6 8.5 6V6l-8.5 6Z";
@@ -1148,6 +1165,22 @@ mod tests {
         );
         dom.rebuild_in_place();
         dioxus_ssr::render(&dom)
+    }
+
+    /// T038-306: the compact player's progress line is a seek target: it
+    /// has an id to measure, and its fill lets the pointer through so the
+    /// click lands on the line and its offset is the line's.
+    #[test]
+    fn the_small_players_progress_line_is_a_seek_target() {
+        let html = bar(None);
+        assert!(html.contains(r#"id="pharos-stage-progress""#), "{html}");
+        let sheet = include_str!("../../assets/pharos.css");
+        let fill = sheet
+            .split("\n.pharos-stage-progress span {")
+            .nth(1)
+            .and_then(|r| r.split('}').next())
+            .unwrap_or_default();
+        assert!(fill.contains("pointer-events: none;"), "{fill}");
     }
 
     /// B900/V852: music's mini bar has a queue button that counts what
