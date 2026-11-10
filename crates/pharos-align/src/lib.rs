@@ -11,6 +11,7 @@ pub mod config;
 pub mod ctc;
 pub mod http;
 pub mod line;
+pub mod obs;
 pub mod offset;
 pub mod plan;
 pub mod service;
