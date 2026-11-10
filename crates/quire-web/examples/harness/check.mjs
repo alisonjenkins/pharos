@@ -89,6 +89,50 @@ await b.evaluate(async () => { await window.q.next(); });
 const forward = await b.evaluate(() => window.q.locator());
 check(forward !== before, `next page moves on (${before} -> ${forward})`);
 
+// V1290/V1291: a fixed-layout page is drawn whole, scaled to fit and centred,
+// with the book's own sizes and colours, and its fonts reach the document.
+async function openFixed(width, height) {
+  const page = await browser.newPage({ viewport: { width, height } });
+  page.on("pageerror", (e) => console.log("pageerror", e.message));
+  await page.goto(url);
+  await page.waitForSelector("body[data-ready]");
+  await page.evaluate(() => window.q.mount_book(new Uint8Array(), 0));
+  return page;
+}
+const fixedState = (page) =>
+  page.evaluate(() => {
+    const sh = document.getElementById("host").shadowRoot;
+    const box = (el) => { const r = el.getBoundingClientRect(); return [r.left, r.top, r.width, r.height]; };
+    const placed = sh.getElementById("placed");
+    const cs = getComputedStyle(placed);
+    return {
+      strip: box(sh.querySelector(".quire-strip")),
+      placed: box(placed),
+      fontSize: cs.fontSize,
+      color: cs.color,
+      art: getComputedStyle(sh.getElementById("art")).backgroundColor,
+      fonts: [...document.fonts].map((f) => f.family.replace(/"/g, "")),
+      at: window.q.where_now(),
+    };
+  });
+const near = (x, y) => Math.abs(x - y) < 1;
+for (const [w, h] of [[1000, 700], [400, 800]]) {
+  const f = await openFixed(w, h);
+  const st = await fixedState(f);
+  const scale = Math.min((w - 16) / 500, (h - 16) / 700);
+  const [l, t, sw, sh] = st.strip;
+  check(near(sw, 500 * scale) && near(sh, 700 * scale), `${w}x${h}: the page is scaled to fit (${sw.toFixed(1)}x${sh.toFixed(1)})`);
+  check(near(l, (w - sw) / 2) && near(t, (h - sh) / 2), `${w}x${h}: and centred (${l.toFixed(1)}, ${t.toFixed(1)})`);
+  check(near(st.placed[0], l + 40 * scale) && near(st.placed[1], t + 400 * scale), `${w}x${h}: placed text sits at its point on the page`);
+  check(st.fontSize === "30px" && st.color === "rgb(10, 20, 30)", `${w}x${h}: placed text keeps the book's size and colour (${st.fontSize}, ${st.color})`);
+  check(st.art === "rgb(250, 220, 200)", `${w}x${h}: the page's own colours are kept (${st.art})`);
+  check(st.at[0] === 0 && st.at[1] === 1, `${w}x${h}: one page per section (${st.at})`);
+  check(st.fonts.includes("placed-hand"), `${w}x${h}: the book's font reaches the document (${st.fonts})`);
+  await f.evaluate(() => window.q.next());
+  check((await fixedState(f)).at[2] === 1, `${w}x${h}: next turns to the next page's section`);
+  await f.close();
+}
+
 await browser.close();
 server.close();
 process.exit(failed ? 1 : 0);
