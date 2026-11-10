@@ -115,14 +115,22 @@ pub fn sampling_ratio() -> f64 {
     SAMPLING_RATIO.get().copied().unwrap_or(1.0)
 }
 
+/// The sampler the provider applies to a trace's root span at `ratio`: every
+/// trace at 1 or above, none below 0. `obs::sampler_for` wraps it in
+/// `ParentBased`, and `trace_sampled` asks it, so the two cannot disagree.
+pub fn root_sampler(ratio: f64) -> Sampler {
+    if ratio >= 1.0 {
+        Sampler::AlwaysOn
+    } else {
+        Sampler::TraceIdRatioBased(ratio.max(0.0))
+    }
+}
+
 /// Whether the provider's root sampler keeps a trace that starts with
 /// `trace_id` at `ratio`. Deterministic on the trace id, so a client child
 /// span's synthetic parent gets the verdict its root span got.
 pub fn trace_sampled(trace_id: TraceId, ratio: f64) -> bool {
-    if ratio >= 1.0 {
-        return true;
-    }
-    Sampler::TraceIdRatioBased(ratio.max(0.0))
+    root_sampler(ratio)
         .should_sample(None, trace_id, "client", &SpanKind::Client, &[], &[])
         .decision
         == SamplingDecision::RecordAndSample
