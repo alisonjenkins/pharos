@@ -28,6 +28,17 @@ pub enum ModelError {
     /// The model itself is broken; the song answers 500.
     #[error("{0}")]
     Fatal(String),
+    /// The device under the model failed (lost, out of memory); a model
+    /// with a fallback runs the window elsewhere, otherwise it is fatal.
+    #[error("{0}")]
+    Device(String),
+}
+
+/// Where a song's forward passes ran and why, for its span and log line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceUsed {
+    pub device: &'static str,
+    pub reason: String,
 }
 
 /// Waveform to word spans: the acoustic model plus CTC, `model.py`'s `Aligner.align`.
@@ -39,6 +50,17 @@ pub trait Model: Send {
         tokens: &[String],
         lead_star: bool,
     ) -> Result<Vec<(u64, u64)>, ModelError>;
+
+    /// Called before each song's first window.
+    fn begin_song(&mut self) {}
+
+    /// Where the song so far ran.
+    fn device(&self) -> DeviceUsed {
+        DeviceUsed {
+            device: "cpu",
+            reason: "forced_cpu".into(),
+        }
+    }
 
     /// [`Model::align`] over independent windows, one answer each in order;
     /// a model may run them through shared forward passes.
@@ -178,6 +200,17 @@ impl Engine {
         full_path: &Path,
         lines: Vec<Line>,
     ) -> Result<Aligned, SongError> {
+        self.align_song_on(rel_path, full_path, lines).0
+    }
+
+    /// [`Engine::align_song`], plus where it ran: known on failure too, so
+    /// the failure's log line names the device as the success's does.
+    pub fn align_song_on(
+        &self,
+        rel_path: &str,
+        full_path: &Path,
+        lines: Vec<Line>,
+    ) -> (Result<Aligned, SongError>, Option<DeviceUsed>) {
         let mut slot = tracing::info_span!("aligner.wait").in_scope(|| {
             // A song that panicked mid-way leaves nothing half-written that the
             // next one reads: the model is reloaded below if it was dropped.
@@ -187,8 +220,13 @@ impl Engine {
         });
         if slot.model.is_none() {
             let started = Instant::now();
-            let model = (self.loader)()
-                .map_err(|e| SongError::Internal(format!("model load failed: {e}")))?;
+            let model = match (self.loader)() {
+                Ok(m) => m,
+                Err(e) => {
+                    let e = SongError::Internal(format!("model load failed: {e}"));
+                    return (Err(e), None);
+                }
+            };
             tracing::info!(
                 load_ms = started.elapsed().as_millis() as u64,
                 "model loaded"
@@ -196,8 +234,15 @@ impl Engine {
             slot.model = Some(model);
         }
         let result = match slot.model.as_deref_mut() {
-            Some(model) => run_song(model, &self.decoder, rel_path, full_path, lines),
-            None => Err(SongError::Internal("model missing after load".into())),
+            Some(model) => {
+                model.begin_song();
+                let r = run_song(model, &self.decoder, rel_path, full_path, lines);
+                (r, Some(model.device()))
+            }
+            None => (
+                Err(SongError::Internal("model missing after load".into())),
+                None,
+            ),
         };
         slot.last_used = Instant::now();
         result
@@ -270,7 +315,9 @@ fn run_song(
                     tracing::warn!(path = %rel_path, error = %e, "offset probe failed");
                     Ok(Vec::new())
                 }
-                Err(e @ ModelError::Fatal(_)) => Err(SongError::Internal(e.to_string())),
+                Err(e @ (ModelError::Fatal(_) | ModelError::Device(_))) => {
+                    Err(SongError::Internal(e.to_string()))
+                }
             })
             .collect()
     };
@@ -323,7 +370,9 @@ fn run_song(
                 out.push(LineWords { words: Vec::new() });
                 continue;
             }
-            Err(e @ ModelError::Fatal(_)) => return Err(SongError::Internal(e.to_string())),
+            Err(e @ (ModelError::Fatal(_) | ModelError::Device(_))) => {
+                return Err(SongError::Internal(e.to_string()))
+            }
         };
         let line_stamps = stamps(&line.text, &w_list, &spans, w_start);
         if let Some(last) = line_stamps.last() {

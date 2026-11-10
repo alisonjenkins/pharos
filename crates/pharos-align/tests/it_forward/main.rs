@@ -218,6 +218,7 @@ fn batched_probes_align_as_they_do_alone() {
     let mut batched = CpuAligner {
         model: model(),
         batch_samples: pharos_align::config::DEFAULT_BATCH_SAMPLES,
+        reason: "forced_cpu".into(),
     };
     let together = synthetic_song(&mut batched);
     batched.batch_samples = 1;
@@ -232,6 +233,7 @@ fn peak_rss_stays_within_budget() {
         let mut aligner = pharos_align::forward::CpuAligner {
             model: model(),
             batch_samples: pharos_align::config::DEFAULT_BATCH_SAMPLES,
+            reason: "forced_cpu".into(),
         };
         synthetic_song(&mut aligner);
         let peak = vm_hwm_kib();
