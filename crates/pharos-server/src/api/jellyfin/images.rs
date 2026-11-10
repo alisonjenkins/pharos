@@ -686,6 +686,10 @@ async fn serve_image(
                 metrics::counter!("pharos_image_thumb_source_total", "source" => "artwork")
                     .increment(1);
             }
+            if matches!(role, ImageRole::Primary) {
+                metrics::counter!("pharos_image_primary_source_total", "source" => "artwork")
+                    .increment(1);
+            }
             return serve_local_artwork(
                 &local,
                 role,
@@ -733,6 +737,17 @@ async fn serve_image(
         && matches!(role, ImageRole::Backdrop | ImageRole::Thumb)
     {
         return Ok(HttpResponse::NotFound().body(""));
+    }
+    // A video item's Primary that reaches here has no servable recorded
+    // artwork, so the still is a frame extracted from the media itself.
+    if index == 0
+        && matches!(role, ImageRole::Primary)
+        && matches!(
+            item.kind,
+            pharos_core::MediaKind::Movie | pharos_core::MediaKind::Episode
+        )
+    {
+        metrics::counter!("pharos_image_primary_source_total", "source" => "frame").increment(1);
     }
     let jpeg_path = match cache
         .fetch_3d(
@@ -1189,6 +1204,7 @@ async fn local_artwork_path(
     match tokio::fs::try_exists(&path).await {
         Ok(true) => Some(path),
         _ => {
+            metrics::counter!("pharos_image_artwork_missing_total", "role" => token).increment(1);
             tracing::warn!(
                 media.id = id,
                 role = token,
@@ -2495,6 +2511,82 @@ mod tests {
         assert_eq!(resp.headers().get("content-type").unwrap(), "image/png");
         let body = test::read_body(resp).await;
         assert_eq!(body.as_ref(), PNG_1X1, "served bytes must be the sidecar");
+    }
+
+    /// The counter values under `name`, keyed by the value of its `label`.
+    fn counter_samples(
+        snap: &pharos_test_metrics::CumulativeSnapshotter,
+        name: &str,
+        label: &str,
+    ) -> std::collections::BTreeMap<String, u64> {
+        use metrics_util::debugging::DebugValue;
+        let mut out = std::collections::BTreeMap::new();
+        for (ck, _, _, value) in snap.snapshot().into_vec() {
+            if ck.key().name() != name {
+                continue;
+            }
+            let Some(sample) = ck.key().labels().find(|l| l.key() == label) else {
+                continue;
+            };
+            if let DebugValue::Counter(n) = value {
+                out.insert(sample.value().to_owned(), n);
+            }
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn a_recorded_file_that_is_gone_is_counted_by_role() {
+        use metrics_util::debugging::DebuggingRecorder;
+        let recorder = DebuggingRecorder::new();
+        let snap = pharos_test_metrics::snapshotter(&recorder);
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let rows = vec![(
+            "Primary".to_owned(),
+            "local".to_owned(),
+            "/nonexistent/pharos-test/folder.jpg".to_owned(),
+        )];
+        assert!(local_artwork_path(1, ImageRole::Primary, &rows)
+            .await
+            .is_none());
+        let missing = counter_samples(&snap, "pharos_image_artwork_missing_total", "role");
+        assert_eq!(missing.get("Primary"), Some(&1));
+    }
+
+    #[actix_web::test]
+    async fn primary_still_names_the_source_that_served_it() {
+        use pharos_core::MediaStore;
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snap = pharos_test_metrics::snapshotter(&recorder);
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+        let poster = dir.path().join("poster.png");
+        std::fs::write(&poster, PNG_1X1).unwrap();
+
+        let state = seed_state_with_cache(cache_dir.path()).await;
+        // Item 42 has a recorded sidecar; item 43 has no artwork at all, so
+        // its Primary falls through to the frame-extract path.
+        put_movie(&state, 42, &dir.path().join("movie.mkv")).await;
+        state
+            .stores
+            .set_artwork(42, "Primary", "local", &poster.to_string_lossy())
+            .await
+            .unwrap();
+        put_movie(&state, 43, &dir.path().join("bare.mkv")).await;
+
+        let token = token_for(&state.stores).await;
+        let app = test::init_service(App::new().app_data(state.clone()).configure(register)).await;
+        for uri in ["/items/42/images/primary", "/items/43/images/primary"] {
+            let req = test::TestRequest::get()
+                .insert_header(("X-Emby-Token", token.clone()))
+                .uri(uri)
+                .to_request();
+            let _ = test::call_service(&app, req).await;
+        }
+        let served = counter_samples(&snap, "pharos_image_primary_source_total", "source");
+        assert_eq!(served.get("artwork"), Some(&1), "{served:?}");
+        assert_eq!(served.get("frame"), Some(&1), "{served:?}");
     }
 
     #[actix_web::test]
