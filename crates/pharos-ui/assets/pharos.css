@@ -2470,7 +2470,8 @@ body:has(.pharos-stage.is-full .pharos-stage-slot:not([inert]) .pharos-connectio
     min-width: 44px;
     min-height: 44px;
   }
-  .pharos-player .pharos-track-picker {
+  .pharos-player .pharos-track-picker,
+  .pharos-player .pharos-subtitle-delay-value {
     min-height: 44px;
   }
   .pharos-seek {
