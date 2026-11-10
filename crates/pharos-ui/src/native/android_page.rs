@@ -2127,6 +2127,9 @@ async fn move_focus_now(dir: super::keymap::Dir) -> Result<(), String> {
     if controls[at].0 == from {
         return Ok(());
     }
+    if !found.from_docked && controls[at].1 && dir == Dir::Up {
+        log::info!("pharos: keys: mini bar reached via=up_from_top");
+    }
     // Only the control moved to is marked for coming back: marking every
     // one ran a document-wide query per control, hundreds on a home page.
     let (sel, nth): (String, u32) = document::eval(&focus_js(at))
