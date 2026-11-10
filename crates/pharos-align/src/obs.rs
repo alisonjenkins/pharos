@@ -156,6 +156,16 @@ impl Metrics {
     }
 }
 
+/// This process's resident memory in MiB, from /proc/self/statm; `None`
+/// where that cannot be read.
+pub fn rss_mib() -> Option<u64> {
+    let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
+    let pages: u64 = statm.split_whitespace().nth(1)?.parse().ok()?;
+    // SAFETY: sysconf only reads a constant of the running system.
+    let page = u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).ok()?;
+    Some(pages * page / (1024 * 1024))
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
