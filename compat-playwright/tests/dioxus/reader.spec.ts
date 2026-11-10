@@ -252,6 +252,72 @@ test.describe("book reader (spec 023)", () => {
     await second.close();
   });
 
+  test("a place read offline is kept on the device and sent when the connection returns (spec 036)", async ({
+    browser,
+    request,
+  }) => {
+    test.setTimeout(150_000);
+    const first = await newReaderContext(browser, { width: 1280, height: 800 });
+    const page = await first.newPage();
+    echoReaderLog(page, "offline");
+    // `setOffline` stops new requests but leaves an open socket up, so the
+    // RPC socket is held by the test and cut with it.
+    let reachable = true;
+    const sockets: { close(): void }[] = [];
+    await page.routeWebSocket(/\/pharos\/rpc/, (ws) => {
+      if (!reachable) {
+        ws.close();
+        return;
+      }
+      ws.connectToServer();
+      sockets.push(ws);
+    });
+    await signIn(page, request);
+    await openFromSearch(page, "Reader Fixture", "Reader Fixture");
+    await page.locator("#pharos-main-action").click();
+    await expect(page.locator(".pharos-reader")).toBeVisible({ timeout: 15_000 });
+    await firstWord(page);
+    const pending = () =>
+      page.evaluate(() => JSON.parse(localStorage.getItem("pharos.reader.pending") ?? "{}"));
+    const note = page.locator(".pharos-reader-offline");
+    await expect(note).toHaveCount(0);
+
+    // The tunnel: the connection goes, pages keep turning.
+    reachable = false;
+    await first.setOffline(true);
+    for (const s of sockets) s.close();
+    const readAtLeast = Date.now();
+    let placed = "";
+    for (let i = 0; i < 3; i++) placed = await turnForward(page);
+    await expect(note).toHaveText("Offline \u00b7 your place is saved on this device", {
+      timeout: 15_000,
+    });
+    await expect.poll(async () => Object.keys(await pending()).length).toBe(1);
+    const queued = Object.values(await pending())[0] as { read_at_ms: number };
+    expect(queued.read_at_ms).toBeGreaterThanOrEqual(readAtLeast);
+    expect(queued.read_at_ms).toBeLessThanOrEqual(Date.now());
+
+    // The way back: the place is sent without anything from the reader.
+    reachable = true;
+    await first.setOffline(false);
+    await expect(note).toHaveCount(0, { timeout: 90_000 });
+    await expect.poll(async () => Object.keys(await pending()).length).toBe(0);
+
+    // Another browser opens at the place read in the tunnel.
+    const second = await newReaderContext(browser, { width: 1280, height: 800 });
+    const other = await second.newPage();
+    echoReaderLog(other, "after");
+    await signIn(other, request);
+    await openFromSearch(other, "Reader Fixture", "Reader Fixture");
+    await other.locator("#pharos-main-action").click();
+    await expect(other.locator(".pharos-reader")).toBeVisible({ timeout: 15_000 });
+    await firstWord(other);
+    await expect.poll(async () => await wordsOnPage(other)).toContain(placed);
+
+    await first.close();
+    await second.close();
+  });
+
   test("a locked Kindle book has no Read button and offers the download (V353)", async ({
     page,
     request,
