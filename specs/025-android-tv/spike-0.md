@@ -77,7 +77,7 @@ treat these as a floor for playback.
 | Native socket | tokio-tungstenite + rustls/ring into `connect_stream`; no Origin header, server accepts |
 | QuickConnect | initiate/poll over the native API, token in `/data/data/<pkg>/files`, `resume(token)` on relaunch |
 | Home row | `home()` 376-562 ms; posters load as `<img>` with `?api_key=<token>` |
-| Playback | 8 Mile, `audio_remux`, hls.js + MSE, hardware `c2.mtk.avc.decoder`, 1920x1080, 1 of 2419 frames dropped, muted; pauses when the app is hidden |
+| Playback | a feature film, `audio_remux`, hls.js + MSE, hardware `c2.mtk.avc.decoder`, 1920x1080, 1 of 2419 frames dropped, muted; pauses when the app is hidden |
 | D-pad / OK | WebView's own spatial navigation moves focus between `<button>`s; Dioxus `onkeydown` gets ArrowUp/Down/Left/Right, Enter |
 | Media keys | `MediaPlayPause`, `MediaPlay`, `MediaFastForward` arrive as keydown |
 | Manifest | `[application] android_manifest = "android/AndroidManifest.xml"` replaces dx's manifest; `aapt2 dump badging` shows `leanback-launchable-activity`, `banner=`, touchscreen and leanback `uses-feature-not-required`; app launches via `LEANBACK_LAUNCHER` |
