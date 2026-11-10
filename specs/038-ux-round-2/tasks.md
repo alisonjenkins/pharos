@@ -84,5 +84,5 @@ Id blocks (bugs and invariants are written with the fix):
 - [x] T038-701 Scan progress, result and per-library scan from the Task topic (FR-701).
 - [x] T038-702 Preferred audio and subtitle language (FR-702).
 - [x] T038-703 [P] Sign-out and Remove confirms for kept books (FR-703); coordinate with the ebook work.
-- [ ] T038-704 [P] Music queue survives reload (FR-704); visualiser idle while paused (FR-706).
-- [ ] T038-705 [ALISON] Storage notice on the listen view (FR-705).
+- [x] T038-704 [P] Music queue survives reload (FR-704); visualiser idle while paused (FR-706).
+- [x] T038-705 [ALISON] Storage notice on the listen view (FR-705).
