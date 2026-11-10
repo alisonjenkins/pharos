@@ -338,7 +338,11 @@ fn time_karaoke(
         return None;
     }
     let aligned = match (sung_track, sung) {
-        (Some(true), Some(s)) => timing::aligned(line, s).map(|syl| (syl, s.score)),
+        // The song's median says its words are sung; the line's own score
+        // says this line's are, so a stray translation line stays paced.
+        (Some(true), Some(s)) if s.score.is_some_and(|v| v >= MIN_SUNG_SCORE) => {
+            timing::aligned(line, s).map(|syl| (syl, s.score))
+        }
         _ => None,
     };
     let (timing, syllables, why) = match aligned {
@@ -1479,6 +1483,44 @@ mod tests {
 
     /// B1212: the aligner times a song whose words are what is sung; a
     /// translation, or a line it could not place, is paced instead.
+    #[test]
+    fn a_low_scoring_line_in_a_sung_song_is_paced() {
+        let lines = vec![line("Run away"), line("Run away"), line("Run away")];
+        let at = |score: f32| {
+            Some(SungLine {
+                words: vec![(0, 10_200), (4, 10_700), (8, 11_500)],
+                score: Some(score),
+            })
+        };
+        let intro = [Segment {
+            kind: SegmentKind::Intro,
+            start_ms: 0,
+            end_ms: 60_000,
+        }];
+        let d = direct(
+            &lines,
+            &TrackSignals {
+                sung: vec![at(0.8), at(0.1), at(0.7)],
+                ..TrackSignals::default()
+            },
+            &intro,
+        );
+        assert_eq!(d.sung_score, Some(0.7));
+        let reasons: Vec<&str> = d.plan.lines.iter().map(|l| l.reason.as_str()).collect();
+        assert!(
+            reasons[0].ends_with("timing=aligned score=0.80"),
+            "{reasons:?}"
+        );
+        assert!(
+            reasons[1].ends_with("timing=paced why=unaligned"),
+            "{reasons:?}"
+        );
+        assert!(
+            reasons[2].ends_with("timing=aligned score=0.70"),
+            "{reasons:?}"
+        );
+    }
+
     #[test]
     fn sung_lines_are_timed_from_the_aligner_when_the_words_match() {
         let lines = vec![line("Run away"), line("Run away"), line("[door slams]")];
