@@ -752,6 +752,16 @@
             path = alignerModel;
           }
         ];
+        # Spec 039: the MMS_FA weights as one mmappable f32 file plus index,
+        # for the Rust aligner. torch runs only here, at build time.
+        alignerWeights = pkgs.runCommand "pharos-aligner-weights" {
+          nativeBuildInputs = [
+            (pkgs.python3.withPackages (ps: [ ps.torch ps.torchaudio ps.numpy ]))
+          ];
+          TORCH_HOME = alignerTorchHome;
+        } ''
+          python3 ${./crates/pharos-align/tools/export_weights.py} $out
+        '';
         aligner = pkgs.python3Packages.buildPythonApplication {
           pname = "pharos-aligner";
           version = "0.1.0";
@@ -1286,7 +1296,7 @@
           oci = ociImage;
           jellyfinWebOci = jellyfinWebImage;
           pharosUiOci = pharosUiImage;
-          inherit aligner;
+          inherit aligner alignerWeights;
           alignerOci = alignerImage;
           pharosUiBundle = pharosUiBundle;
           testMediaOci = testMediaImage;
