@@ -3,7 +3,7 @@
 //! does and how progress reads. No I/O; `reader_web.rs` draws it.
 
 use pharos_client::api::{Book, BookFormat, ItemRef, ReadPosition};
-use quire::{Locator, TocEntry};
+use quire::{page_progress, Locator, PageLocator, TocEntry};
 use serde::{Deserialize, Serialize};
 
 use super::playback::DeviceClass;
@@ -26,6 +26,20 @@ pub const LINE_HEIGHTS: [u32; 4] = [13, 15, 17, 20];
 /// Space around the text, in px.
 pub const MARGINS: [u32; 4] = [12, 40, 72, 120];
 
+/// A PDF page's backing store is drawn at the device's pixel ratio up to
+/// this much. Beyond it the extra pixels cost render time and memory on a
+/// headset or TV for detail the eye cannot use at reading distance.
+pub const PDF_MAX_PIXEL_RATIO: f64 = 2.0;
+
+/// The longest side, in pixels, of a PDF page's backing store. A 4096 px
+/// canvas is the largest a weak GPU is sure to take, and the render time
+/// grows with the pixels.
+pub const PDF_MAX_SIDE_PX: u32 = 4096;
+
+/// A swipe shorter than this, in px, is a tap (quire-web's value, so a PDF
+/// and an EPUB feel alike).
+pub const SWIPE_PX: f64 = 40.0;
+
 /// A fraction at or past which the book counts as finished.
 const FINISHED: f64 = 0.99;
 
@@ -46,6 +60,33 @@ impl Typeface {
             Typeface::Book => "Book",
             Typeface::Serif => "Serif",
             Typeface::Sans => "Sans",
+        }
+    }
+}
+
+/// How a PDF page sits in the window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PdfFit {
+    /// The whole page is visible.
+    #[default]
+    Page,
+    /// The page is as wide as the window, and scrolls up and down.
+    Width,
+}
+
+impl PdfFit {
+    pub fn label(self) -> &'static str {
+        match self {
+            PdfFit::Page => "Fit page",
+            PdfFit::Width => "Fit width",
+        }
+    }
+
+    pub fn toggled(self) -> Self {
+        match self {
+            PdfFit::Page => PdfFit::Width,
+            PdfFit::Width => PdfFit::Page,
         }
     }
 }
@@ -89,6 +130,7 @@ pub struct ReaderSettings {
     pub margin_px: u32,
     pub typeface: Typeface,
     pub theme: PageTheme,
+    pub pdf_fit: PdfFit,
 }
 
 impl Default for ReaderSettings {
@@ -99,6 +141,7 @@ impl Default for ReaderSettings {
             margin_px: 40,
             typeface: Typeface::Book,
             theme: PageTheme::Pharos,
+            pdf_fit: PdfFit::Page,
         }
     }
 }
@@ -350,7 +393,7 @@ pub enum BookAction {
 
 pub fn book_action(book: &Book, position: Option<&ReadPosition>) -> BookAction {
     match book.format {
-        BookFormat::Epub => BookAction::Read(
+        BookFormat::Epub | BookFormat::Pdf => BookAction::Read(
             position
                 .and_then(|p| continue_label(p.fraction))
                 .unwrap_or_else(|| "Read".to_owned()),
@@ -358,7 +401,6 @@ pub fn book_action(book: &Book, position: Option<&ReadPosition>) -> BookAction {
         BookFormat::Unreadable => {
             BookAction::Closed("This book is locked to a Kindle device and cannot be opened here.")
         }
-        BookFormat::Pdf => BookAction::Closed("PDF reading is coming."),
         BookFormat::Comic => BookAction::Closed("Comic reading is coming."),
     }
 }
@@ -366,6 +408,103 @@ pub fn book_action(book: &Book, position: Option<&ReadPosition>) -> BookAction {
 /// The saved locator, if it is one this reader wrote.
 pub fn saved_locator(text: &str) -> Option<Locator> {
     text.parse().ok()
+}
+
+/// Where a PDF page is drawn and how many pixels it takes (spec 023 US5).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PdfLayout {
+    pub css_width: f64,
+    pub css_height: f64,
+    /// The height to ask the engine for; the width follows the page.
+    pub render_height: u32,
+}
+
+/// The size of a page whose width over height is `aspect`, in a window
+/// `viewport_w` by `viewport_h` CSS px, on a screen of `pixel_ratio`. A
+/// window or page with no size is treated as 1 px, never zero.
+pub fn pdf_layout(
+    viewport_w: f64,
+    viewport_h: f64,
+    aspect: f64,
+    fit: PdfFit,
+    pixel_ratio: f64,
+) -> PdfLayout {
+    let positive = |v: f64, or: f64| if v.is_finite() && v > 0.0 { v } else { or };
+    let (vw, vh) = (positive(viewport_w, 1.0), positive(viewport_h, 1.0));
+    let aspect = positive(aspect, 1.0);
+    let css_height = match fit {
+        PdfFit::Page => vh.min(vw / aspect),
+        PdfFit::Width => vw / aspect,
+    };
+    let css_width = css_height * aspect;
+    let ratio = positive(pixel_ratio, 1.0).min(PDF_MAX_PIXEL_RATIO);
+    // Neither side of the backing store passes the cap, so a very wide page
+    // is drawn shorter, not wider.
+    let cap = f64::from(PDF_MAX_SIDE_PX).min(f64::from(PDF_MAX_SIDE_PX) / aspect);
+    let render_height = (css_height * ratio).min(cap).round().max(1.0) as u32;
+    PdfLayout {
+        css_width,
+        css_height,
+        render_height,
+    }
+}
+
+/// The page index a turn reaches from `index` in a book of `count` pages,
+/// or `None` at either end.
+pub fn turn_to(index: usize, count: usize, forward: bool) -> Option<usize> {
+    if forward {
+        let next = index.checked_add(1)?;
+        (next < count).then_some(next)
+    } else {
+        index.checked_sub(1)
+    }
+}
+
+/// The one page worth drawing ahead of time: the next. A page turned back to
+/// is drawn when asked for, so one spare canvas is all the reader holds.
+pub fn prerender_index(index: usize, count: usize) -> Option<usize> {
+    turn_to(index, count, true)
+}
+
+/// What a click `x` (0 at the page's left edge, 1 at its right) asks for: the
+/// outer thirds turn the page, the middle does nothing.
+pub fn tap_action(x: f64) -> Option<KeyAction> {
+    if x < 1.0 / 3.0 {
+        Some(KeyAction::Prev)
+    } else if x > 2.0 / 3.0 {
+        Some(KeyAction::Next)
+    } else {
+        None
+    }
+}
+
+/// What a touch or pen drag of `dx` px (negative is leftwards) asks for.
+pub fn swipe_action(dx: f64) -> Option<KeyAction> {
+    if !dx.is_finite() || dx.abs() < SWIPE_PX {
+        None
+    } else if dx < 0.0 {
+        Some(KeyAction::Next)
+    } else {
+        Some(KeyAction::Prev)
+    }
+}
+
+/// The locator to save for the page at `index` (from 0).
+pub fn pdf_locator(index: usize) -> String {
+    PageLocator::from_index(index).to_string()
+}
+
+/// The page index a saved locator names, held inside a book of `count`
+/// pages; anything that is not a `pdf1` locator opens the first page.
+pub fn pdf_saved_index(text: &str, count: usize) -> usize {
+    text.parse::<PageLocator>()
+        .map_or(0, PageLocator::index)
+        .min(count.saturating_sub(1))
+}
+
+/// Progress through a PDF at the page `index`: the page over the count.
+pub fn pdf_progress(index: usize, count: usize) -> f64 {
+    page_progress(index, count)
 }
 
 /// One line of the table of contents panel.
@@ -408,6 +547,7 @@ mod tests {
             margin_px: 72,
             typeface: Typeface::Serif,
             theme: PageTheme::Night,
+            pdf_fit: PdfFit::Width,
         };
         assert_eq!(ReaderSettings::parse(&s.to_text()), s);
     }
@@ -644,7 +784,15 @@ mod tests {
             book_action(&book(BookFormat::Epub), Some(&at(0.5))),
             BookAction::Read("Continue reading · 50%".into())
         );
-        for format in [BookFormat::Unreadable, BookFormat::Pdf, BookFormat::Comic] {
+        assert_eq!(
+            book_action(&book(BookFormat::Pdf), Some(&at(0.5))),
+            BookAction::Read("Continue reading · 50%".into())
+        );
+        assert_eq!(
+            book_action(&book(BookFormat::Pdf), None),
+            BookAction::Read("Read".into())
+        );
+        for format in [BookFormat::Unreadable, BookFormat::Comic] {
             assert!(
                 matches!(
                     book_action(&book(format), Some(&at(0.5))),
@@ -671,6 +819,95 @@ mod tests {
         );
         assert_eq!(saved_locator("pdf1:3"), None);
         assert_eq!(saved_locator(""), None);
+    }
+
+    #[test]
+    fn a_page_fits_the_window_or_its_width() {
+        // A portrait page (aspect 0.5) in a 1280 x 800 window at ratio 1.
+        let page = pdf_layout(1280.0, 800.0, 0.5, PdfFit::Page, 1.0);
+        assert!((page.css_height - 800.0).abs() < 1e-9);
+        assert!((page.css_width - 400.0).abs() < 1e-9);
+        assert_eq!(page.render_height, 800);
+        let width = pdf_layout(1280.0, 800.0, 0.5, PdfFit::Width, 1.0);
+        assert!((width.css_width - 1280.0).abs() < 1e-9);
+        assert!(
+            (width.css_height - 2560.0).abs() < 1e-9,
+            "taller than the window"
+        );
+        // A landscape page in a narrow window is limited by width.
+        let wide = pdf_layout(400.0, 800.0, 2.0, PdfFit::Page, 1.0);
+        assert!((wide.css_width - 400.0).abs() < 1e-9);
+        assert!((wide.css_height - 200.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn the_backing_store_follows_the_pixel_ratio_up_to_the_caps() {
+        let at = |dpr| pdf_layout(1280.0, 800.0, 0.5, PdfFit::Page, dpr).render_height;
+        assert_eq!(at(1.0), 800);
+        assert_eq!(at(2.0), 1600);
+        assert_eq!(
+            at(3.0),
+            1600,
+            "a ratio of 3 is held to {PDF_MAX_PIXEL_RATIO}"
+        );
+        // Fit width on a tall page would need 5120 px; the side cap holds it.
+        let tall = pdf_layout(1280.0, 800.0, 0.5, PdfFit::Width, 2.0);
+        assert_eq!(tall.render_height, PDF_MAX_SIDE_PX);
+        // A very wide page is drawn shorter so its width stays under the cap.
+        let wide = pdf_layout(3000.0, 3000.0, 4.0, PdfFit::Width, 2.0);
+        assert_eq!(wide.render_height, PDF_MAX_SIDE_PX / 4);
+    }
+
+    #[test]
+    fn a_window_or_page_without_a_size_still_gets_a_pixel() {
+        for (w, h, a, d) in [
+            (0.0, 0.0, 0.0, 0.0),
+            (f64::NAN, 100.0, f64::INFINITY, f64::NAN),
+            (-5.0, -5.0, -1.0, -1.0),
+        ] {
+            let l = pdf_layout(w, h, a, PdfFit::Page, d);
+            assert!(l.render_height >= 1, "{l:?}");
+            assert!(l.css_width.is_finite() && l.css_height.is_finite(), "{l:?}");
+        }
+    }
+
+    #[test]
+    fn page_turns_stop_at_the_ends_and_only_the_next_page_is_drawn_ahead() {
+        assert_eq!(turn_to(0, 3, true), Some(1));
+        assert_eq!(turn_to(2, 3, true), None);
+        assert_eq!(turn_to(0, 3, false), None);
+        assert_eq!(turn_to(2, 3, false), Some(1));
+        assert_eq!(turn_to(0, 0, true), None);
+        assert_eq!(prerender_index(0, 3), Some(1));
+        assert_eq!(prerender_index(2, 3), None, "nothing past the last page");
+    }
+
+    #[test]
+    fn the_outer_thirds_turn_and_a_swipe_needs_forty_pixels() {
+        assert_eq!(tap_action(0.1), Some(KeyAction::Prev));
+        assert_eq!(tap_action(0.5), None);
+        assert_eq!(tap_action(0.9), Some(KeyAction::Next));
+        assert_eq!(swipe_action(-41.0), Some(KeyAction::Next));
+        assert_eq!(swipe_action(41.0), Some(KeyAction::Prev));
+        assert_eq!(swipe_action(-39.0), None);
+        assert_eq!(swipe_action(f64::NAN), None);
+    }
+
+    #[test]
+    fn a_pdf_position_is_its_page_and_restores_inside_the_book() {
+        assert_eq!(pdf_locator(0), "pdf1:1");
+        assert_eq!(pdf_locator(11), "pdf1:12");
+        assert_eq!(pdf_saved_index("pdf1:12", 30), 11);
+        assert_eq!(
+            pdf_saved_index("pdf1:12", 5),
+            4,
+            "a shorter file holds at its end"
+        );
+        assert_eq!(pdf_saved_index("epub1:3:0", 30), 0);
+        assert_eq!(pdf_saved_index("", 30), 0);
+        assert_eq!(pdf_saved_index("pdf1:3", 0), 0);
+        assert!((pdf_progress(1, 4) - 0.5).abs() < 1e-9);
+        assert!((pdf_progress(3, 4) - 1.0).abs() < 1e-9);
     }
 
     #[test]
