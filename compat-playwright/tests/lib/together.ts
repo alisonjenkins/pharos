@@ -7,6 +7,7 @@ import {
   Page,
 } from "@playwright/test";
 import { Probeable, VideoProbeLike } from "./sync-oracle";
+import { firefoxEnv } from "./audio-sink";
 
 // Shared by the pharos Dioxus UI watch-together specs (014): signing in a
 // browser, starting a group from a title and bringing a second browser in by
@@ -327,27 +328,19 @@ export async function pickUntil(
 }
 
 /**
- * Firefox with autoplay allowed and audio muted, and the libavcodec the dev
- * shell names (`PHAROS_FIREFOX_LIBAV`) on its loader path: without one
- * Firefox cannot decode AAC or H.264, so it plays the seeded files direct
- * but no HLS stream with their audio.
+ * Firefox with autoplay allowed and audio muted, and the libavcodec and
+ * libpulse the dev shell names on its loader path (`firefoxEnv`): without
+ * libavcodec Firefox cannot decode AAC or H.264, so it plays the seeded files
+ * direct but no HLS stream with their audio.
  */
 function firefoxGroupLaunch() {
-  const libav = process.env.PHAROS_FIREFOX_LIBAV;
   return {
     firefoxUserPrefs: {
       "media.autoplay.default": 0,
       "media.autoplay.blocking_policy": 0,
       "media.volume_scale": "0.0",
     },
-    ...(libav
-      ? {
-          env: {
-            ...process.env,
-            LD_LIBRARY_PATH: [libav, process.env.LD_LIBRARY_PATH].filter(Boolean).join(":"),
-          },
-        }
-      : {}),
+    ...firefoxEnv(),
   };
 }
 
