@@ -7524,39 +7524,40 @@ mod tests {
         );
     }
 
-    /// The live Flash folder (B987): S01E01 "Pilot" names both shows' pilots,
-    /// so it does not move, but it joins the 1990 owner while its stored
-    /// episode is the 2014 show's (aired 2014-10-07).
-    async fn flash_folder_with_pilot(s: &SqliteStore, pilot_aired: i64) {
-        put_titled_episode(s, 1, FLASH, (1, 1), "Pilot").await;
+    const SHOW_A: &str = "/tv/Show A";
+
+    /// A bare folder holding a 1991 show and its 2015 remake (B987):
+    /// S01E01 "Pilot" names both shows' pilots, so it does not move, but it
+    /// joins the 1991 owner while its stored episode may be the 2015 show's.
+    async fn remake_folder_with_pilot(s: &SqliteStore, pilot_aired: i64) {
+        put_titled_episode(s, 1, SHOW_A, (1, 1), "Pilot").await;
         let mut pilot = s.get(1).await.unwrap();
         pilot.metadata.premiere_date = Some(pilot_aired);
         s.put(pilot).await.unwrap();
-        put_titled_episode(s, 3, FLASH, (1, 2), "Out of Control").await;
+        put_titled_episode(s, 3, SHOW_A, (1, 2), "The Old Second").await;
         let mut modern = MediaItem {
             id: 2,
-            path: format!("{FLASH}/Season 3/The Flash (2014) - S03E01 - The Flash Reborn.mkv")
-                .into(),
-            title: "The Flash Reborn".into(),
+            path: format!("{SHOW_A}/Season 3/Show A (2015) - S03E01 - The New Start.mkv").into(),
+            title: "The New Start".into(),
             kind: MediaKind::Episode,
             ..MediaItem::default()
         };
         modern.series = Some(pharos_core::SeriesInfo {
-            series_name: "The Flash".into(),
+            series_name: "Show A".into(),
             season_number: Some(3),
             episode_number: Some(1),
-            series_folder: Some(FLASH.into()),
+            series_folder: Some(SHOW_A.into()),
             series_year: None,
             series_key: None,
         });
         s.put(modern).await.unwrap();
         s.upsert_series_metadata(SeriesMetadata {
-            series_key: FLASH.into(),
-            series_name: "The Flash".into(),
+            series_key: SHOW_A.into(),
+            series_name: "Show A".into(),
             match_provider: Some("tvdb".into()),
-            match_external_id: Some("78650".into()),
+            match_external_id: Some("900091".into()),
             match_source: Some("search".into()),
-            premiere_date: Some(653_788_800), // 1990-09-20
+            premiere_date: Some(PILOT_1991),
             metadata_refreshed_at: Some(NOW),
             ..Default::default()
         })
@@ -7565,27 +7566,27 @@ mod tests {
         set_version(s, TV_MATCH_VERSION_KEY, "1").await;
     }
 
-    const PILOT_2014: i64 = 1_412_640_000; // 2014-10-07
-    const PILOT_1990: i64 = 653_788_800; // 1990-09-20
+    const PILOT_2015: i64 = 1_425_340_800; // 2015-03-03
+    const PILOT_1991: i64 = 670_550_400; // 1991-04-02
 
-    fn flash_tvdb_dated() -> FakeEnricher {
+    fn remake_tvdb_dated() -> FakeEnricher {
         FakeEnricher::tvdb()
             .with_search(vec![
-                ("279121", "The Flash", Some(2014)),
-                ("78650", "The Flash", Some(1990)),
+                ("900015", "Show A", Some(2015)),
+                ("900091", "Show A", Some(1991)),
             ])
             .with_dated_list(
-                "279121",
+                "900015",
                 &[
-                    (1, 1, "Pilot", PILOT_2014),
-                    (1, 2, "Fastest Man Alive", 1_413_244_800),
+                    (1, 1, "Pilot", PILOT_2015),
+                    (1, 2, "The New Second", 1_425_945_600),
                 ],
             )
             .with_dated_list(
-                "78650",
+                "900091",
                 &[
-                    (1, 1, "Pilot", PILOT_1990),
-                    (1, 2, "Out of Control", 654_393_600),
+                    (1, 1, "Pilot", PILOT_1991),
+                    (1, 2, "The Old Second", 671_155_200),
                 ],
             )
     }
@@ -7597,8 +7598,8 @@ mod tests {
     async fn a_file_joining_the_owner_with_the_other_shows_episode_is_rebuilt() {
         let (logs, _log) = log_capture();
         let s = store().await;
-        flash_folder_with_pilot(&s, PILOT_2014).await;
-        let tvdb = flash_tvdb_dated();
+        remake_folder_with_pilot(&s, PILOT_2015).await;
+        let tvdb = remake_tvdb_dated();
 
         gate(&s, &tvdb, &MetadataConfig::default()).await;
         let text = logs.text();
@@ -7608,10 +7609,10 @@ mod tests {
             .unwrap_or_else(|| panic!("no owner joiner line in {text}"));
         for want in [
             "S01E01 - Pilot.mkv",
-            "owner_id=\"78650\"",
-            "owner_year=1990",
-            &format!("stored_aired={PILOT_2014}"),
-            &format!("owner_aired={PILOT_1990}"),
+            "owner_id=\"900091\"",
+            "owner_year=1991",
+            &format!("stored_aired={PILOT_2015}"),
+            &format!("owner_aired={PILOT_1991}"),
         ] {
             assert!(line.contains(want), "{want} missing from {line}");
         }
@@ -7625,8 +7626,8 @@ mod tests {
     async fn a_file_joining_the_owner_with_its_episode_is_not_rebuilt() {
         let (logs, _log) = log_capture();
         let s = store().await;
-        flash_folder_with_pilot(&s, PILOT_1990).await;
-        let tvdb = flash_tvdb_dated();
+        remake_folder_with_pilot(&s, PILOT_1991).await;
+        let tvdb = remake_tvdb_dated();
 
         gate(&s, &tvdb, &apply_cfg()).await;
         assert_eq!(pending_ids(&s).await, [3]);
