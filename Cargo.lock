@@ -5329,6 +5329,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.21",
+ "tracing",
  "unicode-normalization",
  "wait-timeout",
  "workspace-hack",
