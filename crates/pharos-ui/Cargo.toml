@@ -123,6 +123,10 @@ web-sys = { version = "0.3", optional = true, features = [
     "ServiceWorkerRegistration",
     "ServiceWorker",
     "MessageEvent",
+    "Cache",
+    "CacheStorage",
+    "Response",
+    "StorageManager",
 ] }
 wasm-bindgen = { version = "0.2", optional = true }
 wasm-bindgen-futures = { version = "0.4", optional = true }
