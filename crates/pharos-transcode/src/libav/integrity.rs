@@ -77,10 +77,16 @@ pub fn scan_integrity(src: &Path) -> Result<IntegrityReport, FrameError> {
         }
     };
 
+    // Before the first packet: the AVI demuxer adds an index entry for every
+    // packet it reads from an unindexed file, so after the walk below every
+    // AVI would look indexed.
+    let seek_index = avi_seek_index(&ictx, declared_ms, origin_ms);
+
     let capture = super::logbridge::ErrorCapture::open();
     let mut report = IntegrityReport {
         declared_ms,
         ranges: Some(Vec::new()),
+        seek_index,
         ..Default::default()
     };
     // Set from a fault until the next packet that reads cleanly, which is
@@ -156,6 +162,60 @@ pub fn scan_integrity(src: &Path) -> Result<IntegrityReport, FrameError> {
     report.complete = true;
     finish(&mut report, &capture, first_logged_ms);
     Ok(report)
+}
+
+/// Share of the declared duration an AVI's index must reach before a seek
+/// can use it. An indexed AVI's `idx1` or OpenDML `indx` lists every chunk to
+/// the end. An unindexed one holds only the entries the demuxer added for
+/// the few packets `avformat_find_stream_info` read, a second or two, so
+/// anything between those two shapes is far from the threshold.
+const MIN_INDEX_COVERAGE: f64 = 0.5;
+
+/// Whether an AVI's index reaches far enough for a seek to use it (B1162,
+/// V1122). `None` for every other container: Matroska reads its cues only when
+/// asked to seek, and MP4's sample tables are its header, so an entry count
+/// taken at open says nothing about them. `None` too when the header states
+/// no duration to measure coverage against.
+fn avi_seek_index(
+    ictx: &ffmpeg::format::context::Input,
+    declared_ms: Option<u64>,
+    origin_ms: u64,
+) -> Option<bool> {
+    // SAFETY: `ictx` owns a live, opened format context, and `iformat` is set
+    // for every opened input.
+    let name = unsafe {
+        let iformat = (*ictx.as_ptr()).iformat;
+        if iformat.is_null() || (*iformat).name.is_null() {
+            return None;
+        }
+        std::ffi::CStr::from_ptr((*iformat).name)
+            .to_string_lossy()
+            .into_owned()
+    };
+    if name != "avi" {
+        return None;
+    }
+    let declared = declared_ms.filter(|d| *d > 0)?;
+    let stream = ictx
+        .streams()
+        .best(ffmpeg::media::Type::Video)
+        .or_else(|| ictx.streams().next())?;
+    let tb = stream.time_base();
+    // SAFETY: the stream belongs to `ictx`, which is alive; the entry pointer
+    // is read at once, before anything can add to the index.
+    let last_ms = unsafe {
+        let st = stream.as_ptr();
+        let n = ffmpeg::ffi::avformat_index_get_entries_count(st);
+        if n <= 0 {
+            return Some(false);
+        }
+        let e = ffmpeg::ffi::avformat_index_get_entry(st as *mut _, n - 1);
+        if e.is_null() {
+            return Some(false);
+        }
+        to_ms((*e).timestamp, tb.numerator(), tb.denominator()).saturating_sub(origin_ms)
+    };
+    Some(last_ms as f64 >= declared as f64 * MIN_INDEX_COVERAGE)
 }
 
 /// Fold what libav *said* into the report alongside what it *returned*.
