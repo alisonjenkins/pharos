@@ -4022,6 +4022,61 @@ async fn a_listing_folds_the_films_of_a_box_set_into_one_tile() {
     );
 }
 
+/// A failed series or album tile read lists each fold's newest child rather
+/// than failing the rail, and with it the whole home screen.
+#[actix_web::test]
+async fn a_failed_tile_read_lists_the_newest_child_instead() {
+    use pharos_core::{LibraryStore as _, MediaItem, MediaKind, MediaStore as _};
+    use pharos_server::services::library::LatestTile;
+    let fx = seed_rich().await;
+    for (id, ep) in [(401u64, 1u32), (402, 2), (403, 3)] {
+        let item = MediaItem {
+            id,
+            path: format!("/libA/Show/Season 01/e{ep}.mkv").into(),
+            title: format!("Show {ep}"),
+            kind: MediaKind::Episode,
+            series: Some(pharos_core::SeriesInfo {
+                series_name: "Show".into(),
+                season_number: Some(1),
+                episode_number: Some(ep),
+                series_folder: Some("/libA/Show".into()),
+                series_year: None,
+                series_key: None,
+            }),
+            created_at: Some(1_900_000_000 + id as i64),
+            ..MediaItem::default()
+        };
+        fx.state.stores.put(item).await.unwrap();
+    }
+    fx.state.stores.backfill_library_ids().await.unwrap();
+    #[cfg(feature = "postgres")]
+    let pharos_store_sqlx::any::AnyStore::Sqlite(sqlite) = &fx.state.stores
+    else {
+        panic!("the fixture is sqlite");
+    };
+    #[cfg(not(feature = "postgres"))]
+    let sqlite = &fx.state.stores;
+    sqlx::query("DROP TABLE series_metadata")
+        .execute(sqlite.pool())
+        .await
+        .unwrap();
+    let user = pharos_server::services::auth::user_for_token(&fx.state.stores, &fx.user_token)
+        .await
+        .unwrap();
+    let tiles = library::latest_tiles(&fx.state, &user, None, &library::KindFilter::Unset, None)
+        .await
+        .expect("the rail still lists");
+    let ids: Vec<u64> = tiles
+        .iter()
+        .filter_map(|t| match t {
+            LatestTile::Item(item, _) => Some(item.id),
+            LatestTile::Group { .. } => None,
+        })
+        .collect();
+    assert_eq!(ids.first(), Some(&403), "the fold's newest child: {ids:?}");
+    assert!(!ids.contains(&402) && !ids.contains(&401), "{ids:?}");
+}
+
 /// Spec 038 FR-106: a latest rail folds one show's new episodes and one
 /// album's new tracks into a tile each, placed where the newest child was,
 /// with how many there are; a lone new episode and a film list as items.

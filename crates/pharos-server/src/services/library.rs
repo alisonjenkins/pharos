@@ -329,13 +329,15 @@ pub async fn latest_tiles(
         .filter(|(_, g)| g.len() > 1)
         .map(|(_, g)| g.iter().collect())
         .collect();
-    let mut dtos = crate::api::jellyfin::items::latest_group_dtos(state, user.id, &folds)
-        .await
-        .inspect_err(|error| {
+    // The fold is presentation only: a failed tile read lists each fold's newest child instead.
+    let mut dtos = match crate::api::jellyfin::items::latest_group_dtos(state, user.id, &folds).await {
+        Ok(dtos) => dtos,
+        Err(error) => {
             tracing::warn!(parent = parent_id.unwrap_or("all"), %error, "latest rail: series or album tiles unavailable");
-        })
-        .map_err(ListError::Store)?
-        .into_iter();
+            Vec::new()
+        }
+    }
+    .into_iter();
     // Each slot: a folded tile, or the id of the item listed on its own.
     let mut slots: Vec<Result<(LatestTile, TileKind), u64>> = Vec::with_capacity(groups.len());
     for (fold, group) in &groups {
