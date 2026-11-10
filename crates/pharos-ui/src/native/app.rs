@@ -4027,6 +4027,8 @@ fn WhatsNew(route: Route) -> Element {
     let mut splash_decided = use_signal(|| false);
     let mut page = use_signal(|| 0_usize);
     let mut replay = use_signal(|| 0_u32);
+    // Why the last pick could not be kept on this device (FR-213).
+    let mut not_kept = use_signal(|| None::<String>);
     let mut library_transition = use_signal(stored_library_transition);
     let mut subtitle_size = use_signal(stored_subtitle_size);
     let mut overlay_effect = use_signal(stored_overlay_effect);
@@ -4091,6 +4093,7 @@ fn WhatsNew(route: Route) -> Element {
     use_effect(use_reactive!(|(shown,)| {
         if shown {
             page.set(0);
+            not_kept.set(None);
             platform::focus_by_id(whats_new::FIRST_BUTTON_ID);
         }
     }));
@@ -4116,6 +4119,7 @@ fn WhatsNew(route: Route) -> Element {
             choices,
             page: page(),
             replay: replay(),
+            not_kept: not_kept(),
             on_page: move |to: usize| {
                 page.set(to);
                 platform::focus_by_id(whats_new::FIRST_BUTTON_ID);
@@ -4135,6 +4139,9 @@ fn WhatsNew(route: Route) -> Element {
                             platform::warn(&format!(
                                 "pharos: whats_new subtitle_size not kept error={e}"
                             ));
+                            not_kept.set(Some(e.to_string()));
+                        } else {
+                            not_kept.set(None);
                         }
                         platform::apply_subtitle_size(size);
                         subtitle_size.set(size);
@@ -4148,6 +4155,9 @@ fn WhatsNew(route: Route) -> Element {
                             platform::warn(&format!(
                                 "pharos: whats_new library_transition not kept error={e}"
                             ));
+                            not_kept.set(Some(e.to_string()));
+                        } else {
+                            not_kept.set(None);
                         }
                         platform::apply_library_transition(fx);
                         library_transition.set(fx);
@@ -4161,6 +4171,9 @@ fn WhatsNew(route: Route) -> Element {
                             platform::warn(&format!(
                                 "pharos: whats_new overlay_effect not kept error={e}"
                             ));
+                            not_kept.set(Some(e.to_string()));
+                        } else {
+                            not_kept.set(None);
                         }
                         platform::apply_overlay_effect(fx);
                         overlay_effect.set(fx);

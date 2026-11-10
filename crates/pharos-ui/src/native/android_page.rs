@@ -972,6 +972,12 @@ pub fn scroll_to_y(y: f64) {
     run(format!("window.scrollTo(0,{y})"));
 }
 
+/// The WebView is driven by the remote's own focus moves; arrows already
+/// move between choices there.
+pub fn step_radio(_step: i32) -> bool {
+    false
+}
+
 pub fn scroll_to_top() {
     run(tv_page::SCROLL_TO_TOP_JS.to_owned());
 }
