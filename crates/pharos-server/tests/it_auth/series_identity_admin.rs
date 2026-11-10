@@ -188,17 +188,17 @@ async fn a_move_shows_on_the_overview_and_can_be_removed() {
 #[actix_web::test]
 async fn a_split_the_dry_run_holds_shows_as_pending_with_its_moves() {
     let (state, token) = seed(true).await;
-    let folder = "/tv/Doctor Who";
+    let folder = "/tv/Show R";
     for (id, year, episode) in [(10, 1963, 1), (11, 1963, 2), (12, 2005, 1)] {
         MediaStore::put(
             &state.stores,
             MediaItem {
                 id,
-                path: format!("{folder}/Season 1/Doctor Who ({year}) - S01E0{episode}.mkv").into(),
+                path: format!("{folder}/Season 1/Show R ({year}) - S01E0{episode}.mkv").into(),
                 title: format!("Episode {episode}"),
                 kind: MediaKind::Episode,
                 series: Some(SeriesInfo {
-                    series_name: "Doctor Who".into(),
+                    series_name: "Show R".into(),
                     season_number: Some(1),
                     episode_number: Some(episode),
                     series_folder: Some(folder.into()),
@@ -227,7 +227,7 @@ async fn a_split_the_dry_run_holds_shows_as_pending_with_its_moves() {
     assert_eq!(split["Folder"], folder, "{v}");
     assert_eq!(split["Status"], "pending", "{v}");
     assert_eq!(split["Groups"].as_array().map(Vec::len), Some(2), "{v}");
-    let moved = format!("{folder}/Season 1/Doctor Who (2005) - S01E01.mkv");
+    let moved = format!("{folder}/Season 1/Show R (2005) - S01E01.mkv");
     assert_eq!(
         split["Moves"],
         serde_json::json!([{
