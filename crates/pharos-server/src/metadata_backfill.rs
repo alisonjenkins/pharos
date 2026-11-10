@@ -294,6 +294,14 @@ where
         }
     }
 
+    // B994 — the show NFO's id for a provider the show is not matched at is
+    // dropped from its episodes, on every pass (a rescan folds it back).
+    if tvdb.is_some() || tmdb.is_some() {
+        if let Err(e) = drop_stale_show_ids_pass(store).await {
+            tracing::warn!(error = %e, "stale show id pass aborted");
+        }
+    }
+
     // Items whose last enrichment predates this cutoff (or never matched) are
     // eligible; `manual` rows are excluded by the query itself.
     let ttl_cutoff = now.saturating_sub(i64::from(cfg.refresh_ttl_days) * 86_400);
@@ -1554,6 +1562,89 @@ async fn hand_pick_record<E: OnlineEnricher>(
     )
     .await;
     Some((enriched, poster, backdrop))
+}
+
+/// Most shows one [`drop_stale_show_ids_pass`] looks at.
+const STALE_SHOW_ID_SHOWS: i64 = 10_000;
+
+/// B994 — `ids` without the show NFO's id for a provider other than the
+/// show's own match. Returns the provider dropped. An id that differs from the
+/// show's (an episode NFO's own), imdb, and the matched provider's slot stay;
+/// a second call finds nothing to drop.
+fn drop_unmatched_provider_show_id(
+    ids: &mut ProviderIds,
+    show_provider: &str,
+    shown: &ShowNfoEvidence,
+) -> Option<&'static str> {
+    let (provider, slot, from_show) = match show_provider {
+        "tvdb" => ("tmdb", &mut ids.tmdb, &shown.tmdb),
+        "tmdb" => ("tvdb", &mut ids.tvdb, &shown.tvdb),
+        _ => return None,
+    };
+    if from_show.is_none() || slot != from_show {
+        return None;
+    }
+    *slot = None;
+    Some(provider)
+}
+
+/// B994 — for each search-matched show whose `tvshow.nfo` names an id at the
+/// provider it is not matched at, drop that id from its episodes. Rows are
+/// read, and written only when an id is dropped, so a settled library costs
+/// reads and a rescan that folds the id back costs one write per episode.
+/// Episodes with their own manual match are skipped.
+async fn drop_stale_show_ids_pass<S>(store: &S) -> DomainResult<usize>
+where
+    S: MediaStore + SeriesMetadataStore + pharos_core::SeriesIdentityStore,
+{
+    let shows = store
+        .series_needing_match(STALE_SHOW_ID_SHOWS, i64::MAX)
+        .await?;
+    let mut dropped = 0;
+    for cand in shows {
+        let Some(shown) = show_nfo(&cand).await else {
+            continue;
+        };
+        let key = cand.series_key.clone();
+        let Some(provider) = store
+            .series_metadata_by_keys(std::slice::from_ref(&key))
+            .await?
+            .remove(&key)
+            .and_then(|m| m.match_provider)
+        else {
+            continue;
+        };
+        let other = match provider.as_str() {
+            "tvdb" => &shown.tmdb,
+            "tmdb" => &shown.tvdb,
+            _ => continue,
+        };
+        if other.is_none() {
+            continue;
+        }
+        for row in store.series_episodes(&key).await? {
+            if row.match_source.as_deref() == Some("manual") {
+                continue;
+            }
+            let mut item = store.get(row.id).await?;
+            let Some(gone) =
+                drop_unmatched_provider_show_id(&mut item.metadata.provider_ids, &provider, &shown)
+            else {
+                continue;
+            };
+            store.put(item).await?;
+            metrics::counter!("pharos_episode_stale_show_id_dropped_total", "provider" => gone)
+                .increment(1);
+            tracing::info!(
+                media.id = row.id,
+                show_provider = %provider,
+                dropped = gone,
+                "episode's id from its show's NFO at a provider the show is not matched at dropped"
+            );
+            dropped += 1;
+        }
+    }
+    Ok(dropped)
 }
 
 /// What [`clear_old_providers_show_id`] dropped.
@@ -7650,6 +7741,104 @@ mod tests {
 
         assert_eq!(got.metadata.provider_ids.tvdb.as_deref(), Some("900002"));
         assert_eq!(cleared, 0);
+    }
+
+    /// Stores one episode in a show folder with `tvshow.nfo`, matched at TVDB
+    /// `900002` with `stored` ids, and runs the stale show id pass twice.
+    /// Returns the item, how many ids each run dropped, and the counter.
+    async fn stale_id_passes(
+        show_nfo: &str,
+        episode_nfo: Option<&str>,
+        source: &str,
+        stored: ProviderIds,
+    ) -> (MediaItem, [usize; 2], u64) {
+        use metrics_util::debugging::DebuggingRecorder;
+        let recorder = DebuggingRecorder::new();
+        let snap = pharos_test_metrics::snapshotter(&recorder);
+        let _metrics = metrics::set_default_local_recorder(&recorder);
+        let dir = tempfile::tempdir().unwrap();
+        let show = dir.path().join("Show B");
+        std::fs::create_dir_all(&show).unwrap();
+        std::fs::write(show.join("tvshow.nfo"), show_nfo).unwrap();
+        let folder = show.to_string_lossy().into_owned();
+        let s = store().await;
+        put_titled_episode(&s, 1, &folder, (1, 1), "Opening").await;
+        let mut item = s.get(1).await.unwrap();
+        if let Some(nfo) = episode_nfo {
+            std::fs::write(item.path.with_extension("nfo"), nfo).unwrap_or_else(|_| {
+                std::fs::create_dir_all(item.path.parent().unwrap()).unwrap();
+                std::fs::write(item.path.with_extension("nfo"), nfo).unwrap();
+            });
+        }
+        item.metadata.provider_ids = stored;
+        s.put(item).await.unwrap();
+        s.set_item_match(1, "tvdb", "900002", source, None, NOW)
+            .await
+            .unwrap();
+        pin(&s, &folder, "900002", NOW).await;
+        let first = drop_stale_show_ids_pass(&s).await.unwrap();
+        let second = drop_stale_show_ids_pass(&s).await.unwrap();
+        let dropped = counter_value(
+            &snap,
+            "pharos_episode_stale_show_id_dropped_total",
+            &[("provider", "tmdb")],
+        );
+        (s.get(1).await.unwrap(), [first, second], dropped)
+    }
+
+    fn both_ids() -> ProviderIds {
+        ProviderIds {
+            tmdb: Some("900001".into()),
+            tvdb: Some("900002".into()),
+            imdb: Some("tt900001".into()),
+            ..ProviderIds::default()
+        }
+    }
+
+    /// B994 — an episode already stamped with its show's new provider still
+    /// carries the old provider's id the show NFO names; the pass drops it,
+    /// counts it once, and a second pass finds nothing.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_already_matched_episode_loses_the_show_nfo_id_of_the_other_provider() {
+        let (got, runs, dropped) = stale_id_passes(SHOW_NFO_TMDB, None, "search", both_ids()).await;
+
+        assert_eq!(got.metadata.provider_ids.tmdb, None);
+        assert_eq!(got.metadata.provider_ids.tvdb.as_deref(), Some("900002"));
+        assert_eq!(got.metadata.provider_ids.imdb.as_deref(), Some("tt900001"));
+        assert_eq!(runs, [1, 0], "the second pass writes nothing");
+        assert_eq!(dropped, 1, "and counts nothing more");
+    }
+
+    /// B994 — an id that differs from the show's is the episode's own: kept.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_pass_keeps_an_episode_id_that_is_not_the_shows() {
+        let mut stored = both_ids();
+        stored.tmdb = Some("900055".into());
+        let (got, runs, dropped) = stale_id_passes(SHOW_NFO_TMDB, None, "search", stored).await;
+
+        assert_eq!(got.metadata.provider_ids.tmdb.as_deref(), Some("900055"));
+        assert_eq!((runs, dropped), ([0, 0], 0));
+    }
+
+    /// B994 — an episode with its own manual match is not touched.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_pass_leaves_a_manually_matched_episode_alone() {
+        let (got, runs, dropped) = stale_id_passes(SHOW_NFO_TMDB, None, "manual", both_ids()).await;
+
+        assert_eq!(got.metadata.provider_ids.tmdb.as_deref(), Some("900001"));
+        assert_eq!((runs, dropped), ([0, 0], 0));
+    }
+
+    /// B994 — the id of the provider the show is matched at stays.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_pass_keeps_the_id_of_the_shows_own_provider() {
+        let nfo = "<tvshow><title>Show B</title>\
+            <uniqueid type=\"tvdb\">900002</uniqueid></tvshow>";
+        let (got, runs, dropped) = stale_id_passes(nfo, None, "search", both_ids()).await;
+
+        assert_eq!(got.metadata.provider_ids.tvdb.as_deref(), Some("900002"));
+        assert_eq!(got.metadata.provider_ids.tmdb.as_deref(), Some("900001"));
+        assert_eq!((runs, dropped), ([0, 0], 0));
     }
 
     /// V940 — a rebuild drops the stills the old show's record cached (the
