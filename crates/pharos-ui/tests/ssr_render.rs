@@ -1061,10 +1061,7 @@ fn detail_view_audio_renders_artist_album_and_primary_image() {
     );
     // Image figure rendered when primary_image_url set.
     assert!(html.contains("pharos-detail-primary"), "{html}");
-    assert!(
-        html.contains("/Items/5/Images/Primary"),
-        "{html}"
-    );
+    assert!(html.contains("/Items/5/Images/Primary"), "{html}");
 }
 
 #[test]
@@ -1082,10 +1079,7 @@ fn detail_view_phase3_renders_backdrop_overview_genres_cast() {
     let html = render_root(detail_with_cast_overview_genres_backdrop);
     // Backdrop image
     assert!(html.contains("pharos-detail-backdrop"), "{html}");
-    assert!(
-        html.contains("/Items/33/Images/Backdrop"),
-        "{html}"
-    );
+    assert!(html.contains("/Items/33/Images/Backdrop"), "{html}");
     // Overview text
     assert!(html.contains("pharos-detail-overview"), "{html}");
     assert!(html.contains("A blade runner hunts replicants."), "{html}");
