@@ -652,7 +652,11 @@ mod tests {
     fn only_same_origin_and_mse_sources_are_routed() {
         let origin = "https://pharos.example";
         assert_eq!(
-            routable("https://pharos.example/audio/1/universal?x=1", origin, false),
+            routable(
+                "https://pharos.example/audio/1/universal?x=1",
+                origin,
+                false
+            ),
             Ok(())
         );
         assert_eq!(routable("https://pharos.example", origin, false), Ok(()));
@@ -675,14 +679,22 @@ mod tests {
     fn a_cors_source_is_routed_and_a_refusal_keeps_its_query_out() {
         let origin = "https://pharos.example";
         assert_eq!(
-            routable("https://media.example/audio/1/stream?api_key=t0k", origin, true),
+            routable(
+                "https://media.example/audio/1/stream?api_key=t0k",
+                origin,
+                true
+            ),
             Ok(())
         );
         let refused = routable("https://media.example/a.mp3?api_key=t0k", origin, false)
             .expect_err("no CORS");
         assert!(!refused.contains("t0k"), "{refused}");
-        let hls = routable("https://media.example/v/main.m3u8?api_key=t0k", origin, true)
-            .expect_err("native HLS");
+        let hls = routable(
+            "https://media.example/v/main.m3u8?api_key=t0k",
+            origin,
+            true,
+        )
+        .expect_err("native HLS");
         assert!(hls.contains("native HLS") && !hls.contains("t0k"), "{hls}");
     }
 
