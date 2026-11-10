@@ -2251,14 +2251,17 @@ pub fn wheel_notches(carried: f64, delta: WheelDelta) -> (i32, f64) {
 }
 
 /// Whether a wheel event looks like a trackpad's: pixel travel of less than
-/// half a notch, or a fraction of a pixel, where a mouse wheel moves whole
-/// notches of about [`WHEEL_NOTCH_PX`]. Line and page travel is a mouse's.
+/// half a notch, where a mouse wheel moves notches of about
+/// [`WHEEL_NOTCH_PX`]. Line and page travel is a mouse's.
 pub fn trackpad(delta: WheelDelta) -> bool {
     let WheelDelta::Pixels(v) = delta else {
         return false;
     };
     let along = if v.y.abs() >= v.x.abs() { v.y } else { v.x };
-    along.abs() < WHEEL_NOTCH_PX / 2.0 || along.fract() != 0.0
+    // Size alone, not a fraction of a pixel: a mouse notch at a browser
+    // zoom other than 100% arrives as e.g. 90.909 px, while a trackpad
+    // sends many small steps.
+    along.abs() < WHEEL_NOTCH_PX / 2.0
 }
 
 /// Which third of the picture a tap landed in, for the double-tap seek.
@@ -3512,12 +3515,16 @@ mod tests {
             "a trackpad's small steps"
         );
         assert!(
-            trackpad(WheelDelta::pixels(0.0, 53.5, 0.0)),
-            "a fraction of a pixel"
+            trackpad(WheelDelta::pixels(0.0, 12.5, 0.0)),
+            "a small fractional step"
         );
         assert!(
             !trackpad(WheelDelta::pixels(0.0, -100.0, 0.0)),
             "a mouse notch"
+        );
+        assert!(
+            !trackpad(WheelDelta::pixels(0.0, 90.909, 0.0)),
+            "a mouse notch at 110% zoom"
         );
         assert!(
             !trackpad(WheelDelta::pixels(120.0, 0.0, 0.0)),
