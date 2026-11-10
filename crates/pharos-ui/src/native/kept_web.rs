@@ -19,8 +19,8 @@ use wasm_bindgen_futures::JsFuture;
 
 use super::app::{call, this_device, Ctx};
 use super::kept::{
-    book_key, cache_name, is_books_cache, keep_refusal, plan_eviction, AutoKeep, KeptBook,
-    KeptFormat, KeptStore, Reason, Why, SETTINGS_KEY, STORE_KEY,
+    auto_keep_skip, book_key, cache_name, is_books_cache, keep_refusal, plan_eviction, AutoKeep,
+    KeptBook, KeptFormat, KeptStore, Reason, Why, SETTINGS_KEY, STORE_KEY,
 };
 use super::kept_view::{AutoKeepSettings, KeepControl, KeptList, OfflineView};
 use super::platform;
@@ -339,6 +339,104 @@ pub async fn keep(
         store.total_bytes()
     ));
     Ok(book)
+}
+
+/// Whether a book fetched for reading is worth keeping by a policy, so the
+/// reader holds its bytes past opening only then.
+pub fn wants_auto() -> bool {
+    settings().reason_on_open().is_some()
+}
+
+/// Notes that the kept book `id` was opened now, and why it is kept now when
+/// a policy applies (a book kept by hand stays so). A no-op for a book that
+/// is not kept.
+pub fn note_open(id: ItemRef) {
+    let Some(mut store) = read() else {
+        return;
+    };
+    if store.note_open(&id.to_string(), now_ms(), settings().reason_on_open()) {
+        write(&store);
+    }
+}
+
+/// Keeps a book the reader has just opened, from the bytes it already
+/// fetched: they are written to the cache as they are, never fetched again
+/// (FR-008). A failure, a full quota included, is logged and reading goes on.
+/// `place` is where the reader is, so a resume with no server starts there.
+/// Answers whether the book is kept now.
+pub async fn auto_keep(
+    id: ItemRef,
+    title: &str,
+    format: KeptFormat,
+    user: &str,
+    bytes: &js_sys::Uint8Array,
+    place: (String, f32),
+) -> bool {
+    let settings = settings();
+    let Some(reason) = settings.reason_on_open() else {
+        return false;
+    };
+    let size = u64::from(bytes.length());
+    if size == 0 {
+        platform::warn(&format!(
+            "pharos: kept auto skipped item={id} bytes=0 why=the buffer is empty"
+        ));
+        return false;
+    }
+    let cap = size_cap(this_device(), &platform::user_agent());
+    if let Some(why) = auto_keep_skip(size, cap, &settings) {
+        platform::info(&format!(
+            "pharos: kept auto skipped item={id} bytes={size} why={why}"
+        ));
+        return false;
+    }
+    if read().is_some_and(|s| !s.is_for(user)) {
+        clear_all("another user").await;
+    }
+    let key = book_key(id);
+    let stored = async {
+        let response =
+            web_sys::Response::new_with_opt_buffer_source(Some(bytes)).map_err(|e| describe(&e))?;
+        let cache = open_cache(user).await?;
+        JsFuture::from(cache.put_with_str(&key, &response))
+            .await
+            .map_err(|e| describe(&e))
+    };
+    if let Err(e) = stored.await {
+        platform::warn(&format!(
+            "pharos: kept auto failed item={id} bytes={size} error={e}"
+        ));
+        return false;
+    }
+    // The record is read and written with no wait between, so a place noted
+    // meanwhile is not lost.
+    let mut store = read().unwrap_or_else(|| KeptStore::new(user));
+    if store.find(&id.to_string()).is_some() {
+        // Kept by hand meanwhile (another tab): that copy stands.
+        return true;
+    }
+    let now = now_ms();
+    store.keep(KeptBook {
+        id: id.to_string(),
+        title: title.to_owned(),
+        format,
+        bytes: size,
+        kept_at: String::from(js_sys::Date::new_0().to_iso_string()),
+        reason,
+        locator: Some(place.0),
+        fraction: place.1,
+        read_at_ms: 0,
+        opened_ms: now,
+    });
+    write(&store);
+    request_persist();
+    platform::info(&format!(
+        "pharos: kept auto item={id} bytes={size} format={} reason={} total_bytes={}",
+        format.label(),
+        reason.word(),
+        store.total_bytes()
+    ));
+    true
 }
 
 /// Removes a kept book from the device: its bytes and its record.
