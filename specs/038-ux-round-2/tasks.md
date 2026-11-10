@@ -40,6 +40,17 @@ Id blocks (bugs and invariants are written with the fix):
 - [ ] T038-207 [P] Filter selects by arrow keys on web (FR-208); Manage page in the URL (FR-209).
 - [ ] T038-208 Empty, failed and busy states (FR-210); confirms and palette places (FR-211).
 - [ ] T038-209 Hero art at drawn size (FR-212); palette viewport and focus ring, What's New keys and save message (FR-213).
+- [x] T038-200 Reproduce each G2 problem in a browser (desktop and 390px) and keep the screenshots as the before state.
+  Done as SSR tests that state today's behaviour first, plus a static 390px render of the episode rows (the name had 0px); no live-browser pass from the cloud.
+- [x] T038-201 Show page opens on the season being watched; hero Play is the show's next-up (FR-201).
+- [x] T038-202 Reproduce the phone episode row at 390px, then stack it (FR-202).
+- [x] T038-203 Music library letter rail and album sort (FR-203); tab in the URL (FR-204).
+- [x] T038-204 Series page loads in parallel (FR-205).
+- [x] T038-205 Home and title pages keep content and scroll on Back (FR-206).
+- [x] T038-206 Search URL and grouped "see all" (FR-207).
+- [x] T038-207 [P] Filter selects by arrow keys on web (FR-208); Manage page in the URL (FR-209).
+- [x] T038-208 [P] Empty, failed and busy states (FR-210); confirms and palette places (FR-211).
+- [x] T038-209 [P] Hero art at drawn size (FR-212); palette viewport and focus ring, What's New keys and save message (FR-213).
 
 ## G3 — Player controls by touch and pointer
 
