@@ -5,13 +5,68 @@
 
 use std::time::Instant;
 
-use pharos_core::{MediaStore, PlaybackProgress, User, UserDataStore, UserId};
+use pharos_core::{MediaKind, MediaStore, PlaybackProgress, User, UserDataStore, UserId};
 
 use crate::progress_writes::{self, Decision, ProgressKey};
 use crate::services::access::{check_item, ItemHidden};
 use crate::sessions::SessionEvent;
 use crate::state::AppState;
 use crate::sync_recovery::now_unix_secs;
+
+/// Spec 038 FR-107, ADR-0114: the smallest position kept as a resume point.
+/// A play that never got past it (a trailer peek, a wrong click) leaves no
+/// trace in Continue Watching.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MinResume {
+    /// Video only: this share of the runtime, when it is longer than `secs`.
+    pub pct: u32,
+    /// Video and songs: at least this many seconds in.
+    pub secs: u32,
+}
+
+impl Default for MinResume {
+    fn default() -> Self {
+        Self { pct: 2, secs: 60 }
+    }
+}
+
+/// Which minimum a position fell under, for the metric labels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BelowMinimum {
+    Video,
+    Song,
+}
+
+impl BelowMinimum {
+    pub const ALL: [BelowMinimum; 2] = [BelowMinimum::Video, BelowMinimum::Song];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            BelowMinimum::Video => "video",
+            BelowMinimum::Song => "song",
+        }
+    }
+}
+
+impl MinResume {
+    /// No minimum: every position is kept.
+    pub const OFF: MinResume = MinResume { pct: 0, secs: 0 };
+
+    /// Whether `position` (ticks) on an item of `kind` and `runtime` (ticks,
+    /// 0 when unknown) is too early to keep. Books have no minimum.
+    pub fn below(self, kind: MediaKind, runtime: u64, position: u64) -> Option<BelowMinimum> {
+        let secs = u64::from(self.secs) * pharos_core::time::TICKS_PER_SECOND;
+        let (floor, which) = match kind {
+            MediaKind::Movie | MediaKind::Episode => (
+                secs.max(runtime / 100 * u64::from(self.pct)),
+                BelowMinimum::Video,
+            ),
+            MediaKind::Audio => (secs, BelowMinimum::Song),
+            MediaKind::Book => return None,
+        };
+        (position < floor).then_some(which)
+    }
+}
 
 /// What a stop did with the user's play state. The `label()` pairs are a
 /// dashboard contract for `pharos_play_stop_total{outcome,reason}`.
@@ -400,5 +455,60 @@ fn announce(
         pharos_jellyfin_api::dto::UserItemDataDto::from_domain_with_runtime(item_id, data, runtime);
     if let Ok(entry) = serde_json::to_value(&dto) {
         state.notify_user_data_changed(&user.id.0.simple().to_string(), vec![entry]);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pharos_core::time::TICKS_PER_SECOND as S;
+
+    #[test]
+    fn a_video_needs_the_larger_of_two_percent_and_a_minute() {
+        let min = MinResume::default();
+        let film = 2 * 60 * 60 * S;
+        // 2% of two hours is 144 s, past the minute.
+        assert_eq!(
+            min.below(MediaKind::Movie, film, 143 * S),
+            Some(BelowMinimum::Video)
+        );
+        assert_eq!(min.below(MediaKind::Movie, film, 144 * S), None);
+        let short = 20 * 60 * S;
+        // 2% of twenty minutes is 24 s, so the minute holds.
+        assert_eq!(
+            min.below(MediaKind::Episode, short, 59 * S),
+            Some(BelowMinimum::Video)
+        );
+        assert_eq!(min.below(MediaKind::Episode, short, 60 * S), None);
+        assert_eq!(
+            min.below(MediaKind::Episode, 0, 59 * S),
+            Some(BelowMinimum::Video)
+        );
+    }
+
+    #[test]
+    fn a_song_needs_a_minute_and_a_book_nothing() {
+        let min = MinResume::default();
+        let song = 4 * 60 * S;
+        assert_eq!(
+            min.below(MediaKind::Audio, song, 59 * S),
+            Some(BelowMinimum::Song)
+        );
+        assert_eq!(min.below(MediaKind::Audio, song, 60 * S), None);
+        assert_eq!(min.below(MediaKind::Book, 0, 0), None);
+    }
+
+    #[test]
+    fn a_zero_minimum_keeps_every_position() {
+        let off = MinResume::OFF;
+        assert_eq!(off.below(MediaKind::Movie, 60 * S, 1), None);
+        assert_eq!(off.below(MediaKind::Audio, 60 * S, 1), None);
+    }
+
+    #[test]
+    fn below_minimum_labels_are_distinct() {
+        let labels: std::collections::HashSet<_> =
+            BelowMinimum::ALL.iter().map(|b| b.label()).collect();
+        assert_eq!(labels.len(), BelowMinimum::ALL.len());
     }
 }

@@ -2197,6 +2197,7 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
         web: cfg.server.ui_dir.clone(),
     });
     state = state.with_played_threshold_pct(cfg.server.played_threshold_pct);
+    state = state.with_min_resume(cfg.server.min_resume_pct, cfg.server.min_resume_secs);
     state = state.with_dlna_enabled(cfg.server.dlna_enabled);
     state = state.with_progress_persist_interval(std::time::Duration::from_secs(
         cfg.server.playback_progress_persist_secs,
