@@ -76,6 +76,7 @@ fn requests(token: &str) -> Vec<test::TestRequest> {
     vec![
         test::TestRequest::get().uri("/admin/series-identity"),
         test::TestRequest::get().uri("/admin/series-identity/flagged"),
+        test::TestRequest::get().uri("/admin/series-identity/show?SeriesId=00"),
         test::TestRequest::get().uri("/admin/series-identity/search?Name=Show"),
         test::TestRequest::post()
             .uri("/admin/series-identity/pick")
@@ -288,4 +289,51 @@ async fn a_flagged_show_is_named_by_its_series_item_id() {
     )
     .await;
     assert_eq!(v["Flagged"][0]["SeriesId"], id, "{v}");
+}
+
+/// An admin can open any show by its item id, flagged or not.
+#[actix_web::test]
+async fn an_unflagged_show_opens_by_its_series_item_id_and_an_unknown_id_is_404() {
+    let (state, token) = seed(true).await;
+    let app = app!(state);
+    let auth = ("X-Emby-Token", token.as_str());
+    let series: serde_json::Value = test::call_and_read_body_json(
+        &app,
+        test::TestRequest::get()
+            .uri("/Items?IncludeItemTypes=Series&Recursive=true")
+            .insert_header(auth)
+            .to_request(),
+    )
+    .await;
+    let id = series["Items"][0]["Id"].as_str().unwrap().to_string();
+
+    let v: serde_json::Value = test::call_and_read_body_json(
+        &app,
+        test::TestRequest::get()
+            .uri(&format!("/admin/series-identity/show?SeriesId={id}"))
+            .insert_header(auth)
+            .to_request(),
+    )
+    .await;
+    assert_eq!(v["SeriesKey"], SHOW_A, "{v}");
+    assert_eq!(v["SeriesId"], id.as_str(), "{v}");
+    assert_eq!(v["Folder"], SHOW_A, "{v}");
+    assert_eq!(v["Name"], "Show A", "{v}");
+    assert_eq!(v["CurrentMatch"], serde_json::Value::Null, "{v}");
+    let eps = v["Episodes"].as_array().unwrap();
+    assert_eq!(eps.len(), 2, "{v}");
+    let mut ids: Vec<u64> = eps.iter().map(|e| e["Id"].as_u64().unwrap()).collect();
+    ids.sort_unstable();
+    assert_eq!(ids, [1, 2], "{v}");
+    assert_eq!(eps[0]["Season"], 1, "{v}");
+
+    let resp = test::call_service(
+        &app,
+        test::TestRequest::get()
+            .uri("/admin/series-identity/show?SeriesId=0123456789abcdef0123456789abcdef")
+            .insert_header(auth)
+            .to_request(),
+    )
+    .await;
+    assert_eq!(resp.status().as_u16(), 404);
 }
