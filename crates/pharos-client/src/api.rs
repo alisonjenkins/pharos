@@ -236,6 +236,9 @@ pub struct Listing {
     pub played: Option<bool>,
     /// Only 3D (`Some(true)`) or only 2D (`Some(false)`) titles.
     pub stereo: Option<bool>,
+    /// Fold the films of each box set into one tile for the set (B1086).
+    /// A server older than schemaVersion 37 ignores it and lists the films.
+    pub collapse: bool,
 }
 
 impl Listing {
@@ -249,6 +252,7 @@ impl Listing {
             genre: None,
             played: None,
             stereo: None,
+            collapse: false,
         }
     }
 }
@@ -1958,6 +1962,7 @@ fn write_listing(mut q: item_query::Builder<'_>, listing: &Listing) {
         Some(true) => StereoFilter::Only3d,
         Some(false) => StereoFilter::Only2d,
     });
+    q.set_collapse_collections(listing.collapse);
     let played = listing
         .played
         .map(|p| if p { "IsPlayed" } else { "IsUnplayed" });
