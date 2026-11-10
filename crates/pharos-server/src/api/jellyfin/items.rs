@@ -7759,11 +7759,7 @@ pub(crate) fn spawn_scan_tracked(
             crate::scan_tasks::record_scan_end(&tally, outcome, pass_started.elapsed());
             state.notify_scan_progress(100.0, Some((outcome, tally)));
 
-            let status = if cancelled {
-                crate::scan_tasks::CompletionStatus::Cancelled
-            } else {
-                crate::scan_tasks::CompletionStatus::Completed
-            };
+            let status = outcome.completion_status();
             match state
                 .scan_tasks
                 .finish_or_rerun(crate::scan_tasks::TASK_REFRESH_LIBRARY, status)

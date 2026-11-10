@@ -137,6 +137,17 @@ impl ScanOutcome {
         }
     }
 
+    /// The scheduled task's `LastExecutionResult.Status`: a pass that could
+    /// not read a folder is Failed, so jellyfin-web shows it in red.
+    #[must_use]
+    pub fn completion_status(self) -> CompletionStatus {
+        match self {
+            ScanOutcome::Completed => CompletionStatus::Completed,
+            ScanOutcome::Partial | ScanOutcome::Failed => CompletionStatus::Failed,
+            ScanOutcome::Cancelled => CompletionStatus::Cancelled,
+        }
+    }
+
     /// The `TaskProgress.state` a pass that ended this way is sent with.
     #[must_use]
     pub fn task_state(self) -> &'static str {
@@ -478,6 +489,26 @@ mod tests {
         assert_eq!(ScanOutcome::of(false, 3, 3), ScanOutcome::Failed);
         assert_eq!(ScanOutcome::of(true, 3, 3), ScanOutcome::Cancelled);
         assert_eq!(ScanOutcome::of(false, 0, 0), ScanOutcome::Completed);
+    }
+
+    #[test]
+    fn a_pass_with_an_unreadable_folder_finishes_failed() {
+        assert_eq!(
+            ScanOutcome::Completed.completion_status(),
+            CompletionStatus::Completed
+        );
+        assert_eq!(
+            ScanOutcome::Partial.completion_status(),
+            CompletionStatus::Failed
+        );
+        assert_eq!(
+            ScanOutcome::Failed.completion_status(),
+            CompletionStatus::Failed
+        );
+        assert_eq!(
+            ScanOutcome::Cancelled.completion_status(),
+            CompletionStatus::Cancelled
+        );
     }
 
     #[test]
