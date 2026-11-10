@@ -4,4 +4,5 @@
 
 mod ctc;
 mod line;
+mod plan;
 mod text;
