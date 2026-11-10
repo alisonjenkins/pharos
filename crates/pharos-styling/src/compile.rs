@@ -6,6 +6,7 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::budget::{max_animated, max_events_per_line, PASSTHROUGH_PREFIX};
+use crate::contrast;
 use crate::effects;
 use crate::event::Event;
 use crate::plan::{EffectPlan, EffectsLevel, Intent, Karaoke, LineEffect, Placement, Tier};
@@ -55,7 +56,9 @@ pub fn compile(
     let mut styles: BTreeSet<String> = BTreeSet::new();
     styles.insert(names::DEFAULT.to_owned());
     // Source style definitions kept verbatim, by their `Format:` line and name.
-    let mut verbatim: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
+    // The bool: some event in that style draws text, not only shapes, so its
+    // colours get the sign contrast nudge (B1210).
+    let mut verbatim: BTreeMap<String, BTreeMap<String, (String, bool)>> = BTreeMap::new();
     let mut aliases: BTreeSet<String> = BTreeSet::new();
 
     for line in lines {
@@ -72,18 +75,27 @@ pub fn compile(
         } else {
             &line.style
         };
-        let text = crate::glyphs::latin_punctuation(&line.raw).into_owned();
+        let own_style = line
+            .style_def
+            .as_deref()
+            .filter(|_| theme.style(style).is_none());
+        let light = own_style.map_or(true, |d| contrast::style_is_light(&d.format, &d.line));
+        let text = crate::glyphs::latin_punctuation(&line.raw);
+        let text = contrast::event_text(&text, light);
         let mut ev = Event::on(line, i, style, text);
         ev.name = format!("{PASSTHROUGH_PREFIX}{i}");
         if ev.is_visible() {
             if theme.style(style).is_some() {
                 // A theme style of that name wins over the source's.
                 styles.insert(style.to_owned());
-            } else if let Some(def) = &line.style_def {
+            } else if let Some(def) = own_style {
+                let lettered = !contrast::draws(&line.raw);
                 verbatim
                     .entry(def.format.clone())
                     .or_default()
-                    .insert(style.to_owned(), def.line.clone());
+                    .entry(style.to_owned())
+                    .and_modify(|(_, l)| *l |= lettered)
+                    .or_insert((def.line.clone(), lettered));
             } else {
                 aliases.insert(style.to_owned());
             }
@@ -159,8 +171,12 @@ pub fn compile(
             format
         });
         out.push('\n');
-        for line in defs.values() {
-            out.push_str(line);
+        for (line, lettered) in defs.values() {
+            if *lettered {
+                out.push_str(&contrast::style_line(format, line));
+            } else {
+                out.push_str(line);
+            }
             out.push('\n');
         }
     }
@@ -638,6 +654,59 @@ mod tests {
     }
 
     const SIGN_ASS: &str = "[Script Info]\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, Alignment\nStyle: Sign,Impact,90,8\nStyle: Default,Arial,20,2\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 3,0:00:01.00,0:00:02.00,Sign,,0,0,0,,{\\pos(3,2)\\t(0,1,\\fax1)\\blur3}Baratie, east\nDialogue: 0,0:00:03.00,0:00:04.00,Default,,0,0,0,,Talk\nDialogue: 0,0:00:05.00,0:00:06.00,Default,,0,0,0,,{\\an8}Top\n";
+
+    /// A stats-panel sign as typesetters write them: a box drawing with a
+    /// stray character after `\p1`, a top-left style with no placement tag,
+    /// CJK brackets around Latin labels, and dialogue over it.
+    const PANEL_ASS: &str = "[Script Info]\nPlayResX: 1920\nPlayResY: 1080\n[V4+ Styles]\n\
+        Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n\
+        Style: Panel-BOX,Times New Roman,36,&H2C382F1E,&H0000FFFF,&H2B382F1E,&H7F404040,-1,0,0,0,100,110,0,0,3,12,0,7,60,60,60,0\n\
+        Style: Panel,Times New Roman,36,&H00B98B75,&H0000FFFF,&H2B382F1E,&H7F404040,-1,0,0,0,100,110,0,0,1,0,0,7,90,90,90,0\n\
+        Style: Default,Arial,76,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,-1,0,0,0,100,100,0,0,1,3.5,0,2,150,150,70,1\n\
+        [Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n\
+        Dialogue: 0,0:00:01.00,0:00:05.00,Panel-BOX,Text,0,0,0,,{\\bord0\\p1)}m 0 0 l 510 0 510 420 0 420\n\
+        Dialogue: 1,0:00:01.00,0:00:05.00,Panel,Text,0,0,0,,{\\1a&H17&}【Name】 {\\c&HD2D2D2&}Alex\\N{\\c&HB98B75&}【Level】 {\\c&HD2D2D2&}1\n\
+        Dialogue: 0,0:00:01.00,0:00:03.00,Default,A,0,0,0,,Level one, it says.\n";
+
+    /// B1208–B1210: the panel stays a sign in its own style, its box stays
+    /// a box, its brackets read, and its lettering is nudged off its
+    /// outline; the dialogue under it is restyled as usual.
+    #[test]
+    fn a_stats_panel_passes_through_readable() {
+        let src = source::read(PANEL_ASS).unwrap().lines;
+        assert_eq!(
+            src.iter().map(|l| l.typeset).collect::<Vec<_>>(),
+            [true, true, false]
+        );
+        let out = run(&plain_plan(3), &src, Tier::Desktop, EffectsLevel::Full);
+        let all = dialogue(&out);
+        let by = |style: &str| *all.iter().find(|l| l.contains(style)).unwrap();
+        let d = [by(",Panel-BOX,"), by(",Panel,"), by(",Default,")];
+        assert!(
+            d[0].ends_with(",,{\\bord0\\p1)}m 0 0 l 510 0 510 420 0 420"),
+            "{}",
+            d[0]
+        );
+        assert!(
+            d[1].ends_with(
+                ",,{\\1a&H17&}[Name] {\\c&HDDDDDD&}Alex\\N{\\c&HCBA898&}[Level] {\\c&HDDDDDD&}1"
+            ),
+            "{}",
+            d[1]
+        );
+        assert!(d[2].ends_with("Level one, it says."), "{}", d[2]);
+        // The box keeps its colours; the lettering's fill rises and its
+        // outline falls.
+        assert!(out.contains("Style: Panel-BOX,Times New Roman,36,&H2C382F1E,"));
+        assert!(
+            out.contains(
+                "Style: Panel,Times New Roman,36,&H00CBA898,&H0000FFFF,&H2B16130C,&H7F1A1A1A,"
+            ),
+            "{out}"
+        );
+        assert!(!out.contains('【'));
+        assert_eq!(pharos_subs::Script::parse(&out).stats.bad_lines, 0);
+    }
 
     #[test]
     fn typeset_events_pass_through_with_their_own_style_line() {
