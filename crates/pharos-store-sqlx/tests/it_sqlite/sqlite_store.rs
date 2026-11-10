@@ -422,15 +422,15 @@ async fn series_folder_and_year_round_trip_through_store() {
     let s = fresh().await;
     let mut it = item(
         9,
-        "/tv/Cosmos (1980)/Season 01/S01E01.mkv",
-        "Cosmos E1",
+        "/tv/Show AV (1980)/Season 01/S01E01.mkv",
+        "Show AV E1",
         MediaKind::Episode,
     );
     it.series = Some(SeriesInfo {
-        series_name: "Cosmos".into(),
+        series_name: "Show AV".into(),
         season_number: Some(1),
         episode_number: Some(1),
-        series_folder: Some("/tv/Cosmos (1980)".into()),
+        series_folder: Some("/tv/Show AV (1980)".into()),
         series_year: Some(1980),
         series_key: None,
     });
@@ -438,9 +438,9 @@ async fn series_folder_and_year_round_trip_through_store() {
     let got = s.get(9).await.unwrap();
     assert_eq!(got.series, it.series);
     let series = got.series.unwrap();
-    assert_eq!(series.series_folder.as_deref(), Some("/tv/Cosmos (1980)"));
+    assert_eq!(series.series_folder.as_deref(), Some("/tv/Show AV (1980)"));
     assert_eq!(series.series_year, Some(1980));
-    assert_eq!(series.series_key(), "/tv/Cosmos (1980)");
+    assert_eq!(series.series_key(), "/tv/Show AV (1980)");
 }
 
 #[tokio::test]
@@ -451,12 +451,12 @@ async fn legacy_series_without_folder_round_trips_as_none() {
     let s = fresh().await;
     let mut it = item(
         10,
-        "/tv/Firefly/S01E01.mkv",
-        "Firefly E1",
+        "/tv/Show AX/S01E01.mkv",
+        "Show AX E1",
         MediaKind::Episode,
     );
     it.series = Some(SeriesInfo {
-        series_name: "Firefly".into(),
+        series_name: "Show AX".into(),
         season_number: Some(1),
         episode_number: Some(1),
         ..Default::default()
@@ -466,7 +466,7 @@ async fn legacy_series_without_folder_round_trips_as_none() {
     let series = got.series.unwrap();
     assert_eq!(series.series_folder, None);
     assert_eq!(series.series_year, None);
-    assert_eq!(series.series_key(), "Firefly");
+    assert_eq!(series.series_key(), "Show AX");
 }
 
 // ---- LIB-C4: genres as entities -------------------------------------
@@ -1267,8 +1267,8 @@ async fn tmdb_primary_artwork_flips_has_primary_art() {
     let s = fresh().await;
     let it = item(
         900020,
-        "/movies/Arrival/Arrival.mkv",
-        "Arrival",
+        "/movies/Film BC/Film BC.mkv",
+        "Film BC",
         MediaKind::Movie,
     );
     s.put(it).await.unwrap();
@@ -1315,7 +1315,7 @@ async fn tmdb_primary_artwork_flips_has_primary_art() {
 #[tokio::test]
 async fn set_item_match_persists_and_excludes_from_needing() {
     let store = fresh().await;
-    let mut it = item(900010, "/m/dune.mkv", "Dune", MediaKind::Movie);
+    let mut it = item(900010, "/m/film-au.mkv", "Film AU", MediaKind::Movie);
     it.id = 900010;
     store.put(it.clone()).await.unwrap();
 
@@ -1327,7 +1327,7 @@ async fn set_item_match_persists_and_excludes_from_needing() {
         .set_item_match(
             900010,
             "tmdb",
-            "438631",
+            "932001",
             "search",
             Some(0.92),
             1_700_000_000,
@@ -1336,7 +1336,7 @@ async fn set_item_match_persists_and_excludes_from_needing() {
         .unwrap();
     let got = store.get(900010).await.unwrap();
     assert_eq!(got.match_provider.as_deref(), Some("tmdb"));
-    assert_eq!(got.match_external_id.as_deref(), Some("438631"));
+    assert_eq!(got.match_external_id.as_deref(), Some("932001"));
     assert_eq!(got.match_source.as_deref(), Some("search"));
     assert_eq!(got.metadata_refreshed_at, Some(1_700_000_000));
 
@@ -1423,7 +1423,7 @@ async fn series_needing_match_enumerates_distinct_shows_from_episodes() {
     s.put(episode_of(2, "Buffy", Some("/tv/Buffy (1997)"), Some(1997)))
         .await
         .unwrap();
-    s.put(episode_of(3, "Firefly", None, None)).await.unwrap();
+    s.put(episode_of(3, "Show AX", None, None)).await.unwrap();
 
     let mut got = s.series_needing_match(10, i64::MAX).await.unwrap();
     got.sort_by(|a, b| a.series_key.cmp(&b.series_key));
@@ -1436,8 +1436,8 @@ async fn series_needing_match_enumerates_distinct_shows_from_episodes() {
                 series_year: Some(1997),
             },
             SeriesMatchCandidate {
-                series_key: "Firefly".into(),
-                series_name: "Firefly".into(),
+                series_key: "Show AX".into(),
+                series_name: "Show AX".into(),
                 series_year: None,
             },
         ],
@@ -1505,9 +1505,9 @@ async fn series_needing_match_respects_ttl_and_manual_override() {
     s.put(episode_of(1, "Buffy", Some("/tv/Buffy (1997)"), Some(1997)))
         .await
         .unwrap();
-    s.put(episode_of(2, "Firefly", None, None)).await.unwrap();
+    s.put(episode_of(2, "Show AX", None, None)).await.unwrap();
 
-    // Enrich Buffy at t=500; mark Firefly as a manual override.
+    // Enrich Buffy at t=500; mark Show AX as a manual override.
     s.upsert_series_metadata(SeriesMetadata {
         series_key: "/tv/Buffy (1997)".into(),
         series_name: "Buffy".into(),
@@ -1518,8 +1518,8 @@ async fn series_needing_match_respects_ttl_and_manual_override() {
     .await
     .unwrap();
     s.upsert_series_metadata(SeriesMetadata {
-        series_key: "Firefly".into(),
-        series_name: "Firefly".into(),
+        series_key: "Show AX".into(),
+        series_name: "Show AX".into(),
         match_source: Some("manual".into()),
         metadata_refreshed_at: Some(500),
         ..Default::default()
@@ -1527,7 +1527,7 @@ async fn series_needing_match_respects_ttl_and_manual_override() {
     .await
     .unwrap();
 
-    // Fresh (cutoff=400): Buffy enriched after cutoff → not due; Firefly manual
+    // Fresh (cutoff=400): Buffy enriched after cutoff → not due; Show AX manual
     // → never due. Nothing eligible.
     let need = s.series_needing_match(10, 400).await.unwrap();
     assert!(
@@ -1535,7 +1535,7 @@ async fn series_needing_match_respects_ttl_and_manual_override() {
         "recently-enriched + manual are both skipped"
     );
 
-    // TTL expired (cutoff=600 > Buffy's 500): Buffy re-admits, Firefly (manual)
+    // TTL expired (cutoff=600 > Buffy's 500): Buffy re-admits, Show AX (manual)
     // stays excluded.
     let need2 = s.series_needing_match(10, 600).await.unwrap();
     let keys: Vec<&str> = need2.iter().map(|c| c.series_key.as_str()).collect();
@@ -1575,13 +1575,18 @@ async fn a_nested_library_beats_the_root_that_contains_it() {
         .await
         .unwrap();
 
-    s.put(item(1, "/media/Ebooks/Dune.epub", "Dune", MediaKind::Book))
-        .await
-        .unwrap();
+    s.put(item(
+        1,
+        "/media/Ebooks/Book A.epub",
+        "Book A",
+        MediaKind::Book,
+    ))
+    .await
+    .unwrap();
     s.put(item(
         2,
-        "/media/Movies/Alien.mkv",
-        "Alien",
+        "/media/Movies/Film AX.mkv",
+        "Film AX",
         MediaKind::Movie,
     ))
     .await
@@ -1635,8 +1640,8 @@ async fn a_repeated_backfill_rewrites_nothing_when_roots_nest() {
     .unwrap();
     s.put(item(
         1,
-        "/media/Movies/Alien.mkv",
-        "Alien",
+        "/media/Movies/Film AX.mkv",
+        "Film AX",
         MediaKind::Movie,
     ))
     .await

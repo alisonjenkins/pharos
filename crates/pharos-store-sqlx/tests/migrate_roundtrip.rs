@@ -675,7 +675,7 @@ async fn seed_raw(store: &SqliteStore) {
     for sql in [
         "INSERT INTO series_overrides (series_folder, path, target_key, target_name, \
          target_year, source, created_by, created_at) VALUES \
-         ('/media/shows/Cosmos', NULL, 'tvdb:1', 'Cosmos', 1980, 'admin', 'ali', 1700000000)",
+         ('/media/shows/Show AV', NULL, 'tvdb:1', 'Show AV', 1980, 'admin', 'ali', 1700000000)",
         "INSERT INTO person_details (wire_id, biography, birth_date, death_date, birth_place, \
          imdb_id, wikidata_id, fetched_at) VALUES \
          ('p1', 'Bio.', '1950-01-02', NULL, 'Cardiff', 'nm1', 'Q1', 1700000001)",
