@@ -21,8 +21,8 @@ use super::damage::{in_span, PlayerDamageNote};
 use super::listen::{Icon, QueuePanel, ICON_FLOAT, ICON_PIP, ICON_QUEUE_NEXT, QUEUE_PANEL_ID};
 use super::platform;
 use super::playback::{
-    clock, cues_at, left_to_watch, percent, segment_at, share, skip_label, thumb_at, track_label,
-    ImageCues, MediaEvent, MediaState, SubtitleSize,
+    clock, cues_at, left_to_watch, percent, position_at, segment_at, share, skip_label, thumb_at,
+    track_label, ImageCues, MediaEvent, MediaState, SubtitleSize,
 };
 use super::queue::{Entry, QueueAction};
 use super::seen::SeenRow;
@@ -377,8 +377,6 @@ pub enum Control {
     ReturnFromSeek(u64),
     /// The pointer is `x` px into the seek bar; `None` when it left.
     Hover(Option<f64>),
-    /// A click `x` px into the seek bar.
-    SeekAt(f64),
     Volume {
         volume: f64,
         muted: bool,
@@ -1048,7 +1046,7 @@ pub fn WatchView(
                                 "⏭"
                             }
                         }
-                        TimeLabels { segments: c.segments.clone(), pos, total, scrub: SCRUB_KEYS.then_some(scrub) }
+                        TimeLabels { segments: c.segments.clone(), pos, total, scrub: Some(scrub) }
                         Volume { media, on_control }
                         span { class: "pharos-control-spacer" }
                         TrackMode { in_group, own_tracks, on_change: on_own_tracks }
@@ -1255,25 +1253,37 @@ fn UpNext(card: UpNextCard, on_control: EventHandler<Control>) -> Element {
 
 /// Played and buffered progress, chapter ticks, skippable spans and the
 /// trickplay preview under the pointer.
+///
+/// A press on the bar, by mouse, pen or touch, starts a preview that follows
+/// the pointer (captured, so it keeps following off the bar) and seeks once
+/// when it lets go (T038-301): one seek per scrub, so one group command in a
+/// group. A cancelled pointer (the browser took the touch for a gesture)
+/// drops the preview without seeking.
 #[component]
 fn SeekBar(
     controls: Controls,
     total: u64,
     on_control: EventHandler<Control>,
-    /// A remote scrub (B907): the knob and the preview sit at its target
-    /// until it is committed. Read here, so a press re-renders the bar alone.
+    /// A remote scrub (B907) or a pointer drag: the knob and the preview sit
+    /// at its target until it is committed. Read here, so a press re-renders
+    /// the bar alone.
     #[props(default)]
     scrub: Option<Signal<Option<Scrub>>>,
 ) -> Element {
     let c = &controls;
-    let scrub_ms = scrub.and_then(|s| s()).map(|s| s.target_ms);
-    let live = Position::of(c).now();
+    let mut own_scrub = use_signal(|| None::<Scrub>);
+    let mut scrub = scrub.unwrap_or(own_scrub);
+    // The pointer dragging the bar, while one is.
+    let mut dragging = use_signal(|| None::<i32>);
+    let scrub_ms = scrub().map(|s| s.target_ms);
+    let pos = Position::of(c);
+    let live = pos.now();
     let at = scrub_ms.unwrap_or(live);
     let played = percent(at, total);
-    let class = if scrub_ms.is_some() {
-        "pharos-seek is-scrubbing"
-    } else {
-        "pharos-seek"
+    let class = match (scrub_ms.is_some(), dragging().is_some()) {
+        (true, true) => "pharos-seek is-dragging",
+        (true, false) => "pharos-seek is-scrubbing",
+        _ => "pharos-seek",
     };
     let hover = scrub_ms.or(c.hover_ms).map(|ms| {
         let chapter = c
@@ -1292,22 +1302,73 @@ fn SeekBar(
         .as_ref()
         .map(|d| d.ranges.clone())
         .unwrap_or_default();
+    let ms_at = move |x: f64| position_at(x, platform::element_width(SEEK_ID), total);
+    let mut end_drag = move |end: scrub::End| {
+        dragging.set(None);
+        let open = *scrub.peek();
+        scrub.set(None);
+        own_scrub.set(None);
+        if let Some(s) = open {
+            platform::info(&scrub::end_line(&s, end, platform::now_ms()));
+        }
+        if let Some(control) = drag_end(open, end) {
+            on_control.call(control);
+        }
+    };
     rsx! {
         div {
             id: SEEK_ID,
             class,
             role: "slider",
+            // Focusable, so the arrow keys (the player's own seek steps)
+            // reach it from Tab.
+            tabindex: 0,
             aria_label: "Seek",
             aria_valuemin: 0,
             aria_valuemax: total / 1000,
             aria_valuenow: at / 1000,
             aria_valuetext: clock(at),
-            onmousemove: move |evt: MouseEvent| {
-                on_control.call(Control::Hover(Some(evt.element_coordinates().x)));
+            onpointerdown: move |evt: PointerEvent| {
+                // The main button only; a touch or pen press is always it.
+                if evt.trigger_button() != Some(MouseButton::Primary) {
+                    return;
+                }
+                let Some(ms) = ms_at(evt.element_coordinates().x) else {
+                    return;
+                };
+                platform::capture_pointer(&evt);
+                dragging.set(Some(evt.pointer_id()));
+                let input = scrub::Input::of_pointer(&evt.pointer_type());
+                scrub.set(Some(scrub::drag(None, input, ms, pos.peek(), platform::now_ms())));
             },
-            onmouseleave: move |_| on_control.call(Control::Hover(None)),
-            onclick: move |evt: MouseEvent| {
-                on_control.call(Control::SeekAt(evt.element_coordinates().x));
+            onpointermove: move |evt: PointerEvent| {
+                if *dragging.peek() == Some(evt.pointer_id()) {
+                    let Some(ms) = ms_at(evt.element_coordinates().x) else {
+                        return;
+                    };
+                    let prev = *scrub.peek();
+                    let input = scrub::Input::of_pointer(&evt.pointer_type());
+                    if prev.map(|s| s.target_ms) != Some(ms) {
+                        scrub.set(Some(scrub::drag(prev, input, ms, pos.peek(), platform::now_ms())));
+                    }
+                } else if evt.pointer_type() == "mouse" {
+                    on_control.call(Control::Hover(Some(evt.element_coordinates().x)));
+                }
+            },
+            onpointerup: move |evt: PointerEvent| {
+                if *dragging.peek() == Some(evt.pointer_id()) {
+                    end_drag(scrub::End::Released);
+                }
+            },
+            onpointercancel: move |evt: PointerEvent| {
+                if *dragging.peek() == Some(evt.pointer_id()) {
+                    end_drag(scrub::End::Cancelled);
+                }
+            },
+            onpointerleave: move |evt: PointerEvent| {
+                if evt.pointer_type() == "mouse" {
+                    on_control.call(Control::Hover(None));
+                }
             },
             div { class: "pharos-seek-track",
                 for (i, s) in c.segments.iter().enumerate().filter(|(_, s)| s.end_ms > s.start_ms) {
@@ -1356,6 +1417,15 @@ fn SeekBar(
             }
         }
     }
+}
+
+/// What a pointer drag on the seek bar does when it ends: one seek to its
+/// target when the pointer lets go, nothing when the browser cancelled it.
+/// The moves before it seek nothing, so a scrub is one seek, and in a group
+/// one group command (T038-301).
+fn drag_end(open: Option<Scrub>, end: scrub::End) -> Option<Control> {
+    open.filter(|_| end == scrub::End::Released)
+        .map(|s| Control::Seek(s.target_ms))
 }
 
 /// The mute button and volume slider. The video page's chrome is the
@@ -2399,6 +2469,25 @@ mod tests {
     /// B805: the idle fade hides the top strip and the control bar but not
     /// the skip button, in the plain rule and in every `data-overlay-fx`
     /// variant, or a viewer who is just watching never sees it.
+    #[test]
+    fn a_drag_on_the_seek_bar_seeks_once_when_it_lets_go() {
+        let mut open = None;
+        let mut seeks = 0;
+        for (i, ms) in (0..20u64).map(|i| (i, 10_000 + i * 5_000)) {
+            open = Some(scrub::drag(open, scrub::Input::Touch, ms, 3_000, i as f64));
+            // A move seeks nothing: only the end does.
+            seeks += usize::from(open.is_none());
+        }
+        assert_eq!(seeks, 0);
+        assert_eq!(
+            drag_end(open, scrub::End::Released),
+            Some(Control::Seek(105_000)),
+            "one seek, to where the pointer let go"
+        );
+        assert_eq!(drag_end(open, scrub::End::Cancelled), None);
+        assert_eq!(drag_end(None, scrub::End::Released), None);
+    }
+
     #[test]
     fn idle_never_hides_the_skip_button() {
         let sheet = include_str!("../../assets/pharos.css");
