@@ -1838,6 +1838,7 @@ fn EpisodeRow(episode: Item, #[props(default)] seen: Vec<seen::SeenRow>) -> Elem
                 album: None,
                 kind: QueueTarget::EpisodeRow,
             }
+            super::check_match::RematchEpisode { id: episode.id }
             Link {
                 to: Route::Watch(episode.id),
                 class: "pharos-button pharos-episode-play",
