@@ -30,6 +30,8 @@ pub enum Route {
     Playback,
     /// What this account shares with the server (diagnostics), under `/settings`.
     Privacy,
+    /// The books kept on this device for reading offline, under `/settings`.
+    Offline,
     /// `/find`, where the search screen was: opens the palette over home.
     Find,
     /// The viewer's favourites, a rail per kind, `/favourites` (B1083).
@@ -78,6 +80,7 @@ impl Route {
             ["settings", "approve-device"] => Route::ApproveDevice,
             ["settings", "playback"] => Route::Playback,
             ["settings", "privacy"] => Route::Privacy,
+            ["settings", "offline"] => Route::Offline,
             _ => not_found(path),
         }
     }
@@ -98,6 +101,7 @@ impl Route {
             Route::ApproveDevice => format!("{MOUNT}/settings/approve-device"),
             Route::Playback => format!("{MOUNT}/settings/playback"),
             Route::Privacy => format!("{MOUNT}/settings/privacy"),
+            Route::Offline => format!("{MOUNT}/settings/offline"),
             Route::Find => format!("{MOUNT}/find"),
             Route::Favourites => format!("{MOUNT}/favourites"),
             Route::Together => format!("{MOUNT}/together"),
@@ -134,6 +138,7 @@ impl Route {
             Route::ApproveDevice => Some("Approve a device"),
             Route::Playback => Some("Playback"),
             Route::Privacy => Some("Privacy"),
+            Route::Offline => Some("Offline"),
             Route::Find => Some("Search"),
             Route::Favourites => Some("Favourites"),
             Route::Together | Route::TogetherGroup(_) => Some("Watch together"),
@@ -161,6 +166,7 @@ impl Route {
             Route::ApproveDevice => "approve_device",
             Route::Playback => "playback",
             Route::Privacy => "privacy",
+            Route::Offline => "offline",
             Route::Find => "find",
             Route::Favourites => "favourites",
             Route::Together => "together",
@@ -202,6 +208,7 @@ mod tests {
             Route::ApproveDevice,
             Route::Playback,
             Route::Privacy,
+            Route::Offline,
             Route::Find,
             Route::Favourites,
             Route::Together,
@@ -256,6 +263,7 @@ mod tests {
         assert_eq!(Route::Appearance.path(), "/ui/settings/appearance");
         assert_eq!(Route::Playback.path(), "/ui/settings/playback");
         assert_eq!(Route::Privacy.path(), "/ui/settings/privacy");
+        assert_eq!(Route::Offline.path(), "/ui/settings/offline");
     }
 
     #[test]
