@@ -2020,20 +2020,65 @@ fn FlaggedCard(
     }
 }
 
+/// A fix made by hand. Remove asks once more first, as revoking a key does
+/// (FR-211): it undoes the fix at once and has no Undo.
 #[component]
 fn HandFixRow(fix: HandFix, on_action: EventHandler<AdminAction>) -> Element {
     let id = fix.id;
+    let mut confirming = use_signal(|| false);
+    let keep_id = format!("manage-handfix-keep-{id}");
+    let remove_id = format!("manage-handfix-remove-{id}");
+    let keep_id_for_open = keep_id.clone();
+    let remove_id_for_keep = remove_id.clone();
+    let remove_id_for_esc = remove_id.clone();
+    let name = folder_name(&fix.folder).to_owned();
     rsx! {
         article { class: "pharos-admin-identity-card",
             h4 { title: "{fix.folder}", "{folder_name(&fix.folder)}" }
             p { class: "pharos-admin-identity-status", "{hand_fix_words(&fix)}" }
             p { class: "pharos-admin-identity-facts", "{hand_fix_origin(&fix)}" }
             div { class: "pharos-manage-card-actions",
-                button {
-                    r#type: "button",
-                    class: "pharos-admin-identity-remove",
-                    onclick: move |_| on_action.call(AdminAction::IdentityRemove { id }),
-                    "Remove"
+                if confirming() {
+                    div {
+                        class: "pharos-manage-inline-actions",
+                        role: "group",
+                        aria_label: "Confirm remove",
+                        onkeydown: move |ev: KeyboardEvent| {
+                            if ev.key() == Key::Named(NamedKey::Escape) {
+                                confirming.set(false);
+                                crate::native::focus_after_render(remove_id_for_esc.clone());
+                            }
+                        },
+                        button {
+                            r#type: "button",
+                            id: "{keep_id}",
+                            onclick: move |_| {
+                                confirming.set(false);
+                                crate::native::focus_after_render(remove_id_for_keep.clone());
+                            },
+                            "Keep"
+                        }
+                        button {
+                            r#type: "button",
+                            class: "pharos-danger is-strong pharos-admin-identity-remove-confirm",
+                            onclick: move |_| {
+                                confirming.set(false);
+                                on_action.call(AdminAction::IdentityRemove { id });
+                            },
+                            "Remove the fix to {name}"
+                        }
+                    }
+                } else {
+                    button {
+                        r#type: "button",
+                        id: "{remove_id}",
+                        class: "pharos-admin-identity-remove",
+                        onclick: move |_| {
+                            confirming.set(true);
+                            crate::native::focus_after_render(keep_id_for_open.clone());
+                        },
+                        "Remove"
+                    }
                 }
             }
         }
@@ -5146,6 +5191,12 @@ mod tests {
         assert!(html.contains("Send ticked files to"), "{html}");
         assert!(html.contains("A new group"), "{html}");
         assert!(html.contains("pharos-admin-identity-remove"), "{html}");
+        // FR-211: Remove asks once more before it acts.
+        assert!(html.contains("id=\"manage-handfix-remove-7\""), "{html}");
+        assert!(
+            !html.contains("pharos-admin-identity-remove-confirm"),
+            "{html}"
+        );
         // One group alone has nothing to keep together.
         let single = SeriesIdentity {
             splits: vec![SplitFolder {
