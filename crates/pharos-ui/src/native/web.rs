@@ -522,6 +522,20 @@ pub fn set_rate(video_id: &str, rate: f64) {
     }
 }
 
+/// The viewer's speed (T038-305): `playbackRate`, and the default rate a
+/// new source starts at, so a quality or audio switch keeps it.
+pub fn set_speed(video_id: &str, rate: f64) {
+    if let Some(v) = video_element(video_id) {
+        v.set_default_playback_rate(rate);
+        v.set_playback_rate(rate);
+    }
+}
+
+/// The media `id`'s `playbackRate`, 1.0 when it is gone.
+pub fn speed(video_id: &str) -> f64 {
+    video_element(video_id).map_or(1.0, |v| v.playback_rate())
+}
+
 /// Wall-clock unix milliseconds: the base the server's group clock speaks.
 pub fn unix_ms() -> i64 {
     js_sys::Date::now() as i64
