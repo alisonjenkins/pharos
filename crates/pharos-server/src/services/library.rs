@@ -752,6 +752,9 @@ pub struct ItemQuery {
     pub is_3d: Option<bool>,
     pub min_width: Option<u32>,
     pub max_width: Option<u32>,
+    /// Fold the films of a box set into one tile for the set (B1086): see
+    /// [`query_folded`].
+    pub collapse_collections: bool,
 }
 
 /// How many items a native `Library.query` page holds when the caller names
@@ -787,6 +790,157 @@ pub async fn query(
     let mut page = query_unlocalized(state, user, parent_id, q).await?;
     crate::services::metadata_text::localize_items(state, user.id, page.items.iter_mut()).await;
     Ok(page)
+}
+
+/// One page of a stored listing with the films of each box set folded into
+/// one tile for the set, standing where its first film stood (B1086). A set
+/// folds only when the listing holds two or more of its films, so a lone
+/// member stays a film. The listing is read unpaged, then folded and paged,
+/// so `total` and the offsets count tiles.
+pub async fn query_folded(
+    state: &AppState,
+    user: &User,
+    parent_id: Option<&str>,
+    q: &ItemQuery,
+) -> Result<FoldedPage, DomainError> {
+    let folded = fold_page(state, user, parent_id, q).await;
+    let outcome = if folded.is_ok() { "ok" } else { "error" };
+    metrics::counter!("pharos_collection_fold_total", "outcome" => outcome).increment(1);
+    folded
+}
+
+async fn fold_page(
+    state: &AppState,
+    user: &User,
+    parent_id: Option<&str>,
+    q: &ItemQuery,
+) -> Result<FoldedPage, DomainError> {
+    let unpaged = ItemQuery {
+        start_index: 0,
+        limit: None,
+        ..q.clone()
+    };
+    let listed = query_unlocalized(state, user, parent_id, &unpaged).await?;
+    let folded = fold_into_collections(state, listed.items).await?;
+    let total = u32::try_from(folded.len()).unwrap_or(u32::MAX);
+    let take = q.limit.map_or(usize::MAX, |l| l as usize);
+    let mut entries: Vec<Folded> = folded
+        .into_iter()
+        .skip(q.start_index as usize)
+        .take(take)
+        .collect();
+    let ids: Vec<u64> = entries
+        .iter()
+        .filter_map(|e| match e {
+            Folded::Item(item, _) => Some(item.id),
+            Folded::Collection { .. } => None,
+        })
+        .collect();
+    let user_data = state.stores.user_data_bulk(user.id, &ids).await?;
+    let mut user_data = user_data.into_iter();
+    for entry in &mut entries {
+        if let Folded::Item(_, data) = entry {
+            *data = user_data.next().unwrap_or_default();
+        }
+    }
+    Ok(FoldedPage {
+        entries,
+        total,
+        start: q.start_index,
+    })
+}
+
+/// One tile of a [`query_folded`] listing: a stored item, or a box set
+/// standing in for the films of it the listing held.
+#[derive(Debug)]
+pub enum Folded {
+    Item(MediaItem, UserItemData),
+    Collection {
+        collection: pharos_core::Collection,
+        /// How many of the set's films the listing held (two or more).
+        members: u32,
+        /// The set's film that came first in the listing: the tile stands
+        /// where it stood and shows its poster.
+        first: MediaItem,
+    },
+}
+
+impl Folded {
+    /// The item whose place in the listing this tile holds.
+    pub fn standing_at(&self) -> &MediaItem {
+        match self {
+            Folded::Item(item, _) => item,
+            Folded::Collection { first, .. } => first,
+        }
+    }
+}
+
+/// Fold `items` into box sets (B1086, V1044). A film in several sets goes
+/// to the first by name. A set folds only when two or more of its films
+/// are in `items`; its tile takes the place of the first of them, and the
+/// rest drop out. Every other item keeps its place.
+pub async fn fold_into_collections(
+    state: &AppState,
+    items: Vec<MediaItem>,
+) -> Result<Vec<Folded>, DomainError> {
+    use pharos_core::CollectionStore as _;
+    use std::collections::HashMap;
+    let listed: std::collections::HashSet<pharos_core::MediaId> =
+        items.iter().map(|i| i.id).collect();
+    let mut sets = state.stores.collections_with_counts().await?;
+    sets.sort_by(|a, b| a.collection.name.cmp(&b.collection.name));
+    // film id -> index into `sets` of the first set by name holding it.
+    let mut set_of: HashMap<pharos_core::MediaId, usize> = HashMap::new();
+    for (at, set) in sets.iter().enumerate() {
+        for id in state
+            .stores
+            .collection_items(&set.collection.wire_id)
+            .await?
+        {
+            if listed.contains(&id) {
+                set_of.entry(id).or_insert(at);
+            }
+        }
+    }
+    let mut members: HashMap<usize, u32> = HashMap::new();
+    for at in set_of.values() {
+        *members.entry(*at).or_default() += 1;
+    }
+    let mut placed: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        let folds = set_of
+            .get(&item.id)
+            .copied()
+            .and_then(|at| members.get(&at).filter(|n| **n >= 2).map(|n| (at, *n)));
+        match folds {
+            None => out.push(Folded::Item(item, UserItemData::default())),
+            Some((at, n)) => {
+                if placed.insert(at) {
+                    out.push(Folded::Collection {
+                        collection: sets[at].collection.clone(),
+                        members: n,
+                        first: item,
+                    });
+                }
+            }
+        }
+    }
+    let sets_folded = placed.len();
+    tracing::debug!(
+        sets_folded,
+        tiles = out.len(),
+        "collection fold: listing folded into box sets"
+    );
+    Ok(out)
+}
+
+/// A page of [`query_folded`].
+#[derive(Debug)]
+pub struct FoldedPage {
+    pub entries: Vec<Folded>,
+    pub total: u32,
+    pub start: u32,
 }
 
 /// [`query`] with the stored descriptions, for a caller that reads no
@@ -1102,10 +1256,21 @@ pub async fn index(
         genres.sort_by_key(|g| g.to_lowercase());
         genres
     };
-    Ok(ListIndex {
-        letters: section_starts(listed.items.iter().map(|i| item_section(sections, i))),
-        genres,
-    })
+    let letters = if q.collapse_collections {
+        // A set's tile files under the film it stands at, so the sections
+        // fall where the folded pages do.
+        let folded = fold_into_collections(state, listed.items)
+            .await
+            .map_err(store)?;
+        section_starts(
+            folded
+                .iter()
+                .map(|e| item_section(sections, e.standing_at())),
+        )
+    } else {
+        section_starts(listed.items.iter().map(|i| item_section(sections, i)))
+    };
+    Ok(ListIndex { letters, genres })
 }
 
 /// `page` with the user's play state for each item, read in one batch.

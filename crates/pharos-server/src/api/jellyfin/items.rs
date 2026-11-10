@@ -3319,6 +3319,7 @@ impl From<&ListQuery> for ItemQuery {
             is_3d: q.is_3d,
             min_width: q.min_width,
             max_width: q.max_width,
+            collapse_collections: false,
         }
     }
 }
