@@ -764,8 +764,10 @@ pub fn pick(dir: Dir, from: Rect, controls: &[Rect]) -> Option<usize> {
 
 /// [`pick`] with the player docked in a bar along the bottom (the TV's
 /// compact player) reached last: from the page, Down reaches the bar only
-/// with no page control below, so the arrows still scroll the page; in the
-/// bar, Left and Right stay in it and Up goes back to the page. `controls`
+/// with no page control below, so the arrows still scroll the page, and Up
+/// from the page's top reaches it too, so a long page is no walk (B1222,
+/// V1182); in the bar, Left and Right stay in it and Up goes back to the
+/// page. `controls`
 /// pairs each rect with whether it is in the bar.
 pub fn pick_docked(
     dir: Dir,
@@ -796,6 +798,7 @@ pub fn pick_docked(
             .or_else(|| among(true))
             .or_else(|| nearest_across(from, controls)),
         (Dir::Up, true) => among(false).or_else(|| nearest_above(from, controls)),
+        (Dir::Up, false) => among(false).or_else(|| nearest_across(from, controls)),
         (Dir::Down, true) => None,
         (_, docked) => among(docked),
     }
@@ -879,6 +882,29 @@ mod tests {
         assert_eq!(pick_docked(Dir::Right, play, true, &end), Some(3));
         assert_eq!(pick_docked(Dir::Up, play, true, &end), Some(1));
         assert_eq!(pick_docked(Dir::Down, play, true, &end), None);
+    }
+
+    /// B1222/V1182: Up from the top of a long page reaches the bar, so the
+    /// remote need not walk the whole page down to it; with no bar Up there
+    /// is no move, and below the top Up still climbs the page.
+    #[test]
+    fn up_from_the_top_of_the_page_reaches_the_docked_bar() {
+        let nav = (0.0, 10.0, 80.0, 30.0);
+        let row = (0.0, 100.0, 100.0, 50.0);
+        let far = (0.0, 4000.0, 100.0, 50.0);
+        let play = (0.0, 650.0, 40.0, 40.0);
+        let close = (300.0, 650.0, 40.0, 40.0);
+        let page = [
+            (nav, false),
+            (row, false),
+            (far, false),
+            (play, true),
+            (close, true),
+        ];
+        assert_eq!(pick_docked(Dir::Up, nav, false, &page), Some(3));
+        assert_eq!(pick_docked(Dir::Up, row, false, &page), Some(0));
+        let no_bar = [(nav, false), (row, false), (far, false)];
+        assert_eq!(pick_docked(Dir::Up, nav, false, &no_bar), None);
     }
 
     const ALL: [Mode; 6] = [
