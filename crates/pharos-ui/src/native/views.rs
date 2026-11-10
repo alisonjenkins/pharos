@@ -500,6 +500,11 @@ pub fn GroupEndedNote(message: String) -> Element {
 pub struct PlayFailure {
     pub headline: &'static str,
     pub reason: String,
+    /// The media would not decode, so the file is likely damaged there
+    /// rather than the connection at fault (B1160).
+    pub damaged: bool,
+    /// Where a skip past the damage carries on from, when one is offered.
+    pub skip_to_ms: Option<u64>,
 }
 
 impl PlayFailure {
@@ -508,6 +513,18 @@ impl PlayFailure {
         Self {
             headline: "This video stopped playing.",
             reason: reason.into(),
+            damaged: false,
+            skip_to_ms: None,
+        }
+    }
+
+    /// The stream broke on media that would not decode; `skip_to_ms` is
+    /// where a skip past it lands, if one is offered.
+    pub fn damaged(reason: impl Into<String>, skip_to_ms: Option<u64>) -> Self {
+        Self {
+            damaged: true,
+            skip_to_ms,
+            ..Self::stream(reason)
         }
     }
 
@@ -517,6 +534,17 @@ impl PlayFailure {
         Self {
             headline: "This video could not be started.",
             reason: reason.into(),
+            damaged: false,
+            skip_to_ms: None,
+        }
+    }
+
+    /// The line under the headline: what the viewer can do.
+    pub fn hint(&self) -> &'static str {
+        match (self.damaged, self.skip_to_ms.is_some()) {
+            (true, true) => "This part of the file looks damaged. Skip ahead to carry on past it.",
+            (true, false) => "This part of the file looks damaged. Try again, or go back.",
+            (false, _) => "Check your connection, then try again. Your place is kept.",
         }
     }
 
@@ -534,19 +562,31 @@ pub fn PlaybackFailure(
     failure: PlayFailure,
     on_retry: EventHandler<()>,
     on_back: EventHandler<()>,
+    /// Carries on from `failure.skip_to_ms`; without it no skip is offered.
+    #[props(default)]
+    on_skip: Option<EventHandler<u64>>,
 ) -> Element {
+    let skip = failure.skip_to_ms.zip(on_skip);
     rsx! {
         div { class: "pharos-playback-failure", role: "alert",
             p { class: "pharos-playback-failure-title", "{failure.headline}" }
-            p { class: "pharos-playback-failure-hint",
-                "Check your connection, then try again. Your place is kept."
-            }
+            p { class: "pharos-playback-failure-hint", "{failure.hint()}" }
             div { class: "pharos-playback-failure-actions",
+                if let Some((to_ms, on_skip)) = skip {
+                    button {
+                        class: "pharos-playback-failure-skip",
+                        r#type: "button",
+                        // Trying again only breaks at the same place.
+                        autofocus: true,
+                        onclick: move |_| on_skip.call(to_ms),
+                        "Skip to {super::playback::clock(to_ms)}"
+                    }
+                }
                 button {
                     class: "pharos-playback-failure-retry",
                     r#type: "button",
                     // A remote or keyboard lands on the way forward (TV, Quest).
-                    autofocus: true,
+                    autofocus: skip.is_none(),
                     onclick: move |_| on_retry.call(()),
                     "Try again"
                 }
@@ -1782,6 +1822,52 @@ mod tests {
             "{html}"
         );
         assert!(html.contains(r#"role="alert""#), "{html}");
+    }
+
+    /// B1160: media that would not decode offers a skip past it, first and
+    /// focused, and says the file looks damaged rather than blaming the
+    /// connection; a network failure offers no skip.
+    #[test]
+    fn a_decode_failure_offers_a_skip_past_the_damage() {
+        let html = render(|| {
+            rsx! {
+                PlaybackFailure {
+                    failure: PlayFailure::damaged("code 3", Some(615_000)),
+                    on_retry: |_| {},
+                    on_back: |_| {},
+                    on_skip: |_| {},
+                }
+            }
+        });
+        assert!(html.contains("Skip to 10:15"), "{html}");
+        assert!(html.contains("looks damaged"), "{html}");
+        assert!(!html.contains("Check your connection"), "{html}");
+        let skip = html.find("pharos-playback-failure-skip").unwrap();
+        let retry = html.find("pharos-playback-failure-retry").unwrap();
+        assert!(skip < retry, "the skip comes first: {html}");
+        let network = render(|| {
+            rsx! {
+                PlaybackFailure {
+                    failure: PlayFailure::stream("networkError"),
+                    on_retry: |_| {},
+                    on_back: |_| {},
+                    on_skip: |_| {},
+                }
+            }
+        });
+        assert!(!network.contains("Skip to"), "{network}");
+        assert!(network.contains("Check your connection"), "{network}");
+        // No handler (music, a group): no skip, even with a target.
+        let none = render(|| {
+            rsx! {
+                PlaybackFailure {
+                    failure: PlayFailure::damaged("code 3", Some(615_000)),
+                    on_retry: |_| {},
+                    on_back: |_| {},
+                }
+            }
+        });
+        assert!(!none.contains("Skip to"), "{none}");
     }
 
     /// B822: the listing left on screen while the next one loads says so.
