@@ -2780,24 +2780,74 @@ fn TogetherScreen() -> Element {
         move || error.set(None)
     });
     let api = use_hook(move || group_client(ctx));
-    let groups = use_resource({
+    let mut groups = use_resource({
         let api = api.clone();
         move || list_groups(api.clone())
+    });
+    // What each group is watching, looked up once the list is in.
+    let watching = use_resource(move || {
+        let listed = groups.read().clone();
+        let native = ctx.api.peek().clone();
+        async move {
+            let (Some(Ok(listed)), Some(native)) = (listed, native) else {
+                return Vec::new();
+            };
+            group_titles(&native, &listed).await
+        }
     });
     let state = groups.read();
     match state.as_ref() {
         None => rsx! { Loading {} },
-        Some(Err(e)) => rsx! { ErrorNote { message: e.0.clone() } },
-        Some(Ok(groups)) => rsx! {
+        Some(Err(e)) => {
+            platform::warn(&format!("pharos: together list failed error={}", e.0));
+            rsx! {
+                LoadFailure {
+                    error: LoadError {
+                        headline: "We couldn't list the groups watching together.".to_owned(),
+                        raw: e.0.clone(),
+                        trace_id: None,
+                    },
+                    on_retry: move |()| groups.restart(),
+                }
+            }
+        }
+        Some(Ok(listed)) => rsx! {
             if let Some(message) = together.error.read().clone() {
                 ErrorNote { message }
             }
             TogetherView {
-                groups: groups.clone(),
+                groups: listed.clone(),
                 on_join: move |id: String| join_group(ctx, together.clone(), nav, id),
+                watching: watching.read().clone().unwrap_or_default(),
             }
         },
     }
+}
+
+/// Each listed group's item as the viewer reads it ("Show · S1 · E2"), by
+/// group id. A lookup that fails leaves that group's title out.
+async fn group_titles(api: &NativeApi, groups: &[GroupSummary]) -> Vec<(String, String)> {
+    let mut titles = Vec::new();
+    for group in groups {
+        let Some(item) = group.item else {
+            continue;
+        };
+        match api.detail(&call("together", "list"), item).await {
+            Ok(detail) => {
+                let (title, line) = super::views::watch_heading(&detail.item);
+                let text = match line {
+                    Some(line) => format!("{title} · {line}"),
+                    None => title,
+                };
+                titles.push((group.id.clone(), text));
+            }
+            Err(e) => platform::warn(&format!(
+                "pharos: together title lookup failed group={} error={e}",
+                group.id
+            )),
+        }
+    }
+    titles
 }
 
 /// An invite link: join the group if it still runs.
