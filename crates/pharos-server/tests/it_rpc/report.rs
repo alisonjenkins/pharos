@@ -268,3 +268,25 @@ async fn only_the_reporter_or_an_admin_reaches_a_report() {
         })
         .await;
 }
+
+/// A loop of `listReports` is paced: each scans every stored report. The
+/// burst serves a Privacy page visit, then the call is throttled. Disarm
+/// check: without `admit_read` in `list_reports`, every call succeeds.
+#[actix_web::test]
+async fn a_loop_of_report_lists_is_throttled() {
+    let (fx, _dir) = with_store().await;
+
+    let outcomes = tokio::task::LocalSet::new()
+        .run_until(async {
+            let tel = telemetry_for(&fx, &fx.user_token).await;
+            let mut outcomes = Vec::new();
+            for _ in 0..12 {
+                outcomes.push(list(&tel, false).await.is_ok());
+            }
+            outcomes
+        })
+        .await;
+
+    assert!(outcomes[..10].iter().all(|ok| *ok), "{outcomes:?}");
+    assert!(outcomes[10..].iter().any(|ok| !ok), "{outcomes:?}");
+}

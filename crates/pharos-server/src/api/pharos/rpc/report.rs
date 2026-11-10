@@ -32,6 +32,12 @@ pub(super) const REPORT_BURST: u32 = 3;
 /// Sustained reports per second one session may send. The per-user store
 /// cap is the real bound; this only stops a loop.
 pub(super) const REPORTS_PER_SECOND: u32 = 1;
+/// Report reads (list, get, delete) one session may make in a burst: a
+/// Privacy page visit, a delete and its reload fit well inside it.
+pub(super) const REPORT_READ_BURST: u32 = 10;
+/// Sustained report reads per second one session may make; a list scans
+/// every stored report, so a loop of them is paced.
+pub(super) const REPORT_READS_PER_SECOND: u32 = 1;
 /// Seconds a throttled reporter waits: one token refills in 1/rate.
 const RETRY_AFTER_SECS: u64 = 1;
 
@@ -353,6 +359,23 @@ pub(super) async fn report(
     Ok(())
 }
 
+/// Spends one report-read token, or says how long to wait.
+fn admit_read(session: &Session) -> Result<(), Denial> {
+    if session
+        .report_read_bucket
+        .borrow_mut()
+        .admit(Instant::now())
+    {
+        Ok(())
+    } else {
+        tracing::warn!("client report read refused: rate limited");
+        Err(Denial::Throttled {
+            name: "telemetry_report_reads",
+            retry_after_secs: RETRY_AFTER_SECS,
+        })
+    }
+}
+
 pub(super) async fn list_reports(
     session: Rc<Session>,
     params: telemetry::ListReportsParams,
@@ -367,6 +390,10 @@ pub(super) async fn list_reports(
             return Ok(());
         }
     };
+    if let Err(denial) = admit_read(&session) {
+        denial.write(out.init_error());
+        return Ok(());
+    }
     if everyone && !user.policy.admin {
         Denial::NotPermitted {
             what: "every user's reports",
@@ -422,6 +449,7 @@ async fn reachable(
     Denial,
 > {
     let user = session.current_user().await?;
+    admit_read(session)?;
     let id = id_text
         .to_str()
         .ok()
