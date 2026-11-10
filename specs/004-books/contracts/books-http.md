@@ -53,7 +53,7 @@ gratuitous divergence.
 ## CHANGED `BaseItemDto` — new `Path` field
 
 ```
-"Path": "/srv/Books/Dune.epub"
+"Path": "/srv/Books/Book A.epub"
 ```
 
 - Emitted **only** when the request's `Fields` contains `Path`. The client asks
@@ -79,15 +79,15 @@ this one field.
 ```jsonc
 {
   "Id": "…",
-  "Name": "Dune",
+  "Name": "Book A",
   "Type": "Book",            // BaseItemKind
   "MediaType": "Book",       // gates all three players (lowercased compare)
-  "Path": "/srv/Books/Dune.epub",   // when Fields=Path
+  "Path": "/srv/Books/Book A.epub",   // when Fields=Path
   "CanDownload": true,
   "RunTimeTicks": 0,         // R8/R9 — 0, NOT null; the field is not optional
   "MediaSources": [],        // R9 — EMPTY, not absent
   "MediaStreams": [],        // R9 — EMPTY, not absent
-  "SeriesName": "Dune",      // from book.series_name
+  "SeriesName": "Book A",      // from book.series_name
   "IndexNumber": 1,          // from book.series_index
   "ImageTags": { "Primary": "…" }   // iff a cover was extracted; no Backdrop/Thumb
 }

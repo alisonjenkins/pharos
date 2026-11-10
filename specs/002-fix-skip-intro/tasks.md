@@ -199,7 +199,7 @@ Never squash.
 
 Closed. The user-visible defect was **B130** — `MediaSource.HasSegments` hardcoded
 `false`, which made jellyfin-web skip the segment fetch entirely. Verified on the
-TV by the user: starting Fringe S01E06 from the beginning shows the Skip Intro
+TV by the user: starting Show AW S01E06 from the beginning shows the Skip Intro
 prompt at 5:22, as the crossing-only ExoPlayer trigger predicts.
 
 **B131** (shift discovery) was a real, separate blind spot found on the way and is

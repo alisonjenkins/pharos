@@ -9,7 +9,7 @@
 
 ## Problem statement
 
-013 FR-003 left image subtitles to burn-in. Turning one on in the native player therefore renegotiates the whole playback into an HLS transcode (`downgrade=subtitle_burn`): the picture is re-encoded, the stream restarts, quality drops to the transcode ceiling, and the server spends a GPU/CPU encode for the whole session. Turning it off renegotiates again. Fringe S01E01 (2026-11-03, B293) is the case that surfaced it: its only subtitles are `dvd_subtitle`.
+013 FR-003 left image subtitles to burn-in. Turning one on in the native player therefore renegotiates the whole playback into an HLS transcode (`downgrade=subtitle_burn`): the picture is re-encoded, the stream restarts, quality drops to the transcode ceiling, and the server spends a GPU/CPU encode for the whole session. Turning it off renegotiates again. Show AW S01E01 (2026-11-03, B293) is the case that surfaced it: its only subtitles are `dvd_subtitle`.
 
 ## User story 1 - Turn on an image subtitle without leaving direct play (Priority: P1)
 

@@ -239,7 +239,7 @@ The viewer has played episodes that **do** carry an intro segment:
 |---------|-------|--------|
 | Show B S02E12 | 112–200 s, conf 1.00 | detected (chromaprint) |
 | Show E S01E18 | 0–89 s | detected |
-| Fringe S01E05 | 384–403 s | detected |
+| Show AW S01E05 | 384–403 s | detected |
 | Show K S03E01 | 81–166 s | **chapter** titled `Intro` |
 | Show K S03E05 | 200–219 s | **chapter** titled `Intro` |
 
@@ -294,7 +294,7 @@ schedules a single ExoPlayer `PlayerMessage` at the segment start:
 It fires only on a FORWARD CROSSING of that position — not a periodic check. An
 outro at ~22 min is always crossed; an intro at 3–6 min is missed whenever
 playback resumes past it, which Jellyfin's own resume position causes routinely.
-**Verified by the user**: starting Fringe S01E06 from the beginning, the Skip
+**Verified by the user**: starting Show AW S01E06 from the beginning, the Skip
 Intro prompt appears at 5:22 as predicted.
 
 Ruled out along the way: the undashed 32-hex `Id` (the SDK's UUID serializer

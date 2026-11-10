@@ -280,7 +280,7 @@ introduces the rule is itself the moment it changes**: before it, every CMAF
 H264 segment resolved to CPU; after it, to hardware. Every pre-existing CMAF
 cache entry was therefore stale in exactly the way this spec exists to prevent.
 
-Observed within minutes of rollout, on Fringe S01E07: `1489` cache hits (all
+Observed within minutes of rollout, on Show AW S01E07: `1489` cache hits (all
 CPU-era) against `11` fresh NVENC prefetch encodes, with the client holding a
 cached libx264 init — a non-fatal hls.js transmuxer exception, and video that
 would have failed outright once playback reached the newly-encoded segments.
