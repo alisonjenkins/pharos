@@ -2124,8 +2124,13 @@ fn EpisodeRow(episode: Item, #[props(default)] seen: Vec<seen::SeenRow>) -> Elem
         _ => display_name(&episode),
     };
     let length = runtime(episode.runtime_ms);
+    // Below 40rem the two queue buttons fold behind one "more" control
+    // (FR-202); it is drawn only when they are.
+    let mut more = use_signal(|| false);
+    let queue_offered = video_queue_offered();
+    let more_label = format!("More for {label}");
     rsx! {
-        div { class: "pharos-episode",
+        div { class: if more() { "pharos-episode is-more-open" } else { "pharos-episode" },
             Link { to: Route::Title(episode.id), class: "pharos-episode-link",
                 div { class: "pharos-episode-still",
                     if let Some(src) = &episode.image {
@@ -2148,6 +2153,21 @@ fn EpisodeRow(episode: Item, #[props(default)] seen: Vec<seen::SeenRow>) -> Elem
                 }
             }
             EpisodeMark { id: episode.id, label: label.clone(), played: episode.played }
+            if queue_offered {
+                button {
+                    r#type: "button",
+                    class: "pharos-episode-more",
+                    title: "{more_label}",
+                    aria_label: "{more_label}",
+                    aria_expanded: more(),
+                    onclick: move |_| more.toggle(),
+                    svg { view_box: "0 0 24 24", "aria-hidden": "true",
+                        circle { cx: "5", cy: "12", r: "2" }
+                        circle { cx: "12", cy: "12", r: "2" }
+                        circle { cx: "19", cy: "12", r: "2" }
+                    }
+                }
+            }
             QueueButtons {
                 name: label.clone(),
                 tracks: vec![episode.clone()],
@@ -2492,6 +2512,15 @@ impl QueueTarget {
             format!("{name} has no songs to queue.")
         }
     }
+}
+
+/// Whether [`QueueButtons`] draws a video row's buttons: the app's video
+/// queue is there and no group is picking what plays (V853).
+fn video_queue_offered() -> bool {
+    let in_group = try_use_context::<Together>()
+        .as_ref()
+        .is_some_and(|t| t.view.read().active);
+    try_use_context::<VideoQueueCtx>().is_some() && !in_group
 }
 
 /// How long the "Added" note stays.
@@ -3322,6 +3351,26 @@ mod tests {
         assert_eq!(after_last(&last, &partial), After::Unknown);
         assert_eq!(after_last(&last, &page(vec![last.clone()])), After::Past);
         assert_eq!(after_last(&last, &page(Vec::new())), After::Unknown);
+    }
+
+    /// FR-202: a row offering the queue buttons has one "more" control
+    /// that folds them on a phone; a row without them has none.
+    #[test]
+    fn an_episode_row_folds_its_queue_buttons_behind_more() {
+        let ep = ep_of(1, S1, 1, "Pilot");
+        let row = ep.clone();
+        let html = render(move || {
+            use_context_provider(|| {
+                VideoQueueCtx(Signal::new(Default::default()), Signal::new(false))
+            });
+            rsx! { EpisodeRow { episode: row.clone() } }
+        });
+        assert!(html.contains("class=\"pharos-episode-more\""), "{html}");
+        assert!(html.contains("aria-label=\"More for 1. Pilot\""), "{html}");
+        assert!(html.contains("aria-expanded=false"), "{html}");
+        assert!(html.contains("data-target=\"episode_row\""), "{html}");
+        let bare = render(move || rsx! { EpisodeRow { episode: ep.clone() } });
+        assert!(!bare.contains("pharos-episode-more"), "{bare}");
     }
 
     #[test]
