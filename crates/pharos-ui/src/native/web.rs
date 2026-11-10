@@ -994,6 +994,20 @@ fn lift_cues(cues: &JsValue, cue_box: CueBox) {
 }
 
 /// The rendered width of the element `id`, 0 when it is gone.
+/// Where the media `id` has data up to from its play head: the end of the
+/// buffered range holding it, 0 when none does or the element is gone.
+pub fn buffered_to_ms(id: &str) -> u64 {
+    let Some(media) = video_element(id) else {
+        return 0;
+    };
+    let now = media.current_time();
+    let buffered = media.buffered();
+    (0..buffered.length())
+        .filter_map(|i| Some((buffered.start(i).ok()?, buffered.end(i).ok()?)))
+        .find(|(start, end)| *start <= now && now <= *end)
+        .map_or(0, |(_, end)| seconds_to_ms(end))
+}
+
 pub fn element_width(id: &str) -> f64 {
     web_sys::window()
         .and_then(|w| w.document())

@@ -116,6 +116,9 @@ pub struct Controls {
     /// re-renders them alone and not the whole player (B815). Without it
     /// `media.position_ms` is the position.
     pub live_position: Option<Signal<u64>>,
+    /// Where the media has data up to from the play head, as a signal the
+    /// seek bar alone reads (T038-301); `None` draws no buffered range.
+    pub live_buffered: Option<Signal<u64>>,
     /// The quality control's state: the manual maximum, the auto cap and how
     /// the server plays the video.
     pub quality: QualityView,
@@ -1219,6 +1222,11 @@ fn SeekBar(
     let live = pos.now();
     let at = scrub_ms.unwrap_or(live);
     let played = percent(at, total);
+    let buffered = c
+        .live_buffered
+        .map(|b| b())
+        .filter(|b| *b > live)
+        .map(|b| percent(b, total));
     let class = match (scrub_ms.is_some(), dragging().is_some()) {
         (true, true) => "pharos-seek is-dragging",
         (true, false) => "pharos-seek is-scrubbing",
@@ -1316,6 +1324,9 @@ fn SeekBar(
                         class: "pharos-seek-segment",
                         style: "left: {percent(s.start_ms, total)}%; width: {percent(s.end_ms, total) - percent(s.start_ms, total)}%",
                     }
+                }
+                if let Some(b) = buffered {
+                    span { class: "pharos-seek-buffered", style: "width: {b}%" }
                 }
                 span { class: "pharos-seek-played", style: "width: {played}%" }
                 for (i, s) in damaged_spans.iter().enumerate() {
@@ -3172,6 +3183,36 @@ mod tests {
             "the thumbnail and time are the target's, not playback's: {html}"
         );
         assert!(html.contains(r#"aria-valuetext="5:10""#), "{html}");
+    }
+
+    #[test]
+    fn the_seek_bar_shows_what_is_buffered_ahead_of_the_play_head() {
+        let draw = |buffered_ms: u64| {
+            let mut c = controls();
+            c.media.position_ms = 300_000;
+            let mut dom = VirtualDom::new_with_props(
+                move |mut controls: Controls| {
+                    let total = controls.total_ms();
+                    controls.live_buffered = Some(use_signal(|| buffered_ms));
+                    rsx! {
+                        SeekBar { controls, total, on_control: |_| {} }
+                    }
+                },
+                c,
+            );
+            dom.rebuild_in_place();
+            dioxus_ssr::render(&dom)
+        };
+        let html = draw(600_000);
+        assert!(
+            html.contains(r#"class="pharos-seek-buffered" style="width: 50%""#),
+            "{html}"
+        );
+        let html = draw(200_000);
+        assert!(
+            !html.contains("pharos-seek-buffered"),
+            "nothing ahead of the play head draws no range: {html}"
+        );
     }
 
     #[test]
