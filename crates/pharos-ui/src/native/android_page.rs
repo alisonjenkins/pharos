@@ -35,7 +35,8 @@ use pharos_client::CallInfo;
 
 use super::machine::{Probe, SignInReply, SignOutReply};
 use super::playback::{
-    Engine, LibraryTransition, MediaState, OverlayEffect, PlaybackEngine, SubtitleSize,
+    Engine, FailureKind, Fatal, LibraryTransition, MediaState, OverlayEffect, PlaybackEngine,
+    SubtitleSize,
 };
 
 const NO_BROWSER: &str = "the native app needs a browser";
@@ -1099,7 +1100,7 @@ impl PlaybackEngine for HlsJs {
                             run(format!("const p = {p}; if (p) p.recoverMediaError();"));
                         }
                         super::playback::Recovery::Fail => {
-                            on_fatal(format!("the stream failed ({kind}: {details})"));
+                            on_fatal(Fatal::from_hls(&kind, &details));
                         }
                     }
                 }
@@ -1259,9 +1260,14 @@ impl PlaybackEngine for DirectMedia {
                 log::warn!(
                     "pharos: playback error engine=direct code={code} message={message} action=fail url={log_url}"
                 );
-                on_fatal(format!(
-                    "the TV could not play this stream (code {code}) {message}"
-                ));
+                let reason = format!("the TV could not play this stream (code {code}) {message}");
+                // MEDIA_ERR_DECODE: the bytes arrived and would not decode.
+                // MEDIA_ERR_SRC_NOT_SUPPORTED: this WebView cannot play it.
+                on_fatal(match code {
+                    3 => Fatal::media(reason),
+                    4 => Fatal::of(FailureKind::Unplayable, reason),
+                    _ => Fatal::other(reason),
+                });
             }
         };
         if let Some(old) = self.listener.take() {
