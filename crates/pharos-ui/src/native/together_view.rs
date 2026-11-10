@@ -9,20 +9,34 @@ use super::activity::{WaitPill, LOG_LINES};
 use super::seen::{initial, SeenRow};
 use super::together::{GroupSummary, Member};
 
-/// The Together page: the groups running now, each with a Join button.
+/// The Together page: the groups running now, what each is watching, and a
+/// Join button on each (spec 038 FR-504).
 #[component]
-pub fn TogetherView(groups: Vec<GroupSummary>, on_join: EventHandler<String>) -> Element {
+pub fn TogetherView(
+    groups: Vec<GroupSummary>,
+    on_join: EventHandler<String>,
+    /// What each group is watching, by group id, once looked up.
+    #[props(default)]
+    watching: Vec<(String, String)>,
+) -> Element {
     rsx! {
         section { class: "pharos-together",
             h2 { "Watch together" }
             if groups.is_empty() {
                 p { class: "pharos-empty", "No one is watching together right now" }
+                p { class: "pharos-muted",
+                    "To start a group, open a film or an episode and choose Watch together. "
+                    "Then send the invite link to anyone who can sign in here."
+                }
             }
             ul { class: "pharos-groups",
                 for group in groups {
                     li { key: "{group.id}", class: "pharos-group",
                         div { class: "pharos-group-text",
                             span { class: "pharos-group-name", "{group.name}" }
+                            span { class: "pharos-group-watching",
+                                {watching_line(&group, &watching)}
+                            }
                             span { class: "pharos-muted", {member_names(&group.members)} }
                         }
                         button {
@@ -319,6 +333,15 @@ pub fn SeenDots(rows: Vec<SeenRow>) -> Element {
     }
 }
 
+/// "Watching <title>", or what the group is waiting on before it has one.
+fn watching_line(group: &GroupSummary, watching: &[(String, String)]) -> String {
+    match (group.item, watching.iter().find(|(id, _)| *id == group.id)) {
+        (None, _) => "Choosing what to watch".to_owned(),
+        (Some(_), Some((_, title))) => format!("Watching {title}"),
+        (Some(_), None) => "Watching something".to_owned(),
+    }
+}
+
 fn member_names(members: &[Member]) -> String {
     match members {
         [] => "Empty".to_owned(),
@@ -336,6 +359,7 @@ mod tests {
 
     use super::*;
     use crate::native::seen::Mark;
+    use pharos_client::api::ItemRef;
 
     fn render(body: impl Fn() -> Element + 'static) -> String {
         let body: std::rc::Rc<dyn Fn() -> Element> = std::rc::Rc::new(body);
@@ -373,6 +397,34 @@ mod tests {
             "{html}"
         );
         assert!(!html.contains(">Join<"), "{html}");
+    }
+
+    #[test]
+    fn no_groups_says_how_to_start_one() {
+        let html = render(|| rsx! { TogetherView { groups: vec![], on_join: |_| {} } });
+        assert!(html.contains("choose Watch together"), "{html}");
+        assert!(html.contains("invite link"), "{html}");
+    }
+
+    #[test]
+    fn each_group_says_what_it_is_watching() {
+        let html = render(|| {
+            let mut playing = group();
+            playing.item = Some(ItemRef::Real(7));
+            let mut unknown = group();
+            unknown.id = "g2".into();
+            unknown.item = Some(ItemRef::Real(8));
+            let mut idle = group();
+            idle.id = "g3".into();
+            rsx! { TogetherView {
+                groups: vec![playing, unknown, idle],
+                on_join: |_| {},
+                watching: vec![("g1".to_owned(), "A Film (1999)".to_owned())],
+            } }
+        });
+        assert!(html.contains("Watching A Film (1999)"), "{html}");
+        assert!(html.contains("Watching something"), "{html}");
+        assert!(html.contains("Choosing what to watch"), "{html}");
     }
 
     #[test]
