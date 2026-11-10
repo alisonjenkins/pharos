@@ -318,10 +318,10 @@ async fn an_unflagged_show_opens_by_its_series_item_id_and_an_unknown_id_is_404(
             .to_request(),
     )
     .await;
-    assert_eq!(v["SeriesKey"], FLASH, "{v}");
+    assert_eq!(v["SeriesKey"], SHOW_A, "{v}");
     assert_eq!(v["SeriesId"], id.as_str(), "{v}");
-    assert_eq!(v["Folder"], FLASH, "{v}");
-    assert_eq!(v["Name"], "The Flash", "{v}");
+    assert_eq!(v["Folder"], SHOW_A, "{v}");
+    assert_eq!(v["Name"], "Show A", "{v}");
     assert_eq!(v["CurrentMatch"], serde_json::Value::Null, "{v}");
     let eps = v["Episodes"].as_array().unwrap();
     assert_eq!(eps.len(), 2, "{v}");
