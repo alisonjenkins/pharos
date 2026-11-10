@@ -2,7 +2,10 @@
 //! the size cap on weak devices, when a position is saved, what each key
 //! does and how progress reads. No I/O; `reader_web.rs` draws it.
 
+use std::collections::BTreeMap;
+
 use pharos_client::api::{Book, BookFormat, ItemRef, ReadPosition};
+use pharos_client::ClientError;
 use quire::{page_progress, Locator, PageLocator, TocEntry};
 use serde::{Deserialize, Serialize};
 
@@ -293,6 +296,125 @@ impl SaveGate {
         self.last_sent = Some(locator.to_owned());
     }
 }
+
+/// Where saves the server has not answered are kept on this device (spec 036
+/// FR-001): a map of item id to the newest one for that book.
+pub const PENDING_KEY: &str = "pharos.reader.pending";
+
+/// The wait before the first retry of a queued save, doubling each time.
+pub const RETRY_FIRST_MS: u32 = 2_000;
+
+/// The longest wait between retries: a tunnel is minutes, and a retry is one
+/// small call.
+pub const RETRY_MAX_MS: u32 = 60_000;
+
+/// Books kept in the queue; the oldest reading goes first. Bounds what
+/// `localStorage` holds if a device stays offline across many books.
+pub const PENDING_MAX_ENTRIES: usize = 50;
+
+/// The wait before retry number `attempt` (0 is the first retry).
+pub fn retry_delay_ms(attempt: u32) -> u32 {
+    let factor = 1u32.checked_shl(attempt).unwrap_or(u32::MAX);
+    RETRY_FIRST_MS.saturating_mul(factor).min(RETRY_MAX_MS)
+}
+
+/// Whether a failed save is worth keeping to send again: the connection
+/// failed or the server was unavailable. A refusal (not a book, a bad
+/// locator) or a revoked session would fail the same way every time.
+pub fn retryable(error: &ClientError) -> bool {
+    match error {
+        ClientError::Rpc(_) => !error.is_unimplemented(),
+        ClientError::Api { kind, .. } => *kind == "unavailable",
+    }
+}
+
+/// A place in a book and when the reader got there.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PendingSave {
+    pub locator: String,
+    pub fraction: f32,
+    /// Unix milliseconds on this device's clock: when the page was read.
+    pub read_at_ms: i64,
+}
+
+/// The saves waiting for the server, one per book.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PendingSaves(BTreeMap<String, PendingSave>);
+
+impl PendingSaves {
+    /// The queue as kept; unreadable text is an empty queue (a lost queue
+    /// costs a position, a crash costs the reader).
+    pub fn parse(text: &str) -> Self {
+        Self(serde_json::from_str(text).unwrap_or_default())
+    }
+
+    pub fn to_text(&self) -> String {
+        serde_json::to_string(&self.0).unwrap_or_default()
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn contains(&self, id: ItemRef) -> bool {
+        self.0.contains_key(&id.to_string())
+    }
+
+    /// Keeps `save` for `id` unless one read later is already queued for it.
+    /// Over [`PENDING_MAX_ENTRIES`] the book read longest ago is dropped.
+    pub fn queue(&mut self, id: ItemRef, save: PendingSave) {
+        let key = id.to_string();
+        if self
+            .0
+            .get(&key)
+            .is_some_and(|k| k.read_at_ms > save.read_at_ms)
+        {
+            return;
+        }
+        self.0.insert(key, save);
+        while self.0.len() > PENDING_MAX_ENTRIES {
+            let oldest = self
+                .0
+                .iter()
+                .min_by_key(|(_, v)| v.read_at_ms)
+                .map(|(k, _)| k.clone());
+            match oldest {
+                Some(k) => self.0.remove(&k),
+                None => break,
+            };
+        }
+    }
+
+    /// Forgets the save for `id` once the server has answered it, unless a
+    /// different one was queued meanwhile. Answers whether it was removed.
+    pub fn answered(&mut self, id: ItemRef, sent: &PendingSave) -> bool {
+        let key = id.to_string();
+        if self.0.get(&key) == Some(sent) {
+            self.0.remove(&key);
+            return true;
+        }
+        false
+    }
+
+    /// Every save to send, oldest reading first; entries whose key is not an
+    /// item id are dropped.
+    pub fn entries(&self) -> Vec<(ItemRef, PendingSave)> {
+        let mut all: Vec<_> = self
+            .0
+            .iter()
+            .filter_map(|(k, v)| Some((k.parse::<ItemRef>().ok()?, v.clone())))
+            .collect();
+        all.sort_by_key(|(_, v)| v.read_at_ms);
+        all
+    }
+}
+
+/// The note shown while a save waits for the connection.
+pub const OFFLINE_NOTE: &str = "Offline \u{b7} your place is saved on this device";
 
 /// What a page-turn key asks for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -622,6 +744,93 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
     use quire::Target;
+
+    fn pending(locator: &str, read_at_ms: i64) -> PendingSave {
+        PendingSave {
+            locator: locator.into(),
+            fraction: 0.5,
+            read_at_ms,
+        }
+    }
+
+    #[test]
+    fn a_queued_save_replaces_an_older_one_but_not_a_newer() {
+        let book = ItemRef::Real(7);
+        let mut q = PendingSaves::default();
+        q.queue(book, pending("a", 100));
+        q.queue(book, pending("b", 200));
+        q.queue(book, pending("stale", 150));
+        assert_eq!(q.entries(), vec![(book, pending("b", 200))]);
+        q.queue(ItemRef::Synth(2), pending("other", 50));
+        assert_eq!(q.len(), 2);
+    }
+
+    #[test]
+    fn a_queue_forgets_only_the_save_the_server_answered() {
+        let book = ItemRef::Real(7);
+        let mut q = PendingSaves::default();
+        q.queue(book, pending("a", 100));
+        q.queue(book, pending("b", 200));
+        assert!(
+            !q.answered(book, &pending("a", 100)),
+            "a newer one is queued"
+        );
+        assert!(q.contains(book));
+        assert!(q.answered(book, &pending("b", 200)));
+        assert!(q.is_empty());
+    }
+
+    #[test]
+    fn the_queue_round_trips_and_survives_garbage() {
+        let mut q = PendingSaves::default();
+        q.queue(ItemRef::Real(1), pending("epub:3:10", 1_700_000_000_123));
+        q.queue(ItemRef::Real(2), pending("pdf:4", 1_700_000_000_456));
+        assert_eq!(PendingSaves::parse(&q.to_text()), q);
+        for text in ["", "nope", "[]", "{\"1\":"] {
+            assert!(PendingSaves::parse(text).is_empty(), "{text}");
+        }
+        let odd =
+            PendingSaves::parse(r#"{"not an id":{"locator":"x","fraction":0.1,"read_at_ms":1}}"#);
+        assert_eq!(odd.len(), 1);
+        assert!(odd.entries().is_empty());
+    }
+
+    #[test]
+    fn entries_go_oldest_reading_first_and_the_queue_is_bounded() {
+        let mut q = PendingSaves::default();
+        for n in 0..=PENDING_MAX_ENTRIES as u64 {
+            q.queue(ItemRef::Real(n), pending("x", 1_000 + n as i64));
+        }
+        assert_eq!(q.len(), PENDING_MAX_ENTRIES);
+        assert!(!q.contains(ItemRef::Real(0)), "the oldest reading goes");
+        let times: Vec<i64> = q.entries().iter().map(|(_, s)| s.read_at_ms).collect();
+        assert!(times.windows(2).all(|w| w[0] <= w[1]));
+    }
+
+    #[test]
+    fn retries_back_off_to_a_ceiling() {
+        let delays: Vec<u32> = (0..8).map(retry_delay_ms).collect();
+        assert_eq!(
+            delays,
+            vec![2_000, 4_000, 8_000, 16_000, 32_000, 60_000, 60_000, 60_000]
+        );
+        assert_eq!(retry_delay_ms(500), RETRY_MAX_MS);
+    }
+
+    #[test]
+    fn a_refusal_is_not_retried() {
+        let api = |kind| ClientError::Api {
+            kind,
+            reason: String::new(),
+            trace_id: String::new(),
+        };
+        // `ClientError::Rpc` (a dropped socket) is retried; capnp is not a
+        // host dependency, so the Playwright offline test covers it.
+        assert!(retryable(&api("unavailable")));
+        for kind in ["invalid", "notFound", "notPermitted", "revoked", "limit"] {
+            assert!(!retryable(&api(kind)), "{kind}");
+        }
+    }
 
     #[test]
     fn settings_round_trip_through_their_text() {
