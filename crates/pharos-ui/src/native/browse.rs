@@ -907,8 +907,16 @@ pub fn GridView(
     #[props(default)]
     sets: bool,
 ) -> Element {
+    // A library's own grid has its tab lit in the bar above, which already
+    // says where this is: its heading is for screen readers only, so the
+    // posters start higher (B1313/V1284).
+    let class = if library && more.is_some() {
+        "pharos-browse pharos-browse-library"
+    } else {
+        "pharos-browse"
+    };
     rsx! {
-        section { class: "pharos-browse",
+        section { class,
             h2 { "{title}" }
             match more {
                 // The top bar swaps libraries without leaving this view, and

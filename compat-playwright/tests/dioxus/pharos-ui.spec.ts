@@ -624,7 +624,8 @@ test.describe("pharos Dioxus UI", () => {
 
       await page.locator("section.pharos-rail h2 a").first().click();
       await expect(page).toHaveURL(/\/ui\/browse\/s\d+$/);
-      await expect(page.locator("section.pharos-browse h2")).toBeVisible({
+      // A library's heading is for screen readers only (B1313): its tab is lit.
+      await expect(page.locator("section.pharos-browse h2")).toBeAttached({
         timeout: 15_000,
       });
       await expect(page.locator("ul.pharos-grid li").first()).toBeVisible();
