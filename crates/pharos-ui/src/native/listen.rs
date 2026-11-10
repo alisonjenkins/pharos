@@ -6,6 +6,7 @@ use std::rc::Rc;
 
 use dioxus::prelude::*;
 
+use super::appearance::{not_saved, Notice, NoticeLine};
 use super::browse::track_length;
 use super::keymap::{self, Mode, Resolved};
 use super::lyrics::LyricsPanel;
@@ -194,12 +195,18 @@ pub fn ListenView(
     /// so its own render does not run on every tick (B815).
     #[props(default)]
     live_position: Option<Signal<u64>>,
+    /// The notice a choice this device could not store starts with; tests
+    /// render it, the app leaves it unset.
+    #[props(default)]
+    not_stored: Option<Notice>,
 ) -> Element {
     let media = MediaState {
         position_ms: live_position.map_or(media.position_ms, |s| s()),
         ..media
     };
     let tap = use_hook(Tap::default);
+    // A choice below that this device could not store (FR-705).
+    let mut not_stored = use_signal(move || not_stored);
     let shortcuts = use_shortcuts(media, previous, next, on_control).for_song();
     let mut style =
         use_signal(|| Style::parse(platform::stored_theme(STYLE_KEY).ok().flatten().as_deref()));
@@ -214,6 +221,7 @@ pub fn ListenView(
             platform::store_theme(LYRICS_KEY, if show { "shown" } else { LYRICS_HIDDEN })
         {
             platform::warn(&format!("pharos: lyrics choice not stored error={e}"));
+            not_stored.set(Some(not_saved("whether lyrics show", &e)));
         }
     };
     let lyrics = lyrics.filter(|l| !l.lines.is_empty());
@@ -224,6 +232,7 @@ pub fn ListenView(
         platform::info(&format!("pharos: karaoke on={on}"));
         if let Err(e) = platform::store_theme(KARAOKE_KEY, if on { KARAOKE_ON } else { "off" }) {
             platform::warn(&format!("pharos: karaoke choice not stored error={e}"));
+            not_stored.set(Some(not_saved("the karaoke choice", &e)));
         }
     };
     // Karaoke follows the words, so it is offered only for synced lyrics
@@ -239,6 +248,7 @@ pub fn ListenView(
         if let Err(e) = platform::store_theme(QUEUE_KEY, if show { QUEUE_SHOWN } else { "hidden" })
         {
             platform::warn(&format!("pharos: queue choice not stored error={e}"));
+            not_stored.set(Some(not_saved("whether the queue shows", &e)));
         }
     };
     let queued = queue.len();
@@ -249,6 +259,7 @@ pub fn ListenView(
         fallback.set(None);
         if let Err(e) = platform::store_theme(STYLE_KEY, next.label()) {
             platform::warn(&format!("pharos: visualiser style not stored error={e}"));
+            not_stored.set(Some(not_saved("the visualiser style", &e)));
         }
     };
     // Where a drag on the seek bar is, so playback seeks once on release
@@ -368,6 +379,9 @@ pub fn ListenView(
                 }
                 if let Some(note) = note {
                     p { class: "pharos-muted pharos-listen-note", "{note}" }
+                }
+                if let Some(notice) = not_stored() {
+                    NoticeLine { notice }
                 }
             }
             // Not drawn while the screen is out of sight (B625/V559): a hidden
@@ -1128,6 +1142,39 @@ mod tests {
         );
         dom.rebuild_in_place();
         dioxus_ssr::render(&dom)
+    }
+
+    /// FR-705: a choice the device could not store shows the shared notice
+    /// on the listen view, as Appearance shows it. Disarm check: dropping
+    /// the `NoticeLine` from the view fails the first assertion.
+    #[test]
+    fn a_choice_not_stored_shows_the_shared_notice() {
+        let mut dom = VirtualDom::new(|| {
+            rsx! {
+                ListenView {
+                    title: "Song".to_owned(),
+                    image: None,
+                    artists: Vec::new(),
+                    genres: Vec::new(),
+                    runtime_ms: 1_000,
+                    media: MediaState::default(),
+                    on_media: |_| {},
+                    on_control: |_| {},
+                    not_stored: Some(not_saved("the visualiser style", "QuotaExceededError")),
+                }
+            }
+        });
+        dom.rebuild_in_place();
+        let html = dioxus_ssr::render(&dom);
+        assert!(
+            html.contains(
+                "Could not save the visualiser style on this device: QuotaExceededError."
+            ),
+            "{html}"
+        );
+        assert!(html.contains("role=\"alert\""), "{html}");
+        let plain = render("Song", None);
+        assert!(!plain.contains("Could not save"), "{plain}");
     }
 
     #[test]
