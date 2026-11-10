@@ -84,6 +84,40 @@ async fn prefs_read_and_write_the_diagnostics_opt_in() {
     );
 }
 
+/// T130: the Settings → Devices page's calls. The user's own device takes
+/// a list; another user's device is refused.
+#[actix_web::test]
+async fn my_devices_read_and_set_their_converted_sound() {
+    use pharos_core::TokenStore as _;
+    let (api, fx, _server) = api().await;
+    fx.state.stores.issue(fx.admin_id, "tv").await.unwrap();
+    let call = CallInfo::default();
+    let devices = api.my_devices(&call).await.unwrap();
+    assert_eq!(devices.len(), 1, "{devices:?}");
+    assert!(devices[0].current);
+    api.set_device_converted_audio(&call, &devices[0].id, &["dts".to_string()])
+        .await
+        .expect("stored");
+    assert_eq!(
+        api.my_devices(&call).await.unwrap()[0].converted_audio,
+        ["dts"]
+    );
+    let err = api
+        .set_device_converted_audio(&call, "tv", &["dts".to_string()])
+        .await
+        .expect_err("not the user's device");
+    assert!(
+        matches!(
+            err,
+            ClientError::Api {
+                kind: "notPermitted",
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+}
+
 /// The watched toggle as the UI drives it: a title, then a whole season,
 /// and the detail read afterwards agrees.
 #[actix_web::test]
