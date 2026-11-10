@@ -650,6 +650,22 @@ impl Queue {
         other
     }
 
+    /// Puts a queue read back after a reload, and held until the signed-in
+    /// `user` was known, in place of `self`. It is adopted only when it was
+    /// built for that user and nothing was queued meanwhile; otherwise it is
+    /// dropped (false) and `self` is the user's.
+    pub fn adopt(&mut self, mut held: Queue, user: &str) -> bool {
+        let theirs = held.owner.as_deref() == Some(user);
+        let idle = self.upcoming.is_empty() && self.current.is_none();
+        if theirs && idle {
+            held.claim(user);
+            *self = held;
+            return true;
+        }
+        self.claim(user);
+        false
+    }
+
     /// Whom the queue was built for, once a user is known.
     pub fn owner(&self) -> Option<&str> {
         self.owner.as_deref()
@@ -839,6 +855,28 @@ mod tests {
         assert!(theirs.claim("u2"), "another user's queue is dropped");
         assert!(theirs.upcoming().is_empty());
         assert_eq!(theirs.owner(), Some("u2"));
+    }
+
+    #[test]
+    fn a_held_queue_is_adopted_only_by_its_own_user() {
+        let mut built = Queue::default();
+        built.claim("u1");
+        built.started(ItemRef::Real(1), Some(&album(&[2, 3])), 0);
+        let held = Queue::restore(&built.save()).unwrap();
+
+        let mut live = Queue::default();
+        assert!(!live.adopt(held.clone(), "u2"), "another user's is dropped");
+        assert!(live.upcoming().is_empty());
+        assert_eq!(live.owner(), Some("u2"));
+
+        let mut live = Queue::default();
+        assert!(live.adopt(held.clone(), "u1"));
+        assert_eq!(ids(&live), [2, 3]);
+
+        let mut busy = Queue::default();
+        busy.add(vec![track(9)]);
+        assert!(!busy.adopt(held, "u1"), "a queue built meanwhile stands");
+        assert_eq!(ids(&busy), [9]);
     }
 
     #[test]
