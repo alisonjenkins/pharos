@@ -24,6 +24,10 @@ const LOADER_SRC: &str = "/ui/assets/pdf/loader.js";
 const LOADED_GLOBAL: &str = "QuirePdfDocument";
 /// A promise the loader sets as it starts; it settles when the module has.
 const STARTED_PROMISE: &str = "quirePdfReady";
+/// Marks the loader's script elements so a failed or trapped module's can be
+/// found and removed.
+const LOADER_MARK: &str = "data-quire-pdf";
+const LOADER_SELECTOR: &str = "script[data-quire-pdf]";
 
 /// A resize redraws the page only once the window has been still this long.
 const RESIZE_SETTLE_MS: u32 = 150;
@@ -57,8 +61,38 @@ fn describe(e: &JsValue) -> String {
         .unwrap_or_else(|| format!("{e:?}"))
 }
 
-/// Adds the loader as a module script once and waits for it. The loader
-/// defines [`LOADED_GLOBAL`] only when the module started.
+thread_local! {
+    /// Which load this is, so each asks the loader for its own copy of the
+    /// module (see `loader.js`).
+    static ATTEMPT: Cell<u32> = const { Cell::new(0) };
+}
+
+/// Forgets a module that failed to start or trapped: its globals and its
+/// script elements go, so the next open loads a fresh instance.
+fn discard_module() {
+    let Some(window) = web_sys::window() else {
+        return;
+    };
+    for name in [LOADED_GLOBAL, STARTED_PROMISE] {
+        let _ = js_sys::Reflect::delete_property(&window, &JsValue::from_str(name));
+    }
+    if let Some(document) = window.document() {
+        if let Ok(scripts) = document.query_selector_all(LOADER_SELECTOR) {
+            for i in 0..scripts.length() {
+                if let Some(script) = scripts
+                    .item(i)
+                    .and_then(|n| n.dyn_into::<web_sys::Element>().ok())
+                {
+                    script.remove();
+                }
+            }
+        }
+    }
+}
+
+/// Adds the loader as a module script and waits for the module to start.
+/// The loader defines [`LOADED_GLOBAL`] only when it has. A failure leaves
+/// nothing behind, so the next call tries again from scratch.
 async fn load_module() -> Result<(), String> {
     let window = web_sys::window().ok_or("no window")?;
     let ready =
@@ -66,6 +100,18 @@ async fn load_module() -> Result<(), String> {
     if ready() {
         return Ok(());
     }
+    let result = start_module(&window).await;
+    if result.is_err() {
+        discard_module();
+    }
+    result
+}
+
+async fn start_module(window: &web_sys::Window) -> Result<(), String> {
+    let attempt = ATTEMPT.with(|a| {
+        a.set(a.get().wrapping_add(1));
+        a.get()
+    });
     let document = window.document().ok_or("no document")?;
     let script = document
         .create_element("script")
@@ -73,7 +119,10 @@ async fn load_module() -> Result<(), String> {
         .dyn_into::<web_sys::HtmlScriptElement>()
         .map_err(|_| "not a script element")?;
     script.set_type("module");
-    script.set_src(LOADER_SRC);
+    script.set_src(&format!("{LOADER_SRC}?n={attempt}"));
+    script
+        .set_attribute(LOADER_MARK, "")
+        .map_err(|e| describe(&e))?;
     let finished = js_sys::Promise::new(&mut |resolve, reject| {
         script.set_onload(Some(&resolve));
         script.set_onerror(Some(&reject));
@@ -87,14 +136,14 @@ async fn load_module() -> Result<(), String> {
         .await
         .map_err(|_| "The PDF reader could not be loaded.".to_owned())?;
     // The script's `load` can come before its start-up has finished.
-    let started = js_sys::Reflect::get(&window, &JsValue::from_str(STARTED_PROMISE))
+    let started = js_sys::Reflect::get(window, &JsValue::from_str(STARTED_PROMISE))
         .ok()
         .and_then(|p| p.dyn_into::<js_sys::Promise>().ok())
         .ok_or("The PDF reader did not start.")?;
     wasm_bindgen_futures::JsFuture::from(started)
         .await
         .map_err(|e| format!("The PDF reader could not start: {}", describe(&e)))?;
-    if !ready() {
+    if !js_sys::Reflect::has(window, &JsValue::from_str(LOADED_GLOBAL)).unwrap_or(false) {
         return Err("The PDF reader did not start.".to_owned());
     }
     Ok(())
