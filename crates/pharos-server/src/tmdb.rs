@@ -57,7 +57,7 @@ impl TmdbClient {
     /// connections, so one instance is shared across the backfill.
     pub fn new(api_key: String) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: crate::http_client::client(),
             api_key,
         }
     }

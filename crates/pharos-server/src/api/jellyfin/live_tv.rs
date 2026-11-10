@@ -284,7 +284,7 @@ fn upstream_client() -> Result<&'static reqwest::Client, reqwest::Error> {
     if let Some(client) = CLIENT.get() {
         return Ok(client);
     }
-    let client = reqwest::Client::builder()
+    let client = crate::http_client::builder()
         .connect_timeout(UPSTREAM_CONNECT_TIMEOUT)
         .read_timeout(UPSTREAM_READ_TIMEOUT)
         .build()?;

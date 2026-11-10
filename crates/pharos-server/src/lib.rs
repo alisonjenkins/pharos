@@ -22,6 +22,7 @@ pub mod dlna;
 pub(crate) mod episode_fit;
 pub mod group_ops;
 pub mod health;
+pub mod http_client;
 pub mod http_workers;
 #[cfg(all(unix, feature = "ffmpeg-lib"))]
 pub mod integrity_backfill;

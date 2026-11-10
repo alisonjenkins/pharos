@@ -590,7 +590,7 @@ async fn fetch_url_bytes(url: &str) -> Result<Vec<u8>, String> {
     if !is_allowed_image_host(url) {
         return Err("image URL must be an https TMDB/TVDB CDN URL".to_string());
     }
-    let client = reqwest::Client::builder()
+    let client = crate::http_client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|e| e.to_string())?;

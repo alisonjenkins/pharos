@@ -160,7 +160,12 @@ opentelemetry = "0.33"
 opentelemetry_sdk = { version = "0.33", features = ["rt-tokio"] }
 opentelemetry-otlp = { version = "0.33", default-features = false, features = ["grpc-tonic", "trace"] }
 tracing-opentelemetry = "0.34"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# 0.13 dropped `rustls-tls`; its `rustls` feature pulls aws-lc-rs (a C build)
+# and the OS certificate verifier. `rustls-no-provider` plus a preconfigured
+# ring + webpki-roots config (pharos-server `http_client`) keeps the 0.12
+# behaviour. `query` became opt-in in 0.13.
+reqwest = { version = "0.13", default-features = false, features = ["json", "query", "rustls-no-provider"] }
+webpki-roots = "1"
 uuid = { version = "1", features = ["v4", "v5", "serde"] }
 # 017: Instant that works on wasm32 (std's panics there); pharos-api times RPC calls on both targets.
 web-time = "1"

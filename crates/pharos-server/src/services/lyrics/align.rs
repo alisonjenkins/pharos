@@ -242,11 +242,11 @@ impl Aligner {
             "pharos/{} (https://github.com/alisonjenkins/pharos)",
             env!("CARGO_PKG_VERSION")
         );
-        let http = Client::builder()
+        let http = crate::http_client::builder()
             .user_agent(ua)
             .timeout(TIMEOUT)
             .build()
-            .unwrap_or_else(|_| Client::new());
+            .unwrap_or_else(|_| crate::http_client::client());
 
         let (tx, mut rx) = mpsc::channel(64);
         let cache = AlignCache::new(cache_dir);
@@ -518,7 +518,7 @@ mod tests {
 
     fn test_aligner(media_root: PathBuf, cache: AlignCache, tx: mpsc::Sender<Job>) -> Aligner {
         Aligner {
-            http: Client::new(),
+            http: crate::http_client::client(),
             base: "http://127.0.0.1:8790".into(),
             media_root,
             cache,
