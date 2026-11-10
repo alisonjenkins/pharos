@@ -1102,6 +1102,17 @@ async fn device_options(
             error::ErrorBadRequest(format!("invalid body: {e}"))
         })?
     };
+    // The name is shown to everyone who sees the device, and a device id is
+    // only the client's claim, so an owner sets sound formats but not the
+    // name (ADR-0095). Refused before anything is written.
+    if by == DeviceOptionsRole::Owner && body.custom_name.is_some() {
+        tracing::info!(
+            device.id = device_id,
+            by.user = %user.0.name,
+            "device name change refused: only an admin names a device"
+        );
+        return Err(error::ErrorForbidden("only an admin can rename a device"));
+    }
     // Validated before anything is written, so a bad list never lands half a body.
     let denied = body
         .no_direct_play_audio_codecs
