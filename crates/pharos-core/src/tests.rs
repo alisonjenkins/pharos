@@ -617,12 +617,12 @@ fn match_best_rejects_below_threshold() {
 fn match_best_year_off_by_one_is_partial_not_zero() {
     let cands = vec![SearchCandidate {
         id: "3".into(),
-        title: "Blade Runner".into(),
+        title: "Film AB".into(),
         year: Some(1983),
         aliases: Vec::new(),
     }];
     // title exact, year ±1 -> still above threshold
-    assert!(match_best("Blade Runner", Some(1982), &cands, 0.7).is_some());
+    assert!(match_best("Film AB", Some(1982), &cands, 0.7).is_some());
 }
 
 fn cand(id: &str, title: &str, year: Option<u32>, aliases: &[&str]) -> SearchCandidate {
@@ -974,9 +974,9 @@ fn book_format_round_trips_and_knows_what_a_client_can_open() {
 
 #[test]
 fn sort_name_drops_one_leading_article_case_insensitively() {
-    assert_eq!(sort_name("The Matrix"), "matrix");
-    assert_eq!(sort_name("THE Matrix"), "matrix");
-    assert_eq!(sort_name("A Quiet Place"), "quiet place");
+    assert_eq!(sort_name("The Glass Lattice"), "glass lattice");
+    assert_eq!(sort_name("THE Glass Lattice"), "glass lattice");
+    assert_eq!(sort_name("A Quartz Road"), "quartz road");
     assert_eq!(sort_name("An American Tail"), "american tail");
     assert_eq!(sort_name("The The"), "the");
 }
