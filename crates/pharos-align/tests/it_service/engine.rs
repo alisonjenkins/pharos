@@ -217,6 +217,30 @@ fn a_probe_that_times_out_skips_the_other_probes() {
     assert_eq!(wide.lock().unwrap().len(), 1);
 }
 
+/// Panics in the forward pass, poisoning the engine's lock.
+struct Panics;
+
+impl Model for Panics {
+    fn align(&mut self, _: &[f32], _: &[String], _: bool) -> Result<Vec<(u64, u64)>, ModelError> {
+        panic!("forward pass panicked");
+    }
+}
+
+#[test]
+fn a_song_that_panicked_holding_the_lock_still_lets_the_model_unload() {
+    let e = Engine::new(
+        Box::new(|| Ok(Box::new(Panics) as Box<dyn Model>)),
+        silent(),
+        Some(Duration::ZERO),
+    );
+    let song = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        e.align_song("a", Path::new("/a"), vec![line(0, 1000, "hello")])
+    }));
+    assert!(song.is_err(), "the model panicked");
+    assert!(e.unload_if_idle(), "a poisoned lock still frees the model");
+    assert!(!e.unload_if_idle(), "and it is gone");
+}
+
 #[test]
 fn an_idle_model_is_unloaded_and_reloaded_on_the_next_song() {
     let loads = Arc::new(AtomicUsize::new(0));
