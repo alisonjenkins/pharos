@@ -300,7 +300,6 @@ fn Authenticated(user: Signal<Option<LoggedInUser>>, route: Signal<AppRoute>) ->
             AppRoute::LivePlayer { channel_id } => rsx! {
                 LivePlayerPane {
                     channel_id: channel_id.clone(),
-                    access_token: access_token.clone(),
                     server_base: server_base_from_window(),
                     on_back: move |_| { route.set(AppRoute::LiveTv); },
                 }
@@ -517,16 +516,12 @@ fn DetailPane(
     match detail_opt {
         Some(detail) => {
             let primary_image_url = if detail.has_primary_image {
-                Some(format!(
-                    "{server_base}/Items/{item_id}/Images/Primary?api_key={access_token}"
-                ))
+                Some(format!("{server_base}/Items/{item_id}/Images/Primary"))
             } else {
                 None
             };
             let backdrop_image_url = if detail.has_backdrop_image {
-                Some(format!(
-                    "{server_base}/Items/{item_id}/Images/Backdrop?api_key={access_token}"
-                ))
+                Some(format!("{server_base}/Items/{item_id}/Images/Backdrop"))
             } else {
                 None
             };
@@ -1297,7 +1292,6 @@ fn PlayerPane(
 
     let item_for_url = item_id.clone();
     let server_for_url = server_base.clone();
-    let token_for_url = access_token.clone();
     let access_token_for_progress = access_token.clone();
     let server_base_for_progress = server_base.clone();
     let kind_for_url = kind;
@@ -1307,25 +1301,23 @@ fn PlayerPane(
     let needs_override =
         current_bitrate.is_some() || current_audio.is_some() || current_subtitle.is_some();
     let src_override: Option<String> = if needs_override {
-        let mut qs = format!("?api_key={token_for_url}");
+        // No token in the URL: the sign-in cookie authenticates it (B1150).
+        let mut qs = Vec::new();
         if let Some(b) = current_bitrate {
-            qs.push_str(&format!("&MaxStreamingBitrate={b}"));
+            qs.push(format!("MaxStreamingBitrate={b}"));
         }
         if let Some(a) = current_audio {
-            qs.push_str(&format!("&AudioStreamIndex={a}"));
+            qs.push(format!("AudioStreamIndex={a}"));
         }
         if let Some(s) = current_subtitle {
             // i32 lets us encode -1 = off (Jellyfin convention).
-            qs.push_str(&format!("&SubtitleStreamIndex={s}"));
+            qs.push(format!("SubtitleStreamIndex={s}"));
         }
-        Some(match kind_for_url {
-            ItemKind::Audio => {
-                format!("{server_for_url}/Audio/{item_for_url}/universal{qs}")
-            }
-            ItemKind::Movie | ItemKind::Episode => {
-                format!("{server_for_url}/Videos/{item_for_url}/stream{qs}")
-            }
-        })
+        Some(format!(
+            "{}?{}",
+            super::player::default_src(&server_for_url, &item_for_url, kind_for_url),
+            qs.join("&")
+        ))
     } else {
         None
     };
@@ -1364,7 +1356,6 @@ fn PlayerPane(
             PlayerView {
                 item_id: item_id,
                 kind: kind,
-                access_token: access_token,
                 server_base: server_base,
                 src_override: src_override,
                 quality_options: quality_options,
@@ -1748,13 +1739,8 @@ fn PrefsPane(
 }
 
 #[component]
-fn LivePlayerPane(
-    channel_id: String,
-    access_token: String,
-    server_base: String,
-    on_back: EventHandler<()>,
-) -> Element {
-    let src = format!("{server_base}/LiveTv/Channels/{channel_id}/Stream?api_key={access_token}");
+fn LivePlayerPane(channel_id: String, server_base: String, on_back: EventHandler<()>) -> Element {
+    let src = format!("{server_base}/LiveTv/Channels/{channel_id}/Stream");
     rsx! {
         div {
             class: "pharos-player-pane pharos-livetv-player",
@@ -1766,7 +1752,6 @@ fn LivePlayerPane(
             PlayerView {
                 item_id: channel_id.clone(),
                 kind: ItemKind::Movie,
-                access_token: access_token,
                 server_base: server_base,
                 src_override: Some(src),
                 on_event: move |_| {},
