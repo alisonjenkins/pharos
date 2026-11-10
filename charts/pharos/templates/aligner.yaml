@@ -38,6 +38,11 @@ spec:
               value: /var/lib/pharos/media
             - name: PHAROS_ALIGNER_LISTEN
               value: "0.0.0.0:{{ .Values.aligner.port }}"
+            {{- if .Values.config.obs.otlpEndpoint }}
+            # ADR-0105: the aligner's spans join the server's trace in Tempo.
+            - name: PHAROS_ALIGNER_OTLP_ENDPOINT
+              value: {{ .Values.config.obs.otlpEndpoint | quote }}
+            {{- end }}
           ports:
             - name: http
               containerPort: {{ .Values.aligner.port }}
