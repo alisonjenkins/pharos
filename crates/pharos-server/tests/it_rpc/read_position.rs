@@ -109,6 +109,7 @@ struct BookDetail {
     format: Option<BookFormat>,
     author: String,
     saved: Saved,
+    read_at_ms: i64,
 }
 
 async fn detail(session: &session::Client, id: u64) -> BookDetail {
@@ -149,6 +150,7 @@ async fn detail(session: &session::Client, id: u64) -> BookDetail {
             state.get_read_fraction(),
             state.get_position_ms(),
         ),
+        read_at_ms: state.get_read_at(),
     }
 }
 
@@ -560,6 +562,39 @@ async fn a_future_read_time_counts_as_now_and_zero_is_now() {
             assert_eq!(
                 save(&session, book, "legacy", 0.4).await.unwrap().1,
                 "legacy"
+            );
+        })
+        .await;
+}
+
+/// Spec 036 US4: the detail says when the stored place was read, so a device
+/// holding a kept copy can tell whether the server's place is newer.
+#[actix_web::test]
+async fn detail_says_when_the_stored_place_was_read() {
+    let fx = crate::common::seed_rich().await;
+    seed_books(&fx).await;
+    let book = WireId::Real(EPUB);
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let client = connect(&fx);
+            let session = session_for(&client, &fx.user_token).await;
+            assert_eq!(detail(&session, EPUB).await.read_at_ms, 0, "unread");
+            let read_at = now_secs() * 1000 - 100_000 + 345;
+            save_at(&session, book, "desktop", 0.3, read_at)
+                .await
+                .unwrap();
+            assert_eq!(
+                detail(&session, EPUB).await.read_at_ms,
+                read_at / 1000 * 1000,
+                "the time read, to the second"
+            );
+            // An older reading loses, and so does its time.
+            save_at(&session, book, "phone", 0.6, read_at - 50_000)
+                .await
+                .unwrap();
+            assert_eq!(
+                detail(&session, EPUB).await.read_at_ms,
+                read_at / 1000 * 1000
             );
         })
         .await;

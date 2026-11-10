@@ -1043,6 +1043,7 @@ impl Reads {
 pub(super) fn write_read_state(mut out: user_state::Builder<'_>, position: &ReadPosition) {
     out.set_read_locator(position.locator.as_str());
     out.set_read_fraction(position.fraction);
+    out.set_read_at(position.updated_at.saturating_mul(1000));
 }
 
 fn write_book(mut out: pharos_api::pharos_capnp::book_info::Builder<'_>, book: &BookMeta) {

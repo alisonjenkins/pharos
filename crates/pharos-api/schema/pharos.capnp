@@ -74,6 +74,7 @@ struct UserState {
   played @0 :Bool; favorite @1 :Bool; positionMs @2 :UInt64; playCount @3 :UInt32;
   readLocator @4 :Text;      # a book's saved reading position, opaque to the server; empty when unread. Since schemaVersion 32.
   readFraction @5 :Float32;  # how far through the book, 0 to 1; 0 when unread. Since schemaVersion 32.
+  readAt @6 :Int64;          # unix ms when the stored place was read (the saving device's clock, to the second); 0 when unread. Since schemaVersion 37.
 }
 
 struct ItemSummary {
