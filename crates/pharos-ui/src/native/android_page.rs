@@ -1373,24 +1373,10 @@ pub fn page_visualiser(style: &str, on_fallback: impl FnMut(String) + 'static) -
     let style = style.to_owned();
     log::info!("pharos: visualiser page run={id} style={style} action=start");
     spawn_detached(async move {
-        let started = match load_visualiser().await {
-            Ok(()) => document::eval(&tv_page::visualiser_start_js(id, &style))
-                .join::<bool>()
-                .await
-                .map_err(|e| e.to_string()),
-            Err(e) => Err(e),
-        };
-        match started {
-            Ok(true) => log::info!("pharos: visualiser page run={id} outcome=started"),
-            Ok(false) => log::info!("pharos: visualiser page run={id} outcome=stopped_first"),
-            Err(e) => {
-                log::warn!("pharos: visualiser page run={id} outcome=failed error={e}");
-                on_bridge(Bridge::Visualiser {
-                    id,
-                    reason: crate::render::Fallback::NoWebgl2.label().to_owned(),
-                });
-            }
-        }
+        // A failed load is logged there; the start still runs, as the page
+        // holds the truth and reports it (B1036, V996).
+        let _ = load_visualiser().await;
+        run(tv_page::visualiser_start_js(id, &style));
     });
     PageVisualiser { id, listener }
 }
@@ -1844,8 +1830,16 @@ fn on_bridge(message: Bridge) {
                 }
             }
         }
-        Bridge::Visualiser { id, reason } => {
-            log::info!("pharos: visualiser page run={id} outcome=fallback reason={reason}");
+        Bridge::Visualiser { id, reason, error } => {
+            // The page's own outcome for the run (B1036, V996): only a
+            // fallback reaches the music screen.
+            if matches!(reason.as_str(), "started" | "stopped_first") {
+                log::info!("pharos: visualiser page run={id} outcome={reason}");
+                return;
+            }
+            log::warn!(
+                "pharos: visualiser page run={id} outcome=fallback reason={reason} error={error}"
+            );
             for f in &listeners {
                 if let Ok(mut f) = f.try_lock() {
                     if let Listener::Visualiser(on, f) = &mut f.0 {
