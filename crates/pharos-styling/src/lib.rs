@@ -10,6 +10,7 @@ pub mod compile;
 pub mod director;
 mod effects;
 pub mod event;
+mod glyphs;
 pub mod plan;
 pub mod signals;
 pub mod source;
