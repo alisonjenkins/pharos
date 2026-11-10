@@ -203,6 +203,17 @@ return await window.__pharosVisLoad;"#
     )
 }
 
+/// The script that scrolls the panel `id` so its child `at` is centred:
+/// the web build's `center_child`, run in the TV app's page (B1033).
+pub fn center_child_js(id: &str, at: u32) -> String {
+    let id = serde_json::Value::String(id.to_owned());
+    format!(
+        r#"const panel = document.getElementById({id});
+const child = panel && panel.children[{at}];
+if (child) panel.scrollTop = Math.max(0, child.offsetTop + child.offsetHeight / 2 - panel.clientHeight / 2);"#
+    )
+}
+
 /// The script that stops page visualiser run `id`, or marks it `"gone"` so
 /// a start still on its way does nothing.
 pub fn visualiser_stop_js(id: u64) -> String {
@@ -535,6 +546,17 @@ mod tests {
             );
         }
         assert!(js.contains(r#"atob("AAEC")"#), "{js}");
+    }
+
+    #[test]
+    fn a_lyrics_line_is_centred_in_its_panel() {
+        let js = center_child_js("pharos-lyrics", 20);
+        assert!(
+            js.contains(r#"document.getElementById("pharos-lyrics")"#),
+            "{js}"
+        );
+        assert!(js.contains("panel.children[20]"), "{js}");
+        assert!(js.contains("panel.clientHeight / 2"), "{js}");
     }
 
     #[test]
