@@ -4,6 +4,7 @@
 
 pub mod access;
 pub mod auth;
+pub mod devices;
 pub mod events;
 pub mod font_subset;
 pub mod group_seen;
