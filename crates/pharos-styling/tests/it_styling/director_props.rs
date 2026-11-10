@@ -67,6 +67,7 @@ fn src() -> impl Strategy<Value = SourceLine> {
                 }]
             }),
             style_def: None,
+            speaker: None,
         })
 }
 

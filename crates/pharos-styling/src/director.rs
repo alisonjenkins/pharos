@@ -891,6 +891,7 @@ mod tests {
             typeset: false,
             karaoke: None,
             style_def: None,
+            speaker: None,
         }
     }
 
