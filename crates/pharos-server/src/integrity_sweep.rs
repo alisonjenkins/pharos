@@ -161,6 +161,28 @@ pub fn scannable(it: &MediaItem) -> bool {
     }
 }
 
+/// Whether an AVI's recorded verdict predates the seek-index check (B1162).
+///
+/// Only AVIs: the check answers nothing for any other container, and reading
+/// the whole library again to learn that would cost every file a full NFS
+/// read. An AVI read once more is the price of finding the files whose seeks
+/// take a minute, the fault that went unseen until a viewer reported it.
+pub fn needs_seek_index_check(
+    memo: &crate::integrity_memo::IntegrityMemo,
+    it: &MediaItem,
+    sig: Option<(i64, u64)>,
+) -> bool {
+    let is_avi = it
+        .path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("avi"));
+    is_avi
+        && memo
+            .get(it.id, sig)
+            .is_some_and(|e| e.report.seek_index.is_none())
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum Reader {
     Libav,
@@ -355,6 +377,37 @@ mod tests {
         assert!(
             !scannable(&local("ytdlp://youtube/dQw4w9WgXcQ")),
             "a synthetic path is not a file; scanning it can only ever fail"
+        );
+    }
+
+    /// B1162: a clean AVI verdict recorded before the seek-index check is
+    /// read again, once; a Matroska verdict and an AVI already checked are not.
+    #[test]
+    fn only_an_avi_verdict_without_the_seek_index_check_is_read_again() {
+        let memo = crate::integrity_memo::IntegrityMemo::load("/nonexistent/m.json", 1);
+        let sig = Some((1, 2));
+        let avi = local("/movies/Film/Film.AVI");
+        let mkv = local("/movies/Film/Film.mkv");
+        assert!(
+            !needs_seek_index_check(&memo, &avi, sig),
+            "no verdict: the sweep reads it anyway"
+        );
+
+        memo.record(1, sig, report(0));
+        assert!(needs_seek_index_check(&memo, &avi, sig));
+        assert!(!needs_seek_index_check(&memo, &mkv, sig));
+
+        memo.record(
+            1,
+            sig,
+            IntegrityReport {
+                seek_index: Some(true),
+                ..report(0)
+            },
+        );
+        assert!(
+            !needs_seek_index_check(&memo, &avi, sig),
+            "checked once is enough"
         );
     }
 
