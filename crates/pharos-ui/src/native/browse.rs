@@ -2477,9 +2477,14 @@ fn MusicAlbums(library: ItemRef, first: Page, order: Signal<Narrow>) -> Element 
         }
     });
     let rail = order.read().rail();
+    // A new order keeps the last grid up while it loads: say so (FR-210).
+    let busy = listed.pending() && listed.read().is_some();
     rsx! {
         div { class: "pharos-filters", role: "group", aria_label: "Sort albums",
             SortControls { narrow: order }
+        }
+        if busy {
+            p { class: "pharos-muted pharos-filter-busy", role: "status", "Updating…" }
         }
         match &*listed.read() {
             None => rsx! { p { class: "pharos-muted", "Loading…" } },
