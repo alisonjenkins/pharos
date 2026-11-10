@@ -789,7 +789,7 @@ Drive the `_inner` fns directly (like `remote_search_*` tests):
 #[actix_web::test]
 async fn remote_images_empty_without_key_or_match() {
     let state = seed_state().await;
-    put_movie(&state, 42, "Dune (2021)").await; // no provider id, no key
+    put_movie(&state, 42, "Film AU (2021)").await; // no provider id, no key
     let r = remote_images_inner(&state, "42", &RemoteImagesQuery { image_type: None, provider_name: None }).await;
     assert_eq!(r.total_record_count, 0);
     assert!(r.providers.is_empty());
