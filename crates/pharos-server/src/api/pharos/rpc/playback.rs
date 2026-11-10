@@ -487,7 +487,7 @@ fn report_denial(e: play_state::ReportError) -> Denial {
         },
         play_state::ReportError::Withheld(_) => Denial::NotFound { what: "item" },
         play_state::ReportError::Store { .. } => {
-            tracing::warn!(error = %e, "native playback stop: play state not stored");
+            tracing::warn!(error = %e, "native playback report: play state not stored");
             Denial::Unavailable {
                 dependency: "play state store",
             }
