@@ -26,4 +26,5 @@ mod playback_stopped_audit;
 mod playing_progress_coalescing;
 mod playing_progress_db_calls;
 mod session_start_position;
+mod stop_outcomes;
 mod transcode_url_capability;
