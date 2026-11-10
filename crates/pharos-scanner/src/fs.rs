@@ -764,6 +764,9 @@ impl<P: Prober> FsScanner<P> {
             /// `true` when a row already existed before this run (drives the
             /// added-vs-updated split once the probe lands).
             existed: bool,
+            /// The existing row's stored signature, re-stamped if the probe
+            /// fails so the sweep keeps the row (B1286).
+            kept: Option<(i64, u64)>,
         }
         let mut pending: Vec<Pending> = Vec::new();
         // Buffer the skip-path `mark_seen` stamps (the bulk of scan writes — one
@@ -807,19 +810,6 @@ impl<P: Prober> FsScanner<P> {
                 // fingerprint runs a whole-file hash, and the probe then re-reads
                 // it in full — on every pass, forever. The memo is the only record
                 // that the attempt happened. `--force` still overrides it.
-                if !self.force
-                    && self
-                        .probe_memo
-                        .as_ref()
-                        .is_some_and(|m| m.is_known_bad(id, sig))
-                {
-                    // Deliberately NOT added to `seen_batch`: there is no row to
-                    // mark seen, and inventing one would put an unplayable item in
-                    // the library (V6).
-                    outcome.skipped += 1;
-                    continue;
-                }
-
                 let (row, existing_state) = match store.scan_state(id).await? {
                     Some(state) => (id, Some(state)),
                     // B257 — a seeded row, or one rebound after a move, holds
@@ -829,6 +819,24 @@ impl<P: Prober> FsScanner<P> {
                         None => (id, None),
                     },
                 };
+                if !self.force
+                    && self
+                        .probe_memo
+                        .as_ref()
+                        .is_some_and(|m| m.is_known_bad(id, sig))
+                {
+                    // A file with no row gets none: inventing one would put an
+                    // unplayable item in the library (V6). A row that was
+                    // already there keeps its stored signature, or the sweep
+                    // deletes it (B1286).
+                    if let Some(state) = existing_state {
+                        seen_batch.push((row, state.file_mtime, state.file_size));
+                        seen += 1;
+                        keep_unreadable_row(row, &primary, "known_bad");
+                    }
+                    outcome.skipped += 1;
+                    continue;
+                }
                 if let Some(state) = existing_state {
                     // Existing-by-path: `row` holds this exact path. Skip the probe iff the
                     // signature still matches; otherwise re-probe + put. `--force`
@@ -869,6 +877,7 @@ impl<P: Prober> FsScanner<P> {
                         sig,
                         fp: None,
                         existed: true,
+                        kept: Some((state.file_mtime, state.file_size)),
                     });
                     continue;
                 }
@@ -941,6 +950,7 @@ impl<P: Prober> FsScanner<P> {
                             sig,
                             fp,
                             existed: false,
+                            kept: None,
                         });
                     }
                 }
@@ -1005,6 +1015,7 @@ impl<P: Prober> FsScanner<P> {
                             .await
                             .ok(),
                     };
+                    let kept = p.kept.map(|(mtime, size)| (p.primary.clone(), mtime, size));
                     let item = self.probe_with_alternates(p.primary, p.alts).await;
                     // LIB-D7 — resolve local-first metadata in the SAME
                     // off-reactor/parallel phase as the probe (its NFO read +
@@ -1017,7 +1028,7 @@ impl<P: Prober> FsScanner<P> {
                         Some(it) => self.resolve_metadata(it).await,
                         None => MetadataResult::default(),
                     };
-                    (p.id, p.row, p.sig, p.existed, fp, item, meta)
+                    (p.id, p.row, p.sig, p.existed, kept, fp, item, meta)
                 }
             })
             .buffer_unordered(self.probe_concurrency);
@@ -1059,7 +1070,7 @@ impl<P: Prober> FsScanner<P> {
                         }
                     }
                 };
-                let Some((probed_id, row, sig, existed, fp, item, meta)) = next else {
+                let Some((probed_id, row, sig, existed, kept, fp, item, meta)) = next else {
                     break;
                 };
                 // Cancellation: stop draining the probe stream. Rows already
@@ -1088,7 +1099,14 @@ impl<P: Prober> FsScanner<P> {
                         None => memo.record(probed_id, sig),
                     }
                 }
-                let Some(mut item) = item else { continue };
+                let Some(mut item) = item else {
+                    if let Some((path, mtime, size)) = kept {
+                        store.mark_seen(row, scan_id, mtime, size).await?;
+                        seen += 1;
+                        keep_unreadable_row(row, &path, "reprobe_failed");
+                    }
+                    continue;
+                };
                 item.id = row;
                 let item_id = item.id;
                 // LIB-D7 — merge resolved metadata onto the probe-built item
@@ -2421,6 +2439,19 @@ async fn kind_drift<S: MediaStore>(store: &S, row: MediaId, primary: &Path) -> b
         metrics::counter!("pharos_scan_reprobe_total", "reason" => "kind_changed").increment(1);
     }
     drifted
+}
+
+/// B1286 — a row whose file could not be re-read this pass is stamped seen
+/// with its stored signature, so the sweep keeps it as it was and a later
+/// change to the file is still noticed.
+fn keep_unreadable_row(row: MediaId, path: &Path, reason: &'static str) {
+    tracing::warn!(
+        media.id = %row,
+        path = %path.display(),
+        reason,
+        "file could not be re-read; keeping its row as it was",
+    );
+    metrics::counter!("pharos_scan_kept_unreadable_total", "reason" => reason).increment(1);
 }
 
 /// B1284 — whether an unchanged video's own NFO (`<stem>.nfo`, or
@@ -10689,6 +10720,84 @@ mod tests {
             })
             .sum();
         assert_eq!(nfo_changed, 1);
+    }
+
+    /// B1286 / V1249 — a film whose re-probe fails stays in the library as it
+    /// was, on that pass and on the next, when the probe memo skips it.
+    #[tokio::test]
+    async fn a_row_whose_file_cannot_be_re_read_is_kept() {
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = pharos_test_metrics::snapshotter(&recorder);
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        let td = TempDir::new().unwrap();
+        let memo_dir = TempDir::new().unwrap();
+        write_file(td.path(), "Film Q (2019)/Film Q (2019).mkv", b"video-bytes").await;
+        let nfo = td.path().join("Film Q (2019)/Film Q (2019).nfo");
+        std::fs::write(
+            &nfo,
+            "<?xml version=\"1.0\"?>\n<movie><title>Kept</title></movie>",
+        )
+        .unwrap();
+        let set_mtime = |when: std::time::SystemTime| {
+            std::fs::File::options()
+                .write(true)
+                .open(&nfo)
+                .unwrap()
+                .set_modified(when)
+                .unwrap();
+        };
+        let now = std::time::SystemTime::now();
+        set_mtime(now - std::time::Duration::from_secs(120));
+        let id = stable_id(&td.path().join("Film Q (2019)/Film Q (2019).mkv"));
+        let store = MemStore::default();
+        let memo = Arc::new(crate::probe_memo::ProbeMemo::load(
+            memo_dir.path().join("probe_failures.json"),
+            7,
+        ));
+        FsScanner::new(FakeProber::default())
+            .with_probe_memo(memo.clone())
+            .scan_into(td.path(), &store)
+            .await
+            .unwrap();
+
+        set_mtime(now + std::time::Duration::from_secs(60));
+        let failing = FakeProber {
+            force_fail_for: Some("Film Q".into()),
+            ..Default::default()
+        };
+        for pass in ["reprobe_failed", "known_bad"] {
+            let out = FsScanner::new(failing.clone())
+                .with_probe_memo(memo.clone())
+                .scan_into(td.path(), &store)
+                .await
+                .unwrap();
+            assert!(out.removed.is_empty(), "{pass}: swept {:?}", out.removed);
+            assert_eq!(store.get(id).await.unwrap().title, "Kept", "{pass}");
+        }
+
+        let mut kept: Vec<(String, u64)> = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter_map(|(ck, _, _, v)| match v {
+                metrics_util::debugging::DebugValue::Counter(n)
+                    if ck.key().name() == "pharos_scan_kept_unreadable_total" =>
+                {
+                    let reason = ck.key().labels().find(|l| l.key() == "reason")?;
+                    Some((reason.value().to_owned(), n))
+                }
+                _ => None,
+            })
+            .collect();
+        kept.sort();
+        assert_eq!(
+            kept,
+            vec![
+                ("known_bad".to_owned(), 1),
+                ("reprobe_failed".to_owned(), 1)
+            ]
+        );
     }
 
     #[tokio::test]
