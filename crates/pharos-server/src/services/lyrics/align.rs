@@ -40,6 +40,11 @@ const MIN_ALIGNER_VERSION: u32 = 2;
 /// long before timing out.
 const TIMEOUT: Duration = Duration::from_secs(600);
 
+/// How long the styling job waits for an item's sung lines: an opening and
+/// an ending are a few minutes of audio, tens of seconds of CPU (ADR-0066),
+/// and a stalled aligner must not hold the styling queue for [`TIMEOUT`].
+const SING_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// How long a song whose alignment failed is left alone, so a file the
 /// aligner cannot read is not sent again on every poll.
 const RETRY_AFTER: Duration = Duration::from_secs(60 * 60);
@@ -312,7 +317,7 @@ impl Aligner {
     }
 
     async fn process_job(&self, job: &Job) -> Result<(), String> {
-        let aligned = self.request(&job.path, &job.lines).await?;
+        let aligned = self.request(&job.path, &job.lines, TIMEOUT).await?;
         tracing::info!(
             media.id = job.id,
             lines = job.lines.len(),
@@ -324,7 +329,12 @@ impl Aligner {
     }
 
     /// One `POST /align` for `lines` of the media-relative `path`.
-    async fn request(&self, path: &str, lines: &[(u64, u64, String)]) -> Result<Aligned, String> {
+    async fn request(
+        &self,
+        path: &str,
+        lines: &[(u64, u64, String)],
+        timeout: Duration,
+    ) -> Result<Aligned, String> {
         #[derive(Serialize)]
         struct AlignRequest<'a> {
             path: &'a str,
@@ -353,7 +363,7 @@ impl Aligner {
         };
 
         let url = format!("{}/align", self.base);
-        let mut request = self.http.post(&url).json(&payload);
+        let mut request = self.http.post(&url).json(&payload).timeout(timeout);
         if let Some(traceparent) = crate::obs::traceparent(&tracing::Span::current()) {
             request = request.header("traceparent", traceparent);
         }
@@ -403,7 +413,7 @@ impl Aligner {
                 return Ok(hit);
             }
         }
-        let aligned = self.request(rel, lines).await?;
+        let aligned = self.request(rel, lines, SING_TIMEOUT).await?;
         self.cache.put(item.id, key, aligned.clone());
         Ok(aligned)
     }
