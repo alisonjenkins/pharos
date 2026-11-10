@@ -13,7 +13,7 @@ use super::account::initials;
 use super::art::{Art, POSTER_SIZES};
 use super::browse::{QueueButtons, QueueTarget};
 use super::depth;
-use super::find::SUGGEST_LIMIT;
+use super::find::{self, SUGGEST_LIMIT};
 use super::keymap::Mode;
 use super::keys::{use_arrival_focus, use_key_mode};
 use super::palette::Row;
@@ -904,6 +904,58 @@ pub fn SearchBox(
         }
     }
 }
+
+/// The search page (FR-207): its box, then the matches grouped by kind,
+/// with the cap stated when the server's page left matches out. The term is
+/// in the URL, so Back from a match comes back here.
+#[component]
+pub fn FindView(text: String, hits: Hits, on_input: EventHandler<String>) -> Element {
+    rsx! {
+        section { class: "pharos-find",
+            h2 { "Search" }
+            input {
+                id: FIND_INPUT,
+                class: "pharos-find-input",
+                r#type: "search",
+                placeholder: "Films, shows, music, books, people",
+                autocomplete: "off",
+                "aria-label": "Search all libraries",
+                value: "{text}",
+                oninput: move |evt: FormEvent| on_input.call(evt.value()),
+            }
+            match hits {
+                Hits::Idle => rsx! {
+                    p { class: "pharos-empty", "Type to search every library." }
+                },
+                Hits::Searching => rsx! {
+                    p { class: "pharos-empty", role: "status", "Searching…" }
+                },
+                Hits::Failed(message) => rsx! { ErrorNote { message } },
+                Hits::Found(page) if page.items.is_empty() => rsx! {
+                    p { class: "pharos-empty", role: "status", "No matches for \u{201c}{text.trim()}\u{201d}" }
+                },
+                Hits::Found(page) => rsx! {
+                    if let Some(note) = find::cap_note(page.items.len(), page.total) {
+                        p { class: "pharos-muted pharos-find-cap", role: "status", "{note}" }
+                    }
+                    for (heading, items) in find::grouped(&page.items) {
+                        section { key: "{heading}", class: "pharos-find-group",
+                            h3 { class: "pharos-section-title", "{heading} ({items.len()})" }
+                            ul { class: "pharos-find-hits",
+                                for item in items {
+                                    li { key: "{item.id}", SearchHit { item } }
+                                }
+                            }
+                        }
+                    }
+                },
+            }
+        }
+    }
+}
+
+/// The search page's box, focused on arrival.
+pub const FIND_INPUT: &str = "find-input";
 
 fn option_id(list: &str, at: usize) -> String {
     format!("{list}-option-{at}")
@@ -2379,6 +2431,49 @@ mod tests {
             bar.contains(r#"aria-label="Search all libraries""#),
             "{html}"
         );
+    }
+
+    /// FR-207: the search page groups matches by kind and states the cap
+    /// when the server's page left some out.
+    #[test]
+    fn the_search_page_groups_matches_and_states_the_cap() {
+        let mut items = vec![
+            Item {
+                id: ItemRef::Real(1),
+                name: "A Film".into(),
+                ..item(ItemKind::Movie)
+            },
+            Item {
+                id: ItemRef::Real(2),
+                name: "A Song".into(),
+                ..item(ItemKind::Audio)
+            },
+        ];
+        items.push(Item {
+            id: ItemRef::Real(3),
+            name: "Another Film".into(),
+            ..item(ItemKind::Movie)
+        });
+        let page = Page {
+            items,
+            total: 80,
+            start: 0,
+        };
+        let html = render(move || {
+            rsx! { FindView { text: "a".to_owned(), hits: Hits::Found(page.clone()), on_input: |_| {} } }
+        });
+        let films = html.find("Films (2)").expect("films heading");
+        let songs = html.find("Songs (1)").expect("songs heading");
+        assert!(films < songs, "{html}");
+        assert!(html.contains("best 3 of 80 matches"), "{html}");
+        let whole = render(move || {
+            rsx! { FindView { text: "a".to_owned(), hits: found(2), on_input: |_| {} } }
+        });
+        assert!(!whole.contains("of 2 matches"), "{whole}");
+        let none = render(move || {
+            rsx! { FindView { text: "zz".to_owned(), hits: found(0), on_input: |_| {} } }
+        });
+        assert!(none.contains("No matches for"), "{none}");
     }
 
     #[test]

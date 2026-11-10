@@ -268,7 +268,7 @@ pub(crate) fn encode_component(s: &str) -> String {
 
 /// A query value decoded: `+` is a space, `%XX` a byte; a malformed escape
 /// is kept as written.
-fn decode_component(s: &str) -> String {
+pub(crate) fn decode_component(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
