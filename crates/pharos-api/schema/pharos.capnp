@@ -12,7 +12,7 @@ annotation secret(field, param) :Void;
 
 # Bumped when the schema changes; served as ServerInfo.schemaVersion so a client
 # can tell which methods a server knows (FR-009).
-const schemaVersion :UInt32 = 36;
+const schemaVersion :UInt32 = 37;
 
 # ---- ids and shared types -------------------------------------------------
 struct ItemId {                # mirrors pharos_jellyfin_api::WireId
@@ -182,6 +182,8 @@ struct ItemQuery {
   nameStartsWith @4 :Text; filters @5 :List(Text); start @6 :UInt32; limit @7 :UInt32;
   genre @8 :Text;              # one genre's name; empty means every genre
   stereo @9 :StereoFilter;     # 3D titles only, 2D only, or both. Since schemaVersion 29.
+  collapseCollections @10 :Bool; # fold each box set's films into one tile for the set
+                                 # (B1086). Stored-row lists only. Since schemaVersion 37.
 }
 enum StereoFilter { any @0; only3d @1; only2d @2; }
 
