@@ -8,7 +8,8 @@
 //! order from before, which turning shuffle off brings back.
 //!
 //! It lives for the tab, in the app's context, so it survives moving between
-//! pages and from song to song.
+//! pages and from song to song, and is kept in the tab's session storage so
+//! it survives a reload as the playing song does (FR-704).
 //!
 //! Films, episodes and music videos have a queue of their own (B906/V853),
 //! the same [`Queue`] held as [`VideoQueueCtx`]: only what the viewer added,
@@ -18,11 +19,13 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use dioxus::prelude::*;
 use pharos_client::api::{Item, ItemKind, ItemRef};
+use serde::{Deserialize, Serialize};
 
 use super::views::{display_name, episode_label};
 
 /// How a song got into the queue.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Source {
     /// The listener asked for it.
     Added,
@@ -203,6 +206,58 @@ pub struct Queue {
     /// song, the queue alone says what is next.
     current: Option<ItemRef>,
     next_key: u64,
+    /// Read back after a reload: the playing song starting again is the
+    /// same song resuming, not a new start that reseeds its album.
+    restored: bool,
+}
+
+/// The tab's session-storage key the music queue is kept under.
+pub const QUEUE_KEY: &str = "pharos.queue";
+
+/// The saved form's version; a record of another version is not read.
+const SAVED_VERSION: u32 = 1;
+
+/// What a reload keeps of a [`Queue`]. Item ids are their URL form.
+#[derive(Serialize, Deserialize)]
+struct Saved {
+    v: u32,
+    upcoming: Vec<SavedEntry>,
+    shuffled: bool,
+    unshuffled: Vec<u64>,
+    recent: Vec<String>,
+    behind: Vec<(String, Source)>,
+    current: Option<String>,
+    next_key: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+struct SavedEntry {
+    key: u64,
+    id: String,
+    name: String,
+    runtime_ms: u64,
+    source: Source,
+}
+
+/// Why a saved queue was not read back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RestoreError {
+    /// Not JSON of the saved shape: the reason.
+    Malformed(String),
+    /// Written by another version of the app.
+    Version(u32),
+    /// An item id that does not parse.
+    BadId(String),
+}
+
+impl std::fmt::Display for RestoreError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RestoreError::Malformed(e) => write!(f, "malformed: {e}"),
+            RestoreError::Version(v) => write!(f, "version {v}, expected {SAVED_VERSION}"),
+            RestoreError::BadId(id) => write!(f, "bad item id {id:?}"),
+        }
+    }
 }
 
 /// How many started songs the queue remembers.
@@ -345,6 +400,11 @@ impl Queue {
     /// added stays. `album_after` of `None` (its album could not be read)
     /// leaves the album part alone.
     pub fn started(&mut self, id: ItemRef, album_after: Option<&[Item]>, seed: u64) {
+        // After a reload the playing song starts again: the queue already
+        // holds what follows it, as the listener left it.
+        if std::mem::take(&mut self.restored) && self.current == Some(id) {
+            return;
+        }
         if self.recent.front() != Some(&id) {
             self.recent.push_front(id);
             self.recent.truncate(RECENT);
@@ -472,6 +532,92 @@ impl Queue {
 }
 
 impl Queue {
+    /// The queue as a reload reads it back with [`Queue::restore`]. The
+    /// transient step-back state is left out: a reload ends the step.
+    pub fn save(&self) -> String {
+        let saved = Saved {
+            v: SAVED_VERSION,
+            upcoming: self
+                .upcoming
+                .iter()
+                .map(|e| SavedEntry {
+                    key: e.key,
+                    id: e.id.to_string(),
+                    name: e.name.clone(),
+                    runtime_ms: e.runtime_ms,
+                    source: e.source,
+                })
+                .collect(),
+            shuffled: self.shuffled,
+            unshuffled: self.unshuffled.clone(),
+            recent: self.recent.iter().map(ToString::to_string).collect(),
+            behind: self
+                .behind
+                .iter()
+                .map(|(id, source)| (id.to_string(), *source))
+                .collect(),
+            current: self.current.map(|id| id.to_string()),
+            next_key: self.next_key,
+        };
+        // Strings, numbers and bools only: serialising cannot fail.
+        serde_json::to_string(&saved).unwrap_or_default()
+    }
+
+    /// A queue [`Queue::save`] wrote, marked as restored so the playing
+    /// song resuming does not count as a new start.
+    pub fn restore(text: &str) -> Result<Queue, RestoreError> {
+        let saved: Saved =
+            serde_json::from_str(text).map_err(|e| RestoreError::Malformed(e.to_string()))?;
+        if saved.v != SAVED_VERSION {
+            return Err(RestoreError::Version(saved.v));
+        }
+        let id = |s: &str| {
+            s.parse::<ItemRef>()
+                .map_err(|_| RestoreError::BadId(s.to_owned()))
+        };
+        let upcoming = saved
+            .upcoming
+            .into_iter()
+            .map(|e| {
+                Ok(Entry {
+                    key: e.key,
+                    id: id(&e.id)?,
+                    name: e.name,
+                    runtime_ms: e.runtime_ms,
+                    source: e.source,
+                })
+            })
+            .collect::<Result<Vec<_>, RestoreError>>()?;
+        let recent = saved
+            .recent
+            .iter()
+            .map(|s| id(s))
+            .collect::<Result<VecDeque<_>, _>>()?;
+        let behind = saved
+            .behind
+            .iter()
+            .map(|(s, source)| Ok((id(s)?, *source)))
+            .collect::<Result<VecDeque<_>, RestoreError>>()?;
+        let current = saved.current.as_deref().map(id).transpose()?;
+        // A key at or below one in use would make two rows one.
+        let top = upcoming.iter().map(|e| e.key).max().unwrap_or(0);
+        let mut queue = Queue {
+            upcoming,
+            shuffled: saved.shuffled,
+            unshuffled: saved.unshuffled,
+            recent,
+            behind,
+            current,
+            next_key: saved.next_key.max(top),
+            restored: true,
+            ..Queue::default()
+        };
+        queue.forget_gone();
+        Ok(queue)
+    }
+}
+
+impl Queue {
     /// Where a song that ended goes, by [`Queue::next_after`], and the log
     /// line that says which and why: `from=queue`, `from=album` (the queue
     /// had not heard of the song) or `from=none`.
@@ -570,6 +716,65 @@ mod tests {
 
     fn album(ids: &[u64]) -> Vec<Item> {
         ids.iter().copied().map(item).collect()
+    }
+
+    /// FR-704: a reload reads the queue back as the listener left it, and
+    /// the playing song resuming keeps it. Disarm check: without the
+    /// `restored` guard in `started`, the album part is reseeded and the
+    /// removed song comes back.
+    #[test]
+    fn the_queue_survives_a_reload_as_left() {
+        let mut q = Queue::default();
+        q.started(ItemRef::Real(1), Some(&album(&[2, 3, 4])), 0);
+        q.add(vec![track(9)]);
+        let three = q.upcoming()[1].key;
+        q.apply(QueueAction::Remove(three), 0);
+        q.apply(QueueAction::Shuffle(true), 7);
+        let shuffled = ids(&q);
+
+        let mut back = Queue::restore(&q.save()).unwrap();
+        assert_eq!(ids(&back), shuffled);
+        assert!(back.shuffled());
+        // The playing song starts again after the reload.
+        back.started(ItemRef::Real(1), Some(&album(&[2, 3, 4])), 0);
+        assert_eq!(ids(&back), shuffled, "the removed song stays removed");
+        // Shuffle off brings back the order from before it.
+        back.apply(QueueAction::Shuffle(false), 0);
+        assert_eq!(ids(&back), [2, 4, 9]);
+        // A later song is a new start, as before the reload.
+        back.started(ItemRef::Real(20), Some(&album(&[21])), 0);
+        assert_eq!(ids(&back), [9, 21]);
+    }
+
+    #[test]
+    fn a_restored_queue_steps_back_and_adds_rows_of_its_own() {
+        let mut q = Queue::default();
+        q.started(ItemRef::Real(1), Some(&album(&[2])), 0);
+        q.started(ItemRef::Real(2), Some(&album(&[])), 0);
+        let mut back = Queue::restore(&q.save()).unwrap();
+        back.started(ItemRef::Real(2), None, 0);
+        // Previous still knows the song before the reload.
+        assert_eq!(back.back(track(2)), Some(ItemRef::Real(1)));
+        back.add(vec![track(5), track(5)]);
+        let keys: HashSet<u64> = back.upcoming().iter().map(|e| e.key).collect();
+        assert_eq!(
+            keys.len(),
+            back.upcoming().len(),
+            "every row keeps its own key"
+        );
+    }
+
+    #[test]
+    fn a_saved_queue_another_version_wrote_or_a_broken_one_is_not_read() {
+        let saved = Queue::default().save();
+        let other = saved.replace("\"v\":1", "\"v\":2");
+        assert_eq!(Queue::restore(&other), Err(RestoreError::Version(2)));
+        assert!(matches!(
+            Queue::restore("{"),
+            Err(RestoreError::Malformed(_))
+        ));
+        let bad = saved.replace("\"current\":null", "\"current\":\"x1\"");
+        assert_eq!(Queue::restore(&bad), Err(RestoreError::BadId("x1".into())));
     }
 
     #[test]
