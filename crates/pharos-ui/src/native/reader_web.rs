@@ -296,6 +296,9 @@ impl Saver {
     fn send(&self, locator: &str, fraction: f32, read_at_ms: i64, forced: bool) {
         let key = save_key(locator, fraction);
         let now = platform::now_ms();
+        // While a save is queued the server is out of reach and a save costs
+        // one local write, so the newest place is kept at every turn.
+        let forced = forced || load_pending().contains(self.id);
         if !self.gate.borrow().due(&key, now, forced) {
             return;
         }
