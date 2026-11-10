@@ -4871,27 +4871,27 @@ mod tests {
         }
     }
 
-    fn flash_show() -> ShowDetail {
+    fn remake_show() -> ShowDetail {
         ShowDetail {
-            series_key: "/tv/Flash".into(),
+            series_key: "/tv/Show A".into(),
             series_id: "000000000000002a000000000000002a".into(),
-            folder: "/tv/Flash".into(),
-            name: "The Flash".into(),
+            folder: "/tv/Show A".into(),
+            name: "Show A".into(),
             current_match: Some(crate::client::ShowMatch {
                 provider: Some("tvdb".into()),
-                external_id: Some("78650".into()),
+                external_id: Some("900091".into()),
                 source: Some("search".into()),
                 premiere_date: Some(1_100_000_000),
             }),
             episodes: vec![
                 crate::client::ShowEpisode {
                     id: 11,
-                    path: "/tv/Flash/S01E01.mkv".into(),
+                    path: "/tv/Show A/S01E01.mkv".into(),
                     ..Default::default()
                 },
                 crate::client::ShowEpisode {
                     id: 12,
-                    path: "/tv/Flash/S01E02.mkv".into(),
+                    path: "/tv/Show A/S01E02.mkv".into(),
                     ..Default::default()
                 },
             ],
@@ -4919,11 +4919,11 @@ mod tests {
 
     #[test]
     fn a_focused_show_gets_a_this_show_card_with_its_match_files_and_rebuild() {
-        let html = render_focus(IdentityFocus::Show(flash_show()));
+        let html = render_focus(IdentityFocus::Show(remake_show()));
         for want in [
             "This show",
-            "The Flash",
-            "Matched to tvdb 78650 (search)",
+            "Show A",
+            "Matched to tvdb 900091 (search)",
             "2 episodes",
             "Pick the show",
             "S01E02.mkv",
@@ -4940,9 +4940,9 @@ mod tests {
 
     #[test]
     fn rebuild_asks_for_the_ids_of_the_ticked_paths_only() {
-        let show = flash_show();
+        let show = remake_show();
         assert_eq!(rebuild_ids(&show, &[]), Vec::<u64>::new());
-        assert_eq!(rebuild_ids(&show, &["/tv/Flash/S01E02.mkv".into()]), [12]);
+        assert_eq!(rebuild_ids(&show, &["/tv/Show A/S01E02.mkv".into()]), [12]);
         assert_eq!(
             rebuild_ids(&show, &["/elsewhere.mkv".into()]),
             Vec::<u64>::new()
@@ -4953,7 +4953,7 @@ mod tests {
     fn a_show_with_no_stored_record_says_so() {
         let show = ShowDetail {
             current_match: None,
-            ..flash_show()
+            ..remake_show()
         };
         assert_eq!(show_match_facts(&show), "No match stored yet.");
     }
