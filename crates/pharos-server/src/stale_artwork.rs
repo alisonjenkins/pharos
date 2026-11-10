@@ -12,8 +12,8 @@
 //! it.
 //!
 //! The sweep reads every servable artwork row and checks its file. For a dead
-//! `local` row it relinks to a same-named file in the item's folder or one of
-//! its three nearest ancestors, when one exists. Otherwise it drops the row and
+//! `local` row it relinks to a same-named file in the item's folder (and, for
+//! an episode, the folder above it), when one exists. Otherwise it drops the row and
 //! re-admits the item for online art, unless the match is `manual`. Provider
 //! cached rows (tmdb, tvdb, musicbrainz) have no sibling, so they are only ever
 //! dropped. A row is only judged dead on a definite "not found", and only
@@ -38,9 +38,10 @@ use crate::state::Stores;
 
 /// Rows read per page. Each page takes one background-IO permit.
 const PAGE: i64 = 500;
-/// How far above the media file a same-named sidecar is looked for: the
-/// item's folder, then its parent, then its grandparent.
-const ANCESTORS: usize = 3;
+/// How far above an episode's media file a same-named sidecar is looked for:
+/// its folder and the one above (season, then show; or show, for a show
+/// without season folders). Never higher: that is the library root.
+const ANCESTORS: usize = 2;
 /// Delay before the first pass after boot, so startup I/O settles first.
 const FIRST_PASS: Duration = Duration::from_secs(5 * 60);
 /// Interval between passes once one has run.
@@ -160,22 +161,32 @@ async fn repair_row<S: MediaStore>(
     if !matches!(tokio::fs::try_exists(&row.locator).await, Ok(false)) {
         return Ok(None);
     }
-    let Ok(item) = store.get(row.item_id).await else {
-        tracing::info!(
-            media.id = row.item_id,
-            role = %row.role,
-            source = %row.source,
-            locator = %row.locator,
-            outcome = Outcome::Orphan.label(),
-            "stale artwork row: its item is gone"
-        );
-        metrics::counter!(
-            "pharos_artwork_stale_total",
-            "role" => row.role.clone(),
-            "outcome" => Outcome::Orphan.label()
-        )
-        .increment(1);
-        return Ok(Some(Outcome::Orphan));
+    let item = match store.get(row.item_id).await {
+        Ok(item) => item,
+        // A store hiccup is not evidence the item is gone: leave the row.
+        Err(e) if !matches!(e, pharos_core::DomainError::NotFound(_)) => return Err(e),
+        Err(_) => {
+            if repair {
+                store
+                    .remove_dead_artwork(row.item_id, &row.role, false)
+                    .await?;
+            }
+            tracing::info!(
+                media.id = row.item_id,
+                role = %row.role,
+                source = %row.source,
+                locator = %row.locator,
+                outcome = Outcome::Orphan.label(),
+                "stale artwork row: its item is gone"
+            );
+            metrics::counter!(
+                "pharos_artwork_stale_total",
+                "role" => row.role.clone(),
+                "outcome" => Outcome::Orphan.label()
+            )
+            .increment(1);
+            return Ok(Some(Outcome::Orphan));
+        }
     };
     // Only a local sidecar has a sibling to relink to. A provider-cached file
     // lives in the cache, not beside the media.
@@ -200,7 +211,7 @@ async fn repair_row<S: MediaStore>(
         return Ok(Some(Outcome::Unreachable));
     }
     let sibling = if row.source.eq_ignore_ascii_case("local") {
-        find_sibling(&item.path, &row.locator).await
+        find_sibling(&item.path, &row.locator, ancestors_for(item.kind)).await
     } else {
         None
     };
@@ -241,9 +252,20 @@ async fn repair_row<S: MediaStore>(
 /// The first regular file named like `locator`'s basename in the media file's
 /// folder or one of its [`ANCESTORS`] nearest ancestors. The folder itself is
 /// tried first.
-async fn find_sibling(media: &Path, locator: &str) -> Option<PathBuf> {
+/// How many folders above the media file belong to this item alone. A film
+/// owns its folder only; an episode also owns its season and show folders.
+/// Anything higher is a library root or a collection folder, whose art is not
+/// this item's.
+fn ancestors_for(kind: pharos_core::MediaKind) -> usize {
+    match kind {
+        pharos_core::MediaKind::Episode => ANCESTORS,
+        _ => 1,
+    }
+}
+
+async fn find_sibling(media: &Path, locator: &str, ancestors: usize) -> Option<PathBuf> {
     let name = Path::new(locator).file_name()?;
-    for dir in media.ancestors().skip(1).take(ANCESTORS) {
+    for dir in media.ancestors().skip(1).take(ancestors) {
         let candidate = dir.join(name);
         if tokio::fs::metadata(&candidate)
             .await
@@ -282,6 +304,9 @@ pub fn spawn(
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "stale artwork sweep: pass aborted");
+                    // Pages before the failure may have repaired rows; drop the
+                    // synth-image memo anyway rather than track what landed.
+                    artwork_epoch.fetch_add(1, Ordering::Relaxed);
                 }
             }
             tokio::time::sleep(PASS_EVERY).await;
@@ -533,5 +558,43 @@ mod tests {
         );
         assert!(stores.get(id).await.unwrap().has_primary_art);
         assert!(due(&stores).await.is_empty(), "not re-admitted");
+    }
+
+    #[tokio::test]
+    async fn a_film_never_takes_its_library_roots_art() {
+        // A same-named file one level above a film's folder belongs to the
+        // library or a collection, not to this film.
+        let dir = tempfile::tempdir().unwrap();
+        let (stores, id, folder) = library(dir.path()).await;
+        touch(&dir.path().join("folder.jpg"));
+        stores
+            .set_artwork(
+                id,
+                "Primary",
+                "local",
+                &folder.join("folder.jpg").to_string_lossy(),
+            )
+            .await
+            .unwrap();
+
+        let report = run_pass(&stores, &bg(), true).await.unwrap();
+
+        assert_eq!(report.relinked, 0, "{report:?}");
+        assert_eq!(report.dropped, 1, "{report:?}");
+    }
+
+    #[tokio::test]
+    async fn an_orphan_row_is_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (stores, _, _) = library(dir.path()).await;
+        stores
+            .set_artwork(99, "Backdrop", "local", "/gone/backdrop.jpg")
+            .await
+            .unwrap();
+
+        let report = run_pass(&stores, &bg(), true).await.unwrap();
+
+        assert_eq!(report.orphan, 1, "{report:?}");
+        assert!(stores.artwork_for(99).await.unwrap().is_empty());
     }
 }
