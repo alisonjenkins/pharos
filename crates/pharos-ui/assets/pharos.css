@@ -2766,6 +2766,8 @@ body:has(.pharos-stage.is-full .pharos-stage-slot:not([inert]) .pharos-connectio
 }
 .pharos-up-next-pill button {
   flex: none;
+  min-width: 44px;
+  min-height: 44px; /* a touch target (WCAG 2.5.5) */
   padding: 0.3rem 0.75rem;
   border: 1px solid rgb(255 255 255 / 0.6); /* not themed: controls sit on the video, whose colours no theme sets */
   border-radius: 999px;
@@ -5235,7 +5237,9 @@ body:has(.pharos-stage.is-mini) .pharos-main {
   font-size: 0.85em;
 }
 .pharos-stage-next-cancel {
-  padding: 0;
+  min-width: 44px;
+  min-height: 44px; /* a touch target (WCAG 2.5.5) */
+  padding: 0 0.5rem;
   border: 0;
   background: none;
   color: var(--px-color-accent);
