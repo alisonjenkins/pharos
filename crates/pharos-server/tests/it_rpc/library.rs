@@ -3554,3 +3554,147 @@ async fn descriptions_follow_the_users_language() {
         .map(serde_json::Value::from)
     );
 }
+
+/// One `Library.query` on `parent`, name-ordered, with `collapseCollections`.
+async fn folded_query(
+    session: &session::Client,
+    parent: &str,
+    start: u32,
+    limit: u32,
+) -> (u32, Vec<serde_json::Value>) {
+    use pharos_jellyfin_api::dto::WireId;
+    let library = session.library_request().send().pipeline.get_library();
+    let mut req = library.query_request();
+    req.get().init_ctx();
+    let mut q = req.get().init_q();
+    match WireId::parse(parent).expect("parent is a wire id") {
+        WireId::Real(n) => q.reborrow().init_parent_id().set_real(n),
+        WireId::Synth(n) => q.reborrow().init_parent_id().set_synth(n),
+    }
+    q.set_sort_by("SortName");
+    q.set_collapse_collections(true);
+    q.set_start(start);
+    q.set_limit(limit);
+    let reply = req.send().promise.await.expect("query");
+    summaries(reply.get().unwrap().get_result().unwrap())
+}
+
+/// B1086, V1044: with `collapseCollections` a listing shows each box set as
+/// one tile, where its first film stood, once the listing holds two or more
+/// of its films; a lone member stays a film. The total, the pages and the
+/// letter index count tiles, the tile opens on the set's films, and each
+/// folded listing counts under `pharos_collection_fold_total{outcome}`.
+/// Disarm check: with `fold_into_collections` folding nothing, the tile is
+/// missing and "Delta" is listed.
+#[actix_web::test]
+async fn a_listing_folds_the_films_of_a_box_set_into_one_tile() {
+    use pharos_core::{
+        CollectionStore as _, LibraryStore as _, MediaItem, MediaKind, MediaStore as _,
+    };
+
+    let fx = crate::common::seed_rich().await;
+    seed_movies(&fx).await;
+    for (id, title) in [(103, "Delta"), (104, "Epsilon")] {
+        fx.state
+            .stores
+            .put(MediaItem {
+                id,
+                path: format!("/libA/{title}.mkv").into(),
+                title: title.into(),
+                kind: MediaKind::Movie,
+                ..MediaItem::default()
+            })
+            .await
+            .unwrap();
+    }
+    fx.state.stores.backfill_library_ids().await.unwrap();
+    let set = fx
+        .state
+        .stores
+        .create_collection("Set One", &[103, 101])
+        .await
+        .unwrap();
+    // Gamma is in the other library, so this listing holds one film of it.
+    fx.state
+        .stores
+        .create_collection("Lone Set", &[104, 201])
+        .await
+        .unwrap();
+    let recorder = metrics_util::debugging::DebuggingRecorder::new();
+    let snapshotter = pharos_test_metrics::snapshotter(&recorder);
+    let _metrics = metrics::set_default_local_recorder(&recorder);
+    let lib_a = fx.lib_a_wire.clone();
+    let names = |items: &[serde_json::Value]| -> Vec<String> {
+        items
+            .iter()
+            .map(|i| i["Name"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let client = crate::telemetry::connect(&fx);
+            let session = crate::telemetry::session_for(&client, &fx.user_token).await;
+            let (total, items) = folded_query(&session, &lib_a, 0, 0).await;
+            assert_eq!(names(&items), ["Set One", "Beta", "Epsilon", "Rich Movie"]);
+            assert_eq!(total, 4);
+            assert_eq!(items[0]["Id"], set.wire_id.as_str());
+            let (total, page) = folded_query(&session, &lib_a, 1, 1).await;
+            assert_eq!((total, names(&page)), (4, vec!["Beta".to_owned()]));
+            let (_, plain) = wire_query(
+                &session,
+                Some(&lib_a),
+                &[],
+                "SortName",
+                false,
+                "",
+                &[],
+                0,
+                0,
+            )
+            .await;
+            assert_eq!(
+                names(&plain),
+                ["Alpha", "Beta", "Delta", "Epsilon", "Rich Movie"]
+            );
+            let (_, opened) = wire_query(
+                &session,
+                Some(&set.wire_id),
+                &[],
+                "SortName",
+                false,
+                "",
+                &[],
+                0,
+                0,
+            )
+            .await;
+            // A set lists its films in the set's own order.
+            assert_eq!(names(&opened), ["Delta", "Alpha"]);
+        })
+        .await;
+    let user = pharos_server::services::auth::user_for_token(&fx.state.stores, &fx.user_token)
+        .await
+        .unwrap();
+    let q = library::ItemQuery {
+        sort_by: Some("SortName".into()),
+        collapse_collections: true,
+        ..library::ItemQuery::default()
+    };
+    let index = library::index(&fx.state, &user, Some(&lib_a), None, &q)
+        .await
+        .unwrap();
+    let letters: Vec<(&str, u32)> = index
+        .letters
+        .iter()
+        .map(|(l, s)| (l.as_str(), *s))
+        .collect();
+    assert_eq!(letters, [("A", 0), ("B", 1), ("E", 2), ("R", 3)]);
+    assert_eq!(
+        crate::telemetry::counter(
+            &snapshotter,
+            "pharos_collection_fold_total",
+            &[("outcome", "ok")],
+        ),
+        2
+    );
+}
