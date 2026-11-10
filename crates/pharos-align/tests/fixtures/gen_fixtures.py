@@ -221,7 +221,7 @@ def line_fixture() -> list[dict]:
         case = {"tokens": tokens, "lead_star": lead_star, "n_samples": n_samples, "frames": frames}
         case["grid"] = [int(round(-v * GRID)) for v in e.flatten().tolist()]
         try:
-            case["ms"] = a._align_loaded(b"\0" * (4 * n_samples), tokens, lead_star)
+            case["ms"], _ = a._align_loaded(b"\0" * (4 * n_samples), tokens, lead_star)
         except (RuntimeError, ValueError) as err:
             case["error"] = str(err).splitlines()[0]
         cases.append(case)
