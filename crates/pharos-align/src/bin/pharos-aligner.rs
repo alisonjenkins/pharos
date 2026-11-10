@@ -125,6 +125,7 @@ async fn run(config: Config, (plan, pin_err): (pin::Plan, Option<String>)) -> Re
         Ok(Box::new(CpuAligner {
             model,
             batch_samples,
+            reason: "forced_cpu".into(),
         }) as Box<dyn Model>)
     });
     let engine = Arc::new(Engine::new(loader, decoder, config.idle_unload));
