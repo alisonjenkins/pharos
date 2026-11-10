@@ -3728,6 +3728,7 @@ fn SeenTitle(
     let seen = use_group_seen(vec![detail.item.id]);
     let in_group = (use_context::<Together>().view)().active;
     let PlayFromStart(on_play_from_start) = use_context::<PlayFromStart>();
+    let detail_for_keep = detail.clone();
     rsx! {
         TitleView {
             detail,
@@ -3738,8 +3739,28 @@ fn SeenTitle(
             tracks,
             version,
             on_version,
+            keep: keep_control(&detail_for_keep),
         }
     }
+}
+
+/// Keep offline for a readable book. The cache is the browser's, so the
+/// other builds have none.
+#[cfg(all(feature = "web", target_arch = "wasm32"))]
+fn keep_control(detail: &Detail) -> Option<Element> {
+    let format = detail.book.as_ref()?.format;
+    Some(rsx! {
+        super::kept_web::KeepButton {
+            id: detail.item.id,
+            title: super::views::display_name(&detail.item),
+            format,
+        }
+    })
+}
+
+#[cfg(not(all(feature = "web", target_arch = "wasm32")))]
+fn keep_control(_detail: &Detail) -> Option<Element> {
+    None
 }
 
 #[component]

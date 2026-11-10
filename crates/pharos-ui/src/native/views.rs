@@ -1137,6 +1137,9 @@ pub fn TitleView(
     /// Hears a new pick from the Version select.
     #[props(default)]
     on_version: Option<EventHandler<String>>,
+    /// Keep offline / Remove from device, for a book (browser only).
+    #[props(default)]
+    keep: Option<Element>,
 ) -> Element {
     use_ends_at_refresh();
     use_key_mode(Mode::Detail);
@@ -1237,6 +1240,9 @@ pub fn TitleView(
                             href: reader::download_href(item.id),
                             download: "",
                             "Download"
+                        }
+                        if let Some(keep) = keep.clone() {
+                            {keep}
                         }
                     }
                     if item.kind.playable() && resume {

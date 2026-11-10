@@ -1,0 +1,376 @@
+//! Books kept on this device, in the browser (spec 036 FR-004 to FR-006,
+//! ADR-0110): Cache Storage holds the bytes under `pharos-books-<user>`,
+//! one small `localStorage` value records what is kept (`kept.rs`).
+//!
+//! The page talks to Cache Storage itself; the service worker never serves
+//! a book (V1133), so a book is only ever read by the signed-in page.
+//!
+//! Cost model, for TVs and headsets: nothing runs at start-up but the one
+//! `localStorage` read the offline start and the title page make, and a TV
+//! with no kept book finds no value. The bytes are streamed into the cache
+//! by the browser, never copied through wasm memory.
+
+use std::cell::Cell;
+
+use dioxus::prelude::*;
+use pharos_client::api::{BookFormat, ItemRef};
+use wasm_bindgen::{JsCast as _, JsValue};
+use wasm_bindgen_futures::JsFuture;
+
+use super::app::{call, this_device, Ctx};
+use super::kept::{
+    book_key, cache_name, is_books_cache, keep_refusal, KeptBook, KeptFormat, KeptStore, Reason,
+    STORE_KEY,
+};
+use super::kept_view::KeepControl;
+use super::platform;
+use super::reader::size_cap;
+
+/// The PDF module's files beside the loader (`flake.nix` installs them under
+/// `assets/pdf`). The service worker stores a GET of any of them (ADR-0110).
+const PDF_MODULE: [&str; 3] = [
+    "/ui/assets/pdf/loader.js",
+    "/ui/assets/pdf/quire_pdf.js",
+    "/ui/assets/pdf/quire_pdf_bg.wasm",
+];
+
+thread_local! {
+    static PERSIST_ASKED: Cell<bool> = const { Cell::new(false) };
+}
+
+fn describe(e: &JsValue) -> String {
+    e.as_string()
+        .or_else(|| {
+            e.dyn_ref::<js_sys::Error>()
+                .map(|e| String::from(e.message()))
+        })
+        .unwrap_or_else(|| format!("{e:?}"))
+}
+
+fn local_storage() -> Result<web_sys::Storage, String> {
+    web_sys::window()
+        .ok_or("no window")?
+        .local_storage()
+        .map_err(|e| describe(&e))?
+        .ok_or_else(|| "localStorage is unavailable".to_owned())
+}
+
+/// The record of kept books, or `None` when nothing is kept (or the record
+/// cannot be read, which is logged).
+pub fn read() -> Option<KeptStore> {
+    let text = match local_storage().and_then(|s| s.get_item(STORE_KEY).map_err(|e| describe(&e))) {
+        Ok(Some(text)) => text,
+        Ok(None) => return None,
+        Err(e) => {
+            platform::warn(&format!("pharos: kept record unreadable error={e}"));
+            return None;
+        }
+    };
+    match KeptStore::parse(&text) {
+        Ok(store) => store,
+        Err(e) => {
+            platform::warn(&format!("pharos: kept record damaged error={e}"));
+            None
+        }
+    }
+}
+
+fn write(store: &KeptStore) {
+    let result = local_storage().and_then(|s| {
+        match store.to_text() {
+            Some(text) => s.set_item(STORE_KEY, &text),
+            None => s.remove_item(STORE_KEY),
+        }
+        .map_err(|e| describe(&e))
+    });
+    if let Err(e) = result {
+        platform::warn(&format!("pharos: kept record not saved error={e}"));
+    }
+}
+
+fn caches() -> Result<web_sys::CacheStorage, String> {
+    web_sys::window()
+        .ok_or("no window")?
+        .caches()
+        .map_err(|e| format!("Cache Storage is unavailable: {}", describe(&e)))
+}
+
+async fn open_cache(user: &str) -> Result<web_sys::Cache, String> {
+    let cache = JsFuture::from(caches()?.open(&cache_name(user)))
+        .await
+        .map_err(|e| describe(&e))?;
+    cache.dyn_into().map_err(|e| describe(&e))
+}
+
+/// Asks the browser not to evict what is kept, once per page, and logs the
+/// answer.
+fn request_persist() {
+    if PERSIST_ASKED.replace(true) {
+        return;
+    }
+    let Some(window) = web_sys::window() else {
+        return;
+    };
+    let Ok(promise) = window.navigator().storage().persist() else {
+        platform::info("pharos: kept persist unavailable");
+        return;
+    };
+    platform::spawn_detached(async move {
+        match JsFuture::from(promise).await {
+            Ok(v) => platform::info(&format!(
+                "pharos: kept persist granted={}",
+                v.as_bool().unwrap_or(false)
+            )),
+            Err(e) => platform::warn(&format!(
+                "pharos: kept persist failed error={}",
+                describe(&e)
+            )),
+        }
+    });
+}
+
+async fn blob_size(response: &web_sys::Response) -> Result<u64, String> {
+    let promise = response.blob().map_err(|e| describe(&e))?;
+    let blob: web_sys::Blob = JsFuture::from(promise)
+        .await
+        .map_err(|e| describe(&e))?
+        .dyn_into()
+        .map_err(|e| describe(&e))?;
+    Ok(blob.size() as u64)
+}
+
+async fn fetch(url: &str) -> Result<web_sys::Response, String> {
+    let window = web_sys::window().ok_or("no window")?;
+    let response: web_sys::Response = JsFuture::from(window.fetch_with_str(url))
+        .await
+        .map_err(|e| format!("The download failed: {}", describe(&e)))?
+        .dyn_into()
+        .map_err(|e| describe(&e))?;
+    if !response.ok() {
+        return Err(format!(
+            "The server answered {} {}.",
+            response.status(),
+            response.status_text()
+        ));
+    }
+    Ok(response)
+}
+
+/// Fetches the PDF module's files so the service worker stores them. Only a
+/// page the worker controls can have them stored; a failure is logged and
+/// the book is still kept (it opens once the module has been fetched online).
+async fn ensure_pdf_module() {
+    let controlled = web_sys::window()
+        .map(|w| w.navigator().service_worker())
+        .is_some_and(|c| c.controller().is_some());
+    if !controlled {
+        platform::warn("pharos: kept pdf module not stored: no service worker controls this page");
+        return;
+    }
+    for url in PDF_MODULE {
+        if let Err(e) = fetch(url).await {
+            platform::warn(&format!(
+                "pharos: kept pdf module fetch failed url={url} error={e}"
+            ));
+            return;
+        }
+    }
+    platform::info("pharos: kept pdf module fetched");
+}
+
+/// Stores a book on this device. The download goes straight into the cache;
+/// a book over the weak-device cap is refused, before the body when the
+/// server states its size and after it otherwise.
+pub async fn keep(
+    id: ItemRef,
+    title: &str,
+    format: KeptFormat,
+    user: &str,
+) -> Result<KeptBook, String> {
+    let mut store = match read() {
+        Some(store) if store.is_for(user) => store,
+        Some(_) => {
+            clear_all("another user").await;
+            KeptStore::new(user)
+        }
+        None => KeptStore::new(user),
+    };
+    let cap = size_cap(this_device(), &platform::user_agent());
+    let key = book_key(id);
+    let response = fetch(&key).await?;
+    let stated = response
+        .headers()
+        .get("content-length")
+        .ok()
+        .flatten()
+        .and_then(|v| v.trim().parse::<u64>().ok());
+    if let Some(line) = stated.and_then(|bytes| keep_refusal(bytes, cap)) {
+        platform::warn(&format!(
+            "pharos: kept refused item={id} bytes={} cap={cap:?}",
+            stated.unwrap_or(0)
+        ));
+        return Err(line);
+    }
+    let cache = open_cache(user).await?;
+    JsFuture::from(cache.put_with_str(&key, &response))
+        .await
+        .map_err(|e| format!("The book could not be stored: {}", describe(&e)))?;
+    let stored = JsFuture::from(cache.match_with_str(&key))
+        .await
+        .map_err(|e| describe(&e))?;
+    let stored: web_sys::Response = stored
+        .dyn_into()
+        .map_err(|_| "The book was not stored.".to_owned())?;
+    let bytes = blob_size(&stored).await?;
+    if let Some(line) = keep_refusal(bytes, cap) {
+        // The server did not state a size: the stored copy is what shows it.
+        let _ = JsFuture::from(cache.delete_with_str(&key)).await;
+        platform::warn(&format!(
+            "pharos: kept refused item={id} bytes={bytes} cap={cap:?}"
+        ));
+        return Err(line);
+    }
+    if format == KeptFormat::Pdf {
+        ensure_pdf_module().await;
+    }
+    let book = KeptBook {
+        id: id.to_string(),
+        title: title.to_owned(),
+        format,
+        bytes,
+        kept_at: String::from(js_sys::Date::new_0().to_iso_string()),
+        reason: Reason::Hand,
+        locator: None,
+        fraction: 0.0,
+        read_at_ms: 0,
+    };
+    store.keep(book.clone());
+    write(&store);
+    request_persist();
+    platform::info(&format!(
+        "pharos: kept item={id} bytes={bytes} format={} reason=hand total_bytes={}",
+        format.label(),
+        store.total_bytes()
+    ));
+    Ok(book)
+}
+
+/// Removes a kept book from the device: its bytes and its record.
+pub async fn remove(id: &str) -> Result<(), String> {
+    let Some(mut store) = read() else {
+        return Ok(());
+    };
+    let Some(book) = store.find(id).cloned() else {
+        return Ok(());
+    };
+    if let Some(item) = book.item() {
+        let cache = open_cache(&store.user).await?;
+        JsFuture::from(cache.delete_with_str(&book_key(item)))
+            .await
+            .map_err(|e| format!("The book could not be removed: {}", describe(&e)))?;
+    }
+    store.remove(id);
+    let user = store.user.clone();
+    write(&store);
+    if store.books.is_empty() {
+        // Nothing left: the cache goes too, so an empty one is not kept.
+        let _ = JsFuture::from(caches()?.delete(&cache_name(&user))).await;
+    }
+    platform::info(&format!(
+        "pharos: kept removed item={id} bytes={} total_bytes={}",
+        book.bytes,
+        store.total_bytes()
+    ));
+    Ok(())
+}
+
+/// Deletes every cache of kept books, whoever's, and the record: sign-out
+/// (FR-005), or books found to be another user's.
+pub async fn clear_all(why: &str) {
+    let (books, bytes) = read().map_or((0, 0), |s| (s.books.len(), s.total_bytes()));
+    let mut caches_deleted = 0_u32;
+    match caches() {
+        Ok(storage) => match JsFuture::from(storage.keys()).await {
+            Ok(names) => {
+                for name in js_sys::Array::from(&names)
+                    .iter()
+                    .filter_map(|n| n.as_string())
+                    .filter(|n| is_books_cache(n))
+                {
+                    match JsFuture::from(storage.delete(&name)).await {
+                        Ok(_) => caches_deleted = caches_deleted.saturating_add(1),
+                        Err(e) => platform::warn(&format!(
+                            "pharos: kept cache not deleted name={name} error={}",
+                            describe(&e)
+                        )),
+                    }
+                }
+            }
+            Err(e) => platform::warn(&format!(
+                "pharos: kept caches unlisted error={}",
+                describe(&e)
+            )),
+        },
+        Err(e) => platform::warn(&format!("pharos: kept clear error={e}")),
+    }
+    if let Err(e) = local_storage().and_then(|s| s.remove_item(STORE_KEY).map_err(|e| describe(&e)))
+    {
+        platform::warn(&format!("pharos: kept record not removed error={e}"));
+    }
+    platform::info(&format!(
+        "pharos: kept cleared why={why} books={books} bytes={bytes} caches={caches_deleted}"
+    ));
+}
+
+/// Keep offline / Remove from device on a book's title page.
+#[component]
+pub fn KeepButton(id: ItemRef, title: String, format: BookFormat) -> Element {
+    let ctx = use_context::<Ctx>();
+    let Some(kept_format) = KeptFormat::of(format) else {
+        return rsx! {};
+    };
+    let mut kept = use_signal(move || read().is_some_and(|s| s.find(&id.to_string()).is_some()));
+    let mut busy = use_signal(|| false);
+    let mut message = use_signal(|| None::<String>);
+    rsx! {
+        KeepControl {
+            kept: kept(),
+            busy: busy(),
+            message: message(),
+            on_keep: move |()| {
+                let Some(api) = ctx.api.peek().clone() else {
+                    message.set(Some("Connect to the server to keep this book.".into()));
+                    return;
+                };
+                let title = title.clone();
+                busy.set(true);
+                message.set(None);
+                spawn(async move {
+                    let outcome = match api.me(&call("title", "keep")).await {
+                        Ok(me) => keep(id, &title, kept_format, &me.id).await,
+                        Err(e) => Err(format!("Could not tell who is signed in: {e}")),
+                    };
+                    match outcome {
+                        Ok(_) => kept.set(true),
+                        Err(line) => {
+                            platform::warn(&format!("pharos: keep failed item={id} error={line}"));
+                            message.set(Some(line));
+                        }
+                    }
+                    busy.set(false);
+                });
+            },
+            on_remove: move |()| {
+                busy.set(true);
+                message.set(None);
+                spawn(async move {
+                    match remove(&id.to_string()).await {
+                        Ok(()) => kept.set(false),
+                        Err(line) => message.set(Some(line)),
+                    }
+                    busy.set(false);
+                });
+            },
+        }
+    }
+}
