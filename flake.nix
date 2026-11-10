@@ -761,6 +761,10 @@
           dependencies = [
             pkgs.python3Packages.torch
             pkgs.python3Packages.torchaudio
+            # ADR-0105: spans to Tempo over OTLP/gRPC.
+            pkgs.python3Packages.opentelemetry-api
+            pkgs.python3Packages.opentelemetry-sdk
+            pkgs.python3Packages.opentelemetry-exporter-otlp-proto-grpc
           ];
           nativeCheckInputs = [ pkgs.python3Packages.pytestCheckHook ];
           makeWrapperArgs = [
