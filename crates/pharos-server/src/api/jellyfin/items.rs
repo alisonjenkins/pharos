@@ -6305,9 +6305,13 @@ pub(crate) async fn virtual_shows_page(
         .filter(|_| matches!(mode, ShowFolderKind::Series));
     let want_played = wanted.and_then(|f| f.is_played);
     let want_favorite = wanted.and_then(|f| f.is_favorite);
+    // `IsResumable` on a series tile: started (an episode played or part
+    // watched) and not finished (some episode unplayed), B1199/V1159.
+    let want_started = wanted.is_some_and(|f| f.is_resumable);
     let mut unplayed_series: HashSet<String> = HashSet::new();
     let mut unfavoured_series: HashSet<String> = HashSet::new();
-    if want_played.is_some() || want_favorite.is_some() {
+    let mut started_series: HashSet<String> = HashSet::new();
+    if want_played.is_some() || want_favorite.is_some() || want_started {
         let ids: Vec<u64> = episodes.iter().map(|e| e.id).collect();
         let user_data = state
             .stores
@@ -6324,6 +6328,9 @@ pub(crate) async fn virtual_shows_page(
             }
             if !ud.is_favorite {
                 unfavoured_series.insert(key());
+            }
+            if ud.played || ud.last_played_position_ticks > 0 {
+                started_series.insert(key());
             }
         }
     }
@@ -6385,6 +6392,11 @@ pub(crate) async fn virtual_shows_page(
                     continue;
                 }
                 if want_favorite.is_some_and(|want| want == unfavoured_series.contains(&skey)) {
+                    continue;
+                }
+                if want_started
+                    && !(started_series.contains(&skey) && unplayed_series.contains(&skey))
+                {
                     continue;
                 }
                 let meta = meta_map.get(series.series_key());
