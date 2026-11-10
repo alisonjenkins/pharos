@@ -460,7 +460,17 @@ pub async fn auto_keep(
     }
     // The record is read and written with no wait between, so a place noted
     // meanwhile is not lost.
-    let mut store = read().unwrap_or_else(|| KeptStore::new(user));
+    // An unreadable record is left alone: a fresh store would drop every
+    // book it still lists.
+    let mut store = match read_checked() {
+        Ok(store) => store.unwrap_or_else(|| KeptStore::new(user)),
+        Err(()) => {
+            platform::warn(&format!(
+                "pharos: kept auto failed item={id} bytes={size} error=record unreadable"
+            ));
+            return false;
+        }
+    };
     if store.find(&id.to_string()).is_some() {
         // Kept by hand meanwhile (another tab): that copy stands.
         return true;
