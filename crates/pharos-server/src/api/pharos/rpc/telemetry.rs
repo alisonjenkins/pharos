@@ -474,6 +474,7 @@ fn kind_label(kind: pharos_capnp::EventKind) -> &'static str {
         K::PlaybackResume => "playbackResume",
         K::PlaybackStart => "playbackStart",
         K::PlaybackSummary => "playbackSummary",
+        K::AutoplayRefused => "autoplayRefused",
     }
 }
 
@@ -495,7 +496,7 @@ mod tests {
 
     use super::*;
 
-    const ALL_KINDS: [K; 25] = [
+    const ALL_KINDS: [K; 26] = [
         K::Panic,
         K::JsError,
         K::RpcFailed,
@@ -521,6 +522,7 @@ mod tests {
         K::PlaybackResume,
         K::PlaybackStart,
         K::PlaybackSummary,
+        K::AutoplayRefused,
     ];
 
     /// Disarm check: a repeated label would merge two kinds' counts under

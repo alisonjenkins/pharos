@@ -129,6 +129,7 @@ pub fn kind_label(kind: ClientEventKind) -> &'static str {
         ClientEventKind::PlaybackResume => "playback_resume",
         ClientEventKind::PlaybackStart => "playback_start",
         ClientEventKind::PlaybackSummary => "playback_summary",
+        ClientEventKind::AutoplayRefused => "autoplay_refused",
     }
 }
 
@@ -731,6 +732,7 @@ mod tests {
             ClientEventKind::PlaybackResume,
             ClientEventKind::PlaybackStart,
             ClientEventKind::PlaybackSummary,
+            ClientEventKind::AutoplayRefused,
         ];
         let mut labels: Vec<_> = kinds.iter().map(|k| kind_label(*k)).collect();
         labels.sort_unstable();
