@@ -39,7 +39,7 @@ pub const REJOIN_AFTER_GONE_EVERY_MS: u32 = 30_000;
 /// What the viewer reads when the group this tab was in cannot be joined
 /// again (B807); the server's reason follows.
 pub fn rejoin_failure(reason: &str) -> String {
-    format!("Couldn't rejoin your group, so you're watching on your own. ({reason})")
+    format!("Couldn't rejoin your group ({reason})")
 }
 
 /// How taking a group seat back after a lost connection ended.
@@ -128,6 +128,9 @@ pub struct GroupView {
     pub item_changes: u64,
     /// What the group plays; `None` until it has said.
     pub item: Option<ItemRef>,
+    /// The other members the group is waiting on, by name: those buffering,
+    /// not counting this viewer, whose own player shows its wait.
+    pub waiting: Vec<String>,
 }
 
 impl GroupView {
@@ -646,7 +649,17 @@ impl GroupState {
             activity: self.activity,
             item_changes: self.item_changes,
             item: self.item,
+            waiting: if active { self.waiting() } else { Vec::new() },
         }
+    }
+
+    /// The members other than this viewer that are buffering, by name.
+    fn waiting(&self) -> Vec<String> {
+        self.members
+            .iter()
+            .filter(|m| m.buffering && m.id != self.me)
+            .map(|m| m.name.clone())
+            .collect()
     }
 }
 
@@ -2562,7 +2575,7 @@ mod tests {
         );
         assert_eq!(
             last.and_then(|v| v.ended).as_deref(),
-            Some("Couldn't rejoin your group, so you're watching on your own. (This group has ended)")
+            Some("Couldn't rejoin your group (This group has ended)")
         );
     }
 
@@ -4050,6 +4063,33 @@ mod tests {
             env,
             player,
         }
+    }
+
+    /// FR-502: the view names who the group waits on, never this viewer,
+    /// and empties once they are ready.
+    #[test]
+    fn the_view_names_the_other_members_the_group_waits_on() {
+        let mut state = GroupState::default();
+        let joined = GroupSummary {
+            members: vec![
+                member("me", false),
+                member("bo", false),
+                member("cy", false),
+            ],
+            you: "me".into(),
+            ..summary()
+        };
+        let _ = state.apply(GroupUpdate::Joined(joined), 0);
+        assert!(state.view(true).waiting.is_empty());
+        let _ = state.apply(GroupUpdate::Member(member("me", true)), 0);
+        assert!(state.view(true).waiting.is_empty(), "not this viewer");
+        let _ = state.apply(GroupUpdate::Member(member("bo", true)), 0);
+        let _ = state.apply(GroupUpdate::Member(member("cy", true)), 0);
+        assert_eq!(state.view(true).waiting, ["BO", "CY"]);
+        assert!(state.view(false).waiting.is_empty(), "out of the group");
+        let _ = state.apply(GroupUpdate::Member(member("bo", false)), 0);
+        let _ = state.apply(GroupUpdate::Member(member("cy", false)), 0);
+        assert!(state.view(true).waiting.is_empty());
     }
 
     #[test]
