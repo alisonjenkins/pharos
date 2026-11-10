@@ -867,8 +867,8 @@ pub const SORT_BUTTON_ID: &str = "pharos-sort-open";
 /// The id of the sort and filter sheet.
 const FILTER_SHEET_ID: &str = "pharos-filter-sheet";
 
-/// Material "sort" and "filter list" glyphs.
-const ICON_SORT: &str = "M3 18h6v-2H3v2zM3 6v2h18V6H3zm0 7h12v-2H3v2z";
+/// Material "swap vert" and "filter list" glyphs.
+const ICON_SORT: &str = "M16 17.01V10h-2v7.01h-3L15 21l4-3.99h-3zM9 3 5 6.99h3V14h2V6.99h3L9 3z";
 const ICON_FILTER: &str = "M10 18h4v-2h-4v2zM3 6v2h18V6H3zm3 7h12v-2H6v2z";
 
 /// The words for a direction in `order`: A to Z, or newest first.
