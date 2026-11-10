@@ -471,18 +471,18 @@ mod tests {
     use pharos_core::{MediaItem, MediaKind, SeriesInfo};
     use pharos_store_sqlx::sqlite::SqliteStore;
 
-    const FLASH: &str = "/tv/The Flash";
+    const SHOW_A: &str = "/tv/Show A";
 
     fn path(name: &str) -> String {
-        format!("{FLASH}/Season 1/{name}")
+        format!("{SHOW_A}/Season 1/{name}")
     }
 
-    async fn flash() -> SqliteStore {
+    async fn show_a() -> SqliteStore {
         let s = SqliteStore::connect("sqlite::memory:").await.unwrap();
         for (id, name, episode) in [
-            (1, "The Flash - S01E01 - Pilot.mkv", 1),
-            (2, "The Flash - S01E02 - Out of Control.mkv", 2),
-            (3, "The Flash - S01E03 - City of Heroes.mkv", 3),
+            (1, "Show A - S01E01 - Pilot.mkv", 1),
+            (2, "Show A - S01E02 - The Old Second.mkv", 2),
+            (3, "Show A - S01E03 - The New Start.mkv", 3),
         ] {
             s.put(MediaItem {
                 id,
@@ -490,10 +490,10 @@ mod tests {
                 title: name.into(),
                 kind: MediaKind::Episode,
                 series: Some(SeriesInfo {
-                    series_name: "The Flash".into(),
+                    series_name: "Show A".into(),
                     season_number: Some(1),
                     episode_number: Some(episode),
-                    series_folder: Some(FLASH.into()),
+                    series_folder: Some(SHOW_A.into()),
                     series_year: None,
                     series_key: None,
                 }),
@@ -524,7 +524,7 @@ mod tests {
 
     async fn keys(s: &SqliteStore) -> Vec<(String, Option<String>)> {
         let mut rows: Vec<_> = s
-            .series_identity_rows(FLASH)
+            .series_identity_rows(SHOW_A)
             .await
             .unwrap()
             .into_iter()
@@ -596,20 +596,20 @@ mod tests {
                 .with_ansi(false)
                 .finish(),
         );
-        let s = flash().await;
-        s.set_item_match(3, "tvdb", "279121", "manual", None, 1)
+        let s = show_a().await;
+        s.set_item_match(3, "tvdb", "900001", "manual", None, 1)
             .await
             .unwrap();
         let bg = Arc::new(Semaphore::new(1));
         let f = fixer(&s, &bg, RepairMode::DryRun);
-        let moved = path("The Flash - S01E03 - City of Heroes.mkv");
+        let moved = path("Show A - S01E03 - The New Start.mkv");
 
         let done = f
             .move_files(
-                FLASH,
+                SHOW_A,
                 std::slice::from_ref(&moved),
                 MoveTarget {
-                    year: Some(2014),
+                    year: Some(1996),
                     ..MoveTarget::default()
                 },
             )
@@ -617,12 +617,12 @@ mod tests {
             .unwrap();
 
         assert_eq!(done.moved, std::slice::from_ref(&moved));
-        let new_key = split::split_key(FLASH, 2014);
+        let new_key = split::split_key(SHOW_A, 1996);
         let want = vec![
-            ("The Flash - S01E01 - Pilot.mkv".to_string(), None),
-            ("The Flash - S01E02 - Out of Control.mkv".to_string(), None),
+            ("Show A - S01E01 - Pilot.mkv".to_string(), None),
+            ("Show A - S01E02 - The Old Second.mkv".to_string(), None),
             (
-                "The Flash - S01E03 - City of Heroes.mkv".to_string(),
+                "Show A - S01E03 - The New Start.mkv".to_string(),
                 Some(new_key.clone()),
             ),
         ];
@@ -633,16 +633,16 @@ mod tests {
         for field in [
             "admin=\"ali\"",
             "action=\"move_files\"",
-            "City of Heroes.mkv",
-            "old_keys=[\"/tv/The Flash\"]",
-            "cleared_manual=[(3, \"279121\")]",
+            "The New Start.mkv",
+            "old_keys=[\"/tv/Show A\"]",
+            "cleared_manual=[(3, \"900001\")]",
         ] {
             assert!(line.contains(field), "{field} missing from {line}");
         }
         assert!(line.contains(&format!("new_key={new_key}")), "{line}");
 
         for mode in [RepairMode::DryRun, RepairMode::Apply] {
-            fixer(&s, &bg, mode).replan(FLASH).await.unwrap();
+            fixer(&s, &bg, mode).replan(SHOW_A).await.unwrap();
             assert_eq!(keys(&s).await, want, "{mode:?}");
         }
     }
@@ -651,15 +651,15 @@ mod tests {
     /// keeping a folder together rejoins a file a move had split off.
     #[tokio::test(flavor = "current_thread")]
     async fn removing_a_move_or_keeping_together_returns_the_file() {
-        let s = flash().await;
+        let s = show_a().await;
         let bg = Arc::new(Semaphore::new(1));
         let f = fixer(&s, &bg, RepairMode::DryRun);
-        let moved = path("The Flash - S01E02 - Out of Control.mkv");
+        let moved = path("Show A - S01E02 - The Old Second.mkv");
         let target = MoveTarget {
-            year: Some(1990),
+            year: Some(1971),
             ..MoveTarget::default()
         };
-        f.move_files(FLASH, std::slice::from_ref(&moved), target.clone())
+        f.move_files(SHOW_A, std::slice::from_ref(&moved), target.clone())
             .await
             .unwrap();
         let id = s.all_series_overrides().await.unwrap()[0].id;
@@ -670,15 +670,15 @@ mod tests {
         assert!(keys(&s).await.iter().all(|(_, k)| k.is_none()));
         assert!(s.all_series_overrides().await.unwrap().is_empty());
 
-        f.move_files(FLASH, std::slice::from_ref(&moved), target)
+        f.move_files(SHOW_A, std::slice::from_ref(&moved), target)
             .await
             .unwrap();
         let apply = fixer(&s, &bg, RepairMode::Apply);
-        apply.keep_together(FLASH).await.unwrap();
+        apply.keep_together(SHOW_A).await.unwrap();
         // The admin's own per-path row still places its file.
         assert_eq!(
             keys(&s).await[1].1.as_deref(),
-            Some(split::split_key(FLASH, 1990).as_str())
+            Some(split::split_key(SHOW_A, 1971).as_str())
         );
         let rows = s.all_series_overrides().await.unwrap();
         assert!(rows.iter().any(SeriesOverride::keeps_together), "{rows:?}");
@@ -687,16 +687,16 @@ mod tests {
     /// Each refusal names the value it refused, and nothing is written.
     #[tokio::test(flavor = "current_thread")]
     async fn a_hand_fix_that_cannot_be_made_names_why() {
-        let s = flash().await;
+        let s = show_a().await;
         let bg = Arc::new(Semaphore::new(1));
         let f = fixer(&s, &bg, RepairMode::DryRun);
         let year = MoveTarget {
-            year: Some(2014),
+            year: Some(1996),
             ..MoveTarget::default()
         };
         let stray = "/tv/Other/S01E01.mkv".to_string();
         let err = f
-            .move_files(FLASH, &[stray], year.clone())
+            .move_files(SHOW_A, &[stray], year.clone())
             .await
             .unwrap_err();
         assert!(
@@ -705,8 +705,8 @@ mod tests {
         );
         let err = f
             .move_files(
-                FLASH,
-                &[path("The Flash - S01E01 - Pilot.mkv")],
+                SHOW_A,
+                &[path("Show A - S01E01 - Pilot.mkv")],
                 MoveTarget::default(),
             )
             .await
@@ -718,7 +718,7 @@ mod tests {
             Err(HandFixError::NotFound(_))
         ));
         assert!(matches!(
-            f.pin(FLASH, Some(("imdb", "tt1"))).await,
+            f.pin(SHOW_A, Some(("imdb", "tt1"))).await,
             Err(HandFixError::Invalid(m)) if m.contains("imdb")
         ));
         assert!(s.all_series_overrides().await.unwrap().is_empty());
@@ -745,10 +745,7 @@ mod tests {
 
     #[test]
     fn a_split_keys_name_drops_its_year() {
-        assert_eq!(series_name("/tv/The Flash"), "The Flash");
-        assert_eq!(
-            series_name(&split::split_key("/tv/The Flash", 2014)),
-            "The Flash"
-        );
+        assert_eq!(series_name("/tv/Show A"), "Show A");
+        assert_eq!(series_name(&split::split_key("/tv/Show A", 1996)), "Show A");
     }
 }

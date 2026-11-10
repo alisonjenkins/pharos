@@ -97,7 +97,7 @@ pub(crate) fn log_series_match(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EpisodeRejectReason {
     /// The episode NFO's id names another series than the folder's match
-    /// (B931: Cosmos 1980 files with 2014 NFO ids); the record is set aside.
+    /// (B931: older-show files with newer-show NFO ids); the record is set aside.
     NfoOtherSeries,
     /// The file's episode title is neither the pinned show's record at its
     /// number nor a neighbour's. Observation only.

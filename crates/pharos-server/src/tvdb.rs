@@ -1616,12 +1616,12 @@ mod tests {
 
     #[test]
     fn a_series_records_run_reads_its_dates_and_status() {
-        let ended = r#"{"data":{"firstAired":"1978-09-17","lastAired":"1979-04-29","status":{"id":2,"name":"Ended"}}}"#;
+        let ended = r#"{"data":{"firstAired":"1981-09-17","lastAired":"1982-04-29","status":{"id":2,"name":"Ended"}}}"#;
         assert_eq!(
             parse_series_run(ended),
             Some(crate::online_enrich::SeriesRun {
-                first: Some(274_838_400),
-                last: Some(294_192_000),
+                first: Some(369_532_800),
+                last: Some(388_886_400),
                 ongoing: false,
             })
         );
@@ -2027,7 +2027,7 @@ mod tests {
     /// TVDB's season of The Next Generation, which now counts the two-part
     /// pilot once: every later episode sits one number below the files'.
     /// B983: TVDB pages `/episodes/default`. A long show's episodes after
-    /// the first page (One Piece's after about 500) are read from page 1
+    /// the first page (a very long show's after about 500) are read from page 1
     /// onwards, for the list and for one episode's record.
     #[tokio::test]
     async fn a_paged_episode_list_is_read_to_its_last_page() {
