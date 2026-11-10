@@ -1045,11 +1045,10 @@ pub fn scroll_tile_to(at: u32, top: f64) -> bool {
     true
 }
 
-/// The page's query, `?` included, as `location.search` on the web.
+/// The page's query, `?` and all, as `location.search` reads: the app's
+/// history keeps whole addresses, a library's filter with them (B1276).
 pub fn current_search() -> String {
-    super::route::split_query(lock(&PATHS).current())
-        .1
-        .to_owned()
+    tv_page::search_of(&current_address()).to_owned()
 }
 
 /// A listener for the grid's place settling, removed on drop.
