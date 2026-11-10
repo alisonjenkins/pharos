@@ -13,6 +13,7 @@ use super::keymap::{self, Mode, Transport};
 use super::keys;
 use super::quality::{self, QualityView};
 use super::scrub::{self, Scrub};
+use super::seek_wait::SeekCard;
 use super::stereo::{self, FrameRect, ViewMode};
 
 use super::art::Art;
@@ -107,6 +108,9 @@ pub struct Controls {
     pub next: Option<ItemRef>,
     /// The "Up next" card, while it counts down.
     pub up_next: Option<UpNextCard>,
+    /// Where a seek that has waited a while is going, and the way back
+    /// (B1196); shown in place of the plain loading caption.
+    pub seek_card: Option<SeekCard>,
     /// The playback position as a signal, when the owner updates it apart
     /// from `media`. The leaves that show the position read it, so a tick
     /// re-renders them alone and not the whole player (B815). Without it
@@ -350,7 +354,7 @@ pub(super) fn scrub_key(t: Option<Transport>, key: &Key, scrubbing: bool) -> Scr
 /// A control that moves playback itself, so an open scrub preview is
 /// dropped rather than left to seek back to its target (B907).
 fn drops_preview(control: &Control) -> bool {
-    matches!(control, Control::Seek(_))
+    matches!(control, Control::Seek(_) | Control::ReturnFromSeek(_))
 }
 
 /// What the viewer asked for.
@@ -358,6 +362,10 @@ fn drops_preview(control: &Control) -> bool {
 pub enum Control {
     TogglePlay,
     Seek(u64),
+    /// Give up on a seek that is still waiting and go back to where the
+    /// viewer was (B1196). Not a [`Control::Seek`]: going back is not a new
+    /// wait.
+    ReturnFromSeek(u64),
     /// The pointer is `x` px into the seek bar; `None` when it left.
     Hover(Option<f64>),
     /// A click `x` px into the seek bar.
@@ -846,7 +854,26 @@ pub fn WatchView(
                         "data-loading": "true",
                         span { class: "pharos-watch-spinner", aria_hidden: "true" }
                         span { class: "pharos-watch-loading-label", "Loading" }
-                        span { class: "pharos-watch-loading-caption", "Waiting for the server…" }
+                        match c.seek_card.clone() {
+                            Some(card) => rsx! {
+                                div { class: "pharos-seek-wait", "data-seek-wait": "true",
+                                    p { class: "pharos-seek-wait-title", "{card.title}" }
+                                    p { class: "pharos-seek-wait-time", "{card.waited}" }
+                                    if let Some(reason) = card.reason {
+                                        p { class: "pharos-seek-wait-reason", "{reason}" }
+                                    }
+                                    button {
+                                        class: "pharos-seek-wait-back",
+                                        r#type: "button",
+                                        onclick: move |_| on_control.call(Control::ReturnFromSeek(card.back_to_ms)),
+                                        "{card.back}"
+                                    }
+                                }
+                            },
+                            None => rsx! {
+                                span { class: "pharos-watch-loading-caption", "Waiting for the server…" }
+                            },
+                        }
                     }
                 }
                 for url in image_cues {
@@ -2822,6 +2849,23 @@ mod tests {
         assert!(html.contains(r#"data-loading="true""#), "{html}");
         assert!(html.contains("Loading"), "{html}");
         assert!(html.contains("Waiting for the server…"), "{html}");
+    }
+
+    /// B1196/V1156: a slow seek's card replaces the plain caption, with
+    /// where it is going, how long it has waited, why, and the way back.
+    #[test]
+    fn a_slow_seek_shows_where_it_is_going_and_the_way_back() {
+        let mut c = controls();
+        c.media.loading = true;
+        c.seek_card = super::super::seek_wait::SeekWait::begin(None, 4_805_000, 5_730_000, 0)
+            .card(12_000, true);
+        let html = render(c);
+        assert!(html.contains(r#"data-seek-wait="true""#), "{html}");
+        assert!(html.contains("Jumping to 1:35:30…"), "{html}");
+        assert!(html.contains("Waiting 12 s"), "{html}");
+        assert!(html.contains("no seek index"), "{html}");
+        assert!(html.contains("Go back to 1:20:05"), "{html}");
+        assert!(!html.contains("Waiting for the server…"), "{html}");
     }
 
     #[test]
