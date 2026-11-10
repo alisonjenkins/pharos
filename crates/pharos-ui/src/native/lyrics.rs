@@ -170,7 +170,10 @@ fn word_progress(line: &LyricLine, end: u64, position_ms: u64) -> f64 {
     }
     let mut points = Vec::with_capacity(line.words.len() + 2);
     if line.words.first().map_or(true, |w| w.at != 0) {
-        points.push((line.start_ms, 0usize));
+        // The server may start a line after its first word so the line above
+        // stays selectable; the fill still follows the word.
+        let first = line.words.first().map_or(line.start_ms, |w| w.start_ms);
+        points.push((line.start_ms.min(first), 0usize));
     }
     for w in &line.words {
         let at = usize::try_from(w.at).unwrap_or(usize::MAX).min(len);
@@ -248,7 +251,17 @@ pub fn LyricsPanel(
         });
     }));
     let mut hold = move || held_until.set(platform::now_ms() + HOLD_MS);
+    // Outside the panel: its children are the lines, counted by index when
+    // the sung line is centred.
+    let timing = karaoke && lyrics.words_pending;
     rsx! {
+        if timing {
+            p {
+                class: "pharos-lyrics-timing",
+                role: "status",
+                "Timing the words… the fill is a guess until then"
+            }
+        }
         div {
             id: PANEL_ID,
             class: "pharos-lyrics",
@@ -264,7 +277,7 @@ pub fn LyricsPanel(
             },
             ontouchstart: move |_| hold(),
             onkeydown: move |evt: KeyboardEvent| {
-                if matches!(evt.key(), Key::ArrowUp | Key::ArrowDown | Key::PageUp | Key::PageDown) {
+                if matches!(evt.key(), Key::Named(NamedKey::ArrowUp) | Key::Named(NamedKey::ArrowDown) | Key::Named(NamedKey::PageUp) | Key::Named(NamedKey::PageDown)) {
                     evt.stop_propagation();
                     hold();
                 }
@@ -499,6 +512,31 @@ mod tests {
     }
 
     #[test]
+    fn a_prefixed_line_starting_after_its_first_word_fills_at_the_word_time() {
+        let l = Lyrics {
+            synced: true,
+            lines: vec![
+                LyricLine {
+                    start_ms: 12_001,
+                    text: "♪ hello".into(),
+                    words: vec![LyricWord {
+                        at: 2,
+                        start_ms: 11_000,
+                    }],
+                },
+                LyricLine {
+                    start_ms: 20_000,
+                    text: "next".into(),
+                    words: Vec::new(),
+                },
+            ],
+            words_pending: false,
+        };
+        // (11000, 0) -> (11000, 2) -> "hello" (2 syllables, 1400 ms) ends at 12400.
+        assert!((line_progress(&l, 0, 11_700) - 4.5 / 7.0 * 100.0).abs() < 1e-9);
+    }
+
+    #[test]
     fn a_word_stamp_past_the_last_line_end_keeps_points_ordered() {
         let l = Lyrics {
             synced: true,
@@ -605,6 +643,25 @@ mod tests {
         plain.synced = false;
         let plain = render_as(plain, 2_000, true);
         assert!(plain.contains(r#"data-karaoke="false""#), "{plain}");
+    }
+
+    #[test]
+    fn karaoke_says_so_while_the_words_are_still_being_timed() {
+        let mut l = synced(&[1_000, 3_000]);
+        l.words_pending = true;
+        let timing = render_as(l.clone(), 1_500, true);
+        assert_eq!(
+            timing.matches("pharos-lyrics-timing").count(),
+            1,
+            "{timing}"
+        );
+        assert!(timing.contains(r#"role="status""#), "{timing}");
+        // Lines only, no karaoke: the panel draws no fill to apologise for.
+        let lines_only = render_as(l.clone(), 1_500, false);
+        assert!(!lines_only.contains("pharos-lyrics-timing"), "{lines_only}");
+        l.words_pending = false;
+        let timed = render_as(l, 1_500, true);
+        assert!(!timed.contains("pharos-lyrics-timing"), "{timed}");
     }
 
     #[test]

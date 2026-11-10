@@ -31,7 +31,6 @@ pub struct QualityOption {
 pub struct PlayerProps {
     pub item_id: String,
     pub kind: ItemKind,
-    pub access_token: String,
     pub server_base: String,
     pub tracks: Option<PlaybackTracks>,
     /// Optional source URL override. When set, replaces the
@@ -101,11 +100,20 @@ pub enum PlaybackEvent {
     },
 }
 
+/// The element URL for an item with no override. It carries no token: the
+/// browser sends the `JellyfinAuth` cookie set at sign-in, so the URL never
+/// puts the long-lived token in history, logs or a Referer (B1150, V1110).
+pub(crate) fn default_src(server_base: &str, item_id: &str, kind: ItemKind) -> String {
+    match kind {
+        ItemKind::Audio => format!("{server_base}/Audio/{item_id}/universal"),
+        ItemKind::Movie | ItemKind::Episode => format!("{server_base}/Videos/{item_id}/stream"),
+    }
+}
+
 #[component]
 pub fn PlayerView(
     item_id: String,
     kind: ItemKind,
-    access_token: String,
     server_base: String,
     tracks: Option<PlaybackTracks>,
     src_override: Option<String>,
@@ -125,14 +133,7 @@ pub fn PlayerView(
 ) -> Element {
     let src = match src_override.as_ref() {
         Some(url) => url.clone(),
-        None => match kind {
-            ItemKind::Audio => {
-                format!("{server_base}/Audio/{item_id}/universal?api_key={access_token}")
-            }
-            ItemKind::Movie | ItemKind::Episode => {
-                format!("{server_base}/Videos/{item_id}/stream?api_key={access_token}")
-            }
-        },
+        None => default_src(&server_base, &item_id, kind),
     };
 
     let id_for_play = item_id.clone();
@@ -198,12 +199,13 @@ pub fn PlayerView(
                     // Subtitle `<track>` elements — the browser surfaces
                     // them as the native CC picker. `src` is the
                     // server-emitted DeliveryUrl rebased onto the
-                    // user's server + token.
+                    // user's server; the sign-in cookie authenticates it
+                    // (B1150).
                     for sub in subtitles.iter() {
                         if let Some(url) = sub.delivery_url.as_ref() {
                             track {
                                 kind: "subtitles",
-                                src: "{server_base}{url}&api_key={access_token}",
+                                src: "{server_base}{url}",
                                 srclang: sub.language.clone().unwrap_or_default(),
                                 label: track_label(sub),
                                 default: sub.is_default,
@@ -443,24 +445,17 @@ mod tests {
     }
 
     #[test]
-    fn audio_src_uses_universal_endpoint() {
-        let p = PlayerProps {
-            item_id: "42".into(),
-            kind: ItemKind::Audio,
-            access_token: "tok".into(),
-            server_base: "https://pharos.test".into(),
-            tracks: None,
-            src_override: None,
-            quality_options: Vec::new(),
-            current_max_bitrate: None,
-            chapters: Vec::new(),
-            run_time_ticks: 0,
-        };
-        let expected = "https://pharos.test/Audio/42/universal?api_key=tok";
-        let src = format!(
-            "{}/Audio/{}/universal?api_key={}",
-            p.server_base, p.item_id, p.access_token
+    fn element_urls_carry_no_token() {
+        let base = "https://pharos.test";
+        assert_eq!(
+            default_src(base, "42", ItemKind::Audio),
+            "https://pharos.test/Audio/42/universal"
         );
-        assert_eq!(src, expected);
+        for kind in [ItemKind::Movie, ItemKind::Episode] {
+            assert_eq!(
+                default_src(base, "42", kind),
+                "https://pharos.test/Videos/42/stream"
+            );
+        }
     }
 }

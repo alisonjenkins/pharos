@@ -15,16 +15,18 @@ pub enum Section {
     Account,
     Devices,
     Privacy,
+    Offline,
 }
 
 impl Section {
     /// Sidebar order.
-    pub const ALL: [Section; 5] = [
+    pub const ALL: [Section; 6] = [
         Section::Appearance,
         Section::Playback,
         Section::Account,
         Section::Devices,
         Section::Privacy,
+        Section::Offline,
     ];
 
     /// The section a route shows, if it is a settings page.
@@ -35,6 +37,7 @@ impl Section {
             Route::Account => Some(Section::Account),
             Route::ApproveDevice => Some(Section::Devices),
             Route::Privacy => Some(Section::Privacy),
+            Route::Offline => Some(Section::Offline),
             _ => None,
         }
     }
@@ -46,6 +49,7 @@ impl Section {
             Section::Account => Route::Account,
             Section::Devices => Route::ApproveDevice,
             Section::Privacy => Route::Privacy,
+            Section::Offline => Route::Offline,
         }
     }
 
@@ -56,6 +60,7 @@ impl Section {
             Section::Account => "Account",
             Section::Devices => "Devices",
             Section::Privacy => "Privacy",
+            Section::Offline => "Offline",
         }
     }
 
@@ -67,6 +72,7 @@ impl Section {
             Section::Account => "M12 12a4 4 0 1 0 0-8a4 4 0 0 0 0 8zM4 21c1-4 4.5-6 8-6s7 2 8 6",
             Section::Devices => "M3 5h18v12H3zM8 21h8M12 17v4",
             Section::Privacy => "M12 3l8 3v6c0 5-3.5 8-8 9c-4.5-1-8-4-8-9V6z",
+            Section::Offline => "M12 4v11M7 11l5 5l5-5M5 20h14",
         }
     }
 }

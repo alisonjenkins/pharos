@@ -124,6 +124,7 @@ async fn seed() -> (web::Data<AppState>, String, UserId) {
                 episode_number: Some(1),
                 series_folder: Some("/media/TV/Delta Show".into()),
                 series_year: Some(2020),
+                series_key: None,
             }),
             created_at: Some(4_000),
         },
@@ -139,6 +140,7 @@ async fn seed() -> (web::Data<AppState>, String, UserId) {
                 episode_number: Some(2),
                 series_folder: Some("/media/TV/Delta Show".into()),
                 series_year: Some(2020),
+                series_key: None,
             }),
             created_at: Some(5_000),
         },
@@ -154,6 +156,7 @@ async fn seed() -> (web::Data<AppState>, String, UserId) {
                 episode_number: Some(1),
                 series_folder: Some("/media/TV/Delta Show".into()),
                 series_year: Some(2020),
+                series_key: None,
             }),
             created_at: Some(6_000),
         },
@@ -194,6 +197,7 @@ async fn seed() -> (web::Data<AppState>, String, UserId) {
     for r in &rows {
         stores
             .put(MediaItem {
+                locked: Default::default(),
                 id: r.id,
                 path: r.path.into(),
                 title: r.title.into(),
@@ -560,8 +564,8 @@ async fn items_query_byte_identical_to_golden() {
 
 /// 004-books (T069) — reading order.
 ///
-/// A books library is browsed by shelf, not alphabetically: "Dune Messiah"
-/// alphabetises nowhere near "Children of Dune", so a series sorted by title
+/// A books library is browsed by shelf, not alphabetically: "Book A Two"
+/// alphabetises nowhere near "Aftermath of Book A", so a series sorted by title
 /// reads in an order no one wants. `SortBy=SeriesSortName,SortName` groups by
 /// series and orders by volume.
 ///
@@ -594,16 +598,16 @@ async fn books_sort_into_reading_order_within_a_series() {
     let token = token.0.expose().to_string();
 
     // Deliberately inserted out of order, and TITLED so that alphabetical order
-    // (Children < Dune < Dune Messiah < Sands) differs from reading order — if
+    // (Children < Book A < Book A Two < Sequel) differs from reading order — if
     // the sort silently fell back to SortName the assertion below would still
     // see a plausible-looking list.
     for (id, title, series, index) in [
-        (1u64, "Dune Messiah", Some("Dune Chronicles"), Some(2u32)),
-        (2, "Sands of Arrakis", Some("Dune Chronicles"), None),
-        (3, "Children of Dune", Some("Dune Chronicles"), Some(3)),
-        (4, "Dune", Some("Dune Chronicles"), Some(1)),
+        (1u64, "Book A Two", Some("Book A Chronicles"), Some(2u32)),
+        (2, "Sequel to Book A", Some("Book A Chronicles"), None),
+        (3, "Aftermath of Book A", Some("Book A Chronicles"), Some(3)),
+        (4, "Book A", Some("Book A Chronicles"), Some(1)),
         // A different shelf, so "group by series" is shown to do something.
-        (5, "Neuromancer", Some("Sprawl"), Some(1)),
+        (5, "Book B", Some("Shelf B"), Some(1)),
     ] {
         stores
             .put(MediaItem {
@@ -646,11 +650,11 @@ async fn books_sort_into_reading_order_within_a_series() {
     assert_eq!(
         order,
         [
-            "Dune",
-            "Dune Messiah",
-            "Children of Dune",
-            "Sands of Arrakis",
-            "Neuromancer",
+            "Book A",
+            "Book A Two",
+            "Aftermath of Book A",
+            "Sequel to Book A",
+            "Book B",
         ],
         "reading order: volumes 1-3 in sequence, the UNNUMBERED volume last \
          within its series (not first, which is where SQLite puts a NULL), then \
@@ -659,7 +663,7 @@ async fn books_sort_into_reading_order_within_a_series() {
 
     // And the projection the client groups by is actually present.
     let first = &body["Items"][0];
-    assert_eq!(first["SeriesName"], "Dune Chronicles");
+    assert_eq!(first["SeriesName"], "Book A Chronicles");
     assert_eq!(first["IndexNumber"], 1);
     assert!(
         body["Items"][3]["IndexNumber"].is_null(),

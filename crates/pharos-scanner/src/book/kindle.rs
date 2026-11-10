@@ -400,7 +400,7 @@ mod tests {
     <dc:title>{title}</dc:title>
     <dc:creator>{author}</dc:creator>
     <dc:language>en</dc:language>
-    <dc:identifier id="uid">9781718501867</dc:identifier>
+    <dc:identifier id="uid">9789300000002</dc:identifier>
     <dc:publisher>No Starch Press</dc:publisher>
   </metadata>
   <manifest>
@@ -505,17 +505,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let src = write_azw3(
             dir.path(),
-            "Rust for Rustaceans.azw3",
-            &minimal_epub(
-                "Rust for Rustaceans",
-                "Gjengset, Jon",
-                "Talking About Memory",
-            ),
+            "Book A.azw3",
+            &minimal_epub("Book A", "Gjengset, Jon", "Talking About Memory"),
         );
 
         // 1. Metadata comes off the Kindle container, not the filename.
         let meta = read_kindle(&src).expect("a DRM-free azw3 must read");
-        assert_eq!(meta.title.as_deref(), Some("Rust for Rustaceans"));
+        assert_eq!(meta.title.as_deref(), Some("Book A"));
         assert_eq!(meta.author.as_deref(), Some("Gjengset, Jon"));
         assert_eq!(meta.publisher.as_deref(), Some("No Starch Press"));
         // NOT asserted here: `isbn`. The fixture is made by boko's own AZW3
@@ -523,7 +519,7 @@ mod tests {
         // a round-trip cannot prove anything about ISBN either way.
         //
         // Reading it does work on real files: the deployed library's
-        // `Rust for Rustaceans.azw3` returns `9781718501867`, which is the
+        // `Book A.azw3` returns `9789300000002`, which is the
         // value `only_real_isbns_are_kept` pins the extraction rule against.
         // Asserting `None` here would be asserting a fixture's limitation as
         // if it were behaviour.
@@ -591,8 +587,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let src = write_azw3(
             dir.path(),
-            "Gray Hat Python.azw3",
-            &minimal_epub("Gray Hat Python", "Seitz, Justin", "Chapter 1"),
+            "Book B.azw3",
+            &minimal_epub("Book B", "Author, Anna", "Chapter 1"),
         );
         let meta = super::super::read_book_meta(&src).expect("a book path must yield meta");
         assert_eq!(
@@ -600,12 +596,12 @@ mod tests {
             BookFormat::Epub,
             "a DRM-free Kindle file must be stored as the format it converts to"
         );
-        assert_eq!(meta.author.as_deref(), Some("Seitz, Justin"));
+        assert_eq!(meta.author.as_deref(), Some("Author, Anna"));
 
         // The counterweight: a Kindle file that does NOT convert must keep the
         // 004-books verdict. Without this, "everything is epub now" would pass
         // the assertion above just as well.
-        let broken = dir.path().join("Atomic Habits.azw3");
+        let broken = dir.path().join("Book C.azw3");
         std::fs::write(&broken, b"not a mobi").unwrap();
         assert_eq!(
             super::super::read_book_meta(&broken)
@@ -810,7 +806,7 @@ mod tests {
     /// accepts.
     #[test]
     fn only_real_isbns_are_kept() {
-        assert_eq!(isbn_of("9781718501867").as_deref(), Some("9781718501867"));
+        assert_eq!(isbn_of("9789300000002").as_deref(), Some("9789300000002"));
         assert_eq!(
             isbn_of("978-0-9888202-0-4").as_deref(),
             Some("978-0-9888202-0-4")

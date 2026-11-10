@@ -7,9 +7,11 @@
 
 pub mod budget;
 pub mod compile;
+mod contrast;
 pub mod director;
 mod effects;
 pub mod event;
+mod glyphs;
 pub mod plan;
 pub mod signals;
 pub mod source;

@@ -247,6 +247,9 @@ compat-dioxus-full native="on" port="8096" config="playwright.dioxus.config.ts":
     for n in $(seq 0 20); do
       printf '[%02d:%02d.00]Carefree line %d\n' $((n * 2 / 60)) $((n * 2 % 60)) "$n"
     done > "$TMP/media/05-carefree.lrc"
+    # A long EPUB whose words are unique tokens, and a Kindle file the scanner
+    # cannot convert (DRM stand-in), for the reader's spec (023: V352, V353).
+    nix develop --command node compat-playwright/tools/make-reader-books.cjs "$TMP/media/Books"
     NATIVE_BLOCK=""
     if [[ "{{ native }}" == "on" ]]; then
       NATIVE_BLOCK=$(cat <<NATIVE
@@ -286,6 +289,16 @@ compat-dioxus-full native="on" port="8096" config="playwright.dioxus.config.ts":
     name = "Bulk"
     kind = "movies"
 
+    [[media.libraries]]
+    path = "$TMP/media/Stereo"
+    name = "Stereo"
+    kind = "movies"
+
+    [[media.libraries]]
+    path = "$TMP/media/Books"
+    name = "Reader Books"
+    kind = "books"
+
     [database]
     url = "sqlite://$TMP/pharos.db?mode=rwc"
     $NATIVE_BLOCK
@@ -293,6 +306,16 @@ compat-dioxus-full native="on" port="8096" config="playwright.dioxus.config.ts":
     PHAROS_CONFIG="$TMP/pharos.toml"
     nix develop --command cargo build -q --bin pharos --bin transcode-worker
     nix develop --command cargo run -q --bin pharos -- --config "$PHAROS_CONFIG" admin seed-playwright-user
+    # A film with a half side-by-side edition beside it, and a second copy of
+    # a seeded episode in a "Season 1" folder beside "Season 01", for the 3D
+    # badge, the 3D filter and the version picker (V721, V722).
+    mkdir -p "$TMP/media/Stereo" "$TMP/media/TV/Playwright Show/Season 1"
+    ln "$TMP/media/06-test-av-confirm.webm" "$TMP/media/Stereo/Stereo Film (2009).webm"
+    ln "$TMP/media/06-test-av-confirm.webm" "$TMP/media/Stereo/Stereo Film (2009) - 3D.HSBS.webm"
+    # A lone full side-by-side film, for the one-eye crop's aspect (V920).
+    ln "$TMP/media/06-test-av-confirm.webm" "$TMP/media/Stereo/Stereo Wide (2011) - 3D.FSBS.webm"
+    cp "$TMP/media/TV/Playwright Show/Season 01/Playwright Show - S01E02.webm" \
+      "$TMP/media/TV/Playwright Show/Season 1/Playwright Show - S01E02.webm"
     echo "compat-dioxus-full: ui bundle $UI_SRC, served from $UI_DIR"
     if [[ -d "$UI_SRC" ]]; then echo "  present"; else echo "  MISSING from this view of /nix/store"; fi
     nix path-info "$UI_SRC" 2>&1 | sed 's/^/  path-info: /' || true

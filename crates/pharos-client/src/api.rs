@@ -7,11 +7,14 @@ use std::fmt;
 use std::str::FromStr;
 
 use pharos_api::pharos_capnp::{
-    avatar_result, decision_result, detail_result, done, home_result, index_result, item_id,
-    item_query, item_summary, items_result, library, lyrics_result, me_result, media_token_result,
-    negotiate_result, opt_u16, opt_u32, playback, playback_grant, pref_result, prefs, session,
-    stream_choice, telemetry, track, user_data, user_state_result, Kind,
-    LibraryKind as WireLibraryKind, SegmentKind as WireSegmentKind, SubtitleDelivery,
+    avatar_result, capabilities, decision_result, detail_result, done, home_result, index_result,
+    item_id, item_query, item_summary, items_result, library, lyrics_result, me_result,
+    media_token_result, my_devices_result, negotiate_result, opt_u16, opt_u32, playback,
+    playback_grant, pref_result, prefs, report_document_result, report_list_result, report_result,
+    session, start_tracks_result, stream_choice, telemetry, track, user_data, user_state_result,
+    BookFormat as WireBookFormat, CreditKind as WireCreditKind, Kind,
+    LibraryKind as WireLibraryKind, SegmentKind as WireSegmentKind, Stereo3d as WireStereo,
+    StereoFilter, SubtitleDelivery,
 };
 pub use pharos_api::pharos_capnp::{EventKind as ClientEventKind, Level as ClientLevel};
 pub use pharos_api::PASSWORD_CHANGED_REVOKE_FAILED;
@@ -95,6 +98,65 @@ pub enum LibraryKind {
     Books,
 }
 
+/// How a 3D video packs its two eyes into one frame (018).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stereo {
+    HalfSideBySide,
+    FullSideBySide,
+    HalfTopAndBottom,
+    FullTopAndBottom,
+    /// A second view a browser cannot decode: it plays in 2D.
+    Mvc,
+}
+
+/// One playable file of an item: its primary, a grouped edition, or another
+/// copy of the same episode. Probe facts are 0 or empty when unknown.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Version {
+    /// What [`PharosApi::play`] and [`PharosApi::detail_version`] take;
+    /// empty for the primary.
+    pub id: String,
+    pub name: String,
+    pub stereo: Option<Stereo>,
+    pub primary: bool,
+    pub width: u32,
+    pub height: u32,
+    pub video_codec: String,
+    /// `HDR10` or `HLG`; empty is SDR.
+    pub hdr: String,
+    pub audio: Vec<VersionAudio>,
+    pub size_bytes: u64,
+    pub container: String,
+    /// The file on the server's disk; the server sends it to admins only.
+    pub path: String,
+    /// The integrity check found this file damaged.
+    pub damaged: bool,
+    /// The file's runtime; 0 when unknown (or from a server before
+    /// schemaVersion 31).
+    pub duration_ms: u64,
+    /// Where the picture sits inside the frame when the file has black bars
+    /// baked into it; `None` when it has none, or the server has not looked
+    /// (or is older than schemaVersion 34).
+    pub picture: Option<PictureArea>,
+}
+
+/// A rectangle of a [`Version`]'s coded frame, in its pixels.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PictureArea {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// One audio stream of a [`Version`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VersionAudio {
+    pub language: String,
+    pub codec: String,
+    pub channels: u32,
+}
+
 /// One item as a list or rail shows it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Item {
@@ -122,6 +184,14 @@ pub struct Item {
     pub imdb_rating: Option<u16>,
     /// Rotten Tomatoes Tomatometer, a percentage.
     pub critic_rating: Option<u16>,
+    /// A song's artists, joined, for its card; `None` for anything else or
+    /// from a server before schemaVersion 25.
+    pub artist: Option<String>,
+    /// Its 3D packing, or its first 3D version's when it is itself 2D.
+    pub stereo: Option<Stereo>,
+    /// The integrity check found its file damaged; [`Detail::damage`] says
+    /// where. False from a server older than schemaVersion 30.
+    pub damaged: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -137,6 +207,8 @@ pub struct Home {
     pub resume: Vec<Item>,
     /// Music to resume.
     pub listening: Vec<Item>,
+    /// Books part read.
+    pub reading: Vec<Item>,
     pub next_up: Vec<Item>,
 }
 
@@ -161,8 +233,34 @@ pub struct Listing {
     pub descending: bool,
     /// One genre, by name.
     pub genre: Option<String>,
-    /// Only played (`Some(true)`) or unplayed (`Some(false)`) items.
-    pub played: Option<bool>,
+    /// Only items in this play state.
+    pub watched: Option<Watched>,
+    /// Only 3D (`Some(true)`) or only 2D (`Some(false)`) titles.
+    pub stereo: Option<bool>,
+    /// Fold the films of each box set into one tile for the set (B1086).
+    /// A server older than schemaVersion 37 ignores it and lists the films.
+    pub collapse: bool,
+}
+
+/// A play state a [`Listing`] keeps to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Watched {
+    Unwatched,
+    Watched,
+    /// Started and not finished: a film part watched, a show with an
+    /// episode watched and one still to watch (V1159).
+    InProgress,
+}
+
+impl Watched {
+    /// The Jellyfin `Filters` token the server narrows by.
+    pub fn filter(self) -> &'static str {
+        match self {
+            Watched::Unwatched => "IsUnplayed",
+            Watched::Watched => "IsPlayed",
+            Watched::InProgress => "IsResumable",
+        }
+    }
 }
 
 impl Listing {
@@ -174,7 +272,9 @@ impl Listing {
             sort_by: sort_by.to_owned(),
             descending: false,
             genre: None,
-            played: None,
+            watched: None,
+            stereo: None,
+            collapse: false,
         }
     }
 }
@@ -208,6 +308,132 @@ pub struct Detail {
     pub artists: Vec<String>,
     /// A song's album name.
     pub album: Option<String>,
+    /// Who appears in it, in billed order. A series or season lists its
+    /// regulars ranked across its episodes.
+    pub cast: Vec<Credit>,
+    /// A film or episode's files, the primary first; empty for anything
+    /// else, and from a server older than schema 29.
+    pub versions: Vec<Version>,
+    /// What is wrong with the file this detail describes; `None` when
+    /// nothing is known to be.
+    pub damage: Option<Damage>,
+    /// A book's format, author and size; `None` for anything else, and from
+    /// a server older than schema 32.
+    pub book: Option<Book>,
+    /// Where the signed-in user left a book; `None` when unread.
+    pub read_position: Option<ReadPosition>,
+}
+
+/// How a book can be read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BookFormat {
+    Epub,
+    Pdf,
+    Comic,
+    /// A file the reader cannot open (DRM, an unsupported container).
+    Unreadable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Book {
+    pub format: BookFormat,
+    pub author: String,
+    /// 0 when unknown.
+    pub page_count: u32,
+}
+
+/// A book's saved reading position: an opaque locator and how far through
+/// the book it is, 0 to 1, and when it was read.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReadPosition {
+    pub locator: String,
+    pub fraction: f32,
+    /// Unix ms the place was read, to the second; 0 from a server older than
+    /// schemaVersion 39.
+    pub read_at_ms: i64,
+}
+
+/// What the integrity check found wrong with one file.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Damage {
+    /// `damaged`, `short` or `unreadable`.
+    pub verdict: String,
+    /// The reader's own words for the first fault; empty when it gave none.
+    pub reason: String,
+    /// The damaged spans on the player's timeline, in media order.
+    pub ranges: Vec<DamageSpan>,
+    /// When the file was read, in unix seconds.
+    pub checked_at: Option<i64>,
+}
+
+/// One damaged span, in ms. A span one packet wide has `start_ms == end_ms`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DamageSpan {
+    pub start_ms: u64,
+    pub end_ms: u64,
+}
+
+/// Someone who appears in an item, and who they play.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Credit {
+    pub name: String,
+    /// Empty when the credit names no character.
+    pub character: String,
+    pub kind: CreditKind,
+    /// The person's photo on this server, `None` when there is none.
+    pub image_url: Option<String>,
+    /// What [`PharosApi::person`] takes; `None` from a server older than
+    /// schemaVersion 28.
+    pub person: Option<ItemRef>,
+}
+
+/// Someone in a cast, and what they appear in that the viewer may see.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct PersonPage {
+    pub id: Option<ItemRef>,
+    pub name: String,
+    /// Their photo on this server, `None` when there is none.
+    pub image_url: Option<String>,
+    /// Newest first.
+    pub films: Vec<Appearance>,
+    /// The show they are in most first.
+    pub shows: Vec<ShowAppearances>,
+    pub biography: Option<String>,
+    /// `YYYY-MM-DD`.
+    pub birth_date: Option<String>,
+    /// `YYYY-MM-DD`.
+    pub death_date: Option<String>,
+    pub birth_place: Option<String>,
+    /// Their IMDb id (`nm` and digits).
+    pub imdb_id: Option<String>,
+    /// Their Wikidata item (`Q` and digits).
+    pub wikidata_id: Option<String>,
+}
+
+/// One item a person appears in, and who they play there.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Appearance {
+    pub item: Item,
+    /// Empty when the credit names no one.
+    pub character: String,
+    pub kind: CreditKind,
+}
+
+/// The episodes of one show a person appears in, in season order.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ShowAppearances {
+    pub series: Item,
+    /// Who they play in it, most episodes first.
+    pub characters: Vec<String>,
+    pub episodes: Vec<Appearance>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CreditKind {
+    #[default]
+    Actor,
+    /// Appears in this one episode only.
+    GuestStar,
 }
 
 /// A font the file embeds. `url` holds `{subtitle}`, the index of the
@@ -259,6 +485,8 @@ pub struct Track {
     pub is_default: bool,
     pub is_forced: bool,
     pub is_hearing_impaired: bool,
+    /// An audio track's channel count; 0 is unknown.
+    pub channels: u16,
     /// A text subtitle's same-origin WebVTT, which the player renders
     /// itself. `None` for a subtitle the server must burn in, so choosing it
     /// renegotiates; always `None` for audio.
@@ -316,6 +544,14 @@ pub enum TrackChoice {
 pub struct TrackPicks {
     pub audio: TrackChoice,
     pub subtitle: TrackChoice,
+}
+
+/// The tracks a playback naming neither would start on; `None` is no audio
+/// track, or subtitles off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct StartTracks {
+    pub audio: Option<u32>,
+    pub subtitle: Option<u32>,
 }
 
 /// What the player can decode, for the server to choose a delivery.
@@ -408,6 +644,19 @@ pub trait PharosApi {
     /// most `limit` (0 is the server's default page).
     async fn search(&self, call: &CallInfo, text: &str, limit: u32) -> Result<Page, ClientError>;
     async fn detail(&self, call: &CallInfo, id: ItemRef) -> Result<Detail, ClientError>;
+    /// The person `id` names (a [`Credit::person`]) and what they appear in.
+    async fn person(&self, call: &CallInfo, id: ItemRef) -> Result<PersonPage, ClientError>;
+    /// [`Self::detail`] as the [`Version`] whose id is `version` plays: its
+    /// tracks, fonts and subtitle URLs are that file's. Empty is the primary.
+    async fn detail_version(
+        &self,
+        call: &CallInfo,
+        id: ItemRef,
+        version: &str,
+    ) -> Result<Detail, ClientError> {
+        let _ = version;
+        self.detail(call, id).await
+    }
     async fn lyrics(
         &self,
         call: &CallInfo,
@@ -424,13 +673,24 @@ pub trait PharosApi {
         count: u32,
     ) -> Result<crate::mix::MixBatch, ClientError>;
     /// Negotiate playback of `id` with the tracks in `picks`.
+    /// Negotiate playback of `id` with the tracks in `picks`, from the
+    /// [`Version`] whose id is `version` (empty: the primary).
     async fn play(
         &self,
         call: &CallInfo,
         id: ItemRef,
+        version: &str,
         caps: &Capabilities,
         picks: TrackPicks,
     ) -> Result<(Decision, Self::Playing), ClientError>;
+    /// The tracks [`PharosApi::play`] with default picks would start `id`
+    /// on: the user's last choice for it, else their preferences.
+    async fn start_tracks(
+        &self,
+        call: &CallInfo,
+        id: ItemRef,
+        caps: &Capabilities,
+    ) -> Result<StartTracks, ClientError>;
 }
 
 /// One negotiated playback, for progress reports.
@@ -446,6 +706,36 @@ pub trait PlaybackGrant {
         playing: TrackPicks,
     ) -> Result<(), ClientError>;
     async fn stop(&self, call: &CallInfo, position_ms: u64) -> Result<(), ClientError>;
+    /// What this playback waits behind on the server's encoders, asked while
+    /// a start, seek or buffer waits (038 FR-402). A grant that cannot say
+    /// answers that nothing is queued.
+    async fn queue_hint(&self, _call: &CallInfo) -> Result<QueueHint, ClientError> {
+        Ok(QueueHint::default())
+    }
+}
+
+/// [`PlaybackGrant::queue_hint`]'s answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct QueueHint {
+    /// This playback's requests waiting for an encoder.
+    pub queued: u32,
+    /// How long the oldest of them has waited.
+    pub waited_ms: u64,
+    /// Other viewers' requests waiting too.
+    pub others_queued: u32,
+    /// Every encoder is running at capacity.
+    pub busy: bool,
+}
+
+/// A device the signed-in user is signed in on, from [`NativeApi::my_devices`].
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct MyDevice {
+    pub id: String,
+    pub name: String,
+    /// The device this session runs on.
+    pub current: bool,
+    /// The sound formats it is sent converted rather than as they are.
+    pub converted_audio: Vec<String>,
 }
 
 /// A token from [`NativeApi::media_token`].
@@ -490,6 +780,17 @@ pub struct Me {
     pub avatar_url: Option<String>,
 }
 
+/// One stored problem report as `Telemetry.listReports` lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReportSummary {
+    /// The id the user pastes, `XXXX-XXXX`.
+    pub id: String,
+    pub received_wall_ms: u64,
+    pub user_name: String,
+    pub note: String,
+    pub bytes: u64,
+}
+
 /// One client event for `Telemetry.submit`, in plain Rust types.
 #[derive(Debug, Clone)]
 pub struct ClientEvent {
@@ -511,6 +812,18 @@ impl NativeApi {
             group: NativeGroup::new(session),
             user_data: session.user_data_request().send().pipeline.get_user_data(),
         }
+    }
+
+    /// Live push of the signed-in user's changes: see
+    /// [`crate::events::subscribe`].
+    pub async fn subscribe_events(
+        &self,
+        call: &CallInfo,
+        topics: &[&str],
+        cursor: &crate::events::EventCursor,
+        on_events: impl Fn(Vec<crate::events::PushEvent>) + 'static,
+    ) -> Result<crate::events::EventSubscription, ClientError> {
+        crate::events::subscribe(&self.session, call, topics, cursor, on_events).await
     }
 
     /// Marks `id` watched or not for the signed-in user; a series or season
@@ -539,6 +852,98 @@ impl NativeApi {
             user_state_result::State(s) => Ok(s?.get_played()),
             user_state_result::Error(e) => Err(ClientError::from_api(e?)),
         }
+    }
+
+    /// Saves where `id`, a book, was left for the signed-in user. The server
+    /// refuses anything else, an unreadable book, a locator over 256 bytes
+    /// and a fraction outside 0 to 1. A fraction of 0.99 or more also marks
+    /// it read. `read_at_ms` is when the page was read, unix milliseconds
+    /// (0 = now); the server keeps the newest reading, so a late save is
+    /// answered, not stored, when a newer one is there. Answers whether it is
+    /// now read.
+    pub async fn set_read_position(
+        &self,
+        call: &CallInfo,
+        id: ItemRef,
+        locator: &str,
+        fraction: f32,
+        read_at_ms: i64,
+    ) -> Result<bool, ClientError> {
+        let mut req = self.user_data.set_read_position_request();
+        {
+            let mut p = req.get();
+            call.write(p.reborrow().init_ctx());
+            set_item_ref(p.reborrow().init_id(), id);
+            p.set_locator(locator);
+            p.set_fraction(fraction);
+            p.set_read_at(read_at_ms);
+        }
+        let reply = req.send().promise.await?;
+        match reply
+            .get()?
+            .get_result()?
+            .which()
+            .map_err(capnp::Error::from)?
+        {
+            user_state_result::State(s) => Ok(s?.get_played()),
+            user_state_result::Error(e) => Err(ClientError::from_api(e?)),
+        }
+    }
+
+    /// Marks `id` one of the signed-in user's favourites (`true`) or not; a
+    /// series or season marks every episode in it. Answers whether it is now
+    /// a favourite.
+    pub async fn set_favorite(
+        &self,
+        call: &CallInfo,
+        id: ItemRef,
+        favorite: bool,
+    ) -> Result<bool, ClientError> {
+        let mut req = self.user_data.set_favorite_request();
+        {
+            let mut p = req.get();
+            call.write(p.reborrow().init_ctx());
+            set_item_ref(p.reborrow().init_id(), id);
+            p.set_favorite(favorite);
+        }
+        let reply = req.send().promise.await?;
+        match reply
+            .get()?
+            .get_result()?
+            .which()
+            .map_err(capnp::Error::from)?
+        {
+            user_state_result::State(s) => Ok(s?.get_favorite()),
+            user_state_result::Error(e) => Err(ClientError::from_api(e?)),
+        }
+    }
+
+    /// `limit` of the signed-in user's favourites of one `kind` from `start`,
+    /// across every library, by name. A series counts while every episode
+    /// in it is a favourite, which is what marking the series writes.
+    pub async fn favorites(
+        &self,
+        call: &CallInfo,
+        kind: ItemKind,
+        start: u32,
+        limit: u32,
+    ) -> Result<Page, ClientError> {
+        let Some(kind) = wire_kind(kind) else {
+            return Ok(Page::default());
+        };
+        let mut req = self.library.query_request();
+        {
+            let mut p = req.get();
+            call.write(p.reborrow().init_ctx());
+            let mut q = p.init_q();
+            q.reborrow().init_kinds(1).set(0, kind);
+            q.set_sort_by("SortName");
+            q.reborrow().init_filters(1).set(0, "IsFavorite");
+            q.set_start(start);
+            q.set_limit(limit);
+        }
+        let reply = req.send().promise.await?;
+        read_page(reply.get()?.get_result()?)
     }
 
     /// Who is signed in.
@@ -669,6 +1074,85 @@ impl NativeApi {
         }
     }
 
+    /// A short-lived Full token for the Manage pages, which call the admin
+    /// endpoints of the Jellyfin API with it as `X-Emby-Token` (ADR-0082).
+    /// Admins only: anyone else is refused `notPermitted`. It stops working
+    /// at `expires_at_ms` or when this session ends; ask again before then.
+    pub async fn manage_token(&self, call: &CallInfo) -> Result<MediaToken, ClientError> {
+        let mut req = self.session.manage_token_request();
+        call.write(req.get().init_ctx());
+        let reply = req.send().promise.await?;
+        match reply
+            .get()?
+            .get_result()?
+            .which()
+            .map_err(capnp::Error::from)?
+        {
+            media_token_result::Token(t) => {
+                let t = t?;
+                Ok(MediaToken {
+                    token: text(t.get_token())?,
+                    expires_at_ms: t.get_expires_at_ms(),
+                })
+            }
+            media_token_result::Error(e) => Err(ClientError::from_api(e?)),
+        }
+    }
+
+    /// The devices the signed-in user is signed in on (T130).
+    pub async fn my_devices(&self, call: &CallInfo) -> Result<Vec<MyDevice>, ClientError> {
+        let mut req = self.session.my_devices_request();
+        call.write(req.get().init_ctx());
+        let reply = req.send().promise.await?;
+        match reply
+            .get()?
+            .get_result()?
+            .which()
+            .map_err(capnp::Error::from)?
+        {
+            my_devices_result::Devices(list) => {
+                let mut out = Vec::new();
+                for d in list?.iter() {
+                    let mut converted_audio = Vec::new();
+                    for c in d.get_converted_audio()?.iter() {
+                        converted_audio.push(text(c)?);
+                    }
+                    out.push(MyDevice {
+                        id: text(d.get_id())?,
+                        name: text(d.get_name())?,
+                        current: d.get_current(),
+                        converted_audio,
+                    });
+                }
+                Ok(out)
+            }
+            my_devices_result::Error(e) => Err(ClientError::from_api(e?)),
+        }
+    }
+
+    /// Sets the sound formats `device_id`, one the signed-in user is signed
+    /// in on, is sent converted; empty clears it (T130).
+    pub async fn set_device_converted_audio(
+        &self,
+        call: &CallInfo,
+        device_id: &str,
+        codecs: &[String],
+    ) -> Result<(), ClientError> {
+        let mut req = self.session.set_device_converted_audio_request();
+        {
+            let mut p = req.get();
+            call.write(p.reborrow().init_ctx());
+            p.set_device_id(device_id);
+            let len = u32::try_from(codecs.len()).unwrap_or(u32::MAX);
+            let mut list = p.init_codecs(len);
+            for (i, c) in codecs.iter().enumerate().take(len as usize) {
+                list.set(i as u32, c.as_str());
+            }
+        }
+        let reply = req.send().promise.await?;
+        crate::read_done(reply.get()?.get_result()?)
+    }
+
     /// Removes the signed-in user's avatar.
     pub async fn remove_avatar(&self, call: &CallInfo) -> Result<(), ClientError> {
         let mut req = self.session.remove_avatar_request();
@@ -768,6 +1252,110 @@ impl NativeApi {
             done::Error(e) => Err(ClientError::from_api(e?)),
         }
     }
+
+    /// Sends a "Report a problem": the user's `note` and the `bundle` JSON
+    /// object the user was shown. Returns the report's id. Since schema 35.
+    pub async fn report_problem(
+        &self,
+        call: &CallInfo,
+        note: &str,
+        bundle: &[u8],
+    ) -> Result<String, ClientError> {
+        let mut req = self.telemetry.report_request();
+        {
+            let mut p = req.get();
+            call.write(p.reborrow().init_ctx());
+            p.set_note(note);
+            p.set_bundle(bundle);
+        }
+        let reply = req.send().promise.await?;
+        match reply
+            .get()?
+            .get_result()?
+            .which()
+            .map_err(capnp::Error::from)?
+        {
+            report_result::ReportId(id) => Ok(text(id)?),
+            report_result::Error(e) => Err(ClientError::from_api(e?)),
+        }
+    }
+
+    /// The signed-in user's stored reports, newest first; with `everyone`
+    /// (admins only) every user's.
+    pub async fn list_reports(
+        &self,
+        call: &CallInfo,
+        everyone: bool,
+    ) -> Result<Vec<ReportSummary>, ClientError> {
+        let mut req = self.telemetry.list_reports_request();
+        {
+            let mut p = req.get();
+            call.write(p.reborrow().init_ctx());
+            p.set_everyone(everyone);
+        }
+        let reply = req.send().promise.await?;
+        match reply
+            .get()?
+            .get_result()?
+            .which()
+            .map_err(capnp::Error::from)?
+        {
+            report_list_result::Reports(rows) => rows?
+                .iter()
+                .map(|r| {
+                    Ok(ReportSummary {
+                        id: text(r.get_id())?,
+                        received_wall_ms: r.get_received_wall_ms(),
+                        user_name: text(r.get_user_name())?,
+                        note: text(r.get_note())?,
+                        bytes: r.get_bytes(),
+                    })
+                })
+                .collect::<Result<_, capnp::Error>>()
+                .map_err(ClientError::from),
+            report_list_result::Error(e) => Err(ClientError::from_api(e?)),
+        }
+    }
+
+    /// One stored report's JSON document.
+    pub async fn get_report(&self, call: &CallInfo, id: &str) -> Result<Vec<u8>, ClientError> {
+        let mut req = self.telemetry.get_report_request();
+        {
+            let mut p = req.get();
+            call.write(p.reborrow().init_ctx());
+            p.set_id(id);
+        }
+        let reply = req.send().promise.await?;
+        match reply
+            .get()?
+            .get_result()?
+            .which()
+            .map_err(capnp::Error::from)?
+        {
+            report_document_result::Document(d) => Ok(d?.to_vec()),
+            report_document_result::Error(e) => Err(ClientError::from_api(e?)),
+        }
+    }
+
+    /// Deletes one stored report.
+    pub async fn delete_report(&self, call: &CallInfo, id: &str) -> Result<(), ClientError> {
+        let mut req = self.telemetry.delete_report_request();
+        {
+            let mut p = req.get();
+            call.write(p.reborrow().init_ctx());
+            p.set_id(id);
+        }
+        let reply = req.send().promise.await?;
+        match reply
+            .get()?
+            .get_result()?
+            .which()
+            .map_err(capnp::Error::from)?
+        {
+            done::Ok(()) => Ok(()),
+            done::Error(e) => Err(ClientError::from_api(e?)),
+        }
+    }
 }
 
 impl PharosApi for NativeApi {
@@ -805,6 +1393,7 @@ impl PharosApi for NativeApi {
                     rails,
                     resume: read_items(home.get_resume()?)?,
                     listening: read_items(home.get_listening()?)?,
+                    reading: read_items(home.get_reading()?)?,
                     next_up: read_items(home.get_next_up()?)?,
                 })
             }
@@ -885,11 +1474,21 @@ impl PharosApi for NativeApi {
     }
 
     async fn detail(&self, call: &CallInfo, id: ItemRef) -> Result<Detail, ClientError> {
+        self.detail_version(call, id, "").await
+    }
+
+    async fn detail_version(
+        &self,
+        call: &CallInfo,
+        id: ItemRef,
+        version: &str,
+    ) -> Result<Detail, ClientError> {
         let mut req = self.library.detail_request();
         {
             let mut p = req.get();
             call.write(p.reborrow().init_ctx());
-            set_item_ref(p.init_id(), id);
+            set_item_ref(p.reborrow().init_id(), id);
+            p.set_version(version);
         }
         let reply = req.send().promise.await?;
         match reply
@@ -973,9 +1572,104 @@ impl PharosApi for NativeApi {
                         .map(text)
                         .collect::<Result<_, capnp::Error>>()?,
                     album: Some(text(d.get_album())?).filter(|a| !a.is_empty()),
+                    cast: d
+                        .get_cast()?
+                        .iter()
+                        .filter_map(|c| {
+                            let kind = read_credit_kind(c.get_kind())?;
+                            Some((|| -> Result<Credit, capnp::Error> {
+                                Ok(Credit {
+                                    name: text(c.get_name())?,
+                                    character: text(c.get_character())?,
+                                    kind,
+                                    image_url: Some(text(c.get_image_url())?)
+                                        .filter(|u| !u.is_empty()),
+                                    person: if c.has_person_id() {
+                                        Some(read_item_ref(c.get_person_id()?)?)
+                                    } else {
+                                        None
+                                    },
+                                })
+                            })())
+                        })
+                        .collect::<Result<_, capnp::Error>>()?,
+                    versions: d
+                        .get_versions()?
+                        .iter()
+                        .map(read_version)
+                        .collect::<Result<_, capnp::Error>>()?,
+                    damage: read_damage(d.get_damage()?)?,
+                    book: read_book(&d)?,
+                    read_position: read_read_position(d.get_summary()?.get_user_state()?)?,
                 })
             }
             detail_result::Error(e) => Err(ClientError::from_api(e?)),
+        }
+    }
+
+    async fn person(&self, call: &CallInfo, id: ItemRef) -> Result<PersonPage, ClientError> {
+        use pharos_api::pharos_capnp::{person_credit, person_result};
+        // A credit kind newer than this build still lists the item: being on
+        // the page matters more than the label.
+        fn appearance(a: person_credit::Reader<'_>) -> Result<Appearance, capnp::Error> {
+            Ok(Appearance {
+                item: read_item(a.get_item()?)?,
+                character: text(a.get_character())?,
+                kind: read_credit_kind(a.get_kind()).unwrap_or_default(),
+            })
+        }
+        let mut req = self.library.person_request();
+        {
+            let mut p = req.get();
+            call.write(p.reborrow().init_ctx());
+            set_item_ref(p.init_id(), id);
+        }
+        let reply = req.send().promise.await?;
+        match reply
+            .get()?
+            .get_result()?
+            .which()
+            .map_err(capnp::Error::from)?
+        {
+            person_result::Person(p) => {
+                let p = p?;
+                Ok(PersonPage {
+                    id: Some(read_item_ref(p.get_id()?)?),
+                    name: text(p.get_name())?,
+                    image_url: Some(text(p.get_image_url())?).filter(|u| !u.is_empty()),
+                    biography: known(p.get_biography())?,
+                    birth_date: known(p.get_birth_date())?,
+                    death_date: known(p.get_death_date())?,
+                    birth_place: known(p.get_birth_place())?,
+                    imdb_id: known(p.get_imdb_id())?,
+                    wikidata_id: known(p.get_wikidata_id())?,
+                    films: p
+                        .get_films()?
+                        .iter()
+                        .map(appearance)
+                        .collect::<Result<_, capnp::Error>>()?,
+                    shows: p
+                        .get_shows()?
+                        .iter()
+                        .map(|s| {
+                            Ok(ShowAppearances {
+                                series: read_item(s.get_series()?)?,
+                                characters: s.get_characters()?.iter().map(text).collect::<Result<
+                                    _,
+                                    capnp::Error,
+                                >>(
+                                )?,
+                                episodes: s
+                                    .get_episodes()?
+                                    .iter()
+                                    .map(appearance)
+                                    .collect::<Result<_, capnp::Error>>()?,
+                            })
+                        })
+                        .collect::<Result<_, capnp::Error>>()?,
+                })
+            }
+            person_result::Error(e) => Err(ClientError::from_api(e?)),
         }
     }
 
@@ -1065,6 +1759,7 @@ impl PharosApi for NativeApi {
         &self,
         call: &CallInfo,
         id: ItemRef,
+        version: &str,
         caps: &Capabilities,
         picks: TrackPicks,
     ) -> Result<(Decision, NativeGrant), ClientError> {
@@ -1073,28 +1768,10 @@ impl PharosApi for NativeApi {
             let mut p = req.get();
             call.write(p.reborrow().init_ctx());
             set_item_ref(p.reborrow().init_id(), id);
-            let mut c = p.reborrow().init_caps();
-            set_texts(
-                c.reborrow().init_video_codecs(len(&caps.video_codecs)),
-                &caps.video_codecs,
-            );
-            set_texts(
-                c.reborrow().init_audio_codecs(len(&caps.audio_codecs)),
-                &caps.audio_codecs,
-            );
-            set_texts(
-                c.reborrow().init_containers(len(&caps.containers)),
-                &caps.containers,
-            );
-            c.set_max_bitrate(caps.max_bitrate);
-            c.set_hdr(caps.hdr);
-            set_texts(
-                c.reborrow()
-                    .init_image_subtitles(len(&caps.image_subtitles)),
-                &caps.image_subtitles,
-            );
+            set_caps(p.reborrow().init_caps(), caps);
             set_choice(p.reborrow().init_audio(), picks.audio);
-            set_choice(p.init_subtitle(), picks.subtitle);
+            set_choice(p.reborrow().init_subtitle(), picks.subtitle);
+            p.set_version(version);
         }
         let reply = req.send().promise.await?;
         let grant = match reply
@@ -1131,6 +1808,59 @@ impl PharosApi for NativeApi {
         };
         Ok((decision, NativeGrant(grant)))
     }
+
+    async fn start_tracks(
+        &self,
+        call: &CallInfo,
+        id: ItemRef,
+        caps: &Capabilities,
+    ) -> Result<StartTracks, ClientError> {
+        let mut req = self.playback.start_tracks_request();
+        {
+            let mut p = req.get();
+            call.write(p.reborrow().init_ctx());
+            set_item_ref(p.reborrow().init_id(), id);
+            set_caps(p.reborrow().init_caps(), caps);
+        }
+        let reply = req.send().promise.await?;
+        match reply
+            .get()?
+            .get_result()?
+            .which()
+            .map_err(capnp::Error::from)?
+        {
+            start_tracks_result::Tracks(t) => {
+                let t = t?;
+                Ok(StartTracks {
+                    audio: read_opt_u32(t.get_audio()?)?,
+                    subtitle: read_opt_u32(t.get_subtitle()?)?,
+                })
+            }
+            start_tracks_result::Error(e) => Err(ClientError::from_api(e?)),
+        }
+    }
+}
+
+fn set_caps(mut c: capabilities::Builder<'_>, caps: &Capabilities) {
+    set_texts(
+        c.reborrow().init_video_codecs(len(&caps.video_codecs)),
+        &caps.video_codecs,
+    );
+    set_texts(
+        c.reborrow().init_audio_codecs(len(&caps.audio_codecs)),
+        &caps.audio_codecs,
+    );
+    set_texts(
+        c.reborrow().init_containers(len(&caps.containers)),
+        &caps.containers,
+    );
+    c.set_max_bitrate(caps.max_bitrate);
+    c.set_hdr(caps.hdr);
+    set_texts(
+        c.reborrow()
+            .init_image_subtitles(len(&caps.image_subtitles)),
+        &caps.image_subtitles,
+    );
 }
 
 /// Items per home rail: a screen's width of posters and some to scroll.
@@ -1171,6 +1901,30 @@ impl PlaybackGrant for NativeGrant {
         let reply = req.send().promise.await?;
         crate::read_done(reply.get()?.get_result()?)
     }
+
+    async fn queue_hint(&self, call: &CallInfo) -> Result<QueueHint, ClientError> {
+        use pharos_api::pharos_capnp::queue_hint_result;
+        let mut req = self.0.queue_hint_request();
+        call.write(req.get().init_ctx());
+        let reply = req.send().promise.await?;
+        match reply
+            .get()?
+            .get_result()?
+            .which()
+            .map_err(capnp::Error::from)?
+        {
+            queue_hint_result::Hint(h) => {
+                let h = h?;
+                Ok(QueueHint {
+                    queued: h.get_queued(),
+                    waited_ms: h.get_waited_ms(),
+                    others_queued: h.get_others_queued(),
+                    busy: h.get_busy(),
+                })
+            }
+            queue_hint_result::Error(e) => Err(ClientError::from_api(e?)),
+        }
+    }
 }
 
 fn set_choice(mut out: stream_choice::Builder<'_>, choice: TrackChoice) {
@@ -1194,6 +1948,7 @@ fn read_tracks(
                 is_default: t.get_is_default(),
                 is_forced: t.get_is_forced(),
                 is_hearing_impaired: t.get_is_hearing_impaired(),
+                channels: t.get_channels(),
                 vtt_url: match read_delivery(t.get_delivery()) {
                     SubtitleDelivery::External => Some(text(t.get_url())?),
                     SubtitleDelivery::Burn | SubtitleDelivery::Image => None,
@@ -1210,6 +1965,11 @@ fn read_tracks(
 
 pub(crate) fn text(t: capnp::Result<capnp::text::Reader<'_>>) -> Result<String, capnp::Error> {
     Ok(t?.to_string()?)
+}
+
+/// `t`, or `None` when it is empty (unknown).
+fn known(t: capnp::Result<capnp::text::Reader<'_>>) -> Result<Option<String>, capnp::Error> {
+    Ok(Some(text(t)?).filter(|s| !s.is_empty()))
 }
 
 fn len(list: &[String]) -> u32 {
@@ -1276,6 +2036,15 @@ fn read_library_kind(kind: Result<WireLibraryKind, capnp::NotInSchema>) -> Libra
     }
 }
 
+/// A credit kind newer than this build has no row to show it in, so the
+/// credit is left out rather than failing the whole detail.
+fn read_credit_kind(kind: Result<WireCreditKind, capnp::NotInSchema>) -> Option<CreditKind> {
+    match kind.ok()? {
+        WireCreditKind::Actor => Some(CreditKind::Actor),
+        WireCreditKind::GuestStar => Some(CreditKind::GuestStar),
+    }
+}
+
 fn read_kind(kind: Result<Kind, capnp::NotInSchema>) -> ItemKind {
     let Ok(kind) = kind else {
         return ItemKind::Other;
@@ -1321,12 +2090,16 @@ fn write_listing(mut q: item_query::Builder<'_>, listing: &Listing) {
     q.set_sort_by(&listing.sort_by);
     q.set_descending(listing.descending);
     q.set_genre(listing.genre.as_deref().unwrap_or_default());
-    let played = listing
-        .played
-        .map(|p| if p { "IsPlayed" } else { "IsUnplayed" });
-    let mut filters = q.init_filters(u32::from(played.is_some()));
-    if let Some(played) = played {
-        filters.set(0, played);
+    q.set_stereo(match listing.stereo {
+        None => StereoFilter::Any,
+        Some(true) => StereoFilter::Only3d,
+        Some(false) => StereoFilter::Only2d,
+    });
+    q.set_collapse_collections(listing.collapse);
+    let watched = listing.watched.map(Watched::filter);
+    let mut filters = q.init_filters(u32::from(watched.is_some()));
+    if let Some(watched) = watched {
+        filters.set(0, watched);
     }
 }
 
@@ -1384,6 +2157,110 @@ pub(crate) fn read_item(item: item_summary::Reader<'_>) -> Result<Item, capnp::E
             .then(|| read_library_kind(item.get_library_kind())),
         imdb_rating: read_opt_u16(item.get_imdb_rating()?)?,
         critic_rating: read_opt_u16(item.get_critic_rating()?)?,
+        artist: Some(text(item.get_artist())?).filter(|a| !a.is_empty()),
+        stereo: read_stereo(item.get_stereo()),
+        damaged: item.get_damaged(),
+    })
+}
+
+/// An enum value this build does not know (a newer server's) reads as 2D.
+fn read_stereo(stereo: Result<WireStereo, capnp::NotInSchema>) -> Option<Stereo> {
+    match stereo.ok()? {
+        WireStereo::None => None,
+        WireStereo::HalfSideBySide => Some(Stereo::HalfSideBySide),
+        WireStereo::FullSideBySide => Some(Stereo::FullSideBySide),
+        WireStereo::HalfTopAndBottom => Some(Stereo::HalfTopAndBottom),
+        WireStereo::FullTopAndBottom => Some(Stereo::FullTopAndBottom),
+        WireStereo::Mvc => Some(Stereo::Mvc),
+    }
+}
+
+fn read_book(
+    d: &pharos_api::pharos_capnp::item_detail::Reader<'_>,
+) -> Result<Option<Book>, capnp::Error> {
+    if !d.has_book() {
+        return Ok(None);
+    }
+    let b = d.get_book()?;
+    // A format newer than this build reads as unreadable: no Read action.
+    let format = match b.get_format() {
+        Ok(WireBookFormat::Epub) => BookFormat::Epub,
+        Ok(WireBookFormat::Pdf) => BookFormat::Pdf,
+        Ok(WireBookFormat::Comic) => BookFormat::Comic,
+        Ok(WireBookFormat::Unreadable) | Err(_) => BookFormat::Unreadable,
+    };
+    Ok(Some(Book {
+        format,
+        author: text(b.get_author())?,
+        page_count: b.get_page_count(),
+    }))
+}
+
+fn read_read_position(
+    state: pharos_api::pharos_capnp::user_state::Reader<'_>,
+) -> Result<Option<ReadPosition>, capnp::Error> {
+    let locator = text(state.get_read_locator())?;
+    Ok((!locator.is_empty()).then(|| ReadPosition {
+        locator,
+        fraction: state.get_read_fraction(),
+        read_at_ms: state.get_read_at(),
+    }))
+}
+
+fn read_damage(
+    d: pharos_api::pharos_capnp::damage::Reader<'_>,
+) -> Result<Option<Damage>, capnp::Error> {
+    let verdict = text(d.get_verdict())?;
+    if verdict.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(Damage {
+        verdict,
+        reason: text(d.get_reason())?,
+        ranges: d
+            .get_ranges()?
+            .iter()
+            .map(|r| DamageSpan {
+                start_ms: r.get_start_ms(),
+                end_ms: r.get_end_ms(),
+            })
+            .collect(),
+        checked_at: Some(d.get_checked_at()).filter(|t| *t > 0),
+    }))
+}
+
+fn read_version(v: pharos_api::pharos_capnp::version::Reader<'_>) -> Result<Version, capnp::Error> {
+    Ok(Version {
+        id: text(v.get_id())?,
+        name: text(v.get_name())?,
+        stereo: read_stereo(v.get_stereo()),
+        primary: v.get_primary(),
+        width: v.get_width(),
+        height: v.get_height(),
+        video_codec: text(v.get_video_codec())?,
+        hdr: text(v.get_hdr())?,
+        audio: v
+            .get_audio()?
+            .iter()
+            .map(|a| {
+                Ok(VersionAudio {
+                    language: text(a.get_language())?,
+                    codec: text(a.get_codec())?,
+                    channels: a.get_channels(),
+                })
+            })
+            .collect::<Result<_, capnp::Error>>()?,
+        size_bytes: v.get_size_bytes(),
+        container: text(v.get_container())?,
+        path: text(v.get_path())?,
+        damaged: v.get_damaged(),
+        duration_ms: v.get_duration_ms(),
+        picture: (v.get_picture_width() > 0 && v.get_picture_height() > 0).then(|| PictureArea {
+            x: v.get_picture_x(),
+            y: v.get_picture_y(),
+            width: v.get_picture_width(),
+            height: v.get_picture_height(),
+        }),
     })
 }
 
@@ -1418,6 +2295,15 @@ mod tests {
         assert!(decision("transcode", "/videos/1/master.m3u8?PlaySessionId=p").is_hls());
         assert!(!decision("direct_play", "/videos/1/stream?static=true").is_hls());
         assert!(!decision("", "/videos/1/stream?static=true&x=.m3u8").is_hls());
+    }
+
+    #[test]
+    fn a_credit_kind_newer_than_the_client_is_left_out() {
+        assert_eq!(read_credit_kind(Err(capnp::NotInSchema(9))), None);
+        assert_eq!(
+            read_credit_kind(Ok(WireCreditKind::GuestStar)),
+            Some(CreditKind::GuestStar)
+        );
     }
 
     #[test]

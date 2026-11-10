@@ -13,12 +13,62 @@ use crate::text::unwrap_marks;
 use crate::version::DIRECTOR_VERSION;
 
 /// What [`direct`] decided, with a tally for the per-item log line.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Direction {
     /// One entry per source line.
     pub plan: EffectPlan,
     /// Lines per intent; intents with no line are absent.
     pub counts: BTreeMap<Intent, usize>,
+    /// The dialogue loudness the rules measured against (lines outside an
+    /// intro or outro), for the per-item log line.
+    pub loudness: Loudness,
+    /// Lines per [`BottomText`] verdict; verdicts with no line are absent.
+    pub bottom_text: BTreeMap<BottomText, usize>,
+}
+
+/// What burned-in bottom text did to a line's placement (B1207).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum BottomText {
+    /// No keyframe was checked for the line.
+    Unchecked,
+    /// The picture under the line has no text at the bottom.
+    Clear,
+    /// Text at the bottom, so the line was lifted to the top.
+    Lifted,
+    /// Text at the bottom, but the line is typeset or already placed.
+    Kept,
+}
+
+impl BottomText {
+    pub const ALL: [BottomText; 4] = [
+        BottomText::Unchecked,
+        BottomText::Clear,
+        BottomText::Lifted,
+        BottomText::Kept,
+    ];
+
+    /// The metric label; a dashboard contract.
+    pub fn label(self) -> &'static str {
+        match self {
+            BottomText::Unchecked => "unchecked",
+            BottomText::Clear => "clear",
+            BottomText::Lifted => "lifted",
+            BottomText::Kept => "kept",
+        }
+    }
+}
+
+/// A class of lines' loudness: its median, its spread, and the factor the
+/// loudness rules' margins were widened by.
+#[derive(Clone, Copy, Debug, PartialEq, Default)]
+pub struct Loudness {
+    pub median_lufs: Option<f32>,
+    /// Twice the lower-quartile-to-median distance of the lines' loudness,
+    /// LU (an interquartile range for a symmetric spread).
+    pub spread_lu: Option<f32>,
+    /// 1.0 for dialogue as tightly mixed as [`REFERENCE_SPREAD_LU`]; more for
+    /// a wider mix, so a film's loud scenes do not all read as shouting.
+    pub scale: f32,
 }
 
 /// Loudness at or below this is silence, not speech: no signal (matches the
@@ -29,8 +79,22 @@ const SILENCE_LUFS: f32 = -70.0;
 /// Fewest lines a segment kind needs for its own medians; fewer borrow the
 /// whole track's.
 const MIN_GROUP: usize = 3;
-/// How far above its median a line must be to shout.
+/// Values a spread needs: with fewer, one odd line sets the quartile and the
+/// margins it widens.
+const MIN_SPREAD: usize = 8;
+/// How far above its median a line must be to shout, for a track whose
+/// dialogue spread is [`REFERENCE_SPREAD_LU`]. Every loudness margin below
+/// is scaled by [`Loudness::scale`] (B1204).
 const SHOUT_DLU: f32 = 6.0;
+/// The dialogue loudness spread ([`Loudness::spread_lu`]) the margins were tuned
+/// on: compressed TV dialogue. A film mix is often twice as wide.
+const REFERENCE_SPREAD_LU: f32 = 3.0;
+/// The widest scaling: past this a track's spread is noise, not dynamics.
+const MAX_SCALE: f32 = 3.0;
+/// A shout with no `!` and no shouted capitals must also be pitched up by
+/// this much over the median: a loud scene raises loudness, a raised voice
+/// raises pitch too (B1204).
+const SHOUT_PITCH_RATIO: f32 = 1.1;
 /// Extra margin inside an Intro or Outro, where music swells (plan.md Risks).
 const MUSIC_SHOUT_EXTRA_DLU: f32 = 3.0;
 /// Loudness step per Shout intensity level.
@@ -46,6 +110,22 @@ const CAPS_RATIO: f32 = 0.8;
 const ATTACK_MAX_WORDS: usize = 3;
 /// Most words in a bracketed sound name.
 const SFX_MAX_WORDS: usize = 4;
+/// Sounds and non-speech voices a bracketed cue may open with, as verbs
+/// (matched in their -s, -ing and -ed forms) and as nouns (matched as
+/// written). Laughter is [`LAUGH_VERBS`].
+const SOUND_VERBS: [&str; 30] = [
+    "sigh", "gasp", "groan", "grunt", "scream", "shriek", "sob", "cry", "cough", "sneeze", "pant",
+    "snore", "yawn", "whimper", "growl", "roar", "cheer", "applaud", "scoff", "snort", "sniff",
+    "knock", "bang", "crash", "thud", "ring", "buzz", "beep", "clap", "thunder",
+];
+const SOUND_NOUNS: [&str; 6] = [
+    "explosion",
+    "explosions",
+    "applause",
+    "gunshot",
+    "gunshots",
+    "thunder",
+];
 const PHONE_DEVICES: [&str; 11] = [
     "phone",
     "telephone",
@@ -90,6 +170,8 @@ struct Audio {
 struct Medians {
     lufs: Option<f32>,
     pitch: Option<f32>,
+    spread: Option<f32>,
+    scale: f32,
 }
 
 /// Directs `lines`: one [`LineEffect`] each, from the first rule that
@@ -101,10 +183,12 @@ pub fn direct(lines: &[SourceLine], signals: &TrackSignals, segments: &[Segment]
         .map(|i| audio_of(signals.lines.get(i)))
         .collect();
     let medians = medians(lines, &kinds, &audio);
+    let rest = medians[Class::Rest as usize];
     let caps_track = is_caps_track(lines);
 
     let mut out = Vec::with_capacity(lines.len());
     let mut counts: BTreeMap<Intent, usize> = BTreeMap::new();
+    let mut bottom_text: BTreeMap<BottomText, usize> = BTreeMap::new();
     for (i, line) in lines.iter().enumerate() {
         let med = medians[class_of(kinds[i]) as usize];
         let mut fx = decide(line, kinds[i], audio[i], med, caps_track);
@@ -115,6 +199,9 @@ pub fn direct(lines: &[SourceLine], signals: &TrackSignals, segments: &[Segment]
             fx.static_only = true;
             fx.reason.push_str(" static=cut");
         }
+        let verdict =
+            dodge_bottom_text(&mut fx, line, signals.bottom_text.get(i).copied().flatten());
+        *bottom_text.entry(verdict).or_insert(0) += 1;
         *counts.entry(fx.intent).or_insert(0) += 1;
         out.push(fx);
     }
@@ -124,7 +211,32 @@ pub fn direct(lines: &[SourceLine], signals: &TrackSignals, segments: &[Segment]
             lines: out,
         },
         counts,
+        loudness: Loudness {
+            median_lufs: rest.lufs,
+            spread_lu: rest.spread,
+            scale: rest.scale,
+        },
+        bottom_text,
     }
+}
+
+/// Lifts a line to the top when text is burned into the bottom of the
+/// picture under it, so the two do not overprint (B1207). A typeset line, or
+/// one an effect already placed, keeps its spot.
+fn dodge_bottom_text(fx: &mut LineEffect, line: &SourceLine, share: Option<f32>) -> BottomText {
+    let Some(share) = share.filter(|s| s.is_finite()) else {
+        return BottomText::Unchecked;
+    };
+    if share <= 0.0 {
+        return BottomText::Clear;
+    }
+    if line.typeset || fx.placement != Placement::Default {
+        return BottomText::Kept;
+    }
+    fx.placement = Placement::Top;
+    fx.reason
+        .push_str(&format!(" place=top bottom_text={share:.3}"));
+    BottomText::Lifted
 }
 
 fn effect(intent: Intent, intensity: u8, reason: String) -> LineEffect {
@@ -170,7 +282,13 @@ fn decide(
             format!("rule=flashback style={}", line.style),
         );
     }
-    // 1
+    // 1. Laughter before other sounds (B1205).
+    if is_laugh_cue(text) {
+        return effect(Intent::Laugh, 1, "rule=laugh cue".into());
+    }
+    if is_laughter(text) {
+        return effect(Intent::Laugh, 1, "rule=laugh text".into());
+    }
     if is_sfx(text) {
         return effect(Intent::Sfx, 1, "rule=sfx".into());
     }
@@ -197,12 +315,17 @@ fn decide(
     if whisper_tag {
         return effect(Intent::Whisper, 1, "rule=whisper tag".into());
     }
-    if let Some(d) = dlu.filter(|&d| d <= WHISPER_DLU) {
-        return effect(Intent::Whisper, 1, format!("rule=whisper dlu={d:+.1}"));
+    let k = med.scale;
+    if let Some(d) = dlu.filter(|&d| d <= WHISPER_DLU * k) {
+        return effect(
+            Intent::Whisper,
+            1,
+            format!("rule=whisper dlu={d:+.1} scale={k:.2}"),
+        );
     }
     // 5
     let in_parens = text.starts_with(['(', '（']) && unwrap_marks(text) != text;
-    if let Some(d) = dlu.filter(|d| d.abs() <= NEAR_MEDIAN_DLU) {
+    if let Some(d) = dlu.filter(|d| d.abs() <= NEAR_MEDIAN_DLU * k) {
         if in_parens || line.italic {
             return effect(Intent::Thought, 1, format!("rule=thought dlu={d:+.1}"));
         }
@@ -219,31 +342,46 @@ fn decide(
         // p >= 1.2 * mp, in integers-friendly form to avoid rounding at the edge.
         if (1..=ATTACK_MAX_WORDS).contains(&words)
             && text.ends_with(['!', '！'])
-            && d >= ATTACK_DLU
+            && d >= ATTACK_DLU * k
             && mp > 0.0
             && p * 5.0 >= mp * 6.0
         {
             return effect(
                 Intent::AttackCall,
                 2,
-                format!("rule=attack_call dlu={d:+.1} pitch={p:.0} med={mp:.0}"),
+                format!("rule=attack_call dlu={d:+.1} pitch={p:.0} med={mp:.0} scale={k:.2}"),
             );
         }
     }
     // 8
-    let threshold = SHOUT_DLU + if in_music { MUSIC_SHOUT_EXTRA_DLU } else { 0.0 };
-    let loud = dlu.filter(|&d| d >= threshold);
-    let shouting_caps = !caps_track && caps.mostly && text.contains(['!', '！']);
+    let threshold = (SHOUT_DLU + if in_music { MUSIC_SHOUT_EXTRA_DLU } else { 0.0 }) * k;
+    let bang = text.contains(['!', '！']);
+    let raised = match (a.pitch, med.pitch) {
+        (Some(p), Some(mp)) if mp > 0.0 => p >= mp * SHOUT_PITCH_RATIO,
+        _ => false,
+    };
+    let loud = dlu.filter(|&d| d >= threshold && (bang || raised));
+    let shouting_caps = !caps_track && caps.mostly && bang;
     if loud.is_some() || shouting_caps {
-        let intensity = match dlu {
-            Some(d) if d >= 15.0 => 3,
-            Some(d) => 1 + ((d - threshold) / SHOUT_STEP_DLU).clamp(0.0, 2.0) as u8,
+        let intensity = match loud {
+            Some(d) if d >= threshold + 3.0 * SHOUT_STEP_DLU * k => 3,
+            Some(d) => 1 + ((d - threshold) / (SHOUT_STEP_DLU * k)).clamp(0.0, 2.0) as u8,
             None => 1,
+        };
+        let cue = if bang {
+            "bang"
+        } else if raised {
+            "pitch"
+        } else {
+            "none"
         };
         return effect(
             Intent::Shout,
             intensity,
-            format!("rule=shout dlu={dlu_s} caps={:.2}", caps.ratio),
+            format!(
+                "rule=shout dlu={dlu_s} thr={threshold:.1} cue={cue} caps={:.2}",
+                caps.ratio
+            ),
         );
     }
     // 9
@@ -267,16 +405,139 @@ fn decide(
 }
 
 fn is_sfx(text: &str) -> bool {
-    if text.starts_with(['(', '（']) {
+    let Some((inner, first)) = bracket_cue(text) else {
+        return false;
+    };
+    // Parentheses usually hold a thought; only a sound cue there is a sound
+    // (B1203: `(sighs)` was drawn as a thought).
+    if text.starts_with(['(', '（']) && !is_cue_word(&inner, &first, &SOUND_VERBS, &SOUND_NOUNS) {
         return false;
     }
+    let lower = inner.to_lowercase();
+    !is_phone_tag(&lower) && !is_whisper_tag(&lower)
+}
+
+/// Verbs that open a laugh cue.
+const LAUGH_VERBS: [&str; 7] = [
+    "laugh", "chuckle", "giggle", "snicker", "cackle", "chortle", "guffaw",
+];
+
+/// A whole line in brackets, parentheses or stars naming laughter:
+/// `(laughs)`, `[giggling nervously]`, `*chuckles*`.
+fn is_laugh_cue(text: &str) -> bool {
+    bracket_cue(text).is_some_and(|(inner, first)| is_cue_word(&inner, &first, &LAUGH_VERBS, &[]))
+}
+
+/// A whole-line bracket, parenthesis or star pair short enough to be a cue
+/// (at most [`SFX_MAX_WORDS`] words, no `,` `?` `.`): its contents and their
+/// first word, lowercased and stripped of punctuation.
+fn bracket_cue(text: &str) -> Option<(String, String)> {
     let inner = unwrap_marks(text);
-    inner != text
-        && !inner.is_empty()
-        && inner.split_whitespace().count() <= SFX_MAX_WORDS
-        && !inner.contains([',', '?', '.'])
-        && !is_phone_tag(&inner.to_lowercase())
-        && !is_whisper_tag(&inner.to_lowercase())
+    if inner == text
+        || inner.is_empty()
+        || inner.split_whitespace().count() > SFX_MAX_WORDS
+        || inner.contains([',', '?', '.'])
+    {
+        return None;
+    }
+    let first = inner
+        .split_whitespace()
+        .next()?
+        .trim_matches(|c: char| !c.is_alphabetic())
+        .to_lowercase();
+    Some((inner.to_owned(), first))
+}
+
+/// Whether a cue opens with one of `verbs` in an -s, -ing or -ed form, one
+/// of `nouns`, or a bare verb standing alone: `(knocking on door)` and
+/// `(knock)` are cues, `(Knock it off)` is speech.
+fn is_cue_word(inner: &str, first: &str, verbs: &[&str], nouns: &[&str]) -> bool {
+    if nouns.contains(&first) {
+        return true;
+    }
+    let alone = inner.split_whitespace().count() == 1;
+    verbs
+        .iter()
+        .any(|v| (alone && first == *v) || verb_forms(v).iter().any(|f| f == first))
+}
+
+/// The -s, -ing and -ed forms of a regular verb, with the spelling changes
+/// the cue verbs need (`sneezing`, `cries`, `sobbing`).
+fn verb_forms(v: &str) -> Vec<String> {
+    let mut out = vec![
+        format!("{v}s"),
+        format!("{v}es"),
+        format!("{v}ing"),
+        format!("{v}ed"),
+    ];
+    if let Some(stem) = v.strip_suffix('e') {
+        out.push(format!("{stem}ing"));
+        out.push(format!("{v}d"));
+    }
+    if let Some(stem) = v.strip_suffix('y') {
+        out.push(format!("{stem}ies"));
+        out.push(format!("{stem}ied"));
+    }
+    let b = v.as_bytes();
+    if let [.., c1, vowel, last] = b {
+        let vowels = b"aeiou";
+        if !vowels.contains(c1)
+            && vowels.contains(vowel)
+            && !vowels.contains(last)
+            && !b"wxy".contains(last)
+        {
+            let last = *last as char;
+            out.push(format!("{v}{last}ing"));
+            out.push(format!("{v}{last}ed"));
+        }
+    }
+    out
+}
+
+/// A line that is only laughter, at least two beats of it: `Ha ha!`,
+/// `Hahaha`, `Heh heh`, `Ahaha!`. A lone `Ha!` is often a scoff.
+fn is_laughter(text: &str) -> bool {
+    // A question or a trailing-off is a stammer (`He... he...?`), not a laugh.
+    if text.contains(['?', '？', '…']) || text.contains("..") {
+        return false;
+    }
+    let mut beats = 0usize;
+    let mut words = 0usize;
+    for word in text.split(|c: char| c.is_whitespace() || c == '-') {
+        let w: String = word
+            .chars()
+            .filter(|c| c.is_alphabetic())
+            .flat_map(char::to_lowercase)
+            .collect();
+        if w.is_empty() {
+            continue;
+        }
+        words += 1;
+        let Some(n) = laugh_beats(&w) else {
+            return false;
+        };
+        beats += n;
+    }
+    words > 0 && beats >= 2
+}
+
+/// How many `ha`/`he`/`ho` beats `w` is made of, allowing a leading
+/// `a` and a trailing `h` (`ahaha`, `heh`); `None` when it is anything else.
+fn laugh_beats(w: &str) -> Option<usize> {
+    let w = w.strip_prefix('a').unwrap_or(w);
+    let w = w.strip_suffix('h').filter(|r| !r.is_empty()).unwrap_or(w);
+    let b = w.as_bytes();
+    if b.is_empty() || b.len() % 2 != 0 {
+        return None;
+    }
+    let mut n = 0;
+    for pair in b.chunks(2) {
+        match pair {
+            [b'h', b'a' | b'e' | b'o'] => n += 1,
+            _ => return None,
+        }
+    }
+    Some(n)
 }
 
 fn has_narrator_tag(text: &str) -> bool {
@@ -404,10 +665,11 @@ fn audio_of(s: Option<&LineSignals>) -> Audio {
     }
 }
 
-/// Medians per class (Intro, Outro, Rest), indexed by `Class as usize`. A
-/// class with under [`MIN_GROUP`] values uses the whole track's.
+/// Medians and loudness spread per class (Intro, Outro, Rest), indexed by
+/// `Class as usize`. A class with under [`MIN_GROUP`] values uses the whole
+/// track's.
 fn medians(lines: &[SourceLine], kinds: &[Option<SegmentKind>], audio: &[Audio]) -> [Medians; 3] {
-    let pick = |class: Class, f: fn(&Audio) -> Option<f32>| -> Option<f32> {
+    let pick = |class: Class, f: fn(&Audio) -> Option<f32>| -> Vec<f32> {
         let mut group = Vec::new();
         let mut all = Vec::new();
         for (i, a) in audio.iter().enumerate() {
@@ -421,16 +683,35 @@ fn medians(lines: &[SourceLine], kinds: &[Option<SegmentKind>], audio: &[Audio])
                 }
             }
         }
-        median(if group.len() >= MIN_GROUP {
-            &mut group
+        if group.len() >= MIN_GROUP {
+            group
         } else {
-            &mut all
-        })
+            all
+        }
     };
-    [Class::Intro, Class::Outro, Class::Rest].map(|c| Medians {
-        lufs: pick(c, |a| a.lufs),
-        pitch: pick(c, |a| a.pitch),
+    [Class::Intro, Class::Outro, Class::Rest].map(|c| {
+        let mut lufs = pick(c, |a| a.lufs);
+        let spread = spread(&mut lufs);
+        Medians {
+            lufs: median(&mut lufs),
+            pitch: median(&mut pick(c, |a| a.pitch)),
+            spread,
+            scale: spread.map_or(1.0, |s| (s / REFERENCE_SPREAD_LU).clamp(1.0, MAX_SCALE)),
+        }
     })
+}
+
+/// The loudness spread: twice the distance from the lower quartile to the
+/// median (nearest rank), or `None` under [`MIN_GROUP`] values. Only the
+/// quieter half counts, so a track full of real shouts does not widen its
+/// own margins; a wide mix is wide on both sides.
+fn spread(v: &mut [f32]) -> Option<f32> {
+    if v.len() < MIN_SPREAD {
+        return None;
+    }
+    v.sort_by(f32::total_cmp);
+    let at = |q: usize| v[(v.len() - 1) * q / 4];
+    Some(2.0 * (at(2) - at(1)))
 }
 
 fn median(v: &mut [f32]) -> Option<f32> {
@@ -556,6 +837,7 @@ mod tests {
                 &TrackSignals {
                     lines: sigs,
                     cuts_ms: self.cuts,
+                    bottom_text: vec![],
                 },
                 &self.segs,
             );
@@ -571,7 +853,7 @@ mod tests {
     fn sfx() {
         assert_eq!(intent(case("[explosion]")), Intent::Sfx);
         assert_eq!(intent(case("*bang*")), Intent::Sfx);
-        assert_eq!(intent(case("(explosion)").silent()), Intent::Plain);
+        assert_eq!(intent(case("(explosion)").silent()), Intent::Sfx);
         assert_eq!(intent(case("[Hello] there")), Intent::Plain);
         assert_eq!(intent(case("[on phone]")), Intent::Phone);
         assert_eq!(intent(case("*bang!*")), Intent::Sfx);
@@ -585,6 +867,73 @@ mod tests {
             Intent::Plain
         );
         assert_eq!(intent(case("*It ends here.*").silent()), Intent::Plain);
+    }
+
+    /// B1205: laughter has its own intent, from a cue or from the text.
+    #[test]
+    fn laughter() {
+        for l in [
+            "(laughs)",
+            "(LAUGHING)",
+            "(chuckles softly)",
+            "[giggling]",
+            "*snickers*",
+            "（laughs）",
+            "Hahaha!",
+            "Ha ha ha.",
+            "Heh heh",
+            "Ahahaha!",
+            "Hehe~",
+            "Ha-ha!",
+        ] {
+            let fx = case(l).run();
+            assert_eq!(fx.intent, Intent::Laugh, "{l}");
+            assert!(fx.reason.starts_with("rule=laugh"), "{}", fx.reason);
+        }
+        for not in [
+            "He... he...?",
+            "Ha ha?",
+            "Ha!",
+            "Hah",
+            "Ha, very funny.",
+            "Hello there",
+            "(laughs, then stops)",
+            "He laughs at me",
+            "Hi hi",
+            "Oh ho",
+        ] {
+            assert_ne!(intent(case(not)), Intent::Laugh, "{not}");
+        }
+    }
+
+    /// B1203: a parenthesised sound is a sound, not a thought.
+    #[test]
+    fn a_parenthesised_sound_cue_is_a_sound() {
+        for cue in ["(sighs)", "(knocking on door)", "(EXPLOSION)", "（gasps）"] {
+            assert_eq!(intent(case(cue)), Intent::Sfx, "{cue}");
+        }
+        assert_eq!(intent(case("(What is that)")), Intent::Thought);
+        assert_eq!(intent(case("(sighs, then stops)")), Intent::Thought);
+        assert_eq!(intent(case("(Laughing at me, are you?)")), Intent::Thought);
+        assert_eq!(intent(case("(whispers)")), Intent::Whisper);
+        for thought in [
+            "(Knock it off!)",
+            "(Cheer up)",
+            "(Sober up)",
+            "(Ringo would know)",
+            "(Explore it)",
+        ] {
+            assert_eq!(intent(case(thought)), Intent::Thought, "{thought}");
+        }
+        for cue in [
+            "(knock)",
+            "(sobbing)",
+            "(cries)",
+            "(sneezing)",
+            "(gunshots)",
+        ] {
+            assert_ne!(intent(case(cue)), Intent::Thought, "{cue}");
+        }
     }
 
     #[test]
@@ -694,7 +1043,7 @@ mod tests {
 
     #[test]
     fn shout_and_its_intensity() {
-        let shout = |d: f32| case("Stop right there").dlu(d).run();
+        let shout = |d: f32| case("Stop right there!").dlu(d).run();
         assert_eq!(shout(5.9).intent, Intent::Plain);
         let s = shout(6.0);
         assert_eq!((s.intent, s.intensity), (Intent::Shout, 1));
@@ -702,6 +1051,158 @@ mod tests {
         assert_eq!(shout(12.0).intensity, 3);
         assert_eq!(shout(15.0).intensity, 3);
         assert_eq!(shout(30.0).intensity, 3);
+    }
+
+    /// B1204: a loud line with no `!` shouts only when its pitch is up too.
+    #[test]
+    fn a_loud_line_without_a_bang_needs_a_raised_voice() {
+        let loud = || case("Stop right there").dlu(9.0);
+        assert_eq!(intent(loud()), Intent::Plain, "a loud scene, a calm voice");
+        assert_eq!(intent(loud().pitch(MEDIAN_PITCH * 1.05)), Intent::Plain);
+        let s = loud().pitch(MEDIAN_PITCH * 1.1).run();
+        assert_eq!(s.intent, Intent::Shout);
+        assert!(s.reason.contains("cue=pitch"), "{}", s.reason);
+        let mut unvoiced = loud();
+        unvoiced.sig.voiced_ratio = 0.0;
+        assert_eq!(intent(unvoiced), Intent::Plain, "no pitch, no bang");
+    }
+
+    /// B1204: the loudness margins widen with the track's dialogue spread,
+    /// so a wide film mix shouts only at its own extremes.
+    #[test]
+    fn a_wide_mix_widens_the_loudness_margins() {
+        // Dialogue spread over +-6 LU around -23: an interquartile range of
+        // 6 LU, twice the reference, so every margin doubles.
+        let run = |d: f32, text: &str| {
+            let mut lines = Vec::new();
+            let mut sigs = Vec::new();
+            for i in 0..20 {
+                lines.push(line("Hello there"));
+                sigs.push(sig(MEDIAN_LUFS - 6.0 + (i % 5) as f32 * 3.0));
+            }
+            lines.push(line(text));
+            sigs.push(sig(MEDIAN_LUFS + d));
+            direct(
+                &lines,
+                &TrackSignals {
+                    lines: sigs,
+                    cuts_ms: vec![],
+                    bottom_text: vec![],
+                },
+                &[],
+            )
+        };
+        let d = run(9.0, "Stop right there!");
+        assert_eq!(d.loudness.median_lufs, Some(MEDIAN_LUFS));
+        assert_eq!(d.loudness.spread_lu, Some(6.0));
+        assert_eq!(d.loudness.scale, 2.0);
+        assert_eq!(
+            d.plan.lines[20].intent,
+            Intent::Plain,
+            "+9 is not a shout here"
+        );
+        let s = run(12.0, "Stop right there!").plan.lines[20].clone();
+        assert_eq!((s.intent, s.intensity), (Intent::Shout, 1));
+        assert!(s.reason.contains("thr=12.0"), "{}", s.reason);
+        assert_eq!(run(-9.0, "Hello").plan.lines[20].intent, Intent::Plain);
+        assert_eq!(run(-16.0, "Hello").plan.lines[20].intent, Intent::Whisper);
+        assert!(run(-16.0, "Hello")
+            .plan
+            .lines
+            .iter()
+            .take(20)
+            .all(|l| l.intent == Intent::Plain));
+    }
+
+    /// A track where a third of the lines really are shouted keeps the
+    /// reference margins: only the quieter half sets the spread.
+    /// The Thought band widens with the mix too: a +5 LU italic line is a
+    /// thought on a 6 LU spread, not an off-screen voice.
+    #[test]
+    fn a_wide_mix_widens_the_thought_band() {
+        let mut lines = Vec::new();
+        let mut sigs = Vec::new();
+        for i in 0..20 {
+            lines.push(line("Hello there"));
+            sigs.push(sig(MEDIAN_LUFS - 6.0 + (i % 5) as f32 * 3.0));
+        }
+        let mut l = line("Who is that");
+        l.italic = true;
+        lines.push(l);
+        sigs.push(sig(MEDIAN_LUFS + 5.0));
+        let d = direct(
+            &lines,
+            &TrackSignals {
+                lines: sigs,
+                cuts_ms: vec![],
+                bottom_text: vec![],
+            },
+            &[],
+        );
+        assert_eq!(d.plan.lines[20].intent, Intent::Thought);
+    }
+
+    #[test]
+    fn many_real_shouts_do_not_widen_the_margins() {
+        let mut lines = Vec::new();
+        let mut sigs = Vec::new();
+        for i in 0..30 {
+            let loud = i % 3 == 0;
+            lines.push(line(if loud { "Get down!" } else { "Hello there" }));
+            sigs.push(sig(if loud {
+                MEDIAN_LUFS + 10.0
+            } else {
+                MEDIAN_LUFS
+            }));
+        }
+        let d = direct(
+            &lines,
+            &TrackSignals {
+                lines: sigs,
+                cuts_ms: vec![],
+                bottom_text: vec![],
+            },
+            &[],
+        );
+        assert_eq!(d.loudness.scale, 1.0);
+        assert_eq!(d.counts.get(&Intent::Shout), Some(&10));
+    }
+
+    #[test]
+    fn a_tight_mix_keeps_the_reference_margins() {
+        let d = case("Hi").run();
+        let d2 = direct(
+            &[line("a"), line("b"), line("c")],
+            &TrackSignals {
+                lines: vec![sig(-23.0), sig(-22.0), sig(-21.0)],
+                cuts_ms: vec![],
+                bottom_text: vec![],
+            },
+            &[],
+        );
+        assert_eq!(d.intent, Intent::Plain);
+        assert_eq!(d2.loudness.scale, 1.0);
+        let few = direct(
+            &[line("a")],
+            &TrackSignals {
+                lines: vec![sig(-23.0)],
+                cuts_ms: vec![],
+                bottom_text: vec![],
+            },
+            &[],
+        );
+        assert_eq!((few.loudness.spread_lu, few.loudness.scale), (None, 1.0));
+        // One quiet line among a handful does not widen every margin.
+        let outlier = direct(
+            &[line("a"), line("b"), line("c")],
+            &TrackSignals {
+                lines: vec![sig(-40.0), sig(-23.0), sig(-23.0)],
+                cuts_ms: vec![],
+                bottom_text: vec![],
+            },
+            &[],
+        );
+        assert_eq!(outlier.loudness.scale, 1.0);
     }
 
     #[test]
@@ -741,13 +1242,13 @@ mod tests {
     #[test]
     fn inside_an_intro_or_outro_shout_needs_three_more_lu() {
         for kind in [SegmentKind::Intro, SegmentKind::Outro] {
-            let at = |d: f32| case("Stop right there").dlu(d).seg(kind).run();
+            let at = |d: f32| case("Stop right there!").dlu(d).seg(kind).run();
             assert_eq!(at(8.9).intent, Intent::Plain, "{kind:?}");
             let s = at(9.0);
             assert_eq!((s.intent, s.intensity), (Intent::Shout, 1), "{kind:?}");
             assert_eq!(at(12.0).intensity, 2);
         }
-        let rec = case("Stop right there")
+        let rec = case("Stop right there!")
             .dlu(6.0)
             .seg(SegmentKind::Recap)
             .run();
@@ -766,7 +1267,7 @@ mod tests {
             sigs.push(sig(-23.0));
         }
         for i in 0..4 {
-            let mut l = line("La la");
+            let mut l = line("La la!");
             l.start_ms = 100_000 + i * 1000;
             l.end_ms = 100_000 + i * 1000 + 900;
             lines.push(l);
@@ -780,6 +1281,7 @@ mod tests {
         let track = TrackSignals {
             lines: sigs,
             cuts_ms: vec![],
+            bottom_text: vec![],
         };
         let with = direct(&lines, &track, &intro);
         assert!(with.plan.lines.iter().all(|l| l.intent == Intent::Plain));
@@ -835,12 +1337,12 @@ mod tests {
 
     #[test]
     fn a_line_that_spans_a_cut_keeps_its_intent_but_stays_still() {
-        let fx = case("Stop right there").dlu(9.0).cut(11_000).run();
+        let fx = case("Stop right there!").dlu(9.0).cut(11_000).run();
         assert_eq!(fx.intent, Intent::Shout);
         assert!(fx.static_only);
         assert!(fx.reason.contains("cut"), "{}", fx.reason);
         for edge in [10_000, 13_000, 5_000, 20_000] {
-            let fx = case("Stop right there").dlu(9.0).cut(edge).run();
+            let fx = case("Stop right there!").dlu(9.0).cut(edge).run();
             assert!(!fx.static_only, "cut at {edge}");
         }
         assert!(!case("Hello again").cut(11_000).run().static_only);
@@ -851,6 +1353,55 @@ mod tests {
             .run();
         assert_eq!(k.karaoke, Karaoke::Sweep);
         assert!(k.static_only);
+    }
+
+    #[test]
+    fn a_line_over_burned_in_bottom_text_goes_to_the_top() {
+        let mut lines = vec![line("Hello"), line("Over here"), line("Again")];
+        lines[2].typeset = true;
+        let run = |shares: Vec<Option<f32>>| {
+            direct(
+                &lines,
+                &TrackSignals {
+                    bottom_text: shares,
+                    ..TrackSignals::default()
+                },
+                &[],
+            )
+        };
+        let bottom = |shares| run(shares).plan.lines;
+        let d = run(vec![Some(0.05), Some(0.0), Some(0.05)]);
+        let tally: Vec<_> = d.bottom_text.iter().map(|(v, n)| (v.label(), *n)).collect();
+        assert_eq!(tally, [("clear", 1), ("lifted", 1), ("kept", 1)]);
+        let fx = d.plan.lines;
+        assert_eq!(fx[0].placement, Placement::Top);
+        assert!(
+            fx[0].reason.ends_with(" place=top bottom_text=0.050"),
+            "{}",
+            fx[0].reason
+        );
+        assert_eq!(fx[1].placement, Placement::Default, "clean picture");
+        assert_eq!(
+            fx[2].placement,
+            Placement::Default,
+            "typeset keeps its spot"
+        );
+        for none in [vec![None, Some(f32::NAN)], vec![]] {
+            assert!(bottom(none)
+                .iter()
+                .all(|f| f.placement == Placement::Default));
+        }
+        assert_eq!(
+            run(vec![]).bottom_text.get(&BottomText::Unchecked),
+            Some(&3)
+        );
+    }
+
+    #[test]
+    fn bottom_text_labels_are_distinct() {
+        let labels: std::collections::BTreeSet<_> =
+            BottomText::ALL.iter().map(|v| v.label()).collect();
+        assert_eq!(labels.len(), BottomText::ALL.len());
     }
 
     #[test]
@@ -871,8 +1422,8 @@ mod tests {
 
     #[test]
     fn reasons_name_the_rule_and_its_inputs() {
-        let fx = case("Stop right there").dlu(9.0).run();
-        assert_eq!(fx.reason, "rule=shout dlu=+9.0 caps=0.07");
+        let fx = case("Stop right there!").dlu(9.0).run();
+        assert_eq!(fx.reason, "rule=shout dlu=+9.0 thr=6.0 cue=bang caps=0.07");
         assert_eq!(case("[boom]").run().reason, "rule=sfx");
         let plain = case("Hello again").run();
         assert!(plain.reason.starts_with("rule=plain"), "{}", plain.reason);
@@ -902,6 +1453,7 @@ mod tests {
         let t = TrackSignals {
             lines: sigs,
             cuts_ms: vec![11_000],
+            bottom_text: vec![],
         };
         assert_eq!(direct(&lines, &t, &[]), direct(&lines, &t, &[]));
     }

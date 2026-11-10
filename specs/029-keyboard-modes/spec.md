@@ -1,6 +1,6 @@
 # Spec 029: keyboard modes
 
-Status: Accepted (2026-11-06)
+Status: Accepted (2026-11-06); implemented (audited 2026-11-09): native/keymap.rs (modes Browse, Detail, Player, Music, Queue) and native/keys.rs `KeyLayer` on main (#869, #876, #888, #890, ADR-0080, ADR-0081); Playwright keyboard.spec.ts. Owned elsewhere (keyboard modes).
 
 ## Goal
 

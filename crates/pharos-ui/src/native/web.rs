@@ -18,8 +18,8 @@ use wasm_bindgen::{JsCast as _, JsValue};
 
 use super::machine::{Probe, SignInReply, SignOutReply};
 use super::playback::{
-    cue_chars_per_line, cue_font_px, cue_width_share, is_loading, lifted_line, Engine,
-    FragmentLoad, LibraryTransition, MediaState, OnFatal, OnFragment, OverlayEffect,
+    cue_chars_per_line, cue_font_px, cue_width_share, is_loading, lifted_line, Engine, FailureKind,
+    Fatal, FragmentLoad, LibraryTransition, MediaState, OnFatal, OnFragment, OverlayEffect,
     PlaybackEngine, Recovery, RecoveryBudget, SubtitleSize,
 };
 
@@ -286,6 +286,14 @@ impl Drop for PopState {
 }
 
 /// A window `keydown` listener for Escape, removed on drop.
+/// The browser's Back is history the page does not hold: a guard is never
+/// asked, so Back leaves as it always has.
+pub struct BackWatch;
+
+pub fn on_back(_on_back: impl FnMut() -> bool + 'static) -> BackWatch {
+    BackWatch
+}
+
 pub struct EscapeWatch(Closure<dyn FnMut(web_sys::KeyboardEvent)>);
 
 impl Drop for EscapeWatch {
@@ -466,6 +474,38 @@ pub fn media_state(video_id: &str) -> MediaState {
     })
 }
 
+/// The shape of the picture `video` shows: its decoded frame, one eye of it
+/// while its frame carries a 3D crop (`data-packing`, V921), or the picture
+/// inside baked-in black bars while it carries a bar crop (`data-crop`,
+/// B1017).
+pub(super) fn picture_size(video: &web_sys::HtmlMediaElement) -> (u32, u32) {
+    picture_of(video).1
+}
+
+/// Where the picture `video` shows sits in its decoded frame (fractions),
+/// and its shape: the one reader of the frame's `data-packing` and
+/// `data-crop`, for [`picture_size`] and the transition snapshot.
+pub(super) fn picture_of(
+    video: &web_sys::HtmlMediaElement,
+) -> (super::stereo::FrameRect, (u32, u32)) {
+    let frame = video.parent_element();
+    let packing = frame
+        .as_ref()
+        .and_then(|f| f.get_attribute("data-packing"))
+        .and_then(|a| super::stereo::parse_packing(&a));
+    let bars = frame
+        .as_ref()
+        .and_then(|f| f.get_attribute("data-crop"))
+        .and_then(|a| super::bars::parse_crop(&a));
+    let (w, h) = super::stereo::eye_size(
+        packing,
+        video_dimension(video, "videoWidth"),
+        video_dimension(video, "videoHeight"),
+    );
+    let rect = bars.unwrap_or_else(|| super::stereo::eye_rect(packing, super::stereo::Eye::Left));
+    (rect, super::bars::shown_size(bars, w, h))
+}
+
 /// A `<video>`'s `videoWidth` or `videoHeight`, read off the element so the
 /// media element binding is all this needs.
 fn video_dimension(v: &web_sys::HtmlMediaElement, name: &str) -> u32 {
@@ -490,22 +530,107 @@ pub fn toggle_play(video_id: &str) {
     };
     if v.paused() {
         wake_tap(&v);
-        if let Err(e) = v.play() {
-            warn(&format!("pharos: play() refused: {e:?}"));
-        }
+        start(&v, "toggle");
     } else if let Err(e) = v.pause() {
         warn(&format!("pharos: pause() refused: {e:?}"));
     }
 }
 
-/// Start the `<video>`. A refused `play()` (autoplay policy) leaves it paused.
+/// Start the `<video>`. A refused `play()` (autoplay policy) leaves it
+/// paused, and is told apart from other failures (038 FR-407).
 pub fn play(video_id: &str) {
     if let Some(v) = video_element(video_id) {
         wake_tap(&v);
-        if let Err(e) = v.play() {
-            warn(&format!("pharos: play() refused: {e:?}"));
-        }
+        start(&v, "play");
     }
+}
+
+thread_local! {
+    /// The browser refused a `play()` and no gesture has come since: a
+    /// retry would be refused too (038 FR-407, V1223).
+    static AUTOPLAY_BLOCKED: Cell<bool> = const { Cell::new(false) };
+    /// The document listens for the gesture that lifts it.
+    static GESTURE_WATCHED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Whether the browser refused to start a video until the viewer does
+/// something: the player then shows "Tap to start", and a group stops
+/// retrying the start in the background.
+pub fn autoplay_blocked() -> bool {
+    AUTOPLAY_BLOCKED.with(Cell::get)
+}
+
+/// `play()` with its promise read: a `NotAllowedError` is the autoplay
+/// policy, logged and reported once per refusal; anything else (an aborted
+/// load, a source error) is logged as itself.
+fn start(v: &web_sys::HtmlMediaElement, source: &'static str) {
+    let promise = match v.play() {
+        Ok(p) => p,
+        Err(e) => {
+            warn(&format!("pharos: play() refused source={source}: {e:?}"));
+            return;
+        }
+    };
+    wasm_bindgen_futures::spawn_local(async move {
+        match wasm_bindgen_futures::JsFuture::from(promise).await {
+            Ok(_) => AUTOPLAY_BLOCKED.with(|b| b.set(false)),
+            Err(e) => play_failed(&e, source),
+        }
+    });
+}
+
+fn play_failed(e: &JsValue, source: &'static str) {
+    let name = js_sys::Reflect::get(e, &JsValue::from_str("name"))
+        .ok()
+        .and_then(|n| n.as_string())
+        .unwrap_or_default();
+    if name != "NotAllowedError" {
+        // An AbortError is a newer load or pause overtaking this play.
+        info(&format!(
+            "pharos: play() did not start source={source} name={name} reason={}",
+            js_message(e)
+        ));
+        return;
+    }
+    let first = !AUTOPLAY_BLOCKED.with(|b| b.replace(true));
+    watch_for_gesture();
+    if first {
+        warn(&format!(
+            "pharos: autoplay refused source={source} reason={}",
+            js_message(e)
+        ));
+        report_event(ClientEvent {
+            kind: ClientEventKind::AutoplayRefused,
+            level: ClientLevel::Warn,
+            route: current_path(),
+            fields: vec![("source", source.to_owned())],
+        });
+    }
+}
+
+/// Lifts [`autoplay_blocked`] on the viewer's next tap, click or key, which
+/// gives the page the activation a `play()` needs.
+fn watch_for_gesture() {
+    if GESTURE_WATCHED.with(|w| w.replace(true)) {
+        return;
+    }
+    let Some(doc) = web_sys::window().and_then(|w| w.document()) else {
+        return;
+    };
+    let lift = Closure::<dyn Fn()>::new(|| {
+        if AUTOPLAY_BLOCKED.with(|b| b.replace(false)) {
+            info("pharos: autoplay gesture: a tap or key lifted the refusal");
+        }
+    });
+    for kind in ["pointerdown", "keydown"] {
+        let _ = doc.add_event_listener_with_callback_and_bool(
+            kind,
+            lift.as_ref().unchecked_ref(),
+            true,
+        );
+    }
+    // Lives as long as the page.
+    lift.forget();
 }
 
 pub fn pause(video_id: &str) {
@@ -720,6 +845,8 @@ pub fn hide_text_track(video_id: &str, track_id: &str) {
 }
 
 pub use super::subs_web::{rust_subtitles, RustSubtitles};
+pub use super::turn_web::{turn_begin, turn_cancel, turn_expect, turn_open, turn_ready};
+pub use super::xr_web::{enter_vr, exit_vr, vr_supported};
 
 /// The shared resize observer for the JASSUB canvases and its callback,
 /// kept alive together.
@@ -731,6 +858,19 @@ thread_local! {
     /// Watches each JASSUB canvas so the lift follows a resize or full
     /// screen: it fires after JASSUB refits the canvas, at most once a frame.
     static STYLED_LIFT_OBSERVER: RefCell<Option<CanvasObserver>> = const { RefCell::new(None) };
+    /// When the styled script's signs show, and whether one shows now: the
+    /// lift waits while one does (B1211).
+    static STYLED_SIGNS: RefCell<Vec<(u64, u64)>> = const { RefCell::new(Vec::new()) };
+    static STYLED_SIGN_SHOWING: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Re-reads whether a sign shows at `t_ms`, and redoes the lift when that
+/// changed.
+fn follow_styled_signs(t_ms: u64) {
+    let showing = STYLED_SIGNS.with(|s| super::subtitles::sign_showing(&s.borrow(), t_ms));
+    if STYLED_SIGN_SHOWING.with(|c| c.replace(showing)) != showing {
+        lift_styled_subtitles();
+    }
 }
 
 /// Whether the player's control bar shows. Both subtitle renderers clear it
@@ -768,6 +908,7 @@ fn observe_styled_canvas(canvas: &web_sys::Element) {
 /// trigger itself.
 fn lift_styled_subtitles() {
     let visible = STYLED_CONTROLS_VISIBLE.with(Cell::get);
+    let sign_showing = STYLED_SIGN_SHOWING.with(Cell::get);
     let Some(doc) = web_sys::window().and_then(|w| w.document()) else {
         return;
     };
@@ -808,8 +949,13 @@ fn lift_styled_subtitles() {
         // must not feed back into its lift.
         let canvas_bottom = frame.get_bounding_client_rect().top()
             + f64::from(canvas.offset_top() + canvas.offset_height());
-        let lift =
-            super::subtitles::styled_lift(visible, canvas_bottom, player_bottom, controls_height);
+        let lift = super::subtitles::styled_lift(
+            visible,
+            sign_showing,
+            canvas_bottom,
+            player_bottom,
+            controls_height,
+        );
         let _ = frame
             .style()
             .set_property("--pharos-ass-lift", &lift.to_string());
@@ -843,14 +989,13 @@ fn cue_box_for(video_id: &str) -> CueBox {
     else {
         return none;
     };
+    // The on-screen box: a 3D crop stretches the element past its eye along
+    // one axis, so the narrower fit below is the eye's.
     let rect = video.get_bounding_client_rect();
-    let natural = |key: &str| {
-        js_sys::Reflect::get(&video, &key.into())
-            .ok()
-            .and_then(|v| v.as_f64())
-            .unwrap_or(0.0)
-    };
-    let (picture_w, picture_h) = (natural("videoWidth"), natural("videoHeight"));
+    let (picture_w, picture_h) = video
+        .dyn_ref::<web_sys::HtmlMediaElement>()
+        .map_or((0, 0), picture_size);
+    let (picture_w, picture_h) = (f64::from(picture_w), f64::from(picture_h));
     let width = if picture_w > 0.0 && picture_h > 0.0 {
         rect.width().min(rect.height() * picture_w / picture_h)
     } else {
@@ -1120,29 +1265,51 @@ pub fn focus_by_id(id: &str) {
     }
 }
 
-/// Enters fullscreen on the element `id`, or leaves it.
-pub fn toggle_fullscreen(id: &str) {
+/// Whether the page-wide key layer has its own use for Escape: the key
+/// help is open, or the page is in browser fullscreen. A panel that closes
+/// on Escape gives way to it.
+pub fn escape_claimed() -> bool {
+    let Some(document) = web_sys::window().and_then(|w| w.document()) else {
+        return false;
+    };
+    document.fullscreen_element().is_some()
+        || document
+            .query_selector(".pharos-key-help")
+            .ok()
+            .flatten()
+            .is_some()
+}
+
+/// Leaves browser fullscreen when the page is in it, for an Escape the
+/// browser passed on rather than keeping (headless Chromium does): that
+/// Escape leaves fullscreen and does nothing else (V854).
+pub fn leave_fullscreen_on_escape() -> bool {
+    let Some(document) = web_sys::window().and_then(|w| w.document()) else {
+        return false;
+    };
+    if document.fullscreen_element().is_none() {
+        return false;
+    }
+    document.exit_fullscreen();
+    info("pharos: fullscreen action=exit target=page reason=escape");
+    true
+}
+
+/// Leaves fullscreen, or puts the whole page in it. The page, not the player
+/// element: a track or quality change replaces the player node, and an
+/// element's fullscreen would end with it (B816).
+pub fn toggle_fullscreen() {
     let Some(document) = web_sys::window().and_then(|w| w.document()) else {
         return;
     };
-    let result = if document.fullscreen_element().is_some() {
+    if document.fullscreen_element().is_some() {
         document.exit_fullscreen();
-        Ok(())
-    } else {
-        match document.get_element_by_id(id) {
-            Some(e) => e.request_fullscreen(),
-            None => Ok(()),
-        }
-    };
-    if let Err(e) = result {
-        warn(&format!("pharos: fullscreen refused: {e:?}"));
+        return;
     }
+    enter_page_fullscreen_for("key");
 }
 
-/// Puts the whole page in fullscreen, from a play click: the player is not
-/// mounted yet, and the gesture is gone once it is. The page stays fullscreen
-/// across the players the stage mounts, so the next episode keeps it.
-pub fn enter_page_fullscreen() {
+fn enter_page_fullscreen_for(reason: &'static str) {
     let Some(document) = web_sys::window().and_then(|w| w.document()) else {
         return;
     };
@@ -1157,14 +1324,16 @@ pub fn enter_page_fullscreen() {
     match root.unchecked_into::<FsElement>().request_fullscreen() {
         Ok(promise) => spawn_detached(async move {
             match wasm_bindgen_futures::JsFuture::from(promise).await {
-                Ok(_) => info("pharos: fullscreen action=enter target=page reason=play"),
+                Ok(_) => info(&format!(
+                    "pharos: fullscreen action=enter target=page reason={reason}"
+                )),
                 Err(e) => warn(&format!(
-                    "pharos: fullscreen action=enter target=page refused reason={e:?}"
+                    "pharos: fullscreen action=enter target=page refused reason={reason} error={e:?}"
                 )),
             }
         }),
         Err(e) => warn(&format!(
-            "pharos: fullscreen action=enter target=page refused reason={e:?}"
+            "pharos: fullscreen action=enter target=page refused reason={reason} error={e:?}"
         )),
     }
 }
@@ -1177,8 +1346,8 @@ extern "C" {
     fn request_fullscreen(this: &FsElement) -> Result<js_sys::Promise, JsValue>;
 }
 
-/// Leaves the fullscreen [`enter_page_fullscreen`] started; the player's own
-/// fullscreen (the F key) is left alone.
+/// Leaves the page fullscreen the F key or the Fullscreen button started; a
+/// fullscreen on another element is left alone.
 pub fn exit_page_fullscreen() {
     let Some(document) = web_sys::window().and_then(|w| w.document()) else {
         return;
@@ -1268,11 +1437,6 @@ pub async fn copy_text(text: &str) -> bool {
 /// window (`document.pictureInPictureEnabled`; missing in Firefox).
 pub fn pip_supported() -> bool {
     pip_document().and_then(|d| d.picture_in_picture_enabled()) == Some(true)
-}
-
-/// Whether a video is in the browser's picture-in-picture window.
-pub fn pip_active() -> bool {
-    pip_document().is_some_and(|d| d.picture_in_picture_element().is_some())
 }
 
 /// Hands the video `id` to the browser's picture-in-picture window, or
@@ -1991,7 +2155,8 @@ pub fn activate_focused() -> bool {
 }
 
 /// Click the control marked `data-key-action="<name>"`: the one in the
-/// focused `data-key-row` when there is one, else the page's first.
+/// focused `data-key-row` when there is one, else the page's first that is
+/// not marked `data-key-row-only`.
 pub fn press_key_action(name: &str) -> bool {
     let selector = format!("[data-key-action='{name}']");
     let in_row = focused()
@@ -1999,7 +2164,7 @@ pub fn press_key_action(name: &str) -> bool {
         .and_then(|row| row.query_selector(&selector).ok().flatten());
     let found = in_row.or_else(|| {
         document()?
-            .query_selector(&format!("main {selector}"))
+            .query_selector(&format!("main {selector}:not([data-key-row-only])"))
             .ok()
             .flatten()
     });
@@ -2076,6 +2241,88 @@ pub fn focus_in_area(name: &str) -> bool {
                 .flatten()
         })
         .is_some()
+}
+
+/// What an open modal dialog does to the page behind it (B825): every
+/// element outside it is made `inert`, so Tab, the pointer and screen
+/// readers stay inside, and closing it puts the focus back where it was.
+/// Hold it for as long as the dialog is mounted; dropping it undoes both.
+pub struct ModalHold {
+    /// The control that had the focus when the dialog opened.
+    opener: Option<web_sys::Element>,
+    inerted: Vec<web_sys::Element>,
+    root: Option<web_sys::Element>,
+}
+
+impl ModalHold {
+    /// Notes the focused control. Call it as the dialog first renders,
+    /// before it takes the focus.
+    pub fn capture() -> Self {
+        Self {
+            opener: focused(),
+            inerted: Vec::new(),
+            root: None,
+        }
+    }
+
+    /// Makes the page outside `root` (a selector for the dialog's outermost
+    /// element, its backdrop included so a click there still closes it)
+    /// inert. Call it once the dialog is in the page.
+    pub fn engage(&mut self, root: &str) {
+        if !self.inerted.is_empty() {
+            return;
+        }
+        let Some(found) = document().and_then(|d| d.query_selector(root).ok().flatten()) else {
+            warn(&format!("pharos: modal root {root} not in the page"));
+            return;
+        };
+        let mut node = found.clone();
+        while let Some(parent) = node.parent_element() {
+            let children = parent.children();
+            for at in 0..children.length() {
+                let Some(sibling) = children.item(at) else {
+                    continue;
+                };
+                // Scripts and styles are not content; one that is inert
+                // already (another dialog's doing) is left to its owner.
+                if sibling == node
+                    || sibling.has_attribute("inert")
+                    || matches!(sibling.tag_name().as_str(), "SCRIPT" | "STYLE" | "LINK")
+                {
+                    continue;
+                }
+                if sibling.set_attribute("inert", "").is_ok() {
+                    self.inerted.push(sibling);
+                }
+            }
+            if parent.tag_name() == "BODY" {
+                break;
+            }
+            node = parent;
+        }
+        self.root = Some(found);
+    }
+}
+
+impl Drop for ModalHold {
+    fn drop(&mut self) {
+        for el in self.inerted.drain(..) {
+            let _ = el.remove_attribute("inert");
+        }
+        // Back to the opener, unless the focus has already gone somewhere
+        // on the page the dialog led to.
+        let inside = |el: &web_sys::Element| {
+            self.root
+                .as_ref()
+                .is_some_and(|root| root.contains(Some(el)))
+        };
+        let stranded = focused().is_none_or(|now| inside(&now));
+        if let Some(opener) = self.opener.take().filter(|o| o.is_connected()) {
+            if stranded {
+                focus_element(&opener, false);
+            }
+        }
+    }
 }
 
 /// Whether a dialog is open in the page, other than the key help.
@@ -2743,6 +2990,66 @@ pub fn on_page_hide(mut on_hide: impl FnMut() + 'static) -> PageHide {
     PageHide(listener)
 }
 
+/// `visibilitychange` and `pageshow` listeners; removed on drop.
+pub struct PageLifecycle {
+    visibility: Closure<dyn FnMut(web_sys::Event)>,
+    show: Closure<dyn FnMut(web_sys::Event)>,
+}
+
+impl Drop for PageLifecycle {
+    fn drop(&mut self) {
+        if let Some(window) = web_sys::window() {
+            let _ = window.remove_event_listener_with_callback(
+                "pageshow",
+                self.show.as_ref().unchecked_ref(),
+            );
+            if let Some(document) = window.document() {
+                let _ = document.remove_event_listener_with_callback(
+                    "visibilitychange",
+                    self.visibility.as_ref().unchecked_ref(),
+                );
+            }
+        }
+    }
+}
+
+/// Call `on_hidden` when the page becomes hidden (a mobile or TV browser
+/// closing a tab often fires this and no `pagehide`), and `on_restored`
+/// when the browser shows a page again from its back/forward cache.
+pub fn on_page_lifecycle(
+    mut on_hidden: impl FnMut() + 'static,
+    mut on_restored: impl FnMut() + 'static,
+) -> PageLifecycle {
+    let visibility = Closure::<dyn FnMut(web_sys::Event)>::new(move |_| {
+        let hidden = web_sys::window()
+            .and_then(|w| w.document())
+            .is_some_and(|d| d.hidden());
+        if hidden {
+            on_hidden();
+        }
+    });
+    let show = Closure::<dyn FnMut(web_sys::Event)>::new(move |e: web_sys::Event| {
+        // `PageTransitionEvent.persisted`, read without the web-sys feature.
+        let persisted = js_sys::Reflect::get(&e, &JsValue::from_str("persisted"))
+            .ok()
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if persisted {
+            on_restored();
+        }
+    });
+    if let Some(window) = web_sys::window() {
+        let _ = window.add_event_listener_with_callback("pageshow", show.as_ref().unchecked_ref());
+        if let Some(document) = window.document() {
+            let _ = document.add_event_listener_with_callback(
+                "visibilitychange",
+                visibility.as_ref().unchecked_ref(),
+            );
+        }
+    }
+    PageLifecycle { visibility, show }
+}
+
 /// The engine for `kind`, loading hls.js first when it is needed.
 pub async fn engine(kind: Engine) -> Result<Box<dyn PlaybackEngine>, String> {
     match kind {
@@ -2797,9 +3104,15 @@ impl PlaybackEngine for NativeVideo {
                         ("action", "fail".to_owned()),
                     ],
                 });
-                on_fatal(format!(
-                    "the browser could not play this stream (code {code}) {message}"
-                ));
+                let reason =
+                    format!("the browser could not play this stream (code {code}) {message}");
+                // MEDIA_ERR_DECODE: the bytes arrived and would not decode.
+                // MEDIA_ERR_SRC_NOT_SUPPORTED: this browser cannot play it.
+                on_fatal(match code {
+                    3 => Fatal::media(reason),
+                    4 => Fatal::of(FailureKind::Unplayable, reason),
+                    _ => Fatal::other(reason),
+                });
             })
         };
         video
@@ -2915,6 +3228,62 @@ extern "C" {
     fn destroy(this: &Jassub) -> js_sys::Promise;
     #[wasm_bindgen(method, getter, js_class = "JASSUB")]
     fn debug(this: &Jassub) -> JsValue;
+    #[wasm_bindgen(method, catch, js_class = "JASSUB", js_name = manualRender)]
+    fn manual_render(this: &Jassub, frame: &JsValue, force: bool) -> Result<JsValue, JsValue>;
+}
+
+/// Draws the frame a paused `video` shows with `jassub`. JASSUB draws on the
+/// video's frame callbacks, which a paused video never fires, so a renderer
+/// rebuilt while paused (a size, tier or level change) showed nothing until
+/// playback resumed.
+async fn draw_paused_frame(
+    jassub: &Jassub,
+    video: &web_sys::HtmlMediaElement,
+    live: &std::cell::Cell<bool>,
+) {
+    if !video.paused() {
+        return;
+    }
+    let size =
+        |k: &str| js_sys::Reflect::get(video, &JsValue::from_str(k)).unwrap_or(JsValue::UNDEFINED);
+    let frame = js_sys::Object::new();
+    for (k, v) in [
+        ("mediaTime", JsValue::from_f64(video.current_time())),
+        ("width", size("videoWidth")),
+        ("height", size("videoHeight")),
+    ] {
+        let _ = js_sys::Reflect::set(&frame, &JsValue::from_str(k), &v);
+    }
+    let draw = || async {
+        let p = jassub.manual_render(&frame, true)?;
+        wasm_bindgen_futures::JsFuture::from(js_sys::Promise::resolve(&p)).await
+    };
+    // The first draw sizes the canvas. JASSUB's own observer of the new canvas
+    // resizes it again in the same frames, which clears it and leaves an
+    // unforced redraw that libass answers with "unchanged", so draw once more
+    // after it has settled.
+    let drawn = match draw().await {
+        Ok(_) => {
+            animation_frame().await;
+            animation_frame().await;
+            // Dropped or playing by now: its frame callbacks own the canvas.
+            if !live.get() || !video.paused() {
+                return;
+            }
+            draw().await
+        }
+        Err(e) => Err(e),
+    };
+    match drawn {
+        Ok(_) => info(&format!(
+            "pharos: subtitle renderer=jassub paused redraw at={:.3}",
+            video.current_time()
+        )),
+        Err(e) => warn(&format!(
+            "pharos: subtitle renderer=jassub paused redraw failed error={}",
+            js_message(&e)
+        )),
+    }
 }
 
 /// An ASS/SSA script drawn over the `<video>` by libass in a worker. It
@@ -2923,6 +3292,8 @@ extern "C" {
 pub struct StyledSubtitles {
     jassub: Jassub,
     live: Rc<std::cell::Cell<bool>>,
+    video: web_sys::HtmlMediaElement,
+    on_time: Closure<dyn FnMut()>,
 }
 
 impl StyledSubtitles {
@@ -2949,6 +3320,12 @@ impl Drop for StyledSubtitles {
     fn drop(&mut self) {
         self.live.set(false);
         let _ = self.jassub.destroy();
+        let f = self.on_time.as_ref().unchecked_ref();
+        for event in ["timeupdate", "seeked"] {
+            let _ = self.video.remove_event_listener_with_callback(event, f);
+        }
+        STYLED_SIGNS.with(|s| s.borrow_mut().clear());
+        follow_styled_signs(0);
     }
 }
 
@@ -3054,9 +3431,47 @@ pub async fn styled_subtitles(
         );
     }
     let live = Rc::new(std::cell::Cell::new(true));
+    STYLED_SIGNS.with(|s| s.borrow_mut().clear());
+    follow_styled_signs(0);
+    let on_time: Closure<dyn FnMut()> = Closure::new({
+        let video = video.clone();
+        move || follow_styled_signs((video.current_time().max(0.0) * 1000.0) as u64)
+    });
+    for event in ["timeupdate", "seeked"] {
+        let _ = video.add_event_listener_with_callback(event, on_time.as_ref().unchecked_ref());
+    }
+    // The signs' times, from the script JASSUB fetched (a cached read).
+    spawn_detached({
+        let live = Rc::clone(&live);
+        let url = url.to_owned();
+        let video = video.clone();
+        async move {
+            match get_text(&url).await {
+                Ok(script) if live.get() => {
+                    let spans = super::subtitles::sign_spans(&script);
+                    web_sys::console::info_1(
+                        &format!("pharos: styled script signs={}", spans.len()).into(),
+                    );
+                    STYLED_SIGNS.with(|s| *s.borrow_mut() = spans);
+                    follow_styled_signs((video.current_time().max(0.0) * 1000.0) as u64);
+                }
+                Ok(_) => {}
+                Err((status, e)) => {
+                    web_sys::console::warn_1(
+                        &format!(
+                            "pharos: styled script signs not read (status {status:?}: {e}); the lift ignores signs"
+                        )
+                        .into(),
+                    );
+                }
+            }
+        }
+    });
     let ready = wasm_bindgen_futures::JsFuture::from(jassub.ready());
     spawn_detached({
         let live = Rc::clone(&live);
+        let drawer: Jassub = JsValue::clone(&jassub).unchecked_into();
+        let video = video.clone();
         async move {
             let ready = std::pin::pin!(ready);
             let timeout = std::pin::pin!(sleep_ms(STYLED_READY_MS));
@@ -3068,15 +3483,24 @@ pub async fn styled_subtitles(
                 }
             };
             if live.get() {
-                if result.is_ok() {
+                let ready = result.is_ok();
+                if ready {
                     // The canvas is new: give it the lift the bar already has.
                     lift_styled_subtitles();
                 }
                 report(result);
+                if ready {
+                    draw_paused_frame(&drawer, &video, &live).await;
+                }
             }
         }
     });
-    Ok(StyledSubtitles { jassub, live })
+    Ok(StyledSubtitles {
+        jassub,
+        live,
+        video,
+        on_time,
+    })
 }
 
 /// A thrown value's `message`, or its debug form.
@@ -3127,6 +3551,8 @@ impl PlaybackEngine for HlsJs {
                     report_event(hls_event(ClientLevel::Warn, &kind, &details, "none", 0));
                     return;
                 }
+                // The stream is in trouble: show the player's own state, not the turn.
+                super::turn_web::turn_cancel_current("engine-fatal");
                 let mut budget = budget.borrow_mut();
                 let action = budget.on_fatal(&kind, &details);
                 let attempt = budget.attempts(&kind);
@@ -3144,7 +3570,7 @@ impl PlaybackEngine for HlsJs {
                 match action {
                     Recovery::StartLoad => player.start_load(),
                     Recovery::RecoverMedia => player.recover_media_error(),
-                    Recovery::Fail => on_fatal(format!("the stream failed ({kind}: {details})")),
+                    Recovery::Fail => on_fatal(Fatal::from_hls(&kind, &details)),
                 }
             })
         };
@@ -3306,6 +3732,8 @@ pub fn install_telemetry(api: &NativeApi) {
 /// Submits one client event without waiting for it, if opted in. Opted out,
 /// nothing is sent or held.
 pub fn report_event(event: ClientEvent) {
+    // Kept locally whatever the opt-in: it leaves only inside a pressed report.
+    super::report::record_event(&event);
     let opted = opted_in();
     let submit = TELEMETRY.with(|t| t.borrow_mut().sink.report(opted, event));
     if let Some((api, event)) = submit {
@@ -3778,6 +4206,8 @@ struct TapNodes {
     media: web_sys::HtmlMediaElement,
     context: web_sys::AudioContext,
     analyser: web_sys::AnalyserNode,
+    /// How the last play's wake of `context` went (B735).
+    wake: Rc<Cell<super::resume::Wake>>,
 }
 
 thread_local! {
@@ -3807,32 +4237,59 @@ fn context_state(context: &web_sys::AudioContext) -> String {
 /// A routed element plays into a suspended `AudioContext` in silence, so
 /// wake the context of `media`'s tap before it plays.
 fn wake_tap(media: &web_sys::HtmlMediaElement) {
-    let Some(context) = with_tap(media, |t| t.context.clone()) else {
+    use super::resume::Wake;
+    let Some((context, wake)) = with_tap(media, |t| (t.context.clone(), Rc::clone(&t.wake))) else {
         return;
     };
     let state = context_state(&context);
+    wake.set(Wake::None);
     if super::resume::wakes_context(&state) {
+        wake.set(Wake::Pending);
         info(&format!(
             "pharos: resume context was not running state={state}"
         ));
         match context.resume() {
-            Err(e) => warn(&format!("pharos: resume context resume() refused: {e:?}")),
+            Err(e) => {
+                wake.set(Wake::Refused);
+                warn(&format!("pharos: resume context resume() refused: {e:?}"));
+            }
             // The promise settles after the play; its outcome is logged on
             // its own, as the report (`context_resumed`) only says a wake
             // was asked for.
             Ok(promise) => wasm_bindgen_futures::spawn_local(async move {
                 match wasm_bindgen_futures::JsFuture::from(promise).await {
-                    Ok(_) => info(&format!(
-                        "pharos: resume context resumed state={}",
-                        context_state(&context)
-                    )),
-                    Err(e) => warn(&format!(
-                        "pharos: resume context resume() rejected: {e:?} state={}",
-                        context_state(&context)
-                    )),
+                    Ok(_) => {
+                        wake.set(Wake::Resumed);
+                        info(&format!(
+                            "pharos: resume context resumed state={}",
+                            context_state(&context)
+                        ));
+                    }
+                    Err(e) => {
+                        wake.set(Wake::Rejected);
+                        warn(&format!(
+                            "pharos: resume context resume() rejected: {e:?} state={}",
+                            context_state(&context)
+                        ));
+                    }
                 }
             }),
         }
+    }
+}
+
+/// Wake a suspended tap context on the media element `id` that a play did
+/// not wake first (V683): a play from outside the player's controls, such
+/// as the browser's own media controls, after the pause rested it.
+pub fn wake_media_tap(id: &str) {
+    let Some(media) = video_element(id) else {
+        return;
+    };
+    let asleep = with_tap(&media, |t| {
+        super::resume::wakes_context(&context_state(&t.context))
+    });
+    if asleep == Some(true) {
+        wake_tap(&media);
     }
 }
 
@@ -3876,7 +4333,33 @@ pub fn resume_context(id: &str) -> super::resume::ResumeContext {
         engine,
         muted: media.muted() || media.volume() <= 0.0,
         audio,
+        user_agent: user_agent(),
     }
+}
+
+/// How the last play's wake of the tap on the media element `id` went
+/// (B735); `Wake::None` with no tap.
+pub fn tap_wake(id: &str) -> super::resume::Wake {
+    video_element(id)
+        .and_then(|media| with_tap(&media, |t| t.wake.get()))
+        .unwrap_or_default()
+}
+
+/// Suspend the running tap context on the media element `id`, letting the
+/// output stream close (B734, V683). Returns the context's state before, or
+/// `None` with no tap.
+pub fn rest_tap(id: &str) -> Option<String> {
+    let media = video_element(id)?;
+    let context = with_tap(&media, |t| t.context.clone())?;
+    let state = context_state(&context);
+    if state == "running" {
+        if let Err(e) = context.suspend() {
+            warn(&format!(
+                "pharos: audio output rest suspend() refused: {e:?}"
+            ));
+        }
+    }
+    Some(state)
 }
 
 /// The largest sample in the tap's latest window on the media element `id`,
@@ -3900,6 +4383,87 @@ pub fn tap_peak(id: &str) -> Option<f32> {
     .flatten()
 }
 
+/// Start a new tap's `context` and log how it went (B1141, V1101): Firefox
+/// makes a context suspended and starts it a moment later, and one with no
+/// sound output never starts and its `resume()` never settles (B1140), so a
+/// start still pending after [`super::resume::TAP_START_REPORT_MS`] is
+/// reported stuck.
+fn report_tap_start(context: &web_sys::AudioContext) {
+    use super::resume::{TapStart, TAP_START_REPORT_MS};
+    let made = now_ms();
+    let resume = match context.resume() {
+        Ok(promise) => promise,
+        Err(e) => {
+            log_tap_start(&TapStart::Refused {
+                error: js_error_name(&e),
+            });
+            return;
+        }
+    };
+    // One verdict: the resume races a timer that resolves to `undefined`
+    // (a settled resume resolves to `undefined` too, so the timer's value is
+    // a marker of its own), so a start that settles late is never also
+    // reported stuck.
+    let stuck = JsValue::from_str("pharos-tap-stuck");
+    let timer = {
+        let stuck = stuck.clone();
+        let ms = i32::try_from(TAP_START_REPORT_MS).unwrap_or(i32::MAX);
+        js_sys::Promise::new(&mut |resolve, _| {
+            let stuck = stuck.clone();
+            let fire = Closure::once_into_js(move || {
+                let _ = resolve.call1(&JsValue::NULL, &stuck);
+            });
+            if let Some(window) = web_sys::window() {
+                let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
+                    fire.unchecked_ref(),
+                    ms,
+                );
+            }
+        })
+    };
+    let race = js_sys::Promise::race(&js_sys::Array::of2(&resume, &timer));
+    let context = context.clone();
+    wasm_bindgen_futures::spawn_local(async move {
+        let outcome = wasm_bindgen_futures::JsFuture::from(race).await;
+        let state = context_state(&context);
+        log_tap_start(&match outcome {
+            Ok(v) if v == stuck => TapStart::Stuck { state },
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            Ok(_) => TapStart::Started {
+                state,
+                start_ms: (now_ms() - made).max(0.0) as u64,
+            },
+            Err(e) => TapStart::Rejected {
+                error: js_error_name(&e),
+                state,
+            },
+        });
+    });
+}
+
+fn log_tap_start(start: &super::resume::TapStart) {
+    if start.is_fault() {
+        warn(&start.line());
+    } else {
+        info(&start.line());
+    }
+}
+
+/// A thrown or rejected value's `name` (`NotAllowedError`), one token for a
+/// log field; its debug form when it has none.
+fn js_error_name(e: &JsValue) -> String {
+    js_sys::Reflect::get(e, &JsValue::from_str("name"))
+        .ok()
+        .and_then(|n| n.as_string())
+        .filter(|n| !n.is_empty() && !n.contains(char::is_whitespace))
+        .unwrap_or_else(|| {
+            format!("{e:?}")
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join("_")
+        })
+}
+
 /// Route the media element `media_id` through an analyser, or hand out the
 /// routing it already has: an element is routed once (B1037, V997).
 ///
@@ -3911,25 +4475,12 @@ pub fn audio_tap(media_id: &str) -> Result<Box<dyn super::visualiser::AudioTap>,
     let origin = web_sys::window()
         .and_then(|w| w.location().origin().ok())
         .unwrap_or_default();
-    let same_origin =
-        src.starts_with("blob:") || web_sys::Url::new(&src).is_ok_and(|u| u.origin() == origin);
     // A source fetched with CORS (the TV app's songs, B1032) can be analysed
     // from another origin; one fetched without it reads as silence.
     let cors = media.cross_origin().as_deref() == Some("anonymous");
+    super::resume::routable(&src, &origin, cors)?;
     // The query can carry a media token: never log it.
     let path = src.split('?').next().unwrap_or_default();
-    if !same_origin && !cors {
-        return Err(format!("cross-origin source {path}"));
-    }
-    // WebKit's native HLS feeds a MediaElementAudioSourceNode silence, so a
-    // routed element would go quiet; leave it unrouted and draw idle.
-    if src
-        .split('?')
-        .next()
-        .is_some_and(|path| path.ends_with(".m3u8"))
-    {
-        return Err(format!("native HLS source {path}"));
-    }
     release_detached_taps();
     if let Some((context, analyser)) = with_tap(&media, |t| (t.context.clone(), t.analyser.clone()))
     {
@@ -3954,13 +4505,14 @@ pub fn audio_tap(media_id: &str) -> Result<Box<dyn super::visualiser::AudioTap>,
     analyser
         .connect_with_audio_node(&context.destination())
         .map_err(js)?;
-    let _ = context.resume();
+    report_tap_start(&context);
     info(&format!("pharos: audio tap outcome=routed path={path}"));
     TAPS.with(|taps| {
         taps.borrow_mut().push(TapNodes {
             media: media.clone(),
             context: context.clone(),
             analyser: analyser.clone(),
+            wake: Rc::default(),
         })
     });
     Ok(Box::new(WebAudioTap {

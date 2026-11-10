@@ -10,7 +10,7 @@ pub(crate) const SERIES_META_COLUMNS: &str = "series_key, series_name, match_pro
     match_external_id, match_source, match_confidence, metadata_refreshed_at, \
     overview, community_rating, premiere_date, official_rating, genres, studios, \
     provider_ids, poster_locator, backdrop_locator, original_language, \
-    imdb_rating, rt_tomatometer";
+    imdb_rating, rt_tomatometer, match_flag, match_runner_up_id, match_runner_up_score, locked_fields";
 
 #[derive(sqlx::FromRow)]
 pub(crate) struct SeriesMetaRow {
@@ -33,6 +33,11 @@ pub(crate) struct SeriesMetaRow {
     pub original_language: Option<String>,
     pub imdb_rating: Option<f32>,
     pub rt_tomatometer: Option<i64>,
+    pub match_flag: Option<String>,
+    pub match_runner_up_id: Option<String>,
+    pub match_runner_up_score: Option<f32>,
+    #[sqlx(default)]
+    pub locked_fields: i64,
 }
 
 impl From<SeriesMetaRow> for SeriesMetadata {
@@ -59,6 +64,10 @@ impl From<SeriesMetaRow> for SeriesMetadata {
                 imdb: r.imdb_rating,
                 tomatometer: r.rt_tomatometer.and_then(|v| u16::try_from(v).ok()),
             },
+            match_flag: r.match_flag,
+            match_runner_up_id: r.match_runner_up_id,
+            match_runner_up_score: r.match_runner_up_score,
+            locked: pharos_core::LockedFields::from_bits(r.locked_fields),
         }
     }
 }

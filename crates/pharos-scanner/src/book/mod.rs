@@ -23,6 +23,7 @@
 
 pub mod comic;
 pub mod epub;
+pub mod integrity;
 pub mod kindle;
 pub mod pdf;
 
@@ -767,7 +768,8 @@ mod tests {
         let snapshotter = pharos_test_metrics::snapshotter(&recorder);
         let _guard = metrics::set_default_local_recorder(&recorder);
 
-        let meta = read_book_meta(std::path::Path::new("/books/Dune.azw3")).expect("still imports");
+        let meta =
+            read_book_meta(std::path::Path::new("/books/Book A.azw3")).expect("still imports");
         assert_eq!(
             meta.format,
             BookFormat::Unreadable,

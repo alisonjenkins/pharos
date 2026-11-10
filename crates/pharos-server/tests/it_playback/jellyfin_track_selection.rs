@@ -1,7 +1,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 //! Which audio track a client is told to start on.
 //!
-//! The fixture is Aliens, verified against the real library: three Ukrainian
+//! The fixture is Film AW, verified against the real library: three Ukrainian
 //! tracks ahead of an English DTS-HD MA, and the FIRST of the Ukrainian ones
 //! is the container's `default`. Every rule in play is visible in that one
 //! file:
@@ -37,7 +37,7 @@ fn track(stream_index: u32, language: &str, is_default: bool) -> AudioTrack {
     }
 }
 
-/// Aliens' actual track layout.
+/// Film AW' actual track layout.
 fn aliens_tracks() -> Vec<AudioTrack> {
     vec![
         track(1, "ukr", true),
@@ -87,7 +87,7 @@ async fn seed_full(
         .put(MediaItem {
             id: 9,
             path: "/no/such.mkv".into(),
-            title: "Aliens".into(),
+            title: "Film AW".into(),
             kind: if series_original_language.is_some() {
                 MediaKind::Episode
             } else {

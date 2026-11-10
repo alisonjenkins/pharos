@@ -13,6 +13,57 @@ use crate::sessions::SessionEvent;
 use crate::state::AppState;
 use crate::sync_recovery::now_unix_secs;
 
+/// What a stop did with the user's play state. The `label()` pairs are a
+/// dashboard contract for `pharos_play_stop_total{outcome,reason}`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopOutcome {
+    /// The position was stored as the resume point.
+    Saved,
+    /// The stop was past the played threshold: marked played, position reset.
+    Finished,
+    /// The stop named no item, so there was nothing to store.
+    NoItem,
+    /// The item was removed since it started playing.
+    ItemMissing,
+    /// The item could not be read, so its runtime is unknown.
+    ItemReadFailed,
+    /// The user's stored play state could not be read.
+    UserDataReadFailed,
+    /// The new play state could not be written.
+    UserDataWriteFailed,
+}
+
+impl StopOutcome {
+    pub const ALL: [StopOutcome; 7] = [
+        StopOutcome::Saved,
+        StopOutcome::Finished,
+        StopOutcome::NoItem,
+        StopOutcome::ItemMissing,
+        StopOutcome::ItemReadFailed,
+        StopOutcome::UserDataReadFailed,
+        StopOutcome::UserDataWriteFailed,
+    ];
+
+    /// `(outcome, reason)` as the metric labels them.
+    pub const fn label(self) -> (&'static str, &'static str) {
+        match self {
+            StopOutcome::Saved => ("saved", "position"),
+            StopOutcome::Finished => ("finished", "past_threshold"),
+            StopOutcome::NoItem => ("skipped", "no_item"),
+            StopOutcome::ItemMissing => ("skipped", "item_missing"),
+            StopOutcome::ItemReadFailed => ("store_error", "item_read"),
+            StopOutcome::UserDataReadFailed => ("store_error", "user_data_read"),
+            StopOutcome::UserDataWriteFailed => ("store_error", "user_data_write"),
+        }
+    }
+
+    fn record(self) {
+        let (outcome, reason) = self.label();
+        metrics::counter!("pharos_play_stop_total", "outcome" => outcome, "reason" => reason)
+            .increment(1);
+    }
+}
+
 /// One report from a player.
 pub struct Report<'a> {
     pub play_session_id: Option<&'a str>,
@@ -36,6 +87,14 @@ pub enum ReportError {
     /// be recorded.
     #[error("session registry: {0}")]
     RegistryDown(String),
+    /// A play-state read or write on the stop failed (spec 038 FR-108). The
+    /// playback has ended; the position was not stored, so a retry can.
+    #[error("play state {step}: {source}")]
+    Store {
+        step: &'static str,
+        #[source]
+        source: pharos_core::DomainError,
+    },
 }
 
 /// A player starting an item: the now-playing entry `/Sessions` lists.
@@ -249,28 +308,43 @@ pub async fn stop(state: &AppState, user: &User, r: Report<'_>) -> Result<(), Re
         .item_wire_id
         .and_then(pharos_jellyfin_api::dto::parse_item_id)
     else {
+        StopOutcome::NoItem.record();
         return Ok(());
     };
     let position = r.position_ticks;
-    // The stop below is this session's final write; a report still
-    // held for it is older and must not follow it into the database.
-    state
-        .progress_writes
-        .forget(&ProgressKey::new(user.id, item_id, r.play_session_id));
-    let runtime = state
-        .stores
-        .get(item_id)
-        .await
-        .ok()
-        .and_then(|it| it.probe.run_time_ticks())
-        .unwrap_or(0);
+    let progress_key = ProgressKey::new(user.id, item_id, r.play_session_id);
+    let runtime = match state.stores.get(item_id).await {
+        Ok(item) => item.probe.run_time_ticks().unwrap_or(0),
+        // Removed since it started playing: there is no row to store on.
+        Err(pharos_core::DomainError::NotFound(_)) => {
+            StopOutcome::ItemMissing.record();
+            state.progress_writes.forget(&progress_key);
+            return Ok(());
+        }
+        Err(error) => {
+            StopOutcome::ItemReadFailed.record();
+            tracing::warn!(%error, item = item_id, position, "playback stop: item read failed, nothing stored");
+            return Err(ReportError::Store {
+                step: "item read",
+                source: error,
+            });
+        }
+    };
     // P36 — threshold configurable via [server].played_threshold_pct
     // (default 90, clamped to [50, 100] at boot).
     let played_complement = 100u64.saturating_sub(state.played_threshold_pct as u64);
     let finished =
         runtime > 0 && position >= runtime.saturating_sub(runtime * played_complement / 100);
-    let Ok(mut data) = state.stores.get_user_data(user.id, item_id).await else {
-        return Ok(());
+    let mut data = match state.stores.get_user_data(user.id, item_id).await {
+        Ok(data) => data,
+        Err(error) => {
+            StopOutcome::UserDataReadFailed.record();
+            tracing::warn!(%error, item = item_id, position, "playback stop: user data read failed, nothing stored");
+            return Err(ReportError::Store {
+                step: "user data read",
+                source: error,
+            });
+        }
     };
     if finished {
         data.played = true;
@@ -286,17 +360,31 @@ pub async fn stop(state: &AppState, user: &User, r: Report<'_>) -> Result<(), Re
     if r.subtitle_stream_index.is_some() {
         data.subtitle_stream_index = r.subtitle_stream_index;
     }
-    if state
-        .stores
-        .set_user_data(user.id, item_id, data)
-        .await
-        .is_ok()
-    {
-        // B36 — full DTO so the just-finished (or resumable)
-        // item's card flips its watched tick / resume bar
-        // everywhere without a refresh. `runtime` was
-        // already fetched above for the finished check.
-        announce(state, user, item_id, data, runtime);
+    match state.stores.set_user_data(user.id, item_id, data).await {
+        Ok(()) => {
+            // The stop is this session's final write; a report still held
+            // for it is older. On a failed stop it stays held, so the
+            // background flush still saves the last reported position.
+            state.progress_writes.forget(&progress_key);
+            if finished {
+                StopOutcome::Finished.record();
+            } else {
+                StopOutcome::Saved.record();
+            }
+            // B36 — full DTO so the just-finished (or resumable)
+            // item's card flips its watched tick / resume bar
+            // everywhere without a refresh. `runtime` was
+            // already fetched above for the finished check.
+            announce(state, user, item_id, data, runtime);
+        }
+        Err(error) => {
+            StopOutcome::UserDataWriteFailed.record();
+            tracing::warn!(%error, item = item_id, position, finished, "playback stop: user data write failed");
+            return Err(ReportError::Store {
+                step: "user data write",
+                source: error,
+            });
+        }
     }
     Ok(())
 }

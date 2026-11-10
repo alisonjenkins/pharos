@@ -279,6 +279,15 @@ async fn serve_chapter_image(
     idx: u32,
 ) -> Result<HttpResponse, actix_web::Error> {
     let user = crate::api::jellyfin::optional_bearer(state, req, id_str, "image").await?;
+    check_anonymous_tag(
+        state,
+        user.as_ref(),
+        id_str,
+        "chapter",
+        idx,
+        requested_tag(req.query_string()),
+        ImageClient::of(req),
+    )?;
     let id: u64 = pharos_jellyfin_api::dto::parse_item_id(id_str)
         .ok_or_else(|| error::ErrorBadRequest("invalid id"))?;
     crate::api::jellyfin::require_item_access_if_signed_in(state, user.as_ref(), id, "image")
@@ -347,6 +356,8 @@ async fn get_image(
         parse_image_format(req.query_string()),
         requested_width(req.query_string()),
         if_none_match_of(&req),
+        requested_tag(req.query_string()),
+        ImageClient::of(&req),
     )
     .await
 }
@@ -367,6 +378,8 @@ async fn head_image(
         parse_image_format(req.query_string()),
         requested_width(req.query_string()),
         if_none_match_of(&req),
+        requested_tag(req.query_string()),
+        ImageClient::of(&req),
     )
     .await
 }
@@ -387,6 +400,8 @@ async fn get_image_indexed(
         parse_image_format(req.query_string()),
         requested_width(req.query_string()),
         if_none_match_of(&req),
+        requested_tag(req.query_string()),
+        ImageClient::of(&req),
     )
     .await
 }
@@ -407,6 +422,8 @@ async fn head_image_indexed(
         parse_image_format(req.query_string()),
         requested_width(req.query_string()),
         if_none_match_of(&req),
+        requested_tag(req.query_string()),
+        ImageClient::of(&req),
     )
     .await
 }
@@ -464,6 +481,8 @@ async fn serve_image(
     format: ImageFormat,
     req_width: Option<u32>,
     if_none_match: Option<&str>,
+    tag: Option<&str>,
+    client: ImageClient,
 ) -> Result<HttpResponse, actix_web::Error> {
     // B85 — accept the dashed synth/person id the kotlin SDK (Android TV) sends:
     // person + Series/Season image resolution below compares the raw id to the
@@ -509,21 +528,38 @@ async fn serve_image(
             // metadata (thumb_url = the old server's local disk path like
             // /config/data/metadata/People/…), which a browser would
             // resolve relative to pharos and 404.
-            return Ok(
-                match person
-                    .thumb_url
-                    .filter(|u| u.starts_with("http://") || u.starts_with("https://"))
-                {
-                    Some(url) => HttpResponse::Found()
-                        .insert_header((actix_web::http::header::LOCATION, url))
-                        .finish(),
-                    // Known person, no photo → 404; the client renders its
-                    // initials placeholder.
-                    None => HttpResponse::NotFound().body(""),
-                },
-            );
+            let thumb = person
+                .thumb_url
+                .filter(|u| u.starts_with("http://") || u.starts_with("https://"));
+            // A provider portrait is passed through from this origin, so a
+            // page whose CSP allows only 'self' images can show it.
+            if let Some(url) = thumb.as_deref().filter(|u| crate::portrait::is_proxied(u)) {
+                return Ok(
+                    match crate::portrait::fetch(state.portraits.as_ref(), url).await {
+                        Some(p) => HttpResponse::Ok()
+                            .content_type(p.content_type)
+                            .insert_header((
+                                actix_web::http::header::CACHE_CONTROL,
+                                image_cache_control(),
+                            ))
+                            .body(p.bytes),
+                        None => HttpResponse::NotFound().body(""),
+                    },
+                );
+            }
+            return Ok(match thumb {
+                Some(url) => HttpResponse::Found()
+                    .insert_header((actix_web::http::header::LOCATION, url))
+                    .finish(),
+                // Known person, no photo → 404; the client renders its
+                // initials placeholder.
+                None => HttpResponse::NotFound().body(""),
+            });
         }
     }
+    // Past the person branch: portraits redirect to public provider URLs and
+    // are not tag-checked (ADR-0073).
+    check_anonymous_tag(state, user, id_str, image_type, index, tag, client)?;
     let Some(cache) = state.images.as_ref() else {
         return Ok(HttpResponse::NotFound().body(""));
     };
@@ -602,6 +638,13 @@ async fn serve_image(
             .await;
         }
     }
+    // One read of the item's artwork rows serves the episode-still, local and
+    // backdrop lookups below; only the canonical index (0) resolves locally.
+    let artwork = if index == 0 {
+        artwork_rows(state, id).await
+    } else {
+        Vec::new()
+    };
     // An episode's own Primary row is the series-folder poster (the sidecar
     // provider probes the show folder for episodes, and synth series/season
     // tiles rely on that), so serve the episode's own still ahead of it.
@@ -610,7 +653,7 @@ async fn serve_image(
         && matches!(role, ImageRole::Primary)
         && matches!(item.kind, pharos_core::MediaKind::Episode)
     {
-        if let Some(still) = episode_still_path(state, &item).await {
+        if let Some(still) = episode_still_path(&item, &artwork).await {
             return serve_local_artwork(
                 &still,
                 role,
@@ -638,9 +681,13 @@ async fn serve_image(
     // through to the upload / extract path (V6 spirit — never 500 a
     // public image route on a stale row).
     if index == 0 {
-        if let Some(local) = local_artwork_path(state, id, role).await {
+        if let Some(local) = local_artwork_path(id, role, &artwork).await {
             if matches!(role, ImageRole::Thumb) {
                 metrics::counter!("pharos_image_thumb_source_total", "source" => "artwork")
+                    .increment(1);
+            }
+            if matches!(role, ImageRole::Primary) {
+                metrics::counter!("pharos_image_primary_source_total", "source" => "artwork")
                     .increment(1);
             }
             return serve_local_artwork(
@@ -664,7 +711,7 @@ async fn serve_image(
     // Thumb wants, so serve it. Frame extraction stays the last resort, for
     // items with no artwork at all (unmatched, no sidecar).
     if index == 0 && matches!(role, ImageRole::Thumb) {
-        if let Some(backdrop) = local_artwork_path(state, id, ImageRole::Backdrop).await {
+        if let Some(backdrop) = local_artwork_path(id, ImageRole::Backdrop, &artwork).await {
             metrics::counter!("pharos_image_thumb_source_total", "source" => "backdrop")
                 .increment(1);
             return serve_local_artwork(
@@ -690,6 +737,17 @@ async fn serve_image(
         && matches!(role, ImageRole::Backdrop | ImageRole::Thumb)
     {
         return Ok(HttpResponse::NotFound().body(""));
+    }
+    // A video item's Primary that reaches here has no servable recorded
+    // artwork, so the still is a frame extracted from the media itself.
+    if index == 0
+        && matches!(role, ImageRole::Primary)
+        && matches!(
+            item.kind,
+            pharos_core::MediaKind::Movie | pharos_core::MediaKind::Episode
+        )
+    {
+        metrics::counter!("pharos_image_primary_source_total", "source" => "frame").increment(1);
     }
     let jpeg_path = match cache
         .fetch_3d(
@@ -820,23 +878,53 @@ pub(crate) async fn resolve_synth_image_item(
     // and each full `list()` scans the whole library. Cache the synth-id →
     // item-id mapping (including negatives) so only the first request per group
     // pays the scan.
-    if let Some(cached) = state.synth_image_cached(id_str) {
-        return match cached {
-            Some(item_id) => state.stores.get(item_id).await.ok(),
-            None => None,
-        };
+    let mut stale = None;
+    match state.synth_image_cached(id_str) {
+        Some(Some(item_id)) => match state.stores.get(item_id).await {
+            Ok(item) => return Some(item),
+            Err(pharos_core::DomainError::NotFound(_)) => stale = Some(item_id),
+            Err(error) => {
+                tracing::warn!(synth_id = id_str, item_id, %error, "could not load a group's image representative");
+                return None;
+            }
+        },
+        Some(None) => return None,
+        None => {}
+    }
+    // A memoised representative outlives the library generation, so a scan
+    // that folds or sweeps its row leaves the tile blank until it is re-picked.
+    if let Some(item_id) = stale {
+        tracing::info!(
+            synth_id = id_str,
+            item_id,
+            "re-picked a group's image representative: its memoised row is gone",
+        );
+        metrics::counter!("pharos_synth_image_repick_total").increment(1);
+        state.synth_image_forget(id_str, item_id);
     }
     // Cold miss: warm the ENTIRE synth-id → representative map in one scan,
     // serialised so a grid's burst of concurrent poster requests doesn't each
     // run its own multi-second `list()`. Peers wait here, then hit the memo.
     let mut confirmed_at = state.synth_image_warm.lock().await;
-    if let Some(cached) = state.synth_image_cached(id_str) {
-        return match cached {
-            Some(item_id) => state.stores.get(item_id).await.ok(),
-            None => None,
-        };
+    match state.synth_image_cached(id_str) {
+        Some(Some(item_id)) => match state.stores.get(item_id).await {
+            Ok(item) => return Some(item),
+            Err(pharos_core::DomainError::NotFound(_)) => {
+                state.synth_image_forget(id_str, item_id);
+                stale = Some(item_id);
+            }
+            Err(_) => return None,
+        },
+        Some(None) => return None,
+        None => {}
     }
-    let all = state.list_items_cached().await.ok()?;
+    // The cached list can still hold a row a scan just swept, within one
+    // library generation, so a re-pick reads the store.
+    let all = if stale.is_some() {
+        std::sync::Arc::new(state.stores.list().await.ok()?)
+    } else {
+        state.list_items_fresh().await.ok()?
+    };
     build_synth_image_map(state, &all);
     if let Some(Some(item_id)) = state.synth_image_cached(id_str) {
         return all.iter().find(|it| it.id == item_id).cloned();
@@ -891,13 +979,13 @@ fn build_synth_image_map(state: &AppState, all: &[pharos_core::MediaItem]) {
                 s.episode_number.unwrap_or(0)
             );
             consider(
-                series_id_for_key(s.series_folder.as_deref(), &s.series_name),
+                series_id_for_key(s.identity_folder(), &s.series_name),
                 it.id,
                 key.clone(),
             );
             if let Some(n) = s.season_number {
                 consider(
-                    season_id_for_key(s.series_folder.as_deref(), &s.series_name, n),
+                    season_id_for_key(s.identity_folder(), &s.series_name, n),
                     it.id,
                     key,
                 );
@@ -979,7 +1067,7 @@ async fn season_sidecar_path(
     let s = item.series.as_ref()?;
     let n = s.season_number?;
     let folder = s.series_folder.as_deref()?;
-    if !season_id_for_key(Some(folder), &s.series_name, n).eq_ignore_ascii_case(id_str) {
+    if !season_id_for_key(s.identity_folder(), &s.series_name, n).eq_ignore_ascii_case(id_str) {
         return None; // a series (or foreign) id — not this episode's season
     }
     let suffix = match role {
@@ -1075,6 +1163,22 @@ fn artwork_role_token(role: ImageRole) -> &'static str {
     }
 }
 
+/// One `artwork` row: role, source, locator.
+type ArtworkRow = (String, String, String);
+
+/// The artwork rows recorded for item `id`. A store error is logged and reads
+/// as no rows, so a stale or unreadable table falls through to the upload /
+/// frame-extract path rather than failing a public route.
+async fn artwork_rows(state: &AppState, id: u64) -> Vec<ArtworkRow> {
+    match state.stores.artwork_for(id).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!(error = %e, media.id = id, "artwork lookup failed");
+            Vec::new()
+        }
+    }
+}
+
 /// LIB-D5 — the recorded on-disk artwork path for `(id, role)`, if a
 /// servable source (`local` sidecar from D4 scanning, or a downloaded
 /// `tmdb`/`tvdb` cache entry from Task 8) recorded one and the file still
@@ -1085,20 +1189,13 @@ fn artwork_role_token(role: ImageRole) -> &'static str {
 /// spirit).
 #[tracing::instrument(name = "image.artwork_lookup", skip_all)]
 async fn local_artwork_path(
-    state: &AppState,
     id: u64,
     role: ImageRole,
+    rows: &[ArtworkRow],
 ) -> Option<std::path::PathBuf> {
     let token = artwork_role_token(role);
-    let rows = match state.stores.artwork_for(id).await {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::warn!(error = %e, media.id = id, "artwork lookup failed");
-            return None;
-        }
-    };
     let locator = rows
-        .into_iter()
+        .iter()
         .find(|(r, source, _)| {
             r.eq_ignore_ascii_case(token) && pharos_core::artwork_source_is_item_servable(source)
         })
@@ -1107,6 +1204,7 @@ async fn local_artwork_path(
     match tokio::fs::try_exists(&path).await {
         Ok(true) => Some(path),
         _ => {
+            metrics::counter!("pharos_image_artwork_missing_total", "role" => token).increment(1);
             tracing::warn!(
                 media.id = id,
                 role = token,
@@ -1123,17 +1221,10 @@ async fn local_artwork_path(
 /// first, then a provider's episode image. Show-level art the scanner also
 /// records against the episode (`folder.jpg`, `landscape.jpg`) never counts.
 async fn episode_still_path(
-    state: &AppState,
     item: &pharos_core::MediaItem,
+    rows: &[ArtworkRow],
 ) -> Option<std::path::PathBuf> {
-    let rows = match state.stores.artwork_for(item.id).await {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::warn!(error = %e, media.id = item.id, "artwork lookup failed");
-            return None;
-        }
-    };
-    for locator in episode_still_candidates(&item.path, &rows) {
+    for locator in episode_still_candidates(&item.path, rows) {
         let path = std::path::PathBuf::from(locator);
         if tokio::fs::try_exists(&path).await.unwrap_or(false) {
             return Some(path);
@@ -1356,6 +1447,135 @@ impl ImageFormat {
             Self::Avif => Some(pharos_cache::EncodedFormat::Avif),
         }
     }
+}
+
+/// The `tag=` an image URL carries, as the client echoed it from a listing.
+fn requested_tag(qs: &str) -> Option<&str> {
+    qs.split('&')
+        .filter_map(|kv| kv.split_once('='))
+        .find(|(k, _)| k.eq_ignore_ascii_case("tag"))
+        .map(|(_, v)| v)
+}
+
+/// Which kind of client sent an anonymous image request, from its
+/// `User-Agent`: the `client` label of `pharos_image_tag_check_total`, so a
+/// lingering `invalid` or `absent` names the client to fix before
+/// enforcement (B286 was diagnosed from exactly this value). Buckets are the
+/// user agents seen in pharos's logs, 2026-11.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ImageClient {
+    /// The Jellyfin Android app's image loader: `okhttp/4.x`.
+    Okhttp,
+    /// `jellyfin-sdk-kotlin` clients, e.g. `Jellyfin Android TV/0.19 via
+    /// jellyfin-sdk-kotlin (OkHttp/4.12.0)`.
+    JellyfinSdk,
+    /// A Chromecast receiver (`CrKey` in a Mozilla user agent).
+    Cast,
+    /// Any other `Mozilla/` user agent: a browser.
+    Browser,
+    /// A user agent none of the above match.
+    Other,
+    /// No `User-Agent` header.
+    None,
+}
+
+impl ImageClient {
+    #[cfg(test)]
+    pub(crate) const ALL: [Self; 6] = [
+        Self::Okhttp,
+        Self::JellyfinSdk,
+        Self::Cast,
+        Self::Browser,
+        Self::Other,
+        Self::None,
+    ];
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Okhttp => "okhttp",
+            Self::JellyfinSdk => "jellyfin_sdk",
+            Self::Cast => "cast",
+            Self::Browser => "browser",
+            Self::Other => "other",
+            Self::None => "none",
+        }
+    }
+
+    fn classify(ua: Option<&str>) -> Self {
+        let Some(ua) = ua else {
+            return Self::None;
+        };
+        let lower = ua.to_ascii_lowercase();
+        if lower.contains("jellyfin-sdk") {
+            Self::JellyfinSdk
+        } else if lower.starts_with("okhttp/") {
+            Self::Okhttp
+        } else if lower.contains("crkey") {
+            Self::Cast
+        } else if lower.starts_with("mozilla/") {
+            Self::Browser
+        } else {
+            Self::Other
+        }
+    }
+
+    fn of(req: &HttpRequest) -> Self {
+        Self::classify(
+            req.headers()
+                .get(actix_web::http::header::USER_AGENT)
+                .and_then(|v| v.to_str().ok()),
+        )
+    }
+}
+
+/// ADR-0073 / V712 — an image request without a credential must carry a tag
+/// this server minted for that id and role. The verdict is counted on every
+/// anonymous request (`pharos_image_tag_check_total{verdict,enforced}`), and
+/// only refused when `[server].image_tags_enforced` is on, so the rollout
+/// can be read before it can break a client. A signed-in request is already
+/// checked against the user's library access (V189) and skips this.
+fn check_anonymous_tag(
+    state: &AppState,
+    user: Option<&pharos_core::User>,
+    id_str: &str,
+    role: &str,
+    index: u32,
+    tag: Option<&str>,
+    client: ImageClient,
+) -> Result<(), actix_web::Error> {
+    use pharos_jellyfin_api::image_tag_sig::{indexed_role, TagVerdict};
+    if user.is_some() {
+        return Ok(());
+    }
+    let role = indexed_role(&role.to_ascii_lowercase(), index as usize);
+    let role = role.as_str();
+    let verdict = state.image_tag_key.verify(id_str, role, tag);
+    let enforced = state.image_tags_enforced;
+    metrics::counter!(
+        "pharos_image_tag_check_total",
+        "verdict" => verdict.label(),
+        "enforced" => if enforced { "true" } else { "false" },
+        "client" => client.label(),
+    )
+    .increment(1);
+    if verdict == TagVerdict::Valid {
+        return Ok(());
+    }
+    // Debug, not warn: before enforcement every pre-ADR-0073 cached tag lands
+    // here, once per poster. The counter is the signal; this names the value.
+    tracing::debug!(
+        verdict = verdict.label(),
+        enforced,
+        item = id_str,
+        role,
+        tag_len = tag.map_or(0, str::len),
+        client = client.label(),
+        "anonymous image request without a valid tag"
+    );
+    if enforced {
+        return Err(error::ErrorUnauthorized("image tag required"));
+    }
+    Ok(())
 }
 
 fn parse_image_format(qs: &str) -> ImageFormat {
@@ -1747,6 +1967,133 @@ mod tests {
         );
     }
 
+    /// ADR-0073 / V712 — with enforcement on, an anonymous request needs a
+    /// tag this server minted for that id and role; a signed-in one does not.
+    /// The verdict is counted for every anonymous request either way.
+    #[actix_web::test]
+    async fn an_enforced_anonymous_image_needs_a_keyed_tag() {
+        let _ = crate::obs::init("info", None);
+        let stores = Stores::connect("sqlite::memory:").await.unwrap();
+        let mut st = crate::state::AppState::new(stores, "t".into());
+        st.image_tags_enforced = true;
+        let state = web::Data::new(st);
+        let good = state
+            .image_tag_key
+            .sign("abc", "primary", "0123456789abcdef");
+        let other_role = state
+            .image_tag_key
+            .sign("abc", "backdrop", "0123456789abcdef");
+        let state_key = state.image_tag_key.clone();
+        let token = token_for(&state.stores).await;
+        let app = test::init_service(App::new().app_data(state).configure(register)).await;
+        let status = |uri: String| {
+            let req = test::TestRequest::get().uri(&uri).to_request();
+            test::call_service(&app, req)
+        };
+        let base = "/items/abc/images/primary";
+        assert_eq!(status(base.into()).await.status(), 401, "no tag");
+        assert_eq!(
+            status(format!("{base}?tag=0123456789abcdef"))
+                .await
+                .status(),
+            401,
+            "unkeyed pre-ADR-0073 tag"
+        );
+        assert_eq!(
+            status(format!("{base}?tag={other_role}")).await.status(),
+            401,
+            "a tag minted for another role"
+        );
+        assert_ne!(
+            status(format!("{base}?fillWidth=240&Tag={good}"))
+                .await
+                .status(),
+            401,
+            "a keyed tag authorises its own image"
+        );
+        let backdrop_1 = state_key.sign("abc", "backdrop/1", "0123456789abcdef");
+        assert_eq!(
+            status(format!("/items/abc/images/backdrop/1?tag={other_role}"))
+                .await
+                .status(),
+            401,
+            "backdrop 0's tag must not authorise backdrop 1"
+        );
+        assert_ne!(
+            status(format!("/items/abc/images/backdrop/1?tag={backdrop_1}"))
+                .await
+                .status(),
+            401,
+            "backdrop 1's own tag authorises it"
+        );
+        assert_ne!(
+            status(format!("{base}?api_key={token}")).await.status(),
+            401,
+            "a signed-in request needs no tag"
+        );
+        let rendered = crate::obs::render();
+        for verdict in ["valid", "invalid", "absent"] {
+            assert!(
+                rendered
+                    .lines()
+                    .any(|l| l.starts_with("pharos_image_tag_check_total{")
+                        && l.contains(&format!(r#"verdict="{verdict}""#))
+                        && l.contains(r#"enforced="true""#)),
+                "verdict {verdict} must be counted:\n{rendered}"
+            );
+        }
+    }
+
+    #[actix_web::test]
+    async fn image_client_labels_are_distinct_and_classify_seen_agents() {
+        let mut labels: Vec<_> = ImageClient::ALL.iter().map(|c| c.label()).collect();
+        labels.sort_unstable();
+        labels.dedup();
+        assert_eq!(labels.len(), ImageClient::ALL.len());
+        for (ua, want) in [
+            (Some("okhttp/4.12.0"), ImageClient::Okhttp),
+            (
+                Some("Jellyfin Android TV/0.19.10 via jellyfin-sdk-kotlin (OkHttp/4.12.0)"),
+                ImageClient::JellyfinSdk,
+            ),
+            (
+                Some("Mozilla/5.0 (X11; Linux armv7l) CrKey/1.56.500000"),
+                ImageClient::Cast,
+            ),
+            (
+                Some("Mozilla/5.0 (X11; Linux x86_64) Firefox/140.0"),
+                ImageClient::Browser,
+            ),
+            (Some("curl/8.0"), ImageClient::Other),
+            (None, ImageClient::None),
+        ] {
+            assert_eq!(ImageClient::classify(ua), want, "{ua:?}");
+        }
+    }
+
+    /// Before enforcement is switched on, a bad tag is counted and served.
+    #[actix_web::test]
+    async fn an_unenforced_bad_tag_is_counted_and_served() {
+        let _ = crate::obs::init("info", None);
+        let state = seed_state().await;
+        let app = test::init_service(App::new().app_data(state).configure(register)).await;
+        let req = test::TestRequest::get()
+            .uri("/items/abc/images/primary?tag=0123456789abcdef")
+            .insert_header(("User-Agent", "okhttp/4.12.0"))
+            .to_request();
+        assert_ne!(test::call_service(&app, req).await.status(), 401);
+        let rendered = crate::obs::render();
+        assert!(
+            rendered
+                .lines()
+                .any(|l| l.starts_with("pharos_image_tag_check_total{")
+                    && l.contains(r#"verdict="invalid""#)
+                    && l.contains(r#"enforced="false""#)
+                    && l.contains(r#"client="okhttp""#)),
+            "{rendered}"
+        );
+    }
+
     #[actix_web::test]
     async fn post_requires_auth_and_returns_401_without_token() {
         let state = seed_state().await;
@@ -1867,7 +2214,7 @@ mod tests {
             .await
             .unwrap();
 
-        let all = state.list_items_cached().await.unwrap();
+        let all = state.list_items_fresh().await.unwrap();
         build_synth_image_map(&state, &all);
         let various = crate::api::jellyfin::dto::artist_id_for("Various Artists");
         assert_eq!(state.synth_image_cached(&various), Some(Some(7)));
@@ -1997,6 +2344,89 @@ mod tests {
     }
 
     #[actix_web::test]
+    async fn a_memoised_representative_whose_row_is_gone_is_re_picked() {
+        // B1000 — the copy fold deleted the rows of Show AY' S01 .avi copies,
+        // one of them the show's memoised representative; the memo keeps
+        // positives across library generations, so the show tile lost its
+        // poster until a restart.
+        use crate::api::jellyfin::dto::series_id_for_key;
+        use pharos_core::{MediaItem, MediaKind, MediaStore, SeriesInfo};
+        let cache_dir = tempfile::tempdir().unwrap();
+        let state = seed_state_with_cache(cache_dir.path()).await;
+        state
+            .stores
+            .put(MediaItem {
+                id: 602,
+                path: "/tv/Show AY/Season 01/Show AY S01E01.mkv".into(),
+                title: "Show AY S01E01".into(),
+                kind: MediaKind::Episode,
+                series: Some(SeriesInfo {
+                    series_name: "Show AY".into(),
+                    season_number: Some(1),
+                    episode_number: Some(1),
+                    series_folder: Some("/tv/Show AY".into()),
+                    series_year: None,
+                    series_key: None,
+                }),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let synth = series_id_for_key(Some("/tv/Show AY"), "Show AY");
+        state.synth_image_remember(&synth, Some(601));
+
+        let tags = synth_primary_tag(&state, &synth)
+            .await
+            .expect("a show whose memoised episode was folded keeps a poster");
+        assert_eq!(tags.get("Primary").map(String::as_str), Some("602"));
+        assert_eq!(state.synth_image_cached(&synth), Some(Some(602)));
+    }
+
+    #[actix_web::test]
+    async fn a_re_pick_never_reads_a_cached_list_holding_the_swept_row() {
+        // B1000 — the item-list cache can hold a swept row until the library
+        // generation moves, so a re-pick from it chose the same gone row.
+        use crate::api::jellyfin::dto::series_id_for_key;
+        use pharos_core::{MediaItem, MediaKind, MediaStore, SeriesInfo};
+        let cache_dir = tempfile::tempdir().unwrap();
+        let state = seed_state_with_cache(cache_dir.path()).await;
+        let episode = |id: u64, n: u32| MediaItem {
+            id,
+            path: format!("/tv/Show AY/Season 01/Show AY S01E0{n}.mkv").into(),
+            title: format!("Show AY S01E0{n}"),
+            kind: MediaKind::Episode,
+            series: Some(SeriesInfo {
+                series_name: "Show AY".into(),
+                season_number: Some(1),
+                episode_number: Some(n),
+                series_folder: Some("/tv/Show AY".into()),
+                series_year: None,
+                series_key: None,
+            }),
+            ..Default::default()
+        };
+        state.stores.put(episode(701, 1)).await.unwrap();
+        state.stores.put(episode(702, 2)).await.unwrap();
+        let synth = series_id_for_key(Some("/tv/Show AY"), "Show AY");
+        let warmed = synth_primary_tag(&state, &synth).await.unwrap();
+        assert_eq!(warmed.get("Primary").map(String::as_str), Some("701"));
+
+        let scan = state
+            .stores
+            .begin_scan(std::path::Path::new("/tv"))
+            .await
+            .unwrap();
+        state.stores.mark_seen(702, scan, 0, 0).await.unwrap();
+        let swept = state.stores.sweep_unseen(scan, "/tv").await.unwrap();
+        assert_eq!(swept, vec![701]);
+
+        let tags = synth_primary_tag(&state, &synth)
+            .await
+            .expect("the show keeps a poster after its representative is swept");
+        assert_eq!(tags.get("Primary").map(String::as_str), Some("702"));
+    }
+
+    #[actix_web::test]
     async fn a_head_advertises_the_length_the_get_would_send() {
         // B166 — `.finish()` on the HEAD path declared an empty body, and
         // actix derives Content-Length from the body size while DROPPING a
@@ -2081,6 +2511,82 @@ mod tests {
         assert_eq!(resp.headers().get("content-type").unwrap(), "image/png");
         let body = test::read_body(resp).await;
         assert_eq!(body.as_ref(), PNG_1X1, "served bytes must be the sidecar");
+    }
+
+    /// The counter values under `name`, keyed by the value of its `label`.
+    fn counter_samples(
+        snap: &pharos_test_metrics::CumulativeSnapshotter,
+        name: &str,
+        label: &str,
+    ) -> std::collections::BTreeMap<String, u64> {
+        use metrics_util::debugging::DebugValue;
+        let mut out = std::collections::BTreeMap::new();
+        for (ck, _, _, value) in snap.snapshot().into_vec() {
+            if ck.key().name() != name {
+                continue;
+            }
+            let Some(sample) = ck.key().labels().find(|l| l.key() == label) else {
+                continue;
+            };
+            if let DebugValue::Counter(n) = value {
+                out.insert(sample.value().to_owned(), n);
+            }
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn a_recorded_file_that_is_gone_is_counted_by_role() {
+        use metrics_util::debugging::DebuggingRecorder;
+        let recorder = DebuggingRecorder::new();
+        let snap = pharos_test_metrics::snapshotter(&recorder);
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let rows = vec![(
+            "Primary".to_owned(),
+            "local".to_owned(),
+            "/nonexistent/pharos-test/folder.jpg".to_owned(),
+        )];
+        assert!(local_artwork_path(1, ImageRole::Primary, &rows)
+            .await
+            .is_none());
+        let missing = counter_samples(&snap, "pharos_image_artwork_missing_total", "role");
+        assert_eq!(missing.get("Primary"), Some(&1));
+    }
+
+    #[actix_web::test]
+    async fn primary_still_names_the_source_that_served_it() {
+        use pharos_core::MediaStore;
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snap = pharos_test_metrics::snapshotter(&recorder);
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+        let poster = dir.path().join("poster.png");
+        std::fs::write(&poster, PNG_1X1).unwrap();
+
+        let state = seed_state_with_cache(cache_dir.path()).await;
+        // Item 42 has a recorded sidecar; item 43 has no artwork at all, so
+        // its Primary falls through to the frame-extract path.
+        put_movie(&state, 42, &dir.path().join("movie.mkv")).await;
+        state
+            .stores
+            .set_artwork(42, "Primary", "local", &poster.to_string_lossy())
+            .await
+            .unwrap();
+        put_movie(&state, 43, &dir.path().join("bare.mkv")).await;
+
+        let token = token_for(&state.stores).await;
+        let app = test::init_service(App::new().app_data(state.clone()).configure(register)).await;
+        for uri in ["/items/42/images/primary", "/items/43/images/primary"] {
+            let req = test::TestRequest::get()
+                .insert_header(("X-Emby-Token", token.clone()))
+                .uri(uri)
+                .to_request();
+            let _ = test::call_service(&app, req).await;
+        }
+        let served = counter_samples(&snap, "pharos_image_primary_source_total", "source");
+        assert_eq!(served.get("artwork"), Some(&1), "{served:?}");
+        assert_eq!(served.get("frame"), Some(&1), "{served:?}");
     }
 
     #[actix_web::test]
@@ -2311,6 +2817,7 @@ mod tests {
                 episode_number: Some(1),
                 series_folder: Some("/tv/Buffy (1997)".into()),
                 series_year: Some(1997),
+                series_key: None,
             }),
             ..Default::default()
         };
@@ -2361,7 +2868,7 @@ mod tests {
         let cache_dir = tempfile::tempdir().unwrap();
         let state = seed_state_with_cache(cache_dir.path()).await;
 
-        let series_key = "/tv/Dragon Ball";
+        let series_key = "/tv/Silver Rock";
         // Write a logo into the deterministic series-cache slot.
         let logo_path = series_image_path(cache_dir.path(), ImageRole::Logo, series_key);
         std::fs::create_dir_all(logo_path.parent().unwrap()).unwrap();
@@ -2369,21 +2876,22 @@ mod tests {
 
         let ep = MediaItem {
             id: 601,
-            path: dir.path().join("Dragon Ball/S01E01.mkv"),
-            title: "Dragon Ball S01E01".into(),
+            path: dir.path().join("Silver Rock/S01E01.mkv"),
+            title: "Silver Rock S01E01".into(),
             kind: MediaKind::Episode,
             series: Some(SeriesInfo {
-                series_name: "Dragon Ball".into(),
+                series_name: "Silver Rock".into(),
                 season_number: Some(1),
                 episode_number: Some(1),
                 series_folder: Some(series_key.into()),
                 series_year: Some(1986),
+                series_key: None,
             }),
             ..Default::default()
         };
         state.stores.put(ep).await.unwrap();
 
-        let synth = series_id_for_key(Some(series_key), "Dragon Ball");
+        let synth = series_id_for_key(Some(series_key), "Silver Rock");
         let token = token_for(&state.stores).await;
         let app = test::init_service(App::new().app_data(state).configure(register)).await;
         let resp = test::call_service(

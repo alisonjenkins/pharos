@@ -113,7 +113,7 @@ impl SourceCache {
         }
         Self {
             dir,
-            http: reqwest::Client::new(),
+            http: crate::http_client::client(),
             gate,
             max_bytes,
             entries: Mutex::new(HashMap::new()),

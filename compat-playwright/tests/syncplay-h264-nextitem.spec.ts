@@ -3,7 +3,7 @@ import { requireH264 } from "./lib/h264";
 import { VirtualPerson } from "./lib/virtual-person";
 import { waitUntilInSync } from "./lib/sync-oracle";
 
-// Repro for jana's episode-swap hang (2026-10-05, Loki). Her Windows Chrome,
+// Repro for jana's episode-swap hang (2026-10-05, Show BL). Her Windows Chrome,
 // swapped in-page to the next item, fetched `h264cmaf/init.mp4` 159 times in
 // ~20 s and never requested a video segment, so it never posted Ready and the
 // next-item readiness gate waited on her until the 30 s anti-wedge. The same

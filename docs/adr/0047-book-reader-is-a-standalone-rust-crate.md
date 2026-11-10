@@ -30,7 +30,7 @@ We will build option 3 as two crates with no pharos dependency.
   natively. `quire-web` mounts a `quire` section into a shadow root, paginates
   with CSS columns and reports positions. pharos-ui holds the Dioxus view and
   the native API calls; nothing in the crates names pharos.
-- Both crates are excluded from `workspace-hack`, carry their own README and
+- Both crates (and `quire-pdf`, slice 5) are excluded from `workspace-hack`, carry their own README and
   licence, and must build for wasm32 and the host (V350), so either can move
   to its own repository without change.
 - Zip, XML, HTML sanitising and any PDF engine are adapters behind traits in
@@ -42,19 +42,56 @@ We will build option 3 as two crates with no pharos dependency.
   `PlaybackPositionTicks`, so the native reader and jellyfin-web never clobber
   each other (V354).
 
-### Open: the PDF engine
+### The PDF engine: hayro, in the browser, as a lazily loaded module
 
-Slice 5 picks it after a spike that opens the 28 live PDFs and measures wasm
-size and first-page time. Candidates:
+Decided 2026-11-10 (slice 5), after a spike (2026-11-09) on the 28 live PDFs.
 
-- a pure-Rust PDF renderer compiled to wasm (for example `hayro`; maturity and
-  coverage to be measured, not assumed);
-- PDFium compiled to wasm (complete, several MB);
-- pdf.js behind the fixed-layout port (complete, JavaScript).
+- **Engine: `hayro`** (crates.io, MIT or Apache-2.0), a pure-Rust renderer.
+  Spike, hayro 0.9.0: all 28 PDFs opened and drew pages 1, 2 and the middle
+  with no panic; native first page (open plus render) median 22 ms, p90 43 ms;
+  against mupdf at 1080 px the mean grey difference was 2.6 median and 9.1
+  worst, all sub-pixel glyph placement. In wasm (node) a page took 39 to
+  414 ms, about 2 to 8 times native. Caveats: the corpus is text-heavy
+  technical books (no scans, CJK or complex vector art), and hayro has no
+  decryption, blending or isolation groups, or knockout groups. Encrypted
+  files are refused with an error and the download offered.
+- **Rendered in the browser**, not on the server (Alison, 2026-11-10: "I want
+  to go the route of local as I want the option of allowing the user to read
+  offline ... They would need the wasm reader and the book for that"). Server
+  rendering of one page (about 3 ms after open, WebP about 58 KB median) was
+  measured and is faster for the client, but it would need the server for
+  every page turn.
+- **A separate wasm module, loaded on demand.** The engine is 4.99 MB raw and
+  1.86 MB gzip (opt-level z, fat LTO, `wasm-opt -Oz`; the spike measured
+  1.71 MB gzip), against a main UI wasm of 5.15 MB raw and 2.07 MB gzip that
+  TVs and Quest headsets compile at every cold start. So it is never linked
+  into the main wasm (which grew 23 KB raw, 7 KB gzip, for the canvas
+  reader itself). `quire-pdf` builds as its own `wasm-bindgen --target
+  web` module under the UI's `assets/pdf/`, and a 10-line loader script
+  (a static `<script type=module>`) starts it; the reader adds that script
+  only when a PDF is opened. The UI's CSP needed no change: it already allows
+  scripts from 'self' and `'wasm-unsafe-eval'`, and an inline `import()`
+  would have needed eval. A Playwright check asserts no request to the module
+  happens before a PDF is opened (V356).
+- **Behind the port.** `quire` has the `FixedLayout` trait (page count, page
+  size, render page `i` at a pixel height to RGBA) and the `pdf1:<page>`
+  locator, and does not depend on hayro. `quire-pdf` is the adapter, a
+  standalone crate with no pharos dependency (V350). Changing engine means
+  replacing `quire-pdf` and the module's file names.
+- **The reader** draws one page on a canvas sized to the window at up to 2x
+  pixel ratio and 4096 px a side, draws the next page ahead into one spare
+  canvas, and saves `pdf1:<page>` through the existing position store. The
+  64 MiB weak-device cap applies to PDFs as to EPUBs, checked on
+  `Content-Length`. The file goes from the browser's buffer straight into
+  the module's memory, not through the main wasm's.
 
-Whatever wins sits behind `quire`'s fixed-layout port, so the choice can be
-revisited without touching `quire-web` or pharos-ui. This ADR is amended with
-the result.
+PDFium (2.5 MB gzip) and pdf.js (about 0.7 MB gzip plus decoders and
+fonts) were not built; hayro won on size against PDFium, on being Rust against
+pdf.js, and on the spike's coverage.
+
+Not done: reading with no network after the first open (the module and the
+book are cacheable, but nothing stores them yet), a table of contents (PDF
+outlines), text selection and search, zoom beyond the two fits.
 
 ## Consequences
 

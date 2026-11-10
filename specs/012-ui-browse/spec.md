@@ -2,7 +2,7 @@
 
 **Feature directory**: `specs/012-ui-browse/`
 **Created**: 2026-11-01
-**Status**: draft (`/speckit-specify` stage; next: `/speckit-clarify`)
+**Status**: partly implemented 2026-11-02..08 (home, libraries, shows, music, people, find palette); books, Live TV guide, collections, saved views open (see Progress, audited 2026-11-09)
 **Input**: "It must support all the things Jellyfin's UI does and more."
 (Alison, 2026-11-01)
 **Depends on**: 009 (router, data layer, GPU rails), 010 (tokens), 011 (focus,
@@ -146,3 +146,21 @@ open in jellyfin-web, refresh metadata / edit / identify (admin, 015), delete
 - Items with no images at all; very long titles; RTL titles.
 - Libraries mixing kinds; a library with 50 k tracks.
 - Synthetic album ids (`synth_album_dto`) — must resolve like real ones.
+
+## Progress (audited 2026-11-09)
+
+Evidence is `crates/pharos-ui/src/native/` (`views.rs`, `browse.rs`, `rails.rs`, `letters.rs`, `person.rs`, `palette.rs`).
+
+- US1 home: partial (rails cannot be reordered, hidden or added; `HomeView` order is fixed). Continue watching / listening rows, library rails (#603, #605, #518).
+- US2 library pages: partial (saved views missing). Sort, filter, jump by letter (#601, `letters.rs`), infinite paging (#587), sort in the URL (`browse.rs`).
+- US3 shows: done (#561 seasons; episode navigation #588; next-up/resume label).
+- US4 films and extras: partial. Title page, versions (`versions.rs`), ratings (#614); extras not verified.
+- US5 music: done (#561 artist/album, playlists tab, #632 full-window player, mixes #713).
+- US6 books: not started in pharos-ui (browse tile only; reader is spec 023, owned elsewhere).
+- US7 people, genres, studios: partial. `person.rs` (`/person/{id}`) and genre filter; studios not found.
+- US8 search: done (#549, then Ctrl+K palette b8995022, #881, #898).
+- US9 collections and playlists: partial. Music playlists and queue (`queue.rs`); a Movies library groups its films into box sets, switchable per device (B1086). Video playlists and add-to-collection not built.
+- US10 Live TV guide: partial. Only the legacy REST pane `views/live_tv.rs` under /manage; no native guide.
+- US11 item actions everywhere: partial. Played toggle, queue buttons, versions; favourite mark on title, show, album and artist pages and a `/favourites` page (B1080–B1085). Add to playlist/collection not built.
+- US12 "more": partial. IMDb/RT ratings (#614), what's new (spec 027), trail, depth.
+- FR-004 saved views per library: not found. FR-005 home section config: not found (fixed order, #603).

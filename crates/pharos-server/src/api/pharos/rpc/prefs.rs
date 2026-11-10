@@ -10,6 +10,9 @@ use pharos_api::{redact, server, Denial};
 use pharos_core::UserPrefStore;
 
 use super::session::Session;
+use crate::services::metadata_text::set_language_setting;
+use crate::services::track_settings::{get_setting, set_setting, TrackSetting};
+use crate::services::user_config::SetFieldError;
 
 /// The pref that says whether this user's clients may send diagnostics.
 /// Value bytes `true` or `false`; absent means off.
@@ -22,16 +25,35 @@ pub(super) const DIAGNOSTICS_OPT_IN: &str = "diagnostics.opt_in";
 /// same thing.
 pub(super) const DESCRIPTION_LANGUAGE: &str = "description.language";
 
+/// The playback track settings (spec 038 FR-702), like [`DESCRIPTION_LANGUAGE`]
+/// fields of the user's Jellyfin configuration: see
+/// [`crate::services::track_settings`].
+const PLAYBACK_AUDIO_LANGUAGE: &str = "playback.audio_language";
+const PLAYBACK_SUBTITLE_LANGUAGE: &str = "playback.subtitle_language";
+const PLAYBACK_SUBTITLE_MODE: &str = "playback.subtitle_mode";
+
 /// The newest "what's new" entry this user has been shown (spec 027,
 /// ADR-0065): a decimal number of at most [`MAX_WHATS_NEW_DIGITS`] digits.
 /// Absent means the user has seen none.
 pub(super) const WHATS_NEW_SEEN: &str = "whats_new.seen";
 
+/// The user's saved mixes (spec 024, B902): one capnp `SavedMixes` message
+/// the client writes whole. Must match `pharos_client::mix::SAVED_KEY`.
+pub(super) const MIX_SAVED: &str = "mix.saved";
+
 /// Digits a [`WHATS_NEW_SEEN`] value may hold: room for a u32 counter.
 const MAX_WHATS_NEW_DIGITS: usize = 9;
 
 /// Keys a client may read and write; any other key is refused.
-const ALLOWED_KEYS: &[&str] = &[DIAGNOSTICS_OPT_IN, DESCRIPTION_LANGUAGE, WHATS_NEW_SEEN];
+const ALLOWED_KEYS: &[&str] = &[
+    DIAGNOSTICS_OPT_IN,
+    DESCRIPTION_LANGUAGE,
+    PLAYBACK_AUDIO_LANGUAGE,
+    PLAYBACK_SUBTITLE_LANGUAGE,
+    PLAYBACK_SUBTITLE_MODE,
+    WHATS_NEW_SEEN,
+    MIX_SAVED,
+];
 
 /// Largest value one pref may hold: a toggle or a small settings document,
 /// never a blob, and a bound on what one user can make the database keep.
@@ -123,6 +145,12 @@ impl Prefs {
                 .map_err(|e| store_denial("get", key, &e))?;
             return Ok((!value.is_empty()).then(|| value.into_bytes()));
         }
+        if let Some(setting) = TrackSetting::from_key(key) {
+            let value = get_setting(&self.session.state.stores, user.id, setting)
+                .await
+                .map_err(|e| store_denial("get", key, &e))?;
+            return Ok((!value.is_empty()).then(|| value.into_bytes()));
+        }
         self.session
             .state
             .stores
@@ -147,22 +175,29 @@ impl Prefs {
                 max: MAX_PREF_VALUE_BYTES as u64,
             });
         }
-        if key == DESCRIPTION_LANGUAGE {
-            use crate::services::metadata_text::{set_language_setting, SetLanguageError};
+        let setting = TrackSetting::from_key(key);
+        if key == DESCRIPTION_LANGUAGE || setting.is_some() {
             let text =
                 std::str::from_utf8(value).map_err(|_| Denial::Invalid { field: "value" })?;
-            return set_language_setting(&self.session.state.stores, user.id, text)
-                .await
-                .map_err(|e| match e {
-                    SetLanguageError::Invalid => {
-                        tracing::warn!(key, size = value.len(), "pref refused: not a language");
-                        Denial::Invalid { field: "value" }
-                    }
-                    SetLanguageError::Unreadable => {
-                        store_denial("set", key, &"stored configuration is not a JSON object")
-                    }
-                    SetLanguageError::Store(e) => store_denial("set", key, &e),
-                });
+            let stores = &self.session.state.stores;
+            let stored = match setting {
+                Some(setting) => set_setting(stores, user.id, setting, text).await,
+                None => set_language_setting(stores, user.id, text).await,
+            };
+            return stored.map_err(|e| match e {
+                SetFieldError::Invalid => {
+                    tracing::warn!(
+                        key,
+                        size = value.len(),
+                        "pref refused: not an accepted value"
+                    );
+                    Denial::Invalid { field: "value" }
+                }
+                SetFieldError::Unreadable => {
+                    store_denial("set", key, &"stored configuration is not a JSON object")
+                }
+                SetFieldError::Store(e) => store_denial("set", key, &e),
+            });
         }
         if key == WHATS_NEW_SEEN && !is_whats_new_entry(value) {
             tracing::warn!(key, size = value.len(), "pref refused: not an entry number");

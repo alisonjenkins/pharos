@@ -46,12 +46,7 @@ async fn match_columns_default_null_and_roundtrip() {
     // them (only a later `set_item_match`, T2), so a freshly-inserted
     // item round-trips them all as `None`.
     let s = fresh().await;
-    let it = item(
-        900001,
-        "/m/blade_runner.mkv",
-        "Blade Runner",
-        MediaKind::Movie,
-    );
+    let it = item(900001, "/m/blade_runner.mkv", "Film AB", MediaKind::Movie);
     s.put(it.clone()).await.unwrap();
     let got = s.get(900001).await.unwrap();
     assert_eq!(got.match_provider, None);
@@ -382,7 +377,7 @@ async fn metadata_roundtrips_through_store() {
     // LIB-C7/C8/C9 — descriptive metadata must survive put → get.
     use pharos_core::{MediaMetadata, ProviderIds};
     let s = fresh().await;
-    let mut it = item(7, "/m/matrix.mkv", "The Matrix", MediaKind::Movie);
+    let mut it = item(7, "/m/lattice.mkv", "The Glass Lattice", MediaKind::Movie);
     it.metadata = MediaMetadata {
         original_language: Some("ja".into()),
         community_rating: Some(8.7),
@@ -394,11 +389,11 @@ async fn metadata_roundtrips_through_store() {
         tagline: Some("Free your mind.".into()),
         provider_ids: ProviderIds {
             tmdb: Some("603".into()),
-            imdb: Some("tt0133093".into()),
+            imdb: Some("tt9300001".into()),
             ..Default::default()
         },
         production_locations: vec!["USA".into(), "Australia".into()],
-        trailers: vec!["https://youtu.be/m8e-FF8MsqU".into()],
+        trailers: vec!["https://youtu.be/abcDEF12345".into()],
         ratings: Default::default(),
     };
     s.put(it.clone()).await.unwrap();
@@ -427,24 +422,25 @@ async fn series_folder_and_year_round_trip_through_store() {
     let s = fresh().await;
     let mut it = item(
         9,
-        "/tv/Cosmos (1980)/Season 01/S01E01.mkv",
-        "Cosmos E1",
+        "/tv/Show AV (1980)/Season 01/S01E01.mkv",
+        "Show AV E1",
         MediaKind::Episode,
     );
     it.series = Some(SeriesInfo {
-        series_name: "Cosmos".into(),
+        series_name: "Show AV".into(),
         season_number: Some(1),
         episode_number: Some(1),
-        series_folder: Some("/tv/Cosmos (1980)".into()),
+        series_folder: Some("/tv/Show AV (1980)".into()),
         series_year: Some(1980),
+        series_key: None,
     });
     s.put(it.clone()).await.unwrap();
     let got = s.get(9).await.unwrap();
     assert_eq!(got.series, it.series);
     let series = got.series.unwrap();
-    assert_eq!(series.series_folder.as_deref(), Some("/tv/Cosmos (1980)"));
+    assert_eq!(series.series_folder.as_deref(), Some("/tv/Show AV (1980)"));
     assert_eq!(series.series_year, Some(1980));
-    assert_eq!(series.series_key(), "/tv/Cosmos (1980)");
+    assert_eq!(series.series_key(), "/tv/Show AV (1980)");
 }
 
 #[tokio::test]
@@ -455,12 +451,12 @@ async fn legacy_series_without_folder_round_trips_as_none() {
     let s = fresh().await;
     let mut it = item(
         10,
-        "/tv/Firefly/S01E01.mkv",
-        "Firefly E1",
+        "/tv/Show AX/S01E01.mkv",
+        "Show AX E1",
         MediaKind::Episode,
     );
     it.series = Some(SeriesInfo {
-        series_name: "Firefly".into(),
+        series_name: "Show AX".into(),
         season_number: Some(1),
         episode_number: Some(1),
         ..Default::default()
@@ -470,7 +466,7 @@ async fn legacy_series_without_folder_round_trips_as_none() {
     let series = got.series.unwrap();
     assert_eq!(series.series_folder, None);
     assert_eq!(series.series_year, None);
-    assert_eq!(series.series_key(), "Firefly");
+    assert_eq!(series.series_key(), "Show AX");
 }
 
 // ---- LIB-C4: genres as entities -------------------------------------
@@ -606,39 +602,36 @@ async fn link_item_people_persists_credits_with_wire_id_and_detail() {
     s.put(item(1, "/m/a.mkv", "A", MediaKind::Movie))
         .await
         .unwrap();
-    let mut keanu = person("Keanu Reeves", PersonKind::Actor);
-    keanu.character = Some("Neo".into());
-    keanu.sort_order = Some(0);
-    keanu.thumb = Some("http://x/keanu.jpg".into());
-    let wachowski = person("Lana Wachowski", PersonKind::Director);
-    s.link_item_people(1, &[keanu, wachowski]).await.unwrap();
+    let mut star = person("Actor Q", PersonKind::Actor);
+    star.character = Some("Hero A".into());
+    star.sort_order = Some(0);
+    star.thumb = Some("http://x/actor.jpg".into());
+    let director_r = person("Director Q", PersonKind::Director);
+    s.link_item_people(1, &[star, director_r]).await.unwrap();
 
-    // /Persons list: name-ordered (Keanu < Lana), each carries the wire id.
+    // /Persons list: name-ordered (Actor Q < Director Q), each carries the wire id.
     let rows = s.people_with_counts().await.unwrap();
     let names: Vec<&str> = rows.iter().map(|p| p.person.name.as_str()).collect();
-    assert_eq!(names, vec!["Keanu Reeves", "Lana Wachowski"]);
+    assert_eq!(names, vec!["Actor Q", "Director Q"]);
     assert!(rows.iter().all(|p| p.item_count == 1));
-    let keanu_row = rows
-        .iter()
-        .find(|p| p.person.name == "Keanu Reeves")
-        .unwrap();
-    assert_eq!(keanu_row.person.wire_id, person_wire_id("Keanu Reeves"));
+    let star_row = rows.iter().find(|p| p.person.name == "Actor Q").unwrap();
+    assert_eq!(star_row.person.wire_id, person_wire_id("Actor Q"));
     assert_eq!(
-        keanu_row.person.thumb_url.as_deref(),
-        Some("http://x/keanu.jpg")
+        star_row.person.thumb_url.as_deref(),
+        Some("http://x/actor.jpg")
     );
 
     // people_for_item: NFO order, structured kind + character round-trip.
     let credits = s.people_for_item(1).await.unwrap();
     assert_eq!(credits.len(), 2);
-    assert_eq!(credits[0].name, "Keanu Reeves");
+    assert_eq!(credits[0].name, "Actor Q");
     assert_eq!(credits[0].kind, PersonKind::Actor);
-    assert_eq!(credits[0].character.as_deref(), Some("Neo"));
+    assert_eq!(credits[0].character.as_deref(), Some("Hero A"));
     assert_eq!(credits[1].kind, PersonKind::Director);
 
     // ParentId pivot: person wire id → the crediting item.
     let ids = s
-        .item_ids_for_person(&person_wire_id("Keanu Reeves"))
+        .item_ids_for_person(&person_wire_id("Actor Q"))
         .await
         .unwrap();
     assert_eq!(ids, vec![1]);
@@ -651,11 +644,11 @@ async fn link_item_people_persists_credits_with_wire_id_and_detail() {
 
     // person_by_wire_id resolves the single row.
     let p = s
-        .person_by_wire_id(&person_wire_id("Lana Wachowski"))
+        .person_by_wire_id(&person_wire_id("Director Q"))
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(p.name, "Lana Wachowski");
+    assert_eq!(p.name, "Director Q");
     assert!(s.person_by_wire_id("00").await.unwrap().is_none());
 }
 
@@ -1274,8 +1267,8 @@ async fn tmdb_primary_artwork_flips_has_primary_art() {
     let s = fresh().await;
     let it = item(
         900020,
-        "/movies/Arrival/Arrival.mkv",
-        "Arrival",
+        "/movies/Film BC/Film BC.mkv",
+        "Film BC",
         MediaKind::Movie,
     );
     s.put(it).await.unwrap();
@@ -1322,7 +1315,7 @@ async fn tmdb_primary_artwork_flips_has_primary_art() {
 #[tokio::test]
 async fn set_item_match_persists_and_excludes_from_needing() {
     let store = fresh().await;
-    let mut it = item(900010, "/m/dune.mkv", "Dune", MediaKind::Movie);
+    let mut it = item(900010, "/m/film-au.mkv", "Film AU", MediaKind::Movie);
     it.id = 900010;
     store.put(it.clone()).await.unwrap();
 
@@ -1334,7 +1327,7 @@ async fn set_item_match_persists_and_excludes_from_needing() {
         .set_item_match(
             900010,
             "tmdb",
-            "438631",
+            "932001",
             "search",
             Some(0.92),
             1_700_000_000,
@@ -1343,7 +1336,7 @@ async fn set_item_match_persists_and_excludes_from_needing() {
         .unwrap();
     let got = store.get(900010).await.unwrap();
     assert_eq!(got.match_provider.as_deref(), Some("tmdb"));
-    assert_eq!(got.match_external_id.as_deref(), Some("438631"));
+    assert_eq!(got.match_external_id.as_deref(), Some("932001"));
     assert_eq!(got.match_source.as_deref(), Some("search"));
     assert_eq!(got.metadata_refreshed_at, Some(1_700_000_000));
 
@@ -1414,6 +1407,7 @@ fn episode_of(id: u64, series_name: &str, folder: Option<&str>, year: Option<u32
             episode_number: Some(id as u32),
             series_folder: folder.map(str::to_string),
             series_year: year,
+            series_key: None,
         }),
         ..Default::default()
     }
@@ -1429,7 +1423,7 @@ async fn series_needing_match_enumerates_distinct_shows_from_episodes() {
     s.put(episode_of(2, "Buffy", Some("/tv/Buffy (1997)"), Some(1997)))
         .await
         .unwrap();
-    s.put(episode_of(3, "Firefly", None, None)).await.unwrap();
+    s.put(episode_of(3, "Show AX", None, None)).await.unwrap();
 
     let mut got = s.series_needing_match(10, i64::MAX).await.unwrap();
     got.sort_by(|a, b| a.series_key.cmp(&b.series_key));
@@ -1442,8 +1436,8 @@ async fn series_needing_match_enumerates_distinct_shows_from_episodes() {
                 series_year: Some(1997),
             },
             SeriesMatchCandidate {
-                series_key: "Firefly".into(),
-                series_name: "Firefly".into(),
+                series_key: "Show AX".into(),
+                series_name: "Show AX".into(),
                 series_year: None,
             },
         ],
@@ -1455,9 +1449,10 @@ async fn series_needing_match_enumerates_distinct_shows_from_episodes() {
 async fn series_metadata_upsert_then_by_keys_roundtrips() {
     let s = fresh().await;
     let meta = SeriesMetadata {
+        locked: Default::default(),
         original_language: Some("ja".into()),
         series_key: "/tv/Buffy (1997)".into(),
-        series_name: "Buffy the Vampire Slayer".into(),
+        series_name: "Show AB".into(),
         match_provider: Some("tvdb".into()),
         match_external_id: Some("70327".into()),
         match_source: Some("search".into()),
@@ -1477,6 +1472,9 @@ async fn series_metadata_upsert_then_by_keys_roundtrips() {
         poster_locator: Some("cache/poster.jpg".into()),
         backdrop_locator: Some("cache/back.jpg".into()),
         ratings: Default::default(),
+        match_flag: Some("ambiguous".into()),
+        match_runner_up_id: Some("900001".into()),
+        match_runner_up_score: Some(0.5),
     };
     s.upsert_series_metadata(meta.clone()).await.unwrap();
 
@@ -1507,9 +1505,9 @@ async fn series_needing_match_respects_ttl_and_manual_override() {
     s.put(episode_of(1, "Buffy", Some("/tv/Buffy (1997)"), Some(1997)))
         .await
         .unwrap();
-    s.put(episode_of(2, "Firefly", None, None)).await.unwrap();
+    s.put(episode_of(2, "Show AX", None, None)).await.unwrap();
 
-    // Enrich Buffy at t=500; mark Firefly as a manual override.
+    // Enrich Buffy at t=500; mark Show AX as a manual override.
     s.upsert_series_metadata(SeriesMetadata {
         series_key: "/tv/Buffy (1997)".into(),
         series_name: "Buffy".into(),
@@ -1520,8 +1518,8 @@ async fn series_needing_match_respects_ttl_and_manual_override() {
     .await
     .unwrap();
     s.upsert_series_metadata(SeriesMetadata {
-        series_key: "Firefly".into(),
-        series_name: "Firefly".into(),
+        series_key: "Show AX".into(),
+        series_name: "Show AX".into(),
         match_source: Some("manual".into()),
         metadata_refreshed_at: Some(500),
         ..Default::default()
@@ -1529,7 +1527,7 @@ async fn series_needing_match_respects_ttl_and_manual_override() {
     .await
     .unwrap();
 
-    // Fresh (cutoff=400): Buffy enriched after cutoff → not due; Firefly manual
+    // Fresh (cutoff=400): Buffy enriched after cutoff → not due; Show AX manual
     // → never due. Nothing eligible.
     let need = s.series_needing_match(10, 400).await.unwrap();
     assert!(
@@ -1537,7 +1535,7 @@ async fn series_needing_match_respects_ttl_and_manual_override() {
         "recently-enriched + manual are both skipped"
     );
 
-    // TTL expired (cutoff=600 > Buffy's 500): Buffy re-admits, Firefly (manual)
+    // TTL expired (cutoff=600 > Buffy's 500): Buffy re-admits, Show AX (manual)
     // stays excluded.
     let need2 = s.series_needing_match(10, 600).await.unwrap();
     let keys: Vec<&str> = need2.iter().map(|c| c.series_key.as_str()).collect();
@@ -1577,13 +1575,18 @@ async fn a_nested_library_beats_the_root_that_contains_it() {
         .await
         .unwrap();
 
-    s.put(item(1, "/media/Ebooks/Dune.epub", "Dune", MediaKind::Book))
-        .await
-        .unwrap();
+    s.put(item(
+        1,
+        "/media/Ebooks/Book A.epub",
+        "Book A",
+        MediaKind::Book,
+    ))
+    .await
+    .unwrap();
     s.put(item(
         2,
-        "/media/Movies/Alien.mkv",
-        "Alien",
+        "/media/Movies/Film AX.mkv",
+        "Film AX",
         MediaKind::Movie,
     ))
     .await
@@ -1637,8 +1640,8 @@ async fn a_repeated_backfill_rewrites_nothing_when_roots_nest() {
     .unwrap();
     s.put(item(
         1,
-        "/media/Movies/Alien.mkv",
-        "Alien",
+        "/media/Movies/Film AX.mkv",
+        "Film AX",
         MediaKind::Movie,
     ))
     .await

@@ -28,9 +28,10 @@
 //!   tmp file on failure.
 
 use dashmap::DashMap;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 use tokio::sync::Mutex;
 use tracing::Instrument;
 
@@ -87,7 +88,7 @@ pub enum HlsCacheError {
 /// The three mean different things and want different fixes: `NeverStarted` is
 /// an ffmpeg that failed to spawn or died before its first segment,
 /// `Stalled` is a session that produced and then stopped advancing (finished,
-/// wedged, or — the Ghost in the Shell shape — merely slower than the stall
+/// wedged, or — the Film AH shape — merely slower than the stall
 /// budget under load), and `BudgetExhausted` is a session that kept advancing
 /// for the whole 30 s and still never reached the target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -99,6 +100,10 @@ pub enum AudioWaitGiveUp {
     /// will be written, so waiting out the no-progress grace only delays the
     /// 404 (B217).
     SessionFailed,
+    /// The file was empty or ended in zeros in a session no process is
+    /// writing any more, so the session was dropped for the next request to
+    /// encode again (B891).
+    Defective,
 }
 
 impl AudioWaitGiveUp {
@@ -111,6 +116,7 @@ impl AudioWaitGiveUp {
             Self::Stalled => "stalled",
             Self::BudgetExhausted => "budget_exhausted",
             Self::SessionFailed => "session_failed",
+            Self::Defective => "defective",
         }
     }
 }
@@ -122,6 +128,9 @@ impl std::fmt::Display for AudioWaitGiveUp {
             Self::Stalled => "session stopped advancing",
             Self::BudgetExhausted => "overall wait budget exhausted",
             Self::SessionFailed => "session process exited without producing",
+            Self::Defective => {
+                "file was lost by a session no longer running; dropped for re-encode"
+            }
         })
     }
 }
@@ -260,6 +269,10 @@ pub struct SegmentIdentity {
     stereo_output: pharos_transcode::StereoOutput,
     /// HDR sources are tonemapped to SDR, which changes the pixels.
     tonemap: pharos_transcode::Tonemap,
+    /// A downscaled transcode is different pixels. `None` (the source size)
+    /// adds nothing to the file name, so every unscaled segment keeps the name
+    /// it had before downscaling existed.
+    output_size: Option<pharos_transcode::OutputSize>,
 }
 
 const NO_SUBTITLE: i32 = -1;
@@ -430,7 +443,7 @@ fn record_source_unreadable(reason: &'static str) {
 
 /// Count one audio-rendition read wait. Emitted on BOTH outcomes: a counter
 /// that only fires on failure cannot answer "what fraction of waits 404?",
-/// which is the question the Ghost in the Shell stall actually posed.
+/// which is the question the Film AH stall actually posed.
 fn record_audio_wait(outcome: &'static str) {
     metrics::counter!("pharos_audio_wait_total", "outcome" => outcome).increment(1);
 }
@@ -473,6 +486,27 @@ const FAILURE_REASONS: [&str; 8] = [
 /// event, and `rate()` / `increase()` cannot see that first event (so the
 /// first short or failed segment after a deploy never alerts).
 pub fn register_segment_metrics() {
+    for reason in pharos_transcode::ScaleReason::ALL {
+        metrics::counter!(
+            "pharos_transcode_output_scaled_total",
+            "reason" => reason.label(),
+        )
+        .increment(0);
+    }
+    for stage in [DefectStage::Cached, DefectStage::Produced] {
+        for defect in [
+            SegmentDefect::Empty,
+            SegmentDefect::ZeroTail,
+            SegmentDefect::Fmp4Malformed,
+        ] {
+            metrics::counter!(
+                "pharos_segment_defect_total",
+                "reason" => defect.label(),
+                "stage" => stage.label(),
+            )
+            .increment(0);
+        }
+    }
     for class in [JobClass::Interactive, JobClass::Background] {
         for outcome in [
             SegmentOutcome::Ok,
@@ -934,6 +968,25 @@ pub struct AudioDropReport {
     pub failed: Vec<String>,
 }
 
+/// What [`HlsSegmentCache::enforce_cap`] did.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct CapReport {
+    pub scanned_bytes: u64,
+    pub evicted_bytes: u64,
+    pub evicted_files: u64,
+    pub evicted_sessions: u64,
+    pub remaining_bytes: u64,
+}
+
+/// How recently a cached file must have been written for the janitor to
+/// leave it alone: an encode in flight is still writing it.
+const JANITOR_GRACE: Duration = Duration::from_secs(15 * 60);
+
+/// How long a `.running*` marker keeps its audio session from the janitor.
+/// A pod that dies mid-encode leaves its marker behind, and a marker that
+/// protected forever would pin that session on disk for good.
+const RUNNING_MARKER_MAX_AGE: Duration = Duration::from_secs(6 * 60 * 60);
+
 /// Suffix of the provenance sidecar. Named once: the eviction walk, the
 /// quarantine and the sidecar writer all have to agree, and three string
 /// literals would drift apart silently.
@@ -1077,7 +1130,7 @@ async fn read_progress(out: &Path) -> Option<(u64, f64)> {
 /// stream. Where audio outruns video — a trailing music cue, a fade over
 /// black, any mux that pads audio — the final window therefore asks for video
 /// the source does not hold, and neither a re-encode nor a longer preroll can
-/// conjure it. T113, live on 2026-08-15: Ant-Man's segment 1171 of 1172 asked
+/// conjure it. T113, live on 2026-08-15: Film AV's segment 1171 of 1172 asked
 /// for 0.773 s against 0.500 s of video and 500'd on all 14 attempts across 7
 /// play sessions, so playing that title to its end produced an error instead
 /// of an end of stream.
@@ -1178,6 +1231,323 @@ fn top_level_boxes(raw: &[u8]) -> Option<Vec<([u8; 4], std::ops::Range<usize>)>>
         at = end;
     }
     Some(boxes)
+}
+
+/// How much of a segment's end is checked for zeros. An MPEG-TS packet is 188
+/// bytes and starts with a 0x47 sync byte, and fMP4 ends in compressed `mdat`
+/// payload or an `mfra` with sizes in it, so no real encode ends in this many
+/// zeros; a power cut does (B890).
+const ZERO_TAIL_BYTES: usize = 512;
+
+/// Why bytes in the segment cache cannot be served (B890/V840).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SegmentDefect {
+    /// Zero bytes: the rename reached the disk and the data did not. The
+    /// publish path's own minimum size covers the small-but-not-empty case.
+    Empty,
+    /// Ends in [`ZERO_TAIL_BYTES`] of zeros: the file's size reached the
+    /// disk and its data did not.
+    ZeroTail,
+    /// fMP4 whose top-level boxes do not parse, include an all-zero box type,
+    /// or lack the `moov` and `moof` that `fmp4::process_segment` needs.
+    Fmp4Malformed,
+}
+
+impl SegmentDefect {
+    /// Metric label; a dashboard contract, asserted distinct in a test.
+    fn label(self) -> &'static str {
+        match self {
+            Self::Empty => "empty",
+            Self::ZeroTail => "zero_tail",
+            Self::Fmp4Malformed => "fmp4_malformed",
+        }
+    }
+}
+
+/// Where a [`SegmentDefect`] was caught.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DefectStage {
+    /// On a cache hit, before serving: the file was published and later lost
+    /// its bytes.
+    Cached,
+    /// After an encode, before publishing.
+    Produced,
+}
+
+impl DefectStage {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Cached => "cached",
+            Self::Produced => "produced",
+        }
+    }
+}
+
+/// The checks are structural only, cheap enough for every hit: a box walk
+/// for fMP4, an emptiness check and a tail scan for both containers. MPEG-TS gets no
+/// sync-byte walk, because a damaged TS still decodes around the bad packets
+/// and the zero tail already catches the power-cut shape.
+fn segment_defect(bytes: &[u8], container: SegmentContainer) -> Option<SegmentDefect> {
+    if bytes.is_empty() {
+        return Some(SegmentDefect::Empty);
+    }
+    let tail = bytes
+        .get(bytes.len().saturating_sub(ZERO_TAIL_BYTES)..)
+        .unwrap_or_default();
+    if tail.iter().all(|b| *b == 0) {
+        return Some(SegmentDefect::ZeroTail);
+    }
+    if container == SegmentContainer::Fmp4 {
+        let well_formed = top_level_boxes(bytes).is_some_and(|boxes| {
+            boxes.iter().all(|(kind, _)| kind != &[0u8; 4])
+                && boxes.iter().any(|(kind, _)| kind == b"moov")
+                && boxes.iter().any(|(kind, _)| kind == b"moof")
+        });
+        if !well_formed {
+            return Some(SegmentDefect::Fmp4Malformed);
+        }
+    }
+    None
+}
+
+fn record_segment_defect(defect: SegmentDefect, stage: DefectStage) {
+    metrics::counter!(
+        "pharos_segment_defect_total",
+        "reason" => defect.label(),
+        "stage" => stage.label(),
+    )
+    .increment(1);
+}
+
+/// Written into every `.running*` marker this process creates, so a marker a
+/// dead process left behind can be told from one this process is serving.
+fn process_marker_id() -> &'static str {
+    static ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    ID.get_or_init(|| {
+        let started = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        format!("pharos pid={} started={started}", std::process::id())
+    })
+}
+
+/// A marker another process has not refreshed for this long belongs to a
+/// process that is gone: a power cut, an OOM kill, a pod restart. Ten
+/// heartbeats, so a busy volume or a few minutes of clock skew between a pod
+/// and the file server cannot make a live peer look dead.
+const STALE_MARKER_IDLE: Duration = Duration::from_secs(300);
+
+/// How often a running session rewrites its marker.
+const MARKER_HEARTBEAT: Duration = Duration::from_secs(30);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MarkerState {
+    Absent,
+    Live,
+    /// Left by a process that is not this one, on a session idle for
+    /// [`STALE_MARKER_IDLE`].
+    Stale,
+}
+
+/// Newest mtime among the regular files directly in `dir`.
+async fn newest_file_mtime(dir: &Path) -> Option<SystemTime> {
+    let mut rd = tokio::fs::read_dir(dir).await.ok()?;
+    let mut newest: Option<SystemTime> = None;
+    while let Ok(Some(e)) = rd.next_entry().await {
+        let Ok(meta) = e.metadata().await else {
+            continue;
+        };
+        if let (true, Ok(m)) = (meta.is_file(), meta.modified()) {
+            newest = Some(newest.map_or(m, |n| n.max(m)));
+        }
+    }
+    newest
+}
+
+/// Whether the process that wrote `marker` may still be writing
+/// `session_dir`. A marker with an owner is refreshed every
+/// [`MARKER_HEARTBEAT`] while its encode runs, so its own mtime answers. One
+/// with no owner (written before B891) or that cannot be read falls back to
+/// the newest file its session wrote. A marker whose age cannot be read at
+/// all counts as live: taking over a session that is still running puts two
+/// encoders in one directory, which is worse than one more slow request.
+async fn marker_state(marker: &Path, session_dir: &Path, now: SystemTime) -> MarkerState {
+    let content = match tokio::fs::read(marker).await {
+        Ok(c) => Some(c),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return MarkerState::Absent,
+        Err(_) => None,
+    };
+    if content.as_deref() == Some(process_marker_id().as_bytes()) {
+        return MarkerState::Live;
+    }
+    let Some(marked) = tokio::fs::metadata(marker)
+        .await
+        .ok()
+        .and_then(|m| m.modified().ok())
+    else {
+        return MarkerState::Live;
+    };
+    let heartbeats = content.as_deref().is_some_and(|c| !c.is_empty());
+    let newest = if heartbeats {
+        marked
+    } else {
+        newest_file_mtime(session_dir)
+            .await
+            .map_or(marked, |n| n.max(marked))
+    };
+    if now.duration_since(newest).unwrap_or(Duration::ZERO) >= STALE_MARKER_IDLE {
+        MarkerState::Stale
+    } else {
+        MarkerState::Live
+    }
+}
+
+/// Why an audio session was dropped and encoded again (B891).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AudioHeal {
+    /// Its `.running*` marker outlived the process that wrote it.
+    StaleMarker,
+    /// A file it produced is empty, and nothing is writing it.
+    Empty,
+    /// A file it produced ends in [`ZERO_TAIL_BYTES`] of zeros.
+    ZeroTail,
+}
+
+impl AudioHeal {
+    fn label(self) -> &'static str {
+        match self {
+            Self::StaleMarker => "stale_marker",
+            Self::Empty => "empty",
+            Self::ZeroTail => "zero_tail",
+        }
+    }
+}
+
+/// Which kind of audio session was healed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AudioSessionKind {
+    /// An `_audiohls` rendition session (demuxed audio playlist).
+    Rendition,
+    /// A `_contaudio` continuous AAC encode (the audio muxed segments copy).
+    Continuous,
+}
+
+impl AudioSessionKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Rendition => "rendition",
+            Self::Continuous => "continuous",
+        }
+    }
+}
+
+/// The power-cut shapes `segment_defect` checks for every container: empty,
+/// or a zero tail. Audio files get no structural walk, because a session
+/// without `temp_file` exposes files mid-write and the zero tail is what a
+/// power cut actually leaves.
+fn audio_bytes_defect(bytes: &[u8]) -> Option<AudioHeal> {
+    if bytes.is_empty() {
+        return Some(AudioHeal::Empty);
+    }
+    let tail = bytes
+        .get(bytes.len().saturating_sub(ZERO_TAIL_BYTES)..)
+        .unwrap_or_default();
+    tail.iter().all(|b| *b == 0).then_some(AudioHeal::ZeroTail)
+}
+
+/// [`audio_bytes_defect`] on the last [`ZERO_TAIL_BYTES`] of a file too large
+/// to read per request (a continuous encode is the whole title's audio).
+async fn audio_file_tail_defect(path: &Path) -> Option<AudioHeal> {
+    use tokio::io::AsyncSeekExt;
+    let mut f = tokio::fs::File::open(path).await.ok()?;
+    let len = f.metadata().await.ok()?.len();
+    let from = len.saturating_sub(ZERO_TAIL_BYTES as u64);
+    f.seek(std::io::SeekFrom::Start(from)).await.ok()?;
+    let mut tail = Vec::with_capacity(ZERO_TAIL_BYTES);
+    f.read_to_end(&mut tail).await.ok()?;
+    audio_bytes_defect(&tail)
+}
+
+fn record_audio_heal(kind: AudioSessionKind, why: AudioHeal) {
+    metrics::counter!(
+        "pharos_audio_session_healed_total",
+        "kind" => kind.label(),
+        "reason" => why.label(),
+    )
+    .increment(1);
+}
+
+/// Remove what one audio session produced. A whole-file session's directory is
+/// its rendition root, which also holds every seek session's subdirectory, so
+/// only the root's own files go; a seek session owns its directory outright.
+async fn remove_session_output(session_dir: &Path, is_root: bool) {
+    if !is_root {
+        let _ = tokio::fs::remove_dir_all(session_dir).await;
+        return;
+    }
+    let Ok(mut rd) = tokio::fs::read_dir(session_dir).await else {
+        return;
+    };
+    while let Ok(Some(e)) = rd.next_entry().await {
+        let is_file = e.file_type().await.is_ok_and(|t| t.is_file());
+        let dotted = e.file_name().to_string_lossy().starts_with('.');
+        if is_file && !dotted {
+            let _ = tokio::fs::remove_file(e.path()).await;
+        }
+    }
+}
+
+/// Flush every file an audio session wrote since `since`, and its directory,
+/// once the encode exits cleanly. ffmpeg writes these files itself, so this
+/// cannot make a session durable while it runs; it narrows the window a power
+/// cut can hit to the encode itself.
+async fn sync_session_output(session_dir: &Path, since: SystemTime) {
+    if let Ok(mut rd) = tokio::fs::read_dir(session_dir).await {
+        while let Ok(Some(e)) = rd.next_entry().await {
+            let Ok(meta) = e.metadata().await else {
+                continue;
+            };
+            if meta.is_file() && meta.modified().is_ok_and(|m| m >= since) {
+                let _ = sync_file(&e.path()).await;
+            }
+        }
+    }
+    sync_dir(session_dir).await;
+}
+
+/// Wait for an audio session's ffmpeg, rewriting its marker every
+/// [`MARKER_HEARTBEAT`] so other processes can see it is alive.
+async fn wait_with_heartbeat(
+    child: &mut tokio::process::Child,
+    marker: &Path,
+) -> std::io::Result<std::process::ExitStatus> {
+    let mut beat = tokio::time::interval(MARKER_HEARTBEAT);
+    beat.tick().await;
+    loop {
+        tokio::select! {
+            status = child.wait() => return status,
+            _ = beat.tick() => {
+                let _ = tokio::fs::write(marker, process_marker_id()).await;
+            }
+        }
+    }
+}
+
+/// Flush a finished encode to disk before it is renamed into the keyed path.
+/// Without this the rename can reach the disk before the data, and after a
+/// power cut the cache holds a full-size file of zeros under a key every
+/// later request trusts (B890).
+async fn sync_file(path: &Path) -> std::io::Result<()> {
+    tokio::fs::File::open(path).await?.sync_all().await
+}
+
+/// Make a rename inside `dir` durable. Best-effort: a filesystem that cannot
+/// fsync a directory still has the file's own data synced.
+async fn sync_dir(dir: &Path) {
+    let synced = async { tokio::fs::File::open(dir).await?.sync_all().await }.await;
+    if let Err(e) = synced {
+        tracing::debug!(dir = %dir.display(), error = %e, "could not fsync cache directory");
+    }
 }
 
 /// Appends the filler's fragments to the frames before the hole, writing the
@@ -1430,6 +1800,7 @@ impl SegmentIdentity {
             source_gen,
             stereo_output: opts.stereo_output,
             tonemap: opts.tonemap,
+            output_size: opts.output_size,
         }
     }
 
@@ -1452,6 +1823,7 @@ impl SegmentIdentity {
             source_gen,
             stereo_output,
             tonemap,
+            output_size,
         } = self;
         // A local item contributes NOTHING here, so every existing cache
         // filename is byte-identical to what it was before this field existed
@@ -1478,12 +1850,17 @@ impl SegmentIdentity {
         // Off adds nothing, so every SDR segment keeps the name it had; an HDR
         // source cached before tonemapping existed holds untonemapped pixels
         // under the bare name and is never read for a tonemapped request.
+        // `_tm2`: the 203 nit reference white (ADR-0091); `_tm` entries hold the
+        // darker 100 nit picture and are never read again.
         let tonemap = match tonemap {
             pharos_transcode::Tonemap::Off => "",
-            pharos_transcode::Tonemap::HdrToSdr => "_tm",
+            pharos_transcode::Tonemap::HdrToSdr => "_tm2",
         };
+        let size = output_size
+            .map(|s| format!("_{}x{}", s.width(), s.height()))
+            .unwrap_or_default();
         format!(
-            "{seg_index}-a{audio_index}-s{sub}-v{}-b{}-c{codec_tag}{gen}{stereo}{tonemap}.ts",
+            "{seg_index}-a{audio_index}-s{sub}-v{}-b{}-c{codec_tag}{gen}{stereo}{tonemap}{size}.ts",
             br(*video_bitrate_kbps),
             br(*audio_bitrate_kbps),
         )
@@ -1550,6 +1927,32 @@ pub struct AudioRenditionFile {
     pub session_start_seg: u32,
 }
 
+/// Where a file's media is known to end, from a read of the whole file (the
+/// integrity scan), and the state of the file that read saw (B1198).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KnownSourceEnd {
+    /// The furthest media position the read reached, in ms.
+    pub end_ms: u64,
+    /// The file's mtime (unix seconds) and size when it was read.
+    pub mtime_secs: i64,
+    pub size: u64,
+}
+
+/// Looks up a media item's [`KnownSourceEnd`], for the cache to consult before
+/// it encodes a window. Set once by the server, which owns the scan's memo.
+pub type SourceEndHint = Arc<dyn Fn(u64) -> Option<KnownSourceEnd> + Send + Sync>;
+
+/// A window must start this far past the known end before it is taken as
+/// holding nothing: the scan's last packet time is not a frame boundary.
+const PAST_END_MARGIN_MS: u64 = 1_000;
+
+/// Whether a window starting at `start_ms` lies wholly past where a read of
+/// the whole file found its media ends, for the file in state `sig`
+/// (`(mtime_secs, size)`). A file changed since the read proves nothing.
+fn window_past_known_end(start_ms: u64, end: KnownSourceEnd, sig: Option<(i64, u64)>) -> bool {
+    sig == Some((end.mtime_secs, end.size)) && start_ms >= end.end_ms + PAST_END_MARGIN_MS
+}
+
 /// Outcome of [`HlsSegmentCache::choose_audio_start_seg`]: reuse a session
 /// already covering the request, or spawn one starting at the given segment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1588,6 +1991,8 @@ pub struct HlsSegmentCache {
     /// poisonous: the client's own later request for that segment inherited the
     /// entire wait (B108).
     inflight: Arc<DashMap<SegmentIdentity, InFlightSegment>>,
+    /// Where items' media is known to end (B1198), set once by the server.
+    source_end: Arc<std::sync::OnceLock<SourceEndHint>>,
     /// Segment identities already refused once for coming up short of the
     /// frames their window implies (T119).
     ///
@@ -2224,9 +2629,41 @@ impl HlsSegmentCache {
             scheduler: None,
             state: Arc::new(Mutex::new(CacheState::default())),
             inflight: Arc::new(DashMap::new()),
+            source_end: Arc::new(std::sync::OnceLock::new()),
             refused_once: Arc::new(DashMap::new()),
             next_registration: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
+    }
+
+    /// B1198 — tell the cache where items' media ends, as a read of the whole
+    /// file found it. A window wholly past that end holds no picture, so it is
+    /// served a filler at once instead of encoded. Without this the encoder is
+    /// asked for frames that are not there; on a file with no seek index the
+    /// check that would recognise that ([`pharos_transcode::worker::exec::window_has_video`])
+    /// times out reading from byte 0, and the window fails as a device fault.
+    /// The first hint set stands.
+    pub fn set_source_end_hint(&self, hint: SourceEndHint) {
+        if self.source_end.set(hint).is_err() {
+            tracing::warn!("hls source-end hint already set; the new one is ignored");
+        }
+    }
+
+    /// The known end of `media_id`'s media when the window at `start_ms` lies
+    /// wholly past it and `source` is the file that was read.
+    async fn past_known_end(&self, media_id: u64, source: &Path, start_ms: u64) -> Option<u64> {
+        let end = (self.source_end.get()?)(media_id)?;
+        // The same signature the integrity sweep keys its memo on
+        // (`integrity_backfill::mtime_secs` plus length); a mismatch only
+        // turns this off, never serves a filler on a changed file.
+        let sig = tokio::fs::metadata(source).await.ok().map(|m| {
+            let mtime = m
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |d| d.as_secs() as i64);
+            (mtime, m.len())
+        });
+        window_past_known_end(start_ms, end, sig).then_some(end.end_ms)
     }
 
     /// Route segment transcodes through the load-balancing scheduler.
@@ -2344,7 +2781,7 @@ impl HlsSegmentCache {
     /// Take a range of an item's cached segments out of service, KEEPING the
     /// bytes (T118).
     ///
-    /// Purging by hand three times in one evening (2026-08-16, Black Panther)
+    /// Purging by hand three times in one evening (2026-08-16, Film S)
     /// produced three re-encodes and not one retained sample: segment 827 was
     /// unlinked before anyone copied it, so the only trace of a fault that hit
     /// viewers three times is an md5 of bytes nobody can inspect. Every rule
@@ -2432,6 +2869,74 @@ impl HlsSegmentCache {
             "cached segments taken out of service and retained for inspection"
         );
         Ok(report)
+    }
+
+    /// Take one defective segment out of service, keeping it for inspection
+    /// like [`Self::quarantine_segments`] does, so the next read encodes it
+    /// again. Called from the hit path, so it never fails the request: a
+    /// file that cannot be moved is deleted, and one that cannot be deleted
+    /// either is overwritten by the re-encode's rename.
+    async fn quarantine_defective_segment(
+        &self,
+        key: SegmentIdentity,
+        path: &Path,
+        read: &std::fs::Metadata,
+        defect: SegmentDefect,
+    ) {
+        record_segment_defect(defect, DefectStage::Cached);
+        // A concurrent request may already have quarantined these bytes and
+        // published a fresh encode at the same path; that file is not ours to
+        // move. Same length and mtime is the file this request read.
+        let unchanged = tokio::fs::metadata(path).await.is_ok_and(|now| {
+            now.len() == read.len() && now.modified().ok() == read.modified().ok()
+        });
+        if !unchanged {
+            return;
+        }
+        let bytes = read.len();
+        let pen = self.root.join(QUARANTINE_DIR);
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let dest = pen.join(format!("{}-{name}", key.media_id));
+        let moved = match tokio::fs::create_dir_all(&pen).await {
+            Ok(()) => tokio::fs::rename(path, &dest).await,
+            Err(e) => Err(e),
+        };
+        let kept = match moved {
+            Ok(()) => {
+                let _ = tokio::fs::rename(
+                    provenance_sidecar_path(path),
+                    provenance_sidecar_path(&dest),
+                )
+                .await;
+                metrics::counter!("pharos_segment_quarantined_total").increment(1);
+                Self::trim_quarantine(&pen).await;
+                true
+            }
+            Err(e) => {
+                tracing::debug!(path = %path.display(), error = %e, "could not quarantine a defective segment; deleting it");
+                let _ = tokio::fs::remove_file(path).await;
+                let _ = tokio::fs::remove_file(provenance_sidecar_path(path)).await;
+                false
+            }
+        };
+        {
+            let mut state = self.state.lock().await;
+            if let Some(meta) = state.entries.remove(&key) {
+                state.total_bytes = state.total_bytes.saturating_sub(meta.bytes);
+            }
+        }
+        tracing::warn!(
+            media.id = key.media_id,
+            seg = key.seg_index,
+            reason = defect.label(),
+            bytes,
+            kept,
+            path = %path.display(),
+            "cached segment is defective; taken out of service and re-encoding (B890)"
+        );
     }
 
     /// Delete every cached audio encode of this item: its Opus rendition
@@ -2645,22 +3150,29 @@ impl HlsSegmentCache {
         // the added observability costs no extra stat.
         let hit_started = std::time::Instant::now();
         if let Ok(meta) = tokio::fs::metadata(&path).await {
-            self.touch(key).await;
             match tokio::fs::read(&path).await {
-                Ok(b) => {
-                    record_cache_hit(
-                        media_id,
-                        seg_index,
-                        b.len(),
-                        opts,
-                        class,
-                        CacheHitPath::Fast,
-                        hit_started.elapsed().as_millis() as u64,
-                        cached_age_secs(&meta),
-                    );
-                    self.note_client_playhead(class, stream, seg_index);
-                    return Ok(b);
-                }
+                Ok(b) => match segment_defect(&b, opts.container) {
+                    // Fall through and encode it again.
+                    Some(defect) => {
+                        self.quarantine_defective_segment(key, &path, &meta, defect)
+                            .await;
+                    }
+                    None => {
+                        self.touch(key).await;
+                        record_cache_hit(
+                            media_id,
+                            seg_index,
+                            b.len(),
+                            opts,
+                            class,
+                            CacheHitPath::Fast,
+                            hit_started.elapsed().as_millis() as u64,
+                            cached_age_secs(&meta),
+                        );
+                        self.note_client_playhead(class, stream, seg_index);
+                        return Ok(b);
+                    }
+                },
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => { /* evicted; fall through */
                 }
                 Err(e) => return Err(e.into()),
@@ -3154,6 +3666,16 @@ impl HlsSegmentCache {
             })
             .await
             .map_err(|e| counted("resolve_audio", e))?;
+        // A scaled transcode is starting: this is the one place a downscale is
+        // counted, so a cache hit, a coalesced requester and an init segment
+        // (none of which reach here) do not inflate it.
+        if let (Some(_), Some(reason)) = (opts.output_size, opts.output_scale_reason) {
+            metrics::counter!(
+                "pharos_transcode_output_scaled_total",
+                "reason" => reason.label(),
+            )
+            .increment(1);
+        }
         let mut attempt_opts = resolved.to_transcode_options();
         let mut timing = None;
         // A produced segment can be short of video frames while ffmpeg exits 0
@@ -3162,6 +3684,23 @@ impl HlsSegmentCache {
         // it seeds the decoder much further back, past the point the container
         // index lied about.
         let mut shortfall = None;
+        // B1198 — past where a read of the whole file found its media ends:
+        // nothing to encode, so straight to the filler below.
+        let past_end = self
+            .past_known_end(media_id, source, (start_secs * 1000.0) as u64)
+            .await;
+        if let Some(end_ms) = past_end {
+            tracing::info!(
+                media.id = media_id,
+                seg = seg_index,
+                seek_secs = start_secs,
+                end_ms,
+                "hls segment window is past where the file's media ends; serving a filler"
+            );
+            shortfall = Some(format!(
+                "the window starts past the media's end at {end_ms} ms"
+            ));
+        }
         // What ffmpeg reported the WINNING attempt produced: `(frames,
         // out_time_secs)`. Kept past the retry loop so the success path can
         // account for the frames rather than discarding the only evidence of
@@ -3184,6 +3723,9 @@ impl HlsSegmentCache {
         let mut submit_class = class;
         let mut submit_hint = hint;
         for attempt in 0..2 {
+            if past_end.is_some() {
+                break;
+            }
             if attempt == 1 {
                 attempt_opts.decode_preroll_seconds =
                     Some(pharos_transcode::DECODE_PREROLL_RETRY_SECONDS);
@@ -3514,6 +4056,26 @@ impl HlsSegmentCache {
                 "transcode produced empty/truncated segment ({produced} bytes)"
             )));
         }
+        let bytes = tokio::fs::read(&tmp)
+            .await
+            .map_err(|e| counted("publish_read", e.into()))?;
+        // The hit path refuses these same shapes, so publishing one would only
+        // buy an encode-quarantine-encode loop.
+        if let Some(defect) = segment_defect(&bytes, opts.container) {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            record_segment_defect(defect, DefectStage::Produced);
+            return Err(counted(
+                "publish_validate",
+                HlsCacheError::Transcode(format!(
+                    "transcode produced a malformed segment ({}, {} bytes)",
+                    defect.label(),
+                    bytes.len()
+                )),
+            ));
+        }
+        sync_file(&tmp)
+            .await
+            .map_err(|e| counted("publish_sync", e.into()))?;
         // Raised BEFORE the rename, not after: a flag set afterwards leaves the
         // window it exists to close. Setting it early can only cost a
         // cancellation that was about to become unsafe anyway — the encode is
@@ -3522,10 +4084,9 @@ impl HlsSegmentCache {
         tokio::fs::rename(&tmp, &path)
             .await
             .map_err(|e| counted("publish_rename", e.into()))?;
-
-        let bytes = tokio::fs::read(&path)
-            .await
-            .map_err(|e| counted("publish_read_back", e.into()))?;
+        if let Some(parent) = path.parent() {
+            sync_dir(parent).await;
+        }
         let transcode_ms = started.elapsed().as_millis();
         record_segment_outcome(
             if is_filler {
@@ -3749,7 +4310,7 @@ impl HlsSegmentCache {
         // is drowning (client consumes 1×; even prefetch can't hide a 3×
         // deficit for long). Surface it at WARN with every dimension needed
         // to attribute the stall — the 170-225 s outliers observed live
-        // (2026-07-14, Avatar burn path) were only findable by correlating
+        // (2026-07-14, Film BA burn path) were only findable by correlating
         // INFO lines after the fact.
         if far_below_realtime(transcode_ms as f64, seg_secs) {
             tracing::warn!(
@@ -3785,6 +4346,7 @@ impl HlsSegmentCache {
             source_gen: SourceGen::LOCAL,
             stereo_output: pharos_transcode::StereoOutput::Preserve,
             tonemap: Default::default(),
+            output_size: None,
         })
     }
 
@@ -4118,43 +4680,50 @@ impl HlsSegmentCache {
         // fresh mid-file audio-track switch — seeks straight to the playhead
         // rather than re-encoding 0→playhead first (B106 slow-swap fix).
         let from0_active = tokio::fs::try_exists(&playlist).await.unwrap_or(false)
-            || tokio::fs::try_exists(&dir.join(".running"))
-                .await
-                .unwrap_or(false);
+            || marker_state(&dir.join(".running"), &dir, SystemTime::now()).await
+                == MarkerState::Live;
         let progress = Self::audio_session_progress(&dir).await;
         let start_seg = match Self::choose_audio_start_seg(want_seg, from0_active, progress) {
             AudioStart::Reuse => return Ok(dir),
             AudioStart::Start(s) => s,
         };
-        let running = dir.join(if start_seg == 0 {
-            ".running".to_string()
-        } else {
-            format!(".running-{start_seg}")
-        });
+        let running = Self::rendition_marker(&dir, start_seg);
+        let session_dir = Self::audio_session_dir(&dir, start_seg);
         // Already finished (from-0 leaves the playlist as its done-marker),
         // or a session for this start is in flight → reuse.
         if (start_seg == 0 && tokio::fs::try_exists(&playlist).await.unwrap_or(false))
-            || tokio::fs::try_exists(&running).await.unwrap_or(false)
+            || marker_state(&running, &session_dir, SystemTime::now()).await == MarkerState::Live
         {
             return Ok(dir);
         }
-        let lock = {
-            let mut state = self.state.lock().await;
-            state
-                .audio_locks
-                .entry(running.clone())
-                .or_insert_with(|| Arc::new(Mutex::new(())))
-                .clone()
-        };
+        let lock = self.audio_lock(&running).await;
         let _guard = lock.lock().await;
-        // Re-check under the lock.
-        if (start_seg == 0 && tokio::fs::try_exists(&playlist).await.unwrap_or(false))
-            || tokio::fs::try_exists(&running).await.unwrap_or(false)
-        {
+        // Re-check under the lock. A marker whose process is gone would
+        // otherwise read as "in flight" forever and no session would ever
+        // start again (B891).
+        match marker_state(&running, &session_dir, SystemTime::now()).await {
+            MarkerState::Live => return Ok(dir),
+            MarkerState::Stale => {
+                let dropped = self
+                    .drop_audio_session_locked(
+                        AudioSessionKind::Rendition,
+                        AudioHeal::StaleMarker,
+                        &running,
+                        &session_dir,
+                        start_seg == 0,
+                    )
+                    .await;
+                if !dropped {
+                    return Ok(dir);
+                }
+            }
+            MarkerState::Absent => {}
+        }
+        if start_seg == 0 && tokio::fs::try_exists(&playlist).await.unwrap_or(false) {
             return Ok(dir);
         }
-        tokio::fs::create_dir_all(Self::audio_session_dir(&dir, start_seg)).await?;
-        tokio::fs::write(&running, b"").await?;
+        tokio::fs::create_dir_all(&session_dir).await?;
+        tokio::fs::write(&running, process_marker_id()).await?;
         // A fresh session supersedes any failure recorded for this rendition.
         self.state.lock().await.audio_session_failures.remove(&dir);
 
@@ -4184,6 +4753,8 @@ impl HlsSegmentCache {
         let media = media_id;
         let failures = self.state.clone();
         let failed_dir = dir.clone();
+        let written_dir = session_dir.clone();
+        let spawned_at = SystemTime::now();
         // Detached: run the encode to completion, then drop the `.running`
         // marker (the from-0 session leaves `audio.m3u8` as the done-marker).
         tokio::spawn(async move {
@@ -4194,7 +4765,7 @@ impl HlsSegmentCache {
                 .stderr(std::process::Stdio::null());
             let failed = match cmd.spawn() {
                 Ok(mut child) => {
-                    let status = child.wait().await;
+                    let status = wait_with_heartbeat(&mut child, &running_marker).await;
                     match status {
                         Ok(s) if !s.success() => {
                             tracing::warn!(
@@ -4204,7 +4775,10 @@ impl HlsSegmentCache {
                             );
                             true
                         }
-                        Ok(_) => false,
+                        Ok(_) => {
+                            sync_session_output(&written_dir, spawned_at).await;
+                            false
+                        }
                         Err(_) => true,
                     }
                 }
@@ -4225,6 +4799,71 @@ impl HlsSegmentCache {
             let _ = tokio::fs::remove_file(&running_marker).await;
         });
         Ok(dir)
+    }
+
+    /// The `.running*` marker of the rendition session starting at `start_seg`.
+    fn rendition_marker(root: &Path, start_seg: u32) -> PathBuf {
+        root.join(if start_seg == 0 {
+            ".running".to_string()
+        } else {
+            format!(".running-{start_seg}")
+        })
+    }
+
+    /// The lock that serialises starting, and dropping, the session `marker`
+    /// belongs to.
+    async fn audio_lock(&self, marker: &Path) -> Arc<Mutex<()>> {
+        self.state
+            .lock()
+            .await
+            .audio_locks
+            .entry(marker.to_path_buf())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+
+    /// Drop an audio session no process is writing, so the next request for
+    /// it encodes it again (B891). Returns false, and leaves everything, when
+    /// the session's marker is live. The caller holds [`Self::audio_lock`].
+    async fn drop_audio_session_locked(
+        &self,
+        kind: AudioSessionKind,
+        why: AudioHeal,
+        marker: &Path,
+        session_dir: &Path,
+        is_root: bool,
+    ) -> bool {
+        if marker_state(marker, session_dir, SystemTime::now()).await == MarkerState::Live {
+            return false;
+        }
+        let owner = tokio::fs::read(marker)
+            .await
+            .map(|c| String::from_utf8_lossy(&c).into_owned())
+            .unwrap_or_default();
+        let marker_age_secs = tokio::fs::metadata(marker)
+            .await
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|m| SystemTime::now().duration_since(m).ok())
+            .map(|d| d.as_secs());
+        remove_session_output(session_dir, is_root).await;
+        let _ = tokio::fs::remove_file(marker).await;
+        self.state
+            .lock()
+            .await
+            .audio_session_starts
+            .retain(|p, _| p.parent() != Some(session_dir));
+        record_audio_heal(kind, why);
+        tracing::warn!(
+            kind = kind.label(),
+            reason = why.label(),
+            audio.dir = %session_dir.display(),
+            marker.owner = %owner,
+            marker.age_secs = ?marker_age_secs,
+            this_process = process_marker_id(),
+            "audio session lost by a process that is gone; dropped for re-encode (B891)"
+        );
+        true
     }
 
     /// Highest `aN.m4s` index written by ANY session of this rendition — the
@@ -4602,7 +5241,7 @@ impl HlsSegmentCache {
     // fresh frame grid at its own seek point, so consecutive segments carry
     // overlapping, phase-misaligned audio — the same instants encoded twice,
     // at different timestamps, from different encoder state. Measured live on
-    // Fringe S01E02: 6.037 s of audio against 6.006 s of video in every
+    // Show AW S01E02: 6.037 s of audio against 6.006 s of video in every
     // segment, and the copies 0.53 of a frame out of phase with each other.
     //
     // The fix is one encode per title, sliced by copy. This produces that
@@ -4788,6 +5427,25 @@ impl HlsSegmentCache {
                 // The file EXISTS and is covered, so its true first sample is
                 // knowable — take that over the start it was asked for.
                 let path = dir.join("audio.ts");
+                // The progress report can survive a power cut that the audio
+                // itself did not (B891).
+                if let Some(why) = audio_file_tail_defect(&path).await {
+                    let marker = root.join(format!(".running-cont-{}", candidate as u64));
+                    let lock = self.audio_lock(&marker).await;
+                    let _guard = lock.lock().await;
+                    if self
+                        .drop_audio_session_locked(
+                            AudioSessionKind::Continuous,
+                            why,
+                            &marker,
+                            &dir,
+                            candidate <= 0.0,
+                        )
+                        .await
+                    {
+                        continue;
+                    }
+                }
                 let start_seconds = self.probed_session_start(&path, candidate).await;
                 return Ok(pharos_transcode::MuxedAudio {
                     path,
@@ -4806,21 +5464,29 @@ impl HlsSegmentCache {
             start_seconds: start_secs,
         };
         let running = root.join(format!(".running-cont-{}", start_secs as u64));
-        let lock = {
-            let mut state = self.state.lock().await;
-            state
-                .audio_locks
-                .entry(running.clone())
-                .or_insert_with(|| Arc::new(Mutex::new(())))
-                .clone()
-        };
+        let lock = self.audio_lock(&running).await;
         let spawned = {
             let _guard = lock.lock().await;
-            if tokio::fs::try_exists(&running).await.unwrap_or(false) {
+            let live = match marker_state(&running, &dir, SystemTime::now()).await {
+                MarkerState::Live => true,
+                MarkerState::Absent => false,
+                MarkerState::Stale => {
+                    !self
+                        .drop_audio_session_locked(
+                            AudioSessionKind::Continuous,
+                            AudioHeal::StaleMarker,
+                            &running,
+                            &dir,
+                            start_secs <= 0.0,
+                        )
+                        .await
+                }
+            };
+            if live {
                 false
             } else {
                 tokio::fs::create_dir_all(&dir).await?;
-                tokio::fs::write(&running, b"").await?;
+                tokio::fs::write(&running, process_marker_id()).await?;
                 let args = Self::continuous_audio_args(
                     source,
                     &dir,
@@ -4830,6 +5496,8 @@ impl HlsSegmentCache {
                 )?;
                 let bin = self.transcoder.binary().to_path_buf();
                 let marker = running.clone();
+                let written_dir = dir.clone();
+                let spawned_at = SystemTime::now();
                 tracing::info!(
                     media.id = media_id,
                     start_secs,
@@ -4854,8 +5522,10 @@ impl HlsSegmentCache {
                         .stderr(std::process::Stdio::null());
                     match cmd.spawn() {
                         Ok(mut child) => {
-                            if let Ok(s) = child.wait().await {
-                                if !s.success() {
+                            if let Ok(s) = wait_with_heartbeat(&mut child, &marker).await {
+                                if s.success() {
+                                    sync_session_output(&written_dir, spawned_at).await;
+                                } else {
                                     tracing::warn!(
                                         media.id = media_id,
                                         ?s,
@@ -4926,7 +5596,7 @@ impl HlsSegmentCache {
     /// This is an inter-segment interval, not a latency budget: a continuous
     /// audio session emits one 6 s segment at a time, so at 2× realtime it
     /// writes one every 3 s. The previous 3 s sat exactly on that cliff, and
-    /// any I/O contention pushed a HEALTHY session over it. Ghost in the Shell
+    /// any I/O contention pushed a HEALTHY session over it. Film AH
     /// (2026-07-25) did precisely that — the doubled video ladder saturated the
     /// same NFS stream, the audio session fell below one segment per 3 s, and
     /// the read declared a live session wedged, 404ing `a5.m4s` and `a48.m4s`
@@ -4991,12 +5661,37 @@ impl HlsSegmentCache {
             // once one has written it.
             if let Some((path, session_start_seg)) = Self::resolve_audio_file(dir, name).await {
                 if let Ok(b) = tokio::fs::read(&path).await {
-                    if !b.is_empty() {
-                        record_audio_wait("served");
-                        return Ok(AudioRenditionFile {
-                            bytes: b,
-                            session_start_seg,
-                        });
+                    match audio_bytes_defect(&b) {
+                        None => {
+                            record_audio_wait("served");
+                            return Ok(AudioRenditionFile {
+                                bytes: b,
+                                session_start_seg,
+                            });
+                        }
+                        // Empty or zeroed in a session nothing is writing:
+                        // waiting cannot fill it, and the session's
+                        // done-marker would make every later request reuse
+                        // it. Drop it so the next request encodes it again.
+                        Some(why) => {
+                            let marker = Self::rendition_marker(dir, session_start_seg);
+                            let session_dir = Self::audio_session_dir(dir, session_start_seg);
+                            let lock = self.audio_lock(&marker).await;
+                            let _guard = lock.lock().await;
+                            if self
+                                .drop_audio_session_locked(
+                                    AudioSessionKind::Rendition,
+                                    why,
+                                    &marker,
+                                    &session_dir,
+                                    session_start_seg == 0,
+                                )
+                                .await
+                            {
+                                give_up = AudioWaitGiveUp::Defective;
+                                break;
+                            }
+                        }
                     }
                 }
             }
@@ -5168,6 +5863,320 @@ impl HlsSegmentCache {
         }
     }
 
+    /// Enforce `max_bytes` across the on-disk generation tree (`self.root`).
+    ///
+    /// The in-memory LRU (`CacheState.entries`, `record`, `maybe_evict`) starts
+    /// empty at every boot and never tracks `_contaudio/` or `_audiohls/`
+    /// sessions at all. Recounting `self.root` periodically evicts pre-restart
+    /// segments, orphan provenance sidecars, and finished audio sessions
+    /// oldest-first until disk usage is back under `max_bytes`:
+    /// - `max_bytes == 0` disables the cap and returns [`CapReport::default`].
+    /// - Dot-prefixed entries (`.quarantine`, `.running*` markers) are skipped.
+    /// - Each immediate subdirectory of `_contaudio` and `_audiohls` is one
+    ///   eviction unit sized by all files inside it and aged by its newest
+    ///   file mtime; sessions containing a `.running*` marker or modified
+    ///   within [`JANITOR_GRACE`] are never evicted.
+    /// - Every other regular file older than [`JANITOR_GRACE`] is its own unit;
+    ///   evicting a segment removes and counts its provenance sidecar, and a
+    ///   sidecar is only evicted on its own once its segment is already gone.
+    /// - Evicted segments are dropped from the in-memory LRU and now-empty
+    ///   media-id directories are removed.
+    pub async fn enforce_cap(&self) -> CapReport {
+        self.enforce_cap_at(SystemTime::now(), JANITOR_GRACE).await
+    }
+
+    async fn enforce_cap_at(&self, now: SystemTime, grace: Duration) -> CapReport {
+        if self.max_bytes == 0 {
+            return CapReport::default();
+        }
+        struct ScannedFile {
+            path: PathBuf,
+            size: u64,
+            mtime: SystemTime,
+        }
+        enum EvictUnit {
+            File {
+                path: PathBuf,
+                size: u64,
+                sidecar: Option<(PathBuf, u64)>,
+                mtime: SystemTime,
+            },
+            Session {
+                path: PathBuf,
+                size: u64,
+                mtime: SystemTime,
+            },
+        }
+        impl EvictUnit {
+            fn mtime(&self) -> SystemTime {
+                match self {
+                    Self::File { mtime, .. } | Self::Session { mtime, .. } => *mtime,
+                }
+            }
+            fn path(&self) -> &Path {
+                match self {
+                    Self::File { path, .. } | Self::Session { path, .. } => path,
+                }
+            }
+        }
+
+        let contaudio = self.root.join("_contaudio");
+        let audiohls = self.root.join("_audiohls");
+        let mut regular_files: Vec<ScannedFile> = Vec::new();
+        let mut sidecars: HashMap<PathBuf, (u64, SystemTime)> = HashMap::new();
+        let mut units: Vec<EvictUnit> = Vec::new();
+        let mut total: u64 = 0;
+
+        let mut stack = vec![self.root.clone()];
+        while let Some(dir) = stack.pop() {
+            let is_audio_parent = dir == contaudio || dir == audiohls;
+            let Ok(mut rd) = tokio::fs::read_dir(&dir).await else {
+                continue;
+            };
+            while let Ok(Some(entry)) = rd.next_entry().await {
+                let name = entry.file_name();
+                let name_str = name.to_string_lossy();
+                if name_str.starts_with('.') {
+                    continue;
+                }
+                let Ok(meta) = entry.metadata().await else {
+                    continue;
+                };
+                let path = entry.path();
+                if meta.is_dir() {
+                    if is_audio_parent {
+                        let (size, newest_mtime, has_running) =
+                            Self::scan_audio_session(&path, &meta, now).await;
+                        total = total.saturating_add(size);
+                        if !has_running
+                            && now.duration_since(newest_mtime).unwrap_or(Duration::ZERO) >= grace
+                        {
+                            units.push(EvictUnit::Session {
+                                path,
+                                size,
+                                mtime: newest_mtime,
+                            });
+                        }
+                    } else {
+                        stack.push(path);
+                    }
+                } else if meta.is_file() {
+                    let size = meta.len();
+                    let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+                    total = total.saturating_add(size);
+                    if name_str.ends_with(PROVENANCE_SUFFIX) {
+                        sidecars.insert(path, (size, mtime));
+                    } else {
+                        regular_files.push(ScannedFile { path, size, mtime });
+                    }
+                }
+            }
+        }
+
+        let mut report = CapReport {
+            scanned_bytes: total,
+            remaining_bytes: total,
+            ..Default::default()
+        };
+        if total <= self.max_bytes {
+            return report;
+        }
+
+        for f in regular_files {
+            let sidecar_path = provenance_sidecar_path(&f.path);
+            let sidecar = sidecars
+                .remove(&sidecar_path)
+                .map(|(sz, _)| (sidecar_path, sz));
+            if now.duration_since(f.mtime).unwrap_or(Duration::ZERO) >= grace {
+                units.push(EvictUnit::File {
+                    path: f.path,
+                    size: f.size,
+                    sidecar,
+                    mtime: f.mtime,
+                });
+            }
+        }
+        for (sidecar_path, (size, mtime)) in sidecars {
+            if now.duration_since(mtime).unwrap_or(Duration::ZERO) >= grace {
+                units.push(EvictUnit::File {
+                    path: sidecar_path,
+                    size,
+                    sidecar: None,
+                    mtime,
+                });
+            }
+        }
+
+        units.sort_by(|a, b| {
+            a.mtime()
+                .cmp(&b.mtime())
+                .then_with(|| a.path().cmp(b.path()))
+        });
+
+        let mut evicted_paths: HashSet<PathBuf> = HashSet::new();
+        let mut evicted_session_dirs: Vec<PathBuf> = Vec::new();
+        for unit in units {
+            if total <= self.max_bytes {
+                break;
+            }
+            match unit {
+                EvictUnit::File {
+                    path,
+                    size,
+                    sidecar,
+                    ..
+                } => match tokio::fs::remove_file(&path).await {
+                    Ok(()) => {
+                        total = total.saturating_sub(size);
+                        report.evicted_bytes = report.evicted_bytes.saturating_add(size);
+                        report.evicted_files = report.evicted_files.saturating_add(1);
+                        if let Some((sidecar_path, sidecar_size)) = sidecar {
+                            match tokio::fs::remove_file(&sidecar_path).await {
+                                Ok(()) => {
+                                    total = total.saturating_sub(sidecar_size);
+                                    report.evicted_bytes =
+                                        report.evicted_bytes.saturating_add(sidecar_size);
+                                }
+                                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                                Err(e) => {
+                                    tracing::warn!(
+                                        path = %sidecar_path.display(),
+                                        error = %e,
+                                        "could not evict segment provenance sidecar"
+                                    );
+                                }
+                            }
+                        }
+                        evicted_paths.insert(path);
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            path = %path.display(),
+                            error = %e,
+                            "could not evict cached segment file"
+                        );
+                    }
+                },
+                EvictUnit::Session { path, size, .. } => {
+                    match tokio::fs::remove_dir_all(&path).await {
+                        Ok(()) => {
+                            total = total.saturating_sub(size);
+                            report.evicted_bytes = report.evicted_bytes.saturating_add(size);
+                            report.evicted_sessions = report.evicted_sessions.saturating_add(1);
+                            evicted_session_dirs.push(path);
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                path = %path.display(),
+                                error = %e,
+                                "could not evict cached audio session"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        report.remaining_bytes = total;
+
+        if !evicted_paths.is_empty() || !evicted_session_dirs.is_empty() {
+            let mut state = self.state.lock().await;
+            if !evicted_paths.is_empty() {
+                let doomed: Vec<SegmentIdentity> = state
+                    .entries
+                    .keys()
+                    .filter(|k| evicted_paths.contains(&self.segment_path_keyed(**k)))
+                    .copied()
+                    .collect();
+                for key in doomed {
+                    if let Some(meta) = state.entries.remove(&key) {
+                        state.total_bytes = state.total_bytes.saturating_sub(meta.bytes);
+                    }
+                }
+            }
+            if !evicted_session_dirs.is_empty() {
+                let gone = |p: &PathBuf| evicted_session_dirs.iter().any(|d| p.starts_with(d));
+                state.audio_session_starts.retain(|p, _| !gone(p));
+                state.audio_session_failures.retain(|p, _| !gone(p));
+            }
+        }
+
+        // Only directories this sweep emptied: pruning any empty one could
+        // race a writer that has created its media-id directory but not yet
+        // its first segment.
+        let emptied: HashSet<&Path> = evicted_paths
+            .iter()
+            .filter_map(|p| p.parent())
+            .filter(|d| *d != self.root && *d != contaudio && *d != audiohls)
+            .collect();
+        for dir in emptied {
+            // Fails, as intended, while the directory still holds files.
+            let _ = tokio::fs::remove_dir(dir).await;
+        }
+
+        if report.evicted_files > 0 || report.evicted_sessions > 0 || report.evicted_bytes > 0 {
+            tracing::info!(
+                scanned_bytes = report.scanned_bytes,
+                evicted_bytes = report.evicted_bytes,
+                evicted_files = report.evicted_files,
+                evicted_sessions = report.evicted_sessions,
+                remaining_bytes = report.remaining_bytes,
+                cap_bytes = self.max_bytes,
+                "hls cache: cap enforced"
+            );
+        }
+
+        report
+    }
+
+    async fn scan_audio_session(
+        session_dir: &Path,
+        dir_meta: &std::fs::Metadata,
+        now: SystemTime,
+    ) -> (u64, SystemTime, bool) {
+        let mut size: u64 = 0;
+        let mut newest_mtime: Option<SystemTime> = None;
+        let mut has_running = false;
+        let mut stack = vec![session_dir.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            let Ok(mut rd) = tokio::fs::read_dir(&dir).await else {
+                continue;
+            };
+            while let Ok(Some(entry)) = rd.next_entry().await {
+                let name = entry.file_name();
+                let name_str = name.to_string_lossy();
+                if name_str.starts_with(".running") {
+                    let fresh = entry
+                        .metadata()
+                        .await
+                        .ok()
+                        .and_then(|m| m.modified().ok())
+                        .is_some_and(|at| {
+                            now.duration_since(at).unwrap_or(Duration::ZERO)
+                                < RUNNING_MARKER_MAX_AGE
+                        });
+                    has_running |= fresh;
+                    continue;
+                }
+                if name_str.starts_with('.') {
+                    continue;
+                }
+                let Ok(meta) = entry.metadata().await else {
+                    continue;
+                };
+                if meta.is_dir() {
+                    stack.push(entry.path());
+                } else if meta.is_file() {
+                    size = size.saturating_add(meta.len());
+                    let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+                    newest_mtime = Some(newest_mtime.map_or(mtime, |prev| prev.max(mtime)));
+                }
+            }
+        }
+        let mtime =
+            newest_mtime.unwrap_or_else(|| dir_meta.modified().unwrap_or(SystemTime::UNIX_EPOCH));
+        (size, mtime, has_running)
+    }
+
     #[cfg(test)]
     async fn total_bytes(&self) -> u64 {
         self.state.lock().await.total_bytes
@@ -5235,6 +6244,8 @@ mod tests {
             video_3d_format: None,
             stereo_output: Default::default(),
             tonemap: Default::default(),
+            output_size: None,
+            output_scale_reason: None,
         }
         .resolve_with(|_| {
             Ok::<_, ()>(pharos_transcode::options::MuxedAudio {
@@ -5273,6 +6284,8 @@ mod tests {
             video_3d_format: None,
             stereo_output: Default::default(),
             tonemap: Default::default(),
+            output_size: None,
+            output_scale_reason: None,
         }
     }
 
@@ -5451,6 +6464,203 @@ mod tests {
         std::fs::metadata(encodes).map(|m| m.len()).unwrap_or(0)
     }
 
+    /// The shape `fmp4::process_segment` accepts: init boxes, then a fragment.
+    fn plausible_fmp4() -> Vec<u8> {
+        let mut seg = bmff_box(b"ftyp", b"iso6");
+        seg.extend(bmff_box(b"moov", &[1u8; 32]));
+        seg.extend(bmff_box(b"moof", &[2u8; 32]));
+        seg.extend(bmff_box(b"mdat", &[3u8; 1024]));
+        seg
+    }
+
+    /// B890/V840 — the shapes a power cut leaves are refused, and real
+    /// segments of both containers are not.
+    #[test]
+    fn segment_defect_names_what_a_power_cut_leaves() {
+        use SegmentContainer::{Fmp4, Mpegts};
+        assert_eq!(segment_defect(&plausible_fmp4(), Fmp4), None);
+        assert_eq!(segment_defect(SLOW_SEGMENT_BYTES.as_bytes(), Mpegts), None);
+
+        assert_eq!(segment_defect(b"", Mpegts), Some(SegmentDefect::Empty));
+        assert_eq!(segment_defect(b"", Fmp4), Some(SegmentDefect::Empty));
+        // Size reached the disk, data did not: the seg 54/55 shape, which
+        // `process_segment` reported as "no moov box".
+        assert_eq!(
+            segment_defect(&vec![0u8; 1_500_000], Fmp4),
+            Some(SegmentDefect::ZeroTail)
+        );
+        assert_eq!(
+            segment_defect(&vec![0u8; 1_500_000], Mpegts),
+            Some(SegmentDefect::ZeroTail)
+        );
+        let mut torn = plausible_fmp4();
+        torn.extend(vec![0u8; 4096]);
+        assert_eq!(segment_defect(&torn, Fmp4), Some(SegmentDefect::ZeroTail));
+
+        let mut no_moov = bmff_box(b"ftyp", b"iso6");
+        no_moov.extend(bmff_box(b"moof", &[2u8; 32]));
+        no_moov.extend(bmff_box(b"mdat", &[3u8; 1024]));
+        assert_eq!(
+            segment_defect(&no_moov, Fmp4),
+            Some(SegmentDefect::Fmp4Malformed)
+        );
+        let mut cut = plausible_fmp4();
+        cut.truncate(cut.len() - 100);
+        assert_eq!(
+            segment_defect(&cut, Fmp4),
+            Some(SegmentDefect::Fmp4Malformed)
+        );
+        let mut zero_kind = plausible_fmp4();
+        zero_kind.extend(bmff_box(&[0u8; 4], &[9u8; 16]));
+        assert_eq!(
+            segment_defect(&zero_kind, Fmp4),
+            Some(SegmentDefect::Fmp4Malformed)
+        );
+    }
+
+    #[test]
+    fn segment_defect_labels_are_distinct() {
+        let defects = [
+            SegmentDefect::Empty,
+            SegmentDefect::ZeroTail,
+            SegmentDefect::Fmp4Malformed,
+        ]
+        .map(SegmentDefect::label);
+        let stages = [DefectStage::Cached, DefectStage::Produced].map(DefectStage::label);
+        assert_eq!(defects.iter().collect::<HashSet<_>>().len(), defects.len());
+        assert_eq!(stages.iter().collect::<HashSet<_>>().len(), stages.len());
+    }
+
+    /// B890/V840 — a cached segment whose bytes were lost is re-encoded on the
+    /// next read instead of being trusted forever, the bad file is kept in
+    /// quarantine, and the heal is countable.
+    #[test]
+    fn a_zero_filled_cached_segment_is_quarantined_and_re_encoded() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let dir = TempDir::new().unwrap();
+        let (cache, encodes) = slow_test_cache(&dir, std::time::Duration::ZERO);
+        let opts = slow_opts();
+        let source = Path::new("/no/source");
+        let key = SegmentIdentity::new(1, 0, None, None, &opts, SourceGen::for_read(source, None));
+        let path = cache.segment_path_keyed(key);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, vec![0u8; 8192]).unwrap();
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = pharos_test_metrics::snapshotter(&recorder);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (first, second) = metrics::with_local_recorder(&recorder, || {
+            rt.block_on(async {
+                let first = cache
+                    .segment_bytes(1, 0, source, &opts, JobClass::Interactive)
+                    .await
+                    .expect("the defective entry is replaced by a fresh encode");
+                let second = cache
+                    .segment_bytes(1, 0, source, &opts, JobClass::Interactive)
+                    .await
+                    .expect("the re-encoded entry is a hit");
+                (first, second)
+            })
+        });
+
+        assert_eq!(first, SLOW_SEGMENT_BYTES.as_bytes(), "served the zeros");
+        assert_eq!(second, first);
+        assert_eq!(
+            encode_count(&encodes),
+            1,
+            "the zeros must cost exactly one encode, and the result must be trusted"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            first,
+            "keyed path not healed"
+        );
+        let pen = cache.quarantined();
+        assert_eq!(
+            pen.len(),
+            1,
+            "the defective bytes are kept for inspection: {pen:?}"
+        );
+        assert_eq!(pen[0].1, 8192);
+
+        let defects: u64 = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter_map(|(ck, _, _, v)| {
+                let k = ck.key();
+                let labels: Vec<String> = k
+                    .labels()
+                    .map(|l| format!("{}={}", l.key(), l.value()))
+                    .collect();
+                (k.name() == "pharos_segment_defect_total"
+                    && labels.contains(&"reason=zero_tail".to_string())
+                    && labels.contains(&"stage=cached".to_string()))
+                .then_some(v)
+            })
+            .map(|v| match v {
+                DebugValue::Counter(n) => n,
+                other => panic!("not a counter: {other:?}"),
+            })
+            .sum();
+        assert_eq!(defects, 1, "the heal must be countable by reason and stage");
+    }
+
+    /// B890 — two requests can read the same zeros; the one that loses the
+    /// race must not quarantine the fresh encode the winner published.
+    #[tokio::test]
+    async fn quarantine_leaves_a_segment_replaced_since_it_was_read() {
+        let dir = TempDir::new().unwrap();
+        let (cache, _) = slow_test_cache(&dir, std::time::Duration::ZERO);
+        let opts = slow_opts();
+        let key = SegmentIdentity::new(1, 0, None, None, &opts, SourceGen::LOCAL);
+        let path = cache.segment_path_keyed(key);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, vec![0u8; 8192]).unwrap();
+        let read = std::fs::metadata(&path).unwrap();
+        std::fs::write(&path, SLOW_SEGMENT_BYTES).unwrap();
+
+        cache
+            .quarantine_defective_segment(key, &path, &read, SegmentDefect::ZeroTail)
+            .await;
+
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            SLOW_SEGMENT_BYTES.as_bytes(),
+            "the re-encoded segment must stay in service"
+        );
+        assert!(cache.quarantined().is_empty(), "{:?}", cache.quarantined());
+    }
+
+    /// B890/V840 — an encode whose output has the shape the hit path refuses
+    /// is not published, so a broken encoder cannot loop through quarantine.
+    #[tokio::test]
+    async fn a_zero_filled_encode_is_not_published() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let bin = dir.path().join("zero-ffmpeg");
+        std::fs::write(&bin, "#!/bin/sh\nhead -c 4096 /dev/zero\n").unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let cache = HlsSegmentCache::new(dir.path().join("cache"), 1 << 30).with_ffmpeg(&bin);
+        let opts = slow_opts();
+        let source = Path::new("/no/source");
+
+        let err = cache
+            .segment_bytes(1, 0, source, &opts, JobClass::Interactive)
+            .await
+            .expect_err("zeros are not a segment");
+        assert!(err.to_string().contains("zero_tail"), "{err}");
+        let key = SegmentIdentity::new(1, 0, None, None, &opts, SourceGen::for_read(source, None));
+        assert!(
+            !cache.segment_path_keyed(key).exists(),
+            "the zeros must not be published under the key"
+        );
+    }
+
     /// Every provenance sidecar under `root`, recursively. The test does not
     /// know the keyed segment path (it is derived from a private hash), so it
     /// finds the record by its suffix rather than by reconstructing the name —
@@ -5495,7 +6705,7 @@ mod tests {
 
     /// T122 — a cached segment must say which encoder produced it.
     ///
-    /// Asked on 2026-08-16 whether a specific cached Black Panther segment came
+    /// Asked on 2026-08-16 whether a specific cached Film S segment came
     /// off NVENC or the CPU, the answer was that we could not tell: the device
     /// is on the INFO line and on a metric label, and both age out long before
     /// the file does. Corruption that clusters on one encoder is the first
@@ -5593,6 +6803,8 @@ mod tests {
             video_3d_format: None,
             stereo_output: Default::default(),
             tonemap: Default::default(),
+            output_size: None,
+            output_scale_reason: None,
         }
     }
 
@@ -6235,6 +7447,61 @@ mod tests {
             );
             tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         }
+    }
+
+    fn scaled_total(snapshotter: &pharos_test_metrics::CumulativeSnapshotter, reason: &str) -> u64 {
+        snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(ck, ..)| {
+                ck.key().name() == "pharos_transcode_output_scaled_total"
+                    && ck
+                        .key()
+                        .labels()
+                        .any(|l| l.key() == "reason" && l.value() == reason)
+            })
+            .map(|(_, _, _, v)| match v {
+                metrics_util::debugging::DebugValue::Counter(n) => n,
+                _ => 0,
+            })
+            .sum()
+    }
+
+    /// `pharos_transcode_output_scaled_total` is "scaled transcodes STARTED": the
+    /// encode counts once, and a request served from the cache afterwards does
+    /// not count again.
+    #[test]
+    fn a_scaled_transcode_counts_once_and_a_cache_hit_does_not() {
+        let dir = TempDir::new().unwrap();
+        let (cache, encodes) = slow_test_cache(&dir, std::time::Duration::from_millis(10));
+        let mut opts = slow_opts();
+        opts.output_size = pharos_transcode::OutputSize::new(1920, 1080);
+        opts.output_scale_reason = Some(pharos_transcode::ScaleReason::MaxSize);
+
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = pharos_test_metrics::snapshotter(&recorder);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        metrics::with_local_recorder(&recorder, || {
+            rt.block_on(async {
+                for _ in 0..3 {
+                    cache
+                        .segment_bytes(51, 3, Path::new("/no/source"), &opts, JobClass::Interactive)
+                        .await
+                        .unwrap();
+                }
+            })
+        });
+        assert_eq!(
+            encode_count(&encodes),
+            1,
+            "precondition: one encode, two hits"
+        );
+        assert_eq!(scaled_total(&snapshotter, "max_size"), 1);
+        assert_eq!(scaled_total(&snapshotter, "bitrate"), 0);
     }
 
     /// The `pharos_segment_produced_total` series carrying `outcome=<want>`,
@@ -7367,6 +8634,148 @@ mod tests {
         );
     }
 
+    /// B1198/V1158: a window wholly past where a read of the whole file found
+    /// its media ends is a filler, only for the file state that read saw.
+    #[test]
+    fn only_a_window_past_the_known_end_of_the_same_file_counts() {
+        let end = KnownSourceEnd {
+            end_ms: 5_773_248,
+            mtime_secs: 100,
+            size: 7,
+        };
+        let same = Some((100, 7));
+        assert!(window_past_known_end(5_777_980, end, same));
+        assert!(window_past_known_end(5_774_248, end, same));
+        // Inside the margin, before the end, or a changed or unreadable file.
+        assert!(!window_past_known_end(5_774_000, end, same));
+        assert!(!window_past_known_end(5_000_000, end, same));
+        assert!(!window_past_known_end(5_777_980, end, Some((101, 7))));
+        assert!(!window_past_known_end(5_777_980, end, Some((100, 8))));
+        assert!(!window_past_known_end(5_777_980, end, None));
+    }
+
+    /// B1198/V1158: on a file whose media is known to end early, a window past
+    /// that end is a filler without asking the encoder, so the encoder's
+    /// "no frames" failure, which an unindexed file's slow probe leaves as a
+    /// device fault, never happens. A file changed since the read is encoded
+    /// as before.
+    #[test]
+    fn a_window_past_the_known_end_serves_filler_without_encoding() {
+        use pharos_transcode::protocol::{JobSpec, OutputSink, WorkerError, WorkerId};
+        use pharos_transcode::scheduler::{
+            RunFuture, SpawnFuture, TranscodeScheduler, Worker, WorkerRunResult, WorkerSpawner,
+        };
+
+        struct Spawner {
+            real_attempts: Arc<std::sync::atomic::AtomicU64>,
+        }
+        impl WorkerSpawner for Spawner {
+            fn spawn(&self, id: WorkerId) -> SpawnFuture {
+                let real_attempts = self.real_attempts.clone();
+                Box::pin(async move {
+                    Ok(Box::new(PastEndWorker { id, real_attempts }) as Box<dyn Worker>)
+                })
+            }
+        }
+        struct PastEndWorker {
+            id: WorkerId,
+            real_attempts: Arc<std::sync::atomic::AtomicU64>,
+        }
+        impl Worker for PastEndWorker {
+            fn id(&self) -> WorkerId {
+                self.id
+            }
+            fn run<'a>(&'a mut self, job: JobSpec) -> RunFuture<'a> {
+                let real_attempts = self.real_attempts.clone();
+                Box::pin(async move {
+                    if job.filler.is_none() {
+                        // What the live unindexed file got: the probe timed
+                        // out, so the empty window read as a device fault.
+                        real_attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        return WorkerRunResult::Failed(WorkerError::DeviceBusy(
+                            "Could not open encoder before EOF".into(),
+                        ));
+                    }
+                    let OutputSink::FileDirect { path } = &job.sink else {
+                        return WorkerRunResult::Died;
+                    };
+                    let _ = tokio::fs::write(path, vec![b'x'; 256]).await;
+                    let _ = tokio::fs::write(
+                        pharos_transcode::progress_sidecar_path(path),
+                        "frame=144\nout_time_us=6006000\n",
+                    )
+                    .await;
+                    WorkerRunResult::Done { out_bytes: 256 }
+                })
+            }
+        }
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let dir = TempDir::new().unwrap();
+        let _guard = rt.enter();
+        let source = rt.block_on(real_tiny_source(&dir));
+        let meta = std::fs::metadata(&source).unwrap();
+        let mtime_secs = meta
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let size = meta.len();
+        let (cache, _) = slow_test_cache(&dir, std::time::Duration::ZERO);
+        let real_attempts = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let sched = TranscodeScheduler::spawn(
+            pharos_transcode::device::DeviceTable::from_probe(&[], 4),
+            Arc::new(Spawner {
+                real_attempts: real_attempts.clone(),
+            }),
+            pharos_transcode::scheduler::SchedConfig::default(),
+        );
+        let cache = cache.with_scheduler(sched);
+        // Item 47's media ends at 5 s; item 48's read saw a different file.
+        cache.set_source_end_hint(Arc::new(move |id| match id {
+            47 => Some(KnownSourceEnd {
+                end_ms: 5_000,
+                mtime_secs,
+                size,
+            }),
+            48 => Some(KnownSourceEnd {
+                end_ms: 5_000,
+                mtime_secs,
+                size: size + 1,
+            }),
+            _ => None,
+        }));
+        // Segment 2 of a minute-long title starts at 12 s.
+        let opts = SegmentOpts {
+            video: Some(SegmentVideo::H264),
+            window: pharos_core::SegmentWindow::for_segment(2, None, Some(60.0)),
+            ..slow_opts()
+        };
+        assert!(
+            opts.window.start_seconds() >= 6.0,
+            "precondition: past the end"
+        );
+
+        let bytes = rt
+            .block_on(cache.segment_bytes(47, 2, &source, &opts, JobClass::Interactive))
+            .expect("a window past the known end must serve a filler");
+        assert_eq!(bytes.len(), 256);
+        assert_eq!(
+            real_attempts.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the encoder must not be asked for frames past the known end"
+        );
+
+        let changed =
+            rt.block_on(cache.segment_bytes(48, 2, &source, &opts, JobClass::Interactive));
+        assert!(changed.is_err(), "a changed file is encoded as before");
+        assert!(real_attempts.load(std::sync::atomic::Ordering::SeqCst) >= 1);
+    }
+
     #[test]
     fn a_no_frames_worker_failure_serves_filler_without_retrying_mid_file_and_at_the_final_segment()
     {
@@ -7505,7 +8914,7 @@ mod tests {
         let source = real_tiny_source(&dir).await;
         let (cache, _) = slow_test_cache(&dir, std::time::Duration::ZERO);
         // A worker that always reports a short (but nonzero) duration — the
-        // Ant-Man shape (T113): video ends before the container's clamp.
+        // Film AV shape (T113): video ends before the container's clamp.
         let real_attempts = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let sched = always_short_until_filler(false, real_attempts.clone());
         let cache = cache.with_scheduler(sched);
@@ -8581,7 +9990,7 @@ mod tests {
         // The observed catastrophic case: the decoder could not rebuild its
         // reference list after the seek and skipped every NALU, so the
         // segment carries audio and no picture — and ffmpeg exited 0. Two
-        // live segments of Fringe S01E02 looked exactly like this.
+        // live segments of Show AW S01E02 looked exactly like this.
         let td = TempDir::new().unwrap();
         let out = td.path().join("seg.ts");
         write_progress(&out, 0, 6.006).await;
@@ -9046,7 +10455,7 @@ mod tests {
         assert_eq!(labels.len(), ALL.len(), "frame results collide: {labels:?}");
     }
 
-    /// T116 — a deficit at the LAST segment is not frame loss. Ant-Man's
+    /// T116 — a deficit at the LAST segment is not frame loss. Film AV's
     /// numbers, measured on the deployed B189 fix: the tail produced 15 of the
     /// 19 frames its container-derived window implied, and those four never
     /// existed to be produced.
@@ -9090,7 +10499,7 @@ mod tests {
     /// The grid, and so the window's clamp, comes from the CONTAINER duration;
     /// the encoder stops at the end of the VIDEO stream. When those differ the
     /// final window asks for video the source does not hold, and no encoder and
-    /// no preroll can produce it. Live on 2026-08-15: Ant-Man's segment 1171 of
+    /// no preroll can produce it. Live on 2026-08-15: Film AV's segment 1171 of
     /// 1172 asked for 0.773 s against 0.500 s of video and returned 500 on all
     /// 14 attempts across 7 play sessions, so playing that title to its end
     /// gave an error instead of an end of stream.
@@ -9101,7 +10510,7 @@ mod tests {
     async fn the_final_segment_is_accepted_when_the_video_track_ended_early() {
         let td = TempDir::new().unwrap();
         let out = td.path().join("seg.ts");
-        // Ant-Man's numbers: 0.500 s produced against a 0.773 s window.
+        // Film AV's numbers: 0.500 s produced against a 0.773 s window.
         write_progress(&out, 12, 0.500).await;
         let got = read_progress(&out).await;
         let mut opts = segment_transcode_opts();
@@ -9304,6 +10713,8 @@ mod tests {
             video_3d_format: None,
             stereo_output: Default::default(),
             tonemap: Default::default(),
+            output_size: None,
+            output_scale_reason: None,
         }
     }
 
@@ -9565,12 +10976,40 @@ mod tests {
             key_sdr.filename()
         );
         assert!(
-            key_hdr.filename().ends_with("_tm.ts"),
+            key_hdr.filename().ends_with("_tm2.ts"),
             "{}",
             key_hdr.filename()
         );
         assert_ne!(key_hdr.cache_relative_path(), key_sdr.cache_relative_path());
         assert_ne!(key_hdr.etag(), key_sdr.etag());
+    }
+
+    #[test]
+    fn segment_identity_output_size_distinguishes_cache_and_etag() {
+        let plain = ident_opts(
+            Some(SegmentVideo::H264),
+            Some(SegmentAudio::Aac),
+            SegmentContainer::Mpegts,
+            Some(4_000_000),
+            Some(128_000),
+        );
+        let mut scaled = plain.clone();
+        scaled.output_size = pharos_transcode::OutputSize::new(1920, 1080);
+        let mut other = plain.clone();
+        other.output_size = pharos_transcode::OutputSize::new(1280, 720);
+        let id = |o: &SegmentOpts| SegmentIdentity::new(1, 5, Some(1), None, o, SourceGen::LOCAL);
+        let (k_plain, k_scaled, k_other) = (id(&plain), id(&scaled), id(&other));
+
+        assert_eq!(k_plain.filename(), "5-a1-soff-v4000-b128-c28.ts");
+        assert!(
+            k_scaled.filename().ends_with("_1920x1080.ts"),
+            "{}",
+            k_scaled.filename()
+        );
+        for (a, b) in [(&k_plain, &k_scaled), (&k_scaled, &k_other)] {
+            assert_ne!(a.cache_relative_path(), b.cache_relative_path());
+            assert_ne!(a.etag(), b.etag());
+        }
     }
 
     #[test]
@@ -9805,6 +11244,7 @@ mod tests {
                     source_gen: SourceGen::LOCAL,
                     stereo_output: pharos_transcode::StereoOutput::Preserve,
                     tonemap: Default::default(),
+                    output_size: None,
                 },
                 body.len() as u64,
             )
@@ -9982,7 +11422,7 @@ mod tests {
         );
         assert_ne!(local.filename(), remote.filename());
         assert_eq!(
-            SourceGen::for_source(Path::new("/media/Movies/Arrival.mkv")),
+            SourceGen::for_source(Path::new("/media/Movies/Film BC.mkv")),
             SourceGen::LOCAL,
             "an ordinary path is the local, single-generation case"
         );
@@ -10073,6 +11513,8 @@ mod tests {
             video_3d_format: None,
             stereo_output: Default::default(),
             tonemap: Default::default(),
+            output_size: None,
+            output_scale_reason: None,
         };
         let got = cache
             .segment_bytes(7, 0, Path::new("/no/source"), &opts, JobClass::Interactive)
@@ -10102,6 +11544,8 @@ mod tests {
             video_3d_format: None,
             stereo_output: Default::default(),
             tonemap: Default::default(),
+            output_size: None,
+            output_scale_reason: None,
         };
         let res = cache
             .segment_bytes(8, 0, Path::new("/no/source"), &opts, JobClass::Interactive)
@@ -10196,6 +11640,8 @@ mod tests {
             video_3d_format: None,
             stereo_output: Default::default(),
             tonemap: Default::default(),
+            output_size: None,
+            output_scale_reason: None,
         };
         let source = Path::new("/media/stale.mkv");
         cache.note_source_unreadable(source, "stale_handle").await;
@@ -10240,6 +11686,8 @@ mod tests {
             video_3d_format: None,
             stereo_output: Default::default(),
             tonemap: Default::default(),
+            output_size: None,
+            output_scale_reason: None,
         };
         let _ = cache
             .segment_bytes(7, 0, Path::new("/no/source"), &opts, JobClass::Interactive)
@@ -10285,6 +11733,8 @@ mod tests {
                 video_3d_format: None,
                 stereo_output: Default::default(),
                 tonemap: Default::default(),
+                output_size: None,
+                output_scale_reason: None,
             };
             cache
                 .segment_bytes(9, 0, Path::new("/n"), &opts, JobClass::Interactive)
@@ -10310,6 +11760,8 @@ mod tests {
                 video_3d_format: None,
                 stereo_output: Default::default(),
                 tonemap: Default::default(),
+                output_size: None,
+                output_scale_reason: None,
             };
             cache
                 .segment_bytes(9, 0, Path::new("/n"), &opts, JobClass::Interactive)
@@ -10698,6 +12150,301 @@ mod tests {
             .collect()
     }
 
+    /// Backdate a file's mtime, as a power cut hours ago would have left it.
+    fn age_file(path: &Path, by: Duration) {
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(SystemTime::now() - by)
+            .unwrap();
+    }
+
+    fn rendition_root(cache: &HlsSegmentCache, source: &Path, media_id: u64) -> PathBuf {
+        cache.root().join("_audiohls").join(format!(
+            "{media_id}-a0-b128{}",
+            SourceGen::for_read(source, None).key_suffix()
+        ))
+    }
+
+    /// Sum of `pharos_audio_session_healed_total` for one `reason`.
+    fn audio_heals(snapshotter: &pharos_test_metrics::CumulativeSnapshotter, reason: &str) -> u64 {
+        use metrics_util::debugging::DebugValue;
+        snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter_map(|(ck, _, _, v)| {
+                let k = ck.key();
+                let hit = k.name() == "pharos_audio_session_healed_total"
+                    && k.labels()
+                        .any(|l| l.key() == "reason" && l.value() == reason);
+                match (hit, v) {
+                    (true, DebugValue::Counter(n)) => Some(n),
+                    _ => None,
+                }
+            })
+            .sum()
+    }
+
+    /// Run `ensure_audio_hls_covering(.., 0)` once; count sessions opened and
+    /// stale markers healed.
+    fn sessions_opened_by_ensure(
+        cache: &HlsSegmentCache,
+        source: &Path,
+        media_id: u64,
+    ) -> (u64, u64) {
+        use metrics_util::debugging::DebuggingRecorder;
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = pharos_test_metrics::snapshotter(&recorder);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        metrics::with_local_recorder(&recorder, || {
+            rt.block_on(async {
+                cache
+                    .ensure_audio_hls_covering(source, None, media_id, None, Some(128_000), 0)
+                    .await
+                    .unwrap();
+            })
+        });
+        (
+            audio_sessions_opened(&snapshotter)
+                .iter()
+                .map(|(_, n)| n)
+                .sum(),
+            audio_heals(&snapshotter, "stale_marker"),
+        )
+    }
+
+    #[tokio::test]
+    async fn marker_state_tells_this_process_a_live_peer_and_a_dead_one_apart() {
+        let td = TempDir::new().unwrap();
+        let dir = td.path();
+        let marker = dir.join(".running");
+        let now = SystemTime::now();
+        assert_eq!(marker_state(&marker, dir, now).await, MarkerState::Absent);
+
+        std::fs::write(&marker, process_marker_id()).unwrap();
+        let hours_later = now + Duration::from_secs(6 * 60 * 60);
+        assert_eq!(
+            marker_state(&marker, dir, hours_later).await,
+            MarkerState::Live,
+            "this process's own marker is live however old"
+        );
+
+        // A peer's marker: its heartbeat alone says whether it is alive, so
+        // output it never got round to writing does not count against it.
+        std::fs::write(&marker, b"pharos pid=1 started=1").unwrap();
+        assert_eq!(
+            marker_state(&marker, dir, SystemTime::now()).await,
+            MarkerState::Live
+        );
+        assert_eq!(
+            marker_state(
+                &marker,
+                dir,
+                SystemTime::now() + STALE_MARKER_IDLE + Duration::from_secs(1)
+            )
+            .await,
+            MarkerState::Stale
+        );
+
+        // The empty marker every build before B891 wrote has no heartbeat, so
+        // its session's newest file stands in for one.
+        std::fs::write(&marker, b"").unwrap();
+        std::fs::write(dir.join("a3.m4s"), b"seg").unwrap();
+        assert_eq!(
+            marker_state(&marker, dir, now).await,
+            MarkerState::Live,
+            "a peer whose session wrote just now may be mid-rollout"
+        );
+        assert_eq!(
+            marker_state(
+                &marker,
+                dir,
+                SystemTime::now() + STALE_MARKER_IDLE + Duration::from_secs(1)
+            )
+            .await,
+            MarkerState::Stale
+        );
+    }
+
+    /// B891/V841 — a `.running` marker the dead process left behind must not
+    /// read as an encode in flight: the session is started again, and the
+    /// stale output under it goes first.
+    #[test]
+    fn a_dead_process_marker_is_taken_over() {
+        let td = TempDir::new().unwrap();
+        let cache = HlsSegmentCache::new(td.path(), 1024).with_ffmpeg("/no/such/ffmpeg");
+        let source = Path::new("/media/film.mkv");
+        let root = rendition_root(&cache, source, 7);
+        std::fs::create_dir_all(root.join("s30")).unwrap();
+        std::fs::write(root.join(".running"), b"").unwrap();
+        // Written before the cut; a0 never was.
+        std::fs::write(root.join("init.mp4"), b"init").unwrap();
+        std::fs::write(root.join("s30").join("a30.m4s"), b"seek").unwrap();
+        for f in [".running", "init.mp4"] {
+            age_file(&root.join(f), Duration::from_secs(3600));
+        }
+
+        assert_eq!(
+            sessions_opened_by_ensure(&cache, source, 7),
+            (1, 1),
+            "(sessions opened, stale markers healed)"
+        );
+        assert!(
+            !root.join("init.mp4").exists(),
+            "the dead session's output must go"
+        );
+        assert!(
+            root.join("s30").join("a30.m4s").exists(),
+            "a seek session under the root is not the dead session's to lose"
+        );
+    }
+
+    /// The other half of the rule: a peer that is still writing keeps its
+    /// session, or two encoders share one directory.
+    #[test]
+    fn a_live_peer_marker_is_left_alone() {
+        let td = TempDir::new().unwrap();
+        let cache = HlsSegmentCache::new(td.path(), 1024).with_ffmpeg("/no/such/ffmpeg");
+        let source = Path::new("/media/film.mkv");
+        let root = rendition_root(&cache, source, 7);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join(".running"), b"another pod").unwrap();
+        std::fs::write(root.join("a0.m4s"), b"seg").unwrap();
+
+        assert_eq!(sessions_opened_by_ensure(&cache, source, 7), (0, 0));
+        assert!(root.join("a0.m4s").exists());
+    }
+
+    /// B891/V841 — a finished session holding a zeroed file is dropped instead
+    /// of served, so the next request's ensure starts a fresh encode.
+    #[tokio::test]
+    async fn a_zeroed_file_in_a_finished_session_drops_the_session() {
+        let td = TempDir::new().unwrap();
+        let cache = HlsSegmentCache::new(td.path(), 1024);
+        let root = td.path().join("r");
+        std::fs::create_dir_all(root.join("s30")).unwrap();
+        std::fs::write(root.join("audio.m3u8"), b"#EXTM3U\n").unwrap();
+        std::fs::write(root.join("init.mp4"), b"init").unwrap();
+        std::fs::write(root.join("a5.m4s"), vec![0u8; 4096]).unwrap();
+        std::fs::write(root.join("s30").join("a30.m4s"), b"seek").unwrap();
+
+        let res = cache
+            .audio_hls_file_budget(&root, "a5.m4s", 40, 10, 6)
+            .await;
+
+        assert!(
+            matches!(
+                res,
+                Err(HlsCacheError::AudioNotReady {
+                    reason: AudioWaitGiveUp::Defective,
+                    ..
+                })
+            ),
+            "{:?}",
+            res.err()
+        );
+        for gone in ["audio.m3u8", "init.mp4", "a5.m4s"] {
+            assert!(!root.join(gone).exists(), "{gone} must go with its session");
+        }
+        assert!(root.join("s30").join("a30.m4s").exists());
+    }
+
+    /// A session this process is still running may expose a file before its
+    /// bytes land; that is not damage, and the session must survive it.
+    #[tokio::test]
+    async fn an_empty_file_in_a_live_session_is_waited_for_not_dropped() {
+        let td = TempDir::new().unwrap();
+        let cache = HlsSegmentCache::new(td.path(), 1024);
+        let root = td.path().join("r");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join(".running"), process_marker_id()).unwrap();
+        std::fs::write(root.join("a5.m4s"), b"").unwrap();
+
+        let res = cache.audio_hls_file_budget(&root, "a5.m4s", 4, 2, 2).await;
+
+        assert!(
+            !matches!(
+                res,
+                Err(HlsCacheError::AudioNotReady {
+                    reason: AudioWaitGiveUp::Defective,
+                    ..
+                })
+            ),
+            "{:?}",
+            res.err()
+        );
+        assert!(root.join("a5.m4s").exists());
+        assert!(root.join(".running").exists());
+    }
+
+    /// B891/V841 — the continuous encode's progress report can outlive its
+    /// audio: the tail check reads past the report to the bytes.
+    #[tokio::test]
+    async fn a_zeroed_continuous_encode_is_seen_through_its_tail() {
+        let td = TempDir::new().unwrap();
+        let ok = td.path().join("ok.ts");
+        let zeroed = td.path().join("zeroed.ts");
+        let mut bytes = vec![0x47u8; 188 * 50];
+        std::fs::write(&ok, &bytes).unwrap();
+        bytes.extend(vec![0u8; 8192]);
+        std::fs::write(&zeroed, &bytes).unwrap();
+        assert_eq!(audio_file_tail_defect(&ok).await, None);
+        assert_eq!(
+            audio_file_tail_defect(&zeroed).await,
+            Some(AudioHeal::ZeroTail)
+        );
+    }
+
+    /// A whole-file continuous encode owns its root's files but not the seek
+    /// sessions beside them.
+    #[tokio::test]
+    async fn dropping_a_whole_file_continuous_session_spares_its_seek_sessions() {
+        let td = TempDir::new().unwrap();
+        let cache = HlsSegmentCache::new(td.path(), 1024);
+        let root = td.path().join("c");
+        std::fs::create_dir_all(root.join("s600")).unwrap();
+        std::fs::write(root.join("audio.ts"), vec![0u8; 4096]).unwrap();
+        std::fs::write(root.join("audio.ts.progress"), b"out_time_us=1").unwrap();
+        std::fs::write(root.join("s600").join("audio.ts"), b"seek").unwrap();
+        let marker = root.join(".running-cont-0");
+
+        let lock = cache.audio_lock(&marker).await;
+        let _guard = lock.lock().await;
+        assert!(
+            cache
+                .drop_audio_session_locked(
+                    AudioSessionKind::Continuous,
+                    AudioHeal::ZeroTail,
+                    &marker,
+                    &root,
+                    true,
+                )
+                .await
+        );
+        assert!(!root.join("audio.ts").exists());
+        assert!(!root.join("audio.ts.progress").exists());
+        assert!(root.join("s600").join("audio.ts").exists());
+    }
+
+    #[test]
+    fn audio_heal_labels_are_distinct() {
+        let reasons = [
+            AudioHeal::StaleMarker,
+            AudioHeal::Empty,
+            AudioHeal::ZeroTail,
+        ]
+        .map(AudioHeal::label);
+        let kinds = [AudioSessionKind::Rendition, AudioSessionKind::Continuous]
+            .map(AudioSessionKind::label);
+        assert_eq!(reasons.iter().collect::<HashSet<_>>().len(), reasons.len());
+        assert_eq!(kinds.iter().collect::<HashSet<_>>().len(), kinds.len());
+    }
+
     /// An audio session records which file it was opened for, so a grouped
     /// edition's session can be told apart from its primary's by query.
     #[test]
@@ -10924,7 +12671,7 @@ mod tests {
         // client's AudioStreamIndex are the SAME bytes. Keying them apart minted
         // a second, byte-identical video ladder the moment a viewer switched
         // audio track, doubling GPU + NFS load mid-playback and dragging the
-        // encoder below realtime (Ghost in the Shell, 2026-07-25: 6 of 47
+        // encoder below realtime (Film AH, 2026-07-25: 6 of 47
         // segments encoded twice, each pair byte-for-byte equal).
         let opts = ident_opts(
             Some(SegmentVideo::Vp9),
@@ -11021,6 +12768,7 @@ mod tests {
             AudioWaitGiveUp::Stalled,
             AudioWaitGiveUp::BudgetExhausted,
             AudioWaitGiveUp::SessionFailed,
+            AudioWaitGiveUp::Defective,
         ];
         let labels: Vec<&str> = all.iter().map(|r| r.label()).collect();
         assert_eq!(
@@ -11029,7 +12777,8 @@ mod tests {
                 "never_started",
                 "stalled",
                 "budget_exhausted",
-                "session_failed"
+                "session_failed",
+                "defective"
             ]
         );
         let mut uniq = labels.clone();
@@ -11053,6 +12802,266 @@ mod tests {
         assert!(msg.contains("stopped advancing"), "{msg}");
         assert!(msg.contains("3000ms"), "{msg}");
         assert!(msg.contains("a41.m4s"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn enforce_cap_under_cap_deletes_nothing() {
+        let td = TempDir::new().unwrap();
+        let cache = HlsSegmentCache::new(td.path(), 1000);
+        let dir = cache.root().join("42");
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let seg = dir.join("0.ts");
+        tokio::fs::write(&seg, vec![0u8; 400]).await.unwrap();
+
+        let future = SystemTime::now() + Duration::from_secs(3600);
+        let report = cache.enforce_cap_at(future, JANITOR_GRACE).await;
+        assert_eq!(
+            report,
+            CapReport {
+                scanned_bytes: 400,
+                evicted_bytes: 0,
+                evicted_files: 0,
+                evicted_sessions: 0,
+                remaining_bytes: 400,
+            }
+        );
+        assert!(seg.exists());
+    }
+
+    #[tokio::test]
+    async fn enforce_cap_evicts_oldest_files_with_sidecars_and_updates_lru() {
+        let td = TempDir::new().unwrap();
+        let cache = HlsSegmentCache::new(td.path(), 600);
+        let opts = segment_opts();
+        let key_old = SegmentIdentity::new(1, 0, None, None, &opts, SourceGen::LOCAL);
+        let key_new = SegmentIdentity::new(2, 0, None, None, &opts, SourceGen::LOCAL);
+        let seg_old = cache.segment_path_keyed(key_old);
+        let seg_new = cache.segment_path_keyed(key_new);
+        let sidecar_old = provenance_sidecar_path(&seg_old);
+        let sidecar_new = provenance_sidecar_path(&seg_new);
+
+        tokio::fs::create_dir_all(seg_old.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(seg_new.parent().unwrap())
+            .await
+            .unwrap();
+
+        tokio::fs::write(&seg_old, vec![0u8; 400]).await.unwrap();
+        tokio::fs::write(&sidecar_old, vec![0u8; 100])
+            .await
+            .unwrap();
+        cache.record(key_old, 400).await;
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        tokio::fs::write(&seg_new, vec![0u8; 400]).await.unwrap();
+        tokio::fs::write(&sidecar_new, vec![0u8; 100])
+            .await
+            .unwrap();
+        cache.record(key_new, 400).await;
+
+        let future = SystemTime::now() + Duration::from_secs(3600);
+        let report = cache.enforce_cap_at(future, JANITOR_GRACE).await;
+        assert_eq!(
+            report,
+            CapReport {
+                scanned_bytes: 1000,
+                evicted_bytes: 500,
+                evicted_files: 1,
+                evicted_sessions: 0,
+                remaining_bytes: 500,
+            }
+        );
+        assert!(!seg_old.exists(), "oldest segment must be evicted");
+        assert!(
+            !sidecar_old.exists(),
+            "provenance sidecar must be evicted with its segment"
+        );
+        assert!(
+            !cache.root().join("1").exists(),
+            "now-empty media directory must be pruned"
+        );
+        assert!(seg_new.exists(), "newer segment under cap must stay");
+        assert!(sidecar_new.exists(), "newer segment's sidecar must stay");
+        assert_eq!(cache.entry_count().await, 1);
+        assert_eq!(cache.total_bytes().await, 400);
+    }
+
+    /// ADR-0091 renamed tonemapped segments `_tm` -> `_tm2`, so no key ever
+    /// names an old `_tm` file again. The cap walks the disk, not the LRU, so
+    /// an orphaned `_tm` file (not in the in-memory LRU after a restart) must
+    /// still be counted and reclaimed oldest-first.
+    #[tokio::test]
+    async fn enforce_cap_reclaims_orphaned_pre_adr_0091_tm_segments() {
+        let td = TempDir::new().unwrap();
+        let cache = HlsSegmentCache::new(td.path(), 600);
+        let mut opts = segment_opts();
+        opts.tonemap = pharos_transcode::Tonemap::HdrToSdr;
+        let key = SegmentIdentity::new(3, 0, None, None, &opts, SourceGen::LOCAL);
+        let seg_new = cache.segment_path_keyed(key);
+        let name_new = seg_new.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name_new.ends_with("_tm2.ts"), "{name_new}");
+        let seg_old = seg_new.with_file_name(name_new.replace("_tm2.ts", "_tm.ts"));
+        assert_ne!(seg_old, seg_new);
+
+        tokio::fs::create_dir_all(seg_new.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&seg_old, vec![0u8; 400]).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        tokio::fs::write(&seg_new, vec![0u8; 400]).await.unwrap();
+        cache.record(key, 400).await;
+
+        let future = SystemTime::now() + Duration::from_secs(3600);
+        let report = cache.enforce_cap_at(future, JANITOR_GRACE).await;
+        assert_eq!(report.scanned_bytes, 800);
+        assert_eq!(report.evicted_files, 1);
+        assert!(
+            !seg_old.exists(),
+            "the orphaned `_tm` file must be reclaimed"
+        );
+        assert!(seg_new.exists(), "the live `_tm2` segment must stay");
+    }
+
+    #[tokio::test]
+    async fn enforce_cap_evicts_audio_sessions_as_a_unit_and_spares_running_ones() {
+        let td = TempDir::new().unwrap();
+        let cache = HlsSegmentCache::new(td.path(), 900);
+
+        let running_session = cache.root().join("_contaudio").join("1-a0-b128");
+        tokio::fs::create_dir_all(&running_session).await.unwrap();
+        tokio::fs::write(running_session.join("audio.ts"), vec![0u8; 500])
+            .await
+            .unwrap();
+        tokio::fs::write(running_session.join(".running-cont-0"), b"")
+            .await
+            .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let finished_session = cache.root().join("_audiohls").join("2-a0-b128");
+        tokio::fs::create_dir_all(finished_session.join("s40"))
+            .await
+            .unwrap();
+        tokio::fs::write(finished_session.join("init.mp4"), vec![0u8; 200])
+            .await
+            .unwrap();
+        tokio::fs::write(finished_session.join("s40").join("a40.m4s"), vec![0u8; 300])
+            .await
+            .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let seg_dir = cache.root().join("3");
+        tokio::fs::create_dir_all(&seg_dir).await.unwrap();
+        let seg = seg_dir.join("0.ts");
+        tokio::fs::write(&seg, vec![0u8; 300]).await.unwrap();
+
+        let future = SystemTime::now() + Duration::from_secs(3600);
+        let report = cache.enforce_cap_at(future, JANITOR_GRACE).await;
+        assert_eq!(
+            report,
+            CapReport {
+                scanned_bytes: 1300,
+                evicted_bytes: 500,
+                evicted_files: 0,
+                evicted_sessions: 1,
+                remaining_bytes: 800,
+            }
+        );
+        assert!(
+            running_session.exists(),
+            "session with a .running marker must be kept even when oldest"
+        );
+        assert!(
+            !finished_session.exists(),
+            "finished audio session must be evicted as a whole directory"
+        );
+        assert!(
+            cache.root().join("_audiohls").exists(),
+            "_audiohls root must never be deleted"
+        );
+        assert!(
+            cache.root().join("_contaudio").exists(),
+            "_contaudio root must never be deleted"
+        );
+        assert!(seg.exists());
+    }
+
+    #[tokio::test]
+    async fn enforce_cap_evicts_a_session_whose_running_marker_is_stale() {
+        let td = TempDir::new().unwrap();
+        let cache = HlsSegmentCache::new(td.path(), 100);
+        let abandoned = cache.root().join("_contaudio").join("1-a0-b128");
+        tokio::fs::create_dir_all(&abandoned).await.unwrap();
+        tokio::fs::write(abandoned.join("audio.ts"), vec![0u8; 500])
+            .await
+            .unwrap();
+        tokio::fs::write(abandoned.join(".running-cont-0"), b"")
+            .await
+            .unwrap();
+
+        // A pod that died mid-encode left its marker seven hours ago.
+        let later = SystemTime::now() + Duration::from_secs(7 * 60 * 60);
+        let report = cache.enforce_cap_at(later, JANITOR_GRACE).await;
+        assert_eq!(report.evicted_sessions, 1, "{report:?}");
+        assert!(!abandoned.exists());
+    }
+
+    #[tokio::test]
+    async fn enforce_cap_keeps_files_younger_than_grace() {
+        let td = TempDir::new().unwrap();
+        let cache = HlsSegmentCache::new(td.path(), 200);
+        let dir = cache.root().join("7");
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let seg = dir.join("0.ts");
+        tokio::fs::write(&seg, vec![0u8; 600]).await.unwrap();
+
+        let report = cache.enforce_cap_at(SystemTime::now(), JANITOR_GRACE).await;
+        assert_eq!(
+            report,
+            CapReport {
+                scanned_bytes: 600,
+                evicted_bytes: 0,
+                evicted_files: 0,
+                evicted_sessions: 0,
+                remaining_bytes: 600,
+            }
+        );
+        assert!(seg.exists());
+    }
+
+    #[tokio::test]
+    async fn enforce_cap_never_touches_quarantine() {
+        let td = TempDir::new().unwrap();
+        let cache = HlsSegmentCache::new(td.path(), 100);
+        let pen = cache.root().join(QUARANTINE_DIR);
+        tokio::fs::create_dir_all(&pen).await.unwrap();
+        let quarantined = pen.join("7-0-a0-s-1-vauto-bauto-c28.ts");
+        tokio::fs::write(&quarantined, vec![0u8; 800])
+            .await
+            .unwrap();
+
+        let future = SystemTime::now() + Duration::from_secs(3600);
+        let report = cache.enforce_cap_at(future, JANITOR_GRACE).await;
+        assert_eq!(report, CapReport::default());
+        assert!(quarantined.exists());
+    }
+
+    #[tokio::test]
+    async fn enforce_cap_zero_cap_does_nothing() {
+        let td = TempDir::new().unwrap();
+        let cache = HlsSegmentCache::new(td.path(), 0);
+        let dir = cache.root().join("9");
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let seg = dir.join("0.ts");
+        tokio::fs::write(&seg, vec![0u8; 500]).await.unwrap();
+
+        let future = SystemTime::now() + Duration::from_secs(3600);
+        let report = cache.enforce_cap_at(future, JANITOR_GRACE).await;
+        assert_eq!(report, CapReport::default());
+        assert!(seg.exists());
     }
 }
 

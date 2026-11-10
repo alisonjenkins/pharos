@@ -87,6 +87,7 @@ async fn seed(rows: Vec<Row>) -> (web::Data<AppState>, String) {
                     episode_number: Some(1),
                     series_folder: Some(format!("/tv/{name}")),
                     series_year: Some(year),
+                    series_key: None,
                 }),
                 probe: pharos_core::MediaProbe {
                     album: r.album.map(|(a, _)| a.to_string()),
@@ -417,22 +418,35 @@ fn titled(titles: &[&'static str]) -> Vec<Row> {
 
 #[actix_web::test]
 async fn sort_name_ignores_leading_articles_but_name_does_not() {
-    let (state, token) = seed(titled(&["Zeta", "The Matrix", "Nemo", "Alpha", "A Zoo"])).await;
+    let (state, token) = seed(titled(&[
+        "Zeta",
+        "The Glass Lattice",
+        "Nemo",
+        "Alpha",
+        "A Zoo",
+    ]))
+    .await;
     let app = test::init_service(build_app(state)).await;
-    let expected = vec!["Alpha", "The Matrix", "Nemo", "Zeta", "A Zoo"];
+    let expected = vec!["Alpha", "The Glass Lattice", "Nemo", "Zeta", "A Zoo"];
     let default = names!(&app, token.as_str(), "SortOrder=Ascending");
     assert_eq!(default, expected);
     let sort_name = names!(&app, token.as_str(), "SortBy=SortName");
     assert_eq!(sort_name, expected);
     let name = names!(&app, token.as_str(), "SortBy=Name");
-    assert_eq!(name, vec!["A Zoo", "Alpha", "Nemo", "The Matrix", "Zeta"]);
+    assert_eq!(
+        name,
+        vec!["A Zoo", "Alpha", "Nemo", "The Glass Lattice", "Zeta"]
+    );
     let desc = names!(&app, token.as_str(), "SortBy=SortName&SortOrder=Descending");
-    assert_eq!(desc, vec!["A Zoo", "Zeta", "Nemo", "The Matrix", "Alpha"]);
+    assert_eq!(
+        desc,
+        vec!["A Zoo", "Zeta", "Nemo", "The Glass Lattice", "Alpha"]
+    );
 }
 
 #[actix_web::test]
 async fn item_dto_carries_the_sort_name_as_a_plain_string() {
-    let (state, token) = seed(titled(&["The Matrix", "Ep 10", ""])).await;
+    let (state, token) = seed(titled(&["The Glass Lattice", "Ep 10", ""])).await;
     let app = test::init_service(build_app(state)).await;
     let body = test::call_and_read_body(
         &app,
@@ -454,8 +468,8 @@ async fn item_dto_carries_the_sort_name_as_a_plain_string() {
             .cloned()
     };
     assert_eq!(
-        sort_name("The Matrix"),
-        Some(serde_json::json!("matrix")),
+        sort_name("The Glass Lattice"),
+        Some(serde_json::json!("glass lattice")),
         "article dropped, lowercased"
     );
     assert_eq!(

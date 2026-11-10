@@ -1065,8 +1065,11 @@ fn translate_outbound(msg: ServerMsg, ctx: &TranslateCtx) -> Option<Outbound> {
         // console clean.
         ServerMsg::LeaderChange { .. } => None,
         // Group tracks are native-only (V396): Jellyfin's SyncPlay has no
-        // track sync, so jellyfin-web members are never told.
-        ServerMsg::Tracks { .. } | ServerMsg::MemberTracks { .. } => None,
+        // track sync, so jellyfin-web members are never told. Nor has it an
+        // "Up next" to hold (B1027).
+        ServerMsg::Tracks { .. } | ServerMsg::MemberTracks { .. } | ServerMsg::NextHeld { .. } => {
+            None
+        }
         // B24 — the session sent a group command but the server has no
         // membership for it (unrecoverable: no persisted snapshot names it).
         // jellyfin-web handles NotInGroup by disabling SyncPlay locally — a
@@ -1195,7 +1198,7 @@ pub(crate) fn translate_broadcast(b: SocketBroadcast) -> Option<Outbound> {
                 .to_string();
             translate_session_command(session_id, controlling_user_id, command, arg)
         }
-        SocketBroadcast::CastChanged => None,
+        SocketBroadcast::CastChanged | SocketBroadcast::ScanProgress { .. } => None,
         SocketBroadcast::SessionsChanged => Some(Outbound::new(
             "Sessions",
             serde_json::Value::Array(Vec::new()),
@@ -1552,6 +1555,14 @@ mod tests {
             ServerMsg::MemberTracks {
                 member_id: MemberId::new(),
                 own_tracks: true,
+            },
+            &ctx
+        )
+        .is_none());
+        assert!(translate_outbound(
+            ServerMsg::NextHeld {
+                playlist_item_id: "pli-1".into(),
+                by: MemberId::new(),
             },
             &ctx
         )

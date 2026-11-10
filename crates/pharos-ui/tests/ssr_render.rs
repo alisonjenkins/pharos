@@ -131,7 +131,6 @@ fn player_movie() -> Element {
         PlayerView {
             item_id: "1".to_string(),
             kind: ItemKind::Movie,
-            access_token: "tok".to_string(),
             server_base: "http://x".to_string(),
             on_event: move |_| {},
         }
@@ -143,7 +142,6 @@ fn player_audio() -> Element {
         PlayerView {
             item_id: "2".to_string(),
             kind: ItemKind::Audio,
-            access_token: "tok".to_string(),
             server_base: "http://x".to_string(),
             on_event: move |_| {},
         }
@@ -156,7 +154,6 @@ fn player_movie_with_quality() -> Element {
         PlayerView {
             item_id: "10".to_string(),
             kind: ItemKind::Movie,
-            access_token: "tok".to_string(),
             server_base: "http://x".to_string(),
             quality_options: vec![
                 QualityOption { label: "Auto".into(), max_bitrate: 0 },
@@ -177,7 +174,6 @@ fn player_movie_with_chapters() -> Element {
         PlayerView {
             item_id: "42".to_string(),
             kind: ItemKind::Movie,
-            access_token: "tok".to_string(),
             server_base: "http://x".to_string(),
             run_time_ticks: run_time_ticks,
             chapters: vec![
@@ -194,9 +190,9 @@ fn player_movie_with_chapters() -> Element {
 fn player_view_renders_video_for_movie_kind() {
     let html = render_root(player_movie);
     assert!(html.contains("<video"), "video element missing: {html}");
-    // Direct-play URL with api_key.
+    // Direct-play URL; the sign-in cookie is its credential (V1110).
     assert!(html.contains("/Videos/1/stream"), "{html}");
-    assert!(html.contains("api_key=tok"), "{html}");
+    assert!(!html.contains("api_key"), "{html}");
 }
 
 fn player_movie_with_tracks() -> Element {
@@ -205,7 +201,6 @@ fn player_movie_with_tracks() -> Element {
         PlayerView {
             item_id: "3".to_string(),
             kind: ItemKind::Movie,
-            access_token: "tok".to_string(),
             server_base: "http://x".to_string(),
             tracks: PlaybackTracks {
                 audio: vec![
@@ -242,6 +237,7 @@ fn player_view_renders_subtitle_track_when_tracks_supplied() {
     // Native <track> for the browser CC picker.
     assert!(html.contains("<track"), "{html}");
     assert!(html.contains("Subtitles/2/Stream.vtt"), "{html}");
+    assert!(!html.contains("api_key"), "{html}");
     // Pharos-side OSD picker also renders.
     assert!(html.contains("pharos-player-osd"), "{html}");
     assert!(html.contains("pharos-player-subtitles"), "{html}");
@@ -369,21 +365,30 @@ fn admin_view_renders_user_rows_with_self_delete_disabled() {
     let html = render_root(admin_with_users);
     assert!(html.contains("boss"), "{html}");
     assert!(html.contains("alice"), "{html}");
-    assert!(html.contains("(admin)"), "{html}");
-    // The current user (id=1) renders a `you` button (disabled),
-    // the other renders a `Delete` button (enabled).
+    assert!(html.contains("2 users · 1 admin"), "{html}");
+    // B921: the signed-in admin's own card is marked You, has no Delete or
+    // password reset, and its admin switch is off-limits.
+    let own =
+        &html[html.find(r#"data-user-id="1""#).unwrap()..html.find(r#"data-user-id="2""#).unwrap()];
+    assert!(own.contains(">You<") && own.contains(">Admin<"), "{own}");
+    assert!(!own.contains("pharos-admin-user-delete"), "{own}");
+    assert!(!own.contains("Reset password"), "{own}");
     assert!(
-        html.contains(">you<"),
-        "self-delete not rendered as 'you': {html}"
+        own.contains(r#"role="switch" aria-checked="true""#),
+        "{own}"
     );
-    assert!(html.contains(">Delete<"), "{html}");
-    // T50 phase 2: admin-toggle checkbox + password reset form per row.
+    assert!(own.contains("disabled=true"), "{own}");
+    // Everyone else's card offers Delete and Reset password, behind a
+    // confirm and a form that open on press, and a live admin switch.
+    let other = &html[html.find(r#"data-user-id="2""#).unwrap()..];
+    assert!(other.contains("pharos-admin-user-delete"), "{other}");
+    assert!(other.contains(">Reset password<"), "{other}");
+    assert!(!other.contains("pharos-manage-confirm"), "{other}");
+    assert!(
+        other.contains(r#"role="switch" aria-checked="false""#),
+        "{other}"
+    );
     assert!(html.contains("pharos-admin-user-policy"), "{html}");
-    assert!(html.contains("pharos-admin-user-reset"), "{html}");
-    // Self-row's reset input is disabled (points user at prefs view).
-    // Non-self row carries the standard placeholder.
-    assert!(html.contains("Reset password"), "{html}");
-    assert!(html.contains("Reset (current pw needed)"), "{html}");
 }
 
 #[test]
@@ -431,6 +436,7 @@ fn admin_devices_tab() -> Element {
                 name: "Pixel 9".into(),
                 app_name: "Finamp".into(),
                 last_user_name: "ali".into(),
+                no_direct_play_audio_codecs: Vec::new(),
             }],
             on_action: move |_| {},
         }
@@ -459,6 +465,79 @@ fn admin_view_libraries_tab_renders_library_list() {
     assert!(html.contains("Shows"), "{html}");
     assert!(html.contains("/data/tv"), "{html}");
     assert!(html.contains("tvshows"), "{html}");
+}
+
+fn admin_libraries_scanning() -> Element {
+    use pharos_ui::views::scan_progress::ScanView;
+    let mut scan = ScanView {
+        running: Some(0.42),
+        ..ScanView::default()
+    };
+    scan.libraries.insert("lib-2".into(), 0.5);
+    rsx! {
+        AdminView {
+            users: Vec::<AdminUser>::new(),
+            current_user_id: "1".to_string(),
+            status: None,
+            active_tab: AdminTab::Libraries,
+            libraries: vec![
+                LibraryFolder {
+                    item_id: "lib-1".into(),
+                    name: "Movies".into(),
+                    collection_type: "movies".into(),
+                    locations: vec!["/data/movies".into()],
+                },
+                LibraryFolder {
+                    item_id: "lib-2".into(),
+                    name: "Shows".into(),
+                    collection_type: "tvshows".into(),
+                    locations: vec!["/data/tv".into()],
+                },
+            ],
+            scan,
+            on_action: move |_| {},
+        }
+    }
+}
+
+fn admin_tasks_after_scan() -> Element {
+    use pharos_ui::views::scan_progress::{ScanCounts, ScanEnd, ScanResult, ScanView};
+    rsx! {
+        AdminView {
+            users: Vec::<AdminUser>::new(),
+            current_user_id: "1".to_string(),
+            status: None,
+            active_tab: AdminTab::ScheduledTasks,
+            scan: ScanView {
+                last: Some(ScanResult {
+                    end: ScanEnd::Done,
+                    counts: ScanCounts { added: 3, changed: 1, removed: 0, failed_roots: 0 },
+                }),
+                ..ScanView::default()
+            },
+            on_action: move |_| {},
+        }
+    }
+}
+
+/// FR-701: the whole scan's bar on Libraries, a library's own bar in place
+/// of its Scan button, and a Scan button on the others.
+#[test]
+fn admin_libraries_show_scan_progress_and_a_scan_button_each() {
+    let html = render_root(admin_libraries_scanning);
+    assert!(html.contains("Scanning libraries… 42%"), "{html}");
+    assert!(html.contains(r#"aria-label="Scan Movies""#), "{html}");
+    assert!(!html.contains(r#"aria-label="Scan Shows""#), "{html}");
+    assert!(html.contains("Scanning… 50%"), "{html}");
+}
+
+#[test]
+fn admin_tasks_show_the_last_scans_result() {
+    let html = render_root(admin_tasks_after_scan);
+    assert!(
+        html.contains("Scan finished: added 3, changed 1, removed 0."),
+        "{html}"
+    );
 }
 
 #[test]
@@ -556,7 +635,10 @@ fn admin_view_logs_tab_renders_log_list() {
     assert!(html.contains(r#"data-tab="logs""#), "{html}");
     assert!(html.contains("pharos-admin-section-logs"), "{html}");
     assert!(html.contains("pharos.log"), "{html}");
-    assert!(html.contains("12345"), "{html}");
+    assert!(
+        html.contains("12345 bytes") && html.contains(">12 KiB<"),
+        "{html}"
+    );
 }
 
 fn admin_apikeys_with_new_secret() -> Element {
@@ -598,6 +680,11 @@ fn admin_view_apikeys_tab_surfaces_new_secret_and_revoke_button() {
     assert!(html.contains("pharos-admin-apikey-new"), "{html}");
     assert!(html.contains("secret-token-xyz"), "{html}");
     assert!(html.contains("pharos-admin-apikey-revoke"), "{html}");
+    // V881: Revoke asks first; the confirm is not shown until pressed.
+    assert!(
+        !html.contains("pharos-admin-apikey-revoke-confirm"),
+        "{html}"
+    );
     assert!(html.contains("cli"), "{html}");
     assert!(html.contains("2026-05-28T08:00:00Z"), "{html}");
 }
@@ -786,14 +873,16 @@ fn search_idle_with_hits() -> Element {
     let hits = vec![
         SearchHint {
             id: "1".into(),
-            name: "Blade Runner".into(),
+            name: "Film AB".into(),
             kind: ItemKind::Movie,
+            media_type: "Movie".into(),
             matched_term: "blade".into(),
         },
         SearchHint {
             id: "2".into(),
             name: "Vangelis - Tales".into(),
             kind: ItemKind::Audio,
+            media_type: "Audio".into(),
             matched_term: "vang".into(),
         },
     ];
@@ -848,7 +937,7 @@ fn search_error() -> Element {
 fn search_view_renders_input_and_grouped_hits() {
     let html = render_root(search_idle_with_hits);
     assert!(html.contains(r#"type="search""#), "{html}");
-    assert!(html.contains("Blade Runner"), "{html}");
+    assert!(html.contains("Film AB"), "{html}");
     assert!(html.contains("Vangelis - Tales"), "{html}");
     // Group headings present for both kinds.
     assert!(html.contains(">Video<"), "{html}");
@@ -883,7 +972,7 @@ fn detail_unplayed_no_position() -> Element {
         ItemDetailView {
             detail: ItemDetail {
                 id: "1".into(),
-                name: "Blade Runner".into(),
+                name: "Film AB".into(),
                 kind: ItemKind::Movie,
                 run_time_ticks: 117 * 60 * 10_000_000,
                 played: false,
@@ -932,12 +1021,12 @@ fn detail_audio() -> Element {
                 kind: ItemKind::Audio,
                 run_time_ticks: 3 * 60 * 10_000_000,
                 artists: vec!["Vangelis".into()],
-                album: Some("Blade Runner OST".into()),
+                album: Some("Film AB OST".into()),
                 album_artists: vec!["Vangelis".into()],
                 ..Default::default()
             },
             error: None,
-            primary_image_url: Some("/Items/5/Images/Primary?api_key=tok".into()),
+            primary_image_url: Some("/Items/5/Images/Primary".into()),
             on_action: move |_| {},
         }
     }
@@ -969,10 +1058,10 @@ fn detail_with_cast_overview_genres_backdrop() -> Element {
         ItemDetailView {
             detail: ItemDetail {
                 id: "33".into(),
-                name: "Blade Runner".into(),
+                name: "Film AB".into(),
                 kind: ItemKind::Movie,
                 run_time_ticks: 117 * 60 * 10_000_000,
-                overview: Some("A blade runner hunts replicants.".into()),
+                overview: Some("A tracker hunts androids.".into()),
                 genres: vec!["Sci-Fi".into(), "Drama".into()],
                 has_backdrop_image: true,
                 people: vec![
@@ -995,7 +1084,7 @@ fn detail_with_cast_overview_genres_backdrop() -> Element {
             },
             error: None,
             primary_image_url: None,
-            backdrop_image_url: Some("/Items/33/Images/Backdrop?api_key=tok".to_string()),
+            backdrop_image_url: Some("/Items/33/Images/Backdrop".to_string()),
             person_image_url_template: Some("/Items/{person_id}/Images/Primary".to_string()),
             on_action: move |_| {},
         }
@@ -1005,7 +1094,7 @@ fn detail_with_cast_overview_genres_backdrop() -> Element {
 #[test]
 fn detail_view_renders_title_runtime_and_play_button() {
     let html = render_root(detail_unplayed_no_position);
-    assert!(html.contains("Blade Runner"), "{html}");
+    assert!(html.contains("Film AB"), "{html}");
     assert!(html.contains("1h 57m"), "runtime missing: {html}");
     assert!(html.contains("pharos-detail-play"), "{html}");
     // No resume — Play (not Resume).
@@ -1037,7 +1126,7 @@ fn detail_view_audio_renders_artist_album_and_primary_image() {
     let html = render_root(detail_audio);
     assert!(html.contains("pharos-detail-audio-meta"), "{html}");
     assert!(html.contains("Vangelis"), "{html}");
-    assert!(html.contains("Blade Runner OST"), "{html}");
+    assert!(html.contains("Film AB OST"), "{html}");
     // album_artists same as artists → no separate line.
     assert!(
         !html.contains("Album artist:"),
@@ -1045,10 +1134,7 @@ fn detail_view_audio_renders_artist_album_and_primary_image() {
     );
     // Image figure rendered when primary_image_url set.
     assert!(html.contains("pharos-detail-primary"), "{html}");
-    assert!(
-        html.contains("/Items/5/Images/Primary?api_key=tok"),
-        "{html}"
-    );
+    assert!(html.contains("/Items/5/Images/Primary"), "{html}");
 }
 
 #[test]
@@ -1066,13 +1152,10 @@ fn detail_view_phase3_renders_backdrop_overview_genres_cast() {
     let html = render_root(detail_with_cast_overview_genres_backdrop);
     // Backdrop image
     assert!(html.contains("pharos-detail-backdrop"), "{html}");
-    assert!(
-        html.contains("/Items/33/Images/Backdrop?api_key=tok"),
-        "{html}"
-    );
+    assert!(html.contains("/Items/33/Images/Backdrop"), "{html}");
     // Overview text
     assert!(html.contains("pharos-detail-overview"), "{html}");
-    assert!(html.contains("A blade runner hunts replicants."), "{html}");
+    assert!(html.contains("A tracker hunts androids."), "{html}");
     // Genres
     assert!(html.contains("pharos-detail-genres"), "{html}");
     assert!(html.contains("Sci-Fi, Drama"), "{html}");
@@ -1393,6 +1476,9 @@ fn privacy_page_with(diagnostics: bool) -> Element {
             diagnostics,
             diagnostics_key: 0,
             on_diagnostics: |_| {},
+            reports: Vec::new(),
+            on_report: |_| {},
+            on_delete_report: |_| {},
         }
     }
 }

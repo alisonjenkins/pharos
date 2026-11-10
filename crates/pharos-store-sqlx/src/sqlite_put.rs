@@ -21,24 +21,24 @@ pub(crate) const PUT_COLUMNS: &str = "id, path, title, kind, \
     community_rating, critic_rating, official_rating, production_year, \
     premiere_date, overview, tagline, provider_ids, \
     production_locations_json, trailers_json, \
-    series_folder, series_year, track_number, disc_number, release_year, \
+    series_folder, series_year, series_key, track_number, disc_number, release_year, \
     synopsis, content_rating, network, release_date, title_fold, \
     original_language, \
     book_format, book_page_count, book_author, book_publisher, \
     book_series, book_series_index, book_isbn, sort_name, alternate_sources_json, video_3d_format, has_3d";
 
-pub(crate) const PUT_COLUMN_COUNT: usize = 65;
+pub(crate) const PUT_COLUMN_COUNT: usize = 66;
 
 /// Rows per `INSERT`. SQLite caps bound variables at 32766 per statement.
-pub(crate) const MAX_ROWS_PER_STATEMENT: usize = 500;
+pub(crate) const MAX_ROWS_PER_STATEMENT: usize = 495;
 const _: () = assert!(MAX_ROWS_PER_STATEMENT * PUT_COLUMN_COUNT <= 32_766);
 
 /// `created_at` keeps the value already stored (rows that predate migration
 /// 0010 have none, hence the COALESCE).
 pub(crate) const PUT_CONFLICT_UPDATE: &str = "path = excluded.path,
-    title = excluded.title,
-    title_fold = excluded.title_fold,
-    sort_name = excluded.sort_name,
+    title = CASE WHEN (media_items.locked_fields & 1) <> 0 THEN media_items.title ELSE excluded.title END,
+    title_fold = CASE WHEN (media_items.locked_fields & 1) <> 0 THEN media_items.title_fold ELSE excluded.title_fold END,
+    sort_name = CASE WHEN (media_items.locked_fields & 3) <> 0 THEN media_items.sort_name ELSE excluded.sort_name END,
     kind = excluded.kind,
     size_bytes = excluded.size_bytes,
     duration_ms = excluded.duration_ms,
@@ -68,13 +68,13 @@ pub(crate) const PUT_CONFLICT_UPDATE: &str = "path = excluded.path,
     color_space = excluded.color_space,
     audio_tracks_json = excluded.audio_tracks_json,
     attachments_json = excluded.attachments_json,
-    community_rating = excluded.community_rating,
-    critic_rating = excluded.critic_rating,
-    official_rating = excluded.official_rating,
-    production_year = excluded.production_year,
-    premiere_date = excluded.premiere_date,
-    overview = excluded.overview,
-    tagline = excluded.tagline,
+    community_rating = CASE WHEN (media_items.locked_fields & 128) <> 0 THEN media_items.community_rating ELSE excluded.community_rating END,
+    critic_rating = CASE WHEN (media_items.locked_fields & 256) <> 0 THEN media_items.critic_rating ELSE excluded.critic_rating END,
+    official_rating = CASE WHEN (media_items.locked_fields & 64) <> 0 THEN media_items.official_rating ELSE excluded.official_rating END,
+    production_year = CASE WHEN (media_items.locked_fields & 16) <> 0 THEN media_items.production_year ELSE excluded.production_year END,
+    premiere_date = CASE WHEN (media_items.locked_fields & 32) <> 0 THEN media_items.premiere_date ELSE excluded.premiere_date END,
+    overview = CASE WHEN (media_items.locked_fields & 4) <> 0 THEN media_items.overview ELSE excluded.overview END,
+    tagline = CASE WHEN (media_items.locked_fields & 8) <> 0 THEN media_items.tagline ELSE excluded.tagline END,
     provider_ids = excluded.provider_ids,
     production_locations_json = excluded.production_locations_json,
     original_language = excluded.original_language,
@@ -90,7 +90,13 @@ pub(crate) const PUT_CONFLICT_UPDATE: &str = "path = excluded.path,
     has_3d = excluded.has_3d,
     trailers_json = excluded.trailers_json,
     series_folder = excluded.series_folder,
-    series_year = excluded.series_year,
+    series_year = CASE WHEN excluded.series_key IS NULL
+            AND media_items.series_folder IS excluded.series_folder
+        THEN COALESCE(media_items.series_year, excluded.series_year)
+        ELSE excluded.series_year END,
+    series_key = CASE WHEN excluded.series_key IS NOT NULL THEN excluded.series_key
+        WHEN media_items.series_folder IS excluded.series_folder THEN media_items.series_key
+        ELSE NULL END,
     track_number = excluded.track_number,
     disc_number = excluded.disc_number,
     release_year = excluded.release_year,
@@ -130,6 +136,10 @@ pub(crate) fn bind_item<'q>(q: Q<'q>, item: &'q MediaItem) -> DomainResult<Q<'q>
         .as_ref()
         .and_then(|s| s.series_folder.as_deref());
     let series_year = item.series.as_ref().and_then(|s| s.series_year);
+    // Spec 033 — `None` keeps a split key the row already holds (a writer
+    // that did not decide the grouping must not undo it); NULL reads as the
+    // folder.
+    let series_key = item.series.as_ref().and_then(|s| s.series_key.as_deref());
     let subtitle_tracks_json = crate::subtitle_track_json::encode(&p.subtitle_tracks);
     let attachments_json = crate::attachment_json::encode(&p.attachments);
     let chapters_json = crate::chapter_json::encode(&p.chapters);
@@ -193,6 +203,7 @@ pub(crate) fn bind_item<'q>(q: Q<'q>, item: &'q MediaItem) -> DomainResult<Q<'q>
         .bind(trailers_json)
         .bind(series_folder)
         .bind(series_year.map(|v| v as i64))
+        .bind(series_key)
         .bind(p.track_number.map(|v| v as i64))
         .bind(p.disc_number.map(|v| v as i64))
         .bind(p.year.map(|v| v as i64))
@@ -247,6 +258,17 @@ mod tests {
         for col in columns().into_iter().filter(|c| *c != "id") {
             let assign = if col == "created_at" {
                 "created_at = COALESCE(media_items.created_at, excluded.created_at)".to_string()
+            } else if col == "series_key" {
+                // Spec 033: kept unless the writer names one; see the put.
+                "series_key = CASE WHEN excluded.series_key IS NOT NULL".to_string()
+            } else if col == "series_year" {
+                "series_year = CASE WHEN excluded.series_key IS NULL".to_string()
+            } else if let Some(bits) = crate::metadata_edit::item_column_guard(col) {
+                // ADR-0097: an admin-locked column keeps its stored value.
+                format!(
+                    "{col} = CASE WHEN (media_items.locked_fields & {bits}) <> 0 \
+                     THEN media_items.{col} ELSE excluded.{col} END"
+                )
             } else {
                 format!("{col} = excluded.{col}")
             };

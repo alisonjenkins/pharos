@@ -6,6 +6,8 @@
 
 #[path = "../common/mod.rs"]
 mod common;
+#[path = "../common/store_calls.rs"]
+mod store_calls;
 
 mod avatar;
 mod bootstrap;
@@ -14,19 +16,26 @@ mod client_api;
 mod client_group;
 mod connect;
 mod connection_close;
+mod damage;
 mod detail_subtitle_scripts;
+mod events;
 mod gate;
 mod group;
 mod library;
 mod limits;
 mod login;
 mod lyrics;
+mod manage_token;
 mod media_token;
 mod mix;
+mod my_devices;
 mod password;
+mod person;
 mod playback;
 mod prefs;
 mod quick_connect;
+mod read_position;
+mod report;
 mod revocation;
 mod revocation_sites;
 mod session;

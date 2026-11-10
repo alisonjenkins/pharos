@@ -2,7 +2,7 @@
 
 **Feature directory**: `specs/011-ui-input/`
 **Created**: 2026-11-01
-**Status**: draft (`/speckit-specify` stage; next: `/speckit-clarify`)
+**Status**: partly implemented 2026-11-04..08 (palette, key layer; spec 029 owns the keyboard modes); focus manager, remap, multi-select, gamepad open (see Progress, audited 2026-11-09)
 **Input**: "Efficient for use via keyboard and mouse." (Alison, 2026-11-01)
 **Depends on**: 009 (router, shell, focus ring)
 
@@ -118,3 +118,16 @@ controls). Gamepad as a spatial-navigation source `[NEEDS CLARIFICATION: in v1?]
 - Browser-reserved shortcuts (Ctrl+W, Ctrl+T) are never bound.
 - Focus target removed by a live update (009 FR-004): focus moves to nearest
   neighbour, not to `<body>`.
+
+## Progress (audited 2026-11-09)
+
+Largely re-scoped by spec 029 (keyboard modes), owned elsewhere. Evidence is `crates/pharos-ui/src/native/`.
+
+- US1 spatial navigation: partial. Tab/arrow focus with a focus ring and `?`-style which-key help; no per-route focus tree with named zones (FR-001) found.
+- US2 command palette: partial. Ctrl+K palette (`palette.rs`, b8995022 replacing the find screen; #549, #881 recent searches, #892, #898 word search with typos); action search and execution (e.g. switch theme) are missing.
+- US3 single-key actions: done (`keymap.rs` `BINDINGS`, `keys.rs`; #871, #888).
+- US4 player keys: done (#607 wheel volume/seek, #879 k/j volume, #888 player keys from anywhere, #890 keys survive sliders).
+- US5 mouse efficiency: partial (hover on cards, `oncontextmenu` shortcuts in `listen.rs`, wheel/Shift-click on players).
+- US6 multi-select and bulk actions: not started.
+- US7 remap and inspect: partial. Inspect via generated key help (FR-005); no user remap or persisted bindings (FR-008).
+- US8 media keys and gamepads: partial. Media Session handlers in `native/web.rs` (FR-009); no gamepad support found.

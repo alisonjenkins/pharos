@@ -14,9 +14,124 @@ use pharos_jellyfin_api::device_profile::{
 };
 
 use crate::api::jellyfin::dto::container_for;
+use crate::api::jellyfin::media_source;
 use crate::api::jellyfin::subtitle_delivery::{decide_subtitle_delivery, SubtitleDelivery};
 use crate::api::jellyfin::subtitles::is_image_subtitle_codec;
 use crate::state::AppState;
+
+/// The named-config key holding one device's audio codec deny list (T130).
+pub fn denied_audio_codecs_key(device_id: &str) -> String {
+    format!("devaudionodirect:{device_id}")
+}
+
+/// At most this many codecs per device: the real set is a handful of
+/// bitstream formats (ac3, eac3, truehd, dts), so more is a malformed request.
+pub const MAX_DENIED_AUDIO_CODECS: usize = 16;
+
+/// Why a deny list was refused, naming the offending value.
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+pub enum DeniedCodecsError {
+    #[error("{count} codecs given; at most {MAX_DENIED_AUDIO_CODECS} allowed")]
+    TooMany { count: usize },
+    #[error("codec {codec:?} is not a codec name (1-16 of a-z, 0-9, _ or -)")]
+    BadName { codec: String },
+    /// Every conversion path ends in AAC (the HLS segment encoder makes AAC
+    /// whatever target the negotiator names), so denying it cannot be honoured.
+    #[error("{CONVERSION_AUDIO_CODEC} is what turned-off codecs are converted to, so it cannot be turned off")]
+    ConversionTarget,
+}
+
+/// The codec a denied one is converted to.
+pub const CONVERSION_AUDIO_CODEC: &str = "aac";
+
+/// A deny list as stored: lowercased, trimmed, deduplicated and sorted, so the
+/// same set always reads back the same. Blank entries are dropped.
+pub fn normalise_denied_audio_codecs(codecs: &[String]) -> Result<Vec<String>, DeniedCodecsError> {
+    let set: BTreeSet<String> = codecs
+        .iter()
+        .map(|c| c.trim().to_ascii_lowercase())
+        .filter(|c| !c.is_empty())
+        .collect();
+    if let Some(bad) = set.iter().find(|c| {
+        c.len() > 16
+            || !c
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
+    }) {
+        return Err(DeniedCodecsError::BadName { codec: bad.clone() });
+    }
+    if set.contains(CONVERSION_AUDIO_CODEC) {
+        return Err(DeniedCodecsError::ConversionTarget);
+    }
+    if set.len() > MAX_DENIED_AUDIO_CODECS {
+        return Err(DeniedCodecsError::TooMany { count: set.len() });
+    }
+    Ok(set.into_iter().collect())
+}
+
+/// The audio codecs `device_id` must not direct-play. Empty when none are set,
+/// and also when the stored value cannot be read: the client's own claim then
+/// stands, which is how it played before the setting existed.
+///
+/// A list saved before [`CONVERSION_AUDIO_CODEC`] was refused can still hold
+/// it. It is dropped here, so the device list never shows it and the next
+/// save, which sends the whole list back, is not refused for it.
+pub async fn denied_audio_codecs(state: &AppState, device_id: &str) -> Vec<String> {
+    match try_denied_audio_codecs(state, device_id).await {
+        Ok(codecs) => codecs,
+        Err(e) => {
+            tracing::warn!(device.id = device_id, error = %e, "device audio deny list unreadable");
+            Vec::new()
+        }
+    }
+}
+
+/// [`denied_audio_codecs`], but a store that cannot be read is an error, not
+/// an empty list. A settings listing uses this: showing an empty list there
+/// would let the next toggle, which saves the whole list, wipe the stored one.
+pub async fn try_denied_audio_codecs(
+    state: &AppState,
+    device_id: &str,
+) -> Result<Vec<String>, String> {
+    use pharos_store_sqlx::ServerConfigStore as _;
+    let key = denied_audio_codecs_key(device_id);
+    let raw = match state.stores.load_named_config(&key).await {
+        Ok(Some(raw)) => raw,
+        Ok(None) => return Ok(Vec::new()),
+        Err(e) => return Err(e.to_string()),
+    };
+    Ok(match serde_json::from_str::<Vec<String>>(&raw) {
+        Ok(mut codecs) => {
+            let before = codecs.len();
+            codecs.retain(|c| !c.eq_ignore_ascii_case(CONVERSION_AUDIO_CODEC));
+            if codecs.len() != before {
+                tracing::warn!(
+                    device.id = device_id,
+                    codec = CONVERSION_AUDIO_CODEC,
+                    "device audio deny list holds the conversion codec; ignoring it"
+                );
+            }
+            codecs
+        }
+        Err(e) => {
+            tracing::warn!(device.id = device_id, value = %raw, error = %e, "device audio deny list is not a JSON list");
+            Vec::new()
+        }
+    })
+}
+
+/// [`denied_audio_codecs`] for the device `token` was issued to.
+pub async fn denied_audio_codecs_for_token(state: &AppState, token: &str) -> Vec<String> {
+    use pharos_core::TokenStore as _;
+    match state.stores.device_for_token(token).await {
+        Ok(Some(device)) => denied_audio_codecs(state, &device).await,
+        Ok(None) => Vec::new(),
+        Err(e) => {
+            tracing::warn!(error = %e, "device lookup for the audio deny list failed");
+            Vec::new()
+        }
+    }
+}
 
 /// Which delivery paths a PlaybackInfo request allows; everything is allowed
 /// unless the body says `false`.
@@ -126,7 +241,7 @@ impl Negotiated {
 
     /// Counts the verdict, so "how many sessions are transcoding, and for what
     /// reason" is a query rather than a log trawl. Label cardinality is
-    /// bounded: 4 decisions × 8 block reasons × 5 downgrades (`none` plus the
+    /// bounded: 4 decisions × 10 block reasons × 5 downgrades (`none` plus the
     /// four in [`Negotiated::downgrade`]).
     pub fn record(&self) {
         metrics::counter!(
@@ -224,17 +339,26 @@ pub fn negotiate(state: &AppState, item: &MediaItem, req: &NegotiateRequest<'_>)
     // constructed, but a lie about the client, and indistinguishable on the
     // dashboard from the real "clients are sending nothing" failure.
     let remote = item.origin().is_remote();
+    // Spec 037 — a split film's file is only its first part, so it can no
+    // more be direct played or remuxed from `/stream` than a URL can: it
+    // plays as one film through HLS, which runs on into each part (V1155).
+    let split_parts = (item.edition.is_none() && !probe.parts().is_empty()).then(|| {
+        u32::try_from(probe.parts().len())
+            .unwrap_or(u32::MAX)
+            .saturating_add(1)
+    });
     let mut video_range_unenforced = None;
-    let (decision, direct_play_block) = if remote {
+    let (decision, direct_play_block) = if remote || split_parts.is_some() {
         let mut forced = profile.clone();
         forced.direct_play_profiles.clear();
         let (d, _) = negotiate_explained(&forced, &source, &server_codecs);
-        (
-            d,
-            DirectPlayBlock::RemoteSource {
+        let block = match split_parts {
+            Some(parts) if !remote => DirectPlayBlock::SplitFilm { parts },
+            _ => DirectPlayBlock::RemoteSource {
                 locator: item.path.display().to_string(),
             },
-        )
+        };
+        (d, block)
     } else {
         let verdict = negotiate_explained(profile, &source, &server_codecs);
         if !state.enforce_video_range {
@@ -245,6 +369,16 @@ pub fn negotiate(state: &AppState, item: &MediaItem, req: &NegotiateRequest<'_>)
         }
         verdict
     };
+    if !profile.denied_audio_codecs.is_empty() {
+        tracing::info!(
+            media.id = item.id,
+            audio.codec = source.audio_codec.as_deref().unwrap_or("none"),
+            denied = ?profile.denied_audio_codecs,
+            applied = profile.denies_audio(source.audio_codec.as_deref()),
+            direct_play_block = %direct_play_block,
+            "device audio codec deny list consulted"
+        );
+    }
     // Which post-negotiation override (if any) replaced the negotiator's
     // decision. These fire AFTER `negotiate` and can turn a DirectPlay into a
     // transcode, so a log carrying only the negotiator's reason would name a
@@ -289,13 +423,13 @@ pub fn negotiate(state: &AppState, item: &MediaItem, req: &NegotiateRequest<'_>)
         source.video_codec.as_deref(),
         source.audio_codec.as_deref(),
         &profile.direct_play_profiles,
-    );
+    ) && !profile.denies_audio(source.audio_codec.as_deref());
     // B80 (Lace incident, 2026-07-16) — a browser's <video>/MSE cannot demux a
     // raw Matroska container. When the negotiator returned DirectPlay for a
     // Matroska source to a browser that CANNOT play the `video/webm` relabel
     // (e.g. AV1 + AAC, or h264-in-mkv), advertising SupportsDirectStream with NO
     // TranscodingUrl stranded the client: jellyfin-web silently retried
-    // PlaybackInfo for ~11 min (Supergirl S01E05, av1-in-mkv) before recovering.
+    // PlaybackInfo for ~11 min (Show AI S01E05, av1-in-mkv) before recovering.
     // Downgrade to a transcode so a fallback URL is emitted and
     // SupportsDirectStream resolves false. The generic H.264/AAC target is
     // refined downstream — a Linux-Firefox that can't decode H.264 is redirected
@@ -474,8 +608,10 @@ pub fn negotiate(state: &AppState, item: &MediaItem, req: &NegotiateRequest<'_>)
     // by EnableDirectPlay=false still has a raw stream to offer. A forbidden
     // video copy takes the raw stream away (Jellyfin: `!enableDirectStream ||
     // !allowVideoStreamCopy`).
+    // A split film's raw file is its first part only (V1155).
     let supports_direct_stream = switches.direct_stream
         && switches.video_copy
+        && split_parts.is_none()
         && (pre_switch_decision.is_direct()
             || (matches!(
                 pre_switch_decision,
@@ -719,7 +855,7 @@ pub(crate) fn resolve_selected_subtitle<'a>(
         // take p50 5380 ms / p95 10995 ms to produce 6000 ms of video, i.e.
         // ABOVE REALTIME at the p95. The encoder cannot stay ahead of the
         // player, the buffer starves, the client restarts, and each restart
-        // asks for more burns. Observed live 2026-08-16 on Black Panther:
+        // asks for more burns. Observed live 2026-08-16 on Film S:
         // `subtitle.requested: None, subtitle.resolved: Some(2),
         // subtitle.codec: hdmv_pgs_subtitle, subtitle.delivery: Burn`, with
         // one segment re-fetched 118 times and 22 play sessions in 15
@@ -752,7 +888,7 @@ pub(crate) fn resolve_selected_subtitle<'a>(
 /// never flagged default — but disagreeing about whether THAT answer is
 /// affordable is what let `DefaultSubtitleStreamIndex` point at a track the
 /// burn path had separately and silently declined to ever deliver, live
-/// 2026-08-29 (Code Geass: the container-default PGS track was a sparse
+/// 2026-08-29 (Show U: the container-default PGS track was a sparse
 /// signs/songs-only track; jellyfin-web pre-selected it as "English" and
 /// nothing rendered during dialogue).
 ///
@@ -764,7 +900,7 @@ pub(crate) fn resolve_selected_subtitle<'a>(
 /// PGS/VOBSUB is the measured expensive case and is what this rule is about.
 ///
 /// By FORCED: a forced track is not a convenience, it is dialogue the viewer
-/// cannot follow without — B44's Avatar case, where the Na'vi sections played
+/// cannot follow without — B44's Film BA case, where the alien-language sections played
 /// unsubtitled until the default+forced PGS was baked in. Its cost is the
 /// price of an intelligible film, and it is bounded: forced tracks cover a
 /// fraction of the runtime. What this declines is the UNFORCED image
@@ -854,15 +990,18 @@ pub struct DeliveryRequest<'a> {
     pub item_wire_id: &'a str,
     /// `&MediaSourceId=…` when one edition was asked for, else empty.
     pub source_param: &'a str,
+    /// The URL's credential: the transcode routes accept it in place of a
+    /// token (V1050), so no URL carries one.
     pub play_session_id: &'a str,
-    /// The Jellyfin API puts the token in the URL; the native API does not.
-    pub api_key: Option<&'a str>,
     pub audio_stream_index: Option<String>,
     pub explicit_subtitle_index: Option<i64>,
     pub is_web_client: bool,
     pub resume_ticks: u64,
     /// The client's `EnableTranscoding` switch.
     pub transcoding: bool,
+    /// The client's `MaxWidth` / `MaxHeight`, baked into the master URL so the
+    /// cold-start prewarm and the segment requests plan the same output size.
+    pub size_limits: pharos_transcode::SizeLimits,
 }
 
 /// The segmented delivery of a negotiated playback.
@@ -877,10 +1016,6 @@ pub struct Delivery {
 /// master for video, the universal endpoint for audio.
 pub fn delivery(n: &Negotiated, r: &DeliveryRequest<'_>) -> Delivery {
     let renditions = renditions(n, r);
-    let api_key = r
-        .api_key
-        .map(|k| format!("&api_key={k}"))
-        .unwrap_or_default();
     let (id, psid, source) = (r.item_wire_id, r.play_session_id, r.source_param);
     let transcoding_url = match (&n.decision, n.is_video) {
         (Decision::DirectPlay, _) => None,
@@ -889,13 +1024,14 @@ pub fn delivery(n: &Negotiated, r: &DeliveryRequest<'_>) -> Delivery {
         // client's own isTypeSupported pick; the PlaySessionId lets the
         // segment handlers reuse the registered decision (P9, B77).
         (Decision::VideoRemux { .. }, _) | (_, true) => Some(format!(
-            "/videos/{id}/master.m3u8?PlaySessionId={psid}{api_key}&renditions={}{}{}{source}",
+            "/videos/{id}/master.m3u8?PlaySessionId={psid}&renditions={}{}{}{}{source}",
             renditions.join(","),
             stream_selection(n, r),
             video_bitrate_param(n),
+            r.size_limits.query_suffix(),
         )),
         (_, false) => Some(format!(
-            "/audio/{id}/universal?PlaySessionId={psid}{api_key}{source}"
+            "/audio/{id}/universal?PlaySessionId={psid}{source}"
         )),
     }
     .filter(|_| r.transcoding)
@@ -1024,7 +1160,7 @@ pub async fn pick_audio(
     explicit: Option<u32>,
 ) -> AudioPick {
     // Which tracks THIS user should start on. Until now this was "the first
-    // audio stream in the container", which is how Aliens — three Ukrainian
+    // audio stream in the container", which is how Film AL — three Ukrainian
     // tracks ahead of its English DTS-HD MA — played in Ukrainian every time.
     // The preferences have been stored per user since `/Users/{id}/Configuration`
     // existed; this is the first thing to read them.
@@ -1061,11 +1197,17 @@ pub async fn pick_audio(
     // What this user last played THIS item with. An explicit choice they made
     // outranks any language rule — it is the same person, saying the same
     // thing, one session later.
-    let remembered = state
+    let mut remembered = state
         .stores
         .get_user_data(user.id, item.id)
         .await
         .unwrap_or_default();
+    // A remembered index names a stream of the primary file; in a version
+    // (another file, another stream layout) it can name another track.
+    if item.edition.is_some() {
+        remembered.audio_stream_index = None;
+        remembered.subtitle_stream_index = None;
+    }
     let remembered_audio = track_prefs
         .remember_audio
         .then_some(remembered.audio_stream_index)
@@ -1089,10 +1231,10 @@ pub async fn pick_audio(
             .and_then(|s| s.language.clone())
     });
     // ODD: the audio pick was invisible — diagnosing a wrong-language start
-    // (Jana's Code Geass playing English, 2026-07-26) took a hand DB read.
+    // (A viewer's Show U playing English, 2026-07-26) took a hand DB read.
     // Record the decision: the resolved preference inputs, EVERY candidate with
     // its language + default flag (the flag is what beats a language preference
-    // when prefer_default is on — the Aliens / Code Geass trap), and the chosen
+    // when prefer_default is on — the Film AL / Show U trap), and the chosen
     // index/language/source. A surprising pick is now one query away from its
     // reason. `chosen_index` uses -1 for "no audio" so the field stays numeric.
     {
@@ -1175,7 +1317,7 @@ pub fn pick_subtitle(
     // The re-selection was the client obeying this field, which is why turning
     // subtitles off appeared to do nothing on Google TV. An explicit pick is
     // echoed back; explicit off answers None; only an absent field falls
-    // through to the container's own preference (so B44's forced-Na'vi track
+    // through to the container's own preference (so B44's forced-alien-language track
     // and B104's default ASS are untouched).
     match explicit {
         // The client stated a choice on THIS request — echo it back, including
@@ -1380,6 +1522,8 @@ pub struct GrantRequest<'a> {
     /// The session's device token: the playback ends with it (B256).
     pub token: &'a str,
     pub client_is_remote: bool,
+    /// A version's id (`AlternateMediaSource::id`); empty plays the primary.
+    pub version: &'a str,
 }
 
 /// A playback a native player may start: the stream capability and the
@@ -1395,6 +1539,9 @@ pub struct Grant {
     pub audio_stream_index: Option<u32>,
     /// The subtitle it starts with; `None` is off.
     pub subtitle_stream_index: Option<u32>,
+    /// Whether the tracks this playback reports may be remembered for the
+    /// item: only the primary file's, whose stream indexes they name.
+    pub remembers_tracks: bool,
 }
 
 #[derive(Debug)]
@@ -1403,6 +1550,148 @@ pub enum GrantError {
     Item(crate::services::library::DetailError),
     /// A book is read, not streamed (004-books).
     NotPlayable,
+    Version(VersionError),
+}
+
+/// Why a native player cannot have the version it named.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VersionError {
+    /// Not one of the item's editions or copies.
+    NoSuchVersion,
+    /// Stored before editions kept their own probe (ADR-0030), so it cannot
+    /// be served until a rescan.
+    Unprobed,
+}
+
+/// `item` as the file `version` names: the primary for an empty id, else a
+/// grouped edition or copy, its path and probe swapped in by
+/// [`media_source::select`] under the item's own id. Unlike a Jellyfin
+/// client's `MediaSourceId`, an edition that cannot be served is refused
+/// rather than replaced by the primary: a player that asked for a 3D file
+/// would draw a 2D one as 3D.
+pub(crate) fn select_version(
+    route: media_source::Route,
+    item: MediaItem,
+    version: &str,
+) -> Result<MediaItem, VersionError> {
+    if version.is_empty() {
+        return Ok(item);
+    }
+    let raw = format!(
+        "{}-{version}",
+        pharos_jellyfin_api::dto::wire_item_id(item.id)
+    );
+    if media_source::classify(&item, Some(&raw)).0 != media_source::Requested::Alternate {
+        tracing::info!(
+            media.id = item.id,
+            route = route.label(),
+            version,
+            "asked for a version the item does not have"
+        );
+        return Err(VersionError::NoSuchVersion);
+    }
+    let item = media_source::select(route, item, Some(&raw));
+    if item.edition.is_none() {
+        return Err(VersionError::Unprobed);
+    }
+    Ok(item)
+}
+
+/// The item `id` a native player may start, with the user's play state.
+async fn playable_item(
+    state: &AppState,
+    user: &pharos_core::User,
+    id: u64,
+) -> Result<(MediaItem, pharos_core::UserItemData), GrantError> {
+    let (item, user_data) = crate::services::library::detail(state, user, id)
+        .await
+        .map_err(GrantError::Item)?;
+    if matches!(item.kind, MediaKind::Book) {
+        return Err(GrantError::NotPlayable);
+    }
+    Ok((item, user_data))
+}
+
+/// The tracks a playback starts on, as [`pick_tracks`] chose them.
+pub struct TrackPick {
+    pub audio: AudioPick,
+    /// The subtitle the negotiation asks for, after the styled-track mapping.
+    pub requested_subtitle: Option<i64>,
+    /// The subtitle picked from the source's tracks; `None` is off.
+    pub subtitle: Option<u32>,
+    /// The styled track's own index, when the playback starts on one.
+    pub styled_pick: Option<u32>,
+}
+
+/// Picks the tracks `item` starts on: the explicit pick on the request, else
+/// the user's remembered pick for this item, else their language rules.
+/// `None` names the default. Shared by `grant` and `start_tracks`, so the
+/// tracks a title page shows are the ones the playback starts on.
+async fn pick_tracks(
+    state: &AppState,
+    user: &pharos_core::User,
+    item: &MediaItem,
+    streams: &[pharos_jellyfin_api::dto::MediaStreamDto],
+    subtitle_profiles: &[SubtitleProfileDto],
+    audio_explicit: Option<u32>,
+    subtitle_explicit: Option<i64>,
+) -> TrackPick {
+    let audio = pick_audio(state, user, item, streams, audio_explicit).await;
+    // A remembered pick counts as the player's own: the grant echoes the
+    // styled index, so that is what the player reports and gets remembered.
+    let stated_subtitle = subtitle_explicit.or_else(|| {
+        audio
+            .prefs
+            .remember_subtitle
+            .then_some(audio.remembered.subtitle_stream_index)
+            .flatten()
+            .map(i64::from)
+    });
+    let (requested_subtitle, styled_pick) =
+        crate::styled_track::negotiation_choice(&state.stores, item, stated_subtitle).await;
+    let subtitle = pick_subtitle(
+        &audio,
+        streams,
+        &item.probe,
+        subtitle_profiles,
+        requested_subtitle,
+    );
+    let styled_pick = match (styled_pick, stated_subtitle, subtitle) {
+        (None, None, Some(source)) => {
+            crate::styled_track::default_pick(&state.stores, item, source).await
+        }
+        (picked, _, _) => picked,
+    };
+    TrackPick {
+        audio,
+        requested_subtitle,
+        subtitle,
+        styled_pick,
+    }
+}
+
+/// The audio and subtitle `grant` would start `id` on for a default
+/// negotiation with `capabilities`. Opens no session.
+pub async fn start_tracks(
+    state: &AppState,
+    user: &pharos_core::User,
+    id: u64,
+    capabilities: &Capabilities,
+) -> Result<(Option<u32>, Option<u32>), GrantError> {
+    let (item, _) = playable_item(state, user, id).await?;
+    let profile = capabilities.profile(crate::services::watch::extracts_image_subtitles(state));
+    let streams = crate::services::watch::streams(&item).await;
+    let picked = pick_tracks(
+        state,
+        user,
+        &item,
+        &streams,
+        &profile.subtitle_profiles,
+        None,
+        None,
+    )
+    .await;
+    Ok((picked.audio.index, picked.styled_pick.or(picked.subtitle)))
 }
 
 /// Negotiates `id` for a native player and registers the session that
@@ -1414,38 +1703,37 @@ pub async fn grant(
     id: u64,
     r: &GrantRequest<'_>,
 ) -> Result<Grant, GrantError> {
-    let (item, user_data) = crate::services::library::detail(state, user, id)
-        .await
-        .map_err(GrantError::Item)?;
-    if matches!(item.kind, MediaKind::Book) {
-        return Err(GrantError::NotPlayable);
-    }
-    let profile = r
+    let (item, user_data) = playable_item(state, user, id).await?;
+    let item = select_version(media_source::Route::Negotiate, item, r.version)
+        .map_err(GrantError::Version)?;
+    let item_wire_id = pharos_jellyfin_api::dto::wire_item_id(id);
+    // The `{item}-{edition}` id PlaybackInfo hands Jellyfin clients, so the
+    // stream and playlist routes read the version's file.
+    let source_param = item
+        .edition
+        .as_deref()
+        .map(|e| format!("&MediaSourceId={item_wire_id}-{e}"))
+        .unwrap_or_default();
+    let mut profile = r
         .capabilities
         .profile(crate::services::watch::extracts_image_subtitles(state));
-    // The same start tracks PlaybackInfo picks: the user's remembered track,
-    // else their language rules.
+    profile.denied_audio_codecs = denied_audio_codecs_for_token(state, r.token).await;
     let streams = crate::services::watch::streams(&item).await;
-    let audio = pick_audio(state, user, &item, &streams, r.audio_stream_index).await;
-    // A remembered pick counts as the player's own: the grant echoes the
-    // styled index, so that is what the player reports and gets remembered.
-    let stated_subtitle = r.subtitle_stream_index.or_else(|| {
-        audio
-            .prefs
-            .remember_subtitle
-            .then_some(audio.remembered.subtitle_stream_index)
-            .flatten()
-            .map(i64::from)
-    });
-    let (requested_subtitle, styled_pick) =
-        crate::styled_track::negotiation_choice(&state.stores, &item, stated_subtitle).await;
-    let subtitle = pick_subtitle(
-        &audio,
-        &streams,
-        &item.probe,
-        &profile.subtitle_profiles,
+    let TrackPick {
+        audio,
         requested_subtitle,
-    );
+        subtitle,
+        styled_pick,
+    } = pick_tracks(
+        state,
+        user,
+        &item,
+        &streams,
+        &profile.subtitle_profiles,
+        r.audio_stream_index,
+        r.subtitle_stream_index,
+    )
+    .await;
     // The decision names these tracks, so the stream must carry them: the
     // picked subtitle (or none) is what gets burned, and an audio track other
     // than the one a player starts on cannot direct play.
@@ -1466,7 +1754,6 @@ pub async fn grant(
         },
     );
     let play_session_id = uuid::Uuid::new_v4().simple().to_string();
-    let item_wire_id = pharos_jellyfin_api::dto::wire_item_id(id);
     let resume_ticks = if user_data.played {
         0
     } else {
@@ -1474,7 +1761,7 @@ pub async fn grant(
     };
     let stream_url = match negotiated.decision {
         Decision::DirectPlay => format!(
-            "/{}/{item_wire_id}/stream?static=true&tag={play_session_id}",
+            "/{}/{item_wire_id}/stream?static=true&tag={play_session_id}{source_param}",
             if negotiated.is_video {
                 "videos"
             } else {
@@ -1487,14 +1774,14 @@ pub async fn grant(
                 profile: &profile,
                 probe: &item.probe,
                 item_wire_id: &item_wire_id,
-                source_param: "",
+                source_param: &source_param,
                 play_session_id: &play_session_id,
-                api_key: None,
                 audio_stream_index: audio.index.map(|i| i.to_string()),
                 explicit_subtitle_index: requested_subtitle,
                 is_web_client: false,
                 resume_ticks,
                 transcoding: true,
+                size_limits: pharos_transcode::SizeLimits::default(),
             },
         )
         .transcoding_url
@@ -1525,6 +1812,8 @@ pub async fn grant(
         client_is_remote = r.client_is_remote,
         audio_index = audio.index.map(i64::from).unwrap_or(-1),
         subtitle_index = subtitle.map(i64::from).unwrap_or(-1),
+        edition = item.edition.as_deref().unwrap_or("primary"),
+        stereo = item.probe.video_3d_format.map_or("none", |f| f.wire_name()),
         "native playback negotiated"
     );
     Ok(Grant {
@@ -1534,6 +1823,7 @@ pub async fn grant(
         stream_url,
         audio_stream_index: audio.index,
         subtitle_stream_index: styled_pick.or(subtitle),
+        remembers_tracks: item.edition.is_none(),
     })
 }
 
@@ -1707,7 +1997,7 @@ mod source_plays_raw_in_browser_tests {
 
     #[test]
     fn a_matroska_never_plays_raw_however_webm_legal_its_codecs() {
-        // B107, the exact live case: Cobra Kai S01E01, av1 + opus in a .mkv,
+        // B107, the exact live case: Show AE S01E01, av1 + opus in a .mkv,
         // to Firefox. Every codec here is WebM-legal and the client lists them
         // — which is precisely why the old codec-based check said "playable"
         // and disarmed the downgrade. The container is what decides, and
@@ -1787,7 +2077,7 @@ mod resolve_selected_subtitle_tests {
         }
     }
 
-    /// B44's Avatar case: default AND forced, i.e. dialogue rather than a
+    /// B44's Film BA case: default AND forced, i.e. dialogue rather than a
     /// convenience.
     fn forced_image_track(idx: u32) -> SubtitleTrack {
         SubtitleTrack {
@@ -1868,7 +2158,7 @@ mod resolve_selected_subtitle_tests {
     #[test]
     fn an_unrequested_image_default_is_not_auto_selected() {
         // Only image tracks, so there is nothing cheap to swap to — the case
-        // Black Panther actually presents.
+        // Film S actually presents.
         let probe = probe_with(vec![image_track(2, false), image_track(4, true)]);
         assert!(
             resolve_selected_subtitle(None, &probe, &text_capable_profiles()).is_none(),
@@ -2225,5 +2515,87 @@ mod native_max_bitrate_tests {
             decide(8_000_000, 4_700_000),
             Decision::AudioRemux { .. }
         ));
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod split_film_tests {
+    use super::*;
+    use crate::state::Stores;
+    use pharos_core::{AlternateMediaSource, MediaKind, MediaProbe};
+    use pharos_jellyfin_api::device_profile::DirectPlayProfile;
+
+    fn film(parts: usize) -> MediaItem {
+        let probe = MediaProbe {
+            container: Some("matroska".into()),
+            video_codec: Some("h264".into()),
+            audio_codec: Some("aac".into()),
+            ..Default::default()
+        };
+        MediaItem {
+            id: 1,
+            path: "/m/G/G (2003) cd1.mkv".into(),
+            kind: MediaKind::Movie,
+            probe: MediaProbe {
+                alternate_sources: (2..=parts)
+                    .map(|n| AlternateMediaSource {
+                        id: format!("part-{n}"),
+                        path: format!("/m/G/G (2003) cd{n}.mkv").into(),
+                        part: u32::try_from(n).ok(),
+                        probe: Some(Box::new(probe.clone())),
+                        ..Default::default()
+                    })
+                    .collect(),
+                ..probe
+            },
+            ..Default::default()
+        }
+    }
+
+    async fn negotiated(item: &MediaItem) -> Negotiated {
+        let stores = Stores::connect("sqlite::memory:").await.unwrap();
+        let state = AppState::new(stores, "t".into());
+        let profile = DeviceProfile {
+            direct_play_profiles: vec![DirectPlayProfile {
+                container: "mkv,matroska".into(),
+                video_codec: "h264".into(),
+                audio_codec: "aac".into(),
+                kind: "Video".into(),
+            }],
+            ..Default::default()
+        };
+        negotiate(
+            &state,
+            item,
+            &NegotiateRequest {
+                profile: &profile,
+                switches: PlaybackSwitches::default(),
+                explicit_subtitle_index: None,
+                stereo_mode: None,
+                client_is_remote: false,
+                is_web_client: false,
+            },
+        )
+    }
+
+    /// V1155 — a client that would direct play the first part's file streams
+    /// a split film through HLS instead, and is told why, with the count.
+    #[actix_web::test]
+    async fn a_split_film_never_direct_plays() {
+        let whole = negotiated(&film(1)).await;
+        assert!(
+            whole.direct_play,
+            "control: the same file alone direct plays"
+        );
+
+        let split = negotiated(&film(3)).await;
+        assert!(!split.direct_play);
+        assert!(!split.supports_direct_stream);
+        assert_eq!(
+            split.direct_play_block,
+            DirectPlayBlock::SplitFilm { parts: 3 }
+        );
+        assert!(split.direct_play_block.to_string().contains('3'));
     }
 }

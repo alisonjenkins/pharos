@@ -150,6 +150,12 @@ pub const ENTRIES: &[Entry] = &[
         title: "Controls effect",
         text: "Pick how the player's controls hide while you watch, and come back when you move.",
     },
+    Entry {
+        id: 11,
+        kind: Kind::Feature,
+        title: "In progress filter",
+        text: "A library's Watched filter lists what you started and didn't finish, with a button on each to mark it watched.",
+    },
 ];
 
 /// The newest entry id: what Done records as seen.
@@ -426,6 +432,7 @@ pub fn WhatsNewView(
         Flow::Setup => "Start watching",
         Flow::WhatsNew => "Done",
     };
+    super::views::use_modal_hold(".pharos-whats-new-backdrop");
     rsx! {
         div { class: "pharos-whats-new-backdrop",
             div {
@@ -437,7 +444,7 @@ pub fn WhatsNewView(
                 tabindex: "-1",
                 onkeydown: move |e: KeyboardEvent| {
                     e.stop_propagation();
-                    if e.key() == Key::Escape {
+                    if e.key() == Key::Named(NamedKey::Escape) {
                         on_close.call(Close::Later);
                     }
                 },
@@ -600,7 +607,7 @@ fn SettingPage(
                 },
             }
             p { class: "pharos-whats-new-help",
-                "Saved on this device. You can change it later in Appearance."
+                "Saved on this device. You can change it later in Settings, under Appearance."
             }
         }
     }

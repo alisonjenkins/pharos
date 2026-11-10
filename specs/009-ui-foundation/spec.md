@@ -2,7 +2,7 @@
 
 **Feature directory**: `specs/009-ui-foundation/`
 **Created**: 2026-11-01
-**Status**: draft (`/speckit-specify` stage; next: `/speckit-clarify`)
+**Status**: partly implemented 2026-11-02..09 (see Progress, audited 2026-11-09); i18n, query-cache/ports layer, axe/pseudo-locale CI open
 **Input**: "We need to start working on making a modern UI for Pharos using
 webgl or similar in the browser … a first class UI." (Alison, 2026-11-01)
 **Depends on**: ADR-0012 (Dioxus + dx WASM), ADR-0028 + 017 (pharos-native
@@ -284,3 +284,17 @@ Server-side, a counter by `mode` lets us see real fallback rates by query.
 ## Out of scope
 
 Feature pages (012–015), theme editor (010), shortcut map (011).
+
+## Progress (audited 2026-11-09)
+
+Evidence is `crates/pharos-ui/src/` on main. Note ADR-0038 (supersedes
+ADR-0033) mounts the UI under `/ui/`, not at `/`, so FR-002's root mount is
+deliberately not built; the in-process `ui_dir` mount is `pharos-server/src/ui.rs`.
+
+- US1 URLs: done. `native/route.rs` typed `Route` enum (Home, Browse, Title, Watch, Person, Together, Appearance, ...) with parse/path, case-insensitive; deep links served by `ui.rs` (#513, #556). Scroll/focus restore per entry not verified.
+- US2 instant: partial. Paged grids (#587, `native/paging.rs`), rail prefetch; no keyed stale-while-revalidate query cache (FR-003) found in `pharos-client`.
+- US3 live: partial. `pharos-client` WebSocket transport (#515), Telemetry.submit (#552), SyncPlay group events; no general library/user-data invalidation channel verified.
+- US4 GPU layer: done. WebGL2 via `glow` (ADR-0039, ADR-0049; #558), `render/webgl.rs`, shader catalogue, animated backdrops (#564), context-loss restore, reduced-motion fallback (`theme/css.rs`).
+- US5 design system: done. `pharos.css` reads only `--px-*` tokens (0cec458a, #528). The literal-colour lint is not confirmed.
+- US6 a11y/i18n: partial. ARIA roles used across views; reduced-motion honoured. No message catalogue, pseudo-locale CI, or axe run (FR-010 not started).
+- FR-001 done (route enum); FR-005 done; FR-006 partial (sized AVIF art #825, ADR-0063; no atlas/LRU found); FR-007 done (010); FR-008 done (shell, top bar, account menu #650, mini-player/stage ADR-0052); FR-009 done (module split into `native/*`); FR-012 partial (LoadError/LoadFailure surfaces, client log via Telemetry.submit); FR-013 done (jellyfin-web at `/`, UI at `/ui/`); FR-014 not started as a ports/fakes/contract-test layer. FR-004 partial (2026-11-09): the native `Events` subscription in `native/live.rs` resumes after reconnect and reloads the screens a user data, library or resync event touches. Session, remote-control, group and activity events are not in the schema's `Event` union yet, and the shell shows the connection state through the existing reconnect notice.

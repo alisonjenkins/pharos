@@ -78,6 +78,12 @@ pub fn on_escape(_on_escape: impl FnMut() + 'static) -> EscapeWatch {
     EscapeWatch
 }
 
+pub struct BackWatch;
+
+pub fn on_back(_on_back: impl FnMut() -> bool + 'static) -> BackWatch {
+    BackWatch
+}
+
 pub struct PopState;
 
 /// A reload loads the newer server's page.
@@ -158,6 +164,10 @@ pub fn seek_ms(_video_id: &str, _ms: u64) {}
 pub fn toggle_play(_video_id: &str) {}
 
 pub fn play(_video_id: &str) {}
+
+pub fn autoplay_blocked() -> bool {
+    false
+}
 
 pub fn pause(_video_id: &str) {}
 
@@ -250,7 +260,7 @@ pub fn session_set(_key: &str, _value: &str) -> Result<(), String> {
     Ok(())
 }
 
-pub fn toggle_fullscreen(_id: &str) {}
+pub fn toggle_fullscreen() {}
 
 pub fn page_origin() -> String {
     String::new()
@@ -260,11 +270,13 @@ pub async fn copy_text(_text: &str) -> bool {
     false
 }
 
-pub fn enter_page_fullscreen() {}
-
 pub fn exit_page_fullscreen() {}
 
-pub fn pip_active() -> bool {
+pub fn leave_fullscreen_on_escape() -> bool {
+    false
+}
+
+pub fn escape_claimed() -> bool {
     false
 }
 
@@ -273,6 +285,21 @@ pub fn pip_supported() -> bool {
 }
 
 pub fn toggle_pip(_id: &str) {}
+
+/// No WebXR here (spec 022 US3).
+pub async fn vr_supported() -> bool {
+    false
+}
+
+pub fn enter_vr(
+    _id: &str,
+    _packing: pharos_client::api::Stereo,
+    _screen: (f64, f64),
+    _on_select: std::rc::Rc<dyn Fn()>,
+) {
+}
+
+pub fn exit_vr() {}
 
 pub fn select_field(_id: &str) {}
 
@@ -334,6 +361,17 @@ pub fn focus_in_area(_name: &str) -> bool {
 
 pub fn dialog_open() -> bool {
     false
+}
+
+/// There is no page to make inert off the web.
+pub struct ModalHold;
+
+impl ModalHold {
+    pub fn capture() -> Self {
+        Self
+    }
+
+    pub fn engage(&mut self, _root: &str) {}
 }
 
 pub struct TrackSkips;
@@ -444,6 +482,15 @@ pub fn on_page_hide(_on_hide: impl FnMut() + 'static) -> PageHide {
     PageHide
 }
 
+pub struct PageLifecycle;
+
+pub fn on_page_lifecycle(
+    _on_hidden: impl FnMut() + 'static,
+    _on_restored: impl FnMut() + 'static,
+) -> PageLifecycle {
+    PageLifecycle
+}
+
 pub async fn engine(_kind: Engine) -> Result<Box<dyn PlaybackEngine>, String> {
     Err(NO_BROWSER.into())
 }
@@ -457,7 +504,9 @@ pub fn info(_message: &str) {}
 /// No server to submit to on the host: client events are dropped.
 pub fn install_telemetry(_api: &NativeApi) {}
 
-pub fn report_event(_event: ClientEvent) {}
+pub fn report_event(event: ClientEvent) {
+    super::report::record_event(&event);
+}
 
 /// The host sends no client events, so diagnostics are never opted in.
 pub fn opted_in() -> bool {
@@ -491,6 +540,15 @@ pub fn apply_subtitle_size(_size: SubtitleSize) {}
 pub fn apply_device(_device: super::playback::DeviceClass) {}
 
 pub fn apply_library_transition(_fx: LibraryTransition) {}
+
+/// No layer off the web: no turn begins.
+pub fn turn_begin(_item: &str, _dir: super::turn::Direction) -> bool {
+    false
+}
+pub fn turn_expect(_item: &str, _dir: super::turn::Direction) {}
+pub fn turn_open(_item: &str) {}
+pub fn turn_ready(_item: &str, _image: Option<&str>, _title: &str) {}
+pub fn turn_cancel(_item: &str, _reason: &str) {}
 
 pub fn apply_overlay_effect(_fx: OverlayEffect) {}
 
@@ -545,6 +603,16 @@ pub fn resume_context(_id: &str) -> super::resume::ResumeContext {
 }
 
 pub fn tap_peak(_id: &str) -> Option<f32> {
+    None
+}
+
+pub fn tap_wake(_id: &str) -> super::resume::Wake {
+    super::resume::Wake::None
+}
+
+pub fn wake_media_tap(_id: &str) {}
+
+pub fn rest_tap(_id: &str) -> Option<String> {
     None
 }
 

@@ -98,6 +98,7 @@ fn opts(kind: SourceVideoKind, codec: SourceCodec) -> TranscodeOptions {
         video_3d_format: None,
         stereo_output: Default::default(),
         tonemap: Default::default(),
+        output_size: None,
         filler: None,
     }
 }

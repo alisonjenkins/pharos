@@ -16,6 +16,28 @@ use pharos_sync::{ws::TokenResolverData, GroupRegistry};
 use std::io::Write;
 use tracing_actix_web::TracingLogger;
 
+#[cfg(target_os = "linux")]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+/// jemalloc's build-time options, read once at its first allocation. A
+/// background thread returns dirty pages after about a second instead of on
+/// the next allocation, and muzzy pages are released at once, so RSS falls
+/// back soon after a burst of requests ends. `MALLOC_CONF` in the environment
+/// still overrides any of these.
+#[cfg(target_os = "linux")]
+#[unsafe(export_name = "malloc_conf")]
+static MALLOC_CONF: MallocConf =
+    MallocConf(c"background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:0".as_ptr());
+
+#[cfg(target_os = "linux")]
+#[repr(transparent)]
+struct MallocConf(*const std::ffi::c_char);
+
+// SAFETY: the pointer is to a 'static, immutable C string literal.
+#[cfg(target_os = "linux")]
+unsafe impl Sync for MallocConf {}
+
 #[derive(Debug, thiserror::Error)]
 enum AppError {
     #[error("config: {0}")]
@@ -171,7 +193,7 @@ async fn scan(cfg: &Config, force: bool) -> Result<(), AppError> {
         return Ok(());
     }
 
-    let stores = Stores::connect(&cfg.database.url).await?;
+    let stores = Stores::connect_with(&cfg.database.url, cfg.database.pool()).await?;
     let cli_memo = probe_memo_for(cfg);
     // P48 — `ffmpeg-lib` build probes in-process via a resident libav
     // worker (no ffprobe fork per file); the spawn build keeps ffprobe.
@@ -180,12 +202,14 @@ async fn scan(cfg: &Config, force: bool) -> Result<(), AppError> {
         .with_rate_limit_ms(cfg.server.scan_rate_limit_ms)
         .with_probe_concurrency_opt(cfg.server.scan_probe_concurrency)
         .with_probe_memo(cli_memo.clone())
+        .with_series_identity_repair(cfg.metadata.series_identity_repair)
         .with_force(force);
     #[cfg(not(all(unix, feature = "ffmpeg-lib")))]
     let scanner = FsScanner::new(FfmpegProber::new())
         .with_rate_limit_ms(cfg.server.scan_rate_limit_ms)
         .with_probe_concurrency_opt(cfg.server.scan_probe_concurrency)
         .with_probe_memo(cli_memo.clone())
+        .with_series_identity_repair(cfg.metadata.series_identity_repair)
         .with_force(force);
     // 004-books — the CLI scan writes book covers too. Without this a
     // `pharos scan` would index books with no tiles and the next server-side
@@ -242,7 +266,7 @@ async fn seed_playwright_user(cfg: &Config) -> Result<(), AppError> {
     use pharos_core::{SecretString, UserId, UserPolicy, UserRecord, UserStore};
     use pharos_server::auth::BuiltinAuth;
 
-    let stores = Stores::connect(&cfg.database.url).await?;
+    let stores = Stores::connect_with(&cfg.database.url, cfg.database.pool()).await?;
     let auth = BuiltinAuth::new(stores.clone());
 
     let hash = auth
@@ -301,6 +325,10 @@ async fn seed_playwright_user(cfg: &Config) -> Result<(), AppError> {
     )?;
     Ok(())
 }
+
+/// How often expired problem reports are swept; retention is in days, so
+/// an hour late is harmless.
+const REPORT_EXPIRY_PERIOD: std::time::Duration = std::time::Duration::from_secs(3600);
 
 /// Seed users who have opted in to sending diagnostics (spec 016), so the
 /// watch-together e2e tests can see their client events reach the server.
@@ -973,7 +1001,7 @@ async fn create_user(
     use pharos_server::auth::{BuiltinAuth, CreateUserOutcome};
 
     require_password(password)?;
-    let stores = Stores::connect(&cfg.database.url).await?;
+    let stores = Stores::connect_with(&cfg.database.url, cfg.database.pool()).await?;
     let auth = BuiltinAuth::new(stores.clone());
 
     let outcome = auth
@@ -1018,7 +1046,7 @@ async fn reset_password(cfg: &Config, name: &str, password: &str) -> Result<(), 
     use pharos_server::auth::BuiltinAuth;
 
     require_password(password)?;
-    let stores = Stores::connect(&cfg.database.url).await?;
+    let stores = Stores::connect_with(&cfg.database.url, cfg.database.pool()).await?;
     let auth = BuiltinAuth::new(stores.clone());
 
     let record = stores
@@ -1092,7 +1120,7 @@ async fn create_playwright_user(cfg: &Config) -> Result<(), AppError> {
     use pharos_core::{SecretString, UserId, UserPolicy, UserRecord, UserStore};
     use pharos_server::auth::BuiltinAuth;
 
-    let stores = Stores::connect(&cfg.database.url).await?;
+    let stores = Stores::connect_with(&cfg.database.url, cfg.database.pool()).await?;
     let auth = BuiltinAuth::new(stores.clone());
 
     let hash = auth
@@ -1385,6 +1413,35 @@ async fn build_transcode_scheduler(
         );
         table.set_decodable(*d, &decodable);
     }
+    // ADR-0072: which VAAPI devices can tonemap HDR on the GPU. Trialled with
+    // the route's own argv, so a missing Vulkan ICD, an ffmpeg without
+    // libplacebo or a driver without Vulkan HEVC decode each read as
+    // "incapable" and HDR jobs stay on the CPU chain. Concurrent, like the
+    // other boot probes: each trial may take its whole timeout, and boot waits
+    // for the slowest device rather than the sum.
+    let tonemap_trials = caps
+        .iter()
+        .map(|(d, _)| *d)
+        .filter(|d| {
+            matches!(
+                d,
+                DeviceId::Hw {
+                    accel: pharos_transcode::HwAccel::Vaapi,
+                    ..
+                }
+            )
+        })
+        .map(|d| async move {
+            let verdict = pharos_transcode::probe::probe_gpu_tonemap(
+                d,
+                pharos_transcode::probe::GPU_TONEMAP_TRIAL_TIMEOUT,
+            )
+            .await;
+            (d, verdict)
+        });
+    for (d, verdict) in futures_util::future::join_all(tonemap_trials).await {
+        table.set_gpu_tonemap(d, verdict);
+    }
     // Read BEFORE the table is moved into the scheduler. This is the whole
     // placement input, digested — see `DeviceTable::placement_fingerprint`.
     let placement_fingerprint = table.placement_fingerprint();
@@ -1490,7 +1547,7 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
 
     obs::register_static_series();
 
-    let stores = Stores::connect(&cfg.database.url).await?;
+    let stores = Stores::connect_with(&cfg.database.url, cfg.database.pool()).await?;
     // LIB-C1 — reconcile the typed `libraries` table from config (one row
     // per configured root/typed-library, with its kind + stable wire id),
     // then backfill `media_items.library_id` by path-prefix so the
@@ -1567,6 +1624,11 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
     // run in-process in crash-isolated workers; the fork/exec is amortised.
     #[cfg(all(unix, feature = "ffmpeg-lib"))]
     let libav_pool = pharos_transcode::worker::LibavWorkerPool::with_discovered_bin();
+    state.image_tags_enforced = cfg.server.image_tags_enforced;
+    tracing::info!(
+        enforced = state.image_tags_enforced,
+        "image tag check for anonymous image requests (ADR-0073)"
+    );
     if let Some(cache_dir) = cfg.server.image_cache_dir.clone() {
         let image_cache =
             ImageCache::new(cache_dir).with_seek_seconds(cfg.server.image_seek_seconds);
@@ -1854,22 +1916,51 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
     #[cfg(all(unix, feature = "ffmpeg-lib"))]
     {
         let integrity_memo = integrity_memo_for(&cfg);
+        // A window past where the scan found a file's media ends is a filler
+        // straight away (B1198): asking the encoder for it only ever fails.
+        if let Some(hls) = state.hls.as_ref() {
+            let memo = integrity_memo.clone();
+            hls.set_source_end_hint(std::sync::Arc::new(move |id| memo.known_end(id)));
+        }
+        let integrity_sweep =
+            std::sync::Arc::new(pharos_server::integrity_sweep::IntegritySweep::default());
         pharos_server::integrity_backfill::spawn(
             state.stores.clone(),
             state.is_bg_leader.clone(),
             state.bg_io.clone(),
             libav_pool.clone(),
             integrity_memo.clone(),
+            integrity_sweep.clone(),
         );
         // GET /admin/integrity/damaged reads this — the only way "N files
         // are damaged" turns into which ones without a debug pod on the
         // cache PVC.
-        state = state.with_integrity_memo(integrity_memo);
+        state = state
+            .with_integrity_memo(integrity_memo)
+            .with_integrity_sweep(integrity_sweep);
+    }
+    // On-demand full decode checks (admin "Deep check"). Spawns the ffmpeg
+    // binary, so it is set up on every backend; it never runs unasked.
+    {
+        let deep = std::sync::Arc::new(pharos_server::integrity_deep::DeepChecks::new(
+            pharos_transcode::worker::exec::ffmpeg_bin(),
+            state.bg_io.clone(),
+        ));
+        state = state.with_integrity_deep(deep);
     }
     // Spec 024 — tempo and energy for every song, for the mix rules. One song
     // at a time behind the background-I/O gate; a song is decoded once.
     #[cfg(all(unix, feature = "ffmpeg-lib"))]
     pharos_server::audio_analysis::spawn(
+        state.stores.clone(),
+        state.is_bg_leader.clone(),
+        state.bg_io.clone(),
+        libav_pool.clone(),
+    );
+    // Black bars baked into a film's or episode's picture, found once per
+    // file so the client can crop to the picture. Same gate as above.
+    #[cfg(all(unix, feature = "ffmpeg-lib"))]
+    pharos_server::picture_check::spawn(
         state.stores.clone(),
         state.is_bg_leader.clone(),
         state.bg_io.clone(),
@@ -1897,6 +1988,9 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
     // `PHAROS_TMDB_API_KEY` (a k8s Secret env var), never config.toml.
     match cfg.tmdb.api_key.as_deref() {
         Some(key) if !key.is_empty() => {
+            state = state.with_person_details_source(std::sync::Arc::new(
+                pharos_server::tmdb::TmdbClient::new(key.to_string()),
+            ));
             pharos_server::person_image_backfill::spawn(
                 state.stores.clone(),
                 state.bg_io.clone(),
@@ -1978,6 +2072,16 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
             }
         }
     }
+    // B1180 — repair artwork rows whose file is gone. Needs no provider key or
+    // image cache, so it is not gated like the enrichment loop above. It runs
+    // only on the background leader.
+    pharos_server::stale_artwork::spawn(
+        state.stores.clone(),
+        state.bg_io.clone(),
+        state.is_bg_leader.clone(),
+        cfg.metadata.repair_stale_artwork,
+        state.artwork_epoch.clone(),
+    );
     // Cap the extracted-image cache. Unlike the trickplay/HLS caches it has no
     // in-line eviction, so on a large library posters/backdrops/thumbs/scaled
     // artwork can slowly fill the shared cache volume. A periodic janitor
@@ -2008,6 +2112,32 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
             );
         }
     }
+    // Cap the on-disk HLS segment tree. The in-memory LRU starts empty at boot
+    // and never tracks `_contaudio/` or `_audiohls/` sessions, so a periodic
+    // leader-only sweep recounts the generation root and evicts the oldest
+    // pre-restart segments and finished audio sessions once disk usage exceeds
+    // the cap.
+    if cfg.server.transcode_cache_max_bytes > 0 {
+        if let Some(hls) = state.hls.clone() {
+            let is_leader = state.is_bg_leader.clone();
+            tokio::spawn(async move {
+                // Warm up, then sweep every 5 minutes.
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(300));
+                loop {
+                    tick.tick().await;
+                    if !is_leader.load(std::sync::atomic::Ordering::Relaxed) {
+                        continue;
+                    }
+                    hls.enforce_cap().await;
+                }
+            });
+            tracing::info!(
+                cap_bytes = cfg.server.transcode_cache_max_bytes,
+                "hls cache janitor enabled"
+            );
+        }
+    }
     if let Some(backend) = build_live_tv_backend(
         cfg.server.live_tv_m3u.clone(),
         cfg.server.live_tv_xmltv.clone(),
@@ -2018,6 +2148,40 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
         state = state.with_live_tv(backend);
     }
     state = state.with_log_dir(cfg.obs.log_dir.clone());
+    let report_store = cfg.obs.resolved_report_dir().map(|dir| {
+        pharos_server::client_reports::ReportStore::new(dir, cfg.obs.report_retention_days)
+    });
+    match &report_store {
+        Some(store) => {
+            tracing::info!(
+                dir = %store.dir().display(),
+                retention_days = cfg.obs.report_retention_days,
+                "client problem reports enabled"
+            );
+            let store = store.clone();
+            let is_leader = state.is_bg_leader.clone();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(REPORT_EXPIRY_PERIOD);
+                loop {
+                    tick.tick().await;
+                    if !is_leader.load(std::sync::atomic::Ordering::Relaxed) {
+                        continue;
+                    }
+                    if let Err(e) = store.expire(std::time::SystemTime::now()).await {
+                        tracing::warn!(
+                            dir = %store.dir().display(),
+                            error = %e,
+                            "client report expiry sweep failed"
+                        );
+                    }
+                }
+            });
+        }
+        None => tracing::info!(
+            "client problem reports disabled: neither [obs].report_dir nor [obs].log_dir is set"
+        ),
+    }
+    state = state.with_client_reports(report_store);
     // Dashboard storage panel (`GET /System/Info/Storage`) — report disk
     // usage for the real configured cache/transcode/subtitle/log/web dirs.
     // `program_data` is left unset (the handler falls back to the advertised
@@ -2041,6 +2205,7 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
     state = state.with_remote_default_bitrate_bps(cfg.server.remote_default_bitrate_bps);
     state = state.with_enforce_video_range(cfg.server.enforce_video_range);
     state = state.with_scan_rate_limit_ms(cfg.server.scan_rate_limit_ms);
+    state = state.with_series_identity_repair(cfg.metadata.series_identity_repair);
     state = state.with_scan_probe_concurrency(cfg.server.scan_probe_concurrency);
     let trusted_proxies =
         pharos_server::client_ip::TrustedProxies::parse(&cfg.server.trusted_proxies)
@@ -2091,6 +2256,7 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
             rate_limit_ms: cfg.server.scan_rate_limit_ms,
         };
         let rate_limit_ms = cfg.server.scan_rate_limit_ms;
+        let series_identity_repair = cfg.metadata.series_identity_repair;
         let probe_concurrency = cfg.server.scan_probe_concurrency;
         // Adaptive backpressure — the periodic incremental rescan draws its
         // probe reads through the same shared I/O gate the server shrinks
@@ -2116,12 +2282,14 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
                     .with_rate_limit_ms(rate_limit_ms)
                     .with_probe_concurrency_opt(probe_concurrency)
                     .with_probe_memo(scan_memo.clone())
+                    .with_series_identity_repair(series_identity_repair)
                     .with_io_gate(io_gate.clone());
             #[cfg(not(all(unix, feature = "ffmpeg-lib")))]
             let s = pharos_scanner::FsScanner::new(pharos_scanner::FfmpegProber::new())
                 .with_rate_limit_ms(rate_limit_ms)
                 .with_probe_concurrency_opt(probe_concurrency)
                 .with_probe_memo(scan_memo.clone())
+                .with_series_identity_repair(series_identity_repair)
                 .with_io_gate(io_gate.clone());
             match cover_sink.clone() {
                 Some(sink) => s.with_cover_sink(sink),
@@ -2362,6 +2530,9 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
             // route patterns and RedMetrics falls back to the concrete
             // URI, exploding Prometheus label cardinality (one series per
             // item id). To get that ingress order, register bottom-up.
+            .wrap(actix_web::middleware::from_fn(
+                pharos_server::middleware::sign_image_tags,
+            ))
             .wrap(pharos_server::middleware::nosniff())
             .wrap(pharos_server::middleware::CookieBackfill)
             .wrap(TracingLogger::<pharos_server::obs::StatusRootSpanBuilder>::new())
@@ -2374,6 +2545,7 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
                 native_limits.clone(),
             ))
     })
+    .workers(pharos_server::http_workers::choose(cfg.server.http_workers))
     .bind(&cfg.server.bind)?
     // Phase B3 — we own the SIGTERM/SIGINT → graceful-drain sequencing
     // below, so actix must not install its own signal handlers (which would

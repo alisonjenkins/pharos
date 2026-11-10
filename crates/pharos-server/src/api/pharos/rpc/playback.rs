@@ -7,7 +7,7 @@ use std::rc::Rc;
 
 use pharos_api::pharos_capnp::{
     capabilities, decision, done, opt_u32, playback as wire, playback_grant as grant_wire,
-    stream_choice,
+    queue_hint, start_tracks_result, stream_choice,
 };
 use pharos_api::{server, Denial};
 use pharos_jellyfin_api::dto::WireId;
@@ -64,6 +64,7 @@ impl server::playback::Handler for Playback {
             .get_client_version()?
             .to_string()
             .unwrap_or_default();
+        let version = params.get_version()?.to_str()?.trim().to_owned();
         let session = &self.session;
         let granted = match (session.current_user().await, id, audio_stream_index) {
             (Err(denial), _, _) | (_, _, Err(denial)) => Err(denial),
@@ -74,6 +75,7 @@ impl server::playback::Handler for Playback {
                     subtitle_stream_index,
                     token: &session.token,
                     client_is_remote: session.client_is_remote(),
+                    version: &version,
                 };
                 match playback::grant(&session.state, &user, id, &request).await {
                     Ok(grant) => {
@@ -84,6 +86,7 @@ impl server::playback::Handler for Playback {
                     Err(GrantError::NotPlayable) => Err(Denial::NotPermitted {
                         what: "streaming a book",
                     }),
+                    Err(GrantError::Version(e)) => Err(super::library::version_denial(e)),
                 }
             }
             (Ok(_), WireId::Synth(_), Ok(_)) => Err(Denial::NotFound { what: "item" }),
@@ -101,6 +104,7 @@ impl server::playback::Handler for Playback {
                     stream_url: grant.stream_url,
                     audio: grant.audio_stream_index,
                     subtitle: grant.subtitle_stream_index,
+                    remembers_tracks: grant.remembers_tracks,
                     reported_ms: Cell::new(None),
                     stopped: Cell::new(false),
                 };
@@ -110,6 +114,50 @@ impl server::playback::Handler for Playback {
             Err(denial) => denial.write(out.init_error()),
         }
         Ok(())
+    }
+
+    async fn start_tracks(
+        self: Rc<Self>,
+        params: wire::StartTracksParams,
+        results: &mut wire::StartTracksResults,
+    ) -> Result<(), capnp::Error> {
+        let params = params.get()?;
+        let id = read_item_id(params.get_id()?)?;
+        let knows_image_delivery =
+            params.get_ctx()?.get_schema_version() >= IMAGE_DELIVERY_SCHEMA_VERSION;
+        let capabilities = read_capabilities(params.get_caps()?, knows_image_delivery)?;
+        let session = &self.session;
+        let picked = match (session.current_user().await, id) {
+            (Err(denial), _) => Err(denial),
+            (Ok(user), WireId::Real(id)) => {
+                playback::start_tracks(&session.state, &user, id, &capabilities)
+                    .await
+                    .map_err(|e| match e {
+                        GrantError::Item(e) => item_denial(id, &e, "startTracks"),
+                        GrantError::NotPlayable => Denial::NotPermitted {
+                            what: "streaming a book",
+                        },
+                        GrantError::Version(e) => super::library::version_denial(e),
+                    })
+            }
+            (Ok(_), WireId::Synth(_)) => Err(Denial::NotFound { what: "item" }),
+        };
+        write_start_tracks(results.get().init_result(), picked);
+        Ok(())
+    }
+}
+
+fn write_start_tracks(
+    out: start_tracks_result::Builder<'_>,
+    picked: Result<(Option<u32>, Option<u32>), Denial>,
+) {
+    match picked {
+        Ok((audio, subtitle)) => {
+            let mut tracks = out.init_tracks();
+            set_opt(tracks.reborrow().init_audio(), audio);
+            set_opt(tracks.init_subtitle(), subtitle);
+        }
+        Err(denial) => denial.write(out.init_error()),
     }
 }
 
@@ -174,6 +222,9 @@ struct Grant {
     stream_url: String,
     audio: Option<u32>,
     subtitle: Option<u32>,
+    /// False for a version: its stream indexes are not the primary's, so its
+    /// reports leave the item's remembered tracks alone.
+    remembers_tracks: bool,
     /// The position of the last report, which a stop on release saves.
     reported_ms: Cell<Option<u64>>,
     /// Set by `stop`: the playback has ended and a release has nothing to do.
@@ -189,6 +240,11 @@ struct Playing {
 
 impl Grant {
     fn at(&self, position_ms: u64, is_paused: bool, playing: Playing) -> Report<'_> {
+        let playing = if self.remembers_tracks {
+            playing
+        } else {
+            Playing::default()
+        };
         Report {
             play_session_id: Some(&self.play_session_id),
             item_wire_id: Some(&self.item_wire_id),
@@ -265,6 +321,59 @@ impl server::playback_grant::Handler for Grant {
         write_done(results.get().init_result(), stopped);
         Ok(())
     }
+
+    /// What this playback waits behind on the encoders, asked by a player
+    /// whose start, seek or buffer is taking a while (038 FR-402, V1217).
+    /// Read from the scheduler's queue; nothing is kept per session for it.
+    async fn queue_hint(
+        self: Rc<Self>,
+        _params: grant_wire::QueueHintParams,
+        results: &mut grant_wire::QueueHintResults,
+    ) -> Result<(), capnp::Error> {
+        let out = results.get().init_result();
+        if let Err(denial) = self.session.current_user().await {
+            denial.write(out.init_error());
+            return Ok(());
+        }
+        let stream = pharos_transcode::scheduler::StreamKey::of(&self.play_session_id);
+        let wait = match self.session.state.transcode_scheduler.as_ref() {
+            Some(sched) => sched.stream_wait(stream).await.unwrap_or_default(),
+            None => pharos_transcode::scheduler::StreamWait::default(),
+        };
+        let play_session_id = pharos_core::secret_prefix(&self.play_session_id);
+        // The verdict the viewer is shown, with what it was read from: a
+        // "server busy" caption can be matched to the queue it described.
+        if wait.queued > 0 {
+            tracing::info!(
+                play_session_id = %play_session_id,
+                queued = wait.queued,
+                waited_ms = wait.oldest_ms,
+                others_queued = wait.others_queued,
+                busy = wait.devices_full,
+                "playback queue hint: waiting for an encoder"
+            );
+        } else {
+            tracing::debug!(
+                play_session_id = %play_session_id,
+                others_queued = wait.others_queued,
+                busy = wait.devices_full,
+                "playback queue hint: nothing queued"
+            );
+        }
+        write_queue_hint(out.init_hint(), wait);
+        Ok(())
+    }
+}
+
+fn write_queue_hint(
+    mut out: queue_hint::Builder<'_>,
+    wait: pharos_transcode::scheduler::StreamWait,
+) {
+    let count = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
+    out.set_queued(count(wait.queued));
+    out.set_waited_ms(wait.oldest_ms);
+    out.set_others_queued(count(wait.others_queued));
+    out.set_busy(wait.devices_full);
 }
 
 impl Drop for Grant {
@@ -305,6 +414,11 @@ impl Drop for Grant {
                     Err(play_state::ReportError::Withheld(hidden)) => {
                         tracing::info!(%play_session_id, ?hidden, "playback: released grant's item is withheld, ending without a position");
                         (play_state::end(&session.state, user.id, &psid).await, false)
+                    }
+                    // The playback ended; only its position was lost.
+                    Err(e @ play_state::ReportError::Store { .. }) => {
+                        tracing::warn!(%play_session_id, error = %e, "playback: released grant's position not stored");
+                        (Ok(()), false)
                     }
                     other => (other, reported_ms.is_some()),
                 },
@@ -372,6 +486,12 @@ fn report_denial(e: play_state::ReportError) -> Denial {
             dependency: "item store",
         },
         play_state::ReportError::Withheld(_) => Denial::NotFound { what: "item" },
+        play_state::ReportError::Store { .. } => {
+            tracing::warn!(error = %e, "native playback stop: play state not stored");
+            Denial::Unavailable {
+                dependency: "play state store",
+            }
+        }
         play_state::ReportError::RegistryDown(_) => {
             tracing::warn!(error = %e, "native playback report: session registry unavailable");
             Denial::Unavailable {

@@ -98,10 +98,70 @@ item's bytes, the same class as images and streams under V191.
 | 2 | native API: `BookInfo`, `setReadPosition`, storage, reading row, Download on the media cookie | schema bump, sqlite + postgres migrations, it_rpc | V353 (server half), V354, V355 |
 | 3 | `quire-web`: mount, paginate, turn, settings, locator from and to the DOM; `quire-web` added to hakari `final-excludes` | crate + wasm-bindgen tests in headless Chromium | V352 (DOM half) |
 | 4 | pharos-ui reader: route, Read button, toc, settings panel, position sync, DRM and error states | UI + Playwright | V353, SC-004, B410 |
-| 5 | PDF: spike, then the chosen engine behind `quire`'s fixed-layout port | ADR-0047 amended | US5 |
+| 5 | PDF: `hayro` behind `quire`'s `FixedLayout` port, as `quire-pdf` and its own lazily loaded wasm module; canvas reader in pharos-ui | ADR-0047 amended | US5, V356–V358, B411 |
 | 6 | CBZ, when the library has a comic | | US6 |
 
 Slices 1 and 2 do not depend on each other and can be built in parallel.
+
+## Status and changes, 2026-11-09
+
+Slices 1 (`quire`, #690) and 3 (`quire-web`, #738) are on main;
+`just quire-web-check` passes on main at 0ea9de98e. Slices 2 and 4 are being
+built now ("can you kick something off to make an Ebook reader for Pharos
+please? We have the books but cannot read yet", Alison, 2026-11-09).
+
+The library re-measured on hss1 by extension: 39 `.epub` (836 MB, median
+6.6 MB, 90th percentile 35 MB, largest 214 MB), 75 Kindle files (17 convert,
+58 DRM), 28 `.pdf` (median 13 MB, largest 83 MB), no comics. EPUB first
+stands.
+
+The quire-web harness is 282 KB gzip on its own (std and web-sys included),
+under SC-003's 400 KB before any sharing with pharos-ui.
+
+Changes to slice 2 against the shape above:
+
+- **Storage is its own table, not two `user_data` columns.**
+  `UserItemData` is `Copy` and built in about 40 files; a `String` locator
+  would end that for one feature. A `read_positions` table (`user_id`,
+  `item_id`, `locator`, `fraction`, `updated_at`, primary key on the pair,
+  cascading with the user and the item) behind a `ReadPositionStore` port
+  keeps the two positions apart by construction (V354). Migration 0076 in
+  both stores.
+- **Ordinals, at main today (schema 31):** `schemaVersion` 32,
+  `ItemDetail.book @14`, `UserState.readLocator @4`, `readFraction @5`,
+  `UserData.setReadPosition @2`, `Home.reading @4`. Fixed again at queue time
+  if another schema PR lands first.
+- **Observability.** `pharos_read_position_total{outcome}` counts
+  `setReadPosition` calls by outcome (`saved`, `finished`, `not_book`,
+  `unreadable`, `bad_locator`, `bad_fraction`, `hidden`), and each refusal
+  logs the item id and the reason. The UI logs open time, section parse
+  failures and the book's size with the item id and format.
+
+Weak devices (TV, Quest, phones): the whole book is fetched, and a book over
+64 MiB is refused there with the download offered; desktop has no cap
+("1 please", Alison, 2026-11-09, choosing this over loading chapter by
+chapter from the server). Wasm memory never shrinks once grown, and the
+library's largest EPUB is 214 MB.
+
+## Slice 5: PDF (built 2026-11-10)
+
+```text
+quire       FixedLayout { page_count, page_size, render(i, height_px) -> Raster }
+            PageLocator "pdf1:<page>" (from 1), page_progress = page / count
+quire-pdf   hayro adapter + wasm-bindgen QuirePdfDocument
+            (no pharos dependency, hakari final-exclude, own README)
+bundle      assets/pdf/{loader.js, quire_pdf.js, quire_pdf_bg.wasm}
+            built in flake.nix's pharosUiBundle from the vendored Cargo.lock
+pharos-ui   pdf_web.rs  loads the module on demand, canvas + one spare
+            reader.rs   layout caps, turns, taps, swipes, pdf1 saves (host tests)
+```
+
+Decisions and measured sizes are in ADR-0047. The module is 4.99 MB raw and
+1.86 MB gzip; the main wasm grew 23 KB raw (7 KB gzip) for the reader code. A page turn draws the next page
+ahead (one spare canvas); the position saves through the same debounce and
+page-hide flush as an EPUB. Left for later: offline reading (nothing stores
+the module or book yet), PDF outlines as a contents panel, text selection and
+search.
 
 ## Testing
 

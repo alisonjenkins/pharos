@@ -23,10 +23,34 @@ pub struct Place {
     pub route: Route,
 }
 
+/// A command the palette runs rather than a screen it opens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Command {
+    ReportProblem,
+}
+
+impl Command {
+    pub fn label(self) -> &'static str {
+        match self {
+            Command::ReportProblem => "Report a problem",
+        }
+    }
+
+    pub fn detail(self) -> &'static str {
+        match self {
+            Command::ReportProblem => "Shows what would be sent first",
+        }
+    }
+}
+
+/// Every command, in the order the palette lists them.
+pub const COMMANDS: &[Command] = &[Command::ReportProblem];
+
 /// One row of the palette, in the group it is listed under.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Row {
     Place(Place),
+    Command(Command),
     /// A term searched for before; picking it searches again.
     Search(String),
     /// Something the user was part way through.
@@ -40,7 +64,7 @@ impl Row {
     pub fn route(&self) -> Option<Route> {
         match self {
             Row::Place(place) => Some(place.route.clone()),
-            Row::Search(_) => None,
+            Row::Search(_) | Row::Command(_) => None,
             Row::Recent(item) | Row::Title(item) => Some(open_route(item)),
         }
     }
@@ -48,6 +72,7 @@ impl Row {
     pub fn group(&self) -> &'static str {
         match self {
             Row::Place(_) => "Go to",
+            Row::Command(_) => "Actions",
             Row::Search(_) => "Recent searches",
             Row::Recent(_) => "Continue",
             Row::Title(_) => "Titles",
@@ -55,7 +80,8 @@ impl Row {
     }
 }
 
-/// Home, each library in the order given, then the settings screens.
+/// Home, each library in the order given, Favourites, then the settings
+/// screens.
 pub fn places(libraries: &[Item]) -> Vec<Place> {
     let home = Place {
         label: "Home".into(),
@@ -67,6 +93,11 @@ pub fn places(libraries: &[Item]) -> Vec<Place> {
         detail: "Library",
         route: Route::Browse(library.id),
     });
+    let favourites = Place {
+        label: "Favourites".into(),
+        detail: "Page",
+        route: Route::Favourites,
+    };
     let settings = [
         Place {
             label: "Appearance".into(),
@@ -81,6 +112,7 @@ pub fn places(libraries: &[Item]) -> Vec<Place> {
     ];
     std::iter::once(home)
         .chain(libraries)
+        .chain(std::iter::once(favourites))
         .chain(settings)
         .collect()
 }
@@ -103,6 +135,7 @@ pub fn rows(
             .cloned()
             .map(Row::Search)
             .chain(places.iter().cloned().map(Row::Place))
+            .chain(COMMANDS.iter().copied().map(Row::Command))
             .chain(recent.iter().take(RECENT_LIMIT).cloned().map(Row::Recent))
             .collect();
     }
@@ -111,6 +144,13 @@ pub fn rows(
         .filter(|place| place.label.to_lowercase().contains(&term))
         .cloned()
         .map(Row::Place)
+        .chain(
+            COMMANDS
+                .iter()
+                .copied()
+                .filter(|c| c.label().to_lowercase().contains(&term))
+                .map(Row::Command),
+        )
         .chain(
             hits.into_iter()
                 .flat_map(|page| page.items.iter().cloned().map(Row::Title)),
@@ -172,6 +212,9 @@ mod tests {
             library_kind: None,
             imdb_rating: None,
             critic_rating: None,
+            artist: None,
+            stereo: None,
+            damaged: false,
         }
     }
 
@@ -180,20 +223,25 @@ mod tests {
             .map(|row| match row {
                 Row::Place(place) => place.label.clone(),
                 Row::Search(term) => term.clone(),
+                Row::Command(command) => command.label().to_owned(),
                 Row::Recent(item) | Row::Title(item) => item.name.clone(),
             })
             .collect()
     }
 
     #[test]
-    fn the_places_are_home_the_libraries_then_settings() {
+    fn the_places_are_home_the_libraries_favourites_then_settings() {
         let libraries = [
             item(4, ItemKind::Library, "Films"),
             item(5, ItemKind::Library, "TV"),
         ];
         let places = places(&libraries);
         let labels: Vec<_> = places.iter().map(|p| p.label.as_str()).collect();
-        assert_eq!(labels, ["Home", "Films", "TV", "Appearance", "Manage"]);
+        assert_eq!(
+            labels,
+            ["Home", "Films", "TV", "Favourites", "Appearance", "Manage"]
+        );
+        assert_eq!(places[3].route, Route::Favourites);
         assert_eq!(places[1].route, Route::Browse(ItemRef::Real(4)));
     }
 
@@ -204,7 +252,7 @@ mod tests {
             .map(|n| item(n, ItemKind::Movie, &format!("R{n}")))
             .collect();
         let rows = rows(&[], &places, &recent, "  ", None);
-        assert_eq!(rows.len(), places.len() + RECENT_LIMIT);
+        assert_eq!(rows.len(), places.len() + COMMANDS.len() + RECENT_LIMIT);
         assert!(matches!(rows.last(), Some(Row::Recent(_))));
     }
 
@@ -224,6 +272,20 @@ mod tests {
     }
 
     #[test]
+    fn the_report_command_is_listed_and_found_by_name_and_runs_no_route() {
+        let places = places(&[]);
+        let blank = rows(&[], &places, &[], "", None);
+        let at = blank.len().min(places.len());
+        assert_eq!(blank[at], Row::Command(Command::ReportProblem));
+        assert_eq!(blank[at].group(), "Actions");
+        assert_eq!(blank[at].route(), None);
+        assert_eq!(
+            labels(&rows(&[], &places, &[], "problem", None)),
+            ["Report a problem"]
+        );
+    }
+
+    #[test]
     fn before_the_first_reply_only_places_are_listed() {
         let places = places(&[]);
         assert_eq!(
@@ -235,9 +297,9 @@ mod tests {
     #[test]
     fn a_blank_term_lists_past_searches_first_and_they_go_nowhere() {
         let places = places(&[]);
-        let searches = searches(&remember(&remember("", "moby"), "dragon ball"));
+        let searches = searches(&remember(&remember("", "moby"), "silver rock"));
         let blank = rows(&searches, &places, &[], "", None);
-        assert_eq!(labels(&blank[..3]), ["dragon ball", "moby", "Home"]);
+        assert_eq!(labels(&blank[..3]), ["silver rock", "moby", "Home"]);
         assert_eq!(blank[0].group(), "Recent searches");
         assert_eq!(blank[0].route(), None);
         assert!(rows(&searches, &places, &[], "mo", None)

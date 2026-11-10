@@ -7,10 +7,11 @@ use std::rc::Rc;
 
 use dioxus::core::spawn_forever;
 use dioxus::prelude::*;
+use futures_util::FutureExt as _;
 use futures_util::StreamExt as _;
 use pharos_client::api::{
-    Detail, Home, Item, ItemKind, ItemRef, NativeApi, NativeGrant, PharosApi as _,
-    PlaybackGrant as _, TrackChoice, TrackPicks,
+    Detail, Home, Item, ItemKind, ItemRef, NativeApi, NativeGrant, PersonPage, PharosApi as _,
+    PlaybackGrant as _, StartTracks, TrackChoice, TrackPicks,
 };
 use pharos_client::{CallInfo, ClientError};
 
@@ -19,16 +20,19 @@ use super::account_settings;
 use super::activity;
 use super::appearance::{AppearanceView, ContrastRow, Edit, EditorView, Notice, ThemeCard};
 use super::approve_device;
-use super::backdrop::Backdrop;
+use super::backdrop::{self, Backdrop};
 use super::browse::{self, Neighbours};
+use super::damage;
 use super::diagnostics;
+use super::favourites::{self, Favourites, FavouritesView};
 use super::find::{self, Find, DEBOUNCE_MS, RESULT_LIMIT};
 use super::group_app::{Together, VideoPlayer};
 use super::group_session::{GroupPlayer, GroupView, Ui};
-use super::listen::ListenView;
+use super::listen::{ListenView, QueuePanel};
 use super::machine::{Event, Machine, Phase, SignInReply};
 use super::mixes::{self, ActiveMix, MixCtx};
 use super::palette::{self, Row};
+use super::person::PersonView;
 use super::platform::{self, OpenError};
 use super::playback::{
     choose_engine, crossfade_ms, device_class, engine_verdict, fade_volume, format_tier_drop,
@@ -36,38 +40,52 @@ use super::playback::{
     parse_volume_setting, pick_mse_engine, position_at, preview_set, restart_styled,
     rust_subtitle_url, shown_font_urls, source_of_styled, start_ms, starting_tier,
     starting_tier_line, styled_subtitle_signals, styled_subtitle_url, styled_track_url,
-    subtitle_switch, tier_drop_line, tier_drop_report, tier_spared_line, up_next_at,
-    volume_setting, DeviceClass, EffectsLevel, Engine, EngineReason, LibraryTransition, MediaEvent,
-    MediaState, MseEngine, OnFatal, OnFragment, Outgoing, OverlayEffect, PlaybackEngine,
-    RendererFrames, ReportClock, SubtitleSize, SubtitleSwitch, Tier, TierDrop, TierVerdict, UpNext,
-    UpNextStep, CROSSFADE_KEY, EFFECTS_LEVEL_KEY, LIBRARY_TRANSITION_KEY, MAX_BITRATE_KEY,
-    MSE_ENGINE_KEY, OVERLAY_EFFECT_KEY, SUBTITLE_SIZE_KEY, TIER_DROP_KEY, VOLUME_KEY,
+    subtitle_switch, tier_drop_line, tier_drop_report, tier_spared_line, up_next_at, up_next_pill,
+    volume_setting, DeviceClass, EffectsLevel, Engine, EngineReason, FailureKind, Fatal,
+    LibraryTransition, MediaEvent, MediaState, MseEngine, OnFatal, OnFragment, Outgoing,
+    OverlayEffect, PlaybackEngine, RendererFrames, ReportClock, SubtitleSize, SubtitleSwitch, Tier,
+    TierDrop, TierVerdict, UpNext, UpNextStep, CROSSFADE_KEY, EFFECTS_LEVEL_KEY,
+    LIBRARY_TRANSITION_KEY, MAX_BITRATE_KEY, MSE_ENGINE_KEY, OVERLAY_EFFECT_KEY, SUBTITLE_SIZE_KEY,
+    TIER_DROP_KEY, VOLUME_KEY,
 };
 use super::playback_settings;
+use super::preplay::{self, PlayPicks, TrackChoices};
 use super::privacy;
-use super::quality::{self, Watch};
-use super::queue::{Queue, QueueAction, QueueCtx, Track, RESTART_AFTER_MS};
-use super::resume::{ResumeProbe, ResumeReport};
+use super::quality::{self, QualityView, Watch};
+use super::queue::{
+    video_kind, video_next_line, Queue, QueueAction, QueueCtx, Track, VideoQueueCtx,
+    RESTART_AFTER_MS,
+};
+use super::report;
+use super::resume::{Item as ResumeItem, ResumeProbe, ResumeReport};
 use super::route::Route;
+use super::seek_wait::SeekWait;
 use super::seen::{self, MemberSeen};
 use super::settings::{Section, SettingsLayout};
+use super::show_tracks;
 use super::stage::{
-    Handoff, Stage, StageAction, StageBar, StageClose, StageCtx, StageGrip, View, STAGE_ID,
+    Handoff, QueueButton, QueueDock, Stage, StageAction, StageBar, StageClose, StageCtx, StageGrip,
+    View, STAGE_ID,
 };
+use super::stereo::{self, ViewMode};
 use super::subtitles::{track_mode, FallbackReason, RustState, TrackMode};
 use super::together::{
     can_watch_together, group_api, GroupClient as _, GroupError, GroupSummary, Groups,
 };
-use super::together_view::{InviteView, TogetherView, INVITE_LINK_ID};
+use super::together_view::{InviteView, NotesView, TogetherView, INVITE_LINK_ID};
 use super::track_follow;
 use super::trail;
+use super::turn::{self, EpisodeTurn, EPISODE_TURN_KEY};
+use super::versions;
 use super::views::{
-    open_route, reveal_palette_row, ErrorNote, Hits, HomeView, Loading, MarkPlayed, Nav,
-    PaletteView, PlayFromStart, SearchBox, Shell, SignInView, StatusView, TitleView, PALETTE_INPUT,
+    open_route, reveal_palette_row, Busy, ErrorNote, FirstLoad, FlashNote, GroupEndedNote, Hits,
+    HomeView, LoadError, LoadFailure, Loading, MarkFavorite, MarkPlayed, Nav, PaletteView,
+    PlayFailure, PlayFromStart, PlaybackFailure, SearchBox, Shell, SignInView, StartFailure,
+    StatusView, StoredMark, TitleView, PALETTE_INPUT,
 };
 use super::watch_view::{
-    text_track_id, total_ms, Control, Controls, Skip, UpNextCard, WatchView, OUTGOING_ID,
-    PLAYER_ID, SEEK_ID, VIDEO_ID,
+    split_position, text_track_id, total_ms, Control, Controls, Skip, UpNextCard, VideoQueueView,
+    WatchView, OUTGOING_ID, SEEK_ID, VIDEO_ID,
 };
 use super::whats_new::{self, Close, Gate, GateInputs, Pick, Unseen, WhatsNewBadge, WhatsNewView};
 use crate::theme::editor::{Draft, EffectField};
@@ -77,8 +95,7 @@ use crate::theme::value::{Density, FontStack, Rgba};
 use crate::theme::{self, contrast, css, device, doc, format, Catalogue, Theme, ThemeError};
 use crate::views::RootApp;
 
-/// The page root: one route per URL, kept in step with history. `/manage`
-/// mounts the older REST panes and never opens the native socket.
+/// The page root: one route per URL, kept in step with history.
 #[component]
 pub fn Root() -> Element {
     let boot = use_hook(boot_theme);
@@ -122,7 +139,7 @@ pub fn Root() -> Element {
             true
         }))
     });
-    // A play click put the page in fullscreen; the player leaving the full
+    // The F key put the page in fullscreen; the player leaving the full
     // view (Back, the floating window, Close) takes it out again.
     let shown_full = use_memo(move || {
         let s = stage.read();
@@ -162,6 +179,7 @@ pub fn Root() -> Element {
     });
     use_effect(move || {
         let at = route();
+        super::report::note(&format!("route {}", at.path()));
         let mut next = stage.peek().clone();
         let item = next.item;
         if let Some(view) = next.follow(&at) {
@@ -183,6 +201,7 @@ pub fn Root() -> Element {
                 return;
             }
             if *route.peek() != to {
+                turn_on_nav(&route.peek(), &to);
                 platform::push(&to.path());
                 route.set(to);
             }
@@ -193,6 +212,7 @@ pub fn Root() -> Element {
             if plays_in_place(stage, &to) {
                 return;
             }
+            turn_on_nav(&route.peek(), &to);
             platform::replace(&to.path());
             route.set(to);
         }))
@@ -215,12 +235,12 @@ pub fn Root() -> Element {
         }
     });
     use_context_provider(|| Together::new(group_view, group_error, group_ui));
-    match route() {
-        Route::Manage => rsx! { RootApp {} },
-        route => rsx! {
+    let route = route();
+    rsx! {
+        if backdrop::runs_behind(&route) {
             Backdrop {}
-            NativeApp { route }
-        },
+        }
+        NativeApp { route }
     }
 }
 
@@ -242,10 +262,15 @@ fn plays_in_place(mut stage: Signal<Stage>, to: &Route) -> bool {
     taken
 }
 
-/// How often, and how many times, to ask again for word times the aligner is
-/// still working out (B499): a song takes it a minute or three on a CPU.
-const ALIGN_ASK_MS: u32 = 20_000;
-const ALIGN_ASKS: u32 = 15;
+/// How often to ask again for word times the aligner is
+/// still working out (B499). An ask is a cache read on the server, and every
+/// second between the answer being ready and the next ask is a second of
+/// guessed fill (B937). The asks go on for as long as the server says the
+/// words are pending: a song can wait behind others in the aligner's queue
+/// and then take minutes, and giving up after a fixed count left the fill a
+/// guess for the whole song (B1163). Leaving the song drops the task and
+/// stops the asks.
+const ALIGN_ASK_MS: u32 = 5_000;
 
 const PREFERS_DARK: &str = "(prefers-color-scheme: dark)";
 const PREFERS_MORE_CONTRAST: &str = "(prefers-contrast: more)";
@@ -433,6 +458,42 @@ fn log_lines(lines: &[device::Line]) {
     }
 }
 
+/// The integrity scan's damaged spans, when they describe the file playing:
+/// only the primary file is scanned, so another version has none (B1160).
+fn scanned_spans(p: &Playing) -> Vec<pharos_client::api::DamageSpan> {
+    let primary = p.version.is_empty()
+        || p.detail
+            .versions
+            .iter()
+            .any(|v| v.primary && v.id == p.version);
+    match (&p.detail.damage, primary) {
+        (Some(d), true) => d.ranges.clone(),
+        _ => Vec::new(),
+    }
+}
+
+/// The spans this device skipped in a file before (B1160).
+fn stored_skips(item: ItemRef, version: &str) -> Vec<pharos_client::api::DamageSpan> {
+    let key = damage::skipped_key(item, version);
+    match platform::stored_theme(&key) {
+        Ok(stored) => stored
+            .as_deref()
+            .map_or_else(Vec::new, damage::parse_skipped),
+        Err(e) => {
+            platform::warn(&signal::storage_failed(&key, &e));
+            Vec::new()
+        }
+    }
+}
+
+fn remember_skip(item: ItemRef, version: &str, from_ms: u64, to_ms: u64) {
+    let spans = damage::remember_skip(&stored_skips(item, version), from_ms, to_ms);
+    store_setting(
+        &damage::skipped_key(item, version),
+        &damage::format_skipped(&spans),
+    );
+}
+
 fn store_setting(key: &str, value: &str) {
     if let Err(e) = platform::store_theme(key, value) {
         platform::warn(&signal::storage_failed(key, &e));
@@ -560,6 +621,39 @@ fn stored_subtitle_size() -> SubtitleSize {
 
 /// Keep `size` for this page load and try to save it on the device. The
 /// write's error comes back so the page can say the choice was not kept.
+/// Keeps `size` for this device and draws subtitles at it now, lifting the
+/// cues on screen. The size applies even when it could not be kept.
+fn set_subtitle_size(size: SubtitleSize) -> Result<(), String> {
+    let kept = store_subtitle_size(size);
+    platform::apply_subtitle_size(size);
+    platform::relift_cues(VIDEO_ID);
+    platform::info(&format!("pharos: subtitle_size set={}", size.as_str()));
+    kept
+}
+
+/// How this device shows a packed 3D version (V922: kept on the device
+/// alone); one eye when nothing is kept.
+fn stored_view_mode() -> ViewMode {
+    match platform::stored_theme(stereo::VIEW_MODE_KEY) {
+        Ok(stored) => stored.as_deref().map_or(ViewMode::OneEye, ViewMode::parse),
+        Err(e) => {
+            platform::warn(&format!(
+                "pharos: stereo view storage read failed error={e}"
+            ));
+            ViewMode::OneEye
+        }
+    }
+}
+
+/// Keeps `mode` on this device. It applies for this player even when the
+/// browser refused to keep it.
+fn store_view_mode(mode: ViewMode) {
+    platform::info(&format!("pharos: stereo view set={}", mode.as_str()));
+    if let Err(e) = platform::store_theme(stereo::VIEW_MODE_KEY, mode.as_str()) {
+        platform::warn(&format!("pharos: stereo view not kept error={e}"));
+    }
+}
+
 fn store_subtitle_size(size: SubtitleSize) -> Result<(), String> {
     SESSION_SUBTITLE_SIZE.with(|s| s.set(Some(size)));
     platform::store_theme(SUBTITLE_SIZE_KEY, size.as_str()).inspect_err(|e| {
@@ -852,6 +946,61 @@ fn stored_mse_engine() -> MseEngine {
     pick_mse_engine("", stored_mse_engine_raw().as_deref()).0
 }
 
+thread_local! {
+    /// The episode turn choice this page load, once read or set.
+    static EPISODE_TURN: Cell<Option<EpisodeTurn>> = const { Cell::new(None) };
+}
+
+/// The viewer's episode turn choice; [`EpisodeTurn::Turn`] unless they chose Off.
+fn stored_episode_turn() -> EpisodeTurn {
+    if let Some(choice) = EPISODE_TURN.get() {
+        return choice;
+    }
+    let choice = match platform::stored_theme(EPISODE_TURN_KEY) {
+        Ok(stored) => stored
+            .as_deref()
+            .map_or_else(EpisodeTurn::default, EpisodeTurn::parse),
+        Err(e) => {
+            platform::warn(&format!(
+                "pharos: episode_turn storage read failed error={e}"
+            ));
+            EpisodeTurn::default()
+        }
+    };
+    EPISODE_TURN.set(Some(choice));
+    choice
+}
+
+fn store_episode_turn(choice: EpisodeTurn) -> Result<(), String> {
+    EPISODE_TURN.set(Some(choice));
+    platform::info(&format!("pharos: episode_turn set={}", choice.as_str()));
+    platform::store_theme(EPISODE_TURN_KEY, choice.as_str()).inspect_err(|e| {
+        platform::warn(&format!(
+            "pharos: episode_turn storage write failed error={e}"
+        ));
+    })
+}
+
+/// A navigation to the watch page: turn from the episode on screen, or get
+/// ready to turn onto the one being opened once it is known to be a video.
+fn turn_on_nav(from: &Route, to: &Route) {
+    let direction = turn::take_direction();
+    let Route::Watch(next) = to else {
+        return;
+    };
+    if !turn::wanted(stored_episode_turn(), platform::prefers(REDUCED_MOTION)) {
+        return;
+    }
+    let item = next.to_string();
+    match from {
+        Route::Watch(now) if now != next => {
+            platform::turn_begin(&item, direction);
+        }
+        Route::Watch(_) => {}
+        _ => platform::turn_expect(&item, direction),
+    }
+}
+
 pub(super) fn set_crossfade_seconds(seconds: u32) {
     CROSSFADE_S.set(Some(seconds));
     platform::info(&format!("pharos: crossfade set seconds={seconds}"));
@@ -887,31 +1036,73 @@ async fn fade(id: &'static str, from: f64, to: f64, fade_ms: u64, cancel: Rc<Cel
 /// How often a resume in flight reads the analyser (B563).
 const RESUME_STEP_MS: u32 = 10;
 
-/// A resume in flight, and a count of resumes so a superseded watch stops.
-type ResumeSlot = Rc<RefCell<(u64, Option<ResumeProbe>)>>;
+/// A resume in flight, a count of resumes so a superseded watch stops, and
+/// when the song was last paused.
+#[derive(Default)]
+struct ResumeState {
+    count: u64,
+    probe: Option<ResumeProbe>,
+    /// `now_ms` of the pause the song is in; `None` while it plays.
+    paused_at: Option<f64>,
+}
 
-fn report_resume(report: &ResumeReport) {
+type ResumeSlot = Rc<RefCell<ResumeState>>;
+
+/// Log and send `report`, with the wake of the tap on [`VIDEO_ID`] as it
+/// stands now (B735).
+fn report_resume(report: ResumeReport) {
+    let report = report.with_wake(platform::tap_wake(VIDEO_ID));
     platform::info(&report.line());
     platform::report_event(report.event());
 }
 
-/// Start timing a resume of the media element `id`, before `play()` so its
-/// `playing` cannot come first. Returns the resume's number.
-fn start_resume(id: &str, slot: &ResumeSlot) -> u64 {
+/// Start timing a resume of `item` on the media element `id`, before
+/// `play()` so its `playing` cannot come first. Returns the resume's number.
+fn start_resume(id: &str, item: ResumeItem, slot: &ResumeSlot) -> u64 {
     let (n, superseded) = {
         let mut slot = slot.borrow_mut();
-        let superseded = slot.1.as_mut().and_then(ResumeProbe::superseded);
-        slot.0 = slot.0.wrapping_add(1);
-        slot.1 = Some(ResumeProbe::start(
+        let superseded = slot.probe.as_mut().and_then(ResumeProbe::superseded);
+        slot.count = slot.count.wrapping_add(1);
+        slot.probe = Some(ResumeProbe::start(
             platform::now_ms(),
             platform::resume_context(id),
+            item,
+            slot.paused_at,
         ));
-        (slot.0, superseded)
+        (slot.count, superseded)
     };
     if let Some(report) = superseded {
-        report_resume(&report);
+        report_resume(report);
     }
     n
+}
+
+/// Keep the paused song's output warm, then rest it (B734, V683): a tap's
+/// running `AudioContext` holds the output stream open through the pause,
+/// so the sound server leaves the device awake for the resume. A pause still
+/// unbroken after [`super::resume::REST_AFTER_PAUSE_MS`] suspends the
+/// context; the play that ends it wakes the context first.
+async fn rest_after_pause(slot: ResumeSlot, paused_at: f64) {
+    let state = platform::resume_context(VIDEO_ID)
+        .audio
+        .map_or_else(|| "untapped".to_owned(), |a| a.context_state);
+    platform::info(&format!(
+        "pharos: audio output warm reason=paused context_state={state} rest_after_ms={}",
+        super::resume::REST_AFTER_PAUSE_MS
+    ));
+    // Lossless: the constant is a whole number of ms well inside u32.
+    platform::sleep_ms(super::resume::REST_AFTER_PAUSE_MS as u32).await;
+    if slot.borrow().paused_at != Some(paused_at)
+        || !super::resume::rests(paused_at, platform::now_ms())
+    {
+        return;
+    }
+    match platform::rest_tap(VIDEO_ID) {
+        Some(state) => platform::info(&format!(
+            "pharos: audio output rest reason=paused_too_long state_before={state}"
+        )),
+        None => platform::info("pharos: audio output rest reason=untapped state_before=none"),
+    }
 }
 
 /// Measure resume number `resume` of the media element `id` until it
@@ -921,10 +1112,10 @@ async fn watch_resume(id: &'static str, slot: ResumeSlot, resume: u64) {
         platform::sleep_ms(RESUME_STEP_MS).await;
         let report = {
             let mut slot = slot.borrow_mut();
-            if slot.0 != resume {
+            if slot.count != resume {
                 return;
             }
-            let Some(probe) = slot.1.as_mut() else {
+            let Some(probe) = slot.probe.as_mut() else {
                 return;
             };
             if probe.done() {
@@ -933,7 +1124,7 @@ async fn watch_resume(id: &'static str, slot: ResumeSlot, resume: u64) {
             probe.frame(platform::now_ms(), platform::tap_peak(id))
         };
         if let Some(report) = report {
-            report_resume(&report);
+            report_resume(report);
             return;
         }
     }
@@ -1397,7 +1588,7 @@ struct StartOver(Signal<Option<ItemRef>>);
 /// Who is signed in, as the account menu shows them; a screen that changes
 /// the avatar restarts it.
 #[derive(Clone, Copy)]
-pub(super) struct AccountMe(Resource<Option<pharos_client::api::Me>>);
+pub(super) struct AccountMe(pub(super) Resource<Option<pharos_client::api::Me>>);
 
 /// What screens share: the signed-in API (none until resumed) and the
 /// machine, so a `revoked` answer can send the app to sign-in.
@@ -1410,28 +1601,162 @@ pub(super) struct Ctx {
     pub(super) marks: Signal<u32>,
 }
 
+/// How long a [`Flash`] line stays up.
+const FLASH_MS: u32 = 7000;
+
+/// A line over the screen for an action that has no screen of its own to
+/// report on, such as a watched mark or a saved mix that failed (B824).
+/// Provided by the app root; the newest line replaces the last and clears
+/// itself.
+#[derive(Clone, Copy)]
+pub(super) struct Flash {
+    line: Signal<Option<Notice>>,
+    generation: Signal<u32>,
+}
+
+impl Flash {
+    pub(super) fn say(mut self, text: String, error: bool) {
+        let this = self.generation.peek().wrapping_add(1);
+        self.generation.set(this);
+        self.line.set(Some(Notice { text, error }));
+        spawn(async move {
+            platform::sleep_ms(FLASH_MS).await;
+            if self.generation.try_peek().is_ok_and(|g| *g == this) {
+                self.line.set(None);
+            }
+        });
+    }
+}
+
+/// Which of an item's marks a [`mark_handler`] stores.
+#[derive(Clone, Copy)]
+enum Mark {
+    Played,
+    Favorite,
+}
+
+impl Mark {
+    fn label(self) -> &'static str {
+        match self {
+            Mark::Played => "played",
+            Mark::Favorite => "favorite",
+        }
+    }
+}
+
+/// Stores one kind of mark for `(item, on, name)`, one per item at a time
+/// (a second click before the reload would record a second play), says in
+/// the flash line when the server refuses, and reloads the screen either
+/// way: a season that failed part way through has some episodes marked, and
+/// the screen shows what is stored.
+fn mark_handler(
+    mark: Mark,
+    api: Signal<Option<NativeApi>>,
+    machine: Signal<Machine>,
+    flash: Flash,
+    mut marks: Signal<u32>,
+    mut stored: Signal<Option<(ItemRef, bool)>>,
+) -> EventHandler<(ItemRef, bool, String)> {
+    let marking = Rc::new(RefCell::new(std::collections::HashSet::<ItemRef>::new()));
+    EventHandler::new(move |(id, on, name): (ItemRef, bool, String)| {
+        let Some(api) = api.peek().clone() else {
+            return;
+        };
+        let what = mark.label();
+        if !marking.borrow_mut().insert(id) {
+            platform::info(&format!(
+                "pharos: mark {id} {what}={on} skipped: one in flight"
+            ));
+            return;
+        }
+        let marking = Rc::clone(&marking);
+        spawn(async move {
+            let call = call("mark", what);
+            let result = match mark {
+                Mark::Played => api.set_played(&call, id, on).await,
+                Mark::Favorite => api.set_favorite(&call, id, on).await,
+            };
+            match settle(machine, result) {
+                Ok(now) => {
+                    if matches!(mark, Mark::Played) {
+                        stored.set(Some((id, now)));
+                    }
+                }
+                Err(e) => {
+                    platform::warn(&format!("pharos: marking {id} {what}={on} failed: {e}"));
+                    let line = match mark {
+                        Mark::Played => super::views::mark_failure_line(&name, on, &e),
+                        Mark::Favorite => super::views::favorite_failure_line(&name, on, &e),
+                    };
+                    flash.say(line, true);
+                }
+            }
+            marking.borrow_mut().remove(&id);
+            marks += 1;
+        });
+    })
+}
+
 #[component]
 fn NativeApp(route: Route) -> Element {
     let mut machine = use_signal(Machine::new);
+    // The player shows a lost connection itself; the shell under it is out
+    // of sight (spec 038 FR-503).
+    let connection_lost = use_memo(move || machine.read().reconnecting());
+    use_context_provider(|| ConnectionLost(connection_lost));
     let mut api = use_signal(|| None::<NativeApi>);
     let mut task = use_signal(|| None::<dioxus::core::Task>);
     let mut started = use_signal(|| None::<u32>);
+    // A connection attempt that has not answered in a while (a tunnel, where
+    // the browser still says it is online) lets kept books open meanwhile.
+    let mut slow_connect = use_signal(|| false);
     // A page loaded before a deploy reconnects to the newer server, which may
     // send values this build cannot read: it asks to be reloaded.
     let outdated = use_signal(|| false);
     // Dismissed for the rest of this run; a restart shows it again.
     let mut update_dismissed = use_signal(|| false);
-    let mut marks = use_signal(|| 0u32);
+    let marks = use_signal(|| 0u32);
+    // Bumped by a library change the server pushes; marks by a user data one.
+    let library_rev = use_signal(|| 0u32);
+    use_context_provider(|| super::live::LibraryRev(library_rev));
+    let scan = use_signal(crate::views::scan_progress::ScanView::default);
+    use_context_provider(|| crate::views::scan_progress::ScanWatch(scan));
+    super::live::use_live_updates(api, marks, library_rev, scan);
+    let flash = Flash {
+        line: use_signal(|| None),
+        generation: use_signal(|| 0),
+    };
+    use_context_provider(|| flash);
     use_context_provider(|| Ctx {
         api,
         machine,
         marks,
+    });
+    // One manage token per connection, reused each time Manage opens (B920).
+    let mut held_manage = use_signal(|| None);
+    use_context_provider(|| super::manage::HeldManageToken(held_manage));
+    let manage_tab = use_signal(|| None::<crate::views::AdminTab>);
+    use_context_provider(|| super::manage::ManageTab(manage_tab));
+    let manage_focus = use_signal(|| None::<String>);
+    use_context_provider(|| super::manage::ManageFocus(manage_focus));
+    let mut flagged_list = use_signal(|| None);
+    let mut flagged_asked = use_signal(|| false);
+    use_context_provider(|| super::manage::FlaggedShows {
+        list: flagged_list,
+        asked: flagged_asked,
+    });
+    use_effect(move || {
+        let _ = api.read();
+        held_manage.set(None);
+        flagged_list.set(None);
+        flagged_asked.set(false);
     });
     // A reloaded tab joins the group it was in again (B665): the server kept
     // its seat for the socket-loss grace, and the group's item brings the
     // tab to what the group plays. Read before this page publishes a view.
     let kept_group = use_hook(|| Rc::new(RefCell::new(super::group_app::kept_before_load())));
     let together = use_context::<Together>();
+    let together_again = together.clone();
     use_effect(move || {
         let Some(api) = api.read().clone() else {
             return;
@@ -1442,48 +1767,77 @@ fn NativeApp(route: Route) -> Element {
         };
         platform::info(&format!("pharos: group rejoin reason=reload group={id}"));
         let session = together.session(&api);
+        let mut note = together.note;
+        let started = platform::unix_ms();
         spawn_forever(async move {
-            if let Err(e) = session.join(&id).await {
-                platform::info(&format!(
+            use super::group_session::{rejoin_event, RejoinOutcome};
+            let joined = session.join(&id).await;
+            let waited = platform::unix_ms().saturating_sub(started);
+            let (outcome, cause) = match &joined {
+                Ok(_) => (RejoinOutcome::Rejoined, None),
+                Err(e) if e.is_superseded() => (RejoinOutcome::Superseded, None),
+                Err(e) => (RejoinOutcome::Failed, Some(e.0.as_str())),
+            };
+            platform::report_event(rejoin_event("reload", &id, outcome, 1, waited, cause));
+            if outcome != RejoinOutcome::Failed {
+                return;
+            }
+            if let Err(e) = joined {
+                platform::warn(&format!(
                     "pharos: group rejoin failed group={id} error={}",
                     e.0
                 ));
+                note.set(Some(super::group_app::rejoin_failure(&e.0)));
             }
         });
     });
+    // Each later API is a new connection: a group membership on the old one
+    // is joined again over it.
+    let resumed_once = use_hook(|| Rc::new(Cell::new(false)));
+    use_effect(move || {
+        let Some(api) = api.read().clone() else {
+            return;
+        };
+        if resumed_once.replace(true) {
+            together_again.reconnected(&api);
+        }
+    });
+    // Reading saved offline is sent from wherever the user is (spec 036).
+    #[cfg(all(feature = "web", target_arch = "wasm32"))]
+    super::reader_web::use_pending_flush(api);
     // The play queue lives as long as the app, across pages and songs.
     let queue = use_signal(Queue::default);
     use_context_provider(|| QueueCtx(queue));
+    // Films, episodes and music videos queue apart from songs (V853).
+    use_context_provider(|| VideoQueueCtx(Signal::new(Queue::default()), Signal::new(false)));
     // The mix that is on keeps the queue topped up (spec 024, B441).
     let mix = use_signal(|| None::<ActiveMix>);
     use_context_provider(|| MixCtx(mix));
+    // Bumped when a saved mix is stored, so every list of them reloads.
+    use_context_provider(|| mixes::SavedRev(Signal::new(0)));
+    // Whether the queue is docked beside the compact player (B900).
+    use_context_provider(|| QueueDock(Signal::new(super::listen::dock_shown())));
     mixes::use_top_up(api, queue, mix);
+    let stored = use_context_provider(|| StoredMark(Signal::new(None))).0;
     use_context_provider(|| {
-        let marking = Rc::new(RefCell::new(std::collections::HashSet::<ItemRef>::new()));
-        MarkPlayed(EventHandler::new(move |(id, played): (ItemRef, bool)| {
-            let Some(api) = api.peek().clone() else {
-                return;
-            };
-            // One mark per item at a time: a second click before the reload
-            // would record a second play.
-            if !marking.borrow_mut().insert(id) {
-                platform::info(&format!(
-                    "pharos: mark {id} played={played} skipped: one in flight"
-                ));
-                return;
-            }
-            let marking = Rc::clone(&marking);
-            spawn(async move {
-                let result = api.set_played(&call("mark", "played"), id, played).await;
-                if let Err(e) = settle(machine, result) {
-                    platform::warn(&format!("pharos: marking {id} played={played} failed: {e}"));
-                }
-                marking.borrow_mut().remove(&id);
-                // Reload either way: a season that failed part way through
-                // has some episodes marked, and the screen shows what is stored.
-                marks += 1;
-            });
-        }))
+        MarkPlayed(mark_handler(
+            Mark::Played,
+            api,
+            machine,
+            flash,
+            marks,
+            stored,
+        ))
+    });
+    use_context_provider(|| {
+        MarkFavorite(mark_handler(
+            Mark::Favorite,
+            api,
+            machine,
+            flash,
+            marks,
+            stored,
+        ))
     });
     let search = Search {
         text: use_signal(String::new),
@@ -1493,6 +1847,8 @@ fn NativeApp(route: Route) -> Element {
     use_context_provider(|| search);
     let mut palette = Palette(use_signal(|| false));
     use_context_provider(|| palette);
+    let mut report_open = ReportOpen(use_signal(|| false));
+    use_context_provider(|| report_open);
     super::keys::provide_key_mode();
     let whats_new_state = use_whats_new_state();
     use_context_provider(|| whats_new_state);
@@ -1500,8 +1856,15 @@ fn NativeApp(route: Route) -> Element {
         Rc::new(platform::on_key(move |key, ctrl, meta| {
             // Signed out there is no palette to open: leave the key alone
             // rather than open one that pops up right after sign-in.
-            let toggle = palette::is_toggle(key, ctrl, meta) && api.peek().is_some();
+            let signed_in = api.peek().is_some();
+            if report::is_shortcut(key, ctrl, meta) && signed_in {
+                report::note("key ctrl+shift+d: report a problem");
+                report_open.0.set(true);
+                return true;
+            }
+            let toggle = palette::is_toggle(key, ctrl, meta) && signed_in;
             if toggle {
+                report::note("key ctrl+k: palette");
                 let opening = !*palette.0.peek();
                 if opening {
                     search.clear();
@@ -1514,6 +1877,8 @@ fn NativeApp(route: Route) -> Element {
     let nav = use_context::<Nav>();
     let mut start_over = use_signal(|| None::<ItemRef>);
     use_context_provider(|| StartOver(start_over));
+    let play_picks = use_signal(|| None);
+    use_context_provider(|| PlayPicks(play_picks));
     use_context_provider(|| {
         PlayFromStart(EventHandler::new(move |id: ItemRef| {
             start_over.set(Some(id));
@@ -1524,8 +1889,13 @@ fn NativeApp(route: Route) -> Element {
     // signed-out page never shows the last user's item to the next one.
     let PageNames(mut names) = use_context::<PageNames>();
     use_effect(move || {
-        if matches!(machine.read().phase(), Phase::SignIn { .. }) && !names.peek().is_empty() {
-            names.write().clear();
+        if matches!(machine.read().phase(), Phase::SignIn { .. }) {
+            // Every road to sign-in, a revoked session or a refused resume
+            // included: the next user's report must not carry this trail.
+            report::forget();
+            if !names.peek().is_empty() {
+                names.write().clear();
+            }
         }
     });
     // Signing out ends the session, and the player with it; signing in
@@ -1551,6 +1921,7 @@ fn NativeApp(route: Route) -> Element {
     // keeps the last list until the new one arrives.
     let mut libraries = use_signal(Vec::<Item>::new);
     use_effect(move || {
+        let _ = library_rev();
         let Some(api) = api.read().clone() else {
             return;
         };
@@ -1585,6 +1956,15 @@ fn NativeApp(route: Route) -> Element {
         match phase {
             Phase::Connecting if *started.peek() != Some(epoch) => {
                 started.set(Some(epoch));
+                if kept_any() {
+                    spawn(async move {
+                        platform::sleep_ms(SLOW_CONNECT_MS).await;
+                        let m = machine.peek();
+                        if m.epoch() == epoch && *m.phase() == Phase::Connecting {
+                            slow_connect.set(true);
+                        }
+                    });
+                }
                 if let Some(old) = task.write().take() {
                     old.cancel();
                 }
@@ -1592,7 +1972,12 @@ fn NativeApp(route: Route) -> Element {
                 // so the screens keep what they loaded.
                 task.set(Some(spawn(connect(machine, api, outdated, epoch, delay))));
             }
-            Phase::Connecting | Phase::Ready => {}
+            Phase::Connecting => {}
+            Phase::Ready => {
+                if *slow_connect.peek() {
+                    slow_connect.set(false);
+                }
+            }
             _ => {
                 if let Some(old) = task.write().take() {
                     old.cancel();
@@ -1613,7 +1998,10 @@ fn NativeApp(route: Route) -> Element {
         async move {
             let api = api?;
             match api.me(&call("shell", "me")).await {
-                Ok(me) => Some(me),
+                Ok(me) => {
+                    reconcile_kept_books(&me.id);
+                    Some(me)
+                }
                 Err(e) => {
                     platform::warn(&format!("account: me failed: {e}"));
                     None
@@ -1626,15 +2014,21 @@ fn NativeApp(route: Route) -> Element {
 
     // Ready and reconnecting render through this one node, so a dropped
     // socket does not remount the screen (and its playing video).
+    // With the native API off there is no session to ask for a manage
+    // token, so Manage is the older app with its own sign-in.
+    if route == Route::Manage && matches!(machine.read().phase(), Phase::NotEnabled) {
+        return rsx! { RootApp {} };
+    }
     if machine.read().shows_screens() {
         let notice = {
             let m = machine.read();
             if m.reconnecting() {
-                Some("Connection lost. Reconnecting…".to_owned())
+                None
             } else {
                 m.notice().map(str::to_owned)
             }
         };
+        let reconnecting = machine.read().reconnecting();
         let me = me.read().clone().flatten();
         // The update notice waits while the full player is up: it sat over
         // the picture for the whole film, and nothing in it is urgent there.
@@ -1650,14 +2044,20 @@ fn NativeApp(route: Route) -> Element {
                     WhatsNewButton {}
                     AccountMenu {
                         me,
+                        kept_books: move |()| kept_book_count(),
                         on_sign_out: move |_| {
                             if machine.peek().signing_out() {
                                 return;
                             }
                             machine.write().apply(Event::SignOutSubmitted);
+                            report::forget();
                             spawn(async move {
                                 let reply = platform::sign_out().await;
                                 machine.write().apply(Event::SignOutAnswered(reply));
+                                // Signed out: no kept book stays on the device.
+                                if matches!(machine.peek().phase(), Phase::SignIn { .. }) {
+                                    forget_kept_books("sign-out").await;
+                                }
                             });
                         },
                     }
@@ -1680,8 +2080,14 @@ fn NativeApp(route: Route) -> Element {
                         }
                     }
                 }
+                if reconnecting {
+                    p { class: "pharos-error pharos-connection-shell", role: "alert", {CONNECTION_LOST} }
+                }
                 if let Some(message) = notice {
                     ErrorNote { message }
+                }
+                if let Some(line) = flash.line.read().clone() {
+                    FlashNote { text: line.text, error: line.error }
                 }
                 Screen { route: route.clone() }
                 StageView {}
@@ -1693,6 +2099,9 @@ fn NativeApp(route: Route) -> Element {
                 if (palette.0)() {
                     PaletteScreen {}
                 }
+                if (report_open.0)() {
+                    ReportScreen {}
+                }
             }
         };
     }
@@ -1700,6 +2109,11 @@ fn NativeApp(route: Route) -> Element {
     match phase {
         Phase::Connecting | Phase::Ready => {
             let m = machine.read();
+            // Cut off from the server, kept books still open (spec 036 US3).
+            let cut_off = m.waiting().is_some() || platform_offline() || slow_connect();
+            if let Some(offline) = cut_off.then(|| offline_start(&route)).flatten() {
+                return offline;
+            }
             match m.waiting() {
                 Some(why) => rsx! {
                     StatusView {
@@ -1827,6 +2241,20 @@ pub(super) fn call(route: &str, action: &str) -> CallInfo {
 
 /// A finished load: the value, or the message to show. A `revoked` answer
 /// also sends the app to sign-in.
+/// As [`settle`], for a play: the failure keeps its kind and trace id for
+/// the panel's hint and details line (038 FR-403/404).
+fn settle_start<T>(
+    mut machine: Signal<Machine>,
+    result: Result<T, ClientError>,
+) -> Result<T, StartFailure> {
+    result.map_err(|e| {
+        if e.needs_sign_in() {
+            machine.write().apply(Event::NeedsSignIn);
+        }
+        StartFailure::from_client(&e)
+    })
+}
+
 fn settle<T>(mut machine: Signal<Machine>, result: Result<T, ClientError>) -> Result<T, String> {
     result.map_err(|e| {
         if e.needs_sign_in() {
@@ -1841,28 +2269,140 @@ fn Screen(route: Route) -> Element {
     match route {
         Route::Home => rsx! { HomeScreen {} },
         Route::Browse(id) => rsx! { BrowseScreen { id } },
-        Route::Title(id) => rsx! { TitleScreen { id } },
+        // Remounted per title so the version pick is read for each one.
+        Route::Title(id) => remount_on(&id.to_string(), rsx! { TitleScreen { id } }),
+        Route::Person(id) => rsx! { PersonScreen { id } },
+        Route::Favourites => rsx! { FavouritesScreen {} },
         // The stage beside the screen draws the player (spec 020).
         Route::Watch(_) => rsx! {},
+        Route::Read(id) => remount_on(&id.to_string(), reader_screen(id)),
         Route::SignIn => rsx! { Redirect { to: Route::Home } },
-        // `Root` mounts the older panes for this route.
-        Route::Manage => rsx! { Redirect { to: Route::Manage } },
+        Route::Manage => rsx! { super::manage::ManageScreen {} },
         Route::Appearance => {
             rsx! { SettingsLayout { current: Section::Appearance, AppearanceScreen {} } }
         }
         Route::Account => rsx! { SettingsLayout { current: Section::Account, AccountScreen {} } },
         Route::ApproveDevice => {
-            rsx! { SettingsLayout { current: Section::Devices, ApproveDeviceScreen {} } }
+            rsx! {
+                SettingsLayout { current: Section::Devices,
+                    ApproveDeviceScreen {}
+                    MyDevicesScreen {}
+                }
+            }
         }
         Route::Playback => {
             rsx! { SettingsLayout { current: Section::Playback, PlaybackScreen {} } }
         }
         Route::Privacy => rsx! { SettingsLayout { current: Section::Privacy, PrivacyScreen {} } },
+        Route::Offline => rsx! { SettingsLayout { current: Section::Offline, {on_this_device()} } },
         Route::Find => rsx! { FindRedirect {} },
         Route::Together => rsx! { TogetherScreen {} },
         Route::TogetherGroup(id) => rsx! { InviteScreen { id } },
         Route::NotFound(path) => rsx! { ErrorNote { message: format!("Nothing at {path}.") } },
     }
+}
+
+/// Deletes every kept book and its record (spec 036 FR-005).
+#[cfg(all(feature = "web", target_arch = "wasm32"))]
+async fn forget_kept_books(why: &str) {
+    super::kept_web::clear_all(why).await;
+}
+
+#[cfg(not(all(feature = "web", target_arch = "wasm32")))]
+async fn forget_kept_books(_why: &str) {}
+
+/// How many books are kept on this device, for Sign out's warning; `None`
+/// when the record cannot be read.
+#[cfg(all(feature = "web", target_arch = "wasm32"))]
+fn kept_book_count() -> Option<usize> {
+    super::kept_web::count()
+}
+
+#[cfg(not(all(feature = "web", target_arch = "wasm32")))]
+fn kept_book_count() -> Option<usize> {
+    Some(0)
+}
+
+/// Drops kept books that another user kept, once the signed-in user is known.
+#[cfg(all(feature = "web", target_arch = "wasm32"))]
+fn reconcile_kept_books(user: &str) {
+    super::kept_web::reconcile(user);
+}
+
+#[cfg(not(all(feature = "web", target_arch = "wasm32")))]
+fn reconcile_kept_books(_user: &str) {}
+
+/// Settings, Offline: the books kept on this device. The cache is the
+/// browser's, so the other builds say so.
+#[cfg(all(feature = "web", target_arch = "wasm32"))]
+fn on_this_device() -> Element {
+    rsx! { super::kept_web::OnThisDevice {} }
+}
+
+#[cfg(not(all(feature = "web", target_arch = "wasm32")))]
+fn on_this_device() -> Element {
+    rsx! {
+        section { class: "pharos-settings-page",
+            h2 { "On this device" }
+            p { class: "pharos-settings-lede", "Keeping books to read offline works in the browser app." }
+        }
+    }
+}
+
+/// How long the first connection may take before kept books open without it.
+/// Short, because a phone in a tunnel reports itself online.
+const SLOW_CONNECT_MS: u32 = 3_000;
+
+/// Whether any book is kept on this device: one `localStorage` read, made
+/// only when a connection attempt starts.
+#[cfg(all(feature = "web", target_arch = "wasm32"))]
+fn kept_any() -> bool {
+    super::kept_web::read().is_some()
+}
+
+#[cfg(not(all(feature = "web", target_arch = "wasm32")))]
+fn kept_any() -> bool {
+    false
+}
+
+/// The app with no connection and books kept on the device: the list, or
+/// the reader when a kept book was asked for. `None` when nothing is kept,
+/// so the usual waiting page shows. Browser only; the cache is the browser's.
+#[cfg(all(feature = "web", target_arch = "wasm32"))]
+fn offline_start(route: &Route) -> Option<Element> {
+    let store = super::kept_web::read()?;
+    Some(match route {
+        Route::Read(id) if store.find(&id.to_string()).is_some() => {
+            remount_on(&id.to_string(), reader_screen(*id))
+        }
+        _ => rsx! { super::kept_web::OfflineHome {} },
+    })
+}
+
+#[cfg(not(all(feature = "web", target_arch = "wasm32")))]
+fn offline_start(_route: &Route) -> Option<Element> {
+    None
+}
+
+#[cfg(all(feature = "web", target_arch = "wasm32"))]
+fn platform_offline() -> bool {
+    super::kept_web::is_offline()
+}
+
+#[cfg(not(all(feature = "web", target_arch = "wasm32")))]
+fn platform_offline() -> bool {
+    false
+}
+
+/// The reader draws with `quire-web`, which only the browser build has.
+#[cfg(all(feature = "web", target_arch = "wasm32"))]
+fn reader_screen(id: ItemRef) -> Element {
+    rsx! { super::reader_web::ReaderScreen { id } }
+}
+
+#[cfg(not(all(feature = "web", target_arch = "wasm32")))]
+fn reader_screen(_id: ItemRef) -> Element {
+    rsx! { ErrorNote { message: "Books open in the browser app." } }
 }
 
 /// Where a player sits on the stage.
@@ -1978,16 +2518,19 @@ impl Search {
     fn edit(mut self, ctx: Ctx, value: String) {
         let generation = self.find.write().edit(&value);
         self.text.set(value);
-        self.hits.set(Hits::Idle);
         let Some(generation) = generation else {
+            self.hits.set(Hits::Idle);
             return;
         };
+        // Not "no matches" until the reply says so (B826).
+        self.hits.set(Hits::Searching);
         spawn(async move {
             platform::sleep_ms(DEBOUNCE_MS).await;
             if !self.find.peek().is_current(generation) {
                 return;
             }
             let Some(api) = ctx.api.peek().clone() else {
+                self.hits.set(Hits::Idle);
                 return;
             };
             let term = self.find.peek().term().to_owned();
@@ -2016,6 +2559,65 @@ impl Search {
 /// Whether the Ctrl+K / Cmd+K palette is open.
 #[derive(Clone, Copy)]
 struct Palette(Signal<bool>);
+
+/// Whether the "Report a problem" sheet is open (016 US5).
+#[derive(Clone, Copy)]
+struct ReportOpen(Signal<bool>);
+
+/// The sheet over the page. What it will send is captured and rendered once,
+/// when it opens, and Send posts those very bytes.
+#[component]
+fn ReportScreen() -> Element {
+    let ctx = use_context::<Ctx>();
+    let mut open = use_context::<ReportOpen>().0;
+    let preview = use_hook(|| report::render(&report::ReportContext::capture()));
+    let mut note = use_signal(String::new);
+    let mut sending = use_signal(|| false);
+    let mut result = use_signal(|| None::<Result<String, String>>);
+    rsx! {
+        report::ReportView {
+            open: true,
+            note: note(),
+            preview: preview.clone(),
+            sending: sending(),
+            result: result(),
+            on_note: move |text: String| note.set(text),
+            on_send: move |_| {
+                if *sending.peek() {
+                    return;
+                }
+                let Some(api) = ctx.api.peek().clone() else {
+                    result.set(Some(Err("not signed in".to_owned())));
+                    return;
+                };
+                sending.set(true);
+                let bytes = preview.clone().into_bytes();
+                let text = note.peek().clone();
+                spawn(async move {
+                    let size = bytes.len();
+                    let sent = api
+                        .report_problem(&call("telemetry", "report"), &text, &bytes)
+                        .await;
+                    let outcome = settle(ctx.machine, sent);
+                    match &outcome {
+                        Ok(id) => platform::info(&format!("pharos: report sent id={id} bytes={size}")),
+                        Err(e) => platform::warn(&format!("pharos: report failed bytes={size} error={e}")),
+                    }
+                    sending.set(false);
+                    result.set(Some(outcome));
+                });
+            },
+            on_close: move |_| open.set(false),
+            on_copy: move |id: String| {
+                spawn(async move {
+                    if !platform::copy_text(&id).await {
+                        platform::warn(&format!("pharos: report id {id} not copied: clipboard refused"));
+                    }
+                });
+            },
+        }
+    }
+}
 
 /// An old `/find` link: the palette took the find screen's place.
 #[component]
@@ -2113,14 +2715,22 @@ fn PaletteScreen() -> Element {
         _ => None,
     };
     let mut close = move || palette.0.set(false);
+    let mut report_open = use_context::<ReportOpen>().0;
+    let mut run_command = move |command: palette::Command| {
+        report::note(&format!("palette: {}", command.label()));
+        close();
+        match command {
+            palette::Command::ReportProblem => report_open.set(true),
+        }
+    };
     let on_key = move |evt: KeyboardEvent| match evt.key() {
-        Key::ArrowDown | Key::ArrowUp => {
+        Key::Named(NamedKey::ArrowDown) | Key::Named(NamedKey::ArrowUp) => {
             evt.prevent_default();
-            let down = evt.key() == Key::ArrowDown;
+            let down = evt.key() == Key::Named(NamedKey::ArrowDown);
             let next = find::step(*active.peek(), rows.peek().len(), down);
             active.set(next);
         }
-        Key::Enter => {
+        Key::Named(NamedKey::Enter) => {
             evt.prevent_default();
             let picked = active.peek().and_then(|at| rows.peek().get(at).cloned());
             match picked {
@@ -2128,6 +2738,7 @@ fn PaletteScreen() -> Element {
                     active.set(Some(0));
                     search.edit(ctx, term);
                 }
+                Some(Row::Command(command)) => run_command(command),
                 Some(row) => {
                     if let Some(route) = row.route() {
                         remember();
@@ -2139,7 +2750,7 @@ fn PaletteScreen() -> Element {
             }
         }
         // Closes rather than letting the search input clear itself.
-        Key::Escape => {
+        Key::Named(NamedKey::Escape) => {
             evt.prevent_default();
             close();
         }
@@ -2151,6 +2762,7 @@ fn PaletteScreen() -> Element {
             rows: rows(),
             active: active(),
             failed,
+            searching: matches!(&*search.hits.read(), Hits::Searching),
             on_input: move |value| {
                 active.set(Some(0));
                 search.edit(ctx, value);
@@ -2161,6 +2773,7 @@ fn PaletteScreen() -> Element {
                 close();
             },
             on_close: move |_| close(),
+            on_command: run_command,
         }
     }
 }
@@ -2186,14 +2799,14 @@ fn TopSearch() -> Element {
         _ => Vec::new(),
     };
     let on_key = move |evt: KeyboardEvent| match evt.key() {
-        Key::ArrowDown | Key::ArrowUp => {
+        Key::Named(NamedKey::ArrowDown) | Key::Named(NamedKey::ArrowUp) => {
             evt.prevent_default();
             open.set(true);
-            let down = evt.key() == Key::ArrowDown;
+            let down = evt.key() == Key::Named(NamedKey::ArrowDown);
             let next = find::step(*active.peek(), suggestions().len(), down);
             active.set(next);
         }
-        Key::Enter => {
+        Key::Named(NamedKey::Enter) => {
             evt.prevent_default();
             let picked = active
                 .peek()
@@ -2208,7 +2821,7 @@ fn TopSearch() -> Element {
         }
         // A search input clears itself on Escape; the first press only
         // closes the list, and a second, with the list shut, clears.
-        Key::Escape if *open.peek() => {
+        Key::Named(NamedKey::Escape) if *open.peek() => {
             evt.prevent_default();
             open.set(false);
             active.set(None);
@@ -2285,25 +2898,73 @@ fn TogetherScreen() -> Element {
         let mut error = together.error;
         move || error.set(None)
     });
-    let api = use_hook(move || group_client(ctx));
-    let groups = use_resource({
-        let api = api.clone();
-        move || list_groups(api.clone())
+    // The client is read per request, so Try again after a reconnect asks
+    // over the new connection.
+    let mut groups = use_resource(move || list_groups(group_client(ctx)));
+    // What each group is watching, looked up once the list is in.
+    let watching = use_resource(move || {
+        let listed = groups.read().clone();
+        let native = ctx.api.peek().clone();
+        async move {
+            let (Some(Ok(listed)), Some(native)) = (listed, native) else {
+                return Vec::new();
+            };
+            group_titles(&native, &listed).await
+        }
     });
     let state = groups.read();
     match state.as_ref() {
         None => rsx! { Loading {} },
-        Some(Err(e)) => rsx! { ErrorNote { message: e.0.clone() } },
-        Some(Ok(groups)) => rsx! {
+        Some(Err(e)) => {
+            platform::warn(&format!("pharos: together list failed error={}", e.0));
+            rsx! {
+                LoadFailure {
+                    error: LoadError {
+                        headline: "We couldn't list the groups watching together.".to_owned(),
+                        raw: e.0.clone(),
+                        trace_id: None,
+                    },
+                    on_retry: move |()| groups.restart(),
+                }
+            }
+        }
+        Some(Ok(listed)) => rsx! {
             if let Some(message) = together.error.read().clone() {
                 ErrorNote { message }
             }
             TogetherView {
-                groups: groups.clone(),
+                groups: listed.clone(),
                 on_join: move |id: String| join_group(ctx, together.clone(), nav, id),
+                watching: watching.read().clone().unwrap_or_default(),
             }
         },
     }
+}
+
+/// Each listed group's item as the viewer reads it ("Show · S1 · E2"), by
+/// group id. A lookup that fails leaves that group's title out.
+async fn group_titles(api: &NativeApi, groups: &[GroupSummary]) -> Vec<(String, String)> {
+    let mut titles = Vec::new();
+    for group in groups {
+        let Some(item) = group.item else {
+            continue;
+        };
+        match api.detail(&call("together", "list"), item).await {
+            Ok(detail) => {
+                let (title, line) = super::views::watch_heading(&detail.item);
+                let text = match line {
+                    Some(line) => format!("{title} · {line}"),
+                    None => title,
+                };
+                titles.push((group.id.clone(), text));
+            }
+            Err(e) => platform::warn(&format!(
+                "pharos: together title lookup failed group={} error={e}",
+                group.id
+            )),
+        }
+    }
+    titles
 }
 
 /// An invite link: join the group if it still runs.
@@ -2563,6 +3224,114 @@ fn ApproveDeviceScreen() -> Element {
     }
 }
 
+/// Settings → Devices, "Your devices": loads the user's devices and saves a
+/// device's sound formats on each toggle, one save per device at a time.
+#[component]
+fn MyDevicesScreen() -> Element {
+    use super::my_devices::{with_saved, MyDevicesState, MyDevicesView};
+    let ctx = use_context::<Ctx>();
+    let mut state = use_signal(|| MyDevicesState::Loading);
+    let mut saving = use_signal(std::collections::BTreeSet::<String>::new);
+    let mut problem = use_signal(|| None::<String>);
+    // Counts connections. A call on a closed socket can hang instead of
+    // failing, so a new connection drops every save still in flight: its
+    // device can be changed again, and a late answer from the old one is
+    // ignored.
+    let mut connection = use_signal(|| 0u64);
+    let report = move |e: &ClientError, what: &str| {
+        if e.needs_sign_in() {
+            let mut machine = ctx.machine;
+            machine.write().apply(Event::NeedsSignIn);
+        }
+        platform::warn(&format!("my_devices: {what} failed: {e}"));
+    };
+    // Loads again on a new connection, which may be another account.
+    use_effect(move || {
+        let api = ctx.api.read().clone();
+        *connection.write() += 1;
+        let dropped = std::mem::take(&mut *saving.write());
+        if !dropped.is_empty() {
+            platform::warn(&format!(
+                "my_devices: connection changed with {} save(s) in flight; dropped: {dropped:?}",
+                dropped.len()
+            ));
+            problem.set(Some(
+                "The connection dropped before the sound formats saved. Try again.".to_owned(),
+            ));
+        }
+        let Some(api) = api else {
+            return;
+        };
+        // The old list's toggles would save on the new connection and then
+        // be overwritten by this load's older snapshot; hide them meanwhile.
+        state.set(MyDevicesState::Loading);
+        let loaded_on = *connection.peek();
+        spawn(async move {
+            let result = api.my_devices(&call("my_devices", "my_devices")).await;
+            if *connection.peek() != loaded_on {
+                platform::warn(
+                    "my_devices: device list answered after the connection changed; ignored",
+                );
+                return;
+            }
+            match result {
+                Ok(devices) => state.set(MyDevicesState::Loaded(devices)),
+                Err(e) => {
+                    report(&e, "my devices");
+                    state.set(MyDevicesState::Failed(format!(
+                        "Couldn't load your devices: {e}"
+                    )));
+                }
+            }
+        });
+    });
+    rsx! {
+        MyDevicesView {
+            state: state(),
+            saving: saving(),
+            problem: problem(),
+            on_change: move |(device_id, codecs): (String, Vec<String>)| {
+                let Some(api) = ctx.api.peek().clone() else {
+                    return;
+                };
+                if !saving.write().insert(device_id.clone()) {
+                    return;
+                }
+                problem.set(None);
+                let started_on = *connection.peek();
+                spawn(async move {
+                    let result = api
+                        .set_device_converted_audio(
+                            &call("my_devices", "set_device_converted_audio"),
+                            &device_id,
+                            &codecs,
+                        )
+                        .await;
+                    if *connection.peek() != started_on {
+                        platform::warn(&format!(
+                            "my_devices: save for {device_id} answered after the connection changed; ignored"
+                        ));
+                        return;
+                    }
+                    match result {
+                        Ok(()) => {
+                            let current = state.peek().clone();
+                            if let MyDevicesState::Loaded(devices) = current {
+                                state.set(MyDevicesState::Loaded(with_saved(devices, &device_id, codecs)));
+                            }
+                        }
+                        Err(e) => {
+                            report(&e, "set device converted audio");
+                            problem.set(Some(format!("Couldn't save the sound formats: {e}")));
+                        }
+                    }
+                    saving.write().remove(&device_id);
+                });
+            },
+        }
+    }
+}
+
 /// The Appearance page: the theme gallery, imports, and the editor, mapped
 /// onto the shared theme state.
 #[component]
@@ -2669,18 +3438,187 @@ fn AppearanceScreen() -> Element {
     }
 }
 
+/// One account pref the Playback page edits: the value on screen and the
+/// saves that put it on the server.
+#[derive(Clone, Copy)]
+struct AccountPref {
+    value: Signal<String>,
+    /// Set once the viewer picks, so the mount read, if it answers later,
+    /// does not put the stored (older) value back on screen.
+    picked: Signal<bool>,
+    /// Saves run one at a time, so quick picks can't land out of order.
+    saves: Signal<Option<account_settings::SerialPref>>,
+}
+
+/// Read `key` once into a new [`AccountPref`].
+fn use_account_pref(
+    ctx: Ctx,
+    notice: Signal<Option<Notice>>,
+    key: &'static str,
+    what: &'static str,
+) -> AccountPref {
+    let mut pref = AccountPref {
+        value: use_signal(String::new),
+        picked: use_signal(|| false),
+        saves: use_signal(|| None),
+    };
+    use_hook(move || {
+        let Some(api) = ctx.api.peek().clone() else {
+            return;
+        };
+        spawn(async move {
+            match api.pref(&call("playback", what), key).await {
+                Ok(_) if *pref.picked.peek() => {}
+                Ok(value) => pref.value.set(
+                    value
+                        .map(|v| String::from_utf8_lossy(&v).into_owned())
+                        .unwrap_or_default(),
+                ),
+                Err(e) => {
+                    if e.needs_sign_in() {
+                        let mut machine = ctx.machine;
+                        machine.write().apply(Event::NeedsSignIn);
+                    }
+                    platform::warn(&format!("playback: read {what} failed: {e}"));
+                    notify(
+                        notice,
+                        format!("Could not load your {what} setting: {e}"),
+                        true,
+                    );
+                }
+            }
+        });
+    });
+    pref
+}
+
+impl AccountPref {
+    /// The viewer picked `value`: show it, save it, and on a failed save put
+    /// back what the server holds and say so.
+    fn pick(
+        mut self,
+        ctx: Ctx,
+        notice: Signal<Option<Notice>>,
+        key: &'static str,
+        what: &'static str,
+        value: String,
+    ) {
+        let Some(api) = ctx.api.peek().clone() else {
+            return;
+        };
+        self.picked.set(true);
+        let before = self.value.peek().clone();
+        self.value.set(value.clone());
+        let Some(mut next) = self
+            .saves
+            .write()
+            .get_or_insert_with(|| account_settings::SerialPref::new(before))
+            .pick(value)
+        else {
+            return;
+        };
+        spawn(async move {
+            let mut failed = None;
+            loop {
+                let ok = match api
+                    .set_pref(&call("playback", what), key, next.as_bytes())
+                    .await
+                {
+                    Ok(()) => {
+                        platform::info(&format!("playback: {what} set value={next}"));
+                        true
+                    }
+                    Err(e) => {
+                        if e.needs_sign_in() {
+                            let mut machine = ctx.machine;
+                            machine.write().apply(Event::NeedsSignIn);
+                        }
+                        platform::warn(&format!("playback: set {what} failed: {e}"));
+                        failed = Some(account_settings::refusal_message(&e));
+                        false
+                    }
+                };
+                let mut saves = self.saves.write();
+                let Some(saves) = saves.as_mut() else { return };
+                match saves.finished(next, ok) {
+                    Some(queued) => next = queued,
+                    None => {
+                        let saved = saves.saved().to_string();
+                        if *self.value.peek() != saved {
+                            self.value.set(saved);
+                        }
+                        if let Some(reason) = failed {
+                            notify(
+                                notice,
+                                format!("Could not save your {what} setting: {reason}"),
+                                true,
+                            );
+                        }
+                        return;
+                    }
+                }
+            }
+        });
+    }
+}
+
 /// The Playback page: this device's quality ceiling, subtitle size and
 /// crossfade, each kept in local storage.
 #[component]
 fn PlaybackScreen() -> Element {
+    let ctx = use_context::<Ctx>();
     let notice = use_signal(|| None::<Notice>);
+    let audio_language = use_account_pref(
+        ctx,
+        notice,
+        playback_settings::AUDIO_LANGUAGE_PREF,
+        "audio language",
+    );
+    let subtitle_language = use_account_pref(
+        ctx,
+        notice,
+        playback_settings::SUBTITLE_LANGUAGE_PREF,
+        "subtitle language",
+    );
+    let subtitle_mode = use_account_pref(
+        ctx,
+        notice,
+        playback_settings::SUBTITLE_MODE_PREF,
+        "subtitle mode",
+    );
     let mut max_quality = use_signal(|| stored_bitrate(MAX_BITRATE_KEY, parse_max_bitrate));
     let mut subtitle_size = use_signal(stored_subtitle_size);
     let mut crossfade = use_signal(crossfade_seconds);
     let mut mse_engine = use_signal(stored_mse_engine);
+    let mut episode_turn = use_signal(stored_episode_turn);
     rsx! {
         playback_settings::PlaybackView {
             notice: notice.read().clone(),
+            audio_language: audio_language.value.read().clone(),
+            on_audio_language: move |value: String| {
+                audio_language.pick(ctx, notice, playback_settings::AUDIO_LANGUAGE_PREF, "audio language", value)
+            },
+            subtitle_language: subtitle_language.value.read().clone(),
+            on_subtitle_language: move |value: String| {
+                subtitle_language.pick(ctx, notice, playback_settings::SUBTITLE_LANGUAGE_PREF, "subtitle language", value)
+            },
+            subtitle_mode: subtitle_mode.value.read().clone(),
+            on_subtitle_mode: move |value: String| {
+                subtitle_mode.pick(ctx, notice, playback_settings::SUBTITLE_MODE_PREF, "subtitle mode", value)
+            },
+            episode_turn: episode_turn(),
+            on_episode_turn: move |choice: EpisodeTurn| {
+                if let Err(e) = store_episode_turn(choice) {
+                    notify(
+                        notice,
+                        format!(
+                            "Could not save the episode transition on this device: {e}. It applies until you reload."
+                        ),
+                        true,
+                    );
+                }
+                episode_turn.set(choice);
+            },
             max_quality: max_quality(),
             on_max_quality: move |bps: u64| {
                 store_bitrate(MAX_BITRATE_KEY, bps);
@@ -2689,7 +3627,7 @@ fn PlaybackScreen() -> Element {
             },
             subtitle_size: subtitle_size(),
             on_subtitle_size: move |size: SubtitleSize| {
-                if let Err(e) = store_subtitle_size(size) {
+                if let Err(e) = set_subtitle_size(size) {
                     notify(
                         notice,
                         format!(
@@ -2698,10 +3636,7 @@ fn PlaybackScreen() -> Element {
                         true,
                     );
                 }
-                platform::apply_subtitle_size(size);
-                platform::relift_cues(VIDEO_ID);
                 subtitle_size.set(size);
-                platform::info(&format!("pharos: subtitle_size set={}", size.as_str()));
             },
             crossfade_s: crossfade(),
             on_crossfade: move |seconds| {
@@ -2748,8 +3683,69 @@ fn PrivacyScreen() -> Element {
             }
         }
     });
+    let mut report_open = use_context::<ReportOpen>();
+    let mut reports = use_signal(Vec::new);
+    let mut reload = use_signal(|| 0_u32);
+    // Read again after the sheet closes: a report just sent is in the list.
+    use_resource(move || async move {
+        let _ = reload();
+        if (report_open.0)() {
+            return;
+        }
+        let Some(api) = ctx.api.peek().clone() else {
+            return;
+        };
+        let listed = api
+            .list_reports(&call("telemetry", "list_reports"), false)
+            .await;
+        // A server keeping no reports, or one older than schema 35, is a
+        // normal state: an empty list, not an alert. `unavailable` also
+        // covers a store that failed to read, so it leaves a warning.
+        let older = listed
+            .as_ref()
+            .err()
+            .is_some_and(ClientError::is_unimplemented);
+        let unavailable = matches!(
+            &listed,
+            Err(ClientError::Api {
+                kind: "unavailable",
+                ..
+            })
+        );
+        match settle(ctx.machine, listed) {
+            Ok(rows) => reports.set(rows),
+            Err(e) if older || unavailable => {
+                if unavailable {
+                    platform::warn(&format!("pharos: report list unavailable: {e}"));
+                }
+                reports.set(Vec::new());
+            }
+            Err(e) => notify(
+                notice,
+                format!("Could not load your problem reports: {e}"),
+                true,
+            ),
+        }
+    });
     rsx! {
         privacy::PrivacyView {
+            reports: reports.read().clone(),
+            on_report: move |()| {
+                report::note("settings: report a problem");
+                report_open.0.set(true);
+            },
+            on_delete_report: move |id: String| {
+                let Some(api) = ctx.api.peek().clone() else {
+                    return;
+                };
+                spawn(async move {
+                    let deleted = api.delete_report(&call("telemetry", "delete_report"), &id).await;
+                    if let Err(e) = settle(ctx.machine, deleted) {
+                        notify(notice, format!("Could not delete report {id}: {e}"), true);
+                    }
+                    reload.with_mut(|n| *n = n.wrapping_add(1));
+                });
+            },
             notice: notice.read().clone(),
             diagnostics: diagnostics(),
             diagnostics_key: diagnostics_gen(),
@@ -3029,11 +4025,65 @@ fn WhatsNew(route: Route) -> Element {
     }
 }
 
+/// Opens "Report a problem" from a playback failure panel, the failure
+/// noted first so the report says what the viewer saw and quotes its trace
+/// id (038 FR-403/404).
+fn report_failure(failure: &PlayFailure) {
+    report::note(&failure.crumb());
+    if let Some(trace) = &failure.trace_id {
+        report::trace(trace);
+    }
+    platform::info(&format!(
+        "pharos: report opened from=playback_failure kind={}",
+        failure.kind.label()
+    ));
+    if let Some(ReportOpen(mut open)) = try_consume_context::<ReportOpen>() {
+        open.set(true);
+    }
+}
+
+/// Back one page, or home when there is none to go back to.
+fn leave_player(nav: Nav) {
+    if !platform::go_back() {
+        nav.0.call(Route::Home);
+    }
+}
+
 /// Renders a load's state: loading, its error, or `view` of its value.
-fn loaded<T>(state: Option<&Result<T, String>>, view: impl FnOnce(&T) -> Element) -> Element {
+fn loaded<T, E: std::fmt::Display>(
+    state: Option<&Result<T, E>>,
+    view: impl FnOnce(&T) -> Element,
+) -> Element {
     match state {
         None => rsx! { Loading {} },
-        Some(Err(message)) => rsx! { ErrorNote { message: message.clone() } },
+        Some(Err(message)) => rsx! { ErrorNote { message: message.to_string() } },
+        Some(Ok(value)) => view(value),
+    }
+}
+
+/// As [`settle`], for a screen load that offers "Try again": the failure
+/// keeps its kind and trace id for the plain sentence and details (B823).
+fn settle_load<T>(
+    mut machine: Signal<Machine>,
+    result: Result<T, ClientError>,
+) -> Result<T, LoadError> {
+    result.map_err(|e| {
+        if e.needs_sign_in() {
+            machine.write().apply(Event::NeedsSignIn);
+        }
+        LoadError::from_client(&e)
+    })
+}
+
+/// As [`loaded`], with a failure that offers "Try again" through `retry`.
+fn loaded_or_retry<T>(
+    state: Option<&Result<T, LoadError>>,
+    retry: EventHandler<()>,
+    view: impl FnOnce(&T) -> Element,
+) -> Element {
+    match state {
+        None => rsx! { Loading {} },
+        Some(Err(error)) => rsx! { LoadFailure { error: error.clone(), on_retry: retry } },
         Some(Ok(value)) => view(value),
     }
 }
@@ -3041,34 +4091,46 @@ fn loaded<T>(state: Option<&Result<T, String>>, view: impl FnOnce(&T) -> Element
 #[component]
 fn HomeScreen() -> Element {
     let ctx = use_context::<Ctx>();
-    let home = use_resource(move || {
+    let library = try_use_context::<super::live::LibraryRev>();
+    let mut home = use_resource(move || {
         let api = ctx.api.read().clone();
+        // Continue Watching and Next Up follow watched marks; the rails
+        // follow the library.
+        let _ = (ctx.marks)();
+        let _ = library.map(|l| (l.0)());
         async move {
             let api = api?;
-            Some(settle(ctx.machine, api.home(&call("home", "load")).await))
+            Some(settle_load(
+                ctx.machine,
+                api.home(&call("home", "load")).await,
+            ))
         }
     });
     let state = home.read();
-    loaded(state.as_ref().and_then(Option::as_ref), |home: &Home| {
-        rsx! { HomeView { home: home.clone() } }
-    })
+    loaded_or_retry(
+        state.as_ref().and_then(Option::as_ref),
+        EventHandler::new(move |()| home.restart()),
+        |home: &Home| rsx! { HomeView { home: home.clone() } },
+    )
 }
 
 #[component]
 fn BrowseScreen(id: ItemRef) -> Element {
     let ctx = use_context::<Ctx>();
+    let library = try_use_context::<super::live::LibraryRev>();
     // The screen stays mounted when a tile or season tab opens another
     // parent, so the load follows `id` instead of running once.
-    let listing = use_resource(use_reactive!(|(id,)| {
+    let mut listing = use_resource(use_reactive!(|(id,)| {
         let api = ctx.api.read().clone();
         let _ = (ctx.marks)();
+        let _ = library.map(|l| (l.0)());
         async move {
             let api = api?;
             let result = browse::load(&api, &call("browse", "load"), id, |line| {
                 platform::warn(&line)
             })
             .await;
-            Some((id, settle(ctx.machine, result)))
+            Some((id, settle_load(ctx.machine, result)))
         }
     }));
     let state = listing.read();
@@ -3080,15 +4142,23 @@ fn BrowseScreen(id: ItemRef) -> Element {
         .and_then(|(_, r)| r.as_ref().ok())
         .map(|browse| browse.name(id));
     use_page_name(id, name);
-    loaded(
-        state
-            .as_ref()
-            .and_then(Option::as_ref)
-            .map(|(_, result)| result),
-        |browse: &browse::Browse| {
-            rsx! { SeenBrowse { browse: browse.clone() } }
-        },
-    )
+    // The last parent's listing stays up while the next loads (so a tile
+    // tap never blanks the page), dimmed and marked busy (B822).
+    let busy = state
+        .as_ref()
+        .and_then(Option::as_ref)
+        .is_some_and(|(asked, _)| *asked != id);
+    rsx! {
+        Busy { busy,
+            {loaded_or_retry(
+                state.as_ref().and_then(Option::as_ref).map(|(_, result)| result),
+                EventHandler::new(move |()| listing.restart()),
+                |browse: &browse::Browse| {
+                    rsx! { SeenBrowse { browse: browse.clone() } }
+                },
+            )}
+        }
+    }
 }
 
 /// What the members of the group we are in have seen of `ids`, fetched
@@ -3153,11 +4223,53 @@ fn SeenBrowse(browse: browse::Browse) -> Element {
 
 /// A film or episode page with the group's marks on it.
 #[component]
-fn SeenTitle(detail: Detail, on_watch_together: EventHandler<(ItemRef, u64)>) -> Element {
+fn SeenTitle(
+    detail: Detail,
+    on_watch_together: EventHandler<(ItemRef, u64)>,
+    tracks: Option<Element>,
+    version: String,
+    on_version: EventHandler<String>,
+) -> Element {
     let seen = use_group_seen(vec![detail.item.id]);
     let in_group = (use_context::<Together>().view)().active;
     let PlayFromStart(on_play_from_start) = use_context::<PlayFromStart>();
-    rsx! { TitleView { detail, on_watch_together, on_play_from_start, seen, in_group } }
+    let detail_for_keep = detail.clone();
+    rsx! {
+        TitleView {
+            detail,
+            on_watch_together,
+            on_play_from_start,
+            seen,
+            in_group,
+            tracks,
+            version,
+            on_version,
+            keep: keep_control(&detail_for_keep),
+        }
+    }
+}
+
+/// Keep offline for a readable book. The cache is the browser's, so the
+/// other builds have none.
+#[cfg(all(feature = "web", target_arch = "wasm32"))]
+fn keep_control(detail: &Detail) -> Option<Element> {
+    let format = detail.book.as_ref()?.format;
+    Some(rsx! {
+        super::kept_web::KeepButton {
+            id: detail.item.id,
+            title: super::views::display_name(&detail.item),
+            format,
+            place: detail
+                .read_position
+                .as_ref()
+                .map(|p| (p.locator.clone(), p.fraction)),
+        }
+    })
+}
+
+#[cfg(not(all(feature = "web", target_arch = "wasm32")))]
+fn keep_control(_detail: &Detail) -> Option<Element> {
+    None
 }
 
 #[component]
@@ -3175,16 +4287,60 @@ fn TitleScreen(id: ItemRef) -> Element {
     // (B555). The resource keeps its last value while a new id loads, so
     // each result carries the id it was asked for and a stale one shows as
     // loading, never as the previous title's controls.
-    let detail = use_resource(use_reactive!(|(id,)| {
+    let mut detail = use_resource(use_reactive!(|(id,)| {
         let api = ctx.api.read().clone();
         let _ = (ctx.marks)();
         async move {
             let api = api?;
             Some((
                 id,
-                settle(ctx.machine, api.detail(&call("title", "load"), id).await),
+                settle_load(ctx.machine, api.detail(&call("title", "load"), id).await),
             ))
         }
+    }));
+    // The tracks playback would start on, for the pickers to show, asked
+    // only once the title has a choice to offer (a book or a one-track song
+    // has none). Without them the pickers start on each list's first entry
+    // and still hand on only what the viewer changes.
+    let start = use_resource(move || {
+        let api = ctx.api.read().clone();
+        let offered = detail
+            .read()
+            .as_ref()
+            .and_then(Option::as_ref)
+            .filter(|(asked, _)| *asked == id)
+            .and_then(|(_, r)| r.as_ref().ok())
+            .map(|d| {
+                (
+                    d.item.kind,
+                    d.item.kind.playable()
+                        && (d.audio_tracks.len() > 1 || !d.subtitle_tracks.is_empty()),
+                )
+            });
+        async move {
+            let api = api?;
+            let (kind, true) = offered? else {
+                return None;
+            };
+            let asked = api
+                .start_tracks(
+                    &call("title", "tracks"),
+                    id,
+                    &negotiation_capabilities(kind, 0),
+                )
+                .await;
+            let tracks = asked.unwrap_or_else(|e| {
+                platform::warn(&format!("pharos: start tracks unavailable: {e}"));
+                StartTracks::default()
+            });
+            Some((id, tracks))
+        }
+    });
+    // Picks made on an earlier visit are not this visit's.
+    let mut pending = use_context::<PlayPicks>().0;
+    use_effect(use_reactive!(|(id,)| {
+        let _ = id;
+        pending.set(None);
     }));
     // Start a group on this title where the viewer chose, then watch it as
     // its member.
@@ -3210,6 +4366,7 @@ fn TitleScreen(id: ItemRef) -> Element {
             }
         });
     };
+    let mut picked = use_signal(|| stored_version(id));
     let state = detail.read();
     let name = state
         .as_ref()
@@ -3222,22 +4379,169 @@ fn TitleScreen(id: ItemRef) -> Element {
         if let Some(message) = group_error.read().clone() {
             ErrorNote { message }
         }
-        {loaded(
+        {loaded_or_retry(
             state
                 .as_ref()
                 .and_then(Option::as_ref)
                 .filter(|(asked, _)| *asked == id)
                 .map(|(_, result)| result),
+            EventHandler::new(move |()| detail.restart()),
             |detail: &Detail| {
+                let version = versions::chosen_version(&detail.versions, picked().as_deref()).to_owned();
+                let tracks = start
+                    .read()
+                    .as_ref()
+                    .copied()
+                    .flatten()
+                    .filter(|(asked, _)| *asked == id)
+                    // The pickers list the primary's tracks; another
+                    // version's indexes name other streams, so it starts on
+                    // the user's language rules instead.
+                    .filter(|_| version.is_empty())
+                    .map(|(_, start)| {
+                        // A choice made on another episode of the show
+                        // applies here.
+                        let series = show_tracks::show_of(detail);
+                        let start = series.map_or(start, |s| {
+                            let (audio, subtitle) = show_tracks::shown(
+                                &show_tracks::load(s),
+                                detail,
+                                (start.audio, start.subtitle),
+                            );
+                            StartTracks { audio, subtitle }
+                        });
+                        rsx! {
+                            TrackChoices {
+                                key: "{id}",
+                                id,
+                                audio: detail.audio_tracks.clone(),
+                                subtitles: detail.subtitle_tracks.clone(),
+                                start,
+                                series: series.map(str::to_owned),
+                            }
+                        }
+                    });
                 rsx! {
                     SeenTitle {
                         detail: detail.clone(),
                         on_watch_together: on_watch_together.clone(),
+                        tracks,
+                        version,
+                        on_version: move |v: String| {
+                            store_setting(&versions::version_key(id), &v);
+                            // Picks name the last file's streams; another starts afresh.
+                            pending.set(None);
+                            picked.set(Some(v));
+                        },
                     }
                 }
             },
         )}
     }
+}
+
+/// Someone in a cast, and what they appear in. Follows `id` like
+/// [`TitleScreen`], since one person's page can stay mounted as another opens.
+#[component]
+fn PersonScreen(id: ItemRef) -> Element {
+    let ctx = use_context::<Ctx>();
+    let mut page = use_resource(use_reactive!(|(id,)| {
+        let api = ctx.api.read().clone();
+        let _ = (ctx.marks)();
+        async move {
+            let api = api?;
+            Some((
+                id,
+                settle_load(ctx.machine, api.person(&call("person", "load"), id).await),
+            ))
+        }
+    }));
+    let state = page.read();
+    let shown = state
+        .as_ref()
+        .and_then(Option::as_ref)
+        .filter(|(asked, _)| *asked == id)
+        .map(|(_, result)| result);
+    use_page_name(
+        id,
+        shown.and_then(|r| r.as_ref().ok()).map(|p| p.name.clone()),
+    );
+    rsx! {
+        {loaded_or_retry(
+            shown,
+            EventHandler::new(move |()| page.restart()),
+            |page: &PersonPage| rsx! { PersonView { page: page.clone() } },
+        )}
+    }
+}
+
+/// The viewer's favourites, one query per kind, sent together (B1083). A
+/// mark anywhere reloads it.
+#[component]
+fn FavouritesScreen() -> Element {
+    let ctx = use_context::<Ctx>();
+    let mut page = use_resource(move || {
+        let api = ctx.api.read().clone();
+        let _ = (ctx.marks)();
+        async move {
+            let api = api?;
+            let call = call("favourites", "load");
+            let loads = favourites::KINDS.map(|(kind, _)| {
+                let (api, call) = (&api, &call);
+                async move {
+                    api.favorites(call, kind, 0, favourites::PER_KIND)
+                        .await
+                        .map(|page| (kind, page))
+                }
+            });
+            let loaded = async {
+                let mut pages = futures_util::future::join_all(loads)
+                    .await
+                    .into_iter()
+                    .collect::<Result<Vec<_>, _>>()?;
+                // A show or album marked a favourite fills the first page
+                // of episodes or songs with its own, which fold into its
+                // tile (B1084, B1085).
+                let folds = favourites::Folds::of(&pages);
+                for (kind, rail) in pages
+                    .iter_mut()
+                    .filter(|(kind, _)| favourites::folds(*kind))
+                {
+                    for _ in 0..favourites::MAX_EPISODE_TOP_UPS {
+                        if !folds.wants_more(rail) {
+                            break;
+                        }
+                        let start = rail.items.len() as u32;
+                        let next = api
+                            .favorites(&call, *kind, start, favourites::PER_KIND)
+                            .await?;
+                        if next.items.is_empty() {
+                            break;
+                        }
+                        rail.items.extend(next.items);
+                    }
+                }
+                Ok(pages)
+            };
+            Some(settle_load(ctx.machine, loaded.await).map(Favourites::new))
+        }
+    });
+    let state = page.read();
+    rsx! {
+        {loaded_or_retry(
+            state.as_ref().and_then(Option::as_ref),
+            EventHandler::new(move |()| page.restart()),
+            |favourites: &Favourites| rsx! { FavouritesView { favourites: favourites.clone() } },
+        )}
+    }
+}
+
+/// The version last picked for `title` on this device, if any.
+fn stored_version(title: ItemRef) -> Option<String> {
+    platform::stored_theme(&versions::version_key(title))
+        .map_err(|e| platform::warn(&format!("pharos: version choice unreadable: {e}")))
+        .ok()
+        .flatten()
 }
 
 /// A negotiated playback, ready for the player.
@@ -3256,15 +4560,34 @@ struct Playing {
     /// The API generation `grant` was negotiated on.
     grant_gen: Cell<u32>,
     detail: Detail,
+    /// The version playing, so a renewed grant stays on that file (empty: the primary).
+    version: String,
+    /// Its streams against the primary's, which the group's picks name.
+    track_map: track_follow::TrackMap,
     /// The tracks the server started this playback on.
     audio: Option<u32>,
     subtitle: Option<u32>,
     /// The audio stream this playback was asked for. The server may play
     /// another, so `audio` alone cannot tell a request was already made.
     asked_audio: Option<u32>,
+    /// How the server plays it: "direct_play", "direct_stream" or "transcode".
+    method: String,
+    /// The subtitle this playback was asked for: `Default` left it to the
+    /// server, `Off` asked for none.
+    asked_subtitle: TrackChoice,
 }
 
 impl Playing {
+    /// The tracks this playback was negotiated with, for negotiating it again.
+    fn asked(&self) -> TrackPicks {
+        TrackPicks {
+            audio: self
+                .asked_audio
+                .map_or(TrackChoice::Default, TrackChoice::Index),
+            subtitle: self.asked_subtitle,
+        }
+    }
+
     /// Whether the stream has its subtitle drawn in by the server.
     fn burned(&self) -> bool {
         self.subtitle.is_some_and(|i| {
@@ -3292,6 +4615,7 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
     let ctx = use_context::<Ctx>();
     let replace = use_context::<Replace>();
     let together = use_context::<Together>();
+    let group_view = together.view;
     let StageCtx(mut ctx_stage) = use_context::<StageCtx>();
     // A song that follows one handing over fades in as that one fades out.
     // Taken by the first player mounted, so a renegotiated one starts as is.
@@ -3303,8 +4627,40 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
     // Where the player was, so a renegotiation after a reconnect or a track
     // change carries on from there rather than from the stored position.
     let last_ms = use_hook(|| Rc::new(Cell::new(0u64)));
-    // The tracks asked for; changing them negotiates a new playback.
-    let mut picks = use_signal(TrackPicks::default);
+    let was_paused = use_hook(|| Rc::new(Cell::new(false)));
+    // A line over the picture while a renegotiation replaces the player; it
+    // lives here because the player is remounted under it (B816).
+    let notice = use_signal(|| None::<String>);
+    let notice_gen = use_hook(|| Rc::new(Cell::new(0u32)));
+    let notify: Rc<dyn Fn(String)> = {
+        let notice_gen = Rc::clone(&notice_gen);
+        Rc::new(move |line: String| {
+            let mut notice = notice;
+            let this = notice_gen.get().wrapping_add(1);
+            notice_gen.set(this);
+            notice.set(Some(line));
+            let notice_gen = Rc::clone(&notice_gen);
+            spawn(async move {
+                platform::sleep_ms(NOTICE_MS).await;
+                if notice_gen.get() == this {
+                    notice.set(None);
+                }
+            });
+        })
+    };
+    // The tracks asked for, first those the title page handed on; changing
+    // them negotiates a new playback.
+    let mut pending = use_context::<PlayPicks>().0;
+    let mut picks = use_signal(|| preplay::picks_for(id, *pending.peek()));
+    // A version picked in the player; until then the device's stored pick.
+    let mut version_pick = use_signal(|| None::<String>);
+    // Set by a version switch: `picks` then name the primary's streams, for
+    // the next negotiation to map onto the new file.
+    let picks_in_primary = use_hook(|| Rc::new(Cell::new(false)));
+    // The version whose runtime gap was last told, so a renegotiation on the
+    // same file does not tell it again.
+    let gap_told = use_hook(|| Rc::new(RefCell::new(None::<String>)));
+    use_effect(move || pending.set(None));
     // What the connection has shown about this video, kept across the
     // reloads its own decisions cause; the cap it asks for rides the next
     // negotiation.
@@ -3315,6 +4671,9 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
         QualityWatch(Rc::new(RefCell::new(w)))
     });
     let mut auto_cap = use_signal(|| watch.0.borrow().cap());
+    // The manual maximum as the Playback page keeps it, mirrored for the
+    // player's quality control.
+    let mut manual_cap = use_signal(|| stored_bitrate(MAX_BITRATE_KEY, parse_max_bitrate));
     let resume_from = Rc::clone(&last_ms);
     // The episodes either side follow the item, not the playback, so a track
     // change that renegotiates does not look them up again.
@@ -3344,6 +4703,23 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
                     platform::warn(&format!("pharos: episode neighbours unavailable: {e}"))
                 })
                 .ok()
+        }
+    });
+    // A queued video that starts leaves the video queue (V853), unless a
+    // group brought it here; the screen mounts once per play.
+    let video_queue = try_use_context::<VideoQueueCtx>();
+    use_effect(move || {
+        let Some(VideoQueueCtx(mut q, _)) = video_queue else {
+            return;
+        };
+        if group_view.peek().drives(id) {
+            return;
+        }
+        if q.write().take(id) {
+            platform::info(&format!(
+                "pharos: video queue started item={id} upcoming={}",
+                q.peek().upcoming().len()
+            ));
         }
     });
     // A song that starts takes itself out of the queue, or seeds it with the
@@ -3404,14 +4780,20 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
     // The API generation the latest negotiation started on.
     let negotiated_gen = use_hook(|| Rc::new(Cell::new(0u32)));
     let negotiated_at = Rc::clone(&negotiated_gen);
+    let gap_notify = Rc::clone(&notify);
+    let carry_flag = Rc::clone(&picks_in_primary);
     let mut playing = use_resource(move || {
         connected();
         let api = ctx.api.peek().clone();
         let grant_gen = *api_gen.peek();
         negotiated_at.set(grant_gen);
         let resume_from = Rc::clone(&resume_from);
+        let notify = Rc::clone(&gap_notify);
+        let picks_in_primary = Rc::clone(&carry_flag);
+        let gap_told = Rc::clone(&gap_told);
         let started_over = Rc::clone(&started_over);
         let asked = picks();
+        let picked_here = version_pick();
         let auto = auto_cap();
         // A song Previous went back to starts over (B464/V406), as does an
         // item Play from start was pressed on (B500). The press is spent only
@@ -3436,14 +4818,71 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
             // A play outside the full view is the stage's (spec 020 FR-010).
             let info = call("watch", play_action(ctx_stage.peek().view));
             let result = async {
-                let detail = api.detail(&info, id).await?;
+                // The primary first, to learn which versions the title has.
+                let primary = api.detail(&info, id).await?;
+                if matches!(primary.item.kind, ItemKind::Episode | ItemKind::Movie) {
+                    platform::turn_open(&id.to_string());
+                } else {
+                    platform::turn_cancel(&id.to_string(), "not-video");
+                }
+                let stored = picked_here.or_else(|| stored_version(id));
+                let version =
+                    versions::chosen_version(&primary.versions, stored.as_deref()).to_owned();
+                if primary.versions.len() > 1 {
+                    platform::info(&format!(
+                        "pharos: version chosen={version:?} stored={stored:?} of {}",
+                        primary.versions.len()
+                    ));
+                }
+                // The chosen file's tracks and fonts are its own, so its detail
+                // is fetched once more; the primary's stands when it plays.
+                let primary_tracks = (
+                    primary.audio_tracks.clone(),
+                    primary.subtitle_tracks.clone(),
+                );
+                let detail = if version.is_empty() {
+                    primary
+                } else {
+                    api.detail_version(&info, id, &version).await?
+                };
+                let track_map = track_follow::TrackMap::new(
+                    (&detail.audio_tracks, &detail.subtitle_tracks),
+                    (&primary_tracks.0, &primary_tracks.1),
+                );
+                let asked = if picks_in_primary.replace(false) {
+                    let own = track_map.choices_to_own(asked);
+                    platform::info(&format!(
+                        "pharos: version tracks carried item={id} version={version:?} primary={asked:?} own={own:?}"
+                    ));
+                    own
+                } else {
+                    asked
+                };
+                // Every start of an episode comes through here: from its
+                // title page, the next-episode button, up next and the
+                // episode turn alike.
+                let asked = show_tracks::show_of(&detail).map_or(asked, |series| {
+                    // The group names the primary's streams (ADR-0089).
+                    let followed = together.current().and_then(|s| {
+                        let audio = track_map.primary_indexes(activity::TrackKind::Audio);
+                        let subtitles = track_map.primary_indexes(activity::TrackKind::Subtitles);
+                        s.tracks_followed(&audio, &subtitles)
+                            .map(|picks| track_map.picks_to_own(picks))
+                    });
+                    show_tracks::start_picks(
+                        followed.as_ref(),
+                        &show_tracks::load(series),
+                        &detail,
+                        asked,
+                    )
+                });
                 let caps = negotiation_capabilities(detail.item.kind, auto);
-                let (decision, grant) = api.play(&info, id, &caps, asked).await?;
-                Ok::<_, ClientError>((detail, decision, grant))
+                let (decision, grant) = api.play(&info, id, &version, &caps, asked).await?;
+                Ok::<_, ClientError>((detail, version, decision, grant, asked, track_map))
             }
             .await;
             Some(
-                settle(ctx.machine, result).and_then(|(detail, decision, grant)| {
+                settle_start(ctx.machine, result).and_then(|(detail, version, decision, grant, asked, track_map)| {
                     let (mse_engine, engine_reason) = mse_engine_choice();
                     let picked = choose_engine(
                         decision.is_hls(),
@@ -3467,14 +4906,32 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
                         decision.stream_url
                     ));
                     if engine == Engine::Unsupported {
-                        return Err(
-                            "This title needs HLS, which this browser cannot play.".to_owned()
-                        );
+                        return Err(StartFailure::new(
+                            FailureKind::Unplayable,
+                            "This title needs HLS, which this browser cannot play.",
+                        ));
                     }
                     // In a group playing this item, the player starts where
                     // the group is: this member's own resume point would land
                     // after the group's catch-up seek and carry it away (B664).
                     let group_start = together.current().and_then(|s| s.start_for(id));
+                    if let Some(gap_ms) = versions::runtime_gap_ms(&detail.versions, &version) {
+                        let ms = |id: &str| {
+                            detail.versions.iter().find(|v| v.id == id).map_or(0, |v| v.duration_ms)
+                        };
+                        let primary = detail.versions.iter().find(|v| v.primary).map_or("", |v| v.id.as_str());
+                        platform::info(&format!(
+                            "pharos: version runtime_gap item={id} version={version:?} primary_ms={} version_ms={} gap_ms={gap_ms} grouped={}",
+                            ms(primary),
+                            ms(&version),
+                            group_start.is_some()
+                        ));
+                        let told = gap_told.borrow().as_deref() == Some(version.as_str());
+                        if group_start.is_some() && !told {
+                            gap_told.replace(Some(version.clone()));
+                            notify(versions::runtime_gap_notice(gap_ms));
+                        }
+                    }
                     let start_ms = match (resume_from.get(), group_start) {
                         (0, Some(at)) => {
                             platform::info(&format!(
@@ -3504,32 +4961,69 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
                         grant: RefCell::new(grant),
                         grant_gen: Cell::new(grant_gen),
                         detail,
+                        version,
+                        track_map,
                         audio: decision.audio,
                         subtitle: decision.subtitle,
                         asked_audio: match asked.audio {
                             TrackChoice::Index(i) => Some(i),
                             _ => None,
                         },
+                        method: decision.method,
+                        asked_subtitle: asked.subtitle,
                     })))
                 }),
             )
         }
     });
-    // The next episode's name and still, for the "Up next" card. Only an
-    // episode shows one: a song's next track would cost a detail call for
-    // nothing.
+    // What plays after this video: the video queue's first, unless a group
+    // decides what plays (V853).
+    let video_next = use_memo(move || {
+        let video = matches!(
+            playing.read().as_ref(),
+            Some(Some(Ok(p))) if video_kind(p.0.kind)
+        );
+        let grouped = group_view.read().drives(id);
+        video_queue
+            .filter(|_| video && !grouped)
+            .and_then(|VideoQueueCtx(q, _)| q.read().next_besides(id))
+    });
+    // The decision, whenever its inputs change (V853).
+    use_effect(move || {
+        let video = matches!(
+            playing.read().as_ref(),
+            Some(Some(Ok(p))) if video_kind(p.0.kind)
+        );
+        let episode = near
+            .read()
+            .as_ref()
+            .and_then(|n| n.as_ref())
+            .and_then(|(n, _)| n.next);
+        if video {
+            platform::info(&video_next_line(
+                id,
+                video_next(),
+                episode,
+                group_view.read().drives(id),
+            ));
+        }
+    });
+    // The next video's name and still, for the "Up next" card: the queued
+    // video, else the next episode. A song's next track would cost a detail
+    // call for nothing.
     let upcoming = use_resource(move || {
         let api = ctx.api.read().clone();
         let episode = matches!(
             playing.read().as_ref(),
             Some(Some(Ok(p))) if p.0.kind == ItemKind::Episode
         );
-        let next = near
-            .read()
-            .as_ref()
-            .and_then(|n| n.as_ref())
-            .and_then(|(n, _)| n.next)
-            .filter(|_| episode);
+        let next = video_next().or_else(|| {
+            near.read()
+                .as_ref()
+                .and_then(|n| n.as_ref())
+                .and_then(|(n, _)| n.next)
+                .filter(|_| episode)
+        });
         async move {
             let (api, next) = (api?, next?);
             api.detail(&call("watch", "up next"), next)
@@ -3564,7 +5058,7 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
         let Some(api) = ctx.api.peek().clone() else {
             return;
         };
-        let asked = *picks.peek();
+        let asked = p.0.asked();
         let kind = p.0.kind;
         spawn(async move {
             let info = call("watch", "renew");
@@ -3574,7 +5068,7 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
                 if *api_gen.peek() != gen {
                     return;
                 }
-                match api.play(&info, id, &negotiation_capabilities(kind, *auto_cap.peek()), asked).await {
+                match api.play(&info, id, &p.0.version, &negotiation_capabilities(kind, *auto_cap.peek()), asked).await {
                     Ok((decision, grant)) if *api_gen.peek() == gen => {
                         *p.0.grant.borrow_mut() = grant;
                         // The play session id is a stream credential (B256).
@@ -3613,6 +5107,21 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
             ctx_stage.write().ready(play);
         }
     });
+    // The turn onto this item (V790) follows its load, and stops for an
+    // error, a small player or a page left.
+    use_effect(move || match playing.read().as_ref() {
+        Some(Some(Ok(p))) => {
+            platform::turn_ready(&id.to_string(), p.0.image.as_deref(), &p.0.title);
+        }
+        Some(Some(Err(_))) => platform::turn_cancel(&id.to_string(), "playback-error"),
+        _ => {}
+    });
+    use_effect(move || {
+        if ctx_stage.read().view != View::Full {
+            platform::turn_cancel(&id.to_string(), "not-full");
+        }
+    });
+    use_drop(move || platform::turn_cancel(&id.to_string(), "left"));
     let state = playing.read();
     // The song handing over is not the page's.
     let name = state
@@ -3626,29 +5135,148 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
     // window still loading or failed needs a way out of its own.
     let stranded = ctx_stage.read().view != View::Full
         && !matches!(state.as_ref().and_then(Option::as_ref), Some(Ok(_)));
-    let body = loaded(state.as_ref().and_then(Option::as_ref), |p: &PlayingRef| {
-        remount_on(
-            &p.0.session,
-            rsx! {
-                Player {
-                    playing: p.clone(),
-                    last_ms: LastMs(Rc::clone(&last_ms)),
-                    near: near.read().as_ref().and_then(|n| n.as_ref()).map(|n| n.0).unwrap_or_default(),
-                    upcoming: upcoming.read().clone().flatten(),
-                    on_renegotiate: move |next| picks.set(next),
-                    // In place of this episode, as the next-episode button does.
-                    on_advance: move |next| replace.0.call(Route::Watch(next)),
-                    watch: watch.clone(),
-                    on_quality: move |cap| {
-                        store_bitrate(quality::AUTO_RUNG_KEY, cap);
-                        auto_cap.set(cap);
-                    },
-                    slot,
-                    fade_in: fade_in.clone(),
-                }
-            },
-        )
+    // A negotiation that failed in the full view has no player and no shell
+    // to leave by, so it gets the failure panel (B806).
+    let start_failure = match state.as_ref().and_then(Option::as_ref) {
+        Some(Err(reason)) if ctx_stage.read().view == View::Full => Some(reason.clone()),
+        _ => None,
+    };
+    let nav = use_context::<Nav>();
+    use_effect(move || {
+        if let Some(Some(Err(reason))) = &*playing.read() {
+            platform::warn(&format!(
+                "pharos: playback failure shown item={id} kind=negotiate view={} failure={} trace={} reason={reason}",
+                ctx_stage.peek().view.label(),
+                reason.kind.label(),
+                reason.trace_id.as_deref().unwrap_or("none"),
+            ));
+        }
     });
+    // The full view's first load has no player chrome yet, so it carries its
+    // own way out (038 FR-408, V1220).
+    let first_load =
+        ctx_stage.read().view == View::Full && state.as_ref().and_then(Option::as_ref).is_none();
+    let body = match start_failure {
+        None if first_load => rsx! {
+            FirstLoad { on_back: move |()| leave_player(nav) }
+        },
+        Some(reason) => rsx! {
+            PlaybackFailure {
+                failure: PlayFailure::start(reason.clone()),
+                on_retry: move |()| playing.restart(),
+                on_back: move |()| leave_player(nav),
+                on_report: move |()| report_failure(&PlayFailure::start(reason.clone())),
+            }
+        },
+        None => loaded(state.as_ref().and_then(Option::as_ref), |p: &PlayingRef| {
+            remount_on(
+                &p.0.session,
+                rsx! {
+                    Player {
+                        playing: p.clone(),
+                        last_ms: LastMs(Rc::clone(&last_ms)),
+                        near: {
+                            let mut n = near.read().as_ref().and_then(|n| n.as_ref()).map(|n| n.0).unwrap_or_default();
+                            n.next = video_next().or(n.next);
+                            n
+                        },
+                        upcoming: upcoming.read().clone().flatten(),
+                        on_renegotiate: move |next| picks.set(next),
+                        on_version: {
+                            let (last_ms, notify) = (Rc::clone(&last_ms), Rc::clone(&notify));
+                            let picks_in_primary = Rc::clone(&picks_in_primary);
+                            move |to: String| {
+                                let (from, carried) = match playing.peek().as_ref() {
+                                    Some(Some(Ok(p))) => {
+                                        (p.0.version.clone(), p.0.track_map.choices_to_primary(p.0.asked()))
+                                    }
+                                    _ => {
+                                        platform::warn(&format!(
+                                            "pharos: version switch dropped item={id} to={to:?} reason=no playback"
+                                        ));
+                                        return;
+                                    }
+                                };
+                                if to == from {
+                                    return;
+                                }
+                                platform::info(&format!(
+                                    "pharos: version switch item={id} from={from:?} to={to:?} at_ms={} grouped={}",
+                                    last_ms.get(),
+                                    group_view.peek().drives(id)
+                                ));
+                                store_setting(&versions::version_key(id), &to);
+                                notify("Switching version…".to_owned());
+                                // The last file's indexes name other streams in this one.
+                                picks_in_primary.set(true);
+                                picks.set(carried);
+                                version_pick.set(Some(to));
+                            }
+                        },
+                        on_notice: {
+                            let notify = Rc::clone(&notify);
+                            move |line: String| notify(line)
+                        },
+                        notice: notice(),
+                        manual_cap: manual_cap(),
+                        auto_cap: auto_cap(),
+                        on_quality_pick: {
+                            let (watch, notify) = (watch.clone(), Rc::clone(&notify));
+                            move |pick: Option<u64>| {
+                                let now = now_ms_u64();
+                                match pick {
+                                    Some(bps) => {
+                                        if bps == *manual_cap.peek() {
+                                            return;
+                                        }
+                                        store_bitrate(MAX_BITRATE_KEY, bps);
+                                        let kept = {
+                                            let mut w = watch.0.borrow_mut();
+                                            w.set_ceiling(bps, now);
+                                            w.cap()
+                                        };
+                                        store_bitrate(quality::AUTO_RUNG_KEY, kept);
+                                        platform::info(&format!(
+                                            "pharos: max_bitrate set={} from=player auto={}",
+                                            max_bitrate_label(bps),
+                                            max_bitrate_label(kept)
+                                        ));
+                                        notify(quality_choice_notice(bps));
+                                        manual_cap.set(bps);
+                                        auto_cap.set(kept);
+                                    }
+                                    None => {
+                                        watch.0.borrow_mut().clear_cap(now);
+                                        store_bitrate(quality::AUTO_RUNG_KEY, 0);
+                                        platform::info("pharos: auto quality reset from=player");
+                                        notify("Resetting Auto quality…".to_owned());
+                                        auto_cap.set(0);
+                                    }
+                                }
+                            }
+                        },
+                        was_paused: WasPaused(Rc::clone(&was_paused)),
+                        // In place of this episode, as the next-episode button does.
+                        on_advance: move |next| replace.0.call(Route::Watch(next)),
+                        watch: watch.clone(),
+                        on_quality: {
+                            let notify = Rc::clone(&notify);
+                            move |cap| {
+                                let before = *auto_cap.peek();
+                                if before != cap {
+                                    notify(quality_notice(before, cap));
+                                }
+                                store_bitrate(quality::AUTO_RUNG_KEY, cap);
+                                auto_cap.set(cap);
+                            }
+                        },
+                        slot,
+                        fade_in: fade_in.clone(),
+                    }
+                },
+            )
+        }),
+    };
     rsx! {
         {body}
         if stranded {
@@ -3705,6 +5333,52 @@ impl PartialEq for LastMs {
     }
 }
 
+/// Whether the viewer had paused the player, shared with its screen so a
+/// renegotiation that remounts the player does not start a paused video
+/// (B816).
+#[derive(Clone)]
+struct WasPaused(Rc<Cell<bool>>);
+
+impl PartialEq for WasPaused {
+    fn eq(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+/// Whether a freshly mounted video starts by itself: not in a group, whose
+/// play it waits for, and not when the viewer had paused the one it replaces.
+fn autoplay_after(grouped: bool, was_paused: bool) -> bool {
+    !grouped && !was_paused
+}
+
+/// How long a "Switching audio…" style notice stays up.
+const NOTICE_MS: u32 = 4000;
+
+/// The line shown while a quality pick renegotiates the playback.
+fn quality_choice_notice(manual: u64) -> String {
+    if manual == 0 {
+        "Quality: Auto".to_owned()
+    } else {
+        format!("Quality: up to {} Mbps", manual / 1_000_000)
+    }
+}
+
+/// The line shown while a track change renegotiates the playback.
+fn track_notice(audio: bool) -> String {
+    if audio {
+        "Switching audio…"
+    } else {
+        "Switching subtitles…"
+    }
+    .to_owned()
+}
+
+/// The line shown while the quality step renegotiates from `from` to `to` bps.
+fn quality_notice(from: u64, to: u64) -> String {
+    let verb = if to < from { "Lowering" } else { "Raising" };
+    format!("{verb} quality to {} Mbps", to / 1_000_000)
+}
+
 /// The `ui_action` of a play RPC made in `view`.
 fn play_action(view: View) -> &'static str {
     match view {
@@ -3712,6 +5386,65 @@ fn play_action(view: View) -> &'static str {
         View::Floating => "stage_floating",
         View::Mini => "stage_mini",
     }
+}
+
+/// A Leave on its way to the server, awaitable by more than one caller.
+type LeaveInFlight =
+    futures_util::future::Shared<futures_util::future::LocalBoxFuture<'static, ()>>;
+
+/// Whether the connection to the server is down and being reopened.
+#[derive(Clone, Copy)]
+pub struct ConnectionLost(pub Memo<bool>);
+
+const CONNECTION_LOST: &str = "Connection lost. Reconnecting…";
+
+/// How far past a note's deadline its redraw is timed, so the redraw finds it
+/// expired even when the browser fires the timer a little early.
+const TIMER_SLACK_MS: u64 = 50;
+
+/// Whether `text` still shows, `for_ms` after it first did. Redraws once
+/// when its time is up.
+fn use_timed_note(text: Option<&str>, for_ms: u64) -> bool {
+    let timer = use_hook(|| Rc::new(RefCell::new(activity::NoteTimer::default())));
+    let expired = use_signal(|| 0u32);
+    let _ = expired();
+    let shown = timer.borrow_mut().show(text, now_ms_u64(), for_ms);
+    if shown.arm {
+        let mut expired = expired;
+        spawn(async move {
+            // Past the deadline: a timer can fire before the wall clock agrees.
+            platform::sleep_ms(
+                u32::try_from(for_ms.saturating_add(TIMER_SLACK_MS)).unwrap_or(u32::MAX),
+            )
+            .await;
+            expired += 1;
+        });
+    }
+    shown.visible
+}
+
+/// The pill naming who the group waits on, then "ready" for a moment.
+fn use_wait_pill(waiting: &[String], in_group: bool) -> Option<activity::WaitPill> {
+    let tracker = use_hook(|| Rc::new(RefCell::new(activity::WaitTracker::default())));
+    let expired = use_signal(|| 0u32);
+    let _ = expired();
+    if !in_group {
+        *tracker.borrow_mut() = activity::WaitTracker::default();
+        return None;
+    }
+    let (pill, arm) = tracker.borrow_mut().pill(waiting, now_ms_u64());
+    if arm {
+        let mut expired = expired;
+        spawn(async move {
+            platform::sleep_ms(
+                u32::try_from(activity::READY_MS.saturating_add(TIMER_SLACK_MS))
+                    .unwrap_or(u32::MAX),
+            )
+            .await;
+            expired += 1;
+        });
+    }
+    pill
 }
 
 /// The wall clock in unix milliseconds, as the activity log stamps its lines.
@@ -3728,10 +5461,40 @@ fn choice(index: Option<u32>) -> TrackChoice {
     index.map_or(TrackChoice::Off, TrackChoice::Index)
 }
 
+/// The tracks a progress report names. A track the viewer asked for is
+/// named as it plays, so the next play starts on it; a track left to the
+/// server stays `Default`, so the server's language rules keep deciding. An
+/// in-place subtitle switch is what plays now, so it wins over the ask.
+fn reported_tracks(
+    asked_audio: Option<u32>,
+    audio: Option<u32>,
+    asked_subtitle: TrackChoice,
+    subtitle: Option<u32>,
+    switched: Option<TrackChoice>,
+) -> TrackPicks {
+    let audio = match (asked_audio, audio) {
+        (Some(_), Some(playing)) => TrackChoice::Index(playing),
+        _ => TrackChoice::Default,
+    };
+    let asked = match (asked_subtitle, subtitle) {
+        (TrackChoice::Off, _) => TrackChoice::Off,
+        (TrackChoice::Index(_), Some(playing)) => TrackChoice::Index(playing),
+        _ => TrackChoice::Default,
+    };
+    TrackPicks {
+        audio,
+        subtitle: switched.unwrap_or(asked),
+    }
+}
+
 /// The link that joins group `id`: the invite route on this server.
 fn invite_url(origin: &str, id: &str) -> String {
     format!("{origin}{}", Route::TogetherGroup(id.to_owned()).path())
 }
+
+/// How long after the group changes entry this player waits for events from
+/// the old end before its Up next starts over without a seek (B1027).
+const UP_NEXT_RESET_SETTLE_MS: f64 = 2_000.0;
 
 /// Attaches the engine, draws the controls and reports progress: on play,
 /// pause and seek, every 10 s while playing, and one stop when the video
@@ -3744,6 +5507,20 @@ fn Player(
     near: Neighbours,
     upcoming: Option<Item>,
     on_renegotiate: EventHandler<TrackPicks>,
+    /// The viewer picked another version in the player (spec 034 US3).
+    on_version: EventHandler<String>,
+    /// A line to show while the renegotiation replaces this player.
+    on_notice: EventHandler<String>,
+    /// The line the screen is showing over the picture, if any.
+    notice: Option<String>,
+    /// The viewer's manual maximum and the cap Auto settled on, in bps (0 is
+    /// none), for the quality control.
+    manual_cap: u64,
+    auto_cap: u64,
+    /// The viewer picked a maximum (`Some`, 0 is Auto) or reset Auto (`None`)
+    /// in the player.
+    on_quality_pick: EventHandler<Option<u64>>,
+    was_paused: WasPaused,
     /// Plays the next episode once this one is finished: Up next, or the
     /// video ending.
     on_advance: EventHandler<ItemRef>,
@@ -3766,13 +5543,14 @@ fn Player(
     // out until the next is ready, but its end no longer moves the queue.
     let handed_off = use_hook(|| Rc::new(Cell::new(false)));
     let fade_in_cancel = use_hook(|| Rc::new(Cell::new(false)));
-    let resume: ResumeSlot = use_hook(|| Rc::new(RefCell::new((0, None))));
+    let resume: ResumeSlot = use_hook(ResumeSlot::default);
     let fade_in_ms = use_hook(|| fade_in.0.take());
     let clock = use_hook(|| Rc::new(RefCell::new(ReportClock::new())));
     let engine = use_hook(|| Rc::new(RefCell::new(None::<Box<dyn PlaybackEngine>>)));
     let nav = use_context::<Nav>();
     let replace = use_context::<Replace>();
     let together = use_context::<Together>();
+    let group_view = together.view;
     let group = (together.view)();
     let watch_seen = use_group_seen(vec![p.detail.item.id]);
     // The session is read when used: a join can make it after this mounted.
@@ -3808,9 +5586,123 @@ fn Player(
             });
         }
     });
-    let mut failed = use_signal(|| None::<String>);
+    // A group that ended or could not be rejoined is news for a moment, then
+    // out of the picture's way (FR-501).
+    let group_status = group.ended.clone().or_else(|| together.note.read().clone());
+    let status_shown = use_timed_note(group_status.as_deref(), activity::NOTE_MS);
+    let wait_pill = use_wait_pill(&group.waiting, group.active);
+    let connection_lost =
+        try_use_context::<ConnectionLost>().is_some_and(|ConnectionLost(lost)| lost());
+    // The group just left, while Leave can be undone (FR-505).
+    let left_group = use_signal(|| None::<String>);
+    // The leave in flight, which an Undo waits out so the old leave cannot
+    // land after the new join and end it.
+    let leaving = use_hook(|| Rc::new(RefCell::new(None::<LeaveInFlight>)));
+    // A new membership ends the chance to undo the last leave.
+    use_effect(move || {
+        let mut left_group = left_group;
+        if (together.view)().active && left_group.peek().is_some() {
+            left_group.set(None);
+        }
+    });
+    let undo_shown = use_timed_note(
+        left_group.read().as_deref().filter(|_| !group.active),
+        activity::UNDO_LEAVE_MS,
+    );
+    // Taken at mount: the video this one replaces was paused, or not.
+    let start_paused = use_hook(|| was_paused.0.get());
+    let mut sub_size = use_signal(stored_subtitle_size);
+    let mut view_mode = use_signal(stored_view_mode);
+    let vr = use_resource(platform::vr_supported);
+    let mut failed = use_signal(|| None::<PlayFailure>);
+    // A seek still waiting on its first frame, and a clock that ticks once a
+    // second while one does, for the card that says so (B1196).
+    let mut seek_wait = use_signal(|| None::<SeekWait>);
+    let mut seek_tick = use_signal(|| 0u64);
+    use_future(move || async move {
+        loop {
+            platform::sleep_ms(1_000).await;
+            if seek_wait.peek().is_some() {
+                seek_tick.set(now_ms_u64());
+            }
+        }
+    });
+    // Where the media broke, for the skip past it to remember (B1160).
+    let broke_at = use_hook(|| Rc::new(Cell::new(0u64)));
     let saved_volume = use_hook(last_volume);
     let mut media = use_signal(|| MediaState::at_volume(saved_volume.map(|(v, m, _)| (v, m))));
+    // The position changes every tick and the rest of the state seldom. The
+    // player reads `media_rest` and hands `position` to the leaves that show
+    // it, so a tick does not rebuild the player (B815).
+    let mut position = use_signal(|| 0u64);
+    let media_rest = use_memo(move || split_position(media()).0);
+    // What a wait under the spinner is for (038 FR-401): whether this video
+    // has played yet, and, once a wait passes `wait::HINT_AFTER_MS`, the
+    // server's word on whether it is queued for an encoder (FR-402).
+    let started = use_signal(|| false);
+    let mut queue_hint = use_signal(|| None::<pharos_client::api::QueueHint>);
+    // Read when present: the stage can mount before the signed-in shell has
+    // provided it.
+    let account = try_use_context::<AccountMe>();
+    let wait_logged = use_hook(|| Rc::new(RefCell::new(String::new())));
+    // The first `canplay` has checked that autoplay started (038 FR-407),
+    // and whether the browser refused it and waits for a tap.
+    let autoplay_checked = use_hook(|| Rc::new(Cell::new(false)));
+    let mut autoplay_refused = use_signal(|| false);
+    // How "Up next" was last shown, for its decision line.
+    let up_next_mode = use_hook(|| Rc::new(Cell::new(None::<&'static str>)));
+    use_future({
+        let p = Rc::clone(&p);
+        move || {
+            let p = Rc::clone(&p);
+            async move {
+                // When this wait began, when the server was last asked, and
+                // whether it cannot answer (an older server) for this wait.
+                let (mut since, mut asked_at, mut gave_up) = (None::<u64>, 0u64, false);
+                loop {
+                    platform::sleep_ms(1_000).await;
+                    let refused = platform::autoplay_blocked() && media.peek().paused;
+                    if *autoplay_refused.peek() != refused {
+                        autoplay_refused.set(refused);
+                    }
+                    let now = now_ms_u64();
+                    if !(media.peek().loading && failed.peek().is_none()) {
+                        (since, gave_up) = (None, false);
+                        if queue_hint.peek().is_some() {
+                            queue_hint.set(None);
+                        }
+                        continue;
+                    }
+                    let began = *since.get_or_insert(now);
+                    if gave_up
+                        || now.saturating_sub(began) < super::wait::HINT_AFTER_MS
+                        || now.saturating_sub(asked_at) < super::wait::HINT_EVERY_MS
+                    {
+                        continue;
+                    }
+                    asked_at = now;
+                    let grant = p.grant.borrow().clone();
+                    match grant.queue_hint(&call("watch", "queue hint")).await {
+                        // Set only on a change: each set rebuilds the player.
+                        Ok(hint) if media.peek().loading => {
+                            if *queue_hint.peek() != Some(hint) {
+                                queue_hint.set(Some(hint));
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            gave_up = true;
+                            platform::warn(&format!(
+                                "pharos: queue hint failed item={} waited_ms={} reason={e}",
+                                p.detail.item.id,
+                                now.saturating_sub(began)
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    });
     let mut hover_ms = use_signal(|| None::<u64>);
     // The subtitle on screen: the server's pick, then the viewer's.
     let mut subtitle = use_signal(|| p.subtitle);
@@ -3847,6 +5739,13 @@ fn Player(
     });
     let mut up_next = use_signal(UpNext::default);
     let mut up_next_step = use_signal(|| UpNextStep::Hidden);
+    // The group's queue entry the countdown belongs to: a group moving to
+    // another entry of the same item keeps this player, not its Cancel.
+    let up_next_entry = use_hook(|| Rc::new(RefCell::new(String::new())));
+    // A new entry's countdown starts over only once the player has left the
+    // old end, so events from there cannot move the group on (B1027). Holds
+    // when the group changed entry.
+    let up_next_reset = use_hook(|| Rc::new(Cell::new(None::<f64>)));
     let advanced = use_hook(|| Rc::new(Cell::new(false)));
     // An ASS subtitle drawn from its script (ADR-0057), and the pick it is
     // for; its WebVTT stays on screen until the renderer is ready.
@@ -3870,6 +5769,7 @@ fn Player(
     let view = use_memo(move || stage.read().view)();
     let own_queue = use_signal(Queue::default);
     let mut queue = try_use_context::<QueueCtx>().map_or(own_queue, |q| q.0);
+    let video_queue = try_use_context::<VideoQueueCtx>();
     let audio = p.kind == ItemKind::Audio;
     // Whether Back from the full view stops this play on the TV.
     let current = matches!(slot, Slot::Current { .. });
@@ -3880,6 +5780,12 @@ fn Player(
         }
     });
     let playing_id = p.detail.item.id;
+    // A player that gives up must show why, not sit under the turn (V790).
+    use_effect(move || {
+        if failed.read().is_some() {
+            platform::turn_cancel(&playing_id.to_string(), "player-failed");
+        }
+    });
     // A song's next comes from the queue, unless a group decides what plays.
     // A session is kept after its group ends, so ask the group, not it.
     let grouped = group.drives(playing_id);
@@ -3960,7 +5866,7 @@ fn Player(
                 return;
             };
             spawn(async move {
-                for _ in 0..ALIGN_ASKS {
+                loop {
                     platform::sleep_ms(ALIGN_ASK_MS).await;
                     match api.lyrics(&call("watch", "lyrics"), id, true).await {
                         Ok(next) if next.words_pending => {}
@@ -3981,7 +5887,6 @@ fn Player(
                         }
                     }
                 }
-                platform::info("pharos: lyrics word times still pending, gave up");
             });
         }
     });
@@ -4010,6 +5915,62 @@ fn Player(
     use_hook({
         let stop = stop.clone();
         move || Rc::new(platform::on_page_hide(stop))
+    });
+    // A tab that goes hidden reports where it is, since closing it often
+    // fires no pagehide; a page restored from the back/forward cache reports
+    // again (B809).
+    use_hook({
+        let (p, clock, last_ms, switched) = (
+            Rc::clone(&p),
+            Rc::clone(&clock),
+            Rc::clone(&last_ms.0),
+            Rc::clone(&switched),
+        );
+        let retiring = Rc::clone(&retiring);
+        let restored_clock = Rc::clone(&clock);
+        move || {
+            Rc::new(platform::on_page_lifecycle(
+                move || {
+                    if retiring.get() {
+                        return;
+                    }
+                    let here = platform::position_ms(VIDEO_ID);
+                    if here > 0 {
+                        last_ms.set(here);
+                    }
+                    let Some(Outgoing::Report { paused }) =
+                        clock.borrow_mut().on_hidden(platform::now_ms())
+                    else {
+                        return;
+                    };
+                    let grant = p.grant.borrow().clone();
+                    let at = last_ms.get();
+                    let tracks = TrackPicks {
+                        audio: TrackChoice::Default,
+                        subtitle: switched.get().unwrap_or_default(),
+                    };
+                    platform::info(&format!(
+                        "pharos: progress report reason=hidden item={playing_id} at_ms={at} paused={paused}"
+                    ));
+                    platform::spawn_detached(async move {
+                        if let Err(e) = grant
+                            .report(&call("watch", "report"), at, paused, tracks)
+                            .await
+                        {
+                            platform::warn(&format!(
+                                "pharos: progress report failed reason=hidden: {e}"
+                            ));
+                        }
+                    });
+                },
+                move || {
+                    let was_stopped = restored_clock.borrow_mut().restore();
+                    platform::info(&format!(
+                        "pharos: progress reports restored reason=pageshow item={playing_id} was_stopped={was_stopped}"
+                    ));
+                },
+            ))
+        }
     });
     let retire_stop = stop.clone();
     // The group's track picks arrive from outside the Dioxus runtime; this
@@ -4040,6 +6001,7 @@ fn Player(
                         picks.audio, p.audio, p.asked_audio
                     ));
                     if audio.is_some() || burn {
+                        on_notice.call(track_notice(audio.is_some()));
                         on_renegotiate.call(TrackPicks {
                             audio: audio
                                 .or(p.audio)
@@ -4062,11 +6024,14 @@ fn Player(
             p.detail.audio_tracks.clone(),
             p.detail.subtitle_tracks.clone(),
         );
+        let (map, version) = (p.track_map.clone(), p.version.clone());
         move || {
             let video: Rc<dyn GroupPlayer> = Rc::new(VideoPlayer {
                 id: VIDEO_ID,
                 audio,
                 subtitles,
+                map,
+                version,
                 tracks: group_tracks,
             });
             together.attach(item, Rc::clone(&video));
@@ -4127,12 +6092,53 @@ fn Player(
     // The engines call back from browser events, outside the Dioxus runtime.
     let fatal = use_coroutine({
         let stop = stop.clone();
-        move |mut reasons: UnboundedReceiver<String>| {
+        let (p, last_ms, broke_at) = (Rc::clone(&p), Rc::clone(&last_ms.0), Rc::clone(&broke_at));
+        move |mut reasons: UnboundedReceiver<Fatal>| {
             let stop = stop.clone();
+            let (p, last_ms, broke_at) = (Rc::clone(&p), Rc::clone(&last_ms), Rc::clone(&broke_at));
             async move {
-                while let Some(reason) = reasons.next().await {
+                while let Some(fatal) = reasons.next().await {
                     stop();
-                    failed.set(Some(format!("Playback failed: {reason}")));
+                    let kind = fatal.kind;
+                    let reason = fatal.reason;
+                    // Music keeps its own screen, and a group plays one
+                    // timeline for all: neither is offered a skip.
+                    let skippable = kind == FailureKind::Damaged
+                        && p.kind != ItemKind::Audio
+                        && !group_view.peek().drives(playing_id);
+                    // Where the element stopped; a failure before the first
+                    // position tick has not reached `last_ms` yet, and one
+                    // before the start seek is at the start.
+                    let at = [platform::position_ms(VIDEO_ID), last_ms.get(), p.start_ms]
+                        .into_iter()
+                        .find(|&ms| ms > 0)
+                        .unwrap_or(0);
+                    broke_at.set(at);
+                    let skip = skippable
+                        .then(|| {
+                            damage::skip_target(
+                                at,
+                                p.detail.item.runtime_ms,
+                                &scanned_spans(&p),
+                                &stored_skips(playing_id, &p.version),
+                            )
+                        })
+                        .flatten();
+                    platform::warn(&format!(
+                        "pharos: playback failure shown item={playing_id} kind=stream media={} failure={} at_ms={at} skip_to_ms={} source={} reason={reason}",
+                        kind == FailureKind::Damaged,
+                        kind.label(),
+                        skip.map_or(0, |(to, _)| to),
+                        skip.map_or("none", |(_, s)| s.label()),
+                    ));
+                    // Music and groups are offered no skip, but a damaged
+                    // file is still named as one (038 FR-403).
+                    failed.set(Some(match kind {
+                        FailureKind::Damaged => {
+                            PlayFailure::damaged(reason, skip.map(|(to, _)| to))
+                        }
+                        kind => PlayFailure::stream(kind, reason),
+                    }));
                 }
             }
         }
@@ -4187,7 +6193,16 @@ fn Player(
                 };
                 match attached {
                     Ok(e) => *engine.borrow_mut() = Some(e),
-                    Err(e) => failed.set(Some(format!("Could not start playback: {e}"))),
+                    Err(e) => {
+                        platform::warn(&format!(
+                            "pharos: playback failure shown item={playing_id} kind=start reason={e}"
+                        ));
+                        // The engine would not attach to this browser.
+                        failed.set(Some(PlayFailure::start(StartFailure::new(
+                            FailureKind::Unplayable,
+                            e,
+                        ))));
+                    }
                 }
             });
         }
@@ -4257,11 +6272,11 @@ fn Player(
         );
         move || {
             let shown = if burned { None } else { subtitle() };
-            // Read before any return, so a tier drop or a level change
-            // reloads the script in place.
-            let (tier_now, level_now) = (tier(), effects());
+            // Read before any return, so a tier drop, a level change or a
+            // size change reloads the script in place.
+            let (tier_now, level_now, size_now) = (tier(), effects(), sub_size());
             let track = shown.and_then(|i| p.detail.subtitle_tracks.iter().find(|t| t.index == i));
-            let generated = track.and_then(|t| styled_track_url(t, tier_now, level_now));
+            let generated = track.and_then(|t| styled_track_url(t, tier_now, level_now, size_now));
             // A generated track at Off draws as the plain track beside it,
             // never from its source's raw script.
             let script = generated.clone().or_else(|| {
@@ -4473,10 +6488,12 @@ fn Player(
     // handlers can outlive the render that made them, so they read it here.
     let up_next_to = use_hook(|| Rc::new(Cell::new(None::<ItemRef>)));
     // In a group, moving on moves the group (`advance`).
-    up_next_to.set(near.next.filter(|_| p.kind == ItemKind::Episode));
+    // A film's next is only ever a queued video (V853).
+    up_next_to.set(near.next.filter(|_| video_kind(p.kind)));
 
     let on_media = {
         let (advance, up_next_to) = (advance.clone(), Rc::clone(&up_next_to));
+        let (up_next_entry, up_next_reset) = (Rc::clone(&up_next_entry), Rc::clone(&up_next_reset));
         let (p, clock, last_ms, switched) = (
             Rc::clone(&p),
             Rc::clone(&clock),
@@ -4488,20 +6505,57 @@ fn Player(
         let handed_off = Rc::clone(&handed_off);
         let (watch, assess) = (watch.clone(), Rc::clone(&assess));
         let resume = Rc::clone(&resume);
+        let music = p.kind == ItemKind::Audio;
+        let was_paused = was_paused.clone();
+        let autoplays = autoplay_after(grouped, start_paused);
+        let autoplay_checked = Rc::clone(&autoplay_checked);
         move |event: MediaEvent| {
             if retiring.get() {
                 return;
             }
+            // The `autoplay` attribute fails silently when the browser
+            // refuses it; a `play()` of our own at the first `canplay` reads
+            // the refusal, so the player can say "Tap to start" (038 FR-407).
+            if matches!(event, MediaEvent::CanPlay)
+                && autoplays
+                && !*started.peek()
+                && !autoplay_checked.replace(true)
+                && platform::media_state(VIDEO_ID).paused
+            {
+                platform::play(VIDEO_ID);
+            }
             let resumed = match event {
                 MediaEvent::Playing => {
+                    if !*started.peek() {
+                        let mut started = started;
+                        started.set(true);
+                    }
+                    was_paused.0.set(false);
                     let now = platform::now_ms();
-                    resume.borrow_mut().1.as_mut().and_then(|p| p.playing(now))
+                    let mut slot = resume.borrow_mut();
+                    slot.paused_at = None;
+                    slot.probe.as_mut().and_then(|p| p.playing(now))
                 }
-                MediaEvent::Pause => resume.borrow_mut().1.as_mut().and_then(ResumeProbe::paused),
+                MediaEvent::Pause => {
+                    was_paused.0.set(true);
+                    let now = platform::now_ms();
+                    let mut slot = resume.borrow_mut();
+                    // Each pause restarts the clock: a play that never reached
+                    // `playing` (refused, or stalled) did not end the pause
+                    // the listener sees, but the newer pause is what they
+                    // last did. An earlier rest timer sees the newer start
+                    // and stands down.
+                    slot.paused_at = Some(now);
+                    // Only a song is tapped; a video has no context to rest.
+                    if music {
+                        spawn(rest_after_pause(Rc::clone(&resume), now));
+                    }
+                    slot.probe.as_mut().and_then(ResumeProbe::paused)
+                }
                 _ => None,
             };
             if let Some(report) = resumed {
-                report_resume(&report);
+                report_resume(report);
             }
             match event {
                 MediaEvent::Waiting => {
@@ -4510,6 +6564,23 @@ fn Player(
                 }
                 MediaEvent::Seeked => watch.0.borrow_mut().seeked(),
                 _ => {}
+            }
+            // Whatever the seek waited on is over once the element lands,
+            // plays or ends; a wait left standing would put its card over a
+            // later, unrelated stall (B1196).
+            if matches!(
+                event,
+                MediaEvent::Seeked | MediaEvent::Playing | MediaEvent::Ended
+            ) {
+                if let Some(w) = seek_wait.take() {
+                    let waited = now_ms_u64().saturating_sub(w.started_ms);
+                    if waited >= super::seek_wait::SHOW_AFTER_MS {
+                        platform::info(&format!(
+                            "pharos: seek wait: over event={event:?} to={} from={} waited_ms={waited}",
+                            w.to_ms, w.from_ms
+                        ));
+                    }
+                }
             }
             if let Some(session) = session() {
                 session.on_media(event);
@@ -4563,20 +6634,63 @@ fn Player(
             }
             let state = platform::media_state(VIDEO_ID);
             media.set(state);
+            if *position.peek() != state.position_ms {
+                position.set(state.position_ms);
+            }
             if let Some(next) = up_next_to.get() {
                 let total = total_ms(&state, p.detail.item.runtime_ms);
                 let from = up_next_at(&p.detail.segments, total);
-                let step = up_next.write().step(state.position_ms, from, total);
-                if let Some(why) = up_next.peek().moves_on(step, event) {
+                // Leaving the group (no entry) keeps this player's Cancel.
+                let entry = session().map(|s| s.playlist_item_id()).unwrap_or_default();
+                let was = if entry.is_empty() {
+                    String::new()
+                } else {
+                    up_next_entry.replace(entry.clone())
+                };
+                let now = platform::now_ms();
+                if !was.is_empty() && was != entry {
+                    up_next_reset.set(Some(now));
+                }
+                // The group lands on the new entry with a seek; one that
+                // starts inside the card window lands there too. A player
+                // already where the entry starts gets no seek: events queued
+                // at the old end are long gone after a moment.
+                let before_end = from.map_or(true, |f| state.position_ms < f.at_ms);
+                let waited = up_next_reset.get().map(|since| now - since);
+                let settled = waited.is_some_and(|ms| ms >= UP_NEXT_RESET_SETTLE_MS);
+                if waited.is_some() && (before_end || event == MediaEvent::Seeked || settled) {
+                    up_next_reset.set(None);
                     platform::info(&format!(
-                        "pharos: up next: playing {next} ({why}) at={}ms of={total}ms from={from:?}",
+                        "pharos: up next: reset reason=group_entry entry={entry} at={}ms on={event:?} waited={:.0}ms",
+                        state.position_ms,
+                        waited.unwrap_or_default()
+                    ));
+                    up_next.set(UpNext::default());
+                }
+                // Another member cancelled it: this episode plays to its end
+                // here too, rather than this player moving the group on.
+                if !up_next.peek().is_cancelled() && session().is_some_and(|s| s.next_held()) {
+                    platform::info(&format!(
+                        "pharos: up next: cancelled reason=group at={}ms of={total}ms from={from:?}",
                         state.position_ms
                     ));
-                    advance(next);
-                    return;
+                    up_next.write().cancel();
                 }
-                if *up_next_step.peek() != step {
-                    up_next_step.set(step);
+                // Still at the old entry's end: the group has already moved
+                // on, so no countdown or end from there may move it again.
+                if up_next_reset.get().is_none() {
+                    let step = up_next.write().step(state.position_ms, from, total);
+                    if let Some(why) = up_next.peek().moves_on(step, event) {
+                        platform::info(&format!(
+                            "pharos: up next: playing {next} ({why}) at={}ms of={total}ms from={from:?}",
+                            state.position_ms
+                        ));
+                        advance(next);
+                        return;
+                    }
+                    if *up_next_step.peek() != step {
+                        up_next_step.set(step);
+                    }
                 }
             }
             if event == MediaEvent::Changed && !burned {
@@ -4609,10 +6723,13 @@ fn Player(
             };
             let grant = p.grant.borrow().clone();
             let at = last_ms.get();
-            let tracks = TrackPicks {
-                audio: TrackChoice::Default,
-                subtitle: switched.get().unwrap_or_default(),
-            };
+            let tracks = reported_tracks(
+                p.asked_audio,
+                p.audio,
+                p.asked_subtitle,
+                p.subtitle,
+                switched.get(),
+            );
             spawn(async move {
                 let result = grant
                     .report(&call("watch", "report"), at, paused, tracks)
@@ -4656,10 +6773,27 @@ fn Player(
             if retiring.get() {
                 return;
             }
+            // A menu pick as the primary's stream, which the group names
+            // (ADR-0089); one the primary lacks stays on this player.
+            let to_group = |kind: activity::TrackKind, own: u32| {
+                let mapped = p.track_map.to_primary(kind, own);
+                if mapped.is_none() {
+                    platform::info(&format!(
+                        "pharos: group tracks unmapped kind={kind:?} index={own} version={:?} dir=send",
+                        p.version
+                    ));
+                }
+                mapped
+            };
             // In a group the viewer's play, pause and seek are the group's.
-            let seek = |ms: u64| {
+            let mut seek = |ms: u64| {
                 watch.0.borrow_mut().seeking(now_ms_u64());
                 if !session().is_some_and(|s| s.seek(ms)) {
+                    // A group's seek is the group's to wait on; this one is
+                    // the viewer's, with a way back if it is slow (B1196).
+                    let earlier = *seek_wait.peek();
+                    let at = *position.peek();
+                    seek_wait.set(Some(SeekWait::begin(earlier, at, ms, now_ms_u64())));
                     platform::seek_ms(VIDEO_ID, ms);
                 }
             };
@@ -4674,10 +6808,25 @@ fn Player(
                     // on a load; neither is a resume of a paused song.
                     let state = platform::media_state(VIDEO_ID);
                     let in_group = session().is_some_and(|s| s.drives());
-                    let resuming = (state.paused && state.position_ms > 0 && !in_group)
-                        .then(|| start_resume(VIDEO_ID, &resume));
+                    let resuming =
+                        (state.paused && state.position_ms > 0 && !in_group).then(|| {
+                            let item = match p.kind {
+                                ItemKind::Audio => ResumeItem::Music,
+                                _ => ResumeItem::Video,
+                            };
+                            start_resume(VIDEO_ID, item, &resume)
+                        });
+                    // Read before the group acts: the browser's own flag
+                    // lifts on pointerdown, before this click arrives.
+                    let refused = *autoplay_refused.peek();
                     if !session().is_some_and(|s| s.toggle_play()) {
                         platform::toggle_play(VIDEO_ID);
+                    } else if refused {
+                        // The group's unpause lands after this gesture ends,
+                        // and some browsers (WebKit) only let a play() made
+                        // inside the gesture through; start the local player
+                        // now (038 FR-407, V1223).
+                        platform::play(VIDEO_ID);
                     }
                     if let Some(n) = resuming {
                         spawn(watch_resume(VIDEO_ID, Rc::clone(&resume), n));
@@ -4700,7 +6849,24 @@ fn Player(
                     platform::set_volume(VIDEO_ID, volume, muted);
                     remember_volume(volume, muted);
                 }
-                Control::Fullscreen => platform::toggle_fullscreen(PLAYER_ID),
+                Control::Fullscreen => platform::toggle_fullscreen(),
+                Control::SubtitleSize(size) => {
+                    if let Err(e) = set_subtitle_size(size) {
+                        platform::warn(&format!("pharos: subtitle_size not kept error={e}"));
+                    }
+                    sub_size.set(size);
+                }
+                Control::ViewMode(mode) => {
+                    store_view_mode(mode);
+                    view_mode.set(mode);
+                }
+                Control::Quality(bps) => on_quality_pick.call(Some(bps)),
+                Control::Version(i) => {
+                    if let Some(v) = p.detail.versions.get(i) {
+                        on_version.call(v.id.clone());
+                    }
+                }
+                Control::ResetAutoQuality => on_quality_pick.call(None),
                 Control::PictureInPicture => platform::toggle_pip(VIDEO_ID),
                 // The next-episode button while the card counts is Play now.
                 Control::Play(id)
@@ -4715,6 +6881,9 @@ fn Player(
                 // moves the group, whose item brings this member too (014 US9).
                 Control::Play(id) => {
                     if !session().is_some_and(|s| s.move_to(id, 0)) {
+                        if near.previous == Some(id) {
+                            turn::going_back();
+                        }
                         go(id);
                     }
                 }
@@ -4724,7 +6893,17 @@ fn Player(
                         advance(next);
                     }
                 }
+                Control::ReturnFromSeek(ms) => {
+                    platform::info(&format!("pharos: seek wait: going back to={ms}"));
+                    seek_wait.set(None);
+                    watch.0.borrow_mut().seeking(now_ms_u64());
+                    platform::seek_ms(VIDEO_ID, ms);
+                }
                 Control::CancelNext => {
+                    let shared = session().is_some_and(|s| s.hold_next());
+                    platform::info(&format!(
+                        "pharos: up next: cancelled reason=viewer shared={shared}"
+                    ));
                     up_next.write().cancel();
                     up_next_step.set(UpNextStep::Hidden);
                 }
@@ -4763,6 +6942,39 @@ fn Player(
                         }
                         starting.set(false);
                     });
+                }
+                Control::ShowQueue(open) => {
+                    let Some(VideoQueueCtx(q, mut shown)) = video_queue else {
+                        return;
+                    };
+                    shown.set(open);
+                    platform::info(&format!(
+                        "pharos: video queue shown={open} upcoming={}",
+                        q.peek().upcoming().len()
+                    ));
+                }
+                Control::Queue(action) => {
+                    let Some(VideoQueueCtx(mut q, _)) = video_queue else {
+                        return;
+                    };
+                    let play = match action {
+                        QueueAction::Play(key) => q
+                            .peek()
+                            .upcoming()
+                            .iter()
+                            .find(|e| e.key == key)
+                            .map(|e| e.id),
+                        _ => None,
+                    };
+                    q.write().apply(action, seed());
+                    platform::info(&format!(
+                        "pharos: video queue action={} upcoming={}",
+                        action.label(),
+                        q.peek().upcoming().len()
+                    ));
+                    if let Some(id) = play {
+                        go(id);
+                    }
                 }
                 Control::ShowInvite(open) => {
                     let (mut invite_for, mut note) = (invite_for, invite_note);
@@ -4819,16 +7031,15 @@ fn Player(
                         to.map_or_else(|| "restart".to_owned(), |id| id.to_string())
                     ));
                     match to {
-                        Some(id) => go(id),
+                        Some(id) => {
+                            turn::going_back();
+                            go(id);
+                        }
                         None => seek(0),
                     }
                 }
                 // Leaving the watch page shrinks the player (spec 020).
-                Control::Back => {
-                    if !platform::go_back() {
-                        nav.0.call(Route::Home);
-                    }
-                }
+                Control::Back => leave_player(nav),
                 Control::Shrink => {
                     // A copy, so the handler stays `Fn`.
                     let mut stage = stage;
@@ -4843,19 +7054,33 @@ fn Player(
                     }
                 }
                 Control::Audio(index) => {
+                    if let Some(series) = show_tracks::show_of(&p.detail) {
+                        let tracks = &p.detail.audio_tracks;
+                        show_tracks::keep(series, |s| show_tracks::chose_audio(s, tracks, index));
+                    }
                     let Some(index) = track_follow::audio_pick_here(p.audio, index, |index| {
-                        session().is_some_and(|s| s.pick_audio(index))
+                        to_group(activity::TrackKind::Audio, index)
+                            .is_some_and(|i| session().is_some_and(|s| s.pick_audio(i)))
                     }) else {
                         return;
                     };
+                    on_notice.call(track_notice(true));
                     on_renegotiate.call(TrackPicks {
                         audio: TrackChoice::Index(index),
                         subtitle: choice(*subtitle.peek()),
                     });
                 }
                 Control::Subtitle(to) => {
+                    if let Some(series) = show_tracks::show_of(&p.detail) {
+                        let tracks = &p.detail.subtitle_tracks;
+                        show_tracks::keep(series, |s| show_tracks::chose_subtitle(s, tracks, to));
+                    }
                     let here = track_follow::subtitle_pick_here(*subtitle.peek(), to, |to| {
-                        session().is_some_and(|s| s.pick_subtitle(to))
+                        let to = match to {
+                            None => Some(None),
+                            Some(i) => to_group(activity::TrackKind::Subtitles, i).map(Some),
+                        };
+                        to.is_some_and(|to| session().is_some_and(|s| s.pick_subtitle(to)))
                     });
                     if !here {
                         return;
@@ -4867,10 +7092,13 @@ fn Player(
                             switched.set(Some(choice(to)));
                             subtitle.set(to);
                         }
-                        SubtitleSwitch::Renegotiate => on_renegotiate.call(TrackPicks {
-                            audio: p.audio.map_or(TrackChoice::Default, TrackChoice::Index),
-                            subtitle: choice(to),
-                        }),
+                        SubtitleSwitch::Renegotiate => {
+                            on_notice.call(track_notice(false));
+                            on_renegotiate.call(TrackPicks {
+                                audio: p.audio.map_or(TrackChoice::Default, TrackChoice::Index),
+                                subtitle: choice(to),
+                            });
+                        }
                     }
                 }
             }
@@ -4921,14 +7149,52 @@ fn Player(
         let skips = skips.clone();
         move || release_track_skips(&skips, skip_owner)
     });
+    let waiting = media_rest().loading && failed().is_none();
+    let wait_caption = if waiting {
+        let me = account.and_then(|a| {
+            a.0.read()
+                .as_ref()
+                .and_then(Option::as_ref)
+                .map(|m| (m.id.clone(), m.name.clone()))
+        });
+        let members_waiting: Vec<String> = match me {
+            Some((id, name)) if group.drives(playing_id) => group
+                .members
+                .iter()
+                .filter(|m| m.buffering && m.id != id && m.name != name)
+                .map(|m| m.name.clone())
+                .collect(),
+            _ => Vec::new(),
+        };
+        let facts = super::wait::WaitFacts {
+            started: started(),
+            seeking_to: seek_wait().map(|w| w.to_ms),
+            hint: queue_hint(),
+            members_waiting: &members_waiting,
+        };
+        let cause = super::wait::cause(&facts);
+        let caption = cause.caption();
+        // The decision line, once per caption a wait shows.
+        if *wait_logged.borrow() != caption {
+            platform::info(&super::wait::line(&playing_id.to_string(), &cause, &facts));
+            caption.clone_into(&mut wait_logged.borrow_mut());
+        }
+        caption
+    } else {
+        wait_logged.borrow_mut().clear();
+        String::new()
+    };
     let controls = Controls {
         media: MediaState {
-            loading: media().loading && failed().is_none(),
-            ..media()
+            loading: waiting,
+            ..media_rest()
         },
+        wait_caption,
+        tap_to_start: autoplay_refused(),
         runtime_ms: p.detail.item.runtime_ms,
         chapters: p.detail.chapters.clone(),
         segments: p.detail.segments.clone(),
+        damage: p.detail.damage.clone(),
         preview: preview_set(&p.detail.trickplay).cloned(),
         hover_ms: hover_ms(),
         audio: p.detail.audio_tracks.clone(),
@@ -4937,20 +7203,131 @@ fn Player(
         subtitle_pick: subtitle(),
         previous: near.previous,
         next,
+        seek_card: seek_wait()
+            .filter(|_| media_rest().loading && failed().is_none())
+            .and_then(|w| {
+                let unindexed = p
+                    .detail
+                    .damage
+                    .as_ref()
+                    .is_some_and(|d| d.verdict == "unindexed");
+                w.card(seek_tick(), unindexed)
+            }),
         up_next: match (up_next_step(), upcoming.as_ref()) {
             (UpNextStep::Counting { left_ms, of_ms }, next) => {
-                Some(UpNextCard::of(next, left_ms, of_ms))
+                // Only the card's own item: a group's next is not the queue's.
+                let next = next.filter(|n| Some(n.id) == up_next_to.get());
+                let mut card = UpNextCard::of(next, left_ms, of_ms);
+                if next.is_none() && p.kind != ItemKind::Episode {
+                    "Next".clone_into(&mut card.name);
+                }
+                let credits = up_next_at(
+                    &p.detail.segments,
+                    total_ms(&media_rest(), p.detail.item.runtime_ms),
+                )
+                .is_some_and(|from| from.credits);
+                card.pill = up_next_pill(credits, left_ms);
+                // The decision line, once per way it is shown (038 FR-405/406).
+                let mode = match (view, card.pill) {
+                    (View::Full, true) => "pill",
+                    (View::Full, false) => "card",
+                    _ => "line",
+                };
+                if up_next_mode.get() != Some(mode) {
+                    up_next_mode.set(Some(mode));
+                    platform::info(&format!(
+                        "pharos: up next: shown item={playing_id} mode={mode} credits={credits} left_ms={left_ms} of_ms={of_ms}"
+                    ));
+                }
+                Some(card)
             }
-            _ => None,
+            _ => {
+                up_next_mode.set(None);
+                None
+            }
+        },
+        live_position: Some(position),
+        subtitle_size: sub_size(),
+        packing: versions::playing_stereo(&p.detail.versions, &p.version),
+        // A burned subtitle may sit in a letterbox bar, so those stay (V977).
+        picture: versions::playing_picture(&p.detail.versions, &p.version)
+            .map(|crop| {
+                if p.burned() {
+                    crop.keeping_rows()
+                } else {
+                    crop
+                }
+            })
+            .filter(|crop| crop.crops()),
+        view_mode: view_mode(),
+        vr: vr().unwrap_or(false),
+        versions: p
+            .detail
+            .versions
+            .iter()
+            .map(|v| (v.id.clone(), versions::version_label(v)))
+            .collect(),
+        version: p.version.clone(),
+        quality: QualityView {
+            manual: manual_cap,
+            auto: auto_cap,
+            method: p.method.clone(),
         },
     };
     let on_leave = {
         let session = session.clone();
+        let id = group.id.clone().filter(|_| group.active);
+        let mut left_group = left_group;
+        let leaving = Rc::clone(&leaving);
         move |()| {
             if let Some(session) = session() {
-                spawn(async move { session.leave().await });
+                left_group.set(id.clone());
+                let left = async move { session.leave().await }.boxed_local().shared();
+                *leaving.borrow_mut() = Some(left.clone());
+                spawn(left);
             }
         }
+    };
+    let on_undo_leave = {
+        let together = together.clone();
+        let mut left_group = left_group;
+        let leaving = Rc::clone(&leaving);
+        move |()| {
+            let Some(id) = left_group.take() else {
+                return;
+            };
+            let Some(api) = ctx.api.peek().clone() else {
+                return;
+            };
+            let session = together.session(&api);
+            let mut note = together.note;
+            note.set(None);
+            platform::info(&format!("pharos: group leave undo group={id}"));
+            let left = leaving.borrow_mut().take();
+            spawn_forever(async move {
+                if let Some(left) = left {
+                    left.await;
+                }
+                match session.join(&id).await {
+                    Ok(_) => platform::info(&format!(
+                        "pharos: group leave undone group={id} outcome=rejoined"
+                    )),
+                    Err(e) => {
+                        platform::warn(&format!(
+                            "pharos: group leave undo failed group={id} error={}",
+                            e.0
+                        ));
+                        note.set(Some(super::group_app::rejoin_failure(&e.0)));
+                    }
+                }
+            });
+        }
+    };
+    let notes = NotesView {
+        connection: connection_lost.then(|| CONNECTION_LOST.to_owned()),
+        wait: wait_pill,
+        status: group_status.filter(|_| status_shown),
+        undo: undo_shown,
     };
     let on_own_tracks = {
         let session = session.clone();
@@ -4961,6 +7338,46 @@ fn Player(
         }
     };
     let compact = view != View::Full;
+    // The queue docked beside the compact player (B900/V852), shared by the
+    // stage's players so a song handing over keeps it open.
+    let own_dock = use_signal(|| false);
+    let mut dock = try_use_context::<QueueDock>().map_or(own_dock, |d| d.0);
+    // Exactly one slot is in sight: the playing one, or the outgoing one
+    // while the next is negotiated. Only it docks a queue.
+    let in_sight = matches!(
+        slot,
+        Slot::Current { waiting: false, .. } | Slot::Outgoing(Handoff { ready: false, .. })
+    );
+    // Which side the floating window is on, so the dock takes the other.
+    let window_right = use_memo(move || stage.read().spot.x > 0.5)();
+    // And which half, so the dock keeps to the same edge (the top holds the
+    // page's navigation).
+    let window_low = use_memo(move || stage.read().spot.y > 0.5)();
+    let on_queue = EventHandler::new(move |action: QueueAction| {
+        // In a group the group picks the song.
+        if matches!(action, QueueAction::Play(_)) && !queued {
+            platform::info("pharos: queue action=play refused reason=group");
+            return;
+        }
+        let play = match action {
+            QueueAction::Play(key) => queue
+                .peek()
+                .upcoming()
+                .iter()
+                .find(|e| e.key == key)
+                .map(|e| e.id),
+            _ => None,
+        };
+        queue.write().apply(action, seed());
+        platform::info(&format!(
+            "pharos: queue action={} upcoming={}",
+            action.label(),
+            queue.peek().upcoming().len()
+        ));
+        if let Some(id) = play {
+            go(id);
+        }
+    });
     let on_action = {
         let mut on_control = on_control.clone();
         move |action: StageAction| {
@@ -4989,6 +7406,16 @@ fn Player(
                 }
                 StageAction::Place(to) => stage.write().place(to),
                 StageAction::Keep => stage.peek().keep_spot(),
+                StageAction::Queue => {
+                    let open = !*dock.peek();
+                    dock.set(open);
+                    super::listen::store_dock(open);
+                    platform::info(&super::stage::dock_line(
+                        open,
+                        view,
+                        queue.peek().upcoming().len(),
+                    ));
+                }
             }
         }
     };
@@ -5027,6 +7454,7 @@ fn Player(
             });
         }
     }
+    let retry_audio = p.audio;
     let heading = super::views::watch_heading(&p.detail.item);
     rsx! {
         if compact {
@@ -5034,20 +7462,86 @@ fn Player(
                 view,
                 title: p.title.clone(),
                 image: p.image.clone(),
-                media: media(),
+                media: media_rest(),
+                live_position: Some(position),
                 runtime_ms: p.detail.item.runtime_ms,
                 pip: p.kind != ItemKind::Audio && platform::pip_supported(),
                 previous: near.previous,
                 next,
-                error: failed().or_else(|| group.ended.clone()),
+                error: failed().map(|f| f.line()).or_else(|| group.ended.clone()),
                 on_action,
+                queue: audio.then(|| QueueButton {
+                    count: queue.read().upcoming().len(),
+                    open: dock(),
+                }),
+                up_next_in: controls.up_next.as_ref().map(|card| card.seconds),
+            }
+            // Only the slot in sight: a song handing over shows one queue.
+            if audio && dock() && in_sight {
+                div {
+                    class: "pharos-queue-dock",
+                    "data-view": view.label(),
+                    "data-side": if view == View::Floating && window_right { "left" } else { "right" },
+                    "data-edge": if view == View::Floating && window_low { "bottom" } else { "top" },
+                    QueuePanel {
+                        queue: queue.read().upcoming().to_vec(),
+                        shuffled: queue.read().shuffled(),
+                        on_queue,
+                        playing: queued.then_some(playing_id),
+                    }
+                }
             }
         } else {
-            if let Some(message) = failed() {
-                ErrorNote { message }
+            if let Some(failure) = failed() {
+                PlaybackFailure {
+                    failure: failure.clone(),
+                    on_report: move |()| report_failure(&failure),
+                    on_retry: {
+                        let last_ms = Rc::clone(&last_ms.0);
+                        move |()| {
+                            platform::info(&format!(
+                                "pharos: playback retry item={playing_id} at_ms={}",
+                                last_ms.get()
+                            ));
+                            on_renegotiate.call(TrackPicks {
+                                audio: retry_audio.map_or(TrackChoice::Default, TrackChoice::Index),
+                                subtitle: choice(*subtitle.peek()),
+                            });
+                        }
+                    },
+                    on_back: move |()| leave_player(nav),
+                    // The renegotiation carries on from where `last_ms` says,
+                    // as Try again does; the element that broke cannot seek.
+                    on_skip: {
+                        let (last_ms, broke_at) = (Rc::clone(&last_ms.0), Rc::clone(&broke_at));
+                        let was_paused = was_paused.clone();
+                        let version = p.version.clone();
+                        move |to_ms: u64| {
+                            let from_ms = broke_at.get();
+                            // The viewer asked to carry on: the next player
+                            // plays, whatever the broken one was left at.
+                            was_paused.0.set(false);
+                            remember_skip(playing_id, &version, from_ms, to_ms);
+                            platform::info(&format!(
+                                "pharos: playback skip item={playing_id} from_ms={from_ms} to_ms={to_ms}"
+                            ));
+                            last_ms.set(to_ms);
+                            on_renegotiate.call(TrackPicks {
+                                audio: retry_audio.map_or(TrackChoice::Default, TrackChoice::Index),
+                                subtitle: choice(*subtitle.peek()),
+                            });
+                        }
+                    },
+                }
             }
-            if let Some(message) = group.ended.clone() {
-                ErrorNote { message }
+            // A video's player stacks this with its other group notes.
+            if p.kind == ItemKind::Audio {
+                if let Some(line) = notes.connection.clone() {
+                    p { class: "pharos-status-note pharos-connection-lost", role: "status", "{line}" }
+                }
+                if let Some(message) = notes.status.clone() {
+                    GroupEndedNote { message }
+                }
             }
             if let Some(message) = together.error.read().clone() {
                 ErrorNote { message }
@@ -5057,6 +7551,7 @@ fn Player(
             ListenView {
                 // A retired song's screen is hidden; it draws no visualiser.
                 compact: compact || matches!(slot, Slot::Outgoing(Handoff { ready: true, .. })),
+                in_sight,
                 media_id: slot.media_id(),
                 title: p.title.clone(),
                 image: p.image.clone(),
@@ -5066,7 +7561,8 @@ fn Player(
                 year: p.detail.item.year,
                 genres: p.detail.genres.clone(),
                 runtime_ms: p.detail.item.runtime_ms,
-                media: media(),
+                media: media_rest(),
+                live_position: Some(position),
                 previous: near.previous,
                 next,
                 lyrics: aligned()
@@ -5078,28 +7574,7 @@ fn Player(
                 playing: queued.then_some(playing_id),
                 queue: queue.read().upcoming().to_vec(),
                 shuffled: queue.read().shuffled(),
-                on_queue: move |action: QueueAction| {
-                    // In a group the group picks the song.
-                    if matches!(action, QueueAction::Play(_)) && !queued {
-                        platform::info("pharos: queue action=play refused reason=group");
-                        return;
-                    }
-                    let play = match action {
-                        QueueAction::Play(key) => {
-                            queue.peek().upcoming().iter().find(|e| e.key == key).map(|e| e.id)
-                        }
-                        _ => None,
-                    };
-                    queue.write().apply(action, seed());
-                    platform::info(&format!(
-                        "pharos: queue action={} upcoming={}",
-                        action.label(),
-                        queue.peek().upcoming().len()
-                    ));
-                    if let Some(id) = play {
-                        go(id);
-                    }
-                },
+                on_queue,
                 on_media,
                 on_control,
             }
@@ -5116,7 +7591,9 @@ fn Player(
                 own_tracks: group.own_tracks,
                 on_own_tracks,
                 activity: group.log.lines(),
-                toast: group.log.toast(now_ms_u64()).map(str::to_owned),
+                toast: group.log.toast(now_ms_u64()).map(str::to_owned).or(notice),
+                notes,
+                on_undo_leave,
                 own_track_members: group
                     .members
                     .iter()
@@ -5125,11 +7602,19 @@ fn Player(
                     .collect::<Vec<_>>(),
                 seen: seen::rows(&watch_seen, p.detail.item.id),
                 on_leave,
-                autoplay: !grouped,
+                autoplay: autoplay_after(grouped, start_paused),
                 can_start_together: can_watch_together(p.kind) && !compact,
                 invite,
                 invite_open,
                 invite_note: invite_note(),
+                queue: video_queue.filter(|_| !grouped).map(|VideoQueueCtx(q, shown)| {
+                    let q = q.read();
+                    VideoQueueView {
+                        entries: q.upcoming().to_vec(),
+                        shuffled: q.shuffled(),
+                        open: shown() && !compact,
+                    }
+                }),
             }
         }
     }
@@ -5140,6 +7625,102 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    #[test]
+    fn a_remount_keeps_a_paused_video_paused() {
+        assert!(autoplay_after(false, false));
+        assert!(!autoplay_after(false, true), "paused stays paused");
+        assert!(!autoplay_after(true, false), "a group waits for its play");
+        assert!(!autoplay_after(true, true));
+    }
+
+    #[test]
+    fn a_quality_pick_names_the_new_limit() {
+        assert_eq!(quality_choice_notice(0), "Quality: Auto");
+        assert_eq!(quality_choice_notice(4_000_000), "Quality: up to 4 Mbps");
+    }
+
+    #[test]
+    fn the_notices_name_what_is_changing() {
+        assert_eq!(track_notice(true), "Switching audio…");
+        assert_eq!(track_notice(false), "Switching subtitles…");
+        assert_eq!(
+            quality_notice(4_000_000, 2_000_000),
+            "Lowering quality to 2 Mbps"
+        );
+        assert_eq!(
+            quality_notice(2_000_000, 8_000_000),
+            "Raising quality to 8 Mbps"
+        );
+    }
+
+    /// An audio track the viewer did not ask for is left to the server's
+    /// rules, so the report says nothing about it.
+    #[test]
+    fn an_audio_track_left_to_the_server_is_reported_as_default() {
+        let picks = reported_tracks(None, Some(2), TrackChoice::Default, None, None);
+        assert_eq!(picks.audio, TrackChoice::Default);
+    }
+
+    /// The audio the viewer asked for is named as it plays, so the next
+    /// play starts on the same track.
+    #[test]
+    fn an_asked_audio_track_is_reported_as_it_plays() {
+        let picks = reported_tracks(Some(3), Some(3), TrackChoice::Default, None, None);
+        assert_eq!(picks.audio, TrackChoice::Index(3));
+    }
+
+    /// An asked audio the server did not start on has nothing to name, so
+    /// the report leaves it to the server.
+    #[test]
+    fn an_asked_audio_the_server_did_not_start_is_default() {
+        let picks = reported_tracks(Some(3), None, TrackChoice::Default, None, None);
+        assert_eq!(picks.audio, TrackChoice::Default);
+    }
+
+    /// Subtitles asked off are reported off, so the next play stays off.
+    #[test]
+    fn subtitles_asked_off_are_reported_off() {
+        let picks = reported_tracks(None, None, TrackChoice::Off, None, None);
+        assert_eq!(picks.subtitle, TrackChoice::Off);
+    }
+
+    /// A subtitle asked for by index is named as it plays.
+    #[test]
+    fn an_asked_subtitle_is_reported_as_it_plays() {
+        let picks = reported_tracks(None, None, TrackChoice::Index(4), Some(4), None);
+        assert_eq!(picks.subtitle, TrackChoice::Index(4));
+    }
+
+    /// A subtitle the viewer did not ask for is left to the server, even
+    /// when the server started on one.
+    #[test]
+    fn a_subtitle_left_to_the_server_is_reported_as_default() {
+        let picks = reported_tracks(None, None, TrackChoice::Default, Some(2), None);
+        assert_eq!(picks.subtitle, TrackChoice::Default);
+    }
+
+    /// A subtitle switched to in place is what plays now, so it beats the
+    /// subtitle the playback was asked for, including switching off.
+    #[test]
+    fn an_in_place_switch_beats_the_asked_subtitle() {
+        let switched = reported_tracks(
+            None,
+            None,
+            TrackChoice::Index(4),
+            Some(4),
+            Some(TrackChoice::Index(7)),
+        );
+        assert_eq!(switched.subtitle, TrackChoice::Index(7));
+        let off = reported_tracks(
+            None,
+            None,
+            TrackChoice::Index(4),
+            Some(4),
+            Some(TrackChoice::Off),
+        );
+        assert_eq!(off.subtitle, TrackChoice::Off);
+    }
 
     /// An invite link is the invite route on this server, the group id as
     /// the server minted it.

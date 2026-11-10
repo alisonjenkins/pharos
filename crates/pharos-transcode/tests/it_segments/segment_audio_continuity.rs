@@ -7,7 +7,7 @@
 //! audio — the same instants encoded twice, at different timestamps, from
 //! different encoder state.
 //!
-//! Measured on the live server (Fringe S01E02, muxed mpegts path) before this
+//! Measured on the live server (Show AW S01E02, muxed mpegts path) before this
 //! was fixed:
 //!
 //! ```text
@@ -169,6 +169,8 @@ fn encode_segment(src: &Path, cont_audio: &Path, dir: &Path, seg: u32) -> PathBu
         video_3d_format: None,
         stereo_output: Default::default(),
         tonemap: Default::default(),
+        output_size: None,
+        output_scale_reason: None,
     };
     let out = dir.join(format!("seg{seg}.ts"));
     let args = ffmpeg_transcode_args(

@@ -10,6 +10,7 @@
 //! [`AppState`] (research R2).
 
 mod bootstrap;
+pub mod events;
 mod group;
 mod library;
 pub mod limits;
@@ -17,8 +18,10 @@ mod mix;
 pub mod origin;
 mod playback;
 mod prefs;
+mod report;
 pub use prefs::MAX_PREF_VALUE_BYTES;
 mod session;
+pub use session::is_child_token_device;
 pub mod socket;
 mod telemetry;
 mod user_data;
@@ -75,6 +78,11 @@ pub fn record_state(cfg: &NativeApiConfig) {
     metrics::gauge!("pharos_native_api_enabled").set(f64::from(u8::from(cfg.enabled)));
     if cfg.enabled {
         pharos_api::register_metrics();
+        crate::services::events::register_metrics();
+        for transition in ["issued", "released"] {
+            metrics::counter!(events::CAPABILITIES_TOTAL, "type" => "subscription", "transition" => transition)
+                .absolute(0);
+        }
         pharos_api::set_trace_parent_hook(crate::obs::rpc_trace_parent);
         metrics::counter!(
             "pharos_rpc_auth_deadline_extended_total",
@@ -148,6 +156,9 @@ pub struct ConnectionCtx {
     /// exported on a connection are not reliably dropped when it closes, so
     /// whatever must happen on the close (a membership's seat) registers here.
     on_close: RefCell<Vec<Box<dyn FnOnce()>>>,
+    /// `Events` subscriptions open on this connection: the cap (T026a), and
+    /// stopping them on logout and close.
+    pub(crate) subscriptions: events::Subscriptions,
 }
 
 /// The media token lifetime of a connection nobody configured: the config
@@ -176,6 +187,7 @@ impl ConnectionCtx {
             signed_out: tokio::sync::Notify::new(),
             extend_auth: tokio::sync::Notify::new(),
             on_close: RefCell::new(Vec::new()),
+            subscriptions: events::Subscriptions::default(),
         }))
     }
 
@@ -204,6 +216,7 @@ impl ConnectionCtx {
 
     /// The connection has closed: runs the registered hooks, once.
     pub(crate) fn closed(&self) {
+        self.subscriptions.stop_all();
         let hooks = std::mem::take(&mut *self.on_close.borrow_mut());
         for hook in hooks {
             hook();
@@ -232,6 +245,7 @@ impl ConnectionCtx {
         if !ended.iter().any(|t| t == token) {
             ended.push(token.to_owned());
         }
+        self.subscriptions.stop_token(token);
         if resumed.is_empty() {
             self.limits.sign_out(&mut self.slot.borrow_mut());
             // Only the sign-out itself re-arms the deadline: a repeat logout

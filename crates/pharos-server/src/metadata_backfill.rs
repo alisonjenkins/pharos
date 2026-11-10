@@ -37,11 +37,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::bg_io::BgPermit;
 use crate::config::MetadataConfig;
+use crate::episode_fit::{self, Candidate, LocalEpisode};
 use crate::metadata_language::{record_translation, TranslationOutcome, DEFAULT_LANGUAGE};
 use crate::musicbrainz::{AlbumArtResolver, MusicBrainzClient};
 use crate::online_enrich::{
-    apply_enrichment, download_and_cache_art, EnrichedMetadata, OnlineEnricher, RemoteArt,
-    TextsFetch,
+    apply_enrichment, download_and_cache_art, EnrichedMetadata, EpisodeListing, OnlineEnricher,
+    RemoteArt, TextsFetch,
+};
+use crate::series_identity::{
+    log_series_match, record_episode_rejected, record_rematch, record_series_match,
+    EpisodeRejectReason, RematchStep, SeriesMatchOutcome,
 };
 use crate::state::Stores;
 use crate::tmdb::TmdbEnricher;
@@ -49,11 +54,15 @@ use crate::tvdb::{ReqwestTransport, TvdbEnricher};
 use pharos_cache::image_cache::ImageRole;
 use pharos_cache::ImageCache;
 use pharos_core::{
-    match_best, ArtworkRole, DomainResult, GenreStore, LocalizedText, MediaItem, MediaKind,
-    MediaStore, MetadataTranslationStore, PersonStore, PreferenceStore, ProviderIds,
-    SeriesMatchCandidate, SeriesMetadata, SeriesMetadataStore, TranslationGap, TranslationOwner,
+    match_decide, ArtworkRole, DomainResult, GenreStore, LocalizedText, MatchDecision,
+    MatchOutcome, MediaItem, MediaKind, MediaStore, MetadataTranslationStore, PersonStore,
+    PreferenceStore, ProviderIds, ScoredCandidate, SeriesMatchCandidate, SeriesMetadata,
+    SeriesMetadataStore, TranslationGap, TranslationOwner,
 };
+use pharos_scanner::metadata::nfo::ShowNfoEvidence;
+use pharos_scanner::series_split::RepairMode;
 use pharos_scanner::FilenameProvider;
+use std::collections::HashMap;
 
 /// Courtesy delay between items — well under either provider's published rate
 /// ceiling so a full backfill never trips limiting. This is on top of the
@@ -236,6 +245,7 @@ where
         + MetadataTranslationStore
         + PreferenceStore
         + pharos_core::UserStore
+        + pharos_core::SeriesIdentityStore
         + pharos_store_sqlx::ServerConfigStore,
 {
     // No provider configured → nothing to do (mirrors spawn's key gate).
@@ -248,20 +258,60 @@ where
     if tvdb.is_some() || tmdb.is_some() {
         // Non-fatal: a config store that cannot be read or written must not
         // stop enrichment. The next pass tries again.
-        if let Err(e) = readmit_stale_tv_matches(store).await {
+        let providers = SeriesProviders { tvdb, tmdb };
+        if let Err(e) = readmit_stale_tv_matches(store, &providers, bg_io, cfg, now).await {
             tracing::warn!(error = %e, "T9 metadata backfill: show matcher version check failed");
         }
     }
+    let _tvdb_pass = PassScope::open(tvdb);
+    let mut series_enriched = 0usize;
+    let mut series_work = false;
+    // Series-container pass (the series-level record), first: an episode
+    // takes its record from its show's match (V892), so a show matched here
+    // lets its episodes enrich in the item pass below.
+    if tvdb.is_some() || tmdb.is_some() {
+        match enrich_series_pass(store, bg_io, cache, tvdb, tmdb, cfg, now).await {
+            Ok((n, series_had_work)) => {
+                if n > 0 {
+                    tracing::info!(enriched = n, "T9-series metadata backfill: shows enriched");
+                }
+                series_enriched = n;
+                series_work = series_had_work;
+            }
+            Err(e) => tracing::warn!(error = %e, "T9-series metadata backfill: pass aborted"),
+        }
+    }
+
+    // V940 — episodes whose show's match changed are rebuilt against the new
+    // match before the item pass, which would only fill their empty fields.
+    if tvdb.is_some() || tmdb.is_some() {
+        match reconcile_pass(store, bg_io, cache, tmdb, tvdb, cfg, now).await {
+            Ok((n, pending)) => {
+                series_enriched += n;
+                series_work |= pending;
+            }
+            Err(e) => tracing::warn!(error = %e, "series identity repair: reconcile pass aborted"),
+        }
+    }
+
+    // B994 — the show NFO's id for a provider the show is not matched at is
+    // dropped from its episodes, on every pass (a rescan folds it back).
+    if tvdb.is_some() || tmdb.is_some() {
+        if let Err(e) = drop_stale_show_ids_pass(store).await {
+            tracing::warn!(error = %e, "stale show id pass aborted");
+        }
+    }
+
     // Items whose last enrichment predates this cutoff (or never matched) are
     // eligible; `manual` rows are excluded by the query itself.
     let ttl_cutoff = now.saturating_sub(i64::from(cfg.refresh_ttl_days) * 86_400);
     let items = store
         .items_needing_match(cfg.max_per_pass, ttl_cutoff)
         .await?;
-    let mut enriched = 0usize;
+    let mut enriched = series_enriched;
     // Any eligible row (even one that resolves to `none`/transient) is work:
     // processing it advances the backlog, so the loop should keep draining.
-    let mut had_work = !items.is_empty();
+    let mut had_work = series_work || !items.is_empty();
     if !items.is_empty() {
         tracing::info!(total = items.len(), "T9 metadata backfill: enriching items");
         for item in items {
@@ -289,21 +339,6 @@ where
         }
     }
 
-    // Series-container pass (the series-level record). Runs even when no items
-    // needed matching: episodes and shows drain independently.
-    if tvdb.is_some() || tmdb.is_some() {
-        match enrich_series_pass(store, bg_io, cache, tvdb, tmdb, cfg, now).await {
-            Ok((n, series_had_work)) => {
-                if n > 0 {
-                    tracing::info!(enriched = n, "T9-series metadata backfill: shows enriched");
-                }
-                enriched += n;
-                had_work |= series_had_work;
-            }
-            Err(e) => tracing::warn!(error = %e, "T9-series metadata backfill: pass aborted"),
-        }
-    }
-
     // B564 — text of shows and episodes matched before English was asked for,
     // and of every language a user has picked since.
     if let (Some(tv), true) = (tvdb, cfg.fetch_translations) {
@@ -313,6 +348,28 @@ where
         }
     }
     Ok(PassStats { enriched, had_work })
+}
+
+/// B989 — holds a provider's per-pass state open for exactly one backfill
+/// pass: begun on creation, ended on drop, so every exit from the pass (an
+/// early `?` included) drops what the provider kept.
+struct PassScope<'a, E: OnlineEnricher>(Option<&'a E>);
+
+impl<'a, E: OnlineEnricher> PassScope<'a, E> {
+    fn open(provider: Option<&'a E>) -> Self {
+        if let Some(p) = provider {
+            p.begin_pass();
+        }
+        Self(provider)
+    }
+}
+
+impl<E: OnlineEnricher> Drop for PassScope<'_, E> {
+    fn drop(&mut self) {
+        if let Some(p) = self.0 {
+            p.end_pass();
+        }
+    }
 }
 
 /// The outcome of resolving one item against a single provider.
@@ -328,7 +385,9 @@ enum Resolved {
     },
     /// Search returned no candidate over the confidence floor — mark `none`
     /// so the row isn't re-searched every pass (TTL still re-admits it later).
-    NoMatch,
+    /// `best` is the highest-scoring candidate that fell under the floor, or
+    /// `None` when the provider returned nothing (or nothing was searched).
+    NoMatch { best: Option<ScoredCandidate> },
     /// The id resolved (via search or a pre-set provider id) but the detail
     /// fetch came back empty — a transient provider miss. Carries the resolved
     /// id so [`enrich_one`] can stamp the row (`match_source` + `external_id` +
@@ -348,7 +407,7 @@ enum Resolved {
 /// these apart: an episode that resolved but whose detail fetch came back
 /// empty (`Transient`), and one whose record simply carried no still
 /// (`HitNoArt`), both end `match_source='nfo_id'`, `metadata_refreshed_at=now`,
-/// no `Primary` — so the "5 of 76 Code Geass episodes got a still" gap is
+/// no `Primary` — so the "some episodes got a still, others did not" gap is
 /// invisible in production without this counter. The reason travels with the
 /// value (provider + external id + season/episode + offered roles) in the
 /// decision log, never a bare class.
@@ -442,7 +501,7 @@ fn search_stem(item: &MediaItem) -> &str {
     }
 }
 
-/// An episode's own name, from its filename ("S01E03 - The Naked Now"): the
+/// An episode's own name, from its filename ("S01E03 - The Quiet Arrival"): the
 /// cross-check that places it in a provider that numbers its season
 /// differently (B570). Not its stored title, which an NFO written in the
 /// provider's numbering may have set to the wrong episode's name.
@@ -467,7 +526,7 @@ pub(crate) async fn enrich_one<Tm, Tv, S>(
 where
     Tm: OnlineEnricher,
     Tv: OnlineEnricher,
-    S: MediaStore + GenreStore + PersonStore + MetadataTranslationStore,
+    S: MediaStore + GenreStore + PersonStore + MetadataTranslationStore + SeriesMetadataStore,
 {
     let stem = search_stem(&item);
     let name = episode_name(&item);
@@ -524,6 +583,7 @@ where
     let ids_cleared = trusted != item.metadata.provider_ids;
     item.metadata.provider_ids = trusted;
     let provider_ids = item.metadata.provider_ids.clone();
+    let mut nfo_rejected: Option<NfoRejection> = None;
     let (matched_provider, resolved) = match item.kind {
         MediaKind::Movie => match tmdb {
             Some(t) => (
@@ -548,6 +608,54 @@ where
                 return Ok(false);
             }
         },
+        // V892 — an episode takes its record only from its show's pinned
+        // match. Its own manual match (Identify) is the one exception.
+        MediaKind::Episode if item.match_source.as_deref() != Some("manual") => {
+            let pinned = pinned_show(store, &item).await?;
+            let target = pinned.as_ref().and_then(|p| {
+                let provider = match p.match_provider.as_deref()? {
+                    "tvdb" => "tvdb",
+                    "tmdb" => "tmdb",
+                    _ => return None,
+                };
+                matches!(p.match_source.as_deref(), Some("search" | "manual"))
+                    .then_some((provider, p.match_external_id.as_deref()?))
+            });
+            match target {
+                // The show is matched to nothing: so is the episode, until the
+                // show's match changes.
+                None => {
+                    let provider = match pinned.as_ref().and_then(|p| p.match_provider.as_deref()) {
+                        Some("tmdb") => "tmdb",
+                        _ => "tvdb",
+                    };
+                    (provider, Resolved::NoMatch { best: None })
+                }
+                Some((provider, show_id)) => {
+                    let at = PinnedFetch {
+                        show_id,
+                        confidence: pinned.as_ref().and_then(|p| p.match_confidence),
+                        season,
+                        episode,
+                        name: name.as_deref(),
+                    };
+                    let (resolved, rejected) = match (provider, tvdb, tmdb) {
+                        ("tvdb", Some(t), _) => {
+                            resolve_pinned(t, &at, provider_ids.tvdb.as_deref(), bg_io).await
+                        }
+                        ("tmdb", _, Some(t)) => {
+                            resolve_pinned(t, &at, provider_ids.tmdb.as_deref(), bg_io).await
+                        }
+                        _ => {
+                            record_enrich(item.kind, EnrichOutcome::Skipped);
+                            return Ok(false);
+                        }
+                    };
+                    nfo_rejected = rejected;
+                    (provider, resolved)
+                }
+            }
+        }
         MediaKind::Episode => {
             if let Some(t) = tvdb {
                 (
@@ -602,7 +710,20 @@ where
     };
 
     let (external_id, source, confidence, enriched) = match resolved {
-        Resolved::NoMatch => {
+        Resolved::NoMatch { best } => {
+            // The verdict with its inputs: what was searched and the nearest
+            // miss, so a `none` row can be explained from the log alone.
+            tracing::info!(
+                media.id = item.id,
+                kind = kind_label(item.kind),
+                provider = matched_provider,
+                searched_title = title.as_str(),
+                searched_year = year,
+                best_title = best.as_ref().map(|c| c.title.as_str()),
+                best_year = best.as_ref().and_then(|c| c.year),
+                best_score = best.as_ref().map(|c| c.score),
+                "T9 metadata backfill: no confident match"
+            );
             // No confident hit — record `none` (leaves filename metadata) so
             // the row isn't re-searched until the TTL re-admits it. Guard
             // against a concurrent manual apply that landed while this
@@ -680,11 +801,18 @@ where
             enriched,
         } => (external_id, source, confidence, *enriched),
     };
+    if let Some(rejected) = &nfo_rejected {
+        set_aside_nfo(&mut item, rejected, matched_provider);
+    } else if item.kind == MediaKind::Episode && source == "search" {
+        observe_title_fit(&item, &enriched, matched_provider, &external_id);
+    }
 
     // Fold the record onto the item (local data always wins — apply_enrichment
     // only fills gaps), then stamp the matched provider id if we hadn't one.
     let counts = store.item_entity_counts(item.id).await?;
-    let moved = reidentified(&item, &enriched) || nfo_names_another(&item, &enriched);
+    let moved = nfo_rejected.is_some()
+        || reidentified(&item, &enriched)
+        || nfo_names_another(&item, &enriched);
     if moved {
         adopt_reidentified(&mut item, &enriched);
     }
@@ -766,13 +894,36 @@ where
     // keyed on (item, role), so downloading here would silently replace a
     // user's hand-placed poster/backdrop/etc. Computed once per item, at the
     // role level (a local Primary must not block filling an absent Backdrop).
-    let local_roles: std::collections::HashSet<String> = store
-        .artwork_for(item.id)
-        .await?
-        .into_iter()
-        .filter(|(_, source, _)| source.eq_ignore_ascii_case("local"))
-        .map(|(role, _, _)| role.to_ascii_lowercase())
-        .collect();
+    // B1181 — a local row blocks online art only while its file exists (V1141).
+    // A sidecar that was deleted is no curated art, so the provider fills the
+    // role. The stale-art sweep removes such rows; this keeps the gap closed
+    // until it runs.
+    // When the media file cannot be seen either the share is probably down,
+    // and a missing sidecar proves nothing: keep treating it as curated.
+    // Both stats run only for a local row, and the media one only once a
+    // sidecar is found missing, so an item with provider art costs nothing.
+    let mut media_visible: Option<bool> = None;
+    let mut local_roles: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (role, source, locator) in store.artwork_for(item.id).await? {
+        if !source.eq_ignore_ascii_case("local") {
+            continue;
+        }
+        let gone = matches!(tokio::fs::try_exists(&locator).await, Ok(false));
+        let curated = !gone || {
+            let visible = match media_visible {
+                Some(v) => v,
+                None => {
+                    let v = matches!(tokio::fs::try_exists(&item.path).await, Ok(true));
+                    media_visible = Some(v);
+                    v
+                }
+            };
+            !visible
+        };
+        if curated {
+            local_roles.insert(role.to_ascii_lowercase());
+        }
+    }
     // B570 — a re-identified episode's `<stem>-thumb` was saved by the same
     // scrape as its NFO, so it is the wrong episode's still: the record's
     // still replaces it as the Thumb, which outranks the show-folder Primary
@@ -887,6 +1038,826 @@ where
     }
     Ok(true)
 }
+
+/// The provider and id a stored show match names, if it names one.
+fn stored_match(m: &SeriesMetadata) -> Option<(&str, &str)> {
+    if m.match_source.as_deref() == Some("none") {
+        return None;
+    }
+    Some((
+        m.match_provider.as_deref()?,
+        m.match_external_id.as_deref()?,
+    ))
+}
+
+/// Spec 033 (V940) — before a show's stored match changes automatically,
+/// durably mark its episodes for reconciliation against the new one. Marked
+/// first, so a crash between the two writes leaves them marked rather than
+/// stranded on the old show's text. A show with no row yet has nothing to
+/// reconcile; `new` is `None` for a show matched to nothing.
+async fn mark_if_match_changed<S>(
+    store: &S,
+    series_key: &str,
+    new: Option<(&str, &str)>,
+    now: i64,
+) -> DomainResult<()>
+where
+    S: SeriesMetadataStore + pharos_core::SeriesIdentityStore,
+{
+    let key = series_key.to_string();
+    let Some(prior) = store
+        .series_metadata_by_keys(std::slice::from_ref(&key))
+        .await?
+        .remove(&key)
+    else {
+        return Ok(());
+    };
+    let old = stored_match(&prior);
+    if old == new {
+        return Ok(());
+    }
+    let marked = store.mark_series_reconcile(series_key, now).await?;
+    metrics::counter!("pharos_series_reconcile_marked_total", "reason" => "match_changed")
+        .increment(marked);
+    tracing::info!(
+        series_key,
+        old_provider = old.map(|(p, _)| p),
+        old_id = old.map(|(_, id)| id),
+        new_provider = new.map(|(p, _)| p),
+        new_id = new.map(|(_, id)| id),
+        marked,
+        "series identity repair: show match changed, episodes marked for reconciliation"
+    );
+    Ok(())
+}
+
+/// Spec 033 (V940) — rebuild the episodes marked for reconciliation against
+/// their show's current match: reset their provider-derived fields to local
+/// evidence, delete their stored translations, then enrich them from the
+/// pinned match. Only under `series_identity_repair = "apply"`; a dry run
+/// counts what is pending and changes nothing. A mark clears only once the
+/// episode's enrichment finished (a record, or `none`) or its show's provider
+/// answered that it has no record of it (B991, parked until the TTL or a hand
+/// re-match); a transient miss marks it again with `now`, behind the rest,
+/// for a later pass. Returns
+/// (rebuilt, anything pending).
+async fn reconcile_pass<Tm, Tv, S>(
+    store: &S,
+    bg_io: &Arc<Semaphore>,
+    cache: &ImageCache,
+    tmdb: Option<&Tm>,
+    tvdb: Option<&Tv>,
+    cfg: &MetadataConfig,
+    now: i64,
+) -> DomainResult<(usize, bool)>
+where
+    Tm: OnlineEnricher,
+    Tv: OnlineEnricher,
+    S: MediaStore
+        + GenreStore
+        + PersonStore
+        + MetadataTranslationStore
+        + SeriesMetadataStore
+        + pharos_core::SeriesIdentityStore,
+{
+    let mode = cfg.series_identity_repair;
+    let pending = store.series_reconcile_pending(cfg.max_per_pass).await?;
+    #[allow(clippy::cast_precision_loss)]
+    metrics::gauge!("pharos_series_reconcile_pending", "mode" => mode.label())
+        .set(pending.len() as f64);
+    if pending.is_empty() {
+        return Ok((0, false));
+    }
+    if mode == RepairMode::DryRun {
+        tracing::debug!(
+            pending = pending.len(),
+            "series identity repair: episodes would be rebuilt (dry run)"
+        );
+        return Ok((0, false));
+    }
+    let mut rebuilt = 0usize;
+    for (id, marked_at) in pending {
+        match reconcile_one(store, bg_io, cache, tmdb, tvdb, cfg, id, marked_at, now).await {
+            Ok(true) => rebuilt += 1,
+            Ok(false) => {}
+            Err(e) => {
+                tracing::warn!(error = %e, media.id = id, "series identity repair: episode rebuild failed")
+            }
+        }
+        tokio::time::sleep(REQUEST_SPACING).await;
+    }
+    Ok((rebuilt, true))
+}
+
+/// What one reconcile attempt came to, recorded as
+/// `pharos_series_reconcile_total{outcome}`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReconcileOutcome {
+    /// Rebuilt from its show's match; the mark cleared.
+    Rebuilt,
+    /// The attempt did not finish (a transient miss); still marked, behind
+    /// the rest.
+    Retry,
+    /// The episode's show has no match yet; still marked.
+    Deferred,
+    /// The pinned show's provider answered that it has no record of the
+    /// episode; the mark cleared and the episode keeps its local text.
+    NoRecord,
+}
+
+impl ReconcileOutcome {
+    /// Stable, bounded-cardinality metric label, asserted distinct in a test.
+    fn label(self) -> &'static str {
+        match self {
+            Self::Rebuilt => "rebuilt",
+            Self::Retry => "retry",
+            Self::Deferred => "deferred",
+            Self::NoRecord => "no_record",
+        }
+    }
+}
+
+fn record_reconcile(outcome: ReconcileOutcome) {
+    metrics::counter!("pharos_series_reconcile_total", "outcome" => outcome.label()).increment(1);
+}
+
+/// B991 — asked after a rebuild that found no record: whether the pinned
+/// show's provider answered that it has none for this episode (as opposed
+/// to a failed request, which `episode_status` reports as `Failed`). Returns
+/// the provider, show id and numbers when it has none.
+async fn record_missing_from_pinned_show<Tm, Tv, S>(
+    store: &S,
+    tmdb: Option<&Tm>,
+    tvdb: Option<&Tv>,
+    item: &MediaItem,
+) -> DomainResult<Option<(&'static str, String, u32, u32)>>
+where
+    Tm: OnlineEnricher,
+    Tv: OnlineEnricher,
+    S: SeriesMetadataStore,
+{
+    if item.kind != MediaKind::Episode {
+        return Ok(None);
+    }
+    let Some(pinned) = pinned_show(store, item).await? else {
+        return Ok(None);
+    };
+    let Some(show_id) = pinned.match_external_id.as_deref() else {
+        return Ok(None);
+    };
+    let Some((season, episode)) = item
+        .series
+        .as_ref()
+        .and_then(|s| s.season_number.zip(s.episode_number))
+    else {
+        return Ok(None);
+    };
+    let name = episode_name(item);
+    let (provider, status) = match (pinned.match_provider.as_deref(), tvdb, tmdb) {
+        (Some("tvdb"), Some(t), _) => (
+            "tvdb",
+            t.episode_status(show_id, season, episode, name.as_deref())
+                .await,
+        ),
+        (Some("tmdb"), _, Some(t)) => (
+            "tmdb",
+            t.episode_status(show_id, season, episode, name.as_deref())
+                .await,
+        ),
+        _ => return Ok(None),
+    };
+    Ok((status == TextsFetch::NotFound).then(|| (provider, show_id.to_string(), season, episode)))
+}
+
+/// Rebuild one marked episode. `Ok(true)` when it was rebuilt and its mark
+/// cleared.
+#[allow(clippy::too_many_arguments)]
+async fn reconcile_one<Tm, Tv, S>(
+    store: &S,
+    bg_io: &Arc<Semaphore>,
+    cache: &ImageCache,
+    tmdb: Option<&Tm>,
+    tvdb: Option<&Tv>,
+    cfg: &MetadataConfig,
+    id: pharos_core::MediaId,
+    marked_at: i64,
+    now: i64,
+) -> DomainResult<bool>
+where
+    Tm: OnlineEnricher,
+    Tv: OnlineEnricher,
+    S: MediaStore
+        + GenreStore
+        + PersonStore
+        + MetadataTranslationStore
+        + SeriesMetadataStore
+        + pharos_core::SeriesIdentityStore,
+{
+    let item = match store.get(id).await {
+        Ok(item) => item,
+        // The row is gone, and its mark with it.
+        Err(pharos_core::DomainError::NotFound(_)) => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    // An episode's own manual match is never rebuilt (the store never marks
+    // one; this covers an Identify that landed after the mark).
+    if item.match_source.as_deref() == Some("manual") {
+        store.clear_series_reconcile(id, marked_at).await?;
+        return Ok(false);
+    }
+    // A row the scanner moved to a key with no match row yet waits, behind
+    // the rest, until the series pass has matched its new show.
+    if item.kind == MediaKind::Episode && pinned_show(store, &item).await?.is_none() {
+        store.mark_reconcile_items(&[id], now).await?;
+        record_reconcile(ReconcileOutcome::Deferred);
+        tracing::debug!(
+            media.id = id,
+            "series identity repair: episode's show has no match yet, rebuild deferred"
+        );
+        return Ok(false);
+    }
+    let old_title = item.title.clone();
+    let old_provider = item.match_provider.clone();
+    let new_provider = pinned_show(store, &item)
+        .await?
+        .and_then(|p| p.match_provider);
+    let (mut item, cleared) = tokio::task::spawn_blocking(move || {
+        let mut item = item;
+        tokio::runtime::Handle::current()
+            .block_on(pharos_scanner::fs::reset_to_local_metadata(&mut item));
+        let cleared = clear_old_providers_show_id(
+            &mut item,
+            old_provider.as_deref(),
+            new_provider.as_deref(),
+        );
+        (item, cleared)
+    })
+    .await
+    .map_err(|e| pharos_core::DomainError::Backend(format!("local metadata reset: {e}")))?;
+    if let (Some(old), false) = (cleared.provider, cleared.keys.is_empty()) {
+        record_old_ids_cleared(old, cleared.keys.len());
+        tracing::info!(
+            media.id = id,
+            old_provider = old,
+            cleared = ?cleared.keys,
+            "series identity repair: old provider's show id dropped from the rebuilt episode"
+        );
+    }
+    let translations = store
+        .delete_translations(&TranslationOwner::Item(id))
+        .await?;
+    // The old show's stills: the row and the cached bytes behind it, so the
+    // image route falls back to a local still or a frame grab until the new
+    // match's art is cached.
+    let art = store.delete_provider_artwork(id).await?;
+    for (role, _) in &art {
+        if let Some(role) = ImageRole::from_str_ci(role) {
+            if let Err(e) = cache.remove(id, role, item.kind, 0).await {
+                tracing::warn!(
+                    error = %e,
+                    media.id = id,
+                    role = ?role,
+                    "series identity repair: cached provider art not removed"
+                );
+            }
+        }
+    }
+    store.put(item.clone()).await?;
+    item.match_source = None;
+    let hit = enrich_one(store, bg_io, cache, tmdb, tvdb, cfg, item, now).await?;
+    if !art.is_empty() {
+        store.bump_art_version(id).await?;
+    }
+    let after = store.get(id).await?;
+    let done = hit || matches!(after.match_source.as_deref(), Some("none" | "manual"));
+    // B991 — the pinned show's provider has no record of this episode: park
+    // it. Its item row is stamped `search` with the time of this attempt, so
+    // the metadata TTL re-reads it with the show's normal refresh; a changed
+    // show match or a hand re-match marks it again.
+    if !done {
+        if let Some((provider, show_id, season, episode)) =
+            record_missing_from_pinned_show(store, tmdb, tvdb, &after).await?
+        {
+            store.clear_series_reconcile(id, marked_at).await?;
+            record_reconcile(ReconcileOutcome::NoRecord);
+            tracing::info!(
+                media.id = id,
+                provider,
+                series_external_id = %show_id,
+                season,
+                episode,
+                reason = ReconcileOutcome::NoRecord.label(),
+                "series identity repair: pinned show has no record of the episode, mark cleared"
+            );
+            return Ok(false);
+        }
+    }
+    if done {
+        store.clear_series_reconcile(id, marked_at).await?;
+        record_reconcile(ReconcileOutcome::Rebuilt);
+    } else {
+        store.mark_reconcile_items(&[id], now).await?;
+        record_reconcile(ReconcileOutcome::Retry);
+    }
+    tracing::info!(
+        media.id = id,
+        old_title = %old_title,
+        new_title = %after.title,
+        match_source = after.match_source.as_deref(),
+        translations_deleted = translations,
+        art_deleted = art.len(),
+        done,
+        "series identity repair: episode rebuilt"
+    );
+    Ok(done)
+}
+
+/// Spec 033 §7 (V896) — rebuild `ids` against their show's current match
+/// now, whatever `series_identity_repair` says: a hand fix is the admin's
+/// resolution, not the scanner's. Each is marked first, so one whose show has
+/// no match yet, or whose record did not arrive, stays marked for the
+/// background pass. Returns how many were rebuilt.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn rebuild_now<Tm, Tv, S>(
+    store: &S,
+    bg_io: &Arc<Semaphore>,
+    cache: &ImageCache,
+    tmdb: Option<&Tm>,
+    tvdb: Option<&Tv>,
+    cfg: &MetadataConfig,
+    ids: &[pharos_core::MediaId],
+    now: i64,
+) -> DomainResult<usize>
+where
+    Tm: OnlineEnricher,
+    Tv: OnlineEnricher,
+    S: MediaStore
+        + GenreStore
+        + PersonStore
+        + MetadataTranslationStore
+        + SeriesMetadataStore
+        + pharos_core::SeriesIdentityStore,
+{
+    store.mark_reconcile_items(ids, now).await?;
+    let mut rebuilt = 0usize;
+    for &id in ids {
+        if reconcile_one(store, bg_io, cache, tmdb, tvdb, cfg, id, now, now).await? {
+            rebuilt += 1;
+        }
+    }
+    Ok(rebuilt)
+}
+
+/// What [`pin_series_by_hand`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HandPin {
+    /// The match before, as `provider:id`; `None` when there was none.
+    pub old: Option<String>,
+    pub new: String,
+}
+
+/// Spec 033 §7 (V896) — an admin's pick of `series_key`'s show, or with
+/// `pick: None` their confirmation of the stored match. Either way the row
+/// becomes `match_source = 'manual'` with its ambiguity flag cleared, so
+/// `series_needing_match` never re-admits it. A pick fetches the show's
+/// record and art and marks its episodes when the match moved. `Ok(None)`
+/// when there is nothing to confirm, or the pick's record did not arrive.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn pin_series_by_hand<Tm, Tv, S>(
+    store: &S,
+    bg_io: &Arc<Semaphore>,
+    cache: &ImageCache,
+    tmdb: Option<&Tm>,
+    tvdb: Option<&Tv>,
+    series_key: &str,
+    series_name: &str,
+    pick: Option<(&str, &str)>,
+    now: i64,
+) -> DomainResult<Option<HandPin>>
+where
+    Tm: OnlineEnricher,
+    Tv: OnlineEnricher,
+    S: SeriesMetadataStore + MetadataTranslationStore + pharos_core::SeriesIdentityStore,
+{
+    let key = series_key.to_string();
+    let prior = store
+        .series_metadata_by_keys(std::slice::from_ref(&key))
+        .await?
+        .remove(&key);
+    let old = prior
+        .as_ref()
+        .and_then(stored_match)
+        .map(|(p, id)| format!("{p}:{id}"));
+    let Some((provider, external_id)) = pick else {
+        let Some(mut row) = prior.filter(|m| stored_match(m).is_some()) else {
+            return Ok(None);
+        };
+        let new = old.clone().unwrap_or_default();
+        row.match_source = Some("manual".into());
+        row.match_flag = None;
+        row.match_runner_up_id = None;
+        row.match_runner_up_score = None;
+        store.upsert_series_metadata(row).await?;
+        return Ok(Some(HandPin { old, new }));
+    };
+    let enriched = match provider {
+        "tvdb" => match tvdb {
+            Some(e) => hand_pick_record(e, bg_io, cache, series_key, external_id).await,
+            None => None,
+        },
+        "tmdb" => match tmdb {
+            Some(e) => hand_pick_record(e, bg_io, cache, series_key, external_id).await,
+            None => None,
+        },
+        _ => None,
+    };
+    let Some((enriched, poster_locator, backdrop_locator)) = enriched else {
+        return Ok(None);
+    };
+    mark_if_match_changed(store, series_key, Some((provider, external_id)), now).await?;
+    let provider_ids = match provider {
+        "tmdb" => ProviderIds {
+            tmdb: Some(external_id.to_string()),
+            ..Default::default()
+        },
+        _ => ProviderIds {
+            tvdb: Some(external_id.to_string()),
+            tmdb: enriched.also_tmdb_id.clone(),
+            ..Default::default()
+        },
+    };
+    store
+        .upsert_series_metadata(SeriesMetadata {
+            locked: Default::default(),
+            series_key: key,
+            series_name: prior
+                .as_ref()
+                .map_or_else(|| series_name.to_string(), |m| m.series_name.clone()),
+            match_provider: Some(provider.into()),
+            match_external_id: Some(external_id.into()),
+            match_source: Some("manual".into()),
+            match_confidence: None,
+            metadata_refreshed_at: Some(now),
+            overview: enriched.overview.clone(),
+            community_rating: enriched.community_rating,
+            premiere_date: enriched.premiere_date,
+            official_rating: enriched.official_rating.clone(),
+            original_language: enriched.original_language.clone(),
+            genres: enriched.genres.clone(),
+            studios: Vec::new(),
+            provider_ids,
+            poster_locator,
+            backdrop_locator,
+            ratings: Default::default(),
+            match_flag: None,
+            match_runner_up_id: None,
+            match_runner_up_score: None,
+        })
+        .await?;
+    store_texts(
+        store,
+        &TranslationOwner::Series(series_key.to_string()),
+        &enriched.texts,
+        now,
+    )
+    .await;
+    Ok(Some(HandPin {
+        old,
+        new: format!("{provider}:{external_id}"),
+    }))
+}
+
+/// The show record an admin picked, with its poster and backdrop cached.
+async fn hand_pick_record<E: OnlineEnricher>(
+    enricher: &E,
+    bg_io: &Arc<Semaphore>,
+    cache: &ImageCache,
+    series_key: &str,
+    external_id: &str,
+) -> Option<(EnrichedMetadata, Option<String>, Option<String>)> {
+    let enriched = {
+        let _permit = BgPermit::acquire(bg_io).await;
+        enricher
+            .fetch(MediaKind::Episode, external_id, None, None, None)
+            .await
+    }?;
+    let poster = cache_series_art(
+        cache,
+        enricher,
+        bg_io,
+        series_key,
+        ArtworkRole::Primary,
+        ImageRole::Primary,
+        &enriched,
+    )
+    .await;
+    let backdrop = cache_series_art(
+        cache,
+        enricher,
+        bg_io,
+        series_key,
+        ArtworkRole::Backdrop,
+        ImageRole::Backdrop,
+        &enriched,
+    )
+    .await;
+    Some((enriched, poster, backdrop))
+}
+
+/// Most shows one [`drop_stale_show_ids_pass`] looks at.
+const STALE_SHOW_ID_SHOWS: i64 = 10_000;
+
+/// B994 — `ids` without the show NFO's id for a provider other than the
+/// show's own match. Returns the provider dropped. An id that differs from the
+/// show's (an episode NFO's own), imdb, and the matched provider's slot stay;
+/// a second call finds nothing to drop.
+fn drop_unmatched_provider_show_id(
+    ids: &mut ProviderIds,
+    show_provider: &str,
+    shown: &ShowNfoEvidence,
+) -> Option<&'static str> {
+    let (provider, slot, from_show) = match show_provider {
+        "tvdb" => ("tmdb", &mut ids.tmdb, &shown.tmdb),
+        "tmdb" => ("tvdb", &mut ids.tvdb, &shown.tvdb),
+        _ => return None,
+    };
+    if from_show.is_none() || slot != from_show {
+        return None;
+    }
+    *slot = None;
+    Some(provider)
+}
+
+/// B994 — for each search-matched show whose `tvshow.nfo` names an id at the
+/// provider it is not matched at, drop that id from its episodes. Since B995
+/// the scanner no longer folds those ids onto episodes, so this is a cleanup
+/// of rows stored before it. Rows are read, and written only when an id is
+/// dropped, so a settled library costs reads. Episodes with their own manual
+/// match are skipped.
+async fn drop_stale_show_ids_pass<S>(store: &S) -> DomainResult<usize>
+where
+    S: MediaStore + SeriesMetadataStore + pharos_core::SeriesIdentityStore,
+{
+    let shows = store
+        .series_needing_match(STALE_SHOW_ID_SHOWS, i64::MAX)
+        .await?;
+    let mut dropped = 0;
+    for cand in shows {
+        let Some(shown) = show_nfo(&cand).await else {
+            continue;
+        };
+        let key = cand.series_key.clone();
+        let Some(provider) = store
+            .series_metadata_by_keys(std::slice::from_ref(&key))
+            .await?
+            .remove(&key)
+            .and_then(|m| m.match_provider)
+        else {
+            continue;
+        };
+        let other = match provider.as_str() {
+            "tvdb" => &shown.tmdb,
+            "tmdb" => &shown.tvdb,
+            _ => continue,
+        };
+        if other.is_none() {
+            continue;
+        }
+        for row in store.series_episodes(&key).await? {
+            if row.match_source.as_deref() == Some("manual") {
+                continue;
+            }
+            let mut item = store.get(row.id).await?;
+            let Some(gone) =
+                drop_unmatched_provider_show_id(&mut item.metadata.provider_ids, &provider, &shown)
+            else {
+                continue;
+            };
+            store.put(item).await?;
+            metrics::counter!("pharos_episode_stale_show_id_dropped_total", "provider" => gone)
+                .increment(1);
+            tracing::info!(
+                media.id = row.id,
+                show_provider = %provider,
+                dropped = gone,
+                "episode's id from its show's NFO at a provider the show is not matched at dropped"
+            );
+            dropped += 1;
+        }
+    }
+    Ok(dropped)
+}
+
+/// What [`clear_old_providers_show_id`] dropped.
+struct ClearedIds {
+    provider: Option<&'static str>,
+    keys: Vec<&'static str>,
+}
+
+/// B993 — an episode rebuilt onto a show matched at another provider keeps
+/// no id of the old one that its show's `tvshow.nfo` folded onto it: that
+/// id is the show's old match, which the show pass already overrode. An id
+/// the episode's own NFO or tags give stays (it differs from the show's), as
+/// does every other provider's (imdb) and any id when the provider did not
+/// change.
+fn clear_old_providers_show_id(
+    item: &mut MediaItem,
+    old_provider: Option<&str>,
+    new_provider: Option<&str>,
+) -> ClearedIds {
+    let none = ClearedIds {
+        provider: None,
+        keys: Vec::new(),
+    };
+    let old = match old_provider {
+        Some("tmdb") => "tmdb",
+        Some("tvdb") => "tvdb",
+        _ => return none,
+    };
+    if new_provider.is_none() || new_provider == Some(old) {
+        return none;
+    }
+    let Some(series) = item.series.as_ref() else {
+        return none;
+    };
+    let Some(folder) = series.series_folder.as_deref() else {
+        return none;
+    };
+    let Some(shown) = pharos_scanner::metadata::nfo::show_nfo_evidence(
+        std::path::Path::new(folder),
+        &series.series_name,
+        series.series_year,
+    ) else {
+        return none;
+    };
+    let (slot, from_show) = if old == "tmdb" {
+        (&mut item.metadata.provider_ids.tmdb, shown.tmdb)
+    } else {
+        (&mut item.metadata.provider_ids.tvdb, shown.tvdb)
+    };
+    if from_show.is_none() || *slot != from_show {
+        return none;
+    }
+    *slot = None;
+    ClearedIds {
+        provider: Some(old),
+        keys: vec![old],
+    }
+}
+
+/// `pharos_series_reconcile_ids_cleared_total{provider}`: ids dropped by
+/// [`clear_old_providers_show_id`]. `provider` is `tmdb` or `tvdb`.
+fn record_old_ids_cleared(provider: &'static str, n: usize) {
+    metrics::counter!("pharos_series_reconcile_ids_cleared_total", "provider" => provider)
+        .increment(n as u64);
+}
+
+/// The show an episode's folder (or split group) is matched to, if any.
+async fn pinned_show<S: SeriesMetadataStore>(
+    store: &S,
+    item: &MediaItem,
+) -> DomainResult<Option<SeriesMetadata>> {
+    let Some(series) = item.series.as_ref() else {
+        return Ok(None);
+    };
+    let key = series.series_key().to_string();
+    Ok(store
+        .series_metadata_by_keys(std::slice::from_ref(&key))
+        .await?
+        .remove(&key))
+}
+
+/// Where in its pinned show an episode is looked up.
+struct PinnedFetch<'a> {
+    show_id: &'a str,
+    confidence: Option<f32>,
+    season: Option<u32>,
+    episode: Option<u32>,
+    name: Option<&'a str>,
+}
+
+/// An episode NFO id whose record belongs to another show (V892).
+struct NfoRejection {
+    nfo_id: String,
+    record_series: Option<String>,
+    pinned_series: String,
+}
+
+/// V892 — resolve an episode inside its show's pinned match. An NFO id for
+/// the pinned provider is used only when its record says it is an episode
+/// of the pinned show; otherwise the record is set aside (returned as the
+/// rejection) and the episode is looked up by number in the pinned show.
+async fn resolve_pinned<E: OnlineEnricher>(
+    enricher: &E,
+    at: &PinnedFetch<'_>,
+    nfo_id: Option<&str>,
+    bg_io: &Arc<Semaphore>,
+) -> (Resolved, Option<NfoRejection>) {
+    let mut rejected = None;
+    if let Some(nfo_id) = nfo_id {
+        let record = {
+            let _permit = BgPermit::acquire(bg_io).await;
+            enricher
+                .fetch(MediaKind::Episode, nfo_id, at.season, at.episode, at.name)
+                .await
+        };
+        match record {
+            Some(e) if e.series_id.as_deref() == Some(at.show_id) => {
+                return (
+                    Resolved::Hit {
+                        external_id: nfo_id.to_string(),
+                        source: "nfo_id",
+                        confidence: None,
+                        enriched: Box::new(e),
+                    },
+                    None,
+                );
+            }
+            Some(e) => {
+                rejected = Some(NfoRejection {
+                    nfo_id: nfo_id.to_string(),
+                    record_series: e.series_id,
+                    pinned_series: at.show_id.to_string(),
+                });
+            }
+            // No record for the id: nothing to compare, so the number decides.
+            None => {}
+        }
+    }
+    let record = {
+        let _permit = BgPermit::acquire(bg_io).await;
+        enricher
+            .fetch(
+                MediaKind::Episode,
+                at.show_id,
+                at.season,
+                at.episode,
+                at.name,
+            )
+            .await
+    };
+    let resolved = match record {
+        Some(e) => Resolved::Hit {
+            external_id: at.show_id.to_string(),
+            source: "search",
+            confidence: at.confidence,
+            enriched: Box::new(e),
+        },
+        None => Resolved::Transient {
+            external_id: at.show_id.to_string(),
+            source: "search",
+            confidence: at.confidence,
+        },
+    };
+    (resolved, rejected)
+}
+
+/// V892 — drop what a rejected episode NFO put on `item`: its provider ids
+/// (another show's) and, through the caller's re-identified path, its text
+/// and still.
+fn set_aside_nfo(item: &mut MediaItem, rejected: &NfoRejection, provider: &str) {
+    record_episode_rejected(EpisodeRejectReason::NfoOtherSeries);
+    tracing::info!(
+        media.id = item.id,
+        path = %item.path.display(),
+        provider,
+        nfo_id = %rejected.nfo_id,
+        record_series_id = rejected.record_series.as_deref().unwrap_or_default(),
+        pinned_series_id = %rejected.pinned_series,
+        reason = EpisodeRejectReason::NfoOtherSeries.label(),
+        "episode NFO names another series than its show's match; set aside"
+    );
+    item.metadata.provider_ids = ProviderIds::default();
+    item.metadata.community_rating = None;
+}
+
+/// V892 — an episode placed in its pinned show by number whose file names a
+/// different episode than the record there, and none of its neighbours.
+/// Observation only: the number still decides.
+fn observe_title_fit(item: &MediaItem, enriched: &EnrichedMetadata, provider: &str, show_id: &str) {
+    let (Some(name), Some(record)) = (episode_name(item), enriched.title.as_deref()) else {
+        return;
+    };
+    let fits = |t: &str| pharos_core::title_similarity(&name, t) >= SAME_SHOW_EPISODE_TITLE;
+    if fits(record) || enriched.neighbour_titles.iter().any(|t| fits(t)) {
+        return;
+    }
+    record_episode_rejected(EpisodeRejectReason::TitleMismatch);
+    tracing::info!(
+        media.id = item.id,
+        path = %item.path.display(),
+        provider,
+        pinned_series_id = show_id,
+        file_title = %name,
+        record_title = record,
+        reason = EpisodeRejectReason::TitleMismatch.label(),
+        "episode's file title is not its record's in the pinned show"
+    );
+}
+
+/// Lowest [`pharos_core::title_similarity`] at which a file's episode title
+/// is the record's (spec 033 §2's bar).
+const SAME_SHOW_EPISODE_TITLE: f32 = 0.8;
 
 /// FR1 — true when `id`'s row is currently `match_source = "manual"`
 /// (case-insensitive). Used immediately before every terminal
@@ -1010,7 +1981,7 @@ pub(crate) async fn apply_manual_match<Tm, Tv, S>(
 where
     Tm: OnlineEnricher,
     Tv: OnlineEnricher,
-    S: MediaStore + GenreStore + PersonStore + MetadataTranslationStore,
+    S: MediaStore + GenreStore + PersonStore + MetadataTranslationStore + SeriesMetadataStore,
 {
     store
         .set_item_match(id, provider, external_id, "manual", None, now)
@@ -1113,13 +2084,17 @@ async fn resolve<E: OnlineEnricher>(
     let (external_id, source, confidence) = if let Some(id) = nfo_id {
         (id, "nfo_id", None)
     } else {
-        let candidates = {
-            let _permit = BgPermit::acquire(bg_io).await;
-            enricher.search(kind, title, year).await
-        };
-        match match_best(title, year, &candidates, cfg.match_min_confidence) {
+        let decision = search_decide(enricher, kind, title, year, bg_io, cfg).await;
+        match decision.chosen {
             Some(o) => (o.id, "search", Some(o.confidence)),
-            None => return Resolved::NoMatch,
+            None => {
+                let best = decision
+                    .candidates
+                    .iter()
+                    .max_by(|a, b| a.score.total_cmp(&b.score))
+                    .cloned();
+                return Resolved::NoMatch { best };
+            }
         }
     };
     let enriched = {
@@ -1141,6 +2116,130 @@ async fn resolve<E: OnlineEnricher>(
             confidence,
         },
     }
+}
+
+/// Search `enricher` and decide among its candidates with
+/// [`pharos_core::match_decide`].
+async fn search_decide<E: OnlineEnricher>(
+    enricher: &E,
+    kind: MediaKind,
+    title: &str,
+    year: Option<u32>,
+    bg_io: &Arc<Semaphore>,
+    cfg: &MetadataConfig,
+) -> MatchDecision {
+    let candidates = {
+        let _permit = BgPermit::acquire(bg_io).await;
+        enricher.search(kind, title, year).await
+    };
+    match_decide(title, year, &candidates, cfg.match_min_confidence)
+}
+
+/// B990 — how far a candidate's year may be from the stated year and still
+/// be read as that year, once a search narrowed by the year found nothing: a
+/// provider dates a show by its first episode, which may be a pilot a year or
+/// two before or after the year the folder or files state.
+const STATED_YEAR_SLACK: u32 = 2;
+
+/// Search for a show and decide among its candidates (V891's
+/// [`match_decide`]), leaving out `excluded` ids.
+///
+/// TVDB's `year` and TMDB's `first_air_date_year` keep only shows the
+/// provider dates that year, so a show stated as 2003 that the provider dates
+/// 2005 is lost (B990). A search narrowed by a year that leaves no candidate
+/// is asked again without it; its candidates are ranked nearest year first,
+/// and one within [`STATED_YEAR_SLACK`] reads as the stated year. On either
+/// search, a candidate whose name is the show's name with that year
+/// (`Show (2003)`) reads as that year too, so it is not lost to a bare exact
+/// name of another year.
+async fn series_search_decide<E: OnlineEnricher>(
+    enricher: &E,
+    series_key: &str,
+    title: &str,
+    year: Option<u32>,
+    excluded: &[String],
+    bg_io: &Arc<Semaphore>,
+    cfg: &MetadataConfig,
+) -> MatchDecision {
+    let search = |y: Option<u32>| async move {
+        let _permit = BgPermit::acquire(bg_io).await;
+        enricher.search(MediaKind::Episode, title, y).await
+    };
+    let keep = |c: &pharos_core::SearchCandidate| !excluded.contains(&c.id);
+    let mut candidates: Vec<pharos_core::SearchCandidate> =
+        search(year).await.into_iter().filter(keep).collect();
+    let mut retried = false;
+    if let (true, Some(y)) = (candidates.is_empty(), year) {
+        candidates = search(None).await.into_iter().filter(keep).collect();
+        retried = true;
+        let found: Vec<String> = candidates
+            .iter()
+            .map(|c| match c.year {
+                Some(cy) => format!("{} ({cy})", c.id),
+                None => format!("{} (no year)", c.id),
+            })
+            .collect();
+        tracing::info!(
+            provider = enricher.provider(),
+            series_key,
+            query = title,
+            year = y,
+            candidates = %found.join(", "),
+            "series match: no candidate with the year, searched again without it"
+        );
+        record_rematch(RematchStep::YearRetry);
+    }
+    let (candidates, read) = read_stated_year(title, year, candidates, retried);
+    if !read.is_empty() {
+        tracing::info!(
+            provider = enricher.provider(),
+            series_key,
+            query = title,
+            year,
+            retried,
+            read = %read.join(", "),
+            "series match: candidates read as the stated year"
+        );
+    }
+    match_decide(title, year, &candidates, cfg.match_min_confidence)
+}
+
+/// B990 — candidates as [`series_search_decide`] scores them against the
+/// stated `year`: one named `"{title} ({year})"` takes that year, and after a
+/// retry without the year they are ordered nearest year first (the order is
+/// [`match_decide`]'s last tie-break) and one within [`STATED_YEAR_SLACK`]
+/// takes it as well. Also returns each candidate whose year it changed, as
+/// `id provider_year->year`.
+fn read_stated_year(
+    title: &str,
+    year: Option<u32>,
+    mut candidates: Vec<pharos_core::SearchCandidate>,
+    retried: bool,
+) -> (Vec<pharos_core::SearchCandidate>, Vec<String>) {
+    let Some(year) = year else {
+        return (candidates, Vec::new());
+    };
+    let mut read = Vec::new();
+    let named = format!("{title} ({year})");
+    if retried {
+        candidates.sort_by_key(|c| c.year.map_or(u32::MAX, |cy| cy.abs_diff(year)));
+    }
+    for c in &mut candidates {
+        let carries = std::iter::once(&c.title)
+            .chain(&c.aliases)
+            .any(|n| pharos_core::title_similarity(n, &named) >= 1.0);
+        let near = retried
+            && c.year
+                .is_some_and(|cy| cy.abs_diff(year) <= STATED_YEAR_SLACK);
+        if (carries || near) && c.year != Some(year) {
+            read.push(match c.year {
+                Some(cy) => format!("{} {cy}->{year}", c.id),
+                None => format!("{} none->{year}", c.id),
+            });
+            c.year = Some(year);
+        }
+    }
+    (candidates, read)
 }
 
 /// Insert `art` into `chosen` keyed by its role. When a role is already
@@ -1167,43 +2266,895 @@ fn upsert_art(
 ///
 /// 1 (B557): TVDB hits scored by their English translation and aliases, an
 /// exact name ahead of a prefix match, a franchise name to the original.
-pub(crate) const TV_MATCH_VERSION: u32 = 1;
+/// 2 (spec 033, B930): same-named shows told apart by their episodes (V891).
+/// Re-asks only what [`survey_series_identity`] selects, never every show.
+pub(crate) const TV_MATCH_VERSION: u32 = 2;
 
 /// Key under which the [`TV_MATCH_VERSION`] that produced the stored show and
 /// episode search matches is recorded.
 const TV_MATCH_VERSION_KEY: &str = "tv_match_version";
 
-/// Re-admit every searched show and episode once the matcher that chose them
-/// has changed. Unlike album art, an ABSENT record is stale too: every search
+/// Key recording the [`dry_run_marker`] whose survey a dry run has already
+/// logged, so a dry run surveys once per version and survey revision rather
+/// than every pass.
+const TV_MATCH_SURVEY_DRY_RUN_KEY: &str = "tv_match_survey_dry_run";
+
+/// Key recording the [`dry_run_marker`] whose survey `apply` has run, so a
+/// survey revision bump re-runs it under a matcher version already recorded.
+const TV_MATCH_SURVEY_APPLIED_KEY: &str = "tv_match_survey_applied";
+
+/// Bump when [`survey_series_identity`] selects differently, so the next
+/// dry run, and `apply` ([`TV_MATCH_SURVEY_APPLIED_KEY`]), surveys again
+/// under the same matcher version. r2: B982/B983 run window. r3: B984 date
+/// 0, B985 title agreement. r4: B986 run too short. r5: B987 joiners. r6:
+/// B990 re-matches with the files' year and without a too-short pin.
+const SURVEY_REVISION: u32 = 6;
+
+/// What [`TV_MATCH_SURVEY_DRY_RUN_KEY`] holds once a dry run surveyed `version`.
+fn dry_run_marker(version: &str) -> String {
+    format!("{version}.r{SURVEY_REVISION}")
+}
+
+/// Re-ask stored matches once the matcher that chose them has changed.
+///
+/// An ABSENT record re-admits every searched show and episode: every search
 /// match made before this key existed came from the matcher B557 replaced,
 /// which handed 29 of the deployed library's shows to a fan work, an abridged
 /// parody or the wrong entry of a franchise. A fresh install has no searched
-/// rows, so re-admitting there costs nothing. NFO and manual matches are not
-/// touched. One config read per pass once the versions agree.
-async fn readmit_stale_tv_matches<S>(store: &S) -> DomainResult<()>
+/// rows, so re-admitting there costs nothing.
+///
+/// From version 1 on, only what [`survey_series_identity`] selects is asked
+/// again (V940), and only under `series_identity_repair = "apply"`, which
+/// then records the new version. A dry run logs and counts the selection once
+/// per version and leaves the version key alone, so switching to `"apply"`
+/// still runs it. `apply` records the survey revision it ran beside the
+/// version, and surveys again when [`SURVEY_REVISION`] moves. NFO and manual
+/// matches are not touched. One or two config reads per pass once settled.
+async fn readmit_stale_tv_matches<Tv, Tm, S>(
+    store: &S,
+    providers: &SeriesProviders<'_, Tv, Tm>,
+    bg_io: &Arc<Semaphore>,
+    cfg: &MetadataConfig,
+    now: i64,
+) -> DomainResult<()>
 where
-    S: SeriesMetadataStore + pharos_store_sqlx::ServerConfigStore,
+    Tv: OnlineEnricher,
+    Tm: OnlineEnricher,
+    S: SeriesMetadataStore
+        + pharos_core::SeriesIdentityStore
+        + pharos_store_sqlx::ServerConfigStore,
 {
+    let config =
+        |e: pharos_store_sqlx::StoreError| pharos_core::DomainError::Backend(e.to_string());
     let want = TV_MATCH_VERSION.to_string();
+    let marker = dry_run_marker(&want);
+    let mode = cfg.series_identity_repair;
     let have = store
         .load_named_config(TV_MATCH_VERSION_KEY)
         .await
-        .map_err(|e| pharos_core::DomainError::Backend(e.to_string()))?;
-    if have.as_deref() == Some(want.as_str()) {
+        .map_err(config)?;
+    // B990 — under `apply` a recorded version is settled only once this
+    // survey revision ran too, so a revision bump re-asks what it now finds.
+    if have.as_deref() == Some(want.as_str())
+        && (mode == RepairMode::DryRun
+            || store
+                .load_named_config(TV_MATCH_SURVEY_APPLIED_KEY)
+                .await
+                .map_err(config)?
+                .as_deref()
+                == Some(marker.as_str()))
+    {
         return Ok(());
     }
-    let readmitted = store.readmit_searched_tv().await?;
+    let Some(from) = have else {
+        let readmitted = store.readmit_searched_tv().await?;
+        tracing::info!(
+            readmitted,
+            from = "none",
+            to = want.as_str(),
+            "T9 metadata backfill: show matcher version changed, re-matching searched shows and episodes"
+        );
+        // Every searched show is asked again, so no survey is owed.
+        store
+            .set_named_config(TV_MATCH_SURVEY_APPLIED_KEY, &marker)
+            .await
+            .map_err(config)?;
+        return store
+            .set_named_config(TV_MATCH_VERSION_KEY, &want)
+            .await
+            .map_err(config);
+    };
+    if mode == RepairMode::DryRun
+        && store
+            .load_named_config(TV_MATCH_SURVEY_DRY_RUN_KEY)
+            .await
+            .map_err(config)?
+            .as_deref()
+            == Some(marker.as_str())
+    {
+        return Ok(());
+    }
+    let survey = survey_series_identity(store, providers, bg_io, cfg).await?;
+    survey.record(mode, &from, &want);
+    if mode == RepairMode::DryRun {
+        return store
+            .set_named_config(TV_MATCH_SURVEY_DRY_RUN_KEY, &marker)
+            .await
+            .map_err(config);
+    }
+    let keys: Vec<String> = survey.reask.keys().cloned().collect();
+    let readmitted = store.readmit_series(&keys).await?;
+    let mut ids: Vec<pharos_core::MediaId> = survey.episodes.iter().map(|(id, _)| *id).collect();
+    let mut rows_written = 0usize;
+    for split in &survey.title_splits {
+        rows_written += write_title_split(store, split, now).await?;
+        ids.extend(split.files.iter().map(|f| f.id));
+        ids.extend(split.joiners.iter().copied());
+    }
+    let marked = store.mark_reconcile_items(&ids, now).await?;
     tracing::info!(
         readmitted,
-        from = have.as_deref().unwrap_or("none"),
+        marked,
+        override_rows = rows_written,
+        from = from.as_str(),
         to = want.as_str(),
-        "T9 metadata backfill: show matcher version changed, re-matching searched shows and episodes"
+        "series identity repair: show matcher version changed, re-asking the surveyed shows"
     );
+    store
+        .set_named_config(TV_MATCH_SURVEY_APPLIED_KEY, &marker)
+        .await
+        .map_err(config)?;
     store
         .set_named_config(TV_MATCH_VERSION_KEY, &want)
         .await
-        .map_err(|e| pharos_core::DomainError::Backend(e.to_string()))?;
-    Ok(())
+        .map_err(config)
+}
+
+/// Why the version-2 survey selected a show to re-ask or an episode to
+/// rebuild. A metric label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum RepairReason {
+    /// Another show matches the name exactly and no year separates them.
+    ExactRival,
+    /// The matched show premiered more than [`STATED_YEAR_SLACK`] years
+    /// from the stated year.
+    YearMismatch,
+    /// The folder is split, or a hand fix names it.
+    Split,
+    /// The episode's own old search matched another show than its series'.
+    OtherShow,
+    /// The episode aired outside its show's run.
+    OutsideRun,
+    /// B986 — the matched show's whole run is shorter than the show's local
+    /// seasons could span: a miniseries matched for a series.
+    RunTooShort,
+    /// The unyeared file's episode title is a same-named show's of another
+    /// year, so it splits off (V893).
+    EpisodeTitles,
+}
+
+impl RepairReason {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::ExactRival => "exact_rival",
+            Self::YearMismatch => "year_mismatch",
+            Self::Split => "split",
+            Self::OtherShow => "other_show",
+            Self::OutsideRun => "outside_run",
+            Self::RunTooShort => "run_too_short",
+            Self::EpisodeTitles => "episode_titles",
+        }
+    }
+}
+
+/// Slack on each side of a show's run before an episode's air date counts as
+/// outside it: a special or a pilot can air apart from its season, but not
+/// the year or more that separates a show from its remake.
+const RUN_SLACK_SECS: i64 = 180 * 86_400;
+
+/// What the version-2 survey selected: shows to re-ask (search matches only)
+/// and episodes to rebuild against their show's match.
+#[derive(Debug, Default)]
+pub(crate) struct Survey {
+    pub reask: std::collections::BTreeMap<String, RepairReason>,
+    pub episodes: Vec<(pharos_core::MediaId, RepairReason)>,
+    /// Folders whose unyeared files belong to a same-named show by their
+    /// episode titles: split by `scanner` rows on the next scan, so neither
+    /// re-asked nor rebuilt until then.
+    pub title_splits: Vec<TitleSplit>,
+}
+
+/// Spec 033 §2 (V893) — a folder's unyeared files whose filename episode
+/// titles are a same-named show's of another year, not its own year's.
+#[derive(Debug)]
+pub(crate) struct TitleSplit {
+    pub folder: String,
+    /// The year whose group keeps the plain key: the one within a year of the
+    /// stored match's premiere, if any.
+    pub owner_year: Option<u32>,
+    pub files: Vec<TitleMove>,
+    /// B987 — unyeared files that stay and join an owner of another year
+    /// than the folder's files state, while holding another show's episode.
+    pub joiners: Vec<pharos_core::MediaId>,
+}
+
+/// One unyeared file and the show its episode title names.
+#[derive(Debug)]
+pub(crate) struct TitleMove {
+    pub id: pharos_core::MediaId,
+    pub path: String,
+    pub year: u32,
+}
+
+impl Survey {
+    /// The `series identity repair: survey` line and the selection gauges.
+    fn record(&self, mode: RepairMode, from: &str, to: &str) {
+        let mut counts: std::collections::BTreeMap<(&str, RepairReason), usize> =
+            std::collections::BTreeMap::new();
+        for reason in self.reask.values() {
+            *counts.entry(("show", *reason)).or_default() += 1;
+        }
+        for (_, reason) in &self.episodes {
+            *counts.entry(("episode", *reason)).or_default() += 1;
+        }
+        for split in &self.title_splits {
+            *counts
+                .entry(("episode", RepairReason::EpisodeTitles))
+                .or_default() += split.files.len();
+            *counts.entry(("episode", RepairReason::Split)).or_default() += split.joiners.len();
+        }
+        for kind in ["show", "episode"] {
+            for reason in [
+                RepairReason::ExactRival,
+                RepairReason::YearMismatch,
+                RepairReason::Split,
+                RepairReason::OtherShow,
+                RepairReason::OutsideRun,
+                RepairReason::RunTooShort,
+                RepairReason::EpisodeTitles,
+            ] {
+                let n = counts.get(&(kind, reason)).copied().unwrap_or(0);
+                #[allow(clippy::cast_precision_loss)]
+                metrics::gauge!(
+                    "pharos_series_identity_repair_selected",
+                    "kind" => kind,
+                    "reason" => reason.label(),
+                    "mode" => mode.label(),
+                )
+                .set(n as f64);
+            }
+        }
+        let reask: Vec<String> = self
+            .reask
+            .iter()
+            .map(|(k, r)| format!("{k}:{}", r.label()))
+            .collect();
+        tracing::info!(
+            mode = mode.label(),
+            from,
+            to,
+            shows = self.reask.len(),
+            episodes = self.episodes.len(),
+            title_splits = self.title_splits.len(),
+            reask = ?reask,
+            "series identity repair: survey"
+        );
+    }
+}
+
+/// Spec 033 §6 (V940) — the stored matches with conflicting evidence. A
+/// searched show is re-asked when its folder is split or named by a hand fix,
+/// when its match premiered more than two years from its stated year, or when a
+/// fresh search finds another show of the exact name no year separates. An
+/// episode is rebuilt when its own old search matched another show than its
+/// series' pinned one, or when it aired outside that show's run (by the
+/// show's episode list). Manual shows are left alone. One search per searched
+/// show and one episode list per matched show with dated episodes.
+async fn survey_series_identity<Tv, Tm, S>(
+    store: &S,
+    providers: &SeriesProviders<'_, Tv, Tm>,
+    bg_io: &Arc<Semaphore>,
+    cfg: &MetadataConfig,
+) -> DomainResult<Survey>
+where
+    Tv: OnlineEnricher,
+    Tm: OnlineEnricher,
+    S: SeriesMetadataStore + pharos_core::SeriesIdentityStore,
+{
+    let shows = store.series_needing_match(i64::MAX, i64::MAX).await?;
+    let keys: Vec<String> = shows.iter().map(|c| c.series_key.clone()).collect();
+    let stored = store.series_metadata_by_keys(&keys).await?;
+    let mut survey = Survey::default();
+    for cand in &shows {
+        let Some(m) = stored.get(&cand.series_key) else {
+            continue;
+        };
+        let Some((provider, show_id)) = stored_match(m) else {
+            continue;
+        };
+        if m.match_source.as_deref() != Some("manual") {
+            if let Some(split) =
+                title_evidence(store, providers, bg_io, cfg, cand, m, provider).await?
+            {
+                tracing::info!(
+                    folder = %split.folder,
+                    files = split.files.len(),
+                    owner_year = split.owner_year,
+                    "series identity repair: split pending on episode titles, not re-asked"
+                );
+                survey.title_splits.push(split);
+                tokio::time::sleep(REQUEST_SPACING).await;
+                continue;
+            }
+        }
+        let rows = store.series_episodes(&cand.series_key).await?;
+        if m.match_source.as_deref() == Some("search") {
+            let stated = stated_year(cand, &rows);
+            let reason =
+                show_conflict(store, providers, bg_io, cfg, cand, stated, m, provider).await?;
+            if let Some((reason, candidates)) = reason {
+                tracing::info!(
+                    series_key = %cand.series_key,
+                    provider,
+                    match_id = show_id,
+                    reason = reason.label(),
+                    candidates = %candidates,
+                    "series identity repair: re-ask"
+                );
+                survey.reask.insert(cand.series_key.clone(), reason);
+            }
+        }
+        let mut picked = 0usize;
+        let mut window = None;
+        for row in &rows {
+            let own_search = row.match_source.as_deref() == Some("search")
+                && row.match_provider.as_deref() == Some(provider);
+            if own_search && row.match_external_id.as_deref() != Some(show_id) {
+                survey.episodes.push((row.id, RepairReason::OtherShow));
+                picked += 1;
+            }
+        }
+        if rows.iter().any(|r| aired(r).is_some()) {
+            let seasons: Vec<u32> = rows
+                .iter()
+                .filter_map(|r| r.season)
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            let (listing, series_run) = match provider {
+                "tvdb" => match providers.tvdb {
+                    Some(t) => show_run(t, bg_io, show_id, &seasons).await,
+                    None => (None, None),
+                },
+                "tmdb" => match providers.tmdb {
+                    Some(t) => show_run(t, bg_io, show_id, &seasons).await,
+                    None => (None, None),
+                },
+                _ => (None, None),
+            };
+            window = run_window(listing.iter().flatten().filter_map(|l| l.aired), series_run);
+            let too_short = m.match_source.as_deref() == Some("search")
+                && window.is_some_and(|w| run_too_short(w, &rows));
+            if too_short && !survey.reask.contains_key(&cand.series_key) {
+                tracing::info!(
+                    series_key = %cand.series_key,
+                    provider,
+                    match_id = show_id,
+                    reason = RepairReason::RunTooShort.label(),
+                    run_first = window.map(|(first, _)| first),
+                    run_last = window.and_then(|(_, last)| last),
+                    seasons = regular_seasons(&rows),
+                    candidates = "",
+                    "series identity repair: re-ask"
+                );
+                survey
+                    .reask
+                    .insert(cand.series_key.clone(), RepairReason::RunTooShort);
+            }
+            // A re-asked show's episodes wait for its new match: the pin's
+            // run is no measure of them (B986).
+            let window = window.filter(|_| !too_short);
+            if let Some((first, last)) = window {
+                let mut agreed: Vec<&str> = Vec::new();
+                for row in &rows {
+                    let outside = aired(row).is_some_and(|d| {
+                        d < first - RUN_SLACK_SECS
+                            || last.is_some_and(|last| d > last + RUN_SLACK_SECS)
+                    });
+                    let taken = survey.episodes.iter().any(|(id, _)| *id == row.id);
+                    if !outside || taken {
+                        continue;
+                    }
+                    if file_title_agrees(row) {
+                        agreed.push(&row.path);
+                    } else {
+                        survey.episodes.push((row.id, RepairReason::OutsideRun));
+                        picked += 1;
+                    }
+                }
+                if let Some(sample) = agreed.first() {
+                    tracing::info!(
+                        series_key = %cand.series_key,
+                        provider,
+                        match_id = show_id,
+                        episodes = agreed.len(),
+                        sample = %sample,
+                        "series identity repair: outside the run, titles agree, not marked"
+                    );
+                }
+            }
+        }
+        if picked > 0 {
+            tracing::info!(
+                series_key = %cand.series_key,
+                provider,
+                match_id = show_id,
+                episodes = picked,
+                run_first = window.map(|(first, _)| first),
+                run_last = window.and_then(|(_, last)| last),
+                "series identity repair: episodes to rebuild"
+            );
+        }
+        tokio::time::sleep(REQUEST_SPACING).await;
+    }
+    Ok(survey)
+}
+
+/// B984 — a row's stored air date, with unix second 0 read as none: rows
+/// imported before the NFO parser dropped the `1970-01-01` placeholder still
+/// hold it until their next probe.
+fn aired(row: &pharos_core::SeriesEpisodeRow) -> Option<i64> {
+    row.premiere_date.filter(|&d| d != 0)
+}
+
+/// B986 — a run this short is one event (a film, a miniseries, a special),
+/// never a show with seasons apart.
+const SHORT_RUN_SECS: i64 = 30 * 86_400;
+
+/// The show's distinct local seasons, specials (season 0) aside.
+fn regular_seasons(rows: &[pharos_core::SeriesEpisodeRow]) -> usize {
+    rows.iter()
+        .filter_map(|r| r.season.filter(|&s| s > 0))
+        .collect::<std::collections::BTreeSet<_>>()
+        .len()
+}
+
+/// B986 — whether a show with two or more local seasons is matched to a show
+/// that ran under [`SHORT_RUN_SECS`] from first to last air date.
+fn run_too_short(
+    (first, last): (i64, Option<i64>),
+    rows: &[pharos_core::SeriesEpisodeRow],
+) -> bool {
+    last.is_some_and(|last| last - first < SHORT_RUN_SECS) && regular_seasons(rows) >= 2
+}
+
+/// B985 — whether the episode title the file names is the one stored for
+/// it: then the episode is right and only its date is odd. A file naming no
+/// title cannot vouch for its row, nor can a stored title the local resolver
+/// took from the file name itself (`Show - S03E33 - …`): it would agree with
+/// any file, right or wrong show.
+fn file_title_agrees(row: &pharos_core::SeriesEpisodeRow) -> bool {
+    use pharos_scanner::metadata::filename::episode_title;
+    if episode_title(&row.title).is_some() {
+        return false;
+    }
+    let stored = &row.title;
+    std::path::Path::new(&row.path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .and_then(episode_title)
+        .is_some_and(|file| {
+            pharos_core::title_similarity(&file, stored) >= crate::episode_fit::SAME_TITLE
+        })
+}
+
+/// B982 — the show's episode listing and its series-level run.
+async fn show_run<E: OnlineEnricher>(
+    enricher: &E,
+    bg_io: &Arc<Semaphore>,
+    show_id: &str,
+    seasons: &[u32],
+) -> (
+    Option<Vec<EpisodeListing>>,
+    Option<crate::online_enrich::SeriesRun>,
+) {
+    let listing = list_episodes(enricher, bg_io, show_id, seasons).await;
+    let _permit = BgPermit::acquire(bg_io).await;
+    (listing, enricher.series_run(show_id).await)
+}
+
+/// B982 — a show's run as `(first, last)` air dates: the span of its listed
+/// episodes widened to its series-level run, with no end while it is still
+/// airing. A listing covers only the seasons asked for, so an
+/// absolute-numbered or renumbered episode falls outside it.
+fn run_window(
+    listed: impl Iterator<Item = i64> + Clone,
+    series: Option<crate::online_enrich::SeriesRun>,
+) -> Option<(i64, Option<i64>)> {
+    let series = series.unwrap_or_default();
+    let first = listed.clone().min().into_iter().chain(series.first).min()?;
+    let last = listed.max().into_iter().chain(series.last).max();
+    Some((first, if series.ongoing { None } else { last }))
+}
+
+async fn list_episodes<E: OnlineEnricher>(
+    enricher: &E,
+    bg_io: &Arc<Semaphore>,
+    show_id: &str,
+    seasons: &[u32],
+) -> Option<Vec<EpisodeListing>> {
+    let _permit = BgPermit::acquire(bg_io).await;
+    enricher.episode_list(show_id, seasons).await
+}
+
+/// Spec 033 §2 (V893) — record a [`TitleSplit`] as `scanner` override rows:
+/// one per moved file with its show's year, and the folder-wide owner row,
+/// so a later change of the folder's match cannot hand its plain key to the
+/// other show. Existing rows are kept. Returns the rows inserted.
+async fn write_title_split<S: pharos_core::SeriesIdentityStore>(
+    store: &S,
+    split: &TitleSplit,
+    now: i64,
+) -> DomainResult<usize> {
+    use pharos_core::{OverrideSource, SeriesOverride};
+    let row = |path: Option<String>, target_key: String, year: u32| SeriesOverride {
+        id: 0,
+        series_folder: split.folder.clone(),
+        path,
+        target_key,
+        target_name: None,
+        target_year: Some(year),
+        source: OverrideSource::Scanner,
+        created_by: None,
+        created_at: now,
+    };
+    let mut written = 0;
+    if let Some(year) = split.owner_year {
+        written += usize::from(
+            store
+                .insert_series_override(row(None, split.folder.clone(), year))
+                .await?,
+        );
+    }
+    for f in &split.files {
+        let key = pharos_scanner::series_split::split_key(&split.folder, f.year);
+        written += usize::from(
+            store
+                .insert_series_override(row(Some(f.path.clone()), key, f.year))
+                .await?,
+        );
+    }
+    Ok(written)
+}
+
+/// Spec 033 §2 (V893) — a folder whose files state one show year but also
+/// hold unyeared files with episode titles: each such title is compared with
+/// the stated year's show and with the exact-name shows of other years at
+/// the same season and episode. A file whose title names a rival's episode
+/// (similarity ≥ 0.8) and not its own year's show's belongs to that rival.
+/// Only these folders cost a search and the lists of the shows compared.
+async fn title_evidence<Tv, Tm, S>(
+    store: &S,
+    providers: &SeriesProviders<'_, Tv, Tm>,
+    bg_io: &Arc<Semaphore>,
+    cfg: &MetadataConfig,
+    cand: &SeriesMatchCandidate,
+    stored: &SeriesMetadata,
+    provider: &str,
+) -> DomainResult<Option<TitleSplit>>
+where
+    Tv: OnlineEnricher,
+    Tm: OnlineEnricher,
+    S: pharos_core::SeriesIdentityStore,
+{
+    let folder = cand.series_key.clone();
+    if folder.contains(pharos_scanner::series_split::SPLIT_KEY_SEPARATOR) {
+        return Ok(None);
+    }
+    let rows = store.series_episodes(&folder).await?;
+    let mut years = std::collections::BTreeSet::new();
+    let mut unyeared = Vec::new();
+    for row in &rows {
+        let path = std::path::Path::new(&row.path);
+        match pharos_scanner::series_split::stated_show_year(path) {
+            Some(y) => {
+                years.insert(y);
+            }
+            None => {
+                let title = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .and_then(pharos_scanner::metadata::filename::episode_title);
+                if let (Some(season), Some(episode), Some(title)) = (row.season, row.episode, title)
+                {
+                    unyeared.push((row, season, episode, title));
+                }
+            }
+        }
+    }
+    let stated = match (years.len(), years.first()) {
+        (1, Some(&y)) => y,
+        _ => return Ok(None),
+    };
+    if unyeared.is_empty() {
+        return Ok(None);
+    }
+    match provider {
+        "tvdb" => match providers.tvdb {
+            Some(t) => title_moves(t, provider, bg_io, cfg, cand, stored, stated, &unyeared).await,
+            None => Ok(None),
+        },
+        "tmdb" => match providers.tmdb {
+            Some(t) => title_moves(t, provider, bg_io, cfg, cand, stored, stated, &unyeared).await,
+            None => Ok(None),
+        },
+        _ => Ok(None),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn title_moves<E: OnlineEnricher>(
+    enricher: &E,
+    provider: &str,
+    bg_io: &Arc<Semaphore>,
+    cfg: &MetadataConfig,
+    cand: &SeriesMatchCandidate,
+    stored: &SeriesMetadata,
+    stated: u32,
+    unyeared: &[(&pharos_core::SeriesEpisodeRow, u32, u32, String)],
+) -> DomainResult<Option<TitleSplit>> {
+    let decision = search_decide(
+        enricher,
+        MediaKind::Episode,
+        &cand.series_name,
+        None,
+        bg_io,
+        cfg,
+    )
+    .await;
+    let exact: Vec<&pharos_core::ScoredCandidate> =
+        decision.candidates.iter().filter(|c| c.exact).collect();
+    let Some(own) = exact
+        .iter()
+        .filter(|c| c.year.is_some_and(|y| y.abs_diff(stated) <= 1))
+        .min_by_key(|c| c.year.map(|y| y.abs_diff(stated)))
+    else {
+        return Ok(None);
+    };
+    let rivals: Vec<(&str, u32)> = exact
+        .iter()
+        .filter_map(|c| Some((c.id.as_str(), c.year.filter(|y| y.abs_diff(stated) > 1)?)))
+        .take(episode_fit::MAX_SCORED)
+        .collect();
+    if rivals.is_empty() {
+        return Ok(None);
+    }
+    let seasons: Vec<u32> = unyeared
+        .iter()
+        .map(|(_, s, _, _)| *s)
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let Some(own_list) = list_episodes(enricher, bg_io, &own.id, &seasons).await else {
+        tracing::info!(
+            series_key = %cand.series_key,
+            provider,
+            show_id = %own.id,
+            "series identity repair: episode list unavailable, folder not split on episode titles"
+        );
+        return Ok(None);
+    };
+    let mut rival_lists = Vec::new();
+    for (id, year) in &rivals {
+        if let Some(list) = list_episodes(enricher, bg_io, id, &seasons).await {
+            rival_lists.push((*id, *year, list));
+        }
+    }
+    let listed = |list: &[EpisodeListing], s: u32, e: u32| {
+        list.iter()
+            .find(|l| l.season == s && l.episode == e)
+            .and_then(|l| l.title.clone())
+    };
+    let sim = |a: &str, b: Option<&str>| b.map_or(0.0, |b| pharos_core::title_similarity(a, b));
+    let mut files = Vec::new();
+    let mut stays = Vec::new();
+    for (row, s, e, title) in unyeared {
+        let own_title = listed(&own_list, *s, *e);
+        let own_score = sim(title, own_title.as_deref());
+        if own_score >= episode_fit::SAME_TITLE {
+            stays.push((*row, *s, *e));
+            continue;
+        }
+        let best = rival_lists
+            .iter()
+            .filter_map(|(id, year, list)| {
+                let t = listed(list, *s, *e);
+                let score = sim(title, t.as_deref());
+                (score >= episode_fit::SAME_TITLE).then_some((*id, *year, t, score))
+            })
+            .max_by(|a, b| a.3.total_cmp(&b.3));
+        let Some((rival_id, year, rival_title, rival_score)) = best else {
+            stays.push((*row, *s, *e));
+            continue;
+        };
+        tracing::info!(
+            path = %row.path,
+            season = s,
+            episode = e,
+            title = %title,
+            own_id = %own.id,
+            own_title = own_title.as_deref(),
+            own_score,
+            rival_id,
+            rival_year = year,
+            rival_title = rival_title.as_deref(),
+            rival_score,
+            "series identity repair: file's episode title names a same-named show"
+        );
+        files.push(TitleMove {
+            id: row.id,
+            path: row.path.clone(),
+            year,
+        });
+    }
+    if files.is_empty() {
+        return Ok(None);
+    }
+    let premiered = stored.premiere_date.and_then(pharos_store_sqlx::unix_year);
+    let owner_year = premiered.and_then(|p| {
+        std::iter::once(stated)
+            .chain(files.iter().map(|f| f.year))
+            .filter(|y| y.abs_diff(p) <= 1)
+            .min_by_key(|y| y.abs_diff(p))
+    });
+    let joiners = match owner_year {
+        Some(owner) if owner != stated => rival_lists
+            .iter()
+            .find(|(_, year, _)| *year == owner)
+            .map(|(id, year, list)| owner_joiners(cand, id, *year, list, &stays))
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    };
+    Ok(Some(TitleSplit {
+        folder: cand.series_key.clone(),
+        owner_year,
+        files,
+        joiners,
+    }))
+}
+
+/// B987 — the unyeared files that stay in a title-split folder join its
+/// owner, whose show is not the year the folder's files state. A file whose
+/// stored episode disagrees with the owner's same episode (by title, or by an
+/// air date a remake's distance away) holds the other show's episode and is
+/// rebuilt from the owner. A file the owner lists no episode for is left.
+fn owner_joiners(
+    cand: &SeriesMatchCandidate,
+    owner_id: &str,
+    owner_year: u32,
+    owner_list: &[EpisodeListing],
+    stays: &[(&pharos_core::SeriesEpisodeRow, u32, u32)],
+) -> Vec<pharos_core::MediaId> {
+    let mut joiners = Vec::new();
+    for (row, s, e) in stays {
+        let Some(owner) = owner_list
+            .iter()
+            .find(|l| l.season == *s && l.episode == *e)
+        else {
+            continue;
+        };
+        let title_differs = owner.title.as_deref().is_some_and(|t| {
+            pharos_core::title_similarity(&row.title, t) < episode_fit::SAME_TITLE
+        });
+        let aired_differs = aired(row)
+            .zip(owner.aired)
+            .is_some_and(|(stored, owned)| stored.abs_diff(owned) > RUN_SLACK_SECS.unsigned_abs());
+        if !(title_differs || aired_differs) {
+            continue;
+        }
+        tracing::info!(
+            series_key = %cand.series_key,
+            path = %row.path,
+            season = s,
+            episode = e,
+            stored_title = %row.title,
+            stored_aired = aired(row),
+            owner_id,
+            owner_year,
+            owner_title = owner.title.as_deref(),
+            owner_aired = owner.aired,
+            "series identity repair: file joins the owner's show holding another show's episode"
+        );
+        joiners.push(row.id);
+    }
+    joiners
+}
+
+/// The show year a show's own episode files state (V893), when they agree on
+/// one; else the stored year. The stored column is written by the scan's
+/// split pass, which may not have run (or, in a dry run, written) before the
+/// survey reaches the show (B980).
+fn stated_year(cand: &SeriesMatchCandidate, rows: &[pharos_core::SeriesEpisodeRow]) -> Option<u32> {
+    let years: std::collections::BTreeSet<u32> = rows
+        .iter()
+        .filter_map(|r| {
+            pharos_scanner::series_split::stated_show_year(std::path::Path::new(&r.path))
+        })
+        .collect();
+    match years.len() {
+        1 => years.into_iter().next(),
+        _ => cand.series_year,
+    }
+}
+
+/// Why a searched show's stored match conflicts with its evidence, if it does.
+#[allow(clippy::too_many_arguments)]
+async fn show_conflict<Tv, Tm, S>(
+    store: &S,
+    providers: &SeriesProviders<'_, Tv, Tm>,
+    bg_io: &Arc<Semaphore>,
+    cfg: &MetadataConfig,
+    cand: &SeriesMatchCandidate,
+    stated: Option<u32>,
+    stored: &SeriesMetadata,
+    provider: &str,
+) -> DomainResult<Option<(RepairReason, String)>>
+where
+    Tv: OnlineEnricher,
+    Tm: OnlineEnricher,
+    S: pharos_core::SeriesIdentityStore,
+{
+    let mut parts = cand
+        .series_key
+        .split(pharos_scanner::series_split::SPLIT_KEY_SEPARATOR);
+    let folder = parts.next().unwrap_or_default().to_string();
+    let split = parts.next().is_some()
+        || !store
+            .series_overrides(std::slice::from_ref(&folder))
+            .await?
+            .is_empty();
+    if split {
+        return Ok(Some((RepairReason::Split, String::new())));
+    }
+    let premiered = stored.premiere_date.and_then(pharos_store_sqlx::unix_year);
+    // B990 — the same slack the re-match reads a candidate's year with, so
+    // a show it chose is not re-asked by the next survey.
+    if let (Some(stated), Some(premiered)) = (stated, premiered) {
+        if stated.abs_diff(premiered) > STATED_YEAR_SLACK {
+            return Ok(Some((RepairReason::YearMismatch, String::new())));
+        }
+    }
+    let decision = match provider {
+        "tvdb" => match providers.tvdb {
+            Some(t) => Some(
+                search_decide(t, MediaKind::Episode, &cand.series_name, stated, bg_io, cfg).await,
+            ),
+            None => None,
+        },
+        "tmdb" => match providers.tmdb {
+            Some(t) => Some(
+                search_decide(t, MediaKind::Episode, &cand.series_name, stated, bg_io, cfg).await,
+            ),
+            None => None,
+        },
+        _ => None,
+    };
+    Ok(decision
+        .filter(needs_episode_fit)
+        .map(|d| (RepairReason::ExactRival, exact_candidates_label(&d))))
+}
+
+/// The exact-name candidates a search tied on, as `id (year) score` joined
+/// by `, `, so a re-ask line names the rivals it saw.
+fn exact_candidates_label(decision: &MatchDecision) -> String {
+    exact_candidates(decision)
+        .iter()
+        .map(|c| match c.year {
+            Some(year) => format!("{} ({year}) {:.2}", c.id, c.score),
+            None => format!("{} (no year) {:.2}", c.id, c.score),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Key under which the album-art matcher version that produced the CURRENT
@@ -1216,7 +3167,7 @@ const ALBUM_MATCH_VERSION_KEY: &str = "musicbrainz_album_match_version";
 /// Drop every MusicBrainz-sourced cover when the matcher that chose them has
 /// changed, so a corrected matcher can revisit its own mistakes.
 ///
-/// B150 — the reason this exists. Owl City's `Fireflies` was given The Attic's
+/// B150 — the reason this exists. Band A's `Song A` was given Other Band's
 /// sleeve, and because `audio_items_needing_art` skips anything that already
 /// has art, no later pass would ever have looked at it again. A cached cover is
 /// only as trustworthy as the matcher that picked it, so the matcher's version
@@ -1365,12 +3316,12 @@ where
     // The album artist is the right key: on a compilation the per-track artist
     // is the performer of that track, which would not match the release-group.
     // Fall back to the track artist when there is no album-artist tag.
-    // B152 — a BLANK tag is an absent tag. Owl City's `Fireflies` carries
-    // `album_artist = ""` alongside `artist = "Owl City"`; `Option::or` sees
+    // B152 — a BLANK tag is an absent tag. Band A's `Song A` carries
+    // `album_artist = ""` alongside `artist = "Band A"`; `Option::or` sees
     // `Some("")` and keeps it, so the good tag was shadowed by an empty one.
     // Downstream that empty string reads as "artist unknown", which the B150
     // consistency check deliberately lets pass — so the track went straight
-    // back to matching any album called Fireflies.
+    // back to matching any album called Song A.
     let non_blank = |s: &Option<String>| {
         s.as_deref()
             .map(str::trim)
@@ -1495,7 +3446,7 @@ async fn enrich_series_pass<Tv, Tm, S>(
 where
     Tv: OnlineEnricher,
     Tm: OnlineEnricher,
-    S: SeriesMetadataStore + MetadataTranslationStore,
+    S: SeriesMetadataStore + MetadataTranslationStore + pharos_core::SeriesIdentityStore,
 {
     let providers = SeriesProviders { tvdb, tmdb };
     let ttl_cutoff = now.saturating_sub(i64::from(cfg.refresh_ttl_days) * 86_400);
@@ -1506,9 +3457,11 @@ where
     // keeps draining rather than idling — see [`PassStats::had_work`].
     let had_work = !candidates.is_empty();
     let mut enriched = 0usize;
+    let mut lists = EpisodeLists::new();
     for cand in candidates {
         // V6 — one bad show never aborts the pass; log it and carry on.
-        match enrich_one_series(store, bg_io, cache, &providers, cfg, cand, now).await {
+        let one = enrich_one_series(store, bg_io, cache, &providers, cfg, cand, now, &mut lists);
+        match one.await {
             Ok(true) => enriched += 1,
             Ok(false) => {}
             Err(e) => tracing::warn!(error = %e, "T9-series metadata backfill: show failed"),
@@ -1535,6 +3488,7 @@ struct SeriesProviders<'a, Tv, Tm> {
 /// match, `Ok(false)` when it marked the show `none` (no confident hit) or hit
 /// a transient miss (left for the next pass). Local data can't be clobbered —
 /// a show has no curated local metadata, so this simply writes the record.
+#[allow(clippy::too_many_arguments)]
 async fn enrich_one_series<Tv, Tm, S>(
     store: &S,
     bg_io: &Arc<Semaphore>,
@@ -1543,46 +3497,128 @@ async fn enrich_one_series<Tv, Tm, S>(
     cfg: &MetadataConfig,
     cand: SeriesMatchCandidate,
     now: i64,
+    lists: &mut EpisodeLists,
 ) -> DomainResult<bool>
 where
     Tv: OnlineEnricher,
     Tm: OnlineEnricher,
-    S: SeriesMetadataStore + MetadataTranslationStore,
+    S: SeriesMetadataStore + MetadataTranslationStore + pharos_core::SeriesIdentityStore,
 {
-    // B125 — TVDB first (it is the show-shaped provider), then TMDB. 44 of the
-    // deployed library's 178 shows were marked `none` by TVDB alone, almost all
-    // of them anime — Death Note, Dragon Ball GT, Code Geass — which TMDB
-    // carries. A show marked `none` has no poster, so its tile falls back to a
+    // B125 — TVDB first (it is the show-shaped provider), then TMDB. Many
+    // shows were marked `none` by TVDB alone, almost all of them anime, which
+    // TMDB carries. A show marked `none` has no poster, so its tile falls back to a
     // representative episode and then to an extracted frame.
+    // B990 — the year the show's own files state, as the survey read it
+    // (B980): the stored column is empty for a bare folder until the scan's
+    // split pass writes it, and a search without it hands a remake's files
+    // to the original's exact name.
+    let rows = match store.series_episodes(&cand.series_key).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                series_key = %cand.series_key,
+                "T9-series metadata backfill: local episodes unreadable; searching with the stored year"
+            );
+            Vec::new()
+        }
+    };
+    let year = stated_year(&cand, &rows);
+    let stored = match store
+        .series_metadata_by_keys(std::slice::from_ref(&cand.series_key))
+        .await
+    {
+        Ok(mut found) => found.remove(&cand.series_key),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                series_key = %cand.series_key,
+                "T9-series metadata backfill: stored match unreadable; not checking its run"
+            );
+            None
+        }
+    };
+    let short_pin = too_short_pin(providers, bg_io, stored.as_ref(), &rows).await;
+    if let Some((provider, id)) = &short_pin {
+        tracing::info!(
+            series_key = %cand.series_key,
+            provider,
+            match_id = id.as_str(),
+            seasons = regular_seasons(&rows),
+            "series match: the stored match's run is too short for the show's seasons, leaving it out"
+        );
+        record_rematch(RematchStep::PinExcluded);
+    }
+    let evidence = SeriesEvidence {
+        year,
+        rows: &rows,
+        short_pin,
+    };
     let mut outcome = None;
     // A provider BLIP is not a provider saying no. If any attempt was
     // transient we leave the row untouched for the next pass rather than
     // freezing the show as `none` for the whole TTL.
-    let mut transient = false;
+    let mut transient = None;
     if let Some(tv) = providers.tvdb {
-        match resolve_series(tv, "tvdb", bg_io, cache, cfg, &cand).await {
+        match resolve_series(
+            store, tv, "tvdb", bg_io, cache, cfg, &cand, &evidence, lists,
+        )
+        .await
+        {
             SeriesAttempt::Hit(h) => outcome = Some(h),
-            SeriesAttempt::Transient => transient = true,
+            SeriesAttempt::Transient(d) => transient = Some(d),
             SeriesAttempt::NoMatch => {}
         }
     }
     let mut fell_back = false;
     if outcome.is_none() {
         if let Some(tm) = providers.tmdb {
-            match resolve_series(tm, "tmdb", bg_io, cache, cfg, &cand).await {
+            match resolve_series(
+                store, tm, "tmdb", bg_io, cache, cfg, &cand, &evidence, lists,
+            )
+            .await
+            {
                 SeriesAttempt::Hit(h) => {
                     outcome = Some(h);
                     fell_back = true;
                 }
-                SeriesAttempt::Transient => transient = true,
+                SeriesAttempt::Transient(d) => transient = Some(d),
                 SeriesAttempt::NoMatch => {}
             }
         }
     }
-    if outcome.is_none() && transient {
+    // One count per show, with the final outcome over every provider asked
+    // (a TVDB miss then a TMDB hit is one `matched`).
+    if let Some(hit) = &outcome {
+        record_series_match(
+            SeriesMatchOutcome::of(&hit.decision),
+            hit.decision.decided_by,
+        );
+    } else if let Some(d) = &transient {
+        record_series_match(SeriesMatchOutcome::Transient, d.decided_by);
         return Ok(false);
+    } else {
+        record_series_match(SeriesMatchOutcome::NoMatch, None);
     }
     let Some(hit) = outcome else {
+        // B990 — a show whose stored match ran too short for its seasons, and
+        // whose every other candidate did too (or none was left), keeps its
+        // match flagged for Manage → Show identity rather than be pinned to
+        // it again or lose it.
+        if let (Some((provider, id)), Some(mut row)) = (&evidence.short_pin, stored) {
+            tracing::info!(
+                series_key = %cand.series_key,
+                provider,
+                match_id = id.as_str(),
+                seasons = regular_seasons(&rows),
+                "series identity repair: re-ask left the show flagged: only too-short candidates"
+            );
+            record_rematch(RematchStep::FlaggedTooShort);
+            row.match_flag = Some(AMBIGUOUS_FLAG.to_string());
+            row.metadata_refreshed_at = Some(now);
+            store.upsert_series_metadata(row).await?;
+            return Ok(false);
+        }
         // Every configured provider searched and found nothing over the
         // confidence floor → record `none` so the show isn't re-searched until
         // the TTL re-admits it. Attributed to whichever provider ran last.
@@ -1591,6 +3627,7 @@ where
         } else {
             "tvdb"
         };
+        mark_if_match_changed(store, &cand.series_key, None, now).await?;
         store
             .upsert_series_metadata(SeriesMetadata {
                 series_key: cand.series_key.clone(),
@@ -1603,6 +3640,21 @@ where
             .await?;
         return Ok(false);
     };
+    if year != cand.series_year {
+        tracing::info!(
+            series_key = %cand.series_key,
+            provider = hit.provider,
+            year,
+            stored_year = cand.series_year,
+            chosen = hit.external_id.as_str(),
+            decided_by = hit
+                .decision
+                .decided_by
+                .map_or("none", pharos_core::MatchDecidedBy::label),
+            "series match: matched with the year the show's files state"
+        );
+        record_rematch(RematchStep::StatedYear);
+    }
     if fell_back {
         tracing::info!(
             series = %cand.series_name,
@@ -1611,6 +3663,14 @@ where
         );
     }
 
+    let flagged = hit.decision.ambiguous;
+    mark_if_match_changed(
+        store,
+        &cand.series_key,
+        Some((hit.provider, hit.external_id.as_str())),
+        now,
+    )
+    .await?;
     let provider_ids = match hit.provider {
         "tmdb" => ProviderIds {
             tmdb: Some(hit.external_id.clone()),
@@ -1627,6 +3687,7 @@ where
     };
     store
         .upsert_series_metadata(SeriesMetadata {
+            locked: Default::default(),
             series_key: cand.series_key.clone(),
             series_name: cand.series_name.clone(),
             match_provider: Some(hit.provider.into()),
@@ -1647,6 +3708,13 @@ where
             backdrop_locator: hit.backdrop_locator,
             // The upsert never writes the ratings columns.
             ratings: Default::default(),
+            // V891 — every upsert writes the flag, so a clear decision on a
+            // later pass clears it.
+            match_flag: flagged.then(|| AMBIGUOUS_FLAG.to_string()),
+            match_runner_up_id: flagged
+                .then(|| hit.decision.runner_up.as_ref().map(|r| r.id.clone()))
+                .flatten(),
+            match_runner_up_score: flagged.then_some(hit.runner_up_score).flatten(),
         })
         .await?;
     store_texts(
@@ -2026,6 +4094,10 @@ pub(crate) fn adopt_default_text(
 
 /// One provider's answer for a show, with its artwork already cached.
 struct SeriesHit {
+    decision: MatchDecision,
+    /// The runner-up's score in the deciding rule: its episode fit when the
+    /// episodes decided, else its match confidence.
+    runner_up_score: Option<f32>,
     provider: &'static str,
     external_id: String,
     confidence: Option<f32>,
@@ -2040,47 +4112,108 @@ struct SeriesHit {
 enum SeriesAttempt {
     Hit(Box<SeriesHit>),
     NoMatch,
-    Transient,
+    Transient(MatchDecision),
 }
 
 /// Search `enricher` for `cand` and, on a confident hit, cache the show's
 /// poster + backdrop.
-async fn resolve_series<E: OnlineEnricher>(
+#[allow(clippy::too_many_arguments)]
+async fn resolve_series<E, S>(
+    store: &S,
     enricher: &E,
     provider: &'static str,
     bg_io: &Arc<Semaphore>,
     cache: &ImageCache,
     cfg: &MetadataConfig,
     cand: &SeriesMatchCandidate,
-) -> SeriesAttempt {
-    // Reuse the item resolver: kind=Episode + season/episode=None routes to the
-    // provider's SERIES-level search+fetch (TvdbEnricher: search_series →
-    // get_series; TmdbEnricher: search_tv → tv_detail). No nfo id for a
-    // synthesised show, so it always searches.
-    let resolved = resolve(
-        enricher,
-        MediaKind::Episode,
-        provider,
-        &cand.series_name,
-        cand.series_year,
-        None,
-        None,
-        None,
-        &ProviderIds::default(),
-        bg_io,
-        cfg,
-    )
-    .await;
-    let (external_id, confidence, enriched) = match resolved {
-        Resolved::NoMatch => return SeriesAttempt::NoMatch,
-        Resolved::Transient { .. } => return SeriesAttempt::Transient,
-        Resolved::Hit {
-            external_id,
-            confidence,
-            enriched,
-            ..
-        } => (external_id, confidence, *enriched),
+    evidence: &SeriesEvidence<'_>,
+    lists: &mut EpisodeLists,
+) -> SeriesAttempt
+where
+    E: OnlineEnricher,
+    S: pharos_core::SeriesIdentityStore,
+{
+    // kind=Episode + season/episode=None routes to the provider's SERIES-level
+    // search+fetch (TvdbEnricher: search_series → get_series; TmdbEnricher:
+    // search_tv → tv_detail). No nfo id for a synthesised show, so it always
+    // searches.
+    let year = evidence.year;
+    let mut excluded: Vec<String> = evidence
+        .short_pin
+        .iter()
+        .filter(|(p, _)| *p == provider)
+        .map(|(_, id)| id.clone())
+        .collect();
+    let mut checked = 0usize;
+    let (decision, fit_runner_up) = loop {
+        let mut decision = series_search_decide(
+            enricher,
+            &cand.series_key,
+            &cand.series_name,
+            year,
+            &excluded,
+            bg_io,
+            cfg,
+        )
+        .await;
+        let fit_runner_up = if needs_episode_fit(&decision) {
+            apply_episode_fit(store, enricher, provider, bg_io, cand, &mut decision, lists).await
+        } else {
+            None
+        };
+        // B990 — once the stored match ran too short, so may the next
+        // choice: each is checked, and one too short is left out too.
+        let short = match &decision.chosen {
+            Some(c) if evidence.short_pin.is_some() => {
+                is_too_short(enricher, bg_io, &c.id, evidence.rows).await
+            }
+            _ => false,
+        };
+        if !short {
+            break (decision, fit_runner_up);
+        }
+        let Some(chosen) = decision.chosen.take() else {
+            break (decision, fit_runner_up);
+        };
+        tracing::info!(
+            provider,
+            series_key = %cand.series_key,
+            candidate = chosen.id.as_str(),
+            "series match: candidate's run is too short for the show's seasons, leaving it out"
+        );
+        excluded.push(chosen.id);
+        checked += 1;
+        if checked >= MAX_SHORT_RUN_CHECKS {
+            log_series_match(
+                provider,
+                &cand.series_key,
+                &cand.series_name,
+                year,
+                &decision,
+            );
+            return SeriesAttempt::NoMatch;
+        }
     };
+    log_series_match(
+        provider,
+        &cand.series_key,
+        &cand.series_name,
+        year,
+        &decision,
+    );
+    let Some(chosen) = decision.chosen.clone() else {
+        return SeriesAttempt::NoMatch;
+    };
+    let enriched = {
+        let _permit = BgPermit::acquire(bg_io).await;
+        enricher
+            .fetch(MediaKind::Episode, &chosen.id, None, None, None)
+            .await
+    };
+    let Some(enriched) = enriched else {
+        return SeriesAttempt::Transient(decision);
+    };
+    let (external_id, confidence) = (chosen.id, Some(chosen.confidence));
     let poster_locator = cache_series_art(
         cache,
         enricher,
@@ -2101,7 +4234,11 @@ async fn resolve_series<E: OnlineEnricher>(
         &enriched,
     )
     .await;
+    let runner_up_score =
+        fit_runner_up.or_else(|| decision.runner_up.as_ref().map(|r| r.confidence));
     SeriesAttempt::Hit(Box::new(SeriesHit {
+        decision,
+        runner_up_score,
         provider,
         external_id,
         confidence,
@@ -2109,6 +4246,254 @@ async fn resolve_series<E: OnlineEnricher>(
         poster_locator,
         backdrop_locator,
     }))
+}
+
+/// What a show's own files say about which show it is, for its match.
+struct SeriesEvidence<'a> {
+    /// The year its files state, else the stored year (B990).
+    year: Option<u32>,
+    rows: &'a [pharos_core::SeriesEpisodeRow],
+    /// B990 — the stored search match, by provider and id, when its whole
+    /// run is too short for the show's local seasons (B986).
+    short_pin: Option<(&'static str, String)>,
+}
+
+/// Candidates whose runs a re-match checks before it stops: each costs a
+/// request, and a show with more too-short candidates than this is flagged.
+const MAX_SHORT_RUN_CHECKS: usize = 3;
+
+/// B990 — the stored search match, when its whole run is too short for the
+/// show's two or more local seasons (B986's rule). One request to the
+/// provider that holds it.
+async fn too_short_pin<Tv, Tm>(
+    providers: &SeriesProviders<'_, Tv, Tm>,
+    bg_io: &Arc<Semaphore>,
+    stored: Option<&SeriesMetadata>,
+    rows: &[pharos_core::SeriesEpisodeRow],
+) -> Option<(&'static str, String)>
+where
+    Tv: OnlineEnricher,
+    Tm: OnlineEnricher,
+{
+    let m = stored?;
+    if m.match_source.as_deref() != Some("search") || regular_seasons(rows) < 2 {
+        return None;
+    }
+    let (provider, id) = stored_match(m)?;
+    let short = match provider {
+        "tvdb" => is_too_short(providers.tvdb?, bg_io, id, rows).await,
+        "tmdb" => is_too_short(providers.tmdb?, bg_io, id, rows).await,
+        _ => false,
+    };
+    let provider = if provider == "tvdb" { "tvdb" } else { "tmdb" };
+    short.then(|| (provider, id.to_string()))
+}
+
+/// Whether show `id`'s whole run is too short for `rows`' seasons (B986).
+async fn is_too_short<E: OnlineEnricher>(
+    enricher: &E,
+    bg_io: &Arc<Semaphore>,
+    id: &str,
+    rows: &[pharos_core::SeriesEpisodeRow],
+) -> bool {
+    let run = {
+        let _permit = BgPermit::acquire(bg_io).await;
+        enricher.series_run(id).await
+    };
+    run_window(std::iter::empty(), run).is_some_and(|w| run_too_short(w, rows))
+}
+
+/// Spec 033 (V891) — `series_metadata.match_flag` of a close call.
+pub(crate) const AMBIGUOUS_FLAG: &str = "ambiguous";
+
+/// Episode lists fetched this pass, by provider, show id and the seasons
+/// asked: shows that share candidates (two same-named folders) ask
+/// once.
+type EpisodeLists = HashMap<(&'static str, String, Vec<u32>), Vec<EpisodeListing>>;
+
+/// The exact-name candidates scoring as the chosen one does, in the
+/// provider's order: shows of the same name that no folder or file year told
+/// apart. Empty unless the chosen candidate is one of them.
+fn exact_candidates(decision: &MatchDecision) -> Vec<&pharos_core::ScoredCandidate> {
+    let Some(chosen) = &decision.chosen else {
+        return Vec::new();
+    };
+    let tied = |c: &&pharos_core::ScoredCandidate| {
+        c.exact && (c.score - chosen.confidence).abs() <= f32::EPSILON
+    };
+    if !decision
+        .candidates
+        .iter()
+        .filter(tied)
+        .any(|c| c.id == chosen.id)
+    {
+        return Vec::new();
+    }
+    decision.candidates.iter().filter(tied).collect()
+}
+
+/// B930 — two or more shows match the name exactly and score alike, so the
+/// matcher fell back to provider order or to which of their names matched
+/// first (TVDB lists a remake as "Show B (1996)" with the bare
+/// name as an alias).
+fn needs_episode_fit(decision: &MatchDecision) -> bool {
+    exact_candidates(decision).len() >= 2
+}
+
+/// The show's local episodes, one per (season, episode), with the filename's
+/// episode title.
+fn local_episodes(rows: Vec<pharos_core::SeriesEpisodeRow>) -> Vec<LocalEpisode> {
+    let mut by_number = std::collections::BTreeMap::new();
+    for row in rows {
+        let (Some(season), Some(episode)) = (row.season, row.episode) else {
+            continue;
+        };
+        let title = std::path::Path::new(&row.path)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .and_then(pharos_scanner::metadata::filename::episode_title);
+        let slot = by_number.entry((season, episode)).or_insert(None);
+        if slot.is_none() {
+            *slot = title;
+        }
+    }
+    by_number
+        .into_iter()
+        .map(|((season, episode), title)| LocalEpisode {
+            season,
+            episode,
+            title,
+        })
+        .collect()
+}
+
+/// What the show folder's `tvshow.nfo` says, when the key is a folder.
+async fn show_nfo(cand: &SeriesMatchCandidate) -> Option<ShowNfoEvidence> {
+    let folder = cand
+        .series_key
+        .split(pharos_scanner::series_split::SPLIT_KEY_SEPARATOR)
+        .next()
+        .filter(|f| std::path::Path::new(f).is_absolute())?
+        .to_string();
+    let (name, year) = (cand.series_name.clone(), cand.series_year);
+    tokio::task::spawn_blocking(move || {
+        pharos_scanner::metadata::nfo::show_nfo_evidence(std::path::Path::new(&folder), &name, year)
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+/// Spec 033 (V891) — replace a provider-order tie-break with the candidate
+/// whose episodes fit the local files best, and flag a close call. Returns
+/// the runner-up's score when the episodes decided. A list that cannot be
+/// fetched leaves the provider's choice in place, flagged.
+#[allow(clippy::too_many_arguments)]
+async fn apply_episode_fit<E, S>(
+    store: &S,
+    enricher: &E,
+    provider: &'static str,
+    bg_io: &Arc<Semaphore>,
+    cand: &SeriesMatchCandidate,
+    decision: &mut MatchDecision,
+    lists: &mut EpisodeLists,
+) -> Option<f32>
+where
+    E: OnlineEnricher,
+    S: pharos_core::SeriesIdentityStore,
+{
+    let exact = exact_candidates(decision);
+    let unscored = exact.len().saturating_sub(episode_fit::MAX_SCORED);
+    let scored: Vec<(Candidate, f32)> = exact
+        .into_iter()
+        .take(episode_fit::MAX_SCORED)
+        .map(|c| {
+            (
+                Candidate {
+                    id: c.id.clone(),
+                    year: c.year,
+                },
+                c.score,
+            )
+        })
+        .collect();
+    let rows = match store.series_episodes(&cand.series_key).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!(error = %e, series_key = %cand.series_key, "series episode fit: local episodes unreadable");
+            Vec::new()
+        }
+    };
+    let local = local_episodes(rows);
+    let seasons: Vec<u32> = local
+        .iter()
+        .map(|l| l.season)
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let mut fits = Vec::with_capacity(scored.len());
+    for (c, _) in &scored {
+        let key = (provider, c.id.clone(), seasons.clone());
+        if !lists.contains_key(&key) {
+            let listing = {
+                let _permit = BgPermit::acquire(bg_io).await;
+                enricher.episode_list(&c.id, &seasons).await
+            };
+            match listing {
+                Some(l) => {
+                    lists.insert(key.clone(), l);
+                }
+                None => {
+                    decision.ambiguous = true;
+                    tracing::warn!(
+                        provider,
+                        series_key = %cand.series_key,
+                        candidate = %c.id,
+                        "series episode fit: episode list unavailable; provider order kept, flagged"
+                    );
+                    return None;
+                }
+            }
+        }
+        fits.push(lists.get(&key).map_or(0.0, |l| episode_fit::fit(&local, l)));
+    }
+    let nfo = show_nfo(cand).await;
+    let candidates: Vec<Candidate> = scored.iter().map(|(c, _)| c.clone()).collect();
+    let vote = episode_fit::nfo_vote(provider, &candidates, nfo.as_ref());
+    let verdict = episode_fit::decide(&fits, vote)?;
+    let outcome = |at: Option<usize>| {
+        let (c, score) = scored.get(at?)?;
+        Some(MatchOutcome {
+            id: c.id.clone(),
+            confidence: *score,
+        })
+    };
+    decision.chosen = outcome(Some(verdict.chosen));
+    decision.runner_up = outcome(verdict.runner_up);
+    decision.decided_by = Some(verdict.decided_by);
+    decision.ambiguous = verdict.close || unscored > 0;
+    let scores: Vec<String> = candidates
+        .iter()
+        .zip(&verdict.scores)
+        .map(|(c, s)| format!("{}:{s:.3}", c.id))
+        .collect();
+    let runner_up_score = verdict.runner_up.and_then(|at| verdict.score(at));
+    tracing::info!(
+        provider,
+        series_key = %cand.series_key,
+        local_episodes = local.len(),
+        titled = local.iter().filter(|l| l.title.is_some()).count(),
+        scores = ?scores,
+        nfo_vote = vote.and_then(|at| candidates.get(at)).map(|c| c.id.as_str()),
+        chosen = decision.chosen.as_ref().map(|c| c.id.as_str()),
+        runner_up = decision.runner_up.as_ref().map(|c| c.id.as_str()),
+        margin = verdict.score(verdict.chosen).zip(runner_up_score).map(|(a, b)| a - b),
+        unscored,
+        flagged = decision.ambiguous,
+        decided_by = verdict.decided_by.label(),
+        "series episode fit"
+    );
+    runner_up_score
 }
 
 /// Download the show's artwork of role `want` (if the record offers it) and
@@ -2146,7 +4531,9 @@ async fn cache_series_art<E: OnlineEnricher>(
 mod tests {
     use super::*;
     use crate::musicbrainz::AlbumArt;
+    use pharos_core::SeriesIdentityStore as _;
     use pharos_core::{MediaItem, SearchCandidate};
+    use std::collections::HashMap;
 
     /// A remote item searches by TITLE, a local one by FILENAME.
     ///
@@ -2170,11 +4557,11 @@ mod tests {
 
         let local = MediaItem {
             id: 2,
-            path: "/media/Movies/Arrival (2016)/Arrival.2016.1080p.mkv".into(),
-            title: "Arrival".into(),
+            path: "/media/Movies/Film BC (2016)/Film BC.2016.1080p.mkv".into(),
+            title: "Film BC".into(),
             ..Default::default()
         };
-        assert_eq!(search_stem(&local), "Arrival.2016.1080p");
+        assert_eq!(search_stem(&local), "Film BC.2016.1080p");
     }
 
     use pharos_store_sqlx::sqlite::SqliteStore;
@@ -2231,9 +4618,29 @@ mod tests {
         provider: &'static str,
         search: Vec<SearchCandidate>,
         detail: Option<EnrichedMetadata>,
+        /// Records by the id fetched; any other id gets `detail`.
+        detail_for: HashMap<String, EnrichedMetadata>,
+        /// Every id `fetch` was asked for, in order.
+        fetched: Arc<std::sync::Mutex<Vec<String>>>,
         image_bytes: Option<Vec<u8>>,
         texts: TextsFetch,
+        /// What `episode_status` answers.
+        episode_status: TextsFetch,
         asked: Arc<std::sync::Mutex<Vec<Vec<String>>>>,
+        /// Episode lists by show id; any other id has none.
+        lists: HashMap<String, Vec<EpisodeListing>>,
+        /// Every id `episode_list` was asked for, in order.
+        listed: Arc<std::sync::Mutex<Vec<String>>>,
+        /// How many searches were made.
+        searched: Arc<std::sync::Mutex<usize>>,
+        /// Series runs by show id; any other id has none.
+        runs: HashMap<String, crate::online_enrich::SeriesRun>,
+        /// `begin_pass` / `end_pass` calls, in order.
+        passes: Arc<std::sync::Mutex<Vec<&'static str>>>,
+        /// What a search narrowed by a year answers, when set; else `search`.
+        year_search: Option<Vec<SearchCandidate>>,
+        /// The year each search was narrowed by, in order.
+        years: Arc<std::sync::Mutex<Vec<Option<u32>>>>,
     }
 
     impl FakeEnricher {
@@ -2242,9 +4649,19 @@ mod tests {
                 provider: "tmdb",
                 search: Vec::new(),
                 detail: None,
+                detail_for: HashMap::new(),
+                fetched: Default::default(),
                 image_bytes: None,
                 texts: TextsFetch::Failed,
+                episode_status: TextsFetch::Failed,
                 asked: Default::default(),
+                lists: HashMap::new(),
+                listed: Default::default(),
+                searched: Default::default(),
+                runs: HashMap::new(),
+                passes: Default::default(),
+                year_search: None,
+                years: Default::default(),
             }
         }
 
@@ -2253,28 +4670,105 @@ mod tests {
                 provider: "tvdb",
                 search: Vec::new(),
                 detail: None,
+                detail_for: HashMap::new(),
+                fetched: Default::default(),
                 image_bytes: None,
                 texts: TextsFetch::Failed,
+                episode_status: TextsFetch::Failed,
                 asked: Default::default(),
+                lists: HashMap::new(),
+                listed: Default::default(),
+                searched: Default::default(),
+                runs: HashMap::new(),
+                passes: Default::default(),
+                year_search: None,
+                years: Default::default(),
             }
         }
 
         fn with_search(mut self, cands: Vec<(&str, &str, Option<u32>)>) -> Self {
-            self.search = cands
-                .into_iter()
-                .map(|(id, title, year)| SearchCandidate {
-                    id: id.to_string(),
-                    title: title.to_string(),
-                    year,
-                    aliases: Vec::new(),
-                })
-                .collect();
+            self.search = fake_candidates(cands);
             self
+        }
+
+        /// A provider whose year filter is strict: a search narrowed by a
+        /// year answers `cands`, one without answers `with_search`'s.
+        fn with_year_search(mut self, cands: Vec<(&str, &str, Option<u32>)>) -> Self {
+            self.year_search = Some(fake_candidates(cands));
+            self
+        }
+
+        fn years(&self) -> Vec<Option<u32>> {
+            self.years.lock().unwrap().clone()
         }
 
         fn with_detail(mut self, detail: EnrichedMetadata) -> Self {
             self.detail = Some(detail);
             self
+        }
+
+        fn with_detail_for(mut self, id: &str, detail: EnrichedMetadata) -> Self {
+            self.detail_for.insert(id.to_string(), detail);
+            self
+        }
+
+        fn fetched(&self) -> Vec<String> {
+            self.fetched.lock().unwrap().clone()
+        }
+
+        fn with_list(mut self, id: &str, episodes: &[(u32, u32, &str)]) -> Self {
+            let list = episodes
+                .iter()
+                .map(|&(season, episode, title)| EpisodeListing {
+                    season,
+                    episode,
+                    title: Some(title.to_string()),
+                    aired: None,
+                })
+                .collect();
+            self.lists.insert(id.to_string(), list);
+            self
+        }
+
+        fn with_dated_list(mut self, id: &str, episodes: &[(u32, u32, &str, i64)]) -> Self {
+            let list = episodes
+                .iter()
+                .map(|&(season, episode, title, aired)| EpisodeListing {
+                    season,
+                    episode,
+                    title: Some(title.to_string()),
+                    aired: Some(aired),
+                })
+                .collect();
+            self.lists.insert(id.to_string(), list);
+            self
+        }
+
+        fn with_aired_list(mut self, id: &str, episodes: &[(u32, u32, i64)]) -> Self {
+            let list = episodes
+                .iter()
+                .map(|&(season, episode, aired)| EpisodeListing {
+                    season,
+                    episode,
+                    title: None,
+                    aired: Some(aired),
+                })
+                .collect();
+            self.lists.insert(id.to_string(), list);
+            self
+        }
+
+        fn with_run(mut self, id: &str, run: crate::online_enrich::SeriesRun) -> Self {
+            self.runs.insert(id.to_string(), run);
+            self
+        }
+
+        fn searched(&self) -> usize {
+            *self.searched.lock().unwrap()
+        }
+
+        fn listed(&self) -> Vec<String> {
+            self.listed.lock().unwrap().clone()
         }
 
         fn with_image_bytes(mut self, bytes: Vec<u8>) -> Self {
@@ -2293,15 +4787,39 @@ mod tests {
             self
         }
 
+        /// The provider answers that it has no such episode.
+        fn with_episode_missing(mut self) -> Self {
+            self.episode_status = TextsFetch::NotFound;
+            self
+        }
+
         /// The languages each `fetch_texts` call asked for.
         fn asked(&self) -> Vec<Vec<String>> {
             self.asked.lock().unwrap().clone()
         }
     }
 
+    fn fake_candidates(cands: Vec<(&str, &str, Option<u32>)>) -> Vec<SearchCandidate> {
+        cands
+            .into_iter()
+            .map(|(id, title, year)| SearchCandidate {
+                id: id.to_string(),
+                title: title.to_string(),
+                year,
+                aliases: Vec::new(),
+            })
+            .collect()
+    }
+
     impl OnlineEnricher for FakeEnricher {
         fn provider(&self) -> &'static str {
             self.provider
+        }
+        fn begin_pass(&self) {
+            self.passes.lock().expect("lock").push("begin");
+        }
+        fn end_pass(&self) {
+            self.passes.lock().expect("lock").push("end");
         }
         fn supports(&self, _kind: MediaKind) -> bool {
             true
@@ -2310,19 +4828,28 @@ mod tests {
             &self,
             _kind: MediaKind,
             _title: &str,
-            _year: Option<u32>,
+            year: Option<u32>,
         ) -> Vec<SearchCandidate> {
-            self.search.clone()
+            *self.searched.lock().unwrap() += 1;
+            self.years.lock().unwrap().push(year);
+            match (&self.year_search, year) {
+                (Some(narrowed), Some(_)) => narrowed.clone(),
+                _ => self.search.clone(),
+            }
         }
         async fn fetch(
             &self,
             _kind: MediaKind,
-            _id: &str,
+            id: &str,
             _season: Option<u32>,
             _episode: Option<u32>,
             _name: Option<&str>,
         ) -> Option<EnrichedMetadata> {
-            self.detail.clone()
+            self.fetched.lock().unwrap().push(id.to_string());
+            self.detail_for
+                .get(id)
+                .cloned()
+                .or_else(|| self.detail.clone())
         }
         async fn fetch_image_bytes(&self, _url: &str) -> Option<Vec<u8>> {
             self.image_bytes.clone()
@@ -2346,6 +4873,22 @@ mod tests {
             self.asked.lock().unwrap().push(languages.to_vec());
             self.texts.clone()
         }
+        async fn episode_status(
+            &self,
+            _id: &str,
+            _season: u32,
+            _episode: u32,
+            _name: Option<&str>,
+        ) -> TextsFetch {
+            self.episode_status.clone()
+        }
+        async fn episode_list(&self, id: &str, _seasons: &[u32]) -> Option<Vec<EpisodeListing>> {
+            self.listed.lock().unwrap().push(id.to_string());
+            self.lists.get(id).cloned()
+        }
+        async fn series_run(&self, id: &str) -> Option<crate::online_enrich::SeriesRun> {
+            self.runs.get(id).copied()
+        }
     }
 
     fn enriched_overview(overview: &str) -> EnrichedMetadata {
@@ -2353,6 +4896,17 @@ mod tests {
             overview: Some(overview.to_string()),
             ..EnrichedMetadata::default()
         }
+    }
+
+    /// The version gate with no provider configured, as a dry run.
+    async fn readmit(s: &SqliteStore) {
+        let providers = SeriesProviders::<FakeEnricher, FakeEnricher> {
+            tvdb: None,
+            tmdb: None,
+        };
+        readmit_stale_tv_matches(s, &providers, &sem(1), &MetadataConfig::default(), NOW)
+            .await
+            .unwrap();
     }
 
     async fn store() -> SqliteStore {
@@ -2392,7 +4946,7 @@ mod tests {
         fn hit() -> Self {
             Self(Ok(AlbumArt {
                 mbid: "rg-abc-123".into(),
-                title: "Ocean Eyes".into(),
+                title: "Album A".into(),
                 confidence: 0.99,
                 year: Some(2009),
                 // A real JPEG magic prefix: `download_and_cache_art` writes
@@ -2438,7 +4992,7 @@ mod tests {
     #[tokio::test]
     async fn album_art_pass_caches_a_cover_and_records_the_match() {
         let s = store().await;
-        put_track(&s, 900_400, "Owl City", "Ocean Eyes").await;
+        put_track(&s, 900_400, "Band A", "Album A").await;
         let (_td, cache) = cache();
 
         let (n, had_work) = enrich_audio_pass(
@@ -2526,7 +5080,7 @@ mod tests {
     #[tokio::test]
     async fn provider_outage_leaves_the_track_eligible_for_the_next_pass() {
         let s = store().await;
-        put_track(&s, 900_402, "Owl City", "Ocean Eyes").await;
+        put_track(&s, 900_402, "Band A", "Album A").await;
         let (_td, cache) = cache();
 
         let (n, _) = enrich_audio_pass(
@@ -2569,7 +5123,7 @@ mod tests {
             &s,
             900_404,
             "Coldplay",
-            "A Rush Of Blood To The Head (Japan)",
+            "A Wave Of Static To The Ear (Japan)",
         )
         .await;
         // Stamped by a previous, worse query — same shape the shipped v1 wrote.
@@ -2627,13 +5181,13 @@ mod tests {
     }
 
     // B150 — a WRONG cover is invisible to the eligibility query, which skips
-    // anything that already has art. Without version-gated invalidation, Owl
-    // City's `Fireflies` would keep The Attic's sleeve forever, however much
+    // anything that already has art. Without version-gated invalidation, Band
+    // A's `Song A` would keep Other Band's sleeve forever, however much
     // the matcher improved.
     #[tokio::test]
     async fn a_matcher_version_bump_drops_its_own_covers_for_a_re_match() {
         let s = store().await;
-        put_track(&s, 900_406, "Owl City", "Fireflies").await;
+        put_track(&s, 900_406, "Band A", "Song A").await;
         // A cover from an older, wrong matcher.
         s.set_artwork(
             900_406,
@@ -2698,7 +5252,7 @@ mod tests {
         // query bump must leave hits alone; the miss marker already re-admits
         // the rows that need re-asking.
         let s = store().await;
-        put_track(&s, 900_420, "Owl City", "Ocean Eyes").await;
+        put_track(&s, 900_420, "Band A", "Album A").await;
         s.set_artwork(
             900_420,
             "Primary",
@@ -2747,7 +5301,7 @@ mod tests {
         // first boot after this split, must adopt the version silently rather
         // than treat "never recorded" as "changed" and wipe the library.
         let s = store().await;
-        put_track(&s, 900_421, "Owl City", "Ocean Eyes").await;
+        put_track(&s, 900_421, "Band A", "Album A").await;
         s.set_artwork(900_421, "Primary", "musicbrainz", "/cache/p.jpg")
             .await
             .unwrap();
@@ -2772,7 +5326,7 @@ mod tests {
     #[tokio::test]
     async fn a_current_matcher_version_leaves_existing_covers_alone() {
         let s = store().await;
-        put_track(&s, 900_407, "Owl City", "Ocean Eyes").await;
+        put_track(&s, 900_407, "Band A", "Album A").await;
         s.set_artwork(
             900_407,
             "Primary",
@@ -2805,8 +5359,8 @@ mod tests {
         assert!(s.get(900_407).await.unwrap().has_primary_art);
     }
 
-    // B152 — Owl City's `Fireflies` carries `album_artist = ""` alongside a
-    // perfectly good `artist = "Owl City"`. `Option::or` keeps the `Some("")`,
+    // B152 — Band A's `Song A` carries `album_artist = ""` alongside a
+    // perfectly good `artist = "Band A"`. `Option::or` keeps the `Some("")`,
     // and an empty artist reads downstream as "unknown", which the B150
     // consistency check lets pass — so the artist verification that fix added
     // was silently switched off for exactly the track that motivated it.
@@ -2816,13 +5370,13 @@ mod tests {
         let item = MediaItem {
             id: 900_408,
             path: "/music/owl city/fireflies.mp3".into(),
-            title: "Fireflies".into(),
+            title: "Song A".into(),
             kind: MediaKind::Audio,
             probe: pharos_core::MediaProbe {
-                album: Some("Fireflies - Single of the Week".into()),
+                album: Some("Song A - Single of the Week".into()),
                 // Exactly the shape found in production: present but empty.
                 album_artist: Some("   ".into()),
-                artist: Some("Owl City".into()),
+                artist: Some("Band A".into()),
                 ..Default::default()
             },
             ..MediaItem::default()
@@ -2838,7 +5392,7 @@ mod tests {
 
         assert_eq!(
             seen.lock().unwrap().as_slice(),
-            [Some("Owl City".to_string())],
+            [Some("Band A".to_string())],
             "the blank album_artist must not shadow the track artist"
         );
     }
@@ -2866,7 +5420,7 @@ mod tests {
     #[tokio::test]
     async fn album_art_pass_ignores_video_items() {
         let s = store().await;
-        put_movie(&s, 900_403, "Dune (2021)").await;
+        put_movie(&s, 900_403, "Film A (2021)").await;
         let (_td, cache) = cache();
 
         let (n, had_work) = enrich_audio_pass(
@@ -2887,11 +5441,11 @@ mod tests {
     #[tokio::test]
     async fn backfill_matches_by_search_and_persists_match_state() {
         let s = store().await;
-        put_movie(&s, 900_100, "Dune (2021)").await; // no NFO id
+        put_movie(&s, 900_100, "Film A (2021)").await; // no NFO id
         let (_td, cache) = cache();
         let tmdb = FakeEnricher::tmdb()
-            .with_search(vec![("438631", "Dune", Some(2021))])
-            .with_detail(enriched_overview("A duke's son..."));
+            .with_search(vec![("910101", "Film A", Some(2021))])
+            .with_detail(enriched_overview("A noble's heir..."));
 
         let n = run(
             &s,
@@ -2910,11 +5464,11 @@ mod tests {
         let got = s.get(900_100).await.unwrap();
         assert_eq!(got.match_provider.as_deref(), Some("tmdb"));
         assert_eq!(got.match_source.as_deref(), Some("search"));
-        assert_eq!(got.match_external_id.as_deref(), Some("438631"));
-        assert_eq!(got.metadata.overview.as_deref(), Some("A duke's son..."));
+        assert_eq!(got.match_external_id.as_deref(), Some("910101"));
+        assert_eq!(got.metadata.overview.as_deref(), Some("A noble's heir..."));
         assert_eq!(got.metadata_refreshed_at, Some(NOW));
         // The matched TMDB id was stamped onto the provider ids.
-        assert_eq!(got.metadata.provider_ids.tmdb.as_deref(), Some("438631"));
+        assert_eq!(got.metadata.provider_ids.tmdb.as_deref(), Some("910101"));
     }
 
     #[tokio::test]
@@ -2925,10 +5479,10 @@ mod tests {
         // or the download step silently drops it (the `continue` at the
         // `!CACHED_ART_ROLES.contains` guard in `enrich_one`).
         let s = store().await;
-        put_movie(&s, 900_103, "Dune (2021)").await;
+        put_movie(&s, 900_103, "Film A (2021)").await;
         let (_td, cache) = cache();
         let tmdb = FakeEnricher::tmdb()
-            .with_search(vec![("438631", "Dune", Some(2021))])
+            .with_search(vec![("910101", "Film A", Some(2021))])
             .with_detail(EnrichedMetadata {
                 artwork: vec![
                     RemoteArt {
@@ -3022,6 +5576,40 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_no_confident_match_logs_the_search_and_the_nearest_miss() {
+        let (logs, _log) = log_capture();
+        let s = store().await;
+        put_movie(&s, 900_103, "a film").await;
+        let (_td, cache) = cache();
+        // One candidate, under the floor: it is the nearest miss the log names.
+        let tmdb = FakeEnricher::tmdb().with_search(vec![("5", "Something Else", None)]);
+
+        run(
+            &s,
+            &sem(4),
+            &cache,
+            Some(&tmdb),
+            None::<&FakeEnricher>,
+            None::<&MusicBrainzClient>,
+            &MetadataConfig::default(),
+            NOW,
+        )
+        .await
+        .unwrap();
+        let text = logs.text();
+        let line = text
+            .lines()
+            .find(|l| l.contains("no confident match"))
+            .unwrap_or_default();
+        assert!(line.contains("media.id=900103"), "{line}");
+        assert!(line.contains("provider=\"tmdb\""), "{line}");
+        assert!(line.contains("kind=\"movie\""), "{line}");
+        assert!(line.contains("searched_title=\"a film\""), "{line}");
+        assert!(line.contains("best_title=\"Something Else\""), "{line}");
+        assert!(line.contains("best_score="), "{line}");
+    }
+
     #[tokio::test]
     async fn backfill_transient_fetch_miss_is_stamped_out_of_the_front() {
         // A confident search match whose detail fetch returns nothing must not
@@ -3029,11 +5617,11 @@ mod tests {
         // it). It's stamped with the resolved id + refresh time so it drops out
         // of the eligible set until the TTL re-admits it for a retry.
         let s = store().await;
-        put_movie(&s, 900_104, "Dune (2021)").await;
+        put_movie(&s, 900_104, "Film A (2021)").await;
         let (_td, cache) = cache();
         // Search returns a clean match, but the fake has no detail → fetch
         // returns None → Resolved::Transient.
-        let tmdb = FakeEnricher::tmdb().with_search(vec![("438631", "Dune", Some(2021))]);
+        let tmdb = FakeEnricher::tmdb().with_search(vec![("910101", "Film A", Some(2021))]);
 
         let n = run(
             &s,
@@ -3051,7 +5639,7 @@ mod tests {
 
         let got = s.get(900_104).await.unwrap();
         assert_eq!(got.match_source.as_deref(), Some("search"));
-        assert_eq!(got.match_external_id.as_deref(), Some("438631"));
+        assert_eq!(got.match_external_id.as_deref(), Some("910101"));
         assert_eq!(got.metadata_refreshed_at, Some(NOW));
         // With metadata_refreshed_at = now, a cutoff in the past excludes it —
         // it is no longer re-pulled at the front of the next pass.
@@ -3070,9 +5658,9 @@ mod tests {
         // via `provider_ids`), this would resolve NoMatch and the overview
         // would stay unset — so a set overview proves the direct-fetch path.
         let s = store().await;
-        put_movie(&s, 900_200, "Dune (2021)").await;
+        put_movie(&s, 900_200, "Film A (2021)").await;
         let (_td, cache) = cache();
-        let tmdb = FakeEnricher::tmdb().with_detail(enriched_overview("A duke's son..."));
+        let tmdb = FakeEnricher::tmdb().with_detail(enriched_overview("A noble's heir..."));
 
         apply_manual_match(
             &s,
@@ -3083,7 +5671,7 @@ mod tests {
             &MetadataConfig::default(),
             900_200,
             "tmdb",
-            "438631",
+            "910101",
             NOW,
         )
         .await
@@ -3094,12 +5682,12 @@ mod tests {
         // own internal resolve() would otherwise have recorded.
         assert_eq!(got.match_source.as_deref(), Some("manual"));
         assert_eq!(got.match_provider.as_deref(), Some("tmdb"));
-        assert_eq!(got.match_external_id.as_deref(), Some("438631"));
+        assert_eq!(got.match_external_id.as_deref(), Some("910101"));
         assert_eq!(got.metadata_refreshed_at, Some(NOW));
         // The immediate re-enrich actually ran and merged the chosen
         // record's metadata.
-        assert_eq!(got.metadata.overview.as_deref(), Some("A duke's son..."));
-        assert_eq!(got.metadata.provider_ids.tmdb.as_deref(), Some("438631"));
+        assert_eq!(got.metadata.overview.as_deref(), Some("A noble's heir..."));
+        assert_eq!(got.metadata.provider_ids.tmdb.as_deref(), Some("910101"));
     }
 
     #[tokio::test]
@@ -3110,14 +5698,14 @@ mod tests {
         // window (the row is now "manual" with its own id) and assert the
         // sweep's trailing write does NOT revert the user's override.
         let s = store().await;
-        put_movie(&s, 900_300, "Dune (2021)").await;
+        put_movie(&s, 900_300, "Film A (2021)").await;
         s.set_item_match(900_300, "tmdb", "999", "manual", None, 1)
             .await
             .unwrap();
         let (_td, cache) = cache();
         let tmdb = FakeEnricher::tmdb()
-            .with_search(vec![("438631", "Dune", Some(2021))])
-            .with_detail(enriched_overview("A duke's son..."));
+            .with_search(vec![("910101", "Film A", Some(2021))])
+            .with_detail(enriched_overview("A noble's heir..."));
 
         let item = s.get(900_300).await.unwrap();
         enrich_one(
@@ -3145,13 +5733,18 @@ mod tests {
         // must survive an enrichment pass; a role with no local row is still
         // filled from the provider.
         let s = store().await;
-        put_movie(&s, 900_301, "Dune (2021)").await;
-        s.set_artwork(900_301, "Primary", "local", "/curated/poster.jpg")
+        put_movie(&s, 900_301, "Film A (2021)").await;
+        // B1181 — a local row only blocks online art while its file exists.
+        let curated = tempfile::tempdir().unwrap();
+        let poster = curated.path().join("poster.jpg");
+        std::fs::write(&poster, [0xFF, 0xD8, 0xFF]).unwrap();
+        let poster_locator = poster.to_string_lossy().into_owned();
+        s.set_artwork(900_301, "Primary", "local", &poster_locator)
             .await
             .unwrap();
         let (_td, cache) = cache();
         let tmdb = FakeEnricher::tmdb()
-            .with_search(vec![("438631", "Dune", Some(2021))])
+            .with_search(vec![("910101", "Film A", Some(2021))])
             .with_detail(EnrichedMetadata {
                 artwork: vec![
                     RemoteArt {
@@ -3187,7 +5780,7 @@ mod tests {
             .find(|(role, _, _)| role == "Primary")
             .expect("primary row present");
         assert_eq!(primary.1, "local");
-        assert_eq!(primary.2, "/curated/poster.jpg");
+        assert_eq!(primary.2, poster_locator);
         let backdrop = art.iter().find(|(role, _, _)| role == "Backdrop");
         assert!(
             backdrop.is_some(),
@@ -3196,29 +5789,145 @@ mod tests {
         assert_eq!(backdrop.unwrap().1, "tmdb");
     }
 
+    #[tokio::test]
+    async fn enrich_one_fills_a_role_whose_local_sidecar_is_gone() {
+        // B1181 / V1141 — a local Primary whose file has gone is no curated
+        // art. The provider's Primary is cached and replaces the dead row.
+        let s = store().await;
+        let media_dir = tempfile::tempdir().unwrap();
+        let media = media_dir.path().join("a film.mkv");
+        std::fs::write(&media, b"video").unwrap();
+        s.put(MediaItem {
+            id: 900_302,
+            path: media.clone(),
+            title: "a film".to_string(),
+            kind: MediaKind::Movie,
+            ..MediaItem::default()
+        })
+        .await
+        .unwrap();
+        let dead = media_dir.path().join("folder.jpg");
+        s.set_artwork(900_302, "Primary", "local", &dead.to_string_lossy())
+            .await
+            .unwrap();
+        let (_td, cache) = cache();
+        let tmdb = FakeEnricher::tmdb()
+            .with_search(vec![("438632", "a film", Some(2021))])
+            .with_detail(EnrichedMetadata {
+                artwork: vec![RemoteArt {
+                    role: ArtworkRole::Primary,
+                    url: "https://image.tmdb.org/t/p/original/p2.jpg".into(),
+                }],
+                ..EnrichedMetadata::default()
+            })
+            .with_image_bytes(vec![0xFF, 0xD8, 0xFF]);
+
+        let item = s.get(900_302).await.unwrap();
+        enrich_one(
+            &s,
+            &sem(4),
+            &cache,
+            Some(&tmdb),
+            None::<&FakeEnricher>,
+            &MetadataConfig::default(),
+            item,
+            NOW,
+        )
+        .await
+        .unwrap();
+
+        let art = s.artwork_for(900_302).await.unwrap();
+        let primary = art
+            .iter()
+            .find(|(role, _, _)| role == "Primary")
+            .expect("primary row present");
+        assert_eq!(
+            primary.1, "tmdb",
+            "provider art replaces the dead local row: {art:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn enrich_one_keeps_a_missing_sidecar_while_the_media_is_unreachable_too() {
+        // B1181 / V1141 — with the media file gone too, the share is probably
+        // down: the missing sidecar proves nothing and must not be replaced.
+        let s = store().await;
+        let media_dir = tempfile::tempdir().unwrap();
+        let media = media_dir.path().join("a film.mkv");
+        std::fs::write(&media, b"video").unwrap();
+        s.put(MediaItem {
+            id: 900_302,
+            path: media.clone(),
+            title: "a film".to_string(),
+            kind: MediaKind::Movie,
+            ..MediaItem::default()
+        })
+        .await
+        .unwrap();
+        let dead = media_dir.path().join("folder.jpg");
+        s.set_artwork(900_302, "Primary", "local", &dead.to_string_lossy())
+            .await
+            .unwrap();
+        let (_td, cache) = cache();
+        let tmdb = FakeEnricher::tmdb()
+            .with_search(vec![("438632", "a film", Some(2021))])
+            .with_detail(EnrichedMetadata {
+                artwork: vec![RemoteArt {
+                    role: ArtworkRole::Primary,
+                    url: "https://image.tmdb.org/t/p/original/p2.jpg".into(),
+                }],
+                ..EnrichedMetadata::default()
+            })
+            .with_image_bytes(vec![0xFF, 0xD8, 0xFF]);
+
+        std::fs::remove_file(&media).unwrap();
+        let item = s.get(900_302).await.unwrap();
+        enrich_one(
+            &s,
+            &sem(4),
+            &cache,
+            Some(&tmdb),
+            None::<&FakeEnricher>,
+            &MetadataConfig::default(),
+            item,
+            NOW,
+        )
+        .await
+        .unwrap();
+
+        let art = s.artwork_for(900_302).await.unwrap();
+        let primary = art
+            .iter()
+            .find(|(role, _, _)| role == "Primary")
+            .expect("primary row present");
+        assert_eq!(primary.1, "local", "the sidecar row stays: {art:?}");
+    }
+
     /// An NFO-identified episode as a scrape in the provider's numbering left
-    /// it: the file is "S01E03 - The Naked Now", its NFO and `-thumb` are
-    /// Code of Honor's.
+    /// it: the file is "S01E03 - The Quiet Arrival", its NFO and `-thumb` are
+    /// Rite of Honour's.
     async fn put_shifted_episode(s: &SqliteStore) -> MediaItem {
-        let dir = "/tv/Star Trek The Next Generation/Season 01";
-        let stem = "Star Trek - The Next Generation - S01E03 - The Naked Now WEBDL-1080p";
+        let dir = "/tv/Show N The Next Wave/Season 01";
+        let stem = "Show N - The Next Wave - S01E03 - The Quiet Arrival WEBDL-1080p";
         let mut item = MediaItem {
             id: 900_570,
             path: format!("{dir}/{stem}.mkv").into(),
-            title: "Code of Honor".into(),
+            title: "Rite of Honour".into(),
             kind: MediaKind::Episode,
             series: Some(pharos_core::SeriesInfo {
-                series_name: "Star Trek The Next Generation".into(),
+                series_name: "Show N The Next Wave".into(),
                 season_number: Some(1),
                 episode_number: Some(3),
-                series_folder: Some("/tv/Star Trek The Next Generation".into()),
+                series_folder: Some("/tv/Show N The Next Wave".into()),
                 series_year: None,
+                series_key: None,
             }),
             ..MediaItem::default()
         };
-        item.metadata.overview = Some("Tasha Yar is kidnapped.".into());
-        item.metadata.provider_ids.tvdb = Some("71470".into());
+        item.metadata.overview = Some("The pilot is kidnapped.".into());
+        item.metadata.provider_ids.tvdb = Some("910105".into());
         s.put(item).await.unwrap();
+        pin_series(s, "/tv/Show N The Next Wave", "910105").await;
         s.set_artwork(
             900_570,
             "Thumb",
@@ -3231,19 +5940,20 @@ mod tests {
             900_570,
             "Primary",
             "local",
-            "/tv/Star Trek The Next Generation/folder.jpg",
+            "/tv/Show N The Next Wave/folder.jpg",
         )
         .await
         .unwrap();
         s.get(900_570).await.unwrap()
     }
 
-    fn naked_now(number: (u32, u32)) -> EnrichedMetadata {
+    fn quiet_arrival(number: (u32, u32)) -> EnrichedMetadata {
         EnrichedMetadata {
-            title: Some("The Naked Now".into()),
+            title: Some("The Quiet Arrival".into()),
             overview: Some("An infection.".into()),
             episode_number: Some(number),
-            neighbour_titles: vec!["Encounter at Farpoint".into(), "Code of Honor".into()],
+            neighbour_titles: vec!["Encounter at Farpoint".into(), "Rite of Honour".into()],
+            series_id: Some("910105".into()),
             artwork: vec![RemoteArt {
                 role: ArtworkRole::Primary,
                 url: "https://artworks.thetvdb.com/naked-now.jpg".into(),
@@ -3259,9 +5969,17 @@ mod tests {
     async fn a_reidentified_episode_replaces_its_scraped_text_and_still() {
         let s = store().await;
         let item = put_shifted_episode(&s).await;
+        // B1181 — the show's curated Primary blocks online art only while its
+        // file exists, so this test's sidecar must be a real file.
+        let show = tempfile::tempdir().unwrap();
+        let folder = show.path().join("folder.jpg");
+        std::fs::write(&folder, [0xFF, 0xD8, 0xFF]).unwrap();
+        s.set_artwork(900_570, "Primary", "local", &folder.to_string_lossy())
+            .await
+            .unwrap();
         let (_td, cache) = cache();
         let tvdb = FakeEnricher::tvdb()
-            .with_detail(naked_now((1, 2)))
+            .with_detail(quiet_arrival((1, 2)))
             .with_image_bytes(vec![0xFF, 0xD8, 0xFF]);
         enrich_one(
             &s,
@@ -3277,7 +5995,7 @@ mod tests {
         .unwrap();
 
         let ep = s.get(900_570).await.unwrap();
-        assert_eq!(ep.title, "The Naked Now");
+        assert_eq!(ep.title, "The Quiet Arrival");
         assert_eq!(ep.metadata.overview.as_deref(), Some("An infection."));
         let art = s.artwork_for(900_570).await.unwrap();
         let role = |r: &str| art.iter().find(|(role, _, _)| role == r).cloned();
@@ -3302,7 +6020,7 @@ mod tests {
         let item = put_shifted_episode(&s).await;
         let (_td, cache) = cache();
         let tvdb = FakeEnricher::tvdb()
-            .with_detail(naked_now((1, 3)))
+            .with_detail(quiet_arrival((1, 3)))
             .with_image_bytes(vec![0xFF, 0xD8, 0xFF]);
         enrich_one(
             &s,
@@ -3318,7 +6036,7 @@ mod tests {
         .unwrap();
 
         let ep = s.get(900_570).await.unwrap();
-        assert_eq!(ep.title, "The Naked Now");
+        assert_eq!(ep.title, "The Quiet Arrival");
         assert_eq!(ep.metadata.overview.as_deref(), Some("An infection."));
         let art = s.artwork_for(900_570).await.unwrap();
         assert!(
@@ -3334,11 +6052,11 @@ mod tests {
     async fn an_nfo_title_in_another_language_stays() {
         let s = store().await;
         let mut item = put_shifted_episode(&s).await;
-        item.title = "Le Maintenant Nu".into();
+        item.title = "L'Arrivée Calme".into();
         s.put(item.clone()).await.unwrap();
         let (_td, cache) = cache();
         let tvdb = FakeEnricher::tvdb()
-            .with_detail(naked_now((1, 3)))
+            .with_detail(quiet_arrival((1, 3)))
             .with_image_bytes(vec![0xFF, 0xD8, 0xFF]);
         enrich_one(
             &s,
@@ -3352,7 +6070,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(s.get(900_570).await.unwrap().title, "Le Maintenant Nu");
+        assert_eq!(s.get(900_570).await.unwrap().title, "L'Arrivée Calme");
     }
 
     /// B570, B588 — a record at the file's own number that names neither the
@@ -3364,8 +6082,8 @@ mod tests {
         let (_td, cache) = cache();
         let tvdb = FakeEnricher::tvdb()
             .with_detail(EnrichedMetadata {
-                title: Some("Le Maintenant Nu".into()),
-                ..naked_now((1, 3))
+                title: Some("L'Arrivée Calme".into()),
+                ..quiet_arrival((1, 3))
             })
             .with_image_bytes(vec![0xFF, 0xD8, 0xFF]);
         enrich_one(
@@ -3382,10 +6100,10 @@ mod tests {
         .unwrap();
 
         let ep = s.get(900_570).await.unwrap();
-        assert_eq!(ep.title, "Code of Honor");
+        assert_eq!(ep.title, "Rite of Honour");
         assert_eq!(
             ep.metadata.overview.as_deref(),
-            Some("Tasha Yar is kidnapped.")
+            Some("The pilot is kidnapped.")
         );
         let art = s.artwork_for(900_570).await.unwrap();
         assert!(
@@ -3439,6 +6157,7 @@ mod tests {
                 episode_number: Some(id as u32),
                 series_folder: Some(folder.into()),
                 series_year: Some(1997),
+                series_key: None,
             }),
             ..MediaItem::default()
         };
@@ -3452,8 +6171,8 @@ mod tests {
     #[tokio::test]
     async fn a_show_tvdb_cannot_match_falls_back_to_tmdb() {
         let s = store().await;
-        put_episode(&s, 1, "Death Note", "/tv/Death Note").await;
-        put_episode(&s, 2, "Death Note", "/tv/Death Note").await;
+        put_episode(&s, 1, "Show L", "/tv/Show L").await;
+        put_episode(&s, 2, "Show L", "/tv/Show L").await;
         let (_td, cache) = cache();
         // TVDB searches and offers nothing that clears the floor.
         let tvdb = FakeEnricher::tvdb().with_search(vec![]);
@@ -3461,7 +6180,7 @@ mod tests {
             // `put_episode` stamps every fixture show with year 1997, and a
             // 9-year gap scores 0.6 — below the floor. A provider result with
             // no year (common on TMDB search rows) is the realistic shape here.
-            .with_search(vec![("13916", "Death Note", None)])
+            .with_search(vec![("910102", "Show L", None)])
             .with_detail(EnrichedMetadata {
                 overview: Some("A shinigami's notebook.".into()),
                 artwork: vec![RemoteArt {
@@ -3486,20 +6205,20 @@ mod tests {
         .unwrap();
 
         let got = s
-            .series_metadata_by_keys(&["/tv/Death Note".into()])
+            .series_metadata_by_keys(&["/tv/Show L".into()])
             .await
             .unwrap();
-        let meta = got.get("/tv/Death Note").expect("show row written");
+        let meta = got.get("/tv/Show L").expect("show row written");
         assert_eq!(
             meta.match_source.as_deref(),
             Some("search"),
             "the fallback matched it, so it must not be frozen as `none`: {meta:?}"
         );
         assert_eq!(meta.match_provider.as_deref(), Some("tmdb"));
-        assert_eq!(meta.match_external_id.as_deref(), Some("13916"));
+        assert_eq!(meta.match_external_id.as_deref(), Some("910102"));
         assert_eq!(
             meta.provider_ids.tmdb.as_deref(),
-            Some("13916"),
+            Some("910102"),
             "a TMDB-matched show carries a TMDB id, not a TVDB one"
         );
         assert!(meta.provider_ids.tvdb.is_none());
@@ -3512,13 +6231,13 @@ mod tests {
     #[tokio::test]
     async fn series_pass_enriches_container_from_tvdb_and_caches_poster() {
         let s = store().await;
-        put_episode(&s, 1, "Buffy", "/tv/Buffy (1997)").await;
-        put_episode(&s, 2, "Buffy", "/tv/Buffy (1997)").await;
+        put_episode(&s, 1, "Show M", "/tv/Show M (1997)").await;
+        put_episode(&s, 2, "Show M", "/tv/Show M (1997)").await;
         let (_td, cache) = cache();
-        // Candidate title matches the folder-derived series_name ("Buffy") so
+        // Candidate title matches the folder-derived series_name ("Show M") so
         // match_best clears the confidence floor.
         let tvdb = FakeEnricher::tvdb()
-            .with_search(vec![("70327", "Buffy", Some(1997))])
+            .with_search(vec![("910104", "Show M", Some(1997))])
             .with_detail(EnrichedMetadata {
                 overview: Some("One girl in all the world.".into()),
                 community_rating: Some(8.7),
@@ -3554,17 +6273,17 @@ mod tests {
         );
 
         let got = s
-            .series_metadata_by_keys(&["/tv/Buffy (1997)".into()])
+            .series_metadata_by_keys(&["/tv/Show M (1997)".into()])
             .await
             .unwrap();
-        let m = got.get("/tv/Buffy (1997)").expect("series row written");
+        let m = got.get("/tv/Show M (1997)").expect("series row written");
         assert_eq!(m.match_provider.as_deref(), Some("tvdb"));
         assert_eq!(m.match_source.as_deref(), Some("search"));
-        assert_eq!(m.match_external_id.as_deref(), Some("70327"));
+        assert_eq!(m.match_external_id.as_deref(), Some("910104"));
         assert_eq!(m.overview.as_deref(), Some("One girl in all the world."));
         assert_eq!(m.community_rating, Some(8.7));
         assert_eq!(m.genres, vec!["Drama".to_string(), "Fantasy".to_string()]);
-        assert_eq!(m.provider_ids.tvdb.as_deref(), Some("70327"));
+        assert_eq!(m.provider_ids.tvdb.as_deref(), Some("910104"));
         assert_eq!(m.provider_ids.tmdb.as_deref(), Some("95"));
         assert_eq!(m.metadata_refreshed_at, Some(NOW));
         // The poster was downloaded + cached, and the locator points at a real
@@ -3641,17 +6360,17 @@ mod tests {
     #[tokio::test]
     async fn a_new_show_matcher_re_admits_searched_shows_and_episodes_once() {
         let s = store().await;
-        put_episode(&s, 1, "Dragon Ball", "/tv/Dragon Ball").await;
-        put_episode(&s, 2, "Dragon Ball", "/tv/Dragon Ball").await;
+        put_episode(&s, 1, "Show K", "/tv/Show K").await;
+        put_episode(&s, 2, "Show K", "/tv/Show K").await;
         s.set_item_match(1, "tvdb", "374456", "search", Some(0.83), NOW)
             .await
             .unwrap();
-        s.set_item_match(2, "tvdb", "76666", "nfo_id", None, NOW)
+        s.set_item_match(2, "tvdb", "910103", "nfo_id", None, NOW)
             .await
             .unwrap();
         s.upsert_series_metadata(SeriesMetadata {
-            series_key: "/tv/Dragon Ball".into(),
-            series_name: "Dragon Ball".into(),
+            series_key: "/tv/Show K".into(),
+            series_name: "Show K".into(),
             match_provider: Some("tvdb".into()),
             match_external_id: Some("374456".into()),
             match_source: Some("search".into()),
@@ -3667,7 +6386,7 @@ mod tests {
             .is_empty());
         assert!(s.items_needing_match(10, NOW - 1).await.unwrap().is_empty());
 
-        readmit_stale_tv_matches(&s).await.unwrap();
+        readmit(&s).await;
 
         let shows = s.series_needing_match(10, NOW - 1).await.unwrap();
         assert_eq!(shows.len(), 1, "the searched show is eligible again");
@@ -3681,10 +6400,10 @@ mod tests {
         assert_eq!(items, [1], "only the searched episode, not the NFO one");
 
         // Recorded: the next pass re-admits nothing.
-        s.set_item_match(1, "tvdb", "76666", "search", Some(0.85), NOW)
+        s.set_item_match(1, "tvdb", "910103", "search", Some(0.85), NOW)
             .await
             .unwrap();
-        readmit_stale_tv_matches(&s).await.unwrap();
+        readmit(&s).await;
         assert!(s.items_needing_match(10, NOW - 1).await.unwrap().is_empty());
     }
 
@@ -3695,18 +6414,18 @@ mod tests {
     #[tokio::test]
     async fn a_re_admitted_episode_is_searched_again_not_resolved_by_its_old_id() {
         let s = store().await;
-        put_episode(&s, 1, "Dragon Ball", "/tv/Dragon Ball").await;
+        put_episode(&s, 1, "Show K", "/tv/Show K").await;
         let mut item = s.get(1).await.unwrap();
         item.metadata.provider_ids.tvdb = Some("374456".into());
         s.put(item).await.unwrap();
         s.set_item_match(1, "tvdb", "374456", "search", Some(0.83), NOW)
             .await
             .unwrap();
-        readmit_stale_tv_matches(&s).await.unwrap();
+        readmit(&s).await;
         let (_td, cache) = cache();
         let tvdb = FakeEnricher::tvdb()
-            .with_search(vec![("76666", "Dragon Ball", Some(1997))])
-            .with_detail(enriched_overview("Goku's adventures"));
+            .with_search(vec![("910103", "Show K", Some(1997))])
+            .with_detail(enriched_overview("The hero's adventures"));
 
         run(
             &s,
@@ -3723,8 +6442,8 @@ mod tests {
 
         let got = s.get(1).await.unwrap();
         assert_eq!(got.match_source.as_deref(), Some("search"));
-        assert_eq!(got.match_external_id.as_deref(), Some("76666"));
-        assert_eq!(got.metadata.provider_ids.tvdb.as_deref(), Some("76666"));
+        assert_eq!(got.match_external_id.as_deref(), Some("910103"));
+        assert_eq!(got.metadata.provider_ids.tvdb.as_deref(), Some("910103"));
     }
 
     /// A re-admitted episode whose new search finds nothing loses the id its
@@ -3734,14 +6453,14 @@ mod tests {
     #[tokio::test]
     async fn a_re_admitted_episodes_old_id_is_dropped_when_its_search_finds_nothing() {
         let s = store().await;
-        put_episode(&s, 1, "Dragon Ball", "/tv/Dragon Ball").await;
+        put_episode(&s, 1, "Show K", "/tv/Show K").await;
         let mut item = s.get(1).await.unwrap();
         item.metadata.provider_ids.tvdb = Some("374456".into());
         s.put(item).await.unwrap();
         s.set_item_match(1, "tvdb", "374456", "search", Some(0.83), NOW)
             .await
             .unwrap();
-        readmit_stale_tv_matches(&s).await.unwrap();
+        readmit(&s).await;
         let (_td, cache) = cache();
         let tvdb = FakeEnricher::tvdb().with_search(vec![]);
 
@@ -3775,8 +6494,8 @@ mod tests {
         item.metadata.provider_ids.tvdb = Some("374456".into());
         assert_eq!(trusted_provider_ids(&item).tvdb, None);
 
-        item.metadata.provider_ids.tvdb = Some("76666".into());
-        assert_eq!(trusted_provider_ids(&item).tvdb.as_deref(), Some("76666"));
+        item.metadata.provider_ids.tvdb = Some("910103".into());
+        assert_eq!(trusted_provider_ids(&item).tvdb.as_deref(), Some("910103"));
 
         item.match_source = Some("nfo_id".into());
         item.metadata.provider_ids.tvdb = Some("374456".into());
@@ -3812,11 +6531,11 @@ mod tests {
 
     fn anime_texts() -> Vec<LocalizedText> {
         vec![
-            text("jpn", "ブルマと孫悟空", "ブルマが…", true),
+            text("jpn", "ミアと勇者", "ミアが…", true),
             text(
                 "eng",
-                "The Secret of the Dragon Balls",
-                "Bulma meets Goku.",
+                "The Secret of the Moon Base",
+                "Mia meets the hero.",
                 false,
             ),
         ]
@@ -3824,18 +6543,18 @@ mod tests {
 
     #[test]
     fn adopt_replaces_only_the_base_record_text() {
-        let mut title = "ブルマと孫悟空".to_string();
-        let mut overview = Some(" ブルマが…".to_string());
+        let mut title = "ミアと勇者".to_string();
+        let mut overview = Some(" ミアが…".to_string());
         assert!(adopt_default_text(
             Some(&mut title),
             &mut overview,
             &anime_texts()
         ));
-        assert_eq!(title, "The Secret of the Dragon Balls");
-        assert_eq!(overview.as_deref(), Some("Bulma meets Goku."));
+        assert_eq!(title, "The Secret of the Moon Base");
+        assert_eq!(overview.as_deref(), Some("Mia meets the hero."));
 
         // Local NFO text is not the provider's: left alone.
-        let mut title = "Bulma and Son Goku".to_string();
+        let mut title = "Mia and Son Hero".to_string();
         let mut overview = Some("Une description française.".to_string());
         assert!(!adopt_default_text(
             Some(&mut title),
@@ -3845,7 +6564,7 @@ mod tests {
         assert_eq!(overview.as_deref(), Some("Une description française."));
 
         // No English at TVDB: the original stays.
-        let mut overview = Some("ブルマが…".to_string());
+        let mut overview = Some("ミアが…".to_string());
         assert!(!adopt_default_text(
             None,
             &mut overview,
@@ -3853,8 +6572,8 @@ mod tests {
         ));
 
         // English-made: nothing to replace.
-        let eng_only = [text("eng", "Pilot", "Lord Stark...", true)];
-        let mut overview = Some("Lord Stark...".to_string());
+        let eng_only = [text("eng", "Pilot", "Lord Ash...", true)];
+        let mut overview = Some("Lord Ash...".to_string());
         assert!(!adopt_default_text(None, &mut overview, &eng_only));
     }
 
@@ -3864,34 +6583,35 @@ mod tests {
     async fn put_anime(s: &SqliteStore) {
         let item = MediaItem {
             id: 77,
-            path: "/tv/Dragon Ball/S01E01.mkv".into(),
-            title: "ブルマと孫悟空".into(),
+            path: "/tv/Show K/S01E01.mkv".into(),
+            title: "ミアと勇者".into(),
             kind: MediaKind::Episode,
             series: Some(pharos_core::SeriesInfo {
-                series_name: "Dragon Ball".into(),
+                series_name: "Show K".into(),
                 season_number: Some(1),
                 episode_number: Some(1),
-                series_folder: Some("/tv/Dragon Ball".into()),
+                series_folder: Some("/tv/Show K".into()),
                 series_year: Some(1986),
+                series_key: None,
             }),
             metadata: pharos_core::MediaMetadata {
-                overview: Some("ブルマが…".into()),
+                overview: Some("ミアが…".into()),
                 ..Default::default()
             },
             ..MediaItem::default()
         };
         s.put(item).await.unwrap();
-        s.set_item_match(77, "tvdb", "76666", "nfo_id", Some(0.9), NOW)
+        s.set_item_match(77, "tvdb", "910103", "nfo_id", Some(0.9), NOW)
             .await
             .unwrap();
         s.upsert_series_metadata(SeriesMetadata {
-            series_key: "/tv/Dragon Ball".into(),
-            series_name: "Dragon Ball".into(),
+            series_key: "/tv/Show K".into(),
+            series_name: "Show K".into(),
             match_provider: Some("tvdb".into()),
-            match_external_id: Some("76666".into()),
+            match_external_id: Some("910103".into()),
             match_source: Some("nfo_id".into()),
             metadata_refreshed_at: Some(NOW),
-            overview: Some("悟空の冒険。".into()),
+            overview: Some("勇者の冒険。".into()),
             ..Default::default()
         })
         .await
@@ -3903,42 +6623,42 @@ mod tests {
         let s = store().await;
         put_anime(&s).await;
         let tvdb = FakeEnricher::tvdb().with_texts(vec![
-            text("jpn", "ブルマと孫悟空", "ブルマが…", true),
-            text("jpn", "ドラゴンボール", "悟空の冒険。", true),
+            text("jpn", "ミアと勇者", "ミアが…", true),
+            text("jpn", "ショーK", "勇者の冒険。", true),
             text(
                 "eng",
-                "The Secret of the Dragon Balls",
-                "Bulma meets Goku.",
+                "The Secret of the Moon Base",
+                "Mia meets the hero.",
                 false,
             ),
         ]);
         // One fake answers for show and episode alike; give each its own.
         let ep_texts = anime_texts();
         let show_texts = vec![
-            text("jpn", "ドラゴンボール", "悟空の冒険。", true),
-            text("eng", "Dragon Ball", "Goku sets out.", false),
+            text("jpn", "ショーK", "勇者の冒険。", true),
+            text("eng", "Show K", "The hero sets out.", false),
         ];
         adopt_for_owner(&s, &TranslationOwner::Item(77), &ep_texts)
             .await
             .unwrap();
         adopt_for_owner(
             &s,
-            &TranslationOwner::Series("/tv/Dragon Ball".into()),
+            &TranslationOwner::Series("/tv/Show K".into()),
             &show_texts,
         )
         .await
         .unwrap();
         let ep = s.get(77).await.unwrap();
-        assert_eq!(ep.title, "The Secret of the Dragon Balls");
-        assert_eq!(ep.metadata.overview.as_deref(), Some("Bulma meets Goku."));
+        assert_eq!(ep.title, "The Secret of the Moon Base");
+        assert_eq!(ep.metadata.overview.as_deref(), Some("Mia meets the hero."));
         assert_eq!(ep.match_source.as_deref(), Some("nfo_id"), "still matched");
         let show = s
-            .series_metadata_by_keys(&["/tv/Dragon Ball".into()])
+            .series_metadata_by_keys(&["/tv/Show K".into()])
             .await
             .unwrap();
         assert_eq!(
-            show["/tv/Dragon Ball"].overview.as_deref(),
-            Some("Goku sets out.")
+            show["/tv/Show K"].overview.as_deref(),
+            Some("The hero sets out.")
         );
 
         // The pass stores rows for both owners and asks once each.
@@ -3965,12 +6685,12 @@ mod tests {
         for id in [78u32, 79] {
             let mut item = s.get(77).await.unwrap();
             item.id = u64::from(id);
-            item.path = format!("/tv/Dragon Ball/S01E{id}.mkv").into();
+            item.path = format!("/tv/Show K/S01E{id}.mkv").into();
             if let Some(series) = item.series.as_mut() {
                 series.episode_number = Some(id);
             }
             s.put(item).await.unwrap();
-            s.set_item_match(u64::from(id), "tvdb", "76666", "nfo_id", Some(0.9), NOW)
+            s.set_item_match(u64::from(id), "tvdb", "910103", "nfo_id", Some(0.9), NOW)
                 .await
                 .unwrap();
         }
@@ -4004,7 +6724,7 @@ mod tests {
         .await
         .unwrap();
         let ep = s.get(77).await.unwrap();
-        assert_eq!(ep.metadata.overview.as_deref(), Some("Bulma meets Goku."));
+        assert_eq!(ep.metadata.overview.as_deref(), Some("Mia meets the hero."));
     }
 
     #[tokio::test]
@@ -4031,7 +6751,7 @@ mod tests {
         .unwrap();
         assert!(tvdb.asked().is_empty());
         let ep = s.get(77).await.unwrap();
-        assert_eq!(ep.metadata.overview.as_deref(), Some("ブルマが…"));
+        assert_eq!(ep.metadata.overview.as_deref(), Some("ミアが…"));
     }
 
     /// Records the provider has no such record for (anime numbered
@@ -4045,12 +6765,12 @@ mod tests {
         for id in [78u32, 79, 80, 81] {
             let mut item = s.get(77).await.unwrap();
             item.id = u64::from(id);
-            item.path = format!("/tv/Dragon Ball/S01E{id}.mkv").into();
+            item.path = format!("/tv/Show K/S01E{id}.mkv").into();
             if let Some(series) = item.series.as_mut() {
                 series.episode_number = Some(id);
             }
             s.put(item).await.unwrap();
-            s.set_item_match(u64::from(id), "tvdb", "76666", "nfo_id", Some(0.9), NOW)
+            s.set_item_match(u64::from(id), "tvdb", "910103", "nfo_id", Some(0.9), NOW)
                 .await
                 .unwrap();
         }
@@ -4076,12 +6796,12 @@ mod tests {
         for id in [78u32, 79, 80, 81] {
             let mut item = s.get(77).await.unwrap();
             item.id = u64::from(id);
-            item.path = format!("/tv/Dragon Ball/S01E{id}.mkv").into();
+            item.path = format!("/tv/Show K/S01E{id}.mkv").into();
             if let Some(series) = item.series.as_mut() {
                 series.episode_number = Some(id);
             }
             s.put(item).await.unwrap();
-            s.set_item_match(u64::from(id), "tvdb", "76666", "nfo_id", Some(0.9), NOW)
+            s.set_item_match(u64::from(id), "tvdb", "910103", "nfo_id", Some(0.9), NOW)
                 .await
                 .unwrap();
         }
@@ -4104,19 +6824,19 @@ mod tests {
     /// it with the English text when it is on.
     #[tokio::test]
     async fn the_kill_switch_also_holds_for_a_re_enrichment() {
-        for (fetch, want) in [(false, "砂の惑星…"), (true, "A duke's son...")] {
+        for (fetch, want) in [(false, "乾いた星…"), (true, "A noble's heir...")] {
             let s = store().await;
-            put_movie(&s, 900_400, "Dune (2021)").await;
+            put_movie(&s, 900_400, "Film A (2021)").await;
             let mut item = s.get(900_400).await.unwrap();
-            item.metadata.overview = Some("砂の惑星…".into());
+            item.metadata.overview = Some("乾いた星…".into());
             s.put(item).await.unwrap();
             let (_td, cache) = cache();
             let tmdb = FakeEnricher::tmdb()
-                .with_search(vec![("438631", "Dune", Some(2021))])
+                .with_search(vec![("910101", "Film A", Some(2021))])
                 .with_detail(EnrichedMetadata {
                     texts: vec![
-                        text("jpn", "Dune", "砂の惑星…", true),
-                        text("eng", "Dune", "A duke's son...", false),
+                        text("jpn", "Film A", "乾いた星…", true),
+                        text("eng", "Film A", "A noble's heir...", false),
                     ],
                     ..EnrichedMetadata::default()
                 });
@@ -4188,15 +6908,44 @@ mod tests {
         assert_eq!(tvdb.asked().len(), 4, "asked again after a day");
     }
 
+    /// B989: a provider's per-pass state is opened and closed once around a
+    /// whole pass, and the pass scope closes it on an early exit too.
+    #[tokio::test]
+    async fn a_pass_opens_and_closes_the_providers_state_once() {
+        let s = store().await;
+        let (_td, cache) = cache();
+        let tvdb = FakeEnricher::tvdb();
+        run(
+            &s,
+            &sem(2),
+            &cache,
+            None::<&FakeEnricher>,
+            Some(&tvdb),
+            None::<&MusicBrainzClient>,
+            &MetadataConfig::default(),
+            NOW,
+        )
+        .await
+        .unwrap();
+        assert_eq!(*tvdb.passes.lock().unwrap(), ["begin", "end"]);
+
+        let scoped = FakeEnricher::tvdb();
+        {
+            let _scope = PassScope::open(Some(&scoped));
+            assert_eq!(*scoped.passes.lock().unwrap(), ["begin"]);
+        }
+        assert_eq!(*scoped.passes.lock().unwrap(), ["begin", "end"]);
+    }
+
     #[tokio::test]
     async fn enrichment_stores_the_text_rows() {
         let s = store().await;
-        put_episode(&s, 1, "Dragon Ball", "/tv/Dragon Ball").await;
+        put_episode(&s, 1, "Show K", "/tv/Show K").await;
         let (_td, cache) = cache();
         let tvdb = FakeEnricher::tvdb()
-            .with_search(vec![("76666", "Dragon Ball", Some(1997))])
+            .with_search(vec![("910103", "Show K", Some(1997))])
             .with_detail(EnrichedMetadata {
-                overview: Some("Bulma meets Goku.".into()),
+                overview: Some("Mia meets the hero.".into()),
                 texts: anime_texts(),
                 ..EnrichedMetadata::default()
             });
@@ -4219,12 +6968,2866 @@ mod tests {
         assert_eq!(rows.len(), 2, "{rows:?}");
         let show = s
             .translations_for(
-                &[TranslationOwner::Series("/tv/Dragon Ball".into())],
+                &[TranslationOwner::Series("/tv/Show K".into())],
                 &["eng".into()],
                 false,
             )
             .await
             .unwrap();
         assert_eq!(show.len(), 1);
+    }
+
+    /// Spec 033 — a log buffer for the decision lines. Each nextest test runs
+    /// in its own process, so a thread-scoped subscriber sees every callsite.
+    #[derive(Clone, Default)]
+    struct LogBuf(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogBuf {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuf {
+        type Writer = LogBuf;
+        fn make_writer(&'a self) -> LogBuf {
+            self.clone()
+        }
+    }
+
+    impl LogBuf {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+    }
+
+    fn log_capture() -> (LogBuf, tracing::subscriber::DefaultGuard) {
+        let buf = LogBuf::default();
+        let sub = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+        (buf, tracing::subscriber::set_default(sub))
+    }
+
+    /// Counter value for `name` with exactly these `labels` (0 when absent).
+    fn counter_value(
+        snap: &pharos_test_metrics::CumulativeSnapshotter,
+        name: &str,
+        labels: &[(&str, &str)],
+    ) -> u64 {
+        use metrics_util::debugging::DebugValue;
+        snap.snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(k, ..)| k.key().name() == name)
+            .filter(|(k, ..)| {
+                labels
+                    .iter()
+                    .all(|(n, v)| k.key().labels().any(|l| l.key() == *n && l.value() == *v))
+            })
+            .map(|(.., v)| match v {
+                DebugValue::Counter(c) => c,
+                _ => 0,
+            })
+            .sum()
+    }
+
+    fn gauge_value(
+        snap: &pharos_test_metrics::CumulativeSnapshotter,
+        name: &str,
+        labels: &[(&str, &str)],
+    ) -> Option<f64> {
+        use metrics_util::debugging::DebugValue;
+        snap.snapshot()
+            .into_vec()
+            .into_iter()
+            .find_map(|(k, _, _, v)| {
+                let hit = k.key().name() == name
+                    && labels.iter().all(|(n, want)| {
+                        k.key()
+                            .labels()
+                            .any(|l| l.key() == *n && l.value() == *want)
+                    });
+                match v {
+                    DebugValue::Gauge(g) if hit => Some(g.into_inner()),
+                    _ => None,
+                }
+            })
+    }
+
+    async fn put_bare_episode(store: &SqliteStore, id: u64, series: &str, folder: &str) {
+        let item = MediaItem {
+            id,
+            path: format!("{folder}/{series} (2003) - S01E{id:02}.mkv").into(),
+            title: format!("{series} ep {id}"),
+            kind: MediaKind::Episode,
+            series: Some(pharos_core::SeriesInfo {
+                series_name: series.into(),
+                season_number: Some(1),
+                episode_number: Some(id as u32),
+                series_folder: Some(folder.into()),
+                series_year: None,
+                series_key: None,
+            }),
+            ..MediaItem::default()
+        };
+        store.put(item).await.unwrap();
+    }
+
+    /// Spec 033 B930 — a bare `Show B` folder searches with no
+    /// year, two shows carry the name, and the provider's order picks the
+    /// 1971 one. The decision is counted as ambiguous, decided by provider
+    /// order, and logged with both candidates.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_same_named_show_decided_by_provider_order_is_counted_and_logged() {
+        use metrics_util::debugging::DebuggingRecorder;
+        let recorder = DebuggingRecorder::new();
+        let snap = pharos_test_metrics::snapshotter(&recorder);
+        let _metrics = metrics::set_default_local_recorder(&recorder);
+        let (logs, _log) = log_capture();
+
+        let s = store().await;
+        put_bare_episode(&s, 1, "Show B", "/tv/Show B").await;
+        // No year in the file's name either: a stated year would tell the
+        // two shows apart (B990).
+        let mut item = s.get(1).await.unwrap();
+        item.path = item.path.to_string_lossy().replace(" (2003)", "").into();
+        s.put(item).await.unwrap();
+        let (_td, cache) = cache();
+        let tvdb = FakeEnricher::tvdb()
+            .with_search(vec![
+                ("900001", "Show B", Some(1971)),
+                ("900002", "Show B", Some(1996)),
+            ])
+            .with_detail(enriched_overview("A scattered crew."));
+
+        enrich_series_pass(
+            &s,
+            &sem(4),
+            &cache,
+            Some(&tvdb),
+            None::<&FakeEnricher>,
+            &MetadataConfig::default(),
+            NOW,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            counter_value(
+                &snap,
+                "pharos_series_match_total",
+                &[("outcome", "ambiguous"), ("decided_by", "provider_order")]
+            ),
+            1
+        );
+        assert_eq!(
+            counter_value(&snap, "pharos_series_match_total", &[]),
+            1,
+            "one count per show"
+        );
+        let text = logs.text();
+        let line = text
+            .lines()
+            .find(|l| l.contains("series match"))
+            .unwrap_or_else(|| panic!("no decision line in {text}"));
+        for want in [
+            "query=\"Show B\"",
+            "chosen=\"900001\"",
+            "runner_up=\"900002\"",
+            "margin=0.0",
+            "decided_by=\"provider_order\"",
+            "outcome=\"ambiguous\"",
+        ] {
+            assert!(line.contains(want), "{want} missing from {line}");
+        }
+    }
+
+    /// One episode file of `folder`, named `"{series} - S..E.. - {title}"`.
+    async fn put_titled_episode(
+        store: &SqliteStore,
+        id: u64,
+        folder: &str,
+        (season, episode): (u32, u32),
+        title: &str,
+    ) {
+        let series = folder.rsplit('/').next().unwrap_or(folder);
+        let item = MediaItem {
+            id,
+            path: format!(
+                "{folder}/Season {season}/{series} - S{season:02}E{episode:02} - {title}.mkv"
+            )
+            .into(),
+            title: title.into(),
+            kind: MediaKind::Episode,
+            series: Some(pharos_core::SeriesInfo {
+                series_name: series.into(),
+                season_number: Some(season),
+                episode_number: Some(episode),
+                series_folder: Some(folder.into()),
+                series_year: None,
+                series_key: None,
+            }),
+            ..MediaItem::default()
+        };
+        store.put(item).await.unwrap();
+    }
+
+    fn show_b_search(tvdb: FakeEnricher) -> FakeEnricher {
+        tvdb.with_search(vec![
+            ("900001", "Show B", Some(1971)),
+            ("900002", "Show B", Some(1996)),
+        ])
+        .with_detail(enriched_overview("A scattered crew."))
+    }
+
+    async fn series_row(s: &SqliteStore, key: &str) -> SeriesMetadata {
+        s.series_metadata_by_keys(&[key.to_string()])
+            .await
+            .unwrap()
+            .remove(key)
+            .unwrap_or_else(|| panic!("no series row for {key}"))
+    }
+
+    async fn series_pass(s: &SqliteStore, cache: &ImageCache, tvdb: &FakeEnricher) {
+        enrich_series_pass(
+            s,
+            &sem(4),
+            cache,
+            Some(tvdb),
+            None::<&FakeEnricher>,
+            &MetadataConfig::default(),
+            NOW,
+        )
+        .await
+        .unwrap();
+    }
+
+    /// Spec 033 V891 / B930 — two shows named exactly "Show B"
+    /// and no year: the one whose episodes the folder holds wins, not the
+    /// provider's first. Counted and logged as decided by episode fit, and
+    /// each show's list is fetched once per pass however many folders ask.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_same_named_show_is_decided_by_its_episodes() {
+        use metrics_util::debugging::DebuggingRecorder;
+        let recorder = DebuggingRecorder::new();
+        let snap = pharos_test_metrics::snapshotter(&recorder);
+        let _metrics = metrics::set_default_local_recorder(&recorder);
+        let (logs, _log) = log_capture();
+
+        let s = store().await;
+        for (id, season, title) in [
+            (1, 1, "Opening"),
+            (2, 2, "Second Light"),
+            (3, 4, "The Long Wait"),
+        ] {
+            put_titled_episode(&s, id, "/tv/Show B", (season, 1), title).await;
+            put_titled_episode(&s, id + 10, "/tv2/Show B", (season, 1), title).await;
+        }
+        let (_td, cache) = cache();
+        let tvdb = show_b_search(FakeEnricher::tvdb())
+            .with_list(
+                "900001",
+                &[(1, 1, "The Old Second"), (1, 2, "The Lost Road")],
+            )
+            .with_list(
+                "900002",
+                &[
+                    (1, 1, "Opening"),
+                    (2, 1, "Second Light"),
+                    (3, 1, "The Third Door"),
+                    (4, 1, "The Long Wait"),
+                ],
+            );
+
+        series_pass(&s, &cache, &tvdb).await;
+
+        for key in ["/tv/Show B", "/tv2/Show B"] {
+            let row = series_row(&s, key).await;
+            assert_eq!(row.match_external_id.as_deref(), Some("900002"), "{key}");
+            assert_eq!(row.match_flag, None, "a clear fit is not flagged");
+            assert_eq!(row.match_runner_up_id, None);
+        }
+        let mut listed = tvdb.listed();
+        listed.sort();
+        assert_eq!(listed, ["900001", "900002"], "one list per show per pass");
+        assert!(!tvdb.fetched().contains(&"900001".to_string()));
+        assert_eq!(
+            counter_value(
+                &snap,
+                "pharos_series_match_total",
+                &[("outcome", "matched"), ("decided_by", "episode_fit")]
+            ),
+            2
+        );
+        let text = logs.text();
+        let line = text
+            .lines()
+            .find(|l| l.contains("series episode fit"))
+            .unwrap_or_else(|| panic!("no episode fit line in {text}"));
+        for want in [
+            "chosen=\"900002\"",
+            "runner_up=\"900001\"",
+            "local_episodes=3",
+            "titled=3",
+            "flagged=false",
+            "decided_by=\"episode_fit\"",
+            "900002:1.000",
+            "900001:0.167",
+        ] {
+            assert!(line.contains(want), "{want} missing from {line}");
+        }
+        let decision = text
+            .lines()
+            .find(|l| l.contains("series match"))
+            .unwrap_or_else(|| panic!("no decision line in {text}"));
+        assert!(
+            decision.contains("decided_by=\"episode_fit\""),
+            "{decision}"
+        );
+    }
+
+    /// B930 — TVDB titles the remake "Show B (1996)" with the
+    /// bare name as an alias, so the original wins on name position alone.
+    /// The episodes still decide.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_remake_matching_by_its_alias_is_decided_by_its_episodes() {
+        let s = store().await;
+        put_titled_episode(&s, 1, "/tv/Show B", (4, 1), "The Long Wait").await;
+        let (_td, cache) = cache();
+        let mut tvdb = FakeEnricher::tvdb()
+            .with_detail(enriched_overview("A scattered crew."))
+            .with_list("900001", &[(1, 1, "The Old Second")])
+            .with_list("900002", &[(4, 1, "The Long Wait")]);
+        tvdb.search = vec![
+            SearchCandidate {
+                id: "900001".into(),
+                title: "Show B".into(),
+                year: Some(1971),
+                aliases: Vec::new(),
+            },
+            SearchCandidate {
+                id: "900002".into(),
+                title: "Show B (1996)".into(),
+                year: Some(1996),
+                aliases: vec!["Show B".into()],
+            },
+        ];
+
+        series_pass(&s, &cache, &tvdb).await;
+
+        let row = series_row(&s, "/tv/Show B").await;
+        assert_eq!(row.match_external_id.as_deref(), Some("900002"));
+        assert_eq!(row.match_flag, None);
+    }
+
+    /// V891 — when the episodes fit both shows about as well, the best guess
+    /// is still used, but flagged with its runner-up for an admin.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_close_episode_fit_is_flagged_with_its_runner_up() {
+        use metrics_util::debugging::DebuggingRecorder;
+        let recorder = DebuggingRecorder::new();
+        let snap = pharos_test_metrics::snapshotter(&recorder);
+        let _metrics = metrics::set_default_local_recorder(&recorder);
+        let s = store().await;
+        put_titled_episode(&s, 1, "/tv/Show B", (1, 1), "Pilot").await;
+        let (_td, cache) = cache();
+        let tvdb = show_b_search(FakeEnricher::tvdb())
+            .with_list("900001", &[(1, 1, "Pilot")])
+            .with_list("900002", &[(1, 1, "Pilot")]);
+
+        series_pass(&s, &cache, &tvdb).await;
+
+        let row = series_row(&s, "/tv/Show B").await;
+        assert_eq!(row.match_external_id.as_deref(), Some("900001"));
+        assert_eq!(row.match_flag.as_deref(), Some(AMBIGUOUS_FLAG));
+        assert_eq!(row.match_runner_up_id.as_deref(), Some("900002"));
+        assert_eq!(row.match_runner_up_score, Some(1.0));
+        assert_eq!(
+            counter_value(
+                &snap,
+                "pharos_series_match_total",
+                &[("outcome", "ambiguous"), ("decided_by", "episode_fit")]
+            ),
+            1
+        );
+    }
+
+    /// V890 — `tvshow.nfo` is one vote: it decides between even fits, and the
+    /// call stays flagged because the episodes did not decide it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_show_nfo_votes_between_even_episode_fits() {
+        let show = TempDir::new().unwrap();
+        let folder = show.path().join("Show B");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(
+            folder.join("tvshow.nfo"),
+            r#"<tvshow><title>Show B</title><uniqueid type="tvdb">900002</uniqueid></tvshow>"#,
+        )
+        .unwrap();
+        let folder = folder.to_string_lossy().into_owned();
+        let s = store().await;
+        put_titled_episode(&s, 1, &folder, (1, 1), "Pilot").await;
+        let (_td, cache) = cache();
+        let tvdb = show_b_search(FakeEnricher::tvdb())
+            .with_list("900001", &[(1, 1, "Pilot")])
+            .with_list("900002", &[(1, 1, "Pilot")]);
+        let (logs, _log) = log_capture();
+
+        series_pass(&s, &cache, &tvdb).await;
+
+        let row = series_row(&s, &folder).await;
+        assert_eq!(row.match_external_id.as_deref(), Some("900002"));
+        assert_eq!(row.match_flag.as_deref(), Some(AMBIGUOUS_FLAG));
+        assert_eq!(row.match_runner_up_id.as_deref(), Some("900001"));
+        let text = logs.text();
+        assert!(
+            text.lines().any(|l| l.contains("series episode fit")
+                && l.contains("nfo_vote=\"900002\"")
+                && l.contains("decided_by=\"nfo_vote\"")),
+            "{text}"
+        );
+    }
+
+    /// V891 — more same-named shows than were scored: the best of the scored
+    /// three is used and flagged, since an unscored one may fit better.
+    #[tokio::test(flavor = "current_thread")]
+    async fn more_same_named_shows_than_scored_is_flagged() {
+        let s = store().await;
+        put_titled_episode(&s, 1, "/tv/Show C", (1, 1), "Harbour").await;
+        let (_td, cache) = cache();
+        let tvdb = FakeEnricher::tvdb()
+            .with_search(vec![
+                ("1", "Show C", None),
+                ("2", "Show C", None),
+                ("3", "Show C", None),
+                ("4", "Show C", None),
+            ])
+            .with_detail(enriched_overview("Space."))
+            .with_list("1", &[(2, 1, "x")])
+            .with_list("2", &[(1, 1, "Harbour")])
+            .with_list("3", &[(3, 1, "y")])
+            .with_list("4", &[(1, 1, "Harbour")]);
+
+        series_pass(&s, &cache, &tvdb).await;
+
+        let row = series_row(&s, "/tv/Show C").await;
+        assert_eq!(row.match_external_id.as_deref(), Some("2"));
+        assert_eq!(row.match_flag.as_deref(), Some(AMBIGUOUS_FLAG));
+        assert!(
+            !tvdb.listed().contains(&"4".to_string()),
+            "only three scored"
+        );
+    }
+
+    /// A list the provider cannot give leaves the provider's choice in place,
+    /// flagged rather than silently trusted.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_unavailable_episode_list_keeps_the_choice_and_flags_it() {
+        let s = store().await;
+        put_titled_episode(&s, 1, "/tv/Show B", (1, 1), "Opening").await;
+        let (_td, cache) = cache();
+        let tvdb = show_b_search(FakeEnricher::tvdb()).with_list("900002", &[(1, 1, "Opening")]);
+
+        series_pass(&s, &cache, &tvdb).await;
+
+        let row = series_row(&s, "/tv/Show B").await;
+        assert_eq!(row.match_external_id.as_deref(), Some("900001"));
+        assert_eq!(row.match_flag.as_deref(), Some(AMBIGUOUS_FLAG));
+        assert_eq!(row.match_runner_up_id.as_deref(), Some("900002"));
+    }
+
+    const SHOW_B: &str = "/tv/Show B";
+
+    fn apply_cfg() -> MetadataConfig {
+        MetadataConfig {
+            series_identity_repair: RepairMode::Apply,
+            ..MetadataConfig::default()
+        }
+    }
+
+    async fn pin(s: &SqliteStore, key: &str, id: &str, refreshed_at: i64) {
+        s.upsert_series_metadata(SeriesMetadata {
+            series_key: key.into(),
+            series_name: key.rsplit('/').next().unwrap_or(key).into(),
+            match_provider: Some("tvdb".into()),
+            match_external_id: Some(id.into()),
+            match_source: Some("search".into()),
+            metadata_refreshed_at: Some(refreshed_at),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    }
+
+    async fn pending_ids(s: &SqliteStore) -> Vec<u64> {
+        s.series_reconcile_pending(100)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect()
+    }
+
+    /// V940 — a show re-asked onto another match marks its episodes for
+    /// reconciliation before the new match is written. An episode's own
+    /// manual match is not marked.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_changed_show_match_marks_its_episodes() {
+        use metrics_util::debugging::DebuggingRecorder;
+        let recorder = DebuggingRecorder::new();
+        let snap = pharos_test_metrics::snapshotter(&recorder);
+        let _metrics = metrics::set_default_local_recorder(&recorder);
+        let s = store().await;
+        put_titled_episode(&s, 1, SHOW_B, (1, 1), "Opening").await;
+        put_titled_episode(&s, 2, SHOW_B, (2, 1), "Second Light").await;
+        s.set_item_match(2, "tvdb", "1", "manual", None, NOW)
+            .await
+            .unwrap();
+        // Stored long ago, so the TTL re-asks it.
+        pin(&s, SHOW_B, "900001", 0).await;
+        let (_td, cache) = cache();
+        let tvdb = show_b_search(FakeEnricher::tvdb())
+            .with_list("900001", &[(1, 1, "The Old Second")])
+            .with_list("900002", &[(1, 1, "Opening"), (2, 1, "Second Light")]);
+
+        series_pass(&s, &cache, &tvdb).await;
+
+        assert_eq!(
+            series_row(&s, SHOW_B).await.match_external_id.as_deref(),
+            Some("900002")
+        );
+        assert_eq!(pending_ids(&s).await, [1]);
+        assert_eq!(
+            counter_value(
+                &snap,
+                "pharos_series_reconcile_marked_total",
+                &[("reason", "match_changed")]
+            ),
+            1
+        );
+
+        // The same answer again marks nothing more.
+        s.clear_series_reconcile(1, NOW).await.unwrap();
+        pin(&s, SHOW_B, "900002", 0).await;
+        series_pass(&s, &cache, &tvdb).await;
+        assert!(pending_ids(&s).await.is_empty());
+    }
+
+    /// V940 — under `apply`, a marked episode is rebuilt: what the old show's
+    /// record wrote is reset, its stored translations deleted, and it is read
+    /// from its show's current match. The mark then clears.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_marked_episode_is_rebuilt_against_its_shows_match() {
+        let s = store().await;
+        put_titled_episode(&s, 1, SHOW_B, (1, 1), "Opening").await;
+        let mut item = s.get(1).await.unwrap();
+        item.title = "The Old Second".into();
+        item.metadata.overview = Some("The old pilot.".into());
+        item.metadata.premiere_date = Some(54_259_200);
+        item.metadata.provider_ids.tvdb = Some("900001".into());
+        s.put(item).await.unwrap();
+        s.set_item_match(1, "tvdb", "900001", "search", None, NOW)
+            .await
+            .unwrap();
+        s.upsert_translations(
+            &TranslationOwner::Item(1),
+            &[LocalizedText {
+                language: "deu".into(),
+                title: Some("Das Alte Zweite".into()),
+                ..LocalizedText::default()
+            }],
+            NOW,
+        )
+        .await
+        .unwrap();
+        pin(&s, SHOW_B, "900002", NOW).await;
+        s.mark_series_reconcile(SHOW_B, NOW).await.unwrap();
+        let (_td, cache) = cache();
+        let record = EnrichedMetadata {
+            title: Some("Opening".into()),
+            overview: Some("The crew moves on every 33 minutes.".into()),
+            premiere_date: Some(876_787_200),
+            ..EnrichedMetadata::default()
+        };
+        let tvdb = FakeEnricher::tvdb().with_detail(record);
+
+        let (n, pending) = reconcile_pass(
+            &s,
+            &sem(4),
+            &cache,
+            None::<&FakeEnricher>,
+            Some(&tvdb),
+            &apply_cfg(),
+            NOW + 10,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!((n, pending), (1, true));
+        assert_eq!(tvdb.fetched(), ["900002"], "read from the pinned show");
+        let got = s.get(1).await.unwrap();
+        assert_ne!(got.title, "The Old Second");
+        assert_eq!(
+            got.metadata.overview.as_deref(),
+            Some("The crew moves on every 33 minutes.")
+        );
+        assert_eq!(got.metadata.premiere_date, Some(876_787_200));
+        assert_eq!(got.metadata.provider_ids.tvdb.as_deref(), Some("900002"));
+        assert!(s
+            .translations_for(&[TranslationOwner::Item(1)], &["deu".into()], false)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(pending_ids(&s).await.is_empty());
+    }
+
+    /// B993 — a show re-matched from one provider to another: the rebuilt
+    /// episode keeps no id of the old provider.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_rebuild_onto_another_provider_clears_the_old_providers_id() {
+        let s = store().await;
+        put_titled_episode(&s, 1, SHOW_B, (1, 1), "Opening").await;
+        let mut item = s.get(1).await.unwrap();
+        item.metadata.provider_ids.tmdb = Some("900001".into());
+        s.put(item).await.unwrap();
+        s.set_item_match(1, "tmdb", "900001", "search", None, NOW)
+            .await
+            .unwrap();
+        pin(&s, SHOW_B, "900002", NOW).await;
+        s.mark_series_reconcile(SHOW_B, NOW).await.unwrap();
+        let (_td, cache) = cache();
+        let tvdb = FakeEnricher::tvdb().with_detail(enriched_overview("A scattered crew."));
+
+        reconcile_pass(
+            &s,
+            &sem(4),
+            &cache,
+            None::<&FakeEnricher>,
+            Some(&tvdb),
+            &apply_cfg(),
+            NOW + 10,
+        )
+        .await
+        .unwrap();
+
+        let got = s.get(1).await.unwrap();
+        assert_eq!(got.metadata.provider_ids.tvdb.as_deref(), Some("900002"));
+        assert_eq!(got.metadata.provider_ids.tmdb, None);
+    }
+
+    /// Rebuilds one episode of a show folder holding `tvshow.nfo` (and an
+    /// episode NFO when given), stored as matched at `old_provider` with
+    /// `stored` ids, onto a show pinned at TVDB `900002`.
+    async fn rebuild_in_show_folder(
+        old_provider: &str,
+        show_nfo: &str,
+        episode_nfo: Option<&str>,
+        stored: ProviderIds,
+    ) -> (MediaItem, u64) {
+        use metrics_util::debugging::DebuggingRecorder;
+        let recorder = DebuggingRecorder::new();
+        let snap = pharos_test_metrics::snapshotter(&recorder);
+        let _metrics = metrics::set_default_local_recorder(&recorder);
+        let dir = tempfile::tempdir().unwrap();
+        let show = dir.path().join("Show B");
+        std::fs::create_dir_all(&show).unwrap();
+        std::fs::write(show.join("tvshow.nfo"), show_nfo).unwrap();
+        let folder = show.to_string_lossy().into_owned();
+        let s = store().await;
+        put_titled_episode(&s, 1, &folder, (1, 1), "Opening").await;
+        if let Some(nfo) = episode_nfo {
+            let ep = std::fs::read_dir(&show).unwrap().count();
+            assert_eq!(ep, 1, "only tvshow.nfo so far");
+            let path = s.get(1).await.unwrap().path;
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path.with_extension("nfo"), nfo).unwrap();
+        }
+        let mut item = s.get(1).await.unwrap();
+        item.metadata.provider_ids = stored;
+        s.put(item).await.unwrap();
+        let stamp = if old_provider == "tmdb" {
+            "900001"
+        } else {
+            "900002"
+        };
+        s.set_item_match(1, old_provider, stamp, "search", None, NOW)
+            .await
+            .unwrap();
+        pin(&s, &folder, "900002", NOW).await;
+        s.mark_series_reconcile(&folder, NOW).await.unwrap();
+        let (_td, cache) = cache();
+        let tvdb = FakeEnricher::tvdb().with_detail(enriched_overview("A scattered crew."));
+        reconcile_pass(
+            &s,
+            &sem(4),
+            &cache,
+            None::<&FakeEnricher>,
+            Some(&tvdb),
+            &apply_cfg(),
+            NOW + 10,
+        )
+        .await
+        .unwrap();
+        let cleared = counter_value(
+            &snap,
+            "pharos_series_reconcile_ids_cleared_total",
+            &[("provider", "tmdb")],
+        ) + counter_value(
+            &snap,
+            "pharos_series_reconcile_ids_cleared_total",
+            &[("provider", "tvdb")],
+        );
+        (s.get(1).await.unwrap(), cleared)
+    }
+
+    const SHOW_NFO_TMDB: &str = "<tvshow><title>Show B</title>\
+        <uniqueid type=\"tmdb\">900001</uniqueid>\
+        <uniqueid type=\"imdb\">tt900001</uniqueid></tvshow>";
+
+    /// B993, B995 — the show's `tvshow.nfo` names the show's old TMDB id; a
+    /// rebuild onto a TVDB show leaves it off the episode (the scanner no
+    /// longer folds it), so there is nothing for the rebuild to drop.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_rebuild_onto_another_provider_gives_the_episode_no_show_nfo_id() {
+        let stored = ProviderIds {
+            tmdb: Some("900001".into()),
+            ..ProviderIds::default()
+        };
+        let (got, cleared) = rebuild_in_show_folder("tmdb", SHOW_NFO_TMDB, None, stored).await;
+
+        assert_eq!(got.metadata.provider_ids.tvdb.as_deref(), Some("900002"));
+        assert_eq!(got.metadata.provider_ids.tmdb, None);
+        assert_eq!(got.metadata.provider_ids.imdb, None);
+        assert_eq!(cleared, 0);
+    }
+
+    /// B993 — an id the episode's own NFO gives is curated: it stays.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_rebuild_keeps_the_old_providers_id_its_own_episode_nfo_gives() {
+        let own = "<episodedetails><title>Opening</title>\
+            <uniqueid type=\"tmdb\">900055</uniqueid></episodedetails>";
+        let (got, cleared) = rebuild_in_show_folder(
+            "tmdb",
+            SHOW_NFO_TMDB,
+            Some(own),
+            ProviderIds {
+                tmdb: Some("900001".into()),
+                ..ProviderIds::default()
+            },
+        )
+        .await;
+
+        assert_eq!(got.metadata.provider_ids.tmdb.as_deref(), Some("900055"));
+        assert_eq!(cleared, 0);
+    }
+
+    /// B993 — a re-match at the same provider changes nothing here: the
+    /// show's NFO id for that provider is read as before.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_rebuild_at_the_same_provider_keeps_the_show_nfo_id() {
+        let nfo = "<tvshow><title>Show B</title>\
+            <uniqueid type=\"tvdb\">900002</uniqueid></tvshow>";
+        let (got, cleared) =
+            rebuild_in_show_folder("tvdb", nfo, None, ProviderIds::default()).await;
+
+        assert_eq!(got.metadata.provider_ids.tvdb.as_deref(), Some("900002"));
+        assert_eq!(cleared, 0);
+    }
+
+    /// Stores one episode in a show folder with `tvshow.nfo`, matched at TVDB
+    /// `900002` with `stored` ids, and runs the stale show id pass twice.
+    /// Returns the item, how many ids each run dropped, and the counter.
+    async fn stale_id_passes(
+        show_nfo: &str,
+        episode_nfo: Option<&str>,
+        source: &str,
+        stored: ProviderIds,
+    ) -> (MediaItem, [usize; 2], u64) {
+        use metrics_util::debugging::DebuggingRecorder;
+        let recorder = DebuggingRecorder::new();
+        let snap = pharos_test_metrics::snapshotter(&recorder);
+        let _metrics = metrics::set_default_local_recorder(&recorder);
+        let dir = tempfile::tempdir().unwrap();
+        let show = dir.path().join("Show B");
+        std::fs::create_dir_all(&show).unwrap();
+        std::fs::write(show.join("tvshow.nfo"), show_nfo).unwrap();
+        let folder = show.to_string_lossy().into_owned();
+        let s = store().await;
+        put_titled_episode(&s, 1, &folder, (1, 1), "Opening").await;
+        let mut item = s.get(1).await.unwrap();
+        if let Some(nfo) = episode_nfo {
+            std::fs::write(item.path.with_extension("nfo"), nfo).unwrap_or_else(|_| {
+                std::fs::create_dir_all(item.path.parent().unwrap()).unwrap();
+                std::fs::write(item.path.with_extension("nfo"), nfo).unwrap();
+            });
+        }
+        item.metadata.provider_ids = stored;
+        s.put(item).await.unwrap();
+        s.set_item_match(1, "tvdb", "900002", source, None, NOW)
+            .await
+            .unwrap();
+        pin(&s, &folder, "900002", NOW).await;
+        let first = drop_stale_show_ids_pass(&s).await.unwrap();
+        let second = drop_stale_show_ids_pass(&s).await.unwrap();
+        let dropped = counter_value(
+            &snap,
+            "pharos_episode_stale_show_id_dropped_total",
+            &[("provider", "tmdb")],
+        );
+        (s.get(1).await.unwrap(), [first, second], dropped)
+    }
+
+    fn both_ids() -> ProviderIds {
+        ProviderIds {
+            tmdb: Some("900001".into()),
+            tvdb: Some("900002".into()),
+            imdb: Some("tt900001".into()),
+            ..ProviderIds::default()
+        }
+    }
+
+    /// B994 — an episode already stamped with its show's new provider still
+    /// carries the old provider's id the show NFO names; the pass drops it,
+    /// counts it once, and a second pass finds nothing.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_already_matched_episode_loses_the_show_nfo_id_of_the_other_provider() {
+        let (got, runs, dropped) = stale_id_passes(SHOW_NFO_TMDB, None, "search", both_ids()).await;
+
+        assert_eq!(got.metadata.provider_ids.tmdb, None);
+        assert_eq!(got.metadata.provider_ids.tvdb.as_deref(), Some("900002"));
+        assert_eq!(got.metadata.provider_ids.imdb.as_deref(), Some("tt900001"));
+        assert_eq!(runs, [1, 0], "the second pass writes nothing");
+        assert_eq!(dropped, 1, "and counts nothing more");
+    }
+
+    /// B994 — an id that differs from the show's is the episode's own: kept.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_pass_keeps_an_episode_id_that_is_not_the_shows() {
+        let mut stored = both_ids();
+        stored.tmdb = Some("900055".into());
+        let (got, runs, dropped) = stale_id_passes(SHOW_NFO_TMDB, None, "search", stored).await;
+
+        assert_eq!(got.metadata.provider_ids.tmdb.as_deref(), Some("900055"));
+        assert_eq!((runs, dropped), ([0, 0], 0));
+    }
+
+    /// B994 — an episode with its own manual match is not touched.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_pass_leaves_a_manually_matched_episode_alone() {
+        let (got, runs, dropped) = stale_id_passes(SHOW_NFO_TMDB, None, "manual", both_ids()).await;
+
+        assert_eq!(got.metadata.provider_ids.tmdb.as_deref(), Some("900001"));
+        assert_eq!((runs, dropped), ([0, 0], 0));
+    }
+
+    /// B994 — the id of the provider the show is matched at stays.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_pass_keeps_the_id_of_the_shows_own_provider() {
+        let nfo = "<tvshow><title>Show B</title>\
+            <uniqueid type=\"tvdb\">900002</uniqueid></tvshow>";
+        let (got, runs, dropped) = stale_id_passes(nfo, None, "search", both_ids()).await;
+
+        assert_eq!(got.metadata.provider_ids.tvdb.as_deref(), Some("900002"));
+        assert_eq!(got.metadata.provider_ids.tmdb.as_deref(), Some("900001"));
+        assert_eq!((runs, dropped), ([0, 0], 0));
+    }
+
+    /// V940 — a rebuild drops the stills the old show's record cached (the
+    /// row and the file), so the episode no longer serves the old show's
+    /// still; the new match's still replaces it when its record has one, and
+    /// a local sidecar stays.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_rebuilt_episode_drops_the_old_shows_still() {
+        let s = store().await;
+        let (_td, cache) = cache();
+        let mut old_paths = Vec::new();
+        for id in [1, 2] {
+            put_titled_episode(&s, id, SHOW_B, (1, id as u32), "Opening").await;
+            let old = cache
+                .upload(
+                    id,
+                    ImageRole::Primary,
+                    MediaKind::Episode,
+                    0,
+                    b"remake still",
+                )
+                .await
+                .unwrap();
+            s.set_artwork(id, "Primary", "tvdb", &old.to_string_lossy())
+                .await
+                .unwrap();
+            old_paths.push(old);
+            s.set_artwork(id, "Backdrop", "local", "/tv/Show B/fanart.jpg")
+                .await
+                .unwrap();
+            s.mark_reconcile_items(&[id], NOW).await.unwrap();
+        }
+        pin(&s, SHOW_B, "900002", NOW).await;
+        let before = s.get(1).await.unwrap().art_version;
+        let bare = FakeEnricher::tvdb().with_detail(EnrichedMetadata {
+            title: Some("Opening".into()),
+            ..EnrichedMetadata::default()
+        });
+
+        reconcile_one(
+            &s,
+            &sem(4),
+            &cache,
+            None::<&FakeEnricher>,
+            Some(&bare),
+            &apply_cfg(),
+            1,
+            NOW,
+            NOW + 1,
+        )
+        .await
+        .unwrap();
+
+        let rows = s.artwork_for(1).await.unwrap();
+        assert!(
+            rows.iter().all(|(_, source, _)| source == "local"),
+            "old show's still row kept: {rows:?}"
+        );
+        assert_eq!(rows.len(), 1, "the local sidecar stays");
+        assert!(!old_paths[0].exists(), "old show's cached still kept");
+        assert!(s.get(1).await.unwrap().art_version > before);
+
+        let mut with_still = FakeEnricher::tvdb().with_detail(EnrichedMetadata {
+            title: Some("Wellspring".into()),
+            artwork: vec![RemoteArt {
+                role: ArtworkRole::Primary,
+                url: "https://tvdb.example/new-still.jpg".into(),
+            }],
+            ..EnrichedMetadata::default()
+        });
+        with_still.image_bytes = Some(b"new still".to_vec());
+        reconcile_one(
+            &s,
+            &sem(4),
+            &cache,
+            None::<&FakeEnricher>,
+            Some(&with_still),
+            &apply_cfg(),
+            2,
+            NOW,
+            NOW + 1,
+        )
+        .await
+        .unwrap();
+        let (_, source, locator) = s
+            .artwork_for(2)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|(role, _, _)| role == "Primary")
+            .expect("new still recorded");
+        assert_eq!(source, "tvdb");
+        assert_eq!(std::fs::read(locator).unwrap(), b"new still");
+    }
+
+    /// A dry run rebuilds nothing and keeps the mark; a transient miss under
+    /// `apply` keeps it too, moved behind the rest.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_marked_episode_waits_in_a_dry_run_and_after_a_transient_miss() {
+        let s = store().await;
+        put_titled_episode(&s, 1, SHOW_B, (1, 1), "Opening").await;
+        let mut item = s.get(1).await.unwrap();
+        item.metadata.overview = Some("The old pilot.".into());
+        s.put(item).await.unwrap();
+        pin(&s, SHOW_B, "900002", NOW).await;
+        s.mark_series_reconcile(SHOW_B, NOW).await.unwrap();
+        let (_td, cache) = cache();
+        let tvdb = FakeEnricher::tvdb();
+        let pass = |cfg: MetadataConfig, now: i64| {
+            let (s, cache, tvdb) = (&s, &cache, &tvdb);
+            async move {
+                reconcile_pass(
+                    s,
+                    &sem(4),
+                    cache,
+                    None::<&FakeEnricher>,
+                    Some(tvdb),
+                    &cfg,
+                    now,
+                )
+                .await
+                .unwrap()
+            }
+        };
+
+        assert_eq!(pass(MetadataConfig::default(), NOW + 1).await, (0, false));
+        assert!(tvdb.fetched().is_empty());
+        assert_eq!(
+            s.get(1).await.unwrap().metadata.overview.as_deref(),
+            Some("The old pilot.")
+        );
+        assert_eq!(s.series_reconcile_pending(10).await.unwrap(), [(1, NOW)]);
+
+        assert_eq!(pass(apply_cfg(), NOW + 2).await, (0, true));
+        assert_eq!(
+            s.series_reconcile_pending(10).await.unwrap(),
+            [(1, NOW + 2)]
+        );
+    }
+
+    /// Each reconcile attempt is counted under its outcome, and the labels
+    /// are distinct (a dashboard contract).
+    #[tokio::test(flavor = "current_thread")]
+    async fn reconcile_attempts_are_counted_by_outcome() {
+        use metrics_util::debugging::DebuggingRecorder;
+        let recorder = DebuggingRecorder::new();
+        let snap = pharos_test_metrics::snapshotter(&recorder);
+        let _metrics = metrics::set_default_local_recorder(&recorder);
+        let s = store().await;
+        put_titled_episode(&s, 1, SHOW_B, (1, 1), "Opening").await;
+        put_titled_episode(&s, 2, "/tv/Show C", (1, 1), "Opening").await;
+        pin(&s, SHOW_B, "900002", NOW).await;
+        s.mark_reconcile_items(&[1, 2], NOW).await.unwrap();
+        let (_td, cache) = cache();
+        let tvdb = FakeEnricher::tvdb();
+        let one = |id: u64| {
+            let (s, cache, tvdb) = (&s, &cache, &tvdb);
+            async move {
+                reconcile_one(
+                    s,
+                    &sem(4),
+                    cache,
+                    None::<&FakeEnricher>,
+                    Some(tvdb),
+                    &apply_cfg(),
+                    id,
+                    NOW,
+                    NOW + 1,
+                )
+                .await
+                .unwrap()
+            }
+        };
+
+        // The show is not matched yet.
+        one(2).await;
+        // A miss the provider did not explain.
+        one(1).await;
+        let tvdb = FakeEnricher::tvdb().with_detail(enriched_overview("Found."));
+        s.mark_reconcile_items(&[1], NOW).await.unwrap();
+        reconcile_one(
+            &s,
+            &sem(4),
+            &cache,
+            None::<&FakeEnricher>,
+            Some(&tvdb),
+            &apply_cfg(),
+            1,
+            NOW,
+            NOW + 2,
+        )
+        .await
+        .unwrap();
+
+        let n = |outcome| {
+            counter_value(
+                &snap,
+                "pharos_series_reconcile_total",
+                &[("outcome", outcome)],
+            )
+        };
+        assert_eq!((n("deferred"), n("retry"), n("rebuilt")), (1, 1, 1));
+        let labels = [
+            ReconcileOutcome::Rebuilt,
+            ReconcileOutcome::Retry,
+            ReconcileOutcome::Deferred,
+            ReconcileOutcome::NoRecord,
+        ]
+        .map(ReconcileOutcome::label);
+        let distinct: std::collections::HashSet<_> = labels.iter().collect();
+        assert_eq!(distinct.len(), labels.len());
+    }
+
+    /// An episode marked for rebuild whose pinned show carries it with an
+    /// old provider text, ready to rebuild against a provider with no record.
+    async fn marked_episode_with_old_text(s: &SqliteStore) {
+        put_titled_episode(s, 1, SHOW_B, (1, 1), "Opening").await;
+        let mut item = s.get(1).await.unwrap();
+        item.title = "The Old Second".into();
+        item.metadata.overview = Some("The old pilot.".into());
+        s.put(item).await.unwrap();
+        s.set_item_match(1, "tvdb", "900001", "search", None, NOW)
+            .await
+            .unwrap();
+        pin(s, SHOW_B, "900002", NOW).await;
+        s.mark_series_reconcile(SHOW_B, NOW).await.unwrap();
+    }
+
+    /// B991 / V946 — an episode its pinned show's provider has no record of
+    /// is parked, not retried every pass: the mark clears, it counts under
+    /// `no_record`, one info line names it, it keeps its local text, and the
+    /// pending gauge settles at 0.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_episode_with_no_record_in_its_pinned_show_is_parked() {
+        use metrics_util::debugging::DebuggingRecorder;
+        let recorder = DebuggingRecorder::new();
+        let snap = pharos_test_metrics::snapshotter(&recorder);
+        let _metrics = metrics::set_default_local_recorder(&recorder);
+        let (logs, _logs_guard) = log_capture();
+        let s = store().await;
+        marked_episode_with_old_text(&s).await;
+        let (_td, cache) = cache();
+        let tvdb = FakeEnricher::tvdb().with_episode_missing();
+        let pass = |now: i64| {
+            let (s, cache, tvdb) = (&s, &cache, &tvdb);
+            async move {
+                reconcile_pass(
+                    s,
+                    &sem(4),
+                    cache,
+                    None::<&FakeEnricher>,
+                    Some(tvdb),
+                    &apply_cfg(),
+                    now,
+                )
+                .await
+                .unwrap()
+            }
+        };
+
+        pass(NOW + 10).await;
+
+        assert!(pending_ids(&s).await.is_empty(), "mark cleared");
+        let got = s.get(1).await.unwrap();
+        assert_eq!(got.title, "Opening", "local title kept");
+        assert_eq!(got.metadata.overview, None, "no provider text kept");
+        let count = |outcome| {
+            counter_value(
+                &snap,
+                "pharos_series_reconcile_total",
+                &[("outcome", outcome)],
+            )
+        };
+        assert_eq!((count("no_record"), count("retry")), (1, 0));
+
+        // The next pass finds nothing pending, asks nothing, logs nothing.
+        // Its own recorder: a snapshot never lowers a gauge to 0.
+        let settled = DebuggingRecorder::new();
+        let settled_snap = pharos_test_metrics::snapshotter(&settled);
+        {
+            let _guard = metrics::set_default_local_recorder(&settled);
+            assert_eq!(pass(NOW + 20).await, (0, false));
+        }
+        assert_eq!(tvdb.fetched(), ["900002"], "not asked again");
+        assert_eq!(
+            gauge_value(
+                &settled_snap,
+                "pharos_series_reconcile_pending",
+                &[("mode", "apply")]
+            ),
+            Some(0.0)
+        );
+        let text = logs.text();
+        let lines: Vec<_> = text.lines().filter(|l| l.contains("no_record")).collect();
+        assert_eq!(lines.len(), 1, "logged once: {text}");
+        for want in ["media.id=1", "900002", "tvdb", "season=1", "episode=1"] {
+            assert!(lines[0].contains(want), "{want} missing: {}", lines[0]);
+        }
+    }
+
+    /// B991 — a failed request is not "no such record": the episode stays
+    /// marked and is counted `retry`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_episode_whose_lookup_failed_stays_marked() {
+        use metrics_util::debugging::DebuggingRecorder;
+        let recorder = DebuggingRecorder::new();
+        let snap = pharos_test_metrics::snapshotter(&recorder);
+        let _metrics = metrics::set_default_local_recorder(&recorder);
+        let s = store().await;
+        marked_episode_with_old_text(&s).await;
+        let (_td, cache) = cache();
+        // Neither a record nor an answer about one.
+        let tvdb = FakeEnricher::tvdb();
+
+        let (n, pending) = reconcile_pass(
+            &s,
+            &sem(4),
+            &cache,
+            None::<&FakeEnricher>,
+            Some(&tvdb),
+            &apply_cfg(),
+            NOW + 10,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!((n, pending), (0, true));
+        assert_eq!(pending_ids(&s).await, [1]);
+        let count = |outcome| {
+            counter_value(
+                &snap,
+                "pharos_series_reconcile_total",
+                &[("outcome", outcome)],
+            )
+        };
+        assert_eq!((count("no_record"), count("retry")), (0, 1));
+    }
+
+    /// B991 — a parked episode is not lost: a hand re-match rebuilds it, and
+    /// its item row (stamped `search`) is re-admitted by the metadata TTL, the
+    /// show's normal refresh.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_parked_episode_is_retried_by_a_hand_rematch_and_by_the_ttl() {
+        let s = store().await;
+        marked_episode_with_old_text(&s).await;
+        let (_td, cache) = cache();
+        let missing = FakeEnricher::tvdb().with_episode_missing();
+        reconcile_pass(
+            &s,
+            &sem(4),
+            &cache,
+            None::<&FakeEnricher>,
+            Some(&missing),
+            &apply_cfg(),
+            NOW + 10,
+        )
+        .await
+        .unwrap();
+        assert!(pending_ids(&s).await.is_empty());
+
+        let due = |cutoff: i64| {
+            let s = &s;
+            async move {
+                s.items_needing_match(10, cutoff)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|i| i.id)
+                    .collect::<Vec<_>>()
+            }
+        };
+        assert!(due(NOW).await.is_empty(), "not due before the TTL");
+        assert_eq!(due(NOW + 1_000).await, [1], "due once the TTL passes");
+
+        let tvdb = FakeEnricher::tvdb().with_detail(enriched_overview("The crew moves on."));
+        let rebuilt = rebuild_now(
+            &s,
+            &sem(4),
+            &cache,
+            None::<&FakeEnricher>,
+            Some(&tvdb),
+            &apply_cfg(),
+            &[1],
+            NOW + 30,
+        )
+        .await
+        .unwrap();
+        assert_eq!(rebuilt, 1);
+        assert_eq!(
+            s.get(1).await.unwrap().metadata.overview.as_deref(),
+            Some("The crew moves on.")
+        );
+        assert!(pending_ids(&s).await.is_empty());
+    }
+
+    async fn set_version(s: &SqliteStore, key: &str, v: &str) {
+        pharos_store_sqlx::ServerConfigStore::set_named_config(s, key, v)
+            .await
+            .unwrap();
+    }
+
+    async fn version(s: &SqliteStore, key: &str) -> Option<String> {
+        pharos_store_sqlx::ServerConfigStore::load_named_config(s, key)
+            .await
+            .unwrap()
+    }
+
+    async fn gate(s: &SqliteStore, tvdb: &FakeEnricher, cfg: &MetadataConfig) {
+        let providers = SeriesProviders::<FakeEnricher, FakeEnricher> {
+            tvdb: Some(tvdb),
+            tmdb: None,
+        };
+        readmit_stale_tv_matches(s, &providers, &sem(4), cfg, NOW)
+            .await
+            .unwrap();
+    }
+
+    /// Spec 033 §6 step 3 (V940) — at version 2 only shows with conflicting
+    /// evidence are re-asked, and only under `apply`. A dry run surveys once,
+    /// logs the selection, and leaves the version at 1 so `apply` still runs.
+    /// Episodes are picked when their own old search found another show, or
+    /// when they aired outside their show's run.
+    #[tokio::test(flavor = "current_thread")]
+    async fn version_two_re_asks_only_shows_with_conflicting_evidence() {
+        let (logs, _log) = log_capture();
+        let s = store().await;
+        // SHOW_B: an exact-name rival. Its episode 1's own search found 900001,
+        // its episode 2 aired in 2007, long after the show's run.
+        put_titled_episode(&s, 1, SHOW_B, (1, 1), "Opening").await;
+        put_titled_episode(&s, 2, SHOW_B, (1, 2), "Wellspring").await;
+        s.set_item_match(1, "tvdb", "900001", "search", None, NOW)
+            .await
+            .unwrap();
+        let mut late = s.get(2).await.unwrap();
+        late.metadata.premiere_date = Some(1_173_398_400);
+        // Another show's episode: its stored title is not the file's (B985).
+        late.title = "Stray".into();
+        s.put(late).await.unwrap();
+        pin(&s, SHOW_B, "900002", NOW).await;
+        // Show F: one candidate, the match it has. Left alone.
+        put_titled_episode(&s, 3, "/tv/Show F", (1, 1), "Opening Day").await;
+        pin(&s, "/tv/Show F", "900010", NOW).await;
+        set_version(&s, TV_MATCH_VERSION_KEY, "1").await;
+        let tvdb = show_b_search(FakeEnricher::tvdb()).with_aired_list(
+            "900002",
+            // 1997-10-18 .. 1998-01-24
+            &[(1, 1, 877_132_800), (1, 2, 885_600_000)],
+        );
+
+        gate(&s, &tvdb, &MetadataConfig::default()).await;
+
+        assert_eq!(
+            version(&s, TV_MATCH_VERSION_KEY).await.as_deref(),
+            Some("1")
+        );
+        assert_eq!(
+            version(&s, TV_MATCH_SURVEY_DRY_RUN_KEY).await,
+            Some(dry_run_marker("2"))
+        );
+        assert!(s
+            .series_needing_match(10, NOW - 1)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(pending_ids(&s).await.is_empty());
+        let text = logs.text();
+        let survey = text
+            .lines()
+            .find(|l| l.contains("series identity repair: survey"))
+            .unwrap_or_else(|| panic!("no survey line in {text}"));
+        for want in [
+            "mode=\"dry_run\"",
+            "shows=1",
+            "episodes=2",
+            "Show B:exact_rival",
+        ] {
+            assert!(survey.contains(want), "{want} missing from {survey}");
+        }
+        let reask = text
+            .lines()
+            .find(|l| l.contains("series identity repair: re-ask"))
+            .unwrap_or_else(|| panic!("no re-ask line in {text}"));
+        assert!(
+            reask.contains("candidates=900001 (1971) 0.85, 900002 (1996) 0.85"),
+            "exact-name candidates missing from {reask}"
+        );
+        let searches = tvdb.searched();
+        gate(&s, &tvdb, &MetadataConfig::default()).await;
+        assert_eq!(
+            tvdb.searched(),
+            searches,
+            "a dry run surveys once per version"
+        );
+
+        gate(&s, &tvdb, &apply_cfg()).await;
+
+        assert_eq!(
+            version(&s, TV_MATCH_VERSION_KEY).await.as_deref(),
+            Some("2")
+        );
+        let reask: Vec<String> = s
+            .series_needing_match(10, NOW - 1)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|c| c.series_key)
+            .collect();
+        assert_eq!(reask, [SHOW_B]);
+        let mut pending = pending_ids(&s).await;
+        pending.sort_unstable();
+        assert_eq!(pending, [1, 2]);
+    }
+
+    /// B980: a bare folder whose files state `Show B (1996)`
+    /// but whose rows hold no stored year yet (the scan's split pass has not
+    /// written it) is still re-asked when its match premiered in 1971.
+    #[tokio::test]
+    async fn the_survey_reads_a_shows_year_from_its_files_not_the_stored_column() {
+        let (logs, _log) = log_capture();
+        let s = store().await;
+        for (id, ep) in [(1u64, 1u32), (2, 2)] {
+            put_titled_episode(&s, id, SHOW_B, (1, ep), "Part").await;
+            let mut item = s.get(id).await.unwrap();
+            item.path =
+                format!("{SHOW_B}/Season 1/Show B (1996) - S01E{ep:02} - Part {ep}.mkv").into();
+            s.put(item).await.unwrap();
+        }
+        assert_eq!(
+            s.series_needing_match(10, i64::MAX).await.unwrap()[0].series_year,
+            None,
+            "the stored column is empty"
+        );
+        pin(&s, SHOW_B, "900001", NOW).await;
+        let mut row = series_row(&s, SHOW_B).await;
+        // 1971-09-17
+        row.premiere_date = Some(53_913_600);
+        s.upsert_series_metadata(row).await.unwrap();
+        set_version(&s, TV_MATCH_VERSION_KEY, "1").await;
+        // No exact-name rival: the 1996 show is titled with its year.
+        let tvdb = FakeEnricher::tvdb()
+            .with_search(vec![
+                ("900001", "Show B", Some(1971)),
+                ("900002", "Show B (1996)", Some(1996)),
+            ])
+            .with_detail(enriched_overview("A scattered crew."));
+
+        gate(&s, &tvdb, &MetadataConfig::default()).await;
+
+        let text = logs.text();
+        let survey = text
+            .lines()
+            .find(|l| l.contains("series identity repair: survey"))
+            .unwrap_or_else(|| panic!("no survey line in {text}"));
+        assert!(survey.contains("Show B:year_mismatch"), "{survey}");
+    }
+
+    /// B982 — the run window is the show's whole run, not the span of the
+    /// seasons the provider listed: an absolute-numbered episode of a show
+    /// still airing is no `outside_run`, while an ended show's run still
+    /// bounds a late episode.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_run_window_covers_a_shows_whole_run() {
+        use crate::online_enrich::SeriesRun;
+        let s = store().await;
+        const SHOW_D: &str = "/tv/Show D";
+        const SHOW_C: &str = "/tv/Show C";
+        put_titled_episode(&s, 1, SHOW_D, (1, 1), "The First Step").await;
+        put_titled_episode(&s, 2, SHOW_D, (1, 1050), "The Last Step").await;
+        put_titled_episode(&s, 3, SHOW_C, (1, 1), "The Old Second").await;
+        put_titled_episode(&s, 4, SHOW_C, (1, 2), "The Quiet Hours").await;
+        for (id, aired) in [
+            (1, 719_539_200),   // 1992-10-20
+            (2, 1_452_211_200), // 2016-01-08
+            (3, 118_108_800),   // 1973-09-28
+            (4, 1_173_398_400), // 2007-03-09
+        ] {
+            let mut item = s.get(id).await.unwrap();
+            item.metadata.premiere_date = Some(aired);
+            if id == 4 {
+                // The 2007 remake's episode on a 1973 file (B931, B985).
+                item.title = "The Late Hour".into();
+            }
+            s.put(item).await.unwrap();
+        }
+        pin(&s, SHOW_D, "900014", NOW).await;
+        pin(&s, SHOW_C, "900006", NOW).await;
+        let tvdb = FakeEnricher::tvdb()
+            // Season 1 as the provider numbers it: 1992-10-20 .. 1993-03-15.
+            .with_aired_list("900014", &[(1, 1, 719_539_200), (1, 8, 732_153_600)])
+            .with_run(
+                "900014",
+                SeriesRun {
+                    first: Some(719_539_200),
+                    last: Some(1_541_116_800),
+                    ongoing: true,
+                },
+            )
+            .with_aired_list("900006", &[(1, 1, 118_108_800)])
+            .with_run(
+                "900006",
+                SeriesRun {
+                    first: Some(118_108_800),
+                    last: Some(125_280_000), // 1973-12-21
+                    ongoing: false,
+                },
+            );
+        let providers = SeriesProviders::<FakeEnricher, FakeEnricher> {
+            tvdb: Some(&tvdb),
+            tmdb: None,
+        };
+
+        let survey = survey_series_identity(&s, &providers, &sem(4), &MetadataConfig::default())
+            .await
+            .unwrap();
+
+        assert_eq!(survey.episodes, [(4, RepairReason::OutsideRun)]);
+    }
+
+    /// B984 — an episode stored with air date 0 (an NFO's `1970-01-01`
+    /// placeholder) is no evidence of airing outside its show's run.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_air_date_of_zero_is_not_outside_the_run() {
+        use crate::online_enrich::SeriesRun;
+        let s = store().await;
+        const SHOW_D: &str = "/tv/Show D";
+        put_titled_episode(&s, 1, SHOW_D, (10, 1), "Sudden Notice").await;
+        put_titled_episode(&s, 2, SHOW_D, (1, 1), "The First Step").await;
+        for (id, aired) in [(1, 0), (2, 719_539_200)] {
+            let mut item = s.get(id).await.unwrap();
+            item.metadata.premiere_date = Some(aired);
+            s.put(item).await.unwrap();
+        }
+        pin(&s, SHOW_D, "900014", NOW).await;
+        let tvdb = FakeEnricher::tvdb()
+            .with_aired_list("900014", &[(1, 1, 719_539_200)])
+            .with_run(
+                "900014",
+                SeriesRun {
+                    first: Some(719_539_200),
+                    last: Some(1_541_116_800),
+                    ongoing: true,
+                },
+            );
+        let providers = SeriesProviders::<FakeEnricher, FakeEnricher> {
+            tvdb: Some(&tvdb),
+            tmdb: None,
+        };
+
+        let survey = survey_series_identity(&s, &providers, &sem(4), &MetadataConfig::default())
+            .await
+            .unwrap();
+
+        assert_eq!(survey.episodes, []);
+    }
+
+    /// B985 — an episode dated outside its show's run whose file names the
+    /// title stored for it is the right episode with an odd date (a later
+    /// release, a re-air); only a disagreeing or untitled file is marked.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_outside_run_episode_whose_title_agrees_is_not_marked() {
+        use crate::online_enrich::SeriesRun;
+        let (logs, _log) = log_capture();
+        let s = store().await;
+        const GT: &str = "/tv/Show E";
+        put_titled_episode(&s, 1, GT, (2, 1), "The Gambit").await;
+        put_titled_episode(&s, 2, GT, (2, 2), "Quiet Strength").await;
+        put_titled_episode(&s, 3, GT, (2, 3), "untitled").await;
+        put_titled_episode(&s, 4, GT, (1, 1), "The Long Wish").await;
+        put_titled_episode(&s, 5, GT, (2, 5), "The Open Secret").await;
+        for (id, aired) in [
+            (1, 1_113_091_200), // 2005-04-10
+            (2, 1_113_091_200),
+            (3, 1_113_091_200),
+            (4, 602_812_800), // 1989-02-07
+            (5, 1_113_091_200),
+        ] {
+            let mut item = s.get(id).await.unwrap();
+            item.metadata.premiere_date = Some(aired);
+            match id {
+                2 => item.title = "Terms of Trade".into(),
+                3 => item.path = format!("{GT}/Season 2/Show E - S02E03.mkv").into(),
+                // The local resolver's title, taken from the file name.
+                5 => item.title = "Show E - S02E05 - The Open Secret".into(),
+                _ => {}
+            }
+            s.put(item).await.unwrap();
+        }
+        pin(&s, GT, "900011", NOW).await;
+        let tvdb = FakeEnricher::tvdb()
+            .with_aired_list("900011", &[(1, 1, 602_812_800)])
+            .with_run(
+                "900011",
+                SeriesRun {
+                    first: Some(602_812_800),
+                    last: Some(658_972_800), // 1990-11-19
+                    ongoing: false,
+                },
+            );
+        let providers = SeriesProviders::<FakeEnricher, FakeEnricher> {
+            tvdb: Some(&tvdb),
+            tmdb: None,
+        };
+
+        let survey = survey_series_identity(&s, &providers, &sem(4), &MetadataConfig::default())
+            .await
+            .unwrap();
+
+        let mut marked: Vec<u64> = survey.episodes.iter().map(|(id, _)| *id).collect();
+        marked.sort_unstable();
+        assert_eq!(marked, [2, 3, 5]);
+        let text = logs.text();
+        let line = text
+            .lines()
+            .find(|l| l.contains("outside the run, titles agree"))
+            .unwrap_or_else(|| panic!("no titles-agree line in {text}"));
+        assert!(line.contains("episodes=1"), "{line}");
+    }
+
+    /// B986 — a four-season show matched to its pilot miniseries (a run of
+    /// two days) is re-asked as `run_too_short`, and its episodes are not
+    /// selected against the miniseries meanwhile; a one-season show on a
+    /// short run is left alone.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_series_matched_to_a_miniseries_is_re_asked() {
+        use crate::online_enrich::SeriesRun;
+        let s = store().await;
+        const SHOW_B_REMAKE: &str = "/tv/Show B (1996)";
+        const MINI: &str = "/tv/Show H";
+        let mut id = 0;
+        for season in 1..=4 {
+            id += 1;
+            put_titled_episode(&s, id, SHOW_B_REMAKE, (season, 1), "Slow Start").await;
+            let mut item = s.get(id).await.unwrap();
+            item.title = "Night 1".into();
+            // 1998-01-14 onwards, a season a year.
+            item.metadata.premiere_date = Some(884_736_000 + i64::from(season) * 31_536_000);
+            s.put(item).await.unwrap();
+        }
+        put_titled_episode(&s, 9, MINI, (1, 1), "Step One").await;
+        pin(&s, SHOW_B_REMAKE, "900003", NOW).await;
+        pin(&s, MINI, "900012", NOW).await;
+        let night = |first: i64, last: i64| SeriesRun {
+            first: Some(first),
+            last: Some(last),
+            ongoing: false,
+        };
+        let tvdb = FakeEnricher::tvdb()
+            // 1996-12-08 .. 1996-12-09
+            .with_aired_list("900003", &[(1, 1, 850_003_200), (1, 2, 850_089_600)])
+            .with_run("900003", night(850_003_200, 850_089_600))
+            .with_aired_list("900012", &[(1, 1, 779_673_600)])
+            .with_run("900012", night(779_673_600, 782_697_600));
+        let providers = SeriesProviders::<FakeEnricher, FakeEnricher> {
+            tvdb: Some(&tvdb),
+            tmdb: None,
+        };
+
+        let survey = survey_series_identity(&s, &providers, &sem(4), &MetadataConfig::default())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            survey.reask.get(SHOW_B_REMAKE),
+            Some(&RepairReason::RunTooShort),
+            "{:?}",
+            survey.reask
+        );
+        assert!(!survey.reask.contains_key(MINI), "{:?}", survey.reask);
+        assert_eq!(survey.episodes, []);
+    }
+
+    /// A dry run surveys again when the survey revision moved under the same
+    /// matcher version (a marker from before revisions, or another revision),
+    /// and not while the marker is current.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_dry_run_surveys_again_after_a_survey_revision_bump() {
+        let s = store().await;
+        put_titled_episode(&s, 1, SHOW_B, (1, 1), "Opening").await;
+        pin(&s, SHOW_B, "900002", NOW).await;
+        set_version(&s, TV_MATCH_VERSION_KEY, "1").await;
+        let tvdb = show_b_search(FakeEnricher::tvdb());
+        let current = dry_run_marker(&TV_MATCH_VERSION.to_string());
+
+        for stale in ["2", "2.r1"] {
+            set_version(&s, TV_MATCH_SURVEY_DRY_RUN_KEY, stale).await;
+            let searches = tvdb.searched();
+            gate(&s, &tvdb, &MetadataConfig::default()).await;
+            assert!(
+                tvdb.searched() > searches,
+                "marker {stale} was not re-surveyed"
+            );
+            assert_eq!(
+                version(&s, TV_MATCH_SURVEY_DRY_RUN_KEY).await,
+                Some(current.clone())
+            );
+        }
+
+        let searches = tvdb.searched();
+        gate(&s, &tvdb, &MetadataConfig::default()).await;
+        assert_eq!(
+            tvdb.searched(),
+            searches,
+            "a current marker surveys nothing"
+        );
+        assert_eq!(
+            version(&s, TV_MATCH_VERSION_KEY).await.as_deref(),
+            Some("1"),
+            "a dry run never records the matcher version"
+        );
+    }
+
+    async fn flagged_pin(s: &SqliteStore, key: &str, id: &str) {
+        s.upsert_series_metadata(SeriesMetadata {
+            series_key: key.into(),
+            series_name: key.rsplit('/').next().unwrap_or(key).into(),
+            match_provider: Some("tvdb".into()),
+            match_external_id: Some(id.into()),
+            match_source: Some("search".into()),
+            metadata_refreshed_at: Some(NOW),
+            match_flag: Some(AMBIGUOUS_FLAG.into()),
+            match_runner_up_id: Some("900001".into()),
+            match_runner_up_score: Some(0.85),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    }
+
+    async fn hand_pin(
+        s: &SqliteStore,
+        cache: &ImageCache,
+        tvdb: &FakeEnricher,
+        pick: Option<(&str, &str)>,
+    ) -> Option<HandPin> {
+        pin_series_by_hand(
+            s,
+            &sem(4),
+            cache,
+            None::<&FakeEnricher>,
+            Some(tvdb),
+            SHOW_B,
+            "Show B",
+            pick,
+            NOW + 10,
+        )
+        .await
+        .unwrap()
+    }
+
+    /// Spec 033 §7 (V896) — confirming a flagged guess keeps the match,
+    /// clears the flag and makes it manual, so the refresh TTL never
+    /// re-admits it; there is nothing to confirm on an unmatched show.
+    #[tokio::test(flavor = "current_thread")]
+    async fn confirming_a_flagged_show_makes_its_match_manual() {
+        let s = store().await;
+        let (_td, cache) = cache();
+        let tvdb = FakeEnricher::tvdb();
+        assert_eq!(hand_pin(&s, &cache, &tvdb, None).await, None);
+        put_titled_episode(&s, 1, SHOW_B, (1, 1), "Opening").await;
+        flagged_pin(&s, SHOW_B, "900002").await;
+
+        let pin = hand_pin(&s, &cache, &tvdb, None).await;
+
+        assert_eq!(
+            pin,
+            Some(HandPin {
+                old: Some("tvdb:900002".into()),
+                new: "tvdb:900002".into(),
+            })
+        );
+        let row = series_row(&s, SHOW_B).await;
+        assert_eq!(row.match_source.as_deref(), Some("manual"));
+        assert_eq!(row.match_external_id.as_deref(), Some("900002"));
+        assert_eq!(row.match_flag, None);
+        assert_eq!(row.match_runner_up_id, None);
+        assert!(s
+            .series_needing_match(10, i64::MAX)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(tvdb.fetched().is_empty(), "a confirm fetches nothing");
+        assert!(pending_ids(&s).await.is_empty(), "the match did not move");
+    }
+
+    /// Spec 033 §7 (V896) — picking another show writes its record as a
+    /// manual match with the flag cleared and marks the show's episodes,
+    /// since their text came from the old show.
+    #[tokio::test(flavor = "current_thread")]
+    async fn picking_a_show_by_hand_pins_it_and_marks_its_episodes() {
+        let s = store().await;
+        let (_td, cache) = cache();
+        put_titled_episode(&s, 1, SHOW_B, (1, 1), "Opening").await;
+        flagged_pin(&s, SHOW_B, "900001").await;
+        let tvdb = FakeEnricher::tvdb().with_detail(enriched_overview("A scattered crew."));
+
+        let pin = hand_pin(&s, &cache, &tvdb, Some(("tvdb", "900002"))).await;
+
+        assert_eq!(
+            pin,
+            Some(HandPin {
+                old: Some("tvdb:900001".into()),
+                new: "tvdb:900002".into(),
+            })
+        );
+        assert_eq!(tvdb.fetched(), ["900002"]);
+        let row = series_row(&s, SHOW_B).await;
+        assert_eq!(row.match_source.as_deref(), Some("manual"));
+        assert_eq!(row.match_external_id.as_deref(), Some("900002"));
+        assert_eq!(row.overview.as_deref(), Some("A scattered crew."));
+        assert_eq!(row.match_flag, None);
+        assert_eq!(pending_ids(&s).await, [1]);
+
+        let missing = FakeEnricher::tvdb();
+        assert_eq!(
+            hand_pin(&s, &cache, &missing, Some(("tvdb", "1"))).await,
+            None,
+            "a record that did not arrive writes nothing"
+        );
+        assert_eq!(
+            series_row(&s, SHOW_B).await.match_external_id.as_deref(),
+            Some("900002")
+        );
+    }
+
+    /// Spec 033 §7 — a hand fix rebuilds its episodes at once, even in a
+    /// dry run, where the background pass rebuilds nothing.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_hand_fix_rebuilds_its_episodes_in_a_dry_run() {
+        let s = store().await;
+        let (_td, cache) = cache();
+        put_titled_episode(&s, 1, SHOW_B, (1, 1), "Opening").await;
+        let mut item = s.get(1).await.unwrap();
+        item.metadata.overview = Some("The old pilot.".into());
+        s.put(item).await.unwrap();
+        pin(&s, SHOW_B, "900002", NOW).await;
+        let tvdb = FakeEnricher::tvdb().with_detail(enriched_overview("The new pilot."));
+
+        let rebuilt = rebuild_now(
+            &s,
+            &sem(4),
+            &cache,
+            None::<&FakeEnricher>,
+            Some(&tvdb),
+            &MetadataConfig::default(),
+            &[1],
+            NOW,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(rebuilt, 1);
+        assert_eq!(
+            s.get(1).await.unwrap().metadata.overview.as_deref(),
+            Some("The new pilot.")
+        );
+        assert!(pending_ids(&s).await.is_empty());
+    }
+
+    const SHOW_A: &str = "/tv/Show A";
+
+    /// Show A folder: an unyeared Season 1 file titled like the 1983 show's
+    /// pilot, a Season 3 file stating 2007, and the stored 1983 match.
+    async fn show_a_folder(s: &SqliteStore) {
+        put_titled_episode(s, 1, SHOW_A, (1, 1), "Pilot").await;
+        let mut modern = MediaItem {
+            id: 2,
+            path: format!("{SHOW_A}/Season 3/Show A (2007) - S03E01 - The Third Way.mkv").into(),
+            title: "The Third Way".into(),
+            kind: MediaKind::Episode,
+            ..MediaItem::default()
+        };
+        modern.series = Some(pharos_core::SeriesInfo {
+            series_name: "Show A".into(),
+            season_number: Some(3),
+            episode_number: Some(1),
+            series_folder: Some(SHOW_A.into()),
+            series_year: None,
+            series_key: None,
+        });
+        s.put(modern).await.unwrap();
+        s.upsert_series_metadata(SeriesMetadata {
+            series_key: SHOW_A.into(),
+            series_name: "Show A".into(),
+            match_provider: Some("tvdb".into()),
+            match_external_id: Some("900004".into()),
+            match_source: Some("search".into()),
+            premiere_date: Some(432_864_000), // 1983-09-20
+            metadata_refreshed_at: Some(NOW),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        set_version(s, TV_MATCH_VERSION_KEY, "1").await;
+    }
+
+    fn show_a_tvdb() -> FakeEnricher {
+        FakeEnricher::tvdb()
+            .with_search(vec![
+                ("900005", "Show A", Some(2007)),
+                ("900004", "Show A", Some(1983)),
+            ])
+            .with_list("900005", &[(1, 1, "The New Start")])
+            .with_list("900004", &[(1, 1, "Pilot")])
+    }
+
+    /// Spec 033 §2 (V893, B932) — the survey finds the unyeared file whose
+    /// title is the 1983 show's pilot, not the 2007 show's. A dry run only
+    /// logs it; `apply` records the file's `scanner` row with 1983 and the
+    /// owner row keeping the folder key for the stored 1983 match, marks the
+    /// file, and neither re-asks the folder nor marks the 2007 file before
+    /// the scan has split them.
+    #[tokio::test(flavor = "current_thread")]
+    async fn episode_titles_split_off_a_same_named_shows_files() {
+        use metrics_util::debugging::DebuggingRecorder;
+        let recorder = DebuggingRecorder::new();
+        let snap = pharos_test_metrics::snapshotter(&recorder);
+        let _metrics = metrics::set_default_local_recorder(&recorder);
+        let (logs, _log) = log_capture();
+        let s = store().await;
+        show_a_folder(&s).await;
+        let tvdb = show_a_tvdb();
+
+        gate(&s, &tvdb, &MetadataConfig::default()).await;
+        assert!(s
+            .series_overrides(&[SHOW_A.into()])
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(pending_ids(&s).await.is_empty());
+        let text = logs.text();
+        let line = text
+            .lines()
+            .find(|l| l.contains("file's episode title names a same-named show"))
+            .unwrap_or_else(|| panic!("no title evidence line in {text}"));
+        for want in [
+            "rival_id=\"900004\"",
+            "rival_year=1983",
+            "own_title=\"The New Start\"",
+        ] {
+            assert!(line.contains(want), "{want} missing from {line}");
+        }
+        assert_eq!(
+            gauge_value(
+                &snap,
+                "pharos_series_identity_repair_selected",
+                &[
+                    ("kind", "episode"),
+                    ("reason", "episode_titles"),
+                    ("mode", "dry_run")
+                ]
+            ),
+            Some(1.0)
+        );
+
+        gate(&s, &tvdb, &apply_cfg()).await;
+        let mut rows = s.series_overrides(&[SHOW_A.into()]).await.unwrap();
+        rows.sort_by_key(|o| o.path.is_some());
+        let got: Vec<_> = rows
+            .iter()
+            .map(|o| (o.path.clone(), o.target_year, o.source))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (None, Some(1983), pharos_core::OverrideSource::Scanner),
+                (
+                    Some(format!("{SHOW_A}/Season 1/Show A - S01E01 - Pilot.mkv")),
+                    Some(1983),
+                    pharos_core::OverrideSource::Scanner
+                ),
+            ]
+        );
+        assert_eq!(pending_ids(&s).await, [1]);
+        assert!(s
+            .series_needing_match(10, NOW - 1)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            version(&s, TV_MATCH_VERSION_KEY).await.as_deref(),
+            Some("2")
+        );
+    }
+
+    /// A bare folder holding a 1991 show and its 2015 remake (B987):
+    /// S01E01 "Pilot" names both shows' pilots, so it does not move, but it
+    /// joins the 1991 owner while its stored episode may be the 2015 show's.
+    async fn remake_folder_with_pilot(s: &SqliteStore, pilot_aired: i64) {
+        put_titled_episode(s, 1, SHOW_A, (1, 1), "Pilot").await;
+        let mut pilot = s.get(1).await.unwrap();
+        pilot.metadata.premiere_date = Some(pilot_aired);
+        s.put(pilot).await.unwrap();
+        put_titled_episode(s, 3, SHOW_A, (1, 2), "The Old Second").await;
+        let mut modern = MediaItem {
+            id: 2,
+            path: format!("{SHOW_A}/Season 3/Show A (2015) - S03E01 - The New Start.mkv").into(),
+            title: "The New Start".into(),
+            kind: MediaKind::Episode,
+            ..MediaItem::default()
+        };
+        modern.series = Some(pharos_core::SeriesInfo {
+            series_name: "Show A".into(),
+            season_number: Some(3),
+            episode_number: Some(1),
+            series_folder: Some(SHOW_A.into()),
+            series_year: None,
+            series_key: None,
+        });
+        s.put(modern).await.unwrap();
+        s.upsert_series_metadata(SeriesMetadata {
+            series_key: SHOW_A.into(),
+            series_name: "Show A".into(),
+            match_provider: Some("tvdb".into()),
+            match_external_id: Some("900091".into()),
+            match_source: Some("search".into()),
+            premiere_date: Some(PILOT_1991),
+            metadata_refreshed_at: Some(NOW),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        set_version(s, TV_MATCH_VERSION_KEY, "1").await;
+    }
+
+    const PILOT_2015: i64 = 1_425_340_800; // 2015-03-03
+    const PILOT_1991: i64 = 670_550_400; // 1991-04-02
+
+    fn remake_tvdb_dated() -> FakeEnricher {
+        FakeEnricher::tvdb()
+            .with_search(vec![
+                ("900015", "Show A", Some(2015)),
+                ("900091", "Show A", Some(1991)),
+            ])
+            .with_dated_list(
+                "900015",
+                &[
+                    (1, 1, "Pilot", PILOT_2015),
+                    (1, 2, "The New Second", 1_425_945_600),
+                ],
+            )
+            .with_dated_list(
+                "900091",
+                &[
+                    (1, 1, "Pilot", PILOT_1991),
+                    (1, 2, "The Old Second", 671_155_200),
+                ],
+            )
+    }
+
+    /// B987 — a file that stays with a title split's owner, whose show is not
+    /// the year the folder's files state, holds the other show's episode: it
+    /// is marked with the moved files, and the dry run names it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_file_joining_the_owner_with_the_other_shows_episode_is_rebuilt() {
+        let (logs, _log) = log_capture();
+        let s = store().await;
+        remake_folder_with_pilot(&s, PILOT_2015).await;
+        let tvdb = remake_tvdb_dated();
+
+        gate(&s, &tvdb, &MetadataConfig::default()).await;
+        let text = logs.text();
+        let line = text
+            .lines()
+            .find(|l| l.contains("joins the owner's show holding another show's episode"))
+            .unwrap_or_else(|| panic!("no owner joiner line in {text}"));
+        for want in [
+            "S01E01 - Pilot.mkv",
+            "owner_id=\"900091\"",
+            "owner_year=1991",
+            &format!("stored_aired={PILOT_2015}"),
+            &format!("owner_aired={PILOT_1991}"),
+        ] {
+            assert!(line.contains(want), "{want} missing from {line}");
+        }
+
+        gate(&s, &tvdb, &apply_cfg()).await;
+        assert_eq!(pending_ids(&s).await, [1, 3]);
+    }
+
+    /// B987 — the same file already holding the owner's episode is left alone.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_file_joining_the_owner_with_its_episode_is_not_rebuilt() {
+        let (logs, _log) = log_capture();
+        let s = store().await;
+        remake_folder_with_pilot(&s, PILOT_1991).await;
+        let tvdb = remake_tvdb_dated();
+
+        gate(&s, &tvdb, &apply_cfg()).await;
+        assert_eq!(pending_ids(&s).await, [3]);
+        assert!(!logs.text().contains("joins the owner's show"));
+    }
+
+    /// A row the scanner moved to a key with no match row yet is not rebuilt:
+    /// it stays marked, behind the rest, until its new show is matched.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_moved_episode_waits_for_its_new_shows_match() {
+        let s = store().await;
+        put_titled_episode(&s, 1, SHOW_A, (3, 1), "The Third Way").await;
+        let mut item = s.get(1).await.unwrap();
+        item.metadata.overview = Some("new text".into());
+        if let Some(series) = item.series.as_mut() {
+            series.series_key = Some(format!("{SHOW_A}\u{1f}2007"));
+        }
+        s.put(item).await.unwrap();
+        s.mark_reconcile_items(&[1], NOW).await.unwrap();
+        let (_td, cache) = cache();
+        let tvdb = FakeEnricher::tvdb();
+
+        let (n, pending) = reconcile_pass(
+            &s,
+            &sem(4),
+            &cache,
+            None::<&FakeEnricher>,
+            Some(&tvdb),
+            &apply_cfg(),
+            NOW + 5,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!((n, pending), (0, true));
+        assert!(tvdb.fetched().is_empty());
+        assert_eq!(
+            s.get(1).await.unwrap().metadata.overview.as_deref(),
+            Some("new text")
+        );
+        assert_eq!(
+            s.series_reconcile_pending(10).await.unwrap(),
+            [(1, NOW + 5)]
+        );
+    }
+
+    /// The pre-B557 install with no version recorded still re-admits every
+    /// searched show, as version 1 did.
+    #[tokio::test]
+    async fn an_unrecorded_matcher_version_still_re_admits_every_searched_show() {
+        let s = store().await;
+        put_episode(&s, 1, "Show F", "/tv/Show F").await;
+        pin(&s, "/tv/Show F", "900010", NOW).await;
+        readmit(&s).await;
+        assert_eq!(s.series_needing_match(10, NOW - 1).await.unwrap().len(), 1);
+        assert_eq!(
+            version(&s, TV_MATCH_VERSION_KEY).await.as_deref(),
+            Some("2")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_show_with_no_candidate_is_counted_as_no_match() {
+        use metrics_util::debugging::DebuggingRecorder;
+        let recorder = DebuggingRecorder::new();
+        let snap = pharos_test_metrics::snapshotter(&recorder);
+        let _metrics = metrics::set_default_local_recorder(&recorder);
+        let s = store().await;
+        put_episode(&s, 1, "Obscure Show", "/tv/Obscure Show").await;
+        let (_td, cache) = cache();
+        let tvdb = FakeEnricher::tvdb().with_search(vec![("1", "Something Else", None)]);
+        let tmdb = FakeEnricher::tmdb();
+        enrich_series_pass(
+            &s,
+            &sem(4),
+            &cache,
+            Some(&tvdb),
+            Some(&tmdb),
+            &MetadataConfig::default(),
+            NOW,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            counter_value(
+                &snap,
+                "pharos_series_match_total",
+                &[("outcome", "no_match"), ("decided_by", "none")]
+            ),
+            1,
+            "two providers asked, one show counted"
+        );
+    }
+
+    async fn pin_series(store: &SqliteStore, key: &str, id: &str) {
+        store
+            .upsert_series_metadata(SeriesMetadata {
+                series_key: key.into(),
+                series_name: key.rsplit('/').next().unwrap_or(key).into(),
+                match_provider: Some("tvdb".into()),
+                match_external_id: Some(id.into()),
+                match_source: Some("search".into()),
+                metadata_refreshed_at: Some(NOW),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+    }
+
+    /// A Show C (1973) episode whose NFO id's record belongs to show
+    /// `record_series`; the folder is pinned to the 1973 show (900006).
+    async fn show_c_episode_with_record_of(
+        record_series: &str,
+    ) -> (u64, LogBuf, MediaItem, Vec<String>) {
+        use metrics_util::debugging::DebuggingRecorder;
+        let recorder = DebuggingRecorder::new();
+        let snap = pharos_test_metrics::snapshotter(&recorder);
+        let _metrics = metrics::set_default_local_recorder(&recorder);
+        let (logs, _log) = log_capture();
+        let s = store().await;
+        pin_series(&s, "/tv/Show C", "900006").await;
+        let mut item = MediaItem {
+            id: 7,
+            path: "/tv/Show C/Season 01/Show C - S01E01.mkv".into(),
+            title: "The New Start".into(),
+            kind: MediaKind::Episode,
+            series: Some(pharos_core::SeriesInfo {
+                series_name: "Show C".into(),
+                season_number: Some(1),
+                episode_number: Some(1),
+                series_folder: Some("/tv/Show C".into()),
+                series_year: None,
+                series_key: None,
+            }),
+            ..MediaItem::default()
+        };
+        item.metadata.overview = Some("The new premiere.".into());
+        // A Jellyfin episode NFO's own TVDB id, of the remake's episode.
+        item.metadata.provider_ids.tvdb = Some("900009".into());
+        item.metadata.provider_ids.imdb = Some("tt900001".into());
+        s.put(item.clone()).await.unwrap();
+        let (_td, cache) = cache();
+        let tvdb = FakeEnricher::tvdb()
+            .with_detail_for(
+                "900009",
+                EnrichedMetadata {
+                    title: Some("The New Start".into()),
+                    overview: Some("The new premiere.".into()),
+                    series_id: Some(record_series.into()),
+                    ..EnrichedMetadata::default()
+                },
+            )
+            .with_detail_for(
+                "900006",
+                EnrichedMetadata {
+                    title: Some("The Old Second".into()),
+                    overview: Some("The old premiere.".into()),
+                    episode_number: Some((1, 1)),
+                    series_id: Some("900006".into()),
+                    ..EnrichedMetadata::default()
+                },
+            );
+        enrich_one(
+            &s,
+            &sem(4),
+            &cache,
+            None::<&FakeEnricher>,
+            Some(&tvdb),
+            &MetadataConfig::default(),
+            item,
+            NOW,
+        )
+        .await
+        .unwrap();
+        let n = counter_value(
+            &snap,
+            "pharos_episode_metadata_rejected_total",
+            &[("reason", "nfo_other_series")],
+        );
+        (n, logs, s.get(7).await.unwrap(), tvdb.fetched())
+    }
+
+    /// Spec 033 V892 (B931) — the Show C (1973) folder is matched to the 1973
+    /// show, but its episode NFOs carry the 2007 remake's ids. The NFO's
+    /// record is set aside with its text and ids, the episode is read from
+    /// the pinned show by number, and the rejection is counted and logged.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_episode_nfo_of_another_series_is_set_aside() {
+        let (n, logs, ep, fetched) = show_c_episode_with_record_of("900007").await;
+        assert_eq!(n, 1);
+        assert_eq!(fetched, vec!["900009", "900006"]);
+        assert_eq!(ep.title, "The Old Second");
+        assert_eq!(ep.metadata.overview.as_deref(), Some("The old premiere."));
+        assert_eq!(ep.metadata.provider_ids.imdb, None, "the remake's ids go");
+        assert_ne!(ep.metadata.provider_ids.tvdb.as_deref(), Some("900009"));
+        assert_eq!(ep.match_source.as_deref(), Some("search"));
+        assert_eq!(ep.match_external_id.as_deref(), Some("900006"));
+        let text = logs.text();
+        let line = text
+            .lines()
+            .find(|l| l.contains("names another series"))
+            .unwrap_or_else(|| panic!("no rejection line in {text}"));
+        for want in [
+            "record_series_id=\"900007\"",
+            "pinned_series_id=900006",
+            "nfo_id=900009",
+            "reason=\"nfo_other_series\"",
+            "Show C - S01E01.mkv",
+        ] {
+            assert!(line.contains(want), "{want} missing from {line}");
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_episode_nfo_of_its_own_show_is_used() {
+        let (n, _, ep, fetched) = show_c_episode_with_record_of("900006").await;
+        assert_eq!(n, 0);
+        assert_eq!(fetched, vec!["900009"]);
+        assert_eq!(ep.match_source.as_deref(), Some("nfo_id"));
+        assert_eq!(ep.metadata.provider_ids.tvdb.as_deref(), Some("900009"));
+    }
+
+    /// V892 (B933) — an episode never searches on its own: it is read from
+    /// its show's pinned match by number, whatever a search would say.
+    #[tokio::test]
+    async fn an_episode_is_read_from_its_shows_pinned_match_not_searched() {
+        let s = store().await;
+        put_bare_episode(&s, 41, "Show I", "/tv/Show I").await;
+        pin_series(&s, "/tv/Show I", "900013").await;
+        let (_td, cache) = cache();
+        let tvdb = FakeEnricher::tvdb()
+            .with_search(vec![("999", "Show J", None)])
+            .with_detail(EnrichedMetadata {
+                title: Some("Twice Told".into()),
+                series_id: Some("900013".into()),
+                ..EnrichedMetadata::default()
+            });
+        let item = s.get(41).await.unwrap();
+        assert!(enrich_one(
+            &s,
+            &sem(4),
+            &cache,
+            None::<&FakeEnricher>,
+            Some(&tvdb),
+            &MetadataConfig::default(),
+            item,
+            NOW,
+        )
+        .await
+        .unwrap());
+        assert_eq!(tvdb.fetched(), vec!["900013"]);
+        let ep = s.get(41).await.unwrap();
+        assert_eq!(ep.match_external_id.as_deref(), Some("900013"));
+    }
+
+    /// V892 — a show pinned on TMDB (TVDB had no match) has its episodes read
+    /// from TMDB even when TVDB is configured.
+    #[tokio::test]
+    async fn an_episode_uses_its_shows_pinned_provider() {
+        let s = store().await;
+        put_bare_episode(&s, 42, "Show G", "/tv/Show G").await;
+        s.upsert_series_metadata(SeriesMetadata {
+            series_key: "/tv/Show G".into(),
+            series_name: "Show G".into(),
+            match_provider: Some("tmdb".into()),
+            match_external_id: Some("900015".into()),
+            match_source: Some("search".into()),
+            metadata_refreshed_at: Some(NOW),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let (_td, cache) = cache();
+        let tvdb = FakeEnricher::tvdb().with_detail(EnrichedMetadata::default());
+        let tmdb = FakeEnricher::tmdb().with_detail(EnrichedMetadata {
+            title: Some("Renewal".into()),
+            series_id: Some("900015".into()),
+            ..EnrichedMetadata::default()
+        });
+        let item = s.get(42).await.unwrap();
+        enrich_one(
+            &s,
+            &sem(4),
+            &cache,
+            Some(&tmdb),
+            Some(&tvdb),
+            &MetadataConfig::default(),
+            item,
+            NOW,
+        )
+        .await
+        .unwrap();
+        assert!(tvdb.fetched().is_empty());
+        assert_eq!(tmdb.fetched(), vec!["900015"]);
+        let ep = s.get(42).await.unwrap();
+        assert_eq!(ep.match_provider.as_deref(), Some("tmdb"));
+    }
+
+    /// V892 — a show matched to nothing has its episodes matched to nothing,
+    /// without a provider call.
+    #[tokio::test]
+    async fn an_episode_of_an_unmatched_show_is_matched_to_nothing() {
+        let s = store().await;
+        put_bare_episode(&s, 43, "Home Movies", "/tv/Home Movies").await;
+        s.upsert_series_metadata(SeriesMetadata {
+            series_key: "/tv/Home Movies".into(),
+            series_name: "Home Movies".into(),
+            match_provider: Some("tvdb".into()),
+            match_source: Some("none".into()),
+            metadata_refreshed_at: Some(NOW),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let (_td, cache) = cache();
+        let tvdb = FakeEnricher::tvdb().with_search(vec![("1", "Home Movies", None)]);
+        let item = s.get(43).await.unwrap();
+        assert!(!enrich_one(
+            &s,
+            &sem(4),
+            &cache,
+            None::<&FakeEnricher>,
+            Some(&tvdb),
+            &MetadataConfig::default(),
+            item,
+            NOW,
+        )
+        .await
+        .unwrap());
+        assert!(tvdb.fetched().is_empty());
+        assert_eq!(
+            s.get(43).await.unwrap().match_source.as_deref(),
+            Some("none")
+        );
+    }
+
+    /// V892 — an episode waits for its show: it is not eligible until the
+    /// show has a match row, and then it is.
+    #[tokio::test]
+    async fn an_episode_waits_until_its_show_is_matched() {
+        let s = store().await;
+        put_bare_episode(&s, 44, "Show C", "/tv/Show C").await;
+        let eligible = |items: Vec<MediaItem>| items.iter().any(|i| i.id == 44);
+        assert!(!eligible(s.items_needing_match(100, NOW).await.unwrap()));
+        pin_series(&s, "/tv/Show C", "900006").await;
+        assert!(eligible(s.items_needing_match(100, NOW).await.unwrap()));
+    }
+
+    /// V892 — a file whose episode title is neither its record's nor a
+    /// neighbour's in the pinned show is counted and logged; the number
+    /// still decides.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_episode_titled_unlike_its_record_is_counted() {
+        use metrics_util::debugging::DebuggingRecorder;
+        let recorder = DebuggingRecorder::new();
+        let snap = pharos_test_metrics::snapshotter(&recorder);
+        let _metrics = metrics::set_default_local_recorder(&recorder);
+        let (logs, _log) = log_capture();
+        let s = store().await;
+        let item = MediaItem {
+            id: 45,
+            path: "/tv/Show A/Season 01/Show A - S01E01 - Pilot.mkv".into(),
+            title: "Pilot".into(),
+            kind: MediaKind::Episode,
+            series: Some(pharos_core::SeriesInfo {
+                series_name: "Show A".into(),
+                season_number: Some(1),
+                episode_number: Some(1),
+                series_folder: Some("/tv/Show A".into()),
+                series_year: None,
+                series_key: None,
+            }),
+            ..MediaItem::default()
+        };
+        s.put(item).await.unwrap();
+        pin_series(&s, "/tv/Show A", "900005").await;
+        let (_td, cache) = cache();
+        let tvdb = FakeEnricher::tvdb().with_detail(EnrichedMetadata {
+            title: Some("The New Start".into()),
+            neighbour_titles: vec!["Quick Start".into()],
+            series_id: Some("900005".into()),
+            ..EnrichedMetadata::default()
+        });
+        let item = s.get(45).await.unwrap();
+        enrich_one(
+            &s,
+            &sem(4),
+            &cache,
+            None::<&FakeEnricher>,
+            Some(&tvdb),
+            &MetadataConfig::default(),
+            item,
+            NOW,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            counter_value(
+                &snap,
+                "pharos_episode_metadata_rejected_total",
+                &[("reason", "title_mismatch")]
+            ),
+            1
+        );
+        assert!(logs.text().contains("file_title=Pilot"), "{}", logs.text());
+    }
+
+    /// One episode file of an invented show, as the scanner keys it: the
+    /// folder's `(YYYY)` is its stored year and is not in its name.
+    async fn put_show_episode(
+        store: &SqliteStore,
+        id: u64,
+        folder: &str,
+        (season, episode): (u32, u32),
+        file_show: &str,
+    ) {
+        let base = folder.rsplit('/').next().unwrap_or(folder);
+        let year = pharos_scanner::series_split::stated_show_year(std::path::Path::new(&format!(
+            "{folder}/x.mkv"
+        )))
+        .filter(|_| base.ends_with(')'));
+        let name = match year {
+            Some(y) => base.trim_end_matches(&format!(" ({y})")).to_string(),
+            None => base.to_string(),
+        };
+        let item = MediaItem {
+            id,
+            path: format!(
+                "{folder}/Season {season}/{file_show} - S{season:02}E{episode:02} - Part {episode}.mkv"
+            )
+            .into(),
+            title: format!("Part {episode}"),
+            kind: MediaKind::Episode,
+            series: Some(pharos_core::SeriesInfo {
+                series_name: name,
+                season_number: Some(season),
+                episode_number: Some(episode),
+                series_folder: Some(folder.into()),
+                series_year: year,
+                series_key: None,
+            }),
+            ..MediaItem::default()
+        };
+        store.put(item).await.unwrap();
+    }
+
+    /// B990 — a provider's search narrowed by a year keeps only shows it
+    /// dates that year, so a show stated as 2003 that the provider dates
+    /// 2005 is lost. A year search with no candidate is asked again without
+    /// the year, and its candidates ranked by how near their year is.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_year_search_with_no_candidate_is_asked_again_without_the_year() {
+        use metrics_util::debugging::DebuggingRecorder;
+        let recorder = DebuggingRecorder::new();
+        let snap = pharos_test_metrics::snapshotter(&recorder);
+        let _metrics = metrics::set_default_local_recorder(&recorder);
+        let (logs, _log) = log_capture();
+        let s = store().await;
+        const SHOW: &str = "/tv/Show A (2003)";
+        put_show_episode(&s, 1, SHOW, (1, 1), "Show A (2003)").await;
+        let (_td, cache) = cache();
+        let tvdb = FakeEnricher::tvdb()
+            .with_year_search(vec![])
+            .with_search(vec![
+                ("920001", "Show A", Some(1978)),
+                ("920002", "Show A", Some(2009)),
+                ("920003", "Show A", Some(2005)),
+                ("920004", "Show A", Some(2004)),
+            ])
+            .with_detail(enriched_overview("A fleet."));
+
+        series_pass(&s, &cache, &tvdb).await;
+
+        assert_eq!(tvdb.years(), [Some(2003), None]);
+        let row = series_row(&s, SHOW).await;
+        assert_eq!(row.match_source.as_deref(), Some("search"));
+        // Both near shows read as 2003 and tie: with no episode list to
+        // tell them apart, the nearer year goes first and the call is
+        // flagged as close.
+        assert_eq!(row.match_external_id.as_deref(), Some("920004"));
+        assert_eq!(row.match_flag.as_deref(), Some(AMBIGUOUS_FLAG));
+        assert_eq!(
+            counter_value(
+                &snap,
+                "pharos_series_identity_repair_rematch_total",
+                &[("step", "year_retry")]
+            ),
+            1
+        );
+        let text = logs.text();
+        let line = text
+            .lines()
+            .find(|l| l.contains("searched again without it"))
+            .unwrap_or_else(|| panic!("no retry line in {text}"));
+        assert!(line.contains("year=2003"), "{line}");
+        assert!(line.contains("920003 (2005)"), "{line}");
+    }
+
+    /// B990 — a bare folder whose files state the remake's year, stored on
+    /// the original, is re-asked as `year_mismatch`; under `apply` the
+    /// re-match searches with the year the files state, so the remake (named
+    /// with that year, dated two years later) wins over the original's bare
+    /// exact name.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_year_mismatch_re_ask_re_matches_with_the_files_year() {
+        use metrics_util::debugging::DebuggingRecorder;
+        let recorder = DebuggingRecorder::new();
+        let snap = pharos_test_metrics::snapshotter(&recorder);
+        let _metrics = metrics::set_default_local_recorder(&recorder);
+        let (logs, _log) = log_capture();
+        let s = store().await;
+        const SHOW: &str = "/tv/Show A";
+        put_show_episode(&s, 1, SHOW, (1, 1), "Show A (2003)").await;
+        put_show_episode(&s, 2, SHOW, (1, 2), "Show A (2003)").await;
+        pin(&s, SHOW, "920010", NOW).await;
+        let mut row = series_row(&s, SHOW).await;
+        // 1978-09-17
+        row.premiere_date = Some(274_838_400);
+        s.upsert_series_metadata(row).await.unwrap();
+        set_version(&s, TV_MATCH_VERSION_KEY, "1").await;
+        let tvdb = FakeEnricher::tvdb()
+            .with_year_search(vec![])
+            .with_search(vec![
+                ("920010", "Show A", Some(1978)),
+                ("920011", "Show A (2003)", Some(2005)),
+                ("920012", "Show A: The Return", Some(1980)),
+            ])
+            .with_detail(enriched_overview("A fleet."))
+            // The remake's record dates it by its 2005 series.
+            .with_detail_for(
+                "920011",
+                EnrichedMetadata {
+                    overview: Some("A fleet.".into()),
+                    // 2005-01-14
+                    premiere_date: Some(1_105_660_800),
+                    ..EnrichedMetadata::default()
+                },
+            );
+        let (_td, cache) = cache();
+
+        gate(&s, &tvdb, &apply_cfg()).await;
+        assert_eq!(
+            s.series_needing_match(10, NOW - 1).await.unwrap()[0].series_key,
+            SHOW,
+            "re-asked"
+        );
+        series_pass(&s, &cache, &tvdb).await;
+
+        let row = series_row(&s, SHOW).await;
+        assert_eq!(row.match_external_id.as_deref(), Some("920011"));
+        assert!(tvdb.years().contains(&Some(2003)), "{:?}", tvdb.years());
+        let mut pending = pending_ids(&s).await;
+        pending.sort_unstable();
+        assert_eq!(pending, [1, 2], "the match change marks its episodes");
+        assert_eq!(
+            counter_value(
+                &snap,
+                "pharos_series_identity_repair_rematch_total",
+                &[("step", "stated_year")]
+            ),
+            1
+        );
+        let text = logs.text();
+        let line = text
+            .lines()
+            .find(|l| l.contains("with the year the show's files state"))
+            .unwrap_or_else(|| panic!("no stated-year line in {text}"));
+        for want in ["year=2003", "chosen=\"920011\""] {
+            assert!(line.contains(want), "{want} missing from {line}");
+        }
+        let read = text
+            .lines()
+            .find(|l| l.contains("candidates read as the stated year"))
+            .unwrap_or_else(|| panic!("no read line in {text}"));
+        assert!(read.contains("920011 2005->2003"), "{read}");
+
+        // The next survey accepts what the re-match chose: a premiere two
+        // years from the stated year is no year mismatch.
+        let providers = SeriesProviders::<FakeEnricher, FakeEnricher> {
+            tvdb: Some(&tvdb),
+            tmdb: None,
+        };
+        let survey = survey_series_identity(&s, &providers, &sem(4), &apply_cfg())
+            .await
+            .unwrap();
+        assert!(survey.reask.is_empty(), "{:?}", survey.reask);
+    }
+
+    const SHORT_SHOW: &str = "/tv/Show A (2003)";
+    const MINI_ID: &str = "920020";
+
+    /// A four-season folder stating 2003, pinned by search to a TMDB
+    /// miniseries whose whole run is two days, and re-asked (B986).
+    async fn short_pinned_show(s: &SqliteStore) {
+        let mut id = 0;
+        for season in 1..=4 {
+            id += 1;
+            put_show_episode(s, id, SHORT_SHOW, (season, 1), "Show A (2003)").await;
+        }
+        s.upsert_series_metadata(SeriesMetadata {
+            series_key: SHORT_SHOW.into(),
+            series_name: "Show A".into(),
+            match_provider: Some("tmdb".into()),
+            match_external_id: Some(MINI_ID.into()),
+            match_source: Some("search".into()),
+            metadata_refreshed_at: Some(NOW),
+            overview: Some("The pilot.".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        s.readmit_series(&[SHORT_SHOW.to_string()]).await.unwrap();
+    }
+
+    fn two_day_run() -> crate::online_enrich::SeriesRun {
+        crate::online_enrich::SeriesRun {
+            // 2003-12-08 .. 2003-12-09
+            first: Some(1_070_841_600),
+            last: Some(1_070_928_000),
+            ongoing: false,
+        }
+    }
+
+    async fn both_pass(
+        s: &SqliteStore,
+        cache: &ImageCache,
+        tvdb: &FakeEnricher,
+        tmdb: &FakeEnricher,
+    ) {
+        enrich_series_pass(
+            s,
+            &sem(4),
+            cache,
+            Some(tvdb),
+            Some(tmdb),
+            &MetadataConfig::default(),
+            NOW,
+        )
+        .await
+        .unwrap();
+    }
+
+    /// B990 — a `run_too_short` re-ask leaves the too-short pin out of its
+    /// re-match. TVDB's year search finds nothing and neither does its
+    /// retry; TMDB's year search finds only the miniseries, which is left
+    /// out, so TMDB is asked again without the year and its full series (a
+    /// year off the stated year) wins.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_run_too_short_re_ask_leaves_the_short_pin_out() {
+        use metrics_util::debugging::DebuggingRecorder;
+        let recorder = DebuggingRecorder::new();
+        let snap = pharos_test_metrics::snapshotter(&recorder);
+        let _metrics = metrics::set_default_local_recorder(&recorder);
+        let s = store().await;
+        short_pinned_show(&s).await;
+        let (_td, cache) = cache();
+        let tvdb = FakeEnricher::tvdb();
+        let tmdb = FakeEnricher::tmdb()
+            .with_year_search(vec![(MINI_ID, "Show A", Some(2003))])
+            .with_search(vec![
+                (MINI_ID, "Show A", Some(2003)),
+                ("920021", "Show A", Some(1978)),
+                ("920022", "Show A", Some(2004)),
+            ])
+            .with_run(MINI_ID, two_day_run())
+            .with_detail(enriched_overview("The series."));
+
+        both_pass(&s, &cache, &tvdb, &tmdb).await;
+
+        let row = series_row(&s, SHORT_SHOW).await;
+        assert_eq!(row.match_external_id.as_deref(), Some("920022"));
+        assert_eq!(row.match_flag, None);
+        assert_eq!(tmdb.years(), [Some(2003), None]);
+        assert_eq!(
+            pending_ids(&s).await.len(),
+            4,
+            "the match change marks them"
+        );
+        assert_eq!(
+            counter_value(
+                &snap,
+                "pharos_series_identity_repair_rematch_total",
+                &[("step", "pin_excluded")]
+            ),
+            1
+        );
+    }
+
+    /// B990 — the same re-ask on TVDB: its year search finds nothing, its
+    /// retry finds the full series dated a year after the stated year.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_run_too_short_re_ask_finds_the_series_by_the_tvdb_retry() {
+        let s = store().await;
+        short_pinned_show(&s).await;
+        let (_td, cache) = cache();
+        let tvdb = FakeEnricher::tvdb()
+            .with_year_search(vec![])
+            .with_search(vec![("920023", "Show A (2003)", Some(2005))])
+            .with_detail(enriched_overview("The series."));
+        let tmdb = FakeEnricher::tmdb()
+            .with_search(vec![(MINI_ID, "Show A", Some(2003))])
+            .with_run(MINI_ID, two_day_run());
+
+        both_pass(&s, &cache, &tvdb, &tmdb).await;
+
+        let row = series_row(&s, SHORT_SHOW).await;
+        assert_eq!(row.match_provider.as_deref(), Some("tvdb"));
+        assert_eq!(row.match_external_id.as_deref(), Some("920023"));
+    }
+
+    /// B990 — when the too-short pin is the only candidate left, the re-ask
+    /// does not pin it again: the stored match stays, flagged for Manage →
+    /// Show identity, its episodes unmarked, and the show is not re-asked
+    /// every pass.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_run_too_short_re_ask_with_only_the_short_pin_is_flagged() {
+        use metrics_util::debugging::DebuggingRecorder;
+        let recorder = DebuggingRecorder::new();
+        let snap = pharos_test_metrics::snapshotter(&recorder);
+        let _metrics = metrics::set_default_local_recorder(&recorder);
+        let (logs, _log) = log_capture();
+        let s = store().await;
+        short_pinned_show(&s).await;
+        let (_td, cache) = cache();
+        let tvdb = FakeEnricher::tvdb();
+        let tmdb = FakeEnricher::tmdb()
+            .with_search(vec![(MINI_ID, "Show A", Some(2003))])
+            .with_run(MINI_ID, two_day_run())
+            .with_detail(enriched_overview("The pilot again."));
+
+        both_pass(&s, &cache, &tvdb, &tmdb).await;
+
+        let row = series_row(&s, SHORT_SHOW).await;
+        assert_eq!(row.match_source.as_deref(), Some("search"));
+        assert_eq!(row.match_provider.as_deref(), Some("tmdb"));
+        assert_eq!(row.match_external_id.as_deref(), Some(MINI_ID));
+        assert_eq!(row.match_flag.as_deref(), Some(AMBIGUOUS_FLAG));
+        assert_eq!(
+            row.overview.as_deref(),
+            Some("The pilot."),
+            "not re-written"
+        );
+        assert_eq!(row.metadata_refreshed_at, Some(NOW));
+        assert_eq!(s.flagged_series_keys().await.unwrap(), [SHORT_SHOW]);
+        assert_eq!(pending_ids(&s).await, Vec::<u64>::new());
+        assert!(tmdb.fetched().is_empty(), "{:?}", tmdb.fetched());
+        assert_eq!(
+            counter_value(
+                &snap,
+                "pharos_series_identity_repair_rematch_total",
+                &[("step", "flagged_too_short")]
+            ),
+            1
+        );
+        let text = logs.text();
+        let line = text
+            .lines()
+            .find(|l| l.contains("re-ask left the show flagged: only too-short candidates"))
+            .unwrap_or_else(|| panic!("no flagged line in {text}"));
+        assert!(line.contains(MINI_ID), "{line}");
+    }
+
+    /// B990 — `apply` surveys again when the survey revision moved under the
+    /// matcher version it already recorded (an install that applied before
+    /// the applied marker existed, or under another revision), and not
+    /// while the marker is current.
+    #[tokio::test(flavor = "current_thread")]
+    async fn apply_surveys_again_after_a_survey_revision_bump() {
+        let s = store().await;
+        const SHOW: &str = "/tv/Show A";
+        put_show_episode(&s, 1, SHOW, (1, 1), "Show A (2003)").await;
+        async fn stale_pin(s: &SqliteStore) {
+            pin(s, SHOW, "920010", NOW).await;
+            let mut row = series_row(s, SHOW).await;
+            // 1978-09-17
+            row.premiere_date = Some(274_838_400);
+            s.upsert_series_metadata(row).await.unwrap();
+        }
+        async fn reasked(s: &SqliteStore) -> bool {
+            !s.series_needing_match(10, NOW - 1)
+                .await
+                .unwrap()
+                .is_empty()
+        }
+        let want = TV_MATCH_VERSION.to_string();
+        let current = dry_run_marker(&want);
+        let tvdb = FakeEnricher::tvdb();
+
+        for stale in [None, Some("2.r1")] {
+            stale_pin(&s).await;
+            set_version(&s, TV_MATCH_VERSION_KEY, &want).await;
+            if let Some(m) = stale {
+                set_version(&s, TV_MATCH_SURVEY_APPLIED_KEY, m).await;
+            }
+            gate(&s, &tvdb, &apply_cfg()).await;
+            assert!(reasked(&s).await, "marker {stale:?} was not re-surveyed");
+            assert_eq!(
+                version(&s, TV_MATCH_SURVEY_APPLIED_KEY).await,
+                Some(current.clone())
+            );
+        }
+
+        stale_pin(&s).await;
+        gate(&s, &tvdb, &apply_cfg()).await;
+        assert!(!reasked(&s).await, "a current marker surveys nothing");
+        assert_eq!(version(&s, TV_MATCH_VERSION_KEY).await, Some(want));
     }
 }

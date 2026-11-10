@@ -36,4 +36,10 @@ ignore = [
     "RUSTSEC-2026-0368",
     "RUSTSEC-2026-0369",
     "RUSTSEC-2026-0429",
+    # RUSTSEC-2026-0459 — SQLite < 3.54.0 leaks uninitialised page-cache
+    # memory when it opens a database with a crafted `-wal` beside it, via the
+    # libsqlite3-sys 0.30.1 that sqlx-sqlite 0.9.0 (latest) pins. pharos opens
+    # only its own `cfg.database.url`, so a planter could already rewrite the
+    # db itself. Full argument, and what invalidates it, in deny.toml.
+    "RUSTSEC-2026-0459",
 ]

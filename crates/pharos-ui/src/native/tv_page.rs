@@ -593,6 +593,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_jump_scrolls_the_grid_tile_and_focuses_it() {
+        let js = scroll_to_tile_js(42);
+        assert!(
+            js.contains(r#"document.querySelector(".pharos-browse .pharos-grid")"#),
+            "{js}"
+        );
+        assert!(js.contains("grid.children[42]"), "{js}");
+        assert!(js.contains("scrollIntoView(true)"), "{js}");
+        assert!(js.contains("focus({ preventScroll: true })"), "{js}");
+        assert!(
+            js.contains("return false") && js.contains("return true"),
+            "{js}"
+        );
+    }
+
+    #[test]
     fn a_direct_stream_loads_from_the_server_with_the_media_token() {
         let base = "https://media.example";
         assert_eq!(
@@ -607,6 +623,22 @@ mod tests {
             direct_media_url(base, "https://other.example/x?y=1", "t"),
             "https://other.example/x?y=1&api_key=t"
         );
+    }
+
+    #[test]
+    fn a_sentinel_watch_observes_every_id_and_ends_on_unwatch() {
+        let js = watch_sentinel_js(7, &["pharos-more-sentinel", "pharos-more-end"]);
+        assert!(
+            js.contains(r#"["pharos-more-sentinel","pharos-more-end"].map"#),
+            "{js}"
+        );
+        assert!(js.contains("new IntersectionObserver"), "{js}");
+        assert!(js.contains("dioxus.send(true)"), "{js}");
+        assert!(js.contains("all[7] = () =>"), "{js}");
+        assert!(js.contains(r#"all[7] === "gone""#), "{js}");
+        let stop = unwatch_sentinel_js(7);
+        assert!(stop.contains("const stop = all[7]"), "{stop}");
+        assert!(stop.contains(r#"all[7] = "gone""#), "{stop}");
     }
 
     #[test]
@@ -744,38 +776,6 @@ mod tests {
                 message: "MEDIA_ELEMENT_ERROR: Format error".into(),
             })
         );
-    }
-
-    #[test]
-    fn a_jump_scrolls_the_grid_tile_and_focuses_it() {
-        let js = scroll_to_tile_js(42);
-        assert!(
-            js.contains(r#"document.querySelector(".pharos-browse .pharos-grid")"#),
-            "{js}"
-        );
-        assert!(js.contains("grid.children[42]"), "{js}");
-        assert!(js.contains("scrollIntoView(true)"), "{js}");
-        assert!(js.contains("focus({ preventScroll: true })"), "{js}");
-        assert!(
-            js.contains("return false") && js.contains("return true"),
-            "{js}"
-        );
-    }
-
-    #[test]
-    fn a_sentinel_watch_observes_every_id_and_ends_on_unwatch() {
-        let js = watch_sentinel_js(7, &["pharos-more-sentinel", "pharos-more-end"]);
-        assert!(
-            js.contains(r#"["pharos-more-sentinel","pharos-more-end"].map"#),
-            "{js}"
-        );
-        assert!(js.contains("new IntersectionObserver"), "{js}");
-        assert!(js.contains("dioxus.send(true)"), "{js}");
-        assert!(js.contains("all[7] = () =>"), "{js}");
-        assert!(js.contains(r#"all[7] === "gone""#), "{js}");
-        let stop = unwatch_sentinel_js(7);
-        assert!(stop.contains("const stop = all[7]"), "{stop}");
-        assert!(stop.contains(r#"all[7] = "gone""#), "{stop}");
     }
 
     #[test]

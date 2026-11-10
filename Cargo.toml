@@ -20,6 +20,7 @@ members = [
     "crates/pharos-transcode",
     "crates/pharos-ui",
     "crates/quire",
+    "crates/quire-pdf",
     "crates/quire-web",
     "workspace-hack",
 ]
@@ -68,8 +69,8 @@ metrics-exporter-prometheus = { version = "0.18", default-features = false }
 metrics-util = "0.20"
 metrics-process = "2"
 criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support", "html_reports"] }
-dioxus = { version = "0.7", default-features = false, features = ["macro", "html", "hooks", "signals"] }
-dioxus-web = { version = "0.7", default-features = false }
+dioxus = { version = "=0.8.0-alpha.3", default-features = false, features = ["macro", "html", "hooks", "signals"] }
+dioxus-web = { version = "=0.8.0-alpha.3", default-features = false }
 gloo-net = { version = "0.7", default-features = false, features = ["http", "json"] }
 quick-xml = "0.42"
 # 004-books — book containers. All three are PURE RUST with no `-sys` crate,
@@ -77,7 +78,10 @@ quick-xml = "0.42"
 # beyond ffmpeg is what rules out a PDF rasteriser (R11) and a rar reader
 # (R7). An epub IS a zip, so `zip` covers epub and cbz both.
 zip = { version = "9", default-features = false, features = ["deflate"] }
-sevenz-rust2 = { version = "0.24", default-features = false }
+sevenz-rust2 = { version = "0.25", default-features = false }
+# The integrity check inflates PDF FlateDecode streams itself: lopdf's own
+# decoder logs a corrupt stream and returns what it got, which hides damage.
+flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
 # `.cbt` is a TAR of images. `tar` is pure Rust like the two above, so the
 # no-C-library rule that permanently rules out `.cbr` (R7) does not apply here
 # — a cbt is read for real rather than recorded as unsupported.
@@ -132,6 +136,9 @@ rcgen = { version = "0.14", default-features = false, features = ["ring"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.11"
+# ADR-0073: keyed image tags (HMAC-SHA256, constant-time compare).
+hmac = "0.13"
+subtle = "2.6"
 base64 = "0.23"
 # Avatar uploads: decoded and re-encoded in memory-safe Rust, not ffmpeg.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
@@ -139,6 +146,8 @@ sonic-rs = "0.5"
 sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "macros", "migrate"] }
 thiserror = "2"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
+tikv-jemalloc-ctl = { version = "0.7", features = ["stats"] }
+tikv-jemallocator = { version = "0.7", features = ["unprefixed_malloc_on_supported_platforms", "background_threads"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["io"] }
 bytes = "1"
@@ -151,7 +160,12 @@ opentelemetry = "0.33"
 opentelemetry_sdk = { version = "0.33", features = ["rt-tokio"] }
 opentelemetry-otlp = { version = "0.33", default-features = false, features = ["grpc-tonic", "trace"] }
 tracing-opentelemetry = "0.34"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# 0.13 dropped `rustls-tls`; its `rustls` feature pulls aws-lc-rs (a C build)
+# and the OS certificate verifier. `rustls-no-provider` plus a preconfigured
+# ring + webpki-roots config (pharos-server `http_client`) keeps the 0.12
+# behaviour. `query` became opt-in in 0.13.
+reqwest = { version = "0.13", default-features = false, features = ["json", "query", "rustls-no-provider"] }
+webpki-roots = "1"
 uuid = { version = "1", features = ["v4", "v5", "serde"] }
 # 017: Instant that works on wasm32 (std's panics there); pharos-api times RPC calls on both targets.
 web-time = "1"
@@ -169,6 +183,11 @@ debug = "line-tables-only"
 
 [profile.test]
 debug = "line-tables-only"
+
+# jemalloc's configure fails ("cannot determine return type of strerror_r")
+# when cc runs at -O0 under the nix shell's _FORTIFY_SOURCE hardening.
+[profile.dev.package.tikv-jemalloc-sys]
+opt-level = 3
 
 # Argon2id with its default 19 MiB cost takes ~0.5 s per hash at opt-level 0,
 # and every login/create-user test pays it. Optimise only the hashing crates.
@@ -207,3 +226,18 @@ inherits = "dev"
 
 [profile.android-dev]
 inherits = "dev"
+
+# The web UI's release build (flake.nix `pharosUiBundle`: `dx build --release
+# --profile wasm-release`). Size over speed: the bundle is downloaded and
+# compiled on every cold start of weak clients (Quest, Android TV), and the
+# 017 spike measured 3.53 MB -> 1.86 MB raw for these settings
+# (specs/017-native-api/research.md R8). Kept off plain `release`, which the
+# server and transcode worker build with.
+[profile.wasm-release]
+inherits = "release"
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+# No `strip`: wasm-bindgen reads the `target_features` custom section, and
+# stripping removes it ("target_features custom section is missing").
+# dx's `--debug-symbols false` plus wasm-opt drop the names section instead.

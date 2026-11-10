@@ -114,6 +114,11 @@ impl LineSignals {
     };
 }
 
+/// Bumped whenever this module or the libav pass would measure the same
+/// audio or video differently. Stored passes carry it, so an older one is
+/// measured again (spec 028, B1202).
+pub const SIGNALS_VERSION: u32 = 2;
+
 /// Everything one `SubtitleSignals` op reports.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SubtitleSignals {
@@ -123,6 +128,12 @@ pub struct SubtitleSignals {
     pub keyframes_ms: Vec<u64>,
     /// The keyframes that are likely scene cuts ([`cuts_from_keyframes`]).
     pub cuts_ms: Vec<u64>,
+    /// Per requested window: the height of text burned into the bottom of
+    /// the picture under it, as a share of the frame height (0.0 for none;
+    /// [`crate::burned_text`]); `None` when no keyframe was checked for it.
+    /// Absent (empty) in passes stored before it existed.
+    #[serde(default)]
+    pub bottom_text: Vec<Option<f32>>,
     /// The audio stream analysed (container stream index); `None` when the
     /// file has no audio, in which case every line is [`LineSignals::NONE`].
     pub audio_stream: Option<u32>,

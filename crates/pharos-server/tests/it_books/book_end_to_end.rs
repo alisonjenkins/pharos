@@ -35,10 +35,10 @@ const CONTAINER: &str = r#"<?xml version="1.0"?>
 const OPF: &str = r#"<?xml version="1.0"?>
 <package xmlns="http://www.idpf.org/2007/opf" version="2.0">
   <metadata xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:opf="http://www.idpf.org/2007/opf">
-    <dc:title>Dune</dc:title>
+    <dc:title>Book A</dc:title>
     <dc:creator>Frank Herbert</dc:creator>
     <dc:publisher>Chilton Books</dc:publisher>
-    <meta name="calibre:series" content="Dune Chronicles"/>
+    <meta name="calibre:series" content="Book A Chronicles"/>
     <meta name="calibre:series_index" content="1"/>
   </metadata>
   <manifest><item id="ch1" href="ch1.xhtml" media-type="application/xhtml+xml"/></manifest>
@@ -117,7 +117,7 @@ macro_rules! auth_header {
 #[actix_web::test]
 async fn a_real_epub_survives_scan_to_wire() {
     let td = TempDir::new().unwrap();
-    let epub = td.path().join("Dune.epub");
+    let epub = td.path().join("Book A.epub");
     write_epub(&epub);
     let epub_bytes = std::fs::read(&epub).unwrap();
 
@@ -138,7 +138,7 @@ async fn a_real_epub_survives_scan_to_wire() {
         .iter()
         .find(|i| i.kind == MediaKind::Book)
         .expect("the scan must have produced a Book row");
-    assert_eq!(book.title, "Dune", "title comes from the filename stem");
+    assert_eq!(book.title, "Book A", "title comes from the filename stem");
     let bm = book.book.as_ref().expect("a Book row must carry BookMeta");
     assert_eq!(bm.format, pharos_core::BookFormat::Epub);
     assert_eq!(
@@ -146,7 +146,7 @@ async fn a_real_epub_survives_scan_to_wire() {
         Some("Frank Herbert"),
         "the OPF was actually read during the scan, not just parseable in isolation"
     );
-    assert_eq!(bm.series_name.as_deref(), Some("Dune Chronicles"));
+    assert_eq!(bm.series_name.as_deref(), Some("Book A Chronicles"));
     assert_eq!(bm.series_index, Some(1));
 
     // ---- serve it.
@@ -196,7 +196,7 @@ async fn a_real_epub_survives_scan_to_wire() {
     // asserted now, on the same end-to-end path, so the read and the wire
     // cannot drift apart.
     assert_eq!(
-        item["SeriesName"], "Dune Chronicles",
+        item["SeriesName"], "Book A Chronicles",
         "a book's series is its shelf, and SeriesName is the field jellyfin-web \
          groups by: {item}"
     );

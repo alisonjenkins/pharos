@@ -12,7 +12,7 @@ use futures_util::future::{join, join3, try_join};
 use futures_util::StreamExt as _;
 use pharos_client::api::{
     ClientEvent, ClientEventKind, ClientLevel, Detail, Item, ItemKind, ItemRef, LibraryKind,
-    ListIndex, Listing, Page, PharosApi,
+    ListIndex, Listing, Page, PharosApi, Watched,
 };
 use pharos_client::{CallInfo, ClientError};
 
@@ -25,15 +25,16 @@ use super::letters::{self, Wheel, LETTERS};
 use super::listen::{Icon, ICON_QUEUE_ADD, ICON_QUEUE_NEXT};
 use super::machine::Event;
 use super::mixes::{self, MixCtx, ICON_MIX};
-use super::paging::{Pager, Trigger};
+use super::paging::{Chain, Pager, Trigger, SENTINEL_LEAD};
 use super::platform;
-use super::queue::{added_line, QueueCtx, Track};
+use super::queue::{added_line, video_kind, QueueCtx, Track, VideoQueueCtx};
 use super::route::Route;
 use super::seen::{self, MemberSeen};
 use super::together_view::{InThisGroup, SeenDots};
 use super::views::{
-    display_name, episode_label, is_placeholder_episode_name, progress_percent, runtime, Link,
-    MarkPlayed, PosterTile, Ratings, WatchedToggle, MAIN_ACTION,
+    display_name, episode_label, is_placeholder_episode_name, progress_percent, runtime,
+    ArtPlaceholder, FavoriteToggle, Link, MarkPlayed, PosterTile, Ratings, StoredMark,
+    WatchedToggle, MAIN_ACTION,
 };
 use pharos_client::mix::radio;
 
@@ -43,6 +44,9 @@ pub const BROWSE_PAGE: u32 = 100;
 /// `SortBy` for a season's episodes or an album's tracks: season (disc),
 /// then episode (track) number.
 const INDEX_ORDER: &str = "ParentIndexNumber,IndexNumber";
+
+/// `SortBy` for an artist's albums: oldest first, then by name.
+const ARTIST_ALBUM_ORDER: &str = "ProductionYear,SortName";
 
 /// What a browse screen shows under a title that could not be fetched.
 pub const BROWSE_TITLE_FALLBACK: &str = "Browse";
@@ -119,8 +123,10 @@ pub struct Narrow {
     pub order: Order,
     pub descending: bool,
     pub genre: Option<String>,
-    /// Only watched (`Some(true)`) or unwatched (`Some(false)`) items.
-    pub played: Option<bool>,
+    /// Only items in this play state.
+    pub watched: Option<Watched>,
+    /// Only 3D (`Some(true)`) or only 2D (`Some(false)`) titles (V722).
+    pub stereo: Option<bool>,
 }
 
 impl Default for Narrow {
@@ -129,7 +135,8 @@ impl Default for Narrow {
             order: Order::Name,
             descending: false,
             genre: None,
-            played: None,
+            watched: None,
+            stereo: None,
         }
     }
 }
@@ -144,7 +151,8 @@ impl Narrow {
                 .map_or_else(|| base.sort_by.clone(), str::to_owned),
             descending: self.descending,
             genre: self.genre.clone(),
-            played: self.played,
+            watched: self.watched,
+            stereo: self.stereo,
             ..base.clone()
         }
     }
@@ -182,9 +190,12 @@ impl Narrow {
         if let Some(genre) = &self.genre {
             pairs.push(format!("genre={}", encode_component(genre)));
         }
-        match self.played {
-            Some(true) => pairs.push("watched=watched".to_owned()),
-            Some(false) => pairs.push("watched=unwatched".to_owned()),
+        if let Some(watched) = self.watched {
+            pairs.push(format!("watched={}", watched_token(watched)));
+        }
+        match self.stereo {
+            Some(true) => pairs.push("3d=3d".to_owned()),
+            Some(false) => pairs.push("3d=2d".to_owned()),
             None => {}
         }
         if pairs.is_empty() {
@@ -200,7 +211,8 @@ impl Narrow {
         let mut order = Order::Name;
         let mut descending = None;
         let mut genre = None;
-        let mut played = None;
+        let mut watched = None;
+        let mut stereo = None;
         for pair in query.trim_start_matches('?').split('&') {
             let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
             let value = decode_component(value);
@@ -209,8 +221,9 @@ impl Narrow {
                 ("dir", "asc") => descending = Some(false),
                 ("dir", "desc") => descending = Some(true),
                 ("genre", v) if !v.is_empty() => genre = Some(v.to_owned()),
-                ("watched", "watched") => played = Some(true),
-                ("watched", "unwatched") => played = Some(false),
+                ("watched", v) => watched = watched_of(v),
+                ("3d", "3d") => stereo = Some(true),
+                ("3d", "2d") => stereo = Some(false),
                 _ => {}
             }
         }
@@ -218,13 +231,30 @@ impl Narrow {
             order,
             descending: descending.unwrap_or(order.starts_descending()),
             genre,
-            played,
+            watched,
+            stereo,
         }
     }
 }
 
+/// The URL and `<option>` value of a play state.
+fn watched_token(watched: Watched) -> &'static str {
+    match watched {
+        Watched::Unwatched => "unwatched",
+        Watched::Watched => "watched",
+        Watched::InProgress => "in-progress",
+    }
+}
+
+/// The play state a URL or `<option>` value names; `None` for any other.
+fn watched_of(token: &str) -> Option<Watched> {
+    [Watched::Unwatched, Watched::InProgress, Watched::Watched]
+        .into_iter()
+        .find(|w| watched_token(*w) == token)
+}
+
 /// `s` with everything but unreserved URL characters percent-encoded.
-fn encode_component(s: &str) -> String {
+pub(crate) fn encode_component(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
         if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) {
@@ -278,10 +308,22 @@ pub enum Browse {
         more: Option<Listing>,
         /// A library's own grid, which gets the filter bar and letter rail.
         library: bool,
+        /// A Movies library's grid, which offers to group its films into
+        /// their box sets (B1086).
+        sets: bool,
     },
     Show(Show),
+    /// A mixed library: its series, then its other stored items, paged as
+    /// one grid (B821).
+    Mixed {
+        title: String,
+        page: Page,
+        chain: Chain,
+    },
     Music {
         title: String,
+        /// The library, whose artists and albums the tabs page through.
+        library: ItemRef,
         artists: Page,
         albums: Page,
     },
@@ -302,7 +344,9 @@ impl Browse {
     /// season is only the default) reads the show alone.
     pub fn name(&self, asked: ItemRef) -> String {
         match self {
-            Browse::Grid { title, .. } | Browse::Music { title, .. } => title.clone(),
+            Browse::Grid { title, .. }
+            | Browse::Mixed { title, .. }
+            | Browse::Music { title, .. } => title.clone(),
             Browse::Show(show) => match show
                 .seasons
                 .iter()
@@ -373,27 +417,17 @@ pub fn plan(detail: Option<&Detail>) -> Plan {
     }
 }
 
-/// A mixed library's listing: its series, then its stored items other than
-/// episodes, which the series tiles stand for. With no series, the stored
-/// items as they are.
-pub fn series_first(series: Page, stored: Page) -> Page {
-    if series.items.is_empty() {
-        return stored;
+/// A mixed library's first page: its series, then its stored items, as one
+/// listing of `series.total + stored.total` places ([`Chain`]). The stored
+/// items join only when every series is already on the page; otherwise the
+/// series continue first, and the stored items follow them.
+pub fn mixed_first(series: &Page, stored: Page) -> Page {
+    let total = series.total.saturating_add(stored.total);
+    let whole_head = series.items.len() >= series.total as usize;
+    let mut items = series.items.clone();
+    if whole_head {
+        items.extend(stored.items);
     }
-    let episodes = stored
-        .items
-        .iter()
-        .filter(|i| i.kind == ItemKind::Episode)
-        .count();
-    let rest = stored
-        .items
-        .into_iter()
-        .filter(|i| i.kind != ItemKind::Episode);
-    let total = series.total
-        + stored
-            .total
-            .saturating_sub(u32::try_from(episodes).unwrap_or(u32::MAX));
-    let items: Vec<Item> = series.items.into_iter().chain(rest).collect();
     Page {
         total: total.max(u32::try_from(items.len()).unwrap_or(u32::MAX)),
         items,
@@ -474,6 +508,10 @@ pub async fn load<A: PharosApi>(
     let library = detail
         .as_ref()
         .is_some_and(|d| d.item.kind == ItemKind::Library);
+    let sets = library
+        && detail
+            .as_ref()
+            .is_some_and(|d| d.item.library_kind == Some(LibraryKind::Movies));
     Ok(match (plan(detail.as_ref()), detail) {
         (Plan::SeriesGrid, _) => {
             let more = Listing::of(id, Some(ItemKind::Series), "SortName");
@@ -482,6 +520,7 @@ pub async fn load<A: PharosApi>(
                 page: paged(more.clone()).await?,
                 more: Some(more),
                 library,
+                sets: false,
             }
         }
         (Plan::MixedLibrary, _) => {
@@ -490,12 +529,18 @@ pub async fn load<A: PharosApi>(
                 list(id, None, "SortName"),
             )
             .await?;
-            // Two listings merged: no single list to continue.
-            Browse::Grid {
+            let chain = Chain {
+                head: Listing::of(id, Some(ItemKind::Series), "SortName"),
+                head_total: series.total,
+                tail: Listing::of(id, None, "SortName"),
+                // With no series the stored items are all there is, and
+                // their episodes show as themselves.
+                hide: (series.total > 0).then_some(ItemKind::Episode),
+            };
+            Browse::Mixed {
                 title,
-                page: series_first(series, stored),
-                more: None,
-                library: false,
+                page: mixed_first(&series, stored),
+                chain,
             }
         }
         (Plan::MusicLibrary, _) => {
@@ -506,6 +551,7 @@ pub async fn load<A: PharosApi>(
             .await?;
             Browse::Music {
                 title,
+                library: id,
                 artists,
                 albums,
             }
@@ -580,7 +626,7 @@ pub async fn load<A: PharosApi>(
             })
         }
         (Plan::Artist, Some(detail)) => Browse::Artist {
-            albums: list(id, Some(ItemKind::Album), "ProductionYear,SortName").await?,
+            albums: list(id, Some(ItemKind::Album), ARTIST_ALBUM_ORDER).await?,
             detail,
         },
         (Plan::Album, Some(detail)) => Browse::Album {
@@ -594,15 +640,20 @@ pub async fn load<A: PharosApi>(
                 page: paged(more.clone()).await?,
                 more: Some(more),
                 library: false,
+                sets: false,
             }
         }
         _ => {
-            let more = Listing::of(id, None, "SortName");
+            let mut more = Listing::of(id, None, "SortName");
+            // The library opens as the device last chose, so its first page
+            // is fetched once (B1086).
+            more.collapse = sets && stored_collections();
             Browse::Grid {
                 title,
                 page: paged(more.clone()).await?,
                 more: Some(more),
                 library,
+                sets,
             }
         }
     })
@@ -616,20 +667,31 @@ pub fn BrowseLayout(browse: Browse, #[props(default)] seen: Vec<MemberSeen>) -> 
             page,
             more,
             library,
-        } => rsx! { GridView { title, page, more, library } },
+            sets,
+        } => rsx! { GridView { title, page, more, library, sets } },
         Browse::Show(show) => rsx! { ShowView { show, seen } },
+        Browse::Mixed { title, page, chain } => rsx! { MixedView { title, page, chain } },
         Browse::Music {
             title,
+            library,
             artists,
             albums,
-        } => rsx! { MusicLibraryView { title, artists, albums } },
+        } => rsx! { MusicLibraryView { title, library, artists, albums } },
         Browse::Artist { detail, albums } => rsx! { ArtistView { detail, albums } },
         Browse::Album { detail, tracks } => rsx! { AlbumView { detail, tracks } },
     }
 }
 
 #[component]
-pub fn GridView(title: String, page: Page, more: Option<Listing>, library: bool) -> Element {
+pub fn GridView(
+    title: String,
+    page: Page,
+    more: Option<Listing>,
+    library: bool,
+    /// Offer to group the films into their box sets (B1086).
+    #[props(default)]
+    sets: bool,
+) -> Element {
     rsx! {
         section { class: "pharos-browse",
             h2 { "{title}" }
@@ -639,7 +701,7 @@ pub fn GridView(title: String, page: Page, more: Option<Listing>, library: bool)
                 // on, so a new library mounts a new grid (B490).
                 Some(base) if library => remount_on(
                     &base.parent.to_string(),
-                    rsx! { LibraryGrid { first: page, base } },
+                    rsx! { LibraryGrid { first: page, base, sets } },
                 ),
                 Some(source) => remount_on(
                     &source.parent.to_string(),
@@ -647,6 +709,20 @@ pub fn GridView(title: String, page: Page, more: Option<Listing>, library: bool)
                 ),
                 None => rsx! { PosterGrid { page } },
             }
+        }
+    }
+}
+
+/// A mixed library's grid: series, then the rest, paged as one (B821).
+#[component]
+pub fn MixedView(title: String, page: Page, chain: Chain) -> Element {
+    rsx! {
+        section { class: "pharos-browse",
+            h2 { "{title}" }
+            {remount_on(
+                &chain.head.parent.to_string(),
+                rsx! { PagedGrid { first: page, source: chain.head.clone(), rail: None, chain: Some(chain) } },
+            )}
         }
     }
 }
@@ -697,8 +773,12 @@ fn read_place(key: &str) -> Option<(u32, f64)> {
 /// The choice is kept in the URL and for the tab, and the grid comes back
 /// where it was left while the choice it opened on stands (B560).
 #[component]
-fn LibraryGrid(first: Page, base: Listing) -> Element {
+fn LibraryGrid(first: Page, base: Listing, sets: bool) -> Element {
     let ctx = use_context::<Ctx>();
+    // Whether the films are grouped into box sets; the first page was
+    // fetched the way the device last chose (B1086).
+    let opened_grouped = base.collapse;
+    let grouped = use_signal(|| opened_grouped);
     let library = base.parent;
     let opened = use_hook(|| opening_choice(library));
     let narrow = use_signal(|| opened.clone());
@@ -724,10 +804,13 @@ fn LibraryGrid(first: Page, base: Listing) -> Element {
     let opening = base.clone();
     // The library opened on its default listing; any other is fetched here.
     let listed = use_resource(move || {
-        let listing = narrow.read().apply(&opening);
+        let listing = Listing {
+            collapse: *grouped.read(),
+            ..narrow.read().apply(&opening)
+        };
         let place = place_key(library, &narrow.read().to_query());
         let first = first.clone();
-        let fresh = *narrow.read() != Narrow::default();
+        let fresh = *narrow.read() != Narrow::default() || *grouped.read() != opened_grouped;
         async move {
             if !fresh {
                 return Ok((place, listing, first));
@@ -751,7 +834,7 @@ fn LibraryGrid(first: Page, base: Listing) -> Element {
     });
     let rail = narrow.read().rail();
     rsx! {
-        FilterBar { narrow, genres }
+        FilterBar { narrow, genres, grouped: sets.then_some(grouped) }
         match &*listed.read() {
             None => rsx! { p { class: "pharos-muted", "Loading…" } },
             Some(Err(e)) => rsx! { p { class: "pharos-error", role: "alert", "Couldn't load this library: {e}" } },
@@ -774,13 +857,20 @@ fn LibraryGrid(first: Page, base: Listing) -> Element {
 
 /// Sort, direction, genre and watched state for a library's grid.
 #[component]
-fn FilterBar(narrow: Signal<Narrow>, genres: Signal<Vec<String>>) -> Element {
+fn FilterBar(
+    narrow: Signal<Narrow>,
+    genres: Signal<Vec<String>>,
+    /// Whether films are grouped into box sets, on a Movies library (B1086).
+    #[props(default)]
+    grouped: Option<Signal<bool>>,
+) -> Element {
     let now = narrow.read().clone();
     let genre = now.genre.clone().unwrap_or_default();
-    let played = match now.played {
+    let played = now.watched.map_or(ANY, watched_token);
+    let stereo = match now.stereo {
         None => ANY,
-        Some(false) => "unwatched",
-        Some(true) => "watched",
+        Some(true) => "3d",
+        Some(false) => "2d",
     };
     let direction = match (now.order, now.descending) {
         (Order::Name, false) => "A to Z",
@@ -840,17 +930,48 @@ fn FilterBar(narrow: Signal<Narrow>, genres: Signal<Vec<String>>) -> Element {
                     value: played,
                     onchange: move |e| {
                         let value = e.value();
+                        narrow.with_mut(|n| n.watched = watched_of(&value));
+                    },
+                    option { value: ANY, selected: played == ANY, "All" }
+                    option { value: "unwatched", selected: played == "unwatched", "Unwatched" }
+                    option { value: "in-progress", selected: played == "in-progress", "In progress" }
+                    option { value: "watched", selected: played == "watched", "Watched" }
+                }
+            }
+            label { class: "pharos-filter",
+                span { aria_hidden: "true", "3D" }
+                select {
+                    aria_label: "3D",
+                    value: stereo,
+                    onchange: move |e| {
+                        let value = e.value();
                         narrow.with_mut(|n| {
-                            n.played = match value.as_str() {
-                                "watched" => Some(true),
-                                "unwatched" => Some(false),
+                            n.stereo = match value.as_str() {
+                                "3d" => Some(true),
+                                "2d" => Some(false),
                                 _ => None,
                             }
                         });
                     },
-                    option { value: ANY, selected: played == ANY, "All" }
-                    option { value: "unwatched", selected: played == "unwatched", "Unwatched" }
-                    option { value: "watched", selected: played == "watched", "Watched" }
+                    option { value: ANY, selected: stereo == ANY, "2D and 3D" }
+                    option { value: "3d", selected: stereo == "3d", "3D only" }
+                    option { value: "2d", selected: stereo == "2d", "2D only" }
+                }
+            }
+            if let Some(mut grouped) = grouped {
+                label { class: "pharos-filter",
+                    span { aria_hidden: "true", "Collections" }
+                    select {
+                        aria_label: "Collections",
+                        value: if *grouped.read() { "grouped" } else { "films" },
+                        onchange: move |e| {
+                            let on = e.value() == "grouped";
+                            keep_collections(on);
+                            grouped.set(on);
+                        },
+                        option { value: "grouped", selected: *grouped.read(), "Grouped" }
+                        option { value: "films", selected: !*grouped.read(), "Each film" }
+                    }
                 }
             }
             if now != Narrow::default() {
@@ -862,6 +983,34 @@ fn FilterBar(narrow: Signal<Narrow>, genres: Signal<Vec<String>>) -> Element {
                 }
             }
         }
+    }
+}
+
+/// The device key of whether a Movies library groups its films into their
+/// box sets (B1086).
+pub const COLLECTIONS_KEY: &str = "pharos.library.collections";
+
+/// Whether a Movies library groups its films into box sets, from what the
+/// device keeps under [`COLLECTIONS_KEY`]: on unless turned off.
+pub fn collections_on(kept: Option<&str>) -> bool {
+    kept != Some("off")
+}
+
+/// [`collections_on`] for this device; a failed read keeps the default.
+fn stored_collections() -> bool {
+    match platform::stored_theme(COLLECTIONS_KEY) {
+        Ok(kept) => collections_on(kept.as_deref()),
+        Err(e) => {
+            platform::warn(&format!("pharos: collections choice not read: {e}"));
+            collections_on(None)
+        }
+    }
+}
+
+/// Keeps the device's choice to group films into box sets.
+fn keep_collections(on: bool) {
+    if let Err(e) = platform::store_theme(COLLECTIONS_KEY, if on { "on" } else { "off" }) {
+        platform::warn(&format!("pharos: collections choice not kept: {e}"));
     }
 }
 
@@ -899,6 +1048,8 @@ fn PagedGrid(
     genres: Option<Signal<Vec<String>>>,
     place: Option<String>,
     #[props(default)] restore: bool,
+    #[props(default)] square: Option<bool>,
+    #[props(default)] chain: Option<Chain>,
 ) -> Element {
     let ctx = use_context::<Ctx>();
     let mut pager = use_signal(|| Pager::new(first.clone()));
@@ -906,8 +1057,10 @@ fn PagedGrid(
     // here; `Pager::begin` is what keeps a second request out while one is
     // in flight.
     let paged = source.clone();
+    let chained = chain.clone();
     let requests = use_coroutine(move |mut rx: UnboundedReceiver<Ask>| {
         let paged = paged.clone();
+        let chained = chained.clone();
         async move {
             while let Some(ask) = rx.next().await {
                 let claimed = match ask {
@@ -923,7 +1076,19 @@ fn PagedGrid(
                     pager.write().fail();
                     continue;
                 };
-                let source = paged.clone();
+                // One listing, or the part of a chain this position is in.
+                let (source, start, limit, chain) = match &chained {
+                    Some(c) => {
+                        let (part, start, limit) = c.step(start, limit);
+                        (
+                            c.listing(part).clone(),
+                            start,
+                            limit,
+                            Some((c.clone(), part)),
+                        )
+                    }
+                    None => (paged.clone(), start, limit, None),
+                };
                 spawn(async move {
                     let result = fetch_more(
                         &api,
@@ -936,7 +1101,13 @@ fn PagedGrid(
                     )
                     .await;
                     match result {
-                        Ok(page) => pager.write().land(page),
+                        Ok(page) => match chain {
+                            Some((c, part)) => {
+                                let whole = c.whole(part, page.total, pager.peek().total());
+                                pager.write().land_as(page, whole);
+                            }
+                            None => pager.write().land(page),
+                        },
                         Err(e) => {
                             if e.needs_sign_in() {
                                 let mut machine = ctx.machine;
@@ -949,6 +1120,25 @@ fn PagedGrid(
             }
         }
     });
+    // The grid keeps its loaded pages through a screen reload, so a mark
+    // stored from one of its tiles is shown on that tile here (V1160).
+    // The mark standing when the grid mounts is older than its pages, which
+    // already show it or something newer, so only later ones apply.
+    let stored = try_use_context::<StoredMark>();
+    let mounted = use_hook(|| std::rc::Rc::new(std::cell::Cell::new(false)));
+    use_effect(move || {
+        let last = stored.and_then(|s| *s.0.read());
+        if !mounted.replace(true) {
+            return;
+        }
+        if let Some((id, played)) = last {
+            if pager.peek().items().iter().any(|i| i.id == id) {
+                pager.write().mark(id, played);
+            }
+        }
+    });
+    // An "In progress" grid offers each tile's watched mark (B1200/V1160).
+    let mark = source.watched == Some(Watched::InProgress);
     let mut watch = use_signal(|| None::<platform::SentinelWatch>);
     // Runs once the tiles are in the page, and again after every change to
     // the pager so the observer is re-armed on the tile that is now
@@ -1108,8 +1298,16 @@ fn PagedGrid(
     });
 
     let state = pager.read();
+    let shown: Vec<Item> = match &chain {
+        Some(c) => c.shown(state.items()).into_iter().cloned().collect(),
+        None => state.items().to_vec(),
+    };
+    // The sentinel is a place among the tiles shown, which a chain thins.
+    let sentinel = state
+        .has_more()
+        .then(|| shown.len().saturating_sub(SENTINEL_LEAD));
     let page = Page {
-        items: state.items().to_vec(),
+        items: shown,
         total: state.total(),
         start: 0,
     };
@@ -1178,7 +1376,7 @@ fn PagedGrid(
                 }
             }
         }
-        PosterList { page, sentinel: state.sentinel(), arrive_from }
+        PosterList { page, square, sentinel, arrive_from, mark }
         if state.has_more() {
             div { id: END_ID, aria_hidden: "true" }
             p { class: "pharos-muted", "Showing {state.items().len()} of {state.total()}." }
@@ -1293,6 +1491,9 @@ fn PosterList(
     square: Option<bool>,
     sentinel: Option<usize>,
     #[props(default)] arrive_from: usize,
+    /// Each tile gets a button that marks it watched, or unwatched again.
+    #[props(default)]
+    mark: bool,
 ) -> Element {
     // Each tile that arrives is placed in the wave by where it sits on
     // screen, once it is in the page.
@@ -1311,7 +1512,7 @@ fn PosterList(
     });
     rsx! {
         if page.items.is_empty() {
-            p { class: "pharos-empty", "Nothing in here yet." }
+            p { class: "pharos-empty", if mark { "Nothing in progress here." } else { "Nothing in here yet." } }
         }
         ul { class,
             for (at , item , (tile_class , stagger)) in tiles {
@@ -1320,8 +1521,18 @@ fn PosterList(
                     id: if sentinel == Some(at) { SENTINEL_ID },
                     class: tile_class,
                     style: stagger,
-                    "data-key-row": (item.kind == ItemKind::Album).then_some("true"),
+                    "data-key-row": (item.kind == ItemKind::Album || mark).then_some("true"),
                     PosterTile { item: item.clone() }
+                    if mark {
+                        div { class: "pharos-tile-mark",
+                            WatchedToggle {
+                                id: item.id,
+                                played: item.played,
+                                what: (item.kind == ItemKind::Series).then(|| "show".to_owned()),
+                                name: display_name(item),
+                            }
+                        }
+                    }
                     if item.kind == ItemKind::Album {
                         QueueButtons {
                             name: item.name.clone(),
@@ -1354,6 +1565,9 @@ fn Hero(
     facts: Vec<String>,
     square: bool,
     #[props(default)] mark: bool,
+    /// Offers the favourite mark alone, as an album or artist does (B1085).
+    #[props(default)]
+    favourite: bool,
     /// For a series, the episode its Play or Resume starts.
     #[props(default)]
     next: Option<Item>,
@@ -1364,12 +1578,17 @@ fn Hero(
         "pharos-hero-art"
     };
     let image = detail.as_ref().and_then(|d| d.item.image.clone());
+    let album = detail
+        .as_ref()
+        .is_some_and(|d| d.item.kind == ItemKind::Album);
     let facts = facts.join(" · ");
     rsx! {
         header { class: "pharos-hero",
             div { class: art_class,
-                if let Some(src) = image {
-                    img { src: platform::art_src(&src), alt: "" }
+                match image {
+                    Some(src) => rsx! { img { src: platform::art_src(&src), alt: "" } },
+                    None if album => rsx! { ArtPlaceholder { kind: ItemKind::Album, name: title.clone() } },
+                    None => rsx! {},
                 }
             }
             div { class: "pharos-hero-body",
@@ -1380,20 +1599,31 @@ fn Hero(
                 if let Some(d) = detail.as_ref() {
                     Ratings { kind: d.item.kind, imdb: d.item.imdb_rating, critic: d.item.critic_rating, tile: false }
                 }
-                if next.is_some() || (mark && detail.is_some()) {
+                if next.is_some() || ((mark || favourite) && detail.is_some()) {
                     div { class: "pharos-actions",
                         if let Some(ep) = next.as_ref() {
                             Link {
                                 to: Route::Watch(ep.id),
                                 class: "pharos-button",
-                                plays: ItemKind::Episode,
                                 id: MAIN_ACTION,
                                 key_action: "play",
                                 {next_label(ep)}
                             }
                         }
                         if let Some(d) = detail.as_ref().filter(|_| mark) {
-                            WatchedToggle { id: d.item.id, played: d.item.played, what: "show" }
+                            WatchedToggle {
+                                id: d.item.id,
+                                played: d.item.played,
+                                what: "show",
+                                name: d.item.name.clone(),
+                            }
+                        }
+                        if let Some(d) = detail.as_ref().filter(|_| mark || favourite) {
+                            FavoriteToggle {
+                                id: d.item.id,
+                                favorite: d.item.favorite,
+                                name: d.item.name.clone(),
+                            }
                         }
                     }
                 }
@@ -1447,6 +1677,9 @@ pub fn ShowView(show: Show, #[props(default)] seen: Vec<MemberSeen>) -> Element 
                 mark: true,
                 next: next_episode(&show.episodes.items).cloned(),
             }
+            if let Some(series) = series {
+                super::check_match::CheckMatchBadge { series }
+            }
             if show.seasons.len() > 1 {
                 nav { class: "pharos-tabs", aria_label: "Seasons", "data-key-tabs": "seasons",
                     for season in show.seasons.iter() {
@@ -1470,14 +1703,31 @@ pub fn ShowView(show: Show, #[props(default)] seen: Vec<MemberSeen>) -> Element 
                             id: season,
                             played: all_played(&show.episodes, show.season_played),
                             what: "season",
+                            name: show
+                                .seasons
+                                .iter()
+                                .find(|s| s.id == season)
+                                .map_or_else(String::new, |s| s.name.clone()),
                         }
                     }
                 }
             }
             InThisGroup { rows: in_group }
-            EpisodeList { page: show.episodes.clone(), seen }
+            {remount_on(
+                &show.selected.map_or_else(String::new, |s| s.to_string()),
+                rsx! { EpisodeList { page: show.episodes.clone(), seen, source: episode_source(&show) } },
+            )}
         }
     }
+}
+
+/// How to list the rest of a show page's episodes: the shown season's, or the
+/// series' own when it has no seasons.
+fn episode_source(show: &Show) -> Option<Listing> {
+    let parent = show
+        .selected
+        .or_else(|| show.series.as_ref().map(|d| d.item.id))?;
+    Some(Listing::of(parent, None, INDEX_ORDER))
 }
 
 /// The episode a show page's Play starts, from the season shown: the one
@@ -1548,15 +1798,104 @@ fn all_played(page: &Page, aggregate: Option<bool>) -> bool {
 }
 
 /// A season's episodes as rows: still, number and name, runtime, watched
-/// state and progress. The row opens the episode; Play starts it.
+/// state and progress. The row opens the episode; Play starts it. Given the
+/// `source` listing, a season longer than one page offers "Show more" for the
+/// rest (B821) and keeps what it loaded when a watched mark reloads the
+/// screen.
 #[component]
-pub fn EpisodeList(page: Page, #[props(default)] seen: Vec<MemberSeen>) -> Element {
+pub fn EpisodeList(
+    page: Page,
+    #[props(default)] seen: Vec<MemberSeen>,
+    #[props(default)] source: Option<Listing>,
+) -> Element {
+    let ctx = try_use_context::<Ctx>();
+    let mut pager = use_signal(|| Pager::new(page.clone()));
+    // The fetch of a range of the listing, as `PagedGrid` makes it; `None`
+    // when there is nothing to ask or no one to ask.
+    let read = {
+        let source = source.clone();
+        move |start: u32, limit: u32| {
+            let (ctx, source) = (ctx?, source.clone()?);
+            let api = ctx.api.peek().clone()?;
+            Some(async move {
+                let result = fetch_more(
+                    &api,
+                    call,
+                    &source,
+                    start,
+                    limit,
+                    |line| platform::warn(&line),
+                    platform::report_event,
+                )
+                .await;
+                if let Err(e) = &result {
+                    if e.needs_sign_in() {
+                        let mut machine = ctx.machine;
+                        machine.write().apply(Event::NeedsSignIn);
+                    }
+                }
+                result
+            })
+        }
+    };
+    // A reloaded screen brings a fresh first page: swap it in, and read the
+    // pages loaded after it again so their marks are fresh too.
+    let reloaded = page.clone();
+    let reread = read.clone();
+    use_effect(use_reactive!(|reloaded| {
+        let same = {
+            let state = pager.peek();
+            state.total() == reloaded.total && state.items().starts_with(&reloaded.items)
+        };
+        if same {
+            return;
+        }
+        let Some((start, count)) = pager.write().refresh_head(reloaded) else {
+            return;
+        };
+        match reread(start, count) {
+            Some(fetch) => {
+                spawn(async move {
+                    match fetch.await {
+                        Ok(tail) => pager.write().land_tail(start, tail),
+                        Err(_) => pager.write().fail(),
+                    }
+                });
+            }
+            None => pager.write().fail(),
+        }
+    }));
+    let mut more = move |trigger: Trigger| {
+        let Some(start) = pager.write().begin(trigger) else {
+            return;
+        };
+        match read(start, BROWSE_PAGE) {
+            Some(fetch) => {
+                spawn(async move {
+                    match fetch.await {
+                        Ok(next) => pager.write().land(next),
+                        Err(_) => pager.write().fail(),
+                    }
+                });
+            }
+            None => pager.write().fail(),
+        }
+    };
+    let state = pager.read();
+    let paged = source.is_some() && state.has_more();
+    let label = if state.in_flight() {
+        "Loading…"
+    } else if state.failed() {
+        "Try again"
+    } else {
+        "Show more"
+    };
     rsx! {
-        if page.items.is_empty() {
+        if state.items().is_empty() {
             p { class: "pharos-empty", "No episodes yet." }
         }
         ol { class: "pharos-episodes", "data-keys-list": "episodes",
-            for ep in page.items.iter() {
+            for ep in state.items().iter() {
                 li {
                     key: "{ep.id}",
                     "data-key-row": "episode",
@@ -1564,7 +1903,18 @@ pub fn EpisodeList(page: Page, #[props(default)] seen: Vec<MemberSeen>) -> Eleme
                 }
             }
         }
-        MoreNote { page }
+        if paged {
+            p { class: "pharos-muted", "Showing {state.items().len()} of {state.total()}." }
+            button {
+                class: "pharos-button",
+                r#type: "button",
+                disabled: state.in_flight(),
+                onclick: move |_| more(Trigger::Button),
+                "{label}"
+            }
+        } else if source.is_none() {
+            MoreNote { page: Page { items: state.items().to_vec(), total: state.total(), start: 0 } }
+        }
     }
 }
 
@@ -1593,14 +1943,23 @@ fn EpisodeRow(episode: Item, #[props(default)] seen: Vec<seen::SeenRow>) -> Elem
                         if let Some(l) = length { "{l}" }
                         if episode.played { " · Watched" }
                     }
+                    if episode.damaged {
+                        span { class: "pharos-episode-damaged", title: "The file is damaged", "Damaged" }
+                    }
                     SeenDots { rows: seen }
                 }
             }
             EpisodeMark { id: episode.id, label: label.clone(), played: episode.played }
+            QueueButtons {
+                name: label.clone(),
+                tracks: vec![episode.clone()],
+                album: None,
+                kind: QueueTarget::EpisodeRow,
+            }
+            super::check_match::RematchEpisode { id: episode.id }
             Link {
                 to: Route::Watch(episode.id),
                 class: "pharos-button pharos-episode-play",
-                plays: ItemKind::Episode,
                 key_action: "play",
                 if progress.is_some() { "Resume" } else { "Play" }
             }
@@ -1625,7 +1984,7 @@ fn EpisodeMark(id: ItemRef, label: String, played: bool) -> Element {
             title: "{what}",
             "aria-label": "{what}",
             "data-key-action": "watched",
-            onclick: move |_| mark.0.call((id, !played)),
+            onclick: move |_| mark.0.call((id, !played, label.clone())),
             svg { view_box: "0 0 24 24", "aria-hidden": "true",
                 path { d: "M5 12.5l4.5 4.5L19 7.5" }
             }
@@ -1638,11 +1997,14 @@ fn EpisodeMark(id: ItemRef, label: String, played: bool) -> Element {
 enum MusicTab {
     Artists,
     Albums,
+    /// The mixes the listener can start (B901/V850).
+    Playlists,
 }
 
-/// A music library: its artists or its albums, switched by tabs.
+/// A music library: its artists, its albums or its playlists, switched by
+/// tabs.
 #[component]
-pub fn MusicLibraryView(title: String, artists: Page, albums: Page) -> Element {
+pub fn MusicLibraryView(title: String, library: ItemRef, artists: Page, albums: Page) -> Element {
     let mut tab = use_signal(|| MusicTab::Artists);
     let tab_class = move |t| {
         if tab() == t {
@@ -1671,10 +2033,41 @@ pub fn MusicLibraryView(title: String, artists: Page, albums: Page) -> Element {
                     onclick: move |_| tab.set(MusicTab::Albums),
                     "Albums"
                 }
+                button {
+                    r#type: "button",
+                    role: "tab",
+                    class: tab_class(MusicTab::Playlists),
+                    aria_selected: tab() == MusicTab::Playlists,
+                    onclick: move |_| tab.set(MusicTab::Playlists),
+                    "Playlists"
+                }
             }
+            // Each tab pages through its own listing (B821); switching tabs
+            // mounts the other grid, which starts from the page loaded.
             match tab() {
-                MusicTab::Artists => rsx! { PosterGrid { page: artists.clone(), square: true } },
-                MusicTab::Albums => rsx! { PosterGrid { page: albums.clone(), square: true } },
+                MusicTab::Artists => remount_on(
+                    "artists",
+                    rsx! {
+                        PagedGrid {
+                            first: artists.clone(),
+                            source: Listing::of(library, Some(ItemKind::Artist), "SortName"),
+                            rail: None,
+                            square: Some(true),
+                        }
+                    },
+                ),
+                MusicTab::Playlists => rsx! { mixes::MixShelf {} },
+                MusicTab::Albums => remount_on(
+                    "albums",
+                    rsx! {
+                        PagedGrid {
+                            first: albums.clone(),
+                            source: Listing::of(library, Some(ItemKind::Album), "SortName"),
+                            rail: None,
+                            square: Some(true),
+                        }
+                    },
+                ),
             }
         }
     }
@@ -1690,8 +2083,28 @@ pub fn ArtistView(detail: Detail, albums: Page) -> Element {
     };
     rsx! {
         section { class: "pharos-artist",
-            Hero { title: detail.item.name.clone(), detail: Some(detail.clone()), facts, square: true }
-            PosterGrid { page: albums, square: true }
+            Hero {
+                title: detail.item.name.clone(),
+                detail: Some(detail.clone()),
+                facts,
+                square: true,
+                favourite: true,
+            }
+            {remount_on(
+                &detail.item.id.to_string(),
+                rsx! {
+                    PagedGrid {
+                        first: albums,
+                        source: Listing::of(
+                            detail.item.id,
+                            Some(ItemKind::Album),
+                            ARTIST_ALBUM_ORDER,
+                        ),
+                        rail: None,
+                        square: Some(true),
+                    }
+                },
+            )}
         }
     }
 }
@@ -1724,7 +2137,13 @@ pub fn AlbumView(detail: Detail, tracks: Page) -> Element {
         .unwrap_or_default();
     rsx! {
         section { class: "pharos-album",
-            Hero { title: detail.item.name.clone(), detail: Some(detail.clone()), facts, square: true }
+            Hero {
+                title: detail.item.name.clone(),
+                detail: Some(detail.clone()),
+                facts,
+                square: true,
+                favourite: true,
+            }
             if !tracks.items.is_empty() {
                 QueueButtons {
                     name: detail.item.name.clone(),
@@ -1844,6 +2263,11 @@ pub enum QueueTarget {
     AlbumCard,
     /// An album's songs, on its own page: labelled buttons.
     AlbumPage,
+    /// A film or an episode on its own page, for the video queue (V853):
+    /// labelled buttons.
+    VideoPage,
+    /// An episode on its show's list, for the video queue: icons only.
+    EpisodeRow,
 }
 
 impl QueueTarget {
@@ -1852,6 +2276,22 @@ impl QueueTarget {
             QueueTarget::Song => "song",
             QueueTarget::AlbumCard => "album_card",
             QueueTarget::AlbumPage => "album_page",
+            QueueTarget::VideoPage => "video_page",
+            QueueTarget::EpisodeRow => "episode_row",
+        }
+    }
+
+    /// Whether it queues on the video queue rather than the music one.
+    pub fn video(self) -> bool {
+        matches!(self, QueueTarget::VideoPage | QueueTarget::EpisodeRow)
+    }
+
+    /// The note when nothing it named could be queued.
+    fn nothing(self, name: &str) -> String {
+        if self.video() {
+            format!("{name} cannot be queued.")
+        } else {
+            format!("{name} has no songs to queue.")
         }
     }
 }
@@ -1876,7 +2316,11 @@ pub fn QueueButtons(
         format!("Play {name} next"),
         format!("Add {name} to the queue"),
     );
-    let queue = try_use_context::<QueueCtx>();
+    let queue = if kind.video() {
+        try_use_context::<VideoQueueCtx>().map(|VideoQueueCtx(q, _)| q)
+    } else {
+        try_use_context::<QueueCtx>().map(|q| q.0)
+    };
     let ctx = try_use_context::<Ctx>();
     // A song row can also start a mix like it, playing at once (spec 024).
     // No mix in a SyncPlay group, where the group picks the songs.
@@ -1889,9 +2333,14 @@ pub fn QueueButtons(
         .flatten()
         .filter(|_| mix.is_some());
     let mix_label = format!("Start a mix like {name}");
-    let Some(QueueCtx(mut queue)) = queue else {
+    // In a group the group picks what plays, and the player ignores the
+    // video queue, so nothing offers to fill it (V853).
+    let Some(mut queue) = queue.filter(|_| !(kind.video() && in_group)) else {
         return rsx! {};
     };
+    // A row's buttons answer `a` and `A` only from that row: with the focus
+    // elsewhere on a show's page, they would queue its first episode.
+    let row_only = kind == QueueTarget::EpisodeRow;
     let put = move |place: Place| {
         let (tracks, name) = (tracks.clone(), name.clone());
         spawn(async move {
@@ -1912,11 +2361,19 @@ pub fn QueueButtons(
             let place_label = place.label();
             match found {
                 Ok(items) => {
-                    let songs: Vec<Track> = items
-                        .iter()
-                        .filter(|i| i.kind == ItemKind::Audio)
-                        .map(Track::from)
-                        .collect();
+                    let songs: Vec<Track> = if kind.video() {
+                        items
+                            .iter()
+                            .filter(|i| video_kind(i.kind))
+                            .map(Track::video)
+                            .collect()
+                    } else {
+                        items
+                            .iter()
+                            .filter(|i| i.kind == ItemKind::Audio)
+                            .map(Track::from)
+                            .collect()
+                    };
                     let count = songs.len();
                     platform::info(&added_line(place_label, target, count));
                     match place {
@@ -1924,7 +2381,7 @@ pub fn QueueButtons(
                         Place::End => queue.write().add(songs),
                     }
                     note.set(Some(match (place, count) {
-                        (_, 0) => format!("{name} has no songs to queue."),
+                        (_, 0) => kind.nothing(&name),
                         (Place::Next, _) => format!("{name} plays next."),
                         (Place::End, _) => format!("{name} added to the queue."),
                     }));
@@ -1945,7 +2402,7 @@ pub fn QueueButtons(
         });
     };
     let put_end = put.clone();
-    let labelled = kind == QueueTarget::AlbumPage;
+    let labelled = matches!(kind, QueueTarget::AlbumPage | QueueTarget::VideoPage);
     rsx! {
         div { class: "pharos-queue-buttons", "data-target": kind.label(),
             button {
@@ -1953,6 +2410,7 @@ pub fn QueueButtons(
                 r#type: "button",
                 title: "{next_label}",
                 "data-key-action": "queue-next",
+                "data-key-row-only": row_only.then_some("true"),
                 aria_label: "{next_label}",
                 onclick: move |evt: MouseEvent| {
                     evt.stop_propagation();
@@ -1967,6 +2425,7 @@ pub fn QueueButtons(
                 r#type: "button",
                 title: "{end_label}",
                 "data-key-action": "queue-end",
+                "data-key-row-only": row_only.then_some("true"),
                 aria_label: "{end_label}",
                 onclick: move |evt: MouseEvent| {
                     evt.stop_propagation();
@@ -2115,7 +2574,9 @@ mod tests {
     use std::cell::RefCell;
     use std::collections::HashMap;
 
-    use pharos_client::api::{Capabilities, Decision, Home, PlaybackGrant, TrackPicks};
+    use pharos_client::api::{
+        Capabilities, Decision, Home, PlaybackGrant, StartTracks, TrackPicks,
+    };
 
     use super::*;
     use crate::native::views::Nav;
@@ -2138,6 +2599,9 @@ mod tests {
             library_kind: None,
             imdb_rating: None,
             critic_rating: None,
+            artist: None,
+            stereo: None,
+            damaged: false,
         }
     }
 
@@ -2154,6 +2618,11 @@ mod tests {
             fonts: Vec::new(),
             artists: Vec::new(),
             album: None,
+            cast: Vec::new(),
+            versions: Vec::new(),
+            damage: None,
+            book: None,
+            read_position: None,
         }
     }
 
@@ -2343,6 +2812,8 @@ mod tests {
         stamped: RefCell<Vec<(String, String, u32, u32)>>,
         /// Refuses every listing.
         refuse_lists: bool,
+        /// Whether each listing asked for box sets folded (B1086).
+        collapsed: RefCell<Vec<bool>>,
     }
 
     fn refused() -> ClientError {
@@ -2369,6 +2840,7 @@ mod tests {
             limit: u32,
         ) -> Result<Page, ClientError> {
             let (parent, group) = (listing.parent, listing.group);
+            self.collapsed.borrow_mut().push(listing.collapse);
             self.asked
                 .borrow_mut()
                 .push((parent, group, listing.sort_by.clone()));
@@ -2405,6 +2877,13 @@ mod tests {
         async fn detail(&self, _: &CallInfo, id: ItemRef) -> Result<Detail, ClientError> {
             self.details.get(&id).cloned().ok_or_else(refused)
         }
+        async fn person(
+            &self,
+            _: &CallInfo,
+            _: ItemRef,
+        ) -> Result<pharos_client::api::PersonPage, ClientError> {
+            Err(refused())
+        }
         async fn lyrics(
             &self,
             _: &CallInfo,
@@ -2426,9 +2905,18 @@ mod tests {
             &self,
             _: &CallInfo,
             _: ItemRef,
+            _: &str,
             _: &Capabilities,
             _: TrackPicks,
         ) -> Result<(Decision, NoGrant), ClientError> {
+            Err(refused())
+        }
+        async fn start_tracks(
+            &self,
+            _: &CallInfo,
+            _: ItemRef,
+            _: &Capabilities,
+        ) -> Result<StartTracks, ClientError> {
             Err(refused())
         }
     }
@@ -2530,6 +3018,7 @@ mod tests {
                 page: page(vec![item(ItemRef::Real(3), ItemKind::Movie, "Film")]),
                 more: Some(Listing::of(id, None, "SortName")),
                 library: false,
+                sets: false,
             }
         );
         assert!(
@@ -2555,18 +3044,112 @@ mod tests {
         assert_eq!(plan(Some(&artist)), Plan::Artist);
     }
 
+    fn mixed_library(series: u64, stored: Vec<Item>) -> (Fake, ItemRef) {
+        let lib = ItemRef::Synth(50);
+        let mut fake = Fake::default();
+        let mut l = item(lib, ItemKind::Library, "Mixed");
+        l.library_kind = Some(LibraryKind::Mixed);
+        fake.details.insert(lib, detail(l));
+        fake.lists.insert(
+            (lib, Some(ItemKind::Series)),
+            (0..series)
+                .map(|n| item(ItemRef::Synth(1000 + n), ItemKind::Series, &format!("S{n}")))
+                .collect(),
+        );
+        fake.lists.insert((lib, None), stored);
+        (fake, lib)
+    }
+
     #[test]
     fn a_mixed_library_shows_series_in_place_of_their_episodes() {
-        let series = page(vec![item(SERIES, ItemKind::Series, "Show")]);
-        let stored = page(vec![
+        let stored = vec![
             item(ItemRef::Real(1), ItemKind::Episode, "Pilot"),
             item(ItemRef::Real(2), ItemKind::Movie, "Film"),
-        ]);
-        let mixed = series_first(series, stored.clone());
-        let names: Vec<_> = mixed.items.iter().map(|i| i.name.as_str()).collect();
-        assert_eq!(names, ["Show", "Film"]);
-        assert_eq!(mixed.total, 2);
-        assert_eq!(series_first(Page::default(), stored.clone()), stored);
+        ];
+        let (fake, lib) = mixed_library(1, stored);
+        let Browse::Mixed { page, chain, .. } =
+            run(load(&fake, &CallInfo::default(), lib, |_| {})).unwrap()
+        else {
+            panic!("not a mixed library");
+        };
+        let names: Vec<_> = chain
+            .shown(&page.items)
+            .iter()
+            .map(|i| i.name.clone())
+            .collect();
+        assert_eq!(names, ["S0", "Film"]);
+        assert_eq!(chain.head_total, 1);
+        assert_eq!(page.total, 3, "every place the server counts");
+    }
+
+    #[test]
+    fn a_mixed_library_without_series_shows_what_it_stores() {
+        let stored = vec![item(ItemRef::Real(1), ItemKind::Episode, "Pilot")];
+        let (fake, lib) = mixed_library(0, stored);
+        let Browse::Mixed { page, chain, .. } =
+            run(load(&fake, &CallInfo::default(), lib, |_| {})).unwrap()
+        else {
+            panic!("not a mixed library");
+        };
+        assert_eq!(chain.shown(&page.items).len(), 1);
+    }
+
+    #[test]
+    fn a_mixed_library_with_more_series_than_a_page_continues_them_first() {
+        let stored = vec![item(ItemRef::Real(2), ItemKind::Movie, "Film")];
+        let (fake, lib) = mixed_library(u64::from(BROWSE_PAGE) + 20, stored);
+        let Browse::Mixed { page, chain, .. } =
+            run(load(&fake, &CallInfo::default(), lib, |_| {})).unwrap()
+        else {
+            panic!("not a mixed library");
+        };
+        assert_eq!(page.items.len(), BROWSE_PAGE as usize, "series only so far");
+        assert_eq!(page.total, BROWSE_PAGE + 21);
+        let (part, start, limit) = chain.step(BROWSE_PAGE, BROWSE_PAGE);
+        assert_eq!(chain.listing(part).group, Some(ItemKind::Series));
+        assert_eq!((start, limit), (BROWSE_PAGE, 20));
+    }
+
+    #[test]
+    fn a_music_library_names_itself_for_its_tabs_to_page() {
+        let lib = ItemRef::Synth(60);
+        let mut fake = Fake::default();
+        let mut l = item(lib, ItemKind::Library, "Music");
+        l.library_kind = Some(LibraryKind::Music);
+        fake.details.insert(lib, detail(l));
+        fake.lists.insert(
+            (lib, Some(ItemKind::Artist)),
+            (0..150)
+                .map(|n| item(ItemRef::Synth(2000 + n), ItemKind::Artist, "A"))
+                .collect(),
+        );
+        let Browse::Music {
+            library, artists, ..
+        } = run(load(&fake, &CallInfo::default(), lib, |_| {})).unwrap()
+        else {
+            panic!("not a music library");
+        };
+        assert_eq!(library, lib);
+        assert_eq!((artists.items.len(), artists.total), (100, 150));
+    }
+
+    #[test]
+    fn a_season_longer_than_a_page_offers_the_rest() {
+        let episodes: Vec<Item> = (0..100)
+            .map(|n| item(ItemRef::Real(n), ItemKind::Episode, "E"))
+            .collect();
+        let mut long = page(episodes);
+        long.total = 150;
+        let source = Some(Listing::of(S1, None, INDEX_ORDER));
+        let (paged, plain) = (long.clone(), long);
+        let html = render(move || {
+            rsx! { EpisodeList { page: paged.clone(), source: source.clone() } }
+        });
+        assert!(html.contains("Showing 100 of 150."), "{html}");
+        assert!(html.contains(">Show more<"), "{html}");
+        let html = render(move || rsx! { EpisodeList { page: plain.clone() } });
+        assert!(html.contains("Showing 100 of 150."), "{html}");
+        assert!(!html.contains("Show more"), "{html}");
     }
 
     #[test]
@@ -2598,6 +3181,37 @@ mod tests {
         assert!(html.contains("3:07"), "{html}");
         assert!(html.contains("3 tracks"), "{html}");
         assert!(html.contains("/ui/watch/1"), "{html}");
+    }
+
+    /// B1085: an album or an artist can be made a favourite from its page,
+    /// and shows when it is one; neither offers a watched mark.
+    #[test]
+    fn albums_and_artists_offer_a_favourite_mark() {
+        let mut record = item(ItemRef::Synth(5), ItemKind::Album, "Record");
+        record.favorite = true;
+        let album = detail(record);
+        let tracks = vec![item(ItemRef::Real(1), ItemKind::Audio, "Opener")];
+        let html = render(move || {
+            rsx! { AlbumView { detail: album.clone(), tracks: page(tracks.clone()) } }
+        });
+        assert!(
+            html.contains(r#"data-key-action="favorite""#)
+                && html.contains(r#"aria-pressed="true""#)
+                && html.contains("pharos-favorite on"),
+            "a favourite album says so: {html}"
+        );
+        assert!(!html.contains(r#"data-key-action="watched""#), "{html}");
+
+        let artist = detail(item(ItemRef::Synth(6), ItemKind::Artist, "Band"));
+        let albums = vec![item(ItemRef::Synth(5), ItemKind::Album, "Record")];
+        let html = render(move || {
+            rsx! { ArtistView { detail: artist.clone(), albums: page(albums.clone()) } }
+        });
+        assert!(
+            html.contains(r#"data-key-action="favorite""#)
+                && html.contains(r#"aria-pressed="false""#),
+            "an artist can be made a favourite: {html}"
+        );
     }
 
     /// A season route's tab names the season and the show; the series route
@@ -2678,6 +3292,11 @@ mod tests {
             "{html}"
         );
         assert!(html.contains(">Mark show watched<"), "{html}");
+        assert!(
+            html.contains(r#"data-key-action="favorite""#)
+                && html.contains(r#"aria-pressed="false""#),
+            "the show can be made a favourite (B1082): {html}"
+        );
 
         pilot.played = true;
         let all = show(vec![pilot, second]);
@@ -2708,13 +3327,63 @@ mod tests {
         let mut dom = VirtualDom::new_with_props(
             |body: std::rc::Rc<dyn Fn() -> Element>| {
                 use_context_provider(|| Nav(EventHandler::new(|_: Route| {})));
-                use_context_provider(|| MarkPlayed(EventHandler::new(|_: (ItemRef, bool)| {})));
+                use_context_provider(|| {
+                    MarkPlayed(EventHandler::new(|_: (ItemRef, bool, String)| {}))
+                });
+                use_context_provider(|| {
+                    super::super::views::MarkFavorite(EventHandler::new(
+                        |_: (ItemRef, bool, String)| {},
+                    ))
+                });
                 body()
             },
             body,
         );
         dom.rebuild_in_place();
         dioxus_ssr::render(&dom)
+    }
+
+    /// B1200 (V1160): an "In progress" grid gives each tile its watched
+    /// mark, a show's naming the show; any other grid gives none.
+    /// Disarm check: with `mark` left false, no button renders.
+    #[test]
+    fn an_in_progress_grid_offers_each_tile_its_watched_mark() {
+        let mut film = item(ItemRef::Real(1), ItemKind::Movie, "Film A");
+        film.position_ms = 60_000;
+        film.runtime_ms = 600_000;
+        let show = item(ItemRef::Synth(2), ItemKind::Series, "Show B");
+        let tiles = page(vec![film, show]);
+        let marked = tiles.clone();
+        let html = render(
+            move || rsx! { PosterList { page: marked.clone(), square: None, sentinel: None, mark: true } },
+        );
+        assert!(html.contains(">Mark watched<"), "{html}");
+        assert!(html.contains(">Mark show watched<"), "{html}");
+        let html = render(
+            move || rsx! { PosterList { page: tiles.clone(), square: None, sentinel: None } },
+        );
+        assert!(!html.contains("Mark "), "{html}");
+        let empty = render(
+            || rsx! { PosterList { page: page(vec![]), square: None, sentinel: None, mark: true } },
+        );
+        assert!(empty.contains("Nothing in progress here."), "{empty}");
+    }
+
+    /// B801 (V751): an album with no cover heads its page with the music
+    /// tile; a series with no poster keeps an empty frame.
+    #[test]
+    fn an_album_without_a_cover_heads_its_page_with_the_music_tile() {
+        let album = detail(item(ItemRef::Synth(7), ItemKind::Album, "Mezzanine"));
+        let html = render(move || {
+            rsx! { Hero { title: "Mezzanine", detail: Some(album.clone()), facts: vec![], square: true } }
+        });
+        assert!(html.contains("pharos-art-song"), "{html}");
+
+        let series = detail(item(ItemRef::Synth(8), ItemKind::Series, "Frieren"));
+        let html = render(move || {
+            rsx! { Hero { title: "Frieren", detail: Some(series.clone()), facts: vec![], square: false } }
+        });
+        assert!(!html.contains("pharos-art-song"), "{html}");
     }
 
     fn seen_by(id: &str, name: &str, items: Vec<seen::ItemSeen>) -> MemberSeen {
@@ -2882,13 +3551,18 @@ mod tests {
         assert_eq!(listing.group, Some(ItemKind::Series));
         let released = Narrow {
             genre: Some("Drama".into()),
-            played: Some(false),
+            watched: Some(Watched::Unwatched),
             ..Narrow::default().ordered(Order::Released)
         };
         let listing = released.apply(&base);
         assert_eq!(listing.sort_by, "PremiereDate,ProductionYear,SortName");
         assert_eq!(listing.genre.as_deref(), Some("Drama"));
-        assert_eq!(listing.played, Some(false));
+        assert_eq!(listing.watched, Some(Watched::Unwatched));
+        let three_d = Narrow {
+            stereo: Some(true),
+            ..Narrow::default()
+        };
+        assert_eq!(three_d.apply(&base).stereo, Some(true));
         let by_name = released.ordered(Order::Name);
         assert!(by_name.rail() == Rail::Letters && !by_name.descending);
         assert_eq!(by_name.apply(&base).sort_by, "SortName");
@@ -2917,12 +3591,20 @@ mod tests {
             Narrow {
                 descending: false,
                 genre: Some("Sci-Fi & Fantasy".into()),
-                played: Some(false),
+                watched: Some(Watched::Unwatched),
                 ..Narrow::default().ordered(Order::Released)
             },
             Narrow {
                 genre: Some("Comédie+ 100%".into()),
-                played: Some(true),
+                watched: Some(Watched::Watched),
+                ..Narrow::default()
+            },
+            Narrow {
+                watched: Some(Watched::InProgress),
+                ..Narrow::default()
+            },
+            Narrow {
+                stereo: Some(false),
                 ..Narrow::default()
             },
         ] {
@@ -2972,6 +3654,51 @@ mod tests {
             assert_eq!(Order::from_token(order.token()), Some(order));
         }
         assert_eq!(Order::from_token("bogus"), None);
+    }
+
+    /// B810: collections and playlists open as the generic grid of their
+    /// members, without the library filter bar.
+    #[test]
+    fn collections_and_playlists_load_as_a_plain_grid() {
+        let mut fake = Fake::default();
+        for (n, kind) in [(10, ItemKind::Collection), (11, ItemKind::Playlist)] {
+            let id = ItemRef::Real(n);
+            fake.details.insert(id, detail(item(id, kind, "Set")));
+            assert_eq!(plan(fake.details.get(&id)), Plan::Grid, "{kind:?}");
+            let opened = run(load(&fake, &CallInfo::default(), id, |_| {})).unwrap();
+            assert!(
+                matches!(opened, Browse::Grid { library: false, .. }),
+                "{kind:?}"
+            );
+        }
+    }
+
+    /// B1086: a Movies library opens with its films grouped into box sets
+    /// unless the device turned that off, and offers the choice; a Books
+    /// library or a collection neither groups nor offers it.
+    /// Disarm check: with `load` leaving `collapse` unset, the Movies
+    /// listing asks for each film.
+    #[test]
+    fn a_movies_library_groups_its_box_sets_and_offers_the_choice() {
+        let mut fake = Fake::default();
+        for (n, kind) in [(9, LibraryKind::Movies), (8, LibraryKind::Books)] {
+            let id = ItemRef::Real(n);
+            let mut library = item(id, ItemKind::Library, "Lib");
+            library.library_kind = Some(kind);
+            fake.details.insert(id, detail(library));
+        }
+        let set = ItemRef::Real(10);
+        fake.details
+            .insert(set, detail(item(set, ItemKind::Collection, "Boxset")));
+        let opened = |id| run(load(&fake, &CallInfo::default(), id, |_| {})).unwrap();
+        let sets = |b: &Browse| matches!(b, Browse::Grid { sets: true, .. });
+        assert!(sets(&opened(ItemRef::Real(9))));
+        assert!(!sets(&opened(ItemRef::Real(8))));
+        assert!(!sets(&opened(set)));
+        assert_eq!(*fake.collapsed.borrow(), [true, false, false]);
+        assert!(collections_on(None));
+        assert!(collections_on(Some("on")));
+        assert!(!collections_on(Some("off")));
     }
 
     #[test]

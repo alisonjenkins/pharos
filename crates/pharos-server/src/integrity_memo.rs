@@ -56,6 +56,10 @@ pub struct Entry {
     /// know where the damage starts and what the demuxer called it, and this
     /// file is the only place that survives the scan.
     pub report: IntegrityReport,
+    /// When the scan ran, in unix seconds. Absent on entries written before
+    /// this field existed; those stay valid rather than forcing a re-read.
+    #[serde(default)]
+    pub checked_at: Option<i64>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -112,8 +116,13 @@ impl IntegrityMemo {
     }
 
     /// Whether this file, in this state, has already been read end to end.
+    ///
+    /// A damaged verdict recorded before damage spans existed does not count:
+    /// players mark those spans, and the few damaged files are cheap to read
+    /// again, unlike bumping [`INTEGRITY_SCAN_VERSION`] for the whole library.
     pub fn is_scanned(&self, id: u64, sig: Option<(i64, u64)>) -> bool {
-        self.get(id, sig).is_some()
+        self.get(id, sig)
+            .is_some_and(|e| !e.report.is_damaged() || e.report.ranges.is_some())
     }
 
     /// Record a verdict.
@@ -130,9 +139,28 @@ impl IntegrityMemo {
                     mtime,
                     size,
                     report,
+                    checked_at: now_secs(),
                 },
             );
         }
+    }
+
+    /// Drop this file's verdict, if any. Persisted at the sweep's next save.
+    pub fn forget(&self, id: u64) {
+        if let Ok(mut d) = self.doc.write() {
+            d.entries.remove(&id);
+        }
+    }
+
+    /// The recorded verdict's damaged flag for this id, whatever state the
+    /// file was in; `None` when there is no verdict. For progress counts.
+    pub fn recorded_damaged(&self, id: u64) -> Option<bool> {
+        self.doc
+            .read()
+            .ok()?
+            .entries
+            .get(&id)
+            .map(|e| e.report.is_damaged())
     }
 
     /// Every file currently recorded as damaged, newest verdict wins. This is
@@ -147,6 +175,52 @@ impl IntegrityMemo {
             .filter(|(_, e)| e.report.is_damaged())
             .map(|(id, e)| (*id, e.clone()))
             .collect()
+    }
+
+    /// The ids of every file whose damage can break playback, for the
+    /// library's "Damaged" badges. A file with no seek index plays through, so
+    /// it is listed for admins (`damaged`) but not badged (B1162).
+    pub fn damaged_ids(&self) -> std::collections::HashSet<u64> {
+        let Ok(d) = self.doc.read() else {
+            return Default::default();
+        };
+        d.entries
+            .iter()
+            .filter(|(_, e)| e.report.breaks_playback())
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
+    /// This file's recorded verdict, whatever state the file was in when it
+    /// was read: like the damaged list, it stands until the sweep reads the
+    /// file again.
+    pub fn verdict(&self, id: u64) -> Option<Entry> {
+        self.doc.read().ok()?.entries.get(&id).cloned()
+    }
+
+    /// Where an unindexed file's media really ends, when a full read of it
+    /// found less than its header claims (B1198, V1158): past that point there is nothing
+    /// to encode, so the segment cache serves a filler at once rather than
+    /// asking the encoder for frames that do not exist. Only a read that ran
+    /// to end-of-file says where the media ends; one that gave up early does
+    /// not. The file state the read saw comes along, so a file replaced since
+    /// is encoded as normal.
+    pub fn known_end(&self, id: u64) -> Option<pharos_cache::KnownSourceEnd> {
+        let entry = self.verdict(id)?;
+        let report = &entry.report;
+        // Only an unindexed file: a seek into one reads it from byte 0 with
+        // the same demuxer the scan used, so where the scan stopped is where
+        // any encode stops too. An indexed file's demuxer can stop at a bad
+        // chunk the index then seeks past, and a filler there would replace
+        // real picture.
+        let ends_early = report.complete
+            && report.is_unindexed()
+            && report.declared_ms.is_some_and(|d| d > report.scanned_ms);
+        ends_early.then_some(pharos_cache::KnownSourceEnd {
+            end_ms: report.scanned_ms,
+            mtime_secs: entry.mtime,
+            size: entry.size,
+        })
     }
 
     /// How many files have been scanned.
@@ -182,6 +256,13 @@ impl IntegrityMemo {
     }
 }
 
+fn now_secs() -> Option<i64> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|d| i64::try_from(d.as_secs()).ok())
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -206,8 +287,101 @@ mod tests {
             first_fault: Some("[matroska,webm] invalid as first byte of an EBML number".into()),
             scanned_ms: 19_000,
             complete: true,
+            ranges: Some(vec![pharos_transcode::integrity::DamageRange {
+                start_ms: 2_870,
+                end_ms: 3_400,
+            }]),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn a_damaged_verdict_from_before_spans_is_read_again() {
+        let memo = IntegrityMemo::load("/nonexistent/memo.json", 1);
+        let legacy = IntegrityReport {
+            ranges: None,
+            ..damaged()
+        };
+        memo.record(1, Some((100, 500)), legacy);
+        memo.record(
+            2,
+            Some((100, 500)),
+            IntegrityReport {
+                ranges: None,
+                ..clean()
+            },
+        );
+        assert!(
+            !memo.is_scanned(1, Some((100, 500))),
+            "it needs its spans for the seek bar"
+        );
+        assert!(
+            memo.is_scanned(2, Some((100, 500))),
+            "a clean file has no spans to gain"
+        );
+        assert_eq!(
+            memo.damaged().len(),
+            1,
+            "still listed until the re-read lands"
+        );
+    }
+
+    /// B1198/V1158: only a read of an unindexed file that reached end-of-file
+    /// and found less media than the header claims says where it ends.
+    #[test]
+    fn only_a_complete_read_short_of_the_header_gives_a_known_end() {
+        let memo = IntegrityMemo::load("/nonexistent/memo.json", 1);
+        let ends_early = IntegrityReport {
+            declared_ms: Some(30_000),
+            seek_index: Some(false),
+            ..clean()
+        };
+        memo.record(1, Some((100, 500)), ends_early.clone());
+        memo.record(
+            2,
+            Some((100, 500)),
+            IntegrityReport {
+                complete: false,
+                ..ends_early.clone()
+            },
+        );
+        memo.record(
+            3,
+            Some((100, 500)),
+            IntegrityReport {
+                declared_ms: Some(20_000),
+                ..ends_early.clone()
+            },
+        );
+        memo.record(
+            4,
+            Some((100, 500)),
+            IntegrityReport {
+                declared_ms: None,
+                ..ends_early.clone()
+            },
+        );
+        memo.record(
+            6,
+            Some((100, 500)),
+            IntegrityReport {
+                seek_index: None,
+                ..ends_early.clone()
+            },
+        );
+        assert_eq!(
+            memo.known_end(1),
+            Some(pharos_cache::KnownSourceEnd {
+                end_ms: 20_000,
+                mtime_secs: 100,
+                size: 500,
+            })
+        );
+        assert_eq!(memo.known_end(2), None, "a read that gave up early");
+        assert_eq!(memo.known_end(3), None, "all the media the header claims");
+        assert_eq!(memo.known_end(4), None, "no header duration");
+        assert_eq!(memo.known_end(5), None, "never read");
+        assert_eq!(memo.known_end(6), None, "a seekable file");
     }
 
     /// The load-bearing difference from `probe_memo`: a CLEAN verdict must be
@@ -287,6 +461,30 @@ mod tests {
     }
 
     #[test]
+    fn a_verdict_records_when_it_was_made() {
+        let memo = IntegrityMemo::load("/nonexistent/memo.json", 1);
+        memo.record(1, Some((100, 500)), clean());
+        let at = memo.get(1, Some((100, 500))).unwrap().checked_at.unwrap();
+        assert!(at > 1_700_000_000, "a real clock reading: {at}");
+    }
+
+    /// Memos on disk today carry no `checked_at`. They must load as they are:
+    /// failing to parse would discard every verdict and re-read the library.
+    #[test]
+    fn a_memo_written_before_checked_at_still_loads() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("integrity.json");
+        std::fs::write(
+            &path,
+            r#"{"integrity_scan_version":1,"entries":{"7":{"mtime":1,"size":2,"report":{"packets":3,"corrupt_packets":0,"read_errors":0,"demux_errors":0,"first_fault_ms":null,"first_fault":null,"scanned_ms":4,"declared_ms":null,"complete":true}}}}"#,
+        )
+        .unwrap();
+        let memo = IntegrityMemo::load(&path, 1);
+        let e = memo.get(7, Some((1, 2))).expect("old entry survives");
+        assert_eq!(e.checked_at, None);
+    }
+
+    #[test]
     fn a_corrupt_memo_file_is_an_empty_memo_not_a_failure() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("integrity.json");
@@ -296,5 +494,26 @@ mod tests {
         memo.record(1, Some((1, 1)), clean());
         memo.save().unwrap();
         assert!(IntegrityMemo::load(&path, 1).is_scanned(1, Some((1, 1))));
+    }
+
+    /// B1162: a file with no seek index is listed for admins but carries no
+    /// "Damaged" badge, since it plays through and only seeks slowly.
+    #[test]
+    fn an_unindexed_file_is_listed_but_not_badged() {
+        let memo = IntegrityMemo::load("/nonexistent/m.json", 1);
+        memo.record(
+            4,
+            Some((1, 1)),
+            IntegrityReport {
+                complete: true,
+                seek_index: Some(false),
+                ..Default::default()
+            },
+        );
+        assert_eq!(memo.damaged().len(), 1, "the admin list names it");
+        assert!(
+            memo.damaged_ids().is_empty(),
+            "the library does not badge it"
+        );
     }
 }

@@ -12,7 +12,7 @@ annotation secret(field, param) :Void;
 
 # Bumped when the schema changes; served as ServerInfo.schemaVersion so a client
 # can tell which methods a server knows (FR-009).
-const schemaVersion :UInt32 = 24;
+const schemaVersion :UInt32 = 43;
 
 # ---- ids and shared types -------------------------------------------------
 struct ItemId {                # mirrors pharos_jellyfin_api::WireId
@@ -58,12 +58,24 @@ struct Error {
 struct Done { union { ok @0 :Void; error @1 :Error; } }   # result for methods with no payload
 
 enum Kind { movie @0; episode @1; audio @2; book @3; series @4; season @5; album @6; artist @7; person @8; collection @9; playlist @10; channel @11; library @12; }
+# How a book can be read; mirrors pharos_core::BookFormat. `unreadable` is a file the reader cannot open. Since schemaVersion 32.
+enum BookFormat { epub @0; pdf @1; comic @2; unreadable @3; }
+struct BookInfo { format @0 :BookFormat; author @1 :Text; pageCount @2 :UInt32; }   # pageCount 0 = unknown
 # What a `library` item holds; mirrors pharos_core::LibraryKind.
 enum LibraryKind { mixed @0; movies @1; tvShows @2; music @3; books @4; }
 
+# How a video packs two eyes into one frame; mirrors pharos_core::Video3DFormat.
+# `none` is ordinary 2D video, and what an older server's zero reads as.
+enum Stereo3d { none @0; halfSideBySide @1; fullSideBySide @2; halfTopAndBottom @3; fullTopAndBottom @4; mvc @5; }
+
 struct ImageRef { kind @0 :Text; tag @1 :Text; url @2 :Text; blurhash @3 :Text; }
 
-struct UserState { played @0 :Bool; favorite @1 :Bool; positionMs @2 :UInt64; playCount @3 :UInt32; }
+struct UserState {
+  played @0 :Bool; favorite @1 :Bool; positionMs @2 :UInt64; playCount @3 :UInt32;
+  readLocator @4 :Text;      # a book's saved reading position, opaque to the server; empty when unread. Since schemaVersion 32.
+  readFraction @5 :Float32;  # how far through the book, 0 to 1; 0 when unread. Since schemaVersion 32.
+  readAt @6 :Int64;          # unix ms when the stored place was read (the saving device's clock, to the second); 0 when unread. Since schemaVersion 39.
+}
 
 struct ItemSummary {
   id @0 :ItemId; kind @1 :Kind; name @2 :Text; year @3 :OptU16;
@@ -73,6 +85,9 @@ struct ItemSummary {
   libraryKind @11 :LibraryKind;                            # kind == library only
   imdbRating @12 :OptU16;      # IMDb score in tenths: 78 is 7.8
   criticRating @13 :OptU16;    # Rotten Tomatoes Tomatometer, a percentage
+  artist @14 :Text;            # a song's artists for its card, joined; empty for anything else. Since schemaVersion 25.
+  stereo @15 :Stereo3d;        # the primary's packing, else the first 3D version's. Since schemaVersion 29.
+  damaged @16 :Bool;           # the integrity check found this file damaged; Library.detail says where. Since schemaVersion 30.
 }
 
 struct ItemPage { items @0 :List(ItemSummary); total @1 :UInt32; start @2 :UInt32; }
@@ -135,11 +150,29 @@ interface Session {
   # cannot send the session cookie (025, ADR 0058). Valid only on GET/HEAD
   # media and image endpoints; expires within server-configured TTL.
   mediaToken @14 (ctx :CallContext) -> (result :MediaTokenResult);
+  # A short-lived token for the web UI's Manage pages, which call the admin
+  # endpoints of the Jellyfin API with a header (ADR 0082). Admins only: any
+  # other user is refused notPermitted. Full scope, issued as a child of this
+  # session's token, so signing out ends it; lives one hour at most.
+  manageToken @15 (ctx :CallContext) -> (result :MediaTokenResult);
+  # The devices this user is signed in on, each with the sound formats it is
+  # sent converted rather than as they are (T130, ADR 0095). Since
+  # schemaVersion 38.
+  myDevices @16 (ctx :CallContext) -> (result :MyDevicesResult);
+  # Sets which sound formats a device this user is signed in on is sent
+  # converted; an empty list clears it. A device the user is not signed in
+  # on answers notPermitted, a malformed codec name or `aac` (what every
+  # conversion produces) invalid on `codecs`. Since schemaVersion 38.
+  setDeviceConvertedAudio @17 (ctx :CallContext, deviceId :Text, codecs :List(Text)) -> (result :Done);
   # Capability getters return a capability, never fail; a revoked session makes
   # every call on the returned capability fail with Error.kind.revoked.
   # Sessions, Queue, RemoteSources arrive with specs 013/014 (append-only).
 }
 struct AdminResult { union { admin @0 :Admin; error @1 :Error; } }
+# One device the user is signed in on. `current` marks the one this session
+# runs on. Since schemaVersion 38.
+struct MyDevice { id @0 :Text; name @1 :Text; current @2 :Bool; convertedAudio @3 :List(Text); }
+struct MyDevicesResult { union { devices @0 :List(MyDevice); error @1 :Error; } }
 struct AvatarResult { union { tag @0 :Text; error @1 :Error; } }
 struct MediaToken {
   token       @0 :Text $secret;
@@ -162,7 +195,11 @@ struct ItemQuery {
   kinds @1 :List(Kind); sortBy @2 :Text; descending @3 :Bool;
   nameStartsWith @4 :Text; filters @5 :List(Text); start @6 :UInt32; limit @7 :UInt32;
   genre @8 :Text;              # one genre's name; empty means every genre
+  stereo @9 :StereoFilter;     # 3D titles only, 2D only, or both. Since schemaVersion 29.
+  collapseCollections @10 :Bool; # fold each box set's films into one tile for the set
+                                 # (B1086). Stored-row lists only. Since schemaVersion 37.
 }
+enum StereoFilter { any @0; only3d @1; only2d @2; }
 
 # Where each section starts in a listing, in the listing's own order: a
 # section's `start` is the offset of its first item, so a client can page
@@ -178,8 +215,8 @@ struct IndexResult { union { index @0 :ListIndex; error @1 :Error; } }
 # Home is aggregated server-side: pipelining only follows capabilities, not
 # data, so "views, then latest per view" cannot be one flight client-side.
 struct HomeRail { view @0 :ItemSummary; latest @1 :List(ItemSummary); }
-# `resume` holds films and episodes, `listening` music; `resumeLimit` sizes both.
-struct Home { rails @0 :List(HomeRail); resume @1 :List(ItemSummary); nextUp @2 :List(ItemSummary); listening @3 :List(ItemSummary); }
+# `resume` holds films and episodes, `listening` music, `reading` books part read (since schemaVersion 32); `resumeLimit` sizes both.
+struct Home { rails @0 :List(HomeRail); resume @1 :List(ItemSummary); nextUp @2 :List(ItemSummary); listening @3 :List(ItemSummary); reading @4 :List(ItemSummary); }
 struct HomeResult { union { home @0 :Home; error @1 :Error; } }
 
 interface Library {
@@ -188,13 +225,16 @@ interface Library {
   resume @2 (ctx :CallContext, kinds :List(Kind), limit :UInt32) -> (result :ItemsResult);
   nextUp @3 (ctx :CallContext, limit :UInt32) -> (result :ItemsResult);
   query @4 (ctx :CallContext, q :ItemQuery) -> (result :ItemsResult);
-  detail @5 (ctx :CallContext, id :ItemId) -> (result :DetailResult);
+  detail @5 (ctx :CallContext, id :ItemId, version :Text) -> (result :DetailResult);
+  # `version`: a Version.id; its tracks, fonts and subtitle URLs are that file's. Empty is the primary.
   search @6 (ctx :CallContext, text :Text, limit :UInt32) -> (result :ItemsResult);
   home @7 (ctx :CallContext, latestPerView :UInt32, resumeLimit :UInt32, nextUpLimit :UInt32) -> (result :HomeResult);
   index @8 (ctx :CallContext, q :ItemQuery) -> (result :IndexResult);   # `q.start` and `q.limit` are ignored
   # wantWords is set by a client showing karaoke; it lets the server ask the aligner for word times.
   lyrics @9 (ctx :CallContext, id :ItemId, wantWords :Bool) -> (result :LyricsResult);
   mix @10 (ctx :CallContext, spec :MixSpec, recent :List(ItemId), count :UInt32) -> (result :MixResult);
+  # Someone in a cast, and what they appear in that the viewer may see. Since schemaVersion 28.
+  person @11 (ctx :CallContext, id :ItemId) -> (result :PersonResult);
 }
 struct ItemDetail {
   summary @0 :ItemSummary; overview @1 :Text; genres @2 :List(Text); chapters @3 :List(Chapter);
@@ -205,7 +245,76 @@ struct ItemDetail {
   fonts @8 :List(Font);             # empty when the file embeds none; an older client ignores it
   artists @9 :List(Text);           # a song's track artists, in display order; empty for anything else
   album @10 :Text;                  # a song's album name; empty when it has none
+  cast @11 :List(Credit);           # billed order; a series or season ranks its regulars across episodes
+  versions @12 :List(Version);      # a film or episode's files, the primary first; empty for anything else. Since schemaVersion 29.
+  damage @13 :Damage;               # what is wrong with the file this detail describes; verdict empty when nothing is known. Since schemaVersion 30.
+  book @14 :BookInfo;               # set only for a book. Since schemaVersion 32.
 }
+# Someone who appears in the item. `imageUrl` is the person's photo on this
+# server, empty when there is none.
+struct Credit {
+  name @0 :Text; character @1 :Text; kind @2 :CreditKind; imageUrl @3 :Text;
+  personId @4 :ItemId;              # what Library.person takes. Since schemaVersion 28.
+}
+enum CreditKind { actor @0; guestStar @1; }
+# A person's page. `films` are newest first. `shows` hold one entry per show,
+# the show that gives them the most episodes first, each with its episodes in
+# season order. Only items the viewer may see are listed.
+struct Person {
+  id @0 :ItemId; name @1 :Text;
+  imageUrl @2 :Text;                # the person's photo on this server, empty when there is none
+  films @3 :List(PersonCredit);
+  shows @4 :List(PersonShow);
+  # What a metadata provider says about them; each empty when unknown.
+  biography @5 :Text;
+  birthDate @6 :Text;               # YYYY-MM-DD
+  deathDate @7 :Text;               # YYYY-MM-DD
+  birthPlace @8 :Text;
+  imdbId @9 :Text;                  # nm and digits
+  wikidataId @10 :Text;             # Q and digits
+}
+# One item a person appears in, and who they play there (empty when the credit names no one).
+struct PersonCredit { item @0 :ItemSummary; character @1 :Text; kind @2 :CreditKind; }
+struct PersonShow {
+  series @0 :ItemSummary;
+  characters @1 :List(Text);        # who they play in it, most episodes first
+  episodes @2 :List(PersonCredit);
+}
+struct PersonResult { union { person @0 :Person; error @1 :Error; } }
+# One playable file of an item: its primary, a grouped edition (a cut, a 3D
+# rip) or another copy of the same episode. `id` is what Library.detail and
+# Playback.negotiate take as `version`; the primary's is empty. Probe facts
+# are 0 or empty when unknown. `path` is the file on the server's disk, sent
+# to admins only (else empty).
+struct Version {
+  id @0 :Text; name @1 :Text; stereo @2 :Stereo3d; primary @3 :Bool;
+  width @4 :UInt32; height @5 :UInt32;
+  videoCodec @6 :Text;
+  hdr @7 :Text;                     # HDR10 or HLG; empty is SDR
+  audio @8 :List(VersionAudio);
+  sizeBytes @9 :UInt64;
+  container @10 :Text;
+  path @11 :Text;
+  damaged @12 :Bool;                # the integrity check found this file damaged. Since schemaVersion 30.
+  durationMs @13 :UInt64;           # the file's runtime; 0 when unknown. Since schemaVersion 31.
+  # Where the picture sits in the coded frame, in pixels, when the file has
+  # black bars baked into it (a 4:3 show stored pillarboxed in 1920x1080):
+  # the player crops to it. pictureWidth 0 = no bars found, or not checked
+  # yet. Since schemaVersion 34.
+  pictureX @14 :UInt32; pictureY @15 :UInt32;
+  pictureWidth @16 :UInt32; pictureHeight @17 :UInt32;
+}
+# What the integrity check found wrong with one file. `verdict` is empty when
+# the file is not known to be damaged, else damaged, short or unreadable.
+# `reason` is the reader's own words for the first fault, possibly empty.
+# `ranges` are the damaged spans on the player's timeline, in
+# media order; a span one packet wide has startMs == endMs.
+struct Damage {
+  verdict @0 :Text; reason @1 :Text; ranges @2 :List(DamageRange);
+  checkedAt @3 :Int64;              # unix seconds; 0 = unknown
+}
+struct DamageRange { startMs @0 :UInt64; endMs @1 :UInt64; }
+struct VersionAudio { language @0 :Text; codec @1 :Text; channels @2 :UInt32; }
 # A font the file embeds, for a renderer drawing an ASS subtitle (spec 026).
 # url holds `{subtitle}`, the index of the subtitle track the font is fetched
 # for: the server cuts the font to the glyphs that track draws. A track that
@@ -219,6 +328,7 @@ struct Track {
   delivery @7 :SubtitleDelivery;    # subtitles only
   url @8 :Text;                     # WebVTT for `external`, the PNG manifest for `image` (HTTP, 017 §Scope), else empty
   styledUrl @9 :Text;               # the generated Pharos-styled ASS script (spec 028), fetched with ?tier=&effects=; empty for every other track
+  channels @10 :UInt16;             # audio only; 0 = unknown. Since schemaVersion 26.
 }
 # `external`: the player renders the WebVTT at Track.url itself. `burn`: an
 # image subtitle the server draws into the video, so choosing it renegotiates.
@@ -304,6 +414,9 @@ struct SavedMixes { mixes @0 :List(SavedMix); }
 interface UserData {
   setPlayed @0 (ctx :CallContext, id :ItemId, played :Bool) -> (result :UserStateResult);
   setFavorite @1 (ctx :CallContext, id :ItemId, favorite :Bool) -> (result :UserStateResult);
+  # Refused with Error for a non-book, an unreadable book, a locator over 256 bytes or a fraction outside 0..1. Since schemaVersion 32.
+  # `readAt` is when the page was read, unix milliseconds on the client's clock; 0 means now, one ahead of the server's clock counts as now. The server keeps the newest reading: an older one is not stored and the state answers with the stored position. Since schemaVersion 36.
+  setReadPosition @2 (ctx :CallContext, id :ItemId, locator :Text, fraction :Float32, readAt :Int64) -> (result :UserStateResult);
 }
 struct UserStateResult { union { state @0 :UserState; error @1 :Error; } }
 
@@ -319,16 +432,37 @@ struct Decision {
   subtitle @6 :OptU32;         # the subtitle it starts with; none = off
 }
 struct DecisionResult { union { decision @0 :Decision; error @1 :Error; } }
+# What this playback's viewer is waiting behind on the server, asked while a
+# start, seek or buffer waits (038 FR-402). Since schemaVersion 43.
+struct QueueHint {
+  queued @0 :UInt32;        # this playback's client requests waiting for an encoder
+  waitedMs @1 :UInt64;      # how long the oldest of them has waited; 0 with none
+  othersQueued @2 :UInt32;  # other viewers' requests waiting too
+  busy @3 :Bool;            # every encoder is running at capacity
+}
+struct QueueHintResult { union { hint @0 :QueueHint; error @1 :Error; } }
 interface PlaybackGrant {
   decision @0 (ctx :CallContext) -> (result :DecisionResult);
   # audio/subtitle: the tracks playing now, after any switch the player made
   # without renegotiating; `default` says nothing and keeps the stored choice.
   report @1 (ctx :CallContext, positionMs :UInt64, paused :Bool, audio :StreamChoice, subtitle :StreamChoice) -> (result :Done);
   stop @2 (ctx :CallContext, positionMs :UInt64) -> (result :Done);
+  queueHint @3 (ctx :CallContext) -> (result :QueueHintResult);   # Since schemaVersion 43.
 }
 struct NegotiateResult { union { grant @0 :PlaybackGrant; error @1 :Error; } }
+# The tracks a negotiate naming `default` for both would start on: the user's
+# remembered pick for the item, else their language rules; none = off.
+# Since schemaVersion 26.
+struct StartTracks { audio @0 :OptU32; subtitle @1 :OptU32; }
+struct StartTracksResult { union { tracks @0 :StartTracks; error @1 :Error; } }
 interface Playback {
-  negotiate @0 (ctx :CallContext, id :ItemId, caps :Capabilities, audio :StreamChoice, subtitle :StreamChoice) -> (result :NegotiateResult);
+  negotiate @0 (ctx :CallContext, id :ItemId, caps :Capabilities, audio :StreamChoice, subtitle :StreamChoice, version :Text) -> (result :NegotiateResult);
+  # `version`: a Version.id from ItemDetail.versions; empty plays the primary.
+  # An id the item does not have is notFound; an edition the server cannot
+  # serve yet (no stored probe) is unavailable.
+  # What a title page shows in its track pickers before playback; opens no session.
+  # Since schemaVersion 26.
+  startTracks @1 (ctx :CallContext, id :ItemId, caps :Capabilities) -> (result :StartTracksResult);
 }
 
 # ---- push -----------------------------------------------------------------
@@ -345,7 +479,17 @@ struct Event {
   }
   struct UserDataChanged { id @0 :ItemId; state @1 :UserState; }
   struct LibraryChanged { added @0 :List(ItemId); updated @1 :List(ItemId); removed @2 :List(ItemId); }
-  struct TaskProgress { id @0 :Text; progress @1 :Float32; state @2 :Text; }
+  struct TaskProgress {
+    id @0 :Text;
+    progress @1 :Float32;
+    state @2 :Text;            # running, done, partial (some roots failed), failed, cancelled
+    # What a finished library scan did; all 0 while running and for other
+    # tasks. Since schemaVersion 40.
+    added @3 :UInt32;
+    changed @4 :UInt32;
+    removed @5 :UInt32;
+    failedRoots @6 :UInt32;    # folders the scan could not read
+  }
 }
 interface EventSink { push @0 (ctx :CallContext, events :List(Event)) -> (result :Done); }
 interface Subscription { }      # dropping it unsubscribes
@@ -368,6 +512,8 @@ enum EventKind {               # closed catalogue, 016 contracts/events.md
   seek @14; themeFallback @15; focusRecovered @16; cacheServed @17; cspViolation @18;
   groupDrift @19; groupHardSeek @20; groupWait @21; playbackResume @22;
   playbackStart @23; playbackSummary @24;
+  autoplayRefused @25;         # the browser refused to start a video unasked (038 FR-407). Since schemaVersion 43.
+
 }
 enum Level { error @0; warn @1; info @2; }
 struct TelemetryEvent {
@@ -383,9 +529,22 @@ struct ClientSpan {
   attrs @8 :List(TelemetryEvent.Field);
 }
 struct ReportResult { union { reportId @0 :Text; error @1 :Error; } }
+struct ReportSummary {         # one stored problem report, without its bundle. Since schemaVersion 35.
+  id @0 :Text; receivedWallMs @1 :UInt64; userName @2 :Text; note @3 :Text $secret; bytes @4 :UInt64;
+}
+struct ReportListResult { union { reports @0 :List(ReportSummary); error @1 :Error; } }
+struct ReportDocumentResult { union { document @0 :Data; error @1 :Error; } }   # the stored JSON document
 interface Telemetry {
   submit @0 (ctx :CallContext, events :List(TelemetryEvent), spans :List(ClientSpan)) -> (result :Done);
-  report @1 (ctx :CallContext, note :Text, bundle :Data) -> (result :ReportResult);
+  # "Report a problem" (016 US5): sent only when the user presses it, whatever the
+  # diagnostics opt-in. `bundle` is a UTF-8 JSON object (contracts/report-bundle.md).
+  report @1 (ctx :CallContext, note :Text $secret, bundle :Data $secret) -> (result :ReportResult);
+  # The caller's own reports, or with `everyone` (admins only) every user's. Since schemaVersion 35.
+  listReports @2 (ctx :CallContext, everyone :Bool) -> (result :ReportListResult);
+  # One report's document: its reporter or an admin. Since schemaVersion 35.
+  getReport @3 (ctx :CallContext, id :Text) -> (result :ReportDocumentResult);
+  # Deletes one report: its reporter or an admin. Since schemaVersion 35.
+  deleteReport @4 (ctx :CallContext, id :Text) -> (result :Done);
 }
 struct CountResult { union { count @0 :UInt32; error @1 :Error; } }
 interface Admin {
@@ -456,6 +615,12 @@ interface Membership {
   # playing one, so two members' autoplay at an episode's end moves it once.
   # Empty skips that check. Since schemaVersion 23.
   setItem   @11 (ctx :CallContext, item :ItemId, positionMs :UInt64, playlistItemId :Text) -> (result :Done);
+  # Keep watching the end of queue entry `playlistItemId` (B1027): every
+  # member's "Up next" stops counting on it and none plays the next item by
+  # itself; each member is told with a `nextHeld` update, a late joiner with
+  # its catch-up. Ends when the group moves to another entry. Empty skips the
+  # stale-entry check. Since schemaVersion 33.
+  holdNext  @12 (ctx :CallContext, playlistItemId :Text) -> (result :Done);
 }
 # For a film or episode `played` and `positionPct` (0-100, the resume point)
 # apply. For a series or season `playedCount` of `totalCount` episodes (the ones
@@ -475,9 +640,11 @@ struct GroupUpdate {
     item    @6 :ItemAt;                # the group moved to another item
     ended   @7 :EndReason;
     tracks  @8 :GroupTracks;           # the group's audio or subtitle changed
+    nextHeld @9 :NextHeld;             # a member kept watching the end (holdNext)
   }
   # `by` is the member id that caused it; "" when the group did (all ready).
   struct At { atServerMs @0 :UInt64; positionMs @1 :UInt64; by @2 :Text; }
   struct ItemAt { item @0 :ItemId; playlistItemId @1 :Text; positionMs @2 :UInt64; playing @3 :Bool; }
+  struct NextHeld { playlistItemId @0 :Text; by @1 :Text; }
 }
 interface GroupSink { update @0 (ctx :CallContext, update :GroupUpdate) -> (result :Done); }

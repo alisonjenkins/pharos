@@ -147,6 +147,7 @@ where
         + StudioStore
         + CollectionStore
         + TagStore
+        + pharos_core::SeriesIdentityStore
         + Send
         + Sync
         + 'static,
@@ -201,6 +202,7 @@ async fn watch_loop<P, S>(
         + StudioStore
         + CollectionStore
         + TagStore
+        + pharos_core::SeriesIdentityStore
         + Send
         + Sync
         + 'static,
@@ -265,6 +267,12 @@ impl Batch {
     fn absorb(&mut self, ev: &Event) {
         match ev.kind {
             EventKind::Create(_) | EventKind::Modify(notify::event::ModifyKind::Data(_)) => {
+                // A new `.ignore` or `tvshow.nfo` reshapes rows already
+                // indexed, which only the full scan settles (V961, V982).
+                if ev.paths.iter().any(|p| crate::fs::reshapes_indexed_rows(p)) {
+                    tracing::info!(paths = ?ev.paths, "watch: folder marker written; reconciling");
+                    self.needs_reconcile = true;
+                }
                 self.touched.extend(ev.paths.iter().cloned());
             }
             // A rename is delivered as a Modify(Name) (and/or Remove); both
@@ -299,6 +307,7 @@ where
         + StudioStore
         + CollectionStore
         + TagStore
+        + pharos_core::SeriesIdentityStore
         + Send
         + Sync
         + 'static,
@@ -317,15 +326,28 @@ where
     let mut paths: Vec<PathBuf> = batch.touched;
     paths.sort_unstable();
     paths.dedup();
+    // The `.ignore` ancestor checks stat the disk: keep them off the async
+    // worker and outside the scan lock.
+    let paths = {
+        let root = root.to_path_buf();
+        let exts = exts.clone();
+        tokio::task::spawn_blocking(move || {
+            paths
+                .into_iter()
+                .filter(|p| is_media_file(p, &exts) && !crate::fs::walk_skips(p, &root))
+                .collect::<Vec<_>>()
+        })
+        .await
+        .map_err(|e| pharos_core::DomainError::Backend(format!("watch path filter join: {e}")))?
+    };
 
     let _exclusive = crate::fs::scan_exclusively().await;
+    // A `tvshow.nfo` written since the last scan must count for this batch.
+    crate::fs::forget_show_nfos();
     let scan_id = store.begin_scan(root).await?;
     let mut outcome = ScanOutcome::default();
     let mut touched_media = false;
     for path in paths {
-        if !is_media_file(&path, exts) {
-            continue;
-        }
         // Skip directories / vanished entries: a create event for a new
         // subdir carries the dir path. `update_path` would stat-fail and
         // skip anyway, but filtering here avoids a needless probe attempt.
@@ -644,6 +666,8 @@ mod tests {
     // LIB-C4 — watcher tests don't assert on the genre join, so this is a
     // lightweight in-memory mirror sufficient to satisfy the scan_into /
     // update_path bound.
+    impl pharos_core::SeriesIdentityStore for MemStore {}
+
     impl pharos_core::GenreStore for MemStore {
         async fn upsert_genre(&self, name: &str) -> DomainResult<i64> {
             Ok(i64::from_str_radix(&pharos_core::genre_wire_id(name)[..15], 16).unwrap_or(0))

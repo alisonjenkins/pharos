@@ -25,7 +25,7 @@ use pharos_server::{
     state::{AppState, Stores},
 };
 
-const BOOK_PATH: &str = "/media/Books/Dune.epub";
+const BOOK_PATH: &str = "/media/Books/Book A.epub";
 
 async fn seed() -> (web::Data<AppState>, String) {
     let stores = Stores::connect("sqlite::memory:").await.unwrap();
@@ -45,9 +45,10 @@ async fn seed() -> (web::Data<AppState>, String) {
 
     stores
         .put(MediaItem {
+            locked: Default::default(),
             id: 42,
             path: BOOK_PATH.into(),
-            title: "Dune".into(),
+            title: "Book A".into(),
             kind: MediaKind::Book,
             book: Some(BookMeta {
                 format: BookFormat::Epub,
@@ -74,9 +75,10 @@ async fn seed() -> (web::Data<AppState>, String) {
     // gate itself can only be tested on a non-book item.
     stores
         .put(MediaItem {
+            locked: Default::default(),
             id: 43,
-            path: "/media/Movies/Alien.mkv".into(),
-            title: "Alien".into(),
+            path: "/media/Movies/Film AX.mkv".into(),
+            title: "Film AX".into(),
             kind: MediaKind::Movie,
             book: None,
             probe: MediaProbe::default(),
@@ -158,7 +160,7 @@ async fn a_book_always_carries_its_path() {
     // No Fields at all — the request the details page actually makes.
     let body = get_json!(app, "/Items?IncludeItemTypes=Book", &token);
     let item = &body["Items"][0];
-    assert_eq!(item["Name"], "Dune", "seed item not returned");
+    assert_eq!(item["Name"], "Book A", "seed item not returned");
     assert_eq!(
         item["Path"], BOOK_PATH,
         "a book must carry Path even unasked, or every reader declines silently"
@@ -186,14 +188,14 @@ async fn path_is_absent_for_a_non_book_unless_the_client_asks_for_it() {
 
     let body = get_json!(app, "/Items?IncludeItemTypes=Movie", &token);
     let item = &body["Items"][0];
-    assert_eq!(item["Name"], "Alien", "seed item not returned");
+    assert_eq!(item["Name"], "Film AX", "seed item not returned");
     assert!(
         item.get("Path").is_none(),
         "a movie must not leak its path unasked — least exposure is unchanged: {item}"
     );
 
     let body = get_json!(app, "/Items?IncludeItemTypes=Movie&Fields=Path", &token);
-    assert_eq!(body["Items"][0]["Path"], "/media/Movies/Alien.mkv");
+    assert_eq!(body["Items"][0]["Path"], "/media/Movies/Film AX.mkv");
 }
 
 #[actix_web::test]
@@ -217,7 +219,7 @@ async fn the_path_field_is_recognised_in_every_spelling_a_client_may_send() {
     ] {
         let body = get_json!(app, uri, &token);
         assert_eq!(
-            body["Items"][0]["Path"], "/media/Movies/Alien.mkv",
+            body["Items"][0]["Path"], "/media/Movies/Film AX.mkv",
             "Path missing for spelling: {uri}"
         );
     }
@@ -238,7 +240,7 @@ async fn the_detail_payload_agrees_with_the_list_payload_about_path() {
         "a movie's detail payload must omit Path when not asked: {detail}"
     );
     let detail = get_json!(app, "/Items/43?Fields=Path", &token);
-    assert_eq!(detail["Path"], "/media/Movies/Alien.mkv");
+    assert_eq!(detail["Path"], "/media/Movies/Film AX.mkv");
 
     let detail = get_json!(app, "/Items/42", &token);
     assert_eq!(

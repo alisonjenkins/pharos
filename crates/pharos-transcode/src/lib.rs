@@ -14,7 +14,9 @@
 pub mod admission;
 pub mod audio_features;
 pub mod backend;
+pub mod burned_text;
 pub mod capability;
+pub mod deep_check;
 pub mod device;
 pub mod fingerprint;
 pub mod hwaccel;
@@ -22,6 +24,8 @@ pub mod integrity;
 #[cfg(unix)]
 pub mod libav;
 pub mod options;
+pub mod output_size;
+pub mod picture_area;
 #[cfg(unix)]
 pub mod probe;
 pub mod protocol;
@@ -46,6 +50,7 @@ pub use options::{
     per_eye_layout, stereo_mono_filter, AudioCodec, Container, FillerSpec, MuxedAudio, Output3D,
     RenditionKey, SourceCodec, StereoOutput, Tonemap, TonemapOutput, TranscodeOptions, VideoCodec,
 };
+pub use output_size::{OutputSize, ScaleReason, SizeLimits};
 pub use segment::{
     AudioDelivery, ContinuousAudio, SegmentAudio, SegmentContainer, SegmentOpts, SegmentVideo,
 };
@@ -288,7 +293,7 @@ fn ffmpeg_filter_escape(path: &str) -> String {
 ///   `[0:v:0][0:s:N]overlay=eof_action=pass[,rest][vout]`. `overlay` is the
 ///   only ffmpeg path that renders bitmap subs (PGS/VOBSUB/DVB); libass'
 ///   `subtitles=` is text-only and aborts a PGS burn with "Only text based
-///   subtitles are currently supported" (Avatar's PGS track 500'd every
+///   subtitles are currently supported" (Film BA's PGS track 500'd every
 ///   segment). A `-filter_complex` disables default stream selection, so the
 ///   video (`[vout]`) and audio maps are emitted here.
 /// - TEXT/ASS subtitle burn (Task 7) — a plain `-vf subtitles=filename=…:si=N`
@@ -330,11 +335,38 @@ fn push_video_filters(
     // the PQ curve. The per-eye 3D burn graphs run it on the whole frame ahead
     // of the split, so neither eye's subtitle copy sees it either.
     tonemap: Option<&str>,
+    // Output downscale (`OutputSize::software_filter`). Runs first on the
+    // decoded frame, ahead of the tonemap and the subtitle burn, so both work
+    // on the small frame and libass draws at output size. A BITMAP burn is the
+    // exception: its overlay is positioned in source pixels, so the scale
+    // follows it instead.
+    scale: Option<&str>,
 ) {
     let layout = per_eye.and_then(per_eye_layout);
-    let pre_joined: Option<String> = match (layout.is_some(), mono_filter, tonemap) {
-        (false, Some(m), Some(t)) => Some(format!("{m},{t}")),
-        (false, None, Some(t)) => Some(t.to_string()),
+    let image_burn = burn_subtitle_stream_index.is_some() && !burn_is_text;
+    let owned_tail: Vec<String>;
+    let (head_scale, vf_parts): (Option<&str>, &[String]) = match (scale, image_burn) {
+        (Some(sc), true) => {
+            owned_tail = std::iter::once(sc.to_string())
+                .chain(vf_parts.iter().cloned())
+                .collect();
+            (None, owned_tail.as_slice())
+        }
+        (sc, false) => (sc, vf_parts),
+        (None, true) => (None, vf_parts),
+    };
+    // Per-eye graphs run the head once on the whole frame ahead of the split.
+    let tonemap_owned: Option<String> = match (head_scale, tonemap) {
+        (Some(sc), Some(t)) if layout.is_some() => Some(format!("{sc},{t}")),
+        (Some(sc), None) if layout.is_some() => Some(sc.to_string()),
+        _ => tonemap.map(str::to_string),
+    };
+    let tonemap = tonemap_owned.as_deref();
+    let pre_joined: Option<String> = match (layout.is_some(), mono_filter, tonemap, head_scale) {
+        (false, m, t, sc) => {
+            let parts: Vec<&str> = [sc, m, t].into_iter().flatten().collect();
+            (!parts.is_empty()).then(|| parts.join(","))
+        }
         _ => mono_filter.map(str::to_string),
     };
     let mono_filter = pre_joined.as_deref();
@@ -620,6 +652,26 @@ pub enum DecodeAccel {
     NotProvenDecodable,
 }
 
+/// A downscaled NVENC job whose frames can stay on the GPU: NVDEC decodes to
+/// cuda frames, `scale_cuda` shrinks them, NVENC reads them there. Only a plain
+/// H.264/HEVC re-encode qualifies: the tonemap, subtitle burn and 3D crop
+/// filters all need system-memory frames.
+fn cuda_scale_applies(opts: &TranscodeOptions, device: crate::protocol::DeviceId) -> bool {
+    use crate::protocol::DeviceId;
+    matches!(
+        device,
+        DeviceId::Hw {
+            accel: HwAccel::Nvenc,
+            ..
+        }
+    ) && opts.output_size.is_some()
+        && matches!(opts.video, Some(VideoCodec::H264 | VideoCodec::H265))
+        && opts.tonemap.is_off()
+        && opts.burn_subtitle_stream_index.is_none()
+        && opts.active_stereo_mono_filter().is_none()
+        && opts.per_eye_burn_format().is_none()
+}
+
 impl DecodeAccel {
     /// The verdict for `opts` placed on `device`, given whether the caller
     /// established that this device can decode this source (`offload`).
@@ -659,7 +711,11 @@ impl DecodeAccel {
         }
         // CPU crop / setsar in stereo_mono_filter cannot consume GPU-resident
         // cuda frames when hwaccel is active; fall back to software decode (B240).
-        if (opts.active_stereo_mono_filter().is_some() || opts.per_eye_burn_format().is_some())
+        // The output downscale is a CPU `scale` for the same reason, unless it
+        // can run as `scale_cuda` on the frames NVDEC already holds.
+        if (opts.active_stereo_mono_filter().is_some()
+            || opts.per_eye_burn_format().is_some()
+            || (opts.output_size.is_some() && !cuda_scale_applies(opts, device)))
             && matches!(
                 device,
                 DeviceId::Hw {
@@ -680,6 +736,26 @@ impl DecodeAccel {
             Some(name) => Self::Gpu { name },
             None => Self::NoDecoderForAccel,
         }
+    }
+
+    /// The verdict for a job that will run `pipeline`. The GPU tonemap route
+    /// decodes on Vulkan whatever [`DecodeAccel::of`] says for the CPU chain
+    /// (which refuses a tonemap job), so what is reported must follow the
+    /// argv: `gpu:vulkan`, label `gpu`. Every other pipeline is
+    /// [`DecodeAccel::of`] unchanged.
+    pub fn for_pipeline(
+        opts: &TranscodeOptions,
+        device: crate::protocol::DeviceId,
+        offload: DecodeOffload,
+        pipeline: VaapiPipeline,
+        has_filler: bool,
+    ) -> Self {
+        if pipeline == VaapiPipeline::GpuTonemap
+            && gpu_tonemap_argv_applies(opts, device, offload, has_filler)
+        {
+            return Self::Gpu { name: "vulkan" };
+        }
+        Self::of(opts, device, offload)
     }
 
     /// Whether source decode is offloaded.
@@ -731,6 +807,11 @@ pub enum VaapiPipeline {
     #[default]
     Hybrid,
     Resident,
+    /// HDR to SDR on the GPU (ADR-0072): Vulkan decode, libplacebo tonemap, a
+    /// readback, then the VAAPI encode. Only an HDR job that
+    /// [`gpu_tonemap_argv_applies`] takes it; every other job gets the hybrid
+    /// argv whatever this says.
+    GpuTonemap,
 }
 
 impl VaapiPipeline {
@@ -738,8 +819,42 @@ impl VaapiPipeline {
         match self {
             Self::Hybrid => "hybrid",
             Self::Resident => "resident",
+            Self::GpuTonemap => "gpu_tonemap",
         }
     }
+}
+
+/// Whether the GPU tonemap argv can express this job. Burn-in (libass,
+/// `overlay`) and the 3D per-eye / mono filters are CPU filters that cannot
+/// take Vulkan frames, so those jobs keep the CPU chain; a filler window
+/// decodes nothing; shared-init fMP4 needs one encoder pipeline for every
+/// segment. The route decodes on Vulkan, so it also needs the same evidence
+/// gate as every other hardware decode (`offload`): a device whose trial did
+/// not prove HEVC decode must not get one by the back door. The scheduler asks
+/// this before choosing the route and the argv builder re-checks it, so a
+/// caller cannot request an argv the job cannot run.
+pub(crate) fn gpu_tonemap_argv_applies(
+    opts: &TranscodeOptions,
+    device: crate::protocol::DeviceId,
+    offload: DecodeOffload,
+    has_filler: bool,
+) -> bool {
+    use crate::protocol::DeviceId;
+    matches!(
+        device,
+        DeviceId::Hw {
+            accel: HwAccel::Vaapi,
+            ..
+        }
+    ) && matches!(offload, DecodeOffload::Allowed)
+        && matches!(opts.video, Some(VideoCodec::H264 | VideoCodec::H265))
+        && !has_filler
+        && !crate::device::shared_init_fmp4(opts)
+        && !opts.tonemap.is_off()
+        && opts.burn_subtitle_stream_index.is_none()
+        && !opts.burn_intent
+        && opts.active_stereo_mono_filter().is_none()
+        && opts.per_eye_burn_format().is_none()
 }
 
 /// The part of the resident decision that depends only on the job's shape, not
@@ -998,10 +1113,23 @@ fn build_args_for_pipeline(
     ];
     let resident = pipeline == VaapiPipeline::Resident
         && resident_argv_applies(opts, device, offload, filler.is_some());
+    let gpu_tonemap = pipeline == VaapiPipeline::GpuTonemap
+        && gpu_tonemap_argv_applies(opts, device, offload, filler.is_some());
     // VAAPI: select the render node BEFORE `-i` so the `hwupload` filter
     // resolves the default device. Each GPU is a distinct render node. The
     // resident pipeline has no `hwupload`: `-hwaccel_device` below names it.
-    if !resident {
+    if gpu_tonemap {
+        // Vulkan is derived from the VAAPI device so both name the same GPU;
+        // `-filter_hw_device vk` feeds the Vulkan filter graph.
+        if let Some(node) = device.vaapi_render_node() {
+            a.push("-init_hw_device".into());
+            a.push(format!("vaapi=va:{node}"));
+            a.push("-init_hw_device".into());
+            a.push("vulkan=vk@va".into());
+            a.push("-filter_hw_device".into());
+            a.push("vk".into());
+        }
+    } else if !resident {
         if let Some(node) = device.vaapi_render_node() {
             a.push("-vaapi_device".into());
             a.push(node);
@@ -1021,10 +1149,26 @@ fn build_args_for_pipeline(
         );
     // Decode on the GPU as well as encode there — see [`DecodeAccel`], so what
     // the scheduler reports and what ffmpeg is actually told cannot drift.
-    if filler.is_none() {
+    if gpu_tonemap {
+        for arg in [
+            "-hwaccel",
+            "vulkan",
+            "-hwaccel_output_format",
+            "vulkan",
+            "-hwaccel_device",
+            "vk",
+        ] {
+            a.push(arg.into());
+        }
+    } else if filler.is_none() {
         if let DecodeAccel::Gpu { name } = DecodeAccel::of(opts, device, offload) {
             a.push("-hwaccel".into());
             a.push(name.into());
+            if name == "cuda" && cuda_scale_applies(opts, device) {
+                // `scale_cuda` needs the frames to stay in cuda memory.
+                a.push("-hwaccel_output_format".into());
+                a.push("cuda".into());
+            }
             if resident {
                 // Keep decoded frames on the GPU as VAAPI surfaces; the
                 // encoder reads them there, so nothing is downloaded or
@@ -1135,10 +1279,11 @@ fn build_args_for_pipeline(
                     format!("{num}/{den}")
                 })
                 .unwrap_or_else(|| FILLER_FALLBACK_RATE.to_string());
-            a.push(format!(
-                "color=c=black:size={}x{}:rate={rate}",
-                f.width, f.height
-            ));
+            let (fw, fh) = opts
+                .output_size
+                .map(|s| (s.width(), s.height()))
+                .unwrap_or((f.width, f.height));
+            a.push(format!("color=c=black:size={fw}x{fh}:rate={rate}"));
             if f.audio_codec.is_some() {
                 // Silence, not a copy of the continuous encode: the design
                 // deliberately trades the partial real audio this window
@@ -1250,7 +1395,7 @@ fn build_args_for_pipeline(
                 }
             );
             // A filler window is synthetic, so there is nothing to map.
-            let tonemap_vf = if filler.is_some() {
+            let tonemap_vf = if filler.is_some() || gpu_tonemap {
                 None
             } else {
                 opts.tonemap.filters(
@@ -1261,18 +1406,44 @@ fn build_args_for_pipeline(
                     },
                 )
             };
+            // The GPU tonemap route scales inside libplacebo, and a filler is
+            // generated at the output size already.
+            let cuda_scale = filler.is_none()
+                && cuda_scale_applies(opts, device)
+                && matches!(
+                    DecodeAccel::of(opts, device, offload),
+                    DecodeAccel::Gpu { .. }
+                );
+            let scale_vf = if filler.is_some() || gpu_tonemap {
+                None
+            } else if cuda_scale {
+                opts.output_size.map(|s| s.cuda_filter())
+            } else {
+                opts.output_size.map(|s| s.software_filter())
+            };
             if is_vaapi && matches!(c, VideoCodec::H264 | VideoCodec::H265) {
                 // VAAPI: upload frames to the GPU, then encode. The
                 // upload filter chains after any software filters.
                 // The resident pipeline runs no filter: a plain 8-bit 4:2:0
                 // source decodes to NV12 surfaces, which h264_vaapi/hevc_vaapi
                 // take as they are.
-                if !resident {
-                    // The tonemap chain already ends in nv12.
-                    if tonemap_vf.is_none() {
-                        vf_parts.push("format=nv12".into());
+                if resident {
+                    // Frames stay on the GPU, so the scale does too.
+                    if let Some(size) = opts.output_size {
+                        a.push("-vf".into());
+                        a.push(size.vaapi_filter());
                     }
-                    vf_parts.push("hwupload".into());
+                } else {
+                    if gpu_tonemap {
+                        // Ends in `hwupload`: the frame is VAAPI again.
+                        vf_parts.extend(opts.tonemap.gpu_filters(opts.output_size));
+                    } else {
+                        // The tonemap chain already ends in nv12.
+                        if tonemap_vf.is_none() {
+                            vf_parts.push("format=nv12".into());
+                        }
+                        vf_parts.push("hwupload".into());
+                    }
                     push_video_filters(
                         &mut a,
                         &vf_parts,
@@ -1289,6 +1460,7 @@ fn build_args_for_pipeline(
                         opts.active_stereo_mono_filter(),
                         opts.per_eye_burn_format(),
                         tonemap_vf.as_deref(),
+                        scale_vf.as_deref(),
                     );
                 }
                 a.push("-c:v".into());
@@ -1328,6 +1500,7 @@ fn build_args_for_pipeline(
                     opts.active_stereo_mono_filter(),
                     opts.per_eye_burn_format(),
                     tonemap_vf.as_deref(),
+                    scale_vf.as_deref(),
                 );
                 a.push("-c:v".into());
                 a.push(encoder.into());
@@ -1339,8 +1512,12 @@ fn build_args_for_pipeline(
                 // NVENC / QSV / VideoToolbox encoder. VAAPI handles this
                 // via the `format=nv12` filter above, so it's scoped to
                 // the non-VAAPI encoders here.
-                a.push("-pix_fmt".into());
-                a.push("yuv420p".into());
+                // The cuda scale already emits NV12 and a `-pix_fmt` would
+                // force a download to system memory.
+                if !cuda_scale {
+                    a.push("-pix_fmt".into());
+                    a.push("yuv420p".into());
+                }
                 // NVENC GPU ordinal selection on a multi-GPU box. Only the
                 // NVENC h264/hevc encoders accept `-gpu`; appending it for a
                 // software codec (libvpx-vp9, which never runs on NVENC)
@@ -1579,7 +1756,7 @@ fn build_args_for_pipeline(
             // load-balances ONE session's segments across both devices, and
             // they all decode under the single init segment 0 produced. A
             // segment on the other device's timescale is then read on the
-            // init's clock: measured live, a burned-subtitle Fringe episode
+            // init's clock: measured live, a burned-subtitle Show AW episode
             // spilled from NVENC to CPU and its segment 7 arrived claiming
             // 157.7 s instead of 42.1 s (90000/24000 = 3.75x). hls.js will not
             // join a fragment that far outside the range the playlist
@@ -1692,6 +1869,7 @@ mod tests {
             video_3d_format: None,
             stereo_output: StereoOutput::Preserve,
             tonemap: Default::default(),
+            output_size: None,
         }
     }
 
@@ -2170,6 +2348,7 @@ mod tests {
             video_3d_format: None,
             stereo_output: StereoOutput::Preserve,
             tonemap: Default::default(),
+            output_size: None,
         };
         let joined = build_args("/m/x.mkv", &o).join(" ");
         assert!(joined.contains("-c:v libvpx-vp9"), "{joined}");
@@ -2236,6 +2415,7 @@ mod tests {
             video_3d_format: None,
             stereo_output: StereoOutput::Preserve,
             tonemap: Default::default(),
+            output_size: None,
         };
         let joined = build_args("/m/x.mkv", &o).join(" ");
         assert!(joined.contains("-enc_time_base 1:90000"), "{joined}");
@@ -2279,6 +2459,7 @@ mod tests {
             video_3d_format: None,
             stereo_output: StereoOutput::Preserve,
             tonemap: Default::default(),
+            output_size: None,
         };
         let nvenc = build_args_for_device(
             "/m/x.mkv",
@@ -2388,6 +2569,7 @@ mod tests {
             video_3d_format: None,
             stereo_output: StereoOutput::Preserve,
             tonemap: Default::default(),
+            output_size: None,
         };
         let a = build_args("/m/x.mp4", &o);
         let joined = a.join(" ");
@@ -2422,6 +2604,7 @@ mod tests {
             video_3d_format: None,
             stereo_output: StereoOutput::Preserve,
             tonemap: Default::default(),
+            output_size: None,
         };
         let a = build_args("/m/x.flac", &o);
         let joined = a.join(" ");
@@ -2462,7 +2645,7 @@ mod tests {
     fn burn_subtitle_uses_overlay_filter_complex() {
         // B40 — burn-in is only ever requested for IMAGE subs (PGS/VOBSUB),
         // which the text-only `subtitles=` filter cannot render ("Only text
-        // based subtitles are currently supported" — every Avatar segment
+        // based subtitles are currently supported" — every Film BA segment
         // 500'd). The burn must ride an overlay filter_complex with explicit
         // maps (a filter_complex disables default stream selection).
         let mut o = opts();
@@ -2700,8 +2883,8 @@ mod tests {
         assert!(!joined.contains("-pix_fmt"), "{joined}");
     }
 
-    const TONEMAP_CORE: &str = "zscale=t=linear:npl=100:p=bt709:dither=none,format=gbrpf32le,\
-         tonemap=tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv:dither=none";
+    const TONEMAP_CORE: &str = "zscale=t=linear:npl=203:p=bt709:dither=none,format=gbrpf32le,\
+         tonemap=tonemap=mobius:param=0.35:desat=0,zscale=t=bt709:m=bt709:r=tv:dither=none";
 
     fn vf_of(device: crate::protocol::DeviceId, o: &TranscodeOptions) -> Option<String> {
         let a = build_args_for_device(
@@ -2725,6 +2908,15 @@ mod tests {
     fn tonemap_software_ends_in_yuv420p_before_the_encoder() {
         let vf = vf_of(crate::protocol::DeviceId::Cpu, &hdr_opts()).expect("-vf");
         assert_eq!(vf, format!("{TONEMAP_CORE},format=yuv420p"));
+    }
+
+    #[test]
+    fn tonemap_cpu_chain_uses_the_bt2408_reference_white_of_the_gpu_route() {
+        let vf = vf_of(crate::protocol::DeviceId::Cpu, &hdr_opts()).expect("-vf");
+        assert_eq!(crate::options::CPU_TONEMAP_REFERENCE_WHITE_NITS, 203);
+        assert!(vf.contains("zscale=t=linear:npl=203:"), "{vf}");
+        assert!(!vf.contains("npl=100"), "{vf}");
+        assert!(vf.contains("tonemap=tonemap=mobius:param=0.35:"), "{vf}");
     }
 
     #[test]
@@ -2860,6 +3052,201 @@ mod tests {
         }
     }
 
+    fn size_1080() -> crate::output_size::OutputSize {
+        crate::output_size::OutputSize::new(1920, 1080).unwrap()
+    }
+
+    fn scaled(mut o: TranscodeOptions) -> TranscodeOptions {
+        o.output_size = Some(size_1080());
+        o
+    }
+
+    #[test]
+    fn output_size_scales_before_the_tonemap_on_the_cpu_chain() {
+        let vf = vf_of(crate::protocol::DeviceId::Cpu, &scaled(hdr_opts())).expect("-vf");
+        assert_eq!(vf, format!("scale=1920:1080,{TONEMAP_CORE},format=yuv420p"));
+    }
+
+    #[test]
+    fn output_size_on_an_sdr_source_is_the_scale_alone() {
+        let vf = vf_of(crate::protocol::DeviceId::Cpu, &scaled(opts())).expect("-vf");
+        assert_eq!(vf, "scale=1920:1080");
+    }
+
+    #[test]
+    fn output_size_scales_before_the_vaapi_upload() {
+        let dev = crate::protocol::DeviceId::hw(HwAccel::Vaapi, 0);
+        assert_eq!(
+            vf_of(dev, &scaled(opts())).expect("-vf"),
+            "scale=1920:1080,format=nv12,hwupload"
+        );
+        assert_eq!(
+            vf_of(dev, &scaled(hdr_opts())).expect("-vf"),
+            format!("scale=1920:1080,{TONEMAP_CORE},format=nv12,hwupload")
+        );
+    }
+
+    #[test]
+    fn output_size_scales_before_a_text_subtitle_is_burned() {
+        let mut o = scaled(hdr_opts());
+        o.burn_subtitle_stream_index = Some(0);
+        o.burn_intent = true;
+        o.burn_subtitle_is_text = true;
+        let vf = vf_of(crate::protocol::DeviceId::Cpu, &o).expect("-vf");
+        assert_in_order(&vf, &["scale=1920:1080", "tonemap=", "subtitles="]);
+    }
+
+    #[test]
+    fn output_size_follows_a_bitmap_burn_because_its_overlay_is_in_source_pixels() {
+        let mut o = scaled(opts());
+        o.burn_subtitle_stream_index = Some(3);
+        let j = build_args("/m/x.mkv", &o).join(" ");
+        assert!(
+            j.contains(
+                "-filter_complex [0:v:0][0:s:3]overlay=eof_action=pass,scale=1920:1080[vout]"
+            ),
+            "{j}"
+        );
+    }
+
+    #[test]
+    fn output_size_scales_the_whole_3d_frame_before_the_eyes_split() {
+        use pharos_core::Video3DFormat as F;
+        let mut o = scaled(hdr_opts());
+        o.video_3d_format = Some(F::HalfSideBySide);
+        o.stereo_output = StereoOutput::Preserve;
+        o.burn_intent = true;
+        o.burn_subtitle_stream_index = Some(2);
+        o.burn_subtitle_is_text = true;
+        let a = build_args("/m/3d.mkv", &o);
+        let fc = a.iter().position(|x| x == "-filter_complex").expect("fc");
+        let g = &a[fc + 1];
+        assert_in_order(
+            g,
+            &[
+                "[0:v:0]scale=1920:1080,",
+                "tonemap=",
+                "split=2[e0][e1]",
+                "subtitles=",
+            ],
+        );
+        assert_eq!(g.matches("scale=1920:1080").count(), 1, "{g}");
+    }
+
+    #[test]
+    fn output_size_scales_before_the_mono_downmix_crop() {
+        use pharos_core::Video3DFormat as F;
+        let mut o = scaled(opts());
+        o.video_3d_format = Some(F::HalfSideBySide);
+        o.stereo_output = StereoOutput::Mono2D;
+        let vf = vf_of(crate::protocol::DeviceId::Cpu, &o).expect("-vf");
+        assert!(vf.starts_with("scale=1920:1080,crop="), "{vf}");
+    }
+
+    #[test]
+    fn output_size_in_the_resident_pipeline_is_scale_vaapi() {
+        let mut o = resident_opts();
+        o.output_size = Some(size_1080());
+        let a = pipeline_argv(
+            &o,
+            crate::protocol::DeviceId::hw(HwAccel::Vaapi, 0),
+            DecodeOffload::Allowed,
+            VaapiPipeline::Resident,
+        );
+        let i = a.iter().position(|x| x == "-vf").expect("-vf");
+        assert_eq!(a[i + 1], "scale_vaapi=w=1920:h=1080");
+    }
+
+    #[test]
+    fn output_size_on_the_gpu_tonemap_route_rides_inside_libplacebo() {
+        let a = gpu_tonemap_argv(
+            &scaled(hdr_opts()),
+            crate::protocol::DeviceId::hw(HwAccel::Vaapi, 1),
+        );
+        let i = a.iter().position(|x| x == "-vf").expect("-vf");
+        assert_eq!(
+            a[i + 1],
+            "libplacebo=tonemapping=bt.2390:colorspace=bt709:color_primaries=bt709:\
+             color_trc=bt709:range=tv:format=nv12:w=1920:h=1080,hwdownload,format=nv12,\
+             hwupload=derive_device=vaapi"
+        );
+        assert!(!a.join(" ").contains("scale="), "{a:?}");
+    }
+
+    #[test]
+    fn output_size_on_nvenc_keeps_nvdec_and_scales_with_scale_cuda() {
+        let dev = crate::protocol::DeviceId::hw(HwAccel::Nvenc, 0);
+        let mut o = scaled(opts());
+        o.source_video_codec = Some(SourceCodec::H264);
+        assert!(DecodeAccel::of(&o, dev, DecodeOffload::Allowed).is_gpu());
+        let a = build_args_for_device("/m/x.mkv", &o, dev, "out.ts", DecodeOffload::Allowed, None);
+        let j = a.join(" ");
+        assert!(
+            j.contains("-hwaccel cuda -hwaccel_output_format cuda"),
+            "{j}"
+        );
+        let i = a.iter().position(|x| x == "-vf").expect("-vf");
+        assert_eq!(a[i + 1], "scale_cuda=1920:1080:format=nv12");
+        // A -pix_fmt would pull the frames back to system memory.
+        assert!(!j.contains("-pix_fmt"), "{j}");
+        assert!(j.contains("-c:v h264_nvenc"), "{j}");
+    }
+
+    #[test]
+    fn output_size_on_nvenc_falls_back_to_the_cpu_scale_when_a_filter_needs_system_frames() {
+        let dev = crate::protocol::DeviceId::hw(HwAccel::Nvenc, 0);
+        let gpu = |o: &TranscodeOptions| DecodeAccel::of(o, dev, DecodeOffload::Allowed).is_gpu();
+        let mut burn = scaled(opts());
+        burn.burn_subtitle_stream_index = Some(2);
+        let hdr = scaled(hdr_opts());
+        for o in [burn, hdr] {
+            let mut o = o;
+            o.source_video_codec = Some(SourceCodec::H264);
+            assert!(!gpu(&o));
+            let j =
+                build_args_for_device("/m/x.mkv", &o, dev, "out.ts", DecodeOffload::Allowed, None)
+                    .join(" ");
+            assert!(!j.contains("scale_cuda"), "{j}");
+            assert!(j.contains("scale=1920:1080"), "{j}");
+            assert!(j.contains("-pix_fmt yuv420p"), "{j}");
+        }
+    }
+
+    #[test]
+    fn a_filler_window_is_generated_at_the_output_size() {
+        let o = scaled(opts());
+        let f = options::FillerSpec {
+            width: 3840,
+            height: 2160,
+            audio_codec: None,
+        };
+        let a = build_args_for_pipeline(
+            "/m/x.mkv",
+            &o,
+            crate::protocol::DeviceId::Cpu,
+            "out.ts",
+            DecodeOffload::Allowed,
+            Some(f),
+            VaapiPipeline::Hybrid,
+        )
+        .join(" ");
+        assert!(a.contains("color=c=black:size=1920x1080:"), "{a}");
+        assert!(!a.contains("scale="), "a filler is not scaled again: {a}");
+    }
+
+    #[test]
+    fn output_size_moves_the_rendition_key_only_when_set() {
+        let p = std::path::Path::new("/m/x.mkv");
+        let base = RenditionKey::new(p, &opts());
+        assert_eq!(base, RenditionKey::new(p, &opts()));
+        assert_ne!(base, RenditionKey::new(p, &scaled(opts())));
+        let json = serde_json::to_string(&opts()).unwrap();
+        assert!(
+            !json.contains("output_size"),
+            "unscaled canon moved: {json}"
+        );
+    }
+
     #[test]
     fn tonemap_decision_follows_the_range_type_and_labels_are_distinct() {
         use crate::options::Tonemap;
@@ -2877,6 +3264,181 @@ mod tests {
         );
         let labels: std::collections::HashSet<_> = Tonemap::ALL.iter().map(|t| t.label()).collect();
         assert_eq!(labels.len(), Tonemap::ALL.len());
+    }
+
+    fn gpu_tonemap_argv(o: &TranscodeOptions, dev: crate::protocol::DeviceId) -> Vec<String> {
+        build_args_for_pipeline(
+            "/m/x.mkv",
+            o,
+            dev,
+            "out.ts",
+            DecodeOffload::Allowed,
+            None,
+            VaapiPipeline::GpuTonemap,
+        )
+    }
+
+    #[test]
+    fn gpu_tonemap_argv_decodes_on_vulkan_and_tonemaps_in_libplacebo() {
+        use crate::protocol::DeviceId;
+        let a = gpu_tonemap_argv(&hdr_opts(), DeviceId::hw(HwAccel::Vaapi, 1));
+        let j = a.join(" ");
+        assert_in_order(
+            &j,
+            &[
+                "-init_hw_device vaapi=va:/dev/dri/renderD129",
+                "-init_hw_device vulkan=vk@va",
+                "-filter_hw_device vk",
+                "-hwaccel vulkan",
+                "-hwaccel_output_format vulkan",
+                "-hwaccel_device vk",
+                "-i /m/x.mkv",
+                "-vf libplacebo=tonemapping=bt.2390:colorspace=bt709:color_primaries=bt709:\
+                 color_trc=bt709:range=tv:format=nv12,hwdownload,format=nv12,\
+                 hwupload=derive_device=vaapi",
+                "-c:v h264_vaapi",
+            ],
+        );
+        assert!(!j.contains("-vaapi_device"), "{j}");
+        assert!(
+            !j.contains("zscale") && !j.contains("tonemap=tonemap"),
+            "{j}"
+        );
+        assert!(!j.contains("-hwaccel vaapi"), "{j}");
+    }
+
+    #[test]
+    fn gpu_tonemap_is_only_expressible_for_jobs_that_can_run_it() {
+        use crate::protocol::DeviceId;
+        let vaapi = DeviceId::hw(HwAccel::Vaapi, 0);
+        let cpu_chain = |o: &TranscodeOptions, dev| {
+            build_args_for_pipeline(
+                "/m/x.mkv",
+                o,
+                dev,
+                "out.ts",
+                DecodeOffload::Allowed,
+                None,
+                VaapiPipeline::Hybrid,
+            )
+        };
+        let mut cases: Vec<(&str, TranscodeOptions, DeviceId)> = Vec::new();
+        cases.push(("software", hdr_opts(), DeviceId::Cpu));
+        cases.push(("nvenc", hdr_opts(), DeviceId::hw(HwAccel::Nvenc, 0)));
+        cases.push(("sdr", opts(), vaapi));
+        let mut burn = hdr_opts();
+        burn.burn_intent = true;
+        burn.burn_subtitle_stream_index = Some(2);
+        cases.push(("burn", burn, vaapi));
+        let mut per_eye = hdr_opts();
+        per_eye.video_3d_format = Some(pharos_core::Video3DFormat::HalfSideBySide);
+        per_eye.stereo_output = StereoOutput::Preserve;
+        per_eye.burn_intent = true;
+        per_eye.burn_subtitle_stream_index = Some(2);
+        cases.push(("per_eye_burn", per_eye, vaapi));
+        let mut mono = hdr_opts();
+        mono.video_3d_format = Some(pharos_core::Video3DFormat::HalfSideBySide);
+        mono.stereo_output = StereoOutput::Mono2D;
+        cases.push(("mono2d", mono, vaapi));
+        let mut copy = hdr_opts();
+        copy.video = Some(VideoCodec::Copy);
+        cases.push(("copy", copy, vaapi));
+        for (label, o, dev) in cases {
+            assert_eq!(
+                gpu_tonemap_argv(&o, dev),
+                cpu_chain(&o, dev),
+                "{label}: asking for the GPU route must yield the CPU-chain argv"
+            );
+        }
+    }
+
+    #[test]
+    fn gpu_tonemap_filler_window_keeps_the_hybrid_argv() {
+        use crate::protocol::DeviceId;
+        let dev = DeviceId::hw(HwAccel::Vaapi, 0);
+        let filler = options::FillerSpec {
+            width: 1920,
+            height: 1080,
+            audio_codec: None,
+        };
+        let build = |p| {
+            build_args_for_pipeline(
+                "/m/x.mkv",
+                &hdr_opts(),
+                dev,
+                "out.ts",
+                DecodeOffload::Allowed,
+                Some(filler),
+                p,
+            )
+        };
+        assert_eq!(
+            build(VaapiPipeline::GpuTonemap),
+            build(VaapiPipeline::Hybrid)
+        );
+    }
+
+    /// The route decodes on Vulkan, so it needs the same decode evidence as any
+    /// other hardware decode: a device whose trial did not prove HEVC decode
+    /// gets the CPU-chain argv, not `-hwaccel vulkan`.
+    #[test]
+    fn gpu_tonemap_needs_the_decode_evidence_gate() {
+        use crate::protocol::DeviceId;
+        let dev = DeviceId::hw(HwAccel::Vaapi, 0);
+        let build = |offload, p| {
+            build_args_for_pipeline("/m/x.mkv", &hdr_opts(), dev, "out.ts", offload, None, p)
+        };
+        let denied = build(DecodeOffload::Denied, VaapiPipeline::GpuTonemap);
+        assert_eq!(denied, build(DecodeOffload::Denied, VaapiPipeline::Hybrid));
+        assert!(!denied.join(" ").contains("vulkan"), "{denied:?}");
+        assert!(build(DecodeOffload::Allowed, VaapiPipeline::GpuTonemap)
+            .join(" ")
+            .contains("-hwaccel vulkan"));
+    }
+
+    /// What is reported follows the argv: a GPU-route job decodes on Vulkan
+    /// (`gpu:vulkan`, label `gpu`), the CPU chain decodes in software, and the
+    /// existing labels are unchanged.
+    #[test]
+    fn the_reported_decode_accel_follows_the_gpu_tonemap_argv() {
+        use crate::protocol::DeviceId;
+        let dev = DeviceId::hw(HwAccel::Vaapi, 0);
+        let o = hdr_opts();
+        for (offload, pipeline) in [
+            (DecodeOffload::Allowed, VaapiPipeline::GpuTonemap),
+            (DecodeOffload::Denied, VaapiPipeline::GpuTonemap),
+            (DecodeOffload::Allowed, VaapiPipeline::Hybrid),
+            (DecodeOffload::Denied, VaapiPipeline::Hybrid),
+        ] {
+            let got = DecodeAccel::for_pipeline(&o, dev, offload, pipeline, false);
+            let a = build_args_for_pipeline("/m/x.mkv", &o, dev, "out.ts", offload, None, pipeline);
+            let j = a.join(" ");
+            match got {
+                DecodeAccel::Gpu { name } => {
+                    assert_eq!(name, "vulkan", "{offload:?} {pipeline:?}");
+                    assert!(j.contains("-hwaccel vulkan"), "{j}");
+                    assert_eq!(got.to_string(), "gpu:vulkan");
+                    assert_eq!(got.label(), "gpu");
+                }
+                other => {
+                    assert!(!j.contains("-hwaccel"), "{other}: {j}");
+                    assert_eq!(other, DecodeAccel::of(&o, dev, offload));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pipeline_labels_are_distinct() {
+        let labels: std::collections::HashSet<_> = [
+            VaapiPipeline::Hybrid,
+            VaapiPipeline::Resident,
+            VaapiPipeline::GpuTonemap,
+        ]
+        .iter()
+        .map(|p| p.label())
+        .collect();
+        assert_eq!(labels.len(), 3);
     }
 
     fn resident_opts() -> TranscodeOptions {
@@ -3552,7 +4114,7 @@ mod tests {
         //
         // It then discards every frame until it reaches a genuine recovery
         // point, and — this is why the defect survived to production —
-        // **exits 0**. Measured on the live source (Fringe S01E02) at the
+        // **exits 0**. Measured on the live source (Show AW S01E02) at the
         // timestamps the user reported as freezes: 9 of 43 sampled segments
         // came up short and TWO contained no video frames at all, while the
         // exit status, the byte-size floor and the cache all read success.

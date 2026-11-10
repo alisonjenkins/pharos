@@ -82,6 +82,11 @@ fn an_intact_container_scans_clean() {
     assert!(report.complete, "the scan must reach EOF: {report:?}");
     assert!(report.packets > 0, "no packets demuxed: {report:?}");
     assert_eq!(report.label(), "clean");
+    assert_eq!(
+        report.ranges,
+        Some(Vec::new()),
+        "a current verdict always carries spans"
+    );
     // 20 s of media, allowing container slack at the tail.
     assert!(
         report.scanned_ms >= 19_000,
@@ -141,6 +146,63 @@ fn a_hole_punched_mid_file_is_reported_with_its_position() {
         "label = {}",
         report.label()
     );
+
+    let ranges = report.ranges.clone().unwrap_or_default();
+    assert!(
+        !ranges.is_empty(),
+        "a player marks these spans on its seek bar: {report:?}"
+    );
+    let span_end = report
+        .declared_ms
+        .unwrap_or(report.scanned_ms)
+        .max(report.scanned_ms);
+    assert!(
+        ranges
+            .iter()
+            .all(|r| r.start_ms <= r.end_ms && r.end_ms <= span_end),
+        "spans must lie inside the media: {ranges:?}"
+    );
+    assert!(
+        (4_000..=16_000).contains(&ranges[0].start_ms),
+        "the hole is halfway through 20 s of media: {report:?}"
+    );
+}
+
+/// A body cut off partway is the damage players meet as an early end: the
+/// whole missing tail is one span reaching the header's declared end.
+#[test]
+fn a_truncated_body_marks_its_missing_tail() {
+    if !ffmpeg_available() {
+        eprintln!("skipping: ffmpeg not on PATH");
+        return;
+    }
+    let dir = tempfile::tempdir().expect("tempdir");
+    let input = dir.path().join("cut.mkv");
+    synth_mkv(&input);
+    let size = std::fs::metadata(&input).expect("stat fixture").len();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&input)
+        .expect("open fixture")
+        .set_len(size * 2 / 5)
+        .expect("truncate");
+
+    let report = pharos_transcode::libav::integrity::scan_integrity(&input).expect("scan ok");
+    assert!(report.is_damaged(), "{report:?}");
+    let last = report
+        .ranges
+        .as_ref()
+        .and_then(|r| r.last().copied())
+        .unwrap_or_else(|| panic!("a cut body must leave a span: {report:?}"));
+    let declared = report.declared_ms.expect("mkv declares its duration");
+    assert_eq!(
+        last.end_ms, declared,
+        "the span reaches the declared end: {report:?}"
+    );
+    assert!(
+        last.start_ms <= report.scanned_ms && last.start_ms < declared,
+        "the span starts where reading stopped: {report:?}"
+    );
 }
 
 /// A demuxer wedged on an unparseable byte returns the same error forever
@@ -187,4 +249,147 @@ fn a_wholly_shredded_body_terminates_rather_than_spinning() {
         elapsed < std::time::Duration::from_secs(30),
         "scan took {elapsed:?} — the read-error bounds are not stopping it"
     );
+}
+
+/// MPEG-TS starts its clock well past zero (1.4 s by default, often hours on
+/// a broadcast rip). Spans are on the player's timeline, so a hole halfway
+/// through a 20 s file is marked near 10 s, not near 10 s plus the offset.
+#[test]
+fn spans_are_on_the_players_timeline_for_a_container_that_starts_late() {
+    if !ffmpeg_available() {
+        eprintln!("skipping: ffmpeg not on PATH");
+        return;
+    }
+    let dir = tempfile::tempdir().expect("tempdir");
+    let input = dir.path().join("late.ts");
+    let status = Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=duration=20:size=320x240:rate=25",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-g",
+            "25",
+            "-output_ts_offset",
+            "600",
+        ])
+        .arg(&input)
+        .status()
+        .expect("spawn ffmpeg fixture");
+    assert!(status.success(), "fixture generation failed");
+    punch_hole(&input, 64 * 1024);
+
+    let report = pharos_transcode::libav::integrity::scan_integrity(&input).expect("scan ok");
+    let first = report
+        .ranges
+        .as_ref()
+        .and_then(|r| r.first().copied())
+        .unwrap_or_else(|| panic!("a hole in a TS body must leave a span: {report:?}"));
+    assert!(
+        (4_000..=16_000).contains(&first.start_ms),
+        "the hole is near the middle of 20 s, not at the raw 600 s clock: {report:?}"
+    );
+    assert!(
+        report.scanned_ms <= 21_000,
+        "scanned_ms is on the same timeline: {report:?}"
+    );
+}
+
+/// 20 s of MPEG-4 Part 2 in AVI, the shape of the live file B1162 was found
+/// on (MPEG-4 Part 2, as XviD captures are).
+fn synth_avi(path: &Path) {
+    let status = Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=duration=20:size=320x240:rate=25",
+            "-c:v",
+            "mpeg4",
+            "-q:v",
+            "5",
+            "-g",
+            "25",
+        ])
+        .arg(path)
+        .status()
+        .expect("spawn ffmpeg fixture");
+    assert!(status.success(), "fixture generation failed");
+}
+
+/// Copy `src` to `dst` with every top-level `idx1` chunk renamed to `JUNK`,
+/// which every AVI reader skips. The body is untouched, so the only thing
+/// missing is the index: exactly a capture tool that never finalised it.
+fn strip_avi_index(src: &Path, dst: &Path) {
+    let mut bytes = std::fs::read(src).expect("read fixture");
+    let mut pos = 12; // past "RIFF" <size> "AVI "
+    let mut stripped = 0;
+    while pos + 8 <= bytes.len() {
+        let size = u32::from_le_bytes(bytes[pos + 4..pos + 8].try_into().unwrap()) as usize;
+        if &bytes[pos..pos + 4] == b"idx1" {
+            bytes[pos..pos + 4].copy_from_slice(b"JUNK");
+            stripped += 1;
+        }
+        pos += 8 + size + (size & 1);
+    }
+    assert_eq!(stripped, 1, "the fixture must have had one idx1 to strip");
+    std::fs::write(dst, bytes).expect("write unindexed copy");
+}
+
+/// B1162 / V1122. A live file like this played, probed and demuxed cleanly,
+/// and a seek near its end still took over a minute, because with no index libav reads the
+/// file from byte 0 to find the seek point. Only the index is missing here,
+/// so this is the check that tells the two apart. Disarm it by returning
+/// `None` from `avi_seek_index` and the second assertion fails.
+#[test]
+fn an_avi_without_an_index_is_reported_and_an_indexed_one_is_not() {
+    if !ffmpeg_available() {
+        eprintln!("skipping: ffmpeg not on PATH");
+        return;
+    }
+    let dir = tempfile::tempdir().expect("tempdir");
+    let indexed = dir.path().join("indexed.avi");
+    let unindexed = dir.path().join("unindexed.avi");
+    synth_avi(&indexed);
+    strip_avi_index(&indexed, &unindexed);
+
+    let good = pharos_transcode::libav::integrity::scan_integrity(&indexed).expect("scan ok");
+    assert_eq!(good.seek_index, Some(true), "{good:?}");
+    assert!(!good.is_damaged(), "{}", good.summary());
+
+    let bad = pharos_transcode::libav::integrity::scan_integrity(&unindexed).expect("scan ok");
+    assert_eq!(bad.seek_index, Some(false), "{bad:?}");
+    assert_eq!(bad.label(), "unindexed", "{}", bad.summary());
+    assert!(bad.complete, "the body itself is intact: {bad:?}");
+    assert!(
+        bad.scanned_ms >= 19_000,
+        "the whole body still demuxes: {bad:?}"
+    );
+}
+
+/// A Matroska file's cues are read only when a seek asks for them, so an
+/// entry count taken at open would call every MKV unindexed. It is not checked.
+#[test]
+fn a_matroska_file_is_not_judged_on_its_index() {
+    if !ffmpeg_available() {
+        eprintln!("skipping: ffmpeg not on PATH");
+        return;
+    }
+    let dir = tempfile::tempdir().expect("tempdir");
+    let input = dir.path().join("good.mkv");
+    synth_mkv(&input);
+    let report = pharos_transcode::libav::integrity::scan_integrity(&input).expect("scan ok");
+    assert_eq!(report.seek_index, None, "{report:?}");
 }

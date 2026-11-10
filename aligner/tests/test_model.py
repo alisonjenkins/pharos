@@ -1,0 +1,155 @@
+"""Idle unload of the alignment model, with a fake loader and clock."""
+
+from __future__ import annotations
+
+from typing import Any
+
+import pytest
+
+from pharos_aligner.model import Aligner
+
+
+class FakeClock:
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+class CountingAligner(Aligner):
+    """Aligner whose load is a counter and whose alignment is a stub."""
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.loads = 0
+
+    def _load(self) -> tuple[Any, Any, Any]:
+        self.loads += 1
+        return object(), object(), object()
+
+    def _align_loaded(self, pcm_f32le: bytes, tokens: list[str], lead_star: bool) -> list[tuple[int, int]]:
+        return [(0, 0) for _ in tokens]
+
+
+def test_model_is_unloaded_after_idle_timeout_and_reloaded_on_next_alignment() -> None:
+    clock = FakeClock()
+    aligner = CountingAligner(idle_unload_s=600, clock=clock)
+    aligner.align(b"\0" * 4, ["hello"])
+    assert aligner.loaded
+
+    clock.now += 599
+    assert not aligner.unload_if_idle()
+    assert aligner.loaded
+
+    clock.now += 1
+    assert aligner.unload_if_idle()
+    assert not aligner.loaded
+
+    aligner.align(b"\0" * 4, ["hello"])
+    assert aligner.loaded
+    assert aligner.loads == 2
+
+
+def test_each_alignment_restarts_the_idle_timer() -> None:
+    clock = FakeClock()
+    aligner = CountingAligner(idle_unload_s=600, clock=clock)
+    aligner.align(b"\0" * 4, ["a"])
+    clock.now += 500
+    aligner.align(b"\0" * 4, ["b"])
+    clock.now += 500
+    assert not aligner.unload_if_idle()
+    assert aligner.loads == 1
+
+
+def test_without_idle_timeout_the_model_stays_loaded() -> None:
+    clock = FakeClock()
+    aligner = CountingAligner(idle_unload_s=None, clock=clock)
+    aligner.align(b"\0" * 4, ["a"])
+    clock.now += 1e9
+    assert not aligner.unload_if_idle()
+    assert aligner.loaded
+
+
+def test_a_model_never_loaded_is_not_unloaded() -> None:
+    clock = FakeClock()
+    aligner = CountingAligner(idle_unload_s=1, clock=clock)
+    clock.now += 10
+    assert not aligner.unload_if_idle()
+    assert aligner.loads == 0
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [(None, 600), ("", 600), ("0", None), ("120", 120)],
+)
+def test_idle_unload_secs_parses_the_environment(raw: str | None, expected: float | None) -> None:
+    from pharos_aligner.server import idle_unload_secs
+
+    assert idle_unload_secs(raw) == expected
+
+
+def test_idle_unload_secs_rejects_negative() -> None:
+    from pharos_aligner.server import idle_unload_secs
+
+    with pytest.raises(ValueError):
+        idle_unload_secs("-1")
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [(None, 8), ("", 8), ("  ", 8), ("1", 1), ("16", 16)],
+)
+def test_torch_threads_parses_the_environment(raw: str | None, expected: int) -> None:
+    from pharos_aligner.server import torch_threads
+
+    assert torch_threads(raw) == expected
+
+
+@pytest.mark.parametrize("raw", ["0", "-2", "four"])
+def test_torch_threads_rejects_values_that_are_not_a_positive_count(raw: str) -> None:
+    from pharos_aligner.server import torch_threads
+
+    with pytest.raises(ValueError):
+        torch_threads(raw)
+
+
+def test_set_threads_caps_torch() -> None:
+    import torch
+
+    from pharos_aligner.model import set_threads
+
+    before = torch.get_num_threads()
+    try:
+        set_threads(3)
+        assert torch.get_num_threads() == 3
+    finally:
+        torch.set_num_threads(before)
+
+
+def test_freed_memory_is_trimmed_even_where_find_library_finds_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The service image has no ldconfig, gcc or ld, so find_library("c")
+    # returns None there; the trim must not depend on it.
+    import ctypes.util
+
+    from pharos_aligner.model import _release_freed_memory
+
+    monkeypatch.setattr(ctypes.util, "find_library", lambda _name: None)
+    assert _release_freed_memory() is True
+
+
+def test_unload_logs_the_anon_memory_it_freed_and_whether_it_trimmed(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    clock = FakeClock()
+    aligner = CountingAligner(idle_unload_s=1, clock=clock)
+    aligner.align(b"\0" * 4, ["a"])
+    clock.now += 2
+    with caplog.at_level("INFO", logger="pharos_aligner"):
+        assert aligner.unload_if_idle()
+    line = next(r.getMessage() for r in caplog.records if "unloaded" in r.getMessage())
+    assert "anon_before_mib=" in line
+    assert "anon_after_mib=" in line
+    assert "trimmed=True" in line

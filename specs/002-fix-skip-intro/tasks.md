@@ -25,7 +25,7 @@ devShell (`nix develop --command …`).
 
 ## Phase 1: Setup
 
-- [X] T001 Move the research fixture into the test tree: copy `specs/002-fix-skip-intro/fixtures-mushoku-s03.txt` to `crates/pharos-transcode/tests/fixtures/mushoku_s03_fingerprints.txt` and record its provenance (season, date dumped, `item_id kind hex` format, little-endian `u32`) in a header comment or sibling `README` at `crates/pharos-transcode/tests/fixtures/README.md`
+- [X] T001 Move the research fixture into the test tree: copy `specs/002-fix-skip-intro/fixtures-anime-season.txt` to `crates/pharos-transcode/tests/fixtures/anime_season_fingerprints.txt` and record its provenance (season, date dumped, `item_id kind hex` format, little-endian `u32`) in a header comment or sibling `README` at `crates/pharos-transcode/tests/fixtures/README.md`
 - [X] T002 Add a fixture loader helper in `crates/pharos-transcode/tests/fingerprint_fixture.rs` that parses `item_id kind hex` lines into `(u64, String, Vec<u32>)`, decoding each 8-hex-char group with `swap_bytes()` to undo little-endian storage; no `unwrap` outside `#[cfg(test)]` opt-out
 
 ---
@@ -51,7 +51,7 @@ re-analysis question is settled.
 the client offers Skip Intro over the correct window.
 
 **Independent test**: the fixture test from T003 goes green, and a replay over the
-Mushoku S03 intro fingerprints yields a consensus span matching the show's actual
+Show K S03 intro fingerprints yields a consensus span matching the show's actual
 opening length (≈90 s, per the credits-side control) rather than the current single
 60.2 s outlier.
 
@@ -124,9 +124,9 @@ re-compared on the next sweep and gains an intro, with no read of the source fil
 - [X] T022 [P] Record the latent defect found but deliberately not fixed here — `find_contiguous` returns only the longest run at a shift, which `bound_and_snap` may then reject outright, discarding a valid shorter run at the same shift — as a new task in `specs/001-pharos-baseline/tasks.md`, appending a fresh id (never renumbering)
 - [X] T023 Append this defect to the bug ledger `specs/001-pharos-baseline/bugs.md` with cause and fix, using the next free id after B129, and add the invariant it is now guarded by to `specs/001-pharos-baseline/invariants.md` after V81: shift discovery and point acceptance must use the SAME notion of similarity — a fuzzy acceptance test seeded by an exact-match index can find nothing where thousands of near-matches exist
 - [X] T024 Verify in production by query, not assertion (constitution ODD step 5). After deploy and one sweep pass, run the three checks in `specs/002-fix-skip-intro/quickstart.md` §5 — the recall-by-kind PromQL, the closing-only SQL (145 before), and the named-season LogQL — and report the ACTUAL output
-- [X] T025 Close the loop on the reported symptom: play Mushoku Tensei S03 on the Google TV app, confirm Skip Intro appears over the same window the browser shows, and record the result in `specs/002-fix-skip-intro/research.md`
+- [X] T025 Close the loop on the reported symptom: play Show K S03 on the Google TV app, confirm Skip Intro appears over the same window the browser shows, and record the result in `specs/002-fix-skip-intro/research.md`
 - [-] T026 (NOT NEEDED, see Notes) Update SC-001 in `specs/002-fix-skip-intro/spec.md` from the provisional 80% to the measured figure once T024 reports the post-fix verdict split across the 145 seasons (research R4's open item)
-- [X] T027 Check episode `3096759618643281933` (Mushoku S03E02, matches nothing in either kind) against the known zeroed/corrupt-file list before accepting it as normal; note the outcome in `specs/002-fix-skip-intro/research.md`
+- [X] T027 Check episode `3096759618643281933` (Show K S03E02, matches nothing in either kind) against the known zeroed/corrupt-file list before accepting it as normal; note the outcome in `specs/002-fix-skip-intro/research.md`
 
 ---
 
@@ -199,7 +199,7 @@ Never squash.
 
 Closed. The user-visible defect was **B130** — `MediaSource.HasSegments` hardcoded
 `false`, which made jellyfin-web skip the segment fetch entirely. Verified on the
-TV by the user: starting Fringe S01E06 from the beginning shows the Skip Intro
+TV by the user: starting Show AW S01E06 from the beginning shows the Skip Intro
 prompt at 5:22, as the crossing-only ExoPlayer trigger predicts.
 
 **B131** (shift discovery) was a real, separate blind spot found on the way and is

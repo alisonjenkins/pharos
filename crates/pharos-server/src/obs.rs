@@ -403,17 +403,30 @@ pub fn rpc_trace_parent(span: &tracing::Span, traceparent: &str) {
     }
 }
 
+/// The W3C `traceparent` naming `span`, for an outgoing call to a service
+/// that traces too (the aligner), so its spans join this trace. `None` when
+/// the span is not being exported.
+pub fn traceparent(span: &tracing::Span) -> Option<String> {
+    use opentelemetry::propagation::TextMapPropagator as _;
+    use opentelemetry::trace::TraceContextExt as _;
+    use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+    let context = span.context();
+    if !context.span().span_context().is_valid() {
+        return None;
+    }
+    let mut carrier = std::collections::HashMap::new();
+    opentelemetry_sdk::propagation::TraceContextPropagator::new()
+        .inject_context(&context, &mut carrier);
+    carrier.remove("traceparent")
+}
+
 /// Parent-based sampler: an incoming sampled `traceparent` is honoured so a
 /// distributed trace is never cut in half; only root spans started here are
 /// thinned to `ratio`. At 1.0 this is the SDK default (parent-based always-on).
 fn sampler_for(ratio: f64) -> opentelemetry_sdk::trace::Sampler {
-    use opentelemetry_sdk::trace::Sampler;
-    let root = if ratio >= 1.0 {
-        Sampler::AlwaysOn
-    } else {
-        Sampler::TraceIdRatioBased(ratio.max(0.0))
-    };
-    Sampler::ParentBased(Box::new(root))
+    opentelemetry_sdk::trace::Sampler::ParentBased(Box::new(crate::client_spans::root_sampler(
+        ratio,
+    )))
 }
 
 /// Build the OTLP/gRPC span-export layer pointed at `endpoint`, registering
@@ -439,10 +452,12 @@ where
         .build();
     let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
         .with_sampler(sampler_for(sampling_ratio))
+        .with_id_generator(crate::client_spans::ClientIdGenerator::default())
         .with_batch_exporter(exporter)
         .with_resource(resource)
         .build();
     let tracer = provider.tracer("pharos");
+    crate::client_spans::set_sampling_ratio(sampling_ratio);
     opentelemetry::global::set_tracer_provider(provider.clone());
     let _ = TRACER_PROVIDER.set(provider);
     Ok(tracing_opentelemetry::layer().with_tracer(tracer))
@@ -452,6 +467,7 @@ where
 /// `rate()` / `increase()` see them from startup. Call once after [`init`].
 pub fn register_static_series() {
     pharos_cache::hls_cache::register_segment_metrics();
+    pharos_transcode::scheduler::register_tonemap_metrics();
     for (tonemap, range) in crate::api::jellyfin::hls::tonemap_series() {
         metrics::counter!(
             "pharos_transcode_tonemap_total",
@@ -462,12 +478,46 @@ pub fn register_static_series() {
     }
 }
 
+/// jemalloc's own view of the heap, so RSS can be split into live data
+/// (`allocated`), pages it holds for reuse (`active` minus `allocated`, and
+/// `resident` minus `active`) and address space it keeps unmapped
+/// (`retained`). A rise in `allocated` is a leak; a gap that grows between it
+/// and `resident` is the allocator.
+#[cfg(target_os = "linux")]
+fn collect_allocator_stats() {
+    use tikv_jemalloc_ctl::{epoch, stats};
+    if let Err(e) = epoch::advance() {
+        tracing::debug!(error = %e, "jemalloc epoch advance failed; allocator stats skipped");
+        return;
+    }
+    let reads: [(&'static str, tikv_jemalloc_ctl::Result<usize>); 5] = [
+        ("allocated", stats::allocated::read()),
+        ("active", stats::active::read()),
+        ("resident", stats::resident::read()),
+        ("mapped", stats::mapped::read()),
+        ("retained", stats::retained::read()),
+    ];
+    for (kind, value) in reads {
+        match value {
+            Ok(bytes) => {
+                metrics::gauge!("pharos_allocator_bytes", "kind" => kind).set(bytes as f64)
+            }
+            Err(e) => tracing::debug!(kind, error = %e, "jemalloc stat read failed"),
+        }
+    }
+}
+
 /// Render Prometheus exposition text for `/metrics`. Lock-free.
 pub fn render() -> String {
     match RESULT.get() {
         Some(Ok(h)) => {
             if let Some(process) = PROCESS.get() {
                 process.collect();
+            }
+            #[cfg(target_os = "linux")]
+            {
+                collect_allocator_stats();
+                crate::child_memory::collect();
             }
             h.render()
         }
@@ -583,6 +633,38 @@ mod tests {
             "process_threads",
         ] {
             assert!(body.contains(name), "missing {name}; rendered:\n{body}");
+        }
+    }
+
+    /// The workers' memory must reach /metrics even with none running, so
+    /// a query over it has a series from startup (B911).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn child_memory_is_rendered_on_every_scrape() {
+        init("info", None).unwrap();
+        let body = render();
+        for name in ["pharos_child_processes", "pharos_child_anon_bytes"] {
+            assert!(
+                body.lines()
+                    .any(|l| l.starts_with(&format!("{name}{{process=\"transcode-worker\"}}"))),
+                "missing {name}; rendered:\n{body}"
+            );
+        }
+    }
+
+    /// The heap/allocator split must reach /metrics, or a rise in RSS cannot
+    /// be told apart as live data or allocator-held pages.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn allocator_stats_are_rendered_on_every_scrape() {
+        init("info", None).unwrap();
+        let body = render();
+        for kind in ["allocated", "active", "resident", "mapped", "retained"] {
+            assert!(
+                body.lines()
+                    .any(|l| l.starts_with(&format!("pharos_allocator_bytes{{kind=\"{kind}\"}}"))),
+                "missing pharos_allocator_bytes{{kind={kind}}}; rendered:\n{body}"
+            );
         }
     }
 
@@ -728,6 +810,29 @@ mod tests {
             rpc_trace_parent(&span, traceparent);
             span.context().span().span_context().trace_id().to_string()
         })
+    }
+
+    /// The aligner joins the server's trace (B1164): the header handed to it
+    /// names the span's trace, and a span nobody exports hands it none.
+    #[test]
+    fn an_outgoing_traceparent_names_the_current_trace() {
+        use opentelemetry::trace::TracerProvider as _;
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder().build();
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("test")));
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::info_span!("lyrics.align");
+            rpc_trace_parent(
+                &span,
+                "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01",
+            );
+            let header = traceparent(&span).expect("an exported span names its trace");
+            assert!(
+                header.starts_with("00-0af7651916cd43dd8448eb211c80319c-"),
+                "{header}"
+            );
+        });
+        assert_eq!(traceparent(&tracing::info_span!("untraced")), None);
     }
 
     /// FR-006: a call carrying a `traceparent` joins the caller's trace.

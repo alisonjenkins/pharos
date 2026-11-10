@@ -149,15 +149,54 @@ pub async fn track_preference(state: &AppState, user: UserId) -> TrackPreference
     match serde_json::from_str::<UserConfigurationDto>(&raw) {
         Ok(cfg) => TrackPreference::from_configuration(&cfg),
         Err(e) => {
+            // A sibling field the typed configuration rejects (a `null` where
+            // it wants a list) must not lose the track settings themselves.
+            let cfg = track_fields_alone(&raw);
             tracing::warn!(
                 user.id = %user,
                 error = %e,
-                "stored user configuration did not parse — track selection falls back \
-                 to the container's own order"
+                track_fields_read = cfg.is_some(),
+                "stored user configuration did not parse whole — track selection reads \
+                 its own fields alone"
             );
-            TrackPreference::default()
+            cfg.map_or_else(TrackPreference::default, |cfg| {
+                TrackPreference::from_configuration(&cfg)
+            })
         }
     }
+}
+
+/// The track fields of `raw`, each read on its own over the defaults;
+/// `None` when `raw` is not a JSON object.
+fn track_fields_alone(raw: &str) -> Option<UserConfigurationDto> {
+    let v: serde_json::Value = serde_json::from_str(raw).ok()?;
+    let obj = v.as_object()?;
+    let text = |k: &str| {
+        obj.get(k)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+    };
+    let flag = |k: &str| obj.get(k).and_then(serde_json::Value::as_bool);
+    let mut cfg = UserConfigurationDto::default();
+    if let Some(s) = text("AudioLanguagePreference") {
+        cfg.audio_language_preference = s;
+    }
+    if let Some(s) = text("SubtitleLanguagePreference") {
+        cfg.subtitle_language_preference = s;
+    }
+    if let Some(s) = text("SubtitleMode") {
+        cfg.subtitle_mode = s;
+    }
+    if let Some(b) = flag("PlayDefaultAudioTrack") {
+        cfg.play_default_audio_track = b;
+    }
+    if let Some(b) = flag("RememberAudioSelections") {
+        cfg.remember_audio_selections = b;
+    }
+    if let Some(b) = flag("RememberSubtitleSelections") {
+        cfg.remember_subtitle_selections = b;
+    }
+    Some(cfg)
 }
 
 #[cfg(test)]
@@ -277,6 +316,21 @@ mod tests {
         assert!(prefs.audio_original_language);
         assert_eq!(prefs.subtitle_mode, SubtitleMode::Smart);
         assert!(!prefs.prefer_default_audio_track);
+    }
+
+    /// A field the typed configuration rejects must not drop the track
+    /// settings. Disarm check: returning the defaults on a parse failure
+    /// fails this.
+    #[test]
+    fn track_fields_survive_a_sibling_the_dto_rejects() {
+        let raw = r#"{"OrderedViews":null,"AudioLanguagePreference":"jpn","SubtitleMode":"Always","PlayDefaultAudioTrack":false}"#;
+        assert!(serde_json::from_str::<UserConfigurationDto>(raw).is_err());
+        let p = TrackPreference::from_configuration(&track_fields_alone(raw).unwrap());
+        assert!(p.audio_languages.iter().any(|l| l == "jpn"));
+        assert_eq!(p.subtitle_mode, SubtitleMode::Always);
+        assert!(!p.prefer_default_audio_track);
+        assert!(p.remember_audio, "an absent flag keeps its default");
+        assert!(track_fields_alone("[1]").is_none());
     }
 
     #[test]

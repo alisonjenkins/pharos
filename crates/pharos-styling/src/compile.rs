@@ -2,9 +2,11 @@
 //!
 //! Pure and deterministic: the same inputs give the same bytes.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::budget::{max_animated, max_events_per_line, PASSTHROUGH_PREFIX};
+use crate::contrast;
 use crate::effects;
 use crate::event::Event;
 use crate::plan::{EffectPlan, EffectsLevel, Intent, Karaoke, LineEffect, Placement, Tier};
@@ -15,12 +17,25 @@ use crate::version::COMPILER_VERSION;
 
 const WINDOW_MS: i64 = 10_000;
 const MAX_STARTS_PER_WINDOW: usize = 60;
+/// Two lines this close or closer read as one exchange, so the change from
+/// one to the next is eased rather than cut (B1206).
+const EASE_GAP_MS: i64 = 250;
+/// The eased line's fade in and its predecessor's fade out.
+const EASE_IN_MS: i64 = 120;
+const EASE_OUT_MS: i64 = 100;
+/// How far, in script units, an eased line rises into place on Desktop, and
+/// over how long.
+const EASE_RISE: i32 = 14;
+const EASE_RISE_MS: i64 = 160;
 
 /// Compiles `lines` as directed by `plan`.
 ///
 /// - `Off` draws every line plain; `Subtle` caps intensity at 1 and keeps
 ///   Ember (a Full-only karaoke fill) as Sweep.
 /// - Lines with their own typesetting are copied through verbatim (FR-005).
+/// - Unless the level is `Off`, a plain line that follows another within
+///   [`EASE_GAP_MS`], with nothing else on screen, fades in (and on Desktop
+///   rises a little into place); one followed that closely fades out (B1206).
 /// - When a line's effect would break a budget that depends on its
 ///   neighbours (animated events on screen, event starts per 10 s), the line
 ///   falls back to the next cheaper tier's form of the effect.
@@ -41,7 +56,9 @@ pub fn compile(
     let mut styles: BTreeSet<String> = BTreeSet::new();
     styles.insert(names::DEFAULT.to_owned());
     // Source style definitions kept verbatim, by their `Format:` line and name.
-    let mut verbatim: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
+    // The bool: some event in that style draws text, not only shapes, so its
+    // colours get the sign contrast nudge (B1210).
+    let mut verbatim: BTreeMap<String, BTreeMap<String, (String, bool)>> = BTreeMap::new();
     let mut aliases: BTreeSet<String> = BTreeSet::new();
 
     for line in lines {
@@ -58,17 +75,27 @@ pub fn compile(
         } else {
             &line.style
         };
-        let mut ev = Event::on(line, i, style, line.raw.clone());
+        let own_style = line
+            .style_def
+            .as_deref()
+            .filter(|_| theme.style(style).is_none());
+        let light = own_style.map_or(true, |d| contrast::style_is_light(&d.format, &d.line));
+        let text = crate::glyphs::latin_punctuation(&line.raw);
+        let text = contrast::event_text(&text, light);
+        let mut ev = Event::on(line, i, style, text);
         ev.name = format!("{PASSTHROUGH_PREFIX}{i}");
         if ev.is_visible() {
             if theme.style(style).is_some() {
                 // A theme style of that name wins over the source's.
                 styles.insert(style.to_owned());
-            } else if let Some(def) = &line.style_def {
+            } else if let Some(def) = own_style {
+                let lettered = !contrast::draws(&line.raw);
                 verbatim
                     .entry(def.format.clone())
                     .or_default()
-                    .insert(style.to_owned(), def.line.clone());
+                    .entry(style.to_owned())
+                    .and_modify(|(_, l)| *l |= lettered)
+                    .or_insert((def.line.clone(), lettered));
             } else {
                 aliases.insert(style.to_owned());
             }
@@ -76,16 +103,29 @@ pub fn compile(
             events.push((i, ev));
         }
     }
+    let eases = if level == EffectsLevel::Off || tier == Tier::Low {
+        vec![Ease::default(); lines.len()]
+    } else {
+        eases(lines)
+    };
     for (i, line) in lines.iter().enumerate() {
         if line.typeset || line.text.is_empty() {
             continue;
         }
         let fx = effective(by_line.get(&i).copied(), line, i, level);
-        let Some(evs) = fit(line, &fx, theme, tier, &placer) else {
+        let ease = eases.get(i).copied().unwrap_or_default();
+        let Some(evs) = fit(line, &fx, ease, theme, tier, &placer) else {
             continue;
         };
         placer.accept(&evs);
-        for ev in evs {
+        let sized = (theme.tag_scale - 1.0).abs() > f32::EPSILON;
+        for mut ev in evs {
+            if sized {
+                ev.text = crate::tags::scale_sizes(&ev.text, theme.tag_scale);
+            }
+            if let Cow::Owned(t) = crate::glyphs::latin_punctuation(&ev.text) {
+                ev.text = t;
+            }
             styles.insert(ev.style.clone());
             events.push((i, ev));
         }
@@ -131,8 +171,12 @@ pub fn compile(
             format
         });
         out.push('\n');
-        for line in defs.values() {
-            out.push_str(line);
+        for (line, lettered) in defs.values() {
+            if *lettered {
+                out.push_str(&contrast::style_line(format, line));
+            } else {
+                out.push_str(line);
+            }
             out.push('\n');
         }
     }
@@ -185,10 +229,71 @@ fn effective(
     fx
 }
 
+/// Whether a line eases in from the line before it and out into the line
+/// after it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Ease {
+    into: bool,
+    out_of: bool,
+}
+
+/// Each line's [`Ease`], by index. Only a line alone on screen eases: an
+/// eased plain line is positioned, which turns off the renderer's collision
+/// handling, so a line overlapping another keeps its normal placement.
+fn eases(lines: &[SourceLine]) -> Vec<Ease> {
+    let mut out = vec![Ease::default(); lines.len()];
+    let mut order: Vec<usize> = (0..lines.len())
+        .filter(|&i| !lines[i].typeset && !lines[i].text.is_empty())
+        .collect();
+    order.sort_by_key(|&i| (lines[i].start_ms, lines[i].end_ms, i));
+    // Sorted by start, a line shares the screen with an earlier line when it
+    // starts before the latest end so far, and with a later one when the next
+    // line starts before it ends.
+    // A sign on screen counts too: an eased line is positioned, so libass
+    // would no longer move it out of the sign's way.
+    let mut signs: Vec<(i64, i64)> = lines
+        .iter()
+        .filter(|l| l.typeset && l.end_ms > l.start_ms)
+        .map(|l| (l.start_ms, l.end_ms))
+        .collect();
+    signs.sort_unstable();
+    let sign_reach: Vec<i64> = signs
+        .iter()
+        .scan(i64::MIN, |reach, &(_, end)| {
+            *reach = (*reach).max(end);
+            Some(*reach)
+        })
+        .collect();
+    let under_sign = |l: &SourceLine| {
+        let n = signs.partition_point(|&(start, _)| start < l.end_ms);
+        n > 0 && sign_reach[n - 1] > l.start_ms
+    };
+    let mut alone = Vec::with_capacity(order.len());
+    let mut latest_end = i64::MIN;
+    for (k, &i) in order.iter().enumerate() {
+        let l = &lines[i];
+        let after = order
+            .get(k + 1)
+            .map_or(true, |&j| lines[j].start_ms >= l.end_ms);
+        alone.push(l.start_ms >= latest_end && after && !under_sign(l));
+        latest_end = latest_end.max(l.end_ms);
+    }
+    for k in 1..order.len() {
+        let (a, b) = (order[k - 1], order[k]);
+        let gap = lines[b].start_ms - lines[a].end_ms;
+        if alone[k - 1] && alone[k] && (0..=EASE_GAP_MS).contains(&gap) {
+            out[a].out_of = true;
+            out[b].into = true;
+        }
+    }
+    out
+}
+
 /// The events for the line at the richest tier up to `tier` that fits.
 fn fit(
     line: &SourceLine,
     fx: &LineEffect,
+    ease: Ease,
     theme: &Theme,
     tier: Tier,
     placer: &Placer,
@@ -196,7 +301,7 @@ fn fit(
     let mut t = if fx.static_only { Tier::Low } else { tier };
     loop {
         let evs: Vec<Event> = effects::events(line, fx, theme, t)
-            .unwrap_or_else(|| vec![plain(line, fx)])
+            .unwrap_or_else(|| vec![plain(line, fx, ease, theme, t)])
             .into_iter()
             .filter(Event::is_visible)
             .collect();
@@ -210,10 +315,26 @@ fn fit(
     }
 }
 
-/// The dialogue style with the source's own italics kept.
-fn plain(line: &SourceLine, fx: &LineEffect) -> Event {
+/// The dialogue style with the source's own italics kept, eased in or out
+/// when `ease` says so and the line has its default placement.
+fn plain(line: &SourceLine, fx: &LineEffect, ease: Ease, theme: &Theme, tier: Tier) -> Event {
     let body = text::body(line);
-    let text = format!("{}{}", brace(&effects::place_tags(fx.placement)), body);
+    let mut tags = effects::place_tags(fx.placement);
+    if fx.placement == Placement::Default && tier != Tier::Low && (ease.into || ease.out_of) {
+        let fade_in = if ease.into { EASE_IN_MS } else { 0 };
+        let fade_out = if ease.out_of { EASE_OUT_MS } else { 0 };
+        let (an, x, y) = effects::anchor(theme, names::DEFAULT, Placement::Default);
+        if tier == Tier::Desktop && ease.into {
+            tags.push_str(&format!(
+                "\\an{an}\\move({x},{},{x},{y},0,{EASE_RISE_MS})",
+                y + EASE_RISE
+            ));
+        } else {
+            tags.push_str(&format!("\\an{an}\\pos({x},{y})"));
+        }
+        tags.push_str(&effects::fad(line, fade_in, fade_out));
+    }
+    let text = format!("{}{}", brace(&tags), body);
     Event::on(line, fx.line, names::DEFAULT, text)
 }
 
@@ -285,16 +406,26 @@ impl Placer {
         if cap == 0 {
             return false;
         }
-        // Peak overlap is always reached at some event's start.
-        cand.iter().all(|&(s, _)| {
-            let n = self
-                .animated
-                .iter()
-                .chain(&cand)
-                .filter(|&&(a, b)| a <= s && s < b)
-                .count();
-            n <= cap
-        })
+        // Peak overlap is always reached at some event's start: a candidate's,
+        // or an accepted event's that a candidate now covers.
+        let covered = |s: i64| cand.iter().any(|&(a, b)| a <= s && s < b);
+        cand.iter()
+            .map(|&(s, _)| s)
+            .chain(
+                self.animated
+                    .iter()
+                    .map(|&(s, _)| s)
+                    .filter(|&s| covered(s)),
+            )
+            .all(|s| {
+                let n = self
+                    .animated
+                    .iter()
+                    .chain(&cand)
+                    .filter(|&&(a, b)| a <= s && s < b)
+                    .count();
+                n <= cap
+            })
     }
 
     fn fits_rate(&self, evs: &[Event]) -> bool {
@@ -401,6 +532,81 @@ mod tests {
         );
     }
 
+    /// Three lines a beat apart, then one long after, then two at once.
+    const CLOSE: &str = "1\n00:00:01,000 --> 00:00:02,000\nOne\n\n\
+        2\n00:00:02,100 --> 00:00:03,000\nTwo\n\n\
+        3\n00:00:03,000 --> 00:00:04,000\nThree\n\n\
+        4\n00:00:09,000 --> 00:00:10,000\nFour\n\n\
+        5\n00:00:10,100 --> 00:00:12,000\nFive\n\n\
+        6\n00:00:11,000 --> 00:00:12,000\nSix\n";
+
+    /// B1206: lines a beat apart ease from one to the next; a line with
+    /// another on screen, or far from its neighbours, does not.
+    #[test]
+    fn close_lines_ease_into_each_other() {
+        let lines = source::read(CLOSE).unwrap().lines;
+        let e = eases(&lines);
+        let flags: Vec<(bool, bool)> = e.iter().map(|e| (e.into, e.out_of)).collect();
+        assert_eq!(
+            flags,
+            [
+                (false, true),
+                (true, true),
+                (true, false),
+                (false, false),
+                (false, false),
+                (false, false)
+            ]
+        );
+        let plan = plain_plan(lines.len());
+        let desk = run(&plan, &lines, Tier::Desktop, EffectsLevel::Subtle);
+        let d = dialogue(&desk);
+        assert!(
+            d[0].contains("\\an2\\pos(960,1026)\\fad(0,100)}One"),
+            "{}",
+            d[0]
+        );
+        assert!(
+            d[1].contains("\\an2\\move(960,1040,960,1026,0,160)\\fad(120,100)}Two"),
+            "{}",
+            d[1]
+        );
+        assert!(d[3].ends_with(",,Four"), "{}", d[3]);
+        assert!(d[4].ends_with(",,Five") && d[5].ends_with(",,Six"));
+        let tv = run(&plan, &lines, Tier::Tv, EffectsLevel::Full);
+        assert!(dialogue(&tv)[1].contains("\\pos(960,1026)\\fad(120,100)}Two"));
+        assert!(!tv.contains("\\move"));
+        for (tier, level) in [
+            (Tier::Low, EffectsLevel::Full),
+            (Tier::Desktop, EffectsLevel::Off),
+        ] {
+            let ass = run(&plan, &lines, tier, level);
+            assert!(
+                !ass.contains("\\fad") && !ass.contains("\\pos"),
+                "{tier:?} {level:?}"
+            );
+        }
+        for tier in Tier::ALL {
+            let ass = run(&plan, &lines, tier, EffectsLevel::Full);
+            assert_eq!(crate::budget::check(&ass, tier), Ok(()), "{tier:?}");
+        }
+    }
+
+    /// A sign on screen keeps a line from easing: the eased line would be
+    /// positioned and drawn over the sign instead of moved clear of it.
+    #[test]
+    fn a_line_under_a_sign_does_not_ease() {
+        let mut lines = source::read(CLOSE).unwrap().lines;
+        let mut sign = lines[1].clone();
+        (sign.start_ms, sign.end_ms, sign.typeset) = (2_200, 2_800, true);
+        lines.push(sign);
+        let flags: Vec<(bool, bool)> = eases(&lines)[..3]
+            .iter()
+            .map(|e| (e.into, e.out_of))
+            .collect();
+        assert_eq!(flags, [(false, false), (false, false), (false, false)]);
+    }
+
     #[test]
     fn same_inputs_same_bytes() {
         let plan = plain_plan(3);
@@ -448,6 +654,59 @@ mod tests {
     }
 
     const SIGN_ASS: &str = "[Script Info]\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, Alignment\nStyle: Sign,Impact,90,8\nStyle: Default,Arial,20,2\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 3,0:00:01.00,0:00:02.00,Sign,,0,0,0,,{\\pos(3,2)\\t(0,1,\\fax1)\\blur3}Baratie, east\nDialogue: 0,0:00:03.00,0:00:04.00,Default,,0,0,0,,Talk\nDialogue: 0,0:00:05.00,0:00:06.00,Default,,0,0,0,,{\\an8}Top\n";
+
+    /// A stats-panel sign as typesetters write them: a box drawing with a
+    /// stray character after `\p1`, a top-left style with no placement tag,
+    /// CJK brackets around Latin labels, and dialogue over it.
+    const PANEL_ASS: &str = "[Script Info]\nPlayResX: 1920\nPlayResY: 1080\n[V4+ Styles]\n\
+        Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n\
+        Style: Panel-BOX,Times New Roman,36,&H2C382F1E,&H0000FFFF,&H2B382F1E,&H7F404040,-1,0,0,0,100,110,0,0,3,12,0,7,60,60,60,0\n\
+        Style: Panel,Times New Roman,36,&H00B98B75,&H0000FFFF,&H2B382F1E,&H7F404040,-1,0,0,0,100,110,0,0,1,0,0,7,90,90,90,0\n\
+        Style: Default,Arial,76,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,-1,0,0,0,100,100,0,0,1,3.5,0,2,150,150,70,1\n\
+        [Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n\
+        Dialogue: 0,0:00:01.00,0:00:05.00,Panel-BOX,Text,0,0,0,,{\\bord0\\p1)}m 0 0 l 510 0 510 420 0 420\n\
+        Dialogue: 1,0:00:01.00,0:00:05.00,Panel,Text,0,0,0,,{\\1a&H17&}【Name】 {\\c&HD2D2D2&}Alex\\N{\\c&HB98B75&}【Level】 {\\c&HD2D2D2&}1\n\
+        Dialogue: 0,0:00:01.00,0:00:03.00,Default,A,0,0,0,,Level one, it says.\n";
+
+    /// B1208–B1210: the panel stays a sign in its own style, its box stays
+    /// a box, its brackets read, and its lettering is nudged off its
+    /// outline; the dialogue under it is restyled as usual.
+    #[test]
+    fn a_stats_panel_passes_through_readable() {
+        let src = source::read(PANEL_ASS).unwrap().lines;
+        assert_eq!(
+            src.iter().map(|l| l.typeset).collect::<Vec<_>>(),
+            [true, true, false]
+        );
+        let out = run(&plain_plan(3), &src, Tier::Desktop, EffectsLevel::Full);
+        let all = dialogue(&out);
+        let by = |style: &str| *all.iter().find(|l| l.contains(style)).unwrap();
+        let d = [by(",Panel-BOX,"), by(",Panel,"), by(",Default,")];
+        assert!(
+            d[0].ends_with(",,{\\bord0\\p1)}m 0 0 l 510 0 510 420 0 420"),
+            "{}",
+            d[0]
+        );
+        assert!(
+            d[1].ends_with(
+                ",,{\\1a&H17&}[Name] {\\c&HDDDDDD&}Alex\\N{\\c&HCBA898&}[Level] {\\c&HDDDDDD&}1"
+            ),
+            "{}",
+            d[1]
+        );
+        assert!(d[2].ends_with("Level one, it says."), "{}", d[2]);
+        // The box keeps its colours; the lettering's fill rises and its
+        // outline falls.
+        assert!(out.contains("Style: Panel-BOX,Times New Roman,36,&H2C382F1E,"));
+        assert!(
+            out.contains(
+                "Style: Panel,Times New Roman,36,&H00CBA898,&H0000FFFF,&H2B16130C,&H7F1A1A1A,"
+            ),
+            "{out}"
+        );
+        assert!(!out.contains('【'));
+        assert_eq!(pharos_subs::Script::parse(&out).stats.bad_lines, 0);
+    }
 
     #[test]
     fn typeset_events_pass_through_with_their_own_style_line() {

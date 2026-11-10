@@ -3,8 +3,10 @@
 
 pub mod auth;
 pub mod client_ids;
+pub mod ensemble;
 pub mod fuzzy;
 pub mod language;
+pub mod metadata_edit;
 pub mod origin;
 pub mod parental_rank;
 pub mod secret;
@@ -24,6 +26,10 @@ pub use auth::{
     UserRecord, UserStore, API_KEY_DEVICE_PREFIX,
 };
 pub use client_ids::{ClientDeviceId, PlaySessionId};
+pub use ensemble::ensemble_cast;
+pub use metadata_edit::{
+    EditRejected, EditTarget, EditableField, LockedFields, MetadataEdit, MetadataEditStore,
+};
 pub use origin::{LocalPath, Origin, RemoteRef, RemoteRefError, REMOTE_SCHEME};
 pub use secret::{secret_prefix, SecretString};
 pub use video_3d::{Detect3DSource, ParseVideo3DFormatError, Video3DFormat};
@@ -114,6 +120,9 @@ pub struct MediaItem {
     /// this value carries, when a playback request selected one. Never
     /// persisted: a store read always yields the primary, with `None`.
     pub edition: Option<String>,
+    /// The fields an admin edited, which no scan or refresh overwrites
+    /// (ADR-0097). Written only by [`MetadataEditStore::edit_metadata`].
+    pub locked: LockedFields,
 }
 
 impl MediaItem {
@@ -478,6 +487,16 @@ pub fn artwork_source_is_item_servable(source: &str) -> bool {
     )
 }
 
+/// One `artwork` row as the stale-art sweep reads it. `(item_id, role)` keys
+/// the row; `source` and `locator` say where its bytes are supposed to be.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtworkRow {
+    pub item_id: MediaId,
+    pub role: String,
+    pub source: String,
+    pub locator: String,
+}
+
 /// LIB-C4 — stable 32-hex wire id for an aggregate entity (genre /
 /// artist / album / studio), keyed on a `kind` namespace + `name`. Pure
 /// arithmetic over the UTF-8 bytes — not IO, so it lives in core (V12
@@ -780,8 +799,8 @@ const MIN_PREFIX_MATCH_CHARS: usize = 6;
 
 /// Subtitle/qualifier-tolerant similarity for the shape Levenshtein punishes:
 /// one canonical title extends the other with an appended tail — a provider
-/// subtitle (`Code Geass` ⊂ `Code Geass: Lelouch of the Rebellion`) or a local
-/// qualifier (`Forever` ⊂ `Forever (US)`). When the shorter normalized title
+/// subtitle (`Alpha Beta` ⊂ `Alpha Beta: Rebellion Arc`) or a local
+/// qualifier (`Show D` ⊂ `Show D (US)`). When the shorter normalized title
 /// is an exact whole-token prefix of the longer, the shared portion is a
 /// perfect match and only the dropped tail is uncertain, so it scores high
 /// (0.9 + a small credit for how much of the longer title the prefix covers)
@@ -830,69 +849,231 @@ fn year_factor(q: Option<u32>, c: Option<u32>) -> f32 {
 /// nothing about which one is meant.
 const PREFIX_NEAR_TIE: f32 = 0.03;
 
-/// Best-scoring candidate over `min_confidence`, else None. A candidate's
-/// title similarity is the best over its title and aliases; score = that ×
-/// year factor. Among candidates over `min_confidence`, one whose name equals
-/// the query (after normalization) outranks any that only shares a prefix with
-/// it, whatever the years: otherwise "Dragon Ball R&R" beats "Dragon Ball" when
-/// the real show's year is a year off (B557). An exact name whose year is far
-/// off falls under the floor and so cannot shut out a good prefix match
-/// ("Doctor Who" 1963 vs "Doctor Who (2005)"). When several candidates match
-/// exactly, the one matching by an earlier name wins: a provider lists a
-/// show's own title and translation before its aliases, and an alias is how
-/// the 2023 live-action ONE PIECE also answers to "One Piece". With no exact
-/// match, candidates within [`PREFIX_NEAR_TIE`] of the best score go to the
-/// earliest-premiered: the query is then a franchise name that every entry
-/// extends with a subtitle, and the folder that carries just that name is
-/// almost always the original ("Code Geass" is the 2006 series, not the 2024
-/// Rozé of the Recapture). Remaining ties resolve to the earliest candidate.
+/// Lead over the runner-up below which a match is ambiguous (spec 033 §3): a
+/// rival that matches the name the same way and scores within this of the
+/// winner is as good a reading of the evidence.
+pub const AMBIGUOUS_MATCH_MARGIN: f32 = 0.2;
+
+/// Which rule picked [`MatchDecision::chosen`] over the runner-up. A metric
+/// label (`pharos_series_match_total{decided_by}`), so the strings in
+/// [`label`](Self::label) are a dashboard contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MatchDecidedBy {
+    /// Only one candidate cleared the confidence floor.
+    SoleCandidate,
+    /// The chosen name fits the query better: an exact name over a prefix
+    /// match, an earlier exact name (title before alias), or a closer name.
+    Name,
+    /// The names fit equally; the year agreement separated them.
+    Year,
+    /// Several subtitles of one franchise tied; the earliest premiere won.
+    EarliestPremiere,
+    /// Nothing separated the candidates; the provider's order did (B930).
+    ProviderOrder,
+    /// The candidates' episode lists were compared with the files' (V891).
+    EpisodeFit,
+    /// The `tvshow.nfo` ids broke the tie (V891).
+    NfoVote,
+}
+
+impl MatchDecidedBy {
+    /// Stable, bounded metric label.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::SoleCandidate => "sole_candidate",
+            Self::Name => "name",
+            Self::Year => "year",
+            Self::EarliestPremiere => "earliest_premiere",
+            Self::ProviderOrder => "provider_order",
+            Self::EpisodeFit => "episode_fit",
+            Self::NfoVote => "nfo_vote",
+        }
+    }
+}
+
+/// One search candidate as [`match_decide`] scored it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScoredCandidate {
+    pub id: String,
+    pub title: String,
+    pub year: Option<u32>,
+    /// `title_similarity × year_factor`, the confidence it would match at.
+    pub score: f32,
+    /// One of its names equals the query after normalization.
+    pub exact: bool,
+}
+
+/// Everything [`match_decide`] weighed, for the `series match` decision log.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MatchDecision {
+    /// Every candidate, in the provider's order.
+    pub candidates: Vec<ScoredCandidate>,
+    pub chosen: Option<MatchOutcome>,
+    /// The best other candidate over the floor.
+    pub runner_up: Option<MatchOutcome>,
+    /// `None` exactly when nothing was chosen.
+    pub decided_by: Option<MatchDecidedBy>,
+    /// The runner-up matches the name the same way (both exactly, or both
+    /// not) and trails by less than [`AMBIGUOUS_MATCH_MARGIN`].
+    pub ambiguous: bool,
+}
+
+impl MatchDecision {
+    /// Chosen score minus the runner-up's. Negative when an exact name beat a
+    /// prefix match that scored higher.
+    pub fn margin(&self) -> Option<f32> {
+        Some(self.chosen.as_ref()?.confidence - self.runner_up.as_ref()?.confidence)
+    }
+}
+
+/// Best-scoring candidate over `min_confidence`, else None. See
+/// [`match_decide`] for the rules; this is its `chosen`.
 pub fn match_best(
     query_title: &str,
     query_year: Option<u32>,
     candidates: &[SearchCandidate],
     min_confidence: f32,
 ) -> Option<MatchOutcome> {
+    match_decide(query_title, query_year, candidates, min_confidence).chosen
+}
+
+/// A candidate's fit, kept apart so the decision can say which part decided.
+struct Fit<'a> {
+    c: &'a SearchCandidate,
+    exact_at: Option<usize>,
+    similarity: f32,
+    year_factor: f32,
+    score: f32,
+}
+
+/// Pick the best candidate over `min_confidence` and say why. A candidate's
+/// title similarity is the best over its title and aliases; score = that ×
+/// year factor. Among candidates over `min_confidence`, one whose name equals
+/// the query (after normalization) outranks any that only shares a prefix with
+/// it, whatever the years: otherwise "Show A R&R" beats "Show A" when
+/// the real show's year is a year off (B557). An exact name whose year is far
+/// off falls under the floor and so cannot shut out a good prefix match
+/// ("Show C" 1963 vs "Show C (2005)"). When several candidates match
+/// exactly, the one matching by an earlier name wins: a provider lists a
+/// show's own title and translation before its aliases, and an alias is how
+/// the newer live-action SHOW B also answers to "Show B". With no exact
+/// match, candidates within [`PREFIX_NEAR_TIE`] of the best score go to the
+/// earliest-premiered: the query is then a franchise name that every entry
+/// extends with a subtitle, and the folder that carries just that name is
+/// almost always the original ("Alpha Beta" is the 2006 series, not the 2024
+/// Recapture Arc). Remaining ties resolve to the earliest candidate.
+pub fn match_decide(
+    query_title: &str,
+    query_year: Option<u32>,
+    candidates: &[SearchCandidate],
+    min_confidence: f32,
+) -> MatchDecision {
     let query = normalize_title(query_title);
-    // (index of the first name that equals the query, score, candidate)
-    let mut best: Option<(Option<usize>, f32, &SearchCandidate)> = None;
-    let mut inexact: Vec<(f32, &SearchCandidate)> = Vec::new();
-    for c in candidates {
-        let names = || std::iter::once(&c.title).chain(&c.aliases);
-        let exact_at = names().position(|n| normalize_title(n) == query);
-        let similarity = names()
-            .map(|n| title_similarity(query_title, n))
-            .fold(0.0_f32, f32::max);
-        let score = similarity * year_factor(query_year, c.year);
-        if score < min_confidence {
+    let fits: Vec<Fit<'_>> = candidates
+        .iter()
+        .map(|c| {
+            let names = || std::iter::once(&c.title).chain(&c.aliases);
+            let exact_at = names().position(|n| normalize_title(n) == query);
+            let similarity = names()
+                .map(|n| title_similarity(query_title, n))
+                .fold(0.0_f32, f32::max);
+            let year_factor = year_factor(query_year, c.year);
+            Fit {
+                c,
+                exact_at,
+                similarity,
+                year_factor,
+                score: similarity * year_factor,
+            }
+        })
+        .collect();
+    let over: Vec<usize> = (0..fits.len())
+        .filter(|&i| fits.get(i).is_some_and(|f| f.score >= min_confidence))
+        .collect();
+    let fit = |i: usize| fits.get(i);
+
+    let mut best: Option<usize> = None;
+    for &i in &over {
+        let (Some(f), b) = (fit(i), best.and_then(fit)) else {
             continue;
-        }
-        let beats = match &best {
+        };
+        let beats = match b {
             None => true,
-            Some((best_at, best_score, _)) => match (exact_at, best_at) {
+            Some(b) => match (f.exact_at, b.exact_at) {
                 (Some(_), None) => true,
                 (None, Some(_)) => false,
-                (Some(at), Some(best_at)) if at != *best_at => at < *best_at,
-                _ => score > *best_score,
+                (Some(at), Some(best_at)) if at != best_at => at < best_at,
+                _ => f.score > b.score,
             },
         };
         if beats {
-            best = Some((exact_at, score, c));
-        }
-        if exact_at.is_none() {
-            inexact.push((score, c));
+            best = Some(i);
         }
     }
-    if let Some((None, top, _)) = best {
-        best = inexact
+    let mut franchise_tie = false;
+    if let Some(top) = best.and_then(fit).filter(|f| f.exact_at.is_none()) {
+        let top = top.score;
+        let near: Vec<usize> = over
+            .iter()
+            .copied()
+            .filter(|&i| {
+                fit(i).is_some_and(|f| f.exact_at.is_none() && f.score >= top - PREFIX_NEAR_TIE)
+            })
+            .collect();
+        franchise_tie = near.len() > 1;
+        best = near
             .into_iter()
-            .filter(|(score, _)| *score >= top - PREFIX_NEAR_TIE)
-            .min_by_key(|(_, c)| c.year.unwrap_or(u32::MAX))
-            .map(|(score, c)| (None, score, c));
+            .min_by_key(|&i| fit(i).and_then(|f| f.c.year).unwrap_or(u32::MAX));
     }
-    best.map(|(_, confidence, c)| MatchOutcome {
-        id: c.id.clone(),
-        confidence,
-    })
+
+    let runner = best.and_then(|b| {
+        over.iter()
+            .copied()
+            .filter(|&i| i != b)
+            .fold(None::<usize>, |acc, i| match (acc.and_then(fit), fit(i)) {
+                (Some(a), Some(f)) if f.score <= a.score => acc,
+                _ => Some(i),
+            })
+    });
+    let decided_by = best.and_then(fit).map(|chosen| match runner.and_then(fit) {
+        None => MatchDecidedBy::SoleCandidate,
+        Some(_) if franchise_tie => MatchDecidedBy::EarliestPremiere,
+        Some(r) if chosen.exact_at != r.exact_at => MatchDecidedBy::Name,
+        Some(r) if chosen.similarity > r.similarity => MatchDecidedBy::Name,
+        Some(r) if chosen.year_factor > r.year_factor => MatchDecidedBy::Year,
+        Some(_) => MatchDecidedBy::ProviderOrder,
+    });
+    let outcome = |i: usize| {
+        fit(i).map(|f| MatchOutcome {
+            id: f.c.id.clone(),
+            confidence: f.score,
+        })
+    };
+    let chosen = best.and_then(outcome);
+    let runner_up = runner.and_then(outcome);
+    let ambiguous = match (best.and_then(fit), runner.and_then(fit)) {
+        (Some(c), Some(r)) => {
+            c.exact_at.is_some() == r.exact_at.is_some()
+                && c.score - r.score < AMBIGUOUS_MATCH_MARGIN
+        }
+        _ => false,
+    };
+    MatchDecision {
+        candidates: fits
+            .iter()
+            .map(|f| ScoredCandidate {
+                id: f.c.id.clone(),
+                title: f.c.title.clone(),
+                year: f.c.year,
+                score: f.score,
+                exact: f.exact_at.is_some(),
+            })
+            .collect(),
+        chosen,
+        runner_up,
+        decided_by,
+        ambiguous,
+    }
 }
 
 /// Parse a bare `YYYY-MM-DD` date (TMDB/TVDB style) to unix seconds at UTC
@@ -940,6 +1121,23 @@ pub struct Person {
     pub wire_id: String,
     pub provider_ids: Option<String>,
     pub thumb_url: Option<String>,
+}
+
+/// What a metadata provider says about a person, kept so their page does
+/// not ask again. Every field `None` records that the provider had nothing.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PersonDetails {
+    pub biography: Option<String>,
+    /// `YYYY-MM-DD`, as the provider gives it.
+    pub birth_date: Option<String>,
+    pub death_date: Option<String>,
+    pub birth_place: Option<String>,
+    /// `nm` and digits.
+    pub imdb_id: Option<String>,
+    /// `Q` and digits.
+    pub wikidata_id: Option<String>,
+    /// Unix seconds.
+    pub fetched_at: i64,
 }
 
 /// LIB-C2 — one person plus how many items credit them, for the
@@ -1052,6 +1250,47 @@ pub trait PersonStore: Send + Sync {
         &self,
         limit: i64,
     ) -> impl std::future::Future<Output = DomainResult<Vec<Person>>> + Send;
+
+    /// Every `Actor` credit on any of `items`, paired with the item that
+    /// carries it, so a show's or season's cast can be ranked across its
+    /// episodes with [`ensemble_cast`]. Guest stars and crew are left out.
+    fn actor_credits_for_items(
+        &self,
+        items: &[MediaId],
+    ) -> impl std::future::Future<Output = DomainResult<Vec<(MediaId, ItemPerson)>>> + Send;
+
+    /// Every credit of the person whose `wire_id` matches, each paired with
+    /// the item that carries it, in item order: what a person's page lists.
+    /// Empty when no person row carries that wire id.
+    fn credits_for_person(
+        &self,
+        wire_id: &str,
+    ) -> impl std::future::Future<Output = DomainResult<Vec<(MediaId, ItemPerson)>>> + Send;
+
+    /// Up to `limit` people with an acting credit (`Actor` or `GuestStar`)
+    /// whose name holds every one of `words` (compared lowercased), shortest
+    /// name first. Nothing when `words` is empty. A database may fold only
+    /// ASCII case, so a word with other letters is matched by its ASCII part
+    /// and more names may come back: callers check each name.
+    fn actors_named(
+        &self,
+        words: &[String],
+        limit: u32,
+    ) -> impl std::future::Future<Output = DomainResult<Vec<Person>>> + Send;
+
+    /// The provider details kept for the person whose `wire_id` matches;
+    /// `None` when none were ever fetched.
+    fn person_details(
+        &self,
+        wire_id: &str,
+    ) -> impl std::future::Future<Output = DomainResult<Option<PersonDetails>>> + Send;
+
+    /// Keep `details` for `wire_id`, replacing any kept before.
+    fn put_person_details(
+        &self,
+        wire_id: &str,
+        details: &PersonDetails,
+    ) -> impl std::future::Future<Output = DomainResult<()>> + Send;
 }
 
 /// LIB-C3 — a studio entity row (one per distinct production/network
@@ -1333,6 +1572,17 @@ pub struct SeriesMetadata {
     /// The show's IMDb and Rotten Tomatoes scores. Written only by
     /// [`RatingsStore::set_ratings`]; an upsert leaves them alone.
     pub ratings: ExternalRatings,
+    /// Spec 033 (V891): `"ambiguous"` when the match was a close call between
+    /// same-named shows, for an admin to check. Every upsert writes it, so a
+    /// later clear decision (or a manual match) clears it.
+    pub match_flag: Option<String>,
+    /// The candidate the flagged match beat, on `match_provider`.
+    pub match_runner_up_id: Option<String>,
+    /// That candidate's score in the decision that flagged the match.
+    pub match_runner_up_score: Option<f32>,
+    /// The fields an admin edited, which the enricher's upsert keeps
+    /// (ADR-0097). Written only by [`MetadataEditStore::edit_metadata`].
+    pub locked: LockedFields,
 }
 
 /// T9-series — one distinct show that needs (or is due for re-)enrichment,
@@ -1384,6 +1634,281 @@ pub trait SeriesMetadataStore: Send + Sync {
     /// manual matches are left alone. Returns the rows re-admitted (shows +
     /// episodes).
     fn readmit_searched_tv(&self) -> impl std::future::Future<Output = DomainResult<u64>> + Send;
+}
+
+/// Spec 033 — who wrote a [`SeriesOverride`]. A `Scanner` row records a
+/// decision the scanner made once and must not remake (which group of a split
+/// folder keeps the plain folder key); an `Admin` row is a hand fix and always
+/// wins over a `Scanner` row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OverrideSource {
+    Scanner,
+    Admin,
+}
+
+impl OverrideSource {
+    /// The `series_overrides.source` value.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Scanner => "scanner",
+            Self::Admin => "admin",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "scanner" => Some(Self::Scanner),
+            "admin" => Some(Self::Admin),
+            _ => None,
+        }
+    }
+}
+
+/// Spec 033 (V893, V896) — a grouping decision a rescan must not undo: the
+/// files of `series_folder` (one file when `path` is set) belong to
+/// `target_key`. A folder-wide `Scanner` row whose `target_key` is the folder
+/// itself names the group that keeps the plain key, by `target_year`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeriesOverride {
+    pub id: i64,
+    pub series_folder: String,
+    pub path: Option<String>,
+    pub target_key: String,
+    pub target_name: Option<String>,
+    pub target_year: Option<u32>,
+    pub source: OverrideSource,
+    pub created_by: Option<String>,
+    pub created_at: i64,
+}
+
+impl SeriesOverride {
+    /// An admin's "keep together" for `folder` (V896): the folder is one show
+    /// whatever years its files state. Told apart from an owner row by having
+    /// no `target_year`.
+    pub fn keep_together(folder: &str, by: Option<String>, at: i64) -> Self {
+        Self {
+            id: 0,
+            series_folder: folder.to_string(),
+            path: None,
+            target_key: folder.to_string(),
+            target_name: None,
+            target_year: None,
+            source: OverrideSource::Admin,
+            created_by: by,
+            created_at: at,
+        }
+    }
+
+    /// Whether this row is a [`Self::keep_together`].
+    pub fn keeps_together(&self) -> bool {
+        self.source == OverrideSource::Admin
+            && self.path.is_none()
+            && self.target_key == self.series_folder
+            && self.target_year.is_none()
+    }
+}
+
+/// Spec 033 — an episode row's identity as stored: what the scanner diffs its
+/// split plan against.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeriesIdentityRow {
+    pub path: String,
+    pub series_folder: Option<String>,
+    /// `None` reads as the folder.
+    pub series_key: Option<String>,
+    pub series_year: Option<u32>,
+}
+
+/// Spec 033 (V891) — one stored episode of a show, the local side of an
+/// episode-fit score.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeriesEpisodeRow {
+    pub id: MediaId,
+    pub path: String,
+    /// Stored episode title (the provider's, or the local resolver's).
+    pub title: String,
+    pub season: Option<u32>,
+    pub episode: Option<u32>,
+    /// Stored air date, unix seconds.
+    pub premiere_date: Option<i64>,
+    pub match_source: Option<String>,
+    pub match_provider: Option<String>,
+    pub match_external_id: Option<String>,
+}
+
+/// Spec 033 — one row's new identity. `series_key: None` returns the row to
+/// its folder's key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeriesKeyUpdate {
+    pub path: String,
+    pub series_key: Option<String>,
+    pub series_year: Option<u32>,
+}
+
+/// Spec 033 — the store side of deciding which show a file belongs to. Every
+/// method has a do-nothing default so in-memory test stores need not care;
+/// the sqlx stores implement them all.
+pub trait SeriesIdentityStore: Send + Sync {
+    /// Every override for these folders.
+    fn series_overrides(
+        &self,
+        _folders: &[String],
+    ) -> impl std::future::Future<Output = DomainResult<Vec<SeriesOverride>>> + Send {
+        async { Ok(Vec::new()) }
+    }
+
+    /// Insert `o`, unless a row for the same folder (folder-wide) or path and
+    /// source exists, which is kept. Returns whether a row was inserted.
+    fn insert_series_override(
+        &self,
+        _o: SeriesOverride,
+    ) -> impl std::future::Future<Output = DomainResult<bool>> + Send {
+        async { Ok(false) }
+    }
+
+    /// Every override, newest first (spec 033 §7).
+    fn all_series_overrides(
+        &self,
+    ) -> impl std::future::Future<Output = DomainResult<Vec<SeriesOverride>>> + Send {
+        async { Ok(Vec::new()) }
+    }
+
+    /// Write `o` as the `admin` row for its folder (folder-wide) or path,
+    /// replacing any admin row there; `scanner` rows are kept. Returns its id.
+    fn replace_admin_override(
+        &self,
+        _o: SeriesOverride,
+    ) -> impl std::future::Future<Output = DomainResult<i64>> + Send {
+        async { Ok(0) }
+    }
+
+    /// Delete override `id`, returning it as it was; `None` when absent.
+    fn delete_series_override(
+        &self,
+        _id: i64,
+    ) -> impl std::future::Future<Output = DomainResult<Option<SeriesOverride>>> + Send {
+        async { Ok(None) }
+    }
+
+    /// Every show whose stored match is flagged ambiguous (V891), by key.
+    fn flagged_series_keys(
+        &self,
+    ) -> impl std::future::Future<Output = DomainResult<Vec<String>>> + Send {
+        async { Ok(Vec::new()) }
+    }
+
+    /// Clear the own manual match of each of `ids` that has one, returning
+    /// `(id, its external id)` for each row cleared, by id.
+    fn clear_manual_matches(
+        &self,
+        _ids: &[MediaId],
+    ) -> impl std::future::Future<Output = DomainResult<Vec<(MediaId, String)>>> + Send {
+        async { Ok(Vec::new()) }
+    }
+
+    /// The stored identity of every episode under `root_prefix`.
+    fn series_identity_rows(
+        &self,
+        _root_prefix: &str,
+    ) -> impl std::future::Future<Output = DomainResult<Vec<SeriesIdentityRow>>> + Send {
+        async { Ok(Vec::new()) }
+    }
+
+    /// Write each row's key and year. Returns how many rows changed.
+    fn set_series_keys(
+        &self,
+        _updates: &[SeriesKeyUpdate],
+    ) -> impl std::future::Future<Output = DomainResult<u64>> + Send {
+        async { Ok(0) }
+    }
+
+    /// Every stored episode whose identity key is `series_key`.
+    fn series_episodes(
+        &self,
+        _series_key: &str,
+    ) -> impl std::future::Future<Output = DomainResult<Vec<SeriesEpisodeRow>>> + Send {
+        async { Ok(Vec::new()) }
+    }
+
+    /// The premiere year of each stored show match, by series key.
+    fn series_premiere_years(
+        &self,
+        _keys: &[String],
+    ) -> impl std::future::Future<Output = DomainResult<std::collections::HashMap<String, u32>>> + Send
+    {
+        async { Ok(std::collections::HashMap::new()) }
+    }
+
+    /// The keys in `keys` whose stored show match is flagged ambiguous (V891).
+    fn ambiguous_series(
+        &self,
+        _keys: &[String],
+    ) -> impl std::future::Future<Output = DomainResult<std::collections::HashSet<String>>> + Send
+    {
+        async { Ok(std::collections::HashSet::new()) }
+    }
+
+    /// Mark every non-manual episode of `series_key` for reconciliation at `at`; returns rows changed.
+    fn mark_series_reconcile(
+        &self,
+        _series_key: &str,
+        _at: i64,
+    ) -> impl std::future::Future<Output = DomainResult<u64>> + Send {
+        async { Ok(0) }
+    }
+
+    /// Mark every non-manual episode in `ids` for reconciliation at `at`; returns rows changed.
+    fn mark_reconcile_items(
+        &self,
+        _ids: &[MediaId],
+        _at: i64,
+    ) -> impl std::future::Future<Output = DomainResult<u64>> + Send {
+        async { Ok(0) }
+    }
+
+    /// Mark every non-manual episode at one of `paths` for reconciliation at `at`; returns rows changed.
+    fn mark_reconcile_paths(
+        &self,
+        _paths: &[String],
+        _at: i64,
+    ) -> impl std::future::Future<Output = DomainResult<u64>> + Send {
+        async { Ok(0) }
+    }
+
+    /// Episode `(id, mark)` pairs pending reconciliation, ordered by mark then id, at most `limit`.
+    fn series_reconcile_pending(
+        &self,
+        _limit: i64,
+    ) -> impl std::future::Future<Output = DomainResult<Vec<(MediaId, i64)>>> + Send {
+        async { Ok(Vec::new()) }
+    }
+
+    /// Clear `id`'s reconciliation mark only when it still equals `at`; returns whether a row changed.
+    fn clear_series_reconcile(
+        &self,
+        _id: MediaId,
+        _at: i64,
+    ) -> impl std::future::Future<Output = DomainResult<bool>> + Send {
+        async { Ok(false) }
+    }
+
+    /// Re-admit searched or unmatched `series_metadata` rows in `keys` by clearing `metadata_refreshed_at`.
+    fn readmit_series(
+        &self,
+        _keys: &[String],
+    ) -> impl std::future::Future<Output = DomainResult<u64>> + Send {
+        async { Ok(0) }
+    }
+
+    /// Delete `id`'s artwork rows that a provider wrote (any source but
+    /// `local`), returning each deleted `(role, locator)` so the caller can
+    /// remove the cached file. Local sidecar rows stay.
+    fn delete_provider_artwork(
+        &self,
+        _id: MediaId,
+    ) -> impl std::future::Future<Output = DomainResult<Vec<(String, String)>>> + Send {
+        async { Ok(Vec::new()) }
+    }
 }
 
 /// A provider's title and description for one show or episode in one
@@ -1457,6 +1982,14 @@ pub trait MetadataTranslationStore: Send + Sync {
         missing_cutoff: i64,
         limit: i64,
     ) -> impl std::future::Future<Output = DomainResult<Vec<TranslationGap>>> + Send;
+
+    /// Delete every stored row of `owner`; returns how many.
+    fn delete_translations(
+        &self,
+        _owner: &TranslationOwner,
+    ) -> impl std::future::Future<Output = DomainResult<u64>> + Send {
+        async { Ok(0) }
+    }
 }
 
 /// What a ratings lookup is for: a stored film, or a show by its
@@ -1522,6 +2055,23 @@ pub struct SubtitleStyling {
     pub styled_at: i64,
 }
 
+/// One item's stored subtitle signal pass (spec 028, B1202): the audio
+/// measured per subtitle line, kept so a new director re-directs from it
+/// instead of decoding the audio again. `source_*` is the video file's
+/// signature and `audio_stream` the stream analysed; `signals_json` holds the
+/// line windows and their measures, opaque to the store. `signals_version`
+/// names the signal pass that made it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubtitleSignalsRow {
+    pub item_id: MediaId,
+    pub source_mtime: i64,
+    pub source_size: u64,
+    pub audio_stream: Option<u32>,
+    pub signals_version: u32,
+    pub signals_json: String,
+    pub measured_at: i64,
+}
+
 /// Storage for [`SubtitleStyling`] rows. Split from [`MediaStore`] like
 /// [`RatingsStore`] so in-memory test stores don't have to implement it.
 pub trait SubtitleStylingStore: Send + Sync {
@@ -1546,6 +2096,19 @@ pub trait SubtitleStylingStore: Send + Sync {
     fn subtitle_styling_index(
         &self,
     ) -> impl std::future::Future<Output = DomainResult<Vec<SubtitleStyling>>> + Send;
+
+    /// Upsert the item's stored signal pass (one per item).
+    fn put_subtitle_signals(
+        &self,
+        row: SubtitleSignalsRow,
+    ) -> impl std::future::Future<Output = DomainResult<()>> + Send;
+
+    /// The item's stored signal pass, or `None`. Callers compare its
+    /// signature, stream and version before using it.
+    fn subtitle_signals(
+        &self,
+        item: MediaId,
+    ) -> impl std::future::Future<Output = DomainResult<Option<SubtitleSignalsRow>>> + Send;
 }
 
 /// T70 — playlists as first-class, user-owned, ordered item containers.
@@ -1878,7 +2441,7 @@ pub trait LibraryStore: Send + Sync {
 ///
 /// LIB-C11 — series identity is keyed on the **show folder path**
 /// (`series_folder`), not the bare `series_name`, so two distinct shows
-/// that happen to share a name (`Cosmos (1980)` vs `Cosmos (2014)`) get
+/// that happen to share a name (`Show G (1980)` vs `Show G (2014)`) get
 /// distinct synthesised Series/Season wire ids and don't interleave
 /// their episodes. `series_folder` is the canonical filesystem path of
 /// the directory that holds the season dirs / episode files (captured by
@@ -1900,15 +2463,29 @@ pub struct SeriesInfo {
     /// name, surfaced as `ProductionYear` so same-name shows are
     /// distinguishable in clients. `None` when the folder carries no year.
     pub series_year: Option<u32>,
+    /// Spec 033 (V893) — the identity key a split folder's group was given
+    /// (`"{folder}\u{1f}{YYYY}"`), or the folder itself. `None` until the
+    /// scanner or the store says, which reads as the folder. Never a path:
+    /// file lookups (`tvshow.nfo`, folder art) use `series_folder`.
+    pub series_key: Option<String>,
 }
 
 impl SeriesInfo {
     /// LIB-C11 — the identity key the synthesised Series/Season wire ids
-    /// hash on. Prefers the stable, per-show-on-disk `series_folder`;
-    /// falls back to `series_name` for legacy rows lacking a folder so
-    /// pre-backfill client URLs keep resolving.
+    /// hash on. Prefers the split key, then the stable, per-show-on-disk
+    /// `series_folder`; falls back to `series_name` for legacy rows lacking a
+    /// folder so pre-backfill client URLs keep resolving.
     pub fn series_key(&self) -> &str {
-        self.series_folder.as_deref().unwrap_or(&self.series_name)
+        self.identity_folder().unwrap_or(&self.series_name)
+    }
+
+    /// The folder-shaped key the wire-id helpers take as their `folder`
+    /// argument: the split key, else the folder, and `None` for a legacy row
+    /// with no folder (whose key is its name, hashed the legacy way). A split
+    /// key is only ever given to a row that has a folder.
+    pub fn identity_folder(&self) -> Option<&str> {
+        let folder = self.series_folder.as_deref()?;
+        Some(self.series_key.as_deref().unwrap_or(folder))
     }
 }
 
@@ -2180,6 +2757,13 @@ pub struct MediaProbe {
     // bincode, which cannot decode a skipped field.
     #[serde(default)]
     pub audio_analysis: Option<AudioAnalysis>,
+    /// The picture area found by the background black-bar check, written by
+    /// the sweep (never by the prober or `put`). `None` until the file has
+    /// been checked, and again once it changes. Read it through
+    /// [`MediaProbe::picture_area`].
+    // No `skip_serializing_if`: bincode over the worker pipe (see above).
+    #[serde(default)]
+    pub picture_check: Option<PictureCheck>,
 }
 
 impl MediaProbe {
@@ -2198,6 +2782,32 @@ impl MediaProbe {
     pub fn tempo_source(&self) -> Option<TempoSource> {
         self.audio_analysis?.tempo_source
     }
+}
+
+impl MediaProbe {
+    /// The picture inside baked-in black bars, when the check found bars.
+    /// `None` for an unchecked file and for a file with no bars.
+    pub fn picture_area(&self) -> Option<PictureArea> {
+        self.picture_check?.area
+    }
+}
+
+/// A rectangle of the decoded frame that holds the picture, in pixels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct PictureArea {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// One black-bar check result. `area: None` is a check that found no bars (or
+/// could not tell): it is kept so the file is not decoded again on every pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct PictureCheck {
+    /// The detector version that produced this; an older one is redone.
+    pub version: u32,
+    pub area: Option<PictureArea>,
 }
 
 /// Spec 024 — where a song's tempo came from.
@@ -2313,6 +2923,11 @@ pub struct AlternateMediaSource {
     /// the playback path. `None` on rows probed before schema v9.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub probe: Option<Box<MediaProbe>>,
+    /// Spec 037 — `Some(n)` when this file is part `n` (2 or more) of a film
+    /// split across files (`cd1`/`cd2`), played after the parts before it;
+    /// `None` for a version (an edition or copy) of the whole item.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub part: Option<u32>,
 }
 
 /// One chapter marker. `title` defaults to `Chapter {N}` when ffprobe
@@ -2393,9 +3008,43 @@ impl MediaProbe {
         self.frame_rate_mille.map(|m| m as f32 / 1000.0)
     }
 
-    /// Convert duration_ms → Jellyfin's 100-ns ticks (10_000 ticks / ms).
+    /// Spec 037 — the versions of this item (editions and copies of the whole
+    /// of it): its alternates that are not parts.
+    pub fn versions(&self) -> impl Iterator<Item = &AlternateMediaSource> {
+        self.alternate_sources.iter().filter(|a| a.part.is_none())
+    }
+
+    /// Spec 037 — the files after the first of a film split across files, in
+    /// play order (V1150).
+    pub fn parts(&self) -> Vec<&AlternateMediaSource> {
+        let mut parts: Vec<_> = self
+            .alternate_sources
+            .iter()
+            .filter(|a| a.part.is_some())
+            .collect();
+        parts.sort_by_key(|a| a.part);
+        parts
+    }
+
+    /// How long the item plays, in ms: its file's duration, and for a split
+    /// film every part's too (V1155).
+    pub fn run_time_ms(&self) -> Option<u64> {
+        let rest: u64 = self
+            .parts()
+            .iter()
+            .filter_map(|p| {
+                p.probe
+                    .as_ref()
+                    .and_then(|p| p.duration_ms)
+                    .or(p.duration_ms)
+            })
+            .sum();
+        self.duration_ms.map(|ms| ms.saturating_add(rest))
+    }
+
+    /// [`Self::run_time_ms`] in Jellyfin's 100-ns ticks (10_000 ticks / ms).
     pub fn run_time_ticks(&self) -> Option<u64> {
-        self.duration_ms.map(|ms| ms.saturating_mul(10_000))
+        self.run_time_ms().map(|ms| ms.saturating_mul(10_000))
     }
 
     /// P13 — derive the Jellyfin `VideoRange` discriminator (`"HDR"`
@@ -2682,7 +3331,7 @@ pub struct ScanState {
 // v6 (B169): the container's `creation_time` no longer feeds `year` /
 // `release_date`. It records when the FILE was muxed, so every film carried
 // the date it was copied into the library rather than the date it came out —
-// 139 of them here, "Avatar" as 2026-07-20, "Apocalypse Now" as 2025-05-06.
+// 139 of them here, "Film AE" as 2026-07-20, "Film AC" as 2025-05-06.
 // Re-probe so those rows drop the mux date; the metadata backfill then fills
 // the real year from the provider it had already matched correctly.
 // v7: `video_3d_format` and 3D edition grouping. A skipped (unchanged) primary
@@ -2741,7 +3390,10 @@ pub const SEGMENT_SCHEMA_VERSION: i64 = 1;
 /// agreeing-seconds share. Duration-only (4) regressed endings — a short true
 /// outro outweighed by a few long spurious matches — costing 78 outro rows
 /// library-wide while intros gained 66. Cheap half only.
-pub const SEGMENT_DETECT_VERSION: i64 = 5;
+/// 6 (T106, B1060): an episode the endpoint reading drops gets a second,
+/// overlap reading, so a fragmented match of one opening can agree. Adds
+/// segments only. Cheap half only.
+pub const SEGMENT_DETECT_VERSION: i64 = 6;
 
 /// A typed playback segment (Jellyfin `MediaSegmentType`). Intro/Outro drive
 /// jellyfin-web's Skip Intro / Skip Outro overlay.
@@ -3026,8 +3678,8 @@ pub enum SortKey {
     SeasonNumber,
     /// 004-books — `SeriesSortName` for a book: the shelf it belongs to
     /// (`book_series`). Distinct from [`SortKey::Name`] so a series of books
-    /// groups together whatever the individual titles are — "Dune Messiah"
-    /// alphabetises nowhere near "Children of Dune".
+    /// groups together whatever the individual titles are — "Book A Part 2"
+    /// alphabetises nowhere near "Part 1 of Book A".
     BookSeries,
     /// 004-books — the volume number within that series (`book_series_index`).
     /// An UNNUMBERED volume sorts LAST rather than as zero: unknown is not
@@ -3387,9 +4039,39 @@ pub struct MediaFacets {
     pub subtitle_languages: Vec<FacetValue>,
 }
 
+/// Whether [`MediaStore::merge_user_data`] carries the resume point over.
+/// A position only means the same moment in a file with the same timeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FoldResume {
+    Carry,
+    Drop,
+}
+
 pub trait MediaStore: Send + Sync {
     fn get(&self, id: MediaId)
         -> impl std::future::Future<Output = DomainResult<MediaItem>> + Send;
+
+    /// The items carrying `ids`, in the order of `ids`. An id with no row
+    /// (deleted since the caller learned it) is skipped, not an error. A
+    /// backend should answer in one query; the default loops over
+    /// [`get`](Self::get).
+    fn get_many(
+        &self,
+        ids: &[MediaId],
+    ) -> impl std::future::Future<Output = DomainResult<Vec<MediaItem>>> + Send {
+        async move {
+            let mut out = Vec::with_capacity(ids.len());
+            for id in ids {
+                match self.get(*id).await {
+                    Ok(item) => out.push(item),
+                    Err(DomainError::NotFound(_)) => {}
+                    Err(e) => return Err(e),
+                }
+            }
+            Ok(out)
+        }
+    }
+
     fn put(&self, item: MediaItem) -> impl std::future::Future<Output = DomainResult<()>> + Send;
 
     /// Upsert many items. Equivalent to calling [`put`](Self::put) on each in
@@ -3539,6 +4221,30 @@ pub trait MediaStore: Send + Sync {
         }
     }
 
+    /// Store one file's black-bar check, against the file signature
+    /// `(mtime, size)` the check read. Same contract as
+    /// [`put_audio_analysis`](Self::put_audio_analysis): a read returns it in
+    /// [`MediaProbe::picture_check`] only while the row's scan signature still
+    /// matches, `put` never writes it, and a missing row is a no-op.
+    fn put_picture_check(
+        &self,
+        id: MediaId,
+        check: PictureCheck,
+        signature: (i64, u64),
+    ) -> impl std::future::Future<Output = DomainResult<()>> + Send {
+        async move {
+            let _ = signature;
+            match self.get(id).await {
+                Ok(mut item) => {
+                    item.probe.picture_check = Some(check);
+                    self.put(item).await
+                }
+                Err(DomainError::NotFound(_)) => Ok(()),
+                Err(e) => Err(e),
+            }
+        }
+    }
+
     /// B257 — the id of the row whose `path` is `path`, or `None` when no row
     /// holds it. A row's id is the path-derived one unless it was seeded or
     /// rebound after a move, so the scanner asks this when a lookup by the
@@ -3641,6 +4347,26 @@ pub trait MediaStore: Send + Sync {
         new_path: &std::path::Path,
     ) -> impl std::future::Future<Output = DomainResult<()>> + Send;
 
+    /// Copy each user's played, play count, favourite and resume state for
+    /// `from` onto `into`, keeping the furthest of the two: played or
+    /// favourite on either stays set, the higher play count wins, and resume
+    /// follows the later play. With [`FoldResume::Drop`] the resume point
+    /// stays `into`'s own, for files whose timelines differ (a double
+    /// episode folded into one of its episodes). Stored audio and subtitle
+    /// choices are not copied: their stream indexes name the other file's
+    /// streams. Used when a file's row is folded into another item as one
+    /// of its versions. Idempotent; a no-op when `into` has no row. Stores
+    /// without user data keep the default.
+    fn merge_user_data(
+        &self,
+        from: MediaId,
+        into: MediaId,
+        resume: FoldResume,
+    ) -> impl std::future::Future<Output = DomainResult<()>> + Send {
+        let _ = (from, into, resume);
+        async { Ok(()) }
+    }
+
     /// LIB-D4 — upsert one artwork row for `(item_id, role)`. `role` is an
     /// [`ArtworkRole::as_str`] token (`"Primary"` / `"Backdrop"` / …);
     /// `source` is `"local"` or `"url"`; `locator` is the absolute sidecar
@@ -3693,7 +4419,9 @@ pub trait MediaStore: Send + Sync {
 
     /// Items eligible for online enrichment: `match_source` NULL or in
     /// (`search`,`none`,`nfo_id`), not refreshed since `ttl_cutoff`, kind
-    /// movie/episode, ascending id, capped at `limit`. Excludes `manual` only —
+    /// movie/episode, ascending id, capped at `limit`. An episode is eligible
+    /// only once its show has a `series_metadata` row (V892: it takes its
+    /// record from the show's match). Excludes `manual` only —
     /// a user's explicit pick is never revisited, while an NFO id merely
     /// settles WHICH record the item is and short-circuits the search on every
     /// refresh, so re-admitting one re-fetches that record without
@@ -3743,6 +4471,31 @@ pub trait MediaStore: Send + Sync {
         &self,
         provider: &str,
     ) -> impl std::future::Future<Output = DomainResult<u64>> + Send;
+
+    /// One page of the artwork rows whose source the image route serves from
+    /// disk ([`artwork_source_is_item_servable`]), ordered by `(item_id, role)`
+    /// and strictly after `after`. `None` starts from the first row.
+    ///
+    /// Keyset paging: a sweep that relinks or deletes the rows it has just read
+    /// neither skips nor revisits one, because the cursor is a key, not an
+    /// offset.
+    fn servable_artwork_page(
+        &self,
+        after: Option<(MediaId, String)>,
+        limit: i64,
+    ) -> impl std::future::Future<Output = DomainResult<Vec<ArtworkRow>>> + Send;
+
+    /// Remove the artwork row `(item_id, role)` whose file is gone and bump the
+    /// item's art version so clients refetch. A removed Primary also clears
+    /// `has_primary_art`. With `readmit`, the item's `metadata_refreshed_at` is
+    /// cleared so the next match pass picks it up for online art, unless its
+    /// match is `manual` (a user's explicit pick is never revisited).
+    fn remove_dead_artwork(
+        &self,
+        item_id: MediaId,
+        role: &str,
+        readmit: bool,
+    ) -> impl std::future::Future<Output = DomainResult<()>> + Send;
 
     /// Count of linked genres/people/studios for `id` (fill-if-empty gate).
     fn item_entity_counts(
@@ -3846,6 +4599,62 @@ pub trait UserDataStore: Send + Sync {
     fn resumable_items(
         &self,
         user: UserId,
+    ) -> impl std::future::Future<Output = DomainResult<Vec<MediaId>>> + Send;
+
+    /// Every item of `kind` the user has played or has a resume point on,
+    /// with its row, most recently played first (ties by id, highest
+    /// first). Drives Next Up from the user's own rows instead of a scan of
+    /// the whole library (spec 038 FR-105).
+    fn started_items(
+        &self,
+        user: UserId,
+        kind: MediaKind,
+    ) -> impl std::future::Future<Output = DomainResult<Vec<(MediaId, UserItemData)>>> + Send;
+}
+
+/// Where a user left off in a book (023): the reader's opaque locator and the
+/// whole-book fraction, 0 to 1. Kept apart from [`UserItemData`] so it never
+/// shares a field with `last_played_position_ticks` (V354).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReadPosition {
+    pub locator: String,
+    pub fraction: f32,
+    /// Unix seconds the page was read (the client's `readAt`, clamped to the
+    /// server's now); the newest reading wins.
+    pub updated_at: i64,
+}
+
+pub trait ReadPositionStore: Send + Sync {
+    fn get_read_position(
+        &self,
+        user: UserId,
+        item: MediaId,
+    ) -> impl std::future::Future<Output = DomainResult<Option<ReadPosition>>> + Send;
+
+    /// One entry per requested item, in order; `None` where nothing is saved.
+    fn read_positions_bulk(
+        &self,
+        user: UserId,
+        items: &[MediaId],
+    ) -> impl std::future::Future<Output = DomainResult<Vec<Option<ReadPosition>>>> + Send;
+
+    /// Insert the position for `(user, item)`, or replace the stored one when
+    /// `position.updated_at` is not older than it (newest reading wins, 036).
+    /// Answers whether the position was stored; `false` means a newer one
+    /// was already there and is kept. Atomic: one statement decides.
+    fn set_read_position(
+        &self,
+        user: UserId,
+        item: MediaId,
+        position: ReadPosition,
+    ) -> impl std::future::Future<Output = DomainResult<bool>> + Send;
+
+    /// Items with a saved fraction above 0 that the user has not marked
+    /// played, newest save first: drives "Continue reading".
+    fn part_read_items(
+        &self,
+        user: UserId,
+        limit: u32,
     ) -> impl std::future::Future<Output = DomainResult<Vec<MediaId>>> + Send;
 }
 

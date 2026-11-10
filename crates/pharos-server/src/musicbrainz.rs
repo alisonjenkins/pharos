@@ -756,7 +756,7 @@ impl MusicBrainzClient {
             env!("CARGO_PKG_VERSION"),
             contact.trim()
         );
-        let http = reqwest::Client::builder()
+        let http = crate::http_client::builder()
             .user_agent(ua)
             // Split the budget: a dead host should fail fast, but a live
             // transfer needs room. One 20s WHOLE-request timeout meant a slow
@@ -767,7 +767,7 @@ impl MusicBrainzClient {
             // `ClientBuilder::build` only fails on TLS backend init, which
             // would already have failed for TMDB; fall back rather than panic
             // (V17 forbids `expect` here anyway).
-            .unwrap_or_else(|_| reqwest::Client::new());
+            .unwrap_or_else(|_| crate::http_client::client());
         Self {
             http,
             gate: Arc::new(RateGate::new()),
@@ -1217,8 +1217,8 @@ mod tests {
     fn edition_qualifiers_are_stripped_from_real_failing_titles() {
         for (raw, want) in [
             (
-                "A Rush Of Blood To The Head (Japan)",
-                "A Rush Of Blood To The Head",
+                "A Wave Of Static To The Ear (Japan)",
+                "A Wave Of Static To The Ear",
             ),
             ("Invaders Must Die [Bonus Tracks]", "Invaders Must Die"),
             ("Prospekts March (CD EP UK & Europe)", "Prospekts March"),
@@ -1288,12 +1288,12 @@ mod tests {
 
     #[test]
     fn a_qualified_title_falls_back_to_the_stripped_one_then_to_no_artist() {
-        let attempts = search_attempts(Some("Coldplay"), "A Rush Of Blood To The Head (Japan)");
+        let attempts = search_attempts(Some("Coldplay"), "A Wave Of Static To The Ear (Japan)");
         assert_eq!(attempts.len(), 4, "{attempts:?}");
         // Most specific first — the exact tag still gets its chance.
         assert!(attempts[0].contains(r"\(Japan\)"));
         assert!(
-            attempts[1].contains("A Rush Of Blood To The Head") && !attempts[1].contains("Japan")
+            attempts[1].contains("A Wave Of Static To The Ear") && !attempts[1].contains("Japan")
         );
         assert!(attempts[1].contains("Coldplay"));
         // Last resort drops the artist: a mis-parsed artist tag still names its
@@ -1359,8 +1359,8 @@ mod tests {
         );
         // A leading/trailing quote is punctuation, not part of the word.
         assert_eq!(
-            unquoted_query("'Heroes'").as_deref(),
-            Some("releasegroup:(Heroes*)")
+            unquoted_query("'Legends'").as_deref(),
+            Some("releasegroup:(Legends*)")
         );
     }
 

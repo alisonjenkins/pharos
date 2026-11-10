@@ -2,7 +2,7 @@
 
 **Feature Branch**: `docs/anime-subtitle-styling-spec`
 **Created**: 2026-11-06T00:30:00Z
-**Status**: Draft
+**Status**: Slices 1-6 built on main (crates/pharos-styling, signals op, director, store, serving, Effects setting, tier drop; B601-B606); open: T028-14 (styling-report tool), T028-22 (G08 run), ADR-0067 still Proposed (audited 2026-11-09)
 **Scope**: Phases 0 and 1 of the project design "AI-generated animated anime subtitles" (`docs/design/animated-anime-subtitles.md` on branch `claude/project-thread-62gk21`; §3 effect plan and library, §8a device tiers, §10 phases), which Alison approved. For a video with an English text subtitle track, the server works out ahead of time how each line should look, from signals it already has or can read in the same pass. It then writes that as plain ASS v4+ and serves it as an extra track, "English (Pharos styled)". No machine learning is used in these phases. Clients only draw.
 **Decision record**: ADR-0067. **Backlog**: B600 (phase 0), B601-B606. **Verification**: V530, V531 (phase 0), V532-V539.
 **Depends on**: spec 026 (`pharos-subs`, its ASS parser on main; its renderer will draw this output once slice 3 lands), ADR-0057 (JASSUB draws it until then), 024's `audio_analysis` job pattern, T86 media segments.
@@ -132,6 +132,8 @@ An operator can tell, from Prometheus and Loki alone, how many items were styled
 ### Signals
 
 - **FR-021** `pharos_subtitle_styling_total{outcome,stage}`, with stage being `select`, `read`, `signals`, `direct` or `store`, the stage an item ended in (`styled` ends in `store`). Compiling happens per request and is counted by the delivery metric below. Later phases add `asr`, `align`, `diarize`, `ocr` and `track` (design §9). Also `pharos_subtitle_styling_seconds{stage}`, `pharos_subtitle_styling_pending`, and `pharos_subtitle_effect_total{intent,source}`, where source is `rule` or `model` (always `rule` in phase 1). The signal that fired is in the log line, never a label. The design's proof query is `sum by (intent, source) (increase(pharos_subtitle_effect_total[1d]))`. Labels come from `label()` methods and are asserted distinct. The styled track's deliveries are counted by B600's `pharos_subtitle_delivery_total` with `source="generated"`.
+- **FR-022** (B852) `stream.ass` takes `?size=` in percent (75, 100, 125 or 150; absent is 100, anything else 400): the theme's text, outline and shadow are scaled by it before compiling, and so are the effects' inline `\fs`, `\bord`, `\shad` and `\blur`; margins and positions are not. The player sends its subtitle size, Medium as no parameter, and reloads the script when the size changes. Each size is cached apart.
+- **FR-023** (B853) Amends FR-017's "never default" for the native player: the listed track still carries no default flag, but when a playback has no stated or remembered subtitle and the default rules pick the styled track's source, the grant and `Playback.startTracks` name the styled track instead. A player at Effects Off moves back to the source (FR-006).
 
 ## Key entities
 

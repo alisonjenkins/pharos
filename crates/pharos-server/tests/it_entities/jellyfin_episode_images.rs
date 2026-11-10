@@ -34,6 +34,7 @@ fn episode(id: u64, series_dir: &Path, ep: u32) -> MediaItem {
             episode_number: Some(ep),
             series_folder: Some(series_dir.to_string_lossy().into_owned()),
             series_year: None,
+            series_key: None,
         }),
         ..Default::default()
     }
@@ -132,4 +133,40 @@ async fn episode_primary_is_its_own_still_and_the_series_keeps_its_poster() {
         b"SERIES-POSTER".to_vec(),
         "the series tile still resolves to the series poster"
     );
+}
+
+/// B835 — an episode's Primary reads its artwork rows once, whether the
+/// answer is its own still or falls through to the recorded poster.
+#[actix_web::test]
+async fn an_episode_primary_reads_its_artwork_rows_once() {
+    use crate::store_calls::StoreCallLog;
+    use tracing_subscriber::prelude::*;
+
+    let media = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let (state, token) = seed(media.path(), cache.path()).await;
+    let app = test::init_service(
+        App::new()
+            .app_data(state)
+            .wrap(LowercasePath)
+            .configure(jellyfin::configure),
+    )
+    .await;
+    let calls = StoreCallLog::default();
+    let _spans =
+        tracing::subscriber::set_default(tracing_subscriber::registry().with(calls.clone()));
+    for (id, body) in [
+        (1, &b"E01-STILL"[..]),
+        (2, &b"SERIES-POSTER"[..]),
+        (3, &b"E03-TVDB-STILL"[..]),
+    ] {
+        calls.take();
+        assert_eq!(fetch_primary!(&app, token.as_str(), id), body);
+        let artwork = calls
+            .take()
+            .into_iter()
+            .filter(|c| c == "artwork_for")
+            .count();
+        assert_eq!(artwork, 1, "episode {id}");
+    }
 }

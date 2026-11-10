@@ -16,6 +16,8 @@ pub enum Mode {
     Music,
     /// The music full player's queue.
     Queue,
+    /// The book reader, whose page-turn keys are its own.
+    Reader,
 }
 
 impl Mode {
@@ -27,6 +29,7 @@ impl Mode {
             Mode::Player => "Player",
             Mode::Music => "Music player",
             Mode::Queue => "Queue",
+            Mode::Reader => "Reading",
         }
     }
 }
@@ -80,6 +83,8 @@ pub enum Transport {
     Fullscreen,
     NextSubtitle,
     NextAudio,
+    /// Skip the intro, recap or credits whose button is showing.
+    SkipSegment,
 }
 
 /// What a binding does.
@@ -153,11 +158,13 @@ pub const PREFIXES: &[Prefix] = &[Prefix {
 
 const MOVING: Modes = Modes::Only(&[Mode::Browse, Mode::Detail, Mode::Queue]);
 const BROWSE: Modes = Modes::Only(&[Mode::Browse]);
+/// Where a song, an album, a film or an episode can be queued (V853).
+const QUEUEING: Modes = Modes::Only(&[Mode::Browse, Mode::Detail]);
 const MUSIC: Modes = Modes::Only(&[Mode::Music]);
 const QUEUE: Modes = Modes::Only(&[Mode::Queue]);
 const LISTENING: Modes = Modes::Only(&[Mode::Music, Mode::Queue]);
-/// Escape is the music player's way back to the library.
-const NOT_MUSIC: Modes = Modes::Only(&[Mode::Browse, Mode::Detail, Mode::Player, Mode::Queue]);
+/// Escape is each full player's way back to the library.
+const NOT_PLAYING: Modes = Modes::Only(&[Mode::Browse, Mode::Detail, Mode::Queue]);
 const DETAIL: Modes = Modes::Only(&[Mode::Detail]);
 const PLAYERS: Modes = Modes::Only(&[Mode::Player, Mode::Music]);
 const VIDEO: Modes = Modes::Only(&[Mode::Player]);
@@ -249,6 +256,13 @@ pub const BINDINGS: &[Binding] = &[
         G::Page,
         DETAIL,
         A::Press("watched"),
+    ),
+    bind(
+        &["f"],
+        "Add to or remove from favourites",
+        G::Page,
+        DETAIL,
+        A::Press("favorite"),
     ),
     bind(&["["], "Previous season", G::Page, DETAIL, A::Season(-1)),
     bind(&["]"], "Next season", G::Page, DETAIL, A::Season(1)),
@@ -435,13 +449,26 @@ pub const BINDINGS: &[Binding] = &[
         A::Transport(Transport::NextAudio),
     ),
     bind(
+        &["s"],
+        "Skip intro or credits",
+        G::Play,
+        VIDEO,
+        A::Transport(Transport::SkipSegment),
+    ),
+    bind(
         &["a"],
         "Add to the end of the queue",
         G::Page,
-        BROWSE,
+        QUEUEING,
         A::Press("queue-end"),
     ),
-    bind(&["A"], "Play next", G::Page, BROWSE, A::Press("queue-next")),
+    bind(
+        &["A"],
+        "Play next",
+        G::Page,
+        QUEUEING,
+        A::Press("queue-next"),
+    ),
     bind(
         &["x"],
         "Start a mix like it",
@@ -478,6 +505,14 @@ pub const BINDINGS: &[Binding] = &[
         MUSIC,
         A::Press("shrink"),
     ),
+    // The video goes on in the mini bar or floating window (B905).
+    bind(
+        &["Escape"],
+        "Shrink to the mini bar or floating player",
+        G::Play,
+        VIDEO,
+        A::Press("shrink"),
+    ),
     bind(
         &["Backspace"],
         "Back to the library",
@@ -486,6 +521,8 @@ pub const BINDINGS: &[Binding] = &[
         A::Press("shrink"),
     ),
     bind(&["q"], "Go to the queue", G::Page, MUSIC, A::Focus("queue")),
+    // The video queue, opened if it is closed (V853).
+    bind(&["q"], "Go to the queue", G::Page, VIDEO, A::Focus("queue")),
     bind(
         &["s"],
         "Shuffle on or off",
@@ -564,7 +601,7 @@ pub const BINDINGS: &[Binding] = &[
         &["Escape"],
         "Back, or close",
         G::General,
-        NOT_MUSIC,
+        NOT_PLAYING,
         A::Native,
     ),
 ];
@@ -870,12 +907,13 @@ mod tests {
         assert_eq!(pick_docked(Dir::Up, nav, false, &no_bar), None);
     }
 
-    const ALL: [Mode; 5] = [
+    const ALL: [Mode; 6] = [
         Mode::Browse,
         Mode::Detail,
         Mode::Player,
         Mode::Music,
         Mode::Queue,
+        Mode::Reader,
     ];
 
     /// V510: within a mode no two bindings share a sequence, and no binding
@@ -908,6 +946,46 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// V854: Escape in the full video player shrinks it to the mini bar or
+    /// floating window, as it leaves the music player; elsewhere it is the
+    /// browser's (a menu, a dialog, leaving fullscreen).
+    #[test]
+    fn escape_shrinks_the_full_video_player() {
+        assert_eq!(
+            resolve(Mode::Player, &["Escape"]),
+            Resolved::Run(Action::Press("shrink"))
+        );
+        for mode in [Mode::Browse, Mode::Detail, Mode::Queue] {
+            assert_eq!(
+                resolve(mode, &["Escape"]),
+                Resolved::Run(Action::Native),
+                "{mode:?}"
+            );
+        }
+    }
+
+    /// V853: films and episodes queue from their pages as songs do from
+    /// the library, and q goes to the video player's queue.
+    #[test]
+    fn videos_queue_from_their_pages_and_q_finds_the_queue() {
+        for mode in [Mode::Browse, Mode::Detail] {
+            assert_eq!(
+                resolve(mode, &["a"]),
+                Resolved::Run(Action::Press("queue-end")),
+                "{mode:?}"
+            );
+            assert_eq!(
+                resolve(mode, &["A"]),
+                Resolved::Run(Action::Press("queue-next")),
+                "{mode:?}"
+            );
+        }
+        assert_eq!(
+            resolve(Mode::Player, &["q"]),
+            Resolved::Run(Action::Focus("queue"))
+        );
     }
 
     /// V512: the music player, its queue and the album pages share the
@@ -1056,6 +1134,26 @@ mod tests {
         );
     }
 
+    /// 023: the reader turns pages on these keys itself, so the layer must
+    /// neither move focus on them nor take the press.
+    #[test]
+    fn the_reader_leaves_its_page_turn_keys_unbound() {
+        for key in [
+            "ArrowLeft",
+            "ArrowRight",
+            "PageUp",
+            "PageDown",
+            " ",
+            "Escape",
+        ] {
+            assert_eq!(resolve(Mode::Reader, &[key]), Resolved::Unbound, "{key}");
+        }
+        assert_eq!(
+            resolve(Mode::Reader, &["g", "h"]),
+            Resolved::Run(Action::Go(Place::Home))
+        );
+    }
+
     #[test]
     fn g_waits_for_its_next_key_and_names_the_group() {
         assert_eq!(
@@ -1089,6 +1187,13 @@ mod tests {
         assert_eq!(t("3"), Some(Transport::SeekTenths(3)));
         assert_eq!(t("c"), Some(Transport::NextSubtitle));
         assert_eq!(t("a"), Some(Transport::NextAudio));
+        // B805: `s` presses the skip button; the music player's `s` is shuffle.
+        assert_eq!(t("s"), Some(Transport::SkipSegment));
+        assert_eq!(transport(Mode::Music, "s"), None);
+        let help_row = help(Mode::Player, None, |_| true)
+            .into_iter()
+            .find(|r| r.label == "Skip intro or credits");
+        assert_eq!(help_row.map(|r| r.keys), Some(vec!["s".to_owned()]));
         // Video-only keys are not the music player's.
         assert_eq!(transport(Mode::Music, "c"), None);
         assert_eq!(transport(Mode::Music, "k"), Some(Transport::VolumeUp));
@@ -1103,6 +1208,10 @@ mod tests {
         assert_eq!(
             resolve(Mode::Detail, &["w"]),
             Resolved::Run(Action::Press("watched"))
+        );
+        assert_eq!(
+            resolve(Mode::Detail, &["f"]),
+            Resolved::Run(Action::Press("favorite"))
         );
         assert_eq!(
             resolve(Mode::Detail, &["]"]),

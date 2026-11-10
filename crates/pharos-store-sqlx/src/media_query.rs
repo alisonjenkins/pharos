@@ -96,7 +96,8 @@ fn sort_key_column(key: SortKey) -> &'static str {
 fn sort_key_nullable(key: SortKey) -> bool {
     matches!(
         key,
-        SortKey::PremiereDate
+        SortKey::DateCreated
+            | SortKey::PremiereDate
             | SortKey::ProductionYear
             | SortKey::CommunityRating
             | SortKey::CriticRating
@@ -135,7 +136,7 @@ pub(crate) fn build(
 
     // --- search term (B624/V558) ---
     // Every word of the term must be a substring of the title, the SERIES
-    // name (so searching a show name like "Code Geass" finds its episodes),
+    // name (so searching a show name like "Show U" finds its episodes),
     // the artist or the album, any word in any column, in any order: "go
     // moby" finds the tracks of "Go: The Very Best of Moby". Matched against
     // the Rust-folded `title_fold` (full Unicode lowercase), falling back to
@@ -529,7 +530,7 @@ fn push_series_clause(
         Some(f) => {
             params.push(Param::Text(f.to_string()));
             let p = ph(params.len());
-            clauses.push(format!("series_folder = {p}"));
+            clauses.push(format!("COALESCE(series_key, series_folder) = {p}"));
         }
         None => {
             // Legacy: no folder recorded. Match by name, and only rows that
@@ -800,6 +801,21 @@ fn push_user_data_clauses(
                 .to_string(),
         );
     }
+}
+
+/// What `LOWER(name) LIKE` can find of a lowercased `word`: SQLite, and
+/// Postgres under the C locale, fold only ASCII case, so a word with other letters is cut to its longest
+/// ASCII run ("élodie" to "lodie"), which every name holding the word also
+/// holds. A word with no ASCII letters (a script without case) stays whole.
+pub(crate) fn ascii_needle(word: &str) -> String {
+    if word.is_ascii() {
+        return word.to_owned();
+    }
+    word.split(|c: char| !c.is_ascii_alphanumeric())
+        .max_by_key(|run| run.len())
+        .filter(|run| !run.is_empty())
+        .unwrap_or(word)
+        .to_owned()
 }
 
 /// Escape LIKE wildcards in a user search term so `%`/`_` are literal. The

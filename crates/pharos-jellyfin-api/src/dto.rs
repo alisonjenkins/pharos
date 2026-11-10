@@ -1819,11 +1819,7 @@ impl BaseItemDto {
             can_play: true,
             can_download: true,
             is_3d: item.probe.video_3d_format.is_some()
-                || item
-                    .probe
-                    .alternate_sources
-                    .iter()
-                    .any(|a| a.video_3d_format.is_some()),
+                || item.probe.versions().any(|a| a.video_3d_format.is_some()),
             play_access: "Full",
             media_sources: if is_book {
                 // Empty, so nothing can construct /Videos/{id}/stream for an epub.
@@ -1957,12 +1953,12 @@ impl BaseItemDto {
                 .as_ref()
                 .and_then(|s| {
                     s.season_number
-                        .map(|n| season_id_for_key(s.series_folder.as_deref(), &s.series_name, n))
+                        .map(|n| season_id_for_key(s.identity_folder(), &s.series_name, n))
                 })
                 .or_else(|| item.probe.album.as_deref().map(album_id_for)),
             album: item.probe.album.clone(),
             album_id: item.probe.album.as_deref().map(album_id_for),
-            // 004-books (T068) — a book's series is its shelf: "Dune Chronicles"
+            // 004-books (T068) — a book's series is its shelf: "Book A Chronicles"
             // from an epub's `calibre:series`, "Batman" from a comic's
             // `<Series>`. `SeriesName` is the field jellyfin-web already groups
             // and labels by, so a book reuses it rather than inventing one the
@@ -1976,10 +1972,10 @@ impl BaseItemDto {
             series_id: item
                 .series
                 .as_ref()
-                .map(|s| series_id_for_key(s.series_folder.as_deref(), &s.series_name)),
+                .map(|s| series_id_for_key(s.identity_folder(), &s.series_name)),
             season_id: item.series.as_ref().and_then(|s| {
                 s.season_number
-                    .map(|n| season_id_for_key(s.series_folder.as_deref(), &s.series_name, n))
+                    .map(|n| season_id_for_key(s.identity_folder(), &s.series_name, n))
             }),
             season_name: item
                 .series
@@ -2018,16 +2014,10 @@ impl BaseItemDto {
             overview: item.metadata.overview.clone(),
             taglines: item.metadata.tagline.iter().cloned().collect(),
             community_rating: item.metadata.community_rating,
-            // B341 — an OMDb Tomatometer outranks an NFO <criticrating>.
-            critic_rating: item
-                .metadata
-                .ratings
-                .tomatometer
-                .map(f32::from)
-                .or(item.metadata.critic_rating),
+            critic_rating: shown_critic_rating(item),
             official_rating: item.metadata.official_rating.clone(),
             // LIB-C11 — fall back to the series folder's parsed year so
-            // same-name shows (Cosmos 1980 vs 2014) are distinguishable
+            // same-name shows (Show AV 1980 vs 2014) are distinguishable
             // even before per-episode metadata enrichment (EPIC D).
             production_year: item
                 .metadata
@@ -2318,9 +2308,26 @@ pub fn series_id_for(name: &str) -> String {
     format!("{h:016x}{h:016x}")
 }
 
+/// The critic rating an item answer carries. An admin's locked rating
+/// (ADR-0097, a cleared one included) outranks everything; otherwise an
+/// OMDb Tomatometer outranks an NFO `<criticrating>` (B341).
+pub fn shown_critic_rating(item: &pharos_core::MediaItem) -> Option<f32> {
+    if item
+        .locked
+        .contains(pharos_core::EditableField::CriticRating)
+    {
+        return item.metadata.critic_rating;
+    }
+    item.metadata
+        .ratings
+        .tomatometer
+        .map(f32::from)
+        .or(item.metadata.critic_rating)
+}
+
 /// LIB-C11 — stable 32-hex Series id keyed on the show's FOLDER path when
 /// known, falling back to the bare NAME otherwise. Folder-keyed ids make
-/// same-name shows (`Cosmos (1980)` vs `Cosmos (2014)`) distinct so their
+/// same-name shows (`Show AV (1980)` vs `Show AV (2014)`) distinct so their
 /// episodes don't interleave. Passing `None` is byte-identical to
 /// [`series_id_for`], so legacy/backfilled rows keep their existing wire
 /// id and client URLs keep resolving.
@@ -2923,6 +2930,24 @@ pub fn build_media_attachments(
 mod tests {
     use super::*;
 
+    /// ADR-0097 — an admin's locked critic rating, a cleared one included,
+    /// is what the item answer shows; unlocked, the Tomatometer still wins.
+    #[test]
+    fn a_locked_critic_rating_outranks_the_tomatometer() {
+        let mut item = pharos_core::MediaItem::default();
+        item.metadata.ratings.tomatometer = Some(90);
+        item.metadata.critic_rating = Some(70.0);
+        assert_eq!(shown_critic_rating(&item), Some(90.0));
+        item.locked.insert(pharos_core::EditableField::CriticRating);
+        assert_eq!(shown_critic_rating(&item), Some(70.0));
+        item.metadata.critic_rating = None;
+        assert_eq!(
+            shown_critic_rating(&item),
+            None,
+            "a locked clear stays clear"
+        );
+    }
+
     /// ADR-0062 — jellyfin-web saves back the configuration it read, so the
     /// description language must survive the typed GET or the next save of
     /// any other setting wipes it.
@@ -3053,8 +3078,8 @@ mod tests {
         // parse must classify it as Synth with the hash recovered, for ANY
         // of the synth families.
         for synth in [
-            series_id_for("Cosmos"),
-            season_id_for("Cosmos", 2),
+            series_id_for("Show AV"),
+            season_id_for("Show AV", 2),
             artist_id_for("Limp Bizkit"),
             album_id_for("Significant Other"),
         ] {
@@ -3126,7 +3151,7 @@ mod tests {
 
     #[test]
     fn stream_display_title_composes_language_title_codec_channels() {
-        // Track with a title → "Language - Title" (the Code Geass case that
+        // Track with a title → "Language - Title" (the Show U case that
         // rendered "undefined").
         assert_eq!(
             stream_display_title(Some("jpn"), Some("TrueHD 5.1"), Some("truehd"), Some(6))
@@ -3353,7 +3378,7 @@ mod tests {
                 tagline: Some("a tagline".into()),
                 provider_ids: ProviderIds {
                     tmdb: Some("603".into()),
-                    imdb: Some("tt0133093".into()),
+                    imdb: Some("tt9300001".into()),
                     ..Default::default()
                 },
                 ..Default::default()
@@ -3371,7 +3396,7 @@ mod tests {
         assert_eq!(v["ProductionYear"], 1999);
         assert!(v["PremiereDate"].as_str().unwrap().starts_with("1999-03-"));
         assert_eq!(v["ProviderIds"]["Tmdb"], "603");
-        assert_eq!(v["ProviderIds"]["Imdb"], "tt0133093");
+        assert_eq!(v["ProviderIds"]["Imdb"], "tt9300001");
         assert!(v["ProviderIds"].get("Tvdb").is_none());
         // T67 — ExternalUrls derived from the provider ids. A Movie's TMDb link
         // is type-scoped to `/movie`; the IMDb link points at `/title`.
@@ -3388,7 +3413,7 @@ mod tests {
             .collect();
         assert!(urls.contains(&(
             "IMDb".into(),
-            "https://www.imdb.com/title/tt0133093/".into()
+            "https://www.imdb.com/title/tt9300001/".into()
         )));
         assert!(urls.contains(&(
             "TheMovieDb".into(),
@@ -3434,19 +3459,20 @@ mod tests {
         let mk = |folder: &str, year: u32| MediaItem {
             id: 1,
             path: format!("{folder}/Season 01/S01E01.mkv").into(),
-            title: "Cosmos".into(),
+            title: "Show AV".into(),
             kind: MediaKind::Episode,
             series: Some(SeriesInfo {
-                series_name: "Cosmos".into(),
+                series_name: "Show AV".into(),
                 season_number: Some(1),
                 episode_number: Some(1),
                 series_folder: Some(folder.into()),
                 series_year: Some(year),
+                series_key: None,
             }),
             ..Default::default()
         };
-        let a = BaseItemDto::from_domain(&mk("/tv/Cosmos (1980)", 1980), "srv");
-        let b = BaseItemDto::from_domain(&mk("/tv/Cosmos (2014)", 2014), "srv");
+        let a = BaseItemDto::from_domain(&mk("/tv/Show AV (1980)", 1980), "srv");
+        let b = BaseItemDto::from_domain(&mk("/tv/Show AV (2014)", 2014), "srv");
 
         // Same display name…
         assert_eq!(a.series_name, b.series_name);
@@ -3459,12 +3485,12 @@ mod tests {
         // The folder-keyed id equals the standalone helper output…
         assert_eq!(
             a.series_id.as_deref(),
-            Some(series_id_for_key(Some("/tv/Cosmos (1980)"), "Cosmos").as_str())
+            Some(series_id_for_key(Some("/tv/Show AV (1980)"), "Show AV").as_str())
         );
         // …and differs from the legacy name-only id (proving the fix).
         assert_ne!(
             a.series_id.as_deref(),
-            Some(series_id_for("Cosmos").as_str())
+            Some(series_id_for("Show AV").as_str())
         );
 
         // Year flows into ProductionYear so clients can disambiguate.
@@ -3478,10 +3504,10 @@ mod tests {
     fn legacy_series_id_helpers_unchanged_with_no_folder() {
         // LIB-C11 — passing None must be byte-identical to the legacy
         // name-only helpers so pre-backfill client URLs keep resolving.
-        assert_eq!(series_id_for_key(None, "Cosmos"), series_id_for("Cosmos"));
+        assert_eq!(series_id_for_key(None, "Show AV"), series_id_for("Show AV"));
         assert_eq!(
-            season_id_for_key(None, "Cosmos", 1),
-            season_id_for("Cosmos", 1)
+            season_id_for_key(None, "Show AV", 1),
+            season_id_for("Show AV", 1)
         );
     }
 
@@ -4039,7 +4065,7 @@ mod video_3d_format_tests {
         MediaItem {
             id: 42,
             kind: MediaKind::Movie,
-            title: "Avatar 3D".into(),
+            title: "Film BA 3D".into(),
             probe: MediaProbe {
                 video_codec: Some("h264".into()),
                 video_3d_format: Some(format),

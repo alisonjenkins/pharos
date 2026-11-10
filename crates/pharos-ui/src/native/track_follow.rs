@@ -1,7 +1,11 @@
 //! Group tracks (014 US7): whether a member applies the group's audio and
 //! subtitle picks, and where a menu pick goes. Pure.
 
+pub use pharos_client::api::Track;
+use pharos_client::api::{TrackChoice as ApiChoice, TrackPicks as ApiPicks};
 pub use pharos_client::group::TrackChoice;
+
+use super::activity::TrackKind;
 
 /// What the group is on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -96,6 +100,141 @@ pub fn subtitle_pick_here(
     to_group: impl FnOnce(Option<u32>) -> bool,
 ) -> bool {
     !(shown != to && to_group(to))
+}
+
+/// How the streams of the version playing line up with the item's primary
+/// file, whose indexes the group's picks name (ADR-0089, V902). Two streams
+/// match when they share language, forced and hearing-impaired flags: first
+/// those whose title, codec and channels agree too, then the rest in order.
+/// On the primary every stream matches itself.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TrackMap {
+    /// (this version's index, the primary's index) for each matched stream.
+    audio: Vec<(u32, u32)>,
+    subtitles: Vec<(u32, u32)>,
+}
+
+impl TrackMap {
+    pub fn new(
+        (audio, subtitles): (&[Track], &[Track]),
+        (primary_audio, primary_subtitles): (&[Track], &[Track]),
+    ) -> Self {
+        Self {
+            audio: pair(audio, primary_audio),
+            subtitles: pair(subtitles, primary_subtitles),
+        }
+    }
+
+    fn pairs(&self, kind: TrackKind) -> &[(u32, u32)] {
+        match kind {
+            TrackKind::Audio => &self.audio,
+            TrackKind::Subtitles => &self.subtitles,
+        }
+    }
+
+    /// The primary's index for this version's stream `own`.
+    pub fn to_primary(&self, kind: TrackKind, own: u32) -> Option<u32> {
+        self.pairs(kind)
+            .iter()
+            .find(|(o, _)| *o == own)
+            .map(|(_, p)| *p)
+    }
+
+    /// This version's index for the primary's stream `primary`.
+    pub fn to_own(&self, kind: TrackKind, primary: u32) -> Option<u32> {
+        self.pairs(kind)
+            .iter()
+            .find(|(_, p)| *p == primary)
+            .map(|(o, _)| *o)
+    }
+
+    /// The primary's indexes of the streams this version has.
+    pub fn primary_indexes(&self, kind: TrackKind) -> Vec<u32> {
+        self.pairs(kind).iter().map(|(_, p)| *p).collect()
+    }
+
+    /// Picks naming the primary's streams, as this version's. A stream this
+    /// version lacks becomes `None` (left as it is); turning subtitles off
+    /// always carries.
+    pub fn picks_to_own(&self, picks: TrackPicks) -> TrackPicks {
+        TrackPicks {
+            audio: picks.audio.and_then(|i| self.to_own(TrackKind::Audio, i)),
+            subtitle: picks.subtitle.and_then(|to| match to {
+                None => Some(None),
+                Some(i) => self.to_own(TrackKind::Subtitles, i).map(Some),
+            }),
+        }
+    }
+}
+
+impl TrackMap {
+    /// A playback's track choices as the primary's streams; a stream the
+    /// primary lacks is left to the server (`Default`).
+    pub fn choices_to_primary(&self, picks: ApiPicks) -> ApiPicks {
+        self.choices(picks, Self::to_primary)
+    }
+
+    /// The primary's track choices as this version's; see
+    /// [`Self::choices_to_primary`].
+    pub fn choices_to_own(&self, picks: ApiPicks) -> ApiPicks {
+        self.choices(picks, Self::to_own)
+    }
+
+    fn choices(&self, picks: ApiPicks, map: fn(&Self, TrackKind, u32) -> Option<u32>) -> ApiPicks {
+        let one = |kind, choice| match choice {
+            ApiChoice::Index(i) => map(self, kind, i).map_or(ApiChoice::Default, ApiChoice::Index),
+            other => other,
+        };
+        ApiPicks {
+            audio: one(TrackKind::Audio, picks.audio),
+            subtitle: one(TrackKind::Subtitles, picks.subtitle),
+        }
+    }
+}
+
+/// The streams' matching key: language (case-folded) and the two flags.
+fn track_key(t: &Track) -> (String, bool, bool) {
+    (
+        t.language.to_ascii_lowercase(),
+        t.is_forced,
+        t.is_hearing_impaired,
+    )
+}
+
+/// Pairs each stream of `own` with one of `primary` sharing its key. A stream
+/// whose title, codec and channels also agree is paired first, so a
+/// commentary ahead of the main track in one file still finds its twin; the
+/// rest pair in order among the unpaired streams with that key.
+fn pair(own: &[Track], primary: &[Track]) -> Vec<(u32, u32)> {
+    let same = |a: &Track, b: &Track| {
+        track_key(a) == track_key(b)
+            && a.title == b.title
+            && a.codec.eq_ignore_ascii_case(&b.codec)
+            && a.channels == b.channels
+    };
+    let mut taken = vec![false; primary.len()];
+    let mut paired: Vec<Option<u32>> = vec![None; own.len()];
+    let mut claim = |matches: &dyn Fn(&Track, &Track) -> bool, paired: &mut Vec<Option<u32>>| {
+        for (slot, o) in paired.iter_mut().zip(own) {
+            if slot.is_some() {
+                continue;
+            }
+            let hit = primary
+                .iter()
+                .zip(taken.iter_mut())
+                .find(|(p, used)| !**used && matches(o, p));
+            if let Some((p, used)) = hit {
+                *used = true;
+                *slot = Some(p.index);
+            }
+        }
+    };
+    claim(&same, &mut paired);
+    claim(&|a, b| track_key(a) == track_key(b), &mut paired);
+    own.iter()
+        .zip(paired)
+        .filter_map(|(o, p)| p.map(|p| (o.index, p)))
+        .collect()
 }
 
 #[cfg(test)]
@@ -233,5 +372,142 @@ mod tests {
         assert_eq!(route_pick(true, true), PickRoute::ApplyLocally);
         assert_eq!(route_pick(false, false), PickRoute::ApplyLocally);
         assert_eq!(route_pick(false, true), PickRoute::ApplyLocally);
+    }
+
+    fn track(index: u32, language: &str) -> Track {
+        Track {
+            index,
+            language: language.to_owned(),
+            ..Track::default()
+        }
+    }
+
+    /// B941: the 2D file has English at 1 and Japanese at 2; the 3D rip has
+    /// Japanese at 1, English at 2 and a commentary in English at 3.
+    fn two_versions() -> TrackMap {
+        let primary_audio = [track(1, "eng"), track(2, "jpn")];
+        let primary_subs = [track(3, "eng"), track(4, "eng")];
+        let audio = [track(1, "jpn"), track(2, "ENG"), track(3, "eng")];
+        let subs = [
+            Track {
+                is_forced: true,
+                ..track(5, "eng")
+            },
+            track(6, "eng"),
+        ];
+        TrackMap::new((&audio, &subs), (&primary_audio, &primary_subs))
+    }
+
+    #[test]
+    fn a_group_pick_lands_on_the_same_language_in_another_version() {
+        let map = two_versions();
+        assert_eq!(map.to_own(TrackKind::Audio, 2), Some(1), "Japanese");
+        assert_eq!(map.to_own(TrackKind::Audio, 1), Some(2), "English");
+        assert_eq!(map.to_primary(TrackKind::Audio, 1), Some(2));
+        assert_eq!(map.to_primary(TrackKind::Audio, 3), None, "second English");
+    }
+
+    #[test]
+    fn streams_match_by_flags_and_order_too() {
+        let map = two_versions();
+        assert_eq!(
+            map.to_own(TrackKind::Subtitles, 3),
+            Some(6),
+            "first plain English"
+        );
+        assert_eq!(
+            map.to_own(TrackKind::Subtitles, 4),
+            None,
+            "no second plain English"
+        );
+        assert_eq!(map.to_primary(TrackKind::Subtitles, 5), None, "forced");
+        assert_eq!(map.primary_indexes(TrackKind::Audio), vec![2, 1]);
+    }
+
+    #[test]
+    fn picks_carry_where_they_match_and_off_always_carries() {
+        let map = two_versions();
+        let to_own = |audio, subtitle| map.picks_to_own(TrackPicks { audio, subtitle });
+        assert_eq!(
+            to_own(Some(2), Some(None)),
+            TrackPicks {
+                audio: Some(1),
+                subtitle: Some(None)
+            }
+        );
+        assert_eq!(
+            to_own(Some(9), Some(Some(4))),
+            TrackPicks {
+                audio: None,
+                subtitle: None
+            }
+        );
+    }
+
+    /// A commentary ahead of the main track pairs by title and codec, not by place.
+    #[test]
+    fn a_commentary_first_does_not_take_the_main_tracks_place() {
+        let main = Track {
+            codec: "eac3".into(),
+            channels: 6,
+            ..track(1, "eng")
+        };
+        let commentary = Track {
+            title: "Commentary".into(),
+            codec: "aac".into(),
+            channels: 2,
+            ..track(1, "eng")
+        };
+        let primary = [main.clone()];
+        let rip = [
+            Track {
+                index: 1,
+                ..commentary
+            },
+            Track { index: 2, ..main },
+        ];
+        let map = TrackMap::new((&rip, &[]), (&primary, &[]));
+        assert_eq!(map.to_own(TrackKind::Audio, 1), Some(2));
+        assert_eq!(map.to_primary(TrackKind::Audio, 1), None);
+    }
+
+    /// Spec 034 US3: the viewer's picks survive a version switch.
+    #[test]
+    fn a_playbacks_choices_carry_through_the_primary() {
+        let map = two_versions();
+        let carried = map.choices_to_own(ApiPicks {
+            audio: ApiChoice::Index(2),
+            subtitle: ApiChoice::Index(4),
+        });
+        assert_eq!(
+            carried,
+            ApiPicks {
+                audio: ApiChoice::Index(1),
+                subtitle: ApiChoice::Default,
+            }
+        );
+        let off = ApiPicks {
+            audio: ApiChoice::Index(3),
+            subtitle: ApiChoice::Off,
+        };
+        assert_eq!(
+            map.choices_to_primary(off),
+            ApiPicks {
+                audio: ApiChoice::Default,
+                subtitle: ApiChoice::Off,
+            }
+        );
+    }
+
+    #[test]
+    fn on_the_primary_every_stream_is_itself() {
+        let audio = [track(1, "eng"), track(2, "eng"), track(4, "")];
+        let subs = [track(7, "fre")];
+        let map = TrackMap::new((&audio, &subs), (&audio, &subs));
+        for i in [1, 2, 4] {
+            assert_eq!(map.to_own(TrackKind::Audio, i), Some(i));
+            assert_eq!(map.to_primary(TrackKind::Audio, i), Some(i));
+        }
+        assert_eq!(map.to_own(TrackKind::Subtitles, 7), Some(7));
     }
 }

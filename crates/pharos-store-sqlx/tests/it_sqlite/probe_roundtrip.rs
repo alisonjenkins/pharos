@@ -156,6 +156,7 @@ fn arb_probe() -> impl Strategy<Value = MediaProbe> {
                 video_3d_format,
                 // Not written by `put`; the sweep owns it (V385).
                 audio_analysis: None,
+                picture_check: None,
             },
         )
 }
@@ -186,6 +187,7 @@ fn arb_item() -> impl Strategy<Value = MediaItem> {
         arb_series(),
     )
         .prop_map(|(id, path, title, kind, probe, series)| MediaItem {
+            locked: Default::default(),
             id,
             path: format!("/m/{path}.bin").into(),
             title,
@@ -280,6 +282,7 @@ fn alternate_sources_survive_a_reload() {
                 width: Some(3840),
                 ..MediaProbe::default()
             })),
+            part: None,
         };
         let item = MediaItem {
             id: 7,

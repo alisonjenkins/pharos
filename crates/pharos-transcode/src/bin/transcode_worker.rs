@@ -10,6 +10,25 @@
 //! as the worker dying mid-job and retries elsewhere — the server process
 //! is never affected (V6).
 
+#[cfg(target_os = "linux")]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+/// Same build-time jemalloc options as the server: dirty pages go back about
+/// a second after an op ends, muzzy pages at once. `MALLOC_CONF` overrides.
+#[cfg(target_os = "linux")]
+#[unsafe(export_name = "malloc_conf")]
+static MALLOC_CONF: MallocConf =
+    MallocConf(c"background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:0".as_ptr());
+
+#[cfg(target_os = "linux")]
+#[repr(transparent)]
+struct MallocConf(*const std::ffi::c_char);
+
+// SAFETY: the pointer is to a 'static, immutable C string literal.
+#[cfg(target_os = "linux")]
+unsafe impl Sync for MallocConf {}
+
 #[cfg(unix)]
 fn main() {
     let rt = match tokio::runtime::Builder::new_current_thread()
@@ -318,13 +337,45 @@ async fn run_tiny(
     job_id: pharos_transcode::protocol::JobId,
     op: pharos_transcode::protocol::TinyOp,
 ) {
-    use pharos_transcode::protocol::{write_frame, WorkerError, WorkerEvent};
+    use pharos_transcode::protocol::{write_frame, TinyOp, WorkerError, WorkerEvent};
+    use pharos_transcode::worker::priority;
+    // Trickplay sheets are background work for the whole library: they run
+    // at the lowest CPU priority so playback's encodes win (B908, V856).
+    if matches!(op, TinyOp::Trickplay { .. }) {
+        let ev = match priority::spawn_at_lowest_priority(move || handle_tiny(job_id, op)) {
+            Err(e) => WorkerEvent::Failed {
+                job_id,
+                error: WorkerError::Other(format!("trickplay op thread spawn: {e}")),
+            },
+            Ok(rx) => match rx.await {
+                Ok(Ok(ran)) => {
+                    if let Err(e) = ran.niceness {
+                        eprintln!(
+                            "transcode-worker: trickplay priority not lowered job_id={job_id}, ran at the default: {e}"
+                        );
+                    }
+                    ran.value
+                }
+                Ok(Err(panic)) => WorkerEvent::Failed {
+                    job_id,
+                    error: WorkerError::Other(format!("trickplay op panicked: {panic}")),
+                },
+                Err(_) => WorkerEvent::Failed {
+                    job_id,
+                    error: WorkerError::Other("trickplay op thread ended without an answer".into()),
+                },
+            },
+        };
+        let _ = write_frame(wr, &ev).await;
+        return;
+    }
     let ev = tokio::task::spawn_blocking(move || handle_tiny(job_id, op))
         .await
         .unwrap_or_else(|e| WorkerEvent::Failed {
             job_id,
             error: WorkerError::Other(format!("tiny op task join: {e}")),
         });
+    let ev = pharos_transcode::protocol::fit_reply(job_id, ev);
     let _ = write_frame(wr, &ev).await;
 }
 
@@ -477,6 +528,12 @@ fn handle_tiny(
             Ok(features) => WorkerEvent::AudioFeaturesResult { job_id, features },
             Err(e) => frame_err(job_id, e),
         },
+        TinyOp::PictureCheck { input, duration_ms } => {
+            match libav::picture_area::picture_area(&input, duration_ms) {
+                Ok(analysis) => WorkerEvent::PictureCheckResult { job_id, analysis },
+                Err(e) => frame_err(job_id, e),
+            }
+        }
         TinyOp::SubtitleSignals {
             input,
             audio_stream,

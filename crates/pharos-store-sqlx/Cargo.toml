@@ -14,6 +14,7 @@ postgres = ["sqlx/postgres", "sqlx/tls-rustls"]
 [dependencies]
 pharos-core = { path = "../pharos-core" }
 pharos-sync = { path = "../pharos-sync" }
+futures-util = "0.3"
 metrics.workspace = true
 serde = { workspace = true }
 serde_json = { workspace = true }

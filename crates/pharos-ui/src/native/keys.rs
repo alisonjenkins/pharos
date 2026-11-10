@@ -78,6 +78,14 @@ enum Help {
     All,
 }
 
+/// Whether an open dialog keeps `key` from the page's mode keys (B825): a
+/// single character is a mode key (`g`, `/`, `?`, a digit), which would
+/// otherwise act on the page behind the dialog. Arrows, Enter and Tab stay
+/// the dialog's own to move its focus.
+fn dialog_owns(key: &str, dialog_open: bool) -> bool {
+    dialog_open && key.chars().count() == 1
+}
+
 /// The page-wide key listener and its help panel.
 #[component]
 pub fn KeyLayer(route: Route, on_palette: EventHandler) -> Element {
@@ -160,6 +168,16 @@ pub fn KeyLayer(route: Route, on_palette: EventHandler) -> Element {
             if key == "Escape" && platform::dialog_open() {
                 return false;
             }
+            // The page behind a dialog is not the keys' to drive (B825).
+            if dialog_owns(key, platform::dialog_open()) {
+                return false;
+            }
+            // In browser fullscreen Escape only leaves it; the next one
+            // shrinks the player (V854).
+            if key == "Escape" && platform::leave_fullscreen_on_escape() {
+                reset();
+                return true;
+            }
             let mut keys = chord.peek().clone();
             keys.push(key.to_owned());
             let typed: Vec<&str> = keys.iter().map(String::as_str).collect();
@@ -173,6 +191,7 @@ pub fn KeyLayer(route: Route, on_palette: EventHandler) -> Element {
                     platform::forward_to_player(key)
                 }
                 Resolved::Run(action) => {
+                    super::report::note(&format!("key {}", typed.join(" ")));
                     reset();
                     run(action)
                 }
@@ -232,12 +251,12 @@ pub fn KeyLayer(route: Route, on_palette: EventHandler) -> Element {
     }
 }
 
-/// `mode`, or the queue's while the focus is in the music player's queue:
+/// `mode`, or the queue's while the focus is in the music or video queue:
 /// read at each key, since a removed row takes the focus without a
 /// `focusout`.
 fn focus_mode(mode: Mode) -> Mode {
     match mode {
-        Mode::Music | Mode::Queue if platform::focus_in_area("queue") => Mode::Queue,
+        Mode::Music | Mode::Queue | Mode::Player if platform::focus_in_area("queue") => Mode::Queue,
         Mode::Queue => Mode::Music,
         m => m,
     }
@@ -317,6 +336,23 @@ pub fn KeyHelp(
                     }
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// B825: single-character mode keys stay out of the page behind a dialog.
+    #[test]
+    fn an_open_dialog_keeps_the_single_letter_mode_keys_from_the_page() {
+        for key in ["g", "j", "/", "?", "5"] {
+            assert!(dialog_owns(key, true), "{key}");
+            assert!(!dialog_owns(key, false), "{key}");
+        }
+        for key in ["ArrowDown", "Enter", "Tab", "Escape"] {
+            assert!(!dialog_owns(key, true), "{key}");
         }
     }
 }

@@ -230,6 +230,31 @@ pub struct GroupSummary {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GroupError(pub String);
 
+impl GroupError {
+    const GONE: &'static str = "This group has ended";
+
+    /// The server knows no such group, or no longer counts this member in it.
+    pub fn gone() -> Self {
+        Self(Self::GONE.into())
+    }
+
+    pub fn is_gone(&self) -> bool {
+        self.0 == Self::GONE
+    }
+
+    const SUPERSEDED: &'static str = "The join was superseded";
+
+    /// The viewer left, or began another membership, while the join was in
+    /// flight: not a failure to show them.
+    pub fn superseded() -> Self {
+        Self(Self::SUPERSEDED.into())
+    }
+
+    pub fn is_superseded(&self) -> bool {
+        self.0 == Self::SUPERSEDED
+    }
+}
+
 /// The server's reply to `clock`: the client's timestamp echoed, then when
 /// the server received the request and when it replied (`t1`, `t2`, `t3`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -287,6 +312,12 @@ pub enum GroupUpdate {
         tracks: GroupTracksView,
         by: Option<String>,
     },
+    /// `by` kept the group watching the end of queue entry
+    /// `playlist_item_id`: no member's "Up next" plays on from it (B1027).
+    NextHeld {
+        playlist_item_id: String,
+        by: Option<String>,
+    },
     /// The group is over for this member, for whatever reason.
     Ended,
 }
@@ -340,6 +371,9 @@ pub trait GroupClient {
     ) -> Result<(), GroupError>;
     /// `false` puts this member on their own tracks ("Just me").
     async fn follow_tracks(&self, follow: bool) -> Result<(), GroupError>;
+    /// Keep the group watching the end of entry `playlist_item_id`: every
+    /// member's "Up next" stops (B1027). The group drops it if it has moved on.
+    async fn hold_next(&self, playlist_item_id: String) -> Result<(), GroupError>;
     /// Move the group to `item` from `position_ms` (014 US9).
     /// `playlist_item_id` is the entry this member moves from: the group
     /// drops the move if it has already left it.
@@ -376,11 +410,15 @@ pub struct FakeGroups {
     joined: Rc<RefCell<Option<GroupId>>>,
     seen: Rc<RefCell<Vec<MemberSeen>>>,
     refuse_follow: Rc<Cell<bool>>,
+    refuse_seek: Rc<Cell<bool>>,
     refuse_tracks: Rc<Cell<bool>>,
     refuse_set_item: Rc<Cell<bool>>,
+    refuse_hold_next: Rc<Cell<bool>>,
     hold_buffering: Rc<Cell<bool>>,
     buffering_gates: Rc<RefCell<Vec<BufferingGate>>>,
     join_pushes: Rc<RefCell<Vec<GroupUpdate>>>,
+    gone_joins: Rc<Cell<u32>>,
+    gone_pings: Rc<Cell<bool>>,
 }
 
 impl FakeGroups {
@@ -408,14 +446,39 @@ impl FakeGroups {
         }
     }
 
+    /// The in-memory groups have no connection to move.
+    pub fn reconnect(&self, _api: &NativeApi) {}
+
+    /// The next `n` joins find no group, as a server still hydrating its
+    /// groups after a restart answers.
+    pub fn gone_for_joins(&self, n: u32) {
+        self.gone_joins.set(n);
+    }
+
+    /// Makes every `ping` answer that this member is not in the group, as
+    /// the server does once it has pruned the member.
+    pub fn gone_pings(&self, gone: bool) {
+        self.gone_pings.set(gone);
+    }
+
     /// Makes every `set_tracks` fail, as a dropped connection would.
     pub fn refuse_tracks(&self) {
         self.refuse_tracks.set(true);
     }
 
+    /// Makes every `hold_next` fail, as a server before schemaVersion 33 would.
+    pub fn refuse_hold_next(&self) {
+        self.refuse_hold_next.set(true);
+    }
+
     /// Makes every `set_item` fail, as a server before schemaVersion 23 would.
     pub fn refuse_set_item(&self) {
         self.refuse_set_item.set(true);
+    }
+
+    /// Makes every `seek` fail, as a dropped connection would.
+    pub fn refuse_seek(&self) {
+        self.refuse_seek.set(true);
     }
 
     /// Makes every `follow_tracks` fail, as a dropped connection would.
@@ -506,10 +569,14 @@ impl GroupClient for FakeGroups {
 
     async fn join(&self, id: &str, sink: GroupSink) -> Result<GroupSummary, GroupError> {
         self.log(format!("join({id})"));
+        if let Some(left) = self.gone_joins.get().checked_sub(1) {
+            self.gone_joins.set(left);
+            return Err(GroupError::gone());
+        }
         let answer = {
             let mut groups = self.groups.borrow_mut();
             let Some(group) = groups.iter_mut().find(|g| g.id == id) else {
-                return Err(GroupError("This group has ended".into()));
+                return Err(GroupError::gone());
             };
             group.members.push(Self::me());
             group.clone()
@@ -546,6 +613,9 @@ impl GroupClient for FakeGroups {
 
     async fn ping(&self) -> Result<(), GroupError> {
         self.log("ping".into());
+        if self.gone_pings.get() {
+            return Err(GroupError::gone());
+        }
         Ok(())
     }
 
@@ -566,6 +636,9 @@ impl GroupClient for FakeGroups {
 
     async fn seek(&self, position_ms: u64) -> Result<(), GroupError> {
         self.log(format!("seek({position_ms})"));
+        if self.refuse_seek.get() {
+            return Err(GroupError("connection lost".into()));
+        }
         Ok(())
     }
 
@@ -639,6 +712,21 @@ impl GroupClient for FakeGroups {
         Ok(())
     }
 
+    async fn hold_next(&self, playlist_item_id: String) -> Result<(), GroupError> {
+        self.log(format!("hold_next({playlist_item_id})"));
+        if self.refuse_hold_next.get() {
+            return Err(GroupError("Refused".into()));
+        }
+        if self.with_joined(|_| ()).is_none() {
+            return Err(GroupError("Not in a group".into()));
+        }
+        self.push(&GroupUpdate::NextHeld {
+            playlist_item_id,
+            by: Some(Self::me().id),
+        });
+        Ok(())
+    }
+
     async fn set_item(
         &self,
         item: ItemRef,
@@ -699,6 +787,13 @@ impl GroupClient for FakeGroups {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_superseded_join_is_told_apart_from_a_refusal() {
+        assert!(GroupError::superseded().is_superseded());
+        assert!(!GroupError::gone().is_superseded());
+        assert!(!GroupError("The server said no".into()).is_superseded());
+    }
 
     /// A sample whose server clock is `offset` ahead and whose trip took
     /// `rtt` split evenly, sent at `at`; the server answers at once.

@@ -52,8 +52,8 @@ async fn seed() -> (web::Data<AppState>, String, UserId) {
     stores
         .put(MediaItem {
             id: 42,
-            path: "/media/Books/Dune.epub".into(),
-            title: "Dune".into(),
+            path: "/media/Books/Book A.epub".into(),
+            title: "Book A".into(),
             kind: MediaKind::Book,
             book: Some(BookMeta {
                 format: BookFormat::Epub,
@@ -74,8 +74,8 @@ async fn seed() -> (web::Data<AppState>, String, UserId) {
     stores
         .put(MediaItem {
             id: 43,
-            path: "/media/Movies/Alien.mkv".into(),
-            title: "Alien".into(),
+            path: "/media/Movies/Film AX.mkv".into(),
+            title: "Film AX".into(),
             kind: MediaKind::Movie,
             probe: MediaProbe {
                 duration_ms: Some(7_020_000),

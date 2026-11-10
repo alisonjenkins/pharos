@@ -455,6 +455,25 @@ impl MediaStore for MemStore {
         Ok(0)
     }
 
+    async fn servable_artwork_page(
+        &self,
+        _after: Option<(MediaId, String)>,
+        _limit: i64,
+    ) -> DomainResult<Vec<ArtworkRow>> {
+        // No artwork table here; the stale-art sweep is exercised against sqlx.
+        Ok(Vec::new())
+    }
+
+    async fn remove_dead_artwork(
+        &self,
+        _item_id: MediaId,
+        _role: &str,
+        _readmit: bool,
+    ) -> DomainResult<()> {
+        // No artwork table here; exercised against the real sqlx stores.
+        Ok(())
+    }
+
     async fn item_entity_counts(&self, _item_id: MediaId) -> DomainResult<EntityCounts> {
         // MemStore is a lightweight scanner test-double with no genre/people/
         // studio join tables; the online-enrich fill-if-empty gate is exercised
@@ -488,6 +507,36 @@ fn media_probe_run_time_ticks_converts_ms_to_jellyfin_ticks() {
         ..Default::default()
     };
     assert_eq!(p.run_time_ticks(), Some(25_000_000));
+}
+
+/// V1150, V1155 — a split film runs for all its parts, and its parts are
+/// neither versions of it nor counted twice.
+#[test]
+fn a_split_films_run_time_spans_its_parts() {
+    let part = |n: u32, ms: u64| AlternateMediaSource {
+        id: format!("part-{n}"),
+        part: Some(n),
+        probe: Some(Box::new(MediaProbe {
+            duration_ms: Some(ms),
+            ..Default::default()
+        })),
+        ..Default::default()
+    };
+    let edition = AlternateMediaSource {
+        id: "extended".into(),
+        duration_ms: Some(9_000),
+        ..Default::default()
+    };
+    let p = MediaProbe {
+        duration_ms: Some(2_000),
+        alternate_sources: vec![part(3, 500), edition, part(2, 1_000)],
+        ..Default::default()
+    };
+    assert_eq!(p.run_time_ticks(), Some(35_000_000));
+    let order: Vec<_> = p.parts().iter().map(|a| a.part).collect();
+    assert_eq!(order, [Some(2), Some(3)]);
+    let versions: Vec<_> = p.versions().map(|a| a.id.as_str()).collect();
+    assert_eq!(versions, ["extended"]);
 }
 
 #[test]
@@ -598,12 +647,12 @@ fn match_best_rejects_below_threshold() {
 fn match_best_year_off_by_one_is_partial_not_zero() {
     let cands = vec![SearchCandidate {
         id: "3".into(),
-        title: "Blade Runner".into(),
+        title: "Film AB".into(),
         year: Some(1983),
         aliases: Vec::new(),
     }];
     // title exact, year ±1 -> still above threshold
-    assert!(match_best("Blade Runner", Some(1982), &cands, 0.7).is_some());
+    assert!(match_best("Film AB", Some(1982), &cands, 0.7).is_some());
 }
 
 fn cand(id: &str, title: &str, year: Option<u32>, aliases: &[&str]) -> SearchCandidate {
@@ -616,96 +665,88 @@ fn cand(id: &str, title: &str, year: Option<u32>, aliases: &[&str]) -> SearchCan
 }
 
 /// B557: TVDB names an anime by its Japanese title and carries the English
-/// one only as a translation. Scoring the title alone handed "Dragon Ball" to
-/// the English-titled fan work "Dragon Ball R&R" on a prefix match.
+/// one only as a translation. Scoring the title alone handed "Show A" to
+/// the English-titled fan work "Show A R&R" on a prefix match.
 #[test]
 fn match_best_scores_a_candidate_by_its_best_alias() {
     let cands = vec![
-        cand("374456", "Dragon Ball R&R", Some(2018), &[]),
-        cand("76666", "ドラゴンボール", Some(1986), &["Dragon Ball"]),
+        cand("910001", "Show A R&R", Some(2018), &[]),
+        cand("910002", "ショーA", Some(1986), &["Show A"]),
     ];
-    let m = match_best("Dragon Ball", None, &cands, 0.7).unwrap();
-    assert_eq!(m.id, "76666");
+    let m = match_best("Show A", None, &cands, 0.7).unwrap();
+    assert_eq!(m.id, "910002");
 }
 
 #[test]
 fn match_best_ranks_an_exact_name_over_a_prefix_match_with_a_better_year() {
     let cands = vec![
-        cand("fan", "Dragon Ball Z Abridged", Some(1990), &[]),
-        cand("real", "ドラゴンボールZ", Some(1989), &["Dragon Ball Z"]),
+        cand("fan", "Show A Z Abridged", Some(1990), &[]),
+        cand("real", "ショーAZ", Some(1989), &["Show A Z"]),
     ];
-    let m = match_best("Dragon Ball Z", Some(1990), &cands, 0.7).unwrap();
+    let m = match_best("Show A Z", Some(1990), &cands, 0.7).unwrap();
     assert_eq!(m.id, "real");
 }
 
-/// From the live TVDB search for "One Piece": the 2023 live-action series
-/// lists "One Piece" among its aliases, the anime as its English title.
+/// From a provider search for "Show B": the 2023 live-action series
+/// lists "Show B" among its aliases, the anime as its English title.
 #[test]
 fn match_best_prefers_an_exact_title_over_an_exact_alias() {
     let cands = vec![
         cand(
-            "392276",
-            "ONE PIECE (2023)",
+            "910003",
+            "SHOW B (2023)",
             Some(2023),
-            &["ONE PIECE (2023)", "ONE PIECE (US)", "One Piece"],
+            &["SHOW B (2023)", "SHOW B (US)", "Show B"],
         ),
         cand(
-            "81797",
-            "ワンピース",
+            "910004",
+            "ショーB",
             Some(1999),
-            &["One Piece", "One Piece (1998)"],
+            &["Show B", "Show B (1998)"],
         ),
     ];
-    let m = match_best("One Piece", None, &cands, 0.7).unwrap();
-    assert_eq!(m.id, "81797");
+    let m = match_best("Show B", None, &cands, 0.7).unwrap();
+    assert_eq!(m.id, "910004");
 }
 
-/// From the live TVDB search for "Code Geass": every entry extends the name,
-/// and an alias of the 2024 sequel ("Code Geass: Dakkan no Z") is the
+/// From a provider search for "Alpha Beta": every entry extends the name,
+/// and an alias of the 2024 sequel ("Alpha Beta: Z Arc") is the
 /// shortest, so it scored highest.
 #[test]
 fn match_best_a_franchise_name_goes_to_the_original() {
     let cands = vec![
         cand(
-            "443905",
-            "コードギアス 奪還のロゼ",
+            "910007",
+            "アルファ 第二章",
             Some(2024),
-            &[
-                "Code Geass: Rozé of the Recapture",
-                "Code Geass: Dakkan no Z",
-            ],
+            &["Alpha Beta: Recapture Arc", "Alpha Beta: Z Arc"],
         ),
         cand(
-            "79525",
-            "コードギアス 反逆のルルーシュ",
+            "910008",
+            "アルファ 第一章",
             Some(2006),
-            &["Code Geass: Lelouch of the Rebellion"],
+            &["Alpha Beta: Rebellion Arc"],
         ),
-        cand(
-            "471756",
-            "コードギアス 星追いのアスパル",
-            None,
-            &["Code Geass: Aspar the Star Chaser"],
-        ),
+        cand("910009", "アルファ 第三章", None, &["Alpha Beta: Star Arc"]),
     ];
-    let m = match_best("Code Geass", None, &cands, 0.7).unwrap();
-    assert_eq!(m.id, "79525");
+    let m = match_best("Alpha Beta", None, &cands, 0.7).unwrap();
+    assert_eq!(m.id, "910008");
 }
 
 #[test]
 fn match_best_an_exact_name_under_the_floor_does_not_shut_out_a_prefix_match() {
     let cands = vec![
-        cand("1963", "Doctor Who", Some(1963), &[]),
-        cand("2005", "Doctor Who (2005)", Some(2005), &[]),
+        cand("1963", "Show C", Some(1963), &[]),
+        cand("2005", "Show C (2005)", Some(2005), &[]),
     ];
-    let m = match_best("Doctor Who", Some(2005), &cands, 0.7).unwrap();
+    let m = match_best("Show C", Some(2005), &cands, 0.7).unwrap();
     assert_eq!(m.id, "2005");
 }
 
 #[test]
 fn title_similarity_ignores_case_and_punctuation() {
     assert!(title_similarity("WALL·E", "wall e") > 0.85);
-    assert!(title_similarity("Se7en", "Seven") < 0.9); // not falsely perfect
+    assert!(title_similarity("Fi5e", "Five") < 0.9); // not falsely perfect
 }
 
 #[test]
@@ -714,14 +755,14 @@ fn title_similarity_tolerates_appended_subtitle() {
     // title appends a subtitle. The shared portion is a whole-token prefix, so
     // the match must clear the 0.7 floor rather than being penalised for the
     // length gap (was ~0.29 with pure Levenshtein).
-    let s = title_similarity("Code Geass", "Code Geass: Lelouch of the Rebellion");
+    let s = title_similarity("Alpha Beta", "Alpha Beta: Rebellion Arc");
     assert!(s >= 0.9, "appended-subtitle score too low: {s}");
     assert!(match_best(
-        "Code Geass",
+        "Alpha Beta",
         None,
         &[SearchCandidate {
             id: "cg".into(),
-            title: "Code Geass: Lelouch of the Rebellion".into(),
+            title: "Alpha Beta: Rebellion Arc".into(),
             year: None,
             aliases: Vec::new(),
         }],
@@ -735,14 +776,14 @@ fn title_similarity_tolerates_country_qualifier() {
     // The local title decorates the name with a "(US)" qualifier the provider
     // does not carry; "us" is the appended tail. Symmetric with the subtitle
     // case — the shorter title (provider) is a whole-token prefix of the local.
-    let s = title_similarity("Forever (US)", "Forever");
+    let s = title_similarity("Show D (US)", "Show D");
     assert!(s >= 0.9, "country-qualifier score too low: {s}");
     assert!(match_best(
-        "Forever (US)",
+        "Show D (US)",
         None,
         &[SearchCandidate {
             id: "fv".into(),
-            title: "Forever".into(),
+            title: "Show D".into(),
             year: None,
             aliases: Vec::new(),
         }],
@@ -756,7 +797,7 @@ fn title_similarity_short_prefix_does_not_blanket_match() {
     // A trivially short prefix must NOT count as a subtitle match, or every
     // "Code …" / "The …" show would collide. Guarded by a minimum shared
     // length; here the whole-string Levenshtein still governs and stays low.
-    assert!(title_similarity("Code", "Code Geass: Lelouch of the Rebellion") < 0.7);
+    assert!(title_similarity("Alpha", "Alpha Beta: Rebellion Arc") < 0.7);
     assert!(title_similarity("24", "24 Hours in A&E") < 0.7);
 }
 
@@ -963,9 +1004,9 @@ fn book_format_round_trips_and_knows_what_a_client_can_open() {
 
 #[test]
 fn sort_name_drops_one_leading_article_case_insensitively() {
-    assert_eq!(sort_name("The Matrix"), "matrix");
-    assert_eq!(sort_name("THE Matrix"), "matrix");
-    assert_eq!(sort_name("A Quiet Place"), "quiet place");
+    assert_eq!(sort_name("The Glass Lattice"), "glass lattice");
+    assert_eq!(sort_name("THE Glass Lattice"), "glass lattice");
+    assert_eq!(sort_name("A Quartz Road"), "quartz road");
     assert_eq!(sort_name("An American Tail"), "american tail");
     assert_eq!(sort_name("The The"), "the");
 }
@@ -1002,4 +1043,203 @@ fn sort_name_clamps_runs_longer_than_the_pad_width() {
 #[test]
 fn sort_name_folds_unicode_case_like_title_fold() {
     assert_eq!(sort_name("Émile"), "Émile".to_lowercase());
+}
+
+/// Spec 033 B930: two shows carry the name and no year separates them, so the
+/// provider's order picks one. The decision must say so, or the bug stays
+/// invisible.
+#[test]
+fn match_decide_names_a_provider_order_tie_as_ambiguous() {
+    let cands = vec![
+        cand("910005", "Show E", Some(1978), &[]),
+        cand("910006", "Show E", Some(2003), &[]),
+    ];
+    let d = match_decide("Show E", None, &cands, 0.7);
+    assert_eq!(d.chosen.as_ref().map(|c| c.id.as_str()), Some("910005"));
+    assert_eq!(d.runner_up.as_ref().map(|c| c.id.as_str()), Some("910006"));
+    assert_eq!(d.decided_by, Some(MatchDecidedBy::ProviderOrder));
+    assert!(d.ambiguous);
+    assert_eq!(d.margin(), Some(0.0));
+}
+
+#[test]
+fn match_decide_a_year_that_separates_two_names_is_not_ambiguous() {
+    let cands = vec![
+        cand("910005", "Show E", Some(1978), &[]),
+        cand("910006", "Show E", Some(2003), &[]),
+    ];
+    // A floor low enough that the 1978 show's far-off year still clears it.
+    let d = match_decide("Show E", Some(2003), &cands, 0.5);
+    assert_eq!(d.chosen.as_ref().map(|c| c.id.as_str()), Some("910006"));
+    assert_eq!(d.decided_by, Some(MatchDecidedBy::Year));
+    assert!(!d.ambiguous, "margin {:?}", d.margin());
+}
+
+#[test]
+fn match_decide_says_why_for_each_rule() {
+    let sole = [cand("1", "Show I", Some(1997), &[])];
+    assert_eq!(
+        match_decide("Show I", None, &sole, 0.7).decided_by,
+        Some(MatchDecidedBy::SoleCandidate)
+    );
+    let name = [
+        cand("910001", "Show A R&R", Some(2018), &[]),
+        cand("910002", "ショーA", Some(1986), &["Show A"]),
+    ];
+    let d = match_decide("Show A", None, &name, 0.7);
+    assert_eq!(d.decided_by, Some(MatchDecidedBy::Name));
+    assert!(!d.ambiguous, "an exact name over a prefix match is decided");
+    let abridged = [
+        cand("fan", "Show A Z Abridged", Some(1990), &[]),
+        cand("real", "ショーAZ", Some(1989), &["Show A Z"]),
+    ];
+    let d = match_decide("Show A Z", Some(1990), &abridged, 0.7);
+    assert_eq!(d.decided_by, Some(MatchDecidedBy::Name));
+    assert!(d.margin().is_some_and(|m| m < 0.0), "{:?}", d.margin());
+    let franchise = [
+        cand("910007", "x", Some(2024), &["Alpha Beta: Z Arc"]),
+        cand("910008", "y", Some(2006), &["Alpha Beta: Rebellion Arc"]),
+    ];
+    let d = match_decide("Alpha Beta", None, &franchise, 0.7);
+    assert_eq!(d.chosen.map(|c| c.id), Some("910008".into()));
+    assert_eq!(d.decided_by, Some(MatchDecidedBy::EarliestPremiere));
+    let none = [cand("9", "Completely Different", None, &[])];
+    let d = match_decide("The Thing", None, &none, 0.7);
+    assert_eq!((d.chosen, d.decided_by, d.ambiguous), (None, None, false));
+    assert_eq!(
+        d.candidates.len(),
+        1,
+        "a rejected candidate is still listed"
+    );
+}
+
+#[test]
+fn match_decided_by_labels_are_stable_and_distinct() {
+    use std::collections::BTreeSet;
+    let all = [
+        MatchDecidedBy::SoleCandidate,
+        MatchDecidedBy::Name,
+        MatchDecidedBy::Year,
+        MatchDecidedBy::EarliestPremiere,
+        MatchDecidedBy::ProviderOrder,
+        MatchDecidedBy::EpisodeFit,
+        MatchDecidedBy::NfoVote,
+    ];
+    let labels: BTreeSet<&str> = all.iter().map(|d| d.label()).collect();
+    assert_eq!(labels.len(), all.len());
+    assert_eq!(MatchDecidedBy::ProviderOrder.label(), "provider_order");
+    assert_eq!(MatchDecidedBy::EpisodeFit.label(), "episode_fit");
+}
+
+/// `match_best` before spec 033 split out [`match_decide`], kept verbatim so
+/// the split is shown to change no answer.
+fn match_best_before_033(
+    query_title: &str,
+    query_year: Option<u32>,
+    candidates: &[SearchCandidate],
+    min_confidence: f32,
+) -> Option<MatchOutcome> {
+    let query = normalize_title(query_title);
+    let mut best: Option<(Option<usize>, f32, &SearchCandidate)> = None;
+    let mut inexact: Vec<(f32, &SearchCandidate)> = Vec::new();
+    for c in candidates {
+        let names = || std::iter::once(&c.title).chain(&c.aliases);
+        let exact_at = names().position(|n| normalize_title(n) == query);
+        let similarity = names()
+            .map(|n| title_similarity(query_title, n))
+            .fold(0.0_f32, f32::max);
+        let score = similarity * year_factor(query_year, c.year);
+        if score < min_confidence {
+            continue;
+        }
+        let beats = match &best {
+            None => true,
+            Some((best_at, best_score, _)) => match (exact_at, best_at) {
+                (Some(_), None) => true,
+                (None, Some(_)) => false,
+                (Some(at), Some(best_at)) if at != *best_at => at < *best_at,
+                _ => score > *best_score,
+            },
+        };
+        if beats {
+            best = Some((exact_at, score, c));
+        }
+        if exact_at.is_none() {
+            inexact.push((score, c));
+        }
+    }
+    if let Some((None, top, _)) = best {
+        best = inexact
+            .into_iter()
+            .filter(|(score, _)| *score >= top - PREFIX_NEAR_TIE)
+            .min_by_key(|(_, c)| c.year.unwrap_or(u32::MAX))
+            .map(|(score, c)| (None, score, c));
+    }
+    best.map(|(_, confidence, c)| MatchOutcome {
+        id: c.id.clone(),
+        confidence,
+    })
+}
+
+#[test]
+fn match_best_answers_as_it_did_before_the_decision_was_split_out() {
+    let names = [
+        "Show E",
+        "Show E (2003)",
+        "Show E Alias",
+        "The Show F",
+        "Show F",
+        "Alpha Beta",
+        "Alpha Beta: Rebellion",
+        "Show A",
+        "Show C",
+        "Show B",
+        "Show G",
+    ];
+    let years = [
+        None,
+        Some(1978),
+        Some(1979),
+        Some(2003),
+        Some(2004),
+        Some(2014),
+    ];
+    let pool = [
+        cand("a", "Show E", Some(1978), &[]),
+        cand("b", "Show E", Some(2003), &["Show E Alias"]),
+        cand("c", "Show E (2003)", Some(2004), &[]),
+        cand("d", "The Show F", Some(1990), &[]),
+        cand("e", "The Show F", Some(2014), &["Show F"]),
+        cand("f", "アルファ", Some(2006), &["Alpha Beta: Rebellion Arc"]),
+        cand("g", "アルファ 第二章", Some(2024), &["Alpha Beta: Z Arc"]),
+        cand("h", "Show A R&R", Some(2018), &[]),
+        cand("i", "ショーA", Some(1986), &["Show A"]),
+        cand("j", "Show C", Some(1963), &[]),
+        cand("k", "Show C (2005)", Some(2005), &[]),
+        cand("l", "SHOW B (2023)", Some(2023), &["Show B"]),
+        cand("m", "ショーB", Some(1999), &["Show B"]),
+        cand("n", "Show G", None, &[]),
+        cand("o", "Show G: A Subtitle", Some(2014), &["Show G"]),
+    ];
+    let mut checked = 0;
+    for name in names {
+        for year in years {
+            for start in 0..pool.len() {
+                for len in 1..=4 {
+                    let Some(slice) = pool.get(start..(start + len).min(pool.len())) else {
+                        continue;
+                    };
+                    for floor in [0.5, 0.7, 0.9] {
+                        assert_eq!(
+                            match_best(name, year, slice, floor),
+                            match_best_before_033(name, year, slice, floor),
+                            "{name} {year:?} {slice:?} {floor}"
+                        );
+                        checked += 1;
+                    }
+                }
+            }
+        }
+    }
+    assert!(checked > 1000);
 }

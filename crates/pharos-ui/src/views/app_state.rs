@@ -13,14 +13,18 @@
 
 use crate::api_types::{ItemKind, LibraryItem, LoggedInUser};
 use crate::client::{
-    ActivityEntry, AdminUser, ApiKey, BrandingConfig, DeviceEntry, DuplicateFilm, ItemChapter,
-    ItemDetail, LibraryFolder, LiveChannel, LiveProgram, LocalizationCulture, LogEntry,
-    PluginEntry, QuickConnectInitiate, RemoteSession, ScheduledTask, SearchHint, UserConfiguration,
+    ActivityEntry, AdminUser, ApiKey, BrandingConfig, DeviceEntry, DuplicateFilm, FixDone,
+    IntegrityReport, ItemChapter, ItemDetail, ItemMetadata, LibraryFolder, LiveChannel,
+    LiveProgram, LocalizationCulture, LogEntry, MetadataSaveError, PluginEntry,
+    QuickConnectInitiate, RemoteSession, ScheduledTask, SearchHint, SeriesIdentity, ShowCandidate,
+    ShowDetail, UserConfiguration,
 };
+use crate::views::admin::{fix_summary, PICK_PROMPT};
 use crate::views::server_picker::{load_saved_servers, save_servers};
 use crate::views::{
-    AdminAction, AdminTab, AdminView, CreateUserAttempt, DetailAction, ItemDetailView, LibraryView,
-    LiveTvAction, LiveTvStatus, LiveTvView, LoginAttempt, LoginForm, PlayerView, PrefsAction,
+    AdminAction, AdminTab, AdminView, CreateUserAttempt, DeepSearchState, DetailAction,
+    IdentityFocus, IdentitySearchState, ItemDetailView, LibraryView, LiveTvAction, LiveTvStatus,
+    LiveTvView, LoginAttempt, LoginForm, MetadataState, PickPrompt, PlayerView, PrefsAction,
     PrefsTab, PrefsView, QuickConnectAuthorizeAction, QuickConnectAuthorizeView,
     QuickConnectGuestAction, QuickConnectGuestStatus, QuickConnectGuestView, RemoteAction,
     RemoteControlView, SavedServer, SearchStatus, SearchView, ServerPickerAction, ServerPickerView,
@@ -270,7 +274,7 @@ fn Authenticated(user: Signal<Option<LoggedInUser>>, route: Signal<AppRoute>) ->
                 }
             },
             AppRoute::Admin => rsx! {
-                AdminPane {
+                LegacyAdminPane {
                     access_token: access_token.clone(),
                     server_base: server_base_from_window(),
                     current_user_id: current_user_id.clone(),
@@ -297,7 +301,6 @@ fn Authenticated(user: Signal<Option<LoggedInUser>>, route: Signal<AppRoute>) ->
             AppRoute::LivePlayer { channel_id } => rsx! {
                 LivePlayerPane {
                     channel_id: channel_id.clone(),
-                    access_token: access_token.clone(),
                     server_base: server_base_from_window(),
                     on_back: move |_| { route.set(AppRoute::LiveTv); },
                 }
@@ -514,16 +517,12 @@ fn DetailPane(
     match detail_opt {
         Some(detail) => {
             let primary_image_url = if detail.has_primary_image {
-                Some(format!(
-                    "{server_base}/Items/{item_id}/Images/Primary?api_key={access_token}"
-                ))
+                Some(format!("{server_base}/Items/{item_id}/Images/Primary"))
             } else {
                 None
             };
             let backdrop_image_url = if detail.has_backdrop_image {
-                Some(format!(
-                    "{server_base}/Items/{item_id}/Images/Backdrop?api_key={access_token}"
-                ))
+                Some(format!("{server_base}/Items/{item_id}/Images/Backdrop"))
             } else {
                 None
             };
@@ -560,76 +559,96 @@ fn DetailPane(
     }
 }
 
+/// The older app's Manage, signed in with its own token.
 #[component]
-fn AdminPane(access_token: String, server_base: String, current_user_id: String) -> Element {
+fn LegacyAdminPane(access_token: String, server_base: String, current_user_id: String) -> Element {
+    let token = use_signal(|| access_token);
+    rsx! { AdminPane { access_token: token, server_base, current_user_id } }
+}
+
+#[component]
+pub fn AdminPane(
+    access_token: Signal<String>,
+    server_base: String,
+    current_user_id: String,
+    /// The tab to open on; the first (Users) when not given.
+    #[props(default)]
+    initial_tab: AdminTab,
+    /// A show's series id the Show identity tab opens its "This show" card on.
+    #[props(default)]
+    initial_focus: Option<String>,
+) -> Element {
     let reload = use_signal(|| 0u32);
     let status = use_signal::<Option<String>>(|| None);
-    let active_tab = use_signal::<AdminTab>(AdminTab::default);
+    let active_tab = use_signal::<AdminTab>(move || initial_tab);
     let users_resource = {
         let base = server_base.clone();
-        let token = access_token.clone();
+        let token = access_token;
         let reload_signal = reload;
         use_resource(move || {
             let _bust = reload_signal.read();
             let base = base.clone();
-            let token = token.clone();
+            let token = token.peek().clone();
             async move { fetch_admin_users(&base, &token).await }
         })
     };
     let libraries_resource = {
         let base = server_base.clone();
-        let token = access_token.clone();
+        let token = access_token;
         let reload_signal = reload;
         use_resource(move || {
             let _bust = reload_signal.read();
             let base = base.clone();
-            let token = token.clone();
+            let token = token.peek().clone();
             async move { fetch_virtual_folders(&base, &token).await }
         })
     };
+    // Counts this page's successful sound-format saves (see device_deny_saved).
+    let device_save_seq = use_signal::<u64>(|| 0);
     let devices_resource = {
         let base = server_base.clone();
-        let token = access_token.clone();
+        let token = access_token;
         let reload_signal = reload;
         use_resource(move || {
             let _bust = reload_signal.read();
             let base = base.clone();
-            let token = token.clone();
-            async move { fetch_devices(&base, &token).await }
+            let token = token.peek().clone();
+            let started_at = *device_save_seq.peek();
+            async move { (started_at, fetch_devices(&base, &token).await) }
         })
     };
     let activity_resource = {
         let base = server_base.clone();
-        let token = access_token.clone();
+        let token = access_token;
         let reload_signal = reload;
         use_resource(move || {
             let _bust = reload_signal.read();
             let base = base.clone();
-            let token = token.clone();
+            let token = token.peek().clone();
             async move { fetch_activity_entries(&base, &token).await }
         })
     };
     let scheduled_tasks_resource = {
         let base = server_base.clone();
-        let token = access_token.clone();
+        let token = access_token;
         let reload_signal = reload;
         use_resource(move || {
             let _bust = reload_signal.read();
             let base = base.clone();
-            let token = token.clone();
+            let token = token.peek().clone();
             async move { fetch_scheduled_tasks(&base, &token).await }
         })
     };
     // Grouping walks every film, so it runs only while its tab is open.
     let duplicates_resource = {
         let base = server_base.clone();
-        let token = access_token.clone();
+        let token = access_token;
         let reload_signal = reload;
         use_resource(move || {
             let _bust = reload_signal.read();
             let open = *active_tab.read() == AdminTab::Duplicates;
             let base = base.clone();
-            let token = token.clone();
+            let token = token.peek().clone();
             async move {
                 if open {
                     Some(fetch_duplicate_films(&base, &token).await)
@@ -639,128 +658,558 @@ fn AdminPane(access_token: String, server_base: String, current_user_id: String)
             }
         })
     };
+    // Rows the admin queued from this page, shown as Queued until the server's
+    // own `RecheckPending` arrives with the next load.
+    let integrity_queued = use_signal::<Vec<String>>(Vec::new);
+    let integrity_errors = use_signal::<Vec<(String, String)>>(Vec::new);
+    let deep_queued = use_signal::<Vec<String>>(Vec::new);
+    let deep_errors = use_signal::<Vec<(String, String)>>(Vec::new);
+    // Bumped by the poll below to re-load the tab while a deep check is in progress.
+    let integrity_tick = use_signal(|| 0u32);
+    // Identifies the one pending poll timer; every load supersedes the last,
+    // so reloads and clicks never stack timer chains.
+    let integrity_poll_gen = use_signal(|| 0u32);
+    let deep_search = use_signal(DeepSearchState::default);
+    // Identifies the newest keystroke so an older search never lands.
+    let deep_search_gen = use_signal(|| 0u32);
+    let metadata_search = use_signal(DeepSearchState::default);
+    let metadata_search_gen = use_signal(|| 0u32);
+    let metadata = use_signal(MetadataState::default);
+    // Reads every file's verdict, so it runs only while its tab is open.
+    let integrity_resource = {
+        let base = server_base.clone();
+        let token = access_token;
+        let reload_signal = reload;
+        let mut queued_signal = integrity_queued;
+        let mut deep_queued_signal = deep_queued;
+        let mut tick_signal = integrity_tick;
+        let mut poll_gen_signal = integrity_poll_gen;
+        use_resource(move || {
+            let _bust = reload_signal.read();
+            let _tick = tick_signal.read();
+            let open = *active_tab.read() == AdminTab::Integrity;
+            let base = base.clone();
+            let token = token.peek().clone();
+            async move {
+                let generation = poll_gen_signal.peek().wrapping_add(1);
+                poll_gen_signal.set(generation);
+                if open {
+                    let report = fetch_integrity_report(&base, &token).await;
+                    // The server now says which rows are pending; holding the
+                    // local mark past this would keep a finished row Queued.
+                    if report.is_ok() {
+                        queued_signal.set(Vec::new());
+                        deep_queued_signal.set(Vec::new());
+                    }
+                    // Closing the tab re-runs this resource with `open` false,
+                    // which supersedes the timer; so does nothing being in progress.
+                    if crate::views::admin::deep_poll_wanted(&report) {
+                        spawn(async move {
+                            sleep_ms(DEEP_CHECK_POLL_MS).await;
+                            if crate::views::admin::generation_current(
+                                generation,
+                                *poll_gen_signal.peek(),
+                            ) {
+                                let n = *tick_signal.peek();
+                                tick_signal.set(n.wrapping_add(1));
+                            }
+                        });
+                    }
+                    Some(report)
+                } else {
+                    None
+                }
+            }
+        })
+    };
+    let focus = use_signal(move || initial_focus.clone());
+    // The focused show's record; read again after every fix.
+    let focus_resource = {
+        let base = server_base.clone();
+        let token = access_token;
+        let reload_signal = reload;
+        use_resource(move || {
+            let _bust = reload_signal.read();
+            let open = *active_tab.read() == AdminTab::ShowIdentity;
+            let wanted = focus.read().clone();
+            let base = base.clone();
+            let token = token.peek().clone();
+            async move {
+                match wanted.filter(|_| open) {
+                    Some(id) => Some(fetch_show_identity(&base, &token, &id).await),
+                    None => None,
+                }
+            }
+        })
+    };
+    let identity_search = use_signal(IdentitySearchState::default);
+    let identity_prompt = use_signal::<Option<PickPrompt>>(|| None);
+    // Plans every folder on the server, so it runs only while its tab is open.
+    let identity_resource = {
+        let base = server_base.clone();
+        let token = access_token;
+        let reload_signal = reload;
+        use_resource(move || {
+            let _bust = reload_signal.read();
+            let open = *active_tab.read() == AdminTab::ShowIdentity;
+            let base = base.clone();
+            let token = token.peek().clone();
+            async move {
+                if open {
+                    Some(fetch_series_identity(&base, &token).await)
+                } else {
+                    None
+                }
+            }
+        })
+    };
     let plugins_resource = {
         let base = server_base.clone();
-        let token = access_token.clone();
+        let token = access_token;
         let reload_signal = reload;
         use_resource(move || {
             let _bust = reload_signal.read();
             let base = base.clone();
-            let token = token.clone();
+            let token = token.peek().clone();
             async move { fetch_plugins(&base, &token).await }
         })
     };
     let logs_resource = {
         let base = server_base.clone();
-        let token = access_token.clone();
+        let token = access_token;
         let reload_signal = reload;
         use_resource(move || {
             let _bust = reload_signal.read();
             let base = base.clone();
-            let token = token.clone();
+            let token = token.peek().clone();
             async move { fetch_logs(&base, &token).await }
         })
     };
     let api_keys_resource = {
         let base = server_base.clone();
-        let token = access_token.clone();
+        let token = access_token;
         let reload_signal = reload;
         use_resource(move || {
             let _bust = reload_signal.read();
             let base = base.clone();
-            let token = token.clone();
+            let token = token.peek().clone();
             async move { fetch_api_keys(&base, &token).await }
         })
     };
     let branding_resource = {
         let base = server_base.clone();
-        let token = access_token.clone();
+        let token = access_token;
         let reload_signal = reload;
         use_resource(move || {
             let _bust = reload_signal.read();
             let base = base.clone();
-            let token = token.clone();
+            let token = token.peek().clone();
             async move { fetch_branding(&base, &token).await }
         })
     };
     let new_api_key_secret = use_signal::<Option<String>>(|| None);
+    // Sound-format lists saved since the last device load, and the devices
+    // whose save is in flight: one save per device at a time, each built on
+    // the last, so two quick toggles cannot overwrite each other. Saves for
+    // different devices run side by side. Each saved list carries the save's
+    // sequence number; a device load records the number it started at, and a
+    // saved list stops applying once a load that started after it lands, so a
+    // change made elsewhere since is not overwritten by a stale list.
+    let device_deny_saved =
+        use_signal::<std::collections::HashMap<String, (u64, Vec<String>)>>(Default::default);
+    let device_saving = use_signal::<std::collections::BTreeSet<String>>(Default::default);
+    // Dismiss hides the open tab's load error too; the next tab, reload or
+    // action shows it again if it is still there.
+    let fetch_err_hidden = use_signal(|| false);
 
     let action_handler = {
-        let access_token = access_token.clone();
         let server_base = server_base.clone();
         let mut reload_signal = reload;
         let mut status_signal = status;
         let mut active_tab_signal = active_tab;
         let mut new_secret_signal = new_api_key_secret;
+        let mut queued_signal = integrity_queued;
+        let mut errors_signal = integrity_errors;
+        let mut deep_queued_signal = deep_queued;
+        let mut deep_errors_signal = deep_errors;
+        let deep_search_signal = deep_search;
+        let deep_search_gen_signal = deep_search_gen;
+        let metadata_search_signal = metadata_search;
+        let metadata_search_gen_signal = metadata_search_gen;
+        let metadata_signal = metadata;
+        let mut fetch_err_hidden_signal = fetch_err_hidden;
+        let mut identity_search_signal = identity_search;
+        let mut identity_prompt_signal = identity_prompt;
+        let mut focus_signal = focus;
+        let mut device_deny_saved_signal = device_deny_saved;
+        let mut device_saving_signal = device_saving;
+        let mut device_save_seq_signal = device_save_seq;
         move |action: AdminAction| {
-            let token = access_token.clone();
+            let token = access_token.peek().clone();
             let base = server_base.clone();
+            if let AdminAction::SetDeviceAudioDeny { device_id, .. } = &action {
+                if !device_saving_signal.write().insert(device_id.clone()) {
+                    return;
+                }
+            }
+            if action == AdminAction::DismissStatus {
+                status_signal.set(None);
+                fetch_err_hidden_signal.set(true);
+                return;
+            }
+            fetch_err_hidden_signal.set(false);
             if let AdminAction::SelectTab(t) = action {
                 active_tab_signal.set(t);
+                status_signal.set(None);
+                return;
+            }
+            if action == AdminAction::IdentityUnfocus {
+                focus_signal.set(None);
+                return;
+            }
+            // Names, not ids, in what the status line says.
+            let name_of = |id: &str| -> String {
+                users_resource
+                    .peek()
+                    .as_ref()
+                    .and_then(|r| r.as_ref().ok())
+                    .and_then(|users| users.iter().find(|u| u.id == id))
+                    .map_or_else(|| id.to_string(), |u| u.name.clone())
+            };
+            let subject = match &action {
+                AdminAction::DeleteUser(id)
+                | AdminAction::SetUserPolicy { user_id: id, .. }
+                | AdminAction::ResetUserPassword { user_id: id, .. } => name_of(id),
+                AdminAction::RevokeApiKey { key_id } => api_keys_resource
+                    .peek()
+                    .as_ref()
+                    .and_then(|r| r.as_ref().ok())
+                    .and_then(|keys| keys.iter().find(|k| k.id == *key_id))
+                    .map_or_else(|| key_id.clone(), |k| k.app_name.clone()),
+                AdminAction::SetDeviceAudioDeny { device_id, .. } => devices_resource
+                    .peek()
+                    .as_ref()
+                    .and_then(|(_, r)| r.as_ref().ok())
+                    .and_then(|devices| devices.iter().find(|d| d.id == *device_id))
+                    .map_or_else(|| device_id.clone(), |d| d.name.clone()),
+                _ => String::new(),
+            };
+            if let AdminAction::DeepSearch { term } = action {
+                debounced_hit_search(
+                    base,
+                    token,
+                    term,
+                    deep_search_signal,
+                    deep_search_gen_signal,
+                );
+                return;
+            }
+            if let AdminAction::MetadataSearch { term } = action {
+                debounced_hit_search(
+                    base,
+                    token,
+                    term,
+                    metadata_search_signal,
+                    metadata_search_gen_signal,
+                );
+                return;
+            }
+            if let AdminAction::MetadataOpen { id } = action {
+                let mut state = metadata_signal;
+                // A save in flight would replace the reopened form when it
+                // answers, losing whatever was typed into it meanwhile.
+                if state.peek().saving {
+                    status_signal.set(Some("Wait for the save to finish.".into()));
+                    return;
+                }
+                state.with_mut(|s| {
+                    s.opening = Some(id.clone());
+                    s.open = None;
+                    s.error = None;
+                    s.refusals.clear();
+                });
+                spawn(async move {
+                    let found = fetch_item_metadata(&base, &token, &id).await;
+                    // A newer pick supersedes this one.
+                    if state.peek().opening.as_deref() != Some(id.as_str()) {
+                        return;
+                    }
+                    state.with_mut(|s| {
+                        s.opening = None;
+                        match found {
+                            Ok(view) => {
+                                s.open = Some(view);
+                                s.rev = s.rev.wrapping_add(1);
+                                s.saving = false;
+                            }
+                            Err(e) => s.error = Some(e),
+                        }
+                    });
+                });
+                return;
+            }
+            if let AdminAction::MetadataSave { id, fields, unlock } = action {
+                let mut state = metadata_signal;
+                let name = state
+                    .peek()
+                    .open
+                    .as_ref()
+                    .map_or_else(|| id.clone(), |m| m.name.clone());
+                state.with_mut(|s| {
+                    s.saving = true;
+                    s.refusals.clear();
+                });
+                spawn(async move {
+                    let result = save_item_metadata(&base, &token, &id, &fields, &unlock).await;
+                    state.with_mut(|s| s.saving = false);
+                    match result {
+                        Ok(view) => {
+                            let saved = view.name.clone();
+                            // The admin may have opened another item meanwhile.
+                            if state.peek().open.as_ref().is_some_and(|m| m.id == id) {
+                                state.with_mut(|s| {
+                                    s.open = Some(view);
+                                    s.rev = s.rev.wrapping_add(1);
+                                    s.refusals.clear();
+                                });
+                            }
+                            status_signal.set(Some(format!("Saved {saved}.")));
+                        }
+                        Err(MetadataSaveError::Refused { field, reason }) => {
+                            if state.peek().open.as_ref().is_some_and(|m| m.id == id) {
+                                state.with_mut(|s| s.refusals = vec![(field, reason)]);
+                            } else {
+                                status_signal
+                                    .set(Some(format!("Couldn't save {name}: {field}: {reason}")));
+                            }
+                        }
+                        Err(e) => {
+                            status_signal.set(Some(format!("Couldn't save {name}: {e}")));
+                        }
+                    }
+                });
                 return;
             }
             spawn(async move {
                 match action {
                     AdminAction::Refresh => {}
                     AdminAction::LibraryRefresh => match library_refresh(&base, &token).await {
-                        Ok(()) => status_signal.set(Some("Library refresh broadcast".into())),
-                        Err(e) => status_signal.set(Some(format!("Refresh failed: {e}"))),
+                        Ok(()) => status_signal.set(Some(
+                            "Scanning every library for new and changed files.".into(),
+                        )),
+                        Err(e) => status_signal.set(Some(format!("Couldn't start the scan: {e}"))),
                     },
+                    AdminAction::ScanLibrary { item_id, name } => {
+                        match library_scan(&base, &token, &item_id).await {
+                            Ok(()) => status_signal
+                                .set(Some(format!("Scanning {name} for new and changed files."))),
+                            Err(e) => status_signal
+                                .set(Some(format!("Couldn't start the scan of {name}: {e}"))),
+                        }
+                    }
                     AdminAction::CreateUser(CreateUserAttempt { name, password }) => {
                         match create_user(&base, &token, &name, &password).await {
-                            Ok(()) => status_signal.set(Some(format!("Created {name}"))),
-                            Err(e) => status_signal.set(Some(format!("Create failed: {e}"))),
+                            Ok(()) => status_signal.set(Some(format!("Added {name}."))),
+                            Err(e) => status_signal.set(Some(format!("Couldn't add {name}: {e}"))),
                         }
                     }
                     AdminAction::DeleteUser(id) => match delete_user(&base, &token, &id).await {
-                        Ok(()) => status_signal.set(Some(format!("Deleted {id}"))),
-                        Err(e) => status_signal.set(Some(format!("Delete failed: {e}"))),
+                        Ok(()) => status_signal.set(Some(format!("Deleted {subject}."))),
+                        Err(e) => {
+                            status_signal.set(Some(format!("Couldn't delete {subject}: {e}")))
+                        }
                     },
                     AdminAction::SetUserPolicy { user_id, is_admin } => {
                         match set_user_policy(&base, &token, &user_id, is_admin).await {
-                            Ok(()) => status_signal.set(Some(format!(
-                                "{user_id} is now {}",
-                                if is_admin { "admin" } else { "non-admin" }
+                            Ok(()) => status_signal.set(Some(if is_admin {
+                                format!("{subject} is now an admin.")
+                            } else {
+                                format!("{subject} is no longer an admin.")
+                            })),
+                            Err(e) => status_signal.set(Some(format!(
+                                "Couldn't change {subject}'s admin rights: {e}"
                             ))),
-                            Err(e) => status_signal.set(Some(format!("Policy update failed: {e}"))),
                         }
                     }
                     AdminAction::ResetUserPassword {
                         user_id,
                         new_password,
                     } => match reset_user_password(&base, &token, &user_id, &new_password).await {
-                        Ok(()) => status_signal.set(Some(format!("Password reset for {user_id}"))),
-                        Err(e) => status_signal.set(Some(format!("Password reset failed: {e}"))),
+                        Ok(()) => {
+                            status_signal.set(Some(format!("Set a new password for {subject}.")))
+                        }
+                        Err(e) => status_signal
+                            .set(Some(format!("Couldn't set {subject}'s password: {e}"))),
                     },
                     AdminAction::CreateApiKey { app_name } => {
                         match create_api_key(&base, &token, &app_name).await {
                             Ok(secret) => {
                                 new_secret_signal.set(Some(secret));
-                                status_signal.set(Some(format!("Issued API key '{app_name}'")));
+                                status_signal.set(Some(format!("Issued a key for {app_name}.")));
                             }
-                            Err(e) => {
-                                status_signal.set(Some(format!("API-key creation failed: {e}")))
-                            }
+                            Err(e) => status_signal.set(Some(format!("Couldn't issue a key: {e}"))),
                         }
                     }
                     AdminAction::RevokeApiKey { key_id } => {
                         match revoke_api_key(&base, &token, &key_id).await {
                             Ok(()) => {
                                 new_secret_signal.set(None);
-                                status_signal.set(Some(format!("Revoked {key_id}")));
+                                status_signal.set(Some(format!("Revoked the key for {subject}.")));
+                            }
+                            Err(e) => status_signal
+                                .set(Some(format!("Couldn't revoke the key for {subject}: {e}"))),
+                        }
+                    }
+                    AdminAction::RecheckDamaged { media_id } => {
+                        errors_signal.write().retain(|(id, _)| *id != media_id);
+                        match recheck_damaged_file(&base, &token, &media_id).await {
+                            Ok(()) => queued_signal.write().push(media_id),
+                            Err(e) => errors_signal.write().push((media_id, e)),
+                        }
+                    }
+                    AdminAction::DeepCheck { media_id } => {
+                        deep_errors_signal.write().retain(|(id, _)| *id != media_id);
+                        match request_deep_check(&base, &token, &media_id).await {
+                            Ok(()) => deep_queued_signal.write().push(media_id),
+                            Err(e) => deep_errors_signal.write().push((media_id, e)),
+                        }
+                    }
+                    AdminAction::SetDeviceAudioDeny { device_id, codecs } => {
+                        match set_device_audio_deny(&base, &token, &device_id, &codecs).await {
+                            Ok(()) => {
+                                let seq = *device_save_seq_signal.peek() + 1;
+                                device_save_seq_signal.set(seq);
+                                device_deny_saved_signal
+                                    .write()
+                                    .insert(device_id.clone(), (seq, codecs));
+                                status_signal
+                                    .set(Some(format!("Saved the sound formats for {subject}.")));
+                            }
+                            Err(e) => status_signal.set(Some(format!(
+                                "Couldn't save the sound formats for {subject}: {e}"
+                            ))),
+                        }
+                        device_saving_signal.write().remove(&device_id);
+                    }
+                    AdminAction::IdentitySearch {
+                        series_key,
+                        name,
+                        year,
+                    } => {
+                        identity_search_signal.set(IdentitySearchState {
+                            series_key: series_key.clone(),
+                            loading: true,
+                            ..IdentitySearchState::default()
+                        });
+                        let found = search_shows(&base, &token, &name, year).await;
+                        identity_search_signal.set(match found {
+                            Ok(hits) => IdentitySearchState {
+                                series_key,
+                                loading: false,
+                                hits,
+                                error: None,
+                            },
+                            Err(e) => IdentitySearchState {
+                                series_key,
+                                loading: false,
+                                hits: Vec::new(),
+                                error: Some(e),
+                            },
+                        });
+                    }
+                    AdminAction::IdentityPick {
+                        series_key,
+                        provider,
+                        id,
+                    } => match pick_show(&base, &token, &series_key, &provider, &id).await {
+                        Ok(done) => {
+                            identity_prompt_signal.set(None);
+                            identity_search_signal.set(IdentitySearchState::default());
+                            status_signal.set(Some(fix_summary(&done)));
+                        }
+                        Err(e) => status_signal.set(Some(format!("Couldn't pick that show: {e}"))),
+                    },
+                    AdminAction::IdentityConfirm { series_key } => {
+                        match confirm_show(&base, &token, &series_key).await {
+                            Ok(done) => status_signal.set(Some(fix_summary(&done))),
+                            Err(e) => {
+                                status_signal.set(Some(format!("Couldn't confirm the match: {e}")))
+                            }
+                        }
+                    }
+                    AdminAction::IdentityMove {
+                        folder,
+                        paths,
+                        target_key,
+                        target_name,
+                        target_year,
+                    } => {
+                        let new_group = target_name.is_some();
+                        let body = crate::client::move_body(
+                            &folder,
+                            &paths,
+                            target_key.as_deref(),
+                            target_name.as_deref(),
+                            target_year,
+                        );
+                        match move_files(&base, &token, body).await {
+                            Ok(done) => {
+                                let mut line = fix_summary(&done);
+                                if new_group {
+                                    // Its episodes wait until a show is picked.
+                                    line = format!("{line} {PICK_PROMPT}.");
+                                    identity_prompt_signal.set(Some(PickPrompt {
+                                        folder,
+                                        year: target_year,
+                                    }));
+                                }
+                                status_signal.set(Some(line));
                             }
                             Err(e) => {
-                                status_signal.set(Some(format!("API-key revoke failed: {e}")))
+                                status_signal.set(Some(format!("Couldn't move the files: {e}")))
                             }
+                        }
+                    }
+                    AdminAction::IdentityKeepTogether { folder } => {
+                        match keep_folder_together(&base, &token, &folder).await {
+                            Ok(done) => {
+                                identity_prompt_signal.set(None);
+                                status_signal.set(Some(fix_summary(&done)));
+                            }
+                            Err(e) => status_signal
+                                .set(Some(format!("Couldn't keep the folder together: {e}"))),
+                        }
+                    }
+                    AdminAction::IdentityRemove { id } => {
+                        match remove_hand_fix(&base, &token, id).await {
+                            Ok(done) => status_signal.set(Some(fix_summary(&done))),
+                            Err(e) => {
+                                status_signal.set(Some(format!("Couldn't remove the fix: {e}")))
+                            }
+                        }
+                    }
+                    AdminAction::IdentityRebuild { ids } => {
+                        match rebuild_episodes(&base, &token, &ids).await {
+                            Ok(done) => status_signal.set(Some(fix_summary(&done))),
+                            Err(e) => status_signal
+                                .set(Some(format!("Couldn't rebuild the episodes: {e}"))),
                         }
                     }
                     AdminAction::SaveBranding(cfg) => {
                         match save_branding(&base, &token, &cfg).await {
-                            Ok(()) => status_signal.set(Some("Branding saved".into())),
-                            Err(e) => status_signal.set(Some(format!("Branding save failed: {e}"))),
+                            Ok(()) => status_signal.set(Some("Saved.".into())),
+                            Err(e) => status_signal.set(Some(format!("Couldn't save: {e}"))),
                         }
                     }
-                    AdminAction::SelectTab(_) => unreachable!("handled above"),
+                    AdminAction::SelectTab(_)
+                    | AdminAction::DeepSearch { .. }
+                    | AdminAction::MetadataSearch { .. }
+                    | AdminAction::MetadataOpen { .. }
+                    | AdminAction::MetadataSave { .. }
+                    | AdminAction::IdentityUnfocus
+                    | AdminAction::DismissStatus => {
+                        unreachable!("handled above")
+                    }
                 }
                 let n = *reload_signal.read();
                 reload_signal.set(n.wrapping_add(1));
@@ -768,18 +1217,86 @@ fn AdminPane(access_token: String, server_base: String, current_user_id: String)
         }
     };
 
-    let value = users_resource.read_unchecked();
-    let (users, fetch_err) = match value.as_ref() {
-        None => (Vec::<AdminUser>::new(), Some("loading…".to_string())),
-        Some(Ok(v)) => (v.clone(), None),
-        Some(Err(e)) => (Vec::new(), Some(e.clone())),
+    // The open tab's listing has not answered yet. Duplicates and Damaged
+    // files say so themselves.
+    let loading = match *active_tab.read() {
+        AdminTab::Users => users_resource.read_unchecked().is_none(),
+        AdminTab::Libraries => libraries_resource.read_unchecked().is_none(),
+        AdminTab::Devices => devices_resource.read_unchecked().is_none(),
+        AdminTab::Activity => activity_resource.read_unchecked().is_none(),
+        AdminTab::ScheduledTasks => scheduled_tasks_resource.read_unchecked().is_none(),
+        AdminTab::Plugins => plugins_resource.read_unchecked().is_none(),
+        AdminTab::Logs => logs_resource.read_unchecked().is_none(),
+        AdminTab::ApiKeys => api_keys_resource.read_unchecked().is_none(),
+        AdminTab::Branding => branding_resource.read_unchecked().is_none(),
+        AdminTab::Duplicates
+        | AdminTab::Integrity
+        | AdminTab::ShowIdentity
+        | AdminTab::Metadata => false,
+    };
+    // A listing that failed says why on the open tab, not as an empty list.
+    let tab_error = match *active_tab.read() {
+        AdminTab::Users => users_resource
+            .read_unchecked()
+            .as_ref()
+            .and_then(|r| r.as_ref().err().cloned()),
+        AdminTab::Libraries => libraries_resource
+            .read_unchecked()
+            .as_ref()
+            .and_then(|r| r.as_ref().err().cloned()),
+        AdminTab::Devices => devices_resource
+            .read_unchecked()
+            .as_ref()
+            .and_then(|(_, r)| r.as_ref().err().cloned()),
+        AdminTab::Activity => activity_resource
+            .read_unchecked()
+            .as_ref()
+            .and_then(|r| r.as_ref().err().cloned()),
+        AdminTab::ScheduledTasks => scheduled_tasks_resource
+            .read_unchecked()
+            .as_ref()
+            .and_then(|r| r.as_ref().err().cloned()),
+        AdminTab::Plugins => plugins_resource
+            .read_unchecked()
+            .as_ref()
+            .and_then(|r| r.as_ref().err().cloned()),
+        AdminTab::Logs => logs_resource
+            .read_unchecked()
+            .as_ref()
+            .and_then(|r| r.as_ref().err().cloned()),
+        AdminTab::ApiKeys => api_keys_resource
+            .read_unchecked()
+            .as_ref()
+            .and_then(|r| r.as_ref().err().cloned()),
+        AdminTab::Branding => branding_resource
+            .read_unchecked()
+            .as_ref()
+            .and_then(|r| r.as_ref().err().cloned()),
+        AdminTab::Duplicates
+        | AdminTab::Integrity
+        | AdminTab::ShowIdentity
+        | AdminTab::Metadata => None,
+    };
+    let fetch_err = tab_error.map(|e| {
+        format!(
+            "Couldn't load {}: {e}",
+            active_tab.read().label().to_lowercase()
+        )
+    });
+    let users: Vec<AdminUser> = match users_resource.read_unchecked().as_ref() {
+        Some(Ok(v)) => v.clone(),
+        _ => Vec::new(),
     };
     let libraries: Vec<LibraryFolder> = match libraries_resource.read_unchecked().as_ref() {
         Some(Ok(v)) => v.clone(),
         _ => Vec::new(),
     };
     let devices: Vec<DeviceEntry> = match devices_resource.read_unchecked().as_ref() {
-        Some(Ok(v)) => v.clone(),
+        Some((started_at, Ok(v))) => crate::views::admin::with_saved_audio_deny(
+            v.clone(),
+            &device_deny_saved.read(),
+            *started_at,
+        ),
         _ => Vec::new(),
     };
     let activity: Vec<ActivityEntry> = match activity_resource.read_unchecked().as_ref() {
@@ -792,6 +1309,26 @@ fn AdminPane(access_token: String, server_base: String, current_user_id: String)
             _ => Vec::new(),
         };
     let duplicates = duplicates_resource.read_unchecked().clone().flatten();
+    let integrity = integrity_resource.read_unchecked().clone().flatten();
+    let series_identity = identity_resource.read_unchecked().clone().flatten();
+    let identity_focus = match (
+        focus.read().is_some(),
+        focus_resource.read_unchecked().as_ref(),
+    ) {
+        (false, _) => IdentityFocus::None,
+        (true, Some(Some(Ok(show)))) => IdentityFocus::Show(show.clone()),
+        (true, Some(Some(Err(e)))) => IdentityFocus::Failed(e.clone()),
+        (true, _) => IdentityFocus::Loading,
+    };
+    let identity_search_now = identity_search.read().clone();
+    let identity_prompt_now = identity_prompt.read().clone();
+    let integrity_queued = integrity_queued.read().clone();
+    let integrity_errors = integrity_errors.read().clone();
+    let deep_queued = deep_queued.read().clone();
+    let deep_errors = deep_errors.read().clone();
+    let deep_search = deep_search.read().clone();
+    let metadata_search = metadata_search.read().clone();
+    let metadata = metadata.read().clone();
     let plugins: Vec<PluginEntry> = match plugins_resource.read_unchecked().as_ref() {
         Some(Ok(v)) => v.clone(),
         _ => Vec::new(),
@@ -808,8 +1345,17 @@ fn AdminPane(access_token: String, server_base: String, current_user_id: String)
         Some(Ok(v)) => v.clone(),
         _ => BrandingConfig::default(),
     };
-    let combined_status = fetch_err.or_else(|| status.read().clone());
+    // What an action just did outranks a load error, so its result always
+    // shows.
+    let combined_status = status
+        .read()
+        .clone()
+        .or_else(|| fetch_err.filter(|_| !*fetch_err_hidden.read()));
     let tab_now = *active_tab.read();
+    // Only the native app follows the server's events; elsewhere no bar shows.
+    let scan = try_use_context::<super::scan_progress::ScanWatch>()
+        .map(|w| w.0.read().clone())
+        .unwrap_or_default();
     let new_secret_now = new_api_key_secret.read().clone();
 
     rsx! {
@@ -819,6 +1365,7 @@ fn AdminPane(access_token: String, server_base: String, current_user_id: String)
             status: combined_status,
             on_action: action_handler,
             active_tab: tab_now,
+            loading: loading,
             libraries: libraries,
             devices: devices,
             activity: activity,
@@ -829,6 +1376,20 @@ fn AdminPane(access_token: String, server_base: String, current_user_id: String)
             new_api_key_secret: new_secret_now,
             branding: branding,
             duplicates: duplicates,
+            integrity: integrity,
+            series_identity: series_identity,
+            identity_focus: identity_focus,
+            identity_search: identity_search_now,
+            identity_prompt: identity_prompt_now,
+            integrity_queued: integrity_queued,
+            integrity_errors: integrity_errors,
+            deep_queued: deep_queued,
+            deep_errors: deep_errors,
+            deep_search: deep_search,
+            device_saving: device_saving.read().clone(),
+            metadata_search: metadata_search,
+            metadata: metadata,
+            scan: scan,
         }
     }
 }
@@ -878,7 +1439,6 @@ fn PlayerPane(
 
     let item_for_url = item_id.clone();
     let server_for_url = server_base.clone();
-    let token_for_url = access_token.clone();
     let access_token_for_progress = access_token.clone();
     let server_base_for_progress = server_base.clone();
     let kind_for_url = kind;
@@ -888,25 +1448,23 @@ fn PlayerPane(
     let needs_override =
         current_bitrate.is_some() || current_audio.is_some() || current_subtitle.is_some();
     let src_override: Option<String> = if needs_override {
-        let mut qs = format!("?api_key={token_for_url}");
+        // No token in the URL: the sign-in cookie authenticates it (B1150).
+        let mut qs = Vec::new();
         if let Some(b) = current_bitrate {
-            qs.push_str(&format!("&MaxStreamingBitrate={b}"));
+            qs.push(format!("MaxStreamingBitrate={b}"));
         }
         if let Some(a) = current_audio {
-            qs.push_str(&format!("&AudioStreamIndex={a}"));
+            qs.push(format!("AudioStreamIndex={a}"));
         }
         if let Some(s) = current_subtitle {
             // i32 lets us encode -1 = off (Jellyfin convention).
-            qs.push_str(&format!("&SubtitleStreamIndex={s}"));
+            qs.push(format!("SubtitleStreamIndex={s}"));
         }
-        Some(match kind_for_url {
-            ItemKind::Audio => {
-                format!("{server_for_url}/Audio/{item_for_url}/universal{qs}")
-            }
-            ItemKind::Movie | ItemKind::Episode => {
-                format!("{server_for_url}/Videos/{item_for_url}/stream{qs}")
-            }
-        })
+        Some(format!(
+            "{}?{}",
+            super::player::default_src(&server_for_url, &item_for_url, kind_for_url),
+            qs.join("&")
+        ))
     } else {
         None
     };
@@ -945,7 +1503,6 @@ fn PlayerPane(
             PlayerView {
                 item_id: item_id,
                 kind: kind,
-                access_token: access_token,
                 server_base: server_base,
                 src_override: src_override,
                 quality_options: quality_options,
@@ -1329,13 +1886,8 @@ fn PrefsPane(
 }
 
 #[component]
-fn LivePlayerPane(
-    channel_id: String,
-    access_token: String,
-    server_base: String,
-    on_back: EventHandler<()>,
-) -> Element {
-    let src = format!("{server_base}/LiveTv/Channels/{channel_id}/Stream?api_key={access_token}");
+fn LivePlayerPane(channel_id: String, server_base: String, on_back: EventHandler<()>) -> Element {
+    let src = format!("{server_base}/LiveTv/Channels/{channel_id}/Stream");
     rsx! {
         div {
             class: "pharos-player-pane pharos-livetv-player",
@@ -1347,7 +1899,6 @@ fn LivePlayerPane(
             PlayerView {
                 item_id: channel_id.clone(),
                 kind: ItemKind::Movie,
-                access_token: access_token,
                 server_base: server_base,
                 src_override: Some(src),
                 on_event: move |_| {},
@@ -1810,6 +2361,18 @@ async fn library_refresh(_base: &str, _token: &str) -> Result<(), String> {
 }
 
 #[cfg(feature = "web")]
+async fn library_scan(base: &str, token: &str, item_id: &str) -> Result<(), String> {
+    crate::client::web::admin_scan_library(base, token, item_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(not(feature = "web"))]
+async fn library_scan(_base: &str, _token: &str, _item_id: &str) -> Result<(), String> {
+    Err("library_scan is only wired in the web build".into())
+}
+
+#[cfg(feature = "web")]
 async fn fetch_item_detail_via_client(
     base: &str,
     token: &str,
@@ -1963,6 +2526,28 @@ async fn create_api_key(_base: &str, _token: &str, _app_name: &str) -> Result<St
 }
 
 #[cfg(feature = "web")]
+async fn set_device_audio_deny(
+    base: &str,
+    token: &str,
+    device_id: &str,
+    codecs: &[String],
+) -> Result<(), String> {
+    crate::client::web::set_device_audio_deny(base, token, device_id, codecs)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(not(feature = "web"))]
+async fn set_device_audio_deny(
+    _base: &str,
+    _token: &str,
+    _device_id: &str,
+    _codecs: &[String],
+) -> Result<(), String> {
+    Err("set_device_audio_deny is only wired in the web build".into())
+}
+
+#[cfg(feature = "web")]
 async fn revoke_api_key(base: &str, token: &str, key_id: &str) -> Result<(), String> {
     crate::client::web::revoke_api_key(base, token, key_id)
         .await
@@ -1972,6 +2557,210 @@ async fn revoke_api_key(base: &str, token: &str, key_id: &str) -> Result<(), Str
 #[cfg(not(feature = "web"))]
 async fn revoke_api_key(_base: &str, _token: &str, _key_id: &str) -> Result<(), String> {
     Err("revoke_api_key is only wired in the web build".into())
+}
+
+#[cfg(feature = "web")]
+async fn fetch_integrity_report(base: &str, token: &str) -> Result<IntegrityReport, String> {
+    use crate::client::{web, ClientError};
+    let describe = |e: ClientError| match e {
+        ClientError::Status(503) => {
+            "The integrity check isn't available on this server".to_string()
+        }
+        other => other.to_string(),
+    };
+    let ((status, files), deep_checks) = futures_util::future::join(
+        futures_util::future::join(
+            web::integrity_status(base, token),
+            web::list_damaged_files(base, token),
+        ),
+        web::list_deep_checks(base, token),
+    )
+    .await;
+    let status = status.map_err(describe)?;
+    let files = files.map_err(describe)?;
+    let deep_checks = deep_checks.map_err(|e| e.to_string());
+    Ok(IntegrityReport {
+        status,
+        files,
+        deep_checks,
+    })
+}
+
+#[cfg(not(feature = "web"))]
+async fn fetch_integrity_report(_base: &str, _token: &str) -> Result<IntegrityReport, String> {
+    Err("integrity_status is only wired in the web build".into())
+}
+
+#[cfg(feature = "web")]
+async fn fetch_series_identity(base: &str, token: &str) -> Result<SeriesIdentity, String> {
+    crate::client::web::series_identity(base, token)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(not(feature = "web"))]
+async fn fetch_series_identity(_base: &str, _token: &str) -> Result<SeriesIdentity, String> {
+    Err("series_identity is only wired in the web build".into())
+}
+
+#[cfg(feature = "web")]
+async fn fetch_show_identity(
+    base: &str,
+    token: &str,
+    series_id: &str,
+) -> Result<ShowDetail, String> {
+    crate::client::web::show_identity(base, token, series_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(not(feature = "web"))]
+async fn fetch_show_identity(
+    _base: &str,
+    _token: &str,
+    _series_id: &str,
+) -> Result<ShowDetail, String> {
+    Err("show_identity is only wired in the web build".into())
+}
+
+#[cfg(feature = "web")]
+async fn rebuild_episodes(base: &str, token: &str, ids: &[u64]) -> Result<FixDone, String> {
+    crate::client::web::rebuild_episodes(base, token, ids)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(not(feature = "web"))]
+async fn rebuild_episodes(_base: &str, _token: &str, _ids: &[u64]) -> Result<FixDone, String> {
+    Err("rebuild_episodes is only wired in the web build".into())
+}
+
+#[cfg(feature = "web")]
+async fn search_shows(
+    base: &str,
+    token: &str,
+    name: &str,
+    year: Option<u32>,
+) -> Result<Vec<ShowCandidate>, String> {
+    crate::client::web::search_shows(base, token, name, year)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(not(feature = "web"))]
+async fn search_shows(
+    _base: &str,
+    _token: &str,
+    _name: &str,
+    _year: Option<u32>,
+) -> Result<Vec<ShowCandidate>, String> {
+    Err("search_shows is only wired in the web build".into())
+}
+
+#[cfg(feature = "web")]
+async fn pick_show(
+    base: &str,
+    token: &str,
+    series_key: &str,
+    provider: &str,
+    id: &str,
+) -> Result<FixDone, String> {
+    crate::client::web::pick_show(base, token, series_key, provider, id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(not(feature = "web"))]
+async fn pick_show(
+    _base: &str,
+    _token: &str,
+    _series_key: &str,
+    _provider: &str,
+    _id: &str,
+) -> Result<FixDone, String> {
+    Err("pick_show is only wired in the web build".into())
+}
+
+#[cfg(feature = "web")]
+async fn confirm_show(base: &str, token: &str, series_key: &str) -> Result<FixDone, String> {
+    crate::client::web::confirm_show(base, token, series_key)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(not(feature = "web"))]
+async fn confirm_show(_base: &str, _token: &str, _series_key: &str) -> Result<FixDone, String> {
+    Err("confirm_show is only wired in the web build".into())
+}
+
+#[cfg(feature = "web")]
+async fn move_files(base: &str, token: &str, body: String) -> Result<FixDone, String> {
+    crate::client::web::move_files(base, token, body)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(not(feature = "web"))]
+async fn move_files(_base: &str, _token: &str, _body: String) -> Result<FixDone, String> {
+    Err("move_files is only wired in the web build".into())
+}
+
+#[cfg(feature = "web")]
+async fn keep_folder_together(base: &str, token: &str, folder: &str) -> Result<FixDone, String> {
+    crate::client::web::keep_folder_together(base, token, folder)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(not(feature = "web"))]
+async fn keep_folder_together(_base: &str, _token: &str, _folder: &str) -> Result<FixDone, String> {
+    Err("keep_folder_together is only wired in the web build".into())
+}
+
+#[cfg(feature = "web")]
+async fn remove_hand_fix(base: &str, token: &str, id: i64) -> Result<FixDone, String> {
+    crate::client::web::remove_hand_fix(base, token, id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(not(feature = "web"))]
+async fn remove_hand_fix(_base: &str, _token: &str, _id: i64) -> Result<FixDone, String> {
+    Err("remove_hand_fix is only wired in the web build".into())
+}
+
+#[cfg(feature = "web")]
+async fn recheck_damaged_file(base: &str, token: &str, media_id: &str) -> Result<(), String> {
+    crate::client::web::recheck_damaged_file(base, token, media_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(not(feature = "web"))]
+async fn recheck_damaged_file(_base: &str, _token: &str, _media_id: &str) -> Result<(), String> {
+    Err("recheck_damaged_file is only wired in the web build".into())
+}
+
+/// How often the Damaged files tab re-loads while a deep check is in progress.
+const DEEP_CHECK_POLL_MS: u32 = 5_000;
+
+/// Wait for typing to pause before searching for a file to deep check.
+const DEEP_SEARCH_DEBOUNCE_MS: u32 = 350;
+
+#[cfg(feature = "web")]
+async fn request_deep_check(base: &str, token: &str, media_id: &str) -> Result<(), String> {
+    crate::client::web::request_deep_check(base, token, media_id)
+        .await
+        .map_err(|e| match e {
+            // The server's refusal is already a plain reason; drop the "http:" prefix.
+            crate::client::ClientError::Http(reason) => reason,
+            other => other.to_string(),
+        })
+}
+
+#[cfg(not(feature = "web"))]
+async fn request_deep_check(_base: &str, _token: &str, _media_id: &str) -> Result<(), String> {
+    Err("request_deep_check is only wired in the web build".into())
 }
 
 #[cfg(feature = "web")]
@@ -2307,6 +3096,90 @@ async fn fetch_live_programs(
     _hours: u32,
 ) -> Result<Vec<LiveProgram>, String> {
     Err("live_programs is only wired in the web build".into())
+}
+
+#[cfg(feature = "web")]
+async fn fetch_item_metadata(base: &str, token: &str, id: &str) -> Result<ItemMetadata, String> {
+    crate::client::web::fetch_item_metadata(base, token, id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(not(feature = "web"))]
+async fn fetch_item_metadata(_base: &str, _token: &str, _id: &str) -> Result<ItemMetadata, String> {
+    Err("fetch_item_metadata is only wired in the web build".into())
+}
+
+#[cfg(feature = "web")]
+async fn save_item_metadata(
+    base: &str,
+    token: &str,
+    id: &str,
+    fields: &[(String, serde_json::Value)],
+    unlock: &[String],
+) -> Result<ItemMetadata, MetadataSaveError> {
+    crate::client::web::save_item_metadata(base, token, id, fields, unlock).await
+}
+
+#[cfg(not(feature = "web"))]
+async fn save_item_metadata(
+    _base: &str,
+    _token: &str,
+    _id: &str,
+    _fields: &[(String, serde_json::Value)],
+    _unlock: &[String],
+) -> Result<ItemMetadata, MetadataSaveError> {
+    Err(MetadataSaveError::Failed(
+        "save_item_metadata is only wired in the web build".into(),
+    ))
+}
+
+/// Runs a title search after the typing pauses, writing the hits into
+/// `search`. `generation` identifies the newest keystroke so an older search
+/// never lands over a newer one.
+fn debounced_hit_search(
+    base: String,
+    token: String,
+    term: String,
+    mut search: Signal<DeepSearchState>,
+    mut generation_signal: Signal<u32>,
+) {
+    let generation = generation_signal.peek().wrapping_add(1);
+    generation_signal.set(generation);
+    let current = search.peek().clone();
+    if term.trim().is_empty() {
+        search.set(DeepSearchState::default());
+        return;
+    }
+    search.set(DeepSearchState {
+        query: term.clone(),
+        loading: true,
+        ..current
+    });
+    spawn(async move {
+        sleep_ms(DEEP_SEARCH_DEBOUNCE_MS).await;
+        if !crate::views::admin::generation_current(generation, *generation_signal.peek()) {
+            return;
+        }
+        let found = fetch_search_hints(&base, &token, &term).await;
+        if !crate::views::admin::generation_current(generation, *generation_signal.peek()) {
+            return;
+        }
+        search.set(match found {
+            Ok(hits) => DeepSearchState {
+                query: term,
+                hits,
+                loading: false,
+                error: None,
+            },
+            Err(e) => DeepSearchState {
+                query: term,
+                hits: Vec::new(),
+                loading: false,
+                error: Some(e),
+            },
+        });
+    });
 }
 
 #[cfg(feature = "web")]

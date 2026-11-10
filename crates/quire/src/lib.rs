@@ -21,6 +21,7 @@
 mod archive;
 mod css;
 mod epub;
+mod fixed;
 mod locator;
 mod path;
 mod section;
@@ -29,7 +30,8 @@ mod xml;
 pub use archive::{Archive, ArchiveError, ZipArchive, MAX_ENTRY_BYTES};
 pub use css::Css;
 pub use epub::{Metadata, OpenError, SpineItem, TocEntry};
-pub use locator::{char_index, utf16_offset, Locator, ParseLocatorError};
+pub use fixed::{page_progress, FixedLayout, FixedLayoutError, PageSize, Raster};
+pub use locator::{char_index, utf16_offset, Locator, PageLocator, ParseLocatorError};
 pub use section::{Attr, Content, El, Namespace, ParseTargetError, Section, Target, Value};
 
 use epub::ManifestItem;

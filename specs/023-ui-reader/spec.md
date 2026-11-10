@@ -2,7 +2,7 @@
 
 **Feature directory**: `specs/023-ui-reader/`
 **Created**: 2026-11-04T00:55:00Z
-**Status**: draft
+**Status**: slices 1 and 3 merged; 2 and 4 in progress (2026-11-09); slice 5 (PDF) built 2026-11-10
 **Input**: "We cannot currently read any of the books, if possible please again
 make it so we have something in Rust + WASM for doing that" and "Make sure that
 is its own re-usable crate as that is a nice thing that I might want to use
@@ -125,9 +125,17 @@ never a blank page.
 
 ### US5: read a PDF (P2)
 
-A PDF opens in the same reader with fixed pages: page turns, zoom, fit width
-or page, the page number as the position. Engine choice is ADR-0047's open
-question and is decided by a spike before slice 2.
+A PDF opens in the same reader with fixed pages: page turns, fit page or fit
+width, the page number as the position. The engine is `hayro`, rendered in the
+browser from a separate module that is fetched only when a PDF is opened
+(ADR-0047, decided 2026-11-10). PDFs get Read and Continue reading on the
+title page like EPUBs, and the 64 MiB weak-device cap applies.
+
+**Acceptance.** Opening a PDF shows page 1 on a canvas; arrow keys, the outer
+thirds of the page and swipes turn pages; Fit width fills the window's width
+and scrolls; the position is saved as `pdf1:<page>` and a second browser opens
+on the same page. A page that cannot be drawn says so and offers the
+download.
 
 ### US6: read a comic (P3)
 
@@ -137,9 +145,9 @@ publications so it needs no redesign.
 
 ## Requirements
 
-- **FR-001** `quire` and `quire-web` depend on no `pharos-*` crate and on
+- **FR-001** `quire`, `quire-web` and `quire-pdf` depend on no `pharos-*` crate and on
   `workspace-hack` neither (hakari `final-excludes`), each has its own README
-  and licence, and both build for `wasm32-unknown-unknown` and for the host.
+  and licence, and all build for `wasm32-unknown-unknown` and for the host.
   (V350)
 - **FR-002** Every outside library the crates use (zip, XML, HTML sanitising,
   a PDF engine) sits behind a trait in the crate, with the concrete library in
@@ -217,8 +225,8 @@ publications so it needs no redesign.
 
 ## Invariants reserved
 
-- **V350** `quire*` crates have no pharos dependency and build for wasm32 and
-  the host.
+- **V350** `quire*` crates (including `quire-pdf`) have no pharos dependency
+  and build for wasm32 and the host.
 - **V351** No script, event handler or remote fetch from book content runs or
   is requested.
 - **V352** A locator round-trips: saved at one size and font, restored at
@@ -228,7 +236,15 @@ publications so it needs no redesign.
   untouched, and the reverse.
 - **V355** `setReadPosition` stores nothing for a non-book, an unreadable
   book, an oversized locator or an out-of-range fraction.
+- **V356** The PDF engine is not linked into the main UI wasm, and no request
+  for it is made until a PDF is opened (Playwright network check).
+- **V357** A PDF page's backing store is at most 2x the pixel ratio and 4096
+  px on a side, and at most two page canvases exist (`reader.rs` rule tests).
+- **V358** A `pdf1:<page>` locator round-trips, has one spelling per page, and
+  a saved page past the end of a shorter file opens on its last page (`quire`
+  and `reader.rs` tests).
 
 ## Bugs reserved
 
 - **B410** Books cannot be read in pharos-ui (this feature).
+- **B411** PDFs cannot be read in pharos-ui (US5, slice 5).

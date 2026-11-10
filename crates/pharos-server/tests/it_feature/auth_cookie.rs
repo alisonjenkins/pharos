@@ -108,12 +108,11 @@ async fn the_cookie_reaches_only_reads_of_item_bytes() {
     );
 }
 
-/// Subtitle and font URLs in PlaybackInfo carry the caller's token, so a
-/// `<track>` or SubtitlesOctopus fetch from any client authenticates.
-/// Disarm check: with the `api_key` append in `playback_info` skipped, the
-/// subtitle URL lacks the token.
+/// Subtitle and font URLs in PlaybackInfo carry the play session and not the
+/// caller's token (V1050), so a `<track>` or SubtitlesOctopus fetch from any
+/// client authenticates on the URL alone and a leaked URL opens one item.
 #[actix_web::test]
-async fn playback_info_delivery_urls_carry_the_callers_token() {
+async fn playback_info_delivery_urls_carry_the_play_session() {
     use pharos_core::{MediaAttachment, MediaItem, MediaKind, MediaProbe, MediaStore as _};
     let f = seed_rich().await;
     let dir = tempfile::tempdir().unwrap();
@@ -161,15 +160,27 @@ async fn playback_info_delivery_urls_carry_the_callers_token() {
         .filter_map(|s| s["DeliveryUrl"].as_str())
         .collect();
     assert!(urls.len() >= 2, "{body}");
-    let want = format!("api_key={}", f.admin_token);
+    let want = format!("PlaySessionId={}", body["PlaySessionId"].as_str().unwrap());
     for url in &urls {
-        assert!(url.contains(&want), "{url} lacks the token");
+        assert!(url.contains(&want), "{url} lacks the play session");
+        assert!(
+            !url.contains(f.admin_token.as_str()),
+            "{url} carries the token (V1050)"
+        );
     }
 
     // The same file by cookie alone, as a <track> fetches it: served, and
     // never `public`, or a shared cache would replay it to an anonymous
     // request for the same token-free URL. Disarm check: with subtitles.rs
     // back on `public, max-age=3600` this fails.
+    let full = urls.iter().find(|u| u.contains("/Subtitles/")).unwrap();
+    let resp = test::call_service(&app, test::TestRequest::get().uri(full).to_request()).await;
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "{full} by its play session alone"
+    );
+
     let path = urls
         .iter()
         .find(|u| u.contains("/Subtitles/"))

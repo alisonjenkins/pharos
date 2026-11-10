@@ -646,8 +646,9 @@ fn styled_only() -> actix_web::Error {
 
 /// Serve the generated Pharos styled track (spec 028 FR-017): the item's
 /// stored effect plan compiled over its source subtitle for `?tier=` (default
-/// `tv`) and `?effects=` (default `subtle`). Cached per tier, level, compiler
-/// and director version and the plan's `styled_at` stamp, so a restyle or a
+/// `tv`), `?effects=` (default `subtle`) and `?size=` (the viewer's subtitle
+/// size in percent, default 100). Cached per tier, level, size, compiler and
+/// director version and the plan's `styled_at` stamp, so a restyle or a
 /// version bump never serves an old script.
 async fn deliver_styled_ass(
     state: &AppState,
@@ -667,6 +668,14 @@ async fn deliver_styled_ass(
             EffectsLevel::parse(v).ok_or_else(|| error::ErrorBadRequest("unknown effects level"))?
         }
     };
+    let size_percent = match query_param(query, "size") {
+        None => 100,
+        Some(v) => v
+            .parse::<u16>()
+            .ok()
+            .filter(|p| STYLED_SIZE_PERCENTS.contains(p))
+            .ok_or_else(|| error::ErrorBadRequest("unknown subtitle size"))?,
+    };
     let Some(row) = crate::styled_track::current(&state.stores, item).await else {
         return Err(error::ErrorNotFound("no styled track for this item"));
     };
@@ -683,6 +692,7 @@ async fn deliver_styled_ass(
         compiler_version: pharos_styling::COMPILER_VERSION,
         director_version: row.director_version,
         plan_stamp: row.styled_at,
+        size_percent,
     };
     let mtime = mtime_secs(&item.path).await;
     let cache = state.subtitles.as_ref();
@@ -697,7 +707,7 @@ async fn deliver_styled_ass(
             return Ok(styled_response(tier, (*bytes).clone()));
         }
     }
-    let script = match styled_script(state, item, &row, tier, level).await {
+    let script = match styled_script(state, item, &row, tier, level, size_percent).await {
         Ok(script) => script,
         Err(e) => {
             tracing::error!(
@@ -705,6 +715,7 @@ async fn deliver_styled_ass(
                 source_index = row.source_index,
                 tier = tier.label(),
                 effects = level.label(),
+                size_percent,
                 error = %e,
                 "styled subtitle could not be compiled"
             );
@@ -720,6 +731,11 @@ async fn deliver_styled_ass(
     };
     Ok(styled_response(tier, bytes))
 }
+
+/// The `?size=` values `stream.ass` compiles the styled track at: the
+/// players' subtitle sizes (Small to Extra large), so the cache holds at most
+/// four scripts per tier and level.
+const STYLED_SIZE_PERCENTS: [u16; 4] = [75, 100, 125, 150];
 
 fn styled_response(tier: pharos_styling::Tier, body: Vec<u8>) -> HttpResponse {
     HttpResponse::Ok()
@@ -740,6 +756,7 @@ async fn styled_script(
     row: &pharos_core::SubtitleStyling,
     tier: pharos_styling::Tier,
     level: pharos_styling::EffectsLevel,
+    size_percent: u16,
 ) -> Result<Vec<u8>, String> {
     let sidecar_base = sidecar_base_index(&item.probe);
     let embedded_codec = (row.source_index < sidecar_base)
@@ -766,7 +783,7 @@ async fn styled_script(
         let source = pharos_styling::source::read(&text).map_err(|e| format!("source: {e}"))?;
         let plan = serde_json::from_str::<pharos_styling::EffectPlan>(&plan_json)
             .map_err(|e| format!("plan: {e}"))?;
-        let theme = pharos_styling::theme::Theme::pharos();
+        let theme = pharos_styling::theme::Theme::pharos().scaled(size_percent);
         Ok(pharos_styling::compile(&plan, &source.lines, &theme, tier, level).into_bytes())
     })
     .await
@@ -866,7 +883,7 @@ pub(crate) async fn pre_extract_subtitles(
 
     // Collect the text tracks still needing extraction — skip image subs and
     // anything already cached — so the whole item demuxes in ONE source open
-    // (V36) rather than a whole-file NFS read PER track. B72 / Supergirl-S01E03:
+    // (V36) rather than a whole-file NFS read PER track. B72 / Show AI-S01E03:
     // ~10 text tracks × ~500s cold demux each, serialized, saturating NFS and
     // starving live playback. Batching collapses that to a single open pass.
     let mut pending: Vec<PendingTrack> = Vec::new();
@@ -880,7 +897,7 @@ pub(crate) async fn pre_extract_subtitles(
             // here in EVERY warm pass, so the library-wide warm-all scanned
             // every image-sub title on each boot (thousands of whole-file NFS
             // demuxes), saturating the libav pool and freezing live playback
-            // (Supergirl, 2026-07-14). Never scan from the warm path.
+            // (Show AI, 2026-07-14). Never scan from the warm path.
             continue;
         }
         let is_ass = matches!(

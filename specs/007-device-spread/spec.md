@@ -1,7 +1,10 @@
 # 007-device-spread — use every encoder the machine actually has
 
-**Status**: designed 2026-08-01; **phase A implemented 2026-08-01, pending
-deploy**; **phase B built, measured and dropped** (see its section).
+**Status**: designed 2026-08-01; **phase A implemented and merged 2026-08-01**
+(ea5cb261, 09ff5268, 60ea7c2e; `rate_store.rs`, `pharos_transcode_device_weight`
+and `_rendition_pin_total` on main); no post-deploy query result is recorded
+(plan Task 6 step 6 open); **phase B built, measured and dropped**, nothing
+pending from it (audited 2026-11-09).
 **Depends on**: 006 (the queue, the learned per-device allowance, `urgency_key`,
 and **V126**), spec 003 R8 / V80 / #114 (the shared-init one-encoder rule)
 

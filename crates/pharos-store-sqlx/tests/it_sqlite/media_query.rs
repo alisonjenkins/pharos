@@ -44,11 +44,13 @@ fn synth_item(id: u64) -> MediaItem {
             episode_number: Some((id % 20) as u32 + 1),
             series_folder: Some(format!("/tv/show-{}", id % 10)),
             series_year: Some(2000 + (id % 25) as u32),
+            series_key: None,
         })
     } else {
         None
     };
     MediaItem {
+        locked: Default::default(),
         id,
         path: format!("/media/root-{}/file-{id:06}.mkv", id % 3).into(),
         // Title intentionally NOT id-sorted: zero-padded reversed-ish so
@@ -209,11 +211,11 @@ async fn search_term_substring_case_insensitive() {
     s.put(synth_item(1)).await.unwrap(); // "Title 99998"
     s.put(synth_item(2)).await.unwrap(); // "Title 99997"
     let mut weird = synth_item(3);
-    weird.title = "The Matrix Reloaded".into();
+    weird.title = "The Glass Lattice Reloaded".into();
     s.put(weird).await.unwrap();
 
     let q = MediaQuery {
-        search_term: Some("matrix".into()),
+        search_term: Some("lattice".into()),
         ..Default::default()
     };
     let (hits, total) = s.query(&q).await.unwrap();
@@ -275,7 +277,7 @@ async fn parent_genre_studio_person_tag_collection() {
 
     // People (link table carries role/kind; pivot is by person wire_id).
     let person = PersonRef {
-        name: "Keanu Reeves".into(),
+        name: "Actor Q".into(),
         kind: PersonKind::Actor,
         ..Default::default()
     };
@@ -287,7 +289,7 @@ async fn parent_genre_studio_person_tag_collection() {
         .unwrap();
     let qp = MediaQuery {
         parent: Some(ParentFilter::Person {
-            wire_id: person_wire_id("Keanu Reeves"),
+            wire_id: person_wire_id("Actor Q"),
         }),
         ..Default::default()
     };
@@ -838,6 +840,7 @@ async fn seed_residual(s: &SqliteStore) {
             episode_number: Some(ep),
             series_folder: Some("/tv/Show".into()),
             series_year: Some(2020),
+            series_key: None,
         });
         e.path = format!("/tv/Show/Season 1/e{ep}.mkv").into();
         s.put(e).await.unwrap();

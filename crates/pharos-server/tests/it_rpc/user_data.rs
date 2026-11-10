@@ -265,6 +265,11 @@ async fn a_season_or_series_marks_every_episode_in_it() {
 
 /// Whether `Library.detail` says `id` is watched.
 async fn detail_played(session: &session::Client, id: WireId) -> bool {
+    detail_marks(session, id).await.0
+}
+
+/// What `Library.detail` says of `id`: (watched, favourite).
+async fn detail_marks(session: &session::Client, id: WireId) -> (bool, bool) {
     use pharos_api::pharos_capnp::detail_result;
     let library = session.library_request().send().pipeline.get_library();
     let mut req = library.detail_request();
@@ -277,10 +282,100 @@ async fn detail_played(session: &session::Client, id: WireId) -> bool {
     match reply.get().unwrap().get_result().unwrap().which().unwrap() {
         detail_result::Detail(d) => {
             let summary = d.unwrap().get_summary().unwrap();
-            summary.has_user_state() && summary.get_user_state().unwrap().get_played()
+            if !summary.has_user_state() {
+                return (false, false);
+            }
+            let state = summary.get_user_state().unwrap();
+            (state.get_played(), state.get_favorite())
         }
         detail_result::Error(_) => panic!("detail {id}"),
     }
+}
+
+/// B1080: a show or season marked a favourite says so on its detail, while
+/// every episode in it is one; un-marking one episode takes the mark off.
+/// Disarm check: with `synth_marks` leaving `favorite` false, the show's
+/// detail says it is no favourite right after it was marked.
+#[actix_web::test]
+async fn a_series_marked_favourite_says_so_on_its_detail() {
+    use pharos_jellyfin_api::dto::{season_id_for_key, series_id_for_key};
+    let (server, fx) = crate::revocation::start().await;
+    let (client, _closed) = crate::revocation::connect(&server).await;
+    let session = crate::revocation::signed_in(&client, &fx.user_token).await;
+    crate::library::seed_tv_library(&fx).await;
+
+    let show = WireId::parse(&series_id_for_key(Some("/libTV/Show"), "Show")).unwrap();
+    let season = WireId::parse(&season_id_for_key(Some("/libTV/Show"), "Show", 1)).unwrap();
+    assert_eq!(detail_marks(&session, show).await, (false, false));
+    assert_eq!(
+        wire_set(&session, show, Set::Favorite(true)).await,
+        Ok((false, true, 0, 0))
+    );
+    assert_eq!(detail_marks(&session, show).await, (false, true));
+    assert_eq!(detail_marks(&session, season).await, (false, true));
+
+    assert!(wire_set(&session, WireId::Real(603), Set::Favorite(false))
+        .await
+        .is_ok());
+    assert_eq!(
+        detail_marks(&session, show).await,
+        (false, false),
+        "season 2's episode is no longer a favourite"
+    );
+    assert_eq!(detail_marks(&session, season).await, (false, true));
+}
+
+/// B1085: marking an album or an artist a favourite marks every track under
+/// it, and its detail says it is one while every track is; un-marking one
+/// track takes the mark off the album and artist it is in.
+/// Disarm check: with `music_folder_items` finding no tracks, marking the
+/// album is refused as not found.
+#[actix_web::test]
+async fn an_album_or_artist_marked_favourite_marks_its_tracks() {
+    use pharos_jellyfin_api::dto::{album_id_for, artist_id_for};
+    let (server, fx) = crate::revocation::start().await;
+    let (client, _closed) = crate::revocation::connect(&server).await;
+    let session = crate::revocation::signed_in(&client, &fx.user_token).await;
+    crate::library::seed_music_libraries(&fx).await;
+    let favourite = |id: u64| {
+        let fx = &fx;
+        async move {
+            fx.state
+                .stores
+                .get_user_data(fx.user_id, id)
+                .await
+                .unwrap()
+                .is_favorite
+        }
+    };
+
+    let first = WireId::parse(&album_id_for("First")).unwrap();
+    let second = WireId::parse(&album_id_for("Second")).unwrap();
+    let alpha = WireId::parse(&artist_id_for("Alpha")).unwrap();
+    assert_eq!(detail_marks(&session, first).await, (false, false));
+    assert!(wire_set(&session, first, Set::Favorite(true)).await.is_ok());
+    assert_eq!(detail_marks(&session, first).await, (false, true));
+    for id in [701, 702, 703] {
+        assert!(favourite(id).await, "track {id} of the album");
+    }
+    assert!(!favourite(704).await, "another album's track");
+    assert_eq!(
+        detail_marks(&session, alpha).await,
+        (false, false),
+        "the artist's other album is no favourite"
+    );
+
+    assert!(wire_set(&session, alpha, Set::Favorite(true)).await.is_ok());
+    assert_eq!(detail_marks(&session, alpha).await, (false, true));
+    assert_eq!(detail_marks(&session, second).await, (false, true));
+    assert!(!favourite(705).await, "another artist's track");
+
+    assert!(wire_set(&session, WireId::Real(702), Set::Favorite(false))
+        .await
+        .is_ok());
+    assert_eq!(detail_marks(&session, first).await, (false, false));
+    assert_eq!(detail_marks(&session, alpha).await, (false, false));
+    assert_eq!(detail_marks(&session, second).await, (false, true));
 }
 
 /// Pipelined writes to one item both land: a native client can send

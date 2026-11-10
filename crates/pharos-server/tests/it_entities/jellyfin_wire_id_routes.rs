@@ -289,3 +289,72 @@ async fn person_primary_image_redirects_to_scraped_thumb() {
     let resp = test::call_service(&app, req).await;
     assert_eq!(resp.status(), 404, "local-path thumb must not redirect");
 }
+
+/// A portrait on a provider's image host is passed through from this origin,
+/// so a page whose CSP allows only `'self'` images can show it (ADR-0076).
+#[actix_web::test]
+async fn person_portrait_on_a_provider_host_is_served_from_this_origin() {
+    use pharos_core::PersonStore;
+    use pharos_server::portrait::{Portrait, PortraitMiss, PortraitSource};
+
+    struct Fake;
+    impl PortraitSource for Fake {
+        fn fetch<'a>(
+            &'a self,
+            url: &'a str,
+        ) -> futures_util::future::BoxFuture<'a, Result<Portrait, PortraitMiss>> {
+            Box::pin(async move {
+                if url.ends_with("/kept.jpg") {
+                    Ok(Portrait {
+                        content_type: "image/jpeg".into(),
+                        bytes: b"jpeg".to_vec(),
+                    })
+                } else {
+                    Err(PortraitMiss::Status(404))
+                }
+            })
+        }
+    }
+
+    let (state, token, _uid) = seed().await;
+    let state = std::sync::Arc::try_unwrap(state.into_inner())
+        .unwrap_or_else(|_| panic!("seed state is shared"))
+        .with_portrait_source(std::sync::Arc::new(Fake));
+    for (name, url) in [
+        ("Kept", "https://image.tmdb.org/t/p/w185/kept.jpg"),
+        (
+            "Gone",
+            "https://artworks.thetvdb.com/banners/person/1/gone.jpg",
+        ),
+    ] {
+        state
+            .stores
+            .upsert_person(name, None, None, Some(url))
+            .await
+            .unwrap();
+    }
+    let app = test::init_service(
+        App::new()
+            .app_data(web::Data::new(state))
+            .wrap(LowercasePath)
+            .configure(jellyfin::configure),
+    )
+    .await;
+
+    let get = |name: &str| {
+        test::TestRequest::get()
+            .insert_header(("X-Emby-Token", token.clone()))
+            .uri(&format!(
+                "/Items/{}/Images/Primary",
+                pharos_core::person_wire_id(name)
+            ))
+            .to_request()
+    };
+    let resp = test::call_service(&app, get("Kept")).await;
+    assert_eq!(resp.status(), 200, "provider portrait is passed through");
+    assert_eq!(resp.headers().get("content-type").unwrap(), "image/jpeg");
+    assert_eq!(test::read_body(resp).await.as_ref(), b"jpeg");
+
+    let resp = test::call_service(&app, get("Gone")).await;
+    assert_eq!(resp.status(), 404, "an upstream miss shows the placeholder");
+}

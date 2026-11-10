@@ -878,7 +878,9 @@ const LOCALIZATION_OPTIONS: &[LocalizationOptionDto] = &[LocalizationOptionDto {
     value: "en-US",
 }];
 
-/// `GET /Devices` + `/Devices/Info` — admin dashboard's device list.
+/// `GET /Devices` + `/Devices/Info` — the device list. An admin sees every
+/// device; anyone else sees only the devices they are signed in on, so they
+/// can manage those devices' options themselves (ADR-0095).
 /// Aggregated from the token store: each issued token is one device
 /// record. Currently exposes (device_id, user_id, last_user_name).
 async fn devices_list(
@@ -886,24 +888,32 @@ async fn devices_list(
     user: AuthUser,
 ) -> Result<impl Responder, actix_web::Error> {
     use pharos_core::{TokenStore, UserStore};
-    if !user.0.policy.admin {
-        return Err(error::ErrorForbidden("admin required"));
-    }
     // We don't have a `list_all_tokens` API. Walk users, list tokens
     // per user. Phase 1 small-N — admins live with the per-user scan.
-    let users = state
-        .stores
-        .list()
-        .await
-        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    let users = if user.0.policy.admin {
+        state
+            .stores
+            .list()
+            .await
+            .map_err(|e| error::ErrorInternalServerError(e.to_string()))?
+            .into_iter()
+            .map(|u| (u.id, u.name))
+            .collect::<Vec<_>>()
+    } else {
+        vec![(user.0.id, user.0.name.clone())]
+    };
     let mut items: Vec<DeviceInfoLite> = Vec::new();
-    for u in users {
+    for (uid, uname) in users {
         let tokens = state
             .stores
-            .tokens_for(u.id)
+            .tokens_for(uid)
             .await
             .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
         for t in tokens {
+            // A media or manage token is part of a session already listed.
+            if crate::api::pharos::rpc::is_child_token_device(&t.device_id) {
+                continue;
+            }
             // Operator-set custom name (POST /Devices/Options), else the id.
             let display_name = state
                 .stores
@@ -913,13 +923,23 @@ async fn devices_list(
                 .flatten()
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| t.device_id.clone());
+            // Fallible: an empty list shown here would let the next save,
+            // which sends the whole list, wipe the stored one.
+            let no_direct_play_audio_codecs =
+                crate::services::playback::try_denied_audio_codecs(&state, &t.device_id)
+                    .await
+                    .map_err(|e| {
+                        tracing::warn!(device.id = %t.device_id, error = %e, "device list refused: sound formats unreadable");
+                        error::ErrorInternalServerError(e)
+                    })?;
             items.push(DeviceInfoLite {
+                no_direct_play_audio_codecs,
                 id: t.device_id,
                 name: display_name,
                 app_name: "Jellyfin",
                 app_version: "0",
-                last_user_id: u.id.0.simple().to_string(),
-                last_user_name: u.name.clone(),
+                last_user_id: uid.0.simple().to_string(),
+                last_user_name: uname.clone(),
                 date_last_activity: "1970-01-01T00:00:00.0000000Z",
             });
         }
@@ -940,6 +960,10 @@ struct DeviceInfoLite {
     last_user_id: String,
     last_user_name: String,
     date_last_activity: &'static str,
+    /// Pharos extension (T130): audio codecs this device is never sent as a
+    /// direct play. Absent when none are set, so the element stays Jellyfin's.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    no_direct_play_audio_codecs: Vec<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1005,36 +1029,133 @@ async fn delete_device(
     Ok(HttpResponse::NoContent().finish())
 }
 
+/// Why a caller may change a device's options.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeviceOptionsRole {
+    Admin,
+    /// The caller is signed in on the device.
+    Owner,
+}
+
+impl DeviceOptionsRole {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Admin => "admin",
+            Self::Owner => "owner",
+        }
+    }
+}
+
+/// An admin may change any device's options, and a user the options of a
+/// device they are signed in on: the person holding the device knows when a
+/// format plays badly on it (ADR-0095). Anyone else is refused.
+async fn device_options_role(
+    state: &AppState,
+    user: &AuthUser,
+    device_id: &str,
+) -> Result<DeviceOptionsRole, actix_web::Error> {
+    if user.0.policy.admin {
+        return Ok(DeviceOptionsRole::Admin);
+    }
+    if crate::services::devices::is_signed_in_on(state, user.0.id, device_id)
+        .await
+        .map_err(error::ErrorInternalServerError)?
+    {
+        return Ok(DeviceOptionsRole::Owner);
+    }
+    tracing::info!(
+        device.id = device_id,
+        by.user = %user.0.name,
+        "device options refused: not an admin and not signed in on the device"
+    );
+    Err(error::ErrorForbidden(
+        "only an admin or someone signed in on this device can change it",
+    ))
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "PascalCase", default)]
 struct DeviceOptionsBody {
     custom_name: Option<String>,
+    /// Pharos extension (T130): audio codecs this device must not direct-play,
+    /// though its profile claims them. Absent leaves the list as it is; an
+    /// empty list clears it.
+    no_direct_play_audio_codecs: Option<Vec<String>>,
 }
 
 /// `POST /Devices/Options?id={deviceId}` — persist an operator-set display
-/// name for a device (shown in the devices list). Stored via named_config
-/// (`devname:{id}`). Empty name clears the override.
+/// name for a device (shown in the devices list), stored via named_config
+/// (`devname:{id}`), and its audio codec deny list
+/// (`devaudionodirect:{id}`). Each field is written only when the body
+/// carries it; an empty name clears the override.
 async fn device_options(
     state: web::Data<AppState>,
     user: AuthUser,
     q: CiQuery<DeviceIdQuery>,
-    body: Option<web::Json<DeviceOptionsBody>>,
+    body: web::Bytes,
 ) -> Result<impl Responder, actix_web::Error> {
-    if !user.0.policy.admin {
-        return Err(error::ErrorForbidden("admin required"));
-    }
     let device_id =
         q.id.as_deref()
             .filter(|s| !s.is_empty())
             .ok_or_else(|| error::ErrorBadRequest("missing id"))?;
-    let name = body
-        .and_then(|b| b.into_inner().custom_name)
-        .unwrap_or_default();
-    state
-        .stores
-        .set_named_config(&format!("devname:{device_id}"), name.trim())
-        .await
-        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    let by = device_options_role(&state, &user, device_id).await?;
+    // Only an empty body means "no fields"; a malformed one is refused rather
+    // than read as empty and answered 204 as if it had been saved.
+    let body: DeviceOptionsBody = if body.iter().all(u8::is_ascii_whitespace) {
+        DeviceOptionsBody::default()
+    } else {
+        serde_json::from_slice(&body).map_err(|e| {
+            tracing::info!(device.id = device_id, error = %e, "device options body refused");
+            error::ErrorBadRequest(format!("invalid body: {e}"))
+        })?
+    };
+    // The name is shown to everyone who sees the device, and a device id is
+    // only the client's claim, so an owner sets sound formats but not the
+    // name (ADR-0095). Refused before anything is written.
+    if by == DeviceOptionsRole::Owner && body.custom_name.is_some() {
+        tracing::info!(
+            device.id = device_id,
+            by.user = %user.0.name,
+            "device name change refused: only an admin names a device"
+        );
+        return Err(error::ErrorForbidden("only an admin can rename a device"));
+    }
+    // Validated before anything is written, so a bad list never lands half a body.
+    let denied = body
+        .no_direct_play_audio_codecs
+        .as_deref()
+        .map(crate::services::playback::normalise_denied_audio_codecs)
+        .transpose()
+        .map_err(|e| {
+            tracing::info!(device.id = device_id, error = %e, "device audio deny list refused");
+            error::ErrorBadRequest(e.to_string())
+        })?;
+    if let Some(name) = body.custom_name {
+        state
+            .stores
+            .set_named_config(&format!("devname:{device_id}"), name.trim())
+            .await
+            .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    }
+    if let Some(denied) = denied {
+        let json = serde_json::to_string(&denied)
+            .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+        state
+            .stores
+            .set_named_config(
+                &crate::services::playback::denied_audio_codecs_key(device_id),
+                &json,
+            )
+            .await
+            .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+        tracing::info!(
+            device.id = device_id,
+            by.user = %user.0.name,
+            by.role = by.label(),
+            denied = ?denied,
+            "device audio deny list set"
+        );
+    }
     Ok(HttpResponse::NoContent().finish())
 }
 

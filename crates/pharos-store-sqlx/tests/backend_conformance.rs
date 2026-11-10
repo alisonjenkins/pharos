@@ -11,9 +11,10 @@
 
 use pharos_core::{
     collection_wire_id, genre_wire_id, person_wire_id, studio_wire_id, tag_wire_id,
-    CollectionStore, DetectedSegment, ExternalRatings, GenreStore, LibraryKind, LibraryStore,
-    LocalizedText, MediaId, MediaItem, MediaKind, MediaMetadata, MediaProbe, MediaQuery,
-    MediaSegmentKind, MediaSegmentStore, MediaStore, MetadataTranslationStore, PersistedSyncGroup,
+    CollectionStore, DetectedSegment, EditTarget, EditableField, ExternalRatings, FoldResume,
+    GenreStore, LibraryKind, LibraryStore, LocalizedText, LockedFields, MediaId, MediaItem,
+    MediaKind, MediaMetadata, MediaProbe, MediaQuery, MediaSegmentKind, MediaSegmentStore,
+    MediaStore, MetadataEdit, MetadataEditStore, MetadataTranslationStore, PersistedSyncGroup,
     PersistedTranscodeSession, PersonKind, PersonRef, PersonStore, PlaylistStore, PreferenceStore,
     RatingsStore, RatingsTarget, SecretString, SeriesInfo, SeriesMetadata, SeriesMetadataStore,
     StudioStore, SubtitleStyling, SubtitleStylingStore, SyncGroupStore, TagStore, TokenStore,
@@ -43,6 +44,7 @@ fn media_item(id: MediaId, title: &str) -> MediaItem {
         match_confidence: None,
         metadata_refreshed_at: None,
         edition: None,
+        locked: LockedFields::NONE,
     }
 }
 
@@ -109,6 +111,26 @@ where
         server_id_1, server_id_2,
         "server id must be stable across calls"
     );
+
+    let secret_1 = store
+        .load_or_create_secret("secret-a", &[1; 32])
+        .await
+        .unwrap();
+    assert_eq!(secret_1, vec![1; 32]);
+    let secret_2 = store
+        .load_or_create_secret("secret-a", &[2; 32])
+        .await
+        .unwrap();
+    assert_eq!(
+        secret_2,
+        vec![1; 32],
+        "existing secret must win over a later fresh value"
+    );
+    let secret_other = store
+        .load_or_create_secret("secret-b", &[3; 32])
+        .await
+        .unwrap();
+    assert_eq!(secret_other, vec![3; 32]);
 
     let default_runtime = store.load_runtime_config().await.unwrap();
     assert_eq!(default_runtime, RuntimeConfig::default());
@@ -652,6 +674,45 @@ where
     let listed_items = MediaStore::list(&store).await.unwrap();
     assert!(listed_items.iter().any(|i| i.id == item_id));
 
+    // B811 / V761 — a batch fetch skips ids with no row and returns the same
+    // row `get` does, on both backends (order is covered in it_sqlite).
+    let batch = MediaStore::get_many(&store, &[990_999, item_id, 990_998])
+        .await
+        .unwrap();
+    assert_eq!(batch, vec![item.clone()]);
+    assert!(MediaStore::get_many(&store, &[]).await.unwrap().is_empty());
+
+    // B831 / V781 — newest-first with the id tiebreak and a limit is answered
+    // by the store, and agrees with sorting the full list in memory.
+    let mut every = MediaStore::list(&store).await.unwrap();
+    every.sort_by(|a, b| {
+        b.created_at
+            .unwrap_or(i64::MIN)
+            .cmp(&a.created_at.unwrap_or(i64::MIN))
+            .then(b.id.cmp(&a.id))
+    });
+    let newest = MediaStore::query(
+        &store,
+        &MediaQuery {
+            limit: Some(3),
+            sort: vec![
+                (
+                    pharos_core::SortKey::DateCreated,
+                    pharos_core::SortDir::Desc,
+                ),
+                (pharos_core::SortKey::Id, pharos_core::SortDir::Desc),
+            ],
+            ..MediaQuery::default()
+        },
+    )
+    .await
+    .unwrap()
+    .0;
+    assert_eq!(
+        newest.iter().map(|i| i.id).collect::<Vec<_>>(),
+        every.iter().take(3).map(|i| i.id).collect::<Vec<_>>()
+    );
+
     // B257 — the row holding a path is found by the path, whatever its id.
     assert_eq!(
         MediaStore::id_at_path(&store, &item.path).await.unwrap(),
@@ -1109,6 +1170,118 @@ where
         after_progress
     );
 
+    // Folding a copy's row into its item keeps the furthest state of the
+    // two: played and favourite stay set, resume follows the later play.
+    let copy_id: MediaId = 9_001;
+    MediaStore::put(&store, media_item(copy_id, "Copy Of Item"))
+        .await
+        .unwrap();
+    let copy = UserItemData {
+        played: false,
+        play_count: 1,
+        last_played_position_ticks: 7_000,
+        is_favorite: false,
+        last_played_at: 1_700_001_000,
+        ..Default::default()
+    };
+    UserDataStore::set_user_data(&store, uid, copy_id, copy)
+        .await
+        .unwrap();
+    MediaStore::merge_user_data(&store, copy_id, item_id, FoldResume::Carry)
+        .await
+        .unwrap();
+    MediaStore::merge_user_data(&store, copy_id, item_id, FoldResume::Carry)
+        .await
+        .unwrap();
+    let merged = UserDataStore::get_user_data(&store, uid, item_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        (merged.played, merged.play_count, merged.is_favorite),
+        (true, 3, true)
+    );
+    assert_eq!(
+        (merged.last_played_position_ticks, merged.last_played_at),
+        (7_000, 1_700_001_000)
+    );
+    // Into a row that does not exist: nothing is written.
+    MediaStore::merge_user_data(&store, copy_id, 9_999, FoldResume::Carry)
+        .await
+        .unwrap();
+    // A double episode folded into one of its episodes: its later position
+    // is in another timeline, so the item keeps its own.
+    let double_id: MediaId = 9_002;
+    MediaStore::put(&store, media_item(double_id, "Double Episode"))
+        .await
+        .unwrap();
+    let double = UserItemData {
+        play_count: 5,
+        last_played_position_ticks: 99_000,
+        last_played_at: 1_700_002_000,
+        ..Default::default()
+    };
+    UserDataStore::set_user_data(&store, uid, double_id, double)
+        .await
+        .unwrap();
+    MediaStore::merge_user_data(&store, double_id, item_id, FoldResume::Drop)
+        .await
+        .unwrap();
+    let folded = UserDataStore::get_user_data(&store, uid, item_id)
+        .await
+        .unwrap();
+    assert_eq!(folded.play_count, 5);
+    assert_eq!(
+        (folded.last_played_position_ticks, folded.last_played_at),
+        (7_000, 1_700_001_000),
+        "the play time stays the item's own, so a later fold of a copy that \
+         shares its timeline still compares against it"
+    );
+    // Into an item with no state of its own, the position starts at zero.
+    let fresh_id: MediaId = 9_003;
+    MediaStore::put(&store, media_item(fresh_id, "Fresh Episode"))
+        .await
+        .unwrap();
+    MediaStore::merge_user_data(&store, double_id, fresh_id, FoldResume::Drop)
+        .await
+        .unwrap();
+    let fresh = UserDataStore::get_user_data(&store, uid, fresh_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        (
+            fresh.play_count,
+            fresh.last_played_position_ticks,
+            fresh.last_played_at
+        ),
+        (5, 0, 0)
+    );
+    // A copy that shares the item's timeline, played before the double,
+    // still carries its resume point in.
+    let single_copy_id: MediaId = 9_004;
+    MediaStore::put(&store, media_item(single_copy_id, "Fresh Episode Copy"))
+        .await
+        .unwrap();
+    let single_copy = UserItemData {
+        play_count: 1,
+        last_played_position_ticks: 4_000,
+        last_played_at: 1_700_001_500,
+        ..Default::default()
+    };
+    UserDataStore::set_user_data(&store, uid, single_copy_id, single_copy)
+        .await
+        .unwrap();
+    MediaStore::merge_user_data(&store, single_copy_id, fresh_id, FoldResume::Carry)
+        .await
+        .unwrap();
+    let carried = UserDataStore::get_user_data(&store, uid, fresh_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        (carried.last_played_position_ticks, carried.last_played_at),
+        (4_000, 1_700_001_500),
+        "a dropped double's play time must not outrank a later carried copy"
+    );
+
     // -----------------------------------------------------------------
     // 6. PreferenceStore
     // -----------------------------------------------------------------
@@ -1256,9 +1429,35 @@ where
         kind: PersonKind::Actor,
         ..Default::default()
     };
-    PersonStore::link_item_people(&store, item_id, std::slice::from_ref(&person))
-        .await
-        .unwrap();
+    let guest = PersonRef {
+        name: "Conformance Guest".into(),
+        kind: PersonKind::GuestStar,
+        character: Some("Stranger".into()),
+        ..Default::default()
+    };
+    let person = PersonRef {
+        character: Some("Hero".into()),
+        sort_order: Some(0),
+        ..person
+    };
+    let director = PersonRef {
+        name: "Conformance Director".into(),
+        kind: PersonKind::Director,
+        role: Some("Director".into()),
+        ..Default::default()
+    };
+    let accented = PersonRef {
+        name: "Élodie Conformance".into(),
+        kind: PersonKind::GuestStar,
+        ..Default::default()
+    };
+    PersonStore::link_item_people(
+        &store,
+        item_id,
+        &[person.clone(), guest, director, accented],
+    )
+    .await
+    .unwrap();
     let person_counts = PersonStore::people_with_counts(&store).await.unwrap();
     assert!(person_counts
         .iter()
@@ -1272,6 +1471,101 @@ where
     assert!(people_for_item
         .iter()
         .any(|p| p.name == "Conformance Actor"));
+    // A show's cast is built from its episodes' actor credits only.
+    let credits = PersonStore::actor_credits_for_items(&store, &[item_id])
+        .await
+        .unwrap();
+    assert_eq!(credits.len(), 1, "{credits:?}");
+    assert_eq!(credits[0].0, item_id);
+    assert_eq!(credits[0].1.name, "Conformance Actor");
+    assert_eq!(credits[0].1.character.as_deref(), Some("Hero"));
+    assert!(PersonStore::actor_credits_for_items(&store, &[])
+        .await
+        .unwrap()
+        .is_empty());
+    // A person's page lists their credits with who they play, guest spots included.
+    let guest_credits =
+        PersonStore::credits_for_person(&store, &person_wire_id("Conformance Guest"))
+            .await
+            .unwrap();
+    assert_eq!(guest_credits.len(), 1, "{guest_credits:?}");
+    assert_eq!(guest_credits[0].0, item_id);
+    assert_eq!(guest_credits[0].1.kind, PersonKind::GuestStar);
+    assert_eq!(guest_credits[0].1.character.as_deref(), Some("Stranger"));
+    assert!(
+        PersonStore::credits_for_person(&store, &person_wire_id("Nobody Credited"))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    // Actors are found by every word of their name, crew left out.
+    let named = |words: &[&str], limit| {
+        let words: Vec<String> = words.iter().map(|w| (*w).to_owned()).collect();
+        let store = &store;
+        async move {
+            PersonStore::actors_named(store, &words, limit)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|p| p.name)
+                .collect::<Vec<_>>()
+        }
+    };
+    assert_eq!(
+        named(&["conformance"], 10).await,
+        [
+            "Conformance Actor",
+            "Conformance Guest",
+            "Élodie Conformance"
+        ],
+        "the director is not an actor"
+    );
+    assert!(
+        named(&["élodie"], 10)
+            .await
+            .contains(&"Élodie Conformance".to_owned()),
+        "a capital outside ASCII is still found"
+    );
+    assert_eq!(named(&["GUEST", "conf"], 10).await, ["Conformance Guest"]);
+    assert_eq!(named(&["conformance"], 1).await.len(), 1);
+    assert!(
+        named(&["conf%"], 10).await.is_empty(),
+        "a % is matched literally"
+    );
+    assert!(named(&[], 10).await.is_empty());
+    // A person's provider details are kept, and replaced whole.
+    // A fresh id per run, so a persistent postgres starts with none kept.
+    let lead = person_wire_id(&format!("Details Probe {}", UserId::new().0.simple()));
+    assert_eq!(
+        PersonStore::person_details(&store, &lead).await.unwrap(),
+        None
+    );
+    let details = pharos_core::PersonDetails {
+        biography: Some("Born by the sea.".into()),
+        birth_date: Some("1970-01-02".into()),
+        imdb_id: Some("nm0000001".into()),
+        wikidata_id: Some("Q42".into()),
+        fetched_at: 1_700_000_000,
+        ..Default::default()
+    };
+    PersonStore::put_person_details(&store, &lead, &details)
+        .await
+        .unwrap();
+    assert_eq!(
+        PersonStore::person_details(&store, &lead).await.unwrap(),
+        Some(details)
+    );
+    let nothing = pharos_core::PersonDetails {
+        fetched_at: 1_800_000_000,
+        ..Default::default()
+    };
+    PersonStore::put_person_details(&store, &lead, &nothing)
+        .await
+        .unwrap();
+    assert_eq!(
+        PersonStore::person_details(&store, &lead).await.unwrap(),
+        Some(nothing)
+    );
 
     StudioStore::link_item_studios(&store, item_id, &["Conformance Studio".to_string()])
         .await
@@ -1692,6 +1986,7 @@ where
         episode_number: Some(1),
         series_folder: Some("/media/conformance/Conformance Show (2001)".into()),
         series_year: Some(2001),
+        series_key: None,
     });
     MediaStore::put(&store, ep).await.unwrap();
 
@@ -1746,7 +2041,7 @@ where
     let show_key = "/media/conformance/Conformance Show (2001)".to_string();
     let mut film = media_item(9501, "Rated Film");
     film.metadata.production_year = Some(1999);
-    film.metadata.provider_ids.imdb = Some("tt0133093".into());
+    film.metadata.provider_ids.imdb = Some("tt9300001".into());
     MediaStore::put(&store, film.clone()).await.unwrap();
     let due = RatingsStore::needing_ratings(&store, 1000, 500)
         .await
@@ -1765,7 +2060,7 @@ where
             .all(|d| matches!(d.target, RatingsTarget::Series(_))),
         "shows come before films"
     );
-    assert_eq!(film_due.imdb_id.as_deref(), Some("tt0133093"));
+    assert_eq!(film_due.imdb_id.as_deref(), Some("tt9300001"));
     assert_eq!(film_due.title, "Rated Film");
     assert_eq!(film_due.year, Some(1999));
     let show_due = &due[show_at];
@@ -1894,7 +2189,7 @@ where
 
     let eng = LocalizedText {
         language: "eng".into(),
-        title: Some("Dragon Ball".into()),
+        title: Some("Silver Rock".into()),
         overview: Some("Goku sets out.".into()),
         is_original: false,
     };
@@ -2353,6 +2648,99 @@ where
         .unwrap();
 
     // -----------------------------------------------------------------
+    // Picture check (black bars): written by `put_picture_check` only, kept
+    // across a re-`put`, valid only while the file signature matches.
+    // -----------------------------------------------------------------
+    let episode: MediaId = (UserId::new().0.as_u128() as u64) >> 2;
+    let mut item = media_item(episode, "bars");
+    item.path = format!("/media/conformance/bars-{episode}.mkv").into();
+    MediaStore::put(&store, item.clone()).await.unwrap();
+    assert_eq!(
+        MediaStore::get(&store, episode)
+            .await
+            .unwrap()
+            .probe
+            .picture_check,
+        None,
+        "new file is unchecked"
+    );
+    let bars = pharos_core::PictureCheck {
+        version: 1,
+        area: Some(pharos_core::PictureArea {
+            x: 242,
+            y: 0,
+            width: 1436,
+            height: 1080,
+        }),
+    };
+    MediaStore::put_picture_check(&store, episode, bars, (1_700_000_000, 4_096))
+        .await
+        .unwrap();
+    let got = MediaStore::get(&store, episode).await.unwrap().probe;
+    assert_eq!(got.picture_check, Some(bars));
+    assert_eq!(got.picture_area(), bars.area);
+    let listed = MediaStore::list(&store).await.unwrap();
+    assert_eq!(
+        listed
+            .iter()
+            .find(|i| i.id == episode)
+            .unwrap()
+            .probe
+            .picture_check,
+        Some(bars),
+        "the list path decodes the same columns"
+    );
+    MediaStore::put(&store, item.clone()).await.unwrap();
+    assert_eq!(
+        MediaStore::get(&store, episode)
+            .await
+            .unwrap()
+            .probe
+            .picture_check,
+        Some(bars),
+        "put never writes the picture columns"
+    );
+    let scan = MediaStore::begin_scan(&store, std::path::Path::new("/media/conformance"))
+        .await
+        .unwrap();
+    MediaStore::mark_seen(&store, episode, scan, 1_700_000_000, 4_096)
+        .await
+        .unwrap();
+    assert_eq!(
+        MediaStore::get(&store, episode)
+            .await
+            .unwrap()
+            .probe
+            .picture_check,
+        Some(bars)
+    );
+    MediaStore::mark_seen(&store, episode, scan, 1_700_000_060, 4_096)
+        .await
+        .unwrap();
+    assert_eq!(
+        MediaStore::get(&store, episode)
+            .await
+            .unwrap()
+            .probe
+            .picture_check,
+        None,
+        "a changed file reads as unchecked"
+    );
+    let no_bars = pharos_core::PictureCheck {
+        version: 1,
+        area: None,
+    };
+    MediaStore::put_picture_check(&store, episode, no_bars, (1_700_000_060, 4_096))
+        .await
+        .unwrap();
+    let got = MediaStore::get(&store, episode).await.unwrap().probe;
+    assert_eq!(got.picture_check, Some(no_bars), "no bars is stored too");
+    assert_eq!(got.picture_area(), None);
+    MediaStore::put_picture_check(&store, episode + 1, bars, (1, 1))
+        .await
+        .unwrap();
+
+    // -----------------------------------------------------------------
     // Spec 028 — subtitle styling: one row per item, replaced by a new
     // source choice, plan_json left out of the index, gone with the item.
     // Last, because the cascade check sweeps the whole conformance root.
@@ -2437,6 +2825,40 @@ where
         .await
         .unwrap();
     assert_eq!(index.iter().filter(|r| r.item_id == film).count(), 1);
+    // B1202: the stored signal pass, one per item, upserted, gone with it.
+    assert_eq!(
+        SubtitleStylingStore::subtitle_signals(&store, film)
+            .await
+            .unwrap(),
+        None
+    );
+    let measured = pharos_core::SubtitleSignalsRow {
+        item_id: film,
+        source_mtime: 1_700_000_000,
+        source_size: u64::from(u32::MAX) + 7,
+        audio_stream: Some(1),
+        signals_version: 1,
+        signals_json: r#"{"windows":[]}"#.into(),
+        measured_at: 1_700_000_300,
+    };
+    SubtitleStylingStore::put_subtitle_signals(&store, measured.clone())
+        .await
+        .unwrap();
+    let remeasured = pharos_core::SubtitleSignalsRow {
+        audio_stream: None,
+        signals_version: 2,
+        measured_at: 1_700_000_400,
+        ..measured
+    };
+    SubtitleStylingStore::put_subtitle_signals(&store, remeasured.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        SubtitleStylingStore::subtitle_signals(&store, film)
+            .await
+            .unwrap(),
+        Some(remeasured)
+    );
     // Deleting the item cascades.
     let sweep = MediaStore::begin_scan(&store, std::path::Path::new("/media/conformance"))
         .await
@@ -2451,6 +2873,1006 @@ where
             .unwrap(),
         None
     );
+    assert_eq!(
+        SubtitleStylingStore::subtitle_signals(&store, film)
+            .await
+            .unwrap(),
+        None
+    );
+}
+
+/// Spec 033 — the series split's store contract: a put keeps a key the
+/// split wrote, the split's writes land, overrides are kept once, and the
+/// match pass sees a split folder as two shows.
+async fn run_series_identity_conformance<S>(store: S)
+where
+    S: pharos_core::MediaStore
+        + pharos_core::SeriesMetadataStore
+        + pharos_core::SeriesIdentityStore
+        + pharos_core::MetadataTranslationStore
+        + Send
+        + Sync,
+{
+    use pharos_core::{OverrideSource, SeriesKeyUpdate, SeriesOverride};
+    const ROOT: &str = "/media/series-identity";
+    const FOLDER: &str = "/media/series-identity/Show A";
+    let split = format!("{FOLDER}\u{1f}1971");
+    let ep = |id: u64, file: &str, year: Option<u32>| {
+        let mut item = media_item(MediaId::from(id), file);
+        item.path = format!("{FOLDER}/Season 1/{file}").into();
+        item.kind = MediaKind::Episode;
+        item.series = Some(SeriesInfo {
+            series_name: "Show A".into(),
+            season_number: Some(1),
+            episode_number: Some(1),
+            series_folder: Some(FOLDER.into()),
+            series_year: year,
+            series_key: None,
+        });
+        item
+    };
+    let old = ep(9_300_001, "Show A (1971) - S01E01.mkv", None);
+    let new = ep(9_300_002, "Show A (1996) - S01E01.mkv", None);
+    MediaStore::put(&store, old.clone()).await.unwrap();
+    MediaStore::put(&store, new.clone()).await.unwrap();
+
+    let mut rows = store.series_identity_rows(ROOT).await.unwrap();
+    rows.sort_by(|a, b| a.path.cmp(&b.path));
+    assert_eq!(rows.len(), 2);
+    assert!(rows
+        .iter()
+        .all(|r| r.series_key.is_none() && r.series_year.is_none()));
+    assert!(store
+        .series_identity_rows("/media/elsewhere")
+        .await
+        .unwrap()
+        .is_empty());
+
+    let updates = [
+        SeriesKeyUpdate {
+            path: rows[0].path.clone(),
+            series_key: Some(split.clone()),
+            series_year: Some(1971),
+        },
+        SeriesKeyUpdate {
+            path: rows[1].path.clone(),
+            series_key: None,
+            series_year: Some(1996),
+        },
+    ];
+    assert_eq!(store.set_series_keys(&updates).await.unwrap(), 2);
+    assert_eq!(
+        store.set_series_keys(&updates).await.unwrap(),
+        0,
+        "idempotent"
+    );
+
+    // A re-probe writes no key and the folder's (absent) year; the split's
+    // key and stated year stay.
+    MediaStore::put(&store, old.clone()).await.unwrap();
+    MediaStore::put_batch(&store, std::slice::from_ref(&new))
+        .await
+        .unwrap();
+    let got = MediaStore::get(&store, old.id).await.unwrap();
+    let series = got.series.unwrap();
+    assert_eq!(series.series_key.as_deref(), Some(split.as_str()));
+    assert_eq!(series.series_year, Some(1971));
+    let got = MediaStore::get(&store, new.id).await.unwrap();
+    assert_eq!(got.series.unwrap().series_year, Some(1996));
+
+    // A moved file (new folder) loses the old folder's split.
+    let mut moved = old.clone();
+    if let Some(s) = moved.series.as_mut() {
+        s.series_folder = Some(format!("{ROOT}/Show A (1971)"));
+        s.series_year = Some(1971);
+    }
+    MediaStore::put(&store, moved).await.unwrap();
+    let got = MediaStore::get(&store, old.id).await.unwrap();
+    assert_eq!(got.series.unwrap().series_key, None);
+    MediaStore::put(&store, old.clone()).await.unwrap();
+    store.set_series_keys(&[updates[0].clone()]).await.unwrap();
+
+    // The match pass sees two shows, each with its own year.
+    let need = SeriesMetadataStore::series_needing_match(&store, 1000, i64::MAX)
+        .await
+        .unwrap();
+    let year_of = |key: &str| {
+        need.iter()
+            .find(|c| c.series_key == key)
+            .map(|c| c.series_year)
+    };
+    assert_eq!(year_of(FOLDER), Some(Some(1996)));
+    assert_eq!(year_of(&split), Some(Some(1971)));
+
+    // Overrides: one owner row per folder and source.
+    let owner = SeriesOverride {
+        id: 0,
+        series_folder: FOLDER.into(),
+        path: None,
+        target_key: FOLDER.into(),
+        target_name: None,
+        target_year: Some(1996),
+        source: OverrideSource::Scanner,
+        created_by: None,
+        created_at: 1_700_000_000,
+    };
+    assert!(store.insert_series_override(owner.clone()).await.unwrap());
+    assert!(!store
+        .insert_series_override(SeriesOverride {
+            target_year: Some(1971),
+            ..owner.clone()
+        })
+        .await
+        .unwrap());
+    assert!(store
+        .insert_series_override(SeriesOverride {
+            source: OverrideSource::Admin,
+            created_by: Some("admin".into()),
+            ..owner.clone()
+        })
+        .await
+        .unwrap());
+    let all = store.series_overrides(&[FOLDER.to_string()]).await.unwrap();
+    assert_eq!(all.len(), 2);
+    assert_eq!(all[0].target_year, Some(1996));
+    assert_eq!(all[0].source, OverrideSource::Scanner);
+    assert_eq!(all[1].source, OverrideSource::Admin);
+    assert!(store.series_overrides(&[]).await.unwrap().is_empty());
+
+    // The stored match's premiere year, by key.
+    SeriesMetadataStore::upsert_series_metadata(
+        &store,
+        pharos_core::SeriesMetadata {
+            series_key: FOLDER.into(),
+            series_name: "Show A".into(),
+            match_source: Some("search".into()),
+            // 1996-10-07T00:00:00Z
+            premiere_date: Some(844_646_400),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let years = store
+        .series_premiere_years(&[FOLDER.to_string(), split.clone()])
+        .await
+        .unwrap();
+    assert_eq!(years.get(FOLDER), Some(&1996));
+    assert_eq!(years.get(&split), None);
+
+    // V892 — an episode waits for its show: eligible only once the show (by
+    // its identity key) has a match row.
+    let waiting = |items: &[MediaItem]| items.iter().any(|i| i.id == old.id);
+    let need = MediaStore::items_needing_match(&store, 1000, i64::MAX)
+        .await
+        .unwrap();
+    assert!(!waiting(&need), "the split 1971 group has no match row yet");
+    assert!(
+        need.iter().any(|i| i.id == new.id),
+        "the folder's show is matched"
+    );
+    SeriesMetadataStore::upsert_series_metadata(
+        &store,
+        pharos_core::SeriesMetadata {
+            series_key: split.clone(),
+            series_name: "Show A".into(),
+            match_source: Some("none".into()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let need = MediaStore::items_needing_match(&store, 1000, i64::MAX)
+        .await
+        .unwrap();
+    assert!(waiting(&need));
+
+    // V891 — a show's episodes by identity key, the local side of episode fit.
+    let eps = store.series_episodes(&split).await.unwrap();
+    assert_eq!(
+        eps,
+        vec![pharos_core::SeriesEpisodeRow {
+            id: old.id,
+            path: old.path.to_string_lossy().into_owned(),
+            title: old.title.clone(),
+            season: Some(1),
+            episode: Some(1),
+            premiere_date: None,
+            match_source: None,
+            match_provider: None,
+            match_external_id: None,
+        }]
+    );
+    let eps = store.series_episodes(FOLDER).await.unwrap();
+    assert_eq!(eps.len(), 1);
+    assert_eq!(eps[0].path, new.path.to_string_lossy());
+    assert!(store.series_episodes("/nowhere").await.unwrap().is_empty());
+
+    // V891 — a flagged match round-trips, and the next upsert clears it.
+    let flagged = pharos_core::SeriesMetadata {
+        series_key: FOLDER.into(),
+        series_name: "Show A".into(),
+        match_source: Some("search".into()),
+        match_flag: Some("ambiguous".into()),
+        match_runner_up_id: Some("900004".into()),
+        match_runner_up_score: Some(0.25),
+        ..Default::default()
+    };
+    SeriesMetadataStore::upsert_series_metadata(&store, flagged.clone())
+        .await
+        .unwrap();
+    let by_key = |m: std::collections::HashMap<String, pharos_core::SeriesMetadata>| {
+        m.get(FOLDER).cloned().unwrap()
+    };
+    let got = by_key(
+        SeriesMetadataStore::series_metadata_by_keys(&store, &[FOLDER.to_string()])
+            .await
+            .unwrap(),
+    );
+    assert_eq!(got.match_flag.as_deref(), Some("ambiguous"));
+    assert_eq!(got.match_runner_up_id.as_deref(), Some("900004"));
+    assert_eq!(got.match_runner_up_score, Some(0.25));
+    let keys = [FOLDER.to_string(), split.clone()];
+    assert_eq!(
+        store.ambiguous_series(&keys).await.unwrap(),
+        std::collections::HashSet::from([FOLDER.to_string()])
+    );
+    assert!(store.ambiguous_series(&[]).await.unwrap().is_empty());
+    SeriesMetadataStore::upsert_series_metadata(
+        &store,
+        pharos_core::SeriesMetadata {
+            match_flag: None,
+            match_runner_up_id: None,
+            match_runner_up_score: None,
+            ..flagged
+        },
+    )
+    .await
+    .unwrap();
+    let got = by_key(
+        SeriesMetadataStore::series_metadata_by_keys(&store, &[FOLDER.to_string()])
+            .await
+            .unwrap(),
+    );
+    assert_eq!(
+        (
+            got.match_flag,
+            got.match_runner_up_id,
+            got.match_runner_up_score
+        ),
+        (None, None, None)
+    );
+    assert!(store.ambiguous_series(&keys).await.unwrap().is_empty());
+
+    // V940 — episode reconciliation marks, re-admission, and translation deletion.
+    assert_eq!(store.mark_series_reconcile(&split, 100).await.unwrap(), 1);
+    assert_eq!(
+        store.series_reconcile_pending(10).await.unwrap(),
+        vec![(old.id, 100)]
+    );
+    MediaStore::put(&store, old.clone()).await.unwrap();
+    assert_eq!(
+        store.series_reconcile_pending(10).await.unwrap(),
+        vec![(old.id, 100)]
+    );
+    assert!(!store.clear_series_reconcile(old.id, 99).await.unwrap());
+    assert_eq!(
+        store.series_reconcile_pending(10).await.unwrap(),
+        vec![(old.id, 100)]
+    );
+    assert!(store.clear_series_reconcile(old.id, 100).await.unwrap());
+    assert!(store.series_reconcile_pending(10).await.unwrap().is_empty());
+
+    assert_eq!(store.mark_reconcile_items(&[], 200).await.unwrap(), 0);
+    assert_eq!(store.mark_reconcile_items(&[new.id], 200).await.unwrap(), 1);
+    assert_eq!(
+        store.series_reconcile_pending(10).await.unwrap(),
+        vec![(new.id, 200)]
+    );
+    assert!(store.clear_series_reconcile(new.id, 200).await.unwrap());
+    MediaStore::set_item_match(&store, new.id, "tvdb", "900005", "manual", None, 300)
+        .await
+        .unwrap();
+    assert_eq!(store.mark_reconcile_items(&[new.id], 400).await.unwrap(), 0);
+    assert!(store.series_reconcile_pending(10).await.unwrap().is_empty());
+    let by_path = [
+        old.path.to_string_lossy().into_owned(),
+        new.path.to_string_lossy().into_owned(),
+        "/tv/nowhere.mkv".to_string(),
+    ];
+    assert_eq!(store.mark_reconcile_paths(&[], 450).await.unwrap(), 0);
+    assert_eq!(store.mark_reconcile_paths(&by_path, 500).await.unwrap(), 1);
+    assert_eq!(
+        store.series_reconcile_pending(10).await.unwrap(),
+        vec![(old.id, 500)]
+    );
+    assert!(store.clear_series_reconcile(old.id, 500).await.unwrap());
+
+    MediaStore::set_artwork(&store, old.id, "Primary", "tvdb", "/cache/old-still.jpg")
+        .await
+        .unwrap();
+    MediaStore::set_artwork(&store, old.id, "Thumb", "local", "/tv/x-thumb.jpg")
+        .await
+        .unwrap();
+    assert_eq!(
+        store.delete_provider_artwork(old.id).await.unwrap(),
+        vec![("Primary".to_string(), "/cache/old-still.jpg".to_string())]
+    );
+    assert_eq!(
+        MediaStore::artwork_for(&store, old.id).await.unwrap(),
+        vec![(
+            "Thumb".to_string(),
+            "local".to_string(),
+            "/tv/x-thumb.jpg".to_string()
+        )]
+    );
+
+    assert_eq!(store.readmit_series(&[]).await.unwrap(), 0);
+    assert_eq!(
+        store.readmit_series(&[FOLDER.to_string()]).await.unwrap(),
+        1
+    );
+
+    let owner = TranslationOwner::Item(old.id);
+    MetadataTranslationStore::upsert_translations(
+        &store,
+        &owner,
+        &[LocalizedText {
+            language: "eng".into(),
+            title: Some("x".into()),
+            ..Default::default()
+        }],
+        1,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        MetadataTranslationStore::delete_translations(&store, &owner)
+            .await
+            .unwrap(),
+        1
+    );
+    assert!(MetadataTranslationStore::translations_for(
+        &store,
+        std::slice::from_ref(&owner),
+        &["eng".to_string()],
+        true,
+    )
+    .await
+    .unwrap()
+    .is_empty());
+
+    const SHOW_A: &str = "/tv/Show A";
+    const SHOW_A_EP: &str = "/tv/Show A/S01E01.mkv";
+    const SHOW_B: &str = "/tv/Show B";
+    assert!(store
+        .insert_series_override(SeriesOverride {
+            id: 0,
+            series_folder: SHOW_A.into(),
+            path: None,
+            target_key: SHOW_A.into(),
+            target_name: Some("Show A".into()),
+            target_year: Some(2005),
+            source: OverrideSource::Scanner,
+            created_by: None,
+            created_at: 1_700_000_010,
+        })
+        .await
+        .unwrap());
+    let first_folder_admin = store
+        .replace_admin_override(SeriesOverride {
+            id: 0,
+            series_folder: SHOW_A.into(),
+            path: None,
+            target_key: format!("{SHOW_A}\u{1f}2005"),
+            target_name: Some("Show A (2005)".into()),
+            target_year: Some(2005),
+            source: OverrideSource::Scanner,
+            created_by: Some("alice".into()),
+            created_at: 1_700_000_020,
+        })
+        .await
+        .unwrap();
+    let second_folder_admin = store
+        .replace_admin_override(SeriesOverride {
+            id: 999,
+            series_folder: SHOW_A.into(),
+            path: None,
+            target_key: format!("{SHOW_A}\u{1f}2020"),
+            target_name: Some("Show A (2020)".into()),
+            target_year: Some(2020),
+            source: OverrideSource::Scanner,
+            created_by: Some("bob".into()),
+            created_at: 1_700_000_030,
+        })
+        .await
+        .unwrap();
+    assert_ne!(first_folder_admin, second_folder_admin);
+
+    let all_overrides = store.all_series_overrides().await.unwrap();
+    let show_a_folder_admin: Vec<&SeriesOverride> = all_overrides
+        .iter()
+        .filter(|o| {
+            o.series_folder == SHOW_A && o.path.is_none() && o.source == OverrideSource::Admin
+        })
+        .collect();
+    assert_eq!(show_a_folder_admin.len(), 1);
+    assert_eq!(show_a_folder_admin[0].id, second_folder_admin);
+    assert_eq!(
+        show_a_folder_admin[0].target_key,
+        format!("{SHOW_A}\u{1f}2020")
+    );
+    assert!(all_overrides.iter().any(|o| {
+        o.series_folder == SHOW_A && o.path.is_none() && o.source == OverrideSource::Scanner
+    }));
+
+    store
+        .replace_admin_override(SeriesOverride {
+            id: 0,
+            series_folder: SHOW_A.into(),
+            path: Some(SHOW_A_EP.into()),
+            target_key: format!("{SHOW_A}\u{1f}2005"),
+            target_name: None,
+            target_year: Some(2005),
+            source: OverrideSource::Admin,
+            created_by: Some("alice".into()),
+            created_at: 1_700_000_040,
+        })
+        .await
+        .unwrap();
+    let path_admin_id = store
+        .replace_admin_override(SeriesOverride {
+            id: 0,
+            series_folder: SHOW_A.into(),
+            path: Some(SHOW_A_EP.into()),
+            target_key: format!("{SHOW_A}\u{1f}2020"),
+            target_name: None,
+            target_year: Some(2020),
+            source: OverrideSource::Admin,
+            created_by: Some("bob".into()),
+            created_at: 1_700_000_050,
+        })
+        .await
+        .unwrap();
+
+    let all_overrides = store.all_series_overrides().await.unwrap();
+    let show_a_path_admin: Vec<&SeriesOverride> = all_overrides
+        .iter()
+        .filter(|o| {
+            o.series_folder == SHOW_A
+                && o.path.as_deref() == Some(SHOW_A_EP)
+                && o.source == OverrideSource::Admin
+        })
+        .collect();
+    assert_eq!(show_a_path_admin.len(), 1);
+    assert_eq!(show_a_path_admin[0].id, path_admin_id);
+    assert_eq!(
+        show_a_path_admin[0].target_key,
+        format!("{SHOW_A}\u{1f}2020")
+    );
+    assert!(all_overrides
+        .windows(2)
+        .all(|w| (w[0].created_at, w[0].id) >= (w[1].created_at, w[1].id)));
+    let show_a_times: Vec<i64> = all_overrides
+        .iter()
+        .filter(|o| o.series_folder == SHOW_A)
+        .map(|o| o.created_at)
+        .collect();
+    assert_eq!(
+        show_a_times,
+        vec![1_700_000_050, 1_700_000_030, 1_700_000_010]
+    );
+
+    let deleted = store
+        .delete_series_override(path_admin_id)
+        .await
+        .unwrap()
+        .expect("path override exists");
+    assert_eq!(deleted.id, path_admin_id);
+    assert_eq!(deleted.path.as_deref(), Some(SHOW_A_EP));
+    assert_eq!(
+        store.delete_series_override(path_admin_id).await.unwrap(),
+        None
+    );
+    assert!(store
+        .all_series_overrides()
+        .await
+        .unwrap()
+        .iter()
+        .all(|o| o.id != path_admin_id));
+
+    SeriesMetadataStore::upsert_series_metadata(
+        &store,
+        pharos_core::SeriesMetadata {
+            series_key: SHOW_A.into(),
+            series_name: "Show A".into(),
+            match_source: Some("search".into()),
+            match_flag: Some("ambiguous".into()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    SeriesMetadataStore::upsert_series_metadata(
+        &store,
+        pharos_core::SeriesMetadata {
+            series_key: SHOW_B.into(),
+            series_name: "Show B".into(),
+            match_source: Some("search".into()),
+            match_flag: None,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        store.flagged_series_keys().await.unwrap(),
+        vec![SHOW_A.to_string()]
+    );
+    SeriesMetadataStore::upsert_series_metadata(
+        &store,
+        pharos_core::SeriesMetadata {
+            series_key: SHOW_A.into(),
+            series_name: "Show A".into(),
+            match_source: Some("search".into()),
+            match_flag: None,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let manual_ep = ep(9_300_003, "Show A - S01E02.mkv", Some(1996));
+    let search_ep = ep(9_300_004, "Show A - S01E03.mkv", Some(1996));
+    MediaStore::put(&store, manual_ep.clone()).await.unwrap();
+    MediaStore::put(&store, search_ep.clone()).await.unwrap();
+    MediaStore::set_item_match(
+        &store,
+        manual_ep.id,
+        "tvdb",
+        "123",
+        "manual",
+        Some(1.0),
+        600,
+    )
+    .await
+    .unwrap();
+    MediaStore::set_item_match(
+        &store,
+        search_ep.id,
+        "tvdb",
+        "456",
+        "search",
+        Some(0.9),
+        600,
+    )
+    .await
+    .unwrap();
+    assert!(store.clear_manual_matches(&[]).await.unwrap().is_empty());
+    assert_eq!(
+        store
+            .clear_manual_matches(&[search_ep.id, manual_ep.id])
+            .await
+            .unwrap(),
+        vec![(manual_ep.id, "123".to_string())]
+    );
+    let got_manual = MediaStore::get(&store, manual_ep.id).await.unwrap();
+    assert_eq!(got_manual.match_source, None);
+    assert_eq!(got_manual.match_provider, None);
+    assert_eq!(got_manual.match_external_id, None);
+    assert_eq!(got_manual.match_confidence, None);
+    let got_search = MediaStore::get(&store, search_ep.id).await.unwrap();
+    assert_eq!(got_search.match_source.as_deref(), Some("search"));
+    assert_eq!(got_search.match_provider.as_deref(), Some("tvdb"));
+    assert_eq!(got_search.match_external_id.as_deref(), Some("456"));
+    assert_eq!(got_search.match_confidence, Some(0.9));
+
+    let sweep = MediaStore::begin_scan(&store, std::path::Path::new(ROOT))
+        .await
+        .unwrap();
+    MediaStore::sweep_unseen(&store, sweep, ROOT).await.unwrap();
+}
+
+/// `ReadPositionStore` (023): the contract that keeps a book's reading
+/// position apart from its playback state (V354) and drives "Continue
+/// reading".
+async fn run_read_position_conformance<S>(store: S)
+where
+    S: pharos_core::MediaStore
+        + pharos_core::UserStore
+        + pharos_core::UserDataStore
+        + pharos_core::ReadPositionStore
+        + Send
+        + Sync,
+{
+    use pharos_core::ReadPosition;
+    let uid = user_record("reader");
+    let uid = {
+        let id = uid.id;
+        UserStore::create(&store, uid).await.unwrap();
+        id
+    };
+    let other = user_record("other");
+    let other = {
+        let id = other.id;
+        UserStore::create(&store, other).await.unwrap();
+        id
+    };
+    let (a, b, c): (MediaId, MediaId, MediaId) = (8_101, 8_102, 8_103);
+    for (id, title) in [(a, "Book A"), (b, "Book B"), (c, "Book C")] {
+        MediaStore::put(&store, media_item(id, title))
+            .await
+            .unwrap();
+    }
+    let pos = |locator: &str, fraction: f32, updated_at: i64| ReadPosition {
+        locator: locator.into(),
+        fraction,
+        updated_at,
+    };
+
+    assert_eq!(store.get_read_position(uid, a).await.unwrap(), None);
+    assert_eq!(
+        store.read_positions_bulk(uid, &[a, b]).await.unwrap(),
+        vec![None, None]
+    );
+    assert!(store
+        .read_positions_bulk(uid, &[])
+        .await
+        .unwrap()
+        .is_empty());
+
+    store
+        .set_read_position(uid, a, pos("epub:2:10", 0.25, 100))
+        .await
+        .unwrap();
+    store
+        .set_read_position(uid, b, pos("epub:0:0", 0.5, 300))
+        .await
+        .unwrap();
+    store
+        .set_read_position(uid, c, pos("epub:1:1", 0.0, 400))
+        .await
+        .unwrap();
+    store
+        .set_read_position(other, a, pos("epub:9:9", 0.9, 500))
+        .await
+        .unwrap();
+    assert_eq!(
+        store.get_read_position(uid, a).await.unwrap(),
+        Some(pos("epub:2:10", 0.25, 100))
+    );
+    // A second save replaces the first.
+    store
+        .set_read_position(uid, a, pos("epub:3:0", 0.75, 200))
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .read_positions_bulk(uid, &[c, a, 9_999_999])
+            .await
+            .unwrap(),
+        vec![
+            Some(pos("epub:1:1", 0.0, 400)),
+            Some(pos("epub:3:0", 0.75, 200)),
+            None
+        ]
+    );
+
+    // Newest reading wins (V1131): an older reading is kept out and reported,
+    // an equal one is stored again (a retry).
+    assert!(!store
+        .set_read_position(uid, a, pos("epub:1:0", 0.1, 150))
+        .await
+        .unwrap());
+    assert_eq!(
+        store.get_read_position(uid, a).await.unwrap(),
+        Some(pos("epub:3:0", 0.75, 200))
+    );
+    assert!(store
+        .set_read_position(uid, a, pos("epub:3:0", 0.75, 200))
+        .await
+        .unwrap());
+
+    // Part read: fraction above 0, newest save first, one user's own.
+    assert_eq!(store.part_read_items(uid, 10).await.unwrap(), vec![b, a]);
+    assert_eq!(store.part_read_items(uid, 1).await.unwrap(), vec![b]);
+    assert_eq!(store.part_read_items(other, 10).await.unwrap(), vec![a]);
+
+    // Saving a position does not touch the playback state, and a played book
+    // drops out of the list without losing its position.
+    assert_eq!(
+        UserDataStore::get_user_data(&store, uid, a).await.unwrap(),
+        UserItemData::default()
+    );
+    UserDataStore::set_user_data(
+        &store,
+        uid,
+        b,
+        UserItemData {
+            played: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(store.part_read_items(uid, 10).await.unwrap(), vec![a]);
+    assert!(store.get_read_position(uid, b).await.unwrap().is_some());
+    assert_eq!(
+        UserDataStore::get_user_data(&store, uid, b)
+            .await
+            .unwrap()
+            .last_played_position_ticks,
+        0
+    );
+}
+
+/// A database of its own for one postgres conformance arm, dropped and
+/// recreated each run. The arms run side by side (nextest runs each test in its
+/// own process) and each asserts on whole-table state, such as "newest three
+/// items" or "the runtime config is still the default", so one shared database
+/// let one arm's rows land in another's view mid-assertion, and a retry saw
+/// the first try's rows.
+#[cfg(feature = "postgres")]
+async fn fresh_postgres_url(shared: &str, arm: &str) -> String {
+    use sqlx::Connection;
+    let (base, _) = shared.rsplit_once('/').expect("postgres url has a db path");
+    let db = format!("pharos_conformance_{arm}");
+    let mut admin = sqlx::postgres::PgConnection::connect(&format!("{base}/postgres"))
+        .await
+        .expect("connect postgres admin db");
+    // DROP/CREATE DATABASE cannot run inside a transaction.
+    sqlx::query(sqlx::AssertSqlSafe(format!("DROP DATABASE IF EXISTS {db}")))
+        .execute(&mut admin)
+        .await
+        .expect("drop conformance db");
+    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {db}")))
+        .execute(&mut admin)
+        .await
+        .expect("create conformance db");
+    format!("{base}/{db}")
+}
+
+async fn series_row<S: SeriesMetadataStore>(store: &S, key: &str) -> SeriesMetadata {
+    store
+        .series_metadata_by_keys(&[key.to_string()])
+        .await
+        .unwrap()
+        .remove(key)
+        .unwrap()
+}
+
+/// ADR-0097 / V1030: an admin edit is written, locked, and kept by the
+/// scan's put and the series enricher's upsert until it is unlocked.
+async fn run_metadata_edit_conformance<S>(store: S)
+where
+    S: MediaStore + SeriesMetadataStore + MetadataEditStore,
+{
+    const ID: MediaId = 8_870_001;
+    let scanned = |overview: &str| {
+        let mut item = media_item(ID, "Scanned Title");
+        item.metadata.overview = Some(overview.into());
+        item.metadata.tagline = Some("Scanned tagline".into());
+        item.metadata.production_year = Some(1998);
+        item
+    };
+    MediaStore::put(&store, scanned("Scanned overview"))
+        .await
+        .unwrap();
+
+    let edit = MetadataEdit {
+        title: Some("Edited Title".into()),
+        overview: Some(Some("Admin overview".into())),
+        tagline: Some(None),
+        community_rating: Some(Some(7.5)),
+        premiere_date: Some(Some(900_000_000)),
+        ..Default::default()
+    };
+    let locked = store
+        .edit_metadata(&EditTarget::Item(ID), &edit)
+        .await
+        .unwrap();
+    assert_eq!(locked, edit.fields());
+    let got = MediaStore::get(&store, ID).await.unwrap();
+    assert_eq!(got.title, "Edited Title");
+    assert_eq!(got.metadata.overview.as_deref(), Some("Admin overview"));
+    assert_eq!(got.metadata.tagline, None, "a cleared field stays cleared");
+    assert_eq!(got.metadata.community_rating, Some(7.5));
+    assert_eq!(got.metadata.premiere_date, Some(900_000_000));
+    assert_eq!(got.locked, edit.fields());
+    assert_eq!(
+        store.stored_sort_name(ID).await.unwrap().as_deref(),
+        Some(pharos_core::sort_name("Edited Title").as_str()),
+        "an unlocked sort title follows a new title"
+    );
+
+    // A rescan writes everything it found except the locked columns.
+    let mut rescan = scanned("Rescanned overview");
+    rescan.metadata.production_year = Some(1999);
+    rescan.metadata.community_rating = Some(3.0);
+    MediaStore::put(&store, rescan.clone()).await.unwrap();
+    let got = MediaStore::get(&store, ID).await.unwrap();
+    assert_eq!(got.title, "Edited Title");
+    assert_eq!(got.metadata.overview.as_deref(), Some("Admin overview"));
+    assert_eq!(got.metadata.tagline, None);
+    assert_eq!(got.metadata.community_rating, Some(7.5));
+    assert_eq!(
+        got.metadata.production_year,
+        Some(1999),
+        "unlocked fields refresh"
+    );
+    assert_eq!(got.locked, edit.fields(), "a put never touches the locks");
+    assert_eq!(
+        store.stored_sort_name(ID).await.unwrap().as_deref(),
+        Some(pharos_core::sort_name("Edited Title").as_str()),
+        "the sort title stays with the locked title, not the rescan's"
+    );
+    MediaStore::put_batch(&store, &[rescan.clone()])
+        .await
+        .unwrap();
+    assert_eq!(
+        MediaStore::get(&store, ID).await.unwrap().title,
+        "Edited Title",
+        "the batch put keeps locks too"
+    );
+
+    // Unlocking keeps the value until the next scan writes its own.
+    let unlock: LockedFields = [EditableField::Overview].into_iter().collect();
+    let locked = store
+        .edit_metadata(
+            &EditTarget::Item(ID),
+            &MetadataEdit {
+                unlock,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(!locked.contains(EditableField::Overview));
+    assert!(locked.contains(EditableField::Title));
+    let got = MediaStore::get(&store, ID).await.unwrap();
+    assert_eq!(got.metadata.overview.as_deref(), Some("Admin overview"));
+    MediaStore::put(&store, rescan).await.unwrap();
+    let got = MediaStore::get(&store, ID).await.unwrap();
+    assert_eq!(got.metadata.overview.as_deref(), Some("Rescanned overview"));
+    assert_eq!(got.title, "Edited Title");
+
+    let sort = MetadataEdit {
+        sort_name: Some(Some("title, edited".into())),
+        ..Default::default()
+    };
+    store
+        .edit_metadata(&EditTarget::Item(ID), &sort)
+        .await
+        .unwrap();
+    MediaStore::put(&store, scanned("x")).await.unwrap();
+    assert_eq!(
+        store.stored_sort_name(ID).await.unwrap().as_deref(),
+        Some("title, edited"),
+        "a locked sort title survives a rescan"
+    );
+
+    let missing = store
+        .edit_metadata(&EditTarget::Item(8_870_999), &edit)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(missing, pharos_core::DomainError::NotFound(_)),
+        "{missing:?}"
+    );
+
+    // A show with no metadata row gets one; the enricher keeps what is locked.
+    let show = EditTarget::Series {
+        key: "conformance-edit-show".into(),
+        name: "Edit Show".into(),
+    };
+    let series_edit = MetadataEdit {
+        overview: Some(Some("Admin show overview".into())),
+        genres: Some(vec!["Drama".into()]),
+        ..Default::default()
+    };
+    let locked = store.edit_metadata(&show, &series_edit).await.unwrap();
+    assert_eq!(locked, series_edit.fields());
+    let key = "conformance-edit-show".to_string();
+    let row = series_row(&store, &key).await;
+    assert_eq!(row.series_name, "Edit Show");
+    assert_eq!(row.overview.as_deref(), Some("Admin show overview"));
+    assert_eq!(row.genres, vec!["Drama".to_string()]);
+    assert_eq!(row.locked, series_edit.fields());
+    store
+        .upsert_series_metadata(SeriesMetadata {
+            series_key: key.clone(),
+            series_name: "Edit Show".into(),
+            match_source: Some("search".into()),
+            overview: Some("Provider overview".into()),
+            genres: vec!["Comedy".into()],
+            community_rating: Some(8.0),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let row = series_row(&store, &key).await;
+    assert_eq!(row.overview.as_deref(), Some("Admin show overview"));
+    assert_eq!(row.genres, vec!["Drama".to_string()]);
+    assert_eq!(
+        row.community_rating,
+        Some(8.0),
+        "unlocked show fields refresh"
+    );
+    assert_eq!(row.match_source.as_deref(), Some("search"));
+    assert_eq!(
+        row.locked,
+        series_edit.fields(),
+        "the upsert never touches the locks"
+    );
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn sqlite_read_position_conformance() {
+    let s = pharos_store_sqlx::sqlite::SqliteStore::connect("sqlite::memory:")
+        .await
+        .expect("connect in-memory sqlite");
+    run_read_position_conformance(s).await;
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn sqlite_metadata_edit_conformance() {
+    let s = pharos_store_sqlx::sqlite::SqliteStore::connect("sqlite::memory:")
+        .await
+        .expect("connect in-memory sqlite");
+    run_metadata_edit_conformance(s).await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn postgres_read_position_conformance() {
+    let Ok(url) = std::env::var("PHAROS_TEST_POSTGRES_URL") else {
+        eprintln!("SKIP postgres_read_position_conformance: PHAROS_TEST_POSTGRES_URL unset");
+        return;
+    };
+    let url = fresh_postgres_url(&url, "read_position").await;
+    let p = pharos_store_sqlx::postgres::PostgresStore::connect(&url)
+        .await
+        .expect("connect postgres");
+    run_read_position_conformance(p).await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn postgres_metadata_edit_conformance() {
+    let Ok(url) = std::env::var("PHAROS_TEST_POSTGRES_URL") else {
+        eprintln!("SKIP postgres_metadata_edit_conformance: PHAROS_TEST_POSTGRES_URL unset");
+        return;
+    };
+    let url = fresh_postgres_url(&url, "metadata_edit").await;
+    let p = pharos_store_sqlx::postgres::PostgresStore::connect(&url)
+        .await
+        .expect("connect postgres");
+    run_metadata_edit_conformance(p).await;
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn sqlite_series_identity_conformance() {
+    let s = pharos_store_sqlx::sqlite::SqliteStore::connect("sqlite::memory:")
+        .await
+        .expect("connect in-memory sqlite");
+    run_series_identity_conformance(s).await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn postgres_series_identity_conformance() {
+    let Ok(url) = std::env::var("PHAROS_TEST_POSTGRES_URL") else {
+        eprintln!("SKIP postgres_series_identity_conformance: PHAROS_TEST_POSTGRES_URL unset");
+        return;
+    };
+    let url = fresh_postgres_url(&url, "series_identity").await;
+    let p = pharos_store_sqlx::postgres::PostgresStore::connect(&url)
+        .await
+        .expect("connect postgres");
+    run_series_identity_conformance(p).await;
 }
 
 #[cfg(feature = "sqlite")]
@@ -2469,8 +3891,252 @@ async fn postgres_conformance() {
         eprintln!("SKIP postgres_conformance: PHAROS_TEST_POSTGRES_URL unset");
         return;
     };
+    let url = fresh_postgres_url(&url, "main").await;
+    let p = pharos_store_sqlx::postgres::PostgresStore::connect_with(
+        &url,
+        pharos_store_sqlx::PoolConfig {
+            max_connections: 5,
+            acquire_timeout: std::time::Duration::from_secs(7),
+        },
+    )
+    .await
+    .expect("connect postgres");
+    // B836 — a configured pool is the one the postgres store opens.
+    assert_eq!(p.pool().options().get_max_connections(), 5);
+    assert_eq!(
+        p.pool().options().get_acquire_timeout(),
+        std::time::Duration::from_secs(7)
+    );
+    run_conformance(p).await;
+}
+
+/// V1140 — the stale-art sweep's store reads and writes: keyset paging over the
+/// servable artwork rows, a removed Primary clearing its flag and bumping the
+/// art version, and re-admission that never reaches a manual match.
+async fn run_artwork_repair_conformance<S: MediaStore>(store: S) {
+    const NOW: i64 = 1_000;
+    const TTL_CUTOFF: i64 = 500;
+    for id in 1..=3 {
+        store.put(media_item(id, "a film")).await.unwrap();
+    }
+    store
+        .set_artwork(1, "Primary", "local", "/lib/one/poster.jpg")
+        .await
+        .unwrap();
+    store
+        .set_artwork(1, "Backdrop", "url", "https://example.invalid/one.jpg")
+        .await
+        .unwrap();
+    store
+        .set_artwork(2, "Backdrop", "TMDB", "/cache/two/backdrop.jpg")
+        .await
+        .unwrap();
+    store
+        .set_artwork(2, "Logo", "local", "/lib/two/logo.png")
+        .await
+        .unwrap();
+    store
+        .set_artwork(3, "Primary", "upload", "/cache/three/upload.jpg")
+        .await
+        .unwrap();
+
+    // Pages of two over the servable rows in (item, role) order. The url and
+    // upload rows are never served; the uppercase TMDB source still is.
+    let keys = |rows: Vec<pharos_core::ArtworkRow>| {
+        rows.into_iter()
+            .map(|r| (r.item_id, r.role))
+            .collect::<Vec<_>>()
+    };
+    let cursor =
+        |rows: &[pharos_core::ArtworkRow]| rows.last().map(|r| (r.item_id, r.role.clone()));
+    let first = store.servable_artwork_page(None, 2).await.unwrap();
+    assert_eq!(
+        keys(first.clone()),
+        vec![(1, "Primary".to_owned()), (2, "Backdrop".to_owned())]
+    );
+    assert_eq!(first[1].source, "TMDB");
+    let second = store
+        .servable_artwork_page(cursor(&first), 2)
+        .await
+        .unwrap();
+    assert_eq!(keys(second.clone()), vec![(2, "Logo".to_owned())]);
+    let third = store
+        .servable_artwork_page(cursor(&second), 2)
+        .await
+        .unwrap();
+    assert!(third.is_empty(), "the page after the last row is empty");
+
+    // A removed Primary clears has_primary_art and bumps art_version.
+    let before = store.get(1).await.unwrap();
+    assert!(before.has_primary_art);
+    store
+        .remove_dead_artwork(1, "Primary", false)
+        .await
+        .unwrap();
+    let after = store.get(1).await.unwrap();
+    assert!(!after.has_primary_art, "a removed Primary clears the flag");
+    assert_eq!(
+        after.art_version,
+        before.art_version + 1,
+        "a removal bumps the art version"
+    );
+    let rows = store.artwork_for(1).await.unwrap();
+    assert!(rows.iter().all(|(role, _, _)| role != "Primary"));
+    assert!(rows.iter().any(|(role, _, _)| role == "Backdrop"));
+
+    // Re-admission: both items are matched and fresh, so neither is due.
+    let ids = |items: Vec<MediaItem>| items.into_iter().map(|i| i.id).collect::<Vec<_>>();
+    for (id, source) in [(2, "search"), (3, "manual")] {
+        store
+            .set_item_match(id, "tmdb", "ext-1", source, None, NOW)
+            .await
+            .unwrap();
+    }
+    let due = ids(store.items_needing_match(10, TTL_CUTOFF).await.unwrap());
+    assert!(!due.contains(&2) && !due.contains(&3));
+
+    // A search match is re-admitted by a dead row's removal.
+    store
+        .remove_dead_artwork(2, "Backdrop", true)
+        .await
+        .unwrap();
+    let due = ids(store.items_needing_match(10, TTL_CUTOFF).await.unwrap());
+    assert!(due.contains(&2), "a search match is re-admitted");
+
+    // A manual match keeps its refresh stamp and is never re-admitted.
+    store.remove_dead_artwork(3, "Primary", true).await.unwrap();
+    assert!(store.artwork_for(3).await.unwrap().is_empty());
+    assert_eq!(
+        store.get(3).await.unwrap().metadata_refreshed_at,
+        Some(NOW),
+        "a manual match is never re-admitted"
+    );
+    let due = ids(store.items_needing_match(10, TTL_CUTOFF).await.unwrap());
+    assert!(!due.contains(&3));
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn sqlite_artwork_repair_conformance() {
+    let s = pharos_store_sqlx::sqlite::SqliteStore::connect("sqlite::memory:")
+        .await
+        .expect("connect in-memory sqlite");
+    run_artwork_repair_conformance(s).await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn postgres_artwork_repair_conformance() {
+    let Ok(url) = std::env::var("PHAROS_TEST_POSTGRES_URL") else {
+        eprintln!("SKIP postgres_artwork_repair_conformance: PHAROS_TEST_POSTGRES_URL unset");
+        return;
+    };
+    let url = fresh_postgres_url(&url, "artwork_repair").await;
     let p = pharos_store_sqlx::postgres::PostgresStore::connect(&url)
         .await
         .expect("connect postgres");
-    run_conformance(p).await;
+    run_artwork_repair_conformance(p).await;
+}
+
+/// `UserDataStore::started_items` (spec 038 FR-105): only the user's own
+/// played or part-played rows of the asked kind, newest play first.
+async fn run_started_items_conformance<S>(store: S)
+where
+    S: pharos_core::MediaStore + pharos_core::UserStore + pharos_core::UserDataStore,
+{
+    let uid = user_record("watcher");
+    let uid = {
+        let id = uid.id;
+        UserStore::create(&store, uid).await.unwrap();
+        id
+    };
+    let other = user_record("someone-else");
+    let other = {
+        let id = other.id;
+        UserStore::create(&store, other).await.unwrap();
+        id
+    };
+    let episode = |id: MediaId| MediaItem {
+        kind: MediaKind::Episode,
+        ..media_item(id, "An Episode")
+    };
+    for item in [
+        episode(1),
+        episode(2),
+        episode(3),
+        episode(4),
+        media_item(5, "A Film"),
+    ] {
+        MediaStore::put(&store, item).await.unwrap();
+    }
+    let row = |played: bool, position: u64, at: i64| UserItemData {
+        played,
+        last_played_position_ticks: position,
+        last_played_at: at,
+        ..Default::default()
+    };
+    let rows = [
+        (1, row(true, 0, 100)),
+        (2, row(false, 500, 300)),
+        // A favourite never played is not started.
+        (
+            3,
+            UserItemData {
+                is_favorite: true,
+                ..Default::default()
+            },
+        ),
+        (4, row(true, 0, 300)),
+        (5, row(true, 0, 400)),
+    ];
+    for (id, data) in rows {
+        UserDataStore::set_user_data(&store, uid, id, data)
+            .await
+            .unwrap();
+    }
+    UserDataStore::set_user_data(&store, other, 3, row(true, 0, 900))
+        .await
+        .unwrap();
+
+    let got = UserDataStore::started_items(&store, uid, MediaKind::Episode)
+        .await
+        .unwrap();
+    assert_eq!(
+        got,
+        [
+            (4, row(true, 0, 300)),
+            (2, row(false, 500, 300)),
+            (1, row(true, 0, 100))
+        ],
+        "newest play first, ties by id, the film and the unplayed favourite left out"
+    );
+    assert!(
+        UserDataStore::started_items(&store, other, MediaKind::Movie)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn sqlite_started_items_conformance() {
+    let s = pharos_store_sqlx::sqlite::SqliteStore::connect("sqlite::memory:")
+        .await
+        .expect("connect in-memory sqlite");
+    run_started_items_conformance(s).await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn postgres_started_items_conformance() {
+    let Ok(url) = std::env::var("PHAROS_TEST_POSTGRES_URL") else {
+        eprintln!("SKIP postgres_started_items_conformance: PHAROS_TEST_POSTGRES_URL unset");
+        return;
+    };
+    let url = fresh_postgres_url(&url, "started_items").await;
+    let p = pharos_store_sqlx::postgres::PostgresStore::connect(&url)
+        .await
+        .expect("connect postgres");
+    run_started_items_conformance(p).await;
 }

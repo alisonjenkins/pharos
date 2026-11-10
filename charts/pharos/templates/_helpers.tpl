@@ -58,6 +58,7 @@ ui_dir = {{ $s.uiDir | quote }}
 image_cache_dir = {{ $s.imageCacheDir | quote }}
 {{- end }}
 image_seek_seconds = {{ $s.imageSeekSeconds | int64 }}
+image_tags_enforced = {{ $s.imageTagsEnforced | default false }}
 image_cache_max_bytes = {{ $s.imageCacheMaxBytes | int64 }}
 {{- if $s.transcodeCacheDir }}
 transcode_cache_dir = {{ $s.transcodeCacheDir | quote }}
@@ -97,6 +98,9 @@ scan_probe_concurrency = {{ $s.scanProbeConcurrency | int64 }}
 library_watch_enabled = {{ $s.libraryWatchEnabled }}
 library_poll_interval_secs = {{ $s.libraryPollIntervalSecs | int64 }}
 drain_grace_secs = {{ $s.drainGraceSecs | int64 }}
+{{- with $s.httpWorkers }}
+http_workers = {{ . | int64 }}
+{{- end }}
 {{- with $s.trustedProxies }}
 trusted_proxies = [{{ range $i, $p := . }}{{ if $i }}, {{ end }}{{ $p | quote }}{{ end }}]
 {{- end }}
@@ -166,6 +170,14 @@ name = {{ .name | quote }}
 {{- if .kind }}
 kind = {{ .kind | quote }}
 {{- end }}
+{{- end }}
+{{- with (.Values.config.metadata | default dict).seriesIdentityRepair }}
+{{- if not (has . (list "dry_run" "apply")) }}
+{{- fail (printf "config.metadata.seriesIdentityRepair must be dry_run or apply, got %q" .) }}
+{{- end }}
+
+[metadata]
+series_identity_repair = {{ . | quote }}
 {{- end }}
 
 [database]

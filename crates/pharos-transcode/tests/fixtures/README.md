@@ -1,13 +1,14 @@
 # Fingerprint fixtures
 
-## `mushoku_s03_fingerprints.txt`
+## `anime_season_fingerprints.txt`
 
-Real audio fingerprints dumped from the production store on **2026-07-27**, kept so
+Real audio fingerprints (a long-running anime's third season) dumped from the production store on **2026-07-27**, kept so
 the intro-detection recall failure is reproducible in CI without media, NFS or a
-database.
+database. The fingerprints were captured from real files and are kept
+unchanged as test data, while names and paths here are generic.
 
 **Source**: `episode_fingerprints` for the five episodes of
-`/var/lib/pharos/media/TV/Mushoku Tensei - Jobless Reincarnation/Season 03`:
+`/tv/Show K/Season 03`:
 
 | `item_id` | Episode |
 |-----------|---------|
@@ -51,3 +52,20 @@ kubectl -n pharos exec pharos-db-1 -c postgres -- \
 
 Note: episode `3096759618643281933` (S03E02) matches nothing in either kind, in
 production and in replay. That is expected for this fixture, not a decoding fault.
+
+## `series_a_*`, `series_b_*`, `series_c_*` (T106)
+
+Real fingerprints dumped read-only from production on **2026-11-10**, in the same
+format as above but with **invented item ids** (`1001..`, `2001..`, `3001..`, in
+the original row order), for the fragmented-intro replay
+(`tests/it_analysis/fragmented_intro_replay.rs`). The series are not named, on
+purpose.
+
+- `series_a_fingerprints.txt`: one season, 9 episodes, a ~109 s opening whose
+  matches fragment.
+- `series_b_fingerprints.txt`: one season, 10 episodes. Control: a ~3 s title
+  card, so no intro may be emitted.
+- `series_c_fingerprints.txt`: one season, 24 episodes. Control: no theme, so no
+  intro; every episode shares an ending.
+
+Intro windows here are 1338–1634 points.

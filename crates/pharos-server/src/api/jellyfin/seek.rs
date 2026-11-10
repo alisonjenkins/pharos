@@ -85,7 +85,7 @@ impl ContentRange {
     /// ~1.8 GB for a feature film) makes a reverse proxy temp-file the whole
     /// remainder before relaying — so an unbuffered seek takes minutes and a
     /// stalled/reset progressive connection restarts the `<video>` at 0
-    /// (Deadpool). Capping a range the client explicitly asked for is always
+    /// (Film AJ). Capping a range the client explicitly asked for is always
     /// valid regardless of container (unlike a StartTimeTicks time→byte cut,
     /// which needs a [`ResyncWitness`]): we return a prefix of the requested
     /// bytes and the client asks for the next window.
@@ -384,6 +384,7 @@ mod tests {
 
     fn item(container: Option<&str>, video_codec: Option<&str>, path: &str) -> MediaItem {
         MediaItem {
+            locked: Default::default(),
             id: 1,
             path: path.into(),
             title: "t".into(),

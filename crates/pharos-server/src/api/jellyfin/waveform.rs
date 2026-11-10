@@ -52,7 +52,12 @@ impl WaveformCache {
     }
     async fn store(&self, key: WaveKey, peaks: Vec<f32>) -> Arc<Vec<f32>> {
         let shared = Arc::new(peaks);
-        self.memo.lock().await.insert(key, shared.clone());
+        let mut memo = self.memo.lock().await;
+        // A new mtime means the file was re-encoded: drop that item's peaks for
+        // the old mtime so they do not accumulate. Other bin counts at the same
+        // mtime are still valid and stay.
+        memo.retain(|k, _| !(k.0 == key.0 && k.1 != key.1));
+        memo.insert(key, shared.clone());
         shared
     }
 }
@@ -286,6 +291,39 @@ mod tests {
         assert!(cache.get(&(42, 1000, 128)).await.is_none());
         // A re-encode (new mtime) invalidates.
         assert!(cache.get(&(42, 1001, 256)).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn store_drops_peaks_of_a_superseded_mtime_for_the_same_item() {
+        // A re-encode bumps the mtime. Peaks for the old mtime (every bin
+        // count) must go, but the same mtime at another resolution stays, and
+        // other items are untouched.
+        let cache = WaveformCache::default();
+        cache.store((1, 10, 256), vec![0.1]).await;
+        cache.store((1, 10, 512), vec![0.2]).await;
+        cache.store((2, 10, 256), vec![0.3]).await;
+        cache.store((1, 11, 256), vec![0.4]).await;
+        cache.store((1, 11, 512), vec![0.5]).await;
+
+        let memo = cache.memo.lock().await;
+        assert!(
+            !memo.contains_key(&(1, 10, 256)),
+            "old mtime must be dropped"
+        );
+        assert!(
+            !memo.contains_key(&(1, 10, 512)),
+            "old mtime must be dropped"
+        );
+        assert!(memo.contains_key(&(1, 11, 256)), "new mtime must be kept");
+        assert!(
+            memo.contains_key(&(1, 11, 512)),
+            "bin counts at the same mtime must coexist"
+        );
+        assert!(
+            memo.contains_key(&(2, 10, 256)),
+            "another item must be untouched"
+        );
+        assert_eq!(memo.len(), 3, "exactly the three surviving entries remain");
     }
 
     #[test]

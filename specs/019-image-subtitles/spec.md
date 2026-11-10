@@ -2,14 +2,14 @@
 
 **Feature Branch**: `feat/ui-image-subtitles`
 **Created**: 2026-11-03T18:50:00Z
-**Status**: Ready
+**Status**: Implemented (T1-T10 all done; ADR-0060; audited 2026-11-09)
 **Scope**: The native web player (`/ui/`, 013/017) draws DVD (`dvd_subtitle`), Blu-ray (`hdmv_pgs_subtitle`) and DVB (`dvb_subtitle`) image subtitles itself, over a direct-played video, instead of the server burning them into a transcode. jellyfin-web and every Jellyfin-wire client keep today's burn-in; their `SubtitleProfiles` handling is unchanged.
 
 ---
 
 ## Problem statement
 
-013 FR-003 left image subtitles to burn-in. Turning one on in the native player therefore renegotiates the whole playback into an HLS transcode (`downgrade=subtitle_burn`): the picture is re-encoded, the stream restarts, quality drops to the transcode ceiling, and the server spends a GPU/CPU encode for the whole session. Turning it off renegotiates again. Fringe S01E01 (2026-11-03, B293) is the case that surfaced it: its only subtitles are `dvd_subtitle`.
+013 FR-003 left image subtitles to burn-in. Turning one on in the native player therefore renegotiates the whole playback into an HLS transcode (`downgrade=subtitle_burn`): the picture is re-encoded, the stream restarts, quality drops to the transcode ceiling, and the server spends a GPU/CPU encode for the whole session. Turning it off renegotiates again. Show AW S01E01 (2026-11-03, B293) is the case that surfaced it: its only subtitles are `dvd_subtitle`.
 
 ## User story 1 - Turn on an image subtitle without leaving direct play (Priority: P1)
 

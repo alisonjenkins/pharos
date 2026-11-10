@@ -37,6 +37,7 @@ async fn seed() -> (web::Data<AppState>, String) {
     let mk =
         |id: u64, title: &str, overview: Option<&str>, kind: MediaKind, year: u32, rating: &str| {
             MediaItem {
+                locked: Default::default(),
                 id,
                 path: format!("/m/{id}.mkv").into(),
                 title: title.into(),
@@ -72,7 +73,7 @@ async fn seed() -> (web::Data<AppState>, String) {
         ),
         mk(
             2,
-            "The Matrix",
+            "The Glass Lattice",
             Some("Hacker learns the truth."),
             MediaKind::Movie,
             1999,
@@ -178,7 +179,7 @@ async fn search_hints_mid_word_substring() {
 #[actix_web::test]
 async fn search_hints_searches_overview() {
     let (state, token) = seed().await;
-    // "hacker" only appears in The Matrix overview, not its title.
+    // "hacker" only appears in The Glass Lattice overview, not its title.
     let v = get_json(state, &token, "/Search/Hints?searchTerm=hacker").await;
     let names: Vec<&str> = v["SearchHints"]
         .as_array()
@@ -187,7 +188,7 @@ async fn search_hints_searches_overview() {
         .filter(|h| h["IsFolder"] == false)
         .map(|h| h["Name"].as_str().unwrap())
         .collect();
-    assert!(names.contains(&"The Matrix"), "got {names:?}");
+    assert!(names.contains(&"The Glass Lattice"), "got {names:?}");
 }
 
 #[actix_web::test]

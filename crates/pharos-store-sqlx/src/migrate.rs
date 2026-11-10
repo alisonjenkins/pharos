@@ -1,124 +1,124 @@
 //! One-shot SQLite -> Postgres data migration (`pharos admin db-migrate`).
 //!
-//! Copies every domain table from a live `SqliteStore` into a freshly
-//! migrated (empty) `PostgresStore`, preserving primary-key ids so
-//! association tables (item_genres, playlist_items, …) keep resolving.
-//! Runs as a single postgres transaction: any failure rolls back cleanly,
-//! leaving the target database untouched. After the copy, `setval` bumps
-//! every identity/serial sequence past the copied max id so future inserts
-//! don't collide, and a final count-verification pass (run after commit,
-//! independently on both pools) confirms every row made it across.
+//! Copies every table in [`COPIED_TABLES`] from a live `SqliteStore` into a
+//! freshly migrated (empty) `PostgresStore`. Ids are kept, so association
+//! tables (item_genres, playlist_items, …) keep resolving. The copy runs as
+//! a single postgres transaction, so any failure rolls back and leaves the
+//! target untouched. After the copy, `setval` moves every id sequence past
+//! the copied max id so later inserts don't collide. A final count check,
+//! run after commit on both pools, confirms every row arrived.
 //!
-//! Table order is FK-safe: parents first (users, libraries, genres,
-//! people, studios, tags, collections, playlists, media_items,
-//! system_identity, runtime_config, named_config, scan_runs), then the
-//! dependents that reference them (auth_tokens, user_data,
-//! user_configuration, display_preferences, user_prefs, artwork, item_genres,
-//! item_people, item_studios, item_tags, collection_items,
-//! playlist_items).
+//! The copy follows the schema rather than a hand-kept column list (B1071):
+//! every column the SQLite table has is copied, with each value decoded by
+//! the type of its Postgres column. A column the target lacks, or a type the
+//! copy cannot carry, is an error naming the table and column. A SQLite table
+//! on neither [`COPIED_TABLES`] nor [`NOT_COPIED`] stops the migration before
+//! anything is written, so a table added later cannot be dropped silently.
 //!
-//! Type notes (see the individual copy functions): there are no BOOLEAN
-//! columns in either backend (booleans are 0/1 INTEGER), and postgres
-//! implicitly assignment-casts a wider bind (i64 into an INTEGER column,
-//! f64 into a REAL column) when it lands in an INSERT target column, so
-//! every integer field is read from sqlite and bound into postgres as
-//! `i64` uniformly regardless of the declared column width, and every
-//! REAL/real field as `f64`. BLOB / BYTEA columns round-trip as `Vec<u8>`.
-
-// Every copy function reads a row shape straight off its SQL SELECT into a
-// tuple (or, for media_items, a dedicated FromRow struct) — wide tuples are
-// the simplest honest representation of a wide table's columns here, so
-// the type-complexity lint is silenced file-wide rather than aliased away
-// table-by-table.
-#![allow(clippy::type_complexity)]
+//! Table order is FK-safe: parents first, then the tables that reference them.
 
 use crate::postgres::PostgresStore;
 use crate::sqlite::SqliteStore;
 use crate::StoreError;
-use sqlx::{PgPool, Postgres, SqlitePool, Transaction};
+use sqlx::{PgPool, Postgres, Row, SqlitePool, Transaction};
 
 /// Per-table row counts copied, in copy order.
 pub struct MigrationReport {
     pub tables: Vec<(String, u64)>,
 }
 
-/// Copy every domain table from `src` (SQLite) into `dst` (Postgres). `dst`
-/// must be an empty database — the postgres schema migrations already ran
-/// at `PostgresStore::connect` time, so the tables exist but hold no rows.
-/// Verifies row counts match on both sides before returning; on any
-/// mismatch (or sqlx error) the target's insert transaction has already
-/// rolled back, so a failed call leaves `dst` untouched.
+/// Every table the migration copies, parents before the tables that
+/// reference them.
+pub const COPIED_TABLES: &[&str] = &[
+    // Parents.
+    "users",
+    "libraries",
+    "genres",
+    "people",
+    "studios",
+    "tags",
+    "collections",
+    "playlists",
+    "media_items",
+    "series_metadata",
+    "series_overrides",
+    "person_details",
+    "metadata_translations",
+    "system_identity",
+    "server_secrets",
+    "runtime_config",
+    "named_config",
+    "scan_runs",
+    "sync_groups",
+    // Dependents.
+    "auth_tokens",
+    "user_data",
+    "user_configuration",
+    "display_preferences",
+    "user_prefs",
+    "read_positions",
+    "artwork",
+    "item_genres",
+    "item_people",
+    "item_studios",
+    "item_tags",
+    "collection_items",
+    "playlist_items",
+    "episode_fingerprints",
+    "media_segments",
+    "media_segment_scans",
+    "media_segments_snapshot",
+    "subtitle_styling",
+    "subtitle_signals",
+    "transcode_sessions",
+];
+
+/// SQLite tables the migration leaves behind on purpose, with the reason.
+/// Each one is rebuilt or kept by the target itself.
+pub const NOT_COPIED: &[(&str, &str)] = &[
+    (
+        "_sqlx_migrations",
+        "each backend records its own migrations",
+    ),
+    ("sqlite_sequence", "SQLite's own AUTOINCREMENT bookkeeping"),
+    (
+        "language_codes",
+        "the postgres migration seeds the same rows",
+    ),
+    (
+        "media_item_languages",
+        "derived: the postgres insert trigger indexes each copied item",
+    ),
+    (
+        "media_fts",
+        "SQLite full-text index; postgres derives search_tsv",
+    ),
+    ("media_fts_config", "SQLite full-text index shadow table"),
+    ("media_fts_data", "SQLite full-text index shadow table"),
+    ("media_fts_docsize", "SQLite full-text index shadow table"),
+    ("media_fts_idx", "SQLite full-text index shadow table"),
+];
+
+/// Copy every table in [`COPIED_TABLES`] from `src` (SQLite) into `dst`
+/// (Postgres). `dst` must be an empty database: the postgres schema
+/// migrations already ran at `PostgresStore::connect` time, so the tables
+/// exist but hold no rows. Row counts are checked on both sides before
+/// returning. On any mismatch or sqlx error the insert transaction has
+/// already rolled back, so a failed call leaves `dst` untouched.
 pub async fn migrate_sqlite_to_postgres(
     src: &SqliteStore,
     dst: &PostgresStore,
 ) -> Result<MigrationReport, StoreError> {
     let sp = src.pool();
     let dp = dst.pool();
+    refuse_unknown_tables(sp).await?;
     let mut tx = dp.begin().await.map_err(StoreError::Sqlx)?;
 
-    let mut tables: Vec<(String, u64)> = Vec::new();
-
-    // -- Parents ---------------------------------------------------
-    tables.push(("users".into(), copy_users(sp, &mut tx).await?));
-    tables.push(("libraries".into(), copy_libraries(sp, &mut tx).await?));
-    tables.push((
-        "genres".into(),
-        copy_id_name_wire(sp, &mut tx, "genres").await?,
-    ));
-    tables.push(("people".into(), copy_people(sp, &mut tx).await?));
-    tables.push((
-        "studios".into(),
-        copy_id_name_wire(sp, &mut tx, "studios").await?,
-    ));
-    tables.push(("tags".into(), copy_id_name_wire(sp, &mut tx, "tags").await?));
-    tables.push(("collections".into(), copy_collections(sp, &mut tx).await?));
-    tables.push(("playlists".into(), copy_playlists(sp, &mut tx).await?));
-    tables.push(("media_items".into(), copy_media_items(sp, &mut tx).await?));
-    tables.push((
-        "system_identity".into(),
-        copy_system_identity(sp, &mut tx).await?,
-    ));
-    tables.push((
-        "runtime_config".into(),
-        copy_runtime_config(sp, &mut tx).await?,
-    ));
-    tables.push(("named_config".into(), copy_named_config(sp, &mut tx).await?));
-    tables.push(("scan_runs".into(), copy_scan_runs(sp, &mut tx).await?));
-
-    // -- Dependents --------------------------------------------------
-    tables.push(("auth_tokens".into(), copy_auth_tokens(sp, &mut tx).await?));
-    tables.push(("user_data".into(), copy_user_data(sp, &mut tx).await?));
-    tables.push((
-        "user_configuration".into(),
-        copy_user_configuration(sp, &mut tx).await?,
-    ));
-    tables.push((
-        "display_preferences".into(),
-        copy_display_preferences(sp, &mut tx).await?,
-    ));
-    tables.push(("user_prefs".into(), copy_user_prefs(sp, &mut tx).await?));
-    tables.push(("artwork".into(), copy_artwork(sp, &mut tx).await?));
-    tables.push((
-        "item_genres".into(),
-        copy_item_link(sp, &mut tx, "item_genres", "genre_id").await?,
-    ));
-    tables.push(("item_people".into(), copy_item_people(sp, &mut tx).await?));
-    tables.push((
-        "item_studios".into(),
-        copy_item_link(sp, &mut tx, "item_studios", "studio_id").await?,
-    ));
-    tables.push((
-        "item_tags".into(),
-        copy_item_link(sp, &mut tx, "item_tags", "tag_id").await?,
-    ));
-    tables.push((
-        "collection_items".into(),
-        copy_collection_items(sp, &mut tx).await?,
-    ));
-    tables.push((
-        "playlist_items".into(),
-        copy_playlist_items(sp, &mut tx).await?,
-    ));
+    let mut tables: Vec<(String, u64)> = Vec::with_capacity(COPIED_TABLES.len());
+    for table in COPIED_TABLES {
+        let n = copy_table(sp, &mut tx, table).await?;
+        tables.push(((*table).to_string(), n));
+    }
 
     tx.commit().await.map_err(StoreError::Sqlx)?;
 
@@ -127,10 +127,219 @@ pub async fn migrate_sqlite_to_postgres(
     Ok(MigrationReport { tables })
 }
 
-/// Bump `table`'s id sequence past the copied max id (identity + serial
-/// columns alike — `pg_get_serial_sequence` resolves both), so the next
-/// app-driven insert doesn't collide with a migrated id.
+/// The SQLite tables on neither list. Empty when the lists cover the schema.
+pub async fn unlisted_tables(sp: &SqlitePool) -> Result<Vec<String>, StoreError> {
+    let names: Vec<(String,)> =
+        sqlx::query_as("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+            .fetch_all(sp)
+            .await
+            .map_err(StoreError::Sqlx)?;
+    Ok(names
+        .into_iter()
+        .map(|(n,)| n)
+        .filter(|n| !COPIED_TABLES.contains(&n.as_str()))
+        .filter(|n| !NOT_COPIED.iter().any(|(skip, _)| skip == n))
+        .collect())
+}
+
+async fn refuse_unknown_tables(sp: &SqlitePool) -> Result<(), StoreError> {
+    let unknown = unlisted_tables(sp).await?;
+    if unknown.is_empty() {
+        return Ok(());
+    }
+    Err(StoreError::Parse(format!(
+        "migration does not know how to treat table(s) {}: add each to COPIED_TABLES or \
+         NOT_COPIED in migrate.rs",
+        unknown.join(", ")
+    )))
+}
+
+/// How a value is read from SQLite and bound into Postgres, chosen by the
+/// Postgres column's type. Integers bind as `i64` and floats as `f64`
+/// whatever their width, since postgres assignment-casts a wider bind into
+/// an INSERT's target column.
+#[derive(Debug, Clone, Copy)]
+enum Carry {
+    Int,
+    Float,
+    Text,
+    Bytes,
+    /// SQLite stores booleans as 0/1 INTEGER.
+    Bool,
+}
+
+impl Carry {
+    fn for_pg_type(table: &str, column: &str, data_type: &str) -> Result<Self, StoreError> {
+        Ok(match data_type {
+            "bigint" | "integer" | "smallint" => Self::Int,
+            "real" | "double precision" => Self::Float,
+            "text" | "character varying" => Self::Text,
+            "bytea" => Self::Bytes,
+            "boolean" => Self::Bool,
+            other => {
+                return Err(StoreError::Parse(format!(
+                    "migration cannot carry {table}.{column}: postgres type {other}"
+                )))
+            }
+        })
+    }
+}
+
+/// The copied columns of `table`: every non-generated SQLite column, with
+/// how each is carried into its postgres column.
+async fn columns(
+    sp: &SqlitePool,
+    tx: &mut Transaction<'_, Postgres>,
+    table: &str,
+) -> Result<Vec<(String, Carry)>, StoreError> {
+    // `pragma_table_info` leaves out generated columns, which the target
+    // computes itself.
+    let sqlite_cols: Vec<(String,)> =
+        sqlx::query_as("SELECT name FROM pragma_table_info(?1) ORDER BY cid")
+            .bind(table)
+            .fetch_all(sp)
+            .await
+            .map_err(StoreError::Sqlx)?;
+    let pg_cols: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT column_name::text, data_type::text, is_generated::text \
+         FROM information_schema.columns \
+         WHERE table_schema = current_schema() AND table_name = $1",
+    )
+    .bind(table)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(StoreError::Sqlx)?;
+    if pg_cols.is_empty() {
+        return Err(StoreError::Parse(format!(
+            "migration target has no table {table}"
+        )));
+    }
+    let mut out = Vec::with_capacity(sqlite_cols.len());
+    for (name,) in sqlite_cols {
+        let Some((_, data_type, generated)) = pg_cols.iter().find(|(c, ..)| *c == name) else {
+            return Err(StoreError::Parse(format!(
+                "migration target has no column {table}.{name}"
+            )));
+        };
+        if generated == "ALWAYS" {
+            continue;
+        }
+        out.push((name.clone(), Carry::for_pg_type(table, &name, data_type)?));
+    }
+    Ok(out)
+}
+
+/// One value on its way across, already in its postgres shape.
+#[derive(Debug, Clone, PartialEq)]
+enum Value {
+    Int(Option<i64>),
+    Float(Option<f64>),
+    Text(Option<String>),
+    Bytes(Option<Vec<u8>>),
+    Bool(Option<bool>),
+}
+
+fn read(row: &sqlx::sqlite::SqliteRow, i: usize, carry: Carry) -> Result<Value, StoreError> {
+    // Unchecked: a column without STRICT may hold another storage class
+    // (an INTEGER in a REAL column), which SQLite converts on read.
+    Ok(match carry {
+        Carry::Int => Value::Int(row.try_get_unchecked(i).map_err(StoreError::Sqlx)?),
+        Carry::Float => Value::Float(row.try_get_unchecked(i).map_err(StoreError::Sqlx)?),
+        Carry::Text => Value::Text(row.try_get_unchecked(i).map_err(StoreError::Sqlx)?),
+        Carry::Bytes => Value::Bytes(row.try_get_unchecked(i).map_err(StoreError::Sqlx)?),
+        Carry::Bool => Value::Bool(
+            row.try_get_unchecked::<Option<i64>, _>(i)
+                .map_err(StoreError::Sqlx)?
+                .map(|v| v != 0),
+        ),
+    })
+}
+
+/// Rows the store's background backfill has not reached yet have no sort
+/// name; postgres gets one derived from the title, as the backfill would.
+fn fill_sort_name(table: &str, cols: &[(String, Carry)], values: &mut [Value]) {
+    if table != "media_items" {
+        return;
+    }
+    let at = |name: &str| cols.iter().position(|(c, _)| c == name);
+    let (Some(sort), Some(title)) = (at("sort_name"), at("title")) else {
+        return;
+    };
+    if let (Value::Text(None), Value::Text(Some(t))) = (&values[sort], &values[title]) {
+        values[sort] = Value::Text(Some(pharos_core::sort_name(t)));
+    }
+}
+
+fn quoted(cols: &[(String, Carry)]) -> String {
+    cols.iter()
+        .map(|(c, _)| format!("\"{c}\""))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Copy every row of `table`, bound one row at a time inside the one
+/// transaction so the statement is prepared once and reused.
+async fn copy_table(
+    sp: &SqlitePool,
+    tx: &mut Transaction<'_, Postgres>,
+    table: &str,
+) -> Result<u64, StoreError> {
+    let cols = columns(sp, tx, table).await?;
+    let list = quoted(&cols);
+    let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "SELECT {list} FROM \"{table}\""
+    )))
+    .fetch_all(sp)
+    .await
+    .map_err(StoreError::Sqlx)?;
+    let placeholders = (1..=cols.len())
+        .map(|i| format!("${i}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    // Explicit ids go into GENERATED ALWAYS identity columns too; the clause
+    // is a no-op on a table without one.
+    let insert =
+        format!("INSERT INTO \"{table}\" ({list}) OVERRIDING SYSTEM VALUE VALUES ({placeholders})");
+    let n = rows.len() as u64;
+    for row in rows {
+        let mut values = cols
+            .iter()
+            .enumerate()
+            .map(|(i, (_, carry))| read(&row, i, *carry))
+            .collect::<Result<Vec<_>, _>>()?;
+        fill_sort_name(table, &cols, &mut values);
+        let mut q = sqlx::query(sqlx::AssertSqlSafe(insert.as_str()));
+        for v in values {
+            q = match v {
+                Value::Int(v) => q.bind(v),
+                Value::Float(v) => q.bind(v),
+                Value::Text(v) => q.bind(v),
+                Value::Bytes(v) => q.bind(v),
+                Value::Bool(v) => q.bind(v),
+            };
+        }
+        q.execute(&mut **tx)
+            .await
+            .map_err(|e| StoreError::Parse(format!("migration insert into {table} failed: {e}")))?;
+    }
+    if cols.iter().any(|(c, _)| c == "id") {
+        setval(tx, table).await?;
+    }
+    Ok(n)
+}
+
+/// Move `table`'s id sequence past the copied max id. Identity and serial
+/// columns alike: `pg_get_serial_sequence` resolves both. An `id` with no
+/// sequence (a bytea user id, a fixed singleton row) is left alone.
 async fn setval(tx: &mut Transaction<'_, Postgres>, table: &str) -> Result<(), StoreError> {
+    let (seq,): (Option<String>,) = sqlx::query_as("SELECT pg_get_serial_sequence($1, 'id')")
+        .bind(table)
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(StoreError::Sqlx)?;
+    if seq.is_none() {
+        return Ok(());
+    }
     let sql = format!(
         "SELECT setval(pg_get_serial_sequence('{table}', 'id'), \
          COALESCE((SELECT MAX(id) FROM {table}), 1))"
@@ -170,787 +379,41 @@ async fn verify_counts(
     Ok(())
 }
 
-// ---------------------------------------------------------------------
-// Parents
-// ---------------------------------------------------------------------
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use super::*;
 
-async fn copy_users(
-    sp: &SqlitePool,
-    tx: &mut Transaction<'_, Postgres>,
-) -> Result<u64, StoreError> {
-    let rows: Vec<(Vec<u8>, String, String, i64)> =
-        sqlx::query_as("SELECT id, name, password_hash, admin FROM users")
-            .fetch_all(sp)
+    /// B1071: a table added to the SQLite schema must be put on one list or
+    /// the other, or the migration refuses to run. Runs without postgres.
+    #[tokio::test]
+    async fn every_sqlite_table_is_copied_or_left_with_a_reason() {
+        let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
+        assert_eq!(
+            unlisted_tables(store.pool()).await.unwrap(),
+            Vec::<String>::new(),
+            "add each to COPIED_TABLES or NOT_COPIED"
+        );
+        for table in COPIED_TABLES {
+            assert!(
+                !NOT_COPIED.iter().any(|(n, _)| n == table),
+                "{table} is on both lists"
+            );
+        }
+        let mut seen = std::collections::HashSet::new();
+        for table in COPIED_TABLES {
+            assert!(seen.insert(table), "{table} is copied twice");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unlisted_table_stops_the_migration_before_any_write() {
+        let store = SqliteStore::connect("sqlite::memory:").await.unwrap();
+        sqlx::query("CREATE TABLE brand_new (id INTEGER PRIMARY KEY)")
+            .execute(store.pool())
             .await
-            .map_err(StoreError::Sqlx)?;
-    let n = rows.len() as u64;
-    for (id, name, password_hash, admin) in rows {
-        sqlx::query("INSERT INTO users (id, name, password_hash, admin) VALUES ($1, $2, $3, $4)")
-            .bind(id)
-            .bind(name)
-            .bind(password_hash)
-            .bind(admin)
-            .execute(&mut **tx)
-            .await
-            .map_err(StoreError::Sqlx)?;
+            .unwrap();
+        let err = refuse_unknown_tables(store.pool()).await.unwrap_err();
+        assert!(err.to_string().contains("brand_new"), "{err}");
     }
-    Ok(n)
-}
-
-async fn copy_libraries(
-    sp: &SqlitePool,
-    tx: &mut Transaction<'_, Postgres>,
-) -> Result<u64, StoreError> {
-    let rows: Vec<(
-        i64,
-        String,
-        String,
-        String,
-        String,
-        Option<String>,
-        Option<i64>,
-    )> = sqlx::query_as(
-        "SELECT id, name, root_path, kind, wire_id, options, created_at FROM libraries",
-    )
-    .fetch_all(sp)
-    .await
-    .map_err(StoreError::Sqlx)?;
-    let n = rows.len() as u64;
-    for (id, name, root_path, kind, wire_id, options, created_at) in rows {
-        sqlx::query(
-            "INSERT INTO libraries (id, name, root_path, kind, wire_id, options, created_at) \
-             OVERRIDING SYSTEM VALUE VALUES ($1, $2, $3, $4, $5, $6, $7)",
-        )
-        .bind(id)
-        .bind(name)
-        .bind(root_path)
-        .bind(kind)
-        .bind(wire_id)
-        .bind(options)
-        .bind(created_at)
-        .execute(&mut **tx)
-        .await
-        .map_err(StoreError::Sqlx)?;
-    }
-    setval(tx, "libraries").await?;
-    Ok(n)
-}
-
-/// Shared shape for the `(id, name, wire_id)` identity entity tables
-/// (genres / studios / tags).
-async fn copy_id_name_wire(
-    sp: &SqlitePool,
-    tx: &mut Transaction<'_, Postgres>,
-    table: &str,
-) -> Result<u64, StoreError> {
-    let rows: Vec<(i64, String, String)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-        "SELECT id, name, wire_id FROM {table}"
-    )))
-    .fetch_all(sp)
-    .await
-    .map_err(StoreError::Sqlx)?;
-    let n = rows.len() as u64;
-    for (id, name, wire_id) in rows {
-        sqlx::query(sqlx::AssertSqlSafe(format!(
-            "INSERT INTO {table} (id, name, wire_id) OVERRIDING SYSTEM VALUE VALUES ($1, $2, $3)"
-        )))
-        .bind(id)
-        .bind(name)
-        .bind(wire_id)
-        .execute(&mut **tx)
-        .await
-        .map_err(StoreError::Sqlx)?;
-    }
-    setval(tx, table).await?;
-    Ok(n)
-}
-
-async fn copy_people(
-    sp: &SqlitePool,
-    tx: &mut Transaction<'_, Postgres>,
-) -> Result<u64, StoreError> {
-    let rows: Vec<(
-        i64,
-        String,
-        Option<String>,
-        String,
-        Option<String>,
-        Option<String>,
-    )> = sqlx::query_as("SELECT id, name, sort_name, wire_id, provider_ids, thumb_url FROM people")
-        .fetch_all(sp)
-        .await
-        .map_err(StoreError::Sqlx)?;
-    let n = rows.len() as u64;
-    for (id, name, sort_name, wire_id, provider_ids, thumb_url) in rows {
-        sqlx::query(
-            "INSERT INTO people (id, name, sort_name, wire_id, provider_ids, thumb_url) \
-             OVERRIDING SYSTEM VALUE VALUES ($1, $2, $3, $4, $5, $6)",
-        )
-        .bind(id)
-        .bind(name)
-        .bind(sort_name)
-        .bind(wire_id)
-        .bind(provider_ids)
-        .bind(thumb_url)
-        .execute(&mut **tx)
-        .await
-        .map_err(StoreError::Sqlx)?;
-    }
-    setval(tx, "people").await?;
-    Ok(n)
-}
-
-async fn copy_collections(
-    sp: &SqlitePool,
-    tx: &mut Transaction<'_, Postgres>,
-) -> Result<u64, StoreError> {
-    let rows: Vec<(i64, String, String, String, Option<String>)> =
-        sqlx::query_as("SELECT id, name, wire_id, kind, overview FROM collections")
-            .fetch_all(sp)
-            .await
-            .map_err(StoreError::Sqlx)?;
-    let n = rows.len() as u64;
-    for (id, name, wire_id, kind, overview) in rows {
-        sqlx::query(
-            "INSERT INTO collections (id, name, wire_id, kind, overview) \
-             OVERRIDING SYSTEM VALUE VALUES ($1, $2, $3, $4, $5)",
-        )
-        .bind(id)
-        .bind(name)
-        .bind(wire_id)
-        .bind(kind)
-        .bind(overview)
-        .execute(&mut **tx)
-        .await
-        .map_err(StoreError::Sqlx)?;
-    }
-    setval(tx, "collections").await?;
-    Ok(n)
-}
-
-async fn copy_playlists(
-    sp: &SqlitePool,
-    tx: &mut Transaction<'_, Postgres>,
-) -> Result<u64, StoreError> {
-    let rows: Vec<(i64, String, String, Option<String>, String, i64)> = sqlx::query_as(
-        "SELECT id, wire_id, name, owner_user_id, media_type, created_at FROM playlists",
-    )
-    .fetch_all(sp)
-    .await
-    .map_err(StoreError::Sqlx)?;
-    let n = rows.len() as u64;
-    for (id, wire_id, name, owner_user_id, media_type, created_at) in rows {
-        // playlists.id is a plain BIGSERIAL (GENERATED BY DEFAULT), not a
-        // GENERATED ALWAYS identity column, so an explicit id inserts
-        // without OVERRIDING SYSTEM VALUE.
-        sqlx::query(
-            "INSERT INTO playlists (id, wire_id, name, owner_user_id, media_type, created_at) \
-             VALUES ($1, $2, $3, $4, $5, $6)",
-        )
-        .bind(id)
-        .bind(wire_id)
-        .bind(name)
-        .bind(owner_user_id)
-        .bind(media_type)
-        .bind(created_at)
-        .execute(&mut **tx)
-        .await
-        .map_err(StoreError::Sqlx)?;
-    }
-    setval(tx, "playlists").await?;
-    Ok(n)
-}
-
-async fn copy_system_identity(
-    sp: &SqlitePool,
-    tx: &mut Transaction<'_, Postgres>,
-) -> Result<u64, StoreError> {
-    let rows: Vec<(i64, String, i64)> =
-        sqlx::query_as("SELECT id, server_id, created_at FROM system_identity")
-            .fetch_all(sp)
-            .await
-            .map_err(StoreError::Sqlx)?;
-    let n = rows.len() as u64;
-    for (id, server_id, created_at) in rows {
-        sqlx::query("INSERT INTO system_identity (id, server_id, created_at) VALUES ($1, $2, $3)")
-            .bind(id)
-            .bind(server_id)
-            .bind(created_at)
-            .execute(&mut **tx)
-            .await
-            .map_err(StoreError::Sqlx)?;
-    }
-    Ok(n)
-}
-
-async fn copy_runtime_config(
-    sp: &SqlitePool,
-    tx: &mut Transaction<'_, Postgres>,
-) -> Result<u64, StoreError> {
-    let rows: Vec<(i64, Option<String>, Option<String>, Option<String>, i64)> = sqlx::query_as(
-        "SELECT id, server_name, login_disclaimer, custom_css, updated_at FROM runtime_config",
-    )
-    .fetch_all(sp)
-    .await
-    .map_err(StoreError::Sqlx)?;
-    let n = rows.len() as u64;
-    for (id, server_name, login_disclaimer, custom_css, updated_at) in rows {
-        sqlx::query(
-            "INSERT INTO runtime_config \
-             (id, server_name, login_disclaimer, custom_css, updated_at) \
-             VALUES ($1, $2, $3, $4, $5)",
-        )
-        .bind(id)
-        .bind(server_name)
-        .bind(login_disclaimer)
-        .bind(custom_css)
-        .bind(updated_at)
-        .execute(&mut **tx)
-        .await
-        .map_err(StoreError::Sqlx)?;
-    }
-    Ok(n)
-}
-
-async fn copy_named_config(
-    sp: &SqlitePool,
-    tx: &mut Transaction<'_, Postgres>,
-) -> Result<u64, StoreError> {
-    let rows: Vec<(String, String, i64)> =
-        sqlx::query_as("SELECT key, value, updated_at FROM named_config")
-            .fetch_all(sp)
-            .await
-            .map_err(StoreError::Sqlx)?;
-    let n = rows.len() as u64;
-    for (key, value, updated_at) in rows {
-        sqlx::query("INSERT INTO named_config (key, value, updated_at) VALUES ($1, $2, $3)")
-            .bind(key)
-            .bind(value)
-            .bind(updated_at)
-            .execute(&mut **tx)
-            .await
-            .map_err(StoreError::Sqlx)?;
-    }
-    Ok(n)
-}
-
-async fn copy_scan_runs(
-    sp: &SqlitePool,
-    tx: &mut Transaction<'_, Postgres>,
-) -> Result<u64, StoreError> {
-    let rows: Vec<(
-        i64,
-        Option<String>,
-        Option<i64>,
-        Option<i64>,
-        Option<i64>,
-        Option<i64>,
-    )> = sqlx::query_as(
-        "SELECT id, root, started_at, finished_at, items_seen, items_swept FROM scan_runs",
-    )
-    .fetch_all(sp)
-    .await
-    .map_err(StoreError::Sqlx)?;
-    let n = rows.len() as u64;
-    for (id, root, started_at, finished_at, items_seen, items_swept) in rows {
-        sqlx::query(
-            "INSERT INTO scan_runs (id, root, started_at, finished_at, items_seen, items_swept) \
-             VALUES ($1, $2, $3, $4, $5, $6)",
-        )
-        .bind(id)
-        .bind(root)
-        .bind(started_at)
-        .bind(finished_at)
-        .bind(items_seen)
-        .bind(items_swept)
-        .execute(&mut **tx)
-        .await
-        .map_err(StoreError::Sqlx)?;
-    }
-    setval(tx, "scan_runs").await?;
-    Ok(n)
-}
-
-// ---------------------------------------------------------------------
-// media_items — the widest table; every column added since migration
-// 0001, in the order the postgres migrations introduced them. NOTE:
-// `search_tsv` (0029) is `GENERATED ALWAYS AS (...) STORED` and is
-// deliberately excluded — postgres computes it, inserting into it is an
-// error.
-// ---------------------------------------------------------------------
-
-const MEDIA_MIGRATE_COLUMNS: &str = "id, path, title, kind, \
-    size_bytes, duration_ms, container, bitrate_bps, video_codec, audio_codec, \
-    width, height, frame_rate_mille, audio_channels, sample_rate, \
-    series_name, season_number, episode_number, subtitle_tracks_json, \
-    artist, album, album_artist, genre, created_at, chapters_json, \
-    video_profile, video_level, pixel_format, color_primaries, color_transfer, color_space, \
-    audio_tracks_json, file_mtime, file_size_seen, last_scanned, last_seen_scan_id, fingerprint, \
-    community_rating, critic_rating, official_rating, production_year, premiere_date, \
-    overview, tagline, provider_ids, series_folder, series_year, library_id, \
-    title_fold, attachments_json, probe_schema_version, video_3d_format, \
-    alternate_sources_json, has_3d, \
-    bpm_mille, tempo_source, energy_mille, audio_analysis_version, \
-    audio_analysis_mtime, audio_analysis_size";
-
-#[derive(sqlx::FromRow)]
-struct MediaItemRow {
-    id: i64,
-    path: String,
-    title: String,
-    kind: String,
-    size_bytes: Option<i64>,
-    duration_ms: Option<i64>,
-    container: Option<String>,
-    bitrate_bps: Option<i64>,
-    video_codec: Option<String>,
-    audio_codec: Option<String>,
-    width: Option<i64>,
-    height: Option<i64>,
-    frame_rate_mille: Option<i64>,
-    audio_channels: Option<i64>,
-    sample_rate: Option<i64>,
-    series_name: Option<String>,
-    season_number: Option<i64>,
-    episode_number: Option<i64>,
-    subtitle_tracks_json: Option<String>,
-    artist: Option<String>,
-    album: Option<String>,
-    album_artist: Option<String>,
-    genre: Option<String>,
-    created_at: Option<i64>,
-    chapters_json: Option<String>,
-    video_profile: Option<String>,
-    video_level: Option<i64>,
-    pixel_format: Option<String>,
-    color_primaries: Option<String>,
-    color_transfer: Option<String>,
-    color_space: Option<String>,
-    audio_tracks_json: Option<String>,
-    file_mtime: Option<i64>,
-    file_size_seen: Option<i64>,
-    last_scanned: Option<i64>,
-    last_seen_scan_id: Option<i64>,
-    fingerprint: Option<Vec<u8>>,
-    community_rating: Option<f64>,
-    critic_rating: Option<f64>,
-    official_rating: Option<String>,
-    production_year: Option<i64>,
-    premiere_date: Option<i64>,
-    overview: Option<String>,
-    tagline: Option<String>,
-    provider_ids: Option<String>,
-    series_folder: Option<String>,
-    series_year: Option<i64>,
-    library_id: Option<i64>,
-    title_fold: Option<String>,
-    attachments_json: Option<String>,
-    probe_schema_version: i64,
-    video_3d_format: Option<String>,
-    alternate_sources_json: Option<String>,
-    has_3d: i64,
-    // Spec 024 — carried so a migrated library is not decoded again (V385).
-    bpm_mille: Option<i64>,
-    tempo_source: Option<String>,
-    energy_mille: Option<i64>,
-    audio_analysis_version: Option<i64>,
-    audio_analysis_mtime: Option<i64>,
-    audio_analysis_size: Option<i64>,
-    sort_name: Option<String>,
-}
-
-/// media_items can be ~15k rows in a real deployment; each row is bound
-/// individually inside the one enclosing transaction rather than built as
-/// a giant multi-row VALUES list, which keeps the per-row bind list a
-/// manageable fixed 61-placeholder statement while still batching the
-/// whole copy as a single round of prepared-statement reuse.
-async fn copy_media_items(
-    sp: &SqlitePool,
-    tx: &mut Transaction<'_, Postgres>,
-) -> Result<u64, StoreError> {
-    // `SqliteStore::connect` always runs the migrations, so the source has the
-    // column; rows the background backfill has not reached yet are NULL and
-    // get their sort name derived from the title below.
-    let select_sql =
-        format!("SELECT {MEDIA_MIGRATE_COLUMNS}, sort_name FROM media_items ORDER BY id");
-    let rows: Vec<MediaItemRow> = sqlx::query_as(sqlx::AssertSqlSafe(select_sql))
-        .fetch_all(sp)
-        .await
-        .map_err(StoreError::Sqlx)?;
-    let n = rows.len() as u64;
-    let insert_sql = format!(
-        "INSERT INTO media_items ({MEDIA_MIGRATE_COLUMNS}, sort_name) VALUES \
-         ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,\
-         $24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40,$41,$42,$43,$44,\
-         $45,$46,$47,$48,$49,$50,$51,$52,$53,$54,$55,$56,$57,$58,$59,$60,$61)"
-    );
-    for row in rows {
-        let sort_name = row
-            .sort_name
-            .unwrap_or_else(|| pharos_core::sort_name(&row.title));
-        sqlx::query(sqlx::AssertSqlSafe(insert_sql.as_str()))
-            .bind(row.id)
-            .bind(row.path)
-            .bind(row.title)
-            .bind(row.kind)
-            .bind(row.size_bytes)
-            .bind(row.duration_ms)
-            .bind(row.container)
-            .bind(row.bitrate_bps)
-            .bind(row.video_codec)
-            .bind(row.audio_codec)
-            .bind(row.width)
-            .bind(row.height)
-            .bind(row.frame_rate_mille)
-            .bind(row.audio_channels)
-            .bind(row.sample_rate)
-            .bind(row.series_name)
-            .bind(row.season_number)
-            .bind(row.episode_number)
-            .bind(row.subtitle_tracks_json)
-            .bind(row.artist)
-            .bind(row.album)
-            .bind(row.album_artist)
-            .bind(row.genre)
-            .bind(row.created_at)
-            .bind(row.chapters_json)
-            .bind(row.video_profile)
-            .bind(row.video_level)
-            .bind(row.pixel_format)
-            .bind(row.color_primaries)
-            .bind(row.color_transfer)
-            .bind(row.color_space)
-            .bind(row.audio_tracks_json)
-            .bind(row.file_mtime)
-            .bind(row.file_size_seen)
-            .bind(row.last_scanned)
-            .bind(row.last_seen_scan_id)
-            .bind(row.fingerprint)
-            .bind(row.community_rating)
-            .bind(row.critic_rating)
-            .bind(row.official_rating)
-            .bind(row.production_year)
-            .bind(row.premiere_date)
-            .bind(row.overview)
-            .bind(row.tagline)
-            .bind(row.provider_ids)
-            .bind(row.series_folder)
-            .bind(row.series_year)
-            .bind(row.library_id)
-            .bind(row.title_fold)
-            .bind(row.attachments_json)
-            .bind(row.probe_schema_version)
-            .bind(row.video_3d_format)
-            .bind(row.alternate_sources_json)
-            .bind(row.has_3d)
-            .bind(row.bpm_mille)
-            .bind(row.tempo_source)
-            .bind(row.energy_mille)
-            .bind(row.audio_analysis_version)
-            .bind(row.audio_analysis_mtime)
-            .bind(row.audio_analysis_size)
-            .bind(sort_name)
-            .execute(&mut **tx)
-            .await
-            .map_err(StoreError::Sqlx)?;
-    }
-    Ok(n)
-}
-
-// ---------------------------------------------------------------------
-// Dependents
-// ---------------------------------------------------------------------
-
-async fn copy_auth_tokens(
-    sp: &SqlitePool,
-    tx: &mut Transaction<'_, Postgres>,
-) -> Result<u64, StoreError> {
-    let rows: Vec<(String, Vec<u8>, String, i64, Option<i64>, Option<String>)> = sqlx::query_as(
-        "SELECT token_hash, user_id, device_id, created_at, expires_at, scope FROM auth_tokens",
-    )
-    .fetch_all(sp)
-    .await
-    .map_err(StoreError::Sqlx)?;
-    let n = rows.len() as u64;
-    for (token_hash, user_id, device_id, created_at, expires_at, scope) in rows {
-        sqlx::query(
-            "INSERT INTO auth_tokens (token_hash, user_id, device_id, created_at, expires_at, scope) \
-             VALUES ($1, $2, $3, $4, $5, $6)",
-        )
-        .bind(token_hash)
-        .bind(user_id)
-        .bind(device_id)
-        .bind(created_at)
-        .bind(expires_at)
-        .bind(scope)
-        .execute(&mut **tx)
-        .await
-        .map_err(StoreError::Sqlx)?;
-    }
-    Ok(n)
-}
-
-async fn copy_user_data(
-    sp: &SqlitePool,
-    tx: &mut Transaction<'_, Postgres>,
-) -> Result<u64, StoreError> {
-    let rows: Vec<(
-        Vec<u8>,
-        i64,
-        i64,
-        i64,
-        i64,
-        i64,
-        i64,
-        Option<i64>,
-        Option<i64>,
-    )> = sqlx::query_as(
-        "SELECT user_id, item_id, played, play_count, last_played_position_ticks, \
-             is_favorite, last_played_at, audio_stream_index, subtitle_stream_index \
-             FROM user_data",
-    )
-    .fetch_all(sp)
-    .await
-    .map_err(StoreError::Sqlx)?;
-    let n = rows.len() as u64;
-    for (
-        user_id,
-        item_id,
-        played,
-        play_count,
-        ticks,
-        is_favorite,
-        last_played_at,
-        audio,
-        subtitle,
-    ) in rows
-    {
-        sqlx::query(
-            "INSERT INTO user_data (user_id, item_id, played, play_count, \
-             last_played_position_ticks, is_favorite, last_played_at, \
-             audio_stream_index, subtitle_stream_index) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
-        )
-        .bind(user_id)
-        .bind(item_id)
-        .bind(played)
-        .bind(play_count)
-        .bind(ticks)
-        .bind(is_favorite)
-        .bind(last_played_at)
-        .bind(audio.and_then(|v| i32::try_from(v).ok()))
-        .bind(subtitle.and_then(|v| i32::try_from(v).ok()))
-        .execute(&mut **tx)
-        .await
-        .map_err(StoreError::Sqlx)?;
-    }
-    Ok(n)
-}
-
-async fn copy_user_configuration(
-    sp: &SqlitePool,
-    tx: &mut Transaction<'_, Postgres>,
-) -> Result<u64, StoreError> {
-    let rows: Vec<(Vec<u8>, String, i64)> =
-        sqlx::query_as("SELECT user_id, config, updated_at FROM user_configuration")
-            .fetch_all(sp)
-            .await
-            .map_err(StoreError::Sqlx)?;
-    let n = rows.len() as u64;
-    for (user_id, config, updated_at) in rows {
-        sqlx::query(
-            "INSERT INTO user_configuration (user_id, config, updated_at) VALUES ($1, $2, $3)",
-        )
-        .bind(user_id)
-        .bind(config)
-        .bind(updated_at)
-        .execute(&mut **tx)
-        .await
-        .map_err(StoreError::Sqlx)?;
-    }
-    Ok(n)
-}
-
-async fn copy_display_preferences(
-    sp: &SqlitePool,
-    tx: &mut Transaction<'_, Postgres>,
-) -> Result<u64, StoreError> {
-    let rows: Vec<(Vec<u8>, String, String, String, i64)> =
-        sqlx::query_as("SELECT user_id, dp_id, client, prefs, updated_at FROM display_preferences")
-            .fetch_all(sp)
-            .await
-            .map_err(StoreError::Sqlx)?;
-    let n = rows.len() as u64;
-    for (user_id, dp_id, client, prefs, updated_at) in rows {
-        sqlx::query(
-            "INSERT INTO display_preferences (user_id, dp_id, client, prefs, updated_at) \
-             VALUES ($1, $2, $3, $4, $5)",
-        )
-        .bind(user_id)
-        .bind(dp_id)
-        .bind(client)
-        .bind(prefs)
-        .bind(updated_at)
-        .execute(&mut **tx)
-        .await
-        .map_err(StoreError::Sqlx)?;
-    }
-    Ok(n)
-}
-
-async fn copy_user_prefs(
-    sp: &SqlitePool,
-    tx: &mut Transaction<'_, Postgres>,
-) -> Result<u64, StoreError> {
-    let rows: Vec<(Vec<u8>, String, Vec<u8>, i64)> =
-        sqlx::query_as("SELECT user_id, key, value, updated_at FROM user_prefs")
-            .fetch_all(sp)
-            .await
-            .map_err(StoreError::Sqlx)?;
-    let n = rows.len() as u64;
-    for (user_id, key, value, updated_at) in rows {
-        sqlx::query(
-            "INSERT INTO user_prefs (user_id, key, value, updated_at) VALUES ($1, $2, $3, $4)",
-        )
-        .bind(user_id)
-        .bind(key)
-        .bind(value)
-        .bind(updated_at)
-        .execute(&mut **tx)
-        .await
-        .map_err(StoreError::Sqlx)?;
-    }
-    Ok(n)
-}
-
-async fn copy_artwork(
-    sp: &SqlitePool,
-    tx: &mut Transaction<'_, Postgres>,
-) -> Result<u64, StoreError> {
-    let rows: Vec<(i64, String, String, String)> =
-        sqlx::query_as("SELECT item_id, role, source, locator FROM artwork")
-            .fetch_all(sp)
-            .await
-            .map_err(StoreError::Sqlx)?;
-    let n = rows.len() as u64;
-    for (item_id, role, source, locator) in rows {
-        sqlx::query("INSERT INTO artwork (item_id, role, source, locator) VALUES ($1, $2, $3, $4)")
-            .bind(item_id)
-            .bind(role)
-            .bind(source)
-            .bind(locator)
-            .execute(&mut **tx)
-            .await
-            .map_err(StoreError::Sqlx)?;
-    }
-    Ok(n)
-}
-
-/// Shared shape for the three `(item_id, <entity>_id)` many-to-many join
-/// tables (item_genres / item_studios / item_tags).
-async fn copy_item_link(
-    sp: &SqlitePool,
-    tx: &mut Transaction<'_, Postgres>,
-    table: &str,
-    entity_col: &str,
-) -> Result<u64, StoreError> {
-    let rows: Vec<(i64, i64)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-        "SELECT item_id, {entity_col} FROM {table}"
-    )))
-    .fetch_all(sp)
-    .await
-    .map_err(StoreError::Sqlx)?;
-    let n = rows.len() as u64;
-    for (item_id, entity_id) in rows {
-        sqlx::query(sqlx::AssertSqlSafe(format!(
-            "INSERT INTO {table} (item_id, {entity_col}) VALUES ($1, $2)"
-        )))
-        .bind(item_id)
-        .bind(entity_id)
-        .execute(&mut **tx)
-        .await
-        .map_err(StoreError::Sqlx)?;
-    }
-    Ok(n)
-}
-
-async fn copy_item_people(
-    sp: &SqlitePool,
-    tx: &mut Transaction<'_, Postgres>,
-) -> Result<u64, StoreError> {
-    let rows: Vec<(i64, i64, String, Option<String>, String, Option<i64>)> = sqlx::query_as(
-        "SELECT item_id, person_id, role, character, person_kind, sort_order FROM item_people",
-    )
-    .fetch_all(sp)
-    .await
-    .map_err(StoreError::Sqlx)?;
-    let n = rows.len() as u64;
-    for (item_id, person_id, role, character, person_kind, sort_order) in rows {
-        sqlx::query(
-            "INSERT INTO item_people \
-             (item_id, person_id, role, character, person_kind, sort_order) \
-             VALUES ($1, $2, $3, $4, $5, $6)",
-        )
-        .bind(item_id)
-        .bind(person_id)
-        .bind(role)
-        .bind(character)
-        .bind(person_kind)
-        .bind(sort_order)
-        .execute(&mut **tx)
-        .await
-        .map_err(StoreError::Sqlx)?;
-    }
-    Ok(n)
-}
-
-async fn copy_collection_items(
-    sp: &SqlitePool,
-    tx: &mut Transaction<'_, Postgres>,
-) -> Result<u64, StoreError> {
-    let rows: Vec<(i64, i64, i64)> =
-        sqlx::query_as("SELECT collection_id, item_id, sort_order FROM collection_items")
-            .fetch_all(sp)
-            .await
-            .map_err(StoreError::Sqlx)?;
-    let n = rows.len() as u64;
-    for (collection_id, item_id, sort_order) in rows {
-        sqlx::query(
-            "INSERT INTO collection_items (collection_id, item_id, sort_order) \
-             VALUES ($1, $2, $3)",
-        )
-        .bind(collection_id)
-        .bind(item_id)
-        .bind(sort_order)
-        .execute(&mut **tx)
-        .await
-        .map_err(StoreError::Sqlx)?;
-    }
-    Ok(n)
-}
-
-async fn copy_playlist_items(
-    sp: &SqlitePool,
-    tx: &mut Transaction<'_, Postgres>,
-) -> Result<u64, StoreError> {
-    let rows: Vec<(i64, String, i64, i64)> =
-        sqlx::query_as("SELECT playlist_id, entry_id, item_id, sort_order FROM playlist_items")
-            .fetch_all(sp)
-            .await
-            .map_err(StoreError::Sqlx)?;
-    let n = rows.len() as u64;
-    for (playlist_id, entry_id, item_id, sort_order) in rows {
-        sqlx::query(
-            "INSERT INTO playlist_items (playlist_id, entry_id, item_id, sort_order) \
-             VALUES ($1, $2, $3, $4)",
-        )
-        .bind(playlist_id)
-        .bind(entry_id)
-        .bind(item_id)
-        .bind(sort_order)
-        .execute(&mut **tx)
-        .await
-        .map_err(StoreError::Sqlx)?;
-    }
-    Ok(n)
 }

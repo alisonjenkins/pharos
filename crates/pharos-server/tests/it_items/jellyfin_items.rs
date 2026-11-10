@@ -286,6 +286,7 @@ async fn seed_shows() -> (web::Data<AppState>, String, UserId) {
             episode_number: Some(epn),
             series_folder: Some(format!("/tv/{folder}")),
             series_year: None,
+            series_key: None,
         }),
         ..Default::default()
     };
@@ -411,6 +412,7 @@ async fn episode_list_sorts_by_air_order_not_title() {
                     episode_number: Some(epn),
                     series_folder: Some("/tv/Buffy".into()),
                     series_year: None,
+                    series_key: None,
                 }),
                 ..Default::default()
             })
@@ -475,6 +477,7 @@ async fn seed_with_probe(probe: pharos_core::MediaProbe) -> (web::Data<AppState>
     let token = stores.issue(uid, "t").await.unwrap();
     stores
         .put(MediaItem {
+            locked: Default::default(),
             id: 999,
             path: "/m/probed.webm".into(),
             title: "Probed".into(),
@@ -1022,7 +1025,7 @@ async fn playback_info_lists_sidecar_subtitle_when_present() {
 }
 
 #[actix_web::test]
-async fn shows_next_up_returns_lowest_unwatched_per_series() {
+async fn shows_next_up_lists_only_the_series_the_viewer_started() {
     let stores = Stores::connect("sqlite::memory:").await.unwrap();
     let auth = BuiltinAuth::new(stores.clone());
     let hash = auth.hash_password(&SecretString::new("pw")).unwrap();
@@ -1083,9 +1086,9 @@ async fn shows_next_up_returns_lowest_unwatched_per_series() {
     .await;
     let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
     let items = v["Items"].as_array().unwrap();
-    assert_eq!(items.len(), 2, "{v:?}");
     // Show A: next up is E2 (since E1 played).
-    // Show B: next up is E1 (nothing played).
+    // Show B: nothing played, so not listed (spec 038 FR-101).
+    assert_eq!(items.len(), 1, "{v:?}");
     let by_show: std::collections::HashMap<&str, u64> = items
         .iter()
         .map(|it| {
@@ -1096,7 +1099,7 @@ async fn shows_next_up_returns_lowest_unwatched_per_series() {
         })
         .collect();
     assert_eq!(by_show.get("Show A"), Some(&2));
-    assert_eq!(by_show.get("Show B"), Some(&1));
+    assert_eq!(by_show.get("Show B"), None);
 }
 
 // /Shows/{id}/Episodes + /Shows/{id}/Seasons must return ONLY the requested
@@ -1335,31 +1338,40 @@ async fn next_up_keeps_same_name_shows_in_distinct_folders_separate() {
         .await
         .unwrap();
     let token = stores.issue(uid, "t").await.unwrap();
-    // Cosmos (1980) and Cosmos (2014): same display name, different
-    // folders + years. Each has two unwatched episodes.
+    // Show AV (1980) and Show AV (2014): same display name, different
+    // folders + years. Each has two episodes, the first played.
     for (id, folder, year, ep) in [
-        (1u64, "/tv/Cosmos (1980)", 1980u32, 1u32),
-        (2, "/tv/Cosmos (1980)", 1980, 2),
-        (3, "/tv/Cosmos (2014)", 2014, 1),
-        (4, "/tv/Cosmos (2014)", 2014, 2),
+        (1u64, "/tv/Show AV (1980)", 1980u32, 1u32),
+        (2, "/tv/Show AV (1980)", 1980, 2),
+        (3, "/tv/Show AV (2014)", 2014, 1),
+        (4, "/tv/Show AV (2014)", 2014, 2),
     ] {
         stores
             .put(MediaItem {
                 id,
                 path: format!("{folder}/Season 01/S01E0{ep}.mkv").into(),
-                title: format!("Cosmos E{ep}"),
+                title: format!("Show AV E{ep}"),
                 kind: MediaKind::Episode,
                 series: Some(pharos_core::SeriesInfo {
-                    series_name: "Cosmos".into(),
+                    series_name: "Show AV".into(),
                     season_number: Some(1),
                     episode_number: Some(ep),
                     series_folder: Some(folder.into()),
                     series_year: Some(year),
+                    series_key: None,
                 }),
                 ..Default::default()
             })
             .await
             .unwrap();
+    }
+    for id in [1, 3] {
+        use pharos_core::UserDataStore;
+        let played = pharos_core::UserItemData {
+            played: true,
+            ..Default::default()
+        };
+        stores.set_user_data(uid, id, played).await.unwrap();
     }
     let state = web::Data::new(AppState::new(stores, "srv".into()));
     let app = test::init_service(build_app(state)).await;
@@ -1380,13 +1392,13 @@ async fn next_up_keeps_same_name_shows_in_distinct_folders_separate() {
         .map(|it| it["SeriesId"].as_str().unwrap())
         .collect();
     assert_eq!(series_ids.len(), 2, "distinct SeriesId per folder: {v:?}");
-    // Each NextUp pick is that folder's E1 (non-interleaved) and carries
-    // its own year so clients can tell the two Cosmos shows apart.
+    // Each NextUp pick is that folder's E2 (non-interleaved) and carries
+    // its own year so clients can tell the two Show AV shows apart.
     let years: std::collections::HashSet<u64> = items
         .iter()
         .map(|it| {
-            assert_eq!(it["SeriesName"], "Cosmos");
-            assert_eq!(it["IndexNumber"].as_u64().unwrap(), 1);
+            assert_eq!(it["SeriesName"], "Show AV");
+            assert_eq!(it["IndexNumber"].as_u64().unwrap(), 2);
             it["ProductionYear"].as_u64().unwrap()
         })
         .collect();

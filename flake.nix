@@ -32,6 +32,15 @@
           overlays = [ (import rust-overlay) ];
         };
 
+        # ADR-0072: the `ffmpeg` binary the server spawns carries libplacebo,
+        # which the GPU HDR tonemap route needs. ffmpeg 9.0.1's libplacebo
+        # filter fails to configure with a Vulkan hw device on radv
+        # ("Error initializing filters", EINVAL, no log line), where 8.x runs
+        # the same graph, so the binary is the 8.x line while the libav libs
+        # ffmpeg-the-third links stay on pkgs.ffmpeg-headless. Fixtures keep
+        # plain ffmpeg-headless (a cached input).
+        ffmpegGpu = pkgs.ffmpeg_8-headless.override { withPlacebo = true; };
+
         # Pinned toolchain (rust + clippy + rustfmt + wasm target).
         # Used by the devShell + the buildRustPackage builds below so
         # the server/worker binaries compile with the same compiler that
@@ -57,6 +66,26 @@
           doCheck = false;
         };
 
+
+        # `dx` must match the Dioxus version the workspace locks
+        # (0.8.0-alpha.3, ADR-0078); nixpkgs ships 0.7. Built with the pinned
+        # toolchain: dioxus-cli 0.8 needs rustc 1.93. Bump version and both
+        # hashes together with the `dioxus` workspace dep.
+        dioxusCli = (pkgs.makeRustPlatform { cargo = rustToolchain; rustc = rustToolchain; }).buildRustPackage rec {
+          pname = "dioxus-cli";
+          version = "0.8.0-alpha.3";
+          src = pkgs.fetchCrate {
+            inherit pname version;
+            hash = "sha256-n1Lk9eCjr1vGqvCDbrOmbU7TTvdcGdx/chRsj4Z3a+Q=";
+          };
+          cargoHash = "sha256-nqGrW0Sf7DWdrSXSKcSl+FlO+1NY4uZA7G7G4AGItuw=";
+          buildFeatures = [ "no-downloads" "disable-telemetry" ];
+          env.OPENSSL_NO_VENDOR = 1;
+          nativeBuildInputs = [ pkgs.pkg-config pkgs.cacert pkgs.makeWrapper ];
+          buildInputs = [ pkgs.openssl ];
+          doCheck = false;
+          meta.mainProgram = "dx";
+        };
 
         # Source for the cargo-based binary build (exclude build outputs).
         repoSrc = pkgs.lib.cleanSourceWith {
@@ -635,7 +664,7 @@
           contents = [
             pharos
             transcodeWorker
-            pkgs.ffmpeg-headless
+            ffmpegGpu
             # 008 — URL-backed sources. Present unconditionally rather than
             # behind a build flag: the feature is off by default at RUNTIME
             # (`[remote].enabled`), so shipping the binary costs an unused
@@ -690,7 +719,7 @@
             };
             Env = [
               "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
-              "PATH=${pharos}/bin:${transcodeWorker}/bin:${pkgs.ffmpeg-headless}/bin:${pkgs.yt-dlp}/bin"
+              "PATH=${pharos}/bin:${transcodeWorker}/bin:${ffmpegGpu}/bin:${pkgs.yt-dlp}/bin"
               # Explicit worker path so the transcode scheduler uses the
               # crash-isolated worker pool, not the inline-ffmpeg fallback.
               "PHAROS_TRANSCODE_WORKER=${transcodeWorker}/bin/transcode-worker"
@@ -699,6 +728,11 @@
               "FONTCONFIG_FILE=${fontsConf}/etc/fonts/fonts.conf"
               # libva searches FHS paths that do not exist in this image.
               "LIBVA_DRIVERS_PATH=${pkgs.mesa}/lib/dri"
+              # Same for Vulkan: the GPU tonemap route (ADR-0072) loads radv
+              # through the loader, which otherwise finds no ICD in this image.
+              # Both names, as older loaders read only the first.
+              "VK_ICD_FILENAMES=${pkgs.mesa}/share/vulkan/icd.d/radeon_icd.x86_64.json"
+              "VK_DRIVER_FILES=${pkgs.mesa}/share/vulkan/icd.d/radeon_icd.x86_64.json"
             ];
             WorkingDir = "/var/lib/pharos";
           };
@@ -727,6 +761,10 @@
           dependencies = [
             pkgs.python3Packages.torch
             pkgs.python3Packages.torchaudio
+            # ADR-0105: spans to Tempo over OTLP/gRPC.
+            pkgs.python3Packages.opentelemetry-api
+            pkgs.python3Packages.opentelemetry-sdk
+            pkgs.python3Packages.opentelemetry-exporter-otlp-proto-grpc
           ];
           nativeCheckInputs = [ pkgs.python3Packages.pytestCheckHook ];
           makeWrapperArgs = [
@@ -780,7 +818,9 @@
           src = uiSrc;
           nativeBuildInputs = [
             rustToolchain
-            pkgs.dioxus-cli
+            dioxusCli
+            # dx 0.8 minifies JS with esbuild and cannot download it here.
+            pkgs.esbuild
             wasmBindgenCli
             pkgs.binaryen
             # pharos-api's build script compiles the schema with `capnp`.
@@ -795,15 +835,38 @@
             export HOME=$TMPDIR
             # dx keeps DWARF by default, and binaryen aborts re-emitting it
             # (wasm-opt SIGABRT), which ships the wasm unoptimised.
+            # `wasm-release` (Cargo.toml) builds for size: opt-level z, fat LTO, 1 CGU.
             # Name the platform, bin and feature: with pharos-tv and its `mobile`
             # feature beside them, dx can no longer infer the target triple.
-            dx build --platform web --package pharos-ui --bin pharos-ui-web --features web --release --debug-symbols false
+            dx build --platform web --package pharos-ui --bin pharos-ui-web --features web --release --profile wasm-release --debug-symbols false
+            # The PDF renderer is a second, separate wasm module (quire-pdf,
+            # spec 023 slice 5) that the reader loads only when a PDF is
+            # opened; it is never linked into the main wasm above.
+            cargo build --profile wasm-release --package quire-pdf --lib --target wasm32-unknown-unknown
+            wasm-bindgen --target web --no-typescript --out-dir quire-pdf-pkg --out-name quire_pdf \
+              target/wasm32-unknown-unknown/wasm-release/quire_pdf.wasm
+            # Not --all-features: that enables compact imports and string
+            # references, which Chrome refuses to instantiate. These are what
+            # rustc's wasm32 target emits.
+            wasm-opt -Oz --strip-debug --strip-producers \
+              --enable-bulk-memory --enable-bulk-memory-opt --enable-nontrapping-float-to-int \
+              --enable-sign-ext --enable-mutable-globals --enable-multivalue --enable-reference-types \
+              -o quire-pdf-pkg/quire_pdf_bg.opt.wasm quire-pdf-pkg/quire_pdf_bg.wasm
             runHook postBuild
           '';
           installPhase = ''
             runHook preInstall
             mkdir -p $out
             cp -r target/dx/pharos-ui-web/release/web/public/. $out/
+            # dx preloads the JS glue as a classic script, but loads it as a
+            # module; Firefox fetches it twice and warns the preload went
+            # unused. modulepreload is the matching hint (V895).
+            sed -i 's|<link rel="preload" as="script" \(href="[^"]*\.js"\) crossorigin>|<link rel="modulepreload" \1>|g' $out/index.html
+            if grep -Eq '<link[^>]*(rel="preload"[^>]*as="script"|as="script"[^>]*rel="preload")' $out/index.html \
+              || ! grep -q 'rel="modulepreload"' $out/index.html; then
+              echo "pharosUiBundle: index.html preloads a script as a classic script, or has no modulepreload" >&2
+              exit 1
+            fi
             # dx logs a failed wasm-opt and carries on; DWARF left in the wasm
             # is the sign it never ran (V206).
             for wasm in $out/assets/*.wasm; do
@@ -813,6 +876,9 @@
               fi
             done
             install -Dm644 crates/pharos-ui/assets/pharos.css $out/assets/pharos.css
+            # The service worker template (ADR-0110); pharos-server fills in the
+            # bundle hash and the shell's URLs when it loads the bundle.
+            install -Dm644 crates/pharos-ui/assets/sw.js $out/sw.js
             # Logos, favicons and the web manifest (crates/pharos-ui/assets/brand).
             mkdir -p $out/assets/brand
             cp crates/pharos-ui/assets/brand/*.{svg,png,ico,webmanifest} $out/assets/brand/
@@ -825,6 +891,13 @@
             for f in crates/pharos-ui/assets/vendor/jassub/*; do
               install -Dm644 "$f" "$out/assets/vendor/jassub/$(basename "$f")"
             done
+            # quire-pdf's wasm-bindgen module and the loader script that
+            # starts it (ADR-0047); fetched only when a PDF is opened.
+            install -Dm644 crates/pharos-ui/assets/pdf/loader.js $out/assets/pdf/loader.js
+            install -Dm644 quire-pdf-pkg/quire_pdf.js $out/assets/pdf/quire_pdf.js
+            install -Dm644 quire-pdf-pkg/quire_pdf_bg.opt.wasm $out/assets/pdf/quire_pdf_bg.wasm
+            # Licences of the crates and the fonts and CMaps built into the module.
+            install -Dm644 crates/pharos-ui/assets/pdf/NOTICE.txt $out/assets/pdf/NOTICE.txt
             # Subtitle fonts (SIL OFL), each with its licence: Liberation Sans,
             # which pharos-subs draws plain text in (spec 026), and the pack
             # the ASS renderer gets for styled tracks (V530). Each is fetched
@@ -865,7 +938,7 @@
               http {
                 include ${pkgs.angie}/conf/mime.types;
                 # The stock table has no entry for the UI's web manifest.
-                types { application/manifest+json webmanifest; }
+                types { application/manifest+json webmanifest; font/ttf ttf; }
                 default_type application/octet-stream;
                 ${angieAccessLog}
                 sendfile on;
@@ -903,7 +976,11 @@
                   application/json
                   application/manifest+json
                   application/xml
-                  image/svg+xml;
+                  image/svg+xml
+                  # The UI's wasm (the largest asset of the bundle, about a
+                  # third of its size gzipped) and its subtitle fallback font.
+                  application/wasm
+                  font/ttf;
                 client_body_temp_path /tmp/angie/client_body;
                 proxy_temp_path        /tmp/angie/proxy;
                 fastcgi_temp_path      /tmp/angie/fastcgi;
@@ -1236,6 +1313,8 @@
                   pkgs.coreutils
                   pkgs.findutils
                   pkgs.git
+                  pkgs.gnugrep
+                  pkgs.gnused
                   pkgs.nix
                 ];
                 text = builtins.readFile ./scripts/android-apk.sh;
@@ -1282,10 +1361,16 @@
             pkgs.cargo-guppy
             pkgs.cargo-hakari
             pkgs.cargo-audit
-            pkgs.dioxus-cli
+            dioxusCli
+            pkgs.esbuild
             wasmBindgenCli
             # 017 — Cap'n Proto compiler for pharos-api's capnpc build step.
             pkgs.capnproto
+            # The spawned `ffmpeg` with libplacebo, listed first so it wins
+            # on PATH (its bin output only: its dev output would put ffmpeg 8's
+            # pkg-config files ahead of 9's) ...
+            (pkgs.lib.getBin ffmpegGpu)
+            # ... and the libav dev libs ffmpeg-the-third builds against (9.x).
             pkgs.ffmpeg-headless
             # 019 — spumux builds the dvd_subtitle test source.
             pkgs.dvdauthor
@@ -1388,6 +1473,13 @@
             # server uses. tests/lib/together.ts puts this on Firefox's
             # LD_LIBRARY_PATH.
             export PHAROS_FIREFOX_LIBAV=${pkgs.ffmpeg_7-headless.lib}/lib
+            # Firefox opens its sound output through libpulse, which is not on
+            # NixOS's loader path either, and a CI pod or headless box has no
+            # sound server: every AudioContext then stays "suspended" (B1140).
+            # tests/lib/audio-sink.ts puts the library on Firefox's path and,
+            # as a Playwright globalSetup, runs this daemon with a null sink.
+            export PHAROS_FIREFOX_PULSE=${pkgs.libpulseaudio}/lib
+            export PHAROS_PULSEAUDIO=${pkgs.pulseaudio}/bin/pulseaudio
             # Test fixtures for `cargo nextest run -- --ignored
             # ffmpeg_integration`. Built once in /nix/store, cached
             # across CI + dev. Tests skip when env unset.
@@ -1411,7 +1503,7 @@
                 android_sdk.accept_license = true;
               };
             };
-            # dx 0.7 generates a Gradle project with compileSdk/targetSdk 34.
+            # dx 0.8 generates a Gradle project with compileSdk/targetSdk 34.
             sdk = apkgs.androidenv.composeAndroidPackages {
               platformVersions = [ "34" ];
               buildToolsVersions = [ "34.0.0" "35.0.0" ];
@@ -1430,7 +1522,8 @@
           apkgs.mkShell {
             packages = [
               androidToolchain
-              pkgs.dioxus-cli
+              dioxusCli
+              pkgs.esbuild
               pkgs.capnproto
               pkgs.pkg-config
               apkgs.jdk17

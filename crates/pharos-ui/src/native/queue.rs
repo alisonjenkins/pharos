@@ -9,11 +9,17 @@
 //!
 //! It lives for the tab, in the app's context, so it survives moving between
 //! pages and from song to song.
+//!
+//! Films, episodes and music videos have a queue of their own (B906/V853),
+//! the same [`Queue`] held as [`VideoQueueCtx`]: only what the viewer added,
+//! played after the video on screen and before its next episode.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use dioxus::prelude::*;
 use pharos_client::api::{Item, ItemKind, ItemRef};
+
+use super::views::{display_name, episode_label};
 
 /// How a song got into the queue.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,6 +60,86 @@ pub struct Track {
     pub id: ItemRef,
     pub name: String,
     pub runtime_ms: u64,
+}
+
+impl Track {
+    /// A video as its queue row names it: an episode with its show and
+    /// number, so a queue of several shows reads unambiguously.
+    pub fn video(item: &Item) -> Self {
+        let title = display_name(item);
+        let name = match (item.series_name.as_deref(), episode_label(item)) {
+            (Some(show), Some(number)) => format!("{show} · {number} · {title}"),
+            _ => title,
+        };
+        Track {
+            id: item.id,
+            name,
+            runtime_ms: item.runtime_ms,
+        }
+    }
+}
+
+/// Whether the video queue takes `kind`: a film (music videos are stored
+/// as films) or an episode.
+pub fn video_kind(kind: ItemKind) -> bool {
+    matches!(kind, ItemKind::Movie | ItemKind::Episode)
+}
+
+/// Where a video's next comes from (V853), for its log line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NextFrom {
+    /// The video queue's first that is not the video playing.
+    Queue,
+    /// The next episode: nothing is queued.
+    Episode,
+    /// A group decides what plays; the queue is not consulted.
+    Group,
+    /// Nothing follows.
+    Nothing,
+}
+
+impl NextFrom {
+    pub fn label(self) -> &'static str {
+        match self {
+            NextFrom::Queue => "queue",
+            NextFrom::Episode => "episode",
+            NextFrom::Group => "group",
+            NextFrom::Nothing => "nothing",
+        }
+    }
+}
+
+/// What plays after a video: the queued one, else the next episode; in a
+/// group only the next episode, which the group moves to.
+pub fn video_next(
+    queued: Option<ItemRef>,
+    episode: Option<ItemRef>,
+    grouped: bool,
+) -> (Option<ItemRef>, NextFrom) {
+    match (grouped, queued, episode) {
+        (true, _, next) => (next, NextFrom::Group),
+        (false, Some(q), _) => (Some(q), NextFrom::Queue),
+        (false, None, Some(e)) => (Some(e), NextFrom::Episode),
+        (false, None, None) => (None, NextFrom::Nothing),
+    }
+}
+
+/// The log line for a video's next, with its inputs and the verdict.
+pub fn video_next_line(
+    item: ItemRef,
+    queued: Option<ItemRef>,
+    episode: Option<ItemRef>,
+    grouped: bool,
+) -> String {
+    let (next, from) = video_next(queued, episode, grouped);
+    let show = |r: Option<ItemRef>| r.map_or_else(|| "none".to_owned(), |r| r.to_string());
+    format!(
+        "pharos: video next item={item} next={} from={} queued={} episode={} grouped={grouped}",
+        show(next),
+        from.label(),
+        show(queued),
+        show(episode)
+    )
 }
 
 impl From<&Item> for Track {
@@ -130,6 +216,11 @@ pub const RESTART_AFTER_MS: u64 = 3_000;
 #[derive(Clone, Copy)]
 pub struct QueueCtx(pub Signal<Queue>);
 
+/// The app-wide video queue (B906/V853), provided by the app's root, and
+/// whether its panel is open in the player, kept from video to video.
+#[derive(Clone, Copy)]
+pub struct VideoQueueCtx(pub Signal<Queue>, pub Signal<bool>);
+
 impl Queue {
     pub fn upcoming(&self) -> &[Entry] {
         &self.upcoming
@@ -142,6 +233,24 @@ impl Queue {
     /// The queue's first song.
     pub fn next(&self) -> Option<ItemRef> {
         self.upcoming.first().map(|e| e.id)
+    }
+
+    /// The first entry that is not `playing`: a video queued again while
+    /// it plays waits for a later turn rather than following itself.
+    pub fn next_besides(&self, playing: ItemRef) -> Option<ItemRef> {
+        self.upcoming.iter().map(|e| e.id).find(|id| *id != playing)
+    }
+
+    /// A video started: its first entry leaves the queue, wherever it is,
+    /// so a queued film played from its page is not played again. Returns
+    /// whether one did.
+    pub fn take(&mut self, id: ItemRef) -> bool {
+        let Some(at) = self.upcoming.iter().position(|e| e.id == id) else {
+            return false;
+        };
+        self.upcoming.remove(at);
+        self.forget_gone();
+        true
     }
 
     /// What plays after `playing`: the queue's first once the queue knows
@@ -442,6 +551,9 @@ mod tests {
             library_kind: None,
             imdb_rating: None,
             critic_rating: None,
+            artist: None,
+            stereo: None,
+            damaged: false,
         }
     }
 
@@ -777,5 +889,69 @@ mod tests {
         for (i, a) in labels.iter().enumerate() {
             assert!(!labels[i + 1..].contains(a), "{a}");
         }
+    }
+
+    /// V853: a video's queue row names an episode with its show and number;
+    /// a film keeps its own name.
+    #[test]
+    fn a_queued_video_is_named_with_its_show() {
+        let episode = Item {
+            kind: ItemKind::Episode,
+            name: "The Paper Boat".to_owned(),
+            series_name: Some("Show X".to_owned()),
+            season: Some(3),
+            episode: Some(10),
+            ..item(4)
+        };
+        assert_eq!(
+            Track::video(&episode).name,
+            "Show X · S3 · E10 · The Paper Boat"
+        );
+        let film = Item {
+            kind: ItemKind::Movie,
+            name: "Film BB".to_owned(),
+            ..item(5)
+        };
+        assert_eq!(Track::video(&film).name, "Film BB");
+        assert!(video_kind(ItemKind::Movie) && video_kind(ItemKind::Episode));
+        assert!(!video_kind(ItemKind::Audio) && !video_kind(ItemKind::Series));
+    }
+
+    /// V853: a queued video that starts leaves the queue, from wherever it
+    /// is; one not queued leaves the queue as it was. The video playing is
+    /// never its own next.
+    #[test]
+    fn a_queued_video_leaves_the_queue_when_it_starts() {
+        let mut q = Queue::default();
+        q.add(vec![
+            Track::from(&item(1)),
+            Track::from(&item(2)),
+            Track::from(&item(3)),
+        ]);
+        assert!(!q.take(ItemRef::Real(9)), "a video not queued");
+        assert_eq!(q.upcoming().len(), 3);
+        assert!(q.take(ItemRef::Real(2)));
+        assert_eq!(q.next(), Some(ItemRef::Real(1)));
+        assert_eq!(q.next_besides(ItemRef::Real(1)), Some(ItemRef::Real(3)));
+        assert_eq!(q.next_besides(ItemRef::Real(3)), Some(ItemRef::Real(1)));
+    }
+
+    /// V853: the queued video comes before the next episode, a group's
+    /// next ignores the queue, and the log line names inputs and verdict.
+    #[test]
+    fn a_videos_next_is_the_queue_then_the_episode_unless_grouped() {
+        let (q, e) = (Some(ItemRef::Real(8)), Some(ItemRef::Real(2)));
+        assert_eq!(video_next(q, e, false), (q, NextFrom::Queue));
+        assert_eq!(video_next(None, e, false), (e, NextFrom::Episode));
+        assert_eq!(video_next(q, e, true), (e, NextFrom::Group));
+        assert_eq!(video_next(None, None, false), (None, NextFrom::Nothing));
+        assert_eq!(
+            video_next_line(ItemRef::Real(1), q, e, false),
+            "pharos: video next item=1 next=8 from=queue queued=8 episode=2 grouped=false"
+        );
+        assert_eq!(
+            video_next_line(ItemRef::Real(1), None, None, true),
+            "pharos: video next item=1 next=none from=group queued=none episode=none grouped=true"
+        );
     }
 }

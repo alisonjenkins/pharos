@@ -52,6 +52,7 @@ async fn seed() -> (web::Data<AppState>, String) {
                 episode_number: Some(1),
                 series_folder: Some("/media/tv/Show".into()),
                 series_year: None,
+                series_key: None,
             }),
             probe: MediaProbe::default(),
             ..Default::default()

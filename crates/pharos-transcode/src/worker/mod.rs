@@ -6,6 +6,7 @@
 
 pub mod exec;
 pub mod libav_pool;
+pub mod priority;
 pub mod proc;
 
 pub use libav_pool::{LibavWorkerPool, PoolError};

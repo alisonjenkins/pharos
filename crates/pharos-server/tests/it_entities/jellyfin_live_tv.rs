@@ -281,6 +281,50 @@ async fn channel_stream_relays_without_leaking_provider_credentials() {
     assert_eq!(stream_outcomes(&snapshotter), expected);
 }
 
+/// B1150: the channel stream is a `<video>` element URL, so the sign-in
+/// cookie authenticates it and the web UI's URL carries no token. With no
+/// credential at all it is still a 401. Disarm check: with the route back on
+/// `AuthUser`, the cookie-only request answers 401.
+#[actix_web::test]
+async fn channel_stream_authenticates_with_the_sign_in_cookie() {
+    let provider = fake_provider();
+    let addr = provider.addr();
+    let m3u = format!(
+        "#EXTM3U\n#EXTINF:-1 tvg-id=\"ts\",TS\n\
+         http://prov-user:prov-pass@{addr}/live/ts?password=prov-pass\n"
+    );
+    let (state, token, _td) = seed_state_with_m3u(&m3u).await;
+    let app = test::init_service(build_app(state)).await;
+
+    let req = test::TestRequest::get()
+        .uri("/LiveTv/Channels/ts/Stream")
+        .cookie(actix_web::cookie::Cookie::new(
+            "JellyfinAuth",
+            token.as_str(),
+        ))
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), 200);
+    // The provider picks the type; sandboxed so it never runs as a page.
+    let csp = resp
+        .headers()
+        .get("content-security-policy")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    assert_eq!(csp, "default-src 'none'; sandbox");
+    assert_eq!(
+        resp.headers().get("x-content-type-options").unwrap(),
+        "nosniff"
+    );
+    assert_eq!(&test::read_body(resp).await[..], b"TS-PAYLOAD");
+
+    let req = test::TestRequest::get()
+        .uri("/LiveTv/Channels/ts/Stream")
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), 401);
+}
+
 #[actix_web::test]
 async fn programs_in_window_returns_epg() {
     let (state, token, _td) = seed_state_with_live_tv().await;

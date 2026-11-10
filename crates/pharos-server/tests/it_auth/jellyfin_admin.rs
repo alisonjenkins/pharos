@@ -1065,6 +1065,11 @@ async fn an_admin_can_list_damaged_files_including_one_with_no_resolvable_path()
     assert_eq!(thor["FirstFaultMs"], 5_582_400);
     assert_eq!(thor["ScannedMs"], 5_582_400);
     assert_eq!(thor["DeclaredMs"], 7_800_000);
+    assert_eq!(
+        thor["Ranges"],
+        serde_json::json!([{"StartMs": 5_582_400, "EndMs": 7_800_000}]),
+        "a verdict without spans that stops short marks the missing tail: {v}"
+    );
 
     let gone = arr
         .iter()
@@ -1182,7 +1187,7 @@ async fn an_admin_sees_each_duplicated_film_with_its_versions() {
     let item = |id: u64, path: &str, kind: MediaKind, tmdb: Option<&str>, height: u32| MediaItem {
         id,
         path: path.into(),
-        title: "The Six Million Dollar Man: Wine, Women and War".into(),
+        title: "Show S: The Long Night".into(),
         kind,
         probe: MediaProbe {
             size_bytes: Some(u64::from(height) * 1_000_000),
@@ -1192,7 +1197,7 @@ async fn an_admin_sees_each_duplicated_film_with_its_versions() {
             ..Default::default()
         },
         metadata: MediaMetadata {
-            production_year: Some(1973),
+            production_year: Some(1971),
             provider_ids: ProviderIds {
                 tmdb: tmdb.map(Into::into),
                 ..Default::default()
@@ -1205,25 +1210,19 @@ async fn an_admin_sees_each_duplicated_film_with_its_versions() {
     for m in [
         item(
             11,
-            "/m/Wine Women and War (1973).mkv",
+            "/m/The Long Night (1971).mkv",
             MediaKind::Movie,
-            Some("5157"),
+            Some("932003"),
             1080,
         ),
         item(
             12,
-            "/m/Six Million Dollar Man - Wine Women and War.avi",
+            "/m/Show S - The Long Night.avi",
             MediaKind::Movie,
             None,
             480,
         ),
-        item(
-            13,
-            "/tv/Six Million Dollar Man/S01E01.mkv",
-            MediaKind::Episode,
-            None,
-            480,
-        ),
+        item(13, "/tv/Show S/S01E01.mkv", MediaKind::Episode, None, 480),
     ] {
         MediaStore::put(&state.stores, m).await.unwrap();
     }
@@ -1241,8 +1240,8 @@ async fn an_admin_sees_each_duplicated_film_with_its_versions() {
     let groups = v.as_array().expect("array response");
     assert_eq!(groups.len(), 1, "{v}");
     let group = &groups[0];
-    assert_eq!(group["ProductionYear"], 1973, "{v}");
-    assert_eq!(group["ProviderId"], "tmdb:5157", "{v}");
+    assert_eq!(group["ProductionYear"], 1971, "{v}");
+    assert_eq!(group["ProviderId"], "tmdb:932003", "{v}");
     let versions = group["Versions"].as_array().unwrap();
     let ids: Vec<&str> = versions.iter().map(|e| e["Id"].as_str().unwrap()).collect();
     assert_eq!(ids, ["11", "12"], "{v}");
@@ -1250,4 +1249,315 @@ async fn an_admin_sees_each_duplicated_film_with_its_versions() {
     assert_eq!(versions[1]["VideoCodec"], "h264", "{v}");
     assert_eq!(versions[1]["SizeBytes"], 480_000_000, "{v}");
     assert_eq!(versions[1]["DateAdded"], 1_700_000_000, "{v}");
+}
+
+/// The admin list must say what a person calls the file, when it was checked
+/// and whether a re-check is waiting, not just a path.
+#[actix_web::test]
+async fn the_damaged_list_names_the_episode_and_shows_a_pending_recheck() {
+    use pharos_core::{MediaItem, MediaKind, MediaStore, SeriesInfo};
+    use pharos_server::integrity_memo::{IntegrityMemo, INTEGRITY_SCAN_VERSION};
+    use pharos_server::integrity_sweep::IntegritySweep;
+    use pharos_transcode::integrity::IntegrityReport;
+
+    let (state, token, _uid) = seed(true).await;
+    MediaStore::put(
+        &state.stores,
+        MediaItem {
+            id: 42,
+            path: "/media/TV/Show/S01E25.mkv".into(),
+            title: "The Last One".into(),
+            kind: MediaKind::Episode,
+            series: Some(SeriesInfo {
+                series_name: "Show".into(),
+                season_number: Some(1),
+                episode_number: Some(25),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let memo = IntegrityMemo::load("/nonexistent/integrity.json", INTEGRITY_SCAN_VERSION);
+    memo.record(
+        42,
+        Some((1, 1)),
+        IntegrityReport {
+            demux_errors: 1,
+            first_fault_ms: Some(2_800),
+            complete: true,
+            ..Default::default()
+        },
+    );
+    let sweep = std::sync::Arc::new(IntegritySweep::default());
+    sweep.request(42);
+    let state = web::Data::new(
+        AppState::new(state.stores.clone(), "t".into())
+            .with_integrity_memo(std::sync::Arc::new(memo))
+            .with_integrity_sweep(sweep),
+    );
+    let app = test::init_service(build_app(state)).await;
+    let body = test::call_and_read_body(
+        &app,
+        test::TestRequest::get()
+            .uri("/admin/integrity/damaged")
+            .insert_header(("X-Emby-Token", token.as_str()))
+            .to_request(),
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let e = &v[0];
+    assert_eq!(e["Kind"], "episode", "{v}");
+    assert_eq!(e["Name"], "The Last One");
+    assert_eq!(e["SeriesName"], "Show");
+    assert_eq!(e["SeasonNumber"], 1);
+    assert_eq!(e["EpisodeNumber"], 25);
+    assert!(e["CheckedAt"].as_i64().is_some(), "{v}");
+    assert_eq!(e["RecheckPending"], true);
+}
+
+/// Progress counts every kind in scope, leaves out what cannot be verified,
+/// and only counts files that have a verdict as checked.
+#[actix_web::test]
+async fn integrity_status_counts_checked_damaged_and_queued_files() {
+    use pharos_core::{MediaItem, MediaKind, MediaStore};
+    use pharos_server::integrity_memo::{IntegrityMemo, INTEGRITY_SCAN_VERSION};
+    use pharos_server::integrity_sweep::IntegritySweep;
+    use pharos_transcode::integrity::IntegrityReport;
+
+    let (state, token, _uid) = seed(true).await;
+    for (id, kind, path) in [
+        (1u64, MediaKind::Movie, "/m/a.mkv"),
+        (2, MediaKind::Episode, "/t/b.mkv"),
+        (3, MediaKind::Audio, "/a/c.flac"),
+        (4, MediaKind::Book, "/b/d.epub"),
+        (5, MediaKind::Book, "/b/e.cbr"),
+    ] {
+        MediaStore::put(
+            &state.stores,
+            MediaItem {
+                id,
+                kind,
+                path: path.into(),
+                title: format!("item {id}"),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    }
+    let memo = IntegrityMemo::load("/nonexistent/integrity.json", INTEGRITY_SCAN_VERSION);
+    let clean = IntegrityReport {
+        complete: true,
+        ..Default::default()
+    };
+    memo.record(1, Some((1, 1)), clean.clone());
+    memo.record(4, Some((1, 1)), clean);
+    memo.record(
+        2,
+        Some((1, 1)),
+        IntegrityReport {
+            read_errors: 1,
+            complete: true,
+            ..Default::default()
+        },
+    );
+    let sweep = std::sync::Arc::new(IntegritySweep::default());
+    sweep.mark_not_checkable(5, Some((1, 1)));
+    sweep.request(2);
+    let state = web::Data::new(
+        AppState::new(state.stores.clone(), "t".into())
+            .with_integrity_memo(std::sync::Arc::new(memo))
+            .with_integrity_sweep(sweep),
+    );
+    let app = test::init_service(build_app(state)).await;
+    let body = test::call_and_read_body(
+        &app,
+        test::TestRequest::get()
+            .uri("/admin/integrity/status")
+            .insert_header(("X-Emby-Token", token.as_str()))
+            .to_request(),
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["Eligible"], 4, "{v}");
+    assert_eq!(v["Checked"], 3, "{v}");
+    assert_eq!(v["Damaged"], 1, "{v}");
+    assert_eq!(v["Queued"], 1, "{v}");
+    assert_eq!(v["NotCheckable"], 1, "{v}");
+}
+
+#[actix_web::test]
+async fn an_admin_can_queue_a_recheck_and_unknown_or_remote_items_are_refused() {
+    use pharos_core::{MediaItem, MediaKind, MediaStore};
+    use pharos_server::integrity_memo::{IntegrityMemo, INTEGRITY_SCAN_VERSION};
+    use pharos_server::integrity_sweep::IntegritySweep;
+
+    let (state, token, _uid) = seed(true).await;
+    for (id, path) in [(10u64, "/m/a.mkv"), (11, "ytdlp://youtube/abc")] {
+        MediaStore::put(
+            &state.stores,
+            MediaItem {
+                id,
+                kind: MediaKind::Movie,
+                path: path.into(),
+                title: "x".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    }
+    let sweep = std::sync::Arc::new(IntegritySweep::default());
+    let app_state = AppState::new(state.stores.clone(), "t".into())
+        .with_integrity_memo(std::sync::Arc::new(IntegrityMemo::load(
+            "/nonexistent/integrity.json",
+            INTEGRITY_SCAN_VERSION,
+        )))
+        .with_integrity_sweep(sweep.clone());
+    let leader = app_state.is_bg_leader.clone();
+    let state = web::Data::new(app_state);
+    let app = test::init_service(build_app(state)).await;
+    let post = |uri: &str| {
+        test::TestRequest::post()
+            .uri(uri)
+            .insert_header(("X-Emby-Token", token.as_str()))
+            .to_request()
+    };
+    // A follower does not sweep, so it must not take the request.
+    let resp = test::call_service(&app, post("/admin/integrity/10/recheck")).await;
+    assert_eq!(resp.status().as_u16(), 503, "a follower refuses");
+    assert!(!sweep.is_queued(10));
+    leader.store(true, std::sync::atomic::Ordering::Relaxed);
+    let resp = test::call_service(&app, post("/admin/integrity/10/recheck")).await;
+    assert_eq!(resp.status().as_u16(), 202);
+    assert!(sweep.is_queued(10));
+    // Mixed case, as the web UI sends it.
+    let resp = test::call_service(&app, post("/Admin/Integrity/10/Recheck")).await;
+    assert_eq!(resp.status().as_u16(), 202, "a repeat request is fine");
+    assert_eq!(sweep.queued_len(), 1, "queued once");
+    let resp = test::call_service(&app, post("/admin/integrity/999/recheck")).await;
+    assert_eq!(resp.status().as_u16(), 404);
+    let resp = test::call_service(&app, post("/admin/integrity/11/recheck")).await;
+    assert_eq!(resp.status().as_u16(), 400, "a remote origin is not a file");
+    let resp = test::call_service(&app, post("/admin/integrity/nope/recheck")).await;
+    assert_eq!(resp.status().as_u16(), 400);
+}
+
+#[actix_web::test]
+async fn a_non_admin_cannot_see_integrity_status_or_queue_a_recheck() {
+    let (state, token, _uid) = seed(false).await;
+    let app = test::init_service(build_app(state)).await;
+    let resp = test::call_service(
+        &app,
+        test::TestRequest::get()
+            .uri("/admin/integrity/status")
+            .insert_header(("X-Emby-Token", token.as_str()))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(resp.status().as_u16(), 403);
+    let resp = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri("/admin/integrity/1/recheck")
+            .insert_header(("X-Emby-Token", token.as_str()))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(resp.status().as_u16(), 403);
+}
+
+/// A deep check is asked for one file, refused for a book and on a follower,
+/// and its result (here: ffmpeg missing) is listed with the reason.
+#[actix_web::test]
+async fn an_admin_can_ask_for_a_deep_check_and_read_its_result() {
+    use pharos_core::{MediaItem, MediaKind, MediaStore};
+    use pharos_server::integrity_deep::DeepChecks;
+
+    let (state, token, _uid) = seed(true).await;
+    for (id, kind, path) in [
+        (20u64, MediaKind::Movie, "/m/film.mkv"),
+        (21, MediaKind::Book, "/b/book.epub"),
+    ] {
+        MediaStore::put(
+            &state.stores,
+            MediaItem {
+                id,
+                kind,
+                path: path.into(),
+                title: format!("item {id}"),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    }
+    let deep = std::sync::Arc::new(DeepChecks::new(
+        "/nonexistent/ffmpeg",
+        std::sync::Arc::new(tokio::sync::Semaphore::new(4)),
+    ));
+    let app_state = AppState::new(state.stores.clone(), "t".into()).with_integrity_deep(deep);
+    let leader = app_state.is_bg_leader.clone();
+    let app = test::init_service(build_app(web::Data::new(app_state))).await;
+    let post = |uri: &str| {
+        test::TestRequest::post()
+            .uri(uri)
+            .insert_header(("X-Emby-Token", token.as_str()))
+            .to_request()
+    };
+    let resp = test::call_service(&app, post("/admin/integrity/20/deep")).await;
+    assert_eq!(resp.status().as_u16(), 503, "a follower refuses");
+    leader.store(true, std::sync::atomic::Ordering::Relaxed);
+    let resp = test::call_service(&app, post("/Admin/Integrity/20/Deep")).await;
+    assert_eq!(resp.status().as_u16(), 202);
+    let resp = test::call_service(&app, post("/admin/integrity/21/deep")).await;
+    assert_eq!(resp.status().as_u16(), 400, "a book has no frames");
+    let resp = test::call_service(&app, post("/admin/integrity/999/deep")).await;
+    assert_eq!(resp.status().as_u16(), 404);
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let body = test::call_and_read_body(
+            &app,
+            test::TestRequest::get()
+                .uri("/admin/integrity/deep")
+                .insert_header(("X-Emby-Token", token.as_str()))
+                .to_request(),
+        )
+        .await;
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let e = &v[0];
+        assert_eq!(e["MediaId"], "20", "{v}");
+        assert_eq!(e["Name"], "item 20");
+        assert_eq!(e["Kind"], "movie");
+        if e["State"] == "failed" {
+            assert!(
+                e["Detail"].as_str().unwrap().contains("could not start"),
+                "{v}"
+            );
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "never finished: {v}");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+#[actix_web::test]
+async fn a_non_admin_cannot_ask_for_or_list_deep_checks() {
+    let (state, token, _uid) = seed(false).await;
+    let app = test::init_service(build_app(state)).await;
+    for req in [
+        test::TestRequest::get().uri("/admin/integrity/deep"),
+        test::TestRequest::post().uri("/admin/integrity/1/deep"),
+    ] {
+        let resp = test::call_service(
+            &app,
+            req.insert_header(("X-Emby-Token", token.as_str()))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status().as_u16(), 403);
+    }
 }

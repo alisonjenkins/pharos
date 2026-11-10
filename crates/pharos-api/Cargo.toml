@@ -12,6 +12,14 @@ capnp-rpc = { workspace = true }
 metrics = { workspace = true }
 tracing = { workspace = true }
 web-time = { workspace = true }
+rustls = { workspace = true, optional = true }
+webpki-roots = { workspace = true, optional = true }
+
+[features]
+# The rustls client config native clients share (pharos-server's outbound
+# HTTP, the Android TV app's server proxy). Off by default: the wasm UI
+# build never needs it.
+rustls-client = ["dep:rustls", "dep:webpki-roots"]
 
 [build-dependencies]
 capnp = { workspace = true }

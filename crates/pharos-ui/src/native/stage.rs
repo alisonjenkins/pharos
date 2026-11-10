@@ -6,9 +6,9 @@
 //! view (a class) rather than unmounting the player and its stream.
 
 use dioxus::prelude::*;
-use pharos_client::api::{ItemKind, ItemRef};
+use pharos_client::api::ItemRef;
 
-use super::listen::{Icon, ICON_FLOAT, ICON_PIP};
+use super::listen::{Icon, ICON_FLOAT, ICON_PIP, ICON_QUEUE_NEXT, QUEUE_PANEL_ID};
 use super::platform;
 use super::playback::MediaState;
 use super::route::Route;
@@ -319,8 +319,6 @@ impl Stage {
                 self.set_item(*id);
                 self.view = View::Full;
             }
-            // Manage is another app: the player ends there (FR-009).
-            Route::Manage => self.close(),
             // The TV stops a video there, as TV apps do: a remote cannot
             // watch one in the bar and use the page at once (Alison, 2026-11-08).
             _ if self.item.is_some() && self.view == View::Full && self.video && STOPS_VIDEO => {
@@ -474,28 +472,6 @@ fn store(key: &str, value: &str) {
     }
 }
 
-/// Whether a play started by a click opens the page in browser fullscreen:
-/// a film or an episode does, unless it plays in the floating window or the
-/// mini bar, or a video is in picture-in-picture. Music never does.
-pub fn plays_fullscreen(kind: ItemKind, compact_shown: bool, pip: bool) -> bool {
-    matches!(kind, ItemKind::Movie | ItemKind::Episode) && !compact_shown && !pip
-}
-
-/// Called from a play click, before it navigates: the browser only grants
-/// fullscreen inside the click, and the player mounts after it.
-pub fn fullscreen_for_play(kind: ItemKind, stage: Option<StageCtx>) {
-    let compact = stage.is_some_and(|StageCtx(s)| s.peek().compact_shown());
-    let pip = platform::pip_active();
-    let full = plays_fullscreen(kind, compact, pip);
-    platform::info(&format!(
-        "pharos: fullscreen play kind={kind:?} compact={compact} pip={pip} verdict={}",
-        if full { "enter" } else { "skip" }
-    ));
-    if full {
-        platform::enter_page_fullscreen();
-    }
-}
-
 /// The app's stage, provided by the page root.
 #[derive(Clone, Copy)]
 pub struct StageCtx(pub Signal<Stage>);
@@ -513,6 +489,29 @@ pub enum StageAction {
     Place(Spot),
     /// Remember where the floating window is (a drag or key move ended).
     Keep,
+    /// Dock or undock the queue beside the compact player (B900/V852).
+    Queue,
+}
+
+/// Whether the queue is docked beside the compact player, shared by every
+/// player on the stage so a song handing over keeps it (B900/V852).
+#[derive(Clone, Copy)]
+pub struct QueueDock(pub Signal<bool>);
+
+/// What the stage logs when the docked queue opens or closes.
+pub fn dock_line(open: bool, view: View, upcoming: usize) -> String {
+    format!(
+        "pharos: stage queue shown={open} view={} upcoming={upcoming}",
+        view.label()
+    )
+}
+
+/// The compact player's queue button: how many songs wait, and whether the
+/// docked queue is open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueueButton {
+    pub count: usize,
+    pub open: bool,
 }
 
 /// A drag in progress: where the pointer and the window started.
@@ -553,7 +552,22 @@ pub fn StageBar(
     next: Option<ItemRef>,
     error: Option<String>,
     on_action: EventHandler<StageAction>,
+    /// The position as a signal, when the player keeps it apart from `media`
+    /// (B815).
+    #[props(default)]
+    live_position: Option<Signal<u64>>,
+    /// Music's queue button (B900/V852); none for a video.
+    #[props(default)]
+    queue: Option<QueueButton>,
+    /// Whole seconds until the next video plays, while "Up next" counts
+    /// down: one line with Cancel in place of the card (038 FR-406).
+    #[props(default)]
+    up_next_in: Option<u64>,
 ) -> Element {
+    let media = MediaState {
+        position_ms: live_position.map_or(media.position_ms, |s| s()),
+        ..media
+    };
     let mut drag = use_signal(|| None::<Drag>);
     let StageCtx(stage) = use_context::<StageCtx>();
     let spot = stage.read().spot;
@@ -579,10 +593,10 @@ pub fn StageBar(
             return;
         }
         let delta = match evt.key() {
-            Key::ArrowLeft => (-KEY_STEP_PX, 0.0),
-            Key::ArrowRight => (KEY_STEP_PX, 0.0),
-            Key::ArrowUp => (0.0, -KEY_STEP_PX),
-            Key::ArrowDown => (0.0, KEY_STEP_PX),
+            Key::Named(NamedKey::ArrowLeft) => (-KEY_STEP_PX, 0.0),
+            Key::Named(NamedKey::ArrowRight) => (KEY_STEP_PX, 0.0),
+            Key::Named(NamedKey::ArrowUp) => (0.0, -KEY_STEP_PX),
+            Key::Named(NamedKey::ArrowDown) => (0.0, KEY_STEP_PX),
             _ => return,
         };
         evt.prevent_default();
@@ -634,6 +648,18 @@ pub fn StageBar(
                     p { class: "pharos-stage-title", title: "{title}", "{title}" }
                     if let Some(message) = error {
                         p { class: "pharos-stage-error", role: "alert", "{message}" }
+                    } else if let Some(seconds) = up_next_in {
+                        p { class: "pharos-stage-next",
+                            span { role: "timer", "Next in {seconds} s" }
+                            " · "
+                            button {
+                                class: "pharos-stage-next-cancel",
+                                r#type: "button",
+                                aria_label: "Cancel up next",
+                                onclick: move |_| on_action.call(StageAction::Player(Control::CancelNext)),
+                                "Cancel"
+                            }
+                        }
                     }
                 }
                 div { class: "pharos-stage-transport", role: "group", aria_label: "Transport",
@@ -667,6 +693,24 @@ pub fn StageBar(
                             }
                         },
                         Icon { path: ICON_NEXT }
+                    }
+                }
+                if let Some(q) = queue {
+                    div { class: "pharos-stage-extra",
+                        button {
+                            class: "pharos-stage-button pharos-stage-queue",
+                            r#type: "button",
+                            "data-key-action": "queue",
+                            aria_label: queue_label(q.count),
+                            title: "Show or hide what plays next",
+                            aria_pressed: if q.open { "true" } else { "false" },
+                            aria_controls: q.open.then_some(QUEUE_PANEL_ID),
+                            onclick: move |_| on_action.call(StageAction::Queue),
+                            Icon { path: ICON_QUEUE_NEXT }
+                            if q.count > 0 {
+                                span { class: "pharos-queue-count", aria_hidden: "true", "{q.count}" }
+                            }
+                        }
                     }
                 }
                 if pip {
@@ -727,6 +771,16 @@ pub fn StageBar(
                 span { style: "width: {played:.2}%" }
             }
         }
+    }
+}
+
+/// The queue button's name, with how many songs wait so a screen reader
+/// hears the count the badge shows.
+pub fn queue_label(count: usize) -> String {
+    match count {
+        0 => "Queue".to_owned(),
+        1 => "Queue, 1 song".to_owned(),
+        n => format!("Queue, {n} songs"),
     }
 }
 
@@ -814,10 +868,10 @@ pub fn StageGrip() -> Element {
                 // move the handle by the height that step gives.
                 let rise = KEY_STEP_PX * VIDEO_ASPECT;
                 let delta = match evt.key() {
-                    Key::ArrowLeft => (-KEY_STEP_PX, 0.0),
-                    Key::ArrowRight => (KEY_STEP_PX, 0.0),
-                    Key::ArrowUp => (0.0, -rise),
-                    Key::ArrowDown => (0.0, rise),
+                    Key::Named(NamedKey::ArrowLeft) => (-KEY_STEP_PX, 0.0),
+                    Key::Named(NamedKey::ArrowRight) => (KEY_STEP_PX, 0.0),
+                    Key::Named(NamedKey::ArrowUp) => (0.0, -rise),
+                    Key::Named(NamedKey::ArrowDown) => (0.0, rise),
                     _ => return,
                 };
                 evt.prevent_default();
@@ -860,16 +914,6 @@ const ICON_CLOSE: &str = "M19 6.4 17.6 5 12 10.6 6.4 5 5 6.4 10.6 12 5 17.6 6.4 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn films_and_episodes_open_fullscreen_unless_compact_or_pip() {
-        for kind in [ItemKind::Movie, ItemKind::Episode] {
-            assert!(plays_fullscreen(kind, false, false));
-            assert!(!plays_fullscreen(kind, true, false));
-            assert!(!plays_fullscreen(kind, false, true));
-        }
-        assert!(!plays_fullscreen(ItemKind::Audio, false, false));
-    }
 
     const VIEWPORT: (f64, f64) = (1000.0, 800.0);
     const WINDOW: (f64, f64) = (320.0, 220.0);
@@ -1005,12 +1049,11 @@ mod tests {
     }
 
     #[test]
-    fn going_to_manage_ends_the_player() {
+    fn going_to_manage_keeps_the_player_compact() {
+        // Manage is a screen of this app now (B921), not another app.
         let mut stage = playing_full(7);
-        stage.follow(&Route::Home);
-        stage.follow(&Route::Manage);
-        assert_eq!(stage.item, None);
-        assert_eq!(stage.follow(&Route::Home), None);
+        assert_eq!(stage.follow(&Route::Manage), Some(stage.compact));
+        assert_eq!(stage.item, Some(ItemRef::Real(7)));
     }
 
     #[test]
@@ -1120,7 +1163,39 @@ mod tests {
         assert_eq!(stage.key(), again, "the same route mounts nothing new");
     }
 
-    fn bar() -> String {
+    /// 038 FR-406, V1222: the compact player's Up next is one line in its
+    /// bar, with Cancel. Disarm check: without the line this fails.
+    #[test]
+    fn the_compact_bar_counts_down_to_the_next_video_in_one_line() {
+        let mut dom = VirtualDom::new_with_props(
+            move |()| {
+                use_context_provider(|| StageCtx(Signal::new(Stage::default())));
+                rsx! {
+                    StageBar {
+                        view: View::Floating,
+                        title: "An episode".to_owned(),
+                        image: None,
+                        media: MediaState::default(),
+                        runtime_ms: 1_320_000,
+                        pip: false,
+                        previous: None,
+                        next: None,
+                        error: None,
+                        on_action: |_| {},
+                        up_next_in: Some(12),
+                    }
+                }
+            },
+            (),
+        );
+        dom.rebuild_in_place();
+        let html = dioxus_ssr::render(&dom);
+        assert!(html.contains("Next in 12 s"), "{html}");
+        assert!(html.contains("Cancel"), "{html}");
+        assert!(!bar(None).contains("pharos-stage-next"));
+    }
+
+    fn bar(queue: Option<QueueButton>) -> String {
         let mut dom = VirtualDom::new_with_props(
             move |()| {
                 use_context_provider(|| StageCtx(Signal::new(Stage::default())));
@@ -1136,6 +1211,7 @@ mod tests {
                         next: None,
                         error: None,
                         on_action: |_| {},
+                        queue,
                     }
                 }
             },
@@ -1145,11 +1221,41 @@ mod tests {
         dioxus_ssr::render(&dom)
     }
 
+    /// B900/V852: music's mini bar has a queue button that counts what
+    /// waits and says whether the docked queue is open; a video's has none.
+    #[test]
+    fn the_mini_bar_offers_the_queue_for_music_only() {
+        assert!(!bar(None).contains("pharos-stage-queue"));
+        let closed = bar(Some(QueueButton {
+            count: 3,
+            open: false,
+        }));
+        assert!(
+            closed.contains(r#"aria-label="Queue, 3 songs""#),
+            "{closed}"
+        );
+        assert!(closed.contains(r#"aria-pressed="false""#), "{closed}");
+        assert!(
+            !closed.contains("aria-controls"),
+            "no panel to point at: {closed}"
+        );
+        let open = bar(Some(QueueButton {
+            count: 0,
+            open: true,
+        }));
+        assert!(open.contains(r#"aria-label="Queue""#), "{open}");
+        assert!(open.contains(r#"aria-controls="pharos-queue""#), "{open}");
+        assert!(
+            !open.contains("pharos-queue-count"),
+            "no badge for none: {open}"
+        );
+    }
+
     /// B1031/V990: the focus a TV's compact player hands over lands on the
     /// stage bar's Expand button, which opens the full player.
     #[test]
     fn the_stage_bar_names_its_expand_button() {
-        let html = bar();
+        let html = bar(None);
         let id = format!(r#"id="{STAGE_EXPAND_ID}""#);
         let named = html.split('<').any(|tag| {
             tag.starts_with("button") && tag.contains(r#"aria-label="Expand""#) && tag.contains(&id)
@@ -1173,5 +1279,24 @@ mod tests {
     fn only_a_keyboard_or_pointer_gets_the_resize_grip() {
         assert_eq!(grip_shown(true), !REMOTE_FOCUS);
         assert!(!grip_shown(false));
+    }
+
+    #[test]
+    fn the_queue_button_names_its_count() {
+        assert_eq!(queue_label(0), "Queue");
+        assert_eq!(queue_label(1), "Queue, 1 song");
+        assert_eq!(queue_label(12), "Queue, 12 songs");
+    }
+
+    #[test]
+    fn the_docked_queue_logs_its_state_the_view_and_the_count() {
+        assert_eq!(
+            dock_line(true, View::Mini, 4),
+            "pharos: stage queue shown=true view=mini upcoming=4"
+        );
+        assert_eq!(
+            dock_line(false, View::Floating, 0),
+            "pharos: stage queue shown=false view=floating upcoming=0"
+        );
     }
 }

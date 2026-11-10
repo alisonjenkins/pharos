@@ -52,7 +52,7 @@ pub fn ItemDetailView(
     error: Option<String>,
     /// When set, renders a `<img class="pharos-detail-primary">` tag
     /// pointing at the resolved image URL. None hides the figure.
-    /// Caller composes the URL (`/Items/{id}/Images/Primary?api_key=…`).
+    /// Caller composes the URL (`/Items/{id}/Images/Primary`; the sign-in cookie authenticates it).
     primary_image_url: Option<String>,
     /// T54 phase 3: when set, renders a `<img class="pharos-detail-backdrop">`
     /// banner above the title. None hides it.

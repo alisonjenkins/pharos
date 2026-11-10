@@ -14,9 +14,52 @@ async `document::eval` round trip, and events arrive serialised with no
 element behind them. So `android.rs` cannot copy that surface one to one:
 slice 1 must pick an async surface or a JS-side state mirror pushed into
 Rust. That choice is slice 1's main cost and bears on ADR-0061's premise.
-Eval round-trip latency on the TV is not measured yet.
+Eval round-trip latency was measured on 2026-11-08 (below): reads are cheap
+enough for an async surface, and a pushed mirror keeps up with every frame.
 
-## Build
+## Eval latency (2026-11-08)
+
+Release build of the spike bin (`89d85aac0`), on the TV, nobody signed in,
+three seconds after launch (`~/pharos-tv-bench/run.sh`, logcat `bench`):
+
+| Probe | Result |
+|---|---|
+| `document::eval` round trip, one DOM read, 200 runs | min 2.1 ms, p50 2.5 ms, p95 3.3 ms, max 116 ms (the first, warm-up) |
+| One eval reading ten values (viewport, scroll, focus, tile count, `<video>` time/paused/width, a rect, dpr), 50 runs | p50 2.6 ms, p95 3.8 ms |
+| JS pushing a frame into Rust (`dioxus.send`) per `requestAnimationFrame`, 300 frames | gap p50 16.7 ms, p95 16.9 ms, max 17.8 ms; 5.0 s total |
+
+So a round trip costs about 2.5 ms whatever it reads, and batching is free.
+A pushed stream keeps the 60 Hz frame rate with no dropped frame. Neither
+side is a bottleneck: a D-pad press can afford one batched read (under 4 ms
+at p95 against a 16.7 ms frame), and continuous state can be pushed.
+
+### During playback (2026-11-08T15:36Z)
+
+Same bin with a second phase: after the idle reads it loops a muted 10 s
+1080p30 H.264 clip (a blob URL, hardware decode, 1-3 frames dropped at
+start, none after) and repeats the reads, then pushes 600 frames (~10 s, so
+it crosses the clip's loop point). 500 single reads and 100 batched reads
+per phase; five launches, ranges across them:
+
+| Probe | Idle p50 / p95 / p99 | Playing p50 / p95 / p99 |
+|---|---|---|
+| One DOM read | 2.1-2.2 / 2.7-2.9 / 3.1-3.7 ms | 2.5-2.9 / 7.1-8.9 / 9.2-12.2 ms |
+| One batched read (ten values) | 2.7-2.8 / 3.3-3.9 / 3.5-6.8 ms | 3.4-4.2 / 8.6-11.1 / 9.8-12.6 ms |
+| JS push per frame (two launches) | gap 16.7 / 16.8-16.9 ms | gap 16.7 / 17.4-20.1 / 18.6-21.4 ms, max 24.7 ms |
+
+Worst single read while playing was 53 ms (once in 2500); the 64-68 ms
+idle max is the first call after launch. Playback leaves p50 alone and
+triples the read tail: a read costs up to about 12 ms at p99. The push
+keeps 60 Hz (600 frames in 10.0 s); 3-32 of 600 gaps went over 20 ms and
+none reached two frames. One batched read per D-pad press still fits a
+16.7 ms frame. Polling `<video>` state by eval on every tick would fit
+only as one batched read, and at 12.6 ms p99 that read takes three
+quarters of the frame; the synchronous callers could not wait on it
+anyway. The JS mirror for state that changes on its own costs readers
+nothing and holds 60 Hz, so it holds up under playback too. The clip is not HLS
+through hls.js/MSE, so a real stream adds demux work on the same thread;
+treat these as a floor for playback.
+
 
 - `nix develop .#android -c dx build --platform android --package pharos-ui
   --bin pharos-tv --features mobile --target armv7-linux-androideabi`.
@@ -34,7 +77,7 @@ Eval round-trip latency on the TV is not measured yet.
 | Native socket | tokio-tungstenite + rustls/ring into `connect_stream`; no Origin header, server accepts |
 | QuickConnect | initiate/poll over the native API, token in `/data/data/<pkg>/files`, `resume(token)` on relaunch |
 | Home row | `home()` 376-562 ms; posters load as `<img>` with `?api_key=<token>` |
-| Playback | 8 Mile, `audio_remux`, hls.js + MSE, hardware `c2.mtk.avc.decoder`, 1920x1080, 1 of 2419 frames dropped, muted; pauses when the app is hidden |
+| Playback | a feature film, `audio_remux`, hls.js + MSE, hardware `c2.mtk.avc.decoder`, 1920x1080, 1 of 2419 frames dropped, muted; pauses when the app is hidden |
 | D-pad / OK | WebView's own spatial navigation moves focus between `<button>`s; Dioxus `onkeydown` gets ArrowUp/Down/Left/Right, Enter |
 | Media keys | `MediaPlayPause`, `MediaPlay`, `MediaFastForward` arrive as keydown |
 | Manifest | `[application] android_manifest = "android/AndroidManifest.xml"` replaces dx's manifest; `aapt2 dump badging` shows `leanback-launchable-activity`, `banner=`, touchscreen and leanback `uses-feature-not-required`; app launches via `LEANBACK_LAUNCHER` |

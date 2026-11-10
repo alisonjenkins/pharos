@@ -127,6 +127,13 @@ pub enum SocketBroadcast {
         /// Percent `0.0..=100.0`; serialized as a string to match Jellyfin.
         progress: f64,
     },
+    /// The whole library scan moved: `progress` is percent `0.0..=100.0`, and
+    /// `end` is how a pass finished and what it did. Native events only;
+    /// jellyfin-web follows the scan through `ScheduledTasksInfo`.
+    ScanProgress {
+        progress: f64,
+        end: Option<(crate::scan_tasks::ScanOutcome, crate::scan_tasks::ScanTally)>,
+    },
     /// A new dashboard activity-log entry (pre-shaped `ActivityLogEntry`
     /// JSON). Admin-only: delivered solely to sockets that sent
     /// `ActivityLogEntryStart` and belong to an admin.
@@ -178,6 +185,11 @@ pub struct AppState {
     /// Read by `GET /admin/integrity/damaged` — the one place "a number
     /// stating corruption" becomes "which files".
     pub integrity_memo: Option<std::sync::Arc<crate::integrity_memo::IntegrityMemo>>,
+    /// The integrity sweep's re-check queue and its not-checkable set. `None`
+    /// exactly when `integrity_memo` is: both come from the one spawn.
+    pub integrity_sweep: Option<std::sync::Arc<crate::integrity_sweep::IntegritySweep>>,
+    /// On-demand full decode checks. `None` where nothing set it up (tests).
+    pub integrity_deep: Option<std::sync::Arc<crate::integrity_deep::DeepChecks>>,
     /// Spec 028 — queue of the video a viewer just opened, ahead of the
     /// subtitle styling backfill. `None` where the job is not spawned (no
     /// `ffmpeg-lib`, tests).
@@ -225,6 +237,13 @@ pub struct AppState {
     pub trickplay_priority: Option<crate::trickplay_backfill::PriorityTx>,
     pub live_tv: Option<M3uXmltvBackend>,
     pub server_id: String,
+    /// ADR-0073 — signs the `ImageTag`s handed out in listings so an
+    /// anonymous image request must carry one this server minted.
+    pub image_tag_key: pharos_jellyfin_api::image_tag_sig::ImageTagKey,
+    /// ADR-0073 — refuse an anonymous image request whose tag does not
+    /// verify. Off by default: the verdict is counted either way, and the
+    /// operator turns this on once the counts show clients send good tags.
+    pub image_tags_enforced: bool,
     pub server_name: String,
     pub version: &'static str,
     /// Configured media roots — same list the CLI `pharos scan`
@@ -248,6 +267,9 @@ pub struct AppState {
     /// Directory pharos surfaces log files from for the
     /// `/System/Logs` admin endpoint. None disables the surface.
     pub log_dir: Option<PathBuf>,
+    /// "Report a problem" documents (016 US5). None refuses reports as
+    /// unavailable.
+    pub client_reports: Option<crate::client_reports::ReportStore>,
     /// Resolved directories the dashboard storage panel reports disk
     /// usage for (`GET /System/Info/Storage`). Set from config at boot.
     pub storage_folders: StorageFolders,
@@ -258,6 +280,9 @@ pub struct AppState {
     /// a library refresh stay buffered; slow consumers see a Lagged
     /// signal which `socket.rs` translates into "drop + re-subscribe".
     pub bus: broadcast::Sender<SocketBroadcast>,
+    /// Per-user event streams for the native API's `Events.subscribe`, fed
+    /// from [`Self::bus`] once someone subscribes (ADR-0094).
+    pub events: Arc<crate::services::events::EventLog>,
     /// 009 — what the cast service knows, so configured TVs can be listed as
     /// sessions. `None` (the default) keeps `/Sessions` exactly as it was.
     pub cast_directory: Option<Arc<dyn crate::cast_sessions::CastDirectory>>,
@@ -317,6 +342,8 @@ pub struct AppState {
     /// here so the admin spawn reads the configured value without
     /// re-parsing the toml config.
     pub scan_rate_limit_ms: u64,
+    /// Spec 033 — `[metadata] series_identity_repair` for background scans.
+    pub series_identity_repair: pharos_scanner::series_split::RepairMode,
     /// #11 — probe fan-out cap for background `/Library/Refresh` scans. 0 keeps
     /// the scanner's conservative default (leaves shared-storage I/O headroom).
     pub scan_probe_concurrency: usize,
@@ -326,6 +353,11 @@ pub struct AppState {
     /// Default at `AppState::new` is the spawn backend so tests get
     /// the production behaviour without extra wiring.
     pub ffmpeg: Arc<dyn FfmpegBackend>,
+    /// Where provider-hosted cast portraits are fetched from (ADR-0076).
+    pub portraits: Arc<dyn crate::portrait::PortraitSource>,
+    /// Where a person's biography and external ids are fetched from
+    /// (ADR-0084). `None` without a TMDB key: the page shows what is kept.
+    pub person_details: Option<Arc<dyn crate::person_details::PersonDetailsSource>>,
     /// Memoises a synthesised Series/Season/Artist/Album wire id → the
     /// representative member item id whose frame/cover is its poster. Without
     /// this, every synth-item image request would re-scan the whole library
@@ -395,22 +427,10 @@ pub struct AppState {
     /// (`notify_library_changed` / `notify_library_delta`). The full-item-list
     /// cache below keys on this so any add/remove instantly invalidates it.
     pub library_generation: Arc<std::sync::atomic::AtomicU64>,
-    /// Single-flight cache of the whole `media_items` list. Home-screen +
-    /// synth-id endpoints each did a full ~13k-row `store.list()` (1-4s) per
-    /// request, and browsing fired several at once. Holds
-    /// `((generation, artwork_epoch), built_at, items)` — a hit requires both
-    /// to still match AND the entry to be under `LIST_CACHE_MAX_AGE` (a backstop
-    /// so a missed invalidation self-heals). See `list_items_cached`.
-    #[allow(clippy::type_complexity)]
-    pub item_list_cache: Arc<
-        tokio::sync::Mutex<
-            Option<(
-                (u64, u64),
-                std::time::Instant,
-                Arc<Vec<pharos_core::MediaItem>>,
-            )>,
-        >,
-    >,
+    /// Stale-while-revalidate cache of the whole `media_items` list, keyed on
+    /// `(library_generation, artwork_epoch)` with a 60 s age backstop. See
+    /// `item_list_cache` and `list_items_cached`.
+    pub item_list_cache: Arc<crate::item_list_cache::ItemListCache>,
     /// Synthesised series/season/artist/album wire ids → the parent filter
     /// each names, so a `ParentId` lookup does not re-run four `SELECT
     /// DISTINCT` scans per request. See `items::synth_parent_filter`.
@@ -545,6 +565,18 @@ impl AppState {
     pub fn note_artwork_changed(&self) {
         self.artwork_epoch
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Drop a memoised synth-id resolution to `item_id`, so the next lookup
+    /// re-picks it; a newer pick made meanwhile is kept.
+    pub fn synth_image_forget(&self, id: &str, item_id: u64) {
+        let mut map = self
+            .synth_image_ids
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if map.get(id) == Some(&Some(item_id)) {
+            map.remove(id);
+        }
     }
 
     /// Record a synth-id → representative item id resolution.
@@ -738,6 +770,8 @@ impl AppState {
             images: None,
             hls: None,
             integrity_memo: None,
+            integrity_sweep: None,
+            integrity_deep: None,
             subtitle_styling: None,
             transcode_scheduler: None,
             remote: None,
@@ -754,12 +788,16 @@ impl AppState {
             media_roots: Vec::new(),
             library_set: Arc::new(std::sync::RwLock::new(Vec::new())),
             log_dir: None,
+            client_reports: None,
             storage_folders: StorageFolders::default(),
             quick_connect: crate::quick_connect::QuickConnectRegistry::spawn(),
             server_id: Uuid::new_v4().simple().to_string(),
+            image_tag_key: fresh_image_tag_key(),
+            image_tags_enforced: false,
             server_name,
             version: env!("CARGO_PKG_VERSION"),
             bus,
+            events: Arc::default(),
             cast_directory: None,
             cast: crate::cast_service::CastRuntime::inert(),
             sync: crate::group_ops::SyncRuntime::default(),
@@ -776,8 +814,11 @@ impl AppState {
             remote_default_bitrate_bps: 0,
             enforce_video_range: false,
             scan_rate_limit_ms: 0,
+            series_identity_repair: pharos_scanner::series_split::RepairMode::DryRun,
             scan_probe_concurrency: 0,
             ffmpeg: default_ffmpeg_backend(),
+            portraits: Arc::new(crate::portrait::HttpPortraits::new()),
+            person_details: None,
             synth_image_ids: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             artwork_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             synth_image_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -790,7 +831,7 @@ impl AppState {
             lyrics: Default::default(),
             is_bg_leader: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             library_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            item_list_cache: Arc::new(tokio::sync::Mutex::new(None)),
+            item_list_cache: Arc::new(crate::item_list_cache::ItemListCache::new()),
             synth_parents: Arc::new(std::sync::Mutex::new(None)),
             synth_parents_build: Arc::new(tokio::sync::Mutex::new(())),
             activity_log: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
@@ -826,6 +867,15 @@ impl AppState {
         self
     }
 
+    /// Builder: attach the store "Report a problem" documents are kept in.
+    pub fn with_client_reports(
+        mut self,
+        store: Option<crate::client_reports::ReportStore>,
+    ) -> Self {
+        self.client_reports = store;
+        self
+    }
+
     /// Builder: set the directories the dashboard storage panel reports
     /// disk usage for (`GET /System/Info/Storage`).
     pub fn with_storage_folders(mut self, folders: StorageFolders) -> Self {
@@ -849,6 +899,7 @@ impl AppState {
         server_name: String,
     ) -> Result<Self, pharos_store_sqlx::StoreError> {
         let server_id = stores.load_or_create_server_id().await?;
+        let image_tag_key = load_image_tag_key(&stores).await?;
         let auth = BuiltinAuth::new(stores.clone());
         let sessions = SessionRegistry::spawn();
         let transcode_sessions = TranscodeSessionRegistry::spawn(stores.clone());
@@ -861,6 +912,8 @@ impl AppState {
             images: None,
             hls: None,
             integrity_memo: None,
+            integrity_sweep: None,
+            integrity_deep: None,
             subtitle_styling: None,
             transcode_scheduler: None,
             remote: None,
@@ -877,12 +930,16 @@ impl AppState {
             media_roots: Vec::new(),
             library_set: Arc::new(std::sync::RwLock::new(Vec::new())),
             log_dir: None,
+            client_reports: None,
             storage_folders: StorageFolders::default(),
             quick_connect: crate::quick_connect::QuickConnectRegistry::spawn(),
             server_id,
+            image_tag_key,
+            image_tags_enforced: false,
             server_name,
             version: env!("CARGO_PKG_VERSION"),
             bus,
+            events: Arc::default(),
             cast_directory: None,
             cast: crate::cast_service::CastRuntime::inert(),
             sync: crate::group_ops::SyncRuntime::default(),
@@ -899,8 +956,11 @@ impl AppState {
             remote_default_bitrate_bps: 0,
             enforce_video_range: false,
             scan_rate_limit_ms: 0,
+            series_identity_repair: pharos_scanner::series_split::RepairMode::DryRun,
             scan_probe_concurrency: 0,
             ffmpeg: default_ffmpeg_backend(),
+            portraits: Arc::new(crate::portrait::HttpPortraits::new()),
+            person_details: None,
             synth_image_ids: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             artwork_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             synth_image_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -913,7 +973,7 @@ impl AppState {
             lyrics: Default::default(),
             is_bg_leader: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             library_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            item_list_cache: Arc::new(tokio::sync::Mutex::new(None)),
+            item_list_cache: Arc::new(crate::item_list_cache::ItemListCache::new()),
             synth_parents: Arc::new(std::sync::Mutex::new(None)),
             synth_parents_build: Arc::new(tokio::sync::Mutex::new(())),
             activity_log: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
@@ -1035,6 +1095,15 @@ impl AppState {
     /// P43 builder — apply the configured per-probe rate-limit for
     /// background library refresh. Capped at 5 seconds so a typo
     /// can't make a refresh run effectively forever.
+    /// Spec 033 builder — whether background scans write the series split.
+    pub fn with_series_identity_repair(
+        mut self,
+        mode: pharos_scanner::series_split::RepairMode,
+    ) -> Self {
+        self.series_identity_repair = mode;
+        self
+    }
+
     pub fn with_scan_rate_limit_ms(mut self, ms: u64) -> Self {
         self.scan_rate_limit_ms = ms.min(5_000);
         self
@@ -1053,6 +1122,26 @@ impl AppState {
     /// the `pharos-transcode` cargo features.
     pub fn with_ffmpeg_backend(mut self, backend: Arc<dyn FfmpegBackend>) -> Self {
         self.ffmpeg = backend;
+        self
+    }
+
+    /// Install the [`crate::portrait::PortraitSource`] the person image
+    /// route passes provider portraits through from.
+    pub fn with_portrait_source(
+        mut self,
+        source: Arc<dyn crate::portrait::PortraitSource>,
+    ) -> Self {
+        self.portraits = source;
+        self
+    }
+
+    /// Install the [`crate::person_details::PersonDetailsSource`] a person's
+    /// page asks for their biography and external ids.
+    pub fn with_person_details_source(
+        mut self,
+        source: Arc<dyn crate::person_details::PersonDetailsSource>,
+    ) -> Self {
+        self.person_details = Some(source);
         self
     }
 
@@ -1112,6 +1201,22 @@ impl AppState {
         memo: std::sync::Arc<crate::integrity_memo::IntegrityMemo>,
     ) -> Self {
         self.integrity_memo = Some(memo);
+        self
+    }
+
+    pub fn with_integrity_deep(
+        mut self,
+        deep: std::sync::Arc<crate::integrity_deep::DeepChecks>,
+    ) -> Self {
+        self.integrity_deep = Some(deep);
+        self
+    }
+
+    pub fn with_integrity_sweep(
+        mut self,
+        sweep: std::sync::Arc<crate::integrity_sweep::IntegritySweep>,
+    ) -> Self {
+        self.integrity_sweep = Some(sweep);
         self
     }
 
@@ -1214,30 +1319,37 @@ impl AppState {
         )
     }
 
-    /// Full `media_items` list, cached until the library changes (see
-    /// `item_list_cache`). Callers that only read/filter the list (home-screen
-    /// rows, synth Series/Season resolution) should use this instead of
-    /// `stores.list()` to avoid a full-table scan on every request. Returns an
+    /// Full `media_items` list, cached (see `item_list_cache`). Callers that
+    /// only read/filter the list (home-screen rows, synth Series/Season
+    /// resolution) should use this instead of `stores.list()`. Returns an
     /// `Arc` so the large Vec is shared, not cloned, across concurrent readers.
+    /// After a library change or the age backstop the previous list is
+    /// returned immediately while one background task refreshes it; use
+    /// [`Self::list_items_fresh`] when a stale list would be wrong.
     pub async fn list_items_cached(
         &self,
     ) -> Result<Arc<Vec<pharos_core::MediaItem>>, pharos_core::DomainError> {
-        use pharos_core::MediaStore;
-        /// Backstop: even if some mutation path forgets to bump the generation,
-        /// the cache refreshes at least this often.
-        const LIST_CACHE_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(60);
-        let gen = self.list_generation();
-        let mut guard = self.item_list_cache.lock().await;
-        if let Some((cached_gen, at, items)) = guard.as_ref() {
-            if *cached_gen == gen && at.elapsed() < LIST_CACHE_MAX_AGE {
-                return Ok(items.clone());
-            }
-        }
-        // Miss (stale generation / expired / cold). The mutex makes this
-        // single-flight: a burst of home-screen requests shares one scan.
-        let items = Arc::new(self.stores.list().await?);
-        *guard = Some((gen, std::time::Instant::now(), items.clone()));
-        Ok(items)
+        let (lib, art) = (
+            Arc::clone(&self.library_generation),
+            Arc::clone(&self.artwork_epoch),
+        );
+        self.item_list_cache
+            .get(&self.stores, move || {
+                use std::sync::atomic::Ordering;
+                (lib.load(Ordering::Relaxed), art.load(Ordering::Relaxed))
+            })
+            .await
+    }
+
+    /// Like [`Self::list_items_cached`] but never stale: waits for a load when
+    /// the cached list predates the current generation. For a caller that
+    /// just observed a library change and must see it.
+    pub async fn list_items_fresh(
+        &self,
+    ) -> Result<Arc<Vec<pharos_core::MediaItem>>, pharos_core::DomainError> {
+        self.item_list_cache
+            .get_fresh(&self.stores, self.list_generation())
+            .await
     }
 
     /// LIB-A4 — fire a `LibraryChanged` event carrying the item-id deltas
@@ -1372,6 +1484,19 @@ impl AppState {
         });
     }
 
+    /// Fan out a `ScanProgress` event for the whole library scan, which the
+    /// native events turn into the `refresh-library` task. `progress` is
+    /// `0.0..=100.0`; `end` is set once per pass, when it finishes.
+    pub fn notify_scan_progress(
+        &self,
+        progress: f64,
+        end: Option<(crate::scan_tasks::ScanOutcome, crate::scan_tasks::ScanTally)>,
+    ) {
+        let _ = self
+            .bus
+            .send(SocketBroadcast::ScanProgress { progress, end });
+    }
+
     /// Fan out a `RefreshProgress` event for a library/collection item so
     /// jellyfin-web's library-card refresh indicator fills as a scan runs.
     /// `item_id` is the library's wire id; `progress` is `0.0..=100.0`.
@@ -1450,6 +1575,41 @@ pub fn sockets_draining() -> bool {
 /// promptly (the client reconnects to the already-Ready new pod).
 pub fn shutdown_signal() -> &'static tokio::sync::Notify {
     &SHUTDOWN_NOTIFY
+}
+
+/// Name of the persisted image-tag key in `server_secrets` (ADR-0073).
+const IMAGE_TAG_KEY_SECRET: &str = "image_tag_key";
+
+/// 32 bytes from the OS RNG. On the (never observed) failure of the RNG the
+/// key is derived from a v4 UUID pair, which is itself OS-random.
+fn fresh_image_tag_key() -> pharos_jellyfin_api::image_tag_sig::ImageTagKey {
+    let mut bytes = [0u8; pharos_jellyfin_api::image_tag_sig::ImageTagKey::LEN];
+    if getrandom::fill(&mut bytes).is_err() {
+        bytes[..16].copy_from_slice(Uuid::new_v4().as_bytes());
+        bytes[16..].copy_from_slice(Uuid::new_v4().as_bytes());
+    }
+    pharos_jellyfin_api::image_tag_sig::ImageTagKey::from_array(bytes)
+}
+
+/// Read the persisted image-tag key, creating it on first boot. A stored
+/// value of the wrong length is a corrupt row: refuse to start rather than
+/// silently rotate the key, which would invalidate every cached tag.
+async fn load_image_tag_key(
+    stores: &Stores,
+) -> Result<pharos_jellyfin_api::image_tag_sig::ImageTagKey, pharos_store_sqlx::StoreError> {
+    use pharos_jellyfin_api::image_tag_sig::ImageTagKey;
+    let fresh = fresh_image_tag_key();
+    let fresh_bytes = fresh.to_bytes();
+    let stored = stores
+        .load_or_create_secret(IMAGE_TAG_KEY_SECRET, &fresh_bytes)
+        .await?;
+    ImageTagKey::from_bytes(&stored).ok_or_else(|| {
+        pharos_store_sqlx::StoreError::Parse(format!(
+            "server_secrets.{IMAGE_TAG_KEY_SECRET} holds {} bytes, want {}",
+            stored.len(),
+            ImageTagKey::LEN
+        ))
+    })
 }
 
 #[cfg(test)]

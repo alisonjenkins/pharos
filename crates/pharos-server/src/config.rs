@@ -425,6 +425,16 @@ pub struct MetadataConfig {
     /// rewrite. Default true.
     #[serde(default = "default_true")]
     pub fetch_translations: bool,
+    /// Spec 033 — `"dry_run"` (default) logs the series split and key
+    /// repairs a full scan decides; `"apply"` writes them.
+    #[serde(default)]
+    pub series_identity_repair: pharos_scanner::series_split::RepairMode,
+    /// Artwork whose file is gone from disk is relinked to a same-named file
+    /// in the item's folder, or else dropped so online art can replace it, on
+    /// a daily sweep (B1180). `false` only logs the dead rows and writes
+    /// nothing. Default true.
+    #[serde(default = "default_true")]
+    pub repair_stale_artwork: bool,
 }
 
 fn default_refresh_ttl_days() -> u32 {
@@ -451,6 +461,8 @@ impl Default for MetadataConfig {
             match_min_confidence: default_match_min_confidence(),
             refresh_interval_secs: default_refresh_interval_secs(),
             fetch_translations: true,
+            series_identity_repair: pharos_scanner::series_split::RepairMode::DryRun,
+            repair_stale_artwork: true,
         }
     }
 }
@@ -487,6 +499,12 @@ pub struct ServerConfig {
     /// yields no frame and the image 404s).
     #[serde(default = "default_image_seek_seconds")]
     pub image_seek_seconds: u32,
+    /// ADR-0073 / V712 — refuse an image request that carries no credential
+    /// and no `tag=` this server minted for that image. Off by default:
+    /// `pharos_image_tag_check_total{verdict}` counts the verdict either way,
+    /// so turn this on once `invalid` and `absent` have gone quiet.
+    #[serde(default)]
+    pub image_tags_enforced: bool,
     /// Soft cap on the extracted-image cache (posters / backdrops / thumbs /
     /// scaled sidecar artwork / chapter thumbs), in bytes. `0` = unbounded
     /// (no janitor — the historical behaviour). When non-zero a periodic
@@ -501,8 +519,10 @@ pub struct ServerConfig {
     /// spawns ffmpeg.
     #[serde(default)]
     pub transcode_cache_dir: Option<PathBuf>,
-    /// Soft cap on the HLS segment cache, in bytes. Once exceeded,
-    /// least-recently-used segments are evicted. Default 1 GiB.
+    /// Soft cap on the HLS segment cache, in bytes. Enforced both in-line
+    /// (LRU since boot) and by a periodic janitor that covers segments from
+    /// earlier boots and the audio sessions (`_contaudio/`, `_audiohls/`).
+    /// `0` disables the cap. Default 1 GiB.
     #[serde(default = "default_transcode_cache_bytes")]
     pub transcode_cache_max_bytes: u64,
     /// Directory used to cache Trickplay sprite sheets. When unset,
@@ -688,6 +708,11 @@ pub struct ServerConfig {
     /// this plus the in-flight drain. Default `10`.
     #[serde(default = "default_drain_grace_secs")]
     pub drain_grace_secs: u64,
+    /// actix-web worker threads (ADR-0083). Each costs ~5.6 MiB of heap for
+    /// its own copy of the route table. Unset or `0`: one per CPU, capped at
+    /// 16, where the 2026-11-09 benchmark stopped gaining throughput.
+    #[serde(default)]
+    pub http_workers: Option<usize>,
     /// Default video-bitrate ceiling (bps) applied to a TRANSCODE when the
     /// client connects from a REMOTE (non-private, non-loopback) address.
     ///
@@ -1007,6 +1032,24 @@ pub fn redact_dsn(url: &str) -> String {
 pub struct DatabaseConfig {
     #[serde(default = "default_db_url")]
     pub url: String,
+    /// Connections the pool holds open; requests beyond it queue.
+    #[serde(default = "default_db_max_connections")]
+    pub max_connections: NonZeroU32,
+    /// Seconds a query waits for a free connection before failing.
+    #[serde(default = "default_db_acquire_timeout_secs")]
+    pub acquire_timeout_secs: NonZeroU32,
+}
+
+impl DatabaseConfig {
+    /// The pool size the stores are opened with.
+    pub fn pool(&self) -> pharos_store_sqlx::PoolConfig {
+        pharos_store_sqlx::PoolConfig {
+            max_connections: self.max_connections.get(),
+            acquire_timeout: std::time::Duration::from_secs(u64::from(
+                self.acquire_timeout_secs.get(),
+            )),
+        }
+    }
 }
 
 /// Hand-written so `{:?}` on a `Config` — anywhere, now or later — cannot print
@@ -1015,6 +1058,8 @@ impl std::fmt::Debug for DatabaseConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DatabaseConfig")
             .field("url", &redact_dsn(&self.url))
+            .field("max_connections", &self.max_connections)
+            .field("acquire_timeout_secs", &self.acquire_timeout_secs)
             .finish()
     }
 }
@@ -1023,12 +1068,35 @@ impl Default for DatabaseConfig {
     fn default() -> Self {
         Self {
             url: default_db_url(),
+            max_connections: default_db_max_connections(),
+            acquire_timeout_secs: default_db_acquire_timeout_secs(),
         }
     }
 }
 
 fn default_db_url() -> String {
     "sqlite::memory:".into()
+}
+
+fn default_db_max_connections() -> NonZeroU32 {
+    // Checked at compile time.
+    const DEFAULT: NonZeroU32 =
+        match NonZeroU32::new(pharos_store_sqlx::PoolConfig::DEFAULT_MAX_CONNECTIONS) {
+            Some(n) => n,
+            None => panic!("the default pool size must not be zero"),
+        };
+    DEFAULT
+}
+
+fn default_db_acquire_timeout_secs() -> NonZeroU32 {
+    // Checked at compile time.
+    const DEFAULT: NonZeroU32 = match NonZeroU32::new(
+        pharos_store_sqlx::PoolConfig::DEFAULT_ACQUIRE_TIMEOUT.as_secs() as u32,
+    ) {
+        Some(n) => n,
+        None => panic!("the default acquire timeout must not be zero"),
+    };
+    DEFAULT
 }
 
 fn default_server_name() -> String {
@@ -1053,6 +1121,26 @@ pub struct ObsConfig {
     /// their log shipper (journald-to-file, supervisor, etc.) populates.
     #[serde(default)]
     pub log_dir: Option<PathBuf>,
+    /// Where "Report a problem" documents are kept (016 FR-008). Unset, they
+    /// go under `<log_dir>/clientlog/reports`; with neither set, reports are
+    /// refused as unavailable rather than kept nowhere.
+    #[serde(default)]
+    pub report_dir: Option<PathBuf>,
+    /// Days a problem report is kept before the sweep deletes it.
+    #[serde(default = "default_report_retention_days")]
+    pub report_retention_days: u32,
+}
+
+impl ObsConfig {
+    /// The report directory in force: `report_dir`, else the clientlog area
+    /// under `log_dir`, else none.
+    pub fn resolved_report_dir(&self) -> Option<PathBuf> {
+        self.report_dir.clone().or_else(|| {
+            self.log_dir
+                .as_ref()
+                .map(|d| d.join("clientlog").join("reports"))
+        })
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -1146,6 +1234,10 @@ impl MediaConfig {
         }
         out
     }
+}
+
+fn default_report_retention_days() -> u32 {
+    crate::client_reports::DEFAULT_RETENTION_DAYS
 }
 
 fn default_sampling_ratio() -> f64 {
@@ -1707,6 +1799,17 @@ mod tests {
     }
 
     #[test]
+    fn http_workers_is_unset_unless_given() {
+        let parse =
+            |extra: &str| toml::from_str::<ServerConfig>(&format!("bind = \"0.0.0.0:1\"\n{extra}"));
+        assert_eq!(parse("").expect("parses").http_workers, None);
+        assert_eq!(
+            parse("http_workers = 4").expect("parses").http_workers,
+            Some(4)
+        );
+    }
+
+    #[test]
     fn login_throttle_defaults_when_absent_and_merges_partial_sections() {
         let parse =
             |extra: &str| toml::from_str::<ServerConfig>(&format!("bind = \"0.0.0.0:1\"\n{extra}"));
@@ -1875,6 +1978,49 @@ mod tests {
         assert_eq!(c.obs.log_level, "debug");
         assert_eq!(c.media.roots, vec![PathBuf::from("/srv/media")]);
         assert!(c.obs.otlp_endpoint.is_none());
+        assert_eq!(c.obs.report_retention_days, 30);
+        assert_eq!(c.obs.resolved_report_dir(), None);
+    }
+
+    #[test]
+    fn reports_default_under_the_log_dir_and_an_explicit_dir_wins() {
+        let mut c = Config::from_toml_str(SAMPLE).unwrap();
+        c.obs.log_dir = Some(PathBuf::from("/var/log/pharos"));
+        assert_eq!(
+            c.obs.resolved_report_dir(),
+            Some(PathBuf::from("/var/log/pharos/clientlog/reports"))
+        );
+        c.obs.report_dir = Some(PathBuf::from("/data/reports"));
+        assert_eq!(
+            c.obs.resolved_report_dir(),
+            Some(PathBuf::from("/data/reports"))
+        );
+    }
+
+    #[test]
+    fn database_pool_defaults_to_eight_connections_and_a_thirty_second_wait() {
+        let c = Config::from_toml_str(SAMPLE).unwrap();
+        let pool = c.database.pool();
+        assert_eq!(pool.max_connections, 8);
+        assert_eq!(pool.acquire_timeout, std::time::Duration::from_secs(30));
+    }
+
+    #[test]
+    fn database_pool_is_configurable_and_refuses_zero() {
+        let with = |extra: &str| {
+            Config::from_toml_str(&SAMPLE.replace(
+                "url = \"sqlite::memory:\"",
+                &format!("url = \"sqlite::memory:\"\n{extra}"),
+            ))
+        };
+        let pool = with("max_connections = 24\nacquire_timeout_secs = 5")
+            .unwrap()
+            .database
+            .pool();
+        assert_eq!(pool.max_connections, 24);
+        assert_eq!(pool.acquire_timeout, std::time::Duration::from_secs(5));
+        assert!(with("max_connections = 0").is_err());
+        assert!(with("acquire_timeout_secs = 0").is_err());
     }
 
     #[test]
@@ -2179,6 +2325,7 @@ mod dsn_redaction_tests {
     fn debug_of_the_config_does_not_print_the_password() {
         let cfg = DatabaseConfig {
             url: "postgres://u:hunter2@db:5432/pharos".into(),
+            ..DatabaseConfig::default()
         };
         let shown = format!("{cfg:?}");
         assert!(

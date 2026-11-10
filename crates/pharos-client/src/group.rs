@@ -122,6 +122,12 @@ pub enum GroupUpdate {
     },
     /// The group's audio or subtitle changed.
     Tracks(GroupTracks),
+    /// Member `by` kept the group watching the end of queue entry
+    /// `playlist_item_id`: no "Up next" plays the next item from it.
+    NextHeld {
+        playlist_item_id: String,
+        by: String,
+    },
     /// The group is over for this member, whatever the reason.
     Ended,
 }
@@ -335,6 +341,19 @@ impl NativeMembership {
 
     /// `false` puts this member on their own tracks ("Just me"); `true`
     /// puts them back on the group's.
+    /// Keeps the group watching the end of queue entry `playlist_item_id`:
+    /// no member's "Up next" plays the next item from it (B1027). Since
+    /// schemaVersion 33.
+    pub async fn hold_next(
+        &self,
+        call: &CallInfo,
+        playlist_item_id: &str,
+    ) -> Result<(), ClientError> {
+        command!(self, call, hold_next_request, |p| {
+            p.set_playlist_item_id(playlist_item_id);
+        })
+    }
+
     pub async fn follow_tracks(&self, call: &CallInfo, follow: bool) -> Result<(), ClientError> {
         command!(self, call, follow_tracks_request, |p| {
             p.set_follow(follow);
@@ -492,6 +511,13 @@ fn read_update(update: group_update::Reader<'_>) -> Result<GroupUpdate, capnp::E
             }
         }
         group_update::Tracks(t) => GroupUpdate::Tracks(read_tracks(t?)?),
+        group_update::NextHeld(h) => {
+            let h = h?;
+            GroupUpdate::NextHeld {
+                playlist_item_id: h.get_playlist_item_id()?.to_string()?,
+                by: h.get_by()?.to_string()?,
+            }
+        }
         group_update::Ended(_) => GroupUpdate::Ended,
     })
 }

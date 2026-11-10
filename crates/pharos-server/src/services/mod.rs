@@ -4,15 +4,21 @@
 
 pub mod access;
 pub mod auth;
+pub mod devices;
+pub mod events;
 pub mod font_subset;
 pub mod group_seen;
 pub mod library;
 pub mod lyrics;
+pub mod metadata_edit;
 pub mod metadata_text;
 pub mod mix;
+pub mod person;
 pub mod play_state;
 pub mod playback;
 pub mod search;
 pub mod segments;
+pub mod track_settings;
+pub mod user_config;
 pub mod user_data;
 pub mod watch;

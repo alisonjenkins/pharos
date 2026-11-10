@@ -29,7 +29,7 @@ use crate::options::TranscodeOptions;
 use crate::protocol::{DeviceId, JobId, JobSpec, OutputSink, WorkerError, WorkerId};
 use bytes::Bytes;
 use smallvec::SmallVec;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -681,6 +681,24 @@ impl std::fmt::Display for SchedError {
 
 impl std::error::Error for SchedError {}
 
+/// What one stream's viewer is waiting behind in the queue, read while they
+/// wait so the player can say "the server is busy" before the segment lands
+/// (038 FR-402, V1217). Derived from the queue the scheduler already holds:
+/// no state is kept for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct StreamWait {
+    /// This stream's interactive jobs queued for a device: what its viewer
+    /// is blocked on and nobody has started.
+    pub queued: usize,
+    /// How long the oldest of them has waited; 0 with none queued.
+    pub oldest_ms: u64,
+    /// Other playback streams with interactive jobs queued too, each counted
+    /// once; jobs with no stream (the transcode tool) are not videos and are
+    /// left out.
+    pub others_queued: usize,
+    /// Every device not cooling down holds all its permits.
+    pub devices_full: bool,
+}
 /// Per-device + queue snapshot for the test tool / metrics.
 #[derive(Debug, Clone)]
 pub struct SchedSnapshot {
@@ -865,6 +883,11 @@ enum SchedMsg {
     Snapshot {
         reply: oneshot::Sender<SchedSnapshot>,
     },
+    /// What `stream` is waiting behind (038 FR-402).
+    StreamWait {
+        stream: StreamKey,
+        reply: oneshot::Sender<StreamWait>,
+    },
     /// Which device a shared-init fMP4 rendition is pinned to, resolved by
     /// the same pure function `candidates_for` applies at dispatch. `None`
     /// for a rendition that is not pinned (not shared-init fMP4) or that no
@@ -902,6 +925,9 @@ struct JobCtx {
     /// placement runs hybrid: the pipeline decision is otherwise recomputed
     /// from config and options alone, with no memory of the failed attempt.
     resident_failed: bool,
+    /// A GPU-tonemap run of this job died or failed transiently; every later
+    /// placement tonemaps on the CPU chain.
+    gpu_tonemap_failed: bool,
     /// The submitter's handle on this job, if it kept one. Latched at dispatch
     /// so the submitter can tell the capacity it can still get back from the
     /// capacity it cannot — see [`JobSlot::is_dispatched`]. `None` for callers
@@ -1591,6 +1617,18 @@ impl TranscodeScheduler {
         rx.await.ok()
     }
 
+    /// What `stream`'s viewer is waiting behind: its own queued client
+    /// requests, everyone else's, and whether every device is full. `None`
+    /// when the scheduler is gone.
+    pub async fn stream_wait(&self, stream: StreamKey) -> Option<StreamWait> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(SchedMsg::StreamWait { stream, reply })
+            .await
+            .ok()?;
+        rx.await.ok()
+    }
+
     /// The device a shared-init fMP4 rendition of `input` under `opts` will be
     /// placed on — the pin `candidates_for` enforces — so a caller sizing
     /// speculative work can size it for the device that will actually run it.
@@ -1733,6 +1771,7 @@ fn handle(state: &mut SchedState, msg: SchedMsg, self_tx: &mpsc::Sender<SchedMsg
                 filler,
                 pipeline: crate::VaapiPipeline::Hybrid,
                 resident_failed: false,
+                gpu_tonemap_failed: false,
             };
             place(state, job_id, ctx, self_tx);
         }
@@ -2003,6 +2042,7 @@ fn handle(state: &mut SchedState, msg: SchedMsg, self_tx: &mpsc::Sender<SchedMsg
                     }
                     ctx.span.record("outcome", "transient_retry");
                     ctx.resident_failed |= ctx.pipeline == crate::VaapiPipeline::Resident;
+                    ctx.gpu_tonemap_failed |= ctx.pipeline == crate::VaapiPipeline::GpuTonemap;
                     ctx.retries += 1;
                     ctx.last_error = Some(err);
                     retry_or_fail(state, job_id, ctx, self_tx);
@@ -2027,9 +2067,19 @@ fn handle(state: &mut SchedState, msg: SchedMsg, self_tx: &mpsc::Sender<SchedMsg
                         )
                         .increment(1);
                     }
+                    let gpu_tonemap_died = ctx.pipeline == crate::VaapiPipeline::GpuTonemap;
+                    ctx.gpu_tonemap_failed |= gpu_tonemap_died;
                     ctx.retries += 1;
                     ctx.last_error = Some(WorkerError::Other("worker died".into()));
-                    retry_or_fail(state, job_id, ctx, self_tx);
+                    // Counted only when the CPU redo is actually scheduled: a
+                    // job out of retries is failed, not redone, and counting
+                    // it would overstate how often the fallback saves a
+                    // segment. (A transient failure, `DeviceBusy`, is counted
+                    // by the detached task's single retry before it gets
+                    // here, so it is not counted again on that path.)
+                    if retry_or_fail(state, job_id, ctx, self_tx) && gpu_tonemap_died {
+                        count_tonemap_fallback("worker_died");
+                    }
                 }
             }
             // A permit just freed (the detached task dropped it before
@@ -2044,6 +2094,33 @@ fn handle(state: &mut SchedState, msg: SchedMsg, self_tx: &mpsc::Sender<SchedMsg
                 None
             };
             let _ = reply.send(dev);
+        }
+        SchedMsg::StreamWait { stream, reply } => {
+            let now = Instant::now();
+            let mut wait = StreamWait::default();
+            let mut others = HashSet::new();
+            for (_, c) in state
+                .pending
+                .iter()
+                .filter(|(_, c)| c.class == JobClass::Interactive)
+            {
+                if c.stream == stream && stream != StreamKey::NONE {
+                    wait.queued += 1;
+                    let waited = now.saturating_duration_since(c.enqueued).as_millis() as u64;
+                    wait.oldest_ms = wait.oldest_ms.max(waited);
+                } else if c.stream != StreamKey::NONE {
+                    others.insert(c.stream);
+                }
+            }
+            wait.others_queued = others.len();
+            let mut open = state
+                .devices
+                .slots()
+                .iter()
+                .filter(|s| !matches!(s.cooldown_until, Some(t) if t > now))
+                .peekable();
+            wait.devices_full = open.peek().is_some() && open.all(|s| s.in_use() >= s.capacity);
+            let _ = reply.send(wait);
         }
         SchedMsg::Snapshot { reply } => {
             let devices = state
@@ -2161,13 +2238,14 @@ fn promote_job(state: &mut SchedState, job_id: JobId, self_tx: &mpsc::Sender<Sch
     }
 }
 
-/// Decide what to do with a job that just failed transiently / died.
+/// Decide what to do with a job that just failed transiently / died. Returns
+/// whether it was re-placed (`false`: retries exhausted, the job failed).
 fn retry_or_fail(
     state: &mut SchedState,
     job_id: JobId,
     ctx: JobCtx,
     self_tx: &mpsc::Sender<SchedMsg>,
-) {
+) -> bool {
     if ctx.retries > state.cfg.max_retries {
         let err = ctx
             .last_error
@@ -2175,9 +2253,10 @@ fn retry_or_fail(
             .unwrap_or(WorkerError::Other("retries exhausted".into()));
         tracing::warn!(%job_id, error = %err, "transcode job exhausted retries");
         let _ = ctx.reply.send(Err(SchedError::Failed(err)));
-        return;
+        return false;
     }
     place(state, job_id, ctx, self_tx);
+    true
 }
 
 /// Would admitting a speculative job to `dev` put it beside a client's segment
@@ -2847,11 +2926,92 @@ fn vaapi_pipeline_for(
         )
         .increment(1);
     }
-    if earlier_failure {
+    let pipeline = if earlier_failure {
         crate::VaapiPipeline::Hybrid
     } else {
         verdict.pipeline()
+    };
+    // The resident verdict refuses every tonemap job, so the two routes never
+    // compete: an HDR job is Hybrid here until the GPU tonemap route claims it.
+    let pipeline = if pipeline == crate::VaapiPipeline::Hybrid
+        && gpu_tonemap_route(state, dev, ctx, offload)
+    {
+        crate::VaapiPipeline::GpuTonemap
+    } else {
+        pipeline
+    };
+    if !ctx.opts.tonemap.is_off() {
+        metrics::counter!(
+            "pharos_transcode_tonemap_path_total",
+            "path" => TonemapPath::of(pipeline).label(),
+        )
+        .increment(1);
     }
+    pipeline
+}
+
+/// Which tonemap implementation a job ran: the dashboard-facing view of
+/// [`crate::VaapiPipeline::GpuTonemap`] against everything else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TonemapPath {
+    Cpu,
+    Gpu,
+}
+
+impl TonemapPath {
+    pub const ALL: [Self; 2] = [Self::Cpu, Self::Gpu];
+
+    pub fn of(pipeline: crate::VaapiPipeline) -> Self {
+        if pipeline == crate::VaapiPipeline::GpuTonemap {
+            Self::Gpu
+        } else {
+            Self::Cpu
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Cpu => "cpu",
+            Self::Gpu => "gpu",
+        }
+    }
+}
+
+/// Why a GPU tonemap run was redone on the CPU chain: a [`WorkerError`] class
+/// the route can own, or the worker dying. Bounded; the ffmpeg string goes in
+/// the log.
+pub const TONEMAP_FALLBACK_REASONS: [&str; 4] =
+    ["device_unusable", "decode_failed", "other", "worker_died"];
+
+/// Create the tonemap series whose first event must not be their first sample.
+pub fn register_tonemap_metrics() {
+    for path in TonemapPath::ALL {
+        metrics::counter!("pharos_transcode_tonemap_path_total", "path" => path.label())
+            .increment(0);
+    }
+    for reason in TONEMAP_FALLBACK_REASONS {
+        metrics::counter!("pharos_transcode_tonemap_fallback_total", "reason" => reason)
+            .increment(0);
+    }
+}
+
+fn count_tonemap_fallback(reason: &'static str) {
+    metrics::counter!("pharos_transcode_tonemap_fallback_total", "reason" => reason).increment(1);
+}
+
+/// Should this HDR job take the GPU tonemap route on `dev`? Needs a device
+/// whose trial passed, a source Vulkan decode was proven on (the trial clip is
+/// HEVC, and `offload` is the boot decode evidence for it), a job shape the argv can express, and no earlier GPU failure.
+fn gpu_tonemap_route(
+    state: &SchedState,
+    dev: DeviceId,
+    ctx: &JobCtx,
+    offload: crate::DecodeOffload,
+) -> bool {
+    !ctx.gpu_tonemap_failed
+        && ctx.opts.source_video_codec == Some(crate::SourceCodec::Hevc)
+        && state.devices.may_gpu_tonemap(dev)
+        && crate::gpu_tonemap_argv_applies(&ctx.opts, dev, offload, ctx.filler.is_some())
 }
 
 /// A resident run that failed in a way the hybrid pipeline might not share.
@@ -2871,8 +3031,10 @@ fn record_placement(
     ctx: &JobCtx,
     candidates: &[DeviceId],
     offload: crate::DecodeOffload,
+    pipeline: crate::VaapiPipeline,
 ) -> tracing::Span {
-    let decode = crate::DecodeAccel::of(&ctx.opts, dev, offload);
+    let decode =
+        crate::DecodeAccel::for_pipeline(&ctx.opts, dev, offload, pipeline, ctx.filler.is_some());
     // `queue_wait_ms`/`encode_ms`/`out_bytes`/`outcome` are declared empty and
     // recorded when the job finishes, so one span carries the whole life of a
     // segment: what it was, where it went, how long it waited, how it ended.
@@ -3135,7 +3297,14 @@ fn place(state: &mut SchedState, job_id: JobId, mut ctx: JobCtx, self_tx: &mpsc:
             record_dispatch(state, &ctx);
             let decode_offload = decode_offload_for(state, dev, ctx.opts.source_video_codec);
             let vaapi_pipeline = vaapi_pipeline_for(state, dev, &ctx, decode_offload);
-            let span = record_placement(job_id, dev, &ctx, &candidates, decode_offload);
+            let span = record_placement(
+                job_id,
+                dev,
+                &ctx,
+                &candidates,
+                decode_offload,
+                vaapi_pipeline,
+            );
             span.record("vaapi_pipeline", vaapi_pipeline.label());
             let worker = state.idle.pop();
             let worker_id = WorkerId(state.next_worker);
@@ -3482,7 +3651,14 @@ fn try_place_no_queue(
             record_dispatch(state, &ctx);
             let decode_offload = decode_offload_for(state, dev, ctx.opts.source_video_codec);
             let vaapi_pipeline = vaapi_pipeline_for(state, dev, &ctx, decode_offload);
-            let span = record_placement(job_id, dev, &ctx, &candidates, decode_offload);
+            let span = record_placement(
+                job_id,
+                dev,
+                &ctx,
+                &candidates,
+                decode_offload,
+                vaapi_pipeline,
+            );
             span.record("vaapi_pipeline", vaapi_pipeline.label());
             let worker = state.idle.pop();
             let worker_id = WorkerId(state.next_worker);
@@ -3624,8 +3800,12 @@ fn spawn_run_task(
             // The pipeline the run that produced the timing used: a fallback
             // retry changes it.
             let mut ran = spec.vaapi_pipeline;
-            let resident = spec.vaapi_pipeline == crate::VaapiPipeline::Resident;
-            let retry_spec = resident.then(|| JobSpec {
+            let first = spec.vaapi_pipeline;
+            let retryable = matches!(
+                first,
+                crate::VaapiPipeline::Resident | crate::VaapiPipeline::GpuTonemap
+            );
+            let retry_spec = retryable.then(|| JobSpec {
                 vaapi_pipeline: crate::VaapiPipeline::Hybrid,
                 ..spec.clone()
             });
@@ -3640,19 +3820,30 @@ fn spawn_run_task(
                 |_| matches!(&result, WorkerRunResult::Failed(e) if resident_attributable(e)),
             );
             if let (WorkerRunResult::Failed(err), Some(retry)) = (&result, retry_spec) {
-                tracing::warn!(
-                    %job_id,
-                    %device,
-                    reason = err.label(),
-                    error = %err,
-                    "GPU-resident VAAPI run failed; retrying once on the hybrid path"
-                );
-                metrics::counter!(
-                    "pharos_transcode_vaapi_resident_fallback_total",
-                    "reason" => err.label(),
-                    "stage" => "run",
-                )
-                .increment(1);
+                if first == crate::VaapiPipeline::GpuTonemap {
+                    tracing::warn!(
+                        %job_id,
+                        %device,
+                        reason = err.label(),
+                        error = %err,
+                        "GPU tonemap run failed; retrying once on the CPU tonemap chain"
+                    );
+                    count_tonemap_fallback(err.label());
+                } else {
+                    tracing::warn!(
+                        %job_id,
+                        %device,
+                        reason = err.label(),
+                        error = %err,
+                        "GPU-resident VAAPI run failed; retrying once on the hybrid path"
+                    );
+                    metrics::counter!(
+                        "pharos_transcode_vaapi_resident_fallback_total",
+                        "reason" => err.label(),
+                        "stage" => "run",
+                    )
+                    .increment(1);
+                }
                 ran = crate::VaapiPipeline::Hybrid;
                 result = worker.run(retry).await;
             }
@@ -3710,7 +3901,7 @@ mod tests {
     fn only_a_file_sink_claims_to_have_measured_its_output() {
         // `out_bytes: 0` from a live-stream job means "the worker never saw the
         // bytes", not "the encode produced nothing". Conflating them cost a
-        // wrong lead during the Ghost in the Shell investigation.
+        // wrong lead during the Film AH investigation.
         let file = SinkRequest::FileDirect {
             out_path: PathBuf::from("/tmp/x.ts"),
         };
@@ -4083,6 +4274,322 @@ mod tests {
 
     fn other_failure() -> WorkerRunResult {
         WorkerRunResult::Failed(WorkerError::Other("vaapi: failed to create surface".into()))
+    }
+
+    struct HdrRun {
+        pipelines: Vec<crate::VaapiPipeline>,
+        result: Result<JobDone, SchedError>,
+        /// (metric name, label value, counter value) for the tonemap counters.
+        counts: Vec<(String, String, u64)>,
+        /// (`verdict` label, value) of `pharos_transcode_decode_accel_total`.
+        decode_accel: Vec<(String, u64)>,
+    }
+
+    /// How a test shapes the lone VAAPI device and scheduler.
+    #[derive(Clone, Copy, Default)]
+    struct HdrSetup {
+        /// Codecs the boot decode trial proved; `None`: never probed.
+        decodable: Option<&'static [crate::SourceCodec]>,
+        max_retries: Option<u8>,
+    }
+
+    /// Submit one HDR job to a lone VAAPI device. `capable` is the GPU tonemap
+    /// trial's verdict, `shape` edits the job, and `gpu_result` scripts what the
+    /// worker does on a GPU-tonemap run (every other run succeeds).
+    fn run_hdr_on_vaapi(
+        verdict: crate::device::GpuTonemapCapability,
+        shape: fn(&mut TranscodeOptions),
+        gpu_result: Option<fn() -> WorkerRunResult>,
+    ) -> HdrRun {
+        run_hdr_on_vaapi_with(verdict, shape, gpu_result, HdrSetup::default())
+    }
+
+    fn run_hdr_on_vaapi_with(
+        verdict: crate::device::GpuTonemapCapability,
+        shape: fn(&mut TranscodeOptions),
+        gpu_result: Option<fn() -> WorkerRunResult>,
+        setup: HdrSetup,
+    ) -> HdrRun {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let seen: Arc<Mutex<Vec<crate::VaapiPipeline>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = pharos_test_metrics::snapshotter(&recorder);
+        let log = seen.clone();
+        let result = metrics::with_local_recorder(&recorder, || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let gpu = DeviceId::hw(HwAccel::Vaapi, 0);
+                let (spawner, _) = ScriptedSpawner::new(Duration::ZERO, move |_, spec| {
+                    log.lock().unwrap().push(spec.vaapi_pipeline);
+                    match gpu_result {
+                        Some(run) if spec.vaapi_pipeline == crate::VaapiPipeline::GpuTonemap => {
+                            run()
+                        }
+                        _ => WorkerRunResult::Done { out_bytes: 1 },
+                    }
+                });
+                let mut table = DeviceTable::from_probe(&[(gpu, 2)], 1);
+                table.set_gpu_tonemap(gpu, verdict);
+                if let Some(codecs) = setup.decodable {
+                    table.set_decodable(gpu, codecs);
+                }
+                let mut cfg = SchedConfig::default();
+                if let Some(n) = setup.max_retries {
+                    cfg.max_retries = n;
+                }
+                let s = TranscodeScheduler::spawn(table, spawner, cfg);
+                let mut o = h264();
+                o.source_video_codec = Some(crate::SourceCodec::Hevc);
+                o.tonemap = crate::options::Tonemap::HdrToSdr;
+                shape(&mut o);
+                s.submit(
+                    PathBuf::from("/m/a.mkv"),
+                    o,
+                    file_sink(),
+                    JobClass::Interactive,
+                    JobHint::default(),
+                )
+                .await
+            })
+        });
+        let snapshot = snapshotter.snapshot().into_vec();
+        let counts = snapshot
+            .iter()
+            .filter(|(k, ..)| k.key().name().starts_with("pharos_transcode_tonemap_"))
+            .filter_map(|(k, _, _, v)| match v {
+                DebugValue::Counter(c) => Some((
+                    k.key().name().to_string(),
+                    k.key()
+                        .labels()
+                        .next()
+                        .map(|l| l.value().to_string())
+                        .unwrap_or_default(),
+                    *c,
+                )),
+                _ => None,
+            })
+            .collect();
+        let decode_accel = snapshot
+            .iter()
+            .filter(|(k, ..)| k.key().name() == "pharos_transcode_decode_accel_total")
+            .filter_map(|(k, _, _, v)| match v {
+                DebugValue::Counter(c) => k
+                    .key()
+                    .labels()
+                    .find(|l| l.key() == "verdict")
+                    .map(|l| (l.value().to_string(), *c)),
+                _ => None,
+            })
+            .collect();
+        let pipelines = seen.lock().unwrap().clone();
+        HdrRun {
+            pipelines,
+            result,
+            counts,
+            decode_accel,
+        }
+    }
+
+    fn count(r: &HdrRun, name: &str, label: &str) -> u64 {
+        r.counts
+            .iter()
+            .find(|(n, l, _)| n == name && l == label)
+            .map_or(0, |(_, _, c)| *c)
+    }
+
+    const PATH: &str = "pharos_transcode_tonemap_path_total";
+    const FALLBACK: &str = "pharos_transcode_tonemap_fallback_total";
+
+    #[test]
+    fn an_hdr_job_on_a_tonemap_capable_vaapi_device_takes_the_gpu_route() {
+        let r = run_hdr_on_vaapi(crate::device::GpuTonemapCapability::Capable, |_| {}, None);
+        assert!(r.result.is_ok(), "{:?}", r.result);
+        assert_eq!(r.pipelines, [crate::VaapiPipeline::GpuTonemap]);
+        assert_eq!(count(&r, PATH, "gpu"), 1, "{:?}", r.counts);
+        assert_eq!(count(&r, PATH, "cpu"), 0, "{:?}", r.counts);
+        assert_eq!(count(&r, FALLBACK, "other"), 0, "{:?}", r.counts);
+    }
+
+    #[test]
+    fn an_hdr_job_falls_back_to_the_cpu_chain_unless_the_trial_passed() {
+        use crate::device::GpuTonemapCapability::{Incapable, NotProbed};
+        for verdict in [NotProbed, Incapable] {
+            let r = run_hdr_on_vaapi(verdict, |_| {}, None);
+            assert!(r.result.is_ok(), "{verdict:?}: {:?}", r.result);
+            assert_eq!(r.pipelines, [crate::VaapiPipeline::Hybrid], "{verdict:?}");
+            assert_eq!(count(&r, PATH, "cpu"), 1, "{verdict:?}: {:?}", r.counts);
+            assert_eq!(count(&r, PATH, "gpu"), 0, "{verdict:?}: {:?}", r.counts);
+        }
+    }
+
+    /// The route is only proven on HEVC and cannot burn a subtitle: those jobs
+    /// stay on the CPU chain even on a capable device.
+    #[test]
+    fn jobs_the_gpu_route_cannot_run_stay_on_the_cpu_chain() {
+        type Shape = fn(&mut TranscodeOptions);
+        let cases: [(&str, Shape); 3] = [
+            ("h264 source", |o| {
+                o.source_video_codec = Some(crate::SourceCodec::H264)
+            }),
+            ("unknown source", |o| o.source_video_codec = None),
+            ("subtitle burn", |o| {
+                o.burn_intent = true;
+                o.burn_subtitle_stream_index = Some(2);
+            }),
+        ];
+        for (label, shape) in cases {
+            let r = run_hdr_on_vaapi(crate::device::GpuTonemapCapability::Capable, shape, None);
+            assert!(r.result.is_ok(), "{label}: {:?}", r.result);
+            assert_eq!(r.pipelines, [crate::VaapiPipeline::Hybrid], "{label}");
+            assert_eq!(count(&r, PATH, "cpu"), 1, "{label}: {:?}", r.counts);
+        }
+    }
+
+    /// A failed GPU run is redone once on the CPU chain, the segment still
+    /// succeeds, and the fallback is counted with the failure's class.
+    #[test]
+    fn a_failed_gpu_tonemap_run_is_retried_once_on_the_cpu_chain() {
+        let r = run_hdr_on_vaapi(
+            crate::device::GpuTonemapCapability::Capable,
+            |_| {},
+            Some(|| {
+                WorkerRunResult::Failed(WorkerError::DecodeFailed("vulkan: no hevc decode".into()))
+            }),
+        );
+        assert!(r.result.is_ok(), "{:?}", r.result);
+        assert_eq!(
+            r.pipelines,
+            [
+                crate::VaapiPipeline::GpuTonemap,
+                crate::VaapiPipeline::Hybrid
+            ]
+        );
+        assert_eq!(count(&r, FALLBACK, "decode_failed"), 1, "{:?}", r.counts);
+    }
+
+    #[test]
+    fn a_worker_that_dies_in_a_gpu_tonemap_run_is_replaced_on_the_cpu_chain() {
+        let r = run_hdr_on_vaapi(
+            crate::device::GpuTonemapCapability::Capable,
+            |_| {},
+            Some(|| WorkerRunResult::Died),
+        );
+        assert!(r.result.is_ok(), "{:?}", r.result);
+        assert_eq!(
+            r.pipelines,
+            [
+                crate::VaapiPipeline::GpuTonemap,
+                crate::VaapiPipeline::Hybrid
+            ]
+        );
+        assert_eq!(count(&r, FALLBACK, "worker_died"), 1, "{:?}", r.counts);
+        assert_eq!(count(&r, PATH, "cpu"), 1, "{:?}", r.counts);
+    }
+
+    /// The route decodes on Vulkan, so a device whose decode trial did not
+    /// prove HEVC keeps the CPU chain, like any other hardware decode.
+    #[test]
+    fn an_hdr_job_stays_on_the_cpu_chain_where_hevc_decode_was_not_proven() {
+        let r = run_hdr_on_vaapi_with(
+            crate::device::GpuTonemapCapability::Capable,
+            |_| {},
+            None,
+            HdrSetup {
+                decodable: Some(&[crate::SourceCodec::H264]),
+                ..HdrSetup::default()
+            },
+        );
+        assert!(r.result.is_ok(), "{:?}", r.result);
+        assert_eq!(r.pipelines, [crate::VaapiPipeline::Hybrid]);
+        assert_eq!(count(&r, PATH, "cpu"), 1, "{:?}", r.counts);
+    }
+
+    /// `decode_accel` says what the argv does: Vulkan decode on the GPU route,
+    /// software on the CPU chain.
+    #[test]
+    fn the_decode_accel_series_follows_the_tonemap_route() {
+        let gpu = run_hdr_on_vaapi(crate::device::GpuTonemapCapability::Capable, |_| {}, None);
+        assert_eq!(gpu.decode_accel, [("gpu".to_string(), 1)]);
+        let cpu = run_hdr_on_vaapi(crate::device::GpuTonemapCapability::Incapable, |_| {}, None);
+        assert_eq!(cpu.decode_accel, [("no_decoder_for_accel".to_string(), 1)]);
+    }
+
+    /// The fallback is counted when a CPU redo is scheduled, not when the
+    /// worker dies: a job out of retries is failed, not redone.
+    #[test]
+    fn a_worker_death_with_no_retries_left_is_not_counted_as_a_fallback() {
+        let r = run_hdr_on_vaapi_with(
+            crate::device::GpuTonemapCapability::Capable,
+            |_| {},
+            Some(|| WorkerRunResult::Died),
+            HdrSetup {
+                max_retries: Some(0),
+                ..HdrSetup::default()
+            },
+        );
+        assert!(r.result.is_err(), "{:?}", r.result);
+        assert_eq!(r.pipelines, [crate::VaapiPipeline::GpuTonemap]);
+        assert_eq!(count(&r, FALLBACK, "worker_died"), 0, "{:?}", r.counts);
+    }
+
+    /// A fault the CPU chain would share is not retried, so the fallback
+    /// counter stays free of bad sources.
+    #[test]
+    fn failures_the_cpu_chain_would_share_are_not_retried_on_the_gpu_route() {
+        let r = run_hdr_on_vaapi(
+            crate::device::GpuTonemapCapability::Capable,
+            |_| {},
+            Some(|| WorkerRunResult::Failed(WorkerError::BadInput("corrupt".into()))),
+        );
+        assert!(r.result.is_err());
+        assert_eq!(r.pipelines, [crate::VaapiPipeline::GpuTonemap]);
+        assert_eq!(count(&r, FALLBACK, "other"), 0);
+    }
+
+    /// Every series is created at boot, with the label values that are
+    /// asserted distinct here, so `rate()` sees the first event.
+    #[test]
+    fn the_tonemap_series_are_pre_registered_and_their_labels_are_distinct() {
+        use metrics_util::debugging::DebuggingRecorder;
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = pharos_test_metrics::snapshotter(&recorder);
+        metrics::with_local_recorder(&recorder, register_tonemap_metrics);
+        let seen: std::collections::HashSet<(String, String)> = snapshotter
+            .snapshot()
+            .into_vec()
+            .iter()
+            .map(|(k, ..)| {
+                (
+                    k.key().name().to_string(),
+                    k.key()
+                        .labels()
+                        .next()
+                        .map(|l| l.value().to_string())
+                        .unwrap_or_default(),
+                )
+            })
+            .collect();
+        let want_paths: std::collections::HashSet<_> =
+            TonemapPath::ALL.iter().map(|p| p.label()).collect();
+        assert_eq!(want_paths.len(), TonemapPath::ALL.len());
+        for p in want_paths {
+            assert!(
+                seen.contains(&(PATH.to_string(), p.to_string())),
+                "{p}: {seen:?}"
+            );
+        }
+        let want_reasons: std::collections::HashSet<_> = TONEMAP_FALLBACK_REASONS.iter().collect();
+        assert_eq!(want_reasons.len(), TONEMAP_FALLBACK_REASONS.len());
+        for reason in TONEMAP_FALLBACK_REASONS {
+            assert!(
+                seen.contains(&(FALLBACK.to_string(), reason.to_string())),
+                "{reason}: {seen:?}"
+            );
+        }
     }
 
     /// A worker that dies (crash, or the 20 s heartbeat timeout on a hung GPU)
@@ -4977,6 +5484,70 @@ mod tests {
             6,
             "only 5 blockers + 1 seek-target may run; abandoned queued jobs must be skipped"
         );
+    }
+
+    /// 038 FR-402, V1217: a viewer waiting behind full devices is told so
+    /// while the job is still queued, counted apart from everyone else's.
+    /// Disarm check: with the `StreamWait` arm replying the default, this
+    /// fails on `queued`.
+    #[tokio::test]
+    async fn stream_wait_names_a_streams_queued_requests_behind_full_devices() {
+        let (spawner, _) = ScriptedSpawner::new(Duration::from_millis(600), |_, _| {
+            WorkerRunResult::Done { out_bytes: 1 }
+        });
+        let s = TranscodeScheduler::spawn(table(), spawner, SchedConfig::default());
+        let (mine, theirs) = (StreamKey::of("mine"), StreamKey::of("theirs"));
+        let idle = s.stream_wait(mine).await.expect("wait");
+        assert_eq!(
+            idle,
+            StreamWait::default(),
+            "an idle server has nothing queued"
+        );
+
+        let submit = |stream: StreamKey, path: &'static str| {
+            let s2 = s.clone();
+            tokio::spawn(async move {
+                s2.submit(
+                    PathBuf::from(path),
+                    h264(),
+                    file_sink(),
+                    JobClass::Interactive,
+                    JobHint {
+                        stream,
+                        ..JobHint::default()
+                    },
+                )
+                .await
+            })
+        };
+        // 5 permits (2 nvenc + 1 vaapi + 2 cpu), all taken by another stream.
+        let mut handles = Vec::new();
+        for _ in 0..5 {
+            handles.push(submit(theirs, "/m/run"));
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        handles.push(submit(mine, "/m/a"));
+        handles.push(submit(mine, "/m/b"));
+        handles.push(submit(theirs, "/m/c"));
+        handles.push(submit(StreamKey::NONE, "/m/d"));
+        tokio::time::sleep(Duration::from_millis(80)).await;
+
+        let wait = s.stream_wait(mine).await.expect("wait");
+        assert_eq!(wait.queued, 2, "{wait:?}");
+        assert_eq!(wait.others_queued, 1, "{wait:?}");
+        assert!(wait.devices_full, "{wait:?}");
+        assert!(wait.oldest_ms > 0, "{wait:?}");
+        let none = s
+            .stream_wait(StreamKey::of("elsewhere"))
+            .await
+            .expect("wait");
+        // mine and theirs; the stream-less job is not another video.
+        assert_eq!((none.queued, none.others_queued), (0, 2));
+        for h in handles {
+            let _ = h.await;
+        }
+        let after = s.stream_wait(mine).await.expect("wait");
+        assert_eq!((after.queued, after.devices_full), (0, false), "{after:?}");
     }
 
     #[tokio::test]

@@ -4,7 +4,7 @@
 
 **Created**: 2026-10-12
 
-**Status**: Implemented against an in-process receiver emulator (57 of 65 tasks); NOT proven on a real TV, in jellyfin-web, or on postgres (see tasks.md T006, T007, T045, T048)
+**Status**: Implemented against an in-process receiver emulator (57 of 65 tasks); NOT proven on a real TV, in jellyfin-web, or on postgres (see tasks.md T006, T007, T045, T048); audited 2026-11-09: still 57 of 65, open T006, T007, T045 (Playwright part), T047, T048, T049, T064, T065 (receiver playbackerror still only logged at pharos-cast driver.rs on_report; MAX_LOAD_WAIT still a constant)
 
 **Input**: User description: "I would like to make it so that when we are watching something in Pharos in a sync play group that I can stream to a TV using the chromecast feature and it remaining in sync with the group."
 

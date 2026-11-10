@@ -14,11 +14,15 @@ pub mod player;
 pub mod prefs;
 pub mod quick_connect;
 pub mod remote;
+pub mod scan_progress;
 pub mod search;
 pub mod server_picker;
 
-pub use admin::{AdminAction, AdminTab, AdminView, AdminViewProps, CreateUserAttempt};
-pub use app_state::{AppRoute, RootApp};
+pub use admin::{
+    AdminAction, AdminTab, AdminView, AdminViewProps, CreateUserAttempt, DeepSearchState,
+    IdentityFocus, IdentitySearchState, MetadataSave, MetadataState, PickPrompt,
+};
+pub use app_state::{AdminPane, AppRoute, RootApp};
 pub use detail::{DetailAction, ItemDetailView};
 pub use group::{GroupAction, GroupMember, GroupSessionPanel, GroupSnapshot};
 pub use library::{ItemTile, LibraryView};

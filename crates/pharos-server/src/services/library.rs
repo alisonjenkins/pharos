@@ -3,8 +3,8 @@
 //! drift apart.
 
 use pharos_core::{
-    DomainError, LibraryKind, MediaItem, MediaKind, MediaStore as _, User, UserDataStore as _,
-    UserItemData, UserPolicy,
+    DomainError, ItemPerson, LibraryKind, MediaItem, MediaKind, MediaStore as _, PersonKind,
+    ReadPositionStore as _, User, UserDataStore as _, UserItemData, UserPolicy,
 };
 
 use crate::services::access::ItemHidden;
@@ -109,6 +109,12 @@ pub enum KindFilter {
 }
 
 impl KindFilter {
+    /// Whether this filter names `kind`. `Unset` names none, so a listing
+    /// that must opt in to a kind (books in `resume`) does not for it.
+    pub fn names(&self, kind: MediaKind) -> bool {
+        matches!(self, KindFilter::Kinds(wanted) if wanted.contains(&kind))
+    }
+
     /// `items` with only the kinds this filter keeps.
     pub fn keep(&self, items: Vec<MediaItem>) -> Vec<MediaItem> {
         match self {
@@ -145,24 +151,44 @@ pub async fn latest(
     kinds: &KindFilter,
     limit: Option<u32>,
 ) -> Result<Vec<(MediaItem, UserItemData)>, ListError> {
-    let all = state.list_items_cached().await.map_err(ListError::Store)?;
-    let all = crate::services::access::visible_items(state, user, all, "latest")
-        .await
-        .map_err(ListError::Hidden)?;
-    // Home-page "Latest" rows must match the library the user clicked into,
-    // and jellyfin-web's "Latest Movies" row filters to Type=Movie.
-    let scoped = restrict_to_parent(state, &all, parent_id).await;
-    let mut typed = kinds.keep(scoped);
+    use crate::api::jellyfin::items::{
+        apply_policy_scope, resolve_parent_filter, ParentResolution,
+    };
+    use pharos_core::{MediaQuery, SortDir, SortKey};
+    let limit = limit.unwrap_or(LATEST_MAX).min(LATEST_MAX);
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
     // B97 — "Latest" means most-recently-ADDED first (DateCreated desc), so a
-    // newly scanned film surfaces in the home "Recently Added" row. Rows
-    // lacking a timestamp sort last; id breaks ties so the order is stable.
-    typed.sort_by(|a, b| {
-        b.created_at
-            .unwrap_or(i64::MIN)
-            .cmp(&a.created_at.unwrap_or(i64::MIN))
-            .then(b.id.cmp(&a.id))
-    });
-    typed.truncate(limit.unwrap_or(LATEST_MAX).min(LATEST_MAX) as usize);
+    // newly scanned film surfaces in the home "Recently Added" row; id breaks
+    // ties so the order is stable. Home-page rows must match the library the
+    // user clicked into, and jellyfin-web's "Latest Movies" row filters to
+    // Type=Movie.
+    let mut mq = MediaQuery {
+        limit: Some(limit),
+        sort: vec![
+            (SortKey::DateCreated, SortDir::Desc),
+            (SortKey::Id, SortDir::Desc),
+        ],
+        ..MediaQuery::default()
+    };
+    match kinds {
+        KindFilter::Unset => {}
+        KindFilter::MatchesNothing => return Ok(Vec::new()),
+        KindFilter::Kinds(wanted) => mq.kinds.clone_from(wanted),
+    }
+    match resolve_parent_filter(state, parent_id)
+        .await
+        .map_err(ListError::Store)?
+    {
+        ParentResolution::Empty => return Ok(Vec::new()),
+        ParentResolution::All => {}
+        ParentResolution::Filter(pf) => mq.parent = Some(pf),
+        ParentResolution::PathPrefix(p) => mq.filters.path_prefix = Some(p),
+        ParentResolution::GenreProbe(t) => mq.filters.genre_probe_token = Some(t),
+    }
+    apply_policy_scope(&mut mq, &user.policy, &state.parental_ratings);
+    let (mut typed, _total) = state.stores.query(&mq).await.map_err(ListError::Store)?;
     crate::services::metadata_text::localize_items(state, user.id, typed.iter_mut()).await;
     let ids: Vec<u64> = typed.iter().map(|i| i.id).collect();
     let user_data = state
@@ -188,9 +214,14 @@ pub struct ListPage {
     pub start: u32,
 }
 
+/// The most part-read books `resume` considers (FR-012).
+const PART_READ_MAX: u32 = 200;
+
 /// The items `user` has started and not finished, of the kinds `kinds`
 /// keeps, in the store's resume order, each with the user's play state.
 /// `start` and `limit` page the list; `total` counts every match (B164).
+/// When `kinds` names books it also lists those with a saved read position
+/// that are not played (FR-012), newest activity first among the rest.
 pub async fn resume(
     state: &AppState,
     user: &User,
@@ -203,19 +234,57 @@ pub async fn resume(
         .resumable_items(user.id)
         .await
         .map_err(ListError::Store)?;
+    // When each part-read book was last read, to order it among the rest.
+    let mut read_at: std::collections::HashMap<u64, i64> = std::collections::HashMap::new();
+    if kinds.names(MediaKind::Book) {
+        let books = state
+            .stores
+            .part_read_items(user.id, PART_READ_MAX)
+            .await
+            .map_err(ListError::Store)?;
+        let positions = state
+            .stores
+            .read_positions_bulk(user.id, &books)
+            .await
+            .map_err(ListError::Store)?;
+        for (id, position) in books.iter().zip(positions) {
+            if let Some(position) = position {
+                read_at.insert(*id, position.updated_at);
+                if !ids.contains(id) {
+                    ids.push(*id);
+                }
+            }
+        }
+    }
     crate::services::access::retain_visible(state, user, &mut ids, |id| *id, "resume")
         .await
         .map_err(ListError::Hidden)?;
-    let mut items: Vec<MediaItem> = Vec::with_capacity(ids.len());
-    for id in &ids {
-        match state.stores.get(*id).await {
-            Ok(item) => items.push(item),
-            // Deleted since it was resumed: skipped, not an error.
-            Err(DomainError::NotFound(_)) => {}
-            Err(e) => return Err(ListError::Store(e)),
-        }
+    // One query for every resumed id; a row deleted since it was resumed is skipped.
+    let items = state
+        .stores
+        .get_many(&ids)
+        .await
+        .map_err(ListError::Store)?;
+    let mut items = kinds.keep(items);
+    if !read_at.is_empty() {
+        let all: Vec<u64> = items.iter().map(|i| i.id).collect();
+        let played_at = state
+            .stores
+            .user_data_bulk(user.id, &all)
+            .await
+            .map_err(ListError::Store)?;
+        let when = |id: u64, last_played_at: i64| {
+            read_at.get(&id).copied().unwrap_or(0).max(last_played_at)
+        };
+        let mut stamped: Vec<(i64, MediaItem)> = items
+            .into_iter()
+            .zip(played_at)
+            .map(|(item, data)| (when(item.id, data.last_played_at), item))
+            .collect();
+        // Stable, so equal stamps keep the store's resume order.
+        stamped.sort_by_key(|(at, _)| std::cmp::Reverse(*at));
+        items = stamped.into_iter().map(|(_, item)| item).collect();
     }
-    let items = kinds.keep(items);
     let total = u32::try_from(items.len()).unwrap_or(u32::MAX);
     let start = start.min(total);
     let end = limit.map_or(total, |n| start.saturating_add(n)).min(total);
@@ -245,104 +314,168 @@ pub async fn resume(
 /// How many series a "next up" listing covers when the caller names no limit.
 pub const NEXT_UP_DEFAULT: u32 = 100;
 
-/// For each series `user` may see (or only `series_id`, a series wire id),
-/// the lowest-numbered episode the user has not played, ordered by series
-/// name, each with the user's play state. At most `limit` (at least 1);
-/// `None` means [`NEXT_UP_DEFAULT`].
+/// What one Next Up listing came to. The `label()` strings are a dashboard
+/// contract for `pharos_next_up_total{outcome}`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NextUpOutcome {
+    /// At least one episode listed.
+    Listed,
+    /// Nothing to list.
+    Empty,
+    /// The listing could not be built.
+    Error,
+}
+
+impl NextUpOutcome {
+    pub const ALL: [NextUpOutcome; 3] = [
+        NextUpOutcome::Listed,
+        NextUpOutcome::Empty,
+        NextUpOutcome::Error,
+    ];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            NextUpOutcome::Listed => "listed",
+            NextUpOutcome::Empty => "empty",
+            NextUpOutcome::Error => "error",
+        }
+    }
+
+    fn record(self) {
+        metrics::counter!("pharos_next_up_total", "outcome" => self.label()).increment(1);
+    }
+}
+
+/// For each series `user` has started and may see (or only `series_id`, a
+/// series wire id), the episode to watch next under ADR-0113, the series
+/// watched most recently first, each with the user's play state. At most
+/// `limit` (at least 1); `None` means [`NEXT_UP_DEFAULT`].
 pub async fn next_up(
     state: &AppState,
     user: &User,
     series_id: Option<&str>,
     limit: Option<u32>,
 ) -> Result<ListPage, ListError> {
-    let all = state.list_items_cached().await.map_err(ListError::Store)?;
-    let all = crate::services::access::visible_items(state, user, all, "next_up")
-        .await
-        .map_err(ListError::Hidden)?;
-    let ids: Vec<u64> = all.iter().map(|i| i.id).collect();
-    let user_data = state
-        .stores
-        .user_data_bulk(user.id, &ids)
-        .await
-        .map_err(ListError::Store)?;
-    // Group episodes by series; pick the lowest unwatched per series.
+    let listed = next_up_page(state, user, series_id, limit).await;
+    match &listed {
+        Ok((page, considered)) => {
+            let outcome = if page.items.is_empty() {
+                NextUpOutcome::Empty
+            } else {
+                NextUpOutcome::Listed
+            };
+            outcome.record();
+            tracing::debug!(
+                user_id = %user.id.0.simple(),
+                scoped = series_id.is_some(),
+                considered,
+                kept = page.items.len(),
+                outcome = outcome.label(),
+                "next up listed"
+            );
+        }
+        Err(error) => {
+            NextUpOutcome::Error.record();
+            tracing::warn!(user_id = %user.id.0.simple(), ?error, "next up failed");
+        }
+    }
+    listed.map(|(page, _)| page)
+}
+
+/// [`next_up`]'s page, with the number of series it chose from.
+async fn next_up_page(
+    state: &AppState,
+    user: &User,
+    series_id: Option<&str>,
+    limit: Option<u32>,
+) -> Result<(ListPage, usize), ListError> {
     use crate::api::jellyfin::dto::series_id_for_key;
     use std::collections::HashMap;
     // B92 — the kotlin SDK sends `?SeriesId=` dashed; canonicalise once.
     let series_id_want =
         series_id.map(|s| crate::api::jellyfin::items::canonical_wire_id(s).into_owned());
-    let mut buckets: HashMap<String, Vec<(usize, &MediaItem)>> = HashMap::new();
-    for (idx, item) in all.iter().enumerate() {
+    // FR-105 — the viewer's own rows say which series are started.
+    let started = state
+        .stores
+        .started_items(user.id, MediaKind::Episode)
+        .await
+        .map_err(ListError::Store)?;
+    let empty = ListPage {
+        items: Vec::new(),
+        total: 0,
+        start: 0,
+    };
+    if started.is_empty() && series_id_want.is_none() {
+        return Ok((empty, 0));
+    }
+    let rows: HashMap<u64, UserItemData> = started.into_iter().collect();
+    let all = state.list_items_cached().await.map_err(ListError::Store)?;
+    let all = crate::services::access::visible_items(state, user, all, "next_up")
+        .await
+        .map_err(ListError::Hidden)?;
+    // A Series-page request scopes to that series (`SeriesId`); the
+    // home-screen row leaves it unset and gets one pick per started series.
+    let in_scope = |item: &MediaItem| -> bool {
+        let Some(series) = item.series.as_ref() else {
+            return false;
+        };
         if !matches!(item.kind, MediaKind::Episode) {
-            continue;
+            return false;
         }
+        match series_id_want.as_deref() {
+            None => true,
+            Some(want) => {
+                series_id_for_key(series.identity_folder(), &series.series_name).as_str() == want
+            }
+        }
+    };
+    // LIB-C11 — bucket by the folder-keyed identity, so two same-name
+    // shows in distinct folders stay separate.
+    let mut episodes: HashMap<String, (bool, Vec<&MediaItem>)> = HashMap::new();
+    for item in all.iter().filter(|i| in_scope(i)) {
         let Some(series) = item.series.as_ref() else {
             continue;
         };
-        // A Series-page request scopes to that series (`SeriesId`); the
-        // home-screen row leaves it unset and gets one pick per series.
-        // B92 — canonicalise the dashed `SeriesId` the Android TV Series page
-        // sends, else Next Up on that page comes back empty.
-        if let Some(want) = series_id_want.as_deref() {
-            if series_id_for_key(series.series_folder.as_deref(), &series.series_name).as_str()
-                != want
-            {
-                continue;
-            }
-        }
-        // Skip already-played episodes.
-        if user_data.get(idx).copied().unwrap_or_default().played {
-            continue;
-        }
-        // LIB-C11 — bucket by the folder-keyed identity, not the bare
-        // name, so two same-name shows in distinct folders stay separate
-        // and don't interleave into one NextUp pick.
-        buckets
-            .entry(series.series_key().to_string())
-            .or_default()
-            .push((idx, item));
+        let bucket = episodes.entry(series.series_key().to_string()).or_default();
+        bucket.0 |= rows.contains_key(&item.id);
+        bucket.1.push(item);
     }
-    // Sort each bucket by (season_number, episode_number) ascending,
-    // pick the head.
-    let mut picks: Vec<(usize, &MediaItem)> = buckets
+    let scoped = series_id_want.is_some();
+    let episodes: Vec<Vec<&MediaItem>> = episodes
         .into_values()
+        .filter_map(|(started, eps)| (started || scoped).then_some(eps))
+        .collect();
+    let considered = episodes.len();
+    let data = |id: u64| rows.get(&id).copied().unwrap_or_default();
+    let mut picks: Vec<(i64, &MediaItem)> = episodes
+        .into_iter()
         .filter_map(|mut eps| {
-            eps.sort_by_key(|(_, e)| {
-                let s = e.series.as_ref().and_then(|s| s.season_number).unwrap_or(0);
-                let n = e
-                    .series
-                    .as_ref()
-                    .and_then(|s| s.episode_number)
-                    .unwrap_or(0);
-                (s, n)
-            });
-            eps.into_iter().next()
+            eps.sort_by_key(|e| (airing_order(e), e.id));
+            pick_next(&eps, &data, scoped)
         })
         .collect();
-    // Stable series-name sort across the result set.
-    picks.sort_by(|a, b| {
-        let an =
-            a.1.series
-                .as_ref()
-                .map(|s| s.series_name.as_str())
-                .unwrap_or("");
-        let bn =
-            b.1.series
-                .as_ref()
-                .map(|s| s.series_name.as_str())
-                .unwrap_or("");
-        an.cmp(bn)
+    // FR-103 — the series watched most recently first; name breaks ties.
+    picks.sort_by(|(a_at, a), (b_at, b)| {
+        b_at.cmp(a_at)
+            .then_with(|| series_name(a).cmp(series_name(b)))
     });
     picks.truncate(limit.unwrap_or(NEXT_UP_DEFAULT).max(1) as usize);
+    if picks.is_empty() {
+        return Ok((empty, considered));
+    }
     let total = u32::try_from(picks.len()).unwrap_or(u32::MAX);
+    // A pick is unplayed, so its row (favourite, chosen tracks) is rarely
+    // among the started ones: read it for the picks alone.
+    let pick_ids: Vec<u64> = picks.iter().map(|(_, i)| i.id).collect();
+    let pick_data = state
+        .stores
+        .user_data_bulk(user.id, &pick_ids)
+        .await
+        .map_err(ListError::Store)?;
     let mut items: Vec<(MediaItem, UserItemData)> = picks
         .into_iter()
-        .map(|(idx, item)| {
-            (
-                item.clone(),
-                user_data.get(idx).copied().unwrap_or_default(),
-            )
-        })
+        .zip(pick_data)
+        .map(|((_, item), data)| (item.clone(), data))
         .collect();
     crate::services::metadata_text::localize_items(
         state,
@@ -350,11 +483,118 @@ pub async fn next_up(
         items.iter_mut().map(|(i, _)| i),
     )
     .await;
-    Ok(ListPage {
-        items,
-        total,
-        start: 0,
-    })
+    Ok((
+        ListPage {
+            items,
+            total,
+            start: 0,
+        },
+        considered,
+    ))
+}
+
+/// An episode's place in airing order: season, then episode number.
+fn airing_order(e: &MediaItem) -> (u32, u32) {
+    let series = e.series.as_ref();
+    (
+        series.and_then(|s| s.season_number).unwrap_or(0),
+        series.and_then(|s| s.episode_number).unwrap_or(0),
+    )
+}
+
+fn series_name(e: &MediaItem) -> &str {
+    e.series.as_ref().map_or("", |s| s.series_name.as_str())
+}
+
+fn is_special(e: &MediaItem) -> bool {
+    e.series.as_ref().and_then(|s| s.season_number) == Some(0)
+}
+
+/// The Next Up episode of one series, `eps` in airing order, with when the
+/// series was last played (ADR-0113). The anchor is the episode played or
+/// started most recently, the later in airing order on a tie. The pick is
+/// the first unplayed episode after it, a special only when the anchor is a
+/// special (FR-102). On the home rail a series with nothing started is not
+/// listed, and a pick already in progress is left to Continue Watching
+/// (FR-101, FR-104); a `scoped` (Series page) request lists the anchor
+/// itself when it is in progress, and an unstarted series' first episode.
+fn pick_next<'a>(
+    eps: &[&'a MediaItem],
+    data: &impl Fn(u64) -> UserItemData,
+    scoped: bool,
+) -> Option<(i64, &'a MediaItem)> {
+    let touched = |d: &UserItemData| d.played || d.last_played_position_ticks > 0;
+    let anchor = eps
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| touched(&data(e.id)))
+        .max_by_key(|(idx, e)| (data(e.id).last_played_at, *idx));
+    let Some((at_idx, anchor)) = anchor else {
+        if !scoped {
+            return None;
+        }
+        let first = eps
+            .iter()
+            .find(|e| !is_special(e) && !data(e.id).played)
+            .copied()?;
+        return Some((0, first));
+    };
+    let anchor_data = data(anchor.id);
+    let last_played_at = anchor_data.last_played_at;
+    if !anchor_data.played {
+        return scoped.then_some((last_played_at, *anchor));
+    }
+    let specials = is_special(anchor);
+    let next = eps
+        .iter()
+        .skip(at_idx.saturating_add(1))
+        .find(|e| (specials || !is_special(e)) && !data(e.id).played)
+        .copied()?;
+    if !scoped && data(next.id).last_played_position_ticks > 0 {
+        return None;
+    }
+    Some((last_played_at, next))
+}
+
+/// Most people a title page lists from its cast.
+pub const CAST_LIMIT: usize = 40;
+
+/// Who appears in stored item `id`: its actors in billed order, then its
+/// guest stars. Crew are left out.
+pub async fn cast(state: &AppState, id: u64) -> Result<Vec<ItemPerson>, DomainError> {
+    use pharos_core::PersonStore as _;
+    let (mut cast, guests): (Vec<_>, Vec<_>) = state
+        .stores
+        .people_for_item(id)
+        .await?
+        .into_iter()
+        .filter(|p| matches!(p.kind, PersonKind::Actor | PersonKind::GuestStar))
+        .partition(|p| p.kind == PersonKind::Actor);
+    cast.extend(guests);
+    cast.truncate(CAST_LIMIT);
+    Ok(cast)
+}
+
+/// The regular cast of the synthesised series or season `wire_id`, ranked
+/// across its episodes' actor credits (guest stars left out). Empty for any
+/// other synthesised item.
+pub async fn ensemble(state: &AppState, wire_id: &str) -> Result<Vec<ItemPerson>, DomainError> {
+    use pharos_core::PersonStore as _;
+    let items = state.list_items_cached().await?;
+    let episodes: Vec<u64> = restrict_to_parent(state, &items, Some(wire_id))
+        .await
+        .into_iter()
+        .filter(|i| i.kind == MediaKind::Episode && i.series.is_some())
+        .map(|i| i.id)
+        .collect();
+    let credits = state.stores.actor_credits_for_items(&episodes).await?;
+    tracing::debug!(
+        wire_id,
+        episodes = episodes.len(),
+        credits = credits.len(),
+        "ensemble cast"
+    );
+    Ok(pharos_core::ensemble_cast(credits, CAST_LIMIT))
 }
 
 /// Drop items that don't live under the configured root / series /
@@ -430,14 +670,14 @@ pub async fn restrict_to_parent(
     if items.iter().any(|i| {
         i.series
             .as_ref()
-            .is_some_and(|s| series_id_for_key(s.series_folder.as_deref(), &s.series_name) == pid)
+            .is_some_and(|s| series_id_for_key(s.identity_folder(), &s.series_name) == pid)
     }) {
         return items
             .iter()
             .filter(|i| {
-                i.series.as_ref().is_some_and(|s| {
-                    series_id_for_key(s.series_folder.as_deref(), &s.series_name) == pid
-                })
+                i.series
+                    .as_ref()
+                    .is_some_and(|s| series_id_for_key(s.identity_folder(), &s.series_name) == pid)
             })
             .cloned()
             .collect();
@@ -445,9 +685,8 @@ pub async fn restrict_to_parent(
     // 3) Season id → every episode in that (folder, season) pair.
     if items.iter().any(|i| {
         i.series.as_ref().is_some_and(|s| {
-            s.season_number.is_some_and(|n| {
-                season_id_for_key(s.series_folder.as_deref(), &s.series_name, n) == pid
-            })
+            s.season_number
+                .is_some_and(|n| season_id_for_key(s.identity_folder(), &s.series_name, n) == pid)
         })
     }) {
         return items
@@ -455,7 +694,7 @@ pub async fn restrict_to_parent(
             .filter(|i| {
                 i.series.as_ref().is_some_and(|s| {
                     s.season_number.is_some_and(|n| {
-                        season_id_for_key(s.series_folder.as_deref(), &s.series_name, n) == pid
+                        season_id_for_key(s.identity_folder(), &s.series_name, n) == pid
                     })
                 })
             })
@@ -645,6 +884,9 @@ pub struct ItemQuery {
     pub is_3d: Option<bool>,
     pub min_width: Option<u32>,
     pub max_width: Option<u32>,
+    /// Fold the films of a box set into one tile for the set (B1086): see
+    /// [`query_folded`].
+    pub collapse_collections: bool,
 }
 
 /// How many items a native `Library.query` page holds when the caller names
@@ -682,6 +924,157 @@ pub async fn query(
     Ok(page)
 }
 
+/// One page of a stored listing with the films of each box set folded into
+/// one tile for the set, standing where its first film stood (B1086). A set
+/// folds only when the listing holds two or more of its films, so a lone
+/// member stays a film. The listing is read unpaged, then folded and paged,
+/// so `total` and the offsets count tiles.
+pub async fn query_folded(
+    state: &AppState,
+    user: &User,
+    parent_id: Option<&str>,
+    q: &ItemQuery,
+) -> Result<FoldedPage, DomainError> {
+    let folded = fold_page(state, user, parent_id, q).await;
+    let outcome = if folded.is_ok() { "ok" } else { "error" };
+    metrics::counter!("pharos_collection_fold_total", "outcome" => outcome).increment(1);
+    folded
+}
+
+async fn fold_page(
+    state: &AppState,
+    user: &User,
+    parent_id: Option<&str>,
+    q: &ItemQuery,
+) -> Result<FoldedPage, DomainError> {
+    let unpaged = ItemQuery {
+        start_index: 0,
+        limit: None,
+        ..q.clone()
+    };
+    let listed = query_unlocalized(state, user, parent_id, &unpaged).await?;
+    let folded = fold_into_collections(state, listed.items).await?;
+    let total = u32::try_from(folded.len()).unwrap_or(u32::MAX);
+    let take = q.limit.map_or(usize::MAX, |l| l as usize);
+    let mut entries: Vec<Folded> = folded
+        .into_iter()
+        .skip(q.start_index as usize)
+        .take(take)
+        .collect();
+    let ids: Vec<u64> = entries
+        .iter()
+        .filter_map(|e| match e {
+            Folded::Item(item, _) => Some(item.id),
+            Folded::Collection { .. } => None,
+        })
+        .collect();
+    let user_data = state.stores.user_data_bulk(user.id, &ids).await?;
+    let mut user_data = user_data.into_iter();
+    for entry in &mut entries {
+        if let Folded::Item(_, data) = entry {
+            *data = user_data.next().unwrap_or_default();
+        }
+    }
+    Ok(FoldedPage {
+        entries,
+        total,
+        start: q.start_index,
+    })
+}
+
+/// One tile of a [`query_folded`] listing: a stored item, or a box set
+/// standing in for the films of it the listing held.
+#[derive(Debug)]
+pub enum Folded {
+    Item(MediaItem, UserItemData),
+    Collection {
+        collection: pharos_core::Collection,
+        /// How many of the set's films the listing held (two or more).
+        members: u32,
+        /// The set's film that came first in the listing: the tile stands
+        /// where it stood and shows its poster.
+        first: MediaItem,
+    },
+}
+
+impl Folded {
+    /// The item whose place in the listing this tile holds.
+    pub fn standing_at(&self) -> &MediaItem {
+        match self {
+            Folded::Item(item, _) => item,
+            Folded::Collection { first, .. } => first,
+        }
+    }
+}
+
+/// Fold `items` into box sets (B1086, V1044). A film in several sets goes
+/// to the first by name. A set folds only when two or more of its films
+/// are in `items`; its tile takes the place of the first of them, and the
+/// rest drop out. Every other item keeps its place.
+pub async fn fold_into_collections(
+    state: &AppState,
+    items: Vec<MediaItem>,
+) -> Result<Vec<Folded>, DomainError> {
+    use pharos_core::CollectionStore as _;
+    use std::collections::HashMap;
+    let listed: std::collections::HashSet<pharos_core::MediaId> =
+        items.iter().map(|i| i.id).collect();
+    let mut sets = state.stores.collections_with_counts().await?;
+    sets.sort_by(|a, b| a.collection.name.cmp(&b.collection.name));
+    // film id -> index into `sets` of the first set by name holding it.
+    let mut set_of: HashMap<pharos_core::MediaId, usize> = HashMap::new();
+    for (at, set) in sets.iter().enumerate() {
+        for id in state
+            .stores
+            .collection_items(&set.collection.wire_id)
+            .await?
+        {
+            if listed.contains(&id) {
+                set_of.entry(id).or_insert(at);
+            }
+        }
+    }
+    let mut members: HashMap<usize, u32> = HashMap::new();
+    for at in set_of.values() {
+        *members.entry(*at).or_default() += 1;
+    }
+    let mut placed: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        let folds = set_of
+            .get(&item.id)
+            .copied()
+            .and_then(|at| members.get(&at).filter(|n| **n >= 2).map(|n| (at, *n)));
+        match folds {
+            None => out.push(Folded::Item(item, UserItemData::default())),
+            Some((at, n)) => {
+                if placed.insert(at) {
+                    out.push(Folded::Collection {
+                        collection: sets[at].collection.clone(),
+                        members: n,
+                        first: item,
+                    });
+                }
+            }
+        }
+    }
+    let sets_folded = placed.len();
+    tracing::debug!(
+        sets_folded,
+        tiles = out.len(),
+        "collection fold: listing folded into box sets"
+    );
+    Ok(out)
+}
+
+/// A page of [`query_folded`].
+#[derive(Debug)]
+pub struct FoldedPage {
+    pub entries: Vec<Folded>,
+    pub total: u32,
+    pub start: u32,
+}
+
 /// [`query`] with the stored descriptions, for a caller that reads no
 /// overview: it skips the configuration read and translation lookup.
 async fn query_unlocalized(
@@ -715,15 +1108,17 @@ async fn query_unlocalized(
         });
     }
     // The legacy in-memory order: shuffle the kind/search/chip-filtered set,
-    // then apply the tag and play-state filters, then page.
-    let (mut items, _total) = state.stores.query(&mq).await?;
-    shuffle_in_place(&mut items, effective_sort_seed(q, user.id));
-    let tagged = apply_tags_filter(state, items, q).await?;
+    // then apply the tag and play-state filters, then page. Only ids move
+    // until the page is known; the rows of that page are fetched once.
+    let mut ids = state.stores.query_ids(&mq).await?;
+    shuffle_in_place(&mut ids, effective_sort_seed(q, user.id));
+    let tagged = apply_tags_filter(state, ids, q).await?;
     let filtered = apply_userdata_filter(state, user.id, tagged, q).await?;
     let total = u32::try_from(filtered.len()).unwrap_or(u32::MAX);
     let start = q.start_index as usize;
     let take = q.limit.map_or(usize::MAX, |l| l as usize);
-    let items: Vec<MediaItem> = filtered.into_iter().skip(start).take(take).collect();
+    let page: Vec<pharos_core::MediaId> = filtered.into_iter().skip(start).take(take).collect();
+    let items = state.stores.get_many(&page).await?;
     Ok(QueryPage {
         items,
         total,
@@ -993,10 +1388,21 @@ pub async fn index(
         genres.sort_by_key(|g| g.to_lowercase());
         genres
     };
-    Ok(ListIndex {
-        letters: section_starts(listed.items.iter().map(|i| item_section(sections, i))),
-        genres,
-    })
+    let letters = if q.collapse_collections {
+        // A set's tile files under the film it stands at, so the sections
+        // fall where the folded pages do.
+        let folded = fold_into_collections(state, listed.items)
+            .await
+            .map_err(store)?;
+        section_starts(
+            folded
+                .iter()
+                .map(|e| item_section(sections, e.standing_at())),
+        )
+    } else {
+        section_starts(listed.items.iter().map(|i| item_section(sections, i)))
+    };
+    Ok(ListIndex { letters, genres })
 }
 
 /// `page` with the user's play state for each item, read in one batch.
@@ -1067,12 +1473,14 @@ pub const WATCHING_KINDS: [MediaKind; 2] = [MediaKind::Movie, MediaKind::Episode
 
 /// Everything the home page shows, in one answer: each library the user
 /// may see with its newest items, the films and episodes to resume, the
-/// music to resume, and what is next up.
+/// music to resume, the books part read, and what is next up.
 #[derive(Debug)]
 pub struct Home {
     pub rails: Vec<(LibraryView, Vec<(MediaItem, UserItemData)>)>,
     pub resume: ListPage,
     pub listening: ListPage,
+    /// Books part read (FR-012).
+    pub reading: ListPage,
     pub next_up: ListPage,
 }
 
@@ -1096,6 +1504,8 @@ pub async fn home(
     let watching = KindFilter::Kinds(WATCHING_KINDS.to_vec());
     let audio = KindFilter::Kinds(vec![MediaKind::Audio]);
     let listening = resume(state, user, &audio, 0, resume_n);
+    let books = KindFilter::Kinds(vec![MediaKind::Book]);
+    let reading = resume(state, user, &books, 0, resume_n);
     let resume = resume(state, user, &watching, 0, resume_n);
     let next_up = next_up(
         state,
@@ -1103,12 +1513,13 @@ pub async fn home(
         None,
         Some(next_up_limit.unwrap_or(HOME_NEXT_UP_DEFAULT)),
     );
-    let (rails, resume, listening, next_up) =
-        futures_util::try_join!(rails, resume, listening, next_up)?;
+    let (rails, resume, listening, reading, next_up) =
+        futures_util::try_join!(rails, resume, listening, reading, next_up)?;
     Ok(Home {
         rails,
         resume,
         listening,
+        reading,
         next_up,
     })
 }
@@ -1372,6 +1783,12 @@ mod tests {
     }
 
     #[test]
+    fn next_up_outcome_labels_are_distinct_and_stable() {
+        let labels = super::NextUpOutcome::ALL.map(super::NextUpOutcome::label);
+        assert_eq!(labels, ["listed", "empty", "error"]);
+    }
+
+    #[test]
     fn letters_start_where_their_first_name_is() {
         let names = [
             "2001",
@@ -1390,7 +1807,7 @@ mod tests {
 
     #[test]
     fn a_leading_article_files_under_the_next_word() {
-        assert_eq!(letter_starts(["The Matrix"]), starts(&[("M", 0)]));
+        assert_eq!(letter_starts(["The Glass Lattice"]), starts(&[("G", 0)]));
     }
 
     #[test]

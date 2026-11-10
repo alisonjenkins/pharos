@@ -1,10 +1,14 @@
 # 025 — Android TV app (Dioxus, pure Rust)
 
-- **Status:** draft. Slice 0 done (`spike-0.md`, go for slice 1, qualified); slice 1 in progress.
+- **Status:** draft, partly built (audited 2026-11-09). Slice 0 done (`spike-0.md`); slice 1 partial (`native/android.rs`, manifest, `nix run .#android-apk`; #766, #997): WebView playback is still open, `native/android_page.rs::engine` errors for every engine on main (#1002 open for video); slice 2 largely done (`tv_page.rs`, `tv_auth.rs`, ten-foot UI #966); slice 3 (JNI MediaCodec playback) not started here, taken up by spec 032. NOT superseded: 032 is a second app and this one stays the default until 032 passes parity.
 - **Date:** 2026-11-04
 - **Asked by:** Alison, "I want to go the Rust route with Dioxus, it keeps it
   more like the Web version + means we don't have the heavy weight Java BS".
 - **Ids:** B/V allocated when slices land. ADR-0061 (Proposed).
+- **Successor:** spec 032 (ADR-0077) builds a second TV app on Dioxus Native
+  (Blitz) with a Rust player. This app stays the default until 032's parity
+  gate passes. The eval-latency decision and the WebView playback rows below
+  apply to this app only.
 - **Depends on:** 009 (shell), 011 (D-pad focus, US1/US8), 013 (playback),
   017 (native API: `deviceToken`, `quickConnect*`, `Capabilities`).
 
@@ -92,20 +96,23 @@ query. Signal to name before slice 1 lands:
 - Alison's TV model (Samsung Tizen / LG webOS cannot run Android apps).
 - Port the WebGL visualisers to the WebView (eval'd JS) or to wgpu, or
   leave music visuals off on TV.
-- **How the Android UI reads the DOM (open, decides slice 1's main cost).**
-  About 20 of `web.rs`'s functions read the DOM synchronously; on the
-  webview renderer the only DOM access is an async `document::eval` round
-  trip. Either `android.rs` exposes an async surface (callers change), or a
-  JS-side mirror pushes DOM state into Rust (callers stay synchronous, the
-  mirror can lag). Not decided: it waits for the eval round-trip latency
-  probe on the TV (`spike-0.md`). The pieces below do not depend on it.
+- **How the Android UI reads the DOM (settled 2026-11-08, `spike-0.md`
+  "Eval latency").** An eval round trip on the TV is 2.5 ms p50 / 3.3 ms
+  p95 whatever it reads, and a JS push into Rust holds 60 Hz. `android.rs`
+  uses both, by how a value changes: state that changes on its own
+  (`<video>` position and media state, viewport, page visibility, current
+  path) is pushed by a JS mirror into Rust and read synchronously from the
+  cache; reads made on an input (D-pad spatial focus, element sizes, tile
+  in view) run as one batched eval per event, with the spatial pick done in
+  JS beside the rects. Fire-and-forget calls (seek, play, focus by id,
+  push path) are a spawned eval with no reply.
 - Whether a real 320x180 banner drawable ships through `dx` (the manifest
   override works; the banner is the launcher icon for now).
 
 ## Quickstart: build and sign the TV APK
 
 Landed in slice 1 (the dev shell, the build, the network layer; the UI is a
-placeholder until the DOM question above is settled).
+placeholder until `android.rs` lands; the DOM question above is settled).
 
 ```sh
 # Dev shell (Android SDK 34, NDK, JDK 17, dx, rust android targets). It is

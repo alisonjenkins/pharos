@@ -2,9 +2,9 @@
 //! episode is filed under.
 //!
 //! A scraper that misidentifies a show folder writes NFOs, and stills beside
-//! them, for a different show. Jellyfin did this to this library's
-//! `TV/Dragon Ball`: its `tvshow.nfo` and every episode NFO describe Super
-//! Dragon Ball Heroes, and each `<episode>-thumb.jpg` is that show's still.
+//! them, for a different show. That happened to a library's
+//! `TV/Show K`: its `tvshow.nfo` and every episode NFO describe Super
+//! Show K Heroes, and each `<episode>-thumb.jpg` is that show's still.
 //! Read as authoritative, the episodes took that show's titles, plots and
 //! provider ids. The folder name is the user's own statement of what the show
 //! is, so an NFO whose show name does not resemble it is set aside, along with
@@ -23,7 +23,7 @@ use super::{predefined_entity, sibling_nfo};
 /// the episode's show. Above the online matcher's 0.7 default because this
 /// is a veto on local data that is otherwise authoritative; it still passes
 /// every legitimate variant in the deployed library (punctuation, a `: Sub
-/// title` the folder drops, `Mrs Browns Boys` for `Mrs Brown's Boys`).
+/// title` the folder drops, `Mrs Foxs Cubs` for `Mrs Fox's Cubs`).
 const SHOW_NAME_MIN_SIMILARITY: f32 = 0.8;
 
 /// Which of an episode's NFOs describe a different show.
@@ -95,6 +95,55 @@ pub(crate) fn foreign_nfos(req: &MetadataRequest<'_>) -> ForeignNfos {
         }
     }
     out
+}
+
+/// Years a film's NFO may sit from the year its file or folder states: a
+/// premiere and a release, or two regions' releases, can straddle a new year.
+const FILM_YEAR_SLACK: u32 = 1;
+
+/// B1009 — whether a film's NFO describes another film: its `<year>` is more
+/// than [`FILM_YEAR_SLACK`] from every year the file's name and its folder's
+/// name state (B1026: a year in the title is no evidence on its own). Jellyfin wrote the 1994 *The Tall Meadow* into
+/// `The Tall Meadow (2019)/movie.nfo`, and its tmdb id then matched the remake
+/// to the original. A name or NFO with no year is not evidence either way.
+pub(crate) fn names_another_year(
+    media: &Path,
+    nfo: &Path,
+    parsed: &pharos_core::MetadataResult,
+) -> bool {
+    let Some(nfo_year) = parsed.production_year else {
+        return false;
+    };
+    let year_of = |name: Option<&std::ffi::OsStr>| {
+        crate::metadata::filename::parse_filename(name?.to_str()?, true).year
+    };
+    // A title can hold a year (`Film AB 2049`), so the NFO is foreign
+    // only when it agrees with neither the file's year nor the folder's.
+    let stated: Vec<u32> = [
+        year_of(media.file_stem()),
+        year_of(media.parent().and_then(Path::file_name)),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    let Some(&file_year) = stated.first() else {
+        return false;
+    };
+    let foreign = stated
+        .iter()
+        .all(|y| nfo_year.abs_diff(*y) > FILM_YEAR_SLACK);
+    if foreign {
+        tracing::info!(
+            path = %media.display(),
+            nfo = %nfo.display(),
+            nfo_year,
+            file_year,
+            nfo_title = parsed.title.as_deref().unwrap_or(""),
+            "nfo: movie NFO names another year; ignoring it and its art"
+        );
+        metrics::counter!("pharos_nfo_set_aside_total", "reason" => "film_year").increment(1);
+    }
+    foreign
 }
 
 /// True when the NFO offers at least one show name and none resembles

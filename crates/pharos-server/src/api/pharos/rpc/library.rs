@@ -4,20 +4,28 @@
 use std::rc::Rc;
 
 use pharos_api::pharos_capnp::{
-    home_result, item_detail, item_id, item_summary, items_result, library as wire, track,
-    user_state, Kind, LibraryKind as WireKind, SegmentKind, SubtitleDelivery,
+    credit, home_result, item_detail, item_id, item_summary, items_result, library as wire,
+    person_credit, person_result, track, user_state, version, CreditKind, Kind,
+    LibraryKind as WireKind, SegmentKind, Stereo3d, StereoFilter, SubtitleDelivery,
 };
 use pharos_api::{server, Denial};
-use pharos_core::{LibraryKind, MediaItem, MediaKind, UserItemData};
+use pharos_core::{
+    BookFormat, BookMeta, LibraryKind, MediaItem, MediaKind, MediaProbe, ReadPosition,
+    ReadPositionStore as _, UserItemData, Video3DFormat,
+};
 use pharos_jellyfin_api::dto::{BaseItemDto, WireId};
+use pharos_jellyfin_api::image_tag_sig::ImageTagKey;
 
 use super::session::Session;
 use crate::api::jellyfin::items::SynthPage;
+use crate::api::jellyfin::media_source;
 use crate::services::library::{
     self, DetailError, GroupError, Grouping, ItemQuery, KindFilter, LibraryView, ListError,
     ListPage, QueryPage, QUERY_DEFAULT, QUERY_MAX,
 };
+use crate::services::person::{self, PersonError};
 use crate::services::search::Hit;
+use crate::services::user_data::FolderMarks;
 use crate::services::{lyrics, mix, segments, watch};
 use crate::state::AppState;
 
@@ -61,7 +69,12 @@ impl server::library::Handler for Library {
         page.set_start(0);
         let mut items = page.init_items(count);
         for (i, (id, view)) in (0..count).zip(&views) {
-            write_view(items.reborrow().get(i), *id, view);
+            write_view(
+                items.reborrow().get(i),
+                *id,
+                view,
+                &self.session.state.image_tag_key,
+            );
         }
         Ok(())
     }
@@ -97,11 +110,15 @@ impl server::library::Handler for Library {
                     start: 0,
                 }
             });
+        let reads = Reads::of(state, &user, listing_rows(&listed)).await;
         write_listing(
             results.get().init_result(),
             listed,
             "latest",
             &state.server_id,
+            &state.image_tag_key,
+            &DamagedIds::of(state),
+            &reads,
         );
         Ok(())
     }
@@ -124,11 +141,15 @@ impl server::library::Handler for Library {
         };
         let state = &self.session.state;
         let listed = library::resume(state, &user, &kinds, 0, limit).await;
+        let reads = Reads::of(state, &user, listing_rows(&listed)).await;
         write_listing(
             results.get().init_result(),
             listed,
             "resume",
             &state.server_id,
+            &state.image_tag_key,
+            &DamagedIds::of(state),
+            &reads,
         );
         Ok(())
     }
@@ -162,6 +183,41 @@ impl server::library::Handler for Library {
                 grouping,
                 parent.as_deref(),
                 query.start_index,
+                &state.image_tag_key,
+            );
+            return Ok(());
+        }
+        if query.collapse_collections {
+            let folded = library::query_folded(state, &user, parent.as_deref(), &query)
+                .await
+                .map_err(ListError::Store);
+            record_query(QUERY_SHAPE_FOLDED, folded.is_ok());
+            record_browse(
+                parent.as_deref(),
+                target,
+                folded.as_ref().ok().map(|p| (p.entries.len(), p.total)),
+                query.start_index,
+            );
+            let rows: Vec<(MediaItem, UserItemData)> = folded
+                .as_ref()
+                .map(|p| {
+                    p.entries
+                        .iter()
+                        .filter_map(|e| match e {
+                            library::Folded::Item(item, data) => Some((item.clone(), *data)),
+                            library::Folded::Collection { .. } => None,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let reads = Reads::of(state, &user, &rows).await;
+            write_folded(
+                results.get().init_result(),
+                folded,
+                &state.server_id,
+                &state.image_tag_key,
+                &DamagedIds::of(state),
+                &reads,
             );
             return Ok(());
         }
@@ -177,11 +233,15 @@ impl server::library::Handler for Library {
             listed.as_ref().ok().map(|p| (p.items.len(), p.total)),
             query.start_index,
         );
+        let reads = Reads::of(state, &user, listing_rows(&listed)).await;
         write_listing(
             results.get().init_result(),
             listed,
             "query",
             &state.server_id,
+            &state.image_tag_key,
+            &DamagedIds::of(state),
+            &reads,
         );
         Ok(())
     }
@@ -342,7 +402,15 @@ impl server::library::Handler for Library {
             match crate::services::search::search(state, &user, text, params.get_limit()).await {
                 Ok(hits) => hits,
                 Err(e) => {
-                    write_listing(out, Err(ListError::Store(e)), "search", &state.server_id);
+                    write_listing(
+                        out,
+                        Err(ListError::Store(e)),
+                        "search",
+                        &state.server_id,
+                        &state.image_tag_key,
+                        &DamagedIds::of(state),
+                        &Reads::default(),
+                    );
                     return Ok(());
                 }
             };
@@ -350,7 +418,7 @@ impl server::library::Handler for Library {
             .iter()
             .filter_map(|hit| match hit {
                 Hit::Stored(item) => Some(item.as_ref().clone()),
-                Hit::Group(..) => None,
+                Hit::Group(..) | Hit::Person(..) => None,
             })
             .collect();
         let page = QueryPage {
@@ -361,7 +429,15 @@ impl server::library::Handler for Library {
         let mut played = match library::with_user_data(state, &user, page).await {
             Ok(listed) => listed.items.into_iter().map(|(_, data)| data),
             Err(e) => {
-                write_listing(out, Err(ListError::Store(e)), "search", &state.server_id);
+                write_listing(
+                    out,
+                    Err(ListError::Store(e)),
+                    "search",
+                    &state.server_id,
+                    &state.image_tag_key,
+                    &DamagedIds::of(state),
+                    &Reads::default(),
+                );
                 return Ok(());
             }
         };
@@ -371,12 +447,19 @@ impl server::library::Handler for Library {
         let mut items = page.init_items(len_u32(&hits));
         for (i, hit) in (0..items.len()).zip(&hits) {
             match hit {
-                Hit::Group(id, dto) => write_synth_summary(items.reborrow().get(i), *id, dto),
+                Hit::Group(id, dto) => {
+                    write_synth_summary(items.reborrow().get(i), *id, dto, &state.image_tag_key)
+                }
+                Hit::Person(id, person) => {
+                    write_person_summary(items.reborrow().get(i), *id, person)
+                }
                 Hit::Stored(item) => write_item(
                     items.reborrow().get(i),
                     item,
                     played.next().unwrap_or_default(),
                     &state.server_id,
+                    &state.image_tag_key,
+                    &DamagedIds::of(state),
                 ),
             }
         }
@@ -390,6 +473,7 @@ impl server::library::Handler for Library {
     ) -> Result<(), capnp::Error> {
         let params = params.get()?;
         let id = read_item_id(params.get_id()?)?;
+        let asked_version = params.get_version()?.to_str()?.trim().to_owned();
         let knows_image_delivery =
             params.get_ctx()?.get_schema_version() >= IMAGE_DELIVERY_SCHEMA_VERSION;
         let user = match self.session.current_user().await {
@@ -403,14 +487,17 @@ impl server::library::Handler for Library {
         let id = match id {
             WireId::Real(id) => id,
             synth @ WireId::Synth(_) => {
-                match synth_detail(state, &user, synth).await {
+                match synth_detail(state, &user, synth, "detail").await {
                     Ok(dto) => {
-                        let played = synth_played(state, &user, synth, &dto).await;
+                        let marks = synth_marks(state, &user, synth, &dto).await;
+                        let cast = synth_cast(state, synth, &dto).await;
                         let mut out = results.get().init_result().init_detail();
-                        write_synth_detail(out.reborrow(), synth, &dto);
-                        if played {
+                        write_synth_detail(out.reborrow(), synth, &dto, &state.image_tag_key);
+                        write_cast(out.reborrow().init_cast(len(&cast)), &cast);
+                        if marks != FolderMarks::default() {
                             let data = UserItemData {
-                                played,
+                                played: marks.played,
+                                is_favorite: marks.favorite,
                                 ..UserItemData::default()
                             };
                             write_user_state(out.get_summary()?.init_user_state(), data);
@@ -428,6 +515,17 @@ impl server::library::Handler for Library {
                 return Ok(());
             }
         };
+        let has_versions = matches!(item.kind, MediaKind::Movie | MediaKind::Episode);
+        // The versions list describes every file; the rest of the detail
+        // (tracks, fonts, subtitle URLs) describes the one asked for.
+        let all = item.clone();
+        let item = match select_version(media_source::Route::NativeDetail, item, &asked_version) {
+            Ok(item) => item,
+            Err(denial) => {
+                denial.write(results.get().init_result().init_error());
+                return Ok(());
+            }
+        };
         // Spec 028 — a viewer who opens a video gets its subtitles styled
         // ahead of the backfill.
         if let Some(queue) = state.subtitle_styling.as_ref() {
@@ -436,9 +534,32 @@ impl server::library::Handler for Library {
             }
         }
         let dto = BaseItemDto::from_domain_with_user_data(&item, &state.server_id, user_data);
+        let read = match &item.book {
+            Some(_) => match state.stores.get_read_position(user.id, item.id).await {
+                Ok(position) => position,
+                Err(e) => {
+                    tracing::warn!(media.id = item.id, error = %e, "native detail: read position unavailable");
+                    None
+                }
+            },
+            None => None,
+        };
         let mut out = results.get().init_result().init_detail();
+        if let Some(book) = &item.book {
+            write_book(out.reborrow().init_book(), book);
+        }
         let mut summary = out.reborrow().init_summary();
-        write_item(summary.reborrow(), &item, user_data, &state.server_id);
+        write_item(
+            summary.reborrow(),
+            &item,
+            user_data,
+            &state.server_id,
+            &state.image_tag_key,
+            &DamagedIds::of(state),
+        );
+        if let (Some(position), Ok(state)) = (&read, summary.reborrow().get_user_state()) {
+            write_read_state(state, position);
+        }
         // A film sits straight under its library, as Jellyfin's detail says,
         // so the UI can name the library above it.
         if !summary.has_parent_id() {
@@ -468,7 +589,8 @@ impl server::library::Handler for Library {
             c.set_start_ms(chapter.start_position_ticks / 10_000);
         }
         let draws_images = knows_image_delivery && watch::extracts_image_subtitles(state);
-        let styling = if watch::is_video(&item) {
+        // Styling is generated from the primary's subtitles.
+        let styling = if watch::is_video(&item) && item.edition.is_none() {
             crate::styled_track::current(&state.stores, &item).await
         } else {
             None
@@ -503,25 +625,109 @@ impl server::library::Handler for Library {
             w.set_mime(f.mime.as_str());
             w.set_url(f.url.as_str());
         }
+        // Only the primary file is swept, so a version has no verdict of its own.
+        let verdict = state
+            .integrity_memo
+            .as_ref()
+            .and_then(|m| m.verdict(all.id))
+            .filter(|e| e.report.is_damaged());
+        if has_versions {
+            let mut versions = out.reborrow().init_versions(version_count(&all));
+            write_versions(versions.reborrow(), &all, user.policy.admin);
+            if verdict.as_ref().is_some_and(|e| e.report.breaks_playback()) {
+                versions.get(0).set_damaged(true);
+            }
+        }
+        if let Some(entry) = verdict.as_ref().filter(|_| item.path == all.path) {
+            write_damage(out.reborrow().init_damage(), entry);
+        }
         let segments: Vec<_> = segments::for_item(state, &item)
             .await
             .into_iter()
             .filter_map(|s| segment_kind(s.kind).map(|k| (k, s)))
             .collect();
-        let mut list = out.init_segments(len(&segments));
+        let mut list = out.reborrow().init_segments(len(&segments));
         for (i, (kind, s)) in (0..).zip(&segments) {
             let mut w = list.reborrow().get(i);
             w.set_kind(*kind);
             w.set_start_ms(s.start_ms);
             w.set_end_ms(s.end_ms);
         }
+        // The cast decorates the page; a store error leaves it empty rather
+        // than failing the whole detail.
+        let cast = library::cast(state, id).await.unwrap_or_else(|e| {
+            tracing::warn!(media.id = id, error = %e, "native detail: cast unavailable");
+            Vec::new()
+        });
+        write_cast(out.init_cast(len(&cast)), &cast);
         tracing::debug!(
             media.id = id,
             audio_tracks = tracks.audio.len(),
             subtitle_tracks = tracks.subtitles.len(),
             trickplay_widths = trickplay.len(),
             segments = segments.len(),
+            cast = cast.len(),
             "native detail: player facts"
+        );
+        Ok(())
+    }
+
+    async fn person(
+        self: Rc<Self>,
+        params: wire::PersonParams,
+        results: &mut wire::PersonResults,
+    ) -> Result<(), capnp::Error> {
+        let id = read_item_id(params.get()?.get_id()?)?;
+        let user = match self.session.current_user().await {
+            Ok(user) => user,
+            Err(denial) => {
+                denial.write(results.get().init_result().init_error());
+                return Ok(());
+            }
+        };
+        let state = &self.session.state;
+        let not_found = Denial::NotFound { what: "person" };
+        let page = match person::page(state, &user, &id.to_string()).await {
+            Ok(page) => page,
+            Err(PersonError::NotFound | PersonError::Hidden) => {
+                not_found.write(results.get().init_result().init_error());
+                return Ok(());
+            }
+            Err(PersonError::Store(_)) => {
+                Denial::Unavailable {
+                    dependency: "media store",
+                }
+                .write(results.get().init_result().init_error());
+                return Ok(());
+            }
+        };
+        // Each show's own projection, for its poster; one that fails is named
+        // from its episodes instead, and logged.
+        use futures_util::StreamExt as _;
+        let shows: Vec<_> = futures_util::stream::iter(page.shows.iter().map(|show| {
+            let user = &user;
+            async move {
+                let series = WireId::parse(&show.series_id)?;
+                match synth_detail(state, user, series, "person").await {
+                    Ok(dto) => Some((series, dto)),
+                    Err(_) => {
+                        tracing::warn!(series.id = %series, "person page: show named from its episodes");
+                        None
+                    }
+                }
+            }
+        }))
+        .buffered(PERSON_SHOWS_AT_ONCE)
+        .collect()
+        .await;
+        write_person(
+            results.get().init_result(),
+            id,
+            &page,
+            &shows,
+            &state.server_id,
+            &state.image_tag_key,
+            &DamagedIds::of(state),
         );
         Ok(())
     }
@@ -548,7 +754,15 @@ impl server::library::Handler for Library {
         };
         let state = &self.session.state;
         let home = library::home(state, &user, latest, resume, next_up).await;
-        write_home(results.get().init_result(), home, &state.server_id);
+        let reads = Reads::of_home(state, &user, &home).await;
+        write_home(
+            results.get().init_result(),
+            home,
+            &state.server_id,
+            &state.image_tag_key,
+            &DamagedIds::of(state),
+            &reads,
+        );
         Ok(())
     }
 
@@ -568,11 +782,15 @@ impl server::library::Handler for Library {
         };
         let state = &self.session.state;
         let listed = library::next_up(state, &user, None, limit).await;
+        let reads = Reads::of(state, &user, listing_rows(&listed)).await;
         write_listing(
             results.get().init_result(),
             listed,
             "next_up",
             &state.server_id,
+            &state.image_tag_key,
+            &DamagedIds::of(state),
+            &reads,
         );
         Ok(())
     }
@@ -626,6 +844,13 @@ fn read_query(
         name_starts_with: text(q.get_name_starts_with()?)?,
         filters: (!filters.is_empty()).then(|| filters.join(",")),
         genre: text(q.get_genre()?)?,
+        // An enum value this build does not know narrows nothing.
+        is_3d: match q.get_stereo() {
+            Ok(StereoFilter::Only3d) => Some(true),
+            Ok(StereoFilter::Only2d) => Some(false),
+            Ok(StereoFilter::Any) | Err(_) => None,
+        },
+        collapse_collections: q.get_collapse_collections(),
         ..ItemQuery::default()
     };
     let grouping = grouping_of(q.get_kinds()?);
@@ -637,6 +862,9 @@ fn write_home(
     out: home_result::Builder<'_>,
     home: Result<library::Home, ListError>,
     server_id: &str,
+    key: &ImageTagKey,
+    damaged: &DamagedIds,
+    reads: &Reads,
 ) {
     let home = match home {
         Ok(home) => home,
@@ -665,24 +893,48 @@ fn write_home(
     let mut list = out.reborrow().init_rails(count);
     for (i, (id, view, items)) in (0..count).zip(&rails) {
         let mut rail = list.reborrow().get(i);
-        write_view(rail.reborrow().init_view(), *id, view);
-        write_items(rail.init_latest(len_u32(items)), items, server_id);
+        write_view(rail.reborrow().init_view(), *id, view, key);
+        write_items(
+            rail.init_latest(len_u32(items)),
+            items,
+            server_id,
+            key,
+            damaged,
+            reads,
+        );
     }
     write_items(
         out.reborrow().init_resume(len_u32(&home.resume.items)),
         &home.resume.items,
         server_id,
+        key,
+        damaged,
+        reads,
     );
     write_items(
         out.reborrow()
             .init_listening(len_u32(&home.listening.items)),
         &home.listening.items,
         server_id,
+        key,
+        damaged,
+        reads,
+    );
+    write_items(
+        out.reborrow().init_reading(len_u32(&home.reading.items)),
+        &home.reading.items,
+        server_id,
+        key,
+        damaged,
+        reads,
     );
     write_items(
         out.init_next_up(len_u32(&home.next_up.items)),
         &home.next_up.items,
         server_id,
+        key,
+        damaged,
+        reads,
     );
 }
 
@@ -698,10 +950,112 @@ fn write_items(
     mut out: capnp::struct_list::Builder<'_, item_summary::Owned>,
     items: &Rows,
     server_id: &str,
+    key: &ImageTagKey,
+    damaged: &DamagedIds,
+    reads: &Reads,
 ) {
     for (i, (item, user_data)) in (0..out.len()).zip(items) {
-        write_item(out.reborrow().get(i), item, *user_data, server_id);
+        let mut summary = out.reborrow().get(i);
+        write_item(
+            summary.reborrow(),
+            item,
+            *user_data,
+            server_id,
+            key,
+            damaged,
+        );
+        if let Some(position) = reads.get(item.id) {
+            if let Ok(state) = summary.get_user_state() {
+                write_read_state(state, position);
+            }
+        }
     }
+}
+
+/// Listed items with the user's play state.
+fn listing_rows(listed: &Result<ListPage, ListError>) -> &Rows {
+    listed.as_ref().map_or(&[], |page| page.items.as_slice())
+}
+
+/// The saved read positions of the books in a listing, fetched in one query
+/// so a list of books costs one round trip, not one per book. A failed read
+/// is logged and leaves the books unread rather than failing the listing.
+#[derive(Default)]
+pub(super) struct Reads(std::collections::HashMap<u64, ReadPosition>);
+
+impl Reads {
+    async fn of(state: &AppState, user: &pharos_core::User, rows: &Rows) -> Self {
+        let books: Vec<u64> = rows
+            .iter()
+            .filter(|(item, _)| item.kind == MediaKind::Book)
+            .map(|(item, _)| item.id)
+            .collect();
+        Self::fetch(state, user, books).await
+    }
+
+    async fn of_home(
+        state: &AppState,
+        user: &pharos_core::User,
+        home: &Result<library::Home, ListError>,
+    ) -> Self {
+        let Ok(home) = home else {
+            return Self::default();
+        };
+        let books: Vec<u64> = home
+            .rails
+            .iter()
+            .flat_map(|(_, rows)| rows.iter())
+            .chain(&home.resume.items)
+            .chain(&home.reading.items)
+            .filter(|(item, _)| item.kind == MediaKind::Book)
+            .map(|(item, _)| item.id)
+            .collect();
+        Self::fetch(state, user, books).await
+    }
+
+    async fn fetch(state: &AppState, user: &pharos_core::User, mut books: Vec<u64>) -> Self {
+        books.sort_unstable();
+        books.dedup();
+        if books.is_empty() {
+            return Self::default();
+        }
+        match state.stores.read_positions_bulk(user.id, &books).await {
+            Ok(positions) => Self(
+                books
+                    .into_iter()
+                    .zip(positions)
+                    .filter_map(|(id, position)| Some((id, position?)))
+                    .collect(),
+            ),
+            Err(e) => {
+                tracing::warn!(error = %e, books = books.len(), "native library: read positions unavailable");
+                Self::default()
+            }
+        }
+    }
+
+    fn get(&self, id: u64) -> Option<&ReadPosition> {
+        self.0.get(&id)
+    }
+}
+
+/// A book's saved position on its `UserState`.
+pub(super) fn write_read_state(mut out: user_state::Builder<'_>, position: &ReadPosition) {
+    out.set_read_locator(position.locator.as_str());
+    out.set_read_fraction(position.fraction);
+    out.set_read_at(position.updated_at.saturating_mul(1000));
+}
+
+fn write_book(mut out: pharos_api::pharos_capnp::book_info::Builder<'_>, book: &BookMeta) {
+    use pharos_api::pharos_capnp::BookFormat as Wire;
+    out.set_format(match book.format {
+        BookFormat::Epub => Wire::Epub,
+        BookFormat::Pdf => Wire::Pdf,
+        BookFormat::Comic => Wire::Comic,
+        BookFormat::Unreadable => Wire::Unreadable,
+    });
+    out.set_author(book.author.as_deref().unwrap_or_default());
+    out.set_page_count(book.page_count.unwrap_or(0));
 }
 
 fn list_error_detail(e: &ListError) -> String {
@@ -720,7 +1074,13 @@ async fn run_mix(
 ) {
     let now = crate::sync_recovery::now_unix_secs();
     match mix::mix(state, user, ask, now).await {
-        Ok(mixed) => super::mix::write_batch(out.init_batch(), &mixed, &state.server_id),
+        Ok(mixed) => super::mix::write_batch(
+            out.init_batch(),
+            &mixed,
+            &state.server_id,
+            &state.image_tag_key,
+            &DamagedIds::of(state),
+        ),
         Err(mix::MixError::Invalid(e)) => {
             Denial::Invalid { field: e.label() }.write(out.init_error())
         }
@@ -740,6 +1100,9 @@ fn write_listing(
     listed: Result<ListPage, ListError>,
     method: &'static str,
     server_id: &str,
+    key: &ImageTagKey,
+    damaged: &DamagedIds,
+    reads: &Reads,
 ) {
     let listed = match listed {
         Ok(listed) => listed,
@@ -759,7 +1122,78 @@ fn write_listing(
         page.init_items(len_u32(&listed.items)),
         &listed.items,
         server_id,
+        key,
+        damaged,
+        reads,
     );
+}
+
+/// A [`library::query_folded`] page: each film as [`write_item`] writes it,
+/// each folded box set as [`write_collection_tile`] does.
+fn write_folded(
+    out: items_result::Builder<'_>,
+    folded: Result<library::FoldedPage, ListError>,
+    server_id: &str,
+    key: &ImageTagKey,
+    damaged: &DamagedIds,
+    reads: &Reads,
+) {
+    let folded = match folded {
+        Ok(folded) => folded,
+        Err(e) => {
+            tracing::warn!(method = "query", error = %list_error_detail(&e), "native library: folded listing unavailable");
+            Denial::Unavailable {
+                dependency: "media store",
+            }
+            .write(out.init_error());
+            return;
+        }
+    };
+    let mut page = out.init_page();
+    page.set_total(folded.total);
+    page.set_start(folded.start);
+    let mut items = page.init_items(len_u32(&folded.entries));
+    for (i, entry) in (0..items.len()).zip(&folded.entries) {
+        let mut summary = items.reborrow().get(i);
+        match entry {
+            library::Folded::Item(item, data) => {
+                write_item(summary.reborrow(), item, *data, server_id, key, damaged);
+                if let Some(position) = reads.get(item.id) {
+                    if let Ok(state) = summary.get_user_state() {
+                        write_read_state(state, position);
+                    }
+                }
+            }
+            library::Folded::Collection {
+                collection, first, ..
+            } => write_collection_tile(summary, collection, first, server_id, key),
+        }
+    }
+}
+
+/// A folded box set's tile (B1086): the set's id, kind and name, with the
+/// poster of the film it stands in for first, so the tile looks like the
+/// set and opens it.
+fn write_collection_tile(
+    mut out: item_summary::Builder<'_>,
+    collection: &pharos_core::Collection,
+    first: &MediaItem,
+    server_id: &str,
+    key: &ImageTagKey,
+) {
+    if let Some(id) = WireId::parse(&collection.wire_id) {
+        set_item_id(out.reborrow().init_id(), id);
+    }
+    out.set_kind(Kind::Collection);
+    out.set_name(collection.name.as_str());
+    let dto = BaseItemDto::from_domain_with_user_data(first, server_id, UserItemData::default());
+    if let Some(tag) = dto.image_tags.get("Primary").and_then(|t| t.as_str()) {
+        let tag = key.sign(&dto.id, "primary", tag);
+        let mut image = out.reborrow().init_images(1).get(0);
+        image.set_kind("Primary");
+        image.set_tag(tag.as_str());
+        image.set_url(format!("/Items/{}/Images/Primary?tag={tag}", dto.id).as_str());
+    }
 }
 
 /// The grouping a `kinds` list asks for: exactly one kind pharos only
@@ -786,6 +1220,9 @@ fn grouping_of(kinds: capnp::enum_list::Reader<'_, Kind>) -> Option<Grouping> {
 /// The `shape` label of `pharos_rpc_query_total` for a stored-row listing;
 /// a grouped one carries [`Grouping::label`].
 const QUERY_SHAPE_STORED: &str = "stored";
+/// The `shape` label for a stored-row listing with its box sets folded
+/// (B1086).
+const QUERY_SHAPE_FOLDED: &str = "folded";
 
 /// Counts one native `Library.query` under
 /// `pharos_rpc_query_total{shape,outcome}`: which listing answered it, and
@@ -922,6 +1359,7 @@ fn write_grouped(
     grouping: Grouping,
     parent: Option<&str>,
     start: u32,
+    key: &ImageTagKey,
 ) {
     record_query(grouping.label(), listed.is_ok());
     let listed = match listed {
@@ -967,7 +1405,7 @@ fn write_grouped(
     page.set_start(start);
     let mut items = page.init_items(len_u32(&groups));
     for (i, (id, dto)) in (0..items.len()).zip(&groups) {
-        write_synth_summary(items.reborrow().get(i), *id, dto);
+        write_synth_summary(items.reborrow().get(i), *id, dto, key);
     }
 }
 
@@ -1083,18 +1521,20 @@ pub(super) fn record_refusal(call: &'static str, id: WireId, reason: RefusalReas
 /// The synthesised item `id` (library view, series, season, album…) as the
 /// Jellyfin `/Items/{id}` projection, resolved by the same
 /// `synth_item_json` so the two APIs agree and apply the same access rules.
-/// A refusal is recorded and answers like an id that names nothing.
+/// A refusal is recorded under `call` and answers like an id that names
+/// nothing.
 async fn synth_detail(
     state: &AppState,
     user: &pharos_core::User,
     id: WireId,
+    call: &'static str,
 ) -> Result<serde_json::Value, Denial> {
     let item_not_found = Denial::NotFound { what: "item" };
     match crate::api::jellyfin::items::synth_item_json(state, user, &id.to_string()).await {
         Ok(Some(dto)) => Ok(dto),
         Ok(None) => {
             record_refusal(
-                "detail",
+                call,
                 id,
                 RefusalReason::NotFound,
                 "no such synthesised item",
@@ -1102,41 +1542,193 @@ async fn synth_detail(
             Err(item_not_found)
         }
         Err(e) if e.as_response_error().status_code().is_server_error() => {
-            record_refusal(
-                "detail",
-                id,
-                RefusalReason::StoreUnavailable,
-                &e.to_string(),
-            );
+            record_refusal(call, id, RefusalReason::StoreUnavailable, &e.to_string());
             Err(Denial::Unavailable {
                 dependency: "media store",
             })
         }
         Err(e) => {
-            record_refusal("detail", id, RefusalReason::SynthHidden, &e.to_string());
+            record_refusal(call, id, RefusalReason::SynthHidden, &e.to_string());
             Err(item_not_found)
         }
     }
 }
 
-/// Whether `user` has watched all of synthesised series or season `id`;
-/// false for any other kind. A store that cannot say leaves it unwatched:
-/// the page still opens, and marking it is still offered.
-async fn synth_played(
+/// What `user` has marked on synthesised series, season, album or artist
+/// `id`: watched once every item under it is, a favourite while every one
+/// is (B1080, B1085); neither for any other kind. A store that cannot say leaves both off: the
+/// page still opens, and marking it is still offered.
+async fn synth_marks(
     state: &AppState,
     user: &pharos_core::User,
     id: WireId,
     dto: &serde_json::Value,
-) -> bool {
-    if !matches!(synth_kind(dto), Kind::Series | Kind::Season) {
-        return false;
+) -> FolderMarks {
+    if !matches!(
+        synth_kind(dto),
+        Kind::Series | Kind::Season | Kind::Album | Kind::Artist
+    ) {
+        return FolderMarks::default();
     }
-    crate::services::user_data::folder_played(state, user, &id.to_string())
+    crate::services::user_data::folder_marks(state, user, &id.to_string())
         .await
         .unwrap_or_else(|e| {
-            tracing::warn!(item.id = %id, error = ?e, "detail: watched state unavailable");
-            false
+            tracing::warn!(item.id = %id, error = ?e, "detail: watched and favourite state unavailable");
+            FolderMarks::default()
         })
+}
+
+/// The regular cast of a synthesised series or season; empty for any other
+/// synthesised item, or when the store cannot answer.
+async fn synth_cast(
+    state: &AppState,
+    id: WireId,
+    dto: &serde_json::Value,
+) -> Vec<pharos_core::ItemPerson> {
+    if !matches!(synth_kind(dto), Kind::Series | Kind::Season) {
+        return Vec::new();
+    }
+    let wire_id = id.to_string();
+    library::ensemble(state, &wire_id)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(wire_id, error = %e, "native detail: ensemble cast unavailable");
+            Vec::new()
+        })
+}
+
+/// `cast` as wire credits, each with the person's id and photo (see
+/// [`portrait_url`]).
+fn write_cast(
+    mut out: capnp::struct_list::Builder<'_, credit::Owned>,
+    cast: &[pharos_core::ItemPerson],
+) {
+    for (i, p) in (0..).zip(cast) {
+        let mut w = out.reborrow().get(i);
+        w.set_name(p.name.as_str());
+        w.set_character(p.character.as_deref().unwrap_or_default());
+        w.set_kind(credit_kind(p.kind));
+        if let Some(url) = portrait_url(&p.wire_id, p.thumb_url.as_deref()) {
+            w.set_image_url(url.as_str());
+        }
+        if let Some(person) = WireId::parse(&p.wire_id) {
+            set_item_id(w.init_person_id(), person);
+        }
+    }
+}
+
+/// A person's photo on this origin, or `None`. Only a portrait the image route
+/// passes through from here gets one: the UI's CSP would block a redirect to
+/// anywhere else. The tag is the one the Jellyfin routes hand out for a
+/// person; portrait routes are not tag-checked (ADR-0073).
+fn portrait_url(wire_id: &str, thumb_url: Option<&str>) -> Option<String> {
+    let thumb = thumb_url.filter(|u| crate::portrait::is_proxied(u))?;
+    let tag = pharos_jellyfin_api::dto::person_image_tag_for(thumb);
+    Some(format!("/Items/{wire_id}/Images/Primary?tag={tag}"))
+}
+
+/// How many of a person's shows are projected at once: a long-running guest
+/// star can be in dozens, and each projection reads the store.
+const PERSON_SHOWS_AT_ONCE: usize = 8;
+
+/// A person as a search row: their name and photo, kind `person`.
+fn write_person_summary(
+    mut summary: item_summary::Builder<'_>,
+    id: WireId,
+    person: &pharos_core::Person,
+) {
+    set_item_id(summary.reborrow().init_id(), id);
+    summary.set_kind(Kind::Person);
+    summary.set_name(person.name.as_str());
+    if let Some(url) = portrait_url(&person.wire_id, person.thumb_url.as_deref()) {
+        let mut image = summary.reborrow().init_images(1).get(0);
+        image.set_kind("Primary");
+        image.set_url(url.as_str());
+    }
+}
+
+fn credit_kind(kind: pharos_core::PersonKind) -> CreditKind {
+    match kind {
+        pharos_core::PersonKind::GuestStar => CreditKind::GuestStar,
+        _ => CreditKind::Actor,
+    }
+}
+
+/// `page` as the wire `Person`. `shows` holds, for each of `page.shows` in
+/// order, the show's own projection; a show that has none (withheld, or the
+/// store could not say) is named from its episodes instead.
+fn write_person(
+    out: person_result::Builder<'_>,
+    id: WireId,
+    page: &person::PersonPage,
+    shows: &[Option<(WireId, serde_json::Value)>],
+    server_id: &str,
+    key: &ImageTagKey,
+    damaged: &DamagedIds,
+) {
+    let mut out = out.init_person();
+    set_item_id(out.reborrow().init_id(), id);
+    out.set_name(page.person.name.as_str());
+    if let Some(url) = portrait_url(&page.person.wire_id, page.person.thumb_url.as_deref()) {
+        out.set_image_url(url.as_str());
+    }
+    if let Some(d) = &page.details {
+        let text = |v: &Option<String>| v.clone().unwrap_or_default();
+        out.set_biography(text(&d.biography).as_str());
+        out.set_birth_date(text(&d.birth_date).as_str());
+        out.set_death_date(text(&d.death_date).as_str());
+        out.set_birth_place(text(&d.birth_place).as_str());
+        out.set_imdb_id(text(&d.imdb_id).as_str());
+        out.set_wikidata_id(text(&d.wikidata_id).as_str());
+    }
+    let mut films = out.reborrow().init_films(len(&page.films));
+    for (i, film) in (0..).zip(&page.films) {
+        write_appearance(films.reborrow().get(i), film, server_id, key, damaged);
+    }
+    let mut list = out.init_shows(len(&page.shows));
+    for (i, show) in (0..).zip(&page.shows) {
+        let mut w = list.reborrow().get(i);
+        match shows.get(i as usize).and_then(Option::as_ref) {
+            Some((series, dto)) => {
+                write_synth_summary(w.reborrow().init_series(), *series, dto, key)
+            }
+            None => {
+                let mut summary = w.reborrow().init_series();
+                if let Some(series) = WireId::parse(&show.series_id) {
+                    set_item_id(summary.reborrow().init_id(), series);
+                }
+                summary.set_kind(Kind::Series);
+                summary.set_name(show.series_name.as_str());
+            }
+        }
+        let mut characters = w.reborrow().init_characters(len(&show.characters));
+        for (j, name) in (0..).zip(&show.characters) {
+            characters.set(j, name.as_str());
+        }
+        let mut episodes = w.init_episodes(len(&show.episodes));
+        for (j, episode) in (0..).zip(&show.episodes) {
+            write_appearance(episodes.reborrow().get(j), episode, server_id, key, damaged);
+        }
+    }
+}
+
+fn write_appearance(
+    mut out: person_credit::Builder<'_>,
+    appearance: &person::Appearance,
+    server_id: &str,
+    key: &ImageTagKey,
+    damaged: &DamagedIds,
+) {
+    write_item(
+        out.reborrow().init_item(),
+        &appearance.item,
+        appearance.user_data,
+        server_id,
+        key,
+        damaged,
+    );
+    out.set_character(appearance.character.as_deref().unwrap_or_default());
+    out.set_kind(credit_kind(appearance.kind));
 }
 
 /// The text field `key` of a Jellyfin DTO, empty when absent.
@@ -1159,8 +1751,13 @@ fn synth_kind(dto: &serde_json::Value) -> Kind {
 
 /// A synthesised item's `ItemDetail` from its Jellyfin DTO: its summary,
 /// overview and genres, whichever it has.
-fn write_synth_detail(mut out: item_detail::Builder<'_>, id: WireId, dto: &serde_json::Value) {
-    write_synth_summary(out.reborrow().init_summary(), id, dto);
+fn write_synth_detail(
+    mut out: item_detail::Builder<'_>,
+    id: WireId,
+    dto: &serde_json::Value,
+    key: &ImageTagKey,
+) {
+    write_synth_summary(out.reborrow().init_summary(), id, dto, key);
     out.set_overview(dto_str(dto, "Overview"));
     let genres: Vec<&str> = dto
         .get("Genres")
@@ -1181,6 +1778,7 @@ fn write_synth_summary(
     mut summary: item_summary::Builder<'_>,
     id: WireId,
     dto: &serde_json::Value,
+    key: &ImageTagKey,
 ) {
     let kind = synth_kind(dto);
     set_item_id(summary.reborrow().init_id(), id);
@@ -1203,10 +1801,13 @@ fn write_synth_summary(
         summary.reborrow().init_year().set_some(year);
     }
     if let Some(tag) = dto.pointer("/ImageTags/Primary").and_then(|t| t.as_str()) {
+        // ADR-0073: the same signed tag the Jellyfin routes hand out (V712).
+        let id = dto_str(dto, "Id");
+        let tag = key.sign(id, "primary", tag);
         let mut image = summary.reborrow().init_images(1).get(0);
         image.set_kind("Primary");
-        image.set_tag(tag);
-        image.set_url(format!("/Items/{}/Images/Primary?tag={tag}", dto_str(dto, "Id")).as_str());
+        image.set_tag(tag.as_str());
+        image.set_url(format!("/Items/{id}/Images/Primary?tag={tag}").as_str());
     }
     if let Some(parent) =
         WireId::parse(dto_str(dto, "ParentId")).or_else(|| WireId::parse(dto_str(dto, "SeriesId")))
@@ -1278,6 +1879,45 @@ pub(super) fn write_user_state(mut out: user_state::Builder<'_>, data: UserItemD
     out.set_play_count(data.play_count);
 }
 
+/// A damaged verdict as the player and title page show it.
+fn write_damage(
+    mut out: pharos_api::pharos_capnp::damage::Builder<'_>,
+    entry: &crate::integrity_memo::Entry,
+) {
+    let r = &entry.report;
+    out.set_verdict(r.label());
+    out.set_reason(r.first_fault.as_deref().unwrap_or_default());
+    out.set_checked_at(entry.checked_at.unwrap_or(0));
+    let ranges = r.damage_ranges();
+    let mut list = out.init_ranges(len(&ranges));
+    for (i, d) in (0..).zip(&ranges) {
+        let mut w = list.reborrow().get(i);
+        w.set_start_ms(d.start_ms);
+        w.set_end_ms(d.end_ms);
+    }
+}
+
+/// The ids the integrity check holds damaged, read once per call so a page of
+/// summaries does not take the memo's lock per item.
+#[derive(Debug, Default)]
+pub(super) struct DamagedIds(std::collections::HashSet<u64>);
+
+impl DamagedIds {
+    pub(super) fn of(state: &crate::state::AppState) -> Self {
+        Self(
+            state
+                .integrity_memo
+                .as_ref()
+                .map(|m| m.damaged_ids())
+                .unwrap_or_default(),
+        )
+    }
+
+    pub(super) fn contains(&self, id: u64) -> bool {
+        self.0.contains(&id)
+    }
+}
+
 /// One stored item as an `ItemSummary`. The display fields come from the
 /// Jellyfin projection, so the two APIs cannot disagree on a series name,
 /// year or index number.
@@ -1286,6 +1926,8 @@ pub(super) fn write_item(
     item: &MediaItem,
     user_data: UserItemData,
     server_id: &str,
+    key: &ImageTagKey,
+    damaged: &DamagedIds,
 ) {
     let dto = BaseItemDto::from_domain_with_user_data(item, server_id, user_data);
     set_item_id(out.reborrow().init_id(), WireId::Real(item.id));
@@ -1297,9 +1939,10 @@ pub(super) fn write_item(
     // A book's runtime is 0 by design (no time axis).
     out.set_runtime_ms(dto.run_time_ticks / 10_000);
     if let Some(tag) = dto.image_tags.get("Primary").and_then(|t| t.as_str()) {
+        let tag = key.sign(&dto.id, "primary", tag);
         let mut image = out.reborrow().init_images(1).get(0);
         image.set_kind("Primary");
-        image.set_tag(tag);
+        image.set_tag(tag.as_str());
         image.set_url(format!("/Items/{}/Images/Primary?tag={tag}", dto.id).as_str());
     }
     write_user_state(out.reborrow().init_user_state(), user_data);
@@ -1315,12 +1958,30 @@ pub(super) fn write_item(
     if let Some(n) = dto.parent_index_number {
         out.reborrow().init_parent_index_number().set_some(n);
     }
+    out.set_stereo(wire_stereo(item_stereo(item)));
+    out.set_damaged(damaged.contains(item.id));
     if let Some(score) = dto.critic_rating.and_then(tomatometer) {
         out.reborrow().init_critic_rating().set_some(score);
+    }
+    if item.kind == MediaKind::Audio {
+        if let Some(artist) = card_artist(&dto) {
+            out.set_artist(artist.as_str());
+        }
     }
     if let Some(tenths) = item.metadata.ratings.imdb.and_then(imdb_tenths) {
         out.init_imdb_rating().set_some(tenths);
     }
+}
+
+/// Who a song's card names under its title: its track artists, else its album
+/// artist. Only a song's: a music video's file often carries an artist tag
+/// too, but its card is a video's (V750). A compilation's album artist ("Various Artists") says less than
+/// the track's own, so the track's come first (V750).
+fn card_artist(dto: &BaseItemDto) -> Option<String> {
+    if !dto.artists.is_empty() {
+        return Some(dto.artists.join(", "));
+    }
+    dto.album_artists.first().map(|a| a.name.clone())
 }
 
 /// An IMDb score (0–10) in tenths; `None` outside 0–10.
@@ -1347,12 +2008,18 @@ fn tomatometer(rating: f32) -> Option<u16> {
     Some(rounded as u16)
 }
 
-fn write_view(mut item: item_summary::Builder<'_>, id: WireId, view: &LibraryView) {
+fn write_view(
+    mut item: item_summary::Builder<'_>,
+    id: WireId,
+    view: &LibraryView,
+    key: &ImageTagKey,
+) {
     set_item_id(item.reborrow().init_id(), id);
     item.set_kind(Kind::Library);
     item.set_name(view.name.as_str());
     item.set_library_kind(wire_library_kind(view.kind));
     if let Some(tag) = &view.primary_tag {
+        let tag = key.sign(&view.id, "primary", tag);
         let mut image = item.init_images(1).get(0);
         image.set_kind("Primary");
         image.set_tag(tag.as_str());
@@ -1389,6 +2056,10 @@ fn write_tracks(mut out: capnp::struct_list::Builder<'_, track::Owned>, tracks: 
         w.set_is_default(t.is_default);
         w.set_is_forced(t.is_forced);
         w.set_is_hearing_impaired(t.is_hearing_impaired);
+        w.set_channels(
+            t.channels
+                .map_or(0, |c| u16::try_from(c).unwrap_or(u16::MAX)),
+        );
         w.set_styled_url(t.styled.as_deref().unwrap_or_default());
         match &t.drawn {
             Some(watch::Drawn::Vtt(url)) => {
@@ -1415,6 +2086,128 @@ fn segment_kind(kind: &str) -> Option<SegmentKind> {
         "Commercial" => SegmentKind::Commercial,
         _ => return None,
     })
+}
+
+/// `item` as the file `version` names, or the denial that says why not.
+fn select_version(
+    route: media_source::Route,
+    item: MediaItem,
+    version: &str,
+) -> Result<MediaItem, Denial> {
+    crate::services::playback::select_version(route, item, version).map_err(version_denial)
+}
+
+pub(super) fn version_denial(e: crate::services::playback::VersionError) -> Denial {
+    use crate::services::playback::VersionError;
+    match e {
+        VersionError::NoSuchVersion => Denial::NotFound { what: "version" },
+        VersionError::Unprobed => Denial::Unavailable {
+            dependency: "the version's probe (rescan the library)",
+        },
+    }
+}
+
+/// The packing a tile badges: the primary's, else the first 3D edition's,
+/// so the badge agrees with the store's `has_3d` (V720).
+fn item_stereo(item: &MediaItem) -> Option<Video3DFormat> {
+    item.probe
+        .video_3d_format
+        .or_else(|| item.probe.versions().find_map(|a| a.video_3d_format))
+}
+
+fn wire_stereo(format: Option<Video3DFormat>) -> Stereo3d {
+    match format {
+        None => Stereo3d::None,
+        Some(Video3DFormat::HalfSideBySide) => Stereo3d::HalfSideBySide,
+        Some(Video3DFormat::FullSideBySide) => Stereo3d::FullSideBySide,
+        Some(Video3DFormat::HalfTopAndBottom) => Stereo3d::HalfTopAndBottom,
+        Some(Video3DFormat::FullTopAndBottom) => Stereo3d::FullTopAndBottom,
+        Some(Video3DFormat::Mvc) => Stereo3d::Mvc,
+    }
+}
+
+fn version_count(item: &MediaItem) -> u32 {
+    u32::try_from(item.probe.versions().count())
+        .unwrap_or(u32::MAX)
+        .saturating_add(1)
+}
+
+/// An item's playable files, the primary first. An edition's id is what
+/// `detail` and `Playback.negotiate` take as `version`. Paths go to admins
+/// only.
+fn write_versions(
+    mut out: capnp::struct_list::Builder<'_, version::Owned>,
+    item: &MediaItem,
+    admin: bool,
+) {
+    let mut primary = out.reborrow().get(0);
+    primary.set_primary(true);
+    primary.set_stereo(wire_stereo(item.probe.video_3d_format));
+    write_version_facts(primary, &item.probe, &item.path, admin);
+    for (i, alt) in (1..out.len()).zip(item.probe.versions()) {
+        let mut v = out.reborrow().get(i);
+        v.set_id(alt.id.as_str());
+        v.set_name(alt.name.as_deref().unwrap_or_default());
+        v.set_stereo(wire_stereo(alt.video_3d_format));
+        match alt.probe.as_deref() {
+            Some(probe) => write_version_facts(v, probe, &alt.path, admin),
+            // Probed before editions carried their own probe: only the flat facts.
+            None => {
+                let flat = MediaProbe {
+                    video_codec: alt.video_codec.clone(),
+                    audio_codec: alt.audio_codec.clone(),
+                    size_bytes: alt.size_bytes,
+                    duration_ms: alt.duration_ms,
+                    container: alt.container.clone(),
+                    ..MediaProbe::default()
+                };
+                write_version_facts(v, &flat, &alt.path, admin);
+            }
+        }
+    }
+}
+
+fn write_version_facts(
+    mut v: version::Builder<'_>,
+    probe: &MediaProbe,
+    path: &std::path::Path,
+    admin: bool,
+) {
+    v.set_width(probe.width.unwrap_or_default());
+    v.set_height(probe.height.unwrap_or_default());
+    v.set_video_codec(probe.video_codec.as_deref().unwrap_or_default());
+    v.set_hdr(match probe.video_range_type() {
+        pharos_core::VideoRangeType::Sdr => "",
+        other => other.label(),
+    });
+    v.set_size_bytes(probe.size_bytes.unwrap_or_default());
+    v.set_duration_ms(probe.duration_ms.unwrap_or_default());
+    v.set_container(probe.container.as_deref().unwrap_or_default());
+    if let Some(area) = probe.picture_area() {
+        v.set_picture_x(area.x);
+        v.set_picture_y(area.y);
+        v.set_picture_width(area.width);
+        v.set_picture_height(area.height);
+    }
+    if admin {
+        v.set_path(path.to_string_lossy().as_ref());
+    }
+    if probe.audio_tracks.is_empty() {
+        // A single-stream probe records only the flat codec and channels.
+        if let Some(codec) = probe.audio_codec.as_deref() {
+            let mut a = v.init_audio(1).get(0);
+            a.set_codec(codec);
+            a.set_channels(probe.audio_channels.unwrap_or_default());
+        }
+        return;
+    }
+    let mut audio = v.init_audio(len(&probe.audio_tracks));
+    for (i, track) in (0..).zip(&probe.audio_tracks) {
+        let mut a = audio.reborrow().get(i);
+        a.set_language(track.language.as_deref().unwrap_or_default());
+        a.set_codec(track.codec.as_deref().unwrap_or_default());
+        a.set_channels(track.channels.unwrap_or_default());
+    }
 }
 
 #[cfg(test)]

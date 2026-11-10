@@ -7,7 +7,7 @@
 //! the `MediaStore` from elsewhere must validate root-prefix at the
 //! call site; tracked in §B if violated.
 
-use crate::{api::jellyfin::auth_extractor::MediaUser, state::AppState};
+use crate::{api::jellyfin::play_capability::PlaybackUser, state::AppState};
 use actix_web::{
     body::MessageBody,
     error,
@@ -38,7 +38,7 @@ use pharos_core::time::{Ticks, TICKS_PER_SECOND};
 /// Bounded, stable label naming which streaming surface a body came from —
 /// the counterpart to [`DirectPlayDelivery`] for body-COMPLETION
 /// observability, since a delivery decision and whether its body actually
-/// finished are two different questions. 2026-08-31 (House, skip-intro): the
+/// finished are two different questions. 2026-08-31 (Show BJ, skip-intro): the
 /// DirectPlay decision logged a fast, correct 206 in ~2ms, and then the
 /// client went silent for 82s with no signal ANYWHERE — not an abort (the
 /// handler had already returned by then, so `RedMetrics`'s `AbortGuard` never
@@ -316,7 +316,7 @@ fn not_modified(req: &HttpRequest, file_modified: std::time::SystemTime) -> bool
 /// ffmpeg to the first acceptable target (typically AAC).
 async fn audio_universal(
     state: web::Data<AppState>,
-    user: MediaUser,
+    user: PlaybackUser,
     req: HttpRequest,
     path: web::Path<StreamPath>,
 ) -> Result<HttpResponse, actix_web::Error> {
@@ -501,28 +501,12 @@ fn parse_audio_codec_list(qs: &str) -> Vec<String> {
 }
 
 fn parse_max_streaming_bitrate(qs: &str) -> Option<u64> {
-    for kv in qs.split('&') {
-        if let Some((k, v)) = kv.split_once('=') {
-            if k.eq_ignore_ascii_case("MaxStreamingBitrate") {
-                return v.parse::<u64>().ok();
-            }
-        }
-    }
-    None
+    super::ci_query::values(qs, "MaxStreamingBitrate")
+        .next()
+        .and_then(|v| v.parse::<u64>().ok())
 }
 
 /// First value of query key `key` (case-insensitive), empty values skipped.
-fn query_value_ci(qs: &str, key: &str) -> Option<String> {
-    for kv in qs.split('&') {
-        if let Some((k, v)) = kv.split_once('=') {
-            if k.eq_ignore_ascii_case(key) && !v.is_empty() {
-                return Some(v.to_string());
-            }
-        }
-    }
-    None
-}
-
 /// B75 — authorize a direct-play `/videos/{id}/stream` request. Two accepted
 /// credentials:
 ///
@@ -568,53 +552,11 @@ async fn authorize_media(
     // 2. Capability token forwarded by a native app (tag == our ETag): a
     //    session for this item whose holder's token is still live and who may
     //    still see it (B256). A capability outlives neither.
-    let qs = req.query_string();
-    for key in ["tag", "PlaySessionId"] {
-        if let Some(cap) = query_value_ci(qs, key) {
-            match state
-                .transcode_sessions
-                .get_stored(&pharos_core::PlaySessionId::from(cap))
-                .await
-            {
-                Ok(Some(session)) if session.media_id == media_id => {
-                    return capability_holder_allowed(state, &session.holder, media_id).await;
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    tracing::warn!(media.id = media_id, error = %e, "stream capability: session store unavailable");
-                    return Err(error::ErrorServiceUnavailable("session store unavailable"));
-                }
-            }
-        }
-    }
-    Err(error::ErrorUnauthorized("missing token"))
-}
-
-/// Whether a session's holder may still stream `media_id`: their token is
-/// live, their account enabled, and the library policy lets them see it now.
-async fn capability_holder_allowed(
-    state: &AppState,
-    holder: &pharos_core::SessionHolder,
-    media_id: pharos_core::MediaId,
-) -> Result<(), actix_web::Error> {
-    use crate::services::auth::{user_for_token_id, TokenRefusal};
-    match user_for_token_id(&state.stores, &holder.token_id).await {
-        Ok(user) if user.id == holder.user_id => {
+    match super::play_capability::capability_user(state, req, media_id).await? {
+        Some(user) => {
             crate::api::jellyfin::require_item_access(state, &user, media_id, "stream").await
         }
-        Ok(_) => Err(error::ErrorUnauthorized("session holder mismatch")),
-        Err(TokenRefusal::Unavailable(detail)) => {
-            tracing::warn!(media.id = media_id, error = %detail, "stream capability: token store unavailable");
-            Err(error::ErrorServiceUnavailable("token store unavailable"))
-        }
-        Err(refusal) => {
-            tracing::info!(
-                media.id = media_id,
-                reason = refusal.label(),
-                "stream capability: holder's token no longer live"
-            );
-            Err(error::ErrorUnauthorized("session ended"))
-        }
+        None => Err(error::ErrorUnauthorized("missing token")),
     }
 }
 
@@ -726,6 +668,14 @@ async fn stream_transcoded_webm(
     let sub_rel = parse_query_u32(qs, "SubtitleStreamIndex")
         .and_then(|abs| codec_relative_index(&sub_abs, abs));
     let stereo_output = progressive_stereo_output(qs);
+    let planned = super::output_size::plan_output_size(
+        &item.probe,
+        stereo_output,
+        super::output_size::qs_size_limits(qs),
+        Some(cap),
+        parse_max_streaming_bitrate(qs).is_some(),
+    );
+    let output_size = planned.map(|(size, _)| size);
     let opts = TranscodeOptions {
         source_frame_rate: None,
         container: Container::WebM,
@@ -754,6 +704,7 @@ async fn stream_transcoded_webm(
         video_3d_format: item.probe.video_3d_format,
         stereo_output,
         tonemap: super::hls::source_tonemap(&item.probe),
+        output_size,
     };
     tracing::info!(
         media.id = item.id,
@@ -764,6 +715,11 @@ async fn stream_transcoded_webm(
         burn = sub_rel.is_some(),
         "progressive webm transcode starting"
     );
+    // A progressive stream has no cache: every request starts a transcode, so
+    // this is where its downscale is counted.
+    if let Some((_, reason)) = planned {
+        super::output_size::count_scaled(reason);
+    }
     // Route through the load-balancing scheduler (crash-isolated worker,
     // spread across every GPU + CPU). Inline ffmpeg is only a last-resort
     // fallback when the scheduler genuinely declines (pool saturated).
@@ -842,7 +798,7 @@ async fn stream_audio(
 /// feature film — in one body makes a reverse proxy temp-file the entire
 /// remainder before relaying (an unbuffered seek then takes minutes), and a
 /// stalled/reset progressive connection restarts the `<video>` at 0 (the
-/// Deadpool report). Capping to a bounded window the client simply re-requests
+/// Film AJ report). Capping to a bounded window the client simply re-requests
 /// keeps every response small and fast. 8 MiB ≈ 10 s at 6 Mbps.
 const DIRECTPLAY_RANGE_CAP_BYTES: u64 = 8 * 1024 * 1024;
 
@@ -889,13 +845,13 @@ impl DirectPlayClient {
     ///
     /// B140 — only a browser. A `<video>`/MSE source buffer treats a short
     /// response as "this window is done" and issues the next `bytes=X-`, which
-    /// is what makes the Deadpool cap work. A native progressive player does
+    /// is what makes the Film AJ cap work. A native progressive player does
     /// not: ExoPlayer's `DefaultHttpDataSource` sizes its read from the
     /// response's `Content-Length`, and when that many bytes have been consumed
     /// it returns `RESULT_END_OF_INPUT` to the extractor — the media simply
     /// *ends* at the cap. Capping a native player's open-ended range therefore
     /// truncates the film to the first 8 MiB, which is why the Android TV app
-    /// opened Central Intelligence, read one window and gave up. Native clients
+    /// opened Film AK, read one window and gave up. Native clients
     /// get the whole tail; the reverse-proxy buffering the cap exists to avoid
     /// is a browser-path problem.
     fn caps_ranges(self) -> bool {
@@ -1041,7 +997,7 @@ async fn deliver_stream(
     // Cap an over-large / open-ended DirectPlay range to a bounded window so the
     // client re-requests the next chunk. A single multi-GB `bytes=X-` answer
     // stalls proxy buffering (minutes-long unbuffered seeks) and a reset
-    // progressive connection restarts the `<video>` at 0 (Deadpool). Capping a
+    // progressive connection restarts the `<video>` at 0 (Film AJ). Capping a
     // byte-range the client explicitly asked for is valid for ANY container (we
     // return a prefix of the requested bytes), so — unlike the StartTimeTicks
     // time→byte cut above — it needs no `ResyncWitness`. Small / suffix / multi
@@ -1402,7 +1358,7 @@ mod tests {
 
         let local = MediaItem {
             id: 2,
-            path: "/media/Movies/Arrival.mkv".into(),
+            path: "/media/Movies/Film BC.mkv".into(),
             kind: MediaKind::Movie,
             ..Default::default()
         };
@@ -1446,6 +1402,7 @@ mod tests {
 
     fn item_with_bitrate(bitrate_bps: Option<u64>, size_bytes: Option<u64>) -> MediaItem {
         MediaItem {
+            locked: Default::default(),
             id: 1,
             path: "/no/such".into(),
             title: "t".into(),
@@ -1543,7 +1500,7 @@ mod tests {
         );
     }
 
-    /// 2026-08-31 (House, skip-intro): a body dropped mid-transfer — the
+    /// 2026-08-31 (Show BJ, skip-intro): a body dropped mid-transfer — the
     /// client disconnected or stalled reading it — produced no signal
     /// anywhere. `RedMetrics`'s abort guard only watches the handler's
     /// future, which had already returned by the time this body starts

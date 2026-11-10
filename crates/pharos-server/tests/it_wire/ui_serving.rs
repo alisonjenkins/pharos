@@ -340,3 +340,103 @@ async fn redirects_and_not_found_carry_the_security_headers() {
         );
     }
 }
+
+const WORKER: &str = "const V = \"__PHAROS_BUNDLE_HASH__\";\nconst P = __PHAROS_PRECACHE__;\n";
+
+/// A bundle with a worker template and a PDF module beside the shell.
+fn bundle_with_worker(dir: &Path, wasm: &[u8]) -> Arc<ui::UiBundle> {
+    std::fs::write(dir.join("index.html"), INDEX).unwrap();
+    std::fs::write(dir.join("sw.js"), WORKER).unwrap();
+    std::fs::create_dir_all(dir.join("assets/pdf")).unwrap();
+    std::fs::write(dir.join("assets/pharos-ui_bg-dxhA1b2.wasm"), wasm).unwrap();
+    std::fs::write(dir.join("assets/pharos.css"), "body{}").unwrap();
+    std::fs::write(dir.join("assets/pdf/quire_pdf_bg.wasm"), "pdf").unwrap();
+    Arc::new(ui::UiBundle::load(dir).unwrap())
+}
+
+macro_rules! worker_text {
+    ($app:expr) => {{
+        let resp = test::call_service(
+            &$app,
+            test::TestRequest::get().uri("/ui/sw.js").to_request(),
+        )
+        .await;
+        let headers = resp.headers().clone();
+        let body = String::from_utf8(test::read_body(resp).await.to_vec()).unwrap();
+        (headers, body)
+    }};
+}
+
+/// `/ui/sw.js` is the template with the bundle hash and the shell's URLs
+/// filled in, always revalidated, under the UI's security headers; the PDF
+/// module and the worker are not on its precache list (ADR-0110). Disarm
+/// check: serve the file as it is and the placeholders show.
+#[actix_web::test]
+async fn the_service_worker_is_served_rendered_and_never_cached() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = app!(bundle_with_worker(dir.path(), WASM));
+    let (headers, body) = worker_text!(app);
+    assert_eq!(headers.get(header::CACHE_CONTROL).unwrap(), "no-cache");
+    assert_eq!(
+        headers.get(header::CONTENT_TYPE).unwrap(),
+        "text/javascript; charset=utf-8"
+    );
+    assert!(headers.contains_key(header::CONTENT_SECURITY_POLICY));
+    assert!(
+        !headers.contains_key("service-worker-allowed"),
+        "the worker sits at its own scope"
+    );
+    assert!(!body.contains("__PHAROS"), "{body}");
+    assert!(
+        body.contains(r#"["/ui/assets/pharos-ui_bg-dxhA1b2.wasm","/ui/assets/pharos.css","/ui/"]"#)
+            || body.contains("/ui/assets/pharos-ui_bg-dxhA1b2.wasm")
+    );
+    assert!(
+        body.contains(r#"["/ui/assets/pharos-ui_bg-dxhA1b2.wasm","/ui/assets/pharos.css","/ui/"]"#),
+        "{body}"
+    );
+    assert!(!body.contains("quire_pdf"), "the PDF module is lazy");
+    assert!(!body.contains("sw.js"));
+}
+
+/// The version changes with any shell file and with nothing else, so a deploy
+/// replaces the browser's cache and an unrelated lazy file does not. Disarm
+/// check: hash only the file names and the changed-wasm case reads equal.
+#[actix_web::test]
+async fn the_service_worker_version_follows_the_shell_bytes() {
+    async fn version(wasm: &[u8], pdf: &str) -> String {
+        let dir = tempfile::tempdir().unwrap();
+        let bundle = bundle_with_worker(dir.path(), wasm);
+        std::fs::write(dir.path().join("assets/pdf/quire_pdf_bg.wasm"), pdf).unwrap();
+        let bundle = if pdf == "pdf" {
+            bundle
+        } else {
+            Arc::new(ui::UiBundle::load(dir.path()).unwrap())
+        };
+        let app = app!(bundle);
+        let (_, body) = worker_text!(app);
+        body.lines().next().unwrap().to_owned()
+    }
+    let base = version(WASM, "pdf").await;
+    assert!(base.starts_with("const V = \""), "{base}");
+    assert_eq!(version(WASM, "pdf").await, base);
+    assert_eq!(version(WASM, "other pdf").await, base, "lazy file");
+    assert_ne!(version(b"\0asm-new", "pdf").await, base, "shell file");
+}
+
+/// A bundle with no `sw.js` has no worker: the path is no file. A template
+/// without its placeholders refuses to load rather than serve an unversioned
+/// worker.
+#[actix_web::test]
+async fn a_bundle_without_a_worker_has_none_and_a_bare_template_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = app!(bundle(dir.path()));
+    let resp =
+        test::call_service(&app, test::TestRequest::get().uri("/ui/sw.js").to_request()).await;
+    assert_eq!(resp.status(), 404);
+
+    let bare = tempfile::tempdir().unwrap();
+    std::fs::write(bare.path().join("index.html"), INDEX).unwrap();
+    std::fs::write(bare.path().join("sw.js"), "self.skipWaiting();").unwrap();
+    assert!(ui::UiBundle::load(bare.path()).is_err());
+}

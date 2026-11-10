@@ -4,19 +4,20 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import subprocess
 import threading
 import urllib.error
 import urllib.request
 from typing import Iterator
 import pytest
 
-from pharos_aligner.server import create_server
+from pharos_aligner.server import ALIGNER_VERSION, create_server
 
 
 class FakeAligner:
     """Fake aligner returning evenly spaced spans per token."""
 
-    def align(self, pcm_f32le: bytes, tokens: list[str]) -> list[tuple[int, int]]:
+    def align(self, pcm_f32le: bytes, tokens: list[str], lead_star: bool = False) -> list[tuple[int, int]]:
         if not tokens:
             return []
         step = 100
@@ -83,19 +84,38 @@ def test_post_align_two_lines(running_server: tuple[str, Path]) -> None:
     assert "lines" in data
     assert len(data["lines"]) == 2
 
-    # Line 0: window start is max(0, 1000 - 250) = 750
+    # Line 0: window start is max(0, 1000 - 750) = 250
     # tokens: ["hello", "world"]
     # fake spans: [(0, 100), (100, 200)]
-    # stamps: word 0: at=0, 750+0=750; word 1: at=6, 750+100=850; end: at=11, 750+200=950
+    # stamps: word 0: at=0, 250+0=250; word 1: at=6, 250+100=350; end: at=11, 250+200=450
     line0_words = data["lines"][0]["words"]
     assert line0_words == [
-        {"at": 0, "start_ms": 750},
-        {"at": 6, "start_ms": 850},
-        {"at": 11, "start_ms": 950},
+        {"at": 0, "start_ms": 250},
+        {"at": 6, "start_ms": 350},
+        {"at": 11, "start_ms": 450},
     ]
 
     # Line 1: no alignable words -> empty words list
     assert data["lines"][1]["words"] == []
+
+
+def test_post_align_a_line_sung_straight_after_another_cannot_take_its_last_word(
+    running_server: tuple[str, Path],
+) -> None:
+    base_url, media_root = running_server
+    (media_root / "test.mp3").write_bytes(b"dummy audio content")
+    payload = {
+        "path": "test.mp3",
+        "lines": [
+            {"start_ms": 1000, "end_ms": 1100, "text": "Hello world"},
+            {"start_ms": 1100, "end_ms": 3000, "text": "next line"},
+        ],
+    }
+    with urllib.request.urlopen(_post(base_url, payload)) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    # Line 0 is aligned to end at 250 + 200 = 450; line 1's lead stops there
+    # rather than reaching back to 1100 - 750 = 350.
+    assert data["lines"][1]["words"][0] == {"at": 0, "start_ms": 450}
 
 
 def test_post_align_bad_input_400(running_server: tuple[str, Path]) -> None:
@@ -160,10 +180,10 @@ def _post(base_url: str, payload: dict) -> urllib.request.Request:
 class RaisingOnLongLines(FakeAligner):
     """Raises as torchaudio does when a line's text outruns its window."""
 
-    def align(self, pcm_f32le: bytes, tokens: list[str]) -> list[tuple[int, int]]:
+    def align(self, pcm_f32le: bytes, tokens: list[str], lead_star: bool = False) -> list[tuple[int, int]]:
         if len(tokens) > 2:
             raise RuntimeError("targets length is too long for CTC")
-        return super().align(pcm_f32le, tokens)
+        return super().align(pcm_f32le, tokens, lead_star)
 
 
 def test_post_align_a_failing_line_leaves_the_others(tmp_path: Path) -> None:
@@ -199,6 +219,102 @@ def test_post_align_missing_ffmpeg_is_500_not_404(tmp_path: Path) -> None:
         with pytest.raises(urllib.error.HTTPError) as exc_info:
             urllib.request.urlopen(_post(base_url, payload))
         assert exc_info.value.code == 500
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_post_align_reports_the_whole_song_offset_and_aligns_the_shifted_lines(
+    running_server: tuple[str, Path],
+) -> None:
+    base_url, media_root = running_server
+    (media_root / "song.mp3").write_bytes(b"x")
+    # FakeAligner puts every first word at the start of its window, so each
+    # wide probe finds its line SEARCH_MS early.
+    payload = {
+        "path": "song.mp3",
+        "lines": [
+            {"start_ms": 20_000, "end_ms": 30_000, "text": "one line sung here"},
+            {"start_ms": 30_000, "end_ms": 40_000, "text": "another line sung there"},
+            {"start_ms": 40_000, "end_ms": 50_000, "text": "the last line sung"},
+        ],
+    }
+    with urllib.request.urlopen(_post(base_url, payload)) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    assert data["offset_ms"] == -8_000
+    # The first line's window now opens LEAD_MS before 12 000 ms.
+    assert data["lines"][0]["words"][0] == {"at": 0, "start_ms": 11_250}
+
+
+def test_post_align_a_probe_that_cannot_be_decoded_costs_only_the_offset(tmp_path: Path) -> None:
+    (tmp_path / "song.mp3").write_bytes(b"x")
+
+    def wide_windows_fail(path: str, start_ms: int, end_ms: int, rate: int = 16000) -> bytes:
+        # Probe windows reach SEARCH_MS either side; the line windows do not.
+        if end_ms - start_ms > 10_000:
+            raise subprocess.CalledProcessError(1, "ffmpeg")
+        return b"\0" * 64
+
+    server, thread, base_url = _serve(tmp_path, FakeAligner(), wide_windows_fail)
+    try:
+        payload = {
+            "path": "song.mp3",
+            "lines": [
+                {"start_ms": 20_000, "end_ms": 21_000, "text": "one line sung here"},
+                {"start_ms": 30_000, "end_ms": 31_000, "text": "another line sung there"},
+                {"start_ms": 40_000, "end_ms": 41_000, "text": "the last line sung"},
+            ],
+        }
+        with urllib.request.urlopen(_post(base_url, payload)) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        assert data["offset_ms"] == 0
+        assert all(line["words"] for line in data["lines"])
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_post_align_a_probe_that_times_out_skips_the_other_probes(tmp_path: Path) -> None:
+    (tmp_path / "song.mp3").write_bytes(b"x")
+    wide_calls: list[int] = []
+
+    def wide_windows_hang(path: str, start_ms: int, end_ms: int, rate: int = 16000) -> bytes:
+        if end_ms - start_ms > 10_000:
+            wide_calls.append(start_ms)
+            raise subprocess.TimeoutExpired("ffmpeg", 120)
+        return b"\0" * 64
+
+    server, thread, base_url = _serve(tmp_path, FakeAligner(), wide_windows_hang)
+    try:
+        payload = {
+            "path": "song.mp3",
+            "lines": [
+                {"start_ms": 20_000, "end_ms": 21_000, "text": "one line sung here"},
+                {"start_ms": 30_000, "end_ms": 31_000, "text": "another line sung there"},
+                {"start_ms": 40_000, "end_ms": 41_000, "text": "the last line sung"},
+            ],
+        }
+        with urllib.request.urlopen(_post(base_url, payload)) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        assert data["offset_ms"] == 0
+        assert all(line["words"] for line in data["lines"])
+        assert len(wide_calls) == 1
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_every_answer_names_the_aligner_version(tmp_path: Path) -> None:
+    (tmp_path / "song.mp3").write_bytes(b"x")
+    server, thread, base_url = _serve(tmp_path, FakeAligner(), fake_decoder)
+    try:
+        payload = {"path": "song.mp3", "lines": [{"start_ms": 1000, "end_ms": 4000, "text": "hello there"}]}
+        with urllib.request.urlopen(_post(base_url, payload)) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        assert data["aligner_version"] == ALIGNER_VERSION
     finally:
         server.shutdown()
         server.server_close()

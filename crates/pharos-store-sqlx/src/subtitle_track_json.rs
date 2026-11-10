@@ -65,9 +65,13 @@ pub fn encode(tracks: &[SubtitleTrack]) -> Option<String> {
 /// Parse the JSON column back into a Vec. Invalid / missing → empty.
 pub fn decode(s: Option<&str>) -> Vec<SubtitleTrack> {
     let Some(s) = s else { return Vec::new() };
-    serde_json::from_str::<Vec<SubtitleTrackJson>>(s)
-        .map(|v| v.into_iter().map(Into::into).collect())
-        .unwrap_or_default()
+    let Ok(tracks) = serde_json::from_str::<Vec<SubtitleTrackJson>>(s) else {
+        return Vec::new();
+    };
+    // serde grows the Vec by doubling from 4; trim the unused slots.
+    let mut tracks: Vec<SubtitleTrack> = tracks.into_iter().map(Into::into).collect();
+    tracks.shrink_to_fit();
+    tracks
 }
 
 #[cfg(test)]

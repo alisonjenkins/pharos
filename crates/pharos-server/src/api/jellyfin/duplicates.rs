@@ -79,7 +79,7 @@ fn group_dto(versions: Vec<&MediaItem>) -> DuplicateGroupDto {
                 height: m.probe.height,
                 video_codec: m.probe.video_codec.clone(),
                 date_added: m.created_at,
-                edition_count: m.probe.alternate_sources.len(),
+                edition_count: m.probe.versions().count(),
             })
             .collect(),
     }
@@ -245,9 +245,9 @@ mod tests {
     #[test]
     fn rows_sharing_a_provider_id_are_one_film() {
         let movies = [
-            film(1, "The Matrix", Some(1999), Some("603")),
-            film(2, "Matrix, The (Remastered)", None, Some("603")),
-            film(3, "Heat", Some(1995), Some("949")),
+            film(1, "The Glass Lattice", Some(1999), Some("930603")),
+            film(2, "Glass Lattice, The (Remastered)", None, Some("930603")),
+            film(3, "Film AP", Some(1995), Some("930949")),
         ];
         assert_eq!(ids(&group_duplicates(&movies)), vec![vec![1, 2]]);
     }
@@ -255,18 +255,8 @@ mod tests {
     #[test]
     fn an_unidentified_copy_joins_the_film_with_its_title_and_year() {
         let movies = [
-            film(
-                1,
-                "The Six Million Dollar Man: Wine, Women and War",
-                Some(1973),
-                Some("1"),
-            ),
-            film(
-                2,
-                "Six Million Dollar Man - Wine Women and War",
-                Some(1973),
-                None,
-            ),
+            film(1, "Show AK: Salt, Smoke and Steel", Some(1973), Some("1")),
+            film(2, "Show AK - Salt Smoke and Steel", Some(1973), None),
         ];
         assert_eq!(ids(&group_duplicates(&movies)), vec![vec![1, 2]]);
     }
@@ -274,10 +264,10 @@ mod tests {
     #[test]
     fn unidentified_copies_group_on_title_and_year() {
         let movies = [
-            film(1, "Heat", Some(1995), None),
-            film(2, "heat", Some(1995), None),
-            film(3, "Heat", Some(1986), None),
-            film(4, "Heat", None, None),
+            film(1, "Film AP", Some(1995), None),
+            film(2, "film ap", Some(1995), None),
+            film(3, "Film AP", Some(1986), None),
+            film(4, "Film AP", None, None),
         ];
         assert_eq!(ids(&group_duplicates(&movies)), vec![vec![1, 2]]);
     }
@@ -294,7 +284,7 @@ mod tests {
 
     #[test]
     fn a_row_with_editions_is_one_item() {
-        let mut cut = film(1, "Blade Runner", Some(1982), Some("78"));
+        let mut cut = film(1, "Film AB", Some(1982), Some("930078"));
         cut.probe = MediaProbe {
             alternate_sources: vec![AlternateMediaSource {
                 id: "final".into(),
@@ -302,24 +292,24 @@ mod tests {
             }],
             ..Default::default()
         };
-        let movies = [cut, film(2, "Heat", Some(1995), None)];
+        let movies = [cut, film(2, "Film AP", Some(1995), None)];
         assert!(group_duplicates(&movies).is_empty());
     }
 
     #[test]
     fn a_match_id_links_rows_like_a_provider_id() {
-        let mut a = film(1, "Alien", Some(1979), None);
+        let mut a = film(1, "Film AX", Some(1979), None);
         a.match_provider = Some("tmdb".into());
         a.match_external_id = Some("348".into());
-        let b = film(2, "Alien (Director's Cut)", Some(2003), Some("348"));
+        let b = film(2, "Film AX (Director's Cut)", Some(2003), Some("348"));
         assert_eq!(ids(&group_duplicates(&[a, b])), vec![vec![1, 2]]);
     }
 
     #[test]
     fn a_blank_provider_id_is_no_id() {
         let movies = [
-            film(1, "Heat", Some(1995), Some("")),
-            film(2, "Alien", Some(1979), Some(" ")),
+            film(1, "Film AP", Some(1995), Some("")),
+            film(2, "Film AX", Some(1979), Some(" ")),
         ];
         assert!(group_duplicates(&movies).is_empty());
     }

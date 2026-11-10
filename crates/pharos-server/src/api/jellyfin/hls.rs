@@ -2,18 +2,20 @@
 //! variant playlist; the per-segment URL spawns ffmpeg (via
 //! `pharos-transcode`) on demand. No segment caching — phase 2.
 //!
-//! Auth follows the T7 direct-play pattern: token via `api_key` query
-//! param OR any of the Emby/MediaBrowser headers (see auth_extractor).
-//! The playlist embeds the api_key so the player can fetch segments
-//! without re-auth in `<video src=…>`.
+//! Auth: a token (Emby/MediaBrowser headers, `api_key`, or the auth cookie),
+//! or the PlaySessionId of a live playback of the item (`play_capability`).
+//! A playlist embeds the PlaySessionId so the player can fetch segments
+//! without re-auth in `<video src=…>`; it copies a token into those URLs only
+//! when the request carried no live PlaySessionId.
 //!
 //! V6 stays held by `pharos-transcode`: ffmpeg crashes never crash the
 //! server, abandoned segments don't leak processes.
 
 use crate::api::jellyfin::ci_query::CiQuery;
 use crate::{
-    api::jellyfin::auth_extractor::{extract_token, AuthUser, MediaUser},
+    api::jellyfin::auth_extractor::{extract_token, AuthUser},
     api::jellyfin::fmp4,
+    api::jellyfin::play_capability::{self, PlaybackUser},
     state::AppState,
 };
 use actix_web::{error, web, HttpRequest, HttpResponse, Responder};
@@ -175,7 +177,7 @@ async fn stop_active_encodings(
 
 async fn subtitle_playlist(
     state: web::Data<AppState>,
-    user: MediaUser,
+    user: PlaybackUser,
     req: HttpRequest,
     path: web::Path<(String, u32)>,
 ) -> Result<HttpResponse, actix_web::Error> {
@@ -528,6 +530,93 @@ struct HlsItem {
     path: std::path::PathBuf,
     /// The grouped edition `path` belongs to, if the request selected one.
     edition: Option<String>,
+    /// Spec 037 — a split film's later parts, in play order, which its
+    /// playlists list after its first part. Empty for any other item, and for
+    /// a request that selected a part or an edition itself.
+    parts: Vec<HlsPart>,
+}
+
+/// Spec 037 — one later part of a split film, as its film's playlists list
+/// it: its own segments, addressed by its media source id (V1154).
+struct HlsPart {
+    /// The wire `MediaSourceId` that selects this part's file.
+    source_id: String,
+    path: std::path::PathBuf,
+    /// The part's alternate id, which keys its cached segments.
+    edition: String,
+    duration_seconds: f64,
+    frame_rate_mille: Option<u32>,
+}
+
+/// The later parts of a split film `item` (as stored, before any selection),
+/// in play order. A part with no stored duration ends the list there: its
+/// segments cannot be enumerated, and a gap would skip the film's middle.
+fn hls_parts(item: &pharos_core::MediaItem) -> Vec<HlsPart> {
+    let wire = pharos_jellyfin_api::dto::wire_item_id(item.id);
+    let mut out = Vec::new();
+    for part in item.probe.parts() {
+        let probe = part.probe.as_deref();
+        let Some(ms) = probe.and_then(|p| p.duration_ms).or(part.duration_ms) else {
+            tracing::warn!(
+                media.id = item.id,
+                part = part.part,
+                path = %part.path.display(),
+                "a split film's part has no stored duration; its playlist ends before it",
+            );
+            break;
+        };
+        out.push(HlsPart {
+            source_id: format!("{wire}-{}", part.id),
+            path: part.path.clone(),
+            edition: part.id.clone(),
+            duration_seconds: ms as f64 / 1000.0,
+            frame_rate_mille: probe.and_then(|p| p.frame_rate_mille),
+        });
+    }
+    out
+}
+
+/// A part's copy of its film's playlist query: the film's `MediaSourceId`
+/// and source generation swapped for the part's, so each segment URL reads
+/// the part's file.
+fn part_qs(qs: &str, part: &HlsPart) -> String {
+    let kept: Vec<&str> = qs
+        .split('&')
+        .filter(|kv| {
+            let key = kv.split_once('=').map_or(*kv, |(k, _)| k);
+            !kv.is_empty() && !key.eq_ignore_ascii_case("MediaSourceId") && key != "s"
+        })
+        .collect();
+    let mut base = kept.join("&");
+    if !base.is_empty() {
+        base.push('&');
+    }
+    base.push_str("MediaSourceId=");
+    base.push_str(&part.source_id);
+    with_source_gen(base, &part.path, Some(&part.edition))
+}
+
+/// The playlist entries of `item`'s later parts, each with its own init (when
+/// `init` gives one) and segment URIs built from the part's query.
+fn playlist_parts<'a>(
+    item: &HlsItem,
+    qs: &str,
+    init: impl Fn(&str) -> Option<String>,
+    segment: impl Fn(&str, u32) -> String + Clone + 'a,
+) -> Vec<PlaylistPart<'a>> {
+    item.parts
+        .iter()
+        .map(|part| {
+            let qs = part_qs(qs, part);
+            let segment = segment.clone();
+            PlaylistPart {
+                duration_secs: part.duration_seconds,
+                frame_rate_mille: part.frame_rate_mille,
+                init_uri: init(&qs),
+                segment_uri: Box::new(move |seg| segment(&qs, seg)),
+            }
+        })
+        .collect()
 }
 
 async fn load_hls_item(
@@ -539,13 +628,24 @@ async fn load_hls_item(
     let id: u64 = pharos_jellyfin_api::dto::parse_item_id(id_str)
         .ok_or_else(|| error::ErrorBadRequest("invalid id"))?;
     crate::api::jellyfin::require_item_access(state, user, id, "hls").await?;
-    let item = super::media_source::load(
-        state,
+    let stored = pharos_core::MediaStore::get(&state.stores, id)
+        .await
+        .map_err(|e| match e {
+            pharos_core::DomainError::NotFound(_) => error::ErrorNotFound("not found"),
+            other => error::ErrorInternalServerError(other.to_string()),
+        })?;
+    let requested = super::media_source::requested_id(req.query_string());
+    let parts = match super::media_source::classify(&stored, requested.as_deref()).0 {
+        super::media_source::Requested::Absent | super::media_source::Requested::Primary => {
+            hls_parts(&stored)
+        }
+        _ => Vec::new(),
+    };
+    let item = super::media_source::select(
         super::media_source::Route::Hls,
-        id,
-        req.query_string(),
-    )
-    .await?;
+        stored,
+        requested.as_deref(),
+    );
     // Prefer the probe persisted at scan time. Fall back to live
     // ffprobe only when the row predates the probe-metadata migration
     // so the hot path stays subprocess-free.
@@ -588,6 +688,7 @@ async fn load_hls_item(
         kind: item.kind,
         path: item.path.clone(),
         edition: item.edition.clone(),
+        parts,
     })
 }
 
@@ -601,7 +702,7 @@ const HLS_MIN_BITRATE_BPS: u64 = 500_000;
 //
 // B50 raised this 8M→40M to end VP9 graininess — but 40M is unencodable in
 // realtime by the software VP9 encoder: a 1080p segment took 32s (vs the 6s
-// budget), freezing playback (Supergirl VP9, 2026-07-14). The B50 benchmark
+// budget), freezing playback (Show AI VP9, 2026-07-14). The B50 benchmark
 // used synthetic noise, which encodes far faster than real film detail.
 // B52 caps at 12M: a real improvement over the old 8M (measured grain win),
 // still within the ~1.5-2x realtime margin observed for 1080p VP9 on this
@@ -643,16 +744,69 @@ fn min_opt(a: Option<u64>, b: Option<u64>) -> Option<u64> {
     }
 }
 
+/// Set the downscale target on a re-encoded segment (spec 035). See
+/// [`super::output_size::plan_output_size`] for what `bitrate_capped` means.
+fn apply_output_size(
+    opts: &mut SegmentOpts,
+    probe: &pharos_core::MediaProbe,
+    limits: pharos_transcode::SizeLimits,
+    bitrate_capped: bool,
+) {
+    let planned = if opts.video.is_some() {
+        super::output_size::plan_output_size(
+            probe,
+            opts.stereo_output,
+            limits,
+            opts.video_bitrate_bps,
+            bitrate_capped,
+        )
+    } else {
+        None
+    };
+    opts.output_size = planned.map(|(size, _)| size);
+    opts.output_scale_reason = planned.map(|(_, reason)| reason);
+}
+
+/// The size bounds and the `bitrate_capped` flag a `main`-rung or variant
+/// segment is planned with. ONE function for [`serve_segment`] and the
+/// cold-start prewarm: a prewarm that plans differently keys segments the
+/// client never asks for (V92).
+fn output_size_bounds(
+    requested: pharos_transcode::SizeLimits,
+    session_cap: Option<u64>,
+    url_cap: Option<u64>,
+    rung_height: Option<u32>,
+) -> (pharos_transcode::SizeLimits, bool) {
+    let capped = session_cap.is_some() || url_cap.is_some();
+    match rung_height {
+        Some(h) => (requested.capped_height(h), true),
+        None => (requested, capped),
+    }
+}
+
+/// A CMAF ladder rung also bounds the frame by its own height, and its
+/// bitrate is a client-visible cap. Re-plans after the rung bitrate is set.
+fn apply_rung_output_size(
+    opts: &mut SegmentOpts,
+    probe: &pharos_core::MediaProbe,
+    qs: &str,
+    rung: Option<Variant>,
+) {
+    if let Some(r) = rung {
+        let limits = super::output_size::qs_size_limits(qs).capped_height(r.height());
+        apply_output_size(opts, probe, limits, true);
+    }
+}
+
 /// Fix (Lace incident): parse a `VideoBitrate=` ceiling from a request query
 /// string. PlaybackInfo bakes it into the transcode URL for remote clients and
 /// `playback_qs` rides it master → variant → segment, so the cap survives a
 /// GC'd session and reaches the remux re-encode paths (which carry no cap in
 /// the registered Decision). `0` / unparseable → `None`.
 fn qs_video_bitrate_cap(qs: &str) -> Option<u64> {
-    qs.split('&')
-        .filter_map(|kv| kv.split_once('='))
-        .find(|(k, _)| k.eq_ignore_ascii_case("VideoBitrate"))
-        .and_then(|(_, v)| v.parse::<u64>().ok())
+    super::ci_query::values(qs, "VideoBitrate")
+        .next()
+        .and_then(|v| v.parse::<u64>().ok())
         .filter(|n| *n > 0)
 }
 
@@ -702,6 +856,60 @@ fn select_master_video(qs: &str) -> MasterVideo {
     MasterVideo::H264
 }
 
+/// What the master advertises for the client's size bounds (spec 035): the
+/// frame the `main` rendition is ACTUALLY encoded at, and the bounds the ladder
+/// rungs are held to.
+#[derive(Clone, Copy)]
+struct MasterSize {
+    /// `None` when the source size is unknown.
+    main: Option<(u32, u32)>,
+    limits: pharos_transcode::SizeLimits,
+}
+
+impl MasterSize {
+    /// Plans the `main` rendition exactly as the segment route will: the same
+    /// bounds and the same `capped` rule ([`output_size_bounds`]). Cosmetic for
+    /// a packed-3D source (the master does not know the layout), which is
+    /// planned as flat.
+    fn of(item: &HlsItem, limits: pharos_transcode::SizeLimits, bitrate_cap: Option<u64>) -> Self {
+        let main = item.width.zip(item.height).map(|(w, h)| {
+            let probe = pharos_core::MediaProbe {
+                width: Some(w),
+                height: Some(h),
+                ..Default::default()
+            };
+            let (limits, capped) = output_size_bounds(limits, bitrate_cap, None, None);
+            super::output_size::plan_output_size(
+                &probe,
+                pharos_transcode::StereoOutput::Preserve,
+                limits,
+                Some(effective_video_bitrate(
+                    bitrate_cap,
+                    item.source_bitrate_bps,
+                )),
+                capped,
+            )
+            .map_or((w, h), |(s, _)| (s.width(), s.height()))
+        });
+        Self { main, limits }
+    }
+
+    fn main_resolution(self) -> String {
+        self.main
+            .map(|(w, h)| format!(",RESOLUTION={w}x{h}"))
+            .unwrap_or_default()
+    }
+
+    /// A ladder rung taller (or wider) than the client's bounds would be a
+    /// variant the client cannot use; leave it out of the master.
+    fn admits(self, rung_w: Option<u32>, rung_h: u32) -> bool {
+        self.limits.max_height().map_or(true, |m| rung_h <= m)
+            && rung_w
+                .zip(self.limits.max_width())
+                .map_or(true, |(w, m)| w <= m)
+    }
+}
+
 /// Append the H.264/mpegts master rungs: the backwards-compat `main` rung + the
 /// resolution ladder, all advertising the avc1+aac CODECS the segments carry.
 fn push_h264_rungs(
@@ -710,6 +918,7 @@ fn push_h264_rungs(
     qs: &str,
     item: &HlsItem,
     bitrate_cap: Option<u64>,
+    size: MasterSize,
 ) {
     let codecs = hls_output_codecs_string(
         item.video_codec.as_deref(),
@@ -721,21 +930,19 @@ fn push_h264_rungs(
         .zip(item.height)
         .map(|(w, h)| w as f64 / h as f64);
     let baseline_bw = effective_video_bitrate(bitrate_cap, item.source_bitrate_bps) + 128_000;
-    let baseline_res = match (item.width, item.height) {
-        (Some(w), Some(h)) => format!(",RESOLUTION={w}x{h}"),
-        _ => String::new(),
-    };
+    let baseline_res = size.main_resolution();
     body.push_str(&format!(
         "#EXT-X-STREAM-INF:BANDWIDTH={baseline_bw},CODECS=\"{codecs}\"{baseline_res}\n\
          /Videos/{id}/main.m3u8?{qs}\n"
     ));
     for v in Variant::ladder_for(item.height, bitrate_cap) {
         let target_h = v.height();
-        let resolution = match aspect_w {
-            Some(ratio) => {
-                let target_w = (ratio * target_h as f64).round() as u32 & !1;
-                format!(",RESOLUTION={target_w}x{target_h}")
-            }
+        let target_w = aspect_w.map(|ratio| (ratio * target_h as f64).round() as u32 & !1);
+        if !size.admits(target_w, target_h) {
+            continue;
+        }
+        let resolution = match target_w {
+            Some(target_w) => format!(",RESOLUTION={target_w}x{target_h}"),
             None => String::new(),
         };
         body.push_str(&format!(
@@ -751,16 +958,13 @@ fn push_h264_rungs(
 /// `EXT-X-STREAM-INF` advertising the vp09+opus CODECS, pointing at the fMP4
 /// `/vp9` surface. Shared by the standalone `vp9_master` route and the unified
 /// master.
-fn push_vp9_rungs(body: &mut String, id: &str, qs: &str, item: &HlsItem) {
+fn push_vp9_rungs(body: &mut String, id: &str, qs: &str, item: &HlsItem, size: MasterSize) {
     let bitrate = target_video_bitrate(item.source_bitrate_bps) + 128_000;
     body.push_str(&format!(
         "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"Audio\",DEFAULT=YES,\
          AUTOSELECT=YES,URI=\"/videos/{id}/vp9/audio.m3u8?{qs}\"\n"
     ));
-    let resolution = match (item.width, item.height) {
-        (Some(w), Some(h)) => format!(",RESOLUTION={w}x{h}"),
-        _ => String::new(),
-    };
+    let resolution = size.main_resolution();
     body.push_str(&format!(
         "#EXT-X-STREAM-INF:BANDWIDTH={bitrate},CODECS=\"{VP9_HLS_CODECS}\",AUDIO=\"aud\"{resolution}\n\
          /videos/{id}/vp9/main.m3u8?{qs}\n"
@@ -791,6 +995,7 @@ fn push_h264_cmaf_rungs(
     item: &HlsItem,
     abr: bool,
     bitrate_cap: Option<u64>,
+    size: MasterSize,
 ) {
     // Without `abr=1` the source rung ignores the cap, as it always has: the
     // master must stay byte-identical for hls.js (V644).
@@ -802,10 +1007,7 @@ fn push_h264_cmaf_rungs(
         "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"Audio\",DEFAULT=YES,\
          AUTOSELECT=YES,URI=\"/videos/{id}/vp9/audio.m3u8?{qs}\"\n"
     ));
-    let resolution = match (item.width, item.height) {
-        (Some(w), Some(h)) => format!(",RESOLUTION={w}x{h}"),
-        _ => String::new(),
-    };
+    let resolution = size.main_resolution();
     body.push_str(&format!(
         "#EXT-X-STREAM-INF:BANDWIDTH={bitrate},CODECS=\"{codecs}\",AUDIO=\"aud\"{resolution}\n\
          /videos/{id}/h264cmaf/main.m3u8?{qs}\n"
@@ -819,11 +1021,12 @@ fn push_h264_cmaf_rungs(
         .map(|(w, h)| w as f64 / h as f64);
     for v in Variant::cmaf_ladder(item.height, item.source_bitrate_bps, bitrate_cap) {
         let target_h = v.height();
-        let resolution = match aspect_w {
-            Some(ratio) => {
-                let target_w = (ratio * target_h as f64).round() as u32 & !1;
-                format!(",RESOLUTION={target_w}x{target_h}")
-            }
+        let target_w = aspect_w.map(|ratio| (ratio * target_h as f64).round() as u32 & !1);
+        if !size.admits(target_w, target_h) {
+            continue;
+        }
+        let resolution = match target_w {
+            Some(target_w) => format!(",RESOLUTION={target_w}x{target_h}"),
             None => String::new(),
         };
         body.push_str(&format!(
@@ -837,7 +1040,7 @@ fn push_h264_cmaf_rungs(
 
 async fn master_playlist(
     state: web::Data<AppState>,
-    user: MediaUser,
+    user: PlaybackUser,
     req: HttpRequest,
     path: web::Path<String>,
 ) -> Result<impl Responder, actix_web::Error> {
@@ -918,6 +1121,11 @@ async fn master_playlist(
 
     // Exactly one codec's rungs — never both. The h264 family shares one muxed
     // audio model across its ladder; the vp9 rung owns its demuxed audio group.
+    let size = MasterSize::of(
+        &item,
+        super::output_size::qs_size_limits(req.query_string()),
+        bitrate_cap,
+    );
     match video {
         MasterVideo::H264 if demuxed_h264 => push_h264_cmaf_rungs(
             &mut body,
@@ -926,9 +1134,10 @@ async fn master_playlist(
             &item,
             qs_abr(req.query_string()),
             bitrate_cap,
+            size,
         ),
-        MasterVideo::H264 => push_h264_rungs(&mut body, &id, &qs, &item, bitrate_cap),
-        MasterVideo::Vp9 => push_vp9_rungs(&mut body, &id, &qs, &item),
+        MasterVideo::H264 => push_h264_rungs(&mut body, &id, &qs, &item, bitrate_cap, size),
+        MasterVideo::Vp9 => push_vp9_rungs(&mut body, &id, &qs, &item, size),
     }
     Ok(HttpResponse::Ok()
         .content_type("application/vnd.apple.mpegurl")
@@ -967,7 +1176,6 @@ fn parse_start_time_ticks_qs(qs: &str) -> u64 {
 /// Returns `None` when no PSID was supplied OR the session has no
 /// bitrate cap recorded.
 async fn extract_session_bitrate_cap(state: &AppState, req: &HttpRequest) -> Option<u64> {
-    use crate::api::jellyfin::device_profile::Decision;
     let psid = req
         .query_string()
         .split('&')
@@ -980,11 +1188,17 @@ async fn extract_session_bitrate_cap(state: &AppState, req: &HttpRequest) -> Opt
         .await
         .ok()
         .flatten()?;
-    match session.decision {
+    decision_video_cap(&session.decision)
+}
+
+/// The video bitrate ceiling a negotiated transcode carries.
+fn decision_video_cap(decision: &crate::api::jellyfin::device_profile::Decision) -> Option<u64> {
+    use crate::api::jellyfin::device_profile::Decision;
+    match decision {
         Decision::Transcode {
             max_video_bitrate_bps,
             ..
-        } => max_video_bitrate_bps,
+        } => *max_video_bitrate_bps,
         _ => None,
     }
 }
@@ -1018,7 +1232,7 @@ async fn session_burn_indices(
 
 async fn variant_playlist_main(
     state: web::Data<AppState>,
-    user: MediaUser,
+    user: PlaybackUser,
     req: HttpRequest,
     path: web::Path<String>,
 ) -> Result<impl Responder, actix_web::Error> {
@@ -1028,7 +1242,7 @@ async fn variant_playlist_main(
 
 async fn variant_playlist_named(
     state: web::Data<AppState>,
-    user: MediaUser,
+    user: PlaybackUser,
     req: HttpRequest,
     path: web::Path<(String, String)>,
 ) -> Result<impl Responder, actix_web::Error> {
@@ -1041,7 +1255,7 @@ async fn variant_playlist_named(
 
 async fn render_variant_playlist(
     state: web::Data<AppState>,
-    user: MediaUser,
+    user: PlaybackUser,
     req: HttpRequest,
     id: String,
     variant: &str,
@@ -1060,6 +1274,12 @@ async fn render_variant_playlist(
         // Lowercase: T31 routes are registered lowercase; emit the canonical
         // form so HLS players don't pay a middleware rewrite per segment.
         segment_uri: &|seg| format!("/videos/{id}/hls1/{variant}/{seg}.ts?{qs}"),
+        parts: playlist_parts(
+            &item,
+            &qs,
+            |_| None,
+            |qs, seg| format!("/videos/{id}/hls1/{variant}/{seg}.ts?{qs}"),
+        ),
     }
     .render(item.duration_seconds, item.frame_rate_mille);
     Ok(HttpResponse::Ok()
@@ -1100,7 +1320,7 @@ where
 
 async fn segment_main(
     state: web::Data<AppState>,
-    user: MediaUser,
+    user: PlaybackUser,
     req: HttpRequest,
     path: web::Path<(String, u32)>,
     q: CiQuery<SegmentQuery>,
@@ -1111,7 +1331,7 @@ async fn segment_main(
 
 async fn segment_named(
     state: web::Data<AppState>,
-    user: MediaUser,
+    user: PlaybackUser,
     req: HttpRequest,
     path: web::Path<(String, String, u32)>,
     q: CiQuery<SegmentQuery>,
@@ -1124,7 +1344,7 @@ async fn segment_named(
 
 async fn serve_segment(
     state: web::Data<AppState>,
-    user: MediaUser,
+    user: PlaybackUser,
     req: HttpRequest,
     id: String,
     seg: u32,
@@ -1272,6 +1492,21 @@ async fn serve_segment(
         opts.video_bitrate_bps,
     ) {
         opts.video_bitrate_bps = Some(cur.min(cap).clamp(HLS_MIN_BITRATE_BPS, HLS_MAX_BITRATE_BPS));
+    }
+    // Spec 035 — downscale to the client's MaxWidth/MaxHeight, to the ladder
+    // rung's own height, and to the rung the capped bitrate can carry. After
+    // every bitrate decision above: the bitrate picks the rung.
+    {
+        let (limits, capped) = output_size_bounds(
+            super::output_size::qs_size_limits(req.query_string()),
+            session_cap,
+            qs_video_bitrate_cap(req.query_string()),
+            match variant {
+                Some(AnyVariant::Video(vv)) => Some(vv.height()),
+                _ => None,
+            },
+        );
+        apply_output_size(&mut opts, &item.probe, limits, capped);
     }
 
     // B51 — the client's ACTUAL subtitle pick (codec-relative, pre-gate), so
@@ -1778,6 +2013,8 @@ fn build_segment_opts(
                     video_3d_format,
                     stereo_output: pharos_transcode::StereoOutput::Preserve,
                     tonemap: source_tonemap(&item.probe),
+                    output_size: None,
+                    output_scale_reason: None,
                 };
             }
             // P9/B45 — VideoRemux (video codec compatible, container/audio
@@ -1815,6 +2052,8 @@ fn build_segment_opts(
                     video_3d_format,
                     stereo_output: pharos_transcode::StereoOutput::Preserve,
                     tonemap: source_tonemap(&item.probe),
+                    output_size: None,
+                    output_scale_reason: None,
                 };
             }
             _ => {}
@@ -1852,6 +2091,8 @@ fn build_segment_opts(
         video_3d_format,
         stereo_output: pharos_transcode::StereoOutput::Preserve,
         tonemap: source_tonemap(&item.probe),
+        output_size: None,
+        output_scale_reason: None,
     }
 }
 
@@ -1863,7 +2104,7 @@ const BURN_GATE_PAD_MS: u64 = 500;
 
 /// B46 — per-segment burn gating. Image-subtitle burn (overlay decode +
 /// composite + re-encode) runs BELOW realtime for VP9 (~6-11 s per 6 s
-/// segment observed live, B44 rollout), yet a forced track (the Na'vi
+/// segment observed live, B44 rollout), yet a forced track (the alien-language
 /// case) is SPARSE — most segments contain no event at all. Strip the
 /// burn index when the track's event-window timeline proves this segment
 /// empty: the segment takes the plain fast path AND shares its cache key
@@ -2103,8 +2344,13 @@ fn qs_stereo_output(qs: &str) -> Option<pharos_transcode::StereoOutput> {
 
 fn playback_qs(req: &HttpRequest) -> String {
     let mut parts: Vec<String> = Vec::new();
-    if let Some(t) = extract_token(req) {
-        parts.push(format!("api_key={t}"));
+    // A request bound to its play session hands that capability on through
+    // the PlaySessionId below; only an unbound one still needs its token
+    // copied into each URL (V1050).
+    if !play_capability::is_bound(req) {
+        if let Some(t) = extract_token(req) {
+            parts.push(format!("api_key={t}"));
+        }
     }
     for kv in req.query_string().split('&') {
         if let Some((k, v)) = kv.split_once('=') {
@@ -2130,6 +2376,10 @@ fn playback_qs(req: &HttpRequest) -> String {
                 parts.push(format!("VideoBitrate={v}"));
             } else if k.eq_ignore_ascii_case("StereoMode") {
                 parts.push(format!("StereoMode={v}"));
+            } else if super::output_size::is_size_key(k) {
+                // The client's frame bound rides master -> variant -> segment
+                // so every rung is scaled to it.
+                parts.push(format!("{k}={v}"));
             } else if k.eq_ignore_ascii_case("MediaSourceId") {
                 // The edition the master was built from; without it the
                 // variant and its segments would read the item's own file.
@@ -2161,7 +2411,7 @@ const VP9_HLS_CODECS: &str = "vp09.00.40.08,opus";
 /// the H.264 master. jellyfin-web loads this as the negotiated TranscodingUrl.
 async fn vp9_master(
     state: web::Data<AppState>,
-    user: MediaUser,
+    user: PlaybackUser,
     req: HttpRequest,
     path: web::Path<String>,
 ) -> Result<HttpResponse, actix_web::Error> {
@@ -2176,7 +2426,16 @@ async fn vp9_master(
     // with the unified master via `push_vp9_rungs`.
     let mut body = String::new();
     body.push_str("#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-INDEPENDENT-SEGMENTS\n");
-    push_vp9_rungs(&mut body, &id, &qs, &item);
+    let bitrate_cap = min_opt(
+        extract_session_bitrate_cap(&state, &req).await,
+        qs_video_bitrate_cap(req.query_string()),
+    );
+    let size = MasterSize::of(
+        &item,
+        super::output_size::qs_size_limits(req.query_string()),
+        bitrate_cap,
+    );
+    push_vp9_rungs(&mut body, &id, &qs, &item, size);
     Ok(HttpResponse::Ok()
         .content_type("application/vnd.apple.mpegurl")
         .insert_header(playlist_cache_control(true))
@@ -2193,7 +2452,7 @@ async fn vp9_master(
 /// as a separate rendition the player syncs the two by PTS.
 async fn vp9_audio_playlist(
     state: web::Data<AppState>,
-    user: MediaUser,
+    user: PlaybackUser,
     req: HttpRequest,
     path: web::Path<String>,
     q: CiQuery<SegmentQuery>,
@@ -2226,10 +2485,8 @@ async fn vp9_audio_playlist(
     // timeline to a single 6 s segment — the client could then only seek within
     // the first segment (the same `.max(1)` truncation the video variant
     // already guards against via this path).
-    let duration = load_hls_item(&state, &req, &user.0, &id)
-        .await?
-        .duration_seconds
-        .max(0.0);
+    let hls_item = load_hls_item(&state, &req, &user.0, &id).await?;
+    let duration = hls_item.duration_seconds.max(0.0);
     // B105 — the audio rendition enumerates the SAME grid the video variant
     // does, so a client maps a time to the same index on both. Going through
     // the shared renderer is what keeps that true.
@@ -2244,6 +2501,12 @@ async fn vp9_audio_playlist(
         // which carries the seek target.
         start_offset_secs: None,
         segment_uri: &|seg| format!("/videos/{id}/vp9/audio/a{seg}.m4s?{qs}"),
+        parts: playlist_parts(
+            &hls_item,
+            &qs,
+            |qs| Some(format!("/videos/{id}/vp9/audio/init.mp4?{qs}")),
+            |qs, seg| format!("/videos/{id}/vp9/audio/a{seg}.m4s?{qs}"),
+        ),
     }
     .render(duration, item.probe.frame_rate_mille);
     Ok(HttpResponse::Ok()
@@ -2258,7 +2521,7 @@ async fn vp9_audio_playlist(
 /// requested before the playlist still works.
 async fn vp9_audio_file(
     state: web::Data<AppState>,
-    user: MediaUser,
+    user: PlaybackUser,
     req: HttpRequest,
     path: web::Path<(String, String)>,
     q: CiQuery<SegmentQuery>,
@@ -2274,7 +2537,7 @@ async fn vp9_audio_file(
     // B42 — tell the cache WHICH segment this request needs: a deep seek
     // (segment far past the running from-0 session's progress) spawns a
     // second, seeked session instead of 404ing "not ready" until the
-    // whole-file encode crawls there (observed live: Avatar seek to ~1h40m
+    // whole-file encode crawls there (observed live: Film BA seek to ~1h40m
     // → a996.m4s 404 → hls.js stalled the seek).
     let want_seg = name
         .strip_prefix('a')
@@ -2296,7 +2559,7 @@ async fn vp9_audio_file(
         .audio_hls_file(&dir, &name)
         .await
         // Carry the cache's give-up reason into the response body. A bare
-        // "audio segment not ready" made the Ghost in the Shell stall
+        // "audio segment not ready" made the Film AH stall
         // indistinguishable from a request past the end of the media, and
         // reconstructing which of the three budgets expired took a code read.
         .map_err(|e| error::ErrorNotFound(e.to_string()))?;
@@ -2412,7 +2675,7 @@ async fn vp9_audio_file(
 /// duration, identical to the H.264 variant.
 async fn vp9_variant(
     state: web::Data<AppState>,
-    user: MediaUser,
+    user: PlaybackUser,
     req: HttpRequest,
     path: web::Path<String>,
 ) -> Result<HttpResponse, actix_web::Error> {
@@ -2426,6 +2689,12 @@ async fn vp9_variant(
         init_uri: Some(format!("/videos/{id}/vp9/init.mp4?{qs}")),
         start_offset_secs: resume_offset_secs(&req),
         segment_uri: &|seg| format!("/videos/{id}/vp9/{seg}.m4s?{qs}"),
+        parts: playlist_parts(
+            &item,
+            &qs,
+            |qs| Some(format!("/videos/{id}/vp9/init.mp4?{qs}")),
+            |qs, seg| format!("/videos/{id}/vp9/{seg}.m4s?{qs}"),
+        ),
     }
     .render(item.duration_seconds, item.frame_rate_mille);
     Ok(HttpResponse::Ok()
@@ -2439,7 +2708,7 @@ async fn vp9_variant(
 /// identical across a source's segments, so segment 0 is representative.
 async fn vp9_init(
     state: web::Data<AppState>,
-    user: MediaUser,
+    user: PlaybackUser,
     req: HttpRequest,
     path: web::Path<String>,
     q: CiQuery<SegmentQuery>,
@@ -2489,7 +2758,7 @@ async fn vp9_init(
 /// Serve one VP9 fMP4 media segment (`moof`+`mdat`, `tfdt`-corrected).
 async fn vp9_segment(
     state: web::Data<AppState>,
-    user: MediaUser,
+    user: PlaybackUser,
     req: HttpRequest,
     path: web::Path<(String, u32)>,
     q: CiQuery<SegmentQuery>,
@@ -2608,7 +2877,7 @@ async fn vp9_segment(
 /// tracks — an audio switch reuses it instead of cold-re-transcoding.
 async fn h264cmaf_variant(
     state: web::Data<AppState>,
-    user: MediaUser,
+    user: PlaybackUser,
     req: HttpRequest,
     path: web::Path<String>,
 ) -> Result<HttpResponse, actix_web::Error> {
@@ -2618,7 +2887,7 @@ async fn h264cmaf_variant(
 /// `GET /videos/{id}/h264cmaf/{rung}/main.m3u8` — one `abr=1` ladder rung.
 async fn h264cmaf_rung_variant(
     state: web::Data<AppState>,
-    user: MediaUser,
+    user: PlaybackUser,
     req: HttpRequest,
     path: web::Path<(String, String)>,
 ) -> Result<HttpResponse, actix_web::Error> {
@@ -2651,7 +2920,7 @@ fn cmaf_rung_bitrate(current: Option<u64>, rung: Option<Variant>) -> Option<u64>
 
 async fn h264cmaf_variant_for(
     state: web::Data<AppState>,
-    user: MediaUser,
+    user: PlaybackUser,
     req: HttpRequest,
     id: String,
     rung: Option<Variant>,
@@ -2666,6 +2935,12 @@ async fn h264cmaf_variant_for(
         init_uri: Some(format!("{base}/init.mp4?{qs}")),
         start_offset_secs: resume_offset_secs(&req),
         segment_uri: &|seg| format!("{base}/{seg}.m4s?{qs}"),
+        parts: playlist_parts(
+            &item,
+            &qs,
+            |qs| Some(format!("{base}/init.mp4?{qs}")),
+            |qs, seg| format!("{base}/{seg}.m4s?{qs}"),
+        ),
     }
     .render(item.duration_seconds, item.frame_rate_mille);
     Ok(HttpResponse::Ok()
@@ -2677,7 +2952,7 @@ async fn h264cmaf_variant_for(
 /// `GET /videos/{id}/h264cmaf/init.mp4` — shared h264 fMP4 init (`ftyp`+`moov`).
 async fn h264cmaf_init(
     state: web::Data<AppState>,
-    user: MediaUser,
+    user: PlaybackUser,
     req: HttpRequest,
     path: web::Path<String>,
     q: CiQuery<SegmentQuery>,
@@ -2688,7 +2963,7 @@ async fn h264cmaf_init(
 /// `GET /videos/{id}/h264cmaf/{rung}/init.mp4` — one ladder rung's init.
 async fn h264cmaf_rung_init(
     state: web::Data<AppState>,
-    user: MediaUser,
+    user: PlaybackUser,
     req: HttpRequest,
     path: web::Path<(String, String)>,
     q: CiQuery<SegmentQuery>,
@@ -2700,7 +2975,7 @@ async fn h264cmaf_rung_init(
 
 async fn h264cmaf_init_for(
     state: web::Data<AppState>,
-    user: MediaUser,
+    user: PlaybackUser,
     req: HttpRequest,
     id: String,
     rung: Option<Variant>,
@@ -2731,6 +3006,7 @@ async fn h264cmaf_init_for(
     )
     .await;
     opts.video_bitrate_bps = cmaf_rung_bitrate(opts.video_bitrate_bps, rung);
+    apply_rung_output_size(&mut opts, &item.probe, req.query_string(), rung);
     {
         let (start_secs, dur_secs) = segment_time_range(0, item.probe.frame_rate_mille);
         gate_image_sub_burn(&state, &item, &mut opts, start_secs, dur_secs).await;
@@ -2755,7 +3031,7 @@ async fn h264cmaf_init_for(
 /// segment. Mirrors [`vp9_segment`] with the h264 output codec.
 async fn h264cmaf_segment(
     state: web::Data<AppState>,
-    user: MediaUser,
+    user: PlaybackUser,
     req: HttpRequest,
     path: web::Path<(String, u32)>,
     q: CiQuery<SegmentQuery>,
@@ -2767,7 +3043,7 @@ async fn h264cmaf_segment(
 /// `GET /videos/{id}/h264cmaf/{rung}/{seg}.m4s` — one ladder rung's segment.
 async fn h264cmaf_rung_segment(
     state: web::Data<AppState>,
-    user: MediaUser,
+    user: PlaybackUser,
     req: HttpRequest,
     path: web::Path<(String, String, u32)>,
     q: CiQuery<SegmentQuery>,
@@ -2779,7 +3055,7 @@ async fn h264cmaf_rung_segment(
 
 async fn h264cmaf_segment_for(
     state: web::Data<AppState>,
-    user: MediaUser,
+    user: PlaybackUser,
     req: HttpRequest,
     id: String,
     rung: Option<Variant>,
@@ -2829,6 +3105,7 @@ async fn h264cmaf_segment_for(
     )
     .await;
     opts.video_bitrate_bps = cmaf_rung_bitrate(opts.video_bitrate_bps, rung);
+    apply_rung_output_size(&mut opts, &item.probe, req.query_string(), rung);
     let wanted_burn = opts.burn_subtitle_stream_index;
     {
         let (start_secs, dur_secs) = segment_time_range(seg, item.probe.frame_rate_mille);
@@ -2980,6 +3257,17 @@ struct MediaPlaylist<'a> {
     /// stay byte-identical to what they were before this existed.
     cache_epoch: u32,
     segment_uri: &'a dyn Fn(u32) -> String,
+    /// Spec 037 — a split film's later parts, each listed after a
+    /// discontinuity with its own init and segments (V1154).
+    parts: Vec<PlaylistPart<'a>>,
+}
+
+/// One later part of a split film in its film's media playlist.
+struct PlaylistPart<'a> {
+    duration_secs: f64,
+    frame_rate_mille: Option<u32>,
+    init_uri: Option<String>,
+    segment_uri: Box<dyn Fn(u32) -> String + 'a>,
 }
 
 /// This item's cache epoch, or 0 when there is no cache attached.
@@ -3043,6 +3331,24 @@ impl MediaPlaylist<'_> {
                 self.cache_epoch,
             ));
             body.push('\n');
+        }
+        // Each part's segments run on its own file's timeline, so the player
+        // is told the timestamps restart (and, for fMP4, given the part's own
+        // init, since its codec setup may differ).
+        for part in &self.parts {
+            body.push_str("#EXT-X-DISCONTINUITY\n");
+            if let Some(uri) = &part.init_uri {
+                let uri = with_cache_epoch(uri, self.cache_epoch);
+                body.push_str(&format!("#EXT-X-MAP:URI=\"{uri}\"\n"));
+            }
+            for (seg, _start, len) in playlist_segments(part.duration_secs, part.frame_rate_mille) {
+                body.push_str(&format!("#EXTINF:{len:.3},\n"));
+                body.push_str(&with_cache_epoch(
+                    &(part.segment_uri)(seg),
+                    self.cache_epoch,
+                ));
+                body.push('\n');
+            }
         }
         body.push_str("#EXT-X-ENDLIST\n");
         body
@@ -3294,6 +3600,7 @@ pub(super) fn prewarm_cold_start(
     audio_stream_index: Option<u32>,
     subtitle_stream_index: Option<u32>,
     video_bitrate_cap: Option<u64>,
+    size_limits: pharos_transcode::SizeLimits,
     resume_ticks: u64,
     demuxed_cmaf: bool,
     media_source_id: Option<String>,
@@ -3348,6 +3655,7 @@ pub(super) fn prewarm_cold_start(
         let Some(base) = base else {
             return;
         };
+        let session_cap = decision_video_cap(&session.decision);
         for seg in base..(base + COLD_START_PREWARM_SEGS).min(total_segs) {
             let state = state.clone();
             let item = item.clone();
@@ -3392,6 +3700,12 @@ pub(super) fn prewarm_cold_start(
                     }
                     opts
                 };
+                // serve_segment's downscale, planned by the same function from
+                // the same inputs: the URL's MaxWidth/MaxHeight and the session
+                // and URL bitrate caps.
+                let (limits, capped) =
+                    output_size_bounds(size_limits, session_cap, video_bitrate_cap, None);
+                apply_output_size(&mut opts, &item.probe, limits, capped);
                 // Same per-segment burn gating serve_segment applies before the
                 // cache read (the burn index is part of the key).
                 gate_image_sub_burn(&state, &item, &mut opts, start_secs, dur_secs).await;
@@ -3737,6 +4051,12 @@ async fn fmp4_segment_opts(
     if let Some(so) = qs_stereo_output(req.query_string()) {
         opts.stereo_output = so;
     }
+    apply_output_size(
+        &mut opts,
+        &item.probe,
+        super::output_size::qs_size_limits(req.query_string()),
+        cap.is_some(),
+    );
     opts
 }
 
@@ -3849,6 +4169,8 @@ fn fmp4_segment_opts_resolved(
         video_3d_format: item.probe.video_3d_format,
         stereo_output: pharos_transcode::StereoOutput::Preserve,
         tonemap: source_tonemap(&item.probe),
+        output_size: None,
+        output_scale_reason: None,
     }
 }
 
@@ -4131,7 +4453,7 @@ mod tests {
 
     #[::core::prelude::v1::test]
     fn segments_are_seeked_half_a_frame_early_so_no_frame_falls_between_them() {
-        // Measured against a real 23.976 fps HEVC source (Fringe S01E01): a
+        // Measured against a real 23.976 fps HEVC source (Show AW S01E01): a
         // frame sat at 12.011997, microseconds BELOW the 12.012000 boundary.
         // Seeking segment N+1 to exactly the boundary excluded it (pts below
         // the seek) while segment N's `-t` also excluded it (it fell on the
@@ -4372,6 +4694,7 @@ mod tests {
         let token = stores.issue(uid, "t").await.unwrap();
         stores
             .put(MediaItem {
+                locked: Default::default(),
                 id: 9,
                 path: "/nonexistent.mkv".into(),
                 title: "m".into(),
@@ -5047,6 +5370,7 @@ mod tests {
 
     fn item_with_video_codec(codec: Option<&str>) -> pharos_core::MediaItem {
         pharos_core::MediaItem {
+            locked: Default::default(),
             id: 1,
             path: "/x".into(),
             title: "t".into(),
@@ -5597,6 +5921,71 @@ mod tests {
         assert!(s.contains("BANDWIDTH=3128000"), "{s}");
     }
 
+    async fn master_for(probe: pharos_core::MediaProbe, query: &str, web: bool) -> String {
+        let (state, token) = seed_with_probe(probe).await;
+        let app = test::init_service(App::new().app_data(state).configure(register)).await;
+        let mut req =
+            test::TestRequest::get().uri(&format!("/videos/9/master.m3u8?api_key={token}{query}"));
+        if web {
+            req = req.insert_header((
+                actix_web::http::header::USER_AGENT,
+                "Mozilla/5.0 (X11; Linux x86_64) Firefox/152.0",
+            ));
+        }
+        let body = test::call_and_read_body(&app, req.to_request()).await;
+        String::from_utf8(body.to_vec()).unwrap()
+    }
+
+    fn probe_4k() -> pharos_core::MediaProbe {
+        pharos_core::MediaProbe {
+            duration_ms: Some(10_000),
+            width: Some(3840),
+            height: Some(2160),
+            bitrate_bps: Some(20_000_000),
+            ..Default::default()
+        }
+    }
+
+    #[actix_web::test]
+    async fn the_master_advertises_the_size_the_main_rendition_is_encoded_at() {
+        let s = master_for(probe_4k(), "&MaxWidth=1920", false).await;
+        let main_inf = s
+            .lines()
+            .zip(s.lines().skip(1))
+            .find(|(_, u)| u.contains("/Videos/9/main.m3u8"))
+            .map(|(inf, _)| inf)
+            .unwrap();
+        assert!(main_inf.contains("RESOLUTION=1920x1080"), "{s}");
+        // And never the 4K source.
+        assert!(!s.contains("RESOLUTION=3840x2160"), "{s}");
+    }
+
+    #[actix_web::test]
+    async fn the_master_drops_rungs_taller_than_max_height() {
+        let s = master_for(probe_4k(), "&MaxHeight=720", false).await;
+        for name in ["1080p", "1440p", "2160p"] {
+            assert!(!s.contains(&format!("variants/{name}.m3u8")), "{name}: {s}");
+        }
+        for name in ["720p", "480p"] {
+            assert!(s.contains(&format!("variants/{name}.m3u8")), "{name}: {s}");
+        }
+        assert!(
+            s.contains("RESOLUTION=1280x720"),
+            "main is bounded too: {s}"
+        );
+        // Unbounded: the master is what it was.
+        let all = master_for(probe_4k(), "", false).await;
+        assert!(all.contains("RESOLUTION=3840x2160"), "{all}");
+    }
+
+    #[actix_web::test]
+    async fn the_cmaf_master_advertises_the_bounded_size_too() {
+        let s = master_for(probe_4k(), "&renditions=h264&abr=1&MaxHeight=720", true).await;
+        assert!(s.contains("RESOLUTION=1280x720"), "{s}");
+        assert!(!s.contains("RESOLUTION=3840x2160"), "{s}");
+        assert!(!s.contains("h264cmaf/1080p/"), "{s}");
+    }
+
     #[actix_web::test]
     async fn variant_playlist_unknown_name_404s() {
         let (state, token) = seed().await;
@@ -5645,6 +6034,7 @@ mod tests {
             init_uri: None,
             start_offset_secs: None,
             segment_uri: &uri,
+            parts: Vec::new(),
         }
         .render(20.0, Some(23_976));
 
@@ -5656,6 +6046,7 @@ mod tests {
             init_uri: Some("/videos/9/h264cmaf/init.mp4?q=1".into()),
             start_offset_secs: Some(12.5),
             segment_uri: &cmaf_uri,
+            parts: Vec::new(),
         }
         .render(20.0, Some(23_976));
 
@@ -5714,6 +6105,7 @@ mod tests {
             init_uri: None,
             start_offset_secs: None,
             segment_uri: &uri,
+            parts: Vec::new(),
         }
         .render(20.0, Some(23_976));
         let expected: Vec<(u32, f64, f64)> = playlist_segments(20.0, Some(23_976)).collect();
@@ -5741,6 +6133,7 @@ mod tests {
             init_uri: None,
             start_offset_secs: None,
             segment_uri: &uri,
+            parts: Vec::new(),
         }
         .render(12.0, None);
         assert!(!body.contains("#EXT-X-START"), "{body}");
@@ -5789,7 +6182,7 @@ mod tests {
         );
 
         // A local item resolves to itself, resolver or no resolver.
-        let local = std::path::Path::new("/media/Movies/Arrival.mkv");
+        let local = std::path::Path::new("/media/Movies/Film BC.mkv");
         assert_eq!(
             transcode_source(&state, local, true)
                 .await
@@ -5810,7 +6203,7 @@ mod tests {
         let req = actix_web::test::TestRequest::get()
             .uri("/videos/9/h264cmaf.m3u8?PlaySessionId=abc")
             .to_http_request();
-        let local = std::path::Path::new("/media/Movies/Arrival.mkv");
+        let local = std::path::Path::new("/media/Movies/Film BC.mkv");
         let qs = rendition_qs(&req, local, None);
         assert!(
             qs.ends_with(&format!("g={gen}")),
@@ -5888,7 +6281,7 @@ mod tests {
 
         // A grouped edition's file shares its item's id, so its URLs must
         // differ from the primary's or a browser holds the wrong init.
-        let edition = std::path::Path::new("/media/Movies/Arrival - 3D.HSBS.mkv");
+        let edition = std::path::Path::new("/media/Movies/Film BC - 3D.HSBS.mkv");
         let eg = pharos_cache::hls_cache::SourceGen::for_read(edition, Some("3d-hsbs"));
         assert_eq!(
             rendition_qs(&bare, edition, Some("3d-hsbs")),
@@ -5911,6 +6304,72 @@ mod tests {
         );
     }
 
+    /// V1154 — a split film's playlist lists each later part after a
+    /// discontinuity, with the part's own init and segments, all reading the
+    /// part's file through its media source id.
+    #[::core::prelude::v1::test]
+    fn a_split_films_playlist_runs_on_into_its_parts() {
+        let part = HlsPart {
+            source_id: "0000000000000000000000000000002a-part-2".into(),
+            path: "/m/G/G (2003) cd2.mp4".into(),
+            edition: "part-2".into(),
+            duration_seconds: 9.0,
+            frame_rate_mille: Some(25_000),
+        };
+        let qs = "PlaySessionId=p&MediaSourceId=0000000000000000000000000000002a&g=17";
+        // A part shares its film's id, so its segments carry its own source
+        // generation, as an edition's do.
+        assert!(
+            part_qs(qs, &part).starts_with(
+                "PlaySessionId=p&g=17&MediaSourceId=0000000000000000000000000000002a-part-2&s="
+            ),
+            "{}",
+            part_qs(qs, &part)
+        );
+        let part_qs_value = part_qs(qs, &part);
+        let pl = MediaPlaylist {
+            version: 7,
+            independent_segments: true,
+            init_uri: Some(format!("/videos/7/vp9/init.mp4?{qs}")),
+            start_offset_secs: None,
+            cache_epoch: 0,
+            segment_uri: &|seg| format!("/videos/7/vp9/{seg}.m4s?{qs}"),
+            parts: vec![PlaylistPart {
+                duration_secs: part.duration_seconds,
+                frame_rate_mille: part.frame_rate_mille,
+                init_uri: Some(format!("/videos/7/vp9/init.mp4?{part_qs_value}")),
+                segment_uri: Box::new(|seg| {
+                    format!("/videos/7/vp9/{seg}.m4s?{}", part_qs(qs, &part))
+                }),
+            }],
+        };
+        let body = pl.render(12.0, Some(25_000));
+        let lines: Vec<&str> = body.lines().collect();
+        let at = lines
+            .iter()
+            .position(|l| *l == "#EXT-X-DISCONTINUITY")
+            .expect("a discontinuity before the second part");
+        assert_eq!(
+            lines.get(at + 1).copied(),
+            Some(format!("#EXT-X-MAP:URI=\"/videos/7/vp9/init.mp4?{part_qs_value}\"").as_str())
+        );
+        let first: Vec<_> = lines[..at]
+            .iter()
+            .filter(|l| l.starts_with("/videos/"))
+            .collect();
+        let second: Vec<_> = lines[at..]
+            .iter()
+            .filter(|l| l.starts_with("/videos/"))
+            .collect();
+        assert_eq!(first.len(), 2, "{body}");
+        assert_eq!(second.len(), 2, "{body}");
+        assert!(
+            second[0].starts_with("/videos/7/vp9/0.m4s?") && second[0].contains("-part-2&s="),
+            "{body}"
+        );
+        assert_eq!(lines.last().copied(), Some("#EXT-X-ENDLIST"));
+    }
+
     /// T121 — the epoch, when set, must reach the URLs a client is handed.
     #[::core::prelude::v1::test]
     fn a_cache_epoch_is_stamped_onto_segment_and_init_uris() {
@@ -5921,6 +6380,7 @@ mod tests {
             start_offset_secs: None,
             cache_epoch: 3,
             segment_uri: &|seg| format!("/videos/7/h264cmaf/{seg}.m4s?g=17"),
+            parts: Vec::new(),
         };
         let body = pl.render(12.0, Some(24_000));
         assert!(
@@ -5947,6 +6407,7 @@ mod tests {
             start_offset_secs: None,
             cache_epoch: 0,
             segment_uri: &|seg| format!("/videos/7/h264cmaf/{seg}.m4s?g=17"),
+            parts: Vec::new(),
         };
         let body = pl.render(12.0, Some(24_000));
         assert!(!body.contains("e="), "no epoch parameter at all: {body}");
@@ -6014,8 +6475,14 @@ mod prewarm_edition_tests {
             .await
             .unwrap();
         let bin = dir.join("stub-ffmpeg");
-        // Above the cache's 64-byte floor for a truncated segment.
-        std::fs::write(&bin, format!("#!/bin/sh\nprintf '{}'\n", "s".repeat(128))).unwrap();
+        // The smallest box sequence the cache will publish for an fMP4
+        // rendition (ftyp, moov, moof, mdat), and above its 64-byte floor.
+        let boxes = format!(
+            "\\000\\000\\000\\014ftypiso6\\000\\000\\000\\020moov{s8}\\000\\000\\000\\020moof{s8}\\000\\000\\000\\150mdat{s96}",
+            s8 = "s".repeat(8),
+            s96 = "s".repeat(96),
+        );
+        std::fs::write(&bin, format!("#!/bin/sh\nprintf '{boxes}'\n")).unwrap();
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
         // A subdirectory: the cache wipes everything else in its root.
         let cache =
@@ -6029,11 +6496,14 @@ mod prewarm_edition_tests {
     /// whatever is there after the timeout.
     async fn warmed(root: &Path, want: usize) -> Vec<String> {
         let mut names = Vec::new();
+        // Only finished segments count: an encode in flight is a
+        // `{name}.{n}.ts.tmp` until its rename, and a slow runner can show
+        // `want` of those before any segment lands.
         for _ in 0..200 {
             names = std::fs::read_dir(root.join("7"))
                 .map(|d| {
                     d.filter_map(|e| e.ok()?.file_name().into_string().ok())
-                        .filter(|n| !n.ends_with(".prov.json"))
+                        .filter(|n| !n.ends_with(".prov.json") && !n.ends_with(".tmp"))
                         .collect()
                 })
                 .unwrap_or_default();
@@ -6086,6 +6556,95 @@ mod prewarm_edition_tests {
         );
     }
 
+    /// The prewarm exists to be READ. A bounded client's segment request must
+    /// land on the file the prewarm wrote: same size, same name, no second
+    /// encode. (The unbounded prewarm used to key the full-size name and the
+    /// client's `MaxWidth` request missed it.)
+    #[actix_web::test]
+    async fn the_cold_start_prewarm_writes_the_name_a_bounded_request_reads() {
+        let td = tempfile::TempDir::new().unwrap();
+        let (state, root, _edition) = seed(td.path()).await;
+        let session = crate::transcode_sessions::TranscodeSession {
+            media_id: 7,
+            decision: crate::api::jellyfin::device_profile::Decision::Transcode {
+                target_container: "ts".into(),
+                target_video_codec: Some("h264".into()),
+                target_audio_codec: Some("aac".into()),
+                max_video_bitrate_bps: None,
+            },
+            source_probe: MediaProbe::default(),
+            burn_subtitle_indices: Default::default(),
+            holder: pharos_core::SessionHolder {
+                user_id: pharos_core::UserId::new(),
+                token_id: "test-token-id".into(),
+            },
+        };
+        // What PlaybackInfo does with `MaxWidth=1280`: bake it into the URL the
+        // prewarm and the client both read.
+        let url = "/videos/7/master.m3u8?PlaySessionId=ps-bound&renditions=h264&MaxWidth=1280";
+        prewarm_cold_start(
+            &state,
+            session,
+            "ps-bound",
+            None,
+            None,
+            None,
+            super::super::output_size::qs_size_limits(url),
+            0,
+            true,
+            None,
+        );
+        let want = COLD_START_PREWARM_SEGS as usize;
+        let warmed_names = warmed(&root, want).await;
+        assert_eq!(warmed_names.len(), want, "{warmed_names:?}");
+        assert!(
+            warmed_names.iter().all(|n| n.ends_with("_1280x720.ts")),
+            "every prewarmed segment is keyed by the bounded size: {warmed_names:?}"
+        );
+
+        // The client's own request, through the production request-side builder.
+        let item = super::super::media_source::load_named(
+            &state,
+            super::super::media_source::Route::Hls,
+            7,
+            None,
+        )
+        .await
+        .unwrap();
+        let req = actix_web::test::TestRequest::get()
+            .uri("/videos/7/h264cmaf/main/0.m4s?PlaySessionId=ps-bound&MaxWidth=1280")
+            .to_http_request();
+        let opts = fmp4_segment_opts(&state, &req, &item, 0, SegmentVideo::H264, None, None).await;
+        assert_eq!(
+            opts.output_size,
+            pharos_transcode::OutputSize::new(1280, 720),
+            "the request plans the size the prewarm did"
+        );
+        state
+            .hls
+            .as_ref()
+            .unwrap()
+            .segment_bytes_keyed(
+                item.id,
+                0,
+                opts.audio_source_stream_index,
+                opts.burn_subtitle_stream_index,
+                &item.path,
+                item.edition.as_deref(),
+                &opts,
+                JobClass::Interactive,
+                StreamKey::of("ps-bound"),
+                PlayheadSeed::StatesTheStart,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            warmed(&root, want + 1).await.len(),
+            want,
+            "the request read a prewarmed file instead of encoding its own"
+        );
+    }
+
     #[actix_web::test]
     async fn a_cold_start_warms_the_edition_playback_info_negotiated() {
         let td = tempfile::TempDir::new().unwrap();
@@ -6115,6 +6674,7 @@ mod prewarm_edition_tests {
             None,
             None,
             None,
+            pharos_transcode::SizeLimits::default(),
             0,
             true,
             Some(format!(

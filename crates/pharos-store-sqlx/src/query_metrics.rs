@@ -51,7 +51,10 @@ mod tests {
 
     use super::*;
     use metrics_util::debugging::{DebugValue, DebuggingRecorder};
-    use pharos_core::{MediaQuery, MediaStore, UserDataStore, UserId};
+    use pharos_core::{
+        CollectionStore, MediaQuery, MediaStore, PersonStore, StudioStore, TagStore, TokenStore,
+        UserDataStore, UserId, UserStore,
+    };
 
     fn observations(
         snapshotter: &pharos_test_metrics::CumulativeSnapshotter,
@@ -156,22 +159,51 @@ mod tests {
                     .unwrap();
                 store.query(&MediaQuery::default()).await.unwrap();
                 let _ = MediaStore::get(&store, 1).await;
+                store.get_many(&[1, 2]).await.unwrap();
                 store.get_user_data(UserId::default(), 1).await.unwrap();
                 store
                     .user_data_bulk(UserId::default(), &[1, 2])
                     .await
                     .unwrap();
+                store
+                    .started_items(UserId::default(), pharos_core::MediaKind::Episode)
+                    .await
+                    .unwrap();
                 store.mark_seen_batch(&[], 1).await.unwrap();
                 store.put_batch(&[]).await.unwrap();
+                MediaStore::list(&store).await.unwrap();
+                store.people_for_item(1).await.unwrap();
+                store.studios_for_item(1).await.unwrap();
+                store.tags_for_item(1).await.unwrap();
+                store.artwork_for(1).await.unwrap();
+                store.people_with_counts().await.unwrap();
+                store.studios_with_counts().await.unwrap();
+                store.tags_with_counts().await.unwrap();
+                store.collections_with_counts().await.unwrap();
+                let _ = UserStore::get(&store, UserId::default()).await;
+                let _ = store.resolve_scoped("no-such-token").await;
             });
         });
         for method in [
             "query_items",
             "get_item",
+            "get_items_by_ids",
             "get_user_data",
             "user_data_bulk",
+            "started_items",
             "mark_seen_batch",
             "put_batch",
+            "list",
+            "people_for_item",
+            "studios_for_item",
+            "tags_for_item",
+            "artwork_for",
+            "people_with_counts",
+            "studios_with_counts",
+            "tags_with_counts",
+            "collections_with_counts",
+            "get_user",
+            "resolve_scoped",
         ] {
             assert_eq!(observations(&snapshotter, method), 1, "{method}");
         }

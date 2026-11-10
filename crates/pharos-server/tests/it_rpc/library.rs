@@ -149,6 +149,9 @@ async fn native_views_carry_the_library_id_and_its_poster() {
             .primary_tag
             .as_deref()
             .expect("a seeded movie library has a poster");
+        // ADR-0073: the native API hands out the same signed tag as the
+        // Jellyfin routes (V712).
+        let tag = fx.state.image_tag_key.sign(&view.id, "primary", tag);
         assert_eq!(images.len(), 1, "{}", view.name);
         let image = images.get(0);
         assert_eq!(image.get_kind().unwrap().to_str().unwrap(), "Primary");
@@ -262,6 +265,102 @@ async fn latest_lists_the_newest_items_the_policy_allows() {
         .await
         .unwrap();
     assert_eq!(capped.len(), LATEST_MAX as usize);
+}
+
+/// The shape of "latest" beyond the policy: ties on the timestamp fall to the
+/// higher id, a kind filter keeps only those kinds, a series or season parent
+/// lists only its episodes, and a limit of 0 lists nothing.
+#[actix_web::test]
+async fn latest_orders_ties_by_id_and_scopes_to_kinds_and_series() {
+    use library::KindFilter;
+    use pharos_core::{MediaItem, MediaKind, MediaStore as _, SeriesInfo};
+    use pharos_jellyfin_api::dto::{season_id_for_key, series_id_for_key};
+
+    let fx = seed_rich().await;
+    let episode = |id: u64, show: &str, season: u32, at: i64| MediaItem {
+        id,
+        path: format!("/libA/{show}/S{season}/e{id}.mkv").into(),
+        title: format!("E{id}"),
+        kind: MediaKind::Episode,
+        created_at: Some(at),
+        series: Some(SeriesInfo {
+            series_name: show.into(),
+            season_number: Some(season),
+            episode_number: Some(1),
+            series_folder: Some(format!("/libA/{show}")),
+            series_year: None,
+            series_key: None,
+        }),
+        ..MediaItem::default()
+    };
+    let movie = |id: u64, at: i64| MediaItem {
+        id,
+        path: format!("/libA/m{id}.mkv").into(),
+        title: format!("M{id}"),
+        kind: MediaKind::Movie,
+        created_at: Some(at),
+        ..MediaItem::default()
+    };
+    let at = 4_100_000_000;
+    for item in [
+        movie(301, at),
+        movie(302, at),
+        episode(311, "Alpha", 1, at + 1),
+        episode(312, "Alpha", 2, at + 3),
+        episode(313, "Beta", 1, at + 2),
+    ] {
+        fx.state.stores.put(item).await.unwrap();
+    }
+    let user = pharos_server::services::auth::user_for_token(&fx.state.stores, &fx.user_token)
+        .await
+        .unwrap();
+    let ids = |rows: Vec<(MediaItem, pharos_core::UserItemData)>| {
+        rows.into_iter().map(|(i, _)| i.id).collect::<Vec<_>>()
+    };
+
+    let all = library::latest(&fx.state, &user, None, &KindFilter::Unset, Some(5))
+        .await
+        .unwrap();
+    assert_eq!(ids(all), [312, 313, 311, 302, 301]);
+
+    let movies = library::latest(
+        &fx.state,
+        &user,
+        None,
+        &KindFilter::Kinds(vec![MediaKind::Movie]),
+        Some(2),
+    )
+    .await
+    .unwrap();
+    assert_eq!(ids(movies), [302, 301]);
+
+    let alpha = series_id_for_key(Some("/libA/Alpha"), "Alpha");
+    let show = library::latest(&fx.state, &user, Some(&alpha), &KindFilter::Unset, None)
+        .await
+        .unwrap();
+    assert_eq!(ids(show), [312, 311]);
+
+    let season = season_id_for_key(Some("/libA/Alpha"), "Alpha", 1);
+    let one = library::latest(&fx.state, &user, Some(&season), &KindFilter::Unset, None)
+        .await
+        .unwrap();
+    assert_eq!(ids(one), [311]);
+
+    let unknown = library::latest(
+        &fx.state,
+        &user,
+        Some("ffffffffffffffffffffffffffffffff"),
+        &KindFilter::Unset,
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(unknown.is_empty(), "an unknown parent lists nothing");
+
+    let zero = library::latest(&fx.state, &user, None, &KindFilter::Unset, Some(0))
+        .await
+        .unwrap();
+    assert!(zero.is_empty());
 }
 
 /// `Library.latest` on `session`, as the Jellyfin fields the test compares.
@@ -381,6 +480,7 @@ async fn native_latest_agrees_with_the_jellyfin_latest_route() {
                 episode_number: Some(2),
                 series_folder: Some("/libA/Show".into()),
                 series_year: Some(2001),
+                series_key: None,
             }),
             ..pharos_core::MediaItem::default()
         })
@@ -667,8 +767,8 @@ async fn native_resume_agrees_with_the_jellyfin_resume_route() {
     );
 }
 
-/// Seeds three episodes of "Show" in /libA and one of "Another" in /libB,
-/// with "Show" S01E01 already played.
+/// Seeds three episodes of "Show" in /libA and two of "Another" in /libB,
+/// with "Show" S01E01 played and then "Another" S01E01 played after it.
 async fn seed_shows(fx: &crate::common::Fixture) {
     use pharos_core::{
         LibraryStore as _, MediaItem, MediaKind, MediaStore as _, SeriesInfo, UserDataStore as _,
@@ -684,6 +784,7 @@ async fn seed_shows(fx: &crate::common::Fixture) {
             episode_number: Some(ep),
             series_folder: Some(format!("/{lib}/{show}")),
             series_year: None,
+            series_key: None,
         }),
         ..MediaItem::default()
     };
@@ -692,26 +793,31 @@ async fn seed_shows(fx: &crate::common::Fixture) {
         episode(403, "libA", "Show", 3),
         episode(402, "libA", "Show", 2),
         episode(501, "libB", "Another", 1),
+        episode(502, "libB", "Another", 2),
     ] {
         fx.state.stores.put(item).await.unwrap();
     }
     fx.state.stores.backfill_library_ids().await.unwrap();
-    fx.state
-        .stores
-        .set_user_data(
-            fx.user_id,
-            401,
-            pharos_core::UserItemData {
-                played: true,
-                ..pharos_core::UserItemData::default()
-            },
-        )
-        .await
-        .unwrap();
+    for (id, at) in [(401, 100), (501, 200)] {
+        fx.state
+            .stores
+            .set_user_data(
+                fx.user_id,
+                id,
+                pharos_core::UserItemData {
+                    played: true,
+                    last_played_at: at,
+                    ..pharos_core::UserItemData::default()
+                },
+            )
+            .await
+            .unwrap();
+    }
 }
 
-/// T032: the first unplayed episode of each series, ordered by series name,
-/// scoped to one series on request, only where the policy allows.
+/// T032 / spec 038: the episode after the last played one in each started
+/// series, the series watched most recently first, scoped to one series on
+/// request, only where the policy allows.
 #[actix_web::test]
 async fn next_up_picks_the_first_unplayed_episode_of_each_visible_series() {
     let fx = seed_rich().await;
@@ -725,12 +831,12 @@ async fn next_up_picks_the_first_unplayed_episode_of_each_visible_series() {
         .await
         .unwrap();
     assert_eq!(all.total, 2);
-    assert_eq!(ids(all), [501, 402]);
+    assert_eq!(ids(all), [502, 402]);
 
     let one = library::next_up(&fx.state, &user, None, Some(0))
         .await
         .unwrap();
-    assert_eq!(ids(one), [501], "a limit below 1 still lists one");
+    assert_eq!(ids(one), [502], "a limit below 1 still lists one");
 
     let show = pharos_jellyfin_api::dto::series_id_for_key(Some("/libA/Show"), "Show");
     let scoped = library::next_up(&fx.state, &user, Some(&show), None)
@@ -750,6 +856,271 @@ async fn next_up_picks_the_first_unplayed_episode_of_each_visible_series() {
         .await
         .unwrap();
     assert_eq!(ids(a), [402]);
+}
+
+/// One show in /libA: season 0 special 1, then S01E01–E03 and S02E01.
+async fn seed_one_show(fx: &crate::common::Fixture) {
+    use pharos_core::{LibraryStore as _, MediaItem, MediaKind, MediaStore as _, SeriesInfo};
+    let episode = |id: u64, season: u32, ep: u32| MediaItem {
+        id,
+        path: format!("/libA/Ladder/Season {season:02}/e{ep}.mkv").into(),
+        title: format!("Ladder {season}x{ep}"),
+        kind: MediaKind::Episode,
+        series: Some(SeriesInfo {
+            series_name: "Ladder".into(),
+            season_number: Some(season),
+            episode_number: Some(ep),
+            series_folder: Some("/libA/Ladder".into()),
+            series_year: None,
+            series_key: None,
+        }),
+        ..MediaItem::default()
+    };
+    for item in [
+        episode(600, 0, 1),
+        episode(611, 1, 1),
+        episode(612, 1, 2),
+        episode(613, 1, 3),
+        episode(621, 2, 1),
+    ] {
+        fx.state.stores.put(item).await.unwrap();
+    }
+    fx.state.stores.backfill_library_ids().await.unwrap();
+}
+
+async fn watch(fx: &crate::common::Fixture, id: u64, played: bool, position: u64, at: i64) {
+    use pharos_core::UserDataStore as _;
+    fx.state
+        .stores
+        .set_user_data(
+            fx.user_id,
+            id,
+            pharos_core::UserItemData {
+                played,
+                last_played_position_ticks: position,
+                last_played_at: at,
+                ..pharos_core::UserItemData::default()
+            },
+        )
+        .await
+        .unwrap();
+}
+
+/// Spec 038 FR-101–FR-104 (ADR-0113), on one fixture per case so the
+/// cached item list is fresh for each.
+#[actix_web::test]
+async fn next_up_follows_the_last_played_episode() {
+    async fn case(watched: &[(u64, bool, u64, i64)]) -> Vec<u64> {
+        let fx = seed_rich().await;
+        seed_one_show(&fx).await;
+        for &(id, played, position, at) in watched {
+            watch(&fx, id, played, position, at).await;
+        }
+        let user = pharos_server::services::auth::user_for_token(&fx.state.stores, &fx.user_token)
+            .await
+            .unwrap();
+        library::next_up(&fx.state, &user, None, None)
+            .await
+            .unwrap()
+            .items
+            .iter()
+            .map(|(i, _)| i.id)
+            .collect()
+    }
+    // FR-101: nothing watched, nothing listed.
+    assert_eq!(case(&[]).await, Vec::<u64>::new());
+    // FR-102: the episode after the last played, not the lowest unplayed.
+    assert_eq!(case(&[(612, true, 0, 10)]).await, [613]);
+    // ...across a season boundary.
+    assert_eq!(case(&[(613, true, 0, 10)]).await, [621]);
+    // The most recent play is the anchor, even when it is an earlier episode.
+    assert_eq!(case(&[(613, true, 0, 10), (611, true, 0, 20)]).await, [612]);
+    // Played episodes after the anchor are skipped.
+    assert_eq!(case(&[(611, true, 0, 20), (612, true, 0, 10)]).await, [613]);
+    // A special is never next after a regular episode...
+    assert_eq!(case(&[(611, true, 0, 10)]).await, [612]);
+    // ...but a played special leads on to the regular season.
+    assert_eq!(case(&[(600, true, 0, 10)]).await, [611]);
+    // FR-101: everything after the last played is watched, so left out.
+    assert_eq!(case(&[(621, true, 0, 10)]).await, Vec::<u64>::new());
+    // FR-104: an episode in progress belongs to Continue Watching.
+    assert_eq!(case(&[(612, false, 5_000, 10)]).await, Vec::<u64>::new());
+    assert_eq!(
+        case(&[(611, true, 0, 10), (612, false, 5_000, 5)]).await,
+        Vec::<u64>::new()
+    );
+}
+
+/// FR-103: series ordered by their latest play, newest first.
+#[actix_web::test]
+async fn next_up_lists_the_series_watched_last_first() {
+    let fx = seed_rich().await;
+    seed_shows(&fx).await;
+    seed_one_show(&fx).await;
+    watch(&fx, 611, true, 0, 150).await;
+    let user = pharos_server::services::auth::user_for_token(&fx.state.stores, &fx.user_token)
+        .await
+        .unwrap();
+    let ids: Vec<u64> = library::next_up(&fx.state, &user, None, None)
+        .await
+        .unwrap()
+        .items
+        .iter()
+        .map(|(i, _)| i.id)
+        .collect();
+    // "Another" at 200, "Ladder" at 150, "Show" at 100.
+    assert_eq!(ids, [502, 612, 402]);
+}
+
+/// The Series page asks with `SeriesId`: an unstarted series shows its first
+/// regular episode, and one in progress shows the episode to resume.
+#[actix_web::test]
+async fn scoped_next_up_lists_the_first_or_the_resumed_episode() {
+    let show = pharos_jellyfin_api::dto::series_id_for_key(Some("/libA/Ladder"), "Ladder");
+    for (watched, want) in [(None, 611), (Some((612, false, 5_000, 10)), 612)] {
+        let fx = seed_rich().await;
+        seed_one_show(&fx).await;
+        if let Some((id, played, position, at)) = watched {
+            watch(&fx, id, played, position, at).await;
+        }
+        let user = pharos_server::services::auth::user_for_token(&fx.state.stores, &fx.user_token)
+            .await
+            .unwrap();
+        let page = library::next_up(&fx.state, &user, Some(&show), None)
+            .await
+            .unwrap();
+        let ids: Vec<u64> = page.items.iter().map(|(i, _)| i.id).collect();
+        assert_eq!(ids, [want], "{watched:?}");
+    }
+}
+
+/// FR-105: Next Up reads the viewer's started rows, and a bulk read for its
+/// picks alone, never one keyed by every visible item.
+#[actix_web::test]
+async fn next_up_reads_the_viewers_rows_not_every_items() {
+    use tracing_subscriber::prelude::*;
+    let fx = seed_rich().await;
+    seed_shows(&fx).await;
+    let user = pharos_server::services::auth::user_for_token(&fx.state.stores, &fx.user_token)
+        .await
+        .unwrap();
+    let calls = crate::store_calls::StoreCallLog::default();
+    let _spans =
+        tracing::subscriber::set_default(tracing_subscriber::registry().with(calls.clone()));
+    let page = library::next_up(&fx.state, &user, None, None)
+        .await
+        .unwrap();
+    let made = calls.take();
+    assert!(made.iter().any(|c| c == "started_items"), "{made:?}");
+    let bulk: Vec<u64> = calls
+        .take_counts()
+        .into_iter()
+        .filter(|(m, _)| m == "user_data_bulk")
+        .map(|(_, n)| n)
+        .collect();
+    assert_eq!(bulk, [page.items.len() as u64], "only the picks are bound");
+}
+
+/// A pick keeps its own row: a favourite unplayed episode is listed as one.
+#[actix_web::test]
+async fn next_up_carries_the_picks_own_play_state() {
+    use pharos_core::UserDataStore as _;
+    let fx = seed_rich().await;
+    seed_one_show(&fx).await;
+    watch(&fx, 611, true, 0, 10).await;
+    let favourite = pharos_core::UserItemData {
+        is_favorite: true,
+        audio_stream_index: Some(2),
+        ..pharos_core::UserItemData::default()
+    };
+    fx.state
+        .stores
+        .set_user_data(fx.user_id, 612, favourite)
+        .await
+        .unwrap();
+    let user = pharos_server::services::auth::user_for_token(&fx.state.stores, &fx.user_token)
+        .await
+        .unwrap();
+    let page = library::next_up(&fx.state, &user, None, None)
+        .await
+        .unwrap();
+    assert_eq!(page.items.len(), 1);
+    assert_eq!(page.items[0].0.id, 612);
+    assert_eq!(page.items[0].1, favourite);
+}
+
+/// A Next Up that cannot read the viewer's rows is counted as an error.
+#[actix_web::test]
+async fn a_failed_next_up_is_counted() {
+    let fx = seed_rich().await;
+    let user = pharos_server::services::auth::user_for_token(&fx.state.stores, &fx.user_token)
+        .await
+        .unwrap();
+    let recorder = metrics_util::debugging::DebuggingRecorder::new();
+    let snap = pharos_test_metrics::snapshotter(&recorder);
+    let _metrics = metrics::set_default_local_recorder(&recorder);
+    #[cfg(feature = "postgres")]
+    let sqlite = match &fx.state.stores {
+        pharos_store_sqlx::any::AnyStore::Sqlite(s) => s,
+        pharos_store_sqlx::any::AnyStore::Postgres(_) => panic!("the fixture is sqlite"),
+    };
+    #[cfg(not(feature = "postgres"))]
+    let sqlite = &fx.state.stores;
+    sqlx::query("DROP TABLE user_data")
+        .execute(sqlite.pool())
+        .await
+        .unwrap();
+    assert!(library::next_up(&fx.state, &user, None, None)
+        .await
+        .is_err());
+    assert_eq!(next_up_count(&snap, "error"), 1);
+}
+
+fn next_up_count(snap: &pharos_test_metrics::CumulativeSnapshotter, outcome: &str) -> u64 {
+    use metrics_util::debugging::DebugValue;
+    snap.snapshot()
+        .into_vec()
+        .into_iter()
+        .filter(|(ck, ..)| {
+            ck.key().name() == "pharos_next_up_total"
+                && ck
+                    .key()
+                    .labels()
+                    .any(|l| l.key() == "outcome" && l.value() == outcome)
+        })
+        .map(|(.., v)| match v {
+            DebugValue::Counter(n) => n,
+            _ => 0,
+        })
+        .sum()
+}
+
+/// Spec 038 T038-101: each Next Up listing is counted by outcome.
+/// Disarm check: with `NextUpOutcome::record` a no-op, both counts read 0.
+#[actix_web::test]
+async fn next_up_is_counted_by_outcome() {
+    let fx = seed_rich().await;
+    let user = pharos_server::services::auth::user_for_token(&fx.state.stores, &fx.user_token)
+        .await
+        .unwrap();
+    let recorder = metrics_util::debugging::DebuggingRecorder::new();
+    let snap = pharos_test_metrics::snapshotter(&recorder);
+    let _metrics = metrics::set_default_local_recorder(&recorder);
+
+    seed_shows(&fx).await;
+    let some = library::next_up(&fx.state, &user, None, None)
+        .await
+        .unwrap();
+    assert!(!some.items.is_empty());
+    assert_eq!(next_up_count(&snap, "listed"), 1);
+
+    let unknown = pharos_jellyfin_api::dto::series_id_for_key(Some("/libA/Nothing"), "Nothing");
+    let none = library::next_up(&fx.state, &user, Some(&unknown), None)
+        .await
+        .unwrap();
+    assert!(none.items.is_empty());
+    assert_eq!(next_up_count(&snap, "empty"), 1);
+    assert_eq!(next_up_count(&snap, "error"), 0);
 }
 
 /// `Library.nextUp` on `session`, as its total and items.
@@ -1328,6 +1699,7 @@ pub(crate) async fn seed_tv_library(fx: &crate::common::Fixture) -> String {
                     episode_number: Some(ep),
                     series_folder: Some(format!("/libTV/{show}")),
                     series_year: None,
+                    series_key: None,
                 }),
                 ..MediaItem::default()
             })
@@ -2169,7 +2541,7 @@ async fn series_tiles_agree_with_the_jellyfin_route_page_and_follow_library_acce
 /// Adds music libraries at /libMusic (artists "Alpha", with albums "First"
 /// on two discs and "Second", and "Beta", album "Third") and /libOther
 /// (artist "Gamma"), and returns the first's wire id.
-async fn seed_music_libraries(fx: &crate::common::Fixture) -> String {
+pub async fn seed_music_libraries(fx: &crate::common::Fixture) -> String {
     use pharos_core::{
         LibraryKind, LibraryStore as _, MediaItem, MediaKind, MediaProbe, MediaStore as _,
     };
@@ -2901,6 +3273,204 @@ async fn a_listing_keeps_to_watched_or_unwatched() {
     );
 }
 
+/// B1199/V1159: `IsResumable` is the filter bar's "In progress": a film part
+/// watched and not finished, and a series tile with something watched (an
+/// episode played or part watched) and something still to watch.
+/// Disarm check: with the started check in `virtual_shows_page` skipped,
+/// both series list.
+#[actix_web::test]
+async fn a_listing_keeps_to_in_progress() {
+    use pharos_core::UserDataStore as _;
+
+    let (server, fx) = crate::revocation::start().await;
+    let (client, _closed) = crate::revocation::connect(&server).await;
+    let session = crate::revocation::signed_in(&client, &fx.user_token).await;
+    seed_movies(&fx).await;
+    let tv = seed_tv_library(&fx).await;
+    let store = |id: u64, data: pharos_core::UserItemData| {
+        let fx = &fx;
+        async move {
+            fx.state
+                .stores
+                .set_user_data(fx.user_id, id, data)
+                .await
+                .unwrap();
+        }
+    };
+    let part_watched = pharos_core::UserItemData {
+        last_played_position_ticks: 600_000_000,
+        ..pharos_core::UserItemData::default()
+    };
+    let played = pharos_core::UserItemData {
+        played: true,
+        ..pharos_core::UserItemData::default()
+    };
+    // Alpha finished, Beta part watched; one episode of "Show" played.
+    store(101, played).await;
+    store(102, part_watched).await;
+    store(601, played).await;
+
+    let lib_a = fx.lib_a_wire.clone();
+    assert_eq!(
+        listed_in(&session, &lib_a, &[], "", &["IsResumable"]).await,
+        ["Beta"]
+    );
+    let in_progress = || listed_in(&session, &tv, &[Kind::Series], "", &["IsResumable"]);
+    assert_eq!(in_progress().await, ["Show"]);
+    // A part-watched episode starts a show too.
+    store(604, part_watched).await;
+    assert_eq!(in_progress().await, ["Mature", "Show"]);
+    // Every episode played: finished, no longer in progress.
+    store(602, played).await;
+    store(603, played).await;
+    assert_eq!(in_progress().await, ["Mature"]);
+}
+
+/// B1081: `IsFavorite` lists a series tile while every episode in it is a
+/// favourite, which is what marking the show writes; one favourite episode
+/// does not make its show one. `IsNotFavorite` lists the rest.
+/// Disarm check: with the favourite check in `virtual_shows_page` skipped,
+/// both series list under either filter.
+#[actix_web::test]
+async fn a_listing_keeps_to_favourite_series() {
+    use pharos_core::UserDataStore as _;
+
+    let (server, fx) = crate::revocation::start().await;
+    let (client, _closed) = crate::revocation::connect(&server).await;
+    let session = crate::revocation::signed_in(&client, &fx.user_token).await;
+    let tv = seed_tv_library(&fx).await;
+    let favourite = pharos_core::UserItemData {
+        is_favorite: true,
+        ..pharos_core::UserItemData::default()
+    };
+    let mark = |id: u64| {
+        let fx = &fx;
+        async move {
+            fx.state
+                .stores
+                .set_user_data(fx.user_id, id, favourite)
+                .await
+                .unwrap();
+        }
+    };
+    // Season 1 of "Show" only: its season 2 episode is no favourite.
+    mark(601).await;
+    mark(602).await;
+    assert!(
+        listed_in(&session, &tv, &[Kind::Series], "", &["IsFavorite"])
+            .await
+            .is_empty()
+    );
+    mark(603).await;
+    assert_eq!(
+        listed_in(&session, &tv, &[Kind::Series], "", &["IsFavorite"]).await,
+        ["Show"]
+    );
+    assert_eq!(
+        listed_in(&session, &tv, &[Kind::Series], "", &["IsNotFavorite"]).await,
+        ["Mature"]
+    );
+    // The Favourites page asks with no parent, one kind at a time.
+    let names = |page: Vec<serde_json::Value>| -> Vec<String> {
+        page.iter()
+            .map(|i| i["Name"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    let (_, shows) = wire_query(
+        &session,
+        None,
+        &[Kind::Series],
+        "SortName",
+        false,
+        "",
+        &["IsFavorite"],
+        0,
+        50,
+    )
+    .await;
+    assert_eq!(names(shows), ["Show"]);
+    let (total, episodes) = wire_query(
+        &session,
+        None,
+        &[Kind::Episode],
+        "SortName",
+        false,
+        "",
+        &["IsFavorite"],
+        0,
+        50,
+    )
+    .await;
+    assert_eq!(total, 3, "{:?}", names(episodes));
+}
+
+/// B1085: album and artist listings keep to the favourite ones, an album
+/// or artist being one while every track under it is, as a series is.
+/// Disarm check: with `GroupMarks::keeps` keeping every group, "Third"
+/// joins the favourite albums.
+#[actix_web::test]
+async fn a_listing_keeps_to_favourite_albums_and_artists() {
+    use pharos_core::UserDataStore as _;
+
+    let (server, fx) = crate::revocation::start().await;
+    let (client, _closed) = crate::revocation::connect(&server).await;
+    let session = crate::revocation::signed_in(&client, &fx.user_token).await;
+    let music = seed_music_libraries(&fx).await;
+    let favourite = pharos_core::UserItemData {
+        is_favorite: true,
+        ..pharos_core::UserItemData::default()
+    };
+    for id in [701, 702, 703] {
+        fx.state
+            .stores
+            .set_user_data(fx.user_id, id, favourite)
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        listed_in(&session, &music, &[Kind::Album], "", &["IsFavorite"]).await,
+        ["First"]
+    );
+    assert_eq!(
+        listed_in(&session, &music, &[Kind::Album], "", &["IsNotFavorite"]).await,
+        ["Second", "Third"]
+    );
+    assert!(
+        listed_in(&session, &music, &[Kind::Artist], "", &["IsFavorite"])
+            .await
+            .is_empty(),
+        "Alpha's \"Only song\" is no favourite"
+    );
+    fx.state
+        .stores
+        .set_user_data(fx.user_id, 704, favourite)
+        .await
+        .unwrap();
+    assert_eq!(
+        listed_in(&session, &music, &[Kind::Artist], "", &["IsFavorite"]).await,
+        ["Alpha"]
+    );
+    // The Favourites page asks with no parent, one kind at a time.
+    let names = |page: Vec<serde_json::Value>| -> Vec<String> {
+        page.iter()
+            .map(|i| i["Name"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    let (_, albums) = wire_query(
+        &session,
+        None,
+        &[Kind::Album],
+        "SortName",
+        false,
+        "",
+        &["IsFavorite"],
+        0,
+        50,
+    )
+    .await;
+    assert_eq!(names(albums), ["First", "Second"]);
+}
+
 /// One `Library.index` call: each letter and where it starts, then genres.
 async fn wire_index(
     session: &session::Client,
@@ -3305,5 +3875,149 @@ async fn descriptions_follow_the_users_language() {
             "悟空の冒険。"
         ]
         .map(serde_json::Value::from)
+    );
+}
+
+/// One `Library.query` on `parent`, name-ordered, with `collapseCollections`.
+async fn folded_query(
+    session: &session::Client,
+    parent: &str,
+    start: u32,
+    limit: u32,
+) -> (u32, Vec<serde_json::Value>) {
+    use pharos_jellyfin_api::dto::WireId;
+    let library = session.library_request().send().pipeline.get_library();
+    let mut req = library.query_request();
+    req.get().init_ctx();
+    let mut q = req.get().init_q();
+    match WireId::parse(parent).expect("parent is a wire id") {
+        WireId::Real(n) => q.reborrow().init_parent_id().set_real(n),
+        WireId::Synth(n) => q.reborrow().init_parent_id().set_synth(n),
+    }
+    q.set_sort_by("SortName");
+    q.set_collapse_collections(true);
+    q.set_start(start);
+    q.set_limit(limit);
+    let reply = req.send().promise.await.expect("query");
+    summaries(reply.get().unwrap().get_result().unwrap())
+}
+
+/// B1086, V1044: with `collapseCollections` a listing shows each box set as
+/// one tile, where its first film stood, once the listing holds two or more
+/// of its films; a lone member stays a film. The total, the pages and the
+/// letter index count tiles, the tile opens on the set's films, and each
+/// folded listing counts under `pharos_collection_fold_total{outcome}`.
+/// Disarm check: with `fold_into_collections` folding nothing, the tile is
+/// missing and "Delta" is listed.
+#[actix_web::test]
+async fn a_listing_folds_the_films_of_a_box_set_into_one_tile() {
+    use pharos_core::{
+        CollectionStore as _, LibraryStore as _, MediaItem, MediaKind, MediaStore as _,
+    };
+
+    let fx = crate::common::seed_rich().await;
+    seed_movies(&fx).await;
+    for (id, title) in [(103, "Delta"), (104, "Epsilon")] {
+        fx.state
+            .stores
+            .put(MediaItem {
+                id,
+                path: format!("/libA/{title}.mkv").into(),
+                title: title.into(),
+                kind: MediaKind::Movie,
+                ..MediaItem::default()
+            })
+            .await
+            .unwrap();
+    }
+    fx.state.stores.backfill_library_ids().await.unwrap();
+    let set = fx
+        .state
+        .stores
+        .create_collection("Set One", &[103, 101])
+        .await
+        .unwrap();
+    // Gamma is in the other library, so this listing holds one film of it.
+    fx.state
+        .stores
+        .create_collection("Lone Set", &[104, 201])
+        .await
+        .unwrap();
+    let recorder = metrics_util::debugging::DebuggingRecorder::new();
+    let snapshotter = pharos_test_metrics::snapshotter(&recorder);
+    let _metrics = metrics::set_default_local_recorder(&recorder);
+    let lib_a = fx.lib_a_wire.clone();
+    let names = |items: &[serde_json::Value]| -> Vec<String> {
+        items
+            .iter()
+            .map(|i| i["Name"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let client = crate::telemetry::connect(&fx);
+            let session = crate::telemetry::session_for(&client, &fx.user_token).await;
+            let (total, items) = folded_query(&session, &lib_a, 0, 0).await;
+            assert_eq!(names(&items), ["Set One", "Beta", "Epsilon", "Rich Movie"]);
+            assert_eq!(total, 4);
+            assert_eq!(items[0]["Id"], set.wire_id.as_str());
+            let (total, page) = folded_query(&session, &lib_a, 1, 1).await;
+            assert_eq!((total, names(&page)), (4, vec!["Beta".to_owned()]));
+            let (_, plain) = wire_query(
+                &session,
+                Some(&lib_a),
+                &[],
+                "SortName",
+                false,
+                "",
+                &[],
+                0,
+                0,
+            )
+            .await;
+            assert_eq!(
+                names(&plain),
+                ["Alpha", "Beta", "Delta", "Epsilon", "Rich Movie"]
+            );
+            let (_, opened) = wire_query(
+                &session,
+                Some(&set.wire_id),
+                &[],
+                "SortName",
+                false,
+                "",
+                &[],
+                0,
+                0,
+            )
+            .await;
+            // A set lists its films in the set's own order.
+            assert_eq!(names(&opened), ["Delta", "Alpha"]);
+        })
+        .await;
+    let user = pharos_server::services::auth::user_for_token(&fx.state.stores, &fx.user_token)
+        .await
+        .unwrap();
+    let q = library::ItemQuery {
+        sort_by: Some("SortName".into()),
+        collapse_collections: true,
+        ..library::ItemQuery::default()
+    };
+    let index = library::index(&fx.state, &user, Some(&lib_a), None, &q)
+        .await
+        .unwrap();
+    let letters: Vec<(&str, u32)> = index
+        .letters
+        .iter()
+        .map(|(l, s)| (l.as_str(), *s))
+        .collect();
+    assert_eq!(letters, [("A", 0), ("B", 1), ("E", 2), ("R", 3)]);
+    assert_eq!(
+        crate::telemetry::counter(
+            &snapshotter,
+            "pharos_collection_fold_total",
+            &[("outcome", "ok")],
+        ),
+        2
     );
 }

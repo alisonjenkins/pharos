@@ -34,6 +34,7 @@ fn episode(id: u64, folder: &std::path::Path, season: u32, ep: u32) -> MediaItem
             episode_number: Some(ep),
             series_folder: Some(folder.to_string_lossy().into_owned()),
             series_year: None,
+            series_key: None,
         }),
         ..Default::default()
     }

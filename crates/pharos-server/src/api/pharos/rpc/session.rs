@@ -13,6 +13,7 @@ use pharos_core::{
 };
 
 use super::bootstrap::{qc_denial, token_denial};
+use super::events::{Events, Subscriptions};
 use super::group::Group;
 use super::library::Library;
 use super::playback::Playback;
@@ -42,6 +43,10 @@ pub(super) struct Session {
     pub(super) token: String,
     /// Paces this session's `Telemetry.submit` batches.
     pub(super) telemetry_bucket: RefCell<MessageBucket>,
+    /// Paces this session's `Telemetry.report` calls.
+    pub(super) report_bucket: RefCell<MessageBucket>,
+    /// Paces this session's `listReports`, `getReport` and `deleteReport`.
+    pub(super) report_read_bucket: RefCell<MessageBucket>,
     /// The user's `diagnostics.opt_in` and when it was read.
     opt_in_cache: RefCell<Option<(Instant, bool)>>,
 }
@@ -70,6 +75,16 @@ impl Session {
                 TELEMETRY_BATCH_BURST,
                 TELEMETRY_BATCHES_PER_SECOND,
             )),
+            report_bucket: RefCell::new(MessageBucket::with_rate(
+                Instant::now(),
+                super::report::REPORT_BURST,
+                super::report::REPORTS_PER_SECOND,
+            )),
+            report_read_bucket: RefCell::new(MessageBucket::with_rate(
+                Instant::now(),
+                super::report::REPORT_READ_BURST,
+                super::report::REPORT_READS_PER_SECOND,
+            )),
             opt_in_cache: RefCell::new(None),
         }
     }
@@ -87,6 +102,11 @@ impl Session {
     /// still live.
     pub(super) fn owner(&self) -> UserId {
         self.user.id
+    }
+
+    /// The `Events` subscriptions open on this session's connection.
+    pub(super) fn subscriptions(&self) -> &Subscriptions {
+        &self.ctx.subscriptions
     }
 
     pub(super) fn conn(&self) -> Rc<Connection> {
@@ -250,6 +270,19 @@ impl server::session::Handler for Session {
         Ok(())
     }
 
+    /// Never refused, like `library`; `subscribe` checks the session itself.
+    async fn events(
+        self: Rc<Self>,
+        _params: wire::EventsParams,
+        results: &mut wire::EventsResults,
+    ) -> Result<(), capnp::Error> {
+        let conn = Rc::clone(&self.conn);
+        results
+            .get()
+            .set_events(server::events::client(Events::new(self), &conn));
+        Ok(())
+    }
+
     /// Never refused, like `library`; each `Group` call checks the session
     /// itself.
     async fn group(
@@ -377,6 +410,104 @@ impl server::session::Handler for Session {
                 // An `InvalidToken` here is the session's own token, revoked
                 // or expired since `current_user()`: answer it as revoked so
                 // the client signs in again instead of retrying a store fault.
+                match e {
+                    AuthError::InvalidToken => Denial::Revoked {
+                        reason: "session ended",
+                    },
+                    _ => Denial::Unavailable {
+                        dependency: "token store",
+                    },
+                }
+                .write(result.init_error());
+            }
+        }
+        Ok(())
+    }
+
+    /// A short-lived Full token for the web UI's Manage pages (B920, V880,
+    /// ADR-0082), which drive the admin endpoints of the Jellyfin API with a
+    /// header: the browser's session cookie is `HttpOnly`, and no cookie
+    /// authorizes a write (V191). Admins only. Issued as a child of this
+    /// session's token, so ending the session by any path ends it, and it
+    /// lives [`MANAGE_TOKEN_TTL_SECS`] at most.
+    async fn manage_token(
+        self: Rc<Self>,
+        _params: wire::ManageTokenParams,
+        results: &mut wire::ManageTokenResults,
+    ) -> Result<(), capnp::Error> {
+        let user = match self.current_user().await {
+            Ok(user) => user,
+            Err(denial) => {
+                let outcome = match denial {
+                    Denial::Unavailable { .. } => ManageTokenOutcome::StoreUnavailable,
+                    _ => ManageTokenOutcome::Rejected,
+                };
+                outcome.count();
+                tracing::info!(
+                    outcome = outcome.label(),
+                    denial = ?denial,
+                    "native manage token refused"
+                );
+                denial.write(results.get().init_result().init_error());
+                return Ok(());
+            }
+        };
+        if !user.policy.admin {
+            ManageTokenOutcome::NotAdmin.count();
+            tracing::info!(
+                user = %user.name,
+                outcome = ManageTokenOutcome::NotAdmin.label(),
+                "native manage token refused"
+            );
+            Denial::NotPermitted {
+                what: "manage is for admins",
+            }
+            .write(results.get().init_result().init_error());
+            return Ok(());
+        }
+        let parent = TokenId(self.state.stores.token_id(&self.token));
+        let issued = self
+            .state
+            .stores
+            .issue_child_with_ttl(
+                user.id,
+                MANAGE_TOKEN_DEVICE_ID,
+                MANAGE_TOKEN_TTL_SECS,
+                TokenScope::Full,
+                &parent,
+            )
+            .await;
+        let result = results.get().init_result();
+        match issued {
+            Ok(issued) => {
+                ManageTokenOutcome::Ok.count();
+                tracing::info!(
+                    user = %user.name,
+                    outcome = ManageTokenOutcome::Ok.label(),
+                    token_id = %issued.id.0.chars().take(8).collect::<String>(),
+                    ttl_secs = MANAGE_TOKEN_TTL_SECS,
+                    "native manage token issued"
+                );
+                let mut out = result.init_token();
+                out.set_token(issued.secret.0.expose());
+                out.set_expires_at_ms(
+                    u64::try_from(issued.expires_at)
+                        .unwrap_or(0)
+                        .saturating_mul(1000),
+                );
+            }
+            Err(e) => {
+                let outcome = match e {
+                    AuthError::Backend(_) => ManageTokenOutcome::StoreUnavailable,
+                    _ => ManageTokenOutcome::Rejected,
+                };
+                outcome.count();
+                tracing::warn!(
+                    user = %user.name,
+                    outcome = outcome.label(),
+                    error = %e,
+                    "native manage token refused"
+                );
                 match e {
                     AuthError::InvalidToken => Denial::Revoked {
                         reason: "session ended",
@@ -565,6 +696,126 @@ impl server::session::Handler for Session {
         }
         Ok(())
     }
+
+    async fn my_devices(
+        self: Rc<Self>,
+        _params: wire::MyDevicesParams,
+        results: &mut wire::MyDevicesResults,
+    ) -> Result<(), capnp::Error> {
+        let user = match self.current_user().await {
+            Ok(user) => user,
+            Err(denial) => {
+                denial.write(results.get().init_result().init_error());
+                return Ok(());
+            }
+        };
+        let devices = match crate::services::devices::devices_of(&self.state, user.id).await {
+            Ok(devices) => devices,
+            Err(e) => {
+                tracing::warn!(user = %user.name, error = %e, "native device list failed");
+                Denial::Unavailable {
+                    dependency: "token store",
+                }
+                .write(results.get().init_result().init_error());
+                return Ok(());
+            }
+        };
+        let current = {
+            use pharos_core::TokenStore as _;
+            self.state
+                .stores
+                .device_for_token(&self.token)
+                .await
+                .ok()
+                .flatten()
+        };
+        let len = u32::try_from(devices.len()).unwrap_or(u32::MAX);
+        let mut list = results.get().init_result().init_devices(len);
+        for (i, d) in devices.iter().enumerate().take(len as usize) {
+            let mut b = list.reborrow().get(i as u32);
+            b.set_id(d.id.as_str());
+            b.set_name(d.name.as_str());
+            b.set_current(current.as_deref() == Some(d.id.as_str()));
+            let codecs_len = u32::try_from(d.denied_audio_codecs.len()).unwrap_or(u32::MAX);
+            let mut codecs = b.init_converted_audio(codecs_len);
+            for (j, c) in d
+                .denied_audio_codecs
+                .iter()
+                .enumerate()
+                .take(codecs_len as usize)
+            {
+                codecs.set(j as u32, c.as_str());
+            }
+        }
+        Ok(())
+    }
+
+    async fn set_device_converted_audio(
+        self: Rc<Self>,
+        params: wire::SetDeviceConvertedAudioParams,
+        results: &mut wire::SetDeviceConvertedAudioResults,
+    ) -> Result<(), capnp::Error> {
+        use crate::services::devices::SetConvertedAudioError;
+        let user = match self.current_user().await {
+            Ok(user) => user,
+            Err(denial) => {
+                denial.write(results.get().init_result().init_error());
+                return Ok(());
+            }
+        };
+        let params = params.get()?;
+        let device_id = params
+            .get_device_id()
+            .ok()
+            .and_then(|r| r.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        // Compared as stored: `myDevices` answers ids untrimmed.
+        if device_id.trim().is_empty() {
+            Denial::Invalid { field: "deviceId" }.write(results.get().init_result().init_error());
+            return Ok(());
+        }
+        let mut codecs = Vec::new();
+        if let Ok(list) = params.get_codecs() {
+            for c in list.iter() {
+                match c.ok().and_then(|r| r.to_str().ok()) {
+                    Some(c) => codecs.push(c.to_string()),
+                    None => {
+                        Denial::Invalid { field: "codecs" }
+                            .write(results.get().init_result().init_error());
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        let mut done = results.get().init_result();
+        match crate::services::devices::set_own_converted_audio(
+            &self.state,
+            user.id,
+            &user.name,
+            &device_id,
+            &codecs,
+        )
+        .await
+        {
+            Ok(_) => done.set_ok(()),
+            Err(SetConvertedAudioError::NotSignedIn(_)) => Denial::NotPermitted {
+                what: "a device this user is not signed in on",
+            }
+            .write(done.init_error()),
+            Err(SetConvertedAudioError::Refused(_)) => {
+                Denial::Invalid { field: "codecs" }.write(done.init_error());
+            }
+            Err(SetConvertedAudioError::Store(e)) => {
+                tracing::warn!(user = %user.name, device.id = %device_id, error = %e, "native device sound formats write failed");
+                Denial::Unavailable {
+                    dependency: "config store",
+                }
+                .write(done.init_error());
+            }
+        }
+        Ok(())
+    }
 }
 
 /// The device id a media token is stored under: the session's own device
@@ -597,6 +848,58 @@ impl MediaTokenOutcome {
 
     fn count(self) {
         metrics::counter!("pharos_media_token_issued_total", "outcome" => self.label())
+            .increment(1);
+    }
+}
+
+/// The device id every manage token is stored under, like
+/// [`MEDIA_TOKEN_DEVICE_ID`].
+const MANAGE_TOKEN_DEVICE_ID: &str = "pharos-native:manage";
+
+/// Whether `device_id` names a token issued as a child of a session (a media
+/// or manage token) rather than a device: the device list shows the session's
+/// own device, not one row per child (B920).
+pub fn is_child_token_device(device_id: &str) -> bool {
+    matches!(device_id, MEDIA_TOKEN_DEVICE_ID | MANAGE_TOKEN_DEVICE_ID)
+}
+
+/// How long a manage token lives: an hour, and the page asks for another
+/// before it ends. Short, because script on the page can read it.
+pub const MANAGE_TOKEN_TTL_SECS: i64 = 3_600;
+
+/// `pharos_manage_token_issued_total`. A dashboard contract: bounded, stable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ManageTokenOutcome {
+    /// A token was issued.
+    Ok,
+    /// The user is not an admin.
+    NotAdmin,
+    /// The token store could not answer.
+    StoreUnavailable,
+    /// The session was revoked or ended, or the store refused to issue.
+    Rejected,
+}
+
+impl ManageTokenOutcome {
+    #[cfg(test)]
+    pub(crate) const ALL: [ManageTokenOutcome; 4] = [
+        Self::Ok,
+        Self::NotAdmin,
+        Self::StoreUnavailable,
+        Self::Rejected,
+    ];
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::NotAdmin => "not_admin",
+            Self::StoreUnavailable => "store_unavailable",
+            Self::Rejected => "rejected",
+        }
+    }
+
+    fn count(self) {
+        metrics::counter!("pharos_manage_token_issued_total", "outcome" => self.label())
             .increment(1);
     }
 }
@@ -681,12 +984,18 @@ fn write_change_password_error(
 
 #[cfg(test)]
 mod tests {
-    use super::MediaTokenOutcome;
+    use super::{ManageTokenOutcome, MediaTokenOutcome};
 
     /// The outcome labels are a dashboard contract: fixed and distinct.
     #[test]
     fn media_token_outcome_labels_are_stable_and_distinct() {
         let labels: Vec<_> = MediaTokenOutcome::ALL.iter().map(|o| o.label()).collect();
         assert_eq!(labels, ["ok", "store_unavailable", "rejected"]);
+    }
+
+    #[test]
+    fn manage_token_outcome_labels_are_stable_and_distinct() {
+        let labels: Vec<_> = ManageTokenOutcome::ALL.iter().map(|o| o.label()).collect();
+        assert_eq!(labels, ["ok", "not_admin", "store_unavailable", "rejected"]);
     }
 }

@@ -296,6 +296,7 @@ async fn boot_server_3d() -> (TestServer, String, String, u64, u64) {
                 episode_number: Some(1),
                 series_folder: None,
                 series_year: None,
+                series_key: None,
             }),
             probe: MediaProbe {
                 duration_ms: Some(60_000),
@@ -514,6 +515,8 @@ async fn three_d_playback_negotiation_and_stereo_mode_isolation() {
         video_3d_format: Some(Video3DFormat::HalfSideBySide),
         stereo_output: stereo,
         tonemap: Default::default(),
+        output_size: None,
+        output_scale_reason: None,
     };
 
     let key_preserve = SegmentIdentity::new(

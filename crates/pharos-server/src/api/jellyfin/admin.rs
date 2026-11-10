@@ -45,6 +45,16 @@ pub fn register(cfg: &mut web::ServiceConfig) {
         // Container-integrity sweep results — "which files are damaged",
         // not just a count.
         .route("/admin/integrity/damaged", web::get().to(damaged_files))
+        .route("/admin/integrity/status", web::get().to(integrity_status))
+        .route(
+            "/admin/integrity/{id}/recheck",
+            web::post().to(integrity_recheck),
+        )
+        .route("/admin/integrity/deep", web::get().to(deep_checks))
+        .route(
+            "/admin/integrity/{id}/deep",
+            web::post().to(deep_check_request),
+        )
         .route(
             "/admin/media/duplicates",
             web::get().to(super::duplicates::duplicate_movies),
@@ -966,9 +976,10 @@ struct DamagedFileDto {
     /// and jellyfin-web's own DTOs already carry ids as strings for exactly
     /// this reason (see `wire_id`/`item_id` throughout `items.rs`).
     media_id: String,
-    /// `None` when the id no longer resolves in the media store — see this
-    /// function's doc comment. Never used to drop the entry.
-    path: Option<String>,
+    /// `Path` is `None` when the id no longer resolves in the media store —
+    /// see this function's doc comment. Never used to drop the entry.
+    #[serde(flatten)]
+    file: FileNaming,
     verdict: &'static str,
     first_fault: Option<String>,
     first_fault_ms: Option<u64>,
@@ -977,9 +988,62 @@ struct DamagedFileDto {
     read_errors: u64,
     scanned_ms: u64,
     declared_ms: Option<u64>,
-    // No `recorded_at`: `integrity_memo::Entry` carries `mtime`/`size` (the
-    // FILE's own stat, used to invalidate the verdict) and the report, but no
-    // timestamp of when the scan itself ran — there is nothing to surface.
+    /// Where in the media the damage is, merged into spans.
+    ranges: Vec<DamageRangeDto>,
+    /// Unix seconds. `None` for a verdict recorded before the memo kept it.
+    checked_at: Option<i64>,
+    /// An admin asked for a re-read and the new verdict is not in yet.
+    recheck_pending: bool,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct DamageRangeDto {
+    start_ms: u64,
+    end_ms: u64,
+}
+
+/// What a person calls a file, so an admin list reads "Series · S01E02 ·
+/// Name" rather than a path. Every field is `None` when the row is gone.
+#[derive(Debug, Default, serde::Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct FileNaming {
+    path: Option<String>,
+    kind: Option<&'static str>,
+    name: Option<String>,
+    series_name: Option<String>,
+    season_number: Option<u32>,
+    episode_number: Option<u32>,
+}
+
+impl FileNaming {
+    fn of(item: Option<&pharos_core::MediaItem>) -> Self {
+        let Some(item) = item else {
+            return Self::default();
+        };
+        let series = item.series.as_ref();
+        Self {
+            path: Some(item.path.to_string_lossy().into_owned()),
+            kind: Some(item.kind.as_str()),
+            name: Some(item.title.clone()),
+            series_name: series.map(|s| s.series_name.clone()),
+            season_number: series.and_then(|s| s.season_number),
+            episode_number: series.and_then(|s| s.episode_number),
+        }
+    }
+}
+
+/// The library rows for `ids`, in one store call. An id with no row is
+/// simply absent: the lists that use this still show it, unnamed. Any other
+/// store error fails the request rather than dropping entries one by one.
+async fn items_by_id(
+    state: &AppState,
+    ids: &[u64],
+) -> Result<std::collections::HashMap<u64, pharos_core::MediaItem>, actix_web::Error> {
+    let items = pharos_core::MediaStore::get_many(&state.stores, ids)
+        .await
+        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    Ok(items.into_iter().map(|i| (i.id, i)).collect())
 }
 
 async fn damaged_files(
@@ -995,21 +1059,21 @@ async fn damaged_files(
     // The memo is a HashMap; sort so the listing is stable between requests.
     let mut damaged = memo.damaged();
     damaged.sort_unstable_by_key(|(id, _)| *id);
+    // A row that is gone (`NotFound`) is exactly the case this route exists
+    // to still surface — see the doc comment above.
+    let ids: Vec<u64> = damaged.iter().map(|(id, _)| *id).collect();
+    let items = items_by_id(&state, &ids).await?;
     let mut out = Vec::with_capacity(damaged.len());
     for (id, entry) in damaged {
-        // `NotFound` (row gone) is exactly the case this route exists to
-        // still surface — see the doc comment above. Any OTHER error
-        // (store unreachable) is the server's problem and 500s the whole
-        // request rather than silently dropping entries one by one.
-        let path = match pharos_core::MediaStore::get(&state.stores, id).await {
-            Ok(item) => Some(item.path.to_string_lossy().into_owned()),
-            Err(pharos_core::DomainError::NotFound(_)) => None,
-            Err(e) => return Err(error::ErrorInternalServerError(e.to_string())),
-        };
         let r = &entry.report;
         out.push(DamagedFileDto {
             media_id: id.to_string(),
-            path,
+            file: FileNaming::of(items.get(&id)),
+            checked_at: entry.checked_at,
+            recheck_pending: state
+                .integrity_sweep
+                .as_ref()
+                .is_some_and(|s| s.is_queued(id)),
             verdict: r.label(),
             first_fault: r.first_fault.clone(),
             first_fault_ms: r.first_fault_ms,
@@ -1018,9 +1082,287 @@ async fn damaged_files(
             read_errors: r.read_errors,
             scanned_ms: r.scanned_ms,
             declared_ms: r.declared_ms,
+            ranges: r
+                .damage_ranges()
+                .into_iter()
+                .map(|d| DamageRangeDto {
+                    start_ms: d.start_ms,
+                    end_ms: d.end_ms,
+                })
+                .collect(),
         });
     }
     Ok(web::Json(out))
+}
+
+/// `GET /admin/integrity/status` — how far the sweep has got: files in
+/// scope, files with a verdict, files damaged, re-checks waiting.
+///
+/// `Checked` counts any verdict for the id, whatever state the file was in
+/// then: a `stat` per file to confirm each is current would be thousands of
+/// NFS round trips per page view. A changed file therefore counts as checked
+/// until the sweep reaches it again. Every count is over files the library
+/// holds now, so `Damaged` can be lower than the damaged list, which also
+/// keeps verdicts for files since removed.
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct IntegrityStatusDto {
+    eligible: usize,
+    checked: usize,
+    damaged: usize,
+    queued: usize,
+    /// Files in a format nothing here can verify (rar comics, DRM-locked
+    /// Kindle files). Left out of `Eligible`, so "all checked" is reachable.
+    not_checkable: usize,
+}
+
+async fn integrity_status(
+    state: web::Data<AppState>,
+    user: AuthUser,
+) -> Result<impl Responder, actix_web::Error> {
+    require_admin(&user)?;
+    let (Some(memo), Some(sweep)) = (
+        state.integrity_memo.as_ref(),
+        state.integrity_sweep.as_ref(),
+    ) else {
+        return Err(error::ErrorServiceUnavailable(
+            "no integrity sweep on this build/platform (needs unix + the ffmpeg-lib backend)",
+        ));
+    };
+    // The shared cached list: this page must not cost a full store read.
+    let items = state
+        .list_items_cached()
+        .await
+        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    let (mut eligible, mut checked, mut damaged, mut not_checkable) = (0, 0, 0, 0);
+    for it in items
+        .iter()
+        .filter(|it| crate::integrity_sweep::scannable(it))
+    {
+        if sweep.has_not_checkable(it.id) {
+            not_checkable += 1;
+            continue;
+        }
+        eligible += 1;
+        match memo.recorded_damaged(it.id) {
+            Some(true) => {
+                checked += 1;
+                damaged += 1;
+            }
+            Some(false) => checked += 1,
+            None => {}
+        }
+    }
+    Ok(web::Json(IntegrityStatusDto {
+        eligible,
+        checked,
+        damaged,
+        queued: sweep.queued_len(),
+        not_checkable,
+    }))
+}
+
+/// `POST /admin/integrity/{id}/recheck` — read this one file again, now.
+///
+/// 202: queued, and the sweep is woken. The old verdict stays listed, with
+/// `RecheckPending`, until the new one lands. 404 for an id the library does
+/// not hold; 400 for one the sweep cannot read (a remote origin); 503 on a
+/// replica that is not the background leader.
+async fn integrity_recheck(
+    state: web::Data<AppState>,
+    user: AuthUser,
+    path: web::Path<String>,
+) -> Result<HttpResponse, actix_web::Error> {
+    require_admin(&user)?;
+    let raw = path.into_inner();
+    let answer = integrity_recheck_inner(&state, &raw).await;
+    log_refusal("integrity re-check", &raw, &answer);
+    answer
+}
+
+async fn integrity_recheck_inner(
+    state: &AppState,
+    raw: &str,
+) -> Result<HttpResponse, actix_web::Error> {
+    let Some(sweep) = state.integrity_sweep.as_ref() else {
+        return Err(error::ErrorServiceUnavailable(
+            "no integrity sweep on this build/platform (needs unix + the ffmpeg-lib backend)",
+        ));
+    };
+    // The queue is this process's, and only the background leader sweeps
+    // (T85). Accepting the request on a follower would queue it forever.
+    if !state.is_bg_leader() {
+        return Err(error::ErrorServiceUnavailable(
+            "this replica does not run the integrity sweep; try again",
+        ));
+    }
+    let id: u64 = raw
+        .parse()
+        .map_err(|_| error::ErrorBadRequest(format!("not a media id: {raw:?}")))?;
+    let item = match pharos_core::MediaStore::get(&state.stores, id).await {
+        Ok(item) => item,
+        Err(pharos_core::DomainError::NotFound(_)) => {
+            return Err(error::ErrorNotFound(format!("no media item {id}")))
+        }
+        Err(e) => return Err(error::ErrorInternalServerError(e.to_string())),
+    };
+    if !crate::integrity_sweep::scannable(&item) {
+        return Err(error::ErrorBadRequest(format!(
+            "media item {id} is not a local file and cannot be checked"
+        )));
+    }
+    let newly = sweep.request(id);
+    tracing::info!(
+        item = id,
+        path = %item.path.display(),
+        already_queued = !newly,
+        "integrity re-check requested",
+    );
+    Ok(HttpResponse::Accepted().finish())
+}
+
+/// `GET /admin/integrity/deep` — every deep check this process has run or is
+/// running, newest first, named as a person would name the file.
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct DeepCheckDto {
+    media_id: String,
+    #[serde(flatten)]
+    file: FileNaming,
+    state: &'static str,
+    errors: u64,
+    first_error: Option<String>,
+    first_error_ms: Option<u64>,
+    requested_at: i64,
+    finished_at: Option<i64>,
+    elapsed_secs: Option<u64>,
+    detail: Option<String>,
+}
+
+async fn deep_checks(
+    state: web::Data<AppState>,
+    user: AuthUser,
+) -> Result<impl Responder, actix_web::Error> {
+    require_admin(&user)?;
+    let Some(deep) = state.integrity_deep.as_ref() else {
+        return Err(error::ErrorServiceUnavailable(
+            "deep checks are not set up on this server",
+        ));
+    };
+    if !state.is_bg_leader() {
+        tracing::info!("deep check list refused: this replica is not the background leader");
+        return Err(error::ErrorServiceUnavailable(
+            "this replica does not run deep checks; try again",
+        ));
+    }
+    let entries = deep.list();
+    let ids: Vec<u64> = entries.iter().map(|e| e.id).collect();
+    let items = items_by_id(&state, &ids).await?;
+    let mut out = Vec::with_capacity(entries.len());
+    for e in entries {
+        out.push(DeepCheckDto {
+            media_id: e.id.to_string(),
+            file: FileNaming::of(items.get(&e.id)),
+            state: e.state.label(),
+            errors: e.report.errors,
+            first_error: e.report.first_error,
+            first_error_ms: e.report.first_error_ms,
+            requested_at: e.requested_at,
+            finished_at: e.finished_at,
+            elapsed_secs: e.elapsed_secs,
+            detail: e.detail,
+        });
+    }
+    Ok(web::Json(out))
+}
+
+/// `POST /admin/integrity/{id}/deep` — decode this one file fully.
+///
+/// 202: queued (or already queued). 404 unknown id; 400 for a book (no frames
+/// to decode; the regular check already reads every part of it) or a remote
+/// origin; 503 where deep checks are not set up, or on a replica that is not
+/// the background leader, whose results the page would never see.
+async fn deep_check_request(
+    state: web::Data<AppState>,
+    user: AuthUser,
+    path: web::Path<String>,
+) -> Result<HttpResponse, actix_web::Error> {
+    require_admin(&user)?;
+    let raw = path.into_inner();
+    let answer = deep_check_request_inner(&state, &raw).await;
+    log_refusal("deep check", &raw, &answer);
+    answer
+}
+
+/// The refusal side of an admin integrity request states as much as the
+/// acceptance does: which id, which answer, and why (ODD symmetry).
+fn log_refusal(what: &str, raw_id: &str, answer: &Result<HttpResponse, actix_web::Error>) {
+    if let Err(e) = answer {
+        tracing::info!(
+            media_id = raw_id,
+            status = e.as_response_error().status_code().as_u16(),
+            reason = %e,
+            "{what} refused",
+        );
+    }
+}
+
+async fn deep_check_request_inner(
+    state: &AppState,
+    raw: &str,
+) -> Result<HttpResponse, actix_web::Error> {
+    let Some(deep) = state.integrity_deep.as_ref() else {
+        return Err(error::ErrorServiceUnavailable(
+            "deep checks are not set up on this server",
+        ));
+    };
+    if !state.is_bg_leader() {
+        return Err(error::ErrorServiceUnavailable(
+            "this replica does not run deep checks; try again",
+        ));
+    }
+    let id: u64 = raw
+        .parse()
+        .map_err(|_| error::ErrorBadRequest(format!("not a media id: {raw:?}")))?;
+    let item = match pharos_core::MediaStore::get(&state.stores, id).await {
+        Ok(item) => item,
+        Err(pharos_core::DomainError::NotFound(_)) => {
+            return Err(error::ErrorNotFound(format!("no media item {id}")))
+        }
+        Err(e) => return Err(error::ErrorInternalServerError(e.to_string())),
+    };
+    if item.kind == pharos_core::MediaKind::Book {
+        return Err(error::ErrorBadRequest(
+            "books have no frames to decode; the regular check reads every part of a book",
+        ));
+    }
+    if !crate::integrity_sweep::scannable(&item) {
+        return Err(error::ErrorBadRequest(format!(
+            "media item {id} is not a local file and cannot be checked"
+        )));
+    }
+    use crate::integrity_deep::{Requested, MAX_WAITING};
+    let requested = deep.request(&item);
+    match requested {
+        Requested::QueueFull => {
+            return Err(error::ErrorTooManyRequests(format!(
+                "too many deep checks are waiting ({MAX_WAITING}); try again when some finish"
+            )))
+        }
+        Requested::Unavailable => {
+            return Err(error::ErrorInternalServerError(
+                "the deep check queue is unavailable after an internal fault; restart the server",
+            ))
+        }
+        Requested::Queued | Requested::AlreadyInProgress => {}
+    }
+    tracing::info!(
+        item = id,
+        path = %item.path.display(),
+        already_in_progress = requested == Requested::AlreadyInProgress,
+        "deep check requested",
+    );
+    Ok(HttpResponse::Accepted().finish())
 }
 
 /// `POST /Library/Refresh` — Jellyfin's "Scan All Libraries" (the dashboard

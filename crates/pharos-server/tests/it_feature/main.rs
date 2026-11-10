@@ -4,6 +4,7 @@
 #[path = "../common/mod.rs"]
 mod common;
 
+mod admin_metadata_edit;
 mod attachment_headers;
 mod auth_cookie;
 mod item_access;

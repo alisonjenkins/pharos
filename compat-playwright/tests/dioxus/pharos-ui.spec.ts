@@ -2,7 +2,8 @@ import { test, expect, type APIRequestContext, type Locator, type Page } from "@
 
 // T51 phase 3 — drive the pharos Dioxus UI (served at `/ui/` by
 // `[server].ui_dir`) end-to-end through a real Chromium: the native app
-// at `/ui/` and legacy management panes at `/ui/manage`.
+// at `/ui/` and its Manage screen at `/ui/manage` (the older app when the
+// native API is off).
 //
 // The native sign-in tests need `[server.native_api].enabled = true`, the
 // test origin in `allowed_origins`, and https; with the API off they skip.
@@ -15,6 +16,9 @@ import { test, expect, type APIRequestContext, type Locator, type Page } from "@
 const PHAROS_URL = process.env.PHAROS_URL ?? "http://127.0.0.1:8096";
 const TEST_USER = process.env.PHAROS_TEST_USER ?? "playwright";
 const TEST_PASS = process.env.PHAROS_TEST_PASS ?? "playwright-test-pw";
+// A screen that failed to load: the bare error line, or the panel with a
+// retry that Home, Browse and Title show since B823.
+const LOAD_ERRORS = "p.pharos-error, .pharos-load-failure";
 
 /** A song as the Jellyfin item list returns it. */
 type Song = { Album?: string; AlbumArtist?: string; Artists?: string[] };
@@ -116,37 +120,51 @@ test.describe("pharos Dioxus UI", () => {
     );
   });
 
-  test("legacy panes at /ui/manage: login form renders, sign-in button present", async ({ page }) => {
+  // Whether the server runs the native API: with it, `/ui/manage` is a
+  // screen of the native app (B921, ADR 0082); without it, the older app.
+  async function nativeApiOn(request: APIRequestContext): Promise<boolean> {
+    const probe = await request.get(`${PHAROS_URL}/pharos/session`, {
+      headers: { Accept: "application/json" },
+    });
+    return probe.status() === 405;
+  }
+
+  test("/ui/manage signed out asks to sign in", async ({ page, request }) => {
     const errors: string[] = [];
     page.on("pageerror", (e) => errors.push(`pageerror: ${e.message}`));
     page.on("requestfailed", (r) => {
-      // Ignore favicon misses + cancellations.
-      if (!r.url().includes("favicon")) {
+      // Ignore favicon misses + cancellations. With the native API off the
+      // app's `/pharos/session` probe is cancelled when Manage falls back
+      // to the older app, which is expected.
+      const cancelled = r.failure()?.errorText === "net::ERR_ABORTED";
+      if (!r.url().includes("favicon") && !cancelled) {
         errors.push(`requestfailed: ${r.url()} — ${r.failure()?.errorText}`);
       }
     });
 
     await page.goto("/ui/manage");
 
-    // App shell renders.
-    await expect(page.locator("header.pharos-banner h1")).toHaveText("pharos");
-
-    // Login form lands without an authed user.
-    await expect(page.locator("form")).toBeVisible();
-    await expect(page.locator('input[type="text"]')).toBeVisible();
-    await expect(page.locator('input[type="password"]')).toBeVisible();
+    if (await nativeApiOn(request)) {
+      // The native app's own sign-in, not a second one for Manage.
+      await expect(page.locator("form#signin")).toBeVisible({ timeout: 10_000 });
+      await expect(page.locator("#signin-name")).toBeVisible();
+      await expect(page.locator("#signin-password")).toBeVisible();
+    } else {
+      await expect(page.locator("header.pharos-banner h1")).toHaveText("pharos");
+      await expect(page.locator('input[type="text"]')).toBeVisible();
+      await expect(page.locator('input[type="password"]')).toBeVisible();
+      await expect(page.locator(".pharos-active-server")).toContainText("Connected to:");
+    }
     await expect(page.getByRole("button", { name: "Sign in" })).toBeVisible();
 
-    // Pre-login chrome surfaces the active server URL.
-    await expect(page.locator(".pharos-active-server")).toContainText(
-      "Connected to:",
-    );
-
-    // No console errors so far.
     expect(errors, errors.join("\n")).toEqual([]);
   });
 
-  test("legacy panes at /ui/manage: server-picker toggle reveals the picker form", async ({ page }) => {
+  test("legacy panes at /ui/manage: server-picker toggle reveals the picker form", async ({ page, request }) => {
+    test.skip(
+      await nativeApiOn(request),
+      "native API is on, so /ui/manage is the native app, which has no server picker",
+    );
     await page.goto("/ui/manage");
     await page.locator(".pharos-switch-server").click();
     await expect(page.locator(".pharos-server-picker")).toBeVisible();
@@ -160,7 +178,7 @@ test.describe("pharos Dioxus UI", () => {
     ).toHaveValue(new RegExp(PHAROS_URL.replace(/^https?:\/\//, "")));
   });
 
-  test("legacy panes at /ui/manage: login with seeded creds reaches the library nav", async ({ page }) => {
+  test("an admin signs in at /ui/manage and lands on Users", async ({ page, request }) => {
     const auth = await page.request.post(
       `${PHAROS_URL}/Users/AuthenticateByName`,
       {
@@ -177,18 +195,30 @@ test.describe("pharos Dioxus UI", () => {
     );
 
     await page.goto("/ui/manage");
-    await page.locator('input[type="text"]').fill(TEST_USER);
-    await page.locator('input[type="password"]').fill(TEST_PASS);
+
+    if (!(await nativeApiOn(request))) {
+      await page.locator('input[type="text"]').fill(TEST_USER);
+      await page.locator('input[type="password"]').fill(TEST_PASS);
+      await page.getByRole("button", { name: "Sign in" }).click();
+      await expect(page.locator(".pharos-nav-library")).toBeVisible({ timeout: 10_000 });
+      return;
+    }
+
+    await page.locator("#signin-name").fill(TEST_USER);
+    await page.locator("#signin-password").fill(TEST_PASS);
     await page.getByRole("button", { name: "Sign in" }).click();
 
-    // Authenticated chrome lights up — nav buttons rendered.
-    await expect(page.locator(".pharos-nav-library")).toBeVisible({
-      timeout: 10_000,
-    });
-    await expect(page.locator(".pharos-nav-search")).toBeVisible();
-    await expect(page.locator(".pharos-nav-livetv")).toBeVisible();
-    await expect(page.locator(".pharos-nav-prefs")).toBeVisible();
-    await expect(page.locator(".pharos-nav-remote")).toBeVisible();
+    // Manage opens under the app's own header, on the Users page, with the
+    // seeded admin's card marked as theirs (V881: no Delete, no switch).
+    await expect(page.locator(".pharos-shell-bar")).toBeVisible({ timeout: 15_000 });
+    await expect(page.locator("#manage-heading")).toHaveText("Users", { timeout: 15_000 });
+    await expect(
+      page.locator(".pharos-settings-nav").getByRole("button", { name: "Users" }),
+    ).toHaveAttribute("aria-current", "page");
+    const own = page.locator(".pharos-admin-user", { has: page.locator(".is-you") });
+    await expect(own).toHaveCount(1);
+    await expect(own.locator(".pharos-admin-user-delete")).toHaveCount(0);
+    await expect(own.getByRole("switch")).toBeDisabled();
   });
 
   test.describe("native app at /ui/", () => {
@@ -331,7 +361,8 @@ test.describe("pharos Dioxus UI", () => {
       await account.click();
       // Not an admin: no Manage.
       await expect(page.getByRole("menuitem", { name: "Manage" })).toHaveCount(0);
-      await page.getByRole("menuitem", { name: "Account" }).click();
+      await page.getByRole("menuitem", { name: "Settings" }).click();
+      await page.getByRole("link", { name: "Account", exact: true }).click();
       await expect(page).toHaveURL(/\/ui\/settings\/account$/);
 
       const form = page.locator("form#change-password");
@@ -465,7 +496,8 @@ test.describe("pharos Dioxus UI", () => {
       const account = page.getByRole("button", { name: "Account", exact: true });
       await expect(account.locator("img")).toHaveCount(0);
       await account.click();
-      await page.getByRole("menuitem", { name: "Account" }).click();
+      await page.getByRole("menuitem", { name: "Settings" }).click();
+      await page.getByRole("link", { name: "Account", exact: true }).click();
 
       // A noisy picture well over the 768 KiB a message may carry, so the
       // browser has to scale it down before it sends it.
@@ -582,7 +614,7 @@ test.describe("pharos Dioxus UI", () => {
         timeout: 15_000,
       });
       await expect(page.locator("ul.pharos-grid li").first()).toBeVisible();
-      await expect(page.locator("p.pharos-error")).toHaveCount(0);
+      await expect(page.locator(LOAD_ERRORS)).toHaveCount(0);
 
       // A series is the show page: its name over the season's episodes.
       await page.goto(`/ui/browse/${nativeSynth(episode.SeriesId)}`);
@@ -590,7 +622,7 @@ test.describe("pharos Dioxus UI", () => {
         timeout: 15_000,
       });
       await expect(page.locator("ol.pharos-episodes li").first()).toBeVisible();
-      await expect(page.locator("p.pharos-error")).toHaveCount(0);
+      await expect(page.locator(LOAD_ERRORS)).toHaveCount(0);
 
       // A season opens the same page with that season shown.
       await page.goto(`/ui/browse/${nativeSynth(episode.SeasonId)}`);
@@ -601,7 +633,7 @@ test.describe("pharos Dioxus UI", () => {
         page.locator("section.pharos-show").getByText(/^Season 1$/).first(),
       ).toBeVisible();
       await expect(page.locator("ol.pharos-episodes li").first()).toBeVisible();
-      await expect(page.locator("p.pharos-error")).toHaveCount(0);
+      await expect(page.locator(LOAD_ERRORS)).toHaveCount(0);
 
       // An episode row plays it.
       await page.locator("ol.pharos-episodes li a.pharos-episode-play").first().click();
@@ -676,7 +708,7 @@ test.describe("pharos Dioxus UI", () => {
         seen = now;
       }
       expect(seen, "every title loads once the grid is scrolled").toBe(total);
-      await expect(page.locator("p.pharos-error")).toHaveCount(0);
+      await expect(page.locator(LOAD_ERRORS)).toHaveCount(0);
       await expect(page.getByRole("button", { name: "Show more" })).toHaveCount(0);
     });
 
@@ -704,9 +736,18 @@ test.describe("pharos Dioxus UI", () => {
 
       // Sideways input still moves the rail and leaves the page: a
       // horizontal wheel or trackpad swipe, then Shift+wheel. The page moved,
-      // so point at the rail again.
+      // so point at the rail again, at the middle of the part still on
+      // screen: the rail's own middle can have scrolled off the top, and a
+      // wheel off the viewport reaches no element. Firefox lands the rail
+      // 30 px higher than Chromium does, which put its middle above the top.
       const moved = await rail.boundingBox();
-      await page.mouse.move(moved!.x + moved!.width / 2, moved!.y + moved!.height / 2);
+      const view = page.viewportSize()!;
+      const shown = {
+        top: Math.max(moved!.y, 0),
+        bottom: Math.min(moved!.y + moved!.height, view.height),
+      };
+      expect(shown.bottom - shown.top, "some of the rail is still on screen").toBeGreaterThan(20);
+      await page.mouse.move(moved!.x + moved!.width / 2, (shown.top + shown.bottom) / 2);
       await frames();
       const y = await page.evaluate(() => window.scrollY);
       await page.mouse.wheel(120, 0);
@@ -886,7 +927,7 @@ test.describe("pharos Dioxus UI", () => {
         String(new Date().getUTCFullYear()),
       );
       await expect(tiles.first()).toBeVisible();
-      await expect(page.locator("p.pharos-error")).toHaveCount(0);
+      await expect(page.locator(LOAD_ERRORS)).toHaveCount(0);
       await page.evaluate(() => window.scrollTo(0, 0));
     });
 
@@ -1115,7 +1156,7 @@ test.describe("pharos Dioxus UI", () => {
       });
       const tiles = page.locator("ul.pharos-grid .pharos-poster-name");
       await expect(tiles).toHaveText(["Another Show", "Playwright Show"]);
-      await expect(page.locator("p.pharos-error")).toHaveCount(0);
+      await expect(page.locator(LOAD_ERRORS)).toHaveCount(0);
 
       // Series -> the show page with its three episodes.
       await tiles.filter({ hasText: "Playwright Show" }).click();
@@ -1124,7 +1165,7 @@ test.describe("pharos Dioxus UI", () => {
       });
       const episodes = page.locator("ol.pharos-episodes li");
       await expect(episodes).toHaveCount(3);
-      await expect(page.locator("p.pharos-error")).toHaveCount(0);
+      await expect(page.locator(LOAD_ERRORS)).toHaveCount(0);
 
       // Episode -> its title page, named as the row was.
       const row = (await episodes.first().locator(".pharos-episode-name").innerText()).trim();
@@ -1134,7 +1175,7 @@ test.describe("pharos Dioxus UI", () => {
       await expect(page.locator("article.pharos-title h2")).toHaveText(name, {
         timeout: 15_000,
       });
-      await expect(page.locator("p.pharos-error")).toHaveCount(0);
+      await expect(page.locator(LOAD_ERRORS)).toHaveCount(0);
     });
 
     // B318: the library buttons and the breadcrumb trail.
@@ -1207,7 +1248,7 @@ test.describe("pharos Dioxus UI", () => {
       await expect(page.locator("section.pharos-browse h2")).toHaveText("Bulk", {
         timeout: 15_000,
       });
-      await expect(page.locator("p.pharos-error")).toHaveCount(0);
+      await expect(page.locator(LOAD_ERRORS)).toHaveCount(0);
     });
 
     // B500: an episode row's tick, the season and the show each mark
@@ -1339,7 +1380,7 @@ test.describe("pharos Dioxus UI", () => {
       await expect(tick).toHaveClass(/is-watched/);
       await season.click();
       await expect(tick).not.toHaveClass(/is-watched/);
-      await expect(page.locator("p.pharos-error")).toHaveCount(0);
+      await expect(page.locator(LOAD_ERRORS)).toHaveCount(0);
 
       // Part way through: the title offers Resume and Play from start, and
       // the latter starts at zero.
@@ -1459,7 +1500,7 @@ test.describe("pharos Dioxus UI", () => {
         timeout: 15_000,
       });
       await expect(page.locator("ol.pharos-tracks li").first()).toBeVisible();
-      await expect(page.locator("p.pharos-error")).toHaveCount(0);
+      await expect(page.locator(LOAD_ERRORS)).toHaveCount(0);
     });
 
     test("unknown route renders a message, not a blank page", async ({
@@ -1987,6 +2028,162 @@ test.describe("pharos Dioxus UI", () => {
       );
     });
 
+    // V638, V640, V1062 (spec 031 T16): a segment the browser cannot parse makes
+    // the Rust engine build a fresh MediaSource at the play head, as hls.js's
+    // recoverMediaError does. One bad copy costs one rebuild and playback
+    // goes on past it; a segment that is bad every time spends the budget,
+    // because no rebuild plays far enough to refill it, and then fails.
+    for (const always of [false, true]) {
+      test(`the Rust engine ${always ? "gives up on a segment that never parses" : "rebuilds the MediaSource after a corrupt segment"}`, async ({
+        page,
+        request,
+      }) => {
+        test.setTimeout(120_000);
+        const probe = await request.get(`${PHAROS_URL}/pharos/session`, {
+          headers: { Accept: "application/json" },
+        });
+        test.skip(
+          probe.status() !== 405,
+          `native API is not enabled (status ${probe.status()})`,
+        );
+        const auth = await request.post(
+          `${PHAROS_URL}/Users/AuthenticateByName`,
+          {
+            headers: {
+              "Content-Type": "application/json",
+              "X-Emby-Authorization": `MediaBrowser Client="playwright", Device="pw", DeviceId="pw-rebuild-${Date.now()}", Version="0"`,
+            },
+            data: { Username: TEST_USER, Pw: TEST_PASS },
+          },
+        );
+        test.skip(!auth.ok(), `pharos has no seeded test user (${TEST_USER})`);
+        const { AccessToken: token, User: user } = await auth.json();
+        const api = { "X-Emby-Token": token };
+        const fixture = async () =>
+          (
+            await (
+              await request.get(
+                `${PHAROS_URL}/Users/${user.Id}/Items?Recursive=true&IncludeItemTypes=Movie&Fields=Path,MediaSources`,
+                { headers: api },
+              )
+            ).json()
+          ).Items?.find((i: { Path?: string }) =>
+            i.Path?.endsWith("/fixture-1.webm"),
+          );
+        await expect
+          .poll(async () => (await fixture())?.MediaSources?.[0]?.Container, {
+            timeout: 30_000,
+          })
+          .toMatch(/webm/);
+        const movie = await fixture();
+        test.skip(!movie, "pharos has no seeded movie");
+        const nativeId = BigInt(`0x${movie.Id}`).toString();
+        await request.post(`${PHAROS_URL}/Sessions/Playing/Progress`, {
+          headers: api,
+          data: {
+            ItemId: movie.Id,
+            PlaySessionId: `pw-reset-${Date.now()}`,
+            PositionTicks: 0,
+            IsPaused: true,
+          },
+        });
+
+        await page.addInitScript(() => {
+          const canPlayType = HTMLMediaElement.prototype.canPlayType;
+          HTMLMediaElement.prototype.canPlayType = function (type: string) {
+            return /mpegurl|webm|matroska/i.test(type)
+              ? ""
+              : canPlayType.call(this, type);
+          };
+        });
+        const logs: string[] = [];
+        page.on("console", (m) => logs.push(m.text()));
+        // A real segment with an unknown top-level box type (Firefox rejects
+        // it, Chromium skips it) and then a child box claiming to be larger
+        // than its parent (Chromium rejects that). Random bytes may only
+        // read as a box still arriving. Firefox reports it through the
+        // element's decode error, Chromium through the SourceBuffer.
+        let corrupted = 0;
+        await page.route(
+          (url) => /\/h264cmaf\/(?:[^/]+\/)?2\.m4s$/.test(url.pathname),
+          async (route) => {
+            if (!always && corrupted > 0) {
+              await route.continue();
+              return;
+            }
+            const body = Buffer.from(await (await route.fetch()).body());
+            body.write("junk", 4, "latin1");
+            body.writeUInt32BE(0xffff_fff0, 8);
+            corrupted += 1;
+            await route.fulfill({
+              status: 200,
+              contentType: "video/mp4",
+              body,
+            });
+          },
+        );
+
+        await page.goto("/ui/");
+        await page.locator("#signin-name").fill(TEST_USER);
+        await page.locator("#signin-password").fill(TEST_PASS);
+        await page.getByRole("button", { name: "Sign in" }).click();
+        await expect(page.locator(".pharos-shell-bar")).toBeVisible({
+          timeout: 15_000,
+        });
+
+        await page.goto(`/ui/watch/${nativeId}?engine=rust`);
+        const errors = () =>
+          logs.filter((l) =>
+            l.includes("playback error engine=rust type=mediaError"),
+          );
+        const recovered = () =>
+          logs.filter((l) => l.includes("playback recovered engine=rust"));
+
+        if (!always) {
+          await expect.poll(() => errors().length, { timeout: 30_000 }).toBe(1);
+          expect(errors()[0]).toMatch(
+            /details=(?:bufferAppendError|videoDecodeError) .*fatal=true action=recover_media attempt=1 at_ms=\d+ /,
+          );
+          await expect
+            .poll(() => recovered().length, { timeout: 30_000 })
+            .toBe(1);
+          expect(recovered()[0]).toMatch(
+            /action=recover_media attempt=1 at_ms=\d+ took_ms=\d+ /,
+          );
+          const at = () =>
+            page.evaluate(() => {
+              const v = document.getElementById(
+                "pharos-video",
+              ) as HTMLVideoElement | null;
+              return v?.currentTime ?? 0;
+            });
+          await expect.poll(at, { timeout: 60_000 }).toBeGreaterThan(13);
+          expect(corrupted).toBe(1);
+          expect(errors()).toHaveLength(1);
+          expect(logs.filter((l) => l.includes("engine=rust fallback="))).toEqual(
+            [],
+          );
+          return;
+        }
+
+        await expect
+          .poll(() => errors().some((l) => l.includes("action=fail")), {
+            timeout: 60_000,
+          })
+          .toBe(true);
+        expect(
+          errors().map((l) => /action=(\S+) attempt=(\d+)/.exec(l)?.slice(1)),
+        ).toEqual([
+          ["recover_media", "1"],
+          ["recover_media", "2"],
+          ["recover_media", "3"],
+          ["fail", "3"],
+        ]);
+        expect(recovered()).toEqual([]);
+        expect(corrupted).toBe(4);
+      });
+    }
+
     // B733: after the back buffer is trimmed, a seek to just before where the
     // remaining data starts lands in a segment that is only partly buffered.
     // The Rust engine must fetch it again, not wait on data it never asks for.
@@ -2398,7 +2595,9 @@ test.describe("pharos Dioxus UI", () => {
     // B551: a seek that waits on the server shows a spinner over the video,
     // outside the chrome that hides on idle, and it goes once data arrives.
     test("a seek that waits on the server shows a loading spinner", async ({ page, request }) => {
-      test.setTimeout(120_000);
+      // Its waits alone can take ~170 s (30 + 15 + 30 + 30 + 15 + 15 + 3.5 + 30),
+      // before sign-in and the fixture: a slow transcode must not end it early.
+      test.setTimeout(240_000);
       const probe = await request.get(`${PHAROS_URL}/pharos/session`, {
         headers: { Accept: "application/json" },
       });
@@ -2435,14 +2634,18 @@ test.describe("pharos Dioxus UI", () => {
           return /mpegurl|webm|matroska/i.test(type) ? "" : canPlayType.call(this, type);
         };
       });
-      // Hold every segment after the first until released: the seek below
-      // then has to wait on the "server".
+      // Hold every segment but the first one asked for until released: the
+      // seek below then has to wait on the "server". The first is not always
+      // segment 0: an earlier case can leave a resume point, and the page
+      // starts there (B1144).
       let release: () => void = () => {};
       const released = new Promise<void>((r) => (release = r));
       const segment = /\/videos\/[^?]*\/a?(\d+)\.(?:ts|m4s)(?:\?|$)/;
+      let first: number | undefined;
       await page.route(segment, async (route) => {
         const seg = Number(segment.exec(route.request().url())?.[1] ?? 0);
-        if (seg > 0) await released;
+        first ??= seg;
+        if (seg !== first) await released;
         await route.continue();
       });
 
@@ -2460,11 +2663,29 @@ test.describe("pharos Dioxus UI", () => {
       await expect.poll(async () => (await video()).duration, { timeout: 30_000 }).toBeGreaterThan(12);
       const spinner = page.locator(".pharos-watch-loading");
 
-      const { duration } = await video();
+      // Seek well away from where the page started, past the segment it
+      // played: both targets are a held segment (B1144).
+      // Playing from the first segment, so the seek is a real one: Firefox
+      // does not set `seeking` for a seek made with no media data yet.
+      await expect
+        .poll(() => page.evaluate(() => (document.getElementById("pharos-video") as HTMLVideoElement).readyState), {
+          timeout: 30_000,
+        })
+        .toBeGreaterThanOrEqual(2);
+      const { duration, time } = await video();
+      const target = Math.floor(time < duration / 2 ? duration * 0.75 : duration * 0.25);
       await page.evaluate((to) => {
         (document.getElementById("pharos-video") as HTMLVideoElement).currentTime = to;
-      }, Math.floor(duration / 2));
-      await expect(spinner).toBeVisible({ timeout: 5_000 });
+      }, target);
+      // The seek waits on a held segment, so the spinner stays until release
+      // and a long wait cannot pass on a flash. The element says it is seeking
+      // first, so a miss says which side failed.
+      await expect
+        .poll(() => page.evaluate(() => (document.getElementById("pharos-video") as HTMLVideoElement).seeking), {
+          timeout: 15_000,
+        })
+        .toBe(true);
+      await expect(spinner).toBeVisible({ timeout: 15_000 });
       await expect(spinner).toHaveAttribute("role", "status");
       // Still there once the idle chrome has hidden.
       await page.waitForTimeout(3_500);
@@ -2737,6 +2958,86 @@ test.describe("pharos Dioxus UI", () => {
       expect(problems, problems.join("\n")).toEqual([]);
     });
 
+    // The title page offers the tracks before playback, named by language
+    // rather than by code, and the player starts on the one picked there.
+    test("the title page picks the audio track the player starts on", async ({
+      page,
+      request,
+    }) => {
+      test.setTimeout(120_000);
+      const probe = await request.get(`${PHAROS_URL}/pharos/session`, {
+        headers: { Accept: "application/json" },
+      });
+      test.skip(
+        probe.status() !== 405,
+        `native API is not enabled (status ${probe.status()}); skipping native test`,
+      );
+      const auth = await request.post(`${PHAROS_URL}/Users/AuthenticateByName`, {
+        headers: {
+          "Content-Type": "application/json",
+          "X-Emby-Authorization": `MediaBrowser Client="playwright", Device="pw", DeviceId="pw-preplay-${Date.now()}", Version="0"`,
+        },
+        data: { Username: TEST_USER, Pw: TEST_PASS },
+      });
+      test.skip(!auth.ok(), `pharos has no seeded test user (${TEST_USER})`);
+      const { AccessToken: token, User: user } = await auth.json();
+      const dualAudio = async () =>
+        (
+          await (
+            await request.get(
+              `${PHAROS_URL}/Users/${user.Id}/Items?Recursive=true&IncludeItemTypes=Movie&Fields=Path`,
+              { headers: { "X-Emby-Token": token } },
+            )
+          ).json()
+        ).Items?.find((i: { Path?: string }) => i.Path?.endsWith("/08-test-dual-audio.webm"));
+      await expect.poll(dualAudio, { timeout: 60_000 }).toBeTruthy();
+      const movie = await dualAudio();
+      const nativeId = BigInt(`0x${movie.Id}`).toString();
+      const problems: string[] = [];
+      page.on("pageerror", (e) => problems.push(`pageerror: ${e.message}`));
+      // Nothing plays aloud: every media element is muted before it starts.
+      await page.addInitScript(() => {
+        const play = HTMLMediaElement.prototype.play;
+        HTMLMediaElement.prototype.play = function (this: HTMLMediaElement) {
+          this.muted = true;
+          return play.call(this);
+        };
+      });
+      const sessions = new Set<string>();
+      page.on("request", (r) => {
+        const url = new URL(r.url());
+        if (!url.pathname.toLowerCase().startsWith(`/videos/${movie.Id}/`)) return;
+        const session = url.searchParams.get("tag") ?? url.searchParams.get("PlaySessionId");
+        if (session) sessions.add(session);
+      });
+
+      await page.goto("/ui/");
+      await page.locator("#signin-name").fill(TEST_USER);
+      await page.locator("#signin-password").fill(TEST_PASS);
+      await page.getByRole("button", { name: "Sign in" }).click();
+      await expect(page.locator(".pharos-shell-bar")).toBeVisible({ timeout: 15_000 });
+      await page.goto(`/ui/title/${nativeId}`);
+      const before = page.locator(".pharos-title-tracks").getByRole("combobox", { name: "Audio" });
+      await expect(before).toBeVisible({ timeout: 30_000 });
+      const labels = (await before.locator("option").allTextContents()).join(" | ");
+      expect(labels).toMatch(/English/);
+      expect(labels).toMatch(/Japanese/);
+      expect(labels, "tracks are named by language, not by code").not.toMatch(/\b(eng|jpn)\b/i);
+      const japanese = await before
+        .locator("option", { hasText: "Japanese" })
+        .getAttribute("value");
+      await before.selectOption(japanese!);
+      await page.locator(".pharos-title .pharos-actions a.pharos-button").first().click();
+
+      await expect(page.locator(".pharos-controls")).toBeAttached({ timeout: 30_000 });
+      await expect.poll(() => sessions.size, { timeout: 30_000 }).toBe(1);
+      const picker = page.getByRole("combobox", { name: "Audio" });
+      await expect(picker, "the player starts on the track picked before it").toHaveValue(
+        japanese!,
+      );
+      expect(problems, problems.join("\n")).toEqual([]);
+    });
+
     // Spec 019: an image subtitle (DVD here) is drawn by the player from the
     // server's PNGs, so turning it on keeps the playback it has: no new
     // session, no burn. Disarm check: with `subtitle_switch` renegotiating
@@ -2876,13 +3177,221 @@ test.describe("pharos Dioxus UI", () => {
       });
       await page.goto(`/ui/title/${nativeId}`);
       await page.getByRole("link", { name: /^(Play|Resume)$/ }).click();
-      await expect(page.getByText(/^Playback failed: the stream failed/)).toBeVisible({
+      // B806: the failure panel names what happened in plain words and keeps
+      // the raw reason as its details line.
+      await expect(page.getByText(/This video stopped playing\./).first()).toBeVisible({
         timeout: 30_000,
       });
+      await expect(page.getByText(/the stream failed/).first()).toBeVisible();
       expect(
         errors.some((e) => /engine=hlsjs .*fatal=true action=fail/.test(e)),
         errors.join("\n"),
       ).toBe(true);
+    });
+
+    // B1160/V1120: media that will not decode offers a skip past it, which
+    // carries on from further in, plays, and is remembered on the device.
+    // The decode failure is a stand-in: the first element reports
+    // MEDIA_ERR_DECODE after 2 s of playing, as Firefox does on a broken
+    // packet; where it broke is kept for the checks.
+    test("a decode failure offers a skip past the damage", async ({ page, request }) => {
+      test.setTimeout(60_000);
+      const probe = await request.get(`${PHAROS_URL}/pharos/session`, {
+        headers: { Accept: "application/json" },
+      });
+      test.skip(
+        probe.status() !== 405,
+        `native API is not enabled (status ${probe.status()}); skipping native test`,
+      );
+      const auth = await request.post(`${PHAROS_URL}/Users/AuthenticateByName`, {
+        headers: {
+          "Content-Type": "application/json",
+          "X-Emby-Authorization": `MediaBrowser Client="playwright", Device="pw", DeviceId="pw-skip-${Date.now()}", Version="0"`,
+        },
+        data: { Username: TEST_USER, Pw: TEST_PASS },
+      });
+      test.skip(!auth.ok(), `pharos has no seeded test user (${TEST_USER})`);
+      const { AccessToken: token, User: user } = await auth.json();
+      const items = await (
+        await request.get(
+          `${PHAROS_URL}/Users/${user.Id}/Items?Recursive=true&IncludeItemTypes=Movie&Fields=Path`,
+          { headers: { "X-Emby-Token": token } },
+        )
+      ).json();
+      // A two-minute clip the browser plays directly.
+      const movie = items.Items?.find((i: { Path?: string }) =>
+        i.Path?.endsWith("/fixture-1.webm"),
+      );
+      test.skip(!movie, "pharos has no seeded two-minute fixture");
+      const nativeId = BigInt(`0x${movie.Id}`).toString();
+
+      await page.addInitScript(() => {
+        const first = new WeakMap<HTMLMediaElement, number>();
+        const w = window as unknown as { brokeAt?: number };
+        document.addEventListener(
+          "timeupdate",
+          (e) => {
+            const v = e.target;
+            if (!(v instanceof HTMLVideoElement) || w.brokeAt !== undefined) return;
+            if (!first.has(v)) first.set(v, v.currentTime);
+            if (v.currentTime < (first.get(v) ?? 0) + 2) return;
+            w.brokeAt = v.currentTime;
+            Object.defineProperty(v, "error", {
+              configurable: true,
+              get: () => ({ code: 3, message: "stand-in decode error" }),
+            });
+            v.dispatchEvent(new Event("error"));
+          },
+          true,
+        );
+      });
+      const lines: string[] = [];
+      page.on("console", (m) => {
+        if (/^pharos: playback (failure shown|skip)/.test(m.text())) lines.push(m.text());
+      });
+
+      await page.goto("/ui/");
+      await page.locator("#signin-name").fill(TEST_USER);
+      await page.locator("#signin-password").fill(TEST_PASS);
+      await page.getByRole("button", { name: "Sign in" }).click();
+      await expect(page.locator(".pharos-shell-bar")).toBeVisible({
+        timeout: 15_000,
+      });
+      await page.evaluate((id) => localStorage.removeItem(`pharos.skipped.${id}`), nativeId);
+      await page.goto(`/ui/watch/${nativeId}`);
+      const skip = page.locator(".pharos-playback-failure-skip");
+      await expect(skip).toBeVisible({ timeout: 30_000 });
+      const brokeAt = await page.evaluate(
+        () => (window as unknown as { brokeAt: number }).brokeAt,
+      );
+      // Nothing scanned there: a 10 s step from where it broke.
+      const [m, sec] = (await skip.innerText()).replace("Skip to ", "").split(":").map(Number);
+      expect(m * 60 + sec - brokeAt).toBeGreaterThan(8);
+      expect(m * 60 + sec - brokeAt).toBeLessThan(12);
+      await expect(skip).toBeFocused();
+      await expect(page.getByText(/looks damaged/)).toBeVisible();
+      await skip.click();
+      await expect(page.locator(".pharos-playback-failure")).toHaveCount(0, { timeout: 15_000 });
+      await expect
+        .poll(
+          () =>
+            page.evaluate(() => {
+              const v = document.querySelector("video");
+              return v && !v.paused ? v.currentTime : 0;
+            }),
+          { timeout: 20_000 },
+        )
+        .toBeGreaterThan(brokeAt + 9);
+      const stored = await page.evaluate(
+        (id) => localStorage.getItem(`pharos.skipped.${id}`),
+        nativeId,
+      );
+      expect(stored, "the skipped span is remembered").toMatch(/^\d+-\d+$/);
+      expect(
+        lines.some((l) => /kind=stream media=true .*source=step/.test(l)),
+        lines.join("\n"),
+      ).toBe(true);
+      expect(lines.some((l) => /playback skip item=/.test(l)), lines.join("\n")).toBe(true);
+    });
+
+    test("a slow seek says where it is going and offers the way back", async ({
+      page,
+      request,
+    }) => {
+      test.setTimeout(90_000);
+      const probe = await request.get(`${PHAROS_URL}/pharos/session`, {
+        headers: { Accept: "application/json" },
+      });
+      test.skip(
+        probe.status() !== 405,
+        `native API is not enabled (status ${probe.status()}); skipping native test`,
+      );
+      const auth = await request.post(`${PHAROS_URL}/Users/AuthenticateByName`, {
+        headers: {
+          "Content-Type": "application/json",
+          "X-Emby-Authorization": `MediaBrowser Client="playwright", Device="pw", DeviceId="pw-seekwait-${Date.now()}", Version="0"`,
+        },
+        data: { Username: TEST_USER, Pw: TEST_PASS },
+      });
+      test.skip(!auth.ok(), `pharos has no seeded test user (${TEST_USER})`);
+      const { AccessToken: token, User: user } = await auth.json();
+      const items = await (
+        await request.get(
+          `${PHAROS_URL}/Users/${user.Id}/Items?Recursive=true&IncludeItemTypes=Movie&Fields=Path`,
+          { headers: { "X-Emby-Token": token } },
+        )
+      ).json();
+      const movie = items.Items?.find((i: { Path?: string }) =>
+        i.Path?.endsWith("/fixture-1.webm"),
+      );
+      test.skip(!movie, "pharos has no seeded two-minute fixture");
+      const nativeId = BigInt(`0x${movie.Id}`).toString();
+
+      await page.goto("/ui/");
+      await page.locator("#signin-name").fill(TEST_USER);
+      await page.locator("#signin-password").fill(TEST_PASS);
+      await page.getByRole("button", { name: "Sign in" }).click();
+      await expect(page.locator(".pharos-shell-bar")).toBeVisible({
+        timeout: 15_000,
+      });
+      // A stand-in for a seek into a file with no seek index, which waits on
+      // the server reading from the start: once armed, the first seek never
+      // lands (the element stays `seeking`); the next one is real.
+      await page.addInitScript(() => {
+        const w = window as unknown as { slowSeek: { armed: boolean; held?: number } };
+        w.slowSeek = { armed: false };
+        const real = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, "currentTime")!;
+        Object.defineProperty(HTMLMediaElement.prototype, "currentTime", {
+          configurable: true,
+          get() {
+            return real.get!.call(this);
+          },
+          set(t: number) {
+            if (w.slowSeek.armed && w.slowSeek.held === undefined) {
+              w.slowSeek.held = t;
+              Object.defineProperty(this, "seeking", { configurable: true, get: () => true });
+              this.dispatchEvent(new Event("seeking"));
+              return;
+            }
+            if (w.slowSeek.held !== undefined) {
+              delete (this as { seeking?: boolean }).seeking;
+              w.slowSeek = { armed: false };
+            }
+            real.set!.call(this, t);
+          },
+        });
+      });
+      await page.goto(`/ui/watch/${nativeId}`);
+      // Playing, a few seconds in: that is where "go back" returns to.
+      await expect
+        .poll(
+          () =>
+            page.evaluate(() => {
+              const v = document.querySelector("video");
+              return v && !v.paused ? v.currentTime : 0;
+            }),
+          { timeout: 30_000 },
+        )
+        .toBeGreaterThan(3);
+      await page.evaluate(() => {
+        (window as unknown as { slowSeek: { armed: boolean } }).slowSeek.armed = true;
+      });
+      const from = await page.evaluate(() => document.querySelector("video")!.currentTime);
+      await page.locator(".pharos-watch").hover();
+      await page.keyboard.press("8");
+      const card = page.locator('[data-seek-wait="true"]');
+      await expect(card).toBeVisible({ timeout: 15_000 });
+      const held = await page.evaluate(
+        () => (window as unknown as { slowSeek: { held?: number } }).slowSeek.held,
+      );
+      expect(held, "the seek went to 80%").toBeGreaterThan(from + 10);
+      await expect(card).toContainText(/Jumping to \d+:\d\d…/);
+      await expect(card).toContainText(/Waiting \d+ s/);
+      const back = card.getByRole("button", { name: /Go back to \d+:\d\d/ });
+      await back.click();
+      await expect(card).toHaveCount(0, { timeout: 15_000 });
+      const landed = await page.evaluate(() => document.querySelector("video")!.currentTime);
+      expect(Math.abs(landed - from)).toBeLessThan(3);
     });
 
     test("the Appearance page applies, keeps, imports, refuses and exports themes", async ({
@@ -2912,7 +3421,7 @@ test.describe("pharos Dioxus UI", () => {
       await page.locator("#signin-password").fill(TEST_PASS);
       await page.getByRole("button", { name: "Sign in" }).click();
       await page.getByRole("button", { name: "Account", exact: true }).click();
-      await page.getByRole("menuitem", { name: "Appearance" }).click();
+      await page.getByRole("menuitem", { name: "Settings" }).click();
       await expect(page.getByRole("menu")).toHaveCount(0);
       await expect(page).toHaveURL(/\/ui\/settings\/appearance$/);
       await expect(page.locator("li.pharos-theme-card")).toHaveCount(7);
@@ -3080,6 +3589,67 @@ test.describe("pharos Dioxus UI now playing", () => {
     await expect(picker).toBeHidden();
     await expect(trigger).toContainText("Halo");
     await expect(page.getByRole("button", { name: "Pause" })).toBeVisible();
+  });
+});
+
+// B734 / V682: a song is routed through its analyser once it plays, with no
+// visualiser drawing, so its tap's running context keeps the output awake
+// through a pause (V683). B735: the resume names the item, how long it was
+// paused, the wake and the browser.
+test.describe("pharos Dioxus UI music resume", () => {
+  test("a song with the visualiser off is tapped, and its resume says so", async ({
+    page,
+    request,
+  }) => {
+    test.setTimeout(90_000);
+    const probe = await request.get(`${PHAROS_URL}/pharos/session`, {
+      headers: { Accept: "application/json" },
+    });
+    test.skip(probe.status() !== 405, `native API is not enabled (status ${probe.status()})`);
+    const lines: string[] = [];
+    page.on("console", (m) => lines.push(m.text()));
+
+    await page.goto("/ui/");
+    // Off draws no visualiser, the state a shrunk player is in.
+    await page.evaluate(() => localStorage.setItem("pharos.visualiser", "off"));
+    await page.locator("#signin-name").fill(TEST_USER);
+    await page.locator("#signin-password").fill(TEST_PASS);
+    await page.getByRole("button", { name: "Sign in" }).click();
+    await expect(page.locator(".pharos-shell-bar")).toBeVisible({ timeout: 15_000 });
+    await openFirstHit(page, "carefree");
+    await page.getByRole("link", { name: /^(Play|Resume)$/ }).click();
+    await expect(page.locator(".pharos-listen")).toBeVisible({ timeout: 15_000 });
+    await expect(page.locator("canvas.pharos-visualiser")).toHaveCount(0);
+    await expect
+      .poll(() => lines.some((l) => l === "pharos: visualiser tap=connected"), {
+        timeout: 15_000,
+      })
+      .toBe(true);
+    // Firefox starts the tap's context a moment after making it, where
+    // Chromium makes it running: pause once it runs (B1141, V1101). A
+    // context that never starts means the browser has no sound output: see
+    // tests/lib/audio-sink.ts (B1140).
+    const started = () => lines.find((l) => l.startsWith("pharos: visualiser tap context=")) ?? "";
+    await expect.poll(started, { timeout: 5_000 }).not.toBe("");
+    expect(started()).toMatch(/ context=started state=running start_ms=\d+$/);
+
+    const audio = page.locator("#pharos-video");
+    await page.getByRole("button", { name: "Pause" }).click();
+    await expect.poll(() => audio.evaluate((a) => (a as HTMLMediaElement).paused)).toBe(true);
+    await expect
+      .poll(() => lines.find((l) => l.startsWith("pharos: audio output warm ")) ?? "")
+      .toMatch(/reason=paused context_state=running rest_after_ms=300000/);
+    await page.waitForTimeout(1_000);
+    await page.getByRole("button", { name: "Play" }).click();
+    const resumed = () => lines.find((l) => l.startsWith("pharos: resume click_to_playing_ms=")) ?? "";
+    await expect.poll(resumed, { timeout: 15_000 }).toMatch(/item=music/);
+    const line = resumed();
+    expect(line).toMatch(/ context_state=running /);
+    expect(line).not.toMatch(/playing_to_audible_ms=untapped/);
+    expect(line).toMatch(/ context_wake=none /);
+    expect(line).toMatch(/ user_agent=Mozilla\//);
+    const paused = Number(/ paused_ms=(\d+) /.exec(line)?.[1] ?? "0");
+    expect(paused).toBeGreaterThanOrEqual(900);
   });
 });
 
@@ -3704,6 +4274,13 @@ test.describe("pharos Dioxus UI stage", () => {
     await page.mouse.move(box.x + 60, box.y + box.height / 2);
     await page.mouse.down();
     await page.mouse.move(box.x - 2000, box.y - 2000, { steps: 8 });
+    // Playwright's Firefox drops a mouse release off the viewport, so the drag
+    // would never end there: let go at the page's corner instead, where the
+    // window is clamped anyway (B1143). Chromium still lets go off the page,
+    // which the capturing strip must hear.
+    if (page.context().browser()?.browserType().name() === "firefox") {
+      await page.mouse.move(0, 0);
+    }
     await page.mouse.up();
     await expect.poll(async () => (await stage.boundingBox())!.x).toBeLessThan(1);
     expect((await stage.boundingBox())!.y).toBeLessThan(1);
@@ -3875,10 +4452,10 @@ test.describe("pharos Dioxus UI stage", () => {
     expect(plays(lines), "expanding keeps the stream").toBe(2);
   });
 
-  // A play click asks for fullscreen itself (B582): the browser only grants
-  // it inside the click, and the player mounts after. The whole page goes
-  // fullscreen, so the next episode's new player keeps it.
-  test("a film or episode opens fullscreen, but not into the floating window or for a song", async ({
+  // A video opens full-window, inside the browser window rather than in
+  // browser fullscreen (B905), and Esc shrinks it to the compact player so
+  // the library can be browsed while it plays on (V854).
+  test("a video opens full-window, and Esc shrinks it to the compact player", async ({
     page,
     request,
   }) => {
@@ -3887,8 +4464,16 @@ test.describe("pharos Dioxus UI stage", () => {
       headers: { Accept: "application/json" },
     });
     test.skip(probe.status() !== 405, `native API is not enabled (status ${probe.status()})`);
-    const fullscreen = () =>
-      page.evaluate(() => document.fullscreenElement === document.documentElement);
+    const fullscreen = () => page.evaluate(() => document.fullscreenElement !== null);
+    const fillsWindow = () =>
+      page.evaluate(() => {
+        const stage = document.querySelector(".pharos-stage.is-full .pharos-watch");
+        if (!stage) return false;
+        const r = stage.getBoundingClientRect();
+        return (
+          Math.round(r.width) === window.innerWidth && Math.round(r.height) === window.innerHeight
+        );
+      });
     await signIn(page);
 
     await openFirstHit(page, "Playwright");
@@ -3897,25 +4482,26 @@ test.describe("pharos Dioxus UI stage", () => {
     await expect(page.locator(".pharos-stage.is-full .pharos-watch video")).toBeVisible({
       timeout: 15_000,
     });
-    await expect.poll(fullscreen, { message: "a film opens fullscreen" }).toBe(true);
+    await expect.poll(fillsWindow, { message: "a video fills the window" }).toBe(true);
+    expect(await fullscreen(), "a video is not in browser fullscreen").toBe(false);
 
-    // Shrinking to the floating window leaves fullscreen.
-    await page.mouse.move(20, 20);
-    await page.locator(".pharos-watch-top").getByRole("button", { name: "Shrink" }).click();
-    await expect(page.locator(".pharos-stage.is-floating")).toBeVisible();
-    await expect.poll(fullscreen, { message: "the floating window is not fullscreen" }).toBe(false);
-
-    // A play into the floating window stays there, out of fullscreen.
-    await openFirstHit(page, "Playwright");
-    await page.getByRole("link", { name: /^(Play|Resume)$/ }).click();
-    await expect(page.locator(".pharos-stage.is-floating .pharos-watch video")).toBeVisible({
-      timeout: 15_000,
-    });
-    expect(await fullscreen(), "a play into the floating window").toBe(false);
+    // Esc shrinks it; the library shows with the film still playing.
+    await page.keyboard.press("Escape");
+    await expect(page.locator(".pharos-stage.is-floating, .pharos-stage.is-mini")).toBeVisible();
+    await expect(page).not.toHaveURL(/\/ui\/watch\//);
+    await expect(page.locator(".pharos-shell")).toBeVisible();
+    await expect
+      .poll(() =>
+        page.evaluate(() => {
+          const v = document.querySelector<HTMLVideoElement>(".pharos-stage video");
+          return v !== null && !v.ended && v.readyState > 0;
+        }),
+      )
+      .toBe(true);
     await page.locator(".pharos-stage-bar").getByRole("button", { name: "Close" }).click();
     await expect(page.locator(".pharos-stage")).toHaveCount(0);
 
-    // An episode's Play on its show page; Back leaves fullscreen.
+    // An episode's Play on its show page opens full-window too.
     await page.locator(".pharos-brand").click();
     await page.locator("section.pharos-rail h2 a", { hasText: /^TV$/ }).click();
     await page.locator("ul.pharos-grid .pharos-poster-name", { hasText: "Playwright Show" }).click();
@@ -3923,19 +4509,72 @@ test.describe("pharos Dioxus UI stage", () => {
     await expect(page.locator(".pharos-stage.is-full .pharos-watch video")).toBeVisible({
       timeout: 15_000,
     });
-    await expect.poll(fullscreen, { message: "an episode opens fullscreen" }).toBe(true);
-    await page.mouse.move(20, 20);
-    await page.locator(".pharos-watch-top").getByRole("button", { name: "Back", exact: true }).click();
-    await expect.poll(fullscreen, { message: "Back leaves fullscreen" }).toBe(false);
-    await page.locator(".pharos-stage-bar").getByRole("button", { name: "Close" }).click();
+    await expect.poll(fillsWindow, { message: "an episode fills the window" }).toBe(true);
+    expect(await fullscreen(), "an episode is not in browser fullscreen").toBe(false);
 
-    // A song opens its own screen, never fullscreen.
-    await openFirstHit(page, "carefree");
+    // A menu claims Esc first: the open key help closes, the player stays.
+    await page.keyboard.press("?");
+    await expect(page.locator(".pharos-key-help")).toBeVisible();
+    await page.keyboard.press("Escape");
+    await expect(page.locator(".pharos-key-help")).toHaveCount(0);
+    await expect(page.locator(".pharos-stage.is-full .pharos-watch")).toBeVisible();
+
+    // In browser fullscreen the first Esc only leaves it, the next shrinks.
+    await page.keyboard.press("f");
+    await expect.poll(fullscreen, { message: "f enters fullscreen" }).toBe(true);
+    await page.keyboard.press("Escape");
+    await expect.poll(fullscreen, { message: "Esc leaves fullscreen" }).toBe(false);
+    await expect(page.locator(".pharos-stage.is-full .pharos-watch")).toBeVisible();
+    await page.keyboard.press("Escape");
+    await expect(page.locator(".pharos-stage.is-floating, .pharos-stage.is-mini")).toBeVisible();
+  });
+
+  // Films and episodes have a queue of their own (V853): a film added from
+  // its page waits in the player's queue and Next plays it before the next
+  // episode, taking it out of the queue.
+  test("a queued film plays next from the video player's queue", async ({ page, request }) => {
+    test.setTimeout(120_000);
+    const probe = await request.get(`${PHAROS_URL}/pharos/session`, {
+      headers: { Accept: "application/json" },
+    });
+    test.skip(probe.status() !== 405, `native API is not enabled (status ${probe.status()})`);
+    await signIn(page);
+
+    await openFirstHit(page, "Bulk 001");
+    await expect(page).toHaveURL(/\/ui\/title\//);
+    const film = page.url().match(/\/title\/([^/?#]+)/)![1];
+    await page.getByRole("button", { name: /^Add .*Bulk 001 to the queue$/ }).click();
+    await expect(page.locator(".pharos-queue-note")).toHaveText(/added to the queue/);
+
+    await openFirstHit(page, "Playwright");
     await page.getByRole("link", { name: /^(Play|Resume)$/ }).click();
-    await expect(page.locator(".pharos-stage.is-full .pharos-listen")).toBeVisible({
+    await expect(page.locator(".pharos-stage.is-full .pharos-watch video")).toBeVisible({
       timeout: 15_000,
     });
-    expect(await fullscreen(), "a song").toBe(false);
+    await page.mouse.move(20, 20);
+    const toggle = page.locator(".pharos-watch-top").getByRole("button", { name: "Queue, 1 video" });
+    await toggle.click();
+    const panel = page.locator(".pharos-watch #pharos-queue");
+    await expect(panel).toBeVisible();
+    await expect(panel.locator(".pharos-queue-entry")).toHaveText(/Bulk 001/);
+
+    // Esc in the queue closes it, not the player.
+    await panel.getByRole("button", { name: /Bulk 001/ }).first().focus();
+    await page.keyboard.press("Escape");
+    await expect(panel).toHaveCount(0);
+    await expect(page.locator(".pharos-stage.is-full .pharos-watch")).toBeVisible();
+
+    await page.mouse.move(40, 40);
+    await page.getByRole("button", { name: "Next in the queue" }).click();
+    await expect(page).toHaveURL(new RegExp(`/ui/watch/${film}`));
+    await expect(page.locator(".pharos-stage.is-full .pharos-watch video")).toBeVisible({
+      timeout: 15_000,
+    });
+    await page.mouse.move(20, 20);
+    await expect(
+      page.locator(".pharos-watch-top").getByRole("button", { name: "Queue", exact: true }),
+    ).toBeVisible();
+    await expect(page.locator(".pharos-watch #pharos-queue .pharos-queue-entry")).toHaveCount(0);
   });
 
   // The floating window resizes from a top corner, away from the edge it
@@ -3957,7 +4596,7 @@ test.describe("pharos Dioxus UI stage", () => {
       timeout: 15_000,
     });
     await page.mouse.move(20, 20);
-    await page.locator(".pharos-watch-top").getByRole("button", { name: "Shrink" }).click();
+    await page.locator(".pharos-watch .pharos-controls").getByRole("button", { name: "Shrink" }).click();
     const stage = page.locator(".pharos-stage.is-floating");
     await expect(stage).toBeVisible();
     const grip = stage.getByRole("button", { name: "Resize the player with the arrow keys" });
@@ -4004,7 +4643,7 @@ test.describe("pharos Dioxus UI stage", () => {
       timeout: 15_000,
     });
     await page.mouse.move(20, 20);
-    await page.locator(".pharos-watch-top").getByRole("button", { name: "Shrink" }).click();
+    await page.locator(".pharos-watch .pharos-controls").getByRole("button", { name: "Shrink" }).click();
     await expect.poll(async () => (await stage.boundingBox())!.width).toBeCloseTo(width, 0);
     await page.locator(".pharos-stage-bar").getByRole("button", { name: "Close" }).click();
 
@@ -4029,7 +4668,7 @@ test.describe("pharos Dioxus UI stage", () => {
       timeout: 15_000,
     });
     await page.mouse.move(20, 20);
-    await page.locator(".pharos-watch-top").getByRole("button", { name: "Shrink" }).click();
+    await page.locator(".pharos-watch .pharos-controls").getByRole("button", { name: "Shrink" }).click();
     await page.setViewportSize({ width: 320, height: 640 });
     // Every button of the bar lies wholly inside the stage, which clips.
     const clipped = () =>
@@ -4069,7 +4708,7 @@ test.describe("pharos Dioxus UI stage", () => {
       timeout: 15_000,
     });
     await page.mouse.move(20, 20);
-    await page.locator(".pharos-watch-top").getByRole("button", { name: "Shrink" }).click();
+    await page.locator(".pharos-watch .pharos-controls").getByRole("button", { name: "Shrink" }).click();
     await expect(page.locator(".pharos-stage.is-floating")).toBeVisible();
     await page.setViewportSize({ width: 320, height: 180 });
     // Every visible button of the bar lies inside the viewport's height.
@@ -4130,7 +4769,7 @@ test.describe("pharos Dioxus UI stage", () => {
 
     // From the floating window, which keeps playing behind it.
     await page.mouse.move(20, 20);
-    await page.locator(".pharos-watch-top").getByRole("button", { name: "Shrink" }).click();
+    await page.locator(".pharos-watch .pharos-controls").getByRole("button", { name: "Shrink" }).click();
     await expect(page.locator(".pharos-stage.is-floating")).toBeVisible();
     await stagePip.click();
     await expect.poll(pipId).toBe("pharos-video");
@@ -4165,7 +4804,7 @@ test.describe("pharos Dioxus UI stage", () => {
     await expect(page.getByRole("button", { name: "Fullscreen" })).toHaveCount(1);
     await expect(page.getByRole("button", { name: "Picture in picture" })).toHaveCount(0);
     await page.mouse.move(20, 20);
-    await page.locator(".pharos-watch-top").getByRole("button", { name: "Shrink" }).click();
+    await page.locator(".pharos-watch .pharos-controls").getByRole("button", { name: "Shrink" }).click();
     await expect(page.locator(".pharos-stage.is-floating")).toBeVisible();
     await expect(page.getByRole("button", { name: "Picture in picture" })).toHaveCount(0);
   });

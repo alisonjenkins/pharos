@@ -33,6 +33,7 @@ zip = { workspace = true }
 sevenz-rust2 = { workspace = true }
 tar = { workspace = true }
 lopdf = { workspace = true }
+flate2 = { workspace = true }
 # 005-kindle-conversion — `.mobi`/`.azw`/`.azw3` → EPUB, so the three readers
 # jellyfin-web actually ships can open a Kindle file. See the workspace
 # manifest for why this crate rather than a hand-written decoder, and

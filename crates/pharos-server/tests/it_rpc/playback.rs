@@ -4,7 +4,8 @@
 
 use actix_web::test;
 use pharos_api::pharos_capnp::{
-    decision_result, done, error, negotiate_result, playback_grant, session, stream_choice,
+    capabilities, decision_result, done, error, negotiate_result, playback_grant, session,
+    start_tracks_result, stream_choice,
 };
 use pharos_core::{
     MediaItem, MediaKind, MediaProbe, MediaStore as _, TokenStore as _, UserDataStore as _,
@@ -148,6 +149,19 @@ async fn negotiate_at(
     audio: Choice,
     subtitle: Choice,
 ) -> Result<(playback_grant::Client, Decided), String> {
+    negotiate_version(schema_version, session, id, caps, audio, subtitle, "").await
+}
+
+/// `negotiate_at` for one of the item's versions; `""` plays the primary.
+async fn negotiate_version(
+    schema_version: u32,
+    session: &session::Client,
+    id: WireId,
+    caps: &Capabilities,
+    audio: Choice,
+    subtitle: Choice,
+    version: &str,
+) -> Result<(playback_grant::Client, Decided), String> {
     let playback = session.playback_request().send().pipeline.get_playback();
     let mut req = playback.negotiate_request();
     let mut p = req.get();
@@ -159,37 +173,10 @@ async fn negotiate_at(
             WireId::Synth(n) => out.set_synth(n),
         }
     }
-    {
-        let mut c = p.reborrow().init_caps();
-        let set = |list: &[String], mut out: capnp::text_list::Builder<'_>| {
-            for (i, s) in list.iter().enumerate() {
-                out.set(i as u32, s.as_str());
-            }
-        };
-        set(
-            &caps.video_codecs,
-            c.reborrow()
-                .init_video_codecs(caps.video_codecs.len() as u32),
-        );
-        set(
-            &caps.audio_codecs,
-            c.reborrow()
-                .init_audio_codecs(caps.audio_codecs.len() as u32),
-        );
-        set(
-            &caps.containers,
-            c.reborrow().init_containers(caps.containers.len() as u32),
-        );
-        c.set_max_bitrate(caps.max_bitrate);
-        c.set_hdr(caps.hdr);
-        set(
-            &caps.image_subtitles,
-            c.reborrow()
-                .init_image_subtitles(caps.image_subtitles.len() as u32),
-        );
-    }
+    set_caps(p.reborrow().init_caps(), caps);
     set_choice(p.reborrow().init_audio(), audio);
     set_choice(p.reborrow().init_subtitle(), subtitle);
+    p.set_version(version);
     let reply = req.send().promise.await.expect("negotiate");
     match reply.get().unwrap().get_result().unwrap().which().unwrap() {
         negotiate_result::Grant(grant) => {
@@ -200,6 +187,60 @@ async fn negotiate_at(
             Ok((grant, decided))
         }
         negotiate_result::Error(e) => Err(denial(e.unwrap())),
+    }
+}
+
+fn set_caps(mut c: capabilities::Builder<'_>, caps: &Capabilities) {
+    let set = |list: &[String], mut out: capnp::text_list::Builder<'_>| {
+        for (i, s) in list.iter().enumerate() {
+            out.set(i as u32, s.as_str());
+        }
+    };
+    set(
+        &caps.video_codecs,
+        c.reborrow()
+            .init_video_codecs(caps.video_codecs.len() as u32),
+    );
+    set(
+        &caps.audio_codecs,
+        c.reborrow()
+            .init_audio_codecs(caps.audio_codecs.len() as u32),
+    );
+    set(
+        &caps.containers,
+        c.reborrow().init_containers(caps.containers.len() as u32),
+    );
+    c.set_max_bitrate(caps.max_bitrate);
+    c.set_hdr(caps.hdr);
+    set(
+        &caps.image_subtitles,
+        c.reborrow()
+            .init_image_subtitles(caps.image_subtitles.len() as u32),
+    );
+}
+
+/// `Playback.startTracks`: the audio and subtitle a default negotiation
+/// would start `id` on, as `(audio, subtitle)`.
+async fn start_tracks(
+    session: &session::Client,
+    id: u64,
+    caps: &Capabilities,
+) -> Result<(Option<u32>, Option<u32>), String> {
+    let playback = session.playback_request().send().pipeline.get_playback();
+    let mut req = playback.start_tracks_request();
+    let mut p = req.get();
+    p.reborrow()
+        .init_ctx()
+        .set_schema_version(pharos_api::pharos_capnp::SCHEMA_VERSION);
+    p.reborrow().init_id().set_real(id);
+    set_caps(p.reborrow().init_caps(), caps);
+    let reply = req.send().promise.await.expect("startTracks");
+    match reply.get().unwrap().get_result().unwrap().which().unwrap() {
+        start_tracks_result::Tracks(t) => {
+            let t = t.unwrap();
+            Ok((opt(t.get_audio().unwrap()), opt(t.get_subtitle().unwrap())))
+        }
+        start_tracks_result::Error(e) => Err(denial(e.unwrap())),
     }
 }
 
@@ -789,6 +830,105 @@ async fn the_decision_names_its_tracks_and_reports_remember_a_switch() {
     assert_eq!(again.subtitle, Some(3), "{again:?}");
 }
 
+/// A remembered track index names a stream of the primary file, so a
+/// version (another file, another stream layout) starts on its own default,
+/// and its reports leave the item's remembered tracks alone.
+/// Disarm check: with `pick_audio` keeping the remembered index for a
+/// version, the version starts on track 2; with `Grant::at` passing a
+/// version's tracks, the report overwrites the remembered 2.
+#[actix_web::test]
+async fn a_version_neither_uses_nor_overwrites_remembered_tracks() {
+    use pharos_core::{AlternateMediaSource, AudioTrack};
+
+    let (server, fx) = crate::revocation::start().await;
+    seed_playable(&fx).await;
+    let mut item = pharos_core::MediaStore::get(&fx.state.stores, MOVIE)
+        .await
+        .unwrap();
+    let tracks = vec![
+        AudioTrack {
+            stream_index: 1,
+            codec: Some("aac".into()),
+            is_default: true,
+            ..AudioTrack::default()
+        },
+        AudioTrack {
+            stream_index: 2,
+            codec: Some("aac".into()),
+            ..AudioTrack::default()
+        },
+    ];
+    item.probe.audio_tracks = tracks.clone();
+    let copy = item.probe.clone();
+    item.probe.alternate_sources = vec![AlternateMediaSource {
+        id: "copy".into(),
+        path: "/libA/copy/native.mp4".into(),
+        name: Some("Copy".into()),
+        probe: Some(Box::new(copy)),
+        ..Default::default()
+    }];
+    fx.state.stores.put(item).await.unwrap();
+    let mut data = fx
+        .state
+        .stores
+        .get_user_data(fx.user_id, MOVIE)
+        .await
+        .unwrap();
+    data.audio_stream_index = Some(2);
+    fx.state
+        .stores
+        .set_user_data(fx.user_id, MOVIE, data)
+        .await
+        .unwrap();
+    let (client, _closed) = crate::revocation::connect(&server).await;
+    let session = crate::revocation::signed_in(&client, &fx.user_token).await;
+    let direct = caps(&["h264"], &["aac"], &["mp4"]);
+    let schema = pharos_api::pharos_capnp::SCHEMA_VERSION;
+
+    let (_grant, primary) = negotiate(
+        &session,
+        WireId::Real(MOVIE),
+        &direct,
+        Choice::Default,
+        Choice::Default,
+    )
+    .await
+    .unwrap();
+    assert_eq!(primary.audio, Some(2), "{primary:?}");
+
+    let (grant, version) = negotiate_version(
+        schema,
+        &session,
+        WireId::Real(MOVIE),
+        &direct,
+        Choice::Default,
+        Choice::Default,
+        "copy",
+    )
+    .await
+    .unwrap();
+    assert_eq!(version.audio, Some(1), "{version:?}");
+
+    let mut req = grant.report_request();
+    req.get().init_ctx();
+    req.get().set_position_ms(5_000);
+    set_choice(req.get().init_audio(), Choice::Index(1));
+    set_choice(req.get().init_subtitle(), Choice::Off);
+    let reply = req.send().promise.await.expect("report");
+    read_done(reply.get().unwrap().get_result().unwrap()).unwrap();
+    let data = fx
+        .state
+        .stores
+        .get_user_data(fx.user_id, MOVIE)
+        .await
+        .unwrap();
+    assert_eq!(
+        (data.audio_stream_index, data.subtitle_stream_index),
+        (Some(2), None)
+    );
+    assert_eq!(data.last_played_position_ticks, 5_000 * 10_000);
+}
+
 /// MOVIE with a `dvd_subtitle` at stream 3 and an ASS at stream 4.
 async fn seed_image_subtitle(fx: &Fixture) {
     use pharos_core::SubtitleTrack;
@@ -1008,6 +1148,78 @@ async fn the_styled_track_negotiates_as_its_source_track() {
     assert_eq!(resumed.method, source.method);
 }
 
+/// B853 (V803): with nothing chosen, a playback whose default subtitle is the
+/// styled track's source starts on the styled track, and `startTracks` says
+/// so. A stated pick, the source itself or off, still wins.
+#[actix_web::test]
+async fn the_styled_track_is_the_default_where_its_source_would_show() {
+    use pharos_core::{MediaStore as _, SubtitleStylingStore as _};
+
+    let (server, fx) = crate::revocation::start().await;
+    let (dir, mut item) = crate::styled_track::seed(&fx, 403).await;
+    // No sidecar, and an embedded English ASS flagged default (an anime
+    // release's usual shape), so the default rules pick it and the styled
+    // slot is the first past the embedded streams.
+    std::fs::remove_file(dir.path().join("Show.eng.ass")).unwrap();
+    item.probe.subtitle_tracks[0].is_default = true;
+    item.probe.subtitle_tracks[0].language = Some("eng".into());
+    item.probe.audio_tracks = vec![pharos_core::AudioTrack {
+        stream_index: 1,
+        codec: Some("aac".into()),
+        is_default: true,
+        ..pharos_core::AudioTrack::default()
+    }];
+    fx.state.stores.put(item.clone()).await.unwrap();
+    let (client, _closed) = crate::revocation::connect(&server).await;
+    let session = crate::revocation::signed_in(&client, &fx.user_token).await;
+    let direct = caps(&["h264"], &["aac"], &["mp4"]);
+    let id = WireId::Real(403);
+    let styled_slot = 3;
+
+    let (_g, plain) = negotiate(&session, id, &direct, Choice::Default, Choice::Default)
+        .await
+        .unwrap();
+    assert_eq!(
+        plain.subtitle,
+        Some(2),
+        "the flagged track is the default without a plan"
+    );
+
+    fx.state
+        .stores
+        .put_subtitle_styling(crate::styled_track::styling_row(&item, 2, None))
+        .await
+        .unwrap();
+    let (_g, styled) = negotiate(&session, id, &direct, Choice::Default, Choice::Default)
+        .await
+        .unwrap();
+    assert_eq!(styled.subtitle, Some(styled_slot), "{styled:?}");
+    assert_eq!(styled.method, plain.method, "it decides like its source");
+    assert_eq!(
+        start_tracks(&session, 403, &direct).await.unwrap().1,
+        Some(styled_slot)
+    );
+    let (_g, source) = negotiate(&session, id, &direct, Choice::Default, Choice::Index(2))
+        .await
+        .unwrap();
+    assert_eq!(source.subtitle, Some(2), "the source picked by name stays");
+    let (_g, off) = negotiate(&session, id, &direct, Choice::Default, Choice::Off)
+        .await
+        .unwrap();
+    assert_eq!(off.subtitle, None, "off stays off");
+
+    // A plan made from another track leaves the default alone.
+    fx.state
+        .stores
+        .put_subtitle_styling(crate::styled_track::styling_row(&item, 7, None))
+        .await
+        .unwrap();
+    let (_g, other) = negotiate(&session, id, &direct, Choice::Default, Choice::Default)
+        .await
+        .unwrap();
+    assert_eq!(other.subtitle, Some(2), "{other:?}");
+}
+
 const HDR_MOVIE: u64 = 302;
 
 async fn seed_hdr10(fx: &Fixture) {
@@ -1186,4 +1398,235 @@ async fn video_range_unenforced_plays_on_and_counts_the_would_block() {
         })
         .sum();
     assert_eq!(counted, 1, "one HDR10 would-block, none for the SDR source");
+}
+
+/// `Playback.startTracks` answers the tracks a default negotiation starts
+/// on: the language rules, then the remembered audio and subtitle, then a
+/// remembered subtitle-off. Each answer is checked against the grant's own
+/// decision, not a recomputation.
+#[actix_web::test]
+async fn start_tracks_answer_what_a_default_negotiation_would_play() {
+    use pharos_core::{AudioTrack, SubtitleTrack};
+
+    let (server, fx) = crate::revocation::start().await;
+    seed_playable(&fx).await;
+    let mut item = pharos_core::MediaStore::get(&fx.state.stores, MOVIE)
+        .await
+        .unwrap();
+    item.probe.audio_tracks = vec![
+        AudioTrack {
+            stream_index: 1,
+            codec: Some("aac".into()),
+            is_default: true,
+            ..AudioTrack::default()
+        },
+        AudioTrack {
+            stream_index: 2,
+            codec: Some("aac".into()),
+            ..AudioTrack::default()
+        },
+    ];
+    item.probe.subtitle_tracks = vec![SubtitleTrack {
+        stream_index: 3,
+        codec: Some("subrip".into()),
+        is_default: true,
+        ..SubtitleTrack::default()
+    }];
+    fx.state.stores.put(item).await.unwrap();
+    let (client, _closed) = crate::revocation::connect(&server).await;
+    let session = crate::revocation::signed_in(&client, &fx.user_token).await;
+    let direct = caps(&["h264"], &["aac"], &["mp4"]);
+
+    // Nothing remembered: the language rules pick the default tracks.
+    let (_grant, played) = negotiate(
+        &session,
+        WireId::Real(MOVIE),
+        &direct,
+        Choice::Default,
+        Choice::Default,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        (played.audio, played.subtitle),
+        (Some(1), Some(3)),
+        "{played:?}"
+    );
+    assert_eq!(
+        start_tracks(&session, MOVIE, &direct).await,
+        Ok((played.audio, played.subtitle))
+    );
+
+    // A report remembers audio track 2 and subtitle track 3.
+    let (grant, _) = negotiate(
+        &session,
+        WireId::Real(MOVIE),
+        &direct,
+        Choice::Index(2),
+        Choice::Index(3),
+    )
+    .await
+    .unwrap();
+    let mut req = grant.report_request();
+    req.get().init_ctx();
+    req.get().set_position_ms(5_000);
+    set_choice(req.get().init_audio(), Choice::Index(2));
+    set_choice(req.get().init_subtitle(), Choice::Index(3));
+    let reply = req.send().promise.await.expect("report");
+    read_done(reply.get().unwrap().get_result().unwrap()).unwrap();
+    let (grant, played) = negotiate(
+        &session,
+        WireId::Real(MOVIE),
+        &direct,
+        Choice::Default,
+        Choice::Default,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        (played.audio, played.subtitle),
+        (Some(2), Some(3)),
+        "{played:?}"
+    );
+    assert_eq!(
+        start_tracks(&session, MOVIE, &direct).await,
+        Ok((played.audio, played.subtitle))
+    );
+
+    // A report that turns subtitles off remembers the off, and it sticks.
+    let mut req = grant.report_request();
+    req.get().init_ctx();
+    req.get().set_position_ms(6_000);
+    set_choice(req.get().init_audio(), Choice::Default);
+    set_choice(req.get().init_subtitle(), Choice::Off);
+    let reply = req.send().promise.await.expect("report");
+    read_done(reply.get().unwrap().get_result().unwrap()).unwrap();
+    let data = fx
+        .state
+        .stores
+        .get_user_data(fx.user_id, MOVIE)
+        .await
+        .unwrap();
+    assert_eq!(data.subtitle_stream_index, Some(-1), "{data:?}");
+    let (_grant, played) = negotiate(
+        &session,
+        WireId::Real(MOVIE),
+        &direct,
+        Choice::Default,
+        Choice::Default,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        (played.audio, played.subtitle),
+        (Some(2), None),
+        "{played:?}"
+    );
+    assert_eq!(
+        start_tracks(&session, MOVIE, &direct).await,
+        Ok((played.audio, played.subtitle))
+    );
+
+    // A book has no tracks to play.
+    assert!(start_tracks(&session, BOOK, &direct).await.is_err());
+}
+
+/// T130 / V1011: the native grant reads the deny list of the device its token
+/// was issued to, as PlaybackInfo does, so the two APIs agree.
+/// Disarm check: without the lookup in `playback::grant`, the second
+/// negotiation direct-plays.
+#[actix_web::test]
+async fn a_device_audio_deny_list_stops_a_native_direct_play() {
+    use pharos_store_sqlx::ServerConfigStore as _;
+    let (server, fx) = crate::revocation::start().await;
+    seed_playable(&fx).await;
+    // AAC is the conversion codec and a saved deny entry for it is ignored
+    // (V1012), so deny the source's E-AC-3 instead.
+    fx.state
+        .stores
+        .put(MediaItem {
+            id: MOVIE,
+            path: "/libA/native.mp4".into(),
+            title: "Native".into(),
+            kind: MediaKind::Movie,
+            probe: MediaProbe {
+                duration_ms: Some(60_000),
+                width: Some(1920),
+                height: Some(1080),
+                bitrate_bps: Some(4_000_000),
+                container: Some("mp4".into()),
+                video_codec: Some("h264".into()),
+                audio_codec: Some("eac3".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let (client, _closed) = crate::revocation::connect(&server).await;
+    let session = crate::revocation::signed_in(&client, &fx.user_token).await;
+    let direct = caps(&["h264"], &["eac3"], &["mp4"]);
+    let decide = || async {
+        negotiate(
+            &session,
+            WireId::Real(MOVIE),
+            &direct,
+            Choice::Default,
+            Choice::Default,
+        )
+        .await
+        .unwrap()
+        .1
+    };
+    assert_eq!(decide().await.method, "direct_play", "control");
+
+    fx.state
+        .stores
+        .set_named_config(&playback::denied_audio_codecs_key("test"), r#"["eac3"]"#)
+        .await
+        .unwrap();
+    let denied = decide().await;
+    assert_ne!(denied.method, "direct_play");
+    assert_eq!(denied.block, "audio_codec_denied");
+}
+
+async fn queue_hint(grant: &playback_grant::Client) -> Result<(u32, u64, u32, bool), String> {
+    let mut req = grant.queue_hint_request();
+    req.get().init_ctx();
+    let reply = req.send().promise.await.expect("queue hint");
+    match reply.get().unwrap().get_result().unwrap().which().unwrap() {
+        pharos_api::pharos_capnp::queue_hint_result::Hint(h) => {
+            let h = h.unwrap();
+            Ok((
+                h.get_queued(),
+                h.get_waited_ms(),
+                h.get_others_queued(),
+                h.get_busy(),
+            ))
+        }
+        pharos_api::pharos_capnp::queue_hint_result::Error(e) => Err(denial(e.unwrap())),
+    }
+}
+
+/// 038 FR-402, V1217: a player waiting on its stream can ask what it waits
+/// behind while the wait is on. A server with no encoder queue answers that
+/// nothing is queued, rather than failing. The queue's own counts are pinned
+/// in the scheduler's `stream_wait` test.
+#[actix_web::test]
+async fn a_grant_answers_what_its_playback_waits_behind() {
+    let (server, fx) = crate::revocation::start().await;
+    seed_playable(&fx).await;
+    let (client, _closed) = crate::revocation::connect(&server).await;
+    let session = crate::revocation::signed_in(&client, &fx.user_token).await;
+    let direct = caps(&["h264"], &["aac"], &["mp4"]);
+    let (grant, _) = negotiate(
+        &session,
+        WireId::Real(MOVIE),
+        &direct,
+        Choice::Default,
+        Choice::Default,
+    )
+    .await
+    .unwrap();
+    assert_eq!(queue_hint(&grant).await, Ok((0, 0, 0, false)));
 }

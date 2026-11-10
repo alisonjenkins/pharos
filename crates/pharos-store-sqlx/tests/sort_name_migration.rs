@@ -47,7 +47,7 @@ async fn migration_backfills_existing_rows_and_is_idempotent() {
     let url = format!("sqlite://{}", path.display());
     // More rows than one backfill batch (500) so the keyset paging runs.
     let mut titles: Vec<String> = (0..1_203).map(|i| format!("Filler {i}")).collect();
-    titles[0] = "The Matrix".into();
+    titles[0] = "The Glass Lattice".into();
     titles[1] = "Ep 10".into();
     titles[2] = "Ep 2".into();
     let refs: Vec<&str> = titles.iter().map(String::as_str).collect();
@@ -68,7 +68,7 @@ async fn migration_backfills_existing_rows_and_is_idempotent() {
         "every pre-existing row, id 0 included, must be backfilled"
     );
     assert_eq!(rows[0].0, 0);
-    assert_eq!(rows[0].1.as_deref(), Some("matrix"));
+    assert_eq!(rows[0].1.as_deref(), Some("glass lattice"));
     assert_eq!(rows[1].1.as_deref(), Some("ep 00000000000000000010"));
     assert_eq!(rows[2].1.as_deref(), Some("ep 00000000000000000002"));
 
@@ -83,7 +83,7 @@ async fn migration_backfills_existing_rows_and_is_idempotent() {
 async fn connect_fills_old_rows_in_the_background() {
     let path = scratch_db_path("sort-name-migration");
     let url = format!("sqlite://{}", path.display());
-    populated_old_db(&url, &["The Matrix", "Ep 2"]).await;
+    populated_old_db(&url, &["The Glass Lattice", "Ep 2"]).await;
 
     let store = SqliteStore::connect(&url).await.unwrap();
     // `connect` returns before the backfill necessarily finished.
@@ -91,7 +91,7 @@ async fn connect_fills_old_rows_in_the_background() {
     loop {
         let rows = sort_names(&store).await;
         if rows.iter().all(|(_, s)| s.is_some()) {
-            assert_eq!(rows[0].1.as_deref(), Some("matrix"));
+            assert_eq!(rows[0].1.as_deref(), Some("glass lattice"));
             break;
         }
         assert!(
@@ -111,7 +111,12 @@ async fn unfilled_rows_sort_by_title_fold_until_backfilled() {
     let store = SqliteStore::connect_without_backfill("sqlite::memory:")
         .await
         .unwrap();
-    for (id, title) in [(1u64, "Alpha"), (2, "The Matrix"), (3, "Nemo"), (4, "Zeta")] {
+    for (id, title) in [
+        (1u64, "Alpha"),
+        (2, "The Glass Lattice"),
+        (3, "Nemo"),
+        (4, "Zeta"),
+    ] {
         store
             .put(MediaItem {
                 id,
@@ -123,7 +128,7 @@ async fn unfilled_rows_sort_by_title_fold_until_backfilled() {
             .await
             .unwrap();
     }
-    // Put "The Matrix" back into the pre-migration state.
+    // Put "The Glass Lattice" back into the pre-migration state.
     sqlx::query("UPDATE media_items SET sort_name = NULL WHERE id = 2")
         .execute(store.pool())
         .await
@@ -148,12 +153,12 @@ async fn unfilled_rows_sort_by_title_fold_until_backfilled() {
     // The unfilled row keeps its plain-fold position (under T) mid-backfill.
     assert_eq!(
         order(&store).await,
-        vec!["Alpha", "Nemo", "The Matrix", "Zeta"]
+        vec!["Alpha", "Nemo", "The Glass Lattice", "Zeta"]
     );
     store.backfill_sort_names().await.unwrap();
     assert_eq!(
         order(&store).await,
-        vec!["Alpha", "The Matrix", "Nemo", "Zeta"]
+        vec!["Alpha", "The Glass Lattice", "Nemo", "Zeta"]
     );
 }
 
@@ -167,12 +172,15 @@ async fn put_stores_the_sort_name_for_new_and_rewritten_items() {
         kind: MediaKind::Movie,
         ..Default::default()
     };
-    store.put(item("The Matrix")).await.unwrap();
-    assert_eq!(sort_names(&store).await[0].1.as_deref(), Some("matrix"));
-    store.put(item("A Quiet Place")).await.unwrap();
+    store.put(item("The Glass Lattice")).await.unwrap();
     assert_eq!(
         sort_names(&store).await[0].1.as_deref(),
-        Some("quiet place")
+        Some("glass lattice")
+    );
+    store.put(item("A Quartz Road")).await.unwrap();
+    assert_eq!(
+        sort_names(&store).await[0].1.as_deref(),
+        Some("quartz road")
     );
 }
 
@@ -239,7 +247,7 @@ async fn postgres_stores_and_backfills_sort_names() {
         .put(MediaItem {
             id: id as u64,
             path: "/m/sort-name-pg-put.mkv".into(),
-            title: "The Matrix".into(),
+            title: "The Glass Lattice".into(),
             kind: MediaKind::Movie,
             ..Default::default()
         })
@@ -250,7 +258,7 @@ async fn postgres_stores_and_backfills_sort_names() {
         .fetch_one(store.pool())
         .await
         .unwrap();
-    assert_eq!(put.0.as_deref(), Some("matrix"));
+    assert_eq!(put.0.as_deref(), Some("glass lattice"));
 
     // A row that predates the column: NULL until the next connect.
     let old_id = id + 1;

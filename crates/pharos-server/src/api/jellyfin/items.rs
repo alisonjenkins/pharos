@@ -1931,7 +1931,7 @@ async fn shows_episodes(
         .filter(|(_, item)| matches!(item.kind, MediaKind::Episode))
         .filter(|(_, item)| {
             item.series.as_ref().is_some_and(|s| {
-                series_id_for_key(s.series_folder.as_deref(), &s.series_name) == series_id
+                series_id_for_key(s.identity_folder(), &s.series_name) == series_id
             })
         })
         .filter(|(_, item)| {
@@ -1940,7 +1940,7 @@ async fn shows_episodes(
             };
             item.series.as_ref().is_some_and(|s| {
                 s.season_number.is_some_and(|n| {
-                    season_id_for_key(s.series_folder.as_deref(), &s.series_name, n) == want
+                    season_id_for_key(s.identity_folder(), &s.series_name, n) == want
                 })
             })
         })
@@ -2038,7 +2038,7 @@ async fn shows_seasons(
         .filter(|item| matches!(item.kind, MediaKind::Episode))
         .filter(|item| {
             item.series.as_ref().is_some_and(|s| {
-                series_id_for_key(s.series_folder.as_deref(), &s.series_name) == series_id
+                series_id_for_key(s.identity_folder(), &s.series_name) == series_id
             })
         })
         .collect();
@@ -2178,12 +2178,10 @@ async fn playback_info(
     body: Option<web::Json<PlaybackInfoBody>>,
 ) -> Result<impl Responder, actix_web::Error> {
     let id_str = path.into_inner();
-    // The HLS master/variant playlists and every segment authenticate via an
-    // `api_key` query param — hls.js fetches them with no auth header, so the
-    // TranscodingUrl handed to the client MUST carry the caller's token or the
-    // very first `master.m3u8` request 401s and playback dies with a fatal
-    // `manifestLoadError`. Recover the bearer that authenticated THIS request.
-    let api_key = crate::api::jellyfin::auth_extractor::extract_token(&req).unwrap_or_default();
+    // The token that authenticated THIS request: the play session it mints
+    // ends with it (B256). It never goes into a URL: the PlaySessionId every
+    // transcode, subtitle and font URL carries is their credential (V1050).
+    let token = crate::api::jellyfin::auth_extractor::extract_token(&req).unwrap_or_default();
     let id: u64 = pharos_jellyfin_api::dto::parse_item_id(&id_str)
         .ok_or_else(|| error::ErrorBadRequest("invalid id"))?;
     // Canonical wire form regardless of which shape the caller sent —
@@ -2273,7 +2271,7 @@ async fn playback_info(
     // The session ends with the token that negotiated it (B256).
     let holder = pharos_core::SessionHolder {
         user_id: user.0.id,
-        token_id: pharos_core::TokenStore::token_id(&state.stores, &api_key),
+        token_id: pharos_core::TokenStore::token_id(&state.stores, &token),
     };
     let is_video = matches!(item.kind, MediaKind::Movie | MediaKind::Episode);
     let probe = &item.probe;
@@ -2281,7 +2279,7 @@ async fn playback_info(
     // Consume the POST body once: the DeviceProfile drives negotiation, and
     // the track picks (present when jellyfin-web reloads for an audio/subtitle
     // switch) fall back into the transcode URL below.
-    let (profile, body_audio_index, body_subtitle_index, switches) = match body {
+    let (mut profile, body_audio_index, body_subtitle_index, switches) = match body {
         Some(b) => {
             let switches = playback_switches_from_body(&b);
             (
@@ -2321,6 +2319,7 @@ async fn playback_info(
         .and_then(|v| v.to_str().ok())
         .is_some_and(|ua| ua.contains("Mozilla"));
 
+    profile.denied_audio_codecs = playback::denied_audio_codecs_for_token(&state, &token).await;
     let negotiated = playback::negotiate(
         &state,
         &item,
@@ -2366,12 +2365,12 @@ async fn playback_info(
             item_wire_id: &id_str,
             source_param: &source_param,
             play_session_id: &play_session_id,
-            api_key: Some(&api_key),
             audio_stream_index,
             explicit_subtitle_index,
             is_web_client,
             resume_ticks,
             transcoding: switches.transcoding,
+            size_limits: super::output_size::qs_size_limits(req.query_string()),
         },
     );
     let renditions_param = renditions.join(",");
@@ -2583,6 +2582,9 @@ async fn playback_info(
             audio_idx,
             sub_idx,
             video_bitrate_cap,
+            // The bounds the URL carries, so the prewarmed segments are keyed
+            // by the size the client's own requests will plan.
+            super::output_size::qs_size_limits(url),
             // B136 — warm the segments playback will actually START on. This is
             // the same value that rides `start_position_ticks` in the response
             // (and, for native players, `StartTimeTicks` on the transcoding
@@ -2661,7 +2663,7 @@ async fn playback_info(
     // jellyfin-web names none and trusts the server's pick (it only appends
     // `AudioStreamIndex` after a manual switch). So the pick that sets
     // `DefaultAudioStreamIndex` was shown selected in the UI while the audio
-    // rendition played the default track: Aliens (three Ukrainian tracks ahead
+    // rendition played the default track: Film AL (three Ukrainian tracks ahead
     // of its English DTS-HD MA) selected English yet played Ukrainian; Campfire
     // (English default ahead of Japanese) selected Japanese yet played English.
     // The index is ABSOLUTE — the same form the client sends on a switch and
@@ -2751,7 +2753,8 @@ async fn playback_info(
     // alternate matches.
     let mut media_sources = Vec::with_capacity(1 + probe.alternate_sources.len());
     media_sources.push(primary_source);
-    for alt in &probe.alternate_sources {
+    // A split film's later parts are no versions of it (V1153).
+    for alt in probe.versions() {
         let alt_id = format!("{id_str}-{}", alt.id);
         // An alternate is never direct play (`Default`), so it is transcoded.
         let alt_3d_format = advertised_3d_format(alt.video_3d_format, false);
@@ -2790,23 +2793,21 @@ async fn playback_info(
 
     // V189 — subtitle and font files answer only an authenticated request,
     // and a `<track>` or font fetch cannot send a header: their URLs carry
-    // the caller's own token, as the transcode URLs above do.
-    if !api_key.is_empty() {
-        for source in &mut media_sources {
-            let streams = source
-                .media_streams
-                .iter_mut()
-                .filter_map(|s| s.delivery_url.as_mut());
-            let fonts = source
-                .media_attachments
-                .iter_mut()
-                .map(|a| &mut a.delivery_url);
-            for url in streams.chain(fonts) {
-                let sep = if url.contains('?') { '&' } else { '?' };
-                url.push(sep);
-                url.push_str("api_key=");
-                url.push_str(&api_key);
-            }
+    // the play session as the transcode URLs do, never the token (V1050).
+    for source in &mut media_sources {
+        let streams = source
+            .media_streams
+            .iter_mut()
+            .filter_map(|s| s.delivery_url.as_mut());
+        let fonts = source
+            .media_attachments
+            .iter_mut()
+            .map(|a| &mut a.delivery_url);
+        for url in streams.chain(fonts) {
+            let sep = if url.contains('?') { '&' } else { '?' };
+            url.push(sep);
+            url.push_str("PlaySessionId=");
+            url.push_str(&play_session_id);
         }
     }
     // P4 — top-level resume offset. jellyfin-web reads this when it didn't keep
@@ -3319,6 +3320,7 @@ impl From<&ListQuery> for ItemQuery {
             is_3d: q.is_3d,
             min_width: q.min_width,
             max_width: q.max_width,
+            collapse_collections: false,
         }
     }
 }
@@ -3933,7 +3935,7 @@ async fn list_user_items(
     // `IncludeItemTypes=Series` (or `Season`) browse collapses the scoped
     // episodes into synthetic folder tiles. jellyfin-web's TV-library grid and
     // its "Shows" view both issue this; without the collapse they'd render one
-    // tile per episode instead of one per show, so a series like Code Geass
+    // tile per episode instead of one per show, so a series like Show U
     // never appears as a browsable entry.
     if let Some(resp) = maybe_list_virtual_shows(&state, user.0.id, &user.0.policy, &q).await? {
         return Ok(resp);
@@ -4776,7 +4778,7 @@ pub(crate) fn build_media_query(
     // Season parent) has no meaningful "SortName": ordering by episode TITLE
     // alphabetises the season. Google TV pages a season via
     // /Items?ParentId=<season>&IncludeItemTypes=Episode with NO SortBy, so it
-    // fell through to the SortName default and showed Neon Genesis Evangelion
+    // fell through to the SortName default and showed Show AL
     // S1 as E7 "A Human Work", E3 "A Transfer", E18 "Ambivalence"… (alphabetical).
     // Reused by the explicit-`ParentIndexNumber,IndexNumber` branch below.
     let episode_scoped = mq.kinds.iter().any(|k| matches!(k, MediaKind::Episode))
@@ -5095,9 +5097,9 @@ pub(crate) fn effective_sort_seed(q: &ItemQuery, user_id: UserId) -> u64 {
 pub(crate) async fn apply_userdata_filter(
     state: &AppState,
     user_id: UserId,
-    items: Vec<MediaItem>,
+    items: Vec<pharos_core::MediaId>,
     q: &ItemQuery,
-) -> Result<Vec<MediaItem>, pharos_core::DomainError> {
+) -> Result<Vec<pharos_core::MediaId>, pharos_core::DomainError> {
     let mut f = match q.filters.as_deref() {
         Some(raw) => UserDataFilter::parse(raw),
         None => UserDataFilter::default(),
@@ -5113,9 +5115,8 @@ pub(crate) async fn apply_userdata_filter(
     if !f.is_active() {
         return Ok(items);
     }
-    let ids: Vec<u64> = items.iter().map(|i| i.id).collect();
-    let user_data = state.stores.user_data_bulk(user_id, &ids).await?;
-    let kept: Vec<MediaItem> = items
+    let user_data = state.stores.user_data_bulk(user_id, &items).await?;
+    let kept: Vec<pharos_core::MediaId> = items
         .into_iter()
         .enumerate()
         .filter_map(|(i, item)| {
@@ -5139,9 +5140,9 @@ pub(crate) async fn apply_userdata_filter(
 /// collapses to nothing (the correct "no item has this tag" result).
 pub(crate) async fn apply_tags_filter(
     state: &AppState,
-    items: Vec<MediaItem>,
+    items: Vec<pharos_core::MediaId>,
     q: &ItemQuery,
-) -> Result<Vec<MediaItem>, pharos_core::DomainError> {
+) -> Result<Vec<pharos_core::MediaId>, pharos_core::DomainError> {
     use pharos_core::TagStore;
     let Some(raw) = q.tags.as_deref() else {
         return Ok(items);
@@ -5167,14 +5168,14 @@ pub(crate) async fn apply_tags_filter(
         });
     }
     let keep = keep.unwrap_or_default();
-    Ok(items.into_iter().filter(|i| keep.contains(&i.id)).collect())
+    Ok(items.into_iter().filter(|id| keep.contains(id)).collect())
 }
 
 /// xorshift64 Fisher–Yates. Deterministic for a given seed — same
 /// `(items, seed)` yields the same permutation. Caller threads a
 /// seed (from `?SortSeed=` or the bearer's user id) so /Items?
 /// SortBy=Random pagination doesn't reshuffle between page requests.
-pub(crate) fn shuffle_in_place(items: &mut [MediaItem], seed: u64) {
+pub(crate) fn shuffle_in_place<T>(items: &mut [T], seed: u64) {
     // xorshift64 reqs non-zero state; caller forces low bit.
     let mut state = seed | 1;
     for i in (1..items.len()).rev() {
@@ -5561,11 +5562,26 @@ async fn fetch_item_dto(
                 DetailError::Store(e) => error::ErrorInternalServerError(e.to_string()),
             }
         })?;
+    // The four lookups are independent, so they share one wait instead of
+    // queueing on the pool one after another. Each is best-effort: a store
+    // error just means that part is empty, never a 500.
+    //
     // LIB-D5 — advertise ImageTags for any role with a recorded local
     // sidecar (D4) so clients request roles that are otherwise
-    // upload-only (Logo/Banner/Art/Disc). Best-effort: a store error
-    // just means no extra tags, never a 500.
-    let local_art_roles: Vec<String> = match state.stores.artwork_for(id).await {
+    // upload-only (Logo/Banner/Art/Disc).
+    // LIB-C2 — the item's cast/crew (item_people join, NFO order) for
+    // BaseItemDto.People. LIB-C3 — its studios (item_studios join,
+    // name-ordered). LIB-C6 — its tags (item_tags join, name-ordered).
+    let (art, people, studios, tags) = {
+        use pharos_core::{PersonStore, StudioStore, TagStore};
+        tokio::join!(
+            state.stores.artwork_for(id),
+            state.stores.people_for_item(id),
+            state.stores.studios_for_item(id),
+            state.stores.tags_for_item(id),
+        )
+    };
+    let local_art_roles: Vec<String> = match art {
         Ok(rows) => rows
             .into_iter()
             .filter(|(_, source, _)| source == "local")
@@ -5576,45 +5592,18 @@ async fn fetch_item_dto(
             Vec::new()
         }
     };
-    // LIB-C2 — project the item's cast/crew (item_people join, NFO order)
-    // onto BaseItemDto.People. Best-effort: a store error just means an
-    // empty cast list, never a 500.
-    let people: Vec<pharos_core::ItemPerson> = {
-        use pharos_core::PersonStore;
-        match state.stores.people_for_item(id).await {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::warn!(error = %e, media.id = id, "people lookup for item failed");
-                Vec::new()
-            }
-        }
-    };
-    // LIB-C3 — project the item's studios (item_studios join, name-ordered)
-    // onto BaseItemDto.Studios. Best-effort: a store error just means an
-    // empty studio list, never a 500.
-    let studios: Vec<pharos_core::Studio> = {
-        use pharos_core::StudioStore;
-        match state.stores.studios_for_item(id).await {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!(error = %e, media.id = id, "studios lookup for item failed");
-                Vec::new()
-            }
-        }
-    };
-    // LIB-C6 — project the item's tags (item_tags join, name-ordered) onto
-    // BaseItemDto.Tags. Best-effort: a store error just means an empty tag
-    // list, never a 500.
-    let tags: Vec<pharos_core::Tag> = {
-        use pharos_core::TagStore;
-        match state.stores.tags_for_item(id).await {
-            Ok(t) => t,
-            Err(e) => {
-                tracing::warn!(error = %e, media.id = id, "tags lookup for item failed");
-                Vec::new()
-            }
-        }
-    };
+    let people: Vec<pharos_core::ItemPerson> = people.unwrap_or_else(|e| {
+        tracing::warn!(error = %e, media.id = id, "people lookup for item failed");
+        Vec::new()
+    });
+    let studios: Vec<pharos_core::Studio> = studios.unwrap_or_else(|e| {
+        tracing::warn!(error = %e, media.id = id, "studios lookup for item failed");
+        Vec::new()
+    });
+    let tags: Vec<pharos_core::Tag> = tags.unwrap_or_else(|e| {
+        tracing::warn!(error = %e, media.id = id, "tags lookup for item failed");
+        Vec::new()
+    });
     let mut dto = BaseItemDto::from_domain_with_user_data(&item, &state.server_id, user_data)
         // THE load-bearing site for books: jellyfin-web's details page fetches
         // this route with NO `Fields`, hands the result to `playbackManager`,
@@ -5678,13 +5667,13 @@ async fn item_ancestors(
         {
             if let Some(season) = series.season_number {
                 chain.push(season_id_for_key(
-                    series.series_folder.as_deref(),
+                    series.identity_folder(),
                     &series.series_name,
                     season,
                 ));
             }
             chain.push(series_id_for_key(
-                series.series_folder.as_deref(),
+                series.identity_folder(),
                 &series.series_name,
             ));
         }
@@ -5697,10 +5686,10 @@ async fn item_ancestors(
             let Some(series) = item.series.as_ref() else {
                 continue;
             };
-            let series_id = series_id_for_key(series.series_folder.as_deref(), &series.series_name);
-            let season_id = series.season_number.map(|n| {
-                season_id_for_key(series.series_folder.as_deref(), &series.series_name, n)
-            });
+            let series_id = series_id_for_key(series.identity_folder(), &series.series_name);
+            let season_id = series
+                .season_number
+                .map(|n| season_id_for_key(series.identity_folder(), &series.series_name, n));
             if season_id.as_deref() == Some(id_str) {
                 chain.push(series_id);
             } else if series_id != id_str {
@@ -6002,7 +5991,7 @@ pub(crate) async fn shows_matching(
     let mut shows: Vec<_> = episodes
         .into_iter()
         .filter_map(|e| e.series)
-        .map(|s| (s.series_folder, s.series_name))
+        .map(|s| (s.identity_folder().map(str::to_string), s.series_name))
         .collect();
     shows.sort();
     shows.dedup();
@@ -6122,6 +6111,7 @@ pub(crate) async fn music_groups_page(
             .as_deref()
             .map_or(true, |p| name_matches_letter(name, p))
     };
+    let marks = GroupMarks::read(state, user, &tracks, q.filters.as_deref()).await?;
     // Groups are sorted, filtered and paged on their names; only the page
     // returned is built into DTOs, each of which looks up an image tag.
     match grouping {
@@ -6133,7 +6123,7 @@ pub(crate) async fn music_groups_page(
                 q.sort_by.as_deref(),
                 &parse_sort_orders(q.sort_order.as_deref()),
             );
-            aggs.retain(|a| named(&a.name));
+            aggs.retain(|a| named(&a.name) && marks.keeps(MusicGrouping::Album, &a.name));
             let (total, window) = page_window(aggs.len(), q.start_index, q.limit);
             let mut items = Vec::with_capacity(window.len());
             for a in &aggs[window] {
@@ -6146,13 +6136,103 @@ pub(crate) async fn music_groups_page(
             if first_sort_order_descending(q.sort_order.as_deref()) {
                 names.reverse();
             }
-            names.retain(|n| named(n));
+            names.retain(|n| named(n) && marks.keeps(MusicGrouping::Artist, n));
             let (total, window) = page_window(names.len(), q.start_index, q.limit);
             Ok(SynthPage {
                 items: artist_dtos(state, &names[window]).await,
                 total,
             })
         }
+    }
+}
+
+/// A music listing's played and favourite filters (B1085), applied per
+/// album and artist as the series listing applies them per series (B1081):
+/// marking an album or artist marks every track under it, so it is played,
+/// or a favourite, while every track is.
+#[derive(Default)]
+struct GroupMarks {
+    wanted: UserDataFilter,
+    /// The groups with a track that is not a favourite, and with one not
+    /// played: albums by name, artists lower-cased (an artist matches its
+    /// tracks in any case).
+    unfavoured: GroupKeys,
+    unplayed: GroupKeys,
+}
+
+#[derive(Default)]
+struct GroupKeys {
+    albums: std::collections::HashSet<String>,
+    artists: std::collections::HashSet<String>,
+}
+
+impl GroupKeys {
+    fn add(&mut self, track: &MediaItem) {
+        if let Some(album) = track.probe.album.as_deref() {
+            self.albums.insert(album.to_owned());
+        }
+        for name in [
+            track.probe.artist.as_deref(),
+            track.probe.album_artist.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            self.artists.insert(name.to_lowercase());
+        }
+    }
+
+    fn has(&self, group: MusicGrouping, key: &str) -> bool {
+        match group {
+            MusicGrouping::Album => self.albums.contains(key),
+            MusicGrouping::Artist => self.artists.contains(&key.to_lowercase()),
+        }
+    }
+}
+
+impl GroupMarks {
+    /// The marks `filters` asks for, read for `tracks` in one bulk read; no
+    /// read when it asks for neither.
+    async fn read(
+        state: &AppState,
+        user: &pharos_core::User,
+        tracks: &[MediaItem],
+        filters: Option<&str>,
+    ) -> Result<Self, actix_web::Error> {
+        let wanted = filters.map(UserDataFilter::parse).unwrap_or_default();
+        let mut marks = Self {
+            wanted,
+            ..Self::default()
+        };
+        if wanted.is_favorite.is_none() && wanted.is_played.is_none() {
+            return Ok(marks);
+        }
+        let ids: Vec<u64> = tracks.iter().map(|t| t.id).collect();
+        let user_data = state
+            .stores
+            .user_data_bulk(user.id, &ids)
+            .await
+            .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+        for (track, ud) in tracks.iter().zip(user_data) {
+            if !ud.is_favorite {
+                marks.unfavoured.add(track);
+            }
+            if !ud.played {
+                marks.unplayed.add(track);
+            }
+        }
+        Ok(marks)
+    }
+
+    /// Whether `group` named `key` stays listed: asked for a mark, only
+    /// when every track under it has it; asked for its absence, when one
+    /// lacks it.
+    fn keeps(&self, group: MusicGrouping, key: &str) -> bool {
+        let fits = |want: Option<bool>, lacking: &GroupKeys| {
+            want.map_or(true, |want| want != lacking.has(group, key))
+        };
+        fits(self.wanted.is_favorite, &self.unfavoured)
+            && fits(self.wanted.is_played, &self.unplayed)
     }
 }
 
@@ -6171,7 +6251,7 @@ pub(crate) async fn virtual_shows_page(
 
     // Reuse the full parent/search scoping the media query already implements:
     // fetch the matching EPISODES unpaged, then collapse them in memory. The
-    // SearchTerm→series_name match means a `SearchTerm=Code Geass` browse
+    // SearchTerm→series_name match means a `SearchTerm=Show U` browse
     // narrows to that show before collapsing.
     let parent = resolve_parent_filter(state, parent_id)
         .await
@@ -6214,16 +6294,25 @@ pub(crate) async fn virtual_shows_page(
     let descending = first_sort_order_descending(q.sort_order.as_deref());
 
     // `Filters=IsPlayed` / `IsUnplayed` on series tiles: a series is played
-    // once every episode in it is. The episode query above is unpaged, so
-    // its user-data filter was left out and is applied here per series.
-    let want_played = q
+    // once every episode in it is. `IsFavorite` / `IsNotFavorite` the same
+    // way: marking a show a favourite marks every episode (B1081), so a show
+    // is a favourite while every episode it has is. The episode query above
+    // is unpaged, so its user-data filter was left out and is applied here
+    // per series, from one bulk read.
+    let wanted = q
         .filters
         .as_deref()
         .map(UserDataFilter::parse)
-        .and_then(|f| f.is_played)
         .filter(|_| matches!(mode, ShowFolderKind::Series));
+    let want_played = wanted.and_then(|f| f.is_played);
+    let want_favorite = wanted.and_then(|f| f.is_favorite);
+    // `IsResumable` on a series tile: started (an episode played or part
+    // watched) and not finished (some episode unplayed), B1199/V1159.
+    let want_started = wanted.is_some_and(|f| f.is_resumable);
     let mut unplayed_series: HashSet<String> = HashSet::new();
-    if want_played.is_some() {
+    let mut unfavoured_series: HashSet<String> = HashSet::new();
+    let mut started_series: HashSet<String> = HashSet::new();
+    if want_played.is_some() || want_favorite.is_some() || want_started {
         let ids: Vec<u64> = episodes.iter().map(|e| e.id).collect();
         let user_data = state
             .stores
@@ -6231,11 +6320,18 @@ pub(crate) async fn virtual_shows_page(
             .await
             .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
         for (ep, ud) in episodes.iter().zip(user_data) {
-            if let (Some(series), false) = (ep.series.as_ref(), ud.played) {
-                unplayed_series.insert(series_id_for_key(
-                    series.series_folder.as_deref(),
-                    &series.series_name,
-                ));
+            let Some(series) = ep.series.as_ref() else {
+                continue;
+            };
+            let key = || series_id_for_key(series.identity_folder(), &series.series_name);
+            if !ud.played {
+                unplayed_series.insert(key());
+            }
+            if !ud.is_favorite {
+                unfavoured_series.insert(key());
+            }
+            if ud.played || ud.last_played_position_ticks > 0 {
+                started_series.insert(key());
             }
         }
     }
@@ -6251,7 +6347,7 @@ pub(crate) async fn virtual_shows_page(
         let Some(series) = ep.series.as_ref() else {
             continue;
         };
-        let skey = series_id_for_key(series.series_folder.as_deref(), &series.series_name);
+        let skey = series_id_for_key(series.identity_folder(), &series.series_name);
         *series_eps.entry(skey.clone()).or_insert(0) += 1;
         if let Some(sn) = series.season_number {
             series_seasons.entry(skey).or_default().insert(sn);
@@ -6292,8 +6388,16 @@ pub(crate) async fn virtual_shows_page(
                         continue;
                     }
                 }
-                let skey = series_id_for_key(series.series_folder.as_deref(), &series.series_name);
+                let skey = series_id_for_key(series.identity_folder(), &series.series_name);
                 if want_played.is_some_and(|want| want == unplayed_series.contains(&skey)) {
+                    continue;
+                }
+                if want_favorite.is_some_and(|want| want == unfavoured_series.contains(&skey)) {
+                    continue;
+                }
+                if want_started
+                    && !(started_series.contains(&skey) && unplayed_series.contains(&skey))
+                {
                     continue;
                 }
                 let meta = meta_map.get(series.series_key());
@@ -6470,7 +6574,7 @@ fn series_dto(
     library: Option<String>,
 ) -> serde_json::Value {
     use crate::api::jellyfin::dto::{format_iso8601, series_id_for_key};
-    let id = series_id_for_key(series.series_folder.as_deref(), &series.series_name);
+    let id = series_id_for_key(series.identity_folder(), &series.series_name);
     // T9-series — fold in provider-sourced metadata when the enricher has
     // matched this show; a never-matched show renders the bare tile as before.
     let genres = meta.map(|m| m.genres.clone()).unwrap_or_default();
@@ -6550,11 +6654,7 @@ fn season_dto(
     episode_count: u32,
 ) -> serde_json::Value {
     use crate::api::jellyfin::dto::{season_id_for_key, series_id_for_key};
-    let id = season_id_for_key(
-        series.series_folder.as_deref(),
-        &series.series_name,
-        season_number,
-    );
+    let id = season_id_for_key(series.identity_folder(), &series.series_name, season_number);
     // B78/V38 — typed SeriesFolderDto (Season kind).
     let mut image_tags = std::collections::BTreeMap::new();
     image_tags.insert("Primary".to_string(), id.clone());
@@ -6567,7 +6667,7 @@ fn season_dto(
         can_play: false,
         series_name: Some(series.series_name.clone()),
         series_id: Some(series_id_for_key(
-            series.series_folder.as_deref(),
+            series.identity_folder(),
             &series.series_name,
         )),
         index_number: Some(season_number),
@@ -6596,7 +6696,7 @@ fn season_dto(
         child_count: Some(episode_count),
         recursive_item_count: Some(episode_count),
         parent_id: Some(series_id_for_key(
-            series.series_folder.as_deref(),
+            series.identity_folder(),
             &series.series_name,
         )),
         id,
@@ -7537,6 +7637,9 @@ pub(crate) fn spawn_scan_tracked(
         // than the first pass.
         let num_roots = std::sync::Arc::new(AtomicU64::new(roots.len().max(1) as u64));
         let completed_roots = std::sync::Arc::new(AtomicU64::new(0));
+        // The scanner reports per probe; a frame goes out only when the whole
+        // percent moves, so a scan sends at most about 100 per pass.
+        let last_sent = std::sync::Arc::new(AtomicU64::new(u64::MAX));
         // The scanner checks the cancel flag mid-root (per group + per probe) so
         // DELETE /ScheduledTasks/Running stops a scan promptly, not just between
         // roots.
@@ -7545,11 +7648,18 @@ pub(crate) fn spawn_scan_tracked(
             let item_id = refresh_item_id.clone();
             let done = completed_roots.clone();
             let total = num_roots.clone();
+            let last_sent = last_sent.clone();
             std::sync::Arc::new(move |p: pharos_scanner::ScanProgress| {
                 let n = total.load(Ordering::Relaxed).max(1) as f64;
                 let overall = ((done.load(Ordering::Relaxed) as f64) * 100.0 + p.percent()) / n;
                 st.scan_tasks
                     .set_progress(crate::scan_tasks::TASK_REFRESH_LIBRARY, overall);
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let whole = overall.clamp(0.0, 100.0) as u64;
+                if last_sent.swap(whole, Ordering::Relaxed) == whole {
+                    return;
+                }
+                st.notify_scan_progress(overall, None);
                 if let Some(id) = &item_id {
                     st.notify_refresh_progress(id, overall);
                 }
@@ -7568,9 +7678,15 @@ pub(crate) fn spawn_scan_tracked(
             let planned = plan.iter().map(|(_, g)| g.len()).sum::<usize>();
             num_roots.store(planned.max(1) as u64, Ordering::Relaxed);
             completed_roots.store(0, Ordering::Relaxed);
+            last_sent.store(u64::MAX, Ordering::Relaxed);
             let mut added: Vec<pharos_core::MediaId> = Vec::new();
             let mut removed: Vec<pharos_core::MediaId> = Vec::new();
             let mut cancelled = false;
+            let mut tally = crate::scan_tasks::ScanTally {
+                roots: planned,
+                ..Default::default()
+            };
+            let pass_started = std::time::Instant::now();
             'groups: for (force, group) in plan {
                 // Mirror `main::scan`'s prober selection: the `ffmpeg-lib` build
                 // probes in-process via the resident libav worker (the distroless
@@ -7586,6 +7702,7 @@ pub(crate) fn spawn_scan_tracked(
                 .with_rate_limit_ms(state.scan_rate_limit_ms)
                 .with_probe_concurrency_opt(state.scan_probe_concurrency)
                 .with_io_gate(state.bg_io.clone())
+                .with_series_identity_repair(state.series_identity_repair)
                 .with_force(force)
                 .with_progress(sink.clone())
                 .with_cancel(cancel_flag.clone());
@@ -7594,6 +7711,7 @@ pub(crate) fn spawn_scan_tracked(
                     .with_rate_limit_ms(state.scan_rate_limit_ms)
                     .with_probe_concurrency_opt(state.scan_probe_concurrency)
                     .with_io_gate(state.bg_io.clone())
+                    .with_series_identity_repair(state.series_identity_repair)
                     .with_force(force)
                     .with_progress(sink.clone())
                     .with_cancel(cancel_flag.clone());
@@ -7614,12 +7732,16 @@ pub(crate) fn spawn_scan_tracked(
                                 skipped = outcome.skipped,
                                 "scan: root scanned"
                             );
+                            tally.added += outcome.added.len();
+                            tally.changed += outcome.updated.len();
+                            tally.removed += outcome.removed.len();
                             added.extend(outcome.added.iter().copied());
                             added.extend(outcome.updated.iter().copied());
                             removed.extend(outcome.removed.iter().copied());
                         }
                         Err(e) => {
-                            tracing::warn!(root = %root.display(), error = %e, "scan: root scan failed")
+                            tally.failed_roots += 1;
+                            tracing::warn!(root = %root.display(), force, error = %e, "scan: root scan failed")
                         }
                     }
                     completed_roots.fetch_add(1, Ordering::Relaxed);
@@ -7633,12 +7755,11 @@ pub(crate) fn spawn_scan_tracked(
                 state.set_libraries(libs);
             }
             state.notify_library_delta(&added, &removed);
+            let outcome = tally.outcome(cancelled);
+            crate::scan_tasks::record_scan_end(&tally, outcome, pass_started.elapsed());
+            state.notify_scan_progress(100.0, Some((outcome, tally)));
 
-            let status = if cancelled {
-                crate::scan_tasks::CompletionStatus::Cancelled
-            } else {
-                crate::scan_tasks::CompletionStatus::Completed
-            };
+            let status = outcome.completion_status();
             match state
                 .scan_tasks
                 .finish_or_rerun(crate::scan_tasks::TASK_REFRESH_LIBRARY, status)
@@ -7743,7 +7864,7 @@ mod audio_index_url_tests {
 
     #[test]
     fn appends_server_selected_index_when_url_has_none() {
-        // Aliens: three Ukrainian tracks then English at absolute index 4. The
+        // Film AL: three Ukrainian tracks then English at absolute index 4. The
         // server selects 4, but the initial URL carried no AudioStreamIndex, so
         // the audio rendition played the container default (Ukrainian). The
         // pick must ride the URL.
@@ -7874,20 +7995,20 @@ mod similarity_score_tests {
 
     #[test]
     fn same_kind_alone_does_not_qualify() {
-        // B83 — "Back to the Future" vs an AWS training clip: both Movie kind,
+        // B83 — "Film AQ" vs an AWS training clip: both Movie kind,
         // different folders, no shared genre. Must score 0 so it never appears
         // in "More Like This" (the `>0` gate in items_similar drops it).
-        let bttf = movie(1, "/media/Movies/Back to the Future (1985)/bttf.mkv", None);
+        let filmaq = movie(1, "/media/Movies/Film AQ (1985)/filmaq.mkv", None);
         let aws = movie(2, "/media/Training/aws-intro/lesson1.mp4", None);
-        assert_eq!(similarity_score(&bttf, &aws), 0);
+        assert_eq!(similarity_score(&filmaq, &aws), 0);
     }
 
     #[test]
     fn shared_genre_qualifies_and_beats_same_folder() {
-        let bttf = movie(1, "/media/Movies/bttf.mkv", Some("Adventure"));
+        let filmaq = movie(1, "/media/Movies/filmaq.mkv", Some("Adventure"));
         let other = movie(2, "/media/Movies/goonies.mkv", Some("Adventure"));
         // genre(20) + same parent dir /media/Movies (15) + same-kind tiebreak(5).
-        assert_eq!(similarity_score(&bttf, &other), 40);
+        assert_eq!(similarity_score(&filmaq, &other), 40);
     }
 
     #[test]
@@ -7939,11 +8060,11 @@ mod alpha_picker_tests {
 
     #[test]
     fn letter_prefix_is_case_insensitive_and_trims() {
-        assert!(name_matches_letter("Angel", "a"));
-        assert!(name_matches_letter("angel", "a"));
-        assert!(name_matches_letter("  Angel", "a")); // leading space trimmed
-        assert!(!name_matches_letter("Breaking Bad", "a"));
-        assert!(name_matches_letter("An Idiot Abroad", "an"));
+        assert!(name_matches_letter("Alpha", "a"));
+        assert!(name_matches_letter("alpha", "a"));
+        assert!(name_matches_letter("  Alpha", "a")); // leading space trimmed
+        assert!(!name_matches_letter("Show X", "a"));
+        assert!(name_matches_letter("An Odd Traveller", "an"));
     }
 
     #[test]
@@ -7951,7 +8072,7 @@ mod alpha_picker_tests {
         assert!(name_matches_letter("24", "#"));
         assert!(name_matches_letter("3%", "#"));
         assert!(name_matches_letter("[REC]", "#"));
-        assert!(!name_matches_letter("Angel", "#"));
+        assert!(!name_matches_letter("Alpha", "#"));
     }
 }
 
@@ -8122,6 +8243,7 @@ mod series_dto_tests {
             episode_number: Some(1),
             series_folder: Some("/tv/Buffy (1997)".into()),
             series_year: Some(1997),
+            series_key: None,
         }
     }
 
@@ -8244,6 +8366,7 @@ mod synth_parent_tests {
                     episode_number: Some(1),
                     series_folder: Some(format!("/tv/{show}")),
                     series_year: None,
+                    series_key: None,
                 }),
                 ..Default::default()
             })
@@ -8305,22 +8428,22 @@ mod synth_parent_tests {
         let rec = metrics_util::debugging::DebuggingRecorder::new();
         let _g = metrics::set_default_local_recorder(&rec);
         let state = state_with(&[(1, "Buffy")]).await;
-        let angel = series_id_for_key(Some("/tv/Angel"), "Angel");
+        let alpha = series_id_for_key(Some("/tv/Alpha"), "Alpha");
 
         for _ in 0..2 {
-            let got = resolve_parent_filter(&state, Some(&angel)).await.unwrap();
+            let got = resolve_parent_filter(&state, Some(&alpha)).await.unwrap();
             assert!(matches!(got, ParentResolution::Empty));
         }
         let seen = lookups(&rec);
         assert_eq!(count(&seen, "rebuilt"), 1);
         assert_eq!(count(&seen, "miss"), 1, "a current memo answers no");
 
-        put_episode(&state, 2, "Angel").await;
+        put_episode(&state, 2, "Alpha").await;
         state.notify_library_changed();
-        let got = resolve_parent_filter(&state, Some(&angel)).await.unwrap();
+        let got = resolve_parent_filter(&state, Some(&alpha)).await.unwrap();
         assert!(matches!(
             got,
-            ParentResolution::Filter(ParentFilter::Series { ref name, .. }) if name == "Angel"
+            ParentResolution::Filter(ParentFilter::Series { ref name, .. }) if name == "Alpha"
         ));
         assert_eq!(
             count(&lookups(&rec), "rebuilt"),
@@ -8335,11 +8458,11 @@ mod synth_parent_tests {
         let _g = metrics::set_default_local_recorder(&rec);
         let state = state_with(&[(1, "Buffy")]).await;
         let buffy = series_id_for_key(Some("/tv/Buffy"), "Buffy");
-        let angel = series_id_for_key(Some("/tv/Angel"), "Angel");
+        let alpha = series_id_for_key(Some("/tv/Alpha"), "Alpha");
         resolve_parent_filter(&state, Some(&buffy)).await.unwrap();
         lookups(&rec);
 
-        put_episode(&state, 2, "Angel").await;
+        put_episode(&state, 2, "Alpha").await;
         state.notify_library_changed();
         let got = resolve_parent_filter(&state, Some(&buffy)).await.unwrap();
         assert!(matches!(
@@ -8353,7 +8476,7 @@ mod synth_parent_tests {
         for _ in 0..500 {
             if state
                 .synth_parents_memo()
-                .is_some_and(|m| m.filters.contains_key(&angel))
+                .is_some_and(|m| m.filters.contains_key(&alpha))
             {
                 landed = true;
                 break;
@@ -8361,10 +8484,10 @@ mod synth_parent_tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         assert!(landed, "the background refresh did not land within 5 s");
-        let got = resolve_parent_filter(&state, Some(&angel)).await.unwrap();
+        let got = resolve_parent_filter(&state, Some(&alpha)).await.unwrap();
         assert!(matches!(
             got,
-            ParentResolution::Filter(ParentFilter::Series { ref name, .. }) if name == "Angel"
+            ParentResolution::Filter(ParentFilter::Series { ref name, .. }) if name == "Alpha"
         ));
         assert_eq!(count(&lookups(&rec), "hit"), 1);
     }

@@ -1,7 +1,9 @@
 //! `Telemetry.submit`: a signed-in client's events and spans. Each event is
-//! logged at its level and counted; spans have no sink yet, so they are only
-//! counted in a debug line. Every batch is bounded, and every string a client
-//! sends is cut and redacted before it reaches a log line (V8).
+//! logged at its level and counted; each span is re-exported through the
+//! server's OTLP pipeline (`client_spans`) and counted. Every batch is
+//! bounded, and every string a client sends is cut and redacted before it
+//! reaches a log line or a span (V8). `report` and the stored-report calls
+//! live in `report.rs`.
 
 use std::rc::Rc;
 use std::time::Instant;
@@ -155,10 +157,157 @@ impl server::telemetry::Handler for Telemetry {
                 tracing::debug!(error = %e, "client event unreadable, skipped");
             }
         }
-        tracing::debug!(spans = spans.len(), "client spans received; no span sink");
+        if !spans.is_empty() {
+            let tracer = opentelemetry::global::tracer("pharos-ui");
+            let ratio = crate::client_spans::sampling_ratio();
+            let now = std::time::SystemTime::now();
+            for span in spans.iter() {
+                match read_span(span) {
+                    Ok(Some(span)) => {
+                        let outcome = match crate::client_spans::forward(&tracer, span, ratio, now)
+                        {
+                            Ok(()) => SpanOutcome::Forwarded,
+                            Err(crate::client_spans::Refused::OutOfWindow) => {
+                                SpanOutcome::OutOfWindow
+                            }
+                        };
+                        count_span(outcome);
+                    }
+                    Ok(None) => count_span(SpanOutcome::InvalidId),
+                    Err(e) => {
+                        count_span(SpanOutcome::Unreadable);
+                        tracing::debug!(error = %e, "client span unreadable, skipped");
+                    }
+                }
+            }
+        }
         out.set_ok(());
         Ok(())
     }
+
+    async fn report(
+        self: Rc<Self>,
+        params: pharos_capnp::telemetry::ReportParams,
+        results: &mut pharos_capnp::telemetry::ReportResults,
+    ) -> Result<(), capnp::Error> {
+        super::report::report(Rc::clone(&self.session), params, results).await
+    }
+
+    async fn list_reports(
+        self: Rc<Self>,
+        params: pharos_capnp::telemetry::ListReportsParams,
+        results: &mut pharos_capnp::telemetry::ListReportsResults,
+    ) -> Result<(), capnp::Error> {
+        super::report::list_reports(Rc::clone(&self.session), params, results).await
+    }
+
+    async fn get_report(
+        self: Rc<Self>,
+        params: pharos_capnp::telemetry::GetReportParams,
+        results: &mut pharos_capnp::telemetry::GetReportResults,
+    ) -> Result<(), capnp::Error> {
+        super::report::get_report(Rc::clone(&self.session), params, results).await
+    }
+
+    async fn delete_report(
+        self: Rc<Self>,
+        params: pharos_capnp::telemetry::DeleteReportParams,
+        results: &mut pharos_capnp::telemetry::DeleteReportResults,
+    ) -> Result<(), capnp::Error> {
+        super::report::delete_report(Rc::clone(&self.session), params, results).await
+    }
+}
+
+/// Attributes kept per client span; the rest are dropped.
+const MAX_SPAN_ATTRS: u32 = 32;
+/// Longest client span name; names are code-chosen, so a longer one is a bug.
+const MAX_SPAN_NAME_BYTES: usize = 128;
+
+/// What became of one client span: the `outcome` label of
+/// `pharos_client_spans_total`.
+#[derive(Clone, Copy, Debug)]
+enum SpanOutcome {
+    Forwarded,
+    InvalidId,
+    OutOfWindow,
+    Unreadable,
+}
+
+impl SpanOutcome {
+    fn label(self) -> &'static str {
+        match self {
+            SpanOutcome::Forwarded => "forwarded",
+            SpanOutcome::InvalidId => "invalid_id",
+            SpanOutcome::OutOfWindow => "out_of_window",
+            SpanOutcome::Unreadable => "unreadable",
+        }
+    }
+}
+
+fn count_span(outcome: SpanOutcome) {
+    metrics::counter!("pharos_client_spans_total", "outcome" => outcome.label()).increment(1);
+}
+
+/// `span` checked and made safe to export: `None` when its trace, span or
+/// (non-empty) parent id is not a W3C id, which would orphan it in Tempo.
+/// Its name, message and attributes are cut and redacted like event fields.
+fn read_span(
+    span: pharos_capnp::client_span::Reader<'_>,
+) -> Result<Option<crate::client_spans::ClientSpan>, capnp::Error> {
+    use crate::client_spans::{parse_span_id, parse_trace_id, ClientSpan};
+    let trace_text = span.get_trace_id()?.to_str().unwrap_or("");
+    let span_text = span.get_span_id()?.to_str().unwrap_or("");
+    let parent_text = span.get_parent_span_id()?.to_str().unwrap_or("");
+    let (Some(trace_id), Some(span_id)) = (parse_trace_id(trace_text), parse_span_id(span_text))
+    else {
+        tracing::debug!(
+            trace_id = %redact::bounded_text(span.get_trace_id()?, 64),
+            span_id = %redact::bounded_text(span.get_span_id()?, 64),
+            "client span skipped: not a W3C trace/span id"
+        );
+        return Ok(None);
+    };
+    let parent_span_id = if parent_text.is_empty() {
+        None
+    } else if let Some(parent) = parse_span_id(parent_text) {
+        Some(parent)
+    } else {
+        tracing::debug!(
+            parent_span_id = %redact::bounded_text(span.get_parent_span_id()?, 64),
+            "client span skipped: parent is not a W3C span id"
+        );
+        return Ok(None);
+    };
+    let message_text = span.get_message()?;
+    let message = if message_text.to_str().map_or(true, looks_like_credential) {
+        redact::REDACTED.to_owned()
+    } else {
+        redact::bounded_text(message_text, MAX_FIELD_BYTES)
+    };
+    let mut attrs = Vec::new();
+    for field in span.get_attrs()?.iter().take(MAX_SPAN_ATTRS as usize) {
+        let key_text = field.get_key()?;
+        let value_text = field.get_value()?;
+        let secret = key_text.to_str().map_or(true, is_credential_key)
+            || value_text.to_str().map_or(true, looks_like_credential);
+        let value = if secret {
+            redact::REDACTED.to_owned()
+        } else {
+            redact::bounded_text(value_text, MAX_FIELD_BYTES)
+        };
+        attrs.push((redact::bounded_text(key_text, MAX_FIELD_BYTES), value));
+    }
+    Ok(Some(ClientSpan {
+        trace_id,
+        span_id,
+        parent_span_id,
+        name: redact::bounded_text(span.get_name()?, MAX_SPAN_NAME_BYTES),
+        start_wall_ms: span.get_start_wall_ms(),
+        duration_ms: span.get_duration_ms(),
+        ok: span.get_ok(),
+        message,
+        attrs,
+    }))
 }
 
 /// Why a batch's events were dropped: the `reason` label of
@@ -278,14 +427,14 @@ fn render_fields(
     Ok(out.join(" "))
 }
 
-fn is_credential_key(key: &str) -> bool {
+pub(super) fn is_credential_key(key: &str) -> bool {
     let lower = key.to_ascii_lowercase();
     CREDENTIAL_KEYS.iter().any(|k| lower.contains(k))
 }
 
 /// Whether `value` looks like a credential: an auth scheme or a token marker,
 /// or one long run of token characters with a digit in it.
-fn looks_like_credential(value: &str) -> bool {
+pub(super) fn looks_like_credential(value: &str) -> bool {
     let lower = value.to_ascii_lowercase();
     let scheme = ["bearer ", "basic "].iter().any(|s| lower.starts_with(s));
     if scheme || CREDENTIAL_MARKERS.iter().any(|m| lower.contains(m)) {
@@ -325,6 +474,7 @@ fn kind_label(kind: pharos_capnp::EventKind) -> &'static str {
         K::PlaybackResume => "playbackResume",
         K::PlaybackStart => "playbackStart",
         K::PlaybackSummary => "playbackSummary",
+        K::AutoplayRefused => "autoplayRefused",
     }
 }
 
@@ -346,7 +496,7 @@ mod tests {
 
     use super::*;
 
-    const ALL_KINDS: [K; 25] = [
+    const ALL_KINDS: [K; 26] = [
         K::Panic,
         K::JsError,
         K::RpcFailed,
@@ -372,6 +522,7 @@ mod tests {
         K::PlaybackResume,
         K::PlaybackStart,
         K::PlaybackSummary,
+        K::AutoplayRefused,
     ];
 
     /// Disarm check: a repeated label would merge two kinds' counts under
@@ -393,6 +544,18 @@ mod tests {
             labels.iter().collect::<HashSet<_>>().len(),
             ALL_DROP_REASONS.len()
         );
+    }
+
+    #[test]
+    fn span_outcome_labels_are_distinct() {
+        let labels = [
+            SpanOutcome::Forwarded,
+            SpanOutcome::InvalidId,
+            SpanOutcome::OutOfWindow,
+            SpanOutcome::Unreadable,
+        ]
+        .map(SpanOutcome::label);
+        assert_eq!(labels.iter().collect::<HashSet<_>>().len(), labels.len());
     }
 
     const ALL_DROP_REASONS: [DropReason; 4] = [

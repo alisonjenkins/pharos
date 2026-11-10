@@ -18,6 +18,24 @@ pub enum ClientError {
     Parse(String),
     #[error("status {0}")]
     Status(u16),
+    /// The server refused and said why in the body (the series-identity
+    /// calls name the cause: unknown file, provider down).
+    #[error("{message}")]
+    Rejected { status: u16, message: String },
+}
+
+/// The error for a non-2xx answer: the body's text when it has any, else
+/// the bare status.
+pub fn rejection(status: u16, body: &str) -> ClientError {
+    let message = body.trim();
+    if message.is_empty() {
+        ClientError::Status(status)
+    } else {
+        ClientError::Rejected {
+            status,
+            message: message.to_owned(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -114,6 +132,9 @@ pub struct SearchHint {
     pub id: String,
     pub name: String,
     pub kind: ItemKind,
+    /// The server's own `Type`, which `kind` flattens (a book or a folder
+    /// becomes `Movie`).
+    pub media_type: String,
     pub matched_term: String,
 }
 
@@ -337,6 +358,7 @@ pub fn parse_search_hints_response(bytes: &[u8]) -> Result<Vec<SearchHint>, Clie
             id: h.id,
             name: h.name,
             kind: ItemKind::from_jellyfin_type(&h.kind),
+            media_type: h.kind,
             matched_term: h.matched_term,
         })
         .collect())
@@ -842,6 +864,393 @@ pub fn parse_duplicate_films_response(bytes: &[u8]) -> Result<Vec<DuplicateFilm>
     serde_json::from_slice(bytes).map_err(|e| ClientError::Parse(e.to_string()))
 }
 
+/// `/Admin/Integrity/Damaged` row: a file the integrity scan found
+/// damaged, short or unreadable.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct DamagedFile {
+    pub media_id: String,
+    pub path: Option<String>,
+    /// `damaged`, `short` or `unreadable`.
+    pub verdict: String,
+    pub first_fault: Option<String>,
+    pub first_fault_ms: Option<u64>,
+    pub demux_errors: u64,
+    pub corrupt_packets: u64,
+    pub read_errors: u64,
+    pub scanned_ms: u64,
+    pub declared_ms: Option<u64>,
+    /// Where in the media the damage is; empty for a book.
+    pub ranges: Vec<DamageRange>,
+    /// `movie`, `episode`, `audio` or `book`.
+    pub kind: Option<String>,
+    pub name: Option<String>,
+    pub series_name: Option<String>,
+    pub season_number: Option<u32>,
+    pub episode_number: Option<u32>,
+    /// Unix seconds.
+    pub checked_at: Option<i64>,
+    pub recheck_pending: bool,
+}
+
+/// One damaged span of a file, in ms on the player's timeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct DamageRange {
+    pub start_ms: u64,
+    pub end_ms: u64,
+}
+
+/// `/Admin/Integrity/Status`: how far the background check has got.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct IntegrityStatus {
+    pub eligible: u64,
+    pub checked: u64,
+    pub damaged: u64,
+    pub queued: u64,
+}
+
+/// The integrity answers the Damaged files tab shows together.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IntegrityReport {
+    pub status: IntegrityStatus,
+    pub files: Vec<DamagedFile>,
+    /// Its own result so a replica that cannot run deep checks still shows
+    /// the status and the damaged list.
+    pub deep_checks: Result<Vec<DeepCheck>, String>,
+}
+
+impl Default for IntegrityReport {
+    fn default() -> Self {
+        Self {
+            status: IntegrityStatus::default(),
+            files: Vec::new(),
+            deep_checks: Ok(Vec::new()),
+        }
+    }
+}
+
+pub fn parse_damaged_files_response(bytes: &[u8]) -> Result<Vec<DamagedFile>, ClientError> {
+    serde_json::from_slice(bytes).map_err(|e| ClientError::Parse(e.to_string()))
+}
+
+pub fn parse_integrity_status_response(bytes: &[u8]) -> Result<IntegrityStatus, ClientError> {
+    serde_json::from_slice(bytes).map_err(|e| ClientError::Parse(e.to_string()))
+}
+
+/// `/Admin/Integrity/Deep` row: one on-demand full-decode run. Results live in
+/// server memory and are lost on restart.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct DeepCheck {
+    pub media_id: String,
+    pub path: Option<String>,
+    /// `movie`, `episode` or `audio`.
+    pub kind: Option<String>,
+    pub name: Option<String>,
+    pub series_name: Option<String>,
+    pub season_number: Option<u32>,
+    pub episode_number: Option<u32>,
+    /// `queued`, `running`, `clean`, `damaged` or `failed`.
+    pub state: String,
+    pub errors: u64,
+    pub first_error: Option<String>,
+    pub first_error_ms: Option<u64>,
+    /// Unix seconds.
+    pub requested_at: i64,
+    /// Unix seconds.
+    pub finished_at: Option<i64>,
+    pub elapsed_secs: Option<u64>,
+    /// Why a `failed` run could not finish.
+    pub detail: Option<String>,
+}
+
+pub fn parse_deep_checks_response(bytes: &[u8]) -> Result<Vec<DeepCheck>, ClientError> {
+    serde_json::from_slice(bytes).map_err(|e| ClientError::Parse(e.to_string()))
+}
+
+/// `/admin/series-identity`: what needs a look on the Show identity page
+/// (spec 033 §7).
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct SeriesIdentity {
+    /// `dry_run` or `apply`.
+    pub repair_mode: String,
+    pub splits: Vec<SplitFolder>,
+    pub flagged: Vec<FlaggedMatch>,
+    pub overrides: Vec<HandFix>,
+}
+
+/// A folder whose files sit, or would sit, under more than one show.
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct SplitFolder {
+    pub folder: String,
+    /// `applied`, or `pending` while the scanner still has rows to move.
+    pub status: String,
+    pub groups: Vec<SplitGroup>,
+    /// The rows a pending split would still move.
+    pub moves: Vec<PendingMove>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct SplitGroup {
+    pub series_key: String,
+    pub year: Option<u32>,
+    pub paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct PendingMove {
+    pub path: String,
+    pub from_key: String,
+    pub from_year: Option<u32>,
+    pub to_key: String,
+    pub to_year: Option<u32>,
+}
+
+/// A show match the matcher flagged as a close call.
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct FlaggedMatch {
+    pub series_key: String,
+    /// The show's item id, for a link to its page.
+    pub series_id: String,
+    pub name: String,
+    pub provider: Option<String>,
+    pub external_id: Option<String>,
+    /// Unix seconds.
+    pub premiere_date: Option<i64>,
+    pub runner_up_id: Option<String>,
+    pub runner_up_score: Option<f32>,
+}
+
+/// The Series item ref a show's 32-hex id names: the 63-bit hash the
+/// server repeats in both halves. `None` for any other id.
+pub fn series_item_ref(series_id: &str) -> Option<pharos_client::api::ItemRef> {
+    let hex = series_id.trim();
+    if hex.len() != 32 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let (hi, lo) = hex.split_at(16);
+    let hash = u64::from_str_radix(lo, 16).ok()?;
+    let same = u64::from_str_radix(hi, 16).ok()? == hash;
+    (same && hash != 0).then_some(pharos_client::api::ItemRef::Synth(hash))
+}
+
+/// A hand fix already on record: where files were sent, or a folder kept
+/// together.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct HandFix {
+    pub id: i64,
+    pub folder: String,
+    pub path: Option<String>,
+    pub target_key: String,
+    pub target_name: Option<String>,
+    pub target_year: Option<u32>,
+    /// `admin` or `scanner`.
+    pub source: String,
+    pub keeps_together: bool,
+    pub created_by: Option<String>,
+    /// Unix seconds.
+    pub created_at: i64,
+}
+
+/// A show a provider offered for a pick.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct ShowCandidate {
+    pub provider: String,
+    pub id: String,
+    pub name: String,
+    pub year: Option<u32>,
+}
+
+/// What a fix changed: the paths it moved, and how many episodes it marked
+/// to be rebuilt in the background.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct FixDone {
+    pub moved: Vec<String>,
+    pub rebuilding: usize,
+}
+
+/// A show's stored match, as `/show` states it.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct ShowMatch {
+    pub provider: Option<String>,
+    pub external_id: Option<String>,
+    pub source: Option<String>,
+    /// Unix seconds.
+    pub premiere_date: Option<i64>,
+}
+
+/// One episode file of a show.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct ShowEpisode {
+    pub id: u64,
+    pub path: String,
+    pub season: Option<u32>,
+    pub episode: Option<u32>,
+    pub title: String,
+}
+
+/// One show by item id, flagged or not: where it is stored, its match and
+/// its files.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct ShowDetail {
+    pub series_key: String,
+    pub series_id: String,
+    pub folder: String,
+    pub name: String,
+    pub current_match: Option<ShowMatch>,
+    pub episodes: Vec<ShowEpisode>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "PascalCase", default)]
+struct FlaggedIds {
+    series_ids: Vec<String>,
+}
+
+pub fn parse_series_identity_response(bytes: &[u8]) -> Result<SeriesIdentity, ClientError> {
+    serde_json::from_slice(bytes).map_err(|e| ClientError::Parse(e.to_string()))
+}
+
+pub fn parse_flagged_ids_response(bytes: &[u8]) -> Result<Vec<String>, ClientError> {
+    serde_json::from_slice::<FlaggedIds>(bytes)
+        .map(|f| f.series_ids)
+        .map_err(|e| ClientError::Parse(e.to_string()))
+}
+
+pub fn parse_show_detail_response(bytes: &[u8]) -> Result<ShowDetail, ClientError> {
+    serde_json::from_slice(bytes).map_err(|e| ClientError::Parse(e.to_string()))
+}
+
+/// The body of a Rebuild: the episodes to rebuild from their show's match.
+pub fn rebuild_body(ids: &[u64]) -> String {
+    serde_json::json!({ "ItemIds": ids }).to_string()
+}
+
+pub fn parse_show_candidates_response(bytes: &[u8]) -> Result<Vec<ShowCandidate>, ClientError> {
+    serde_json::from_slice(bytes).map_err(|e| ClientError::Parse(e.to_string()))
+}
+
+pub fn parse_fix_done_response(bytes: &[u8]) -> Result<FixDone, ClientError> {
+    serde_json::from_slice(bytes).map_err(|e| ClientError::Parse(e.to_string()))
+}
+
+/// The body of a Move: the files, and the group they go to (an existing
+/// one by key, or a new one by name and year).
+pub fn move_body(
+    folder: &str,
+    paths: &[String],
+    target_key: Option<&str>,
+    target_name: Option<&str>,
+    target_year: Option<u32>,
+) -> String {
+    serde_json::json!({
+        "Folder": folder,
+        "Paths": paths,
+        "TargetKey": target_key,
+        "TargetName": target_name,
+        "TargetYear": target_year,
+    })
+    .to_string()
+}
+
+/// `/Admin/Items/{id}/Metadata`: the fields an admin may edit on one item or
+/// show, with their current values.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct ItemMetadata {
+    pub id: String,
+    /// `item` or `series`.
+    pub target: String,
+    pub kind: String,
+    pub name: String,
+    /// Current value by field name; a missing or `null` entry is unset.
+    pub fields: serde_json::Map<String, serde_json::Value>,
+    /// Field names the admin may change, in display order.
+    pub editable: Vec<String>,
+    /// Editable fields the scanner no longer overwrites.
+    pub locked: Vec<String>,
+}
+
+impl ItemMetadata {
+    pub fn is_locked(&self, field: &str) -> bool {
+        self.locked.iter().any(|f| f == field)
+    }
+}
+
+pub fn parse_item_metadata_response(bytes: &[u8]) -> Result<ItemMetadata, ClientError> {
+    serde_json::from_slice(bytes).map_err(|e| ClientError::Parse(e.to_string()))
+}
+
+/// Why a metadata save did not go through.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MetadataSaveError {
+    /// The server named the field it refused and why.
+    Refused {
+        field: String,
+        reason: String,
+    },
+    Failed(String),
+}
+
+impl std::fmt::Display for MetadataSaveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Refused { field, reason } => write!(f, "{field}: {reason}"),
+            Self::Failed(e) => f.write_str(e),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct MetadataRefusalDto {
+    field: String,
+    reason: String,
+}
+
+/// Reads a refused save: a 400 carrying `{"Field","Reason"}` names the field,
+/// anything else is a plain failure worded from the body or the status.
+pub fn parse_metadata_save_error(status: u16, body: &[u8]) -> MetadataSaveError {
+    if status == 400 {
+        if let Ok(r) = serde_json::from_slice::<MetadataRefusalDto>(body) {
+            return MetadataSaveError::Refused {
+                field: r.field,
+                reason: r.reason,
+            };
+        }
+    }
+    let text = String::from_utf8_lossy(body);
+    let text = text.trim();
+    MetadataSaveError::Failed(if text.is_empty() {
+        format!("status {status}")
+    } else {
+        text.to_string()
+    })
+}
+
+/// The POST body: only the fields that changed (written and locked), and the
+/// fields handed back to the scanner.
+pub fn build_metadata_save_body(
+    fields: &[(String, serde_json::Value)],
+    unlock: &[String],
+) -> String {
+    let fields: serde_json::Map<String, serde_json::Value> = fields.iter().cloned().collect();
+    serde_json::json!({ "Fields": fields, "Unlock": unlock }).to_string()
+}
+
 /// T58 phase 3 — `/Auth/Keys` row.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ApiKey {
@@ -988,6 +1397,8 @@ pub struct DeviceEntry {
     pub name: String,
     pub app_name: String,
     pub last_user_name: String,
+    /// Audio codecs this device is never sent as a direct play (T130).
+    pub no_direct_play_audio_codecs: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1001,6 +1412,8 @@ struct DeviceDto {
     app_name: String,
     #[serde(default)]
     last_user_name: String,
+    #[serde(default)]
+    no_direct_play_audio_codecs: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1022,8 +1435,14 @@ pub fn parse_devices_response(bytes: &[u8]) -> Result<Vec<DeviceEntry>, ClientEr
             name: d.name,
             app_name: d.app_name,
             last_user_name: d.last_user_name,
+            no_direct_play_audio_codecs: d.no_direct_play_audio_codecs,
         })
         .collect())
+}
+
+/// The `/Devices/Options` body that sets only a device's audio deny list.
+pub fn device_audio_deny_body(codecs: &[String]) -> String {
+    serde_json::json!({ "NoDirectPlayAudioCodecs": codecs }).to_string()
 }
 
 /// T58 — `/System/ActivityLog/Entries` row (jellyfin-web's Activity Log
@@ -1666,6 +2085,321 @@ pub mod web {
         parse_duplicate_films_response(&bytes)
     }
 
+    pub async fn list_damaged_files(
+        base: &str,
+        token: &str,
+    ) -> Result<Vec<DamagedFile>, ClientError> {
+        let resp = Request::get(&format!("{base}/Admin/Integrity/Damaged"))
+            .header("X-Emby-Token", token)
+            .send()
+            .await
+            .map_err(|e| ClientError::Http(e.to_string()))?;
+        if !resp.ok() {
+            return Err(ClientError::Status(resp.status()));
+        }
+        let bytes = resp
+            .binary()
+            .await
+            .map_err(|e| ClientError::Http(e.to_string()))?;
+        parse_damaged_files_response(&bytes)
+    }
+
+    pub async fn integrity_status(base: &str, token: &str) -> Result<IntegrityStatus, ClientError> {
+        let resp = Request::get(&format!("{base}/Admin/Integrity/Status"))
+            .header("X-Emby-Token", token)
+            .send()
+            .await
+            .map_err(|e| ClientError::Http(e.to_string()))?;
+        if !resp.ok() {
+            return Err(ClientError::Status(resp.status()));
+        }
+        let bytes = resp
+            .binary()
+            .await
+            .map_err(|e| ClientError::Http(e.to_string()))?;
+        parse_integrity_status_response(&bytes)
+    }
+
+    /// Queues the file to be read again; the server answers 202.
+    pub async fn recheck_damaged_file(
+        base: &str,
+        token: &str,
+        media_id: &str,
+    ) -> Result<(), ClientError> {
+        let resp = Request::post(&format!(
+            "{base}/Admin/Integrity/{}/Recheck",
+            urlencode(media_id)
+        ))
+        .header("X-Emby-Token", token)
+        .send()
+        .await
+        .map_err(|e| ClientError::Http(e.to_string()))?;
+        if !resp.ok() {
+            return Err(ClientError::Status(resp.status()));
+        }
+        Ok(())
+    }
+
+    /// One series-identity call; a refusal carries the server's words.
+    async fn series_identity_call(
+        base: &str,
+        token: &str,
+        method: gloo_net::http::Method,
+        path: &str,
+        body: Option<String>,
+    ) -> Result<Vec<u8>, ClientError> {
+        let req =
+            gloo_net::http::RequestBuilder::new(&format!("{base}/admin/series-identity{path}"))
+                .method(method)
+                .header("X-Emby-Token", token);
+        let resp = match body {
+            Some(b) => {
+                req.header("Content-Type", "application/json")
+                    .body(b)
+                    .map_err(|e| ClientError::Http(e.to_string()))?
+                    .send()
+                    .await
+            }
+            None => req.send().await,
+        }
+        .map_err(|e| ClientError::Http(e.to_string()))?;
+        if !resp.ok() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(rejection(status, &text));
+        }
+        resp.binary()
+            .await
+            .map_err(|e| ClientError::Http(e.to_string()))
+    }
+
+    pub async fn series_identity(base: &str, token: &str) -> Result<SeriesIdentity, ClientError> {
+        let bytes =
+            series_identity_call(base, token, gloo_net::http::Method::GET, "", None).await?;
+        parse_series_identity_response(&bytes)
+    }
+
+    pub async fn flagged_series_ids(base: &str, token: &str) -> Result<Vec<String>, ClientError> {
+        let bytes =
+            series_identity_call(base, token, gloo_net::http::Method::GET, "/flagged", None)
+                .await?;
+        parse_flagged_ids_response(&bytes)
+    }
+
+    pub async fn show_identity(
+        base: &str,
+        token: &str,
+        series_id: &str,
+    ) -> Result<ShowDetail, ClientError> {
+        let path = format!("/show?SeriesId={}", urlencode(series_id));
+        let bytes =
+            series_identity_call(base, token, gloo_net::http::Method::GET, &path, None).await?;
+        parse_show_detail_response(&bytes)
+    }
+
+    pub async fn rebuild_episodes(
+        base: &str,
+        token: &str,
+        ids: &[u64],
+    ) -> Result<FixDone, ClientError> {
+        let bytes = series_identity_call(
+            base,
+            token,
+            gloo_net::http::Method::POST,
+            "/rebuild",
+            Some(rebuild_body(ids)),
+        )
+        .await?;
+        parse_fix_done_response(&bytes)
+    }
+
+    pub async fn search_shows(
+        base: &str,
+        token: &str,
+        name: &str,
+        year: Option<u32>,
+    ) -> Result<Vec<ShowCandidate>, ClientError> {
+        let mut path = format!("/search?Name={}", urlencode(name));
+        if let Some(y) = year {
+            path.push_str(&format!("&Year={y}"));
+        }
+        let bytes =
+            series_identity_call(base, token, gloo_net::http::Method::GET, &path, None).await?;
+        parse_show_candidates_response(&bytes)
+    }
+
+    pub async fn pick_show(
+        base: &str,
+        token: &str,
+        series_key: &str,
+        provider: &str,
+        id: &str,
+    ) -> Result<FixDone, ClientError> {
+        let body = serde_json::json!({ "SeriesKey": series_key, "Provider": provider, "Id": id })
+            .to_string();
+        let bytes = series_identity_call(
+            base,
+            token,
+            gloo_net::http::Method::POST,
+            "/pick",
+            Some(body),
+        )
+        .await?;
+        parse_fix_done_response(&bytes)
+    }
+
+    pub async fn confirm_show(
+        base: &str,
+        token: &str,
+        series_key: &str,
+    ) -> Result<FixDone, ClientError> {
+        let body = serde_json::json!({ "SeriesKey": series_key }).to_string();
+        let bytes = series_identity_call(
+            base,
+            token,
+            gloo_net::http::Method::POST,
+            "/confirm",
+            Some(body),
+        )
+        .await?;
+        parse_fix_done_response(&bytes)
+    }
+
+    pub async fn move_files(base: &str, token: &str, body: String) -> Result<FixDone, ClientError> {
+        let bytes = series_identity_call(
+            base,
+            token,
+            gloo_net::http::Method::POST,
+            "/move",
+            Some(body),
+        )
+        .await?;
+        parse_fix_done_response(&bytes)
+    }
+
+    pub async fn keep_folder_together(
+        base: &str,
+        token: &str,
+        folder: &str,
+    ) -> Result<FixDone, ClientError> {
+        let body = serde_json::json!({ "Folder": folder }).to_string();
+        let bytes = series_identity_call(
+            base,
+            token,
+            gloo_net::http::Method::POST,
+            "/keep-together",
+            Some(body),
+        )
+        .await?;
+        parse_fix_done_response(&bytes)
+    }
+
+    pub async fn remove_hand_fix(base: &str, token: &str, id: i64) -> Result<FixDone, ClientError> {
+        let bytes = series_identity_call(
+            base,
+            token,
+            gloo_net::http::Method::DELETE,
+            &format!("/overrides/{id}"),
+            None,
+        )
+        .await?;
+        parse_fix_done_response(&bytes)
+    }
+
+    pub async fn list_deep_checks(base: &str, token: &str) -> Result<Vec<DeepCheck>, ClientError> {
+        let resp = Request::get(&format!("{base}/Admin/Integrity/Deep"))
+            .header("X-Emby-Token", token)
+            .send()
+            .await
+            .map_err(|e| ClientError::Http(e.to_string()))?;
+        if !resp.ok() {
+            let status = resp.status();
+            return match resp.text().await {
+                Ok(t) if !t.trim().is_empty() => Err(ClientError::Http(t.trim().to_string())),
+                _ => Err(ClientError::Status(status)),
+            };
+        }
+        let bytes = resp
+            .binary()
+            .await
+            .map_err(|e| ClientError::Http(e.to_string()))?;
+        parse_deep_checks_response(&bytes)
+    }
+
+    /// Queues a full decode of the file; the server answers 202 and refuses
+    /// with the reason as text (404, 400, 503), which is returned as `Http`.
+    pub async fn request_deep_check(
+        base: &str,
+        token: &str,
+        media_id: &str,
+    ) -> Result<(), ClientError> {
+        let resp = Request::post(&format!(
+            "{base}/Admin/Integrity/{}/Deep",
+            urlencode(media_id)
+        ))
+        .header("X-Emby-Token", token)
+        .send()
+        .await
+        .map_err(|e| ClientError::Http(e.to_string()))?;
+        if !resp.ok() {
+            let status = resp.status();
+            return match resp.text().await {
+                Ok(t) if !t.trim().is_empty() => Err(ClientError::Http(t.trim().to_string())),
+                _ => Err(ClientError::Status(status)),
+            };
+        }
+        Ok(())
+    }
+
+    pub async fn fetch_item_metadata(
+        base: &str,
+        token: &str,
+        id: &str,
+    ) -> Result<ItemMetadata, ClientError> {
+        let resp = Request::get(&format!("{base}/Admin/Items/{}/Metadata", urlencode(id)))
+            .header("X-Emby-Token", token)
+            .send()
+            .await
+            .map_err(|e| ClientError::Http(e.to_string()))?;
+        if !resp.ok() {
+            let status = resp.status();
+            return match resp.text().await {
+                Ok(t) if !t.trim().is_empty() => Err(ClientError::Http(t.trim().to_string())),
+                _ => Err(ClientError::Status(status)),
+            };
+        }
+        let bytes = resp
+            .binary()
+            .await
+            .map_err(|e| ClientError::Http(e.to_string()))?;
+        parse_item_metadata_response(&bytes)
+    }
+
+    /// Writes the changed fields and answers with the item's new view.
+    pub async fn save_item_metadata(
+        base: &str,
+        token: &str,
+        id: &str,
+        fields: &[(String, serde_json::Value)],
+        unlock: &[String],
+    ) -> Result<ItemMetadata, MetadataSaveError> {
+        let failed = |e: String| MetadataSaveError::Failed(e);
+        let resp = Request::post(&format!("{base}/Admin/Items/{}/Metadata", urlencode(id)))
+            .header("X-Emby-Token", token)
+            .header("Content-Type", "application/json")
+            .body(build_metadata_save_body(fields, unlock))
+            .map_err(|e| failed(e.to_string()))?
+            .send()
+            .await
+            .map_err(|e| failed(e.to_string()))?;
+        let status = resp.status();
+        let bytes = resp.binary().await.map_err(|e| failed(e.to_string()))?;
+        if !(200..300).contains(&status) {
+            return Err(parse_metadata_save_error(status, &bytes));
+        }
+        parse_item_metadata_response(&bytes).map_err(|e| failed(e.to_string()))
+    }
+
     pub async fn list_logs(base: &str, token: &str) -> Result<Vec<LogEntry>, ClientError> {
         let resp = Request::get(&format!("{base}/System/Logs"))
             .header("X-Emby-Token", token)
@@ -1715,6 +2449,29 @@ pub mod web {
             .await
             .map_err(|e| ClientError::Http(e.to_string()))?;
         parse_devices_response(&bytes)
+    }
+
+    pub async fn set_device_audio_deny(
+        base: &str,
+        token: &str,
+        device_id: &str,
+        codecs: &[String],
+    ) -> Result<(), ClientError> {
+        let resp = Request::post(&format!(
+            "{base}/Devices/Options?id={}",
+            urlencode(device_id)
+        ))
+        .header("X-Emby-Token", token)
+        .header("Content-Type", "application/json")
+        .body(super::device_audio_deny_body(codecs))
+        .map_err(|e| ClientError::Http(e.to_string()))?
+        .send()
+        .await
+        .map_err(|e| ClientError::Http(e.to_string()))?;
+        if !resp.ok() {
+            return Err(ClientError::Status(resp.status()));
+        }
+        Ok(())
     }
 
     pub async fn list_activity_entries(
@@ -1917,6 +2674,26 @@ pub mod web {
         Ok(())
     }
 
+    /// Scans one library: `POST /Items/{id}/Refresh` with the library's item
+    /// id, an incremental scan of its folder.
+    pub async fn admin_scan_library(
+        base: &str,
+        token: &str,
+        item_id: &str,
+    ) -> Result<(), ClientError> {
+        let resp = Request::post(&format!("{base}/Items/{}/Refresh", urlencode(item_id)))
+            .header("X-Emby-Token", token)
+            .body("")
+            .map_err(|e| ClientError::Http(e.to_string()))?
+            .send()
+            .await
+            .map_err(|e| ClientError::Http(e.to_string()))?;
+        if !resp.ok() {
+            return Err(ClientError::Status(resp.status()));
+        }
+        Ok(())
+    }
+
     pub async fn admin_library_refresh(base: &str, token: &str) -> Result<(), ClientError> {
         let resp = Request::post(&format!("{base}/Library/Refresh"))
             .header("X-Emby-Token", token)
@@ -2026,16 +2803,16 @@ mod tests {
     #[test]
     fn parse_item_detail_audio_extracts_artists_album() {
         let body = br#"{
-            "Id":"a1","Name":"Tears in Rain","Type":"Audio","RunTimeTicks":1800000000,
-            "Artists":["Vangelis"],"Album":"Blade Runner OST",
-            "AlbumArtists":[{"Name":"Vangelis","Id":"va"}],
+            "Id":"a1","Name":"Track A","Type":"Audio","RunTimeTicks":1800000000,
+            "Artists":["Artist A"],"Album":"Album A",
+            "AlbumArtists":[{"Name":"Artist A","Id":"va"}],
             "ImageTags":{},"BackdropImageTags":["bg1"],
             "UserData":{"Played":true,"PlayCount":4,"IsFavorite":true,"PlaybackPositionTicks":0}
         }"#;
         let d = parse_item_detail_response(body).unwrap();
-        assert_eq!(d.artists, vec!["Vangelis"]);
-        assert_eq!(d.album.as_deref(), Some("Blade Runner OST"));
-        assert_eq!(d.album_artists, vec!["Vangelis"]);
+        assert_eq!(d.artists, vec!["Artist A"]);
+        assert_eq!(d.album.as_deref(), Some("Album A"));
+        assert_eq!(d.album_artists, vec!["Artist A"]);
         assert!(!d.has_primary_image);
         assert!(d.has_backdrop_image);
         assert_eq!(d.play_count, 4);
@@ -2112,6 +2889,294 @@ mod tests {
     }
 
     #[test]
+    fn parse_item_metadata_reads_fields_editable_and_locked() {
+        let body = br#"{"Id":"abc","Target":"item","Kind":"Movie","Name":"Alien",
+            "Fields":{"Title":"Alien","SortName":null,"ProductionYear":1979,"CommunityRating":8.5},
+            "Editable":["Title","SortName","ProductionYear"],"Locked":["Title"]}"#;
+        let m = parse_item_metadata_response(body).unwrap();
+        assert_eq!((m.id.as_str(), m.target.as_str()), ("abc", "item"));
+        assert_eq!(m.name, "Alien");
+        assert_eq!(m.editable, ["Title", "SortName", "ProductionYear"]);
+        assert!(m.is_locked("Title") && !m.is_locked("SortName"));
+        assert_eq!(m.fields["ProductionYear"], serde_json::json!(1979));
+        assert!(m.fields["SortName"].is_null());
+    }
+
+    #[test]
+    fn parse_item_metadata_reads_a_show_with_genres() {
+        let body = br#"{"Id":"s1","Target":"series","Kind":"Series","Name":"Show",
+            "Fields":{"Genres":["Drama","Sci-Fi"]},"Editable":["Genres"]}"#;
+        let m = parse_item_metadata_response(body).unwrap();
+        assert_eq!(m.fields["Genres"], serde_json::json!(["Drama", "Sci-Fi"]));
+        assert!(m.locked.is_empty());
+    }
+
+    #[test]
+    fn parse_item_metadata_rejects_non_json() {
+        assert!(matches!(
+            parse_item_metadata_response(b"nope"),
+            Err(ClientError::Parse(_))
+        ));
+    }
+
+    #[test]
+    fn a_400_with_field_and_reason_is_a_refusal_of_that_field() {
+        let body =
+            br#"{"Field":"ProductionYear","Reason":"ProductionYear 19999 is outside 1850..=2200"}"#;
+        assert_eq!(
+            parse_metadata_save_error(400, body),
+            MetadataSaveError::Refused {
+                field: "ProductionYear".into(),
+                reason: "ProductionYear 19999 is outside 1850..=2200".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn other_save_failures_carry_the_body_or_the_status() {
+        assert_eq!(
+            parse_metadata_save_error(404, b" no such item \n"),
+            MetadataSaveError::Failed("no such item".into())
+        );
+        assert_eq!(
+            parse_metadata_save_error(500, b""),
+            MetadataSaveError::Failed("status 500".into())
+        );
+        assert_eq!(
+            parse_metadata_save_error(400, b"not json"),
+            MetadataSaveError::Failed("not json".into())
+        );
+    }
+
+    #[test]
+    fn the_save_body_holds_only_the_given_fields_and_unlocks() {
+        let body = build_metadata_save_body(
+            &[
+                ("Title".into(), serde_json::json!("Alien")),
+                ("Tagline".into(), serde_json::Value::Null),
+            ],
+            &["Overview".to_string()],
+        );
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({"Fields":{"Title":"Alien","Tagline":null},"Unlock":["Overview"]})
+        );
+        let empty: serde_json::Value =
+            serde_json::from_str(&build_metadata_save_body(&[], &[])).unwrap();
+        assert_eq!(empty, serde_json::json!({"Fields":{},"Unlock":[]}));
+    }
+
+    #[test]
+    fn parse_damaged_files_reads_nulls_and_missing_fields() {
+        let body = br#"[
+            {"MediaId":"123","Path":"/tv/Show/S01E02.mkv","Verdict":"damaged",
+             "FirstFault":"Invalid data found","FirstFaultMs":2533000,"DemuxErrors":3,
+             "CorruptPackets":4,"ReadErrors":0,"ScannedMs":600000,"DeclaredMs":2700000,
+             "Kind":"episode","Name":"Pilot","SeriesName":"Show","SeasonNumber":1,
+             "EpisodeNumber":2,"CheckedAt":1762214400,"RecheckPending":true,
+             "Ranges":[{"StartMs":2533000,"EndMs":2541000}]},
+            {"MediaId":"9","Path":null,"Verdict":"unreadable","FirstFault":null,
+             "FirstFaultMs":null,"DemuxErrors":0,"CorruptPackets":0,"ReadErrors":7,
+             "ScannedMs":0,"DeclaredMs":null,"Kind":null,"Name":null,"SeriesName":null,
+             "SeasonNumber":null,"EpisodeNumber":null,"CheckedAt":null}
+        ]"#;
+        let v = parse_damaged_files_response(body).unwrap();
+        assert_eq!(v.len(), 2);
+        assert_eq!(v[0].media_id, "123");
+        assert_eq!(v[0].first_fault_ms, Some(2_533_000));
+        assert_eq!(v[0].series_name.as_deref(), Some("Show"));
+        assert_eq!(v[0].episode_number, Some(2));
+        assert!(v[0].recheck_pending);
+        assert_eq!(
+            v[0].ranges,
+            vec![DamageRange {
+                start_ms: 2_533_000,
+                end_ms: 2_541_000
+            }]
+        );
+        assert!(v[1].ranges.is_empty(), "a server without spans sends none");
+        assert_eq!(v[1].path, None);
+        assert_eq!(v[1].verdict, "unreadable");
+        assert_eq!(v[1].read_errors, 7);
+        assert_eq!(v[1].checked_at, None);
+        assert!(!v[1].recheck_pending, "a missing RecheckPending is false");
+        assert!(parse_damaged_files_response(b"[]").unwrap().is_empty());
+        assert!(parse_damaged_files_response(b"{").is_err());
+    }
+
+    #[test]
+    fn parse_deep_checks_reads_nulls_and_missing_fields() {
+        let body = br#"[
+            {"MediaId":"123","Path":"/m/Heat.mkv","Kind":"movie","Name":"Heat",
+             "SeriesName":null,"SeasonNumber":null,"EpisodeNumber":null,
+             "State":"damaged","Errors":4,"FirstError":"Invalid NAL unit size",
+             "FirstErrorMs":2533000,"RequestedAt":1762214400,"FinishedAt":1762215000,
+             "ElapsedSecs":600,"Detail":null},
+            {"MediaId":"9","Path":null,"Kind":null,"Name":null,"State":"queued",
+             "Errors":0,"FirstError":null,"FirstErrorMs":null,"RequestedAt":1762216000,
+             "FinishedAt":null,"ElapsedSecs":null,"Detail":null}
+        ]"#;
+        let v = parse_deep_checks_response(body).unwrap();
+        assert_eq!(v.len(), 2);
+        assert_eq!(v[0].state, "damaged");
+        assert_eq!(v[0].errors, 4);
+        assert_eq!(v[0].first_error_ms, Some(2_533_000));
+        assert_eq!(v[0].finished_at, Some(1_762_215_000));
+        assert_eq!(v[0].elapsed_secs, Some(600));
+        assert_eq!(v[1].path, None);
+        assert_eq!(v[1].finished_at, None);
+        assert_eq!(v[1].series_name, None, "a missing SeriesName is None");
+        assert_eq!(v[1].requested_at, 1_762_216_000);
+        assert!(parse_deep_checks_response(b"[]").unwrap().is_empty());
+        assert!(parse_deep_checks_response(b"{").is_err());
+    }
+
+    #[test]
+    fn parse_integrity_status_reads_the_four_counts() {
+        let v = parse_integrity_status_response(
+            br#"{"Eligible":9700,"Checked":4120,"Damaged":3,"Queued":2}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            v,
+            IntegrityStatus {
+                eligible: 9700,
+                checked: 4120,
+                damaged: 3,
+                queued: 2
+            }
+        );
+        let partial = parse_integrity_status_response(br#"{"Eligible":5}"#).unwrap();
+        assert_eq!((partial.eligible, partial.queued), (5, 0));
+    }
+
+    #[test]
+    fn parse_series_identity_reads_all_three_lists() {
+        let body = br#"{
+            "RepairMode":"dry_run",
+            "Splits":[{"Folder":"/tv/Show A","Status":"pending",
+                "Groups":[{"SeriesKey":"/tv/Show A\u001f1971","Year":1971,"Paths":["/tv/Show A/a.mkv"]},
+                          {"SeriesKey":"/tv/Show A\u001f1996","Year":1996,"Paths":["/tv/Show A/b.mkv","/tv/Show A/c.mkv"]}],
+                "Moves":[{"Path":"/tv/Show A/b.mkv","FromKey":"/tv/Show A","FromYear":null,
+                          "ToKey":"/tv/Show A\u001f1996","ToYear":1996}]}],
+            "Flagged":[{"SeriesKey":"Fate","SeriesId":"00ff00ff00ff00ff00ff00ff00ff00ff","Name":"Fate",
+                "Provider":"tvdb","ExternalId":"81","PremiereDate":1100000000,
+                "RunnerUpId":"82","RunnerUpScore":0.8}],
+            "Overrides":[{"Id":7,"Folder":"/tv/Show A","Path":null,"TargetKey":"/tv/Show A",
+                "TargetName":null,"TargetYear":null,"Source":"admin","KeepsTogether":true,
+                "CreatedBy":"ali","CreatedAt":1700000000}]
+        }"#;
+        let v = parse_series_identity_response(body).unwrap();
+        assert_eq!(v.repair_mode, "dry_run");
+        assert_eq!(v.splits[0].status, "pending");
+        assert_eq!(v.splits[0].groups[1].paths.len(), 2);
+        assert_eq!(v.splits[0].groups[1].year, Some(1996));
+        assert_eq!(v.splits[0].moves[0].from_year, None);
+        assert_eq!(v.splits[0].moves[0].to_year, Some(1996));
+        assert_eq!(v.flagged[0].runner_up_id.as_deref(), Some("82"));
+        assert_eq!(v.flagged[0].premiere_date, Some(1_100_000_000));
+        assert!(v.overrides[0].keeps_together);
+        assert_eq!(v.overrides[0].created_by.as_deref(), Some("ali"));
+    }
+
+    #[test]
+    fn parse_show_detail_reads_the_match_and_files() {
+        let body = br#"{"SeriesKey":"/tv/Show A","SeriesId":"ab","Folder":"/tv/Show A","Name":"Show A",
+            "CurrentMatch":{"Provider":"tvdb","ExternalId":"1","Source":"search","PremiereDate":5},
+            "Episodes":[{"Id":7,"Path":"/tv/Show A/S01E01.mkv","Season":1,"Episode":1,"Title":"Pilot"}]}"#;
+        let v = parse_show_detail_response(body).unwrap();
+        assert_eq!(v.name, "Show A");
+        assert_eq!(v.current_match.unwrap().external_id.as_deref(), Some("1"));
+        assert_eq!(v.episodes[0].id, 7);
+        assert_eq!(v.episodes[0].episode, Some(1));
+        let bare = parse_show_detail_response(br#"{"CurrentMatch":null}"#).unwrap();
+        assert!(bare.current_match.is_none() && bare.episodes.is_empty());
+        assert!(parse_show_detail_response(b"{").is_err());
+    }
+
+    #[test]
+    fn rebuild_body_is_pascal_cased_ids() {
+        assert_eq!(rebuild_body(&[3, 4]), r#"{"ItemIds":[3,4]}"#);
+    }
+
+    #[test]
+    fn parse_series_identity_tolerates_an_empty_page() {
+        let v = parse_series_identity_response(br#"{"RepairMode":"apply"}"#).unwrap();
+        assert_eq!(v.repair_mode, "apply");
+        assert!(v.splits.is_empty() && v.flagged.is_empty() && v.overrides.is_empty());
+        assert!(parse_series_identity_response(b"{").is_err());
+    }
+
+    #[test]
+    fn parse_flagged_ids_reads_the_series_ids() {
+        let v = parse_flagged_ids_response(br#"{"SeriesIds":["aa","bb"]}"#).unwrap();
+        assert_eq!(v, ["aa", "bb"]);
+        assert!(parse_flagged_ids_response(b"{}").unwrap().is_empty());
+        assert!(parse_flagged_ids_response(b"[").is_err());
+    }
+
+    #[test]
+    fn parse_show_candidates_and_fix_done() {
+        let c = parse_show_candidates_response(
+            br#"[{"Provider":"tvdb","Id":"81","Name":"Show A","Year":1971},
+                 {"Provider":"tmdb","Id":"9","Name":"Show A","Year":null}]"#,
+        )
+        .unwrap();
+        assert_eq!((c[0].provider.as_str(), c[0].year), ("tvdb", Some(1971)));
+        assert_eq!(c[1].year, None);
+        let d = parse_fix_done_response(br#"{"Moved":["/a","/b"],"Rebuilding":12}"#).unwrap();
+        assert_eq!(
+            d,
+            FixDone {
+                moved: vec!["/a".into(), "/b".into()],
+                rebuilding: 12
+            }
+        );
+        assert!(parse_fix_done_response(b"x").is_err());
+    }
+
+    #[test]
+    fn move_body_names_an_existing_group_or_a_new_one() {
+        let paths = vec!["/a".to_string()];
+        let existing: serde_json::Value =
+            serde_json::from_str(&move_body("/tv/X", &paths, Some("k"), None, None)).unwrap();
+        assert_eq!(existing["TargetKey"], "k");
+        assert!(existing["TargetName"].is_null() && existing["TargetYear"].is_null());
+        let fresh: serde_json::Value =
+            serde_json::from_str(&move_body("/tv/X", &paths, None, Some("X"), Some(1996))).unwrap();
+        assert!(fresh["TargetKey"].is_null());
+        assert_eq!(
+            (fresh["TargetName"].as_str(), fresh["TargetYear"].as_u64()),
+            (Some("X"), Some(1996))
+        );
+        assert_eq!(fresh["Paths"][0], "/a");
+    }
+
+    #[test]
+    fn a_refusal_carries_the_servers_words() {
+        assert_eq!(
+            rejection(404, " no such file \n").to_string(),
+            "no such file"
+        );
+        assert_eq!(rejection(502, "").to_string(), "status 502");
+    }
+
+    #[test]
+    fn a_series_id_names_its_synth_item() {
+        use pharos_client::api::ItemRef;
+        assert_eq!(
+            series_item_ref("000000000000002a000000000000002a"),
+            Some(ItemRef::Synth(42))
+        );
+        // A library item, a halves mismatch and junk are not shows.
+        assert_eq!(series_item_ref("0000000000000000000000000000002a"), None);
+        assert_eq!(series_item_ref("000000000000002a000000000000002b"), None);
+        assert_eq!(series_item_ref("zz"), None);
+        assert_eq!(series_item_ref("+00000000000002a+00000000000002a"), None);
+    }
+
+    #[test]
     fn parse_plugins_extracts_name_version_status() {
         let body = br#"[
             {"Id":"p1","Name":"Subtitle Edit","Version":"1.2.3","Status":"Active"}
@@ -2155,6 +3220,26 @@ mod tests {
         let v = parse_devices_response(body).unwrap();
         assert_eq!(v.len(), 2);
         assert_eq!(v[1].app_name, "Infuse");
+    }
+
+    #[test]
+    fn parse_devices_reads_the_audio_deny_list_and_defaults_it_empty() {
+        let body = br#"{"Items":[
+            {"Id":"tv","Name":"TV","NoDirectPlayAudioCodecs":["eac3"]},
+            {"Id":"pc","Name":"PC"}
+        ]}"#;
+        let v = parse_devices_response(body).unwrap();
+        assert_eq!(v[0].no_direct_play_audio_codecs, vec!["eac3".to_string()]);
+        assert!(v[1].no_direct_play_audio_codecs.is_empty());
+    }
+
+    /// The body names only the deny list, so saving it cannot touch the
+    /// device's custom name.
+    #[test]
+    fn the_audio_deny_body_carries_only_the_list() {
+        let v: serde_json::Value =
+            serde_json::from_str(&device_audio_deny_body(&["ac3".into()])).unwrap();
+        assert_eq!(v, serde_json::json!({ "NoDirectPlayAudioCodecs": ["ac3"] }));
     }
 
     #[test]
@@ -2326,8 +3411,8 @@ mod tests {
     #[test]
     fn parse_item_detail_phase3_extracts_people_overview_genres() {
         let body = br#"{
-            "Id":"m1","Name":"Blade Runner","Type":"Movie","RunTimeTicks":70200000000,
-            "Overview":"A blade runner hunts replicants.",
+            "Id":"m1","Name":"Film BE","Type":"Movie","RunTimeTicks":70200000000,
+            "Overview":"A courier crosses a city.",
             "Genres":["Sci-Fi","Drama","Mystery"],
             "People":[
                 {"Id":"p1","Name":"Harrison Ford","Role":"Rick Deckard","Type":"Actor","PrimaryImageTag":"tag1"},
@@ -2336,10 +3421,7 @@ mod tests {
             "UserData":{"Played":false,"PlayCount":0,"IsFavorite":false,"PlaybackPositionTicks":0}
         }"#;
         let d = parse_item_detail_response(body).unwrap();
-        assert_eq!(
-            d.overview.as_deref(),
-            Some("A blade runner hunts replicants.")
-        );
+        assert_eq!(d.overview.as_deref(), Some("A courier crosses a city."));
         assert_eq!(d.genres, vec!["Sci-Fi", "Drama", "Mystery"]);
         assert_eq!(d.people.len(), 2);
         assert_eq!(d.people[0].name, "Harrison Ford");
@@ -2354,7 +3436,7 @@ mod tests {
     #[test]
     fn parse_item_detail_movie_defaults_have_no_episode_fields() {
         let body = br#"{
-            "Id":"m1","Name":"Blade Runner","Type":"Movie","RunTimeTicks":70200000000,
+            "Id":"m1","Name":"Film BE","Type":"Movie","RunTimeTicks":70200000000,
             "UserData":{"Played":false,"PlayCount":0,"IsFavorite":false,"PlaybackPositionTicks":0}
         }"#;
         let d = parse_item_detail_response(body).unwrap();

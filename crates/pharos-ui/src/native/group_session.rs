@@ -6,7 +6,7 @@
 //! event sink; [`GroupPlayer`] is the `<video>`; [`GroupClient`] is the
 //! network. The app supplies browser versions, the tests supply fakes.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::rc::{Rc, Weak};
 
@@ -25,6 +25,74 @@ use super::together::{
 use super::track_follow::{
     follows_group, route_pick, GroupTracksView, PickRoute, TrackChoice, TrackPicks,
 };
+
+/// How long a rejoin waits before each retry. They add up to 89 s: past a
+/// restarted server's three 20 s rounds of loading its saved groups, which
+/// took 51 s from boot in production on 2026-11-08.
+pub const REJOIN_BACKOFF_MS: [u32; 10] = [
+    500, 1_500, 4_000, 8_000, 12_000, 12_000, 12_000, 12_000, 12_000, 15_000,
+];
+
+/// A member the server keeps refusing rejoins at most this often.
+pub const REJOIN_AFTER_GONE_EVERY_MS: u32 = 30_000;
+
+/// What the viewer reads when the group this tab was in cannot be joined
+/// again (B807); the server's reason follows.
+pub fn rejoin_failure(reason: &str) -> String {
+    format!("Couldn't rejoin your group ({reason})")
+}
+
+/// How taking a group seat back after a lost connection ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RejoinOutcome {
+    Rejoined,
+    Failed,
+    /// The viewer left, or joined another group, while it ran.
+    Superseded,
+}
+
+impl RejoinOutcome {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Rejoined => "rejoined",
+            Self::Failed => "failed",
+            Self::Superseded => "superseded",
+        }
+    }
+}
+
+/// The client event for a group seat taken back, or not, after the socket it
+/// lived on closed (`reason` is `reconnect` or `reload`). Telemetry has no
+/// other sight of a group lost to a dropped connection (spec 038 FR-503).
+pub fn rejoin_event(
+    reason: &'static str,
+    group: &str,
+    outcome: RejoinOutcome,
+    attempts: u32,
+    waited_ms: i64,
+    error: Option<&str>,
+) -> ClientEvent {
+    let mut fields = vec![
+        ("group", group.to_owned()),
+        ("reason", reason.to_owned()),
+        ("outcome", outcome.label().to_owned()),
+        ("attempts", attempts.to_string()),
+        ("waited_ms", waited_ms.max(0).to_string()),
+    ];
+    if let Some(error) = error {
+        fields.push(("error", error.to_owned()));
+    }
+    ClientEvent {
+        kind: ClientEventKind::WsClosed,
+        level: if outcome == RejoinOutcome::Failed {
+            ClientLevel::Warn
+        } else {
+            ClientLevel::Info
+        },
+        route: "watch".to_owned(),
+        fields,
+    }
+}
 
 /// Keep-alive cadence (T83's ghost prune is 150 s).
 pub const PING_EVERY_S: u64 = 30;
@@ -60,6 +128,9 @@ pub struct GroupView {
     pub item_changes: u64,
     /// What the group plays; `None` until it has said.
     pub item: Option<ItemRef>,
+    /// The other members the group is waiting on, by name: those buffering,
+    /// not counting this viewer, whose own player shows its wait.
+    pub waiting: Vec<String>,
 }
 
 impl GroupView {
@@ -104,12 +175,20 @@ pub trait GroupPlayer {
     fn pause(&self);
     fn seek_ms(&self, ms: u64);
     fn set_rate(&self, rate: f64);
-    /// What the viewer calls the stream `index` of this kind, for the activity lines.
+    /// What the viewer calls the stream `index` of this kind, for the activity
+    /// lines. Indexes here are the primary file's, as the group's (ADR-0089).
     fn track_label(&self, kind: TrackKind, index: u32) -> Option<String>;
-    /// The audio and subtitle stream indexes of the item playing.
+    /// The audio and subtitle streams of the version playing, as the primary
+    /// file's indexes.
     fn stream_indexes(&self) -> (Vec<u32>, Vec<u32>);
-    /// Switch the player's audio and subtitle, as its own menus do.
+    /// Switch the player's audio and subtitle, as its own menus do; `picks`
+    /// name the primary file's streams.
     fn apply_tracks(&self, picks: TrackPicks);
+    /// The browser refused to start this player until the viewer does
+    /// something (038 FR-407): a `play()` now would be refused again.
+    fn autoplay_blocked(&self) -> bool {
+        false
+    }
 }
 
 /// When an anchor was struck.
@@ -173,6 +252,8 @@ pub struct GroupState {
     pub log: ActivityLog,
     /// The queue entry the group is on, which readiness reports carry.
     pub playlist_item_id: String,
+    /// The queue entry whose end a member kept the group watching (B1027).
+    next_held: Option<String>,
     pub ended: Option<String>,
     /// The group's updates so far.
     activity: u64,
@@ -400,6 +481,7 @@ impl GroupState {
                 push(TrackKind::Subtitles, tracks.subtitle, self.tracks.subtitle);
                 events
             }
+            GroupUpdate::NextHeld { by, .. } => vec![by_member(by, activity::Action::HeldNext)],
             GroupUpdate::Joined(_) | GroupUpdate::Item { .. } | GroupUpdate::Ended => Vec::new(),
         }
     }
@@ -454,6 +536,7 @@ impl GroupState {
                 // first item (no previous one) keeps what `Joined` brought.
                 if !self.playlist_item_id.is_empty() && self.playlist_item_id != playlist_item_id {
                     self.tracks = GroupTracksView::default();
+                    self.next_held = None;
                 }
                 self.playlist_item_id = playlist_item_id;
                 self.item = Some(item);
@@ -528,6 +611,12 @@ impl GroupState {
                 self.tracks = tracks;
                 Vec::new()
             }
+            GroupUpdate::NextHeld {
+                playlist_item_id, ..
+            } => {
+                self.next_held = Some(playlist_item_id);
+                Vec::new()
+            }
             GroupUpdate::Ended => {
                 self.ended = Some("This group has ended".to_owned());
                 self.id = None;
@@ -547,6 +636,13 @@ impl GroupState {
         self.last_command_ms = Some(now_ms);
     }
 
+    /// A member kept the group watching the end of the entry it is on, so no
+    /// "Up next" plays on from it (B1027).
+    pub fn holds_next(&self) -> bool {
+        !self.playlist_item_id.is_empty()
+            && self.next_held.as_deref() == Some(self.playlist_item_id.as_str())
+    }
+
     pub fn view(&self, active: bool) -> GroupView {
         GroupView {
             active,
@@ -558,7 +654,17 @@ impl GroupState {
             activity: self.activity,
             item_changes: self.item_changes,
             item: self.item,
+            waiting: if active { self.waiting() } else { Vec::new() },
         }
+    }
+
+    /// The members other than this viewer that are buffering, by name.
+    fn waiting(&self) -> Vec<String> {
+        self.members
+            .iter()
+            .filter(|m| m.buffering && m.id != self.me)
+            .map(|m| m.name.clone())
+            .collect()
     }
 }
 
@@ -588,11 +694,19 @@ struct Inner {
     last_drift_ms: Option<i64>,
     /// This member left; what the server still sends is not for the screens.
     leaving: bool,
+    /// When the clock was last sampled and the server last pinged, by the
+    /// wall clock: a hidden tab's timers can fire once a minute, so counting
+    /// one-second ticks would ping every 30 minutes and be pruned (B893).
+    sampled_ms: i64,
+    pinged_ms: i64,
     /// When this session last moved the player itself.
     self_seek_ms: Option<i64>,
     /// When the drift check last started a player it found paused while the
     /// group plays (B660), so a refused `play()` is not retried every tick.
     resumed_ms: Option<i64>,
+    /// The drift check is holding its resume for a gesture after a refused
+    /// autoplay (038 FR-407), so the hold is logged once.
+    gesture_wait: bool,
     /// The video waited within the grace of our own seek; it is reported as
     /// buffering only if it outlasts the grace.
     held_waiting: bool,
@@ -600,6 +714,10 @@ struct Inner {
     /// was made in; one task sends them one at a time, so the server sees
     /// them in the order the viewer caused them.
     commands: VecDeque<QueuedCommand>,
+    /// When the last "couldn't reach the group" line was shown: a burst of
+    /// failures (a socket outage fails every queued command and buffering
+    /// report) shows one line per toast, not one per command.
+    failure_shown_ms: Option<i64>,
     /// A task is working through `commands`.
     draining: bool,
     /// That task has a command's RPC out and unanswered.
@@ -660,6 +778,11 @@ pub struct Session<C, E> {
     env: E,
     inner: RefCell<Inner>,
     this: RefCell<Weak<Self>>,
+    /// A rejoin is under way; a second trigger waits for it.
+    rejoining: Cell<bool>,
+    /// When a rejoin triggered by the server last started, so a server that
+    /// keeps refusing this member cannot start one per call.
+    rejoined_ms: Cell<Option<i64>>,
 }
 
 impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
@@ -672,6 +795,8 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
                 ..Inner::default()
             }),
             this: RefCell::new(Weak::new()),
+            rejoining: Cell::new(false),
+            rejoined_ms: Cell::new(None),
         });
         *session.this.borrow_mut() = Rc::downgrade(&session);
         session
@@ -679,6 +804,11 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
 
     fn me(&self) -> Option<Rc<Self>> {
         self.this.borrow().upgrade()
+    }
+
+    /// The group client, to move it to a new connection.
+    pub fn client(&self) -> &C {
+        &self.client
     }
 
     /// Whether a membership is active.
@@ -714,8 +844,11 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
         let asks = ids
             .chunks(seen::MAX_IDS)
             .map(|chunk| self.client.seen(chunk.to_vec()));
+        let answers = futures_util::future::try_join_all(asks)
+            .await
+            .inspect_err(|e| self.rejoin_if_gone(e, "seen"))?;
         let mut all = Vec::new();
-        for answer in futures_util::future::try_join_all(asks).await? {
+        for answer in answers {
             seen::merge(&mut all, answer);
         }
         Ok(all)
@@ -752,14 +885,134 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
             .client
             .create(item, position_ms, self.sink(epoch))
             .await;
-        self.began(made)
+        self.began(epoch, made).await
     }
 
     /// Join the group `id`.
     pub async fn join(&self, id: &str) -> Result<GroupSummary, GroupError> {
         let epoch = self.prepare(None).await;
         let made = self.client.join(id, self.sink(epoch)).await;
-        self.began(made)
+        self.began(epoch, made).await
+    }
+
+    /// The membership was lost while the viewer is still in the group: the
+    /// connection it lived on was replaced, or the server no longer counts
+    /// this member. Joins the same group again, without leaving it first or
+    /// showing the viewer out of it, so the server's seat for this device
+    /// is taken back and the group's item brings the player to it.
+    ///
+    /// A server that restarted answers that it knows no such group until it
+    /// has loaded its saved groups (its boot reconciliation retries every
+    /// 20 s), so a refusal is retried on [`REJOIN_BACKOFF_MS`]. Only an
+    /// `ended` from the group, or the backoff running out, gives up; then the
+    /// viewer reads why, and watches on their own.
+    pub async fn rejoin(&self, reason: &'static str) {
+        let id = {
+            let inner = self.inner.borrow();
+            inner.state.id.clone().filter(|_| inner.active)
+        };
+        let Some(id) = id else {
+            return;
+        };
+        if self.rejoining.replace(true) {
+            self.env.info(&format!(
+                "pharos: group rejoin skipped reason={reason} group={id} cause=in_progress"
+            ));
+            return;
+        }
+        let started = self.env.now_ms();
+        self.env.info(&format!(
+            "pharos: group rejoin started reason={reason} group={id}"
+        ));
+        let mut attempts = 0u32;
+        let mut backoff = REJOIN_BACKOFF_MS.iter();
+        let outcome = loop {
+            attempts = attempts.saturating_add(1);
+            // Out of the old membership without a `leave`: that would end
+            // the seat this join takes back, and publish the viewer out.
+            self.inner.borrow_mut().active = false;
+            let epoch = self.prepare(None).await;
+            let made = self.client.join(&id, self.sink(epoch)).await;
+            let error = match self.began(epoch, made).await {
+                Ok(_) => break Ok(()),
+                Err(e) => e,
+            };
+            if self.inner.borrow().epoch != epoch {
+                break Err(None);
+            }
+            let ended = self.inner.borrow().state.ended.is_some();
+            match backoff.next() {
+                Some(&wait) if !ended => {
+                    self.env.info(&format!(
+                        "pharos: group rejoin retrying reason={reason} group={id} attempt={attempts} wait_ms={wait} error={}",
+                        error.0
+                    ));
+                    self.env.sleep(wait).await;
+                    // The viewer left, or joined another group, meanwhile.
+                    if self.inner.borrow().epoch != epoch {
+                        break Err(None);
+                    }
+                }
+                _ => break Err(Some(error)),
+            }
+        };
+        self.rejoining.set(false);
+        let waited = self.env.now_ms().saturating_sub(started);
+        if reason == "reconnect" {
+            let (verdict, error) = match &outcome {
+                Ok(()) => (RejoinOutcome::Rejoined, None),
+                Err(None) => (RejoinOutcome::Superseded, None),
+                Err(Some(e)) => (RejoinOutcome::Failed, Some(e.0.as_str())),
+            };
+            self.env
+                .report(rejoin_event(reason, &id, verdict, attempts, waited, error));
+        }
+        match outcome {
+            Ok(()) => self.env.info(&format!(
+                "pharos: group rejoined reason={reason} group={id} attempts={attempts} waited_ms={waited}"
+            )),
+            Err(None) => self.env.info(&format!(
+                "pharos: group rejoin stopped reason={reason} group={id} attempts={attempts} cause=superseded"
+            )),
+            Err(Some(e)) => {
+                self.env.warn(&format!(
+                    "pharos: group rejoin failed reason={reason} group={id} attempts={attempts} waited_ms={waited} error={}",
+                    e.0
+                ));
+                {
+                    let mut inner = self.inner.borrow_mut();
+                    inner.active = false;
+                    inner.state.ended.get_or_insert_with(|| rejoin_failure(&e.0));
+                }
+                self.publish();
+            }
+        }
+    }
+
+    /// A membership call was refused because the server no longer counts
+    /// this member in the group (it pruned a silent member, B893): rejoin,
+    /// at most once per [`REJOIN_AFTER_GONE_EVERY_MS`].
+    fn rejoin_if_gone(&self, error: &GroupError, call: &str) {
+        if !error.is_gone() || !self.active() {
+            return;
+        }
+        let now = self.env.now_ms();
+        let every = i64::from(REJOIN_AFTER_GONE_EVERY_MS);
+        if self
+            .rejoined_ms
+            .get()
+            .is_some_and(|at| now.saturating_sub(at) < every)
+        {
+            return;
+        }
+        self.rejoined_ms.set(Some(now));
+        self.env.info(&format!(
+            "pharos: group membership gone call={call}, rejoining"
+        ));
+        if let Some(me) = self.me() {
+            self.env
+                .spawn(Box::pin(async move { me.rejoin("not_a_member").await }));
+        }
     }
 
     /// A clean slate for a new membership, whose epoch it returns; an old
@@ -793,15 +1046,46 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
         epoch
     }
 
-    fn began(&self, made: Result<GroupSummary, GroupError>) -> Result<GroupSummary, GroupError> {
+    /// The answer to the call that began membership `epoch`. If the viewer
+    /// left, or began another membership, while it was in flight (B1005),
+    /// the answer is stale: it must not put them back in the group. A server
+    /// that already took the seat is told to drop it, unless a newer
+    /// membership began, whose seat that `leave` would end.
+    async fn began(
+        &self,
+        epoch: u64,
+        made: Result<GroupSummary, GroupError>,
+    ) -> Result<GroupSummary, GroupError> {
         let summary = made?;
+        let stale = {
+            let inner = self.inner.borrow();
+            // `prepare` resets `leaving`, so it is set only while no newer
+            // membership has begun.
+            (inner.epoch != epoch).then_some(inner.leaving && !inner.active)
+        };
+        if let Some(left) = stale {
+            self.env.info(&format!(
+                "pharos: group join answer superseded group={} left={left}",
+                summary.id
+            ));
+            if left {
+                if let Err(e) = self.client.leave().await {
+                    self.env
+                        .warn(&format!("pharos: leaving the group failed: {}", e.0));
+                }
+            }
+            return Err(GroupError::superseded());
+        }
         let epoch = {
             let mut inner = self.inner.borrow_mut();
             // An `Ended` that raced the answer leaves nothing to run.
             if inner.state.ended.is_some() {
-                return Err(GroupError("This group has ended".into()));
+                return Err(GroupError::gone());
             }
             inner.active = true;
+            let now = self.env.now_ms();
+            inner.sampled_ms = now;
+            inner.pinged_ms = now;
             inner.state.id = Some(summary.id.clone());
             if inner.state.members.is_empty() {
                 inner.state.members = summary.members.clone();
@@ -932,6 +1216,17 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
         }
     }
 
+    /// The picks this member applies to a player of streams `audio` and
+    /// `subtitles`: the group's, unless this member is out of the group or on
+    /// their own tracks. `None` when there is nothing to apply.
+    pub fn tracks_followed(&self, audio: &[u32], subtitles: &[u32]) -> Option<TrackPicks> {
+        let inner = self.inner.borrow();
+        if !inner.active {
+            return None;
+        }
+        follows_group(inner.state.own_tracks, inner.state.tracks, audio, subtitles)
+    }
+
     /// A menu pick of an audio stream. `true` when it went to the group, which
     /// applies it to every following player, this one included; `false` when
     /// the caller changes only its own player.
@@ -975,8 +1270,10 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
                 let Err(e) = client.set_tracks(audio, subtitle, playlist_item_id).await else {
                     return;
                 };
-                me.env
-                    .warn(&format!("pharos: group command failed: {}", e.0));
+                me.env.warn(&format!(
+                    "pharos: group command failed kind=set_tracks: {}",
+                    e.0
+                ));
                 me.apply_pick_here(audio, subtitle, epoch);
             }));
         }
@@ -1041,6 +1338,37 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
             }));
         }
         true
+    }
+
+    /// A command the group never heard: say so on the activity toast, or the
+    /// viewer's click seems to do nothing (B807). Nothing for a membership
+    /// that has moved on.
+    fn command_failed(&self, epoch: u64) {
+        {
+            let mut inner = self.inner.borrow_mut();
+            if !inner.active || inner.epoch != epoch {
+                return;
+            }
+            let now = self.env.now_ms();
+            let toast = i64::try_from(activity::TOAST_MS).unwrap_or(i64::MAX);
+            if inner
+                .failure_shown_ms
+                .is_some_and(|shown| now.saturating_sub(shown) < toast)
+            {
+                return;
+            }
+            inner.failure_shown_ms = Some(now);
+            let at = u64::try_from(now).unwrap_or(0);
+            inner.state.log.push(
+                &Event {
+                    by: None,
+                    action: activity::Action::CommandFailed,
+                },
+                at,
+            );
+            inner.state.activity = inner.state.activity.wrapping_add(1);
+        }
+        self.publish();
     }
 
     /// The group did not take a pick (the call failed), so change this player
@@ -1109,8 +1437,11 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
                 let Err(e) = client.follow_tracks(follow).await else {
                     return;
                 };
-                me.env
-                    .warn(&format!("pharos: group command failed: {}", e.0));
+                me.env.warn(&format!(
+                    "pharos: group command failed kind=follow_tracks({follow}): {}",
+                    e.0
+                ));
+                me.command_failed(epoch);
                 // The server never heard it, so the flag it keeps is the old
                 // one; unless the membership has moved on, show that again.
                 let reverted = {
@@ -1338,30 +1669,38 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
             }
             self.sync_clock().await;
         }
-        let mut n = 0u64;
         loop {
             self.env.sleep(1_000).await;
             if self.inner.borrow().epoch != epoch {
                 return;
             }
-            n += 1;
-            self.tick(n).await;
+            self.tick().await;
         }
     }
 
-    /// The work for the `n`th second of a membership: the drift check every
-    /// second, the drift sample and clock sync every 10 s, the ping every 30 s.
-    pub async fn tick(&self, n: u64) {
+    /// One second of a membership: the drift check, then the drift sample and
+    /// clock sync once 10 s have passed since the last, and the ping once 30 s
+    /// have.
+    pub async fn tick(&self) {
         self.check_drift();
         self.report_held_stall();
-        if n % SAMPLE_EVERY_S == 0 {
+        let (sample, ping) = {
+            let now = self.env.now_ms();
+            let mut inner = self.inner.borrow_mut();
+            (
+                elapsed(&mut inner.sampled_ms, now, SAMPLE_EVERY_S),
+                elapsed(&mut inner.pinged_ms, now, PING_EVERY_S),
+            )
+        };
+        if sample {
             self.report_drift();
             self.sync_clock().await;
         }
-        if n % PING_EVERY_S == 0 {
+        if ping {
             if let Err(e) = self.client.ping().await {
                 self.env
                     .warn(&format!("pharos: group ping failed: {}", e.0));
+                self.rejoin_if_gone(&e, "ping");
             }
         }
     }
@@ -1421,10 +1760,18 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
         if loading {
             return;
         }
+        // A player still owing its ready is loading what the group asked for,
+        // and its playhead sits at the target until the seek lands: correcting
+        // it seeks again and restarts the load, every ~2 s on a slow link
+        // (B1019). The ready's own hold puts it where the group is; a player
+        // that loaded with no event left to carry the ready says it here.
+        if owes_ready {
+            self.ready_if_loaded();
+            return;
+        }
         if player.paused() {
-            // A player still owing its ready is loading what the group asked
-            // for; one at its end has nothing left to play.
-            if !owes_ready && !player.ended() {
+            // One at its end has nothing left to play.
+            if !player.ended() {
                 self.resume_paused(&player, expected, since, now);
             }
             return;
@@ -1441,6 +1788,8 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
             Correction::Hold if nudged_before => self.set_rate(&player, 1.0),
             Correction::Hold => {}
             Correction::Rate(rate) => self.set_rate(&player, rate),
+            // Our last seek has not played yet: seeking again restarts it.
+            Correction::Seek(_) if self.inner.borrow().within_self_seek_grace(now) => {}
             Correction::Seek(to) => {
                 self.set_rate(&player, 1.0);
                 self.inner.borrow_mut().self_seek_ms = Some(now);
@@ -1462,6 +1811,19 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
     /// each second.
     fn resume_paused(&self, player: &Rc<dyn GroupPlayer>, expected: u64, since: u64, now: i64) {
         let settle = i64::try_from(SETTLE_AFTER_COMMAND_MS).unwrap_or(i64::MAX);
+        // A refused autoplay waits for the viewer's tap on "Tap to start";
+        // retrying in the background is refused each time (038 FR-407).
+        if player.autoplay_blocked() {
+            let first = !std::mem::replace(&mut self.inner.borrow_mut().gesture_wait, true);
+            if first {
+                self.env.info(&format!(
+                    "pharos: group resume held reason=autoplay_refused position_ms={} expected_ms={expected}",
+                    player.position_ms()
+                ));
+            }
+            return;
+        }
+        self.inner.borrow_mut().gesture_wait = false;
         {
             let mut inner = self.inner.borrow_mut();
             let recent = inner
@@ -1546,6 +1908,44 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
         true
     }
 
+    /// The viewer cancelled "Up next": the group keeps watching this entry's
+    /// end, so every member's countdown stops too (B1027). `false` when the
+    /// group does not drive the stage, where the cancel is this player's.
+    pub fn hold_next(&self) -> bool {
+        if !self.drives() {
+            return false;
+        }
+        let playlist_item_id = self.inner.borrow().state.playlist_item_id.clone();
+        // Before the group's item arrives the server would hold whatever it
+        // plays, not the entry this viewer cancelled on.
+        if playlist_item_id.is_empty() {
+            return false;
+        }
+        let client = self.client.clone();
+        self.command(format!("hold_next({playlist_item_id})"), async move {
+            client.hold_next(playlist_item_id).await
+        });
+        true
+    }
+
+    /// The queue entry the group plays; empty out of a group or before its
+    /// first item. A player's "Up next" belongs to one entry (B1027).
+    pub fn playlist_item_id(&self) -> String {
+        let inner = self.inner.borrow();
+        if inner.active {
+            inner.state.playlist_item_id.clone()
+        } else {
+            String::new()
+        }
+    }
+
+    /// A member kept the group watching the end of what the stage shows, so
+    /// this player's "Up next" must not play on (B1027).
+    pub fn next_held(&self) -> bool {
+        let inner = self.inner.borrow();
+        inner.active && inner.state.drives_stage() && inner.state.holds_next()
+    }
+
     /// Sends a group command after every earlier one has been answered: two
     /// RPCs in flight can reach the server, and the group, in reverse order
     /// (buffering end before its start leaves a member buffering for good).
@@ -1603,13 +2003,21 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
                     continue;
                 }
                 match select(next, me.env.sleep(COMMAND_TIMEOUT_MS)).await {
-                    Either::Left((Err(e), _)) => me
-                        .env
-                        .warn(&format!("pharos: group command failed: {}", e.0)),
+                    Either::Left((Err(e), _)) => {
+                        me.env.warn(&format!(
+                            "pharos: group command failed kind={kind}: {}",
+                            e.0
+                        ));
+                        me.command_failed(epoch);
+                        me.rejoin_if_gone(&e, "command");
+                    }
                     Either::Left((Ok(()), _)) => {}
-                    Either::Right(_) => me.env.warn(&format!(
-                        "pharos: group command timed out kind={kind} after_ms={COMMAND_TIMEOUT_MS}"
-                    )),
+                    Either::Right(_) => {
+                        me.env.warn(&format!(
+                            "pharos: group command timed out kind={kind} after_ms={COMMAND_TIMEOUT_MS}"
+                        ));
+                        me.command_failed(epoch);
+                    }
                 }
             }
         }));
@@ -1767,6 +2175,17 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
 /// re-state the group's position: the drift check closes the gap by rate in
 /// under about 10 s, where a seek would rebuffer (B761).
 const NUDGE_BELOW_MS: u64 = 500;
+
+/// Whether `every_s` seconds have passed since `*last` by `now`; if so,
+/// `*last` moves to `now`.
+fn elapsed(last: &mut i64, now: i64, every_s: u64) -> bool {
+    let every_ms = i64::try_from(every_s.saturating_mul(1_000)).unwrap_or(i64::MAX);
+    if now.saturating_sub(*last) < every_ms {
+        return false;
+    }
+    *last = now;
+    true
+}
 
 /// The `<video>` the stage plays and the item it shows.
 struct Video {
@@ -1964,9 +2383,13 @@ mod tests {
         /// Audio and subtitle stream indexes of the item.
         streams: RefCell<(Vec<u32>, Vec<u32>)>,
         applied: RefCell<Vec<TrackPicks>>,
+        blocked: Cell<bool>,
     }
 
     impl GroupPlayer for TestPlayer {
+        fn autoplay_blocked(&self) -> bool {
+            self.blocked.get()
+        }
         fn position_ms(&self) -> u64 {
             self.position.get()
         }
@@ -2098,11 +2521,193 @@ mod tests {
     fn a_tick_syncs_the_clock_every_10_s_and_pings_every_30_s() {
         let rig = rig();
         let clocks = calls_with(&rig, "clock(").len();
-        for n in 1..=30 {
-            let _ = rig.session.tick(n).now_or_never();
+        for _ in 1..=30 {
+            rig.env.now.set(rig.env.now.get() + 1_000);
+            let _ = rig.session.tick().now_or_never();
         }
         assert_eq!(calls_with(&rig, "clock(").len() - clocks, 3);
         assert_eq!(calls_with(&rig, "ping").len(), 1);
+    }
+
+    /// The `View`s the session published, oldest first.
+    fn views(rig: &Rig) -> Vec<GroupView> {
+        rig.env
+            .ui
+            .borrow()
+            .iter()
+            .filter_map(|u| match u {
+                Ui::View(v) => Some(v.clone()),
+                Ui::Navigate(_) => None,
+            })
+            .collect()
+    }
+
+    /// B894: after a server restart the new connection's join is refused
+    /// until the server has loaded its saved groups. The rejoin retries
+    /// through that, never leaves the group or shows the viewer out of it,
+    /// and ends back in it with a new membership.
+    #[test]
+    fn a_rejoin_retries_while_the_server_loads_its_groups() {
+        let rig = rig();
+        let views_before = views(&rig).len();
+        let epoch = rig.session.inner.borrow().epoch;
+        rig.groups.gone_for_joins(3);
+        let _ = rig.session.rejoin("reconnect").now_or_never();
+        rig.env.settle();
+        assert_eq!(
+            calls_with(&rig, "join(g1)").len(),
+            5,
+            "the first join, 3 refused, 1 taken"
+        );
+        assert!(
+            calls_with(&rig, "leave").is_empty(),
+            "a rejoin never leaves"
+        );
+        assert!(rig.session.active());
+        assert!(rig.session.inner.borrow().epoch > epoch, "a new membership");
+        assert!(
+            views(&rig).iter().skip(views_before).all(|v| v.active),
+            "the viewer is never shown out of the group"
+        );
+        assert_eq!(
+            rig.env
+                .logged("pharos: group rejoined reason=reconnect group=g1 attempts=4 ")
+                .len(),
+            1,
+            "{:?}",
+            rig.env.logs.borrow()
+        );
+    }
+
+    /// A group the server no longer has, past every retry, is given up on:
+    /// the viewer reads why and watches on their own.
+    #[test]
+    fn a_rejoin_that_never_finds_the_group_says_so() {
+        let rig = rig();
+        rig.groups.gone_for_joins(u32::MAX);
+        let _ = rig.session.rejoin("reconnect").now_or_never();
+        rig.env.settle();
+        assert_eq!(
+            calls_with(&rig, "join(g1)").len(),
+            1 + 1 + REJOIN_BACKOFF_MS.len(),
+            "one try, then one per backoff step"
+        );
+        assert!(!rig.session.active());
+        let last = views(&rig).pop();
+        assert!(
+            last.as_ref().is_some_and(|v| !v.active),
+            "a view out of the group after giving up"
+        );
+        assert_eq!(
+            last.and_then(|v| v.ended).as_deref(),
+            Some("Couldn't rejoin your group (This group has ended)")
+        );
+    }
+
+    /// B893: a member the server pruned is told so by its next ping; it joins
+    /// the group again rather than going on as a member nobody hears.
+    #[test]
+    fn a_pruned_member_rejoins_on_the_ping_that_finds_out() {
+        let rig = rig();
+        rig.groups.gone_pings(true);
+        rig.env.now.set(rig.env.now.get() + 30_000);
+        let _ = rig.session.tick().now_or_never();
+        rig.env.settle();
+        assert_eq!(calls_with(&rig, "join(g1)").len(), 2);
+        assert!(rig.session.active());
+        // The server still refuses: no second rejoin within the 30 s.
+        rig.env.now.set(rig.env.now.get() + 29_000);
+        let _ = rig.session.tick().now_or_never();
+        rig.env.settle();
+        assert_eq!(calls_with(&rig, "join(g1)").len(), 2, "one rejoin per 30 s");
+    }
+
+    /// FR-503's signal: a reconnect inside a group reports how taking the
+    /// seat back went. Disarm: drop the `report(rejoin_event(..))` call in
+    /// `rejoin` and both assertions go red.
+    #[test]
+    fn a_reconnect_in_a_group_reports_the_rejoin() {
+        let rig = rig();
+        rig.groups.gone_for_joins(1);
+        let _ = rig.session.rejoin("reconnect").now_or_never();
+        rig.env.settle();
+        let reports = rig.env.reports.borrow();
+        let Some(event) = reports.iter().find(|e| e.kind == ClientEventKind::WsClosed) else {
+            panic!("no ws_closed report: {reports:?}");
+        };
+        assert_eq!(event.level, ClientLevel::Info);
+        assert_eq!(
+            event.fields[..4],
+            [
+                ("group", "g1".to_owned()),
+                ("reason", "reconnect".to_owned()),
+                ("outcome", "rejoined".to_owned()),
+                ("attempts", "2".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_reconnect_that_loses_the_group_reports_a_warning_with_the_cause() {
+        let rig = rig();
+        rig.groups.gone_for_joins(u32::MAX);
+        let _ = rig.session.rejoin("reconnect").now_or_never();
+        rig.env.settle();
+        let reports = rig.env.reports.borrow();
+        let Some(event) = reports.iter().find(|e| e.kind == ClientEventKind::WsClosed) else {
+            panic!("no ws_closed report: {reports:?}");
+        };
+        assert_eq!(event.level, ClientLevel::Warn);
+        assert!(event.fields.contains(&("outcome", "failed".to_owned())));
+        assert!(event
+            .fields
+            .contains(&("error", "This group has ended".to_owned())));
+    }
+
+    #[test]
+    fn a_rejoin_after_a_pruned_ping_is_not_a_closed_socket() {
+        let rig = rig();
+        rig.groups.gone_for_joins(1);
+        let _ = rig.session.rejoin("not_a_member").now_or_never();
+        rig.env.settle();
+        assert!(!rig.env.kinds().contains(&ClientEventKind::WsClosed));
+    }
+
+    #[test]
+    fn rejoin_outcome_labels_are_distinct() {
+        let labels = [
+            RejoinOutcome::Rejoined,
+            RejoinOutcome::Failed,
+            RejoinOutcome::Superseded,
+        ]
+        .map(RejoinOutcome::label);
+        let set: std::collections::HashSet<_> = labels.iter().collect();
+        assert_eq!(set.len(), labels.len());
+    }
+
+    /// Out of a group there is nothing to rejoin.
+    #[test]
+    fn a_rejoin_out_of_a_group_does_nothing() {
+        let session = Session::new(FakeGroups::default(), TestEnv::default());
+        let _ = session.rejoin("reconnect").now_or_never();
+        assert!(!session.active());
+    }
+
+    /// B893: a hidden tab's timers fire about once a minute, so the one-second
+    /// tick comes 60 s apart. Each such tick still pings, well inside the
+    /// server's 150 s prune, where counting ticks pinged every 30 minutes.
+    #[test]
+    fn a_throttled_tick_still_pings_by_the_clock() {
+        let rig = rig();
+        let pings = || calls_with(&rig, "ping").len();
+        for _ in 0..3 {
+            rig.env.now.set(rig.env.now.get() + 60_000);
+            let _ = rig.session.tick().now_or_never();
+        }
+        assert_eq!(pings(), 3, "one ping a minute");
+        rig.env.now.set(rig.env.now.get() + 1_000);
+        let _ = rig.session.tick().now_or_never();
+        assert_eq!(pings(), 3, "a tick right after a ping does not ping again");
     }
 
     #[test]
@@ -2330,6 +2935,83 @@ mod tests {
         let view = rig.session.view();
         assert!(!view.active);
         assert_eq!(view.ended, None);
+    }
+
+    /// B1005: a join held in flight by a push to the sink, as the server's
+    /// pushes can reach a member before the answer does.
+    fn hold_join(groups: &FakeGroups) {
+        groups.push_on_join(vec![GroupUpdate::Item {
+            item: ItemRef::Real(7),
+            playlist_item_id: "pl-7".into(),
+            position_ms: 0,
+            playing: false,
+        }]);
+    }
+
+    fn poll_once<T>(f: &mut std::pin::Pin<Box<impl std::future::Future<Output = T>>>) -> bool {
+        let mut cx = std::task::Context::from_waker(futures_util::task::noop_waker_ref());
+        std::future::Future::poll(f.as_mut(), &mut cx).is_ready()
+    }
+
+    /// B1005: Leave pressed while a join is in flight finds the session not
+    /// yet active and sends nothing; the answer must not put the viewer back,
+    /// and the seat the server took is dropped. Disarm check: began ignoring
+    /// the epoch leaves the session active and sends no leave.
+    #[test]
+    fn leaving_while_a_join_is_in_flight_drops_the_seat_it_takes() {
+        let groups = FakeGroups::with_groups(vec![summary()]);
+        let session = Session::new(groups.clone(), TestEnv::default());
+        hold_join(&groups);
+        let mut joined = Box::pin(session.join("g1"));
+        assert!(!poll_once(&mut joined));
+        let _ = session.leave().now_or_never();
+        assert!(groups.calls().iter().all(|c| c != "leave"));
+        assert!(poll_once(&mut joined));
+        assert!(!session.view().active);
+        assert_eq!(groups.calls(), ["join(g1)", "leave"]);
+    }
+
+    /// B1005: the same for a rejoin, which also reads as `superseded`, not
+    /// as rejoined.
+    #[test]
+    fn leaving_while_a_rejoin_is_in_flight_drops_the_seat_it_takes() {
+        let rig = rig();
+        hold_join(&rig.groups);
+        let mut rejoined = Box::pin(rig.session.rejoin("reconnect"));
+        assert!(!poll_once(&mut rejoined));
+        let _ = rig.session.leave().now_or_never();
+        assert!(poll_once(&mut rejoined));
+        assert!(!rig.session.view().active);
+        assert_eq!(calls_with(&rig, "leave").len(), 1);
+        let logs = rig.env.logs.borrow().clone();
+        assert!(
+            logs.iter().any(|l| l.contains("cause=superseded")),
+            "{logs:#?}"
+        );
+        assert!(
+            logs.iter().all(|l| !l.contains("group rejoined")),
+            "{logs:#?}"
+        );
+    }
+
+    /// B1005: an answer to a join that a newer join replaced is ignored, and
+    /// no leave is sent: it would end the newer seat.
+    #[test]
+    fn a_join_answer_after_a_newer_join_began_is_ignored() {
+        let groups = FakeGroups::with_groups(vec![summary()]);
+        let session = Session::new(groups.clone(), TestEnv::default());
+        hold_join(&groups);
+        let mut first = Box::pin(session.join("g1"));
+        assert!(!poll_once(&mut first));
+        hold_join(&groups);
+        let mut second = Box::pin(session.join("g1"));
+        assert!(!poll_once(&mut second));
+        assert!(poll_once(&mut first));
+        assert!(groups.calls().iter().all(|c| c != "leave"));
+        assert!(!session.view().active);
+        assert!(poll_once(&mut second));
+        assert!(session.view().active);
+        assert!(groups.calls().iter().all(|c| c != "leave"));
     }
 
     #[test]
@@ -2735,6 +3417,83 @@ mod tests {
         );
     }
 
+    /// B807: a command the group never heard says so on the activity toast
+    /// instead of leaving the click looking dead. Disarm check: dropping the
+    /// `command_failed` calls fails all three.
+    #[test]
+    fn a_failed_command_tells_the_viewer() {
+        let rig = rig();
+        rig.groups.refuse_seek();
+        assert!(rig.session.seek(5_000));
+        let mut live: Vec<LocalBoxFuture<'static, ()>> = Vec::new();
+        pump(&rig.env, &mut live);
+        let lines = rig.session.view().log.lines();
+        assert_eq!(
+            lines.last().map(String::as_str),
+            Some("Couldn't reach the group. Try again.")
+        );
+        assert_eq!(
+            rig.env
+                .logged("pharos: group command failed kind=seek(5000)"),
+            ["pharos: group command failed kind=seek(5000): connection lost"]
+        );
+    }
+
+    /// A burst of failures (an outage fails every queued command) shows one
+    /// line per toast, and a failure after the toast has gone shows again.
+    #[test]
+    fn a_burst_of_failed_commands_shows_one_line() {
+        let rig = rig();
+        rig.groups.refuse_seek();
+        let failed = |rig: &Rig| {
+            rig.session
+                .view()
+                .log
+                .lines()
+                .iter()
+                .filter(|l| l.as_str() == "Couldn't reach the group. Try again.")
+                .count()
+        };
+        let mut live: Vec<LocalBoxFuture<'static, ()>> = Vec::new();
+        for at in [5_000, 6_000, 7_000] {
+            assert!(rig.session.seek(at));
+            pump(&rig.env, &mut live);
+        }
+        assert_eq!(failed(&rig), 1, "{:?}", rig.session.view().log.lines());
+        rig.env.now.set(rig.env.now.get() + 4_000);
+        assert!(rig.session.seek(8_000));
+        pump(&rig.env, &mut live);
+        assert_eq!(failed(&rig), 2);
+    }
+
+    #[test]
+    fn a_command_that_times_out_tells_the_viewer() {
+        let rig = rig();
+        rig.groups.hold_buffering();
+        rig.session.on_media(MediaEvent::Waiting);
+        let mut live: Vec<LocalBoxFuture<'static, ()>> = Vec::new();
+        pump(&rig.env, &mut live);
+        rig.env.timeout_elapsed.set(true);
+        pump(&rig.env, &mut live);
+        assert_eq!(
+            rig.session.view().log.lines().last().map(String::as_str),
+            Some("Couldn't reach the group. Try again.")
+        );
+    }
+
+    #[test]
+    fn a_follow_toggle_the_group_missed_tells_the_viewer() {
+        let rig = rig();
+        rig.groups.refuse_follow();
+        rig.session.follow_tracks(false);
+        let mut live: Vec<LocalBoxFuture<'static, ()>> = Vec::new();
+        pump(&rig.env, &mut live);
+        assert_eq!(
+            rig.session.view().log.lines().last().map(String::as_str),
+            Some("Couldn't reach the group. Try again.")
+        );
+    }
+
     /// Joining again resets the membership, not the queue a running drain
     /// task works through; a command of the old membership still queued is
     /// dropped when reached, never sent to the new group.
@@ -2847,12 +3606,12 @@ mod tests {
 
         rig.player.paused.set(true);
         rig.env.now.set(104_999);
-        assert!(rig.session.tick(1).now_or_never().is_some());
+        assert!(rig.session.tick().now_or_never().is_some());
         rig.env.settle();
         assert!(calls_with(&rig, "buffering").is_empty());
 
         rig.env.now.set(105_000);
-        assert!(rig.session.tick(2).now_or_never().is_some());
+        assert!(rig.session.tick().now_or_never().is_some());
         rig.env.settle();
         let sent = calls_with(&rig, "buffering");
         assert_eq!(sent.len(), 1);
@@ -2889,9 +3648,9 @@ mod tests {
 
         // Past the report too: a player still waiting is not sought again
         // until it can play.
-        for (n, now) in [(1, 112_000), (2, 114_000), (3, 115_000), (4, 125_000)] {
+        for now in [112_000, 114_000, 115_000, 125_000] {
             rig.env.now.set(now);
-            assert!(rig.session.tick(n).now_or_never().is_some());
+            assert!(rig.session.tick().now_or_never().is_some());
             rig.env.settle();
         }
         assert_eq!(seeks(), before);
@@ -2998,7 +3757,7 @@ mod tests {
             1
         );
         rig.env.now.set(105_000);
-        assert!(rig.session.tick(1).now_or_never().is_some());
+        assert!(rig.session.tick().now_or_never().is_some());
         rig.env.settle();
         assert!(calls_with(&rig, "buffering").is_empty());
         assert!(rig.env.logged("pharos: group wait reported").is_empty());
@@ -3042,6 +3801,41 @@ mod tests {
                 .logged("pharos: group resume reason=paused_while_group_plays position_ms=5000 expected_ms=20000")
                 .len(),
             1
+        );
+    }
+
+    /// 038 FR-407, V1223: after a refused autoplay the drift check stops
+    /// starting the player in the background until a gesture lifts it, and
+    /// says so once. Disarm check: without the `autoplay_blocked` guard the
+    /// first assert sees `play`.
+    #[test]
+    fn a_refused_autoplay_holds_the_group_resume_until_a_gesture() {
+        let rig = playing_rig();
+        rig.player.paused.set(true);
+        rig.player.position.set(5_000);
+        rig.player.blocked.set(true);
+        for now in [110_000, 113_000, 116_000] {
+            rig.env.now.set(now);
+            rig.session.check_drift();
+        }
+        assert!(
+            rig.player.log.borrow().is_empty(),
+            "{:?}",
+            rig.player.log.borrow()
+        );
+        assert_eq!(
+            rig.env
+                .logged("pharos: group resume held reason=autoplay_refused position_ms=5000")
+                .len(),
+            1
+        );
+        rig.player.blocked.set(false);
+        rig.env.now.set(120_000);
+        rig.session.check_drift();
+        assert!(
+            rig.player.log.borrow().iter().any(|l| l == "play"),
+            "{:?}",
+            rig.player.log.borrow()
         );
     }
 
@@ -3144,6 +3938,91 @@ mod tests {
         );
     }
 
+    fn seeks(rig: &Rig) -> Vec<String> {
+        rig.player
+            .log
+            .borrow()
+            .iter()
+            .filter(|l| l.starts_with("seek("))
+            .cloned()
+            .collect()
+    }
+
+    /// B1019/V978: after a group seek, a player whose seek has not landed
+    /// (slow direct play: the playhead stays on the target, no `seeked`) is
+    /// left to load. The drift check used to hard-seek it every ~2 s, which
+    /// restarted the load each time and kept "Waiting for the server…" up.
+    #[test]
+    fn a_player_loading_the_groups_seek_is_not_seeked_again() {
+        let rig = playing_rig();
+        rig.env.now.set(101_000);
+        rig.session.deliver(GroupUpdate::Seek {
+            at_server_ms: 101_000,
+            position_ms: 94_852,
+            by: None,
+        });
+        rig.env.settle();
+        assert_eq!(seeks(&rig), ["seek(94852)"]);
+        for now in (102_000..=120_000).step_by(1_000) {
+            rig.env.now.set(now);
+            rig.session.check_drift();
+        }
+        assert_eq!(seeks(&rig), ["seek(94852)"]);
+        assert!(rig.env.kinds().is_empty(), "{:?}", rig.env.kinds());
+    }
+
+    /// B1019/V978: a player that loaded the group's seek with no event left
+    /// to carry its ready (attached after its `canplay`) says ready from the
+    /// drift check instead of sitting uncorrected.
+    #[test]
+    fn a_loaded_player_owing_a_ready_says_it_from_the_drift_check() {
+        let rig = playing_rig();
+        rig.env.now.set(101_000);
+        rig.session.deliver(GroupUpdate::Seek {
+            at_server_ms: 101_000,
+            position_ms: 94_852,
+            by: None,
+        });
+        rig.env.settle();
+        rig.env.now.set(102_000);
+        rig.session.check_drift();
+        rig.env.settle();
+        assert!(rig.env.logged("pharos: group ready sent").is_empty());
+        // Loaded 2 s behind the group: the hold moves it there once...
+        rig.player.has_data.set(true);
+        rig.env.now.set(103_000);
+        rig.session.check_drift();
+        rig.env.settle();
+        assert_eq!(seeks(&rig), ["seek(94852)", "seek(96852)"]);
+        assert!(rig.env.logged("pharos: group ready sent").is_empty());
+        // ...and the next tick, landed, says ready.
+        rig.env.now.set(104_000);
+        rig.session.check_drift();
+        rig.env.settle();
+        assert_eq!(rig.env.logged("pharos: group ready sent").len(), 1);
+        assert_eq!(seeks(&rig).len(), 2);
+    }
+
+    /// B1019/V978: a drift hard seek still loading is not seeked again inside
+    /// the self-seek grace; past it, a player still far off is.
+    #[test]
+    fn a_hard_seek_still_loading_is_not_repeated_inside_the_grace() {
+        let rig = playing_rig();
+        rig.env.now.set(110_000);
+        rig.player.position.set(15_000);
+        rig.session.check_drift();
+        assert_eq!(seeks(&rig), ["seek(20000)"]);
+        // The seek has not landed: the playhead stays on its target.
+        for now in (111_000..=114_000).step_by(1_000) {
+            rig.env.now.set(now);
+            rig.session.check_drift();
+        }
+        assert_eq!(seeks(&rig), ["seek(20000)"]);
+        rig.env.now.set(115_000);
+        rig.session.check_drift();
+        assert_eq!(seeks(&rig), ["seek(20000)", "seek(25000)"]);
+    }
+
     #[test]
     fn a_fresh_server_command_holds_off_corrections() {
         let rig = playing_rig();
@@ -3244,6 +4123,33 @@ mod tests {
             env,
             player,
         }
+    }
+
+    /// FR-502: the view names who the group waits on, never this viewer,
+    /// and empties once they are ready.
+    #[test]
+    fn the_view_names_the_other_members_the_group_waits_on() {
+        let mut state = GroupState::default();
+        let joined = GroupSummary {
+            members: vec![
+                member("me", false),
+                member("bo", false),
+                member("cy", false),
+            ],
+            you: "me".into(),
+            ..summary()
+        };
+        let _ = state.apply(GroupUpdate::Joined(joined), 0);
+        assert!(state.view(true).waiting.is_empty());
+        let _ = state.apply(GroupUpdate::Member(member("me", true)), 0);
+        assert!(state.view(true).waiting.is_empty(), "not this viewer");
+        let _ = state.apply(GroupUpdate::Member(member("bo", true)), 0);
+        let _ = state.apply(GroupUpdate::Member(member("cy", true)), 0);
+        assert_eq!(state.view(true).waiting, ["BO", "CY"]);
+        assert!(state.view(false).waiting.is_empty(), "out of the group");
+        let _ = state.apply(GroupUpdate::Member(member("bo", false)), 0);
+        let _ = state.apply(GroupUpdate::Member(member("cy", false)), 0);
+        assert!(state.view(true).waiting.is_empty());
     }
 
     #[test]
@@ -3902,6 +4808,63 @@ mod tests {
         assert_eq!(
             calls_with(&rig, "set_tracks"),
             ["set_tracks(Index(2),Unset,pl-7)"]
+        );
+    }
+
+    fn on_entry(rig: &Rig, item: u64, playlist_item_id: &str) {
+        rig.session.deliver(GroupUpdate::Item {
+            item: ItemRef::Real(item),
+            playlist_item_id: playlist_item_id.into(),
+            position_ms: 0,
+            playing: true,
+        });
+    }
+
+    /// V986: cancelling "Up next" in a group holds the end for the group,
+    /// naming the entry the viewer is on; out of a group it stays local.
+    #[test]
+    fn a_cancelled_up_next_holds_the_end_for_the_group() {
+        let rig = rig();
+        assert!(
+            !rig.session.hold_next(),
+            "no entry yet: the cancel stays here"
+        );
+        on_entry(&rig, 7, "pl-7");
+        assert!(!rig.session.next_held());
+        assert!(rig.session.hold_next());
+        rig.env.settle();
+        assert_eq!(calls_with(&rig, "hold_next"), ["hold_next(pl-7)"]);
+        assert!(rig.session.next_held(), "the group's update came back");
+        assert_eq!(rig.session.view().log.lines(), ["ME cancelled Up next"]);
+
+        let alone = Session::new(FakeGroups::default(), TestEnv::default());
+        assert!(!alone.hold_next());
+        assert!(!alone.next_held());
+    }
+
+    /// V986: another member's hold stops this player's "Up next" on that
+    /// entry only: once the group moves on, the next episode counts again.
+    #[test]
+    fn another_members_hold_lasts_until_the_group_moves_on() {
+        let rig = rig();
+        on_entry(&rig, 7, "pl-7");
+        rig.session.deliver(GroupUpdate::NextHeld {
+            playlist_item_id: "pl-6".into(),
+            by: Some("me".into()),
+        });
+        assert!(!rig.session.next_held(), "a hold on an entry already left");
+        rig.session.deliver(GroupUpdate::NextHeld {
+            playlist_item_id: "pl-7".into(),
+            by: Some("me".into()),
+        });
+        assert!(rig.session.next_held());
+        on_entry(&rig, 8, "pl-8");
+        assert!(!rig.session.next_held());
+        assert_eq!(rig.session.playlist_item_id(), "pl-8");
+        on_entry(&rig, 7, "pl-7");
+        assert!(
+            !rig.session.next_held(),
+            "back on the held entry, it counts again"
         );
     }
 

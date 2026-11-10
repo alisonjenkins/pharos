@@ -61,7 +61,7 @@ Eleven shipped defects, grouped by *which* decision was re-derived:
 The muxed mpegts path AAC-encodes audio *independently per segment*
 (`build_segment_opts` sets `audio: Some(SegmentAudio::Aac)`), so every segment
 carries a fresh encoder priming frame and restarts the AAC frame grid at its own
-seek point. Measured on three consecutive live segments of Fringe S01E02:
+seek point. Measured on three consecutive live segments of Show AW S01E02:
 
 ```
 seg40  video [239.969 → 245.975]   audio [239.9477 → 245.985]
@@ -285,7 +285,7 @@ directions.
 ## 6. Success criteria
 
 1. The crown-jewel test fails on `main` today and passes after.
-2. Fringe S01E02 plays without freezes on the Google TV app.
+2. Show AW S01E02 plays without freezes on the Google TV app.
 3. `grep` finds one segment-grid definition, one identity function, one playlist
    renderer, one audio encoder.
 4. No route, content type or playlist field changes.

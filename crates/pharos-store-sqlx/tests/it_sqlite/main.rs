@@ -6,10 +6,12 @@ mod bg_leadership;
 mod book_roundtrip;
 #[path = "../common/mod.rs"]
 mod common;
+mod get_many;
 mod language_index;
 mod media_fts_facets;
 mod media_query;
 mod media_segments;
+mod pool_config;
 mod probe_roundtrip;
 mod put_batch;
 mod sqlite_store;

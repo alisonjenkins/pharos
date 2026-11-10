@@ -123,6 +123,7 @@ impl Group {
         deps: &SyncDeps,
         user: &pharos_core::User,
         device: &str,
+        schema: u32,
         sink: group_sink::Client,
         group: &GroupHandle,
     ) -> Membership {
@@ -132,7 +133,10 @@ impl Group {
             .hub
             .register(key.clone(), user.name.clone(), tx.clone());
         deps.sinks.insert(reg.member_id, reg.gen, tx);
-        let pump = actix_web::rt::spawn(pump(rx, sink, group.clone(), reg.member_id));
+        let reads = Reads {
+            next_held: schema >= NEXT_HELD_SCHEMA_VERSION,
+        };
+        let pump = actix_web::rt::spawn(pump(rx, sink, group.clone(), reg.member_id, reads));
         // The capability is not always dropped when its connection closes
         // (observed live: the seat outlived the socket until the silence
         // TTL), so the close itself starts the same loss.
@@ -336,6 +340,10 @@ enum Update {
         own_tracks: bool,
     },
     Tracks(GroupTracks),
+    NextHeld {
+        playlist_item_id: String,
+        by: String,
+    },
     Left(String),
     Item {
         item: u64,
@@ -407,6 +415,13 @@ fn translate(msg: &ServerMsg, group: GroupId, epoch_unix_ms: u64) -> Option<Upda
             id: member_id.to_string(),
             own_tracks: *own_tracks,
         },
+        ServerMsg::NextHeld {
+            playlist_item_id,
+            by,
+        } => Update::NextHeld {
+            playlist_item_id: playlist_item_id.clone(),
+            by: by.to_string(),
+        },
         ServerMsg::MemberLeft { member_id, .. } => Update::Left(member_id.to_string()),
         ServerMsg::PlayQueue {
             items,
@@ -472,6 +487,14 @@ fn write_update(mut out: group_update::Builder<'_>, update: &Update) {
         Update::Tracks(tracks) => write_tracks(out.init_tracks(), tracks),
         // The pump turns it into a `Member` before anything is written.
         Update::MemberTracks { .. } => {}
+        Update::NextHeld {
+            playlist_item_id,
+            by,
+        } => {
+            let mut held = out.init_next_held();
+            held.set_playlist_item_id(playlist_item_id.as_str());
+            held.set_by(by.as_str());
+        }
         Update::Left(id) => out.set_left(id.as_str()),
         Update::Item {
             item,
@@ -486,6 +509,26 @@ fn write_update(mut out: group_update::Builder<'_>, update: &Update) {
             at.set_playing(*playing);
         }
         Update::Ended(reason) => out.set_ended(*reason),
+    }
+}
+
+/// The first schemaVersion whose clients read a `nextHeld` update (B1027).
+const NEXT_HELD_SCHEMA_VERSION: u32 = 33;
+
+/// The updates a member's client can read. An older client fails the whole
+/// `update` call on a union variant it does not know, and the pump stops
+/// at the first failed call, so such a member would hear nothing more.
+#[derive(Debug, Clone, Copy)]
+struct Reads {
+    next_held: bool,
+}
+
+impl Reads {
+    fn takes(self, update: &Update) -> bool {
+        match update {
+            Update::NextHeld { .. } => self.next_held,
+            _ => true,
+        }
     }
 }
 
@@ -507,6 +550,7 @@ async fn pump(
     sink: group_sink::Client,
     group: GroupHandle,
     me: MemberId,
+    reads: Reads,
 ) {
     let mut roster: HashMap<String, String> = HashMap::new();
     let mut buffering: HashSet<String> = HashSet::new();
@@ -524,7 +568,9 @@ async fn pump(
             _ = poll.tick() => None,
         };
         if let Some(msg) = &msg {
-            if let Some(mut update) = translate(msg, group.group_id, group.epoch_unix_ms) {
+            if let Some(mut update) =
+                translate(msg, group.group_id, group.epoch_unix_ms).filter(|u| reads.takes(u))
+            {
                 let mut member_update = None;
                 match &mut update {
                     Update::Joined(summary) => {
@@ -699,6 +745,7 @@ impl server::group::Handler for Group {
     ) -> Result<(), capnp::Error> {
         let params = params.get()?;
         let device = params.get_ctx()?.get_device()?.get_value()?.to_string()?;
+        let schema = params.get_ctx()?.get_schema_version();
         let item = read_item_id(params.get_item()?)?;
         let position_ms = params.get_position_ms();
         let sink = params.get_sink()?;
@@ -720,7 +767,7 @@ impl server::group::Handler for Group {
                 }
             })?;
             self.leave_previous(&deps, &user, &device, None).await;
-            let member = self.register(&deps, &user, &device, sink, &handle);
+            let member = self.register(&deps, &user, &device, schema, sink, &handle);
             add_caller_to_group(&deps.hub, &deps.sinks, &member.key, user.id, handle.clone())
                 .await;
             let name = format!("{}'s Group", user.name);
@@ -775,6 +822,7 @@ impl server::group::Handler for Group {
     ) -> Result<(), capnp::Error> {
         let params = params.get()?;
         let device = params.get_ctx()?.get_device()?.get_value()?.to_string()?;
+        let schema = params.get_ctx()?.get_schema_version();
         let id = params.get_id()?.get_value()?.to_string()?;
         let sink = params.get_sink()?;
         let made = async {
@@ -796,7 +844,7 @@ impl server::group::Handler for Group {
             // device's existing membership, if any, as it was.
             self.leave_previous(&deps, &user, &device, Some(handle.group_id))
                 .await;
-            let member = self.register(&deps, &user, &device, sink, &handle);
+            let member = self.register(&deps, &user, &device, schema, sink, &handle);
             tracing::info!(device_id = %member.key, group = %handle.group_id, "syncplay: native join");
             add_caller_to_group(&deps.hub, &deps.sinks, &member.key, user.id, handle).await;
             Ok(member)
@@ -909,6 +957,15 @@ async fn lose_seat(
     }
     // A newer registration of the device bumped the generation.
     if let Some(group) = deps.hub.remove_if_current_gen(&key, gen) {
+        // A sole member is the host waiting in a group for guests: removing
+        // it ends the group, and its rejoin can take longer than the grace
+        // (a restarted server answers notFound until it loads the group). The
+        // group keeps the seat, off every gate, until the abandonment reaps it.
+        if group.snapshot().await.is_some_and(|g| g.member_count == 1) {
+            deps.sinks.remove(member_id, gen);
+            tracing::info!(device_id = %key, %member_id, group = %group.group_id, "syncplay: native sole member kept after its connection stayed gone");
+            return;
+        }
         let _ = group.tx.send(GroupMsg::RemoveMember { member_id }).await;
         deps.sinks.remove(member_id, gen);
         metrics::counter!(
@@ -1058,7 +1115,14 @@ impl Membership {
             return Ok(());
         }
         end_owned_cast(&self.session.state, user.id, self.member_id).await;
-        if let Some(group) = hub.detach_group(&self.key) {
+        let detached = hub.detach_group(&self.key);
+        tracing::info!(
+            device_id = %self.key, member_id = %self.member_id,
+            group = %detached.as_ref().map_or_else(|| "none".to_owned(), |g| g.group_id.to_string()),
+            detached = detached.is_some(),
+            "syncplay: native member left on request"
+        );
+        if let Some(group) = detached {
             let _ = group
                 .tx
                 .send(GroupMsg::RemoveMember {
@@ -1248,6 +1312,22 @@ impl server::membership::Handler for Membership {
             })
         }
         .await;
+        write_done(results.get().init_result(), done);
+        Ok(())
+    }
+
+    async fn hold_next(
+        self: Rc<Self>,
+        params: member_wire::HoldNextParams,
+        results: &mut member_wire::HoldNextResults,
+    ) -> Result<(), capnp::Error> {
+        let playlist_item_id = playlist_item_id(params.get()?.get_playlist_item_id()?.to_string()?);
+        let done = self
+            .command("hold_next", |sender| GroupMsg::HoldNext {
+                sender,
+                playlist_item_id,
+            })
+            .await;
         write_done(results.get().init_result(), done);
         Ok(())
     }

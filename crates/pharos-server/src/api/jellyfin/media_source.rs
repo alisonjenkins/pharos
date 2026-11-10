@@ -21,6 +21,10 @@ pub(crate) enum Route {
     /// Background segment warming for a play session, with no request of its
     /// own: it names the source the session selected.
     Prewarm,
+    /// A native player's `Library.detail` naming a version.
+    NativeDetail,
+    /// A native player's `Playback.negotiate` naming a version.
+    Negotiate,
 }
 
 impl Route {
@@ -31,6 +35,8 @@ impl Route {
             Self::PlaybackInfo => "playback_info",
             Self::Subtitles => "subtitles",
             Self::Prewarm => "prewarm",
+            Self::NativeDetail => "native_detail",
+            Self::Negotiate => "negotiate",
         }
     }
 }
@@ -42,6 +48,9 @@ pub(crate) enum Requested {
     Absent,
     Primary,
     Alternate,
+    /// A later part of a split film, which its film's playlists address
+    /// (V1154).
+    Part,
     /// Names neither the primary nor any edition of this item.
     Unknown,
 }
@@ -52,6 +61,7 @@ impl Requested {
             Self::Absent => "absent",
             Self::Primary => "primary",
             Self::Alternate => "alternate",
+            Self::Part => "part",
             Self::Unknown => "unknown",
         }
     }
@@ -106,6 +116,7 @@ pub(crate) fn classify<'a>(
             .flatten()
     });
     match alt {
+        Some(a) if a.part.is_some() => (Requested::Part, Some(a)),
         Some(a) => (Requested::Alternate, Some(a)),
         None => (Requested::Unknown, None),
     }
@@ -129,7 +140,8 @@ pub(crate) fn record(
     )
     .increment(1);
     match requested {
-        Requested::Absent | Requested::Primary => tracing::debug!(
+        // A split film's part is asked for on every one of its segments.
+        Requested::Absent | Requested::Primary | Requested::Part => tracing::debug!(
             media.id = item.id,
             route = route.label(),
             requested = requested.label(),
@@ -156,8 +168,13 @@ pub(crate) fn record(
 /// kept (ADR-0030), is served the primary rather than refused: a stale id
 /// after a rescan must not stop playback, and the `requested`/`served` pair
 /// says it happened.
+///
+/// A split film's part is served only to the HLS routes its film's playlists
+/// address (V1154). Anywhere else, such as PlaybackInfo, it is the whole film,
+/// so no client is offered one part to direct play (V1155).
 pub(crate) fn select(route: Route, mut item: MediaItem, raw: Option<&str>) -> MediaItem {
     let (requested, alt) = classify(&item, raw);
+    let alt = alt.filter(|_| requested != Requested::Part || route == Route::Hls);
     let Some(alt) = alt else {
         record(route, &item, raw, requested, Served::Primary);
         return item;
@@ -269,6 +286,24 @@ mod tests {
         assert_eq!(got.edition.as_deref(), Some("3d-hsbs"));
     }
 
+    /// V1154, V1155 — a part is its film's file on the HLS routes only;
+    /// PlaybackInfo naming a part gets the whole film.
+    #[test]
+    fn a_part_is_served_only_to_its_films_playlists() {
+        let mut item = item_with_edition();
+        item.probe.alternate_sources[0].part = Some(2);
+        let raw = format!(
+            "{}-3d-hsbs",
+            pharos_jellyfin_api::dto::wire_item_id(item.id)
+        );
+        let hls = select(Route::Hls, item.clone(), Some(&raw));
+        assert_eq!(hls.edition.as_deref(), Some("3d-hsbs"));
+        let info = select(Route::PlaybackInfo, item, Some(&raw));
+        assert_eq!(info.edition, None);
+        assert_eq!(info.path, std::path::PathBuf::from("/m/Film.mkv"));
+        assert_eq!(info.probe.parts().len(), 1, "the film keeps its parts");
+    }
+
     #[test]
     fn select_serves_the_primary_when_it_cannot_serve_the_edition() {
         let recorder = DebuggingRecorder::new();
@@ -352,10 +387,12 @@ mod tests {
             Route::PlaybackInfo,
             Route::Subtitles,
             Route::Prewarm,
+            Route::NativeDetail,
+            Route::Negotiate,
         ]
         .map(Route::label)
         .into();
-        assert_eq!(rt.len(), 5);
+        assert_eq!(rt.len(), 7);
     }
 
     #[test]

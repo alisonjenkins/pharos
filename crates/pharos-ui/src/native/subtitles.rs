@@ -134,23 +134,90 @@ pub fn controls_inset(controls_visible: bool, box_bottom: f64, controls_top: f64
     }
 }
 
+/// How long the Rust renderer's cues take to glide up or down as the control
+/// bar shows or hides (B820), matching the ASS canvas's CSS transition.
+pub const INSET_GLIDE_MS: f64 = 150.0;
+
+/// The inset `elapsed_ms` into a glide from `from` to `to`: an ease-out, so
+/// the cues move fastest as the bar starts to show or hide. At or past
+/// [`INSET_GLIDE_MS`] it is `to`.
+pub fn glide_inset(from: u32, to: u32, elapsed_ms: f64) -> u32 {
+    if elapsed_ms.is_nan() || elapsed_ms <= 0.0 {
+        return from;
+    }
+    if elapsed_ms >= INSET_GLIDE_MS {
+        return to;
+    }
+    let left = 1.0 - elapsed_ms / INSET_GLIDE_MS;
+    let eased = 1.0 - left * left * left;
+    let (from, to) = (f64::from(from), f64::from(to));
+    (from + (to - from) * eased).round() as u32
+}
+
 /// How far the ASS renderer's canvas moves up while the control bar shows
 /// (B634, V583): the overlap of the canvas, which JASSUB fits to the picture,
 /// with the bar's laid-out box, `player_bottom - controls_height` (the bar sits
 /// at the bottom of the player; its height, not its on-screen box, so a bar
 /// still sliding in is measured where it ends). Nothing for a letterboxed
 /// picture that ends above the bar, or while the bar is hidden.
+///
+/// Nothing either while a sign is on screen (B1211): the lift moves the
+/// whole canvas, and a sign is pinned to the picture it labels, so it stays
+/// put and the bar covers the bottom of the picture for that moment.
 pub fn styled_lift(
     controls_visible: bool,
+    sign_showing: bool,
     canvas_bottom: f64,
     player_bottom: f64,
     controls_height: f64,
 ) -> u32 {
     controls_inset(
-        controls_visible,
+        controls_visible && !sign_showing,
         canvas_bottom,
         player_bottom - controls_height,
     )
+}
+
+/// The Name the styling compiler gives the events it passes through from
+/// the source (pharos-styling `PASSTHROUGH_PREFIX`).
+const SIGN_NAME_PREFIX: &str = "sign:";
+
+/// When each sign in a compiled styled script shows, `(start_ms, end_ms)`
+/// sorted by start: the events named `sign:<n>` (B1211). Lines that do not
+/// read as events are skipped.
+pub fn sign_spans(script: &str) -> Vec<(u64, u64)> {
+    let mut spans: Vec<(u64, u64)> = script
+        .lines()
+        .filter_map(|l| l.strip_prefix("Dialogue:"))
+        .filter_map(|rest| {
+            let f: Vec<&str> = rest.splitn(10, ',').collect();
+            let name = f.get(4)?.trim();
+            if !name.starts_with(SIGN_NAME_PREFIX) {
+                return None;
+            }
+            let (start, end) = (ass_ms(f.get(1)?)?, ass_ms(f.get(2)?)?);
+            (end > start).then_some((start, end))
+        })
+        .collect();
+    spans.sort_unstable();
+    spans
+}
+
+/// Whether any of `spans` (from [`sign_spans`]) shows at `t_ms`.
+pub fn sign_showing(spans: &[(u64, u64)], t_ms: u64) -> bool {
+    let n = spans.partition_point(|&(start, _)| start <= t_ms);
+    spans[..n].iter().any(|&(_, end)| t_ms < end)
+}
+
+/// An ASS time, `h:mm:ss.cc`, in ms.
+fn ass_ms(t: &str) -> Option<u64> {
+    let mut parts = t.trim().splitn(3, ':');
+    let h: u64 = parts.next()?.parse().ok()?;
+    let m: u64 = parts.next()?.parse().ok()?;
+    let (s, cs) = parts.next()?.split_once('.')?;
+    let s: u64 = s.parse().ok()?;
+    let cs: u64 = cs.parse().ok()?;
+    Some(((h * 60 + m) * 60 + s) * 1000 + cs * 10)
 }
 
 /// Why a text track fell back to the browser's own cue display. The label
@@ -243,6 +310,23 @@ mod tests {
     use pharos_subs::{Mask, MaskKind};
 
     use super::*;
+
+    #[test]
+    fn the_cues_glide_between_the_two_insets_instead_of_jumping() {
+        assert_eq!(glide_inset(0, 100, 0.0), 0);
+        let mid = glide_inset(0, 100, INSET_GLIDE_MS / 2.0);
+        assert!(
+            mid > 50 && mid < 100,
+            "ease-out is past halfway at half time: {mid}"
+        );
+        assert_eq!(glide_inset(0, 100, INSET_GLIDE_MS), 100);
+        assert_eq!(glide_inset(0, 100, INSET_GLIDE_MS * 4.0), 100);
+        // Down again, and never outside the two ends.
+        let down = glide_inset(100, 0, 30.0);
+        assert!(down < 100 && down > 0, "{down}");
+        assert_eq!(glide_inset(80, 80, 40.0), 80);
+        assert_eq!(glide_inset(0, 100, f64::NAN), 0);
+    }
 
     const FONT: &[u8] = include_bytes!("../../assets/fonts/LiberationSans-Regular.ttf");
     const VTT: &str = "WEBVTT\n\n00:00:01.000 --> 00:00:03.000\nHello there\n";
@@ -391,15 +475,35 @@ mod tests {
     #[test]
     fn the_ass_canvas_clears_the_control_bar_only_while_it_shows() {
         // A picture down to the player's bottom moves up by the bar's height.
-        assert_eq!(styled_lift(true, 720.0, 720.0, 96.0), 96);
+        assert_eq!(styled_lift(true, false, 720.0, 720.0, 96.0), 96);
         // Hidden controls: the canvas stays where JASSUB put it.
-        assert_eq!(styled_lift(false, 720.0, 720.0, 96.0), 0);
+        assert_eq!(styled_lift(false, false, 720.0, 720.0, 96.0), 0);
         // A letterboxed picture ending above the bar needs no move, and one
         // ending inside it moves only by the overlap.
-        assert_eq!(styled_lift(true, 600.0, 720.0, 96.0), 0);
-        assert_eq!(styled_lift(true, 650.0, 720.0, 96.0), 26);
+        assert_eq!(styled_lift(true, false, 600.0, 720.0, 96.0), 0);
+        assert_eq!(styled_lift(true, false, 650.0, 720.0, 96.0), 26);
         // A canvas not laid out yet never moves.
-        assert_eq!(styled_lift(true, f64::NAN, 720.0, 96.0), 0);
+        assert_eq!(styled_lift(true, false, f64::NAN, 720.0, 96.0), 0);
+        // B1211: a sign on screen keeps the canvas on the picture.
+        assert_eq!(styled_lift(true, true, 720.0, 720.0, 96.0), 0);
+    }
+
+    /// B1211: the signs' spans come from the compiler's `sign:` names.
+    #[test]
+    fn signs_are_found_by_their_name_and_time() {
+        let script = "[Events]\n\
+            Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n\
+            Dialogue: 1,0:03:38.73,0:03:47.24,Panel,sign:12,0,0,0,,{\\1a&H17&}[Name], a, b\n\
+            Dialogue: 0,0:00:01.00,0:00:02.50,Default,,0,0,0,,Talk\n\
+            Dialogue: 0,0:00:00.50,0:00:01.00,Sign,sign:3,0,0,0,,x\n\
+            Dialogue: 0,bad,0:00:01.00,Sign,sign:4,0,0,0,,x\n";
+        let spans = sign_spans(script);
+        assert_eq!(spans, [(500, 1_000), (218_730, 227_240)]);
+        assert!(sign_showing(&spans, 500));
+        assert!(!sign_showing(&spans, 1_000));
+        assert!(!sign_showing(&spans, 2_000));
+        assert!(sign_showing(&spans, 220_000));
+        assert!(!sign_showing(&[], 0));
     }
 
     /// B634: the move is a transform on the canvas (no redraw of the script)

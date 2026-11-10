@@ -76,6 +76,7 @@ async fn seed(cache_dir: &std::path::Path) -> (web::Data<AppState>, String) {
     let fx = fixture("video.webm").unwrap();
     stores
         .put(MediaItem {
+            locked: Default::default(),
             id: 7,
             path: fx,
             title: "fx".into(),

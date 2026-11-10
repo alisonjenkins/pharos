@@ -61,6 +61,23 @@ const QUEUE_KEY: &str = "pharos.listen.queue";
 const QUEUE_SHOWN: &str = "shown";
 pub const QUEUE_PANEL_ID: &str = "pharos-queue";
 
+/// Device-local: whether the listener docked the queue beside the mini bar
+/// or floating window (B900/V852). It starts closed, so the page keeps the
+/// room.
+const DOCK_KEY: &str = "pharos.stage.queue";
+
+/// Whether the queue is docked beside the compact player on this device.
+pub fn dock_shown() -> bool {
+    platform::stored_theme(DOCK_KEY).ok().flatten().as_deref() == Some(QUEUE_SHOWN)
+}
+
+/// Remember whether the queue is docked beside the compact player.
+pub fn store_dock(shown: bool) {
+    if let Err(e) = platform::store_theme(DOCK_KEY, if shown { QUEUE_SHOWN } else { "hidden" }) {
+        platform::warn(&format!("pharos: docked queue choice not stored error={e}"));
+    }
+}
+
 /// The analyser on this screen's media element. Web Audio routes an element
 /// once, so it outlives style changes and is shared with each visualiser.
 #[derive(Clone, Default)]
@@ -79,13 +96,16 @@ impl PartialEq for Tap {
 
 #[cfg_attr(all(feature = "mobile", target_os = "android"), allow(dead_code))]
 impl Tap {
-    /// Route the media element through an analyser once it is playing and
-    /// the page has had a gesture; one attempt per screen.
-    fn connect(&self) {
+    /// Route the media element `media_id` through an analyser once it is
+    /// playing and the page has had a gesture; one attempt per screen. Asked
+    /// from the element's `playing` as well as the visualiser's frames, so a
+    /// song is tapped with the player shrunk too (B734, V682): the tap's
+    /// running context is what keeps the output awake through a pause.
+    fn connect(&self, media_id: &str) {
         if self.tried.get() {
             return;
         }
-        let waiting = if !platform::media_playing(VIDEO_ID) {
+        let waiting = if !platform::media_playing(media_id) {
             Some("not_playing")
         } else if !platform::user_activated() {
             Some("no_activation")
@@ -99,7 +119,7 @@ impl Tap {
             return;
         }
         self.tried.set(true);
-        match platform::audio_tap(VIDEO_ID) {
+        match platform::audio_tap(media_id) {
             Ok(tap) => {
                 platform::info("pharos: visualiser tap=connected");
                 *self.tap.borrow_mut() = Some(tap);
@@ -164,11 +184,23 @@ pub fn ListenView(
     /// screen is out of sight, so it draws no visualiser.
     #[props(default)]
     compact: bool,
+    /// This screen's slot is the one in sight. A song handing over mounts
+    /// two screens; only the one in sight draws the queue panel (V852).
+    #[props(default = true)]
+    in_sight: bool,
     /// The `<audio>` element's id: [`VIDEO_ID`], or another while this song
     /// hands over to the next.
     #[props(default = VIDEO_ID)]
     media_id: &'static str,
+    /// The position as a signal, when the player keeps it apart from `media`
+    /// so its own render does not run on every tick (B815).
+    #[props(default)]
+    live_position: Option<Signal<u64>>,
 ) -> Element {
+    let media = MediaState {
+        position_ms: live_position.map_or(media.position_ms, |s| s()),
+        ..media
+    };
     let tap = use_hook(Tap::default);
     let shortcuts = use_shortcuts(media, previous, next, on_control).for_song();
     let mut style =
@@ -267,6 +299,7 @@ pub fn ListenView(
             if let (false, Some(program), None) = (compact, current.program(), fallback()) {
                 Visualiser {
                     key: "{current.label()}",
+                    media_id,
                     style: current,
                     program,
                     tap: tap.clone(),
@@ -326,7 +359,7 @@ pub fn ListenView(
                         r#type: "button",
                         title: "Show or hide what plays next",
                         aria_pressed: if show_queue() { "true" } else { "false" },
-                        aria_controls: show_queue().then_some(QUEUE_PANEL_ID),
+                        aria_controls: (show_queue() && !compact && in_sight).then_some(QUEUE_PANEL_ID),
                         onclick: move |_| toggle_queue(),
                         Icon { path: ICON_QUEUE_NEXT }
                         "Queue"
@@ -351,7 +384,9 @@ pub fn ListenView(
                     karaoke: karaoke(),
                 }
             }
-            if show_queue() {
+            // Not while the screen is out of sight: the compact player docks
+            // its own (B900/V852), and two panels would share element ids.
+            if show_queue() && !compact && in_sight {
                 QueuePanel { queue: queue.clone(), shuffled, on_queue, playing }
             }
             div { class: "pharos-listen-body",
@@ -374,7 +409,14 @@ pub fn ListenView(
                         id: media_id,
                         class: "pharos-audio",
                         autoplay: true,
-                        onplaying: move |_| on_media.call(MediaEvent::Playing),
+                        onplaying: {
+                            let tap = tap.clone();
+                            move |_| {
+                                platform::wake_media_tap(media_id);
+                                tap.connect(media_id);
+                                on_media.call(MediaEvent::Playing);
+                            }
+                        },
                         onpause: move |_| on_media.call(MediaEvent::Pause),
                         onseeked: move |_| {
                             scrub.set(None);
@@ -399,7 +441,7 @@ pub fn ListenView(
                             aria_valuetext: "{clock(at)}",
                             disabled: total == 0,
                             style: "--pharos-fill: {played:.2}%",
-                            onkeydown: slider_key,
+                            onkeydown: move |evt| slider_key(evt, None),
                             oninput: move |evt: FormEvent| {
                                 if let Ok(ms) = evt.value().parse::<f64>() {
                                     scrub.set(Some(Scrub { ms: ms as u64, released: false }));
@@ -513,20 +555,29 @@ const CLEAR_NOTE_ID: &str = "pharos-queue-clear-note";
 /// skip to it, drag a row (or use its arrows) to move it, shuffle, remove
 /// or clear.
 #[component]
-fn QueuePanel(
+pub(super) fn QueuePanel(
     queue: Vec<Entry>,
     shuffled: bool,
     on_queue: EventHandler<QueueAction>,
     #[props(default)] playing: Option<ItemRef>,
+    /// The video queue's panel (V853): it counts videos and has no mix.
+    #[props(default)]
+    videos: bool,
+    /// Escape outside the Clear confirm, for a panel that closes on it (the
+    /// video player's). The panel stops the key going further up, so its
+    /// holder cannot hear it itself.
+    #[props(default)]
+    on_escape: Option<EventHandler<()>>,
 ) -> Element {
     // The row being dragged, by key, and the position it would drop at.
     let mut dragging = use_signal(|| None::<u64>);
     let mut over = use_signal(|| None::<usize>);
     let total = queue.len();
+    let noun = if videos { "video" } else { "song" };
     let count = match total {
         0 => String::new(),
-        1 => "1 song".to_owned(),
-        n => format!("{n} songs"),
+        1 => format!("1 {noun}"),
+        n => format!("{n} {noun}s"),
     };
     let mut end_drag = move || {
         dragging.set(None);
@@ -584,17 +635,23 @@ fn QueuePanel(
             // Keys on the queue's own buttons are theirs, not the player's.
             onkeydown: move |evt: KeyboardEvent| {
                 let key = evt.key();
-                let own = matches!(key, Key::Enter | Key::ArrowUp | Key::ArrowDown | Key::PageUp | Key::PageDown)
+                let own = matches!(key, Key::Named(NamedKey::Enter) | Key::Named(NamedKey::ArrowUp) | Key::Named(NamedKey::ArrowDown) | Key::Named(NamedKey::PageUp) | Key::Named(NamedKey::PageDown))
                     || matches!(&key, Key::Character(k) if k == " ")
                     // The queue's own keys (spec 029), not the player's k and h/l.
                     || !matches!(keymap::resolve(Mode::Queue, &[&key.to_string()]), Resolved::Unbound);
                 if own {
                     evt.stop_propagation();
                 }
-                if key == Key::Escape && *confirming.peek() {
+                if key == Key::Named(NamedKey::Escape) && *confirming.peek() {
                     evt.prevent_default();
                     evt.stop_propagation();
                     cancel();
+                } else if key == Key::Named(NamedKey::Escape) && !platform::escape_claimed() {
+                    // The key help and fullscreen take Escape first.
+                    if let Some(on_escape) = on_escape {
+                        evt.prevent_default();
+                        on_escape.call(());
+                    }
                 }
             },
             div { class: "pharos-queue-head",
@@ -622,7 +679,9 @@ fn QueuePanel(
                     }
                 }
             }
-            MixBar { playing }
+            if !videos {
+                MixBar { playing }
+            }
             if asking {
                 div {
                     class: "pharos-queue-confirm",
@@ -653,7 +712,11 @@ fn QueuePanel(
             }
             if queue.is_empty() {
                 p { class: "pharos-muted pharos-queue-empty",
-                    "Nothing queued. Use Play next or Add to queue on any song or album."
+                    if videos {
+                        "Nothing queued. Use Play next or Add to queue on any film or episode."
+                    } else {
+                        "Nothing queued. Use Play next or Add to queue on any song or album."
+                    }
                 }
             }
             ol { class: "pharos-queue-list",
@@ -870,6 +933,8 @@ fn Visualiser(
     style: Style,
     program: render::Program,
     tap: Tap,
+    /// The `<audio>` element the tap reads.
+    media_id: &'static str,
     on_fallback: EventHandler<Fallback>,
 ) -> Element {
     // On the TV the page draws: this crate, built to wasm, runs the same
@@ -895,7 +960,7 @@ fn Visualiser(
             let outcome = match opened {
                 Ok(surface) => {
                     report(style, None);
-                    draw(surface, &tap).await
+                    draw(surface, &tap, media_id).await
                 }
                 Err(f) => Err(f),
             };
@@ -927,7 +992,7 @@ pub async fn run_page_visualiser(style_label: &str) -> Result<(), Fallback> {
     ) {
         Ok(surface) => {
             report(style, None);
-            draw(surface, &Tap::default()).await
+            draw(surface, &Tap::default(), VIDEO_ID).await
         }
         Err(f) => Err(f),
     };
@@ -988,7 +1053,11 @@ fn renderer_signals(style: Style, fallback: Option<&Fallback>) -> (String, Vec<C
 /// this future) or the surface fails. A paused song keeps its last frame,
 /// so a headset spends no GPU time on a still picture.
 #[cfg_attr(all(feature = "mobile", target_os = "android"), allow(dead_code))]
-async fn draw(mut surface: Box<dyn Surface>, tap: &Tap) -> Result<(), Fallback> {
+async fn draw(
+    mut surface: Box<dyn Surface>,
+    tap: &Tap,
+    media_id: &'static str,
+) -> Result<(), Fallback> {
     let start = platform::now_ms();
     let mut palette = platform::theme_palette();
     let mut palette_at = start;
@@ -996,7 +1065,7 @@ async fn draw(mut surface: Box<dyn Surface>, tap: &Tap) -> Result<(), Fallback> 
     let mut drawn = false;
     loop {
         platform::animation_frame().await;
-        if drawn && !platform::media_playing(VIDEO_ID) && !surface.needs_frame() {
+        if drawn && !platform::media_playing(media_id) && !surface.needs_frame() {
             continue;
         }
         let now = platform::now_ms();
@@ -1004,7 +1073,7 @@ async fn draw(mut surface: Box<dyn Surface>, tap: &Tap) -> Result<(), Fallback> 
             palette = platform::theme_palette();
             palette_at = now;
         }
-        tap.connect();
+        tap.connect(media_id);
         let mut slot = tap.tap.borrow_mut();
         let analysis = slot.as_mut().map(|t| {
             let a = analysis.get_or_insert_with(|| Analysis::new(t.bins(), t.sample_rate()));
@@ -1348,7 +1417,7 @@ mod tests {
     #[test]
     fn the_queue_starts_closed_beside_the_lyrics_toggle_with_its_count() {
         let queue = vec![
-            entry(1, "Angel", Source::Album),
+            entry(1, "Alpha", Source::Album),
             entry(2, "Inertia Creeps", Source::Added),
         ];
         let mut dom = VirtualDom::new_with_props(
@@ -1404,7 +1473,7 @@ mod tests {
     fn the_queue_panel_lists_each_song_with_its_controls() {
         let html = render_panel(
             vec![
-                entry(1, "Angel", Source::Album),
+                entry(1, "Alpha", Source::Album),
                 entry(2, "Inertia Creeps", Source::Added),
             ],
             true,
@@ -1415,9 +1484,9 @@ mod tests {
         assert!(html.contains(r#"data-source="added""#), "{html}");
         assert!(html.contains("3:07"), "{html}");
         for label in [
-            "Move Angel up",
-            "Move Angel down",
-            "Remove Angel from the queue",
+            "Move Alpha up",
+            "Move Alpha down",
+            "Remove Alpha from the queue",
             "Remove Inertia Creeps from the queue",
         ] {
             assert!(
@@ -1427,7 +1496,7 @@ mod tests {
         }
         // The first cannot go up, the last cannot go down.
         let up = html
-            .split_once(r#"aria-label="Move Angel up""#)
+            .split_once(r#"aria-label="Move Alpha up""#)
             .map(|(_, rest)| rest.split_once('>').map_or("", |(t, _)| t))
             .expect("move up");
         assert!(up.contains("disabled"), "{up}");
@@ -1479,13 +1548,22 @@ mod tests {
         );
     }
 
+    /// The attributes of the first `<tag ...>` in `html`, in whatever order
+    /// the renderer writes them (dioxus-ssr 0.8 puts `class` before `id`).
+    fn open_tag<'a>(html: &'a str, tag: &str) -> &'a str {
+        html.split(&format!("<{tag} "))
+            .nth(1)
+            .and_then(|rest| rest.split('>').next())
+            .unwrap_or("")
+    }
+
     #[test]
     fn a_song_gets_art_title_audio_and_every_style() {
         let html = render("Teardrop", Some("/art.jpg"));
         assert!(html.contains("Teardrop"));
         assert!(html.contains(r#"src="/art.jpg""#));
         assert!(
-            html.contains(&format!(r#"<audio id="{VIDEO_ID}""#)),
+            open_tag(&html, "audio").contains(&format!(r#"id="{VIDEO_ID}""#)),
             "{html}"
         );
         for style in Style::ALL {
@@ -1498,7 +1576,7 @@ mod tests {
     fn the_default_style_mounts_a_canvas_behind_the_controls() {
         let html = render("Teardrop", None);
         assert!(
-            html.contains(&format!(r#"<canvas id="{CANVAS_ID}""#)),
+            open_tag(&html, "canvas").contains(&format!(r#"id="{CANVAS_ID}""#)),
             "{html}"
         );
         assert!(html.contains("♪"));

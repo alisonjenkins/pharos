@@ -127,7 +127,7 @@ type CacheKey = (u64, u32);
 /// every cached tile so it regenerates with the current code — the cache is
 /// otherwise keyed only by `(media_id, width)` and never re-derives a tile that
 /// already exists, so a stale tile from an older build would persist forever
-/// (observed: magenta-cast Code Geass sprites from a pre-fix build). Starts at
+/// (observed: magenta-cast Show U sprites from a pre-fix build). Starts at
 /// 1: since existing deployments have no marker, the first startup after this
 /// lands treats them as stale and regenerates once.
 const TRICKPLAY_GEN_VERSION: u32 = 1;
@@ -141,7 +141,7 @@ const GEN_VERSION_MARKER: &str = ".gen_version";
 /// interrupted run (heavy-op timeout on a long movie, worker crash, pod
 /// restart mid-deploy) leaves a partial set that used to pass the tile-0
 /// "generated" probe forever — advertised trickplay, grey previews past the
-/// truncation point (observed live: Avatar, tiles ending at 1h39m58s).
+/// truncation point (observed live: Film BA, tiles ending at 1h39m58s).
 const COMPLETE_MARKER: &str = ".complete";
 
 #[derive(Debug)]
@@ -1087,7 +1087,7 @@ mod tests {
         );
     }
 
-    /// B39 — the Avatar failure: an interrupted generation leaves a TRUNCATED
+    /// B39 — the Film BA failure: an interrupted generation leaves a TRUNCATED
     /// sheet set (no completion marker). It must not count as generated, and
     /// ensure_generated must wipe + re-attempt it rather than no-op.
     #[tokio::test]

@@ -4,11 +4,73 @@
 
 use dioxus::prelude::*;
 
+use super::account_settings::DESCRIPTION_LANGUAGES;
 use super::appearance::Notice;
 use super::playback::{
     parse_crossfade, MseEngine, SubtitleSize, CROSSFADE_CHOICES, MAX_BITRATE_CHOICES,
 };
 use super::settings::Choices;
+use super::turn::EpisodeTurn;
+
+/// The `Prefs` keys the server maps onto the user's Jellyfin
+/// `AudioLanguagePreference`, `SubtitleLanguagePreference` and
+/// `SubtitleMode`; match the server's allow-list.
+pub const AUDIO_LANGUAGE_PREF: &str = "playback.audio_language";
+pub const SUBTITLE_LANGUAGE_PREF: &str = "playback.subtitle_language";
+pub const SUBTITLE_MODE_PREF: &str = "playback.subtitle_mode";
+
+/// The stored value that means "the language this title was made in".
+const ORIGINAL_LANGUAGE: &str = "OriginalLanguage";
+
+/// The languages a track preference offers, as (stored value, label): no
+/// preference first, then English and the languages the description
+/// selector offers. The audio preference alone may also be the title's
+/// original language.
+pub fn track_language_options(with_original: bool, stored: &str) -> Vec<(String, String)> {
+    let mut out = vec![
+        (String::new(), "No preference".to_owned()),
+        ("eng".to_owned(), "English".to_owned()),
+    ];
+    out.extend(
+        DESCRIPTION_LANGUAGES
+            .iter()
+            .filter(|(value, _)| !value.is_empty() && *value != ORIGINAL_LANGUAGE)
+            .map(|(value, label)| ((*value).to_owned(), (*label).to_owned())),
+    );
+    if with_original {
+        out.push((
+            ORIGINAL_LANGUAGE.to_owned(),
+            "The title's original language".to_owned(),
+        ));
+    }
+    // jellyfin-web can store any language: show it so the page does not
+    // look unset while the server applies it.
+    let stored = stored.trim();
+    if !stored.is_empty() && !out.iter().any(|(v, _)| v == stored) {
+        out.push((stored.to_owned(), stored.to_owned()));
+    }
+    out
+}
+
+/// The subtitle modes, as (stored value, label), in the words of what
+/// `stream_select` does for each.
+pub const SUBTITLE_MODES: [(&str, &str); 5] = [
+    ("Default", "Use the file's default"),
+    ("Always", "Always"),
+    ("OnlyForced", "Only forced (signs and foreign parts)"),
+    ("None", "Off"),
+    ("Smart", "When the audio isn't in my language"),
+];
+
+/// The selector value for a stored subtitle mode: unset, or a value that
+/// names no mode, behaves as Default on the server.
+pub fn subtitle_mode_option(stored: &str) -> &'static str {
+    SUBTITLE_MODES
+        .iter()
+        .map(|(value, _)| *value)
+        .find(|value| value.eq_ignore_ascii_case(stored.trim()))
+        .unwrap_or("Default")
+}
 
 #[component]
 pub fn PlaybackView(
@@ -23,7 +85,34 @@ pub fn PlaybackView(
     /// The engine that plays HLS through Media Source Extensions here.
     engine: MseEngine,
     on_engine: EventHandler<MseEngine>,
+    /// Whether opening an episode or moving to the next turns like a cube.
+    #[props(default)]
+    episode_turn: EpisodeTurn,
+    #[props(default)] on_episode_turn: EventHandler<EpisodeTurn>,
+    /// The account's preferred audio language, as stored: empty, a
+    /// three-letter code or `OriginalLanguage`.
+    #[props(default)]
+    audio_language: String,
+    #[props(default)] on_audio_language: EventHandler<String>,
+    /// The account's preferred subtitle language: empty or a code.
+    #[props(default)]
+    subtitle_language: String,
+    #[props(default)] on_subtitle_language: EventHandler<String>,
+    /// The account's subtitle mode, as stored.
+    #[props(default)]
+    subtitle_mode: String,
+    #[props(default)] on_subtitle_mode: EventHandler<String>,
 ) -> Element {
+    let audio_languages = track_language_options(true, &audio_language);
+    let subtitle_languages = track_language_options(false, &subtitle_language);
+    let modes = SUBTITLE_MODES
+        .iter()
+        .map(|(value, label)| ((*value).to_owned(), (*label).to_owned()))
+        .collect::<Vec<_>>();
+    let turns = EpisodeTurn::ALL
+        .iter()
+        .map(|t| (t.as_str().to_owned(), t.label().to_owned()))
+        .collect::<Vec<_>>();
     let engines = MseEngine::ALL
         .iter()
         .map(|e| (e.as_str().to_owned(), e.label().to_owned()))
@@ -81,6 +170,22 @@ pub fn PlaybackView(
                         },
                     }
                 }
+                div { class: "pharos-setting pharos-episode-turn",
+                    div { class: "pharos-setting-text",
+                        p { class: "pharos-setting-name", id: "episode-turn-label", "Episode transitions" }
+                        p { id: "episode-turn-help", class: "pharos-setting-help",
+                            "Opening an episode, or moving to the next, turns like a cube that follows the load, landing as the video starts. Off, or with reduced motion on, the video simply appears. Kept on this device."
+                        }
+                    }
+                    Choices {
+                        id: "episode-turn",
+                        labelled_by: "episode-turn-label",
+                        described_by: "episode-turn-help".to_owned(),
+                        options: turns,
+                        selected: episode_turn.as_str().to_owned(),
+                        on_pick: move |value: String| on_episode_turn.call(EpisodeTurn::parse(&value)),
+                    }
+                }
                 div { class: "pharos-setting pharos-subtitle-size",
                     div { class: "pharos-setting-text",
                         p { class: "pharos-setting-name", id: "subtitle-size-label", "Subtitle size" }
@@ -95,6 +200,56 @@ pub fn PlaybackView(
                         options: sizes,
                         selected: subtitle_size.as_str().to_owned(),
                         on_pick: move |value: String| on_subtitle_size.call(SubtitleSize::parse(&value)),
+                    }
+                }
+            }
+            div { class: "pharos-settings-group", id: "track-settings",
+                div { class: "pharos-setting pharos-audio-language",
+                    div { class: "pharos-setting-text",
+                        p { class: "pharos-setting-name", id: "audio-language-label", "Preferred audio language" }
+                        p { id: "audio-language-help", class: "pharos-setting-help",
+                            "The audio track a title starts on when it has one in this language. Saved to your account, so it applies on every device. A track you pick for a show is still remembered and wins."
+                        }
+                    }
+                    Choices {
+                        id: "audio-language",
+                        labelled_by: "audio-language-label",
+                        described_by: "audio-language-help".to_owned(),
+                        options: audio_languages,
+                        selected: audio_language,
+                        on_pick: move |value: String| on_audio_language.call(value),
+                    }
+                }
+                div { class: "pharos-setting pharos-subtitle-language",
+                    div { class: "pharos-setting-text",
+                        p { class: "pharos-setting-name", id: "subtitle-language-label", "Preferred subtitle language" }
+                        p { id: "subtitle-language-help", class: "pharos-setting-help",
+                            "The language subtitles start in when the mode below turns them on. Saved to your account, so it applies on every device. A track you pick for a show is still remembered and wins."
+                        }
+                    }
+                    Choices {
+                        id: "subtitle-language",
+                        labelled_by: "subtitle-language-label",
+                        described_by: "subtitle-language-help".to_owned(),
+                        options: subtitle_languages,
+                        selected: subtitle_language,
+                        on_pick: move |value: String| on_subtitle_language.call(value),
+                    }
+                }
+                div { class: "pharos-setting pharos-subtitle-mode",
+                    div { class: "pharos-setting-text",
+                        p { class: "pharos-setting-name", id: "subtitle-mode-label", "Subtitle mode" }
+                        p { id: "subtitle-mode-help", class: "pharos-setting-help",
+                            "When subtitles start on. Always picks a track in your subtitle language, else a forced one. Only forced shows just signs and foreign-language parts. When the audio isn't in my language shows subtitles in your language only if the audio is not already in it. Saved to your account, so it applies on every device. A track you pick for a show is still remembered and wins."
+                        }
+                    }
+                    Choices {
+                        id: "subtitle-mode",
+                        labelled_by: "subtitle-mode-label",
+                        described_by: "subtitle-mode-help".to_owned(),
+                        options: modes,
+                        selected: subtitle_mode_option(&subtitle_mode).to_owned(),
+                        on_pick: move |value: String| on_subtitle_mode.call(value),
                     }
                 }
             }
@@ -203,6 +358,115 @@ mod tests {
             .collect()
     }
 
+    fn tracks_page(audio: &str, sub_lang: &str, mode: &str) -> String {
+        let mut dom = VirtualDom::new_with_props(
+            |(audio, sub_lang, mode): (String, String, String)| {
+                rsx! {
+                    PlaybackView {
+                        notice: None,
+                        max_quality: 0,
+                        on_max_quality: |_| {},
+                        subtitle_size: SubtitleSize::default(),
+                        on_subtitle_size: |_| {},
+                        crossfade_s: 0,
+                        on_crossfade: |_| {},
+                        engine: MseEngine::default(),
+                        on_engine: |_| {},
+                        audio_language: audio,
+                        subtitle_language: sub_lang,
+                        subtitle_mode: mode,
+                    }
+                }
+            },
+            (audio.to_owned(), sub_lang.to_owned(), mode.to_owned()),
+        );
+        dom.rebuild_in_place();
+        dioxus_ssr::render(&dom)
+    }
+
+    #[test]
+    fn only_the_audio_language_offers_the_titles_original() {
+        let audio = track_language_options(true, "");
+        let subtitles = track_language_options(false, "");
+        assert_eq!(audio[0], (String::new(), "No preference".to_owned()));
+        assert_eq!(subtitles[0], audio[0]);
+        assert!(audio.iter().any(|(v, _)| v == ORIGINAL_LANGUAGE));
+        assert!(!subtitles.iter().any(|(v, _)| v == ORIGINAL_LANGUAGE));
+        assert!(subtitles.iter().any(|(v, _)| v == "eng"));
+        let values: Vec<_> = audio.iter().map(|(v, _)| v).collect();
+        let mut unique = values.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(values.len(), unique.len(), "values are distinct");
+    }
+
+    #[test]
+    fn a_stored_language_outside_the_list_is_still_offered() {
+        let audio = track_language_options(true, "swe");
+        assert_eq!(audio.last(), Some(&("swe".to_owned(), "swe".to_owned())));
+        let known = track_language_options(false, "eng");
+        assert_eq!(known.len(), track_language_options(false, "").len());
+    }
+
+    #[test]
+    fn subtitle_mode_options_name_the_server_modes() {
+        let values: Vec<_> = SUBTITLE_MODES.iter().map(|(v, _)| *v).collect();
+        assert_eq!(values, ["Default", "Always", "OnlyForced", "None", "Smart"]);
+        assert_eq!(subtitle_mode_option("smart"), "Smart");
+        assert_eq!(subtitle_mode_option(""), "Default");
+        assert_eq!(subtitle_mode_option("nonsense"), "Default");
+    }
+
+    #[test]
+    fn the_track_settings_press_only_the_stored_choices() {
+        let html = tracks_page("OriginalLanguage", "fra", "OnlyForced");
+        for group in ["audio-language", "subtitle-language", "subtitle-mode"] {
+            let own = html
+                .split("<button")
+                .filter_map(|b| b.split('>').next())
+                .filter(|tag| {
+                    tag.contains(&format!("id=\"{group}-")) && tag.contains("aria-pressed=\"true\"")
+                })
+                .count();
+            assert_eq!(own, 1, "{group}: {html}");
+        }
+        assert!(
+            button(&html, "audio-language-OriginalLanguage").contains("aria-pressed=\"true\""),
+            "{html}"
+        );
+        assert!(
+            button(&html, "subtitle-language-fra").contains("aria-pressed=\"true\""),
+            "{html}"
+        );
+        assert!(
+            button(&html, "subtitle-mode-OnlyForced").contains("aria-pressed=\"true\""),
+            "{html}"
+        );
+        assert!(
+            !html.contains("id=\"subtitle-language-OriginalLanguage\""),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn nothing_stored_shows_no_preference_and_the_default_mode() {
+        let html = tracks_page("", "", "");
+        assert!(
+            button(&html, "audio-language-").contains("aria-pressed=\"true\""),
+            "{html}"
+        );
+        assert!(
+            button(&html, "subtitle-language-").contains("aria-pressed=\"true\""),
+            "{html}"
+        );
+        assert!(
+            button(&html, "subtitle-mode-Default").contains("aria-pressed=\"true\""),
+            "{html}"
+        );
+        assert!(html.contains("applies on every device"), "{html}");
+        assert!(html.contains("still remembered and wins"), "{html}");
+    }
+
     #[test]
     fn max_quality_presses_only_the_stored_choice() {
         let html = page(2_000_000, SubtitleSize::default(), 0);
@@ -264,6 +528,18 @@ mod tests {
         );
         assert!(html.contains("id=\"crossfade-12\""), "{html}");
         assert_eq!(pressed(&html, "crossfade").len(), 1, "{html}");
+    }
+
+    #[test]
+    fn episode_turn_is_offered_and_starts_on() {
+        let html = page(0, SubtitleSize::Medium, 0);
+        assert!(html.contains("Episode transitions"), "{html}");
+        assert!(
+            button(&html, "episode-turn-turn").contains("aria-pressed=\"true\""),
+            "{html}"
+        );
+        assert!(html.contains("id=\"episode-turn-off\""), "{html}");
+        assert_eq!(pressed(&html, "episode-turn").len(), 1, "{html}");
     }
 
     #[test]

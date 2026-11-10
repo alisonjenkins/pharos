@@ -14,7 +14,7 @@
 use crate::api::jellyfin::ci_query::CiQuery;
 use crate::{api::jellyfin::auth_extractor::AuthUser, state::AppState};
 use actix_web::{error, web, Responder};
-use pharos_core::{MediaItem, MediaKind, MediaStore};
+use pharos_core::{MediaItem, MediaKind};
 use pharos_jellyfin_api::kinds::ItemType;
 use serde::{Deserialize, Serialize};
 
@@ -115,10 +115,9 @@ async fn search_hints(
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
     let restricted = visible.is_some();
     let all = match visible {
-        Some(items) => items,
+        Some(items) => std::sync::Arc::new(items),
         None => state
-            .stores
-            .list()
+            .list_items_cached()
             .await
             .map_err(|e| error::ErrorInternalServerError(e.to_string()))?,
     };
@@ -192,10 +191,14 @@ async fn search_hints(
     // ParentId={id}. Skipped when IncludeItemTypes explicitly omits
     // all three of MusicArtist / MusicAlbum / Genre.
     if include_aggregates && !needle.is_empty() {
+        // One or two letters match most names, and each keystroke would read
+        // four whole tables for them: the entity tables wait for a name long
+        // enough to narrow, as the native search does.
+        let entities = needle.chars().count() >= crate::services::search::GROUP_MIN_CHARS;
         let mut seen_artist: HashSet<String> = HashSet::new();
         let mut seen_album: HashSet<String> = HashSet::new();
         let mut seen_genre: HashSet<String> = HashSet::new();
-        for i in &all {
+        for i in all.iter() {
             for n in [i.probe.artist.as_deref(), i.probe.album_artist.as_deref()]
                 .into_iter()
                 .flatten()
@@ -250,7 +253,12 @@ async fn search_hints(
         // /Items?ParentId=<person wire id>.
         {
             use pharos_core::PersonStore;
-            if let Ok(people) = state.stores.people_with_counts().await {
+            let rows = if entities {
+                state.stores.people_with_counts().await
+            } else {
+                Ok(Vec::new())
+            };
+            if let Ok(people) = rows {
                 for pc in &people {
                     if pc.person.name.to_lowercase().contains(&needle)
                         && entity_visible(pc.person.wire_id.clone()).await
@@ -275,7 +283,12 @@ async fn search_hints(
         // /Items?ParentId=<studio wire id>.
         {
             use pharos_core::StudioStore;
-            if let Ok(studios) = state.stores.studios_with_counts().await {
+            let rows = if entities {
+                state.stores.studios_with_counts().await
+            } else {
+                Ok(Vec::new())
+            };
+            if let Ok(studios) = rows {
                 for sc in &studios {
                     if sc.studio.name.to_lowercase().contains(&needle)
                         && entity_visible(sc.studio.wire_id.clone()).await
@@ -300,7 +313,12 @@ async fn search_hints(
         // /Items?ParentId=<collection wire id> (the box set's members).
         {
             use pharos_core::CollectionStore;
-            if let Ok(collections) = state.stores.collections_with_counts().await {
+            let rows = if entities {
+                state.stores.collections_with_counts().await
+            } else {
+                Ok(Vec::new())
+            };
+            if let Ok(collections) = rows {
                 for cc in &collections {
                     if cc.collection.name.to_lowercase().contains(&needle)
                         && entity_visible(cc.collection.wire_id.clone()).await
@@ -324,7 +342,12 @@ async fn search_hints(
         // /Items?ParentId=<tag wire id> (the tag's tagged items).
         {
             use pharos_core::TagStore;
-            if let Ok(tags) = state.stores.tags_with_counts().await {
+            let rows = if entities {
+                state.stores.tags_with_counts().await
+            } else {
+                Ok(Vec::new())
+            };
+            if let Ok(tags) = rows {
                 for tc in &tags {
                     if tc.tag.name.to_lowercase().contains(&needle)
                         && entity_visible(tc.tag.wire_id.clone()).await
@@ -395,10 +418,9 @@ async fn build_suggestions(
     limit: usize,
 ) -> Result<serde_json::Value, actix_web::Error> {
     use crate::api::jellyfin::dto::BaseItemDto;
-    use pharos_core::{MediaStore, UserDataStore};
+    use pharos_core::UserDataStore;
     let all = state
-        .stores
-        .list()
+        .list_items_cached()
         .await
         .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
     let ids: Vec<u64> = all.iter().map(|i| i.id).collect();

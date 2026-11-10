@@ -174,7 +174,7 @@ impl OpenSubtitlesClient {
         gate: Arc<QuotaGate>,
     ) -> Result<Self, reqwest::Error> {
         let user_agent = format!("Pharos v{}", env!("CARGO_PKG_VERSION"));
-        let http = reqwest::Client::builder()
+        let http = crate::http_client::builder()
             .user_agent(user_agent.clone())
             .timeout(REQUEST_TIMEOUT)
             .build()?;

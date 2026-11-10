@@ -50,6 +50,40 @@ use quick_xml::Reader;
 
 pub(crate) mod identity;
 
+/// Spec 033 (V890) — what a show folder's `tvshow.nfo` says the show is.
+/// Evidence for the show matcher, never its identity: the NFOs in the
+/// deployed library are wrong as often as the search.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ShowNfoEvidence {
+    pub tvdb: Option<String>,
+    pub tmdb: Option<String>,
+    pub year: Option<u32>,
+}
+
+/// Read `series_folder/tvshow.nfo` as [`ShowNfoEvidence`]. `None` when it is
+/// absent, unreadable, names no id or year, or names another show than
+/// `series_name` (B558: then it is no evidence for this show at all).
+pub fn show_nfo_evidence(
+    series_folder: &Path,
+    series_name: &str,
+    series_year: Option<u32>,
+) -> Option<ShowNfoEvidence> {
+    let path = series_folder.join("tvshow.nfo");
+    let bytes = std::fs::read(&path).ok()?;
+    let names = identity::parse_names(&bytes)?;
+    let titles = [&names.title, &names.original_title];
+    if identity::names_another_show(series_name, series_year, titles.into_iter().flatten()) {
+        return None;
+    }
+    let parsed = parse_nfo(&bytes, &path).ok()?;
+    let out = ShowNfoEvidence {
+        tvdb: parsed.provider_ids.tvdb,
+        tmdb: parsed.provider_ids.tmdb,
+        year: parsed.production_year,
+    };
+    (out != ShowNfoEvidence::default()).then_some(out)
+}
+
 /// Merge priority for the NFO source — the highest local source. A
 /// user-authored `<title>`/`<plot>`/`<rating>` beats the filename provider
 /// (priority 10) and any future online provider, so local curation wins.
@@ -102,6 +136,11 @@ impl MetadataProvider for NfoProvider {
             match std::fs::read(&candidate) {
                 Ok(bytes) => {
                     let mut parsed = parse_nfo(&bytes, &candidate)?;
+                    if req.kind == MediaKind::Movie
+                        && identity::names_another_year(req.path, &candidate, &parsed)
+                    {
+                        continue;
+                    }
                     locate_local_art(&mut parsed, &candidate);
                     if show_nfo {
                         drop_episode_fields(&mut parsed);
@@ -200,12 +239,18 @@ fn is_show_nfo(req: &MetadataRequest<'_>, candidate: &Path) -> bool {
 
 /// A `tvshow.nfo` describes the show, so its title, plot, tagline and
 /// premiere are not the episode's: an episode without its own NFO would
-/// otherwise be titled with the show's name.
+/// otherwise be titled with the show's name. Its ids are the show's too (the
+/// series reads them through [`show_nfo_evidence`]); an episode that carried
+/// them would look matched at whichever provider the show once was.
 fn drop_episode_fields(show: &mut MetadataResult) {
     show.title = None;
     show.overview = None;
     show.tagline = None;
     show.premiere_date = None;
+    if show.provider_ids != ProviderIds::default() {
+        tracing::debug!("tvshow.nfo ids are the show's, not folded onto its episodes");
+    }
+    show.provider_ids = ProviderIds::default();
 }
 
 /// Fold `under` beneath `acc`: `acc` (more-specific source) keeps its set
@@ -703,6 +748,9 @@ fn parse_year(text: &str) -> Option<u32> {
 
 /// `YYYY` from a `YYYY-MM-DD` (or `YYYY/MM/DD`) date string.
 fn year_from_date(text: &str) -> Option<u32> {
+    if is_epoch_placeholder(text) {
+        return None;
+    }
     let y: u32 = text.get(..4)?.parse().ok()?;
     (1800..3000).contains(&y).then_some(y)
 }
@@ -736,9 +784,12 @@ fn normalise_certification(text: &str) -> String {
 /// Parse a Kodi date (`YYYY-MM-DD`, optionally with a time) into
 /// unix-seconds (UTC midnight of that date). Pure integer arithmetic — no
 /// chrono dependency. Returns `None` on an unparseable / out-of-range date.
-/// `pub(crate)` so the `embedded` provider reuses it for a container's raw
-/// `release_date` tag (B90).
-pub(crate) fn parse_date_unix(text: &str) -> Option<i64> {
+/// Public so the admin metadata editor and the `embedded` provider (a container's raw
+/// `release_date` tag, B90) read dates the same way.
+pub fn parse_date_unix(text: &str) -> Option<i64> {
+    if is_epoch_placeholder(text) {
+        return None;
+    }
     // Take the date portion before any whitespace/`T`.
     let date = text.split(|c: char| c == 'T' || c.is_whitespace()).next()?;
     let mut parts = date.split(['-', '/', '.']);
@@ -749,6 +800,15 @@ pub(crate) fn parse_date_unix(text: &str) -> Option<i64> {
         return None;
     }
     Some(days_from_civil(y, m, d) * 86_400)
+}
+
+/// B984 — `1970-01-01` is what a writer puts for an unknown air date (an
+/// unaired anime episode's NFO carries it with `<year>1970</year>`); read as a
+/// date it is unix second 0 and lands decades outside the show's run.
+fn is_epoch_placeholder(text: &str) -> bool {
+    text.split(|c: char| c == 'T' || c.is_whitespace())
+        .next()
+        .is_some_and(|d| matches!(d.trim(), "1970-01-01" | "1970/01/01" | "1970.01.01"))
 }
 
 /// Days since the unix epoch (1970-01-01) for a proleptic-Gregorian date,

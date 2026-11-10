@@ -5,11 +5,14 @@
 
 pub mod catalogue;
 pub mod resolution;
+pub mod stereo_quad;
 pub mod subtitles;
 #[cfg(all(feature = "web", target_arch = "wasm32"))]
 mod webgl;
 #[cfg(all(feature = "web", target_arch = "wasm32"))]
 mod webgl_subs;
+#[cfg(all(feature = "web", target_arch = "wasm32"))]
+pub mod webgl_xr;
 
 pub use catalogue::Program;
 

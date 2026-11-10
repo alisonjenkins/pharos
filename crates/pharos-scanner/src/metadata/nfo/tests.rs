@@ -8,11 +8,11 @@ use tempfile::tempdir;
 /// A trimmed but realistic Kodi `movie.nfo`.
 const MOVIE_NFO: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <movie>
-  <title>The Matrix</title>
-  <originaltitle>The Matrix</originaltitle>
+  <title>The Glass Lattice</title>
+  <originaltitle>The Glass Lattice</originaltitle>
   <tagline>Free your mind.</tagline>
   <plot>A computer hacker learns the true nature of his reality.</plot>
-  <outline>Neo discovers the Matrix.</outline>
+  <outline>Hero A discovers the Glass Lattice.</outline>
   <year>1999</year>
   <premiered>1999-03-31</premiered>
   <rating>8.7</rating>
@@ -24,20 +24,20 @@ const MOVIE_NFO: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"
   <tag>cyberpunk</tag>
   <country>USA</country>
   <country>Australia</country>
-  <trailer>plugin://plugin.video.youtube/?action=play_video&amp;videoid=m8e-FF8MsqU</trailer>
-  <set>The Matrix Collection</set>
-  <uniqueid type="tmdb">603</uniqueid>
-  <uniqueid type="imdb">tt0133093</uniqueid>
+  <trailer>plugin://plugin.video.youtube/?action=play_video&amp;videoid=abcDEF12345</trailer>
+  <set>The Glass Lattice Collection</set>
+  <uniqueid type="tmdb">930603</uniqueid>
+  <uniqueid type="imdb">tt9300001</uniqueid>
   <thumb aspect="poster">https://example.test/poster.jpg</thumb>
   <fanart>https://example.test/fanart.jpg</fanart>
-  <director>Lana Wachowski</director>
-  <director>Lilly Wachowski</director>
-  <credits>The Wachowskis</credits>
+  <director>Director Q</director>
+  <director>Director R</director>
+  <credits>The Directors Q</credits>
   <actor>
-    <name>Keanu Reeves</name>
-    <role>Neo</role>
+    <name>Actor Q</name>
+    <role>Hero A</role>
     <order>0</order>
-    <thumb>http://img/keanu.jpg</thumb>
+    <thumb>http://img/actor.jpg</thumb>
   </actor>
   <actor>
     <name>Laurence Fishburne</name>
@@ -50,7 +50,7 @@ const MOVIE_NFO: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"
 /// A `tvshow.nfo` with the structured `<ratings>` form and a country mpaa.
 const TVSHOW_NFO: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <tvshow>
-  <title>Breaking Bad</title>
+  <title>Show X</title>
   <plot>A chemistry teacher turns to crime.</plot>
   <premiered>2008-01-20</premiered>
   <mpaa>US:TV-MA</mpaa>
@@ -84,8 +84,8 @@ fn probe() -> MediaProbe {
 #[tokio::test]
 async fn movie_nfo_maps_all_common_fields() {
     let dir = tempdir().unwrap();
-    let media = dir.path().join("The Matrix (1999).mkv");
-    std::fs::write(dir.path().join("The Matrix (1999).nfo"), MOVIE_NFO).unwrap();
+    let media = dir.path().join("The Glass Lattice (1999).mkv");
+    std::fs::write(dir.path().join("The Glass Lattice (1999).nfo"), MOVIE_NFO).unwrap();
 
     let p = probe();
     let req = MetadataRequest {
@@ -96,7 +96,7 @@ async fn movie_nfo_maps_all_common_fields() {
     };
     let r = NfoProvider::new().fetch(&req).await.unwrap();
 
-    assert_eq!(r.title.as_deref(), Some("The Matrix"));
+    assert_eq!(r.title.as_deref(), Some("The Glass Lattice"));
     assert_eq!(r.tagline.as_deref(), Some("Free your mind."));
     assert_eq!(
         r.overview.as_deref(),
@@ -112,15 +112,15 @@ async fn movie_nfo_maps_all_common_fields() {
     assert_eq!(r.genres, vec!["Action", "Sci-Fi"]);
     assert_eq!(r.studios, vec!["Warner Bros."]);
     assert_eq!(r.tags, vec!["cyberpunk"]);
-    assert_eq!(r.collections, vec!["The Matrix Collection"]);
+    assert_eq!(r.collections, vec!["The Glass Lattice Collection"]);
     // T67 — repeated <country> → production_locations; <trailer> → trailers.
     assert_eq!(r.production_locations, vec!["USA", "Australia"]);
     assert_eq!(
         r.trailers,
-        vec!["plugin://plugin.video.youtube/?action=play_video&videoid=m8e-FF8MsqU"]
+        vec!["plugin://plugin.video.youtube/?action=play_video&videoid=abcDEF12345"]
     );
-    assert_eq!(r.provider_ids.tmdb.as_deref(), Some("603"));
-    assert_eq!(r.provider_ids.imdb.as_deref(), Some("tt0133093"));
+    assert_eq!(r.provider_ids.tmdb.as_deref(), Some("930603"));
+    assert_eq!(r.provider_ids.imdb.as_deref(), Some("tt9300001"));
 
     // Artwork: poster (Primary) + fanart (Backdrop) as URLs.
     assert!(r.artwork.iter().any(|a| a.role == ArtworkRole::Primary
@@ -132,20 +132,20 @@ async fn movie_nfo_maps_all_common_fields() {
     assert!(r
         .people
         .iter()
-        .any(|p| p.name == "Lana Wachowski" && p.kind == PersonKind::Director));
+        .any(|p| p.name == "Director Q" && p.kind == PersonKind::Director));
     assert!(r
         .people
         .iter()
-        .any(|p| p.name == "The Wachowskis" && p.kind == PersonKind::Writer));
+        .any(|p| p.name == "The Directors Q" && p.kind == PersonKind::Writer));
     let neo = r
         .people
         .iter()
-        .find(|p| p.name == "Keanu Reeves")
-        .expect("Keanu present");
+        .find(|p| p.name == "Actor Q")
+        .expect("Actor Q present");
     assert_eq!(neo.kind, PersonKind::Actor);
-    assert_eq!(neo.character.as_deref(), Some("Neo"));
+    assert_eq!(neo.character.as_deref(), Some("Hero A"));
     // LIB-C2 — the actor's <thumb> headshot URL is captured.
-    assert_eq!(neo.thumb.as_deref(), Some("http://img/keanu.jpg"));
+    assert_eq!(neo.thumb.as_deref(), Some("http://img/actor.jpg"));
     assert_eq!(neo.sort_order, Some(0));
 }
 
@@ -223,7 +223,7 @@ async fn movie_falls_back_to_movie_nfo_in_dir() {
         series: None,
     };
     let r = NfoProvider::new().fetch(&req).await.unwrap();
-    assert_eq!(r.title.as_deref(), Some("The Matrix"));
+    assert_eq!(r.title.as_deref(), Some("The Glass Lattice"));
 }
 
 #[tokio::test]
@@ -233,7 +233,7 @@ async fn tvshow_structured_ratings_and_country_mpaa() {
     // A request keyed by the series folder, no episode sibling.
     let media = dir.path().join("Episode.mkv");
     let series = SeriesInfo {
-        series_name: "Breaking Bad".into(),
+        series_name: "Show X".into(),
         series_folder: Some(dir.path().to_string_lossy().into_owned()),
         ..SeriesInfo::default()
     };
@@ -250,7 +250,6 @@ async fn tvshow_structured_ratings_and_country_mpaa() {
     assert_eq!(r.community_rating, Some(9.4));
     // US:TV-MA -> TV-MA.
     assert_eq!(r.official_rating.as_deref(), Some("TV-MA"));
-    assert_eq!(r.provider_ids.tvdb.as_deref(), Some("81189"));
     assert!(r.genres.contains(&"Crime".to_string()));
 }
 
@@ -258,12 +257,12 @@ async fn tvshow_structured_ratings_and_country_mpaa() {
 async fn episode_merges_show_nfo_underneath() {
     let dir = tempdir().unwrap();
     // Episode sibling NFO + show-level tvshow.nfo.
-    let media = dir.path().join("Breaking Bad S01E01.mkv");
-    std::fs::write(dir.path().join("Breaking Bad S01E01.nfo"), EPISODE_NFO).unwrap();
+    let media = dir.path().join("Show X S01E01.mkv");
+    std::fs::write(dir.path().join("Show X S01E01.nfo"), EPISODE_NFO).unwrap();
     std::fs::write(dir.path().join("tvshow.nfo"), TVSHOW_NFO).unwrap();
 
     let series = SeriesInfo {
-        series_name: "Breaking Bad".into(),
+        series_name: "Show X".into(),
         series_folder: Some(dir.path().to_string_lossy().into_owned()),
         ..SeriesInfo::default()
     };
@@ -279,10 +278,10 @@ async fn episode_merges_show_nfo_underneath() {
     // Episode-level title/plot win.
     assert_eq!(r.title.as_deref(), Some("Pilot"));
     assert_eq!(r.overview.as_deref(), Some("Walter White starts cooking."));
-    // Show-level fields backfill: studio + rating + tvdb id from tvshow.nfo.
+    // Show-level fields backfill: studio + rating from tvshow.nfo (not its ids).
     assert_eq!(r.studios, vec!["AMC"]);
     assert_eq!(r.community_rating, Some(9.4));
-    assert_eq!(r.provider_ids.tvdb.as_deref(), Some("81189"));
+    assert_eq!(r.provider_ids.tvdb, None);
     // Genres union: episode "Drama" + show "Drama","Crime" (deduped).
     assert!(r.genres.contains(&"Drama".to_string()));
     assert!(r.genres.contains(&"Crime".to_string()));
@@ -292,13 +291,11 @@ async fn episode_merges_show_nfo_underneath() {
 #[tokio::test]
 async fn an_episode_without_its_own_nfo_is_not_titled_with_the_show() {
     let dir = tempdir().unwrap();
-    let media = dir
-        .path()
-        .join("Breaking Bad - S01E02 - Cat's in the Bag.mkv");
+    let media = dir.path().join("Show X - S01E02 - The Copper Key.mkv");
     std::fs::write(dir.path().join("tvshow.nfo"), TVSHOW_NFO).unwrap();
 
     let series = SeriesInfo {
-        series_name: "Breaking Bad".into(),
+        series_name: "Show X".into(),
         series_folder: Some(dir.path().to_string_lossy().into_owned()),
         ..SeriesInfo::default()
     };
@@ -316,7 +313,6 @@ async fn an_episode_without_its_own_nfo_is_not_titled_with_the_show() {
     assert_eq!(r.premiere_date, None);
     // Show-wide fields still apply to the episode.
     assert_eq!(r.studios, vec!["AMC"]);
-    assert_eq!(r.provider_ids.tvdb.as_deref(), Some("81189"));
 }
 
 #[tokio::test]
@@ -384,7 +380,7 @@ async fn unknown_and_extra_elements_are_ignored() {
 /// Directly exercise the date helper for a couple of known epochs.
 #[test]
 fn date_parsing_known_values() {
-    assert_eq!(parse_date_unix("1970-01-01"), Some(0));
+    assert_eq!(parse_date_unix("1970-01-02"), Some(86_400));
     assert_eq!(parse_date_unix("2000-01-01"), Some(946_684_800));
     assert_eq!(parse_date_unix("1999-03-31"), Some(922_838_400));
     // With a time component and `T` separator.
@@ -392,6 +388,34 @@ fn date_parsing_known_values() {
     // Garbage -> None, never panics.
     assert_eq!(parse_date_unix("not-a-date"), None);
     assert_eq!(parse_date_unix(""), None);
+}
+
+/// B984 — an episode NFO's `1970-01-01` placeholder is no date, and gives
+/// no year either.
+#[tokio::test]
+async fn an_epoch_placeholder_air_date_is_no_date() {
+    let dir = tempdir().unwrap();
+    let season = dir.path().join("Show E/Season 10");
+    std::fs::create_dir_all(&season).unwrap();
+    let media = season.join("Show E - S10E01 - 196 - The Old Second.mkv");
+    std::fs::write(
+        season.join("Show E - S10E01 - 196 - The Old Second.nfo"),
+        "<episodedetails><title>The Old Second</title>\
+         <aired>1970-01-01</aired></episodedetails>",
+    )
+    .unwrap();
+    let p = probe();
+    let req = MetadataRequest {
+        path: &media,
+        kind: MediaKind::Episode,
+        probe: &p,
+        series: None,
+    };
+    let r = NfoProvider::new().fetch(&req).await.unwrap();
+    assert_eq!(r.title.as_deref(), Some("The Old Second"));
+    assert_eq!(r.premiere_date, None);
+    assert_eq!(r.production_year, None);
+    assert_eq!(parse_date_unix("1970-01-01T00:00:00"), None);
 }
 
 /// A `<uniqueid>` with no type but a `tt…` value is recognised as IMDb;
@@ -435,13 +459,13 @@ async fn nested_set_name_form_parses_into_collections() {
 <movie>
   <title>Movie</title>
   <set>
-    <name>The Matrix Collection</name>
+    <name>The Glass Lattice Collection</name>
     <overview>ignored</overview>
   </set>
-  <collection>Wachowski Films</collection>
+  <collection>Zed Films</collection>
   <actor>
-    <name>Keanu Reeves</name>
-    <role>Neo</role>
+    <name>Actor Q</name>
+    <role>Hero A</role>
   </actor>
 </movie>"#,
     )
@@ -456,42 +480,42 @@ async fn nested_set_name_form_parses_into_collections() {
     let r = NfoProvider::new().fetch(&req).await.unwrap();
     assert_eq!(
         r.collections,
-        vec!["The Matrix Collection", "Wachowski Films"],
+        vec!["The Glass Lattice Collection", "Zed Films"],
         "nested <set><name> + flat <collection>"
     );
     // The actor's nested <name> stays a person, not a collection.
-    assert!(r.people.iter().any(|pe| pe.name == "Keanu Reeves"));
-    assert!(!r.collections.iter().any(|c| c == "Keanu Reeves"));
+    assert!(r.people.iter().any(|pe| pe.name == "Actor Q"));
+    assert!(!r.collections.iter().any(|c| c == "Actor Q"));
 }
 
-/// B558 — trimmed from the deployed library: Jellyfin identified the
-/// `TV/Dragon Ball` folder as Super Dragon Ball Heroes and wrote that show's
+/// B558 — trimmed from a deployed library: a scraper identified the
+/// `TV/Show K` folder as Super Show K Legion and wrote that show's
 /// NFOs and stills into it.
 const FOREIGN_TVSHOW_NFO: &str = r#"<?xml version="1.0" encoding="utf-8" standalone="yes"?>
 <tvshow>
-  <plot>Trunks returns from the future to train with Goku and Vegeta.</plot>
-  <title>Super Dragon Ball Heroes</title>
-  <originaltitle>スーパードラゴンボールヒーローズ</originaltitle>
-  <tmdbid>80020</tmdbid>
-  <tvdbid>347734</tvdbid>
+  <plot>A hero returns from the future to train with two rivals.</plot>
+  <title>Super Show K Legion</title>
+  <originaltitle>スーパーショーKレギオン</originaltitle>
+  <tmdbid>910011</tmdbid>
+  <tvdbid>910012</tvdbid>
   <art>
-    <poster>/media/TV/Dragon Ball/folder.jpg</poster>
-    <fanart>/media/TV/Dragon Ball/fanart.jpg</fanart>
+    <poster>/media/TV/Show K/folder.jpg</poster>
+    <fanart>/media/TV/Show K/fanart.jpg</fanart>
   </art>
-  <id>347734</id>
+  <id>910012</id>
 </tvshow>
 "#;
 
 const FOREIGN_EPISODE_NFO: &str = r#"<?xml version="1.0" encoding="utf-8" standalone="yes"?>
 <episodedetails>
-  <plot>Goku and Vegeta's training with Whis and Beerus is interrupted.</plot>
-  <title>Goku vs. Goku! A Super Battle Begins on Prison Planet!</title>
-  <imdbid>tt8594374</imdbid>
-  <tvdbid>6692765</tvdbid>
+  <plot>Two rivals' training with their mentors is interrupted.</plot>
+  <title>Rival Legion! A Great Battle Begins on the Prison Moon!</title>
+  <imdbid>tt9100001</imdbid>
+  <tvdbid>910013</tvdbid>
   <art>
-    <poster>/media/TV/Dragon Ball/Season 01/Dragon Ball - S01E01 - Secret of the Dragon Balls-thumb.jpg</poster>
+    <poster>/media/TV/Show K/Season 01/Show K - S01E01 - Secret of the Moon Base-thumb.jpg</poster>
   </art>
-  <showtitle>Super Dragon Ball Heroes</showtitle>
+  <showtitle>Super Show K Legion</showtitle>
   <episode>1</episode>
   <season>1</season>
 </episodedetails>
@@ -499,13 +523,13 @@ const FOREIGN_EPISODE_NFO: &str = r#"<?xml version="1.0" encoding="utf-8" standa
 
 /// A show folder holding `tvshow.nfo` and a `Season 01` with one episode, its
 /// NFO and its `-thumb.jpg`. Returns (tempdir, episode path, series info).
-fn dragon_ball(show_nfo: &str, episode_nfo: &str) -> (tempfile::TempDir, PathBuf, SeriesInfo) {
-    dragon_ball_in(show_nfo, episode_nfo, Some("Season 01"))
+fn show_k(show_nfo: &str, episode_nfo: &str) -> (tempfile::TempDir, PathBuf, SeriesInfo) {
+    show_k_in(show_nfo, episode_nfo, Some("Season 01"))
 }
 
-/// [`dragon_ball`] with the episode in `season` under the show folder, or
+/// [`show_k`] with the episode in `season` under the show folder, or
 /// in the show folder itself for `None`.
-fn dragon_ball_in(
+fn show_k_in(
     show_nfo: &str,
     episode_nfo: &str,
     season: Option<&str>,
@@ -519,7 +543,7 @@ fn dragon_ball_in(
         }
         None => dir.path().to_path_buf(),
     };
-    let stem = "Dragon Ball - S01E01 - Secret of the Dragon Balls";
+    let stem = "Show K - S01E01 - Secret of the Moon Base";
     let media = season.join(format!("{stem}.mkv"));
     std::fs::write(&media, b"").unwrap();
     std::fs::write(season.join(format!("{stem}.nfo")), episode_nfo).unwrap();
@@ -528,7 +552,7 @@ fn dragon_ball_in(
     std::fs::write(dir.path().join("folder.jpg"), b"jpg").unwrap();
     std::fs::write(dir.path().join("logo.png"), b"png").unwrap();
     let series = SeriesInfo {
-        series_name: "Dragon Ball".into(),
+        series_name: "Show K".into(),
         season_number: Some(1),
         episode_number: Some(1),
         series_folder: Some(dir.path().to_string_lossy().into_owned()),
@@ -539,7 +563,7 @@ fn dragon_ball_in(
 
 #[tokio::test]
 async fn nfos_naming_another_show_are_ignored_with_their_art() {
-    let (_dir, media, series) = dragon_ball(FOREIGN_TVSHOW_NFO, FOREIGN_EPISODE_NFO);
+    let (_dir, media, series) = show_k(FOREIGN_TVSHOW_NFO, FOREIGN_EPISODE_NFO);
     let p = probe();
     let req = MetadataRequest {
         path: &media,
@@ -562,10 +586,10 @@ async fn nfos_naming_another_show_are_ignored_with_their_art() {
 #[tokio::test]
 async fn nfos_naming_the_show_are_kept_with_their_art() {
     let show = FOREIGN_TVSHOW_NFO
-        .replace("Super Dragon Ball Heroes", "Dragon Ball")
-        .replace("スーパードラゴンボールヒーローズ", "ドラゴンボール");
-    let episode = FOREIGN_EPISODE_NFO.replace("Super Dragon Ball Heroes", "Dragon Ball");
-    let (_dir, media, series) = dragon_ball(&show, &episode);
+        .replace("Super Show K Legion", "Show K")
+        .replace("スーパーショーKレギオン", "ドラゴンボール");
+    let episode = FOREIGN_EPISODE_NFO.replace("Super Show K Legion", "Show K");
+    let (_dir, media, series) = show_k(&show, &episode);
     let p = probe();
     let req = MetadataRequest {
         path: &media,
@@ -575,7 +599,7 @@ async fn nfos_naming_the_show_are_kept_with_their_art() {
     };
 
     let r = NfoProvider::new().fetch(&req).await.unwrap();
-    assert_eq!(r.provider_ids.tvdb.as_deref(), Some("6692765"));
+    assert_eq!(r.provider_ids.tvdb.as_deref(), Some("910013"));
     assert_eq!(
         identity::foreign_nfos(&req),
         identity::ForeignNfos::default()
@@ -622,7 +646,7 @@ fn an_episode_nfo_without_a_show_title_shares_the_show_nfos_verdict() {
         .filter(|l| !l.contains("<showtitle>"))
         .map(|l| format!("{l}\n"))
         .collect();
-    let (_dir, media, series) = dragon_ball(FOREIGN_TVSHOW_NFO, &episode);
+    let (_dir, media, series) = show_k(FOREIGN_TVSHOW_NFO, &episode);
     let p = probe();
     let foreign = identity::foreign_nfos(&request(&media, &p, &series));
     assert!(foreign.show);
@@ -633,8 +657,8 @@ fn an_episode_nfo_without_a_show_title_shares_the_show_nfos_verdict() {
 /// own thumb, and the show folder's art is dropped.
 #[test]
 fn a_trusted_episode_keeps_its_thumb_under_a_foreign_show_nfo() {
-    let episode = FOREIGN_EPISODE_NFO.replace("Super Dragon Ball Heroes", "Dragon Ball");
-    let (_dir, media, series) = dragon_ball(FOREIGN_TVSHOW_NFO, &episode);
+    let episode = FOREIGN_EPISODE_NFO.replace("Super Show K Legion", "Show K");
+    let (_dir, media, series) = show_k(FOREIGN_TVSHOW_NFO, &episode);
     let p = probe();
     let req = request(&media, &p, &series);
     let foreign = identity::foreign_nfos(&req);
@@ -653,8 +677,8 @@ fn a_trusted_episode_keeps_its_thumb_under_a_foreign_show_nfo() {
 /// `detect_in_dir` again picks up folder.jpg; skipping it loses the thumb.
 #[test]
 fn an_episode_in_a_foreign_show_folder_keeps_only_its_own_art() {
-    let episode = FOREIGN_EPISODE_NFO.replace("Super Dragon Ball Heroes", "Dragon Ball");
-    let (_dir, media, series) = dragon_ball_in(FOREIGN_TVSHOW_NFO, &episode, None);
+    let episode = FOREIGN_EPISODE_NFO.replace("Super Show K Legion", "Show K");
+    let (_dir, media, series) = show_k_in(FOREIGN_TVSHOW_NFO, &episode, None);
     let p = probe();
     let req = request(&media, &p, &series);
     let art = crate::metadata::sidecar::detect_artwork(&req);
@@ -664,7 +688,7 @@ fn an_episode_in_a_foreign_show_folder_keeps_only_its_own_art() {
     );
     assert!(has_local(&art, "-thumb.jpg"), "{art:?}");
 
-    let (_dir, media, series) = dragon_ball_in(FOREIGN_TVSHOW_NFO, FOREIGN_EPISODE_NFO, None);
+    let (_dir, media, series) = show_k_in(FOREIGN_TVSHOW_NFO, FOREIGN_EPISODE_NFO, None);
     let req = request(&media, &p, &series);
     let art = crate::metadata::sidecar::detect_artwork(&req);
     assert!(art.is_empty(), "{art:?}");
@@ -675,7 +699,7 @@ fn an_episode_in_a_foreign_show_folder_keeps_only_its_own_art() {
 /// Disarm check: trusting an absent episode NFO keeps the thumb.
 #[test]
 fn an_episode_without_its_own_nfo_shares_a_foreign_show_nfos_verdict() {
-    let (_dir, media, series) = dragon_ball(FOREIGN_TVSHOW_NFO, FOREIGN_EPISODE_NFO);
+    let (_dir, media, series) = show_k(FOREIGN_TVSHOW_NFO, FOREIGN_EPISODE_NFO);
     std::fs::remove_file(media.with_extension("nfo")).unwrap();
     let p = probe();
     let req = request(&media, &p, &series);
@@ -691,8 +715,8 @@ fn an_episode_without_its_own_nfo_shares_a_foreign_show_nfos_verdict() {
 /// up its folder.jpg.
 #[test]
 fn a_foreign_shows_season_folder_art_is_dropped() {
-    let episode = FOREIGN_EPISODE_NFO.replace("Super Dragon Ball Heroes", "Dragon Ball");
-    let (_dir, media, series) = dragon_ball(FOREIGN_TVSHOW_NFO, &episode);
+    let episode = FOREIGN_EPISODE_NFO.replace("Super Show K Legion", "Show K");
+    let (_dir, media, series) = show_k(FOREIGN_TVSHOW_NFO, &episode);
     let season = media.parent().unwrap();
     std::fs::write(season.join("folder.jpg"), b"jpg").unwrap();
     std::fs::write(season.join("fanart.jpg"), b"jpg").unwrap();
@@ -706,37 +730,28 @@ fn a_foreign_shows_season_folder_art_is_dropped() {
     assert!(has_local(&art, "-thumb.jpg"), "{art:?}");
 }
 
-/// The show names the deployed library's `tvshow.nfo` files carry for folders
-/// whose name differs from them (2026-11-05). Every one but the last two names
+/// The show names `tvshow.nfo` files carry for folders
+/// whose name differs from them. Every one but the last two names
 /// the folder's show; those two are scraper misidentifications.
 #[test]
 fn the_show_name_check_passes_the_librarys_legitimate_variants() {
     let pairs = [
-        ("Alien - Earth", "Alien: Earth"),
-        ("Cagney & Lacey", "Cagney & Lacey"),
-        ("Code Geass", "Code Geass: Lelouch of the Rebellion"),
-        ("DARK MOON - THE BLOOD ALTAR", "DARK MOON: THE BLOOD ALTAR"),
-        ("Fullmetal Alchemist", "Fullmetal Alchemist: Brotherhood"),
+        ("Show M - Earth", "Show M: Earth"),
+        ("Pair N & Pair O", "Pair N & Pair O"),
+        ("Alpha Beta", "Alpha Beta: Rebellion Arc"),
+        ("NIGHT TIDE - THE IRON GATE", "NIGHT TIDE: THE IRON GATE"),
+        ("Show P Alchemist", "Show P Alchemist: Second Cycle"),
         (
-            "KonoSuba – God’s blessing on this wonderful world!!",
-            "KONOSUBA - God's blessing on this wonderful world!",
+            "Show Q – Fate’s blessing on this odd world!!",
+            "SHOW Q - Fate's blessing on this odd world!",
         ),
-        ("Lie to me", "Lie to Me"),
-        (
-            "Marvel's Agents of S.H.I.E.L.D",
-            "Marvel's Agents of S.H.I.E.L.D.",
-        ),
-        ("Mrs Browns Boys", "Mrs Brown's Boys"),
-        ("One Piece.old", "One Piece old"),
-        ("PLUR1BUS", "Pluribus"),
-        (
-            "Star Trek The Next Generation",
-            "Star Trek: The Next Generation",
-        ),
-        (
-            "Person.of.Interest.S01E03.720p.HDTV.x264-IMMERSE",
-            "Person of Interest",
-        ),
+        ("Tell it to me", "Tell it to Me"),
+        ("Studio's Agents of A.B.C.D", "Studio's Agents of A.B.C.D."),
+        ("Mrs Carters Girls", "Mrs Carter's Girls"),
+        ("Show B.old", "Show B old"),
+        ("PLANT1NG", "Planting"),
+        ("Show T The Next Wave", "Show T: The Next Wave"),
+        ("Man.of.Mystery.S01E03.720p.HDTV.x264-GRP", "Man of Mystery"),
     ];
     for (folder, nfo) in pairs {
         assert!(
@@ -745,8 +760,8 @@ fn the_show_name_check_passes_the_librarys_legitimate_variants() {
         );
     }
     for (folder, nfo) in [
-        ("Dragon Ball", "Super Dragon Ball Heroes"),
-        ("Forever (US)", "Us Forever"),
+        ("Show K", "Super Show K Legion"),
+        ("Show D (US)", "Us Show D"),
     ] {
         assert!(
             identity::names_another_show(folder, None, [&nfo.to_string()]),
@@ -759,20 +774,15 @@ fn the_show_name_check_passes_the_librarys_legitimate_variants() {
 fn the_show_name_check_rejects_a_conflicting_region_or_year() {
     // (series name, series year, NFO show name, names another show)
     let cases = [
-        ("The Office (US)", None, "The Office (UK)", true),
-        ("The Office (US)", None, "The Office (us)", false),
-        ("The Office (US)", None, "The Office", false),
-        ("The Office", None, "The Office (UK)", false),
-        ("Doctor Who", Some(2005), "Doctor Who (1963)", true),
-        ("Doctor Who", Some(2005), "Doctor Who (2005)", false),
-        ("Doctor Who", Some(2005), "Doctor Who", false),
-        ("Doctor Who", None, "Doctor Who (1963)", false),
-        (
-            "Battlestar Galactica",
-            Some(2003),
-            "Battlestar Galactica",
-            false,
-        ),
+        ("Show V (US)", None, "Show V (UK)", true),
+        ("Show V (US)", None, "Show V (us)", false),
+        ("Show V (US)", None, "Show V", false),
+        ("Show V", None, "Show V (UK)", false),
+        ("Show C", Some(2005), "Show C (1963)", true),
+        ("Show C", Some(2005), "Show C (2005)", false),
+        ("Show C", Some(2005), "Show C", false),
+        ("Show C", None, "Show C (1963)", false),
+        ("Show E", Some(2003), "Show E", false),
         (
             "Party Political Broadcast",
             Some(2006),
@@ -791,26 +801,25 @@ fn the_show_name_check_rejects_a_conflicting_region_or_year() {
 
 #[test]
 fn the_show_name_check_reads_an_nfo_with_a_mismatched_end_tag() {
-    let nfo =
-        "<tvshow><plot>Trunks returns.</plott><title>Super Dragon Ball Heroes</title></tvshow>";
+    let nfo = "<tvshow><plot>A hero returns.</plott><title>Super Show K Legion</title></tvshow>";
     let names = identity::parse_names(nfo.as_bytes()).expect("parse_nfo reads this NFO");
-    assert_eq!(names.title.as_deref(), Some("Super Dragon Ball Heroes"));
+    assert_eq!(names.title.as_deref(), Some("Super Show K Legion"));
 }
 
 /// [`FOREIGN_TVSHOW_NFO`] renamed to the folder's own show, so its art is
 /// kept, with `<fanart>` set to `fanart`.
 fn own_show_nfo(fanart: &str) -> String {
     FOREIGN_TVSHOW_NFO
-        .replace("Super Dragon Ball Heroes", "Dragon Ball")
-        .replace("スーパードラゴンボールヒーローズ", "ドラゴンボール")
-        .replace("/media/TV/Dragon Ball/fanart.jpg", fanart)
+        .replace("Super Show K Legion", "Show K")
+        .replace("スーパーショーKレギオン", "ドラゴンボール")
+        .replace("/media/TV/Show K/fanart.jpg", fanart)
 }
 
 /// The episode's Backdrop from its NFOs, with `fanart.jpg` in the show
 /// folder.
 async fn episode_backdrop(fanart: &str) -> (tempfile::TempDir, Option<ArtworkSource>) {
-    let episode = FOREIGN_EPISODE_NFO.replace("Super Dragon Ball Heroes", "Dragon Ball");
-    let (dir, media, series) = dragon_ball(&own_show_nfo(fanart), &episode);
+    let episode = FOREIGN_EPISODE_NFO.replace("Super Show K Legion", "Show K");
+    let (dir, media, series) = show_k(&own_show_nfo(fanart), &episode);
     std::fs::write(dir.path().join("fanart.jpg"), b"jpg").unwrap();
     let p = probe();
     let r = NfoProvider::new()
@@ -828,7 +837,7 @@ async fn episode_backdrop(fanart: &str) -> (tempfile::TempDir, Option<ArtworkSou
 /// B571 — Jellyfin writes art paths as its own container sees them.
 #[tokio::test]
 async fn a_jellyfin_art_path_is_found_beside_its_nfo() {
-    let (dir, backdrop) = episode_backdrop("/media/TV/Dragon Ball/fanart.jpg").await;
+    let (dir, backdrop) = episode_backdrop("/media/TV/Show K/fanart.jpg").await;
     assert_eq!(
         backdrop,
         Some(ArtworkSource::LocalFile(dir.path().join("fanart.jpg")))
@@ -868,12 +877,12 @@ async fn an_art_path_climbing_out_of_its_nfos_folder_is_dropped() {
 
 #[tokio::test]
 async fn two_art_paths_found_as_one_file_are_kept_once() {
-    let show = own_show_nfo("/media/TV/Dragon Ball/fanart.jpg").replace(
+    let show = own_show_nfo("/media/TV/Show K/fanart.jpg").replace(
         "</art>",
         "  <fanart>/config/data/metadata/library/ab/abc/fanart.jpg</fanart>\n  </art>",
     );
-    let episode = FOREIGN_EPISODE_NFO.replace("Super Dragon Ball Heroes", "Dragon Ball");
-    let (dir, media, series) = dragon_ball(&show, &episode);
+    let episode = FOREIGN_EPISODE_NFO.replace("Super Show K Legion", "Show K");
+    let (dir, media, series) = show_k(&show, &episode);
     std::fs::write(dir.path().join("fanart.jpg"), b"jpg").unwrap();
     let p = probe();
     let r = NfoProvider::new()
@@ -893,8 +902,8 @@ async fn two_art_paths_found_as_one_file_are_kept_once() {
 #[tokio::test]
 async fn a_dead_nfo_art_path_gives_way_to_the_show_folders_image() {
     let show = own_show_nfo("/config/data/metadata/library/ab/abc/backdrop.jpg");
-    let episode = FOREIGN_EPISODE_NFO.replace("Super Dragon Ball Heroes", "Dragon Ball");
-    let (dir, media, series) = dragon_ball(&show, &episode);
+    let episode = FOREIGN_EPISODE_NFO.replace("Super Show K Legion", "Show K");
+    let (dir, media, series) = show_k(&show, &episode);
     std::fs::write(dir.path().join("fanart.jpg"), b"jpg").unwrap();
     let p = probe();
     let resolver = crate::metadata::MetadataResolver::new()
@@ -906,4 +915,209 @@ async fn a_dead_nfo_art_path_gives_way_to_the_show_folders_image() {
         backdrop.map(|a| &a.source),
         Some(&ArtworkSource::LocalFile(dir.path().join("fanart.jpg")))
     );
+}
+
+#[test]
+fn show_nfo_evidence_reads_ids_and_year_of_this_show_only() {
+    let dir = tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("tvshow.nfo"),
+        r#"<tvshow><title>Show B</title><year>1996</year>
+           <uniqueid type="tvdb">900001</uniqueid><uniqueid type="tmdb">900002</uniqueid></tvshow>"#,
+    )
+    .unwrap();
+    assert_eq!(
+        show_nfo_evidence(dir.path(), "Show B", None),
+        Some(ShowNfoEvidence {
+            tvdb: Some("900001".into()),
+            tmdb: Some("900002".into()),
+            year: Some(1996),
+        })
+    );
+    // B558 — an NFO naming another show is no evidence for this one.
+    assert_eq!(show_nfo_evidence(dir.path(), "Show CA", None), None);
+    assert_eq!(
+        show_nfo_evidence(&dir.path().join("missing"), "Show B", None),
+        None
+    );
+}
+
+/// B1009 / V968 — a film's NFO whose year is not the year its file names is
+/// another film's: Jellyfin wrote the 1994 *Tall Meadow* into the 2019 one's
+/// folder. A year one off, or no year on the file or folder, keeps the NFO.
+#[tokio::test]
+async fn a_movie_nfo_naming_another_year_is_set_aside() {
+    let recorder = metrics_util::debugging::DebuggingRecorder::new();
+    let snapshotter = pharos_test_metrics::snapshotter(&recorder);
+    let _guard = metrics::set_default_local_recorder(&recorder);
+    let nfo = |year: u32| {
+        format!(
+            "<movie><title>The Tall Meadow</title><year>{year}</year><tmdbid>930587</tmdbid></movie>"
+        )
+    };
+    let fetch = |folder: &'static str, file: &'static str, year: u32| async move {
+        let dir = tempdir().unwrap();
+        let folder = dir.path().join(folder);
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("movie.nfo"), nfo(year)).unwrap();
+        let media = folder.join(file);
+        let p = probe();
+        let req = MetadataRequest {
+            path: &media,
+            kind: MediaKind::Movie,
+            probe: &p,
+            series: None,
+        };
+        NfoProvider::new()
+            .fetch(&req)
+            .await
+            .unwrap()
+            .production_year
+    };
+
+    assert_eq!(
+        fetch(
+            "The Tall Meadow (2019)",
+            "The Tall Meadow (2019) Bluray-1080p.mp4",
+            1994
+        )
+        .await,
+        None
+    );
+    assert_eq!(
+        fetch("The Tall Meadow (2019)", "tall.meadow.mp4", 1994).await,
+        None
+    );
+    assert_eq!(
+        fetch("The Tall Meadow (1994)", "The Tall Meadow (1994).mkv", 1994).await,
+        Some(1994)
+    );
+    assert_eq!(
+        fetch("Film BB (1995)", "Film BB (1995).mkv", 1996).await,
+        Some(1996)
+    );
+    assert_eq!(
+        fetch("Tall Meadow", "tall.meadow.mkv", 1994).await,
+        Some(1994)
+    );
+    // B1026 / V985 — two years off is the first set aside; a year in the
+    // title does not outvote the folder's.
+    assert_eq!(
+        fetch("Film BB (1995)", "Film BB (1995).mkv", 1997).await,
+        None
+    );
+    assert_eq!(
+        fetch("Film AB 2049 (2017)", "Film AB 2049.mkv", 2017).await,
+        Some(2017)
+    );
+
+    let set_aside: u64 = snapshotter
+        .snapshot()
+        .into_vec()
+        .into_iter()
+        .filter_map(|(ck, _, _, v)| match v {
+            metrics_util::debugging::DebugValue::Counter(n)
+                if ck.key().name() == "pharos_nfo_set_aside_total"
+                    && ck
+                        .key()
+                        .labels()
+                        .any(|l| l.key() == "reason" && l.value() == "film_year") =>
+            {
+                Some(n)
+            }
+            _ => None,
+        })
+        .sum();
+    assert_eq!(set_aside, 3, "each set-aside NFO is counted once");
+}
+
+/// B995 — a `tvshow.nfo` naming show-level ids (typed, `<tvdbid>`, and the
+/// bare `<id>` read as tmdb).
+const SHOW_IDS_TVSHOW_NFO: &str = r#"<tvshow>
+  <title>Show X</title>
+  <id>900001</id>
+  <uniqueid type="tvdb">900002</uniqueid>
+  <uniqueid type="imdb">tt900001</uniqueid>
+  <studio>AMC</studio>
+</tvshow>"#;
+
+fn show_x_request<'a>(
+    dir: &tempfile::TempDir,
+    media: &'a std::path::Path,
+    series: &'a SeriesInfo,
+    p: &'a MediaProbe,
+) -> MetadataRequest<'a> {
+    let _ = dir;
+    MetadataRequest {
+        path: media,
+        kind: MediaKind::Episode,
+        probe: p,
+        series: Some(series),
+    }
+}
+
+/// B995 — a show-level id is not an episode id: an episode without ids of
+/// its own gains none from `tvshow.nfo`, though the show's other fields still
+/// reach it.
+#[tokio::test]
+async fn an_episode_gains_no_id_from_the_show_nfo() {
+    let dir = tempdir().unwrap();
+    let media = dir.path().join("Show X - S01E02 - The Copper Key.mkv");
+    std::fs::write(dir.path().join("tvshow.nfo"), SHOW_IDS_TVSHOW_NFO).unwrap();
+    let series = SeriesInfo {
+        series_name: "Show X".into(),
+        series_folder: Some(dir.path().to_string_lossy().into_owned()),
+        ..SeriesInfo::default()
+    };
+    let p = probe();
+    let req = show_x_request(&dir, &media, &series, &p);
+
+    let r = NfoProvider::new().fetch(&req).await.unwrap();
+
+    assert_eq!(r.provider_ids, ProviderIds::default());
+    assert_eq!(r.studios, vec!["AMC"]);
+}
+
+/// B995 — the ids an episode's own NFO gives stay, and the show's do not
+/// fill the slots it leaves empty.
+#[tokio::test]
+async fn an_episodes_own_nfo_ids_stay_and_the_shows_do_not_fill_the_gaps() {
+    let dir = tempdir().unwrap();
+    let media = dir.path().join("Show X - S01E02 - The Copper Key.mkv");
+    std::fs::write(
+        media.with_extension("nfo"),
+        "<episodedetails><title>The Copper Key</title>\
+         <uniqueid type=\"tvdb\">900055</uniqueid></episodedetails>",
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("tvshow.nfo"), SHOW_IDS_TVSHOW_NFO).unwrap();
+    let series = SeriesInfo {
+        series_name: "Show X".into(),
+        series_folder: Some(dir.path().to_string_lossy().into_owned()),
+        ..SeriesInfo::default()
+    };
+    let p = probe();
+    let req = show_x_request(&dir, &media, &series, &p);
+
+    let r = NfoProvider::new().fetch(&req).await.unwrap();
+
+    assert_eq!(
+        r.provider_ids,
+        ProviderIds {
+            tvdb: Some("900055".into()),
+            ..ProviderIds::default()
+        }
+    );
+}
+
+/// B995 — the show's own evidence still carries the ids to the series.
+#[test]
+fn the_show_nfo_evidence_still_names_the_shows_ids() {
+    let dir = tempdir().unwrap();
+    std::fs::write(dir.path().join("tvshow.nfo"), SHOW_IDS_TVSHOW_NFO).unwrap();
+
+    let got = show_nfo_evidence(dir.path(), "Show X", None).unwrap();
+
+    assert_eq!(got.tmdb.as_deref(), Some("900001"));
+    assert_eq!(got.tvdb.as_deref(), Some("900002"));
 }

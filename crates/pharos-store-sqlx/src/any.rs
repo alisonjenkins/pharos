@@ -10,12 +10,14 @@ use pharos_core::{
     AuthResult, AuthToken, Collection, CollectionCount, CollectionStore, DomainResult,
     EntityCounts, Fingerprint, GenreCount, GenreStore, IssuedToken, ItemPerson, Library,
     LibraryKind, LibraryStore, MediaFacets, MediaId, MediaItem, MediaQuery, MediaStore,
-    PersistedSyncGroup, PersistedTranscodeSession, Person, PersonCount, PersonRef, PersonStore,
-    PlaybackProgress, Playlist, PlaylistEntry, PlaylistStore, PreferenceStore, ResolvedToken,
-    ScanState, SearchQuery, SecretString, SeriesMatchCandidate, SeriesMetadata,
-    SeriesMetadataStore, Studio, StudioCount, StudioStore, SyncGroupStore, Tag, TagCount, TagStore,
-    TokenId, TokenRecord, TokenScope, TokenSelector, TokenStore, TranscodeSessionStore,
-    UserDataStore, UserId, UserItemData, UserPolicy, UserRecord, UserStore,
+    PersistedSyncGroup, PersistedTranscodeSession, Person, PersonCount, PersonDetails, PersonRef,
+    PersonStore, PlaybackProgress, Playlist, PlaylistEntry, PlaylistStore, PreferenceStore,
+    ReadPosition, ReadPositionStore, ResolvedToken, ScanState, SearchQuery, SecretString,
+    SeriesEpisodeRow, SeriesIdentityRow, SeriesIdentityStore, SeriesKeyUpdate,
+    SeriesMatchCandidate, SeriesMetadata, SeriesMetadataStore, SeriesOverride, Studio, StudioCount,
+    StudioStore, SyncGroupStore, Tag, TagCount, TagStore, TokenId, TokenRecord, TokenScope,
+    TokenSelector, TokenStore, TranscodeSessionStore, UserDataStore, UserId, UserItemData,
+    UserPolicy, UserRecord, UserStore,
 };
 
 #[derive(Clone)]
@@ -27,10 +29,17 @@ pub enum AnyStore {
 impl AnyStore {
     /// Dispatch by URL scheme: `postgres://` / `postgresql://` -> Postgres, else SQLite.
     pub async fn connect(url: &str) -> Result<Self, StoreError> {
+        Self::connect_with(url, crate::PoolConfig::default()).await
+    }
+
+    /// [`connect`](Self::connect) with a pool of the given size.
+    pub async fn connect_with(url: &str, sizing: crate::PoolConfig) -> Result<Self, StoreError> {
         if url.starts_with("postgres://") || url.starts_with("postgresql://") {
-            Ok(Self::Postgres(PostgresStore::connect(url).await?))
+            Ok(Self::Postgres(
+                PostgresStore::connect_with(url, sizing).await?,
+            ))
         } else {
-            Ok(Self::Sqlite(SqliteStore::connect(url).await?))
+            Ok(Self::Sqlite(SqliteStore::connect_with(url, sizing).await?))
         }
     }
 }
@@ -43,6 +52,13 @@ impl ServerConfigStore for AnyStore {
         match self {
             AnyStore::Sqlite(s) => s.load_or_create_server_id().await,
             AnyStore::Postgres(p) => p.load_or_create_server_id().await,
+        }
+    }
+
+    async fn load_or_create_secret(&self, name: &str, fresh: &[u8]) -> Result<Vec<u8>, StoreError> {
+        match self {
+            AnyStore::Sqlite(s) => s.load_or_create_secret(name, fresh).await,
+            AnyStore::Postgres(p) => p.load_or_create_secret(name, fresh).await,
         }
     }
 
@@ -131,6 +147,16 @@ impl MediaStore for AnyStore {
         .await
     }
 
+    async fn get_many(&self, ids: &[MediaId]) -> DomainResult<Vec<MediaItem>> {
+        timed("get_items_by_ids", async {
+            match self {
+                AnyStore::Sqlite(s) => MediaStore::get_many(s, ids).await,
+                AnyStore::Postgres(p) => MediaStore::get_many(p, ids).await,
+            }
+        })
+        .await
+    }
+
     async fn put(&self, item: MediaItem) -> DomainResult<()> {
         match self {
             AnyStore::Sqlite(s) => s.put(item).await,
@@ -149,10 +175,13 @@ impl MediaStore for AnyStore {
     }
 
     async fn list(&self) -> DomainResult<Vec<MediaItem>> {
-        match self {
-            AnyStore::Sqlite(s) => MediaStore::list(s).await,
-            AnyStore::Postgres(p) => MediaStore::list(p).await,
-        }
+        timed("list", async {
+            match self {
+                AnyStore::Sqlite(s) => MediaStore::list(s).await,
+                AnyStore::Postgres(p) => MediaStore::list(p).await,
+            }
+        })
+        .await
     }
 
     async fn query(&self, q: &MediaQuery) -> DomainResult<(Vec<MediaItem>, u64)> {
@@ -242,6 +271,18 @@ impl MediaStore for AnyStore {
         }
     }
 
+    async fn put_picture_check(
+        &self,
+        id: MediaId,
+        check: pharos_core::PictureCheck,
+        signature: (i64, u64),
+    ) -> DomainResult<()> {
+        match self {
+            AnyStore::Sqlite(s) => s.put_picture_check(id, check, signature).await,
+            AnyStore::Postgres(p) => p.put_picture_check(id, check, signature).await,
+        }
+    }
+
     async fn begin_scan(&self, root: &std::path::Path) -> DomainResult<i64> {
         match self {
             AnyStore::Sqlite(s) => s.begin_scan(root).await,
@@ -316,6 +357,18 @@ impl MediaStore for AnyStore {
         }
     }
 
+    async fn merge_user_data(
+        &self,
+        from: MediaId,
+        into: MediaId,
+        resume: pharos_core::FoldResume,
+    ) -> DomainResult<()> {
+        match self {
+            AnyStore::Sqlite(s) => s.merge_user_data(from, into, resume).await,
+            AnyStore::Postgres(p) => p.merge_user_data(from, into, resume).await,
+        }
+    }
+
     async fn set_artwork(
         &self,
         item_id: MediaId,
@@ -337,10 +390,13 @@ impl MediaStore for AnyStore {
     }
 
     async fn artwork_for(&self, item_id: MediaId) -> DomainResult<Vec<(String, String, String)>> {
-        match self {
-            AnyStore::Sqlite(s) => s.artwork_for(item_id).await,
-            AnyStore::Postgres(p) => p.artwork_for(item_id).await,
-        }
+        timed("artwork_for", async {
+            match self {
+                AnyStore::Sqlite(s) => s.artwork_for(item_id).await,
+                AnyStore::Postgres(p) => p.artwork_for(item_id).await,
+            }
+        })
+        .await
     }
 
     async fn set_item_match(
@@ -393,6 +449,29 @@ impl MediaStore for AnyStore {
         match self {
             AnyStore::Sqlite(s) => s.clear_provider_artwork(provider).await,
             AnyStore::Postgres(p) => p.clear_provider_artwork(provider).await,
+        }
+    }
+
+    async fn servable_artwork_page(
+        &self,
+        after: Option<(MediaId, String)>,
+        limit: i64,
+    ) -> DomainResult<Vec<pharos_core::ArtworkRow>> {
+        match self {
+            AnyStore::Sqlite(s) => s.servable_artwork_page(after, limit).await,
+            AnyStore::Postgres(p) => p.servable_artwork_page(after, limit).await,
+        }
+    }
+
+    async fn remove_dead_artwork(
+        &self,
+        item_id: MediaId,
+        role: &str,
+        readmit: bool,
+    ) -> DomainResult<()> {
+        match self {
+            AnyStore::Sqlite(s) => s.remove_dead_artwork(item_id, role, readmit).await,
+            AnyStore::Postgres(p) => p.remove_dead_artwork(item_id, role, readmit).await,
         }
     }
 
@@ -593,6 +672,39 @@ impl pharos_core::MetadataTranslationStore for AnyStore {
             }
         }
     }
+
+    async fn delete_translations(
+        &self,
+        owner: &pharos_core::TranslationOwner,
+    ) -> DomainResult<u64> {
+        match self {
+            AnyStore::Sqlite(s) => s.delete_translations(owner).await,
+            AnyStore::Postgres(p) => p.delete_translations(owner).await,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
+// MetadataEditStore
+// ---------------------------------------------------------------------
+impl pharos_core::MetadataEditStore for AnyStore {
+    async fn edit_metadata(
+        &self,
+        target: &pharos_core::EditTarget,
+        edit: &pharos_core::MetadataEdit,
+    ) -> DomainResult<pharos_core::LockedFields> {
+        match self {
+            AnyStore::Sqlite(s) => s.edit_metadata(target, edit).await,
+            AnyStore::Postgres(p) => p.edit_metadata(target, edit).await,
+        }
+    }
+
+    async fn stored_sort_name(&self, id: pharos_core::MediaId) -> DomainResult<Option<String>> {
+        match self {
+            AnyStore::Sqlite(s) => s.stored_sort_name(id).await,
+            AnyStore::Postgres(p) => p.stored_sort_name(id).await,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -650,6 +762,23 @@ impl pharos_core::SubtitleStylingStore for AnyStore {
             AnyStore::Postgres(p) => p.subtitle_styling_index().await,
         }
     }
+
+    async fn put_subtitle_signals(&self, row: pharos_core::SubtitleSignalsRow) -> DomainResult<()> {
+        match self {
+            AnyStore::Sqlite(s) => s.put_subtitle_signals(row).await,
+            AnyStore::Postgres(p) => p.put_subtitle_signals(row).await,
+        }
+    }
+
+    async fn subtitle_signals(
+        &self,
+        item: MediaId,
+    ) -> DomainResult<Option<pharos_core::SubtitleSignalsRow>> {
+        match self {
+            AnyStore::Sqlite(s) => s.subtitle_signals(item).await,
+            AnyStore::Postgres(p) => p.subtitle_signals(item).await,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -693,6 +822,153 @@ impl SeriesMetadataStore for AnyStore {
 }
 
 // ---------------------------------------------------------------------
+// SeriesIdentityStore
+// ---------------------------------------------------------------------
+impl SeriesIdentityStore for AnyStore {
+    async fn series_overrides(&self, folders: &[String]) -> DomainResult<Vec<SeriesOverride>> {
+        match self {
+            AnyStore::Sqlite(s) => s.series_overrides(folders).await,
+            AnyStore::Postgres(p) => p.series_overrides(folders).await,
+        }
+    }
+
+    async fn insert_series_override(&self, o: SeriesOverride) -> DomainResult<bool> {
+        match self {
+            AnyStore::Sqlite(s) => s.insert_series_override(o).await,
+            AnyStore::Postgres(p) => p.insert_series_override(o).await,
+        }
+    }
+
+    async fn series_identity_rows(
+        &self,
+        root_prefix: &str,
+    ) -> DomainResult<Vec<SeriesIdentityRow>> {
+        match self {
+            AnyStore::Sqlite(s) => s.series_identity_rows(root_prefix).await,
+            AnyStore::Postgres(p) => p.series_identity_rows(root_prefix).await,
+        }
+    }
+
+    async fn set_series_keys(&self, updates: &[SeriesKeyUpdate]) -> DomainResult<u64> {
+        match self {
+            AnyStore::Sqlite(s) => s.set_series_keys(updates).await,
+            AnyStore::Postgres(p) => p.set_series_keys(updates).await,
+        }
+    }
+
+    async fn series_episodes(&self, series_key: &str) -> DomainResult<Vec<SeriesEpisodeRow>> {
+        match self {
+            AnyStore::Sqlite(s) => s.series_episodes(series_key).await,
+            AnyStore::Postgres(p) => p.series_episodes(series_key).await,
+        }
+    }
+
+    async fn series_premiere_years(
+        &self,
+        keys: &[String],
+    ) -> DomainResult<std::collections::HashMap<String, u32>> {
+        match self {
+            AnyStore::Sqlite(s) => s.series_premiere_years(keys).await,
+            AnyStore::Postgres(p) => p.series_premiere_years(keys).await,
+        }
+    }
+
+    async fn ambiguous_series(
+        &self,
+        keys: &[String],
+    ) -> DomainResult<std::collections::HashSet<String>> {
+        match self {
+            AnyStore::Sqlite(s) => s.ambiguous_series(keys).await,
+            AnyStore::Postgres(p) => p.ambiguous_series(keys).await,
+        }
+    }
+
+    async fn mark_series_reconcile(&self, series_key: &str, at: i64) -> DomainResult<u64> {
+        match self {
+            AnyStore::Sqlite(s) => s.mark_series_reconcile(series_key, at).await,
+            AnyStore::Postgres(p) => p.mark_series_reconcile(series_key, at).await,
+        }
+    }
+
+    async fn mark_reconcile_items(&self, ids: &[MediaId], at: i64) -> DomainResult<u64> {
+        match self {
+            AnyStore::Sqlite(s) => s.mark_reconcile_items(ids, at).await,
+            AnyStore::Postgres(p) => p.mark_reconcile_items(ids, at).await,
+        }
+    }
+
+    async fn mark_reconcile_paths(&self, paths: &[String], at: i64) -> DomainResult<u64> {
+        match self {
+            AnyStore::Sqlite(s) => s.mark_reconcile_paths(paths, at).await,
+            AnyStore::Postgres(p) => p.mark_reconcile_paths(paths, at).await,
+        }
+    }
+
+    async fn series_reconcile_pending(&self, limit: i64) -> DomainResult<Vec<(MediaId, i64)>> {
+        match self {
+            AnyStore::Sqlite(s) => s.series_reconcile_pending(limit).await,
+            AnyStore::Postgres(p) => p.series_reconcile_pending(limit).await,
+        }
+    }
+
+    async fn clear_series_reconcile(&self, id: MediaId, at: i64) -> DomainResult<bool> {
+        match self {
+            AnyStore::Sqlite(s) => s.clear_series_reconcile(id, at).await,
+            AnyStore::Postgres(p) => p.clear_series_reconcile(id, at).await,
+        }
+    }
+
+    async fn readmit_series(&self, keys: &[String]) -> DomainResult<u64> {
+        match self {
+            AnyStore::Sqlite(s) => s.readmit_series(keys).await,
+            AnyStore::Postgres(p) => p.readmit_series(keys).await,
+        }
+    }
+
+    async fn delete_provider_artwork(&self, id: MediaId) -> DomainResult<Vec<(String, String)>> {
+        match self {
+            AnyStore::Sqlite(s) => s.delete_provider_artwork(id).await,
+            AnyStore::Postgres(p) => p.delete_provider_artwork(id).await,
+        }
+    }
+
+    async fn all_series_overrides(&self) -> DomainResult<Vec<SeriesOverride>> {
+        match self {
+            AnyStore::Sqlite(s) => s.all_series_overrides().await,
+            AnyStore::Postgres(p) => p.all_series_overrides().await,
+        }
+    }
+
+    async fn replace_admin_override(&self, o: SeriesOverride) -> DomainResult<i64> {
+        match self {
+            AnyStore::Sqlite(s) => s.replace_admin_override(o).await,
+            AnyStore::Postgres(p) => p.replace_admin_override(o).await,
+        }
+    }
+
+    async fn delete_series_override(&self, id: i64) -> DomainResult<Option<SeriesOverride>> {
+        match self {
+            AnyStore::Sqlite(s) => s.delete_series_override(id).await,
+            AnyStore::Postgres(p) => p.delete_series_override(id).await,
+        }
+    }
+
+    async fn flagged_series_keys(&self) -> DomainResult<Vec<String>> {
+        match self {
+            AnyStore::Sqlite(s) => s.flagged_series_keys().await,
+            AnyStore::Postgres(p) => p.flagged_series_keys().await,
+        }
+    }
+
+    async fn clear_manual_matches(&self, ids: &[MediaId]) -> DomainResult<Vec<(MediaId, String)>> {
+        match self {
+            AnyStore::Sqlite(s) => s.clear_manual_matches(ids).await,
+            AnyStore::Postgres(p) => p.clear_manual_matches(ids).await,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
 // PersonStore
 // ---------------------------------------------------------------------
 impl PersonStore for AnyStore {
@@ -723,10 +999,13 @@ impl PersonStore for AnyStore {
     }
 
     async fn people_with_counts(&self) -> DomainResult<Vec<PersonCount>> {
-        match self {
-            AnyStore::Sqlite(s) => s.people_with_counts().await,
-            AnyStore::Postgres(p) => p.people_with_counts().await,
-        }
+        timed("people_with_counts", async {
+            match self {
+                AnyStore::Sqlite(s) => s.people_with_counts().await,
+                AnyStore::Postgres(p) => p.people_with_counts().await,
+            }
+        })
+        .await
     }
 
     async fn person_by_wire_id(&self, wire_id: &str) -> DomainResult<Option<Person>> {
@@ -751,9 +1030,50 @@ impl PersonStore for AnyStore {
     }
 
     async fn people_for_item(&self, item: MediaId) -> DomainResult<Vec<ItemPerson>> {
+        timed("people_for_item", async {
+            match self {
+                AnyStore::Sqlite(s) => s.people_for_item(item).await,
+                AnyStore::Postgres(p) => p.people_for_item(item).await,
+            }
+        })
+        .await
+    }
+
+    async fn actor_credits_for_items(
+        &self,
+        items: &[MediaId],
+    ) -> DomainResult<Vec<(MediaId, ItemPerson)>> {
         match self {
-            AnyStore::Sqlite(s) => s.people_for_item(item).await,
-            AnyStore::Postgres(p) => p.people_for_item(item).await,
+            AnyStore::Sqlite(s) => s.actor_credits_for_items(items).await,
+            AnyStore::Postgres(p) => p.actor_credits_for_items(items).await,
+        }
+    }
+
+    async fn credits_for_person(&self, wire_id: &str) -> DomainResult<Vec<(MediaId, ItemPerson)>> {
+        match self {
+            AnyStore::Sqlite(s) => s.credits_for_person(wire_id).await,
+            AnyStore::Postgres(p) => p.credits_for_person(wire_id).await,
+        }
+    }
+
+    async fn actors_named(&self, words: &[String], limit: u32) -> DomainResult<Vec<Person>> {
+        match self {
+            AnyStore::Sqlite(s) => s.actors_named(words, limit).await,
+            AnyStore::Postgres(p) => p.actors_named(words, limit).await,
+        }
+    }
+
+    async fn person_details(&self, wire_id: &str) -> DomainResult<Option<PersonDetails>> {
+        match self {
+            AnyStore::Sqlite(s) => s.person_details(wire_id).await,
+            AnyStore::Postgres(p) => p.person_details(wire_id).await,
+        }
+    }
+
+    async fn put_person_details(&self, wire_id: &str, details: &PersonDetails) -> DomainResult<()> {
+        match self {
+            AnyStore::Sqlite(s) => s.put_person_details(wire_id, details).await,
+            AnyStore::Postgres(p) => p.put_person_details(wire_id, details).await,
         }
     }
 }
@@ -777,10 +1097,13 @@ impl StudioStore for AnyStore {
     }
 
     async fn studios_with_counts(&self) -> DomainResult<Vec<StudioCount>> {
-        match self {
-            AnyStore::Sqlite(s) => s.studios_with_counts().await,
-            AnyStore::Postgres(p) => p.studios_with_counts().await,
-        }
+        timed("studios_with_counts", async {
+            match self {
+                AnyStore::Sqlite(s) => s.studios_with_counts().await,
+                AnyStore::Postgres(p) => p.studios_with_counts().await,
+            }
+        })
+        .await
     }
 
     async fn item_ids_for_studio(&self, wire_id: &str) -> DomainResult<Vec<MediaId>> {
@@ -791,10 +1114,13 @@ impl StudioStore for AnyStore {
     }
 
     async fn studios_for_item(&self, item: MediaId) -> DomainResult<Vec<Studio>> {
-        match self {
-            AnyStore::Sqlite(s) => s.studios_for_item(item).await,
-            AnyStore::Postgres(p) => p.studios_for_item(item).await,
-        }
+        timed("studios_for_item", async {
+            match self {
+                AnyStore::Sqlite(s) => s.studios_for_item(item).await,
+                AnyStore::Postgres(p) => p.studios_for_item(item).await,
+            }
+        })
+        .await
     }
 }
 
@@ -831,10 +1157,13 @@ impl TagStore for AnyStore {
     }
 
     async fn tags_with_counts(&self) -> DomainResult<Vec<TagCount>> {
-        match self {
-            AnyStore::Sqlite(s) => s.tags_with_counts().await,
-            AnyStore::Postgres(p) => p.tags_with_counts().await,
-        }
+        timed("tags_with_counts", async {
+            match self {
+                AnyStore::Sqlite(s) => s.tags_with_counts().await,
+                AnyStore::Postgres(p) => p.tags_with_counts().await,
+            }
+        })
+        .await
     }
 
     async fn item_ids_for_tag(&self, wire_id: &str) -> DomainResult<Vec<MediaId>> {
@@ -845,10 +1174,13 @@ impl TagStore for AnyStore {
     }
 
     async fn tags_for_item(&self, item: MediaId) -> DomainResult<Vec<Tag>> {
-        match self {
-            AnyStore::Sqlite(s) => s.tags_for_item(item).await,
-            AnyStore::Postgres(p) => p.tags_for_item(item).await,
-        }
+        timed("tags_for_item", async {
+            match self {
+                AnyStore::Sqlite(s) => s.tags_for_item(item).await,
+                AnyStore::Postgres(p) => p.tags_for_item(item).await,
+            }
+        })
+        .await
     }
 }
 
@@ -876,10 +1208,13 @@ impl CollectionStore for AnyStore {
     }
 
     async fn collections_with_counts(&self) -> DomainResult<Vec<CollectionCount>> {
-        match self {
-            AnyStore::Sqlite(s) => s.collections_with_counts().await,
-            AnyStore::Postgres(p) => p.collections_with_counts().await,
-        }
+        timed("collections_with_counts", async {
+            match self {
+                AnyStore::Sqlite(s) => s.collections_with_counts().await,
+                AnyStore::Postgres(p) => p.collections_with_counts().await,
+            }
+        })
+        .await
     }
 
     async fn collection_by_wire_id(&self, wire_id: &str) -> DomainResult<Option<Collection>> {
@@ -1287,6 +1622,52 @@ impl SyncGroupStore for AnyStore {
 }
 
 // ---------------------------------------------------------------------
+// ReadPositionStore
+// ---------------------------------------------------------------------
+impl ReadPositionStore for AnyStore {
+    async fn get_read_position(
+        &self,
+        user: UserId,
+        item: MediaId,
+    ) -> DomainResult<Option<ReadPosition>> {
+        match self {
+            AnyStore::Sqlite(s) => s.get_read_position(user, item).await,
+            AnyStore::Postgres(p) => p.get_read_position(user, item).await,
+        }
+    }
+
+    async fn read_positions_bulk(
+        &self,
+        user: UserId,
+        items: &[MediaId],
+    ) -> DomainResult<Vec<Option<ReadPosition>>> {
+        match self {
+            AnyStore::Sqlite(s) => s.read_positions_bulk(user, items).await,
+            AnyStore::Postgres(p) => p.read_positions_bulk(user, items).await,
+        }
+    }
+
+    async fn set_read_position(
+        &self,
+        user: UserId,
+        item: MediaId,
+        position: ReadPosition,
+    ) -> DomainResult<bool> {
+        match self {
+            AnyStore::Sqlite(s) => s.set_read_position(user, item, position).await,
+            AnyStore::Postgres(p) => p.set_read_position(user, item, position).await,
+        }
+    }
+
+    async fn part_read_items(&self, user: UserId, limit: u32) -> DomainResult<Vec<MediaId>> {
+        match self {
+            AnyStore::Sqlite(s) => s.part_read_items(user, limit).await,
+            AnyStore::Postgres(p) => p.part_read_items(user, limit).await,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
 // UserDataStore
 // ---------------------------------------------------------------------
 impl UserDataStore for AnyStore {
@@ -1347,6 +1728,20 @@ impl UserDataStore for AnyStore {
             AnyStore::Postgres(p) => p.resumable_items(user).await,
         }
     }
+
+    async fn started_items(
+        &self,
+        user: UserId,
+        kind: pharos_core::MediaKind,
+    ) -> DomainResult<Vec<(MediaId, UserItemData)>> {
+        timed("started_items", async {
+            match self {
+                AnyStore::Sqlite(s) => s.started_items(user, kind).await,
+                AnyStore::Postgres(p) => p.started_items(user, kind).await,
+            }
+        })
+        .await
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -1375,10 +1770,13 @@ impl UserStore for AnyStore {
     }
 
     async fn get(&self, id: UserId) -> AuthResult<UserRecord> {
-        match self {
-            AnyStore::Sqlite(s) => UserStore::get(s, id).await,
-            AnyStore::Postgres(p) => UserStore::get(p, id).await,
-        }
+        timed("get_user", async {
+            match self {
+                AnyStore::Sqlite(s) => UserStore::get(s, id).await,
+                AnyStore::Postgres(p) => UserStore::get(p, id).await,
+            }
+        })
+        .await
     }
 
     async fn list(&self) -> AuthResult<Vec<UserRecord>> {
@@ -1494,10 +1892,13 @@ impl TokenStore for AnyStore {
     }
 
     async fn resolve_scoped(&self, token: &str) -> AuthResult<ResolvedToken> {
-        match self {
-            AnyStore::Sqlite(s) => s.resolve_scoped(token).await,
-            AnyStore::Postgres(p) => p.resolve_scoped(token).await,
-        }
+        timed("resolve_scoped", async {
+            match self {
+                AnyStore::Sqlite(s) => s.resolve_scoped(token).await,
+                AnyStore::Postgres(p) => p.resolve_scoped(token).await,
+            }
+        })
+        .await
     }
 
     fn token_id(&self, token: &str) -> String {

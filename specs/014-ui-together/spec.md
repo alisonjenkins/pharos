@@ -2,7 +2,7 @@
 
 **Feature directory**: `specs/014-ui-together/`
 **Created**: 2026-11-01
-**Status**: draft (`/speckit-specify` stage; next: `/speckit-clarify`)
+**Status**: implemented on main (US1, US6-US10, US2 partial without chat/reactions or the group queue: native Group/Membership, Together page, Playwright two-browser + mixed jellyfin-web); open: T027 (stub cleanup), T029 (10-minute mixed drift run); US3-US5 not tracked in tasks.md (audited 2026-11-09)
 **Input**: "… all the things Jellyfin's UI does and more (tailored to the Pharos
 server)." (Alison, 2026-11-01)
 **Depends on**: 009 (websocket FR-004), 013 (player, queue), ADR-0014/0016
@@ -150,3 +150,13 @@ floating player plays the new title there, as any play does (spec 020 FR-001)
   while others direct-play (different start latency).
 - Stale group id in an invite link → "group ended", not a new empty group
   (relates to T90a).
+
+## Progress (audited 2026-11-09)
+
+- US1 start or join a group: done (tasks T001-T013, T043, T049-T051; native Group/Membership in `crates/pharos-server/src/api/pharos/rpc/group.rs`, UI in `crates/pharos-ui/src/native/together*.rs`).
+- US2 in-group experience: partial (T014, T024, T025, T026, T041; chat and reactions deferred to their own plan, not in the native `Group` interface; the group queue (members add and reorder items, vote-skip) is also deferred per plan.md and is remaining P1 work; the member strip shows names, buffering, seen marks, own-track indicators and a recent-activity log (`together_view.rs` `MemberStrip`), but no per-member avatar or drift indicator (`together.rs` `Member` has no such fields)).
+- US3 remote control other sessions: not started on the native API (no remote-control interface in `pharos.capnp`; only the legacy `views/remote.rs` stub over `/Sessions/...`); no task exists.
+- US4 watch a URL: not started in pharos-ui (no remote-items call in `crates/pharos-ui/src/native`); no task exists.
+- US5 group-aware everywhere: partial (Together page lists groups; no card badge / "Join group" on detail verified); no task exists.
+- US6-US10: done (T030-T051).
+- Open tasks: T027 (stub `views/group.rs` still present), T029 (10-minute mixed-group drift run in `just compat-syncplay`).

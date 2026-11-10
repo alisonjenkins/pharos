@@ -13,6 +13,7 @@ pub mod names {
     pub const CAPTION: &str = "Caption";
     pub const ASIDE: &str = "Aside";
     pub const BURST: &str = "Burst";
+    pub const GIGGLE: &str = "Giggle";
     pub const KARAOKE: &str = "Karaoke";
 }
 
@@ -116,6 +117,9 @@ pub struct Theme {
     pub play_res_y: i32,
     /// `Default` first, then one style per effect that needs its own face.
     pub styles: Vec<StyleDef>,
+    /// What [`scaled`](Self::scaled) multiplied the styles by, so the
+    /// compiler scales the size tags its effects write inline to match.
+    pub tag_scale: f32,
 }
 
 impl Theme {
@@ -211,6 +215,17 @@ impl Theme {
             margin_v: 120,
             ..StyleDef::base(BURST)
         };
+        // Laughter: the rounded hand face in a warm pink with a deep rose
+        // outline, at the dialogue's spot (B1205).
+        let giggle = StyleDef {
+            font: faces::HAND,
+            size: 76,
+            primary: rgb(255, 204, 228),
+            outline_colour: rgb(118, 22, 70),
+            outline: 4.0,
+            shadow: 1.5,
+            ..StyleDef::base(GIGGLE)
+        };
         // Sung text takes the primary colour, unsung the secondary.
         let karaoke = StyleDef {
             size: 58,
@@ -225,13 +240,30 @@ impl Theme {
             play_res_y: 1080,
             styles: vec![
                 dialogue, shout, scream, whisper, thought, echo, wire, memory, caption, aside,
-                burst, karaoke,
+                burst, giggle, karaoke,
             ],
+            tag_scale: 1.0,
         }
     }
 
     pub fn style(&self, name: &str) -> Option<&StyleDef> {
         self.styles.iter().find(|s| s.name == name)
+    }
+
+    /// The theme with every style's text, outline and shadow at `percent` of
+    /// its size: the viewer's subtitle size choice (spec 028 FR-022). Margins
+    /// stay, so the text still sits where the plain track's does. The
+    /// compiler scales the effects' inline size tags by the same factor.
+    pub fn scaled(&self, percent: u16) -> Theme {
+        let k = f32::from(percent) / 100.0;
+        let mut out = self.clone();
+        for s in &mut out.styles {
+            s.size = (s.size as f32 * k).round() as u32;
+            s.outline *= k;
+            s.shadow *= k;
+        }
+        out.tag_scale *= k;
+        out
     }
 
     /// Where `\an2` text sits by default: bottom centre.
@@ -279,6 +311,20 @@ mod tests {
         assert!(wire
             .render()
             .starts_with("Style: Wire,Liberation Sans,56,&H00FFE1C8,"));
+    }
+
+    #[test]
+    fn scaled_grows_text_outline_and_shadow_but_not_margins() {
+        let t = Theme::pharos();
+        assert_eq!(t.scaled(100), t);
+        let big = t.scaled(150);
+        for (a, b) in t.styles.iter().zip(&big.styles) {
+            assert_eq!(b.size, (a.size as f32 * 1.5).round() as u32, "{}", a.name);
+            assert!((b.outline - a.outline * 1.5).abs() < 1e-4, "{}", a.name);
+            assert!((b.shadow - a.shadow * 1.5).abs() < 1e-4, "{}", a.name);
+            assert_eq!(b.margin_v, a.margin_v, "{}", a.name);
+        }
+        assert_eq!(t.scaled(75).styles[0].size, 42);
     }
 
     #[test]

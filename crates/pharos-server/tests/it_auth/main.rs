@@ -22,4 +22,5 @@ mod no_token_echo;
 mod password_change_audit;
 mod password_debug_audit;
 mod route_auth_audit;
+mod series_identity_admin;
 mod sessions_tenant_audit;

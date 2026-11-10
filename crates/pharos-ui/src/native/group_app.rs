@@ -12,7 +12,7 @@ use super::activity::TrackKind;
 use super::group_session::{Env, GroupPlayer, GroupView, Seat, Session, Ui};
 use super::platform;
 use super::together::{group_api, Groups};
-use super::track_follow::TrackPicks;
+use super::track_follow::{TrackMap, TrackPicks};
 
 /// The one session type the app uses.
 pub type AppSession = Session<Groups, AppEnv>;
@@ -60,6 +60,11 @@ pub struct VideoPlayer {
     /// The item's audio and subtitle streams.
     pub audio: Vec<Track>,
     pub subtitles: Vec<Track>,
+    /// The group names the primary file's streams; this lines the version
+    /// playing up with them (ADR-0089).
+    pub map: TrackMap,
+    /// The version playing, for the logs (empty: the primary).
+    pub version: String,
     /// Where the group's track picks go: the player screen switches tracks
     /// there, inside the Dioxus runtime.
     pub tracks: Coroutine<TrackPicks>,
@@ -86,6 +91,10 @@ impl GroupPlayer for VideoPlayer {
         platform::play(self.id);
     }
 
+    fn autoplay_blocked(&self) -> bool {
+        platform::autoplay_blocked()
+    }
+
     fn pause(&self) {
         platform::pause(self.id);
     }
@@ -98,9 +107,12 @@ impl GroupPlayer for VideoPlayer {
         platform::set_rate(self.id, rate);
     }
 
+    /// As the primary's indexes: the group's picks name those.
     fn stream_indexes(&self) -> (Vec<u32>, Vec<u32>) {
-        let indexes = |tracks: &[Track]| tracks.iter().map(|t| t.index).collect();
-        (indexes(&self.audio), indexes(&self.subtitles))
+        (
+            self.map.primary_indexes(TrackKind::Audio),
+            self.map.primary_indexes(TrackKind::Subtitles),
+        )
     }
 
     fn track_label(&self, kind: TrackKind, index: u32) -> Option<String> {
@@ -108,7 +120,8 @@ impl GroupPlayer for VideoPlayer {
             TrackKind::Audio => &self.audio,
             TrackKind::Subtitles => &self.subtitles,
         };
-        let track = tracks.iter().find(|t| t.index == index)?;
+        let own = self.map.to_own(kind, index)?;
+        let track = tracks.iter().find(|t| t.index == own)?;
         [&track.title, &track.language]
             .into_iter()
             .find(|s| !s.is_empty())
@@ -116,7 +129,28 @@ impl GroupPlayer for VideoPlayer {
     }
 
     fn apply_tracks(&self, picks: TrackPicks) {
-        self.tracks.send(picks);
+        let own = self.map.picks_to_own(picks);
+        let dropped = [
+            (
+                TrackKind::Audio,
+                picks.audio.filter(|_| own.audio.is_none()),
+            ),
+            (
+                TrackKind::Subtitles,
+                picks.subtitle.flatten().filter(|_| own.subtitle.is_none()),
+            ),
+        ];
+        for (kind, index) in dropped {
+            if let Some(index) = index {
+                platform::info(&format!(
+                    "pharos: group tracks unmapped kind={kind:?} index={index} version={:?}",
+                    self.version
+                ));
+            }
+        }
+        if own.audio.is_some() || own.subtitle.is_some() {
+            self.tracks.send(own);
+        }
     }
 }
 
@@ -128,6 +162,10 @@ pub struct Together {
     /// Why the last create or join failed. It lives with the app, not a
     /// screen: the attempt outlasts the screen that started it.
     pub error: Signal<Option<String>>,
+    /// News about the group that is not a failure of what the viewer just
+    /// did, such as a reload that could not rejoin it: a timed status note
+    /// over the video, never a pinned alert (spec 038 FR-501).
+    pub note: Signal<Option<String>>,
     ui: Coroutine<Ui>,
     seat: Rc<Seat<Groups, AppEnv>>,
 }
@@ -137,6 +175,7 @@ impl Together {
         Self {
             view,
             error,
+            note: Signal::new(None),
             ui,
             seat: Rc::new(Seat::new(platform::info)),
         }
@@ -149,6 +188,20 @@ impl Together {
     pub fn session(&self, api: &NativeApi) -> Rc<AppSession> {
         self.seat
             .session(|| Session::new(group_api(api), AppEnv { ui: self.ui }))
+    }
+
+    /// The app's connection was replaced by `api`'s, as after a deploy or a
+    /// dropped socket. A session in a group moves to it and joins its group
+    /// again: its membership lived on the old connection, so without this the
+    /// tab would think itself in the group while hearing nothing from it.
+    pub fn reconnected(&self, api: &NativeApi) {
+        let Some(session) = self.seat.current().filter(|s| s.active()) else {
+            return;
+        };
+        session.client().reconnect(api);
+        platform::spawn_detached(Box::pin(async move {
+            session.rejoin("reconnect").await;
+        }));
     }
 
     /// A video is on the stage: the group drives it, whatever route shows.
@@ -207,6 +260,8 @@ pub fn group_to_rejoin(kept: Option<String>, in_group: bool) -> Option<String> {
     kept.filter(|id| !id.is_empty() && !in_group)
 }
 
+pub use super::group_session::rejoin_failure;
+
 /// What the tab kept before this page loaded.
 pub fn kept_before_load() -> Option<String> {
     platform::session_get(GROUP_KEY).unwrap_or_else(|e| {
@@ -232,6 +287,14 @@ mod tests {
             kept_group(&view),
             "",
             "a left or ended group is not rejoined"
+        );
+    }
+
+    #[test]
+    fn a_failed_rejoin_says_so_and_carries_the_reason() {
+        assert_eq!(
+            rejoin_failure("This group has ended"),
+            "Couldn't rejoin your group (This group has ended)"
         );
     }
 

@@ -63,7 +63,7 @@ fn make_source(dir: &Path) -> PathBuf {
 /// Runs each job's production argv through the real `ffmpeg` on the CPU, in
 /// process. The cache only detects a short window, and only reaches the
 /// filler, behind a scheduler.
-struct FfmpegSpawner;
+pub(crate) struct FfmpegSpawner;
 impl WorkerSpawner for FfmpegSpawner {
     fn spawn(&self, id: WorkerId) -> SpawnFuture {
         Box::pin(async move { Ok(Box::new(FfmpegWorker(id)) as Box<dyn Worker>) })
@@ -122,6 +122,8 @@ fn opts() -> SegmentOpts {
         video_3d_format: None,
         stereo_output: Default::default(),
         tonemap: Default::default(),
+        output_size: None,
+        output_scale_reason: None,
     }
 }
 

@@ -40,7 +40,8 @@ mod tests {
     use std::collections::HashMap;
 
     use pharos_client::api::{
-        Capabilities, Decision, Detail, Home, ListIndex, Listing, Page, PlaybackGrant, TrackPicks,
+        Capabilities, Decision, Detail, Home, ListIndex, Listing, Page, PlaybackGrant, StartTracks,
+        TrackPicks,
     };
 
     use super::*;
@@ -114,7 +115,19 @@ mod tests {
                 fonts: Vec::new(),
                 artists: Vec::new(),
                 album: None,
+                cast: Vec::new(),
+                versions: Vec::new(),
+                damage: None,
+                book: None,
+                read_position: None,
             })
+        }
+        async fn person(
+            &self,
+            _: &CallInfo,
+            _: ItemRef,
+        ) -> Result<pharos_client::api::PersonPage, ClientError> {
+            Err(missing())
         }
         async fn lyrics(
             &self,
@@ -137,9 +150,18 @@ mod tests {
             &self,
             _: &CallInfo,
             _: ItemRef,
+            _: &str,
             _: &Capabilities,
             _: TrackPicks,
         ) -> Result<(Decision, NoGrant), ClientError> {
+            Err(missing())
+        }
+        async fn start_tracks(
+            &self,
+            _: &CallInfo,
+            _: ItemRef,
+            _: &Capabilities,
+        ) -> Result<StartTracks, ClientError> {
             Err(missing())
         }
     }
@@ -172,6 +194,9 @@ mod tests {
             library_kind: None,
             imdb_rating: None,
             critic_rating: None,
+            artist: None,
+            stereo: None,
+            damaged: false,
         }
     }
 
@@ -184,7 +209,7 @@ mod tests {
         let mut fake = Fake::default();
         for i in [
             item(LIBRARY, ItemKind::Library, "TV Shows", None),
-            item(SERIES, ItemKind::Series, "Breaking Bad", Some(LIBRARY)),
+            item(SERIES, ItemKind::Series, "Show X", Some(LIBRARY)),
             item(SEASON, ItemKind::Season, "Season 1", Some(SERIES)),
             item(EPISODE, ItemKind::Episode, "Pilot", Some(SEASON)),
         ] {
@@ -201,10 +226,7 @@ mod tests {
     fn an_episode_trails_back_to_its_library() {
         let fake = show();
         let trail = run(load(&fake, &CallInfo::default(), EPISODE)).unwrap();
-        assert_eq!(
-            names(&trail),
-            ["TV Shows", "Breaking Bad", "Season 1", "Pilot"]
-        );
+        assert_eq!(names(&trail), ["TV Shows", "Show X", "Season 1", "Pilot"]);
     }
 
     #[test]

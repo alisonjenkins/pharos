@@ -49,14 +49,15 @@ async fn seed(dir: &std::path::Path) -> (web::Data<AppState>, String, std::path:
         .unwrap();
     let token = stores.issue(uid, "t").await.unwrap();
 
-    let path = dir.join("Dune.epub");
+    let path = dir.join("Book A.epub");
     std::fs::write(&path, payload()).unwrap();
 
     stores
         .put(MediaItem {
+            locked: Default::default(),
             id: 42,
             path: path.clone(),
-            title: "Dune".into(),
+            title: "Book A".into(),
             kind: MediaKind::Book,
             book: Some(BookMeta {
                 format: BookFormat::Epub,
@@ -137,7 +138,7 @@ async fn query_auth_alone_serves_the_exact_bytes() {
         .unwrap_or_default()
         .to_string();
     assert_eq!(ct, "application/epub+zip");
-    assert_eq!(cd, "attachment; filename=\"Dune.epub\"");
+    assert_eq!(cd, "attachment; filename=\"Book A.epub\"");
     assert_eq!(ar, "bytes", "a reader needs range support to seek");
 
     let body = test::read_body(resp).await;
@@ -257,14 +258,15 @@ async fn download_is_not_restricted_to_books() {
     // so a movie must download too.
     let td = TempDir::new().unwrap();
     let (state, token, _) = seed(td.path()).await;
-    let movie_path = td.path().join("Alien.mkv");
+    let movie_path = td.path().join("Film AX.mkv");
     std::fs::write(&movie_path, b"not a book").unwrap();
     state
         .stores
         .put(MediaItem {
+            locked: Default::default(),
             id: 43,
             path: movie_path,
-            title: "Alien".into(),
+            title: "Film AX".into(),
             kind: MediaKind::Movie,
             book: None,
             probe: MediaProbe::default(),
@@ -303,4 +305,51 @@ async fn download_is_not_restricted_to_books() {
         "an unrecognised extension gets octet-stream rather than a guess"
     );
     assert_eq!(test::read_body(resp).await.as_ref(), b"not a book");
+}
+
+/// 023 FR-009: the native reader's credentialed same-origin `fetch` carries
+/// only the `pharos_media` cookie (its session token is HttpOnly), so that
+/// cookie alone must serve the bytes on GET and HEAD, and a cookie holding no
+/// live token must not.
+/// Disarm check: with the route back on `AuthUser`, the cookie is ignored and
+/// both answer 401.
+#[actix_web::test]
+async fn the_media_cookie_alone_serves_the_bytes() {
+    use pharos_server::api::jellyfin::auth_extractor::MEDIA_COOKIE;
+    let td = TempDir::new().unwrap();
+    let (state, token, _) = seed(td.path()).await;
+    let app = test::init_service(app(state)).await;
+    let cookie = |value: &str| actix_web::cookie::Cookie::new(MEDIA_COOKIE, value.to_owned());
+
+    let resp = test::call_service(
+        &app,
+        test::TestRequest::get()
+            .uri("/Items/42/Download")
+            .cookie(cookie(&token))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(test::read_body(resp).await.as_ref(), payload().as_slice());
+
+    let head = test::call_service(
+        &app,
+        test::TestRequest::default()
+            .method(actix_web::http::Method::HEAD)
+            .uri("/Items/42/Download")
+            .cookie(cookie(&token))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(head.status(), StatusCode::OK);
+
+    let stale = test::call_service(
+        &app,
+        test::TestRequest::get()
+            .uri("/Items/42/Download")
+            .cookie(cookie("not-a-token"))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(stale.status(), StatusCode::UNAUTHORIZED);
 }

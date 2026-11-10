@@ -165,6 +165,23 @@ pub fn open(canvas_id: &str, program: Program) -> Result<Box<dyn Surface>, Fallb
     }))
 }
 
+/// A bound 2D texture sampled bilinearly and clamped at its edges.
+pub(super) fn linear_texture(gl: &Gl) -> Result<WebGlTexture, Fallback> {
+    let texture = gl
+        .create_texture()
+        .ok_or_else(|| Fallback::Shader("create texture".to_owned()))?;
+    gl.bind_texture(Gl::TEXTURE_2D, Some(&texture));
+    for (param, value) in [
+        (Gl::TEXTURE_MIN_FILTER, Gl::LINEAR),
+        (Gl::TEXTURE_MAG_FILTER, Gl::LINEAR),
+        (Gl::TEXTURE_WRAP_S, Gl::CLAMP_TO_EDGE),
+        (Gl::TEXTURE_WRAP_T, Gl::CLAMP_TO_EDGE),
+    ] {
+        gl.tex_parameteri(Gl::TEXTURE_2D, param, value as i32);
+    }
+    Ok(texture)
+}
+
 /// Compile `program` and make its vertex array and data texture.
 fn build(gl: &Gl, program: Program) -> Result<Resources, Fallback> {
     let handle = link(gl, VERTEX, &fragment_source(program))?;
@@ -189,18 +206,7 @@ fn build(gl: &Gl, program: Program) -> Result<Resources, Fallback> {
     gl.enable_vertex_attrib_array(0);
     gl.vertex_attrib_pointer_with_i32(0, 2, Gl::UNSIGNED_BYTE, false, 0, 0);
     gl.bind_vertex_array(None);
-    let texture = gl
-        .create_texture()
-        .ok_or_else(|| Fallback::Shader("create texture".to_owned()))?;
-    gl.bind_texture(Gl::TEXTURE_2D, Some(&texture));
-    for (param, value) in [
-        (Gl::TEXTURE_MIN_FILTER, Gl::LINEAR),
-        (Gl::TEXTURE_MAG_FILTER, Gl::LINEAR),
-        (Gl::TEXTURE_WRAP_S, Gl::CLAMP_TO_EDGE),
-        (Gl::TEXTURE_WRAP_T, Gl::CLAMP_TO_EDGE),
-    ] {
-        gl.tex_parameteri(Gl::TEXTURE_2D, param, value as i32);
-    }
+    let texture = linear_texture(gl)?;
     gl.pixel_storei(Gl::UNPACK_ALIGNMENT, 1);
     gl.use_program(Some(&handle));
     gl.uniform1i(gl.get_uniform_location(&handle, "u_data").as_ref(), 0);

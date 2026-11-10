@@ -33,12 +33,12 @@ impl LrcLib {
             "pharos/{} (https://github.com/alisonjenkins/pharos)",
             env!("CARGO_PKG_VERSION")
         );
-        let http = reqwest::Client::builder()
+        let http = crate::http_client::builder()
             .user_agent(ua)
             .timeout(TIMEOUT)
             .build()
             // Only TLS backend init fails here; V17 forbids `expect`.
-            .unwrap_or_else(|_| reqwest::Client::new());
+            .unwrap_or_else(|_| crate::http_client::client());
         Self {
             http,
             base: base.trim_end_matches('/').to_owned(),

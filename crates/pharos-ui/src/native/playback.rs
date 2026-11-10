@@ -25,7 +25,118 @@ pub trait PlaybackEngine {
 }
 
 /// Told why playback stopped for good.
-pub type OnFatal = std::rc::Rc<dyn Fn(String)>;
+pub type OnFatal = std::rc::Rc<dyn Fn(Fatal)>;
+
+/// What kind of failure stopped a video, which decides the hint its panel
+/// gives (038 FR-403, V1219). Each names who can fix it: the connection, the
+/// server, the browser or device, or the file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureKind {
+    /// The connection: a fetch that failed or timed out, a socket that went.
+    Network,
+    /// The server answered and refused, or failed: an `Error`, an HTTP 4xx/5xx.
+    Server,
+    /// This browser or device cannot play what it was sent: a codec it lacks,
+    /// an engine that will not attach.
+    Unplayable,
+    /// The bytes arrived and would not decode: the file is likely damaged.
+    Damaged,
+}
+
+impl FailureKind {
+    /// Stable label for log lines and the panel's `data-kind`.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Network => "network",
+            Self::Server => "server",
+            Self::Unplayable => "unplayable",
+            Self::Damaged => "damaged",
+        }
+    }
+
+    /// An HTTP status that ended a fetch: the server's (4xx, 5xx), else the
+    /// network's.
+    pub fn of_status(status: u16) -> Self {
+        if (400..600).contains(&status) {
+            Self::Server
+        } else {
+            Self::Network
+        }
+    }
+
+    /// A media error the Rust engine gave up on, by its hls.js-shaped
+    /// `details`: bytes that would not decode are damage, a codec the
+    /// browser refused is unplayable, and anything else (a stall with data
+    /// buffered, a SourceBuffer that would not remove) is neither, so it is
+    /// not offered a skip (V1219).
+    pub fn of_media_error(details: &str) -> Self {
+        match details {
+            "bufferAppendError"
+            | "bufferAppendingError"
+            | "fragParsingError"
+            | "videoDecodeError" => Self::Damaged,
+            "bufferAddCodecError"
+            | "manifestIncompatibleCodecsError"
+            | "bufferIncompatibleCodecsError" => Self::Unplayable,
+            _ => Self::Network,
+        }
+    }
+}
+
+/// Why playback stopped for good, and what kind of failure it was.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fatal {
+    pub reason: String,
+    pub kind: FailureKind,
+}
+
+impl Fatal {
+    /// The media could not be decoded: the file is likely damaged there,
+    /// so skipping ahead may get past it (B1160).
+    pub fn media(reason: impl Into<String>) -> Self {
+        Self::of(FailureKind::Damaged, reason)
+    }
+
+    /// The network, or anything not known to be otherwise.
+    pub fn other(reason: impl Into<String>) -> Self {
+        Self::of(FailureKind::Network, reason)
+    }
+
+    pub fn of(kind: FailureKind, reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+            kind,
+        }
+    }
+
+    /// Whether the media itself broke.
+    pub fn is_media(&self) -> bool {
+        self.kind == FailureKind::Damaged
+    }
+
+    /// hls.js reports media it could not parse or append as a `mediaError`
+    /// with these details; a stall, a full buffer or a codec the browser
+    /// lacks is a `mediaError` too, but not damage. A codec the browser
+    /// lacks is this browser's limit.
+    pub fn from_hls(kind: &str, details: &str) -> Self {
+        let reason = format!("the stream failed ({kind}: {details})");
+        let damage = matches!(
+            details,
+            "bufferAppendError" | "bufferAppendingError" | "fragParsingError"
+        );
+        let unplayable = matches!(
+            details,
+            "manifestIncompatibleCodecsError" | "bufferIncompatibleCodecsError"
+        );
+        if kind == "mediaError" && damage {
+            Self::media(reason)
+        } else if unplayable {
+            Self::of(FailureKind::Unplayable, reason)
+        } else {
+            Self::other(reason)
+        }
+    }
+}
 
 /// One video fragment the engine downloaded, for measuring the connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1202,6 +1313,12 @@ impl SubtitleSize {
         }
     }
 
+    /// [`scale`](Self::scale) in whole percent: the `?size=` the generated
+    /// styled track is compiled at (spec 028 FR-022).
+    pub fn percent(self) -> u16 {
+        (self.scale() * 100.0).round() as u16
+    }
+
     /// The option text shown in the Appearance picker.
     pub fn label(self) -> &'static str {
         match self {
@@ -1890,6 +2007,26 @@ impl ReportClock {
         Some(send)
     }
 
+    /// The report owed when the page becomes hidden: a report, not a stop,
+    /// since a hidden tab usually comes back. Nothing once stopped.
+    pub fn on_hidden(&mut self, now_ms: f64) -> Option<Outgoing> {
+        if self.stopped {
+            return None;
+        }
+        self.last_report_ms = Some(now_ms);
+        Some(Outgoing::Report {
+            paused: self.paused,
+        })
+    }
+
+    /// The page came back from the back/forward cache after `pagehide` sent
+    /// the stop: reports flow again, the next one at once. Whether a stop
+    /// had been sent.
+    pub fn restore(&mut self) -> bool {
+        self.last_report_ms = None;
+        std::mem::replace(&mut self.stopped, false)
+    }
+
     /// Whether a stop is still owed: true once, then false.
     pub fn stop(&mut self) -> bool {
         !std::mem::replace(&mut self.stopped, true)
@@ -1964,6 +2101,196 @@ impl RecoveryBudget {
     /// A fragment loaded: playback is moving again.
     pub fn progressed(&mut self) {
         *self = Self::default();
+    }
+}
+
+/// The play head must pass this far beyond where a rebuild started before
+/// the media budget refills. A loaded segment is not enough: a segment that
+/// fails to decode every time loads fine each time, and would rebuild forever.
+/// Longer than one segment (6 s) so the failing one is behind the play head.
+pub const MEDIA_REFILL_MS: u64 = 10_000;
+
+/// What to do about one Rust-engine media error (V638, V1062).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MediaVerdict {
+    /// The MediaSource this error came from was already rebuilt: one fault
+    /// fires several errors, and only the first one counts.
+    Stale,
+    /// Rebuild the MediaSource at the play head; `attempt` counts from 1.
+    Rebuild { attempt: u32 },
+    /// Give up: `attempt` recoveries already failed, or the error cannot be
+    /// recovered by a rebuild.
+    Fail { attempt: u32 },
+}
+
+impl MediaVerdict {
+    /// The `action` token, shared with hls.js's error line.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Stale => "stale",
+            Self::Rebuild { .. } => Recovery::RecoverMedia.label(),
+            Self::Fail { .. } => Recovery::Fail.label(),
+        }
+    }
+
+    pub fn attempt(self) -> u32 {
+        match self {
+            Self::Stale => 0,
+            Self::Rebuild { attempt } | Self::Fail { attempt } => attempt,
+        }
+    }
+}
+
+/// Playback got [`MEDIA_REFILL_MS`] past the last rebuild with no new media
+/// error: the rebuild fixed it. A head that merely moves is not enough, as the
+/// fault is often a segment buffered ahead that fails again on its refetch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MediaResumed {
+    pub attempt: u32,
+    pub at_ms: u64,
+    pub took_ms: u64,
+}
+
+/// Media-error recovery for the Rust engine: [`RecoveryBudget`]'s media
+/// budget, counted per MediaSource (`epoch`) and refilled only once the play
+/// head has moved [`MEDIA_REFILL_MS`] past the rebuild point.
+#[derive(Debug, Clone, Default)]
+pub struct MediaRecovery {
+    budget: RecoveryBudget,
+    epoch: u32,
+    /// Where and when the last rebuild started, until playback passes it.
+    rebuilt: Option<(u64, u64)>,
+}
+
+impl MediaRecovery {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The MediaSource generation errors are counted against.
+    pub fn epoch(&self) -> u32 {
+        self.epoch
+    }
+
+    /// A media error `details` from MediaSource `epoch` at play head `at_ms`.
+    pub fn on_error(&mut self, epoch: u32, details: &str, at_ms: u64, now_ms: u64) -> MediaVerdict {
+        if epoch != self.epoch {
+            return MediaVerdict::Stale;
+        }
+        // A codec the browser refuses is refused again by a new MediaSource.
+        if details == "bufferAddCodecError" {
+            return MediaVerdict::Fail {
+                attempt: self.budget.attempts("mediaError"),
+            };
+        }
+        match self.budget.on_fatal("mediaError", details) {
+            Recovery::RecoverMedia => {
+                self.epoch = self.epoch.saturating_add(1);
+                self.rebuilt = Some((at_ms, now_ms));
+                MediaVerdict::Rebuild {
+                    attempt: self.budget.attempts("mediaError"),
+                }
+            }
+            Recovery::StartLoad | Recovery::Fail => MediaVerdict::Fail {
+                attempt: self.budget.attempts("mediaError"),
+            },
+        }
+    }
+
+    /// The play head is at `at_ms` and moving. [`MEDIA_REFILL_MS`] past the
+    /// rebuild point, the rebuild counts as a recovery: the budget refills and
+    /// the recovery is reported, once.
+    pub fn on_play_head(&mut self, at_ms: u64, now_ms: u64) -> Option<MediaResumed> {
+        let (from_ms, started_ms) = self.rebuilt?;
+        if at_ms < from_ms.saturating_add(MEDIA_REFILL_MS) {
+            return None;
+        }
+        let attempt = self.budget.attempts("mediaError");
+        self.budget.progressed();
+        self.rebuilt = None;
+        Some(MediaResumed {
+            attempt,
+            at_ms,
+            took_ms: now_ms.saturating_sub(started_ms),
+        })
+    }
+}
+
+/// One media-error decision of the Rust engine, or the rebuilt MediaSource
+/// playing again: the failure and the success side of V638 in one shape
+/// (V640).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MediaRecoveryReport {
+    Error {
+        details: String,
+        message: String,
+        verdict: MediaVerdict,
+        at_ms: u64,
+    },
+    Resumed(MediaResumed),
+}
+
+impl MediaRecoveryReport {
+    pub fn line(&self, url: &str) -> String {
+        match self {
+            Self::Error {
+                details,
+                message,
+                verdict,
+                at_ms,
+            } => format!(
+                "pharos: playback error engine=rust type=mediaError details={details} message={message} fatal=true action={} attempt={} at_ms={at_ms} url={url}",
+                verdict.label(),
+                verdict.attempt(),
+            ),
+            Self::Resumed(r) => format!(
+                "pharos: playback recovered engine=rust type=mediaError action=recover_media attempt={} at_ms={} took_ms={} url={url}",
+                r.attempt, r.at_ms, r.took_ms
+            ),
+        }
+    }
+
+    pub fn event(&self, route: String) -> ClientEvent {
+        let (level, fields) = match self {
+            Self::Error {
+                details,
+                message,
+                verdict,
+                at_ms,
+            } => (
+                match verdict {
+                    MediaVerdict::Stale => ClientLevel::Warn,
+                    MediaVerdict::Rebuild { .. } | MediaVerdict::Fail { .. } => ClientLevel::Error,
+                },
+                vec![
+                    ("engine", "rust".to_owned()),
+                    ("type", "mediaError".to_owned()),
+                    ("details", details.clone()),
+                    ("message", message.clone()),
+                    ("action", verdict.label().to_owned()),
+                    ("attempt", verdict.attempt().to_string()),
+                    ("at_ms", at_ms.to_string()),
+                ],
+            ),
+            Self::Resumed(r) => (
+                ClientLevel::Info,
+                vec![
+                    ("engine", "rust".to_owned()),
+                    ("type", "mediaError".to_owned()),
+                    ("details", "recovered".to_owned()),
+                    ("action", Recovery::RecoverMedia.label().to_owned()),
+                    ("attempt", r.attempt.to_string()),
+                    ("at_ms", r.at_ms.to_string()),
+                    ("took_ms", r.took_ms.to_string()),
+                ],
+            ),
+        };
+        ClientEvent {
+            kind: ClientEventKind::PlaybackError,
+            level,
+            route,
+            fields,
+        }
     }
 }
 
@@ -2125,6 +2452,15 @@ pub fn up_next_at(segments: &[Segment], total_ms: u64) -> Option<UpNextFrom> {
     })
 }
 
+/// Whether "Up next" is the small pill rather than the full card: over a
+/// guessed ending (no credits detected) the card would cover the last
+/// scene for up to 90 s, so it waits as a pill until the last
+/// [`UP_NEXT_COUNTDOWN_MS`] (038 FR-405, V1221). Over detected credits it
+/// is the card throughout.
+pub fn up_next_pill(credits: bool, left_ms: u64) -> bool {
+    !credits && left_ms > UP_NEXT_COUNTDOWN_MS
+}
+
 /// What the "Up next" card does at a position.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UpNextStep {
@@ -2185,6 +2521,10 @@ impl UpNext {
         self.cancelled = true;
     }
 
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled
+    }
+
     /// Why the player should move on to the next episode after `event`,
     /// which left the card at `step`; `None` to stay.
     pub fn moves_on(&self, step: UpNextStep, event: MediaEvent) -> Option<&'static str> {
@@ -2228,15 +2568,20 @@ pub fn clock(ms: u64) -> String {
     }
 }
 
-/// How a track is named in a picker: its title, else its language, else its
-/// position, with the forced and SDH flags the title does not already say.
+/// How a track is named in a picker: its language, an audio track's codec
+/// and channels, then its title when that says something more (a file's
+/// "Surround" on a 5.1 track does not), and the forced and SDH flags the
+/// title does not already say. A track with none of these is its position.
 pub fn track_label(track: &Track, position: usize) -> String {
-    let mut label = [&track.title, &track.language]
-        .into_iter()
-        .find(|s| !s.is_empty())
-        .cloned()
-        .unwrap_or_else(|| format!("Track {}", position.saturating_add(1)));
-    let lower = label.to_lowercase();
+    let channels = (track.channels > 0).then_some(track.channels);
+    let mut label = audio_label(
+        &track.language,
+        &track.codec,
+        channels,
+        &track.title,
+        position,
+    );
+    let lower = track.title.to_lowercase();
     if track.is_forced && !lower.contains("forced") {
         label.push_str(" (forced)");
     }
@@ -2244,6 +2589,181 @@ pub fn track_label(track: &Track, position: usize) -> String {
         label.push_str(" [SDH]");
     }
     label
+}
+
+/// The picker name from a track's parts; `channels` is `None` when the
+/// track does not say them.
+fn audio_label(
+    language: &str,
+    codec: &str,
+    channels: Option<u16>,
+    title: &str,
+    position: usize,
+) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    let language = language_name(language);
+    if !language.is_empty() {
+        parts.push(language);
+    }
+    let sound = [codec_name(codec), channels.and_then(channel_name)]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if !sound.is_empty() {
+        parts.push(sound);
+    }
+    let said = parts.join(" ").to_lowercase();
+    let adds = title.split_whitespace().any(|word| {
+        let word = word.to_lowercase();
+        !said.contains(&word) && !GENERIC_TITLE_WORDS.contains(&word.as_str())
+    });
+    if adds {
+        parts.push(title.to_owned());
+    }
+    match parts.is_empty() {
+        true => format!("Track {}", position.saturating_add(1)),
+        false => parts.join(" · "),
+    }
+}
+
+/// Title words that only restate a track's channels or that it is audio.
+const GENERIC_TITLE_WORDS: &[&str] = &[
+    "surround", "stereo", "mono", "audio", "sound", "track", "-", "ch", "channel", "channels",
+];
+
+/// A language's English name for an ISO 639-1 or 639-2 (bibliographic or
+/// terminology) code, else the code in capitals; nothing for an undetermined
+/// code (`und`, `mis`, `zxx`, `mul`) or an empty one. A region or script tag
+/// after it (`pt-BR`, `zh-Hant`) is dropped; the track title says which.
+pub(super) fn language_name(code: &str) -> String {
+    let lower = code.trim().to_ascii_lowercase();
+    let base = lower.split(['-', '_']).next().unwrap_or_default();
+    match base {
+        "aa" | "aar" => "Afar",
+        "af" | "afr" => "Afrikaans",
+        "sq" | "alb" | "sqi" => "Albanian",
+        "am" | "amh" => "Amharic",
+        "ar" | "ara" => "Arabic",
+        "hy" | "arm" | "hye" => "Armenian",
+        "az" | "aze" => "Azerbaijani",
+        "eu" | "baq" | "eus" => "Basque",
+        "be" | "bel" => "Belarusian",
+        "bn" | "ben" => "Bengali",
+        "bs" | "bos" => "Bosnian",
+        "bg" | "bul" => "Bulgarian",
+        "my" | "bur" | "mya" => "Burmese",
+        "ca" | "cat" => "Catalan",
+        "zh" | "chi" | "zho" => "Chinese",
+        "hr" | "hrv" | "scr" => "Croatian",
+        "cs" | "cze" | "ces" => "Czech",
+        "da" | "dan" => "Danish",
+        "nl" | "dut" | "nld" => "Dutch",
+        "en" | "eng" => "English",
+        "eo" | "epo" => "Esperanto",
+        "et" | "est" => "Estonian",
+        "fo" | "fao" => "Faroese",
+        "fil" => "Filipino",
+        "fi" | "fin" => "Finnish",
+        "fr" | "fre" | "fra" => "French",
+        "gl" | "glg" => "Galician",
+        "ka" | "geo" | "kat" => "Georgian",
+        "de" | "ger" | "deu" => "German",
+        "el" | "gre" | "ell" => "Greek",
+        "gu" | "guj" => "Gujarati",
+        "he" | "heb" => "Hebrew",
+        "hi" | "hin" => "Hindi",
+        "hu" | "hun" => "Hungarian",
+        "is" | "ice" | "isl" => "Icelandic",
+        "id" | "ind" => "Indonesian",
+        "ga" | "gle" => "Irish",
+        "it" | "ita" => "Italian",
+        "ja" | "jpn" => "Japanese",
+        "kn" | "kan" => "Kannada",
+        "kk" | "kaz" => "Kazakh",
+        "km" | "khm" => "Khmer",
+        "ko" | "kor" => "Korean",
+        "ku" | "kur" => "Kurdish",
+        "lo" | "lao" => "Lao",
+        "la" | "lat" => "Latin",
+        "lv" | "lav" => "Latvian",
+        "lt" | "lit" => "Lithuanian",
+        "lb" | "ltz" => "Luxembourgish",
+        "mk" | "mac" | "mkd" => "Macedonian",
+        "ms" | "may" | "msa" => "Malay",
+        "ml" | "mal" => "Malayalam",
+        "mt" | "mlt" => "Maltese",
+        "mi" | "mao" | "mri" => "Maori",
+        "mr" | "mar" => "Marathi",
+        "mn" | "mon" => "Mongolian",
+        "ne" | "nep" => "Nepali",
+        "no" | "nor" => "Norwegian",
+        "nb" | "nob" => "Norwegian Bokmål",
+        "nn" | "nno" => "Norwegian Nynorsk",
+        "fa" | "per" | "fas" => "Persian",
+        "pl" | "pol" => "Polish",
+        "pt" | "por" => "Portuguese",
+        "pa" | "pan" => "Punjabi",
+        "ro" | "rum" | "ron" => "Romanian",
+        "ru" | "rus" => "Russian",
+        "sr" | "srp" | "scc" => "Serbian",
+        "si" | "sin" => "Sinhala",
+        "sk" | "slo" | "slk" => "Slovak",
+        "sl" | "slv" => "Slovenian",
+        "so" | "som" => "Somali",
+        "es" | "spa" => "Spanish",
+        "sw" | "swa" => "Swahili",
+        "sv" | "swe" => "Swedish",
+        "tl" | "tgl" => "Tagalog",
+        "ta" | "tam" => "Tamil",
+        "te" | "tel" => "Telugu",
+        "th" | "tha" => "Thai",
+        "bo" | "tib" | "bod" => "Tibetan",
+        "tr" | "tur" => "Turkish",
+        "uk" | "ukr" => "Ukrainian",
+        "ur" | "urd" => "Urdu",
+        "uz" | "uzb" => "Uzbek",
+        "vi" | "vie" => "Vietnamese",
+        "cy" | "wel" | "cym" => "Welsh",
+        "xh" | "xho" => "Xhosa",
+        "yi" | "yid" => "Yiddish",
+        "zu" | "zul" => "Zulu",
+        "und" | "mis" | "zxx" | "mul" => "",
+        _ => return code.trim().to_ascii_uppercase(),
+    }
+    .to_owned()
+}
+
+/// How an audio codec is usually written; nothing for a subtitle's.
+fn codec_name(codec: &str) -> Option<String> {
+    let name = match codec.to_ascii_lowercase().as_str() {
+        "aac" => "AAC",
+        "ac3" => "AC3",
+        "eac3" => "E-AC3",
+        "dts" => "DTS",
+        "truehd" => "TrueHD",
+        "flac" => "FLAC",
+        "opus" => "Opus",
+        "vorbis" => "Vorbis",
+        "mp3" => "MP3",
+        "mp2" => "MP2",
+        "alac" => "ALAC",
+        c if c.starts_with("pcm") => "PCM",
+        _ => return None,
+    };
+    Some(name.to_owned())
+}
+
+/// "Stereo", "5.1": a layout by its usual name, nothing when unknown.
+fn channel_name(channels: u16) -> Option<String> {
+    Some(match channels {
+        0 => return None,
+        1 => "Mono".to_owned(),
+        2 => "Stereo".to_owned(),
+        6 => "5.1".to_owned(),
+        8 => "7.1".to_owned(),
+        n => format!("{n} ch"),
+    })
 }
 
 /// How the player moves from the subtitle it shows to another.
@@ -2285,16 +2805,26 @@ pub fn styled_subtitle_url(track: &Track) -> Option<String> {
         .map(|base| format!("{base}/stream.ass"))
 }
 
-/// The URL of a generated styled track's script at `tier` and `level`
-/// (spec 028 FR-006): `None` for any other track, and for every track while
-/// Effects is Off, where the plain track draws instead.
-pub fn styled_track_url(track: &Track, tier: Tier, level: EffectsLevel) -> Option<String> {
+/// The URL of a generated styled track's script at `tier`, `level` and the
+/// viewer's subtitle `size` (spec 028 FR-006, FR-022): `None` for any other
+/// track, and for every track while Effects is Off, where the plain track
+/// draws instead. Medium sends no `size`, the server's default.
+pub fn styled_track_url(
+    track: &Track,
+    tier: Tier,
+    level: EffectsLevel,
+    size: SubtitleSize,
+) -> Option<String> {
     if level == EffectsLevel::Off {
         return None;
     }
     let url = track.styled_url.as_deref()?;
+    let sized = match size.percent() {
+        100 => String::new(),
+        p => format!("&size={p}"),
+    };
     Some(format!(
-        "{url}?tier={}&effects={}",
+        "{url}?tier={}&effects={}{sized}",
         tier.label(),
         level.as_str()
     ))
@@ -2413,6 +2943,74 @@ mod tests {
 
     use super::*;
 
+    /// B1160: only hls.js media it could not parse or append counts as
+    /// damage; a stall or a missing codec does not, nor does the network.
+    #[test]
+    fn only_unparseable_hls_media_counts_as_damage() {
+        assert!(Fatal::from_hls("mediaError", "bufferAppendError").is_media());
+        assert!(Fatal::from_hls("mediaError", "fragParsingError").is_media());
+        assert!(!Fatal::from_hls("mediaError", "bufferStalledError").is_media());
+        assert!(!Fatal::from_hls("mediaError", "manifestIncompatibleCodecsError").is_media());
+        assert!(!Fatal::from_hls("networkError", "fragLoadError").is_media());
+    }
+
+    /// 038 FR-405, V1221: a guessed ending gets the pill until its last
+    /// 15 s; detected credits get the card. Disarm check: returning `false`
+    /// fails the first assert.
+    #[test]
+    fn a_guessed_ending_shows_the_pill_until_its_last_seconds() {
+        assert!(up_next_pill(false, 60_000));
+        assert!(up_next_pill(false, UP_NEXT_COUNTDOWN_MS + 1));
+        assert!(!up_next_pill(false, UP_NEXT_COUNTDOWN_MS));
+        assert!(!up_next_pill(true, 60_000));
+    }
+
+    /// 038 FR-403: the Rust engine's give-ups name the same culprit
+    /// hls.js's would; a refused codec or a stall is not called damage.
+    #[test]
+    fn a_rust_engine_media_failure_is_damage_only_when_bytes_would_not_decode() {
+        use FailureKind::{Damaged, Network, Unplayable};
+        for (details, want) in [
+            ("bufferAppendError", Damaged),
+            ("videoDecodeError", Damaged),
+            ("bufferAddCodecError", Unplayable),
+            ("bufferStalledError", Network),
+            ("bufferRemoveError", Network),
+            ("internalException", Network),
+        ] {
+            assert_eq!(FailureKind::of_media_error(details), want, "{details}");
+        }
+    }
+
+    /// 038 FR-403: a codec the browser lacks is the browser's limit, a
+    /// fetch the server refused is the server's, and the rest the network's.
+    #[test]
+    fn a_failure_names_who_can_fix_it() {
+        let kind = |k, d| Fatal::from_hls(k, d).kind;
+        assert_eq!(
+            kind("mediaError", "manifestIncompatibleCodecsError"),
+            FailureKind::Unplayable
+        );
+        assert_eq!(
+            kind("mediaError", "bufferIncompatibleCodecsError"),
+            FailureKind::Unplayable
+        );
+        assert_eq!(kind("networkError", "fragLoadError"), FailureKind::Network);
+        assert_eq!(kind("mediaError", "fragParsingError"), FailureKind::Damaged);
+        assert_eq!(FailureKind::of_status(404), FailureKind::Server);
+        assert_eq!(FailureKind::of_status(503), FailureKind::Server);
+        assert_eq!(FailureKind::of_status(0), FailureKind::Network);
+        let labels = [
+            FailureKind::Network,
+            FailureKind::Server,
+            FailureKind::Unplayable,
+            FailureKind::Damaged,
+        ]
+        .map(FailureKind::label);
+        let distinct: std::collections::HashSet<_> = labels.iter().collect();
+        assert_eq!(distinct.len(), labels.len());
+    }
+
     /// B600: a styled renderer that fails says so with its reason, in the
     /// same shape as one that gets ready.
     #[test]
@@ -2513,6 +3111,10 @@ mod tests {
         let scales = SubtitleSize::ALL.map(SubtitleSize::scale);
         assert_eq!(scales, [0.75, 1.0, 1.25, 1.5]);
         assert_eq!(SubtitleSize::default().scale(), 1.0);
+        assert_eq!(
+            SubtitleSize::ALL.map(SubtitleSize::percent),
+            [75, 100, 125, 150]
+        );
     }
 
     #[test]
@@ -3282,17 +3884,94 @@ mod tests {
     }
 
     #[test]
-    fn tracks_are_named_by_title_then_language_then_position() {
+    fn tracks_are_named_by_language_sound_and_a_title_that_adds_something() {
         let mut t = Track {
             language: "eng".into(),
+            title: "Commentary".into(),
+            codec: "aac".into(),
             ..Track::default()
         };
-        assert_eq!(track_label(&t, 0), "eng");
-        t.title = "Commentary".into();
-        assert_eq!(track_label(&t, 0), "Commentary");
+        assert_eq!(track_label(&t, 0), "English · AAC · Commentary");
         t.is_forced = true;
-        assert_eq!(track_label(&t, 0), "Commentary (forced)");
+        assert_eq!(track_label(&t, 0), "English · AAC · Commentary (forced)");
+        let subtitle = Track {
+            language: "jpn".into(),
+            title: "Signs".into(),
+            codec: "subrip".into(),
+            ..Track::default()
+        };
+        assert_eq!(track_label(&subtitle, 0), "Japanese · Signs");
+        let untagged = Track {
+            title: "Commentary".into(),
+            ..Track::default()
+        };
+        assert_eq!(track_label(&untagged, 0), "Commentary");
         assert_eq!(track_label(&Track::default(), 2), "Track 3");
+    }
+
+    #[test]
+    fn audio_is_named_with_its_layout_and_a_title_only_when_it_adds_something() {
+        assert_eq!(
+            audio_label("eng", "aac", Some(6), "Surround", 0),
+            "English · AAC 5.1"
+        );
+        assert_eq!(
+            audio_label("jpn", "aac", Some(6), "Surround", 0),
+            "Japanese · AAC 5.1"
+        );
+        assert_eq!(
+            audio_label("eng", "aac", Some(6), "Director's commentary", 0),
+            "English · AAC 5.1 · Director's commentary"
+        );
+        assert_eq!(
+            audio_label("eng", "aac", None, "Surround", 0),
+            "English · AAC"
+        );
+        assert_eq!(audio_label("", "", None, "", 0), "Track 1");
+        assert_eq!(audio_label("und", "aac", None, "", 0), "AAC");
+    }
+
+    #[test]
+    fn channel_layouts_are_named_by_their_usual_names() {
+        assert_eq!(channel_name(1).as_deref(), Some("Mono"));
+        assert_eq!(channel_name(2).as_deref(), Some("Stereo"));
+        assert_eq!(channel_name(6).as_deref(), Some("5.1"));
+        assert_eq!(channel_name(8).as_deref(), Some("7.1"));
+        assert_eq!(channel_name(0), None);
+    }
+
+    #[test]
+    fn every_kind_of_language_code_reads_as_its_name() {
+        let named = |language: &str, title: &str, forced: bool, sdh: bool| {
+            let t = Track {
+                language: language.into(),
+                title: title.into(),
+                codec: "subrip".into(),
+                is_forced: forced,
+                is_hearing_impaired: sdh,
+                ..Track::default()
+            };
+            track_label(&t, 0)
+        };
+        assert_eq!(named("gre", "", false, false), "Greek");
+        assert_eq!(named("ell", "", false, false), "Greek");
+        assert_eq!(named("rum", "", false, false), "Romanian");
+        assert_eq!(named("heb", "", false, false), "Hebrew");
+        assert_eq!(named("ind", "", false, false), "Indonesian");
+        assert_eq!(named("tha", "", false, false), "Thai");
+        assert_eq!(named("pt-BR", "", false, false), "Portuguese");
+        assert_eq!(
+            named("por", "Brazilian", false, false),
+            "Portuguese · Brazilian"
+        );
+        assert_eq!(
+            named("chi", "Simplified", false, false),
+            "Chinese · Simplified"
+        );
+        assert_eq!(named("eng", "SDH", false, true), "English · SDH");
+        assert_eq!(named("eng", "Forced", true, false), "English · Forced");
+        assert_eq!(named("eng", "", true, false), "English (forced)");
+        assert_eq!(named("qaa", "", false, false), "QAA");
     }
 
     #[test]
@@ -3348,15 +4027,43 @@ mod tests {
             ..Track::default()
         };
         assert_eq!(
-            styled_track_url(&styled, Tier::Tv, EffectsLevel::Subtle).as_deref(),
+            styled_track_url(
+                &styled,
+                Tier::Tv,
+                EffectsLevel::Subtle,
+                SubtitleSize::Medium
+            )
+            .as_deref(),
             Some("/videos/7/subtitles/3/stream.ass?tier=tv&effects=subtle")
         );
         assert_eq!(
-            styled_track_url(&styled, Tier::Desktop, EffectsLevel::Full).as_deref(),
+            styled_track_url(
+                &styled,
+                Tier::Desktop,
+                EffectsLevel::Full,
+                SubtitleSize::Medium
+            )
+            .as_deref(),
             Some("/videos/7/subtitles/3/stream.ass?tier=desktop&effects=full")
         );
+        // B852: the size choice reaches the styled track.
         assert_eq!(
-            styled_track_url(&styled, Tier::Low, EffectsLevel::Off),
+            styled_track_url(
+                &styled,
+                Tier::Tv,
+                EffectsLevel::Subtle,
+                SubtitleSize::ExtraLarge
+            )
+            .as_deref(),
+            Some("/videos/7/subtitles/3/stream.ass?tier=tv&effects=subtle&size=150")
+        );
+        assert_eq!(
+            styled_track_url(&styled, Tier::Tv, EffectsLevel::Subtle, SubtitleSize::Small)
+                .as_deref(),
+            Some("/videos/7/subtitles/3/stream.ass?tier=tv&effects=subtle&size=75")
+        );
+        assert_eq!(
+            styled_track_url(&styled, Tier::Low, EffectsLevel::Off, SubtitleSize::Large),
             None
         );
         let source = Track {
@@ -3364,7 +4071,7 @@ mod tests {
             ..styled
         };
         assert_eq!(
-            styled_track_url(&source, Tier::Tv, EffectsLevel::Full),
+            styled_track_url(&source, Tier::Tv, EffectsLevel::Full, SubtitleSize::Large),
             None
         );
     }
@@ -4134,6 +4841,46 @@ mod tests {
         assert_eq!(clock.on(1.0, MediaEvent::Ended), None);
     }
 
+    /// B809: a page that goes hidden reports where it is, as a report and
+    /// with the pause state, and keeps reporting afterwards.
+    #[test]
+    fn hiding_the_page_reports_without_stopping() {
+        let mut clock = ReportClock::new();
+        clock.on(0.0, MediaEvent::Playing);
+        assert_eq!(
+            clock.on_hidden(3_000.0),
+            Some(Outgoing::Report { paused: false })
+        );
+        // The interval restarts from the hidden report.
+        assert_eq!(clock.on(12_999.0, MediaEvent::TimeUpdate), None);
+        assert_eq!(
+            clock.on(13_000.0, MediaEvent::TimeUpdate),
+            Some(Outgoing::Report { paused: false })
+        );
+        clock.on(14_000.0, MediaEvent::Pause);
+        assert_eq!(
+            clock.on_hidden(15_000.0),
+            Some(Outgoing::Report { paused: true })
+        );
+        assert!(clock.stop(), "the stop is still owed");
+    }
+
+    #[test]
+    fn a_stopped_clock_does_not_report_on_hide_until_the_page_is_restored() {
+        let mut clock = ReportClock::new();
+        clock.on(0.0, MediaEvent::Playing);
+        assert!(clock.stop());
+        assert_eq!(clock.on_hidden(1.0), None);
+        assert_eq!(clock.on(2.0, MediaEvent::TimeUpdate), None);
+        assert!(clock.restore(), "a stop had been sent");
+        assert_eq!(
+            clock.on(3.0, MediaEvent::TimeUpdate),
+            Some(Outgoing::Report { paused: false }),
+            "reporting resumes at once"
+        );
+        assert!(!clock.restore(), "nothing to restore on a live clock");
+    }
+
     #[test]
     fn fatal_errors_recover_a_few_times_then_fail() {
         let mut budget = RecoveryBudget::new();
@@ -4153,6 +4900,144 @@ mod tests {
             Recovery::RecoverMedia,
             "each kind has its own budget"
         );
+    }
+
+    // V638/V1062: one fault costs one rebuild, and only playback well past
+    // the rebuild point refills the budget, so a segment that never decodes
+    // gives up after MAX_RECOVERIES instead of rebuilding forever.
+    #[test]
+    fn a_media_error_rebuilds_once_per_mediasource_and_refills_only_on_playback() {
+        let mut r = MediaRecovery::new();
+        assert_eq!(
+            r.on_error(0, "bufferAppendError", 60_000, 1_000),
+            MediaVerdict::Rebuild { attempt: 1 }
+        );
+        assert_eq!(
+            r.on_error(0, "videoError", 60_000, 1_010),
+            MediaVerdict::Stale,
+            "the same fault's second error"
+        );
+        assert_eq!(r.epoch(), 1);
+        assert_eq!(r.on_play_head(60_000, 1_500), None, "not moving yet");
+        assert_eq!(
+            r.on_play_head(60_250, 2_000),
+            None,
+            "moving again is not recovered: the bad segment may still be ahead"
+        );
+
+        // The same segment fails again before playback gets past it.
+        for attempt in 2..=MAX_RECOVERIES {
+            let epoch = r.epoch();
+            assert_eq!(
+                r.on_error(epoch, "bufferAppendError", 60_500, 3_000),
+                MediaVerdict::Rebuild { attempt }
+            );
+        }
+        let epoch = r.epoch();
+        assert_eq!(
+            r.on_error(epoch, "bufferAppendError", 60_500, 4_000),
+            MediaVerdict::Fail {
+                attempt: MAX_RECOVERIES
+            }
+        );
+    }
+
+    #[test]
+    fn playback_well_past_a_rebuild_refills_the_media_budget() {
+        let mut r = MediaRecovery::new();
+        for _ in 0..MAX_RECOVERIES {
+            let epoch = r.epoch();
+            r.on_error(epoch, "bufferStalledError", 30_000, 0);
+        }
+        assert_eq!(r.on_play_head(30_000 + MEDIA_REFILL_MS - 1, 100), None);
+        let epoch = r.epoch();
+        assert!(matches!(
+            r.on_error(epoch, "bufferStalledError", 30_000, 200),
+            MediaVerdict::Fail { .. }
+        ));
+        let mut r = MediaRecovery::new();
+        for _ in 0..MAX_RECOVERIES {
+            let epoch = r.epoch();
+            r.on_error(epoch, "bufferStalledError", 30_000, 0);
+        }
+        assert_eq!(
+            r.on_play_head(30_000 + MEDIA_REFILL_MS, 100),
+            Some(MediaResumed {
+                attempt: MAX_RECOVERIES,
+                at_ms: 30_000 + MEDIA_REFILL_MS,
+                took_ms: 100,
+            }),
+            "the recovery is reported where the budget refills"
+        );
+        assert_eq!(
+            r.on_play_head(30_000 + MEDIA_REFILL_MS + 500, 600),
+            None,
+            "once"
+        );
+        let epoch = r.epoch();
+        assert_eq!(
+            r.on_error(epoch, "bufferStalledError", 45_000, 200),
+            MediaVerdict::Rebuild { attempt: 1 }
+        );
+    }
+
+    // V640: the rebuild, the give-up and the resume each log and report
+    // the same fields, with the attempt and the play head.
+    #[test]
+    fn media_recovery_is_logged_and_reported_on_both_sides() {
+        let rebuild = MediaRecoveryReport::Error {
+            details: "bufferAppendError".to_owned(),
+            message: "video SourceBuffer error".to_owned(),
+            verdict: MediaVerdict::Rebuild { attempt: 1 },
+            at_ms: 42_000,
+        };
+        assert_eq!(
+            rebuild.line("/m.m3u8"),
+            "pharos: playback error engine=rust type=mediaError details=bufferAppendError message=video SourceBuffer error fatal=true action=recover_media attempt=1 at_ms=42000 url=/m.m3u8"
+        );
+        let e = rebuild.event("/ui/watch/1".to_owned());
+        assert_eq!(e.kind, ClientEventKind::PlaybackError);
+        assert_eq!(e.level, ClientLevel::Error);
+        let keys: Vec<_> = e.fields.iter().map(|(k, _)| *k).collect();
+        assert_eq!(
+            keys,
+            ["engine", "type", "details", "message", "action", "attempt", "at_ms"]
+        );
+        let fail = MediaRecoveryReport::Error {
+            details: "bufferAppendError".to_owned(),
+            message: "video SourceBuffer error".to_owned(),
+            verdict: MediaVerdict::Fail { attempt: 3 },
+            at_ms: 42_000,
+        };
+        assert!(fail.line("u").contains("action=fail attempt=3 at_ms=42000"));
+        let resumed = MediaRecoveryReport::Resumed(MediaResumed {
+            attempt: 1,
+            at_ms: 42_300,
+            took_ms: 1_800,
+        });
+        assert_eq!(
+            resumed.line("u"),
+            "pharos: playback recovered engine=rust type=mediaError action=recover_media attempt=1 at_ms=42300 took_ms=1800 url=u"
+        );
+        let e = resumed.event(String::new());
+        assert_eq!(e.level, ClientLevel::Info);
+        assert!(e.fields.contains(&("action", "recover_media".to_owned())));
+    }
+
+    #[test]
+    fn a_refused_codec_fails_without_a_rebuild() {
+        let mut r = MediaRecovery::new();
+        assert_eq!(
+            r.on_error(0, "bufferAddCodecError", 0, 0),
+            MediaVerdict::Fail { attempt: 0 }
+        );
+        assert_eq!(r.epoch(), 0);
+        assert_eq!(
+            MediaVerdict::Rebuild { attempt: 1 }.label(),
+            "recover_media"
+        );
+        assert_eq!(MediaVerdict::Fail { attempt: 1 }.label(), "fail");
+        assert_ne!(MediaVerdict::Stale.label(), "fail");
     }
 
     #[test]

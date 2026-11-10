@@ -32,6 +32,15 @@ async fn start_with(revalidate_secs: NonZeroU32) -> (actix_test::TestServer, Fix
     serve(seed_rich().await, revalidate_secs)
 }
 
+/// A server holding `memo` as the integrity check's verdicts.
+pub(crate) async fn start_with_integrity_memo(
+    memo: pharos_server::integrity_memo::IntegrityMemo,
+) -> (actix_test::TestServer, Fixture) {
+    let memo = std::sync::Arc::new(memo);
+    let fx = crate::common::seed_rich_with(|s| s.with_integrity_memo(memo)).await;
+    serve(fx, NonZeroU32::MIN)
+}
+
 /// A server that enforces `VideoRangeType` conditions (T065).
 pub(crate) async fn start_enforcing_video_range() -> (actix_test::TestServer, Fixture) {
     let fx = crate::common::seed_rich_with(|s| s.with_enforce_video_range(true)).await;
@@ -51,6 +60,11 @@ pub(crate) async fn start_drawing_images(
             1,
         ));
     let fx = crate::common::seed_rich_with(|s| s.with_subtitle_cache(cache)).await;
+    serve(fx, NonZeroU32::MIN)
+}
+
+/// A server over an already-configured `fx`.
+pub(crate) fn serve_fixture(fx: Fixture) -> (actix_test::TestServer, Fixture) {
     serve(fx, NonZeroU32::MIN)
 }
 

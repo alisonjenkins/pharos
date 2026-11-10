@@ -16,6 +16,7 @@ use pharos_core::{
 
 fn book(id: MediaId, title: &str, book: Option<BookMeta>) -> MediaItem {
     MediaItem {
+        locked: Default::default(),
         id,
         path: format!("/media/books/{id}.epub").into(),
         title: title.into(),
@@ -84,7 +85,7 @@ async fn run<S: MediaStore>(store: S) {
     //    columns were bound from anything other than the one Option, a movie
     //    would come back carrying a default BookMeta (format Epub!) instead of
     //    None.
-    let movie = book(BASE + 2, "Alien", None);
+    let movie = book(BASE + 2, "Film AX", None);
     store.put(movie).await.unwrap();
     let got = store.get(BASE + 2).await.unwrap();
     assert_eq!(got.book, None, "a non-book item must carry no BookMeta");

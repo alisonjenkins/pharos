@@ -20,6 +20,7 @@ actix-router = { version = "0.5", default-features = false, features = ["http", 
 actix-rt = { version = "2" }
 aho-corasick = { version = "1", default-features = false, features = ["perf-literal", "std"] }
 base64 = { version = "0.22" }
+brotli-decompressor = { version = "5" }
 bytemuck = { version = "1", default-features = false, features = ["derive", "extern_crate_alloc", "min_const_generics"] }
 byteorder = { version = "1" }
 bytes = { version = "1" }
@@ -46,15 +47,17 @@ futures-util = { version = "0.3", features = ["channel", "io", "sink"] }
 getrandom-468e82937335b1c9 = { package = "getrandom", version = "0.3", default-features = false, features = ["std"] }
 hashbrown-9067fe90e8c1f593 = { package = "hashbrown", version = "0.17" }
 hashbrown-986da7b5efc2b80e = { package = "hashbrown", version = "0.16" }
+image = { version = "0.25", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
 indexmap = { version = "2" }
 itertools = { version = "0.13" }
 libsqlite3-sys = { version = "0.30", default-features = false, features = ["bundled", "pkg-config", "unlock_notify", "vcpkg"] }
 log = { version = "0.4", default-features = false, features = ["std"] }
-lzma-rust2 = { version = "0.23", default-features = false, features = ["encoder", "optimization", "std"] }
+lzma-rust2 = { version = "0.25", default-features = false, features = ["encoder", "optimization", "std"] }
 md-5 = { version = "0.11" }
 memchr = { version = "2" }
 metrics-util = { version = "0.20" }
 mio = { version = "1", features = ["net", "os-ext"] }
+moxcms = { version = "0.8", features = ["in_place"] }
 num-traits = { version = "0.2", features = ["i128"] }
 once_cell = { version = "1" }
 percent-encoding = { version = "2" }
@@ -68,7 +71,7 @@ regex-syntax = { version = "0.8" }
 serde = { version = "1", features = ["alloc", "derive", "rc"] }
 serde_core = { version = "1", default-features = false, features = ["alloc", "rc", "result", "std"] }
 serde_json = { version = "1", features = ["raw_value"] }
-sevenz-rust2 = { version = "0.24", default-features = false, features = ["compress", "util"] }
+sevenz-rust2 = { version = "0.25", default-features = false, features = ["compress", "util"] }
 sha1_smol = { version = "1", default-features = false, features = ["std"] }
 sha2-93f6ce9d446188ac = { package = "sha2", version = "0.10" }
 sha2-a6292c17cd707f01 = { package = "sha2", version = "0.11" }
@@ -81,6 +84,7 @@ sqlx = { version = "0.9", default-features = false, features = ["macros", "migra
 sqlx-core = { version = "0.9", features = ["_rt-tokio", "_tls-rustls-ring-webpki", "any", "json", "migrate", "offline"] }
 sqlx-sqlite = { version = "0.9", default-features = false, features = ["bundled", "deserialize", "load-extension", "migrate", "offline", "unlock-notify"] }
 stable_deref_trait = { version = "1" }
+subtle = { version = "2" }
 thiserror = { version = "2" }
 time = { version = "0.3", default-features = false, features = ["formatting", "macros", "parsing"] }
 tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "parking_lot", "process", "rt-multi-thread", "signal", "test-util"] }
@@ -92,8 +96,10 @@ unicode-bidi = { version = "0.3" }
 yoke = { version = "0.8", features = ["derive"] }
 zerocopy = { version = "0.8", default-features = false, features = ["derive", "simd"] }
 zerofrom = { version = "0.1", default-features = false, features = ["alloc", "derive"] }
+zeroize = { version = "1", features = ["derive"] }
 zip = { version = "9", default-features = false, features = ["deflate"] }
 zlib-rs = { version = "0.6", default-features = false, features = ["std"] }
+zune-jpeg = { version = "0.5" }
 
 [build-dependencies]
 actix-router = { version = "0.5", default-features = false, features = ["http", "unicode"] }
@@ -145,6 +151,7 @@ sqlx-macros = { version = "0.9", features = ["_rt-tokio", "_tls-rustls-ring-webp
 sqlx-macros-core = { version = "0.9", features = ["_rt-tokio", "_tls-rustls-ring-webpki", "derive", "macros", "migrate", "postgres", "sqlite", "sqlite-load-extension"] }
 sqlx-sqlite = { version = "0.9", default-features = false, features = ["bundled", "deserialize", "load-extension", "migrate", "offline", "unlock-notify"] }
 stable_deref_trait = { version = "1" }
+subtle = { version = "2" }
 syn-7b89eefb6aaa9bf3 = { package = "syn", version = "3", features = ["extra-traits", "full", "visit", "visit-mut"] }
 syn-f595c2ba2a3f28df = { package = "syn", version = "2", features = ["extra-traits", "fold", "full", "visit", "visit-mut"] }
 thiserror = { version = "2" }
@@ -155,6 +162,7 @@ typenum = { version = "1", default-features = false, features = ["const-generics
 unicode-bidi = { version = "0.3" }
 yoke = { version = "0.8", features = ["derive"] }
 zerofrom = { version = "0.1", default-features = false, features = ["alloc", "derive"] }
+zeroize = { version = "1", features = ["derive"] }
 
 [target.x86_64-unknown-linux-gnu.dependencies]
 bitflags = { version = "2", default-features = false, features = ["std"] }
@@ -166,6 +174,8 @@ linux-raw-sys = { version = "0.12", default-features = false, features = ["auxve
 rustix = { version = "1", features = ["fs", "param", "process", "system", "thread"] }
 simdutf8 = { version = "0.1", features = ["aarch64_neon", "public_imp"] }
 sync_wrapper = { version = "1", default-features = false, features = ["futures"] }
+tikv-jemalloc-sys = { version = "0.7", features = ["background_threads", "stats", "unprefixed_malloc_on_supported_platforms"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 tower = { version = "0.5", default-features = false, features = ["balance", "buffer", "limit", "load-shed", "retry", "timeout"] }
 
 [target.x86_64-unknown-linux-gnu.build-dependencies]
@@ -184,6 +194,8 @@ linux-raw-sys = { version = "0.12", default-features = false, features = ["auxve
 rustix = { version = "1", features = ["fs", "param", "process", "system", "thread"] }
 simdutf8 = { version = "0.1", features = ["aarch64_neon", "public_imp"] }
 sync_wrapper = { version = "1", default-features = false, features = ["futures"] }
+tikv-jemalloc-sys = { version = "0.7", features = ["background_threads", "stats", "unprefixed_malloc_on_supported_platforms"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 tower = { version = "0.5", default-features = false, features = ["balance", "buffer", "limit", "load-shed", "retry", "timeout"] }
 
 [target.aarch64-unknown-linux-gnu.build-dependencies]
@@ -201,6 +213,7 @@ hyper = { version = "1", features = ["client", "http1", "http2"] }
 libc = { version = "0.2", features = ["extra_traits"] }
 simdutf8 = { version = "0.1", features = ["aarch64_neon", "public_imp"] }
 sync_wrapper = { version = "1", default-features = false, features = ["futures"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 tower = { version = "0.5", default-features = false, features = ["balance", "buffer", "limit", "load-shed", "retry", "timeout"] }
 
 [target.aarch64-apple-darwin.build-dependencies]
@@ -219,6 +232,7 @@ hyper = { version = "1", features = ["client", "http1", "http2"] }
 libc = { version = "0.2", features = ["extra_traits"] }
 simdutf8 = { version = "0.1", features = ["aarch64_neon", "public_imp"] }
 sync_wrapper = { version = "1", default-features = false, features = ["futures"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 tower = { version = "0.5", default-features = false, features = ["balance", "buffer", "limit", "load-shed", "retry", "timeout"] }
 
 [target.x86_64-apple-darwin.build-dependencies]

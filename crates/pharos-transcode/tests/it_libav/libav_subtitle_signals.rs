@@ -170,3 +170,202 @@ async fn the_pool_carries_the_op_through_a_worker() {
     assert!(s.lines[0].loudness_lufs.unwrap() - s.lines[1].loudness_lufs.unwrap() >= 15.0);
     assert!(near(&s.cuts_ms, 5300, 50));
 }
+
+fn counter(
+    snap: &pharos_test_metrics::CumulativeSnapshotter,
+    name: &str,
+    labels: &[(&str, &str)],
+) -> u64 {
+    use metrics_util::debugging::DebugValue;
+    snap.snapshot()
+        .into_vec()
+        .iter()
+        .filter(|(k, ..)| {
+            k.key().name() == name
+                && labels
+                    .iter()
+                    .all(|(lk, lv)| k.key().labels().any(|l| l.key() == *lk && l.value() == *lv))
+        })
+        .map(|(.., v)| match v {
+            DebugValue::Counter(c) => *c,
+            _ => 0,
+        })
+        .sum()
+}
+
+/// B914/V875: a track with more lines than one frame holds (79k on a
+/// long episode) is analysed in chunks, each line keeps its own
+/// signals, and the worker survives.
+#[tokio::test]
+async fn a_track_too_long_for_one_frame_is_analysed_in_chunks() {
+    if !ffmpeg_available() {
+        eprintln!("skipping: ffmpeg not on PATH");
+        return;
+    }
+    let recorder = metrics_util::debugging::DebuggingRecorder::new();
+    let snap = pharos_test_metrics::snapshotter(&recorder);
+    let _guard = metrics::set_default_local_recorder(&recorder);
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("fixture.mkv");
+    fixture(&input);
+    let bin = PathBuf::from(env!("CARGO_BIN_EXE_transcode-worker"));
+    let pool = LibavWorkerPool::new(bin, 1).with_op_timeout(Duration::from_secs(120));
+
+    let alone = pool
+        .subtitle_signals(input.clone(), None, LINES.to_vec())
+        .await
+        .expect("two lines");
+    // 70k distinct spans (more than one frame holds even deduplicated), each
+    // twice, after the two reference lines.
+    let distinct: Vec<(u64, u64)> = (0..70_000u64)
+        .map(|i| {
+            let start = i % 10_000;
+            (start, start + 100 + (i / 10_000) * 500)
+        })
+        .collect();
+    let mut windows = LINES.to_vec();
+    windows.extend(&distinct);
+    windows.extend(&distinct);
+    assert!(distinct.len() * 16 > pharos_transcode::protocol::MAX_FRAME as usize);
+
+    let s = pool
+        .subtitle_signals(input, None, windows.clone())
+        .await
+        .expect("long track");
+    assert_eq!(s.lines.len(), windows.len());
+    assert_eq!(&s.lines[..2], &alone.lines[..]);
+    assert_eq!(s.lines[2], s.lines[2 + distinct.len()]);
+    assert_eq!(s.bottom_text.len(), windows.len());
+    assert_eq!(&s.bottom_text[..2], &alone.bottom_text[..]);
+    assert_eq!(s.bottom_text[2], s.bottom_text[2 + distinct.len()]);
+    assert_eq!(s.cuts_ms, alone.cuts_ms);
+    assert_eq!(pool.idle_workers().await, 1);
+    assert_eq!(
+        counter(
+            &snap,
+            "pharos_libav_worker_lifecycle_total",
+            &[("reason", "broken")]
+        ),
+        0
+    );
+    assert_eq!(counter(&snap, "pharos_libav_frame_too_large_total", &[]), 0);
+}
+
+/// B914: a request that cannot fit in a frame fails the op, is counted with
+/// its op, and leaves the worker idle for the next op instead of killing it.
+#[tokio::test]
+async fn an_oversized_request_fails_the_op_and_keeps_the_worker() {
+    if !ffmpeg_available() {
+        eprintln!("skipping: ffmpeg not on PATH");
+        return;
+    }
+    let recorder = metrics_util::debugging::DebuggingRecorder::new();
+    let snap = pharos_test_metrics::snapshotter(&recorder);
+    let _guard = metrics::set_default_local_recorder(&recorder);
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("fixture.mkv");
+    fixture(&input);
+    let bin = PathBuf::from(env!("CARGO_BIN_EXE_transcode-worker"));
+    let pool = LibavWorkerPool::new(bin, 1).with_op_timeout(Duration::from_secs(60));
+    pool.subtitle_signals(input.clone(), None, LINES.to_vec())
+        .await
+        .expect("warm the worker");
+
+    let huge: Vec<(u64, u64)> = (0..100_000u64).map(|i| (i, i + 1)).collect();
+    let err = pool
+        .fingerprint_multi(input.clone(), huge)
+        .await
+        .expect_err("oversized request");
+    assert!(err.to_string().contains("frame too large"), "{err}");
+    assert_eq!(pool.idle_workers().await, 1, "worker was discarded");
+    assert_eq!(
+        counter(
+            &snap,
+            "pharos_libav_frame_too_large_total",
+            &[("direction", "request"), ("op", "fingerprint_multi")]
+        ),
+        1
+    );
+
+    pool.subtitle_signals(input, None, LINES.to_vec())
+        .await
+        .expect("same worker serves the next op");
+    assert_eq!(
+        counter(
+            &snap,
+            "pharos_libav_worker_lifecycle_total",
+            &[("event", "spawned")]
+        ),
+        1
+    );
+    assert_eq!(
+        counter(
+            &snap,
+            "pharos_libav_worker_lifecycle_total",
+            &[("reason", "broken")]
+        ),
+        0
+    );
+}
+
+/// Grey video with a "caption" (white strokes on black, 20 rows of 360) at the
+/// bottom from 6 s on, keyframes every 2 s.
+fn captioned_fixture(path: &Path) {
+    let picture = "color=c=gray:s=640x360:r=24:d=12,format=gray,\
+        geq=lum='if(gte(T,6)*between(Y,300,319)*between(X,160,479),if(lt(mod(X,6),2),235,20),110)'";
+    let status = Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            picture,
+            "-f",
+            "lavfi",
+            "-i",
+            "anullsrc=r=48000:cl=stereo:d=12",
+            "-c:v",
+            "mpeg4",
+            "-q:v",
+            "2",
+            "-g",
+            "48",
+            "-sc_threshold",
+            "0",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "flac",
+        ])
+        .arg(path)
+        .status()
+        .expect("spawn ffmpeg fixture");
+    assert!(status.success(), "fixture generation failed");
+}
+
+#[test]
+fn text_burned_into_the_bottom_is_found_per_line() {
+    if !ffmpeg_available() {
+        eprintln!("skipping: ffmpeg not on PATH");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("captioned.mkv");
+    captioned_fixture(&input);
+
+    let lines = [(1000, 3000), (7000, 9000), (60_000, 61_000)];
+    let s = subtitle_signals(&input, None, &lines).unwrap();
+
+    assert_eq!(s.bottom_text.len(), 3);
+    assert_eq!(s.bottom_text[0], Some(0.0), "clean picture under line 1");
+    let share = s.bottom_text[1].expect("the keyframe at 8 s was checked");
+    assert!(
+        (0.045..=0.075).contains(&share),
+        "a 20-row caption in 360 rows: {share}"
+    );
+    // Past the last keyframe's reach: nothing speaks for it.
+    assert_eq!(s.bottom_text[2], None);
+}

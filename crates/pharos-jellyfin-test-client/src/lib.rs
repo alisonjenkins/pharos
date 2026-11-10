@@ -59,12 +59,35 @@ pub struct JellyfinClient {
     token: Option<String>,
 }
 
+/// The test client only speaks plain HTTP to a local server, but reqwest 0.13
+/// with `rustls-no-provider` (the workspace setting) panics at build time
+/// without a crypto provider. Hand it a ring config with no roots: no TLS
+/// handshake can succeed, and none is ever attempted.
+fn http_client() -> Client {
+    let tls = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .map(|b| {
+        b.with_root_certificates(rustls::RootCertStore::empty())
+            .with_no_client_auth()
+    });
+    let builder = match tls {
+        Ok(tls) => Client::builder().tls_backend_preconfigured(tls),
+        Err(_) => {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+            Client::builder()
+        }
+    };
+    builder.build().unwrap_or_default()
+}
+
 impl JellyfinClient {
     pub fn new(base: impl Into<String>, device: DeviceInfo) -> Self {
         Self {
             base: base.into(),
             device,
-            http: Client::new(),
+            http: http_client(),
             token: None,
         }
     }

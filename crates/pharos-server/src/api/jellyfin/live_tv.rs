@@ -7,7 +7,10 @@
 //! `stream_url`'s bytes; transcode-on-tune is its own follow-up.
 
 use crate::api::jellyfin::ci_query::CiQuery;
-use crate::{api::jellyfin::auth_extractor::AuthUser, state::AppState};
+use crate::{
+    api::jellyfin::auth_extractor::{AuthUser, MediaUser},
+    state::AppState,
+};
 use actix_web::{http::header, web, HttpResponse, Responder};
 use pharos_core::TunerBackend;
 use pharos_discovery::live_tv::M3uXmltvBackend;
@@ -281,7 +284,7 @@ fn upstream_client() -> Result<&'static reqwest::Client, reqwest::Error> {
     if let Some(client) = CLIENT.get() {
         return Ok(client);
     }
-    let client = reqwest::Client::builder()
+    let client = crate::http_client::builder()
         .connect_timeout(UPSTREAM_CONNECT_TIMEOUT)
         .read_timeout(UPSTREAM_READ_TIMEOUT)
         .build()?;
@@ -321,9 +324,12 @@ fn stream_refused(outcome: StreamOutcome, response: HttpResponse) -> HttpRespons
 /// against pharos or name the provider directly.
 async fn stream(
     state: web::Data<AppState>,
-    user: AuthUser,
+    MediaUser(user): MediaUser,
     path: web::Path<String>,
 ) -> impl Responder {
+    // A `<video>` element's fetch: the sign-in cookie authenticates it, so
+    // the URL need not carry the token (B1150, V191).
+    let user = AuthUser(user);
     let Some(backend) = backend_for(&state, &user, "stream") else {
         tracing::info!(user = %user.0.name, "live tv stream asked for with no live tv to serve");
         return stream_refused(
@@ -427,8 +433,15 @@ async fn stream(
     let body = futures_util::StreamExt::chain(futures_util::stream::iter(first.map(Ok)), rest);
     HttpResponse::Ok()
         .insert_header((header::CONTENT_TYPE, content_type))
+        .insert_header((header::CONTENT_SECURITY_POLICY, RELAY_CSP))
+        .insert_header((header::X_CONTENT_TYPE_OPTIONS, "nosniff"))
         .streaming(body)
 }
+
+/// The provider chooses the relayed content type. Opened as a page on
+/// pharos's origin (the sign-in cookie authenticates a navigation too), an
+/// HTML or SVG body runs no script and reaches nothing (B1150, as B255).
+const RELAY_CSP: &str = "default-src 'none'; sandbox";
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]

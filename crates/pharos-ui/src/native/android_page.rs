@@ -6,7 +6,8 @@
 //! the host does.
 //!
 //! How it reaches the page (spec 025, "How the Android UI reads the DOM"):
-//! one long-lived script (`BRIDGE_JS`) sends keys, Back (`popstate`) and the
+//! one long-lived script (`BRIDGE_JS`) sends keys, Back (`popstate`, which
+//! an `on_back` guard may take before any route hears it) and the
 //! viewport into Rust, which keeps them in thread-locals read
 //! synchronously; reads made on a key press run as one batched
 //! `document::eval`; calls with no answer are a spawned eval. The page's
@@ -276,6 +277,15 @@ pub fn on_pop_state(on_path: impl FnMut(String) + 'static) -> PopState {
     PopState(listen(Listener::Pop(Box::new(on_path))))
 }
 
+/// A Back guard, removed on drop.
+pub struct BackWatch(u64);
+
+impl Drop for BackWatch {
+    fn drop(&mut self) {
+        unlisten(self.0);
+    }
+}
+
 /// A listener for the remote's Back at the first page, removed on drop.
 pub struct BackAtRoot(u64);
 
@@ -283,6 +293,14 @@ impl Drop for BackAtRoot {
     fn drop(&mut self) {
         unlisten(self.0);
     }
+}
+
+/// Ask `on_back` first when the remote's Back arrives: answering `true`
+/// takes it, so the page stays where it is and no `popstate` listener hears
+/// it. The player's remote scrub uses this to drop its preview in place
+/// (B907) instead of leaving the player.
+pub fn on_back(on_back: impl FnMut() -> bool + 'static) -> BackWatch {
+    BackWatch(listen(Listener::Back(Box::new(on_back))))
 }
 
 /// Call `on_back` when the remote's Back is pressed at the first page. It
@@ -434,6 +452,10 @@ fn on_media(id: &str, body: &str) {
         "const v = document.getElementById({}); if (v) {{ {body} }}",
         js_str(id)
     ));
+}
+
+pub fn autoplay_blocked() -> bool {
+    false
 }
 
 #[allow(clippy::cast_precision_loss)]
@@ -620,11 +642,13 @@ pub async fn copy_text(_text: &str) -> bool {
     false
 }
 
-pub fn enter_page_fullscreen() {}
-
 pub fn exit_page_fullscreen() {}
 
-pub fn pip_active() -> bool {
+pub fn leave_fullscreen_on_escape() -> bool {
+    false
+}
+
+pub fn escape_claimed() -> bool {
     false
 }
 
@@ -633,6 +657,21 @@ pub fn pip_supported() -> bool {
 }
 
 pub fn toggle_pip(_id: &str) {}
+
+/// No WebXR here (spec 022 US3).
+pub async fn vr_supported() -> bool {
+    false
+}
+
+pub fn enter_vr(
+    _id: &str,
+    _packing: pharos_client::api::Stereo,
+    _screen: (f64, f64),
+    _on_select: std::rc::Rc<dyn Fn()>,
+) {
+}
+
+pub fn exit_vr() {}
 
 pub fn select_field(_id: &str) {}
 
@@ -1330,7 +1369,9 @@ pub fn info(message: &str) {
 /// No server to submit to on the host: client events are dropped.
 pub fn install_telemetry(_api: &NativeApi) {}
 
-pub fn report_event(_event: ClientEvent) {}
+pub fn report_event(event: ClientEvent) {
+    super::report::record_event(&event);
+}
 
 /// The host sends no client events, so diagnostics are never opted in.
 pub fn opted_in() -> bool {
@@ -1563,6 +1604,8 @@ enum Listener {
     Mode(Box<dyn FnMut(&str) -> bool>),
     Escape(Box<dyn FnMut()>),
     Pop(Box<dyn FnMut(String)>),
+    /// Asked first on Back; `true` keeps the page where it is.
+    Back(Box<dyn FnMut() -> bool>),
     /// The remote's Back at the first page; true when it used the press.
     Root(Box<dyn FnMut() -> bool>),
     /// hls.js events for the player on one media element.
@@ -1622,6 +1665,16 @@ const inText = (t) => !!t && (t.isContentEditable || /^(INPUT|TEXTAREA)$/.test(t
 // Space too: the player's mode key toggles play, and the WebView would
 // click the focused button as well (it cannot wait for Rust's answer).
 const takes = new Set(["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", " "]);
+// OK that commits a remote scrub (B907) must not also click the focused
+// button, on its first press or while it is held.
+// A left or right in the player starts or moves a scrub before its class
+// has rendered, so a press inside the settle window (900 ms) counts too.
+// The keys the player binds to a 10 s seek (keymap.rs), each of which
+// starts a scrub.
+const seekKeys = new Set(["ArrowLeft", "ArrowRight", "h", "l"]);
+let okCommits = false;
+let lastSeekKey = -1e9;
+addEventListener("keyup", (e) => { if (e.key === "Enter") okCommits = false; });
 const players = '#pharos-player, .pharos-listen';
 // A remote has no Space: OK with the focus on the player itself (or on
 // nothing) and the media keys play and pause, as Space does. Swapped in
@@ -1634,7 +1687,8 @@ addEventListener("keydown", (e) => {
   const onPlayer = !at || at === document.body || at === player;
   const v = player.querySelector("video, audio");
   const paused = !v || v.paused;
-  const toggle = (e.key === "Enter" && onPlayer) || e.key === "MediaPlayPause" ||
+  const scrubbing = !!document.querySelector(".pharos-seek.is-scrubbing");
+  const toggle = (e.key === "Enter" && onPlayer && !scrubbing) || e.key === "MediaPlayPause" ||
     (e.key === "MediaPlay" && paused) || (e.key === "MediaPause" && !paused);
   if (!toggle) return;
   e.preventDefault();
@@ -1705,10 +1759,15 @@ addEventListener("keydown", (e) => {
   if (to) to.focus({ preventScroll: true });
 }, true);
 addEventListener("keydown", (e) => {
-  if (e.repeat) return;
   const text = inText(e.target);
   const prevented = e.defaultPrevented;
+  if (!text && !e.ctrlKey && !e.metaKey && !document.querySelector('.pharos-invite') && seekKeys.has(e.key) && e.target.closest && e.target.closest('#pharos-player')) lastSeekKey = performance.now();
+  if (e.key === "Enter" && !e.repeat) okCommits = !!document.querySelector(".pharos-seek.is-scrubbing") || performance.now() - lastSeekKey < 900;
+  if (e.key === "Enter" && okCommits) e.preventDefault();
+  // A held arrow repeats (the player's scrub speeds up on it): the WebView
+  // must not move the focus on the repeats either. Rust hears the first.
   if (!text && takes.has(e.key)) e.preventDefault();
+  if (e.repeat) return;
   const player = document.querySelector(players);
   const at = document.activeElement;
   send({
@@ -1869,6 +1928,25 @@ fn on_bridge(message: Bridge) {
             }
         }
         Bridge::Pop { path } => {
+            let mut kept = false;
+            for f in &listeners {
+                if let Ok(mut f) = f.try_lock() {
+                    if let Listener::Back(f) = &mut f.0 {
+                        kept |= f();
+                    }
+                }
+            }
+            if kept {
+                // The WebView has already gone back an entry: put the page
+                // that took Back back on top, so the next Back leaves it.
+                let here = current_path();
+                log::info!("pharos: back taken by the page path={here} popped_to={path}");
+                run(format!(
+                    "history.pushState('pharos', '', {});",
+                    js_str(&here)
+                ));
+                return;
+            }
             lock(&PATHS).popped_to(&path);
             for f in &listeners {
                 if let Ok(mut f) = f.try_lock() {
@@ -2091,10 +2169,20 @@ fn http() -> &'static reqwest::Client {
     static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
     CLIENT.get_or_init(|| {
         let _ = rustls::crypto::ring::default_provider().install_default();
-        reqwest::Client::builder()
-            .user_agent(tv_page::USER_AGENT)
-            .build()
-            .unwrap_or_default()
+        // reqwest 0.13's default verifier is rustls-platform-verifier, which
+        // on Android needs JNI setup this app does not do. Use the shared
+        // ring + webpki-roots config the server uses.
+        let builder = reqwest::Client::builder().user_agent(tv_page::USER_AGENT);
+        let builder = match pharos_api::tls::client_config() {
+            Ok(tls) => builder.tls_backend_preconfigured(tls),
+            Err(error) => {
+                // ring is installed above, so this still builds; the platform
+                // verifier it falls back to fails every handshake loudly.
+                log::error!("server proxy TLS config failed to build: {error}");
+                builder
+            }
+        };
+        builder.build().unwrap_or_default()
     })
 }
 

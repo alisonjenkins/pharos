@@ -14,19 +14,25 @@
 //! bounded `Semaphore` caps concurrent in-flight ops (and thus live
 //! workers). On any channel error / EOF / timeout the worker is dropped
 //! (its `Child` has `kill_on_drop`) rather than returned to the idle set.
+//!
+//! A worker left idle for the pool's idle timeout is shut down (ADR-0085,
+//! B913); the next op spawns a fresh one. Every spawn and exit is counted in
+//! `pharos_libav_worker_lifecycle_total{event,reason}`.
 
 use crate::protocol::{
-    read_frame, write_frame, JobId, TinyOp, WorkerCmd, WorkerError, WorkerEvent,
+    read_frame, write_frame, FrameError, JobId, TinyOp, WorkerCmd, WorkerError, WorkerEvent,
+    REPLY_TOO_LARGE,
 };
 use crate::worker::proc::spawn_worker_proc;
 use pharos_core::ProbeInfo;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::process::Child;
 use tokio::sync::{Mutex, Semaphore};
+use tokio::time::Instant;
 
 const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Tiny ops are bounded work (decode a header / one frame / a few seconds
@@ -39,6 +45,109 @@ const DEFAULT_OP_TIMEOUT: Duration = Duration::from_secs(60);
 /// wall-clock ceiling, sized to still catch a genuinely hung decode.
 const DEFAULT_HEAVY_OP_TIMEOUT: Duration = Duration::from_secs(900);
 const DEFAULT_MAX_WORKERS: usize = 4;
+/// How long a resident worker may sit idle before it is shut down (V874).
+/// Scans and sweeps issue ops back to back, so they keep their workers;
+/// a lone request after a minute of quiet pays one spawn (~32 ms).
+pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+/// Overrides [`DEFAULT_IDLE_TIMEOUT`] for pools built by
+/// [`LibavWorkerPool::with_discovered_bin`]; `0` keeps workers resident.
+pub const IDLE_TIMEOUT_ENV: &str = "PHAROS_LIBAV_WORKER_IDLE_SECS";
+/// Time an idle worker gets to read `Shutdown` before it is killed.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
+
+/// A worker spawning or leaving the pool, as the `event` and `reason`
+/// labels of `pharos_libav_worker_lifecycle_total`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Lifecycle {
+    /// No idle worker was free for an op.
+    Spawned,
+    /// Spawning or the handshake failed.
+    SpawnFailed,
+    /// Idle for the idle timeout.
+    ReapedIdle,
+    /// Died, hung or spoke out of protocol mid-op.
+    DiscardedBroken,
+}
+
+impl Lifecycle {
+    pub const ALL: [Lifecycle; 4] = [
+        Lifecycle::Spawned,
+        Lifecycle::SpawnFailed,
+        Lifecycle::ReapedIdle,
+        Lifecycle::DiscardedBroken,
+    ];
+
+    pub const fn event(self) -> &'static str {
+        match self {
+            Lifecycle::Spawned => "spawned",
+            Lifecycle::SpawnFailed => "spawn_failed",
+            Lifecycle::ReapedIdle | Lifecycle::DiscardedBroken => "exited",
+        }
+    }
+
+    pub const fn reason(self) -> &'static str {
+        match self {
+            Lifecycle::Spawned => "no_idle_worker",
+            Lifecycle::SpawnFailed => "spawn_error",
+            Lifecycle::ReapedIdle => "idle_timeout",
+            Lifecycle::DiscardedBroken => "broken",
+        }
+    }
+}
+
+fn record(ev: Lifecycle) {
+    metrics::counter!(
+        "pharos_libav_worker_lifecycle_total",
+        "event" => ev.event(),
+        "reason" => ev.reason(),
+    )
+    .increment(1);
+}
+
+/// The idle timeout for discovered pools: `IDLE_TIMEOUT_ENV` if it parses,
+/// else the default. `None` keeps workers resident.
+fn idle_timeout_from(raw: Option<&str>) -> Option<Duration> {
+    let Some(raw) = raw else {
+        return Some(DEFAULT_IDLE_TIMEOUT);
+    };
+    match raw.trim().parse::<u64>() {
+        Ok(0) => None,
+        Ok(secs) => Some(Duration::from_secs(secs)),
+        Err(e) => {
+            tracing::warn!(
+                env = IDLE_TIMEOUT_ENV,
+                value = raw,
+                error = %e,
+                default_s = DEFAULT_IDLE_TIMEOUT.as_secs(),
+                "libav worker idle timeout unparseable; using the default"
+            );
+            Some(DEFAULT_IDLE_TIMEOUT)
+        }
+    }
+}
+
+/// Subtitle-signal windows sent per op. A window is 16 bytes on the wire and
+/// a line's reply ~30 (signals plus bottom text), so 16 384 of them keep both
+/// frames under ~500 KiB,
+/// well inside `MAX_FRAME`; a longer track runs one pass per chunk (B914).
+pub const SIGNALS_WINDOWS_PER_OP: usize = 16_384;
+
+/// Count an op whose request or reply did not fit in one frame, as
+/// `pharos_libav_frame_too_large_total{direction,op}` (B914).
+fn record_too_large(direction: &'static str, op: &'static str, detail: &str) {
+    metrics::counter!(
+        "pharos_libav_frame_too_large_total",
+        "direction" => direction,
+        "op" => op,
+    )
+    .increment(1);
+    tracing::warn!(
+        direction,
+        op,
+        detail,
+        "libav op frame too large; op failed, worker kept"
+    );
+}
 
 /// Short label for logs.
 fn op_name(op: &TinyOp) -> &'static str {
@@ -49,6 +158,7 @@ fn op_name(op: &TinyOp) -> &'static str {
         TinyOp::SrtToWebvtt { .. } => "srt_to_webvtt",
         TinyOp::Waveform { .. } => "waveform",
         TinyOp::AudioFeatures { .. } => "audio_features",
+        TinyOp::PictureCheck { .. } => "picture_check",
         TinyOp::SubtitleWindows { .. } => "subtitle_windows",
         TinyOp::SubtitleImages { .. } => "subtitle_images",
         TinyOp::Integrity { .. } => "integrity",
@@ -78,6 +188,8 @@ fn is_heavy_op(op: &TinyOp) -> bool {
             // One demux of the whole file for the keyframes, plus the audio
             // decode up to the last line.
             | TinyOp::SubtitleSignals { .. }
+            // Seven seeks and keyframe decodes, each a cold read on NFS.
+            | TinyOp::PictureCheck { .. }
     )
 }
 
@@ -104,6 +216,8 @@ struct PooledWorker {
     wr: OwnedWriteHalf,
     // Kept for `kill_on_drop`: dropping the worker reaps the child.
     _child: Child,
+    /// When it last went back to the idle set.
+    idle_since: Instant,
 }
 
 #[derive(Debug)]
@@ -112,9 +226,13 @@ struct Inner {
     handshake_timeout: Duration,
     op_timeout: Duration,
     heavy_op_timeout: Duration,
+    /// Most recently used last, so the oldest age out first.
     idle: Mutex<Vec<PooledWorker>>,
     permits: Semaphore,
     next_job: AtomicU64,
+    idle_timeout: Option<Duration>,
+    /// Set while a reaper task is watching `idle`; cleared under its lock.
+    reaper_running: AtomicBool,
 }
 
 /// A cheap-to-clone handle to the resident libav-worker pool.
@@ -138,6 +256,8 @@ impl LibavWorkerPool {
                 idle: Mutex::new(Vec::new()),
                 permits: Semaphore::new(max),
                 next_job: AtomicU64::new(1),
+                idle_timeout: None,
+                reaper_running: AtomicBool::new(false),
             }),
         }
     }
@@ -149,7 +269,22 @@ impl LibavWorkerPool {
         let max = std::thread::available_parallelism()
             .map(|n| n.get().min(8))
             .unwrap_or(DEFAULT_MAX_WORKERS);
-        Self::new(bin, max)
+        let idle = idle_timeout_from(std::env::var(IDLE_TIMEOUT_ENV).ok().as_deref());
+        Self::new(bin, max).with_idle_timeout(idle)
+    }
+
+    /// Shut down workers idle for `d` (`None`: keep them resident). Only
+    /// effective before the pool is cloned.
+    pub fn with_idle_timeout(mut self, d: Option<Duration>) -> Self {
+        if let Some(inner) = Arc::get_mut(&mut self.inner) {
+            inner.idle_timeout = d;
+        }
+        self
+    }
+
+    /// Workers resident and idle right now.
+    pub async fn idle_workers(&self) -> usize {
+        self.inner.idle.lock().await.len()
     }
 
     /// Override the per-op timeout. Only effective before the pool is
@@ -357,6 +492,25 @@ impl LibavWorkerPool {
         }
     }
 
+    /// Find black bars baked into a video's picture, from keyframes sampled
+    /// across the file. See `crate::picture_area`.
+    pub async fn picture_check(
+        &self,
+        input: impl Into<PathBuf>,
+        duration_ms: u64,
+    ) -> Result<crate::picture_area::PictureAnalysis, PoolError> {
+        let ev = self
+            .run(TinyOp::PictureCheck {
+                input: input.into(),
+                duration_ms,
+            })
+            .await?;
+        match ev {
+            WorkerEvent::PictureCheckResult { analysis, .. } => Ok(analysis),
+            other => Err(unexpected(other)),
+        }
+    }
+
     /// Loudness, pitch and high-band share of each line's span, and the
     /// video keyframes and likely cuts, from one pass over the file (spec
     /// 028). `windows` are the lines' `(start_ms, end_ms)`; the result's
@@ -367,17 +521,88 @@ impl LibavWorkerPool {
         audio_stream: Option<u32>,
         windows: Vec<(u64, u64)>,
     ) -> Result<crate::subtitle_signals::SubtitleSignals, PoolError> {
-        let ev = self
-            .run(TinyOp::SubtitleSignals {
-                input: input.into(),
-                audio_stream,
-                windows,
-            })
-            .await?;
-        match ev {
-            WorkerEvent::SubtitleSignalsResult { signals, .. } => Ok(signals),
-            other => Err(unexpected(other)),
+        let input = input.into();
+        // Typeset-heavy tracks repeat spans; analyse each distinct one once.
+        let mut unique = windows.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        let chunks = unique.len().div_ceil(SIGNALS_WINDOWS_PER_OP);
+        if chunks > 1 {
+            tracing::info!(
+                lines = windows.len(),
+                unique = unique.len(),
+                chunks,
+                per_op = SIGNALS_WINDOWS_PER_OP,
+                "subtitle signals: windows split across passes to fit the frame"
+            );
         }
+        let mut merged: Option<crate::subtitle_signals::SubtitleSignals> = None;
+        let mut by_window: Vec<crate::subtitle_signals::LineSignals> =
+            Vec::with_capacity(unique.len());
+        let mut text_by_window: Vec<Option<f32>> = Vec::with_capacity(unique.len());
+        for chunk in unique.chunks(SIGNALS_WINDOWS_PER_OP) {
+            let ev = self
+                .run(TinyOp::SubtitleSignals {
+                    input: input.clone(),
+                    audio_stream,
+                    windows: chunk.to_vec(),
+                })
+                .await?;
+            let mut sig = match ev {
+                WorkerEvent::SubtitleSignalsResult { signals, .. } => signals,
+                other => return Err(unexpected(other)),
+            };
+            if sig.lines.len() != chunk.len() {
+                return Err(PoolError::Dead(format!(
+                    "subtitle signals: {} lines for {} windows",
+                    sig.lines.len(),
+                    chunk.len()
+                )));
+            }
+            by_window.append(&mut sig.lines);
+            // A worker that reports no text check speaks for none of these.
+            sig.bottom_text.resize(chunk.len(), None);
+            text_by_window.append(&mut sig.bottom_text);
+            merged = Some(match merged {
+                None => sig,
+                Some(mut m) => {
+                    m.analysed_seconds = m.analysed_seconds.max(sig.analysed_seconds);
+                    m.read_errors = m.read_errors.max(sig.read_errors);
+                    m
+                }
+            });
+        }
+        let mut out = match merged {
+            Some(m) => m,
+            // No windows at all: one pass still reports keyframes and cuts.
+            None => {
+                let ev = self
+                    .run(TinyOp::SubtitleSignals {
+                        input,
+                        audio_stream,
+                        windows: Vec::new(),
+                    })
+                    .await?;
+                return match ev {
+                    WorkerEvent::SubtitleSignalsResult { signals, .. } => Ok(signals),
+                    other => Err(unexpected(other)),
+                };
+            }
+        };
+        let slot = |w: &(u64, u64)| unique.binary_search(w).ok();
+        out.lines = windows
+            .iter()
+            .map(|w| {
+                slot(w)
+                    .and_then(|i| by_window.get(i).copied())
+                    .unwrap_or(crate::subtitle_signals::LineSignals::NONE)
+            })
+            .collect();
+        out.bottom_text = windows
+            .iter()
+            .map(|w| slot(w).and_then(|i| text_by_window.get(i).copied().flatten()))
+            .collect();
+        Ok(out)
     }
 
     /// Subtitle event windows — merged `(start_ms, end_ms)` intervals of
@@ -529,20 +754,40 @@ impl LibavWorkerPool {
         } else {
             self.inner.op_timeout
         };
+        let name = op_name(&op);
         let mut worker = self.checkout().await?;
 
         match self.exchange(&mut worker, job_id, op, op_timeout).await {
             Ok(ev) => {
+                if let WorkerEvent::Failed {
+                    error: WorkerError::Other(msg),
+                    ..
+                } = &ev
+                {
+                    if msg.starts_with(REPLY_TOO_LARGE) {
+                        record_too_large("reply", name, msg);
+                    }
+                }
                 // Healthy → reuse.
+                worker.idle_since = Instant::now();
                 self.inner.idle.lock().await.push(worker);
+                self.ensure_reaper();
                 match ev {
                     WorkerEvent::Failed { error, .. } => Err(PoolError::Op(error)),
                     other => Ok(other),
                 }
             }
+            // Refused before sending: the worker never saw the op.
+            Err(e @ PoolError::Op(_)) => {
+                worker.idle_since = Instant::now();
+                self.inner.idle.lock().await.push(worker);
+                self.ensure_reaper();
+                Err(e)
+            }
             Err(e) => {
                 // Broken channel → drop the worker (kill_on_drop reaps it).
                 drop(worker);
+                record(Lifecycle::DiscardedBroken);
                 Err(e)
             }
         }
@@ -553,19 +798,38 @@ impl LibavWorkerPool {
         if let Some(w) = self.inner.idle.lock().await.pop() {
             return Ok(w);
         }
-        let (child, rd, wr, _handshake) = spawn_worker_proc(
+        let spawned = spawn_worker_proc(
             &self.inner.worker_bin,
             self.inner.handshake_timeout,
             false,
             crate::stage_timing::StageTimingMode::Off,
         )
-        .await
-        .map_err(|e| PoolError::Spawn(e.to_string()))?;
+        .await;
+        let (child, rd, wr, _handshake) = match spawned {
+            Ok(w) => w,
+            Err(e) => {
+                record(Lifecycle::SpawnFailed);
+                return Err(PoolError::Spawn(e.to_string()));
+            }
+        };
+        record(Lifecycle::Spawned);
         Ok(PooledWorker {
             rd,
             wr,
             _child: child,
+            idle_since: Instant::now(),
         })
+    }
+
+    /// Start the reaper if the pool has an idle timeout and none is running.
+    fn ensure_reaper(&self) {
+        let Some(timeout) = self.inner.idle_timeout else {
+            return;
+        };
+        if self.inner.reaper_running.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        tokio::spawn(reap_idle(Arc::downgrade(&self.inner), timeout));
     }
 
     /// Send the op and read frames until the terminal reply for `job_id`,
@@ -578,9 +842,17 @@ impl LibavWorkerPool {
         op: TinyOp,
         op_timeout: Duration,
     ) -> Result<WorkerEvent, PoolError> {
-        write_frame(&mut worker.wr, &WorkerCmd::Tiny { job_id, op })
-            .await
-            .map_err(|e| PoolError::Dead(format!("send op: {e}")))?;
+        let name = op_name(&op);
+        match write_frame(&mut worker.wr, &WorkerCmd::Tiny { job_id, op }).await {
+            Ok(()) => {}
+            // Refused before a byte was written: the channel is intact.
+            Err(e @ FrameError::TooLarge(_)) => {
+                let detail = format!("request {e}");
+                record_too_large("request", name, &detail);
+                return Err(PoolError::Op(WorkerError::Other(detail)));
+            }
+            Err(e) => return Err(PoolError::Dead(format!("send op: {e}"))),
+        }
 
         let deadline = tokio::time::Instant::now() + op_timeout;
         loop {
@@ -598,6 +870,7 @@ impl LibavWorkerPool {
                 WorkerEvent::ProbeResult { job_id: j, .. }
                 | WorkerEvent::WaveformResult { job_id: j, .. }
                 | WorkerEvent::AudioFeaturesResult { job_id: j, .. }
+                | WorkerEvent::PictureCheckResult { job_id: j, .. }
                 | WorkerEvent::SubtitleWindowsResult { job_id: j, .. }
                 | WorkerEvent::IntegrityResult { job_id: j, .. }
                 | WorkerEvent::FingerprintResult { job_id: j, .. }
@@ -619,6 +892,46 @@ impl LibavWorkerPool {
     }
 }
 
+/// Shut down workers idle for `timeout`, sleeping until the oldest one is
+/// due. Ends when the idle set is empty (the next return restarts it) or the
+/// pool is gone.
+async fn reap_idle(pool: Weak<Inner>, timeout: Duration) {
+    loop {
+        let Some(inner) = pool.upgrade() else {
+            return;
+        };
+        let (expired, next_due) = {
+            let mut idle = inner.idle.lock().await;
+            let now = Instant::now();
+            let (expired, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut *idle)
+                .into_iter()
+                .partition(|w| now.duration_since(w.idle_since) >= timeout);
+            *idle = kept;
+            let next_due = idle.iter().map(|w| w.idle_since + timeout).min();
+            if next_due.is_none() {
+                inner.reaper_running.store(false, Ordering::Release);
+            }
+            (expired, next_due)
+        };
+        drop(inner);
+        for mut w in expired {
+            let _ =
+                tokio::time::timeout(SHUTDOWN_GRACE, write_frame(&mut w.wr, &WorkerCmd::Shutdown))
+                    .await;
+            drop(w);
+            record(Lifecycle::ReapedIdle);
+            tracing::debug!(
+                idle_s = timeout.as_secs(),
+                "libav worker shut down after idle timeout"
+            );
+        }
+        match next_due {
+            Some(at) => tokio::time::sleep_until(at).await,
+            None => return,
+        }
+    }
+}
+
 fn expect_done(ev: WorkerEvent) -> Result<u64, PoolError> {
     match ev {
         WorkerEvent::Done { out_bytes, .. } => Ok(out_bytes),
@@ -628,4 +941,29 @@ fn expect_done(ev: WorkerEvent) -> Result<u64, PoolError> {
 
 fn unexpected(ev: WorkerEvent) -> PoolError {
     PoolError::Dead(format!("unexpected reply: {ev:?}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lifecycle_label_pairs_are_distinct() {
+        let pairs: std::collections::HashSet<_> = Lifecycle::ALL
+            .iter()
+            .map(|l| (l.event(), l.reason()))
+            .collect();
+        assert_eq!(pairs.len(), Lifecycle::ALL.len());
+    }
+
+    #[test]
+    fn idle_timeout_defaults_and_zero_keeps_workers() {
+        assert_eq!(idle_timeout_from(None), Some(DEFAULT_IDLE_TIMEOUT));
+        assert_eq!(idle_timeout_from(Some("0")), None);
+        assert_eq!(
+            idle_timeout_from(Some(" 300 ")),
+            Some(Duration::from_secs(300))
+        );
+        assert_eq!(idle_timeout_from(Some("soon")), Some(DEFAULT_IDLE_TIMEOUT));
+    }
 }

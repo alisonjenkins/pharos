@@ -356,7 +356,7 @@ async fn synth_series_logo_serves_cached_file_without_db_locator() {
     use pharos_cache::image_cache::{series_image_path, ImageRole};
     let state = /* build AppState with an ImageCache rooted at a tempdir — copy the
         harness the poster test uses */;
-    let series_key = "Dragon Ball";
+    let series_key = "Anime P";
     // Write a logo into the deterministic slot.
     let root = /* the cache root PathBuf used by state.images */;
     let logo_path = series_image_path(&root, ImageRole::Logo, series_key);
@@ -789,7 +789,7 @@ Drive the `_inner` fns directly (like `remote_search_*` tests):
 #[actix_web::test]
 async fn remote_images_empty_without_key_or_match() {
     let state = seed_state().await;
-    put_movie(&state, 42, "Dune (2021)").await; // no provider id, no key
+    put_movie(&state, 42, "Film AU (2021)").await; // no provider id, no key
     let r = remote_images_inner(&state, "42", &RemoteImagesQuery { image_type: None, provider_name: None }).await;
     assert_eq!(r.total_record_count, 0);
     assert!(r.providers.is_empty());
@@ -913,7 +913,7 @@ git commit -m "test(compat): cover RemoteImages/Download route"
 - [ ] `nix develop --command cargo clippy --workspace --all-targets -- -D warnings` — clean.
 - [ ] `nix develop --command cargo build -p pharos-server --no-default-features --features backend-spawn` — spawn backend builds.
 - [ ] If any `Cargo.toml` changed: `just hakari-regen`. (No dep changes expected.)
-- [ ] Manual sanity: `resolve_image_match` returns `tvdb` for a synth Dragon Ball id whose `series_metadata.match_provider = "tvdb"`.
+- [ ] Manual sanity: `resolve_image_match` returns `tvdb` for a synth Anime P id whose `series_metadata.match_provider = "tvdb"`.
 
 ## Notes / non-goals (carried from the spec)
 

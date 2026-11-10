@@ -28,18 +28,51 @@ pub fn initials(name: &str) -> String {
 
 /// The account button and its menu, open state kept here. `me` is `None`
 /// until `Session.me` answers; the button then shows `?` and Manage stays
-/// hidden.
+/// hidden. `kept_books` counts the books kept on this device, read as the
+/// menu opens: signing out removes them, so Sign out asks first (FR-703).
 #[component]
-pub fn AccountMenu(me: Option<Me>, on_sign_out: EventHandler<()>) -> Element {
+pub fn AccountMenu(
+    me: Option<Me>,
+    kept_books: Callback<(), Option<usize>>,
+    on_sign_out: EventHandler<()>,
+) -> Element {
     let mut open = use_signal(|| false);
+    let mut kept = use_signal(|| Some(0usize));
+    let mut confirming = use_signal(|| false);
     rsx! {
         AccountMenuView {
             me,
             open: open(),
-            on_toggle: move |_| open.toggle(),
-            on_close: move |_| open.set(false),
-            on_sign_out,
+            kept_books: kept(),
+            confirming: confirming(),
+            on_toggle: move |_| {
+                if !*open.peek() {
+                    kept.set(kept_books.call(()));
+                }
+                confirming.set(false);
+                open.toggle();
+            },
+            on_close: move |_| {
+                confirming.set(false);
+                open.set(false);
+            },
+            on_confirm: move |ask: bool| confirming.set(ask),
+            on_sign_out: move |()| {
+                confirming.set(false);
+                open.set(false);
+                on_sign_out.call(());
+            },
         }
+    }
+}
+
+/// What Sign out says before removing `count` kept books; `None` when the
+/// record could not be read, which may still leave books in the cache.
+pub fn sign_out_warning(count: Option<usize>) -> String {
+    match count {
+        Some(1) => "Signing out removes the book kept on this device. You will need a connection to read it again.".to_owned(),
+        Some(n) => format!("Signing out removes the {n} books kept on this device. You will need a connection to read them again."),
+        None => "Signing out removes any books kept on this device. You will need a connection to read them again.".to_owned(),
     }
 }
 
@@ -51,6 +84,15 @@ pub fn AccountMenuView(
     on_toggle: EventHandler<()>,
     on_close: EventHandler<()>,
     on_sign_out: EventHandler<()>,
+    /// Books kept on this device; with any, Sign out asks first.
+    #[props(default = Some(0))]
+    kept_books: Option<usize>,
+    /// Sign out was pressed once and is asking.
+    #[props(default)]
+    confirming: bool,
+    /// `true` to ask, `false` to cancel the ask.
+    #[props(default)]
+    on_confirm: EventHandler<bool>,
 ) -> Element {
     let name = me.as_ref().map(|me| me.name.clone()).unwrap_or_default();
     let is_admin = me.as_ref().is_some_and(|me| me.is_admin);
@@ -65,7 +107,7 @@ pub fn AccountMenuView(
         div {
             class: "pharos-account",
             onkeydown: move |evt: KeyboardEvent| {
-                if open && evt.key() == Key::Escape {
+                if open && evt.key() == Key::Named(NamedKey::Escape) {
                     on_close.call(());
                 }
             },
@@ -92,18 +134,61 @@ pub fn AccountMenuView(
                     if !name.is_empty() {
                         p { class: "pharos-account-name", "{name}" }
                     }
-                    MenuLink { to: Route::Account, "Account" }
+                    // One way into the settings pages (Appearance, Playback,
+                    // Account, Devices, Privacy); their sidebar does the rest.
+                    MenuLink { to: Route::Appearance, "Settings" }
                     MenuLink { to: Route::ApproveDevice, "Approve a device" }
-                    MenuLink { to: Route::Appearance, "Appearance" }
                     if is_admin {
                         MenuLink { to: Route::Manage, "Manage" }
                     }
-                    button {
-                        class: "pharos-account-item",
-                        r#type: "button",
-                        role: "menuitem",
-                        onclick: move |_| on_sign_out.call(()),
-                        "Sign out"
+                    if confirming {
+                        div {
+                            class: "pharos-account-confirm",
+                            role: "group",
+                            aria_label: "Sign out",
+                            // A click on the warning must not close the menu.
+                            onclick: move |e: MouseEvent| e.stop_propagation(),
+                            p { class: "pharos-account-warning", "{sign_out_warning(kept_books)}" }
+                            button {
+                                class: "pharos-account-item pharos-account-danger",
+                                r#type: "button",
+                                role: "menuitem",
+                                // The pressed Sign out is gone: keep keyboard focus in the ask.
+                                onmounted: move |e: MountedEvent| async move {
+                                    let _ = e.set_focus(true).await;
+                                },
+                                onclick: move |e: MouseEvent| {
+                                    e.stop_propagation();
+                                    on_sign_out.call(());
+                                },
+                                "Sign out and remove"
+                            }
+                            button {
+                                class: "pharos-account-item",
+                                r#type: "button",
+                                role: "menuitem",
+                                onclick: move |e: MouseEvent| {
+                                    e.stop_propagation();
+                                    on_confirm.call(false);
+                                },
+                                "Cancel"
+                            }
+                        }
+                    } else {
+                        button {
+                            class: "pharos-account-item",
+                            r#type: "button",
+                            role: "menuitem",
+                            onclick: move |e: MouseEvent| {
+                                if kept_books != Some(0) {
+                                    e.stop_propagation();
+                                    on_confirm.call(true);
+                                } else {
+                                    on_sign_out.call(());
+                                }
+                            },
+                            "Sign out"
+                        }
                     }
                 }
             }
@@ -154,23 +239,66 @@ mod tests {
     use super::*;
 
     fn render(me: Option<Me>, open: bool) -> String {
+        render_kept(me, open, Some(0), false)
+    }
+
+    fn render_kept(
+        me: Option<Me>,
+        open: bool,
+        kept_books: Option<usize>,
+        confirming: bool,
+    ) -> String {
         let mut dom = VirtualDom::new_with_props(
-            |(me, open): (Option<Me>, bool)| {
+            |(me, open, kept_books, confirming): (Option<Me>, bool, Option<usize>, bool)| {
                 use_context_provider(|| Nav(EventHandler::new(|_: Route| {})));
                 rsx! {
                     AccountMenuView {
                         me,
                         open,
+                        kept_books,
+                        confirming,
                         on_toggle: |_| {},
                         on_close: |_| {},
                         on_sign_out: |_| {},
                     }
                 }
             },
-            (me, open),
+            (me, open, kept_books, confirming),
         );
         dom.rebuild_in_place();
         dioxus_ssr::render(&dom)
+    }
+
+    /// FR-703: with books kept, the asking menu names their count and offers
+    /// Cancel. Disarm check: rendering the plain Sign out while confirming
+    /// fails the first assertion.
+    #[test]
+    fn sign_out_asks_first_naming_the_kept_books() {
+        let html = render_kept(me("ali", false), true, Some(3), true);
+        assert!(
+            html.contains("Signing out removes the 3 books kept on this device."),
+            "{html}"
+        );
+        assert!(html.contains(">Sign out and remove<"), "{html}");
+        assert!(html.contains(">Cancel<"), "{html}");
+        let one = render_kept(me("ali", false), true, Some(1), true);
+        assert!(
+            one.contains("removes the book kept on this device"),
+            "{one}"
+        );
+        // An unreadable record may still leave books cached: ask anyway.
+        let unknown = render_kept(me("ali", false), true, None, true);
+        assert!(
+            unknown.contains("removes any books kept on this device"),
+            "{unknown}"
+        );
+    }
+
+    #[test]
+    fn with_nothing_kept_sign_out_is_one_step() {
+        let html = render_kept(me("ali", false), true, Some(0), false);
+        assert!(html.contains(">Sign out<"), "{html}");
+        assert!(!html.contains("Signing out removes"), "{html}");
     }
 
     fn me(name: &str, is_admin: bool) -> Option<Me> {
@@ -198,7 +326,7 @@ mod tests {
         assert!(html.contains(">AJ<"), "{html}");
         assert!(html.contains("aria-expanded=\"false\""), "{html}");
         assert!(!html.contains("Sign out"), "{html}");
-        assert!(!html.contains("Appearance"), "{html}");
+        assert!(!html.contains("Settings"), "{html}");
     }
 
     #[test]
@@ -219,13 +347,7 @@ mod tests {
     fn an_admin_sees_manage() {
         let html = render(me("ali", true), true);
         assert!(html.contains("aria-expanded=\"true\""), "{html}");
-        for item in [
-            "Account",
-            "Approve a device",
-            "Appearance",
-            "Manage",
-            "Sign out",
-        ] {
+        for item in ["Settings", "Approve a device", "Manage", "Sign out"] {
             assert!(html.contains(item), "{item}: {html}");
         }
     }
@@ -234,7 +356,7 @@ mod tests {
     fn a_user_who_is_not_an_admin_does_not_see_manage() {
         let html = render(me("guest", false), true);
         assert!(html.contains("Approve a device"), "{html}");
-        assert!(html.contains("Appearance"), "{html}");
+        assert!(html.contains("Settings"), "{html}");
         assert!(html.contains("Sign out"), "{html}");
         assert!(!html.contains("Manage"), "{html}");
     }

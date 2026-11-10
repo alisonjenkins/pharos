@@ -19,7 +19,7 @@ use pharos_core::{
 };
 use pharos_transcode::fingerprint::align::AlignConfig;
 use pharos_transcode::fingerprint::season::{
-    detect_season_verbose, EpisodeFingerprint, EpisodeVerdict, SeasonConfig, Verdict,
+    detect_season_verbose, Consensus, EpisodeFingerprint, EpisodeVerdict, SeasonConfig, Verdict,
 };
 use pharos_transcode::worker::LibavWorkerPool;
 use std::collections::HashMap;
@@ -162,11 +162,7 @@ async fn analyze_all_seasons(ctx: &Ctx, items: &[MediaItem]) {
         };
         // Folder-keyed identity (falls back to name) so two same-named shows
         // don't merge — matches the wire-id scheme.
-        let key = format!(
-            "{}::{}",
-            s.series_folder.as_deref().unwrap_or(&s.series_name),
-            season
-        );
+        let key = format!("{}::{}", s.series_key(), season);
         seasons.entry(key).or_default().push(it);
     }
 
@@ -246,6 +242,7 @@ fn record_verdicts(season: &str, kind: &'static str, verdicts: &[EpisodeVerdict]
             "pharos_segment_detect_total",
             "kind" => kind,
             "outcome" => v.verdict.label(),
+            "consensus" => v.consensus.map_or("none", Consensus::label),
         )
         .increment(1);
     }
@@ -274,6 +271,10 @@ fn record_verdicts(season: &str, kind: &'static str, verdicts: &[EpisodeVerdict]
         low_confidence = counts.get("low_confidence").copied().unwrap_or(0),
         few_agreeing = counts.get("few_agreeing").copied().unwrap_or(0),
         no_span = counts.get("no_span").copied().unwrap_or(0),
+        emitted_by_overlap = verdicts
+            .iter()
+            .filter(|v| v.consensus == Some(Consensus::Overlap))
+            .count(),
         dropped = %dropped.join(" "),
         "segment backfill: season detection verdicts"
     );
@@ -526,7 +527,7 @@ mod tests {
         let local = MediaItem {
             id: 2,
             kind: pharos_core::MediaKind::Episode,
-            path: "/tv/Arrow/s01e01.mkv".into(),
+            path: "/tv/Show CA/s01e01.mkv".into(),
             ..Default::default()
         };
         assert!(analysable(&local));
@@ -537,7 +538,7 @@ mod tests {
         let movie = MediaItem {
             id: 3,
             kind: pharos_core::MediaKind::Movie,
-            path: "/media/Movies/Arrival.mkv".into(),
+            path: "/media/Movies/Film BC.mkv".into(),
             ..Default::default()
         };
         assert!(!analysable(&movie));
@@ -560,6 +561,7 @@ mod tests {
                 end: 30.0,
             }),
             verdict: v,
+            consensus: (v == Verdict::Emitted).then_some(Consensus::Endpoints),
         }
     }
 
@@ -611,7 +613,7 @@ mod tests {
     fn a_dropped_episode_is_countable_by_reason() {
         let _ = crate::obs::init("info", None);
         record_verdicts(
-            "/media/TV/Fringe::1",
+            "/media/TV/Show AW::1",
             "Intro",
             &[
                 verdict(1, 12, 12, 0.63, Verdict::Emitted),
@@ -624,10 +626,27 @@ mod tests {
                     confidence: 0.0,
                     span: None,
                     verdict: Verdict::NoSpan,
+                    consensus: None,
+                },
+                EpisodeVerdict {
+                    consensus: Some(Consensus::Overlap),
+                    ..verdict(5, 8, 5, 0.81, Verdict::Emitted)
                 },
             ],
         );
         let rendered = crate::obs::render();
+        // T106 (B1060) — which reading emitted is the signal that the overlap
+        // fallback is adding Skip buttons, and how many.
+        for consensus in ["endpoints", "overlap", "none"] {
+            assert!(
+                rendered
+                    .lines()
+                    .any(|l| l.starts_with("pharos_segment_detect_total")
+                        && l.contains(&format!("consensus=\"{consensus}\""))
+                        && l.contains("kind=\"Intro\"")),
+                "the consensus reading must be countable; {consensus} missing from:\n{rendered}"
+            );
+        }
         for outcome in ["emitted", "low_confidence", "few_agreeing", "no_span"] {
             assert!(
                 rendered

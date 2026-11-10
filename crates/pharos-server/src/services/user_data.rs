@@ -5,7 +5,10 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, Weak};
 
-use pharos_core::{DomainError, MediaItem, MediaStore, User, UserDataStore, UserId, UserItemData};
+use pharos_core::{
+    DomainError, MediaItem, MediaKind, MediaStore, ReadPosition, ReadPositionStore, User,
+    UserDataStore, UserId, UserItemData,
+};
 
 use crate::api::jellyfin::dto::UserItemDataDto;
 use crate::services::library::DetailError;
@@ -118,6 +121,173 @@ pub async fn set_favorite(
     update(state, user, id, |d| apply_favorite(d, favorite)).await
 }
 
+/// The longest locator `set_read_position` stores, in bytes (FR-011).
+pub const MAX_READ_LOCATOR_BYTES: usize = 256;
+
+/// A saved fraction at or past this marks the book read.
+pub const READ_FINISHED_FRACTION: f32 = 0.99;
+
+/// Why `set_read_position` stored nothing (FR-011).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadRefusal {
+    NotBook,
+    Unreadable,
+    BadLocator,
+    BadFraction,
+}
+
+impl ReadRefusal {
+    /// The `outcome` label of `pharos_read_position_total`.
+    pub fn outcome(self) -> &'static str {
+        match self {
+            Self::NotBook => "not_book",
+            Self::Unreadable => "unreadable",
+            Self::BadLocator => "bad_locator",
+            Self::BadFraction => "bad_fraction",
+        }
+    }
+
+    /// The argument the caller got wrong, for the wire error.
+    pub fn field(self) -> &'static str {
+        match self {
+            Self::NotBook | Self::Unreadable => "id",
+            Self::BadLocator => "locator",
+            Self::BadFraction => "fraction",
+        }
+    }
+}
+
+/// Why `set_read_position` has no position to answer with.
+#[derive(Debug)]
+pub enum ReadError {
+    Refused(ReadRefusal),
+    Item(DetailError),
+}
+
+/// The unix second a reading happened, from the client's `readAt` in unix
+/// milliseconds: 0 or less means now (old clients send nothing), and one ahead
+/// of `now_secs` counts as now so a fast clock cannot outrank every later
+/// reading (FR-002). Whole seconds: the `updated_at` column's unit.
+pub fn read_time_secs(read_at_ms: i64, now_secs: i64) -> i64 {
+    if read_at_ms <= 0 {
+        return now_secs;
+    }
+    (read_at_ms / 1000).min(now_secs)
+}
+
+fn count_read_position(outcome: &'static str) {
+    metrics::counter!("pharos_read_position_total", "outcome" => outcome).increment(1);
+}
+
+/// Saves where `user` is in book `id`: the reader's opaque `locator` and the
+/// whole-book `fraction`. Stores nothing for an item that is not a readable
+/// book, a locator that is empty or over [`MAX_READ_LOCATOR_BYTES`], or a
+/// fraction that is not in 0 to 1 (V355). A fraction of
+/// [`READ_FINISHED_FRACTION`] or more also marks the book played; the resume
+/// position `last_played_position_ticks` is never written (V354). `read_at_ms`
+/// is when the page was read (see [`read_time_secs`]); a reading older than
+/// the stored one is not stored and does not mark the book played (V1131).
+/// Answers the item, the user's play state, the position as stored and
+/// whether this reading was the one stored.
+pub async fn set_read_position(
+    state: &AppState,
+    user: &User,
+    id: u64,
+    locator: &str,
+    fraction: f32,
+    read_at_ms: i64,
+) -> Result<(MediaItem, UserItemData, ReadPosition, bool), ReadError> {
+    if let Err(hidden) = crate::services::access::check_item(state, user, id, "read_position").await
+    {
+        count_read_position("hidden");
+        return Err(ReadError::Item(DetailError::Hidden(hidden)));
+    }
+    let item = state.stores.get(id).await.map_err(|e| {
+        ReadError::Item(match e {
+            DomainError::NotFound(_) => DetailError::NotFound,
+            other => DetailError::Store(other),
+        })
+    })?;
+    let refusal = match item.book.as_ref() {
+        _ if item.kind != MediaKind::Book => Some(ReadRefusal::NotBook),
+        Some(book) if !book.format.readable_by_client() => Some(ReadRefusal::Unreadable),
+        None => Some(ReadRefusal::NotBook),
+        Some(_) if locator.is_empty() || locator.len() > MAX_READ_LOCATOR_BYTES => {
+            Some(ReadRefusal::BadLocator)
+        }
+        Some(_) if !(fraction.is_finite() && (0.0..=1.0).contains(&fraction)) => {
+            Some(ReadRefusal::BadFraction)
+        }
+        Some(_) => None,
+    };
+    if let Some(refusal) = refusal {
+        count_read_position(refusal.outcome());
+        tracing::info!(
+            media.id = id,
+            user.id = %user.id.0,
+            reason = refusal.outcome(),
+            locator_bytes = locator.len(),
+            "read position refused, nothing stored"
+        );
+        return Err(ReadError::Refused(refusal));
+    }
+    let position = ReadPosition {
+        locator: locator.to_owned(),
+        fraction,
+        updated_at: read_time_secs(read_at_ms, crate::sync_recovery::now_unix_secs()),
+    };
+    let stored = state
+        .stores
+        .set_read_position(user.id, id, position.clone())
+        .await
+        .map_err(|e| ReadError::Item(DetailError::Store(e)))?;
+    if !stored {
+        let sent_updated_at = position.updated_at;
+        let kept = state
+            .stores
+            .get_read_position(user.id, id)
+            .await
+            .map_err(|e| ReadError::Item(DetailError::Store(e)))?
+            .unwrap_or(position);
+        let data = state
+            .stores
+            .get_user_data(user.id, id)
+            .await
+            .map_err(|e| ReadError::Item(DetailError::Store(e)))?;
+        count_read_position("stale");
+        tracing::info!(
+            media.id = id,
+            user.id = %user.id.0,
+            sent_updated_at,
+            kept_updated_at = kept.updated_at,
+            "read position older than the stored one, kept the stored"
+        );
+        return Ok((item, data, kept, false));
+    }
+    let finished = fraction >= READ_FINISHED_FRACTION;
+    let data = if finished {
+        // Played without `apply_played`, which would zero the resume ticks.
+        let (_, data) = update(state, user, id, |d| {
+            if !d.played {
+                d.played = true;
+                d.play_count = d.play_count.saturating_add(1);
+                d.last_played_at = crate::sync_recovery::now_unix_secs();
+            }
+        })
+        .await
+        .map_err(ReadError::Item)?;
+        data
+    } else {
+        state
+            .stores
+            .get_user_data(user.id, id)
+            .await
+            .map_err(|e| ReadError::Item(DetailError::Store(e)))?
+    };
+    count_read_position(if finished { "finished" } else { "saved" });
+    Ok((item, data, position, true))
+}
+
 /// Applies `change` to `user`'s state on stored item `id`, if they may see
 /// it, and announces the new state to their connected sockets. Answers the
 /// item and the state as written.
@@ -160,8 +330,9 @@ pub async fn update(
     Ok((item, data))
 }
 
-/// The stored items under synthesised series or season `id` (its 32-hex
-/// wire id) that `user` may see.
+/// The stored items under synthesised series, season, album or artist `id`
+/// (its 32-hex wire id) that `user` may see: an album's tracks, an artist's
+/// tracks as [`by_artist`] files them (B1085).
 pub async fn folder_items(
     state: &AppState,
     user: &User,
@@ -178,27 +349,77 @@ pub async fn folder_items(
             let Some(series) = item.series.as_ref() else {
                 return false;
             };
-            if series_id_for_key(series.series_folder.as_deref(), &series.series_name) == id {
+            if series_id_for_key(series.identity_folder(), &series.series_name) == id {
                 return true;
             }
             series.season_number.is_some_and(|n| {
-                season_id_for_key(series.series_folder.as_deref(), &series.series_name, n) == id
+                season_id_for_key(series.identity_folder(), &series.series_name, n) == id
             })
         })
         .cloned()
         .collect();
+    if items.is_empty() {
+        items = music_folder_items(state, &all, id).await?;
+    }
     crate::services::access::retain_visible(state, user, &mut items, |e| e.id, "user_data")
         .await
         .map_err(DetailError::Hidden)?;
     Ok(items)
 }
 
-/// Whether `user` has played every item under synthesised series or season
-/// `id` that they may see; false when they may see none.
-pub async fn folder_played(state: &AppState, user: &User, id: &str) -> Result<bool, DetailError> {
+/// The tracks among `all` under album or artist `id`; none when `id` names
+/// neither.
+async fn music_folder_items(
+    state: &AppState,
+    all: &[MediaItem],
+    id: &str,
+) -> Result<Vec<MediaItem>, DetailError> {
+    use crate::api::jellyfin::items::{resolve_parent_filter, ParentResolution};
+    use pharos_core::ParentFilter;
+    let keep: Box<dyn Fn(&MediaItem) -> bool> = match resolve_parent_filter(state, Some(id))
+        .await
+        .map_err(DetailError::Store)?
+    {
+        ParentResolution::Filter(ParentFilter::Album { name }) => {
+            Box::new(move |i| i.probe.album.as_deref() == Some(name.as_str()))
+        }
+        ParentResolution::Filter(ParentFilter::Artist { name }) => {
+            Box::new(move |i| by_artist(i, &name))
+        }
+        _ => return Ok(Vec::new()),
+    };
+    Ok(all
+        .iter()
+        .filter(|i| i.kind == pharos_core::MediaKind::Audio && keep(i))
+        .cloned()
+        .collect())
+}
+
+/// Whether track `item` is by `artist`: its artist or its album artist is
+/// `artist`, in any case. Marking an artist marks every such track, and an
+/// artist is a favourite while every one is (B1085).
+pub fn by_artist(item: &MediaItem, artist: &str) -> bool {
+    [
+        item.probe.artist.as_deref(),
+        item.probe.album_artist.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|a| a.eq_ignore_ascii_case(artist))
+}
+
+/// What `user` has marked on synthesised series or season `id`, from one
+/// bulk read: played once they have played every item under it they may
+/// see, a favourite while every one is a favourite (marking the folder marks
+/// each, B1080). Both false when they may see none.
+pub async fn folder_marks(
+    state: &AppState,
+    user: &User,
+    id: &str,
+) -> Result<FolderMarks, DetailError> {
     let items = folder_items(state, user, id).await?;
     if items.is_empty() {
-        return Ok(false);
+        return Ok(FolderMarks::default());
     }
     let ids: Vec<_> = items.iter().map(|i| i.id).collect();
     let data = state
@@ -206,7 +427,26 @@ pub async fn folder_played(state: &AppState, user: &User, id: &str) -> Result<bo
         .user_data_bulk(user.id, &ids)
         .await
         .map_err(DetailError::Store)?;
-    Ok(data.iter().all(|d| d.played))
+    Ok(FolderMarks::of(&data))
+}
+
+/// A series or season's marks, as [`folder_marks`] answers them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FolderMarks {
+    pub played: bool,
+    pub favorite: bool,
+}
+
+impl FolderMarks {
+    /// The marks of a folder holding items with `data`: each true only
+    /// when every item has it, so an empty folder has neither.
+    pub fn of(data: &[UserItemData]) -> Self {
+        let all = |f: fn(&UserItemData) -> bool| !data.is_empty() && data.iter().all(f);
+        Self {
+            played: all(|d| d.played),
+            favorite: all(|d| d.is_favorite),
+        }
+    }
 }
 
 /// Applies `change` to `user`'s state on every item under synthesised
@@ -285,6 +525,49 @@ async fn write_one(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// FR-002: a read time is whole seconds, 0 or less is now, a future one is
+    /// now.
+    #[test]
+    fn read_time_is_clamped_to_now() {
+        assert_eq!(
+            read_time_secs(1_700_000_123_999, 1_800_000_000),
+            1_700_000_123
+        );
+        assert_eq!(read_time_secs(0, 1_800_000_000), 1_800_000_000);
+        assert_eq!(read_time_secs(-5, 1_800_000_000), 1_800_000_000);
+        assert_eq!(read_time_secs(i64::MAX, 1_800_000_000), 1_800_000_000);
+    }
+
+    /// A folder is watched, or a favourite, only when every item in it is
+    /// (B1080); an empty one is neither.
+    #[test]
+    fn folder_marks_need_every_item() {
+        let item = |played, is_favorite| UserItemData {
+            played,
+            is_favorite,
+            ..UserItemData::default()
+        };
+        assert_eq!(FolderMarks::of(&[]), FolderMarks::default());
+        assert_eq!(
+            FolderMarks::of(&[item(true, true), item(true, true)]),
+            FolderMarks {
+                played: true,
+                favorite: true
+            }
+        );
+        assert_eq!(
+            FolderMarks::of(&[item(true, true), item(false, false)]),
+            FolderMarks::default()
+        );
+        assert_eq!(
+            FolderMarks::of(&[item(true, false), item(true, true)]),
+            FolderMarks {
+                played: true,
+                favorite: false
+            }
+        );
+    }
 
     /// Writes to different items do not wait on each other, and a lock
     /// nobody holds is forgotten.

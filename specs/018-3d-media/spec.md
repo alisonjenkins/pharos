@@ -2,7 +2,7 @@
 
 **Feature Branch**: `018-3d-media`
 **Created**: 2026-10-18T00:25:00Z
-**Status**: Ready
+**Status**: Implemented (T133-T145 done, T135 superseded by migration 0058_video_3d; audited 2026-11-09)
 **Scope**: Stereoscopic 3D detection from probe metadata and filename tags across movies and TV episodes, `Video3DFormat` wire exposure on Jellyfin DTOs, SQLite and PostgreSQL schema migration `0057` with `Is3D` filtering, DirectPlay passthrough by default, stereo-preserving and 2D left-eye conversion transcode pipelines (including thumbnail, trickplay, and subtitle burn-in safety), observability signals, and client compatibility verification.
 
 **Note (2026-11-01)**: landed after 3D edition grouping, which already added `media_items.video_3d_format` and `has_3d` in migration `0058_video_3d`. The planned `0057_video_3d_format` migration and its partial index were dropped, `Is3D` follows `has_3d` (primary file or any grouped edition), and the stream-detection re-probe is `PROBE_SCHEMA_VERSION = 8`.
@@ -19,7 +19,7 @@ Pharos currently discards stereoscopic 3D layout metadata during probing and fil
 
 ### User story 1 - Scan, persist, and browse 3D movies and TV episodes (Priority: P1)
 
-A library contains 3D movies (for example `Avatar (2009) [1080p.HSBS].mkv`, `Gravity (2013) 3D.MVC.mkv`) and 3D TV episodes (`Doctor Who - S07E14 - The Day of the Doctor [1080p.HTAB].mkv`). When the scanner runs, Pharos inspects both container/stream metadata (`stereo_mode` tags, `AV_PKT_DATA_STEREO3D` side data, H.264 `Stereo High` / `Multiview High` MVC profiles) and filename tokens (`HSBS`, `SBS`, `FSBS`, `HTAB`, `TAB`, `FTAB`, `OU`, `HOU`, `MVC`, `3D`, `anaglyph`). Upgraded libraries automatically re-probe existing files via `PROBE_SCHEMA_VERSION = 7`. Clients querying `/Items`, `/Users/{userId}/Items`, `/Shows/{id}/Episodes`, or `/Items/{id}/PlaybackInfo` receive `Video3DFormat` on the item, media source, and video stream, and can filter by `Is3D=true` or `Is3D=false`.
+A library contains 3D movies (for example `Film Q (2009) [1080p.HSBS].mkv`, `Film R (2013) 3D.MVC.mkv`) and 3D TV episodes (`Show K - S07E14 - Episode Title [1080p.HTAB].mkv`). When the scanner runs, Pharos inspects both container/stream metadata (`stereo_mode` tags, `AV_PKT_DATA_STEREO3D` side data, H.264 `Stereo High` / `Multiview High` MVC profiles) and filename tokens (`HSBS`, `SBS`, `FSBS`, `HTAB`, `TAB`, `FTAB`, `OU`, `HOU`, `MVC`, `3D`, `anaglyph`). Upgraded libraries automatically re-probe existing files via `PROBE_SCHEMA_VERSION = 7`. Clients querying `/Items`, `/Users/{userId}/Items`, `/Shows/{id}/Episodes`, or `/Items/{id}/PlaybackInfo` receive `Video3DFormat` on the item, media source, and video stream, and can filter by `Is3D=true` or `Is3D=false`.
 
 **Independent test**: Scan fixture movies and TV episodes covering Matroska `stereo_mode`, MP4 `Stereo 3D` side data, H.264 MVC profile, and filename-only tags into both SQLite and PostgreSQL stores; assert `BaseItemDto.Video3DFormat`, `MediaSourceInfo.Video3DFormat`, `MediaStreamDto.Video3DFormat`, and `/Items?Is3D=true` / `/Items?Is3D=false`.
 

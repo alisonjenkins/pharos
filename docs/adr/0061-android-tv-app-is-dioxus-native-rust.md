@@ -1,6 +1,6 @@
 # ADR-0061: The Android TV app is the Dioxus UI built for Android, in Rust only
 
-- **Status:** Proposed
+- **Status:** Proposed. Superseded in part by ADR-0077 (renderer and playback) once that is accepted; this app stays the default until spec 032's parity gate passes.
 - **Date:** 2026-11-04T22:20:00Z
 - **Deciders:** Alison
 
@@ -35,9 +35,24 @@ Details: `specs/025-android-tv/spec.md`.
   and every new browser call needs an Android twin.
 - Dioxus on Android is younger than its web target and unproven on TV; a
   spike on real hardware gates the work.
-- How `android.rs` reads the DOM (async surface or a JS state mirror) is not
-  decided here; it waits for a TV measurement of `document::eval` latency
-  (spec 025, Open questions).
+- `android.rs` reads the DOM both ways, by how a value changes (decided
+  2026-11-08 from the TV's eval latency, `specs/025-android-tv/spike-0.md`).
+  State that changes on its own (`<video>` position and media state,
+  viewport, page visibility, current path) is pushed by a JS mirror into
+  Rust and read synchronously from the cache, so `web.rs`'s synchronous
+  callers keep their signatures; the mirror can lag by one push. Reads made
+  on an input (spatial focus, element sizes, tile in view) run as one
+  batched `document::eval` per event. Worst of five launches (p50 / p95 /
+  p99), a single-value read is 2.2 / 2.9 / 3.7 ms idle and 2.9 / 8.9 /
+  12.2 ms during muted 1080p playback; a batched ten-value read is 2.8 /
+  3.9 / 6.8 ms idle and 4.2 / 11.1 / 12.6 ms playing. The mirror's push
+  holds 60 Hz during playback (gap p95 20.1 ms, max 24.7 ms). So one
+  batched read per key press fits a 16.7 ms frame. Polling media state by
+  eval every frame would spend up to three quarters of each frame waiting,
+  and a synchronous caller cannot wait on an eval at all; the push costs
+  readers nothing. A fully async surface
+  was rejected: every caller changes and it still pays a round trip per
+  read.
 - Until native playback lands, codec support is the WebView's (weak HEVC,
   HDR and surround).
 - The Nix devShell gains the Android SDK/NDK.
