@@ -18,7 +18,7 @@ use super::keymap::Mode;
 use super::keys::{use_arrival_focus, use_key_mode};
 use super::palette::Row;
 use super::platform;
-use super::playback::{ends_at_label, left_to_watch, start_ms, Left};
+use super::playback::{ends_at_label, left_to_watch, start_ms, FailureKind, Left};
 use super::queue::video_kind;
 use super::reader;
 use super::route::Route;
@@ -500,27 +500,30 @@ pub fn GroupEndedNote(message: String) -> Element {
     }
 }
 
-/// Why a video is not playing: the plain-language headline the viewer reads
-/// and the raw reason kept for the details line (B806).
+/// Why a video is not playing: the plain-language headline the viewer reads,
+/// the hint chosen by what kind of failure it was, and the raw reason and
+/// trace id kept for the details line (B806, 038 FR-403/404).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlayFailure {
     pub headline: &'static str,
     pub reason: String,
-    /// The media would not decode, so the file is likely damaged there
-    /// rather than the connection at fault (B1160).
-    pub damaged: bool,
+    /// Who can fix it: the connection, the server, the browser, the file.
+    pub kind: FailureKind,
     /// Where a skip past the damage carries on from, when one is offered.
     pub skip_to_ms: Option<u64>,
+    /// The server's trace id for a refusal, to quote in a report.
+    pub trace_id: Option<String>,
 }
 
 impl PlayFailure {
-    /// The stream broke while it played.
-    pub fn stream(reason: impl Into<String>) -> Self {
+    /// The stream broke while it played, for a reason of `kind`.
+    pub fn stream(kind: FailureKind, reason: impl Into<String>) -> Self {
         Self {
             headline: "This video stopped playing.",
             reason: reason.into(),
-            damaged: false,
+            kind,
             skip_to_ms: None,
+            trace_id: None,
         }
     }
 
@@ -528,30 +531,60 @@ impl PlayFailure {
     /// where a skip past it lands, if one is offered.
     pub fn damaged(reason: impl Into<String>, skip_to_ms: Option<u64>) -> Self {
         Self {
-            damaged: true,
             skip_to_ms,
-            ..Self::stream(reason)
+            ..Self::stream(FailureKind::Damaged, reason)
         }
     }
 
-    /// The video could not be started: the engine would not attach, or the
-    /// server refused the play.
-    pub fn start(reason: impl Into<String>) -> Self {
+    /// The video could not be started: the engine would not attach, the
+    /// browser cannot play it, or the server refused the play.
+    pub fn start(failure: StartFailure) -> Self {
         Self {
             headline: "This video could not be started.",
-            reason: reason.into(),
-            damaged: false,
+            reason: failure.reason,
+            kind: failure.kind,
             skip_to_ms: None,
+            trace_id: failure.trace_id,
         }
     }
 
-    /// The line under the headline: what the viewer can do.
+    /// The line under the headline: what the viewer can do, by kind.
     pub fn hint(&self) -> &'static str {
-        match (self.damaged, self.skip_to_ms.is_some()) {
-            (true, true) => "This part of the file looks damaged. Skip ahead to carry on past it.",
-            (true, false) => "This part of the file looks damaged. Try again, or go back.",
-            (false, _) => "Check your connection, then try again. Your place is kept.",
+        match (self.kind, self.skip_to_ms.is_some()) {
+            (FailureKind::Damaged, true) => {
+                "This part of the file looks damaged. Skip ahead to carry on past it."
+            }
+            (FailureKind::Damaged, false) => {
+                "This part of the file looks damaged. Try again, or go back."
+            }
+            (FailureKind::Network, _) => {
+                "Check your connection, then try again. Your place is kept."
+            }
+            (FailureKind::Server, _) => {
+                "The server couldn't send this video. Try again, and report it if it keeps happening."
+            }
+            (FailureKind::Unplayable, _) => {
+                "This browser can't play this video. Try another browser or device, or report it."
+            }
         }
+    }
+
+    /// The small details line: the raw reason, then the trace id to quote.
+    pub fn details(&self) -> String {
+        match &self.trace_id {
+            Some(trace) => format!("Details: {} (trace {trace})", self.reason),
+            None => format!("Details: {}", self.reason),
+        }
+    }
+
+    /// The breadcrumb a report from the panel carries.
+    pub fn crumb(&self) -> String {
+        format!(
+            "playback failure kind={} headline={:?} {}",
+            self.kind.label(),
+            self.headline,
+            self.details()
+        )
     }
 
     /// The one line a compact window shows in place of the panel.
@@ -560,9 +593,47 @@ impl PlayFailure {
     }
 }
 
+/// Why a play could not start, as the negotiation reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartFailure {
+    pub kind: FailureKind,
+    pub reason: String,
+    pub trace_id: Option<String>,
+}
+
+impl StartFailure {
+    pub fn new(kind: FailureKind, reason: impl Into<String>) -> Self {
+        Self {
+            kind,
+            reason: reason.into(),
+            trace_id: None,
+        }
+    }
+
+    /// A failed call: the server's answer is the server's, with its trace
+    /// id; a call that never got one is the network's.
+    pub fn from_client(e: &ClientError) -> Self {
+        match e {
+            ClientError::Api { trace_id, .. } => Self {
+                kind: FailureKind::Server,
+                reason: e.to_string(),
+                trace_id: Some(trace_id.clone()).filter(|t| !t.is_empty()),
+            },
+            ClientError::Rpc(_) => Self::new(FailureKind::Network, e.to_string()),
+        }
+    }
+}
+
+/// The reason alone, as a compact window's one line shows it.
+impl std::fmt::Display for StartFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.reason)
+    }
+}
+
 /// A playback failure over the picture: what happened in plain words, a way
-/// to try again from the last position, a way out, and the raw reason in a
-/// small details line (B806).
+/// to try again from the last position, a way out, a way to report it, and
+/// the raw reason and trace id in a small details line (B806, 038 FR-403).
 #[component]
 pub fn PlaybackFailure(
     failure: PlayFailure,
@@ -571,10 +642,13 @@ pub fn PlaybackFailure(
     /// Carries on from `failure.skip_to_ms`; without it no skip is offered.
     #[props(default)]
     on_skip: Option<EventHandler<u64>>,
+    /// Opens "Report a problem"; without it the button is not shown.
+    #[props(default)]
+    on_report: Option<EventHandler<()>>,
 ) -> Element {
     let skip = failure.skip_to_ms.zip(on_skip);
     rsx! {
-        div { class: "pharos-playback-failure", role: "alert",
+        div { class: "pharos-playback-failure", role: "alert", "data-kind": failure.kind.label(),
             p { class: "pharos-playback-failure-title", "{failure.headline}" }
             p { class: "pharos-playback-failure-hint", "{failure.hint()}" }
             div { class: "pharos-playback-failure-actions",
@@ -602,8 +676,16 @@ pub fn PlaybackFailure(
                     onclick: move |_| on_back.call(()),
                     "Back"
                 }
+                if let Some(on_report) = on_report {
+                    button {
+                        class: "pharos-playback-failure-report",
+                        r#type: "button",
+                        onclick: move |_| on_report.call(()),
+                        "Report a problem"
+                    }
+                }
             }
-            p { class: "pharos-playback-failure-details", "Details: {failure.reason}" }
+            p { class: "pharos-playback-failure-details", "{failure.details()}" }
         }
     }
 }
@@ -1818,7 +1900,7 @@ mod tests {
         let html = render(|| {
             rsx! {
                 PlaybackFailure {
-                    failure: PlayFailure::stream("the stream failed (video segment 14: timeout)"),
+                    failure: PlayFailure::stream(FailureKind::Network, "the stream failed (video segment 14: timeout)"),
                     on_retry: |_| {},
                     on_back: |_| {},
                 }
@@ -1860,7 +1942,7 @@ mod tests {
         let network = render(|| {
             rsx! {
                 PlaybackFailure {
-                    failure: PlayFailure::stream("networkError"),
+                    failure: PlayFailure::stream(FailureKind::Network, "networkError"),
                     on_retry: |_| {},
                     on_back: |_| {},
                     on_skip: |_| {},
@@ -1999,9 +2081,62 @@ mod tests {
 
     #[test]
     fn a_start_failure_reads_differently_from_a_broken_stream() {
-        let start = PlayFailure::start("no MSE");
-        assert_ne!(start.headline, PlayFailure::stream("x").headline);
+        let start = PlayFailure::start(StartFailure::new(FailureKind::Unplayable, "no MSE"));
+        assert_ne!(start.headline, PlayFailure::stream(FailureKind::Network, "x").headline);
         assert_eq!(start.line(), "This video could not be started. no MSE");
+    }
+
+    /// 038 FR-403, V1219: the hint follows the kind of failure, so a refusal
+    /// or a codec the browser lacks is not blamed on the connection. Disarm
+    /// check: with `hint` matching only on the skip, the server and browser
+    /// lines read "Check your connection".
+    #[test]
+    fn the_failure_hint_names_who_can_fix_it() {
+        let hint = |kind| PlayFailure::stream(kind, "x").hint();
+        assert!(hint(FailureKind::Network).contains("connection"));
+        assert!(hint(FailureKind::Server).contains("server"));
+        assert!(hint(FailureKind::Unplayable).contains("browser"));
+        assert!(hint(FailureKind::Damaged).contains("damaged"));
+        let all = [FailureKind::Network, FailureKind::Server, FailureKind::Unplayable, FailureKind::Damaged];
+        let distinct: std::collections::HashSet<_> = all.iter().map(|&k| hint(k)).collect();
+        assert_eq!(distinct.len(), all.len());
+    }
+
+    /// 038 FR-404, V1216: a refused play shows the server's trace id small
+    /// and the panel offers Report a problem; a panel without the handler
+    /// has no button.
+    #[test]
+    fn a_refused_start_shows_its_trace_id_and_a_report_button() {
+        let refused = ClientError::Api {
+            kind: "unavailable",
+            reason: "transcoder unavailable".to_owned(),
+            trace_id: "4bf92f3577b34da6a3ce929d0e0e4736".to_owned(),
+        };
+        let failure = PlayFailure::start(StartFailure::from_client(&refused));
+        assert_eq!(failure.kind, FailureKind::Server);
+        let html = render(move || {
+            rsx! {
+                PlaybackFailure {
+                    failure: failure.clone(),
+                    on_retry: |_| {},
+                    on_back: |_| {},
+                    on_report: |_| {},
+                }
+            }
+        });
+        assert!(html.contains("(trace 4bf92f3577b34da6a3ce929d0e0e4736)"), "{html}");
+        assert!(html.contains("Report a problem"), "{html}");
+        assert!(html.contains(r#"data-kind="server""#), "{html}");
+        let no_report = render(|| {
+            rsx! {
+                PlaybackFailure {
+                    failure: PlayFailure::stream(FailureKind::Network, "x"),
+                    on_retry: |_| {},
+                    on_back: |_| {},
+                }
+            }
+        });
+        assert!(!no_report.contains("Report a problem"), "{no_report}");
     }
 
     /// The heading on `html`, open tag to close tag.

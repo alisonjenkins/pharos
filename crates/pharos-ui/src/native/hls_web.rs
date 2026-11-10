@@ -21,7 +21,7 @@ use super::platform::{
 };
 use super::playback::{
     abr_ladder, check_master, forward_buffer_ms, pick_audio_uri, plan_hls, ranges_to_ms,
-    rung_label, segment_deadlines, with_abr, AbrSwitchReport, Fatal, FragmentLoad,
+    rung_label, segment_deadlines, with_abr, AbrSwitchReport, FailureKind, Fatal, FragmentLoad,
     HlsFallbackCause, MediaRecovery, MediaRecoveryReport, MediaVerdict, OnFatal, OnFragment,
     PlaybackEngine, SegmentFailureReport, SegmentRecovery, StallReport,
 };
@@ -849,7 +849,8 @@ async fn fallback(weak: &Weak<RefCell<Session>>, cause: HlsFallbackCause, value:
         Ok(()) => {
             session.borrow_mut().fallback = Some(hls);
         }
-        Err(e) => on_fatal(Fatal::other(e)),
+        // hls.js would not attach to this browser's media element.
+        Err(e) => on_fatal(Fatal::of(FailureKind::Unplayable, e)),
     }
 }
 
@@ -1559,13 +1560,19 @@ fn on_fetch_failed(
         return;
     }
     match report.recovery {
-        SegmentRecovery::Fail { .. } => on_fatal(Fatal::other(format!(
-            "the stream failed ({} segment {}: {} {})",
-            report.track,
-            report.index,
-            report.cause.label(),
-            report.reason
-        ))),
+        SegmentRecovery::Fail { .. } => on_fatal(Fatal::of(
+            match report.cause {
+                Cause::Http(status) => FailureKind::of_status(status),
+                _ => FailureKind::Network,
+            },
+            format!(
+                "the stream failed ({} segment {}: {} {})",
+                report.track,
+                report.index,
+                report.cause.label(),
+                report.reason
+            ),
+        )),
         SegmentRecovery::Retry { after_ms, .. } => {
             let weak = Rc::downgrade(session);
             wasm_bindgen_futures::spawn_local(async move {
