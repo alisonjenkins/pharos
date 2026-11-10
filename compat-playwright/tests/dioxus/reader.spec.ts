@@ -86,8 +86,8 @@ async function openFromSearch(page: Page, term: string, heading: string): Promis
 }
 
 /** The words of the book lying inside the page frame, in reading order. */
-async function wordsOnPage(page: Page): Promise<string[]> {
-  return page.evaluate(() => {
+async function wordsOnPage(page: Page, pattern = "zq\\d+x\\d+x\\d+"): Promise<string[]> {
+  return page.evaluate((pattern) => {
     const host = document.getElementById("pharos-reader-host");
     const root = host?.shadowRoot;
     const frame = root?.querySelector(".quire-frame");
@@ -98,7 +98,7 @@ async function wordsOnPage(page: Page): Promise<string[]> {
     const walker = document.createTreeWalker(strip, NodeFilter.SHOW_TEXT);
     for (let n = walker.nextNode(); n; n = walker.nextNode()) {
       const text = n.nodeValue ?? "";
-      for (const m of text.matchAll(/zq\d+x\d+x\d+/g)) {
+      for (const m of text.matchAll(new RegExp(pattern, "g"))) {
         const range = document.createRange();
         range.setStart(n, m.index ?? 0);
         range.setEnd(n, (m.index ?? 0) + m[0].length);
@@ -109,7 +109,7 @@ async function wordsOnPage(page: Page): Promise<string[]> {
       }
     }
     return words;
-  });
+  }, pattern);
 }
 
 /** Waits for the first page to be laid out and returns its first word. */
@@ -377,6 +377,84 @@ test.describe("book reader (spec 023)", () => {
 
     await first.close();
     await second.close();
+  });
+
+  test("links in a book jump to their place, by mouse and by keys, and Return goes back (V1286-V1288)", async ({
+    browser,
+    request,
+  }) => {
+    const context = await newReaderContext(browser, { width: 1280, height: 800 });
+    const page = await context.newPage();
+    echoReaderLog(page, "links");
+    const jumps: string[] = [];
+    page.on("console", (m) => {
+      if (m.text().startsWith("pharos: reader jump ")) jumps.push(m.text());
+    });
+    await signIn(page, request);
+    await openFromSearch(page, "Reader Links", "Reader Links");
+    await page.locator("#pharos-main-action").click();
+    const link = (id: string) => page.locator(`#pharos-reader-host a#${id}`);
+    // From the contents page, wherever a run before left the book.
+    const toContentsPage = async () => {
+      await page.getByRole("button", { name: "Contents", exact: true }).first().click();
+      await page.locator(".pharos-reader-toc-row", { hasText: /^Contents$/ }).click();
+    };
+    await expect(page.locator(".pharos-reader")).toBeVisible({ timeout: 15_000 });
+    await toContentsPage();
+    await expect(link("to-deep")).toBeVisible({ timeout: 15_000 });
+    const words = () => wordsOnPage(page, "zl(?:\\d+x\\d+|note)");
+
+    // A click on a contents link opens the chapter on the page holding the
+    // target, deep inside it, and offers the way back.
+    await link("to-deep").click();
+    await expect.poll(words, { timeout: 10_000 }).toContain("zl30x0");
+    const back = page.getByRole("button", { name: "↩ Return" });
+    await expect(back).toBeVisible();
+    await expect.poll(() => jumps.at(-1) ?? "").toMatch(/via=link .* to=1#deep landed=target/);
+    if (SHOTS) {
+      fs.mkdirSync(SHOTS, { recursive: true });
+      await page.screenshot({ path: path.join(SHOTS, "reader-link-followed.png") });
+    }
+    await back.click();
+    await expect(link("to-deep")).toBeVisible({ timeout: 10_000 });
+    await expect(back).toHaveCount(0);
+
+    // An old <a name> target is found too (B1315).
+    await link("to-old").click();
+    await expect.poll(words, { timeout: 10_000 }).toContain("zl50x0");
+    await back.click();
+    await expect(link("to-old")).toBeVisible({ timeout: 10_000 });
+
+    // The keys: Down focuses the first link on the page, Down again the
+    // next, Enter follows it (V1287).
+    await page.locator("#pharos-reader").focus();
+    await page.keyboard.press("ArrowDown");
+    await expect.poll(() => page.evaluate(() => document.getElementById("pharos-reader-host")?.shadowRoot?.activeElement?.id)).toBe("to-deep");
+    if (SHOTS) await page.screenshot({ path: path.join(SHOTS, "reader-link-focused.png") });
+    await page.keyboard.press("ArrowDown");
+    await expect.poll(() => page.evaluate(() => document.getElementById("pharos-reader-host")?.shadowRoot?.activeElement?.id)).toBe("to-old");
+    await page.keyboard.press("ArrowUp");
+    await expect.poll(() => page.evaluate(() => document.getElementById("pharos-reader-host")?.shadowRoot?.activeElement?.id)).toBe("to-deep");
+    await page.keyboard.press("Enter");
+    await expect.poll(words, { timeout: 10_000 }).toContain("zl30x0");
+
+    // A footnote in a file outside the reading order opens, and Return comes
+    // back to the page it was read from.
+    await back.click();
+    await page.getByRole("button", { name: "Contents", exact: true }).first().click();
+    await page.locator(".pharos-reader-toc-row", { hasText: "Chapter One" }).click();
+    await expect.poll(words, { timeout: 10_000 }).toContain("zl0x0");
+    await expect(back).toHaveCount(0);
+    await link("noteref").click();
+    await expect.poll(words, { timeout: 10_000 }).toContain("zlnote");
+    await back.click();
+    await expect.poll(words, { timeout: 10_000 }).toContain("zl0x0");
+
+    // A web link stays a plain link to a new tab with no opener.
+    await toContentsPage();
+    await expect(link("to-web")).toHaveAttribute("target", "_blank");
+    await expect(link("to-web")).toHaveAttribute("rel", "noopener noreferrer");
+    await context.close();
   });
 
   test("a locked Kindle book has no Read button and offers the download (V353)", async ({
