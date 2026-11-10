@@ -3824,6 +3824,14 @@ label.pharos-setting {
   flex: 0 0 auto;
 }
 /* The watched tick: an outline ring until marked, then filled. */
+.pharos-episode-rematch {
+  flex: 0 0 auto;
+  font-size: 0.85em;
+}
+.pharos-episode-rematch-status {
+  flex: 0 1 12rem;
+  font-size: 0.85em;
+}
 .pharos-episode-mark {
   flex: 0 0 auto;
   display: grid;
