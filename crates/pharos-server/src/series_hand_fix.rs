@@ -791,7 +791,7 @@ mod tests {
                 .with_ansi(false)
                 .finish(),
         );
-        let s = flash().await;
+        let s = show_a().await;
         s.put(MediaItem {
             id: 9,
             path: "/movies/Heat.mkv".into(),
