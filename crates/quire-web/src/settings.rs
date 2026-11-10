@@ -5,8 +5,7 @@ use crate::layout::Fit;
 /// Which typeface the text is set in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Font {
-    /// The book's own `font-family` rules (embedded fonts are not loaded, so
-    /// this falls back to the families they name and then the generic one).
+    /// The book's own `font-family` rules, with the fonts the book ships.
     #[default]
     Book,
     Serif,
