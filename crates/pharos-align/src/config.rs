@@ -95,7 +95,17 @@ impl Config {
             None => Some(DEFAULT_IDLE_UNLOAD),
             Some(raw) => match raw.trim().parse::<f64>() {
                 Ok(0.0) => None,
-                Ok(s) if s > 0.0 && s.is_finite() => Some(Duration::from_secs_f64(s)),
+                // try_: a value past Duration's range would panic in from_secs_f64.
+                Ok(s) if s > 0.0 => match Duration::try_from_secs_f64(s) {
+                    Ok(d) => Some(d),
+                    Err(_) => {
+                        return Err(invalid(
+                            "PHAROS_ALIGNER_IDLE_UNLOAD_SECS",
+                            "seconds >= 0",
+                            &raw,
+                        ))
+                    }
+                },
                 _ => {
                     return Err(invalid(
                         "PHAROS_ALIGNER_IDLE_UNLOAD_SECS",
@@ -258,6 +268,18 @@ mod tests {
             e.to_string(),
             r#"PHAROS_ALIGNER_IDLE_UNLOAD_SECS must be seconds >= 0, got "-1""#
         );
+        for huge in ["1e30", "inf"] {
+            let e = Config::from_env(env(&[
+                ("PHAROS_ALIGNER_MEDIA_ROOT", "/m"),
+                ("PHAROS_ALIGNER_WEIGHTS", "/w"),
+                ("PHAROS_ALIGNER_IDLE_UNLOAD_SECS", huge),
+            ]))
+            .unwrap_err();
+            assert_eq!(
+                e.to_string(),
+                format!(r#"PHAROS_ALIGNER_IDLE_UNLOAD_SECS must be seconds >= 0, got "{huge}""#)
+            );
+        }
         let e = Config::from_env(env(&[
             ("PHAROS_ALIGNER_MEDIA_ROOT", "/m"),
             ("PHAROS_ALIGNER_WEIGHTS", "/w"),
