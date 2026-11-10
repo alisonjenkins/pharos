@@ -454,7 +454,6 @@ pub async fn auto_keep(
     if before.as_ref().is_some_and(|s| !s.is_for(user)) {
         clear_all("another user").await;
     }
-    let was_kept = before.is_some_and(|s| s.is_for(user) && s.find(&id.to_string()).is_some());
     let key = book_key(id);
     let stored = async {
         let response =
@@ -477,14 +476,13 @@ pub async fn auto_keep(
     let mut store = match read_checked() {
         Ok(store) => store.unwrap_or_else(|| KeptStore::new(user)),
         Err(()) => {
+            // The bytes stay: another tab may have kept this book since the
+            // first read, and its record would then list a copy deleted
+            // here. A copy listed nowhere is the lesser harm; sign-out
+            // clears it with the cache, and a later keep lists it again.
             platform::warn(&format!(
-                "pharos: kept auto failed item={id} bytes={size} error=record unreadable"
+                "pharos: kept auto failed item={id} bytes={size} key={key} error=record unreadable cached=left"
             ));
-            // The bytes just cached are listed nowhere; a copy kept before
-            // stays, as the record will still list it once it reads again.
-            if !was_kept {
-                forget_cached(user, &key).await;
-            }
             return false;
         }
     };
@@ -517,21 +515,6 @@ pub async fn auto_keep(
         store.total_bytes()
     ));
     true
-}
-
-/// Deletes one cached book's bytes, logging a failure.
-async fn forget_cached(user: &str, key: &str) {
-    let deleted = async {
-        let cache = open_cache(user).await?;
-        JsFuture::from(cache.delete_with_str(key))
-            .await
-            .map_err(|e| describe(&e))
-    };
-    if let Err(e) = deleted.await {
-        platform::warn(&format!(
-            "pharos: kept auto cleanup failed key={key} error={e}"
-        ));
-    }
 }
 
 /// Removes a kept book from the device: its bytes and its record.
