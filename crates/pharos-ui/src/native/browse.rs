@@ -1043,9 +1043,16 @@ fn PagedGrid(
     });
     // The grid keeps its loaded pages through a screen reload, so a mark
     // stored from one of its tiles is shown on that tile here (V1160).
+    // The mark standing when the grid mounts is older than its pages, which
+    // already show it or something newer, so only later ones apply.
     let stored = try_use_context::<StoredMark>();
+    let mounted = use_hook(|| std::rc::Rc::new(std::cell::Cell::new(false)));
     use_effect(move || {
-        if let Some((id, played)) = stored.and_then(|s| *s.0.read()) {
+        let last = stored.and_then(|s| *s.0.read());
+        if !mounted.replace(true) {
+            return;
+        }
+        if let Some((id, played)) = last {
             if pager.peek().items().iter().any(|i| i.id == id) {
                 pager.write().mark(id, played);
             }
