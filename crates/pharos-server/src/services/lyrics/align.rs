@@ -17,6 +17,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 use tracing::Instrument as _;
 
+use super::shadow::Shadow;
 use super::{Lyrics, WordStamp};
 
 /// Bumped when the aligner's answers change for the same song and lines, so
@@ -235,6 +236,14 @@ fn write_record(dir: &Path, path: &Path, record: &WordsRecord) -> std::io::Resul
     Ok(())
 }
 
+/// An aligner's answer, with the request that got it and its traceparent,
+/// so the shadow can be sent the very same request.
+struct Answered {
+    aligned: Aligned,
+    sent: Vec<u8>,
+    traceparent: Option<String>,
+}
+
 /// Client and background worker for lyric forced alignment.
 pub struct Aligner {
     http: Client,
@@ -245,6 +254,8 @@ pub struct Aligner {
     /// Songs whose last alignment failed, and when to try them again.
     failed: Mutex<HashMap<u64, std::time::Instant>>,
     tx: mpsc::Sender<Job>,
+    /// Spec 039, R21: sent each stored song for a comparison, when set.
+    shadow: Option<Shadow>,
 }
 
 impl Aligner {
@@ -260,11 +271,19 @@ impl Aligner {
             pending: Mutex::new(HashSet::new()),
             failed: Mutex::default(),
             tx: mpsc::channel(1).0,
+            shadow: None,
         }
     }
 
     /// Start the aligner background worker and return a shared handle.
-    pub fn start(url: String, media_root: PathBuf, cache_dir: Option<PathBuf>) -> Arc<Self> {
+    /// `shadow_url`, when set, gets each song again once its answer is
+    /// stored (spec 039, R21).
+    pub fn start(
+        url: String,
+        shadow_url: Option<String>,
+        media_root: PathBuf,
+        cache_dir: Option<PathBuf>,
+    ) -> Arc<Self> {
         let ua = format!(
             "pharos/{} (https://github.com/alisonjenkins/pharos)",
             env!("CARGO_PKG_VERSION")
@@ -278,7 +297,9 @@ impl Aligner {
         let (tx, mut rx) = mpsc::channel(64);
         let cache = AlignCache::new(cache_dir);
         let base = url.trim_end_matches('/').to_owned();
+        let shadow = shadow_url.map(|u| Shadow::new(http.clone(), &u));
         let aligner = Arc::new(Self {
+            shadow,
             http,
             base,
             media_root,
@@ -317,14 +338,25 @@ impl Aligner {
     }
 
     async fn process_job(&self, job: &Job) -> Result<(), String> {
-        let aligned = self.request(&job.path, &job.lines, TIMEOUT).await?;
+        let Answered {
+            aligned,
+            sent,
+            traceparent,
+        } = self.request(&job.path, &job.lines, TIMEOUT).await?;
         tracing::info!(
             media.id = job.id,
             lines = job.lines.len(),
             offset_ms = aligned.offset_ms,
             "lyrics: aligned"
         );
+
+        // Stored first: the shadow runs on its own task and never holds up,
+        // changes or replaces the primary's answer.
+        let compared = self.shadow.as_ref().map(|_| aligned.clone());
         self.cache.put(job.id, job.key.clone(), aligned);
+        if let (Some(shadow), Some(primary)) = (&self.shadow, compared) {
+            drop(shadow.spawn(job.id, sent, primary, traceparent));
+        }
         Ok(())
     }
 
@@ -334,7 +366,7 @@ impl Aligner {
         path: &str,
         lines: &[(u64, u64, String)],
         timeout: Duration,
-    ) -> Result<Aligned, String> {
+    ) -> Result<Answered, String> {
         #[derive(Serialize)]
         struct AlignRequest<'a> {
             path: &'a str,
@@ -362,10 +394,18 @@ impl Aligner {
             lines: req_lines,
         };
 
+        // Bytes, not `.json()`: the shadow is sent the very same request.
+        let sent = serde_json::to_vec(&payload).map_err(|e| format!("request body: {e}"))?;
         let url = format!("{}/align", self.base);
-        let mut request = self.http.post(&url).json(&payload).timeout(timeout);
-        if let Some(traceparent) = crate::obs::traceparent(&tracing::Span::current()) {
-            request = request.header("traceparent", traceparent);
+        let traceparent = crate::obs::traceparent(&tracing::Span::current());
+        let mut request = self
+            .http
+            .post(&url)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(sent.clone())
+            .timeout(timeout);
+        if let Some(traceparent) = &traceparent {
+            request = request.header("traceparent", traceparent.clone());
         }
         let resp = request.send().await.map_err(|e| format!("request: {e}"))?;
 
@@ -375,7 +415,11 @@ impl Aligner {
         }
 
         let body = resp.text().await.map_err(|e| format!("body: {e}"))?;
-        parse_answer(&body, lines.len())
+        Ok(Answered {
+            aligned: parse_answer(&body, lines.len())?,
+            sent,
+            traceparent,
+        })
     }
 
     /// Word stamps for sung subtitle lines of a video, `(start, end, text)`
@@ -413,7 +457,7 @@ impl Aligner {
                 return Ok(hit);
             }
         }
-        let aligned = self.request(rel, lines, SING_TIMEOUT).await?;
+        let aligned = self.request(rel, lines, SING_TIMEOUT).await?.aligned;
         self.cache.put(item.id, key, aligned.clone());
         Ok(aligned)
     }
@@ -621,6 +665,7 @@ mod tests {
             pending: Mutex::new(HashSet::new()),
             failed: Mutex::default(),
             tx,
+            shadow: None,
         }
     }
 
@@ -631,6 +676,70 @@ mod tests {
             kind: pharos_core::MediaKind::Audio,
             ..Default::default()
         }
+    }
+
+    #[tokio::test]
+    async fn the_primary_answer_is_stored_before_the_shadow_answers_and_never_replaced() {
+        use crate::services::lyrics::shadow::tests::{body, counts, fake};
+        use metrics_util::debugging::DebuggingRecorder;
+        use tokio::sync::oneshot;
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let stamp = |at, start_ms| WordStamp { at, start_ms };
+        let primary = Aligned {
+            lines: vec![vec![stamp(0, 1000), stamp(3, 1400)]],
+            offset_ms: 0,
+            scores: vec![None],
+        };
+        let differing = Aligned {
+            lines: vec![vec![stamp(0, 1000), stamp(3, 1600)]],
+            offset_ms: 0,
+            scores: vec![None],
+        };
+        let (primary_base, primary_got) = fake(200, body(&primary, 2), None).await;
+        let (release, hold) = oneshot::channel();
+        let (shadow_base, shadow_got) = fake(200, body(&differing, 3), Some(hold)).await;
+        let cache = AlignCache::new(None);
+        let (tx, _rx) = mpsc::channel(1);
+        let aligner = Aligner {
+            base: primary_base,
+            shadow: Some(Shadow::new(crate::http_client::client(), &shadow_base)),
+            ..test_aligner(PathBuf::from("/m"), cache.clone(), tx)
+        };
+        let job = Job {
+            id: 42,
+            path: "a/song.flac".into(),
+            lines: vec![(1000, 2000, "two words".into())],
+            key: "k".into(),
+        };
+
+        // The shadow holds its answer back, and the job still finishes.
+        tokio::time::timeout(Duration::from_secs(5), aligner.process_job(&job))
+            .await
+            .expect("the job waits for no shadow")
+            .unwrap();
+        assert_eq!(cache.get(42, "k"), Some(primary.clone()));
+        assert_eq!(
+            shadow_got.await.unwrap(),
+            primary_got.await.unwrap(),
+            "the shadow is sent the primary's request"
+        );
+
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while counts(&snapshotter).is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            cache.get(42, "k"),
+            Some(primary),
+            "the mismatch replaced nothing"
+        );
     }
 
     #[test]
