@@ -2809,8 +2809,14 @@ fn FindScreen() -> Element {
     let search = use_context::<Search>();
     use_hook(move || {
         let term = find::term_of(&platform::current_search());
-        // Back to the same term keeps the matches it already has.
-        if !term.trim().is_empty() && search.find.peek().term() != term.trim() {
+        // The URL is the page's state: no term starts it empty, rather than
+        // writing the last search back into the URL. Back to the same term
+        // keeps the matches it already has.
+        if term.trim().is_empty() {
+            if !search.text.peek().is_empty() {
+                search.clear();
+            }
+        } else if search.find.peek().term() != term.trim() {
             search.edit(ctx, term);
         }
     });
