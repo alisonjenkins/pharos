@@ -253,6 +253,13 @@ pub fn Shell(
 /// A button per library, in the home page's order.
 #[component]
 pub fn LibraryNav(libraries: Vec<Item>, current: Option<ItemRef>) -> Element {
+    // The lit tab can sit past the edge of a phone's row, and a library's
+    // grid has no heading of its own to say where it is (B1313).
+    use_effect(use_reactive!(|current| {
+        if current.is_some() {
+            platform::reveal_across(".pharos-library-tab[aria-current='page']");
+        }
+    }));
     if libraries.is_empty() {
         return rsx! {};
     }

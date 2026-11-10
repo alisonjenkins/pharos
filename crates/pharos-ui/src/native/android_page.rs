@@ -1075,6 +1075,18 @@ pub fn center_child(id: &str, at: u32) -> bool {
 
 pub fn reveal(_list: &str, _id: &str) {}
 
+/// As the browser's: the row around `selector` scrolls sideways so the
+/// element is in sight, and the page stays put.
+pub fn reveal_across(selector: &str) {
+    run(format!(
+        "(() => {{ const el = document.querySelector({}); const row = el && el.parentElement; if (!row) return; \
+         const o = row.getBoundingClientRect(), i = el.getBoundingClientRect(); \
+         if (i.left < o.left) row.scrollLeft += i.left - o.left; \
+         else if (i.right > o.right) row.scrollLeft += i.right - o.right; }})();",
+        js_str(selector)
+    ));
+}
+
 pub struct PageHide;
 
 pub fn on_page_hide(_on_hide: impl FnMut() + 'static) -> PageHide {
