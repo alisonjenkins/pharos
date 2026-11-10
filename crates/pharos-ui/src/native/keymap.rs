@@ -301,6 +301,22 @@ pub const BINDINGS: &[Binding] = &[
         PLAYERS,
         A::Transport(Transport::SeekForward),
     ),
+    // A remote's rewind and fast-forward keys (FR-609); on a TV they move
+    // the scrub preview, and holding one speeds it up, as left and right do.
+    bind(
+        &["MediaRewind"],
+        "Back 10 s",
+        G::Play,
+        PLAYERS,
+        A::Transport(Transport::SeekBack),
+    ),
+    bind(
+        &["MediaFastForward"],
+        "Forward 10 s",
+        G::Play,
+        PLAYERS,
+        A::Transport(Transport::SeekForward),
+    ),
     bind(
         &["ArrowUp"],
         "Volume up",
@@ -647,6 +663,8 @@ pub fn key_name(key: &str) -> &str {
         "ArrowRight" => "→",
         " " => "Space",
         "Escape" => "Esc",
+        "MediaRewind" => "⏪",
+        "MediaFastForward" => "⏩",
         other => other,
     }
 }
