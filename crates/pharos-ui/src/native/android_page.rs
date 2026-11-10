@@ -1961,10 +1961,33 @@ if (!window.__pharosGuard) {
   history.replaceState("pharos-guard", "", location.href);
   history.pushState("pharos", "", location.href);
 }
+// Back closes an open dialog or menu before it goes back a page (FR-607),
+// with the Escape each of them already closes on. One that is still open
+// at the next Back, with no key pressed between, does not close on Escape:
+// that Back goes on as usual.
+let backClosed = null;
+addEventListener("keydown", () => { backClosed = null; }, true);
+const closeOverlay = () => {
+  let el = null;
+  for (const o of document.querySelectorAll('__OVERLAYS__')) {
+    if (o.getClientRects().length > 0) { el = o; break; }
+  }
+  if (!el || el === backClosed) return null;
+  const at = document.activeElement;
+  const target = at && el.contains(at) ? at : el;
+  target.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));
+  backClosed = el;
+  return (el.getAttribute("role") || "") + "." + (el.className || el.tagName.toLowerCase());
+};
 addEventListener("popstate", (e) => {
+  const closed = closeOverlay();
   if (e.state === "pharos-guard") {
     history.pushState("pharos", "", location.href);
-    send({ t: "root" });
+    send(closed ? { t: "backclose", what: closed, restore: false } : { t: "root" });
+    return;
+  }
+  if (closed) {
+    send({ t: "backclose", what: closed, restore: true });
     return;
   }
   send({ t: "pop", path: location.pathname + location.search });
@@ -2164,6 +2187,17 @@ fn on_bridge(message: Bridge) {
             }
         }
         Bridge::Size { w, h } => *lock(&VIEWPORT) = (w, h),
+        Bridge::BackClose { what, restore } => {
+            let here = current_path();
+            log::info!("pharos: back closed overlay what={what} path={here}");
+            if restore {
+                // The WebView went back an entry; the page stays.
+                run(format!(
+                    "history.pushState('pharos', '', {});",
+                    js_str(&here)
+                ));
+            }
+        }
         Bridge::OkPress { target } => {
             log::info!("pharos: remote ok pressed target={target}");
         }

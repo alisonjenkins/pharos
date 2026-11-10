@@ -331,6 +331,11 @@ addEventListener("keydown", (e) => {
 /// Up Next's Play now, or the skip intro/credits button (FR-604).
 pub const OK_PRESSES: &str = ".pharos-up-next-play, .pharos-up-next-pill-play, .pharos-skip";
 
+/// What the remote's Back closes, with an Escape, before it goes back a page
+/// (FR-607): dialogs, menus, an open search list, the player's settings
+/// sheet and its queue.
+pub const OVERLAYS: &str = r#"[aria-modal="true"], [role="dialog"], [role="menu"], [role="listbox"], .pharos-control-menus.is-open, .pharos-watch-queue"#;
+
 pub fn bridge_script(template: &str) -> String {
     template
         .replace("__BAR_KEYS__", BAR_KEY_JS)
@@ -340,6 +345,7 @@ pub fn bridge_script(template: &str) -> String {
         .replace("__PLAYER_HOME__", PLAYER_HOME)
         .replace("__REMOTE_SKIPS__", REMOTE_SKIPS)
         .replace("__OK_PRESSES__", OK_PRESSES)
+        .replace("__OVERLAYS__", OVERLAYS)
 }
 
 /// The container list a TV build declares: one no file has, so the server
@@ -387,6 +393,16 @@ pub enum Bridge {
     Root,
     /// The viewport's CSS size.
     Size { w: f64, h: f64 },
+    /// The remote's Back closed an open dialog or menu (`what`, its class
+    /// or role) instead of going back a page (FR-607). With `restore` the
+    /// WebView already went back an entry, which Rust puts back.
+    #[serde(rename = "backclose")]
+    BackClose {
+        #[serde(default)]
+        what: String,
+        #[serde(default)]
+        restore: bool,
+    },
     /// OK on the picture pressed the shown Skip or Up Next button (FR-604);
     /// `target` is its class.
     #[serde(rename = "okpress")]
@@ -779,6 +795,7 @@ mod tests {
         assert!(PLAYER_HOME.split(", ").any(|s| s == ".pharos-listen-play"));
         assert!(!bridge_script("__REMOTE_SKIPS__").contains("__"));
         assert_eq!(bridge_script("__OK_PRESSES__"), OK_PRESSES);
+        assert_eq!(bridge_script("__OVERLAYS__"), OVERLAYS);
         // B1222/V1182: the Info key's script is in the bridge, filled in.
         let keys = bridge_script("__BAR_KEYS__");
         assert!(keys.contains(r#"e.key !== "Info""#), "{keys}");
@@ -985,6 +1002,13 @@ mod tests {
             parse_bridge(&serde_json::json!({"t": "okpress", "target": "pharos-skip"})),
             Some(Bridge::OkPress {
                 target: "pharos-skip".to_owned()
+            })
+        );
+        assert_eq!(
+            parse_bridge(&serde_json::json!({"t": "backclose", "what": "menu", "restore": true})),
+            Some(Bridge::BackClose {
+                what: "menu".to_owned(),
+                restore: true
             })
         );
         assert_eq!(parse_bridge(&serde_json::json!({"t": "nope"})), None);
