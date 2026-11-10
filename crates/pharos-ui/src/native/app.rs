@@ -5624,6 +5624,8 @@ fn Player(
     // it, so a tick does not rebuild the player (B815).
     let mut position = use_signal(|| 0u64);
     let mut buffered = use_signal(|| 0u64);
+    // The viewer's playback speed (T038-305), 1.0 being normal.
+    let mut speed = use_signal(|| 1.0f64);
     let media_rest = use_memo(move || split_position(media()).0);
     // What a wait under the spinner is for (038 FR-401): whether this video
     // has played yet, and, once a wait passes `wait::HINT_AFTER_MS`, the
@@ -6629,6 +6631,18 @@ fn Player(
             if *buffered.peek() != to {
                 buffered.set(to);
             }
+            // A new source or element starts at its default rate; the
+            // viewer's speed carries over, except in a group, whose drift
+            // correction owns the rate.
+            let want = *speed.peek();
+            if event == MediaEvent::Playing
+                && !music
+                && want != 1.0
+                && !session().is_some_and(|s| s.drives())
+                && platform::speed(VIDEO_ID) != want
+            {
+                platform::set_speed(VIDEO_ID, want);
+            }
             if let Some(next) = up_next_to.get() {
                 let total = total_ms(&state, p.detail.item.runtime_ms);
                 let from = up_next_at(&p.detail.segments, total);
@@ -6828,6 +6842,17 @@ fn Player(
                     view_mode.set(mode);
                 }
                 Control::Quality(bps) => on_quality_pick.call(Some(bps)),
+                Control::Speed(rate) => {
+                    if session().is_some_and(|s| s.drives()) {
+                        platform::info(&format!(
+                            "pharos: speed unchanged to={rate} reason=in_group"
+                        ));
+                    } else {
+                        platform::info(&format!("pharos: speed from={} to={rate}", *speed.peek()));
+                        speed.set(rate);
+                        platform::set_speed(VIDEO_ID, rate);
+                    }
+                }
                 Control::Version(i) => {
                     if let Some(v) = p.detail.versions.get(i) {
                         on_version.call(v.id.clone());
@@ -7241,6 +7266,7 @@ fn Player(
             .map(|v| (v.id.clone(), versions::version_label(v)))
             .collect(),
         version: p.version.clone(),
+        speed: speed(),
         quality: QualityView {
             manual: manual_cap,
             auto: auto_cap,
