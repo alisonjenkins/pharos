@@ -452,6 +452,29 @@ impl MediaStore for AnyStore {
         }
     }
 
+    async fn servable_artwork_page(
+        &self,
+        after: Option<(MediaId, String)>,
+        limit: i64,
+    ) -> DomainResult<Vec<pharos_core::ArtworkRow>> {
+        match self {
+            AnyStore::Sqlite(s) => s.servable_artwork_page(after, limit).await,
+            AnyStore::Postgres(p) => p.servable_artwork_page(after, limit).await,
+        }
+    }
+
+    async fn remove_dead_artwork(
+        &self,
+        item_id: MediaId,
+        role: &str,
+        readmit: bool,
+    ) -> DomainResult<()> {
+        match self {
+            AnyStore::Sqlite(s) => s.remove_dead_artwork(item_id, role, readmit).await,
+            AnyStore::Postgres(p) => p.remove_dead_artwork(item_id, role, readmit).await,
+        }
+    }
+
     async fn audio_items_needing_art(
         &self,
         limit: i64,
