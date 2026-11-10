@@ -97,6 +97,9 @@ struct Telemetry {
     sink: Sink<NativeApi>,
     failure_logged: bool,
     opted_in: bool,
+    /// Bumped by each [`forget_opt_in`]: a read or an install begun under an
+    /// earlier session must not land in this one.
+    session: u64,
 }
 
 thread_local! {
@@ -113,10 +116,24 @@ fn remember_opt_in(on: bool) {
     TELEMETRY.with(|t| t.borrow_mut().opted_in = on);
 }
 
-/// Forgets the opt-in, so nothing is sent after sign-out until the next
-/// user's choice is read.
+/// Forgets the session: the opt-in, the connection events went through
+/// and any events held for it, so nothing is sent after sign-out until the
+/// next user's choice is read, and nothing raised before reaches that user's
+/// session. A read or an install still under way is discarded when it lands.
 pub fn forget_opt_in() {
-    remember_opt_in(false);
+    TELEMETRY.with(|t| {
+        let mut t = t.borrow_mut();
+        let session = t.session.wrapping_add(1);
+        *t = Telemetry {
+            session,
+            ..Telemetry::default()
+        };
+    });
+}
+
+/// The session a read or an install is begun under; see [`forget_opt_in`].
+pub fn session() -> u64 {
+    TELEMETRY.with(|t| t.borrow().session)
 }
 
 fn prefs_call(action: &str) -> CallInfo {
@@ -129,10 +146,14 @@ fn prefs_call(action: &str) -> CallInfo {
 
 /// Reads the user's opt-in from `Prefs` and remembers it.
 pub async fn load_opted_in(api: &NativeApi) -> Result<bool, String> {
+    let begun = session();
     let raw = api
         .pref(&prefs_call("opt_in_read"), OPT_IN_PREF)
         .await
         .map_err(|e| e.to_string())?;
+    if session() != begun {
+        return Err("signed out while the opt-in was read".to_owned());
+    }
     let on = opt_in_from(raw.as_deref());
     remember_opt_in(on);
     Ok(on)
@@ -150,9 +171,16 @@ pub async fn set_opted_in(api: &NativeApi, on: bool) -> Result<(), String> {
 }
 
 /// Starts submitting through `api`: the held events to send now, none when
-/// opted out.
-pub fn install(api: NativeApi, opted_in: bool) -> Vec<ClientEvent> {
-    TELEMETRY.with(|t| t.borrow_mut().sink.install(api, opted_in))
+/// opted out. An install begun under an earlier session (`begun`, from
+/// [`session`]) does nothing.
+pub fn install(api: NativeApi, opted_in: bool, begun: u64) -> Vec<ClientEvent> {
+    TELEMETRY.with(|t| {
+        let mut t = t.borrow_mut();
+        if t.session != begun {
+            return Vec::new();
+        }
+        t.sink.install(api, opted_in)
+    })
 }
 
 /// The submit to make now for `event`, if any (see [`Sink::report`]).
@@ -188,6 +216,23 @@ mod tests {
             route: "/player".to_owned(),
             fields: Vec::new(),
         }
+    }
+
+    #[test]
+    fn sign_out_forgets_the_opt_in_and_the_held_events_and_starts_a_new_session() {
+        remember_opt_in(true);
+        assert!(report(event()).is_none(), "no connection yet: held");
+        let held = || TELEMETRY.with(|t| t.borrow().sink.pending_len());
+        assert_eq!(held(), 1);
+        let before = session();
+        forget_opt_in();
+        assert!(!opted_in());
+        assert_eq!(held(), 0, "a held event survived sign-out");
+        assert_ne!(
+            session(),
+            before,
+            "a read begun before sign-out would still land"
+        );
     }
 
     #[test]
