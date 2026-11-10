@@ -47,3 +47,15 @@ Every task follows TDD: a failing test first, then the code. Metrics and log lin
 ## Ledger
 
 - [ ] T028-23 Each slice's PR appends its B entry to `bugs.md` and its V entries to `invariants.md`, and marks ADR-0067 Accepted when slice 1 merges. (partial, audited 2026-11-09: B601-B606 and V532-V539 are in the ledger; ADR-0067 is still Status Proposed, not Accepted)
+
+## Round 2 (2026-11-10, B1202-B1216, V1162-V1176, ADR-0108/0109)
+
+- [x] T028-24 Store each item's signal pass and re-direct from it (B1202, V1162, migration 0079).
+- [x] T028-25 Parenthesised sound cues are sounds (B1203, V1163).
+- [x] T028-26 Loudness margins follow the track's dialogue spread; a bang-less shout needs a raised pitch (B1204, V1164).
+- [x] T028-27 A `Laugh` intent and its Giggle effect (B1205, V1165).
+- [x] T028-28 Ease between plain lines that follow closely (B1206, V1166). Two-speaker lines left as the source breaks them.
+- [ ] T028-29 Lift lines clear of burned-in text at the bottom of the frame.
+- [ ] T028-30 Karaoke timings from the aligner for songs without `\k`.
+- [ ] T028-31 Opt-in speaker colours from speaker detection.
+- [ ] T028-32 Measure the styled track's frame cost on the TV app.
