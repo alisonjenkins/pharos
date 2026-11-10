@@ -2077,8 +2077,12 @@ fn NativeApp(route: Route) -> Element {
                             spawn(async move {
                                 let reply = platform::sign_out().await;
                                 machine.write().apply(Event::SignOutAnswered(reply));
-                                // Signed out: no kept book stays on the device.
+                                // Signed out: no kept book stays on the device,
+                                // and the queue (kept for the tab, B1281) does
+                                // not pass to whoever signs in next.
                                 if matches!(machine.peek().phase(), Phase::SignIn { .. }) {
+                                    let mut queue = queue;
+                                    queue.set(Queue::default());
                                     forget_kept_books("sign-out").await;
                                 }
                             });
