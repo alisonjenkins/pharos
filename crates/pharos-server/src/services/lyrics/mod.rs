@@ -221,6 +221,11 @@ impl LyricsFinder {
         self
     }
 
+    /// The aligner, when one is configured.
+    pub fn aligner(&self) -> Option<Arc<align::Aligner>> {
+        self.aligner.clone()
+    }
+
     /// Ask an aligner service for word timestamps when requested.
     pub fn with_aligner(mut self, a: Arc<align::Aligner>) -> Self {
         self.aligner = Some(a);
