@@ -111,7 +111,7 @@ impl Saver {
         let (api, id, locator) = (self.api.clone(), self.id, locator.to_owned());
         platform::spawn_detached(async move {
             if let Err(e) = api
-                .set_read_position(&call("read", "save"), id, &locator, fraction)
+                .set_read_position(&call("read", "save"), id, &locator, fraction, 0)
                 .await
             {
                 platform::warn(&format!(
