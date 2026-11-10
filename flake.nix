@@ -1446,6 +1446,13 @@
             # server uses. tests/lib/together.ts puts this on Firefox's
             # LD_LIBRARY_PATH.
             export PHAROS_FIREFOX_LIBAV=${pkgs.ffmpeg_7-headless.lib}/lib
+            # Firefox opens its sound output through libpulse, which is not on
+            # NixOS's loader path either, and a CI pod or headless box has no
+            # sound server: every AudioContext then stays "suspended" (B1140).
+            # tests/lib/audio-sink.ts puts the library on Firefox's path and,
+            # as a Playwright globalSetup, runs this daemon with a null sink.
+            export PHAROS_FIREFOX_PULSE=${pkgs.libpulseaudio}/lib
+            export PHAROS_PULSEAUDIO=${pkgs.pulseaudio}/bin/pulseaudio
             # Test fixtures for `cargo nextest run -- --ignored
             # ffmpeg_integration`. Built once in /nix/store, cached
             # across CI + dev. Tests skip when env unset.
