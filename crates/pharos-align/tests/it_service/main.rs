@@ -2,6 +2,7 @@
 //! `aligner/tests/test_server.py`.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+#[path = "../common/mod.rs"]
+mod common;
 mod engine;
 mod http;
-mod spans;

@@ -1,3 +1,7 @@
+//! The song span and its children through the HTTP path. Standalone: it
+//! installs a process-global tracing subscriber.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -8,7 +12,8 @@ use tracing_subscriber::layer::{Context, SubscriberExt as _};
 use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::Layer;
 
-use crate::http::{post, serve, silent};
+mod common;
+use common::{post, serve, silent};
 
 #[derive(Debug, Default, Clone)]
 struct Recorded {
