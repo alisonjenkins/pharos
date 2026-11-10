@@ -2759,6 +2759,12 @@ mod tests {
         );
         assert!(html.contains("data-passed=true"), "{html}");
         assert!(!html.contains("data-passed=false"), "{html}");
+        let bar = html.split(r#"id="pharos-seek""#).nth(1).unwrap_or_default();
+        let open_tag = bar.split('>').next().unwrap_or_default();
+        assert!(
+            open_tag.contains(r#"tabindex=0"#) || open_tag.contains(r#"tabindex="0""#),
+            "the seek bar takes the focus (V1209): {open_tag}"
+        );
     }
 
     /// B750: the skip button and "Up next" overlap the top of the
