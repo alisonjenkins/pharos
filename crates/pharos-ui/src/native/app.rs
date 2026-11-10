@@ -58,6 +58,7 @@ use super::queue::{
 use super::report;
 use super::resume::{Item as ResumeItem, ResumeProbe, ResumeReport};
 use super::route::Route;
+use super::seek_wait::SeekWait;
 use super::seen::{self, MemberSeen};
 use super::settings::{Section, SettingsLayout};
 use super::show_tracks;
@@ -5127,6 +5128,18 @@ fn Player(
     let mut view_mode = use_signal(stored_view_mode);
     let vr = use_resource(platform::vr_supported);
     let mut failed = use_signal(|| None::<PlayFailure>);
+    // A seek still waiting on its first frame, and a clock that ticks once a
+    // second while one does, for the card that says so (B1196).
+    let mut seek_wait = use_signal(|| None::<SeekWait>);
+    let mut seek_tick = use_signal(|| 0u64);
+    use_future(move || async move {
+        loop {
+            platform::sleep_ms(1_000).await;
+            if seek_wait.peek().is_some() {
+                seek_tick.set(now_ms_u64());
+            }
+        }
+    });
     // Where the media broke, for the skip past it to remember (B1160).
     let broke_at = use_hook(|| Rc::new(Cell::new(0u64)));
     let saved_volume = use_hook(last_volume);
@@ -5965,6 +5978,23 @@ fn Player(
                 MediaEvent::Seeked => watch.0.borrow_mut().seeked(),
                 _ => {}
             }
+            // Whatever the seek waited on is over once the element lands,
+            // plays or ends; a wait left standing would put its card over a
+            // later, unrelated stall (B1196).
+            if matches!(
+                event,
+                MediaEvent::Seeked | MediaEvent::Playing | MediaEvent::Ended
+            ) {
+                if let Some(w) = seek_wait.take() {
+                    let waited = now_ms_u64().saturating_sub(w.started_ms);
+                    if waited >= super::seek_wait::SHOW_AFTER_MS {
+                        platform::info(&format!(
+                            "pharos: seek wait: over event={event:?} to={} from={} waited_ms={waited}",
+                            w.to_ms, w.from_ms
+                        ));
+                    }
+                }
+            }
             if let Some(session) = session() {
                 session.on_media(event);
             }
@@ -6151,9 +6181,14 @@ fn Player(
                 mapped
             };
             // In a group the viewer's play, pause and seek are the group's.
-            let seek = |ms: u64| {
+            let mut seek = |ms: u64| {
                 watch.0.borrow_mut().seeking(now_ms_u64());
                 if !session().is_some_and(|s| s.seek(ms)) {
+                    // A group's seek is the group's to wait on; this one is
+                    // the viewer's, with a way back if it is slow (B1196).
+                    let earlier = *seek_wait.peek();
+                    let at = *position.peek();
+                    seek_wait.set(Some(SeekWait::begin(earlier, at, ms, now_ms_u64())));
                     platform::seek_ms(VIDEO_ID, ms);
                 }
             };
@@ -6241,6 +6276,12 @@ fn Player(
                         platform::info(&format!("pharos: up next: playing {next} (play now)"));
                         advance(next);
                     }
+                }
+                Control::ReturnFromSeek(ms) => {
+                    platform::info(&format!("pharos: seek wait: going back to={ms}"));
+                    seek_wait.set(None);
+                    watch.0.borrow_mut().seeking(now_ms_u64());
+                    platform::seek_ms(VIDEO_ID, ms);
                 }
                 Control::CancelNext => {
                     let shared = session().is_some_and(|s| s.hold_next());
@@ -6509,6 +6550,16 @@ fn Player(
         subtitle_pick: subtitle(),
         previous: near.previous,
         next,
+        seek_card: seek_wait()
+            .filter(|_| media_rest().loading && failed().is_none())
+            .and_then(|w| {
+                let unindexed = p
+                    .detail
+                    .damage
+                    .as_ref()
+                    .is_some_and(|d| d.verdict == "unindexed");
+                w.card(seek_tick(), unindexed)
+            }),
         up_next: match (up_next_step(), upcoming.as_ref()) {
             (UpNextStep::Counting { left_ms, of_ms }, next) => {
                 // Only the card's own item: a group's next is not the queue's.
