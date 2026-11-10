@@ -43,7 +43,7 @@ Pinning helps torch as much as it helps Rust (song A: 24 s unpinned, 16 s pinned
 
 - R1. `POST /align` takes the same JSON body (`path` under the media root, `lines` with `text`, `start_ms`, `end_ms`) and returns the same body: `lines[].words[]` with `at` and `start_ms`, `offset_ms` and `aligner_version`. Error statuses and messages stay: 400 for a bad body or path, 404 for a missing file, 413 over 1 MiB, 422 when ffmpeg fails, 500 otherwise.
 - R2. `GET /healthz` answers `{"ok": true}` while an alignment runs.
-- R3. The same environment variables keep their meaning: `PHAROS_ALIGNER_MEDIA_ROOT`, `PHAROS_ALIGNER_LISTEN` (default `0.0.0.0:8790`), `PHAROS_ALIGNER_OTLP_ENDPOINT`, `PHAROS_ALIGNER_THREADS` (default 8), `PHAROS_ALIGNER_IDLE_UNLOAD_SECS` (default 600, 0 keeps the model loaded).
+- R3. The same environment variables keep their meaning: `PHAROS_ALIGNER_MEDIA_ROOT`, `PHAROS_ALIGNER_LISTEN` (default `0.0.0.0:8790`), `PHAROS_ALIGNER_OTLP_ENDPOINT`, `PHAROS_ALIGNER_THREADS` (default 8), `PHAROS_ALIGNER_IDLE_UNLOAD_SECS` (default 600, 0 keeps the model loaded). One is new: `PHAROS_ALIGNER_FFMPEG` names the ffmpeg to run (default `ffmpeg` on `PATH`), so the image can pin its own.
 - R4. `aligner_version` becomes 3, so stored answers show which service made them. The server's `MIN_ALIGNER_VERSION` stays 2: answers from the Python service stay valid.
 - R5. One alignment at a time, as today. A request that waits for another is visible as its own span.
 - R6. Spans join the server's trace by `traceparent` (ADR-0105) under the same names: `aligner.align`, `aligner.wait`, `aligner.decode`, `aligner.model`, `aligner.forward`, `aligner.ctc`. The song's log line keeps its fields and phase totals.
