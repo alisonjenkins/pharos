@@ -815,6 +815,16 @@ pub fn dialog_open() -> bool {
     false
 }
 
+pub struct ModalHold;
+
+impl ModalHold {
+    pub fn capture() -> Self {
+        Self
+    }
+
+    pub fn engage(&mut self, _root: &str) {}
+}
+
 pub struct TrackSkips;
 
 pub fn on_track_skip(
