@@ -1032,7 +1032,7 @@ pub async fn run_page_visualiser(style_label: &str) -> Result<(), Fallback> {
     ) {
         Ok(surface) => {
             report(style, None);
-            draw(surface, &Tap::default()).await
+            draw(surface, &Tap::default(), VIDEO_ID).await
         }
         Err(f) => Err(f),
     };
