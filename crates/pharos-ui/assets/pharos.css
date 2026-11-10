@@ -1833,6 +1833,31 @@ body:has(.pharos-stage.is-full) .pharos-status-note {
    or mid-play stall shows work is happening after the controls hide (B551).
    The 300 ms fade-in keeps quick seeks inside the buffer from flashing it; the
    caption appears after ~8 s of waiting. */
+/* The browser refused to start the video: one large tap target over the
+   picture (038 FR-407). */
+.pharos-tap-to-start {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  z-index: 2;
+  display: flex;
+  gap: 0.6rem;
+  align-items: center;
+  padding: 0.9rem 1.6rem;
+  border: 0;
+  border-radius: 999px;
+  background: var(--px-color-accent);
+  color: var(--px-color-accent-fg);
+  font: inherit;
+  font-size: 1.15rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+.pharos-tap-to-start:focus-visible {
+  outline: 3px solid #fff; /* not themed: controls sit on the video, whose colours no theme sets */
+  outline-offset: 3px;
+}
 .pharos-watch-loading {
   position: absolute;
   inset: 0;

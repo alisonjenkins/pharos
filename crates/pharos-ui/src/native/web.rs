@@ -489,22 +489,97 @@ pub fn toggle_play(video_id: &str) {
     };
     if v.paused() {
         wake_tap(&v);
-        if let Err(e) = v.play() {
-            warn(&format!("pharos: play() refused: {e:?}"));
-        }
+        start(&v, "toggle");
     } else if let Err(e) = v.pause() {
         warn(&format!("pharos: pause() refused: {e:?}"));
     }
 }
 
-/// Start the `<video>`. A refused `play()` (autoplay policy) leaves it paused.
+/// Start the `<video>`. A refused `play()` (autoplay policy) leaves it
+/// paused, and is told apart from other failures (038 FR-407).
 pub fn play(video_id: &str) {
     if let Some(v) = video_element(video_id) {
         wake_tap(&v);
-        if let Err(e) = v.play() {
-            warn(&format!("pharos: play() refused: {e:?}"));
-        }
+        start(&v, "play");
     }
+}
+
+thread_local! {
+    /// The browser refused a `play()` and no gesture has come since: a
+    /// retry would be refused too (038 FR-407, V1223).
+    static AUTOPLAY_BLOCKED: Cell<bool> = const { Cell::new(false) };
+    /// The document listens for the gesture that lifts it.
+    static GESTURE_WATCHED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Whether the browser refused to start a video until the viewer does
+/// something: the player then shows "Tap to start", and a group stops
+/// retrying the start in the background.
+pub fn autoplay_blocked() -> bool {
+    AUTOPLAY_BLOCKED.with(Cell::get)
+}
+
+/// `play()` with its promise read: a `NotAllowedError` is the autoplay
+/// policy, logged and reported once per refusal; anything else (an aborted
+/// load, a source error) is logged as itself.
+fn start(v: &web_sys::HtmlMediaElement, source: &'static str) {
+    let promise = match v.play() {
+        Ok(p) => p,
+        Err(e) => {
+            warn(&format!("pharos: play() refused source={source}: {e:?}"));
+            return;
+        }
+    };
+    wasm_bindgen_futures::spawn_local(async move {
+        match wasm_bindgen_futures::JsFuture::from(promise).await {
+            Ok(_) => AUTOPLAY_BLOCKED.with(|b| b.set(false)),
+            Err(e) => play_failed(&e, source),
+        }
+    });
+}
+
+fn play_failed(e: &JsValue, source: &'static str) {
+    let name = js_sys::Reflect::get(e, &JsValue::from_str("name"))
+        .ok()
+        .and_then(|n| n.as_string())
+        .unwrap_or_default();
+    if name != "NotAllowedError" {
+        // An AbortError is a newer load or pause overtaking this play.
+        info(&format!("pharos: play() did not start source={source} name={name} reason={}", js_message(e)));
+        return;
+    }
+    let first = !AUTOPLAY_BLOCKED.with(|b| b.replace(true));
+    watch_for_gesture();
+    if first {
+        warn(&format!("pharos: autoplay refused source={source} reason={}", js_message(e)));
+        report_event(ClientEvent {
+            kind: ClientEventKind::AutoplayRefused,
+            level: ClientLevel::Warn,
+            route: current_path(),
+            fields: vec![("source", source.to_owned())],
+        });
+    }
+}
+
+/// Lifts [`autoplay_blocked`] on the viewer's next tap, click or key, which
+/// gives the page the activation a `play()` needs.
+fn watch_for_gesture() {
+    if GESTURE_WATCHED.with(|w| w.replace(true)) {
+        return;
+    }
+    let Some(doc) = web_sys::window().and_then(|w| w.document()) else {
+        return;
+    };
+    let lift = Closure::<dyn Fn()>::new(|| {
+        if AUTOPLAY_BLOCKED.with(|b| b.replace(false)) {
+            info("pharos: autoplay gesture: a tap or key lifted the refusal");
+        }
+    });
+    for kind in ["pointerdown", "keydown"] {
+        let _ = doc.add_event_listener_with_callback_and_bool(kind, lift.as_ref().unchecked_ref(), true);
+    }
+    // Lives as long as the page.
+    lift.forget();
 }
 
 pub fn pause(video_id: &str) {

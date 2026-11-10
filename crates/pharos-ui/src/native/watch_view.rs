@@ -114,6 +114,8 @@ pub struct Controls {
     /// What the wait under the spinner is for (038 FR-401); empty reads as
     /// the generic "Loading".
     pub wait_caption: String,
+    /// The browser refused to start the video: a tap starts it (038 FR-407).
+    pub tap_to_start: bool,
     /// The playback position as a signal, when the owner updates it apart
     /// from `media`. The leaves that show the position read it, so a tick
     /// re-renders them alone and not the whole player (B815). Without it
@@ -851,6 +853,16 @@ pub fn WatchView(
                                 label: track_label(&t, 0),
                             }
                         }
+                    }
+                }
+                if c.tap_to_start {
+                    button {
+                        class: "pharos-tap-to-start",
+                        r#type: "button",
+                        "data-tap-to-start": "true",
+                        onclick: move |_| on_control.call(Control::TogglePlay),
+                        span { class: "pharos-tap-to-start-icon", aria_hidden: "true", "▶" }
+                        span { "Tap to start" }
                     }
                 }
                 if media.loading {
@@ -2887,6 +2899,17 @@ mod tests {
         assert!(html.contains(r#"data-loading="true""#), "{html}");
         assert!(html.contains("Loading"), "{html}");
         assert!(!html.contains("pharos-watch-loading-caption"), "no cause, no caption: {html}");
+    }
+
+    /// 038 FR-407, V1223: a refused autoplay offers a tap to start.
+    #[test]
+    fn a_refused_autoplay_offers_tap_to_start() {
+        assert!(!render(controls()).contains("Tap to start"));
+        let mut c = controls();
+        c.tap_to_start = true;
+        let html = render(c);
+        assert!(html.contains("Tap to start"), "{html}");
+        assert!(html.contains(r#"data-tap-to-start="true""#), "{html}");
     }
 
     /// 038 FR-401, V1218: the caption under the spinner is the wait's cause.

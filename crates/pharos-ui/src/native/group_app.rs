@@ -91,6 +91,10 @@ impl GroupPlayer for VideoPlayer {
         platform::play(self.id);
     }
 
+    fn autoplay_blocked(&self) -> bool {
+        platform::autoplay_blocked()
+    }
+
     fn pause(&self) {
         platform::pause(self.id);
     }
