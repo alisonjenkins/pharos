@@ -146,15 +146,25 @@ fn prefs_call(action: &str) -> CallInfo {
 
 /// Reads the user's opt-in from `Prefs` and remembers it.
 pub async fn load_opted_in(api: &NativeApi) -> Result<bool, String> {
-    let begun = session();
+    load_opted_in_since(api, session()).await
+}
+
+/// [`load_opted_in`] for a read begun under session `begun` (from
+/// [`session`]), taken where `api` was: a task that only starts after a
+/// sign-out must not remember the previous user's opt-in for the next.
+pub async fn load_opted_in_since(api: &NativeApi, begun: u64) -> Result<bool, String> {
     let raw = api
         .pref(&prefs_call("opt_in_read"), OPT_IN_PREF)
         .await
         .map_err(|e| e.to_string())?;
+    remember_if_current(begun, opt_in_from(raw.as_deref()))
+}
+
+/// Remembers `on` if no sign-out came since session `begun`.
+fn remember_if_current(begun: u64, on: bool) -> Result<bool, String> {
     if session() != begun {
         return Err("signed out while the opt-in was read".to_owned());
     }
-    let on = opt_in_from(raw.as_deref());
     remember_opt_in(on);
     Ok(on)
 }
@@ -300,6 +310,20 @@ mod tests {
             matches!(submitted, Some((7, _))),
             "expected one submit through api 7"
         );
+    }
+
+    /// An opt-in read begun before a sign-out, even one whose task only
+    /// starts after it, is not remembered for the next user.
+    #[test]
+    fn an_opt_in_read_from_before_sign_out_is_not_remembered() {
+        forget_opt_in();
+        let begun = session();
+        forget_opt_in();
+        assert!(remember_if_current(begun, true).is_err());
+        assert!(!opted_in());
+        assert_eq!(remember_if_current(session(), true), Ok(true));
+        assert!(opted_in());
+        forget_opt_in();
     }
 
     #[test]
