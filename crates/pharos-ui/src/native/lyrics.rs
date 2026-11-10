@@ -170,7 +170,10 @@ fn word_progress(line: &LyricLine, end: u64, position_ms: u64) -> f64 {
     }
     let mut points = Vec::with_capacity(line.words.len() + 2);
     if line.words.first().map_or(true, |w| w.at != 0) {
-        points.push((line.start_ms, 0usize));
+        // The server may start a line after its first word so the line above
+        // stays selectable; the fill still follows the word.
+        let first = line.words.first().map_or(line.start_ms, |w| w.start_ms);
+        points.push((line.start_ms.min(first), 0usize));
     }
     for w in &line.words {
         let at = usize::try_from(w.at).unwrap_or(usize::MAX).min(len);
@@ -506,6 +509,31 @@ mod tests {
         assert!((line_progress(&l, 0, 1_250) - 3.0 / 11.0 * 100.0).abs() < 1e-9);
         assert!((line_progress(&l, 0, 1_850) - 8.5 / 11.0 * 100.0).abs() < 1e-9);
         assert!((line_progress(&l, 0, 2_200) - 100.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn a_prefixed_line_starting_after_its_first_word_fills_at_the_word_time() {
+        let l = Lyrics {
+            synced: true,
+            lines: vec![
+                LyricLine {
+                    start_ms: 12_001,
+                    text: "♪ hello".into(),
+                    words: vec![LyricWord {
+                        at: 2,
+                        start_ms: 11_000,
+                    }],
+                },
+                LyricLine {
+                    start_ms: 20_000,
+                    text: "next".into(),
+                    words: Vec::new(),
+                },
+            ],
+            words_pending: false,
+        };
+        // (11000, 0) -> (11000, 2) -> "hello" (2 syllables, 1400 ms) ends at 12400.
+        assert!((line_progress(&l, 0, 11_700) - 4.5 / 7.0 * 100.0).abs() < 1e-9);
     }
 
     #[test]
