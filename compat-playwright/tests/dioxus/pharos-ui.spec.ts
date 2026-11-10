@@ -1560,33 +1560,25 @@ test.describe("pharos Dioxus UI", () => {
       await bar.press("Escape");
       await expect(options).toHaveCount(0);
 
-      // Enter with no match picked opens the palette on the same term,
-      // with every match under Titles.
+      // Enter with no match picked opens the search page on the same term
+      // (FR-207): the URL holds it, and the matches are grouped by kind.
       await bar.press("Enter");
-      const palette = page.getByRole("dialog", { name: "Go to or search" });
-      await expect(palette).toBeVisible();
-      const box = palette.getByRole("combobox");
+      await expect(page).toHaveURL(/\/ui\/find\?q=Playwright$/, { timeout: 15_000 });
+      const box = page.locator("#find-input");
       await expect(box).toHaveValue("Playwright");
       await expect(box).toBeFocused();
-      // The term it opens on is selected, so typing replaces it (B623).
-      await expect
-        .poll(() =>
-          box.evaluate((el: HTMLInputElement) => [el.selectionStart, el.selectionEnd]),
-        )
-        .toEqual([0, "Playwright".length]);
-      await expect(palette.getByRole("group", { name: "Titles" })).toBeVisible({
+      await expect(page.locator("section.pharos-find-group").first()).toBeVisible({
         timeout: 15_000,
       });
 
       await box.fill("zzqx-no-such-title");
-      await expect(palette.getByText("No matches")).toBeVisible({
+      await expect(page.getByText(/^No matches for/)).toBeVisible({
         timeout: 15_000,
       });
-      await box.press("Escape");
-      await expect(palette).toHaveCount(0);
+      await expect(page).toHaveURL(/\/ui\/find\?q=zzqx-no-such-title$/);
     });
 
-    test("palette: Ctrl+K goes to a page by name, and an old /find link opens it", async ({
+    test("palette: Ctrl+K goes to a page by name, and /find is the search page", async ({
       page,
       request,
     }) => {
@@ -1626,9 +1618,12 @@ test.describe("pharos Dioxus UI", () => {
       await page.keyboard.press("Meta+k");
       await expect(palette).toHaveCount(0);
 
+      // /find is a page of its own now (FR-207), empty until a term.
       await page.goto("/ui/find");
-      await expect(page).toHaveURL(/\/ui\/$/, { timeout: 15_000 });
-      await expect(palette).toBeVisible();
+      await expect(page).toHaveURL(/\/ui\/find$/);
+      await expect(page.locator("#find-input")).toHaveValue("", { timeout: 15_000 });
+      await expect(page.getByText("Type to search every library.")).toBeVisible();
+      await expect(palette).toHaveCount(0);
     });
 
     // V518: a show's name lists the show first, `s01` opens its season and
