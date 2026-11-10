@@ -2047,13 +2047,20 @@ pub fn on_key(mut on_key: impl FnMut(&str, bool, bool) -> bool + 'static) -> Key
 pub fn on_mode_key(mut on_key: impl FnMut(&str) -> bool + 'static) -> KeyListener {
     let listener =
         Closure::<dyn FnMut(web_sys::KeyboardEvent)>::new(move |e: web_sys::KeyboardEvent| {
-            if e.ctrl_key()
-                || e.alt_key()
-                || e.meta_key()
-                || e.repeat()
-                || e.default_prevented()
-                || (in_text_field(&e) && !arrow_on_select(&e))
-            {
+            if e.ctrl_key() || e.alt_key() || e.meta_key() || e.default_prevented() {
+                return;
+            }
+            // An arrow on a closed select never steps its value, a held
+            // one's repeats and an arrow with nowhere to move included
+            // (FR-208): only the first press moves the focus.
+            if arrow_on_select(&e) {
+                e.prevent_default();
+                if !e.repeat() {
+                    on_key(&e.key());
+                }
+                return;
+            }
+            if e.repeat() || in_text_field(&e) {
                 return;
             }
             if on_key(&e.key()) {
