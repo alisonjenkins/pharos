@@ -1,0 +1,39 @@
+[package]
+name = "quire-pdf"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.92"
+license = "AGPL-3.0-or-later"
+publish = false
+description = "Draw PDF pages from bytes behind quire's fixed-layout port, with a wasm-bindgen module for browsers"
+readme = "README.md"
+keywords = ["pdf", "ebook", "reader", "wasm"]
+categories = ["rendering", "wasm"]
+
+# Standalone like quire (spec 023 FR-001): no `pharos-*` dependency and no
+# `workspace = true` keys. It is the PDF adapter for quire's `FixedLayout`,
+# built as its own wasm module so the PDF engine is loaded only when a PDF is
+# opened and never linked into the main UI (ADR-0047).
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+hayro = "0.9"
+quire = { path = "../quire" }
+thiserror = "2"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
+web-sys = { version = "0.3", features = ["ImageData"] }
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+unwrap_in_result = "deny"
+panic = "deny"
+indexing_slicing = "deny"
+arithmetic_side_effects = "deny"
+unreachable = "deny"
+todo = "deny"
+unimplemented = "deny"
+get_unwrap = "deny"
