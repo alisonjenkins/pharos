@@ -848,13 +848,18 @@ where
     // keyed on (item, role), so downloading here would silently replace a
     // user's hand-placed poster/backdrop/etc. Computed once per item, at the
     // role level (a local Primary must not block filling an absent Backdrop).
-    let local_roles: std::collections::HashSet<String> = store
-        .artwork_for(item.id)
-        .await?
-        .into_iter()
-        .filter(|(_, source, _)| source.eq_ignore_ascii_case("local"))
-        .map(|(role, _, _)| role.to_ascii_lowercase())
-        .collect();
+    // B1181 — a local row blocks online art only while its file exists (V1141).
+    // A sidecar that was deleted is no curated art, so the provider fills the
+    // role. The stale-art sweep removes such rows; this keeps the gap closed
+    // until it runs.
+    let mut local_roles: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (role, source, locator) in store.artwork_for(item.id).await? {
+        if source.eq_ignore_ascii_case("local")
+            && matches!(tokio::fs::try_exists(&locator).await, Ok(true))
+        {
+            local_roles.insert(role.to_ascii_lowercase());
+        }
+    }
     // B570 — a re-identified episode's `<stem>-thumb` was saved by the same
     // scrape as its NFO, so it is the wrong episode's still: the record's
     // still replaces it as the Thumb, which outranks the show-folder Primary
@@ -4899,7 +4904,12 @@ mod tests {
         // filled from the provider.
         let s = store().await;
         put_movie(&s, 900_301, "Dune (2021)").await;
-        s.set_artwork(900_301, "Primary", "local", "/curated/poster.jpg")
+        // B1181 — a local row only blocks online art while its file exists.
+        let curated = tempfile::tempdir().unwrap();
+        let poster = curated.path().join("poster.jpg");
+        std::fs::write(&poster, [0xFF, 0xD8, 0xFF]).unwrap();
+        let poster_locator = poster.to_string_lossy().into_owned();
+        s.set_artwork(900_301, "Primary", "local", &poster_locator)
             .await
             .unwrap();
         let (_td, cache) = cache();
@@ -4940,13 +4950,59 @@ mod tests {
             .find(|(role, _, _)| role == "Primary")
             .expect("primary row present");
         assert_eq!(primary.1, "local");
-        assert_eq!(primary.2, "/curated/poster.jpg");
+        assert_eq!(primary.2, poster_locator);
         let backdrop = art.iter().find(|(role, _, _)| role == "Backdrop");
         assert!(
             backdrop.is_some(),
             "backdrop should still be added: {art:?}"
         );
         assert_eq!(backdrop.unwrap().1, "tmdb");
+    }
+
+    #[tokio::test]
+    async fn enrich_one_fills_a_role_whose_local_sidecar_is_gone() {
+        // B1181 / V1141 — a local Primary whose file has gone is no curated
+        // art. The provider's Primary is cached and replaces the dead row.
+        let s = store().await;
+        put_movie(&s, 900_302, "a film").await;
+        s.set_artwork(900_302, "Primary", "local", "/gone/folder.jpg")
+            .await
+            .unwrap();
+        let (_td, cache) = cache();
+        let tmdb = FakeEnricher::tmdb()
+            .with_search(vec![("438632", "a film", Some(2021))])
+            .with_detail(EnrichedMetadata {
+                artwork: vec![RemoteArt {
+                    role: ArtworkRole::Primary,
+                    url: "https://image.tmdb.org/t/p/original/p2.jpg".into(),
+                }],
+                ..EnrichedMetadata::default()
+            })
+            .with_image_bytes(vec![0xFF, 0xD8, 0xFF]);
+
+        let item = s.get(900_302).await.unwrap();
+        enrich_one(
+            &s,
+            &sem(4),
+            &cache,
+            Some(&tmdb),
+            None::<&FakeEnricher>,
+            &MetadataConfig::default(),
+            item,
+            NOW,
+        )
+        .await
+        .unwrap();
+
+        let art = s.artwork_for(900_302).await.unwrap();
+        let primary = art
+            .iter()
+            .find(|(role, _, _)| role == "Primary")
+            .expect("primary row present");
+        assert_eq!(
+            primary.1, "tmdb",
+            "provider art replaces the dead local row: {art:?}"
+        );
     }
 
     /// An NFO-identified episode as a scrape in the provider's numbering left
