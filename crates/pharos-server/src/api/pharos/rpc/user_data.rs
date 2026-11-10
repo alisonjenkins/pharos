@@ -89,19 +89,25 @@ impl server::user_data::Handler for UserData {
         let id = read_item_id(params.get_id()?)?;
         let locator = params.get_locator()?.to_str()?;
         let fraction = params.get_fraction();
+        let read_at_ms = params.get_read_at();
         let written = match (self.session.current_user().await, id) {
             (Err(denial), _) => Err(denial),
-            (Ok(user), WireId::Real(id)) => {
-                user_data::set_read_position(&self.session.state, &user, id, locator, fraction)
-                    .await
-                    .map(|(_, data, position)| (data, Some(position)))
-                    .map_err(|e| match e {
-                        ReadError::Refused(refusal) => Denial::Invalid {
-                            field: refusal.field(),
-                        },
-                        ReadError::Item(e) => item_denial(id, &e, "set_read_position"),
-                    })
-            }
+            (Ok(user), WireId::Real(id)) => user_data::set_read_position(
+                &self.session.state,
+                &user,
+                id,
+                locator,
+                fraction,
+                read_at_ms,
+            )
+            .await
+            .map(|(_, data, position, _)| (data, Some(position)))
+            .map_err(|e| match e {
+                ReadError::Refused(refusal) => Denial::Invalid {
+                    field: refusal.field(),
+                },
+                ReadError::Item(e) => item_denial(id, &e, "set_read_position"),
+            }),
             // A series, season or album is never a book.
             (Ok(_), synth @ WireId::Synth(_)) => {
                 tracing::info!(item.id = %synth, reason = "not_book", "read position refused, nothing stored");
