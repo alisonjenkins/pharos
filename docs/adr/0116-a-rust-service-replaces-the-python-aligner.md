@@ -44,7 +44,7 @@ We will replace the Python aligner with one Rust service, built from the new cra
    - It gets a cache PVC, and an optional `aligner-shadow` Deployment.
 7. **Cutover:**
    - The server gains `[lyrics].aligner_shadow_url`. After each stored answer, it sends the same request to the shadow, compares word times and counts `pharos_lyrics_shadow_total{outcome}`, but never stores or serves the shadow answer.
-   - `aligner_url` moves to the Rust service after at least 50 shadow `outcome=match` results, each comparing the full answer from an `aligner_version` 3 shadow. Errors and version-2 answers do not count. Then `aligner/` and its flake outputs go.
+   - `aligner_url` moves to the Rust service after at least 50 consecutive shadow `outcome=match` comparisons with no mismatch, each comparing the full answer, per-line `score` included, from an `aligner_version` 5 shadow. A mismatch starts the count again; errors do not count and must stay under 5% of the run's comparisons. Then `aligner/` and its flake outputs go.
 
 ## Consequences
 
