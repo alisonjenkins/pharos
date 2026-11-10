@@ -152,6 +152,8 @@ pub struct Controls {
     pub versions: Vec<(String, String)>,
     /// The version playing.
     pub version: String,
+    /// The speed the viewer picked; 0 (the default) is normal speed.
+    pub speed: f64,
 }
 
 /// Where playback is. Reading it with `now` in a component's body
@@ -399,6 +401,8 @@ pub enum Control {
     Fullscreen,
     /// Limit the video to this many bits per second (0 is Auto).
     Quality(u64),
+    /// Play at this speed, 1.0 being normal (T038-305).
+    Speed(f64),
     /// Play the version at this place in [`Controls::versions`] from here
     /// (spec 034 US3).
     Version(usize),
@@ -1194,6 +1198,11 @@ pub fn WatchView(
                             version: c.version.clone(),
                             on_pick: move |control| on_control.call(control),
                         }
+                        SpeedPicker {
+                            speed: c.speed,
+                            in_group,
+                            on_pick: move |control| on_control.call(control),
+                        }
                         QualityPicker {
                             quality: c.quality.clone(),
                             height: media.video_height,
@@ -1855,6 +1864,49 @@ fn ViewModePicker(show: bool, mode: ViewMode, on_pick: EventHandler<Control>) ->
                     value: "{each.as_str()}",
                     selected: each == mode,
                     "{each.label()}"
+                }
+            }
+        }
+    }
+}
+
+/// The speeds the speed menu offers.
+pub const SPEEDS: [f64; 7] = [0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0];
+
+/// The speed menu's label for `speed`: "Speed: Normal", "Speed: 1.5×".
+pub fn speed_label(speed: f64) -> String {
+    if speed == 1.0 {
+        "Speed: Normal".to_owned()
+    } else {
+        format!("Speed: {speed}×")
+    }
+}
+
+/// The playback speed menu (T038-305). In a group the group's drift
+/// correction owns the rate, so the menu shows normal speed and is off.
+#[component]
+fn SpeedPicker(speed: f64, in_group: bool, on_pick: EventHandler<Control>) -> Element {
+    let wake = try_use_context::<Wake>();
+    let speed = if in_group || speed <= 0.0 { 1.0 } else { speed };
+    rsx! {
+        select {
+            class: "pharos-track-picker pharos-speed-picker",
+            aria_label: "Speed",
+            title: if in_group { "The group keeps everyone at normal speed" } else { "Speed" },
+            disabled: in_group,
+            onkeydown: move |evt| menu_key(evt, wake),
+            onchange: move |evt: FormEvent| {
+                if let Ok(rate) = evt.value().parse::<f64>() {
+                    on_pick.call(Control::Speed(rate));
+                }
+                platform::focus_by_id(PLAYER_ID);
+            },
+            for each in SPEEDS {
+                option {
+                    key: "{each}",
+                    value: "{each}",
+                    selected: each == speed,
+                    {speed_label(each)}
                 }
             }
         }
@@ -2573,6 +2625,40 @@ mod tests {
 
     /// B569/V482: the knob rides the end of the fill, and a tick the video
     /// has passed is marked so it dims.
+    #[test]
+    fn the_speed_menu_offers_the_speeds_and_is_off_in_a_group() {
+        let mut c = controls();
+        c.speed = 1.5;
+        let html = render(c.clone());
+        assert!(
+            html.contains(r#"<option value="1.5" selected=true>Speed: 1.5×</option>"#),
+            "{html}"
+        );
+        assert!(
+            html.contains("Speed: Normal") && html.contains("Speed: 2×"),
+            "{html}"
+        );
+        let speed_menu = |html: &str| {
+            html.split(r#"aria-label="Speed""#)
+                .nth(1)
+                .and_then(|r| r.split("</select>").next())
+                .unwrap_or_default()
+                .to_owned()
+        };
+        assert!(!speed_menu(&html).contains("disabled"), "{html}");
+        let mut dom = VirtualDom::new_with_props(
+            |()| rsx! { SpeedPicker { speed: 1.5, in_group: true, on_pick: |_| {} } },
+            (),
+        );
+        dom.rebuild_in_place();
+        let grouped = dioxus_ssr::render(&dom);
+        assert!(grouped.contains("disabled=true"), "{grouped}");
+        assert!(
+            grouped.contains(r#"<option value="1" selected=true>Speed: Normal</option>"#),
+            "the group plays at normal speed: {grouped}"
+        );
+    }
+
     #[test]
     fn the_player_draws_its_glyphs_as_icons_not_text() {
         let html = render(controls());
