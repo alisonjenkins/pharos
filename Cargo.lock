@@ -5327,6 +5327,7 @@ name = "pharos-align"
 version = "0.0.0"
 dependencies = [
  "actix-web",
+ "memmap2",
  "metrics",
  "metrics-exporter-prometheus",
  "metrics-process",
