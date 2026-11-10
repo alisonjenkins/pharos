@@ -30,8 +30,63 @@ pub struct Scrub {
     pub hold_start: f64,
     /// When the last press arrived; the settle timer compares against it.
     pub last_press: f64,
-    /// Presses in this preview, for the commit log.
+    /// Presses in this preview, for the commit log; a pointer drag's moves.
     pub presses: u32,
+    /// What drives the preview.
+    pub input: Input,
+}
+
+/// What drives a preview: the remote's left and right, or a pointer
+/// dragging the seek bar (T038-301).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Input {
+    Remote,
+    Mouse,
+    Touch,
+    Pen,
+}
+
+impl Input {
+    /// A pointer event's `pointerType`; an unknown one counts as a mouse.
+    pub fn of_pointer(kind: &str) -> Self {
+        match kind {
+            "touch" => Self::Touch,
+            "pen" => Self::Pen,
+            _ => Self::Mouse,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Remote => "remote",
+            Self::Mouse => "mouse",
+            Self::Touch => "touch",
+            Self::Pen => "pen",
+        }
+    }
+}
+
+/// The preview after a pointer on the seek bar moved to `target_ms`: the
+/// first call (no `prev`) is the press, which starts the preview from
+/// playback's `position_ms`. Nothing seeks until the pointer lets go.
+pub fn drag(
+    prev: Option<Scrub>,
+    input: Input,
+    target_ms: u64,
+    position_ms: u64,
+    now: f64,
+) -> Scrub {
+    let prev = prev.filter(|s| s.input == input);
+    Scrub {
+        origin_ms: prev.map_or(position_ms, |s| s.origin_ms),
+        target_ms,
+        forward: target_ms >= prev.map_or(position_ms, |s| s.origin_ms),
+        started_at: prev.map_or(now, |s| s.started_at),
+        hold_start: prev.map_or(now, |s| s.hold_start),
+        last_press: now,
+        presses: prev.map_or(0, |s| s.presses) + 1,
+        input,
+    }
 }
 
 /// Video milliseconds a held key moves per real millisecond, `held_ms` into
@@ -96,6 +151,7 @@ pub fn press(
         hold_start,
         last_press: now,
         presses: prev.map_or(0, |s| s.presses) + 1,
+        input: Input::Remote,
     }
 }
 
@@ -108,6 +164,8 @@ pub enum End {
     Confirmed,
     /// Back: no seek.
     Cancelled,
+    /// The pointer dragging the seek bar let go.
+    Released,
 }
 
 impl End {
@@ -116,6 +174,7 @@ impl End {
             End::Settled => "settled",
             End::Confirmed => "confirmed",
             End::Cancelled => "cancelled",
+            End::Released => "released",
         }
     }
 }
@@ -124,9 +183,15 @@ impl End {
 /// TV's logs: where it started and ended, how, after how many presses, and
 /// what drove it (`input=remote` for the D-pad).
 pub fn end_line(s: &Scrub, end: End, now: f64) -> String {
+    let steps = if s.input == Input::Remote {
+        "presses"
+    } else {
+        "moves"
+    };
     format!(
-        "pharos: scrub {} input=remote from {} ms to {} ms after {} presses in {} ms",
+        "pharos: scrub {} input={} from {} ms to {} ms after {} {steps} in {} ms",
         end.label(),
+        s.input.label(),
         s.origin_ms,
         s.target_ms,
         s.presses,
@@ -272,10 +337,35 @@ mod tests {
             line, "pharos: scrub cancelled input=remote from 60000 ms to 80000 ms after 2 presses in 1900 ms",
             "the time is the whole preview's, not the last hold's"
         );
-        let labels = [End::Settled, End::Confirmed, End::Cancelled].map(End::label);
+        let labels = [End::Settled, End::Confirmed, End::Cancelled, End::Released].map(End::label);
         assert!(labels
             .iter()
             .enumerate()
             .all(|(i, a)| labels[i + 1..].iter().all(|b| a != b)));
+    }
+
+    #[test]
+    fn a_drag_previews_until_it_lets_go_and_logs_its_input() {
+        let s = drag(None, Input::Touch, 90_000, 60_000, 0.0);
+        assert_eq!((s.origin_ms, s.target_ms, s.presses), (60_000, 90_000, 1));
+        let s = drag(Some(s), Input::Touch, 30_000, 75_000, 400.0);
+        assert_eq!(
+            (s.origin_ms, s.target_ms, s.presses, s.forward),
+            (60_000, 30_000, 2, false),
+            "the origin is where playback was at the press"
+        );
+        assert_eq!(
+            end_line(&s, End::Released, 650.0),
+            "pharos: scrub released input=touch from 60000 ms to 30000 ms after 2 moves in 650 ms"
+        );
+        let remote = press(None, true, false, 0, HOUR, 0.0);
+        let s = drag(Some(remote), Input::Mouse, 5_000, 1_000, 10.0);
+        assert_eq!(
+            (s.origin_ms, s.presses),
+            (1_000, 1),
+            "a drag never continues a remote preview"
+        );
+        let kinds = ["touch", "pen", "mouse", ""].map(|k| Input::of_pointer(k).label());
+        assert_eq!(kinds, ["touch", "pen", "mouse", "mouse"]);
     }
 }
