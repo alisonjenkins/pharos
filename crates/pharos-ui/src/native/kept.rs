@@ -7,7 +7,7 @@
 //! the title page read it without opening Cache Storage, and a device with
 //! nothing kept has no value at all.
 
-use pharos_client::api::{BookFormat, ItemRef};
+use pharos_client::api::{BookFormat, ItemRef, ReadPosition};
 use serde::{Deserialize, Serialize};
 
 use super::reader::{download_href, PendingSave};
@@ -193,20 +193,49 @@ impl KeptStore {
     }
 }
 
-/// Where to resume a kept book with no word from the server: the place
-/// noted in the record or the one waiting in the save queue, whichever was
-/// read later (the queue's on a tie, as it is what gets sent). `None` when
-/// neither has one.
-pub fn resume_place(book: &KeptBook, queued: Option<&PendingSave>) -> Option<(String, f32)> {
+/// The place a kept book would open at with no word from the server, and
+/// when it was read: the one noted in the record or the one waiting in the
+/// save queue, whichever was read later (the queue's on a tie, as it is what
+/// gets sent). `None` when neither has one.
+fn local_place(book: &KeptBook, queued: Option<&PendingSave>) -> Option<(String, f32, i64)> {
     let noted = book
         .locator
         .as_ref()
         .map(|l| (l, book.fraction, book.read_at_ms));
     match (noted, queued) {
-        (Some((l, f, at)), Some(q)) if at > q.read_at_ms => Some((l.clone(), f)),
-        (_, Some(q)) => Some((q.locator.clone(), q.fraction)),
-        (Some((l, f, _)), None) => Some((l.clone(), f)),
+        (Some((l, f, at)), Some(q)) if at > q.read_at_ms => Some((l.clone(), f, at)),
+        (_, Some(q)) => Some((q.locator.clone(), q.fraction, q.read_at_ms)),
+        (Some((l, f, at)), None) => Some((l.clone(), f, at)),
         (None, None) => None,
+    }
+}
+
+/// Where to resume a kept book with no word from the server.
+pub fn resume_place(book: &KeptBook, queued: Option<&PendingSave>) -> Option<(String, f32)> {
+    local_place(book, queued).map(|(locator, fraction, _)| (locator, fraction))
+}
+
+/// The server's place for a kept book that is already open, when the reader
+/// should move to it: another device read further since this one noted its
+/// own (spec 036 US4, the newest reading wins). `turned` is whether the user
+/// has turned a page since the book opened; their own reading is newer than
+/// anything the server held then, so they are never moved. Times are judged
+/// to the whole second, as the server stores them.
+pub fn server_place_to_adopt<'a>(
+    book: &KeptBook,
+    queued: Option<&PendingSave>,
+    server: Option<&'a ReadPosition>,
+    turned: bool,
+) -> Option<&'a ReadPosition> {
+    let server = server?;
+    if turned || server.locator.is_empty() || server.read_at_ms <= 0 {
+        return None;
+    }
+    match local_place(book, queued) {
+        None => Some(server),
+        Some((locator, _, at)) => (locator != server.locator
+            && server.read_at_ms.div_euclid(1000) > at.div_euclid(1000))
+        .then_some(server),
     }
 }
 
@@ -379,6 +408,105 @@ mod tests {
         assert_eq!(
             resume_place(&kept, Some(&queued("tie", 100))),
             Some(("tie".into(), 0.5))
+        );
+    }
+
+    fn server(locator: &str, read_at_ms: i64) -> ReadPosition {
+        ReadPosition {
+            locator: locator.into(),
+            fraction: 0.7,
+            read_at_ms,
+        }
+    }
+
+    fn noted(locator: &str, read_at_ms: i64) -> KeptBook {
+        KeptBook {
+            locator: Some(locator.into()),
+            fraction: 0.2,
+            read_at_ms,
+            ..book("1", 10)
+        }
+    }
+
+    #[test]
+    fn a_server_place_read_later_is_adopted() {
+        let kept = noted("mine", 100_000);
+        let theirs = server("theirs", 160_000);
+        assert_eq!(
+            server_place_to_adopt(&kept, None, Some(&theirs), false),
+            Some(&theirs)
+        );
+        // The queue's place is the local one when it was read later than the record.
+        assert_eq!(
+            server_place_to_adopt(&kept, Some(&queued("q", 150_000)), Some(&theirs), false),
+            Some(&theirs)
+        );
+        assert_eq!(
+            server_place_to_adopt(&kept, Some(&queued("q", 170_000)), Some(&theirs), false),
+            None
+        );
+        // A kept book with no place yet takes the server's.
+        assert_eq!(
+            server_place_to_adopt(&book("1", 10), None, Some(&theirs), false),
+            Some(&theirs)
+        );
+    }
+
+    #[test]
+    fn a_local_place_read_later_stays() {
+        let kept = noted("mine", 200_000);
+        assert_eq!(
+            server_place_to_adopt(&kept, None, Some(&server("theirs", 100_000)), false),
+            None
+        );
+    }
+
+    #[test]
+    fn the_same_second_is_equal_and_the_next_is_not() {
+        let kept = noted("mine", 100_400);
+        assert_eq!(
+            server_place_to_adopt(&kept, None, Some(&server("theirs", 100_000)), false),
+            None
+        );
+        assert_eq!(
+            server_place_to_adopt(&kept, None, Some(&server("theirs", 100_999)), false),
+            None
+        );
+        assert!(
+            server_place_to_adopt(&kept, None, Some(&server("theirs", 101_000)), false).is_some()
+        );
+    }
+
+    #[test]
+    fn a_server_with_no_place_or_no_time_changes_nothing() {
+        let kept = noted("mine", 100_000);
+        assert_eq!(server_place_to_adopt(&kept, None, None, false), None);
+        assert_eq!(
+            server_place_to_adopt(&kept, None, Some(&server("", 0)), false),
+            None
+        );
+        // A server older than schemaVersion 37 sends no time to judge by.
+        assert_eq!(
+            server_place_to_adopt(&book("1", 10), None, Some(&server("theirs", 0)), false),
+            None
+        );
+    }
+
+    #[test]
+    fn the_same_place_needs_no_move() {
+        let kept = noted("same", 100_000);
+        assert_eq!(
+            server_place_to_adopt(&kept, None, Some(&server("same", 900_000)), false),
+            None
+        );
+    }
+
+    #[test]
+    fn a_reader_who_has_turned_pages_is_not_moved() {
+        let kept = noted("mine", 100_000);
+        assert_eq!(
+            server_place_to_adopt(&kept, None, Some(&server("theirs", 900_000)), true),
+            None
         );
     }
 
