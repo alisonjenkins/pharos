@@ -1746,9 +1746,13 @@ fn NativeApp(route: Route) -> Element {
             let waited = platform::unix_ms().saturating_sub(started);
             let (outcome, cause) = match &joined {
                 Ok(_) => (RejoinOutcome::Rejoined, None),
+                Err(e) if e.is_superseded() => (RejoinOutcome::Superseded, None),
                 Err(e) => (RejoinOutcome::Failed, Some(e.0.as_str())),
             };
             platform::report_event(rejoin_event("reload", &id, outcome, 1, waited, cause));
+            if outcome != RejoinOutcome::Failed {
+                return;
+            }
             if let Err(e) = joined {
                 platform::warn(&format!(
                     "pharos: group rejoin failed group={id} error={}",
