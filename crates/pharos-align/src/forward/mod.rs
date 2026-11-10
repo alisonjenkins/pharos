@@ -2,6 +2,7 @@
 //! the 29 labels out, as torchaudio's bundle model computes them.
 
 pub mod cpu;
+pub mod fallback;
 mod math;
 #[cfg(feature = "vulkan")]
 pub mod vulkan;

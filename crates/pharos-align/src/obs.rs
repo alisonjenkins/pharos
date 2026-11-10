@@ -126,6 +126,10 @@ impl Metrics {
         let process = metrics_process::Collector::default();
         process.describe();
         metrics::describe_counter!(SONGS_TOTAL, "Songs aligned, by outcome");
+        metrics::describe_counter!(
+            crate::forward::fallback::DEVICE_FALLBACK_TOTAL,
+            "Songs moved off the GPU: gpu_error per failed window, latched per song after the latch"
+        );
         metrics::describe_histogram!(
             SONG_SECONDS,
             metrics::Unit::Seconds,
