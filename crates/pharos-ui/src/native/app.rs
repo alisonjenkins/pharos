@@ -41,7 +41,7 @@ use super::playback::{
     rust_subtitle_url, shown_font_urls, source_of_styled, start_ms, starting_tier,
     starting_tier_line, styled_subtitle_signals, styled_subtitle_url, styled_track_url,
     subtitle_switch, tier_drop_line, tier_drop_report, tier_spared_line, up_next_at,
-    volume_setting, DeviceClass, EffectsLevel, Engine, EngineReason, Fatal, LibraryTransition,
+    volume_setting, DeviceClass, EffectsLevel, Engine, EngineReason, FailureKind, Fatal, LibraryTransition,
     MediaEvent, MediaState, MseEngine, OnFatal, OnFragment, Outgoing, OverlayEffect,
     PlaybackEngine, RendererFrames, ReportClock, SubtitleSize, SubtitleSwitch, Tier, TierDrop,
     TierVerdict, UpNext, UpNextStep, CROSSFADE_KEY, EFFECTS_LEVEL_KEY, LIBRARY_TRANSITION_KEY,
@@ -80,7 +80,7 @@ use super::versions;
 use super::views::{
     open_route, reveal_palette_row, Busy, ErrorNote, FlashNote, GroupEndedNote, Hits, HomeView,
     LoadError, LoadFailure, Loading, MarkFavorite, MarkPlayed, Nav, PaletteView, PlayFailure,
-    PlayFromStart, PlaybackFailure, SearchBox, Shell, SignInView, StatusView, StoredMark,
+    PlayFromStart, PlaybackFailure, SearchBox, Shell, StartFailure, SignInView, StatusView, StoredMark,
     TitleView, PALETTE_INPUT,
 };
 use super::watch_view::{
@@ -2166,6 +2166,20 @@ pub(super) fn call(route: &str, action: &str) -> CallInfo {
 
 /// A finished load: the value, or the message to show. A `revoked` answer
 /// also sends the app to sign-in.
+/// As [`settle`], for a play: the failure keeps its kind and trace id for
+/// the panel's hint and details line (038 FR-403/404).
+fn settle_start<T>(
+    mut machine: Signal<Machine>,
+    result: Result<T, ClientError>,
+) -> Result<T, StartFailure> {
+    result.map_err(|e| {
+        if e.needs_sign_in() {
+            machine.write().apply(Event::NeedsSignIn);
+        }
+        StartFailure::from_client(&e)
+    })
+}
+
 fn settle<T>(mut machine: Signal<Machine>, result: Result<T, ClientError>) -> Result<T, String> {
     result.map_err(|e| {
         if e.needs_sign_in() {
@@ -3926,6 +3940,23 @@ fn WhatsNew(route: Route) -> Element {
     }
 }
 
+/// Opens "Report a problem" from a playback failure panel, the failure
+/// noted first so the report says what the viewer saw and quotes its trace
+/// id (038 FR-403/404).
+fn report_failure(failure: &PlayFailure) {
+    report::note(&failure.crumb());
+    if let Some(trace) = &failure.trace_id {
+        report::trace(trace);
+    }
+    platform::info(&format!(
+        "pharos: report opened from=playback_failure kind={}",
+        failure.kind.label()
+    ));
+    if let Some(ReportOpen(mut open)) = try_consume_context::<ReportOpen>() {
+        open.set(true);
+    }
+}
+
 /// Back one page, or home when there is none to go back to.
 fn leave_player(nav: Nav) {
     if !platform::go_back() {
@@ -3934,10 +3965,13 @@ fn leave_player(nav: Nav) {
 }
 
 /// Renders a load's state: loading, its error, or `view` of its value.
-fn loaded<T>(state: Option<&Result<T, String>>, view: impl FnOnce(&T) -> Element) -> Element {
+fn loaded<T, E: std::fmt::Display>(
+    state: Option<&Result<T, E>>,
+    view: impl FnOnce(&T) -> Element,
+) -> Element {
     match state {
         None => rsx! { Loading {} },
-        Some(Err(message)) => rsx! { ErrorNote { message: message.clone() } },
+        Some(Err(message)) => rsx! { ErrorNote { message: message.to_string() } },
         Some(Ok(value)) => view(value),
     }
 }
@@ -4763,7 +4797,7 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
             }
             .await;
             Some(
-                settle(ctx.machine, result).and_then(|(detail, version, decision, grant, asked, track_map)| {
+                settle_start(ctx.machine, result).and_then(|(detail, version, decision, grant, asked, track_map)| {
                     let (mse_engine, engine_reason) = mse_engine_choice();
                     let picked = choose_engine(
                         decision.is_hls(),
@@ -4787,9 +4821,10 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
                         decision.stream_url
                     ));
                     if engine == Engine::Unsupported {
-                        return Err(
-                            "This title needs HLS, which this browser cannot play.".to_owned()
-                        );
+                        return Err(StartFailure::new(
+                            FailureKind::Unplayable,
+                            "This title needs HLS, which this browser cannot play.",
+                        ));
                     }
                     // In a group playing this item, the player starts where
                     // the group is: this member's own resume point would land
@@ -5025,17 +5060,20 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
     use_effect(move || {
         if let Some(Some(Err(reason))) = &*playing.read() {
             platform::warn(&format!(
-                "pharos: playback failure shown item={id} kind=negotiate view={} reason={reason}",
-                ctx_stage.peek().view.label()
+                "pharos: playback failure shown item={id} kind=negotiate view={} failure={} trace={} reason={reason}",
+                ctx_stage.peek().view.label(),
+                reason.kind.label(),
+                reason.trace_id.as_deref().unwrap_or("none"),
             ));
         }
     });
     let body = match start_failure {
         Some(reason) => rsx! {
             PlaybackFailure {
-                failure: PlayFailure::start(reason),
+                failure: PlayFailure::start(reason.clone()),
                 on_retry: move |()| playing.restart(),
                 on_back: move |()| leave_player(nav),
+                on_report: move |()| report_failure(&PlayFailure::start(reason.clone())),
             }
         },
         None => loaded(state.as_ref().and_then(Option::as_ref), |p: &PlayingRef| {
@@ -5894,10 +5932,11 @@ fn Player(
             async move {
                 while let Some(fatal) = reasons.next().await {
                     stop();
+                    let kind = fatal.kind;
                     let reason = fatal.reason;
                     // Music keeps its own screen, and a group plays one
                     // timeline for all: neither is offered a skip.
-                    let skippable = fatal.media
+                    let skippable = kind == FailureKind::Damaged
                         && p.kind != ItemKind::Audio
                         && !group_view.peek().drives(playing_id);
                     // Where the element stopped; a failure before the first
@@ -5919,16 +5958,17 @@ fn Player(
                         })
                         .flatten();
                     platform::warn(&format!(
-                        "pharos: playback failure shown item={playing_id} kind=stream media={} at_ms={at} skip_to_ms={} source={} reason={reason}",
-                        fatal.media,
+                        "pharos: playback failure shown item={playing_id} kind=stream media={} failure={} at_ms={at} skip_to_ms={} source={} reason={reason}",
+                        kind == FailureKind::Damaged,
+                        kind.label(),
                         skip.map_or(0, |(to, _)| to),
                         skip.map_or("none", |(_, s)| s.label()),
                     ));
-                    // Music and groups keep the panel they had.
-                    failed.set(Some(if skippable {
-                        PlayFailure::damaged(reason, skip.map(|(to, _)| to))
-                    } else {
-                        PlayFailure::stream(reason)
+                    // Music and groups are offered no skip, but a damaged
+                    // file is still named as one (038 FR-403).
+                    failed.set(Some(match kind {
+                        FailureKind::Damaged => PlayFailure::damaged(reason, skip.map(|(to, _)| to)),
+                        kind => PlayFailure::stream(kind, reason),
                     }));
                 }
             }
@@ -5988,7 +6028,8 @@ fn Player(
                         platform::warn(&format!(
                             "pharos: playback failure shown item={playing_id} kind=start reason={e}"
                         ));
-                        failed.set(Some(PlayFailure::start(e)));
+                        // The engine would not attach to this browser.
+                        failed.set(Some(PlayFailure::start(StartFailure::new(FailureKind::Unplayable, e))));
                     }
                 }
             });
@@ -7176,7 +7217,8 @@ fn Player(
         } else {
             if let Some(failure) = failed() {
                 PlaybackFailure {
-                    failure,
+                    failure: failure.clone(),
+                    on_report: move |()| report_failure(&failure),
                     on_retry: {
                         let last_ms = Rc::clone(&last_ms.0);
                         move |()| {
