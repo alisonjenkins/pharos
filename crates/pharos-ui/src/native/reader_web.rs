@@ -1,6 +1,7 @@
 //! The book reader screen (spec 023): fetches an EPUB, hands it to `quire`
-//! and draws it with `quire-web` in a host the stylesheet sizes. Rules
-//! (settings, size cap, save timing, keys) are in `reader.rs`.
+//! and draws it with `quire-web` in a host the stylesheet sizes; a PDF is
+//! drawn page by page on a canvas by `pdf_web.rs`. Rules (settings, size
+//! cap, save timing, keys) are in `reader.rs`.
 //!
 //! Cost model, for TVs and headsets. Nothing animates beyond what
 //! `quire-web` does for a page turn, no timer runs while reading (a save
@@ -20,12 +21,13 @@ use wasm_bindgen::JsCast as _;
 
 use super::app::{call, this_device, Ctx};
 use super::keymap::Mode;
+use super::pdf_web::PdfView;
 use super::platform;
 use super::reader::{
-    check_size, download_href, flatten_toc, key_action, margin_label, percent_label, save_key,
-    saved_fraction, saved_locator, size_cap, too_big_message, KeyAction, KeyPress, KeyTarget,
-    PageTheme, ReaderSettings, SaveGate, SizeVerdict, TocRow, Typeface, LINE_HEIGHTS, MARGINS,
-    SETTINGS_KEY,
+    check_size, download_href, flatten_toc, key_action, margin_label, pdf_locator, pdf_progress,
+    pdf_saved_index, progress_label, save_key, saved_fraction, saved_locator, size_cap,
+    swipe_action, tap_action, too_big_message, KeyAction, KeyPress, KeyTarget, PageTheme, PdfFit,
+    ReaderSettings, SaveGate, SizeVerdict, TocRow, Typeface, LINE_HEIGHTS, MARGINS, SETTINGS_KEY,
 };
 use super::route::Route;
 use super::views::{display_name, Nav};
@@ -119,14 +121,52 @@ impl Saver {
     }
 }
 
-/// An open book on screen. Holds the view; the view's callbacks hold only
+/// What draws the open book: quire-web's text view or a PDF canvas.
+enum Engine {
+    Epub(View),
+    Pdf(Rc<PdfView>),
+}
+
+impl Engine {
+    fn locator(&self) -> String {
+        match self {
+            Engine::Epub(view) => view.locator().to_string(),
+            Engine::Pdf(pdf) => pdf_locator(pdf.index()),
+        }
+    }
+
+    fn progress(&self) -> f64 {
+        match self {
+            Engine::Epub(view) => view.progress(),
+            Engine::Pdf(pdf) => pdf_progress(pdf.index(), pdf.count()),
+        }
+    }
+
+    /// The PDF page index (from 0) and page count; `None` for an EPUB.
+    fn page(&self) -> Option<(usize, usize)> {
+        match self {
+            Engine::Epub(_) => None,
+            Engine::Pdf(pdf) => Some((pdf.index(), pdf.count())),
+        }
+    }
+
+    fn unmount(&self) {
+        match self {
+            Engine::Epub(view) => view.unmount(),
+            Engine::Pdf(pdf) => pdf.unmount(),
+        }
+    }
+}
+
+/// An open book on screen. Holds the engine; the view's callbacks hold only
 /// a `Weak` of this, so dropping the screen frees both.
 struct Core {
-    view: View,
+    engine: Engine,
     saver: Saver,
     at_end: Cell<bool>,
     alive: Rc<Cell<bool>>,
     fraction: Signal<f64>,
+    page: Signal<Option<(usize, usize)>>,
 }
 
 impl Core {
@@ -134,27 +174,35 @@ impl Core {
         if self.alive.get() {
             let mut shown = self.fraction;
             shown.set(f);
+            let mut page = self.page;
+            page.set(self.engine.page());
         }
     }
 
     /// The reader has gone to a new page: show how far, and offer a save.
     fn moved(&self, at_end: bool) {
         self.at_end.set(at_end);
-        self.set_fraction(if at_end { 1.0 } else { self.view.progress() });
+        self.set_fraction(if at_end { 1.0 } else { self.engine.progress() });
         self.save(false);
     }
 
     fn save(&self, forced: bool) {
-        let locator = self.view.locator().to_string();
-        let fraction = saved_fraction(self.view.progress(), self.at_end.get());
+        let locator = self.engine.locator();
+        let fraction = saved_fraction(self.engine.progress(), self.at_end.get());
         self.saver.send(&locator, fraction, forced);
     }
 
     async fn turn(&self, forward: bool) {
-        let more = if forward {
-            self.view.next().await
-        } else {
-            self.view.prev().await
+        let more = match &self.engine {
+            Engine::Epub(view) => {
+                let more = if forward {
+                    view.next().await
+                } else {
+                    view.prev().await
+                };
+                more.map_err(|e| e.to_string())
+            }
+            Engine::Pdf(pdf) => pdf.turn(forward),
         };
         match more {
             Ok(more) => self.moved(forward && !more),
@@ -163,9 +211,19 @@ impl Core {
     }
 
     async fn go(&self, target: &Target) {
-        match self.view.go(target).await {
+        let Engine::Epub(view) = &self.engine else {
+            return;
+        };
+        match view.go(target).await {
             Ok(()) => self.moved(false),
             Err(e) => platform::warn(&format!("pharos: reader jump failed error={e}")),
+        }
+    }
+
+    fn apply_settings(&self, settings: ReaderSettings) {
+        match &self.engine {
+            Engine::Epub(view) => view.set_settings(view_settings(settings)),
+            Engine::Pdf(pdf) => pdf.set_fit(settings.pdf_fit),
         }
     }
 }
@@ -185,9 +243,10 @@ impl Drop for AbortOnDrop {
     }
 }
 
-/// The book's bytes, refused before the body is read when a weak device
-/// would hold too many of them.
-async fn fetch_book(id: ItemRef) -> Result<Vec<u8>, String> {
+/// The book's bytes as the browser holds them, refused before the body is
+/// read when a weak device would hold too many of them. A PDF goes to its
+/// module from here without a copy through this module's memory.
+async fn fetch_book(id: ItemRef) -> Result<js_sys::Uint8Array, String> {
     let cap = size_cap(this_device(), &platform::user_agent());
     let controller = AbortOnDrop(web_sys::AbortController::new().map_err(|e| format!("{e:?}"))?);
     let response = Request::get(&download_href(id))
@@ -218,10 +277,13 @@ async fn fetch_book(id: ItemRef) -> Result<Vec<u8>, String> {
             return Err(too_big_message(bytes, cap));
         }
     }
-    response
-        .binary()
+    let failed = |e: wasm_bindgen::JsValue| format!("The download failed: {e:?}");
+    let raw: web_sys::Response = response.into();
+    let promise = raw.array_buffer().map_err(failed)?;
+    let buffer = wasm_bindgen_futures::JsFuture::from(promise)
         .await
-        .map_err(|e| format!("The download failed: {e}"))
+        .map_err(failed)?;
+    Ok(js_sys::Uint8Array::new(&buffer))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -231,6 +293,7 @@ async fn open_book(
     saved: Option<Locator>,
     settings: ReaderSettings,
     fraction: Signal<f64>,
+    page: Signal<Option<(usize, usize)>>,
     alive: Rc<Cell<bool>>,
     bytes: Vec<u8>,
     on_action: impl Fn(Action) + 'static,
@@ -264,7 +327,7 @@ async fn open_book(
         return Err(format!("The book cannot be shown: {e}"));
     }
     let core = Rc::new(Core {
-        view,
+        engine: Engine::Epub(view),
         saver: Saver {
             api,
             id,
@@ -273,9 +336,50 @@ async fn open_book(
         at_end: Cell::new(false),
         alive,
         fraction,
+        page,
     });
-    core.set_fraction(core.view.progress());
+    core.set_fraction(core.engine.progress());
     Ok(Opened { core, toc })
+}
+
+/// Opens a PDF on the page `saved` names, if any.
+#[allow(clippy::too_many_arguments)]
+async fn open_pdf(
+    api: NativeApi,
+    id: ItemRef,
+    saved: Option<&str>,
+    settings: ReaderSettings,
+    fraction: Signal<f64>,
+    page: Signal<Option<(usize, usize)>>,
+    alive: Rc<Cell<bool>>,
+    bytes: &js_sys::Uint8Array,
+) -> Result<Opened, String> {
+    let host = web_sys::window()
+        .and_then(|w| w.document())
+        .and_then(|d| d.get_element_by_id(HOST_ID))
+        .and_then(|e| e.dyn_into::<web_sys::HtmlElement>().ok())
+        .ok_or("The reader has no page to draw on.")?;
+    // The count is only known once the file is open, so a saved page is held
+    // inside the book by the view.
+    let wanted = saved.map_or(0, |text| pdf_saved_index(text, usize::MAX));
+    let view = PdfView::open(host, bytes, wanted, settings.pdf_fit, id).await?;
+    let core = Rc::new(Core {
+        engine: Engine::Pdf(view),
+        saver: Saver {
+            api,
+            id,
+            gate: RefCell::new(SaveGate::default()),
+        },
+        at_end: Cell::new(false),
+        alive,
+        fraction,
+        page,
+    });
+    core.set_fraction(core.engine.progress());
+    Ok(Opened {
+        core,
+        toc: Vec::new(),
+    })
 }
 
 /// A page-wide `keydown` listener that reports the press and what it came
@@ -356,6 +460,10 @@ pub fn ReaderScreen(id: ItemRef) -> Element {
     let mut title = use_signal(String::new);
     let mut toc = use_signal(Vec::<TocRow>::new);
     let fraction = use_signal(|| 0.0f64);
+    let page = use_signal(|| None::<(usize, usize)>);
+    let mut is_pdf = use_signal(|| false);
+    let swipe_from = use_hook(|| Rc::new(Cell::new(f64::NAN)));
+    let swiped = use_hook(|| Rc::new(Cell::new(false)));
     let mut settings = use_signal(stored_settings);
     let mut panel = use_signal(|| None::<Panel>);
     let alive = use_hook(|| Rc::new(Cell::new(true)));
@@ -384,11 +492,58 @@ pub fn ReaderScreen(id: ItemRef) -> Element {
                 };
                 title.set(display_name(&detail.item));
                 let format = detail.book.as_ref().map(|b| b.format);
-                if format != Some(BookFormat::Epub) {
+                if !matches!(format, Some(BookFormat::Epub | BookFormat::Pdf)) {
                     platform::warn(&format!(
-                        "pharos: reader failed item={id} format={format:?} error=not an EPUB"
+                        "pharos: reader failed item={id} format={format:?} error=not an EPUB or PDF"
                     ));
                     phase.set(Phase::Failed("This book cannot be opened here.".into()));
+                    return;
+                }
+                if format == Some(BookFormat::Pdf) {
+                    is_pdf.set(true);
+                    let bytes = match fetch_book(id).await {
+                        Ok(b) => b,
+                        Err(message) => {
+                            platform::warn(&format!(
+                                "pharos: reader failed item={id} error={message}"
+                            ));
+                            phase.set(Phase::Failed(message));
+                            return;
+                        }
+                    };
+                    let length = bytes.length();
+                    let saved = detail.read_position.as_ref().map(|p| p.locator.clone());
+                    let opened = open_pdf(
+                        api,
+                        id,
+                        saved.as_deref(),
+                        *settings.peek(),
+                        fraction,
+                        page,
+                        alive.clone(),
+                        &bytes,
+                    )
+                    .await;
+                    match opened {
+                        Ok(o) if alive.get() => {
+                            let at = o.core.engine.locator();
+                            *core.borrow_mut() = Some(o.core);
+                            phase.set(Phase::Reading);
+                            platform::info(&format!(
+                                "pharos: reader opened item={id} format=pdf bytes={length} ms={:.0} resumed={} at={}",
+                                platform::now_ms() - began,
+                                saved.is_some(),
+                                at
+                            ));
+                        }
+                        Ok(o) => o.core.engine.unmount(),
+                        Err(message) => {
+                            platform::warn(&format!(
+                                "pharos: reader failed item={id} bytes={length} error={message}"
+                            ));
+                            phase.set(Phase::Failed(message));
+                        }
+                    }
                     return;
                 }
                 let bytes = match fetch_book(id).await {
@@ -399,6 +554,7 @@ pub fn ReaderScreen(id: ItemRef) -> Element {
                         return;
                     }
                 };
+                let bytes = js_sys::Uint8Array::to_vec(&bytes);
                 let length = bytes.len();
                 let saved = detail
                     .read_position
@@ -423,7 +579,11 @@ pub fn ReaderScreen(id: ItemRef) -> Element {
                             Action::Jump(target) => platform::spawn_detached(async move {
                                 c.go(&target).await;
                             }),
-                            Action::Relayout => c.view.relayout(),
+                            Action::Relayout => {
+                                if let Engine::Epub(view) = &c.engine {
+                                    view.relayout();
+                                }
+                            }
                         }
                     }
                 };
@@ -433,6 +593,7 @@ pub fn ReaderScreen(id: ItemRef) -> Element {
                     saved,
                     *settings.peek(),
                     fraction,
+                    page,
                     alive.clone(),
                     bytes,
                     handler,
@@ -440,7 +601,7 @@ pub fn ReaderScreen(id: ItemRef) -> Element {
                 .await;
                 match opened {
                     Ok(o) if alive.get() => {
-                        let at = o.core.view.locator();
+                        let at = o.core.engine.locator();
                         *weak.borrow_mut() = Rc::downgrade(&o.core);
                         toc.set(o.toc);
                         *core.borrow_mut() = Some(o.core);
@@ -452,7 +613,7 @@ pub fn ReaderScreen(id: ItemRef) -> Element {
                             at
                         ));
                     }
-                    Ok(o) => o.core.view.unmount(),
+                    Ok(o) => o.core.engine.unmount(),
                     Err(message) => {
                         platform::warn(&format!(
                             "pharos: reader failed item={id} bytes={length} error={message}"
@@ -513,7 +674,7 @@ pub fn ReaderScreen(id: ItemRef) -> Element {
             let held = core.borrow_mut().take();
             if let Some(c) = held {
                 c.save(true);
-                c.view.unmount();
+                c.engine.unmount();
             }
         }
     });
@@ -527,7 +688,7 @@ pub fn ReaderScreen(id: ItemRef) -> Element {
             }
             let held = core.borrow().clone();
             if let Some(c) = held {
-                c.view.set_settings(view_settings(next));
+                c.apply_settings(next);
             }
         }
     });
@@ -546,9 +707,52 @@ pub fn ReaderScreen(id: ItemRef) -> Element {
     let current = *settings.read();
     let page_background = view_settings(current).theme.background;
     let shown = phase.read().clone();
-    let label = percent_label(*fraction.read());
+    let label = progress_label(*fraction.read(), *page.read());
     let width = format!("width: {}%", super::reader::percent(*fraction.read()));
     let open = *panel.read();
+    let pdf = *is_pdf.read();
+    let host_class = if pdf {
+        "pharos-reader-host pharos-reader-host-pdf"
+    } else {
+        "pharos-reader-host"
+    };
+    let host_font = if pdf {
+        String::new()
+    } else {
+        format!("font-size: {}px", current.font_px)
+    };
+    let tap = EventHandler::new({
+        let (core, swiped) = (core.clone(), swiped.clone());
+        move |x: f64| {
+            if swiped.replace(false) {
+                return;
+            }
+            let Some(action) = tap_action(x) else {
+                return;
+            };
+            let held = core.borrow().clone();
+            if let Some(c) = held {
+                platform::spawn_detached(async move {
+                    c.turn(action == KeyAction::Next).await;
+                });
+            }
+        }
+    });
+    let swipe = EventHandler::new({
+        let (core, swiped) = (core.clone(), swiped.clone());
+        move |dx: f64| {
+            let Some(action) = swipe_action(dx) else {
+                return;
+            };
+            swiped.set(true);
+            let held = core.borrow().clone();
+            if let Some(c) = held {
+                platform::spawn_detached(async move {
+                    c.turn(action == KeyAction::Next).await;
+                });
+            }
+        }
+    });
     let toggle = EventHandler::new(move |which: Panel| {
         let next = if *panel.peek() == Some(which) {
             None
@@ -571,30 +775,70 @@ pub fn ReaderScreen(id: ItemRef) -> Element {
                     "←"
                 }
                 h2 { class: "pharos-reader-title", "{title}" }
-                button {
-                    class: "pharos-control",
-                    r#type: "button",
-                    aria_label: "Contents",
-                    aria_pressed: "{open == Some(Panel::Contents)}",
-                    onclick: move |_| toggle.call(Panel::Contents),
-                    "Contents"
-                }
-                button {
-                    class: "pharos-control",
-                    r#type: "button",
-                    aria_label: "Text settings",
-                    aria_pressed: "{open == Some(Panel::Text)}",
-                    onclick: move |_| toggle.call(Panel::Text),
-                    "Aa"
+                if pdf {
+                    button {
+                        class: "pharos-control",
+                        r#type: "button",
+                        aria_label: "Fit width",
+                        aria_pressed: "{current.pdf_fit == PdfFit::Width}",
+                        onclick: move |_| apply.call(ReaderSettings { pdf_fit: current.pdf_fit.toggled(), ..current }),
+                        "{PdfFit::Width.label()}"
+                    }
+                } else {
+                    button {
+                        class: "pharos-control",
+                        r#type: "button",
+                        aria_label: "Contents",
+                        aria_pressed: "{open == Some(Panel::Contents)}",
+                        onclick: move |_| toggle.call(Panel::Contents),
+                        "Contents"
+                    }
+                    button {
+                        class: "pharos-control",
+                        r#type: "button",
+                        aria_label: "Text settings",
+                        aria_pressed: "{open == Some(Panel::Text)}",
+                        onclick: move |_| toggle.call(Panel::Text),
+                        "Aa"
+                    }
                 }
             }
             // The page theme fills the stage; the host, one measure wide at
             // the text size, sits in its middle.
             div { class: "pharos-reader-stage", style: "background: {page_background}",
                 div {
-                    class: "pharos-reader-host",
+                    class: host_class,
                     id: HOST_ID,
-                    style: "font-size: {current.font_px}px",
+                    style: "{host_font}",
+                    onpointerdown: {
+                        let swipe_from = swipe_from.clone();
+                        move |e| {
+                            swipe_from.set(e.client_coordinates().x);
+                        }
+                    },
+                    onpointerup: {
+                        let swipe_from = swipe_from.clone();
+                        move |e| {
+                            // A mouse drag is not a swipe, as in quire-web.
+                            let dx = e.client_coordinates().x - swipe_from.replace(f64::NAN);
+                            if pdf && e.pointer_type() != "mouse" {
+                                swipe.call(dx);
+                            }
+                        }
+                    },
+                    onclick: move |e| {
+                        if !pdf {
+                            return;
+                        }
+                        let Some(host) = web_sys::window()
+                            .and_then(|w| w.document())
+                            .and_then(|d| d.get_element_by_id(HOST_ID))
+                        else {
+                            return;
+                        };
+                        let rect = host.get_bounding_client_rect();
+                        tap.call((e.client_coordinates().x - rect.left()) / rect.width().max(1.0));
+                    },
                 }
             }
             div {
