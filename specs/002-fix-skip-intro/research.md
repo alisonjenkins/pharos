@@ -237,8 +237,8 @@ The viewer has played episodes that **do** carry an intro segment:
 
 | Episode | Intro | Source |
 |---------|-------|--------|
-| Code Geass S02E12 | 112–200 s, conf 1.00 | detected (chromaprint) |
-| Neon Genesis Evangelion S01E18 | 0–89 s | detected |
+| Show B S02E12 | 112–200 s, conf 1.00 | detected (chromaprint) |
+| Show E S01E18 | 0–89 s | detected |
 | Fringe S01E05 | 384–403 s | detected |
 | Show K S03E01 | 81–166 s | **chapter** titled `Intro` |
 | Show K S03E05 | 200–219 s | **chapter** titled `Intro` |
