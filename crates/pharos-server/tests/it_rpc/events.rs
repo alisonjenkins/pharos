@@ -388,9 +388,10 @@ async fn a_finished_scan_arrives_with_its_counts() {
                 other => panic!("expected scan progress, got {other:?}"),
             }
             let tally = ScanTally {
-                roots: 2,
+                roots: 3,
                 failed_roots: 1,
-                incomplete_roots: 0,
+                // A root read in part is unread too: failedRoots carries both.
+                incomplete_roots: 1,
                 added: 5,
                 changed: 3,
                 removed: 2,
@@ -400,7 +401,7 @@ async fn a_finished_scan_arrives_with_its_counts() {
             match next(&mut rx).await {
                 Got::Task { state, counts, .. } => {
                     assert_eq!(state, "partial");
-                    assert_eq!(counts, [5, 3, 2, 1]);
+                    assert_eq!(counts, [5, 3, 2, 2]);
                 }
                 other => panic!("expected the scan's end, got {other:?}"),
             }
