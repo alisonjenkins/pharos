@@ -304,6 +304,26 @@ pub(super) fn transport_control(t: Transport, media: &MediaState) -> Option<Cont
     })
 }
 
+/// What the remote's Back does in the player, nearest first: it drops an
+/// open scrub preview (B907), then cancels Up Next (FR-604), and only then
+/// leaves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum BackInPlayer {
+    DropPreview,
+    CancelUpNext,
+    Leave,
+}
+
+pub(super) fn back_in_player(scrubbing: bool, up_next_shown: bool) -> BackInPlayer {
+    if scrubbing {
+        BackInPlayer::DropPreview
+    } else if up_next_shown {
+        BackInPlayer::CancelUpNext
+    } else {
+        BackInPlayer::Leave
+    }
+}
+
 /// The seek `s` makes: to the end of the segment whose skip button shows,
 /// and nothing when no button shows (B805). "Up next" takes the button's
 /// place over the credits, so it leaves `s` unbound too.
@@ -652,14 +672,23 @@ pub fn WatchView(
     };
     // The WebView app's Back is a history pop, not a key: while a preview
     // is open it drops the preview and stays in the player, as Escape does.
+    // Up Next showing, Back cancels it before it leaves the player (FR-604).
+    // Read at the press, not from the render the hook was made in.
+    let up_next_live = use_hook(|| std::rc::Rc::new(std::cell::Cell::new(false)));
+    up_next_live.set(up_next_shown);
     let _back = use_hook(|| {
         SCRUB_KEYS.then(|| {
             let mut end_scrub = end_scrub;
+            let up_next = std::rc::Rc::clone(&up_next_live);
             std::rc::Rc::new(platform::on_back(move || {
-                if scrub.peek().is_none() {
-                    return false;
+                match back_in_player(scrub.peek().is_some(), up_next.get()) {
+                    BackInPlayer::DropPreview => end_scrub(scrub::End::Cancelled),
+                    BackInPlayer::CancelUpNext => {
+                        platform::info("pharos: up next cancelled via=back");
+                        on_control.call(Control::CancelNext);
+                    }
+                    BackInPlayer::Leave => return false,
                 }
-                end_scrub(scrub::End::Cancelled);
                 true
             }))
         })
@@ -2852,6 +2881,13 @@ mod tests {
             open_tag.contains(r#"tabindex=0"#) || open_tag.contains(r#"tabindex="0""#),
             "the seek bar takes the focus (V1209): {open_tag}"
         );
+    }
+
+    #[test]
+    fn back_drops_a_preview_then_cancels_up_next_then_leaves() {
+        assert_eq!(back_in_player(true, true), BackInPlayer::DropPreview);
+        assert_eq!(back_in_player(false, true), BackInPlayer::CancelUpNext);
+        assert_eq!(back_in_player(false, false), BackInPlayer::Leave);
     }
 
     /// B750: the skip button and "Up next" overlap the top of the
