@@ -8,8 +8,9 @@
 
 ## Problem
 
-Alison (2026-11-09): shows that were remade under the same name (Cosmos 1980 and
-2014, Battlestar Galactica 1978 and 2004, The Flash 1990 and 2014) get confused
+Alison (2026-11-09): shows that were remade under the same name (a 1980 documentary
+series and its 2014 remake, a 1978 drama and its 2004 remake, a 1990 show and
+its 2014 remake) get confused
 by the scanner. The episodes show the other show's titles, plots and dates.
 
 Series identity is already keyed on the show folder (LIB-C11,
@@ -19,36 +20,36 @@ provider episode each file takes its metadata from**.
 
 ## What the live library shows (read-only queries, 2026-11-09T14:09Z)
 
-Remake pairs present: Battlestar Galactica, Cosmos, The Flash, Charmed, Knight
-Rider, Quantum Leap, One Piece, Life on Mars. In every pair the remake sits in a
+Several remake pairs are present, among them dramas, a documentary series, an
+anime and a UK/US pair. In every pair the remake sits in a
 `Show (YYYY)` folder and the other in a bare `Show` folder. All year folders
-match correctly (confidence 0.95–1.0), and so do both sides of Charmed, Knight
-Rider, Quantum Leap and One Piece. Only bare folders go wrong. **176 episode
-rows show another show's metadata.** No row has a NULL `series_folder`.
+match correctly (confidence 0.95–1.0), and so do both sides of several pairs.
+Only bare folders go wrong. **Episode rows show another show's metadata.** No row has a NULL `series_folder`.
 
-| Folder | Episodes | On disk | Series match | Episode metadata | Failure |
-|---|---|---|---|---|---|
-| `Battlestar Galactica` | 81 | every file `Battlestar Galactica (2003) - SxxEyy`; `tvshow.nfo` says 2003 | 1978 (tvdb 71173, conf 0.85) | 1978 titles ("33" → "Saga of a Star World (1)") | B930 |
-| `The Flash` | 66 | Season 01: 4 files of the 1990 series, no year; Seasons 03–09: 62 files `The Flash (2014) - SxxEyy` | 1990 (tvdb 78650) | from Jellyfin NFOs (2014), so the 1990 files carry 2014 titles | B930, B932 |
-| `Cosmos` | 13 | the 1980 Sagan series; Jellyfin `tvshow.nfo` and episode NFOs say 2014 | 1980 (tvdb 74995), correct | 2014 titles, plots, air dates from the NFO ids | B931 |
-| `Life on Mars` | 16 | UK 2006 (8 + 8, `Episode N` naming; inferred from count and naming) | UK, correct | US 2008 from the NFO ids | B931 |
+| Folder | On disk | Series match | Episode metadata | Failure |
+|---|---|---|---|---|
+| `Show B` (2003 remake) | every file `Show B (2003) - SxxEyy`; `tvshow.nfo` says 2003 | the 1978 original (conf 0.85) | 1978 titles | B930 |
+| `Show A` (1990 original, 2014 remake) | Season 01: a few files of the 1990 series, no year; later seasons: most files `Show A (2014) - SxxEyy` | the 1990 show | from Jellyfin NFOs (2014), so the 1990 files carry 2014 titles | B930, B932 |
+| `Show C` (1980 documentary series, 2014 remake) | the 1980 series; Jellyfin `tvshow.nfo` and episode NFOs say 2014 | 1980, correct | 2014 titles, plots, air dates from the NFO ids | B931 |
+| `Show D` (UK original, US remake) | UK 2006 (two seasons, `Episode N` naming; inferred from count and naming) | UK, correct | US 2008 from the NFO ids | B931 |
 
 Also found: the per-episode search attached unrelated shows' episodes in
-`Dune - Prophecy` S01E06 ("First Date", 2007), `Knight Rider (2008)` S01E02/E04
-("Condom Mania", 2003) and `Star Trek - Starfleet Academy` S01E02/E04/E05
+a prequel series' S01E06 (an unrelated 2007 sitcom episode), a 2008 reboot's
+S01E02/E04 (episodes of a 2003 show) and a sci-fi spinoff's S01E02/E04/E05
 (French crime-show titles) — B933.
 
-The NFOs are wrong as often as the search: `tvshow.nfo` loses on Cosmos, Life on
-Mars, Dragon Ball (B558) and Forever (US) and is right on The Flash and BSG. So
+The NFOs are wrong as often as the search: `tvshow.nfo` loses on the documentary
+and UK/US cases, on an anime (B558) and on another US show, and is right on the
+1990/2014 and 1978/2004 cases. So
 "trust the NFO" does not fix this, and neither does "trust the search".
 
 ## Causes in the code
 
 1. **The filename's show year is ignored (B930).** `parse_series_info`
    (`pharos-scanner/src/fs.rs`) takes `series_year` from the folder name, then
-   a release folder. `Battlestar Galactica (2003) - S01E01.mkv` in a bare folder
-   gives `series_year = None`. `match_best` then scores both "Battlestar
-   Galactica" candidates as exact names at the no-year factor 0.85, and the
+   a release folder. `Show B (2003) - S01E01.mkv` in a bare folder
+   gives `series_year = None`. `match_best` then scores both "Show B"
+   candidates as exact names at the no-year factor 0.85, and the
    tie-break ("an earlier name wins", then the earliest candidate) picks the
    1978 show. The `tvshow.nfo` year is not used either.
 2. **An ambiguous exact name is matched silently (B930).** When two candidates
@@ -60,10 +61,10 @@ Mars, Dragon Ball (B558) and Forever (US) and is right on The Flash and BSG. So
    (`metadata_backfill.rs`, `MediaKind::Episode` arm), or takes the episode
    NFO's id as authoritative (`resolve`, `nfo_id`). Neither checks that the
    episode belongs to the show the folder was matched to in `series_metadata`.
-   That is how Cosmos 1980 files take 2014 episodes, and how Dune - Prophecy
-   takes a 2007 sitcom's episode.
+   That is how 1980 files take a 2014 remake's episodes, and how a prequel
+   series takes a 2007 sitcom's episode.
 4. **One folder can hold two shows (B932).** The key is the folder, so the
-   1990 and 2014 Flash files are one series and one match.
+   1990 and 2014 files of Show A are one series and one match.
 
 ## Design
 
@@ -77,10 +78,10 @@ The scanner derives a **stated show year** for each episode file, first hit wins
 3. the release folder's year (today's rule).
 
 A filename that states a show year different from the folder's own year (for
-example `The Flash (2014) - S01E01.mkv` inside a folder `The Flash (1990)`) is
+example `Show A (2014) - S01E01.mkv` inside a folder `Show A (1990)`) is
 conflicting evidence, not overruled by the folder. `series_year` becomes the
 folder's **consensus** of its files' stated years when all its files agree on
-one year: BSG gets 2003 from 81 of 81 files. `tvshow.nfo`'s year is used only
+one year: Show B gets 2003 from all of its files. `tvshow.nfo`'s year is used only
 when no file states one and the NFO passes the B558 name check, and then only as
 matching evidence (§3), never as identity.
 
@@ -117,16 +118,16 @@ Every other group gets the key `"{folder}\u{1f}{YYYY}"` (unit separator, which
 never occurs in a path), or `"{folder}\u{1f}none"` for an unyeared group that
 does not keep the plain key, with `series_year` set to its year.
 
-A folder whose files all state one year (BSG) is not split, so it keeps its key
+A folder whose files all state one year (Show B) is not split, so it keeps its key
 and its state. For the deployed
-library this splits `The Flash`: its 4 Season 01 files carry
-1990 episode titles, so they split from the 62 `(2014)` files. The stored match
-is the 1990 show, so the 4 files keep the folder key and the 62 move to
-`…\u{1f}2014`. The UI shows two "The Flash" tiles,
+library this splits `Show A`: its few Season 01 files carry
+1990 episode titles, so they split from the `(2014)` files. The stored match
+is the 1990 show, so the 1990 files keep the folder key and the 2014 files move
+to `…\u{1f}2014`. The UI shows two "Show A" tiles,
 told apart by `ProductionYear` as LIB-C11 already does for two folders.
 
 Every split is logged with the folder, the groups, their counts and the reason
-(`series folder split folder=… groups=[none:4, 2014:62] reason=stated_years`),
+(`series folder split folder=… groups=[none:3, 2014:20] reason=stated_years`),
 and counted. Every split folder is listed on the Show identity page (§7), where
 a wrong split is fixed by hand.
 
@@ -177,7 +178,7 @@ An episode's provider metadata comes **only** from its series' pinned match in
   matches nothing in the pinned show, where the season/episode lookup gives a
   different title, is logged as a mismatch.
 
-This fixes Cosmos and Life on Mars (NFO ids from the remake) and B933 (searches
+This fixes Show C and Show D (NFO ids from the remake) and B933 (searches
 landing in unrelated shows) at one root, and makes an episode's metadata change
 together with its show's when the show is re-matched.
 
@@ -201,18 +202,18 @@ pass, so a split folder's groups are separate shows before #1055 looks at them.
 A refused fold is logged with both paths and the reason and counted under its
 own `decided_by` label.
 
-Today's library is safe for #1055 as it stands: the only mixed folder (The Flash)
-has no season in both shows (1990 is Season 01, 2014 is Seasons 03–09), so no
+Today's library is safe for #1055 as it stands: the only mixed folder (Show A)
+has no season in both shows (1990 is Season 01, 2014 is the later seasons), so no
 copy pair crosses shows. The guard is for the next mixed folder.
 
 For films, #1055 already keys a copy by its name including the year, so
-`Dune (1984)` and `Dune (2021)` never fold, and `duplicates.rs` already keeps
+`Show E (1984)` and `Show E (2021)` never fold, and `duplicates.rs` already keeps
 same-title-and-year rows with different provider ids apart.
 
 ### 6. Migration for rows already wrong
 
 No row is deleted. Item ids, play state, resume and favourites stay on their
-rows. What changes is provider text, artwork and, for the 62 split Flash rows,
+rows. What changes is provider text, artwork and, for the split 2014 rows,
 the series wire id.
 
 1. **Schema**: new nullable `media_items.series_key` (migration 0073, verify
@@ -245,7 +246,7 @@ the series wire id.
    than one, or the folder was split. Every automatic change of a show's stored
    match durably marks that show's episodes for reconciliation with a stored
    pending marker. Manual matches are kept. In the deployed
-   library this re-asks BSG and The Flash (and checks the other bare-folder
+   library this re-asks Show B and Show A (and checks the other bare-folder
    remakes, which keep their match).
 4. **Re-fetch episodes whose show id disagrees**: an episode marked pending
    reconciliation (step 3), or whose stored provider ids belong to a show other
@@ -269,10 +270,9 @@ the series wire id.
    from §4's pinned-show rule and from reconciliation: repair never rebuilds it.
    A conflicting manual match is kept and listed on the Show identity page (§7)
    with both shows, for the admin to keep or move. In the deployed library that
-   is about 176 rows (BSG 81, Flash 66, Cosmos 13, Life on Mars 16) plus the 6
-   B933 rows.
-5. **Series-level state of split rows**: the 62 Flash 2014 rows get a new series
-   wire id. A favourite or played mark set on "The Flash" series stays with the
+   is every episode of the four tabled shows plus the few B933 rows.
+5. **Series-level state of split rows**: the split 2014 rows get a new series
+   wire id. A favourite or played mark set on the "Show A" series stays with the
    folder key, which the 1990 group keeps because it holds the stored match
    (§2). Episode-level state does not move. A folder that is not split keeps
    its key and state.
@@ -338,8 +338,8 @@ log line naming the admin, paths and old and new series keys.
 ### 8. Decisions (Alison, 2026-11-09T17:27Z)
 
 1. Split mixed folders automatically, with a way to remap and fix them (§2, §7).
-2. Yes, the server may re-match BSG and The Flash and re-fetch metadata on about
-   180 episode rows once `"apply"` is set. Nothing is deleted.
+2. Yes, the server may re-match Show B and Show A and re-fetch metadata on the
+   affected episode rows once `"apply"` is set. Nothing is deleted.
 3. A show the matcher can't decide between shows its best guess with a flag,
    and can be fixed (§3, §7).
 
@@ -398,18 +398,18 @@ these):
   `apply` drains to 0 and `dry_run` leaves standing; each rebuild logs
   `|= "series identity repair: episode rebuilt"`.
 
-After deploy, success is: the dry-run lines list BSG → 2004 (tvdb id of the
-2004 series), The Flash split 4 + 62, Cosmos 13 and Life on Mars 16 episode
-re-fetches, and nothing else changing match.
+After deploy, success is: the dry-run lines list Show B → 2004 (the 2004
+series' provider id), Show A split into its 1990 and 2014 groups, and episode
+re-fetches for Show C and Show D, and nothing else changing match.
 
 ## Ids
 
 | Id | What |
 |---|---|
-| B930 | A bare show folder whose files state the show year (`Show (2003) - S01E01`) matched the older same-named show: the filename year and `tvshow.nfo` year were ignored, and an ambiguous exact name tie-broke silently (BSG, The Flash). |
-| B931 | Episode NFO ids from a same-named remake were taken as authoritative although the folder was matched to the other show (Cosmos, Life on Mars). |
-| B932 | One show folder holding two shows (The Flash 1990 Season 01 and 2014 Seasons 03–09) was one series with one match. |
-| B933 | The per-episode series search attached unrelated shows' episodes (Dune - Prophecy S01E06, Knight Rider (2008) S01E02/E04, Star Trek - Starfleet Academy S01E02/E04/E05). |
+| B930 | A bare show folder whose files state the show year (`Show (2003) - S01E01`) matched the older same-named show: the filename year and `tvshow.nfo` year were ignored, and an ambiguous exact name tie-broke silently (Show B, Show A). |
+| B931 | Episode NFO ids from a same-named remake were taken as authoritative although the folder was matched to the other show (Show C, Show D). |
+| B932 | One show folder holding two shows (Show A 1990 Season 01 and 2014 later seasons) was one series with one match. |
+| B933 | The per-episode series search attached unrelated shows' episodes (a prequel series' S01E06, a 2008 reboot's S01E02/E04, a sci-fi spinoff's S01E02/E04/E05). |
 | B934 | Reserved for an issue found while implementing. |
 | V890 | A show's year comes from filename `Show (YYYY)` prefix (when the name matches the folder) ▸ folder `(YYYY)` ▸ release folder, per file, with the folder taking its files' consensus; a `tvshow.nfo` year is a vote only and never separates same-named candidates. |
 | V891 | At most 3 exact-name candidates with no folder or file year between them have their episode lists scored, never tie-breaking by provider order; the best guess is used and a close call or more exact-name candidates than were scored is flagged for an admin. |
