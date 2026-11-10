@@ -19,6 +19,7 @@ pub mod cache;
 pub mod embedded;
 pub mod lrc;
 pub mod lrclib;
+pub mod shadow;
 pub mod sidecar;
 
 use std::collections::HashMap;
