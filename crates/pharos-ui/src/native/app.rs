@@ -3124,6 +3124,7 @@ fn TogetherScreen() -> Element {
     // The client is read per request, so Try again after a reconnect asks
     // over the new connection.
     let mut groups = use_resource(move || list_groups(group_client(ctx)));
+    super::live::use_group_list_updates(ctx.api, groups);
     // What each group is watching, looked up once the list is in.
     let watching = use_resource(move || {
         let listed = groups.read().clone();
