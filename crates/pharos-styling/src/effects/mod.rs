@@ -81,7 +81,7 @@ pub(crate) fn events(
     theme: &Theme,
     tier: Tier,
 ) -> Option<Vec<Event>> {
-    if fx.karaoke != Karaoke::None && line.karaoke.is_some() {
+    if fx.karaoke != Karaoke::None && karaoke::syllables(line, fx).is_some() {
         return Some(karaoke::events(line, fx, theme, tier));
     }
     match fx.intent {
@@ -132,6 +132,7 @@ pub(crate) mod testutil {
             karaoke: Karaoke::None,
             reason: String::new(),
             static_only: false,
+            syllables: None,
         }
     }
 

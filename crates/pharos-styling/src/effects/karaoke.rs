@@ -13,8 +13,13 @@ use crate::theme::{names, rgb, tag_colour, Theme};
 /// allows four per event.
 const MAX_LIFTS: usize = 4;
 
+/// The line's fill timings: the source's own, else the director's (B1212).
+pub(crate) fn syllables<'a>(line: &'a SourceLine, fx: &'a LineEffect) -> Option<&'a [Syllable]> {
+    line.karaoke.as_deref().or(fx.syllables.as_deref())
+}
+
 pub(crate) fn events(line: &SourceLine, fx: &LineEffect, _theme: &Theme, tier: Tier) -> Vec<Event> {
-    let Some(syllables) = line.karaoke.as_deref() else {
+    let Some(syllables) = syllables(line, fx) else {
         return vec![ev(
             line,
             fx,
