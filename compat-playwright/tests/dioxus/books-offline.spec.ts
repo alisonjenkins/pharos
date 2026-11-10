@@ -147,12 +147,38 @@ async function anotherDeviceReadsOn(
   return { page: b.page, word };
 }
 
-async function keepFixture(page: Page): Promise<void> {
-  await openBookPage(page);
+async function keepFixture(page: Page, name = "Reader Fixture"): Promise<void> {
+  await openBookPage(page, name);
   await page.locator("#pharos-keep-offline").click();
   await expect(page.locator("#pharos-keep-offline")).toHaveText("Remove from device", {
     timeout: 20_000,
   });
+}
+
+/** Sets the automatic keeping settings of this device, as Settings, Offline stores them. */
+const setAutoKeep = (page: Page, settings: Record<string, unknown>) =>
+  page.evaluate((s) => localStorage.setItem("pharos.kept.settings", JSON.stringify(s)), settings);
+
+/** Opens a book in the reader from its title page, waits for its text and leaves. */
+async function readBook(page: Page, name: string): Promise<void> {
+  await openBookPage(page, name);
+  await page.locator("#pharos-main-action").click();
+  await expect(page.locator(".pharos-reader")).toBeVisible({ timeout: 20_000 });
+  await expect.poll(() => firstWord(page), { timeout: 20_000 }).not.toBe("");
+  await page.getByRole("button", { name: "Back" }).click();
+  await expect(page.locator("#pharos-main-action")).toBeVisible({ timeout: 15_000 });
+}
+
+const keptTitles = async (page: Page): Promise<string[]> =>
+  ((await record(page))?.books ?? []).map((b: { title: string }) => b.title).sort();
+
+/** The number of book downloads the page asked the network for. */
+function countDownloads(page: Page): { count: () => number } {
+  let n = 0;
+  page.on("request", (r) => {
+    if (/\/Items\/[^/]+\/Download$/.test(new URL(r.url()).pathname)) n++;
+  });
+  return { count: () => n };
 }
 
 test.describe("books kept on the device (spec 036)", () => {
@@ -380,6 +406,104 @@ test.describe("books kept on the device (spec 036)", () => {
     await expect.poll(async () => Object.keys(await bookCaches(page)).length).toBe(0);
     expect(await record(page)).toBeNull();
     expect(logs.some((l) => /^pharos: kept cleared why=sign-out books=1 /.test(l))).toBe(true);
+    await page.context().close();
+  });
+  test("with the defaults the book being read is kept from the bytes already fetched", async ({
+    browser,
+  }) => {
+    const { page, logs } = await signedIn(browser);
+    const downloads = countDownloads(page);
+    await readBook(page, "Reader Fixture");
+
+    await expect.poll(async () => (await record(page))?.books?.length ?? 0, { timeout: 20_000 }).toBe(1);
+    const kept = (await record(page)).books[0];
+    expect(kept).toMatchObject({ title: "Reader Fixture", format: "epub", reason: "reading" });
+    expect(kept.opened_ms).toBeGreaterThan(0);
+    const cached = await bookCaches(page);
+    expect(Object.values(cached).flat()).toHaveLength(1);
+    expect(logs.some((l) => /^pharos: kept auto item=\d+ bytes=\d+ format=EPUB reason=reading /.test(l))).toBe(
+      true,
+    );
+
+    // Offline, a reload starts from the kept list and the book opens from the cache.
+    await page.context().setOffline(true);
+    await page.goto("/ui/settings/offline");
+    await expect(page.getByRole("heading", { name: "Offline: showing books on this device" })).toBeVisible({
+      timeout: 30_000,
+    });
+    await expect(page.locator(".pharos-kept-row")).toContainText("reading now");
+    await page.getByRole("link", { name: "Reader Fixture" }).click();
+    await expect(page.locator(".pharos-reader")).toBeVisible({ timeout: 20_000 });
+    await expect.poll(() => firstWord(page), { timeout: 20_000 }).not.toBe("");
+    expect(logs.some((l) => /^pharos: reader opened item=\d+ format=epub from=cache/.test(l))).toBe(true);
+
+    // The book was fetched once, to read; keeping it fetched nothing more.
+    expect(logs.filter((l) => /^pharos: reader opened .* from=network/.test(l))).toHaveLength(1);
+    expect(downloads.count()).toBe(1);
+    await page.context().close();
+  });
+
+  test("keeping the last book keeps only the second of two opened", async ({ browser }) => {
+    const { page, logs } = await signedIn(browser);
+    await setAutoKeep(page, { reading: false, recent: true, last_n: 1 });
+    await readBook(page, "Reader Fixture");
+    await expect.poll(() => keptTitles(page), { timeout: 20_000 }).toEqual(["Reader Fixture"]);
+    await readBook(page, "Reader Second");
+    await expect.poll(() => keptTitles(page), { timeout: 20_000 }).toEqual(["Reader Second"]);
+    expect((await record(page)).books[0].reason).toBe("recent");
+    expect(Object.values(await bookCaches(page)).flat()).toHaveLength(1);
+    expect(logs.some((l) => /^pharos: kept evict item=\d+ why=beyond-last bytes=\d+/.test(l))).toBe(true);
+
+    await page.goto("/ui/settings/offline");
+    await expect(page.locator(".pharos-kept-row")).toHaveCount(1, { timeout: 15_000 });
+    await expect(page.locator(".pharos-kept-row")).toContainText("recent");
+    await page.context().close();
+  });
+
+  test("turning the reading policy off removes what it kept on the next list open, and not a hand-kept book", async ({
+    browser,
+  }) => {
+    const { page, logs } = await signedIn(browser);
+    await keepFixture(page, "Reader Second");
+    await readBook(page, "Reader Fixture");
+    await expect.poll(() => keptTitles(page), { timeout: 20_000 }).toEqual(["Reader Fixture", "Reader Second"]);
+
+    await page.goto("/ui/settings/offline");
+    await expect(page.locator(".pharos-kept-row")).toHaveCount(2, { timeout: 15_000 });
+    await expect(page.locator(".pharos-kept-row").filter({ hasText: "Reader Second" })).toContainText(
+      "kept by hand",
+    );
+    await expect(page.locator(".pharos-kept-row").filter({ hasText: "Reader Fixture" })).toContainText(
+      "reading now",
+    );
+    await page.locator("#pharos-keep-reading").uncheck();
+    expect(JSON.parse((await page.evaluate(() => localStorage.getItem("pharos.kept.settings"))) ?? "{}")).toMatchObject({
+      reading: false,
+    });
+    // Nothing is removed until the list or a book opens again.
+    expect(await keptTitles(page)).toEqual(["Reader Fixture", "Reader Second"]);
+
+    await page.goto("/ui/settings/offline");
+    await expect(page.locator(".pharos-kept-row")).toHaveCount(1, { timeout: 15_000 });
+    await expect(page.locator(".pharos-kept-row")).toContainText("Reader Second");
+    expect(await keptTitles(page)).toEqual(["Reader Second"]);
+    expect(Object.values(await bookCaches(page)).flat()).toHaveLength(1);
+    expect(logs.some((l) => /^pharos: kept evict item=\d+ why=policy-off bytes=\d+/.test(l))).toBe(true);
+    await page.context().close();
+  });
+
+  test("a small budget evicts the oldest opened automatic book first", async ({ browser }) => {
+    const { page, logs } = await signedIn(browser);
+    // Each sized book is about 0.8 MiB: two fit in 2 MiB, three do not.
+    await setAutoKeep(page, { reading: true, recent: false, last_n: 3, budget_mib: 2 });
+    await readBook(page, "Reader Sized A");
+    await expect.poll(() => keptTitles(page), { timeout: 20_000 }).toEqual(["Reader Sized A"]);
+    await readBook(page, "Reader Sized B");
+    await expect.poll(() => keptTitles(page), { timeout: 20_000 }).toEqual(["Reader Sized A", "Reader Sized B"]);
+    await readBook(page, "Reader Sized C");
+    await expect.poll(() => keptTitles(page), { timeout: 20_000 }).toEqual(["Reader Sized B", "Reader Sized C"]);
+    expect(Object.values(await bookCaches(page)).flat()).toHaveLength(2);
+    expect(logs.some((l) => /^pharos: kept evict item=\d+ why=over-budget bytes=\d+/.test(l))).toBe(true);
     await page.context().close();
   });
 });
