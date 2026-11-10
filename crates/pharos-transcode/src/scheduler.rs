@@ -681,6 +681,23 @@ impl std::fmt::Display for SchedError {
 
 impl std::error::Error for SchedError {}
 
+
+/// What one stream's viewer is waiting behind in the queue, read while they
+/// wait so the player can say "the server is busy" before the segment lands
+/// (038 FR-402, V1217). Derived from the queue the scheduler already holds:
+/// no state is kept for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct StreamWait {
+    /// This stream's interactive jobs queued for a device: what its viewer
+    /// is blocked on and nobody has started.
+    pub queued: usize,
+    /// How long the oldest of them has waited; 0 with none queued.
+    pub oldest_ms: u64,
+    /// Interactive jobs of other streams queued too.
+    pub others_queued: usize,
+    /// Every device not cooling down holds all its permits.
+    pub devices_full: bool,
+}
 /// Per-device + queue snapshot for the test tool / metrics.
 #[derive(Debug, Clone)]
 pub struct SchedSnapshot {
@@ -864,6 +881,11 @@ enum SchedMsg {
     },
     Snapshot {
         reply: oneshot::Sender<SchedSnapshot>,
+    },
+    /// What `stream` is waiting behind (038 FR-402).
+    StreamWait {
+        stream: StreamKey,
+        reply: oneshot::Sender<StreamWait>,
     },
     /// Which device a shared-init fMP4 rendition is pinned to, resolved by
     /// the same pure function `candidates_for` applies at dispatch. `None`
@@ -1594,6 +1616,15 @@ impl TranscodeScheduler {
         rx.await.ok()
     }
 
+    /// What `stream`'s viewer is waiting behind: its own queued client
+    /// requests, everyone else's, and whether every device is full. `None`
+    /// when the scheduler is gone.
+    pub async fn stream_wait(&self, stream: StreamKey) -> Option<StreamWait> {
+        let (reply, rx) = oneshot::channel();
+        self.tx.send(SchedMsg::StreamWait { stream, reply }).await.ok()?;
+        rx.await.ok()
+    }
+
     /// The device a shared-init fMP4 rendition of `input` under `opts` will be
     /// placed on — the pin `candidates_for` enforces — so a caller sizing
     /// speculative work can size it for the device that will actually run it.
@@ -2059,6 +2090,27 @@ fn handle(state: &mut SchedState, msg: SchedMsg, self_tx: &mpsc::Sender<SchedMsg
                 None
             };
             let _ = reply.send(dev);
+        }
+        SchedMsg::StreamWait { stream, reply } => {
+            let now = Instant::now();
+            let mut wait = StreamWait::default();
+            for (_, c) in state.pending.iter().filter(|(_, c)| c.class == JobClass::Interactive) {
+                if c.stream == stream && stream != StreamKey::NONE {
+                    wait.queued += 1;
+                    let waited = now.saturating_duration_since(c.enqueued).as_millis() as u64;
+                    wait.oldest_ms = wait.oldest_ms.max(waited);
+                } else {
+                    wait.others_queued += 1;
+                }
+            }
+            let mut open = state
+                .devices
+                .slots()
+                .iter()
+                .filter(|s| !matches!(s.cooldown_until, Some(t) if t > now))
+                .peekable();
+            wait.devices_full = open.peek().is_some() && open.all(|s| s.in_use() >= s.capacity);
+            let _ = reply.send(wait);
         }
         SchedMsg::Snapshot { reply } => {
             let devices = state
@@ -5422,6 +5474,61 @@ mod tests {
             6,
             "only 5 blockers + 1 seek-target may run; abandoned queued jobs must be skipped"
         );
+    }
+
+    /// 038 FR-402, V1217: a viewer waiting behind full devices is told so
+    /// while the job is still queued, counted apart from everyone else's.
+    /// Disarm check: with the `StreamWait` arm replying the default, this
+    /// fails on `queued`.
+    #[tokio::test]
+    async fn stream_wait_names_a_streams_queued_requests_behind_full_devices() {
+        let (spawner, _) = ScriptedSpawner::new(Duration::from_millis(600), |_, _| {
+            WorkerRunResult::Done { out_bytes: 1 }
+        });
+        let s = TranscodeScheduler::spawn(table(), spawner, SchedConfig::default());
+        let (mine, theirs) = (StreamKey::of("mine"), StreamKey::of("theirs"));
+        let idle = s.stream_wait(mine).await.expect("wait");
+        assert_eq!(idle, StreamWait::default(), "an idle server has nothing queued");
+
+        let submit = |stream: StreamKey, path: &'static str| {
+            let s2 = s.clone();
+            tokio::spawn(async move {
+                s2.submit(
+                    PathBuf::from(path),
+                    h264(),
+                    file_sink(),
+                    JobClass::Interactive,
+                    JobHint {
+                        stream,
+                        ..JobHint::default()
+                    },
+                )
+                .await
+            })
+        };
+        // 5 permits (2 nvenc + 1 vaapi + 2 cpu), all taken by another stream.
+        let mut handles = Vec::new();
+        for _ in 0..5 {
+            handles.push(submit(theirs, "/m/run"));
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        handles.push(submit(mine, "/m/a"));
+        handles.push(submit(mine, "/m/b"));
+        handles.push(submit(theirs, "/m/c"));
+        tokio::time::sleep(Duration::from_millis(80)).await;
+
+        let wait = s.stream_wait(mine).await.expect("wait");
+        assert_eq!(wait.queued, 2, "{wait:?}");
+        assert_eq!(wait.others_queued, 1, "{wait:?}");
+        assert!(wait.devices_full, "{wait:?}");
+        assert!(wait.oldest_ms > 0, "{wait:?}");
+        let none = s.stream_wait(StreamKey::of("elsewhere")).await.expect("wait");
+        assert_eq!((none.queued, none.others_queued), (0, 3));
+        for h in handles {
+            let _ = h.await;
+        }
+        let after = s.stream_wait(mine).await.expect("wait");
+        assert_eq!((after.queued, after.devices_full), (0, false), "{after:?}");
     }
 
     #[tokio::test]
