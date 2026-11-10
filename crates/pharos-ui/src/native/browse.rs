@@ -1045,6 +1045,45 @@ fn LibraryGrid(first: Page, base: Listing, sets: bool) -> Element {
     }
 }
 
+/// A grid's order and its direction, as a [`FilterBar`] and a music
+/// library's Albums tab show them.
+#[component]
+fn SortControls(narrow: Signal<Narrow>) -> Element {
+    let now = narrow.read().clone();
+    let direction = match (now.order, now.descending) {
+        (Order::Name, false) => "A to Z",
+        (Order::Name, true) => "Z to A",
+        (_, true) => "Newest first",
+        (_, false) => "Oldest first",
+    };
+    let mut narrow = narrow;
+    rsx! {
+        label { class: "pharos-filter",
+            span { aria_hidden: "true", "Sort" }
+            select {
+                aria_label: "Sort",
+                value: now.order.token(),
+                onchange: move |e| {
+                    if let Some(order) = Order::from_token(&e.value()) {
+                        let next = narrow.read().ordered(order);
+                        narrow.set(next);
+                    }
+                },
+                for order in Order::ALL {
+                    option { value: order.token(), selected: order == now.order, "{order.label()}" }
+                }
+            }
+        }
+        button {
+            class: "pharos-button pharos-filter-direction",
+            r#type: "button",
+            aria_label: "Sort direction: {direction}",
+            onclick: move |_| narrow.with_mut(|n| n.descending = !n.descending),
+            "{direction}"
+        }
+    }
+}
+
 /// Sort, direction, genre and watched state for a library's grid.
 #[component]
 fn FilterBar(
@@ -1062,38 +1101,10 @@ fn FilterBar(
         Some(true) => "3d",
         Some(false) => "2d",
     };
-    let direction = match (now.order, now.descending) {
-        (Order::Name, false) => "A to Z",
-        (Order::Name, true) => "Z to A",
-        (_, true) => "Newest first",
-        (_, false) => "Oldest first",
-    };
     let mut narrow = narrow;
     rsx! {
         div { class: "pharos-filters", role: "group", aria_label: "Sort and filter",
-            label { class: "pharos-filter",
-                span { aria_hidden: "true", "Sort" }
-                select {
-                    aria_label: "Sort",
-                    value: now.order.token(),
-                    onchange: move |e| {
-                        if let Some(order) = Order::from_token(&e.value()) {
-                            let next = narrow.read().ordered(order);
-                            narrow.set(next);
-                        }
-                    },
-                    for order in Order::ALL {
-                        option { value: order.token(), selected: order == now.order, "{order.label()}" }
-                    }
-                }
-            }
-            button {
-                class: "pharos-button pharos-filter-direction",
-                r#type: "button",
-                aria_label: "Sort direction: {direction}",
-                onclick: move |_| narrow.with_mut(|n| n.descending = !n.descending),
-                "{direction}"
-            }
+            SortControls { narrow }
             label { class: "pharos-filter",
                 span { aria_hidden: "true", "Genre" }
                 select {
