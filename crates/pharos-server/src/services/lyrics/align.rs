@@ -243,6 +243,21 @@ pub struct Aligner {
 }
 
 impl Aligner {
+    /// An aligner at `base` for files under `media_root`, with no worker
+    /// behind its queue; for other modules' tests.
+    #[cfg(test)]
+    pub(crate) fn for_tests(base: String, media_root: PathBuf) -> Aligner {
+        Aligner {
+            http: crate::http_client::client(),
+            base,
+            media_root,
+            cache: AlignCache::new(None),
+            pending: Mutex::new(HashSet::new()),
+            failed: Mutex::default(),
+            tx: mpsc::channel(1).0,
+        }
+    }
+
     /// Start the aligner background worker and return a shared handle.
     pub fn start(url: String, media_root: PathBuf, cache_dir: Option<PathBuf>) -> Arc<Self> {
         let ua = format!(

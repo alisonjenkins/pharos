@@ -1896,6 +1896,68 @@ mod tests {
         assert_eq!(sung, [("off".to_owned(), 1)]);
     }
 
+    /// The counter values of `name` by its first label.
+    fn by_label(
+        snap: &pharos_test_metrics::CumulativeSnapshotter,
+        name: &str,
+    ) -> Vec<(String, u64)> {
+        let mut out: Vec<(String, u64)> = snap
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(ck, ..)| ck.key().name() == name)
+            .map(|(ck, _, _, v)| {
+                let DebugValue::Counter(c) = v else { panic!() };
+                (ck.key().labels().next().unwrap().value().to_owned(), c)
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// B1212: an aligner that cannot be reached is counted as failed, the
+    /// item is still styled, and its song lines are paced.
+    #[tokio::test]
+    async fn an_unreachable_aligner_is_counted_and_the_song_is_paced() {
+        let (rec, snap) = recorder();
+        let _guard = metrics::set_default_local_recorder(&rec);
+        let lib = library(&[(1, "a.mkv", ANIME, true)]).await;
+        lib.store
+            .set_media_segments(
+                1,
+                &[pharos_core::DetectedSegment {
+                    kind: MediaSegmentKind::Intro,
+                    start_ms: 0,
+                    end_ms: 60_000,
+                    detector: "chapter".into(),
+                    confidence: 1.0,
+                }],
+                1,
+            )
+            .await
+            .unwrap();
+        let fake = FakeSignals::default();
+        let mut job = styler(&lib, &fake, idle());
+        // Port 9 (discard) on loopback: nothing listens there.
+        job.aligner = Some(Arc::new(
+            crate::services::lyrics::align::Aligner::for_tests(
+                "http://127.0.0.1:9".into(),
+                lib.dir.path().to_path_buf(),
+            ),
+        ));
+        let sum = job.run_pass(&OnDemand::default()).await;
+        assert_eq!((sum.pending, sum.styled), (1, 1));
+        assert_eq!(
+            by_label(&snap, "pharos_subtitle_sung_total"),
+            [("failed".to_owned(), 1)]
+        );
+        // "Look out!" is a shout, not a plain line, so it takes no fill.
+        assert_eq!(
+            by_label(&snap, "pharos_subtitle_karaoke_total"),
+            [("paced".to_owned(), 4)]
+        );
+    }
+
     /// FR-014 — a file the media cannot give us is remembered and not tried
     /// again; a worker that died says nothing about it and is retried.
     #[tokio::test]
