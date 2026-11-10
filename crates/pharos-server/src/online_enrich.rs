@@ -7,10 +7,11 @@
 
 use std::future::Future;
 
+use crate::local_text::{junk_title, record_replaced, ReplaceReason};
 use pharos_cache::image_cache::{ImageCache, ImageRole};
 use pharos_core::{
-    ArtworkRole, DomainError, DomainResult, MediaItem, MediaKind, MediaStore, PersonRef,
-    SearchCandidate,
+    ArtworkRole, DomainError, DomainResult, EditableField, MediaItem, MediaKind, MediaStore,
+    PersonRef, SearchCandidate,
 };
 
 /// What [`OnlineEnricher::fetch_texts`] got for one record.
@@ -262,8 +263,9 @@ pub struct AppliedEnrichment {
 /// diluted by an online guess.
 ///
 /// A local title stays authoritative, except an episode's placeholder
-/// (its file stem, or its show's name), which the record's episode name
-/// replaces. Does not touch `metadata.provider_ids` (the orchestrator sets
+/// (its file stem, or its show's name) or junk (a disc label, a release
+/// name), which the record's episode name replaces, and a container-tag air
+/// date, which the record's replaces (B992). Locked fields win over both. Does not touch `metadata.provider_ids` (the orchestrator sets
 /// those once it knows which provider matched — T9).
 pub fn apply_enrichment(
     item: &mut pharos_core::MediaItem,
@@ -271,10 +273,24 @@ pub fn apply_enrichment(
     e: &EnrichedMetadata,
 ) -> AppliedEnrichment {
     if let Some(title) = e.title.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
-        if is_placeholder_episode_title(item, &item.title)
+        if !item.locked.contains(EditableField::Title)
             && !is_placeholder_episode_title(item, title)
+            && junk_episode_title(item, title).is_none()
         {
-            item.title = title.to_string();
+            if let Some(reason) = junk_episode_title(item, &item.title) {
+                record_replaced(item.id, reason, &item.title);
+                item.title = title.to_string();
+            } else if is_placeholder_episode_title(item, &item.title) {
+                item.title = title.to_string();
+            }
+        }
+    }
+    if item.kind == MediaKind::Episode && !item.locked.contains(EditableField::PremiereDate) {
+        if let (Some(local), Some(record)) = (item.metadata.premiere_date, e.premiere_date) {
+            if local != record && is_container_date(item, local) {
+                record_replaced(item.id, ReplaceReason::ContainerDate, &local.to_string());
+                item.metadata.premiere_date = Some(record);
+            }
         }
     }
     let md = &mut item.metadata;
@@ -297,6 +313,32 @@ pub fn apply_enrichment(
             vec![]
         },
     }
+}
+
+/// B992 — why `title` is not an episode's name (disc label, release name,
+/// the file stem); `None` for a movie or a title that may be one.
+fn junk_episode_title(item: &pharos_core::MediaItem, title: &str) -> Option<ReplaceReason> {
+    if item.kind != MediaKind::Episode {
+        return None;
+    }
+    let stem = item
+        .path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    junk_title(title, &stem)
+}
+
+/// B992 — whether the stored air date `local` is the container tag's. The
+/// stored date does not record its source, so this is a value match against
+/// the probe's `release_date`: an NFO date that differs from the tag (the
+/// usual case, the tag being a rip date) is never touched.
+fn is_container_date(item: &pharos_core::MediaItem, local: i64) -> bool {
+    item.probe
+        .release_date
+        .as_deref()
+        .and_then(pharos_scanner::metadata::nfo::parse_date_unix)
+        == Some(local)
 }
 
 /// Whether `raw` is, for episode `item`, a stand-in rather than the
@@ -464,6 +506,140 @@ mod tests {
         movie.title = "Film BC".into();
         apply_enrichment(&mut movie, counts(), &named("Film BC (2016)"));
         assert_eq!(movie.title, "Film BC");
+    }
+
+    /// B992 fixtures: an episode whose local title and air date are given.
+    fn local_episode(title: &str, aired: Option<i64>) -> pharos_core::MediaItem {
+        pharos_core::MediaItem {
+            id: 7,
+            kind: MediaKind::Episode,
+            title: title.into(),
+            path: "/tv/Show A/Season 1/Show A - S1 E02 - 1080p.mkv".into(),
+            metadata: pharos_core::MediaMetadata {
+                premiere_date: aired,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    fn record(title: Option<&str>, aired: Option<i64>) -> EnrichedMetadata {
+        EnrichedMetadata {
+            title: title.map(Into::into),
+            premiere_date: aired,
+            ..EnrichedMetadata::default()
+        }
+    }
+
+    fn apply_with_metrics(
+        item: &mut pharos_core::MediaItem,
+        e: &EnrichedMetadata,
+    ) -> pharos_test_metrics::CumulativeSnapshotter {
+        use metrics_util::debugging::DebuggingRecorder;
+        let recorder = DebuggingRecorder::new();
+        let snap = pharos_test_metrics::snapshotter(&recorder);
+        metrics::with_local_recorder(&recorder, || {
+            apply_enrichment(item, pharos_core::EntityCounts::default(), e);
+        });
+        snap
+    }
+
+    fn replaced(
+        snap: &pharos_test_metrics::CumulativeSnapshotter,
+        field: &str,
+        reason: &str,
+    ) -> u64 {
+        use metrics_util::debugging::DebugValue;
+        snap.snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(k, ..)| k.key().name() == "pharos_episode_local_text_replaced_total")
+            .filter(|(k, ..)| {
+                [("field", field), ("reason", reason)]
+                    .iter()
+                    .all(|(n, v)| k.key().labels().any(|l| l.key() == *n && l.value() == *v))
+            })
+            .map(|(.., v)| match v {
+                DebugValue::Counter(c) => c,
+                _ => 0,
+            })
+            .sum()
+    }
+
+    #[test]
+    fn a_junk_local_title_loses_to_the_record_and_is_counted_by_reason() {
+        let cases = [
+            ("SHOW A - S1 D2", "disc_label"),
+            ("SHOW A - SEASON 4 DISC 1", "disc_label"),
+            (
+                "Show.A.S02E06.Part.One.1080p.WEBRip.10Bit.DDP5.1.HEVC-GRP",
+                "release_name",
+            ),
+            ("show a - s1 e02 - 1080p", "file_stem"),
+        ];
+        for (junk, reason) in cases {
+            let mut item = local_episode(junk, None);
+            let snap = apply_with_metrics(&mut item, &record(Some("The Distant Signal"), None));
+            assert_eq!(item.title, "The Distant Signal", "{junk}");
+            assert_eq!(replaced(&snap, "title", reason), 1, "{junk}: {reason}");
+        }
+    }
+
+    #[test]
+    fn a_curated_local_title_beats_the_record_and_is_not_counted() {
+        let mut item = local_episode("Signals Crossed", None);
+        let snap = apply_with_metrics(&mut item, &record(Some("The Distant Signal"), None));
+        assert_eq!(item.title, "Signals Crossed");
+        for reason in ["disc_label", "release_name", "file_stem"] {
+            assert_eq!(replaced(&snap, "title", reason), 0, "{reason}");
+        }
+    }
+
+    #[test]
+    fn a_locked_title_or_air_date_beats_the_record() {
+        use pharos_core::{EditableField, LockedFields};
+        let mut item = local_episode("SHOW A - S1 D2", Some(RIP_DATE));
+        item.probe.release_date = Some("1970-01-12".into());
+        item.locked = [EditableField::Title, EditableField::PremiereDate]
+            .into_iter()
+            .collect::<LockedFields>();
+        let snap = apply_with_metrics(&mut item, &record(Some("The Distant Signal"), Some(AIRED)));
+        assert_eq!(item.title, "SHOW A - S1 D2");
+        assert_eq!(item.metadata.premiere_date, Some(RIP_DATE));
+        assert_eq!(replaced(&snap, "title", "disc_label"), 0);
+        assert_eq!(replaced(&snap, "premiere_date", "container_date"), 0);
+    }
+
+    /// 1970-01-12 and 2001-09-09 UTC midnight.
+    const RIP_DATE: i64 = 950_400;
+    const AIRED: i64 = 999_993_600;
+
+    #[test]
+    fn a_container_tag_air_date_loses_to_the_records_and_is_counted() {
+        let mut item = local_episode("The Distant Signal", Some(RIP_DATE));
+        item.probe.release_date = Some("1970-01-12".into());
+        let snap = apply_with_metrics(&mut item, &record(None, Some(AIRED)));
+        assert_eq!(item.metadata.premiere_date, Some(AIRED));
+        assert_eq!(replaced(&snap, "premiere_date", "container_date"), 1);
+    }
+
+    #[test]
+    fn an_nfo_air_date_beats_the_record() {
+        // The container tag says one day, the NFO another: the stored date is the NFO's.
+        let mut item = local_episode("The Distant Signal", Some(AIRED - 86_400));
+        item.probe.release_date = Some("1970-01-12".into());
+        let snap = apply_with_metrics(&mut item, &record(None, Some(AIRED)));
+        assert_eq!(item.metadata.premiere_date, Some(AIRED - 86_400));
+        assert_eq!(replaced(&snap, "premiere_date", "container_date"), 0);
+    }
+
+    #[test]
+    fn a_container_tag_air_date_stays_when_the_record_has_none() {
+        let mut item = local_episode("The Distant Signal", Some(RIP_DATE));
+        item.probe.release_date = Some("1970-01-12".into());
+        let snap = apply_with_metrics(&mut item, &record(None, None));
+        assert_eq!(item.metadata.premiere_date, Some(RIP_DATE));
+        assert_eq!(replaced(&snap, "premiere_date", "container_date"), 0);
     }
 
     #[test]
