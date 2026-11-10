@@ -29,6 +29,7 @@
 | `playback_resume` | info (warn on timeout) | a paused song resumed, once it sounded or after 5 s (B563) | click_to_playing_ms, playing_to_audible_ms, ready_state, buffered_ahead_ms, context_state, base_latency_ms, output_latency_ms, context_resumed, engine |
 | `playback_start` | info (warn when abandoned or slower than 5 s) | Rust HLS engine: attach to the first `playing`, or the player closing first (031, V691) | engine, startup_ms, start_ms, end, segments, first_index, first_ttfb_ms, first_load_ms, first_appended_ms |
 | `playback_summary` | info (warn with stalls, quota or refused switches) | Rust HLS engine: every 5 min of segments and when the engine goes (031, V692) | engine, reason, window_ms, video_segments, audio_segments, bytes, kbps, ttfb_p50_ms, ttfb_max_ms, load_max_ms, buffer_min_ms, buffer_mean_ms, stalls, stall_ms, seeks, seek_max_ms, switches, refused_switches, quota |
+| `autoplay_refused` | warn | the browser refused a `play()` the viewer did not ask for (038 FR-407, V1223) | source, grouped |
 
 ## Server-side signals produced from them (labels bounded via `label()`)
 
