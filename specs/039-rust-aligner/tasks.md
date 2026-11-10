@@ -35,7 +35,7 @@
 ## Slice 5 - Warm-up and cache (V1264)
 
 - [x] T039-19 `PHAROS_ALIGNER_CACHE_DIR` wired to cubecl persistence, plus warm-up lengths, before readiness. Start log fields (V1264).
-- [x] T039-28 `pharos_aligner_forward_seconds{device}` histogram and `aligner.rss_mib` on the song's log line, both named in spec.md's signals table and not yet emitted.
+- [x] T039-28 `pharos_aligner_forward_seconds{device}` histogram and `aligner.rss_mib` on the song's log line, both named in spec.md's signals table. Emitted by the implementation PR, each with a test that fails without it.
 - [ ] T039-20 Measure the cold cost per window length on the RX 9070 node, and settle open question 1. Results go in this file, with ISO 8601 UTC times.
 
 ## Slice 6 - Image and chart (V1265-V1266)
