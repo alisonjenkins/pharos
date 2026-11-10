@@ -9,9 +9,9 @@ use wasm_bindgen::closure::Closure;
 use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{
-    Blob, BlobPropertyBag, Document, Element, Event, EventTarget, HtmlElement, HtmlImageElement,
-    MouseEvent, PointerEvent, Range, ResizeObserver, ShadowRoot, ShadowRootInit, ShadowRootMode,
-    Text, Url,
+    Blob, BlobPropertyBag, Document, Element, Event, EventTarget, FontFace, FontFaceDescriptors,
+    HtmlElement, HtmlImageElement, MouseEvent, PointerEvent, Range, ResizeObserver, ShadowRoot,
+    ShadowRootInit, ShadowRootMode, Text, Url,
 };
 
 use crate::layout::{self, Columns, Fit};
@@ -92,6 +92,9 @@ struct Inner {
     settings: RefCell<Settings>,
     state: RefCell<State>,
     blobs: RefCell<HashMap<String, Option<String>>>,
+    /// The book's own fonts, added to the document's font set (a browser
+    /// ignores `@font-face` inside a shadow root), by family and sources.
+    fonts: RefCell<HashMap<String, FontFace>>,
     actions: Actions,
     listeners: RefCell<Vec<Listener>>,
     observer: RefCell<Option<Observer>>,
@@ -154,6 +157,7 @@ impl View {
             settings: RefCell::new(settings),
             state: RefCell::new(State::default()),
             blobs: RefCell::new(HashMap::new()),
+            fonts: RefCell::new(HashMap::new()),
             actions: Rc::new(RefCell::new(None)),
             listeners: RefCell::new(Vec::new()),
             observer: RefCell::new(None),
@@ -185,7 +189,8 @@ impl View {
     }
 
     /// Opens reading-order item `spine` at `start`. Waits for the section's
-    /// images to decode, since they move text between pages.
+    /// images to decode and its fonts to load, since they move text between
+    /// pages.
     /// A later `open` (or a page turn across sections) supersedes one still
     /// waiting for images; page turns made meanwhile are ignored.
     pub async fn open(&self, spine: usize, start: Start) -> Result<(), ViewError> {
@@ -203,6 +208,7 @@ impl View {
         let section = self.0.book.section(spine)?;
         self.0.build(&section, spine)?;
         self.0.decode_images().await;
+        self.0.load_fonts().await;
         if self.0.generation.get() != generation {
             return Ok(());
         }
@@ -498,6 +504,8 @@ impl Inner {
         ours.set_attribute("data-quire-settings", "")?;
         self.sheets.append_child(&ours)?;
 
+        self.add_fonts(section);
+
         let mut state = State::default();
         let root = self.element(&section.root, &mut state)?;
         self.strip.append_child(&root)?;
@@ -542,6 +550,60 @@ impl Inner {
             }
         }
         Ok(node)
+    }
+
+    /// Adds the section's `@font-face` fonts to the document, once per view.
+    /// A font the browser refuses is left out; its text falls back.
+    fn add_fonts(&self, section: &quire::Section) {
+        let set = self.document.fonts();
+        for face in section.styles.iter().flat_map(|c| c.font_faces()) {
+            let key = format!(
+                "{}\u{0}{}\u{0}{:?}",
+                face.family,
+                face.sources.join("\u{0}"),
+                face.descriptors
+            );
+            if self.fonts.borrow().contains_key(&key) {
+                continue;
+            }
+            let source = face
+                .sources
+                .iter()
+                .filter_map(|p| self.resource_url(p))
+                .map(|u| format!("url(\"{}\")", u.replace(['"', '\\', '\n'], "")))
+                .collect::<Vec<_>>()
+                .join(", ");
+            if source.is_empty() {
+                continue;
+            }
+            let descriptors = FontFaceDescriptors::new();
+            for (name, value) in &face.descriptors {
+                match name.as_str() {
+                    "font-weight" => descriptors.set_weight(value),
+                    "font-style" => descriptors.set_style(value),
+                    "font-stretch" => descriptors.set_stretch(value),
+                    "unicode-range" => descriptors.set_unicode_range(value),
+                    _ => {}
+                }
+            }
+            let Ok(font) =
+                FontFace::new_with_str_and_descriptors(&face.family, &source, &descriptors)
+            else {
+                continue;
+            };
+            if set.add(&font).is_ok() {
+                self.fonts.borrow_mut().insert(key, font);
+            }
+        }
+    }
+
+    /// Waits for the fonts the page uses. A font that fails to load is drawn
+    /// in the fallback; it must not stop the page.
+    async fn load_fonts(&self) {
+        let set = self.document.fonts();
+        if let Ok(ready) = set.ready() {
+            let _ = JsFuture::from(ready).await;
+        }
     }
 
     async fn decode_images(&self) {
@@ -718,6 +780,10 @@ impl Inner {
         }
         if let Some((observer, _)) = self.observer.borrow_mut().take() {
             observer.disconnect();
+        }
+        let set = self.document.fonts();
+        for (_, font) in self.fonts.borrow_mut().drain() {
+            set.delete(&font);
         }
         for url in self.blobs.borrow_mut().drain().filter_map(|(_, u)| u) {
             let _ = Url::revoke_object_url(&url);
