@@ -872,6 +872,9 @@
               fi
             done
             install -Dm644 crates/pharos-ui/assets/pharos.css $out/assets/pharos.css
+            # The service worker template (ADR-0110); pharos-server fills in the
+            # bundle hash and the shell's URLs when it loads the bundle.
+            install -Dm644 crates/pharos-ui/assets/sw.js $out/sw.js
             # Logos, favicons and the web manifest (crates/pharos-ui/assets/brand).
             mkdir -p $out/assets/brand
             cp crates/pharos-ui/assets/brand/*.{svg,png,ico,webmanifest} $out/assets/brand/
