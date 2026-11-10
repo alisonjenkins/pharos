@@ -131,6 +131,12 @@ pub(crate) enum RematchStep {
     /// The search used the year the show's files state, which the stored
     /// column did not hold.
     StatedYear,
+    /// The stored match's run was too short for the show's seasons, so the
+    /// re-match left it out.
+    PinExcluded,
+    /// Every candidate left was too short, so the show kept its match,
+    /// flagged.
+    FlaggedTooShort,
 }
 
 impl RematchStep {
@@ -138,6 +144,8 @@ impl RematchStep {
         match self {
             Self::YearRetry => "year_retry",
             Self::StatedYear => "stated_year",
+            Self::PinExcluded => "pin_excluded",
+            Self::FlaggedTooShort => "flagged_too_short",
         }
     }
 }
@@ -178,7 +186,12 @@ mod tests {
             "nfo_other_series"
         );
         assert_eq!(decided_by_label(None), "none");
-        let steps = [RematchStep::YearRetry, RematchStep::StatedYear];
+        let steps = [
+            RematchStep::YearRetry,
+            RematchStep::StatedYear,
+            RematchStep::PinExcluded,
+            RematchStep::FlaggedTooShort,
+        ];
         let set: BTreeSet<_> = steps.iter().map(|s| s.label()).collect();
         assert_eq!(set.len(), steps.len());
         assert_eq!(RematchStep::YearRetry.label(), "year_retry");

@@ -3199,13 +3199,47 @@ where
         }
     };
     let year = stated_year(&cand, &rows);
+    let stored = match store
+        .series_metadata_by_keys(std::slice::from_ref(&cand.series_key))
+        .await
+    {
+        Ok(mut found) => found.remove(&cand.series_key),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                series_key = %cand.series_key,
+                "T9-series metadata backfill: stored match unreadable; not checking its run"
+            );
+            None
+        }
+    };
+    let short_pin = too_short_pin(providers, bg_io, stored.as_ref(), &rows).await;
+    if let Some((provider, id)) = &short_pin {
+        tracing::info!(
+            series_key = %cand.series_key,
+            provider,
+            match_id = id.as_str(),
+            seasons = regular_seasons(&rows),
+            "series match: the stored match's run is too short for the show's seasons, leaving it out"
+        );
+        record_rematch(RematchStep::PinExcluded);
+    }
+    let evidence = SeriesEvidence {
+        year,
+        rows: &rows,
+        short_pin,
+    };
     let mut outcome = None;
     // A provider BLIP is not a provider saying no. If any attempt was
     // transient we leave the row untouched for the next pass rather than
     // freezing the show as `none` for the whole TTL.
     let mut transient = None;
     if let Some(tv) = providers.tvdb {
-        match resolve_series(store, tv, "tvdb", bg_io, cache, cfg, &cand, year, lists).await {
+        match resolve_series(
+            store, tv, "tvdb", bg_io, cache, cfg, &cand, &evidence, lists,
+        )
+        .await
+        {
             SeriesAttempt::Hit(h) => outcome = Some(h),
             SeriesAttempt::Transient(d) => transient = Some(d),
             SeriesAttempt::NoMatch => {}
@@ -3214,7 +3248,11 @@ where
     let mut fell_back = false;
     if outcome.is_none() {
         if let Some(tm) = providers.tmdb {
-            match resolve_series(store, tm, "tmdb", bg_io, cache, cfg, &cand, year, lists).await {
+            match resolve_series(
+                store, tm, "tmdb", bg_io, cache, cfg, &cand, &evidence, lists,
+            )
+            .await
+            {
                 SeriesAttempt::Hit(h) => {
                     outcome = Some(h);
                     fell_back = true;
@@ -3238,6 +3276,24 @@ where
         record_series_match(SeriesMatchOutcome::NoMatch, None);
     }
     let Some(hit) = outcome else {
+        // B990 — a show whose stored match ran too short for its seasons, and
+        // whose every other candidate did too (or none was left), keeps its
+        // match flagged for Manage → Show identity rather than be pinned to
+        // it again or lose it.
+        if let (Some((provider, id)), Some(mut row)) = (&evidence.short_pin, stored) {
+            tracing::info!(
+                series_key = %cand.series_key,
+                provider,
+                match_id = id.as_str(),
+                seasons = regular_seasons(&rows),
+                "series identity repair: re-ask left the show flagged: only too-short candidates"
+            );
+            record_rematch(RematchStep::FlaggedTooShort);
+            row.match_flag = Some(AMBIGUOUS_FLAG.to_string());
+            row.metadata_refreshed_at = Some(now);
+            store.upsert_series_metadata(row).await?;
+            return Ok(false);
+        }
         // Every configured provider searched and found nothing over the
         // confidence floor → record `none` so the show isn't re-searched until
         // the TTL re-admits it. Attributed to whichever provider ran last.
@@ -3745,7 +3801,7 @@ async fn resolve_series<E, S>(
     cache: &ImageCache,
     cfg: &MetadataConfig,
     cand: &SeriesMatchCandidate,
-    year: Option<u32>,
+    evidence: &SeriesEvidence<'_>,
     lists: &mut EpisodeLists,
 ) -> SeriesAttempt
 where
@@ -3756,20 +3812,62 @@ where
     // search+fetch (TvdbEnricher: search_series → get_series; TmdbEnricher:
     // search_tv → tv_detail). No nfo id for a synthesised show, so it always
     // searches.
-    let mut decision = series_search_decide(
-        enricher,
-        &cand.series_key,
-        &cand.series_name,
-        year,
-        &[],
-        bg_io,
-        cfg,
-    )
-    .await;
-    let fit_runner_up = if needs_episode_fit(&decision) {
-        apply_episode_fit(store, enricher, provider, bg_io, cand, &mut decision, lists).await
-    } else {
-        None
+    let year = evidence.year;
+    let mut excluded: Vec<String> = evidence
+        .short_pin
+        .iter()
+        .filter(|(p, _)| *p == provider)
+        .map(|(_, id)| id.clone())
+        .collect();
+    let mut checked = 0usize;
+    let (decision, fit_runner_up) = loop {
+        let mut decision = series_search_decide(
+            enricher,
+            &cand.series_key,
+            &cand.series_name,
+            year,
+            &excluded,
+            bg_io,
+            cfg,
+        )
+        .await;
+        let fit_runner_up = if needs_episode_fit(&decision) {
+            apply_episode_fit(store, enricher, provider, bg_io, cand, &mut decision, lists).await
+        } else {
+            None
+        };
+        // B990 — once the stored match ran too short, so may the next
+        // choice: each is checked, and one too short is left out too.
+        let short = match &decision.chosen {
+            Some(c) if evidence.short_pin.is_some() => {
+                is_too_short(enricher, bg_io, &c.id, evidence.rows).await
+            }
+            _ => false,
+        };
+        if !short {
+            break (decision, fit_runner_up);
+        }
+        let Some(chosen) = decision.chosen.take() else {
+            break (decision, fit_runner_up);
+        };
+        tracing::info!(
+            provider,
+            series_key = %cand.series_key,
+            candidate = chosen.id.as_str(),
+            "series match: candidate's run is too short for the show's seasons, leaving it out"
+        );
+        excluded.push(chosen.id);
+        checked += 1;
+        if checked >= MAX_SHORT_RUN_CHECKS {
+            log_series_match(
+                provider,
+                &cand.series_key,
+                &cand.series_name,
+                year,
+                &decision,
+            );
+            return SeriesAttempt::NoMatch;
+        }
     };
     log_series_match(
         provider,
@@ -3823,6 +3921,61 @@ where
         poster_locator,
         backdrop_locator,
     }))
+}
+
+/// What a show's own files say about which show it is, for its match.
+struct SeriesEvidence<'a> {
+    /// The year its files state, else the stored year (B990).
+    year: Option<u32>,
+    rows: &'a [pharos_core::SeriesEpisodeRow],
+    /// B990 — the stored search match, by provider and id, when its whole
+    /// run is too short for the show's local seasons (B986).
+    short_pin: Option<(&'static str, String)>,
+}
+
+/// Candidates whose runs a re-match checks before it stops: each costs a
+/// request, and a show with more too-short candidates than this is flagged.
+const MAX_SHORT_RUN_CHECKS: usize = 3;
+
+/// B990 — the stored search match, when its whole run is too short for the
+/// show's two or more local seasons (B986's rule). One request to the
+/// provider that holds it.
+async fn too_short_pin<Tv, Tm>(
+    providers: &SeriesProviders<'_, Tv, Tm>,
+    bg_io: &Arc<Semaphore>,
+    stored: Option<&SeriesMetadata>,
+    rows: &[pharos_core::SeriesEpisodeRow],
+) -> Option<(&'static str, String)>
+where
+    Tv: OnlineEnricher,
+    Tm: OnlineEnricher,
+{
+    let m = stored?;
+    if m.match_source.as_deref() != Some("search") || regular_seasons(rows) < 2 {
+        return None;
+    }
+    let (provider, id) = stored_match(m)?;
+    let short = match provider {
+        "tvdb" => is_too_short(providers.tvdb?, bg_io, id, rows).await,
+        "tmdb" => is_too_short(providers.tmdb?, bg_io, id, rows).await,
+        _ => false,
+    };
+    let provider = if provider == "tvdb" { "tvdb" } else { "tmdb" };
+    short.then(|| (provider, id.to_string()))
+}
+
+/// Whether show `id`'s whole run is too short for `rows`' seasons (B986).
+async fn is_too_short<E: OnlineEnricher>(
+    enricher: &E,
+    bg_io: &Arc<Semaphore>,
+    id: &str,
+    rows: &[pharos_core::SeriesEpisodeRow],
+) -> bool {
+    let run = {
+        let _permit = BgPermit::acquire(bg_io).await;
+        enricher.series_run(id).await
+    };
+    run_window(std::iter::empty(), run).is_some_and(|w| run_too_short(w, rows))
 }
 
 /// Spec 033 (V891) — `series_metadata.match_flag` of a close call.
@@ -8575,5 +8728,179 @@ mod tests {
         for want in ["year=2003", "chosen=\"920011\""] {
             assert!(line.contains(want), "{want} missing from {line}");
         }
+    }
+
+    const SHORT_SHOW: &str = "/tv/Show A (2003)";
+    const MINI_ID: &str = "920020";
+
+    /// A four-season folder stating 2003, pinned by search to a TMDB
+    /// miniseries whose whole run is two days, and re-asked (B986).
+    async fn short_pinned_show(s: &SqliteStore) {
+        let mut id = 0;
+        for season in 1..=4 {
+            id += 1;
+            put_show_episode(s, id, SHORT_SHOW, (season, 1), "Show A (2003)").await;
+        }
+        s.upsert_series_metadata(SeriesMetadata {
+            series_key: SHORT_SHOW.into(),
+            series_name: "Show A".into(),
+            match_provider: Some("tmdb".into()),
+            match_external_id: Some(MINI_ID.into()),
+            match_source: Some("search".into()),
+            metadata_refreshed_at: Some(NOW),
+            overview: Some("The pilot.".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        s.readmit_series(&[SHORT_SHOW.to_string()]).await.unwrap();
+    }
+
+    fn two_day_run() -> crate::online_enrich::SeriesRun {
+        crate::online_enrich::SeriesRun {
+            // 2003-12-08 .. 2003-12-09
+            first: Some(1_070_841_600),
+            last: Some(1_070_928_000),
+            ongoing: false,
+        }
+    }
+
+    async fn both_pass(
+        s: &SqliteStore,
+        cache: &ImageCache,
+        tvdb: &FakeEnricher,
+        tmdb: &FakeEnricher,
+    ) {
+        enrich_series_pass(
+            s,
+            &sem(4),
+            cache,
+            Some(tvdb),
+            Some(tmdb),
+            &MetadataConfig::default(),
+            NOW,
+        )
+        .await
+        .unwrap();
+    }
+
+    /// B990 — a `run_too_short` re-ask leaves the too-short pin out of its
+    /// re-match. TVDB's year search finds nothing and neither does its
+    /// retry; TMDB's year search finds only the miniseries, which is left
+    /// out, so TMDB is asked again without the year and its full series (a
+    /// year off the stated year) wins.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_run_too_short_re_ask_leaves_the_short_pin_out() {
+        use metrics_util::debugging::DebuggingRecorder;
+        let recorder = DebuggingRecorder::new();
+        let snap = pharos_test_metrics::snapshotter(&recorder);
+        let _metrics = metrics::set_default_local_recorder(&recorder);
+        let s = store().await;
+        short_pinned_show(&s).await;
+        let (_td, cache) = cache();
+        let tvdb = FakeEnricher::tvdb();
+        let tmdb = FakeEnricher::tmdb()
+            .with_year_search(vec![(MINI_ID, "Show A", Some(2003))])
+            .with_search(vec![
+                (MINI_ID, "Show A", Some(2003)),
+                ("920021", "Show A", Some(1978)),
+                ("920022", "Show A", Some(2004)),
+            ])
+            .with_run(MINI_ID, two_day_run())
+            .with_detail(enriched_overview("The series."));
+
+        both_pass(&s, &cache, &tvdb, &tmdb).await;
+
+        let row = series_row(&s, SHORT_SHOW).await;
+        assert_eq!(row.match_external_id.as_deref(), Some("920022"));
+        assert_eq!(row.match_flag, None);
+        assert_eq!(tmdb.years(), [Some(2003), None]);
+        assert_eq!(
+            pending_ids(&s).await.len(),
+            4,
+            "the match change marks them"
+        );
+        assert_eq!(
+            counter_value(
+                &snap,
+                "pharos_series_identity_repair_rematch_total",
+                &[("step", "pin_excluded")]
+            ),
+            1
+        );
+    }
+
+    /// B990 — the same re-ask on TVDB: its year search finds nothing, its
+    /// retry finds the full series dated a year after the stated year.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_run_too_short_re_ask_finds_the_series_by_the_tvdb_retry() {
+        let s = store().await;
+        short_pinned_show(&s).await;
+        let (_td, cache) = cache();
+        let tvdb = FakeEnricher::tvdb()
+            .with_year_search(vec![])
+            .with_search(vec![("920023", "Show A (2003)", Some(2005))])
+            .with_detail(enriched_overview("The series."));
+        let tmdb = FakeEnricher::tmdb()
+            .with_search(vec![(MINI_ID, "Show A", Some(2003))])
+            .with_run(MINI_ID, two_day_run());
+
+        both_pass(&s, &cache, &tvdb, &tmdb).await;
+
+        let row = series_row(&s, SHORT_SHOW).await;
+        assert_eq!(row.match_provider.as_deref(), Some("tvdb"));
+        assert_eq!(row.match_external_id.as_deref(), Some("920023"));
+    }
+
+    /// B990 — when the too-short pin is the only candidate left, the re-ask
+    /// does not pin it again: the stored match stays, flagged for Manage →
+    /// Show identity, its episodes unmarked, and the show is not re-asked
+    /// every pass.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_run_too_short_re_ask_with_only_the_short_pin_is_flagged() {
+        use metrics_util::debugging::DebuggingRecorder;
+        let recorder = DebuggingRecorder::new();
+        let snap = pharos_test_metrics::snapshotter(&recorder);
+        let _metrics = metrics::set_default_local_recorder(&recorder);
+        let (logs, _log) = log_capture();
+        let s = store().await;
+        short_pinned_show(&s).await;
+        let (_td, cache) = cache();
+        let tvdb = FakeEnricher::tvdb();
+        let tmdb = FakeEnricher::tmdb()
+            .with_search(vec![(MINI_ID, "Show A", Some(2003))])
+            .with_run(MINI_ID, two_day_run())
+            .with_detail(enriched_overview("The pilot again."));
+
+        both_pass(&s, &cache, &tvdb, &tmdb).await;
+
+        let row = series_row(&s, SHORT_SHOW).await;
+        assert_eq!(row.match_source.as_deref(), Some("search"));
+        assert_eq!(row.match_provider.as_deref(), Some("tmdb"));
+        assert_eq!(row.match_external_id.as_deref(), Some(MINI_ID));
+        assert_eq!(row.match_flag.as_deref(), Some(AMBIGUOUS_FLAG));
+        assert_eq!(
+            row.overview.as_deref(),
+            Some("The pilot."),
+            "not re-written"
+        );
+        assert_eq!(row.metadata_refreshed_at, Some(NOW));
+        assert_eq!(s.flagged_series_keys().await.unwrap(), [SHORT_SHOW]);
+        assert_eq!(pending_ids(&s).await, Vec::<u64>::new());
+        assert!(tmdb.fetched().is_empty(), "{:?}", tmdb.fetched());
+        assert_eq!(
+            counter_value(
+                &snap,
+                "pharos_series_identity_repair_rematch_total",
+                &[("step", "flagged_too_short")]
+            ),
+            1
+        );
+        let text = logs.text();
+        let line = text
+            .lines()
+            .find(|l| l.contains("re-ask left the show flagged: only too-short candidates"))
+            .unwrap_or_else(|| panic!("no flagged line in {text}"));
+        assert!(line.contains(MINI_ID), "{line}");
     }
 }
