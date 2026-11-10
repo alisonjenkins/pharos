@@ -29,7 +29,7 @@ use crate::options::TranscodeOptions;
 use crate::protocol::{DeviceId, JobId, JobSpec, OutputSink, WorkerError, WorkerId};
 use bytes::Bytes;
 use smallvec::SmallVec;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -693,7 +693,9 @@ pub struct StreamWait {
     pub queued: usize,
     /// How long the oldest of them has waited; 0 with none queued.
     pub oldest_ms: u64,
-    /// Interactive jobs of other streams queued too.
+    /// Other playback streams with interactive jobs queued too, each counted
+    /// once; jobs with no stream (the transcode tool) are not videos and are
+    /// left out.
     pub others_queued: usize,
     /// Every device not cooling down holds all its permits.
     pub devices_full: bool,
@@ -2094,15 +2096,21 @@ fn handle(state: &mut SchedState, msg: SchedMsg, self_tx: &mpsc::Sender<SchedMsg
         SchedMsg::StreamWait { stream, reply } => {
             let now = Instant::now();
             let mut wait = StreamWait::default();
-            for (_, c) in state.pending.iter().filter(|(_, c)| c.class == JobClass::Interactive) {
+            let mut others = HashSet::new();
+            for (_, c) in state
+                .pending
+                .iter()
+                .filter(|(_, c)| c.class == JobClass::Interactive)
+            {
                 if c.stream == stream && stream != StreamKey::NONE {
                     wait.queued += 1;
                     let waited = now.saturating_duration_since(c.enqueued).as_millis() as u64;
                     wait.oldest_ms = wait.oldest_ms.max(waited);
-                } else {
-                    wait.others_queued += 1;
+                } else if c.stream != StreamKey::NONE {
+                    others.insert(c.stream);
                 }
             }
+            wait.others_queued = others.len();
             let mut open = state
                 .devices
                 .slots()
@@ -5515,6 +5523,7 @@ mod tests {
         handles.push(submit(mine, "/m/a"));
         handles.push(submit(mine, "/m/b"));
         handles.push(submit(theirs, "/m/c"));
+        handles.push(submit(StreamKey::NONE, "/m/d"));
         tokio::time::sleep(Duration::from_millis(80)).await;
 
         let wait = s.stream_wait(mine).await.expect("wait");
@@ -5522,8 +5531,12 @@ mod tests {
         assert_eq!(wait.others_queued, 1, "{wait:?}");
         assert!(wait.devices_full, "{wait:?}");
         assert!(wait.oldest_ms > 0, "{wait:?}");
-        let none = s.stream_wait(StreamKey::of("elsewhere")).await.expect("wait");
-        assert_eq!((none.queued, none.others_queued), (0, 3));
+        let none = s
+            .stream_wait(StreamKey::of("elsewhere"))
+            .await
+            .expect("wait");
+        // mine and theirs; the stream-less job is not another video.
+        assert_eq!((none.queued, none.others_queued), (0, 2));
         for h in handles {
             let _ = h.await;
         }
