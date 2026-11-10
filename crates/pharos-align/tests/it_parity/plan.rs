@@ -114,16 +114,16 @@ fn offset_estimate_matches_python() {
             let mut calls = calls.borrow_mut();
             let probe = case.probe_indices[calls.len()];
             calls.push((s, e));
-            match case.answers[&probe.to_string()] {
+            Ok::<_, std::convert::Infallible>(match case.answers[&probe.to_string()] {
                 Some(_) => vec![0.0],
                 None => Vec::new(),
-            }
+            })
         };
         let align = |_: &[f32], _: &[String]| {
             let probe = case.probe_indices[calls.borrow().len() - 1];
-            case.answers[&probe.to_string()].clone().unwrap()
+            Ok(case.answers[&probe.to_string()].clone().unwrap())
         };
-        let got = estimate(&lines, decode, align);
+        let Ok(got) = estimate(&lines, decode, align);
         assert_eq!(calls.into_inner(), case.decode_calls);
         assert_eq!(got.probes, case.probes, "{}", case.reason);
         assert_eq!(

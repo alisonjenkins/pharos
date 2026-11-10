@@ -69,13 +69,14 @@ fn median(sorted: &[i64]) -> f64 {
 
 /// Finds the shift that moves the stamped lines onto the singing.
 ///
-/// `decode(start_ms, end_ms)` returns the window's samples, empty when it
-/// could not be decoded; `align_wide(samples, tokens)` returns token spans
-/// relative to the window, empty when the line was not found.
-pub fn estimate<D, A>(lines: &[Line], mut decode: D, mut align_wide: A) -> Estimate
+/// `decode(start_ms, end_ms)` returns the window's samples, empty when the
+/// probe is to be skipped, or an error that ends the estimate (and the song);
+/// `align_wide(samples, tokens)` returns token spans relative to the window,
+/// empty when the line was not found, or likewise an error that ends it.
+pub fn estimate<D, A, E>(lines: &[Line], mut decode: D, mut align_wide: A) -> Result<Estimate, E>
 where
-    D: FnMut(i64, i64) -> Vec<f32>,
-    A: FnMut(&[f32], &[String]) -> Vec<(u64, u64)>,
+    D: FnMut(i64, i64) -> Result<Vec<f32>, E>,
+    A: FnMut(&[f32], &[String]) -> Result<Vec<(u64, u64)>, E>,
 {
     let mut probes = Vec::new();
     for i in probe_indices(lines) {
@@ -86,11 +87,11 @@ where
             (line.end_ms - line.start_ms).min(n.saturating_mul(CAP_MS_PER_WORD) + CAP_EXTRA_MS);
         let start = (line.start_ms - SEARCH_MS).max(0);
         let end = line.start_ms + sung_ms + SEARCH_MS;
-        let pcm = decode(start, end);
+        let pcm = decode(start, end)?;
         let spans = if pcm.is_empty() {
             Vec::new()
         } else {
-            align_wide(&pcm, &tokens)
+            align_wide(&pcm, &tokens)?
         };
         probes.push(match spans.first() {
             None | Some((0, 0)) => None,
@@ -100,11 +101,11 @@ where
     let mut found: Vec<i64> = probes.iter().flatten().copied().collect();
     if found.len() < MIN_AGREEING {
         let reason = format!("only {} probes found their line", found.len());
-        return Estimate {
+        return Ok(Estimate {
             offset_ms: 0,
             probes,
             reason,
-        };
+        });
     }
     found.sort_unstable();
     let middle = median(&found);
@@ -115,27 +116,27 @@ where
         .collect();
     let agree = format!("{} of {} probes agree", agreeing.len(), found.len());
     if agreeing.len() < MIN_AGREEING.max(found.len() / 2 + 1) {
-        return Estimate {
+        return Ok(Estimate {
             offset_ms: 0,
             probes,
             reason: agree,
-        };
+        });
     }
     // `int()` truncates toward zero; a half from an even count is dropped.
     let offset = median(&agreeing).trunc() as i64;
     if offset.abs() < NEGLIGIBLE_MS {
         let reason = format!("shift {offset} ms is negligible");
-        return Estimate {
+        return Ok(Estimate {
             offset_ms: 0,
             probes,
             reason,
-        };
+        });
     }
-    Estimate {
+    Ok(Estimate {
         offset_ms: offset,
         probes,
         reason: agree,
-    }
+    })
 }
 
 /// Every line moved by `offset_ms`, keeping times at or after zero.
