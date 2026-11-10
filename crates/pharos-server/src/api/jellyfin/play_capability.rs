@@ -200,9 +200,11 @@ fn path_media_id(req: &HttpRequest) -> Option<MediaId> {
 
 /// Marks a token-authenticated playlist request whose PlaySessionId is a
 /// session this same token negotiated for the item, so the URLs it embeds
-/// drop the token. Reads the in-memory registry only: the token itself
-/// authorized the request. A session another token holds (one since revoked,
-/// say) stays unbound, so the playlist keeps the live token it was given.
+/// drop the token. Reads the stored row, as the child requests'
+/// [`capability_user`] will: a session only this replica's cache holds (its
+/// durable write failed) would bind a playlist whose children then 401. A
+/// session another token holds (one since revoked, say) stays unbound too, so
+/// the playlist keeps the live token it was given.
 async fn bind_if_live(state: &AppState, req: &HttpRequest, media_id: MediaId, user: &User) {
     let Some(cap) = super::ci_query::values(req.query_string(), "PlaySessionId")
         .find(|v| !v.is_empty())
@@ -216,7 +218,7 @@ async fn bind_if_live(state: &AppState, req: &HttpRequest, media_id: MediaId, us
     let token_id = pharos_core::TokenStore::token_id(&state.stores, &token);
     match state
         .transcode_sessions
-        .get(PlaySessionId::from(cap.as_str()))
+        .get_stored(&PlaySessionId::from(cap.as_str()))
         .await
     {
         Ok(Some(s))
@@ -230,7 +232,7 @@ async fn bind_if_live(state: &AppState, req: &HttpRequest, media_id: MediaId, us
         Err(e) => tracing::debug!(
             media.id = media_id,
             error = %e,
-            "play capability: registry unavailable; the playlist keeps the token"
+            "play capability: session store unavailable; the playlist keeps the token"
         ),
     }
 }
