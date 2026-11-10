@@ -3566,16 +3566,22 @@ test.describe("pharos Dioxus UI now playing", () => {
     const styles = await picker.getByRole("button").allTextContents();
     expect(styles.length).toBeGreaterThanOrEqual(9);
     // Spectrum, the default, logged its decision above.
+    // Choosing a style closes the grid (B1038), so each pick opens it again.
     for (const name of styles.filter((s) => s !== "Off" && s !== "Spectrum")) {
       lines.length = 0;
+      if (!(await picker.isVisible())) await trigger.click();
       await picker.getByRole("button", { name, exact: true }).click();
+      await expect(picker).toBeHidden();
       const decided = new RegExp(`pharos: renderer mode=\\S+ reason=\\S+ style=${name.toLowerCase()} `);
       await expect
         .poll(() => lines.find((l) => decided.test(l)) ?? "", { timeout: 15_000 })
         .toMatch(decided);
       expect(lines.find((l) => decided.test(l))).not.toMatch(/reason=shader/);
     }
+    await trigger.click();
     await picker.getByRole("button", { name: "Halo", exact: true }).click();
+    await expect(picker).toBeHidden();
+    await trigger.click();
     await expect(
       picker.getByRole("button", { name: "Halo", exact: true }),
     ).toHaveAttribute("aria-pressed", "true");
