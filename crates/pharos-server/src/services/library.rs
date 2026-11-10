@@ -654,10 +654,11 @@ async fn next_up_page(
             pick_next(&eps, &data, scoped)
         })
         .collect();
-    // FR-103 — the series watched most recently first; name breaks ties.
+    // FR-103 — the series watched most recently first; name, then id, breaks ties.
     picks.sort_by(|(a_at, a), (b_at, b)| {
         b_at.cmp(a_at)
             .then_with(|| series_name(a).cmp(series_name(b)))
+            .then_with(|| a.id.cmp(&b.id))
     });
     picks.truncate(limit.unwrap_or(NEXT_UP_DEFAULT).max(1) as usize);
     if picks.is_empty() {
