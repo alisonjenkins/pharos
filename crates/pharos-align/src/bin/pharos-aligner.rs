@@ -114,13 +114,14 @@ async fn run(config: Config, (plan, pin_err): (pin::Plan, Option<String>)) -> Re
     let ffmpeg = std::env::var("PHAROS_ALIGNER_FFMPEG").unwrap_or_else(|_| "ffmpeg".into());
     let decoder: Decoder =
         Box::new(move |path, start, end| pharos_align::audio::decode(&ffmpeg, path, start, end));
-    let (weights, threads) = (config.weights.clone(), config.threads);
+    let (weights, threads, batch_samples) =
+        (config.weights.clone(), config.threads, config.batch_samples);
     let loader: Loader = Box::new(move || {
         let weights = Weights::open(&weights).map_err(|e| e.to_string())?;
         let model = CpuModel::load(weights, threads).map_err(|e| e.to_string())?;
         Ok(Box::new(CpuAligner {
             model,
-            batch_samples: pharos_align::config::DEFAULT_BATCH_SAMPLES,
+            batch_samples,
         }) as Box<dyn Model>)
     });
     let engine = Arc::new(Engine::new(loader, decoder, config.idle_unload));
@@ -142,6 +143,7 @@ async fn run(config: Config, (plan, pin_err): (pin::Plan, Option<String>)) -> Re
         weights = %config.weights.display(),
         idle_unload_s = %config.idle_unload.map_or("off".to_owned(), |d| d.as_secs().to_string()),
         threads = config.threads,
+        batch_samples = config.batch_samples,
         traces = %if traced { config.otlp_endpoint.as_deref().unwrap_or("on") } else { "off" },
         "serving pharos-aligner"
     );

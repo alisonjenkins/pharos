@@ -29,6 +29,8 @@ pub struct Config {
     /// The `alignerWeights` output: `weights.bin` and `weights.json`.
     pub weights: PathBuf,
     pub pin: PinMode,
+    /// Most samples one forward pass holds.
+    pub batch_samples: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -106,6 +108,20 @@ impl Config {
                 .map_err(|()| invalid("PHAROS_ALIGNER_PIN", "auto, on or off", &raw))?,
         };
 
+        let batch_samples = match set(get("PHAROS_ALIGNER_BATCH_SAMPLES")) {
+            None => DEFAULT_BATCH_SAMPLES,
+            Some(raw) => match raw.trim().parse::<usize>() {
+                Ok(n) if n >= 1 => n,
+                _ => {
+                    return Err(invalid(
+                        "PHAROS_ALIGNER_BATCH_SAMPLES",
+                        "an integer >= 1",
+                        &raw,
+                    ))
+                }
+            },
+        };
+
         Ok(Self {
             media_root: PathBuf::from(media_root),
             host,
@@ -115,6 +131,7 @@ impl Config {
             idle_unload,
             weights: PathBuf::from(weights),
             pin,
+            batch_samples,
         })
     }
 }
@@ -146,6 +163,7 @@ mod tests {
         assert_eq!(c.otlp_endpoint, None);
         assert_eq!(c.weights, PathBuf::from("/w"));
         assert_eq!(c.pin, PinMode::Auto);
+        assert_eq!(c.batch_samples, 1_000_000);
     }
 
     #[test]
@@ -158,9 +176,11 @@ mod tests {
             ("PHAROS_ALIGNER_IDLE_UNLOAD_SECS", "0"),
             ("PHAROS_ALIGNER_OTLP_ENDPOINT", "http://otel:4317"),
             ("PHAROS_ALIGNER_PIN", "off"),
+            ("PHAROS_ALIGNER_BATCH_SAMPLES", "48000"),
         ]))
         .unwrap();
         assert_eq!(c.pin, PinMode::Off);
+        assert_eq!(c.batch_samples, 48_000);
         assert_eq!((c.host.as_str(), c.port, c.threads), ("127.0.0.1", 9000, 4));
         assert_eq!(c.idle_unload, None, "0 keeps the model loaded");
         assert_eq!(c.otlp_endpoint.as_deref(), Some("http://otel:4317"));
@@ -233,6 +253,16 @@ mod tests {
         assert_eq!(
             e.to_string(),
             r#"PHAROS_ALIGNER_PIN must be auto, on or off, got "yes""#
+        );
+        let e = Config::from_env(env(&[
+            ("PHAROS_ALIGNER_MEDIA_ROOT", "/m"),
+            ("PHAROS_ALIGNER_WEIGHTS", "/w"),
+            ("PHAROS_ALIGNER_BATCH_SAMPLES", "0"),
+        ]))
+        .unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            r#"PHAROS_ALIGNER_BATCH_SAMPLES must be an integer >= 1, got "0""#
         );
     }
 }
