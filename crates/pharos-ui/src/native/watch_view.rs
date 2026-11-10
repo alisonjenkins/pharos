@@ -1986,7 +1986,7 @@ mod tests {
         }
     }
 
-    fn bewitched() -> bars::Crop {
+    fn pillarboxed() -> bars::Crop {
         bars::Crop {
             rect: FrameRect {
                 x: 0.125,
@@ -2003,7 +2003,7 @@ mod tests {
         let mut c = controls();
         c.media.video_width = 0;
         c.media.video_height = 0;
-        c.picture = Some(bewitched());
+        c.picture = Some(pillarboxed());
         let html = render(c);
         assert!(html.contains("--pharos-eye-aspect: 1.333333"), "{html}");
     }
@@ -2013,8 +2013,8 @@ mod tests {
         let mut c = controls();
         c.media.video_width = 1920;
         c.media.video_height = 1080;
-        // Bewitched: a 4:3 picture pillarboxed in 1920x1080 (B1017).
-        c.picture = Some(bewitched());
+        // Pillarboxed: a 4:3 picture pillarboxed in 1920x1080 (B1017).
+        c.picture = Some(pillarboxed());
         let html = render(c.clone());
         assert!(
             html.contains(r#"data-crop="0.125000 0.000000 0.750000 1.000000""#),
@@ -2038,7 +2038,7 @@ mod tests {
         c.media.video_width = 3840;
         c.media.video_height = 1080;
         c.packing = Some(Stereo::FullSideBySide);
-        c.picture = Some(bewitched());
+        c.picture = Some(pillarboxed());
         let html = render(c.clone());
         assert!(!html.contains("data-crop"), "{html}");
         assert!(html.contains("--pharos-eye-aspect: 1.777778"), "{html}");

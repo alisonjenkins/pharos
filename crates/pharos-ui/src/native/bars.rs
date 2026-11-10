@@ -153,8 +153,8 @@ mod tests {
     #![allow(clippy::expect_used)]
     use super::*;
 
-    /// Bewitched: a 4:3 picture pillarboxed in 1920x1080.
-    const BEWITCHED: PictureArea = PictureArea {
+    /// Pillarboxed: a 4:3 picture pillarboxed in 1920x1080.
+    const PILLARBOXED: PictureArea = PictureArea {
         x: 242,
         y: 0,
         width: 1436,
@@ -167,7 +167,7 @@ mod tests {
 
     #[test]
     fn a_pillarboxed_picture_is_the_middle_of_the_frame() {
-        let r = picture_rect(Some(BEWITCHED), 1920, 1080).expect("cropped");
+        let r = picture_rect(Some(PILLARBOXED), 1920, 1080).expect("cropped");
         assert!(close(r.x, 242.0 / 1920.0), "{r:?}");
         assert!(close(r.w, 1436.0 / 1920.0), "{r:?}");
         assert!(close(r.y, 0.0) && close(r.h, 1.0), "{r:?}");
@@ -177,7 +177,7 @@ mod tests {
     #[test]
     fn nothing_is_cropped_without_an_area_inside_a_known_frame() {
         assert_eq!(picture_rect(None, 1920, 1080), None);
-        assert_eq!(picture_rect(Some(BEWITCHED), 0, 0), None, "size unknown");
+        assert_eq!(picture_rect(Some(PILLARBOXED), 0, 0), None, "size unknown");
         let whole = PictureArea {
             x: 0,
             y: 0,
@@ -186,10 +186,10 @@ mod tests {
         };
         assert_eq!(picture_rect(Some(whole), 1920, 1080), None, "no bars");
         // An area from a probe of another size must not crop this frame.
-        assert_eq!(picture_rect(Some(BEWITCHED), 1280, 720), None);
+        assert_eq!(picture_rect(Some(PILLARBOXED), 1280, 720), None);
         let empty = PictureArea {
             width: 0,
-            ..BEWITCHED
+            ..PILLARBOXED
         };
         assert_eq!(picture_rect(Some(empty), 1920, 1080), None);
         assert_eq!(shown_size(None, 1920, 1080), (1920, 1080));
@@ -231,7 +231,7 @@ mod tests {
 
     #[test]
     fn the_crop_attribute_reads_back() {
-        let r = picture_rect(Some(BEWITCHED), 1920, 1080).expect("cropped");
+        let r = picture_rect(Some(PILLARBOXED), 1920, 1080).expect("cropped");
         let back = parse_crop(&crop_attr(r)).expect("parses");
         assert!(close(back.x, r.x) && close(back.w, r.w), "{back:?}");
         for bad in [

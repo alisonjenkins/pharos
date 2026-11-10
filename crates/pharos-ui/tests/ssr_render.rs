@@ -800,7 +800,7 @@ fn search_idle_with_hits() -> Element {
     let hits = vec![
         SearchHint {
             id: "1".into(),
-            name: "Blade Runner".into(),
+            name: "Film AB".into(),
             kind: ItemKind::Movie,
             media_type: "Movie".into(),
             matched_term: "blade".into(),
@@ -864,7 +864,7 @@ fn search_error() -> Element {
 fn search_view_renders_input_and_grouped_hits() {
     let html = render_root(search_idle_with_hits);
     assert!(html.contains(r#"type="search""#), "{html}");
-    assert!(html.contains("Blade Runner"), "{html}");
+    assert!(html.contains("Film AB"), "{html}");
     assert!(html.contains("Vangelis - Tales"), "{html}");
     // Group headings present for both kinds.
     assert!(html.contains(">Video<"), "{html}");
@@ -899,7 +899,7 @@ fn detail_unplayed_no_position() -> Element {
         ItemDetailView {
             detail: ItemDetail {
                 id: "1".into(),
-                name: "Blade Runner".into(),
+                name: "Film AB".into(),
                 kind: ItemKind::Movie,
                 run_time_ticks: 117 * 60 * 10_000_000,
                 played: false,
@@ -948,7 +948,7 @@ fn detail_audio() -> Element {
                 kind: ItemKind::Audio,
                 run_time_ticks: 3 * 60 * 10_000_000,
                 artists: vec!["Vangelis".into()],
-                album: Some("Blade Runner OST".into()),
+                album: Some("Film AB OST".into()),
                 album_artists: vec!["Vangelis".into()],
                 ..Default::default()
             },
@@ -985,10 +985,10 @@ fn detail_with_cast_overview_genres_backdrop() -> Element {
         ItemDetailView {
             detail: ItemDetail {
                 id: "33".into(),
-                name: "Blade Runner".into(),
+                name: "Film AB".into(),
                 kind: ItemKind::Movie,
                 run_time_ticks: 117 * 60 * 10_000_000,
-                overview: Some("A blade runner hunts replicants.".into()),
+                overview: Some("A tracker hunts androids.".into()),
                 genres: vec!["Sci-Fi".into(), "Drama".into()],
                 has_backdrop_image: true,
                 people: vec![
@@ -1021,7 +1021,7 @@ fn detail_with_cast_overview_genres_backdrop() -> Element {
 #[test]
 fn detail_view_renders_title_runtime_and_play_button() {
     let html = render_root(detail_unplayed_no_position);
-    assert!(html.contains("Blade Runner"), "{html}");
+    assert!(html.contains("Film AB"), "{html}");
     assert!(html.contains("1h 57m"), "runtime missing: {html}");
     assert!(html.contains("pharos-detail-play"), "{html}");
     // No resume — Play (not Resume).
@@ -1053,7 +1053,7 @@ fn detail_view_audio_renders_artist_album_and_primary_image() {
     let html = render_root(detail_audio);
     assert!(html.contains("pharos-detail-audio-meta"), "{html}");
     assert!(html.contains("Vangelis"), "{html}");
-    assert!(html.contains("Blade Runner OST"), "{html}");
+    assert!(html.contains("Film AB OST"), "{html}");
     // album_artists same as artists → no separate line.
     assert!(
         !html.contains("Album artist:"),
@@ -1082,7 +1082,7 @@ fn detail_view_phase3_renders_backdrop_overview_genres_cast() {
     assert!(html.contains("/Items/33/Images/Backdrop"), "{html}");
     // Overview text
     assert!(html.contains("pharos-detail-overview"), "{html}");
-    assert!(html.contains("A blade runner hunts replicants."), "{html}");
+    assert!(html.contains("A tracker hunts androids."), "{html}");
     // Genres
     assert!(html.contains("pharos-detail-genres"), "{html}");
     assert!(html.contains("Sci-Fi, Drama"), "{html}");
