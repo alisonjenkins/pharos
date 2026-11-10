@@ -2908,6 +2908,11 @@ fn MyDevicesScreen() -> Element {
     let mut state = use_signal(|| MyDevicesState::Loading);
     let mut saving = use_signal(std::collections::BTreeSet::<String>::new);
     let mut problem = use_signal(|| None::<String>);
+    // Counts connections. A call on a closed socket can hang instead of
+    // failing, so a new connection drops every save still in flight: its
+    // device can be changed again, and a late answer from the old one is
+    // ignored.
+    let mut connection = use_signal(|| 0u64);
     let report = move |e: &ClientError, what: &str| {
         if e.needs_sign_in() {
             let mut machine = ctx.machine;
@@ -2917,7 +2922,19 @@ fn MyDevicesScreen() -> Element {
     };
     // Loads again on a new connection, which may be another account.
     use_effect(move || {
-        let Some(api) = ctx.api.read().clone() else {
+        let api = ctx.api.read().clone();
+        *connection.write() += 1;
+        let dropped = std::mem::take(&mut *saving.write());
+        if !dropped.is_empty() {
+            platform::warn(&format!(
+                "my_devices: connection changed with {} save(s) in flight; dropped: {dropped:?}",
+                dropped.len()
+            ));
+            problem.set(Some(
+                "The connection dropped before the sound formats saved. Try again.".to_owned(),
+            ));
+        }
+        let Some(api) = api else {
             return;
         };
         spawn(async move {
@@ -2945,6 +2962,7 @@ fn MyDevicesScreen() -> Element {
                     return;
                 }
                 problem.set(None);
+                let started_on = *connection.peek();
                 spawn(async move {
                     let result = api
                         .set_device_converted_audio(
@@ -2953,6 +2971,12 @@ fn MyDevicesScreen() -> Element {
                             &codecs,
                         )
                         .await;
+                    if *connection.peek() != started_on {
+                        platform::warn(&format!(
+                            "my_devices: save for {device_id} answered after the connection changed; ignored"
+                        ));
+                        return;
+                    }
                     match result {
                         Ok(()) => {
                             let current = state.peek().clone();
