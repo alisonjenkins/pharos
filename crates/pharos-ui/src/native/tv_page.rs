@@ -327,6 +327,10 @@ addEventListener("keydown", (e) => {
 
 /// The bridge script `template` with its tick intervals, player selectors
 /// and Info key filled in.
+/// What OK on the picture presses instead of pausing, while one shows:
+/// Up Next's Play now, or the skip intro/credits button (FR-604).
+pub const OK_PRESSES: &str = ".pharos-up-next-play, .pharos-up-next-pill-play, .pharos-skip";
+
 pub fn bridge_script(template: &str) -> String {
     template
         .replace("__BAR_KEYS__", BAR_KEY_JS)
@@ -335,6 +339,7 @@ pub fn bridge_script(template: &str) -> String {
         .replace("__REMOTE_PLAYERS__", REMOTE_PLAYERS)
         .replace("__PLAYER_HOME__", PLAYER_HOME)
         .replace("__REMOTE_SKIPS__", REMOTE_SKIPS)
+        .replace("__OK_PRESSES__", OK_PRESSES)
 }
 
 /// The container list a TV build declares: one no file has, so the server
@@ -382,6 +387,13 @@ pub enum Bridge {
     Root,
     /// The viewport's CSS size.
     Size { w: f64, h: f64 },
+    /// OK on the picture pressed the shown Skip or Up Next button (FR-604);
+    /// `target` is its class.
+    #[serde(rename = "okpress")]
+    OkPress {
+        #[serde(default)]
+        target: String,
+    },
     /// The remote's Stop key, which the page's script handled: it paused
     /// the player, and left it when it was a video (FR-609).
     Stop {
@@ -651,6 +663,18 @@ mod tests {
     }
 
     #[test]
+    fn ok_presses_the_buttons_the_player_draws() {
+        let view = include_str!("watch_view.rs");
+        for class in OK_PRESSES.split(", ") {
+            let name = class.trim_start_matches('.');
+            assert!(
+                view.contains(&format!("class: \"{name}\"")),
+                "the player draws no {name}"
+            );
+        }
+    }
+
+    #[test]
     fn the_remotes_next_and_previous_keys_skip() {
         use super::super::watch_view::Skip;
         assert_eq!(track_skip("MediaTrackNext"), Some(Skip::Next));
@@ -754,6 +778,7 @@ mod tests {
         );
         assert!(PLAYER_HOME.split(", ").any(|s| s == ".pharos-listen-play"));
         assert!(!bridge_script("__REMOTE_SKIPS__").contains("__"));
+        assert_eq!(bridge_script("__OK_PRESSES__"), OK_PRESSES);
         // B1222/V1182: the Info key's script is in the bridge, filled in.
         let keys = bridge_script("__BAR_KEYS__");
         assert!(keys.contains(r#"e.key !== "Info""#), "{keys}");
@@ -955,6 +980,12 @@ mod tests {
         assert_eq!(
             parse_bridge(&serde_json::json!({"t": "stop", "video": true})),
             Some(Bridge::Stop { video: true })
+        );
+        assert_eq!(
+            parse_bridge(&serde_json::json!({"t": "okpress", "target": "pharos-skip"})),
+            Some(Bridge::OkPress {
+                target: "pharos-skip".to_owned()
+            })
         );
         assert_eq!(parse_bridge(&serde_json::json!({"t": "nope"})), None);
         assert_eq!(parse_bridge(&serde_json::json!(3)), None);
