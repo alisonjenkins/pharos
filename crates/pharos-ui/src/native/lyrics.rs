@@ -614,4 +614,28 @@ mod tests {
         let html = render(l, 0);
         assert!(html.contains("pharos-lyrics-gap"), "{html}");
     }
+
+    /// B1220/V1180: on the TV the sung line glides without the glow, whose
+    /// blur the GPU redrew every frame; elsewhere the glow stays.
+    #[test]
+    fn the_tv_glides_the_karaoke_fill_without_the_glow() {
+        let sheet = include_str!("../../assets/pharos.css");
+        let rule = |head: &str| {
+            sheet
+                .split(head)
+                .nth(1)
+                .and_then(|r| r.split('}').next())
+                .unwrap_or_default()
+                .to_owned()
+        };
+        let words = rule("\n.pharos-lyrics-words {");
+        assert!(
+            words.contains("transition: --pharos-wipe 250ms linear"),
+            "{words}"
+        );
+        assert!(words.contains("filter: drop-shadow("), "{words}");
+        let tv = rule(":root[data-device=\"tv\"] .pharos-lyrics-words {");
+        assert!(tv.contains("filter: none"), "{tv}");
+        assert!(!tv.contains("transition"), "{tv}");
+    }
 }
