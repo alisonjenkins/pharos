@@ -15,6 +15,10 @@ pub mod names {
     pub const BURST: &str = "Burst";
     pub const GIGGLE: &str = "Giggle";
     pub const KARAOKE: &str = "Karaoke";
+    /// Dialogue in a speaker's colour, by palette slot.
+    pub const SPEAKERS: [&str; 6] = [
+        "Speaker1", "Speaker2", "Speaker3", "Speaker4", "Speaker5", "Speaker6",
+    ];
 }
 
 /// The faces in the font pack (V508) and the dialogue face.
@@ -27,6 +31,17 @@ pub mod faces {
 
 /// Wire's text colour, a cool silver-blue.
 pub const WIRE_PRIMARY: u32 = rgb(200, 225, 255);
+
+/// Speakers' text colours by palette slot: light enough to read on the
+/// black outline, apart from each other, the karaoke gold and Wire's silver.
+pub const SPEAKER_PRIMARY: [u32; 6] = [
+    rgb(150, 220, 255),
+    rgb(255, 190, 140),
+    rgb(170, 240, 160),
+    rgb(255, 175, 215),
+    rgb(215, 190, 255),
+    rgb(255, 240, 150),
+];
 
 /// An opaque `&H00BBGGRR` colour from RGB.
 pub const fn rgb(r: u8, g: u8, b: u8) -> u32 {
@@ -266,6 +281,34 @@ impl Theme {
         out
     }
 
+    /// The theme with a dialogue style per speaker slot, each `Default` in
+    /// that speaker's colour, so plain lines with a slot are drawn in it.
+    pub fn with_speakers(&self) -> Theme {
+        let mut out = self.clone();
+        if let Some(base) = self.style(names::DEFAULT) {
+            out.styles
+                .retain(|s| !names::SPEAKERS.contains(&s.name.as_str()));
+            for (name, primary) in names::SPEAKERS.iter().zip(SPEAKER_PRIMARY) {
+                out.styles.push(StyleDef {
+                    name: (*name).to_owned(),
+                    primary,
+                    secondary: primary,
+                    ..base.clone()
+                });
+            }
+        }
+        out
+    }
+
+    /// The dialogue style for a line spoken by `slot`: its speaker's style
+    /// when the theme has speaker styles, else `Default`.
+    pub fn dialogue_style(&self, slot: Option<u8>) -> &'static str {
+        slot.and_then(|s| names::SPEAKERS.get(usize::from(s)))
+            .filter(|n| self.style(n).is_some())
+            .copied()
+            .unwrap_or(names::DEFAULT)
+    }
+
     /// Where `\an2` text sits by default: bottom centre.
     pub fn bottom_anchor(&self) -> (i32, i32) {
         let mv = self.style(names::DEFAULT).map_or(54, |s| s.margin_v);
@@ -344,6 +387,28 @@ mod tests {
                 fmt_fields
             );
         }
+    }
+
+    #[test]
+    fn speaker_styles_are_dialogue_in_distinct_colours() {
+        let plain = Theme::pharos().scaled(150);
+        assert_eq!(plain.dialogue_style(Some(0)), names::DEFAULT);
+        let t = plain.with_speakers();
+        let base = t.style(names::DEFAULT).unwrap();
+        let mut seen = vec![base.primary];
+        for (slot, name) in names::SPEAKERS.iter().enumerate() {
+            let s = t.style(name).unwrap();
+            assert_eq!(
+                (s.size, s.outline, s.margin_v),
+                (base.size, base.outline, base.margin_v)
+            );
+            assert!(!seen.contains(&s.primary), "{name}");
+            seen.push(s.primary);
+            assert_eq!(t.dialogue_style(Some(slot as u8)), *name);
+        }
+        assert_eq!(t.dialogue_style(None), names::DEFAULT);
+        assert_eq!(t.dialogue_style(Some(6)), names::DEFAULT);
+        assert_eq!(t.with_speakers().styles.len(), t.styles.len());
     }
 
     #[test]

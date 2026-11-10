@@ -5,4 +5,4 @@ pub const COMPILER_VERSION: u32 = 4;
 
 /// Bumped whenever the director would pick different effects for the same
 /// source. Stored with every plan so stale plans can be re-directed.
-pub const DIRECTOR_VERSION: u32 = 6;
+pub const DIRECTOR_VERSION: u32 = 7;

@@ -434,6 +434,8 @@ struct Report {
     sung_score: Option<f32>,
     /// Karaoke lines per timing, `timing=n` (B1212).
     karaoke: String,
+    /// Speakers the plan gives a colour slot.
+    speakers: usize,
 }
 
 /// What came of asking the aligner about an item's sung lines (B1212).
@@ -812,7 +814,6 @@ impl<S: JobStore, A: Signals, Q: TranscodeQueue> Styler<S, A, Q> {
         ended.outcome
     }
 
-    /// The stages after `select`. `Err` carries how the item ended early.
     /// Asks the aligner where the item's sung lines are sung (B1212). A
     /// failure is logged and the lines are paced: the item is styled anyway.
     async fn sung(
@@ -852,6 +853,7 @@ impl<S: JobStore, A: Signals, Q: TranscodeQueue> Styler<S, A, Q> {
         }
     }
 
+    /// The stages after `select`. `Err` carries how the item ended early.
     async fn style(&self, task: &Task, report: &mut Report) -> Result<(), Ended> {
         let Some(source) = task.source.as_ref() else {
             self.put(task, Outcome::NoSource, NO_SOURCE_INDEX, None)
@@ -979,7 +981,6 @@ impl<S: JobStore, A: Signals, Q: TranscodeQueue> Styler<S, A, Q> {
         };
         let (sung, ask) = self.sung(&task.item, &parsed.lines, &segments).await;
         report.sung = Some(ask);
-        metrics::counter!("pharos_subtitle_sung_total", "outcome" => ask.label()).increment(1);
         let t = Instant::now();
         let track = TrackSignals {
             lines: sig.lines.iter().map(line_signals).collect(),
@@ -1006,6 +1007,7 @@ impl<S: JobStore, A: Signals, Q: TranscodeQueue> Styler<S, A, Q> {
         report.signs = parsed.lines.iter().filter(|l| l.typeset).count();
         report.sign_causes = sign_causes(&parsed.lines);
         report.sung_score = direction.sung_score;
+        report.speakers = direction.speakers;
         report.karaoke = direction
             .karaoke
             .iter()
@@ -1034,6 +1036,9 @@ impl<S: JobStore, A: Signals, Q: TranscodeQueue> Styler<S, A, Q> {
                     .record(d.as_secs_f64());
             }
         }
+        // Counted once the item is stored, so a failed store and its retry
+        // do not count the item twice.
+        metrics::counter!("pharos_subtitle_sung_total", "outcome" => ask.label()).increment(1);
         for (timing, n) in &direction.karaoke {
             metrics::counter!("pharos_subtitle_karaoke_total", "timing" => timing.label())
                 .increment(*n as u64);
@@ -1226,6 +1231,7 @@ impl<S: JobStore, A: Signals, Q: TranscodeQueue> Styler<S, A, Q> {
                     sung = report.sung.map(SungAsk::label),
                     sung_score = report.sung_score,
                     karaoke = %report.karaoke,
+                    speakers = report.speakers,
                     outcome = ended.outcome.label(),
                     stage = ended.stage.label(),
                     error = ended.error.as_deref(),
@@ -1892,6 +1898,68 @@ mod tests {
             })
             .collect();
         assert_eq!(sung, [("off".to_owned(), 1)]);
+    }
+
+    /// The counter values of `name` by its first label.
+    fn by_label(
+        snap: &pharos_test_metrics::CumulativeSnapshotter,
+        name: &str,
+    ) -> Vec<(String, u64)> {
+        let mut out: Vec<(String, u64)> = snap
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(ck, ..)| ck.key().name() == name)
+            .map(|(ck, _, _, v)| {
+                let DebugValue::Counter(c) = v else { panic!() };
+                (ck.key().labels().next().unwrap().value().to_owned(), c)
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// B1212: an aligner that cannot be reached is counted as failed, the
+    /// item is still styled, and its song lines are paced.
+    #[tokio::test]
+    async fn an_unreachable_aligner_is_counted_and_the_song_is_paced() {
+        let (rec, snap) = recorder();
+        let _guard = metrics::set_default_local_recorder(&rec);
+        let lib = library(&[(1, "a.mkv", ANIME, true)]).await;
+        lib.store
+            .set_media_segments(
+                1,
+                &[pharos_core::DetectedSegment {
+                    kind: MediaSegmentKind::Intro,
+                    start_ms: 0,
+                    end_ms: 60_000,
+                    detector: "chapter".into(),
+                    confidence: 1.0,
+                }],
+                1,
+            )
+            .await
+            .unwrap();
+        let fake = FakeSignals::default();
+        let mut job = styler(&lib, &fake, idle());
+        // Port 9 (discard) on loopback: nothing listens there.
+        job.aligner = Some(Arc::new(
+            crate::services::lyrics::align::Aligner::for_tests(
+                "http://127.0.0.1:9".into(),
+                lib.dir.path().to_path_buf(),
+            ),
+        ));
+        let sum = job.run_pass(&OnDemand::default()).await;
+        assert_eq!((sum.pending, sum.styled), (1, 1));
+        assert_eq!(
+            by_label(&snap, "pharos_subtitle_sung_total"),
+            [("failed".to_owned(), 1)]
+        );
+        // "Look out!" is a shout, not a plain line, so it takes no fill.
+        assert_eq!(
+            by_label(&snap, "pharos_subtitle_karaoke_total"),
+            [("paced".to_owned(), 4)]
+        );
     }
 
     /// FR-014 — a file the media cannot give us is remembered and not tried

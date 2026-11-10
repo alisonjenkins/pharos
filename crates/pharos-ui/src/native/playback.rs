@@ -1334,6 +1334,53 @@ impl SubtitleSize {
 /// [`EffectsLevel::Subtle`].
 pub const EFFECTS_LEVEL_KEY: &str = "pharos.subtitles.effects";
 
+/// Where the viewer's speaker colours switch is kept: `on`, else off.
+pub const SPEAKER_COLOURS_KEY: &str = "pharos.subtitles.speakers";
+
+/// Where the viewer's subtitle effects detail is kept; absent or unknown is
+/// [`EffectsDetail::Auto`].
+pub const EFFECTS_DETAIL_KEY: &str = "pharos.subtitles.detail";
+
+/// How rich a tier a TV or phone asks for. Auto takes the device's tier;
+/// Rich asks for the desktop tier everywhere and leaves the frame-drop watch
+/// (T028-21) to step it down where the device cannot keep up.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum EffectsDetail {
+    #[default]
+    Auto,
+    Rich,
+}
+
+impl EffectsDetail {
+    /// Every choice offered, the default first.
+    pub const ALL: [EffectsDetail; 2] = [EffectsDetail::Auto, EffectsDetail::Rich];
+
+    /// The choice a stored [`EFFECTS_DETAIL_KEY`] value holds; anything
+    /// unknown is [`EffectsDetail::Auto`].
+    pub fn parse(stored: &str) -> EffectsDetail {
+        match stored.trim() {
+            "rich" => EffectsDetail::Rich,
+            _ => EffectsDetail::Auto,
+        }
+    }
+
+    /// The stored value.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            EffectsDetail::Auto => "auto",
+            EffectsDetail::Rich => "rich",
+        }
+    }
+
+    /// The setting's label.
+    pub fn label(self) -> &'static str {
+        match self {
+            EffectsDetail::Auto => "Auto",
+            EffectsDetail::Rich => "Rich",
+        }
+    }
+}
+
 /// How much motion the styled subtitle track may carry on this device
 /// (spec 028 FR-018).
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -1473,15 +1520,20 @@ fn has_word_start(text: &str, token: &str) -> bool {
 }
 
 /// The tier a styled track is first fetched at: Low under reduced motion,
-/// else Tv for TVs and phones and Desktop for desktops, capped at the tier
-/// this device last dropped to.
-pub fn starting_tier(device: DeviceClass, reduced_motion: bool, remembered: Option<Tier>) -> Tier {
+/// else Desktop for desktops and for any device set to Rich, else Tv, capped
+/// at the tier this device last dropped to.
+pub fn starting_tier(
+    device: DeviceClass,
+    reduced_motion: bool,
+    remembered: Option<Tier>,
+    detail: EffectsDetail,
+) -> Tier {
     let by_device = if reduced_motion {
         Tier::Low
     } else {
-        match device {
-            DeviceClass::Tv | DeviceClass::Phone => Tier::Tv,
-            DeviceClass::Desktop => Tier::Desktop,
+        match (device, detail) {
+            (DeviceClass::Desktop, _) | (_, EffectsDetail::Rich) => Tier::Desktop,
+            (DeviceClass::Tv | DeviceClass::Phone, EffectsDetail::Auto) => Tier::Tv,
         }
     };
     remembered.map_or(by_device, |cap| by_device.min(cap))
@@ -1493,12 +1545,14 @@ pub fn starting_tier_line(
     device: DeviceClass,
     reduced_motion: bool,
     remembered: Option<Tier>,
+    detail: EffectsDetail,
 ) -> String {
     format!(
-        "pharos: subtitle tier={} device={} reduced_motion={reduced_motion} remembered={}",
+        "pharos: subtitle tier={} device={} reduced_motion={reduced_motion} remembered={} detail={}",
         tier.label(),
         device.label(),
         remembered.map_or("none", Tier::label),
+        detail.as_str(),
     )
 }
 
@@ -2808,12 +2862,14 @@ pub fn styled_subtitle_url(track: &Track) -> Option<String> {
 /// The URL of a generated styled track's script at `tier`, `level` and the
 /// viewer's subtitle `size` (spec 028 FR-006, FR-022): `None` for any other
 /// track, and for every track while Effects is Off, where the plain track
-/// draws instead. Medium sends no `size`, the server's default.
+/// draws instead. Medium sends no `size`, the server's default, and
+/// `speakers` off sends nothing either.
 pub fn styled_track_url(
     track: &Track,
     tier: Tier,
     level: EffectsLevel,
     size: SubtitleSize,
+    speakers: bool,
 ) -> Option<String> {
     if level == EffectsLevel::Off {
         return None;
@@ -2823,8 +2879,9 @@ pub fn styled_track_url(
         100 => String::new(),
         p => format!("&size={p}"),
     };
+    let speakers = if speakers { "&speakers=1" } else { "" };
     Some(format!(
-        "{url}?tier={}&effects={}{sized}",
+        "{url}?tier={}&effects={}{sized}{speakers}",
         tier.label(),
         level.as_str()
     ))
@@ -3392,7 +3449,7 @@ mod tests {
         ];
         for (device, reduced, remembered, want) in cases {
             assert_eq!(
-                starting_tier(device, reduced, remembered),
+                starting_tier(device, reduced, remembered, EffectsDetail::Auto),
                 want,
                 "{device:?} {reduced} {remembered:?}"
             );
@@ -3400,14 +3457,56 @@ mod tests {
     }
 
     #[test]
+    fn rich_detail_asks_a_tv_for_the_desktop_tier_under_the_same_caps() {
+        use DeviceClass::{Desktop, Phone, Tv};
+        let rich = EffectsDetail::Rich;
+        let cases = [
+            (Tv, false, None, Tier::Desktop),
+            (Phone, false, None, Tier::Desktop),
+            (Desktop, false, None, Tier::Desktop),
+            (Tv, true, None, Tier::Low),
+            (Tv, false, Some(Tier::Tv), Tier::Tv),
+            (Tv, false, Some(Tier::Low), Tier::Low),
+        ];
+        for (device, reduced, remembered, want) in cases {
+            assert_eq!(
+                starting_tier(device, reduced, remembered, rich),
+                want,
+                "{device:?} {reduced} {remembered:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn effects_detail_reads_back_what_it_stores() {
+        for d in EffectsDetail::ALL {
+            assert_eq!(EffectsDetail::parse(d.as_str()), d);
+        }
+        assert_eq!(EffectsDetail::parse("max"), EffectsDetail::Auto);
+        assert_eq!(EffectsDetail::default(), EffectsDetail::Auto);
+    }
+
+    #[test]
     fn the_starting_tier_log_line_names_every_input() {
         assert_eq!(
-            starting_tier_line(Tier::Low, DeviceClass::Tv, true, Some(Tier::Tv)),
-            "pharos: subtitle tier=low device=tv reduced_motion=true remembered=tv"
+            starting_tier_line(
+                Tier::Low,
+                DeviceClass::Tv,
+                true,
+                Some(Tier::Tv),
+                EffectsDetail::Rich
+            ),
+            "pharos: subtitle tier=low device=tv reduced_motion=true remembered=tv detail=rich"
         );
         assert_eq!(
-            starting_tier_line(Tier::Desktop, DeviceClass::Desktop, false, None),
-            "pharos: subtitle tier=desktop device=desktop reduced_motion=false remembered=none"
+            starting_tier_line(
+                Tier::Desktop,
+                DeviceClass::Desktop,
+                false,
+                None,
+                EffectsDetail::Auto
+            ),
+            "pharos: subtitle tier=desktop device=desktop reduced_motion=false remembered=none detail=auto"
         );
     }
 
@@ -4031,7 +4130,8 @@ mod tests {
                 &styled,
                 Tier::Tv,
                 EffectsLevel::Subtle,
-                SubtitleSize::Medium
+                SubtitleSize::Medium,
+                false
             )
             .as_deref(),
             Some("/videos/7/subtitles/3/stream.ass?tier=tv&effects=subtle")
@@ -4041,7 +4141,8 @@ mod tests {
                 &styled,
                 Tier::Desktop,
                 EffectsLevel::Full,
-                SubtitleSize::Medium
+                SubtitleSize::Medium,
+                false
             )
             .as_deref(),
             Some("/videos/7/subtitles/3/stream.ass?tier=desktop&effects=full")
@@ -4052,26 +4153,56 @@ mod tests {
                 &styled,
                 Tier::Tv,
                 EffectsLevel::Subtle,
-                SubtitleSize::ExtraLarge
+                SubtitleSize::ExtraLarge,
+                false
             )
             .as_deref(),
             Some("/videos/7/subtitles/3/stream.ass?tier=tv&effects=subtle&size=150")
         );
         assert_eq!(
-            styled_track_url(&styled, Tier::Tv, EffectsLevel::Subtle, SubtitleSize::Small)
-                .as_deref(),
+            styled_track_url(
+                &styled,
+                Tier::Tv,
+                EffectsLevel::Subtle,
+                SubtitleSize::Small,
+                false
+            )
+            .as_deref(),
             Some("/videos/7/subtitles/3/stream.ass?tier=tv&effects=subtle&size=75")
         );
         assert_eq!(
-            styled_track_url(&styled, Tier::Low, EffectsLevel::Off, SubtitleSize::Large),
+            styled_track_url(
+                &styled,
+                Tier::Low,
+                EffectsLevel::Off,
+                SubtitleSize::Large,
+                false
+            ),
             None
+        );
+        assert_eq!(
+            styled_track_url(
+                &styled,
+                Tier::Tv,
+                EffectsLevel::Subtle,
+                SubtitleSize::Small,
+                true
+            )
+            .as_deref(),
+            Some("/videos/7/subtitles/3/stream.ass?tier=tv&effects=subtle&size=75&speakers=1")
         );
         let source = Track {
             styled_url: None,
             ..styled
         };
         assert_eq!(
-            styled_track_url(&source, Tier::Tv, EffectsLevel::Full, SubtitleSize::Large),
+            styled_track_url(
+                &source,
+                Tier::Tv,
+                EffectsLevel::Full,
+                SubtitleSize::Large,
+                false
+            ),
             None
         );
     }

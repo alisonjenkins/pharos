@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 use crate::plan::{EffectPlan, Intent, Karaoke, LineEffect, Placement};
 use crate::signals::{LineSignals, Segment, SegmentKind, SungLine, TrackSignals};
 use crate::source::SourceLine;
+use crate::speakers;
 use crate::text::unwrap_marks;
 use crate::timing;
 use crate::version::DIRECTOR_VERSION;
@@ -30,6 +31,8 @@ pub struct Direction {
     /// Median aligner score of the opening and ending lines, `None` when the
     /// aligner was not asked; what [`MIN_SUNG_SCORE`] is calibrated against.
     pub sung_score: Option<f32>,
+    /// Speakers given a palette slot.
+    pub speakers: usize,
 }
 
 /// Where a karaoke line's fill timings came from (B1212).
@@ -225,8 +228,16 @@ pub fn direct(lines: &[SourceLine], signals: &TrackSignals, segments: &[Segment]
     let rest = medians[Class::Rest as usize];
     let caps_track = is_caps_track(lines);
 
-    let sung_score = sung_score(&kinds, &signals.sung);
-    let sung_track = sung_score.map(|s| s >= MIN_SUNG_SCORE);
+    let songs = [SegmentKind::Intro, SegmentKind::Outro];
+    let overall_score = sung_score(&kinds, &signals.sung, &songs);
+    // Each song is judged on its own lines: a translated ending must not
+    // pace a sung opening, nor the other way round.
+    let sung_track = |kind| sung_score(&kinds, &signals.sung, &[kind]).map(|s| s >= MIN_SUNG_SCORE);
+    let song_tracks = [
+        sung_track(SegmentKind::Intro),
+        sung_track(SegmentKind::Outro),
+    ];
+    let speakers = speakers::slots(lines);
 
     let mut out = Vec::with_capacity(lines.len());
     let mut counts: BTreeMap<Intent, usize> = BTreeMap::new();
@@ -236,8 +247,14 @@ pub fn direct(lines: &[SourceLine], signals: &TrackSignals, segments: &[Segment]
         let med = medians[class_of(kinds[i]) as usize];
         let mut fx = decide(line, kinds[i], audio[i], med, caps_track);
         fx.line = i;
+        fx.speaker = speakers[i];
         let sung = signals.sung.get(i).and_then(Option::as_ref);
-        if let Some(timing) = time_karaoke(&mut fx, line, kinds[i], sung, sung_track) {
+        let song_track = match kinds[i] {
+            Some(SegmentKind::Intro) => song_tracks[0],
+            Some(SegmentKind::Outro) => song_tracks[1],
+            _ => None,
+        };
+        if let Some(timing) = time_karaoke(&mut fx, line, kinds[i], sung, song_track) {
             *karaoke.entry(timing).or_insert(0) += 1;
         }
         if spans_cut(line, &signals.cuts_ms)
@@ -265,13 +282,18 @@ pub fn direct(lines: &[SourceLine], signals: &TrackSignals, segments: &[Segment]
         },
         bottom_text,
         karaoke,
-        sung_score,
+        sung_score: overall_score,
+        speakers: speakers
+            .iter()
+            .flatten()
+            .max()
+            .map_or(0, |&s| usize::from(s) + 1),
     }
 }
 
 /// The lines worth asking the aligner about (B1212): inside an intro or
-/// outro, not typeset, with no `\k` of their own, and with a Latin letter
-/// (the aligner times romanised text only).
+/// outro, not typeset, not ending before they start, with no `\k` of their
+/// own, and with a Latin letter (the aligner times romanised text only).
 pub fn sung_candidates(lines: &[SourceLine], segments: &[Segment]) -> Vec<usize> {
     lines
         .iter()
@@ -281,6 +303,7 @@ pub fn sung_candidates(lines: &[SourceLine], segments: &[Segment]) -> Vec<usize>
                 segment_of(l, segments),
                 Some(SegmentKind::Intro | SegmentKind::Outro)
             ) && !l.typeset
+                && l.end_ms >= l.start_ms
                 && l.karaoke.is_none()
                 && l.text.chars().any(|c| c.is_ascii_alphabetic())
         })
@@ -288,12 +311,17 @@ pub fn sung_candidates(lines: &[SourceLine], segments: &[Segment]) -> Vec<usize>
         .collect()
 }
 
-/// Median score of the opening and ending lines the aligner answered for.
-fn sung_score(kinds: &[Option<SegmentKind>], sung: &[Option<SungLine>]) -> Option<f32> {
+/// Median score of the lines in segments of `of` that the aligner answered
+/// for.
+fn sung_score(
+    kinds: &[Option<SegmentKind>],
+    sung: &[Option<SungLine>],
+    of: &[SegmentKind],
+) -> Option<f32> {
     let mut scores: Vec<f32> = kinds
         .iter()
         .zip(sung)
-        .filter(|(k, _)| matches!(k, Some(SegmentKind::Intro | SegmentKind::Outro)))
+        .filter(|(k, _)| k.is_some_and(|k| of.contains(&k)))
         .filter_map(|(_, s)| s.as_ref()?.score)
         .filter(|s| s.is_finite())
         .collect();
@@ -327,7 +355,11 @@ fn time_karaoke(
         return None;
     }
     let aligned = match (sung_track, sung) {
-        (Some(true), Some(s)) => timing::aligned(line, s).map(|syl| (syl, s.score)),
+        // The song's median says its words are sung; the line's own score
+        // says this line's are, so a stray translation line stays paced.
+        (Some(true), Some(s)) if s.score.is_some_and(|v| v >= MIN_SUNG_SCORE) => {
+            timing::aligned(line, s).map(|syl| (syl, s.score))
+        }
         _ => None,
     };
     let (timing, syllables, why) = match aligned {
@@ -388,6 +420,7 @@ fn effect(intent: Intent, intensity: u8, reason: String) -> LineEffect {
         reason,
         static_only: false,
         syllables: None,
+        speaker: None,
     }
 }
 
@@ -890,6 +923,7 @@ mod tests {
             typeset: false,
             karaoke: None,
             style_def: None,
+            speaker: None,
         }
     }
 
@@ -1467,6 +1501,92 @@ mod tests {
     /// B1212: the aligner times a song whose words are what is sung; a
     /// translation, or a line it could not place, is paced instead.
     #[test]
+    fn each_song_is_judged_on_its_own_lines() {
+        let mut lines = vec![line("Run away"); 4];
+        for l in &mut lines[2..] {
+            l.start_ms += 80_000;
+            l.end_ms += 80_000;
+        }
+        let at = |score: f32, base: i64| {
+            Some(SungLine {
+                words: vec![(0, base + 10_200), (4, base + 10_700), (8, base + 11_500)],
+                score: Some(score),
+            })
+        };
+        let segments = [
+            Segment {
+                kind: SegmentKind::Intro,
+                start_ms: 0,
+                end_ms: 60_000,
+            },
+            Segment {
+                kind: SegmentKind::Outro,
+                start_ms: 60_000,
+                end_ms: 120_000,
+            },
+        ];
+        // A sung opening and a translated ending: the overall median would
+        // fall either way, but each song keeps its own verdict.
+        let d = direct(
+            &lines,
+            &TrackSignals {
+                sung: vec![at(0.8, 0), at(0.7, 0), at(0.1, 80_000), at(0.05, 80_000)],
+                ..TrackSignals::default()
+            },
+            &segments,
+        );
+        let reasons: Vec<&str> = d.plan.lines.iter().map(|l| l.reason.as_str()).collect();
+        assert!(reasons[0].contains("timing=aligned"), "{reasons:?}");
+        assert!(reasons[1].contains("timing=aligned"), "{reasons:?}");
+        assert!(
+            reasons[2].ends_with("timing=paced why=translated"),
+            "{reasons:?}"
+        );
+        assert!(
+            reasons[3].ends_with("timing=paced why=translated"),
+            "{reasons:?}"
+        );
+    }
+
+    #[test]
+    fn a_low_scoring_line_in_a_sung_song_is_paced() {
+        let lines = vec![line("Run away"), line("Run away"), line("Run away")];
+        let at = |score: f32| {
+            Some(SungLine {
+                words: vec![(0, 10_200), (4, 10_700), (8, 11_500)],
+                score: Some(score),
+            })
+        };
+        let intro = [Segment {
+            kind: SegmentKind::Intro,
+            start_ms: 0,
+            end_ms: 60_000,
+        }];
+        let d = direct(
+            &lines,
+            &TrackSignals {
+                sung: vec![at(0.8), at(0.1), at(0.7)],
+                ..TrackSignals::default()
+            },
+            &intro,
+        );
+        assert_eq!(d.sung_score, Some(0.7));
+        let reasons: Vec<&str> = d.plan.lines.iter().map(|l| l.reason.as_str()).collect();
+        assert!(
+            reasons[0].ends_with("timing=aligned score=0.80"),
+            "{reasons:?}"
+        );
+        assert!(
+            reasons[1].ends_with("timing=paced why=unaligned"),
+            "{reasons:?}"
+        );
+        assert!(
+            reasons[2].ends_with("timing=aligned score=0.70"),
+            "{reasons:?}"
+        );
+    }
+
+    #[test]
     fn sung_lines_are_timed_from_the_aligner_when_the_words_match() {
         let lines = vec![line("Run away"), line("Run away"), line("[door slams]")];
         let at = |score: f32| {
@@ -1552,11 +1672,15 @@ mod tests {
             line("走れ"),
             line("Run away"),
             line("Run away"),
+            line("Run away"),
         ];
         lines[1].typeset = true;
         lines[3].karaoke = Some(vec![]);
         lines[4].start_ms = 70_000;
         lines[4].end_ms = 72_000;
+        // Ends before it starts: no span to align over.
+        lines[5].start_ms = 12_000;
+        lines[5].end_ms = 11_000;
         let intro = [Segment {
             kind: SegmentKind::Intro,
             start_ms: 0,
@@ -1689,6 +1813,21 @@ mod tests {
         assert_eq!(case("[boom]").run().reason, "rule=sfx");
         let plain = case("Hello again").run();
         assert!(plain.reason.starts_with("rule=plain"), "{}", plain.reason);
+    }
+
+    #[test]
+    fn recurring_speakers_get_slots_in_the_plan() {
+        let lines: Vec<SourceLine> = ["Ann", "Bo", "Ann", "Ann", ""]
+            .into_iter()
+            .map(|who| SourceLine {
+                speaker: (!who.is_empty()).then(|| who.to_owned()),
+                ..line("Hi")
+            })
+            .collect();
+        let d = direct(&lines, &TrackSignals::default(), &[]);
+        let slots: Vec<Option<u8>> = d.plan.lines.iter().map(|l| l.speaker).collect();
+        assert_eq!(slots, [Some(0), None, Some(0), Some(0), None]);
+        assert_eq!(d.speakers, 1);
     }
 
     #[test]

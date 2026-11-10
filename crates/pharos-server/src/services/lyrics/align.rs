@@ -40,6 +40,11 @@ const MIN_ALIGNER_VERSION: u32 = 2;
 /// long before timing out.
 const TIMEOUT: Duration = Duration::from_secs(600);
 
+/// How long the styling job waits for an item's sung lines: an opening and
+/// an ending are a few minutes of audio, tens of seconds of CPU (ADR-0066),
+/// and a stalled aligner must not hold the styling queue for [`TIMEOUT`].
+const SING_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// How long a song whose alignment failed is left alone, so a file the
 /// aligner cannot read is not sent again on every poll.
 const RETRY_AFTER: Duration = Duration::from_secs(60 * 60);
@@ -243,6 +248,21 @@ pub struct Aligner {
 }
 
 impl Aligner {
+    /// An aligner at `base` for files under `media_root`, with no worker
+    /// behind its queue; for other modules' tests.
+    #[cfg(test)]
+    pub(crate) fn for_tests(base: String, media_root: PathBuf) -> Aligner {
+        Aligner {
+            http: crate::http_client::client(),
+            base,
+            media_root,
+            cache: AlignCache::new(None),
+            pending: Mutex::new(HashSet::new()),
+            failed: Mutex::default(),
+            tx: mpsc::channel(1).0,
+        }
+    }
+
     /// Start the aligner background worker and return a shared handle.
     pub fn start(url: String, media_root: PathBuf, cache_dir: Option<PathBuf>) -> Arc<Self> {
         let ua = format!(
@@ -297,7 +317,7 @@ impl Aligner {
     }
 
     async fn process_job(&self, job: &Job) -> Result<(), String> {
-        let aligned = self.request(&job.path, &job.lines).await?;
+        let aligned = self.request(&job.path, &job.lines, TIMEOUT).await?;
         tracing::info!(
             media.id = job.id,
             lines = job.lines.len(),
@@ -309,7 +329,12 @@ impl Aligner {
     }
 
     /// One `POST /align` for `lines` of the media-relative `path`.
-    async fn request(&self, path: &str, lines: &[(u64, u64, String)]) -> Result<Aligned, String> {
+    async fn request(
+        &self,
+        path: &str,
+        lines: &[(u64, u64, String)],
+        timeout: Duration,
+    ) -> Result<Aligned, String> {
         #[derive(Serialize)]
         struct AlignRequest<'a> {
             path: &'a str,
@@ -338,7 +363,7 @@ impl Aligner {
         };
 
         let url = format!("{}/align", self.base);
-        let mut request = self.http.post(&url).json(&payload);
+        let mut request = self.http.post(&url).json(&payload).timeout(timeout);
         if let Some(traceparent) = crate::obs::traceparent(&tracing::Span::current()) {
             request = request.header("traceparent", traceparent);
         }
@@ -382,11 +407,13 @@ impl Aligner {
             })?;
         let key = cache_key(&["subtitle"], rel, &item.path, lines);
         if let Some(hit) = self.cache.get(item.id, &key) {
-            if hit.lines.len() == lines.len() {
+            // No score at all is an aligner from before scores: ask again, so
+            // a scoring aligner deployed since is heard.
+            if hit.lines.len() == lines.len() && hit.scores.iter().any(Option::is_some) {
                 return Ok(hit);
             }
         }
-        let aligned = self.request(rel, lines).await?;
+        let aligned = self.request(rel, lines, SING_TIMEOUT).await?;
         self.cache.put(item.id, key, aligned.clone());
         Ok(aligned)
     }
@@ -945,6 +972,32 @@ mod tests {
         };
         assert!(aligner.sing(&outside, &lines).await.is_err());
         assert!(aligner.sing(&item, &[]).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn an_unscored_cached_answer_is_asked_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let media_root = dir.path().join("media");
+        std::fs::create_dir_all(&media_root).unwrap();
+        let file = media_root.join("episode.mkv");
+        std::fs::write(&file, b"x").unwrap();
+        let (base, hits) = fake_service(
+            r#"{"offset_ms": 0, "aligner_version": 3, "lines": [
+                {"words": [{"at": 0, "start_ms": 1200}, {"at": 8, "start_ms": 1900}]}
+            ]}"#,
+        )
+        .await;
+        let (tx, _rx) = mpsc::channel(1);
+        let mut aligner = test_aligner(media_root, AlignCache::new(None), tx);
+        aligner.base = base;
+        let item = MediaItem {
+            kind: pharos_core::MediaKind::Episode,
+            ..sample_item(file)
+        };
+        let lines = vec![(1000, 2500, "Run away".to_owned())];
+        assert_eq!(aligner.sing(&item, &lines).await.unwrap().scores, [None]);
+        aligner.sing(&item, &lines).await.unwrap();
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     #[test]
