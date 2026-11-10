@@ -6,36 +6,19 @@
 //! hands reqwest a preconfigured rustls config. A plain `Client::new()` would
 //! panic: with `rustls-no-provider` there is no crypto provider to fall back on.
 
-use std::sync::{Arc, OnceLock};
-
-/// The rustls config every outbound client shares: ring, rustls's default
-/// protocol versions, the webpki root set, and ALPN for HTTP/1.1 (the only
-/// version the workspace enables).
-fn tls_config() -> Result<rustls::ClientConfig, rustls::Error> {
-    let roots = rustls::RootCertStore {
-        roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
-    };
-    let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(
-        rustls::crypto::ring::default_provider(),
-    ))
-    .with_safe_default_protocol_versions()?
-    .with_root_certificates(roots)
-    .with_no_client_auth();
-    config.alpn_protocols = vec![b"http/1.1".to_vec()];
-    Ok(config)
-}
+use std::sync::OnceLock;
 
 /// Built once: the root store copy and provider setup are the same for every
 /// client.
 fn shared_tls_config() -> Option<&'static rustls::ClientConfig> {
     static CONFIG: OnceLock<Option<rustls::ClientConfig>> = OnceLock::new();
     CONFIG
-        .get_or_init(|| match tls_config() {
+        .get_or_init(|| match pharos_api::tls::client_config() {
             Ok(config) => Some(config),
             Err(error) => {
                 tracing::error!(
                     error = %error,
-                    "outbound TLS config failed to build; installing ring as the process default instead"
+                    "outbound TLS config failed to build; clients fall back to reqwest's verifier with ring as the process default"
                 );
                 None
             }
@@ -73,13 +56,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tls_config_uses_ring_webpki_roots_and_http1_alpn() {
-        let config = tls_config().unwrap_or_else(|e| panic!("tls config: {e}"));
-        assert_eq!(config.alpn_protocols, vec![b"http/1.1".to_vec()]);
-        assert_eq!(
-            config.crypto_provider().cipher_suites,
-            rustls::crypto::ring::default_provider().cipher_suites
-        );
+    fn shared_config_is_built() {
+        assert!(shared_tls_config().is_some());
     }
 
     #[test]
