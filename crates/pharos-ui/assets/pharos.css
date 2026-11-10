@@ -421,6 +421,9 @@ input:focus-visible {
   justify-content: center;
   align-items: flex-start;
   padding: 12vh 1rem 1rem;
+  /* The dynamic viewport, so a phone's on-screen keyboard and toolbars do
+     not push the list off screen (FR-213, A24). */
+  padding-top: 12dvh;
 }
 .pharos-palette-backdrop {
   position: absolute;
@@ -434,6 +437,7 @@ input:focus-visible {
   flex-direction: column;
   width: min(36rem, 100%);
   max-height: 70vh;
+  max-height: 70dvh;
   border: var(--px-border) solid var(--px-color-border);
   border-radius: var(--px-radius);
   background: var(--px-color-surface-raised);
@@ -451,8 +455,11 @@ input:focus-visible {
   font: inherit;
   font-size: var(--px-type-step-1);
 }
+/* The box is where typing goes, so it shows that it has the focus. Inset,
+   inside the box's rounded top, so the list's edge does not cut it. */
 .pharos-palette-box input:focus-visible {
-  outline: none;
+  outline: 2px solid var(--px-color-focus);
+  outline-offset: -2px;
 }
 .pharos-palette-list {
   overflow-y: auto;
