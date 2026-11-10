@@ -132,6 +132,12 @@ pub fn pause(_video_id: &str) {}
 
 pub fn set_rate(_video_id: &str, _rate: f64) {}
 
+pub fn set_speed(_video_id: &str, _rate: f64) {}
+
+pub fn speed(_video_id: &str) -> f64 {
+    1.0
+}
+
 pub fn unix_ms() -> i64 {
     0
 }
