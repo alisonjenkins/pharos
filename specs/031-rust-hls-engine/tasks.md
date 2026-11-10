@@ -4,10 +4,8 @@
 
 ## Slice 0 - Baseline (measurements only, no player change)
 
-- [ ] T031-01 Corpus: record master, media playlists, init and first media segments for an H.264 CMAF film, a VP9 film and an audio-only item from a dev server into `crates/pharos-hls/tests/corpus/` (small clips only, under 2 MB in all). (audited 2026-11-09: no `crates/pharos-hls/tests/` dir; open)
+- [x] T031-01 Corpus: record master, media playlists, init and first media segments for an H.264 CMAF film, a VP9 film and an audio-only item from a dev server into `crates/pharos-hls/tests/corpus/` (small clips only, under 2 MB in all). `scripts/record-hls-corpus.py` records it (about 1.3 MB) and `tests/it_corpus` reads it. The audio-only item is muxed MPEG-TS, which the Rust engine leaves to hls.js.
 - [x] T031-02 Playwright harness that plays one stream for N seconds on a named engine and writes JSON: time to first frame, seek-to-playing time, buffered ranges every second, long tasks, JS heap. Runs in Chromium and Firefox, muted. `tests/dioxus/hls-bench.spec.ts` with `playwright.hls-bench.config.ts`, off unless `PHAROS_HLS_BENCH=1`; long tasks and heap are Chromium only (Firefox has neither API).
-- [ ] T031-01 Corpus: record master, media playlists, init and first media segments for an H.264 CMAF film, a VP9 film and an audio-only item from a dev server into `crates/pharos-hls/tests/corpus/` (small clips only, under 2 MB in all). (2026-11-10: H.264 CMAF and VP9 recorded by `scripts/record-hls-corpus.py`, read by `tests/it_corpus`; audio-only still open, as the seeded server has no audio-only item the test user can list. See the corpus README.)
-- [ ] T031-02 Playwright harness that plays one stream for N seconds on a named engine and writes JSON: time to first frame, seek-to-playing time, buffered ranges every second, long tasks, JS heap. Runs in Chromium and Firefox, muted.
 - [ ] T031-03 hls.js baseline on Chromium, Firefox, Quest, Steam Frame and the G08 (device runs by hand via CDP/WebView debugging); results table appended to this file with ISO 8601 UTC timestamps.
 
 ## Slice 1 - Seam (V630)
