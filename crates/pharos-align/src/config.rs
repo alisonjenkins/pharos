@@ -17,6 +17,8 @@ pub const DEFAULT_THREADS: usize = 8;
 /// About 62 s of 16 kHz audio a forward pass: every offset probe of a
 /// typical song in one pass, with peak RSS inside 2.6 GiB (spec 039, R19).
 pub const DEFAULT_BATCH_SAMPLES: usize = 1_000_000;
+/// Spec 039, R14; the chart mounts a persistent volume here.
+pub const DEFAULT_CACHE_DIR: &str = "/var/cache/pharos-aligner";
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
@@ -33,9 +35,8 @@ pub struct Config {
     /// Most samples one forward pass holds.
     pub batch_samples: usize,
     pub device: DeviceMode,
-    /// Where the GPU pass keeps compiled kernels between restarts; `None`
-    /// compiles them afresh in every process.
-    pub cache_dir: Option<PathBuf>,
+    /// Where the GPU pass keeps compiled kernels between restarts.
+    pub cache_dir: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -146,7 +147,9 @@ impl Config {
             pin,
             batch_samples,
             device,
-            cache_dir: set(get("PHAROS_ALIGNER_CACHE_DIR")).map(PathBuf::from),
+            cache_dir: PathBuf::from(
+                set(get("PHAROS_ALIGNER_CACHE_DIR")).unwrap_or_else(|| DEFAULT_CACHE_DIR.into()),
+            ),
         })
     }
 }
@@ -180,7 +183,7 @@ mod tests {
         assert_eq!(c.pin, PinMode::Auto);
         assert_eq!(c.batch_samples, 1_000_000);
         assert_eq!(c.device, DeviceMode::Auto);
-        assert_eq!(c.cache_dir, None);
+        assert_eq!(c.cache_dir, PathBuf::from("/var/cache/pharos-aligner"));
     }
 
     #[test]
@@ -199,7 +202,7 @@ mod tests {
         ]))
         .unwrap();
         assert_eq!(c.device, DeviceMode::Cpu);
-        assert_eq!(c.cache_dir, Some(PathBuf::from("/var/cache/aligner")));
+        assert_eq!(c.cache_dir, PathBuf::from("/var/cache/aligner"));
         assert_eq!(c.pin, PinMode::Off);
         assert_eq!(c.batch_samples, 48_000);
         assert_eq!((c.host.as_str(), c.port, c.threads), ("127.0.0.1", 9000, 4));
