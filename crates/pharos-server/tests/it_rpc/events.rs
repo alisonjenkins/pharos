@@ -31,6 +31,9 @@ enum Got {
     Task {
         seq: u64,
         id: String,
+        state: String,
+        /// added, changed, removed, failed roots.
+        counts: [u32; 4],
     },
     Resync {
         seq: u64,
@@ -101,10 +104,20 @@ impl server::event_sink::Handler for TestSink {
                         })
                         .collect(),
                 },
-                event::Task(t) => Got::Task {
-                    seq,
-                    id: t?.get_id()?.to_string()?,
-                },
+                event::Task(t) => {
+                    let t = t?;
+                    Got::Task {
+                        seq,
+                        id: t.get_id()?.to_string()?,
+                        state: t.get_state()?.to_string()?,
+                        counts: [
+                            t.get_added(),
+                            t.get_changed(),
+                            t.get_removed(),
+                            t.get_failed_roots(),
+                        ],
+                    }
+                }
                 event::Resync(()) => Got::Resync { seq },
             };
             let _ = self.0.send(got);
@@ -348,6 +361,48 @@ async fn only_the_asked_topics_arrive() {
             let (_tasks, mut trx) = subscribe(&s, &["task"], 0).await.unwrap();
             fx.state.notify_refresh_progress("lib", 20.0);
             assert!(matches!(next(&mut trx).await, Got::Task { id, .. } if id == "lib"));
+        })
+        .await;
+}
+
+/// A whole-library scan arrives on the task topic and ends with what it did.
+/// Disarm check: with the counts not written in the encoder, the end frame
+/// reads all zero.
+#[actix_web::test]
+async fn a_finished_scan_arrives_with_its_counts() {
+    use pharos_server::scan_tasks::{ScanOutcome, ScanTally, TASK_REFRESH_LIBRARY};
+    let fx = seed_rich().await;
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let s = session_for(&connect(&fx), &fx.user_token).await;
+            let (_sub, mut rx) = subscribe(&s, &["task"], 0).await.unwrap();
+            fx.state.notify_scan_progress(40.0, None);
+            match next(&mut rx).await {
+                Got::Task {
+                    id, state, counts, ..
+                } => {
+                    assert_eq!(id, TASK_REFRESH_LIBRARY);
+                    assert_eq!(state, "running");
+                    assert_eq!(counts, [0; 4]);
+                }
+                other => panic!("expected scan progress, got {other:?}"),
+            }
+            let tally = ScanTally {
+                roots: 2,
+                failed_roots: 1,
+                added: 5,
+                changed: 3,
+                removed: 2,
+            };
+            fx.state
+                .notify_scan_progress(100.0, Some((ScanOutcome::Partial, tally)));
+            match next(&mut rx).await {
+                Got::Task { state, counts, .. } => {
+                    assert_eq!(state, "partial");
+                    assert_eq!(counts, [5, 3, 2, 1]);
+                }
+                other => panic!("expected the scan's end, got {other:?}"),
+            }
         })
         .await;
 }

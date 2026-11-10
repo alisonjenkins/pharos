@@ -1198,7 +1198,7 @@ pub(crate) fn translate_broadcast(b: SocketBroadcast) -> Option<Outbound> {
                 .to_string();
             translate_session_command(session_id, controlling_user_id, command, arg)
         }
-        SocketBroadcast::CastChanged => None,
+        SocketBroadcast::CastChanged | SocketBroadcast::ScanProgress { .. } => None,
         SocketBroadcast::SessionsChanged => Some(Outbound::new(
             "Sessions",
             serde_json::Value::Array(Vec::new()),
