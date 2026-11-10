@@ -129,7 +129,9 @@ pub fn ScanBar(scan: ScanView) -> Element {
     if let Some(fraction) = scan.running {
         let p = percent(fraction);
         return rsx! {
-            div { class: "pharos-scan-status", role: "status",
+            // No live region: the bar's own value is exposed, and a status
+            // line would be read out at every percent.
+            div { class: "pharos-scan-status",
                 progress {
                     class: "pharos-scan-bar",
                     max: "100",
@@ -163,7 +165,7 @@ pub fn ScanBar(scan: ScanView) -> Element {
 pub fn LibraryScanBar(name: String, fraction: f32) -> Element {
     let p = percent(fraction);
     rsx! {
-        div { class: "pharos-scan-status pharos-library-scan", role: "status",
+        div { class: "pharos-scan-status pharos-library-scan",
             progress {
                 class: "pharos-scan-bar",
                 max: "100",
