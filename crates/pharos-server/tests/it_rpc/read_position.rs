@@ -63,12 +63,23 @@ async fn save(
     locator: &str,
     fraction: f32,
 ) -> Result<Saved, String> {
+    save_at(session, id, locator, fraction, 0).await
+}
+
+async fn save_at(
+    session: &session::Client,
+    id: WireId,
+    locator: &str,
+    fraction: f32,
+    read_at_ms: i64,
+) -> Result<Saved, String> {
     let user_data = session.user_data_request().send().pipeline.get_user_data();
     let mut req = user_data.set_read_position_request();
     req.get().init_ctx();
     set_id(req.get().init_id(), id);
     req.get().set_locator(locator);
     req.get().set_fraction(fraction);
+    req.get().set_read_at(read_at_ms);
     let reply = req.send().promise.await.expect("setReadPosition");
     match reply.get().unwrap().get_result().unwrap().which().unwrap() {
         user_state_result::State(s) => {
@@ -403,8 +414,16 @@ async fn a_part_read_book_is_listed_until_played() {
             assert_eq!(home_reading(&session).await.0, Vec::<u64>::new());
             assert_eq!(resume_ids(&session, &[Kind::Book]).await, Vec::<u64>::new());
 
-            save(&session, WireId::Real(EPUB), "a", 0.2).await.unwrap();
-            // Reads are stamped in unix seconds; step past the first.
+            save_at(
+                &session,
+                WireId::Real(EPUB),
+                "a",
+                0.2,
+                (now_secs() - 10) * 1000,
+            )
+            .await
+            .unwrap();
+            // Reads are stamped in unix seconds; this one is newer.
             fx.state
                 .stores
                 .set_read_position(
@@ -413,7 +432,7 @@ async fn a_part_read_book_is_listed_until_played() {
                     pharos_core::ReadPosition {
                         locator: "b".into(),
                         fraction: 0.4,
-                        updated_at: i64::MAX / 2,
+                        updated_at: now_secs(),
                     },
                 )
                 .await
@@ -447,6 +466,109 @@ async fn a_part_read_book_is_listed_until_played() {
             assert_eq!(again, 1);
         })
         .await;
+}
+
+/// V1131: of two readings, the one read last is kept, whichever arrives last.
+/// A save that loses is answered with the stored position, not an error,
+/// counts as `stale`, and never marks the book played.
+#[actix_web::test]
+async fn the_newest_reading_wins_whatever_arrives_last() {
+    let fx = crate::common::seed_rich().await;
+    seed_books(&fx).await;
+    let logs = Captured::default();
+    let _log = tracing::subscriber::set_default(subscriber(&logs));
+    let recorder = metrics_util::debugging::DebuggingRecorder::new();
+    let snapshotter = pharos_test_metrics::snapshotter(&recorder);
+    let _metrics = metrics::set_default_local_recorder(&recorder);
+    let book = WireId::Real(EPUB);
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let client = connect(&fx);
+            let session = session_for(&client, &fx.user_token).await;
+            let ago = |secs: i64| (now_secs() - secs) * 1000;
+            // Read on the desktop 100 s ago, then the phone uploads a reading
+            // from 1000 s ago, and one that finishes the book from 500 s ago.
+            assert_eq!(
+                save_at(&session, book, "desktop", 0.3, ago(100)).await,
+                Ok((false, "desktop".to_owned(), 0.3, 0))
+            );
+            assert_eq!(
+                save_at(&session, book, "phone", 0.6, ago(1000)).await,
+                Ok((false, "desktop".to_owned(), 0.3, 0)),
+                "an older reading must not replace the newer one"
+            );
+            assert_eq!(
+                save_at(&session, book, "phone-end", 1.0, ago(500)).await,
+                Ok((false, "desktop".to_owned(), 0.3, 0)),
+                "a stale finishing reading must not mark the book played"
+            );
+            assert_eq!(stores_play_count(&fx, EPUB).await, 0);
+            // A newer reading from the phone replaces it.
+            assert_eq!(
+                save_at(&session, book, "phone-new", 0.5, ago(10)).await,
+                Ok((false, "phone-new".to_owned(), 0.5, 0))
+            );
+        })
+        .await;
+    let outcome = |o| {
+        counter(
+            &snapshotter,
+            "pharos_read_position_total",
+            &[("outcome", o)],
+        )
+    };
+    assert_eq!((outcome("stale"), outcome("saved")), (2, 2));
+    assert_eq!(outcome("finished"), 0);
+    let text = logs.text();
+    assert!(
+        text.contains("older than the stored") && text.contains(&format!("media.id={EPUB}")),
+        "{text}"
+    );
+}
+
+/// FR-002: a time ahead of the server's clock counts as now, so it cannot
+/// outrank later readings; 0 (old clients) is now.
+#[actix_web::test]
+async fn a_future_read_time_counts_as_now_and_zero_is_now() {
+    let fx = crate::common::seed_rich().await;
+    seed_books(&fx).await;
+    let book = WireId::Real(EPUB);
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let client = connect(&fx);
+            let session = session_for(&client, &fx.user_token).await;
+            let hour_ahead = (now_secs() + 3600) * 1000;
+            save_at(&session, book, "ahead", 0.2, hour_ahead)
+                .await
+                .unwrap();
+            let kept = fx.state.stores.get_read_position(fx.user_id, EPUB).await;
+            let kept = kept.unwrap().unwrap();
+            assert!(
+                kept.updated_at <= now_secs(),
+                "a future readAt was stored as {}",
+                kept.updated_at
+            );
+            // A reading made a minute ago loses to the clamped one; an old
+            // client's (0, now) wins over it.
+            assert_eq!(
+                save_at(&session, book, "minute-ago", 0.1, (now_secs() - 60) * 1000)
+                    .await
+                    .unwrap()
+                    .1,
+                "ahead"
+            );
+            assert_eq!(
+                save(&session, book, "legacy", 0.4).await.unwrap().1,
+                "legacy"
+            );
+        })
+        .await;
+}
+
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(0))
 }
 
 async fn stores_play_count(fx: &Fixture, id: u64) -> u32 {
