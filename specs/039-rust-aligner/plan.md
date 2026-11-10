@@ -63,7 +63,7 @@ This is a port of the `cpufwd` spike with its measured choices kept.
   - `aligner.cache.storageClass`
 - The GPU is mounted as a `hostPath` at `devicePath`, as the server's `gpu.vaapi` does. The pod also gets `supplementalGroups` for the render group (gid from values).
 - `/var/cache/pharos-aligner` is a PersistentVolumeClaim.
-- The probes stay; the readiness probe passes only after warm-up.
+- The probes stay; the readiness probe passes only after warm-up. Warm-up runs before the port binds, so both Deployments also get a `/healthz` startup probe (every 10 s, 60 failures: 10 minutes), which holds off the liveness probe until the first answer.
 - A second Deployment, `aligner-shadow`, renders when `aligner.shadow.enabled`. It runs the Rust image beside the Python one during the shadow week, and the server gets `aligner_shadow_url`.
 
 ## Server change (shadow only)
