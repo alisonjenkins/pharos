@@ -27,10 +27,15 @@ CAP_MS_PER_WORD = 700
 CAP_EXTRA_MS = 2000
 
 
-def window(line: Line, n_words: int) -> tuple[int, int]:
-    """Compute audio decode window with safety margin around line LRC span."""
+def window(line: Line, n_words: int, prev_end_ms: int = 0) -> tuple[int, int]:
+    """Compute audio decode window with safety margin around line LRC span.
+
+    `prev_end_ms` is where the line before was aligned to end: the lead stops
+    there, or a line sung straight after another would take its last word.
+    """
     end_ms = min(line.end_ms, line.start_ms + n_words * CAP_MS_PER_WORD + CAP_EXTRA_MS)
-    return (max(0, line.start_ms - LEAD_MS), end_ms + MARGIN_MS)
+    start_ms = max(line.start_ms - LEAD_MS, min(prev_end_ms, line.start_ms - MARGIN_MS))
+    return (max(0, start_ms), end_ms + MARGIN_MS)
 
 
 def stamps(

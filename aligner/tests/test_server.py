@@ -99,6 +99,25 @@ def test_post_align_two_lines(running_server: tuple[str, Path]) -> None:
     assert data["lines"][1]["words"] == []
 
 
+def test_post_align_a_line_sung_straight_after_another_cannot_take_its_last_word(
+    running_server: tuple[str, Path],
+) -> None:
+    base_url, media_root = running_server
+    (media_root / "test.mp3").write_bytes(b"dummy audio content")
+    payload = {
+        "path": "test.mp3",
+        "lines": [
+            {"start_ms": 1000, "end_ms": 1100, "text": "Hello world"},
+            {"start_ms": 1100, "end_ms": 3000, "text": "next line"},
+        ],
+    }
+    with urllib.request.urlopen(_post(base_url, payload)) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    # Line 0 is aligned to end at 250 + 200 = 450; line 1's lead stops there
+    # rather than reaching back to 1100 - 750 = 350.
+    assert data["lines"][1]["words"][0] == {"at": 0, "start_ms": 450}
+
+
 def test_post_align_bad_input_400(running_server: tuple[str, Path]) -> None:
     base_url, _ = running_server
     payload = {"bad": "data"}

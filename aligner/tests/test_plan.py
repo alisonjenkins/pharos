@@ -30,6 +30,16 @@ def test_window_opens_early_enough_for_a_stamp_tapped_late() -> None:
     assert window(line, 2)[0] <= sung_from
 
 
+def test_window_lead_stops_where_the_line_before_ended() -> None:
+    line = Line(start_ms=20_000, end_ms=25_000, text="one two")
+    # The line before ended 300 ms ahead of this stamp: the lead stops there.
+    assert window(line, 2, prev_end_ms=19_700)[0] == 19_700
+    # It never opens later than the plain margin, even if the line before ran on.
+    assert window(line, 2, prev_end_ms=20_400)[0] == 19_750
+    # Long gone: the full lead.
+    assert window(line, 2, prev_end_ms=10_000)[0] == 19_250
+
+
 def test_stamps_end_stamp_and_non_decreasing() -> None:
     words_list = [Word(at=0, token="hello"), Word(at=6, token="world")]
     spans = [(100, 150), (80, 200)]
