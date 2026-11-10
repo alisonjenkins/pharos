@@ -2964,15 +2964,15 @@ mod tests {
     fn parse_series_identity_reads_all_three_lists() {
         let body = br#"{
             "RepairMode":"dry_run",
-            "Splits":[{"Folder":"/tv/Cosmos","Status":"pending",
-                "Groups":[{"SeriesKey":"/tv/Cosmos\u001f1980","Year":1980,"Paths":["/tv/Cosmos/a.mkv"]},
-                          {"SeriesKey":"/tv/Cosmos\u001f2014","Year":2014,"Paths":["/tv/Cosmos/b.mkv","/tv/Cosmos/c.mkv"]}],
-                "Moves":[{"Path":"/tv/Cosmos/b.mkv","FromKey":"/tv/Cosmos","FromYear":null,
-                          "ToKey":"/tv/Cosmos\u001f2014","ToYear":2014}]}],
+            "Splits":[{"Folder":"/tv/Show A","Status":"pending",
+                "Groups":[{"SeriesKey":"/tv/Show A\u001f1971","Year":1971,"Paths":["/tv/Show A/a.mkv"]},
+                          {"SeriesKey":"/tv/Show A\u001f1996","Year":1996,"Paths":["/tv/Show A/b.mkv","/tv/Show A/c.mkv"]}],
+                "Moves":[{"Path":"/tv/Show A/b.mkv","FromKey":"/tv/Show A","FromYear":null,
+                          "ToKey":"/tv/Show A\u001f1996","ToYear":1996}]}],
             "Flagged":[{"SeriesKey":"Fate","SeriesId":"00ff00ff00ff00ff00ff00ff00ff00ff","Name":"Fate",
                 "Provider":"tvdb","ExternalId":"81","PremiereDate":1100000000,
                 "RunnerUpId":"82","RunnerUpScore":0.8}],
-            "Overrides":[{"Id":7,"Folder":"/tv/Cosmos","Path":null,"TargetKey":"/tv/Cosmos",
+            "Overrides":[{"Id":7,"Folder":"/tv/Show A","Path":null,"TargetKey":"/tv/Show A",
                 "TargetName":null,"TargetYear":null,"Source":"admin","KeepsTogether":true,
                 "CreatedBy":"ali","CreatedAt":1700000000}]
         }"#;
@@ -2980,9 +2980,9 @@ mod tests {
         assert_eq!(v.repair_mode, "dry_run");
         assert_eq!(v.splits[0].status, "pending");
         assert_eq!(v.splits[0].groups[1].paths.len(), 2);
-        assert_eq!(v.splits[0].groups[1].year, Some(2014));
+        assert_eq!(v.splits[0].groups[1].year, Some(1996));
         assert_eq!(v.splits[0].moves[0].from_year, None);
-        assert_eq!(v.splits[0].moves[0].to_year, Some(2014));
+        assert_eq!(v.splits[0].moves[0].to_year, Some(1996));
         assert_eq!(v.flagged[0].runner_up_id.as_deref(), Some("82"));
         assert_eq!(v.flagged[0].premiere_date, Some(1_100_000_000));
         assert!(v.overrides[0].keeps_together);
@@ -3008,11 +3008,11 @@ mod tests {
     #[test]
     fn parse_show_candidates_and_fix_done() {
         let c = parse_show_candidates_response(
-            br#"[{"Provider":"tvdb","Id":"81","Name":"Cosmos","Year":1980},
-                 {"Provider":"tmdb","Id":"9","Name":"Cosmos","Year":null}]"#,
+            br#"[{"Provider":"tvdb","Id":"81","Name":"Show A","Year":1971},
+                 {"Provider":"tmdb","Id":"9","Name":"Show A","Year":null}]"#,
         )
         .unwrap();
-        assert_eq!((c[0].provider.as_str(), c[0].year), ("tvdb", Some(1980)));
+        assert_eq!((c[0].provider.as_str(), c[0].year), ("tvdb", Some(1971)));
         assert_eq!(c[1].year, None);
         let d = parse_fix_done_response(br#"{"Moved":["/a","/b"],"Rebuilding":12}"#).unwrap();
         assert_eq!(
@@ -3033,11 +3033,11 @@ mod tests {
         assert_eq!(existing["TargetKey"], "k");
         assert!(existing["TargetName"].is_null() && existing["TargetYear"].is_null());
         let fresh: serde_json::Value =
-            serde_json::from_str(&move_body("/tv/X", &paths, None, Some("X"), Some(2014))).unwrap();
+            serde_json::from_str(&move_body("/tv/X", &paths, None, Some("X"), Some(1996))).unwrap();
         assert!(fresh["TargetKey"].is_null());
         assert_eq!(
             (fresh["TargetName"].as_str(), fresh["TargetYear"].as_u64()),
-            (Some("X"), Some(2014))
+            (Some("X"), Some(1996))
         );
         assert_eq!(fresh["Paths"][0], "/a");
     }
