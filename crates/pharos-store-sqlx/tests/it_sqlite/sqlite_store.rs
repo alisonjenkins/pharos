@@ -1481,7 +1481,7 @@ async fn series_metadata_upsert_then_by_keys_roundtrips() {
         backdrop_locator: Some("cache/back.jpg".into()),
         ratings: Default::default(),
         match_flag: Some("ambiguous".into()),
-        match_runner_up_id: Some("71173".into()),
+        match_runner_up_id: Some("900001".into()),
         match_runner_up_score: Some(0.5),
     };
     s.upsert_series_metadata(meta.clone()).await.unwrap();

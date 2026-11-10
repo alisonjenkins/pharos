@@ -2855,14 +2855,14 @@ where
 {
     use pharos_core::{OverrideSource, SeriesKeyUpdate, SeriesOverride};
     const ROOT: &str = "/media/series-identity";
-    const FOLDER: &str = "/media/series-identity/The Flash";
-    let split = format!("{FOLDER}\u{1f}1990");
+    const FOLDER: &str = "/media/series-identity/Show A";
+    let split = format!("{FOLDER}\u{1f}1971");
     let ep = |id: u64, file: &str, year: Option<u32>| {
         let mut item = media_item(MediaId::from(id), file);
         item.path = format!("{FOLDER}/Season 1/{file}").into();
         item.kind = MediaKind::Episode;
         item.series = Some(SeriesInfo {
-            series_name: "The Flash".into(),
+            series_name: "Show A".into(),
             season_number: Some(1),
             episode_number: Some(1),
             series_folder: Some(FOLDER.into()),
@@ -2871,8 +2871,8 @@ where
         });
         item
     };
-    let old = ep(9_300_001, "The Flash (1990) - S01E01.mkv", None);
-    let new = ep(9_300_002, "The Flash (2014) - S01E01.mkv", None);
+    let old = ep(9_300_001, "Show A (1971) - S01E01.mkv", None);
+    let new = ep(9_300_002, "Show A (1996) - S01E01.mkv", None);
     MediaStore::put(&store, old.clone()).await.unwrap();
     MediaStore::put(&store, new.clone()).await.unwrap();
 
@@ -2892,12 +2892,12 @@ where
         SeriesKeyUpdate {
             path: rows[0].path.clone(),
             series_key: Some(split.clone()),
-            series_year: Some(1990),
+            series_year: Some(1971),
         },
         SeriesKeyUpdate {
             path: rows[1].path.clone(),
             series_key: None,
-            series_year: Some(2014),
+            series_year: Some(1996),
         },
     ];
     assert_eq!(store.set_series_keys(&updates).await.unwrap(), 2);
@@ -2916,15 +2916,15 @@ where
     let got = MediaStore::get(&store, old.id).await.unwrap();
     let series = got.series.unwrap();
     assert_eq!(series.series_key.as_deref(), Some(split.as_str()));
-    assert_eq!(series.series_year, Some(1990));
+    assert_eq!(series.series_year, Some(1971));
     let got = MediaStore::get(&store, new.id).await.unwrap();
-    assert_eq!(got.series.unwrap().series_year, Some(2014));
+    assert_eq!(got.series.unwrap().series_year, Some(1996));
 
     // A moved file (new folder) loses the old folder's split.
     let mut moved = old.clone();
     if let Some(s) = moved.series.as_mut() {
-        s.series_folder = Some(format!("{ROOT}/The Flash (1990)"));
-        s.series_year = Some(1990);
+        s.series_folder = Some(format!("{ROOT}/Show A (1971)"));
+        s.series_year = Some(1971);
     }
     MediaStore::put(&store, moved).await.unwrap();
     let got = MediaStore::get(&store, old.id).await.unwrap();
@@ -2941,8 +2941,8 @@ where
             .find(|c| c.series_key == key)
             .map(|c| c.series_year)
     };
-    assert_eq!(year_of(FOLDER), Some(Some(2014)));
-    assert_eq!(year_of(&split), Some(Some(1990)));
+    assert_eq!(year_of(FOLDER), Some(Some(1996)));
+    assert_eq!(year_of(&split), Some(Some(1971)));
 
     // Overrides: one owner row per folder and source.
     let owner = SeriesOverride {
@@ -2951,7 +2951,7 @@ where
         path: None,
         target_key: FOLDER.into(),
         target_name: None,
-        target_year: Some(2014),
+        target_year: Some(1996),
         source: OverrideSource::Scanner,
         created_by: None,
         created_at: 1_700_000_000,
@@ -2959,7 +2959,7 @@ where
     assert!(store.insert_series_override(owner.clone()).await.unwrap());
     assert!(!store
         .insert_series_override(SeriesOverride {
-            target_year: Some(1990),
+            target_year: Some(1971),
             ..owner.clone()
         })
         .await
@@ -2974,7 +2974,7 @@ where
         .unwrap());
     let all = store.series_overrides(&[FOLDER.to_string()]).await.unwrap();
     assert_eq!(all.len(), 2);
-    assert_eq!(all[0].target_year, Some(2014));
+    assert_eq!(all[0].target_year, Some(1996));
     assert_eq!(all[0].source, OverrideSource::Scanner);
     assert_eq!(all[1].source, OverrideSource::Admin);
     assert!(store.series_overrides(&[]).await.unwrap().is_empty());
@@ -2984,10 +2984,10 @@ where
         &store,
         pharos_core::SeriesMetadata {
             series_key: FOLDER.into(),
-            series_name: "The Flash".into(),
+            series_name: "Show A".into(),
             match_source: Some("search".into()),
-            // 2014-10-07T00:00:00Z
-            premiere_date: Some(1_412_640_000),
+            // 1996-10-07T00:00:00Z
+            premiere_date: Some(844_646_400),
             ..Default::default()
         },
     )
@@ -2997,7 +2997,7 @@ where
         .series_premiere_years(&[FOLDER.to_string(), split.clone()])
         .await
         .unwrap();
-    assert_eq!(years.get(FOLDER), Some(&2014));
+    assert_eq!(years.get(FOLDER), Some(&1996));
     assert_eq!(years.get(&split), None);
 
     // V892 — an episode waits for its show: eligible only once the show (by
@@ -3006,7 +3006,7 @@ where
     let need = MediaStore::items_needing_match(&store, 1000, i64::MAX)
         .await
         .unwrap();
-    assert!(!waiting(&need), "the split 1990 group has no match row yet");
+    assert!(!waiting(&need), "the split 1971 group has no match row yet");
     assert!(
         need.iter().any(|i| i.id == new.id),
         "the folder's show is matched"
@@ -3015,7 +3015,7 @@ where
         &store,
         pharos_core::SeriesMetadata {
             series_key: split.clone(),
-            series_name: "The Flash".into(),
+            series_name: "Show A".into(),
             match_source: Some("none".into()),
             ..Default::default()
         },
@@ -3051,10 +3051,10 @@ where
     // V891 — a flagged match round-trips, and the next upsert clears it.
     let flagged = pharos_core::SeriesMetadata {
         series_key: FOLDER.into(),
-        series_name: "The Flash".into(),
+        series_name: "Show A".into(),
         match_source: Some("search".into()),
         match_flag: Some("ambiguous".into()),
-        match_runner_up_id: Some("78650".into()),
+        match_runner_up_id: Some("900004".into()),
         match_runner_up_score: Some(0.25),
         ..Default::default()
     };
@@ -3070,7 +3070,7 @@ where
             .unwrap(),
     );
     assert_eq!(got.match_flag.as_deref(), Some("ambiguous"));
-    assert_eq!(got.match_runner_up_id.as_deref(), Some("78650"));
+    assert_eq!(got.match_runner_up_id.as_deref(), Some("900004"));
     assert_eq!(got.match_runner_up_score, Some(0.25));
     let keys = [FOLDER.to_string(), split.clone()];
     assert_eq!(
@@ -3130,7 +3130,7 @@ where
         vec![(new.id, 200)]
     );
     assert!(store.clear_series_reconcile(new.id, 200).await.unwrap());
-    MediaStore::set_item_match(&store, new.id, "tvdb", "279121", "manual", None, 300)
+    MediaStore::set_item_match(&store, new.id, "tvdb", "900005", "manual", None, 300)
         .await
         .unwrap();
     assert_eq!(store.mark_reconcile_items(&[new.id], 400).await.unwrap(), 0);
@@ -3382,8 +3382,8 @@ where
     .await
     .unwrap();
 
-    let manual_ep = ep(9_300_003, "The Flash - S01E02.mkv", Some(2014));
-    let search_ep = ep(9_300_004, "The Flash - S01E03.mkv", Some(2014));
+    let manual_ep = ep(9_300_003, "Show A - S01E02.mkv", Some(1996));
+    let search_ep = ep(9_300_004, "Show A - S01E03.mkv", Some(1996));
     MediaStore::put(&store, manual_ep.clone()).await.unwrap();
     MediaStore::put(&store, search_ep.clone()).await.unwrap();
     MediaStore::set_item_match(
