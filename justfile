@@ -484,6 +484,10 @@ tilt-down delete="0":
 helm-lint:
     nix develop --command helm lint charts/pharos
 
+# Render the aligner with its options on and off and check each (spec 039, V1265).
+helm-test:
+    nix develop --command bash scripts/test-chart-aligner.sh
+
 # Render the chart to stdout (override values with `args`, e.g.
 # `just helm-template '--set ui.enabled=false'`).
 helm-template *args:

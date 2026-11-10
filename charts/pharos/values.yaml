@@ -335,6 +335,24 @@ aligner:
       memory: 2Gi
     limits:
       memory: 6Gi
+  # Spec 039 (the Rust image, ghcr.io/alisonjenkins/pharos-aligner-rs):
+  # PHAROS_ALIGNER_DEVICE, auto (default when empty), vulkan or cpu.
+  device: ""
+  # A GPU for the Rust image's Vulkan pass, from a device plugin.
+  gpu:
+    enabled: false
+    # The generic-device-plugin's render node resource.
+    resourceName: devic.es/dri
+    count: 1
+    # The render node's group on the node (e.g. [303]), so the non-root
+    # user may open /dev/dri/renderD*.
+    supplementalGroups: []
+  # Compiled GPU kernels kept across restarts (R14): without it each new pod
+  # compiles them again, ~25 s more before it is ready.
+  cache:
+    enabled: false
+    size: 1Gi
+    storageClass: ""
 
 # pharos-ui sidecar: the old angie image serving the bundle under /ui/.
 # Superseded by ADR-0033 (pharos serves the UI itself via config.server.uiDir);
