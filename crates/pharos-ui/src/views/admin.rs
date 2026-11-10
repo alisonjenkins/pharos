@@ -78,6 +78,11 @@ pub enum AdminAction {
         unlock: Vec<String>,
     },
     LibraryRefresh,
+    /// Scan one library, by its item id; `name` is for the status line.
+    ScanLibrary {
+        item_id: String,
+        name: String,
+    },
     Refresh,
     SelectTab(AdminTab),
     /// The status line's Dismiss.
@@ -366,6 +371,9 @@ pub struct AdminViewProps {
     /// The item open in the Metadata tab's form.
     #[props(default)]
     pub metadata: MetadataState,
+    /// The library scan as the server last told it.
+    #[props(default)]
+    pub scan: super::scan_progress::ScanView,
 }
 
 /// The show the Show identity tab was opened on from its title page.
@@ -496,6 +504,9 @@ pub fn AdminView(props: AdminViewProps) -> Element {
                         }
                     }
                 }
+                if matches!(active_tab, AdminTab::Libraries | AdminTab::ScheduledTasks) {
+                    super::scan_progress::ScanBar { scan: props.scan.clone() }
+                }
                 if loading {
                     p { class: "pharos-loading", "Loading…" }
                 } else {
@@ -507,7 +518,13 @@ pub fn AdminView(props: AdminViewProps) -> Element {
                                 on_action,
                             }
                         },
-                        AdminTab::Libraries => rsx! { LibrariesPane { libraries: props.libraries.clone() } },
+                        AdminTab::Libraries => rsx! {
+                            LibrariesPane {
+                                libraries: props.libraries.clone(),
+                                scanning: props.scan.libraries.clone(),
+                                on_action,
+                            }
+                        },
                         AdminTab::Devices => rsx! {
                             DevicesPane {
                                 devices: props.devices.clone(),
@@ -877,7 +894,11 @@ fn library_kind(collection_type: &str) -> &str {
 }
 
 #[component]
-fn LibrariesPane(libraries: Vec<LibraryFolder>) -> Element {
+fn LibrariesPane(
+    libraries: Vec<LibraryFolder>,
+    scanning: std::collections::BTreeMap<String, f32>,
+    on_action: EventHandler<AdminAction>,
+) -> Element {
     rsx! {
         if libraries.is_empty() {
             p { class: "pharos-empty", "No libraries configured" }
@@ -896,6 +917,23 @@ fn LibrariesPane(libraries: Vec<LibraryFolder>) -> Element {
                         ul { class: "pharos-manage-paths pharos-admin-library-locations",
                             for loc in lib.locations.iter() {
                                 li { key: "{loc}", code { "{loc}" } }
+                            }
+                        }
+                        if let Some(fraction) = scanning.get(&lib.item_id).copied() {
+                            super::scan_progress::LibraryScanBar { name: lib.name.clone(), fraction }
+                        } else if !lib.item_id.is_empty() {
+                            button {
+                                r#type: "button",
+                                class: "pharos-admin-scan-library",
+                                aria_label: "Scan {lib.name}",
+                                onclick: {
+                                    let (item_id, name) = (lib.item_id.clone(), lib.name.clone());
+                                    move |_| on_action.call(AdminAction::ScanLibrary {
+                                        item_id: item_id.clone(),
+                                        name: name.clone(),
+                                    })
+                                },
+                                "Scan"
                             }
                         }
                     }
