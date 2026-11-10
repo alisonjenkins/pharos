@@ -213,7 +213,13 @@ impl AdminTab {
             Self::Branding => "Branding",
         }
     }
-    fn class_suffix(self) -> &'static str {
+    /// The tab a Manage URL's `page=` value names (FR-209); `None` for
+    /// any other value.
+    pub fn from_token(token: &str) -> Option<Self> {
+        Self::all().into_iter().find(|t| t.class_suffix() == token)
+    }
+    /// Its `page=` value in the Manage URL, and its CSS class suffix.
+    pub fn class_suffix(self) -> &'static str {
         match self {
             Self::Users => "users",
             Self::Libraries => "libraries",
