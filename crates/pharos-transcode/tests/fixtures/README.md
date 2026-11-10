@@ -51,3 +51,20 @@ kubectl -n pharos exec pharos-db-1 -c postgres -- \
 
 Note: episode `3096759618643281933` (S03E02) matches nothing in either kind, in
 production and in replay. That is expected for this fixture, not a decoding fault.
+
+## `series_a_*`, `series_b_*`, `series_c_*` (T106)
+
+Real fingerprints dumped read-only from production on **2026-11-10**, in the same
+format as above but with **invented item ids** (`1001..`, `2001..`, `3001..`, in
+the original row order), for the fragmented-intro replay
+(`tests/it_analysis/fragmented_intro_replay.rs`). The series are not named, on
+purpose.
+
+- `series_a_fingerprints.txt`: one season, 9 episodes, a ~109 s opening whose
+  matches fragment.
+- `series_b_fingerprints.txt`: one season, 10 episodes. Control: a ~3 s title
+  card, so no intro may be emitted.
+- `series_c_fingerprints.txt`: one season, 24 episodes. Control: no theme, so no
+  intro; every episode shares an ending.
+
+Intro windows here are 1338–1634 points.
