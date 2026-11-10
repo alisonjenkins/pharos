@@ -1487,10 +1487,12 @@ pub fn install_telemetry(api: &NativeApi) {
     let api = api.clone();
     let begun = super::diagnostics::session();
     spawn_forever(async move {
-        let opted = load_opted_in(&api).await.unwrap_or_else(|e| {
-            log::warn!("pharos: diagnostics opt-in unreadable: {e}");
-            false
-        });
+        let opted = super::diagnostics::load_opted_in_since(&api, begun)
+            .await
+            .unwrap_or_else(|e| {
+                log::warn!("pharos: diagnostics opt-in unreadable: {e}");
+                false
+            });
         let held = super::diagnostics::install(api.clone(), opted, begun);
         log::info!(
             "pharos: telemetry installed opted_in={opted} held={}",
