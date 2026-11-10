@@ -130,6 +130,10 @@ pub fn Link(
     /// The key action that presses this link (spec 029), such as `play`.
     #[props(default)]
     key_action: Option<&'static str>,
+    /// What the link does, for a screen reader and as its tooltip, when its
+    /// text alone does not say.
+    #[props(default)]
+    label: Option<String>,
     children: Element,
 ) -> Element {
     let nav = use_context::<Nav>();
@@ -141,6 +145,8 @@ pub fn Link(
             id,
             "data-key-action": key_action,
             "aria-current": if current { "page" },
+            "aria-label": label.clone(),
+            title: label,
             onclick: move |evt: MouseEvent| {
                 if evt.modifiers().is_empty() {
                     evt.prevent_default();
@@ -731,10 +737,10 @@ pub fn HomeView(home: Home) -> Element {
                 p { class: "pharos-empty", "Nothing here yet. Add a library from Manage." }
             }
             if !home.resume.is_empty() {
-                Rail { title: "Continue watching", items: home.resume.clone() }
+                Rail { title: "Continue watching", items: home.resume.clone(), play: true }
             }
             if !home.next_up.is_empty() {
-                Rail { title: "Next up", items: home.next_up.clone() }
+                Rail { title: "Next up", items: home.next_up.clone(), play: true }
             }
             for rail in before_music {
                 LibraryRail { key: "{rail.library.id}", rail: (*rail).clone() }
@@ -789,6 +795,9 @@ pub fn Rail(
     /// Tiles open the reader, not the title page.
     #[props(default)]
     read: bool,
+    /// Tiles start playing, with an info control for the title page.
+    #[props(default)]
+    play: bool,
 ) -> Element {
     rsx! {
         section { class: "pharos-rail",
@@ -800,7 +809,7 @@ pub fn Rail(
             }
             ul { class: "pharos-rail-items",
                 for item in items {
-                    li { key: "{item.id}", PosterTile { item: item.clone(), read } }
+                    li { key: "{item.id}", PosterTile { item: item.clone(), read, play } }
                 }
             }
         }
@@ -1143,18 +1152,28 @@ pub fn PosterTile(
     /// Opens the reader, for a book part read.
     #[props(default)]
     read: bool,
+    /// Starts playing at once (spec 038 FR-109); an info control beside it
+    /// opens the title page.
+    #[props(default)]
+    play: bool,
 ) -> Element {
+    let play = play && item.kind.playable();
     let to = if read {
         Route::Read(item.id)
+    } else if play {
+        Route::Watch(item.id)
     } else {
         open_route(&item)
     };
     let name = display_name(&item);
+    let play_label = play.then(|| format!("Play {name}"));
+    let info_label = format!("About {name}");
+    let info_to = open_route(&item);
     let sub = sub_lines(&item);
     let progress = progress_percent(&item);
     let rated = !ratings(item.kind, item.imdb_rating, item.critic_rating).is_empty();
     rsx! {
-        Link { to, class: "pharos-poster",
+        Link { to, class: "pharos-poster", label: play_label,
             div { class: "pharos-poster-art",
                 onpointermove: move |evt| depth::tilt(&evt),
                 onpointerleave: move |evt| depth::untilt(&evt),
@@ -1194,6 +1213,9 @@ pub fn PosterTile(
                     span { class: "pharos-poster-sub", title: "{line}", "{line}" }
                 }
             }
+        }
+        if play {
+            Link { to: info_to, class: "pharos-poster-info", label: info_label, "i" }
         }
     }
 }
@@ -3493,6 +3515,42 @@ mod tests {
         let mut film = item(ItemKind::Movie);
         film.name = "Film AX".into();
         assert_eq!(page_name(&film), "Film AX");
+    }
+
+    #[test]
+    fn a_resume_tile_plays_at_once_and_its_info_control_opens_the_title() {
+        let mut e = item(ItemKind::Episode);
+        e.name = "Pilot".into();
+        let id = e.id;
+        let html = render(move || rsx! { PosterTile { item: e.clone(), play: true } });
+        let watch = format!(r#"href="{}""#, Route::Watch(id).path());
+        let title = format!(r#"href="{}""#, Route::Title(id).path());
+        assert!(html.contains(&watch), "the tile plays: {html}");
+        assert!(
+            html.contains(&title),
+            "the info control opens the title: {html}"
+        );
+        assert!(html.contains(r#"aria-label="Play Pilot""#), "{html}");
+        assert!(html.contains(r#"aria-label="About Pilot""#), "{html}");
+        assert!(
+            html.find(&watch) < html.find(&title),
+            "info sits after the tile: {html}"
+        );
+    }
+
+    #[test]
+    fn a_tile_with_nothing_to_play_opens_its_page_and_has_no_info_control() {
+        let series = item(ItemKind::Series);
+        let html = render(move || rsx! { PosterTile { item: series.clone(), play: true } });
+        assert!(!html.contains("/watch/"), "{html}");
+        assert!(!html.contains("pharos-poster-info"), "{html}");
+        let film = item(ItemKind::Movie);
+        let html = render(move || rsx! { PosterTile { item: film.clone() } });
+        assert!(
+            !html.contains("/watch/"),
+            "a plain tile still opens the title: {html}"
+        );
+        assert!(!html.contains("pharos-poster-info"), "{html}");
     }
 
     #[test]

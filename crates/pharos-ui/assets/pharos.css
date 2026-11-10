@@ -625,6 +625,31 @@ input:focus-visible {
 .pharos-rail-items > li {
   flex: 0 0 auto;
   scroll-snap-align: start;
+  position: relative;
+}
+/* A resume or Next Up tile plays at once (spec 038 FR-109); this opens its
+   title page. Top right: those rails never hold a watched item. */
+.pharos-poster-info {
+  position: absolute;
+  top: 0.4rem;
+  right: 0.4rem;
+  display: grid;
+  place-items: center;
+  width: 2rem;
+  height: 2rem;
+  border-radius: 9999px;
+  background: var(--px-color-bg);
+  color: var(--px-color-fg);
+  font-weight: 700;
+  font-style: italic;
+  text-decoration: none;
+  opacity: 0.9;
+}
+.pharos-poster-info:hover,
+.pharos-poster-info:focus-visible {
+  opacity: 1;
+  background: var(--px-color-accent);
+  color: var(--px-color-accent-fg);
 }
 
 .pharos-grid {
