@@ -472,6 +472,7 @@ fn emit_interface(o: &mut String, i: &Interface) {
                 m.label
             );
         }
+        let _ = writeln!(o, "                crate::instrument::stamp_trace_id(::capnp::dynamic_value::Builder::from(results.get()), scope.trace_id());");
         let _ = writeln!(o, "                let reply = ::capnp::dynamic_value::Reader::from(results.get().into_reader());");
         let _ = writeln!(o, "                scope.finish(outcome, reply)");
         let _ = writeln!(o, "            }}");

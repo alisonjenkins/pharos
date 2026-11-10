@@ -15,4 +15,5 @@ mod registration;
 mod resume;
 mod schema_copy;
 mod support;
+mod trace_id;
 mod wire;
