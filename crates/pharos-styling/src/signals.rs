@@ -42,6 +42,20 @@ pub struct TrackSignals {
     /// picture under it, as a share of the frame height (0.0 for none);
     /// `None`, or a line past the end, when nothing was checked.
     pub bottom_text: Vec<Option<f32>>,
+    /// Per source line: where the aligner heard its words sung (B1212);
+    /// `None`, or a line past the end, when it was not asked.
+    pub sung: Vec<Option<SungLine>>,
+}
+
+/// The aligner's answer for one line.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SungLine {
+    /// `(char offset into the line's text, ms from the start of the file)`
+    /// per word, then one at the text's end for when the last word ends.
+    pub words: Vec<(usize, i64)>,
+    /// Mean probability of the words' characters, 0.0 to 1.0: low when the
+    /// words are not what is sung.
+    pub score: Option<f32>,
 }
 
 /// What a stretch of the episode is.
