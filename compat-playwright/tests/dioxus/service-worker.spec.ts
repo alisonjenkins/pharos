@@ -23,6 +23,16 @@ test.use({
   serviceWorkers: "allow",
 });
 
+// The default crawl config globs this file in against a server with no UI
+// bundle; like the other pharos-ui specs, skip where /ui/ is not served.
+test.beforeEach(async ({ request }) => {
+  const probe = await request.get(`${PHAROS_URL}/ui/`);
+  test.skip(
+    !probe.ok(),
+    `pharos-ui is not served (status ${probe.status()}); skipping service worker test`,
+  );
+});
+
 test("the shell opens offline from the worker's cache", async ({ page, context }) => {
   await openControlled(page);
   const names = (await cacheNames(page)).filter((n) => n.startsWith("pharos-shell-"));
