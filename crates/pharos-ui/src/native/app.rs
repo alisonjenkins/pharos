@@ -18,7 +18,7 @@ use super::account::AccountMenu;
 use super::account_settings;
 use super::activity;
 use super::appearance::{
-    not_saved, AppearanceView, ContrastRow, Edit, EditorView, Notice, ThemeCard,
+    not_saved, AppearanceView, ContrastRow, Edit, EditorView, Lasts, Notice, ThemeCard,
 };
 use super::approve_device;
 use super::backdrop::{self, Backdrop};
@@ -3335,7 +3335,7 @@ fn AppearanceScreen() -> Element {
             library_transition: library_transition_now,
             on_library_transition: move |fx: LibraryTransition| {
                 if let Err(e) = store_library_transition(fx) {
-                    show(notice, not_saved("the library transition", &e));
+                    show(notice, not_saved("the library transition", &e, Lasts::UntilReload));
                 }
                 platform::apply_library_transition(fx);
                 library_transition.set(fx);
@@ -3344,7 +3344,7 @@ fn AppearanceScreen() -> Element {
             overlay_effect: overlay_effect_now,
             on_overlay_effect: move |fx: OverlayEffect| {
                 if let Err(e) = store_overlay_effect(fx) {
-                    show(notice, not_saved("the controls effect", &e));
+                    show(notice, not_saved("the controls effect", &e, Lasts::UntilReload));
                 }
                 platform::apply_overlay_effect(fx);
                 overlay_effect.set(fx);
@@ -3353,7 +3353,7 @@ fn AppearanceScreen() -> Element {
             effects_level: effects_level_now,
             on_effects_level: move |level: EffectsLevel| {
                 if let Err(e) = store_effects_level(level) {
-                    show(notice, not_saved("the subtitle effects", &e));
+                    show(notice, not_saved("the subtitle effects", &e, Lasts::UntilReload));
                 }
                 effects_level.set(level);
                 platform::info(&format!("pharos: effects_level set={}", level.as_str()));
@@ -3552,7 +3552,7 @@ fn PlaybackScreen() -> Element {
             episode_turn: episode_turn(),
             on_episode_turn: move |choice: EpisodeTurn| {
                 if let Err(e) = store_episode_turn(choice) {
-                    show(notice, not_saved("the episode transition", &e));
+                    show(notice, not_saved("the episode transition", &e, Lasts::UntilReload));
                 }
                 episode_turn.set(choice);
             },
@@ -3565,7 +3565,7 @@ fn PlaybackScreen() -> Element {
             subtitle_size: subtitle_size(),
             on_subtitle_size: move |size: SubtitleSize| {
                 if let Err(e) = set_subtitle_size(size) {
-                    show(notice, not_saved("the subtitle size", &e));
+                    show(notice, not_saved("the subtitle size", &e, Lasts::UntilReload));
                 }
                 subtitle_size.set(size);
             },
