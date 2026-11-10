@@ -916,7 +916,7 @@ mod tests {
     /// Burn is the encode that cannot afford to lose the draw. It re-encodes
     /// every frame through a filter graph, and the CPU is the one device whose
     /// permits are also spent on everything else: audio, copies, and every
-    /// speculative prefetch. Live on 2026-08-16 (Black Panther, two viewers,
+    /// speculative prefetch. Live on 2026-08-16 (Film S, two viewers,
     /// subtitles switched on mid-film) a burning rendition landed in the CPU
     /// third of the weighted spread and playback stalled — segment 87 waited
     /// 23.7 s for a permit while its actual encode took 3.9 s, and NVENC sat at
