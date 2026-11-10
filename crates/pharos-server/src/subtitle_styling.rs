@@ -47,6 +47,8 @@
 //! pharos_subtitle_effect_total{intent,source}    one per styled line; source: rule (phase 1)
 //! pharos_subtitle_signals_total{source,outcome}  source: stored | measured; outcome: ok | failed
 //! pharos_subtitle_bottom_text_total{verdict}     one per styled line: unchecked | clear | lifted | kept
+//! pharos_subtitle_sung_total{outcome}            one per styled item: off | none | asked | failed
+//! pharos_subtitle_karaoke_total{timing}          one per karaoke line: source | aligned | paced
 //!                                                (text burned into the bottom of the picture, B1207)
 //! ```
 //!
@@ -65,6 +67,7 @@ use crate::api::jellyfin::subtitles::{
     sidecar_base_index, sidecar_language_from_name,
 };
 use crate::bg_io::BgPermit;
+use crate::services::lyrics::align::Aligner;
 use pharos_cache::SubtitleCache;
 use pharos_core::{
     AudioTrack, DetectedSegment, GenreStore, MediaId, MediaItem, MediaKind, MediaSegmentKind,
@@ -72,7 +75,8 @@ use pharos_core::{
     SubtitleStyling, SubtitleStylingStore,
 };
 use pharos_styling::plan::{Intent, Placement};
-use pharos_styling::signals::{LineSignals, Segment, SegmentKind, TrackSignals};
+use pharos_styling::signals::{LineSignals, Segment, SegmentKind, SungLine, TrackSignals};
+use pharos_styling::source::SourceLine;
 use pharos_styling::DIRECTOR_VERSION;
 use pharos_transcode::protocol::WorkerError;
 use pharos_transcode::scheduler::TranscodeScheduler;
@@ -424,6 +428,38 @@ struct Report {
     signs: usize,
     /// Signs per cause, `tag=n style7=n` (B1208).
     sign_causes: String,
+    /// Whether the aligner was asked about the sung lines (B1212).
+    sung: Option<SungAsk>,
+    /// Median aligner score of the sung lines.
+    sung_score: Option<f32>,
+    /// Karaoke lines per timing, `timing=n` (B1212).
+    karaoke: String,
+}
+
+/// What came of asking the aligner about an item's sung lines (B1212).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SungAsk {
+    /// No aligner is configured.
+    Off,
+    /// No line inside an intro or outro could take a fill.
+    None,
+    Asked,
+    /// The aligner could not answer; the lines are paced instead.
+    Failed,
+}
+
+impl SungAsk {
+    pub const ALL: [SungAsk; 4] = [SungAsk::Off, SungAsk::None, SungAsk::Asked, SungAsk::Failed];
+
+    /// The metric label; a dashboard contract.
+    pub fn label(self) -> &'static str {
+        match self {
+            SungAsk::Off => "off",
+            SungAsk::None => "none",
+            SungAsk::Asked => "asked",
+            SungAsk::Failed => "failed",
+        }
+    }
 }
 
 /// A stored signal pass: the windows it measured and what it found.
@@ -479,6 +515,8 @@ pub struct Styler<S, A, Q> {
     pub bg_io: Arc<Semaphore>,
     pub cache: Option<SubtitleCache>,
     pub queue_poll: Duration,
+    /// Times sung lines that have no `\k` (B1212); `None` paces them.
+    pub aligner: Option<Arc<Aligner>>,
 }
 
 /// Spawn the job. Fire-and-forget: a failure aborts only the job (logged),
@@ -491,6 +529,7 @@ pub fn spawn<S>(
     pool: LibavWorkerPool,
     cache: Option<SubtitleCache>,
     scheduler: Option<TranscodeScheduler>,
+    aligner: Option<Arc<Aligner>>,
 ) -> OnDemand
 where
     S: JobStore + 'static,
@@ -508,6 +547,7 @@ where
         bg_io,
         cache,
         queue_poll: QUEUE_POLL,
+        aligner,
     };
     tokio::spawn(async move {
         tokio::time::sleep(crate::audio_analysis::WARMUP).await;
@@ -773,6 +813,45 @@ impl<S: JobStore, A: Signals, Q: TranscodeQueue> Styler<S, A, Q> {
     }
 
     /// The stages after `select`. `Err` carries how the item ended early.
+    /// Asks the aligner where the item's sung lines are sung (B1212). A
+    /// failure is logged and the lines are paced: the item is styled anyway.
+    async fn sung(
+        &self,
+        item: &MediaItem,
+        lines: &[SourceLine],
+        segments: &[Segment],
+    ) -> (Vec<Option<SungLine>>, SungAsk) {
+        let Some(aligner) = &self.aligner else {
+            return (Vec::new(), SungAsk::Off);
+        };
+        let asked = pharos_styling::director::sung_candidates(lines, segments);
+        if asked.is_empty() {
+            return (Vec::new(), SungAsk::None);
+        }
+        let spans: Vec<(u64, u64, String)> = asked
+            .iter()
+            .map(|&i| {
+                let l = &lines[i];
+                let ms = |v: i64| u64::try_from(v).unwrap_or(0);
+                (ms(l.start_ms), ms(l.end_ms), l.text.clone())
+            })
+            .collect();
+        let t = Instant::now();
+        match aligner.sing(item, &spans).await {
+            Ok(answer) => (sung_lines(lines.len(), &asked, &answer), SungAsk::Asked),
+            Err(e) => {
+                tracing::warn!(
+                    item = item.id,
+                    lines = asked.len(),
+                    elapsed_s = t.elapsed().as_secs_f32(),
+                    error = %e,
+                    "subtitle styling: aligner failed; sung lines are paced"
+                );
+                (Vec::new(), SungAsk::Failed)
+            }
+        }
+    }
+
     async fn style(&self, task: &Task, report: &mut Report) -> Result<(), Ended> {
         let Some(source) = task.source.as_ref() else {
             self.put(task, Outcome::NoSource, NO_SOURCE_INDEX, None)
@@ -898,12 +977,15 @@ impl<S: JobStore, A: Signals, Q: TranscodeQueue> Styler<S, A, Q> {
                 Vec::new()
             }
         };
+        let (sung, ask) = self.sung(&task.item, &parsed.lines, &segments).await;
+        report.sung = Some(ask);
+        metrics::counter!("pharos_subtitle_sung_total", "outcome" => ask.label()).increment(1);
         let t = Instant::now();
         let track = TrackSignals {
             lines: sig.lines.iter().map(line_signals).collect(),
             cuts_ms: sig.cuts_ms,
             bottom_text: sig.bottom_text,
-            sung: Vec::new(),
+            sung,
         };
         let direction = pharos_styling::direct(&parsed.lines, &track, &segments);
         report.direct = Some(t.elapsed());
@@ -923,6 +1005,13 @@ impl<S: JobStore, A: Signals, Q: TranscodeQueue> Styler<S, A, Q> {
             .join(" ");
         report.signs = parsed.lines.iter().filter(|l| l.typeset).count();
         report.sign_causes = sign_causes(&parsed.lines);
+        report.sung_score = direction.sung_score;
+        report.karaoke = direction
+            .karaoke
+            .iter()
+            .map(|(t, n)| format!("{}={n}", t.label()))
+            .collect::<Vec<_>>()
+            .join(" ");
         report.bottom_text = direction
             .bottom_text
             .iter()
@@ -944,6 +1033,10 @@ impl<S: JobStore, A: Signals, Q: TranscodeQueue> Styler<S, A, Q> {
                 metrics::histogram!("pharos_subtitle_styling_seconds", "stage" => stage)
                     .record(d.as_secs_f64());
             }
+        }
+        for (timing, n) in &direction.karaoke {
+            metrics::counter!("pharos_subtitle_karaoke_total", "timing" => timing.label())
+                .increment(*n as u64);
         }
         for (verdict, n) in &direction.bottom_text {
             metrics::counter!(
@@ -1130,6 +1223,9 @@ impl<S: JobStore, A: Signals, Q: TranscodeQueue> Styler<S, A, Q> {
                     bottom_text = %report.bottom_text,
                     signs = report.signs,
                     sign_causes = %report.sign_causes,
+                    sung = report.sung.map(SungAsk::label),
+                    sung_score = report.sung_score,
+                    karaoke = %report.karaoke,
                     outcome = ended.outcome.label(),
                     stage = ended.stage.label(),
                     error = ended.error.as_deref(),
@@ -1311,6 +1407,36 @@ async fn read_source(
     Ok(text.trim_start_matches('\u{feff}').to_owned())
 }
 
+/// The aligner's answer for the `asked` lines, by source line index.
+fn sung_lines(
+    n: usize,
+    asked: &[usize],
+    answer: &crate::services::lyrics::align::Aligned,
+) -> Vec<Option<SungLine>> {
+    let mut out = vec![None; n];
+    for (k, &i) in asked.iter().enumerate() {
+        let Some(words) = answer.lines.get(k) else {
+            continue;
+        };
+        if words.is_empty() || i >= n {
+            continue;
+        }
+        out[i] = Some(SungLine {
+            words: words
+                .iter()
+                .map(|w| (w.at as usize, i64::try_from(w.start_ms).unwrap_or(i64::MAX)))
+                .collect(),
+            score: answer
+                .scores
+                .get(k)
+                .copied()
+                .flatten()
+                .map(|s| f32::from(s) / 1000.0),
+        });
+    }
+    out
+}
+
 /// `tag=n style<alignment>=n`, so a mis-read style alignment shows by value.
 fn sign_causes(lines: &[pharos_styling::source::SourceLine]) -> String {
     use pharos_styling::source::SignCause;
@@ -1332,6 +1458,45 @@ fn sign_causes(lines: &[pharos_styling::source::SourceLine]) -> String {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_aligner_answer_lands_on_the_lines_it_was_asked_about() {
+        use crate::services::lyrics::{align::Aligned, WordStamp};
+        let answer = Aligned {
+            lines: vec![
+                vec![
+                    WordStamp {
+                        at: 0,
+                        start_ms: 1200,
+                    },
+                    WordStamp {
+                        at: 3,
+                        start_ms: 1500,
+                    },
+                ],
+                vec![],
+            ],
+            offset_ms: 0,
+            scores: vec![Some(640), None],
+        };
+        let sung = sung_lines(4, &[1, 3], &answer);
+        assert_eq!(sung.len(), 4);
+        assert_eq!(sung[0], None);
+        assert_eq!(
+            sung[1],
+            Some(SungLine {
+                words: vec![(0, 1200), (3, 1500)],
+                score: Some(0.64),
+            })
+        );
+        assert_eq!(sung[3], None, "a line with no words is left to pace");
+    }
+
+    #[test]
+    fn sung_labels_are_distinct() {
+        let labels: HashSet<_> = SungAsk::ALL.iter().map(|a| a.label()).collect();
+        assert_eq!(labels.len(), SungAsk::ALL.len());
+    }
 
     #[test]
     fn signs_are_counted_by_cause_and_alignment() {
@@ -1603,6 +1768,7 @@ mod tests {
             bg_io: Arc::new(Semaphore::new(1)),
             cache: None,
             queue_poll: Duration::from_millis(1),
+            aligner: None,
         }
     }
 
@@ -1713,6 +1879,19 @@ mod tests {
             std::collections::BTreeMap::from([("clear".to_owned(), 4), ("lifted".to_owned(), 1)])
         );
         assert_eq!(plan.lines[0].placement, Placement::Top);
+
+        // B1212: with no aligner configured, the item says so.
+        let sung: Vec<(String, u64)> = snap
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(ck, ..)| ck.key().name() == "pharos_subtitle_sung_total")
+            .map(|(ck, _, _, v)| {
+                let DebugValue::Counter(c) = v else { panic!() };
+                (ck.key().labels().next().unwrap().value().to_owned(), c)
+            })
+            .collect();
+        assert_eq!(sung, [("off".to_owned(), 1)]);
     }
 
     /// FR-014 — a file the media cannot give us is remembered and not tried
