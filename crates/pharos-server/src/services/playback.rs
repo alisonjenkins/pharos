@@ -339,17 +339,26 @@ pub fn negotiate(state: &AppState, item: &MediaItem, req: &NegotiateRequest<'_>)
     // constructed, but a lie about the client, and indistinguishable on the
     // dashboard from the real "clients are sending nothing" failure.
     let remote = item.origin().is_remote();
+    // Spec 037 — a split film's file is only its first part, so it can no
+    // more be direct played or remuxed from `/stream` than a URL can: it
+    // plays as one film through HLS, which runs on into each part (V1155).
+    let split_parts = (item.edition.is_none() && !probe.parts().is_empty()).then(|| {
+        u32::try_from(probe.parts().len())
+            .unwrap_or(u32::MAX)
+            .saturating_add(1)
+    });
     let mut video_range_unenforced = None;
-    let (decision, direct_play_block) = if remote {
+    let (decision, direct_play_block) = if remote || split_parts.is_some() {
         let mut forced = profile.clone();
         forced.direct_play_profiles.clear();
         let (d, _) = negotiate_explained(&forced, &source, &server_codecs);
-        (
-            d,
-            DirectPlayBlock::RemoteSource {
+        let block = match split_parts {
+            Some(parts) if !remote => DirectPlayBlock::SplitFilm { parts },
+            _ => DirectPlayBlock::RemoteSource {
                 locator: item.path.display().to_string(),
             },
-        )
+        };
+        (d, block)
     } else {
         let verdict = negotiate_explained(profile, &source, &server_codecs);
         if !state.enforce_video_range {
@@ -599,8 +608,10 @@ pub fn negotiate(state: &AppState, item: &MediaItem, req: &NegotiateRequest<'_>)
     // by EnableDirectPlay=false still has a raw stream to offer. A forbidden
     // video copy takes the raw stream away (Jellyfin: `!enableDirectStream ||
     // !allowVideoStreamCopy`).
+    // A split film's raw file is its first part only (V1155).
     let supports_direct_stream = switches.direct_stream
         && switches.video_copy
+        && split_parts.is_none()
         && (pre_switch_decision.is_direct()
             || (matches!(
                 pre_switch_decision,
@@ -2504,5 +2515,87 @@ mod native_max_bitrate_tests {
             decide(8_000_000, 4_700_000),
             Decision::AudioRemux { .. }
         ));
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod split_film_tests {
+    use super::*;
+    use crate::state::Stores;
+    use pharos_core::{AlternateMediaSource, MediaKind, MediaProbe};
+    use pharos_jellyfin_api::device_profile::DirectPlayProfile;
+
+    fn film(parts: usize) -> MediaItem {
+        let probe = MediaProbe {
+            container: Some("matroska".into()),
+            video_codec: Some("h264".into()),
+            audio_codec: Some("aac".into()),
+            ..Default::default()
+        };
+        MediaItem {
+            id: 1,
+            path: "/m/G/G (2003) cd1.mkv".into(),
+            kind: MediaKind::Movie,
+            probe: MediaProbe {
+                alternate_sources: (2..=parts)
+                    .map(|n| AlternateMediaSource {
+                        id: format!("part-{n}"),
+                        path: format!("/m/G/G (2003) cd{n}.mkv").into(),
+                        part: u32::try_from(n).ok(),
+                        probe: Some(Box::new(probe.clone())),
+                        ..Default::default()
+                    })
+                    .collect(),
+                ..probe
+            },
+            ..Default::default()
+        }
+    }
+
+    async fn negotiated(item: &MediaItem) -> Negotiated {
+        let stores = Stores::connect("sqlite::memory:").await.unwrap();
+        let state = AppState::new(stores, "t".into());
+        let profile = DeviceProfile {
+            direct_play_profiles: vec![DirectPlayProfile {
+                container: "mkv,matroska".into(),
+                video_codec: "h264".into(),
+                audio_codec: "aac".into(),
+                kind: "Video".into(),
+            }],
+            ..Default::default()
+        };
+        negotiate(
+            &state,
+            item,
+            &NegotiateRequest {
+                profile: &profile,
+                switches: PlaybackSwitches::default(),
+                explicit_subtitle_index: None,
+                stereo_mode: None,
+                client_is_remote: false,
+                is_web_client: false,
+            },
+        )
+    }
+
+    /// V1155 — a client that would direct play the first part's file streams
+    /// a split film through HLS instead, and is told why, with the count.
+    #[actix_web::test]
+    async fn a_split_film_never_direct_plays() {
+        let whole = negotiated(&film(1)).await;
+        assert!(
+            whole.direct_play,
+            "control: the same file alone direct plays"
+        );
+
+        let split = negotiated(&film(3)).await;
+        assert!(!split.direct_play);
+        assert!(!split.supports_direct_stream);
+        assert_eq!(
+            split.direct_play_block,
+            DirectPlayBlock::SplitFilm { parts: 3 }
+        );
+        assert!(split.direct_play_block.to_string().contains('3'));
     }
 }
