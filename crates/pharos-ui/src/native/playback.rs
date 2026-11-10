@@ -2426,6 +2426,15 @@ pub fn up_next_at(segments: &[Segment], total_ms: u64) -> Option<UpNextFrom> {
     })
 }
 
+/// Whether "Up next" is the small pill rather than the full card: over a
+/// guessed ending (no credits detected) the card would cover the last
+/// scene for up to 90 s, so it waits as a pill until the last
+/// [`UP_NEXT_COUNTDOWN_MS`] (038 FR-405, V1221). Over detected credits it
+/// is the card throughout.
+pub fn up_next_pill(credits: bool, left_ms: u64) -> bool {
+    !credits && left_ms > UP_NEXT_COUNTDOWN_MS
+}
+
 /// What the "Up next" card does at a position.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UpNextStep {
@@ -2917,6 +2926,17 @@ mod tests {
         assert!(!Fatal::from_hls("mediaError", "bufferStalledError").is_media());
         assert!(!Fatal::from_hls("mediaError", "manifestIncompatibleCodecsError").is_media());
         assert!(!Fatal::from_hls("networkError", "fragLoadError").is_media());
+    }
+
+    /// 038 FR-405, V1221: a guessed ending gets the pill until its last
+    /// 15 s; detected credits get the card. Disarm check: returning `false`
+    /// fails the first assert.
+    #[test]
+    fn a_guessed_ending_shows_the_pill_until_its_last_seconds() {
+        assert!(up_next_pill(false, 60_000));
+        assert!(up_next_pill(false, UP_NEXT_COUNTDOWN_MS + 1));
+        assert!(!up_next_pill(false, UP_NEXT_COUNTDOWN_MS));
+        assert!(!up_next_pill(true, 60_000));
     }
 
     /// 038 FR-403: a codec the browser lacks is the browser's limit, a

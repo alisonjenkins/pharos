@@ -39,7 +39,7 @@ use super::playback::{
     parse_volume_setting, pick_mse_engine, position_at, preview_set, restart_styled,
     rust_subtitle_url, shown_font_urls, source_of_styled, start_ms, starting_tier,
     starting_tier_line, styled_subtitle_signals, styled_subtitle_url, styled_track_url,
-    subtitle_switch, tier_drop_line, tier_drop_report, tier_spared_line, up_next_at,
+    subtitle_switch, tier_drop_line, tier_drop_report, tier_spared_line, up_next_at, up_next_pill,
     volume_setting, DeviceClass, EffectsLevel, Engine, EngineReason, FailureKind, Fatal, LibraryTransition,
     MediaEvent, MediaState, MseEngine, OnFatal, OnFragment, Outgoing, OverlayEffect,
     PlaybackEngine, RendererFrames, ReportClock, SubtitleSize, SubtitleSwitch, Tier, TierDrop,
@@ -5238,6 +5238,8 @@ fn Player(
     // provided it.
     let account = try_use_context::<AccountMe>();
     let wait_logged = use_hook(|| Rc::new(RefCell::new(String::new())));
+    // How "Up next" was last shown, for its decision line.
+    let up_next_mode = use_hook(|| Rc::new(Cell::new(None::<&'static str>)));
     use_future({
         let p = Rc::clone(&p);
         move || {
@@ -6745,9 +6747,27 @@ fn Player(
                 if next.is_none() && p.kind != ItemKind::Episode {
                     "Next".clone_into(&mut card.name);
                 }
+                let credits = up_next_at(&p.detail.segments, total_ms(&media_rest(), p.detail.item.runtime_ms))
+                    .is_some_and(|from| from.credits);
+                card.pill = up_next_pill(credits, left_ms);
+                // The decision line, once per way it is shown (038 FR-405/406).
+                let mode = match (view, card.pill) {
+                    (View::Full, true) => "pill",
+                    (View::Full, false) => "card",
+                    _ => "line",
+                };
+                if up_next_mode.get() != Some(mode) {
+                    up_next_mode.set(Some(mode));
+                    platform::info(&format!(
+                        "pharos: up next: shown item={playing_id} mode={mode} credits={credits} left_ms={left_ms} of_ms={of_ms}"
+                    ));
+                }
                 Some(card)
             }
-            _ => None,
+            _ => {
+                up_next_mode.set(None);
+                None
+            }
         },
         live_position: Some(position),
         subtitle_size: sub_size(),
@@ -6930,6 +6950,7 @@ fn Player(
                     count: queue.read().upcoming().len(),
                     open: dock(),
                 }),
+                up_next_in: controls.up_next.as_ref().map(|card| card.seconds),
             }
             // Only the slot in sight: a song handing over shows one queue.
             if audio && dock() && in_sight {
