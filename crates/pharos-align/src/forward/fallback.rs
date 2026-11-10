@@ -1,14 +1,21 @@
 //! The GPU pass with the CPU behind it (spec 039, R12). A device error or a
 //! panic in a GPU window sends that window and the rest of its song to the
-//! CPU; three in ten minutes keep every song on the CPU until restart.
+//! CPU; three in ten minutes keep every song on the CPU until restart. A GPU
+//! pass that cannot be built again after an idle unload leaves the CPU
+//! serving until restart too.
 
 use std::collections::VecDeque;
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::service::{DeviceUsed, Model, ModelError};
+use crate::service::{DeviceUsed, Loader, Model, ModelError};
 
 pub const DEVICE_FALLBACK_TOTAL: &str = "pharos_aligner_device_fallback_total";
+/// `reason` labels of `DEVICE_FALLBACK_TOTAL`, a dashboard contract.
+pub const GPU_ERROR: &str = "gpu_error";
+pub const LATCHED: &str = "latched";
+pub const RELOAD_FAILED: &str = "reload_failed";
 /// GPU errors within `LATCH_WINDOW` that turn the GPU off until restart.
 pub const LATCH_ERRORS: usize = 3;
 pub const LATCH_WINDOW: Duration = Duration::from_secs(600);
@@ -80,7 +87,7 @@ impl Fallback {
 
     /// Moves the rest of this song to the CPU after `error`, counting it.
     fn fall_back(&mut self, error: &str) {
-        metrics::counter!(DEVICE_FALLBACK_TOTAL, "reason" => "gpu_error").increment(1);
+        metrics::counter!(DEVICE_FALLBACK_TOTAL, "reason" => GPU_ERROR).increment(1);
         let latched = self.latch.record(Instant::now());
         tracing::warn!(error = %error, latched, "GPU forward failed; this song continues on the CPU");
         if latched {
@@ -90,15 +97,15 @@ impl Fallback {
                 "GPU failed too often; every song runs on the CPU until restart"
             );
         }
-        self.song_on_cpu = Some("gpu_error");
+        self.song_on_cpu = Some(GPU_ERROR);
     }
 }
 
 impl Model for Fallback {
     fn begin_song(&mut self) {
         self.song_on_cpu = if self.latch.latched() {
-            metrics::counter!(DEVICE_FALLBACK_TOTAL, "reason" => "latched").increment(1);
-            Some("latched")
+            metrics::counter!(DEVICE_FALLBACK_TOTAL, "reason" => LATCHED).increment(1);
+            Some(LATCHED)
         } else {
             None
         };
@@ -125,18 +132,47 @@ impl Model for Fallback {
             match catch_unwind(AssertUnwindSafe(|| gpu.align(pcm, tokens, lead_star))) {
                 Ok(Err(ModelError::Device(e))) => self.fall_back(&e),
                 Ok(other) => return other,
-                Err(panic) => {
-                    let what = panic
-                        .downcast_ref::<String>()
-                        .cloned()
-                        .or_else(|| panic.downcast_ref::<&str>().map(|s| (*s).to_owned()))
-                        .unwrap_or_else(|| "a panic without a message".into());
-                    self.fall_back(&format!("panicked: {what}"));
-                }
+                Err(panic) => self.fall_back(&format!("panicked: {}", panic_message(&*panic))),
             }
         }
         self.cpu()?.align(pcm, tokens, lead_star)
     }
+}
+
+fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
+    panic
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| panic.downcast_ref::<&str>().map(|s| (*s).to_owned()))
+        .unwrap_or_else(|| "a panic without a message".into())
+}
+
+/// The GPU device's loader: `load_gpu` while it works, and `load_cpu` from
+/// the first time it errors or panics (a reload after an idle unload can
+/// meet a device that has gone), so the service keeps answering. Only a CPU
+/// pass that fails as well is an error.
+pub fn gpu_or_cpu<G, C>(load_gpu: G, load_cpu: C) -> Loader
+where
+    G: Fn() -> Result<Box<dyn Model>, String> + Send + Sync + 'static,
+    C: Fn() -> Result<Box<dyn Model>, String> + Send + Sync + 'static,
+{
+    let latched = AtomicBool::new(false);
+    Box::new(move || {
+        if latched.load(Ordering::SeqCst) {
+            return load_cpu();
+        }
+        let error = match catch_unwind(AssertUnwindSafe(&load_gpu)) {
+            Ok(Ok(model)) => return Ok(model),
+            Ok(Err(e)) => e,
+            Err(panic) => format!("panicked: {}", panic_message(&*panic)),
+        };
+        metrics::counter!(DEVICE_FALLBACK_TOTAL, "reason" => RELOAD_FAILED).increment(1);
+        latched.store(true, Ordering::SeqCst);
+        tracing::warn!(error = %error, "loading the GPU pass failed; every song runs on the CPU until restart");
+        load_cpu().map_err(|cpu| {
+            format!("loading the GPU pass failed ({error}), and the CPU pass: {cpu}")
+        })
+    })
 }
 
 #[cfg(test)]
@@ -266,5 +302,89 @@ mod tests {
         };
         assert_eq!(count("gpu_error"), Some(&DebugValue::Counter(3)));
         assert_eq!(count("latched"), Some(&DebugValue::Counter(1)));
+    }
+
+    #[test]
+    fn fallback_reasons_are_distinct() {
+        let mut labels = vec![GPU_ERROR, LATCHED, RELOAD_FAILED];
+        labels.sort_unstable();
+        labels.dedup();
+        assert_eq!(labels.len(), 3);
+    }
+
+    fn fake_loader(
+        device: &'static str,
+        loads: &Arc<AtomicUsize>,
+        fail: Option<bool>,
+    ) -> impl Fn() -> Result<Box<dyn Model>, String> + Send + Sync + 'static {
+        let loads = Arc::clone(loads);
+        move || {
+            loads.fetch_add(1, Ordering::SeqCst);
+            match fail {
+                Some(true) => panic!("device lost"),
+                Some(false) => Err("no adapter".into()),
+                None => Ok(Box::new(Fake(device, Arc::default())) as Box<dyn Model>),
+            }
+        }
+    }
+
+    #[test]
+    fn a_failed_gpu_reload_serves_from_the_cpu_until_restart() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        for panics in [false, true] {
+            let recorder = DebuggingRecorder::new();
+            let snapshotter = recorder.snapshotter();
+            let _guard = metrics::set_default_local_recorder(&recorder);
+            let (gpu_loads, cpu_loads) = (Arc::default(), Arc::default());
+            let load = gpu_or_cpu(
+                fake_loader("vulkan", &gpu_loads, Some(panics)),
+                fake_loader("cpu", &cpu_loads, None),
+            );
+            assert_eq!(load().unwrap().device().device, "cpu", "panics={panics}");
+            assert_eq!(load().unwrap().device().device, "cpu");
+            assert_eq!(
+                gpu_loads.load(Ordering::SeqCst),
+                1,
+                "the GPU is not retried"
+            );
+            assert_eq!(cpu_loads.load(Ordering::SeqCst), 2);
+            let snapshot = snapshotter.snapshot().into_vec();
+            let reload_failed = snapshot.iter().find(|(k, ..)| {
+                k.key().name() == DEVICE_FALLBACK_TOTAL
+                    && k.key()
+                        .labels()
+                        .any(|l| l.key() == "reason" && l.value() == RELOAD_FAILED)
+            });
+            assert_eq!(
+                reload_failed.map(|(.., v)| v),
+                Some(&DebugValue::Counter(1))
+            );
+        }
+    }
+
+    #[test]
+    fn a_working_gpu_loader_is_used_every_time() {
+        let (gpu_loads, cpu_loads) = (Arc::default(), Arc::default());
+        let load = gpu_or_cpu(
+            fake_loader("vulkan", &gpu_loads, None),
+            fake_loader("cpu", &cpu_loads, None),
+        );
+        assert_eq!(load().unwrap().device().device, "vulkan");
+        assert_eq!(load().unwrap().device().device, "vulkan");
+        assert_eq!(cpu_loads.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn only_a_cpu_that_fails_too_is_an_error() {
+        let (gpu_loads, cpu_loads) = (Arc::default(), Arc::default());
+        let load = gpu_or_cpu(
+            fake_loader("vulkan", &gpu_loads, Some(false)),
+            fake_loader("cpu", &cpu_loads, Some(false)),
+        );
+        let e = load().err().unwrap();
+        assert_eq!(
+            e,
+            "loading the GPU pass failed (no adapter), and the CPU pass: no adapter"
+        );
     }
 }
