@@ -396,6 +396,33 @@ mod tests {
         assert_eq!(forward(&tracer, span(ROOT, None, true), 1.0, now()), Ok(()));
     }
 
+    /// The window's edges are inside it: a start exactly a day old or
+    /// exactly 5 minutes ahead, and a span of exactly an hour, are kept.
+    #[test]
+    fn spans_on_the_window_edges_are_kept() {
+        let provider = SdkTracerProvider::builder().build();
+        let tracer = provider.tracer("pharos-ui");
+        let now_ms = 1_762_700_060_000_u64;
+        let ms = |d: Duration| u64::try_from(d.as_millis()).unwrap();
+        let edges = [
+            ClientSpan {
+                start_wall_ms: now_ms - ms(MAX_SPAN_AGE),
+                ..span(ROOT, None, true)
+            },
+            ClientSpan {
+                start_wall_ms: now_ms + ms(MAX_SPAN_LEAD),
+                ..span(ROOT, None, true)
+            },
+            ClientSpan {
+                duration_ms: ms(MAX_SPAN_DURATION),
+                ..span(ROOT, None, true)
+            },
+        ];
+        for edge in edges {
+            assert_eq!(forward(&tracer, edge, 1.0, now()), Ok(()));
+        }
+    }
+
     #[test]
     fn ids_parse_only_as_lowercase_hex_of_their_length() {
         assert!(parse_trace_id(TRACE).is_some());
