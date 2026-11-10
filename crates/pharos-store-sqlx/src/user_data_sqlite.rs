@@ -6,7 +6,8 @@
 
 use crate::sqlite::SqliteStore;
 use pharos_core::{
-    DomainError, DomainResult, MediaId, PlaybackProgress, UserDataStore, UserId, UserItemData,
+    DomainError, DomainResult, MediaId, MediaKind, PlaybackProgress, UserDataStore, UserId,
+    UserItemData,
 };
 
 fn map_err<E: std::fmt::Display>(e: E) -> DomainError {
@@ -195,6 +196,35 @@ impl UserDataStore for SqliteStore {
         rows.into_iter()
             .map(|(id,)| {
                 u64::try_from(id).map_err(|e| DomainError::Backend(format!("id negative: {e}")))
+            })
+            .collect()
+    }
+
+    #[tracing::instrument(skip(self), fields(user.id = %user.0, kind = kind.as_str()))]
+    async fn started_items(
+        &self,
+        user: UserId,
+        kind: MediaKind,
+    ) -> DomainResult<Vec<(MediaId, UserItemData)>> {
+        let id_bytes = user.0.as_bytes().to_vec();
+        let rows: Vec<UserDataRowWithId> = sqlx::query_as(
+            "SELECT u.item_id, u.played, u.play_count, u.last_played_position_ticks,
+                    u.is_favorite, u.last_played_at, u.audio_stream_index, u.subtitle_stream_index
+             FROM user_data u JOIN media_items m ON m.id = u.item_id
+             WHERE u.user_id = ? AND m.kind = ?
+               AND (u.played <> 0 OR u.last_played_position_ticks > 0)
+             ORDER BY u.last_played_at DESC, u.item_id DESC",
+        )
+        .bind(id_bytes)
+        .bind(kind.as_str())
+        .fetch_all(self.pool())
+        .await
+        .map_err(map_err)?;
+        rows.into_iter()
+            .map(|(id, played, pc, pos, fav, lp, ai, si)| {
+                let id = u64::try_from(id)
+                    .map_err(|e| DomainError::Backend(format!("id negative: {e}")))?;
+                Ok((id, row_to_data((played, pc, pos, fav, lp, ai, si))))
             })
             .collect()
     }
