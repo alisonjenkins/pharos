@@ -530,6 +530,93 @@ struct HlsItem {
     path: std::path::PathBuf,
     /// The grouped edition `path` belongs to, if the request selected one.
     edition: Option<String>,
+    /// Spec 037 — a split film's later parts, in play order, which its
+    /// playlists list after its first part. Empty for any other item, and for
+    /// a request that selected a part or an edition itself.
+    parts: Vec<HlsPart>,
+}
+
+/// Spec 037 — one later part of a split film, as its film's playlists list
+/// it: its own segments, addressed by its media source id (V1154).
+struct HlsPart {
+    /// The wire `MediaSourceId` that selects this part's file.
+    source_id: String,
+    path: std::path::PathBuf,
+    /// The part's alternate id, which keys its cached segments.
+    edition: String,
+    duration_seconds: f64,
+    frame_rate_mille: Option<u32>,
+}
+
+/// The later parts of a split film `item` (as stored, before any selection),
+/// in play order. A part with no stored duration ends the list there: its
+/// segments cannot be enumerated, and a gap would skip the film's middle.
+fn hls_parts(item: &pharos_core::MediaItem) -> Vec<HlsPart> {
+    let wire = pharos_jellyfin_api::dto::wire_item_id(item.id);
+    let mut out = Vec::new();
+    for part in item.probe.parts() {
+        let probe = part.probe.as_deref();
+        let Some(ms) = probe.and_then(|p| p.duration_ms).or(part.duration_ms) else {
+            tracing::warn!(
+                media.id = item.id,
+                part = part.part,
+                path = %part.path.display(),
+                "a split film's part has no stored duration; its playlist ends before it",
+            );
+            break;
+        };
+        out.push(HlsPart {
+            source_id: format!("{wire}-{}", part.id),
+            path: part.path.clone(),
+            edition: part.id.clone(),
+            duration_seconds: ms as f64 / 1000.0,
+            frame_rate_mille: probe.and_then(|p| p.frame_rate_mille),
+        });
+    }
+    out
+}
+
+/// A part's copy of its film's playlist query: the film's `MediaSourceId`
+/// and source generation swapped for the part's, so each segment URL reads
+/// the part's file.
+fn part_qs(qs: &str, part: &HlsPart) -> String {
+    let kept: Vec<&str> = qs
+        .split('&')
+        .filter(|kv| {
+            let key = kv.split_once('=').map_or(*kv, |(k, _)| k);
+            !kv.is_empty() && !key.eq_ignore_ascii_case("MediaSourceId") && key != "s"
+        })
+        .collect();
+    let mut base = kept.join("&");
+    if !base.is_empty() {
+        base.push('&');
+    }
+    base.push_str("MediaSourceId=");
+    base.push_str(&part.source_id);
+    with_source_gen(base, &part.path, Some(&part.edition))
+}
+
+/// The playlist entries of `item`'s later parts, each with its own init (when
+/// `init` gives one) and segment URIs built from the part's query.
+fn playlist_parts<'a>(
+    item: &HlsItem,
+    qs: &str,
+    init: impl Fn(&str) -> Option<String>,
+    segment: impl Fn(&str, u32) -> String + Clone + 'a,
+) -> Vec<PlaylistPart<'a>> {
+    item.parts
+        .iter()
+        .map(|part| {
+            let qs = part_qs(qs, part);
+            let segment = segment.clone();
+            PlaylistPart {
+                duration_secs: part.duration_seconds,
+                frame_rate_mille: part.frame_rate_mille,
+                init_uri: init(&qs),
+                segment_uri: Box::new(move |seg| segment(&qs, seg)),
+            }
+        })
+        .collect()
 }
 
 async fn load_hls_item(
@@ -541,13 +628,24 @@ async fn load_hls_item(
     let id: u64 = pharos_jellyfin_api::dto::parse_item_id(id_str)
         .ok_or_else(|| error::ErrorBadRequest("invalid id"))?;
     crate::api::jellyfin::require_item_access(state, user, id, "hls").await?;
-    let item = super::media_source::load(
-        state,
+    let stored = pharos_core::MediaStore::get(&state.stores, id)
+        .await
+        .map_err(|e| match e {
+            pharos_core::DomainError::NotFound(_) => error::ErrorNotFound("not found"),
+            other => error::ErrorInternalServerError(other.to_string()),
+        })?;
+    let requested = super::media_source::requested_id(req.query_string());
+    let parts = match super::media_source::classify(&stored, requested.as_deref()).0 {
+        super::media_source::Requested::Absent | super::media_source::Requested::Primary => {
+            hls_parts(&stored)
+        }
+        _ => Vec::new(),
+    };
+    let item = super::media_source::select(
         super::media_source::Route::Hls,
-        id,
-        req.query_string(),
-    )
-    .await?;
+        stored,
+        requested.as_deref(),
+    );
     // Prefer the probe persisted at scan time. Fall back to live
     // ffprobe only when the row predates the probe-metadata migration
     // so the hot path stays subprocess-free.
@@ -590,6 +688,7 @@ async fn load_hls_item(
         kind: item.kind,
         path: item.path.clone(),
         edition: item.edition.clone(),
+        parts,
     })
 }
 
@@ -1175,6 +1274,12 @@ async fn render_variant_playlist(
         // Lowercase: T31 routes are registered lowercase; emit the canonical
         // form so HLS players don't pay a middleware rewrite per segment.
         segment_uri: &|seg| format!("/videos/{id}/hls1/{variant}/{seg}.ts?{qs}"),
+        parts: playlist_parts(
+            &item,
+            &qs,
+            |_| None,
+            |qs, seg| format!("/videos/{id}/hls1/{variant}/{seg}.ts?{qs}"),
+        ),
     }
     .render(item.duration_seconds, item.frame_rate_mille);
     Ok(HttpResponse::Ok()
@@ -2380,10 +2485,8 @@ async fn vp9_audio_playlist(
     // timeline to a single 6 s segment — the client could then only seek within
     // the first segment (the same `.max(1)` truncation the video variant
     // already guards against via this path).
-    let duration = load_hls_item(&state, &req, &user.0, &id)
-        .await?
-        .duration_seconds
-        .max(0.0);
+    let hls_item = load_hls_item(&state, &req, &user.0, &id).await?;
+    let duration = hls_item.duration_seconds.max(0.0);
     // B105 — the audio rendition enumerates the SAME grid the video variant
     // does, so a client maps a time to the same index on both. Going through
     // the shared renderer is what keeps that true.
@@ -2398,6 +2501,12 @@ async fn vp9_audio_playlist(
         // which carries the seek target.
         start_offset_secs: None,
         segment_uri: &|seg| format!("/videos/{id}/vp9/audio/a{seg}.m4s?{qs}"),
+        parts: playlist_parts(
+            &hls_item,
+            &qs,
+            |qs| Some(format!("/videos/{id}/vp9/audio/init.mp4?{qs}")),
+            |qs, seg| format!("/videos/{id}/vp9/audio/a{seg}.m4s?{qs}"),
+        ),
     }
     .render(duration, item.probe.frame_rate_mille);
     Ok(HttpResponse::Ok()
@@ -2580,6 +2689,12 @@ async fn vp9_variant(
         init_uri: Some(format!("/videos/{id}/vp9/init.mp4?{qs}")),
         start_offset_secs: resume_offset_secs(&req),
         segment_uri: &|seg| format!("/videos/{id}/vp9/{seg}.m4s?{qs}"),
+        parts: playlist_parts(
+            &item,
+            &qs,
+            |qs| Some(format!("/videos/{id}/vp9/init.mp4?{qs}")),
+            |qs, seg| format!("/videos/{id}/vp9/{seg}.m4s?{qs}"),
+        ),
     }
     .render(item.duration_seconds, item.frame_rate_mille);
     Ok(HttpResponse::Ok()
@@ -2820,6 +2935,12 @@ async fn h264cmaf_variant_for(
         init_uri: Some(format!("{base}/init.mp4?{qs}")),
         start_offset_secs: resume_offset_secs(&req),
         segment_uri: &|seg| format!("{base}/{seg}.m4s?{qs}"),
+        parts: playlist_parts(
+            &item,
+            &qs,
+            |qs| Some(format!("{base}/init.mp4?{qs}")),
+            |qs, seg| format!("{base}/{seg}.m4s?{qs}"),
+        ),
     }
     .render(item.duration_seconds, item.frame_rate_mille);
     Ok(HttpResponse::Ok()
@@ -3136,6 +3257,17 @@ struct MediaPlaylist<'a> {
     /// stay byte-identical to what they were before this existed.
     cache_epoch: u32,
     segment_uri: &'a dyn Fn(u32) -> String,
+    /// Spec 037 — a split film's later parts, each listed after a
+    /// discontinuity with its own init and segments (V1154).
+    parts: Vec<PlaylistPart<'a>>,
+}
+
+/// One later part of a split film in its film's media playlist.
+struct PlaylistPart<'a> {
+    duration_secs: f64,
+    frame_rate_mille: Option<u32>,
+    init_uri: Option<String>,
+    segment_uri: Box<dyn Fn(u32) -> String + 'a>,
 }
 
 /// This item's cache epoch, or 0 when there is no cache attached.
@@ -3199,6 +3331,24 @@ impl MediaPlaylist<'_> {
                 self.cache_epoch,
             ));
             body.push('\n');
+        }
+        // Each part's segments run on its own file's timeline, so the player
+        // is told the timestamps restart (and, for fMP4, given the part's own
+        // init, since its codec setup may differ).
+        for part in &self.parts {
+            body.push_str("#EXT-X-DISCONTINUITY\n");
+            if let Some(uri) = &part.init_uri {
+                let uri = with_cache_epoch(uri, self.cache_epoch);
+                body.push_str(&format!("#EXT-X-MAP:URI=\"{uri}\"\n"));
+            }
+            for (seg, _start, len) in playlist_segments(part.duration_secs, part.frame_rate_mille) {
+                body.push_str(&format!("#EXTINF:{len:.3},\n"));
+                body.push_str(&with_cache_epoch(
+                    &(part.segment_uri)(seg),
+                    self.cache_epoch,
+                ));
+                body.push('\n');
+            }
         }
         body.push_str("#EXT-X-ENDLIST\n");
         body
@@ -5884,6 +6034,7 @@ mod tests {
             init_uri: None,
             start_offset_secs: None,
             segment_uri: &uri,
+            parts: Vec::new(),
         }
         .render(20.0, Some(23_976));
 
@@ -5895,6 +6046,7 @@ mod tests {
             init_uri: Some("/videos/9/h264cmaf/init.mp4?q=1".into()),
             start_offset_secs: Some(12.5),
             segment_uri: &cmaf_uri,
+            parts: Vec::new(),
         }
         .render(20.0, Some(23_976));
 
@@ -5953,6 +6105,7 @@ mod tests {
             init_uri: None,
             start_offset_secs: None,
             segment_uri: &uri,
+            parts: Vec::new(),
         }
         .render(20.0, Some(23_976));
         let expected: Vec<(u32, f64, f64)> = playlist_segments(20.0, Some(23_976)).collect();
@@ -5980,6 +6133,7 @@ mod tests {
             init_uri: None,
             start_offset_secs: None,
             segment_uri: &uri,
+            parts: Vec::new(),
         }
         .render(12.0, None);
         assert!(!body.contains("#EXT-X-START"), "{body}");
@@ -6150,6 +6304,72 @@ mod tests {
         );
     }
 
+    /// V1154 — a split film's playlist lists each later part after a
+    /// discontinuity, with the part's own init and segments, all reading the
+    /// part's file through its media source id.
+    #[::core::prelude::v1::test]
+    fn a_split_films_playlist_runs_on_into_its_parts() {
+        let part = HlsPart {
+            source_id: "0000000000000000000000000000002a-part-2".into(),
+            path: "/m/G/G (2003) cd2.mp4".into(),
+            edition: "part-2".into(),
+            duration_seconds: 9.0,
+            frame_rate_mille: Some(25_000),
+        };
+        let qs = "PlaySessionId=p&MediaSourceId=0000000000000000000000000000002a&g=17";
+        // A part shares its film's id, so its segments carry its own source
+        // generation, as an edition's do.
+        assert!(
+            part_qs(qs, &part).starts_with(
+                "PlaySessionId=p&g=17&MediaSourceId=0000000000000000000000000000002a-part-2&s="
+            ),
+            "{}",
+            part_qs(qs, &part)
+        );
+        let part_qs_value = part_qs(qs, &part);
+        let pl = MediaPlaylist {
+            version: 7,
+            independent_segments: true,
+            init_uri: Some(format!("/videos/7/vp9/init.mp4?{qs}")),
+            start_offset_secs: None,
+            cache_epoch: 0,
+            segment_uri: &|seg| format!("/videos/7/vp9/{seg}.m4s?{qs}"),
+            parts: vec![PlaylistPart {
+                duration_secs: part.duration_seconds,
+                frame_rate_mille: part.frame_rate_mille,
+                init_uri: Some(format!("/videos/7/vp9/init.mp4?{part_qs_value}")),
+                segment_uri: Box::new(|seg| {
+                    format!("/videos/7/vp9/{seg}.m4s?{}", part_qs(qs, &part))
+                }),
+            }],
+        };
+        let body = pl.render(12.0, Some(25_000));
+        let lines: Vec<&str> = body.lines().collect();
+        let at = lines
+            .iter()
+            .position(|l| *l == "#EXT-X-DISCONTINUITY")
+            .expect("a discontinuity before the second part");
+        assert_eq!(
+            lines.get(at + 1).copied(),
+            Some(format!("#EXT-X-MAP:URI=\"/videos/7/vp9/init.mp4?{part_qs_value}\"").as_str())
+        );
+        let first: Vec<_> = lines[..at]
+            .iter()
+            .filter(|l| l.starts_with("/videos/"))
+            .collect();
+        let second: Vec<_> = lines[at..]
+            .iter()
+            .filter(|l| l.starts_with("/videos/"))
+            .collect();
+        assert_eq!(first.len(), 2, "{body}");
+        assert_eq!(second.len(), 2, "{body}");
+        assert!(
+            second[0].starts_with("/videos/7/vp9/0.m4s?") && second[0].contains("-part-2&s="),
+            "{body}"
+        );
+        assert_eq!(lines.last().copied(), Some("#EXT-X-ENDLIST"));
+    }
+
     /// T121 — the epoch, when set, must reach the URLs a client is handed.
     #[::core::prelude::v1::test]
     fn a_cache_epoch_is_stamped_onto_segment_and_init_uris() {
@@ -6160,6 +6380,7 @@ mod tests {
             start_offset_secs: None,
             cache_epoch: 3,
             segment_uri: &|seg| format!("/videos/7/h264cmaf/{seg}.m4s?g=17"),
+            parts: Vec::new(),
         };
         let body = pl.render(12.0, Some(24_000));
         assert!(
@@ -6186,6 +6407,7 @@ mod tests {
             start_offset_secs: None,
             cache_epoch: 0,
             segment_uri: &|seg| format!("/videos/7/h264cmaf/{seg}.m4s?g=17"),
+            parts: Vec::new(),
         };
         let body = pl.render(12.0, Some(24_000));
         assert!(!body.contains("e="), "no epoch parameter at all: {body}");
