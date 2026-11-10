@@ -318,6 +318,10 @@ pub struct AppState {
     /// `played=true`. Surfaced here so handlers stay zero-allocation
     /// per-request.
     pub played_threshold_pct: u32,
+    /// Spec 038 FR-107 — the earliest position stored as a resume point
+    /// (`[server].min_resume_pct` and `min_resume_secs`). Off until boot
+    /// sets it from the config, so a test state keeps every position.
+    pub min_resume: crate::services::play_state::MinResume,
     /// Whether the DLNA / UPnP HTTP routes answer (`[server].dlna_enabled`).
     /// UPnP has no authentication, so they are off unless asked for (V190).
     pub dlna_enabled: bool,
@@ -806,6 +810,7 @@ impl AppState {
             session_starts: crate::session_start::SessionStarts::new(),
             segment_refetches: crate::session_start::SegmentRefetches::new(),
             played_threshold_pct: 90,
+            min_resume: crate::services::play_state::MinResume::OFF,
             dlna_enabled: false,
             progress_writes: Arc::new(crate::progress_writes::ProgressCoalescer::new(
                 std::time::Duration::from_secs(crate::progress_writes::DEFAULT_INTERVAL_SECS),
@@ -948,6 +953,7 @@ impl AppState {
             session_starts: crate::session_start::SessionStarts::new(),
             segment_refetches: crate::session_start::SegmentRefetches::new(),
             played_threshold_pct: 90,
+            min_resume: crate::services::play_state::MinResume::OFF,
             dlna_enabled: false,
             progress_writes: Arc::new(crate::progress_writes::ProgressCoalescer::new(
                 std::time::Duration::from_secs(crate::progress_writes::DEFAULT_INTERVAL_SECS),
@@ -1039,6 +1045,15 @@ impl AppState {
 
     pub fn with_played_threshold_pct(mut self, pct: u32) -> Self {
         self.played_threshold_pct = pct.clamp(50, 100);
+        self
+    }
+
+    /// Clamped so a typo can neither keep every touch nor drop most of a film.
+    pub fn with_min_resume(mut self, pct: u32, secs: u32) -> Self {
+        self.min_resume = crate::services::play_state::MinResume {
+            pct: pct.min(MIN_RESUME_PCT_MAX),
+            secs: secs.min(MIN_RESUME_SECS_MAX),
+        };
         self
     }
 
@@ -1611,6 +1626,11 @@ async fn load_image_tag_key(
         ))
     })
 }
+
+/// Largest `[server].min_resume_pct`: past it the minimum eats a real part of a film.
+const MIN_RESUME_PCT_MAX: u32 = 10;
+/// Largest `[server].min_resume_secs`: ten minutes.
+const MIN_RESUME_SECS_MAX: u32 = 600;
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]

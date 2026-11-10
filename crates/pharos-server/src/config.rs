@@ -658,6 +658,15 @@ pub struct ServerConfig {
     /// on read so a typo doesn't make every touch mark played.
     #[serde(default = "default_played_threshold_pct")]
     pub played_threshold_pct: u32,
+    /// Spec 038 FR-107, ADR-0114 — a video stopped before the larger of this
+    /// share of its runtime and `min_resume_secs` keeps no resume point.
+    /// Clamped to at most 10.
+    #[serde(default = "default_min_resume_pct")]
+    pub min_resume_pct: u32,
+    /// The seconds half of the minimum resume point, for video and songs
+    /// alike. Books have none. Clamped to at most 600.
+    #[serde(default = "default_min_resume_secs")]
+    pub min_resume_secs: u32,
     /// Seconds between database writes of one play session's resume position.
     /// Clients report every ~10 s; writing each report made the progress
     /// route the busiest in the server. A report is still written at once on
@@ -940,6 +949,14 @@ fn default_native_max_connections_per_user() -> NonZeroU32 {
 
 fn default_played_threshold_pct() -> u32 {
     90
+}
+
+fn default_min_resume_pct() -> u32 {
+    crate::services::play_state::MinResume::default().pct
+}
+
+fn default_min_resume_secs() -> u32 {
+    crate::services::play_state::MinResume::default().secs
 }
 
 fn default_playback_progress_persist_secs() -> u64 {
