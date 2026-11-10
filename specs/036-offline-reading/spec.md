@@ -1,13 +1,13 @@
 # Spec 036: read books offline
 
-- **Status:** draft; choice 1 decided 2026-11-10 (all three, configurable)
+- **Status:** accepted 2026-11-10; slices 1–3 merged (#1172, #1178, #1195), newer-place fix #1201 and slice 4 in review
 - **Created:** 2026-11-10T06:00:00Z
 - **Input:** "I want the option of allowing the user to read offline if they are
   reading on the train and they go through a tunnel. They would need the wasm
   reader and the book for that." (Alison, 2026-11-10)
 - **Depends on:** 023 (the reader: EPUB slices 1–4, PDF slice 5 #1162),
   ADR-0047, 017 (native API)
-- **Ids:** bugs B1170–B1179, invariants V1130–V1139, ADR 0110 (service worker and cache design).
+- **Ids:** bugs B1170–B1179, invariants V1130–V1139 and V1184–V1186, ADR 0110 (service worker and cache design).
 
 ## Problem
 
