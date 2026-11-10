@@ -158,6 +158,10 @@ pub struct Together {
     /// Why the last create or join failed. It lives with the app, not a
     /// screen: the attempt outlasts the screen that started it.
     pub error: Signal<Option<String>>,
+    /// News about the group that is not a failure of what the viewer just
+    /// did, such as a reload that could not rejoin it: a timed status note
+    /// over the video, never a pinned alert (spec 038 FR-501).
+    pub note: Signal<Option<String>>,
     ui: Coroutine<Ui>,
     seat: Rc<Seat<Groups, AppEnv>>,
 }
@@ -167,6 +171,7 @@ impl Together {
         Self {
             view,
             error,
+            note: Signal::new(None),
             ui,
             seat: Rc::new(Seat::new(platform::info)),
         }
@@ -285,7 +290,7 @@ mod tests {
     fn a_failed_rejoin_says_so_and_carries_the_reason() {
         assert_eq!(
             rejoin_failure("This group has ended"),
-            "Couldn't rejoin your group, so you're watching on your own. (This group has ended)"
+            "Couldn't rejoin your group (This group has ended)"
         );
     }
 
