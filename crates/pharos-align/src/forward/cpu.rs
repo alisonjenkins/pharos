@@ -170,6 +170,8 @@ pub struct CpuModel {
 pub enum LoadError {
     #[error(transparent)]
     Weights(#[from] WeightsError),
+    #[error("this CPU lacks {feature}, which the CPU forward pass is built around")]
+    MissingFeature { feature: &'static str },
     #[error("building the {threads}-thread pool: {source}")]
     Pool {
         threads: usize,
@@ -189,10 +191,38 @@ struct Bufs {
     col: Vec<f32>,
 }
 
+/// The features the pass was measured with: OpenBLAS's and gemm's kernels
+/// fall back to far slower code without them (spec 039, R16), so a node
+/// without them is refused at start rather than left to align slowly.
+const FEATURES: [&str; 2] = ["avx2", "fma"];
+
+/// The first of `FEATURES` that `has` reports missing.
+fn missing_feature(has: impl Fn(&str) -> bool) -> Option<&'static str> {
+    FEATURES.into_iter().find(|f| !has(f))
+}
+
+/// Refuses a CPU without AVX2 and FMA, naming the missing feature.
+pub fn check_cpu() -> Result<(), LoadError> {
+    #[cfg(target_arch = "x86_64")]
+    let has = |f: &str| match f {
+        "avx2" => std::arch::is_x86_feature_detected!("avx2"),
+        "fma" => std::arch::is_x86_feature_detected!("fma"),
+        _ => false,
+    };
+    // Other architectures have their own SIMD and no x86 features to check.
+    #[cfg(not(target_arch = "x86_64"))]
+    let has = |_: &str| true;
+    match missing_feature(has) {
+        Some(feature) => Err(LoadError::MissingFeature { feature }),
+        None => Ok(()),
+    }
+}
+
 impl CpuModel {
     /// Checks every tensor's shape and builds the derived weights; `threads`
     /// sizes both the rayon pool and OpenBLAS.
     pub fn load(weights: Weights, threads: usize) -> Result<Self, LoadError> {
+        check_cpu()?;
         let w = &weights;
         let v = |n: &str, shape: &[usize]| w.get(n, shape).map(<[f32]>::to_vec);
         let ln = |p: &str, n: usize| -> Result<Norm, WeightsError> {
@@ -614,7 +644,21 @@ fn attention(qkv: &[f32], segs: &[(usize, usize)], out: &mut [f32]) {
 
 #[cfg(test)]
 mod tests {
-    use super::CpuModel;
+    use super::{missing_feature, CpuModel, LoadError};
+
+    #[test]
+    fn a_cpu_without_avx2_or_fma_is_refused_by_name() {
+        assert_eq!(missing_feature(|_| true), None);
+        assert_eq!(missing_feature(|f| f != "avx2"), Some("avx2"));
+        assert_eq!(missing_feature(|f| f != "fma"), Some("fma"));
+        let e = LoadError::MissingFeature { feature: "avx2" };
+        assert_eq!(
+            e.to_string(),
+            "this CPU lacks avx2, which the CPU forward pass is built around"
+        );
+        // The machines this runs on have both.
+        assert!(super::check_cpu().is_ok());
+    }
 
     #[test]
     fn frames_follow_the_conv_strides() {
