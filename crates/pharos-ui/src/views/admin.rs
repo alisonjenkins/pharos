@@ -936,41 +936,61 @@ fn DevicesPane(
                                 td { "{d.app_name}" }
                                 td { "{d.last_user_name}" }
                                 td {
-                                    div {
-                                        class: "pharos-manage-badges pharos-admin-device-audio",
-                                        role: "group",
-                                        aria_label: "Sound formats converted for {d.name}",
-                                        "aria-busy": "{saving.contains(&d.id)}",
-                                        for (codec, label) in DENIABLE_AUDIO_CODECS {
-                                            {
-                                                let denied = d
-                                                    .no_direct_play_audio_codecs
-                                                    .iter()
-                                                    .any(|c| c.eq_ignore_ascii_case(codec));
-                                                let busy = saving.contains(&d.id);
-                                                let device_id = d.id.clone();
-                                                let current = d.no_direct_play_audio_codecs.clone();
-                                                rsx! {
-                                                    button {
-                                                        key: "{codec}",
-                                                        r#type: "button",
-                                                        class: "pharos-manage-badge pharos-admin-device-codec",
-                                                        "aria-pressed": "{denied}",
-                                                        disabled: busy,
-                                                        onclick: move |_| {
-                                                            on_action.call(AdminAction::SetDeviceAudioDeny {
-                                                                device_id: device_id.clone(),
-                                                                codecs: toggled_codecs(&current, codec),
-                                                            })
-                                                        },
-                                                        "{label}"
-                                                    }
-                                                }
+                                    DeviceSoundFormats {
+                                        device: d.clone(),
+                                        busy: saving.contains(&d.id),
+                                        on_change: {
+                                            let device_id = d.id.clone();
+                                            move |codecs| {
+                                                on_action.call(AdminAction::SetDeviceAudioDeny {
+                                                    device_id: device_id.clone(),
+                                                    codecs,
+                                                })
                                             }
-                                        }
+                                        },
                                     }
                                 }
                             }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// One device's sound-format toggles: each pressed format is converted for
+/// the device instead of sent as it is. A click hands `on_change` the whole
+/// new list; `busy` disables them while a save for this device is in flight.
+/// Shared by Manage → Devices and the user's own Settings → Devices.
+#[component]
+pub fn DeviceSoundFormats(
+    device: DeviceEntry,
+    busy: bool,
+    on_change: EventHandler<Vec<String>>,
+) -> Element {
+    rsx! {
+        div {
+            class: "pharos-manage-badges pharos-admin-device-audio",
+            role: "group",
+            aria_label: "Sound formats converted for {device.name}",
+            "aria-busy": "{busy}",
+            for (codec, label) in DENIABLE_AUDIO_CODECS {
+                {
+                    let denied = device
+                        .no_direct_play_audio_codecs
+                        .iter()
+                        .any(|c| c.eq_ignore_ascii_case(codec));
+                    let current = device.no_direct_play_audio_codecs.clone();
+                    rsx! {
+                        button {
+                            key: "{codec}",
+                            r#type: "button",
+                            class: "pharos-manage-badge pharos-admin-device-codec",
+                            "aria-pressed": "{denied}",
+                            disabled: busy,
+                            onclick: move |_| on_change.call(toggled_codecs(&current, codec)),
+                            "{label}"
                         }
                     }
                 }
