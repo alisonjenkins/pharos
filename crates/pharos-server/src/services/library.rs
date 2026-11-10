@@ -151,6 +151,41 @@ pub async fn latest(
     kinds: &KindFilter,
     limit: Option<u32>,
 ) -> Result<Vec<(MediaItem, UserItemData)>, ListError> {
+    let mut typed = newest_items(state, user, parent_id, kinds, limit).await?;
+    crate::services::metadata_text::localize_items(state, user.id, typed.iter_mut()).await;
+    items_with_user_data(state, user, typed).await
+}
+
+/// `items`, each with `user`'s play state, in one read.
+async fn items_with_user_data(
+    state: &AppState,
+    user: &User,
+    items: Vec<MediaItem>,
+) -> Result<Vec<(MediaItem, UserItemData)>, ListError> {
+    let ids: Vec<u64> = items.iter().map(|i| i.id).collect();
+    let user_data = state
+        .stores
+        .user_data_bulk(user.id, &ids)
+        .await
+        .map_err(ListError::Store)?;
+    Ok(items
+        .into_iter()
+        .enumerate()
+        .map(|(i, item)| {
+            let ud = user_data.get(i).copied().unwrap_or_default();
+            (item, ud)
+        })
+        .collect())
+}
+
+/// [`latest`]'s rows, without play state or localised text.
+async fn newest_items(
+    state: &AppState,
+    user: &User,
+    parent_id: Option<&str>,
+    kinds: &KindFilter,
+    limit: Option<u32>,
+) -> Result<Vec<MediaItem>, ListError> {
     use crate::api::jellyfin::items::{
         apply_policy_scope, resolve_parent_filter, ParentResolution,
     };
@@ -188,20 +223,110 @@ pub async fn latest(
         ParentResolution::GenreProbe(t) => mq.filters.genre_probe_token = Some(t),
     }
     apply_policy_scope(&mut mq, &user.policy, &state.parental_ratings);
-    let (mut typed, _total) = state.stores.query(&mq).await.map_err(ListError::Store)?;
-    crate::services::metadata_text::localize_items(state, user.id, typed.iter_mut()).await;
-    let ids: Vec<u64> = typed.iter().map(|i| i.id).collect();
-    let user_data = state
-        .stores
-        .user_data_bulk(user.id, &ids)
-        .await
-        .map_err(ListError::Store)?;
-    Ok(typed
+    let (typed, _total) = state.stores.query(&mq).await.map_err(ListError::Store)?;
+    Ok(typed)
+}
+
+/// One tile of a latest rail (spec 038 FR-106).
+#[derive(Debug)]
+pub enum LatestTile {
+    /// An item added on its own.
+    Item(Box<MediaItem>, UserItemData),
+    /// The series or album several of the newest items belong to: its DTO,
+    /// dated by its newest child, and how many of them there are.
+    Group {
+        dto: serde_json::Value,
+        new_children: u32,
+    },
+}
+
+/// What a newly added item folds under on a latest rail.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum Fold {
+    Own(u64),
+    /// An episode, by its series' identity key (spec 033).
+    Series(String),
+    /// A track, by its album name, as the album listing keys it.
+    Album(String),
+}
+
+fn fold_of(item: &MediaItem) -> Fold {
+    match (item.kind, item.series.as_ref(), item.probe.album.as_deref()) {
+        (MediaKind::Episode, Some(series), _) => Fold::Series(series.series_key().to_string()),
+        (MediaKind::Audio, _, Some(album)) if !album.is_empty() => Fold::Album(album.to_owned()),
+        _ => Fold::Own(item.id),
+    }
+}
+
+/// A latest rail under `parent_id`: the newest [`LATEST_MAX`] items, with the
+/// episodes of one series and the tracks of one album folded into one tile
+/// placed where its newest child was; a series or album with a single new
+/// child shows that child. At most `limit` tiles (`None` is the cap). Films
+/// and books are unchanged.
+pub async fn latest_tiles(
+    state: &AppState,
+    user: &User,
+    parent_id: Option<&str>,
+    kinds: &KindFilter,
+    limit: Option<u32>,
+) -> Result<Vec<LatestTile>, ListError> {
+    let limit = limit.unwrap_or(LATEST_MAX).min(LATEST_MAX) as usize;
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let newest = newest_items(state, user, parent_id, kinds, Some(LATEST_MAX)).await?;
+    let mut groups: Vec<Vec<MediaItem>> = Vec::new();
+    let mut at: std::collections::HashMap<Fold, usize> = std::collections::HashMap::new();
+    for item in newest {
+        match at.get(&fold_of(&item)) {
+            Some(&i) => {
+                if let Some(group) = groups.get_mut(i) {
+                    group.push(item);
+                }
+            }
+            None if groups.len() < limit => {
+                at.insert(fold_of(&item), groups.len());
+                groups.push(vec![item]);
+            }
+            None => {}
+        }
+    }
+    let mut singles: Vec<MediaItem> = Vec::new();
+    let mut tiles: Vec<Option<LatestTile>> = Vec::with_capacity(groups.len());
+    for mut group in groups {
+        if group.len() == 1 {
+            singles.extend(group.pop());
+            tiles.push(None);
+            continue;
+        }
+        let children: Vec<&MediaItem> = group.iter().collect();
+        let dto = crate::api::jellyfin::items::latest_group_dto(state, user.id, &children)
+            .await
+            .map_err(ListError::Store)?;
+        match dto {
+            Some(dto) => tiles.push(Some(LatestTile::Group {
+                dto,
+                new_children: u32::try_from(group.len()).unwrap_or(u32::MAX),
+            })),
+            // Not a series or an album after all: list its newest child.
+            None => {
+                group.truncate(1);
+                singles.extend(group.pop());
+                tiles.push(None);
+            }
+        }
+    }
+    crate::services::metadata_text::localize_items(state, user.id, singles.iter_mut()).await;
+    let mut singles = items_with_user_data(state, user, singles)
+        .await?
+        .into_iter();
+    Ok(tiles
         .into_iter()
-        .enumerate()
-        .map(|(i, item)| {
-            let ud = user_data.get(i).copied().unwrap_or_default();
-            (item, ud)
+        .filter_map(|tile| match tile {
+            Some(group) => Some(group),
+            None => singles
+                .next()
+                .map(|(item, data)| LatestTile::Item(Box::new(item), data)),
         })
         .collect())
 }
@@ -1476,7 +1601,7 @@ pub const WATCHING_KINDS: [MediaKind; 2] = [MediaKind::Movie, MediaKind::Episode
 /// music to resume, the books part read, and what is next up.
 #[derive(Debug)]
 pub struct Home {
-    pub rails: Vec<(LibraryView, Vec<(MediaItem, UserItemData)>)>,
+    pub rails: Vec<(LibraryView, Vec<LatestTile>)>,
     pub resume: ListPage,
     pub listening: ListPage,
     /// Books part read (FR-012).
@@ -1484,7 +1609,7 @@ pub struct Home {
     pub next_up: ListPage,
 }
 
-/// The home page for `user`, from [`views`], [`latest`], [`resume`] and
+/// The home page for `user`, from [`views`], [`latest_tiles`], [`resume`] and
 /// [`next_up`]. A limit of `None` takes that rail's `HOME_*_DEFAULT`;
 /// `resume_limit` sizes both resume rows.
 pub async fn home(
@@ -1497,7 +1622,7 @@ pub async fn home(
     let latest_n = Some(latest_per_view.unwrap_or(HOME_LATEST_DEFAULT));
     let views = views(state, &user.policy).await;
     let rails = futures_util::future::try_join_all(views.into_iter().map(|view| async move {
-        let items = latest(state, user, Some(&view.id), &KindFilter::Unset, latest_n).await?;
+        let items = latest_tiles(state, user, Some(&view.id), &KindFilter::Unset, latest_n).await?;
         Ok::<_, ListError>((view, items))
     }));
     let resume_n = Some(resume_limit.unwrap_or(HOME_RESUME_DEFAULT));

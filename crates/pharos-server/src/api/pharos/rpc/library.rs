@@ -877,7 +877,7 @@ fn write_home(
             return;
         }
     };
-    let rails: Vec<(WireId, &LibraryView, &Rows)> = home
+    let rails: Vec<(WireId, &LibraryView, &[library::LatestTile])> = home
         .rails
         .iter()
         .filter_map(|(view, items)| match WireId::parse(&view.id) {
@@ -894,7 +894,7 @@ fn write_home(
     for (i, (id, view, items)) in (0..count).zip(&rails) {
         let mut rail = list.reborrow().get(i);
         write_view(rail.reborrow().init_view(), *id, view, key);
-        write_items(
+        write_tiles(
             rail.init_latest(len_u32(items)),
             items,
             server_id,
@@ -945,6 +945,38 @@ fn len_u32<T>(items: &[T]) -> u32 {
     u32::try_from(items.len()).unwrap_or(u32::MAX)
 }
 
+/// A latest rail's `tiles` into `out`, which holds `len_u32(tiles)`
+/// summaries: an item as any listing writes it, a group as its series or
+/// album with its count of new children (spec 038 FR-106).
+fn write_tiles(
+    mut out: capnp::struct_list::Builder<'_, item_summary::Owned>,
+    tiles: &[library::LatestTile],
+    server_id: &str,
+    key: &ImageTagKey,
+    damaged: &DamagedIds,
+    reads: &Reads,
+) {
+    for (i, tile) in (0..out.len()).zip(tiles) {
+        let mut summary = out.reborrow().get(i);
+        match tile {
+            library::LatestTile::Item(item, user_data) => {
+                write_items_one(summary, item, *user_data, server_id, key, damaged, reads);
+            }
+            library::LatestTile::Group { dto, new_children } => {
+                let Some(id) = WireId::parse(dto_str(dto, "Id")) else {
+                    tracing::warn!(
+                        id = dto_str(dto, "Id"),
+                        "native library: latest group id is not a wire id; written empty"
+                    );
+                    continue;
+                };
+                write_synth_summary(summary.reborrow(), id, dto, key);
+                summary.set_new_children(*new_children);
+            }
+        }
+    }
+}
+
 /// `items` into `out`, which holds `len_u32(items)` summaries.
 fn write_items(
     mut out: capnp::struct_list::Builder<'_, item_summary::Owned>,
@@ -955,19 +987,25 @@ fn write_items(
     reads: &Reads,
 ) {
     for (i, (item, user_data)) in (0..out.len()).zip(items) {
-        let mut summary = out.reborrow().get(i);
-        write_item(
-            summary.reborrow(),
-            item,
-            *user_data,
-            server_id,
-            key,
-            damaged,
-        );
-        if let Some(position) = reads.get(item.id) {
-            if let Ok(state) = summary.get_user_state() {
-                write_read_state(state, position);
-            }
+        let summary = out.reborrow().get(i);
+        write_items_one(summary, item, *user_data, server_id, key, damaged, reads);
+    }
+}
+
+/// One listed `item` into `summary`, with its saved read position if a book.
+fn write_items_one(
+    mut summary: item_summary::Builder<'_>,
+    item: &MediaItem,
+    user_data: UserItemData,
+    server_id: &str,
+    key: &ImageTagKey,
+    damaged: &DamagedIds,
+    reads: &Reads,
+) {
+    write_item(summary.reborrow(), item, user_data, server_id, key, damaged);
+    if let Some(position) = reads.get(item.id) {
+        if let Ok(state) = summary.get_user_state() {
+            write_read_state(state, position);
         }
     }
 }
@@ -1004,9 +1042,13 @@ impl Reads {
         let books: Vec<u64> = home
             .rails
             .iter()
-            .flat_map(|(_, rows)| rows.iter())
-            .chain(&home.resume.items)
-            .chain(&home.reading.items)
+            .flat_map(|(_, tiles)| tiles.iter())
+            .filter_map(|tile| match tile {
+                library::LatestTile::Item(item, data) => Some((item.as_ref(), data)),
+                library::LatestTile::Group { .. } => None,
+            })
+            .chain(home.resume.items.iter().map(|(i, d)| (i, d)))
+            .chain(home.reading.items.iter().map(|(i, d)| (i, d)))
             .filter(|(item, _)| item.kind == MediaKind::Book)
             .map(|(item, _)| item.id)
             .collect();
