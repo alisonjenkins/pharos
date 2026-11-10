@@ -6705,8 +6705,17 @@ fn Player(
                             };
                             start_resume(VIDEO_ID, item, &resume)
                         });
+                    // Read before the group acts: the browser's own flag
+                    // lifts on pointerdown, before this click arrives.
+                    let refused = *autoplay_refused.peek();
                     if !session().is_some_and(|s| s.toggle_play()) {
                         platform::toggle_play(VIDEO_ID);
+                    } else if refused {
+                        // The group's unpause lands after this gesture ends,
+                        // and some browsers (WebKit) only let a play() made
+                        // inside the gesture through; start the local player
+                        // now (038 FR-407, V1223).
+                        platform::play(VIDEO_ID);
                     }
                     if let Some(n) = resuming {
                         spawn(watch_resume(VIDEO_ID, Rc::clone(&resume), n));
