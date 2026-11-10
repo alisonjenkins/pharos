@@ -135,24 +135,28 @@ pub fn FavouritesView(favourites: Favourites) -> Element {
                     "Nothing here yet. Press Favourite on a film, show, episode or song (or f on its page) and it shows up here."
                 }
             }
-            for rail in favourites.rails.iter().filter(|rail| !rail.items.is_empty()) {
-                Rail {
-                    key: "{title_of(rail.kind)}",
-                    title: title_of(rail.kind).to_owned(),
-                    link: None,
-                    items: rail.items.clone(),
-                }
-                if let Some(note) = rail.more_note() {
-                    p { class: "pharos-muted", "{note}" }
-                }
-            }
-            // Every episode read so far folded into a favourite show, and the
-            // server holds more: say so rather than drop the rail unseen.
-            for rail in favourites.rails.iter().filter(|rail| rail.items.is_empty() && rail.more_note().is_some()) {
-                section { key: "{title_of(rail.kind)}", class: "pharos-rail",
-                    h2 { class: "pharos-rail-title", "{title_of(rail.kind)}" }
-                    p { class: "pharos-muted",
-                        "The first {rail.loaded} belong to the shows above; there are more."
+            // One pass, so every rail keeps its place in [`KINDS`].
+            for rail in favourites.rails.iter().filter(|rail| !rail.items.is_empty() || rail.more_note().is_some()) {
+                div { key: "{title_of(rail.kind)}", class: "pharos-favourites-kind",
+                    if rail.items.is_empty() {
+                        // Every episode read so far folded into a favourite
+                        // show, and the server holds more: say so rather
+                        // than drop the rail unseen.
+                        section { class: "pharos-rail",
+                            h2 { class: "pharos-rail-title", "{title_of(rail.kind)}" }
+                            p { class: "pharos-muted",
+                                "The first {rail.loaded} belong to the shows above; there are more."
+                            }
+                        }
+                    } else {
+                        Rail {
+                            title: title_of(rail.kind).to_owned(),
+                            link: None,
+                            items: rail.items.clone(),
+                        }
+                        if let Some(note) = rail.more_note() {
+                            p { class: "pharos-muted", "{note}" }
+                        }
                     }
                 }
             }
@@ -294,11 +298,22 @@ mod tests {
                 page(vec![item(2, ItemKind::Series, "Frieren", None)]),
             ),
             (ItemKind::Episode, episodes),
+            (
+                ItemKind::Audio,
+                page(vec![item(6, ItemKind::Audio, "Zanarkand", None)]),
+            ),
         ]));
         assert!(
-            html.contains(">Episodes<")
-                && html.contains("The first 1 belong to the shows above; there are more."),
+            html.contains("The first 1 belong to the shows above; there are more."),
             "{html}"
+        );
+        let at: Vec<usize> = [">Shows<", ">Episodes<", ">Songs<"]
+            .iter()
+            .filter_map(|title| html.find(title))
+            .collect();
+        assert!(
+            at.len() == 3 && at[0] < at[1] && at[1] < at[2],
+            "every rail shows, in the page's order: {html}"
         );
         assert!(!html.contains("Nothing here yet"), "{html}");
     }
