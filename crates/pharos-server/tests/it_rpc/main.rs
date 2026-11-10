@@ -6,6 +6,8 @@
 
 #[path = "../common/mod.rs"]
 mod common;
+#[path = "../common/store_calls.rs"]
+mod store_calls;
 
 mod avatar;
 mod bootstrap;
