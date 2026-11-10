@@ -18,7 +18,10 @@ use super::stereo::{self, FrameRect, ViewMode};
 
 use super::art::Art;
 use super::damage::{in_span, PlayerDamageNote};
-use super::listen::{Icon, QueuePanel, ICON_FLOAT, ICON_PIP, ICON_QUEUE_NEXT, QUEUE_PANEL_ID};
+use super::listen::{
+    Icon, QueuePanel, ICON_FLOAT, ICON_LEAVE, ICON_MUTED, ICON_PIP, ICON_QUEUE_NEXT, ICON_VOLUME,
+    QUEUE_PANEL_ID,
+};
 use super::platform;
 use super::playback::{
     clock, cues_at, left_to_watch, percent, position_at, segment_at, share, skip_label, thumb_at,
@@ -26,7 +29,7 @@ use super::playback::{
 };
 use super::queue::{Entry, QueueAction};
 use super::seen::SeenRow;
-use super::stage::STAGE_EXPAND_ID;
+use super::stage::{ICON_FULL, ICON_NEXT, ICON_PAUSE, ICON_PLAY, ICON_PREVIOUS, STAGE_EXPAND_ID};
 use super::together::Member;
 use super::together_view::{GroupNotes, InvitePanel, MemberStrip, NotesView};
 use super::views::{ends_at, episode_label, use_ends_at_refresh};
@@ -979,7 +982,7 @@ pub fn WatchView(
                         r#type: "button",
                         aria_label: "Back",
                         onclick: move |_| on_control.call(Control::Back),
-                        "←"
+                        Icon { path: ICON_LEAVE }
                     }
                     div { class: "pharos-watch-heading",
                         h2 { class: "pharos-watch-title", "{title}" }
@@ -1092,7 +1095,7 @@ pub fn WatchView(
                             r#type: "button",
                             aria_label: if media.paused { "Play" } else { "Pause" },
                             onclick: move |_| on_control.call(Control::TogglePlay),
-                            if media.paused { "▶" } else { "❚❚" }
+                            Icon { path: if media.paused { ICON_PLAY } else { ICON_PAUSE } }
                         }
                         if let Some(id) = c.previous {
                             button {
@@ -1100,7 +1103,7 @@ pub fn WatchView(
                                 r#type: "button",
                                 aria_label: "Previous episode",
                                 onclick: move |_| on_control.call(Control::Play(id)),
-                                "⏮"
+                                Icon { path: ICON_PREVIOUS }
                             }
                         }
                         if let Some(id) = c.next {
@@ -1109,7 +1112,7 @@ pub fn WatchView(
                                 r#type: "button",
                                 aria_label: if next_queued { "Next in the queue" } else { "Next episode" },
                                 onclick: move |_| on_control.call(Control::Play(id)),
-                                "⏭"
+                                Icon { path: ICON_NEXT }
                             }
                         }
                         TimeLabels { segments: c.segments.clone(), pos, total, scrub: Some(scrub) }
@@ -1226,7 +1229,7 @@ pub fn WatchView(
                             r#type: "button",
                             aria_label: "Fullscreen",
                             onclick: move |_| on_control.call(Control::Fullscreen),
-                            "⛶"
+                            Icon { path: ICON_FULL }
                         }
                     }
                 }
@@ -1559,7 +1562,9 @@ pub(super) fn Volume(
             }),
             match icon {
                 Some(icon) => icon,
-                None => rsx! { if shown == 0.0 { "🔇" } else { "🔊" } },
+                None => rsx! {
+                    Icon { path: if shown == 0.0 { ICON_MUTED } else { ICON_VOLUME } }
+                },
             }
         }
         input {
@@ -2568,6 +2573,15 @@ mod tests {
 
     /// B569/V482: the knob rides the end of the fill, and a tick the video
     /// has passed is marked so it dims.
+    #[test]
+    fn the_player_draws_its_glyphs_as_icons_not_text() {
+        let html = render(controls());
+        for glyph in ["▶", "❚❚", "⏮", "⏭", "⛶", "🔇", "🔊", "←"] {
+            assert!(!html.contains(glyph), "{glyph} in {html}");
+        }
+        assert!(html.contains(ICON_PLAY) && html.contains(ICON_FULL), "{html}");
+    }
+
     #[test]
     fn the_menus_wait_behind_a_settings_button_the_sheet_opens() {
         let html = render(controls());
