@@ -71,4 +71,6 @@ pub mod tmdb;
 pub mod transcode_sessions;
 pub mod trickplay_backfill;
 pub mod tvdb;
+#[allow(dead_code)] // wired into TvdbClient in the next commit
+pub(crate) mod tvdb_list_cache;
 pub mod ui;
