@@ -320,6 +320,8 @@ pub async fn rust_subtitles(
 
 pub fn set_subtitle_controls_visible(_visible: bool) {}
 
+pub fn set_subtitle_delay(_video_id: &str, _delay_ms: i64) {}
+
 pub async fn video_metadata(_video_id: &str) {}
 
 pub struct StyledSubtitles;

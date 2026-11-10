@@ -5626,6 +5626,12 @@ fn Player(
     let mut buffered = use_signal(|| 0u64);
     // The viewer's playback speed (T038-305), 1.0 being normal.
     let mut speed = use_signal(|| 1.0f64);
+    // The viewer's subtitle delay in ms (T038-305). A new player starts
+    // at none, as a delay fits one file.
+    let mut subtitle_delay = use_signal(|| {
+        platform::set_subtitle_delay(VIDEO_ID, 0);
+        0i64
+    });
     let media_rest = use_memo(move || split_position(media()).0);
     // What a wait under the spinner is for (038 FR-401): whether this video
     // has played yet, and, once a wait passes `wait::HINT_AFTER_MS`, the
@@ -6842,6 +6848,14 @@ fn Player(
                     view_mode.set(mode);
                 }
                 Control::Quality(bps) => on_quality_pick.call(Some(bps)),
+                Control::SubtitleDelay(ms) => {
+                    platform::info(&format!(
+                        "pharos: subtitle delay from={} ms to={ms} ms",
+                        *subtitle_delay.peek()
+                    ));
+                    subtitle_delay.set(ms);
+                    platform::set_subtitle_delay(VIDEO_ID, ms);
+                }
                 Control::Speed(rate) => {
                     if session().is_some_and(|s| s.drives()) {
                         platform::info(&format!(
@@ -7267,6 +7281,7 @@ fn Player(
             .collect(),
         version: p.version.clone(),
         speed: speed(),
+        subtitle_delay_ms: subtitle_delay(),
         quality: QualityView {
             manual: manual_cap,
             auto: auto_cap,
