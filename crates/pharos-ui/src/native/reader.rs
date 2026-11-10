@@ -352,7 +352,21 @@ impl PendingSaves {
     /// The queue as kept; unreadable text is an empty queue (a lost queue
     /// costs a position, a crash costs the reader).
     pub fn parse(text: &str) -> Self {
-        Self(serde_json::from_str(text).unwrap_or_default())
+        Self::parse_counting(text).0
+    }
+
+    /// [`PendingSaves::parse`], also answering how many entries were dropped
+    /// because their key is not an item id (corrupt storage): they could
+    /// never be sent and would keep the retry loop and the note alive.
+    pub fn parse_counting(text: &str) -> (Self, usize) {
+        let all: BTreeMap<String, PendingSave> = serde_json::from_str(text).unwrap_or_default();
+        let total = all.len();
+        let kept: BTreeMap<String, PendingSave> = all
+            .into_iter()
+            .filter(|(k, _)| k.parse::<ItemRef>().is_ok())
+            .collect();
+        let dropped = total.saturating_sub(kept.len());
+        (Self(kept), dropped)
     }
 
     pub fn to_text(&self) -> String {
@@ -796,10 +810,15 @@ mod tests {
         for text in ["", "nope", "[]", "{\"1\":"] {
             assert!(PendingSaves::parse(text).is_empty(), "{text}");
         }
-        let odd =
-            PendingSaves::parse(r#"{"not an id":{"locator":"x","fraction":0.1,"read_at_ms":1}}"#);
-        assert_eq!(odd.len(), 1);
-        assert!(odd.entries().is_empty());
+        let (odd, dropped) = PendingSaves::parse_counting(
+            r#"{"not an id":{"locator":"x","fraction":0.1,"read_at_ms":1},"7":{"locator":"y","fraction":0.2,"read_at_ms":2}}"#,
+        );
+        assert_eq!(
+            (odd.len(), dropped),
+            (1, 1),
+            "a key that is no item id is dropped"
+        );
+        assert!(odd.contains(ItemRef::Real(7)));
     }
 
     #[test]

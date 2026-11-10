@@ -93,7 +93,16 @@ fn stored_settings() -> ReaderSettings {
 /// The saves still waiting for the server, read from this device.
 fn load_pending() -> PendingSaves {
     match platform::stored_theme(PENDING_KEY) {
-        Ok(Some(text)) => PendingSaves::parse(&text),
+        Ok(Some(text)) => {
+            let (queue, dropped) = PendingSaves::parse_counting(&text);
+            if dropped > 0 {
+                platform::warn(&format!(
+                    "pharos: reader pending dropped {dropped} entries with no item id"
+                ));
+                store_pending(&queue);
+            }
+            queue
+        }
         Ok(None) => PendingSaves::default(),
         Err(e) => {
             platform::warn(&format!("pharos: reader pending read failed error={e}"));
