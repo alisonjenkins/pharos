@@ -213,7 +213,13 @@ fn effective(
     let mut fx = fx.clone();
     fx.line = index;
     match level {
-        EffectsLevel::Off => return plain,
+        // Speaker colours are their own switch, on at any effects level.
+        EffectsLevel::Off => {
+            return LineEffect {
+                speaker: fx.speaker,
+                ..plain
+            }
+        }
         EffectsLevel::Subtle => {
             fx.intensity = fx.intensity.min(1);
             if fx.karaoke == Karaoke::Ember {
@@ -337,7 +343,7 @@ fn plain(line: &SourceLine, fx: &LineEffect, ease: Ease, theme: &Theme, tier: Ti
         tags.push_str(&effects::fad(line, fade_in, fade_out));
     }
     let text = format!("{}{}", brace(&tags), body);
-    Event::on(line, fx.line, names::DEFAULT, text)
+    Event::on(line, fx.line, theme.dialogue_style(fx.speaker), text)
 }
 
 fn brace(tags: &str) -> String {
@@ -670,6 +676,33 @@ mod tests {
     fn events_stay_inside_their_source_line() {
         let ass = run(&plain_plan(3), &lines(), Tier::Low, EffectsLevel::Full);
         assert!(dialogue(&ass)[1].starts_with("Dialogue: 0,0:00:04.00,0:00:05.50,"));
+    }
+
+    #[test]
+    fn speaker_slots_colour_plain_lines_only_when_the_theme_has_speakers() {
+        let lines = lines();
+        let mut plan = plain_plan(3);
+        plan.lines[0].speaker = Some(0);
+        plan.lines[2].speaker = Some(0);
+        let plain = run(&plan, &lines, Tier::Desktop, EffectsLevel::Full);
+        assert!(dialogue(&plain).iter().all(|d| d.contains(",Default,")));
+        for level in [EffectsLevel::Full, EffectsLevel::Off] {
+            let ass = compile(
+                &plan,
+                &lines,
+                &Theme::pharos().with_speakers(),
+                Tier::Desktop,
+                level,
+            );
+            let styles: Vec<_> = ass.lines().filter(|l| l.starts_with("Style:")).collect();
+            // Only the speaker styles some line uses are written.
+            assert_eq!(styles.len(), 2, "{styles:?}");
+            assert!(styles[1].starts_with("Style: Speaker1,Liberation Sans,"));
+            let d = dialogue(&ass);
+            assert!(d[0].contains(",Speaker1,"), "{}", d[0]);
+            assert!(d[1].contains(",Default,"), "{}", d[1]);
+            assert!(d[2].contains(",Speaker1,"), "{}", d[2]);
+        }
     }
 
     #[test]
