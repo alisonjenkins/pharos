@@ -461,6 +461,12 @@ pub fn scroll_to_tile(_at: u32) -> bool {
     false
 }
 
+pub fn scroll_y() -> Option<f64> {
+    None
+}
+
+pub fn scroll_to_y(_y: f64) {}
+
 pub fn scroll_to_top() {}
 
 pub fn tile_top(_at: u32) -> Option<f64> {
