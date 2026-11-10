@@ -100,7 +100,17 @@ pub fn StylePicker(current: Style, on_choose: EventHandler<Style>) -> Element {
                         class: "pharos-style-tile",
                         r#type: "button",
                         aria_pressed: if s == current { "true" } else { "false" },
-                        onclick: move |_| on_choose.call(s),
+                        // Choosing a style closes the grid and puts focus
+                        // back on the button, on the TV's remote as with a
+                        // click (B1038, V998).
+                        onclick: move |_| {
+                            on_choose.call(s);
+                            close();
+                            platform::info(&format!(
+                                "pharos: visualiser picker chosen={} shown=false",
+                                s.label()
+                            ));
+                        },
                         Thumbnail { style: s }
                         span { "{s.name()}" }
                     }
