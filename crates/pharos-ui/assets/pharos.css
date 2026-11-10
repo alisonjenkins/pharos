@@ -4188,6 +4188,33 @@ label.pharos-setting {
   color: var(--px-color-fg-muted);
   cursor: pointer;
 }
+/* Folds the queue buttons on a phone; hidden where they fit (FR-202). */
+.pharos-episode-more {
+  flex: 0 0 auto;
+  display: none;
+  place-items: center;
+  width: 2.25rem;
+  height: 2.25rem;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  background: none;
+  color: var(--px-color-fg);
+  cursor: pointer;
+}
+.pharos-episode-more svg {
+  width: 1.15rem;
+  height: 1.15rem;
+  fill: currentColor;
+}
+.pharos-episode-more:hover,
+.pharos-episode-more:focus-visible {
+  background: color-mix(in srgb, var(--px-color-fg) 12%, transparent);
+}
+.pharos-episode-more:focus-visible {
+  outline: 2px solid var(--px-color-focus);
+  outline-offset: 2px;
+}
 .pharos-episode-mark:hover {
   border-color: var(--px-color-accent);
   color: var(--px-color-fg);
@@ -4259,6 +4286,42 @@ label.pharos-setting {
   }
   .pharos-episode-still {
     flex-basis: 7rem;
+  }
+  /* FR-202: the name and still take the first line, the controls the
+     second; the name wraps to two lines; every target is 44px. */
+  .pharos-episode {
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    gap: 0.5rem;
+  }
+  .pharos-episode-link {
+    flex-basis: 100%;
+  }
+  .pharos-episode-name {
+    display: -webkit-box;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
+    line-clamp: 2;
+    white-space: normal;
+  }
+  .pharos-episode-mark,
+  .pharos-episode-more,
+  .pharos-episode .pharos-queue-button {
+    width: 2.75rem;
+    height: 2.75rem;
+    justify-content: center;
+  }
+  .pharos-episode-play {
+    box-sizing: border-box;
+    display: inline-flex;
+    align-items: center;
+    min-height: 2.75rem;
+  }
+  .pharos-episode-more {
+    display: grid;
+  }
+  .pharos-episode:not(.is-more-open) .pharos-queue-buttons[data-target="episode_row"] {
+    display: none;
   }
 }
 
