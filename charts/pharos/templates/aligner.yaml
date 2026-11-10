@@ -74,8 +74,16 @@ spec:
             - name: http
               containerPort: {{ $root.Values.aligner.port }}
               protocol: TCP
-          # /healthz answers once the model is serving; the Rust image warms
-          # every GPU window length first (10 s on a kept cache, ~40 s cold).
+          # The Rust image warms every GPU window length before it binds the
+          # port (10 s on a kept cache, ~40 s cold, longer on a slow device),
+          # so the startup probe allows 10 minutes and holds off the liveness
+          # probe until /healthz first answers.
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+            failureThreshold: 60
           readinessProbe:
             httpGet:
               path: /healthz
@@ -85,7 +93,6 @@ spec:
             httpGet:
               path: /healthz
               port: http
-            initialDelaySeconds: 60
             periodSeconds: 30
             failureThreshold: 5
           securityContext:
