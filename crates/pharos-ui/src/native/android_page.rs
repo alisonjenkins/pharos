@@ -1823,6 +1823,18 @@ addEventListener("keydown", (e) => {
     return;
   }
   const scrubbing = !!document.querySelector(".pharos-seek.is-scrubbing");
+  // OK on the picture presses Skip or Up Next while one shows (FR-604):
+  // the button is what the viewer is looking at.
+  if (e.key === "Enter" && onPlayer && !scrubbing) {
+    const press = player.querySelector('__OK_PRESSES__');
+    if (press && press.getClientRects().length > 0) {
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      press.click();
+      send({ t: "okpress", target: press.className });
+      return;
+    }
+  }
   const toggle = (e.key === "Enter" && onPlayer && !scrubbing) || e.key === "MediaPlayPause" ||
     (e.key === "MediaPlay" && paused) || (e.key === "MediaPause" && !paused);
   if (!toggle) return;
@@ -2121,6 +2133,9 @@ fn on_bridge(message: Bridge) {
             }
         }
         Bridge::Size { w, h } => *lock(&VIEWPORT) = (w, h),
+        Bridge::OkPress { target } => {
+            log::info!("pharos: remote ok pressed target={target}");
+        }
         Bridge::Stop { video } => {
             log::info!(
                 "pharos: remote key key=MediaStop video={video} path={}",
