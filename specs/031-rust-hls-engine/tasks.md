@@ -5,7 +5,7 @@
 ## Slice 0 - Baseline (measurements only, no player change)
 
 - [ ] T031-01 Corpus: record master, media playlists, init and first media segments for an H.264 CMAF film, a VP9 film and an audio-only item from a dev server into `crates/pharos-hls/tests/corpus/` (small clips only, under 2 MB in all). (audited 2026-11-09: no `crates/pharos-hls/tests/` dir; open)
-- [ ] T031-02 Playwright harness that plays one stream for N seconds on a named engine and writes JSON: time to first frame, seek-to-playing time, buffered ranges every second, long tasks, JS heap. Runs in Chromium and Firefox, muted.
+- [x] T031-02 Playwright harness that plays one stream for N seconds on a named engine and writes JSON: time to first frame, seek-to-playing time, buffered ranges every second, long tasks, JS heap. Runs in Chromium and Firefox, muted. `tests/dioxus/hls-bench.spec.ts` with `playwright.hls-bench.config.ts`, off unless `PHAROS_HLS_BENCH=1`; long tasks and heap are Chromium only (Firefox has neither API).
 - [ ] T031-03 hls.js baseline on Chromium, Firefox, Quest, Steam Frame and the G08 (device runs by hand via CDP/WebView debugging); results table appended to this file with ISO 8601 UTC timestamps.
 
 ## Slice 1 - Seam (V630)
@@ -56,5 +56,5 @@ Notes from slice 2 (2026-11-08T00:40:00Z): with #949's `PHAROS_FIREFOX_LIBAV` on
 
 ## Slice 5 - Measure and flip
 
-- [ ] T031-17 Comparison harness in CI on the corpus streams, both engines.
+- [ ] T031-17 Comparison harness in CI on the corpus streams, both engines. (2026-11-10: `.github/workflows/hls-bench.yml` runs both engines in Chromium and Firefox on the seeded `fixture-1.webm` and writes `tools/hls-bench-compare.cjs`'s table to the job summary, for batch PRs and main pushes touching the engine; the corpus streams wait on T031-01; open)
 - [ ] T031-18 Device traces against the slice 0 baseline; a separate ADR or ADR-0071 acceptance to flip the default.
