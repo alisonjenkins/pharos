@@ -1101,6 +1101,34 @@ where
     Ok((rebuilt, true))
 }
 
+/// What one reconcile attempt came to, recorded as
+/// `pharos_series_reconcile_total{outcome}`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReconcileOutcome {
+    /// Rebuilt from its show's match; the mark cleared.
+    Rebuilt,
+    /// The attempt did not finish (a transient miss); still marked, behind
+    /// the rest.
+    Retry,
+    /// The episode's show has no match yet; still marked.
+    Deferred,
+}
+
+impl ReconcileOutcome {
+    /// Stable, bounded-cardinality metric label, asserted distinct in a test.
+    fn label(self) -> &'static str {
+        match self {
+            Self::Rebuilt => "rebuilt",
+            Self::Retry => "retry",
+            Self::Deferred => "deferred",
+        }
+    }
+}
+
+fn record_reconcile(outcome: ReconcileOutcome) {
+    metrics::counter!("pharos_series_reconcile_total", "outcome" => outcome.label()).increment(1);
+}
+
 /// Rebuild one marked episode. `Ok(true)` when it was rebuilt and its mark
 /// cleared.
 #[allow(clippy::too_many_arguments)]
@@ -1141,6 +1169,7 @@ where
     // the rest, until the series pass has matched its new show.
     if item.kind == MediaKind::Episode && pinned_show(store, &item).await?.is_none() {
         store.mark_reconcile_items(&[id], now).await?;
+        record_reconcile(ReconcileOutcome::Deferred);
         tracing::debug!(
             media.id = id,
             "series identity repair: episode's show has no match yet, rebuild deferred"
@@ -1185,8 +1214,10 @@ where
     let done = hit || matches!(after.match_source.as_deref(), Some("none" | "manual"));
     if done {
         store.clear_series_reconcile(id, marked_at).await?;
+        record_reconcile(ReconcileOutcome::Rebuilt);
     } else {
         store.mark_reconcile_items(&[id], now).await?;
+        record_reconcile(ReconcileOutcome::Retry);
     }
     tracing::info!(
         media.id = id,
@@ -6956,6 +6987,78 @@ mod tests {
             s.series_reconcile_pending(10).await.unwrap(),
             [(1, NOW + 2)]
         );
+    }
+
+    /// Each reconcile attempt is counted under its outcome, and the labels
+    /// are distinct (a dashboard contract).
+    #[tokio::test(flavor = "current_thread")]
+    async fn reconcile_attempts_are_counted_by_outcome() {
+        use metrics_util::debugging::DebuggingRecorder;
+        let recorder = DebuggingRecorder::new();
+        let snap = pharos_test_metrics::snapshotter(&recorder);
+        let _metrics = metrics::set_default_local_recorder(&recorder);
+        let s = store().await;
+        put_titled_episode(&s, 1, SHOW_B, (1, 1), "Opening").await;
+        put_titled_episode(&s, 2, "/tv/Show C", (1, 1), "Opening").await;
+        pin(&s, SHOW_B, "900002", NOW).await;
+        s.mark_reconcile_items(&[1, 2], NOW).await.unwrap();
+        let (_td, cache) = cache();
+        let tvdb = FakeEnricher::tvdb();
+        let one = |id: u64| {
+            let (s, cache, tvdb) = (&s, &cache, &tvdb);
+            async move {
+                reconcile_one(
+                    s,
+                    &sem(4),
+                    cache,
+                    None::<&FakeEnricher>,
+                    Some(tvdb),
+                    &apply_cfg(),
+                    id,
+                    NOW,
+                    NOW + 1,
+                )
+                .await
+                .unwrap()
+            }
+        };
+
+        // The show is not matched yet.
+        one(2).await;
+        // A miss the provider did not explain.
+        one(1).await;
+        let tvdb = FakeEnricher::tvdb().with_detail(enriched_overview("Found."));
+        s.mark_reconcile_items(&[1], NOW).await.unwrap();
+        reconcile_one(
+            &s,
+            &sem(4),
+            &cache,
+            None::<&FakeEnricher>,
+            Some(&tvdb),
+            &apply_cfg(),
+            1,
+            NOW,
+            NOW + 2,
+        )
+        .await
+        .unwrap();
+
+        let n = |outcome| {
+            counter_value(
+                &snap,
+                "pharos_series_reconcile_total",
+                &[("outcome", outcome)],
+            )
+        };
+        assert_eq!((n("deferred"), n("retry"), n("rebuilt")), (1, 1, 1));
+        let labels = [
+            ReconcileOutcome::Rebuilt,
+            ReconcileOutcome::Retry,
+            ReconcileOutcome::Deferred,
+        ]
+        .map(ReconcileOutcome::label);
+        let distinct: std::collections::HashSet<_> = labels.iter().collect();
+        assert_eq!(distinct.len(), labels.len());
     }
 
     async fn set_version(s: &SqliteStore, key: &str, v: &str) {
