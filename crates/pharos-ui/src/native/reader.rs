@@ -343,6 +343,77 @@ pub fn key_action(press: KeyPress<'_>) -> Option<KeyAction> {
     }
 }
 
+/// How far Space, Page Up and Down and the vertical arrows scroll a fit-width
+/// page, as a share of the host's height (a little under a screenful, so a
+/// line stays in view across the jump).
+pub const PDF_SCROLL_STEP: f64 = 0.9;
+
+/// A scroll position within a tolerance of this many px counts as the edge.
+const SCROLL_EDGE_PX: f64 = 1.0;
+
+/// Where the PDF host is scrolled, in CSS px.
+#[derive(Debug, Clone, Copy)]
+pub struct HostScroll {
+    pub top: f64,
+    pub client_height: f64,
+    pub scroll_height: f64,
+}
+
+/// What a key does to a PDF page.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PdfKey {
+    /// Turn to the next (`true`) or previous page.
+    Turn(bool),
+    /// Scroll the page by this many px (negative is up).
+    Scroll(f64),
+}
+
+/// The meaning of a press on a PDF page. A fit-page page only turns. A
+/// fit-width page is taller than the window, so Space, Page Up and Down and
+/// the vertical arrows scroll it and turn only once it is already at the
+/// end (or the start, going back); otherwise the lower part of a tall page
+/// could not be reached from a keyboard or a TV remote. Left and Right still
+/// turn. Escape is the caller's.
+pub fn pdf_key(press: KeyPress<'_>, fit: PdfFit, scroll: HostScroll) -> Option<PdfKey> {
+    let action = match (press.key, fit) {
+        // The vertical arrows mean the page keys, with the same modifier and
+        // focus rules, only where the page scrolls.
+        ("ArrowDown", PdfFit::Width) => key_action(KeyPress {
+            key: "PageDown",
+            ..press
+        }),
+        ("ArrowUp", PdfFit::Width) => key_action(KeyPress {
+            key: "PageUp",
+            ..press
+        }),
+        _ => key_action(press),
+    }?;
+    let forward = match action {
+        KeyAction::Next => true,
+        KeyAction::Prev => false,
+        KeyAction::Escape => return None,
+    };
+    let scrolls = fit == PdfFit::Width
+        && matches!(
+            press.key,
+            " " | "PageDown" | "PageUp" | "ArrowDown" | "ArrowUp"
+        );
+    let known = [scroll.top, scroll.client_height, scroll.scroll_height]
+        .iter()
+        .all(|v| v.is_finite());
+    if !scrolls || !known {
+        return Some(PdfKey::Turn(forward));
+    }
+    let at_end = scroll.top + scroll.client_height >= scroll.scroll_height - SCROLL_EDGE_PX;
+    let at_start = scroll.top <= SCROLL_EDGE_PX;
+    let step = scroll.client_height * PDF_SCROLL_STEP;
+    Some(match (forward, at_end, at_start) {
+        (true, true, _) | (false, _, true) => PdfKey::Turn(forward),
+        (true, false, _) => PdfKey::Scroll(step),
+        (false, _, false) => PdfKey::Scroll(-step),
+    })
+}
+
 /// `fraction` of the book read as a whole percent, 0 to 100.
 pub fn percent(fraction: f64) -> u32 {
     if !fraction.is_finite() {
@@ -703,6 +774,105 @@ mod tests {
             ..press(" ")
         };
         assert_eq!(key_action(back), Some(KeyAction::Prev));
+    }
+
+    const TALL: HostScroll = HostScroll {
+        top: 0.0,
+        client_height: 700.0,
+        scroll_height: 2000.0,
+    };
+
+    #[test]
+    fn a_fit_page_pdf_only_turns() {
+        let page = |k| pdf_key(press(k), PdfFit::Page, TALL);
+        assert_eq!(page(" "), Some(PdfKey::Turn(true)));
+        assert_eq!(page("PageUp"), Some(PdfKey::Turn(false)));
+        assert_eq!(page("ArrowRight"), Some(PdfKey::Turn(true)));
+        assert_eq!(page("ArrowDown"), None, "nothing to scroll");
+        assert_eq!(page("Escape"), None);
+        assert_eq!(page("a"), None);
+    }
+
+    #[test]
+    fn a_fit_width_pdf_scrolls_to_its_end_before_it_turns() {
+        let width = |k, scroll| pdf_key(press(k), PdfFit::Width, scroll);
+        let at = |top| HostScroll { top, ..TALL };
+        for k in [" ", "PageDown", "ArrowDown"] {
+            assert_eq!(width(k, at(0.0)), Some(PdfKey::Scroll(630.0)), "{k}");
+            assert_eq!(width(k, at(600.0)), Some(PdfKey::Scroll(630.0)), "{k}");
+            assert_eq!(
+                width(k, at(1300.0)),
+                Some(PdfKey::Turn(true)),
+                "{k} at the end"
+            );
+        }
+        for k in ["PageUp", "ArrowUp"] {
+            assert_eq!(width(k, at(1300.0)), Some(PdfKey::Scroll(-630.0)), "{k}");
+            assert_eq!(
+                width(k, at(0.0)),
+                Some(PdfKey::Turn(false)),
+                "{k} at the start"
+            );
+        }
+        let back = KeyPress {
+            shift: true,
+            ..press(" ")
+        };
+        assert_eq!(
+            pdf_key(back, PdfFit::Width, at(500.0)),
+            Some(PdfKey::Scroll(-630.0))
+        );
+        // Left and right turn whatever the scroll.
+        assert_eq!(width("ArrowRight", at(500.0)), Some(PdfKey::Turn(true)));
+        assert_eq!(width("ArrowLeft", at(500.0)), Some(PdfKey::Turn(false)));
+    }
+
+    #[test]
+    fn a_fit_width_page_that_fits_the_window_just_turns() {
+        let short = HostScroll {
+            top: 0.0,
+            client_height: 700.0,
+            scroll_height: 700.0,
+        };
+        assert_eq!(
+            pdf_key(press("PageDown"), PdfFit::Width, short),
+            Some(PdfKey::Turn(true))
+        );
+        assert_eq!(
+            pdf_key(press("PageUp"), PdfFit::Width, short),
+            Some(PdfKey::Turn(false))
+        );
+        let unknown = HostScroll {
+            top: f64::NAN,
+            ..TALL
+        };
+        assert_eq!(
+            pdf_key(press("PageDown"), PdfFit::Width, unknown),
+            Some(PdfKey::Turn(true))
+        );
+    }
+
+    #[test]
+    fn pdf_scrolling_keeps_the_modifier_and_focus_rules() {
+        let chord = KeyPress {
+            ctrl: true,
+            ..press("ArrowDown")
+        };
+        assert_eq!(pdf_key(chord, PdfFit::Width, TALL), None);
+        let field = KeyPress {
+            target: KeyTarget::Field,
+            ..press("ArrowDown")
+        };
+        assert_eq!(pdf_key(field, PdfFit::Width, TALL), None);
+        let control = KeyPress {
+            target: KeyTarget::Control,
+            ..press(" ")
+        };
+        assert_eq!(
+            pdf_key(control, PdfFit::Width, TALL),
+            None,
+            "a button keeps Space"
+        );
     }
 
     #[test]

@@ -24,10 +24,11 @@ use super::keymap::Mode;
 use super::pdf_web::PdfView;
 use super::platform;
 use super::reader::{
-    check_size, download_href, flatten_toc, key_action, margin_label, pdf_locator, pdf_progress,
-    pdf_saved_index, progress_label, save_key, saved_fraction, saved_locator, size_cap,
-    swipe_action, tap_action, too_big_message, KeyAction, KeyPress, KeyTarget, PageTheme, PdfFit,
-    ReaderSettings, SaveGate, SizeVerdict, TocRow, Typeface, LINE_HEIGHTS, MARGINS, SETTINGS_KEY,
+    check_size, download_href, flatten_toc, key_action, margin_label, pdf_key, pdf_locator,
+    pdf_progress, pdf_saved_index, progress_label, save_key, saved_fraction, saved_locator,
+    size_cap, swipe_action, tap_action, too_big_message, KeyAction, KeyPress, KeyTarget, PageTheme,
+    PdfFit, PdfKey, ReaderSettings, SaveGate, SizeVerdict, TocRow, Typeface, LINE_HEIGHTS, MARGINS,
+    SETTINGS_KEY,
 };
 use super::route::Route;
 use super::views::{display_name, Nav};
@@ -650,10 +651,18 @@ pub fn ReaderScreen(id: ItemRef) -> Element {
                 if !key_alive.get() || platform::dialog_open() {
                     return false;
                 }
-                let Some(action) = key_action(press) else {
-                    return false;
+                let held = key_core.borrow().clone();
+                // A fit-width PDF also takes the vertical arrows, so the
+                // press is read per engine; Escape is common.
+                let pdf_press = match held.as_ref().map(|c| &c.engine) {
+                    Some(Engine::Pdf(pdf)) => Some(pdf_key(press, pdf.fit(), pdf.host_scroll())),
+                    _ => None,
                 };
-                if action == KeyAction::Escape {
+                let action = key_action(press);
+                if action.is_none() && pdf_press.flatten().is_none() {
+                    return false;
+                }
+                if action == Some(KeyAction::Escape) {
                     if panel.peek().is_some() {
                         let mut open = panel;
                         open.set(None);
@@ -666,12 +675,22 @@ pub fn ReaderScreen(id: ItemRef) -> Element {
                 if panel.peek().is_some() {
                     return false;
                 }
-                let held = key_core.borrow().clone();
                 let Some(c) = held else {
                     return false;
                 };
+                if let Some(Some(PdfKey::Scroll(dy))) = pdf_press {
+                    if let Engine::Pdf(pdf) = &c.engine {
+                        pdf.scroll_by(dy);
+                    }
+                    return true;
+                }
+                let forward = match pdf_press {
+                    Some(Some(PdfKey::Turn(forward))) => forward,
+                    Some(_) => return false,
+                    None => action == Some(KeyAction::Next),
+                };
                 platform::spawn_detached(async move {
-                    c.turn(action == KeyAction::Next).await;
+                    c.turn(forward).await;
                 });
                 true
             });
