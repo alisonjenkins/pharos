@@ -272,6 +272,19 @@ pub async fn report(state: &AppState, user: &User, r: Report<'_>) -> Result<(), 
     if let Some(tx) = &state.trickplay_priority {
         let _ = tx.send(item_id);
     }
+    // FR-107: a position under the minimum resume point is not stored; the
+    // live session and the sockets above still saw it.
+    if let Some(item) = &item {
+        let runtime = item.probe.run_time_ticks().unwrap_or(0);
+        if state
+            .min_resume
+            .below(item.kind, runtime, r.position_ticks)
+            .is_some()
+        {
+            progress_writes::count_below_minimum();
+            return Ok(());
+        }
+    }
     let progress = PlaybackProgress {
         position_ticks: r.position_ticks,
         at: now_unix_secs(),

@@ -394,6 +394,12 @@ pub fn count_held() {
         .increment(1);
 }
 
+/// A report under the minimum resume point (spec 038 FR-107), never written.
+pub fn count_below_minimum() {
+    metrics::counter!("pharos_progress_writes_total", "outcome" => "skipped", "reason" => "below_minimum")
+        .increment(1);
+}
+
 /// One database write of a progress report, timed and counted.
 /// `pharos_progress_writes_total{outcome,reason}` splits the reports into
 /// written (and why), held and failed; `pharos_progress_persist_seconds` is
