@@ -134,6 +134,7 @@ pub(crate) mod testutil {
             reason: String::new(),
             static_only: false,
             syllables: None,
+            speaker: None,
         }
     }
 
