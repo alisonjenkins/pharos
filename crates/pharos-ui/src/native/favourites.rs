@@ -307,10 +307,13 @@ mod tests {
             html.contains("The first 1 belong to the shows above; there are more."),
             "{html}"
         );
-        let at = |title: &str| html.find(title).unwrap_or(usize::MAX);
+        let at: Vec<usize> = [">Shows<", ">Episodes<", ">Songs<"]
+            .iter()
+            .filter_map(|title| html.find(title))
+            .collect();
         assert!(
-            at(">Shows<") < at(">Episodes<") && at(">Episodes<") < at(">Songs<"),
-            "rails keep the page's order: {html}"
+            at.len() == 3 && at[0] < at[1] && at[1] < at[2],
+            "every rail shows, in the page's order: {html}"
         );
         assert!(!html.contains("Nothing here yet"), "{html}");
     }
