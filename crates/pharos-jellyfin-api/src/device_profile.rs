@@ -1773,7 +1773,7 @@ mod tests {
     // we never hand a device a stream it can't decode (→ crash). One case per
     // device class the deployment actually serves.
 
-    /// A 10-bit HEVC 1080p source (the "Alien"-style remux that OOM-killed the
+    /// A 10-bit HEVC 1080p source (the "Film AX"-style remux that OOM-killed the
     /// TCL TV under the old force-transcode).
     fn hevc_10bit_source() -> SourceMedia {
         SourceMedia {

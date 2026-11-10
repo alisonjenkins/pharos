@@ -1962,7 +1962,7 @@ impl BaseItemDto {
                 .or_else(|| item.probe.album.as_deref().map(album_id_for)),
             album: item.probe.album.clone(),
             album_id: item.probe.album.as_deref().map(album_id_for),
-            // 004-books (T068) — a book's series is its shelf: "Dune Chronicles"
+            // 004-books (T068) — a book's series is its shelf: "Book A Chronicles"
             // from an epub's `calibre:series`, "Batman" from a comic's
             // `<Series>`. `SeriesName` is the field jellyfin-web already groups
             // and labels by, so a book reuses it rather than inventing one the
@@ -2021,7 +2021,7 @@ impl BaseItemDto {
             critic_rating: shown_critic_rating(item),
             official_rating: item.metadata.official_rating.clone(),
             // LIB-C11 — fall back to the series folder's parsed year so
-            // same-name shows (Cosmos 1980 vs 2014) are distinguishable
+            // same-name shows (Show AV 1980 vs 2014) are distinguishable
             // even before per-episode metadata enrichment (EPIC D).
             production_year: item
                 .metadata
@@ -2331,7 +2331,7 @@ pub fn shown_critic_rating(item: &pharos_core::MediaItem) -> Option<f32> {
 
 /// LIB-C11 — stable 32-hex Series id keyed on the show's FOLDER path when
 /// known, falling back to the bare NAME otherwise. Folder-keyed ids make
-/// same-name shows (`Cosmos (1980)` vs `Cosmos (2014)`) distinct so their
+/// same-name shows (`Show AV (1980)` vs `Show AV (2014)`) distinct so their
 /// episodes don't interleave. Passing `None` is byte-identical to
 /// [`series_id_for`], so legacy/backfilled rows keep their existing wire
 /// id and client URLs keep resolving.
@@ -3082,8 +3082,8 @@ mod tests {
         // parse must classify it as Synth with the hash recovered, for ANY
         // of the synth families.
         for synth in [
-            series_id_for("Cosmos"),
-            season_id_for("Cosmos", 2),
+            series_id_for("Show AV"),
+            season_id_for("Show AV", 2),
             artist_id_for("Limp Bizkit"),
             album_id_for("Significant Other"),
         ] {
@@ -3463,10 +3463,10 @@ mod tests {
         let mk = |folder: &str, year: u32| MediaItem {
             id: 1,
             path: format!("{folder}/Season 01/S01E01.mkv").into(),
-            title: "Cosmos".into(),
+            title: "Show AV".into(),
             kind: MediaKind::Episode,
             series: Some(SeriesInfo {
-                series_name: "Cosmos".into(),
+                series_name: "Show AV".into(),
                 season_number: Some(1),
                 episode_number: Some(1),
                 series_folder: Some(folder.into()),
@@ -3475,8 +3475,8 @@ mod tests {
             }),
             ..Default::default()
         };
-        let a = BaseItemDto::from_domain(&mk("/tv/Cosmos (1980)", 1980), "srv");
-        let b = BaseItemDto::from_domain(&mk("/tv/Cosmos (2014)", 2014), "srv");
+        let a = BaseItemDto::from_domain(&mk("/tv/Show AV (1980)", 1980), "srv");
+        let b = BaseItemDto::from_domain(&mk("/tv/Show AV (2014)", 2014), "srv");
 
         // Same display name…
         assert_eq!(a.series_name, b.series_name);
@@ -3489,12 +3489,12 @@ mod tests {
         // The folder-keyed id equals the standalone helper output…
         assert_eq!(
             a.series_id.as_deref(),
-            Some(series_id_for_key(Some("/tv/Cosmos (1980)"), "Cosmos").as_str())
+            Some(series_id_for_key(Some("/tv/Show AV (1980)"), "Show AV").as_str())
         );
         // …and differs from the legacy name-only id (proving the fix).
         assert_ne!(
             a.series_id.as_deref(),
-            Some(series_id_for("Cosmos").as_str())
+            Some(series_id_for("Show AV").as_str())
         );
 
         // Year flows into ProductionYear so clients can disambiguate.
@@ -3508,10 +3508,10 @@ mod tests {
     fn legacy_series_id_helpers_unchanged_with_no_folder() {
         // LIB-C11 — passing None must be byte-identical to the legacy
         // name-only helpers so pre-backfill client URLs keep resolving.
-        assert_eq!(series_id_for_key(None, "Cosmos"), series_id_for("Cosmos"));
+        assert_eq!(series_id_for_key(None, "Show AV"), series_id_for("Show AV"));
         assert_eq!(
-            season_id_for_key(None, "Cosmos", 1),
-            season_id_for("Cosmos", 1)
+            season_id_for_key(None, "Show AV", 1),
+            season_id_for("Show AV", 1)
         );
     }
 
@@ -4069,7 +4069,7 @@ mod video_3d_format_tests {
         MediaItem {
             id: 42,
             kind: MediaKind::Movie,
-            title: "Avatar 3D".into(),
+            title: "Film BA 3D".into(),
             probe: MediaProbe {
                 video_codec: Some("h264".into()),
                 video_3d_format: Some(format),
