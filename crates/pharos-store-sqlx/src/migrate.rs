@@ -11,7 +11,7 @@
 //!
 //! Table order is FK-safe: parents first (users, libraries, genres,
 //! people, studios, tags, collections, playlists, media_items,
-//! system_identity, runtime_config, named_config, scan_runs), then the
+//! series_metadata, system_identity, runtime_config, named_config, scan_runs), then the
 //! dependents that reference them (auth_tokens, user_data,
 //! user_configuration, display_preferences, user_prefs, artwork, item_genres,
 //! item_people, item_studios, item_tags, collection_items,
@@ -74,6 +74,10 @@ pub async fn migrate_sqlite_to_postgres(
     tables.push(("collections".into(), copy_collections(sp, &mut tx).await?));
     tables.push(("playlists".into(), copy_playlists(sp, &mut tx).await?));
     tables.push(("media_items".into(), copy_media_items(sp, &mut tx).await?));
+    tables.push((
+        "series_metadata".into(),
+        copy_series_metadata(sp, &mut tx).await?,
+    ));
     tables.push((
         "system_identity".into(),
         copy_system_identity(sp, &mut tx).await?,
@@ -695,6 +699,92 @@ async fn copy_media_items(
             .bind(row.picture_check_mtime)
             .bind(row.picture_check_size)
             .bind(sort_name)
+            .bind(row.locked_fields)
+            .execute(&mut **tx)
+            .await
+            .map_err(StoreError::Sqlx)?;
+    }
+    Ok(n)
+}
+
+/// Every `series_metadata` column, in the same order on both backends.
+const SERIES_METADATA_COLUMNS: &str = "series_key, series_name, match_provider, \
+     match_external_id, match_source, match_confidence, metadata_refreshed_at, overview, \
+     community_rating, premiere_date, official_rating, genres, studios, provider_ids, \
+     poster_locator, backdrop_locator, original_language, imdb_rating, rt_tomatometer, \
+     ratings_fetched_at, match_flag, match_runner_up_id, match_runner_up_score, locked_fields";
+
+#[derive(sqlx::FromRow)]
+struct SeriesMetadataRow {
+    series_key: String,
+    series_name: String,
+    match_provider: Option<String>,
+    match_external_id: Option<String>,
+    match_source: Option<String>,
+    match_confidence: Option<f64>,
+    metadata_refreshed_at: Option<i64>,
+    overview: Option<String>,
+    community_rating: Option<f64>,
+    premiere_date: Option<i64>,
+    official_rating: Option<String>,
+    genres: String,
+    studios: String,
+    provider_ids: String,
+    poster_locator: Option<String>,
+    backdrop_locator: Option<String>,
+    original_language: Option<String>,
+    imdb_rating: Option<f64>,
+    rt_tomatometer: Option<i64>,
+    ratings_fetched_at: Option<i64>,
+    match_flag: Option<String>,
+    match_runner_up_id: Option<String>,
+    match_runner_up_score: Option<f64>,
+    locked_fields: i64,
+}
+
+/// B1070: a show's metadata row, with its admin edits and their locks
+/// (ADR-0097). A manual match (`match_source = 'manual'`) and an edit cannot
+/// be fetched again, so a move that dropped this table lost them.
+async fn copy_series_metadata(
+    sp: &SqlitePool,
+    tx: &mut Transaction<'_, Postgres>,
+) -> Result<u64, StoreError> {
+    let rows: Vec<SeriesMetadataRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT {SERIES_METADATA_COLUMNS} FROM series_metadata ORDER BY series_key"
+    )))
+    .fetch_all(sp)
+    .await
+    .map_err(StoreError::Sqlx)?;
+    let n = rows.len() as u64;
+    let insert_sql = format!(
+        "INSERT INTO series_metadata ({SERIES_METADATA_COLUMNS}) VALUES \
+         ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)"
+    );
+    for row in rows {
+        sqlx::query(sqlx::AssertSqlSafe(insert_sql.as_str()))
+            .bind(row.series_key)
+            .bind(row.series_name)
+            .bind(row.match_provider)
+            .bind(row.match_external_id)
+            .bind(row.match_source)
+            .bind(row.match_confidence)
+            .bind(row.metadata_refreshed_at)
+            .bind(row.overview)
+            .bind(row.community_rating)
+            .bind(row.premiere_date)
+            .bind(row.official_rating)
+            .bind(row.genres)
+            .bind(row.studios)
+            .bind(row.provider_ids)
+            .bind(row.poster_locator)
+            .bind(row.backdrop_locator)
+            .bind(row.original_language)
+            .bind(row.imdb_rating)
+            .bind(row.rt_tomatometer)
+            .bind(row.ratings_fetched_at)
+            .bind(row.match_flag)
+            .bind(row.match_runner_up_id)
+            .bind(row.match_runner_up_score)
             .bind(row.locked_fields)
             .execute(&mut **tx)
             .await
