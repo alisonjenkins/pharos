@@ -18,7 +18,9 @@ use pharos_client::{CallInfo, ClientError};
 use super::account::AccountMenu;
 use super::account_settings;
 use super::activity;
-use super::appearance::{AppearanceView, ContrastRow, Edit, EditorView, Notice, ThemeCard};
+use super::appearance::{
+    not_saved, AppearanceView, ContrastRow, Edit, EditorView, Notice, ThemeCard,
+};
 use super::approve_device;
 use super::backdrop::{self, Backdrop};
 use super::browse::{self, Neighbours};
@@ -1181,8 +1183,12 @@ fn bad_field(path: &str, value: &str) -> ThemeError {
     }
 }
 
-fn notify(mut notice: Signal<Option<Notice>>, text: String, error: bool) {
-    notice.set(Some(Notice { text, error }));
+fn notify(notice: Signal<Option<Notice>>, text: String, error: bool) {
+    show(notice, Notice { text, error });
+}
+
+fn show(mut notice: Signal<Option<Notice>>, line: Notice) {
+    notice.set(Some(line));
 }
 
 /// Store `source` as a custom theme. The outcome's lines are logged; the
@@ -3339,13 +3345,7 @@ fn AppearanceScreen() -> Element {
             library_transition: library_transition_now,
             on_library_transition: move |fx: LibraryTransition| {
                 if let Err(e) = store_library_transition(fx) {
-                    notify(
-                        notice,
-                        format!(
-                            "Could not save the library transition on this device: {e}. It applies until you reload."
-                        ),
-                        true,
-                    );
+                    show(notice, not_saved("the library transition", &e));
                 }
                 platform::apply_library_transition(fx);
                 library_transition.set(fx);
@@ -3354,13 +3354,7 @@ fn AppearanceScreen() -> Element {
             overlay_effect: overlay_effect_now,
             on_overlay_effect: move |fx: OverlayEffect| {
                 if let Err(e) = store_overlay_effect(fx) {
-                    notify(
-                        notice,
-                        format!(
-                            "Could not save the controls effect on this device: {e}. It applies until you reload."
-                        ),
-                        true,
-                    );
+                    show(notice, not_saved("the controls effect", &e));
                 }
                 platform::apply_overlay_effect(fx);
                 overlay_effect.set(fx);
@@ -3369,13 +3363,7 @@ fn AppearanceScreen() -> Element {
             effects_level: effects_level_now,
             on_effects_level: move |level: EffectsLevel| {
                 if let Err(e) = store_effects_level(level) {
-                    notify(
-                        notice,
-                        format!(
-                            "Could not save the subtitle effects on this device: {e}. It applies until you reload."
-                        ),
-                        true,
-                    );
+                    show(notice, not_saved("the subtitle effects", &e));
                 }
                 effects_level.set(level);
                 platform::info(&format!("pharos: effects_level set={}", level.as_str()));
@@ -3574,13 +3562,7 @@ fn PlaybackScreen() -> Element {
             episode_turn: episode_turn(),
             on_episode_turn: move |choice: EpisodeTurn| {
                 if let Err(e) = store_episode_turn(choice) {
-                    notify(
-                        notice,
-                        format!(
-                            "Could not save the episode transition on this device: {e}. It applies until you reload."
-                        ),
-                        true,
-                    );
+                    show(notice, not_saved("the episode transition", &e));
                 }
                 episode_turn.set(choice);
             },
@@ -3593,13 +3575,7 @@ fn PlaybackScreen() -> Element {
             subtitle_size: subtitle_size(),
             on_subtitle_size: move |size: SubtitleSize| {
                 if let Err(e) = set_subtitle_size(size) {
-                    notify(
-                        notice,
-                        format!(
-                            "Could not save the subtitle size on this device: {e}. It applies until you reload."
-                        ),
-                        true,
-                    );
+                    show(notice, not_saved("the subtitle size", &e));
                 }
                 subtitle_size.set(size);
             },

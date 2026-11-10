@@ -28,6 +28,30 @@ pub struct Notice {
     pub error: bool,
 }
 
+/// The one notice for a choice this device could not store: `what` names
+/// it ("the subtitle size"), `error` is the storage's reason. Used by every
+/// page that keeps choices on the device (FR-705).
+pub fn not_saved(what: &str, error: &str) -> Notice {
+    Notice {
+        text: format!(
+            "Could not save {what} on this device: {error}. It applies until you reload."
+        ),
+        error: true,
+    }
+}
+
+/// A [`Notice`] as a line: an alert when it is an error, else a status.
+#[component]
+pub fn NoticeLine(notice: Notice) -> Element {
+    rsx! {
+        p {
+            class: "pharos-notice",
+            role: if notice.error { "alert" } else { "status" },
+            "{notice.text}"
+        }
+    }
+}
+
 /// One contrast pair checked by the editor.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ContrastRow {
@@ -120,12 +144,8 @@ pub fn AppearanceView(
         section { class: "pharos-settings-page pharos-appearance",
             h2 { "Appearance" }
             p { class: "pharos-settings-lede", "Themes and motion on this device." }
-            if let Some(notice) = &notice {
-                p {
-                    class: "pharos-notice",
-                    role: if notice.error { "alert" } else { "status" },
-                    "{notice.text}"
-                }
+            if let Some(notice) = notice {
+                NoticeLine { notice }
             }
             div { class: "pharos-settings-group",
                 div { class: "pharos-setting",
@@ -840,6 +860,16 @@ mod tests {
         assert!(
             html.contains("role=\"alert\"") && html.contains("palette.accent is not a colour"),
             "{html}"
+        );
+    }
+
+    #[test]
+    fn a_choice_not_saved_names_itself_the_reason_and_how_long_it_lasts() {
+        let n = not_saved("the subtitle size", "QuotaExceededError");
+        assert!(n.error);
+        assert_eq!(
+            n.text,
+            "Could not save the subtitle size on this device: QuotaExceededError. It applies until you reload."
         );
     }
 
