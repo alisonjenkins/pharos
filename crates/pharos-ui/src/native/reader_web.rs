@@ -812,7 +812,11 @@ pub fn ReaderScreen(id: ItemRef) -> Element {
                     style: "{host_font}",
                     onpointerdown: {
                         let swipe_from = swipe_from.clone();
+                        let swiped = swiped.clone();
                         move |e| {
+                            // Chrome sends no click after a touch that moved,
+                            // so a swipe's flag must not outlive the next press.
+                            swiped.set(false);
                             swipe_from.set(e.client_coordinates().x);
                         }
                     },
