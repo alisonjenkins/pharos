@@ -854,12 +854,27 @@ where
     // until it runs.
     // When the media file cannot be seen either the share is probably down,
     // and a missing sidecar proves nothing: keep treating it as curated.
-    let media_visible = matches!(tokio::fs::try_exists(&item.path).await, Ok(true));
+    // Both stats run only for a local row, and the media one only once a
+    // sidecar is found missing, so an item with provider art costs nothing.
+    let mut media_visible: Option<bool> = None;
     let mut local_roles: std::collections::HashSet<String> = std::collections::HashSet::new();
     for (role, source, locator) in store.artwork_for(item.id).await? {
-        if source.eq_ignore_ascii_case("local")
-            && (!media_visible || !matches!(tokio::fs::try_exists(&locator).await, Ok(false)))
-        {
+        if !source.eq_ignore_ascii_case("local") {
+            continue;
+        }
+        let gone = matches!(tokio::fs::try_exists(&locator).await, Ok(false));
+        let curated = !gone || {
+            let visible = match media_visible {
+                Some(v) => v,
+                None => {
+                    let v = matches!(tokio::fs::try_exists(&item.path).await, Ok(true));
+                    media_visible = Some(v);
+                    v
+                }
+            };
+            !visible
+        };
+        if curated {
             local_roles.insert(role.to_ascii_lowercase());
         }
     }
