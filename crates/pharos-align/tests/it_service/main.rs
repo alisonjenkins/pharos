@@ -4,3 +4,4 @@
 
 mod engine;
 mod http;
+mod spans;
