@@ -28,7 +28,7 @@ done (`pharos-transcode/src/scheduler.rs`, the `transcode job done` line).
 To reproduce the saturated case: start more transcoding plays than
 `sum(pharos_transcode_device_capacity)`, then seek in one of them.
 
-- Saturation, server side (exists):
+- Saturation, server-side (exists):
   `sum(pharos_transcode_device_in_use) >= sum(pharos_transcode_device_capacity)`
   with `pharos_transcode_pending_by_class{class="interactive"} > 0` and
   `pharos_transcode_pending_oldest_seconds` climbing.
