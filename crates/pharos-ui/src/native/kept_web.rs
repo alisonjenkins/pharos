@@ -275,6 +275,22 @@ async fn ensure_pdf_module() {
     platform::info("pharos: kept pdf module fetched");
 }
 
+/// Whether every file of the PDF module is in a cache, whichever: a page the
+/// service worker does not control may have loaded the module without its
+/// being stored.
+async fn pdf_module_cached() -> bool {
+    let Ok(storage) = caches() else {
+        return false;
+    };
+    for url in PDF_MODULE {
+        match JsFuture::from(storage.match_with_str(url)).await {
+            Ok(found) if !found.is_undefined() => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
 /// Stores a book on this device. The download goes straight into the cache;
 /// a book over the weak-device cap is refused, before the body when the
 /// server states its size and after it otherwise.
@@ -445,6 +461,9 @@ pub async fn auto_keep(
     });
     write(&store);
     request_persist();
+    if format == KeptFormat::Pdf && !pdf_module_cached().await {
+        ensure_pdf_module().await;
+    }
     platform::info(&format!(
         "pharos: kept auto item={id} bytes={size} format={} reason={} total_bytes={}",
         format.label(),
