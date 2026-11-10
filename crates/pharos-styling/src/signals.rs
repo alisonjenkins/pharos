@@ -38,6 +38,10 @@ pub struct TrackSignals {
     pub lines: Vec<LineSignals>,
     /// Likely scene cuts, ms from the start of the file.
     pub cuts_ms: Vec<u64>,
+    /// Per source line: the height of text burned into the bottom of the
+    /// picture under it, as a share of the frame height (0.0 for none);
+    /// `None`, or a line past the end, when nothing was checked.
+    pub bottom_text: Vec<Option<f32>>,
 }
 
 /// What a stretch of the episode is.
