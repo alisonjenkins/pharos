@@ -70,7 +70,9 @@ use super::stage::{
     View, STAGE_ID,
 };
 use super::stereo::{self, ViewMode};
-use super::subtitles::{track_mode, FallbackReason, RustState, TrackMode};
+use super::subtitles::{
+    cues_in_video, rows_kept_for, track_mode, FallbackReason, RustState, TrackMode,
+};
 use super::together::{
     can_watch_together, group_api, GroupClient as _, GroupError, GroupSummary, Groups,
 };
@@ -6009,6 +6011,7 @@ fn Player(
     let mut autoplay_refused = use_signal(|| false);
     // How "Up next" was last shown, for its decision line.
     let up_next_mode = use_hook(|| Rc::new(Cell::new(None::<&'static str>)));
+    let crop_rows_kept = use_hook(|| Rc::new(Cell::new(None::<Option<&'static str>>)));
     // Its own loop: a queue hint the server is slow to answer must not keep
     // Tap to start hidden (038 FR-407).
     use_future(move || async move {
@@ -7654,10 +7657,26 @@ fn Player(
         live_buffered: Some(buffered),
         subtitle_size: sub_size(),
         packing: versions::playing_stereo(&p.detail.versions, &p.version),
-        // A burned subtitle may sit in a letterbox bar, so those stay (V977).
+        // A burned subtitle or the browser's own cues may sit in a letterbox
+        // bar, so those stay (V977, B1215).
         picture: versions::playing_picture(&p.detail.versions, &p.version)
             .map(|crop| {
-                if p.burned() {
+                let text_picked = subtitle().is_some_and(|i| {
+                    p.detail
+                        .subtitle_tracks
+                        .iter()
+                        .any(|t| t.index == i && t.vtt_url.is_some() && t.images_url.is_none())
+                });
+                let cues = cues_in_video(text_picked, styled_ready(), rust_state());
+                let kept = rows_kept_for(p.burned(), cues);
+                if crop_rows_kept.get() != Some(kept) {
+                    crop_rows_kept.set(Some(kept));
+                    platform::info(&format!(
+                        "pharos: picture crop item={playing_id} rows_kept={}",
+                        kept.unwrap_or("no")
+                    ));
+                }
+                if kept.is_some() {
                     crop.keeping_rows()
                 } else {
                     crop
