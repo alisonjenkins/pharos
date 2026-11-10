@@ -1819,11 +1819,7 @@ impl BaseItemDto {
             can_play: true,
             can_download: true,
             is_3d: item.probe.video_3d_format.is_some()
-                || item
-                    .probe
-                    .alternate_sources
-                    .iter()
-                    .any(|a| a.video_3d_format.is_some()),
+                || item.probe.versions().any(|a| a.video_3d_format.is_some()),
             play_access: "Full",
             media_sources: if is_book {
                 // Empty, so nothing can construct /Videos/{id}/stream for an epub.

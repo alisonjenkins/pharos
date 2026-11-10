@@ -2753,7 +2753,8 @@ async fn playback_info(
     // alternate matches.
     let mut media_sources = Vec::with_capacity(1 + probe.alternate_sources.len());
     media_sources.push(primary_source);
-    for alt in &probe.alternate_sources {
+    // A split film's later parts are no versions of it (V1153).
+    for alt in probe.versions() {
         let alt_id = format!("{id_str}-{}", alt.id);
         // An alternate is never direct play (`Default`), so it is transcoded.
         let alt_3d_format = advertised_3d_format(alt.video_3d_format, false);
