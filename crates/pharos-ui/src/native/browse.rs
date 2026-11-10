@@ -1810,7 +1810,10 @@ fn Hero(
         header { class: "pharos-hero",
             div { class: art_class,
                 match image {
-                    Some(src) => rsx! { img { src: platform::art_src(&src), alt: "" } },
+                    // Asked for at the size it is drawn, as every other
+                    // poster is (FR-212): the full-size original cost a
+                    // title page several times the bytes.
+                    Some(src) => rsx! { Art { src, sizes: HERO_SIZES, lazy: false } },
                     None if album => rsx! { ArtPlaceholder { kind: ItemKind::Album, name: title.clone() } },
                     None => rsx! {},
                 }
@@ -1963,6 +1966,10 @@ pub fn next_episode(episodes: &[Item]) -> Option<&Item> {
         .or_else(|| episodes.iter().find(|e| !e.played))
         .or(episodes.first())
 }
+
+/// The width a title page's hero art is drawn at: 12rem, 10rem on a phone
+/// (`.pharos-hero-art`).
+pub const HERO_SIZES: &str = "(max-width: 40rem) 10rem, 12rem";
 
 /// The episode the show page's Play starts: the viewer's next episode when
 /// the season shown holds it, else [`next_episode`] of the season shown.
@@ -3652,6 +3659,20 @@ mod tests {
         assert!(html.contains("role=\"alert\""), "{html}");
         let quiet = render(|| rsx! { PageFailure { reason: None } });
         assert!(!quiet.contains("load more"), "{quiet}");
+    }
+
+    /// FR-212: the hero asks for its art at the size it is drawn.
+    #[test]
+    fn the_hero_asks_for_art_at_its_drawn_size() {
+        let mut series = item(SERIES, ItemKind::Series, "Show");
+        series.image = Some("/Items/10/Images/Primary".into());
+        let d = detail(series);
+        let html = render(move || {
+            rsx! { Hero { title: "Show".to_owned(), detail: Some(d.clone()), facts: vec![], square: false } }
+        });
+        assert!(html.contains("fillWidth=240"), "{html}");
+        assert!(html.contains("(max-width: 40rem) 10rem, 12rem"), "{html}");
+        assert!(html.contains("loading=\"eager\""), "{html}");
     }
 
     #[test]
