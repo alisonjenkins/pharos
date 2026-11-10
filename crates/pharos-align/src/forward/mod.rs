@@ -152,6 +152,48 @@ impl Model for CpuAligner {
     }
 }
 
+/// `service::Model` on the Vulkan pass; a failed read-back is a
+/// `ModelError::Device`, for `fallback::Fallback` to catch.
+#[cfg(feature = "vulkan")]
+pub struct VulkanAligner {
+    pub model: vulkan::VulkanModel,
+    pub reason: String,
+    pub adapter: String,
+}
+
+#[cfg(feature = "vulkan")]
+impl Model for VulkanAligner {
+    fn device(&self) -> DeviceUsed {
+        DeviceUsed {
+            device: "vulkan",
+            reason: self.reason.clone(),
+        }
+    }
+
+    fn align(
+        &mut self,
+        pcm: &[f32],
+        tokens: &[String],
+        lead_star: bool,
+    ) -> Result<Vec<(u64, u64)>, ModelError> {
+        if pcm.is_empty() || tokens.is_empty() {
+            return Ok(Vec::new());
+        }
+        let wave = normalise(pcm);
+        let logits = tracing::info_span!(
+            "aligner.forward",
+            samples = pcm.len(),
+            windows = 1,
+            aligner.device = "vulkan",
+            aligner.device_reason = %self.reason,
+            aligner.adapter = %self.adapter
+        )
+        .in_scope(|| self.model.logits(&wave))
+        .map_err(ModelError::Device)?;
+        spans(&logits, pcm.len(), tokens, lead_star)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

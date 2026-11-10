@@ -4,6 +4,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use crate::device::DeviceMode;
 use crate::pin::PinMode;
 
 pub const DEFAULT_LISTEN: &str = "0.0.0.0:8790";
@@ -31,6 +32,7 @@ pub struct Config {
     pub pin: PinMode,
     /// Most samples one forward pass holds.
     pub batch_samples: usize,
+    pub device: DeviceMode,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -122,6 +124,14 @@ impl Config {
             },
         };
 
+        let device = match set(get("PHAROS_ALIGNER_DEVICE")) {
+            None => DeviceMode::Auto,
+            Some(raw) => raw
+                .trim()
+                .parse()
+                .map_err(|()| invalid("PHAROS_ALIGNER_DEVICE", "auto, vulkan or cpu", &raw))?,
+        };
+
         Ok(Self {
             media_root: PathBuf::from(media_root),
             host,
@@ -132,6 +142,7 @@ impl Config {
             weights: PathBuf::from(weights),
             pin,
             batch_samples,
+            device,
         })
     }
 }
@@ -164,6 +175,7 @@ mod tests {
         assert_eq!(c.weights, PathBuf::from("/w"));
         assert_eq!(c.pin, PinMode::Auto);
         assert_eq!(c.batch_samples, 1_000_000);
+        assert_eq!(c.device, DeviceMode::Auto);
     }
 
     #[test]
@@ -177,8 +189,10 @@ mod tests {
             ("PHAROS_ALIGNER_OTLP_ENDPOINT", "http://otel:4317"),
             ("PHAROS_ALIGNER_PIN", "off"),
             ("PHAROS_ALIGNER_BATCH_SAMPLES", "48000"),
+            ("PHAROS_ALIGNER_DEVICE", "cpu"),
         ]))
         .unwrap();
+        assert_eq!(c.device, DeviceMode::Cpu);
         assert_eq!(c.pin, PinMode::Off);
         assert_eq!(c.batch_samples, 48_000);
         assert_eq!((c.host.as_str(), c.port, c.threads), ("127.0.0.1", 9000, 4));
@@ -263,6 +277,16 @@ mod tests {
         assert_eq!(
             e.to_string(),
             r#"PHAROS_ALIGNER_BATCH_SAMPLES must be an integer >= 1, got "0""#
+        );
+        let e = Config::from_env(env(&[
+            ("PHAROS_ALIGNER_MEDIA_ROOT", "/m"),
+            ("PHAROS_ALIGNER_WEIGHTS", "/w"),
+            ("PHAROS_ALIGNER_DEVICE", "gpu"),
+        ]))
+        .unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            r#"PHAROS_ALIGNER_DEVICE must be auto, vulkan or cpu, got "gpu""#
         );
     }
 }
