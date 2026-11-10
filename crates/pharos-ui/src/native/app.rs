@@ -3754,6 +3754,10 @@ fn keep_control(detail: &Detail) -> Option<Element> {
             id: detail.item.id,
             title: super::views::display_name(&detail.item),
             format,
+            place: detail
+                .read_position
+                .as_ref()
+                .map(|p| (p.locator.clone(), p.fraction)),
         }
     })
 }

@@ -88,6 +88,27 @@ fn write(store: &KeptStore) {
     }
 }
 
+/// Whether the browser says it has no connection. A phone in a tunnel often
+/// says it has one, so the callers that wait on the server also bound the wait
+/// ([`within`]).
+pub fn is_offline() -> bool {
+    web_sys::window().is_some_and(|w| !w.navigator().on_line())
+}
+
+/// How long the reader waits for the server's word on a book it already
+/// opened from the device (spec 036 FR-006).
+pub const SERVER_CHECK_MS: u32 = 3_000;
+
+/// `fut`'s output, or `None` once `ms` have passed.
+pub async fn within<T>(ms: u32, fut: impl std::future::Future<Output = T>) -> Option<T> {
+    use futures_util::future::{select, Either};
+    let wait = std::pin::pin!(platform::sleep_ms(ms));
+    match select(std::pin::pin!(fut), wait).await {
+        Either::Left((out, _)) => Some(out),
+        Either::Right(_) => None,
+    }
+}
+
 fn caches() -> Result<web_sys::CacheStorage, String> {
     web_sys::window()
         .ok_or("no window")?
@@ -186,6 +207,7 @@ pub async fn keep(
     title: &str,
     format: KeptFormat,
     user: &str,
+    place: Option<(String, f32)>,
 ) -> Result<KeptBook, String> {
     let mut store = match read() {
         Some(store) if store.is_for(user) => store,
@@ -240,8 +262,10 @@ pub async fn keep(
         bytes,
         kept_at: String::from(js_sys::Date::new_0().to_iso_string()),
         reason: Reason::Hand,
-        locator: None,
-        fraction: 0.0,
+        // Where the server has the reader, so a resume with no server starts
+        // there; its time is unknown, so any place read here is later.
+        fraction: place.as_ref().map_or(0.0, |p| p.1),
+        locator: place.map(|p| p.0),
         read_at_ms: 0,
     };
     store.keep(book.clone());
@@ -322,9 +346,58 @@ pub async fn clear_all(why: &str) {
     ));
 }
 
+/// A kept book's bytes, read from this user's cache. `None` when the book
+/// is not there (evicted, or never kept), so the reader asks the network.
+pub async fn cached_book(user: &str, id: ItemRef) -> Option<js_sys::Uint8Array> {
+    let cache = open_cache(user).await.ok()?;
+    let found = JsFuture::from(cache.match_with_str(&book_key(id)))
+        .await
+        .ok()?;
+    let response: web_sys::Response = found.dyn_into().ok()?;
+    let buffer = JsFuture::from(response.array_buffer().ok()?).await.ok()?;
+    Some(js_sys::Uint8Array::new(&buffer))
+}
+
+/// Notes where the reader is in a kept book, for a resume with no server.
+/// The save queue holds what still has to be sent; this is only the place.
+/// A no-op for a book that is not kept.
+pub fn note_position(id: ItemRef, locator: &str, fraction: f32, read_at_ms: i64) {
+    let Some(mut store) = read() else {
+        return;
+    };
+    if store.note_position(&id.to_string(), locator, fraction, read_at_ms) {
+        write(&store);
+    }
+}
+
+/// Called with the signed-in user once known: a record kept by someone else
+/// is deleted, so a user never reads another's books (FR-005). Answers
+/// whether it was.
+pub fn reconcile(user: &str) -> bool {
+    let Some(store) = read() else {
+        return false;
+    };
+    if store.is_for(user) {
+        return false;
+    }
+    platform::warn(&format!(
+        "pharos: kept books belong to another user, clearing books={}",
+        store.books.len()
+    ));
+    platform::spawn_detached(async {
+        clear_all("another user").await;
+    });
+    true
+}
+
 /// Keep offline / Remove from device on a book's title page.
 #[component]
-pub fn KeepButton(id: ItemRef, title: String, format: BookFormat) -> Element {
+pub fn KeepButton(
+    id: ItemRef,
+    title: String,
+    format: BookFormat,
+    place: Option<(String, f32)>,
+) -> Element {
     let ctx = use_context::<Ctx>();
     let Some(kept_format) = KeptFormat::of(format) else {
         return rsx! {};
@@ -342,12 +415,12 @@ pub fn KeepButton(id: ItemRef, title: String, format: BookFormat) -> Element {
                     message.set(Some("Connect to the server to keep this book.".into()));
                     return;
                 };
-                let title = title.clone();
+                let (title, place) = (title.clone(), place.clone());
                 busy.set(true);
                 message.set(None);
                 spawn(async move {
                     let outcome = match api.me(&call("title", "keep")).await {
-                        Ok(me) => keep(id, &title, kept_format, &me.id).await,
+                        Ok(me) => keep(id, &title, kept_format, &me.id, place).await,
                         Err(e) => Err(format!("Could not tell who is signed in: {e}")),
                     };
                     match outcome {
