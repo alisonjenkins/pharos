@@ -6,7 +6,7 @@ use std::rc::Rc;
 
 use dioxus::prelude::*;
 
-use super::appearance::{not_saved, Notice, NoticeLine};
+use super::appearance::{not_saved, Lasts, Notice, NoticeLine};
 use super::browse::track_length;
 use super::keymap::{self, Mode, Resolved};
 use super::lyrics::LyricsPanel;
@@ -75,6 +75,27 @@ pub fn dock_shown() -> bool {
 pub fn store_dock(shown: bool) {
     if let Err(e) = platform::store_theme(DOCK_KEY, if shown { QUEUE_SHOWN } else { "hidden" }) {
         platform::warn(&format!("pharos: docked queue choice not stored error={e}"));
+    }
+}
+
+/// Shows the outcome of storing a listen-view choice: the shared notice on a
+/// failure (logged as `<log> not stored`), nothing once a later one is stored.
+fn note_stored(
+    mut note: Signal<Option<Notice>>,
+    result: Result<(), String>,
+    log: &str,
+    what: &str,
+) {
+    match result {
+        Ok(()) => {
+            if note.peek().is_some() {
+                note.set(None);
+            }
+        }
+        Err(e) => {
+            platform::warn(&format!("pharos: {log} not stored error={e}"));
+            note.set(Some(not_saved(what, &e, Lasts::ThisSong)));
+        }
     }
 }
 
@@ -206,7 +227,7 @@ pub fn ListenView(
     };
     let tap = use_hook(Tap::default);
     // A choice below that this device could not store (FR-705).
-    let mut not_stored = use_signal(move || not_stored);
+    let not_stored = use_signal(move || not_stored);
     let shortcuts = use_shortcuts(media, previous, next, on_control).for_song();
     let mut style =
         use_signal(|| Style::parse(platform::stored_theme(STYLE_KEY).ok().flatten().as_deref()));
@@ -217,12 +238,12 @@ pub fn ListenView(
     let mut toggle_lyrics = move || {
         let show = !show_lyrics();
         show_lyrics.set(show);
-        if let Err(e) =
-            platform::store_theme(LYRICS_KEY, if show { "shown" } else { LYRICS_HIDDEN })
-        {
-            platform::warn(&format!("pharos: lyrics choice not stored error={e}"));
-            not_stored.set(Some(not_saved("whether lyrics show", &e)));
-        }
+        note_stored(
+            not_stored,
+            platform::store_theme(LYRICS_KEY, if show { "shown" } else { LYRICS_HIDDEN }),
+            "lyrics choice",
+            "whether lyrics show",
+        );
     };
     let lyrics = lyrics.filter(|l| !l.lines.is_empty());
     let mut karaoke = use_signal(karaoke_on);
@@ -230,10 +251,12 @@ pub fn ListenView(
         let on = !karaoke();
         karaoke.set(on);
         platform::info(&format!("pharos: karaoke on={on}"));
-        if let Err(e) = platform::store_theme(KARAOKE_KEY, if on { KARAOKE_ON } else { "off" }) {
-            platform::warn(&format!("pharos: karaoke choice not stored error={e}"));
-            not_stored.set(Some(not_saved("the karaoke choice", &e)));
-        }
+        note_stored(
+            not_stored,
+            platform::store_theme(KARAOKE_KEY, if on { KARAOKE_ON } else { "off" }),
+            "karaoke choice",
+            "the karaoke choice",
+        );
     };
     // Karaoke follows the words, so it is offered only for synced lyrics
     // that are on screen.
@@ -245,11 +268,12 @@ pub fn ListenView(
         let show = !show_queue();
         show_queue.set(show);
         platform::info(&format!("pharos: queue panel shown={show}"));
-        if let Err(e) = platform::store_theme(QUEUE_KEY, if show { QUEUE_SHOWN } else { "hidden" })
-        {
-            platform::warn(&format!("pharos: queue choice not stored error={e}"));
-            not_stored.set(Some(not_saved("whether the queue shows", &e)));
-        }
+        note_stored(
+            not_stored,
+            platform::store_theme(QUEUE_KEY, if show { QUEUE_SHOWN } else { "hidden" }),
+            "queue choice",
+            "whether the queue shows",
+        );
     };
     let queued = queue.len();
     // The player's keys, and the queue's while the focus is in it (spec 029).
@@ -257,10 +281,12 @@ pub fn ListenView(
     let choose = move |next: Style| {
         style.set(next);
         fallback.set(None);
-        if let Err(e) = platform::store_theme(STYLE_KEY, next.label()) {
-            platform::warn(&format!("pharos: visualiser style not stored error={e}"));
-            not_stored.set(Some(not_saved("the visualiser style", &e)));
-        }
+        note_stored(
+            not_stored,
+            platform::store_theme(STYLE_KEY, next.label()),
+            "visualiser style",
+            "the visualiser style",
+        );
     };
     // Where a drag on the seek bar is, so playback seeks once on release
     // rather than on every step and the thumb stays under the pointer.
@@ -1144,6 +1170,28 @@ mod tests {
         dioxus_ssr::render(&dom)
     }
 
+    /// A choice stored after one that was not clears the notice, so it
+    /// tells of the latest write.
+    #[test]
+    fn a_later_stored_choice_clears_the_notice() {
+        let mut dom = VirtualDom::new(|| {
+            let note = use_signal(|| None::<Notice>);
+            use_hook(|| {
+                note_stored(
+                    note,
+                    Err("QuotaExceededError".into()),
+                    "lyrics choice",
+                    "whether lyrics show",
+                );
+                assert!(note.peek().is_some());
+                note_stored(note, Ok(()), "lyrics choice", "whether lyrics show");
+                assert!(note.peek().is_none());
+            });
+            rsx! {}
+        });
+        dom.rebuild_in_place();
+    }
+
     /// FR-705: a choice the device could not store shows the shared notice
     /// on the listen view, as Appearance shows it. Disarm check: dropping
     /// the `NoticeLine` from the view fails the first assertion.
@@ -1160,7 +1208,7 @@ mod tests {
                     media: MediaState::default(),
                     on_media: |_| {},
                     on_control: |_| {},
-                    not_stored: Some(not_saved("the visualiser style", "QuotaExceededError")),
+                    not_stored: Some(not_saved("the visualiser style", "QuotaExceededError", Lasts::ThisSong)),
                 }
             }
         });
