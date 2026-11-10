@@ -264,7 +264,7 @@ fn decide(
     }
     // 5
     let in_parens = text.starts_with(['(', '（']) && unwrap_marks(text) != text;
-    if let Some(d) = dlu.filter(|d| d.abs() <= NEAR_MEDIAN_DLU) {
+    if let Some(d) = dlu.filter(|d| d.abs() <= NEAR_MEDIAN_DLU * k) {
         if in_parens || line.italic {
             return effect(Intent::Thought, 1, format!("rule=thought dlu={d:+.1}"));
         }
@@ -1053,6 +1053,31 @@ mod tests {
 
     /// A track where a third of the lines really are shouted keeps the
     /// reference margins: only the quieter half sets the spread.
+    /// The Thought band widens with the mix too: a +5 LU italic line is a
+    /// thought on a 6 LU spread, not an off-screen voice.
+    #[test]
+    fn a_wide_mix_widens_the_thought_band() {
+        let mut lines = Vec::new();
+        let mut sigs = Vec::new();
+        for i in 0..20 {
+            lines.push(line("Hello there"));
+            sigs.push(sig(MEDIAN_LUFS - 6.0 + (i % 5) as f32 * 3.0));
+        }
+        let mut l = line("Who is that");
+        l.italic = true;
+        lines.push(l);
+        sigs.push(sig(MEDIAN_LUFS + 5.0));
+        let d = direct(
+            &lines,
+            &TrackSignals {
+                lines: sigs,
+                cuts_ms: vec![],
+            },
+            &[],
+        );
+        assert_eq!(d.plan.lines[20].intent, Intent::Thought);
+    }
+
     #[test]
     fn many_real_shouts_do_not_widen_the_margins() {
         let mut lines = Vec::new();
