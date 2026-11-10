@@ -252,11 +252,24 @@ pub const VIDEO_TICK_MS: u32 = 1000;
 /// often.
 pub const AUDIO_TICK_MS: u32 = 250;
 
-/// The bridge script `template` with its tick intervals filled in.
+/// The players whose arrows the bridge turns into moves between their
+/// controls: the video player, and the music screen while it fills the
+/// screen (B1034, V994). Not the music screen in the mini bar or floating
+/// window, whose controls are the stage bar's.
+pub const REMOTE_PLAYERS: &str = "#pharos-player, .pharos-stage.is-full .pharos-listen";
+
+/// Where Up or Down from the player itself lands: the video's control row,
+/// or the music screen's play button.
+pub const PLAYER_HOME: &str = ".pharos-control-row button, .pharos-listen-play";
+
+/// The bridge script `template` with its tick intervals and player
+/// selectors filled in.
 pub fn bridge_script(template: &str) -> String {
     template
         .replace("__VIDEO_TICK_MS__", &VIDEO_TICK_MS.to_string())
         .replace("__AUDIO_TICK_MS__", &AUDIO_TICK_MS.to_string())
+        .replace("__REMOTE_PLAYERS__", REMOTE_PLAYERS)
+        .replace("__PLAYER_HOME__", PLAYER_HOME)
 }
 
 /// The container list a TV build declares: one no file has, so the server
@@ -503,6 +516,29 @@ mod tests {
             "const every = v instanceof HTMLVideoElement ? 1000 : 250;"
         );
         const { assert!(AUDIO_TICK_MS * 4 <= VIDEO_TICK_MS) };
+    }
+
+    /// B1034/V994: the remote moves between the full music screen's
+    /// controls as it does the video player's, and lands on its play button;
+    /// the music screen in the mini bar is left to the stage bar.
+    #[test]
+    fn the_remote_moves_round_the_full_music_screen() {
+        use crate::native::stage::View;
+        let script =
+            bridge_script("document.querySelector('__REMOTE_PLAYERS__') ?? '__PLAYER_HOME__'");
+        assert!(!script.contains("__"), "{script}");
+        let players: Vec<&str> = REMOTE_PLAYERS.split(", ").collect();
+        let full = format!(".pharos-stage.is-{} .pharos-listen", View::Full.label());
+        assert!(players.contains(&full.as_str()), "{REMOTE_PLAYERS}");
+        assert!(players.contains(&"#pharos-player"), "{REMOTE_PLAYERS}");
+        for compact in [View::Mini, View::Floating] {
+            assert!(!REMOTE_PLAYERS.contains(&format!("is-{}", compact.label())));
+        }
+        assert!(
+            !players.contains(&".pharos-listen"),
+            "the compact music screen is the stage bar's"
+        );
+        assert!(PLAYER_HOME.split(", ").any(|s| s == ".pharos-listen-play"));
     }
 
     #[test]
