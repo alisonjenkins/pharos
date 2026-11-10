@@ -178,6 +178,9 @@ pub async fn server_schema_version(
     }
 }
 
+/// The schema version this build speaks.
+pub const SCHEMA_VERSION: u32 = pharos_api::pharos_capnp::SCHEMA_VERSION;
+
 /// Whether a server on `server_schema` is newer than this build, as it is when
 /// a page loaded before a deploy reconnects after it: the page should reload.
 pub fn is_outdated_by(server_schema: u32) -> bool {
