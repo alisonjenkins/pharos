@@ -1570,6 +1570,12 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
     // built-in US default) backing per-user MaxParentalRating enforcement.
     state.parental_ratings =
         pharos_server::parental::ParentalRatingMap::from_config(&cfg.parental.ratings);
+    if let (None, Some(shadow)) = (&cfg.lyrics.aligner_url, &cfg.lyrics.aligner_shadow_url) {
+        tracing::warn!(
+            shadow_url = %shadow,
+            "lyrics: aligner_shadow_url is set without aligner_url; no song is sent to it"
+        );
+    }
     if cfg.lyrics.online || cfg.lyrics.aligner_url.is_some() {
         // Same "explicit dir, else a sibling of an existing cache dir" rule
         // the subtitle and book caches use (B361).
