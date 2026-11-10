@@ -3140,8 +3140,8 @@ fn library_buckets<'a>(paths: impl Iterator<Item = &'a Path>) -> Vec<Vec<CopyBuc
     out
 }
 
-/// The key a film file's name gives it (`Heat (1995) Bluray-1080p.mkv` is
-/// `("heat", 1995)`): the name's words, lower-cased, less its year, the words
+/// The key a film file's name gives it (`Film BB (1995) Bluray-1080p.mkv` is
+/// `("film bb", 1995)`): the name's words, lower-cased, less its year, the words
 /// that say how the copy was made ([`FILM_RELEASE_WORDS`], resolutions,
 /// channel layouts, the 3D packing) and a leading or trailing article
 /// (`The Thing`, `Thing, The`). A cut or edition after the year and a lone
@@ -3266,7 +3266,7 @@ fn title_words(name: &str, year: Option<u32>) -> Vec<String> {
 }
 
 /// Words that make a file a film's extra, not a copy of it: a scene tail
-/// keeps them (`Heat.1995.Trailer.720p` is no copy of `Heat (1995)`).
+/// keeps them (`Film BB.1995.Trailer.720p` is no copy of `Film BB (1995)`).
 const EXTRA_WORDS: &[&str] = &[
     "trailer",
     "teaser",
@@ -4045,7 +4045,7 @@ pub(crate) fn is_show_folder_video(path: &Path) -> bool {
     video && show_folder_of(path).is_some()
 }
 
-/// A folder of a show's bonus material (`Extras`, `Chuck Extras`,
+/// A folder of a show's bonus material (`Extras`, `Show AZ Extras`,
 /// `Featurettes`, `Special Features`, `Bonus`).
 fn is_extras_dir(name: &str) -> bool {
     let lower = name.to_lowercase();
@@ -4061,7 +4061,7 @@ fn is_extras_dir(name: &str) -> bool {
 
 /// [`parse_series_info`] for a file under a show folder: the show is the
 /// folder holding `tvshow.nfo`, not a sub-folder between it and the file
-/// (`SAO II/`, `Chuck Extras/`), and a file in an extras folder is a special
+/// (`Show BG II/`, `Show AZ Extras/`), and a file in an extras folder is a special
 /// with no episode number, since its name carries none of the show's.
 pub fn episode_series_info(path: &Path) -> Option<SeriesInfo> {
     let mut info = parse_series_info(path)?;
@@ -4450,7 +4450,7 @@ fn parse_episode_from_name(name: &str) -> Option<(Option<u32>, u32)> {
                 if next.is_ascii_digit() || matches!(next, b'i' | b'I' | b'p' | b'P') {
                     continue;
                 }
-                // A half-numbered recap (`SAO II - 14.5`) is not episode 14.
+                // A half-numbered recap (`Show BG II - 14.5`) is not episode 14.
                 let half = name.as_bytes().get(e_match.end() + 1..e_match.end() + 3);
                 if next == b'.'
                     && half.is_some_and(|h| h[0].is_ascii_digit() && !h[1].is_ascii_alphanumeric())
@@ -4558,7 +4558,7 @@ fn is_sidecar_noise(path: &Path) -> bool {
 }
 
 /// A release's sample clip: a video under a `Sample` folder, or one whose
-/// name ends in `sample` (`Heat.1995.sample.mkv`, `Heat (Sample).mkv`).
+/// name ends in `sample` (`Film BB.1995.sample.mkv`, `Film BB (Sample).mkv`).
 /// Indexed, each showed up as another copy of its film.
 pub(crate) fn is_release_sample(relative: &Path) -> bool {
     let video = relative
@@ -8290,10 +8290,13 @@ mod tests {
     /// it folds in as a copy of 14; a release tag after `S01E03.` stays read.
     #[test]
     fn a_half_numbered_recap_is_not_its_whole_episode() {
-        assert_eq!(parse_episode_from_name("SAO II - 14.5 L@mBerT.mp4"), None);
+        assert_eq!(
+            parse_episode_from_name("Show BG II - 14.5 L@mBerT.mp4"),
+            None
+        );
         assert_eq!(parse_episode_from_name("Show - 07.5.mkv"), None);
         assert_eq!(
-            parse_episode_from_name("SAO II - 14 L@mBerT.mp4"),
+            parse_episode_from_name("Show BG II - 14 L@mBerT.mp4"),
             Some((None, 14))
         );
         assert_eq!(
@@ -8609,14 +8612,14 @@ mod tests {
     #[test]
     fn split_edition_tag_recognises_3d_labels() {
         assert_eq!(
-            split_edition_tag("Avatar (2009) - 3D.HSBS"),
-            Some(("Avatar (2009)", "3D.HSBS"))
+            split_edition_tag("Film BA (2009) - 3D.HSBS"),
+            Some(("Film BA (2009)", "3D.HSBS"))
         );
         assert_eq!(
             split_edition_tag("Foo S01E01 - 3D HTAB"),
             Some(("Foo S01E01", "3D HTAB"))
         );
-        assert_eq!(split_edition_tag("Avatar - 3D"), None);
+        assert_eq!(split_edition_tag("Film BA - 3D"), None);
     }
 
     #[test]
@@ -8628,8 +8631,8 @@ mod tests {
     #[tokio::test]
     async fn a_3d_rip_groups_under_its_2d_movie_with_its_format() {
         let td = TempDir::new().unwrap();
-        touch(td.path(), "Avatar (2009)/Avatar (2009).mkv").await;
-        touch(td.path(), "Avatar (2009)/Avatar (2009) - 3D.HSBS.mkv").await;
+        touch(td.path(), "Film BA (2009)/Film BA (2009).mkv").await;
+        touch(td.path(), "Film BA (2009)/Film BA (2009) - 3D.HSBS.mkv").await;
         let items = FsScanner::new(FakeProber::default())
             .scan(td.path())
             .await
@@ -8969,7 +8972,7 @@ mod tests {
             PathBuf::from("/tv/Foo/Season 01/Foo S01E02.mkv"),
             PathBuf::from("/tv/Foo/Season 02/Foo S02E01.mkv"),
             PathBuf::from("/tv/Bar/Season 01/Bar S01E01.mkv"),
-            PathBuf::from("/films/Heat (1995).mkv"),
+            PathBuf::from("/films/Film BB (1995).mkv"),
         ]);
         assert_eq!(groups.len(), 5);
         assert!(groups.iter().all(|(_, alts)| alts.is_empty()));
@@ -9138,9 +9141,9 @@ mod tests {
     /// V846: copies of one film are one item, the best quality primary.
     #[test]
     fn copies_of_a_film_are_one_item() {
-        let sd = PathBuf::from("/films/Heat (1995) [720p]/Heat.1995.720p.HDTV.mkv");
-        let hd = PathBuf::from("/films/Heat (1995)/Heat (1995) Bluray-1080p.mkv");
-        let three_d = PathBuf::from("/films/3D/Heat (1995) - 3D.HSBS.mkv");
+        let sd = PathBuf::from("/films/Film BB (1995) [720p]/Film BB.1995.720p.HDTV.mkv");
+        let hd = PathBuf::from("/films/Film BB (1995)/Film BB (1995) Bluray-1080p.mkv");
+        let three_d = PathBuf::from("/films/3D/Film BB (1995) - 3D.HSBS.mkv");
         let groups = group_editions(vec![sd.clone(), hd.clone(), three_d.clone()]);
         assert_eq!(groups.len(), 1, "{groups:?}");
         assert_eq!(groups[0].0, hd);
@@ -9164,17 +9167,17 @@ mod tests {
         let groups = group_editions(vec![
             PathBuf::from("/films/Film A (1971)/Film A (1971).mkv"),
             PathBuf::from("/films/Film A (1996)/Film A (1996).mkv"),
-            PathBuf::from("/films/Heat (1995)/Heat (1995).mkv"),
-            PathBuf::from("/films/Heat (1995)/trailer.mkv"),
-            PathBuf::from("/films/Other/Heat (1995) - Director's Cut.mkv"),
-            PathBuf::from("/films/Untitled/Heat.mkv"),
+            PathBuf::from("/films/Film BB (1995)/Film BB (1995).mkv"),
+            PathBuf::from("/films/Film BB (1995)/trailer.mkv"),
+            PathBuf::from("/films/Other/Film BB (1995) - Director's Cut.mkv"),
+            PathBuf::from("/films/Untitled/Film BB.mkv"),
             PathBuf::from("/films/Untitled/Film A.mkv"),
-            PathBuf::from("/music/Heat (1995)/Heat (1995).flac"),
+            PathBuf::from("/music/Film BB (1995)/Film BB (1995).flac"),
         ]);
         assert_eq!(groups.len(), 6, "{groups:?}");
         let heat = groups
             .iter()
-            .find(|(p, _)| p == Path::new("/films/Heat (1995)/Heat (1995).mkv"))
+            .find(|(p, _)| p == Path::new("/films/Film BB (1995)/Film BB (1995).mkv"))
             .map(|(_, alts)| {
                 alt_paths(alts)
                     .into_iter()
@@ -9184,14 +9187,14 @@ mod tests {
         assert_eq!(
             heat,
             Some(vec![
-                PathBuf::from("/films/Untitled/Heat.mkv"),
-                PathBuf::from("/films/Other/Heat (1995) - Director's Cut.mkv"),
+                PathBuf::from("/films/Untitled/Film BB.mkv"),
+                PathBuf::from("/films/Other/Film BB (1995) - Director's Cut.mkv"),
             ]),
             "a cut is a version of its film (V962); a yearless copy joins the one year its title is held in (V971)"
         );
         let others = groups
             .iter()
-            .filter(|(p, _)| !p.ends_with("Heat (1995).mkv"));
+            .filter(|(p, _)| !p.ends_with("Film BB (1995).mkv"));
         assert!(
             others.into_iter().all(|(_, alts)| alts.is_empty()),
             "{groups:?}"
@@ -9235,17 +9238,17 @@ mod tests {
                 "/m/Film X (2000)/Film X (2000) BluRay cd2.mkv",
             ),
             (
-                "/m/Heat (1995)/Heat (1995) Bluray-1080p.mkv",
-                "/m/Heat (1995)/Heat (1995) Part 2 Bluray-1080p.mkv",
+                "/m/Film BB (1995)/Film BB (1995) Bluray-1080p.mkv",
+                "/m/Film BB (1995)/Film BB (1995) Part 2 Bluray-1080p.mkv",
             ),
             // B1025 / V984
             (
-                "/m/Heat (1995)/Heat (1995) Bluray-1080p.mkv",
-                "/m/Heat (1995)/Heat.1995.Trailer.720p.mkv",
+                "/m/Film BB (1995)/Film BB (1995) Bluray-1080p.mkv",
+                "/m/Film BB (1995)/Film BB.1995.Trailer.720p.mkv",
             ),
             (
-                "/m/Heat (1995)/Heat (1995) Bluray-1080p.mkv",
-                "/m/Heat (1995)/Heat.1995.Behind.The.Scenes.1080p.WEB.mkv",
+                "/m/Film BB (1995)/Film BB (1995) Bluray-1080p.mkv",
+                "/m/Film BB (1995)/Film BB.1995.Behind.The.Scenes.1080p.WEB.mkv",
             ),
         ] {
             let groups = group_editions(vec![PathBuf::from(a), PathBuf::from(b)]);
@@ -9336,8 +9339,8 @@ mod tests {
             "a release group is how a copy was made"
         );
         assert_eq!(
-            film_copy_key(Path::new("/m/Heat.1995.1080p.BluRay.x264-SPARKS.mkv")),
-            Some(("heat".to_string(), 1995))
+            film_copy_key(Path::new("/m/Film BB.1995.1080p.BluRay.x264-SPARKS.mkv")),
+            Some(("film bb".to_string(), 1995))
         );
         for extra in [
             "trailer.mkv",
@@ -9414,14 +9417,14 @@ mod tests {
             "X/Film X 3 2006 BluRay 720p DTS x264-MgB (Sample).mkv",
             "X/Film.X.5.2011.1080p.BluRay.x264.AC3-ETRG.Sample.mp4",
             "The Golem (2018)/Sample.mkv",
-            "Heat (1995)/Heat (1995)-sample.mkv",
+            "Film BB (1995)/Film BB (1995)-sample.mkv",
             // B1013 / V972
             "X/sample-The Last Beacon (1984) 25th Anniversary Ed.mkv",
         ] {
             assert!(is_release_sample(Path::new(sample)), "{sample}");
         }
         for kept in [
-            "Heat (1995)/Heat (1995) Bluray-1080p.mkv",
+            "Film BB (1995)/Film BB (1995) Bluray-1080p.mkv",
             "Samples (2020)/Samples (2020).mkv",
             "Music/Artist/Album/03 - Sample.flac",
             "Sample Size (2019)/Sample Size (2019).mkv",
@@ -9434,38 +9437,40 @@ mod tests {
     /// are never copies of the film; a 3D rip of a cut is a copy of that cut.
     #[test]
     fn a_film_name_that_says_more_than_its_release_is_its_own_title() {
-        let film = film_copy_key(Path::new("/f/Heat (1995)/Heat (1995) Bluray-1080p.mkv"));
-        assert_eq!(film, Some(("heat".to_string(), 1995)));
+        let film = film_copy_key(Path::new(
+            "/f/Film BB (1995)/Film BB (1995) Bluray-1080p.mkv",
+        ));
+        assert_eq!(film, Some(("film bb".to_string(), 1995)));
         for other in [
-            "Heat (1995)-trailer.mkv",
-            "Heat (1995)-sample.mkv",
-            "Heat.1995.sample.mkv",
-            "Heat (1995) - Behind the Scenes.mkv",
-            "Heat (1995) Extras.mkv",
-            "Heat (1995) - part1.mkv",
-            "Heat (1995) - part2.mkv",
-            "Heat (1995) cd2.avi",
+            "Film BB (1995)-trailer.mkv",
+            "Film BB (1995)-sample.mkv",
+            "Film BB.1995.sample.mkv",
+            "Film BB (1995) - Behind the Scenes.mkv",
+            "Film BB (1995) Extras.mkv",
+            "Film BB (1995) - part1.mkv",
+            "Film BB (1995) - part2.mkv",
+            "Film BB (1995) cd2.avi",
         ] {
-            let key = film_copy_key(&Path::new("/f/Heat (1995)").join(other));
+            let key = film_copy_key(&Path::new("/f/Film BB (1995)").join(other));
             assert_ne!(key, film, "{other}");
         }
         assert_ne!(
-            film_copy_key(Path::new("/f/Heat (1995) - part1.mkv")),
-            film_copy_key(Path::new("/f/Heat (1995) - part2.mkv")),
+            film_copy_key(Path::new("/f/Film BB (1995) - part1.mkv")),
+            film_copy_key(Path::new("/f/Film BB (1995) - part2.mkv")),
         );
         // V962, V963: a cut, an edition or a lone cd1 is a version of the film.
         for cut in [
-            "Heat (1995) Director's Cut.mkv",
-            "Heat (1995) - Director's Cut - 3D.HSBS.mkv",
-            "Heat.1995.Directors.Cut.1080p.BluRay.x264-SPARKS.mkv",
-            "Heat (1995) {edition-Director's Cut}.mkv",
-            "Heat (1995) Remastered.mkv",
-            "Heat (1995) IMAX.mkv",
-            "Heat (1995) Unrated Extended Cut.mkv",
-            "Heat (1995) [Extended].mkv",
-            "Heat (1995) cd1.avi",
+            "Film BB (1995) Director's Cut.mkv",
+            "Film BB (1995) - Director's Cut - 3D.HSBS.mkv",
+            "Film BB.1995.Directors.Cut.1080p.BluRay.x264-SPARKS.mkv",
+            "Film BB (1995) {edition-Director's Cut}.mkv",
+            "Film BB (1995) Remastered.mkv",
+            "Film BB (1995) IMAX.mkv",
+            "Film BB (1995) Unrated Extended Cut.mkv",
+            "Film BB (1995) [Extended].mkv",
+            "Film BB (1995) cd1.avi",
         ] {
-            let key = film_copy_key(&Path::new("/f/Heat (1995)").join(cut));
+            let key = film_copy_key(&Path::new("/f/Film BB (1995)").join(cut));
             assert_eq!(key, film, "{cut}");
         }
         assert_ne!(
@@ -9477,16 +9482,16 @@ mod tests {
         );
         assert_eq!(
             film_copy_key(Path::new(
-                "/f/Heat.1995.2160p.UHD.BluRay.x265.HDR.DDP5.1.mkv"
+                "/f/Film BB.1995.2160p.UHD.BluRay.x265.HDR.DDP5.1.mkv"
             )),
             film,
         );
         assert_ne!(
             film_copy_key(Path::new(
-                "/tv/Planet Earth (2006)/Planet Earth (2006) - 01 - From Pole to Pole.mkv"
+                "/tv/Show BF (2006)/Show BF (2006) - 01 - From Pole to Pole.mkv"
             )),
             film_copy_key(Path::new(
-                "/tv/Planet Earth (2006)/Planet Earth (2006) - 02 - Mountains.mkv"
+                "/tv/Show BF (2006)/Show BF (2006) - 02 - Mountains.mkv"
             )),
         );
     }
@@ -9874,11 +9879,11 @@ mod tests {
     fn a_flagged_shows_guard_covers_its_show_folder_copies() {
         let td = TempDir::new().unwrap();
         let show = td.path().join("Show W II");
-        std::fs::create_dir_all(show.join("SAO II")).unwrap();
+        std::fs::create_dir_all(show.join("Show BG II")).unwrap();
         std::fs::write(show.join("tvshow.nfo"), b"<tvshow/>").unwrap();
         let paths = vec![
-            show.join("SAO II/SAO II - 14 L@mBerT.mp4"),
-            show.join("SAO II/SAO II - 14 [1080p].mkv"),
+            show.join("Show BG II/Show BG II - 14 L@mBerT.mp4"),
+            show.join("Show BG II/Show BG II - 14 [1080p].mkv"),
         ];
         let key = show.to_string_lossy().into_owned();
         let guard = guard_for(&paths, vec![], &[key.as_str()]);
@@ -10207,13 +10212,13 @@ mod tests {
     #[tokio::test]
     async fn a_watched_3d_file_is_flagged_3d() {
         let td = TempDir::new().unwrap();
-        touch(td.path(), "Gravity (2013) - 3D.HTAB.mkv").await;
+        touch(td.path(), "Film AZ (2013) - 3D.HTAB.mkv").await;
         let store = MemStore::default();
         let scanner = FsScanner::new(FakeProber::default());
         let scan_id = store.begin_scan(td.path()).await.unwrap();
         scanner
             .update_path(
-                &td.path().join("Gravity (2013) - 3D.HTAB.mkv"),
+                &td.path().join("Film AZ (2013) - 3D.HTAB.mkv"),
                 &store,
                 scan_id,
             )
@@ -10230,7 +10235,7 @@ mod tests {
     #[tokio::test]
     async fn a_lone_3d_rip_is_its_own_item_flagged_3d() {
         let td = TempDir::new().unwrap();
-        touch(td.path(), "Gravity (2013) - 3D.HTAB.mkv").await;
+        touch(td.path(), "Film AZ (2013) - 3D.HTAB.mkv").await;
         let items = FsScanner::new(FakeProber::default())
             .scan(td.path())
             .await
@@ -10695,7 +10700,7 @@ mod tests {
     #[test]
     fn resolve_3d_format_filename_fallback_movie_and_episode() {
         let mut movie_probe = pharos_core::MediaProbe::default();
-        let movie_path = Path::new("/movies/Avatar.2009.1080p.3D.HSBS.mkv");
+        let movie_path = Path::new("/movies/Film BA.2009.1080p.3D.HSBS.mkv");
         resolve_item_3d_format(movie_path, MediaKind::Movie, &mut movie_probe);
         assert_eq!(
             movie_probe.video_3d_format,
@@ -10723,7 +10728,7 @@ mod tests {
             container: Some("matroska".into()),
             ..Default::default()
         };
-        let path = Path::new("/movies/Avatar.2009.1080p.3D.HSBS.mkv");
+        let path = Path::new("/movies/Film BA.2009.1080p.3D.HSBS.mkv");
         resolve_item_3d_format(path, MediaKind::Movie, &mut probe);
         assert_eq!(
             probe.video_3d_format,
@@ -10741,7 +10746,7 @@ mod tests {
             container: Some("matroska".into()),
             ..Default::default()
         };
-        let path = Path::new("/movies/Avatar.2009.1080p.3D.FSBS.mkv");
+        let path = Path::new("/movies/Film BA.2009.1080p.3D.FSBS.mkv");
         resolve_item_3d_format(path, MediaKind::Movie, &mut probe);
         assert_eq!(
             probe.video_3d_format,
@@ -10765,7 +10770,7 @@ mod tests {
             container: Some("matroska".into()),
             ..Default::default()
         };
-        let path = Path::new("/movies/Avatar.2009.1080p.mkv");
+        let path = Path::new("/movies/Film BA.2009.1080p.mkv");
         resolve_item_3d_format(path, MediaKind::Movie, &mut probe);
 
         let snapshot = snapshotter.snapshot();
@@ -10791,14 +10796,14 @@ mod tests {
     #[tokio::test]
     async fn scanner_probe_one_integrates_3d_detection_for_movie_and_episode() {
         let td = TempDir::new().unwrap();
-        write_file(td.path(), "Avatar.2009.1080p.3D.HSBS.mkv", b"fake").await;
+        write_file(td.path(), "Film BA.2009.1080p.3D.HSBS.mkv", b"fake").await;
         write_file(td.path(), "Show.S01E01.1080p.3D.HTAB.mkv", b"fake").await;
 
         let s = FsScanner::new(FakeProber::default());
         let store = MemStore::default();
         s.scan_into(td.path(), &store).await.unwrap();
 
-        let movie_item = item_by_path(&store, &td.path().join("Avatar.2009.1080p.3D.HSBS.mkv"));
+        let movie_item = item_by_path(&store, &td.path().join("Film BA.2009.1080p.3D.HSBS.mkv"));
         assert_eq!(
             movie_item.probe.video_3d_format,
             Some(Video3DFormat::HalfSideBySide)
@@ -10826,25 +10831,30 @@ mod tests {
             "TV/Show D/[a-s]_show_d_-_063_-_the_old_second__rs2_[1AE8566B].mkv",
         )
         .await;
-        write_file(root, "TV/SAO II [Season 2] [480p]/tvshow.nfo", b"<tvshow/>").await;
-        touch(
+        write_file(
             root,
-            "TV/SAO II [Season 2] [480p]/SAO II/SAO II - 14 L@mBerT.mp4",
+            "TV/Show BG II [Season 2] [480p]/tvshow.nfo",
+            b"<tvshow/>",
         )
         .await;
         touch(
             root,
-            "TV/SAO II [Season 2] [480p]/SAO II/SAO II - 14.5 L@mBerT.mp4",
+            "TV/Show BG II [Season 2] [480p]/Show BG II/Show BG II - 14 L@mBerT.mp4",
         )
         .await;
-        write_file(root, "TV/Chuck/tvshow.nfo", b"<tvshow/>").await;
         touch(
             root,
-            "TV/Chuck/Chuck Extras/CHUCK Season 2 DVD Bloopers [www[1].keepvid.com].mp4",
+            "TV/Show BG II [Season 2] [480p]/Show BG II/Show BG II - 14.5 L@mBerT.mp4",
+        )
+        .await;
+        write_file(root, "TV/Show AZ/tvshow.nfo", b"<tvshow/>").await;
+        touch(
+            root,
+            "TV/Show AZ/Show AZ Extras/SHOW AZ Season 2 DVD Bloopers [www[1].keepvid.com].mp4",
         )
         .await;
         touch(root, "TV/No Nfo/loose - 07 - title.mkv").await;
-        touch(root, "Movies/Heat (1995)/Heat (1995).mkv").await;
+        touch(root, "Movies/Film BB (1995)/Film BB (1995).mkv").await;
 
         let items = FsScanner::new(FakeProber::default())
             .scan(root)
@@ -10872,21 +10882,21 @@ mod tests {
 
         assert_eq!(shape("_063_"), episode("Show D", Some(1), Some(63)));
         assert_eq!(
-            shape("SAO II - 14 "),
-            episode("SAO II [Season 2] [480p]", Some(1), Some(14))
+            shape("Show BG II - 14 "),
+            episode("Show BG II [Season 2] [480p]", Some(1), Some(14))
         );
         assert_eq!(
-            shape("SAO II - 14.5"),
-            episode("SAO II [Season 2] [480p]", None, None),
+            shape("Show BG II - 14.5"),
+            episode("Show BG II [Season 2] [480p]", None, None),
             "a half-numbered recap is not episode 14"
         );
-        assert_eq!(shape("Bloopers"), episode("Chuck", Some(0), None));
+        assert_eq!(shape("Bloopers"), episode("Show AZ", Some(0), None));
         assert_eq!(
             find("loose - 07").kind,
             MediaKind::Movie,
             "no tvshow.nfo, no season folder"
         );
-        assert_eq!(find("Heat (1995)").kind, MediaKind::Movie);
+        assert_eq!(find("Film BB (1995)").kind, MediaKind::Movie);
     }
 
     /// B1010 / V969 — a folder holding Jellyfin's `.ignore` is left out of
@@ -10900,7 +10910,7 @@ mod tests {
 
         let td = TempDir::new().unwrap();
         touch(td.path(), "To Sort/SG1_S9V2_E/title_t00.mkv").await;
-        touch(td.path(), "Movies/Heat (1995)/Heat (1995).mkv").await;
+        touch(td.path(), "Movies/Film BB (1995)/Film BB (1995).mkv").await;
         let store = MemStore::default();
         let s = FsScanner::new(FakeProber::default());
         let first = s.scan_into(td.path(), &store).await.unwrap();
@@ -10912,7 +10922,7 @@ mod tests {
         assert_eq!(second.removed, [rip], "the marked folder's row is swept");
         assert!(store
             .get(stable_id(
-                &td.path().join("Movies/Heat (1995)/Heat (1995).mkv")
+                &td.path().join("Movies/Film BB (1995)/Film BB (1995).mkv")
             ))
             .await
             .is_ok());
@@ -10921,7 +10931,7 @@ mod tests {
             td.path()
         ));
         assert!(!in_ignored_folder(
-            &td.path().join("Movies/Heat (1995)/Heat (1995).mkv"),
+            &td.path().join("Movies/Film BB (1995)/Film BB (1995).mkv"),
             td.path()
         ));
 
@@ -10953,7 +10963,7 @@ mod tests {
         let td = TempDir::new().unwrap();
         let file = "TV/Show D/[a-s]_show_d_-_063_-_the_old_second.mkv";
         touch(td.path(), file).await;
-        touch(td.path(), "Movies/Heat (1995)/Heat (1995).mkv").await;
+        touch(td.path(), "Movies/Film BB (1995)/Film BB (1995).mkv").await;
         let store = MemStore::default();
         let s = FsScanner::new(FakeProber::default());
         s.scan_into(td.path(), &store).await.unwrap();
@@ -11091,13 +11101,16 @@ mod tests {
         std::fs::write(root.join("To Sort/.ignore"), b"").unwrap();
         for skipped in [
             "To Sort/SG1/title_t00.mkv",
-            "Heat (1995)/Sample/heat.sample.mkv",
+            "Film BB (1995)/Sample/film-bb.sample.mkv",
             "X/sample-The Last Beacon (1984).mkv",
             "X/ETRG.mp4",
         ] {
             assert!(walk_skips(&root.join(skipped), root), "{skipped}");
         }
-        assert!(!walk_skips(&root.join("Heat (1995)/Heat (1995).mkv"), root));
+        assert!(!walk_skips(
+            &root.join("Film BB (1995)/Film BB (1995).mkv"),
+            root
+        ));
     }
 
     #[test]
@@ -11109,7 +11122,7 @@ mod tests {
             "/lib/To Sort/x.ignore",
             "/lib/.ignore/x.mkv",
             "/lib/To Sort",
-            "/lib/Heat (1995)/movie.nfo",
+            "/lib/Film BB (1995)/movie.nfo",
         ] {
             assert!(!reshapes_indexed_rows(Path::new(other)), "{other}");
         }

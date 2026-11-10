@@ -491,13 +491,13 @@ async fn nested_set_name_form_parses_into_collections() {
 }
 
 /// B558 — trimmed from a deployed library: a scraper identified the
-/// `TV/Show K` folder as Super Show K Heroes and wrote that show's
+/// `TV/Show K` folder as Super Show K Legion and wrote that show's
 /// NFOs and stills into it.
 const FOREIGN_TVSHOW_NFO: &str = r#"<?xml version="1.0" encoding="utf-8" standalone="yes"?>
 <tvshow>
   <plot>A hero returns from the future to train with two rivals.</plot>
-  <title>Super Show K Heroes</title>
-  <originaltitle>スーパーショーKヒーローズ</originaltitle>
+  <title>Super Show K Legion</title>
+  <originaltitle>スーパーショーKレギオン</originaltitle>
   <tmdbid>910011</tmdbid>
   <tvdbid>910012</tvdbid>
   <art>
@@ -511,13 +511,13 @@ const FOREIGN_TVSHOW_NFO: &str = r#"<?xml version="1.0" encoding="utf-8" standal
 const FOREIGN_EPISODE_NFO: &str = r#"<?xml version="1.0" encoding="utf-8" standalone="yes"?>
 <episodedetails>
   <plot>Two rivals' training with their mentors is interrupted.</plot>
-  <title>Rival Heroes! A Great Battle Begins on the Prison Moon!</title>
+  <title>Rival Legion! A Great Battle Begins on the Prison Moon!</title>
   <imdbid>tt9100001</imdbid>
   <tvdbid>910013</tvdbid>
   <art>
     <poster>/media/TV/Show K/Season 01/Show K - S01E01 - Secret of the Moon Base-thumb.jpg</poster>
   </art>
-  <showtitle>Super Show K Heroes</showtitle>
+  <showtitle>Super Show K Legion</showtitle>
   <episode>1</episode>
   <season>1</season>
 </episodedetails>
@@ -588,9 +588,9 @@ async fn nfos_naming_another_show_are_ignored_with_their_art() {
 #[tokio::test]
 async fn nfos_naming_the_show_are_kept_with_their_art() {
     let show = FOREIGN_TVSHOW_NFO
-        .replace("Super Show K Heroes", "Show K")
-        .replace("スーパーショーKヒーローズ", "ドラゴンボール");
-    let episode = FOREIGN_EPISODE_NFO.replace("Super Show K Heroes", "Show K");
+        .replace("Super Show K Legion", "Show K")
+        .replace("スーパーショーKレギオン", "ドラゴンボール");
+    let episode = FOREIGN_EPISODE_NFO.replace("Super Show K Legion", "Show K");
     let (_dir, media, series) = show_k(&show, &episode);
     let p = probe();
     let req = MetadataRequest {
@@ -659,7 +659,7 @@ fn an_episode_nfo_without_a_show_title_shares_the_show_nfos_verdict() {
 /// own thumb, and the show folder's art is dropped.
 #[test]
 fn a_trusted_episode_keeps_its_thumb_under_a_foreign_show_nfo() {
-    let episode = FOREIGN_EPISODE_NFO.replace("Super Show K Heroes", "Show K");
+    let episode = FOREIGN_EPISODE_NFO.replace("Super Show K Legion", "Show K");
     let (_dir, media, series) = show_k(FOREIGN_TVSHOW_NFO, &episode);
     let p = probe();
     let req = request(&media, &p, &series);
@@ -679,7 +679,7 @@ fn a_trusted_episode_keeps_its_thumb_under_a_foreign_show_nfo() {
 /// `detect_in_dir` again picks up folder.jpg; skipping it loses the thumb.
 #[test]
 fn an_episode_in_a_foreign_show_folder_keeps_only_its_own_art() {
-    let episode = FOREIGN_EPISODE_NFO.replace("Super Show K Heroes", "Show K");
+    let episode = FOREIGN_EPISODE_NFO.replace("Super Show K Legion", "Show K");
     let (_dir, media, series) = show_k_in(FOREIGN_TVSHOW_NFO, &episode, None);
     let p = probe();
     let req = request(&media, &p, &series);
@@ -717,7 +717,7 @@ fn an_episode_without_its_own_nfo_shares_a_foreign_show_nfos_verdict() {
 /// up its folder.jpg.
 #[test]
 fn a_foreign_shows_season_folder_art_is_dropped() {
-    let episode = FOREIGN_EPISODE_NFO.replace("Super Show K Heroes", "Show K");
+    let episode = FOREIGN_EPISODE_NFO.replace("Super Show K Legion", "Show K");
     let (_dir, media, series) = show_k(FOREIGN_TVSHOW_NFO, &episode);
     let season = media.parent().unwrap();
     std::fs::write(season.join("folder.jpg"), b"jpg").unwrap();
@@ -762,7 +762,7 @@ fn the_show_name_check_passes_the_librarys_legitimate_variants() {
         );
     }
     for (folder, nfo) in [
-        ("Show K", "Super Show K Heroes"),
+        ("Show K", "Super Show K Legion"),
         ("Show D (US)", "Us Show D"),
     ] {
         assert!(
@@ -803,24 +803,24 @@ fn the_show_name_check_rejects_a_conflicting_region_or_year() {
 
 #[test]
 fn the_show_name_check_reads_an_nfo_with_a_mismatched_end_tag() {
-    let nfo = "<tvshow><plot>A hero returns.</plott><title>Super Show K Heroes</title></tvshow>";
+    let nfo = "<tvshow><plot>A hero returns.</plott><title>Super Show K Legion</title></tvshow>";
     let names = identity::parse_names(nfo.as_bytes()).expect("parse_nfo reads this NFO");
-    assert_eq!(names.title.as_deref(), Some("Super Show K Heroes"));
+    assert_eq!(names.title.as_deref(), Some("Super Show K Legion"));
 }
 
 /// [`FOREIGN_TVSHOW_NFO`] renamed to the folder's own show, so its art is
 /// kept, with `<fanart>` set to `fanart`.
 fn own_show_nfo(fanart: &str) -> String {
     FOREIGN_TVSHOW_NFO
-        .replace("Super Show K Heroes", "Show K")
-        .replace("スーパーショーKヒーローズ", "ドラゴンボール")
+        .replace("Super Show K Legion", "Show K")
+        .replace("スーパーショーKレギオン", "ドラゴンボール")
         .replace("/media/TV/Show K/fanart.jpg", fanart)
 }
 
 /// The episode's Backdrop from its NFOs, with `fanart.jpg` in the show
 /// folder.
 async fn episode_backdrop(fanart: &str) -> (tempfile::TempDir, Option<ArtworkSource>) {
-    let episode = FOREIGN_EPISODE_NFO.replace("Super Show K Heroes", "Show K");
+    let episode = FOREIGN_EPISODE_NFO.replace("Super Show K Legion", "Show K");
     let (dir, media, series) = show_k(&own_show_nfo(fanart), &episode);
     std::fs::write(dir.path().join("fanart.jpg"), b"jpg").unwrap();
     let p = probe();
@@ -883,7 +883,7 @@ async fn two_art_paths_found_as_one_file_are_kept_once() {
         "</art>",
         "  <fanart>/config/data/metadata/library/ab/abc/fanart.jpg</fanart>\n  </art>",
     );
-    let episode = FOREIGN_EPISODE_NFO.replace("Super Show K Heroes", "Show K");
+    let episode = FOREIGN_EPISODE_NFO.replace("Super Show K Legion", "Show K");
     let (dir, media, series) = show_k(&show, &episode);
     std::fs::write(dir.path().join("fanart.jpg"), b"jpg").unwrap();
     let p = probe();
@@ -904,7 +904,7 @@ async fn two_art_paths_found_as_one_file_are_kept_once() {
 #[tokio::test]
 async fn a_dead_nfo_art_path_gives_way_to_the_show_folders_image() {
     let show = own_show_nfo("/config/data/metadata/library/ab/abc/backdrop.jpg");
-    let episode = FOREIGN_EPISODE_NFO.replace("Super Show K Heroes", "Show K");
+    let episode = FOREIGN_EPISODE_NFO.replace("Super Show K Legion", "Show K");
     let (dir, media, series) = show_k(&show, &episode);
     std::fs::write(dir.path().join("fanart.jpg"), b"jpg").unwrap();
     let p = probe();
@@ -937,7 +937,7 @@ fn show_nfo_evidence_reads_ids_and_year_of_this_show_only() {
         })
     );
     // B558 — an NFO naming another show is no evidence for this one.
-    assert_eq!(show_nfo_evidence(dir.path(), "Arrow", None), None);
+    assert_eq!(show_nfo_evidence(dir.path(), "Show CA", None), None);
     assert_eq!(
         show_nfo_evidence(&dir.path().join("missing"), "Show B", None),
         None
@@ -995,7 +995,7 @@ async fn a_movie_nfo_naming_another_year_is_set_aside() {
         Some(1994)
     );
     assert_eq!(
-        fetch("Heat (1995)", "Heat (1995).mkv", 1996).await,
+        fetch("Film BB (1995)", "Film BB (1995).mkv", 1996).await,
         Some(1996)
     );
     assert_eq!(
@@ -1004,7 +1004,10 @@ async fn a_movie_nfo_naming_another_year_is_set_aside() {
     );
     // B1026 / V985 — two years off is the first set aside; a year in the
     // title does not outvote the folder's.
-    assert_eq!(fetch("Heat (1995)", "Heat (1995).mkv", 1997).await, None);
+    assert_eq!(
+        fetch("Film BB (1995)", "Film BB (1995).mkv", 1997).await,
+        None
+    );
     assert_eq!(
         fetch("Film AB 2049 (2017)", "Film AB 2049.mkv", 2017).await,
         Some(2017)
