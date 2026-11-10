@@ -6276,6 +6276,23 @@ body:has(.pharos-reader) {
   min-width: 0;
   position: relative;
 }
+/* A PDF page: one canvas, at least as large as the window or scrolling
+   inside it. The auto margins centre it without clipping its top when it
+   is taller than the host (fit width). The page is paper whatever the
+   reader's theme; `pan-y` leaves horizontal drags to the page turn. */
+.pharos-reader-host-pdf {
+  flex: 1 1 auto;
+  display: flex;
+  overflow: auto;
+  scrollbar-gutter: stable;
+  touch-action: pan-y;
+}
+.pharos-reader-host-pdf canvas {
+  flex: none;
+  display: block;
+  margin: auto;
+  background: #fff; /* not themed: a page of paper */
+}
 .pharos-reader-progress {
   position: relative;
   display: flex;

@@ -72,6 +72,8 @@ pub fn focus_after_render(id: String) {
         platform::focus_by_id(&id);
     });
 }
+#[cfg(all(feature = "web", target_arch = "wasm32"))]
+mod pdf_web;
 pub mod preplay;
 pub mod privacy;
 pub mod quality;
