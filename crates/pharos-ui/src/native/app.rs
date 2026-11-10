@@ -1739,6 +1739,9 @@ fn NativeApp(route: Route) -> Element {
             together_again.reconnected(&api);
         }
     });
+    // Reading saved offline is sent from wherever the user is (spec 036).
+    #[cfg(all(feature = "web", target_arch = "wasm32"))]
+    super::reader_web::use_pending_flush(api);
     // The play queue lives as long as the app, across pages and songs.
     let queue = use_signal(Queue::default);
     use_context_provider(|| QueueCtx(queue));
