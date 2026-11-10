@@ -1066,7 +1066,7 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
                         .warn(&format!("pharos: leaving the group failed: {}", e.0));
                 }
             }
-            return Err(GroupError("The join was superseded".into()));
+            return Err(GroupError::superseded());
         }
         let epoch = {
             let mut inner = self.inner.borrow_mut();
