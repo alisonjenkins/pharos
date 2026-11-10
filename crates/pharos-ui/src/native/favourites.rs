@@ -266,7 +266,7 @@ mod tests {
         let favourites = Favourites::new(vec![
             (
                 ItemKind::Movie,
-                page(vec![item(1, ItemKind::Movie, "Alien", None)]),
+                page(vec![item(1, ItemKind::Movie, "Film AX", None)]),
             ),
             (
                 ItemKind::Series,
@@ -276,7 +276,7 @@ mod tests {
                 ItemKind::Episode,
                 page(vec![
                     item(3, ItemKind::Episode, "Journey's End", Some("Frieren")),
-                    item(4, ItemKind::Episode, "Pilot", Some("Firefly")),
+                    item(4, ItemKind::Episode, "Pilot", Some("Show AX")),
                 ]),
             ),
             (ItemKind::Audio, page(vec![])),
@@ -286,7 +286,7 @@ mod tests {
             ">Films<",
             ">Shows<",
             ">Episodes<",
-            "Alien",
+            "Film AX",
             "Frieren",
             "Pilot",
         ] {
@@ -318,7 +318,7 @@ mod tests {
         assert!(shows.wants_more(&first));
         first
             .items
-            .push(item(5, ItemKind::Episode, "Pilot", Some("Firefly")));
+            .push(item(5, ItemKind::Episode, "Pilot", Some("Show AX")));
         assert!(!shows.wants_more(&first), "all loaded");
 
         let html = render(Favourites::new(vec![
@@ -366,7 +366,7 @@ mod tests {
 
     #[test]
     fn a_cut_episode_rail_says_there_are_more() {
-        let mut episodes = page(vec![item(5, ItemKind::Episode, "Pilot", Some("Firefly"))]);
+        let mut episodes = page(vec![item(5, ItemKind::Episode, "Pilot", Some("Show AX"))]);
         episodes.total = 400;
         let html = render(Favourites::new(vec![(ItemKind::Episode, episodes)]));
         assert!(
@@ -378,7 +378,7 @@ mod tests {
     /// A rail the server holds more of than it sent says how many it shows.
     #[test]
     fn a_cut_rail_says_it_is_cut() {
-        let mut films = page(vec![item(1, ItemKind::Movie, "Alien", None)]);
+        let mut films = page(vec![item(1, ItemKind::Movie, "Film AX", None)]);
         films.total = 75;
         let html = render(Favourites::new(vec![(ItemKind::Movie, films)]));
         assert!(html.contains("Showing the first 1 of 75."), "{html}");

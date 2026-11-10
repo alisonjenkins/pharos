@@ -1678,15 +1678,15 @@ mod tests {
             ("Future Enemies".to_owned(), Some("S1 · E22".to_owned()))
         );
         let film = Item {
-            name: "Dune".into(),
+            name: "Film AU".into(),
             ..item(ItemKind::Movie)
         };
         assert_eq!(
             watch_heading(&film),
-            ("Dune".to_owned(), Some("2001".to_owned()))
+            ("Film AU".to_owned(), Some("2001".to_owned()))
         );
         let undated = Item { year: None, ..film };
-        assert_eq!(watch_heading(&undated), ("Dune".to_owned(), None));
+        assert_eq!(watch_heading(&undated), ("Film AU".to_owned(), None));
     }
 
     #[test]
@@ -2357,7 +2357,7 @@ mod tests {
         lib.name = "Films".into();
         let mut movie = item(ItemKind::Movie);
         movie.id = ItemRef::Real(42);
-        movie.name = "Heat".into();
+        movie.name = "Film BB".into();
         movie.runtime_ms = 1000;
         movie.position_ms = 250;
         let home = Home {
@@ -2379,7 +2379,7 @@ mod tests {
             "{html}"
         );
         assert!(
-            html.contains(r#"href="/ui/title/42""#) && html.contains("Heat"),
+            html.contains(r#"href="/ui/title/42""#) && html.contains("Film BB"),
             "{html}"
         );
         assert!(html.contains("width: 25%"), "{html}");
@@ -2711,8 +2711,8 @@ mod tests {
     #[test]
     fn a_refused_favourite_mark_names_the_item_and_the_reason() {
         assert_eq!(
-            favorite_failure_line("Alien", true, "unavailable: db down"),
-            "Couldn't add Alien to favourites: unavailable: db down"
+            favorite_failure_line("Film AX", true, "unavailable: db down"),
+            "Couldn't add Film AX to favourites: unavailable: db down"
         );
         assert_eq!(
             favorite_failure_line("", false, "x"),
@@ -3267,20 +3267,20 @@ mod tests {
         e.series_name = None;
         assert_eq!(page_name(&e), "Pilot");
         let mut film = item(ItemKind::Movie);
-        film.name = "Alien".into();
-        assert_eq!(page_name(&film), "Alien");
+        film.name = "Film AX".into();
+        assert_eq!(page_name(&film), "Film AX");
     }
 
     #[test]
     fn a_tile_puts_series_and_numbers_on_their_own_lines_with_tooltips() {
         let mut e = item(ItemKind::Episode);
-        e.name = "Murder House".into();
+        e.name = "Show BK".into();
         e.series_name = Some("Show AA".into());
         e.season = Some(1);
         e.episode = Some(1);
         let html = render(move || rsx! { PosterTile { item: e.clone() } });
         for want in [
-            r#"class="pharos-poster-name" title="Murder House""#,
+            r#"class="pharos-poster-name" title="Show BK""#,
             r#"class="pharos-poster-sub" title="Show AA""#,
             r#"class="pharos-poster-sub" title="S1 · E1""#,
         ] {

@@ -216,10 +216,10 @@ mod tests {
         assert_eq!(Route::Home.page_title(None), "Pharos");
         assert_eq!(Route::Appearance.page_title(None), "Appearance · Pharos");
         let title = Route::Title(ItemRef::Real(42));
-        assert_eq!(title.page_title(Some("Alien")), "Alien · Pharos");
+        assert_eq!(title.page_title(Some("Film AX")), "Film AX · Pharos");
         // Still loading: the app's name, never the last page's.
         assert_eq!(title.page_title(None), "Pharos");
-        assert_eq!(Route::Home.page_title(Some("Alien")), "Pharos");
+        assert_eq!(Route::Home.page_title(Some("Film AX")), "Pharos");
     }
 
     #[test]
@@ -229,7 +229,7 @@ mod tests {
         assert_eq!(Route::parse("/ui/read/9/"), read);
         assert_eq!(read.name(), "read");
         assert_eq!(read.item(), Some(ItemRef::Real(9)));
-        assert_eq!(read.page_title(Some("Dune")), "Dune · Pharos");
+        assert_eq!(read.page_title(Some("Film AU")), "Film AU · Pharos");
         assert_eq!(
             Route::parse("/read/abc"),
             Route::NotFound("/read/abc".into())

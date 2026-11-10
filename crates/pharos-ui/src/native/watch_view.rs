@@ -2624,7 +2624,7 @@ mod tests {
         let mut q = crate::native::queue::Queue::default();
         q.add(vec![crate::native::queue::Track {
             id: ItemRef::Real(8),
-            name: "Heat".to_owned(),
+            name: "Film BB".to_owned(),
             runtime_ms: 10_200_000,
         }]);
         VideoQueueView {
@@ -2654,7 +2654,7 @@ mod tests {
         );
         let open = render_queue(Some(queued(true)), Some(ItemRef::Real(2)));
         assert!(open.contains(r#"id="pharos-queue""#), "{open}");
-        assert!(open.contains("Heat"), "{open}");
+        assert!(open.contains("Film BB"), "{open}");
         assert!(open.contains("1 video"), "{open}");
         assert!(
             !open.contains("pharos-mix"),
