@@ -301,7 +301,8 @@ addEventListener("keydown", (e) => {
     return;
   }
   const shown = (el) => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
-  const to = [...bar.querySelectorAll('__PLAYER_HOME__')].find(shown) ||
+  const to = [...bar.querySelectorAll(".pharos-stage-play")].find(shown) ||
+    [...bar.querySelectorAll('__PLAYER_HOME__')].find(shown) ||
     [...bar.querySelectorAll("button:not([disabled])")].find(shown);
   if (!to) return;
   window.__pharosBeforeBar = at && at !== document.body ? at : null;
@@ -691,6 +692,12 @@ mod tests {
         assert!(keys.contains(r#"e.key !== "Info""#), "{keys}");
         assert!(keys.contains(".pharos-stage.is-mini"), "{keys}");
         assert!(keys.contains(".pharos-listen-play"), "{keys}");
+        // The bar's play button first: the document's first match was its
+        // Previous button (found on the TV, v22).
+        assert!(
+            keys.find(".pharos-stage-play") < keys.find(".pharos-listen-play"),
+            "{keys}"
+        );
         assert!(!keys.contains("__PLAYER_HOME__"), "{keys}");
     }
 
