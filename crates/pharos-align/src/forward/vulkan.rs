@@ -108,6 +108,9 @@ const SECOND: usize = 16_000;
 /// Padded window lengths in seconds: each at most half again the last past
 /// 4 s, so padding costs under 50% of a window's work there.
 const BUCKETS_S: [usize; 12] = [1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64];
+/// Warm-up compiles every bucket up to this: past it, windows are rare
+/// enough to pay their compile on first use (once per kernel cache).
+pub const WARM_UP_TO: usize = 64 * SECOND;
 /// Past the last bucket, windows round up to a multiple of this.
 const LONG_STEP_S: usize = 32;
 
@@ -277,6 +280,24 @@ impl VulkanModel {
     /// result back.
     pub fn logits(&self, wave: &[f32]) -> Result<Vec<f32>, String> {
         self.logits_padded(wave, bucket(wave.len()))
+    }
+
+    /// Runs one window at every bucket up to [`WARM_UP_TO`], so their
+    /// kernels are compiled and tuned before the first song. Each window
+    /// falls short of its bucket, as nearly every real one does, so the
+    /// masked kernels are the ones warmed. Returns each bucket's time.
+    pub fn warm_up(&self) -> Result<Vec<(usize, std::time::Duration)>, String> {
+        buckets_up_to(WARM_UP_TO)
+            .into_iter()
+            .map(|b| {
+                let wave: Vec<f32> = (0..b - SECOND / 2)
+                    .map(|i| (i as f32 * 0.07).sin() * 0.3)
+                    .collect();
+                let t = std::time::Instant::now();
+                self.logits(&super::normalise(&wave))?;
+                Ok((b, t.elapsed()))
+            })
+            .collect()
     }
 
     /// [`VulkanModel::logits`] with the window zero-padded to `padded`
