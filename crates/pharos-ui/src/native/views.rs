@@ -371,6 +371,23 @@ pub fn Loading() -> Element {
     rsx! { p { class: "pharos-loading", role: "status", "Loading…" } }
 }
 
+/// The full player while its play is negotiated: the loading status and a
+/// Back, since nothing else on screen leads out yet (038 FR-408, V1220).
+#[component]
+pub fn FirstLoad(on_back: EventHandler<()>) -> Element {
+    rsx! {
+        div { class: "pharos-watch-first-load",
+            Loading {}
+            button {
+                class: "pharos-button pharos-watch-first-load-back",
+                r#type: "button",
+                onclick: move |_| on_back.call(()),
+                "Back"
+            }
+        }
+    }
+}
+
 /// The last screen's content under a cue that the next one is loading
 /// (B822): dimmed, not clickable, `aria-busy`, and a "Loading…" status above
 /// it. Not busy, `children` stand alone, with no wrapper.
@@ -1962,6 +1979,15 @@ mod tests {
             }
         });
         assert!(!none.contains("Skip to"), "{none}");
+    }
+
+    /// 038 FR-408, V1220: the full player's first load has a Back beside
+    /// the loading status. Disarm check: without the button this fails.
+    #[test]
+    fn the_first_load_offers_back() {
+        let html = render(|| rsx! { FirstLoad { on_back: |_| {} } });
+        assert!(html.contains("Loading…"), "{html}");
+        assert!(html.contains(">Back<"), "{html}");
     }
 
     /// B822: the listing left on screen while the next one loads says so.
