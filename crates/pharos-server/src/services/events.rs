@@ -147,11 +147,13 @@ pub enum Payload {
         added: Vec<MediaId>,
         removed: Vec<MediaId>,
     },
-    /// `progress` is 0.0 to 1.0.
+    /// `progress` is 0.0 to 1.0. `result` is what a finished library scan
+    /// did; `None` while it runs and for other tasks.
     Task {
         id: String,
         progress: f32,
         state: &'static str,
+        result: Option<crate::scan_tasks::ScanTally>,
     },
     /// Events were lost: refetch everything cached.
     Resync,
@@ -379,6 +381,7 @@ impl EventLog {
                     id: item_id,
                     progress: fraction,
                     state: if done { "done" } else { "running" },
+                    result: None,
                 });
             }
             SocketBroadcast::SessionCommand { .. }
@@ -712,12 +715,14 @@ mod tests {
                 Payload::Task {
                     id: "lib".into(),
                     progress: 0.5,
-                    state: "running"
+                    state: "running",
+                    result: None,
                 },
                 Payload::Task {
                     id: "lib".into(),
                     progress: 1.0,
-                    state: "done"
+                    state: "done",
+                    result: None,
                 },
             ]
         );

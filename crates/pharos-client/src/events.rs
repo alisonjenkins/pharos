@@ -29,13 +29,27 @@ pub enum PushEvent {
         removed: Vec<ItemRef>,
     },
     /// A server task (a library scan) moved; `progress` is 0.0 to 1.0.
+    /// `state` is `running`, `done`, `partial`, `failed` or `cancelled`.
     Task {
         id: String,
         progress: f32,
         state: String,
+        /// What a finished scan did; all zero while it runs, for other
+        /// tasks, and from a server older than schemaVersion 40.
+        counts: TaskCounts,
     },
     /// Events were missed: everything cached may be stale.
     Resync,
+}
+
+/// What a finished library scan did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TaskCounts {
+    pub added: u32,
+    pub changed: u32,
+    pub removed: u32,
+    /// Folders the scan could not read.
+    pub failed_roots: u32,
 }
 
 /// The last `seq` this client received, shared across connections so a
@@ -175,6 +189,12 @@ fn read_event(e: event::Reader<'_>) -> Result<PushEvent, capnp::Error> {
                 id: t.get_id()?.to_string()?,
                 progress: t.get_progress(),
                 state: t.get_state()?.to_string()?,
+                counts: TaskCounts {
+                    added: t.get_added(),
+                    changed: t.get_changed(),
+                    removed: t.get_removed(),
+                    failed_roots: t.get_failed_roots(),
+                },
             }
         }
         event::Resync(()) => PushEvent::Resync,

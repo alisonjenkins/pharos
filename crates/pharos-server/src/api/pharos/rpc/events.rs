@@ -584,11 +584,19 @@ fn write_event(mut out: event::Builder<'_>, event: &Event) {
             id,
             progress,
             state,
+            result,
         } => {
             let mut task = out.init_task();
             task.set_id(id.as_str());
             task.set_progress(*progress);
             task.set_state(*state);
+            if let Some(tally) = result {
+                let wire = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
+                task.set_added(wire(tally.added));
+                task.set_changed(wire(tally.changed));
+                task.set_removed(wire(tally.removed));
+                task.set_failed_roots(wire(tally.failed_roots));
+            }
         }
         Payload::Resync => out.set_resync(()),
     }
