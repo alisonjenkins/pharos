@@ -7678,7 +7678,11 @@ pub(crate) fn spawn_scan_tracked(
             let planned = plan.iter().map(|(_, g)| g.len()).sum::<usize>();
             num_roots.store(planned.max(1) as u64, Ordering::Relaxed);
             completed_roots.store(0, Ordering::Relaxed);
-            last_sent.store(u64::MAX, Ordering::Relaxed);
+            // Each pass, a coalesced re-run too, says it is running before it
+            // walks: the last pass's end line must not stand while the next
+            // one plans its files.
+            last_sent.store(0, Ordering::Relaxed);
+            state.notify_scan_progress(0.0, None);
             let mut added: Vec<pharos_core::MediaId> = Vec::new();
             let mut removed: Vec<pharos_core::MediaId> = Vec::new();
             let mut cancelled = false;
