@@ -378,6 +378,9 @@ pub struct Show {
     /// Why the page opened on `selected`: its `data-season-pick`, read by
     /// SSR and browser tests and by a look at the live page.
     pub pick: SeasonPick,
+    /// The viewer's next episode when the page could place it: the one the
+    /// hero's Play starts while its season is shown (FR-201).
+    pub next_up: Option<ItemRef>,
 }
 
 /// The verdict of choosing the season a series page opens on, with its
@@ -393,6 +396,18 @@ pub enum SeasonPick {
     First,
     /// The series has no seasons; its episodes are listed directly.
     NoSeasons,
+    /// The season of the episode after the last one played.
+    NextUp,
+    /// The season of the episode being watched.
+    Resume,
+    /// The season of the last episode played, which is not on the page read,
+    /// so the next one could not be placed.
+    Unplaced,
+    /// Every episode after the last one played is watched: its season.
+    Finished,
+    /// The later seasons read were all watched and more remain unread: the
+    /// last played episode's season.
+    WalkLimit,
 }
 
 impl SeasonPick {
@@ -409,6 +424,11 @@ impl SeasonPick {
             Self::FirstRegular => "first-regular",
             Self::First => "first",
             Self::NoSeasons => "no-seasons",
+            Self::NextUp => "next-up",
+            Self::Resume => "resume",
+            Self::Unplaced => "unplaced",
+            Self::Finished => "finished",
+            Self::WalkLimit => "walk-limit",
         }
     }
 }
@@ -480,6 +500,63 @@ pub fn default_season(seasons: &[Item]) -> (Option<ItemRef>, SeasonPick) {
     match seasons.first() {
         Some(s) => (Some(s.id), SeasonPick::First),
         None => (None, SeasonPick::NoSeasons),
+    }
+}
+
+/// How many later seasons a series page reads looking for the next unwatched
+/// episode once the last played one's season is done.
+pub const SEASON_WALK: usize = 2;
+
+/// The listing whose first item is the viewer's most recently played episode
+/// of `series`, a part-watched one included; ties (a season marked watched at
+/// once) go to the latest in airing order.
+pub fn last_played(series: ItemRef) -> Listing {
+    Listing {
+        descending: true,
+        ..Listing::of(series, None, "DatePlayed,ParentIndexNumber,IndexNumber")
+    }
+}
+
+/// Whether the viewer has started `episode`: watched it or part of it. An
+/// unstarted top of [`last_played`] means nothing of the show is watched.
+fn started(episode: &Item) -> bool {
+    episode.played || episode.position_ms > 0
+}
+
+/// Where the viewer's next episode is against one page of episodes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum After {
+    /// This one: the part-watched last, or the first unwatched after it.
+    Here(ItemRef),
+    /// The page is the whole list and everything after the last is watched.
+    Past,
+    /// The page cannot say: the last or what follows it is not on it.
+    Unknown,
+}
+
+/// The viewer's next episode after `last` on `page` (FR-102's rule): `last`
+/// itself while part-watched, else the first unwatched one after it.
+pub fn after_last(last: &Item, page: &Page) -> After {
+    if !last.played && last.position_ms > 0 {
+        return After::Here(last.id);
+    }
+    let Some(at) = page.items.iter().position(|e| e.id == last.id) else {
+        return After::Unknown;
+    };
+    match page.items[at + 1..].iter().find(|e| !e.played) {
+        Some(next) => After::Here(next.id),
+        None if is_partial(page) => After::Unknown,
+        None => After::Past,
+    }
+}
+
+/// The pick and the next episode for a page that holds `last`.
+fn placed(last: &Item, after: After) -> (SeasonPick, Option<ItemRef>) {
+    match after {
+        After::Here(next) if next == last.id => (SeasonPick::Resume, Some(next)),
+        After::Here(next) => (SeasonPick::NextUp, Some(next)),
+        After::Past => (SeasonPick::Finished, None),
+        After::Unknown => (SeasonPick::Unplaced, None),
     }
 }
 
@@ -595,11 +672,82 @@ pub async fn load<A: PharosApi>(
             }
         }
         (Plan::Series, series) => {
-            let seasons = list(id, Some(ItemKind::Season), "").await?.items;
-            let (selected, pick) = default_season(&seasons);
-            let episodes = match selected {
-                Some(season) => list(season, None, INDEX_ORDER).await?,
-                None => list(id, None, INDEX_ORDER).await?,
+            // The seasons and the viewer's last played episode do not depend
+            // on each other: one round trip for both (FR-205).
+            let (seasons, last) = join(
+                list(id, Some(ItemKind::Season), ""),
+                api.query(info, &last_played(id), 0, 1),
+            )
+            .await;
+            let seasons = seasons?.items;
+            let last = match last {
+                Ok(page) => page.items.into_iter().next().filter(started),
+                Err(e) => {
+                    warn(format!(
+                        "pharos: browse {id}: last played episode unavailable: {e}"
+                    ));
+                    None
+                }
+            };
+            let mut opened = None;
+            if let Some(last) = &last {
+                if seasons.is_empty() {
+                    let episodes = list(id, None, INDEX_ORDER).await?;
+                    let (pick, next) = placed(last, after_last(last, &episodes));
+                    opened = Some((None, pick, episodes, next));
+                } else if let Some(at) = last
+                    .parent
+                    .and_then(|p| seasons.iter().position(|s| s.id == p))
+                {
+                    let season = seasons[at].id;
+                    let episodes = list(season, None, INDEX_ORDER).await?;
+                    if after_last(last, &episodes) == After::Past {
+                        // Its season is done: the next is the first unwatched
+                        // episode of a later regular season, at most
+                        // SEASON_WALK seasons on.
+                        let later: Vec<ItemRef> = seasons[at + 1..]
+                            .iter()
+                            .filter(|s| s.episode != Some(0))
+                            .map(|s| s.id)
+                            .collect();
+                        for &next_season in later.iter().take(SEASON_WALK) {
+                            let page = list(next_season, None, INDEX_ORDER).await?;
+                            if let Some(next) = page.items.iter().find(|e| !e.played) {
+                                let next = next.id;
+                                opened =
+                                    Some((Some(next_season), SeasonPick::NextUp, page, Some(next)));
+                                break;
+                            }
+                            if is_partial(&page) {
+                                opened =
+                                    Some((Some(next_season), SeasonPick::Unplaced, page, None));
+                                break;
+                            }
+                        }
+                        if opened.is_none() {
+                            let pick = if later.len() > SEASON_WALK {
+                                SeasonPick::WalkLimit
+                            } else {
+                                SeasonPick::Finished
+                            };
+                            opened = Some((Some(season), pick, episodes, None));
+                        }
+                    } else {
+                        let (pick, next) = placed(last, after_last(last, &episodes));
+                        opened = Some((Some(season), pick, episodes, next));
+                    }
+                }
+            }
+            let (selected, pick, episodes, next_up) = match opened {
+                Some(opened) => opened,
+                None => {
+                    let (selected, pick) = default_season(&seasons);
+                    let episodes = match selected {
+                        Some(season) => list(season, None, INDEX_ORDER).await?,
+                        None => list(id, None, INDEX_ORDER).await?,
+                    };
+                    (selected, pick, episodes, None)
+                }
             };
             let season_played = match selected {
                 Some(season) if is_partial(&episodes) => match api.detail(info, season).await {
@@ -621,6 +769,7 @@ pub async fn load<A: PharosApi>(
                 episodes,
                 season_played,
                 pick,
+                next_up,
             })
         }
         (
@@ -663,6 +812,7 @@ pub async fn load<A: PharosApi>(
                 episodes: episodes?,
                 season_played,
                 pick: SeasonPick::Asked,
+                next_up: None,
             })
         }
         (Plan::Artist, Some(detail)) => Browse::Artist {
@@ -1715,7 +1865,7 @@ pub fn ShowView(show: Show, #[props(default)] seen: Vec<MemberSeen>) -> Element 
                 facts,
                 square: false,
                 mark: true,
-                next: next_episode(&show.episodes.items).cloned(),
+                next: play_target(&show).cloned(),
             }
             if let Some(series) = series {
                 super::check_match::CheckMatchBadge { series }
@@ -1778,6 +1928,14 @@ pub fn next_episode(episodes: &[Item]) -> Option<&Item> {
         .find(|e| progress_percent(e).is_some())
         .or_else(|| episodes.iter().find(|e| !e.played))
         .or(episodes.first())
+}
+
+/// The episode the show page's Play starts: the viewer's next episode when
+/// the season shown holds it, else [`next_episode`] of the season shown.
+pub fn play_target(show: &Show) -> Option<&Item> {
+    show.next_up
+        .and_then(|next| show.episodes.items.iter().find(|e| e.id == next))
+        .or_else(|| next_episode(&show.episodes.items))
 }
 
 /// The show page's Play, naming the episode: "Resume S2 · E3".
@@ -3053,6 +3211,120 @@ mod tests {
         assert_eq!(asked.pick, SeasonPick::Asked);
     }
 
+    /// An episode of `season` numbered `n`, as the series' listings give it.
+    fn ep_of(id: u64, season: ItemRef, n: u32, name: &str) -> Item {
+        let mut e = item(ItemRef::Real(id), ItemKind::Episode, name);
+        e.parent = Some(season);
+        e.episode = Some(n);
+        e
+    }
+
+    fn opened(fake: &Fake) -> Show {
+        let Browse::Show(show) = run(load(fake, &CallInfo::default(), SERIES, |_| {})).unwrap()
+        else {
+            panic!("not a show page");
+        };
+        show
+    }
+
+    /// FR-201: season 1 watched, the page opens on season 2 and Play starts
+    /// its first episode.
+    #[test]
+    fn a_series_opens_on_the_season_after_a_finished_one() {
+        let mut fake = show_fake();
+        let mut pilot = ep_of(1, S1, 1, "Pilot");
+        pilot.played = true;
+        fake.lists.insert((S1, None), vec![pilot.clone()]);
+        fake.lists.insert((SERIES, None), vec![pilot]);
+        let show = opened(&fake);
+        assert_eq!(show.selected, Some(S2));
+        assert_eq!(show.pick, SeasonPick::NextUp);
+        assert_eq!(show.next_up, Some(ItemRef::Real(2)));
+        assert_eq!(play_target(&show).map(|e| e.name.as_str()), Some("Return"));
+        assert!(fake.asked.borrow().contains(&(
+            SERIES,
+            None,
+            "DatePlayed,ParentIndexNumber,IndexNumber".to_owned()
+        )));
+        let html = render(move || rsx! { ShowView { show: show.clone() } });
+        assert!(html.contains("data-season-pick=\"next-up\""), "{html}");
+    }
+
+    /// FR-201: a part-watched episode keeps its season and Play resumes it.
+    #[test]
+    fn a_series_opens_on_the_season_being_watched() {
+        let mut fake = show_fake();
+        let mut back = ep_of(2, S2, 1, "Return");
+        back.position_ms = 5_000;
+        back.runtime_ms = 60_000;
+        fake.lists.insert((S2, None), vec![back.clone()]);
+        fake.lists.insert((SERIES, None), vec![back]);
+        let show = opened(&fake);
+        assert_eq!(show.selected, Some(S2));
+        assert_eq!(show.pick, SeasonPick::Resume);
+        assert_eq!(play_target(&show).map(|e| e.id), Some(ItemRef::Real(2)));
+    }
+
+    /// FR-102's rule: the next is the first unwatched after the last played,
+    /// not the first unwatched of the season.
+    #[test]
+    fn play_starts_the_episode_after_the_last_played_not_a_skipped_one() {
+        let mut fake = show_fake();
+        let first = ep_of(1, S1, 1, "Skipped");
+        let mut second = ep_of(3, S1, 2, "Seen");
+        second.played = true;
+        let third = ep_of(4, S1, 3, "Next");
+        fake.lists
+            .insert((S1, None), vec![first, second.clone(), third]);
+        fake.lists.insert((SERIES, None), vec![second]);
+        let show = opened(&fake);
+        assert_eq!(show.selected, Some(S1));
+        assert_eq!(show.pick, SeasonPick::NextUp);
+        assert_eq!(play_target(&show).map(|e| e.name.as_str()), Some("Next"));
+    }
+
+    #[test]
+    fn a_finished_series_opens_on_the_last_season_watched() {
+        let mut fake = show_fake();
+        let mut pilot = ep_of(1, S1, 1, "Pilot");
+        pilot.played = true;
+        let mut back = ep_of(2, S2, 1, "Return");
+        back.played = true;
+        fake.lists.insert((S1, None), vec![pilot]);
+        fake.lists.insert((S2, None), vec![back.clone()]);
+        fake.lists.insert((SERIES, None), vec![back]);
+        let show = opened(&fake);
+        assert_eq!(show.selected, Some(S2));
+        assert_eq!(show.pick, SeasonPick::Finished);
+        assert_eq!(show.next_up, None);
+    }
+
+    /// Nothing watched: the most recent "play" the server lists is an
+    /// unstarted episode, and the page keeps its first regular season.
+    #[test]
+    fn a_series_with_nothing_watched_opens_on_season_one() {
+        let mut fake = show_fake();
+        fake.lists
+            .insert((SERIES, None), vec![ep_of(2, S2, 1, "Return")]);
+        let show = opened(&fake);
+        assert_eq!(show.selected, Some(S1));
+        assert_eq!(show.pick, SeasonPick::FirstRegular);
+    }
+
+    #[test]
+    fn the_next_episode_past_a_partial_page_is_unknown() {
+        let mut last = ep_of(1, S1, 1, "Pilot");
+        last.played = true;
+        let partial = Page {
+            items: vec![last.clone()],
+            total: 30,
+            start: 0,
+        };
+        assert_eq!(after_last(&last, &partial), After::Unknown);
+        assert_eq!(after_last(&last, &page(vec![last.clone()])), After::Past);
+        assert_eq!(after_last(&last, &page(Vec::new())), After::Unknown);
+    }
+
     #[test]
     fn season_pick_labels_are_distinct() {
         let labels: HashSet<&str> = SeasonPick::ALL.iter().map(|p| p.label()).collect();
@@ -3303,6 +3575,7 @@ mod tests {
             episodes: page(Vec::new()),
             season_played: None,
             pick: SeasonPick::Asked,
+            next_up: None,
         });
         assert_eq!(show.name(S2), "Season 2 · Show");
         assert_eq!(show.name(SERIES), "Show");
@@ -3325,6 +3598,7 @@ mod tests {
             episodes: page(vec![ep]),
             season_played: None,
             pick: SeasonPick::Asked,
+            next_up: None,
         };
         let html = render(move || rsx! { ShowView { show: show.clone() } });
         assert!(
@@ -3354,6 +3628,7 @@ mod tests {
             episodes: page(episodes),
             season_played: None,
             pick: SeasonPick::Asked,
+            next_up: None,
         };
 
         let part = show(vec![pilot.clone(), second.clone()]);
@@ -3489,6 +3764,7 @@ mod tests {
             episodes: page(vec![one, two]),
             season_played: None,
             pick: SeasonPick::Asked,
+            next_up: None,
         }
     }
 
