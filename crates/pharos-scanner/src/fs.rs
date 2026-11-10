@@ -4740,6 +4740,36 @@ mod tests {
 
     /// Spec 033 (V940) — a reset drops what an enrichment wrote and keeps
     /// what the files say.
+    /// B995 — a rebuild's local reset gives an episode no id from the show's
+    /// `tvshow.nfo`.
+    #[tokio::test]
+    async fn reset_to_local_metadata_gives_an_episode_no_show_nfo_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let show = dir.path().join("Show A");
+        std::fs::create_dir_all(&show).unwrap();
+        std::fs::write(
+            show.join("tvshow.nfo"),
+            "<tvshow><title>Show A</title><uniqueid type=\"tmdb\">900001</uniqueid></tvshow>",
+        )
+        .unwrap();
+        let path = show.join("Show A - S01E01.mkv");
+        std::fs::write(&path, b"").unwrap();
+        let mut item = MediaItem {
+            path,
+            kind: MediaKind::Episode,
+            series: Some(SeriesInfo {
+                series_name: "Show A".into(),
+                series_folder: Some(show.to_string_lossy().into_owned()),
+                ..SeriesInfo::default()
+            }),
+            ..MediaItem::default()
+        };
+
+        reset_to_local_metadata(&mut item).await;
+
+        assert_eq!(item.metadata.provider_ids.tmdb, None);
+    }
+
     #[tokio::test]
     async fn reset_to_local_metadata_keeps_the_files_and_drops_the_rest() {
         let dir = tempfile::tempdir().unwrap();
