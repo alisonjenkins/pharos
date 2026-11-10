@@ -2579,7 +2579,10 @@ mod tests {
         for glyph in ["▶", "❚❚", "⏮", "⏭", "⛶", "🔇", "🔊", "←"] {
             assert!(!html.contains(glyph), "{glyph} in {html}");
         }
-        assert!(html.contains(ICON_PLAY) && html.contains(ICON_FULL), "{html}");
+        assert!(
+            html.contains(ICON_PLAY) && html.contains(ICON_FULL),
+            "{html}"
+        );
     }
 
     #[test]
