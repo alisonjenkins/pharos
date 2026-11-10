@@ -265,6 +265,11 @@ pub fn use_group_list_updates<T: 'static>(api: Signal<Option<NativeApi>>, groups
                 Ok(sub) => {
                     platform::info("pharos: together subscribed topic=groups");
                     *held.borrow_mut() = Some(sub);
+                    // A change between the first list and the subscription,
+                    // or while reconnecting, sent no event: list again from
+                    // the point the stream starts.
+                    let mut groups = groups;
+                    groups.restart();
                 }
                 // A server from before the topic (it refuses the name) or
                 // before push: the list loads as before, without updates.
