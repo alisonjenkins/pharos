@@ -477,7 +477,7 @@ pub fn init_empty_edit_secs(init: &[u8]) -> Option<f64> {
 /// empty edit, so a player that honours the edit list adds the offset a second
 /// time: audio lands at twice its true position, never overlaps the video's
 /// buffered range, and the player loads fragment after fragment without ever
-/// reaching a playable state (B186 — Lace could not watch Supergirl; the
+/// reaching a playable state (B186 — a viewer could not watch Show AI; the
 /// browser drained 45 minutes of segments in seven and never started).
 ///
 /// The amount to remove is therefore the SESSION's own offset and nothing else.
