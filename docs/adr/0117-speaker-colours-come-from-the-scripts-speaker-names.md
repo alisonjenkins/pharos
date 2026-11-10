@@ -9,7 +9,8 @@
 Every dialogue line of the styled track is drawn white, so a viewer cannot
 tell speakers apart by colour. Alison asked for speaker colours as an opt-in
 (spec 028 T028-31). Most fansub ASS scripts name who speaks each line in the
-event's Name (actor) field; SRT and WebVTT carry no speaker. Voice detection
+event's Name (actor) field. SRT carries no speaker; WebVTT can name one in a
+voice span (`<v Ann>`), which the source reader does not read yet. Voice detection
 from the audio would cover those too, but nothing in the project detects
 voices yet.
 
@@ -32,12 +33,17 @@ voices yet.
 
 ## Consequences
 
-- Tracks without speaker names, and every SRT or WebVTT source, stay white.
+- Tracks without speaker names, every SRT source and, until the reader
+  takes voice spans, every WebVTT source stay white.
 - DIRECTOR_VERSION 7 re-directs every item once.
-- Off is byte-for-byte the track without the feature, under the same cache
-  name, so turning it off costs nothing.
-- The thresholds are guesses; the per-item log line's `speakers` field shows
-  how many speakers each plan colours.
+- Off is byte-for-byte the track without the feature, and its cache name
+  gains no `.s` suffix. The director bump still renames every cached script
+  once (`d7`), so each is compiled again on its first request after the
+  re-direct.
+- The thresholds are guesses. The per-item log line's `speakers` field
+  counts the speakers given a slot, which is what they set. It is not how
+  many colours a viewer sees: it is counted with the setting off too, and a
+  slotted speaker whose lines all carry effects shows no colour.
 - Changing the slot rules means another director bump and a re-direct of
   every item.
 
