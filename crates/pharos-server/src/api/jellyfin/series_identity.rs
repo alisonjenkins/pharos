@@ -27,6 +27,7 @@ pub(super) fn register(cfg: &mut web::ServiceConfig) {
         .route("/admin/series-identity/pick", web::post().to(pick))
         .route("/admin/series-identity/confirm", web::post().to(confirm))
         .route("/admin/series-identity/move", web::post().to(move_files))
+        .route("/admin/series-identity/rebuild", web::post().to(rebuild))
         .route(
             "/admin/series-identity/keep-together",
             web::post().to(keep_together),
@@ -489,6 +490,9 @@ enum Op {
     Remove {
         id: i64,
     },
+    Rebuild {
+        ids: Vec<pharos_core::MediaId>,
+    },
 }
 
 /// Run one hand fix with the server's providers, cache and repair mode, as
@@ -527,6 +531,7 @@ async fn fix(
         } => fixer.move_files(&folder, &paths, target).await,
         Op::KeepTogether { folder } => fixer.keep_together(&folder).await,
         Op::Remove { id } => fixer.remove(id).await,
+        Op::Rebuild { ids } => fixer.rebuild_episodes(&ids).await,
     };
     match done {
         Ok(done) => {
@@ -668,4 +673,21 @@ async fn remove(
 ) -> Result<impl Responder, actix_web::Error> {
     let id = path.into_inner();
     fix(&state, &user, Op::Remove { id }).await
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct RebuildBody {
+    item_ids: Vec<pharos_core::MediaId>,
+}
+
+/// Rebuild episodes from their show's stored match, as the pick's rebuild
+/// does for every episode of a show.
+async fn rebuild(
+    state: web::Data<AppState>,
+    user: AuthUser,
+    body: web::Json<RebuildBody>,
+) -> Result<impl Responder, actix_web::Error> {
+    let ids = body.into_inner().item_ids;
+    fix(&state, &user, Op::Rebuild { ids }).await
 }

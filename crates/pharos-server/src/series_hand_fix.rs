@@ -8,8 +8,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use pharos_core::{
-    DomainError, GenreStore, MediaId, MediaStore, MetadataTranslationStore, OverrideSource,
-    PersonStore, SeriesIdentityStore, SeriesMetadataStore, SeriesOverride,
+    DomainError, GenreStore, MediaId, MediaKind, MediaStore, MetadataTranslationStore,
+    OverrideSource, PersonStore, SeriesIdentityStore, SeriesMetadataStore, SeriesOverride,
 };
 use pharos_scanner::series_split::{self as split, RepairMode};
 use tokio::sync::Semaphore;
@@ -27,16 +27,18 @@ pub(crate) enum HandFix {
     MoveFiles,
     KeepTogether,
     Remove,
+    Rebuild,
 }
 
 impl HandFix {
     #[cfg(test)]
-    pub(crate) const ALL: [Self; 5] = [
+    pub(crate) const ALL: [Self; 6] = [
         Self::PickShow,
         Self::Confirm,
         Self::MoveFiles,
         Self::KeepTogether,
         Self::Remove,
+        Self::Rebuild,
     ];
 
     pub(crate) fn label(self) -> &'static str {
@@ -46,6 +48,7 @@ impl HandFix {
             Self::MoveFiles => "move_files",
             Self::KeepTogether => "keep_together",
             Self::Remove => "remove",
+            Self::Rebuild => "rebuild",
         }
     }
 }
@@ -324,6 +327,56 @@ where
             "series hand fix"
         );
         Ok(HandFixDone { moved, rebuild })
+    }
+
+    /// Mark `ids`, each an episode, to be rebuilt against its show's stored
+    /// match, which is how an admin repairs one episode that kept an old
+    /// show's data after its show was fixed.
+    pub(crate) async fn rebuild_episodes(
+        &self,
+        ids: &[MediaId],
+    ) -> Result<HandFixDone, HandFixError> {
+        let mut ids = ids.to_vec();
+        ids.sort_unstable();
+        ids.dedup();
+        let refuse = |why: HandFixError| {
+            tracing::warn!(
+                admin = self.admin,
+                action = HandFix::Rebuild.label(),
+                episodes = ids.len(),
+                refused = %why,
+                "series hand fix refused"
+            );
+            why
+        };
+        if ids.is_empty() {
+            return Err(refuse(HandFixError::Invalid(
+                "no episodes to rebuild".into(),
+            )));
+        }
+        let items = self.store.get_many(&ids).await?;
+        if let Some(missing) = ids.iter().find(|id| !items.iter().any(|i| i.id == **id)) {
+            return Err(refuse(HandFixError::NotFound(format!("no item {missing}"))));
+        }
+        if let Some(other) = items.iter().find(|i| i.kind != MediaKind::Episode) {
+            return Err(refuse(HandFixError::Invalid(format!(
+                "item {} is a {:?}, not an episode",
+                other.id, other.kind
+            ))));
+        }
+        let rebuild = self.mark(ids).await?;
+        count(HandFix::Rebuild);
+        tracing::info!(
+            admin = self.admin,
+            action = HandFix::Rebuild.label(),
+            episodes = rebuild.len(),
+            to_rebuild = rebuild.len(),
+            "series hand fix"
+        );
+        Ok(HandFixDone {
+            moved: Vec::new(),
+            rebuild,
+        })
     }
 
     async fn folder_rows(
@@ -724,6 +777,61 @@ mod tests {
         assert!(s.all_series_overrides().await.unwrap().is_empty());
     }
 
+    /// A rebuild of ticked episodes marks each, counts and logs the admin and
+    /// how many; a non-episode or unknown id is refused, by name, and logged.
+    #[tokio::test(flavor = "current_thread")]
+    async fn rebuilding_episodes_marks_them_and_is_counted_and_logged() {
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snap = pharos_test_metrics::snapshotter(&recorder);
+        let _metrics = metrics::set_default_local_recorder(&recorder);
+        let logs = LogBuf::default();
+        let _log = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_writer(logs.clone())
+                .with_ansi(false)
+                .finish(),
+        );
+        let s = show_a().await;
+        s.put(MediaItem {
+            id: 9,
+            path: "/movies/Heat.mkv".into(),
+            title: "Heat".into(),
+            kind: MediaKind::Movie,
+            ..MediaItem::default()
+        })
+        .await
+        .unwrap();
+        let bg = Arc::new(Semaphore::new(1));
+        let f = fixer(&s, &bg, RepairMode::DryRun);
+
+        let done = f.rebuild_episodes(&[2, 1, 2]).await.unwrap();
+
+        assert_eq!(done.rebuild, vec![1, 2]);
+        assert_eq!(counter(&snap, "rebuild"), 1);
+        let line = fix_line(&logs);
+        for field in ["admin=\"ali\"", "action=\"rebuild\"", "episodes=2"] {
+            assert!(line.contains(field), "{field} missing from {line}");
+        }
+
+        let err = f.rebuild_episodes(&[1, 9]).await.unwrap_err();
+        assert!(
+            matches!(&err, HandFixError::Invalid(m) if m.contains("item 9")),
+            "{err:?}"
+        );
+        let line = fix_line(&logs);
+        assert!(line.contains("series hand fix refused"), "{line}");
+        assert!(line.contains("item 9"), "{line}");
+        assert!(matches!(
+            f.rebuild_episodes(&[77]).await,
+            Err(HandFixError::NotFound(m)) if m.contains("77")
+        ));
+        assert!(matches!(
+            f.rebuild_episodes(&[]).await,
+            Err(HandFixError::Invalid(_))
+        ));
+        assert_eq!(counter(&snap, "rebuild"), 1);
+    }
+
     #[test]
     fn hand_fix_labels_are_distinct() {
         let labels: std::collections::BTreeSet<&str> =
@@ -736,6 +844,7 @@ mod tests {
                 "keep_together",
                 "move_files",
                 "pick_show",
+                "rebuild",
                 "remove"
             ]
             .into_iter()

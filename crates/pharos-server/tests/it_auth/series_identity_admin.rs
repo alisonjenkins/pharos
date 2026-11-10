@@ -88,6 +88,9 @@ fn requests(token: &str) -> Vec<test::TestRequest> {
             .uri("/admin/series-identity/move")
             .set_json(serde_json::json!({"Folder": SHOW_A, "Paths": [], "TargetYear": 1996})),
         test::TestRequest::post()
+            .uri("/admin/series-identity/rebuild")
+            .set_json(serde_json::json!({"ItemIds": [1]})),
+        test::TestRequest::post()
             .uri("/admin/series-identity/keep-together")
             .set_json(serde_json::json!({"Folder": SHOW_A})),
         test::TestRequest::delete().uri("/admin/series-identity/overrides/1"),
@@ -336,4 +339,53 @@ async fn an_unflagged_show_opens_by_its_series_item_id_and_an_unknown_id_is_404(
     )
     .await;
     assert_eq!(resp.status().as_u16(), 404);
+}
+
+#[actix_web::test]
+async fn a_rebuild_marks_the_episodes_and_refuses_a_non_episode() {
+    use pharos_core::SeriesIdentityStore;
+    let (state, token) = seed(true).await;
+    MediaStore::put(
+        &state.stores,
+        MediaItem {
+            id: 50,
+            path: "/movies/Heat.mkv".into(),
+            title: "Heat".into(),
+            kind: MediaKind::Movie,
+            ..MediaItem::default()
+        },
+    )
+    .await
+    .unwrap();
+    let app = app!(state.clone());
+    let auth = ("X-Emby-Token", token.as_str());
+
+    let resp = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri("/admin/series-identity/rebuild")
+            .insert_header(auth)
+            .set_json(serde_json::json!({"ItemIds": [1, 2]}))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(resp.status().as_u16(), 200);
+    let done: serde_json::Value = test::read_body_json(resp).await;
+    assert_eq!(done["Rebuilding"], 2, "{done}");
+    assert_eq!(done["Moved"], serde_json::json!([]), "{done}");
+    let pending = state.stores.series_reconcile_pending(10).await.unwrap();
+    let mut marked: Vec<u64> = pending.iter().map(|p| p.0).collect();
+    marked.sort_unstable();
+    assert_eq!(marked, [1, 2], "{pending:?}");
+
+    let resp = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri("/admin/series-identity/rebuild")
+            .insert_header(auth)
+            .set_json(serde_json::json!({"ItemIds": [1, 50]}))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(resp.status().as_u16(), 400);
 }
