@@ -1020,8 +1020,10 @@ pub fn scroll_tile_to(at: u32, top: f64) -> bool {
     true
 }
 
+/// The page's query, `?` and all, as `location.search` reads: the app's
+/// history keeps whole paths, a library's filter with them (B1276).
 pub fn current_search() -> String {
-    String::new()
+    tv_page::search_of(&current_path()).to_owned()
 }
 
 /// A listener for the grid's place settling, removed on drop.

@@ -31,6 +31,13 @@ pub fn tagged(mut event: pharos_client::api::ClientEvent) -> pharos_client::api:
     event
 }
 
+/// The query of `path`, `?` and all, without any fragment; empty when it
+/// has none, as `location.search` reads (B1276).
+pub fn search_of(path: &str) -> &str {
+    let path = path.split('#').next().unwrap_or_default();
+    path.find('?').map_or("", |at| &path[at..])
+}
+
 /// The first page the app opens on.
 pub const START_PATH: &str = "/ui/";
 
@@ -681,6 +688,16 @@ pub fn unwatch_sentinel_js(watch: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_paths_search_is_its_query() {
+        assert_eq!(
+            search_of("/ui/browse/s7?genre=animation"),
+            "?genre=animation"
+        );
+        assert_eq!(search_of("/ui/browse/s7"), "");
+        assert_eq!(search_of("/ui/title/s7?a=1#x"), "?a=1");
+    }
 
     #[test]
     fn a_tv_event_names_its_client_once() {
