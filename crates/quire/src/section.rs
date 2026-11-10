@@ -607,6 +607,15 @@ fn attrs(e: &Element, name: &str, ns: Namespace, book: &Book<'_>) -> Vec<Attr> {
             }
         }
     }
+    // Older books mark link targets with `<a name>`, which no id lookup finds.
+    if name == "a" && ns == Namespace::Html && !out.iter().any(|a| a.name == "id") {
+        if let Some(anchor) = e.attr("name").filter(|n| !n.trim().is_empty()) {
+            out.push(Attr {
+                name: "id".into(),
+                value: Value::Text(anchor.to_owned()),
+            });
+        }
+    }
     out
 }
 
