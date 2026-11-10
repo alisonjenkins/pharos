@@ -2055,6 +2055,23 @@ pub struct SubtitleStyling {
     pub styled_at: i64,
 }
 
+/// One item's stored subtitle signal pass (spec 028, B1202): the audio
+/// measured per subtitle line, kept so a new director re-directs from it
+/// instead of decoding the audio again. `source_*` is the video file's
+/// signature and `audio_stream` the stream analysed; `signals_json` holds the
+/// line windows and their measures, opaque to the store. `signals_version`
+/// names the signal pass that made it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubtitleSignalsRow {
+    pub item_id: MediaId,
+    pub source_mtime: i64,
+    pub source_size: u64,
+    pub audio_stream: Option<u32>,
+    pub signals_version: u32,
+    pub signals_json: String,
+    pub measured_at: i64,
+}
+
 /// Storage for [`SubtitleStyling`] rows. Split from [`MediaStore`] like
 /// [`RatingsStore`] so in-memory test stores don't have to implement it.
 pub trait SubtitleStylingStore: Send + Sync {
@@ -2079,6 +2096,19 @@ pub trait SubtitleStylingStore: Send + Sync {
     fn subtitle_styling_index(
         &self,
     ) -> impl std::future::Future<Output = DomainResult<Vec<SubtitleStyling>>> + Send;
+
+    /// Upsert the item's stored signal pass (one per item).
+    fn put_subtitle_signals(
+        &self,
+        row: SubtitleSignalsRow,
+    ) -> impl std::future::Future<Output = DomainResult<()>> + Send;
+
+    /// The item's stored signal pass, or `None`. Callers compare its
+    /// signature, stream and version before using it.
+    fn subtitle_signals(
+        &self,
+        item: MediaId,
+    ) -> impl std::future::Future<Output = DomainResult<Option<SubtitleSignalsRow>>> + Send;
 }
 
 /// T70 — playlists as first-class, user-owned, ordered item containers.

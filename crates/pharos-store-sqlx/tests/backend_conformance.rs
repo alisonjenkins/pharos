@@ -2825,6 +2825,40 @@ where
         .await
         .unwrap();
     assert_eq!(index.iter().filter(|r| r.item_id == film).count(), 1);
+    // B1202: the stored signal pass, one per item, upserted, gone with it.
+    assert_eq!(
+        SubtitleStylingStore::subtitle_signals(&store, film)
+            .await
+            .unwrap(),
+        None
+    );
+    let measured = pharos_core::SubtitleSignalsRow {
+        item_id: film,
+        source_mtime: 1_700_000_000,
+        source_size: u64::from(u32::MAX) + 7,
+        audio_stream: Some(1),
+        signals_version: 1,
+        signals_json: r#"{"windows":[]}"#.into(),
+        measured_at: 1_700_000_300,
+    };
+    SubtitleStylingStore::put_subtitle_signals(&store, measured.clone())
+        .await
+        .unwrap();
+    let remeasured = pharos_core::SubtitleSignalsRow {
+        audio_stream: None,
+        signals_version: 2,
+        measured_at: 1_700_000_400,
+        ..measured
+    };
+    SubtitleStylingStore::put_subtitle_signals(&store, remeasured.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        SubtitleStylingStore::subtitle_signals(&store, film)
+            .await
+            .unwrap(),
+        Some(remeasured)
+    );
     // Deleting the item cascades.
     let sweep = MediaStore::begin_scan(&store, std::path::Path::new("/media/conformance"))
         .await
@@ -2835,6 +2869,12 @@ where
     assert!(swept.contains(&film));
     assert_eq!(
         SubtitleStylingStore::subtitle_styling(&store, film)
+            .await
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        SubtitleStylingStore::subtitle_signals(&store, film)
             .await
             .unwrap(),
         None
