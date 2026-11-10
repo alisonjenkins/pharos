@@ -22,7 +22,7 @@ use super::kept::{
     book_key, cache_name, is_books_cache, keep_refusal, KeptBook, KeptFormat, KeptStore, Reason,
     STORE_KEY,
 };
-use super::kept_view::{KeepControl, KeptList};
+use super::kept_view::{KeepControl, KeptList, OfflineView};
 use super::platform;
 use super::reader::size_cap;
 
@@ -476,4 +476,11 @@ pub fn OnThisDevice() -> Element {
             KeptList { store: store(), on_remove }
         }
     }
+}
+
+/// The app with no connection: the kept books, which open without the server.
+#[component]
+pub fn OfflineHome() -> Element {
+    let (store, on_remove) = use_store();
+    rsx! { OfflineView { store: store(), on_remove } }
 }
