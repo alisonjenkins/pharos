@@ -34,6 +34,10 @@ async function newReaderContext(
     baseURL: PHAROS_URL,
     viewport,
     deviceScaleFactor,
+    // The UI service worker (ADR-0110) fetches assets itself, and
+    // page.route never sees a request a service worker serves, so the
+    // tests that block a reader module would not block anything.
+    serviceWorkers: "block",
     storageState: {
       cookies: [],
       origins: [
