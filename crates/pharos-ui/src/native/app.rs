@@ -2448,7 +2448,7 @@ fn Screen(route: Route) -> Element {
         }
         Route::Privacy => rsx! { SettingsLayout { current: Section::Privacy, PrivacyScreen {} } },
         Route::Offline => rsx! { SettingsLayout { current: Section::Offline, {on_this_device()} } },
-        Route::Find => rsx! { FindRedirect {} },
+        Route::Find => rsx! { FindScreen {} },
         Route::Together => rsx! { TogetherScreen {} },
         Route::TogetherGroup(id) => rsx! { InviteScreen { id } },
         Route::NotFound(path) => rsx! { ErrorNote { message: format!("Nothing at {path}.") } },
@@ -2772,12 +2772,41 @@ fn ReportScreen() -> Element {
     }
 }
 
-/// An old `/find` link: the palette took the find screen's place.
+/// The search page at `/find?q=` (FR-207). It shares the top bar's search,
+/// takes its term from the URL on arrival, and keeps the URL in step as the
+/// term changes, so Back from a match returns to these results.
 #[component]
-fn FindRedirect() -> Element {
-    let mut palette = use_context::<Palette>();
-    use_hook(move || palette.0.set(true));
-    rsx! { Redirect { to: Route::Home } }
+fn FindScreen() -> Element {
+    let ctx = use_context::<Ctx>();
+    let search = use_context::<Search>();
+    use_hook(move || {
+        let term = find::term_of(&platform::current_search());
+        // Back to the same term keeps the matches it already has.
+        if !term.trim().is_empty() && search.find.peek().term() != term.trim() {
+            search.edit(ctx, term);
+        }
+    });
+    use_effect(|| platform::focus_by_id(super::views::FIND_INPUT));
+    use_effect(move || {
+        let query = find::find_query(&(search.text)());
+        let here = Route::parse(&platform::current_path()) == Route::Find;
+        if here && platform::current_search() != query {
+            platform::replace(&format!("{}{query}", Route::Find.path()));
+        }
+    });
+    rsx! {
+        super::views::FindView {
+            text: (search.text)(),
+            hits: (search.hits)(),
+            on_input: move |value| search.edit(ctx, value),
+        }
+    }
+}
+
+/// Opens the search page on `term` (FR-207).
+fn open_find(nav: Nav, term: &str) {
+    nav.0.call(Route::Find);
+    platform::replace(&format!("{}{}", Route::Find.path(), find::find_query(term)));
 }
 
 /// The palette over the page: places to go and what to resume from the home
@@ -2939,7 +2968,6 @@ fn TopSearch() -> Element {
     let ctx = use_context::<Ctx>();
     let search = use_context::<Search>();
     let nav = use_context::<Nav>();
-    let mut palette = use_context::<Palette>();
     let mut open = use_signal(|| false);
     let mut active = use_signal(|| None::<usize>);
     let suggestions = move || match &*search.hits.peek() {
@@ -2968,7 +2996,9 @@ fn TopSearch() -> Element {
             active.set(None);
             match picked {
                 Some(item) => nav.0.call(open_route(&item)),
-                None if !search.text.peek().trim().is_empty() => palette.0.set(true),
+                None if !search.text.peek().trim().is_empty() => {
+                    open_find(nav, &search.text.peek());
+                }
                 None => {}
             }
         }
@@ -2999,7 +3029,10 @@ fn TopSearch() -> Element {
                 open.set(false);
                 active.set(None);
             },
-            on_all: move |_| palette.0.set(true),
+            on_all: move |_| {
+                open.set(false);
+                open_find(nav, &search.text.peek());
+            },
         }
     }
 }
