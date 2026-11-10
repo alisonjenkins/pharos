@@ -10,6 +10,7 @@ use pharos_client::ClientError;
 use super::app::{call, AccountMe, Ctx};
 use super::machine::{Event, Machine};
 use super::platform;
+use super::route::Route;
 use crate::views::{AdminPane, AdminTab};
 
 /// How long before a manage token ends the screen asks for the next one.
@@ -196,13 +197,17 @@ pub fn ManageScreen() -> Element {
     let local = use_signal(|| None::<MediaToken>);
     let held = try_use_context::<HeldManageToken>().map_or(local, |h| h.0);
     let manage_tab = try_use_context::<ManageTab>();
+    // A tab another page asked for, else the one the URL names, so Back
+    // and a reload return to it (FR-209).
     let initial_tab = use_hook(|| {
-        manage_tab.and_then(|tab| {
-            let mut tab = tab.0;
-            let wanted = *tab.peek();
-            tab.set(None);
-            wanted
-        })
+        manage_tab
+            .and_then(|tab| {
+                let mut tab = tab.0;
+                let wanted = *tab.peek();
+                tab.set(None);
+                wanted
+            })
+            .or_else(|| tab_of(&platform::current_search()))
     })
     .unwrap_or_default();
     let manage_focus = try_use_context::<ManageFocus>();
@@ -310,8 +315,37 @@ pub fn ManageScreen() -> Element {
                 current_user_id: me_id,
                 initial_tab,
                 initial_focus,
+                on_tab: keep_tab_in_url,
             }
         },
+    }
+}
+
+/// The Manage page's URL query for `tab`, `?` included; empty for Users,
+/// the page Manage opens on.
+pub fn manage_query(tab: AdminTab) -> String {
+    if tab == AdminTab::default() {
+        String::new()
+    } else {
+        format!("?page={}", tab.class_suffix())
+    }
+}
+
+/// The tab a Manage URL query names, if any.
+pub fn tab_of(query: &str) -> Option<AdminTab> {
+    query
+        .trim_start_matches('?')
+        .split('&')
+        .find_map(|pair| pair.strip_prefix("page="))
+        .and_then(AdminTab::from_token)
+}
+
+/// Replaces the Manage URL with one naming `tab`, while Manage is shown.
+fn keep_tab_in_url(tab: AdminTab) {
+    let query = manage_query(tab);
+    let here = Route::parse(&platform::current_path()) == Route::Manage;
+    if here && platform::current_search() != query {
+        platform::replace(&format!("{}{query}", Route::Manage.path()));
     }
 }
 
@@ -321,6 +355,25 @@ mod tests {
     use super::*;
 
     const HOUR: u64 = 60 * 60 * 1000;
+
+    /// FR-209: every Manage page round-trips through the URL; Users keeps
+    /// the bare URL, and an unknown page opens on the default.
+    #[test]
+    fn a_manage_page_round_trips_through_the_url() {
+        assert_eq!(manage_query(AdminTab::Users), "");
+        assert_eq!(manage_query(AdminTab::Devices), "?page=devices");
+        for tab in AdminTab::all() {
+            let query = manage_query(tab);
+            let back = if query.is_empty() {
+                AdminTab::default()
+            } else {
+                tab_of(&query).unwrap()
+            };
+            assert_eq!(back, tab);
+        }
+        assert_eq!(tab_of("?page=nonsense"), None);
+        assert_eq!(tab_of(""), None);
+    }
 
     #[test]
     fn the_next_token_is_asked_for_five_minutes_before_this_one_ends() {
