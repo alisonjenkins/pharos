@@ -4537,7 +4537,8 @@ pub trait UserDataStore: Send + Sync {
 pub struct ReadPosition {
     pub locator: String,
     pub fraction: f32,
-    /// Unix seconds of the last save.
+    /// Unix seconds the page was read (the client's `readAt`, clamped to the
+    /// server's now); the newest reading wins.
     pub updated_at: i64,
 }
 
@@ -4555,13 +4556,16 @@ pub trait ReadPositionStore: Send + Sync {
         items: &[MediaId],
     ) -> impl std::future::Future<Output = DomainResult<Vec<Option<ReadPosition>>>> + Send;
 
-    /// Insert or replace the position for `(user, item)`.
+    /// Insert the position for `(user, item)`, or replace the stored one when
+    /// `position.updated_at` is not older than it (newest reading wins, 036).
+    /// Answers whether the position was stored; `false` means a newer one
+    /// was already there and is kept. Atomic: one statement decides.
     fn set_read_position(
         &self,
         user: UserId,
         item: MediaId,
         position: ReadPosition,
-    ) -> impl std::future::Future<Output = DomainResult<()>> + Send;
+    ) -> impl std::future::Future<Output = DomainResult<bool>> + Send;
 
     /// Items with a saved fraction above 0 that the user has not marked
     /// played, newest save first: drives "Continue reading".
