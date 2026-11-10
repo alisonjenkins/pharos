@@ -469,6 +469,8 @@ pub struct KeyContext {
     pub in_player: bool,
     /// The focus is on a button or link.
     pub on_button: bool,
+    /// The focus is on a field: text, a text area or a slider (FR-606).
+    pub field: bool,
 }
 
 /// The neighbour a remote's next or previous key asks for (FR-609).
@@ -1090,6 +1092,16 @@ mod tests {
         assert!(!waiting.has_data());
         let live = Media { dur: None, ..m };
         assert_eq!(live.duration_ms(), 0);
+    }
+
+    #[test]
+    fn a_key_says_when_the_focus_is_on_a_field() {
+        let key = serde_json::json!({"t": "key", "key": "ArrowDown", "field": true});
+        let Some(Bridge::Key { at, text, .. }) = parse_bridge(&key) else {
+            panic!("not a key");
+        };
+        assert!(at.field);
+        assert!(!text, "an arrow leaving a field is not a key in it");
     }
 
     #[test]
