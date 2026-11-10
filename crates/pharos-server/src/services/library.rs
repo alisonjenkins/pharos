@@ -275,6 +275,7 @@ pub async fn latest_tiles(
         return Ok(Vec::new());
     }
     let newest = newest_items(state, user, parent_id, kinds, Some(LATEST_MAX)).await?;
+    let read = newest.len();
     let mut groups: Vec<Vec<MediaItem>> = Vec::new();
     let mut at: std::collections::HashMap<Fold, usize> = std::collections::HashMap::new();
     for item in newest {
@@ -316,6 +317,13 @@ pub async fn latest_tiles(
             }
         }
     }
+    tracing::debug!(
+        parent = parent_id.unwrap_or("all"),
+        read,
+        tiles = tiles.len(),
+        folded = tiles.iter().filter(|t| t.is_some()).count(),
+        "latest rail folded"
+    );
     crate::services::metadata_text::localize_items(state, user.id, singles.iter_mut()).await;
     let mut singles = items_with_user_data(state, user, singles)
         .await?
