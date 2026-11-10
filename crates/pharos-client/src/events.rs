@@ -38,6 +38,9 @@ pub enum PushEvent {
         /// tasks, and from a server older than schemaVersion 40.
         counts: TaskCounts,
     },
+    /// The groups the user could join changed: list them again. Only for a
+    /// subscriber that asked for the `groups` topic.
+    Groups,
     /// Events were missed: everything cached may be stale.
     Resync,
 }
@@ -197,6 +200,7 @@ fn read_event(e: event::Reader<'_>) -> Result<PushEvent, capnp::Error> {
                 },
             }
         }
+        event::GroupsChanged(()) => PushEvent::Groups,
         event::Resync(()) => PushEvent::Resync,
     })
 }

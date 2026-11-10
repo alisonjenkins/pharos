@@ -86,7 +86,7 @@ impl Known {
                     refresh.user_data = true;
                     refresh.library = true;
                 }
-                PushEvent::Task { .. } => {}
+                PushEvent::Task { .. } | PushEvent::Groups => {}
             }
         }
         refresh
@@ -129,7 +129,7 @@ fn fold_tasks(view: &mut ScanView, batch: &[PushEvent]) -> bool {
                     changed = true;
                 }
             }
-            PushEvent::UserData { .. } | PushEvent::Library { .. } => {}
+            PushEvent::UserData { .. } | PushEvent::Library { .. } | PushEvent::Groups => {}
         }
     }
     changed
