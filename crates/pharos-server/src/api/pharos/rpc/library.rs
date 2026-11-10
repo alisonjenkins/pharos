@@ -600,7 +600,7 @@ impl server::library::Handler for Library {
         if has_versions {
             let mut versions = out.reborrow().init_versions(version_count(&all));
             write_versions(versions.reborrow(), &all, user.policy.admin);
-            if verdict.is_some() {
+            if verdict.as_ref().is_some_and(|e| e.report.breaks_playback()) {
                 versions.get(0).set_damaged(true);
             }
         }

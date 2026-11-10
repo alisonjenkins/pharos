@@ -177,14 +177,16 @@ impl IntegrityMemo {
             .collect()
     }
 
-    /// The ids of every file recorded as damaged.
+    /// The ids of every file whose damage can break playback, for the
+    /// library's "Damaged" badges. A file with no seek index plays through, so
+    /// it is listed for admins (`damaged`) but not badged (B1162).
     pub fn damaged_ids(&self) -> std::collections::HashSet<u64> {
         let Ok(d) = self.doc.read() else {
             return Default::default();
         };
         d.entries
             .iter()
-            .filter(|(_, e)| e.report.is_damaged())
+            .filter(|(_, e)| e.report.breaks_playback())
             .map(|(id, _)| *id)
             .collect()
     }
@@ -409,5 +411,26 @@ mod tests {
         memo.record(1, Some((1, 1)), clean());
         memo.save().unwrap();
         assert!(IntegrityMemo::load(&path, 1).is_scanned(1, Some((1, 1))));
+    }
+
+    /// B1162: a file with no seek index is listed for admins but carries no
+    /// "Damaged" badge, since it plays through and only seeks slowly.
+    #[test]
+    fn an_unindexed_file_is_listed_but_not_badged() {
+        let memo = IntegrityMemo::load("/nonexistent/m.json", 1);
+        memo.record(
+            4,
+            Some((1, 1)),
+            IntegrityReport {
+                complete: true,
+                seek_index: Some(false),
+                ..Default::default()
+            },
+        );
+        assert_eq!(memo.damaged().len(), 1, "the admin list names it");
+        assert!(
+            memo.damaged_ids().is_empty(),
+            "the library does not badge it"
+        );
     }
 }
