@@ -1943,6 +1943,11 @@ fn NativeApp(route: Route) -> Element {
     match phase {
         Phase::Connecting | Phase::Ready => {
             let m = machine.read();
+            // Cut off from the server, kept books still open (spec 036 US3).
+            let cut_off = m.waiting().is_some() || platform_offline();
+            if let Some(offline) = cut_off.then(|| offline_start(&route)).flatten() {
+                return offline;
+            }
             match m.waiting() {
                 Some(why) => rsx! {
                     StatusView {
@@ -2095,6 +2100,35 @@ fn on_this_device() -> Element {
             p { class: "pharos-settings-lede", "Keeping books to read offline works in the browser app." }
         }
     }
+}
+
+/// The app with no connection and books kept on the device: the list, or
+/// the reader when a kept book was asked for. `None` when nothing is kept,
+/// so the usual waiting page shows. Browser only; the cache is the browser's.
+#[cfg(all(feature = "web", target_arch = "wasm32"))]
+fn offline_start(route: &Route) -> Option<Element> {
+    let store = super::kept_web::read()?;
+    Some(match route {
+        Route::Read(id) if store.find(&id.to_string()).is_some() => {
+            remount_on(&id.to_string(), reader_screen(*id))
+        }
+        _ => rsx! { super::kept_web::OfflineHome {} },
+    })
+}
+
+#[cfg(not(all(feature = "web", target_arch = "wasm32")))]
+fn offline_start(_route: &Route) -> Option<Element> {
+    None
+}
+
+#[cfg(all(feature = "web", target_arch = "wasm32"))]
+fn platform_offline() -> bool {
+    super::kept_web::is_offline()
+}
+
+#[cfg(not(all(feature = "web", target_arch = "wasm32")))]
+fn platform_offline() -> bool {
+    false
 }
 
 /// The reader draws with `quire-web`, which only the browser build has.
