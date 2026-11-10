@@ -161,6 +161,6 @@ Evidence is `crates/pharos-ui/src/native/` (`views.rs`, `browse.rs`, `rails.rs`,
 - US8 search: done (#549, then Ctrl+K palette b8995022, #881, #898).
 - US9 collections and playlists: partial. Music playlists and queue (`queue.rs`); collections/video playlists not found.
 - US10 Live TV guide: partial. Only the legacy REST pane `views/live_tv.rs` under /manage; no native guide.
-- US11 item actions everywhere: partial. Played toggle, queue buttons, versions; favourite mark on title and show pages and a `/favourites` page (B1080–B1083). Add to playlist/collection not built; albums and artists have no favourite mark yet.
+- US11 item actions everywhere: partial. Played toggle, queue buttons, versions; favourite mark on title, show, album and artist pages and a `/favourites` page (B1080–B1085). Add to playlist/collection not built.
 - US12 "more": partial. IMDb/RT ratings (#614), what's new (spec 027), trail, depth.
 - FR-004 saved views per library: not found. FR-005 home section config: not found (fixed order, #603).
