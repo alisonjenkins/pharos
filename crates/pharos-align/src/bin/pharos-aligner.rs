@@ -25,7 +25,10 @@ const IDLE_CHECK: Duration = Duration::from_secs(30);
 /// next, and a song took twice as long. So the process starts again with the
 /// team sized to `threads` and waiting passively, unless they were set.
 fn openmp_env(threads: usize) {
-    let mut cmd = std::process::Command::new("/proc/self/exe");
+    // The resolved path, not /proc/self/exe, so ps and ss name the process
+    // pharos-aligner rather than "exe".
+    let exe = std::env::current_exe().unwrap_or_else(|_| "/proc/self/exe".into());
+    let mut cmd = std::process::Command::new(exe);
     let mut changed = false;
     for (name, value) in [
         ("OMP_NUM_THREADS", threads.to_string()),
