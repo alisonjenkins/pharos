@@ -5332,12 +5332,14 @@ dependencies = [
  "metrics",
  "metrics-util",
  "pharos-test-metrics",
+ "rustls",
  "serde_json",
  "tokio",
  "tokio-util",
  "tracing",
  "tracing-subscriber",
  "web-time",
+ "webpki-roots 1.0.10",
 ]
 
 [[package]]
@@ -5566,7 +5568,6 @@ dependencies = [
  "tracing-opentelemetry",
  "tracing-subscriber",
  "uuid",
- "webpki-roots 1.0.10",
  "workspace-hack",
  "xxhash-rust",
  "zip",
@@ -5713,7 +5714,6 @@ dependencies = [
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
- "webpki-roots 1.0.10",
 ]
 
 [[package]]
