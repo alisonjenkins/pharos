@@ -150,6 +150,12 @@ pub const ENTRIES: &[Entry] = &[
         title: "Controls effect",
         text: "Pick how the player's controls hide while you watch, and come back when you move.",
     },
+    Entry {
+        id: 11,
+        kind: Kind::Feature,
+        title: "In progress filter",
+        text: "A library's Watched filter lists what you started and didn't finish, with a button on each to mark it watched.",
+    },
 ];
 
 /// The newest entry id: what Done records as seen.
