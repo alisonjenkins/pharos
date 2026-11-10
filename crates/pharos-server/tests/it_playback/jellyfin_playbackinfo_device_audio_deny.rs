@@ -313,15 +313,23 @@ async fn a_user_manages_the_devices_they_are_signed_in_on_and_no_others() {
             .set_payload(body)
     };
     assert_eq!(
-        call(&fx, set("phone", r#"{"NoDirectPlayAudioCodecs":["eac3"]}"#), &phone)
-            .await
-            .0,
+        call(
+            &fx,
+            set("phone", r#"{"NoDirectPlayAudioCodecs":["eac3"]}"#),
+            &phone
+        )
+        .await
+        .0,
         StatusCode::NO_CONTENT
     );
     assert_eq!(
-        call(&fx, set("tv", r#"{"NoDirectPlayAudioCodecs":["dts"]}"#), &phone)
-            .await
-            .0,
+        call(
+            &fx,
+            set("tv", r#"{"NoDirectPlayAudioCodecs":["dts"]}"#),
+            &phone
+        )
+        .await
+        .0,
         StatusCode::FORBIDDEN
     );
     assert!(

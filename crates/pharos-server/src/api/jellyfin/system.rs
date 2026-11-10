@@ -1047,16 +1047,13 @@ async fn device_options_role(
     user: &AuthUser,
     device_id: &str,
 ) -> Result<DeviceOptionsRole, actix_web::Error> {
-    use pharos_core::TokenStore;
     if user.0.policy.admin {
         return Ok(DeviceOptionsRole::Admin);
     }
-    let tokens = state
-        .stores
-        .tokens_for(user.0.id)
+    if crate::services::devices::is_signed_in_on(state, user.0.id, device_id)
         .await
-        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
-    if tokens.iter().any(|t| t.device_id == device_id) {
+        .map_err(error::ErrorInternalServerError)?
+    {
         return Ok(DeviceOptionsRole::Owner);
     }
     tracing::info!(
