@@ -2109,7 +2109,12 @@ fn Screen(route: Route) -> Element {
         }
         Route::Account => rsx! { SettingsLayout { current: Section::Account, AccountScreen {} } },
         Route::ApproveDevice => {
-            rsx! { SettingsLayout { current: Section::Devices, ApproveDeviceScreen {} } }
+            rsx! {
+                SettingsLayout { current: Section::Devices,
+                    ApproveDeviceScreen {}
+                    MyDevicesScreen {}
+                }
+            }
         }
         Route::Playback => {
             rsx! { SettingsLayout { current: Section::Playback, PlaybackScreen {} } }
@@ -2888,6 +2893,79 @@ fn ApproveDeviceScreen() -> Element {
                     }
                     outcome.set(Some(result.map_err(|e| approve_device::refusal_message(&e))));
                     busy.set(false);
+                });
+            },
+        }
+    }
+}
+
+/// Settings → Devices, "Your devices": loads the user's devices and saves a
+/// device's sound formats on each toggle, one save per device at a time.
+#[component]
+fn MyDevicesScreen() -> Element {
+    use super::my_devices::{with_saved, MyDevicesState, MyDevicesView};
+    let ctx = use_context::<Ctx>();
+    let mut state = use_signal(|| MyDevicesState::Loading);
+    let mut saving = use_signal(std::collections::BTreeSet::<String>::new);
+    let mut problem = use_signal(|| None::<String>);
+    let report = move |e: &ClientError, what: &str| {
+        if e.needs_sign_in() {
+            let mut machine = ctx.machine;
+            machine.write().apply(Event::NeedsSignIn);
+        }
+        platform::warn(&format!("my_devices: {what} failed: {e}"));
+    };
+    // Loads again on a new connection, which may be another account.
+    use_effect(move || {
+        let Some(api) = ctx.api.read().clone() else {
+            return;
+        };
+        spawn(async move {
+            match api.my_devices(&call("my_devices", "my_devices")).await {
+                Ok(devices) => state.set(MyDevicesState::Loaded(devices)),
+                Err(e) => {
+                    report(&e, "my devices");
+                    state.set(MyDevicesState::Failed(format!(
+                        "Couldn't load your devices: {e}"
+                    )));
+                }
+            }
+        });
+    });
+    rsx! {
+        MyDevicesView {
+            state: state(),
+            saving: saving(),
+            problem: problem(),
+            on_change: move |(device_id, codecs): (String, Vec<String>)| {
+                let Some(api) = ctx.api.peek().clone() else {
+                    return;
+                };
+                if !saving.write().insert(device_id.clone()) {
+                    return;
+                }
+                problem.set(None);
+                spawn(async move {
+                    let result = api
+                        .set_device_converted_audio(
+                            &call("my_devices", "set_device_converted_audio"),
+                            &device_id,
+                            &codecs,
+                        )
+                        .await;
+                    match result {
+                        Ok(()) => {
+                            let current = state.peek().clone();
+                            if let MyDevicesState::Loaded(devices) = current {
+                                state.set(MyDevicesState::Loaded(with_saved(devices, &device_id, codecs)));
+                            }
+                        }
+                        Err(e) => {
+                            report(&e, "set device converted audio");
+                            problem.set(Some(format!("Couldn't save the sound formats: {e}")));
+                        }
+                    }
+                    saving.write().remove(&device_id);
                 });
             },
         }

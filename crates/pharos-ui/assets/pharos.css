@@ -5457,6 +5457,23 @@ body:has(.pharos-stage.is-mini) .pharos-main {
   outline-offset: 2px;
 }
 
+/* Settings → Devices, "Your devices" (T130). */
+.pharos-settings-page + .pharos-my-devices {
+  margin-top: 2.5rem;
+}
+.pharos-my-devices-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.pharos-my-device + .pharos-my-device {
+  border-top: var(--px-border) solid var(--px-color-border);
+}
+.pharos-my-device-current {
+  color: var(--px-color-fg-muted);
+  font-weight: 400;
+}
+
 /* Paths and rows. */
 .pharos-manage-paths {
   display: grid;

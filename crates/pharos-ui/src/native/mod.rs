@@ -40,6 +40,7 @@ pub mod lyrics;
 pub mod machine;
 pub mod manage;
 pub mod mixes;
+pub mod my_devices;
 pub mod paging;
 pub mod palette;
 pub mod person;
