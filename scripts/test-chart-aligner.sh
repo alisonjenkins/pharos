@@ -54,6 +54,15 @@ expect "shadow on renders its deployment" present "name: p-pharos-aligner-shadow
   --set aligner.shadow.enabled=true --set aligner.shadow.image.tag=s
 expect "shadow on runs the Rust image" present "pharos-aligner-rs:s" -- \
   --set aligner.shadow.enabled=true --set aligner.shadow.image.tag=s
+expect "the aligner waits up to 10 minutes to start" present "failureThreshold: 60" --
+# Both Deployments carry it: the primary's and the shadow's.
+startup="$(render --set aligner.shadow.enabled=true --set aligner.shadow.image.tag=s)"
+if [ "$(grep -c "startupProbe:" <<<"$startup")" -eq 2 ]; then
+  echo "ok   the shadow has a startup probe too"
+else
+  echo "FAIL the shadow has no startup probe" >&2
+  failed=1
+fi
 
 # The primary Service must not select the shadow's pods, or songs would
 # reach the shadow as answers.
