@@ -21,9 +21,9 @@ use super::platform::{
 };
 use super::playback::{
     abr_ladder, check_master, forward_buffer_ms, pick_audio_uri, plan_hls, ranges_to_ms,
-    rung_label, segment_deadlines, with_abr, AbrSwitchReport, FragmentLoad, HlsFallbackCause,
-    MediaRecovery, MediaRecoveryReport, MediaVerdict, OnFatal, OnFragment, PlaybackEngine,
-    SegmentFailureReport, SegmentRecovery, StallReport,
+    rung_label, segment_deadlines, with_abr, AbrSwitchReport, Fatal, FragmentLoad,
+    HlsFallbackCause, MediaRecovery, MediaRecoveryReport, MediaVerdict, OnFatal, OnFragment,
+    PlaybackEngine, SegmentFailureReport, SegmentRecovery, StallReport,
 };
 
 /// The cold-encode time is the slowest time-to-first-byte over this many recent
@@ -833,7 +833,7 @@ async fn fallback(weak: &Weak<RefCell<Session>>, cause: HlsFallbackCause, value:
     });
 
     if let Err(e) = load_script(HLSJS_SRC, "Hls").await {
-        on_fatal(e);
+        on_fatal(Fatal::other(e));
         return;
     }
 
@@ -849,7 +849,7 @@ async fn fallback(weak: &Weak<RefCell<Session>>, cause: HlsFallbackCause, value:
         Ok(()) => {
             session.borrow_mut().fallback = Some(hls);
         }
-        Err(e) => on_fatal(e),
+        Err(e) => on_fatal(Fatal::other(e)),
     }
 }
 
@@ -1559,13 +1559,13 @@ fn on_fetch_failed(
         return;
     }
     match report.recovery {
-        SegmentRecovery::Fail { .. } => on_fatal(format!(
+        SegmentRecovery::Fail { .. } => on_fatal(Fatal::other(format!(
             "the stream failed ({} segment {}: {} {})",
             report.track,
             report.index,
             report.cause.label(),
             report.reason
-        )),
+        ))),
         SegmentRecovery::Retry { after_ms, .. } => {
             let weak = Rc::downgrade(session);
             wasm_bindgen_futures::spawn_local(async move {
@@ -1821,7 +1821,9 @@ fn fail_manifest(
             ("attempt", "0".to_owned()),
         ],
     });
-    on_fatal(format!("the stream failed (networkError: {reason})"));
+    on_fatal(Fatal::other(format!(
+        "the stream failed (networkError: {reason})"
+    )));
 }
 
 /// A media error: rebuild the MediaSource at the play head while the media
@@ -1860,7 +1862,9 @@ fn fail_media(weak: &Weak<RefCell<Session>>, details: &str, message: &str) {
         MediaVerdict::Fail { .. } => {
             finish_trace(&session, super::hls_trace::Flush::Fatal);
             report_event(report.event(current_path()));
-            on_fatal(format!("the stream failed (mediaError: {message})"));
+            on_fatal(Fatal::media(format!(
+                "the stream failed (mediaError: {message})"
+            )));
         }
     }
 }
@@ -1963,5 +1967,8 @@ fn fail_rebuild(session: &Rc<RefCell<Session>>, reason: &str) {
     warn(&report.line(&url));
     report_event(report.event(current_path()));
     finish_trace(session, super::hls_trace::Flush::Fatal);
-    on_fatal(format!("the stream failed (mediaError: {reason})"));
+    // The rebuild itself failed: the MediaSource, not the file.
+    on_fatal(Fatal::other(format!(
+        "the stream failed (mediaError: {reason})"
+    )));
 }

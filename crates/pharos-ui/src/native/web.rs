@@ -18,7 +18,7 @@ use wasm_bindgen::{JsCast as _, JsValue};
 
 use super::machine::{Probe, SignInReply, SignOutReply};
 use super::playback::{
-    cue_chars_per_line, cue_font_px, cue_width_share, is_loading, lifted_line, Engine,
+    cue_chars_per_line, cue_font_px, cue_width_share, is_loading, lifted_line, Engine, Fatal,
     FragmentLoad, LibraryTransition, MediaState, OnFatal, OnFragment, OverlayEffect,
     PlaybackEngine, Recovery, RecoveryBudget, SubtitleSize,
 };
@@ -2959,9 +2959,14 @@ impl PlaybackEngine for NativeVideo {
                         ("action", "fail".to_owned()),
                     ],
                 });
-                on_fatal(format!(
-                    "the browser could not play this stream (code {code}) {message}"
-                ));
+                let reason =
+                    format!("the browser could not play this stream (code {code}) {message}");
+                // MEDIA_ERR_DECODE: the bytes arrived and would not decode.
+                on_fatal(if code == 3 {
+                    Fatal::media(reason)
+                } else {
+                    Fatal::other(reason)
+                });
             })
         };
         video
@@ -3375,7 +3380,7 @@ impl PlaybackEngine for HlsJs {
                 match action {
                     Recovery::StartLoad => player.start_load(),
                     Recovery::RecoverMedia => player.recover_media_error(),
-                    Recovery::Fail => on_fatal(format!("the stream failed ({kind}: {details})")),
+                    Recovery::Fail => on_fatal(Fatal::from_hls(&kind, &details)),
                 }
             })
         };

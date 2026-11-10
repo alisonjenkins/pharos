@@ -39,11 +39,12 @@ use super::playback::{
     rust_subtitle_url, shown_font_urls, source_of_styled, start_ms, starting_tier,
     starting_tier_line, styled_subtitle_signals, styled_subtitle_url, styled_track_url,
     subtitle_switch, tier_drop_line, tier_drop_report, tier_spared_line, up_next_at,
-    volume_setting, DeviceClass, EffectsLevel, Engine, EngineReason, LibraryTransition, MediaEvent,
-    MediaState, MseEngine, OnFatal, OnFragment, Outgoing, OverlayEffect, PlaybackEngine,
-    RendererFrames, ReportClock, SubtitleSize, SubtitleSwitch, Tier, TierDrop, TierVerdict, UpNext,
-    UpNextStep, CROSSFADE_KEY, EFFECTS_LEVEL_KEY, LIBRARY_TRANSITION_KEY, MAX_BITRATE_KEY,
-    MSE_ENGINE_KEY, OVERLAY_EFFECT_KEY, SUBTITLE_SIZE_KEY, TIER_DROP_KEY, VOLUME_KEY,
+    volume_setting, DeviceClass, EffectsLevel, Engine, EngineReason, Fatal, LibraryTransition,
+    MediaEvent, MediaState, MseEngine, OnFatal, OnFragment, Outgoing, OverlayEffect,
+    PlaybackEngine, RendererFrames, ReportClock, SubtitleSize, SubtitleSwitch, Tier, TierDrop,
+    TierVerdict, UpNext, UpNextStep, CROSSFADE_KEY, EFFECTS_LEVEL_KEY, LIBRARY_TRANSITION_KEY,
+    MAX_BITRATE_KEY, MSE_ENGINE_KEY, OVERLAY_EFFECT_KEY, SUBTITLE_SIZE_KEY, TIER_DROP_KEY,
+    VOLUME_KEY,
 };
 use super::playback_settings;
 use super::preplay::{self, PlayPicks, TrackChoices};
@@ -5228,10 +5229,10 @@ fn Player(
     // The engines call back from browser events, outside the Dioxus runtime.
     let fatal = use_coroutine({
         let stop = stop.clone();
-        move |mut reasons: UnboundedReceiver<String>| {
+        move |mut reasons: UnboundedReceiver<Fatal>| {
             let stop = stop.clone();
             async move {
-                while let Some(reason) = reasons.next().await {
+                while let Some(Fatal { reason, .. }) = reasons.next().await {
                     stop();
                     platform::warn(&format!(
                         "pharos: playback failure shown item={playing_id} kind=stream reason={reason}"
