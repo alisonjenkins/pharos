@@ -49,7 +49,7 @@ Id blocks (bugs and invariants are written with the fix):
 - [x] T038-303 [P] 44px targets and double-tap zones (FR-303); wheel rule (FR-304).
 - [x] T038-304 [P] SVG glyphs (FR-305); small-player seek (FR-306).
 - [x] T038-305 Speed control and subtitle delay (FR-307).
-- [ ] T038-306 [ALISON] Key map for `k`/`j` (FR-308).
+- [x] T038-306 [ALISON] Key map for `k`/`j` (FR-308). Declined by Alison 2026-11-10: `k`/`j` stay as volume, no change.
 
 ## G4 — Player feedback
 
