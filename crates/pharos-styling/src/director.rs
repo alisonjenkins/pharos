@@ -73,13 +73,21 @@ const CAPS_RATIO: f32 = 0.8;
 const ATTACK_MAX_WORDS: usize = 3;
 /// Most words in a bracketed sound name.
 const SFX_MAX_WORDS: usize = 4;
-/// First-word stems that make a parenthesised line a sound cue rather than
-/// a thought: non-speech voices first, then common sounds.
-const SOUND_CUES: [&str; 38] = [
-    "laugh", "chuckl", "giggl", "snicker", "cackl", "chortl", "guffaw", "sigh", "gasp", "groan",
-    "grunt", "scream", "shriek", "sob", "crying", "cries", "cough", "sneez", "pant", "snor",
-    "yawn", "whimper", "growl", "roar", "cheer", "applau", "scoff", "snort", "sniff", "knock",
-    "bang", "crash", "thud", "ring", "buzz", "beep", "explo", "thunder",
+/// Sounds and non-speech voices a bracketed cue may open with, as verbs
+/// (matched in their -s, -ing and -ed forms) and as nouns (matched as
+/// written). Laughter is [`LAUGH_VERBS`].
+const SOUND_VERBS: [&str; 30] = [
+    "sigh", "gasp", "groan", "grunt", "scream", "shriek", "sob", "cry", "cough", "sneeze", "pant",
+    "snore", "yawn", "whimper", "growl", "roar", "cheer", "applaud", "scoff", "snort", "sniff",
+    "knock", "bang", "crash", "thud", "ring", "buzz", "beep", "clap", "thunder",
+];
+const SOUND_NOUNS: [&str; 6] = [
+    "explosion",
+    "explosions",
+    "applause",
+    "gunshot",
+    "gunshots",
+    "thunder",
 ];
 const PHONE_DEVICES: [&str; 11] = [
     "phone",
@@ -336,47 +344,102 @@ fn decide(
 }
 
 fn is_sfx(text: &str) -> bool {
-    let inner = unwrap_marks(text);
+    let Some((inner, first)) = bracket_cue(text) else {
+        return false;
+    };
     // Parentheses usually hold a thought; only a sound cue there is a sound
-    // (B1203: `(laughs)` was drawn as a thought).
-    if text.starts_with(['(', '（']) && !is_sound_cue(inner) {
+    // (B1203: `(sighs)` was drawn as a thought).
+    if text.starts_with(['(', '（']) && !is_cue_word(&inner, &first, &SOUND_VERBS, &SOUND_NOUNS) {
         return false;
     }
-    inner != text
-        && !inner.is_empty()
-        && inner.split_whitespace().count() <= SFX_MAX_WORDS
-        && !inner.contains([',', '?', '.'])
-        && !is_phone_tag(&inner.to_lowercase())
-        && !is_whisper_tag(&inner.to_lowercase())
+    let lower = inner.to_lowercase();
+    !is_phone_tag(&lower) && !is_whisper_tag(&lower)
 }
 
-/// First-word stems of a laugh cue.
-const LAUGH_CUES: [&str; 7] = [
-    "laugh", "chuckl", "giggl", "snicker", "cackl", "chortl", "guffaw",
+/// Verbs that open a laugh cue.
+const LAUGH_VERBS: [&str; 7] = [
+    "laugh", "chuckle", "giggle", "snicker", "cackle", "chortle", "guffaw",
 ];
 
 /// A whole line in brackets, parentheses or stars naming laughter:
 /// `(laughs)`, `[giggling nervously]`, `*chuckles*`.
 fn is_laugh_cue(text: &str) -> bool {
+    bracket_cue(text).is_some_and(|(inner, first)| is_cue_word(&inner, &first, &LAUGH_VERBS, &[]))
+}
+
+/// A whole-line bracket, parenthesis or star pair short enough to be a cue
+/// (at most [`SFX_MAX_WORDS`] words, no `,` `?` `.`): its contents and their
+/// first word, lowercased and stripped of punctuation.
+fn bracket_cue(text: &str) -> Option<(String, String)> {
     let inner = unwrap_marks(text);
     if inner == text
+        || inner.is_empty()
         || inner.split_whitespace().count() > SFX_MAX_WORDS
         || inner.contains([',', '?', '.'])
     {
-        return false;
+        return None;
     }
-    let lower = inner.to_lowercase();
-    let first = lower
+    let first = inner
         .split_whitespace()
-        .next()
-        .unwrap_or("")
-        .trim_matches(|c: char| !c.is_alphabetic());
-    LAUGH_CUES.iter().any(|stem| first.starts_with(stem))
+        .next()?
+        .trim_matches(|c: char| !c.is_alphabetic())
+        .to_lowercase();
+    Some((inner.to_owned(), first))
+}
+
+/// Whether a cue opens with one of `verbs` in an -s, -ing or -ed form, one
+/// of `nouns`, or a bare verb standing alone: `(knocking on door)` and
+/// `(knock)` are cues, `(Knock it off)` is speech.
+fn is_cue_word(inner: &str, first: &str, verbs: &[&str], nouns: &[&str]) -> bool {
+    if nouns.contains(&first) {
+        return true;
+    }
+    let alone = inner.split_whitespace().count() == 1;
+    verbs
+        .iter()
+        .any(|v| (alone && first == *v) || verb_forms(v).iter().any(|f| f == first))
+}
+
+/// The -s, -ing and -ed forms of a regular verb, with the spelling changes
+/// the cue verbs need (`sneezing`, `cries`, `sobbing`).
+fn verb_forms(v: &str) -> Vec<String> {
+    let mut out = vec![
+        format!("{v}s"),
+        format!("{v}es"),
+        format!("{v}ing"),
+        format!("{v}ed"),
+    ];
+    if let Some(stem) = v.strip_suffix('e') {
+        out.push(format!("{stem}ing"));
+        out.push(format!("{v}d"));
+    }
+    if let Some(stem) = v.strip_suffix('y') {
+        out.push(format!("{stem}ies"));
+        out.push(format!("{stem}ied"));
+    }
+    let b = v.as_bytes();
+    if let [.., c1, vowel, last] = b {
+        let vowels = b"aeiou";
+        if !vowels.contains(c1)
+            && vowels.contains(vowel)
+            && !vowels.contains(last)
+            && !b"wxy".contains(last)
+        {
+            let last = *last as char;
+            out.push(format!("{v}{last}ing"));
+            out.push(format!("{v}{last}ed"));
+        }
+    }
+    out
 }
 
 /// A line that is only laughter, at least two beats of it: `Ha ha!`,
 /// `Hahaha`, `Heh heh`, `Ahaha!`. A lone `Ha!` is often a scoff.
 fn is_laughter(text: &str) -> bool {
+    // A question or a trailing-off is a stammer (`He... he...?`), not a laugh.
+    if text.contains(['?', '？', '…']) || text.contains("..") {
+        return false;
+    }
     let mut beats = 0usize;
     let mut words = 0usize;
     for word in text.split(|c: char| c.is_whitespace() || c == '-') {
@@ -414,18 +477,6 @@ fn laugh_beats(w: &str) -> Option<usize> {
         }
     }
     Some(n)
-}
-
-/// Whether a bracket's contents name a sound or a non-speech voice: its
-/// first word starts with a [`SOUND_CUES`] stem (`laughs`, `sighing`,
-/// `door creaks` has no stem and is not one; `knocking on door` is).
-fn is_sound_cue(inner: &str) -> bool {
-    let lower = inner.to_lowercase();
-    let Some(first) = lower.split_whitespace().next() else {
-        return false;
-    };
-    let first = first.trim_matches(|c: char| !c.is_alphabetic());
-    SOUND_CUES.iter().any(|stem| first.starts_with(stem))
 }
 
 fn has_narrator_tag(text: &str) -> bool {
@@ -778,6 +829,8 @@ mod tests {
             assert!(fx.reason.starts_with("rule=laugh"), "{}", fx.reason);
         }
         for not in [
+            "He... he...?",
+            "Ha ha?",
             "Ha!",
             "Hah",
             "Ha, very funny.",
@@ -801,6 +854,24 @@ mod tests {
         assert_eq!(intent(case("(sighs, then stops)")), Intent::Thought);
         assert_eq!(intent(case("(Laughing at me, are you?)")), Intent::Thought);
         assert_eq!(intent(case("(whispers)")), Intent::Whisper);
+        for thought in [
+            "(Knock it off!)",
+            "(Cheer up)",
+            "(Sober up)",
+            "(Ringo would know)",
+            "(Explore it)",
+        ] {
+            assert_eq!(intent(case(thought)), Intent::Thought, "{thought}");
+        }
+        for cue in [
+            "(knock)",
+            "(sobbing)",
+            "(cries)",
+            "(sneezing)",
+            "(gunshots)",
+        ] {
+            assert_ne!(intent(case(cue)), Intent::Thought, "{cue}");
+        }
     }
 
     #[test]
