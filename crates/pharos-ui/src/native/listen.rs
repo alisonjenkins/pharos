@@ -1373,7 +1373,7 @@ mod tests {
     #[test]
     fn the_queue_starts_closed_beside_the_lyrics_toggle_with_its_count() {
         let queue = vec![
-            entry(1, "Angel", Source::Album),
+            entry(1, "Alpha", Source::Album),
             entry(2, "Inertia Creeps", Source::Added),
         ];
         let mut dom = VirtualDom::new_with_props(
@@ -1429,7 +1429,7 @@ mod tests {
     fn the_queue_panel_lists_each_song_with_its_controls() {
         let html = render_panel(
             vec![
-                entry(1, "Angel", Source::Album),
+                entry(1, "Alpha", Source::Album),
                 entry(2, "Inertia Creeps", Source::Added),
             ],
             true,
@@ -1440,9 +1440,9 @@ mod tests {
         assert!(html.contains(r#"data-source="added""#), "{html}");
         assert!(html.contains("3:07"), "{html}");
         for label in [
-            "Move Angel up",
-            "Move Angel down",
-            "Remove Angel from the queue",
+            "Move Alpha up",
+            "Move Alpha down",
+            "Remove Alpha from the queue",
             "Remove Inertia Creeps from the queue",
         ] {
             assert!(
@@ -1452,7 +1452,7 @@ mod tests {
         }
         // The first cannot go up, the last cannot go down.
         let up = html
-            .split_once(r#"aria-label="Move Angel up""#)
+            .split_once(r#"aria-label="Move Alpha up""#)
             .map(|(_, rest)| rest.split_once('>').map_or("", |(t, _)| t))
             .expect("move up");
         assert!(up.contains("disabled"), "{up}");

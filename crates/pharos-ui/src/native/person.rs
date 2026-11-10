@@ -458,7 +458,7 @@ mod tests {
             name: "Jane Lead".into(),
             image_url: Some("/Items/p/Images/Primary?tag=t".into()),
             films: vec![Appearance {
-                item: item(ItemRef::Real(1), ItemKind::Movie, "Alien"),
+                item: item(ItemRef::Real(1), ItemKind::Movie, "Film AX"),
                 character: "Ripley".into(),
                 kind: CreditKind::Actor,
             }],

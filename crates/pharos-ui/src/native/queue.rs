@@ -909,10 +909,10 @@ mod tests {
         );
         let film = Item {
             kind: ItemKind::Movie,
-            name: "Heat".to_owned(),
+            name: "Film BB".to_owned(),
             ..item(5)
         };
-        assert_eq!(Track::video(&film).name, "Heat");
+        assert_eq!(Track::video(&film).name, "Film BB");
         assert!(video_kind(ItemKind::Movie) && video_kind(ItemKind::Episode));
         assert!(!video_kind(ItemKind::Audio) && !video_kind(ItemKind::Series));
     }
