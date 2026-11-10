@@ -811,7 +811,7 @@ mod tests {
         use metrics_util::debugging::{DebugValue, DebuggingRecorder};
         let tmp = tempfile::tempdir().unwrap();
         let cache = image_cache(tmp.path());
-        let src = Path::new("/m/fringe.mkv");
+        let src = Path::new("/m/show-aw.mkv");
         let recorder = DebuggingRecorder::new();
         let snapshotter = pharos_test_metrics::snapshotter(&recorder);
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -878,7 +878,7 @@ mod tests {
     async fn a_complete_manifest_on_disk_is_served_without_extracting() {
         let tmp = tempfile::tempdir().unwrap();
         let cache = image_cache(tmp.path());
-        let src = Path::new("/m/fringe.mkv");
+        let src = Path::new("/m/show-aw.mkv");
         let dir = cache.image_dir(src, 7, 0).unwrap();
         tokio::fs::create_dir_all(&dir).await.unwrap();
         tokio::fs::write(dir.join("manifest.json"), br#"{"complete":true}"#)
