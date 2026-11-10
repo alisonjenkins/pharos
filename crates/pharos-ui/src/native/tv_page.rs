@@ -689,6 +689,33 @@ pub fn unwatch_sentinel_js(watch: u64) -> String {
 mod tests {
     use super::*;
 
+    /// B1323 / V1294: the TV's activity handles every configuration change
+    /// a TV makes while the app runs; one it does not list recreates the
+    /// NativeActivity, which comes back to a dark window with no page.
+    #[test]
+    fn the_tv_manifest_keeps_the_activity_through_config_changes() {
+        let manifest = include_str!("../../android/AndroidManifest.xml");
+        let changes = manifest
+            .split("android:configChanges=\"")
+            .nth(1)
+            .and_then(|r| r.split('"').next())
+            .unwrap_or_default();
+        let listed: Vec<&str> = changes.split('|').collect();
+        for change in [
+            "density",
+            "keyboard",
+            "keyboardHidden",
+            "navigation",
+            "orientation",
+            "screenLayout",
+            "screenSize",
+            "smallestScreenSize",
+            "uiMode",
+        ] {
+            assert!(listed.contains(&change), "{change} missing from {changes}");
+        }
+    }
+
     #[test]
     fn a_paths_search_is_its_query() {
         assert_eq!(
