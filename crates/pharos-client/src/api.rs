@@ -706,6 +706,25 @@ pub trait PlaybackGrant {
         playing: TrackPicks,
     ) -> Result<(), ClientError>;
     async fn stop(&self, call: &CallInfo, position_ms: u64) -> Result<(), ClientError>;
+    /// What this playback waits behind on the server's encoders, asked while
+    /// a start, seek or buffer waits (038 FR-402). A grant that cannot say
+    /// answers that nothing is queued.
+    async fn queue_hint(&self, _call: &CallInfo) -> Result<QueueHint, ClientError> {
+        Ok(QueueHint::default())
+    }
+}
+
+/// [`PlaybackGrant::queue_hint`]'s answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct QueueHint {
+    /// This playback's requests waiting for an encoder.
+    pub queued: u32,
+    /// How long the oldest of them has waited.
+    pub waited_ms: u64,
+    /// Other viewers' requests waiting too.
+    pub others_queued: u32,
+    /// Every encoder is running at capacity.
+    pub busy: bool,
 }
 
 /// A device the signed-in user is signed in on, from [`NativeApi::my_devices`].
@@ -1881,6 +1900,25 @@ impl PlaybackGrant for NativeGrant {
         }
         let reply = req.send().promise.await?;
         crate::read_done(reply.get()?.get_result()?)
+    }
+
+    async fn queue_hint(&self, call: &CallInfo) -> Result<QueueHint, ClientError> {
+        use pharos_api::pharos_capnp::queue_hint_result;
+        let mut req = self.0.queue_hint_request();
+        call.write(req.get().init_ctx());
+        let reply = req.send().promise.await?;
+        match reply.get()?.get_result()?.which().map_err(capnp::Error::from)? {
+            queue_hint_result::Hint(h) => {
+                let h = h?;
+                Ok(QueueHint {
+                    queued: h.get_queued(),
+                    waited_ms: h.get_waited_ms(),
+                    others_queued: h.get_others_queued(),
+                    busy: h.get_busy(),
+                })
+            }
+            queue_hint_result::Error(e) => Err(ClientError::from_api(e?)),
+        }
     }
 }
 
