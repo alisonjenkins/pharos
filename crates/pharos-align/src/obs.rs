@@ -11,6 +11,10 @@ use tracing_subscriber::EnvFilter;
 pub const SONGS_TOTAL: &str = "pharos_aligner_songs_total";
 /// Wall time of one song, the wait for the lock included.
 pub const SONG_SECONDS: &str = "pharos_aligner_song_seconds";
+/// Wall time of one forward pass, by `device` (`cpu`, `vulkan`).
+pub const FORWARD_SECONDS: &str = "pharos_aligner_forward_seconds";
+/// A GPU window takes tens of milliseconds, a batched CPU pass seconds.
+const FORWARD_BUCKETS: &[f64] = &[0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0];
 /// A song takes seconds to minutes on the CPU.
 const SONG_BUCKETS: &[f64] = &[1.0, 2.5, 5.0, 10.0, 20.0, 30.0, 60.0, 120.0, 300.0, 600.0];
 
@@ -121,6 +125,9 @@ impl Metrics {
     pub fn install() -> Result<Self, String> {
         let handle = PrometheusBuilder::new()
             .set_buckets_for_metric(Matcher::Full(SONG_SECONDS.into()), SONG_BUCKETS)
+            .and_then(|b| {
+                b.set_buckets_for_metric(Matcher::Full(FORWARD_SECONDS.into()), FORWARD_BUCKETS)
+            })
             .and_then(PrometheusBuilder::install_recorder)
             .map_err(|e| format!("prometheus recorder: {e}"))?;
         let process = metrics_process::Collector::default();
@@ -134,6 +141,11 @@ impl Metrics {
             SONG_SECONDS,
             metrics::Unit::Seconds,
             "Wall time of one song"
+        );
+        metrics::describe_histogram!(
+            FORWARD_SECONDS,
+            metrics::Unit::Seconds,
+            "Wall time of one forward pass, by device"
         );
         Ok(Self { handle, process })
     }

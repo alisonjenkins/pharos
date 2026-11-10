@@ -238,10 +238,37 @@ fn batched_probes_align_as_they_do_alone() {
         batch_samples: pharos_align::config::DEFAULT_BATCH_SAMPLES,
         reason: "forced_cpu".into(),
     };
+    let recorder = metrics_util::debugging::DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+    // Taking a snapshot drains the histogram, so each one counts one run.
+    let passes = || {
+        snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .find(|(k, ..)| {
+                k.key().name() == pharos_align::obs::FORWARD_SECONDS
+                    && k.key()
+                        .labels()
+                        .any(|l| l.key() == "device" && l.value() == "cpu")
+            })
+            .map_or(0, |(.., v)| match v {
+                metrics_util::debugging::DebugValue::Histogram(h) => h.len(),
+                _ => 0,
+            })
+    };
     let together = synthetic_song(&mut batched);
+    let batched_passes = passes();
     batched.batch_samples = 1;
     let alone = synthetic_song(&mut batched);
     assert_eq!(together, alone);
+    // Every pass lands in pharos_aligner_forward_seconds{device="cpu"}.
+    let alone_passes = passes();
+    assert!(
+        batched_passes >= 1 && alone_passes > batched_passes,
+        "forward passes timed: {batched_passes} batched, {alone_passes} alone"
+    );
 }
 
 #[test]
