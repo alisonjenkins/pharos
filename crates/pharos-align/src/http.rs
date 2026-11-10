@@ -110,6 +110,7 @@ async fn align(
         aligner.model_ms = tracing::field::Empty,
         aligner.device = tracing::field::Empty,
         aligner.device_reason = tracing::field::Empty,
+        aligner.rss_mib = tracing::field::Empty,
     );
     set_remote_parent(&span, req.headers());
     let fail = |status: StatusCode, message: String| {
@@ -166,7 +167,10 @@ fn run_song(
     let elapsed = started.elapsed();
     let duration_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
     metrics::histogram!(SONG_SECONDS).record(elapsed.as_secs_f64());
+    // 0 where /proc cannot be read, so the field is always there to query.
+    let rss_mib = crate::obs::rss_mib().unwrap_or(0);
     let span = tracing::Span::current();
+    span.record("aligner.rss_mib", rss_mib);
     let outcome = match &result {
         Ok(a) => {
             span.record("aligner.offset_ms", a.answer.offset_ms);
@@ -185,6 +189,7 @@ fn run_song(
                 model_ms = a.phases.model_ms(),
                 device = %device,
                 device_reason = %device_reason,
+                rss_mib,
                 "song aligned"
             );
             "ok"
@@ -204,6 +209,7 @@ fn run_song(
                 duration_ms,
                 device = %device,
                 device_reason = %device_reason,
+                rss_mib,
                 error = %e,
                 "song failed"
             );
