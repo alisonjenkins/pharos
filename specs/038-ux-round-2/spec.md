@@ -357,8 +357,9 @@ learn that a guess is getting closer to a password.
   there is no notion of a near match.
 - Sign-out, password change, user disable or delete and a policy edit drop the
   entry at once; the time to live is a backstop, not the revocation mechanism.
-- It ships with a test that a wrong password, an unknown user and a revoked
-  token are indistinguishable in status, body and headers, before and after.
+- It ships with a test that a wrong password and an unknown user get the same
+  status, body and headers as each other, and that each refusal, including a
+  revoked token, is the same with the cache as without it.
 - A review of response timing on the sign-in path is part of the change, with
   the result written into its ADR.
 
