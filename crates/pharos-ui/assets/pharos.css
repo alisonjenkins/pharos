@@ -6313,6 +6313,11 @@ body:has(.pharos-reader) {
 .pharos-reader-progress-label {
   position: relative;
 }
+.pharos-reader-offline {
+  position: relative;
+  margin-right: auto;
+  color: var(--px-color-fg-muted);
+}
 .pharos-reader-note {
   position: absolute;
   inset: 3rem 0 2rem;
