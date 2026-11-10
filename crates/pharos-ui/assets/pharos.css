@@ -362,6 +362,35 @@ input:focus-visible {
   overflow-x: auto;
   scrollbar-width: none;
 }
+
+/* B1314/V1285: with room for it (a desktop, a TV), the brand, the library
+   tabs and the search and links share one row, so the page starts a row
+   higher. A narrower screen keeps them on rows of their own. */
+@media (min-width: 64rem) {
+  .pharos-shell {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr) auto;
+    align-items: center;
+    column-gap: 1.5rem;
+  }
+  .pharos-shell .pharos-shell-bar {
+    display: contents;
+  }
+  .pharos-shell .pharos-brand {
+    grid-area: 1 / 1;
+  }
+  .pharos-shell .pharos-library-nav {
+    grid-area: 1 / 2;
+    margin-block: -12px;
+  }
+  .pharos-shell .pharos-shell-nav {
+    grid-area: 1 / 3;
+    flex: none;
+  }
+  .pharos-shell .pharos-crumbs {
+    grid-column: 1 / -1;
+  }
+}
 .pharos-library-tab {
   flex: none;
   padding: 0.35rem 0.9rem;
@@ -7180,6 +7209,34 @@ body:has(.pharos-reader) {
   overflow-wrap: anywhere;
 }
 
+/* B1314: a TV (960 CSS px wide) gets the one-row bar too, with a shorter
+   search box so the library tabs keep their room. */
+:root[data-device="tv"] .pharos-shell {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  column-gap: 1.25rem;
+}
+:root[data-device="tv"] .pharos-shell .pharos-shell-bar {
+  display: contents;
+}
+:root[data-device="tv"] .pharos-shell .pharos-brand {
+  grid-area: 1 / 1;
+}
+:root[data-device="tv"] .pharos-shell .pharos-library-nav {
+  grid-area: 1 / 2;
+  margin-block: -12px;
+}
+:root[data-device="tv"] .pharos-shell .pharos-shell-nav {
+  grid-area: 1 / 3;
+  flex: none;
+}
+:root[data-device="tv"] .pharos-shell .pharos-search {
+  flex-basis: 10rem;
+}
+:root[data-device="tv"] .pharos-shell .pharos-crumbs {
+  grid-column: 1 / -1;
+}
 /* B1311: the filter row and its sheet on a TV: smaller pills, and the
    sheet's content inside the title-safe area. */
 :root[data-device="tv"] .pharos-filters {
