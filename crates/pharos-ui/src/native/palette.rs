@@ -215,6 +215,7 @@ mod tests {
             artist: None,
             stereo: None,
             damaged: false,
+            new_children: 0,
         }
     }
 
