@@ -440,9 +440,21 @@ pub async fn auto_keep(
         ));
         return false;
     }
-    if read().is_some_and(|s| !s.is_for(user)) {
+    // The record is checked before any bytes go in: bytes it cannot list
+    // would sit outside eviction for good.
+    let before = match read_checked() {
+        Ok(store) => store,
+        Err(()) => {
+            platform::warn(&format!(
+                "pharos: kept auto skipped item={id} bytes={size} why=the kept record is unreadable"
+            ));
+            return false;
+        }
+    };
+    if before.as_ref().is_some_and(|s| !s.is_for(user)) {
         clear_all("another user").await;
     }
+    let was_kept = before.is_some_and(|s| s.is_for(user) && s.find(&id.to_string()).is_some());
     let key = book_key(id);
     let stored = async {
         let response =
@@ -468,6 +480,11 @@ pub async fn auto_keep(
             platform::warn(&format!(
                 "pharos: kept auto failed item={id} bytes={size} error=record unreadable"
             ));
+            // The bytes just cached are listed nowhere; a copy kept before
+            // stays, as the record will still list it once it reads again.
+            if !was_kept {
+                forget_cached(user, &key).await;
+            }
             return false;
         }
     };
@@ -500,6 +517,21 @@ pub async fn auto_keep(
         store.total_bytes()
     ));
     true
+}
+
+/// Deletes one cached book's bytes, logging a failure.
+async fn forget_cached(user: &str, key: &str) {
+    let deleted = async {
+        let cache = open_cache(user).await?;
+        JsFuture::from(cache.delete_with_str(key))
+            .await
+            .map_err(|e| describe(&e))
+    };
+    if let Err(e) = deleted.await {
+        platform::warn(&format!(
+            "pharos: kept auto cleanup failed key={key} error={e}"
+        ));
+    }
 }
 
 /// Removes a kept book from the device: its bytes and its record.
