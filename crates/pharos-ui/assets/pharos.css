@@ -5725,7 +5725,8 @@ body:has(.pharos-stage.is-mini) .pharos-main {
   margin-inline-start: auto;
 }
 
-.pharos-check-match {
+.pharos-check-match,
+.pharos-fix-identity {
   justify-self: start;
   text-decoration: none;
 }
