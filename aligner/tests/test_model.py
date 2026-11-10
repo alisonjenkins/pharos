@@ -96,6 +96,37 @@ def test_idle_unload_secs_rejects_negative() -> None:
         idle_unload_secs("-1")
 
 
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [(None, 8), ("", 8), ("  ", 8), ("1", 1), ("16", 16)],
+)
+def test_torch_threads_parses_the_environment(raw: str | None, expected: int) -> None:
+    from pharos_aligner.server import torch_threads
+
+    assert torch_threads(raw) == expected
+
+
+@pytest.mark.parametrize("raw", ["0", "-2", "four"])
+def test_torch_threads_rejects_values_that_are_not_a_positive_count(raw: str) -> None:
+    from pharos_aligner.server import torch_threads
+
+    with pytest.raises(ValueError):
+        torch_threads(raw)
+
+
+def test_set_threads_caps_torch() -> None:
+    import torch
+
+    from pharos_aligner.model import set_threads
+
+    before = torch.get_num_threads()
+    try:
+        set_threads(3)
+        assert torch.get_num_threads() == 3
+    finally:
+        torch.set_num_threads(before)
+
+
 def test_freed_memory_is_trimmed_even_where_find_library_finds_nothing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

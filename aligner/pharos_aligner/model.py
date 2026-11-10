@@ -46,6 +46,11 @@ def _anon_mib() -> int | None:
     return None
 
 
+def set_threads(n: int) -> None:
+    """Cap the threads torch runs each op on."""
+    torch.set_num_threads(n)
+
+
 class Aligner:
     """Lazy-loaded multilingual forced aligner using torchaudio MMS_FA.
 
