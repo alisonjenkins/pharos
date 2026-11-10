@@ -4,7 +4,7 @@
 
 use dioxus::prelude::*;
 
-use super::playback::{EffectsLevel, LibraryTransition, OverlayEffect};
+use super::playback::{EffectsDetail, EffectsLevel, LibraryTransition, OverlayEffect};
 use super::settings::Choices;
 use crate::theme::slug;
 use crate::theme::value::{
@@ -122,6 +122,8 @@ pub fn AppearanceView(
     #[props(default)] on_effects_level: EventHandler<EffectsLevel>,
     #[props(default)] speaker_colours: bool,
     #[props(default)] on_speaker_colours: EventHandler<bool>,
+    #[props(default)] effects_detail: EffectsDetail,
+    #[props(default)] on_effects_detail: EventHandler<EffectsDetail>,
     on_pick: EventHandler<String>,
     on_auto: EventHandler<()>,
     on_customise: EventHandler<String>,
@@ -153,6 +155,10 @@ pub fn AppearanceView(
     let levels = EffectsLevel::ALL
         .iter()
         .map(|level| (level.as_str().to_owned(), level.label().to_owned()))
+        .collect::<Vec<_>>();
+    let details = EffectsDetail::ALL
+        .iter()
+        .map(|d| (d.as_str().to_owned(), d.label().to_owned()))
         .collect::<Vec<_>>();
     let switch = vec![
         ("off".to_owned(), "Off".to_owned()),
@@ -472,6 +478,22 @@ pub fn AppearanceView(
                         on_pick: move |value: String| on_effects_level.call(EffectsLevel::parse(&value)),
                     }
                 }
+                div { class: "pharos-setting pharos-effects-detail",
+                    div { class: "pharos-setting-text",
+                        p { class: "pharos-setting-name", id: "effects-detail-label", "Effects detail" }
+                        p { id: "effects-detail-help", class: "pharos-setting-help",
+                            "Auto gives a TV or phone a lighter set of effects. Rich asks for every effect a desktop draws, and steps back down by itself if the video starts dropping frames. Saved on this device."
+                        }
+                    }
+                    Choices {
+                        id: "effects-detail",
+                        labelled_by: "effects-detail-label",
+                        described_by: "effects-detail-help".to_owned(),
+                        options: details,
+                        selected: effects_detail.as_str().to_owned(),
+                        on_pick: move |value: String| on_effects_detail.call(EffectsDetail::parse(&value)),
+                    }
+                }
                 div { class: "pharos-setting pharos-speaker-colours",
                     div { class: "pharos-setting-text",
                         p { class: "pharos-setting-name", id: "speaker-colours-label", "Speaker colours" }
@@ -762,6 +784,46 @@ mod tests {
             start_tag(group, "id=\"effects-level-subtle\"").contains("aria-pressed=\"true\""),
             "{group}"
         );
+    }
+
+    #[test]
+    fn effects_detail_presses_only_the_stored_choice() {
+        for detail in EffectsDetail::ALL {
+            let html = render(move || {
+                rsx! {
+                    AppearanceView {
+                        themes: Vec::new(),
+                        auto: false,
+                        editor: None,
+                        notice: None,
+                        effects_detail: detail,
+                        on_pick: |_| {},
+                        on_auto: |_| {},
+                        on_customise: |_| {},
+                        on_edit_custom: |_| {},
+                        on_delete: |_| {},
+                        on_export: |_| {},
+                        on_import_file: |_| {},
+                        on_import_paste: |_| {},
+                        on_edit: |_| {},
+                        on_save: |_| {},
+                        on_cancel: |_| {},
+                    }
+                }
+            });
+            let start = html.find("id=\"effects-detail\"").unwrap_or(html.len());
+            let end = html[start..]
+                .find("</div>")
+                .map_or(html.len(), |e| start + e);
+            let group = &html[start..end];
+            assert_eq!(group.matches("aria-pressed=\"true\"").count(), 1, "{group}");
+            let pressed = format!("id=\"effects-detail-{}\"", detail.as_str());
+            assert!(
+                start_tag(group, &pressed).contains("aria-pressed=\"true\""),
+                "{group}"
+            );
+            assert!(html.contains("Effects detail"), "{html}");
+        }
     }
 
     #[test]
