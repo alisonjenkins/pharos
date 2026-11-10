@@ -1777,12 +1777,42 @@ body:has(.pharos-stage.is-full) .pharos-status-note {
   color: inherit;
   font: inherit;
 }
-.pharos-activity-toast {
+/* What is happening in the group, stacked under the top bar and outside the
+   chrome, so it shows whether or not the controls are up (spec 038 G5). */
+.pharos-watch-notes {
   position: absolute;
   left: 50%;
   top: 4.5rem;
   transform: translateX(-50%);
-  max-width: 90%;
+  /* Not shrink-to-fit from the centre line, which wraps at half the width. */
+  width: max-content;
+  max-width: min(90%, 40rem);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.4rem;
+  pointer-events: none;
+}
+.pharos-watch-note,
+.pharos-wait-pill {
+  margin: 0;
+  padding: 0.4rem 0.9rem;
+  border-radius: 6px;
+  background: rgb(0 0 0 / 0.65); /* not themed: notes sit on the video, whose colours no theme sets */
+  color: #fff; /* not themed: notes sit on the video, whose colours no theme sets */
+}
+.pharos-wait-pill {
+  border-radius: 999px;
+}
+.pharos-leave-undo .pharos-button {
+  pointer-events: auto;
+  margin-left: 0.5rem;
+}
+/* The player says the connection is down itself (FR-503). */
+body:has(.pharos-stage.is-full) .pharos-connection-shell {
+  display: none;
+}
+.pharos-activity-toast {
   padding: 0.4rem 0.9rem;
   border-radius: 6px;
   background: rgb(0 0 0 / 0.65); /* not themed: controls sit on the video, whose colours no theme sets */
