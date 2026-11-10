@@ -853,6 +853,53 @@ async fn next_up_picks_the_first_unplayed_episode_of_each_visible_series() {
     assert_eq!(ids(a), [402]);
 }
 
+fn next_up_count(snap: &pharos_test_metrics::CumulativeSnapshotter, outcome: &str) -> u64 {
+    use metrics_util::debugging::DebugValue;
+    snap.snapshot()
+        .into_vec()
+        .into_iter()
+        .filter(|(ck, ..)| {
+            ck.key().name() == "pharos_next_up_total"
+                && ck
+                    .key()
+                    .labels()
+                    .any(|l| l.key() == "outcome" && l.value() == outcome)
+        })
+        .map(|(.., v)| match v {
+            DebugValue::Counter(n) => n,
+            _ => 0,
+        })
+        .sum()
+}
+
+/// Spec 038 T038-101: each Next Up listing is counted by outcome.
+/// Disarm check: with `NextUpOutcome::record` a no-op, both counts read 0.
+#[actix_web::test]
+async fn next_up_is_counted_by_outcome() {
+    let fx = seed_rich().await;
+    let user = pharos_server::services::auth::user_for_token(&fx.state.stores, &fx.user_token)
+        .await
+        .unwrap();
+    let recorder = metrics_util::debugging::DebuggingRecorder::new();
+    let snap = pharos_test_metrics::snapshotter(&recorder);
+    let _metrics = metrics::set_default_local_recorder(&recorder);
+
+    seed_shows(&fx).await;
+    let some = library::next_up(&fx.state, &user, None, None)
+        .await
+        .unwrap();
+    assert!(!some.items.is_empty());
+    assert_eq!(next_up_count(&snap, "listed"), 1);
+
+    let unknown = pharos_jellyfin_api::dto::series_id_for_key(Some("/libA/Nothing"), "Nothing");
+    let none = library::next_up(&fx.state, &user, Some(&unknown), None)
+        .await
+        .unwrap();
+    assert!(none.items.is_empty());
+    assert_eq!(next_up_count(&snap, "empty"), 1);
+    assert_eq!(next_up_count(&snap, "error"), 0);
+}
+
 /// `Library.nextUp` on `session`, as its total and items.
 async fn wire_next_up(session: &session::Client, limit: u32) -> (u32, Vec<serde_json::Value>) {
     let library = session.library_request().send().pipeline.get_library();
