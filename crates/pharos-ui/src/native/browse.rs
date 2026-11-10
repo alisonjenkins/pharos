@@ -2223,52 +2223,147 @@ fn EpisodeMark(id: ItemRef, label: String, played: bool) -> Element {
 
 /// Which list a music library shows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MusicTab {
+pub enum MusicTab {
     Artists,
     Albums,
     /// The mixes the listener can start (B901/V850).
     Playlists,
 }
 
+impl MusicTab {
+    pub const ALL: [Self; 3] = [Self::Artists, Self::Albums, Self::Playlists];
+
+    /// Its `tab=` value in the URL.
+    pub fn token(self) -> &'static str {
+        match self {
+            Self::Artists => "artists",
+            Self::Albums => "albums",
+            Self::Playlists => "playlists",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Artists => "Artists",
+            Self::Albums => "Albums",
+            Self::Playlists => "Playlists",
+        }
+    }
+
+    /// The tab button's `id`, which an arrow key focuses.
+    fn id(self) -> &'static str {
+        match self {
+            Self::Artists => "pharos-music-tab-artists",
+            Self::Albums => "pharos-music-tab-albums",
+            Self::Playlists => "pharos-music-tab-playlists",
+        }
+    }
+
+    /// The tab an arrow key, Home or End moves to from this one, wrapping
+    /// at either end; `None` for any other key.
+    pub fn stepped(self, key: &Key) -> Option<Self> {
+        let at = Self::ALL.iter().position(|t| *t == self)?;
+        let last = Self::ALL.len() - 1;
+        let to = match key {
+            Key::Named(NamedKey::ArrowRight) => (at + 1) % Self::ALL.len(),
+            Key::Named(NamedKey::ArrowLeft) => at.checked_sub(1).unwrap_or(last),
+            Key::Named(NamedKey::Home) => 0,
+            Key::Named(NamedKey::End) => last,
+            _ => return None,
+        };
+        Self::ALL.get(to).copied()
+    }
+}
+
+/// A music library's URL query, `?` included: the tab, and on Albums its
+/// order (FR-203, FR-204). Empty for Artists, the tab it opens on.
+pub fn music_query(tab: MusicTab, albums: &Narrow) -> String {
+    match tab {
+        MusicTab::Artists => String::new(),
+        MusicTab::Playlists => "?tab=playlists".to_owned(),
+        MusicTab::Albums => {
+            let order = Narrow {
+                order: albums.order,
+                descending: albums.descending,
+                ..Narrow::default()
+            }
+            .to_query();
+            match order.strip_prefix('?') {
+                Some(rest) => format!("?tab=albums&{rest}"),
+                None => "?tab=albums".to_owned(),
+            }
+        }
+    }
+}
+
+/// The tab and album order a music library's URL query names; anything
+/// missing or unknown keeps the default.
+pub fn music_choice(query: &str) -> (MusicTab, Narrow) {
+    let tab = query
+        .trim_start_matches('?')
+        .split('&')
+        .find_map(|pair| pair.strip_prefix("tab="))
+        .and_then(|t| MusicTab::ALL.into_iter().find(|tab| tab.token() == t))
+        .unwrap_or(MusicTab::Artists);
+    let named = Narrow::from_query(query);
+    let order = Narrow {
+        order: named.order,
+        descending: named.descending,
+        ..Narrow::default()
+    };
+    (tab, order)
+}
+
 /// A music library: its artists, its albums or its playlists, switched by
-/// tabs.
+/// tabs that take the arrow keys. The tab and the albums' order are kept in
+/// the URL, so Back returns to them (FR-204); both grids jump by letter, or
+/// by year in a date order, as a film or TV library's does (FR-203).
 #[component]
 pub fn MusicLibraryView(title: String, library: ItemRef, artists: Page, albums: Page) -> Element {
-    let mut tab = use_signal(|| MusicTab::Artists);
-    let tab_class = move |t| {
-        if tab() == t {
-            "pharos-tab pharos-tab-active"
+    let opened = use_hook(|| {
+        if Route::parse(&platform::current_path()) == Route::Browse(library) {
+            music_choice(&platform::current_search())
         } else {
-            "pharos-tab"
+            (MusicTab::Artists, Narrow::default())
         }
-    };
+    });
+    let mut tab = use_signal(|| opened.0);
+    let order = use_signal(|| opened.1.clone());
+    use_effect(move || {
+        let query = music_query(tab(), &order.read());
+        let here = Route::parse(&platform::current_path()) == Route::Browse(library);
+        if here && platform::current_search() != query {
+            platform::replace(&format!("{}{query}", Route::Browse(library).path()));
+        }
+    });
     rsx! {
         section { class: "pharos-browse pharos-music",
             h2 { "{title}" }
-            div { class: "pharos-tabs", role: "tablist",
-                button {
-                    r#type: "button",
-                    role: "tab",
-                    class: tab_class(MusicTab::Artists),
-                    aria_selected: tab() == MusicTab::Artists,
-                    onclick: move |_| tab.set(MusicTab::Artists),
-                    "Artists"
-                }
-                button {
-                    r#type: "button",
-                    role: "tab",
-                    class: tab_class(MusicTab::Albums),
-                    aria_selected: tab() == MusicTab::Albums,
-                    onclick: move |_| tab.set(MusicTab::Albums),
-                    "Albums"
-                }
-                button {
-                    r#type: "button",
-                    role: "tab",
-                    class: tab_class(MusicTab::Playlists),
-                    aria_selected: tab() == MusicTab::Playlists,
-                    onclick: move |_| tab.set(MusicTab::Playlists),
-                    "Playlists"
+            div {
+                class: "pharos-tabs",
+                role: "tablist",
+                aria_label: "Music",
+                "data-key-tabs": "music",
+                onkeydown: move |e: KeyboardEvent| {
+                    if let Some(next) = tab().stepped(&e.key()) {
+                        e.prevent_default();
+                        tab.set(next);
+                        platform::focus_by_id(next.id());
+                    }
+                },
+                for t in MusicTab::ALL {
+                    button {
+                        key: "{t.token()}",
+                        r#type: "button",
+                        role: "tab",
+                        id: t.id(),
+                        class: if tab() == t { "pharos-tab pharos-tab-active" } else { "pharos-tab" },
+                        aria_selected: tab() == t,
+                        // One stop in the tab order; the arrows move along.
+                        tabindex: if tab() == t { "0" } else { "-1" },
+                        onclick: move |_| tab.set(t),
+                        "{t.label()}"
+                    }
                 }
             }
             // Each tab pages through its own listing (B821); switching tabs
@@ -2280,7 +2375,7 @@ pub fn MusicLibraryView(title: String, library: ItemRef, artists: Page, albums: 
                         PagedGrid {
                             first: artists.clone(),
                             source: Listing::of(library, Some(ItemKind::Artist), "SortName"),
-                            rail: None,
+                            rail: Some(Rail::Letters),
                             square: Some(true),
                         }
                     },
@@ -2288,16 +2383,64 @@ pub fn MusicLibraryView(title: String, library: ItemRef, artists: Page, albums: 
                 MusicTab::Playlists => rsx! { mixes::MixShelf {} },
                 MusicTab::Albums => remount_on(
                     "albums",
-                    rsx! {
-                        PagedGrid {
-                            first: albums.clone(),
-                            source: Listing::of(library, Some(ItemKind::Album), "SortName"),
-                            rail: None,
-                            square: Some(true),
-                        }
-                    },
+                    rsx! { MusicAlbums { library, first: albums.clone(), order } },
                 ),
             }
+        }
+    }
+}
+
+/// A music library's albums in the order chosen, with their sort controls.
+/// The albums by name were fetched with the page; any other order is
+/// fetched here, and a new order starts the grid afresh.
+#[component]
+fn MusicAlbums(library: ItemRef, first: Page, order: Signal<Narrow>) -> Element {
+    let ctx = use_context::<Ctx>();
+    let base = Listing::of(library, Some(ItemKind::Album), "SortName");
+    let listed = use_resource(move || {
+        let listing = order.read().apply(&base);
+        let fresh = *order.read() != Narrow::default();
+        let first = first.clone();
+        async move {
+            if !fresh {
+                return Ok((listing, first));
+            }
+            let Some(api) = ctx.api.peek().clone() else {
+                return Err("not signed in".to_owned());
+            };
+            fetch_more(
+                &api,
+                call,
+                &listing,
+                0,
+                BROWSE_PAGE,
+                |line| platform::warn(&line),
+                platform::report_event,
+            )
+            .await
+            .map(|page| (listing, page))
+            .map_err(|e| e.to_string())
+        }
+    });
+    let rail = order.read().rail();
+    rsx! {
+        div { class: "pharos-filters", role: "group", aria_label: "Sort albums",
+            SortControls { narrow: order }
+        }
+        match &*listed.read() {
+            None => rsx! { p { class: "pharos-muted", "Loading…" } },
+            Some(Err(e)) => rsx! { p { class: "pharos-error", role: "alert", "Couldn't load the albums: {e}" } },
+            Some(Ok((listing, page))) => remount_on(
+                &format!("{listing:?}"),
+                rsx! {
+                    PagedGrid {
+                        first: page.clone(),
+                        source: listing.clone(),
+                        rail: Some(rail),
+                        square: Some(true),
+                    }
+                },
+            ),
         }
     }
 }
@@ -3382,6 +3525,94 @@ mod tests {
         assert!(html.contains("data-target=\"episode_row\""), "{html}");
         let bare = render(move || rsx! { EpisodeRow { episode: ep.clone() } });
         assert!(!bare.contains("pharos-episode-more"), "{bare}");
+    }
+
+    /// FR-204: the tab and the albums' order round-trip through the URL;
+    /// Artists in name order keeps the bare URL.
+    #[test]
+    fn a_music_library_keeps_its_tab_and_album_order_in_the_url() {
+        let plain = Narrow::default();
+        assert_eq!(music_query(MusicTab::Artists, &plain), "");
+        assert_eq!(music_query(MusicTab::Playlists, &plain), "?tab=playlists");
+        assert_eq!(music_query(MusicTab::Albums, &plain), "?tab=albums");
+        let newest = plain.ordered(Order::Released);
+        assert_eq!(
+            music_query(MusicTab::Albums, &newest),
+            "?tab=albums&sort=released"
+        );
+        assert_eq!(
+            music_choice("?tab=albums&sort=released"),
+            (MusicTab::Albums, newest.clone())
+        );
+        assert_eq!(music_choice(""), (MusicTab::Artists, Narrow::default()));
+        assert_eq!(
+            music_choice("?tab=nonsense&genre=Rock"),
+            (MusicTab::Artists, Narrow::default())
+        );
+        for tab in MusicTab::ALL {
+            assert_eq!(music_choice(&music_query(tab, &newest)).0, tab);
+        }
+    }
+
+    /// FR-204: the arrows, Home and End move along the tabs, wrapping.
+    #[test]
+    fn music_tabs_step_by_arrow_key() {
+        let key = |k| Key::Named(k);
+        assert_eq!(
+            MusicTab::Artists.stepped(&key(NamedKey::ArrowRight)),
+            Some(MusicTab::Albums)
+        );
+        assert_eq!(
+            MusicTab::Artists.stepped(&key(NamedKey::ArrowLeft)),
+            Some(MusicTab::Playlists)
+        );
+        assert_eq!(
+            MusicTab::Playlists.stepped(&key(NamedKey::ArrowRight)),
+            Some(MusicTab::Artists)
+        );
+        assert_eq!(
+            MusicTab::Albums.stepped(&key(NamedKey::Home)),
+            Some(MusicTab::Artists)
+        );
+        assert_eq!(
+            MusicTab::Albums.stepped(&key(NamedKey::End)),
+            Some(MusicTab::Playlists)
+        );
+        assert_eq!(MusicTab::Albums.stepped(&Key::Character("a".into())), None);
+    }
+
+    /// FR-204: the tabs are one tab stop that the arrows, `[` and `]` step
+    /// along.
+    #[test]
+    fn a_music_library_has_keyed_tabs() {
+        #[component]
+        fn Harness() -> Element {
+            use_context_provider(|| Nav(EventHandler::new(|_: Route| {})));
+            let api = use_signal(|| None::<pharos_client::api::NativeApi>);
+            let machine = use_signal(super::super::machine::Machine::new);
+            let marks = use_signal(|| 0);
+            use_context_provider(|| Ctx {
+                api,
+                machine,
+                marks,
+            });
+            let artist = item(ItemRef::Synth(5), ItemKind::Artist, "An Artist");
+            rsx! {
+                MusicLibraryView {
+                    title: "Music".to_owned(),
+                    library: ItemRef::Real(1),
+                    artists: page(vec![artist]),
+                    albums: page(Vec::new()),
+                }
+            }
+        }
+        let mut dom = VirtualDom::new(Harness);
+        dom.rebuild_in_place();
+        let html = dioxus_ssr::render(&dom);
+        assert!(html.contains("data-key-tabs=\"music\""), "{html}");
+        assert!(html.contains("id=\"pharos-music-tab-artists\""), "{html}");
+        assert_eq!(html.matches("tabindex=\"0\"").count(), 1, "{html}");
+        assert_eq!(html.matches("tabindex=\"-1\"").count(), 2, "{html}");
     }
 
     #[test]
