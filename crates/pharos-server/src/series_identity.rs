@@ -121,6 +121,31 @@ pub(crate) fn record_episode_rejected(reason: EpisodeRejectReason) {
     .increment(1);
 }
 
+/// A step a show's re-match took beyond a plain search (B990). A metric
+/// label (`pharos_series_identity_repair_rematch_total{step}`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RematchStep {
+    /// A search narrowed by the year found nothing and was asked again
+    /// without it.
+    YearRetry,
+}
+
+impl RematchStep {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::YearRetry => "year_retry",
+        }
+    }
+}
+
+pub(crate) fn record_rematch(step: RematchStep) {
+    metrics::counter!(
+        "pharos_series_identity_repair_rematch_total",
+        "step" => step.label(),
+    )
+    .increment(1);
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -149,5 +174,9 @@ mod tests {
             "nfo_other_series"
         );
         assert_eq!(decided_by_label(None), "none");
+        let steps = [RematchStep::YearRetry];
+        let set: BTreeSet<_> = steps.iter().map(|s| s.label()).collect();
+        assert_eq!(set.len(), steps.len());
+        assert_eq!(RematchStep::YearRetry.label(), "year_retry");
     }
 }
