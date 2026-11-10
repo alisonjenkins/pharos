@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/pharos-align",
     "crates/pharos-api",
     "crates/pharos-client",
     "crates/pharos-cache",
