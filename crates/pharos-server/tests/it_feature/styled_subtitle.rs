@@ -81,6 +81,7 @@ async fn rig(sidecar_name: &str, body: &str) -> Rig {
         reason: "test".into(),
         static_only: false,
         syllables: None,
+        speaker: None,
     }];
     let (source_mtime, source_size) = signature(&item.path);
     let (sidecar_mtime, sidecar_size) = signature(&sidecar);

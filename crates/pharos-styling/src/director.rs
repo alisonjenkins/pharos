@@ -389,6 +389,7 @@ fn effect(intent: Intent, intensity: u8, reason: String) -> LineEffect {
         reason,
         static_only: false,
         syllables: None,
+        speaker: None,
     }
 }
 

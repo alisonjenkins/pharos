@@ -207,6 +207,7 @@ fn effective(
         reason: String::new(),
         static_only: false,
         syllables: None,
+        speaker: None,
     };
     let Some(fx) = fx else { return plain };
     let mut fx = fx.clone();
@@ -484,6 +485,7 @@ mod tests {
                     reason: String::new(),
                     static_only: false,
                     syllables: None,
+                    speaker: None,
                 })
                 .collect(),
         }
@@ -866,6 +868,7 @@ mod tests {
                                 reason: String::new(),
                                 static_only: false,
                                 syllables: None,
+                                speaker: None,
                             })
                             .collect(),
                     };
