@@ -2381,19 +2381,36 @@ body:has(.pharos-stage.is-full) .pharos-status-note {
 .pharos-control-menus {
   display: contents;
 }
-.pharos-settings-toggle,
-.pharos-sheet-label {
+.pharos-sheet-label,
+.pharos-control-extra {
   display: none;
+}
+.pharos-settings-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+/* On a wide screen the settings button opens the speed menu in a small
+   panel above the right of the bar. */
+.pharos-control-menus.is-open > .pharos-control-extra {
+  position: absolute;
+  right: 0.75rem;
+  bottom: 100%;
+  z-index: 3;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 0.5rem;
+  min-width: 16rem;
+  padding: 0.75rem;
+  border-radius: 12px;
+  background: rgb(16 20 28 / 0.94); /* not themed: controls sit on the video, whose colours no theme sets */
+  box-shadow: 0 8px 24px rgb(0 0 0 / 0.5); /* not themed: controls sit on the video, whose colours no theme sets */
 }
 @media (max-width: 40rem) {
   .pharos-control-row {
     flex-wrap: nowrap;
     gap: 0.25rem;
-  }
-  .pharos-settings-toggle {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
   }
   .pharos-ends-at {
     display: none;
@@ -2430,6 +2447,19 @@ body:has(.pharos-stage.is-full) .pharos-status-note {
     padding: 0 0.5rem;
     font-size: 1rem;
     text-align: left;
+  }
+  /* In the phone's sheet the panel is just more rows of it. */
+  .pharos-control-menus.is-open > .pharos-control-extra {
+    position: static;
+    min-width: 0;
+    padding: 0;
+    background: none;
+    box-shadow: none;
+  }
+  .pharos-control-menus.is-open > .pharos-control-extra > * {
+    width: 100%;
+    max-width: none;
+    min-height: 44px;
   }
   .pharos-control-menus.is-open .pharos-sheet-label {
     display: inline;

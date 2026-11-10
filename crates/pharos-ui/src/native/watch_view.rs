@@ -1085,14 +1085,14 @@ pub fn WatchView(
                         TimeLabels { segments: c.segments.clone(), pos, total, scrub: Some(scrub) }
                         Volume { media, on_control }
                         span { class: "pharos-control-spacer" }
-                        // Shown on a narrow screen only, where the menus and
-                        // the window-size buttons wait behind it.
+                        // Speed waits behind it; on a narrow
+                        // screen the menus and window-size buttons do too.
                         button {
                             id: SETTINGS_TOGGLE_ID,
                             class: "pharos-control pharos-settings-toggle",
                             r#type: "button",
                             aria_label: "Settings",
-                            title: "Tracks, subtitles and quality",
+                            title: "Speed and more",
                             aria_expanded: if sheet_open() { "true" } else { "false" },
                             aria_controls: SETTINGS_ID,
                             onclick: move |_| sheet_open.toggle(),
@@ -1161,10 +1161,14 @@ pub fn WatchView(
                             version: c.version.clone(),
                             on_pick: move |control| on_control.call(control),
                         }
+                        // Speed is set now and then, so even a
+                        // wide screen keeps them behind the settings button.
+                        div { class: "pharos-control-extra",
                         SpeedPicker {
                             speed: c.speed,
                             in_group,
                             on_pick: move |control| on_control.call(control),
+                        }
                         }
                         QualityPicker {
                             quality: c.quality.clone(),
