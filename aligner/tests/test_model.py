@@ -6,7 +6,7 @@ from typing import Any
 
 import pytest
 
-from pharos_aligner.model import Aligner
+from pharos_aligner.model import Aligner, mean_score
 
 
 class FakeClock:
@@ -28,8 +28,10 @@ class CountingAligner(Aligner):
         self.loads += 1
         return object(), object(), object()
 
-    def _align_loaded(self, pcm_f32le: bytes, tokens: list[str], lead_star: bool) -> list[tuple[int, int]]:
-        return [(0, 0) for _ in tokens]
+    def _align_loaded(
+        self, pcm_f32le: bytes, tokens: list[str], lead_star: bool
+    ) -> tuple[list[tuple[int, int]], float | None]:
+        return [(0, 0) for _ in tokens], 0.5
 
 
 def test_model_is_unloaded_after_idle_timeout_and_reloaded_on_next_alignment() -> None:
@@ -153,3 +155,20 @@ def test_unload_logs_the_anon_memory_it_freed_and_whether_it_trimmed(
     assert "anon_before_mib=" in line
     assert "anon_after_mib=" in line
     assert "trimmed=True" in line
+
+
+class Span:
+    def __init__(self, score: float) -> None:
+        self.score = score
+
+
+def test_mean_score_averages_every_character_and_is_none_without_any() -> None:
+    assert mean_score([[Span(0.9), Span(0.7)], [Span(0.2)]]) == pytest.approx(0.6)
+    assert mean_score([[], []]) is None
+
+
+def test_align_scored_passes_the_score_through_and_align_drops_it() -> None:
+    aligner = CountingAligner(clock=FakeClock())
+    assert aligner.align_scored(b"\0" * 4, ["hi"]) == ([(0, 0)], 0.5)
+    assert aligner.align(b"\0" * 4, ["hi"]) == [(0, 0)]
+    assert aligner.align_scored(b"", ["hi"]) == ([], None)

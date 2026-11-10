@@ -41,7 +41,9 @@ DEFAULT_THREADS = 8
 # Sent with every answer. The server keeps only answers at or above its
 # minimum, so an aligner deployed after the server can't pin old times.
 # 2: a line's window opens LEAD_MS before its stamp (B1165).
-ALIGNER_VERSION = 2
+# 3: the Rust service (spec 039), same answers.
+# 4: each line carries a `score`, how well its words match the singing.
+ALIGNER_VERSION = 4
 
 
 def idle_unload_secs(raw: str | None) -> float | None:
@@ -227,7 +229,7 @@ class AlignerHandler(http.server.BaseHTTPRequestHandler):
                 for index, line in enumerate(lines):
                     w_list = words(line.text)
                     if not w_list:
-                        out_lines.append({"words": []})
+                        out_lines.append({"words": [], "score": None})
                         continue
                     w_start, w_end = window(line, len(w_list), prev_end_ms)
                     with phases.phase("decode", stage="line", line=index, window_ms=w_end - w_start):
@@ -235,15 +237,15 @@ class AlignerHandler(http.server.BaseHTTPRequestHandler):
                     tokens = [w.token for w in w_list]
                     try:
                         with phases.phase("model", stage="line", line=index, words=len(tokens)):
-                            spans = aligner.align(pcm, tokens)
+                            spans, score = aligner.align_scored(pcm, tokens)
                     except (RuntimeError, ValueError):
                         # A window too short for its text makes the aligner
                         # raise; only that line goes without word times.
                         logger.warning("path=%s line=%d alignment failed", rel_path, index, exc_info=True)
-                        out_lines.append({"words": []})
+                        out_lines.append({"words": [], "score": None})
                         continue
                     line_stamps = stamps(line.text, w_list, spans, w_start)
-                    out_lines.append({"words": line_stamps})
+                    out_lines.append({"words": line_stamps, "score": None if score is None else round(score, 3)})
                     if line_stamps:
                         words_aligned += len(w_list)
                         prev_end_ms = line_stamps[-1]["start_ms"]
