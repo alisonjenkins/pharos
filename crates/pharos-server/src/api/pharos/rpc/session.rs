@@ -45,6 +45,8 @@ pub(super) struct Session {
     pub(super) telemetry_bucket: RefCell<MessageBucket>,
     /// Paces this session's `Telemetry.report` calls.
     pub(super) report_bucket: RefCell<MessageBucket>,
+    /// Paces this session's `listReports`, `getReport` and `deleteReport`.
+    pub(super) report_read_bucket: RefCell<MessageBucket>,
     /// The user's `diagnostics.opt_in` and when it was read.
     opt_in_cache: RefCell<Option<(Instant, bool)>>,
 }
@@ -77,6 +79,11 @@ impl Session {
                 Instant::now(),
                 super::report::REPORT_BURST,
                 super::report::REPORTS_PER_SECOND,
+            )),
+            report_read_bucket: RefCell::new(MessageBucket::with_rate(
+                Instant::now(),
+                super::report::REPORT_READ_BURST,
+                super::report::REPORT_READS_PER_SECOND,
             )),
             opt_in_cache: RefCell::new(None),
         }
