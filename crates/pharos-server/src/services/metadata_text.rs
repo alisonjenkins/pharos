@@ -11,22 +11,16 @@
 use std::collections::HashMap;
 
 use crate::metadata_language::DescriptionLanguage;
+use crate::services::user_config::{
+    get_string_field, set_string_field, string_field, SetFieldError,
+};
 use crate::state::AppState;
 use pharos_core::{
     EditableField, LocalizedText, MediaId, MediaItem, MediaKind, MetadataTranslationStore,
     PreferenceStore, SeriesMetadata, TranslationOwner, UserId,
 };
 
-/// The stored `DescriptionLanguagePreference`, read on its own: a field the
-/// typed configuration would reject (a `null` where it wants a list, say)
-/// must not lose a valid language setting. Missing or not a string is "".
-fn stored_preference(raw: &str) -> Result<String, serde_json::Error> {
-    let v: serde_json::Value = serde_json::from_str(raw)?;
-    Ok(v.get("DescriptionLanguagePreference")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default()
-        .to_string())
-}
+const FIELD: &str = "DescriptionLanguagePreference";
 
 /// The description language `user` picked. A missing or unreadable
 /// configuration is the default: a corrupt blob must not hide a page.
@@ -35,7 +29,7 @@ pub async fn description_language<S: PreferenceStore>(
     user: UserId,
 ) -> DescriptionLanguage {
     match store.get_user_configuration(user).await {
-        Ok(Some(raw)) => match stored_preference(&raw) {
+        Ok(Some(raw)) => match string_field(&raw, FIELD) {
             Ok(p) => DescriptionLanguage::parse(&p),
             Err(e) => {
                 tracing::warn!(user.id = %user, error = %e, "user configuration does not parse; descriptions use the default language");
@@ -50,18 +44,6 @@ pub async fn description_language<S: PreferenceStore>(
     }
 }
 
-/// Why a description-language setting was not stored.
-#[derive(Debug)]
-pub enum SetLanguageError {
-    /// Not a language code, `OriginalLanguage` or empty.
-    Invalid,
-    /// The stored configuration is not a JSON object, so setting one field
-    /// in it would throw the rest away.
-    Unreadable,
-    /// The configuration could not be read or written.
-    Store(String),
-}
-
 /// The stored description-language setting in the form the settings pages
 /// offer, empty when unset. The Jellyfin configuration save stores the field
 /// unchecked, so an alias written there (`fr`, `fre`) is returned as the
@@ -70,14 +52,8 @@ pub async fn language_setting<S: PreferenceStore>(
     store: &S,
     user: UserId,
 ) -> Result<String, String> {
-    let raw = store
-        .get_user_configuration(user)
-        .await
-        .map_err(|e| e.to_string())?;
-    Ok(raw
-        .and_then(|r| stored_preference(&r).ok())
-        .map(|p| canonical_setting(&p).unwrap_or(p))
-        .unwrap_or_default())
+    let p = get_string_field(store, user, FIELD).await?;
+    Ok(canonical_setting(&p).unwrap_or(p))
 }
 
 /// Store `value` as `user`'s description language, in their Jellyfin
@@ -91,29 +67,9 @@ pub async fn set_language_setting<S: PreferenceStore>(
     store: &S,
     user: UserId,
     value: &str,
-) -> Result<(), SetLanguageError> {
-    let value = canonical_setting(value).ok_or(SetLanguageError::Invalid)?;
-    let raw = store
-        .get_user_configuration(user)
-        .await
-        .map_err(|e| SetLanguageError::Store(e.to_string()))?;
-    let mut cfg = match raw {
-        None => serde_json::json!({}),
-        Some(r) => match serde_json::from_str::<serde_json::Value>(&r) {
-            Ok(v) if v.is_object() => v,
-            _ => {
-                tracing::warn!(user.id = %user, size = r.len(), "description language not set: stored configuration is not a JSON object");
-                return Err(SetLanguageError::Unreadable);
-            }
-        },
-    };
-    cfg["DescriptionLanguagePreference"] = value.as_str().into();
-    store
-        .set_user_configuration(user, &cfg.to_string())
-        .await
-        .map_err(|e| SetLanguageError::Store(e.to_string()))?;
-    tracing::info!(user.id = %user, description_language = value, "description language set");
-    Ok(())
+) -> Result<(), SetFieldError> {
+    let value = canonical_setting(value).ok_or(SetFieldError::Invalid)?;
+    set_string_field(store, user, FIELD, &value).await
 }
 
 /// `raw` as the settings pages offer it, or `None` when it names no
@@ -489,12 +445,12 @@ mod tests {
         );
         assert!(matches!(
             set_language_setting(&s, uid, "not a language").await,
-            Err(SetLanguageError::Invalid)
+            Err(SetFieldError::Invalid)
         ));
         s.set_user_configuration(uid, "[1,2]").await.unwrap();
         assert!(matches!(
             set_language_setting(&s, uid, "fra").await,
-            Err(SetLanguageError::Unreadable)
+            Err(SetFieldError::Unreadable)
         ));
         assert_eq!(
             s.get_user_configuration(uid).await.unwrap().unwrap(),
