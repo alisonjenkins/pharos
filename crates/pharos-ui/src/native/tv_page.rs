@@ -382,6 +382,12 @@ pub enum Bridge {
     Root,
     /// The viewport's CSS size.
     Size { w: f64, h: f64 },
+    /// The remote's Stop key, which the page's script handled: it paused
+    /// the player, and left it when it was a video (FR-609).
+    Stop {
+        #[serde(default)]
+        video: bool,
+    },
     /// The page was hidden (the app left the screen: Home, another app, the
     /// TV's input switch) or shown again. `paused` counts the videos the
     /// page's script paused as it hid (FR-605).
@@ -430,6 +436,15 @@ pub struct KeyContext {
     pub in_player: bool,
     /// The focus is on a button or link.
     pub on_button: bool,
+}
+
+/// The neighbour a remote's next or previous key asks for (FR-609).
+pub fn track_skip(key: &str) -> Option<super::watch_view::Skip> {
+    match key {
+        "MediaTrackNext" => Some(super::watch_view::Skip::Next),
+        "MediaTrackPrevious" => Some(super::watch_view::Skip::Previous),
+        _ => None,
+    }
 }
 
 /// Whether a transport key goes on to the player (B618): there is one, the
@@ -633,6 +648,15 @@ mod tests {
         );
         let twice = tagged(once.clone());
         assert_eq!(twice.fields, once.fields, "tagged twice");
+    }
+
+    #[test]
+    fn the_remotes_next_and_previous_keys_skip() {
+        use super::super::watch_view::Skip;
+        assert_eq!(track_skip("MediaTrackNext"), Some(Skip::Next));
+        assert_eq!(track_skip("MediaTrackPrevious"), Some(Skip::Previous));
+        assert_eq!(track_skip("ArrowRight"), None);
+        assert_eq!(track_skip("MediaFastForward"), None);
     }
 
     #[test]
@@ -927,6 +951,10 @@ mod tests {
                 hidden: true,
                 paused: 1
             })
+        );
+        assert_eq!(
+            parse_bridge(&serde_json::json!({"t": "stop", "video": true})),
+            Some(Bridge::Stop { video: true })
         );
         assert_eq!(parse_bridge(&serde_json::json!({"t": "nope"})), None);
         assert_eq!(parse_bridge(&serde_json::json!(3)), None);
