@@ -54,6 +54,30 @@ pub struct SourceStyle {
     pub line: String,
 }
 
+impl SourceStyle {
+    /// The style's `Alignment` column; `None` when the line has none or it
+    /// is not a number.
+    pub fn alignment(&self) -> Option<u8> {
+        let columns = self.format.split_once(':')?.1.split(',').map(str::trim);
+        let at = columns
+            .into_iter()
+            .position(|c| c.eq_ignore_ascii_case("alignment"))?;
+        self.line
+            .split_once(':')?
+            .1
+            .split(',')
+            .nth(at)
+            .and_then(|v| lead_int(v.trim()))
+    }
+}
+
+/// The leading decimal digits of `s` as libass reads a numeric tag or field
+/// (`1)` is 1); `None` without any.
+fn lead_int<T: std::str::FromStr>(s: &str) -> Option<T> {
+    let end = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
+    s[..end].parse().ok()
+}
+
 /// What [`read`] found: the lines, and how many cues or events it had to skip.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Source {
@@ -183,6 +207,7 @@ fn read_cues(script: &str, format: SourceFormat) -> Source {
                 format,
                 "Default".to_owned(),
                 0,
+                None,
             )),
             None => skipped += 1,
         }
@@ -352,16 +377,15 @@ fn read_ass(script: &str) -> Source {
         .events
         .into_iter()
         .map(|e| {
-            let mut l = build_line(
+            build_line(
                 e.start_ms,
                 e.end_ms,
                 e.text.to_owned(),
                 SourceFormat::Ass,
                 e.style.to_owned(),
                 e.layer,
-            );
-            l.style_def = scan.styles.get(e.style).cloned();
-            l
+                scan.styles.get(e.style).cloned(),
+            )
         })
         .collect();
     Source {
@@ -375,6 +399,9 @@ fn read_ass(script: &str) -> Source {
 struct Parsed {
     runs: Vec<Run>,
     typeset: bool,
+    /// Whether the last alignment override puts the line at bottom centre;
+    /// `None` without one, when the style's alignment decides.
+    bottom_centre: Option<bool>,
     karaoke: Option<Vec<Syllable>>,
 }
 
@@ -385,8 +412,16 @@ fn build_line(
     format: SourceFormat,
     style: String,
     layer: i32,
+    style_def: Option<Arc<SourceStyle>>,
 ) -> SourceLine {
     let p = parse_text(&raw, format);
+    // A style placed anywhere but bottom centre is a sign's (B1208), unless
+    // the line moves itself back there.
+    let style_placed = p.bottom_centre.is_none()
+        && style_def
+            .as_deref()
+            .and_then(SourceStyle::alignment)
+            .is_some_and(|a| a != 2);
     let text = join(&p.runs);
     let visible: Vec<&Run> = p
         .runs
@@ -403,9 +438,9 @@ fn build_line(
         style,
         layer,
         italic,
-        typeset: p.typeset,
+        typeset: p.typeset || style_placed,
         karaoke: p.karaoke,
-        style_def: None,
+        style_def,
     }
 }
 
@@ -463,6 +498,7 @@ fn parse_text(raw: &str, format: SourceFormat) -> Parsed {
 fn parse_ass_text(raw: &str) -> Parsed {
     let mut acc = Acc::default();
     let mut typeset = false;
+    let mut bottom_centre = None;
     let mut drawing = false;
     let mut syllables: Vec<Syllable> = Vec::new();
     let mut pending: Option<u32> = None; // duration of the open syllable
@@ -488,11 +524,14 @@ fn parse_ass_text(raw: &str) -> Parsed {
                         "i" => acc.italic = tag.arg == "1",
                         "r" => acc.italic = false,
                         "pos" | "move" | "org" | "clip" | "iclip" => typeset = true,
-                        "an" => typeset |= tag.arg.parse::<u8>().is_ok_and(|n| n != 2),
-                        // Legacy SSA alignment; 2 is bottom centre.
-                        "a" => typeset |= tag.arg.parse::<u8>().is_ok_and(|n| n != 2),
+                        // Legacy SSA `\a` too: 2 is bottom centre in both.
+                        "an" | "a" => {
+                            if let Some(n) = lead_int::<u8>(&tag.arg) {
+                                bottom_centre = Some(n == 2);
+                            }
+                        }
                         "p" => {
-                            drawing = tag.arg.parse::<u32>().is_ok_and(|n| n > 0);
+                            drawing = lead_int::<u32>(&tag.arg).is_some_and(|n| n > 0);
                             typeset |= drawing;
                         }
                         "k" | "kf" | "K" | "ko" => {
@@ -519,7 +558,8 @@ fn parse_ass_text(raw: &str) -> Parsed {
     }
     Parsed {
         runs: acc.runs,
-        typeset,
+        typeset: typeset || bottom_centre == Some(false),
+        bottom_centre,
         karaoke: saw_k.then_some(syllables),
     }
 }
@@ -587,6 +627,7 @@ fn parse_cue_text(raw: &str) -> Parsed {
     Parsed {
         runs: acc.runs,
         typeset: false,
+        bottom_centre: None,
         karaoke: None,
     }
 }
@@ -756,6 +797,35 @@ mod tests {
         assert!(!mk(r"{\a2}legacy bottom").typeset);
         assert!(!mk(r"{\fad(100,100)\i1}plain").typeset);
         assert_eq!(mk(r"{\p1}m 0 0 l 5 5{\p0}after").text, "after");
+        // libass reads a tag's leading digits, so a stray character after
+        // them still starts a drawing (B1208).
+        let stray = mk(r"{\bord0\p1)}m 0 0 l 510 0 510 420 0 420");
+        assert!(stray.typeset);
+        assert_eq!(stray.text, "");
+    }
+
+    /// B1208: a line whose style sits anywhere but bottom centre is a sign,
+    /// unless the line puts itself back at bottom centre.
+    #[test]
+    fn a_style_placed_off_bottom_centre_makes_a_sign() {
+        let ass = "[V4+ Styles]\n\
+            Format: Name, Fontname, Fontsize, Alignment, MarginV\n\
+            Style: Menu,Times New Roman,36,7,90\n\
+            Style: Default,Arial,48,2,30\n\
+            Style: Odd,Arial,48,x,30\n\
+            [Events]\n\
+            Dialogue: 0,0:00:01.00,0:00:02.00,Menu,,0,0,0,,Stats\n\
+            Dialogue: 0,0:00:01.00,0:00:02.00,Menu,,0,0,0,,{\\an2}Stats at the bottom\n\
+            Dialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,Hello\n\
+            Dialogue: 0,0:00:01.00,0:00:02.00,Odd,,0,0,0,,Hello\n\
+            Dialogue: 0,0:00:01.00,0:00:02.00,Missing,,0,0,0,,Hello\n";
+        let l = read(ass).unwrap().lines;
+        let flags: Vec<bool> = l.iter().map(|l| l.typeset).collect();
+        assert_eq!(flags, [true, false, false, false, false]);
+        assert_eq!(
+            l[0].style_def.as_deref().and_then(SourceStyle::alignment),
+            Some(7)
+        );
     }
 
     #[test]
