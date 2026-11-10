@@ -125,18 +125,21 @@ fn check_gpu(
     Ok(model)
 }
 
-/// R20: compiled kernels persist under `PHAROS_ALIGNER_CACHE_DIR` when set.
+/// R14: compiled kernels persist under `PHAROS_ALIGNER_CACHE_DIR`. cubecl
+/// does not create it, and without it keeps kernels in memory only, so a
+/// directory that cannot be made says so here rather than in its warnings.
 #[cfg(feature = "vulkan")]
-fn kernel_cache(dir: Option<&Path>) -> String {
-    match dir {
-        None => "off".into(),
-        Some(d) if pharos_align::forward::vulkan::use_kernel_cache(d) => d.display().to_string(),
-        Some(_) => "off_already_configured".into(),
+fn kernel_cache(dir: &Path) -> String {
+    if let Err(e) = std::fs::create_dir_all(dir) {
+        return format!("off_unwritable:{}: {e}", dir.display());
+    }
+    if pharos_align::forward::vulkan::use_kernel_cache(dir) {
+        dir.display().to_string()
+    } else {
+        "off_already_configured".into()
     }
 }
 
-/// R10 and R11: probe (unless forced to the CPU), choose, check the GPU,
-/// and log the outcome once.
 /// The model the GPU warm-up loaded, which the first song then uses rather
 /// than uploading the weights again.
 #[cfg(feature = "vulkan")]
@@ -156,8 +159,12 @@ fn choose_device(config: &Config) -> Result<(device::Choice, Warmed), String> {
     #[cfg(feature = "vulkan")]
     let (choice, warmed) = match &choice.device {
         device::Device::Vulkan(a) => {
-            let cache = kernel_cache(config.cache_dir.as_deref());
-            tracing::info!(kernel_cache = %cache, "GPU kernel cache");
+            let cache = kernel_cache(&config.cache_dir);
+            if cache.starts_with("off_") {
+                tracing::warn!(kernel_cache = %cache, "GPU kernels compile afresh in every process");
+            } else {
+                tracing::info!(kernel_cache = %cache, "GPU kernel cache");
+            }
             let (checked, warmed) = match check_gpu(&config.weights, a) {
                 Ok(m) => (Ok(()), Some(m)),
                 Err(e) => (Err(e), None),
