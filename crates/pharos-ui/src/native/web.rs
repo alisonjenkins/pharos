@@ -2440,9 +2440,13 @@ pub fn step_tab(step: i8) -> bool {
         return false;
     };
     let tabs = strip.children();
+    // A strip of links marks its current one `aria-current`; a tablist,
+    // its selected tab `aria-selected`.
     let current = (0..tabs.length()).find(|&i| {
-        tabs.item(i)
-            .is_some_and(|t| t.get_attribute("aria-current").is_some())
+        tabs.item(i).is_some_and(|t| {
+            t.get_attribute("aria-current").is_some()
+                || t.get_attribute("aria-selected").as_deref() == Some("true")
+        })
     });
     let next = current.and_then(|i| i.checked_add_signed(i32::from(step)));
     match next.and_then(|i| tabs.item(i)) {
