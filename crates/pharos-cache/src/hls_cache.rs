@@ -1927,6 +1927,32 @@ pub struct AudioRenditionFile {
     pub session_start_seg: u32,
 }
 
+/// Where a file's media is known to end, from a read of the whole file (the
+/// integrity scan), and the state of the file that read saw (B1198).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KnownSourceEnd {
+    /// The furthest media position the read reached, in ms.
+    pub end_ms: u64,
+    /// The file's mtime (unix seconds) and size when it was read.
+    pub mtime_secs: i64,
+    pub size: u64,
+}
+
+/// Looks up a media item's [`KnownSourceEnd`], for the cache to consult before
+/// it encodes a window. Set once by the server, which owns the scan's memo.
+pub type SourceEndHint = Arc<dyn Fn(u64) -> Option<KnownSourceEnd> + Send + Sync>;
+
+/// A window must start this far past the known end before it is taken as
+/// holding nothing: the scan's last packet time is not a frame boundary.
+const PAST_END_MARGIN_MS: u64 = 1_000;
+
+/// Whether a window starting at `start_ms` lies wholly past where a read of
+/// the whole file found its media ends, for the file in state `sig`
+/// (`(mtime_secs, size)`). A file changed since the read proves nothing.
+fn window_past_known_end(start_ms: u64, end: KnownSourceEnd, sig: Option<(i64, u64)>) -> bool {
+    sig == Some((end.mtime_secs, end.size)) && start_ms >= end.end_ms + PAST_END_MARGIN_MS
+}
+
 /// Outcome of [`HlsSegmentCache::choose_audio_start_seg`]: reuse a session
 /// already covering the request, or spawn one starting at the given segment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1965,6 +1991,8 @@ pub struct HlsSegmentCache {
     /// poisonous: the client's own later request for that segment inherited the
     /// entire wait (B108).
     inflight: Arc<DashMap<SegmentIdentity, InFlightSegment>>,
+    /// Where items' media is known to end (B1198), set once by the server.
+    source_end: Arc<std::sync::OnceLock<SourceEndHint>>,
     /// Segment identities already refused once for coming up short of the
     /// frames their window implies (T119).
     ///
@@ -2601,9 +2629,41 @@ impl HlsSegmentCache {
             scheduler: None,
             state: Arc::new(Mutex::new(CacheState::default())),
             inflight: Arc::new(DashMap::new()),
+            source_end: Arc::new(std::sync::OnceLock::new()),
             refused_once: Arc::new(DashMap::new()),
             next_registration: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
+    }
+
+    /// B1198 — tell the cache where items' media ends, as a read of the whole
+    /// file found it. A window wholly past that end holds no picture, so it is
+    /// served a filler at once instead of encoded. Without this the encoder is
+    /// asked for frames that are not there; on a file with no seek index the
+    /// check that would recognise that ([`pharos_transcode::worker::exec::window_has_video`])
+    /// times out reading from byte 0, and the window fails as a device fault.
+    /// The first hint set stands.
+    pub fn set_source_end_hint(&self, hint: SourceEndHint) {
+        if self.source_end.set(hint).is_err() {
+            tracing::warn!("hls source-end hint already set; the new one is ignored");
+        }
+    }
+
+    /// The known end of `media_id`'s media when the window at `start_ms` lies
+    /// wholly past it and `source` is the file that was read.
+    async fn past_known_end(&self, media_id: u64, source: &Path, start_ms: u64) -> Option<u64> {
+        let end = (self.source_end.get()?)(media_id)?;
+        // The same signature the integrity sweep keys its memo on
+        // (`integrity_backfill::mtime_secs` plus length); a mismatch only
+        // turns this off, never serves a filler on a changed file.
+        let sig = tokio::fs::metadata(source).await.ok().map(|m| {
+            let mtime = m
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |d| d.as_secs() as i64);
+            (mtime, m.len())
+        });
+        window_past_known_end(start_ms, end, sig).then_some(end.end_ms)
     }
 
     /// Route segment transcodes through the load-balancing scheduler.
@@ -3624,6 +3684,23 @@ impl HlsSegmentCache {
         // it seeds the decoder much further back, past the point the container
         // index lied about.
         let mut shortfall = None;
+        // B1198 — past where a read of the whole file found its media ends:
+        // nothing to encode, so straight to the filler below.
+        let past_end = self
+            .past_known_end(media_id, source, (start_secs * 1000.0) as u64)
+            .await;
+        if let Some(end_ms) = past_end {
+            tracing::info!(
+                media.id = media_id,
+                seg = seg_index,
+                seek_secs = start_secs,
+                end_ms,
+                "hls segment window is past where the file's media ends; serving a filler"
+            );
+            shortfall = Some(format!(
+                "the window starts past the media's end at {end_ms} ms"
+            ));
+        }
         // What ffmpeg reported the WINNING attempt produced: `(frames,
         // out_time_secs)`. Kept past the retry loop so the success path can
         // account for the frames rather than discarding the only evidence of
@@ -3646,6 +3723,9 @@ impl HlsSegmentCache {
         let mut submit_class = class;
         let mut submit_hint = hint;
         for attempt in 0..2 {
+            if past_end.is_some() {
+                break;
+            }
             if attempt == 1 {
                 attempt_opts.decode_preroll_seconds =
                     Some(pharos_transcode::DECODE_PREROLL_RETRY_SECONDS);
@@ -8552,6 +8632,148 @@ mod tests {
             2,
             "both real attempts must have run and both reported zero frames"
         );
+    }
+
+    /// B1198/V1158: a window wholly past where a read of the whole file found
+    /// its media ends is a filler, only for the file state that read saw.
+    #[test]
+    fn only_a_window_past_the_known_end_of_the_same_file_counts() {
+        let end = KnownSourceEnd {
+            end_ms: 5_773_248,
+            mtime_secs: 100,
+            size: 7,
+        };
+        let same = Some((100, 7));
+        assert!(window_past_known_end(5_777_980, end, same));
+        assert!(window_past_known_end(5_774_248, end, same));
+        // Inside the margin, before the end, or a changed or unreadable file.
+        assert!(!window_past_known_end(5_774_000, end, same));
+        assert!(!window_past_known_end(5_000_000, end, same));
+        assert!(!window_past_known_end(5_777_980, end, Some((101, 7))));
+        assert!(!window_past_known_end(5_777_980, end, Some((100, 8))));
+        assert!(!window_past_known_end(5_777_980, end, None));
+    }
+
+    /// B1198/V1158: on a file whose media is known to end early, a window past
+    /// that end is a filler without asking the encoder, so the encoder's
+    /// "no frames" failure, which an unindexed file's slow probe leaves as a
+    /// device fault, never happens. A file changed since the read is encoded
+    /// as before.
+    #[test]
+    fn a_window_past_the_known_end_serves_filler_without_encoding() {
+        use pharos_transcode::protocol::{JobSpec, OutputSink, WorkerError, WorkerId};
+        use pharos_transcode::scheduler::{
+            RunFuture, SpawnFuture, TranscodeScheduler, Worker, WorkerRunResult, WorkerSpawner,
+        };
+
+        struct Spawner {
+            real_attempts: Arc<std::sync::atomic::AtomicU64>,
+        }
+        impl WorkerSpawner for Spawner {
+            fn spawn(&self, id: WorkerId) -> SpawnFuture {
+                let real_attempts = self.real_attempts.clone();
+                Box::pin(async move {
+                    Ok(Box::new(PastEndWorker { id, real_attempts }) as Box<dyn Worker>)
+                })
+            }
+        }
+        struct PastEndWorker {
+            id: WorkerId,
+            real_attempts: Arc<std::sync::atomic::AtomicU64>,
+        }
+        impl Worker for PastEndWorker {
+            fn id(&self) -> WorkerId {
+                self.id
+            }
+            fn run<'a>(&'a mut self, job: JobSpec) -> RunFuture<'a> {
+                let real_attempts = self.real_attempts.clone();
+                Box::pin(async move {
+                    if job.filler.is_none() {
+                        // What the live unindexed file got: the probe timed
+                        // out, so the empty window read as a device fault.
+                        real_attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        return WorkerRunResult::Failed(WorkerError::DeviceBusy(
+                            "Could not open encoder before EOF".into(),
+                        ));
+                    }
+                    let OutputSink::FileDirect { path } = &job.sink else {
+                        return WorkerRunResult::Died;
+                    };
+                    let _ = tokio::fs::write(path, vec![b'x'; 256]).await;
+                    let _ = tokio::fs::write(
+                        pharos_transcode::progress_sidecar_path(path),
+                        "frame=144\nout_time_us=6006000\n",
+                    )
+                    .await;
+                    WorkerRunResult::Done { out_bytes: 256 }
+                })
+            }
+        }
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let dir = TempDir::new().unwrap();
+        let _guard = rt.enter();
+        let source = rt.block_on(real_tiny_source(&dir));
+        let meta = std::fs::metadata(&source).unwrap();
+        let mtime_secs = meta
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let size = meta.len();
+        let (cache, _) = slow_test_cache(&dir, std::time::Duration::ZERO);
+        let real_attempts = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let sched = TranscodeScheduler::spawn(
+            pharos_transcode::device::DeviceTable::from_probe(&[], 4),
+            Arc::new(Spawner {
+                real_attempts: real_attempts.clone(),
+            }),
+            pharos_transcode::scheduler::SchedConfig::default(),
+        );
+        let cache = cache.with_scheduler(sched);
+        // Item 47's media ends at 5 s; item 48's read saw a different file.
+        cache.set_source_end_hint(Arc::new(move |id| match id {
+            47 => Some(KnownSourceEnd {
+                end_ms: 5_000,
+                mtime_secs,
+                size,
+            }),
+            48 => Some(KnownSourceEnd {
+                end_ms: 5_000,
+                mtime_secs,
+                size: size + 1,
+            }),
+            _ => None,
+        }));
+        // Segment 2 of a minute-long title starts at 12 s.
+        let opts = SegmentOpts {
+            video: Some(SegmentVideo::H264),
+            window: pharos_core::SegmentWindow::for_segment(2, None, Some(60.0)),
+            ..slow_opts()
+        };
+        assert!(
+            opts.window.start_seconds() >= 6.0,
+            "precondition: past the end"
+        );
+
+        let bytes = rt
+            .block_on(cache.segment_bytes(47, 2, &source, &opts, JobClass::Interactive))
+            .expect("a window past the known end must serve a filler");
+        assert_eq!(bytes.len(), 256);
+        assert_eq!(
+            real_attempts.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the encoder must not be asked for frames past the known end"
+        );
+
+        let changed =
+            rt.block_on(cache.segment_bytes(48, 2, &source, &opts, JobClass::Interactive));
+        assert!(changed.is_err(), "a changed file is encoded as before");
+        assert!(real_attempts.load(std::sync::atomic::Ordering::SeqCst) >= 1);
     }
 
     #[test]
