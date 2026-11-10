@@ -1338,22 +1338,22 @@ async fn next_up_keeps_same_name_shows_in_distinct_folders_separate() {
         .await
         .unwrap();
     let token = stores.issue(uid, "t").await.unwrap();
-    // Cosmos (1980) and Cosmos (2014): same display name, different
+    // Show AV (1980) and Show AV (2014): same display name, different
     // folders + years. Each has two unwatched episodes.
     for (id, folder, year, ep) in [
-        (1u64, "/tv/Cosmos (1980)", 1980u32, 1u32),
-        (2, "/tv/Cosmos (1980)", 1980, 2),
-        (3, "/tv/Cosmos (2014)", 2014, 1),
-        (4, "/tv/Cosmos (2014)", 2014, 2),
+        (1u64, "/tv/Show AV (1980)", 1980u32, 1u32),
+        (2, "/tv/Show AV (1980)", 1980, 2),
+        (3, "/tv/Show AV (2014)", 2014, 1),
+        (4, "/tv/Show AV (2014)", 2014, 2),
     ] {
         stores
             .put(MediaItem {
                 id,
                 path: format!("{folder}/Season 01/S01E0{ep}.mkv").into(),
-                title: format!("Cosmos E{ep}"),
+                title: format!("Show AV E{ep}"),
                 kind: MediaKind::Episode,
                 series: Some(pharos_core::SeriesInfo {
-                    series_name: "Cosmos".into(),
+                    series_name: "Show AV".into(),
                     season_number: Some(1),
                     episode_number: Some(ep),
                     series_folder: Some(folder.into()),
@@ -1385,11 +1385,11 @@ async fn next_up_keeps_same_name_shows_in_distinct_folders_separate() {
         .collect();
     assert_eq!(series_ids.len(), 2, "distinct SeriesId per folder: {v:?}");
     // Each NextUp pick is that folder's E1 (non-interleaved) and carries
-    // its own year so clients can tell the two Cosmos shows apart.
+    // its own year so clients can tell the two Show AV shows apart.
     let years: std::collections::HashSet<u64> = items
         .iter()
         .map(|it| {
-            assert_eq!(it["SeriesName"], "Cosmos");
+            assert_eq!(it["SeriesName"], "Show AV");
             assert_eq!(it["IndexNumber"].as_u64().unwrap(), 1);
             it["ProductionYear"].as_u64().unwrap()
         })

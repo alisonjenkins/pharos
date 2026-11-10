@@ -429,9 +429,9 @@ mod tests {
         assert!(rank("Silver Rock").unwrap().is_exact());
         assert!(rank("Silver Rock").unwrap() < rank("Silver Rock GT").unwrap());
         assert!(rank("Silver Rock GT").unwrap() < rank("Silver Rock Super").unwrap());
-        assert!(rank("Silver Rock Super").unwrap() < rank("Super Silver Rock Heroes").unwrap());
-        assert!(rank("Super Silver Rock Heroes").unwrap() < rank("SuperSilver Rocks").unwrap());
-        assert_eq!(rank("Bleach"), None);
+        assert!(rank("Silver Rock Super").unwrap() < rank("Super Silver Rock Legion").unwrap());
+        assert!(rank("Super Silver Rock Legion").unwrap() < rank("SuperSilver Rocks").unwrap());
+        assert_eq!(rank("Show BI"), None);
     }
 
     #[test]

@@ -2345,7 +2345,7 @@ mod tests {
 
     #[actix_web::test]
     async fn a_memoised_representative_whose_row_is_gone_is_re_picked() {
-        // B1000 — the copy fold deleted the rows of Bones' S01 .avi copies,
+        // B1000 — the copy fold deleted the rows of Show AY' S01 .avi copies,
         // one of them the show's memoised representative; the memo keeps
         // positives across library generations, so the show tile lost its
         // poster until a restart.
@@ -2357,14 +2357,14 @@ mod tests {
             .stores
             .put(MediaItem {
                 id: 602,
-                path: "/tv/Bones/Season 01/Bones S01E01.mkv".into(),
-                title: "Bones S01E01".into(),
+                path: "/tv/Show AY/Season 01/Show AY S01E01.mkv".into(),
+                title: "Show AY S01E01".into(),
                 kind: MediaKind::Episode,
                 series: Some(SeriesInfo {
-                    series_name: "Bones".into(),
+                    series_name: "Show AY".into(),
                     season_number: Some(1),
                     episode_number: Some(1),
-                    series_folder: Some("/tv/Bones".into()),
+                    series_folder: Some("/tv/Show AY".into()),
                     series_year: None,
                     series_key: None,
                 }),
@@ -2372,7 +2372,7 @@ mod tests {
             })
             .await
             .unwrap();
-        let synth = series_id_for_key(Some("/tv/Bones"), "Bones");
+        let synth = series_id_for_key(Some("/tv/Show AY"), "Show AY");
         state.synth_image_remember(&synth, Some(601));
 
         let tags = synth_primary_tag(&state, &synth)
@@ -2392,14 +2392,14 @@ mod tests {
         let state = seed_state_with_cache(cache_dir.path()).await;
         let episode = |id: u64, n: u32| MediaItem {
             id,
-            path: format!("/tv/Bones/Season 01/Bones S01E0{n}.mkv").into(),
-            title: format!("Bones S01E0{n}"),
+            path: format!("/tv/Show AY/Season 01/Show AY S01E0{n}.mkv").into(),
+            title: format!("Show AY S01E0{n}"),
             kind: MediaKind::Episode,
             series: Some(SeriesInfo {
-                series_name: "Bones".into(),
+                series_name: "Show AY".into(),
                 season_number: Some(1),
                 episode_number: Some(n),
-                series_folder: Some("/tv/Bones".into()),
+                series_folder: Some("/tv/Show AY".into()),
                 series_year: None,
                 series_key: None,
             }),
@@ -2407,7 +2407,7 @@ mod tests {
         };
         state.stores.put(episode(701, 1)).await.unwrap();
         state.stores.put(episode(702, 2)).await.unwrap();
-        let synth = series_id_for_key(Some("/tv/Bones"), "Bones");
+        let synth = series_id_for_key(Some("/tv/Show AY"), "Show AY");
         let warmed = synth_primary_tag(&state, &synth).await.unwrap();
         assert_eq!(warmed.get("Primary").map(String::as_str), Some("701"));
 

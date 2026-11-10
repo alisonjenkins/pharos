@@ -1999,7 +1999,7 @@ const BURN_GATE_PAD_MS: u64 = 500;
 
 /// B46 — per-segment burn gating. Image-subtitle burn (overlay decode +
 /// composite + re-encode) runs BELOW realtime for VP9 (~6-11 s per 6 s
-/// segment observed live, B44 rollout), yet a forced track (the Na'vi
+/// segment observed live, B44 rollout), yet a forced track (the alien-language
 /// case) is SPARSE — most segments contain no event at all. Strip the
 /// burn index when the track's event-window timeline proves this segment
 /// empty: the segment takes the plain fast path AND shares its cache key
@@ -2428,7 +2428,7 @@ async fn vp9_audio_file(
     // B42 — tell the cache WHICH segment this request needs: a deep seek
     // (segment far past the running from-0 session's progress) spawns a
     // second, seeked session instead of 404ing "not ready" until the
-    // whole-file encode crawls there (observed live: Avatar seek to ~1h40m
+    // whole-file encode crawls there (observed live: Film BA seek to ~1h40m
     // → a996.m4s 404 → hls.js stalled the seek).
     let want_seg = name
         .strip_prefix('a')
@@ -4303,7 +4303,7 @@ mod tests {
 
     #[::core::prelude::v1::test]
     fn segments_are_seeked_half_a_frame_early_so_no_frame_falls_between_them() {
-        // Measured against a real 23.976 fps HEVC source (Fringe S01E01): a
+        // Measured against a real 23.976 fps HEVC source (Show AW S01E01): a
         // frame sat at 12.011997, microseconds BELOW the 12.012000 boundary.
         // Seeking segment N+1 to exactly the boundary excluded it (pts below
         // the seek) while segment N's `-t` also excluded it (it fell on the
@@ -6028,7 +6028,7 @@ mod tests {
         );
 
         // A local item resolves to itself, resolver or no resolver.
-        let local = std::path::Path::new("/media/Movies/Arrival.mkv");
+        let local = std::path::Path::new("/media/Movies/Film BC.mkv");
         assert_eq!(
             transcode_source(&state, local, true)
                 .await
@@ -6049,7 +6049,7 @@ mod tests {
         let req = actix_web::test::TestRequest::get()
             .uri("/videos/9/h264cmaf.m3u8?PlaySessionId=abc")
             .to_http_request();
-        let local = std::path::Path::new("/media/Movies/Arrival.mkv");
+        let local = std::path::Path::new("/media/Movies/Film BC.mkv");
         let qs = rendition_qs(&req, local, None);
         assert!(
             qs.ends_with(&format!("g={gen}")),
@@ -6127,7 +6127,7 @@ mod tests {
 
         // A grouped edition's file shares its item's id, so its URLs must
         // differ from the primary's or a browser holds the wrong init.
-        let edition = std::path::Path::new("/media/Movies/Arrival - 3D.HSBS.mkv");
+        let edition = std::path::Path::new("/media/Movies/Film BC - 3D.HSBS.mkv");
         let eg = pharos_cache::hls_cache::SourceGen::for_read(edition, Some("3d-hsbs"));
         assert_eq!(
             rendition_qs(&bare, edition, Some("3d-hsbs")),

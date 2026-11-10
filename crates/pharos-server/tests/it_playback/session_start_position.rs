@@ -24,7 +24,7 @@ use pharos_server::{
     transcode_sessions::TranscodeSession,
 };
 
-/// 60 s at the 6 s grid = 10 segments, so the last index is 9. Ant-Man's real
+/// 60 s at the 6 s grid = 10 segments, so the last index is 9. Film AV's real
 /// shape (1171 of 1172) scaled down; what matters is that the tail index is
 /// not also index 0.
 const DURATION_MS: u64 = 60_000;

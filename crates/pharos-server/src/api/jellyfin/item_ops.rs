@@ -1166,14 +1166,14 @@ mod tests {
     #[actix_web::test]
     async fn apply_flips_match_source_to_manual_and_persists() {
         let state = seed_state().await;
-        put_movie(&state, 42, "Dune (2021)").await;
+        put_movie(&state, 42, "Film AU (2021)").await;
 
         remote_search_apply_inner(
             &state,
             42,
             RemoteSearchApplyDto {
                 provider: "tmdb".to_string(),
-                id: "438631".to_string(),
+                id: "932001".to_string(),
             },
         )
         .await
@@ -1182,7 +1182,7 @@ mod tests {
         let got = state.stores.get(42).await.expect("item still present");
         assert_eq!(got.match_source.as_deref(), Some("manual"));
         assert_eq!(got.match_provider.as_deref(), Some("tmdb"));
-        assert_eq!(got.match_external_id.as_deref(), Some("438631"));
+        assert_eq!(got.match_external_id.as_deref(), Some("932001"));
     }
 
     async fn seed_state_with_cache(root: &std::path::Path) -> AppState {
@@ -1197,7 +1197,7 @@ mod tests {
     #[actix_web::test]
     async fn remote_images_empty_without_key_or_match() {
         let state = seed_state().await;
-        put_movie(&state, 42, "Dune (2021)").await; // no provider id, no key
+        put_movie(&state, 42, "Film AU (2021)").await; // no provider id, no key
         let r = remote_images_inner(&state, "42", &RemoteImagesQuery::default()).await;
         assert_eq!(r.total_record_count, 0);
         assert!(r.images.is_empty());
@@ -1437,7 +1437,7 @@ mod tests {
     #[actix_web::test]
     async fn search_movie_returns_empty_without_a_key() {
         let state = seed_state().await;
-        put_movie(&state, 43, "Dune (2021)").await;
+        put_movie(&state, 43, "Film AU (2021)").await;
 
         let results = remote_search_movie_inner(&state, 43)
             .await

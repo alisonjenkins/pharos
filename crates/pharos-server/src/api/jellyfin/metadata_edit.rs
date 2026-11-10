@@ -492,12 +492,12 @@ mod tests {
     #[test]
     fn a_body_sets_clears_and_unlocks() {
         let edit = parse_edit(&json!({
-            "Fields": {"Title": "Alien", "Tagline": null, "ProductionYear": 1979,
+            "Fields": {"Title": "Film AX", "Tagline": null, "ProductionYear": 1979,
                        "PremiereDate": "1979-05-25", "CommunityRating": 8.5},
             "Unlock": ["Overview"]
         }))
         .unwrap();
-        assert_eq!(edit.title.as_deref(), Some("Alien"));
+        assert_eq!(edit.title.as_deref(), Some("Film AX"));
         assert_eq!(edit.tagline, Some(None));
         assert_eq!(edit.production_year, Some(Some(1979)));
         assert_eq!(edit.premiere_date, Some(Some(296_438_400)));
@@ -508,7 +508,7 @@ mod tests {
 
     #[test]
     fn a_jellyfin_save_edits_only_what_changed_or_is_locked() {
-        let current = json!({"Title": "Alien", "Overview": "Old", "Tagline": "In space",
+        let current = json!({"Title": "Film AX", "Overview": "Old", "Tagline": "In space",
                              "ProductionYear": 1979, "OfficialRating": "R",
                              "CommunityRating": 8.5, "PremiereDate": "1979-05-25"});
         let current = current.as_object().unwrap();
@@ -521,7 +521,7 @@ mod tests {
             "CommunityRating",
             "PremiereDate",
         ];
-        let body = json!({"Name": "Alien", "Overview": "New", "Taglines": ["In space"],
+        let body = json!({"Name": "Film AX", "Overview": "New", "Taglines": ["In space"],
                           "ProductionYear": 1979, "OfficialRating": "R", "CommunityRating": 8.5,
                           "PremiereDate": "1979-05-25T00:00:00.0000000Z",
                           "Genres": ["Horror"], "LockedFields": ["OfficialRating"]});
@@ -537,7 +537,7 @@ mod tests {
 
     #[test]
     fn jellyfin_webs_text_boxes_and_empty_values_are_not_changes() {
-        let current = json!({"Title": "Alien", "SortName": "alien", "Tagline": null,
+        let current = json!({"Title": "Film AX", "SortName": "film ax", "Tagline": null,
                              "ProductionYear": 1979, "CommunityRating": null, "CriticRating": 97});
         let current = current.as_object().unwrap();
         let editable = [
@@ -548,13 +548,13 @@ mod tests {
             "CommunityRating",
             "CriticRating",
         ];
-        let body = json!({"Name": "Alien", "ForcedSortName": "", "Taglines": [""],
+        let body = json!({"Name": "Film AX", "ForcedSortName": "", "Taglines": [""],
                           "ProductionYear": "1979", "CommunityRating": "", "CriticRating": "97"});
         assert!(jellyfin_fields(&body, current, &editable).is_empty());
-        let body = json!({"ProductionYear": "1980", "ForcedSortName": "Alien 1"});
+        let body = json!({"ProductionYear": "1980", "ForcedSortName": "Film AX 1"});
         let out = jellyfin_fields(&body, current, &editable);
         assert_eq!(out["ProductionYear"], json!(1980.0));
-        assert_eq!(out["SortName"], "Alien 1");
+        assert_eq!(out["SortName"], "Film AX 1");
         assert_eq!(
             parse_edit(&json!({"Fields": out})).unwrap().production_year,
             Some(Some(1980))

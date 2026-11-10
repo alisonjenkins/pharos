@@ -209,7 +209,7 @@ mod tests {
         // blast-radius guard.
         for real in [
             "/media",
-            "/media/Movies/Arrival.mkv",
+            "/media/Movies/Film BC.mkv",
             "/var/lib/pharos/media",
         ] {
             assert!(

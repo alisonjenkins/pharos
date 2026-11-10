@@ -236,7 +236,7 @@ async fn declines_an_unforced_image_default_with_no_renderable_alternative() {
 
 #[actix_web::test]
 async fn a_forced_image_default_still_selects_and_burns() {
-    // B44's Avatar case: a forced track is dialogue the viewer cannot follow
+    // B44's Film BA case: a forced track is dialogue the viewer cannot follow
     // without, not a convenience — the cost-decline must not touch it.
     let tracks = vec![SubtitleTrack {
         stream_index: 3,

@@ -1936,7 +1936,7 @@ mod tests {
       {"tvdb_id":"910202","name":"Show K Z Abridged","year":"2008","translations":{"eng":"Show K Z Abridged"},"aliases":["Show K Z: Abridged","SKZ: Abridged"]},
       {"tvdb_id":"910203","name":"Show K R&R","year":"2018","translations":{"eng":"Show K R&R"}},
       {"tvdb_id":"910103","name":"ショーK","year":"1986","translations":{"eng":"Show K","jpn":"ショーK"},"aliases":["Showkay"]},
-      {"tvdb_id":"910204","name":"スーパーショーKヒーローズ","year":"2018","translations":{"eng":"Super Show K Heroes"}},
+      {"tvdb_id":"910204","name":"スーパーショーKレギオン","year":"2018","translations":{"eng":"Super Show K Legion"}},
       {"tvdb_id":"910205","name":"ショーKZ","year":"1989","translations":{"eng":"Show K Z"},"aliases":["Showkay Z","Show K Z (1989)"]}
     ]}"#;
 

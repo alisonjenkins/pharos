@@ -527,7 +527,7 @@ mod tests {
         let local = MediaItem {
             id: 2,
             kind: pharos_core::MediaKind::Episode,
-            path: "/tv/Arrow/s01e01.mkv".into(),
+            path: "/tv/Show CA/s01e01.mkv".into(),
             ..Default::default()
         };
         assert!(analysable(&local));
@@ -538,7 +538,7 @@ mod tests {
         let movie = MediaItem {
             id: 3,
             kind: pharos_core::MediaKind::Movie,
-            path: "/media/Movies/Arrival.mkv".into(),
+            path: "/media/Movies/Film BC.mkv".into(),
             ..Default::default()
         };
         assert!(!analysable(&movie));
@@ -613,7 +613,7 @@ mod tests {
     fn a_dropped_episode_is_countable_by_reason() {
         let _ = crate::obs::init("info", None);
         record_verdicts(
-            "/media/TV/Fringe::1",
+            "/media/TV/Show AW::1",
             "Intro",
             &[
                 verdict(1, 12, 12, 0.63, Verdict::Emitted),
