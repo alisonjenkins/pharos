@@ -490,8 +490,8 @@ mod tests {
         let id = h.group_id;
         assert_eq!(
             next_listing(&mut listing).await,
-            None,
-            "an empty new group is unchanged"
+            Some(id),
+            "a new group is listable before anyone joins"
         );
 
         let (sink, _rx) = mpsc::channel(64);

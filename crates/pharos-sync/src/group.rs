@@ -3249,6 +3249,11 @@ impl GroupHandle {
                 tokio::time::interval(std::time::Duration::from_millis(MEMBER_PRUNE_TICK_MS));
             prune_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             let mut listed = state.listing();
+            // Listable from the start: the list shows a group before anyone
+            // joins it.
+            if let Some(listing) = &listing {
+                let _ = listing.send(state.id);
+            }
             loop {
                 // Only a mutating message, or a prune that removed someone,
                 // can change what a list shows; clock, ping and snapshot
