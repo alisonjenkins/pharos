@@ -28,7 +28,7 @@ stopped half way.
   2. no part has versions of its own (`versions`);
   3. every part has been probed (`unprobed`): the first scan indexes them
      apart, the next decides;
-  4. every part's probe found a duration (`no_duration`), since the
+  4. every part's probe found a non-zero duration (`no_duration`), since the
      playlist can only run on past a part of known length;
   5. no two parts' embedded titles, with any part marker dropped, differ
      (`titles_differ`). Files named as parts that hold different films (a
@@ -39,7 +39,8 @@ stopped half way.
 - A part's old row hands over its played state and favourite, never its
   resume point, which was a time in that part (V1152).
 - Every decision is counted in `pharos_scan_part_stack_total{outcome}`
-  (`stacked`, `numbering`, `versions`, `unprobed`, `titles_differ`), and a
+  (`stacked`, `numbering`, `versions`, `unprobed`, `titles_differ`,
+  `no_duration`), and a
   refusal is logged as "left a film's parts apart" with the deciding value and
   the files.
 
