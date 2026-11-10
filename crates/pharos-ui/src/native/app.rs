@@ -71,7 +71,7 @@ use super::subtitles::{track_mode, FallbackReason, RustState, TrackMode};
 use super::together::{
     can_watch_together, group_api, GroupClient as _, GroupError, GroupSummary, Groups,
 };
-use super::together_view::{InviteView, TogetherView, INVITE_LINK_ID};
+use super::together_view::{InviteView, NotesView, TogetherView, INVITE_LINK_ID};
 use super::track_follow;
 use super::trail;
 use super::turn::{self, EpisodeTurn, EPISODE_TURN_KEY};
@@ -1675,6 +1675,10 @@ fn mark_handler(
 #[component]
 fn NativeApp(route: Route) -> Element {
     let mut machine = use_signal(Machine::new);
+    // The player shows a lost connection itself; the shell under it is out
+    // of sight (spec 038 FR-503).
+    let connection_lost = use_memo(move || machine.read().reconnecting());
+    use_context_provider(|| ConnectionLost(connection_lost));
     let mut api = use_signal(|| None::<NativeApi>);
     let mut task = use_signal(|| None::<dioxus::core::Task>);
     let mut started = use_signal(|| None::<u32>);
@@ -1734,7 +1738,7 @@ fn NativeApp(route: Route) -> Element {
         };
         platform::info(&format!("pharos: group rejoin reason=reload group={id}"));
         let session = together.session(&api);
-        let mut error = together.error;
+        let mut note = together.note;
         let started = platform::unix_ms();
         spawn_forever(async move {
             use super::group_session::{rejoin_event, RejoinOutcome};
@@ -1750,7 +1754,7 @@ fn NativeApp(route: Route) -> Element {
                     "pharos: group rejoin failed group={id} error={}",
                     e.0
                 ));
-                error.set(Some(super::group_app::rejoin_failure(&e.0)));
+                note.set(Some(super::group_app::rejoin_failure(&e.0)));
             }
         });
     });
@@ -1986,11 +1990,12 @@ fn NativeApp(route: Route) -> Element {
         let notice = {
             let m = machine.read();
             if m.reconnecting() {
-                Some("Connection lost. Reconnecting…".to_owned())
+                None
             } else {
                 m.notice().map(str::to_owned)
             }
         };
+        let reconnecting = machine.read().reconnecting();
         let me = me.read().clone().flatten();
         return rsx! {
             Shell {
@@ -2023,6 +2028,9 @@ fn NativeApp(route: Route) -> Element {
                         "Pharos has been updated. Reload to keep using it. "
                         button { class: "pharos-button", onclick: move |_| platform::reload(), "Reload" }
                     }
+                }
+                if reconnecting {
+                    p { class: "pharos-error pharos-connection-shell", role: "alert", {CONNECTION_LOST} }
                 }
                 if let Some(message) = notice {
                     ErrorNote { message }
@@ -5028,6 +5036,49 @@ fn play_action(view: View) -> &'static str {
 }
 
 /// The wall clock in unix milliseconds, as the activity log stamps its lines.
+/// Whether the connection to the server is down and being reopened.
+#[derive(Clone, Copy)]
+pub struct ConnectionLost(pub Memo<bool>);
+
+const CONNECTION_LOST: &str = "Connection lost. Reconnecting…";
+
+/// Whether `text` still shows, `for_ms` after it first did. Redraws once
+/// when its time is up.
+fn use_timed_note(text: Option<&str>, for_ms: u64) -> bool {
+    let timer = use_hook(|| Rc::new(RefCell::new(activity::NoteTimer::default())));
+    let expired = use_signal(|| 0u32);
+    let _ = expired();
+    let shown = timer.borrow_mut().show(text, now_ms_u64(), for_ms);
+    if shown.arm {
+        let mut expired = expired;
+        spawn(async move {
+            platform::sleep_ms(u32::try_from(for_ms).unwrap_or(u32::MAX)).await;
+            expired += 1;
+        });
+    }
+    shown.visible
+}
+
+/// The pill naming who the group waits on, then "ready" for a moment.
+fn use_wait_pill(waiting: &[String], in_group: bool) -> Option<activity::WaitPill> {
+    let tracker = use_hook(|| Rc::new(RefCell::new(activity::WaitTracker::default())));
+    let expired = use_signal(|| 0u32);
+    let _ = expired();
+    if !in_group {
+        *tracker.borrow_mut() = activity::WaitTracker::default();
+        return None;
+    }
+    let (pill, arm) = tracker.borrow_mut().pill(waiting, now_ms_u64());
+    if arm {
+        let mut expired = expired;
+        spawn(async move {
+            platform::sleep_ms(u32::try_from(activity::READY_MS).unwrap_or(u32::MAX)).await;
+            expired += 1;
+        });
+    }
+    pill
+}
+
 fn now_ms_u64() -> u64 {
     u64::try_from(platform::unix_ms()).unwrap_or(0)
 }
@@ -5166,6 +5217,19 @@ fn Player(
             });
         }
     });
+    // A group that ended or could not be rejoined is news for a moment, then
+    // out of the picture's way (FR-501).
+    let group_status = group.ended.clone().or_else(|| together.note.read().clone());
+    let status_shown = use_timed_note(group_status.as_deref(), activity::NOTE_MS);
+    let wait_pill = use_wait_pill(&group.waiting, group.active);
+    let connection_lost =
+        try_use_context::<ConnectionLost>().is_some_and(|ConnectionLost(lost)| lost());
+    // The group just left, while Leave can be undone (FR-505).
+    let left_group = use_signal(|| None::<String>);
+    let undo_shown = use_timed_note(
+        left_group.read().as_deref().filter(|_| !group.active),
+        activity::UNDO_LEAVE_MS,
+    );
     // Taken at mount: the video this one replaces was paused, or not.
     let start_paused = use_hook(|| was_paused.0.get());
     let mut sub_size = use_signal(stored_subtitle_size);
@@ -6646,11 +6710,50 @@ fn Player(
     };
     let on_leave = {
         let session = session.clone();
+        let id = group.id.clone().filter(|_| group.active);
+        let mut left_group = left_group;
         move |()| {
             if let Some(session) = session() {
+                left_group.set(id.clone());
                 spawn(async move { session.leave().await });
             }
         }
+    };
+    let on_undo_leave = {
+        let together = together.clone();
+        let mut left_group = left_group;
+        move |()| {
+            let Some(id) = left_group.take() else {
+                return;
+            };
+            let Some(api) = ctx.api.peek().clone() else {
+                return;
+            };
+            let session = together.session(&api);
+            let mut note = together.note;
+            note.set(None);
+            platform::info(&format!("pharos: group leave undo group={id}"));
+            spawn_forever(async move {
+                match session.join(&id).await {
+                    Ok(_) => platform::info(&format!(
+                        "pharos: group leave undone group={id} outcome=rejoined"
+                    )),
+                    Err(e) => {
+                        platform::warn(&format!(
+                            "pharos: group leave undo failed group={id} error={}",
+                            e.0
+                        ));
+                        note.set(Some(super::group_app::rejoin_failure(&e.0)));
+                    }
+                }
+            });
+        }
+    };
+    let notes = NotesView {
+        connection: connection_lost.then(|| CONNECTION_LOST.to_owned()),
+        wait: wait_pill,
+        status: group_status.filter(|_| status_shown),
+        undo: undo_shown,
     };
     let on_own_tracks = {
         let session = session.clone();
@@ -6855,8 +6958,11 @@ fn Player(
                     },
                 }
             }
-            if let Some(message) = group.ended.clone() {
-                GroupEndedNote { message }
+            // A video's player stacks this with its other group notes.
+            if p.kind == ItemKind::Audio {
+                if let Some(message) = notes.status.clone() {
+                    GroupEndedNote { message }
+                }
             }
             if let Some(message) = together.error.read().clone() {
                 ErrorNote { message }
@@ -6907,6 +7013,8 @@ fn Player(
                 on_own_tracks,
                 activity: group.log.lines(),
                 toast: group.log.toast(now_ms_u64()).map(str::to_owned).or(notice),
+                notes,
+                on_undo_leave,
                 own_track_members: group
                     .members
                     .iter()

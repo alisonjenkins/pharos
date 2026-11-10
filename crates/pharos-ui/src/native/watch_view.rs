@@ -28,7 +28,7 @@ use super::queue::{Entry, QueueAction};
 use super::seen::SeenRow;
 use super::stage::STAGE_EXPAND_ID;
 use super::together::Member;
-use super::together_view::{ActivityToast, InvitePanel, MemberStrip};
+use super::together_view::{GroupNotes, InvitePanel, MemberStrip, NotesView};
 use super::views::{ends_at, episode_label, use_ends_at_refresh};
 
 /// The `<video>` the playback engine attaches to.
@@ -491,6 +491,10 @@ pub fn WatchView(
     /// The activity line to show over the video now, if any.
     #[props(default)]
     toast: Option<String>,
+    /// The connection, wait, status and undo notes stacked with the toast.
+    #[props(default)]
+    notes: NotesView,
+    #[props(default)] on_undo_leave: EventHandler<()>,
     /// Whether this item can start a group: the Watch together button shows
     /// while not in one.
     #[props(default)]
@@ -969,7 +973,14 @@ pub fn WatchView(
                         }
                     }
                 }
-                ActivityToast { line: toast }
+                GroupNotes {
+                    connection: notes.connection.clone(),
+                    wait: notes.wait.clone(),
+                    status: notes.status.clone(),
+                    undo: notes.undo,
+                    on_undo: on_undo_leave,
+                    toast,
+                }
                 if let Some(damage) = c.damage.clone() {
                     PlayerDamageNote { damage }
                 }
@@ -2821,9 +2832,14 @@ mod tests {
     #[test]
     fn the_toast_is_outside_the_chrome_that_idles() {
         let html = render_group(true, false, Some("Sam paused at 12:04".into()));
+        assert!(
+            html.contains(r#"<div class="pharos-activity-toast""#),
+            "{html}"
+        );
+        // The toast sits in the group notes, which sit outside the chrome.
         let toast = html
-            .find(r#"<div class="pharos-activity-toast""#)
-            .expect("toast rendered");
+            .find(r#"<div class="pharos-watch-notes""#)
+            .expect("notes rendered");
         let top = html.find(r#"class="pharos-watch-top""#).expect("top bar");
         let controls = html.find(r#"class="pharos-controls""#).expect("controls");
         assert!(top < toast && toast < controls, "{html}");

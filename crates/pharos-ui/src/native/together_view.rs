@@ -5,7 +5,7 @@
 
 use dioxus::prelude::*;
 
-use super::activity::LOG_LINES;
+use super::activity::{WaitPill, LOG_LINES};
 use super::seen::{initial, SeenRow};
 use super::together::{GroupSummary, Member};
 
@@ -203,6 +203,69 @@ pub fn ActivityToast(line: Option<String>) -> Element {
         return rsx! {};
     };
     rsx! { div { class: "pharos-activity-toast", role: "status", aria_live: "polite", "{line}" } }
+}
+
+/// The group notes' content, apart from the toast, as the watch page passes
+/// it through the player.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NotesView {
+    pub connection: Option<String>,
+    pub wait: Option<WaitPill>,
+    pub status: Option<String>,
+    pub undo: bool,
+}
+
+/// What the viewer needs to know about the group over the video, stacked
+/// under the top bar and outside the chrome, so each shows whether or not
+/// the controls are up (spec 038 G5): a lost connection, who the group waits
+/// on, a group that ended or could not be rejoined, Leave's undo, and the
+/// newest activity line.
+#[component]
+pub fn GroupNotes(
+    #[props(default)] connection: Option<String>,
+    #[props(default)] wait: Option<WaitPill>,
+    #[props(default)] status: Option<String>,
+    /// Leave's undo, while it can still be taken.
+    #[props(default)]
+    undo: bool,
+    #[props(default)] on_undo: EventHandler<()>,
+    #[props(default)] toast: Option<String>,
+) -> Element {
+    // The toast saying who it waits on repeats the pill.
+    let toast = toast.filter(|t| wait.as_ref().map_or(true, |w| w.text() != *t));
+    if connection.is_none() && wait.is_none() && status.is_none() && !undo && toast.is_none() {
+        return rsx! {};
+    }
+    rsx! {
+        div { class: "pharos-watch-notes",
+            if let Some(line) = connection {
+                p { class: "pharos-watch-note pharos-connection-lost", role: "status", "{line}" }
+            }
+            if let Some(pill) = wait {
+                p {
+                    class: if matches!(pill, WaitPill::Ready) { "pharos-wait-pill is-ready" } else { "pharos-wait-pill" },
+                    role: "status",
+                    aria_live: "polite",
+                    {pill.text()}
+                }
+            }
+            if let Some(message) = status {
+                p { class: "pharos-watch-note", role: "status", "{message}. You can keep watching." }
+            }
+            if undo {
+                p { class: "pharos-watch-note pharos-leave-undo", role: "status",
+                    "You left the group. "
+                    button {
+                        class: "pharos-button pharos-button-secondary",
+                        r#type: "button",
+                        onclick: move |_| on_undo.call(()),
+                        "Undo"
+                    }
+                }
+            }
+            ActivityToast { line: toast }
+        }
+    }
 }
 
 /// "In this group": what each member has seen of the item shown. `rows` has
@@ -440,6 +503,46 @@ mod tests {
         );
         let html = render(|| rsx! { ActivityToast { line: None } });
         assert!(!html.contains("pharos-activity-toast"), "{html}");
+    }
+
+    #[test]
+    fn group_notes_stack_what_is_happening_and_nothing_when_quiet() {
+        let html = render(|| rsx! { GroupNotes {} });
+        assert!(!html.contains("pharos-watch-notes"), "{html}");
+        let html = render(|| {
+            rsx! { GroupNotes {
+                connection: Some("Connection lost. Reconnecting…".to_owned()),
+                wait: Some(WaitPill::Waiting("Waiting for Sam".to_owned())),
+                status: Some("This group has ended".to_owned()),
+                undo: true,
+                toast: Some("Bo joined".to_owned()),
+            } }
+        });
+        let at = |needle: &str| {
+            html.find(needle)
+                .unwrap_or_else(|| panic!("{needle}: {html}"))
+        };
+        assert!(at("Connection lost") < at("Waiting for Sam"), "{html}");
+        assert!(at("Waiting for Sam") < at("This group has ended. You can keep watching."));
+        assert!(at(">Undo<") < at("Bo joined"), "{html}");
+        assert!(!html.contains("role=\"alert\""), "news, not alerts: {html}");
+    }
+
+    #[test]
+    fn the_toast_does_not_repeat_the_wait_pill() {
+        let html = render(|| {
+            rsx! { GroupNotes {
+                wait: Some(WaitPill::Waiting("Waiting for Sam".to_owned())),
+                toast: Some("Waiting for Sam".to_owned()),
+            } }
+        });
+        assert_eq!(html.matches("Waiting for Sam").count(), 1, "{html}");
+        assert!(!html.contains("pharos-activity-toast"), "{html}");
+        let ready = render(|| rsx! { GroupNotes { wait: Some(WaitPill::Ready) } });
+        assert!(
+            ready.contains("is-ready") && ready.contains("Everyone"),
+            "{ready}"
+        );
     }
 
     #[test]
