@@ -147,7 +147,12 @@ pub struct Store {
     crumbs: VecDeque<Crumb>,
     events: VecDeque<KeptEvent>,
     renderer: Option<String>,
+    /// Server trace ids the viewer was shown, newest last (038 FR-404).
+    traces: VecDeque<String>,
 }
+
+/// Trace ids a report keeps.
+const MAX_TRACES: usize = 8;
 
 impl Store {
     pub fn note(&mut self, wall_ms: u64, text: &str) {
@@ -184,6 +189,18 @@ impl Store {
         });
     }
 
+    /// Keeps a trace id the viewer was shown, once, so a report can quote it.
+    pub fn trace(&mut self, id: &str) {
+        let id = kept_text(id, MAX_FIELD_BYTES);
+        if id.is_empty() || self.traces.contains(&id) {
+            return;
+        }
+        if self.traces.len() >= MAX_TRACES {
+            self.traces.pop_front();
+        }
+        self.traces.push_back(id);
+    }
+
     pub fn clear(&mut self) {
         *self = Store::default();
     }
@@ -209,6 +226,11 @@ pub fn note(text: &str) {
     STORE.with(|s| s.borrow_mut().note(now_ms(), text));
 }
 
+/// Keeps a server trace id the viewer was shown, for the report's `traceIds`.
+pub fn trace(id: &str) {
+    STORE.with(|s| s.borrow_mut().trace(id));
+}
+
 /// Keeps `event` for a report, whether or not diagnostics are opted in.
 pub fn record_event(event: &ClientEvent) {
     STORE.with(|s| s.borrow_mut().event(now_ms(), event));
@@ -230,18 +252,20 @@ pub struct ReportContext {
     pub route: String,
     pub breadcrumbs: Vec<Crumb>,
     pub events: Vec<KeptEvent>,
+    pub trace_ids: Vec<String>,
     pub captured_at_ms: u64,
 }
 
 impl ReportContext {
     /// The rings and the page as they are now.
     pub fn capture() -> Self {
-        let (breadcrumbs, events, renderer) = STORE.with(|s| {
+        let (breadcrumbs, events, renderer, trace_ids) = STORE.with(|s| {
             let s = s.borrow();
             (
                 s.crumbs.iter().cloned().collect(),
                 s.events.iter().cloned().collect(),
                 s.renderer.clone(),
+                s.traces.iter().cloned().collect(),
             )
         });
         ReportContext {
@@ -257,6 +281,7 @@ impl ReportContext {
             route: kept_text(&super::platform::current_path(), MAX_FIELD_BYTES),
             breadcrumbs,
             events,
+            trace_ids,
             captured_at_ms: now_ms(),
         }
     }
@@ -295,7 +320,7 @@ pub fn build_bundle(ctx: &ReportContext) -> Value {
         "route": kept_text(&ctx.route, MAX_FIELD_BYTES),
         "breadcrumbs": breadcrumbs,
         "events": events,
-        "traceIds": [],
+        "traceIds": ctx.trace_ids,
         "capturedAtMs": ctx.captured_at_ms,
     })
 }
@@ -526,8 +551,26 @@ mod tests {
             route: "/watch/9".into(),
             breadcrumbs: store.crumbs.iter().cloned().collect(),
             events: store.events.iter().cloned().collect(),
+            trace_ids: store.traces.iter().cloned().collect(),
             captured_at_ms: 1_700_000_000_000,
         }
+    }
+
+    /// 038 FR-404: a trace id the viewer was shown reaches the report once,
+    /// and the ring keeps only the newest.
+    #[test]
+    fn a_shown_trace_id_is_quoted_by_the_report() {
+        let mut store = Store::default();
+        store.trace("4bf92f3577b34da6a3ce929d0e0e4736");
+        store.trace("4bf92f3577b34da6a3ce929d0e0e4736");
+        store.trace("");
+        let bundle = build_bundle(&context(&store));
+        assert_eq!(bundle["traceIds"], json!(["4bf92f3577b34da6a3ce929d0e0e4736"]));
+        for n in 0..20 {
+            store.trace(&format!("t{n}"));
+        }
+        assert_eq!(store.traces.len(), MAX_TRACES);
+        assert_eq!(store.traces.back().map(String::as_str), Some("t19"));
     }
 
     #[test]
