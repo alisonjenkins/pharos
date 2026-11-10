@@ -70,6 +70,21 @@ impl Revisit {
         }
     }
 
+    /// Drops every page kept, for a session that ended: the next user must
+    /// never be drawn the last one's Home or titles. Writes only what holds
+    /// something, so an empty memory wakes no reader.
+    pub fn forget(&mut self) {
+        if self.home.peek().is_some() {
+            self.home.set(None);
+        }
+        if !self.titles.peek().is_empty() {
+            self.titles.set(Recent::new(TITLES));
+        }
+        if !self.places.peek().is_empty() {
+            self.places.set(Recent::new(PLACES));
+        }
+    }
+
     /// The scroll position to put back on the page at `path`: only on a
     /// return by Back or Forward, and only when one was kept.
     pub fn place_for(&self, path: &str) -> Option<f64> {
@@ -117,6 +132,24 @@ mod tests {
             back.set(true);
             assert_eq!(revisit.place_for("/ui/"), Some(640.0));
             assert_eq!(revisit.place_for("/ui/title/r1"), None);
+            rsx! {}
+        });
+        dom.rebuild_in_place();
+    }
+
+    /// FR-206 with sign-in: the memory of one session is gone before the
+    /// next user's first page.
+    #[test]
+    fn forget_drops_every_kept_page() {
+        let mut dom = VirtualDom::new(|| {
+            let mut revisit = use_hook(Revisit::new);
+            revisit.home.set(Some(Home::default()));
+            revisit.places.write().put("/ui/".to_owned(), 640.0);
+            revisit.back.set(true);
+            revisit.forget();
+            assert!(revisit.home.peek().is_none());
+            assert!(revisit.titles.peek().is_empty());
+            assert_eq!(revisit.place_for("/ui/"), None);
             rsx! {}
         });
         dom.rebuild_in_place();

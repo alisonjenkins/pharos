@@ -2029,11 +2029,16 @@ fn NativeApp(route: Route) -> Element {
     // Signing out forgets the names pages loaded, so the tab title of a
     // signed-out page never shows the last user's item to the next one.
     let PageNames(mut names) = use_context::<PageNames>();
+    let mut revisit = try_use_context::<super::revisit::Revisit>();
     use_effect(move || {
         if matches!(machine.read().phase(), Phase::SignIn { .. }) {
             // Every road to sign-in, a revoked session or a refused resume
             // included: the next user's report must not carry this trail.
             report::forget();
+            // Nor may Back draw them the last user's Home or titles.
+            if let Some(revisit) = revisit.as_mut() {
+                revisit.forget();
+            }
             if !names.peek().is_empty() {
                 names.write().clear();
             }
