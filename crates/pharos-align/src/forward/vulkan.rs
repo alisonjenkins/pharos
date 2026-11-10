@@ -55,11 +55,42 @@ impl Linear {
     }
 }
 
+/// A feature-extractor conv as matmuls on channels-last `[1, t, cin]`:
+/// frames are grouped `stride` to a row, and block `j` of the kernel (taps
+/// `j*stride..`) multiplies the rows shifted by `j`. Burn's strided conv1d
+/// ran at about 0.1 TFLOPS here and was 95% of a window's time.
 struct FeConv {
-    w: Tensor<3>,
+    /// Per block, `[1, taps*cin, 512]`, rows ordered tap-major then channel.
+    blocks: Vec<Tensor<3>>,
     b: Tensor<1>,
     ln: Norm,
+    cin: usize,
+    k: usize,
     stride: usize,
+}
+
+impl FeConv {
+    fn apply(&self, x: Tensor<3>) -> Tensor<3> {
+        let [_, t, _] = x.dims();
+        let (s, cin) = (self.stride, self.cin);
+        let tout = (t - self.k) / s + 1;
+        let rows = tout + self.blocks.len() - 1;
+        let need = rows * s;
+        let x = if t >= need {
+            x.narrow(1, 0, need)
+        } else {
+            let pad = Tensor::zeros([1, need - t, cin], &x.device());
+            Tensor::cat(vec![x, pad], 1)
+        };
+        let grouped = x.reshape([1, rows, s * cin]);
+        let mut out = self.b.clone().unsqueeze::<3>();
+        for (j, w) in self.blocks.iter().enumerate() {
+            let taps = w.dims()[1] / cin;
+            let xb = grouped.clone().narrow(1, j, tout).narrow(2, 0, taps * cin);
+            out = out + xb.matmul(w.clone());
+        }
+        out
+    }
 }
 
 struct Layer {
@@ -142,14 +173,28 @@ impl VulkanModel {
             .enumerate()
             .map(|(i, &(cin, k, stride))| {
                 let p = format!("feature_extractor.conv_layers.{i}");
+                let w = weights.get(&format!("{p}.conv.weight"), &[FE_C, cin, k])?;
+                let blocks = (0..k.div_ceil(stride))
+                    .map(|j| {
+                        let taps = stride.min(k - j * stride);
+                        let mut m = vec![0f32; taps * cin * FE_C];
+                        for tap in 0..taps {
+                            for c in 0..cin {
+                                for o in 0..FE_C {
+                                    m[(tap * cin + c) * FE_C + o] =
+                                        w[(o * cin + c) * k + j * stride + tap];
+                                }
+                            }
+                        }
+                        tensor(&m, [1, taps * cin, FE_C], dev)
+                    })
+                    .collect();
                 Ok(FeConv {
-                    w: tensor(
-                        weights.get(&format!("{p}.conv.weight"), &[FE_C, cin, k])?,
-                        [FE_C, cin, k],
-                        dev,
-                    ),
+                    blocks,
                     b: t1(&format!("{p}.conv.bias"), FE_C)?,
                     ln: ln(&format!("{p}.layer_norm"), FE_C)?,
+                    cin,
+                    k,
                     stride,
                 })
             })
@@ -190,17 +235,11 @@ impl VulkanModel {
         if super::cpu::CpuModel::frames(wave.len()) == 0 {
             return Ok(Vec::new());
         }
-        let mut x: Tensor<3> = tensor(wave, [1, 1, wave.len()], &self.device);
+        let mut x: Tensor<3> = tensor(wave, [1, wave.len(), 1], &self.device);
         for c in &self.fe {
-            x = conv1d(
-                x,
-                c.w.clone(),
-                Some(c.b.clone()),
-                ConvOptions::new([c.stride], [0], [1], 1),
-            );
-            x = gelu(c.ln.apply(x.swap_dims(1, 2))).swap_dims(1, 2);
+            x = gelu(c.ln.apply(c.apply(x)));
         }
-        let mut x = self.fp.apply(self.fp_ln.apply(x.swap_dims(1, 2)));
+        let mut x = self.fp.apply(self.fp_ln.apply(x));
         let t = x.dims()[1];
 
         // Grouped positional conv, pad 64 each side; the even kernel makes one
