@@ -8243,6 +8243,7 @@ mod tests {
                     artist: None,
                     stereo: None,
                     damaged: false,
+                    new_children: 0,
                 };
                 let mut home = revisit.home;
                 home.set(Some(Home {
