@@ -974,8 +974,11 @@ pub fn on_scroll_settled(_on_settled: impl FnMut() + 'static) -> ScrollWatch {
     ScrollWatch
 }
 
-pub fn center_child(_id: &str, _at: u32) -> bool {
-    false
+/// Scrolls the panel `id` so its child `at` sits in the middle (the lyrics'
+/// sung line, B1033). The page answers later: true means asked, not done.
+pub fn center_child(id: &str, at: u32) -> bool {
+    run(tv_page::center_child_js(id, at));
+    true
 }
 
 pub fn reveal(_list: &str, _id: &str) {}
