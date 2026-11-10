@@ -748,6 +748,7 @@ mod tests {
         let tally = ScanTally {
             roots: 3,
             failed_roots: 1,
+            incomplete_roots: 0,
             added: 4,
             changed: 2,
             removed: 1,

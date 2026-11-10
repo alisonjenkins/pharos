@@ -591,6 +591,7 @@ mod tests {
             updated: vec![],
             removed: vec![],
             skipped: 0,
+            walk_errors: 0,
         };
         warm_scanned_subtitles(&state, &outcome).await;
 

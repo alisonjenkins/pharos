@@ -1207,6 +1207,7 @@ impl<P: Prober> FsScanner<P> {
             tracing::info!(scan_id, removed, ids = ?swept, "swept rows for files removed from disk");
         }
         outcome.removed = swept;
+        outcome.walk_errors = walk_errors;
         tracing::debug!(
             scan_id,
             added = outcome.added.len(),
@@ -6648,6 +6649,8 @@ mod tests {
             second.removed.is_empty(),
             "must not sweep on an incomplete walk"
         );
+        // The caller is told, so the pass is not reported as complete (B1285).
+        assert!(second.walk_errors > 0, "{second:?}");
         assert_eq!(
             store.list().await.unwrap().len(),
             1,

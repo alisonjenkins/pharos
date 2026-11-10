@@ -595,7 +595,7 @@ fn write_event(mut out: event::Builder<'_>, event: &Event) {
                 task.set_added(wire(tally.added));
                 task.set_changed(wire(tally.changed));
                 task.set_removed(wire(tally.removed));
-                task.set_failed_roots(wire(tally.failed_roots));
+                task.set_failed_roots(wire(tally.unread_roots()));
             }
         }
         Payload::Resync => out.set_resync(()),

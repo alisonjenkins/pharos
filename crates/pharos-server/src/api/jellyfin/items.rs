@@ -7730,8 +7730,12 @@ pub(crate) fn spawn_scan_tracked(
                                 updated = outcome.updated.len(),
                                 removed = outcome.removed.len(),
                                 skipped = outcome.skipped,
+                                walk_errors = outcome.walk_errors,
                                 "scan: root scanned"
                             );
+                            if outcome.walk_errors > 0 {
+                                tally.incomplete_roots += 1;
+                            }
                             tally.added += outcome.added.len();
                             tally.changed += outcome.updated.len();
                             tally.removed += outcome.removed.len();
