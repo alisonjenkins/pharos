@@ -487,6 +487,16 @@ pub fn artwork_source_is_item_servable(source: &str) -> bool {
     )
 }
 
+/// One `artwork` row as the stale-art sweep reads it. `(item_id, role)` keys
+/// the row; `source` and `locator` say where its bytes are supposed to be.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtworkRow {
+    pub item_id: MediaId,
+    pub role: String,
+    pub source: String,
+    pub locator: String,
+}
+
 /// LIB-C4 — stable 32-hex wire id for an aggregate entity (genre /
 /// artist / album / studio), keyed on a `kind` namespace + `name`. Pure
 /// arithmetic over the UTF-8 bytes — not IO, so it lives in core (V12
@@ -4389,6 +4399,31 @@ pub trait MediaStore: Send + Sync {
         &self,
         provider: &str,
     ) -> impl std::future::Future<Output = DomainResult<u64>> + Send;
+
+    /// One page of the artwork rows whose source the image route serves from
+    /// disk ([`artwork_source_is_item_servable`]), ordered by `(item_id, role)`
+    /// and strictly after `after`. `None` starts from the first row.
+    ///
+    /// Keyset paging: a sweep that relinks or deletes the rows it has just read
+    /// neither skips nor revisits one, because the cursor is a key, not an
+    /// offset.
+    fn servable_artwork_page(
+        &self,
+        after: Option<(MediaId, String)>,
+        limit: i64,
+    ) -> impl std::future::Future<Output = DomainResult<Vec<ArtworkRow>>> + Send;
+
+    /// Remove the artwork row `(item_id, role)` whose file is gone and bump the
+    /// item's art version so clients refetch. A removed Primary also clears
+    /// `has_primary_art`. With `readmit`, the item's `metadata_refreshed_at` is
+    /// cleared so the next match pass picks it up for online art, unless its
+    /// match is `manual` (a user's explicit pick is never revisited).
+    fn remove_dead_artwork(
+        &self,
+        item_id: MediaId,
+        role: &str,
+        readmit: bool,
+    ) -> impl std::future::Future<Output = DomainResult<()>> + Send;
 
     /// Count of linked genres/people/studios for `id` (fill-if-empty gate).
     fn item_entity_counts(

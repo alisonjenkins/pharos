@@ -1514,6 +1514,104 @@ impl MediaStore for SqliteStore {
         Ok(affected)
     }
 
+    async fn servable_artwork_page(
+        &self,
+        after: Option<(MediaId, String)>,
+        limit: i64,
+    ) -> DomainResult<Vec<pharos_core::ArtworkRow>> {
+        // LOWER() matches artwork_source_is_item_servable's case-insensitive test.
+        let rows = match after {
+            None => {
+                sqlx::query_as::<_, (i64, String, String, String)>(
+                    "SELECT item_id, role, source, locator FROM artwork \
+                     WHERE LOWER(source) IN ('local','tmdb','tvdb','musicbrainz') \
+                     ORDER BY item_id, role LIMIT ?",
+                )
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await
+            }
+            Some((after_id, after_role)) => {
+                let after_i64 = i64::try_from(after_id)
+                    .map_err(|e| DomainError::Backend(format!("id overflow: {e}")))?;
+                sqlx::query_as::<_, (i64, String, String, String)>(
+                    "SELECT item_id, role, source, locator FROM artwork \
+                     WHERE LOWER(source) IN ('local','tmdb','tvdb','musicbrainz') \
+                       AND (item_id, role) > (?, ?) \
+                     ORDER BY item_id, role LIMIT ?",
+                )
+                .bind(after_i64)
+                .bind(after_role)
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await
+            }
+        }
+        .map_err(|e| DomainError::Backend(e.to_string()))?;
+        rows.into_iter()
+            .map(|(item_id, role, source, locator)| {
+                Ok(pharos_core::ArtworkRow {
+                    item_id: u64::try_from(item_id)
+                        .map_err(|e| DomainError::Backend(format!("id negative: {e}")))?,
+                    role,
+                    source,
+                    locator,
+                })
+            })
+            .collect()
+    }
+
+    #[tracing::instrument(skip(self), fields(media.id = %item_id, artwork.role = %role))]
+    async fn remove_dead_artwork(
+        &self,
+        item_id: MediaId,
+        role: &str,
+        readmit: bool,
+    ) -> DomainResult<()> {
+        let id_i64 = i64::try_from(item_id)
+            .map_err(|e| DomainError::Backend(format!("id overflow: {e}")))?;
+        // One transaction: the artwork row, the Primary flag, the art version
+        // and the re-admission either all land or none do.
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| DomainError::Backend(e.to_string()))?;
+        sqlx::query("DELETE FROM artwork WHERE item_id = ? AND role = ?")
+            .bind(id_i64)
+            .bind(role)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| DomainError::Backend(e.to_string()))?;
+        if role.eq_ignore_ascii_case("Primary") {
+            sqlx::query("UPDATE media_items SET has_primary_art = 0 WHERE id = ?")
+                .bind(id_i64)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| DomainError::Backend(e.to_string()))?;
+        }
+        sqlx::query("UPDATE media_items SET art_version = art_version + 1 WHERE id = ?")
+            .bind(id_i64)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| DomainError::Backend(e.to_string()))?;
+        if readmit {
+            // A manual match is the user's explicit pick: never re-admit it.
+            sqlx::query(
+                "UPDATE media_items SET metadata_refreshed_at = NULL WHERE id = ? \
+                   AND (match_source IS NULL OR match_source <> 'manual')",
+            )
+            .bind(id_i64)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| DomainError::Backend(e.to_string()))?;
+        }
+        tx.commit()
+            .await
+            .map_err(|e| DomainError::Backend(e.to_string()))?;
+        Ok(())
+    }
+
     #[tracing::instrument(skip(self), fields(media.id = %item_id))]
     async fn item_entity_counts(&self, item_id: MediaId) -> DomainResult<EntityCounts> {
         let id_i64 = i64::try_from(item_id)

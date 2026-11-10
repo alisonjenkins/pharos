@@ -3854,3 +3854,131 @@ async fn postgres_conformance() {
     );
     run_conformance(p).await;
 }
+
+/// V1140 — the stale-art sweep's store reads and writes: keyset paging over the
+/// servable artwork rows, a removed Primary clearing its flag and bumping the
+/// art version, and re-admission that never reaches a manual match.
+async fn run_artwork_repair_conformance<S: MediaStore>(store: S) {
+    const NOW: i64 = 1_000;
+    const TTL_CUTOFF: i64 = 500;
+    for id in 1..=3 {
+        store.put(media_item(id, "a film")).await.unwrap();
+    }
+    store
+        .set_artwork(1, "Primary", "local", "/lib/one/poster.jpg")
+        .await
+        .unwrap();
+    store
+        .set_artwork(1, "Backdrop", "url", "https://example.invalid/one.jpg")
+        .await
+        .unwrap();
+    store
+        .set_artwork(2, "Backdrop", "TMDB", "/cache/two/backdrop.jpg")
+        .await
+        .unwrap();
+    store
+        .set_artwork(2, "Logo", "local", "/lib/two/logo.png")
+        .await
+        .unwrap();
+    store
+        .set_artwork(3, "Primary", "upload", "/cache/three/upload.jpg")
+        .await
+        .unwrap();
+
+    // Pages of two over the servable rows in (item, role) order. The url and
+    // upload rows are never served; the uppercase TMDB source still is.
+    let keys = |rows: Vec<pharos_core::ArtworkRow>| {
+        rows.into_iter()
+            .map(|r| (r.item_id, r.role))
+            .collect::<Vec<_>>()
+    };
+    let cursor =
+        |rows: &[pharos_core::ArtworkRow]| rows.last().map(|r| (r.item_id, r.role.clone()));
+    let first = store.servable_artwork_page(None, 2).await.unwrap();
+    assert_eq!(
+        keys(first.clone()),
+        vec![(1, "Primary".to_owned()), (2, "Backdrop".to_owned())]
+    );
+    assert_eq!(first[1].source, "TMDB");
+    let second = store
+        .servable_artwork_page(cursor(&first), 2)
+        .await
+        .unwrap();
+    assert_eq!(keys(second.clone()), vec![(2, "Logo".to_owned())]);
+    let third = store
+        .servable_artwork_page(cursor(&second), 2)
+        .await
+        .unwrap();
+    assert!(third.is_empty(), "the page after the last row is empty");
+
+    // A removed Primary clears has_primary_art and bumps art_version.
+    let before = store.get(1).await.unwrap();
+    assert!(before.has_primary_art);
+    store
+        .remove_dead_artwork(1, "Primary", false)
+        .await
+        .unwrap();
+    let after = store.get(1).await.unwrap();
+    assert!(!after.has_primary_art, "a removed Primary clears the flag");
+    assert_eq!(
+        after.art_version,
+        before.art_version + 1,
+        "a removal bumps the art version"
+    );
+    let rows = store.artwork_for(1).await.unwrap();
+    assert!(rows.iter().all(|(role, _, _)| role != "Primary"));
+    assert!(rows.iter().any(|(role, _, _)| role == "Backdrop"));
+
+    // Re-admission: both items are matched and fresh, so neither is due.
+    let ids = |items: Vec<MediaItem>| items.into_iter().map(|i| i.id).collect::<Vec<_>>();
+    for (id, source) in [(2, "search"), (3, "manual")] {
+        store
+            .set_item_match(id, "tmdb", "ext-1", source, None, NOW)
+            .await
+            .unwrap();
+    }
+    let due = ids(store.items_needing_match(10, TTL_CUTOFF).await.unwrap());
+    assert!(!due.contains(&2) && !due.contains(&3));
+
+    // A search match is re-admitted by a dead row's removal.
+    store
+        .remove_dead_artwork(2, "Backdrop", true)
+        .await
+        .unwrap();
+    let due = ids(store.items_needing_match(10, TTL_CUTOFF).await.unwrap());
+    assert!(due.contains(&2), "a search match is re-admitted");
+
+    // A manual match keeps its refresh stamp and is never re-admitted.
+    store.remove_dead_artwork(3, "Primary", true).await.unwrap();
+    assert!(store.artwork_for(3).await.unwrap().is_empty());
+    assert_eq!(
+        store.get(3).await.unwrap().metadata_refreshed_at,
+        Some(NOW),
+        "a manual match is never re-admitted"
+    );
+    let due = ids(store.items_needing_match(10, TTL_CUTOFF).await.unwrap());
+    assert!(!due.contains(&3));
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn sqlite_artwork_repair_conformance() {
+    let s = pharos_store_sqlx::sqlite::SqliteStore::connect("sqlite::memory:")
+        .await
+        .expect("connect in-memory sqlite");
+    run_artwork_repair_conformance(s).await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn postgres_artwork_repair_conformance() {
+    let Ok(url) = std::env::var("PHAROS_TEST_POSTGRES_URL") else {
+        eprintln!("SKIP postgres_artwork_repair_conformance: PHAROS_TEST_POSTGRES_URL unset");
+        return;
+    };
+    let url = fresh_postgres_url(&url, "artwork_repair").await;
+    let p = pharos_store_sqlx::postgres::PostgresStore::connect(&url)
+        .await
+        .expect("connect postgres");
+    run_artwork_repair_conformance(p).await;
+}

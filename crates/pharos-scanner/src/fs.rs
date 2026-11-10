@@ -5282,6 +5282,23 @@ mod tests {
             Ok(0)
         }
 
+        async fn servable_artwork_page(
+            &self,
+            _after: Option<(MediaId, String)>,
+            _limit: i64,
+        ) -> DomainResult<Vec<pharos_core::ArtworkRow>> {
+            Ok(Vec::new())
+        }
+
+        async fn remove_dead_artwork(
+            &self,
+            _item_id: MediaId,
+            _role: &str,
+            _readmit: bool,
+        ) -> DomainResult<()> {
+            Ok(())
+        }
+
         async fn item_entity_counts(
             &self,
             item_id: MediaId,

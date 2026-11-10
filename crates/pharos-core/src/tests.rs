@@ -455,6 +455,25 @@ impl MediaStore for MemStore {
         Ok(0)
     }
 
+    async fn servable_artwork_page(
+        &self,
+        _after: Option<(MediaId, String)>,
+        _limit: i64,
+    ) -> DomainResult<Vec<ArtworkRow>> {
+        // No artwork table here; the stale-art sweep is exercised against sqlx.
+        Ok(Vec::new())
+    }
+
+    async fn remove_dead_artwork(
+        &self,
+        _item_id: MediaId,
+        _role: &str,
+        _readmit: bool,
+    ) -> DomainResult<()> {
+        // No artwork table here; exercised against the real sqlx stores.
+        Ok(())
+    }
+
     async fn item_entity_counts(&self, _item_id: MediaId) -> DomainResult<EntityCounts> {
         // MemStore is a lightweight scanner test-double with no genre/people/
         // studio join tables; the online-enrich fill-if-empty gate is exercised
