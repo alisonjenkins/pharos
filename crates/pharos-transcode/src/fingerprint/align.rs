@@ -143,7 +143,7 @@ fn find_contiguous(times: &[f64], max_skip: f64, secs_per_point: f64) -> Option<
 /// differing bits — so two episodes could share an entire opening, every point
 /// of it inside the 6-bit tolerance, and still seed ZERO shifts because no pair
 /// of points happened to be numerically adjacent. Measured on a real season
-/// (`tests/fixtures/mushoku_s03_fingerprints.txt`): 9 of 10 intro pairs produced
+/// (`tests/fixtures/anime_season_fingerprints.txt`): 9 of 10 intro pairs produced
 /// no candidate shift at all, while the credits window of the same five files
 /// matched 6 of 10. The opening was never compared, not compared and rejected.
 ///
@@ -383,7 +383,7 @@ mod tests {
     /// So two episodes could share an entire opening — every point within the
     /// 6-bit tolerance — and yield ZERO candidate shifts, because not one pair
     /// of points was numerically near-identical. Nine of ten real intro pairs in
-    /// `tests/fixtures/mushoku_s03_fingerprints.txt` were in exactly this state.
+    /// `tests/fixtures/anime_season_fingerprints.txt` were in exactly this state.
     ///
     /// Here every shared point differs by two HIGH bits: Hamming distance 2 (well
     /// inside the threshold) but numerically 0x30000000 apart (hopelessly outside
@@ -486,7 +486,7 @@ mod tests {
     fn the_bounds_check_is_not_what_discarded_the_real_openings() {
         let raw = std::fs::read_to_string(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("tests/fixtures/mushoku_s03_fingerprints.txt"),
+                .join("tests/fixtures/anime_season_fingerprints.txt"),
         )
         .expect("fixture readable");
         let intros: Vec<Vec<u32>> = raw

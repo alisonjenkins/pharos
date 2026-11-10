@@ -7,7 +7,7 @@ Everything here runs inside the Nix devShell (`nix develop --command …`).
 ## 1. Reproduce the failure without media or a cluster
 
 The detector's real inputs are checked in:
-[fixtures-mushoku-s03.txt](./fixtures-mushoku-s03.txt) — 10 rows,
+[fixtures-anime-season.txt](./fixtures-anime-season.txt) — 10 rows,
 `item_id kind hex`, hex being little-endian `u32` fingerprint points as stored in
 `episode_fingerprints.points`.
 
@@ -87,10 +87,10 @@ actual output.
    ```
 5. Named season, end to end:
    ```logql
-   {namespace="pharos",container="pharos"} |= "detection verdicts" |= "Mushoku"
+   {namespace="pharos",container="pharos"} |= "detection verdicts" |= "Show K"
    ```
    Expect `kind=Intro` to move off `no_span=4`.
-6. The user-visible check that closes the loop: play Mushoku Tensei S03 on the
+6. The user-visible check that closes the loop: play Show K S03 on the
    Google TV app and confirm **Skip Intro** appears, over the same window the
    browser shows.
 
