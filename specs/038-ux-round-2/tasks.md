@@ -63,9 +63,9 @@ Id blocks (bugs and invariants are written with the fix):
 
 ## G5 — Watching together feedback
 
-- [ ] T038-501 Check whether a group session rebinds after a reconnect; fix if not (FR-503).
-- [ ] T038-502 [P] Rejoin note (FR-501); waiting pill (FR-502); connection banner in the player (FR-503).
-- [ ] T038-503 [P] Together page (FR-504); Leave undo (FR-505).
+- [x] T038-501 Check whether a group session rebinds after a reconnect; fix if not (FR-503). It does (B894); its outcome is now reported (B1261).
+- [x] T038-502 [P] Rejoin note (FR-501); waiting pill (FR-502); connection banner in the player (FR-503). B1262–B1264.
+- [ ] T038-503 [P] Together page (FR-504); Leave undo (FR-505). Done but for the page refreshing from server push, which follows with schema 41 (B1265).
 
 ## G6 — TV with a remote
 
