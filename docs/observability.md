@@ -56,7 +56,7 @@ The line carries `user`, `device`, `route` and `trace_ids` (comma-separated); op
 
 **Is reporting working?** `sum by (outcome) (increase(pharos_ui_reports_total[1d]))`; any outcome other than `stored` names why a report was lost. `increase(pharos_ui_reports_expired_total[1d])` shows the retention sweep.
 
-**Client spans.** An opted-in user's `ClientSpan`s are re-exported through the server's OTLP exporter under their own ids (ADR-0099), tagged `ui.source=pharos-ui`, so they share a trace with the server spans their calls caused. `sum by (outcome) (rate(pharos_client_spans_total[5m]))`: `invalid_id` means a client is sending malformed W3C ids.
+**Client spans.** An opted-in user's `ClientSpan`s are re-exported through the server's OTLP exporter under their own ids (ADR-0099), tagged `ui.source=pharos-ui`, so they share a trace with the server spans their calls caused. `sum by (outcome) (rate(pharos_client_spans_total[5m]))`: `invalid_id` means a client is sending malformed W3C ids; `out_of_window` means its clock is far off or a span runs over an hour. Client spans follow the server's sampling ratio on their trace id, so a sampled-out trace has neither.
 
 ## Where each invariant lives
 
