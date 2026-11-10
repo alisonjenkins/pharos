@@ -72,7 +72,7 @@ pub struct ReqwestTransport {
 impl ReqwestTransport {
     pub fn new() -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: crate::http_client::client(),
         }
     }
 }

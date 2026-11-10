@@ -1171,10 +1171,30 @@ fn http() -> &'static reqwest::Client {
     static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
     CLIENT.get_or_init(|| {
         let _ = rustls::crypto::ring::default_provider().install_default();
-        reqwest::Client::builder()
-            .user_agent(tv_page::USER_AGENT)
-            .build()
-            .unwrap_or_default()
+        // reqwest 0.13's default verifier is rustls-platform-verifier, which
+        // on Android needs JNI setup this app does not do. Keep the bundled
+        // webpki roots the 0.12 `rustls-tls` feature used.
+        let builder = reqwest::Client::builder().user_agent(tv_page::USER_AGENT);
+        let builder = match rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        {
+            Ok(b) => {
+                let mut tls = b
+                    .with_root_certificates(rustls::RootCertStore {
+                        roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+                    })
+                    .with_no_client_auth();
+                tls.alpn_protocols = vec![b"http/1.1".to_vec()];
+                builder.tls_backend_preconfigured(tls)
+            }
+            Err(error) => {
+                log::error!("server proxy TLS config failed to build: {error}");
+                builder
+            }
+        };
+        builder.build().unwrap_or_default()
     })
 }
 

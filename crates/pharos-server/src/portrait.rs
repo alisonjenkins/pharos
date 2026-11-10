@@ -108,7 +108,7 @@ pub struct HttpPortraits {
 
 impl HttpPortraits {
     pub fn new() -> Self {
-        let client = reqwest::Client::builder()
+        let client = crate::http_client::builder()
             .timeout(FETCH_TIMEOUT)
             .redirect(reqwest::redirect::Policy::none())
             .build()
