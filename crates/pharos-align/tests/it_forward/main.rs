@@ -136,3 +136,90 @@ fn a_window_under_one_frame_gives_no_frames() {
     assert!(out[0].is_empty() && out[2].is_empty());
     assert_eq!(out[1].len(), 49 * 28);
 }
+
+/// Peak RSS a song may reach with the default batch cap (spec 039, V1260).
+const MAX_RSS_KIB: u64 = 2_600 * 1024 * 1024 / 1000;
+/// Set in the child process `peak_rss_stays_within_budget` starts.
+const RSS_CHILD: &str = "PHAROS_ALIGN_RSS_CHILD";
+
+/// A synthetic song's worth of work: seven ~22 s probe windows modelled
+/// together under the default cap, then line windows one at a time, the
+/// longest a full minute.
+fn synthetic_song(aligner: &mut pharos_align::forward::CpuAligner) -> Vec<Vec<(u64, u64)>> {
+    use pharos_align::service::Model;
+    let tokens: Vec<String> = ["la", "da", "na"].iter().map(|s| (*s).to_owned()).collect();
+    let probes: Vec<Vec<f32>> = (0..7)
+        .map(|i| wave(352_000 + i * 1_000, i as u64))
+        .collect();
+    let windows: Vec<(&[f32], &[String])> = probes
+        .iter()
+        .map(|p| (p.as_slice(), tokens.as_slice()))
+        .collect();
+    let mut out: Vec<Vec<(u64, u64)>> = aligner
+        .align_many(&windows, true)
+        .into_iter()
+        .map(Result::unwrap)
+        .collect();
+    for secs in [4, 12, 30, 60] {
+        let line = wave(secs * 16_000, secs as u64);
+        out.push(aligner.align(&line, &tokens, false).unwrap());
+    }
+    out
+}
+
+fn vm_hwm_kib() -> u64 {
+    let status = std::fs::read_to_string("/proc/self/status").unwrap();
+    let line = status.lines().find(|l| l.starts_with("VmHWM:")).unwrap();
+    line.split_whitespace().nth(1).unwrap().parse().unwrap()
+}
+
+#[test]
+#[ignore = "needs PHAROS_ALIGNER_WEIGHTS; run with --release"]
+fn batched_probes_align_as_they_do_alone() {
+    use pharos_align::forward::CpuAligner;
+    let mut batched = CpuAligner {
+        model: model(),
+        batch_samples: pharos_align::config::DEFAULT_BATCH_SAMPLES,
+    };
+    let together = synthetic_song(&mut batched);
+    batched.batch_samples = 1;
+    let alone = synthetic_song(&mut batched);
+    assert_eq!(together, alone);
+}
+
+#[test]
+#[ignore = "needs PHAROS_ALIGNER_WEIGHTS; run with --release"]
+fn peak_rss_stays_within_budget() {
+    if std::env::var_os(RSS_CHILD).is_some() {
+        let mut aligner = pharos_align::forward::CpuAligner {
+            model: model(),
+            batch_samples: pharos_align::config::DEFAULT_BATCH_SAMPLES,
+        };
+        synthetic_song(&mut aligner);
+        let peak = vm_hwm_kib();
+        println!("peak RSS {peak} KiB");
+        assert!(
+            peak <= MAX_RSS_KIB,
+            "peak RSS {peak} KiB over {MAX_RSS_KIB} KiB"
+        );
+        return;
+    }
+    // Its own process, so no other test's memory counts toward the peak.
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "peak_rss_stays_within_budget",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env(RSS_CHILD, "1")
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{text}{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(text.contains("peak RSS"), "the child ran no song: {text}");
+}
