@@ -4021,3 +4021,164 @@ async fn a_listing_folds_the_films_of_a_box_set_into_one_tile() {
         2
     );
 }
+
+/// Spec 038 FR-106: a latest rail folds one show's new episodes and one
+/// album's new tracks into a tile each, placed where the newest child was,
+/// with how many there are; a lone new episode and a film list as items.
+#[actix_web::test]
+async fn latest_rails_fold_new_episodes_and_tracks_into_one_tile() {
+    use pharos_core::{LibraryStore as _, MediaItem, MediaKind, MediaProbe, MediaStore as _};
+    use pharos_server::services::library::LatestTile;
+    let fx = seed_rich().await;
+    let at = |id: u64| Some(1_800_000_000 + id as i64);
+    let episode = |id: u64, show: &str, ep: u32, when: u64| MediaItem {
+        id,
+        path: format!("/libA/{show}/Season 01/e{ep}.mkv").into(),
+        title: format!("{show} {ep}"),
+        kind: MediaKind::Episode,
+        series: Some(pharos_core::SeriesInfo {
+            series_name: show.into(),
+            season_number: Some(1),
+            episode_number: Some(ep),
+            series_folder: Some(format!("/libA/{show}")),
+            series_year: None,
+            series_key: None,
+        }),
+        created_at: at(when),
+        ..MediaItem::default()
+    };
+    let track = |id: u64, album: &str| MediaItem {
+        id,
+        path: format!("/libB/{album}/{id}.flac").into(),
+        title: format!("Track {id}"),
+        kind: MediaKind::Audio,
+        probe: MediaProbe {
+            album: Some(album.into()),
+            album_artist: Some("A Band".into()),
+            ..MediaProbe::default()
+        },
+        created_at: at(id),
+        ..MediaItem::default()
+    };
+    for item in [
+        episode(401, "Show", 1, 401),
+        episode(402, "Show", 2, 402),
+        episode(403, "Show", 3, 403),
+        episode(501, "Another", 1, 1),
+        episode(502, "Another", 2, 2),
+        track(701, "First Record"),
+        track(702, "First Record"),
+        track(703, "Single"),
+    ] {
+        fx.state.stores.put(item).await.unwrap();
+    }
+    fx.state.stores.backfill_library_ids().await.unwrap();
+    let user = pharos_server::services::auth::user_for_token(&fx.state.stores, &fx.user_token)
+        .await
+        .unwrap();
+    let tiles = library::latest_tiles(&fx.state, &user, None, &library::KindFilter::Unset, None)
+        .await
+        .unwrap();
+    let shape: Vec<String> = tiles
+        .iter()
+        .map(|t| match t {
+            LatestTile::Item(item, _) => format!("item {}", item.id),
+            LatestTile::Group { dto, new_children } => {
+                format!(
+                    "{} {} x{new_children}",
+                    dto["Type"].as_str().unwrap(),
+                    dto["Name"].as_str().unwrap()
+                )
+            }
+        })
+        .collect();
+    assert_eq!(
+        shape.get(..3),
+        Some(
+            &[
+                "item 703".to_string(),
+                "MusicAlbum First Record x2".to_string(),
+                "Series Show x3".to_string(),
+            ][..]
+        ),
+        "{shape:?}"
+    );
+    assert!(
+        !shape.iter().any(|s| s == "item 401" || s == "item 701"),
+        "no child is listed beside its group: {shape:?}"
+    );
+    let LatestTile::Group { dto, .. } = &tiles[2] else {
+        panic!("{shape:?}");
+    };
+    assert_eq!(dto["ChildCount"], 3);
+    assert_eq!(
+        dto["DateCreated"],
+        pharos_jellyfin_api::dto::format_iso8601(1_800_000_403)
+    );
+
+    let one = library::latest_tiles(&fx.state, &user, None, &library::KindFilter::Unset, Some(2))
+        .await
+        .unwrap();
+    assert_eq!(one.len(), 2, "the limit counts tiles, not items");
+}
+
+/// FR-106 on the wire: the home rail carries the group as its series with
+/// `newChildren`, and `/Items/Latest` folds unless `GroupItems=false`.
+#[actix_web::test]
+async fn home_rails_and_jellyfin_latest_carry_the_fold() {
+    use actix_web::test;
+    use pharos_api::pharos_capnp::{home_result, Kind};
+
+    let (server, fx) = crate::revocation::start().await;
+    let (client, _closed) = crate::revocation::connect(&server).await;
+    let session = crate::revocation::signed_in(&client, &fx.user_token).await;
+    seed_shows(&fx).await;
+    let library = session.library_request().send().pipeline.get_library();
+    let mut home = library.home_request();
+    home.get().init_ctx();
+    let reply = home.send().promise.await.expect("home");
+    let home_result::Home(home) = reply.get().unwrap().get_result().unwrap().which().unwrap()
+    else {
+        panic!("home answered an error");
+    };
+    let rails = home.unwrap().get_rails().unwrap();
+    let mut groups = Vec::new();
+    for rail in rails.iter() {
+        for tile in rail.get_latest().unwrap().iter() {
+            if tile.get_kind().unwrap() == Kind::Series {
+                groups.push((
+                    tile.get_name().unwrap().to_str().unwrap().to_owned(),
+                    tile.get_new_children(),
+                ));
+            }
+        }
+    }
+    groups.sort();
+    assert_eq!(groups, [("Another".to_owned(), 2), ("Show".to_owned(), 3)]);
+
+    let app = test::init_service(crate::common::build_app(fx.state.clone())).await;
+    let latest = |q: &'static str| {
+        test::TestRequest::get()
+            .uri(&format!("/Items/Latest?ParentId={}{q}", fx.lib_a_wire))
+            .insert_header(("X-Emby-Token", fx.user_token.as_str()))
+            .to_request()
+    };
+    let folded: serde_json::Value = test::call_and_read_body_json(&app, latest("")).await;
+    let types: Vec<&str> = folded
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["Type"].as_str().unwrap())
+        .collect();
+    assert!(types.contains(&"Series"), "{types:?}");
+    assert!(!types.contains(&"Episode"), "{types:?}");
+    let flat: serde_json::Value =
+        test::call_and_read_body_json(&app, latest("&GroupItems=false")).await;
+    let flat_eps = flat
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|d| d["Type"] == "Episode")
+        .count();
+    assert_eq!(flat_eps, 3);
+}
