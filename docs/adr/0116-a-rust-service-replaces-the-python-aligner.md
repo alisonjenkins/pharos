@@ -23,7 +23,7 @@ We will replace the Python aligner with one Rust service, built from the new cra
 
 1. **Same HTTP contract.**
    - `POST /align`, `GET /healthz`, the same JSON bodies, error statuses and environment variables.
-   - `aligner_version` becomes 3. The server's minimum stays 2, so stored Python answers stay valid.
+   - `aligner_version` becomes 5, once each line answers its `score` (3 was the first Rust value, before scores). The server's minimum stays 2, so stored Python answers stay valid.
    - Spans keep the ADR-0105 names, and `/metrics` is added.
 2. **Same pipeline.**
    - Text, tokens, offset probes, line windows (with the B1165 lead clamp), CTC and ms conversion are ports checked against the Python code by fixtures.
