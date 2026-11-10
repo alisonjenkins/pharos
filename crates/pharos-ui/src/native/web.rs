@@ -732,6 +732,19 @@ thread_local! {
     /// Watches each JASSUB canvas so the lift follows a resize or full
     /// screen: it fires after JASSUB refits the canvas, at most once a frame.
     static STYLED_LIFT_OBSERVER: RefCell<Option<CanvasObserver>> = const { RefCell::new(None) };
+    /// When the styled script's signs show, and whether one shows now: the
+    /// lift waits while one does (B1211).
+    static STYLED_SIGNS: RefCell<Vec<(u64, u64)>> = const { RefCell::new(Vec::new()) };
+    static STYLED_SIGN_SHOWING: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Re-reads whether a sign shows at `t_ms`, and redoes the lift when that
+/// changed.
+fn follow_styled_signs(t_ms: u64) {
+    let showing = STYLED_SIGNS.with(|s| super::subtitles::sign_showing(&s.borrow(), t_ms));
+    if STYLED_SIGN_SHOWING.with(|c| c.replace(showing)) != showing {
+        lift_styled_subtitles();
+    }
 }
 
 /// Whether the player's control bar shows. Both subtitle renderers clear it
@@ -769,6 +782,7 @@ fn observe_styled_canvas(canvas: &web_sys::Element) {
 /// trigger itself.
 fn lift_styled_subtitles() {
     let visible = STYLED_CONTROLS_VISIBLE.with(Cell::get);
+    let sign_showing = STYLED_SIGN_SHOWING.with(Cell::get);
     let Some(doc) = web_sys::window().and_then(|w| w.document()) else {
         return;
     };
@@ -809,8 +823,13 @@ fn lift_styled_subtitles() {
         // must not feed back into its lift.
         let canvas_bottom = frame.get_bounding_client_rect().top()
             + f64::from(canvas.offset_top() + canvas.offset_height());
-        let lift =
-            super::subtitles::styled_lift(visible, canvas_bottom, player_bottom, controls_height);
+        let lift = super::subtitles::styled_lift(
+            visible,
+            sign_showing,
+            canvas_bottom,
+            player_bottom,
+            controls_height,
+        );
         let _ = frame
             .style()
             .set_property("--pharos-ass-lift", &lift.to_string());
@@ -3146,6 +3165,8 @@ async fn draw_paused_frame(
 pub struct StyledSubtitles {
     jassub: Jassub,
     live: Rc<std::cell::Cell<bool>>,
+    video: web_sys::HtmlMediaElement,
+    on_time: Closure<dyn FnMut()>,
 }
 
 impl StyledSubtitles {
@@ -3172,6 +3193,12 @@ impl Drop for StyledSubtitles {
     fn drop(&mut self) {
         self.live.set(false);
         let _ = self.jassub.destroy();
+        let f = self.on_time.as_ref().unchecked_ref();
+        for event in ["timeupdate", "seeked"] {
+            let _ = self.video.remove_event_listener_with_callback(event, f);
+        }
+        STYLED_SIGNS.with(|s| s.borrow_mut().clear());
+        follow_styled_signs(0);
     }
 }
 
@@ -3277,6 +3304,42 @@ pub async fn styled_subtitles(
         );
     }
     let live = Rc::new(std::cell::Cell::new(true));
+    STYLED_SIGNS.with(|s| s.borrow_mut().clear());
+    follow_styled_signs(0);
+    let on_time: Closure<dyn FnMut()> = Closure::new({
+        let video = video.clone();
+        move || follow_styled_signs((video.current_time().max(0.0) * 1000.0) as u64)
+    });
+    for event in ["timeupdate", "seeked"] {
+        let _ = video.add_event_listener_with_callback(event, on_time.as_ref().unchecked_ref());
+    }
+    // The signs' times, from the script JASSUB fetched (a cached read).
+    spawn_detached({
+        let live = Rc::clone(&live);
+        let url = url.to_owned();
+        let video = video.clone();
+        async move {
+            match get_text(&url).await {
+                Ok(script) if live.get() => {
+                    let spans = super::subtitles::sign_spans(&script);
+                    web_sys::console::info_1(
+                        &format!("pharos: styled script signs={}", spans.len()).into(),
+                    );
+                    STYLED_SIGNS.with(|s| *s.borrow_mut() = spans);
+                    follow_styled_signs((video.current_time().max(0.0) * 1000.0) as u64);
+                }
+                Ok(_) => {}
+                Err((status, e)) => {
+                    web_sys::console::warn_1(
+                        &format!(
+                            "pharos: styled script signs not read (status {status:?}: {e}); the lift ignores signs"
+                        )
+                        .into(),
+                    );
+                }
+            }
+        }
+    });
     let ready = wasm_bindgen_futures::JsFuture::from(jassub.ready());
     spawn_detached({
         let live = Rc::clone(&live);
@@ -3305,7 +3368,12 @@ pub async fn styled_subtitles(
             }
         }
     });
-    Ok(StyledSubtitles { jassub, live })
+    Ok(StyledSubtitles {
+        jassub,
+        live,
+        video,
+        on_time,
+    })
 }
 
 /// A thrown value's `message`, or its debug form.
