@@ -38,16 +38,16 @@ Id blocks (bugs and invariants are written with the fix):
 - [ ] T038-205 Home and title pages keep content and scroll on Back (FR-206).
 - [ ] T038-206 Search URL and grouped "see all" (FR-207).
 - [ ] T038-207 [P] Filter selects by arrow keys on web (FR-208); Manage page in the URL (FR-209).
-- [ ] T038-208 [P] Empty, failed and busy states (FR-210); confirms and palette places (FR-211).
-- [ ] T038-209 [P] Hero art at drawn size (FR-212); palette viewport and focus ring, What's New keys and save message (FR-213).
+- [ ] T038-208 Empty, failed and busy states (FR-210); confirms and palette places (FR-211).
+- [ ] T038-209 Hero art at drawn size (FR-212); palette viewport and focus ring, What's New keys and save message (FR-213).
 
 ## G3 — Player controls by touch and pointer
 
 - [ ] T038-300 Reproduce on a touch device profile at 390x844: seek bar ignores touch, control row height, target sizes. Keep the before screenshots.
 - [ ] T038-301 Seek bar: drag, touch, buffered range, focus (FR-301), with a group test for one command per scrub.
 - [ ] T038-302 Narrow-screen control bar and settings sheet (FR-302); screenshots at 390x844 for Alison before merge.
-- [ ] T038-303 [P] 44px targets and double-tap zones (FR-303); wheel rule (FR-304).
-- [ ] T038-304 [P] SVG glyphs (FR-305); small-player seek (FR-306).
+- [ ] T038-303 44px targets and double-tap zones (FR-303); wheel rule (FR-304).
+- [ ] T038-304 SVG glyphs (FR-305); small-player seek (FR-306).
 - [ ] T038-305 Speed control and subtitle delay (FR-307).
 - [ ] T038-306 [ALISON] Key map for `k`/`j` (FR-308).
 
@@ -64,8 +64,8 @@ Id blocks (bugs and invariants are written with the fix):
 ## G5 — Watching together feedback
 
 - [ ] T038-501 Check whether a group session rebinds after a reconnect; fix if not (FR-503).
-- [ ] T038-502 [P] Rejoin note (FR-501); waiting pill (FR-502); connection banner in the player (FR-503).
-- [ ] T038-503 [P] Together page (FR-504); Leave undo (FR-505).
+- [ ] T038-502 Rejoin note (FR-501); waiting pill (FR-502); connection banner in the player (FR-503).
+- [ ] T038-503 Together page (FR-504); Leave undo (FR-505).
 
 ## G6 — TV with a remote
 
