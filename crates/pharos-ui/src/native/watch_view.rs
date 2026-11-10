@@ -205,6 +205,9 @@ pub struct UpNextCard {
     pub seconds: u64,
     /// How much of the countdown has run, 0 to 100.
     pub elapsed_pct: f64,
+    /// The small pill, not the card: the ending is a guess and more than
+    /// the last 15 s are left (038 FR-405).
+    pub pill: bool,
 }
 
 impl UpNextCard {
@@ -218,6 +221,7 @@ impl UpNextCard {
             image: next.and_then(|n| n.image.clone()),
             seconds: left_ms.div_ceil(1_000),
             elapsed_pct: percent(run, of_ms),
+            pill: false,
         }
     }
 }
@@ -988,9 +992,15 @@ pub fn WatchView(
                 if let Some(damage) = c.damage.clone() {
                     PlayerDamageNote { damage }
                 }
-                if let Some(card) = c.up_next.clone() {
-                    UpNext { card, on_control }
-                } else {
+                // The compact player says it in one line in its stage bar
+                // (038 FR-406); the picture there is too small for a card.
+                if let Some(card) = c.up_next.clone().filter(|_| !compact) {
+                    if card.pill {
+                        UpNextPill { card, on_control }
+                    } else {
+                        UpNext { card, on_control }
+                    }
+                } else if c.up_next.is_none() {
                     SkipButton { segments: c.segments.clone(), pos, on_control }
                 }
                 div { class: "pharos-controls",
@@ -1164,6 +1174,30 @@ fn TimeLabels(
 /// The `<track id>` of the subtitle stream `index`.
 pub fn text_track_id(index: u32) -> String {
     format!("pharos-sub-{index}")
+}
+
+/// "Up next" while the ending is a guess: one small line in the corner
+/// that leaves the last scene in view (038 FR-405, V1221).
+#[component]
+fn UpNextPill(card: UpNextCard, on_control: EventHandler<Control>) -> Element {
+    rsx! {
+        aside { class: "pharos-up-next-pill", aria_label: "Up next",
+            span { class: "pharos-up-next-pill-name", "Up next: {card.name}" }
+            button {
+                class: "pharos-up-next-pill-play",
+                r#type: "button",
+                onclick: move |_| on_control.call(Control::PlayNext),
+                "Play now"
+            }
+            button {
+                class: "pharos-up-next-pill-cancel",
+                r#type: "button",
+                aria_label: "Cancel up next",
+                onclick: move |_| on_control.call(Control::CancelNext),
+                "Cancel"
+            }
+        }
+    }
 }
 
 /// The next episode and a countdown to it, over the end of this one.
@@ -3020,6 +3054,30 @@ mod tests {
         );
         assert!(html.contains("--pharos-fill: 52.0%"), "{html}");
         assert!(!html.contains("Skip intro"), "{html}");
+
+        // 038 FR-405, V1221: over a guessed ending the pill shows instead,
+        // and the compact player leaves it to its stage bar (FR-406).
+        let mut pill = controls();
+        let mut card = UpNextCard::of(Some(&next), 60_000, 90_000);
+        card.pill = true;
+        pill.up_next = Some(card.clone());
+        let html = render(pill);
+        assert!(html.contains("pharos-up-next-pill") && html.contains("Up next: The Return"), "{html}");
+        assert!(!html.contains("pharos-up-next-art") && !html.contains("Playing in"), "{html}");
+
+        let mut compact = controls();
+        compact.up_next = Some(card);
+        let mut dom = VirtualDom::new_with_props(
+            |controls: Controls| {
+                rsx! {
+                    WatchView { title: "Pilot", controls, compact: true, on_media: |_| {}, on_control: |_| {} }
+                }
+            },
+            compact,
+        );
+        dom.rebuild_in_place();
+        let html = dioxus_ssr::render(&dom);
+        assert!(!html.contains("pharos-up-next"), "the stage bar says it: {html}");
 
         let plain = UpNextCard::of(None, 1_000, 15_000);
         assert_eq!((plain.name.as_str(), plain.seconds), ("Next episode", 1));
