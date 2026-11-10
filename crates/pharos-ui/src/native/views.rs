@@ -3010,6 +3010,7 @@ mod tests {
             read_position: position.map(|fraction| ReadPosition {
                 locator: "epub1:1:0".into(),
                 fraction,
+                read_at_ms: 0,
             }),
             item: item(ItemKind::Book),
             overview: String::new(),

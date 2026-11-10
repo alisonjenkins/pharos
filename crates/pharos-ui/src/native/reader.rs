@@ -1198,6 +1198,7 @@ mod tests {
         let at = |fraction| ReadPosition {
             locator: "epub1:1:0".into(),
             fraction,
+            read_at_ms: 0,
         };
         assert_eq!(
             book_action(&book(BookFormat::Epub), None),
