@@ -71,7 +71,7 @@ Id blocks (bugs and invariants are written with the fix):
 
 - [ ] T038-600 Reproduce each G6 problem on the TV with a remote (volume 0, read back first) and name or add the signal that shows it; where none exists, T038-602 adds it before any fix.
 - [ ] T038-601 ADR and plan for landing the TV playback line on main; CI compiles the `mobile` feature (FR-601). Landing decided and done in ADR 0115 (2026-11-10); CI compiling `mobile` is still open.
-- [ ] T038-602 TV telemetry (FR-608) first, so the rest can be seen.
+- [x] T038-602 TV telemetry (FR-608) first, so the rest can be seen. B1267, V1230.
 - [ ] T038-603 Search from the banner (FR-602).
 - [ ] T038-604 Return to the opened tile (FR-603).
 - [ ] T038-605 OK on Skip and Up Next; Back order (FR-604, FR-607).
