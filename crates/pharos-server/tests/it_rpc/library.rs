@@ -767,8 +767,8 @@ async fn native_resume_agrees_with_the_jellyfin_resume_route() {
     );
 }
 
-/// Seeds three episodes of "Show" in /libA and one of "Another" in /libB,
-/// with "Show" S01E01 already played.
+/// Seeds three episodes of "Show" in /libA and two of "Another" in /libB,
+/// with "Show" S01E01 played and then "Another" S01E01 played after it.
 async fn seed_shows(fx: &crate::common::Fixture) {
     use pharos_core::{
         LibraryStore as _, MediaItem, MediaKind, MediaStore as _, SeriesInfo, UserDataStore as _,
@@ -793,26 +793,31 @@ async fn seed_shows(fx: &crate::common::Fixture) {
         episode(403, "libA", "Show", 3),
         episode(402, "libA", "Show", 2),
         episode(501, "libB", "Another", 1),
+        episode(502, "libB", "Another", 2),
     ] {
         fx.state.stores.put(item).await.unwrap();
     }
     fx.state.stores.backfill_library_ids().await.unwrap();
-    fx.state
-        .stores
-        .set_user_data(
-            fx.user_id,
-            401,
-            pharos_core::UserItemData {
-                played: true,
-                ..pharos_core::UserItemData::default()
-            },
-        )
-        .await
-        .unwrap();
+    for (id, at) in [(401, 100), (501, 200)] {
+        fx.state
+            .stores
+            .set_user_data(
+                fx.user_id,
+                id,
+                pharos_core::UserItemData {
+                    played: true,
+                    last_played_at: at,
+                    ..pharos_core::UserItemData::default()
+                },
+            )
+            .await
+            .unwrap();
+    }
 }
 
-/// T032: the first unplayed episode of each series, ordered by series name,
-/// scoped to one series on request, only where the policy allows.
+/// T032 / spec 038: the episode after the last played one in each started
+/// series, the series watched most recently first, scoped to one series on
+/// request, only where the policy allows.
 #[actix_web::test]
 async fn next_up_picks_the_first_unplayed_episode_of_each_visible_series() {
     let fx = seed_rich().await;
@@ -826,12 +831,12 @@ async fn next_up_picks_the_first_unplayed_episode_of_each_visible_series() {
         .await
         .unwrap();
     assert_eq!(all.total, 2);
-    assert_eq!(ids(all), [501, 402]);
+    assert_eq!(ids(all), [502, 402]);
 
     let one = library::next_up(&fx.state, &user, None, Some(0))
         .await
         .unwrap();
-    assert_eq!(ids(one), [501], "a limit below 1 still lists one");
+    assert_eq!(ids(one), [502], "a limit below 1 still lists one");
 
     let show = pharos_jellyfin_api::dto::series_id_for_key(Some("/libA/Show"), "Show");
     let scoped = library::next_up(&fx.state, &user, Some(&show), None)
@@ -851,6 +856,163 @@ async fn next_up_picks_the_first_unplayed_episode_of_each_visible_series() {
         .await
         .unwrap();
     assert_eq!(ids(a), [402]);
+}
+
+/// One show in /libA: season 0 special 1, then S01E01–E03 and S02E01.
+async fn seed_one_show(fx: &crate::common::Fixture) {
+    use pharos_core::{LibraryStore as _, MediaItem, MediaKind, MediaStore as _, SeriesInfo};
+    let episode = |id: u64, season: u32, ep: u32| MediaItem {
+        id,
+        path: format!("/libA/Ladder/Season {season:02}/e{ep}.mkv").into(),
+        title: format!("Ladder {season}x{ep}"),
+        kind: MediaKind::Episode,
+        series: Some(SeriesInfo {
+            series_name: "Ladder".into(),
+            season_number: Some(season),
+            episode_number: Some(ep),
+            series_folder: Some("/libA/Ladder".into()),
+            series_year: None,
+            series_key: None,
+        }),
+        ..MediaItem::default()
+    };
+    for item in [
+        episode(600, 0, 1),
+        episode(611, 1, 1),
+        episode(612, 1, 2),
+        episode(613, 1, 3),
+        episode(621, 2, 1),
+    ] {
+        fx.state.stores.put(item).await.unwrap();
+    }
+    fx.state.stores.backfill_library_ids().await.unwrap();
+}
+
+async fn watch(fx: &crate::common::Fixture, id: u64, played: bool, position: u64, at: i64) {
+    use pharos_core::UserDataStore as _;
+    fx.state
+        .stores
+        .set_user_data(
+            fx.user_id,
+            id,
+            pharos_core::UserItemData {
+                played,
+                last_played_position_ticks: position,
+                last_played_at: at,
+                ..pharos_core::UserItemData::default()
+            },
+        )
+        .await
+        .unwrap();
+}
+
+/// Spec 038 FR-101–FR-104 (ADR-0113), on one fixture per case so the
+/// cached item list is fresh for each.
+#[actix_web::test]
+async fn next_up_follows_the_last_played_episode() {
+    async fn case(watched: &[(u64, bool, u64, i64)]) -> Vec<u64> {
+        let fx = seed_rich().await;
+        seed_one_show(&fx).await;
+        for &(id, played, position, at) in watched {
+            watch(&fx, id, played, position, at).await;
+        }
+        let user = pharos_server::services::auth::user_for_token(&fx.state.stores, &fx.user_token)
+            .await
+            .unwrap();
+        library::next_up(&fx.state, &user, None, None)
+            .await
+            .unwrap()
+            .items
+            .iter()
+            .map(|(i, _)| i.id)
+            .collect()
+    }
+    // FR-101: nothing watched, nothing listed.
+    assert_eq!(case(&[]).await, Vec::<u64>::new());
+    // FR-102: the episode after the last played, not the lowest unplayed.
+    assert_eq!(case(&[(612, true, 0, 10)]).await, [613]);
+    // ...across a season boundary.
+    assert_eq!(case(&[(613, true, 0, 10)]).await, [621]);
+    // The most recent play is the anchor, even when it is an earlier episode.
+    assert_eq!(case(&[(613, true, 0, 10), (611, true, 0, 20)]).await, [612]);
+    // Played episodes after the anchor are skipped.
+    assert_eq!(case(&[(611, true, 0, 20), (612, true, 0, 10)]).await, [613]);
+    // A special is never next after a regular episode...
+    assert_eq!(case(&[(611, true, 0, 10)]).await, [612]);
+    // ...but a played special leads on to the regular season.
+    assert_eq!(case(&[(600, true, 0, 10)]).await, [611]);
+    // FR-101: everything after the last played is watched, so left out.
+    assert_eq!(case(&[(621, true, 0, 10)]).await, Vec::<u64>::new());
+    // FR-104: an episode in progress belongs to Continue Watching.
+    assert_eq!(case(&[(612, false, 5_000, 10)]).await, Vec::<u64>::new());
+    assert_eq!(
+        case(&[(611, true, 0, 10), (612, false, 5_000, 5)]).await,
+        Vec::<u64>::new()
+    );
+}
+
+/// FR-103: series ordered by their latest play, newest first.
+#[actix_web::test]
+async fn next_up_lists_the_series_watched_last_first() {
+    let fx = seed_rich().await;
+    seed_shows(&fx).await;
+    seed_one_show(&fx).await;
+    watch(&fx, 611, true, 0, 150).await;
+    let user = pharos_server::services::auth::user_for_token(&fx.state.stores, &fx.user_token)
+        .await
+        .unwrap();
+    let ids: Vec<u64> = library::next_up(&fx.state, &user, None, None)
+        .await
+        .unwrap()
+        .items
+        .iter()
+        .map(|(i, _)| i.id)
+        .collect();
+    // "Another" at 200, "Ladder" at 150, "Show" at 100.
+    assert_eq!(ids, [502, 612, 402]);
+}
+
+/// The Series page asks with `SeriesId`: an unstarted series shows its first
+/// regular episode, and one in progress shows the episode to resume.
+#[actix_web::test]
+async fn scoped_next_up_lists_the_first_or_the_resumed_episode() {
+    let show = pharos_jellyfin_api::dto::series_id_for_key(Some("/libA/Ladder"), "Ladder");
+    for (watched, want) in [(None, 611), (Some((612, false, 5_000, 10)), 612)] {
+        let fx = seed_rich().await;
+        seed_one_show(&fx).await;
+        if let Some((id, played, position, at)) = watched {
+            watch(&fx, id, played, position, at).await;
+        }
+        let user = pharos_server::services::auth::user_for_token(&fx.state.stores, &fx.user_token)
+            .await
+            .unwrap();
+        let page = library::next_up(&fx.state, &user, Some(&show), None)
+            .await
+            .unwrap();
+        let ids: Vec<u64> = page.items.iter().map(|(i, _)| i.id).collect();
+        assert_eq!(ids, [want], "{watched:?}");
+    }
+}
+
+/// FR-105: Next Up reads the viewer's started rows, never a bulk read keyed
+/// by every visible item.
+#[actix_web::test]
+async fn next_up_reads_the_viewers_rows_not_every_items() {
+    use tracing_subscriber::prelude::*;
+    let fx = seed_rich().await;
+    seed_shows(&fx).await;
+    let user = pharos_server::services::auth::user_for_token(&fx.state.stores, &fx.user_token)
+        .await
+        .unwrap();
+    let calls = crate::store_calls::StoreCallLog::default();
+    let _spans =
+        tracing::subscriber::set_default(tracing_subscriber::registry().with(calls.clone()));
+    library::next_up(&fx.state, &user, None, None)
+        .await
+        .unwrap();
+    let made = calls.take();
+    assert!(made.iter().any(|c| c == "started_items"), "{made:?}");
+    assert!(!made.iter().any(|c| c == "user_data_bulk"), "{made:?}");
 }
 
 fn next_up_count(snap: &pharos_test_metrics::CumulativeSnapshotter, outcome: &str) -> u64 {
