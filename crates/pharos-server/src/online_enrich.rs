@@ -192,6 +192,21 @@ pub trait OnlineEnricher: Send + Sync {
         let _ = (kind, id, season, episode, name, languages);
         async { TextsFetch::NotFound }
     }
+    /// B991 — whether the provider holds season `season`, episode `episode`
+    /// of show `id`, asked only after [`fetch`](Self::fetch) came back
+    /// empty to tell "no such record" from a failed request.
+    /// [`TextsFetch::Found`] carries no rows here. A provider that cannot
+    /// tell answers [`TextsFetch::Failed`], so the caller retries.
+    fn episode_status(
+        &self,
+        id: &str,
+        season: u32,
+        episode: u32,
+        name: Option<&str>,
+    ) -> impl Future<Output = TextsFetch> + Send {
+        let _ = (id, season, episode, name);
+        async { TextsFetch::Failed }
+    }
     /// Spec 033 (V891) — the episodes the provider lists for show `id`, in
     /// `seasons` where the provider is asked season by season. `None` when a
     /// request failed or the provider has no such listing.

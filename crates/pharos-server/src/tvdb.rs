@@ -1594,6 +1594,19 @@ impl<T: TvdbTransport> crate::online_enrich::OnlineEnricher for TvdbEnricher<T> 
             },
         }
     }
+    async fn episode_status(
+        &self,
+        id: &str,
+        season: u32,
+        episode: u32,
+        name: Option<&str>,
+    ) -> TextsFetch {
+        match self.0.episode_record(id, season, episode, name, &[]).await {
+            Ok((_, false)) => TextsFetch::Found(Vec::new()),
+            Ok((_, true)) => TextsFetch::Failed,
+            Err(miss) => miss,
+        }
+    }
     async fn episode_list(
         &self,
         id: &str,
@@ -2532,6 +2545,27 @@ mod tests {
             panic!("a 404 is an answer");
         };
         assert!(by_lang(&missed, "eng").is_some_and(|r| r.overview.is_none()));
+    }
+
+    /// B991 — `episode_status` tells "TVDB has no such episode" from a
+    /// failed request, which decides whether a rebuild is retried.
+    #[tokio::test]
+    async fn episode_status_separates_no_record_from_a_failed_request() {
+        use crate::online_enrich::OnlineEnricher;
+        let status = |t: FakeTransport, season: u32| async move {
+            TvdbEnricher(TvdbClient::with_transport("key".into(), t))
+                .episode_status("76666", season, 1, None)
+                .await
+        };
+        let list = || {
+            FakeTransport::new()
+                .push_login("jwt")
+                .push_ok(ANIME_EPISODES)
+        };
+        assert_eq!(status(list(), 99).await, TextsFetch::NotFound);
+        assert!(matches!(status(list(), 1).await, TextsFetch::Found(_)));
+        let failed = FakeTransport::new().push_login("jwt").push_status(500, "");
+        assert_eq!(status(failed, 1).await, TextsFetch::Failed);
     }
 
     /// An episode the series' list does not hold, or a series TVDB answers

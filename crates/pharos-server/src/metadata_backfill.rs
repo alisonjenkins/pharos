@@ -1050,8 +1050,10 @@ where
 /// evidence, delete their stored translations, then enrich them from the
 /// pinned match. Only under `series_identity_repair = "apply"`; a dry run
 /// counts what is pending and changes nothing. A mark clears only once the
-/// episode's enrichment finished (a record, or `none`); a transient miss
-/// marks it again with `now`, behind the rest, for a later pass. Returns
+/// episode's enrichment finished (a record, or `none`) or its show's provider
+/// answered that it has no record of it (B991, parked until the TTL or a hand
+/// re-match); a transient miss marks it again with `now`, behind the rest,
+/// for a later pass. Returns
 /// (rebuilt, anything pending).
 async fn reconcile_pass<Tm, Tv, S>(
     store: &S,
@@ -1112,6 +1114,9 @@ enum ReconcileOutcome {
     Retry,
     /// The episode's show has no match yet; still marked.
     Deferred,
+    /// The pinned show's provider answered that it has no record of the
+    /// episode; the mark cleared and the episode keeps its local text.
+    NoRecord,
 }
 
 impl ReconcileOutcome {
@@ -1121,12 +1126,61 @@ impl ReconcileOutcome {
             Self::Rebuilt => "rebuilt",
             Self::Retry => "retry",
             Self::Deferred => "deferred",
+            Self::NoRecord => "no_record",
         }
     }
 }
 
 fn record_reconcile(outcome: ReconcileOutcome) {
     metrics::counter!("pharos_series_reconcile_total", "outcome" => outcome.label()).increment(1);
+}
+
+/// B991 — asked after a rebuild that found no record: whether the pinned
+/// show's provider answered that it has none for this episode (as opposed
+/// to a failed request, which `episode_status` reports as `Failed`). Returns
+/// the provider, show id and numbers when it has none.
+async fn record_missing_from_pinned_show<Tm, Tv, S>(
+    store: &S,
+    tmdb: Option<&Tm>,
+    tvdb: Option<&Tv>,
+    item: &MediaItem,
+) -> DomainResult<Option<(&'static str, String, u32, u32)>>
+where
+    Tm: OnlineEnricher,
+    Tv: OnlineEnricher,
+    S: SeriesMetadataStore,
+{
+    if item.kind != MediaKind::Episode {
+        return Ok(None);
+    }
+    let Some(pinned) = pinned_show(store, item).await? else {
+        return Ok(None);
+    };
+    let Some(show_id) = pinned.match_external_id.as_deref() else {
+        return Ok(None);
+    };
+    let Some((season, episode)) = item
+        .series
+        .as_ref()
+        .and_then(|s| s.season_number.zip(s.episode_number))
+    else {
+        return Ok(None);
+    };
+    let name = episode_name(item);
+    let (provider, status) = match (pinned.match_provider.as_deref(), tvdb, tmdb) {
+        (Some("tvdb"), Some(t), _) => (
+            "tvdb",
+            t.episode_status(show_id, season, episode, name.as_deref())
+                .await,
+        ),
+        (Some("tmdb"), _, Some(t)) => (
+            "tmdb",
+            t.episode_status(show_id, season, episode, name.as_deref())
+                .await,
+        ),
+        _ => return Ok(None),
+    };
+    Ok((status == TextsFetch::NotFound).then(|| (provider, show_id.to_string(), season, episode)))
 }
 
 /// Rebuild one marked episode. `Ok(true)` when it was rebuilt and its mark
@@ -1212,6 +1266,28 @@ where
     }
     let after = store.get(id).await?;
     let done = hit || matches!(after.match_source.as_deref(), Some("none" | "manual"));
+    // B991 — the pinned show's provider has no record of this episode: park
+    // it. Its item row is stamped `search` with the time of this attempt, so
+    // the metadata TTL re-reads it with the show's normal refresh; a changed
+    // show match or a hand re-match marks it again.
+    if !done {
+        if let Some((provider, show_id, season, episode)) =
+            record_missing_from_pinned_show(store, tmdb, tvdb, &after).await?
+        {
+            store.clear_series_reconcile(id, marked_at).await?;
+            record_reconcile(ReconcileOutcome::NoRecord);
+            tracing::info!(
+                media.id = id,
+                provider,
+                series_external_id = %show_id,
+                season,
+                episode,
+                reason = ReconcileOutcome::NoRecord.label(),
+                "series identity repair: pinned show has no record of the episode, mark cleared"
+            );
+            return Ok(false);
+        }
+    }
     if done {
         store.clear_series_reconcile(id, marked_at).await?;
         record_reconcile(ReconcileOutcome::Rebuilt);
@@ -4011,6 +4087,8 @@ mod tests {
         fetched: Arc<std::sync::Mutex<Vec<String>>>,
         image_bytes: Option<Vec<u8>>,
         texts: TextsFetch,
+        /// What `episode_status` answers.
+        episode_status: TextsFetch,
         asked: Arc<std::sync::Mutex<Vec<Vec<String>>>>,
         /// Episode lists by show id; any other id has none.
         lists: HashMap<String, Vec<EpisodeListing>>,
@@ -4032,6 +4110,7 @@ mod tests {
                 fetched: Default::default(),
                 image_bytes: None,
                 texts: TextsFetch::Failed,
+                episode_status: TextsFetch::Failed,
                 asked: Default::default(),
                 lists: HashMap::new(),
                 listed: Default::default(),
@@ -4049,6 +4128,7 @@ mod tests {
                 fetched: Default::default(),
                 image_bytes: None,
                 texts: TextsFetch::Failed,
+                episode_status: TextsFetch::Failed,
                 asked: Default::default(),
                 lists: HashMap::new(),
                 listed: Default::default(),
@@ -4155,6 +4235,12 @@ mod tests {
             self
         }
 
+        /// The provider answers that it has no such episode.
+        fn with_episode_missing(mut self) -> Self {
+            self.episode_status = TextsFetch::NotFound;
+            self
+        }
+
         /// The languages each `fetch_texts` call asked for.
         fn asked(&self) -> Vec<Vec<String>> {
             self.asked.lock().unwrap().clone()
@@ -4212,6 +4298,15 @@ mod tests {
         ) -> TextsFetch {
             self.asked.lock().unwrap().push(languages.to_vec());
             self.texts.clone()
+        }
+        async fn episode_status(
+            &self,
+            _id: &str,
+            _season: u32,
+            _episode: u32,
+            _name: Option<&str>,
+        ) -> TextsFetch {
+            self.episode_status.clone()
         }
         async fn episode_list(&self, id: &str, _seasons: &[u32]) -> Option<Vec<EpisodeListing>> {
             self.listed.lock().unwrap().push(id.to_string());
@@ -7055,10 +7150,193 @@ mod tests {
             ReconcileOutcome::Rebuilt,
             ReconcileOutcome::Retry,
             ReconcileOutcome::Deferred,
+            ReconcileOutcome::NoRecord,
         ]
         .map(ReconcileOutcome::label);
         let distinct: std::collections::HashSet<_> = labels.iter().collect();
         assert_eq!(distinct.len(), labels.len());
+    }
+
+    /// An episode marked for rebuild whose pinned show carries it with an
+    /// old provider text, ready to rebuild against a provider with no record.
+    async fn marked_episode_with_old_text(s: &SqliteStore) {
+        put_titled_episode(s, 1, SHOW_B, (1, 1), "Opening").await;
+        let mut item = s.get(1).await.unwrap();
+        item.title = "The Old Second".into();
+        item.metadata.overview = Some("The old pilot.".into());
+        s.put(item).await.unwrap();
+        s.set_item_match(1, "tvdb", "900001", "search", None, NOW)
+            .await
+            .unwrap();
+        pin(s, SHOW_B, "900002", NOW).await;
+        s.mark_series_reconcile(SHOW_B, NOW).await.unwrap();
+    }
+
+    /// B991 / V946 — an episode its pinned show's provider has no record of
+    /// is parked, not retried every pass: the mark clears, it counts under
+    /// `no_record`, one info line names it, it keeps its local text, and the
+    /// pending gauge settles at 0.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_episode_with_no_record_in_its_pinned_show_is_parked() {
+        use metrics_util::debugging::DebuggingRecorder;
+        let recorder = DebuggingRecorder::new();
+        let snap = pharos_test_metrics::snapshotter(&recorder);
+        let _metrics = metrics::set_default_local_recorder(&recorder);
+        let (logs, _logs_guard) = log_capture();
+        let s = store().await;
+        marked_episode_with_old_text(&s).await;
+        let (_td, cache) = cache();
+        let tvdb = FakeEnricher::tvdb().with_episode_missing();
+        let pass = |now: i64| {
+            let (s, cache, tvdb) = (&s, &cache, &tvdb);
+            async move {
+                reconcile_pass(
+                    s,
+                    &sem(4),
+                    cache,
+                    None::<&FakeEnricher>,
+                    Some(tvdb),
+                    &apply_cfg(),
+                    now,
+                )
+                .await
+                .unwrap()
+            }
+        };
+
+        pass(NOW + 10).await;
+
+        assert!(pending_ids(&s).await.is_empty(), "mark cleared");
+        let got = s.get(1).await.unwrap();
+        assert_eq!(got.title, "Opening", "local title kept");
+        assert_eq!(got.metadata.overview, None, "no provider text kept");
+        let count = |outcome| {
+            counter_value(
+                &snap,
+                "pharos_series_reconcile_total",
+                &[("outcome", outcome)],
+            )
+        };
+        assert_eq!((count("no_record"), count("retry")), (1, 0));
+
+        // The next pass finds nothing pending, asks nothing, logs nothing.
+        // Its own recorder: a snapshot never lowers a gauge to 0.
+        let settled = DebuggingRecorder::new();
+        let settled_snap = pharos_test_metrics::snapshotter(&settled);
+        {
+            let _guard = metrics::set_default_local_recorder(&settled);
+            assert_eq!(pass(NOW + 20).await, (0, false));
+        }
+        assert_eq!(tvdb.fetched(), ["900002"], "not asked again");
+        assert_eq!(
+            gauge_value(
+                &settled_snap,
+                "pharos_series_reconcile_pending",
+                &[("mode", "apply")]
+            ),
+            Some(0.0)
+        );
+        let text = logs.text();
+        let lines: Vec<_> = text.lines().filter(|l| l.contains("no_record")).collect();
+        assert_eq!(lines.len(), 1, "logged once: {text}");
+        for want in ["media.id=1", "900002", "tvdb", "season=1", "episode=1"] {
+            assert!(lines[0].contains(want), "{want} missing: {}", lines[0]);
+        }
+    }
+
+    /// B991 — a failed request is not "no such record": the episode stays
+    /// marked and is counted `retry`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_episode_whose_lookup_failed_stays_marked() {
+        use metrics_util::debugging::DebuggingRecorder;
+        let recorder = DebuggingRecorder::new();
+        let snap = pharos_test_metrics::snapshotter(&recorder);
+        let _metrics = metrics::set_default_local_recorder(&recorder);
+        let s = store().await;
+        marked_episode_with_old_text(&s).await;
+        let (_td, cache) = cache();
+        // Neither a record nor an answer about one.
+        let tvdb = FakeEnricher::tvdb();
+
+        let (n, pending) = reconcile_pass(
+            &s,
+            &sem(4),
+            &cache,
+            None::<&FakeEnricher>,
+            Some(&tvdb),
+            &apply_cfg(),
+            NOW + 10,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!((n, pending), (0, true));
+        assert_eq!(pending_ids(&s).await, [1]);
+        let count = |outcome| {
+            counter_value(
+                &snap,
+                "pharos_series_reconcile_total",
+                &[("outcome", outcome)],
+            )
+        };
+        assert_eq!((count("no_record"), count("retry")), (0, 1));
+    }
+
+    /// B991 — a parked episode is not lost: a hand re-match rebuilds it, and
+    /// its item row (stamped `search`) is re-admitted by the metadata TTL, the
+    /// show's normal refresh.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_parked_episode_is_retried_by_a_hand_rematch_and_by_the_ttl() {
+        let s = store().await;
+        marked_episode_with_old_text(&s).await;
+        let (_td, cache) = cache();
+        let missing = FakeEnricher::tvdb().with_episode_missing();
+        reconcile_pass(
+            &s,
+            &sem(4),
+            &cache,
+            None::<&FakeEnricher>,
+            Some(&missing),
+            &apply_cfg(),
+            NOW + 10,
+        )
+        .await
+        .unwrap();
+        assert!(pending_ids(&s).await.is_empty());
+
+        let due = |cutoff: i64| {
+            let s = &s;
+            async move {
+                s.items_needing_match(10, cutoff)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|i| i.id)
+                    .collect::<Vec<_>>()
+            }
+        };
+        assert!(due(NOW).await.is_empty(), "not due before the TTL");
+        assert_eq!(due(NOW + 1_000).await, [1], "due once the TTL passes");
+
+        let tvdb = FakeEnricher::tvdb().with_detail(enriched_overview("The crew moves on."));
+        let rebuilt = rebuild_now(
+            &s,
+            &sem(4),
+            &cache,
+            None::<&FakeEnricher>,
+            Some(&tvdb),
+            &apply_cfg(),
+            &[1],
+            NOW + 30,
+        )
+        .await
+        .unwrap();
+        assert_eq!(rebuilt, 1);
+        assert_eq!(
+            s.get(1).await.unwrap().metadata.overview.as_deref(),
+            Some("The crew moves on.")
+        );
+        assert!(pending_ids(&s).await.is_empty());
     }
 
     async fn set_version(s: &SqliteStore, key: &str, v: &str) {
