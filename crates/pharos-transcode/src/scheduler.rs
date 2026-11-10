@@ -3839,7 +3839,7 @@ mod tests {
     fn only_a_file_sink_claims_to_have_measured_its_output() {
         // `out_bytes: 0` from a live-stream job means "the worker never saw the
         // bytes", not "the encode produced nothing". Conflating them cost a
-        // wrong lead during the Ghost in the Shell investigation.
+        // wrong lead during the Film AH investigation.
         let file = SinkRequest::FileDirect {
             out_path: PathBuf::from("/tmp/x.ts"),
         };

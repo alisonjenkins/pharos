@@ -92,16 +92,16 @@ fn agreement_confidence(spans: &[Located], agreed_secs: f64, agreeing: u32, matc
     // in opposite directions and requiring both loses coverage twice over.
     //
     // By count alone, a long true opening loses to a crowd of short
-    // coincidences (T102: Game of Thrones S1 at 3/7 = 0.43, whole season
+    // coincidences (T102: Show AD S1 at 3/7 = 0.43, whole season
     // dropped). By duration alone, a SHORT true ending loses to a few long
     // spurious matches — measured on the real fingerprints after T102 shipped:
-    // Breaking Bad S5 credits went 6 emitted -> 0, Sabrina S1 9 -> 1,
+    // Show X S5 credits went 6 emitted -> 0, Show AF S1 9 -> 1,
     // library-wide outro rows 7025 -> 6947 while intro rows rose 6186 -> 6252.
     //
     // Neither ratio is "the" definition of agreement; each is evidence. Taking
     // the max on the same real fixtures dominates both: GoT S1 0/4/4,
-    // Breaking Bad S5 6/0/6, Sabrina S1 9/3/12, Frieren S1 22/16/23
-    // (count/duration/max). The controls stay silent — Cobra Kai S1 and 24 S2
+    // Show X S5 6/0/6, Show AF S1 9/3/12, Show AG S1 22/16/23
+    // (count/duration/max). The controls stay silent — Show AE S1 and Show AH S2
     // emit 0 under all three — so this widens recall without inventing spans.
     //
     // `min_agreeing` remains the floor that stops a lone coincidence either way.
@@ -377,7 +377,7 @@ pub fn detect_season_verbose(
         // T102 — weighted by matched DURATION, not by comparison COUNT. Counting
         // votes treats a 109 s agreement and an 18 s fragment as equal evidence,
         // so a correct answer can be outvoted by noise. Measured on the real
-        // stored fingerprints for Game of Thrones S1 (which opens with its full
+        // stored fingerprints for Show AD S1 (which opens with its full
         // ~111 s title sequence at t=0 — the span S2 emits at confidence
         // 0.63-0.88): episode 5 had THREE peers agree on 0.00..109 and four
         // locate scattered 17-28 s fragments elsewhere. By count that is
@@ -547,7 +547,7 @@ mod tests {
         );
     }
 
-    /// T102 — the Game of Thrones S1 shape, taken from production. Three peers
+    /// T102 — the Show AD S1 shape, taken from production. Three peers
     /// agree on the full ~109 s title sequence; four locate short coincidental
     /// fragments elsewhere. By COUNT that is 3/7 = 0.43 and the true intro is
     /// discarded; by DURATION it is 327/415 = 0.79 and it survives.
@@ -615,7 +615,7 @@ mod tests {
     /// and the season emits nothing; by count it is 6/10 = 0.60 and it stands.
     ///
     /// Measured, not hypothetical: after duration-only weighting shipped,
-    /// Breaking Bad S5 credits went 6 -> 0 and library outro rows fell
+    /// Show X S5 credits went 6 -> 0 and library outro rows fell
     /// 7025 -> 6947.
     ///
     /// Disarm by returning `by_duration` alone and this goes red.

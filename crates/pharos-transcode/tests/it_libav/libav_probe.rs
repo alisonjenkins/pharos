@@ -112,8 +112,8 @@ fn synth_tagged_mp4(path: &Path, tags: &[&str]) {
 /// B169 — the deployed backend is libav, and its tag reader aliased the
 /// container's `creation_time` into `date`, so it poisoned BOTH the year and
 /// the premiere date. On the live library that dated 139 films by when they
-/// were copied in: "300" and "300 - Rise of an Empire" both 2026-07-19,
-/// "Avatar" 2026-07-20, "Apocalypse Now" 2025-05-06.
+/// were copied in: "Film AD" and "Film AD - Rise of the Empire" both 2026-07-19,
+/// "Film AE" 2026-07-20, "Film AC" 2025-05-06.
 ///
 /// Uses a REAL fixture rather than a hand-built tag map, because the defect
 /// was in which container keys are consulted — the thing a mocked map assumes
