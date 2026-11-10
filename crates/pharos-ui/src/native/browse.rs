@@ -1450,6 +1450,9 @@ fn Hero(
     facts: Vec<String>,
     square: bool,
     #[props(default)] mark: bool,
+    /// Offers the favourite mark alone, as an album or artist does (B1085).
+    #[props(default)]
+    favourite: bool,
     /// For a series, the episode its Play or Resume starts.
     #[props(default)]
     next: Option<Item>,
@@ -1481,7 +1484,7 @@ fn Hero(
                 if let Some(d) = detail.as_ref() {
                     Ratings { kind: d.item.kind, imdb: d.item.imdb_rating, critic: d.item.critic_rating, tile: false }
                 }
-                if next.is_some() || (mark && detail.is_some()) {
+                if next.is_some() || ((mark || favourite) && detail.is_some()) {
                     div { class: "pharos-actions",
                         if let Some(ep) = next.as_ref() {
                             Link {
@@ -1500,7 +1503,7 @@ fn Hero(
                                 name: d.item.name.clone(),
                             }
                         }
-                        if let Some(d) = detail.as_ref().filter(|_| mark) {
+                        if let Some(d) = detail.as_ref().filter(|_| mark || favourite) {
                             FavoriteToggle {
                                 id: d.item.id,
                                 favorite: d.item.favorite,
@@ -1965,7 +1968,13 @@ pub fn ArtistView(detail: Detail, albums: Page) -> Element {
     };
     rsx! {
         section { class: "pharos-artist",
-            Hero { title: detail.item.name.clone(), detail: Some(detail.clone()), facts, square: true }
+            Hero {
+                title: detail.item.name.clone(),
+                detail: Some(detail.clone()),
+                facts,
+                square: true,
+                favourite: true,
+            }
             {remount_on(
                 &detail.item.id.to_string(),
                 rsx! {
@@ -2013,7 +2022,13 @@ pub fn AlbumView(detail: Detail, tracks: Page) -> Element {
         .unwrap_or_default();
     rsx! {
         section { class: "pharos-album",
-            Hero { title: detail.item.name.clone(), detail: Some(detail.clone()), facts, square: true }
+            Hero {
+                title: detail.item.name.clone(),
+                detail: Some(detail.clone()),
+                facts,
+                square: true,
+                favourite: true,
+            }
             if !tracks.items.is_empty() {
                 QueueButtons {
                     name: detail.item.name.clone(),
@@ -3047,6 +3062,37 @@ mod tests {
         assert!(html.contains("3:07"), "{html}");
         assert!(html.contains("3 tracks"), "{html}");
         assert!(html.contains("/ui/watch/1"), "{html}");
+    }
+
+    /// B1085: an album or an artist can be made a favourite from its page,
+    /// and shows when it is one; neither offers a watched mark.
+    #[test]
+    fn albums_and_artists_offer_a_favourite_mark() {
+        let mut record = item(ItemRef::Synth(5), ItemKind::Album, "Record");
+        record.favorite = true;
+        let album = detail(record);
+        let tracks = vec![item(ItemRef::Real(1), ItemKind::Audio, "Opener")];
+        let html = render(move || {
+            rsx! { AlbumView { detail: album.clone(), tracks: page(tracks.clone()) } }
+        });
+        assert!(
+            html.contains(r#"data-key-action="favorite""#)
+                && html.contains(r#"aria-pressed="true""#)
+                && html.contains("pharos-favorite on"),
+            "a favourite album says so: {html}"
+        );
+        assert!(!html.contains(r#"data-key-action="watched""#), "{html}");
+
+        let artist = detail(item(ItemRef::Synth(6), ItemKind::Artist, "Band"));
+        let albums = vec![item(ItemRef::Synth(5), ItemKind::Album, "Record")];
+        let html = render(move || {
+            rsx! { ArtistView { detail: artist.clone(), albums: page(albums.clone()) } }
+        });
+        assert!(
+            html.contains(r#"data-key-action="favorite""#)
+                && html.contains(r#"aria-pressed="false""#),
+            "an artist can be made a favourite: {html}"
+        );
     }
 
     /// A season route's tab names the season and the show; the series route
