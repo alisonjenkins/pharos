@@ -43,17 +43,11 @@ Id blocks (bugs and invariants are written with the fix):
 
 ## G3 — Player controls by touch and pointer
 
-- [ ] T038-300 Reproduce on a touch device profile at 390x844: seek bar ignores touch, control row height, target sizes. Keep the before screenshots and name or add the signal that shows each one.
-- [ ] T038-301 Seek bar: drag, touch, buffered range, focus (FR-301), with a group test for one command per scrub.
-- [ ] T038-302 Narrow-screen control bar and settings sheet (FR-302); screenshots at 390x844 for Alison before merge.
-- [ ] T038-303 44px targets and double-tap zones (FR-303); wheel rule (FR-304).
-- [ ] T038-304 SVG glyphs (FR-305); small-player seek (FR-306).
-- [ ] T038-305 Speed control and subtitle delay (FR-307).
-- [x] T038-300 Reproduce on a touch device profile at 390x844: seek bar ignores touch, control row height, target sizes. Keep the before screenshots.
+- [x] T038-300 Reproduce on a touch device profile at 390x844: seek bar ignores touch, control row height, target sizes. Keep the before screenshots and name or add the signal that shows each one.
 - [x] T038-301 Seek bar: drag, touch, buffered range, focus (FR-301), with a group test for one command per scrub.
 - [x] T038-302 Narrow-screen control bar and settings sheet (FR-302); screenshots at 390x844 for Alison before merge.
-- [x] T038-303 [P] 44px targets and double-tap zones (FR-303); wheel rule (FR-304).
-- [x] T038-304 [P] SVG glyphs (FR-305); small-player seek (FR-306).
+- [x] T038-303 44px targets and double-tap zones (FR-303); wheel rule (FR-304).
+- [x] T038-304 SVG glyphs (FR-305); small-player seek (FR-306).
 - [x] T038-305 Speed control and subtitle delay (FR-307).
 - [x] T038-306 [ALISON] Key map for `k`/`j` (FR-308). Declined by Alison 2026-11-10: `k`/`j` stay as volume, no change.
 
