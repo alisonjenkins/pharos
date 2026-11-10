@@ -33,6 +33,9 @@ pub struct Config {
     /// Most samples one forward pass holds.
     pub batch_samples: usize,
     pub device: DeviceMode,
+    /// Where the GPU pass keeps compiled kernels between restarts; `None`
+    /// compiles them afresh in every process.
+    pub cache_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -143,6 +146,7 @@ impl Config {
             pin,
             batch_samples,
             device,
+            cache_dir: set(get("PHAROS_ALIGNER_CACHE_DIR")).map(PathBuf::from),
         })
     }
 }
@@ -176,6 +180,7 @@ mod tests {
         assert_eq!(c.pin, PinMode::Auto);
         assert_eq!(c.batch_samples, 1_000_000);
         assert_eq!(c.device, DeviceMode::Auto);
+        assert_eq!(c.cache_dir, None);
     }
 
     #[test]
@@ -190,9 +195,11 @@ mod tests {
             ("PHAROS_ALIGNER_PIN", "off"),
             ("PHAROS_ALIGNER_BATCH_SAMPLES", "48000"),
             ("PHAROS_ALIGNER_DEVICE", "cpu"),
+            ("PHAROS_ALIGNER_CACHE_DIR", "/var/cache/aligner"),
         ]))
         .unwrap();
         assert_eq!(c.device, DeviceMode::Cpu);
+        assert_eq!(c.cache_dir, Some(PathBuf::from("/var/cache/aligner")));
         assert_eq!(c.pin, PinMode::Off);
         assert_eq!(c.batch_samples, 48_000);
         assert_eq!((c.host.as_str(), c.port, c.threads), ("127.0.0.1", 9000, 4));
