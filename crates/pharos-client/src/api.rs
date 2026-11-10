@@ -9,11 +9,12 @@ use std::str::FromStr;
 use pharos_api::pharos_capnp::{
     avatar_result, capabilities, decision_result, detail_result, done, home_result, index_result,
     item_id, item_query, item_summary, items_result, library, lyrics_result, me_result,
-    media_token_result, negotiate_result, opt_u16, opt_u32, playback, playback_grant, pref_result,
-    prefs, report_document_result, report_list_result, report_result, session, start_tracks_result,
-    stream_choice, telemetry, track, user_data, user_state_result, BookFormat as WireBookFormat,
-    CreditKind as WireCreditKind, Kind, LibraryKind as WireLibraryKind,
-    SegmentKind as WireSegmentKind, Stereo3d as WireStereo, StereoFilter, SubtitleDelivery,
+    media_token_result, my_devices_result, negotiate_result, opt_u16, opt_u32, playback,
+    playback_grant, pref_result, prefs, report_document_result, report_list_result, report_result,
+    session, start_tracks_result, stream_choice, telemetry, track, user_data, user_state_result,
+    BookFormat as WireBookFormat, CreditKind as WireCreditKind, Kind,
+    LibraryKind as WireLibraryKind, SegmentKind as WireSegmentKind, Stereo3d as WireStereo,
+    StereoFilter, SubtitleDelivery,
 };
 pub use pharos_api::pharos_capnp::{EventKind as ClientEventKind, Level as ClientLevel};
 pub use pharos_api::PASSWORD_CHANGED_REVOKE_FAILED;
@@ -679,6 +680,17 @@ pub trait PlaybackGrant {
     async fn stop(&self, call: &CallInfo, position_ms: u64) -> Result<(), ClientError>;
 }
 
+/// A device the signed-in user is signed in on, from [`NativeApi::my_devices`].
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct MyDevice {
+    pub id: String,
+    pub name: String,
+    /// The device this session runs on.
+    pub current: bool,
+    /// The sound formats it is sent converted rather than as they are.
+    pub converted_audio: Vec<String>,
+}
+
 /// A token from [`NativeApi::media_token`].
 #[derive(Clone, PartialEq, Eq)]
 pub struct MediaToken {
@@ -1038,6 +1050,60 @@ impl NativeApi {
             }
             media_token_result::Error(e) => Err(ClientError::from_api(e?)),
         }
+    }
+
+    /// The devices the signed-in user is signed in on (T130).
+    pub async fn my_devices(&self, call: &CallInfo) -> Result<Vec<MyDevice>, ClientError> {
+        let mut req = self.session.my_devices_request();
+        call.write(req.get().init_ctx());
+        let reply = req.send().promise.await?;
+        match reply
+            .get()?
+            .get_result()?
+            .which()
+            .map_err(capnp::Error::from)?
+        {
+            my_devices_result::Devices(list) => {
+                let mut out = Vec::new();
+                for d in list?.iter() {
+                    let mut converted_audio = Vec::new();
+                    for c in d.get_converted_audio()?.iter() {
+                        converted_audio.push(text(c)?);
+                    }
+                    out.push(MyDevice {
+                        id: text(d.get_id())?,
+                        name: text(d.get_name())?,
+                        current: d.get_current(),
+                        converted_audio,
+                    });
+                }
+                Ok(out)
+            }
+            my_devices_result::Error(e) => Err(ClientError::from_api(e?)),
+        }
+    }
+
+    /// Sets the sound formats `device_id`, one the signed-in user is signed
+    /// in on, is sent converted; empty clears it (T130).
+    pub async fn set_device_converted_audio(
+        &self,
+        call: &CallInfo,
+        device_id: &str,
+        codecs: &[String],
+    ) -> Result<(), ClientError> {
+        let mut req = self.session.set_device_converted_audio_request();
+        {
+            let mut p = req.get();
+            call.write(p.reborrow().init_ctx());
+            p.set_device_id(device_id);
+            let len = u32::try_from(codecs.len()).unwrap_or(u32::MAX);
+            let mut list = p.init_codecs(len);
+            for (i, c) in codecs.iter().enumerate().take(len as usize) {
+                list.set(i as u32, c.as_str());
+            }
+        }
+        let reply = req.send().promise.await?;
+        crate::read_done(reply.get()?.get_result()?)
     }
 
     /// Removes the signed-in user's avatar.
