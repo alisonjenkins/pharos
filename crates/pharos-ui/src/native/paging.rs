@@ -24,7 +24,8 @@ pub struct Pager {
     items: Vec<Item>,
     total: u32,
     in_flight: bool,
-    failed: bool,
+    /// Why the last page asked for failed, while it stands (FR-210).
+    failed: Option<String>,
     /// A page came back empty: `total` was wrong, so stop asking.
     exhausted: bool,
 }
@@ -35,7 +36,7 @@ impl Pager {
             items: first.items,
             total: first.total,
             in_flight: false,
-            failed: false,
+            failed: None,
             exhausted: false,
         }
     }
@@ -53,7 +54,12 @@ impl Pager {
     }
 
     pub fn failed(&self) -> bool {
-        self.failed
+        self.failed.is_some()
+    }
+
+    /// Why the last page asked for failed, while it stands.
+    pub fn failure(&self) -> Option<&str> {
+        self.failed.as_deref()
     }
 
     /// A watched mark the server stored for `id`: its loaded tile shows it,
@@ -89,11 +95,14 @@ impl Pager {
     /// page is already in flight, nothing more can be loaded, or a failed
     /// page is awaiting a button press. At most one page is ever in flight.
     pub fn begin(&mut self, trigger: Trigger) -> Option<u32> {
-        if self.in_flight || !self.has_more() || (self.failed && trigger == Trigger::Scroll) {
+        if self.in_flight
+            || !self.has_more()
+            || (self.failed.is_some() && trigger == Trigger::Scroll)
+        {
             return None;
         }
         self.in_flight = true;
-        self.failed = false;
+        self.failed = None;
         Some(self.loaded())
     }
 
@@ -110,7 +119,7 @@ impl Pager {
         }
         let want = (target - loaded + 1).div_ceil(page.max(1)) * page.max(1);
         self.in_flight = true;
-        self.failed = false;
+        self.failed = None;
         Some((loaded, want.clamp(page.max(1), max.max(page))))
     }
 
@@ -124,7 +133,7 @@ impl Pager {
     /// page's own total is only one part's, so the caller says the whole's.
     pub fn land_as(&mut self, page: Page, total: u32) {
         self.in_flight = false;
-        self.failed = false;
+        self.failed = None;
         if page.items.is_empty() {
             self.exhausted = true;
             return;
@@ -151,7 +160,7 @@ impl Pager {
         self.items = head.items;
         self.total = head.total;
         self.in_flight = true;
-        self.failed = false;
+        self.failed = None;
         // The old tail stays on screen until the fresh one lands.
         self.items.extend(tail);
         Some((start, count))
@@ -169,11 +178,11 @@ impl Pager {
         self.items.extend(page.items);
     }
 
-    /// The page asked for failed; the same page is asked for again on the
-    /// next button press.
-    pub fn fail(&mut self) {
+    /// The page asked for failed, for `reason`; the same page is asked for
+    /// again on the next button press.
+    pub fn fail(&mut self, reason: impl Into<String>) {
         self.in_flight = false;
-        self.failed = true;
+        self.failed = Some(reason.into());
     }
 }
 
@@ -339,7 +348,7 @@ mod tests {
     fn a_failed_page_is_asked_for_again_from_the_same_start() {
         let mut p = Pager::new(page(0, 2, 10));
         assert_eq!(p.begin(Trigger::Scroll), Some(2));
-        p.fail();
+        p.fail("store unavailable");
         assert!(p.failed());
         assert!(!p.in_flight());
         assert_eq!(p.items().len(), 2);
@@ -351,7 +360,7 @@ mod tests {
     fn scrolling_does_not_retry_a_failed_page() {
         let mut p = Pager::new(page(0, 2, 10));
         p.begin(Trigger::Scroll);
-        p.fail();
+        p.fail("store unavailable");
         assert_eq!(p.begin(Trigger::Scroll), None);
         assert!(p.failed());
     }

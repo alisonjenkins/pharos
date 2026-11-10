@@ -1023,8 +1023,14 @@ fn LibraryGrid(first: Page, base: Listing, sets: bool) -> Element {
         }
     });
     let rail = narrow.read().rail();
+    // A new choice keeps the old grid up while its first page loads; say
+    // so, or the change looks ignored (FR-210, A19).
+    let busy = listed.pending() && listed.read().is_some();
     rsx! {
         FilterBar { narrow, genres, grouped: sets.then_some(grouped) }
+        if busy {
+            p { class: "pharos-muted pharos-filter-busy", role: "status", "Updating…" }
+        }
         match &*listed.read() {
             None => rsx! { p { class: "pharos-muted", "Loading…" } },
             Some(Err(e)) => rsx! { p { class: "pharos-error", role: "alert", "Couldn't load this library: {e}" } },
@@ -1274,7 +1280,7 @@ fn PagedGrid(
                     continue;
                 };
                 let Some(api) = ctx.api.peek().clone() else {
-                    pager.write().fail();
+                    pager.write().fail(NOT_SIGNED_IN);
                     continue;
                 };
                 // One listing, or the part of a chain this position is in.
@@ -1314,7 +1320,7 @@ fn PagedGrid(
                                 let mut machine = ctx.machine;
                                 machine.write().apply(Event::NeedsSignIn);
                             }
-                            pager.write().fail();
+                            pager.write().fail(e.to_string());
                         }
                     }
                 });
@@ -1587,6 +1593,23 @@ fn PagedGrid(
                 disabled: state.in_flight(),
                 onclick: move |_| requests.send(Ask::Next(Trigger::Button)),
                 "{label}"
+            }
+            PageFailure { reason: state.failure().map(str::to_owned) }
+        }
+    }
+}
+
+/// A page's failure while paging, when there is no connection to the
+/// server to ask.
+const NOT_SIGNED_IN: &str = "not signed in";
+
+/// Why the next page did not load, beside its "Try again" (FR-210, A20).
+#[component]
+fn PageFailure(reason: Option<String>) -> Element {
+    rsx! {
+        if let Some(reason) = reason {
+            p { class: "pharos-error pharos-page-failure", role: "alert",
+                "Couldn't load more: {reason}"
             }
         }
     }
@@ -2067,11 +2090,11 @@ pub fn EpisodeList(
                 spawn(async move {
                     match fetch.await {
                         Ok(tail) => pager.write().land_tail(start, tail),
-                        Err(_) => pager.write().fail(),
+                        Err(e) => pager.write().fail(e.to_string()),
                     }
                 });
             }
-            None => pager.write().fail(),
+            None => pager.write().fail(NOT_SIGNED_IN),
         }
     }));
     let mut more = move |trigger: Trigger| {
@@ -2083,11 +2106,11 @@ pub fn EpisodeList(
                 spawn(async move {
                     match fetch.await {
                         Ok(next) => pager.write().land(next),
-                        Err(_) => pager.write().fail(),
+                        Err(e) => pager.write().fail(e.to_string()),
                     }
                 });
             }
-            None => pager.write().fail(),
+            None => pager.write().fail(NOT_SIGNED_IN),
         }
     };
     let state = pager.read();
@@ -2121,6 +2144,7 @@ pub fn EpisodeList(
                 onclick: move |_| more(Trigger::Button),
                 "{label}"
             }
+            PageFailure { reason: state.failure().map(str::to_owned) }
         } else if source.is_none() {
             MoreNote { page: Page { items: state.items().to_vec(), total: state.total(), start: 0 } }
         }
@@ -3614,6 +3638,20 @@ mod tests {
         assert!(html.contains("id=\"pharos-music-tab-artists\""), "{html}");
         assert_eq!(html.matches("tabindex=\"0\"").count(), 1, "{html}");
         assert_eq!(html.matches("tabindex=\"-1\"").count(), 2, "{html}");
+    }
+
+    /// FR-210: a failed paging step says why beside its retry.
+    #[test]
+    fn a_failed_page_says_why() {
+        let html =
+            render(|| rsx! { PageFailure { reason: Some("media store unavailable".to_owned()) } });
+        assert!(
+            html.contains("load more: media store unavailable"),
+            "{html}"
+        );
+        assert!(html.contains("role=\"alert\""), "{html}");
+        let quiet = render(|| rsx! { PageFailure { reason: None } });
+        assert!(!quiet.contains("load more"), "{quiet}");
     }
 
     #[test]
