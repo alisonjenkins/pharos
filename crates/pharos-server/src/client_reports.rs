@@ -263,40 +263,14 @@ impl ReportStore {
     }
 
     /// Every stored report's summary, newest first. A file that is not a
-    /// report document is skipped with a WARN naming it, never served.
+    /// report document is skipped with a WARN naming it, never served. The
+    /// directory is read and parsed on the blocking pool: at the caps it is
+    /// up to 500 files of 256 KiB, too much to parse on an RPC thread.
     pub async fn summaries(&self) -> std::io::Result<Vec<Summary>> {
-        let mut entries = match tokio::fs::read_dir(&self.dir).await {
-            Ok(entries) => entries,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(e) => return Err(e),
-        };
-        let mut out = Vec::new();
-        while let Some(entry) = entries.next_entry().await? {
-            let path = entry.path();
-            let Some(id) = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .and_then(|n| n.strip_suffix(".json"))
-                .and_then(ReportId::parse)
-            else {
-                continue;
-            };
-            match read_summary(&path).await {
-                Ok(summary) if summary.id == id => out.push(summary),
-                Ok(summary) => tracing::warn!(
-                    path = %path.display(),
-                    inner = %summary.id,
-                    "client report skipped: id inside differs from its file name"
-                ),
-                Err(e) => tracing::warn!(
-                    path = %path.display(),
-                    error = %e,
-                    "client report skipped: unreadable"
-                ),
-            }
-        }
-        out.sort_by_key(|s| std::cmp::Reverse(s.received_wall_ms));
-        Ok(out)
+        let dir = self.dir.clone();
+        tokio::task::spawn_blocking(move || summaries_in(&dir))
+            .await
+            .map_err(std::io::Error::other)?
     }
 
     /// The report `id`'s whole document, or `None` when there is none.
@@ -358,8 +332,43 @@ impl ReportStore {
     }
 }
 
-async fn read_summary(path: &Path) -> std::io::Result<Summary> {
-    let bytes = tokio::fs::read(path).await?;
+fn summaries_in(dir: &Path) -> std::io::Result<Vec<Summary>> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    let mut out = Vec::new();
+    for entry in entries {
+        let path = entry?.path();
+        let Some(id) = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.strip_suffix(".json"))
+            .and_then(ReportId::parse)
+        else {
+            continue;
+        };
+        match read_summary(&path) {
+            Ok(summary) if summary.id == id => out.push(summary),
+            Ok(summary) => tracing::warn!(
+                path = %path.display(),
+                inner = %summary.id,
+                "client report skipped: id inside differs from its file name"
+            ),
+            Err(e) => tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "client report skipped: unreadable"
+            ),
+        }
+    }
+    out.sort_by_key(|s| std::cmp::Reverse(s.received_wall_ms));
+    Ok(out)
+}
+
+fn read_summary(path: &Path) -> std::io::Result<Summary> {
+    let bytes = std::fs::read(path)?;
     let mut summary: Summary = serde_json::from_slice(&bytes)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     summary.bytes = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
