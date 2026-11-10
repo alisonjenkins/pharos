@@ -8,6 +8,7 @@ publish.workspace = true
 description = "CTC forced alignment of lyric words to MMS_FA emissions, matching the Python aligner"
 
 [dependencies]
+actix-web.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 thiserror.workspace = true
