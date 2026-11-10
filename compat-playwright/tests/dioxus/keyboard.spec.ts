@@ -91,8 +91,9 @@ test.describe("keyboard modes (spec 029)", () => {
     await page.keyboard.press("ArrowUp");
     expect((await focused(page)).row).toBe(first.row);
 
-    // Along the row to its Play, which Enter starts.
-    for (let i = 0; i < 4 && (await focused(page)).action !== "play"; i++) {
+    // Along the row to its Play, which Enter starts. An admin's row also
+    // holds Re-match (B988), so Play can be five stops along.
+    for (let i = 0; i < 8 && (await focused(page)).action !== "play"; i++) {
       await page.keyboard.press("l");
     }
     expect((await focused(page)).action).toBe("play");
