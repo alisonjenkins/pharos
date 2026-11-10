@@ -73,11 +73,11 @@ Id blocks (bugs and invariants are written with the fix):
 - [ ] T038-600 Reproduce each G6 problem on the TV with a remote (volume 0, read back first) and name or add the signal that shows it; where none exists, T038-602 adds it before any fix.
 - [ ] T038-601 ADR and plan for landing the TV playback line on main; CI compiles the `mobile` feature (FR-601). Landing decided and done in ADR 0115 (2026-11-10); CI compiling `mobile` is still open.
 - [x] T038-602 TV telemetry (FR-608) first, so the rest can be seen. B1267, V1230.
-- [ ] T038-603 Search from the banner (FR-602).
-- [ ] T038-604 Return to the opened tile (FR-603).
-- [ ] T038-605 OK on Skip and Up Next; Back order (FR-604, FR-607).
-- [ ] T038-606 Report and pause on leaving the app (FR-605).
-- [ ] T038-607 [P] Inputs by D-pad (FR-606); transport keys (FR-609); out-of-date notice (FR-610).
+- [x] T038-603 Search from the banner (FR-602). B1272, V1235.
+- [x] T038-604 Return to the opened tile (FR-603). B1273, V1236.
+- [x] T038-605 OK on Skip and Up Next; Back order (FR-604, FR-607). B1270, B1271, V1233, V1234.
+- [x] T038-606 Report and pause on leaving the app (FR-605). B1268, V1231.
+- [x] T038-607 [P] Inputs by D-pad (FR-606); transport keys (FR-609); out-of-date notice (FR-610). B1274, B1269, B1275, V1237, V1232, V1238.
 - [ ] T038-608 Test each on the TV with Alison (volume 0, read back first).
 
 ## G7 — Admin and settings
