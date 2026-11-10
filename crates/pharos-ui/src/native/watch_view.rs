@@ -111,6 +111,9 @@ pub struct Controls {
     /// Where a seek that has waited a while is going, and the way back
     /// (B1196); shown in place of the plain loading caption.
     pub seek_card: Option<SeekCard>,
+    /// What the wait under the spinner is for (038 FR-401); empty reads as
+    /// the generic "Loading".
+    pub wait_caption: String,
     /// The playback position as a signal, when the owner updates it apart
     /// from `media`. The leaves that show the position read it, so a tick
     /// re-renders them alone and not the whole player (B815). Without it
@@ -870,9 +873,10 @@ pub fn WatchView(
                                     }
                                 }
                             },
-                            None => rsx! {
-                                span { class: "pharos-watch-loading-caption", "Waiting for the server…" }
+                            None if !c.wait_caption.is_empty() => rsx! {
+                                span { class: "pharos-watch-loading-caption", "{c.wait_caption}" }
                             },
+                            None => rsx! {},
                         }
                     }
                 }
@@ -2848,7 +2852,18 @@ mod tests {
         assert!(loading < top, "{html}");
         assert!(html.contains(r#"data-loading="true""#), "{html}");
         assert!(html.contains("Loading"), "{html}");
-        assert!(html.contains("Waiting for the server…"), "{html}");
+        assert!(!html.contains("pharos-watch-loading-caption"), "no cause, no caption: {html}");
+    }
+
+    /// 038 FR-401, V1218: the caption under the spinner is the wait's cause.
+    #[test]
+    fn the_loading_caption_names_the_wait() {
+        let mut c = controls();
+        c.media.loading = true;
+        c.wait_caption = "Buffering…".to_owned();
+        let html = render(c);
+        assert!(html.contains("Buffering…"), "{html}");
+        assert!(!html.contains("Waiting for the server…"), "{html}");
     }
 
     /// B1196/V1156: a slow seek's card replaces the plain caption, with
@@ -2865,7 +2880,7 @@ mod tests {
         assert!(html.contains("Waiting 12 s"), "{html}");
         assert!(html.contains("no seek index"), "{html}");
         assert!(html.contains("Go back to 1:20:05"), "{html}");
-        assert!(!html.contains("Waiting for the server…"), "{html}");
+        assert!(!html.contains("pharos-watch-loading-caption"), "{html}");
     }
 
     #[test]
