@@ -190,6 +190,10 @@ pub fn AccountView(
     #[props(default)]
     description_language: String,
     #[props(default)] on_description_language: EventHandler<String>,
+    /// Why the last description language pick was not saved; the select
+    /// shows the value kept (FR-211).
+    #[props(default)]
+    description_language_failed: Option<String>,
 ) -> Element {
     let name = me.as_ref().map(|me| me.name.clone());
     let has_avatar = me.as_ref().is_some_and(|me| me.avatar_url.is_some());
@@ -260,6 +264,11 @@ pub fn AccountView(
                                 "{label}"
                             }
                         }
+                    }
+                }
+                if let Some(why) = description_language_failed {
+                    p { class: "pharos-error", role: "alert",
+                        "Couldn't save the description language: {why}. The one shown is still the one in use."
                     }
                 }
             }
@@ -418,6 +427,35 @@ mod tests {
         );
         dom.rebuild_in_place();
         dioxus_ssr::render(&dom)
+    }
+
+    /// FR-211: a failed description language save says so beside the select.
+    #[test]
+    fn a_failed_description_language_save_is_said() {
+        let mut dom = VirtualDom::new(|| {
+            rsx! {
+                AccountView {
+                    me: None,
+                    busy: false,
+                    outcome: None,
+                    avatar_busy: false,
+                    avatar_outcome: None,
+                    on_change_password: |_| {},
+                    on_pick_avatar: |_| {},
+                    on_remove_avatar: |_| {},
+                    description_language: String::new(),
+                    description_language_failed: Some("connection lost".to_owned()),
+                }
+            }
+        });
+        dom.rebuild_in_place();
+        let html = dioxus_ssr::render(&dom);
+        assert!(
+            html.contains("save the description language: connection lost"),
+            "{html}"
+        );
+        let quiet = render(None, false);
+        assert!(!quiet.contains("save the description language"), "{quiet}");
     }
 
     #[test]

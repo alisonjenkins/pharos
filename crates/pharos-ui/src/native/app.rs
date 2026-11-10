@@ -3104,6 +3104,7 @@ fn AccountScreen() -> Element {
     let mut description_language_picked = use_signal(|| false);
     // Saves run one at a time, so quick picks can't land out of order.
     let mut description_language_saves = use_signal(|| None::<account_settings::SerialPref>);
+    let mut description_language_failed = use_signal(|| None::<String>);
     let me = account.0.read().clone().flatten();
     let report = move |e: &ClientError, what: &str| {
         if e.needs_sign_in() {
@@ -3214,6 +3215,7 @@ fn AccountScreen() -> Element {
                 });
             },
             description_language: description_language(),
+            description_language_failed: description_language_failed(),
             on_description_language: move |value: String| {
                 let Some(api) = ctx.api.peek().clone() else {
                     return;
@@ -3234,10 +3236,12 @@ fn AccountScreen() -> Element {
                         let ok = match api.set_pref(&call("account", "description_language_set"), key, next.as_bytes()).await {
                             Ok(()) => {
                                 platform::info(&format!("account: description language set value={next}"));
+                                description_language_failed.set(None);
                                 true
                             }
                             Err(e) => {
                                 report(&e, "set description language");
+                                description_language_failed.set(Some(e.to_string()));
                                 false
                             }
                         };
