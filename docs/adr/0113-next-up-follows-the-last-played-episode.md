@@ -32,8 +32,9 @@ We will build Next Up from the viewer's own play state:
   by name.
 - The started rows come from `UserDataStore::started_items(user, Episode)`,
   one query over the viewer's own rows joined to `media_items.kind`. The
-  series' episodes come from the cached item list; no other user-data read
-  is made.
+  series' episodes come from the cached item list, and one `user_data_bulk`
+  bound to the picks alone gives each pick its own row (favourite, chosen
+  tracks).
 - A Series page request (`SeriesId`) uses the same anchor rule, but lists an
   in-progress anchor itself (there is no Continue Watching beside it) and,
   for a series not started, its first unplayed regular episode.
