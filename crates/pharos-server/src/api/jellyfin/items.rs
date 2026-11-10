@@ -2865,37 +2865,44 @@ async fn latest_items(
     user: &AuthUser,
     q: &ListQuery,
 ) -> Result<HttpResponse, actix_web::Error> {
-    let latest = crate::services::library::latest(
-        state,
-        &user.0,
-        q.parent_id.as_deref(),
-        &parse_kind_filter(q.include_item_types.as_deref()),
-        q.limit,
-    )
-    .await
-    .map_err(|e| match e {
-        crate::services::library::ListError::Hidden(hidden) => {
-            crate::api::jellyfin::access_error(hidden)
-        }
-        crate::services::library::ListError::Store(e) => {
-            error::ErrorInternalServerError(e.to_string())
-        }
-    })?;
-    let dtos: Vec<BaseItemDto> = latest
-        .iter()
-        .map(|(item, ud)| {
-            BaseItemDto::from_domain_with_user_data(item, &state.server_id, *ud)
-                .with_converted_book(
-                    crate::book_convert::converted_book_path(state.books.as_ref(), item).as_deref(),
-                )
-                .with_trickplay(
-                    &item.probe,
-                    &state.generated_trickplay_widths(item.id),
-                    state.trickplay_interval_ms,
-                )
+    use crate::services::library::{LatestTile, ListError};
+    let list_error = |e| match e {
+        ListError::Hidden(hidden) => crate::api::jellyfin::access_error(hidden),
+        ListError::Store(e) => error::ErrorInternalServerError(e.to_string()),
+    };
+    let kinds = parse_kind_filter(q.include_item_types.as_deref());
+    let parent = q.parent_id.as_deref();
+    let dto = |item: &MediaItem, ud: pharos_core::UserItemData| {
+        BaseItemDto::from_domain_with_user_data(item, &state.server_id, ud)
+            .with_converted_book(
+                crate::book_convert::converted_book_path(state.books.as_ref(), item).as_deref(),
+            )
+            .with_trickplay(
+                &item.probe,
+                &state.generated_trickplay_widths(item.id),
+                state.trickplay_interval_ms,
+            )
+    };
+    // /Items/Latest returns a raw array, not the ItemsResult envelope.
+    if q.group_items == Some(false) {
+        let latest = crate::services::library::latest(state, &user.0, parent, &kinds, q.limit)
+            .await
+            .map_err(list_error)?;
+        let dtos: Vec<BaseItemDto> = latest.iter().map(|(item, ud)| dto(item, *ud)).collect();
+        return Ok(crate::api::jellyfin::wire::json(&dtos));
+    }
+    let tiles = crate::services::library::latest_tiles(state, &user.0, parent, &kinds, q.limit)
+        .await
+        .map_err(list_error)?;
+    let dtos: Vec<serde_json::Value> = tiles
+        .into_iter()
+        .map(|tile| match tile {
+            LatestTile::Item(item, ud) => {
+                serde_json::to_value(dto(item.as_ref(), ud)).unwrap_or(serde_json::Value::Null)
+            }
+            LatestTile::Group { dto, .. } => dto,
         })
         .collect();
-    // /Items/Latest returns a raw array, not the ItemsResult envelope.
     Ok(crate::api::jellyfin::wire::json(&dtos))
 }
 
@@ -3134,6 +3141,11 @@ struct ListQuery {
     /// Comma-separated Jellyfin Type names: e.g. "Movie,Episode".
     #[serde(default)]
     include_item_types: Option<String>,
+    /// `/Items/Latest`: fold a series' new episodes and an album's new tracks
+    /// into one tile. Jellyfin's default is to fold, so only `false` lists
+    /// every item (spec 038 FR-106).
+    #[serde(default)]
+    group_items: Option<bool>,
     /// Comma-separated Jellyfin `Fields` the client wants hydrated on each
     /// list row (e.g. `People,Studios,Tags`). T67 — the list builder omits
     /// these join-backed arrays by default (one query per item), populating
@@ -3607,6 +3619,58 @@ async fn synth_album_dto(state: &AppState, a: &AlbumAgg) -> serde_json::Value {
         )
     })
     .unwrap_or(serde_json::Value::Null)
+}
+
+/// The tile a latest rail shows for several newly added episodes of one show
+/// or tracks of one album (spec 038 FR-106): the series or album DTO, dated by
+/// its newest child, with `ChildCount` the number of new children, as
+/// Jellyfin's grouped Latest reports it. `None` when `children` is neither.
+pub(crate) async fn latest_group_dto(
+    state: &AppState,
+    user_id: UserId,
+    children: &[&MediaItem],
+) -> Result<Option<serde_json::Value>, pharos_core::DomainError> {
+    use pharos_core::SeriesMetadataStore;
+    let Some(first) = children.first() else {
+        return Ok(None);
+    };
+    let newest = children.iter().filter_map(|c| c.created_at).max();
+    let count = u32::try_from(children.len()).unwrap_or(u32::MAX);
+    let mut dto = match (first.kind, first.series.as_ref()) {
+        (MediaKind::Episode, Some(series)) => {
+            let key = series.series_key().to_string();
+            let mut meta = state.stores.series_metadata_by_keys(&[key]).await?;
+            crate::services::metadata_text::localize_series(state, user_id, &mut meta).await;
+            let seasons = children
+                .iter()
+                .filter_map(|c| c.series.as_ref().and_then(|s| s.season_number))
+                .collect::<std::collections::HashSet<_>>()
+                .len();
+            let mut dto = series_dto(
+                &state.server_id,
+                series,
+                u32::try_from(seasons).unwrap_or(u32::MAX),
+                count,
+                meta.get(series.series_key()),
+                library_parent_id(state, first),
+            );
+            dto["ChildCount"] = serde_json::Value::from(count);
+            dto
+        }
+        (MediaKind::Audio, _) => {
+            let owned: Vec<MediaItem> = children.iter().map(|c| (*c).clone()).collect();
+            let Some(album) = aggregate_albums(&owned, |_| true).into_iter().next() else {
+                return Ok(None);
+            };
+            synth_album_dto(state, &album).await
+        }
+        _ => return Ok(None),
+    };
+    if let Some(at) = newest {
+        dto["DateCreated"] =
+            serde_json::Value::String(crate::api::jellyfin::dto::format_iso8601(at));
+    }
+    Ok(Some(dto))
 }
 
 /// Sort synthesised albums per the request: each `SortBy` key an album has
