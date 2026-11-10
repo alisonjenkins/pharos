@@ -4583,6 +4583,8 @@ body::before {
   margin-top: 0.35rem;
   padding: 0.3rem 0.5rem;
   font-size: 0.85rem;
+  /* A 44px touch target on phones and tablets. */
+  min-height: 2.75rem;
 }
 /* Over an album's cover, shown while the card is hovered or focused. */
 .pharos-album-tile {
