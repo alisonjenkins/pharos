@@ -12,7 +12,7 @@ annotation secret(field, param) :Void;
 
 # Bumped when the schema changes; served as ServerInfo.schemaVersion so a client
 # can tell which methods a server knows (FR-009).
-const schemaVersion :UInt32 = 40;
+const schemaVersion :UInt32 = 43;
 
 # ---- ids and shared types -------------------------------------------------
 struct ItemId {                # mirrors pharos_jellyfin_api::WireId
@@ -433,7 +433,7 @@ struct Decision {
 }
 struct DecisionResult { union { decision @0 :Decision; error @1 :Error; } }
 # What this playback's viewer is waiting behind on the server, asked while a
-# start, seek or buffer waits (038 FR-402). Since schemaVersion 40.
+# start, seek or buffer waits (038 FR-402). Since schemaVersion 43.
 struct QueueHint {
   queued @0 :UInt32;        # this playback's client requests waiting for an encoder
   waitedMs @1 :UInt64;      # how long the oldest of them has waited; 0 with none
@@ -447,7 +447,7 @@ interface PlaybackGrant {
   # without renegotiating; `default` says nothing and keeps the stored choice.
   report @1 (ctx :CallContext, positionMs :UInt64, paused :Bool, audio :StreamChoice, subtitle :StreamChoice) -> (result :Done);
   stop @2 (ctx :CallContext, positionMs :UInt64) -> (result :Done);
-  queueHint @3 (ctx :CallContext) -> (result :QueueHintResult);   # Since schemaVersion 40.
+  queueHint @3 (ctx :CallContext) -> (result :QueueHintResult);   # Since schemaVersion 43.
 }
 struct NegotiateResult { union { grant @0 :PlaybackGrant; error @1 :Error; } }
 # The tracks a negotiate naming `default` for both would start on: the user's
@@ -512,7 +512,7 @@ enum EventKind {               # closed catalogue, 016 contracts/events.md
   seek @14; themeFallback @15; focusRecovered @16; cacheServed @17; cspViolation @18;
   groupDrift @19; groupHardSeek @20; groupWait @21; playbackResume @22;
   playbackStart @23; playbackSummary @24;
-  autoplayRefused @25;         # the browser refused to start a video unasked (038 FR-407). Since schemaVersion 40.
+  autoplayRefused @25;         # the browser refused to start a video unasked (038 FR-407). Since schemaVersion 43.
 
 }
 enum Level { error @0; warn @1; info @2; }
