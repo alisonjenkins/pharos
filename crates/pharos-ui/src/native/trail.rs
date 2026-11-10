@@ -209,7 +209,7 @@ mod tests {
         let mut fake = Fake::default();
         for i in [
             item(LIBRARY, ItemKind::Library, "TV Shows", None),
-            item(SERIES, ItemKind::Series, "Breaking Bad", Some(LIBRARY)),
+            item(SERIES, ItemKind::Series, "Show X", Some(LIBRARY)),
             item(SEASON, ItemKind::Season, "Season 1", Some(SERIES)),
             item(EPISODE, ItemKind::Episode, "Pilot", Some(SEASON)),
         ] {
@@ -226,10 +226,7 @@ mod tests {
     fn an_episode_trails_back_to_its_library() {
         let fake = show();
         let trail = run(load(&fake, &CallInfo::default(), EPISODE)).unwrap();
-        assert_eq!(
-            names(&trail),
-            ["TV Shows", "Breaking Bad", "Season 1", "Pilot"]
-        );
+        assert_eq!(names(&trail), ["TV Shows", "Show X", "Season 1", "Pilot"]);
     }
 
     #[test]
