@@ -2251,7 +2251,7 @@ fn run_too_short(
 /// B985 — whether the episode title the file names is the one stored for
 /// it: then the episode is right and only its date is odd. A file naming no
 /// title cannot vouch for its row, nor can a stored title the local resolver
-/// took from the file name itself (`Naruto - S03E33 - …`): it would agree with
+/// took from the file name itself (`Show - S03E33 - …`): it would agree with
 /// any file, right or wrong show.
 fn file_title_agrees(row: &pharos_core::SeriesEpisodeRow) -> bool {
     use pharos_scanner::metadata::filename::episode_title;
@@ -3640,7 +3640,7 @@ where
 pub(crate) const AMBIGUOUS_FLAG: &str = "ambiguous";
 
 /// Episode lists fetched this pass, by provider, show id and the seasons
-/// asked: shows that share candidates (two Battlestar Galactica folders) ask
+/// asked: shows that share candidates (two same-named folders) ask
 /// once.
 type EpisodeLists = HashMap<(&'static str, String, Vec<u32>), Vec<EpisodeListing>>;
 
@@ -3667,7 +3667,7 @@ fn exact_candidates(decision: &MatchDecision) -> Vec<&pharos_core::ScoredCandida
 
 /// B930 — two or more shows match the name exactly and score alike, so the
 /// matcher fell back to provider order or to which of their names matched
-/// first (TVDB lists a remake as "Battlestar Galactica (2003)" with the bare
+/// first (TVDB lists a remake as "Show B (1996)" with the bare
 /// name as an alias).
 fn needs_episode_fit(decision: &MatchDecision) -> bool {
     exact_candidates(decision).len() >= 2
@@ -6167,9 +6167,9 @@ mod tests {
         store.put(item).await.unwrap();
     }
 
-    /// Spec 033 B930 — a bare `Battlestar Galactica` folder searches with no
+    /// Spec 033 B930 — a bare `Show B` folder searches with no
     /// year, two shows carry the name, and the provider's order picks the
-    /// 1978 one. The decision is counted as ambiguous, decided by provider
+    /// 1971 one. The decision is counted as ambiguous, decided by provider
     /// order, and logged with both candidates.
     #[tokio::test(flavor = "current_thread")]
     async fn a_same_named_show_decided_by_provider_order_is_counted_and_logged() {
@@ -6180,14 +6180,14 @@ mod tests {
         let (logs, _log) = log_capture();
 
         let s = store().await;
-        put_bare_episode(&s, 1, "Battlestar Galactica", "/tv/Battlestar Galactica").await;
+        put_bare_episode(&s, 1, "Show B", "/tv/Show B").await;
         let (_td, cache) = cache();
         let tvdb = FakeEnricher::tvdb()
             .with_search(vec![
-                ("71173", "Battlestar Galactica", Some(1978)),
-                ("73545", "Battlestar Galactica", Some(2003)),
+                ("900001", "Show B", Some(1971)),
+                ("900002", "Show B", Some(1996)),
             ])
-            .with_detail(enriched_overview("A rag-tag fleet."));
+            .with_detail(enriched_overview("A scattered crew."));
 
         enrich_series_pass(
             &s,
@@ -6220,9 +6220,9 @@ mod tests {
             .find(|l| l.contains("series match"))
             .unwrap_or_else(|| panic!("no decision line in {text}"));
         for want in [
-            "query=\"Battlestar Galactica\"",
-            "chosen=\"71173\"",
-            "runner_up=\"73545\"",
+            "query=\"Show B\"",
+            "chosen=\"900001\"",
+            "runner_up=\"900002\"",
             "margin=0.0",
             "decided_by=\"provider_order\"",
             "outcome=\"ambiguous\"",
@@ -6261,12 +6261,12 @@ mod tests {
         store.put(item).await.unwrap();
     }
 
-    fn bsg_search(tvdb: FakeEnricher) -> FakeEnricher {
+    fn show_b_search(tvdb: FakeEnricher) -> FakeEnricher {
         tvdb.with_search(vec![
-            ("71173", "Battlestar Galactica", Some(1978)),
-            ("73545", "Battlestar Galactica", Some(2003)),
+            ("900001", "Show B", Some(1971)),
+            ("900002", "Show B", Some(1996)),
         ])
-        .with_detail(enriched_overview("A rag-tag fleet."))
+        .with_detail(enriched_overview("A scattered crew."))
     }
 
     async fn series_row(s: &SqliteStore, key: &str) -> SeriesMetadata {
@@ -6291,7 +6291,7 @@ mod tests {
         .unwrap();
     }
 
-    /// Spec 033 V891 / B930 — two shows named exactly "Battlestar Galactica"
+    /// Spec 033 V891 / B930 — two shows named exactly "Show B"
     /// and no year: the one whose episodes the folder holds wins, not the
     /// provider's first. Counted and logged as decided by episode fit, and
     /// each show's list is fetched once per pass however many folders ask.
@@ -6305,44 +6305,41 @@ mod tests {
 
         let s = store().await;
         for (id, season, title) in [
-            (1, 1, "33"),
-            (2, 2, "Valley of Darkness"),
-            (3, 4, "He That Believeth in Me"),
+            (1, 1, "Opening"),
+            (2, 2, "Second Light"),
+            (3, 4, "The Long Wait"),
         ] {
-            put_titled_episode(&s, id, "/tv/Battlestar Galactica", (season, 1), title).await;
-            put_titled_episode(&s, id + 10, "/tv2/Battlestar Galactica", (season, 1), title).await;
+            put_titled_episode(&s, id, "/tv/Show B", (season, 1), title).await;
+            put_titled_episode(&s, id + 10, "/tv2/Show B", (season, 1), title).await;
         }
         let (_td, cache) = cache();
-        let tvdb = bsg_search(FakeEnricher::tvdb())
+        let tvdb = show_b_search(FakeEnricher::tvdb())
             .with_list(
-                "71173",
-                &[
-                    (1, 1, "Saga of a Star World"),
-                    (1, 2, "Lost Planet of the Gods"),
-                ],
+                "900001",
+                &[(1, 1, "The Old Second"), (1, 2, "The Lost Road")],
             )
             .with_list(
-                "73545",
+                "900002",
                 &[
-                    (1, 1, "33"),
-                    (2, 1, "Valley of Darkness"),
-                    (3, 1, "Occupation"),
-                    (4, 1, "He That Believeth in Me"),
+                    (1, 1, "Opening"),
+                    (2, 1, "Second Light"),
+                    (3, 1, "The Third Door"),
+                    (4, 1, "The Long Wait"),
                 ],
             );
 
         series_pass(&s, &cache, &tvdb).await;
 
-        for key in ["/tv/Battlestar Galactica", "/tv2/Battlestar Galactica"] {
+        for key in ["/tv/Show B", "/tv2/Show B"] {
             let row = series_row(&s, key).await;
-            assert_eq!(row.match_external_id.as_deref(), Some("73545"), "{key}");
+            assert_eq!(row.match_external_id.as_deref(), Some("900002"), "{key}");
             assert_eq!(row.match_flag, None, "a clear fit is not flagged");
             assert_eq!(row.match_runner_up_id, None);
         }
         let mut listed = tvdb.listed();
         listed.sort();
-        assert_eq!(listed, ["71173", "73545"], "one list per show per pass");
-        assert!(!tvdb.fetched().contains(&"71173".to_string()));
+        assert_eq!(listed, ["900001", "900002"], "one list per show per pass");
+        assert!(!tvdb.fetched().contains(&"900001".to_string()));
         assert_eq!(
             counter_value(
                 &snap,
@@ -6357,14 +6354,14 @@ mod tests {
             .find(|l| l.contains("series episode fit"))
             .unwrap_or_else(|| panic!("no episode fit line in {text}"));
         for want in [
-            "chosen=\"73545\"",
-            "runner_up=\"71173\"",
+            "chosen=\"900002\"",
+            "runner_up=\"900001\"",
             "local_episodes=3",
             "titled=3",
             "flagged=false",
             "decided_by=\"episode_fit\"",
-            "73545:1.000",
-            "71173:0.167",
+            "900002:1.000",
+            "900001:0.167",
         ] {
             assert!(line.contains(want), "{want} missing from {line}");
         }
@@ -6378,44 +6375,37 @@ mod tests {
         );
     }
 
-    /// B930 — TVDB titles the remake "Battlestar Galactica (2003)" with the
+    /// B930 — TVDB titles the remake "Show B (1996)" with the
     /// bare name as an alias, so the original wins on name position alone.
     /// The episodes still decide.
     #[tokio::test(flavor = "current_thread")]
     async fn a_remake_matching_by_its_alias_is_decided_by_its_episodes() {
         let s = store().await;
-        put_titled_episode(
-            &s,
-            1,
-            "/tv/Battlestar Galactica",
-            (4, 1),
-            "He That Believeth in Me",
-        )
-        .await;
+        put_titled_episode(&s, 1, "/tv/Show B", (4, 1), "The Long Wait").await;
         let (_td, cache) = cache();
         let mut tvdb = FakeEnricher::tvdb()
-            .with_detail(enriched_overview("A rag-tag fleet."))
-            .with_list("71173", &[(1, 1, "Saga of a Star World")])
-            .with_list("73545", &[(4, 1, "He That Believeth in Me")]);
+            .with_detail(enriched_overview("A scattered crew."))
+            .with_list("900001", &[(1, 1, "The Old Second")])
+            .with_list("900002", &[(4, 1, "The Long Wait")]);
         tvdb.search = vec![
             SearchCandidate {
-                id: "71173".into(),
-                title: "Battlestar Galactica".into(),
-                year: Some(1978),
+                id: "900001".into(),
+                title: "Show B".into(),
+                year: Some(1971),
                 aliases: Vec::new(),
             },
             SearchCandidate {
-                id: "73545".into(),
-                title: "Battlestar Galactica (2003)".into(),
-                year: Some(2003),
-                aliases: vec!["Battlestar Galactica".into()],
+                id: "900002".into(),
+                title: "Show B (1996)".into(),
+                year: Some(1996),
+                aliases: vec!["Show B".into()],
             },
         ];
 
         series_pass(&s, &cache, &tvdb).await;
 
-        let row = series_row(&s, "/tv/Battlestar Galactica").await;
-        assert_eq!(row.match_external_id.as_deref(), Some("73545"));
+        let row = series_row(&s, "/tv/Show B").await;
+        assert_eq!(row.match_external_id.as_deref(), Some("900002"));
         assert_eq!(row.match_flag, None);
     }
 
@@ -6428,18 +6418,18 @@ mod tests {
         let snap = pharos_test_metrics::snapshotter(&recorder);
         let _metrics = metrics::set_default_local_recorder(&recorder);
         let s = store().await;
-        put_titled_episode(&s, 1, "/tv/Battlestar Galactica", (1, 1), "Pilot").await;
+        put_titled_episode(&s, 1, "/tv/Show B", (1, 1), "Pilot").await;
         let (_td, cache) = cache();
-        let tvdb = bsg_search(FakeEnricher::tvdb())
-            .with_list("71173", &[(1, 1, "Pilot")])
-            .with_list("73545", &[(1, 1, "Pilot")]);
+        let tvdb = show_b_search(FakeEnricher::tvdb())
+            .with_list("900001", &[(1, 1, "Pilot")])
+            .with_list("900002", &[(1, 1, "Pilot")]);
 
         series_pass(&s, &cache, &tvdb).await;
 
-        let row = series_row(&s, "/tv/Battlestar Galactica").await;
-        assert_eq!(row.match_external_id.as_deref(), Some("71173"));
+        let row = series_row(&s, "/tv/Show B").await;
+        assert_eq!(row.match_external_id.as_deref(), Some("900001"));
         assert_eq!(row.match_flag.as_deref(), Some(AMBIGUOUS_FLAG));
-        assert_eq!(row.match_runner_up_id.as_deref(), Some("73545"));
+        assert_eq!(row.match_runner_up_id.as_deref(), Some("900002"));
         assert_eq!(row.match_runner_up_score, Some(1.0));
         assert_eq!(
             counter_value(
@@ -6456,32 +6446,32 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn the_show_nfo_votes_between_even_episode_fits() {
         let show = TempDir::new().unwrap();
-        let folder = show.path().join("Battlestar Galactica");
+        let folder = show.path().join("Show B");
         std::fs::create_dir_all(&folder).unwrap();
         std::fs::write(
             folder.join("tvshow.nfo"),
-            r#"<tvshow><title>Battlestar Galactica</title><uniqueid type="tvdb">73545</uniqueid></tvshow>"#,
+            r#"<tvshow><title>Show B</title><uniqueid type="tvdb">900002</uniqueid></tvshow>"#,
         )
         .unwrap();
         let folder = folder.to_string_lossy().into_owned();
         let s = store().await;
         put_titled_episode(&s, 1, &folder, (1, 1), "Pilot").await;
         let (_td, cache) = cache();
-        let tvdb = bsg_search(FakeEnricher::tvdb())
-            .with_list("71173", &[(1, 1, "Pilot")])
-            .with_list("73545", &[(1, 1, "Pilot")]);
+        let tvdb = show_b_search(FakeEnricher::tvdb())
+            .with_list("900001", &[(1, 1, "Pilot")])
+            .with_list("900002", &[(1, 1, "Pilot")]);
         let (logs, _log) = log_capture();
 
         series_pass(&s, &cache, &tvdb).await;
 
         let row = series_row(&s, &folder).await;
-        assert_eq!(row.match_external_id.as_deref(), Some("73545"));
+        assert_eq!(row.match_external_id.as_deref(), Some("900002"));
         assert_eq!(row.match_flag.as_deref(), Some(AMBIGUOUS_FLAG));
-        assert_eq!(row.match_runner_up_id.as_deref(), Some("71173"));
+        assert_eq!(row.match_runner_up_id.as_deref(), Some("900001"));
         let text = logs.text();
         assert!(
             text.lines().any(|l| l.contains("series episode fit")
-                && l.contains("nfo_vote=\"73545\"")
+                && l.contains("nfo_vote=\"900002\"")
                 && l.contains("decided_by=\"nfo_vote\"")),
             "{text}"
         );
@@ -6492,24 +6482,24 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn more_same_named_shows_than_scored_is_flagged() {
         let s = store().await;
-        put_titled_episode(&s, 1, "/tv/Cosmos", (1, 1), "Shores").await;
+        put_titled_episode(&s, 1, "/tv/Show C", (1, 1), "Harbour").await;
         let (_td, cache) = cache();
         let tvdb = FakeEnricher::tvdb()
             .with_search(vec![
-                ("1", "Cosmos", None),
-                ("2", "Cosmos", None),
-                ("3", "Cosmos", None),
-                ("4", "Cosmos", None),
+                ("1", "Show C", None),
+                ("2", "Show C", None),
+                ("3", "Show C", None),
+                ("4", "Show C", None),
             ])
             .with_detail(enriched_overview("Space."))
             .with_list("1", &[(2, 1, "x")])
-            .with_list("2", &[(1, 1, "Shores")])
+            .with_list("2", &[(1, 1, "Harbour")])
             .with_list("3", &[(3, 1, "y")])
-            .with_list("4", &[(1, 1, "Shores")]);
+            .with_list("4", &[(1, 1, "Harbour")]);
 
         series_pass(&s, &cache, &tvdb).await;
 
-        let row = series_row(&s, "/tv/Cosmos").await;
+        let row = series_row(&s, "/tv/Show C").await;
         assert_eq!(row.match_external_id.as_deref(), Some("2"));
         assert_eq!(row.match_flag.as_deref(), Some(AMBIGUOUS_FLAG));
         assert!(
@@ -6523,19 +6513,19 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn an_unavailable_episode_list_keeps_the_choice_and_flags_it() {
         let s = store().await;
-        put_titled_episode(&s, 1, "/tv/Battlestar Galactica", (1, 1), "33").await;
+        put_titled_episode(&s, 1, "/tv/Show B", (1, 1), "Opening").await;
         let (_td, cache) = cache();
-        let tvdb = bsg_search(FakeEnricher::tvdb()).with_list("73545", &[(1, 1, "33")]);
+        let tvdb = show_b_search(FakeEnricher::tvdb()).with_list("900002", &[(1, 1, "Opening")]);
 
         series_pass(&s, &cache, &tvdb).await;
 
-        let row = series_row(&s, "/tv/Battlestar Galactica").await;
-        assert_eq!(row.match_external_id.as_deref(), Some("71173"));
+        let row = series_row(&s, "/tv/Show B").await;
+        assert_eq!(row.match_external_id.as_deref(), Some("900001"));
         assert_eq!(row.match_flag.as_deref(), Some(AMBIGUOUS_FLAG));
-        assert_eq!(row.match_runner_up_id.as_deref(), Some("73545"));
+        assert_eq!(row.match_runner_up_id.as_deref(), Some("900002"));
     }
 
-    const BSG: &str = "/tv/Battlestar Galactica";
+    const SHOW_B: &str = "/tv/Show B";
 
     fn apply_cfg() -> MetadataConfig {
         MetadataConfig {
@@ -6577,23 +6567,23 @@ mod tests {
         let snap = pharos_test_metrics::snapshotter(&recorder);
         let _metrics = metrics::set_default_local_recorder(&recorder);
         let s = store().await;
-        put_titled_episode(&s, 1, BSG, (1, 1), "33").await;
-        put_titled_episode(&s, 2, BSG, (2, 1), "Valley of Darkness").await;
+        put_titled_episode(&s, 1, SHOW_B, (1, 1), "Opening").await;
+        put_titled_episode(&s, 2, SHOW_B, (2, 1), "Second Light").await;
         s.set_item_match(2, "tvdb", "1", "manual", None, NOW)
             .await
             .unwrap();
         // Stored long ago, so the TTL re-asks it.
-        pin(&s, BSG, "71173", 0).await;
+        pin(&s, SHOW_B, "900001", 0).await;
         let (_td, cache) = cache();
-        let tvdb = bsg_search(FakeEnricher::tvdb())
-            .with_list("71173", &[(1, 1, "Saga of a Star World")])
-            .with_list("73545", &[(1, 1, "33"), (2, 1, "Valley of Darkness")]);
+        let tvdb = show_b_search(FakeEnricher::tvdb())
+            .with_list("900001", &[(1, 1, "The Old Second")])
+            .with_list("900002", &[(1, 1, "Opening"), (2, 1, "Second Light")]);
 
         series_pass(&s, &cache, &tvdb).await;
 
         assert_eq!(
-            series_row(&s, BSG).await.match_external_id.as_deref(),
-            Some("73545")
+            series_row(&s, SHOW_B).await.match_external_id.as_deref(),
+            Some("900002")
         );
         assert_eq!(pending_ids(&s).await, [1]);
         assert_eq!(
@@ -6607,7 +6597,7 @@ mod tests {
 
         // The same answer again marks nothing more.
         s.clear_series_reconcile(1, NOW).await.unwrap();
-        pin(&s, BSG, "73545", 0).await;
+        pin(&s, SHOW_B, "900002", 0).await;
         series_pass(&s, &cache, &tvdb).await;
         assert!(pending_ids(&s).await.is_empty());
     }
@@ -6618,34 +6608,34 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn a_marked_episode_is_rebuilt_against_its_shows_match() {
         let s = store().await;
-        put_titled_episode(&s, 1, BSG, (1, 1), "33").await;
+        put_titled_episode(&s, 1, SHOW_B, (1, 1), "Opening").await;
         let mut item = s.get(1).await.unwrap();
-        item.title = "Saga of a Star World".into();
-        item.metadata.overview = Some("The 1978 pilot.".into());
-        item.metadata.premiere_date = Some(275_184_000);
-        item.metadata.provider_ids.tvdb = Some("71173".into());
+        item.title = "The Old Second".into();
+        item.metadata.overview = Some("The old pilot.".into());
+        item.metadata.premiere_date = Some(54_259_200);
+        item.metadata.provider_ids.tvdb = Some("900001".into());
         s.put(item).await.unwrap();
-        s.set_item_match(1, "tvdb", "71173", "search", None, NOW)
+        s.set_item_match(1, "tvdb", "900001", "search", None, NOW)
             .await
             .unwrap();
         s.upsert_translations(
             &TranslationOwner::Item(1),
             &[LocalizedText {
                 language: "deu".into(),
-                title: Some("Die Saga".into()),
+                title: Some("Das Alte Zweite".into()),
                 ..LocalizedText::default()
             }],
             NOW,
         )
         .await
         .unwrap();
-        pin(&s, BSG, "73545", NOW).await;
-        s.mark_series_reconcile(BSG, NOW).await.unwrap();
+        pin(&s, SHOW_B, "900002", NOW).await;
+        s.mark_series_reconcile(SHOW_B, NOW).await.unwrap();
         let (_td, cache) = cache();
         let record = EnrichedMetadata {
-            title: Some("33".into()),
-            overview: Some("The fleet jumps every 33 minutes.".into()),
-            premiere_date: Some(1_097_712_000),
+            title: Some("Opening".into()),
+            overview: Some("The crew moves on every 33 minutes.".into()),
+            premiere_date: Some(876_787_200),
             ..EnrichedMetadata::default()
         };
         let tvdb = FakeEnricher::tvdb().with_detail(record);
@@ -6663,15 +6653,15 @@ mod tests {
         .unwrap();
 
         assert_eq!((n, pending), (1, true));
-        assert_eq!(tvdb.fetched(), ["73545"], "read from the pinned show");
+        assert_eq!(tvdb.fetched(), ["900002"], "read from the pinned show");
         let got = s.get(1).await.unwrap();
-        assert_ne!(got.title, "Saga of a Star World");
+        assert_ne!(got.title, "The Old Second");
         assert_eq!(
             got.metadata.overview.as_deref(),
-            Some("The fleet jumps every 33 minutes.")
+            Some("The crew moves on every 33 minutes.")
         );
-        assert_eq!(got.metadata.premiere_date, Some(1_097_712_000));
-        assert_eq!(got.metadata.provider_ids.tvdb.as_deref(), Some("73545"));
+        assert_eq!(got.metadata.premiere_date, Some(876_787_200));
+        assert_eq!(got.metadata.provider_ids.tvdb.as_deref(), Some("900002"));
         assert!(s
             .translations_for(&[TranslationOwner::Item(1)], &["deu".into()], false)
             .await
@@ -6690,7 +6680,7 @@ mod tests {
         let (_td, cache) = cache();
         let mut old_paths = Vec::new();
         for id in [1, 2] {
-            put_titled_episode(&s, id, BSG, (1, id as u32), "33").await;
+            put_titled_episode(&s, id, SHOW_B, (1, id as u32), "Opening").await;
             let old = cache
                 .upload(
                     id,
@@ -6705,20 +6695,15 @@ mod tests {
                 .await
                 .unwrap();
             old_paths.push(old);
-            s.set_artwork(
-                id,
-                "Backdrop",
-                "local",
-                "/tv/Battlestar Galactica/fanart.jpg",
-            )
-            .await
-            .unwrap();
+            s.set_artwork(id, "Backdrop", "local", "/tv/Show B/fanart.jpg")
+                .await
+                .unwrap();
             s.mark_reconcile_items(&[id], NOW).await.unwrap();
         }
-        pin(&s, BSG, "73545", NOW).await;
+        pin(&s, SHOW_B, "900002", NOW).await;
         let before = s.get(1).await.unwrap().art_version;
         let bare = FakeEnricher::tvdb().with_detail(EnrichedMetadata {
-            title: Some("33".into()),
+            title: Some("Opening".into()),
             ..EnrichedMetadata::default()
         });
 
@@ -6746,14 +6731,14 @@ mod tests {
         assert!(s.get(1).await.unwrap().art_version > before);
 
         let mut with_still = FakeEnricher::tvdb().with_detail(EnrichedMetadata {
-            title: Some("Water".into()),
+            title: Some("Wellspring".into()),
             artwork: vec![RemoteArt {
                 role: ArtworkRole::Primary,
-                url: "https://tvdb.example/2004-still.jpg".into(),
+                url: "https://tvdb.example/new-still.jpg".into(),
             }],
             ..EnrichedMetadata::default()
         });
-        with_still.image_bytes = Some(b"2004 still".to_vec());
+        with_still.image_bytes = Some(b"new still".to_vec());
         reconcile_one(
             &s,
             &sem(4),
@@ -6775,7 +6760,7 @@ mod tests {
             .find(|(role, _, _)| role == "Primary")
             .expect("new still recorded");
         assert_eq!(source, "tvdb");
-        assert_eq!(std::fs::read(locator).unwrap(), b"2004 still");
+        assert_eq!(std::fs::read(locator).unwrap(), b"new still");
     }
 
     /// A dry run rebuilds nothing and keeps the mark; a transient miss under
@@ -6783,12 +6768,12 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn a_marked_episode_waits_in_a_dry_run_and_after_a_transient_miss() {
         let s = store().await;
-        put_titled_episode(&s, 1, BSG, (1, 1), "33").await;
+        put_titled_episode(&s, 1, SHOW_B, (1, 1), "Opening").await;
         let mut item = s.get(1).await.unwrap();
-        item.metadata.overview = Some("The 1978 pilot.".into());
+        item.metadata.overview = Some("The old pilot.".into());
         s.put(item).await.unwrap();
-        pin(&s, BSG, "73545", NOW).await;
-        s.mark_series_reconcile(BSG, NOW).await.unwrap();
+        pin(&s, SHOW_B, "900002", NOW).await;
+        s.mark_series_reconcile(SHOW_B, NOW).await.unwrap();
         let (_td, cache) = cache();
         let tvdb = FakeEnricher::tvdb();
         let pass = |cfg: MetadataConfig, now: i64| {
@@ -6812,7 +6797,7 @@ mod tests {
         assert!(tvdb.fetched().is_empty());
         assert_eq!(
             s.get(1).await.unwrap().metadata.overview.as_deref(),
-            Some("The 1978 pilot.")
+            Some("The old pilot.")
         );
         assert_eq!(s.series_reconcile_pending(10).await.unwrap(), [(1, NOW)]);
 
@@ -6854,27 +6839,27 @@ mod tests {
     async fn version_two_re_asks_only_shows_with_conflicting_evidence() {
         let (logs, _log) = log_capture();
         let s = store().await;
-        // BSG: an exact-name rival. Its episode 1's own search found 71173,
-        // its episode 2 aired in 2014, long after the show's run.
-        put_titled_episode(&s, 1, BSG, (1, 1), "33").await;
-        put_titled_episode(&s, 2, BSG, (1, 2), "Water").await;
-        s.set_item_match(1, "tvdb", "71173", "search", None, NOW)
+        // SHOW_B: an exact-name rival. Its episode 1's own search found 900001,
+        // its episode 2 aired in 2007, long after the show's run.
+        put_titled_episode(&s, 1, SHOW_B, (1, 1), "Opening").await;
+        put_titled_episode(&s, 2, SHOW_B, (1, 2), "Wellspring").await;
+        s.set_item_match(1, "tvdb", "900001", "search", None, NOW)
             .await
             .unwrap();
         let mut late = s.get(2).await.unwrap();
-        late.metadata.premiere_date = Some(1_394_323_200);
+        late.metadata.premiere_date = Some(1_173_398_400);
         // Another show's episode: its stored title is not the file's (B985).
-        late.title = "Scattered".into();
+        late.title = "Stray".into();
         s.put(late).await.unwrap();
-        pin(&s, BSG, "73545", NOW).await;
-        // Firefly: one candidate, the match it has. Left alone.
-        put_titled_episode(&s, 3, "/tv/Firefly", (1, 1), "Serenity").await;
-        pin(&s, "/tv/Firefly", "78874", NOW).await;
+        pin(&s, SHOW_B, "900002", NOW).await;
+        // Show F: one candidate, the match it has. Left alone.
+        put_titled_episode(&s, 3, "/tv/Show F", (1, 1), "Opening Day").await;
+        pin(&s, "/tv/Show F", "900010", NOW).await;
         set_version(&s, TV_MATCH_VERSION_KEY, "1").await;
-        let tvdb = bsg_search(FakeEnricher::tvdb()).with_aired_list(
-            "73545",
-            // 2004-10-18 .. 2005-01-24
-            &[(1, 1, 1_098_057_600), (1, 2, 1_106_524_800)],
+        let tvdb = show_b_search(FakeEnricher::tvdb()).with_aired_list(
+            "900002",
+            // 1997-10-18 .. 1998-01-24
+            &[(1, 1, 877_132_800), (1, 2, 885_600_000)],
         );
 
         gate(&s, &tvdb, &MetadataConfig::default()).await;
@@ -6902,7 +6887,7 @@ mod tests {
             "mode=\"dry_run\"",
             "shows=1",
             "episodes=2",
-            "Battlestar Galactica:exact_rival",
+            "Show B:exact_rival",
         ] {
             assert!(survey.contains(want), "{want} missing from {survey}");
         }
@@ -6911,7 +6896,7 @@ mod tests {
             .find(|l| l.contains("series identity repair: re-ask"))
             .unwrap_or_else(|| panic!("no re-ask line in {text}"));
         assert!(
-            reask.contains("candidates=71173 (1978) 0.85, 73545 (2003) 0.85"),
+            reask.contains("candidates=900001 (1971) 0.85, 900002 (1996) 0.85"),
             "exact-name candidates missing from {reask}"
         );
         let searches = tvdb.searched();
@@ -6935,25 +6920,24 @@ mod tests {
             .into_iter()
             .map(|c| c.series_key)
             .collect();
-        assert_eq!(reask, [BSG]);
+        assert_eq!(reask, [SHOW_B]);
         let mut pending = pending_ids(&s).await;
         pending.sort_unstable();
         assert_eq!(pending, [1, 2]);
     }
 
-    /// B980: a bare folder whose files state `Battlestar Galactica (2003)`
+    /// B980: a bare folder whose files state `Show B (1996)`
     /// but whose rows hold no stored year yet (the scan's split pass has not
-    /// written it) is still re-asked when its match premiered in 1978.
+    /// written it) is still re-asked when its match premiered in 1971.
     #[tokio::test]
     async fn the_survey_reads_a_shows_year_from_its_files_not_the_stored_column() {
         let (logs, _log) = log_capture();
         let s = store().await;
         for (id, ep) in [(1u64, 1u32), (2, 2)] {
-            put_titled_episode(&s, id, BSG, (1, ep), "Part").await;
+            put_titled_episode(&s, id, SHOW_B, (1, ep), "Part").await;
             let mut item = s.get(id).await.unwrap();
             item.path =
-                format!("{BSG}/Season 1/Battlestar Galactica (2003) - S01E{ep:02} - Part {ep}.mkv")
-                    .into();
+                format!("{SHOW_B}/Season 1/Show B (1996) - S01E{ep:02} - Part {ep}.mkv").into();
             s.put(item).await.unwrap();
         }
         assert_eq!(
@@ -6961,19 +6945,19 @@ mod tests {
             None,
             "the stored column is empty"
         );
-        pin(&s, BSG, "71173", NOW).await;
-        let mut row = series_row(&s, BSG).await;
-        // 1978-09-17
-        row.premiere_date = Some(274_838_400);
+        pin(&s, SHOW_B, "900001", NOW).await;
+        let mut row = series_row(&s, SHOW_B).await;
+        // 1971-09-17
+        row.premiere_date = Some(53_913_600);
         s.upsert_series_metadata(row).await.unwrap();
         set_version(&s, TV_MATCH_VERSION_KEY, "1").await;
-        // No exact-name rival: the 2003 show is titled with its year.
+        // No exact-name rival: the 1996 show is titled with its year.
         let tvdb = FakeEnricher::tvdb()
             .with_search(vec![
-                ("71173", "Battlestar Galactica", Some(1978)),
-                ("73545", "Battlestar Galactica (2003)", Some(2003)),
+                ("900001", "Show B", Some(1971)),
+                ("900002", "Show B (1996)", Some(1996)),
             ])
-            .with_detail(enriched_overview("A rag-tag fleet."));
+            .with_detail(enriched_overview("A scattered crew."));
 
         gate(&s, &tvdb, &MetadataConfig::default()).await;
 
@@ -6982,10 +6966,7 @@ mod tests {
             .lines()
             .find(|l| l.contains("series identity repair: survey"))
             .unwrap_or_else(|| panic!("no survey line in {text}"));
-        assert!(
-            survey.contains("Battlestar Galactica:year_mismatch"),
-            "{survey}"
-        );
+        assert!(survey.contains("Show B:year_mismatch"), "{survey}");
     }
 
     /// B982 — the run window is the show's whole run, not the span of the
@@ -6996,52 +6977,45 @@ mod tests {
     async fn the_run_window_covers_a_shows_whole_run() {
         use crate::online_enrich::SeriesRun;
         let s = store().await;
-        const ONE_PIECE: &str = "/tv/One Piece";
-        const COSMOS: &str = "/tv/Cosmos";
-        put_titled_episode(&s, 1, ONE_PIECE, (1, 1), "I'm Luffy!").await;
-        put_titled_episode(&s, 2, ONE_PIECE, (1, 1050), "Honor Above All").await;
-        put_titled_episode(&s, 3, COSMOS, (1, 1), "The Shores of the Cosmic Ocean").await;
-        put_titled_episode(
-            &s,
-            4,
-            COSMOS,
-            (1, 2),
-            "Some of the Things That Molecules Do",
-        )
-        .await;
+        const SHOW_D: &str = "/tv/Show D";
+        const SHOW_C: &str = "/tv/Show C";
+        put_titled_episode(&s, 1, SHOW_D, (1, 1), "The First Step").await;
+        put_titled_episode(&s, 2, SHOW_D, (1, 1050), "The Last Step").await;
+        put_titled_episode(&s, 3, SHOW_C, (1, 1), "The Old Second").await;
+        put_titled_episode(&s, 4, SHOW_C, (1, 2), "The Quiet Hours").await;
         for (id, aired) in [
-            (1, 940_377_600),   // 1999-10-20
-            (2, 1_673_136_000), // 2023-01-08
-            (3, 339_033_600),   // 1980-09-28
-            (4, 1_394_323_200), // 2014-03-09
+            (1, 719_539_200),   // 1992-10-20
+            (2, 1_452_211_200), // 2016-01-08
+            (3, 118_108_800),   // 1973-09-28
+            (4, 1_173_398_400), // 2007-03-09
         ] {
             let mut item = s.get(id).await.unwrap();
             item.metadata.premiere_date = Some(aired);
             if id == 4 {
-                // The 2014 remake's episode on a 1980 file (B931, B985).
-                item.title = "Hiding in the Light".into();
+                // The 2007 remake's episode on a 1973 file (B931, B985).
+                item.title = "The Late Hour".into();
             }
             s.put(item).await.unwrap();
         }
-        pin(&s, ONE_PIECE, "81797", NOW).await;
-        pin(&s, COSMOS, "74995", NOW).await;
+        pin(&s, SHOW_D, "900014", NOW).await;
+        pin(&s, SHOW_C, "900006", NOW).await;
         let tvdb = FakeEnricher::tvdb()
-            // Season 1 as the provider numbers it: 1999-10-20 .. 2000-03-15.
-            .with_aired_list("81797", &[(1, 1, 940_377_600), (1, 8, 953_078_400)])
+            // Season 1 as the provider numbers it: 1992-10-20 .. 1993-03-15.
+            .with_aired_list("900014", &[(1, 1, 719_539_200), (1, 8, 732_153_600)])
             .with_run(
-                "81797",
+                "900014",
                 SeriesRun {
-                    first: Some(940_377_600),
-                    last: Some(1_762_041_600),
+                    first: Some(719_539_200),
+                    last: Some(1_541_116_800),
                     ongoing: true,
                 },
             )
-            .with_aired_list("74995", &[(1, 1, 339_033_600)])
+            .with_aired_list("900006", &[(1, 1, 118_108_800)])
             .with_run(
-                "74995",
+                "900006",
                 SeriesRun {
-                    first: Some(339_033_600),
-                    last: Some(346_204_800), // 1980-12-21
+                    first: Some(118_108_800),
+                    last: Some(125_280_000), // 1973-12-21
                     ongoing: false,
                 },
             );
@@ -7063,22 +7037,22 @@ mod tests {
     async fn an_air_date_of_zero_is_not_outside_the_run() {
         use crate::online_enrich::SeriesRun;
         let s = store().await;
-        const ONE_PIECE: &str = "/tv/One Piece";
-        put_titled_episode(&s, 1, ONE_PIECE, (10, 1), "Emergency Announcement").await;
-        put_titled_episode(&s, 2, ONE_PIECE, (1, 1), "I'm Luffy!").await;
-        for (id, aired) in [(1, 0), (2, 940_377_600)] {
+        const SHOW_D: &str = "/tv/Show D";
+        put_titled_episode(&s, 1, SHOW_D, (10, 1), "Sudden Notice").await;
+        put_titled_episode(&s, 2, SHOW_D, (1, 1), "The First Step").await;
+        for (id, aired) in [(1, 0), (2, 719_539_200)] {
             let mut item = s.get(id).await.unwrap();
             item.metadata.premiere_date = Some(aired);
             s.put(item).await.unwrap();
         }
-        pin(&s, ONE_PIECE, "81797", NOW).await;
+        pin(&s, SHOW_D, "900014", NOW).await;
         let tvdb = FakeEnricher::tvdb()
-            .with_aired_list("81797", &[(1, 1, 940_377_600)])
+            .with_aired_list("900014", &[(1, 1, 719_539_200)])
             .with_run(
-                "81797",
+                "900014",
                 SeriesRun {
-                    first: Some(940_377_600),
-                    last: Some(1_762_041_600),
+                    first: Some(719_539_200),
+                    last: Some(1_541_116_800),
                     ongoing: true,
                 },
             );
@@ -7102,38 +7076,38 @@ mod tests {
         use crate::online_enrich::SeriesRun;
         let (logs, _log) = log_capture();
         let s = store().await;
-        const GT: &str = "/tv/Dragon Ball GT";
-        put_titled_episode(&s, 1, GT, (2, 1), "Pan's Gambit").await;
-        put_titled_episode(&s, 2, GT, (2, 2), "Unexpected Power").await;
+        const GT: &str = "/tv/Show E";
+        put_titled_episode(&s, 1, GT, (2, 1), "The Gambit").await;
+        put_titled_episode(&s, 2, GT, (2, 2), "Quiet Strength").await;
         put_titled_episode(&s, 3, GT, (2, 3), "untitled").await;
-        put_titled_episode(&s, 4, GT, (1, 1), "A Grand Wish").await;
-        put_titled_episode(&s, 5, GT, (2, 5), "A Secret Revealed").await;
+        put_titled_episode(&s, 4, GT, (1, 1), "The Long Wish").await;
+        put_titled_episode(&s, 5, GT, (2, 5), "The Open Secret").await;
         for (id, aired) in [
-            (1, 1_334_016_000), // 2012-04-10
-            (2, 1_334_016_000),
-            (3, 1_334_016_000),
-            (4, 823_651_200), // 1996-02-07
-            (5, 1_334_016_000),
+            (1, 1_113_091_200), // 2005-04-10
+            (2, 1_113_091_200),
+            (3, 1_113_091_200),
+            (4, 602_812_800), // 1989-02-07
+            (5, 1_113_091_200),
         ] {
             let mut item = s.get(id).await.unwrap();
             item.metadata.premiere_date = Some(aired);
             match id {
-                2 => item.title = "Deal of Pay".into(),
-                3 => item.path = format!("{GT}/Season 2/Dragon Ball GT - S02E03.mkv").into(),
+                2 => item.title = "Terms of Trade".into(),
+                3 => item.path = format!("{GT}/Season 2/Show E - S02E03.mkv").into(),
                 // The local resolver's title, taken from the file name.
-                5 => item.title = "Dragon Ball GT - S02E05 - A Secret Revealed".into(),
+                5 => item.title = "Show E - S02E05 - The Open Secret".into(),
                 _ => {}
             }
             s.put(item).await.unwrap();
         }
-        pin(&s, GT, "79275", NOW).await;
+        pin(&s, GT, "900011", NOW).await;
         let tvdb = FakeEnricher::tvdb()
-            .with_aired_list("79275", &[(1, 1, 823_651_200)])
+            .with_aired_list("900011", &[(1, 1, 602_812_800)])
             .with_run(
-                "79275",
+                "900011",
                 SeriesRun {
-                    first: Some(823_651_200),
-                    last: Some(879_897_600), // 1997-11-19
+                    first: Some(602_812_800),
+                    last: Some(658_972_800), // 1990-11-19
                     ongoing: false,
                 },
             );
@@ -7165,32 +7139,32 @@ mod tests {
     async fn a_series_matched_to_a_miniseries_is_re_asked() {
         use crate::online_enrich::SeriesRun;
         let s = store().await;
-        const BSG03: &str = "/tv/Battlestar Galactica (2003)";
-        const MINI: &str = "/tv/Band of Brothers";
+        const SHOW_B_REMAKE: &str = "/tv/Show B (1996)";
+        const MINI: &str = "/tv/Show H";
         let mut id = 0;
         for season in 1..=4 {
             id += 1;
-            put_titled_episode(&s, id, BSG03, (season, 1), "Sometimes a Great Notion").await;
+            put_titled_episode(&s, id, SHOW_B_REMAKE, (season, 1), "Slow Start").await;
             let mut item = s.get(id).await.unwrap();
             item.title = "Night 1".into();
-            // 2005-01-14 onwards, a season a year.
-            item.metadata.premiere_date = Some(1_105_660_800 + i64::from(season) * 31_536_000);
+            // 1998-01-14 onwards, a season a year.
+            item.metadata.premiere_date = Some(884_736_000 + i64::from(season) * 31_536_000);
             s.put(item).await.unwrap();
         }
-        put_titled_episode(&s, 9, MINI, (1, 1), "Currahee").await;
-        pin(&s, BSG03, "71365", NOW).await;
-        pin(&s, MINI, "74205", NOW).await;
+        put_titled_episode(&s, 9, MINI, (1, 1), "Step One").await;
+        pin(&s, SHOW_B_REMAKE, "900003", NOW).await;
+        pin(&s, MINI, "900012", NOW).await;
         let night = |first: i64, last: i64| SeriesRun {
             first: Some(first),
             last: Some(last),
             ongoing: false,
         };
         let tvdb = FakeEnricher::tvdb()
-            // 2003-12-08 .. 2003-12-09
-            .with_aired_list("71365", &[(1, 1, 1_070_841_600), (1, 2, 1_070_928_000)])
-            .with_run("71365", night(1_070_841_600, 1_070_928_000))
-            .with_aired_list("74205", &[(1, 1, 1_000_598_400)])
-            .with_run("74205", night(1_000_598_400, 1_003_622_400));
+            // 1996-12-08 .. 1996-12-09
+            .with_aired_list("900003", &[(1, 1, 850_003_200), (1, 2, 850_089_600)])
+            .with_run("900003", night(850_003_200, 850_089_600))
+            .with_aired_list("900012", &[(1, 1, 779_673_600)])
+            .with_run("900012", night(779_673_600, 782_697_600));
         let providers = SeriesProviders::<FakeEnricher, FakeEnricher> {
             tvdb: Some(&tvdb),
             tmdb: None,
@@ -7201,7 +7175,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            survey.reask.get(BSG03),
+            survey.reask.get(SHOW_B_REMAKE),
             Some(&RepairReason::RunTooShort),
             "{:?}",
             survey.reask
@@ -7216,10 +7190,10 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn a_dry_run_surveys_again_after_a_survey_revision_bump() {
         let s = store().await;
-        put_titled_episode(&s, 1, BSG, (1, 1), "33").await;
-        pin(&s, BSG, "73545", NOW).await;
+        put_titled_episode(&s, 1, SHOW_B, (1, 1), "Opening").await;
+        pin(&s, SHOW_B, "900002", NOW).await;
         set_version(&s, TV_MATCH_VERSION_KEY, "1").await;
-        let tvdb = bsg_search(FakeEnricher::tvdb());
+        let tvdb = show_b_search(FakeEnricher::tvdb());
         let current = dry_run_marker(&TV_MATCH_VERSION.to_string());
 
         for stale in ["2", "2.r1"] {
@@ -7259,7 +7233,7 @@ mod tests {
             match_source: Some("search".into()),
             metadata_refreshed_at: Some(NOW),
             match_flag: Some(AMBIGUOUS_FLAG.into()),
-            match_runner_up_id: Some("71173".into()),
+            match_runner_up_id: Some("900001".into()),
             match_runner_up_score: Some(0.85),
             ..Default::default()
         })
@@ -7279,8 +7253,8 @@ mod tests {
             cache,
             None::<&FakeEnricher>,
             Some(tvdb),
-            BSG,
-            "Battlestar Galactica",
+            SHOW_B,
+            "Show B",
             pick,
             NOW + 10,
         )
@@ -7297,21 +7271,21 @@ mod tests {
         let (_td, cache) = cache();
         let tvdb = FakeEnricher::tvdb();
         assert_eq!(hand_pin(&s, &cache, &tvdb, None).await, None);
-        put_titled_episode(&s, 1, BSG, (1, 1), "33").await;
-        flagged_pin(&s, BSG, "73545").await;
+        put_titled_episode(&s, 1, SHOW_B, (1, 1), "Opening").await;
+        flagged_pin(&s, SHOW_B, "900002").await;
 
         let pin = hand_pin(&s, &cache, &tvdb, None).await;
 
         assert_eq!(
             pin,
             Some(HandPin {
-                old: Some("tvdb:73545".into()),
-                new: "tvdb:73545".into(),
+                old: Some("tvdb:900002".into()),
+                new: "tvdb:900002".into(),
             })
         );
-        let row = series_row(&s, BSG).await;
+        let row = series_row(&s, SHOW_B).await;
         assert_eq!(row.match_source.as_deref(), Some("manual"));
-        assert_eq!(row.match_external_id.as_deref(), Some("73545"));
+        assert_eq!(row.match_external_id.as_deref(), Some("900002"));
         assert_eq!(row.match_flag, None);
         assert_eq!(row.match_runner_up_id, None);
         assert!(s
@@ -7330,24 +7304,24 @@ mod tests {
     async fn picking_a_show_by_hand_pins_it_and_marks_its_episodes() {
         let s = store().await;
         let (_td, cache) = cache();
-        put_titled_episode(&s, 1, BSG, (1, 1), "33").await;
-        flagged_pin(&s, BSG, "71173").await;
-        let tvdb = FakeEnricher::tvdb().with_detail(enriched_overview("A rag-tag fleet."));
+        put_titled_episode(&s, 1, SHOW_B, (1, 1), "Opening").await;
+        flagged_pin(&s, SHOW_B, "900001").await;
+        let tvdb = FakeEnricher::tvdb().with_detail(enriched_overview("A scattered crew."));
 
-        let pin = hand_pin(&s, &cache, &tvdb, Some(("tvdb", "73545"))).await;
+        let pin = hand_pin(&s, &cache, &tvdb, Some(("tvdb", "900002"))).await;
 
         assert_eq!(
             pin,
             Some(HandPin {
-                old: Some("tvdb:71173".into()),
-                new: "tvdb:73545".into(),
+                old: Some("tvdb:900001".into()),
+                new: "tvdb:900002".into(),
             })
         );
-        assert_eq!(tvdb.fetched(), ["73545"]);
-        let row = series_row(&s, BSG).await;
+        assert_eq!(tvdb.fetched(), ["900002"]);
+        let row = series_row(&s, SHOW_B).await;
         assert_eq!(row.match_source.as_deref(), Some("manual"));
-        assert_eq!(row.match_external_id.as_deref(), Some("73545"));
-        assert_eq!(row.overview.as_deref(), Some("A rag-tag fleet."));
+        assert_eq!(row.match_external_id.as_deref(), Some("900002"));
+        assert_eq!(row.overview.as_deref(), Some("A scattered crew."));
         assert_eq!(row.match_flag, None);
         assert_eq!(pending_ids(&s).await, [1]);
 
@@ -7358,8 +7332,8 @@ mod tests {
             "a record that did not arrive writes nothing"
         );
         assert_eq!(
-            series_row(&s, BSG).await.match_external_id.as_deref(),
-            Some("73545")
+            series_row(&s, SHOW_B).await.match_external_id.as_deref(),
+            Some("900002")
         );
     }
 
@@ -7369,12 +7343,12 @@ mod tests {
     async fn a_hand_fix_rebuilds_its_episodes_in_a_dry_run() {
         let s = store().await;
         let (_td, cache) = cache();
-        put_titled_episode(&s, 1, BSG, (1, 1), "33").await;
+        put_titled_episode(&s, 1, SHOW_B, (1, 1), "Opening").await;
         let mut item = s.get(1).await.unwrap();
-        item.metadata.overview = Some("The 1978 pilot.".into());
+        item.metadata.overview = Some("The old pilot.".into());
         s.put(item).await.unwrap();
-        pin(&s, BSG, "73545", NOW).await;
-        let tvdb = FakeEnricher::tvdb().with_detail(enriched_overview("The 2004 pilot."));
+        pin(&s, SHOW_B, "900002", NOW).await;
+        let tvdb = FakeEnricher::tvdb().with_detail(enriched_overview("The new pilot."));
 
         let rebuilt = rebuild_now(
             &s,
@@ -7392,41 +7366,40 @@ mod tests {
         assert_eq!(rebuilt, 1);
         assert_eq!(
             s.get(1).await.unwrap().metadata.overview.as_deref(),
-            Some("The 2004 pilot.")
+            Some("The new pilot.")
         );
         assert!(pending_ids(&s).await.is_empty());
     }
 
-    const FLASH: &str = "/tv/The Flash";
+    const SHOW_A: &str = "/tv/Show A";
 
-    /// The Flash folder: an unyeared Season 1 file titled like the 1990 show's
-    /// pilot, a Season 3 file stating 2014, and the stored 1990 match.
-    async fn flash_folder(s: &SqliteStore) {
-        put_titled_episode(s, 1, FLASH, (1, 1), "Pilot").await;
+    /// Show A folder: an unyeared Season 1 file titled like the 1983 show's
+    /// pilot, a Season 3 file stating 2007, and the stored 1983 match.
+    async fn show_a_folder(s: &SqliteStore) {
+        put_titled_episode(s, 1, SHOW_A, (1, 1), "Pilot").await;
         let mut modern = MediaItem {
             id: 2,
-            path: format!("{FLASH}/Season 3/The Flash (2014) - S03E01 - The Flash Reborn.mkv")
-                .into(),
-            title: "The Flash Reborn".into(),
+            path: format!("{SHOW_A}/Season 3/Show A (2007) - S03E01 - The Third Way.mkv").into(),
+            title: "The Third Way".into(),
             kind: MediaKind::Episode,
             ..MediaItem::default()
         };
         modern.series = Some(pharos_core::SeriesInfo {
-            series_name: "The Flash".into(),
+            series_name: "Show A".into(),
             season_number: Some(3),
             episode_number: Some(1),
-            series_folder: Some(FLASH.into()),
+            series_folder: Some(SHOW_A.into()),
             series_year: None,
             series_key: None,
         });
         s.put(modern).await.unwrap();
         s.upsert_series_metadata(SeriesMetadata {
-            series_key: FLASH.into(),
-            series_name: "The Flash".into(),
+            series_key: SHOW_A.into(),
+            series_name: "Show A".into(),
             match_provider: Some("tvdb".into()),
-            match_external_id: Some("78650".into()),
+            match_external_id: Some("900004".into()),
             match_source: Some("search".into()),
-            premiere_date: Some(653_788_800), // 1990-09-20
+            premiere_date: Some(432_864_000), // 1983-09-20
             metadata_refreshed_at: Some(NOW),
             ..Default::default()
         })
@@ -7435,21 +7408,21 @@ mod tests {
         set_version(s, TV_MATCH_VERSION_KEY, "1").await;
     }
 
-    fn flash_tvdb() -> FakeEnricher {
+    fn show_a_tvdb() -> FakeEnricher {
         FakeEnricher::tvdb()
             .with_search(vec![
-                ("279121", "The Flash", Some(2014)),
-                ("78650", "The Flash", Some(1990)),
+                ("900005", "Show A", Some(2007)),
+                ("900004", "Show A", Some(1983)),
             ])
-            .with_list("279121", &[(1, 1, "City of Heroes")])
-            .with_list("78650", &[(1, 1, "Pilot")])
+            .with_list("900005", &[(1, 1, "The New Start")])
+            .with_list("900004", &[(1, 1, "Pilot")])
     }
 
     /// Spec 033 §2 (V893, B932) — the survey finds the unyeared file whose
-    /// title is the 1990 show's pilot, not the 2014 show's. A dry run only
-    /// logs it; `apply` records the file's `scanner` row with 1990 and the
-    /// owner row keeping the folder key for the stored 1990 match, marks the
-    /// file, and neither re-asks the folder nor marks the 2014 file before
+    /// title is the 1983 show's pilot, not the 2007 show's. A dry run only
+    /// logs it; `apply` records the file's `scanner` row with 1983 and the
+    /// owner row keeping the folder key for the stored 1983 match, marks the
+    /// file, and neither re-asks the folder nor marks the 2007 file before
     /// the scan has split them.
     #[tokio::test(flavor = "current_thread")]
     async fn episode_titles_split_off_a_same_named_shows_files() {
@@ -7459,12 +7432,12 @@ mod tests {
         let _metrics = metrics::set_default_local_recorder(&recorder);
         let (logs, _log) = log_capture();
         let s = store().await;
-        flash_folder(&s).await;
-        let tvdb = flash_tvdb();
+        show_a_folder(&s).await;
+        let tvdb = show_a_tvdb();
 
         gate(&s, &tvdb, &MetadataConfig::default()).await;
         assert!(s
-            .series_overrides(&[FLASH.into()])
+            .series_overrides(&[SHOW_A.into()])
             .await
             .unwrap()
             .is_empty());
@@ -7475,9 +7448,9 @@ mod tests {
             .find(|l| l.contains("file's episode title names a same-named show"))
             .unwrap_or_else(|| panic!("no title evidence line in {text}"));
         for want in [
-            "rival_id=\"78650\"",
-            "rival_year=1990",
-            "own_title=\"City of Heroes\"",
+            "rival_id=\"900004\"",
+            "rival_year=1983",
+            "own_title=\"The New Start\"",
         ] {
             assert!(line.contains(want), "{want} missing from {line}");
         }
@@ -7495,7 +7468,7 @@ mod tests {
         );
 
         gate(&s, &tvdb, &apply_cfg()).await;
-        let mut rows = s.series_overrides(&[FLASH.into()]).await.unwrap();
+        let mut rows = s.series_overrides(&[SHOW_A.into()]).await.unwrap();
         rows.sort_by_key(|o| o.path.is_some());
         let got: Vec<_> = rows
             .iter()
@@ -7504,10 +7477,10 @@ mod tests {
         assert_eq!(
             got,
             [
-                (None, Some(1990), pharos_core::OverrideSource::Scanner),
+                (None, Some(1983), pharos_core::OverrideSource::Scanner),
                 (
-                    Some(format!("{FLASH}/Season 1/The Flash - S01E01 - Pilot.mkv")),
-                    Some(1990),
+                    Some(format!("{SHOW_A}/Season 1/Show A - S01E01 - Pilot.mkv")),
+                    Some(1983),
                     pharos_core::OverrideSource::Scanner
                 ),
             ]
@@ -7523,8 +7496,6 @@ mod tests {
             Some("2")
         );
     }
-
-    const SHOW_A: &str = "/tv/Show A";
 
     /// A bare folder holding a 1991 show and its 2015 remake (B987):
     /// S01E01 "Pilot" names both shows' pilots, so it does not move, but it
@@ -7639,11 +7610,11 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn a_moved_episode_waits_for_its_new_shows_match() {
         let s = store().await;
-        put_titled_episode(&s, 1, FLASH, (3, 1), "The Flash Reborn").await;
+        put_titled_episode(&s, 1, SHOW_A, (3, 1), "The Third Way").await;
         let mut item = s.get(1).await.unwrap();
-        item.metadata.overview = Some("2014 text".into());
+        item.metadata.overview = Some("new text".into());
         if let Some(series) = item.series.as_mut() {
-            series.series_key = Some(format!("{FLASH}\u{1f}2014"));
+            series.series_key = Some(format!("{SHOW_A}\u{1f}2007"));
         }
         s.put(item).await.unwrap();
         s.mark_reconcile_items(&[1], NOW).await.unwrap();
@@ -7666,7 +7637,7 @@ mod tests {
         assert!(tvdb.fetched().is_empty());
         assert_eq!(
             s.get(1).await.unwrap().metadata.overview.as_deref(),
-            Some("2014 text")
+            Some("new text")
         );
         assert_eq!(
             s.series_reconcile_pending(10).await.unwrap(),
@@ -7679,8 +7650,8 @@ mod tests {
     #[tokio::test]
     async fn an_unrecorded_matcher_version_still_re_admits_every_searched_show() {
         let s = store().await;
-        put_episode(&s, 1, "Firefly", "/tv/Firefly").await;
-        pin(&s, "/tv/Firefly", "78874", NOW).await;
+        put_episode(&s, 1, "Show F", "/tv/Show F").await;
+        pin(&s, "/tv/Show F", "900010", NOW).await;
         readmit(&s).await;
         assert_eq!(s.series_needing_match(10, NOW - 1).await.unwrap().len(), 1);
         assert_eq!(
@@ -7737,9 +7708,9 @@ mod tests {
             .unwrap();
     }
 
-    /// A Cosmos (1980) episode whose NFO id's record belongs to show
-    /// `record_series`; the folder is pinned to the 1980 show (74995).
-    async fn cosmos_episode_with_record_of(
+    /// A Show C (1973) episode whose NFO id's record belongs to show
+    /// `record_series`; the folder is pinned to the 1973 show (900006).
+    async fn show_c_episode_with_record_of(
         record_series: &str,
     ) -> (u64, LogBuf, MediaItem, Vec<String>) {
         use metrics_util::debugging::DebuggingRecorder;
@@ -7748,45 +7719,45 @@ mod tests {
         let _metrics = metrics::set_default_local_recorder(&recorder);
         let (logs, _log) = log_capture();
         let s = store().await;
-        pin_series(&s, "/tv/Cosmos", "74995").await;
+        pin_series(&s, "/tv/Show C", "900006").await;
         let mut item = MediaItem {
             id: 7,
-            path: "/tv/Cosmos/Season 01/Cosmos - S01E01.mkv".into(),
-            title: "Standing Up in the Milky Way".into(),
+            path: "/tv/Show C/Season 01/Show C - S01E01.mkv".into(),
+            title: "The New Start".into(),
             kind: MediaKind::Episode,
             series: Some(pharos_core::SeriesInfo {
-                series_name: "Cosmos".into(),
+                series_name: "Show C".into(),
                 season_number: Some(1),
                 episode_number: Some(1),
-                series_folder: Some("/tv/Cosmos".into()),
+                series_folder: Some("/tv/Show C".into()),
                 series_year: None,
                 series_key: None,
             }),
             ..MediaItem::default()
         };
-        item.metadata.overview = Some("The 2014 premiere.".into());
+        item.metadata.overview = Some("The new premiere.".into());
         // A Jellyfin episode NFO's own TVDB id, of the remake's episode.
-        item.metadata.provider_ids.tvdb = Some("4777210".into());
-        item.metadata.provider_ids.imdb = Some("tt2395695".into());
+        item.metadata.provider_ids.tvdb = Some("900009".into());
+        item.metadata.provider_ids.imdb = Some("tt900001".into());
         s.put(item.clone()).await.unwrap();
         let (_td, cache) = cache();
         let tvdb = FakeEnricher::tvdb()
             .with_detail_for(
-                "4777210",
+                "900009",
                 EnrichedMetadata {
-                    title: Some("Standing Up in the Milky Way".into()),
-                    overview: Some("The 2014 premiere.".into()),
+                    title: Some("The New Start".into()),
+                    overview: Some("The new premiere.".into()),
                     series_id: Some(record_series.into()),
                     ..EnrichedMetadata::default()
                 },
             )
             .with_detail_for(
-                "74995",
+                "900006",
                 EnrichedMetadata {
-                    title: Some("The Shores of the Cosmic Ocean".into()),
-                    overview: Some("Sagan's 1980 premiere.".into()),
+                    title: Some("The Old Second".into()),
+                    overview: Some("The old premiere.".into()),
                     episode_number: Some((1, 1)),
-                    series_id: Some("74995".into()),
+                    series_id: Some("900006".into()),
                     ..EnrichedMetadata::default()
                 },
             );
@@ -7810,35 +7781,32 @@ mod tests {
         (n, logs, s.get(7).await.unwrap(), tvdb.fetched())
     }
 
-    /// Spec 033 V892 (B931) — the Cosmos (1980) folder is matched to the 1980
-    /// show, but its episode NFOs carry the 2014 remake's ids. The NFO's
+    /// Spec 033 V892 (B931) — the Show C (1973) folder is matched to the 1973
+    /// show, but its episode NFOs carry the 2007 remake's ids. The NFO's
     /// record is set aside with its text and ids, the episode is read from
     /// the pinned show by number, and the rejection is counted and logged.
     #[tokio::test(flavor = "current_thread")]
     async fn an_episode_nfo_of_another_series_is_set_aside() {
-        let (n, logs, ep, fetched) = cosmos_episode_with_record_of("260586").await;
+        let (n, logs, ep, fetched) = show_c_episode_with_record_of("900007").await;
         assert_eq!(n, 1);
-        assert_eq!(fetched, vec!["4777210", "74995"]);
-        assert_eq!(ep.title, "The Shores of the Cosmic Ocean");
-        assert_eq!(
-            ep.metadata.overview.as_deref(),
-            Some("Sagan's 1980 premiere.")
-        );
+        assert_eq!(fetched, vec!["900009", "900006"]);
+        assert_eq!(ep.title, "The Old Second");
+        assert_eq!(ep.metadata.overview.as_deref(), Some("The old premiere."));
         assert_eq!(ep.metadata.provider_ids.imdb, None, "the remake's ids go");
-        assert_ne!(ep.metadata.provider_ids.tvdb.as_deref(), Some("4777210"));
+        assert_ne!(ep.metadata.provider_ids.tvdb.as_deref(), Some("900009"));
         assert_eq!(ep.match_source.as_deref(), Some("search"));
-        assert_eq!(ep.match_external_id.as_deref(), Some("74995"));
+        assert_eq!(ep.match_external_id.as_deref(), Some("900006"));
         let text = logs.text();
         let line = text
             .lines()
             .find(|l| l.contains("names another series"))
             .unwrap_or_else(|| panic!("no rejection line in {text}"));
         for want in [
-            "record_series_id=\"260586\"",
-            "pinned_series_id=74995",
-            "nfo_id=4777210",
+            "record_series_id=\"900007\"",
+            "pinned_series_id=900006",
+            "nfo_id=900009",
             "reason=\"nfo_other_series\"",
-            "Cosmos - S01E01.mkv",
+            "Show C - S01E01.mkv",
         ] {
             assert!(line.contains(want), "{want} missing from {line}");
         }
@@ -7846,11 +7814,11 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn an_episode_nfo_of_its_own_show_is_used() {
-        let (n, _, ep, fetched) = cosmos_episode_with_record_of("74995").await;
+        let (n, _, ep, fetched) = show_c_episode_with_record_of("900006").await;
         assert_eq!(n, 0);
-        assert_eq!(fetched, vec!["4777210"]);
+        assert_eq!(fetched, vec!["900009"]);
         assert_eq!(ep.match_source.as_deref(), Some("nfo_id"));
-        assert_eq!(ep.metadata.provider_ids.tvdb.as_deref(), Some("4777210"));
+        assert_eq!(ep.metadata.provider_ids.tvdb.as_deref(), Some("900009"));
     }
 
     /// V892 (B933) — an episode never searches on its own: it is read from
@@ -7858,14 +7826,14 @@ mod tests {
     #[tokio::test]
     async fn an_episode_is_read_from_its_shows_pinned_match_not_searched() {
         let s = store().await;
-        put_bare_episode(&s, 41, "Dune: Prophecy", "/tv/Dune Prophecy").await;
-        pin_series(&s, "/tv/Dune Prophecy", "432109").await;
+        put_bare_episode(&s, 41, "Show I", "/tv/Show I").await;
+        pin_series(&s, "/tv/Show I", "900013").await;
         let (_td, cache) = cache();
         let tvdb = FakeEnricher::tvdb()
-            .with_search(vec![("999", "Les Rivières pourpres", None)])
+            .with_search(vec![("999", "Show J", None)])
             .with_detail(EnrichedMetadata {
-                title: Some("Twice Born".into()),
-                series_id: Some("432109".into()),
+                title: Some("Twice Told".into()),
+                series_id: Some("900013".into()),
                 ..EnrichedMetadata::default()
             });
         let item = s.get(41).await.unwrap();
@@ -7881,9 +7849,9 @@ mod tests {
         )
         .await
         .unwrap());
-        assert_eq!(tvdb.fetched(), vec!["432109"]);
+        assert_eq!(tvdb.fetched(), vec!["900013"]);
         let ep = s.get(41).await.unwrap();
-        assert_eq!(ep.match_external_id.as_deref(), Some("432109"));
+        assert_eq!(ep.match_external_id.as_deref(), Some("900013"));
     }
 
     /// V892 — a show pinned on TMDB (TVDB had no match) has its episodes read
@@ -7891,12 +7859,12 @@ mod tests {
     #[tokio::test]
     async fn an_episode_uses_its_shows_pinned_provider() {
         let s = store().await;
-        put_bare_episode(&s, 42, "Death Note", "/tv/Death Note").await;
+        put_bare_episode(&s, 42, "Show G", "/tv/Show G").await;
         s.upsert_series_metadata(SeriesMetadata {
-            series_key: "/tv/Death Note".into(),
-            series_name: "Death Note".into(),
+            series_key: "/tv/Show G".into(),
+            series_name: "Show G".into(),
             match_provider: Some("tmdb".into()),
-            match_external_id: Some("13916".into()),
+            match_external_id: Some("900015".into()),
             match_source: Some("search".into()),
             metadata_refreshed_at: Some(NOW),
             ..Default::default()
@@ -7906,8 +7874,8 @@ mod tests {
         let (_td, cache) = cache();
         let tvdb = FakeEnricher::tvdb().with_detail(EnrichedMetadata::default());
         let tmdb = FakeEnricher::tmdb().with_detail(EnrichedMetadata {
-            title: Some("Rebirth".into()),
-            series_id: Some("13916".into()),
+            title: Some("Renewal".into()),
+            series_id: Some("900015".into()),
             ..EnrichedMetadata::default()
         });
         let item = s.get(42).await.unwrap();
@@ -7924,7 +7892,7 @@ mod tests {
         .await
         .unwrap();
         assert!(tvdb.fetched().is_empty());
-        assert_eq!(tmdb.fetched(), vec!["13916"]);
+        assert_eq!(tmdb.fetched(), vec!["900015"]);
         let ep = s.get(42).await.unwrap();
         assert_eq!(ep.match_provider.as_deref(), Some("tmdb"));
     }
@@ -7972,10 +7940,10 @@ mod tests {
     #[tokio::test]
     async fn an_episode_waits_until_its_show_is_matched() {
         let s = store().await;
-        put_bare_episode(&s, 44, "Cosmos", "/tv/Cosmos").await;
+        put_bare_episode(&s, 44, "Show C", "/tv/Show C").await;
         let eligible = |items: Vec<MediaItem>| items.iter().any(|i| i.id == 44);
         assert!(!eligible(s.items_needing_match(100, NOW).await.unwrap()));
-        pin_series(&s, "/tv/Cosmos", "74995").await;
+        pin_series(&s, "/tv/Show C", "900006").await;
         assert!(eligible(s.items_needing_match(100, NOW).await.unwrap()));
     }
 
@@ -7992,26 +7960,26 @@ mod tests {
         let s = store().await;
         let item = MediaItem {
             id: 45,
-            path: "/tv/The Flash/Season 01/The Flash - S01E01 - Pilot.mkv".into(),
+            path: "/tv/Show A/Season 01/Show A - S01E01 - Pilot.mkv".into(),
             title: "Pilot".into(),
             kind: MediaKind::Episode,
             series: Some(pharos_core::SeriesInfo {
-                series_name: "The Flash".into(),
+                series_name: "Show A".into(),
                 season_number: Some(1),
                 episode_number: Some(1),
-                series_folder: Some("/tv/The Flash".into()),
+                series_folder: Some("/tv/Show A".into()),
                 series_year: None,
                 series_key: None,
             }),
             ..MediaItem::default()
         };
         s.put(item).await.unwrap();
-        pin_series(&s, "/tv/The Flash", "279121").await;
+        pin_series(&s, "/tv/Show A", "900005").await;
         let (_td, cache) = cache();
         let tvdb = FakeEnricher::tvdb().with_detail(EnrichedMetadata {
-            title: Some("City of Heroes".into()),
-            neighbour_titles: vec!["Fastest Man Alive".into()],
-            series_id: Some("279121".into()),
+            title: Some("The New Start".into()),
+            neighbour_titles: vec!["Quick Start".into()],
+            series_id: Some("900005".into()),
             ..EnrichedMetadata::default()
         });
         let item = s.get(45).await.unwrap();
