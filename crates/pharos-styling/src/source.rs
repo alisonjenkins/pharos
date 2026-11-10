@@ -44,6 +44,9 @@ pub struct SourceLine {
     /// The source's definition of `style`, verbatim, for ASS lines whose
     /// style the script defines. Typeset events keep it (FR-005).
     pub style_def: Option<Arc<SourceStyle>>,
+    /// Who speaks the line, from an ASS event's Name (actor) field; `None`
+    /// when it is empty and for SRT and WebVTT.
+    pub speaker: Option<String>,
 }
 
 /// A `Style:` line of the source as written, with the `Format:` line that
@@ -376,8 +379,9 @@ fn read_ass(script: &str) -> Source {
     let lines = scan
         .events
         .into_iter()
-        .map(|e| {
-            build_line(
+        .map(|e| SourceLine {
+            speaker: Some(e.name).filter(|n| !n.is_empty()).map(str::to_owned),
+            ..build_line(
                 e.start_ms,
                 e.end_ms,
                 e.text.to_owned(),
@@ -435,6 +439,7 @@ fn build_line(
         typeset,
         karaoke: p.karaoke,
         style_def,
+        speaker: None,
     }
 }
 
@@ -801,6 +806,18 @@ mod tests {
         let ass = "[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,{\\i1}All slanted\n";
         let l = read(ass).unwrap().lines;
         assert!(l[0].italic);
+    }
+
+    #[test]
+    fn ass_name_field_is_the_speaker() {
+        let ass = "[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:01.00,0:00:02.00,Default,Ann,0,0,0,,Hi\nDialogue: 0,0:00:02.00,0:00:03.00,Default,,0,0,0,,Hi\n";
+        let l = read(ass).unwrap().lines;
+        assert_eq!(l[0].speaker.as_deref(), Some("Ann"));
+        assert_eq!(l[1].speaker, None);
+        let srt = read("1\n00:00:01,000 --> 00:00:02,000\nHi\n")
+            .unwrap()
+            .lines;
+        assert_eq!(srt[0].speaker, None);
     }
 
     #[test]
