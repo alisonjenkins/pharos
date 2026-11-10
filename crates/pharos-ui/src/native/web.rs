@@ -3865,10 +3865,12 @@ pub fn install_telemetry(api: &NativeApi) {
     let api = api.clone();
     let begun = diagnostics::session();
     wasm_bindgen_futures::spawn_local(async move {
-        let opted = load_opted_in(&api).await.unwrap_or_else(|e| {
-            warn(&format!("pharos: diagnostics opt-in unreadable: {e}"));
-            false
-        });
+        let opted = diagnostics::load_opted_in_since(&api, begun)
+            .await
+            .unwrap_or_else(|e| {
+                warn(&format!("pharos: diagnostics opt-in unreadable: {e}"));
+                false
+            });
         let held = diagnostics::install(api.clone(), opted, begun);
         if !held.is_empty() {
             send(api, held);
