@@ -750,17 +750,78 @@ pub fn pick_docked(
             let rects: Vec<Rect> = controls.iter().map(|(r, _)| *r).collect();
             pick(dir, from, &rects)
         }
-        (Dir::Down, false) => among(false).or_else(|| among(true)),
-        (Dir::Up, true) => among(false),
+        // The bar is fixed over the page's foot, so the rows scrolled to the
+        // foot can sit partly under it, with no bar control wholly below
+        // them nor page control wholly above it (B1035): Down then takes the
+        // bar's control nearest across, and Up the page's nearest whose
+        // middle is above the bar.
+        (Dir::Down, false) => among(false)
+            .or_else(|| among(true))
+            .or_else(|| nearest_across(from, controls)),
+        (Dir::Up, true) => among(false).or_else(|| nearest_above(from, controls)),
         (Dir::Down, true) => None,
         (_, docked) => among(docked),
     }
+}
+
+/// The page control nearest above `from` whose middle is above its top.
+fn nearest_above(from: Rect, controls: &[(Rect, bool)]) -> Option<usize> {
+    let fcx = from.0 + from.2 / 2.0;
+    controls
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, docked))| !*docked)
+        .filter_map(|(i, (r, _))| {
+            let (cx, cy) = (r.0 + r.2 / 2.0, r.1 + r.3 / 2.0);
+            (cy < from.1).then(|| (i, (from.1 - cy) * 4.0 + (cx - fcx).abs()))
+        })
+        .min_by(|a, b| a.1.total_cmp(&b.1))
+        .map(|(i, _)| i)
+}
+
+/// The docked control whose centre is nearest `from`'s across the screen.
+fn nearest_across(from: Rect, controls: &[(Rect, bool)]) -> Option<usize> {
+    let centre = |r: &Rect| r.0 + r.2 / 2.0;
+    let fcx = centre(&from);
+    controls
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, docked))| *docked)
+        .map(|(i, (r, _))| (i, (centre(r) - fcx).abs()))
+        .min_by(|a, b| a.1.total_cmp(&b.1))
+        .map(|(i, _)| i)
 }
 
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
+
+    /// B1035/V995: the last row scrolled to the foot of the screen sits
+    /// under the fixed bar; Down still reaches the bar, at the control
+    /// nearest across, and Up leaves it for the page.
+    #[test]
+    fn down_reaches_a_bar_laid_over_the_last_row() {
+        // The TV's 960x540 page: the last track ends at the screen's foot,
+        // the bar's buttons sit over it.
+        let ninth = (96.0, 464.0, 830.0, 38.0);
+        let last = (96.0, 502.0, 830.0, 38.0);
+        let queue = (880.0, 506.0, 30.0, 30.0);
+        let play = (784.0, 495.0, 32.0, 32.0);
+        let close = (920.0, 495.0, 32.0, 32.0);
+        let page = [
+            (ninth, false),
+            (last, false),
+            (queue, false),
+            (play, true),
+            (close, true),
+        ];
+        assert_eq!(pick_docked(Dir::Down, last, false, &page), Some(3));
+        assert_eq!(pick_docked(Dir::Down, queue, false, &page), Some(4));
+        assert_eq!(pick_docked(Dir::Down, ninth, false, &page), Some(1));
+        assert_eq!(pick_docked(Dir::Up, play, true, &page), Some(0));
+        assert_eq!(pick_docked(Dir::Down, play, true, &page), None);
+    }
 
     #[test]
     fn the_docked_bar_is_reached_last_and_left_by_up() {
