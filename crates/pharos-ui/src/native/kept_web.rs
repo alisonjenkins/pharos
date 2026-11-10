@@ -643,7 +643,12 @@ pub fn KeepButton(
 }
 
 /// The list as a signal the Remove buttons update.
-fn use_store() -> (Signal<KeptStore>, EventHandler<String>) {
+fn use_store() -> (
+    Signal<KeptStore>,
+    EventHandler<String>,
+    Signal<Option<(String, String)>>,
+) {
+    let mut failed = use_signal(|| None::<(String, String)>);
     let mut store = use_signal(|| read().unwrap_or_else(|| KeptStore::new("")));
     // Opening the list is when books a policy no longer keeps go.
     use_hook(|| {
@@ -654,20 +659,24 @@ fn use_store() -> (Signal<KeptStore>, EventHandler<String>) {
     });
     let on_remove = EventHandler::new(move |id: String| {
         spawn(async move {
-            if let Err(e) = remove(&id).await {
-                platform::warn(&format!("pharos: kept remove failed item={id} error={e}"));
+            match remove(&id).await {
+                Ok(()) => failed.set(None),
+                Err(e) => {
+                    platform::warn(&format!("pharos: kept remove failed item={id} error={e}"));
+                    failed.set(Some((id, e)));
+                }
             }
             store.set(read().unwrap_or_else(|| KeptStore::new("")));
         });
     });
-    (store, on_remove)
+    (store, on_remove, failed)
 }
 
 /// Settings, On this device: the kept books, why, their size and a Remove
 /// for each.
 #[component]
 pub fn OnThisDevice() -> Element {
-    let (store, on_remove) = use_store();
+    let (store, on_remove, failed) = use_store();
     let mut auto = use_signal(settings);
     rsx! {
         section { class: "pharos-settings-page pharos-offline-page",
@@ -687,7 +696,7 @@ pub fn OnThisDevice() -> Element {
                 },
             }
             h3 { "Books on this device" }
-            KeptList { store: store(), on_remove }
+            KeptList { store: store(), on_remove, failed: failed() }
         }
     }
 }
@@ -695,6 +704,6 @@ pub fn OnThisDevice() -> Element {
 /// The app with no connection: the kept books, which open without the server.
 #[component]
 pub fn OfflineHome() -> Element {
-    let (store, on_remove) = use_store();
-    rsx! { OfflineView { store: store(), on_remove } }
+    let (store, on_remove, failed) = use_store();
+    rsx! { OfflineView { store: store(), on_remove, failed: failed() } }
 }

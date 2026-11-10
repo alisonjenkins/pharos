@@ -402,6 +402,10 @@ test.describe("books kept on the device (spec 036)", () => {
 
     await page.getByRole("button", { name: "Account", exact: true }).click();
     await page.getByRole("menuitem", { name: "Sign out" }).click();
+    // FR-703: with a book kept, Sign out asks first and nothing is removed yet.
+    await expect(page.getByText("Signing out removes the book kept on this device.")).toBeVisible();
+    expect(Object.keys(await bookCaches(page))).toHaveLength(1);
+    await page.getByRole("menuitem", { name: "Sign out and remove" }).click();
     await expect(page.locator("form#signin")).toBeVisible();
     await expect.poll(async () => Object.keys(await bookCaches(page)).length).toBe(0);
     expect(await record(page)).toBeNull();

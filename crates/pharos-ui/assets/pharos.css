@@ -546,6 +546,27 @@ input:focus-visible {
   background: var(--px-color-surface);
   outline: none;
 }
+/* FR-703: Sign out asks first when books are kept on the device. */
+.pharos-account-warning {
+  margin: 0;
+  padding: 0.5rem 1rem;
+  max-width: 18rem;
+  color: var(--px-color-fg-muted);
+  font-size: var(--px-type-step--1);
+}
+.pharos-account-danger {
+  color: var(--px-color-danger);
+}
+.pharos-kept-confirm {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+}
+.pharos-kept-confirm p {
+  flex-basis: 100%;
+  margin: 0;
+}
 
 .pharos-status {
   box-sizing: border-box;

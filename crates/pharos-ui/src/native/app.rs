@@ -2011,6 +2011,7 @@ fn NativeApp(route: Route) -> Element {
                     WhatsNewButton {}
                     AccountMenu {
                         me,
+                        kept_books: move |()| kept_book_count(),
                         on_sign_out: move |_| {
                             if machine.peek().signing_out() {
                                 return;
@@ -2219,6 +2220,17 @@ async fn forget_kept_books(why: &str) {
 
 #[cfg(not(all(feature = "web", target_arch = "wasm32")))]
 async fn forget_kept_books(_why: &str) {}
+
+/// How many books are kept on this device, for Sign out's warning.
+#[cfg(all(feature = "web", target_arch = "wasm32"))]
+fn kept_book_count() -> usize {
+    super::kept_web::read().map_or(0, |store| store.books.len())
+}
+
+#[cfg(not(all(feature = "web", target_arch = "wasm32")))]
+fn kept_book_count() -> usize {
+    0
+}
 
 /// Drops kept books that another user kept, once the signed-in user is known.
 #[cfg(all(feature = "web", target_arch = "wasm32"))]
