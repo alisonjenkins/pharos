@@ -32,6 +32,9 @@ async function newReaderContext(
 ): Promise<BrowserContext> {
   return browser.newContext({
     baseURL: PHAROS_URL,
+    // The service worker (ADR-0110) answers a request before `page.route`
+    // sees it, and these cases block and count requests.
+    serviceWorkers: "block",
     viewport,
     deviceScaleFactor,
     storageState: {
