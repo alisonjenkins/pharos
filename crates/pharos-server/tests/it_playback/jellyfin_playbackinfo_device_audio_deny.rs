@@ -338,6 +338,20 @@ async fn a_user_manages_the_devices_they_are_signed_in_on_and_no_others() {
             .is_none(),
         "the refused body wrote nothing"
     );
+    // The owner sets sound formats but not the name everyone else sees.
+    assert_eq!(
+        call(
+            &fx,
+            set(
+                "phone",
+                r#"{"CustomName":"x","NoDirectPlayAudioCodecs":["dts"]}"#
+            ),
+            &phone
+        )
+        .await
+        .0,
+        StatusCode::FORBIDDEN
+    );
 
     let (status, mine) = call(&fx, test::TestRequest::get().uri("/Devices"), &phone).await;
     assert_eq!(status, StatusCode::OK);
@@ -351,6 +365,11 @@ async fn a_user_manages_the_devices_they_are_signed_in_on_and_no_others() {
     assert_eq!(
         device(&mine, "phone")["NoDirectPlayAudioCodecs"],
         serde_json::json!(["eac3"])
+    );
+    assert_eq!(
+        device(&mine, "phone")["Name"],
+        "phone",
+        "the refused name was not written"
     );
     // The admin's list still has every device, the phone's setting included.
     assert_eq!(
