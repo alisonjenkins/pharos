@@ -12,7 +12,7 @@ annotation secret(field, param) :Void;
 
 # Bumped when the schema changes; served as ServerInfo.schemaVersion so a client
 # can tell which methods a server knows (FR-009).
-const schemaVersion :UInt32 = 43;
+const schemaVersion :UInt32 = 44;
 
 # ---- ids and shared types -------------------------------------------------
 struct ItemId {                # mirrors pharos_jellyfin_api::WireId
@@ -477,6 +477,10 @@ struct Event {
     libraryChanged @2 :LibraryChanged;
     task @3 :TaskProgress;
     resync @4 :Void;           # replay window exceeded: refetch everything cached
+    # The groups the user could join changed: one started or ended, or its
+    # name, members, leader or queue did. Carries nothing; re-list. Topic
+    # `groups`, sent only to a subscriber that names it. Since schemaVersion 44.
+    groupsChanged @5 :Void;
   }
   struct UserDataChanged { id @0 :ItemId; state @1 :UserState; }
   struct LibraryChanged { added @0 :List(ItemId); updated @1 :List(ItemId); removed @2 :List(ItemId); }
