@@ -1,13 +1,14 @@
 # Fingerprint fixtures
 
-## `mushoku_s03_fingerprints.txt`
+## `anime_season_fingerprints.txt`
 
-Real audio fingerprints dumped from the production store on **2026-07-27**, kept so
+Real audio fingerprints (a long-running anime's third season) dumped from the production store on **2026-07-27**, kept so
 the intro-detection recall failure is reproducible in CI without media, NFS or a
-database.
+database. The fingerprints were captured from real files and are kept
+unchanged as test data, while names and paths here are generic.
 
 **Source**: `episode_fingerprints` for the five episodes of
-`/var/lib/pharos/media/TV/Mushoku Tensei - Jobless Reincarnation/Season 03`:
+`/tv/Show K/Season 03`:
 
 | `item_id` | Episode |
 |-----------|---------|

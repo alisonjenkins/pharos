@@ -28,7 +28,7 @@ use pharos_transcode::fingerprint::season::{
     detect_season_verbose, EpisodeFingerprint, SeasonConfig, Verdict,
 };
 
-const FIXTURE: &str = "mushoku_s03_fingerprints.txt";
+const FIXTURE: &str = "anime_season_fingerprints.txt";
 
 /// Pairs of `kind` whose comparison located a span, and the located durations.
 fn matched_pairs(rows: &[FixtureRow], kind: &str) -> (usize, usize, Vec<f64>) {

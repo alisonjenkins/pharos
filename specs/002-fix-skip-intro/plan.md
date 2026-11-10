@@ -8,7 +8,7 @@
 Skip Intro never appears because, for the affected seasons, no intro segment
 exists to serve. Delivery (`GET /MediaSegments/{id}` → `MediaSegmentDto`) is
 verified healthy and shared with Outro, which works. The defect is in the
-detection arm: on Mushoku Tensei S03 the intro run returned `no_span` for all
+detection arm: on Show K S03 the intro run returned `no_span` for all
 four episodes (`0 matched / 0 agreeing / conf 0.00`) while the credits run on the
 same four files emitted 3 of 4.
 

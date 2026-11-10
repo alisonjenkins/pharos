@@ -22,7 +22,7 @@ Evidence gathered 2026-07-27 before writing this spec:
   6746 outro rows; 481 seasons have at least one intro, 506 at least one outro.
 - The gap is per-show and one-directional: **145 seasons have outros and zero
   intros**, against 120 the other way. The episodes the viewer actually reported
-  (Mushoku Tensei S03) are in that set — every episode carries an outro, none
+  (Show K S03) are in that set — every episode carries an outro, none
   carries an intro.
 - For that season the detector recorded its own reason: on the **same four
   episodes**, Outro emitted 3 of 4, while Intro returned `no_span` for all four —
@@ -156,7 +156,7 @@ shows that prompted the report.
   too in at least **80%** of cases where a human confirms a shared opening exists.
   Baseline today: of 987 seasons, 145 have a closing and no opening.
 - **SC-002**: The reported outro-only count for the seasons named in this report
-  (Mushoku Tensei S03, and spot-checked members of the 145) falls to zero, and
+  (Show K S03, and spot-checked members of the 145) falls to zero, and
   each shows Skip Intro on the Google TV app and in the browser.
 - **SC-003**: A skip lands within **1 second** of the opening's true end, judged
   against a human-marked timestamp on a sample of at least 10 episodes.

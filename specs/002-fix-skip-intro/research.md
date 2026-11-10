@@ -11,11 +11,11 @@ is the measured one, not the assumed one.
 **Decision**: reproduced. Every intro pair but one dies at **candidate-shift
 discovery**, before any span is ever built.
 
-**Method**: dumped `episode_fingerprints.points` for the five Mushoku Tensei S03
+**Method**: dumped `episode_fingerprints.points` for the five Show K S03
 episodes (both `intro` and `credits`) as hex, decoded LE `u32` (the encoding
 `postgres.rs` writes), and replayed `align::compare` over all 10 pairs of each
 kind in a throwaway test in `pharos-transcode`. The dump is kept as
-[fixtures-mushoku-s03.txt](./fixtures-mushoku-s03.txt) (`item_id kind hex`, one
+[fixtures-anime-season.txt](./fixtures-anime-season.txt) (`item_id kind hex`, one
 line per row) so the fixture is reproducible without cluster access.
 
 **Result** (hop 0.2476 s; intro 1412–1413 points ≈ 350 s, credits 1794–1796
@@ -240,10 +240,10 @@ The viewer has played episodes that **do** carry an intro segment:
 | Code Geass S02E12 | 112–200 s, conf 1.00 | detected (chromaprint) |
 | Neon Genesis Evangelion S01E18 | 0–89 s | detected |
 | Fringe S01E05 | 384–403 s | detected |
-| Mushoku S03E01 | 81–166 s | **chapter** titled `Intro` |
-| Mushoku S03E05 | 200–219 s | **chapter** titled `Intro` |
+| Show K S03E01 | 81–166 s | **chapter** titled `Intro` |
+| Show K S03E05 | 200–219 s | **chapter** titled `Intro` |
 
-Mushoku S03E01 and S03E05 carry a chapter literally titled `Intro`, which
+Show K S03E01 and S03E05 carry a chapter literally titled `Intro`, which
 `classify_chapter_title` maps to a segment ahead of any detection. That matches
 the wire evidence: the production request for S03E05 returned **351 bytes**
 against **200 bytes** for S03E04 — two segments versus one.
