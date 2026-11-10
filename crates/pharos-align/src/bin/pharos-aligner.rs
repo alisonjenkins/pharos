@@ -5,9 +5,12 @@ use std::time::Duration;
 
 use actix_web::{web, App, HttpServer};
 use pharos_align::config::Config;
+use pharos_align::forward::cpu::CpuModel;
+use pharos_align::forward::CpuAligner;
 use pharos_align::http::{configure, AppState};
 use pharos_align::obs::{self, Metrics};
-use pharos_align::service::{Decoder, Engine, Loader};
+use pharos_align::service::{Decoder, Engine, Loader, Model};
+use pharos_align::weights::Weights;
 
 /// Workers only parse and answer; songs run on the blocking pool, one at a
 /// time. The default of one a core is 44 idle workers on the production node.
@@ -38,7 +41,12 @@ async fn run(config: Config) -> Result<(), String> {
     let ffmpeg = std::env::var("PHAROS_ALIGNER_FFMPEG").unwrap_or_else(|_| "ffmpeg".into());
     let decoder: Decoder =
         Box::new(move |path, start, end| pharos_align::audio::decode(&ffmpeg, path, start, end));
-    let loader: Loader = Box::new(|| Err("this build has no acoustic model".into()));
+    let (weights, threads) = (config.weights.clone(), config.threads);
+    let loader: Loader = Box::new(move || {
+        let weights = Weights::open(&weights).map_err(|e| e.to_string())?;
+        let model = CpuModel::load(weights, threads).map_err(|e| e.to_string())?;
+        Ok(Box::new(CpuAligner { model }) as Box<dyn Model>)
+    });
     let engine = Arc::new(Engine::new(loader, decoder, config.idle_unload));
 
     if let Some(idle) = config.idle_unload {
@@ -55,6 +63,7 @@ async fn run(config: Config) -> Result<(), String> {
     tracing::info!(
         listen = %format!("{}:{}", config.host, config.port),
         media_root = %config.media_root.display(),
+        weights = %config.weights.display(),
         idle_unload_s = %config.idle_unload.map_or("off".to_owned(), |d| d.as_secs().to_string()),
         threads = config.threads,
         traces = %if traced { config.otlp_endpoint.as_deref().unwrap_or("on") } else { "off" },

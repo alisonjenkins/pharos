@@ -1,4 +1,5 @@
-//! The service's environment, with the Python service's names and defaults.
+//! The service's environment, with the Python service's names and defaults,
+//! plus `PHAROS_ALIGNER_WEIGHTS`, the converted weights the image ships.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -20,12 +21,16 @@ pub struct Config {
     pub threads: usize,
     /// `None` keeps the model loaded.
     pub idle_unload: Option<Duration>,
+    /// The `alignerWeights` output: `weights.bin` and `weights.json`.
+    pub weights: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ConfigError {
     #[error("PHAROS_ALIGNER_MEDIA_ROOT environment variable is required")]
     NoMediaRoot,
+    #[error("PHAROS_ALIGNER_WEIGHTS environment variable is required")]
+    NoWeights,
     #[error("{name} must be {want}, got {value:?}")]
     Invalid {
         name: &'static str,
@@ -51,6 +56,7 @@ impl Config {
     /// Reads the variables through `get`, `std::env::var` outside tests.
     pub fn from_env(get: impl Fn(&str) -> Option<String>) -> Result<Self, ConfigError> {
         let media_root = set(get("PHAROS_ALIGNER_MEDIA_ROOT")).ok_or(ConfigError::NoMediaRoot)?;
+        let weights = set(get("PHAROS_ALIGNER_WEIGHTS")).ok_or(ConfigError::NoWeights)?;
 
         let listen = set(get("PHAROS_ALIGNER_LISTEN")).unwrap_or_else(|| DEFAULT_LISTEN.to_owned());
         let (host, port) = match listen.rsplit_once(':') {
@@ -93,6 +99,7 @@ impl Config {
             otlp_endpoint: set(get("PHAROS_ALIGNER_OTLP_ENDPOINT")),
             threads,
             idle_unload,
+            weights: PathBuf::from(weights),
         })
     }
 }
@@ -112,18 +119,24 @@ mod tests {
 
     #[test]
     fn defaults_match_server_py() {
-        let c = Config::from_env(env(&[("PHAROS_ALIGNER_MEDIA_ROOT", "/media")])).unwrap();
+        let c = Config::from_env(env(&[
+            ("PHAROS_ALIGNER_MEDIA_ROOT", "/media"),
+            ("PHAROS_ALIGNER_WEIGHTS", "/w"),
+        ]))
+        .unwrap();
         assert_eq!(c.media_root, PathBuf::from("/media"));
         assert_eq!((c.host.as_str(), c.port), ("0.0.0.0", 8790));
         assert_eq!(c.threads, 8);
         assert_eq!(c.idle_unload, Some(Duration::from_secs(600)));
         assert_eq!(c.otlp_endpoint, None);
+        assert_eq!(c.weights, PathBuf::from("/w"));
     }
 
     #[test]
     fn values_are_read() {
         let c = Config::from_env(env(&[
             ("PHAROS_ALIGNER_MEDIA_ROOT", "/m"),
+            ("PHAROS_ALIGNER_WEIGHTS", "/w"),
             ("PHAROS_ALIGNER_LISTEN", "127.0.0.1:9000"),
             ("PHAROS_ALIGNER_THREADS", "4"),
             ("PHAROS_ALIGNER_IDLE_UNLOAD_SECS", "0"),
@@ -135,11 +148,13 @@ mod tests {
         assert_eq!(c.otlp_endpoint.as_deref(), Some("http://otel:4317"));
         let bare = Config::from_env(env(&[
             ("PHAROS_ALIGNER_MEDIA_ROOT", "/m"),
+            ("PHAROS_ALIGNER_WEIGHTS", "/w"),
             ("PHAROS_ALIGNER_LISTEN", "::1x"),
         ]));
         assert!(bare.is_err());
         let host_only = Config::from_env(env(&[
             ("PHAROS_ALIGNER_MEDIA_ROOT", "/m"),
+            ("PHAROS_ALIGNER_WEIGHTS", "/w"),
             ("PHAROS_ALIGNER_LISTEN", "localhost"),
         ]))
         .unwrap();
@@ -149,6 +164,7 @@ mod tests {
         );
         let half = Config::from_env(env(&[
             ("PHAROS_ALIGNER_MEDIA_ROOT", "/m"),
+            ("PHAROS_ALIGNER_WEIGHTS", "/w"),
             ("PHAROS_ALIGNER_IDLE_UNLOAD_SECS", "1.5"),
         ]))
         .unwrap();
@@ -158,8 +174,11 @@ mod tests {
     #[test]
     fn errors_name_the_variable_and_value() {
         assert_eq!(Config::from_env(env(&[])), Err(ConfigError::NoMediaRoot));
+        let no_weights = Config::from_env(env(&[("PHAROS_ALIGNER_MEDIA_ROOT", "/m")]));
+        assert_eq!(no_weights, Err(ConfigError::NoWeights));
         let e = Config::from_env(env(&[
             ("PHAROS_ALIGNER_MEDIA_ROOT", "/m"),
+            ("PHAROS_ALIGNER_WEIGHTS", "/w"),
             ("PHAROS_ALIGNER_THREADS", "0"),
         ]))
         .unwrap_err();
@@ -169,6 +188,7 @@ mod tests {
         );
         let e = Config::from_env(env(&[
             ("PHAROS_ALIGNER_MEDIA_ROOT", "/m"),
+            ("PHAROS_ALIGNER_WEIGHTS", "/w"),
             ("PHAROS_ALIGNER_IDLE_UNLOAD_SECS", "-1"),
         ]))
         .unwrap_err();
@@ -178,6 +198,7 @@ mod tests {
         );
         let e = Config::from_env(env(&[
             ("PHAROS_ALIGNER_MEDIA_ROOT", "/m"),
+            ("PHAROS_ALIGNER_WEIGHTS", "/w"),
             ("PHAROS_ALIGNER_LISTEN", "h:port"),
         ]))
         .unwrap_err();
