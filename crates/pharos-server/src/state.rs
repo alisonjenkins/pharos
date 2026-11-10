@@ -1484,9 +1484,9 @@ impl AppState {
         });
     }
 
-    /// Fan out a `RefreshProgress` event for a library/collection item so
-    /// jellyfin-web's library-card refresh indicator fills as a scan runs.
-    /// `item_id` is the library's wire id; `progress` is `0.0..=100.0`.
+    /// Fan out a `ScanProgress` event for the whole library scan, which the
+    /// native events turn into the `refresh-library` task. `progress` is
+    /// `0.0..=100.0`; `end` is set once per pass, when it finishes.
     pub fn notify_scan_progress(
         &self,
         progress: f64,
@@ -1497,6 +1497,9 @@ impl AppState {
             .send(SocketBroadcast::ScanProgress { progress, end });
     }
 
+    /// Fan out a `RefreshProgress` event for a library/collection item so
+    /// jellyfin-web's library-card refresh indicator fills as a scan runs.
+    /// `item_id` is the library's wire id; `progress` is `0.0..=100.0`.
     pub fn notify_refresh_progress(&self, item_id: &str, progress: f64) {
         let _ = self.bus.send(SocketBroadcast::RefreshProgress {
             item_id: item_id.to_string(),
