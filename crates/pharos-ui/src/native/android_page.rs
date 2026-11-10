@@ -1562,6 +1562,16 @@ pub fn tap_peak(_id: &str) -> Option<f32> {
     None
 }
 
+pub fn tap_wake(_id: &str) -> super::resume::Wake {
+    super::resume::Wake::None
+}
+
+pub fn wake_media_tap(_id: &str) {}
+
+pub fn rest_tap(_id: &str) -> Option<String> {
+    None
+}
+
 /// The session's [`super::group_rpc::Groups`], as this TV's member.
 pub type Groups = super::group_rpc::Groups;
 
