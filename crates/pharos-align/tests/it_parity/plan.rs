@@ -114,14 +114,25 @@ fn offset_estimate_matches_python() {
             let mut calls = calls.borrow_mut();
             let probe = case.probe_indices[calls.len()];
             calls.push((s, e));
+            // The window carries its probe's line index, for `align` to look up.
             Ok::<_, std::convert::Infallible>(match case.answers[&probe.to_string()] {
-                Some(_) => vec![0.0],
+                Some(_) => vec![probe as f32],
                 None => Vec::new(),
             })
         };
-        let align = |_: &[f32], _: &[String]| {
-            let probe = case.probe_indices[calls.borrow().len() - 1];
-            Ok(case.answers[&probe.to_string()].clone().unwrap())
+        let align = |windows: &[(&[f32], &[String])]| {
+            assert_eq!(
+                calls.borrow().len(),
+                case.probe_indices.len(),
+                "all decoded first"
+            );
+            Ok(windows
+                .iter()
+                .map(|(pcm, _)| {
+                    let probe = pcm[0] as usize;
+                    case.answers[&probe.to_string()].clone().unwrap()
+                })
+                .collect())
         };
         let Ok(got) = estimate(&lines, decode, align);
         assert_eq!(calls.into_inner(), case.decode_calls);
