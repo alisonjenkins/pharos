@@ -81,6 +81,20 @@ pub(crate) fn part_of(path: &Path) -> Option<(String, u32)> {
     Some((folded(&rest), n.as_str().parse().ok()?))
 }
 
+/// The path a part's whole film would have: its name less the part marker
+/// (`Heat (1995) cd2.mkv` is `Heat (1995).mkv`), so the whole film's copy
+/// key can be read from it.
+pub(crate) fn without_marker(path: &Path) -> Option<PathBuf> {
+    part_of(path)?;
+    let stem = path.file_stem()?.to_str()?;
+    let caps = PART_RE.as_ref()?.captures_iter(stem).last()?;
+    let all = caps.get(0)?;
+    let rest = format!("{} {}", stem.get(..all.start())?, stem.get(all.end()..)?);
+    let rest = rest.split_whitespace().collect::<Vec<_>>().join(" ");
+    let ext = path.extension()?.to_str()?;
+    Some(path.with_file_name(format!("{rest}.{ext}")))
+}
+
 /// An embedded title less any part marker in it, folded, so `Heat CD1` and
 /// `Heat CD2` agree and `Heat` and `Heat 2` do not.
 fn title_key(title: &str) -> String {
@@ -110,17 +124,21 @@ pub(crate) enum StackOutcome {
     /// A part's probe found no duration, so its film's playlist could not
     /// run on past it.
     NoDuration,
+    /// The film is also held whole in one file, which copy folding keeps as
+    /// the item; stacking the parts as well would list the film twice.
+    WholeCopy,
 }
 
 impl StackOutcome {
     #[cfg(test)]
-    pub(crate) const ALL: [Self; 6] = [
+    pub(crate) const ALL: [Self; 7] = [
         Self::Stacked,
         Self::Numbering,
         Self::Versions,
         Self::Unprobed,
         Self::TitlesDiffer,
         Self::NoDuration,
+        Self::WholeCopy,
     ];
 
     pub(crate) fn label(self) -> &'static str {
@@ -131,6 +149,7 @@ impl StackOutcome {
             Self::Unprobed => "unprobed",
             Self::TitlesDiffer => "titles_differ",
             Self::NoDuration => "no_duration",
+            Self::WholeCopy => "whole_copy",
         }
     }
 }
@@ -500,6 +519,20 @@ mod tests {
         assert_eq!(outcome, StackOutcome::NoDuration);
         assert!(value.ends_with("cd2.mkv"), "{value}");
         assert_eq!(stack(pair, &found, &timeless).len(), 2);
+    }
+
+    #[test]
+    fn a_parts_whole_film_is_its_name_less_the_marker() {
+        let whole = |p: &str| without_marker(Path::new(p)).map(|p| p.display().to_string());
+        assert_eq!(
+            whole("/m/Heat (1995)/Heat (1995) cd2.mkv").as_deref(),
+            Some("/m/Heat (1995)/Heat (1995).mkv")
+        );
+        assert_eq!(
+            whole("/m/Heat (1995)/Heat (1995) - Part 1 [x264].mp4").as_deref(),
+            Some("/m/Heat (1995)/Heat (1995) - [x264].mp4")
+        );
+        assert_eq!(whole("/m/Heat (1995)/Heat (1995).mkv"), None);
     }
 
     #[test]
