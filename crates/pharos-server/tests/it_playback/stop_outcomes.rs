@@ -103,6 +103,7 @@ fn stop_outcome_labels_are_distinct_and_stable() {
             ("saved", "position"),
             ("finished", "past_threshold"),
             ("skipped", "no_item"),
+            ("skipped", "item_missing"),
             ("store_error", "item_read"),
             ("store_error", "user_data_read"),
             ("store_error", "user_data_write"),
@@ -140,6 +141,39 @@ async fn each_stop_is_counted_by_what_it_stored() {
 
     assert_eq!(stop!(app, token.as_str(), r#"{"PositionTicks":1}"#), 204);
     assert_eq!(stops(&snap, StopOutcome::NoItem), 1);
+
+    let gone = pharos_jellyfin_api::dto::WireId::Real(ITEM + 1).to_string();
+    let missing = format!(r#"{{"ItemId":"{gone}","PositionTicks":50000000}}"#);
+    // A removed item has no row to store on; that is not a store fault.
+    assert_eq!(stop!(app, token.as_str(), missing), 204);
+    assert_eq!(stops(&snap, StopOutcome::ItemMissing), 1);
+    assert_eq!(stops(&snap, StopOutcome::UserDataWriteFailed), 0);
+}
+
+/// A stop whose item cannot be read is counted and answered 503 (FR-108).
+#[actix_web::test]
+async fn a_stop_whose_item_read_fails_is_counted() {
+    let (state, token, _uid) = seed().await;
+    let app = test::init_service(
+        App::new()
+            .app_data(state.clone())
+            .wrap(LowercasePath)
+            .configure(jellyfin::configure),
+    )
+    .await;
+    let recorder = DebuggingRecorder::new();
+    let snap = pharos_test_metrics::snapshotter(&recorder);
+    let _metrics = metrics::set_default_local_recorder(&recorder);
+    // The item read selects every column; the access check reads only the
+    // library, so it still passes.
+    sqlx::query("ALTER TABLE media_items RENAME COLUMN title TO title_gone")
+        .execute(sqlite_of(&state.stores).pool())
+        .await
+        .unwrap();
+
+    let body = format!(r#"{{"ItemId":"{}","PositionTicks":50000000}}"#, item_wire());
+    assert_eq!(stop!(app, token.as_str(), body), 503);
+    assert_eq!(stops(&snap, StopOutcome::ItemReadFailed), 1);
 }
 
 fn sqlite_of(stores: &Stores) -> &pharos_store_sqlx::sqlite::SqliteStore {
