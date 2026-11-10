@@ -26,5 +26,8 @@ unicode-normalization = "0.1"
 wait-timeout = "0.2"
 workspace-hack = { version = "0.1", path = "../../workspace-hack" }
 
+[build-dependencies]
+pkg-config = "0.3"
+
 [lints]
 workspace = true

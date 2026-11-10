@@ -5334,6 +5334,7 @@ dependencies = [
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
+ "pkg-config",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
