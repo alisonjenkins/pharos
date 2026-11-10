@@ -6480,3 +6480,37 @@ body:has(.pharos-reader) {
   padding: 0;
   min-width: 0;
 }
+
+/* Books kept on this device (spec 036): Settings and the offline start. */
+.pharos-offline {
+  max-width: 40rem;
+  margin: 0 auto;
+  padding: 2rem 1rem;
+}
+
+.pharos-kept-list {
+  list-style: none;
+  margin: 1rem 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.pharos-kept-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.pharos-kept-text {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.pharos-kept-title {
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
