@@ -55,7 +55,7 @@ Every task follows TDD: a failing test first, then the code. Metrics and log lin
 - [x] T028-26 Loudness margins follow the track's dialogue spread; a bang-less shout needs a raised pitch (B1204, V1164).
 - [x] T028-27 A `Laugh` intent and its Giggle effect (B1205, V1165).
 - [x] T028-28 Ease between plain lines that follow closely (B1206, V1166). Two-speaker lines left as the source breaks them.
-- [ ] T028-29 Lift lines clear of burned-in text at the bottom of the frame.
+- [x] T028-29 Lift lines clear of burned-in text at the bottom of the frame (B1207, V1167). Signs drawn elsewhere in the frame are not looked for.
 - [ ] T028-30 Karaoke timings from the aligner for songs without `\k`.
 - [ ] T028-31 Opt-in speaker colours from speaker detection.
 - [ ] T028-32 Measure the styled track's frame cost on the TV app.
