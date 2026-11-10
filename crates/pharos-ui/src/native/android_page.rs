@@ -697,7 +697,14 @@ pub fn enter_vr(
 
 pub fn exit_vr() {}
 
-pub fn select_field(_id: &str) {}
+/// Focuses the text field `id` and selects all of it; on a TV that brings
+/// up the remote's keyboard (FR-602).
+pub fn select_field(id: &str) {
+    run(format!(
+        "const el = document.getElementById({}); if (el) {{ el.focus(); if (el.select) el.select(); }}",
+        js_str(id)
+    ));
+}
 
 /// Move the focus to `to` when it is inside `within` (B1031): the compact
 /// player's picture hands it to the stage bar.
@@ -865,8 +872,10 @@ pub fn android_shell() -> bool {
     cfg!(target_os = "android")
 }
 
+/// No keyboard shortcut opens the palette on a TV: the banner's Search
+/// button does (FR-602).
 pub fn palette_keys() -> &'static str {
-    "Ctrl+K"
+    ""
 }
 
 pub fn now_ms() -> f64 {

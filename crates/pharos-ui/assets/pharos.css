@@ -239,6 +239,16 @@ input:focus-visible {
   flex: 0 1 18rem;
   min-width: 8rem;
 }
+/* 038 FR-602: the TV's banner opens the palette from a button. */
+.pharos-search-open {
+  padding: 0.3rem 0.9rem;
+  border: var(--px-border) solid var(--px-color-border);
+  border-radius: var(--px-radius);
+  background: var(--px-color-overlay);
+  color: var(--px-color-fg);
+  font: inherit;
+  cursor: pointer;
+}
 .pharos-search input {
   box-sizing: border-box;
   width: 100%;
