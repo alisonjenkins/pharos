@@ -72,6 +72,10 @@ pub fn normalise_denied_audio_codecs(codecs: &[String]) -> Result<Vec<String>, D
 /// The audio codecs `device_id` must not direct-play. Empty when none are set,
 /// and also when the stored value cannot be read: the client's own claim then
 /// stands, which is how it played before the setting existed.
+///
+/// A list saved before [`CONVERSION_AUDIO_CODEC`] was refused can still hold
+/// it. It is dropped here, so the device list never shows it and the next
+/// save, which sends the whole list back, is not refused for it.
 pub async fn denied_audio_codecs(state: &AppState, device_id: &str) -> Vec<String> {
     use pharos_store_sqlx::ServerConfigStore as _;
     let key = denied_audio_codecs_key(device_id);
@@ -84,7 +88,18 @@ pub async fn denied_audio_codecs(state: &AppState, device_id: &str) -> Vec<Strin
         }
     };
     match serde_json::from_str::<Vec<String>>(&raw) {
-        Ok(codecs) => codecs,
+        Ok(mut codecs) => {
+            let before = codecs.len();
+            codecs.retain(|c| !c.eq_ignore_ascii_case(CONVERSION_AUDIO_CODEC));
+            if codecs.len() != before {
+                tracing::warn!(
+                    device.id = device_id,
+                    codec = CONVERSION_AUDIO_CODEC,
+                    "device audio deny list holds the conversion codec; ignoring it"
+                );
+            }
+            codecs
+        }
         Err(e) => {
             tracing::warn!(device.id = device_id, value = %raw, error = %e, "device audio deny list is not a JSON list");
             Vec::new()
