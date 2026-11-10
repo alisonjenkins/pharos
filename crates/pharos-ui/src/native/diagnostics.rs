@@ -162,10 +162,14 @@ pub async fn load_opted_in(api: &NativeApi) -> Result<bool, String> {
 /// Writes the user's opt-in to `Prefs`; remembered only once the server
 /// has stored it.
 pub async fn set_opted_in(api: &NativeApi, on: bool) -> Result<(), String> {
+    let begun = session();
     let value: &[u8] = if on { b"true" } else { b"false" };
     api.set_pref(&prefs_call("opt_in_write"), OPT_IN_PREF, value)
         .await
         .map_err(|e| e.to_string())?;
+    if session() != begun {
+        return Err("signed out while the opt-in was saved".to_owned());
+    }
     remember_opt_in(on);
     Ok(())
 }
