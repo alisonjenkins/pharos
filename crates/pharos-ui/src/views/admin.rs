@@ -320,9 +320,9 @@ pub struct AdminViewProps {
     /// The "Deep check another file" box and its hits.
     #[props(default)]
     pub deep_search: DeepSearchState,
-    /// The device whose sound formats are being saved; its toggles wait.
+    /// The devices whose sound formats are being saved; their toggles wait.
     #[props(default)]
-    pub device_saving: Option<String>,
+    pub device_saving: std::collections::BTreeSet<String>,
 }
 
 /// What the pick form shows for the group or match it was opened on.
@@ -831,7 +831,7 @@ fn LibrariesPane(libraries: Vec<LibraryFolder>) -> Element {
 #[component]
 fn DevicesPane(
     devices: Vec<DeviceEntry>,
-    saving: Option<String>,
+    saving: std::collections::BTreeSet<String>,
     on_action: EventHandler<AdminAction>,
 ) -> Element {
     rsx! {
@@ -863,14 +863,14 @@ fn DevicesPane(
                                         class: "pharos-manage-badges pharos-admin-device-audio",
                                         role: "group",
                                         aria_label: "Sound formats converted for {d.name}",
-                                        "aria-busy": "{saving.as_deref() == Some(d.id.as_str())}",
+                                        "aria-busy": "{saving.contains(&d.id)}",
                                         for (codec, label) in DENIABLE_AUDIO_CODECS {
                                             {
                                                 let denied = d
                                                     .no_direct_play_audio_codecs
                                                     .iter()
                                                     .any(|c| c.eq_ignore_ascii_case(codec));
-                                                let busy = saving.as_deref() == Some(d.id.as_str());
+                                                let busy = saving.contains(&d.id);
                                                 let device_id = d.id.clone();
                                                 let current = d.no_direct_play_audio_codecs.clone();
                                                 rsx! {
@@ -2785,7 +2785,7 @@ mod tests {
                     status: None,
                     on_action: |_| {},
                     active_tab: AdminTab::Devices,
-                    device_saving: Some("tv".to_string()),
+                    device_saving: std::collections::BTreeSet::from(["tv".to_string()]),
                     devices: vec![
                         DeviceEntry { id: "tv".into(), name: "TV".into(), ..Default::default() },
                         DeviceEntry { id: "pc".into(), name: "PC".into(), ..Default::default() },

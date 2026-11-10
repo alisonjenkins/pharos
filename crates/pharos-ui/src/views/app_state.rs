@@ -783,12 +783,13 @@ pub fn AdminPane(
         })
     };
     let new_api_key_secret = use_signal::<Option<String>>(|| None);
-    // Sound-format lists saved since the last device load, and the device
+    // Sound-format lists saved since the last device load, and the devices
     // whose save is in flight: one save per device at a time, each built on
-    // the last, so two quick toggles cannot overwrite each other.
+    // the last, so two quick toggles cannot overwrite each other. Saves for
+    // different devices run side by side.
     let device_deny_saved =
         use_signal::<std::collections::HashMap<String, Vec<String>>>(Default::default);
-    let device_saving = use_signal::<Option<String>>(|| None);
+    let device_saving = use_signal::<std::collections::BTreeSet<String>>(Default::default);
     // Dismiss hides the open tab's load error too; the next tab, reload or
     // action shows it again if it is still there.
     let fetch_err_hidden = use_signal(|| false);
@@ -814,10 +815,9 @@ pub fn AdminPane(
             let token = access_token.peek().clone();
             let base = server_base.clone();
             if let AdminAction::SetDeviceAudioDeny { device_id, .. } = &action {
-                if device_saving_signal.peek().is_some() {
+                if !device_saving_signal.write().insert(device_id.clone()) {
                     return;
                 }
-                device_saving_signal.set(Some(device_id.clone()));
             }
             if action == AdminAction::DismissStatus {
                 status_signal.set(None);
@@ -977,7 +977,9 @@ pub fn AdminPane(
                     AdminAction::SetDeviceAudioDeny { device_id, codecs } => {
                         match set_device_audio_deny(&base, &token, &device_id, &codecs).await {
                             Ok(()) => {
-                                device_deny_saved_signal.write().insert(device_id, codecs);
+                                device_deny_saved_signal
+                                    .write()
+                                    .insert(device_id.clone(), codecs);
                                 status_signal
                                     .set(Some(format!("Saved the sound formats for {subject}.")));
                             }
@@ -985,7 +987,7 @@ pub fn AdminPane(
                                 "Couldn't save the sound formats for {subject}: {e}"
                             ))),
                         }
-                        device_saving_signal.set(None);
+                        device_saving_signal.write().remove(&device_id);
                     }
                     AdminAction::IdentitySearch {
                         series_key,
