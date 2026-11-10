@@ -12,9 +12,12 @@ import threading
 import time
 from typing import Any, Callable
 
+from opentelemetry import trace
+
 from pharos_aligner.offset import estimate, shift
 from pharos_aligner.plan import parse_request, resolve, stamps, window
 from pharos_aligner.text import words
+from pharos_aligner.tracing import Phases, remote_parent, tracer
 
 logger = logging.getLogger("pharos_aligner")
 
@@ -123,16 +126,29 @@ class AlignerHandler(http.server.BaseHTTPRequestHandler):
             self._send_json(400, {"error": f"invalid JSON: {e}"})
             return
 
+        with tracer.start_as_current_span(
+            "aligner.align",
+            context=remote_parent(self.headers),
+            kind=trace.SpanKind.SERVER,
+        ) as span:
+            self._align(body, span)
+
+    def _align(self, body: Any, span: trace.Span) -> None:
         start_time = time.monotonic()
+        phases = Phases()
         try:
             rel_path, lines = parse_request(body)
             full_path = resolve(self.get_media_root(), rel_path)
         except ValueError as e:
+            span.set_status(trace.Status(trace.StatusCode.ERROR, str(e)))
             self._send_json(400, {"error": str(e)})
             return
+        span.set_attribute("aligner.path", rel_path)
+        span.set_attribute("aligner.lines", len(lines))
         # Checked here, not caught: a FileNotFoundError from inside the work
         # (ffmpeg missing) is a server fault, not a missing file.
         if not os.path.isfile(full_path):
+            span.set_status(trace.Status(trace.StatusCode.ERROR, "file not found"))
             self._send_json(404, {"error": f"file not found: {rel_path}"})
             return
 
@@ -142,7 +158,8 @@ class AlignerHandler(http.server.BaseHTTPRequestHandler):
 
             def align_wide(pcm: bytes, tokens: list[str]) -> list[tuple[int, int]]:
                 try:
-                    return aligner.align(pcm, tokens, lead_star=True)
+                    with phases.phase("model", stage="probe", words=len(tokens)):
+                        return aligner.align(pcm, tokens, lead_star=True)
                 except (RuntimeError, ValueError):
                     logger.warning("path=%s offset probe failed", rel_path, exc_info=True)
                     return []
@@ -158,7 +175,8 @@ class AlignerHandler(http.server.BaseHTTPRequestHandler):
                 if probe_timed_out:
                     return b""
                 try:
-                    return decoder(full_path, start_ms, end_ms)
+                    with phases.phase("decode", stage="probe", window_ms=end_ms - start_ms):
+                        return decoder(full_path, start_ms, end_ms)
                 except subprocess.TimeoutExpired:
                     probe_timed_out = True
                     logger.warning("path=%s offset probe decode timed out; skipping the rest", rel_path)
@@ -167,7 +185,11 @@ class AlignerHandler(http.server.BaseHTTPRequestHandler):
                     logger.warning("path=%s offset probe decode failed", rel_path, exc_info=True)
                     return b""
 
-            with ALIGN_LOCK:
+            # Waiting behind another song shows as its own span, so a slow
+            # answer that was mostly queueing is told apart from a slow one.
+            with tracer.start_as_current_span("aligner.wait"):
+                ALIGN_LOCK.acquire()
+            try:
                 found = estimate(lines, decode_probe, align_wide)
                 logger.info(
                     "path=%s offset_ms=%d probes=%s reason=%s",
@@ -185,10 +207,12 @@ class AlignerHandler(http.server.BaseHTTPRequestHandler):
                         out_lines.append({"words": []})
                         continue
                     w_start, w_end = window(line, len(w_list))
-                    pcm = decoder(full_path, w_start, w_end)
+                    with phases.phase("decode", stage="line", line=index, window_ms=w_end - w_start):
+                        pcm = decoder(full_path, w_start, w_end)
                     tokens = [w.token for w in w_list]
                     try:
-                        spans = aligner.align(pcm, tokens)
+                        with phases.phase("model", stage="line", line=index, words=len(tokens)):
+                            spans = aligner.align(pcm, tokens)
                     except (RuntimeError, ValueError):
                         # A window too short for its text makes the aligner
                         # raise; only that line goes without word times.
@@ -199,23 +223,57 @@ class AlignerHandler(http.server.BaseHTTPRequestHandler):
                     out_lines.append({"words": line_stamps})
                     if line_stamps:
                         words_aligned += len(w_list)
+            finally:
+                ALIGN_LOCK.release()
         except subprocess.CalledProcessError as e:
+            span.set_status(trace.Status(trace.StatusCode.ERROR, f"ffmpeg failed: {e}"))
+            logger.warning(
+                "path=%s failed=ffmpeg duration_ms=%d %s",
+                rel_path,
+                int((time.monotonic() - start_time) * 1000),
+                phases.summary(),
+            )
             self._send_json(422, {"error": f"ffmpeg failed: {e}"})
             return
-        except Exception:
-            logger.exception("internal error during alignment request")
+        except Exception as e:
+            span.record_exception(e)
+            span.set_status(trace.Status(trace.StatusCode.ERROR, "internal error"))
+            logger.exception(
+                "path=%s failed=internal duration_ms=%d %s",
+                rel_path,
+                int((time.monotonic() - start_time) * 1000),
+                phases.summary(),
+            )
             self._send_json(500, {"error": "internal error"})
             return
 
-        self._send_json(200, {"lines": out_lines, "offset_ms": found.offset_ms})
         duration_ms = int((time.monotonic() - start_time) * 1000)
+        span.set_attribute("aligner.offset_ms", found.offset_ms)
+        span.set_attribute("aligner.words_aligned", words_aligned)
+        for name, ms in phases.ms.items():
+            span.set_attribute(f"aligner.{name}_ms", ms)
+        try:
+            self._send_json(200, {"lines": out_lines, "offset_ms": found.offset_ms})
+        except (BrokenPipeError, ConnectionResetError) as e:
+            # The server stopped waiting (its timeout) before the answer was
+            # ready: the work is lost, and saying so is the only trace of it.
+            span.set_status(trace.Status(trace.StatusCode.ERROR, "caller gone"))
+            logger.warning(
+                "path=%s failed=caller_gone error=%s duration_ms=%d %s",
+                rel_path,
+                type(e).__name__,
+                duration_ms,
+                phases.summary(),
+            )
+            return
         logger.info(
-            "path=%s lines=%d words_aligned=%d offset_ms=%d duration_ms=%d",
+            "path=%s lines=%d words_aligned=%d offset_ms=%d duration_ms=%d %s",
             rel_path,
             len(lines),
             words_aligned,
             found.offset_ms,
             duration_ms,
+            phases.summary(),
         )
 
 
@@ -257,6 +315,10 @@ def main() -> None:
         port = 8790
 
     from pharos_aligner.model import Aligner, start_idle_reaper
+    from pharos_aligner.tracing import init as init_tracing
+
+    otlp_endpoint = os.environ.get("PHAROS_ALIGNER_OTLP_ENDPOINT")
+    traced = init_tracing(otlp_endpoint)
 
     idle_unload_s = idle_unload_secs(os.environ.get("PHAROS_ALIGNER_IDLE_UNLOAD_SECS"))
     aligner = Aligner(idle_unload_s=idle_unload_s)
@@ -264,11 +326,12 @@ def main() -> None:
         start_idle_reaper(aligner, interval_s=min(IDLE_CHECK_SECS, idle_unload_s))
     server = create_server((host, port), media_root=media_root, aligner=aligner)
     logger.info(
-        "Serving pharos-aligner on %s:%d (media root: %s, idle unload: %s s)",
+        "Serving pharos-aligner on %s:%d (media root: %s, idle unload: %s s, traces: %s)",
         host,
         port,
         media_root,
         "off" if idle_unload_s is None else int(idle_unload_s),
+        otlp_endpoint if traced else "off",
     )
     try:
         server.serve_forever()
