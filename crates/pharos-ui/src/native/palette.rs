@@ -297,9 +297,9 @@ mod tests {
     #[test]
     fn a_blank_term_lists_past_searches_first_and_they_go_nowhere() {
         let places = places(&[]);
-        let searches = searches(&remember(&remember("", "moby"), "dragon ball"));
+        let searches = searches(&remember(&remember("", "moby"), "silver rock"));
         let blank = rows(&searches, &places, &[], "", None);
-        assert_eq!(labels(&blank[..3]), ["dragon ball", "moby", "Home"]);
+        assert_eq!(labels(&blank[..3]), ["silver rock", "moby", "Home"]);
         assert_eq!(blank[0].group(), "Recent searches");
         assert_eq!(blank[0].route(), None);
         assert!(rows(&searches, &places, &[], "mo", None)

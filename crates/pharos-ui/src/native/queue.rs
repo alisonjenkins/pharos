@@ -897,15 +897,15 @@ mod tests {
     fn a_queued_video_is_named_with_its_show() {
         let episode = Item {
             kind: ItemKind::Episode,
-            name: "The Fly".to_owned(),
-            series_name: Some("Breaking Bad".to_owned()),
+            name: "The Paper Boat".to_owned(),
+            series_name: Some("Show X".to_owned()),
             season: Some(3),
             episode: Some(10),
             ..item(4)
         };
         assert_eq!(
             Track::video(&episode).name,
-            "Breaking Bad · S3 · E10 · The Fly"
+            "Show X · S3 · E10 · The Paper Boat"
         );
         let film = Item {
             kind: ItemKind::Movie,

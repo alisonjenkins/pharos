@@ -1649,7 +1649,7 @@ mod tests {
     fn the_player_heading_names_the_show_season_and_episode() {
         let episode = Item {
             name: "Future Enemies".into(),
-            series_name: Some("Frieren".into()),
+            series_name: Some("Show AG".into()),
             season: Some(1),
             episode: Some(22),
             ..item(ItemKind::Episode)
@@ -1657,17 +1657,17 @@ mod tests {
         assert_eq!(
             watch_heading(&episode),
             (
-                "Frieren".to_owned(),
+                "Show AG".to_owned(),
                 Some("S1 · E22 · Future Enemies".to_owned())
             )
         );
         let stand_in = Item {
-            name: "Frieren S01E22".into(),
+            name: "Show AG S01E22".into(),
             ..episode.clone()
         };
         assert_eq!(
             watch_heading(&stand_in),
-            ("Frieren".to_owned(), Some("S1 · E22".to_owned()))
+            ("Show AG".to_owned(), Some("S1 · E22".to_owned()))
         );
         let no_show = Item {
             series_name: None,
@@ -3236,20 +3236,20 @@ mod tests {
     #[test]
     fn an_episode_without_a_title_reads_as_its_number() {
         let mut e = item(ItemKind::Episode);
-        e.series_name = Some("Star Trek The Next Generation".into());
+        e.series_name = Some("Show Y The Next Chapter".into());
         e.season = Some(3);
         e.episode = Some(7);
         for stand_in in [
-            "Star Trek: The Next Generation",
-            "Star Trek - The Next Generation - S03E07 - The Enemy WEBRip-1080p",
-            "Person.of.Interest.S01E03.720p.HDTV.x264-IMMERSE",
+            "Show Y: The Next Chapter",
+            "Show Y - The Next Chapter - S03E07 - The Distant Signal WEBRip-1080p",
+            "Show.Z.S01E03.720p.HDTV.x264-GRPD",
             "",
         ] {
             e.name = stand_in.into();
             assert_eq!(display_name(&e), "Episode 7", "{stand_in}");
         }
-        e.name = "The Enemy".into();
-        assert_eq!(display_name(&e), "The Enemy");
+        e.name = "The Distant Signal".into();
+        assert_eq!(display_name(&e), "The Distant Signal");
         e.name = "Mass Effect".into();
         assert_eq!(display_name(&e), "Mass Effect");
 
@@ -3262,8 +3262,8 @@ mod tests {
     fn an_episode_page_is_named_with_its_show() {
         let mut e = item(ItemKind::Episode);
         e.name = "Pilot".into();
-        e.series_name = Some("Breaking Bad".into());
-        assert_eq!(page_name(&e), "Pilot · Breaking Bad");
+        e.series_name = Some("Show X".into());
+        assert_eq!(page_name(&e), "Pilot · Show X");
         e.series_name = None;
         assert_eq!(page_name(&e), "Pilot");
         let mut film = item(ItemKind::Movie);
@@ -3275,13 +3275,13 @@ mod tests {
     fn a_tile_puts_series_and_numbers_on_their_own_lines_with_tooltips() {
         let mut e = item(ItemKind::Episode);
         e.name = "Murder House".into();
-        e.series_name = Some("American Horror Story".into());
+        e.series_name = Some("Show AA".into());
         e.season = Some(1);
         e.episode = Some(1);
         let html = render(move || rsx! { PosterTile { item: e.clone() } });
         for want in [
             r#"class="pharos-poster-name" title="Murder House""#,
-            r#"class="pharos-poster-sub" title="American Horror Story""#,
+            r#"class="pharos-poster-sub" title="Show AA""#,
             r#"class="pharos-poster-sub" title="S1 · E1""#,
         ] {
             assert!(html.contains(want), "missing {want} in {html}");
@@ -3318,7 +3318,7 @@ mod tests {
     #[test]
     fn a_poster_tiles_scores_sit_beside_the_year_not_on_the_art() {
         let mut rated = item(ItemKind::Movie);
-        rated.name = "Die Hard".into();
+        rated.name = "Film AA".into();
         rated.year = Some(1988);
         rated.critic_rating = Some(94);
         let html = render(move || rsx! { PosterTile { item: rated.clone() } });
@@ -3491,7 +3491,7 @@ mod tests {
     fn crumbs_link_every_step_but_the_page_shown() {
         let mut series = item(ItemKind::Series);
         series.id = ItemRef::Synth(5);
-        series.name = "Breaking Bad".into();
+        series.name = "Show X".into();
         let mut season = item(ItemKind::Season);
         season.id = ItemRef::Synth(6);
         season.name = "Season 1".into();
