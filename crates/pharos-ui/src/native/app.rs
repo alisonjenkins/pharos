@@ -310,15 +310,22 @@ impl Themes {
         }
     }
 
-    /// Make `name` the choice, apply it and store the choice.
-    fn choose(mut self, name: String) {
-        self.active.set(name);
-        self.apply_active();
-        self.store_active();
+    /// Make `name` the choice, apply it and store the choice. A failed
+    /// store is logged; [`Self::choose_kept`] also hands it back.
+    fn choose(self, name: String) {
+        let _logged = self.choose_kept(name);
     }
 
-    fn store_active(self) {
-        store_setting(device::ACTIVE_KEY, &self.active.peek());
+    /// [`Self::choose`], answering why the device would not keep the choice
+    /// when it would not: the choice still applies to this page.
+    fn choose_kept(mut self, name: String) -> Result<(), String> {
+        self.active.set(name);
+        self.apply_active();
+        self.store_active()
+    }
+
+    fn store_active(self) -> Result<(), String> {
+        kept_setting(device::ACTIVE_KEY, &self.active.peek())
     }
 
     fn store_custom(self) {
@@ -562,10 +569,15 @@ fn store_queue(text: &str) {
     });
 }
 
+/// Stores one device setting, logging a failure.
 fn store_setting(key: &str, value: &str) {
-    if let Err(e) = platform::store_theme(key, value) {
-        platform::warn(&signal::storage_failed(key, &e));
-    }
+    let _logged = kept_setting(key, value);
+}
+
+/// [`store_setting`], handing a failure back to say so to the viewer.
+fn kept_setting(key: &str, value: &str) -> Result<(), String> {
+    platform::store_theme(key, value)
+        .inspect_err(|e| platform::warn(&signal::storage_failed(key, e)))
 }
 
 thread_local! {
@@ -3997,6 +4009,8 @@ fn WhatsNew(route: Route) -> Element {
             replay: replay(),
             not_kept: not_kept(),
             on_page: move |to: usize| {
+                // A failure belongs to the setting that made it, not the next.
+                not_kept.set(None);
                 page.set(to);
                 platform::focus_by_id(whats_new::FIRST_BUTTON_ID);
             },
@@ -4004,11 +4018,11 @@ fn WhatsNew(route: Route) -> Element {
                 match pick {
                     Pick::Theme(name) => {
                         platform::info(&format!("pharos: theme set={name} from=whats_new"));
-                        themes.choose(name);
+                        not_kept.set(themes.choose_kept(name).err());
                     }
                     Pick::ThemeAuto => {
                         platform::info("pharos: theme set=auto from=whats_new");
-                        themes.choose(device::AUTO.to_owned());
+                        not_kept.set(themes.choose_kept(device::AUTO.to_owned()).err());
                     }
                     Pick::SubtitleSize(size) => {
                         if let Err(e) = store_subtitle_size(size) {
