@@ -13,6 +13,9 @@ const DEFAULT_PORT: u16 = 8790;
 pub const DEFAULT_IDLE_UNLOAD: Duration = Duration::from_secs(600);
 /// On a busy node, threads beyond this wait on each other more than they work.
 pub const DEFAULT_THREADS: usize = 8;
+/// About 62 s of 16 kHz audio a forward pass: every offset probe of a
+/// typical song in one pass, with peak RSS inside 2.6 GiB (spec 039, R19).
+pub const DEFAULT_BATCH_SAMPLES: usize = 1_000_000;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
