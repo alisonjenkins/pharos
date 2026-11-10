@@ -123,6 +123,18 @@ ignore = [
     # example importing a Jellyfin `library.db`): then fix it first. Drop
     # the entry when an sqlx release depends on libsqlite3-sys >= 0.39.
     "RUSTSEC-2026-0459",
+    # RUSTSEC-2026-0403 — uninitialised memory exposed when streaming
+    # decompression of a legacy zstd frame fails, in zstd-safe < 7.4.0. The
+    # zstd-safe 5.0.2 in Cargo.lock comes from zstd 0.11 <- zip 0.6 <- tch /
+    # torch-sys <- burn-tch, Burn's optional libtorch backend, which
+    # burn-dispatch only enables with its `tch` feature. pharos-align turns on
+    # Burn's `vulkan` backend only (spec 039, ADR-0116), so the chain is never
+    # built: `cargo tree -i zstd-safe@5.0.2 --workspace --all-features
+    # --target all -e all` is EMPTY. Cargo still locks it because the lockfile
+    # resolves every optional dependency. The zstd-safe that is compiled is
+    # 8.2.0, which is fixed. Re-check if anything enables Burn's `tch`
+    # backend, and drop the entry when burn-tch moves off zip 0.6.
+    "RUSTSEC-2026-0403",
 ]
 
 [licenses]
