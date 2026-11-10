@@ -21,6 +21,7 @@ use super::appearance::{AppearanceView, ContrastRow, Edit, EditorView, Notice, T
 use super::approve_device;
 use super::backdrop::{self, Backdrop};
 use super::browse::{self, Neighbours};
+use super::damage;
 use super::diagnostics;
 use super::favourites::{self, Favourites, FavouritesView};
 use super::find::{self, Find, DEBOUNCE_MS, RESULT_LIMIT};
@@ -431,6 +432,42 @@ fn log_lines(lines: &[device::Line]) {
             }
         }
     }
+}
+
+/// The integrity scan's damaged spans, when they describe the file playing:
+/// only the primary file is scanned, so another version has none (B1160).
+fn scanned_spans(p: &Playing) -> Vec<pharos_client::api::DamageSpan> {
+    let primary = p.version.is_empty()
+        || p.detail
+            .versions
+            .iter()
+            .any(|v| v.primary && v.id == p.version);
+    match (&p.detail.damage, primary) {
+        (Some(d), true) => d.ranges.clone(),
+        _ => Vec::new(),
+    }
+}
+
+/// The spans this device skipped in a file before (B1160).
+fn stored_skips(item: ItemRef, version: &str) -> Vec<pharos_client::api::DamageSpan> {
+    let key = damage::skipped_key(item, version);
+    match platform::stored_theme(&key) {
+        Ok(stored) => stored
+            .as_deref()
+            .map_or_else(Vec::new, damage::parse_skipped),
+        Err(e) => {
+            platform::warn(&signal::storage_failed(&key, &e));
+            Vec::new()
+        }
+    }
+}
+
+fn remember_skip(item: ItemRef, version: &str, from_ms: u64, to_ms: u64) {
+    let spans = damage::remember_skip(&stored_skips(item, version), from_ms, to_ms);
+    store_setting(
+        &damage::skipped_key(item, version),
+        &damage::format_skipped(&spans),
+    );
 }
 
 fn store_setting(key: &str, value: &str) {
@@ -4799,6 +4836,7 @@ fn Player(
     let nav = use_context::<Nav>();
     let replace = use_context::<Replace>();
     let together = use_context::<Together>();
+    let group_view = together.view;
     let group = (together.view)();
     let watch_seen = use_group_seen(vec![p.detail.item.id]);
     // The session is read when used: a join can make it after this mounted.
@@ -4840,6 +4878,8 @@ fn Player(
     let mut view_mode = use_signal(stored_view_mode);
     let vr = use_resource(platform::vr_supported);
     let mut failed = use_signal(|| None::<PlayFailure>);
+    // Where the media broke, for the skip past it to remember (B1160).
+    let broke_at = use_hook(|| Rc::new(Cell::new(0u64)));
     let saved_volume = use_hook(last_volume);
     let mut media = use_signal(|| MediaState::at_volume(saved_volume.map(|(v, m, _)| (v, m))));
     // The position changes every tick and the rest of the state seldom. The
@@ -5229,15 +5269,49 @@ fn Player(
     // The engines call back from browser events, outside the Dioxus runtime.
     let fatal = use_coroutine({
         let stop = stop.clone();
+        let (p, last_ms, broke_at) = (Rc::clone(&p), Rc::clone(&last_ms.0), Rc::clone(&broke_at));
         move |mut reasons: UnboundedReceiver<Fatal>| {
             let stop = stop.clone();
+            let (p, last_ms, broke_at) = (Rc::clone(&p), Rc::clone(&last_ms), Rc::clone(&broke_at));
             async move {
-                while let Some(Fatal { reason, .. }) = reasons.next().await {
+                while let Some(fatal) = reasons.next().await {
                     stop();
+                    let reason = fatal.reason;
+                    // Music keeps its own screen, and a group plays one
+                    // timeline for all: neither is offered a skip.
+                    let skippable = fatal.media
+                        && p.kind != ItemKind::Audio
+                        && !group_view.peek().drives(playing_id);
+                    // Where the element stopped; a failure before the first
+                    // position tick has not reached `last_ms` yet, and one
+                    // before the start seek is at the start.
+                    let at = [platform::position_ms(VIDEO_ID), last_ms.get(), p.start_ms]
+                        .into_iter()
+                        .find(|&ms| ms > 0)
+                        .unwrap_or(0);
+                    broke_at.set(at);
+                    let skip = skippable
+                        .then(|| {
+                            damage::skip_target(
+                                at,
+                                p.detail.item.runtime_ms,
+                                &scanned_spans(&p),
+                                &stored_skips(playing_id, &p.version),
+                            )
+                        })
+                        .flatten();
                     platform::warn(&format!(
-                        "pharos: playback failure shown item={playing_id} kind=stream reason={reason}"
+                        "pharos: playback failure shown item={playing_id} kind=stream media={} at_ms={at} skip_to_ms={} source={} reason={reason}",
+                        fatal.media,
+                        skip.map_or(0, |(to, _)| to),
+                        skip.map_or("none", |(_, s)| s.label()),
                     ));
-                    failed.set(Some(PlayFailure::stream(reason)));
+                    // Music and groups keep the panel they had.
+                    failed.set(Some(if skippable {
+                        PlayFailure::damaged(reason, skip.map(|(to, _)| to))
+                    } else {
+                        PlayFailure::stream(reason)
+                    }));
                 }
             }
         }
@@ -6400,17 +6474,42 @@ fn Player(
             if let Some(failure) = failed() {
                 PlaybackFailure {
                     failure,
-                    on_retry: move |()| {
-                        platform::info(&format!(
-                            "pharos: playback retry item={playing_id} at_ms={}",
-                            last_ms.0.get()
-                        ));
-                        on_renegotiate.call(TrackPicks {
-                            audio: retry_audio.map_or(TrackChoice::Default, TrackChoice::Index),
-                            subtitle: choice(*subtitle.peek()),
-                        });
+                    on_retry: {
+                        let last_ms = Rc::clone(&last_ms.0);
+                        move |()| {
+                            platform::info(&format!(
+                                "pharos: playback retry item={playing_id} at_ms={}",
+                                last_ms.get()
+                            ));
+                            on_renegotiate.call(TrackPicks {
+                                audio: retry_audio.map_or(TrackChoice::Default, TrackChoice::Index),
+                                subtitle: choice(*subtitle.peek()),
+                            });
+                        }
                     },
                     on_back: move |()| leave_player(nav),
+                    // The renegotiation carries on from where `last_ms` says,
+                    // as Try again does; the element that broke cannot seek.
+                    on_skip: {
+                        let (last_ms, broke_at) = (Rc::clone(&last_ms.0), Rc::clone(&broke_at));
+                        let was_paused = was_paused.clone();
+                        let version = p.version.clone();
+                        move |to_ms: u64| {
+                            let from_ms = broke_at.get();
+                            // The viewer asked to carry on: the next player
+                            // plays, whatever the broken one was left at.
+                            was_paused.0.set(false);
+                            remember_skip(playing_id, &version, from_ms, to_ms);
+                            platform::info(&format!(
+                                "pharos: playback skip item={playing_id} from_ms={from_ms} to_ms={to_ms}"
+                            ));
+                            last_ms.set(to_ms);
+                            on_renegotiate.call(TrackPicks {
+                                audio: retry_audio.map_or(TrackChoice::Default, TrackChoice::Index),
+                                subtitle: choice(*subtitle.peek()),
+                            });
+                        }
+                    },
                 }
             }
             if let Some(message) = group.ended.clone() {
