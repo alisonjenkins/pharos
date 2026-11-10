@@ -1713,6 +1713,7 @@ static KEY_AT: Mutex<tv_page::KeyContext> = Mutex::new(tv_page::KeyContext {
     player: false,
     in_player: false,
     on_button: false,
+    field: false,
 });
 /// What `probe_capabilities` found.
 static CAPS: Mutex<Option<Capabilities>> = Mutex::new(None);
@@ -1735,8 +1736,10 @@ unsafe impl<T> Send for Owned<T> {}
 
 /// The controls the arrow keys move between: the web's, and the player's
 /// track pickers too, which a remote has no other way to reach.
-const KEY_TARGETS: &str =
-    "a[href], button:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex='-1'])";
+/// The D-pad's stops. Fields too (FR-606): a join code, a switch, a slider.
+const KEY_TARGETS: &str = "a[href], button:not([disabled]), select:not([disabled]), \
+     input:not([disabled]):not([type='hidden']), textarea:not([disabled]), \
+     [tabindex]:not([tabindex='-1'])";
 
 /// An app-wide key listener: key, ctrl, meta; true takes the key.
 type AppKeys = Box<dyn FnMut(&str, bool, bool) -> bool>;
@@ -1834,7 +1837,32 @@ const BRIDGE_JS: &str = r#"
 const send = (v) => dioxus.send(v);
 __BAR_KEYS__
 // Not a <select>: OK opens its list, and the arrows have to move off it.
-const inText = (t) => !!t && (t.isContentEditable || /^(INPUT|TEXTAREA)$/.test(t.tagName));
+// A field typed into; a checkbox, switch or slider is not (FR-606).
+const notTyped = /^(checkbox|radio|range|button|submit|reset|color|file|image)$/;
+const inText = (t) => !!t && (t.isContentEditable || t.tagName === "TEXTAREA" ||
+  (t.tagName === "INPUT" && !notTyped.test(t.type)));
+const isRange = (t) => !!t && t.tagName === "INPUT" && t.type === "range";
+// Whether the focused field keeps an arrow for itself rather than let the
+// D-pad leave it (FR-606): a slider keeps left and right; a text field
+// keeps left and right until its caret is at that end, and a text area
+// keeps up and down too.
+const fieldKeeps = (t, key) => {
+  if (isRange(t)) return key === "ArrowLeft" || key === "ArrowRight";
+  if (!inText(t)) return false;
+  if (key === "ArrowUp" || key === "ArrowDown") return t.tagName === "TEXTAREA";
+  if (t.isContentEditable || t.selectionStart == null) return false;
+  const n = (t.value || "").length;
+  if (key === "ArrowLeft") return !(t.selectionStart === 0 && t.selectionEnd === 0);
+  if (key === "ArrowRight") return !(t.selectionStart === n && t.selectionEnd === n);
+  return false;
+};
+// A remote has no Space: OK toggles a checkbox or switch, as Space does.
+addEventListener("keydown", (e) => {
+  const t = e.target;
+  if (e.key !== "Enter" || e.repeat || !t || t.tagName !== "INPUT" || !/^(checkbox|radio)$/.test(t.type)) return;
+  e.preventDefault();
+  t.click();
+}, true);
 // Space too: the player's mode key toggles play, and the WebView would
 // click the focused button as well (it cannot wait for Rust's answer).
 const takes = new Set(["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", " "]);
@@ -1954,7 +1982,10 @@ addEventListener("keydown", (e) => {
   if (to) to.focus({ preventScroll: true });
 }, true);
 addEventListener("keydown", (e) => {
-  const text = inText(e.target);
+  // An arrow the focused field does not keep leaves it: it is no longer
+  // a key "in the field", so the D-pad moves on (FR-606).
+  const field = inText(e.target) || isRange(e.target);
+  const text = field && (!e.key.startsWith("Arrow") || fieldKeeps(e.target, e.key));
   const prevented = e.defaultPrevented;
   if (!text && !e.ctrlKey && !e.metaKey && !document.querySelector('.pharos-invite') && seekKeys.has(e.key) && e.target.closest && e.target.closest('#pharos-player')) lastSeekKey = performance.now();
   if (e.key === "Enter" && !e.repeat) okCommits = !!document.querySelector(".pharos-seek.is-scrubbing") || performance.now() - lastSeekKey < 900;
@@ -1969,6 +2000,7 @@ addEventListener("keydown", (e) => {
     t: "key", key: e.key, ctrl: e.ctrlKey, meta: e.metaKey, text, prevented,
     player: !!player, in_player: !!(player && at && player.contains(at)),
     on_button: !!(at && at.matches && at.matches("a[href], button")),
+    field,
   });
 });
 // The WebView takes the remote's Back only while it has a page to go back
@@ -2135,6 +2167,9 @@ fn on_bridge(message: Bridge) {
             at,
         } => {
             *lock(&KEY_AT) = at;
+            if at.field && !text && key.starts_with("Arrow") {
+                log::info!("pharos: keys: field left via={key} path={}", current_path());
+            }
             let mut taken = false;
             if let Some(skip) = tv_page::track_skip(&key) {
                 for f in &listeners {
