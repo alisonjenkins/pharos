@@ -814,7 +814,6 @@ impl<S: JobStore, A: Signals, Q: TranscodeQueue> Styler<S, A, Q> {
         ended.outcome
     }
 
-    /// The stages after `select`. `Err` carries how the item ended early.
     /// Asks the aligner where the item's sung lines are sung (B1212). A
     /// failure is logged and the lines are paced: the item is styled anyway.
     async fn sung(
@@ -854,6 +853,7 @@ impl<S: JobStore, A: Signals, Q: TranscodeQueue> Styler<S, A, Q> {
         }
     }
 
+    /// The stages after `select`. `Err` carries how the item ended early.
     async fn style(&self, task: &Task, report: &mut Report) -> Result<(), Ended> {
         let Some(source) = task.source.as_ref() else {
             self.put(task, Outcome::NoSource, NO_SOURCE_INDEX, None)
