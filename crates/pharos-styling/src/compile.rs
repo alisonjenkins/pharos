@@ -89,7 +89,7 @@ pub fn compile(
             events.push((i, ev));
         }
     }
-    let eases = if level == EffectsLevel::Off {
+    let eases = if level == EffectsLevel::Off || tier == Tier::Low {
         vec![Ease::default(); lines.len()]
     } else {
         eases(lines)
@@ -225,18 +225,19 @@ fn eases(lines: &[SourceLine]) -> Vec<Ease> {
         .filter(|&i| !lines[i].typeset && !lines[i].text.is_empty())
         .collect();
     order.sort_by_key(|&i| (lines[i].start_ms, lines[i].end_ms, i));
-    let alone: Vec<bool> = order
-        .iter()
-        .enumerate()
-        .map(|(k, &i)| {
-            let l = &lines[i];
-            let before = order[..k].iter().all(|&j| lines[j].end_ms <= l.start_ms);
-            let after = order
-                .get(k + 1)
-                .map_or(true, |&j| lines[j].start_ms >= l.end_ms);
-            before && after
-        })
-        .collect();
+    // Sorted by start, a line shares the screen with an earlier line when it
+    // starts before the latest end so far, and with a later one when the next
+    // line starts before it ends.
+    let mut alone = Vec::with_capacity(order.len());
+    let mut latest_end = i64::MIN;
+    for (k, &i) in order.iter().enumerate() {
+        let l = &lines[i];
+        let after = order
+            .get(k + 1)
+            .map_or(true, |&j| lines[j].start_ms >= l.end_ms);
+        alone.push(l.start_ms >= latest_end && after);
+        latest_end = latest_end.max(l.end_ms);
+    }
     for k in 1..order.len() {
         let (a, b) = (order[k - 1], order[k]);
         let gap = lines[b].start_ms - lines[a].end_ms;
