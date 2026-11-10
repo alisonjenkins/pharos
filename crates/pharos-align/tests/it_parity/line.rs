@@ -51,7 +51,7 @@ fn lines_match_model_py_end_to_end() {
         let got = align_line(&em, case.n_samples, &case.tokens, case.lead_star);
         match (&case.ms, &case.error) {
             (Some(want), _) => assert_eq!(
-                &got.unwrap(),
+                &got.unwrap().times,
                 want,
                 "{:?} lead_star={}",
                 case.tokens,
