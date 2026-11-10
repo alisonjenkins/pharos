@@ -260,3 +260,26 @@ async fn a_malformed_body_is_refused() {
     );
     assert_eq!(set_options(&fx, "tv", "").await, StatusCode::NO_CONTENT);
 }
+
+/// A list saved before AAC was refused still holds it. The device list drops
+/// it, so the admin page's next save (the whole list) is not refused for it.
+#[actix_web::test]
+async fn a_saved_aac_entry_is_ignored_and_does_not_block_the_next_save() {
+    use pharos_store_sqlx::ServerConfigStore as _;
+    let fx = setup().await;
+    fx.state
+        .stores
+        .set_named_config(
+            &pharos_server::services::playback::denied_audio_codecs_key("tv"),
+            r#"["aac","eac3"]"#,
+        )
+        .await
+        .unwrap();
+    let list = devices(&fx).await;
+    let shown = device(&list, "tv")["NoDirectPlayAudioCodecs"].clone();
+    assert_eq!(shown, serde_json::json!(["eac3"]));
+    let mut next: Vec<String> = serde_json::from_value(shown).unwrap();
+    next.push("ac3".into());
+    let body = serde_json::json!({ "NoDirectPlayAudioCodecs": next }).to_string();
+    assert_eq!(set_options(&fx, "tv", &body).await, StatusCode::NO_CONTENT);
+}
