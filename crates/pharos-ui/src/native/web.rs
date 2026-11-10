@@ -18,7 +18,7 @@ use wasm_bindgen::{JsCast as _, JsValue};
 
 use super::machine::{Probe, SignInReply, SignOutReply};
 use super::playback::{
-    cue_chars_per_line, cue_font_px, cue_width_share, is_loading, lifted_line, Engine, Fatal,
+    cue_chars_per_line, cue_font_px, cue_width_share, is_loading, lifted_line, Engine, FailureKind, Fatal,
     FragmentLoad, LibraryTransition, MediaState, OnFatal, OnFragment, OverlayEffect,
     PlaybackEngine, Recovery, RecoveryBudget, SubtitleSize,
 };
@@ -2981,10 +2981,11 @@ impl PlaybackEngine for NativeVideo {
                 let reason =
                     format!("the browser could not play this stream (code {code}) {message}");
                 // MEDIA_ERR_DECODE: the bytes arrived and would not decode.
-                on_fatal(if code == 3 {
-                    Fatal::media(reason)
-                } else {
-                    Fatal::other(reason)
+                // MEDIA_ERR_SRC_NOT_SUPPORTED: this browser cannot play it.
+                on_fatal(match code {
+                    3 => Fatal::media(reason),
+                    4 => Fatal::of(FailureKind::Unplayable, reason),
+                    _ => Fatal::other(reason),
                 });
             })
         };

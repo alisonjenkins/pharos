@@ -27,44 +27,93 @@ pub trait PlaybackEngine {
 /// Told why playback stopped for good.
 pub type OnFatal = std::rc::Rc<dyn Fn(Fatal)>;
 
-/// Why playback stopped for good, and whether the media itself broke.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Fatal {
-    pub reason: String,
-    /// The browser could not decode or append what it was given: the file
-    /// is likely damaged there, so skipping ahead may get past it (B1160).
-    /// A network failure, or a failure to start an engine, is not.
-    pub media: bool,
+/// What kind of failure stopped a video, which decides the hint its panel
+/// gives (038 FR-403, V1219). Each names who can fix it: the connection, the
+/// server, the browser or device, or the file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureKind {
+    /// The connection: a fetch that failed or timed out, a socket that went.
+    Network,
+    /// The server answered and refused, or failed: an `Error`, an HTTP 4xx/5xx.
+    Server,
+    /// This browser or device cannot play what it was sent: a codec it lacks,
+    /// an engine that will not attach.
+    Unplayable,
+    /// The bytes arrived and would not decode: the file is likely damaged.
+    Damaged,
 }
 
-impl Fatal {
-    /// The media could not be decoded.
-    pub fn media(reason: impl Into<String>) -> Self {
-        Self {
-            reason: reason.into(),
-            media: true,
+impl FailureKind {
+    /// Stable label for log lines and the panel's `data-kind`.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Network => "network",
+            Self::Server => "server",
+            Self::Unplayable => "unplayable",
+            Self::Damaged => "damaged",
         }
     }
 
-    /// Anything else: the network, the server, the engine.
+    /// An HTTP status that ended a fetch: the server's (4xx, 5xx), else the
+    /// network's.
+    pub fn of_status(status: u16) -> Self {
+        if (400..600).contains(&status) {
+            Self::Server
+        } else {
+            Self::Network
+        }
+    }
+}
+
+/// Why playback stopped for good, and what kind of failure it was.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fatal {
+    pub reason: String,
+    pub kind: FailureKind,
+}
+
+impl Fatal {
+    /// The media could not be decoded: the file is likely damaged there,
+    /// so skipping ahead may get past it (B1160).
+    pub fn media(reason: impl Into<String>) -> Self {
+        Self::of(FailureKind::Damaged, reason)
+    }
+
+    /// The network, or anything not known to be otherwise.
     pub fn other(reason: impl Into<String>) -> Self {
+        Self::of(FailureKind::Network, reason)
+    }
+
+    pub fn of(kind: FailureKind, reason: impl Into<String>) -> Self {
         Self {
             reason: reason.into(),
-            media: false,
+            kind,
         }
+    }
+
+    /// Whether the media itself broke.
+    pub fn is_media(&self) -> bool {
+        self.kind == FailureKind::Damaged
     }
 
     /// hls.js reports media it could not parse or append as a `mediaError`
     /// with these details; a stall, a full buffer or a codec the browser
-    /// lacks is a `mediaError` too, but not damage.
+    /// lacks is a `mediaError` too, but not damage. A codec the browser
+    /// lacks is this browser's limit.
     pub fn from_hls(kind: &str, details: &str) -> Self {
         let reason = format!("the stream failed ({kind}: {details})");
         let damage = matches!(
             details,
             "bufferAppendError" | "bufferAppendingError" | "fragParsingError"
         );
+        let unplayable = matches!(
+            details,
+            "manifestIncompatibleCodecsError" | "bufferIncompatibleCodecsError"
+        );
         if kind == "mediaError" && damage {
             Self::media(reason)
+        } else if unplayable {
+            Self::of(FailureKind::Unplayable, reason)
         } else {
             Self::other(reason)
         }
@@ -2863,11 +2912,29 @@ mod tests {
     /// damage; a stall or a missing codec does not, nor does the network.
     #[test]
     fn only_unparseable_hls_media_counts_as_damage() {
-        assert!(Fatal::from_hls("mediaError", "bufferAppendError").media);
-        assert!(Fatal::from_hls("mediaError", "fragParsingError").media);
-        assert!(!Fatal::from_hls("mediaError", "bufferStalledError").media);
-        assert!(!Fatal::from_hls("mediaError", "manifestIncompatibleCodecsError").media);
-        assert!(!Fatal::from_hls("networkError", "fragLoadError").media);
+        assert!(Fatal::from_hls("mediaError", "bufferAppendError").is_media());
+        assert!(Fatal::from_hls("mediaError", "fragParsingError").is_media());
+        assert!(!Fatal::from_hls("mediaError", "bufferStalledError").is_media());
+        assert!(!Fatal::from_hls("mediaError", "manifestIncompatibleCodecsError").is_media());
+        assert!(!Fatal::from_hls("networkError", "fragLoadError").is_media());
+    }
+
+    /// 038 FR-403: a codec the browser lacks is the browser's limit, a
+    /// fetch the server refused is the server's, and the rest the network's.
+    #[test]
+    fn a_failure_names_who_can_fix_it() {
+        let kind = |k, d| Fatal::from_hls(k, d).kind;
+        assert_eq!(kind("mediaError", "manifestIncompatibleCodecsError"), FailureKind::Unplayable);
+        assert_eq!(kind("mediaError", "bufferIncompatibleCodecsError"), FailureKind::Unplayable);
+        assert_eq!(kind("networkError", "fragLoadError"), FailureKind::Network);
+        assert_eq!(kind("mediaError", "fragParsingError"), FailureKind::Damaged);
+        assert_eq!(FailureKind::of_status(404), FailureKind::Server);
+        assert_eq!(FailureKind::of_status(503), FailureKind::Server);
+        assert_eq!(FailureKind::of_status(0), FailureKind::Network);
+        let labels = [FailureKind::Network, FailureKind::Server, FailureKind::Unplayable, FailureKind::Damaged]
+            .map(FailureKind::label);
+        let distinct: std::collections::HashSet<_> = labels.iter().collect();
+        assert_eq!(distinct.len(), labels.len());
     }
 
     /// B600: a styled renderer that fails says so with its reason, in the
