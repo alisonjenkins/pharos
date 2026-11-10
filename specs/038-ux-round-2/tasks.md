@@ -18,6 +18,7 @@ Id blocks (bugs and invariants are written with the fix):
 
 ## G1 — Home rails and resume rules (server)
 
+- [ ] T038-100 Reproduce on a seeded library: an unstarted show in Next Up, a started one missing, one new season filling a latest rail, a 5 s play in Continue Watching. Record which existing signal shows each, if any.
 - [ ] T038-101 Add `pharos_next_up_total{outcome}` and `pharos_play_stop_total{outcome,reason}`; assert both in tests and watch them fail when disarmed.
 - [ ] T038-102 Tests pinning the Next Up rule: started series only, episode after the last played, season 0 rule, order by last play, nothing repeated from Continue Watching (FR-101–FR-104).
 - [ ] T038-103 Next Up driven from the viewer's `user_data` rows (FR-105); run `just test-postgres`.
@@ -29,6 +30,7 @@ Id blocks (bugs and invariants are written with the fix):
 
 ## G2 — Show page and browse
 
+- [ ] T038-200 Reproduce each G2 problem in a browser (desktop and 390px) and keep the screenshots as the before state.
 - [ ] T038-201 Show page opens on the season being watched; hero Play is the show's next-up (FR-201).
 - [ ] T038-202 [P] Reproduce the phone episode row at 390px, then stack it (FR-202).
 - [ ] T038-203 [P] Music library letter rail and album sort (FR-203); tab in the URL (FR-204).
@@ -41,6 +43,7 @@ Id blocks (bugs and invariants are written with the fix):
 
 ## G3 — Player controls by touch and pointer
 
+- [ ] T038-300 Reproduce on a touch device profile at 390x844: seek bar ignores touch, control row height, target sizes. Keep the before screenshots.
 - [ ] T038-301 Seek bar: drag, touch, buffered range, focus (FR-301), with a group test for one command per scrub.
 - [ ] T038-302 Narrow-screen control bar and settings sheet (FR-302); screenshots at 390x844 for Alison before merge.
 - [ ] T038-303 [P] 44px targets and double-tap zones (FR-303); wheel rule (FR-304).
@@ -50,6 +53,7 @@ Id blocks (bugs and invariants are written with the fix):
 
 ## G4 — Player feedback
 
+- [ ] T038-400 Reproduce: a denial with no trace id, one caption for every wait (include a saturated encoder), Up Next over the ending without detected credits. Name the query that shows each.
 - [ ] T038-401 Trace id on every denial, shown in error panels (FR-404); verify by query.
 - [ ] T038-402 Server load hint for a queued play or seek (FR-402).
 - [ ] T038-403 Wait caption by cause (FR-401), using T038-402.
@@ -76,6 +80,7 @@ Id blocks (bugs and invariants are written with the fix):
 
 ## G7 — Admin and settings
 
+- [ ] T038-700 Reproduce: a scan with no progress in the UI while the Task topic is published; check whether a scan outcome metric already exists.
 - [ ] T038-701 Scan progress, result and per-library scan from the Task topic (FR-701).
 - [ ] T038-702 Preferred audio and subtitle language (FR-702).
 - [ ] T038-703 [P] Sign-out and Remove confirms for kept books (FR-703); coordinate with the ebook work.
