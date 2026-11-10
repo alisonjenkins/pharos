@@ -15,6 +15,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
+use tracing::Instrument as _;
 
 use super::{Lyrics, WordStamp};
 
@@ -263,7 +264,10 @@ impl Aligner {
         let worker = Arc::clone(&aligner);
         tokio::spawn(async move {
             while let Some(job) = rx.recv().await {
-                if let Err(e) = worker.process_job(&job).await {
+                // The aligner joins this span's trace through `traceparent`.
+                let span =
+                    tracing::info_span!("lyrics.align", media.id = job.id, lines = job.lines.len());
+                if let Err(e) = worker.process_job(&job).instrument(span).await {
                     tracing::warn!(media.id = job.id, error = %e, "lyrics: alignment failed");
                     let retry = std::time::Instant::now() + RETRY_AFTER;
                     match worker.failed.lock() {
@@ -315,13 +319,11 @@ impl Aligner {
         };
 
         let url = format!("{}/align", self.base);
-        let resp = self
-            .http
-            .post(&url)
-            .json(&payload)
-            .send()
-            .await
-            .map_err(|e| format!("request: {e}"))?;
+        let mut request = self.http.post(&url).json(&payload);
+        if let Some(traceparent) = crate::obs::traceparent(&tracing::Span::current()) {
+            request = request.header("traceparent", traceparent);
+        }
+        let resp = request.send().await.map_err(|e| format!("request: {e}"))?;
 
         let status = resp.status();
         if !status.is_success() {
