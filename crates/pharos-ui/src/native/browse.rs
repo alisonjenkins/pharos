@@ -375,6 +375,42 @@ pub struct Show {
     /// from its detail when `episodes` is only part of it: a page cannot say
     /// whether a longer season is all watched.
     pub season_played: Option<bool>,
+    /// Why the page opened on `selected`: its `data-season-pick`, read by
+    /// SSR and browser tests and by a look at the live page.
+    pub pick: SeasonPick,
+}
+
+/// The verdict of choosing the season a series page opens on, with its
+/// reason. [`SeasonPick::label`] is the page's `data-season-pick` value, so
+/// the labels are a contract: stable, few, and distinct.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeasonPick {
+    /// A season's own route: the viewer asked for it.
+    Asked,
+    /// The first season numbered above 0.
+    FirstRegular,
+    /// No season is numbered above 0, so the first.
+    First,
+    /// The series has no seasons; its episodes are listed directly.
+    NoSeasons,
+}
+
+impl SeasonPick {
+    pub const ALL: [Self; 4] = [
+        Self::Asked,
+        Self::FirstRegular,
+        Self::First,
+        Self::NoSeasons,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Asked => "asked",
+            Self::FirstRegular => "first-regular",
+            Self::First => "first",
+            Self::NoSeasons => "no-seasons",
+        }
+    }
 }
 
 /// How a parent's children are fetched and laid out, decided from its
@@ -437,12 +473,14 @@ pub fn mixed_first(series: &Page, stored: Page) -> Page {
 
 /// The season a series page opens on: the first numbered above 0, so
 /// specials (season 0) do not hide the show's start; else the first.
-pub fn default_season(seasons: &[Item]) -> Option<ItemRef> {
-    seasons
-        .iter()
-        .find(|s| s.episode.is_some_and(|n| n > 0))
-        .or(seasons.first())
-        .map(|s| s.id)
+pub fn default_season(seasons: &[Item]) -> (Option<ItemRef>, SeasonPick) {
+    if let Some(s) = seasons.iter().find(|s| s.episode.is_some_and(|n| n > 0)) {
+        return (Some(s.id), SeasonPick::FirstRegular);
+    }
+    match seasons.first() {
+        Some(s) => (Some(s.id), SeasonPick::First),
+        None => (None, SeasonPick::NoSeasons),
+    }
 }
 
 /// Fetches `limit` items of `source` from `start`. Every failure is
@@ -558,7 +596,7 @@ pub async fn load<A: PharosApi>(
         }
         (Plan::Series, series) => {
             let seasons = list(id, Some(ItemKind::Season), "").await?.items;
-            let selected = default_season(&seasons);
+            let (selected, pick) = default_season(&seasons);
             let episodes = match selected {
                 Some(season) => list(season, None, INDEX_ORDER).await?,
                 None => list(id, None, INDEX_ORDER).await?,
@@ -582,6 +620,7 @@ pub async fn load<A: PharosApi>(
                 selected,
                 episodes,
                 season_played,
+                pick,
             })
         }
         (
@@ -623,6 +662,7 @@ pub async fn load<A: PharosApi>(
                 selected: Some(id),
                 episodes: episodes?,
                 season_played,
+                pick: SeasonPick::Asked,
             })
         }
         (Plan::Artist, Some(detail)) => Browse::Artist {
@@ -1668,7 +1708,7 @@ pub fn ShowView(show: Show, #[props(default)] seen: Vec<MemberSeen>) -> Element 
     .collect();
     let marked_season = show.selected.filter(|_| !show.episodes.items.is_empty());
     rsx! {
-        section { class: "pharos-show",
+        section { class: "pharos-show", "data-season-pick": show.pick.label(),
             Hero {
                 title: show.title.clone(),
                 detail: show.series.clone(),
@@ -2986,6 +3026,39 @@ mod tests {
             .contains(&(S1, None, INDEX_ORDER.to_owned())));
     }
 
+    /// T038-200 (FR-201 before): a viewer who has watched all of season 1
+    /// still lands on season 1, and the page says why.
+    #[test]
+    fn a_series_page_says_why_it_opened_on_its_season() {
+        let mut fake = show_fake();
+        let mut pilot = item(ItemRef::Real(1), ItemKind::Episode, "Pilot");
+        pilot.played = true;
+        fake.lists.insert((S1, None), vec![pilot]);
+        let Browse::Show(show) = run(load(&fake, &CallInfo::default(), SERIES, |_| {})).unwrap()
+        else {
+            panic!("not a show page");
+        };
+        assert_eq!(show.selected, Some(S1));
+        assert_eq!(show.pick, SeasonPick::FirstRegular);
+        let html = render(move || rsx! { ShowView { show: show.clone() } });
+        assert!(
+            html.contains("data-season-pick=\"first-regular\""),
+            "{html}"
+        );
+
+        let Browse::Show(asked) = run(load(&fake, &CallInfo::default(), S2, |_| {})).unwrap()
+        else {
+            panic!("not a show page");
+        };
+        assert_eq!(asked.pick, SeasonPick::Asked);
+    }
+
+    #[test]
+    fn season_pick_labels_are_distinct() {
+        let labels: HashSet<&str> = SeasonPick::ALL.iter().map(|p| p.label()).collect();
+        assert_eq!(labels.len(), SeasonPick::ALL.len());
+    }
+
     #[test]
     fn a_season_opens_its_series_page_with_that_season_shown() {
         let fake = show_fake();
@@ -3229,6 +3302,7 @@ mod tests {
             selected: Some(S2),
             episodes: page(Vec::new()),
             season_played: None,
+            pick: SeasonPick::Asked,
         });
         assert_eq!(show.name(S2), "Season 2 · Show");
         assert_eq!(show.name(SERIES), "Show");
@@ -3250,6 +3324,7 @@ mod tests {
             selected: Some(S2),
             episodes: page(vec![ep]),
             season_played: None,
+            pick: SeasonPick::Asked,
         };
         let html = render(move || rsx! { ShowView { show: show.clone() } });
         assert!(
@@ -3278,6 +3353,7 @@ mod tests {
             selected: Some(S1),
             episodes: page(episodes),
             season_played: None,
+            pick: SeasonPick::Asked,
         };
 
         let part = show(vec![pilot.clone(), second.clone()]);
@@ -3412,6 +3488,7 @@ mod tests {
             selected: Some(S1),
             episodes: page(vec![one, two]),
             season_played: None,
+            pick: SeasonPick::Asked,
         }
     }
 
