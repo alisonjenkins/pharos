@@ -353,6 +353,7 @@ async fn open_pdf(
     page: Signal<Option<(usize, usize)>>,
     alive: Rc<Cell<bool>>,
     bytes: &js_sys::Uint8Array,
+    on_broken: Box<dyn Fn(String)>,
 ) -> Result<Opened, String> {
     let host = web_sys::window()
         .and_then(|w| w.document())
@@ -362,7 +363,7 @@ async fn open_pdf(
     // The count is only known once the file is open, so a saved page is held
     // inside the book by the view.
     let wanted = saved.map_or(0, |text| pdf_saved_index(text, usize::MAX));
-    let view = PdfView::open(host, bytes, wanted, settings.pdf_fit, id).await?;
+    let view = PdfView::open(host, bytes, wanted, settings.pdf_fit, id, on_broken).await?;
     let core = Rc::new(Core {
         engine: Engine::Pdf(view),
         saver: Saver {
@@ -522,6 +523,20 @@ pub fn ReaderScreen(id: ItemRef) -> Element {
                         page,
                         alive.clone(),
                         &bytes,
+                        // The module trapped: say so, with the download, and
+                        // let the next open start a fresh module.
+                        Box::new({
+                            let alive = alive.clone();
+                            move |message| {
+                                if alive.get() {
+                                    platform::warn(&format!(
+                                        "pharos: reader failed item={id} error={message}"
+                                    ));
+                                    let mut phase = phase;
+                                    phase.set(Phase::Failed(message));
+                                }
+                            }
+                        }),
                     )
                     .await;
                     match opened {
