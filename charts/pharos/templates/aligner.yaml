@@ -22,6 +22,12 @@ metadata:
     app.kubernetes.io/component: {{ .component }}
 spec:
   replicas: 1
+  {{- if or $cfg.gpu.enabled $cfg.cache.enabled }}
+  # The running pod holds the render node and the ReadWriteOnce cache claim;
+  # a surge pod could wait on either, so the old pod stops first.
+  strategy:
+    type: Recreate
+  {{- end }}
   selector:
     matchLabels:
       {{- $selector | nindent 6 }}
