@@ -2713,8 +2713,7 @@ mod tests {
         assert!(!render(c).contains("pharos-seek-damage-name"));
     }
 
-    /// B569/V482: the knob rides the end of the fill, and a tick the video
-    /// has passed is marked so it dims.
+    /// T038-305: the speed menu.
     #[test]
     fn the_speed_menu_offers_the_speeds_and_is_off_in_a_group() {
         let mut c = controls();
@@ -2810,6 +2809,8 @@ mod tests {
         assert!(sheet.contains(".pharos-control-menus.is-open {"));
     }
 
+    /// B569/V482: the knob rides the end of the fill, and a tick the video
+    /// has passed is marked so it dims.
     #[test]
     fn the_seek_bar_marks_passed_chapters_and_the_play_head() {
         let mut c = controls();
@@ -2880,9 +2881,7 @@ mod tests {
         assert!(phone.contains("top: calc("), "{phone}");
     }
 
-    /// B805: the idle fade hides the top strip and the control bar but not
-    /// the skip button, in the plain rule and in every `data-overlay-fx`
-    /// variant, or a viewer who is just watching never sees it.
+    /// T038-301, V1208.
     #[test]
     fn a_drag_on_the_seek_bar_seeks_once_when_it_lets_go() {
         let mut open = None;
@@ -2902,6 +2901,9 @@ mod tests {
         assert_eq!(drag_end(None, scrub::End::Released), None);
     }
 
+    /// B805: the idle fade hides the top strip and the control bar but not
+    /// the skip button, in the plain rule and in every `data-overlay-fx`
+    /// variant, or a viewer who is just watching never sees it.
     #[test]
     fn idle_never_hides_the_skip_button() {
         let sheet = include_str!("../../assets/pharos.css");
