@@ -7690,11 +7690,11 @@ mod tests {
         <uniqueid type=\"tmdb\">900001</uniqueid>\
         <uniqueid type=\"imdb\">tt900001</uniqueid></tvshow>";
 
-    /// B993 — the show's `tvshow.nfo` names the show's old TMDB id; a rebuild
-    /// onto a TVDB show must not copy it onto the episode as if the new
-    /// match's record had it. Counted once, imdb kept.
+    /// B993, B995 — the show's `tvshow.nfo` names the show's old TMDB id; a
+    /// rebuild onto a TVDB show leaves it off the episode (the scanner no
+    /// longer folds it), so there is nothing for the rebuild to drop.
     #[tokio::test(flavor = "current_thread")]
-    async fn a_rebuild_onto_another_provider_drops_the_show_nfo_id_of_the_old_one() {
+    async fn a_rebuild_onto_another_provider_gives_the_episode_no_show_nfo_id() {
         let stored = ProviderIds {
             tmdb: Some("900001".into()),
             ..ProviderIds::default()
@@ -7703,11 +7703,8 @@ mod tests {
 
         assert_eq!(got.metadata.provider_ids.tvdb.as_deref(), Some("900002"));
         assert_eq!(got.metadata.provider_ids.tmdb, None);
-        assert_eq!(got.metadata.provider_ids.imdb.as_deref(), Some("tt900001"));
-        assert_eq!(
-            cleared, 1,
-            "counted in pharos_series_reconcile_ids_cleared_total"
-        );
+        assert_eq!(got.metadata.provider_ids.imdb, None);
+        assert_eq!(cleared, 0);
     }
 
     /// B993 — an id the episode's own NFO gives is curated: it stays.

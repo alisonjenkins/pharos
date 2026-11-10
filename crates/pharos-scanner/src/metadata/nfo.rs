@@ -239,12 +239,18 @@ fn is_show_nfo(req: &MetadataRequest<'_>, candidate: &Path) -> bool {
 
 /// A `tvshow.nfo` describes the show, so its title, plot, tagline and
 /// premiere are not the episode's: an episode without its own NFO would
-/// otherwise be titled with the show's name.
+/// otherwise be titled with the show's name. Its ids are the show's too (the
+/// series reads them through [`show_nfo_evidence`]); an episode that carried
+/// them would look matched at whichever provider the show once was.
 fn drop_episode_fields(show: &mut MetadataResult) {
     show.title = None;
     show.overview = None;
     show.tagline = None;
     show.premiere_date = None;
+    if show.provider_ids != ProviderIds::default() {
+        tracing::debug!("tvshow.nfo ids are the show's, not folded onto its episodes");
+    }
+    show.provider_ids = ProviderIds::default();
 }
 
 /// Fold `under` beneath `acc`: `acc` (more-specific source) keeps its set
