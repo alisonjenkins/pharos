@@ -79,7 +79,7 @@ This is a port of the `cpufwd` spike with its measured choices kept.
     | line_format "{{.fields_outcome}} {{.fields_field}} {{.fields_primary}} {{.fields_shadow}}"
   ```
 
-  The log is the record: `increase()` extrapolates, so PromQL counts are not whole numbers. The dashboard view of the same run is
+  The log is the gate's record. The PromQL below is only an approximation for a dashboard: a 7-day window cannot show 50 matches in a row or start the count again after a mismatch, and `increase()` extrapolates, so its counts are not whole numbers. It is
 
   ```promql
   sum by (outcome) (increase(pharos_lyrics_shadow_total[7d]))
@@ -87,7 +87,7 @@ This is a port of the `cpufwd` spike with its measured choices kept.
     / sum(increase(pharos_lyrics_shadow_total{outcome!="skipped_busy"}[7d]))
   ```
 
-  with any rise of `outcome="mismatch"` meaning the run starts again.
+  where any rise of `outcome="mismatch"` means the run has started again; read the LogQL to see where.
 
 ## Testing
 
