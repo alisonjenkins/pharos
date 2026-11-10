@@ -17,7 +17,9 @@ use crate::text::words;
 /// minimum, so an aligner deployed after the server cannot pin old times.
 /// 2: a line's window opens `LEAD_MS` before its stamp (B1165).
 /// 3: the Rust service (spec 039).
-pub const ALIGNER_VERSION: u32 = 3;
+/// 5: each line carries its `score`. Python's aligner went to 4 with the
+///    same field, so the shadow comparison can tell the two apart.
+pub const ALIGNER_VERSION: u32 = 5;
 
 /// Why the model gave a window no spans.
 #[derive(Debug, thiserror::Error)]
