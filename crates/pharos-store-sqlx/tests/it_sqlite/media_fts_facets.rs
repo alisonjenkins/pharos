@@ -77,7 +77,7 @@ async fn fts_finds_prefix_tokens() {
     s.put(item(1, "Pokemon Detective", None, MediaKind::Movie))
         .await
         .unwrap();
-    s.put(item(2, "The Matrix", None, MediaKind::Movie))
+    s.put(item(2, "The Glass Lattice", None, MediaKind::Movie))
         .await
         .unwrap();
 
@@ -94,7 +94,7 @@ async fn fts_finds_prefix_tokens() {
     // Multi-token AND: both prefixes must match.
     let (hits3, _) = s.search(&sq("pok det")).await.unwrap();
     assert_eq!(hits3.iter().map(|i| i.id).collect::<Vec<_>>(), vec![1]);
-    let (hits4, _) = s.search(&sq("pok matrix")).await.unwrap();
+    let (hits4, _) = s.search(&sq("pok lattice")).await.unwrap();
     assert!(hits4.is_empty(), "AND of disjoint tokens matches nothing");
 }
 

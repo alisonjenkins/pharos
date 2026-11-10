@@ -285,7 +285,7 @@ mod tests {
     fn owner_round_trips_through_its_columns() {
         for owner in [
             TranslationOwner::Item(42),
-            TranslationOwner::Series("TV/Dragon Ball".into()),
+            TranslationOwner::Series("TV/Silver Rock".into()),
         ] {
             let (kind, key) = owner_parts(&owner);
             assert_eq!(owner_from(kind, key), Some(owner));

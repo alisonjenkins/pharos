@@ -2041,7 +2041,7 @@ where
     let show_key = "/media/conformance/Conformance Show (2001)".to_string();
     let mut film = media_item(9501, "Rated Film");
     film.metadata.production_year = Some(1999);
-    film.metadata.provider_ids.imdb = Some("tt0133093".into());
+    film.metadata.provider_ids.imdb = Some("tt9300001".into());
     MediaStore::put(&store, film.clone()).await.unwrap();
     let due = RatingsStore::needing_ratings(&store, 1000, 500)
         .await
@@ -2060,7 +2060,7 @@ where
             .all(|d| matches!(d.target, RatingsTarget::Series(_))),
         "shows come before films"
     );
-    assert_eq!(film_due.imdb_id.as_deref(), Some("tt0133093"));
+    assert_eq!(film_due.imdb_id.as_deref(), Some("tt9300001"));
     assert_eq!(film_due.title, "Rated Film");
     assert_eq!(film_due.year, Some(1999));
     let show_due = &due[show_at];
@@ -2189,7 +2189,7 @@ where
 
     let eng = LocalizedText {
         language: "eng".into(),
-        title: Some("Dragon Ball".into()),
+        title: Some("Silver Rock".into()),
         overview: Some("Goku sets out.".into()),
         is_original: false,
     };

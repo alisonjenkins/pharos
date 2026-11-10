@@ -136,7 +136,7 @@ pub(crate) fn build(
 
     // --- search term (B624/V558) ---
     // Every word of the term must be a substring of the title, the SERIES
-    // name (so searching a show name like "Code Geass" finds its episodes),
+    // name (so searching a show name like "Show U" finds its episodes),
     // the artist or the album, any word in any column, in any order: "go
     // moby" finds the tracks of "Go: The Very Best of Moby". Matched against
     // the Rust-folded `title_fold` (full Unicode lowercase), falling back to
