@@ -3754,15 +3754,10 @@ impl super::visualiser::AudioTap for WebAudioTap {
     }
 }
 
-impl Drop for WebAudioTap {
-    fn drop(&mut self) {
-        TAPS.with(|taps| taps.borrow_mut().retain(|t| t.context != self.context));
-        let _ = self.context.close();
-    }
-}
-
-/// A live tap's nodes, so a resume (B563) can read them without the
-/// visualiser that owns the tap.
+/// A routed element's nodes, kept for the element's life: an element is
+/// routed once (a second `MediaElementSourceNode` throws), and closing its
+/// context would silence it, so a dropped tap leaves them for the next one
+/// (B1037, V997). A resume (B563) reads them too.
 struct TapNodes {
     media: web_sys::HtmlMediaElement,
     context: web_sys::AudioContext,
@@ -3889,8 +3884,8 @@ pub fn tap_peak(id: &str) -> Option<f32> {
     .flatten()
 }
 
-/// Route the media element `media_id` through an analyser. A media element
-/// can be routed once, so the caller keeps the tap for the element's life.
+/// Route the media element `media_id` through an analyser, or hand out the
+/// routing it already has: an element is routed once (B1037, V997).
 ///
 /// A cross-origin source without CORS would play silence once routed, so
 /// only same-origin and MSE (`blob:`) sources are tapped.
@@ -3919,6 +3914,20 @@ pub fn audio_tap(media_id: &str) -> Result<Box<dyn super::visualiser::AudioTap>,
     {
         return Err(format!("native HLS source {path}"));
     }
+    release_detached_taps();
+    if let Some((context, analyser)) = with_tap(&media, |t| (t.context.clone(), t.analyser.clone()))
+    {
+        let state = context_state(&context);
+        info(&format!(
+            "pharos: audio tap outcome=reused path={path} context_state={state}"
+        ));
+        let _ = context.resume();
+        return Ok(Box::new(WebAudioTap {
+            context,
+            analyser,
+            media,
+        }));
+    }
     let js = |e: JsValue| format!("{e:?}");
     let context = web_sys::AudioContext::new().map_err(js)?;
     let source = context.create_media_element_source(&media).map_err(js)?;
@@ -3930,6 +3939,7 @@ pub fn audio_tap(media_id: &str) -> Result<Box<dyn super::visualiser::AudioTap>,
         .connect_with_audio_node(&context.destination())
         .map_err(js)?;
     let _ = context.resume();
+    info(&format!("pharos: audio tap outcome=routed path={path}"));
     TAPS.with(|taps| {
         taps.borrow_mut().push(TapNodes {
             media: media.clone(),
@@ -3942,6 +3952,21 @@ pub fn audio_tap(media_id: &str) -> Result<Box<dyn super::visualiser::AudioTap>,
         analyser,
         media,
     }))
+}
+
+/// Close the routing of elements gone from the page and paused: nothing
+/// can play them again, and each holds an `AudioContext`.
+fn release_detached_taps() {
+    TAPS.with(|taps| {
+        taps.borrow_mut().retain(|t| {
+            let spent = !t.media.is_connected() && t.media.paused();
+            if spent {
+                let _ = t.context.close();
+                info("pharos: audio tap outcome=released reason=detached");
+            }
+            !spent
+        })
+    });
 }
 
 /// Whether the media element `id` has a source and is playing.
