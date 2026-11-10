@@ -25,7 +25,51 @@ pub trait PlaybackEngine {
 }
 
 /// Told why playback stopped for good.
-pub type OnFatal = std::rc::Rc<dyn Fn(String)>;
+pub type OnFatal = std::rc::Rc<dyn Fn(Fatal)>;
+
+/// Why playback stopped for good, and whether the media itself broke.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fatal {
+    pub reason: String,
+    /// The browser could not decode or append what it was given: the file
+    /// is likely damaged there, so skipping ahead may get past it (B1160).
+    /// A network failure, or a failure to start an engine, is not.
+    pub media: bool,
+}
+
+impl Fatal {
+    /// The media could not be decoded.
+    pub fn media(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+            media: true,
+        }
+    }
+
+    /// Anything else: the network, the server, the engine.
+    pub fn other(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+            media: false,
+        }
+    }
+
+    /// hls.js reports media it could not parse or append as a `mediaError`
+    /// with these details; a stall, a full buffer or a codec the browser
+    /// lacks is a `mediaError` too, but not damage.
+    pub fn from_hls(kind: &str, details: &str) -> Self {
+        let reason = format!("the stream failed ({kind}: {details})");
+        let damage = matches!(
+            details,
+            "bufferAppendError" | "bufferAppendingError" | "fragParsingError"
+        );
+        if kind == "mediaError" && damage {
+            Self::media(reason)
+        } else {
+            Self::other(reason)
+        }
+    }
+}
 
 /// One video fragment the engine downloaded, for measuring the connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2814,6 +2858,17 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
+
+    /// B1160: only hls.js media it could not parse or append counts as
+    /// damage; a stall or a missing codec does not, nor does the network.
+    #[test]
+    fn only_unparseable_hls_media_counts_as_damage() {
+        assert!(Fatal::from_hls("mediaError", "bufferAppendError").media);
+        assert!(Fatal::from_hls("mediaError", "fragParsingError").media);
+        assert!(!Fatal::from_hls("mediaError", "bufferStalledError").media);
+        assert!(!Fatal::from_hls("mediaError", "manifestIncompatibleCodecsError").media);
+        assert!(!Fatal::from_hls("networkError", "fragLoadError").media);
+    }
 
     /// B600: a styled renderer that fails says so with its reason, in the
     /// same shape as one that gets ready.
