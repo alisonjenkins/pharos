@@ -96,17 +96,24 @@ pub fn toggled_codecs(current: &[String], codec: &str) -> Vec<String> {
     next
 }
 
-/// `devices` with each list this page saved since the last load put in place
-/// of the loaded one, so a toggle made before the reload lands builds on it.
+/// `devices` with each list this page saved after the load began put in
+/// place of the loaded one, so a toggle made before the reload lands builds
+/// on it. `saved` maps a device to its last save's sequence number and list;
+/// `loaded_at` is the sequence number when the load began. A load that began
+/// after a save already holds it (and anything changed elsewhere since), so
+/// that save no longer applies.
 pub fn with_saved_audio_deny(
     devices: Vec<DeviceEntry>,
-    saved: &std::collections::HashMap<String, Vec<String>>,
+    saved: &std::collections::HashMap<String, (u64, Vec<String>)>,
+    loaded_at: u64,
 ) -> Vec<DeviceEntry> {
     devices
         .into_iter()
         .map(|mut d| {
-            if let Some(list) = saved.get(&d.id) {
-                d.no_direct_play_audio_codecs = list.clone();
+            if let Some((seq, list)) = saved.get(&d.id) {
+                if *seq > loaded_at {
+                    d.no_direct_play_audio_codecs = list.clone();
+                }
             }
             d
         })
@@ -2128,8 +2135,9 @@ mod tests {
                 ..Default::default()
             },
         ];
-        let saved = std::collections::HashMap::from([("tv".to_string(), vec!["eac3".to_string()])]);
-        let merged = with_saved_audio_deny(loaded, &saved);
+        let saved =
+            std::collections::HashMap::from([("tv".to_string(), (1, vec!["eac3".to_string()]))]);
+        let merged = with_saved_audio_deny(loaded.clone(), &saved, 0);
         assert_eq!(
             merged[0].no_direct_play_audio_codecs,
             vec!["eac3".to_string()]
@@ -2143,6 +2151,10 @@ mod tests {
             toggled_codecs(&merged[0].no_direct_play_audio_codecs, "ac3"),
             vec!["ac3".to_string(), "eac3".to_string()]
         );
+        // A load that began after the save already holds it, and anything
+        // changed elsewhere since: what it says stands.
+        let fresh = with_saved_audio_deny(loaded, &saved, 1);
+        assert!(fresh[0].no_direct_play_audio_codecs.is_empty());
     }
 
     #[test]

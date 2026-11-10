@@ -600,6 +600,8 @@ pub fn AdminPane(
             async move { fetch_virtual_folders(&base, &token).await }
         })
     };
+    // Counts this page's successful sound-format saves (see device_deny_saved).
+    let device_save_seq = use_signal::<u64>(|| 0);
     let devices_resource = {
         let base = server_base.clone();
         let token = access_token;
@@ -608,7 +610,8 @@ pub fn AdminPane(
             let _bust = reload_signal.read();
             let base = base.clone();
             let token = token.peek().clone();
-            async move { fetch_devices(&base, &token).await }
+            let started_at = *device_save_seq.peek();
+            async move { (started_at, fetch_devices(&base, &token).await) }
         })
     };
     let activity_resource = {
@@ -761,9 +764,12 @@ pub fn AdminPane(
     // Sound-format lists saved since the last device load, and the devices
     // whose save is in flight: one save per device at a time, each built on
     // the last, so two quick toggles cannot overwrite each other. Saves for
-    // different devices run side by side.
+    // different devices run side by side. Each saved list carries the save's
+    // sequence number; a device load records the number it started at, and a
+    // saved list stops applying once a load that started after it lands, so a
+    // change made elsewhere since is not overwritten by a stale list.
     let device_deny_saved =
-        use_signal::<std::collections::HashMap<String, Vec<String>>>(Default::default);
+        use_signal::<std::collections::HashMap<String, (u64, Vec<String>)>>(Default::default);
     let device_saving = use_signal::<std::collections::BTreeSet<String>>(Default::default);
     // Dismiss hides the open tab's load error too; the next tab, reload or
     // action shows it again if it is still there.
@@ -784,6 +790,7 @@ pub fn AdminPane(
         let mut fetch_err_hidden_signal = fetch_err_hidden;
         let mut device_deny_saved_signal = device_deny_saved;
         let mut device_saving_signal = device_saving;
+        let mut device_save_seq_signal = device_save_seq;
         move |action: AdminAction| {
             let token = access_token.peek().clone();
             let base = server_base.clone();
@@ -825,7 +832,7 @@ pub fn AdminPane(
                 AdminAction::SetDeviceAudioDeny { device_id, .. } => devices_resource
                     .peek()
                     .as_ref()
-                    .and_then(|r| r.as_ref().ok())
+                    .and_then(|(_, r)| r.as_ref().ok())
                     .and_then(|devices| devices.iter().find(|d| d.id == *device_id))
                     .map_or_else(|| device_id.clone(), |d| d.name.clone()),
                 _ => String::new(),
@@ -950,9 +957,11 @@ pub fn AdminPane(
                     AdminAction::SetDeviceAudioDeny { device_id, codecs } => {
                         match set_device_audio_deny(&base, &token, &device_id, &codecs).await {
                             Ok(()) => {
+                                let seq = *device_save_seq_signal.peek() + 1;
+                                device_save_seq_signal.set(seq);
                                 device_deny_saved_signal
                                     .write()
-                                    .insert(device_id.clone(), codecs);
+                                    .insert(device_id.clone(), (seq, codecs));
                                 status_signal
                                     .set(Some(format!("Saved the sound formats for {subject}.")));
                             }
@@ -1007,7 +1016,7 @@ pub fn AdminPane(
         AdminTab::Devices => devices_resource
             .read_unchecked()
             .as_ref()
-            .and_then(|r| r.as_ref().err().cloned()),
+            .and_then(|(_, r)| r.as_ref().err().cloned()),
         AdminTab::Activity => activity_resource
             .read_unchecked()
             .as_ref()
@@ -1049,9 +1058,11 @@ pub fn AdminPane(
         _ => Vec::new(),
     };
     let devices: Vec<DeviceEntry> = match devices_resource.read_unchecked().as_ref() {
-        Some(Ok(v)) => {
-            crate::views::admin::with_saved_audio_deny(v.clone(), &device_deny_saved.read())
-        }
+        Some((started_at, Ok(v))) => crate::views::admin::with_saved_audio_deny(
+            v.clone(),
+            &device_deny_saved.read(),
+            *started_at,
+        ),
         _ => Vec::new(),
     };
     let activity: Vec<ActivityEntry> = match activity_resource.read_unchecked().as_ref() {
