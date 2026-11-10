@@ -1,0 +1,316 @@
+//! One song's alignment, as `server.py`'s `_align` runs it once the request
+//! is parsed: the offset estimate, then each line in turn, one song at a time.
+
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
+use serde::Serialize;
+
+use crate::audio::DecodeError;
+use crate::offset::{estimate, shift};
+use crate::plan::{stamps, window, Line, Stamp};
+use crate::text::words;
+
+/// Sent with every answer. The server keeps only answers at or above its
+/// minimum, so an aligner deployed after the server cannot pin old times.
+/// 2: a line's window opens `LEAD_MS` before its stamp (B1165).
+/// 3: the Rust service (spec 039).
+pub const ALIGNER_VERSION: u32 = 3;
+
+/// Why the model gave a window no spans.
+#[derive(Debug, thiserror::Error)]
+pub enum ModelError {
+    /// This window only, as torchaudio's RuntimeError for text that outruns
+    /// its window: the line goes without word times and the song goes on.
+    #[error("{0}")]
+    Line(String),
+    /// The model itself is broken; the song answers 500.
+    #[error("{0}")]
+    Fatal(String),
+}
+
+/// Waveform to word spans: the acoustic model plus CTC, `model.py`'s `Aligner.align`.
+pub trait Model: Send {
+    /// `(start_ms, end_ms)` per token within the window.
+    fn align(
+        &mut self,
+        pcm: &[f32],
+        tokens: &[String],
+        lead_star: bool,
+    ) -> Result<Vec<(u64, u64)>, ModelError>;
+}
+
+/// Loads the model on first use and after an idle unload.
+pub type Loader = Box<dyn Fn() -> Result<Box<dyn Model>, String> + Send + Sync>;
+
+/// One window of a file to samples; `audio::decode` outside tests.
+pub type Decoder = Box<dyn Fn(&Path, i64, i64) -> Result<Vec<f32>, DecodeError> + Send + Sync>;
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct LineWords {
+    pub words: Vec<Stamp>,
+}
+
+/// The `/align` answer, fields in the Python service's order.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct Answer {
+    pub lines: Vec<LineWords>,
+    pub offset_ms: i64,
+    pub aligner_version: u32,
+}
+
+/// Why a song failed as a whole.
+#[derive(Debug, thiserror::Error)]
+pub enum SongError {
+    /// A line window ffmpeg could not decode: 422.
+    #[error("ffmpeg failed: {0}")]
+    Ffmpeg(DecodeError),
+    /// Anything else, ffmpeg missing or timing out on a line included: 500.
+    #[error("{0}")]
+    Internal(String),
+}
+
+/// Wall time per phase of one song, summed over its windows, for the log line
+/// and the request span.
+#[derive(Debug, Default, Clone)]
+pub struct Phases {
+    decode_ms: u64,
+    model_ms: u64,
+}
+
+impl Phases {
+    fn time<T>(slot: &mut u64, f: impl FnOnce() -> T) -> T {
+        let started = Instant::now();
+        let out = f();
+        *slot += u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        out
+    }
+
+    pub fn decode_ms(&self) -> u64 {
+        self.decode_ms
+    }
+
+    pub fn model_ms(&self) -> u64 {
+        self.model_ms
+    }
+
+    /// `decode_ms=… model_ms=…`, as `Phases.summary` prints it.
+    pub fn summary(&self) -> String {
+        format!("decode_ms={} model_ms={}", self.decode_ms, self.model_ms)
+    }
+}
+
+/// A finished song: the answer plus what the log line and span report.
+#[derive(Debug)]
+pub struct Aligned {
+    pub answer: Answer,
+    pub words_aligned: usize,
+    pub probes: Vec<Option<i64>>,
+    pub reason: String,
+    pub phases: Phases,
+}
+
+struct Slot {
+    model: Option<Box<dyn Model>>,
+    last_used: Instant,
+}
+
+/// The loaded model behind the one-song-at-a-time lock.
+pub struct Engine {
+    slot: Mutex<Slot>,
+    loader: Loader,
+    decoder: Decoder,
+    idle_unload: Option<Duration>,
+}
+
+impl Engine {
+    pub fn new(loader: Loader, decoder: Decoder, idle_unload: Option<Duration>) -> Self {
+        Self {
+            slot: Mutex::new(Slot {
+                model: None,
+                last_used: Instant::now(),
+            }),
+            loader,
+            decoder,
+            idle_unload,
+        }
+    }
+
+    /// Drops the model when it has sat unused for the idle timeout; true if
+    /// it did. A song in progress holds the lock, so it is never unloaded mid-song.
+    pub fn unload_if_idle(&self) -> bool {
+        let Some(idle) = self.idle_unload else {
+            return false;
+        };
+        let Ok(mut slot) = self.slot.try_lock() else {
+            return false;
+        };
+        if slot.model.is_none() || slot.last_used.elapsed() < idle {
+            return false;
+        }
+        slot.model = None;
+        tracing::info!(
+            idle_s = slot.last_used.elapsed().as_secs(),
+            "model unloaded after idle"
+        );
+        true
+    }
+
+    /// Aligns every line of the song at `full_path` (already resolved and
+    /// checked to exist); `rel_path` names it in logs.
+    pub fn align_song(
+        &self,
+        rel_path: &str,
+        full_path: &Path,
+        lines: Vec<Line>,
+    ) -> Result<Aligned, SongError> {
+        let mut slot = tracing::info_span!("aligner.wait").in_scope(|| {
+            // A song that panicked mid-way leaves nothing half-written that the
+            // next one reads: the model is reloaded below if it was dropped.
+            self.slot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        });
+        if slot.model.is_none() {
+            let started = Instant::now();
+            let model = (self.loader)()
+                .map_err(|e| SongError::Internal(format!("model load failed: {e}")))?;
+            tracing::info!(
+                load_ms = started.elapsed().as_millis() as u64,
+                "model loaded"
+            );
+            slot.model = Some(model);
+        }
+        let result = match slot.model.as_deref_mut() {
+            Some(model) => run_song(model, &self.decoder, rel_path, full_path, lines),
+            None => Err(SongError::Internal("model missing after load".into())),
+        };
+        slot.last_used = Instant::now();
+        result
+    }
+}
+
+fn run_song(
+    model: &mut dyn Model,
+    decoder: &Decoder,
+    rel_path: &str,
+    full_path: &Path,
+    lines: Vec<Line>,
+) -> Result<Aligned, SongError> {
+    let mut phases = Phases::default();
+    let path: PathBuf = full_path.to_owned();
+
+    // Probes are optional: a window ffmpeg cannot decode costs the song its
+    // offset, not its word times. After one timeout the rest are skipped, so
+    // seven of them cannot outlast the server's whole-song budget.
+    let mut probe_timed_out = false;
+    let probe_phases = std::cell::RefCell::new(&mut phases);
+    let decode_probe = |start: i64, end: i64| -> Result<Vec<f32>, SongError> {
+        if probe_timed_out {
+            return Ok(Vec::new());
+        }
+        let span = tracing::info_span!("aligner.decode", stage = "probe", window_ms = end - start);
+        let got = span.in_scope(|| {
+            let mut p = probe_phases.borrow_mut();
+            Phases::time(&mut p.decode_ms, || decoder(&path, start, end))
+        });
+        match got {
+            Ok(pcm) => Ok(pcm),
+            Err(e @ DecodeError::TimedOut { .. }) => {
+                probe_timed_out = true;
+                tracing::warn!(path = rel_path, error = %e, "offset probe decode timed out; skipping the rest");
+                Ok(Vec::new())
+            }
+            Err(e @ DecodeError::Failed { .. }) => {
+                tracing::warn!(path = rel_path, error = %e, "offset probe decode failed");
+                Ok(Vec::new())
+            }
+            Err(e) => Err(SongError::Internal(e.to_string())),
+        }
+    };
+    let align_wide = |pcm: &[f32], tokens: &[String]| -> Result<Vec<(u64, u64)>, SongError> {
+        let span = tracing::info_span!("aligner.model", stage = "probe", words = tokens.len());
+        let got = span.in_scope(|| {
+            let mut p = probe_phases.borrow_mut();
+            Phases::time(&mut p.model_ms, || model.align(pcm, tokens, true))
+        });
+        match got {
+            Ok(spans) => Ok(spans),
+            Err(ModelError::Line(e)) => {
+                tracing::warn!(path = rel_path, error = %e, "offset probe failed");
+                Ok(Vec::new())
+            }
+            Err(e @ ModelError::Fatal(_)) => Err(SongError::Internal(e.to_string())),
+        }
+    };
+    let found = estimate(&lines, decode_probe, align_wide)?;
+    tracing::info!(
+        path = rel_path,
+        offset_ms = found.offset_ms,
+        probes = ?found.probes,
+        reason = %found.reason,
+        "offset estimate"
+    );
+
+    let lines = shift(lines, found.offset_ms);
+    let mut out = Vec::with_capacity(lines.len());
+    let mut words_aligned = 0;
+    let mut prev_end_ms = 0;
+    for (index, line) in lines.iter().enumerate() {
+        let w_list = words(&line.text);
+        if w_list.is_empty() {
+            out.push(LineWords { words: Vec::new() });
+            continue;
+        }
+        let (w_start, w_end) = window(line, w_list.len(), prev_end_ms);
+        let span = tracing::info_span!(
+            "aligner.decode",
+            stage = "line",
+            line = index,
+            window_ms = w_end - w_start
+        );
+        let pcm = span
+            .in_scope(|| Phases::time(&mut phases.decode_ms, || decoder(&path, w_start, w_end)))
+            .map_err(|e| match e {
+                DecodeError::Failed { .. } => SongError::Ffmpeg(e),
+                other => SongError::Internal(other.to_string()),
+            })?;
+        let tokens: Vec<String> = w_list.iter().map(|w| w.token.clone()).collect();
+        let span = tracing::info_span!(
+            "aligner.model",
+            stage = "line",
+            line = index,
+            words = tokens.len()
+        );
+        let spans = match span
+            .in_scope(|| Phases::time(&mut phases.model_ms, || model.align(&pcm, &tokens, false)))
+        {
+            Ok(spans) => spans,
+            // A window too short for its text: only that line goes without word times.
+            Err(ModelError::Line(e)) => {
+                tracing::warn!(path = rel_path, line = index, error = %e, "alignment failed");
+                out.push(LineWords { words: Vec::new() });
+                continue;
+            }
+            Err(e @ ModelError::Fatal(_)) => return Err(SongError::Internal(e.to_string())),
+        };
+        let line_stamps = stamps(&line.text, &w_list, &spans, w_start);
+        if let Some(last) = line_stamps.last() {
+            words_aligned += w_list.len();
+            prev_end_ms = last.start_ms;
+        }
+        out.push(LineWords { words: line_stamps });
+    }
+    Ok(Aligned {
+        answer: Answer {
+            lines: out,
+            offset_ms: found.offset_ms,
+            aligner_version: ALIGNER_VERSION,
+        },
+        words_aligned,
+        probes: found.probes,
+        reason: found.reason,
+        phases,
+    })
+}
