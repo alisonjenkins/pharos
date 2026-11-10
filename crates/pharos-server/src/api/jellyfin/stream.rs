@@ -798,7 +798,7 @@ async fn stream_audio(
 /// feature film — in one body makes a reverse proxy temp-file the entire
 /// remainder before relaying (an unbuffered seek then takes minutes), and a
 /// stalled/reset progressive connection restarts the `<video>` at 0 (the
-/// Deadpool report). Capping to a bounded window the client simply re-requests
+/// Film AJ report). Capping to a bounded window the client simply re-requests
 /// keeps every response small and fast. 8 MiB ≈ 10 s at 6 Mbps.
 const DIRECTPLAY_RANGE_CAP_BYTES: u64 = 8 * 1024 * 1024;
 
@@ -845,13 +845,13 @@ impl DirectPlayClient {
     ///
     /// B140 — only a browser. A `<video>`/MSE source buffer treats a short
     /// response as "this window is done" and issues the next `bytes=X-`, which
-    /// is what makes the Deadpool cap work. A native progressive player does
+    /// is what makes the Film AJ cap work. A native progressive player does
     /// not: ExoPlayer's `DefaultHttpDataSource` sizes its read from the
     /// response's `Content-Length`, and when that many bytes have been consumed
     /// it returns `RESULT_END_OF_INPUT` to the extractor — the media simply
     /// *ends* at the cap. Capping a native player's open-ended range therefore
     /// truncates the film to the first 8 MiB, which is why the Android TV app
-    /// opened Central Intelligence, read one window and gave up. Native clients
+    /// opened Film AK, read one window and gave up. Native clients
     /// get the whole tail; the reverse-proxy buffering the cap exists to avoid
     /// is a browser-path problem.
     fn caps_ranges(self) -> bool {
@@ -997,7 +997,7 @@ async fn deliver_stream(
     // Cap an over-large / open-ended DirectPlay range to a bounded window so the
     // client re-requests the next chunk. A single multi-GB `bytes=X-` answer
     // stalls proxy buffering (minutes-long unbuffered seeks) and a reset
-    // progressive connection restarts the `<video>` at 0 (Deadpool). Capping a
+    // progressive connection restarts the `<video>` at 0 (Film AJ). Capping a
     // byte-range the client explicitly asked for is valid for ANY container (we
     // return a prefix of the requested bytes), so — unlike the StartTimeTicks
     // time→byte cut above — it needs no `ResyncWitness`. Small / suffix / multi

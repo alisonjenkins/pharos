@@ -43,8 +43,8 @@ async fn seed() -> (web::Data<AppState>, String) {
         })
         .await
         .unwrap();
-    // Two items. Item 1 stars Keanu (Neo) + directed by Lana; item 2 also
-    // stars Keanu (John Wick), so Keanu's count is 2.
+    // Two items. Item 1 stars Actor Q (Hero A) + directed by Director Q; item 2 also
+    // stars Actor Q (Hero B), so Actor Q's count is 2.
     for (id, title) in [(1u64, "A"), (2, "B")] {
         stores
             .put(MediaItem {
@@ -58,18 +58,18 @@ async fn seed() -> (web::Data<AppState>, String) {
             .await
             .unwrap();
     }
-    let mut lana = PersonRef {
-        name: "Lana Wachowski".into(),
+    let mut director_q = PersonRef {
+        name: "Director Q".into(),
         kind: PersonKind::Director,
         ..Default::default()
     };
-    lana.thumb = Some("http://img/lana.jpg".into());
+    director_q.thumb = Some("http://img/director_q.jpg".into());
     stores
-        .link_item_people(1, &[actor("Keanu Reeves", "Neo", 0), lana])
+        .link_item_people(1, &[actor("Actor Q", "Hero A", 0), director_q])
         .await
         .unwrap();
     stores
-        .link_item_people(2, &[actor("Keanu Reeves", "John Wick", 0)])
+        .link_item_people(2, &[actor("Actor Q", "Hero B", 0)])
         .await
         .unwrap();
     let token = stores.issue(uid, "t").await.unwrap();
@@ -125,21 +125,21 @@ async fn persons_list_emits_rows_with_wire_id_and_counts() {
     let (state, token) = seed().await;
     let v = get_json(state, &token, "/Persons").await;
     let items = v["Items"].as_array().unwrap();
-    // Name-ordered: Keanu Reeves, Lana Wachowski.
+    // Name-ordered: Actor Q, Director Q.
     let names: Vec<&str> = items.iter().map(|i| i["Name"].as_str().unwrap()).collect();
-    assert_eq!(names, vec!["Keanu Reeves", "Lana Wachowski"]);
-    let keanu = &items[0];
-    assert_eq!(keanu["Id"].as_str().unwrap(), person_id_for("Keanu Reeves"));
-    assert_eq!(keanu["Type"].as_str().unwrap(), "Person");
-    assert!(keanu["IsFolder"].as_bool().unwrap());
+    assert_eq!(names, vec!["Actor Q", "Director Q"]);
+    let star = &items[0];
+    assert_eq!(star["Id"].as_str().unwrap(), person_id_for("Actor Q"));
+    assert_eq!(star["Type"].as_str().unwrap(), "Person");
+    assert!(star["IsFolder"].as_bool().unwrap());
     assert_eq!(
-        keanu["ChildCount"].as_u64().unwrap(),
+        star["ChildCount"].as_u64().unwrap(),
         2,
-        "Keanu in both items"
+        "Actor Q in both items"
     );
     assert_eq!(items[1]["ChildCount"].as_u64().unwrap(), 1);
     assert_eq!(v["TotalRecordCount"].as_u64().unwrap(), 2);
-    // Lana's recorded headshot advertises a Primary image tag.
+    // Director Q's recorded headshot advertises a Primary image tag.
     assert!(items[1]["ImageTags"].get("Primary").is_some());
 }
 
@@ -149,16 +149,16 @@ async fn get_person_resolves_by_wire_id_and_404s_unknown() {
     let v = get_json(
         state.clone(),
         &token,
-        &format!("/Persons/{}", person_id_for("Keanu Reeves")),
+        &format!("/Persons/{}", person_id_for("Actor Q")),
     )
     .await;
-    assert_eq!(v["Name"].as_str().unwrap(), "Keanu Reeves");
+    assert_eq!(v["Name"].as_str().unwrap(), "Actor Q");
     assert_eq!(v["Type"].as_str().unwrap(), "Person");
     assert_eq!(v["ChildCount"].as_u64().unwrap(), 2);
     // B92 — the Android TV kotlin SDK re-serialises the person wire id DASHED;
     // the store matches wire_id exactly, so a dashed id 404'd. It must resolve
     // identically to the dashless form.
-    let dashless = person_id_for("Keanu Reeves");
+    let dashless = person_id_for("Actor Q");
     let dashed = format!(
         "{}-{}-{}-{}-{}",
         &dashless[0..8],
@@ -170,7 +170,7 @@ async fn get_person_resolves_by_wire_id_and_404s_unknown() {
     let v = get_json(state.clone(), &token, &format!("/Persons/{dashed}")).await;
     assert_eq!(
         v["Name"].as_str().unwrap(),
-        "Keanu Reeves",
+        "Actor Q",
         "dashed person id must resolve"
     );
     assert_eq!(v["ChildCount"].as_u64().unwrap(), 2);
@@ -181,12 +181,12 @@ async fn get_person_resolves_by_wire_id_and_404s_unknown() {
 #[actix_web::test]
 async fn parent_id_person_resolves_to_credited_items() {
     let (state, token) = seed().await;
-    // ParentId = Keanu → items 1 and 2.
-    let keanu = person_id_for("Keanu Reeves");
+    // ParentId = Actor Q → items 1 and 2.
+    let star = person_id_for("Actor Q");
     let v = get_json(
         state.clone(),
         &token,
-        &format!("/Items?ParentId={keanu}&Limit=100"),
+        &format!("/Items?ParentId={star}&Limit=100"),
     )
     .await;
     let mut titles: Vec<&str> = v["Items"]
@@ -196,17 +196,22 @@ async fn parent_id_person_resolves_to_credited_items() {
         .map(|i| i["Name"].as_str().unwrap())
         .collect();
     titles.sort_unstable();
-    assert_eq!(titles, vec!["A", "B"], "both Keanu items");
-    // ParentId = Lana → only item 1.
-    let lana = person_id_for("Lana Wachowski");
-    let v = get_json(state, &token, &format!("/Items?ParentId={lana}&Limit=100")).await;
+    assert_eq!(titles, vec!["A", "B"], "both Actor Q items");
+    // ParentId = Director Q → only item 1.
+    let director_q = person_id_for("Director Q");
+    let v = get_json(
+        state,
+        &token,
+        &format!("/Items?ParentId={director_q}&Limit=100"),
+    )
+    .await;
     let titles: Vec<&str> = v["Items"]
         .as_array()
         .unwrap()
         .iter()
         .map(|i| i["Name"].as_str().unwrap())
         .collect();
-    assert_eq!(titles, vec!["A"], "only the Lana-directed item");
+    assert_eq!(titles, vec!["A"], "only the Director-Q-directed item");
 }
 
 #[actix_web::test]
@@ -215,21 +220,18 @@ async fn item_dto_carries_its_people() {
     let v = get_json(state, &token, "/Items/1").await;
     let people = v["People"].as_array().unwrap();
     let names: Vec<&str> = people.iter().map(|p| p["Name"].as_str().unwrap()).collect();
-    // NFO order: Keanu (order 0) then Lana (crew, no order).
-    assert_eq!(names, vec!["Keanu Reeves", "Lana Wachowski"]);
-    let keanu = &people[0];
-    assert_eq!(keanu["Id"].as_str().unwrap(), person_id_for("Keanu Reeves"));
+    // NFO order: Actor Q (order 0) then Director Q (crew, no order).
+    assert_eq!(names, vec!["Actor Q", "Director Q"]);
+    let star = &people[0];
+    assert_eq!(star["Id"].as_str().unwrap(), person_id_for("Actor Q"));
     // Role on a cast credit = the character.
-    assert_eq!(keanu["Role"].as_str().unwrap(), "Neo");
-    assert_eq!(keanu["Type"].as_str().unwrap(), "Actor");
+    assert_eq!(star["Role"].as_str().unwrap(), "Hero A");
+    assert_eq!(star["Type"].as_str().unwrap(), "Actor");
     assert_eq!(people[1]["Type"].as_str().unwrap(), "Director");
 }
 
 #[actix_web::test]
 async fn wire_id_matches_core_helper() {
     // The DTO helper, the store wire_id, and the ParentId pivot all agree.
-    assert_eq!(
-        person_id_for("Keanu Reeves"),
-        person_wire_id("Keanu Reeves")
-    );
+    assert_eq!(person_id_for("Actor Q"), person_wire_id("Actor Q"));
 }

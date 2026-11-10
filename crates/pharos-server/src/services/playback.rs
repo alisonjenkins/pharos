@@ -407,7 +407,7 @@ pub fn negotiate(state: &AppState, item: &MediaItem, req: &NegotiateRequest<'_>)
     // Matroska source to a browser that CANNOT play the `video/webm` relabel
     // (e.g. AV1 + AAC, or h264-in-mkv), advertising SupportsDirectStream with NO
     // TranscodingUrl stranded the client: jellyfin-web silently retried
-    // PlaybackInfo for ~11 min (Supergirl S01E05, av1-in-mkv) before recovering.
+    // PlaybackInfo for ~11 min (Show AI S01E05, av1-in-mkv) before recovering.
     // Downgrade to a transcode so a fallback URL is emitted and
     // SupportsDirectStream resolves false. The generic H.264/AAC target is
     // refined downstream — a Linux-Firefox that can't decode H.264 is redirected
@@ -831,7 +831,7 @@ pub(crate) fn resolve_selected_subtitle<'a>(
         // take p50 5380 ms / p95 10995 ms to produce 6000 ms of video, i.e.
         // ABOVE REALTIME at the p95. The encoder cannot stay ahead of the
         // player, the buffer starves, the client restarts, and each restart
-        // asks for more burns. Observed live 2026-08-16 on Black Panther:
+        // asks for more burns. Observed live 2026-08-16 on Film S:
         // `subtitle.requested: None, subtitle.resolved: Some(2),
         // subtitle.codec: hdmv_pgs_subtitle, subtitle.delivery: Burn`, with
         // one segment re-fetched 118 times and 22 play sessions in 15
@@ -864,7 +864,7 @@ pub(crate) fn resolve_selected_subtitle<'a>(
 /// never flagged default — but disagreeing about whether THAT answer is
 /// affordable is what let `DefaultSubtitleStreamIndex` point at a track the
 /// burn path had separately and silently declined to ever deliver, live
-/// 2026-08-29 (Code Geass: the container-default PGS track was a sparse
+/// 2026-08-29 (Show U: the container-default PGS track was a sparse
 /// signs/songs-only track; jellyfin-web pre-selected it as "English" and
 /// nothing rendered during dialogue).
 ///
@@ -1136,7 +1136,7 @@ pub async fn pick_audio(
     explicit: Option<u32>,
 ) -> AudioPick {
     // Which tracks THIS user should start on. Until now this was "the first
-    // audio stream in the container", which is how Aliens — three Ukrainian
+    // audio stream in the container", which is how Film AL — three Ukrainian
     // tracks ahead of its English DTS-HD MA — played in Ukrainian every time.
     // The preferences have been stored per user since `/Users/{id}/Configuration`
     // existed; this is the first thing to read them.
@@ -1207,10 +1207,10 @@ pub async fn pick_audio(
             .and_then(|s| s.language.clone())
     });
     // ODD: the audio pick was invisible — diagnosing a wrong-language start
-    // (Jana's Code Geass playing English, 2026-07-26) took a hand DB read.
+    // (A viewer's Show U playing English, 2026-07-26) took a hand DB read.
     // Record the decision: the resolved preference inputs, EVERY candidate with
     // its language + default flag (the flag is what beats a language preference
-    // when prefer_default is on — the Aliens / Code Geass trap), and the chosen
+    // when prefer_default is on — the Film AL / Show U trap), and the chosen
     // index/language/source. A surprising pick is now one query away from its
     // reason. `chosen_index` uses -1 for "no audio" so the field stays numeric.
     {
@@ -1973,7 +1973,7 @@ mod source_plays_raw_in_browser_tests {
 
     #[test]
     fn a_matroska_never_plays_raw_however_webm_legal_its_codecs() {
-        // B107, the exact live case: Cobra Kai S01E01, av1 + opus in a .mkv,
+        // B107, the exact live case: Show AE S01E01, av1 + opus in a .mkv,
         // to Firefox. Every codec here is WebM-legal and the client lists them
         // — which is precisely why the old codec-based check said "playable"
         // and disarmed the downgrade. The container is what decides, and
@@ -2134,7 +2134,7 @@ mod resolve_selected_subtitle_tests {
     #[test]
     fn an_unrequested_image_default_is_not_auto_selected() {
         // Only image tracks, so there is nothing cheap to swap to — the case
-        // Black Panther actually presents.
+        // Film S actually presents.
         let probe = probe_with(vec![image_track(2, false), image_track(4, true)]);
         assert!(
             resolve_selected_subtitle(None, &probe, &text_capable_profiles()).is_none(),

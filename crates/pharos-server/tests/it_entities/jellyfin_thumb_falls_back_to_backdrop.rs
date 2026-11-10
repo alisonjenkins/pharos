@@ -54,7 +54,7 @@ async fn seed(
             // Deliberately unreadable: the frame-extract fallback must never be
             // what satisfies this request.
             path: "/no/such/movie.mkv".into(),
-            title: "Project Hail Mary".into(),
+            title: "Film AN".into(),
             kind: MediaKind::Movie,
             ..Default::default()
         })

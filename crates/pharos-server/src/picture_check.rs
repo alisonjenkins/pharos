@@ -449,7 +449,7 @@ mod tests {
     #[tokio::test]
     async fn a_pass_stores_bars_and_no_bars_and_skips_songs_and_3d() {
         let lib = library(&[
-            (1, "bewitched.mkv", MediaKind::Episode),
+            (1, "pillarboxed.mkv", MediaKind::Episode),
             (2, "film.mkv", MediaKind::Movie),
             (3, "song.flac", MediaKind::Audio),
             (4, "sbs.mkv", MediaKind::Movie),
@@ -459,7 +459,7 @@ mod tests {
         let fake = Fake {
             script: HashMap::from([
                 (
-                    "bewitched.mkv".into(),
+                    "pillarboxed.mkv".into(),
                     Ok(analysis(PictureVerdict::Bars(BARS), 7)),
                 ),
                 ("film.mkv".into(), Ok(analysis(PictureVerdict::NoBars, 7))),
@@ -473,7 +473,7 @@ mod tests {
         let sum = run_pass(&lib.store, &fake, &gate(), &lib.items).await;
         assert_eq!(sum.pending, 3, "neither the song nor the 3D film");
         assert_eq!((sum.bars, sum.none, sum.undetermined), (1, 1, 1));
-        assert_eq!(fake.calls(), ["bewitched.mkv", "film.mkv", "dark.mkv"]);
+        assert_eq!(fake.calls(), ["pillarboxed.mkv", "film.mkv", "dark.mkv"]);
 
         let got = lib.store.get(1).await.unwrap().probe;
         assert_eq!(got.picture_area(), Some(BARS));
@@ -504,10 +504,10 @@ mod tests {
     /// back from the store, decodes nothing; a changed file is redone.
     #[tokio::test]
     async fn a_file_is_decoded_once_until_it_changes() {
-        let lib = library(&[(1, "bewitched.mkv", MediaKind::Episode)]).await;
+        let lib = library(&[(1, "pillarboxed.mkv", MediaKind::Episode)]).await;
         let fake = Fake {
             script: HashMap::from([(
-                "bewitched.mkv".into(),
+                "pillarboxed.mkv".into(),
                 Ok(analysis(PictureVerdict::Bars(BARS), 7)),
             )]),
             ..Fake::default()

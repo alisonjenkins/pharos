@@ -386,34 +386,34 @@ mod tests {
     #[test]
     fn a_trailing_season_or_episode_token_is_read_off_the_name() {
         assert_eq!(
-            Term::parse("dragon ball s01"),
-            term("dragon ball", Some(1), None)
+            Term::parse("silver rock s01"),
+            term("silver rock", Some(1), None)
         );
         assert_eq!(
-            Term::parse("dragon ball s1"),
-            term("dragon ball", Some(1), None)
+            Term::parse("silver rock s1"),
+            term("silver rock", Some(1), None)
         );
         assert_eq!(
-            Term::parse("Dragon Ball S01E02"),
-            term("Dragon Ball", Some(1), Some(2))
+            Term::parse("Silver Rock S01E02"),
+            term("Silver Rock", Some(1), Some(2))
         );
         assert_eq!(
-            Term::parse("dragon ball s01e2"),
-            term("dragon ball", Some(1), Some(2))
+            Term::parse("silver rock s01e2"),
+            term("silver rock", Some(1), Some(2))
         );
         assert_eq!(
-            Term::parse("dragon  ball s1 e2"),
-            term("dragon ball", Some(1), Some(2))
+            Term::parse("silver  rock s1 e2"),
+            term("silver rock", Some(1), Some(2))
         );
     }
 
     #[test]
     fn a_term_without_a_season_token_is_all_name() {
-        assert_eq!(Term::parse("dragon ball"), term("dragon ball", None, None));
+        assert_eq!(Term::parse("silver rock"), term("silver rock", None, None));
         assert_eq!(Term::parse("s01"), term("s01", None, None));
         assert_eq!(
-            Term::parse("the boys season"),
-            term("the boys season", None, None)
+            Term::parse("the foxes season"),
+            term("the foxes season", None, None)
         );
         assert_eq!(
             Term::parse("sons of anarchy"),
@@ -425,12 +425,12 @@ mod tests {
 
     #[test]
     fn names_rank_whole_then_start_then_word_then_anywhere_then_shorter() {
-        let rank = |name| score(&[name], "Dragon Ball");
-        assert!(rank("Dragon Ball").unwrap().is_exact());
-        assert!(rank("Dragon Ball").unwrap() < rank("Dragon Ball GT").unwrap());
-        assert!(rank("Dragon Ball GT").unwrap() < rank("Dragon Ball Super").unwrap());
-        assert!(rank("Dragon Ball Super").unwrap() < rank("Super Dragon Ball Heroes").unwrap());
-        assert!(rank("Super Dragon Ball Heroes").unwrap() < rank("SuperDragon Balls").unwrap());
+        let rank = |name| score(&[name], "Silver Rock");
+        assert!(rank("Silver Rock").unwrap().is_exact());
+        assert!(rank("Silver Rock").unwrap() < rank("Silver Rock GT").unwrap());
+        assert!(rank("Silver Rock GT").unwrap() < rank("Silver Rock Super").unwrap());
+        assert!(rank("Silver Rock Super").unwrap() < rank("Super Silver Rock Heroes").unwrap());
+        assert!(rank("Super Silver Rock Heroes").unwrap() < rank("SuperSilver Rocks").unwrap());
         assert_eq!(rank("Bleach"), None);
     }
 

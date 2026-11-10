@@ -183,7 +183,7 @@ const SOURCES: &[Source] = &[
         container: "matroska,webm",
         video: "h264",
         audio: "eac3",
-    }, // B77 — the Supergirl shape: h264 + 6ch eac3 in Matroska
+    }, // B77 — the Show AI shape: h264 + 6ch eac3 in Matroska
     Source {
         id: 8,
         container: "matroska,webm",

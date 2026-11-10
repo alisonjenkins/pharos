@@ -173,8 +173,8 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
-    const MATRIX: &str = r#"{"Title":"The Matrix","Year":"1999","Rated":"R","Ratings":[{"Source":"Internet Movie Database","Value":"8.7/10"},{"Source":"Rotten Tomatoes","Value":"83%"},{"Source":"Metacritic","Value":"73/100"}],"Metascore":"73","imdbRating":"8.7","imdbVotes":"2,195,334","imdbID":"tt0133093","Type":"movie","Response":"True"}"#;
-    const BREAKING_BAD: &str = r#"{"Title":"Breaking Bad","Year":"2008–2013","Ratings":[{"Source":"Internet Movie Database","Value":"9.5/10"}],"imdbRating":"9.5","imdbID":"tt0903747","Type":"series","totalSeasons":"5","Response":"True"}"#;
+    const MATRIX: &str = r#"{"Title":"The Glass Lattice","Year":"1999","Rated":"R","Ratings":[{"Source":"Internet Movie Database","Value":"8.7/10"},{"Source":"Rotten Tomatoes","Value":"83%"},{"Source":"Metacritic","Value":"73/100"}],"Metascore":"73","imdbRating":"8.7","imdbVotes":"2,195,334","imdbID":"tt9300001","Type":"movie","Response":"True"}"#;
+    const SHOW_X: &str = r#"{"Title":"Show X","Year":"2008–2013","Ratings":[{"Source":"Internet Movie Database","Value":"9.5/10"}],"imdbRating":"9.5","imdbID":"tt9300002","Type":"series","totalSeasons":"5","Response":"True"}"#;
     const NO_SCORES: &str = r#"{"Title":"Obscure","Year":"2001","Ratings":[],"imdbRating":"N/A","imdbID":"tt0000001","Type":"movie","Response":"True"}"#;
     const NOT_FOUND: &str = r#"{"Response":"False","Error":"Movie not found!"}"#;
     const LIMIT: &str = r#"{"Response":"False","Error":"Request limit reached!"}"#;
@@ -217,7 +217,7 @@ mod tests {
         RatingsQuery {
             kind: TitleKind::Movie,
             imdb_id: Some(id),
-            title: "The Matrix",
+            title: "The Glass Lattice",
             year: Some(1999),
         }
     }
@@ -234,7 +234,7 @@ mod tests {
     #[tokio::test]
     async fn an_imdb_id_lookup_reads_both_scores() {
         let c = client(200, MATRIX);
-        let got = c.lookup(&by_id("tt0133093")).await;
+        let got = c.lookup(&by_id("tt9300001")).await;
         assert_eq!(
             got,
             Lookup::Found(ExternalRatings {
@@ -243,16 +243,16 @@ mod tests {
             })
         );
         let sent = c.transport.sent.lock().unwrap();
-        assert!(sent[0].contains(&("i".into(), "tt0133093".into())));
+        assert!(sent[0].contains(&("i".into(), "tt9300001".into())));
         assert!(sent[0].contains(&("type".into(), "movie".into())));
         assert!(!sent[0].iter().any(|(k, _)| k == "t"));
     }
 
     #[tokio::test]
     async fn a_title_lookup_sends_title_type_and_year_and_takes_a_run_of_years() {
-        let c = client(200, BREAKING_BAD);
+        let c = client(200, SHOW_X);
         let got = c
-            .lookup(&by_title(TitleKind::Series, "Breaking Bad", Some(2008)))
+            .lookup(&by_title(TitleKind::Series, "Show X", Some(2008)))
             .await;
         assert_eq!(
             got,
@@ -262,16 +262,16 @@ mod tests {
             })
         );
         let sent = c.transport.sent.lock().unwrap();
-        for p in [("t", "Breaking Bad"), ("y", "2008"), ("type", "series")] {
+        for p in [("t", "Show X"), ("y", "2008"), ("type", "series")] {
             assert!(sent[0].contains(&(p.0.into(), p.1.into())), "{p:?}");
         }
     }
 
     #[tokio::test]
     async fn a_title_match_from_another_year_is_not_found() {
-        let c = client(200, BREAKING_BAD);
+        let c = client(200, SHOW_X);
         let got = c
-            .lookup(&by_title(TitleKind::Series, "Breaking Bad", Some(2021)))
+            .lookup(&by_title(TitleKind::Series, "Show X", Some(2021)))
             .await;
         assert_eq!(got, Lookup::NotFound);
     }

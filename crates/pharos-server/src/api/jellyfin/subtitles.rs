@@ -883,7 +883,7 @@ pub(crate) async fn pre_extract_subtitles(
 
     // Collect the text tracks still needing extraction — skip image subs and
     // anything already cached — so the whole item demuxes in ONE source open
-    // (V36) rather than a whole-file NFS read PER track. B72 / Supergirl-S01E03:
+    // (V36) rather than a whole-file NFS read PER track. B72 / Show AI-S01E03:
     // ~10 text tracks × ~500s cold demux each, serialized, saturating NFS and
     // starving live playback. Batching collapses that to a single open pass.
     let mut pending: Vec<PendingTrack> = Vec::new();
@@ -897,7 +897,7 @@ pub(crate) async fn pre_extract_subtitles(
             // here in EVERY warm pass, so the library-wide warm-all scanned
             // every image-sub title on each boot (thousands of whole-file NFS
             // demuxes), saturating the libav pool and freezing live playback
-            // (Supergirl, 2026-07-14). Never scan from the warm path.
+            // (Show AI, 2026-07-14). Never scan from the warm path.
             continue;
         }
         let is_ass = matches!(

@@ -51,7 +51,7 @@ async fn setup() -> Fixture {
         .put(MediaItem {
             id: MOVIE,
             path: "/a-beautiful-mind.mkv".into(),
-            title: "A Beautiful Mind".into(),
+            title: "Film AM".into(),
             kind: MediaKind::Movie,
             probe: MediaProbe {
                 duration_ms: Some(60_000),
