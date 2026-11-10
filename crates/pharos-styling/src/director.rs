@@ -228,8 +228,15 @@ pub fn direct(lines: &[SourceLine], signals: &TrackSignals, segments: &[Segment]
     let rest = medians[Class::Rest as usize];
     let caps_track = is_caps_track(lines);
 
-    let sung_score = sung_score(&kinds, &signals.sung);
-    let sung_track = sung_score.map(|s| s >= MIN_SUNG_SCORE);
+    let songs = [SegmentKind::Intro, SegmentKind::Outro];
+    let overall_score = sung_score(&kinds, &signals.sung, &songs);
+    // Each song is judged on its own lines: a translated ending must not
+    // pace a sung opening, nor the other way round.
+    let sung_track = |kind| sung_score(&kinds, &signals.sung, &[kind]).map(|s| s >= MIN_SUNG_SCORE);
+    let song_tracks = [
+        sung_track(SegmentKind::Intro),
+        sung_track(SegmentKind::Outro),
+    ];
     let speakers = speakers::slots(lines);
 
     let mut out = Vec::with_capacity(lines.len());
@@ -242,7 +249,12 @@ pub fn direct(lines: &[SourceLine], signals: &TrackSignals, segments: &[Segment]
         fx.line = i;
         fx.speaker = speakers[i];
         let sung = signals.sung.get(i).and_then(Option::as_ref);
-        if let Some(timing) = time_karaoke(&mut fx, line, kinds[i], sung, sung_track) {
+        let song_track = match kinds[i] {
+            Some(SegmentKind::Intro) => song_tracks[0],
+            Some(SegmentKind::Outro) => song_tracks[1],
+            _ => None,
+        };
+        if let Some(timing) = time_karaoke(&mut fx, line, kinds[i], sung, song_track) {
             *karaoke.entry(timing).or_insert(0) += 1;
         }
         if spans_cut(line, &signals.cuts_ms)
@@ -270,7 +282,7 @@ pub fn direct(lines: &[SourceLine], signals: &TrackSignals, segments: &[Segment]
         },
         bottom_text,
         karaoke,
-        sung_score,
+        sung_score: overall_score,
         speakers: speakers
             .iter()
             .flatten()
@@ -299,12 +311,17 @@ pub fn sung_candidates(lines: &[SourceLine], segments: &[Segment]) -> Vec<usize>
         .collect()
 }
 
-/// Median score of the opening and ending lines the aligner answered for.
-fn sung_score(kinds: &[Option<SegmentKind>], sung: &[Option<SungLine>]) -> Option<f32> {
+/// Median score of the lines in segments of `of` that the aligner answered
+/// for.
+fn sung_score(
+    kinds: &[Option<SegmentKind>],
+    sung: &[Option<SungLine>],
+    of: &[SegmentKind],
+) -> Option<f32> {
     let mut scores: Vec<f32> = kinds
         .iter()
         .zip(sung)
-        .filter(|(k, _)| matches!(k, Some(SegmentKind::Intro | SegmentKind::Outro)))
+        .filter(|(k, _)| k.is_some_and(|k| of.contains(&k)))
         .filter_map(|(_, s)| s.as_ref()?.score)
         .filter(|s| s.is_finite())
         .collect();
@@ -1483,6 +1500,54 @@ mod tests {
 
     /// B1212: the aligner times a song whose words are what is sung; a
     /// translation, or a line it could not place, is paced instead.
+    #[test]
+    fn each_song_is_judged_on_its_own_lines() {
+        let mut lines = vec![line("Run away"); 4];
+        for l in &mut lines[2..] {
+            l.start_ms += 80_000;
+            l.end_ms += 80_000;
+        }
+        let at = |score: f32, base: i64| {
+            Some(SungLine {
+                words: vec![(0, base + 10_200), (4, base + 10_700), (8, base + 11_500)],
+                score: Some(score),
+            })
+        };
+        let segments = [
+            Segment {
+                kind: SegmentKind::Intro,
+                start_ms: 0,
+                end_ms: 60_000,
+            },
+            Segment {
+                kind: SegmentKind::Outro,
+                start_ms: 60_000,
+                end_ms: 120_000,
+            },
+        ];
+        // A sung opening and a translated ending: the overall median would
+        // fall either way, but each song keeps its own verdict.
+        let d = direct(
+            &lines,
+            &TrackSignals {
+                sung: vec![at(0.8, 0), at(0.7, 0), at(0.1, 80_000), at(0.05, 80_000)],
+                ..TrackSignals::default()
+            },
+            &segments,
+        );
+        let reasons: Vec<&str> = d.plan.lines.iter().map(|l| l.reason.as_str()).collect();
+        assert!(reasons[0].contains("timing=aligned"), "{reasons:?}");
+        assert!(reasons[1].contains("timing=aligned"), "{reasons:?}");
+        assert!(
+            reasons[2].ends_with("timing=paced why=translated"),
+            "{reasons:?}"
+        );
+        assert!(
+            reasons[3].ends_with("timing=paced why=translated"),
+            "{reasons:?}"
+        );
+    }
+
     #[test]
     fn a_low_scoring_line_in_a_sung_song_is_paced() {
         let lines = vec![line("Run away"), line("Run away"), line("Run away")];
