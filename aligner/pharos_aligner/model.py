@@ -12,6 +12,8 @@ from typing import Any, Callable
 import torch
 import torchaudio
 
+from pharos_aligner.tracing import tracer
+
 logger = logging.getLogger("pharos_aligner")
 
 # MMS_FA's wildcard label, matching any audio that is not the transcript.
@@ -133,7 +135,10 @@ class Aligner:
             return []
 
         with torch.inference_mode():
-            out = self._model(waveform)
+            # The wav2vec2 forward pass and the CTC search, apart: which of
+            # them a slow song spends its time in decides the fix (B1164).
+            with tracer.start_as_current_span("aligner.forward", attributes={"samples": n_samples}):
+                out = self._model(waveform)
             emission = out[0] if isinstance(out, tuple) else out
             num_frames = emission.size(1)
             if num_frames == 0:
@@ -145,12 +150,13 @@ class Aligner:
             # to the next line. None goes before the first word: a line is sung
             # from its stamp, and a leading star let the words drift late.
             lead = [STAR] if lead_star else []
-            tokenized = self._tokenizer([*lead, *tokens, STAR])
-            # CTC needs a frame a character: a window too short for its text
-            # cannot be aligned, and the aligner would raise.
-            if sum(len(t) for t in tokenized) > num_frames:
-                return []
-            spans = self._aligner(emission[0], tokenized)[len(lead) : -1]
+            with tracer.start_as_current_span("aligner.ctc", attributes={"frames": num_frames}):
+                tokenized = self._tokenizer([*lead, *tokens, STAR])
+                # CTC needs a frame a character: a window too short for its
+                # text cannot be aligned, and the aligner would raise.
+                if sum(len(t) for t in tokenized) > num_frames:
+                    return []
+                spans = self._aligner(emission[0], tokenized)[len(lead) : -1]
 
         ratio = (n_samples / num_frames / 16000.0) * 1000.0
         result: list[tuple[int, int]] = []
