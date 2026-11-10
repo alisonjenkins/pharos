@@ -159,7 +159,14 @@ pub async fn sleep_ms(ms: u32) {
 
 pub fn set_title(_title: &str) {}
 
+/// The page's path, its query left off: routing reads this, as it reads
+/// `location.pathname` on the web.
 pub fn current_path() -> String {
+    PATHS.with(|p| super::route::split_query(p.borrow().current()).0.to_owned())
+}
+
+/// The whole address on top, query included.
+fn current_address() -> String {
     PATHS.with(|p| p.borrow().current().to_owned())
 }
 
@@ -708,8 +715,9 @@ pub fn scroll_tile_to(_at: u32, _top: f64) -> bool {
     false
 }
 
+/// The page's query, `?` included, as `location.search` on the web.
 pub fn current_search() -> String {
-    String::new()
+    PATHS.with(|p| super::route::split_query(p.borrow().current()).1.to_owned())
 }
 
 pub struct ScrollWatch;
@@ -973,7 +981,7 @@ fn install_bridge() {
     if BRIDGED.with(|b| b.replace(true)) {
         return;
     }
-    let start = current_path();
+    let start = current_address();
     spawn_forever(async move {
         let _ = document::eval(&format!(
             "history.replaceState('pharos', '', {});",
@@ -1051,7 +1059,7 @@ fn on_bridge(message: Bridge) {
             if kept {
                 // The WebView has already gone back an entry: put the page
                 // that took Back back on top, so the next Back leaves it.
-                let here = current_path();
+                let here = current_address();
                 log::info!("pharos: back taken by the page path={here} popped_to={path}");
                 run(format!(
                     "history.pushState('pharos', '', {});",
@@ -1063,7 +1071,9 @@ fn on_bridge(message: Bridge) {
             for f in &listeners {
                 if let Ok(mut f) = f.try_borrow_mut() {
                     if let Listener::Pop(f) = &mut *f {
-                        f(path.clone());
+                        // Routing takes the path; the query stays on top of
+                        // PATHS for the page to read (current_search).
+                        f(super::route::split_query(&path).0.to_owned());
                     }
                 }
             }
