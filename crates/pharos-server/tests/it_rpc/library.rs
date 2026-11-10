@@ -4076,9 +4076,35 @@ async fn latest_rails_fold_new_episodes_and_tracks_into_one_tile() {
     let user = pharos_server::services::auth::user_for_token(&fx.state.stores, &fx.user_token)
         .await
         .unwrap();
+    let recorder = metrics_util::debugging::DebuggingRecorder::new();
+    let snap = pharos_test_metrics::snapshotter(&recorder);
+    let metrics_guard = metrics::set_default_local_recorder(&recorder);
     let tiles = library::latest_tiles(&fx.state, &user, None, &library::KindFilter::Unset, None)
         .await
         .unwrap();
+    let counted = |tile: &str| -> u64 {
+        use metrics_util::debugging::DebugValue;
+        snap.snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(ck, ..)| {
+                ck.key().name() == "pharos_latest_tiles_total"
+                    && ck
+                        .key()
+                        .labels()
+                        .any(|l| l.key() == "tile" && l.value() == tile)
+            })
+            .map(|(.., v)| match v {
+                DebugValue::Counter(n) => n,
+                _ => 0,
+            })
+            .sum()
+    };
+    // Disarm check: with the counter removed every count reads 0.
+    assert_eq!(counted("series"), 2, "Show and Another");
+    assert_eq!(counted("album"), 1);
+    assert_eq!(counted("item"), (tiles.len() - 3) as u64);
+    drop(metrics_guard);
     let shape: Vec<String> = tiles
         .iter()
         .map(|t| match t {
