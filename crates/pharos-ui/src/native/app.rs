@@ -4715,6 +4715,10 @@ fn invite_url(origin: &str, id: &str) -> String {
     format!("{origin}{}", Route::TogetherGroup(id.to_owned()).path())
 }
 
+/// How long after the group changes entry this player waits for events from
+/// the old end before its Up next starts over without a seek (B1027).
+const UP_NEXT_RESET_SETTLE_MS: f64 = 2_000.0;
+
 /// Attaches the engine, draws the controls and reports progress: on play,
 /// pause and seek, every 10 s while playing, and one stop when the video
 /// ends, the player unmounts or the page is hidden. A track change the
@@ -4857,8 +4861,9 @@ fn Player(
     // another entry of the same item keeps this player, not its Cancel.
     let up_next_entry = use_hook(|| Rc::new(RefCell::new(String::new())));
     // A new entry's countdown starts over only once the player has left the
-    // old end, so events from there cannot move the group on (B1027).
-    let up_next_reset = use_hook(|| Rc::new(Cell::new(false)));
+    // old end, so events from there cannot move the group on (B1027). Holds
+    // when the group changed entry.
+    let up_next_reset = use_hook(|| Rc::new(Cell::new(None::<f64>)));
     let advanced = use_hook(|| Rc::new(Cell::new(false)));
     // An ASS subtitle drawn from its script (ADR-0057), and the pick it is
     // for; its WebVTT stays on screen until the renderer is ready.
@@ -5677,17 +5682,23 @@ fn Player(
                 } else {
                     up_next_entry.replace(entry.clone())
                 };
+                let now = platform::now_ms();
                 if !was.is_empty() && was != entry {
-                    up_next_reset.set(true);
+                    up_next_reset.set(Some(now));
                 }
                 // The group lands on the new entry with a seek; one that
-                // starts inside the card window lands there too.
+                // starts inside the card window lands there too. A player
+                // already where the entry starts gets no seek: events queued
+                // at the old end are long gone after a moment.
                 let before_end = from.map_or(true, |f| state.position_ms < f.at_ms);
-                if up_next_reset.get() && (before_end || event == MediaEvent::Seeked) {
-                    up_next_reset.set(false);
+                let waited = up_next_reset.get().map(|since| now - since);
+                let settled = waited.is_some_and(|ms| ms >= UP_NEXT_RESET_SETTLE_MS);
+                if waited.is_some() && (before_end || event == MediaEvent::Seeked || settled) {
+                    up_next_reset.set(None);
                     platform::info(&format!(
-                        "pharos: up next: reset reason=group_entry entry={entry} at={}ms on={event:?}",
-                        state.position_ms
+                        "pharos: up next: reset reason=group_entry entry={entry} at={}ms on={event:?} waited={:.0}ms",
+                        state.position_ms,
+                        waited.unwrap_or_default()
                     ));
                     up_next.set(UpNext::default());
                 }
@@ -5702,7 +5713,7 @@ fn Player(
                 }
                 // Still at the old entry's end: the group has already moved
                 // on, so no countdown or end from there may move it again.
-                if !up_next_reset.get() {
+                if up_next_reset.get().is_none() {
                     let step = up_next.write().step(state.position_ms, from, total);
                     if let Some(why) = up_next.peek().moves_on(step, event) {
                         platform::info(&format!(
