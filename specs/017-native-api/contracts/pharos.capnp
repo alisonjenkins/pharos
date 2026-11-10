@@ -12,7 +12,7 @@ annotation secret(field, param) :Void;
 
 # Bumped when the schema changes; served as ServerInfo.schemaVersion so a client
 # can tell which methods a server knows (FR-009).
-const schemaVersion :UInt32 = 37;
+const schemaVersion :UInt32 = 39;
 
 # ---- ids and shared types -------------------------------------------------
 struct ItemId {                # mirrors pharos_jellyfin_api::WireId
@@ -74,7 +74,7 @@ struct UserState {
   played @0 :Bool; favorite @1 :Bool; positionMs @2 :UInt64; playCount @3 :UInt32;
   readLocator @4 :Text;      # a book's saved reading position, opaque to the server; empty when unread. Since schemaVersion 32.
   readFraction @5 :Float32;  # how far through the book, 0 to 1; 0 when unread. Since schemaVersion 32.
-  readAt @6 :Int64;          # unix ms when the stored place was read (the saving device's clock, to the second); 0 when unread. Since schemaVersion 37.
+  readAt @6 :Int64;          # unix ms when the stored place was read (the saving device's clock, to the second); 0 when unread. Since schemaVersion 39.
 }
 
 struct ItemSummary {

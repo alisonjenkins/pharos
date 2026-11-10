@@ -323,7 +323,7 @@ pub struct ReadPosition {
     pub locator: String,
     pub fraction: f32,
     /// Unix ms the place was read, to the second; 0 from a server older than
-    /// schemaVersion 37.
+    /// schemaVersion 39.
     pub read_at_ms: i64,
 }
 
