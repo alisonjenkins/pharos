@@ -30,6 +30,11 @@ DecoderFunc = Callable[..., bytes]
 DEFAULT_IDLE_UNLOAD_SECS = 600
 IDLE_CHECK_SECS = 30
 
+# torch otherwise runs one thread a core. On a busy node its OpenMP threads
+# wait on each other at every op, and a song that takes 30 s at 8 threads
+# takes 500 s at 44.
+DEFAULT_THREADS = 8
+
 
 def idle_unload_secs(raw: str | None) -> float | None:
     """Parse PHAROS_ALIGNER_IDLE_UNLOAD_SECS; 0 keeps the model loaded."""
@@ -39,6 +44,16 @@ def idle_unload_secs(raw: str | None) -> float | None:
     if value < 0:
         raise ValueError(f"PHAROS_ALIGNER_IDLE_UNLOAD_SECS must be >= 0, got {raw!r}")
     return None if value == 0 else value
+
+
+def torch_threads(raw: str | None) -> int:
+    """Parse PHAROS_ALIGNER_THREADS, the CPU threads torch may use."""
+    if raw is None or raw.strip() == "":
+        return DEFAULT_THREADS
+    value = int(raw)
+    if value < 1:
+        raise ValueError(f"PHAROS_ALIGNER_THREADS must be >= 1, got {raw!r}")
+    return value
 
 
 class AlignerHandler(http.server.BaseHTTPRequestHandler):
@@ -256,19 +271,22 @@ def main() -> None:
         host = listen
         port = 8790
 
-    from pharos_aligner.model import Aligner, start_idle_reaper
+    from pharos_aligner.model import Aligner, set_threads, start_idle_reaper
 
+    threads = torch_threads(os.environ.get("PHAROS_ALIGNER_THREADS"))
+    set_threads(threads)
     idle_unload_s = idle_unload_secs(os.environ.get("PHAROS_ALIGNER_IDLE_UNLOAD_SECS"))
     aligner = Aligner(idle_unload_s=idle_unload_s)
     if idle_unload_s is not None:
         start_idle_reaper(aligner, interval_s=min(IDLE_CHECK_SECS, idle_unload_s))
     server = create_server((host, port), media_root=media_root, aligner=aligner)
     logger.info(
-        "Serving pharos-aligner on %s:%d (media root: %s, idle unload: %s s)",
+        "Serving pharos-aligner on %s:%d (media root: %s, idle unload: %s s, threads: %d)",
         host,
         port,
         media_root,
         "off" if idle_unload_s is None else int(idle_unload_s),
+        threads,
     )
     try:
         server.serve_forever()
