@@ -128,12 +128,16 @@ pub(crate) enum RematchStep {
     /// A search narrowed by the year found nothing and was asked again
     /// without it.
     YearRetry,
+    /// The search used the year the show's files state, which the stored
+    /// column did not hold.
+    StatedYear,
 }
 
 impl RematchStep {
     pub(crate) fn label(self) -> &'static str {
         match self {
             Self::YearRetry => "year_retry",
+            Self::StatedYear => "stated_year",
         }
     }
 }
@@ -174,7 +178,7 @@ mod tests {
             "nfo_other_series"
         );
         assert_eq!(decided_by_label(None), "none");
-        let steps = [RematchStep::YearRetry];
+        let steps = [RematchStep::YearRetry, RematchStep::StatedYear];
         let set: BTreeSet<_> = steps.iter().map(|s| s.label()).collect();
         assert_eq!(set.len(), steps.len());
         assert_eq!(RematchStep::YearRetry.label(), "year_retry");
