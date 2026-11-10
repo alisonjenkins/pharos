@@ -878,7 +878,9 @@ const LOCALIZATION_OPTIONS: &[LocalizationOptionDto] = &[LocalizationOptionDto {
     value: "en-US",
 }];
 
-/// `GET /Devices` + `/Devices/Info` — admin dashboard's device list.
+/// `GET /Devices` + `/Devices/Info` — the device list. An admin sees every
+/// device; anyone else sees only the devices they are signed in on, so they
+/// can manage those devices' options themselves (ADR-0095).
 /// Aggregated from the token store: each issued token is one device
 /// record. Currently exposes (device_id, user_id, last_user_name).
 async fn devices_list(
@@ -886,21 +888,25 @@ async fn devices_list(
     user: AuthUser,
 ) -> Result<impl Responder, actix_web::Error> {
     use pharos_core::{TokenStore, UserStore};
-    if !user.0.policy.admin {
-        return Err(error::ErrorForbidden("admin required"));
-    }
     // We don't have a `list_all_tokens` API. Walk users, list tokens
     // per user. Phase 1 small-N — admins live with the per-user scan.
-    let users = state
-        .stores
-        .list()
-        .await
-        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    let users = if user.0.policy.admin {
+        state
+            .stores
+            .list()
+            .await
+            .map_err(|e| error::ErrorInternalServerError(e.to_string()))?
+            .into_iter()
+            .map(|u| (u.id, u.name))
+            .collect::<Vec<_>>()
+    } else {
+        vec![(user.0.id, user.0.name.clone())]
+    };
     let mut items: Vec<DeviceInfoLite> = Vec::new();
-    for u in users {
+    for (uid, uname) in users {
         let tokens = state
             .stores
-            .tokens_for(u.id)
+            .tokens_for(uid)
             .await
             .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
         for t in tokens {
@@ -925,8 +931,8 @@ async fn devices_list(
                 name: display_name,
                 app_name: "Jellyfin",
                 app_version: "0",
-                last_user_id: u.id.0.simple().to_string(),
-                last_user_name: u.name.clone(),
+                last_user_id: uid.0.simple().to_string(),
+                last_user_name: uname.clone(),
                 date_last_activity: "1970-01-01T00:00:00.0000000Z",
             });
         }
@@ -1016,6 +1022,53 @@ async fn delete_device(
     Ok(HttpResponse::NoContent().finish())
 }
 
+/// Why a caller may change a device's options.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeviceOptionsRole {
+    Admin,
+    /// The caller is signed in on the device.
+    Owner,
+}
+
+impl DeviceOptionsRole {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Admin => "admin",
+            Self::Owner => "owner",
+        }
+    }
+}
+
+/// An admin may change any device's options, and a user the options of a
+/// device they are signed in on: the person holding the device knows when a
+/// format plays badly on it (ADR-0095). Anyone else is refused.
+async fn device_options_role(
+    state: &AppState,
+    user: &AuthUser,
+    device_id: &str,
+) -> Result<DeviceOptionsRole, actix_web::Error> {
+    use pharos_core::TokenStore;
+    if user.0.policy.admin {
+        return Ok(DeviceOptionsRole::Admin);
+    }
+    let tokens = state
+        .stores
+        .tokens_for(user.0.id)
+        .await
+        .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+    if tokens.iter().any(|t| t.device_id == device_id) {
+        return Ok(DeviceOptionsRole::Owner);
+    }
+    tracing::info!(
+        device.id = device_id,
+        by.user = %user.0.name,
+        "device options refused: not an admin and not signed in on the device"
+    );
+    Err(error::ErrorForbidden(
+        "only an admin or someone signed in on this device can change it",
+    ))
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "PascalCase", default)]
 struct DeviceOptionsBody {
@@ -1037,13 +1090,11 @@ async fn device_options(
     q: CiQuery<DeviceIdQuery>,
     body: web::Bytes,
 ) -> Result<impl Responder, actix_web::Error> {
-    if !user.0.policy.admin {
-        return Err(error::ErrorForbidden("admin required"));
-    }
     let device_id =
         q.id.as_deref()
             .filter(|s| !s.is_empty())
             .ok_or_else(|| error::ErrorBadRequest("missing id"))?;
+    let by = device_options_role(&state, &user, device_id).await?;
     // Only an empty body means "no fields"; a malformed one is refused rather
     // than read as empty and answered 204 as if it had been saved.
     let body: DeviceOptionsBody = if body.iter().all(u8::is_ascii_whitespace) {
@@ -1085,6 +1136,7 @@ async fn device_options(
         tracing::info!(
             device.id = device_id,
             by.user = %user.0.name,
+            by.role = by.label(),
             denied = ?denied,
             "device audio deny list set"
         );
