@@ -295,6 +295,9 @@ pub enum Browse {
         more: Option<Listing>,
         /// A library's own grid, which gets the filter bar and letter rail.
         library: bool,
+        /// A Movies library's grid, which offers to group its films into
+        /// their box sets (B1086).
+        sets: bool,
     },
     Show(Show),
     /// A mixed library: its series, then its other stored items, paged as
@@ -492,6 +495,10 @@ pub async fn load<A: PharosApi>(
     let library = detail
         .as_ref()
         .is_some_and(|d| d.item.kind == ItemKind::Library);
+    let sets = library
+        && detail
+            .as_ref()
+            .is_some_and(|d| d.item.library_kind == Some(LibraryKind::Movies));
     Ok(match (plan(detail.as_ref()), detail) {
         (Plan::SeriesGrid, _) => {
             let more = Listing::of(id, Some(ItemKind::Series), "SortName");
@@ -500,6 +507,7 @@ pub async fn load<A: PharosApi>(
                 page: paged(more.clone()).await?,
                 more: Some(more),
                 library,
+                sets: false,
             }
         }
         (Plan::MixedLibrary, _) => {
@@ -619,15 +627,20 @@ pub async fn load<A: PharosApi>(
                 page: paged(more.clone()).await?,
                 more: Some(more),
                 library: false,
+                sets: false,
             }
         }
         _ => {
-            let more = Listing::of(id, None, "SortName");
+            let mut more = Listing::of(id, None, "SortName");
+            // The library opens as the device last chose, so its first page
+            // is fetched once (B1086).
+            more.collapse = sets && stored_collections();
             Browse::Grid {
                 title,
                 page: paged(more.clone()).await?,
                 more: Some(more),
                 library,
+                sets,
             }
         }
     })
@@ -641,7 +654,8 @@ pub fn BrowseLayout(browse: Browse, #[props(default)] seen: Vec<MemberSeen>) -> 
             page,
             more,
             library,
-        } => rsx! { GridView { title, page, more, library } },
+            sets,
+        } => rsx! { GridView { title, page, more, library, sets } },
         Browse::Show(show) => rsx! { ShowView { show, seen } },
         Browse::Mixed { title, page, chain } => rsx! { MixedView { title, page, chain } },
         Browse::Music {
@@ -656,7 +670,15 @@ pub fn BrowseLayout(browse: Browse, #[props(default)] seen: Vec<MemberSeen>) -> 
 }
 
 #[component]
-pub fn GridView(title: String, page: Page, more: Option<Listing>, library: bool) -> Element {
+pub fn GridView(
+    title: String,
+    page: Page,
+    more: Option<Listing>,
+    library: bool,
+    /// Offer to group the films into their box sets (B1086).
+    #[props(default)]
+    sets: bool,
+) -> Element {
     rsx! {
         section { class: "pharos-browse",
             h2 { "{title}" }
@@ -666,7 +688,7 @@ pub fn GridView(title: String, page: Page, more: Option<Listing>, library: bool)
                 // on, so a new library mounts a new grid (B490).
                 Some(base) if library => remount_on(
                     &base.parent.to_string(),
-                    rsx! { LibraryGrid { first: page, base } },
+                    rsx! { LibraryGrid { first: page, base, sets } },
                 ),
                 Some(source) => remount_on(
                     &source.parent.to_string(),
@@ -738,8 +760,12 @@ fn read_place(key: &str) -> Option<(u32, f64)> {
 /// The choice is kept in the URL and for the tab, and the grid comes back
 /// where it was left while the choice it opened on stands (B560).
 #[component]
-fn LibraryGrid(first: Page, base: Listing) -> Element {
+fn LibraryGrid(first: Page, base: Listing, sets: bool) -> Element {
     let ctx = use_context::<Ctx>();
+    // Whether the films are grouped into box sets; the first page was
+    // fetched the way the device last chose (B1086).
+    let opened_grouped = base.collapse;
+    let grouped = use_signal(|| opened_grouped);
     let library = base.parent;
     let opened = use_hook(|| opening_choice(library));
     let narrow = use_signal(|| opened.clone());
@@ -765,10 +791,13 @@ fn LibraryGrid(first: Page, base: Listing) -> Element {
     let opening = base.clone();
     // The library opened on its default listing; any other is fetched here.
     let listed = use_resource(move || {
-        let listing = narrow.read().apply(&opening);
+        let listing = Listing {
+            collapse: *grouped.read(),
+            ..narrow.read().apply(&opening)
+        };
         let place = place_key(library, &narrow.read().to_query());
         let first = first.clone();
-        let fresh = *narrow.read() != Narrow::default();
+        let fresh = *narrow.read() != Narrow::default() || *grouped.read() != opened_grouped;
         async move {
             if !fresh {
                 return Ok((place, listing, first));
@@ -792,7 +821,7 @@ fn LibraryGrid(first: Page, base: Listing) -> Element {
     });
     let rail = narrow.read().rail();
     rsx! {
-        FilterBar { narrow, genres }
+        FilterBar { narrow, genres, grouped: sets.then_some(grouped) }
         match &*listed.read() {
             None => rsx! { p { class: "pharos-muted", "Loading…" } },
             Some(Err(e)) => rsx! { p { class: "pharos-error", role: "alert", "Couldn't load this library: {e}" } },
@@ -815,7 +844,13 @@ fn LibraryGrid(first: Page, base: Listing) -> Element {
 
 /// Sort, direction, genre and watched state for a library's grid.
 #[component]
-fn FilterBar(narrow: Signal<Narrow>, genres: Signal<Vec<String>>) -> Element {
+fn FilterBar(
+    narrow: Signal<Narrow>,
+    genres: Signal<Vec<String>>,
+    /// Whether films are grouped into box sets, on a Movies library (B1086).
+    #[props(default)]
+    grouped: Option<Signal<bool>>,
+) -> Element {
     let now = narrow.read().clone();
     let genre = now.genre.clone().unwrap_or_default();
     let played = match now.played {
@@ -919,6 +954,22 @@ fn FilterBar(narrow: Signal<Narrow>, genres: Signal<Vec<String>>) -> Element {
                     option { value: "2d", selected: stereo == "2d", "2D only" }
                 }
             }
+            if let Some(mut grouped) = grouped {
+                label { class: "pharos-filter",
+                    span { aria_hidden: "true", "Collections" }
+                    select {
+                        aria_label: "Collections",
+                        value: if *grouped.read() { "grouped" } else { "films" },
+                        onchange: move |e| {
+                            let on = e.value() == "grouped";
+                            keep_collections(on);
+                            grouped.set(on);
+                        },
+                        option { value: "grouped", selected: *grouped.read(), "Grouped" }
+                        option { value: "films", selected: !*grouped.read(), "Each film" }
+                    }
+                }
+            }
             if now != Narrow::default() {
                 button {
                     class: "pharos-button pharos-button-secondary pharos-filter-reset",
@@ -928,6 +979,34 @@ fn FilterBar(narrow: Signal<Narrow>, genres: Signal<Vec<String>>) -> Element {
                 }
             }
         }
+    }
+}
+
+/// The device key of whether a Movies library groups its films into their
+/// box sets (B1086).
+pub const COLLECTIONS_KEY: &str = "pharos.library.collections";
+
+/// Whether a Movies library groups its films into box sets, from what the
+/// device keeps under [`COLLECTIONS_KEY`]: on unless turned off.
+pub fn collections_on(kept: Option<&str>) -> bool {
+    kept != Some("off")
+}
+
+/// [`collections_on`] for this device; a failed read keeps the default.
+fn stored_collections() -> bool {
+    match platform::stored_theme(COLLECTIONS_KEY) {
+        Ok(kept) => collections_on(kept.as_deref()),
+        Err(e) => {
+            platform::warn(&format!("pharos: collections choice not read: {e}"));
+            collections_on(None)
+        }
+    }
+}
+
+/// Keeps the device's choice to group films into box sets.
+fn keep_collections(on: bool) {
+    if let Err(e) = platform::store_theme(COLLECTIONS_KEY, if on { "on" } else { "off" }) {
+        platform::warn(&format!("pharos: collections choice not kept: {e}"));
     }
 }
 
@@ -2697,6 +2776,8 @@ mod tests {
         stamped: RefCell<Vec<(String, String, u32, u32)>>,
         /// Refuses every listing.
         refuse_lists: bool,
+        /// Whether each listing asked for box sets folded (B1086).
+        collapsed: RefCell<Vec<bool>>,
     }
 
     fn refused() -> ClientError {
@@ -2723,6 +2804,7 @@ mod tests {
             limit: u32,
         ) -> Result<Page, ClientError> {
             let (parent, group) = (listing.parent, listing.group);
+            self.collapsed.borrow_mut().push(listing.collapse);
             self.asked
                 .borrow_mut()
                 .push((parent, group, listing.sort_by.clone()));
@@ -2900,6 +2982,7 @@ mod tests {
                 page: page(vec![item(ItemRef::Real(3), ItemKind::Movie, "Film")]),
                 more: Some(Listing::of(id, None, "SortName")),
                 library: false,
+                sets: false,
             }
         );
         assert!(
@@ -3522,6 +3605,34 @@ mod tests {
                 "{kind:?}"
             );
         }
+    }
+
+    /// B1086: a Movies library opens with its films grouped into box sets
+    /// unless the device turned that off, and offers the choice; a Books
+    /// library or a collection neither groups nor offers it.
+    /// Disarm check: with `load` leaving `collapse` unset, the Movies
+    /// listing asks for each film.
+    #[test]
+    fn a_movies_library_groups_its_box_sets_and_offers_the_choice() {
+        let mut fake = Fake::default();
+        for (n, kind) in [(9, LibraryKind::Movies), (8, LibraryKind::Books)] {
+            let id = ItemRef::Real(n);
+            let mut library = item(id, ItemKind::Library, "Lib");
+            library.library_kind = Some(kind);
+            fake.details.insert(id, detail(library));
+        }
+        let set = ItemRef::Real(10);
+        fake.details
+            .insert(set, detail(item(set, ItemKind::Collection, "Boxset")));
+        let opened = |id| run(load(&fake, &CallInfo::default(), id, |_| {})).unwrap();
+        let sets = |b: &Browse| matches!(b, Browse::Grid { sets: true, .. });
+        assert!(sets(&opened(ItemRef::Real(9))));
+        assert!(!sets(&opened(ItemRef::Real(8))));
+        assert!(!sets(&opened(set)));
+        assert_eq!(*fake.collapsed.borrow(), [true, false, false]);
+        assert!(collections_on(None));
+        assert!(collections_on(Some("on")));
+        assert!(!collections_on(Some("off")));
     }
 
     #[test]
