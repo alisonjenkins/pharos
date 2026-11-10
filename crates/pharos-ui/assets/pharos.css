@@ -1057,6 +1057,17 @@ input:focus-visible {
   border-radius: 999px;
   background: var(--px-color-overlay);
 }
+/* B1321/V1292: a phone's header is taller than the space the centred rail
+   leaves above it, so the rail sat over the library tabs. On a phone it
+   sits at the foot of the screen, clear of the header. */
+@media (max-width: 40rem) {
+  .pharos-letters {
+    top: auto;
+    bottom: 0.75rem;
+    translate: none;
+    height: min(calc(100dvh - 15rem), 36rem);
+  }
+}
 .pharos-letter {
   flex: 1 1 0;
   min-height: 0;
