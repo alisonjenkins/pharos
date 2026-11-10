@@ -12,7 +12,7 @@ description = "Pure-Rust subtitle renderer (SRT, WebVTT, ASS/SSA) producing alph
 [dependencies]
 encoding_rs = { version = "0.8", optional = true }
 harfrust = "0.15"
-skrifa = "0.49"
+skrifa = "0.50"
 unicode-bidi = { version = "0.3", default-features = false, features = ["std", "hardcoded-data"] }
 unicode-linebreak = "0.1"
 
