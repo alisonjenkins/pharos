@@ -3260,6 +3260,12 @@ button.pharos-lyrics-line:focus-visible {
   white-space: nowrap;
   pointer-events: none;
 }
+/* The TV's GPU redraws the glow's blur every frame of the glide, which
+   took karaoke from 60 to about 41 fps there; without it the glide holds
+   60 (B1220, V1180). */
+:root[data-device="tv"] .pharos-lyrics-words {
+  filter: none;
+}
 .pharos-listen-note {
   grid-column: 1 / -1;
   margin: 0;
