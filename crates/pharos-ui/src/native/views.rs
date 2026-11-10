@@ -215,6 +215,9 @@ pub fn Shell(
     account: Element,
     search: Element,
     libraries: Vec<Item>,
+    /// The library list could not be read, even on a second ask.
+    #[props(default)]
+    libraries_failed: bool,
     trail: Vec<Item>,
     children: Element,
 ) -> Element {
@@ -232,6 +235,11 @@ pub fn Shell(
                         Link { to: Route::Favourites, "Favourites" }
                         Link { to: Route::Together, "Together" }
                         {account}
+                    }
+                }
+                if libraries_failed && libraries.is_empty() {
+                    p { class: "pharos-muted pharos-library-nav-failed", role: "status",
+                        "Couldn't load your libraries. They come back when the connection does."
                     }
                 }
                 LibraryNav { libraries, current }
@@ -725,6 +733,9 @@ pub fn HomeView(home: Home) -> Element {
         && home.listening.is_empty()
         && home.reading.is_empty()
         && home.next_up.is_empty();
+    let admin = empty
+        && try_use_context::<super::app::AccountMe>()
+            .is_some_and(|me| me.0.read().clone().flatten().is_some_and(|m| m.is_admin));
     let mut rails: Vec<&HomeRail> = home.rails.iter().collect();
     rails.sort_by_key(|rail| rail_rank(rail.library.library_kind));
     // Music to resume sits just before the music libraries.
@@ -738,7 +749,7 @@ pub fn HomeView(home: Home) -> Element {
     rsx! {
         div { class: "pharos-home",
             if empty {
-                p { class: "pharos-empty", "Nothing here yet. Add a library from Manage." }
+                EmptyHome { admin }
             }
             if !home.resume.is_empty() {
                 Rail { title: "Continue watching", items: home.resume.clone(), play: true }
@@ -760,6 +771,31 @@ pub fn HomeView(home: Home) -> Element {
             }
             for rail in from_books {
                 LibraryRail { key: "{rail.library.id}", rail: (*rail).clone() }
+            }
+        }
+    }
+}
+
+/// Home with nothing on it, worded for who is looking (FR-210, A18): an
+/// admin is offered Manage's Libraries page, where libraries are added;
+/// anyone else is told who can add one.
+#[component]
+fn EmptyHome(admin: bool) -> Element {
+    let nav = try_use_context::<Nav>();
+    rsx! {
+        div { class: "pharos-empty pharos-empty-home",
+            if admin {
+                p { "Nothing here yet. Libraries are added in Manage, under Libraries." }
+                if let Some(nav) = nav {
+                    button {
+                        class: "pharos-button",
+                        r#type: "button",
+                        onclick: move |_| super::manage::open_manage(nav, crate::views::AdminTab::Libraries),
+                        "Add a library"
+                    }
+                }
+            } else {
+                p { "Nothing here yet. Ask whoever runs this server to add a library or to share one with you." }
             }
         }
     }
@@ -2507,6 +2543,27 @@ mod tests {
         assert!(none.contains("No matches for"), "{none}");
     }
 
+    /// FR-210: a library list that could not be read, even twice, is said.
+    #[test]
+    fn the_shell_says_when_the_libraries_could_not_load() {
+        let shell = |failed: bool| {
+            render(move || {
+                rsx! {
+                    Shell {
+                        account: rsx! {},
+                        search: rsx! {},
+                        libraries: vec![],
+                        libraries_failed: failed,
+                        trail: vec![],
+                        p { "screen" }
+                    }
+                }
+            })
+        };
+        assert!(shell(true).contains("load your libraries"));
+        assert!(!shell(false).contains("load your libraries"));
+    }
+
     #[test]
     fn the_search_list_shows_the_first_matches_and_a_way_to_the_rest() {
         let html = search_box("match", found(9), true, Some(1));
@@ -2800,14 +2857,20 @@ mod tests {
         assert!(html.contains("Continue listening"), "{html}");
         assert!(html.contains("Carefree"), "{html}");
         assert!(!html.contains("Continue watching"), "{html}");
-        assert!(!html.contains("Add a library from Manage"), "{html}");
+        assert!(!html.contains("Nothing here yet"), "{html}");
     }
 
+    /// FR-210: an empty home tells a viewer who can add a library, and
+    /// offers an admin Manage's Libraries page.
     #[test]
-    fn an_empty_home_points_at_manage() {
+    fn an_empty_home_is_worded_for_who_is_looking() {
         let home = Home::default();
         let html = render(move || rsx! { HomeView { home: home.clone() } });
-        assert!(html.contains("Add a library from Manage"), "{html}");
+        assert!(html.contains("Ask whoever runs this server"), "{html}");
+        assert!(!html.contains("Add a library"), "{html}");
+        let admin = render(|| rsx! { EmptyHome { admin: true } });
+        assert!(admin.contains("under Libraries"), "{admin}");
+        assert!(admin.contains("Add a library"), "{admin}");
     }
 
     #[test]
