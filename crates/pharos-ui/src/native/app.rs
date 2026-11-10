@@ -5551,6 +5551,63 @@ fn Player(
     // it, so a tick does not rebuild the player (B815).
     let mut position = use_signal(|| 0u64);
     let media_rest = use_memo(move || split_position(media()).0);
+    // What a wait under the spinner is for (038 FR-401): whether this video
+    // has played yet, and, once a wait passes `wait::HINT_AFTER_MS`, the
+    // server's word on whether it is queued for an encoder (FR-402).
+    let started = use_signal(|| false);
+    let mut queue_hint = use_signal(|| None::<pharos_client::api::QueueHint>);
+    // Read when present: the stage can mount before the signed-in shell has
+    // provided it.
+    let account = try_use_context::<AccountMe>();
+    let wait_logged = use_hook(|| Rc::new(RefCell::new(String::new())));
+    use_future({
+        let p = Rc::clone(&p);
+        move || {
+            let p = Rc::clone(&p);
+            async move {
+                // When this wait began, when the server was last asked, and
+                // whether it cannot answer (an older server) for this wait.
+                let (mut since, mut asked_at, mut gave_up) = (None::<u64>, 0u64, false);
+                loop {
+                    platform::sleep_ms(1_000).await;
+                    let now = now_ms_u64();
+                    if !(media.peek().loading && failed.peek().is_none()) {
+                        (since, gave_up) = (None, false);
+                        if queue_hint.peek().is_some() {
+                            queue_hint.set(None);
+                        }
+                        continue;
+                    }
+                    let began = *since.get_or_insert(now);
+                    if gave_up
+                        || now.saturating_sub(began) < super::wait::HINT_AFTER_MS
+                        || now.saturating_sub(asked_at) < super::wait::HINT_EVERY_MS
+                    {
+                        continue;
+                    }
+                    asked_at = now;
+                    let grant = p.grant.borrow().clone();
+                    match grant.queue_hint(&call("watch", "queue hint")).await {
+                        // Set only on a change: each set rebuilds the player.
+                        Ok(hint) if media.peek().loading => {
+                            if *queue_hint.peek() != Some(hint) {
+                                queue_hint.set(Some(hint));
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            gave_up = true;
+                            platform::warn(&format!(
+                                "pharos: queue hint failed item={} waited_ms={} reason={e}",
+                                p.detail.item.id,
+                                now.saturating_sub(began)
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    });
     let mut hover_ms = use_signal(|| None::<u64>);
     // The subtitle on screen: the server's pick, then the viewer's.
     let mut subtitle = use_signal(|| p.subtitle);
@@ -6348,6 +6405,10 @@ fn Player(
             }
             let resumed = match event {
                 MediaEvent::Playing => {
+                    if !*started.peek() {
+                        let mut started = started;
+                        started.set(true);
+                    }
                     was_paused.0.set(false);
                     let now = platform::now_ms();
                     let mut slot = resume.borrow_mut();
@@ -6938,11 +6999,44 @@ fn Player(
         let skips = skips.clone();
         move || release_track_skips(&skips, skip_owner)
     });
+    let waiting = media_rest().loading && failed().is_none();
+    let wait_caption = if waiting {
+        let me = account.and_then(|a| {
+            a.0.read().as_ref().and_then(Option::as_ref).map(|m| (m.id.clone(), m.name.clone()))
+        });
+        let members_waiting: Vec<String> = match me {
+            Some((id, name)) if group.drives(playing_id) => group
+                .members
+                .iter()
+                .filter(|m| m.buffering && m.id != id && m.name != name)
+                .map(|m| m.name.clone())
+                .collect(),
+            _ => Vec::new(),
+        };
+        let facts = super::wait::WaitFacts {
+            started: started(),
+            seeking_to: seek_wait().map(|w| w.to_ms),
+            hint: queue_hint(),
+            members_waiting: &members_waiting,
+        };
+        let cause = super::wait::cause(&facts);
+        let caption = cause.caption();
+        // The decision line, once per caption a wait shows.
+        if *wait_logged.borrow() != caption {
+            platform::info(&super::wait::line(&playing_id.to_string(), &cause, &facts));
+            caption.clone_into(&mut wait_logged.borrow_mut());
+        }
+        caption
+    } else {
+        wait_logged.borrow_mut().clear();
+        String::new()
+    };
     let controls = Controls {
         media: MediaState {
-            loading: media_rest().loading && failed().is_none(),
+            loading: waiting,
             ..media_rest()
         },
+        wait_caption,
         runtime_ms: p.detail.item.runtime_ms,
         chapters: p.detail.chapters.clone(),
         segments: p.detail.segments.clone(),
