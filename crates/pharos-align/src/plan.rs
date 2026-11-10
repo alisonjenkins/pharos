@@ -31,7 +31,7 @@ pub struct Line {
 }
 
 /// A word's start, or the line's end when `at` is the line length.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub struct Stamp {
     /// Code-point offset into the line text.
     pub at: usize,
