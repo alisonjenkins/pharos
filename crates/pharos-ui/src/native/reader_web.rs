@@ -20,7 +20,7 @@ use wasm_bindgen::closure::Closure;
 use wasm_bindgen::JsCast as _;
 
 use super::app::{call, this_device, Ctx};
-use super::kept::{resume_place, server_place_to_adopt};
+use super::kept::{resume_place, server_place_to_adopt, KeptFormat};
 use super::kept_web;
 use super::keymap::Mode;
 use super::pdf_web::PdfView;
@@ -326,7 +326,7 @@ struct Saver {
     id: ItemRef,
     /// The book is kept on this device: each place is also noted in its
     /// record, for a resume with no server.
-    kept: bool,
+    kept: Cell<bool>,
     gate: RefCell<SaveGate>,
 }
 
@@ -346,7 +346,7 @@ impl Saver {
             "pharos: reader save item={} locator={locator} fraction={fraction:.3} forced={forced}",
             self.id
         ));
-        if self.kept {
+        if self.kept.get() {
             kept_web::note_position(self.id, locator, fraction, read_at_ms);
         }
         self.outbox.submit(
@@ -539,6 +539,47 @@ async fn book_bytes(
         return Err("This book is not on this device and there is no connection.".into());
     }
     fetch_book(id).await.map(|bytes| (bytes, "network"))
+}
+
+/// What follows a book opening, off the critical path (FR-008). A kept
+/// book notes the open and why it is kept now; a book fetched for reading
+/// and not kept is written to the cache from the bytes already in hand,
+/// when a policy keeps it. Then the books the settings no longer keep go.
+fn after_open(
+    id: ItemRef,
+    title: String,
+    format: KeptFormat,
+    api: Option<NativeApi>,
+    core: Rc<Core>,
+    fetched: Option<js_sys::Uint8Array>,
+) {
+    platform::spawn_detached(async move {
+        if core.saver.kept.get() {
+            kept_web::note_open(id);
+        } else if let (Some(bytes), Some(api)) = (fetched, api) {
+            let place = (core.engine.locator(), core.engine.progress() as f32);
+            match kept_web::within(
+                kept_web::SERVER_CHECK_MS,
+                api.me(&call("read", "auto-keep")),
+            )
+            .await
+            {
+                Some(Ok(me)) => {
+                    if kept_web::auto_keep(id, &title, format, &me.id, &bytes, place).await {
+                        core.saver.kept.set(true);
+                    }
+                }
+                Some(Err(e)) => platform::warn(&format!(
+                    "pharos: kept auto skipped item={id} why=could not tell who is signed in: {e}"
+                )),
+                None => platform::warn(&format!(
+                    "pharos: kept auto skipped item={id} why=no answer in {} ms",
+                    kept_web::SERVER_CHECK_MS
+                )),
+            }
+        }
+        kept_web::enforce("open").await;
+    });
 }
 
 /// Once a kept book is open, asks the server who is signed in, for at most
@@ -767,7 +808,7 @@ async fn open_book(
         saver: Saver {
             outbox,
             id,
-            kept,
+            kept: Cell::new(kept),
             gate: RefCell::new(SaveGate::default()),
         },
         read_at: Cell::new(read_now()),
@@ -809,7 +850,7 @@ async fn open_pdf(
         saver: Saver {
             outbox,
             id,
-            kept,
+            kept: Cell::new(kept),
             gate: RefCell::new(SaveGate::default()),
         },
         read_at: Cell::new(read_now()),
@@ -1001,6 +1042,8 @@ pub fn ReaderScreen(id: ItemRef) -> Element {
                         }
                     };
                     let length = bytes.length();
+                    let auto = (!kept && from == "network" && kept_web::wants_auto())
+                        .then(|| bytes.clone());
                     let saved = head.saved.clone();
                     let opened = open_pdf(
                         outbox,
@@ -1031,11 +1074,20 @@ pub fn ReaderScreen(id: ItemRef) -> Element {
                     match opened {
                         Ok(o) if alive.get() => {
                             let at = o.core.engine.locator();
+                            let opened_core = o.core.clone();
                             *core.borrow_mut() = Some(o.core);
                             phase.set(Phase::Reading);
                             if kept {
                                 check_place_later(id, live_api, alive.clone(), core.clone());
                             }
+                            after_open(
+                                id,
+                                head.title.clone(),
+                                KeptFormat::Pdf,
+                                api.clone(),
+                                opened_core,
+                                auto,
+                            );
                             platform::info(&format!(
                                 "pharos: reader opened item={id} format=pdf from={from} bytes={length} ms={:.0} resumed={} at={}",
                                 platform::now_ms() - began,
@@ -1061,6 +1113,8 @@ pub fn ReaderScreen(id: ItemRef) -> Element {
                         return;
                     }
                 };
+                let auto =
+                    (!kept && from == "network" && kept_web::wants_auto()).then(|| bytes.clone());
                 let bytes = js_sys::Uint8Array::to_vec(&bytes);
                 let length = bytes.len();
                 let saved = head.saved.as_deref().and_then(saved_locator);
@@ -1107,6 +1161,7 @@ pub fn ReaderScreen(id: ItemRef) -> Element {
                 match opened {
                     Ok(o) if alive.get() => {
                         let at = o.core.engine.locator();
+                        let opened_core = o.core.clone();
                         *weak.borrow_mut() = Rc::downgrade(&o.core);
                         toc.set(o.toc);
                         *core.borrow_mut() = Some(o.core);
@@ -1114,6 +1169,14 @@ pub fn ReaderScreen(id: ItemRef) -> Element {
                         if kept {
                             check_place_later(id, live_api, alive.clone(), core.clone());
                         }
+                        after_open(
+                            id,
+                            head.title.clone(),
+                            KeptFormat::Epub,
+                            api.clone(),
+                            opened_core,
+                            auto,
+                        );
                         platform::info(&format!(
                             "pharos: reader opened item={id} format=epub from={from} bytes={length} ms={:.0} resumed={} at={}",
                             platform::now_ms() - began,
