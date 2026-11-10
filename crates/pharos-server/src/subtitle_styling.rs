@@ -903,6 +903,7 @@ impl<S: JobStore, A: Signals, Q: TranscodeQueue> Styler<S, A, Q> {
             lines: sig.lines.iter().map(line_signals).collect(),
             cuts_ms: sig.cuts_ms,
             bottom_text: sig.bottom_text,
+            sung: Vec::new(),
         };
         let direction = pharos_styling::direct(&parsed.lines, &track, &segments);
         report.direct = Some(t.elapsed());
