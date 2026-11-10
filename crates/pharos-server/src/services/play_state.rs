@@ -83,6 +83,14 @@ pub enum ReportError {
     /// be recorded.
     #[error("session registry: {0}")]
     RegistryDown(String),
+    /// A play-state read or write on the stop failed (spec 038 FR-108). The
+    /// playback has ended; the position was not stored, so a retry can.
+    #[error("play state {step}: {source}")]
+    Store {
+        step: &'static str,
+        #[source]
+        source: pharos_core::DomainError,
+    },
 }
 
 /// A player starting an item: the now-playing entry `/Sessions` lists.
@@ -311,8 +319,11 @@ pub async fn stop(state: &AppState, user: &User, r: Report<'_>) -> Result<(), Re
         Err(pharos_core::DomainError::NotFound(_)) => 0,
         Err(error) => {
             StopOutcome::ItemReadFailed.record();
-            tracing::warn!(%error, item = item_id, position, "playback stop: item read failed, treating the runtime as unknown");
-            0
+            tracing::warn!(%error, item = item_id, position, "playback stop: item read failed, nothing stored");
+            return Err(ReportError::Store {
+                step: "item read",
+                source: error,
+            });
         }
     };
     // P36 — threshold configurable via [server].played_threshold_pct
@@ -325,7 +336,10 @@ pub async fn stop(state: &AppState, user: &User, r: Report<'_>) -> Result<(), Re
         Err(error) => {
             StopOutcome::UserDataReadFailed.record();
             tracing::warn!(%error, item = item_id, position, "playback stop: user data read failed, nothing stored");
-            return Ok(());
+            return Err(ReportError::Store {
+                step: "user data read",
+                source: error,
+            });
         }
     };
     if finished {
@@ -358,6 +372,10 @@ pub async fn stop(state: &AppState, user: &User, r: Report<'_>) -> Result<(), Re
         Err(error) => {
             StopOutcome::UserDataWriteFailed.record();
             tracing::warn!(%error, item = item_id, position, finished, "playback stop: user data write failed");
+            return Err(ReportError::Store {
+                step: "user data write",
+                source: error,
+            });
         }
     }
     Ok(())

@@ -362,6 +362,11 @@ impl Drop for Grant {
                         tracing::info!(%play_session_id, ?hidden, "playback: released grant's item is withheld, ending without a position");
                         (play_state::end(&session.state, user.id, &psid).await, false)
                     }
+                    // The playback ended; only its position was lost.
+                    Err(e @ play_state::ReportError::Store { .. }) => {
+                        tracing::warn!(%play_session_id, error = %e, "playback: released grant's position not stored");
+                        (Ok(()), false)
+                    }
                     other => (other, reported_ms.is_some()),
                 },
                 Err(_) => (
@@ -428,6 +433,12 @@ fn report_denial(e: play_state::ReportError) -> Denial {
             dependency: "item store",
         },
         play_state::ReportError::Withheld(_) => Denial::NotFound { what: "item" },
+        play_state::ReportError::Store { .. } => {
+            tracing::warn!(error = %e, "native playback stop: play state not stored");
+            Denial::Unavailable {
+                dependency: "play state store",
+            }
+        }
         play_state::ReportError::RegistryDown(_) => {
             tracing::warn!(error = %e, "native playback report: session registry unavailable");
             Denial::Unavailable {
