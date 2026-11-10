@@ -696,6 +696,126 @@ impl server::session::Handler for Session {
         }
         Ok(())
     }
+
+    async fn my_devices(
+        self: Rc<Self>,
+        _params: wire::MyDevicesParams,
+        results: &mut wire::MyDevicesResults,
+    ) -> Result<(), capnp::Error> {
+        let user = match self.current_user().await {
+            Ok(user) => user,
+            Err(denial) => {
+                denial.write(results.get().init_result().init_error());
+                return Ok(());
+            }
+        };
+        let devices = match crate::services::devices::devices_of(&self.state, user.id).await {
+            Ok(devices) => devices,
+            Err(e) => {
+                tracing::warn!(user = %user.name, error = %e, "native device list failed");
+                Denial::Unavailable {
+                    dependency: "token store",
+                }
+                .write(results.get().init_result().init_error());
+                return Ok(());
+            }
+        };
+        let current = {
+            use pharos_core::TokenStore as _;
+            self.state
+                .stores
+                .device_for_token(&self.token)
+                .await
+                .ok()
+                .flatten()
+        };
+        let len = u32::try_from(devices.len()).unwrap_or(u32::MAX);
+        let mut list = results.get().init_result().init_devices(len);
+        for (i, d) in devices.iter().enumerate().take(len as usize) {
+            let mut b = list.reborrow().get(i as u32);
+            b.set_id(d.id.as_str());
+            b.set_name(d.name.as_str());
+            b.set_current(current.as_deref() == Some(d.id.as_str()));
+            let codecs_len = u32::try_from(d.denied_audio_codecs.len()).unwrap_or(u32::MAX);
+            let mut codecs = b.init_converted_audio(codecs_len);
+            for (j, c) in d
+                .denied_audio_codecs
+                .iter()
+                .enumerate()
+                .take(codecs_len as usize)
+            {
+                codecs.set(j as u32, c.as_str());
+            }
+        }
+        Ok(())
+    }
+
+    async fn set_device_converted_audio(
+        self: Rc<Self>,
+        params: wire::SetDeviceConvertedAudioParams,
+        results: &mut wire::SetDeviceConvertedAudioResults,
+    ) -> Result<(), capnp::Error> {
+        use crate::services::devices::SetConvertedAudioError;
+        let user = match self.current_user().await {
+            Ok(user) => user,
+            Err(denial) => {
+                denial.write(results.get().init_result().init_error());
+                return Ok(());
+            }
+        };
+        let params = params.get()?;
+        let device_id = params
+            .get_device_id()
+            .ok()
+            .and_then(|r| r.to_str().ok())
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        if device_id.is_empty() {
+            Denial::Invalid { field: "deviceId" }.write(results.get().init_result().init_error());
+            return Ok(());
+        }
+        let mut codecs = Vec::new();
+        if let Ok(list) = params.get_codecs() {
+            for c in list.iter() {
+                match c.ok().and_then(|r| r.to_str().ok()) {
+                    Some(c) => codecs.push(c.to_string()),
+                    None => {
+                        Denial::Invalid { field: "codecs" }
+                            .write(results.get().init_result().init_error());
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        let mut done = results.get().init_result();
+        match crate::services::devices::set_own_converted_audio(
+            &self.state,
+            user.id,
+            &user.name,
+            &device_id,
+            &codecs,
+        )
+        .await
+        {
+            Ok(_) => done.set_ok(()),
+            Err(SetConvertedAudioError::NotSignedIn(_)) => Denial::NotPermitted {
+                what: "a device this user is not signed in on",
+            }
+            .write(done.init_error()),
+            Err(SetConvertedAudioError::Refused(_)) => {
+                Denial::Invalid { field: "codecs" }.write(done.init_error());
+            }
+            Err(SetConvertedAudioError::Store(e)) => {
+                tracing::warn!(user = %user.name, device.id = %device_id, error = %e, "native device sound formats write failed");
+                Denial::Unavailable {
+                    dependency: "config store",
+                }
+                .write(done.init_error());
+            }
+        }
+        Ok(())
+    }
 }
 
 /// The device id a media token is stored under: the session's own device

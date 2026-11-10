@@ -26,6 +26,7 @@ mod lyrics;
 mod manage_token;
 mod media_token;
 mod mix;
+mod my_devices;
 mod password;
 mod person;
 mod playback;
