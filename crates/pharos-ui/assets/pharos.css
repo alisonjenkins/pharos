@@ -2531,6 +2531,13 @@ body:has(.pharos-stage.is-full .pharos-stage-slot:not([inert]) .pharos-connectio
   top: 0;
   bottom: 0;
 }
+/* What the media has data for ahead of the play head (T038-301), under
+   the played fill. */
+.pharos-seek-buffered {
+  left: 0;
+  border-radius: 3px;
+  background: rgb(255 255 255 / 0.28); /* not themed: controls sit on the video, whose colours no theme sets */
+}
 .pharos-seek-played {
   left: 0;
   overflow: hidden;

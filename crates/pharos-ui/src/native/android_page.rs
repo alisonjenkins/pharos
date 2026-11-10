@@ -343,6 +343,10 @@ pub fn page_visible() -> bool {
     true
 }
 
+pub fn buffered_to_ms(_id: &str) -> u64 {
+    0
+}
+
 pub fn element_width(_id: &str) -> f64 {
     0.0
 }
