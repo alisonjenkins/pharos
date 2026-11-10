@@ -103,6 +103,100 @@ impl CompletionStatus {
     }
 }
 
+/// How one scan pass ended: the `outcome` label of `pharos_scan_total`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ScanOutcome {
+    /// Every root scanned.
+    Completed,
+    /// Some roots scanned and at least one failed.
+    Partial,
+    /// Every root failed.
+    Failed,
+    /// Stopped by a cancel request.
+    Cancelled,
+}
+
+impl ScanOutcome {
+    pub const ALL: [ScanOutcome; 4] = [
+        ScanOutcome::Completed,
+        ScanOutcome::Partial,
+        ScanOutcome::Failed,
+        ScanOutcome::Cancelled,
+    ];
+
+    #[must_use]
+    pub fn of(cancelled: bool, roots: usize, failed_roots: usize) -> Self {
+        if cancelled {
+            ScanOutcome::Cancelled
+        } else if failed_roots == 0 {
+            ScanOutcome::Completed
+        } else if failed_roots >= roots {
+            ScanOutcome::Failed
+        } else {
+            ScanOutcome::Partial
+        }
+    }
+
+    /// Stable metric label; dashboards and alerts key on these strings.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            ScanOutcome::Completed => "completed",
+            ScanOutcome::Partial => "partial",
+            ScanOutcome::Failed => "failed",
+            ScanOutcome::Cancelled => "cancelled",
+        }
+    }
+}
+
+/// What one scan pass did, summed over its roots.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub struct ScanTally {
+    pub roots: usize,
+    pub failed_roots: usize,
+    pub added: usize,
+    pub changed: usize,
+    pub removed: usize,
+}
+
+impl ScanTally {
+    #[must_use]
+    pub fn outcome(&self, cancelled: bool) -> ScanOutcome {
+        ScanOutcome::of(cancelled, self.roots, self.failed_roots)
+    }
+}
+
+/// Counts the pass in `pharos_scan_total{outcome}` and writes its end line,
+/// failures and all, so a scan that found nothing can be told from one that
+/// read nothing.
+pub fn record_scan_end(tally: &ScanTally, outcome: ScanOutcome, elapsed: std::time::Duration) {
+    metrics::counter!("pharos_scan_total", "outcome" => outcome.label()).increment(1);
+    let ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+    if outcome == ScanOutcome::Completed || outcome == ScanOutcome::Cancelled {
+        tracing::info!(
+            outcome = outcome.label(),
+            roots = tally.roots,
+            failed_roots = tally.failed_roots,
+            added = tally.added,
+            changed = tally.changed,
+            removed = tally.removed,
+            elapsed_ms = ms,
+            "scan: finished"
+        );
+    } else {
+        tracing::warn!(
+            outcome = outcome.label(),
+            roots = tally.roots,
+            failed_roots = tally.failed_roots,
+            added = tally.added,
+            changed = tally.changed,
+            removed = tally.removed,
+            elapsed_ms = ms,
+            "scan: finished"
+        );
+    }
+}
+
 /// Result of the most recent completed run of a task — feeds
 /// `TaskInfo.LastExecutionResult`.
 #[derive(Clone, Copy, Debug)]
@@ -365,6 +459,61 @@ fn now_ms() -> i64 {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scan_outcome_follows_root_failures() {
+        assert_eq!(ScanOutcome::of(false, 3, 0), ScanOutcome::Completed);
+        assert_eq!(ScanOutcome::of(false, 3, 1), ScanOutcome::Partial);
+        assert_eq!(ScanOutcome::of(false, 3, 3), ScanOutcome::Failed);
+        assert_eq!(ScanOutcome::of(true, 3, 3), ScanOutcome::Cancelled);
+        assert_eq!(ScanOutcome::of(false, 0, 0), ScanOutcome::Completed);
+    }
+
+    #[test]
+    fn scan_outcome_labels_are_distinct() {
+        let mut labels: Vec<_> = ScanOutcome::ALL.iter().map(|o| o.label()).collect();
+        labels.sort_unstable();
+        labels.dedup();
+        assert_eq!(labels.len(), ScanOutcome::ALL.len());
+    }
+
+    /// The counter is the dashboard contract. Fails if `record_scan_end`
+    /// stops emitting it.
+    #[test]
+    fn record_scan_end_counts_each_outcome() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = pharos_test_metrics::snapshotter(&recorder);
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let tally = ScanTally {
+            roots: 2,
+            failed_roots: 2,
+            ..ScanTally::default()
+        };
+        record_scan_end(&tally, tally.outcome(false), std::time::Duration::ZERO);
+        record_scan_end(
+            &ScanTally::default(),
+            ScanOutcome::Completed,
+            std::time::Duration::ZERO,
+        );
+        let mut seen = Vec::new();
+        for (ck, _, _, v) in snapshotter.snapshot().into_vec() {
+            if ck.key().name() != "pharos_scan_total" {
+                continue;
+            }
+            let outcome = ck
+                .key()
+                .labels()
+                .find(|l| l.key() == "outcome")
+                .map(|l| l.value().to_string())
+                .unwrap_or_default();
+            if let DebugValue::Counter(c) = v {
+                seen.push((outcome, c));
+            }
+        }
+        seen.sort();
+        assert_eq!(seen, vec![("completed".into(), 1), ("failed".into(), 1)]);
+    }
 
     #[test]
     fn start_progress_finish_cycle() {

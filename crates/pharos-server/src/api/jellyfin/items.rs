@@ -7671,6 +7671,11 @@ pub(crate) fn spawn_scan_tracked(
             let mut added: Vec<pharos_core::MediaId> = Vec::new();
             let mut removed: Vec<pharos_core::MediaId> = Vec::new();
             let mut cancelled = false;
+            let mut tally = crate::scan_tasks::ScanTally {
+                roots: planned,
+                ..Default::default()
+            };
+            let pass_started = std::time::Instant::now();
             'groups: for (force, group) in plan {
                 // Mirror `main::scan`'s prober selection: the `ffmpeg-lib` build
                 // probes in-process via the resident libav worker (the distroless
@@ -7716,12 +7721,16 @@ pub(crate) fn spawn_scan_tracked(
                                 skipped = outcome.skipped,
                                 "scan: root scanned"
                             );
+                            tally.added += outcome.added.len();
+                            tally.changed += outcome.updated.len();
+                            tally.removed += outcome.removed.len();
                             added.extend(outcome.added.iter().copied());
                             added.extend(outcome.updated.iter().copied());
                             removed.extend(outcome.removed.iter().copied());
                         }
                         Err(e) => {
-                            tracing::warn!(root = %root.display(), error = %e, "scan: root scan failed")
+                            tally.failed_roots += 1;
+                            tracing::warn!(root = %root.display(), force, error = %e, "scan: root scan failed")
                         }
                     }
                     completed_roots.fetch_add(1, Ordering::Relaxed);
@@ -7735,6 +7744,11 @@ pub(crate) fn spawn_scan_tracked(
                 state.set_libraries(libs);
             }
             state.notify_library_delta(&added, &removed);
+            crate::scan_tasks::record_scan_end(
+                &tally,
+                tally.outcome(cancelled),
+                pass_started.elapsed(),
+            );
 
             let status = if cancelled {
                 crate::scan_tasks::CompletionStatus::Cancelled
