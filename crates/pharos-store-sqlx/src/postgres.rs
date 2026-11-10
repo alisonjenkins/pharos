@@ -4181,14 +4181,15 @@ impl ReadPositionStore for PostgresStore {
         user: UserId,
         item: MediaId,
         position: ReadPosition,
-    ) -> DomainResult<()> {
-        sqlx::query(
+    ) -> DomainResult<bool> {
+        let done = sqlx::query(
             "INSERT INTO read_positions (user_id, item_id, locator, fraction, updated_at)
              VALUES ($1, $2, $3, $4, $5)
              ON CONFLICT (user_id, item_id) DO UPDATE SET
                locator = EXCLUDED.locator,
                fraction = EXCLUDED.fraction,
-               updated_at = EXCLUDED.updated_at",
+               updated_at = EXCLUDED.updated_at
+             WHERE EXCLUDED.updated_at >= read_positions.updated_at",
         )
         .bind(user.0.as_bytes().to_vec())
         .bind(media_id_i64(item)?)
@@ -4198,7 +4199,7 @@ impl ReadPositionStore for PostgresStore {
         .execute(&self.pool)
         .await
         .map_err(|e| DomainError::Backend(e.to_string()))?;
-        Ok(())
+        Ok(done.rows_affected() > 0)
     }
 
     #[tracing::instrument(skip(self), fields(user.id = %user.0, limit))]

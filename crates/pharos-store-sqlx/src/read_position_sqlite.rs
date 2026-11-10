@@ -79,14 +79,15 @@ impl ReadPositionStore for SqliteStore {
         user: UserId,
         item: MediaId,
         position: ReadPosition,
-    ) -> DomainResult<()> {
-        sqlx::query(
+    ) -> DomainResult<bool> {
+        let done = sqlx::query(
             "INSERT INTO read_positions (user_id, item_id, locator, fraction, updated_at)
              VALUES (?, ?, ?, ?, ?)
              ON CONFLICT(user_id, item_id) DO UPDATE SET
                locator = excluded.locator,
                fraction = excluded.fraction,
-               updated_at = excluded.updated_at",
+               updated_at = excluded.updated_at
+             WHERE excluded.updated_at >= read_positions.updated_at",
         )
         .bind(user.0.as_bytes().to_vec())
         .bind(media_id_i64(item)?)
@@ -96,7 +97,7 @@ impl ReadPositionStore for SqliteStore {
         .execute(self.pool())
         .await
         .map_err(map_err)?;
-        Ok(())
+        Ok(done.rows_affected() > 0)
     }
 
     #[tracing::instrument(skip(self), fields(user.id = %user.0, limit))]

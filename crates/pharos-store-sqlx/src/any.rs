@@ -1635,7 +1635,7 @@ impl ReadPositionStore for AnyStore {
         user: UserId,
         item: MediaId,
         position: ReadPosition,
-    ) -> DomainResult<()> {
+    ) -> DomainResult<bool> {
         match self {
             AnyStore::Sqlite(s) => s.set_read_position(user, item, position).await,
             AnyStore::Postgres(p) => p.set_read_position(user, item, position).await,

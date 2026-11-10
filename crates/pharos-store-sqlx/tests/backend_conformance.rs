@@ -3518,6 +3518,21 @@ where
         ]
     );
 
+    // Newest reading wins (V1131): an older reading is kept out and reported,
+    // an equal one is stored again (a retry).
+    assert!(!store
+        .set_read_position(uid, a, pos("epub:1:0", 0.1, 150))
+        .await
+        .unwrap());
+    assert_eq!(
+        store.get_read_position(uid, a).await.unwrap(),
+        Some(pos("epub:3:0", 0.75, 200))
+    );
+    assert!(store
+        .set_read_position(uid, a, pos("epub:3:0", 0.75, 200))
+        .await
+        .unwrap());
+
     // Part read: fraction above 0, newest save first, one user's own.
     assert_eq!(store.part_read_items(uid, 10).await.unwrap(), vec![b, a]);
     assert_eq!(store.part_read_items(uid, 1).await.unwrap(), vec![b]);
