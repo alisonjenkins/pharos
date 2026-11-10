@@ -2092,7 +2092,8 @@ where
 pub(crate) enum RepairReason {
     /// Another show matches the name exactly and no year separates them.
     ExactRival,
-    /// The matched show premiered more than a year from the stated year.
+    /// The matched show premiered more than [`STATED_YEAR_SLACK`] years
+    /// from the stated year.
     YearMismatch,
     /// The folder is split, or a hand fix names it.
     Split,
@@ -2219,7 +2220,7 @@ impl Survey {
 
 /// Spec 033 §6 (V940) — the stored matches with conflicting evidence. A
 /// searched show is re-asked when its folder is split or named by a hand fix,
-/// when its match premiered more than a year from its stated year, or when a
+/// when its match premiered more than two years from its stated year, or when a
 /// fresh search finds another show of the exact name no year separates. An
 /// episode is rebuilt when its own old search matched another show than its
 /// series' pinned one, or when it aired outside that show's run (by the
@@ -2792,8 +2793,10 @@ where
         return Ok(Some((RepairReason::Split, String::new())));
     }
     let premiered = stored.premiere_date.and_then(pharos_store_sqlx::unix_year);
+    // B990 — the same slack the re-match reads a candidate's year with, so
+    // a show it chose is not re-asked by the next survey.
     if let (Some(stated), Some(premiered)) = (stated, premiered) {
-        if stated.abs_diff(premiered) > 1 {
+        if stated.abs_diff(premiered) > STATED_YEAR_SLACK {
             return Ok(Some((RepairReason::YearMismatch, String::new())));
         }
     }
@@ -8626,7 +8629,17 @@ mod tests {
                 ("920011", "Show A (2003)", Some(2005)),
                 ("920012", "Show A: The Return", Some(1980)),
             ])
-            .with_detail(enriched_overview("A fleet."));
+            .with_detail(enriched_overview("A fleet."))
+            // The remake's record dates it by its 2005 series.
+            .with_detail_for(
+                "920011",
+                EnrichedMetadata {
+                    overview: Some("A fleet.".into()),
+                    // 2005-01-14
+                    premiere_date: Some(1_105_660_800),
+                    ..EnrichedMetadata::default()
+                },
+            );
         let (_td, cache) = cache();
 
         gate(&s, &tvdb, &apply_cfg()).await;
@@ -8664,6 +8677,17 @@ mod tests {
             .find(|l| l.contains("candidates read as the stated year"))
             .unwrap_or_else(|| panic!("no read line in {text}"));
         assert!(read.contains("920011 2005->2003"), "{read}");
+
+        // The next survey accepts what the re-match chose: a premiere two
+        // years from the stated year is no year mismatch.
+        let providers = SeriesProviders::<FakeEnricher, FakeEnricher> {
+            tvdb: Some(&tvdb),
+            tmdb: None,
+        };
+        let survey = survey_series_identity(&s, &providers, &sem(4), &apply_cfg())
+            .await
+            .unwrap();
+        assert!(survey.reask.is_empty(), "{:?}", survey.reask);
     }
 
     const SHORT_SHOW: &str = "/tv/Show A (2003)";
