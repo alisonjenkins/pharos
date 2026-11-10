@@ -28,7 +28,9 @@ stopped half way.
   2. no part has versions of its own (`versions`);
   3. every part has been probed (`unprobed`): the first scan indexes them
      apart, the next decides;
-  4. no two parts' embedded titles, with any part marker dropped, differ
+  4. every part's probe found a duration (`no_duration`), since the
+     playlist can only run on past a part of known length;
+  5. no two parts' embedded titles, with any part marker dropped, differ
      (`titles_differ`). Files named as parts that hold different films (a
      series ripped as `cd1`…`cd4`) stay apart (V1151).
 - The first part is the item; each later part is stored on it as an
@@ -59,8 +61,9 @@ stopped half way.
   then for each later part `#EXT-X-DISCONTINUITY`, the part's own
   `#EXT-X-MAP` (fMP4) and its segments (V1154). A part's URLs carry
   `MediaSourceId={item}-part-{n}`, so the existing segment, init and audio
-  handlers serve it from its own file, grid and cache keys. A part with no
-  stored duration ends the playlist there and is logged.
+  handlers serve it from its own file, grid and cache keys. The scanner
+  only stacks parts with a duration; should one still be missing (a row
+  edited by hand), the playlist ends before it and logs the part.
 - `pharos_media_source_selection_total{requested="part"}` counts part
   segment requests.
 
