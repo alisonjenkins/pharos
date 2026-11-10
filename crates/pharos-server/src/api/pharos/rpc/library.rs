@@ -187,6 +187,40 @@ impl server::library::Handler for Library {
             );
             return Ok(());
         }
+        if query.collapse_collections {
+            let folded = library::query_folded(state, &user, parent.as_deref(), &query)
+                .await
+                .map_err(ListError::Store);
+            record_query(QUERY_SHAPE_FOLDED, folded.is_ok());
+            record_browse(
+                parent.as_deref(),
+                target,
+                folded.as_ref().ok().map(|p| (p.entries.len(), p.total)),
+                query.start_index,
+            );
+            let rows: Vec<(MediaItem, UserItemData)> = folded
+                .as_ref()
+                .map(|p| {
+                    p.entries
+                        .iter()
+                        .filter_map(|e| match e {
+                            library::Folded::Item(item, data) => Some((item.clone(), *data)),
+                            library::Folded::Collection { .. } => None,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let reads = Reads::of(state, &user, &rows).await;
+            write_folded(
+                results.get().init_result(),
+                folded,
+                &state.server_id,
+                &state.image_tag_key,
+                &DamagedIds::of(state),
+                &reads,
+            );
+            return Ok(());
+        }
         let listed = match library::query(state, &user, parent.as_deref(), &query).await {
             Ok(page) => library::with_user_data(state, &user, page).await,
             Err(e) => Err(e),
@@ -816,6 +850,7 @@ fn read_query(
             Ok(StereoFilter::Only2d) => Some(false),
             Ok(StereoFilter::Any) | Err(_) => None,
         },
+        collapse_collections: q.get_collapse_collections(),
         ..ItemQuery::default()
     };
     let grouping = grouping_of(q.get_kinds()?);
@@ -1092,6 +1127,74 @@ fn write_listing(
     );
 }
 
+/// A [`library::query_folded`] page: each film as [`write_item`] writes it,
+/// each folded box set as [`write_collection_tile`] does.
+fn write_folded(
+    out: items_result::Builder<'_>,
+    folded: Result<library::FoldedPage, ListError>,
+    server_id: &str,
+    key: &ImageTagKey,
+    damaged: &DamagedIds,
+    reads: &Reads,
+) {
+    let folded = match folded {
+        Ok(folded) => folded,
+        Err(e) => {
+            tracing::warn!(method = "query", error = %list_error_detail(&e), "native library: folded listing unavailable");
+            Denial::Unavailable {
+                dependency: "media store",
+            }
+            .write(out.init_error());
+            return;
+        }
+    };
+    let mut page = out.init_page();
+    page.set_total(folded.total);
+    page.set_start(folded.start);
+    let mut items = page.init_items(len_u32(&folded.entries));
+    for (i, entry) in (0..items.len()).zip(&folded.entries) {
+        let mut summary = items.reborrow().get(i);
+        match entry {
+            library::Folded::Item(item, data) => {
+                write_item(summary.reborrow(), item, *data, server_id, key, damaged);
+                if let Some(position) = reads.get(item.id) {
+                    if let Ok(state) = summary.get_user_state() {
+                        write_read_state(state, position);
+                    }
+                }
+            }
+            library::Folded::Collection {
+                collection, first, ..
+            } => write_collection_tile(summary, collection, first, server_id, key),
+        }
+    }
+}
+
+/// A folded box set's tile (B1086): the set's id, kind and name, with the
+/// poster of the film it stands in for first, so the tile looks like the
+/// set and opens it.
+fn write_collection_tile(
+    mut out: item_summary::Builder<'_>,
+    collection: &pharos_core::Collection,
+    first: &MediaItem,
+    server_id: &str,
+    key: &ImageTagKey,
+) {
+    if let Some(id) = WireId::parse(&collection.wire_id) {
+        set_item_id(out.reborrow().init_id(), id);
+    }
+    out.set_kind(Kind::Collection);
+    out.set_name(collection.name.as_str());
+    let dto = BaseItemDto::from_domain_with_user_data(first, server_id, UserItemData::default());
+    if let Some(tag) = dto.image_tags.get("Primary").and_then(|t| t.as_str()) {
+        let tag = key.sign(&dto.id, "primary", tag);
+        let mut image = out.reborrow().init_images(1).get(0);
+        image.set_kind("Primary");
+        image.set_tag(tag.as_str());
+        image.set_url(format!("/Items/{}/Images/Primary?tag={tag}", dto.id).as_str());
+    }
+}
+
 /// The grouping a `kinds` list asks for: exactly one kind pharos only
 /// synthesises (series, season, album, artist), named once or more. Any
 /// other list is a stored-row listing, filtered by [`kind_filter`].
@@ -1116,6 +1219,9 @@ fn grouping_of(kinds: capnp::enum_list::Reader<'_, Kind>) -> Option<Grouping> {
 /// The `shape` label of `pharos_rpc_query_total` for a stored-row listing;
 /// a grouped one carries [`Grouping::label`].
 const QUERY_SHAPE_STORED: &str = "stored";
+/// The `shape` label for a stored-row listing with its box sets folded
+/// (B1086).
+const QUERY_SHAPE_FOLDED: &str = "folded";
 
 /// Counts one native `Library.query` under
 /// `pharos_rpc_query_total{shape,outcome}`: which listing answered it, and
