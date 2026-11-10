@@ -3078,6 +3078,9 @@ fn MyDevicesScreen() -> Element {
         let Some(api) = api else {
             return;
         };
+        // The old list's toggles would save on the new connection and then
+        // be overwritten by this load's older snapshot; hide them meanwhile.
+        state.set(MyDevicesState::Loading);
         let loaded_on = *connection.peek();
         spawn(async move {
             let result = api.my_devices(&call("my_devices", "my_devices")).await;
