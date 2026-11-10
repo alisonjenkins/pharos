@@ -269,6 +269,25 @@ pub fn direct(lines: &[SourceLine], signals: &TrackSignals, segments: &[Segment]
     }
 }
 
+/// The lines worth asking the aligner about (B1212): inside an intro or
+/// outro, not typeset, with no `\k` of their own, and with a Latin letter
+/// (the aligner times romanised text only).
+pub fn sung_candidates(lines: &[SourceLine], segments: &[Segment]) -> Vec<usize> {
+    lines
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| {
+            matches!(
+                segment_of(l, segments),
+                Some(SegmentKind::Intro | SegmentKind::Outro)
+            ) && !l.typeset
+                && l.karaoke.is_none()
+                && l.text.chars().any(|c| c.is_ascii_alphabetic())
+        })
+        .map(|(i, _)| i)
+        .collect()
+}
+
 /// Median score of the opening and ending lines the aligner answered for.
 fn sung_score(kinds: &[Option<SegmentKind>], sung: &[Option<SungLine>]) -> Option<f32> {
     let mut scores: Vec<f32> = kinds
@@ -1523,6 +1542,28 @@ mod tests {
                 fx.reason
             );
         }
+    }
+
+    #[test]
+    fn only_plain_lines_of_an_intro_or_outro_are_asked_about() {
+        let mut lines = vec![
+            line("Run away"),
+            line("Run away"),
+            line("走れ"),
+            line("Run away"),
+            line("Run away"),
+        ];
+        lines[1].typeset = true;
+        lines[3].karaoke = Some(vec![]);
+        lines[4].start_ms = 70_000;
+        lines[4].end_ms = 72_000;
+        let intro = [Segment {
+            kind: SegmentKind::Intro,
+            start_ms: 0,
+            end_ms: 60_000,
+        }];
+        assert_eq!(sung_candidates(&lines, &intro), [0]);
+        assert!(sung_candidates(&lines, &[]).is_empty());
     }
 
     #[test]
