@@ -701,7 +701,7 @@ impl<P: Prober> FsScanner<P> {
         // A file now grouped under another may still hold its own row from an
         // earlier pass; that row is swept, so its viewers' state moves first.
         let mut folded = folded_copies(&groups);
-        folded.extend(hidden_parts);
+        folded.extend(into_items(hidden_parts, &groups));
         let mut outcome = ScanOutcome::default();
         let mut seen = 0i64;
 
@@ -2513,14 +2513,44 @@ fn hide_parts_held_whole(groups: Vec<Group>) -> (Vec<Group>, Vec<Fold>) {
         match hidden.get(&i).and_then(|w| wholes.get(w)) {
             // A part's resume point is a time in that part, not in the
             // whole film (V1152).
-            Some(whole) => folds.push(Fold {
-                copy: group.0,
-                into: vec![(whole.clone(), pharos_core::FoldResume::Drop)],
-            }),
+            Some(whole) => {
+                let (primary, editions) = group;
+                for copy in std::iter::once(primary).chain(editions.into_iter().map(|(_, p)| p)) {
+                    folds.push(Fold {
+                        copy,
+                        into: vec![(whole.clone(), pharos_core::FoldResume::Drop)],
+                    });
+                }
+            }
             None => kept.push(group),
         }
     }
     (kept, folds)
+}
+
+/// Point each hidden part's fold at the item its whole file ended up in: a
+/// whole file that copy folding made a version of a better copy has no row
+/// of its own written this pass, so folding into it would keep the part.
+fn into_items(folds: Vec<Fold>, groups: &[Group]) -> Vec<Fold> {
+    let mut item_of: HashMap<&Path, &Path> = groups
+        .iter()
+        .flat_map(|(primary, alts)| {
+            alts.iter()
+                .map(move |(_, alt)| (alt.as_path(), primary.as_path()))
+        })
+        .collect();
+    item_of.extend(groups.iter().map(|(p, _)| (p.as_path(), p.as_path())));
+    folds
+        .into_iter()
+        .map(|mut fold| {
+            for (whole, _) in &mut fold.into {
+                if let Some(item) = item_of.get(whole.as_path()) {
+                    *whole = item.to_path_buf();
+                }
+            }
+            fold
+        })
+        .collect()
 }
 
 /// B1284 — whether an unchanged video's own NFO (`<stem>.nfo`, or
@@ -8934,6 +8964,12 @@ mod tests {
             items[0].probe.alternate_sources.is_empty(),
             "no part is a version or a part of the whole film: {paths:?}"
         );
+        let stack_row = stable_id(&td.path().join("Film W (2015)/Film W (2015) cd1.mkv"));
+        assert_eq!(
+            store.merged.lock().unwrap().last(),
+            Some(&(stack_row, items[0].id, pharos_core::FoldResume::Drop)),
+            "the stack's viewers fold into the whole film, resume dropped"
+        );
 
         let whole_copy: u64 = snapshotter
             .snapshot()
@@ -8953,6 +8989,56 @@ mod tests {
             })
             .sum();
         assert_eq!(whole_copy, 1, "refused once the whole file arrived");
+    }
+
+    /// B1289 — when the film is held whole twice, the parts' viewers fold
+    /// into the copy that is the item, not the one that became its version.
+    #[tokio::test]
+    async fn a_stack_folds_into_the_whole_film_item_among_its_copies() {
+        let td = TempDir::new().unwrap();
+        write_file(td.path(), "Film W (2015)/Film W (2015) cd1.mkv", b"one").await;
+        write_file(td.path(), "Film W (2015)/Film W (2015) cd2.mkv", b"two").await;
+        let store = MemStore::default();
+        let scanner = FsScanner::new(FakeProber {
+            duration_ms: Some(60_000),
+            ..Default::default()
+        });
+        scanner.scan_into(td.path(), &store).await.unwrap();
+        scanner.scan_into(td.path(), &store).await.unwrap();
+
+        for name in [
+            "Film W (2015) Bluray-1080p.mkv",
+            "Film W (2015) Bluray-2160p.mkv",
+        ] {
+            write_file(td.path(), &format!("Film W (2015)/{name}"), name.as_bytes()).await;
+        }
+        scanner.scan_into(td.path(), &store).await.unwrap();
+
+        let items: Vec<MediaItem> = store.inner.lock().unwrap().values().cloned().collect();
+        let paths: Vec<_> = items.iter().map(|i| &i.path).collect();
+        assert_eq!(items.len(), 1, "one film: {paths:?}");
+        let stack_row = stable_id(&td.path().join("Film W (2015)/Film W (2015) cd1.mkv"));
+        assert_eq!(
+            store.merged.lock().unwrap().last(),
+            Some(&(stack_row, items[0].id, pharos_core::FoldResume::Drop)),
+            "into the item, not its version"
+        );
+    }
+
+    /// B1289 — a hidden part folds into the item its whole file is grouped
+    /// under, since a whole file that is now a version wrote no row.
+    #[test]
+    fn a_hidden_part_folds_into_its_whole_films_item() {
+        let p = |n: &str| PathBuf::from(format!("/m/Film W (2015)/{n}"));
+        let groups = vec![(p("2160p.mkv"), vec![("1080p".to_owned(), p("1080p.mkv"))])];
+        let fold = |into: &str| Fold {
+            copy: p("cd1.mkv"),
+            into: vec![(p(into), pharos_core::FoldResume::Drop)],
+        };
+        assert_eq!(
+            into_items(vec![fold("1080p.mkv"), fold("2160p.mkv")], &groups),
+            vec![fold("2160p.mkv"), fold("2160p.mkv")]
+        );
     }
 
     /// B1289 — whole and split from the first scan: the whole file is the one
