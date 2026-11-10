@@ -275,6 +275,27 @@ pub(crate) fn verdict(
     (StackOutcome::Stacked, String::new())
 }
 
+/// Count one stacking decision and log it with the files and the value that
+/// decided it: a refusal at info, a stack at debug.
+pub(crate) fn record(groups: &[Group], candidate: &Candidate, outcome: StackOutcome, value: &str) {
+    let files: Vec<String> = candidate
+        .parts
+        .iter()
+        .filter_map(|&(i, _)| groups.get(i).map(|g| g.0.display().to_string()))
+        .collect();
+    metrics::counter!("pharos_scan_part_stack_total", "outcome" => outcome.label()).increment(1);
+    if outcome == StackOutcome::Stacked {
+        tracing::debug!(parts = files.len(), files = ?files, "stacked a film's parts");
+    } else {
+        tracing::info!(
+            outcome = outcome.label(),
+            value = %value,
+            files = ?files,
+            "left a film's parts apart",
+        );
+    }
+}
+
 /// Stack each candidate that passes [`verdict`]: its first part keeps its
 /// group and the others join it as numbered parts. Every decision is logged
 /// with the files and the value that decided it, and counted.
@@ -287,23 +308,10 @@ pub(crate) fn stack(
     let mut taken = vec![false; groups.len()];
     for candidate in candidates {
         let (outcome, value) = verdict(&groups, candidate, titles);
-        let files: Vec<String> = candidate
-            .parts
-            .iter()
-            .filter_map(|&(i, _)| groups.get(i).map(|g| g.0.display().to_string()))
-            .collect();
-        metrics::counter!("pharos_scan_part_stack_total", "outcome" => outcome.label())
-            .increment(1);
+        record(&groups, candidate, outcome, &value);
         if outcome != StackOutcome::Stacked {
-            tracing::info!(
-                outcome = outcome.label(),
-                value = %value,
-                files = ?files,
-                "left a film's parts apart",
-            );
             continue;
         }
-        tracing::debug!(parts = files.len(), files = ?files, "stacked a film's parts");
         let Some(&(first, _)) = candidate.parts.first() else {
             continue;
         };
