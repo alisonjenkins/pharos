@@ -256,6 +256,108 @@ if (run && run.stop) {{ run.stop(); run.free(); delete all[{id}]; }} else {{ all
     )
 }
 
+/// Where the page loads the vendored JASSUB from (ADR-0057); `ui` is a
+/// proxied segment, so it comes from the server like the stylesheet.
+pub const JASSUB_DIR: &str = "/ui/assets/vendor/jassub";
+
+/// How long the styled renderer may take to get ready before the player
+/// keeps the plain cues; the web build's wait.
+pub const STYLED_READY_MS: u32 = 45_000;
+
+/// The script that starts styled-subtitle run `run` on `<video id=video_id>`:
+/// JASSUB drawing the script at `url` with the script's own `fonts` and the
+/// subtitle font `pack` (family, file under `/ui/assets/fonts/`). It answers
+/// `"ready"` or `"failed: …"`.
+///
+/// The worker, its wasm and every font reach JASSUB as `blob:` URLs the page
+/// fetched itself, and the script as `subContent`: requests from inside a
+/// worker are not known to reach the app's proxy (B1216). The worker and
+/// wasm blobs are kept on `window` for the next track, so a TV fetches the
+/// 2 MB wasm once per launch, and only the build its WebView can run.
+pub fn styled_start_js(
+    video_id: &str,
+    url: &str,
+    fonts: &[String],
+    pack: &[(&str, &str)],
+    run: u64,
+) -> String {
+    let vid = serde_json::Value::String(video_id.to_owned());
+    let sub = serde_json::Value::String(url.to_owned());
+    let fonts = serde_json::to_string(fonts).unwrap_or_else(|_| "[]".to_owned());
+    let pack = serde_json::to_string(
+        &pack
+            .iter()
+            .map(|(family, file)| [*family, *file])
+            .collect::<Vec<_>>(),
+    )
+    .unwrap_or_else(|_| "[]".to_owned());
+    let dir = serde_json::Value::String(JASSUB_DIR.to_owned());
+    format!(
+        r#"const run = {run}, vid = {vid}, sub = {sub}, fonts = {fonts}, pack = {pack}, dir = {dir};
+const blob = async (path, type) => {{
+  const r = await fetch(path);
+  if (!r.ok) throw new Error(path.split("?")[0] + " answered " + r.status);
+  return URL.createObjectURL(new Blob([await r.arrayBuffer()], {{ type }}));
+}};
+const assets = window.__pharosJassubAssets = window.__pharosJassubAssets || {{}};
+try {{
+  if (!window.JASSUB) {{
+    await new Promise((ok, no) => {{
+      const s = document.createElement("script");
+      s.src = dir + "/jassub.js";
+      s.onload = ok;
+      s.onerror = () => no(new Error("jassub.js did not load"));
+      document.head.append(s);
+    }});
+  }}
+  const simd = WebAssembly.validate(new Uint8Array([0,97,115,109,1,0,0,0,1,5,1,96,0,1,123,3,2,1,0,10,10,1,8,0,65,0,253,15,253,98,11]));
+  if (!assets.worker) assets.worker = await blob(dir + "/jassub-worker.js", "text/javascript");
+  if (!assets.wasm) assets.wasm = await blob(dir + (simd ? "/jassub-worker-modern.wasm" : "/jassub-worker.wasm"), "application/wasm");
+  if (!assets.font) assets.font = await blob(dir + "/default.woff2", "font/woff2");
+  assets.pack = assets.pack || {{}};
+  for (const [family, file] of pack) {{
+    if (!assets.pack[family]) assets.pack[family] = await blob("/ui/assets/fonts/" + file, "font/ttf").catch(() => null);
+  }}
+  const r = await fetch(sub);
+  if (!r.ok) throw new Error("the styled script answered " + r.status);
+  const subContent = await r.text();
+  const own = (await Promise.all(fonts.map((f) => blob(f, "font/ttf").catch(() => null)))).filter(Boolean);
+  const runs = window.__pharosStyledRuns = window.__pharosStyledRuns || {{}};
+  if (runs[run] === "gone") {{ delete runs[run]; own.forEach((u) => URL.revokeObjectURL(u)); return "failed: stopped before it started"; }}
+  const v = document.getElementById(vid);
+  if (!v) throw new Error("no <video id=" + vid + ">");
+  const availableFonts = {{ "liberation sans": assets.font }};
+  for (const [family] of pack) if (assets.pack[family]) availableFonts[family] = assets.pack[family];
+  const j = new JASSUB({{
+    video: v, subContent, workerUrl: assets.worker, wasmUrl: assets.wasm, modernWasmUrl: assets.wasm,
+    availableFonts, fonts: own, defaultFont: "liberation sans", queryFonts: false, debug: true,
+  }});
+  runs[run] = {{ j, own }};
+  window.__pharosJassub = j;
+  await Promise.race([j.ready, new Promise((_, no) => setTimeout(() => no(new Error("not ready after {ready_ms} ms")), {ready_ms}))]);
+  return runs[run] ? "ready" : "failed: stopped while starting";
+}} catch (e) {{
+  return "failed: " + ((e && e.message) || e);
+}}"#,
+        ready_ms = STYLED_READY_MS,
+    )
+}
+
+/// The script that stops styled-subtitle run `run`, or marks it `"gone"` so
+/// a start still on its way draws nothing.
+pub fn styled_stop_js(run: u64) -> String {
+    format!(
+        r#"const runs = window.__pharosStyledRuns = window.__pharosStyledRuns || {{}};
+const r = runs[{run}];
+if (r && r.j) {{
+  try {{ r.j.destroy(); }} catch (e) {{}}
+  r.own.forEach((u) => URL.revokeObjectURL(u));
+  if (window.__pharosJassub === r.j) window.__pharosJassub = null;
+  delete runs[{run}];
+}} else {{ runs[{run}] = "gone"; }}"#
+    )
+}
+
 /// How long before a media token expires the app asks for the next one, so
 /// a song started just before expiry still loads.
 pub const MEDIA_TOKEN_MARGIN_MS: u64 = 15 * 60 * 1000;
@@ -592,6 +694,12 @@ pub struct Media {
     pub dropped: u64,
     #[serde(default)]
     pub frames: u64,
+    /// The styled renderer's own skipped and drawn frames (JASSUB's debug
+    /// counters), while one draws over this video.
+    #[serde(default)]
+    pub sub_skipped: Option<u64>,
+    #[serde(default)]
+    pub sub_drawn: Option<u64>,
     /// A throttled `timeupdate`, which Rust hears only this way.
     #[serde(default)]
     pub tick: bool,
@@ -928,6 +1036,52 @@ mod tests {
         assert!(js.contains("link.focus({ preventScroll: true })"), "{js}");
         assert!(scroll_tile_to_js(1, f64::NAN).contains("- (0)"));
         assert_eq!(bridge_script("__GRID__"), GRID);
+    }
+
+    #[test]
+    fn the_styled_start_hands_jassub_only_page_fetched_blobs() {
+        let js = styled_start_js(
+            "v",
+            "/videos/1/subtitles/2/stream.ass?tier=tv",
+            &["/videos/1/attachments/a.ttf".to_owned()],
+            &[("bangers", "Bangers-Regular.ttf")],
+            7,
+        );
+        assert!(js.starts_with("const run = 7, vid = \"v\""), "{js}");
+        assert!(js.contains(r#"sub = "/videos/1/subtitles/2/stream.ass?tier=tv""#));
+        assert!(js.contains(r#"fonts = ["/videos/1/attachments/a.ttf"]"#));
+        assert!(js.contains(r#"pack = [["bangers","Bangers-Regular.ttf"]]"#));
+        // JASSUB is never given a server path to fetch in its worker.
+        assert!(js.contains("subContent, workerUrl: assets.worker, wasmUrl: assets.wasm"));
+        assert!(!js.contains("subUrl"), "{js}");
+        assert!(js.contains("debug: true"));
+        assert!(js.contains(&format!("not ready after {STYLED_READY_MS} ms")));
+    }
+
+    #[test]
+    fn a_stopped_styled_run_is_destroyed_or_marked_gone() {
+        let js = styled_stop_js(7);
+        assert!(js.contains("runs[7]"));
+        assert!(js.contains("r.j.destroy()"));
+        assert!(js.contains(r#"runs[7] = "gone""#));
+    }
+
+    #[test]
+    fn the_styled_renderers_frames_ride_on_the_media_message() {
+        let with = serde_json::json!({"t": "media", "id": "v", "pos": 1.0, "dur": 2.0,
+            "paused": false, "ended": false, "seeking": false, "ready": 4, "vol": 1.0,
+            "muted": false, "sub_skipped": 3, "sub_drawn": 90});
+        let Some(Bridge::Media(with)) = parse_bridge(&with) else {
+            panic!("not media");
+        };
+        assert_eq!((with.sub_skipped, with.sub_drawn), (Some(3), Some(90)));
+        let without = serde_json::json!({"t": "media", "id": "v", "pos": 1.0, "dur": 2.0,
+            "paused": false, "ended": false, "seeking": false, "ready": 4, "vol": 1.0,
+            "muted": false, "sub_skipped": null});
+        let Some(Bridge::Media(without)) = parse_bridge(&without) else {
+            panic!("not media");
+        };
+        assert_eq!((without.sub_skipped, without.sub_drawn), (None, None));
     }
 
     #[test]
