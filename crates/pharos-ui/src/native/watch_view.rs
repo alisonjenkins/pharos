@@ -815,6 +815,8 @@ pub fn WatchView(
         .iter()
         .find(|t| Some(t.index) == c.subtitle_pick)
         .and_then(|t| t.images_url.clone());
+    // A TV offers the delay only for image subtitles, which it draws itself.
+    let offer_delay = c.subtitle_pick.is_some() && (!SCRUB_KEYS || image_cues.is_some());
 
     rsx! {
         section { class: "pharos-watch",
@@ -1180,14 +1182,19 @@ pub fn WatchView(
                         // wide screen keeps them behind the settings button.
                         div { class: "pharos-control-extra",
                         SubtitleDelay {
-                            show: c.subtitle_pick.is_some(),
+                            // The TV app's text subtitles are its WebView's
+                            // own, which take no delay; image ones do.
+                            show: offer_delay,
                             delay_ms: c.subtitle_delay_ms,
                             on_pick: move |control| on_control.call(control),
                         }
-                        SpeedPicker {
-                            speed: c.speed,
-                            in_group,
-                            on_pick: move |control| on_control.call(control),
+                        // The TV app cannot set the rate yet.
+                        if !SCRUB_KEYS {
+                            SpeedPicker {
+                                speed: c.speed,
+                                in_group,
+                                on_pick: move |control| on_control.call(control),
+                            }
                         }
                         }
                         QualityPicker {
