@@ -131,7 +131,6 @@ fn player_movie() -> Element {
         PlayerView {
             item_id: "1".to_string(),
             kind: ItemKind::Movie,
-            access_token: "tok".to_string(),
             server_base: "http://x".to_string(),
             on_event: move |_| {},
         }
@@ -143,7 +142,6 @@ fn player_audio() -> Element {
         PlayerView {
             item_id: "2".to_string(),
             kind: ItemKind::Audio,
-            access_token: "tok".to_string(),
             server_base: "http://x".to_string(),
             on_event: move |_| {},
         }
@@ -156,7 +154,6 @@ fn player_movie_with_quality() -> Element {
         PlayerView {
             item_id: "10".to_string(),
             kind: ItemKind::Movie,
-            access_token: "tok".to_string(),
             server_base: "http://x".to_string(),
             quality_options: vec![
                 QualityOption { label: "Auto".into(), max_bitrate: 0 },
@@ -177,7 +174,6 @@ fn player_movie_with_chapters() -> Element {
         PlayerView {
             item_id: "42".to_string(),
             kind: ItemKind::Movie,
-            access_token: "tok".to_string(),
             server_base: "http://x".to_string(),
             run_time_ticks: run_time_ticks,
             chapters: vec![
@@ -194,9 +190,9 @@ fn player_movie_with_chapters() -> Element {
 fn player_view_renders_video_for_movie_kind() {
     let html = render_root(player_movie);
     assert!(html.contains("<video"), "video element missing: {html}");
-    // Direct-play URL with api_key.
+    // Direct-play URL; the sign-in cookie is its credential (V1110).
     assert!(html.contains("/Videos/1/stream"), "{html}");
-    assert!(html.contains("api_key=tok"), "{html}");
+    assert!(!html.contains("api_key"), "{html}");
 }
 
 fn player_movie_with_tracks() -> Element {
@@ -205,7 +201,6 @@ fn player_movie_with_tracks() -> Element {
         PlayerView {
             item_id: "3".to_string(),
             kind: ItemKind::Movie,
-            access_token: "tok".to_string(),
             server_base: "http://x".to_string(),
             tracks: PlaybackTracks {
                 audio: vec![
@@ -242,6 +237,7 @@ fn player_view_renders_subtitle_track_when_tracks_supplied() {
     // Native <track> for the browser CC picker.
     assert!(html.contains("<track"), "{html}");
     assert!(html.contains("Subtitles/2/Stream.vtt"), "{html}");
+    assert!(!html.contains("api_key"), "{html}");
     // Pharos-side OSD picker also renders.
     assert!(html.contains("pharos-player-osd"), "{html}");
     assert!(html.contains("pharos-player-subtitles"), "{html}");
@@ -957,7 +953,7 @@ fn detail_audio() -> Element {
                 ..Default::default()
             },
             error: None,
-            primary_image_url: Some("/Items/5/Images/Primary?api_key=tok".into()),
+            primary_image_url: Some("/Items/5/Images/Primary".into()),
             on_action: move |_| {},
         }
     }
@@ -1015,7 +1011,7 @@ fn detail_with_cast_overview_genres_backdrop() -> Element {
             },
             error: None,
             primary_image_url: None,
-            backdrop_image_url: Some("/Items/33/Images/Backdrop?api_key=tok".to_string()),
+            backdrop_image_url: Some("/Items/33/Images/Backdrop".to_string()),
             person_image_url_template: Some("/Items/{person_id}/Images/Primary".to_string()),
             on_action: move |_| {},
         }
@@ -1065,10 +1061,7 @@ fn detail_view_audio_renders_artist_album_and_primary_image() {
     );
     // Image figure rendered when primary_image_url set.
     assert!(html.contains("pharos-detail-primary"), "{html}");
-    assert!(
-        html.contains("/Items/5/Images/Primary?api_key=tok"),
-        "{html}"
-    );
+    assert!(html.contains("/Items/5/Images/Primary"), "{html}");
 }
 
 #[test]
@@ -1086,10 +1079,7 @@ fn detail_view_phase3_renders_backdrop_overview_genres_cast() {
     let html = render_root(detail_with_cast_overview_genres_backdrop);
     // Backdrop image
     assert!(html.contains("pharos-detail-backdrop"), "{html}");
-    assert!(
-        html.contains("/Items/33/Images/Backdrop?api_key=tok"),
-        "{html}"
-    );
+    assert!(html.contains("/Items/33/Images/Backdrop"), "{html}");
     // Overview text
     assert!(html.contains("pharos-detail-overview"), "{html}");
     assert!(html.contains("A blade runner hunts replicants."), "{html}");
