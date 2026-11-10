@@ -7,8 +7,12 @@
 //!   [`ANALYSIS_RATE`] and fed to a [`SignalAnalyser`] (the front-centre
 //!   channel when the layout has one, because dialogue sits there and music
 //!   and effects mostly do not; otherwise a mono downmix);
-//! - the best video stream's packets are only inspected: a packet with the
-//!   key flag contributes its timestamp. No video is decoded.
+//! - the best video stream's packets are inspected: a packet with the key
+//!   flag contributes its timestamp, and a keyframe that a line's middle
+//!   falls within [`TEXT_SAMPLE_MAX_AGE_MS`] after is decoded on its own,
+//!   scaled to a small luma plane and checked for text burned into the bottom
+//!   of the picture ([`crate::burned_text`], B1207). No other video is
+//!   decoded.
 //!
 //! Audio decoding stops once the stream is past the last requested window,
 //! but the demux carries on to the end, because the keyframes come from all of
@@ -18,6 +22,8 @@
 //! `subtitle_windows` reports its windows on.
 
 use super::frames::FrameError;
+use crate::burned_text::bottom_text_share;
+use crate::picture_area::LumaPlane;
 use crate::subtitle_signals::{
     cuts_from_keyframes, place_frame, ChannelPick, LineSignals, SignalAnalyser, SubtitleSignals,
     ANALYSIS_RATE,
@@ -26,6 +32,7 @@ use ffmpeg::ffi;
 use ffmpeg::format::Sample;
 use ffmpeg::{codec, format, frame, media, software, Channel, ChannelLayout, ChannelOrder};
 use ffmpeg_the_third as ffmpeg;
+use std::collections::BTreeMap;
 use std::path::Path;
 
 /// Audio kept after the last window, so a window ending at a frame boundary
@@ -35,6 +42,13 @@ const TAIL_MS: u64 = 1_000;
 const MAX_READ_ERRORS: u32 = 64;
 /// Undecodable frames tolerated before the audio is abandoned.
 const MAX_BAD_FRAMES: u32 = 200;
+/// A keyframe speaks for the picture under a line whose middle is at most
+/// this long after it (and before the next keyframe).
+pub const TEXT_SAMPLE_MAX_AGE_MS: u64 = 4_000;
+/// Width of the luma plane a keyframe is scaled to for the text check.
+const TEXT_SAMPLE_WIDTH: u32 = 480;
+/// Undecodable keyframes tolerated before the text check is abandoned.
+const MAX_BAD_KEYFRAMES: u32 = 50;
 
 struct TimeBase {
     num: i64,
@@ -151,6 +165,159 @@ impl AudioPass {
     }
 }
 
+/// The text check's half: a decoder fed one key packet at a time, and what
+/// each decoded keyframe showed.
+///
+/// A key packet is held until the next one arrives, because only then is it
+/// known to be the latest keyframe before some line's middle; so each
+/// keyframe that speaks for a line is decoded once and no other is.
+struct TextPass {
+    decoder: ffmpeg::decoder::Video,
+    scaler: Option<(format::Pixel, u32, u32, software::scaling::Context)>,
+    /// Line middles, ascending.
+    mids: Vec<u64>,
+    held: Option<(u64, ffmpeg::Packet)>,
+    /// Bottom-text share per decoded keyframe, by its time in ms.
+    shares: BTreeMap<u64, f32>,
+    bad: u32,
+}
+
+impl TextPass {
+    fn open(ictx: &format::context::Input, idx: usize, windows: &[(u64, u64)]) -> Option<Self> {
+        let stream = ictx.stream(idx)?;
+        let ctx = codec::context::Context::from_parameters(stream.parameters()).ok()?;
+        let mut decoder = ctx.decoder().video().ok()?;
+        decoder.skip_frame(ffmpeg::Discard::NonKey);
+        // The text check needs strokes, not a clean picture.
+        // SAFETY: `decoder` owns a valid, opened AVCodecContext.
+        unsafe {
+            (*decoder.as_mut_ptr()).skip_loop_filter = ffi::AVDiscard::from(ffmpeg::Discard::All);
+        }
+        let mut mids: Vec<u64> = windows.iter().map(|&(s, e)| s / 2 + e / 2).collect();
+        mids.sort_unstable();
+        Some(TextPass {
+            decoder,
+            scaler: None,
+            mids,
+            held: None,
+            shares: BTreeMap::new(),
+            bad: 0,
+        })
+    }
+
+    /// Whether a keyframe at `t_ms` followed by the next at `next_ms`
+    /// (`None`: no more) is the one some line's middle reads.
+    fn speaks(&self, t_ms: u64, next_ms: Option<u64>) -> bool {
+        let i = self.mids.partition_point(|&m| m < t_ms);
+        self.mids
+            .get(i)
+            .is_some_and(|&m| m - t_ms <= TEXT_SAMPLE_MAX_AGE_MS && next_ms.map_or(true, |n| m < n))
+    }
+
+    fn give_up(&self) -> bool {
+        self.bad > MAX_BAD_KEYFRAMES
+    }
+
+    /// A key packet at `t_ms`, in demux order.
+    fn key_packet(&mut self, t_ms: u64, packet: &ffmpeg::Packet) {
+        if self.give_up() {
+            return;
+        }
+        if let Some((held_t, held)) = self.held.take() {
+            if held_t < t_ms && self.speaks(held_t, Some(t_ms)) {
+                self.decode(held_t, &held);
+            }
+        }
+        self.held = Some((t_ms, packet.clone()));
+    }
+
+    fn finish(&mut self) {
+        if let Some((held_t, held)) = self.held.take() {
+            if !self.give_up() && self.speaks(held_t, None) {
+                self.decode(held_t, &held);
+            }
+        }
+    }
+
+    /// Decodes `packet` on its own: send, drain to the end, reset. Each frame
+    /// therefore belongs to `t_ms`, whatever delay the codec has.
+    fn decode(&mut self, t_ms: u64, packet: &ffmpeg::Packet) {
+        let mut share = None;
+        if self.decoder.send_packet(packet).is_ok() && self.decoder.send_eof().is_ok() {
+            let mut decoded = frame::Video::empty();
+            while self.decoder.receive_frame(&mut decoded).is_ok() {
+                if share.is_none() {
+                    share = self.luma(&decoded).map(|plane| bottom_text_share(&plane));
+                }
+            }
+        }
+        self.decoder.flush();
+        match share {
+            Some(s) => {
+                self.shares.insert(t_ms, s);
+            }
+            None => self.bad += 1,
+        }
+    }
+
+    /// `f` scaled to [`TEXT_SAMPLE_WIDTH`] wide, 8-bit luma.
+    fn luma(&mut self, f: &frame::Video) -> Option<LumaPlane> {
+        let (fmt, w, h) = (f.format(), f.width(), f.height());
+        if w == 0 || h == 0 {
+            return None;
+        }
+        let out_w = TEXT_SAMPLE_WIDTH.min(w);
+        let out_h = ((u64::from(h) * u64::from(out_w) / u64::from(w)) as u32).max(1);
+        let stale =
+            !matches!(&self.scaler, Some((sf, sw, sh, _)) if *sf == fmt && *sw == w && *sh == h);
+        if stale {
+            let ctx = software::scaling::Context::get(
+                fmt,
+                w,
+                h,
+                format::Pixel::GRAY8,
+                out_w,
+                out_h,
+                software::scaling::Flags::FAST_BILINEAR,
+            )
+            .ok()?;
+            self.scaler = Some((fmt, w, h, ctx));
+        }
+        let (_, _, _, sws) = self.scaler.as_mut()?;
+        let mut out = frame::Video::empty();
+        sws.run(f, &mut out).ok()?;
+        Some(LumaPlane {
+            width: out.width(),
+            height: out.height(),
+            stride: out.stride(0),
+            data: out.data(0).to_vec(),
+        })
+    }
+}
+
+/// Each window's bottom-text share from the keyframe that speaks for it: the
+/// latest keyframe at or before its middle, at most
+/// [`TEXT_SAMPLE_MAX_AGE_MS`] before it. `None` when there is no such
+/// keyframe or it was not decoded.
+pub fn bottom_text_per_line(
+    windows: &[(u64, u64)],
+    keyframes_ms: &[u64],
+    shares: &BTreeMap<u64, f32>,
+) -> Vec<Option<f32>> {
+    windows
+        .iter()
+        .map(|&(s, e)| {
+            let mid = s / 2 + e / 2;
+            let i = keyframes_ms.partition_point(|&k| k <= mid);
+            let k = *keyframes_ms.get(i.checked_sub(1)?)?;
+            if mid - k > TEXT_SAMPLE_MAX_AGE_MS {
+                return None;
+            }
+            shares.get(&k).copied()
+        })
+        .collect()
+}
+
 /// Loudness, pitch, high-band share and keyframes of `src` for `windows`
 /// (`[start_ms, end_ms]` per subtitle line).
 ///
@@ -222,6 +389,9 @@ pub fn subtitle_signals(
         _ => ChannelPick::Downmix,
     };
 
+    let mut text = video
+        .as_ref()
+        .and_then(|(vi, _)| TextPass::open(&ictx, *vi, windows));
     let mut keyframes_ms: Vec<u64> = Vec::new();
     let mut read_errors = 0u32;
     let mut consecutive_errors = 0u32;
@@ -246,7 +416,11 @@ pub fn subtitle_signals(
             if idx == *vi {
                 if packet.is_key() {
                     if let Some(ts) = packet.pts().or(packet.dts()) {
-                        keyframes_ms.push(tb.ms(ts).max(0) as u64);
+                        let t = tb.ms(ts).max(0) as u64;
+                        keyframes_ms.push(t);
+                        if let Some(tp) = text.as_mut() {
+                            tp.key_packet(t, &packet);
+                        }
                     }
                 }
                 continue;
@@ -261,6 +435,13 @@ pub fn subtitle_signals(
     keyframes_ms.sort_unstable();
     keyframes_ms.dedup();
     let cuts_ms = cuts_from_keyframes(&keyframes_ms);
+    let bottom_text = match text.as_mut() {
+        Some(tp) => {
+            tp.finish();
+            bottom_text_per_line(windows, &keyframes_ms, &tp.shares)
+        }
+        None => vec![None; windows.len()],
+    };
 
     let (lines, analysed_seconds) = match pass {
         Some(mut p) => {
@@ -276,6 +457,7 @@ pub fn subtitle_signals(
         lines,
         keyframes_ms,
         cuts_ms,
+        bottom_text,
         audio_stream: audio_index.map(|i| i as u32),
         channel,
         analysed_seconds,
