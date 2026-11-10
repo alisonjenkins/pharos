@@ -5149,6 +5149,14 @@ mod tests {
     async fn a_reidentified_episode_replaces_its_scraped_text_and_still() {
         let s = store().await;
         let item = put_shifted_episode(&s).await;
+        // B1181 — the show's curated Primary blocks online art only while its
+        // file exists, so this test's sidecar must be a real file.
+        let show = tempfile::tempdir().unwrap();
+        let folder = show.path().join("folder.jpg");
+        std::fs::write(&folder, [0xFF, 0xD8, 0xFF]).unwrap();
+        s.set_artwork(900_570, "Primary", "local", &folder.to_string_lossy())
+            .await
+            .unwrap();
         let (_td, cache) = cache();
         let tvdb = FakeEnricher::tvdb()
             .with_detail(naked_now((1, 2)))
