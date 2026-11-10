@@ -13,7 +13,7 @@ use pharos_server::{
     state::{AppState, Stores},
 };
 
-const FLASH: &str = "/tv/The Flash";
+const SHOW_A: &str = "/tv/Show A";
 
 async fn seed(admin: bool) -> (web::Data<AppState>, String) {
     let stores = Stores::connect("sqlite::memory:").await.unwrap();
@@ -37,14 +37,14 @@ async fn seed(admin: bool) -> (web::Data<AppState>, String) {
             &stores,
             MediaItem {
                 id,
-                path: format!("{FLASH}/Season 1/The Flash - S01E0{episode}.mkv").into(),
+                path: format!("{SHOW_A}/Season 1/Show A - S01E0{episode}.mkv").into(),
                 title: format!("Episode {episode}"),
                 kind: MediaKind::Episode,
                 series: Some(SeriesInfo {
-                    series_name: "The Flash".into(),
+                    series_name: "Show A".into(),
                     season_number: Some(1),
                     episode_number: Some(episode),
-                    series_folder: Some(FLASH.into()),
+                    series_folder: Some(SHOW_A.into()),
                     series_year: None,
                     series_key: None,
                 }),
@@ -76,19 +76,19 @@ fn requests(token: &str) -> Vec<test::TestRequest> {
     vec![
         test::TestRequest::get().uri("/admin/series-identity"),
         test::TestRequest::get().uri("/admin/series-identity/flagged"),
-        test::TestRequest::get().uri("/admin/series-identity/search?Name=Flash"),
+        test::TestRequest::get().uri("/admin/series-identity/search?Name=Show"),
         test::TestRequest::post()
             .uri("/admin/series-identity/pick")
-            .set_json(serde_json::json!({"SeriesKey": FLASH, "Provider": "tvdb", "Id": "1"})),
+            .set_json(serde_json::json!({"SeriesKey": SHOW_A, "Provider": "tvdb", "Id": "1"})),
         test::TestRequest::post()
             .uri("/admin/series-identity/confirm")
-            .set_json(serde_json::json!({"SeriesKey": FLASH})),
+            .set_json(serde_json::json!({"SeriesKey": SHOW_A})),
         test::TestRequest::post()
             .uri("/admin/series-identity/move")
-            .set_json(serde_json::json!({"Folder": FLASH, "Paths": [], "TargetYear": 2014})),
+            .set_json(serde_json::json!({"Folder": SHOW_A, "Paths": [], "TargetYear": 1996})),
         test::TestRequest::post()
             .uri("/admin/series-identity/keep-together")
-            .set_json(serde_json::json!({"Folder": FLASH})),
+            .set_json(serde_json::json!({"Folder": SHOW_A})),
         test::TestRequest::delete().uri("/admin/series-identity/overrides/1"),
     ]
     .into_iter()
@@ -113,7 +113,7 @@ async fn a_move_shows_on_the_overview_and_can_be_removed() {
     let (state, token) = seed(true).await;
     let app = app!(state);
     let auth = ("X-Emby-Token", token.as_str());
-    let moved = format!("{FLASH}/Season 1/The Flash - S01E02.mkv");
+    let moved = format!("{SHOW_A}/Season 1/Show A - S01E02.mkv");
 
     let resp = test::call_service(
         &app,
@@ -121,7 +121,7 @@ async fn a_move_shows_on_the_overview_and_can_be_removed() {
             .uri("/admin/series-identity/move")
             .insert_header(auth)
             .set_json(serde_json::json!({
-                "Folder": FLASH, "Paths": [moved], "TargetYear": 2014, "TargetName": "The Flash"
+                "Folder": SHOW_A, "Paths": [moved], "TargetYear": 1996, "TargetName": "Show A"
             }))
             .to_request(),
     )
@@ -139,7 +139,7 @@ async fn a_move_shows_on_the_overview_and_can_be_removed() {
     )
     .await;
     let groups = &v["Splits"][0]["Groups"];
-    assert_eq!(v["Splits"][0]["Folder"], FLASH, "{v}");
+    assert_eq!(v["Splits"][0]["Folder"], SHOW_A, "{v}");
     assert_eq!(v["Splits"][0]["Status"], "applied", "{v}");
     assert_eq!(v["Splits"][0]["Moves"], serde_json::json!([]), "{v}");
     assert_eq!(groups.as_array().map(Vec::len), Some(2), "{v}");
@@ -244,13 +244,13 @@ async fn a_flagged_show_is_named_by_its_series_item_id() {
     SeriesMetadataStore::upsert_series_metadata(
         &state.stores,
         SeriesMetadata {
-            series_key: FLASH.into(),
-            series_name: "The Flash".into(),
+            series_key: SHOW_A.into(),
+            series_name: "Show A".into(),
             match_provider: Some("tvdb".into()),
-            match_external_id: Some("279121".into()),
+            match_external_id: Some("900001".into()),
             match_source: Some("search".into()),
             match_flag: Some("ambiguous".into()),
-            match_runner_up_id: Some("78650".into()),
+            match_runner_up_id: Some("900002".into()),
             match_runner_up_score: Some(0.7),
             ..Default::default()
         },
