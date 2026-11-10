@@ -2372,7 +2372,7 @@ mod tests {
             name: "Alpha".into(),
             ..item(ItemKind::Movie)
         };
-        let mut rows: Vec<Row> = places(&[]).into_iter().map(Row::Place).collect();
+        let mut rows: Vec<Row> = places(&[], true).into_iter().map(Row::Place).collect();
         rows.push(Row::Title(film));
         let html = render(move || {
             rsx! {

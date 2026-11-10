@@ -2587,6 +2587,9 @@ fn PaletteScreen() -> Element {
             platform::warn(&format!("palette: search not kept: {e}"));
         }
     };
+    let account = try_use_context::<AccountMe>();
+    let admin =
+        move || account.is_some_and(|me| me.0.read().clone().flatten().is_some_and(|m| m.is_admin));
     let rows = use_memo(move || {
         let home = home.read();
         let libraries: Vec<_> = home.rails.iter().map(|rail| rail.library.clone()).collect();
@@ -2598,7 +2601,7 @@ fn PaletteScreen() -> Element {
         };
         palette::rows(
             &searches.read(),
-            &palette::places(&libraries),
+            &palette::places(&libraries, admin()),
             &recent,
             &search.text.read(),
             page,
