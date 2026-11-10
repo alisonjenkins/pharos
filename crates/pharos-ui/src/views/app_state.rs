@@ -999,6 +999,14 @@ pub fn AdminPane(
                         )),
                         Err(e) => status_signal.set(Some(format!("Couldn't start the scan: {e}"))),
                     },
+                    AdminAction::ScanLibrary { item_id, name } => {
+                        match library_scan(&base, &token, &item_id).await {
+                            Ok(()) => status_signal
+                                .set(Some(format!("Scanning {name} for new and changed files."))),
+                            Err(e) => status_signal
+                                .set(Some(format!("Couldn't start the scan of {name}: {e}"))),
+                        }
+                    }
                     AdminAction::CreateUser(CreateUserAttempt { name, password }) => {
                         match create_user(&base, &token, &name, &password).await {
                             Ok(()) => status_signal.set(Some(format!("Added {name}."))),
@@ -1344,6 +1352,10 @@ pub fn AdminPane(
         .clone()
         .or_else(|| fetch_err.filter(|_| !*fetch_err_hidden.read()));
     let tab_now = *active_tab.read();
+    // Only the native app follows the server's events; elsewhere no bar shows.
+    let scan = try_use_context::<super::scan_progress::ScanWatch>()
+        .map(|w| w.0.read().clone())
+        .unwrap_or_default();
     let new_secret_now = new_api_key_secret.read().clone();
 
     rsx! {
@@ -1377,6 +1389,7 @@ pub fn AdminPane(
             device_saving: device_saving.read().clone(),
             metadata_search: metadata_search,
             metadata: metadata,
+            scan: scan,
         }
     }
 }
@@ -2345,6 +2358,18 @@ async fn library_refresh(base: &str, token: &str) -> Result<(), String> {
 #[cfg(not(feature = "web"))]
 async fn library_refresh(_base: &str, _token: &str) -> Result<(), String> {
     Err("library_refresh is only wired in the web build".into())
+}
+
+#[cfg(feature = "web")]
+async fn library_scan(base: &str, token: &str, item_id: &str) -> Result<(), String> {
+    crate::client::web::admin_scan_library(base, token, item_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(not(feature = "web"))]
+async fn library_scan(_base: &str, _token: &str, _item_id: &str) -> Result<(), String> {
+    Err("library_scan is only wired in the web build".into())
 }
 
 #[cfg(feature = "web")]
