@@ -358,6 +358,25 @@ if (r && r.j) {{
     )
 }
 
+/// The script that measures the styled canvas against the control bar for
+/// the lift (B634): `[canvas bottom, player bottom, bar height]` in CSS px,
+/// laid-out offsets as the web build reads them, or `null` with no canvas.
+pub const STYLED_LIFT_MEASURE_JS: &str = r#"const c = document.querySelector(".pharos-video-frame > canvas.JASSUB");
+if (!c) return null;
+const f = c.parentElement, p = f.closest(".pharos-player");
+const bar = p && p.querySelector(".pharos-controls");
+if (!bar) return null;
+return [f.getBoundingClientRect().top + c.offsetTop + c.offsetHeight, p.getBoundingClientRect().bottom, bar.offsetHeight];"#;
+
+/// The script that moves the styled canvas up by `lift` px (pharos.css turns
+/// `--pharos-ass-lift` into a transform).
+pub fn styled_lift_set_js(lift: u32) -> String {
+    format!(
+        r#"const c = document.querySelector(".pharos-video-frame > canvas.JASSUB");
+if (c) c.parentElement.style.setProperty("--pharos-ass-lift", "{lift}");"#
+    )
+}
+
 /// How long before a media token expires the app asks for the next one, so
 /// a song started just before expiry still loads.
 pub const MEDIA_TOKEN_MARGIN_MS: u64 = 15 * 60 * 1000;
@@ -997,6 +1016,14 @@ mod tests {
         assert!(!js.contains("subUrl"), "{js}");
         assert!(js.contains("debug: true"));
         assert!(js.contains(&format!("not ready after {STYLED_READY_MS} ms")));
+    }
+
+    #[test]
+    fn the_styled_lift_measures_the_canvas_against_the_bar_and_sets_the_var() {
+        assert!(STYLED_LIFT_MEASURE_JS.contains("canvas.JASSUB"));
+        assert!(STYLED_LIFT_MEASURE_JS.contains(".pharos-controls"));
+        assert!(STYLED_LIFT_MEASURE_JS.contains("bar.offsetHeight"));
+        assert!(styled_lift_set_js(108).contains(r#"setProperty("--pharos-ass-lift", "108")"#));
     }
 
     #[test]
