@@ -75,8 +75,23 @@ fn differs(field: String, primary: impl ToString, shadow: impl ToString) -> Opti
     })
 }
 
-/// Compares `offset_ms`, the line count, each line's word count and each
-/// word's `at` and `start_ms`, in that order; `None` when all are equal.
+/// Most two line scores, in thousandths, may differ and still match: each
+/// side rounds its own mean to three places, so a mean near a .0005
+/// boundary can land one thousandth apart.
+pub const SCORE_TOLERANCE: u16 = 1;
+
+/// A line score in thousandths as the aligner wrote it, or `null`.
+fn show_score(score: Option<u16>) -> String {
+    score.map_or_else(
+        || "null".into(),
+        |n| format!("{}.{:03}", n / 1000, n % 1000),
+    )
+}
+
+/// Compares `offset_ms`, the line count, then line by line each line's word
+/// count, each word's `at` and `start_ms`, and the line's score within
+/// [`SCORE_TOLERANCE`], in that order; `None` when all are equal. A score on
+/// one side only is a difference.
 pub fn compare(primary: &Aligned, shadow: &Aligned) -> Option<Difference> {
     if primary.offset_ms != shadow.offset_ms {
         return differs("offset_ms".into(), primary.offset_ms, shadow.offset_ms);
@@ -99,6 +114,16 @@ pub fn compare(primary: &Aligned, shadow: &Aligned) -> Option<Difference> {
                     sw.start_ms,
                 );
             }
+        }
+        let score = |a: &Aligned| a.scores.get(i).copied().flatten();
+        let (ps, ss) = (score(primary), score(shadow));
+        let close = match (ps, ss) {
+            (Some(p), Some(s)) => p.abs_diff(s) <= SCORE_TOLERANCE,
+            (None, None) => true,
+            _ => false,
+        };
+        if !close {
+            return differs(format!("lines[{i}].score"), show_score(ps), show_score(ss));
         }
     }
     None
@@ -280,12 +305,19 @@ pub(super) mod tests {
         let lines: Vec<serde_json::Value> = a
             .lines
             .iter()
-            .map(|l| {
+            .enumerate()
+            .map(|(i, l)| {
                 let words: Vec<_> = l
                     .iter()
                     .map(|w| serde_json::json!({"at": w.at, "start_ms": w.start_ms}))
                     .collect();
-                serde_json::json!({ "words": words })
+                let score = a
+                    .scores
+                    .get(i)
+                    .copied()
+                    .flatten()
+                    .map(|n| f64::from(n) / 1000.0);
+                serde_json::json!({ "words": words, "score": score })
             })
             .collect();
         serde_json::json!({"lines": lines, "offset_ms": a.offset_ms, "aligner_version": version})
@@ -418,6 +450,62 @@ pub(super) mod tests {
                 })
             );
         }
+    }
+
+    fn scored(mut a: Aligned, scores: &[Option<u16>]) -> Aligned {
+        a.scores = scores.to_vec();
+        a
+    }
+
+    #[test]
+    fn line_scores_match_within_a_thousandth_and_only_when_both_sides_have_one() {
+        let words: &[&[(u32, u64)]] = &[&[(0, 1000)], &[(0, 3000)], &[]];
+        let a = scored(answer(0, words), &[Some(812), Some(1000), None]);
+        let near = scored(answer(0, words), &[Some(811), Some(999), None]);
+        assert_eq!(compare(&a, &near), None, "one thousandth apart matches");
+        let cases: [(&[Option<u16>], &str, &str, &str); 3] = [
+            (
+                &[Some(814), Some(1000), None],
+                "lines[0].score",
+                "0.812",
+                "0.814",
+            ),
+            (&[Some(812), None, None], "lines[1].score", "1.000", "null"),
+            (
+                &[Some(812), Some(1000), Some(0)],
+                "lines[2].score",
+                "null",
+                "0.000",
+            ),
+        ];
+        for (scores, field, p, s) in cases {
+            assert_eq!(
+                compare(&a, &scored(answer(0, words), scores)),
+                Some(Difference {
+                    field: field.into(),
+                    primary: p.into(),
+                    shadow: s.into()
+                })
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_line_score_two_thousandths_apart_is_a_mismatch_over_http() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let primary = scored(answer(0, &[&[(0, 900)]]), &[Some(700)]);
+        let near = scored(answer(0, &[&[(0, 900)]]), &[Some(701)]);
+        let far = scored(answer(0, &[&[(0, 900)]]), &[Some(702)]);
+        let (base, _sent) = fake(200, body(&near, SHADOW_VERSION), None).await;
+        assert_eq!(run(&base, &primary).await, Outcome::Match);
+        let (base, _sent) = fake(200, body(&far, SHADOW_VERSION), None).await;
+        assert_eq!(run(&base, &primary).await, Outcome::Mismatch);
+        assert_eq!(
+            counts(&snapshotter),
+            vec![("match".into(), 1), ("mismatch".into(), 1)]
+        );
     }
 
     #[tokio::test]
