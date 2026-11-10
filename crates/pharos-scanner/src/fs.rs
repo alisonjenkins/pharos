@@ -4790,11 +4790,16 @@ async fn walk(root: PathBuf, exts: HashSet<String>) -> DomainResult<WalkOutcome>
                             Ok(meta) => {
                                 nfos.insert(e.path().to_path_buf(), mtime_secs(&meta));
                             }
-                            Err(err) => tracing::debug!(
-                                path = %e.path().display(),
-                                error = %err,
-                                "walk: could not stat an NFO; an edit to it waits for its video to change",
-                            ),
+                            // An NFO whose time is unknown counts as edited, so
+                            // its video is re-read rather than stamped past it.
+                            Err(err) => {
+                                tracing::debug!(
+                                    path = %e.path().display(),
+                                    error = %err,
+                                    "walk: could not stat an NFO; its video is re-read",
+                                );
+                                nfos.insert(e.path().to_path_buf(), i64::MAX);
+                            }
                         }
                     } else if exts.contains(&ext) {
                         out.push(e.into_path());
@@ -10597,6 +10602,22 @@ mod tests {
         assert_eq!(p.thumb_url.as_deref(), Some("http://img/actor.jpg"));
     }
 
+    /// B1284 — a row no scan has stamped says nothing about its NFO, so it is
+    /// not re-read for one; an NFO the walk could not stat is.
+    #[test]
+    fn nfo_drift_needs_a_stamp_and_counts_an_unknown_time_as_an_edit() {
+        let video = Path::new("/m/F (2001)/F (2001).mkv");
+        let nfo = PathBuf::from("/m/F (2001)/F (2001).nfo");
+        let at = |t: i64| HashMap::from([(nfo.clone(), t)]);
+        assert!(!nfo_drift(&at(2_000), 1, video, 0), "unstamped row");
+        assert!(!nfo_drift(&at(1_000), 1, video, 1_000), "same second");
+        assert!(nfo_drift(&at(1_001), 1, video, 1_000));
+        assert!(nfo_drift(&at(i64::MAX), 1, video, 1_000), "unknown time");
+        let movie = HashMap::from([(PathBuf::from("/m/F (2001)/movie.nfo"), 1_001)]);
+        assert!(nfo_drift(&movie, 1, video, 1_000), "movie.nfo beside it");
+        assert!(!nfo_drift(&HashMap::new(), 1, video, 1_000), "no NFO");
+    }
+
     /// B1284 / V1247 — an edit to a film's NFO alone reaches its row on the
     /// next scan, though the video is untouched; an NFO older than the row's
     /// last stamp leaves the film skipped.
@@ -10617,14 +10638,13 @@ mod tests {
             .unwrap();
         };
         let set_mtime = |offset: i64| {
-            let when = std::time::SystemTime::now()
-                .checked_add(std::time::Duration::from_secs(offset.unsigned_abs()))
-                .filter(|_| offset >= 0)
-                .or_else(|| {
-                    std::time::SystemTime::now()
-                        .checked_sub(std::time::Duration::from_secs(offset.unsigned_abs()))
-                })
-                .unwrap();
+            let delta = std::time::Duration::from_secs(offset.unsigned_abs());
+            let now = std::time::SystemTime::now();
+            let when = if offset >= 0 {
+                now + delta
+            } else {
+                now - delta
+            };
             std::fs::File::options()
                 .write(true)
                 .open(&nfo)
