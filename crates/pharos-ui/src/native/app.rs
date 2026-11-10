@@ -5256,7 +5256,6 @@ fn play_action(view: View) -> &'static str {
     }
 }
 
-/// The wall clock in unix milliseconds, as the activity log stamps its lines.
 /// Whether the connection to the server is down and being reopened.
 #[derive(Clone, Copy)]
 pub struct ConnectionLost(pub Memo<bool>);
@@ -5312,6 +5311,7 @@ fn use_wait_pill(waiting: &[String], in_group: bool) -> Option<activity::WaitPil
     pill
 }
 
+/// The wall clock in unix milliseconds, as the activity log stamps its lines.
 fn now_ms_u64() -> u64 {
     u64::try_from(platform::unix_ms()).unwrap_or(0)
 }
