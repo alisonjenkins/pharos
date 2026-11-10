@@ -80,9 +80,10 @@ impl Row {
     }
 }
 
-/// Home, each library in the order given, Favourites, then the settings
-/// screens.
-pub fn places(libraries: &[Item]) -> Vec<Place> {
+/// Home, each library in the order given, Favourites and Together, then the
+/// settings screens; Manage only for an admin, who alone can open it
+/// (FR-211).
+pub fn places(libraries: &[Item], admin: bool) -> Vec<Place> {
     let home = Place {
         label: "Home".into(),
         detail: "Page",
@@ -93,11 +94,18 @@ pub fn places(libraries: &[Item]) -> Vec<Place> {
         detail: "Library",
         route: Route::Browse(library.id),
     });
-    let favourites = Place {
-        label: "Favourites".into(),
-        detail: "Page",
-        route: Route::Favourites,
-    };
+    let pages = [
+        Place {
+            label: "Favourites".into(),
+            detail: "Page",
+            route: Route::Favourites,
+        },
+        Place {
+            label: "Together".into(),
+            detail: "Page",
+            route: Route::Together,
+        },
+    ];
     let settings = [
         Place {
             label: "Appearance".into(),
@@ -105,15 +113,26 @@ pub fn places(libraries: &[Item]) -> Vec<Place> {
             route: Route::Appearance,
         },
         Place {
-            label: "Manage".into(),
+            label: "Playback".into(),
             detail: "Settings",
-            route: Route::Manage,
+            route: Route::Playback,
+        },
+        Place {
+            label: "Account".into(),
+            detail: "Settings",
+            route: Route::Account,
         },
     ];
+    let manage = admin.then(|| Place {
+        label: "Manage".into(),
+        detail: "Settings",
+        route: Route::Manage,
+    });
     std::iter::once(home)
         .chain(libraries)
-        .chain(std::iter::once(favourites))
+        .chain(pages)
         .chain(settings)
+        .chain(manage)
         .collect()
 }
 
@@ -236,19 +255,33 @@ mod tests {
             item(4, ItemKind::Library, "Films"),
             item(5, ItemKind::Library, "TV"),
         ];
-        let places = places(&libraries);
+        let places = places(&libraries, true);
         let labels: Vec<_> = places.iter().map(|p| p.label.as_str()).collect();
         assert_eq!(
             labels,
-            ["Home", "Films", "TV", "Favourites", "Appearance", "Manage"]
+            [
+                "Home",
+                "Films",
+                "TV",
+                "Favourites",
+                "Together",
+                "Appearance",
+                "Playback",
+                "Account",
+                "Manage"
+            ]
         );
         assert_eq!(places[3].route, Route::Favourites);
         assert_eq!(places[1].route, Route::Browse(ItemRef::Real(4)));
+        // FR-211: only an admin is offered Manage.
+        let viewer = super::places(&libraries, false);
+        assert!(viewer.iter().all(|p| p.route != Route::Manage));
+        assert_eq!(viewer.len(), places.len() - 1);
     }
 
     #[test]
     fn a_blank_term_lists_every_place_then_a_few_to_resume() {
-        let places = places(&[]);
+        let places = places(&[], false);
         let recent: Vec<_> = (1..=8)
             .map(|n| item(n, ItemKind::Movie, &format!("R{n}")))
             .collect();
@@ -259,7 +292,7 @@ mod tests {
 
     #[test]
     fn a_term_keeps_the_places_it_names_then_the_matches() {
-        let places = places(&[item(4, ItemKind::Library, "Music")]);
+        let places = places(&[item(4, ItemKind::Library, "Music")], false);
         let recent = [item(9, ItemKind::Movie, "Resumable")];
         let hits = Page {
             items: vec![item(7, ItemKind::Audio, "Music Box")],
@@ -274,7 +307,7 @@ mod tests {
 
     #[test]
     fn the_report_command_is_listed_and_found_by_name_and_runs_no_route() {
-        let places = places(&[]);
+        let places = places(&[], false);
         let blank = rows(&[], &places, &[], "", None);
         let at = blank.len().min(places.len());
         assert_eq!(blank[at], Row::Command(Command::ReportProblem));
@@ -288,7 +321,7 @@ mod tests {
 
     #[test]
     fn before_the_first_reply_only_places_are_listed() {
-        let places = places(&[]);
+        let places = places(&[], false);
         assert_eq!(
             labels(&rows(&[], &places, &[], "app", None)),
             ["Appearance"]
@@ -297,7 +330,7 @@ mod tests {
 
     #[test]
     fn a_blank_term_lists_past_searches_first_and_they_go_nowhere() {
-        let places = places(&[]);
+        let places = places(&[], false);
         let searches = searches(&remember(&remember("", "moby"), "silver rock"));
         let blank = rows(&searches, &places, &[], "", None);
         assert_eq!(labels(&blank[..3]), ["silver rock", "moby", "Home"]);
