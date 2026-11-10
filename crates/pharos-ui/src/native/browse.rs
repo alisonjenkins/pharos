@@ -1338,6 +1338,9 @@ fn FilterSheet(
                 class: "pharos-sheet",
                 role: "dialog",
                 "aria-modal": "true",
+                // A click on the sheet's text focuses the sheet, not the
+                // page behind it, so Escape still reaches it.
+                tabindex: "-1",
                 aria_labelledby: "pharos-filter-sheet-title",
                 onkeydown: move |evt: KeyboardEvent| {
                     if evt.key() == Key::Named(NamedKey::Escape) {
