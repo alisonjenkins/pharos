@@ -203,7 +203,14 @@ pub async fn sleep_ms(ms: u32) {
 
 pub fn set_title(_title: &str) {}
 
+/// The page's path, its query left off: routing reads this, as it reads
+/// `location.pathname` on the web.
 pub fn current_path() -> String {
+    super::route::split_query(lock(&PATHS).current()).0.to_owned()
+}
+
+/// The whole address on top, query included.
+fn current_address() -> String {
     lock(&PATHS).current().to_owned()
 }
 
@@ -992,8 +999,9 @@ pub fn scroll_tile_to(_at: u32, _top: f64) -> bool {
     false
 }
 
+/// The page's query, `?` included, as `location.search` on the web.
 pub fn current_search() -> String {
-    String::new()
+    super::route::split_query(lock(&PATHS).current()).1.to_owned()
 }
 
 pub struct ScrollWatch;
@@ -1937,7 +1945,7 @@ fn install_bridge() {
     if BRIDGED.swap(true, Ordering::AcqRel) {
         return;
     }
-    let start = current_path();
+    let start = current_address();
     let page = page();
     spawn_forever(async move {
         let _ = page
@@ -2039,7 +2047,7 @@ fn on_bridge(message: Bridge) {
             if kept {
                 // The WebView has already gone back an entry: put the page
                 // that took Back back on top, so the next Back leaves it.
-                let here = current_path();
+                let here = current_address();
                 log::info!("pharos: back taken by the page path={here} popped_to={path}");
                 run(format!(
                     "history.pushState('pharos', '', {});",
@@ -2051,7 +2059,9 @@ fn on_bridge(message: Bridge) {
             for f in &listeners {
                 if let Ok(mut f) = f.try_lock() {
                     if let Listener::Pop(f) = &mut f.0 {
-                        f(path.clone());
+                        // Routing takes the path; the query stays on top of
+                        // PATHS for the page to read (current_search).
+                        f(super::route::split_query(&path).0.to_owned());
                     }
                 }
             }
@@ -2214,7 +2224,7 @@ async fn move_focus_now(dir: super::keymap::Dir) -> Result<(), String> {
         .await
         .map_err(|e| e.to_string())?;
     let Some(from) = found.from else {
-        let path = current_path();
+        let path = current_address();
         let left = lock(&LEFT_AT).get(&path).cloned();
         page_eval(&arrive_js(left.as_ref()))
             .await
@@ -2238,7 +2248,7 @@ async fn move_focus_now(dir: super::keymap::Dir) -> Result<(), String> {
         .await
         .map_err(|e| e.to_string())?;
     if !sel.is_empty() {
-        let path = current_path();
+        let path = current_address();
         let mut m = lock(&LEFT_AT);
         if m.len() >= 64 && !m.contains_key(&path) {
             m.clear();
