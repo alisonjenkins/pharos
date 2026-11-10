@@ -6,6 +6,9 @@
 //                        spans many pages at any window size, and every word
 //                        is a unique token ("zq1x4x17": chapter 1,
 //                        paragraph 4, word 17) the spec can find on screen.
+//   Reader Paged.pdf     five pages ("Page 1 of 5" in large type, and a row
+//                        of squares counting the page), written by hand
+//                        below: Helvetica, no library.
 //   Reader Locked.azw3   bytes the Kindle converter cannot read, which the
 //                        scanner indexes as an unreadable book.
 //
@@ -134,6 +137,38 @@ function epub() {
   ]);
 }
 
+const PDF_PAGES = 5;
+
+/** A PDF of `PDF_PAGES` letter pages, each saying which it is and showing that many squares. */
+function pdf() {
+  const objects = [];
+  const add = (body) => objects.push(body);
+  add("<< /Type /Catalog /Pages 2 0 R >>");
+  const kids = Array.from({ length: PDF_PAGES }, (_, i) => `${4 + 2 * i} 0 R`).join(" ");
+  add(`<< /Type /Pages /Kids [${kids}] /Count ${PDF_PAGES} >>`);
+  add("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>");
+  for (let i = 0; i < PDF_PAGES; i++) {
+    add(
+      `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents ${5 + 2 * i} 0 R ` +
+        `/Resources << /Font << /F1 3 0 R >> >> >>`,
+    );
+    let content = `BT /F1 64 Tf 72 600 Td (Page ${i + 1} of ${PDF_PAGES}) Tj ET\n`;
+    for (let q = 0; q <= i; q++) content += `0.1 0.2 0.6 rg ${72 + q * 80} 120 60 60 re f\n`;
+    add(`<< /Length ${Buffer.byteLength(content)} >>\nstream\n${content}endstream`);
+  }
+  let out = "%PDF-1.4\n";
+  const offsets = [];
+  objects.forEach((body, i) => {
+    offsets.push(Buffer.byteLength(out));
+    out += `${i + 1} 0 obj\n${body}\nendobj\n`;
+  });
+  const xref = Buffer.byteLength(out);
+  out += `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n`;
+  for (const at of offsets) out += `${String(at).padStart(10, "0")} 00000 n \n`;
+  out += `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF\n`;
+  return Buffer.from(out, "latin1");
+}
+
 const out = process.argv[2];
 if (!out) {
   console.error("usage: make-reader-books.cjs <directory>");
@@ -141,4 +176,5 @@ if (!out) {
 }
 fs.mkdirSync(out, { recursive: true });
 fs.writeFileSync(path.join(out, "Reader Fixture.epub"), epub());
+fs.writeFileSync(path.join(out, "Reader Paged.pdf"), pdf());
 fs.writeFileSync(path.join(out, "Reader Locked.azw3"), Buffer.from("not a mobi file: DRM stand-in\n"));
