@@ -79,7 +79,7 @@ Pinning helps torch as much as it helps Rust (song A: 24 s unpinned, 16 s pinned
 
 ### Rollout
 
-- R21. The pharos server gains an optional `[lyrics].aligner_shadow_url`. When it is set, each finished alignment is also sent to the shadow aligner after the primary answer is stored, at most one at a time. The two answers are compared word by word, and the result is logged and counted; the shadow answer is never stored or served.
+- R21. The pharos server gains an optional `[lyrics].aligner_shadow_url`. When it is set, each finished alignment is also sent to the shadow aligner after the primary answer is stored, at most one at a time. The two answers are compared in full (`offset_ms`, line and word counts, and each word's `at` and `start_ms`), and the result is logged and counted; the shadow answer is never stored or served.
 - R22. The cutover points `[lyrics].aligner_url` at the Rust service after the shadow shows no word difference over at least 50 songs. A later slice removes the Python service, its image and its flake outputs.
 
 ## Observability (named signals)
