@@ -200,6 +200,13 @@ impl IntegrityReport {
         self.seek_index == Some(false)
     }
 
+    /// Whether playback itself can break: anything damaged but a missing seek
+    /// index, which plays through and only seeks slowly. Library badges say
+    /// "Damaged" from this, so an unindexed file is not called damaged there.
+    pub fn breaks_playback(&self) -> bool {
+        self.is_damaged() && self.label() != "unindexed"
+    }
+
     /// Whether anything was wrong with the container.
     pub fn is_damaged(&self) -> bool {
         self.corrupt_packets > 0
@@ -546,9 +553,13 @@ mod tests {
         assert!(!indexed.is_damaged());
         let unchecked = IntegrityReport {
             seek_index: None,
-            ..r
+            ..r.clone()
         };
         assert!(!unchecked.is_damaged(), "not checked is not a fault");
+        assert!(
+            !r.breaks_playback(),
+            "it plays through; only its seeks are slow"
+        );
     }
 
     /// A verdict written to the memo before the check existed reads back as
