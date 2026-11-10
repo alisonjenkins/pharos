@@ -155,7 +155,7 @@ impl CallScope {
                 record.request_bytes = p.total_size().map_or(0, |s| s.word_count * 8);
                 if let Some(ctx) = struct_field(*p, "ctx") {
                     let traceparent = text_field(ctx, "traceparent");
-                    record.trace_id = trace_id_of(&traceparent).to_owned();
+                    trace_id_of(&traceparent).clone_into(&mut record.trace_id);
                     record.client_version = text_field(ctx, "clientVersion");
                     if !conn.schema_counted.replace(true) {
                         let version = client_schema_label(u32_field(ctx, "schemaVersion"));
@@ -181,6 +181,12 @@ impl CallScope {
                     (log.payload)(&record, "request", &format!("<undecodable: {e}>"));
                 }
             }
+        }
+        // A call the client sent without a trace gets one here, so its log
+        // line, its span and any `Error` it answers carry the same id and a
+        // viewer can quote it (038 FR-404, V1216).
+        if record.trace_id.is_empty() {
+            record.trace_id = mint_trace_id(conn.id, &record.call_id);
         }
         span.record("trace_id", record.trace_id.as_str());
         span.record("device", record.device.as_str());
@@ -218,6 +224,11 @@ impl CallScope {
     /// handler.
     pub fn refusal(&self) -> Option<&Denial> {
         self.refusal.as_ref()
+    }
+
+    /// The call's trace id: the caller's, or one minted for it. Never empty.
+    pub fn trace_id(&self) -> &str {
+        &self.record.trace_id
     }
 
     /// Runs the handler's future inside the call span.
@@ -490,6 +501,56 @@ pub fn fill_denied(
     Ok(())
 }
 
+/// Writes `trace_id` into the `Error` a handler answered with, when that
+/// error does not already carry one: the `error` arm of `result`, or of its
+/// `status` (`ResumeResult`). Every denial a viewer sees can then be quoted
+/// and found in the server's log by that id (038 FR-404, V1216). A reply
+/// that is not an error is left as it is.
+pub fn stamp_trace_id(results: dynamic_value::Builder<'_>, trace_id: &str) {
+    let Ok(results) = results.downcast::<capnp::dynamic_struct::Builder<'_>>().get_named("result")
+    else {
+        return;
+    };
+    let mut carrier = results.downcast::<capnp::dynamic_struct::Builder<'_>>();
+    if !builder_active_is(&carrier, "error") {
+        let Ok(status) = carrier.get_named("status") else {
+            return;
+        };
+        carrier = status.downcast::<capnp::dynamic_struct::Builder<'_>>();
+        if !builder_active_is(&carrier, "error") {
+            return;
+        }
+    }
+    let Ok(error) = carrier.get_named("error") else {
+        return;
+    };
+    let mut error = error.downcast::<capnp::dynamic_struct::Builder<'_>>();
+    let has = error.reborrow_as_reader().has_named("traceId").unwrap_or(false);
+    if !has {
+        let _ = error.set_named("traceId", dynamic_value::Reader::Text(trace_id.into()));
+    }
+}
+
+fn builder_active_is(s: &capnp::dynamic_struct::Builder<'_>, name: &str) -> bool {
+    matches!(s.which(), Ok(Some(f)) if redact::name_of(f.get_proto().get_name()) == name)
+}
+
+/// A fresh W3C trace id (32 lowercase hex digits, not all zero) for a call
+/// that arrived without one. Seeded from the process's per-hasher random keys,
+/// the clock, the connection and the call, so two calls never share one.
+fn mint_trace_id(connection: u64, call_id: &str) -> String {
+    use std::hash::BuildHasher as _;
+    let now = web_time::SystemTime::now()
+        .duration_since(web_time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let half = |salt: u8| {
+        std::collections::hash_map::RandomState::new().hash_one((salt, connection, call_id, now))
+    };
+    let (hi, lo) = (half(0), half(1));
+    // All zeros is the W3C "invalid" id; one bit keeps it valid.
+    format!("{hi:016x}{:016x}", if hi == 0 && lo == 0 { 1 } else { lo })
+}
+
 /// Whether `s`'s active union member is named `name`.
 fn active_is(s: capnp::dynamic_struct::Reader<'_>, name: &str) -> bool {
     matches!(s.which(), Ok(Some(f)) if redact::name_of(f.get_proto().get_name()) == name)
@@ -542,7 +603,17 @@ fn trace_id_of(traceparent: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use super::trace_id_of;
+    use super::{mint_trace_id, trace_id_of};
+
+    #[test]
+    fn a_minted_trace_id_is_well_formed_and_fresh() {
+        let a = mint_trace_id(1, "1.1");
+        let b = mint_trace_id(1, "1.2");
+        assert_eq!(a.len(), 32);
+        assert!(a.bytes().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert_ne!(a, b);
+        assert_eq!(trace_id_of(&format!("00-{a}-00f067aa0ba902b7-01")), a);
+    }
 
     #[test]
     fn trace_id_is_the_second_traceparent_field() {
