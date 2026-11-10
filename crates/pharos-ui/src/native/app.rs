@@ -2222,15 +2222,16 @@ async fn forget_kept_books(why: &str) {
 #[cfg(not(all(feature = "web", target_arch = "wasm32")))]
 async fn forget_kept_books(_why: &str) {}
 
-/// How many books are kept on this device, for Sign out's warning.
+/// How many books are kept on this device, for Sign out's warning; `None`
+/// when the record cannot be read.
 #[cfg(all(feature = "web", target_arch = "wasm32"))]
-fn kept_book_count() -> usize {
-    super::kept_web::read().map_or(0, |store| store.books.len())
+fn kept_book_count() -> Option<usize> {
+    super::kept_web::count()
 }
 
 #[cfg(not(all(feature = "web", target_arch = "wasm32")))]
-fn kept_book_count() -> usize {
-    0
+fn kept_book_count() -> Option<usize> {
+    Some(0)
 }
 
 /// Drops kept books that another user kept, once the signed-in user is known.

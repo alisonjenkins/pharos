@@ -58,19 +58,33 @@ fn local_storage() -> Result<web_sys::Storage, String> {
 /// The record of kept books, or `None` when nothing is kept (or the record
 /// cannot be read, which is logged).
 pub fn read() -> Option<KeptStore> {
+    read_checked().ok().flatten()
+}
+
+/// How many books are kept, or `None` when the record cannot be read: the
+/// caches may still hold books, so a caller must not take that as none.
+pub fn count() -> Option<usize> {
+    read_checked()
+        .ok()
+        .map(|store| store.map_or(0, |s| s.books.len()))
+}
+
+/// [`read`], telling an unreadable or damaged record (`Err`, logged) from
+/// none at all.
+fn read_checked() -> Result<Option<KeptStore>, ()> {
     let text = match local_storage().and_then(|s| s.get_item(STORE_KEY).map_err(|e| describe(&e))) {
         Ok(Some(text)) => text,
-        Ok(None) => return None,
+        Ok(None) => return Ok(None),
         Err(e) => {
             platform::warn(&format!("pharos: kept record unreadable error={e}"));
-            return None;
+            return Err(());
         }
     };
     match KeptStore::parse(&text) {
-        Ok(store) => store,
+        Ok(store) => Ok(store),
         Err(e) => {
             platform::warn(&format!("pharos: kept record damaged error={e}"));
-            None
+            Err(())
         }
     }
 }
@@ -659,8 +673,9 @@ fn use_store() -> (
     });
     let on_remove = EventHandler::new(move |id: String| {
         spawn(async move {
+            failed.set(None);
             match remove(&id).await {
-                Ok(()) => failed.set(None),
+                Ok(()) => {}
                 Err(e) => {
                     platform::warn(&format!("pharos: kept remove failed item={id} error={e}"));
                     failed.set(Some((id, e)));
