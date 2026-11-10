@@ -444,3 +444,26 @@ async fn a_playlist_on_another_tokens_session_keeps_its_own_token() {
     let master = String::from_utf8_lossy(&body);
     assert!(master.contains(&format!("api_key={fresh}")), "{master}");
 }
+
+#[actix_web::test]
+async fn a_playlist_whose_session_is_not_stored_keeps_its_token() {
+    // The durable write can fail while this replica's cache still holds the
+    // session; child requests check the stored row, so binding on the cache
+    // alone would strip the only credential that still works (B1091).
+    use pharos_core::TranscodeSessionStore as _;
+    let (state, token, _) = seed().await;
+    let app = init_app!(state.clone());
+    let v = playback_info!(&app, token.as_str(), 1);
+    let psid = v["PlaySessionId"].as_str().unwrap().to_string();
+    let url = transcoding_url(&v);
+    state.stores.remove_transcode_session(&psid).await.unwrap();
+    let body = test::call_and_read_body(
+        &app,
+        test::TestRequest::get()
+            .uri(&format!("{url}&api_key={token}"))
+            .to_request(),
+    )
+    .await;
+    let master = String::from_utf8_lossy(&body);
+    assert!(master.contains(&format!("api_key={token}")), "{master}");
+}
