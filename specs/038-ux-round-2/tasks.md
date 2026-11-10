@@ -65,7 +65,7 @@ Id blocks (bugs and invariants are written with the fix):
 
 - [x] T038-501 Check whether a group session rebinds after a reconnect; fix if not (FR-503). It does (B894); its outcome is now reported (B1261).
 - [x] T038-502 [P] Rejoin note (FR-501); waiting pill (FR-502); connection banner in the player (FR-503). B1262–B1264.
-- [ ] T038-503 Together page (FR-504); Leave undo (FR-505). Done but for the page refreshing from server push, which follows with schema 41 (B1265).
+- [x] T038-503 Together page (FR-504); Leave undo (FR-505) (B1265); the page refreshes from server push, schemaVersion 44 (B1266).
 
 ## G6 — TV with a remote
 
