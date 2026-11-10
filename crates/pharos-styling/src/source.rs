@@ -462,7 +462,10 @@ impl SourceLine {
         if !self.typeset {
             return None;
         }
-        sign_cause(&parse_text(&self.raw, self.format), self.style_def.as_deref())
+        sign_cause(
+            &parse_text(&self.raw, self.format),
+            self.style_def.as_deref(),
+        )
     }
 }
 
