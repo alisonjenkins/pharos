@@ -646,7 +646,7 @@ pub fn session_set(key: &str, value: &str) -> Result<(), String> {
     Ok(())
 }
 
-pub fn toggle_fullscreen(_id: &str) {}
+pub fn toggle_fullscreen() {}
 
 pub fn page_origin() -> String {
     String::new()
