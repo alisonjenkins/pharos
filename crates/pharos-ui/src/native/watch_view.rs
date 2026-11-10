@@ -1469,9 +1469,15 @@ fn SeekBar(
         let damaged = c.damage.as_ref().is_some_and(|d| in_span(&d.ranges, ms));
         (percent(ms, total), clock(ms), chapter, thumb, damaged)
     });
-    let preview_at = hover.as_ref().map_or_else(String::new, |(at, _, _, thumb, _)| {
-        preview_left(*at, thumb.as_ref().map(|t| t.width), class == "pharos-seek is-scrubbing")
-    });
+    let preview_at = hover
+        .as_ref()
+        .map_or_else(String::new, |(at, _, _, thumb, _)| {
+            preview_left(
+                *at,
+                thumb.as_ref().map(|t| t.width),
+                class == "pharos-seek is-scrubbing",
+            )
+        });
     let damaged_spans = c
         .damage
         .as_ref()
