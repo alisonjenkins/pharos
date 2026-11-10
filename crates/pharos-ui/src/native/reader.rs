@@ -319,13 +319,20 @@ pub fn retry_delay_ms(attempt: u32) -> u32 {
 }
 
 /// Whether a failed save is worth keeping to send again: the connection
-/// failed or the server was unavailable. A refusal (not a book, a bad
-/// locator) or a revoked session would fail the same way every time.
+/// failed, the server was unavailable or rate limiting, or the session needs
+/// signing in again (the entry is held and sent after sign-in). Only a
+/// refusal (invalid, not found, not permitted) would fail the same way
+/// every time.
 pub fn retryable(error: &ClientError) -> bool {
     match error {
         ClientError::Rpc(_) => !error.is_unimplemented(),
-        ClientError::Api { kind, .. } => *kind == "unavailable",
+        ClientError::Api { kind, .. } => retryable_kind(kind),
     }
+}
+
+/// [`retryable`] for a server `Error.kind`.
+pub fn retryable_kind(kind: &str) -> bool {
+    matches!(kind, "unavailable" | "limit" | "revoked")
 }
 
 /// A place in a book and when the reader got there.
@@ -818,7 +825,7 @@ mod tests {
     }
 
     #[test]
-    fn a_refusal_is_not_retried() {
+    fn only_a_refusal_is_not_retried() {
         let api = |kind| ClientError::Api {
             kind,
             reason: String::new(),
@@ -826,8 +833,11 @@ mod tests {
         };
         // `ClientError::Rpc` (a dropped socket) is retried; capnp is not a
         // host dependency, so the Playwright offline test covers it.
-        assert!(retryable(&api("unavailable")));
-        for kind in ["invalid", "notFound", "notPermitted", "revoked", "limit"] {
+        for kind in ["unavailable", "limit", "revoked"] {
+            assert!(retryable(&api(kind)), "{kind} is held and retried");
+            assert!(retryable_kind(kind), "{kind}");
+        }
+        for kind in ["invalid", "notFound", "notPermitted"] {
             assert!(!retryable(&api(kind)), "{kind}");
         }
     }
