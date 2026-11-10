@@ -1828,9 +1828,10 @@ fn fail_manifest(
             ("attempt", "0".to_owned()),
         ],
     });
-    on_fatal(Fatal::other(format!(
-        "the stream failed (networkError: {reason})"
-    )));
+    on_fatal(Fatal::of(
+        status.map_or(FailureKind::Network, FailureKind::of_status),
+        format!("the stream failed (networkError: {reason})"),
+    ));
 }
 
 /// A media error: rebuild the MediaSource at the play head while the media
@@ -1869,9 +1870,10 @@ fn fail_media(weak: &Weak<RefCell<Session>>, details: &str, message: &str) {
         MediaVerdict::Fail { .. } => {
             finish_trace(&session, super::hls_trace::Flush::Fatal);
             report_event(report.event(current_path()));
-            on_fatal(Fatal::media(format!(
-                "the stream failed (mediaError: {message})"
-            )));
+            on_fatal(Fatal::of(
+                FailureKind::of_media_error(details),
+                format!("the stream failed (mediaError: {message})"),
+            ));
         }
     }
 }
