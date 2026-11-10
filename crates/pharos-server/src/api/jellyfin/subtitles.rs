@@ -693,6 +693,7 @@ async fn deliver_styled_ass(
         director_version: row.director_version,
         plan_stamp: row.styled_at,
         size_percent,
+        speakers: false,
     };
     let mtime = mtime_secs(&item.path).await;
     let cache = state.subtitles.as_ref();
