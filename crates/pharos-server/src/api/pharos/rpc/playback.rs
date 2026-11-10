@@ -7,7 +7,7 @@ use std::rc::Rc;
 
 use pharos_api::pharos_capnp::{
     capabilities, decision, done, opt_u32, playback as wire, playback_grant as grant_wire,
-    start_tracks_result, stream_choice,
+    queue_hint, start_tracks_result, stream_choice,
 };
 use pharos_api::{server, Denial};
 use pharos_jellyfin_api::dto::WireId;
@@ -321,6 +321,56 @@ impl server::playback_grant::Handler for Grant {
         write_done(results.get().init_result(), stopped);
         Ok(())
     }
+
+    /// What this playback waits behind on the encoders, asked by a player
+    /// whose start, seek or buffer is taking a while (038 FR-402, V1217).
+    /// Read from the scheduler's queue; nothing is kept per session for it.
+    async fn queue_hint(
+        self: Rc<Self>,
+        _params: grant_wire::QueueHintParams,
+        results: &mut grant_wire::QueueHintResults,
+    ) -> Result<(), capnp::Error> {
+        let out = results.get().init_result();
+        if let Err(denial) = self.session.current_user().await {
+            denial.write(out.init_error());
+            return Ok(());
+        }
+        let stream = pharos_transcode::scheduler::StreamKey::of(&self.play_session_id);
+        let wait = match self.session.state.transcode_scheduler.as_ref() {
+            Some(sched) => sched.stream_wait(stream).await.unwrap_or_default(),
+            None => pharos_transcode::scheduler::StreamWait::default(),
+        };
+        let play_session_id = pharos_core::secret_prefix(&self.play_session_id);
+        // The verdict the viewer is shown, with what it was read from: a
+        // "server busy" caption can be matched to the queue it described.
+        if wait.queued > 0 {
+            tracing::info!(
+                play_session_id = %play_session_id,
+                queued = wait.queued,
+                waited_ms = wait.oldest_ms,
+                others_queued = wait.others_queued,
+                busy = wait.devices_full,
+                "playback queue hint: waiting for an encoder"
+            );
+        } else {
+            tracing::debug!(
+                play_session_id = %play_session_id,
+                others_queued = wait.others_queued,
+                busy = wait.devices_full,
+                "playback queue hint: nothing queued"
+            );
+        }
+        write_queue_hint(out.init_hint(), wait);
+        Ok(())
+    }
+}
+
+fn write_queue_hint(mut out: queue_hint::Builder<'_>, wait: pharos_transcode::scheduler::StreamWait) {
+    let count = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
+    out.set_queued(count(wait.queued));
+    out.set_waited_ms(wait.oldest_ms);
+    out.set_others_queued(count(wait.others_queued));
+    out.set_busy(wait.devices_full);
 }
 
 impl Drop for Grant {

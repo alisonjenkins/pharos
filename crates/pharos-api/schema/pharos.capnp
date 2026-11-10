@@ -432,12 +432,22 @@ struct Decision {
   subtitle @6 :OptU32;         # the subtitle it starts with; none = off
 }
 struct DecisionResult { union { decision @0 :Decision; error @1 :Error; } }
+# What this playback's viewer is waiting behind on the server, asked while a
+# start, seek or buffer waits (038 FR-402). Since schemaVersion 40.
+struct QueueHint {
+  queued @0 :UInt32;        # this playback's client requests waiting for an encoder
+  waitedMs @1 :UInt64;      # how long the oldest of them has waited; 0 with none
+  othersQueued @2 :UInt32;  # other viewers' requests waiting too
+  busy @3 :Bool;            # every encoder is running at capacity
+}
+struct QueueHintResult { union { hint @0 :QueueHint; error @1 :Error; } }
 interface PlaybackGrant {
   decision @0 (ctx :CallContext) -> (result :DecisionResult);
   # audio/subtitle: the tracks playing now, after any switch the player made
   # without renegotiating; `default` says nothing and keeps the stored choice.
   report @1 (ctx :CallContext, positionMs :UInt64, paused :Bool, audio :StreamChoice, subtitle :StreamChoice) -> (result :Done);
   stop @2 (ctx :CallContext, positionMs :UInt64) -> (result :Done);
+  queueHint @3 (ctx :CallContext) -> (result :QueueHintResult);   # Since schemaVersion 40.
 }
 struct NegotiateResult { union { grant @0 :PlaybackGrant; error @1 :Error; } }
 # The tracks a negotiate naming `default` for both would start on: the user's
