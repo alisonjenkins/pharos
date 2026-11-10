@@ -11,6 +11,7 @@ mod aside;
 mod burst;
 mod caption;
 mod echo;
+mod giggle;
 mod hush;
 mod impact;
 mod inner_voice;
@@ -87,6 +88,7 @@ pub(crate) fn events(
         Intent::Narration => Some(caption::events(line, fx, theme, tier)),
         Intent::OffScreen => Some(aside::events(line, fx, theme, tier)),
         Intent::Sfx => Some(burst::events(line, fx, theme, tier)),
+        Intent::Laugh => Some(giggle::events(line, fx, theme, tier)),
         Intent::AttackCall => Some(echo::events(line, fx, theme, tier)),
         Intent::Phone => Some(wire::events(line, fx, theme, tier)),
         Intent::Flashback => Some(memory::events(line, fx, theme, tier)),

@@ -213,7 +213,13 @@ fn decide(
             format!("rule=flashback style={}", line.style),
         );
     }
-    // 1
+    // 1. Laughter before other sounds (B1205).
+    if is_laugh_cue(text) {
+        return effect(Intent::Laugh, 1, "rule=laugh cue".into());
+    }
+    if is_laughter(text) {
+        return effect(Intent::Laugh, 1, "rule=laugh text".into());
+    }
     if is_sfx(text) {
         return effect(Intent::Sfx, 1, "rule=sfx".into());
     }
@@ -342,6 +348,72 @@ fn is_sfx(text: &str) -> bool {
         && !inner.contains([',', '?', '.'])
         && !is_phone_tag(&inner.to_lowercase())
         && !is_whisper_tag(&inner.to_lowercase())
+}
+
+/// First-word stems of a laugh cue.
+const LAUGH_CUES: [&str; 7] = [
+    "laugh", "chuckl", "giggl", "snicker", "cackl", "chortl", "guffaw",
+];
+
+/// A whole line in brackets, parentheses or stars naming laughter:
+/// `(laughs)`, `[giggling nervously]`, `*chuckles*`.
+fn is_laugh_cue(text: &str) -> bool {
+    let inner = unwrap_marks(text);
+    if inner == text
+        || inner.split_whitespace().count() > SFX_MAX_WORDS
+        || inner.contains([',', '?', '.'])
+    {
+        return false;
+    }
+    let lower = inner.to_lowercase();
+    let first = lower
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .trim_matches(|c: char| !c.is_alphabetic());
+    LAUGH_CUES.iter().any(|stem| first.starts_with(stem))
+}
+
+/// A line that is only laughter, at least two beats of it: `Ha ha!`,
+/// `Hahaha`, `Heh heh`, `Ahaha!`. A lone `Ha!` is often a scoff.
+fn is_laughter(text: &str) -> bool {
+    let mut beats = 0usize;
+    let mut words = 0usize;
+    for word in text.split(|c: char| c.is_whitespace() || c == '-') {
+        let w: String = word
+            .chars()
+            .filter(|c| c.is_alphabetic())
+            .flat_map(char::to_lowercase)
+            .collect();
+        if w.is_empty() {
+            continue;
+        }
+        words += 1;
+        let Some(n) = laugh_beats(&w) else {
+            return false;
+        };
+        beats += n;
+    }
+    words > 0 && beats >= 2
+}
+
+/// How many `ha`/`he`/`ho` beats `w` is made of, allowing a leading
+/// `a` and a trailing `h` (`ahaha`, `heh`); `None` when it is anything else.
+fn laugh_beats(w: &str) -> Option<usize> {
+    let w = w.strip_prefix('a').unwrap_or(w);
+    let w = w.strip_suffix('h').filter(|r| !r.is_empty()).unwrap_or(w);
+    let b = w.as_bytes();
+    if b.is_empty() || b.len() % 2 != 0 {
+        return None;
+    }
+    let mut n = 0;
+    for pair in b.chunks(2) {
+        match pair {
+            [b'h', b'a' | b'e' | b'o'] => n += 1,
+            _ => return None,
+        }
+    }
+    Some(n)
 }
 
 /// Whether a bracket's contents name a sound or a non-speech voice: its
@@ -682,6 +754,41 @@ mod tests {
             Intent::Plain
         );
         assert_eq!(intent(case("*It ends here.*").silent()), Intent::Plain);
+    }
+
+    /// B1205: laughter has its own intent, from a cue or from the text.
+    #[test]
+    fn laughter() {
+        for l in [
+            "(laughs)",
+            "(LAUGHING)",
+            "(chuckles softly)",
+            "[giggling]",
+            "*snickers*",
+            "（laughs）",
+            "Hahaha!",
+            "Ha ha ha.",
+            "Heh heh",
+            "Ahahaha!",
+            "Hehe~",
+            "Ha-ha!",
+        ] {
+            let fx = case(l).run();
+            assert_eq!(fx.intent, Intent::Laugh, "{l}");
+            assert!(fx.reason.starts_with("rule=laugh"), "{}", fx.reason);
+        }
+        for not in [
+            "Ha!",
+            "Hah",
+            "Ha, very funny.",
+            "Hello there",
+            "(laughs, then stops)",
+            "He laughs at me",
+            "Hi hi",
+            "Oh ho",
+        ] {
+            assert_ne!(intent(case(not)), Intent::Laugh, "{not}");
+        }
     }
 
     /// B1203: a parenthesised sound is a sound, not a thought.
