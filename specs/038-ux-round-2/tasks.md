@@ -32,8 +32,8 @@ Id blocks (bugs and invariants are written with the fix):
 
 - [ ] T038-200 Reproduce each G2 problem in a browser (desktop and 390px) and keep the screenshots as the before state.
 - [ ] T038-201 Show page opens on the season being watched; hero Play is the show's next-up (FR-201).
-- [ ] T038-202 [P] Reproduce the phone episode row at 390px, then stack it (FR-202).
-- [ ] T038-203 [P] Music library letter rail and album sort (FR-203); tab in the URL (FR-204).
+- [ ] T038-202 Reproduce the phone episode row at 390px, then stack it (FR-202).
+- [ ] T038-203 Music library letter rail and album sort (FR-203); tab in the URL (FR-204).
 - [ ] T038-204 Series page loads in parallel (FR-205).
 - [ ] T038-205 Home and title pages keep content and scroll on Back (FR-206).
 - [ ] T038-206 Search URL and grouped "see all" (FR-207).
