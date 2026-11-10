@@ -1,7 +1,7 @@
 //! The HTTP face of the service: `/align` and `/healthz` with the Python
 //! service's statuses and error bodies.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -10,9 +10,9 @@ use actix_web::http::StatusCode;
 use actix_web::{web, HttpRequest, HttpResponse};
 use serde::Serialize;
 
-use crate::obs::{Metrics, SONGS_TOTAL, SONG_SECONDS};
-use crate::plan::{parse_request, resolve};
-use crate::service::{Engine, SongError};
+use crate::obs::{set_remote_parent, Metrics, SONGS_TOTAL, SONG_SECONDS};
+use crate::plan::{parse_request, resolve, Line};
+use crate::service::{Aligned, Engine, SongError};
 
 /// Largest `/align` body read; larger ones answer 413 without being read.
 pub const MAX_BODY_BYTES: usize = 1024 * 1024;
@@ -99,64 +99,43 @@ async fn align(
 
     let span = tracing::info_span!(
         "aligner.align",
+        otel.kind = "server",
+        otel.status_code = tracing::field::Empty,
+        otel.status_message = tracing::field::Empty,
         aligner.path = tracing::field::Empty,
         aligner.lines = tracing::field::Empty,
+        aligner.offset_ms = tracing::field::Empty,
+        aligner.words_aligned = tracing::field::Empty,
+        aligner.decode_ms = tracing::field::Empty,
+        aligner.model_ms = tracing::field::Empty,
     );
+    set_remote_parent(&span, req.headers());
+    let fail = |status: StatusCode, message: String| {
+        span.record("otel.status_code", "error");
+        span.record("otel.status_message", message.as_str());
+        error(status, message)
+    };
     let (rel_path, lines) = match parse_request(&body) {
         Ok(parsed) => parsed,
-        Err(e) => return error(StatusCode::BAD_REQUEST, e.to_string()),
+        Err(e) => return fail(StatusCode::BAD_REQUEST, e.to_string()),
     };
     let full_path = match resolve(&state.media_root, &rel_path) {
         Ok(p) => p,
-        Err(e) => return error(StatusCode::BAD_REQUEST, e.to_string()),
+        Err(e) => return fail(StatusCode::BAD_REQUEST, e.to_string()),
     };
     span.record("aligner.path", rel_path.as_str());
     span.record("aligner.lines", lines.len());
     // Checked here, not mapped from the decode: ffmpeg missing is a server
     // fault (500), not a missing file.
     if !full_path.is_file() {
-        return error(StatusCode::NOT_FOUND, format!("file not found: {rel_path}"));
+        return fail(StatusCode::NOT_FOUND, format!("file not found: {rel_path}"));
     }
 
     let engine = Arc::clone(&state.engine);
     // The song runs on a blocking thread so /healthz answers meanwhile; it
     // finishes and logs even if the caller stops waiting.
-    let done = web::block(move || {
-        span.in_scope(|| {
-            let started = Instant::now();
-            let n_lines = lines.len();
-            let result = engine.align_song(&rel_path, &full_path, lines);
-            let elapsed = started.elapsed();
-            let duration_ms = elapsed.as_millis() as u64;
-            let outcome = match &result {
-                Ok(_) => "ok",
-                Err(SongError::Ffmpeg(_)) => "ffmpeg",
-                Err(SongError::Internal(_)) => "internal",
-            };
-            metrics::counter!(SONGS_TOTAL, "outcome" => outcome).increment(1);
-            metrics::histogram!(SONG_SECONDS).record(elapsed.as_secs_f64());
-            match &result {
-                Ok(a) => tracing::info!(
-                    path = %rel_path,
-                    lines = n_lines,
-                    words_aligned = a.words_aligned,
-                    offset_ms = a.answer.offset_ms,
-                    duration_ms,
-                    decode_ms = a.phases.decode_ms(),
-                    model_ms = a.phases.model_ms(),
-                    "song aligned"
-                ),
-                Err(e @ SongError::Ffmpeg(_)) => {
-                    tracing::warn!(path = %rel_path, failed = "ffmpeg", duration_ms, error = %e, "song failed");
-                }
-                Err(e @ SongError::Internal(_)) => {
-                    tracing::error!(path = %rel_path, failed = "internal", duration_ms, error = %e, "song failed");
-                }
-            }
-            result
-        })
-    })
-    .await;
+    let done =
+        web::block(move || span.in_scope(|| run_song(&engine, &rel_path, &full_path, lines))).await;
     match done {
         Ok(Ok(aligned)) => json(StatusCode::OK, &aligned.answer),
         Ok(Err(e @ SongError::Ffmpeg(_))) => error(StatusCode::UNPROCESSABLE_ENTITY, e.to_string()),
@@ -168,6 +147,54 @@ async fn align(
             error(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
         }
     }
+}
+
+/// One song on the blocking pool, inside its `aligner.align` span: the
+/// alignment, then its counters, span attributes and log line.
+fn run_song(
+    engine: &Engine,
+    rel_path: &str,
+    full_path: &Path,
+    lines: Vec<Line>,
+) -> Result<Aligned, SongError> {
+    let started = Instant::now();
+    let n_lines = lines.len();
+    let result = engine.align_song(rel_path, full_path, lines);
+    let elapsed = started.elapsed();
+    let duration_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+    metrics::histogram!(SONG_SECONDS).record(elapsed.as_secs_f64());
+    let span = tracing::Span::current();
+    let outcome = match &result {
+        Ok(a) => {
+            span.record("aligner.offset_ms", a.answer.offset_ms);
+            span.record("aligner.words_aligned", a.words_aligned);
+            span.record("aligner.decode_ms", a.phases.decode_ms());
+            span.record("aligner.model_ms", a.phases.model_ms());
+            tracing::info!(
+                path = rel_path,
+                lines = n_lines,
+                words_aligned = a.words_aligned,
+                offset_ms = a.answer.offset_ms,
+                duration_ms,
+                decode_ms = a.phases.decode_ms(),
+                model_ms = a.phases.model_ms(),
+                "song aligned"
+            );
+            "ok"
+        }
+        Err(e) => {
+            span.record("otel.status_code", "error");
+            span.record("otel.status_message", e.to_string().as_str());
+            let failed = match e {
+                SongError::Ffmpeg(_) => "ffmpeg",
+                SongError::Internal(_) => "internal",
+            };
+            tracing::warn!(path = rel_path, failed, duration_ms, error = %e, "song failed");
+            failed
+        }
+    };
+    metrics::counter!(SONGS_TOTAL, "outcome" => outcome).increment(1);
+    result
 }
 
 /// Registers the routes; `state` must be built once, outside the
