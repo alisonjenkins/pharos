@@ -2797,11 +2797,9 @@ fn TogetherScreen() -> Element {
         let mut error = together.error;
         move || error.set(None)
     });
-    let api = use_hook(move || group_client(ctx));
-    let mut groups = use_resource({
-        let api = api.clone();
-        move || list_groups(api.clone())
-    });
+    // The client is read per request, so Try again after a reconnect asks
+    // over the new connection.
+    let mut groups = use_resource(move || list_groups(group_client(ctx)));
     // What each group is watching, looked up once the list is in.
     let watching = use_resource(move || {
         let listed = groups.read().clone();
