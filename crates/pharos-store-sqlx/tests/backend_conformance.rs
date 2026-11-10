@@ -4037,3 +4037,106 @@ async fn postgres_artwork_repair_conformance() {
         .expect("connect postgres");
     run_artwork_repair_conformance(p).await;
 }
+
+/// `UserDataStore::started_items` (spec 038 FR-105): only the user's own
+/// played or part-played rows of the asked kind, newest play first.
+async fn run_started_items_conformance<S>(store: S)
+where
+    S: pharos_core::MediaStore + pharos_core::UserStore + pharos_core::UserDataStore,
+{
+    let uid = user_record("watcher");
+    let uid = {
+        let id = uid.id;
+        UserStore::create(&store, uid).await.unwrap();
+        id
+    };
+    let other = user_record("someone-else");
+    let other = {
+        let id = other.id;
+        UserStore::create(&store, other).await.unwrap();
+        id
+    };
+    let episode = |id: MediaId| MediaItem {
+        kind: MediaKind::Episode,
+        ..media_item(id, "An Episode")
+    };
+    for item in [
+        episode(1),
+        episode(2),
+        episode(3),
+        episode(4),
+        media_item(5, "A Film"),
+    ] {
+        MediaStore::put(&store, item).await.unwrap();
+    }
+    let row = |played: bool, position: u64, at: i64| UserItemData {
+        played,
+        last_played_position_ticks: position,
+        last_played_at: at,
+        ..Default::default()
+    };
+    let rows = [
+        (1, row(true, 0, 100)),
+        (2, row(false, 500, 300)),
+        // A favourite never played is not started.
+        (
+            3,
+            UserItemData {
+                is_favorite: true,
+                ..Default::default()
+            },
+        ),
+        (4, row(true, 0, 300)),
+        (5, row(true, 0, 400)),
+    ];
+    for (id, data) in rows {
+        UserDataStore::set_user_data(&store, uid, id, data)
+            .await
+            .unwrap();
+    }
+    UserDataStore::set_user_data(&store, other, 3, row(true, 0, 900))
+        .await
+        .unwrap();
+
+    let got = UserDataStore::started_items(&store, uid, MediaKind::Episode)
+        .await
+        .unwrap();
+    assert_eq!(
+        got,
+        [
+            (4, row(true, 0, 300)),
+            (2, row(false, 500, 300)),
+            (1, row(true, 0, 100))
+        ],
+        "newest play first, ties by id, the film and the unplayed favourite left out"
+    );
+    assert!(
+        UserDataStore::started_items(&store, other, MediaKind::Movie)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn sqlite_started_items_conformance() {
+    let s = pharos_store_sqlx::sqlite::SqliteStore::connect("sqlite::memory:")
+        .await
+        .expect("connect in-memory sqlite");
+    run_started_items_conformance(s).await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn postgres_started_items_conformance() {
+    let Ok(url) = std::env::var("PHAROS_TEST_POSTGRES_URL") else {
+        eprintln!("SKIP postgres_started_items_conformance: PHAROS_TEST_POSTGRES_URL unset");
+        return;
+    };
+    let url = fresh_postgres_url(&url, "started_items").await;
+    let p = pharos_store_sqlx::postgres::PostgresStore::connect(&url)
+        .await
+        .expect("connect postgres");
+    run_started_items_conformance(p).await;
+}
