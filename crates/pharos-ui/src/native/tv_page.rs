@@ -17,6 +17,20 @@ pub const DEFAULT_SERVER: &str = match option_env!("PHAROS_TV_SERVER") {
 /// a TV, so the ten-foot layout applies.
 pub const USER_AGENT: &str = "Pharos Android TV";
 
+/// The field the TV adds to each client event it submits, so the server's
+/// log tells its events from a browser's (FR-608).
+pub const EVENT_CLIENT: (&str, &str) = ("client", "android-tv");
+
+/// `event` as the TV submits it: tagged with [`EVENT_CLIENT`], once.
+pub fn tagged(mut event: pharos_client::api::ClientEvent) -> pharos_client::api::ClientEvent {
+    if !event.fields.iter().any(|(k, _)| *k == EVENT_CLIENT.0) {
+        event
+            .fields
+            .push((EVENT_CLIENT.0, EVENT_CLIENT.1.to_owned()));
+    }
+    event
+}
+
 /// The first page the app opens on.
 pub const START_PATH: &str = "/ui/";
 
@@ -591,6 +605,27 @@ pub fn unwatch_sentinel_js(watch: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_tv_event_names_its_client_once() {
+        use pharos_client::api::{ClientEvent, ClientEventKind, ClientLevel};
+        let event = ClientEvent {
+            kind: ClientEventKind::PlaybackError,
+            level: ClientLevel::Error,
+            route: "/watch/1".to_owned(),
+            fields: vec![("engine", "hlsjs".to_owned())],
+        };
+        let once = tagged(event);
+        assert_eq!(
+            once.fields,
+            vec![
+                ("engine", "hlsjs".to_owned()),
+                ("client", "android-tv".to_owned())
+            ]
+        );
+        let twice = tagged(once.clone());
+        assert_eq!(twice.fields, once.fields, "tagged twice");
+    }
 
     #[test]
     fn a_jump_scrolls_the_grid_tile_and_focuses_it() {

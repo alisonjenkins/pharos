@@ -1413,26 +1413,45 @@ pub fn info(message: &str) {
     log::info!("{message}");
 }
 
-/// No server to submit to on the host: client events are dropped.
-pub fn install_telemetry(_api: &NativeApi) {}
+pub use super::diagnostics::{forget_opt_in, load_opted_in, opted_in, set_opted_in};
 
+/// Reads the user's opt-in, then sends the session's client events from
+/// now on, and the held ones. An unreadable opt-in counts as off. As in the
+/// browser, nothing leaves the TV unless the user opted in (FR-608).
+pub fn install_telemetry(api: &NativeApi) {
+    let api = api.clone();
+    spawn_forever(async move {
+        let opted = load_opted_in(&api).await.unwrap_or_else(|e| {
+            log::warn!("pharos: diagnostics opt-in unreadable: {e}");
+            false
+        });
+        let held = super::diagnostics::install(api.clone(), opted);
+        log::info!(
+            "pharos: telemetry installed opted_in={opted} held={}",
+            held.len()
+        );
+        if !held.is_empty() {
+            send(api, held);
+        }
+    });
+}
+
+/// Submits one client event without waiting for it, if opted in. Opted out,
+/// nothing is sent or held.
 pub fn report_event(event: ClientEvent) {
+    // Kept locally whatever the opt-in: it leaves only inside a pressed report.
     super::report::record_event(&event);
+    if let Some((api, event)) = super::diagnostics::report(tv_page::tagged(event)) {
+        send(api, vec![event]);
+    }
 }
 
-/// The host sends no client events, so diagnostics are never opted in.
-pub fn opted_in() -> bool {
-    false
-}
-
-pub fn forget_opt_in() {}
-
-pub async fn load_opted_in(_api: &NativeApi) -> Result<bool, String> {
-    Ok(false)
-}
-
-pub async fn set_opted_in(_api: &NativeApi, _on: bool) -> Result<(), String> {
-    Err("no server to store the choice on".to_owned())
+fn send(api: NativeApi, events: Vec<ClientEvent>) {
+    spawn_forever(async move {
+        if let Some(e) = super::diagnostics::submit(&api, &events).await {
+            log::warn!("pharos: client event submit failed: {e}");
+        }
+    });
 }
 
 /// `localStorage`'s twin: a file in the app's private directory.
