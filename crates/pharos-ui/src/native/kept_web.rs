@@ -678,12 +678,12 @@ type RemoveFailure = Signal<Option<(String, String)>>;
 /// The list as a signal the Remove buttons update.
 fn use_store() -> (Signal<KeptStore>, EventHandler<String>, RemoveFailure) {
     let mut failed = use_signal(|| None::<(String, String)>);
-    let mut store = use_signal(|| read().unwrap_or_else(|| KeptStore::new("")));
+    let store = use_signal(|| read().unwrap_or_else(|| KeptStore::new("")));
     // Opening the list is when books a policy no longer keeps go.
     use_hook(|| {
         spawn(async move {
             enforce("list").await;
-            store.set(read().unwrap_or_else(|| KeptStore::new("")));
+            refresh(store);
         })
     });
     let on_remove = EventHandler::new(move |id: String| {
@@ -696,10 +696,18 @@ fn use_store() -> (Signal<KeptStore>, EventHandler<String>, RemoveFailure) {
                     failed.set(Some((id, e)));
                 }
             }
-            store.set(read().unwrap_or_else(|| KeptStore::new("")));
+            refresh(store);
         });
     });
     (store, on_remove, failed)
+}
+
+/// Re-reads the list after a change. An unreadable record keeps the books
+/// shown, so a failed removal still has its row to show the failure on.
+fn refresh(mut store: Signal<KeptStore>) {
+    if let Ok(read) = read_checked() {
+        store.set(read.unwrap_or_else(|| KeptStore::new("")));
+    }
 }
 
 /// Settings, On this device: the kept books, why, their size and a Remove
