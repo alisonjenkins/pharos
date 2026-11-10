@@ -1,8 +1,9 @@
 //! `SubtitleStylingStore` for both backends (spec 028, migration 0068). The
 //! row is the style director's plan for one track of an item; see
 //! [`pharos_core::SubtitleStyling`] for what the signature columns mean.
+//! The stored signal pass (migration 0079) lives beside it.
 
-use pharos_core::{DomainError, DomainResult, MediaId, SubtitleStyling};
+use pharos_core::{DomainError, DomainResult, MediaId, SubtitleSignalsRow, SubtitleStyling};
 
 const PUT: &str = "INSERT INTO subtitle_styling \
        (item_id, source_index, source_mtime, source_size, sidecar_mtime, sidecar_size, \
@@ -25,6 +26,32 @@ const GET: &str = "SELECT item_id, source_index, source_mtime, source_size, side
 const INDEX: &str = "SELECT item_id, source_index, source_mtime, source_size, sidecar_mtime, \
      sidecar_size, director_version, outcome, CAST(NULL AS TEXT), styled_at \
      FROM subtitle_styling ORDER BY item_id, source_index";
+
+const PUT_SIGNALS: &str = "INSERT INTO subtitle_signals \
+       (item_id, source_mtime, source_size, audio_stream, signals_version, signals_json, \
+        measured_at) \
+     VALUES ($1, $2, $3, $4, $5, $6, $7) \
+     ON CONFLICT (item_id) DO UPDATE SET \
+       source_mtime = excluded.source_mtime, source_size = excluded.source_size, \
+       audio_stream = excluded.audio_stream, signals_version = excluded.signals_version, \
+       signals_json = excluded.signals_json, measured_at = excluded.measured_at";
+
+const GET_SIGNALS: &str = "SELECT item_id, source_mtime, source_size, audio_stream, \
+     signals_version, signals_json, measured_at FROM subtitle_signals WHERE item_id = $1";
+
+type SignalsRow = (i64, i64, i64, Option<i64>, i64, String, i64);
+
+fn from_signals_row(r: SignalsRow) -> DomainResult<SubtitleSignalsRow> {
+    Ok(SubtitleSignalsRow {
+        item_id: conv(r.0, "item_id")?,
+        source_mtime: r.1,
+        source_size: conv(r.2, "source_size")?,
+        audio_stream: r.3.map(|v| conv(v, "audio_stream")).transpose()?,
+        signals_version: conv(r.4, "signals_version")?,
+        signals_json: r.5,
+        measured_at: r.6,
+    })
+}
 
 type Row = (
     i64,
@@ -122,6 +149,33 @@ macro_rules! impl_store {
                     .await
                     .map_err(backend)?;
                 rows.into_iter().map(from_row).collect()
+            }
+
+            async fn put_subtitle_signals(&self, row: SubtitleSignalsRow) -> DomainResult<()> {
+                sqlx::query(PUT_SIGNALS)
+                    .bind(item_key(row.item_id)?)
+                    .bind(row.source_mtime)
+                    .bind(conv::<u64, i64>(row.source_size, "source_size")?)
+                    .bind(row.audio_stream.map(i64::from))
+                    .bind(i64::from(row.signals_version))
+                    .bind(row.signals_json)
+                    .bind(row.measured_at)
+                    .execute(self.pool())
+                    .await
+                    .map_err(backend)?;
+                Ok(())
+            }
+
+            async fn subtitle_signals(
+                &self,
+                item: MediaId,
+            ) -> DomainResult<Option<SubtitleSignalsRow>> {
+                let row: Option<SignalsRow> = sqlx::query_as(GET_SIGNALS)
+                    .bind(item_key(item)?)
+                    .fetch_optional(self.pool())
+                    .await
+                    .map_err(backend)?;
+                row.map(from_signals_row).transpose()
             }
         }
     };
