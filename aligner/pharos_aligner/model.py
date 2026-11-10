@@ -119,8 +119,18 @@ class Aligner:
         `lead_star` lets music before the first word go unmatched, for a
         window that starts well ahead of where the line may be sung.
         """
+        return self.align_scored(pcm_f32le, tokens, lead_star)[0]
+
+    def align_scored(
+        self, pcm_f32le: bytes, tokens: list[str], lead_star: bool = False
+    ) -> tuple[list[tuple[int, int]], float | None]:
+        """As `align`, with the mean probability of the words' characters.
+
+        The score is low when the words are not what is sung, such as a
+        translation over the original singing; `None` when nothing aligned.
+        """
         if not pcm_f32le or not tokens:
-            return []
+            return [], None
         with self._lock:
             try:
                 self._ensure_loaded()
@@ -128,11 +138,13 @@ class Aligner:
             finally:
                 self._last_used = self._clock()
 
-    def _align_loaded(self, pcm_f32le: bytes, tokens: list[str], lead_star: bool) -> list[tuple[int, int]]:
+    def _align_loaded(
+        self, pcm_f32le: bytes, tokens: list[str], lead_star: bool
+    ) -> tuple[list[tuple[int, int]], float | None]:
         waveform = torch.frombuffer(bytearray(pcm_f32le), dtype=torch.float32).unsqueeze(0)
         n_samples = waveform.size(1)
         if n_samples == 0:
-            return []
+            return [], None
 
         with torch.inference_mode():
             # The wav2vec2 forward pass and the CTC search, apart: which of
@@ -142,7 +154,7 @@ class Aligner:
             emission = out[0] if isinstance(out, tuple) else out
             num_frames = emission.size(1)
             if num_frames == 0:
-                return []
+                return [], None
 
             # A star token after the last word soaks up the music that follows
             # the line; without it CTC must spend every frame of the window on
@@ -155,7 +167,7 @@ class Aligner:
                 # CTC needs a frame a character: a window too short for its
                 # text cannot be aligned, and the aligner would raise.
                 if sum(len(t) for t in tokenized) > num_frames:
-                    return []
+                    return [], None
                 spans = self._aligner(emission[0], tokenized)[len(lead) : -1]
 
         ratio = (n_samples / num_frames / 16000.0) * 1000.0
@@ -167,7 +179,13 @@ class Aligner:
             start_ms = int(word_spans[0].start * ratio)
             end_ms = int(word_spans[-1].end * ratio)
             result.append((start_ms, end_ms))
-        return result
+        return result, mean_score(spans)
+
+
+def mean_score(spans: list[list[Any]]) -> float | None:
+    """Mean `score` of every character span, or `None` when there are none."""
+    scores = [float(c.score) for word in spans for c in word]
+    return sum(scores) / len(scores) if scores else None
 
 
 def start_idle_reaper(aligner: Aligner, interval_s: float) -> threading.Thread:

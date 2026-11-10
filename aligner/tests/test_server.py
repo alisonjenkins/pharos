@@ -17,11 +17,18 @@ from pharos_aligner.server import ALIGNER_VERSION, create_server
 class FakeAligner:
     """Fake aligner returning evenly spaced spans per token."""
 
+    score = 0.8
+
     def align(self, pcm_f32le: bytes, tokens: list[str], lead_star: bool = False) -> list[tuple[int, int]]:
+        return self.align_scored(pcm_f32le, tokens, lead_star)[0]
+
+    def align_scored(
+        self, pcm_f32le: bytes, tokens: list[str], lead_star: bool = False
+    ) -> tuple[list[tuple[int, int]], float | None]:
         if not tokens:
-            return []
+            return [], None
         step = 100
-        return [(i * step, (i + 1) * step) for i in range(len(tokens))]
+        return [(i * step, (i + 1) * step) for i in range(len(tokens))], self.score
 
 
 def fake_decoder(path: str, start_ms: int, end_ms: int, rate: int = 16000) -> bytes:
@@ -97,6 +104,8 @@ def test_post_align_two_lines(running_server: tuple[str, Path]) -> None:
 
     # Line 1: no alignable words -> empty words list
     assert data["lines"][1]["words"] == []
+    # How well each line matched the singing, none for a line with no words.
+    assert [line["score"] for line in data["lines"]] == [0.8, None]
 
 
 def test_post_align_a_line_sung_straight_after_another_cannot_take_its_last_word(
@@ -180,10 +189,12 @@ def _post(base_url: str, payload: dict) -> urllib.request.Request:
 class RaisingOnLongLines(FakeAligner):
     """Raises as torchaudio does when a line's text outruns its window."""
 
-    def align(self, pcm_f32le: bytes, tokens: list[str], lead_star: bool = False) -> list[tuple[int, int]]:
+    def align_scored(
+        self, pcm_f32le: bytes, tokens: list[str], lead_star: bool = False
+    ) -> tuple[list[tuple[int, int]], float | None]:
         if len(tokens) > 2:
             raise RuntimeError("targets length is too long for CTC")
-        return super().align(pcm_f32le, tokens, lead_star)
+        return super().align_scored(pcm_f32le, tokens, lead_star)
 
 
 def test_post_align_a_failing_line_leaves_the_others(tmp_path: Path) -> None:
@@ -199,7 +210,7 @@ def test_post_align_a_failing_line_leaves_the_others(tmp_path: Path) -> None:
         }
         with urllib.request.urlopen(_post(base_url, payload)) as resp:
             data = json.loads(resp.read().decode("utf-8"))
-        assert data["lines"][0] == {"words": []}
+        assert data["lines"][0] == {"words": [], "score": None}
         assert data["lines"][1]["words"]
     finally:
         server.shutdown()
