@@ -161,6 +161,9 @@ pub struct CpuModel {
     aux_w: Range<usize>,
     aux_b: Vec<f32>,
     pool: rayon::ThreadPool,
+    /// Activations kept between windows: fresh ones page-fault in over 100 MB
+    /// a window, which doubled a song's time.
+    bufs: std::sync::Mutex<Bufs>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -262,7 +265,9 @@ impl CpuModel {
             .thread_name(|i| format!("forward-{i}"))
             .build()
             .map_err(|source| LoadError::Pool { threads, source })?;
-        // SAFETY: a plain setter on OpenBLAS's global thread count.
+        // SAFETY: a plain setter on OpenBLAS's global thread count. The OpenMP
+        // build also takes its team size from OMP_NUM_THREADS at load, which
+        // the binary sets.
         unsafe { openblas_set_num_threads(as_i32(threads)) };
         Ok(Self {
             fe,
@@ -276,6 +281,7 @@ impl CpuModel {
             aux_w: w.range("aux.weight", &[LOGITS, D])?,
             aux_b: v("aux.bias", &[LOGITS])?,
             pool,
+            bufs: std::sync::Mutex::default(),
             weights,
         })
     }
@@ -294,19 +300,24 @@ impl CpuModel {
     /// the positional conv stay per window. A window shorter than
     /// `MIN_SAMPLES` gives no frames.
     pub fn logits(&self, waves: &[&[f32]]) -> Vec<Vec<f32>> {
-        self.pool.install(|| self.forward(waves))
+        let mut guard = self
+            .bufs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let bufs: &mut Bufs = &mut guard;
+        self.pool.install(|| self.forward(waves, bufs))
     }
 
-    fn forward(&self, waves: &[&[f32]]) -> Vec<Vec<f32>> {
-        let mut bf = Bufs::default();
-        let mut x = Vec::new();
+    fn forward(&self, waves: &[&[f32]], bf: &mut Bufs) -> Vec<Vec<f32>> {
+        let mut x = std::mem::take(&mut bf.x);
+        x.clear();
         let ts: Vec<usize> = waves
             .iter()
             .map(|w| {
                 if w.len() < MIN_SAMPLES {
                     0
                 } else {
-                    self.features(w, &mut bf, &mut x)
+                    self.features(w, bf, &mut x)
                 }
             })
             .collect();
