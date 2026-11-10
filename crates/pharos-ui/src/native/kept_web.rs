@@ -89,6 +89,9 @@ fn read_checked() -> Result<Option<KeptStore>, ()> {
     }
 }
 
+/// What keep and remove say when the record of kept books cannot be read.
+const UNREADABLE: &str = "The record of books kept on this device could not be read.";
+
 fn write(store: &KeptStore) {
     let result = local_storage().and_then(|s| {
         match store.to_text() {
@@ -315,7 +318,9 @@ pub async fn keep(
     user: &str,
     place: Option<(String, f32)>,
 ) -> Result<KeptBook, String> {
-    let mut store = match read() {
+    // An unreadable record is refused, not replaced: a fresh store would
+    // drop every book the record still lists.
+    let mut store = match read_checked().map_err(|()| UNREADABLE.to_owned())? {
         Some(store) if store.is_for(user) => store,
         Some(_) => {
             clear_all("another user").await;
@@ -489,7 +494,8 @@ pub async fn auto_keep(
 
 /// Removes a kept book from the device: its bytes and its record.
 pub async fn remove(id: &str) -> Result<(), String> {
-    let Some(mut store) = read() else {
+    // An unreadable record must not report the book gone while it stays.
+    let Some(mut store) = read_checked().map_err(|()| UNREADABLE.to_owned())? else {
         return Ok(());
     };
     let Some(book) = store.find(id).cloned() else {
