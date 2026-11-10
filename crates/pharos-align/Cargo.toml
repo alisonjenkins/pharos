@@ -17,7 +17,7 @@ burn = { version = "0.22.1", default-features = false, features = ["std", "vulka
 cubecl-runtime = { version = "0.11.4", default-features = false, features = ["std", "persistence"], optional = true }
 # Listing adapters for the device choice; the versions Burn already pulls in.
 wgpu = { version = "30", default-features = false, optional = true }
-pollster = { version = "0.4", optional = true }
+pollster = { version = "1.0", optional = true }
 actix-web.workspace = true
 gemm = "0.19"
 memmap2 = "0.9"
