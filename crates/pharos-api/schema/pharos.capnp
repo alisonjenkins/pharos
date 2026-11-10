@@ -502,6 +502,8 @@ enum EventKind {               # closed catalogue, 016 contracts/events.md
   seek @14; themeFallback @15; focusRecovered @16; cacheServed @17; cspViolation @18;
   groupDrift @19; groupHardSeek @20; groupWait @21; playbackResume @22;
   playbackStart @23; playbackSummary @24;
+  autoplayRefused @25;         # the browser refused to start a video unasked (038 FR-407). Since schemaVersion 40.
+
 }
 enum Level { error @0; warn @1; info @2; }
 struct TelemetryEvent {
