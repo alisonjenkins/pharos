@@ -835,12 +835,22 @@ impl ModalHold {
     pub fn engage(&mut self, _root: &str) {}
 }
 
-pub struct TrackSkips;
+/// The remote's next and previous keys' listener, removed on drop.
+pub struct TrackSkips(u64);
 
+impl Drop for TrackSkips {
+    fn drop(&mut self) {
+        unlisten(self.0);
+    }
+}
+
+/// Call `on_skip` for the remote's next and previous keys (FR-609), from
+/// anywhere in the app, for whichever player is on show; its answer is
+/// whether it took the press.
 pub fn on_track_skip(
-    _on_skip: impl FnMut(super::watch_view::Skip, &'static str) -> bool + 'static,
+    on_skip: impl FnMut(super::watch_view::Skip, &'static str) -> bool + 'static,
 ) -> TrackSkips {
-    TrackSkips
+    TrackSkips(listen(Listener::Skip(Box::new(on_skip))))
 }
 
 pub fn offer_track_skips(_previous: bool, _next: bool) {}
@@ -1733,6 +1743,8 @@ enum Listener {
     Visualiser(u64, Box<dyn FnMut(String)>),
     /// The page went hidden: the app left the screen.
     Hidden(Box<dyn FnMut()>),
+    /// The remote's next or previous key; true when a player took it.
+    Skip(Box<dyn FnMut(super::watch_view::Skip, &'static str) -> bool>),
 }
 
 fn listen(listener: Listener) -> u64 {
@@ -1829,6 +1841,16 @@ addEventListener("keydown", (e) => {
   const onPlayer = !at || at === document.body || at === player;
   const v = player.querySelector("video, audio");
   const paused = !v || v.paused;
+  // Stop (FR-609): a song pauses; a video pauses and leaves the player, as
+  // Back does.
+  if (e.key === "MediaStop") {
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    if (v && !v.paused) v.pause();
+    if (v instanceof HTMLVideoElement) history.back();
+    send({ t: "stop", video: v instanceof HTMLVideoElement });
+    return;
+  }
   const scrubbing = !!document.querySelector(".pharos-seek.is-scrubbing");
   const toggle = (e.key === "Enter" && onPlayer && !scrubbing) || e.key === "MediaPlayPause" ||
     (e.key === "MediaPlay" && paused) || (e.key === "MediaPause" && !paused);
@@ -2040,6 +2062,20 @@ fn on_bridge(message: Bridge) {
         } => {
             *lock(&KEY_AT) = at;
             let mut taken = false;
+            if let Some(skip) = tv_page::track_skip(&key) {
+                for f in &listeners {
+                    if let Ok(mut f) = f.try_lock() {
+                        if let Listener::Skip(f) = &mut f.0 {
+                            taken |= f(skip, "remote");
+                        }
+                    }
+                }
+                log::info!(
+                    "pharos: remote key key={key} skip={} taken={taken}",
+                    skip.label()
+                );
+                return;
+            }
             for f in &listeners {
                 if let Ok(mut f) = f.try_lock() {
                     if let Listener::App(f) = &mut f.0 {
@@ -2116,6 +2152,12 @@ fn on_bridge(message: Bridge) {
             }
         }
         Bridge::Size { w, h } => *lock(&VIEWPORT) = (w, h),
+        Bridge::Stop { video } => {
+            log::info!(
+                "pharos: remote key key=MediaStop video={video} path={}",
+                current_path()
+            );
+        }
         Bridge::Visibility { hidden, paused } => {
             log::info!(
                 "pharos: page visibility hidden={hidden} paused_videos={paused} path={}",
