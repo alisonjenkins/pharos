@@ -105,9 +105,13 @@ impl LineWords {
 
 /// `round(score, 3)`, as server.py rounds it. Python rounds the nearest
 /// double half to even, this rounds it away from zero; they can differ by
-/// 0.001 only on an exact tie, within the shadow's tolerance.
-pub fn round_score(score: f64) -> f64 {
-    (score * 1000.0).round() / 1000.0
+/// 0.001 only on an exact tie, within the shadow's tolerance. A score that
+/// is not finite answers `null`, and one outside 0..=1 is clamped to it, as
+/// the server would read it anyway.
+pub fn round_score(score: f64) -> Option<f64> {
+    score
+        .is_finite()
+        .then(|| (score.clamp(0.0, 1.0) * 1000.0).round() / 1000.0)
 }
 
 /// The `/align` answer, fields in the Python service's order.
@@ -409,7 +413,7 @@ fn run_song(
         }
         out.push(LineWords {
             words: line_stamps,
-            score: spans.score.map(round_score),
+            score: spans.score.and_then(round_score),
         });
     }
     Ok(Aligned {
@@ -427,6 +431,19 @@ fn run_song(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_score_is_rounded_to_three_places_within_0_to_1_and_null_when_not_finite() {
+        use super::round_score;
+        assert_eq!(round_score(0.81264), Some(0.813));
+        assert_eq!(round_score(0.0), Some(0.0));
+        assert_eq!(round_score(1.0), Some(1.0));
+        assert_eq!(round_score(1.2), Some(1.0));
+        assert_eq!(round_score(-0.3), Some(0.0));
+        assert_eq!(round_score(f64::NAN), None);
+        assert_eq!(round_score(f64::INFINITY), None);
+        assert_eq!(round_score(f64::NEG_INFINITY), None);
+    }
+
     #[test]
     fn probe_list_prints_as_python_does() {
         assert_eq!(
