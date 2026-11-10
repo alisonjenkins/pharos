@@ -262,30 +262,35 @@ jobs:
           publish oci            ghcr.io/alisonjenkins/pharos
           publish jellyfinWebOci ghcr.io/alisonjenkins/pharos-jellyfin-web
 
-          # pharos-aligner (ADR-0066) is 3-4 GB and changes rarely, so it is
-          # tagged by its script's store hash and streamed only when that tag
-          # is missing; the chart pins the tag (aligner.image.tag).
+          # The aligner images are GBs and change rarely, so each is tagged
+          # by its script's store hash and streamed only when that tag is
+          # missing; the chart pins the tag (aligner.image.tag).
           # Rooted in the host's gcroots drop box: the `nix develop` of the
           # tag check below can start an auto-GC that deletes an unrooted
           # script before it is streamed (B628).
-          aligner_script="$(nix build .#alignerOci --print-out-paths \
-            --out-link /nix/var/nix/gcroots/gha/pharos-aligner-oci)"
-          aligner_tag="$(basename "$aligner_script" | cut -d- -f1)"
-          if nix develop --command skopeo inspect --creds "$GHCR_CREDS" \
-               "docker://ghcr.io/alisonjenkins/pharos-aligner:${aligner_tag}" >/dev/null 2>&1; then
-            echo "publish: pharos-aligner:${aligner_tag} already published"
-          else
+          publish_by_hash() { # <flake output> <repository> <gcroot name>
+            local script tag stage
+            script="$(nix build ".#$1" --print-out-paths \
+              --out-link "/nix/var/nix/gcroots/gha/$3")"
+            tag="$(basename "$script" | cut -d- -f1)"
+            if nix develop --command skopeo inspect --creds "$GHCR_CREDS" \
+                 "docker://$2:${tag}" >/dev/null 2>&1; then
+              echo "publish: $2:${tag} already published"
+              return
+            fi
             stage="$(mktemp -d)/img"
-            "$aligner_script" | nix develop --command skopeo --insecure-policy copy \
+            "$script" | nix develop --command skopeo --insecure-policy copy \
               docker-archive:/dev/stdin "oci:${stage}:img"
-            for tag in latest "$aligner_tag"; do
+            for t in latest "$tag"; do
               nix develop --command skopeo --insecure-policy copy \
                 --dest-creds "$GHCR_CREDS" \
-                "oci:${stage}:img" "docker://ghcr.io/alisonjenkins/pharos-aligner:${tag}"
+                "oci:${stage}:img" "docker://$2:${t}"
             done
             rm -rf "$(dirname "$stage")"
-            echo "publish: pharos-aligner:${aligner_tag} pushed"
-          fi
+            echo "publish: $2:${tag} pushed"
+          }
+          # ADR-0066, the Python aligner.
+          publish_by_hash alignerOci ghcr.io/alisonjenkins/pharos-aligner pharos-aligner-oci
 
   compat-playwright:
     name: jellyfin-web crawl
