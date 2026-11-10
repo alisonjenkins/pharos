@@ -680,11 +680,22 @@ impl<P: Prober> FsScanner<P> {
             None => FoldGuard::default(),
         };
         let groups = group_by_edition(paths);
+        // A film split across files is stacked before copies are folded, so
+        // its first part is never folded as a version of a whole copy (V1150).
+        let part_candidates = crate::parts::candidates(&groups);
+        let part_titles = crate::parts::stored_titles(store, &groups, &part_candidates)
+            .instrument(tracing::info_span!("scan.part_titles"))
+            .await;
+        let (stacks, groups): (Vec<Group>, Vec<Group>) =
+            crate::parts::stack(groups, &part_candidates, &part_titles)
+                .into_iter()
+                .partition(crate::parts::is_stack);
         let facts = copy_facts(store, &copy_candidates(&groups))
             .instrument(tracing::info_span!("scan.copy_facts"))
             .await;
         let mut tally = CopyTally::default();
-        let groups = group_copies_guarded(groups, &facts, &guard, &mut tally);
+        let mut groups = group_copies_guarded(groups, &facts, &guard, &mut tally);
+        groups.extend(stacks);
         tally.publish();
         // A file now grouped under another may still hold its own row from an
         // earlier pass; that row is swept, so its viewers' state moves first.
@@ -1702,7 +1713,12 @@ impl<P: Prober> FsScanner<P> {
                     // Stable id suffix derived from the edition tag so
                     // URL paths survive re-scans the same way the
                     // primary's id does.
-                    let id = unique_edition_id(&item.probe.alternate_sources, &edition);
+                    let part = crate::parts::label_part(&edition);
+                    let shown = match part {
+                        Some(n) => format!("Part {n}"),
+                        None => edition_display_name(&edition),
+                    };
+                    let id = unique_edition_id(&item.probe.alternate_sources, &shown);
                     resolve_item_3d_format(&alt_path, item.kind, &mut probe);
                     item.probe.alternate_sources.push(AlternateMediaSource {
                         id,
@@ -1712,13 +1728,13 @@ impl<P: Prober> FsScanner<P> {
                         bitrate_bps: probe.bitrate_bps,
                         size_bytes: probe.size_bytes,
                         duration_ms: probe.duration_ms,
-                        name: Some(edition_display_name(&edition)),
+                        name: Some(shown),
                         video_3d_format: probe
                             .video_3d_format
                             .or_else(|| parse_3d_edition(&edition)),
                         path: alt_path,
                         probe: Some(Box::new(probe)),
-                        part: None,
+                        part,
                     });
                 }
                 Err(err) => {
@@ -2422,10 +2438,14 @@ struct Fold {
 fn folded_copies(groups: &[(PathBuf, Vec<(String, PathBuf)>)]) -> Vec<Fold> {
     let items: HashSet<&Path> = groups.iter().map(|(p, _)| p.as_path()).collect();
     let mut folds: BTreeMap<&Path, Vec<&Path>> = BTreeMap::new();
+    let mut parts: HashSet<&Path> = HashSet::new();
     for (primary, alts) in groups {
-        for (_, alt) in alts {
+        for (label, alt) in alts {
             if !items.contains(alt.as_path()) {
                 folds.entry(alt).or_default().push(primary);
+            }
+            if crate::parts::label_part(label).is_some() {
+                parts.insert(alt);
             }
         }
     }
@@ -2433,13 +2453,15 @@ fn folded_copies(groups: &[(PathBuf, Vec<(String, PathBuf)>)]) -> Vec<Fold> {
         .into_iter()
         .map(|(copy, into)| {
             let span = |p: &Path| episode_copy_key(p).map(|(_, _, first, last)| (first, last));
-            let own = span(copy);
+            // A part's resume point is a time in that part, not in its film
+            // (V1152).
+            let own = (!parts.contains(copy)).then(|| span(copy));
             Fold {
                 copy: copy.to_path_buf(),
                 into: into
                     .into_iter()
                     .map(|p| {
-                        let resume = if span(p) == own {
+                        let resume = if Some(span(p)) == own {
                             pharos_core::FoldResume::Carry
                         } else {
                             pharos_core::FoldResume::Drop
@@ -8657,6 +8679,71 @@ mod tests {
         let own = alt.probe.as_deref().expect("edition keeps its own probe");
         assert_eq!(own.video_3d_format, Some(Video3DFormat::HalfSideBySide));
         assert!(own.alternate_sources.is_empty());
+    }
+
+    /// V1150, V1151, V1152 — a split film's parts stay apart until each has
+    /// been probed, then become one film on the next scan: its first part is
+    /// the item, the second rides on it as part 2, and the second part's old
+    /// row hands over its played state but not its resume point.
+    #[tokio::test]
+    async fn a_split_films_parts_become_one_film_once_probed() {
+        let td = TempDir::new().unwrap();
+        write_file(
+            td.path(),
+            "Glass Harbour (2003)/Glass Harbour (2003) cd1.mkv",
+            b"one",
+        )
+        .await;
+        write_file(
+            td.path(),
+            "Glass Harbour (2003)/Glass Harbour (2003) cd2.mp4",
+            b"two",
+        )
+        .await;
+        let store = MemStore::default();
+        let scanner = FsScanner::new(FakeProber::default());
+        scanner.scan_into(td.path(), &store).await.unwrap();
+        assert_eq!(
+            store.inner.lock().unwrap().len(),
+            2,
+            "unprobed parts stay apart"
+        );
+        let second = store
+            .inner
+            .lock()
+            .unwrap()
+            .values()
+            .find(|i| i.path.ends_with("Glass Harbour (2003) cd2.mp4"))
+            .map(|i| i.id)
+            .unwrap();
+
+        scanner.scan_into(td.path(), &store).await.unwrap();
+
+        let items: Vec<MediaItem> = store.inner.lock().unwrap().values().cloned().collect();
+        assert_eq!(
+            items.len(),
+            1,
+            "{:?}",
+            items.iter().map(|i| &i.path).collect::<Vec<_>>()
+        );
+        let film = &items[0];
+        assert!(film.path.ends_with("Glass Harbour (2003) cd1.mkv"));
+        let parts: Vec<_> = film
+            .probe
+            .alternate_sources
+            .iter()
+            .map(|a| (a.part, a.id.as_str()))
+            .collect();
+        assert_eq!(parts, [(Some(2), "part-2")]);
+        let merged = store.merged.lock().unwrap().clone();
+        assert_eq!(merged, [(second, film.id, pharos_core::FoldResume::Drop)]);
+
+        scanner.scan_into(td.path(), &store).await.unwrap();
+        assert_eq!(
+            store.inner.lock().unwrap().len(),
+            1,
+            "a stacked film stays stacked"
+        );
     }
 
     fn reprobe_counter(snap: &pharos_test_metrics::CumulativeSnapshotter, reason: &str) -> u64 {
