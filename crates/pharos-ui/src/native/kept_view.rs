@@ -151,9 +151,16 @@ pub fn AutoKeepSettings(settings: AutoKeep, on_change: EventHandler<AutoKeep>) -
 
 /// The kept books with their size, why each is kept, a total and a Remove
 /// button for each. `Read` links open the reader, which takes the bytes
-/// from the cache.
+/// from the cache. `offline`: a removed book cannot be fetched again until
+/// the connection returns, so Remove asks first (FR-703). `failed` is the
+/// book whose removal failed, and why.
 #[component]
-pub fn KeptList(store: KeptStore, on_remove: EventHandler<String>) -> Element {
+pub fn KeptList(
+    store: KeptStore,
+    on_remove: EventHandler<String>,
+    #[props(default)] offline: bool,
+    #[props(default)] failed: Option<(String, String)>,
+) -> Element {
     if store.books.is_empty() {
         return rsx! {
             p { class: "pharos-muted", id: "pharos-kept-empty", "No books are kept on this device." }
@@ -164,14 +171,28 @@ pub fn KeptList(store: KeptStore, on_remove: EventHandler<String>) -> Element {
         p { class: "pharos-muted", id: "pharos-kept-total", "{total}" }
         ul { class: "pharos-kept-list", id: "pharos-kept-list",
             for book in store.books.iter().cloned() {
-                KeptRow { key: "{book.id}", book, on_remove }
+                KeptRow {
+                    key: "{book.id}",
+                    failed: failed.as_ref().filter(|(id, _)| *id == book.id).map(|(_, why)| why.clone()),
+                    book,
+                    offline,
+                    on_remove,
+                }
             }
         }
     }
 }
 
 #[component]
-fn KeptRow(book: KeptBook, on_remove: EventHandler<String>) -> Element {
+fn KeptRow(
+    book: KeptBook,
+    on_remove: EventHandler<String>,
+    offline: bool,
+    failed: Option<String>,
+    #[props(default)] asking: Option<bool>,
+) -> Element {
+    // `asking` lets a test render the second step.
+    let mut confirming = use_signal(move || asking.unwrap_or(false));
     let size = size_label(book.bytes);
     let facts = format!(
         "{} · {} · {}",
@@ -192,12 +213,42 @@ fn KeptRow(book: KeptBook, on_remove: EventHandler<String>) -> Element {
                 }
                 span { class: "pharos-muted", "{facts}" }
             }
-            button {
-                class: "pharos-button pharos-button-secondary",
-                r#type: "button",
-                aria_label: "Remove {name} from this device",
-                onclick: move |_| on_remove.call(id.clone()),
-                "Remove"
+            if confirming() {
+                div { class: "pharos-kept-confirm", role: "group", aria_label: "Remove {name}",
+                    p { class: "pharos-setting-help",
+                        "You're offline: once removed, it can't be read again until the connection returns."
+                    }
+                    button {
+                        class: "pharos-button pharos-button-secondary",
+                        r#type: "button",
+                        aria_label: "Remove {name} now",
+                        onclick: {
+                            let id = id.clone();
+                            move |_| {
+                                confirming.set(false);
+                                on_remove.call(id.clone());
+                            }
+                        },
+                        "Remove"
+                    }
+                    button {
+                        class: "pharos-button pharos-button-secondary",
+                        r#type: "button",
+                        onclick: move |_| confirming.set(false),
+                        "Keep"
+                    }
+                }
+            } else {
+                button {
+                    class: "pharos-button pharos-button-secondary",
+                    r#type: "button",
+                    aria_label: "Remove {name} from this device",
+                    onclick: move |_| if offline { confirming.set(true) } else { on_remove.call(id.clone()) },
+                    "Remove"
+                }
+            }
+            if let Some(why) = failed {
+                p { class: "pharos-error", role: "alert", "Couldn't remove {name}: {why}" }
             }
         }
     }
@@ -205,14 +256,18 @@ fn KeptRow(book: KeptBook, on_remove: EventHandler<String>) -> Element {
 
 /// What the app shows with no connection and books kept on the device.
 #[component]
-pub fn OfflineView(store: KeptStore, on_remove: EventHandler<String>) -> Element {
+pub fn OfflineView(
+    store: KeptStore,
+    on_remove: EventHandler<String>,
+    #[props(default)] failed: Option<(String, String)>,
+) -> Element {
     rsx! {
         section { class: "pharos-offline", id: "pharos-offline",
             h2 { "Offline: showing books on this device" }
             p { class: "pharos-muted",
                 "The server cannot be reached. Everything that needs it is unavailable until the connection returns; these books open without it."
             }
-            KeptList { store, on_remove }
+            KeptList { store, on_remove, offline: true, failed }
         }
     }
 }
@@ -256,6 +311,52 @@ mod tests {
         store.keep(book("1", "Invented Tale", 1_572_864));
         store.keep(book("2", "Another Made-up Book", 2_097_152));
         store
+    }
+
+    /// FR-703: a failed removal says so on its row. Disarm check: dropping
+    /// the row's alert fails this.
+    #[test]
+    fn a_failed_removal_shows_on_its_row() {
+        let html = render(|| {
+            rsx! {
+                WithNav {
+                    KeptList {
+                        store: two_books(),
+                        on_remove: |_| {},
+                        failed: Some(("2".to_owned(), "The book could not be removed: quota".to_owned())),
+                    }
+                }
+            }
+        });
+        assert!(
+            html.contains("remove Another Made-up Book: The book could not be removed: quota"),
+            "{html}"
+        );
+        assert_eq!(html.matches("role=\"alert\"").count(), 1, "{html}");
+    }
+
+    /// FR-703: offline, Remove's second step warns that the book can't come
+    /// back until the connection does, and offers Keep.
+    #[test]
+    fn offline_remove_asks_first() {
+        let html = render(|| {
+            rsx! {
+                WithNav {
+                    ul {
+                        KeptRow {
+                            book: book("1", "Invented Tale", 1_000),
+                            on_remove: |_| {},
+                            offline: true,
+                            failed: None,
+                            asking: Some(true),
+                        }
+                    }
+                }
+            }
+        });
+        assert!(html.contains("offline: once removed"), "{html}");
+        assert!(html.contains("Remove Invented Tale now"), "{html}");
+        assert!(html.contains(">Keep<"), "{html}");
     }
 
     #[test]

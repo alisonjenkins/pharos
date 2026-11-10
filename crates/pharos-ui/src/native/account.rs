@@ -28,18 +28,49 @@ pub fn initials(name: &str) -> String {
 
 /// The account button and its menu, open state kept here. `me` is `None`
 /// until `Session.me` answers; the button then shows `?` and Manage stays
-/// hidden.
+/// hidden. `kept_books` counts the books kept on this device, read as the
+/// menu opens: signing out removes them, so Sign out asks first (FR-703).
 #[component]
-pub fn AccountMenu(me: Option<Me>, on_sign_out: EventHandler<()>) -> Element {
+pub fn AccountMenu(
+    me: Option<Me>,
+    kept_books: Callback<(), usize>,
+    on_sign_out: EventHandler<()>,
+) -> Element {
     let mut open = use_signal(|| false);
+    let mut kept = use_signal(|| 0usize);
+    let mut confirming = use_signal(|| false);
     rsx! {
         AccountMenuView {
             me,
             open: open(),
-            on_toggle: move |_| open.toggle(),
-            on_close: move |_| open.set(false),
-            on_sign_out,
+            kept_books: kept(),
+            confirming: confirming(),
+            on_toggle: move |_| {
+                if !*open.peek() {
+                    kept.set(kept_books.call(()));
+                }
+                confirming.set(false);
+                open.toggle();
+            },
+            on_close: move |_| {
+                confirming.set(false);
+                open.set(false);
+            },
+            on_confirm: move |ask: bool| confirming.set(ask),
+            on_sign_out: move |()| {
+                confirming.set(false);
+                open.set(false);
+                on_sign_out.call(());
+            },
         }
+    }
+}
+
+/// What Sign out says before removing `count` kept books.
+pub fn sign_out_warning(count: usize) -> String {
+    match count {
+        1 => "Signing out removes the book kept on this device. You will need a connection to read it again.".to_owned(),
+        n => format!("Signing out removes the {n} books kept on this device. You will need a connection to read them again."),
     }
 }
 
@@ -51,6 +82,15 @@ pub fn AccountMenuView(
     on_toggle: EventHandler<()>,
     on_close: EventHandler<()>,
     on_sign_out: EventHandler<()>,
+    /// Books kept on this device; with any, Sign out asks first.
+    #[props(default)]
+    kept_books: usize,
+    /// Sign out was pressed once and is asking.
+    #[props(default)]
+    confirming: bool,
+    /// `true` to ask, `false` to cancel the ask.
+    #[props(default)]
+    on_confirm: EventHandler<bool>,
 ) -> Element {
     let name = me.as_ref().map(|me| me.name.clone()).unwrap_or_default();
     let is_admin = me.as_ref().is_some_and(|me| me.is_admin);
@@ -99,12 +139,45 @@ pub fn AccountMenuView(
                     if is_admin {
                         MenuLink { to: Route::Manage, "Manage" }
                     }
-                    button {
-                        class: "pharos-account-item",
-                        r#type: "button",
-                        role: "menuitem",
-                        onclick: move |_| on_sign_out.call(()),
-                        "Sign out"
+                    if confirming {
+                        div { class: "pharos-account-confirm", role: "group", aria_label: "Sign out",
+                            p { class: "pharos-account-warning", "{sign_out_warning(kept_books)}" }
+                            button {
+                                class: "pharos-account-item pharos-account-danger",
+                                r#type: "button",
+                                role: "menuitem",
+                                onclick: move |e: MouseEvent| {
+                                    e.stop_propagation();
+                                    on_sign_out.call(());
+                                },
+                                "Sign out and remove"
+                            }
+                            button {
+                                class: "pharos-account-item",
+                                r#type: "button",
+                                role: "menuitem",
+                                onclick: move |e: MouseEvent| {
+                                    e.stop_propagation();
+                                    on_confirm.call(false);
+                                },
+                                "Cancel"
+                            }
+                        }
+                    } else {
+                        button {
+                            class: "pharos-account-item",
+                            r#type: "button",
+                            role: "menuitem",
+                            onclick: move |e: MouseEvent| {
+                                if kept_books > 0 {
+                                    e.stop_propagation();
+                                    on_confirm.call(true);
+                                } else {
+                                    on_sign_out.call(());
+                                }
+                            },
+                            "Sign out"
+                        }
                     }
                 }
             }
@@ -155,23 +228,55 @@ mod tests {
     use super::*;
 
     fn render(me: Option<Me>, open: bool) -> String {
+        render_kept(me, open, 0, false)
+    }
+
+    fn render_kept(me: Option<Me>, open: bool, kept_books: usize, confirming: bool) -> String {
         let mut dom = VirtualDom::new_with_props(
-            |(me, open): (Option<Me>, bool)| {
+            |(me, open, kept_books, confirming): (Option<Me>, bool, usize, bool)| {
                 use_context_provider(|| Nav(EventHandler::new(|_: Route| {})));
                 rsx! {
                     AccountMenuView {
                         me,
                         open,
+                        kept_books,
+                        confirming,
                         on_toggle: |_| {},
                         on_close: |_| {},
                         on_sign_out: |_| {},
                     }
                 }
             },
-            (me, open),
+            (me, open, kept_books, confirming),
         );
         dom.rebuild_in_place();
         dioxus_ssr::render(&dom)
+    }
+
+    /// FR-703: with books kept, the asking menu names their count and offers
+    /// Cancel. Disarm check: rendering the plain Sign out while confirming
+    /// fails the first assertion.
+    #[test]
+    fn sign_out_asks_first_naming_the_kept_books() {
+        let html = render_kept(me("ali", false), true, 3, true);
+        assert!(
+            html.contains("Signing out removes the 3 books kept on this device."),
+            "{html}"
+        );
+        assert!(html.contains(">Sign out and remove<"), "{html}");
+        assert!(html.contains(">Cancel<"), "{html}");
+        let one = render_kept(me("ali", false), true, 1, true);
+        assert!(
+            one.contains("removes the book kept on this device"),
+            "{one}"
+        );
+    }
+
+    #[test]
+    fn with_nothing_kept_sign_out_is_one_step() {
+        let html = render_kept(me("ali", false), true, 0, false);
+        assert!(html.contains(">Sign out<"), "{html}");
+        assert!(!html.contains("Signing out removes"), "{html}");
     }
 
     fn me(name: &str, is_admin: bool) -> Option<Me> {
