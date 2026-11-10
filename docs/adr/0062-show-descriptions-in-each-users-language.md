@@ -7,7 +7,7 @@
 ## Context
 
 TVDB's base series and episode records are written in the language the show
-was made in. Pharos read them as they were, so Dragon Ball and other anime
+was made in. Pharos read them as they were, so a long-running anime and others
 showed Japanese descriptions to English-speaking users (B564). Alison wants
 to keep the ability to show other languages, but chosen per user: "we should
 make it so we can set the language in the per user settings on what language
