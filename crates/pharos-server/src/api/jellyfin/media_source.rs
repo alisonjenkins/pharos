@@ -48,6 +48,9 @@ pub(crate) enum Requested {
     Absent,
     Primary,
     Alternate,
+    /// A later part of a split film, which its film's playlists address
+    /// (V1154).
+    Part,
     /// Names neither the primary nor any edition of this item.
     Unknown,
 }
@@ -58,6 +61,7 @@ impl Requested {
             Self::Absent => "absent",
             Self::Primary => "primary",
             Self::Alternate => "alternate",
+            Self::Part => "part",
             Self::Unknown => "unknown",
         }
     }
@@ -103,10 +107,16 @@ pub(crate) fn classify<'a>(
     // may contain one (`3d-hsbs`), so split on the first.
     let alt = raw.split_once('-').and_then(|(item_part, edition)| {
         (pharos_jellyfin_api::dto::parse_item_id(item_part) == Some(item.id))
-            .then(|| item.probe.versions().find(|a| a.id == edition))
+            .then(|| {
+                item.probe
+                    .alternate_sources
+                    .iter()
+                    .find(|a| a.id == edition)
+            })
             .flatten()
     });
     match alt {
+        Some(a) if a.part.is_some() => (Requested::Part, Some(a)),
         Some(a) => (Requested::Alternate, Some(a)),
         None => (Requested::Unknown, None),
     }
@@ -130,7 +140,8 @@ pub(crate) fn record(
     )
     .increment(1);
     match requested {
-        Requested::Absent | Requested::Primary => tracing::debug!(
+        // A split film's part is asked for on every one of its segments.
+        Requested::Absent | Requested::Primary | Requested::Part => tracing::debug!(
             media.id = item.id,
             route = route.label(),
             requested = requested.label(),
