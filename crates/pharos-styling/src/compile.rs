@@ -15,12 +15,25 @@ use crate::version::COMPILER_VERSION;
 
 const WINDOW_MS: i64 = 10_000;
 const MAX_STARTS_PER_WINDOW: usize = 60;
+/// Two lines this close or closer read as one exchange, so the change from
+/// one to the next is eased rather than cut (B1206).
+const EASE_GAP_MS: i64 = 250;
+/// The eased line's fade in and its predecessor's fade out.
+const EASE_IN_MS: i64 = 120;
+const EASE_OUT_MS: i64 = 100;
+/// How far, in script units, an eased line rises into place on Desktop, and
+/// over how long.
+const EASE_RISE: i32 = 14;
+const EASE_RISE_MS: i64 = 160;
 
 /// Compiles `lines` as directed by `plan`.
 ///
 /// - `Off` draws every line plain; `Subtle` caps intensity at 1 and keeps
 ///   Ember (a Full-only karaoke fill) as Sweep.
 /// - Lines with their own typesetting are copied through verbatim (FR-005).
+/// - Unless the level is `Off`, a plain line that follows another within
+///   [`EASE_GAP_MS`], with nothing else on screen, fades in (and on Desktop
+///   rises a little into place); one followed that closely fades out (B1206).
 /// - When a line's effect would break a budget that depends on its
 ///   neighbours (animated events on screen, event starts per 10 s), the line
 ///   falls back to the next cheaper tier's form of the effect.
@@ -76,12 +89,18 @@ pub fn compile(
             events.push((i, ev));
         }
     }
+    let eases = if level == EffectsLevel::Off {
+        vec![Ease::default(); lines.len()]
+    } else {
+        eases(lines)
+    };
     for (i, line) in lines.iter().enumerate() {
         if line.typeset || line.text.is_empty() {
             continue;
         }
         let fx = effective(by_line.get(&i).copied(), line, i, level);
-        let Some(evs) = fit(line, &fx, theme, tier, &placer) else {
+        let ease = eases.get(i).copied().unwrap_or_default();
+        let Some(evs) = fit(line, &fx, ease, theme, tier, &placer) else {
             continue;
         };
         placer.accept(&evs);
@@ -189,10 +208,51 @@ fn effective(
     fx
 }
 
+/// Whether a line eases in from the line before it and out into the line
+/// after it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Ease {
+    into: bool,
+    out_of: bool,
+}
+
+/// Each line's [`Ease`], by index. Only a line alone on screen eases: an
+/// eased plain line is positioned, which turns off the renderer's collision
+/// handling, so a line overlapping another keeps its normal placement.
+fn eases(lines: &[SourceLine]) -> Vec<Ease> {
+    let mut out = vec![Ease::default(); lines.len()];
+    let mut order: Vec<usize> = (0..lines.len())
+        .filter(|&i| !lines[i].typeset && !lines[i].text.is_empty())
+        .collect();
+    order.sort_by_key(|&i| (lines[i].start_ms, lines[i].end_ms, i));
+    let alone: Vec<bool> = order
+        .iter()
+        .enumerate()
+        .map(|(k, &i)| {
+            let l = &lines[i];
+            let before = order[..k].iter().all(|&j| lines[j].end_ms <= l.start_ms);
+            let after = order
+                .get(k + 1)
+                .map_or(true, |&j| lines[j].start_ms >= l.end_ms);
+            before && after
+        })
+        .collect();
+    for k in 1..order.len() {
+        let (a, b) = (order[k - 1], order[k]);
+        let gap = lines[b].start_ms - lines[a].end_ms;
+        if alone[k - 1] && alone[k] && (0..=EASE_GAP_MS).contains(&gap) {
+            out[a].out_of = true;
+            out[b].into = true;
+        }
+    }
+    out
+}
+
 /// The events for the line at the richest tier up to `tier` that fits.
 fn fit(
     line: &SourceLine,
     fx: &LineEffect,
+    ease: Ease,
     theme: &Theme,
     tier: Tier,
     placer: &Placer,
@@ -200,7 +260,7 @@ fn fit(
     let mut t = if fx.static_only { Tier::Low } else { tier };
     loop {
         let evs: Vec<Event> = effects::events(line, fx, theme, t)
-            .unwrap_or_else(|| vec![plain(line, fx)])
+            .unwrap_or_else(|| vec![plain(line, fx, ease, theme, t)])
             .into_iter()
             .filter(Event::is_visible)
             .collect();
@@ -214,10 +274,26 @@ fn fit(
     }
 }
 
-/// The dialogue style with the source's own italics kept.
-fn plain(line: &SourceLine, fx: &LineEffect) -> Event {
+/// The dialogue style with the source's own italics kept, eased in or out
+/// when `ease` says so and the line has its default placement.
+fn plain(line: &SourceLine, fx: &LineEffect, ease: Ease, theme: &Theme, tier: Tier) -> Event {
     let body = text::body(line);
-    let text = format!("{}{}", brace(&effects::place_tags(fx.placement)), body);
+    let mut tags = effects::place_tags(fx.placement);
+    if fx.placement == Placement::Default && tier != Tier::Low && (ease.into || ease.out_of) {
+        let fade_in = if ease.into { EASE_IN_MS } else { 0 };
+        let fade_out = if ease.out_of { EASE_OUT_MS } else { 0 };
+        let (an, x, y) = effects::anchor(theme, names::DEFAULT, Placement::Default);
+        if tier == Tier::Desktop && ease.into {
+            tags.push_str(&format!(
+                "\\an{an}\\move({x},{},{x},{y},0,{EASE_RISE_MS})",
+                y + EASE_RISE
+            ));
+        } else {
+            tags.push_str(&format!("\\an{an}\\pos({x},{y})"));
+        }
+        tags.push_str(&effects::fad(line, fade_in, fade_out));
+    }
+    let text = format!("{}{}", brace(&tags), body);
     Event::on(line, fx.line, names::DEFAULT, text)
 }
 
@@ -403,6 +479,66 @@ mod tests {
             "{}",
             d[1]
         );
+    }
+
+    /// Three lines a beat apart, then one long after, then two at once.
+    const CLOSE: &str = "1\n00:00:01,000 --> 00:00:02,000\nOne\n\n\
+        2\n00:00:02,100 --> 00:00:03,000\nTwo\n\n\
+        3\n00:00:03,000 --> 00:00:04,000\nThree\n\n\
+        4\n00:00:09,000 --> 00:00:10,000\nFour\n\n\
+        5\n00:00:10,100 --> 00:00:12,000\nFive\n\n\
+        6\n00:00:11,000 --> 00:00:12,000\nSix\n";
+
+    /// B1206: lines a beat apart ease from one to the next; a line with
+    /// another on screen, or far from its neighbours, does not.
+    #[test]
+    fn close_lines_ease_into_each_other() {
+        let lines = source::read(CLOSE).unwrap().lines;
+        let e = eases(&lines);
+        let flags: Vec<(bool, bool)> = e.iter().map(|e| (e.into, e.out_of)).collect();
+        assert_eq!(
+            flags,
+            [
+                (false, true),
+                (true, true),
+                (true, false),
+                (false, false),
+                (false, false),
+                (false, false)
+            ]
+        );
+        let plan = plain_plan(lines.len());
+        let desk = run(&plan, &lines, Tier::Desktop, EffectsLevel::Subtle);
+        let d = dialogue(&desk);
+        assert!(
+            d[0].contains("\\an2\\pos(960,1026)\\fad(0,100)}One"),
+            "{}",
+            d[0]
+        );
+        assert!(
+            d[1].contains("\\an2\\move(960,1040,960,1026,0,160)\\fad(120,100)}Two"),
+            "{}",
+            d[1]
+        );
+        assert!(d[3].ends_with(",,Four"), "{}", d[3]);
+        assert!(d[4].ends_with(",,Five") && d[5].ends_with(",,Six"));
+        let tv = run(&plan, &lines, Tier::Tv, EffectsLevel::Full);
+        assert!(dialogue(&tv)[1].contains("\\pos(960,1026)\\fad(120,100)}Two"));
+        assert!(!tv.contains("\\move"));
+        for (tier, level) in [
+            (Tier::Low, EffectsLevel::Full),
+            (Tier::Desktop, EffectsLevel::Off),
+        ] {
+            let ass = run(&plan, &lines, tier, level);
+            assert!(
+                !ass.contains("\\fad") && !ass.contains("\\pos"),
+                "{tier:?} {level:?}"
+            );
+        }
+        for tier in Tier::ALL {
+            let ass = run(&plan, &lines, tier, EffectsLevel::Full);
+            assert_eq!(crate::budget::check(&ass, tier), Ok(()), "{tier:?}");
+        }
     }
 
     #[test]
