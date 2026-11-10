@@ -39,6 +39,19 @@ pub trait Model: Send {
         tokens: &[String],
         lead_star: bool,
     ) -> Result<Vec<(u64, u64)>, ModelError>;
+
+    /// [`Model::align`] over independent windows, one answer each in order;
+    /// a model may run them through shared forward passes.
+    fn align_many(
+        &mut self,
+        windows: &[(&[f32], &[String])],
+        lead_star: bool,
+    ) -> Vec<Result<Vec<(u64, u64)>, ModelError>> {
+        windows
+            .iter()
+            .map(|(pcm, tokens)| self.align(pcm, tokens, lead_star))
+            .collect()
+    }
 }
 
 /// Loads the model on first use and after an idle unload.
@@ -238,20 +251,28 @@ fn run_song(
             Err(e) => Err(SongError::Internal(e.to_string())),
         }
     };
-    let align_wide = |pcm: &[f32], tokens: &[String]| -> Result<Vec<(u64, u64)>, SongError> {
-        let span = tracing::info_span!("aligner.model", stage = "probe", words = tokens.len());
+    let align_wide = |windows: &[(&[f32], &[String])]| -> Result<Vec<Vec<(u64, u64)>>, SongError> {
+        let words: usize = windows.iter().map(|(_, t)| t.len()).sum();
+        let span = tracing::info_span!(
+            "aligner.model",
+            stage = "probe",
+            windows = windows.len(),
+            words
+        );
         let got = span.in_scope(|| {
             let mut p = probe_phases.borrow_mut();
-            Phases::time(&mut p.model_ms, || model.align(pcm, tokens, true))
+            Phases::time(&mut p.model_ms, || model.align_many(windows, true))
         });
-        match got {
-            Ok(spans) => Ok(spans),
-            Err(ModelError::Line(e)) => {
-                tracing::warn!(path = %rel_path, error = %e, "offset probe failed");
-                Ok(Vec::new())
-            }
-            Err(e @ ModelError::Fatal(_)) => Err(SongError::Internal(e.to_string())),
-        }
+        got.into_iter()
+            .map(|r| match r {
+                Ok(spans) => Ok(spans),
+                Err(ModelError::Line(e)) => {
+                    tracing::warn!(path = %rel_path, error = %e, "offset probe failed");
+                    Ok(Vec::new())
+                }
+                Err(e @ ModelError::Fatal(_)) => Err(SongError::Internal(e.to_string())),
+            })
+            .collect()
     };
     let found = estimate(&lines, decode_probe, align_wide)?;
     tracing::info!(

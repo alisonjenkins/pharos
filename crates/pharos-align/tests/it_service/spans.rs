@@ -122,7 +122,18 @@ fn a_song_traces_its_wait_decodes_and_model_calls_under_one_span() {
             count("aligner.decode", "probe"),
             count("aligner.model", "probe")
         ),
-        (3, 3)
+        (3, 1),
+        "the probes are decoded one by one and modelled together"
+    );
+    let probe_model = under
+        .iter()
+        .find(|r| {
+            r.name == "aligner.model" && r.fields.get("stage").map(String::as_str) == Some("probe")
+        })
+        .unwrap();
+    assert_eq!(
+        probe_model.fields.get("windows").map(String::as_str),
+        Some("3")
     );
     // The line with no alignable words is neither decoded nor modelled.
     assert_eq!(
