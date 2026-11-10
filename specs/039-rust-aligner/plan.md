@@ -69,10 +69,10 @@ This is a port of the `cpufwd` spike with its measured choices kept.
 ## Server change (shadow only)
 
 - `[lyrics].aligner_shadow_url` / `PHAROS_LYRICS_ALIGNER_SHADOW_URL`.
-- After `process_job` stores an answer, a background task sends the same request to the shadow and compares the whole result: `offset_ms`, the line and word counts, and each word's `at` and `start_ms`. Only `aligner_version` is expected to differ, and it is left out of the equality check; but a shadow answer whose `aligner_version` is not 5 is counted as `outcome=error`, never as a match, so a shadow URL pointed at the Python service cannot pass the gate. It logs one line and bumps `pharos_lyrics_shadow_total{outcome}`, then drops the answer.
-- At most one shadow request is in flight at a time, with the same 600 s timeout.
+- After either aligner path stores an answer (`process_job` for a song, `sing` for a video's sung subtitle lines), a background task sends the same request to the shadow and compares the whole result: `offset_ms`, the line and word counts, and each word's `at` and `start_ms`. Only `aligner_version` is expected to differ, and it is left out of the equality check; but a shadow answer whose `aligner_version` is not 5 is counted as `outcome=error`, never as a match, so a shadow URL pointed at the Python service cannot pass the gate. It logs one line and bumps `pharos_lyrics_shadow_total{outcome,path}` (`path` is `song` or `lines`), then drops the answer.
+- At most one shadow request is in flight at a time across both paths, with the same 600 s timeout.
 - The comparison also checks each line's `score`; the server keeps it in thousandths, so "within 0.001" is a difference of at most 1. Only `aligner_version` 5 can match.
-- The gate (R22), read from the comparison log line, newest first. It holds when the newest 50 `match` lines have no `mismatch` among or after them, and `error` plus `timeout` lines are under 5% of the lines in that span (`skipped_busy` left out):
+- The gate (R22), read from the comparison log line, newest first, both paths together. It holds when the newest 50 `match` lines have no `mismatch` among or after them, and `error` plus `timeout` lines are under 5% of the lines in that span (`skipped_busy` left out):
 
   ```logql
   {namespace="pharos"} |= "lyrics: shadow compared" | json | fields_outcome != "skipped_busy"
