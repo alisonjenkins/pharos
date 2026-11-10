@@ -448,7 +448,7 @@ pub(crate) async fn rebuild_paced<S, Tm, Tv>(
 
 /// A show's display name from its key: the folder's last segment, without a
 /// split's year.
-fn series_name(series_key: &str) -> String {
+pub(crate) fn series_name(series_key: &str) -> String {
     let folder = series_key
         .split(split::SPLIT_KEY_SEPARATOR)
         .next()

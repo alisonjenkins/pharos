@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use super::admin::require_admin;
 use crate::api::jellyfin::auth_extractor::AuthUser;
 use crate::online_enrich::OnlineEnricher;
-use crate::series_hand_fix::{rebuild_paced, HandFixError, HandFixer, MoveTarget};
+use crate::series_hand_fix::{rebuild_paced, series_name, HandFixError, HandFixer, MoveTarget};
 use crate::state::AppState;
 use crate::tmdb::{TmdbClient, TmdbEnricher};
 use crate::tvdb::{ReqwestTransport, TvdbClient, TvdbEnricher};
@@ -22,6 +22,7 @@ use crate::tvdb::{ReqwestTransport, TvdbClient, TvdbEnricher};
 pub(super) fn register(cfg: &mut web::ServiceConfig) {
     cfg.route("/admin/series-identity", web::get().to(overview))
         .route("/admin/series-identity/flagged", web::get().to(flagged_ids))
+        .route("/admin/series-identity/show", web::get().to(show))
         .route("/admin/series-identity/search", web::get().to(search))
         .route("/admin/series-identity/pick", web::post().to(pick))
         .route("/admin/series-identity/confirm", web::post().to(confirm))
@@ -163,6 +164,116 @@ async fn flagged_ids(
         .map(|m| series_id(&m.series_key, &m.series_name))
         .collect();
     Ok(web::Json(FlaggedIdsDto { series_ids }))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct ShowQuery {
+    series_id: String,
+}
+
+/// A show's stored match as the "This show" card states it.
+#[derive(Debug, Serialize, PartialEq)]
+#[serde(rename_all = "PascalCase")]
+struct ShowMatchDto {
+    provider: Option<String>,
+    external_id: Option<String>,
+    source: Option<String>,
+    premiere_date: Option<i64>,
+}
+
+#[derive(Debug, Serialize, PartialEq)]
+#[serde(rename_all = "PascalCase")]
+struct ShowEpisodeDto {
+    id: pharos_core::MediaId,
+    path: String,
+    season: Option<u32>,
+    episode: Option<u32>,
+    title: String,
+}
+
+#[derive(Debug, Serialize, PartialEq)]
+#[serde(rename_all = "PascalCase")]
+struct ShowDto {
+    series_key: String,
+    series_id: String,
+    folder: String,
+    name: String,
+    /// `None` while the show has no stored record at all.
+    current_match: Option<ShowMatchDto>,
+    episodes: Vec<ShowEpisodeDto>,
+}
+
+/// One show by its item id, flagged or not: the key it is stored under, its
+/// match and its episode files, for the Manage tab opened from a title page.
+/// The id is a hash of the key, so it is found by hashing each stored key.
+async fn show(
+    state: web::Data<AppState>,
+    user: AuthUser,
+    query: web::Query<ShowQuery>,
+) -> Result<impl Responder, actix_web::Error> {
+    require_admin(&user)?;
+    let want = super::items::canonical_wire_id(&query.series_id).into_owned();
+    let rows = state
+        .stores
+        .series_identity_rows("")
+        .await
+        .map_err(internal("reading episode identities"))?;
+    let found = rows.iter().find_map(|r| {
+        let folder = r.series_folder.as_deref()?;
+        let key = r.series_key.as_deref().unwrap_or(folder);
+        (pharos_jellyfin_api::dto::series_id_for_key(Some(key), "") == want)
+            .then(|| (key.to_string(), folder.to_string()))
+    });
+    let Some((series_key, folder)) = found else {
+        tracing::warn!(
+            admin = %user.0.name,
+            series_id = %want,
+            rows = rows.len(),
+            "series identity: no stored show has this item id"
+        );
+        return Err(error::ErrorNotFound(format!(
+            "no show has item id {want:?}"
+        )));
+    };
+    let metadata = state
+        .stores
+        .series_metadata_by_keys(std::slice::from_ref(&series_key))
+        .await
+        .map_err(internal("reading the show's match"))?
+        .remove(&series_key);
+    let mut rows = state
+        .stores
+        .series_episodes(&series_key)
+        .await
+        .map_err(internal("reading the show's episodes"))?;
+    rows.sort_by(|a, b| (a.season, a.episode, &a.path).cmp(&(b.season, b.episode, &b.path)));
+    let episodes = rows
+        .into_iter()
+        .map(|e| ShowEpisodeDto {
+            id: e.id,
+            path: e.path,
+            season: e.season,
+            episode: e.episode,
+            title: e.title,
+        })
+        .collect();
+    let name = metadata
+        .as_ref()
+        .map_or_else(|| series_name(&series_key), |m| m.series_name.clone());
+    Ok(web::Json(ShowDto {
+        series_id: want,
+        current_match: metadata.map(|m| ShowMatchDto {
+            provider: m.match_provider,
+            external_id: m.match_external_id,
+            source: m.match_source,
+            premiere_date: m.premiere_date,
+        }),
+        series_key,
+        folder,
+        name,
+        episodes,
+    }))
 }
 
 fn internal(context: &str) -> impl Fn(pharos_core::DomainError) -> actix_web::Error + '_ {
