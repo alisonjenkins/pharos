@@ -434,6 +434,8 @@ struct Report {
     sung_score: Option<f32>,
     /// Karaoke lines per timing, `timing=n` (B1212).
     karaoke: String,
+    /// Speakers the plan gives a colour slot.
+    speakers: usize,
 }
 
 /// What came of asking the aligner about an item's sung lines (B1212).
@@ -1005,6 +1007,7 @@ impl<S: JobStore, A: Signals, Q: TranscodeQueue> Styler<S, A, Q> {
         report.signs = parsed.lines.iter().filter(|l| l.typeset).count();
         report.sign_causes = sign_causes(&parsed.lines);
         report.sung_score = direction.sung_score;
+        report.speakers = direction.speakers;
         report.karaoke = direction
             .karaoke
             .iter()
@@ -1228,6 +1231,7 @@ impl<S: JobStore, A: Signals, Q: TranscodeQueue> Styler<S, A, Q> {
                     sung = report.sung.map(SungAsk::label),
                     sung_score = report.sung_score,
                     karaoke = %report.karaoke,
+                    speakers = report.speakers,
                     outcome = ended.outcome.label(),
                     stage = ended.stage.label(),
                     error = ended.error.as_deref(),
