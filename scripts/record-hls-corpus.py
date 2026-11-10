@@ -4,7 +4,8 @@
     scripts/record-hls-corpus.py http://127.0.0.1:8096 crates/pharos-hls/tests/corpus
 
 The server is the one `just compat-dioxus-full on` starts: the seeded
-`playwright` user and the 120 s `fixture-1.webm` (item ...01). For each
+`playwright` user, the 120 s `fixture-1.webm` (item ...01) and the test
+media tree's `05-carefree.mp3` for the audio-only stream. For each
 stream it saves the master and every media playlist. It also saves the init
 and first media segment of the audio group, the first video rung and the
 last (lowest) rung. The other rungs keep only their playlist, which keeps the
@@ -15,6 +16,7 @@ import json
 import os
 import re
 import sys
+import time
 import urllib.parse
 import urllib.request
 
@@ -44,7 +46,9 @@ def main(base: str, out: str) -> None:
     def get(url: str) -> bytes:
         return fetch(base, url, headers={"X-Emby-Token": token})
 
-    for name, url in STREAMS.items():
+    streams = dict(STREAMS)
+    streams["audio-only"] = f"/videos/{song(get, auth['User']['Id'])}/master.m3u8"
+    for name, url in streams.items():
         master_url = urllib.parse.urljoin(base, url)
         master = get(master_url).decode()
         save(out, name, "master.m3u8", scrub(master).encode())
@@ -64,6 +68,18 @@ def main(base: str, out: str) -> None:
             for r in inits[:1] + segments[:1]:
                 part = urllib.parse.urljoin(playlist_url, r)
                 save(out, name, local(part), get(part))
+
+
+def song(get, user_id: str) -> str:
+    """The test media tree's mp3. The library scan finishes after the server
+    answers, so wait for it."""
+    query = f"/Users/{user_id}/Items?Recursive=true&IncludeItemTypes=Audio&Fields=Path"
+    for _ in range(120):
+        for item in json.loads(get(query))["Items"]:
+            if (item.get("Path") or "").endswith("/05-carefree.mp3"):
+                return item["Id"]
+        time.sleep(1)
+    sys.exit("record-hls-corpus: 05-carefree.mp3 never showed up in the library")
 
 
 def fetch(base: str, url: str, data: bytes | None = None, headers: dict | None = None) -> bytes:
