@@ -80,8 +80,8 @@ Id blocks (bugs and invariants are written with the fix):
 
 ## G7 — Admin and settings
 
-- [ ] T038-700 Reproduce: a scan with no progress in the UI while the Task topic is published; check whether a scan outcome metric already exists.
-- [ ] T038-701 Scan progress, result and per-library scan from the Task topic (FR-701).
+- [x] T038-700 Reproduce: a scan with no progress in the UI while the Task topic is published; check whether a scan outcome metric already exists.
+- [x] T038-701 Scan progress, result and per-library scan from the Task topic (FR-701).
 - [ ] T038-702 Preferred audio and subtitle language (FR-702).
 - [ ] T038-703 [P] Sign-out and Remove confirms for kept books (FR-703); coordinate with the ebook work.
 - [ ] T038-704 [P] Music queue survives reload (FR-704); visualiser idle while paused (FR-706).
