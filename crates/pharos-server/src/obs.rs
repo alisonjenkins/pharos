@@ -403,6 +403,23 @@ pub fn rpc_trace_parent(span: &tracing::Span, traceparent: &str) {
     }
 }
 
+/// The W3C `traceparent` naming `span`, for an outgoing call to a service
+/// that traces too (the aligner), so its spans join this trace. `None` when
+/// the span is not being exported.
+pub fn traceparent(span: &tracing::Span) -> Option<String> {
+    use opentelemetry::propagation::TextMapPropagator as _;
+    use opentelemetry::trace::TraceContextExt as _;
+    use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+    let context = span.context();
+    if !context.span().span_context().is_valid() {
+        return None;
+    }
+    let mut carrier = std::collections::HashMap::new();
+    opentelemetry_sdk::propagation::TraceContextPropagator::new()
+        .inject_context(&context, &mut carrier);
+    carrier.remove("traceparent")
+}
+
 /// Parent-based sampler: an incoming sampled `traceparent` is honoured so a
 /// distributed trace is never cut in half; only root spans started here are
 /// thinned to `ratio`. At 1.0 this is the SDK default (parent-based always-on).
@@ -793,6 +810,29 @@ mod tests {
             rpc_trace_parent(&span, traceparent);
             span.context().span().span_context().trace_id().to_string()
         })
+    }
+
+    /// The aligner joins the server's trace (B1164): the header handed to it
+    /// names the span's trace, and a span nobody exports hands it none.
+    #[test]
+    fn an_outgoing_traceparent_names_the_current_trace() {
+        use opentelemetry::trace::TracerProvider as _;
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder().build();
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("test")));
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::info_span!("lyrics.align");
+            rpc_trace_parent(
+                &span,
+                "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01",
+            );
+            let header = traceparent(&span).expect("an exported span names its trace");
+            assert!(
+                header.starts_with("00-0af7651916cd43dd8448eb211c80319c-"),
+                "{header}"
+            );
+        });
+        assert_eq!(traceparent(&tracing::info_span!("untraced")), None);
     }
 
     /// FR-006: a call carrying a `traceparent` joins the caller's trace.
