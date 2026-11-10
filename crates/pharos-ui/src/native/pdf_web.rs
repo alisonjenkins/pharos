@@ -106,9 +106,27 @@ struct Spare {
     drawn: Option<(usize, PdfLayout)>,
 }
 
-/// An open PDF on screen. Dropping it frees the document and the canvases.
+/// The module's document, freed from its memory when dropped, so an early
+/// error return cannot leak it.
+struct Doc(PdfDoc);
+
+impl std::ops::Deref for Doc {
+    type Target = PdfDoc;
+
+    fn deref(&self) -> &PdfDoc {
+        &self.0
+    }
+}
+
+impl Drop for Doc {
+    fn drop(&mut self) {
+        self.0.free();
+    }
+}
+
+/// An open PDF on screen. Dropping it frees the document.
 pub struct PdfView {
-    doc: PdfDoc,
+    doc: Doc,
     id: ItemRef,
     count: usize,
     host: web_sys::HtmlElement,
@@ -143,10 +161,10 @@ impl PdfView {
         load_module().await?;
         let module_ms = platform::now_ms() - began;
         let doc =
-            PdfDoc::new(bytes).map_err(|e| format!("The PDF cannot be read: {}", describe(&e)))?;
+            Doc(PdfDoc::new(bytes)
+                .map_err(|e| format!("The PDF cannot be read: {}", describe(&e)))?);
         let count = doc.page_count() as usize;
         if count == 0 {
-            doc.free();
             return Err("The PDF has no pages.".to_owned());
         }
         let document = host.owner_document().ok_or("The reader has no document.")?;
@@ -355,11 +373,5 @@ impl PdfView {
         }
         self.generation.set(self.generation.get().wrapping_add(1));
         self.host.set_text_content(None);
-    }
-}
-
-impl Drop for PdfView {
-    fn drop(&mut self) {
-        self.doc.free();
     }
 }
