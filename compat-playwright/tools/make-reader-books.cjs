@@ -15,6 +15,10 @@
 //                        (spec 036): two fit in 2 MiB, three do not.
 //   Reader Locked.azw3   bytes the Kindle converter cannot read, which the
 //                        scanner indexes as an unreadable book.
+//   Reader Links.epub    a contents page whose links reach deep into a long
+//                        chapter, to an id and to an old <a name>, and a
+//                        footnote in a non-linear notes file (V1286-V1288).
+//                        Its words are "zl<paragraph>x<word>".
 //
 // Node only: the devShell has it, and the EPUB is a stored (uncompressed)
 // zip, which needs no library.
@@ -144,6 +148,60 @@ function epub(title = "Reader Fixture", count = PARAGRAPHS) {
   ]);
 }
 
+const LINKED_PARAGRAPHS = 60;
+
+/** The book of links: contents, one long chapter, and notes outside the reading order. */
+function linkedEpub() {
+  const xhtml = (title, body) =>
+    `<?xml version="1.0" encoding="UTF-8"?>\n` +
+    `<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops"><head><title>${title}</title></head>` +
+    `<body>${body}</body></html>`;
+  const paragraphs = [];
+  for (let p = 0; p < LINKED_PARAGRAPHS; p++) {
+    const words = [];
+    for (let w = 0; w < WORDS; w++) words.push(`zl${p}x${w}`);
+    const id = p === 30 ? ' id="deep"' : "";
+    const old = p === 50 ? '<a name="old"></a>' : "";
+    const note = p === 0 ? ' <a id="noteref" href="../notes.xhtml#n1" epub:type="noteref">1</a>' : "";
+    paragraphs.push(`<p${id}>${old}${words.join(" ")}${note}</p>`);
+  }
+  return zip([
+    ["mimetype", "application/epub+zip"],
+    [
+      "META-INF/container.xml",
+      `<?xml version="1.0"?><container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">` +
+        `<rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles></container>`,
+    ],
+    [
+      "OEBPS/content.opf",
+      `<?xml version="1.0" encoding="UTF-8"?>` +
+        `<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="uid">` +
+        `<metadata xmlns:dc="http://purl.org/dc/elements/1.1/">` +
+        `<dc:title>Reader Links</dc:title><dc:creator>Ada Lovelace</dc:creator>` +
+        `<dc:language>en</dc:language><dc:identifier id="uid">urn:pharos:reader-links</dc:identifier></metadata>` +
+        `<manifest><item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>` +
+        `<item id="contents" href="contents.xhtml" media-type="application/xhtml+xml"/>` +
+        `<item id="chapter" href="text/chapter%20one.xhtml" media-type="application/xhtml+xml"/>` +
+        `<item id="notes" href="notes.xhtml" media-type="application/xhtml+xml"/></manifest>` +
+        `<spine><itemref idref="contents"/><itemref idref="chapter"/><itemref idref="notes" linear="no"/></spine></package>`,
+    ],
+    [
+      "OEBPS/nav.xhtml",
+      xhtml("Contents", `<nav epub:type="toc"><ol><li><a href="contents.xhtml">Contents</a></li>` +
+        `<li><a href="text/chapter%20one.xhtml">Chapter One</a></li></ol></nav>`),
+    ],
+    [
+      "OEBPS/contents.xhtml",
+      xhtml("Contents", `<h1>Contents</h1>` +
+        `<p><a id="to-deep" href="text/chapter%20one.xhtml#deep">The deep section</a></p>` +
+        `<p><a id="to-old" href="text/chapter%20one.xhtml#old">The old anchor</a></p>` +
+        `<p><a id="to-web" href="https://example.org/">A web page</a></p>`),
+    ],
+    ["OEBPS/text/chapter one.xhtml", xhtml("Chapter One", `<h1>Chapter One</h1>${paragraphs.join("")}`)],
+    ["OEBPS/notes.xhtml", xhtml("Notes", `<h1>Notes</h1><p id="n1">zlnote the first note.</p>`)],
+  ]);
+}
+
 const PDF_PAGES = 5;
 
 /** A PDF of `PDF_PAGES` letter pages, each saying which it is and showing that many squares. */
@@ -188,4 +246,5 @@ for (const x of ["A", "B", "C"]) {
   fs.writeFileSync(path.join(out, `Reader Sized ${x}.epub`), epub(`Reader Sized ${x}`, SIZED_PARAGRAPHS));
 }
 fs.writeFileSync(path.join(out, "Reader Paged.pdf"), pdf());
+fs.writeFileSync(path.join(out, "Reader Links.epub"), linkedEpub());
 fs.writeFileSync(path.join(out, "Reader Locked.azw3"), Buffer.from("not a mobi file: DRM stand-in\n"));
