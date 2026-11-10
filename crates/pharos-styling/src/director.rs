@@ -7,9 +7,10 @@
 use std::collections::BTreeMap;
 
 use crate::plan::{EffectPlan, Intent, Karaoke, LineEffect, Placement};
-use crate::signals::{LineSignals, Segment, SegmentKind, TrackSignals};
+use crate::signals::{LineSignals, Segment, SegmentKind, SungLine, TrackSignals};
 use crate::source::SourceLine;
 use crate::text::unwrap_marks;
+use crate::timing;
 use crate::version::DIRECTOR_VERSION;
 
 /// What [`direct`] decided, with a tally for the per-item log line.
@@ -24,6 +25,40 @@ pub struct Direction {
     pub loudness: Loudness,
     /// Lines per [`BottomText`] verdict; verdicts with no line are absent.
     pub bottom_text: BTreeMap<BottomText, usize>,
+    /// Karaoke lines per [`KaraokeTiming`]; timings with no line are absent.
+    pub karaoke: BTreeMap<KaraokeTiming, usize>,
+    /// Median aligner score of the opening and ending lines, `None` when the
+    /// aligner was not asked; what [`MIN_SUNG_SCORE`] is calibrated against.
+    pub sung_score: Option<f32>,
+}
+
+/// Where a karaoke line's fill timings came from (B1212).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum KaraokeTiming {
+    /// The source's own `\k` tags.
+    Source,
+    /// The aligner heard the words sung.
+    Aligned,
+    /// Spread evenly over the line: a translation of the singing, or no
+    /// aligner answer for it.
+    Paced,
+}
+
+impl KaraokeTiming {
+    pub const ALL: [KaraokeTiming; 3] = [
+        KaraokeTiming::Source,
+        KaraokeTiming::Aligned,
+        KaraokeTiming::Paced,
+    ];
+
+    /// The metric label; a dashboard contract.
+    pub fn label(self) -> &'static str {
+        match self {
+            KaraokeTiming::Source => "source",
+            KaraokeTiming::Aligned => "aligned",
+            KaraokeTiming::Paced => "paced",
+        }
+    }
 }
 
 /// What burned-in bottom text did to a line's placement (B1207).
@@ -95,6 +130,10 @@ const MAX_SCALE: f32 = 3.0;
 /// this much over the median: a loud scene raises loudness, a raised voice
 /// raises pitch too (B1204).
 const SHOUT_PITCH_RATIO: f32 = 1.1;
+/// Median aligner score at or above which a song's lines are taken to be
+/// what is sung, and timed from the aligner (B1212). A first guess, not yet
+/// measured on real songs: calibrate from the logged `sung_score`.
+pub const MIN_SUNG_SCORE: f32 = 0.3;
 /// Extra margin inside an Intro or Outro, where music swells (plan.md Risks).
 const MUSIC_SHOUT_EXTRA_DLU: f32 = 3.0;
 /// Loudness step per Shout intensity level.
@@ -186,13 +225,21 @@ pub fn direct(lines: &[SourceLine], signals: &TrackSignals, segments: &[Segment]
     let rest = medians[Class::Rest as usize];
     let caps_track = is_caps_track(lines);
 
+    let sung_score = sung_score(&kinds, &signals.sung);
+    let sung_track = sung_score.map(|s| s >= MIN_SUNG_SCORE);
+
     let mut out = Vec::with_capacity(lines.len());
     let mut counts: BTreeMap<Intent, usize> = BTreeMap::new();
     let mut bottom_text: BTreeMap<BottomText, usize> = BTreeMap::new();
+    let mut karaoke: BTreeMap<KaraokeTiming, usize> = BTreeMap::new();
     for (i, line) in lines.iter().enumerate() {
         let med = medians[class_of(kinds[i]) as usize];
         let mut fx = decide(line, kinds[i], audio[i], med, caps_track);
         fx.line = i;
+        let sung = signals.sung.get(i).and_then(Option::as_ref);
+        if let Some(timing) = time_karaoke(&mut fx, line, kinds[i], sung, sung_track) {
+            *karaoke.entry(timing).or_insert(0) += 1;
+        }
         if spans_cut(line, &signals.cuts_ms)
             && (fx.intent != Intent::Plain || fx.karaoke != Karaoke::None)
         {
@@ -217,7 +264,80 @@ pub fn direct(lines: &[SourceLine], signals: &TrackSignals, segments: &[Segment]
             scale: rest.scale,
         },
         bottom_text,
+        karaoke,
+        sung_score,
     }
+}
+
+/// Median score of the opening and ending lines the aligner answered for.
+fn sung_score(kinds: &[Option<SegmentKind>], sung: &[Option<SungLine>]) -> Option<f32> {
+    let mut scores: Vec<f32> = kinds
+        .iter()
+        .zip(sung)
+        .filter(|(k, _)| matches!(k, Some(SegmentKind::Intro | SegmentKind::Outro)))
+        .filter_map(|(_, s)| s.as_ref()?.score)
+        .filter(|s| s.is_finite())
+        .collect();
+    if scores.is_empty() {
+        return None;
+    }
+    scores.sort_by(f32::total_cmp);
+    Some(scores[scores.len() / 2])
+}
+
+/// Gives a sung line with no `\k` of its own a karaoke fill (B1212): from
+/// the aligner when the song's words are what is sung, else paced over the
+/// line. Only a line the rules left plain inside an intro or outro; returns
+/// where a karaoke line's timings come from.
+fn time_karaoke(
+    fx: &mut LineEffect,
+    line: &SourceLine,
+    kind: Option<SegmentKind>,
+    sung: Option<&SungLine>,
+    sung_track: Option<bool>,
+) -> Option<KaraokeTiming> {
+    if fx.karaoke != Karaoke::None {
+        return Some(KaraokeTiming::Source);
+    }
+    let seg = match kind {
+        Some(SegmentKind::Intro) => "intro",
+        Some(SegmentKind::Outro) => "outro",
+        _ => return None,
+    };
+    if line.typeset || line.karaoke.is_some() || !fx.reason.starts_with("rule=plain") {
+        return None;
+    }
+    let aligned = match (sung_track, sung) {
+        (Some(true), Some(s)) => timing::aligned(line, s).map(|syl| (syl, s.score)),
+        _ => None,
+    };
+    let (timing, syllables, why) = match aligned {
+        Some((syl, score)) => (
+            KaraokeTiming::Aligned,
+            syl,
+            format!("aligned score={:.2}", score.unwrap_or(f32::NAN)),
+        ),
+        None => {
+            let why = match (sung_track, sung) {
+                // Answered, but by an aligner that does not score lines.
+                (None, Some(_)) => "paced why=unscored",
+                (None, None) => "paced why=no_aligner",
+                (Some(false), _) => "paced why=translated",
+                (Some(true), _) => "paced why=unaligned",
+            };
+            (KaraokeTiming::Paced, timing::paced(line)?, why.to_owned())
+        }
+    };
+    let mut new = effect(
+        Intent::Plain,
+        1,
+        format!("rule=karaoke seg={seg} timing={why}"),
+    );
+    new.line = fx.line;
+    new.karaoke = Karaoke::Sweep;
+    new.syllables = Some(syllables);
+    *fx = new;
+    Some(timing)
 }
 
 /// Lifts a line to the top when text is burned into the bottom of the
@@ -839,6 +959,7 @@ mod tests {
                     lines: sigs,
                     cuts_ms: self.cuts,
                     bottom_text: vec![],
+                    sung: vec![],
                 },
                 &self.segs,
             );
@@ -1089,6 +1210,7 @@ mod tests {
                     lines: sigs,
                     cuts_ms: vec![],
                     bottom_text: vec![],
+                    sung: vec![],
                 },
                 &[],
             )
@@ -1137,6 +1259,7 @@ mod tests {
                 lines: sigs,
                 cuts_ms: vec![],
                 bottom_text: vec![],
+                sung: vec![],
             },
             &[],
         );
@@ -1162,6 +1285,7 @@ mod tests {
                 lines: sigs,
                 cuts_ms: vec![],
                 bottom_text: vec![],
+                sung: vec![],
             },
             &[],
         );
@@ -1178,6 +1302,7 @@ mod tests {
                 lines: vec![sig(-23.0), sig(-22.0), sig(-21.0)],
                 cuts_ms: vec![],
                 bottom_text: vec![],
+                sung: vec![],
             },
             &[],
         );
@@ -1189,6 +1314,7 @@ mod tests {
                 lines: vec![sig(-23.0)],
                 cuts_ms: vec![],
                 bottom_text: vec![],
+                sung: vec![],
             },
             &[],
         );
@@ -1200,6 +1326,7 @@ mod tests {
                 lines: vec![sig(-40.0), sig(-23.0), sig(-23.0)],
                 cuts_ms: vec![],
                 bottom_text: vec![],
+                sung: vec![],
             },
             &[],
         );
@@ -1283,6 +1410,7 @@ mod tests {
             lines: sigs,
             cuts_ms: vec![],
             bottom_text: vec![],
+            sung: vec![],
         };
         let with = direct(&lines, &track, &intro);
         assert!(with.plan.lines.iter().all(|l| l.intent == Intent::Plain));
@@ -1306,10 +1434,102 @@ mod tests {
                 .karaoke,
             Karaoke::None
         );
-        assert_eq!(
-            case("la la").seg(SegmentKind::Intro).run().karaoke,
-            Karaoke::None
+        // B1212: a sung line with no `\k` gets a paced fill instead.
+        let paced = case("la la").seg(SegmentKind::Intro).run();
+        assert_eq!(paced.karaoke, Karaoke::Sweep);
+        assert!(
+            paced.reason.ends_with("timing=paced why=no_aligner"),
+            "{}",
+            paced.reason
         );
+        assert_eq!(case("la la").run().syllables, None);
+    }
+
+    /// B1212: the aligner times a song whose words are what is sung; a
+    /// translation, or a line it could not place, is paced instead.
+    #[test]
+    fn sung_lines_are_timed_from_the_aligner_when_the_words_match() {
+        let lines = vec![line("Run away"), line("Run away"), line("[door slams]")];
+        let at = |score: f32| {
+            Some(SungLine {
+                words: vec![(0, 10_200), (4, 10_700), (8, 11_500)],
+                score: Some(score),
+            })
+        };
+        let intro = [Segment {
+            kind: SegmentKind::Intro,
+            start_ms: 0,
+            end_ms: 60_000,
+        }];
+        let run = |sung: Vec<Option<SungLine>>| {
+            direct(
+                &lines,
+                &TrackSignals {
+                    sung,
+                    ..TrackSignals::default()
+                },
+                &intro,
+            )
+        };
+
+        let matched = run(vec![at(0.7), None, at(0.1)]);
+        assert_eq!(matched.sung_score, Some(0.7));
+        let first = &matched.plan.lines[0];
+        assert_eq!(first.karaoke, Karaoke::Sweep);
+        assert!(
+            first.reason.ends_with("timing=aligned score=0.70"),
+            "{}",
+            first.reason
+        );
+        let durs: Vec<u32> = first.syllables.iter().flatten().map(|s| s.dur_ms).collect();
+        assert_eq!(durs, [200, 500, 800]);
+        let second = &matched.plan.lines[1];
+        assert!(
+            second.reason.ends_with("timing=paced why=unaligned"),
+            "{}",
+            second.reason
+        );
+        // A sound cue keeps its own rule.
+        assert_eq!(matched.plan.lines[2].intent, Intent::Sfx);
+        let counts: Vec<_> = matched.karaoke.into_iter().collect();
+        assert_eq!(
+            counts,
+            [(KaraokeTiming::Aligned, 1), (KaraokeTiming::Paced, 1)]
+        );
+
+        // An aligner that does not score lines leaves the song paced.
+        let unscored = run(vec![
+            Some(SungLine {
+                words: vec![(0, 10_200), (4, 10_700), (8, 11_500)],
+                score: None,
+            }),
+            None,
+            None,
+        ]);
+        assert_eq!(unscored.sung_score, None);
+        let fx = &unscored.plan.lines[0];
+        assert!(
+            fx.reason.ends_with("timing=paced why=unscored"),
+            "{}",
+            fx.reason
+        );
+
+        let translated = run(vec![at(0.1), at(0.2), None]);
+        assert_eq!(translated.sung_score, Some(0.2));
+        for fx in &translated.plan.lines[..2] {
+            assert!(
+                fx.reason.ends_with("timing=paced why=translated"),
+                "{}",
+                fx.reason
+            );
+        }
+    }
+
+    #[test]
+    fn karaoke_timing_labels_are_distinct() {
+        let labels: std::collections::BTreeSet<_> =
+            KaraokeTiming::ALL.iter().map(|t| t.label()).collect();
+        assert_eq!(labels.len(), KaraokeTiming::ALL.len());
     }
 
     #[test]
@@ -1455,6 +1675,7 @@ mod tests {
             lines: sigs,
             cuts_ms: vec![11_000],
             bottom_text: vec![],
+            sung: vec![],
         };
         assert_eq!(direct(&lines, &t, &[]), direct(&lines, &t, &[]));
     }
