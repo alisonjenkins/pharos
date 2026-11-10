@@ -26,7 +26,7 @@ Id blocks (bugs and invariants are written with the fix):
 - [x] T038-105 Latest rails grouped by series and album with a new-children count (FR-106); schema change if the count travels on the wire (get the schema number from the merge queue).
 - [x] T038-106 [ALISON] Minimum resume point setting and rule (FR-107), with its ADR.
 - [x] T038-107 Stop path reports its failures (FR-108).
-- [ ] T038-108 [ALISON] Resume tiles play at once (FR-109).
+- [x] T038-108 [ALISON] Resume tiles play at once (FR-109).
 
 ## G2 — Show page and browse
 
