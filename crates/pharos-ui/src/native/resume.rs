@@ -101,6 +101,62 @@ pub fn wakes_context(state: &str) -> bool {
     matches!(state, "suspended" | "interrupted")
 }
 
+/// How long a new tap's `AudioContext` may take to start before it is
+/// reported stuck (B1141, V1101). Firefox starts one asynchronously, within
+/// ~200 ms on a working output; with no sound output it never starts and
+/// its `resume()` never settles (B1140).
+pub const TAP_START_REPORT_MS: u32 = 3_000;
+
+/// How a new tap's `AudioContext` started (B1141). Chromium makes one
+/// running; Firefox makes one suspended and starts it a moment later.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TapStart {
+    /// `resume()` settled and the context is in `state` (running, unless the
+    /// browser said otherwise), `start_ms` after the tap was made; 0 when it
+    /// was running from the start.
+    Started { state: String, start_ms: u64 },
+    /// Still in `state` with `resume()` unsettled after
+    /// [`TAP_START_REPORT_MS`]: the browser has no output to open.
+    Stuck { state: String },
+    /// `resume()`'s promise was rejected with `error`, leaving `state`.
+    Rejected { error: String, state: String },
+    /// `resume()` threw `error` before returning a promise.
+    Refused { error: String },
+}
+
+impl TapStart {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Started { .. } => "started",
+            Self::Stuck { .. } => "stuck",
+            Self::Rejected { .. } => "rejected",
+            Self::Refused { .. } => "refused",
+        }
+    }
+
+    /// Whether the outcome is a fault, logged as a warning.
+    pub fn is_fault(&self) -> bool {
+        !matches!(self, Self::Started { state, .. } if state == "running")
+    }
+
+    /// The console line, naming the outcome and the values behind it.
+    pub fn line(&self) -> String {
+        let label = self.label();
+        match self {
+            Self::Started { state, start_ms } => {
+                format!("pharos: visualiser tap context={label} state={state} start_ms={start_ms}")
+            }
+            Self::Stuck { state } => format!(
+                "pharos: visualiser tap context={label} state={state} waited_ms={TAP_START_REPORT_MS}"
+            ),
+            Self::Rejected { error, state } => {
+                format!("pharos: visualiser tap context={label} state={state} error={error}")
+            }
+            Self::Refused { error } => format!("pharos: visualiser tap context={label} error={error}"),
+        }
+    }
+}
+
 /// The Web Audio path the song is routed through, when it is tapped.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AudioPath {
@@ -636,5 +692,64 @@ mod tests {
             "{}",
             report.line()
         );
+    }
+
+    // B1141 / V1101: a tap says how its context started, with the values
+    // behind the verdict; only a context that runs is not a fault.
+    #[test]
+    fn a_tap_start_names_its_outcome_and_values() {
+        let started = TapStart::Started {
+            state: "running".to_owned(),
+            start_ms: 140,
+        };
+        assert_eq!(
+            started.line(),
+            "pharos: visualiser tap context=started state=running start_ms=140"
+        );
+        assert!(!started.is_fault());
+
+        let stuck = TapStart::Stuck {
+            state: "suspended".to_owned(),
+        };
+        assert_eq!(
+            stuck.line(),
+            "pharos: visualiser tap context=stuck state=suspended waited_ms=3000"
+        );
+        assert!(stuck.is_fault());
+
+        let rejected = TapStart::Rejected {
+            error: "NotAllowedError".to_owned(),
+            state: "suspended".to_owned(),
+        };
+        assert!(rejected
+            .line()
+            .contains("context=rejected state=suspended error=NotAllowedError"));
+        assert!(rejected.is_fault());
+
+        let refused = TapStart::Refused {
+            error: "InvalidStateError".to_owned(),
+        };
+        assert!(refused
+            .line()
+            .contains("context=refused error=InvalidStateError"));
+        assert!(refused.is_fault());
+
+        // Settled but not running (a browser that resolves early) is a fault.
+        let odd = TapStart::Started {
+            state: "suspended".to_owned(),
+            start_ms: 5,
+        };
+        assert!(odd.is_fault());
+
+        let labels = [
+            started.label(),
+            stuck.label(),
+            rejected.label(),
+            refused.label(),
+        ];
+        let mut distinct = labels.to_vec();
+        distinct.sort_unstable();
+        distinct.dedup();
+        assert_eq!(distinct.len(), labels.len(), "{labels:?}");
     }
 }
