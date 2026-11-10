@@ -8,6 +8,10 @@ from typing import Any, NamedTuple
 from pharos_aligner.text import Word
 
 MARGIN_MS = 250
+# Synced lyrics are mostly tapped by ear, so a stamp often lands a few hundred
+# ms after the singing starts; a window opening only MARGIN_MS early cuts off
+# the first word, and CTC then pins it late.
+LEAD_MS = 750
 
 
 class Line(NamedTuple):
@@ -26,7 +30,7 @@ CAP_EXTRA_MS = 2000
 def window(line: Line, n_words: int) -> tuple[int, int]:
     """Compute audio decode window with safety margin around line LRC span."""
     end_ms = min(line.end_ms, line.start_ms + n_words * CAP_MS_PER_WORD + CAP_EXTRA_MS)
-    return (max(0, line.start_ms - MARGIN_MS), end_ms + MARGIN_MS)
+    return (max(0, line.start_ms - LEAD_MS), end_ms + MARGIN_MS)
 
 
 def stamps(
