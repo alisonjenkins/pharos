@@ -477,17 +477,19 @@ pub async fn for_item(
 
 /// The aligner may find a line's first word before its stamp (B1165); the
 /// player shows a line from its start, so a later start would show that word
-/// late. A line never moves before the one above it.
+/// late. A moved line still starts after the one above it, since the player
+/// would skip a line that shares its start with the next.
 fn start_lines_at_their_first_word(lines: &mut [LyricLine]) {
-    let mut floor = 0;
+    let mut above = None::<u64>;
     for line in lines {
         if let (Some(start), Some(first)) = (line.start_ms, line.words.first()) {
             if first.start_ms < start {
-                line.start_ms = Some(first.start_ms.max(floor));
+                let lowest = above.map_or(0, |a| a.saturating_add(1));
+                line.start_ms = Some(first.start_ms.max(lowest).min(start));
             }
         }
-        if let Some(start) = line.start_ms {
-            floor = start;
+        if line.start_ms.is_some() {
+            above = line.start_ms;
         }
     }
 }
@@ -507,7 +509,7 @@ mod tests {
     }
 
     #[test]
-    fn a_line_starts_at_a_first_word_sung_before_its_stamp_but_not_before_the_line_above() {
+    fn a_line_starts_at_a_first_word_sung_before_its_stamp_but_after_the_line_above() {
         let word = |start_ms| WordStamp { at: 0, start_ms };
         let mut lines = vec![
             LyricLine {
@@ -528,7 +530,7 @@ mod tests {
         let starts: Vec<_> = lines.iter().map(|l| l.start_ms).collect();
         assert_eq!(
             starts,
-            [Some(9_400), Some(12_000), Some(12_000), Some(14_000)]
+            [Some(9_400), Some(12_000), Some(12_001), Some(14_000)]
         );
     }
 
