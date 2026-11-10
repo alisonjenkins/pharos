@@ -5065,6 +5065,12 @@ body::before {
     opacity: 1;
   }
 }
+/* The TV draws no queue buttons over an album's cover: they sat inside the
+   tile, so the remote's Down landed on them and OK queued the album instead
+   of opening it (B1322, V1293). The album page offers both. */
+:root[data-device="tv"] .pharos-queue-buttons[data-target="album_card"] {
+  display: none;
+}
 
 /* Dynamic mixes (spec 024, B441): the mix line in the queue panel, its
    picker, the rule editor, and why a mix picked a song. */
