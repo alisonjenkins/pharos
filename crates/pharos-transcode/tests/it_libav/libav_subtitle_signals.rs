@@ -235,6 +235,9 @@ async fn a_track_too_long_for_one_frame_is_analysed_in_chunks() {
     assert_eq!(s.lines.len(), windows.len());
     assert_eq!(&s.lines[..2], &alone.lines[..]);
     assert_eq!(s.lines[2], s.lines[2 + distinct.len()]);
+    assert_eq!(s.bottom_text.len(), windows.len());
+    assert_eq!(&s.bottom_text[..2], &alone.bottom_text[..]);
+    assert_eq!(s.bottom_text[2], s.bottom_text[2 + distinct.len()]);
     assert_eq!(s.cuts_ms, alone.cuts_ms);
     assert_eq!(pool.idle_workers().await, 1);
     assert_eq!(
@@ -303,4 +306,66 @@ async fn an_oversized_request_fails_the_op_and_keeps_the_worker() {
         ),
         0
     );
+}
+
+/// Grey video with a "caption" (white strokes on black, 20 rows of 360) at the
+/// bottom from 6 s on, keyframes every 2 s.
+fn captioned_fixture(path: &Path) {
+    let picture = "color=c=gray:s=640x360:r=24:d=12,format=gray,\
+        geq=lum='if(gte(T,6)*between(Y,300,319)*between(X,160,479),if(lt(mod(X,6),2),235,20),110)'";
+    let status = Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            picture,
+            "-f",
+            "lavfi",
+            "-i",
+            "anullsrc=r=48000:cl=stereo:d=12",
+            "-c:v",
+            "mpeg4",
+            "-q:v",
+            "2",
+            "-g",
+            "48",
+            "-sc_threshold",
+            "0",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "flac",
+        ])
+        .arg(path)
+        .status()
+        .expect("spawn ffmpeg fixture");
+    assert!(status.success(), "fixture generation failed");
+}
+
+#[test]
+fn text_burned_into_the_bottom_is_found_per_line() {
+    if !ffmpeg_available() {
+        eprintln!("skipping: ffmpeg not on PATH");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("captioned.mkv");
+    captioned_fixture(&input);
+
+    let lines = [(1000, 3000), (7000, 9000), (60_000, 61_000)];
+    let s = subtitle_signals(&input, None, &lines).unwrap();
+
+    assert_eq!(s.bottom_text.len(), 3);
+    assert_eq!(s.bottom_text[0], Some(0.0), "clean picture under line 1");
+    let share = s.bottom_text[1].expect("the keyframe at 8 s was checked");
+    assert!(
+        (0.045..=0.075).contains(&share),
+        "a 20-row caption in 360 rows: {share}"
+    );
+    // Past the last keyframe's reach: nothing speaks for it.
+    assert_eq!(s.bottom_text[2], None);
 }
