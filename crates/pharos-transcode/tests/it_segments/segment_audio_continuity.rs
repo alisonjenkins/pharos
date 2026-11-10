@@ -7,7 +7,7 @@
 //! audio — the same instants encoded twice, at different timestamps, from
 //! different encoder state.
 //!
-//! Measured on the live server (Fringe S01E02, muxed mpegts path) before this
+//! Measured on the live server (Show AW S01E02, muxed mpegts path) before this
 //! was fixed:
 //!
 //! ```text

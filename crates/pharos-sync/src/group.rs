@@ -5818,7 +5818,7 @@ mod tests {
     /// runtime, and by nothing when the runtime is unknown.
     #[test]
     fn a_position_is_bounded_by_the_items_runtime() {
-        // Ant-Man's real numbers from the incident: the model said 5 h 39 m
+        // Film AV's real numbers from the incident: the model said 5 h 39 m
         // into a 1 h 57 m film.
         assert_eq!(clamp_to_runtime(20_337_295, Some(7_026_771)), 7_026_771);
         // Inside the item, untouched.

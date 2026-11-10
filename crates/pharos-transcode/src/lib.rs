@@ -292,7 +292,7 @@ fn ffmpeg_filter_escape(path: &str) -> String {
 ///   `[0:v:0][0:s:N]overlay=eof_action=pass[,rest][vout]`. `overlay` is the
 ///   only ffmpeg path that renders bitmap subs (PGS/VOBSUB/DVB); libass'
 ///   `subtitles=` is text-only and aborts a PGS burn with "Only text based
-///   subtitles are currently supported" (Avatar's PGS track 500'd every
+///   subtitles are currently supported" (Film BA's PGS track 500'd every
 ///   segment). A `-filter_complex` disables default stream selection, so the
 ///   video (`[vout]`) and audio maps are emitted here.
 /// - TEXT/ASS subtitle burn (Task 7) — a plain `-vf subtitles=filename=…:si=N`
@@ -1755,7 +1755,7 @@ fn build_args_for_pipeline(
             // load-balances ONE session's segments across both devices, and
             // they all decode under the single init segment 0 produced. A
             // segment on the other device's timescale is then read on the
-            // init's clock: measured live, a burned-subtitle Fringe episode
+            // init's clock: measured live, a burned-subtitle Show AW episode
             // spilled from NVENC to CPU and its segment 7 arrived claiming
             // 157.7 s instead of 42.1 s (90000/24000 = 3.75x). hls.js will not
             // join a fragment that far outside the range the playlist
@@ -2644,7 +2644,7 @@ mod tests {
     fn burn_subtitle_uses_overlay_filter_complex() {
         // B40 — burn-in is only ever requested for IMAGE subs (PGS/VOBSUB),
         // which the text-only `subtitles=` filter cannot render ("Only text
-        // based subtitles are currently supported" — every Avatar segment
+        // based subtitles are currently supported" — every Film BA segment
         // 500'd). The burn must ride an overlay filter_complex with explicit
         // maps (a filter_complex disables default stream selection).
         let mut o = opts();
@@ -4113,7 +4113,7 @@ mod tests {
         //
         // It then discards every frame until it reaches a genuine recovery
         // point, and — this is why the defect survived to production —
-        // **exits 0**. Measured on the live source (Fringe S01E02) at the
+        // **exits 0**. Measured on the live source (Show AW S01E02) at the
         // timestamps the user reported as freezes: 9 of 43 sampled segments
         // came up short and TWO contained no video frames at all, while the
         // exit status, the byte-size floor and the cache all read success.
