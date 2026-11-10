@@ -13,7 +13,10 @@ browser one.
 
 Everything that would run or fetch is removed before a section is handed out:
 scripts, `on*` attributes, forms, frames, objects, `<use>`,
-`foreignObject`, `@import`, `@font-face`, and every URL that leaves the book.
+`foreignObject`, `@import`, and every URL that leaves the book. A
+`@font-face` whose font is inside the book is handed out apart
+(`Css::font_faces`) for the renderer to load from the book's bytes; any other
+is dropped.
 A link to another section becomes `data-quire-link="<spine>#<id>"` for the
 renderer to turn into a jump; a link to any other file in the book is inert;
 an `http(s)` link opens in a new tab with `rel="noopener noreferrer"`.

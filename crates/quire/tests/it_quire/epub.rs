@@ -459,3 +459,18 @@ fn a_viewport_in_a_reflowable_book_is_not_a_page() {
     assert!(!book.metadata().fixed_layout);
     assert_eq!(book.section(0).unwrap().page, None);
 }
+
+#[test]
+fn a_fixed_page_keeps_its_placed_text_and_its_font() {
+    let book = fixed_layout_book("", "");
+    let s = book.section(0).unwrap();
+    let faces: Vec<_> = s.styles.iter().flat_map(|c| c.font_faces()).collect();
+    assert_eq!(faces.len(), 1);
+    assert_eq!(faces[0].family, "hand");
+    assert_eq!(faces[0].sources, ["OEBPS/fonts/hand.ttf"]);
+    assert!(s.resources().contains(&"OEBPS/fonts/hand.ttf".to_owned()));
+    let h = s.to_html(&mut |p| Some(format!("blob:{p}")));
+    assert!(h.contains("left:10px;top:20px;font-family:hand"), "{h}");
+    let css = s.styles[0].render(&mut |p| Some(format!("blob:{p}")));
+    assert!(!css.contains("font-face"), "{css}");
+}

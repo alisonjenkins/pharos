@@ -1,6 +1,8 @@
 //! Book stylesheets, made safe to apply: no remote fetches, no `@import`, no
-//! `@font-face`, and `url()`s that point inside the book kept as references
-//! the caller resolves when it draws.
+//! `@font-face` in the text, and `url()`s that point inside the book kept as
+//! references the caller resolves when it draws. A `@font-face` whose font is
+//! inside the book is handed out apart, as a [`FontFace`] for the renderer to
+//! load from the book's own bytes.
 
 use crate::path::{self, Href};
 
@@ -8,6 +10,18 @@ use crate::path::{self, Href};
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Css {
     pieces: Vec<Piece>,
+    faces: Vec<FontFace>,
+}
+
+/// A `@font-face` rule whose font files are inside the book.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FontFace {
+    pub family: String,
+    /// Archive paths of the font files, in the rule's order of preference.
+    pub sources: Vec<String>,
+    /// `font-weight`, `font-style`, `font-stretch` and `unicode-range`, as
+    /// written, when they hold only characters those values use.
+    pub descriptors: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -18,12 +32,26 @@ enum Piece {
 }
 
 impl Css {
-    /// Archive paths this stylesheet refers to.
+    /// Archive paths this stylesheet refers to, fonts included.
     pub fn resources(&self) -> impl Iterator<Item = &str> {
-        self.pieces.iter().filter_map(|p| match p {
-            Piece::Resource(r) => Some(r.as_str()),
-            Piece::Text(_) => None,
-        })
+        self.pieces
+            .iter()
+            .filter_map(|p| match p {
+                Piece::Resource(r) => Some(r.as_str()),
+                Piece::Text(_) => None,
+            })
+            .chain(
+                self.faces
+                    .iter()
+                    .flat_map(|f| f.sources.iter().map(String::as_str)),
+            )
+    }
+
+    /// The `@font-face` rules whose fonts are inside the book. They are not
+    /// part of [`Css::render`]'s text: a browser ignores `@font-face` inside
+    /// a shadow root, so a renderer loads them itself.
+    pub fn font_faces(&self) -> &[FontFace] {
+        &self.faces
     }
 
     /// The stylesheet text, each resource replaced by the URL `resolve` gives
@@ -258,7 +286,14 @@ impl Scanner<'_> {
         let name = self.read_ident();
         match name.value.to_ascii_lowercase().as_str() {
             "import" => self.skip_until_semicolon(),
-            "font-face" => self.skip_block(),
+            "font-face" => {
+                let start = self.at;
+                self.skip_block();
+                let rule = self.source_since(start);
+                if let Some(face) = font_face(&rule, self.base) {
+                    self.out.faces.push(face);
+                }
+            }
             _ => {
                 self.text("@");
                 self.text(&name.value);
@@ -316,6 +351,116 @@ impl Scanner<'_> {
 struct Lexed {
     value: String,
     source: String,
+}
+
+/// Longest `font-family` name kept; a real one is a few dozen characters.
+const MAX_FAMILY_CHARS: usize = 200;
+
+/// The `@font-face` rule whose text, after the at-keyword, is `rule`, when
+/// it names a family and at least one font inside the book.
+fn font_face(rule: &str, base: &str) -> Option<FontFace> {
+    let body = rule.split_once('{')?.1;
+    let body = body.rsplit_once('}').map_or(body, |(b, _)| b);
+    let body = strip_comments(body);
+    let mut family = None;
+    let mut sources = Vec::new();
+    let mut descriptors = Vec::new();
+    for decl in split_outside(&body, ';') {
+        let Some((name, value)) = decl.split_once(':') else {
+            continue;
+        };
+        let name = name.trim().to_ascii_lowercase();
+        let value = value.trim();
+        match name.as_str() {
+            "font-family" => {
+                family = Some(unquote(value))
+                    .filter(|f| !f.is_empty() && f.chars().count() <= MAX_FAMILY_CHARS);
+            }
+            "src" => {
+                for item in split_outside(value, ',') {
+                    if let Some(path) = font_url(item.trim(), base) {
+                        sources.push(path);
+                    }
+                }
+            }
+            "font-weight" | "font-style" | "font-stretch" | "unicode-range"
+                if !value.is_empty()
+                    && value.chars().all(|c| {
+                        c.is_ascii_alphanumeric()
+                            || matches!(c, ' ' | '%' | '+' | '-' | '.' | ',' | '?')
+                    }) =>
+            {
+                descriptors.push((name, value.to_owned()));
+            }
+            _ => {}
+        }
+    }
+    let family = family?;
+    (!sources.is_empty()).then_some(FontFace {
+        family,
+        sources,
+        descriptors,
+    })
+}
+
+/// The archive path of a `url(...)` source inside the book; `None` for
+/// `local()`, a remote URL or anything else.
+fn font_url(item: &str, base: &str) -> Option<String> {
+    let head = item.get(..4)?;
+    if !head.eq_ignore_ascii_case("url(") {
+        return None;
+    }
+    let rest = item.get(4..)?;
+    let arg = rest.split_once(')').map_or(rest, |(a, _)| a);
+    match path::resolve(base, &unquote(arg)) {
+        Href::Internal { path, .. } => Some(path),
+        _ => None,
+    }
+}
+
+fn unquote(v: &str) -> String {
+    let v = v.trim();
+    let inner = v
+        .strip_prefix('"')
+        .and_then(|r| r.strip_suffix('"'))
+        .or_else(|| v.strip_prefix('\'').and_then(|r| r.strip_suffix('\'')))
+        .unwrap_or(v);
+    inner.trim().to_owned()
+}
+
+fn strip_comments(css: &str) -> String {
+    let mut out = String::with_capacity(css.len());
+    let mut rest = css;
+    while let Some((before, after)) = rest.split_once("/*") {
+        out.push_str(before);
+        rest = after.split_once("*/").map_or("", |(_, a)| a);
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Splits `s` at each `sep` that is outside quotes and parentheses.
+fn split_outside(s: &str, sep: char) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth = 0usize;
+    let mut quote = None;
+    let mut start = 0;
+    for (i, c) in s.char_indices() {
+        match (quote, c) {
+            (Some(q), c) if c == q => quote = None,
+            (Some(_), _) => {}
+            (None, '"' | '\'') => quote = Some(c),
+            (None, '(') => depth = depth.saturating_add(1),
+            (None, ')') => depth = depth.saturating_sub(1),
+            (None, c) if c == sep && depth == 0 => {
+                parts.extend(s.get(start..i));
+                start = i.saturating_add(c.len_utf8());
+            }
+            _ => {}
+        }
+    }
+    parts.extend(s.get(start..));
+    parts
 }
 
 fn is_ident_start(c: char) -> bool {
@@ -433,6 +578,56 @@ mod tests {
             show("p{}</style><img src=x onerror=alert(1)>"),
             r"p{}<\/style><img src=x onerror=alert(1)>"
         );
+    }
+
+    #[test]
+    fn a_font_inside_the_book_is_handed_out_apart() {
+        let css = sanitise(
+            "@font-face { font-family: 'Book Hand'; font-weight: 700; \
+             src: local(Arial), url('../fonts/hand.ttf?reload=1') format('truetype'), \
+             url(https://x.example/hand.woff) } p{font-family:'Book Hand'}",
+            "OEBPS/css/book.css",
+        );
+        assert_eq!(
+            css.font_faces(),
+            [FontFace {
+                family: "Book Hand".into(),
+                sources: vec!["OEBPS/fonts/hand.ttf".into()],
+                descriptors: vec![("font-weight".into(), "700".into())],
+            }]
+        );
+        assert_eq!(css.render(&mut |_| None), " p{font-family:'Book Hand'}");
+        assert!(css.resources().any(|r| r == "OEBPS/fonts/hand.ttf"));
+    }
+
+    #[test]
+    fn a_font_face_with_no_font_inside_the_book_is_dropped() {
+        for rule in [
+            "@font-face{font-family:X;src:url(https://x.example/a.woff)}",
+            "@font-face{font-family:X;src:local(Arial)}",
+            "@font-face{src:url(a.ttf)}",
+            "@font-face{font-family:X;src:url(../../../../etc/a.ttf)}",
+        ] {
+            assert!(
+                sanitise(rule, "OEBPS/a.css").font_faces().is_empty(),
+                "{rule}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_descriptor_carrying_syntax_is_dropped() {
+        let css = sanitise(
+            "@font-face{font-family:X;src:url(a.ttf);font-style:italic;font-weight:bold}x{}}",
+            "OEBPS/a.css",
+        );
+        let face = css.font_faces().first().unwrap();
+        assert_eq!(face.descriptors.len(), 2);
+        let css = sanitise(
+            r#"@font-face{font-family:X;src:url(a.ttf);font-style:"a;b"}"#,
+            "OEBPS/a.css",
+        );
+        assert!(css.font_faces().first().unwrap().descriptors.is_empty());
     }
 
     #[test]
