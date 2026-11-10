@@ -5596,6 +5596,17 @@ fn Player(
     let mut autoplay_refused = use_signal(|| false);
     // How "Up next" was last shown, for its decision line.
     let up_next_mode = use_hook(|| Rc::new(Cell::new(None::<&'static str>)));
+    // Its own loop: a queue hint the server is slow to answer must not keep
+    // Tap to start hidden (038 FR-407).
+    use_future(move || async move {
+        loop {
+            platform::sleep_ms(1_000).await;
+            let refused = platform::autoplay_blocked() && media.peek().paused;
+            if *autoplay_refused.peek() != refused {
+                autoplay_refused.set(refused);
+            }
+        }
+    });
     use_future({
         let p = Rc::clone(&p);
         move || {
@@ -5606,10 +5617,6 @@ fn Player(
                 let (mut since, mut asked_at, mut gave_up) = (None::<u64>, 0u64, false);
                 loop {
                     platform::sleep_ms(1_000).await;
-                    let refused = platform::autoplay_blocked() && media.peek().paused;
-                    if *autoplay_refused.peek() != refused {
-                        autoplay_refused.set(refused);
-                    }
                     let now = now_ms_u64();
                     if !(media.peek().loading && failed.peek().is_none()) {
                         (since, gave_up) = (None, false);
