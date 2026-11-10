@@ -58,12 +58,28 @@ pub fn AccountMenu(
             },
             on_confirm: move |ask: bool| confirming.set(ask),
             on_sign_out: move |()| {
+                // A book kept since the menu opened (an automatic keep) is
+                // counted now: the one-step sign-out is only for none.
+                if !*confirming.peek() {
+                    let now = kept_books.call(());
+                    if must_ask(now) {
+                        kept.set(now);
+                        confirming.set(true);
+                        return;
+                    }
+                }
                 confirming.set(false);
                 open.set(false);
                 on_sign_out.call(());
             },
         }
     }
+}
+
+/// Whether Sign out must ask before removing what `count` says is kept:
+/// any book, or a record that could not be read (it may still hold some).
+pub fn must_ask(count: Option<usize>) -> bool {
+    count != Some(0)
 }
 
 /// What Sign out says before removing `count` kept books; `None` when the
@@ -180,8 +196,10 @@ pub fn AccountMenuView(
                             r#type: "button",
                             role: "menuitem",
                             onclick: move |e: MouseEvent| {
-                                if kept_books != Some(0) {
-                                    e.stop_propagation();
+                                // The menu closes itself on sign-out; a click
+                                // that turns into an ask must not close it.
+                                e.stop_propagation();
+                                if must_ask(kept_books) {
                                     on_confirm.call(true);
                                 } else {
                                     on_sign_out.call(());
@@ -292,6 +310,15 @@ mod tests {
             unknown.contains("removes any books kept on this device"),
             "{unknown}"
         );
+    }
+
+    /// A book kept after the menu opened is counted when Sign out is
+    /// pressed: only a fresh count of none signs out at once.
+    #[test]
+    fn sign_out_asks_unless_a_fresh_count_is_none() {
+        assert!(!must_ask(Some(0)));
+        assert!(must_ask(Some(1)));
+        assert!(must_ask(None), "an unreadable record may still hold books");
     }
 
     #[test]
