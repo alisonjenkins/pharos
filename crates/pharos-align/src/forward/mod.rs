@@ -8,7 +8,7 @@ pub mod vulkan;
 
 use crate::ctc::Emission;
 use crate::line::align_line;
-use crate::service::{Model, ModelError};
+use crate::service::{DeviceUsed, Model, ModelError};
 use crate::tokens::CLASSES;
 
 /// The model's 28 output labels; the star (`tokens::STAR`) is appended after.
@@ -69,6 +69,8 @@ pub struct CpuAligner {
     pub model: cpu::CpuModel,
     /// Most samples one forward pass holds; activations grow with it.
     pub batch_samples: usize,
+    /// Why the CPU runs the pass: R11's start reason, or a GPU fallback's.
+    pub reason: String,
 }
 
 impl CpuAligner {
@@ -81,14 +83,15 @@ impl CpuAligner {
             "aligner.forward",
             samples,
             windows = windows.len(),
-            aligner.device = "cpu"
+            aligner.device = "cpu",
+            aligner.device_reason = %self.reason
         )
         .in_scope(|| self.model.logits(&refs))
     }
 }
 
 /// CTC over one window's logits.
-fn spans(
+pub(crate) fn spans(
     logits: &[f32],
     samples: usize,
     tokens: &[String],
@@ -105,6 +108,13 @@ fn spans(
 }
 
 impl Model for CpuAligner {
+    fn device(&self) -> DeviceUsed {
+        DeviceUsed {
+            device: "cpu",
+            reason: self.reason.clone(),
+        }
+    }
+
     fn align(
         &mut self,
         pcm: &[f32],

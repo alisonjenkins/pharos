@@ -108,6 +108,8 @@ async fn align(
         aligner.words_aligned = tracing::field::Empty,
         aligner.decode_ms = tracing::field::Empty,
         aligner.model_ms = tracing::field::Empty,
+        aligner.device = tracing::field::Empty,
+        aligner.device_reason = tracing::field::Empty,
     );
     set_remote_parent(&span, req.headers());
     let fail = |status: StatusCode, message: String| {
@@ -159,7 +161,8 @@ fn run_song(
 ) -> Result<Aligned, SongError> {
     let started = Instant::now();
     let n_lines = lines.len();
-    let result = engine.align_song(rel_path, full_path, lines);
+    let (result, used) = engine.align_song_on(rel_path, full_path, lines);
+    let (device, device_reason) = used.map_or(("none", String::new()), |u| (u.device, u.reason));
     let elapsed = started.elapsed();
     let duration_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
     metrics::histogram!(SONG_SECONDS).record(elapsed.as_secs_f64());
@@ -170,6 +173,8 @@ fn run_song(
             span.record("aligner.words_aligned", a.words_aligned);
             span.record("aligner.decode_ms", a.phases.decode_ms());
             span.record("aligner.model_ms", a.phases.model_ms());
+            span.record("aligner.device", device);
+            span.record("aligner.device_reason", device_reason.as_str());
             tracing::info!(
                 path = %rel_path,
                 lines = n_lines,
@@ -178,6 +183,8 @@ fn run_song(
                 duration_ms,
                 decode_ms = a.phases.decode_ms(),
                 model_ms = a.phases.model_ms(),
+                device = %device,
+                device_reason = %device_reason,
                 "song aligned"
             );
             "ok"
@@ -189,7 +196,17 @@ fn run_song(
                 SongError::Ffmpeg(_) => "ffmpeg",
                 SongError::Internal(_) => "internal",
             };
-            tracing::warn!(path = %rel_path, failed = %failed, duration_ms, error = %e, "song failed");
+            span.record("aligner.device", device);
+            span.record("aligner.device_reason", device_reason.as_str());
+            tracing::warn!(
+                path = %rel_path,
+                failed = %failed,
+                duration_ms,
+                device = %device,
+                device_reason = %device_reason,
+                error = %e,
+                "song failed"
+            );
             failed
         }
     };
