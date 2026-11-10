@@ -37,7 +37,7 @@ use super::playback::{
     choose_engine, crossfade_ms, device_class, engine_verdict, fade_volume, format_tier_drop,
     max_bitrate_label, offered_subtitles, parse_crossfade, parse_max_bitrate, parse_tier_drop,
     parse_volume_setting, pick_mse_engine, position_at, preview_set, restart_styled,
-    rust_subtitle_url, shown_font_urls, source_of_styled, start_ms, starting_tier,
+    rust_subtitle_url, seek_bar_line, shown_font_urls, source_of_styled, start_ms, starting_tier,
     starting_tier_line, styled_subtitle_signals, styled_subtitle_url, styled_track_url,
     subtitle_switch, tier_drop_line, tier_drop_report, tier_spared_line, up_next_at,
     volume_setting, DeviceClass, EffectsLevel, Engine, EngineReason, Fatal, LibraryTransition,
@@ -6258,6 +6258,7 @@ fn Player(
                 Control::Seek(ms) => seek(ms),
                 Control::SeekAt(x) => {
                     if let Some(ms) = position_at(x, platform::element_width(SEEK_ID), total) {
+                        platform::info(&seek_bar_line(state.position_ms, ms));
                         seek(ms);
                     }
                 }
