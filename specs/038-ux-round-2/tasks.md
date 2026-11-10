@@ -18,14 +18,14 @@ Id blocks (bugs and invariants are written with the fix):
 
 ## G1 — Home rails and resume rules (server)
 
-- [ ] T038-100 Reproduce on a seeded library: an unstarted show in Next Up, a started one missing, one new season filling a latest rail, a 5 s play in Continue Watching. Record which existing signal shows each, if any.
-- [ ] T038-101 Add `pharos_next_up_total{outcome}` and `pharos_play_stop_total{outcome,reason}`; assert both in tests and watch them fail when disarmed.
-- [ ] T038-102 Tests pinning the Next Up rule: started series only, episode after the last played, season 0 rule, order by last play, nothing repeated from Continue Watching (FR-101–FR-104).
-- [ ] T038-103 Next Up driven from the viewer's `user_data` rows (FR-105); run `just test-postgres`.
-- [ ] T038-104 ADR: the Next Up rule.
+- [x] T038-100 Reproduce on a seeded library: an unstarted show in Next Up, a started one missing, one new season filling a latest rail, a 5 s play in Continue Watching. Record which existing signal shows each, if any.
+- [x] T038-101 Add `pharos_next_up_total{outcome}` and `pharos_play_stop_total{outcome,reason}`; assert both in tests and watch them fail when disarmed.
+- [x] T038-102 Tests pinning the Next Up rule: started series only, episode after the last played, season 0 rule, order by last play, nothing repeated from Continue Watching (FR-101–FR-104).
+- [x] T038-103 Next Up driven from the viewer's `user_data` rows (FR-105); run `just test-postgres`.
+- [x] T038-104 ADR: the Next Up rule.
 - [ ] T038-105 Latest rails grouped by series and album with a new-children count (FR-106); schema change if the count travels on the wire (get the schema number from the merge queue).
 - [ ] T038-106 [ALISON] Minimum resume point setting and rule (FR-107), with its ADR.
-- [ ] T038-107 Stop path reports its failures (FR-108).
+- [x] T038-107 Stop path reports its failures (FR-108).
 - [ ] T038-108 [ALISON] Resume tiles play at once (FR-109).
 
 ## G2 — Show page and browse
