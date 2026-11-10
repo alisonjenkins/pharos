@@ -990,6 +990,15 @@ pub fn on_page_hide(_on_hide: impl FnMut() + 'static) -> PageHide {
     PageHide
 }
 
+pub struct PageLifecycle;
+
+pub fn on_page_lifecycle(
+    _on_hidden: impl FnMut() + 'static,
+    _on_restored: impl FnMut() + 'static,
+) -> PageLifecycle {
+    PageLifecycle
+}
+
 /// hls.js for every HLS stream; the Rust engine (spec 031) is the web
 /// build's, so it hands over to hls.js here. Video never direct-plays
 /// (`tv_page::NO_DIRECT_PLAY`), but a song's stream is a plain file, so a
