@@ -4,6 +4,7 @@
 //! the page keeps its CSS look; the reason is returned for the log.
 
 pub mod catalogue;
+pub mod resolution;
 pub mod subtitles;
 #[cfg(all(feature = "web", target_arch = "wasm32"))]
 mod webgl;

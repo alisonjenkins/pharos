@@ -15,6 +15,7 @@ use web_sys::{
 };
 
 use super::catalogue::{fragment_source, Program, VERTEX};
+use super::resolution::Resolution;
 use super::{Fallback, Frame, Surface, DATA_ROWS, DATA_WIDTH};
 
 /// Device pixels per CSS pixel at most: past this a fill-rate-bound headset
@@ -69,6 +70,8 @@ pub struct WebglSurface {
     /// Kept to release the context on drop: browsers cap live contexts
     /// (~16) and free a dropped one only when it is garbage collected.
     lose: Option<web_sys::WebglLoseContext>,
+    /// The share of the pixel ratio drawn at (B1218, V1178).
+    resolution: Resolution,
 }
 
 pub fn open(canvas_id: &str, program: Program) -> Result<Box<dyn Surface>, Fallback> {
@@ -148,6 +151,7 @@ pub fn open(canvas_id: &str, program: Program) -> Result<Box<dyn Surface>, Fallb
         context,
         listeners,
         lose,
+        resolution: Resolution::default(),
     }))
 }
 
@@ -261,12 +265,24 @@ fn compile_and_link(
 }
 
 impl WebglSurface {
-    /// Match the drawing buffer to the canvas's box, capped at
-    /// [`MAX_PIXEL_RATIO`]; returns the buffer size.
-    fn fit(&self) -> (i32, i32) {
+    /// Match the drawing buffer to the canvas's box at the device's pixel
+    /// ratio, capped at [`MAX_PIXEL_RATIO`] and scaled down while frames run
+    /// slow (B1218); returns the buffer size.
+    fn fit(&mut self) -> (i32, i32) {
+        let now = js_sys::Date::now();
+        if let Some(l) = self.resolution.frame(now) {
+            web_sys::console::info_1(
+                &format!(
+                    "pharos: visualiser resolution lowered program={:?} scale_from={:.2} scale_to={:.2} median_frame_ms={:.1}",
+                    self.program, l.from, l.to, l.median_ms
+                )
+                .into(),
+            );
+        }
         let ratio = web_sys::window()
             .map_or(1.0, |w| w.device_pixel_ratio())
-            .min(MAX_PIXEL_RATIO);
+            .min(MAX_PIXEL_RATIO)
+            * self.resolution.scale();
         let width = (f64::from(self.canvas.client_width()) * ratio)
             .round()
             .max(1.0) as u32;
