@@ -206,7 +206,9 @@ pub fn set_title(_title: &str) {}
 /// The page's path, its query left off: routing reads this, as it reads
 /// `location.pathname` on the web.
 pub fn current_path() -> String {
-    super::route::split_query(lock(&PATHS).current()).0.to_owned()
+    super::route::split_query(lock(&PATHS).current())
+        .0
+        .to_owned()
 }
 
 /// The whole address on top, query included.
@@ -1001,7 +1003,9 @@ pub fn scroll_tile_to(_at: u32, _top: f64) -> bool {
 
 /// The page's query, `?` included, as `location.search` on the web.
 pub fn current_search() -> String {
-    super::route::split_query(lock(&PATHS).current()).1.to_owned()
+    super::route::split_query(lock(&PATHS).current())
+        .1
+        .to_owned()
 }
 
 pub struct ScrollWatch;
