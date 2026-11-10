@@ -9,6 +9,10 @@
 //   Reader Paged.pdf     five pages ("Page 1 of 5" in large type, and a row
 //                        of squares counting the page), written by hand
 //                        below: Helvetica, no library.
+//   Reader Second.epub   the same book under another title, for the cases that
+//                        need two books (last-N, spec 036).
+//   Reader Sized A/B/C.epub  about 800 KiB each, for the space budget cases
+//                        (spec 036): two fit in 2 MiB, three do not.
 //   Reader Locked.azw3   bytes the Kindle converter cannot read, which the
 //                        scanner indexes as an unreadable book.
 //
@@ -85,11 +89,14 @@ function zip(entries) {
 
 const CHAPTERS = 3;
 const PARAGRAPHS = 40;
+// Each paragraph of 70 tokens is about 0.7 kB; 380 of them in each of three
+// chapters is about 800 KiB.
+const SIZED_PARAGRAPHS = 380;
 const WORDS = 70;
 
-function chapter(c) {
+function chapter(c, count) {
   const paragraphs = [];
-  for (let p = 0; p < PARAGRAPHS; p++) {
+  for (let p = 0; p < count; p++) {
     const words = [];
     for (let w = 0; w < WORDS; w++) words.push(`zq${c}x${p}x${w}`);
     paragraphs.push(`<p>${words.join(" ")}</p>`);
@@ -101,7 +108,7 @@ function chapter(c) {
   );
 }
 
-function epub() {
+function epub(title = "Reader Fixture", count = PARAGRAPHS) {
   const items = [];
   const refs = [];
   const nav = [];
@@ -122,8 +129,8 @@ function epub() {
       `<?xml version="1.0" encoding="UTF-8"?>` +
         `<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="uid">` +
         `<metadata xmlns:dc="http://purl.org/dc/elements/1.1/">` +
-        `<dc:title>Reader Fixture</dc:title><dc:creator>Ada Lovelace</dc:creator>` +
-        `<dc:language>en</dc:language><dc:identifier id="uid">urn:pharos:reader-fixture</dc:identifier></metadata>` +
+        `<dc:title>${title}</dc:title><dc:creator>Ada Lovelace</dc:creator>` +
+        `<dc:language>en</dc:language><dc:identifier id="uid">urn:pharos:${title.toLowerCase().replace(/ /g, "-")}</dc:identifier></metadata>` +
         `<manifest><item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>` +
         `${items.join("")}</manifest><spine>${refs.join("")}</spine></package>`,
     ],
@@ -133,7 +140,7 @@ function epub() {
         `<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops"><head><title>Contents</title></head>` +
         `<body><nav epub:type="toc"><ol>${nav.join("")}</ol></nav></body></html>`,
     ],
-    ...Array.from({ length: CHAPTERS }, (_, c) => [`OEBPS/c${c}.xhtml`, chapter(c)]),
+    ...Array.from({ length: CHAPTERS }, (_, c) => [`OEBPS/c${c}.xhtml`, chapter(c, count)]),
   ]);
 }
 
@@ -176,5 +183,9 @@ if (!out) {
 }
 fs.mkdirSync(out, { recursive: true });
 fs.writeFileSync(path.join(out, "Reader Fixture.epub"), epub());
+fs.writeFileSync(path.join(out, "Reader Second.epub"), epub("Reader Second"));
+for (const x of ["A", "B", "C"]) {
+  fs.writeFileSync(path.join(out, `Reader Sized ${x}.epub`), epub(`Reader Sized ${x}`, SIZED_PARAGRAPHS));
+}
 fs.writeFileSync(path.join(out, "Reader Paged.pdf"), pdf());
 fs.writeFileSync(path.join(out, "Reader Locked.azw3"), Buffer.from("not a mobi file: DRM stand-in\n"));
