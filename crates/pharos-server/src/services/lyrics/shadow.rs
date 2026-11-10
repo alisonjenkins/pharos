@@ -200,6 +200,18 @@ impl Shadow {
     }
 }
 
+/// Puts every `outcome` × `path` series of [`SHADOW_TOTAL`] on `/metrics` at
+/// zero, as `obs::register_static_series` does for the server's own, so
+/// `increase()` and `rate()` see each series' first comparison.
+pub fn register_series() {
+    for source in Source::ALL {
+        for outcome in Outcome::ALL {
+            metrics::counter!(SHADOW_TOTAL, "outcome" => outcome.label(), "path" => source.label())
+                .increment(0);
+        }
+    }
+}
+
 fn record(outcome: Outcome, source: Source) {
     metrics::counter!(SHADOW_TOTAL, "outcome" => outcome.label(), "path" => source.label())
         .increment(1);
