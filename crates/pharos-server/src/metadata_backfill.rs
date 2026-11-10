@@ -3140,13 +3140,29 @@ where
     // of them anime — Death Note, Dragon Ball GT, Code Geass — which TMDB
     // carries. A show marked `none` has no poster, so its tile falls back to a
     // representative episode and then to an extracted frame.
+    // B990 — the year the show's own files state, as the survey read it
+    // (B980): the stored column is empty for a bare folder until the scan's
+    // split pass writes it, and a search without it hands a remake's files
+    // to the original's exact name.
+    let rows = match store.series_episodes(&cand.series_key).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                series_key = %cand.series_key,
+                "T9-series metadata backfill: local episodes unreadable; searching with the stored year"
+            );
+            Vec::new()
+        }
+    };
+    let year = stated_year(&cand, &rows);
     let mut outcome = None;
     // A provider BLIP is not a provider saying no. If any attempt was
     // transient we leave the row untouched for the next pass rather than
     // freezing the show as `none` for the whole TTL.
     let mut transient = None;
     if let Some(tv) = providers.tvdb {
-        match resolve_series(store, tv, "tvdb", bg_io, cache, cfg, &cand, lists).await {
+        match resolve_series(store, tv, "tvdb", bg_io, cache, cfg, &cand, year, lists).await {
             SeriesAttempt::Hit(h) => outcome = Some(h),
             SeriesAttempt::Transient(d) => transient = Some(d),
             SeriesAttempt::NoMatch => {}
@@ -3155,7 +3171,7 @@ where
     let mut fell_back = false;
     if outcome.is_none() {
         if let Some(tm) = providers.tmdb {
-            match resolve_series(store, tm, "tmdb", bg_io, cache, cfg, &cand, lists).await {
+            match resolve_series(store, tm, "tmdb", bg_io, cache, cfg, &cand, year, lists).await {
                 SeriesAttempt::Hit(h) => {
                     outcome = Some(h);
                     fell_back = true;
@@ -3200,6 +3216,21 @@ where
             .await?;
         return Ok(false);
     };
+    if year != cand.series_year {
+        tracing::info!(
+            series_key = %cand.series_key,
+            provider = hit.provider,
+            year,
+            stored_year = cand.series_year,
+            chosen = hit.external_id.as_str(),
+            decided_by = hit
+                .decision
+                .decided_by
+                .map_or("none", pharos_core::MatchDecidedBy::label),
+            "series match: matched with the year the show's files state"
+        );
+        record_rematch(RematchStep::StatedYear);
+    }
     if fell_back {
         tracing::info!(
             series = %cand.series_name,
@@ -3671,6 +3702,7 @@ async fn resolve_series<E, S>(
     cache: &ImageCache,
     cfg: &MetadataConfig,
     cand: &SeriesMatchCandidate,
+    year: Option<u32>,
     lists: &mut EpisodeLists,
 ) -> SeriesAttempt
 where
@@ -3685,7 +3717,7 @@ where
         enricher,
         &cand.series_key,
         &cand.series_name,
-        cand.series_year,
+        year,
         &[],
         bg_io,
         cfg,
@@ -3700,7 +3732,7 @@ where
         provider,
         &cand.series_key,
         &cand.series_name,
-        cand.series_year,
+        year,
         &decision,
     );
     let Some(chosen) = decision.chosen.clone() else {
@@ -6449,6 +6481,11 @@ mod tests {
 
         let s = store().await;
         put_bare_episode(&s, 1, "Show B", "/tv/Show B").await;
+        // No year in the file's name either: a stated year would tell the
+        // two shows apart (B990).
+        let mut item = s.get(1).await.unwrap();
+        item.path = item.path.to_string_lossy().replace(" (2003)", "").into();
+        s.put(item).await.unwrap();
         let (_td, cache) = cache();
         let tvdb = FakeEnricher::tvdb()
             .with_search(vec![
@@ -8358,5 +8395,69 @@ mod tests {
             .unwrap_or_else(|| panic!("no retry line in {text}"));
         assert!(line.contains("year=2003"), "{line}");
         assert!(line.contains("920003 (2005)"), "{line}");
+    }
+
+    /// B990 — a bare folder whose files state the remake's year, stored on
+    /// the original, is re-asked as `year_mismatch`; under `apply` the
+    /// re-match searches with the year the files state, so the remake (named
+    /// with that year, dated two years later) wins over the original's bare
+    /// exact name.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_year_mismatch_re_ask_re_matches_with_the_files_year() {
+        use metrics_util::debugging::DebuggingRecorder;
+        let recorder = DebuggingRecorder::new();
+        let snap = pharos_test_metrics::snapshotter(&recorder);
+        let _metrics = metrics::set_default_local_recorder(&recorder);
+        let (logs, _log) = log_capture();
+        let s = store().await;
+        const SHOW: &str = "/tv/Show A";
+        put_show_episode(&s, 1, SHOW, (1, 1), "Show A (2003)").await;
+        put_show_episode(&s, 2, SHOW, (1, 2), "Show A (2003)").await;
+        pin(&s, SHOW, "920010", NOW).await;
+        let mut row = series_row(&s, SHOW).await;
+        // 1978-09-17
+        row.premiere_date = Some(274_838_400);
+        s.upsert_series_metadata(row).await.unwrap();
+        set_version(&s, TV_MATCH_VERSION_KEY, "1").await;
+        let tvdb = FakeEnricher::tvdb()
+            .with_year_search(vec![])
+            .with_search(vec![
+                ("920010", "Show A", Some(1978)),
+                ("920011", "Show A (2003)", Some(2005)),
+                ("920012", "Show A: The Return", Some(1980)),
+            ])
+            .with_detail(enriched_overview("A fleet."));
+        let (_td, cache) = cache();
+
+        gate(&s, &tvdb, &apply_cfg()).await;
+        assert_eq!(
+            s.series_needing_match(10, NOW - 1).await.unwrap()[0].series_key,
+            SHOW,
+            "re-asked"
+        );
+        series_pass(&s, &cache, &tvdb).await;
+
+        let row = series_row(&s, SHOW).await;
+        assert_eq!(row.match_external_id.as_deref(), Some("920011"));
+        assert!(tvdb.years().contains(&Some(2003)), "{:?}", tvdb.years());
+        let mut pending = pending_ids(&s).await;
+        pending.sort_unstable();
+        assert_eq!(pending, [1, 2], "the match change marks its episodes");
+        assert_eq!(
+            counter_value(
+                &snap,
+                "pharos_series_identity_repair_rematch_total",
+                &[("step", "stated_year")]
+            ),
+            1
+        );
+        let text = logs.text();
+        let line = text
+            .lines()
+            .find(|l| l.contains("with the year the show's files state"))
+            .unwrap_or_else(|| panic!("no stated-year line in {text}"));
+        for want in ["year=2003", "chosen=\"920011\""] {
+            assert!(line.contains(want), "{want} missing from {line}");
+        }
     }
 }
