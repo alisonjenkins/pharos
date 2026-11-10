@@ -168,8 +168,13 @@ pub(crate) fn record(
 /// kept (ADR-0030), is served the primary rather than refused: a stale id
 /// after a rescan must not stop playback, and the `requested`/`served` pair
 /// says it happened.
+///
+/// A split film's part is served only to the HLS routes its film's playlists
+/// address (V1154). Anywhere else, such as PlaybackInfo, it is the whole film,
+/// so no client is offered one part to direct play (V1155).
 pub(crate) fn select(route: Route, mut item: MediaItem, raw: Option<&str>) -> MediaItem {
     let (requested, alt) = classify(&item, raw);
+    let alt = alt.filter(|_| requested != Requested::Part || route == Route::Hls);
     let Some(alt) = alt else {
         record(route, &item, raw, requested, Served::Primary);
         return item;
@@ -279,6 +284,24 @@ mod tests {
         assert_eq!(got.path, std::path::PathBuf::from("/m/Film - 3D.HSBS.mkv"));
         assert_eq!(got.probe.duration_ms, Some(5_000));
         assert_eq!(got.edition.as_deref(), Some("3d-hsbs"));
+    }
+
+    /// V1154, V1155 — a part is its film's file on the HLS routes only;
+    /// PlaybackInfo naming a part gets the whole film.
+    #[test]
+    fn a_part_is_served_only_to_its_films_playlists() {
+        let mut item = item_with_edition();
+        item.probe.alternate_sources[0].part = Some(2);
+        let raw = format!(
+            "{}-3d-hsbs",
+            pharos_jellyfin_api::dto::wire_item_id(item.id)
+        );
+        let hls = select(Route::Hls, item.clone(), Some(&raw));
+        assert_eq!(hls.edition.as_deref(), Some("3d-hsbs"));
+        let info = select(Route::PlaybackInfo, item, Some(&raw));
+        assert_eq!(info.edition, None);
+        assert_eq!(info.path, std::path::PathBuf::from("/m/Film.mkv"));
+        assert_eq!(info.probe.parts().len(), 1, "the film keeps its parts");
     }
 
     #[test]
