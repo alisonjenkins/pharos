@@ -8682,6 +8682,7 @@ mod tests {
                 ("920001", "Show A", Some(1978)),
                 ("920002", "Show A", Some(2009)),
                 ("920003", "Show A", Some(2005)),
+                ("920004", "Show A", Some(2004)),
             ])
             .with_detail(enriched_overview("A fleet."));
 
@@ -8690,7 +8691,11 @@ mod tests {
         assert_eq!(tvdb.years(), [Some(2003), None]);
         let row = series_row(&s, SHOW).await;
         assert_eq!(row.match_source.as_deref(), Some("search"));
-        assert_eq!(row.match_external_id.as_deref(), Some("920003"));
+        // Both near shows read as 2003 and tie: with no episode list to
+        // tell them apart, the nearer year goes first and the call is
+        // flagged as close.
+        assert_eq!(row.match_external_id.as_deref(), Some("920004"));
+        assert_eq!(row.match_flag.as_deref(), Some(AMBIGUOUS_FLAG));
         assert_eq!(
             counter_value(
                 &snap,
