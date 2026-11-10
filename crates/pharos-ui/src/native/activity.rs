@@ -121,6 +121,108 @@ fn join_names(names: &[String]) -> String {
     }
 }
 
+/// How long a status note over the video (a group ended, a rejoin failed)
+/// stays before it gets out of the picture's way (spec 038 FR-501).
+pub const NOTE_MS: u64 = 8_000;
+/// How long "Everyone's ready" shows once the group stops waiting.
+pub const READY_MS: u64 = 2_000;
+/// How long Leave can be undone (FR-505).
+pub const UNDO_LEAVE_MS: u64 = 5_000;
+
+/// When a note was first shown, so it hides `for_ms` after; a different
+/// text starts again.
+#[derive(Debug, Default)]
+pub struct NoteTimer {
+    since: Option<(String, u64)>,
+}
+
+/// What [`NoteTimer::show`] decided.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NoteShown {
+    pub visible: bool,
+    /// The text is new: arm one timer to redraw without it.
+    pub arm: bool,
+}
+
+impl NoteTimer {
+    pub fn show(&mut self, text: Option<&str>, now_ms: u64, for_ms: u64) -> NoteShown {
+        let Some(text) = text else {
+            self.since = None;
+            return NoteShown {
+                visible: false,
+                arm: false,
+            };
+        };
+        match &self.since {
+            Some((shown, at)) if shown == text => NoteShown {
+                visible: now_ms.saturating_sub(*at) < for_ms,
+                arm: false,
+            },
+            _ => {
+                self.since = Some((text.to_owned(), now_ms));
+                NoteShown {
+                    visible: true,
+                    arm: true,
+                }
+            }
+        }
+    }
+}
+
+/// The pill over the video while the group waits on someone (FR-502).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WaitPill {
+    Waiting(String),
+    Ready,
+}
+
+impl WaitPill {
+    pub fn text(&self) -> String {
+        match self {
+            Self::Waiting(names) => names.clone(),
+            Self::Ready => "Everyone's ready".to_owned(),
+        }
+    }
+}
+
+/// Holds the pill: the wait while anyone is buffering, then "ready" for
+/// [`READY_MS`] once nobody is.
+#[derive(Debug, Default)]
+pub struct WaitTracker {
+    ready_at: Option<u64>,
+    waited: bool,
+}
+
+impl WaitTracker {
+    /// The pill for `waiting` (names) at `now_ms`, and whether a timer must
+    /// be armed to take a "ready" pill down.
+    pub fn pill(&mut self, waiting: &[String], now_ms: u64) -> (Option<WaitPill>, bool) {
+        if !waiting.is_empty() {
+            self.waited = true;
+            self.ready_at = None;
+            let line = line(&Event {
+                by: None,
+                action: Action::Waiting {
+                    names: waiting.to_vec(),
+                },
+            });
+            return (Some(WaitPill::Waiting(line)), false);
+        }
+        if self.waited {
+            self.waited = false;
+            self.ready_at = Some(now_ms);
+            return (Some(WaitPill::Ready), true);
+        }
+        match self.ready_at {
+            Some(at) if now_ms.saturating_sub(at) < READY_MS => (Some(WaitPill::Ready), false),
+            _ => {
+                self.ready_at = None;
+                (None, false)
+            }
+        }
+    }
+}
+
 /// The newest [`LOG_LINES`] lines, each with when it arrived.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ActivityLog {
@@ -170,6 +272,45 @@ mod tests {
 
     fn group(action: Action) -> Event {
         Event { by: None, action }
+    }
+
+    #[test]
+    fn a_note_shows_for_its_time_and_a_new_text_starts_again() {
+        let mut timer = NoteTimer::default();
+        let first = timer.show(Some("Ended"), 1_000, NOTE_MS);
+        assert!(first.visible && first.arm);
+        let later = timer.show(Some("Ended"), 1_000 + NOTE_MS - 1, NOTE_MS);
+        assert!(later.visible && !later.arm, "one timer per text");
+        assert!(!timer.show(Some("Ended"), 1_000 + NOTE_MS, NOTE_MS).visible);
+        assert!(timer.show(Some("Other"), 20_000, NOTE_MS).arm);
+        assert!(!timer.show(None, 20_001, NOTE_MS).visible);
+        assert!(
+            timer.show(Some("Other"), 20_002, NOTE_MS).arm,
+            "cleared, then back"
+        );
+    }
+
+    #[test]
+    fn the_wait_pill_holds_while_anyone_buffers_then_says_ready() {
+        let mut wait = WaitTracker::default();
+        assert_eq!(wait.pill(&[], 0), (None, false), "never waited");
+        let names = vec!["Sam".to_owned()];
+        assert_eq!(
+            wait.pill(&names, 1_000),
+            (Some(WaitPill::Waiting("Waiting for Sam".into())), false)
+        );
+        assert_eq!(
+            wait.pill(&names, 60_000).0,
+            Some(WaitPill::Waiting("Waiting for Sam".into())),
+            "no time limit on a wait"
+        );
+        assert_eq!(wait.pill(&[], 61_000), (Some(WaitPill::Ready), true));
+        assert_eq!(
+            wait.pill(&[], 61_000 + READY_MS - 1).0,
+            Some(WaitPill::Ready)
+        );
+        assert_eq!(wait.pill(&[], 61_000 + READY_MS), (None, false));
+        assert_eq!(WaitPill::Ready.text(), "Everyone's ready");
     }
 
     #[test]
