@@ -536,6 +536,10 @@ pub fn StageBar(
     /// Music's queue button (B900/V852); none for a video.
     #[props(default)]
     queue: Option<QueueButton>,
+    /// Whole seconds until the next video plays, while "Up next" counts
+    /// down: one line with Cancel in place of the card (038 FR-406).
+    #[props(default)]
+    up_next_in: Option<u64>,
 ) -> Element {
     let media = MediaState {
         position_ms: live_position.map_or(media.position_ms, |s| s()),
@@ -621,6 +625,18 @@ pub fn StageBar(
                     p { class: "pharos-stage-title", title: "{title}", "{title}" }
                     if let Some(message) = error {
                         p { class: "pharos-stage-error", role: "alert", "{message}" }
+                    } else if let Some(seconds) = up_next_in {
+                        p { class: "pharos-stage-next",
+                            span { role: "timer", "Next in {seconds} s" }
+                            " · "
+                            button {
+                                class: "pharos-stage-next-cancel",
+                                r#type: "button",
+                                aria_label: "Cancel up next",
+                                onclick: move |_| on_action.call(StageAction::Player(Control::CancelNext)),
+                                "Cancel"
+                            }
+                        }
                     }
                 }
                 div { class: "pharos-stage-transport", role: "group", aria_label: "Transport",
@@ -1122,6 +1138,38 @@ mod tests {
         let again = stage.key();
         stage.follow(&Route::Watch(ItemRef::Real(7)));
         assert_eq!(stage.key(), again, "the same route mounts nothing new");
+    }
+
+    /// 038 FR-406, V1222: the compact player's Up next is one line in its
+    /// bar, with Cancel. Disarm check: without the line this fails.
+    #[test]
+    fn the_compact_bar_counts_down_to_the_next_video_in_one_line() {
+        let mut dom = VirtualDom::new_with_props(
+            move |()| {
+                use_context_provider(|| StageCtx(Signal::new(Stage::default())));
+                rsx! {
+                    StageBar {
+                        view: View::Floating,
+                        title: "An episode".to_owned(),
+                        image: None,
+                        media: MediaState::default(),
+                        runtime_ms: 1_320_000,
+                        pip: false,
+                        previous: None,
+                        next: None,
+                        error: None,
+                        on_action: |_| {},
+                        up_next_in: Some(12),
+                    }
+                }
+            },
+            (),
+        );
+        dom.rebuild_in_place();
+        let html = dioxus_ssr::render(&dom);
+        assert!(html.contains("Next in 12 s"), "{html}");
+        assert!(html.contains("Cancel"), "{html}");
+        assert!(!bar(None).contains("pharos-stage-next"));
     }
 
     fn bar(queue: Option<QueueButton>) -> String {
