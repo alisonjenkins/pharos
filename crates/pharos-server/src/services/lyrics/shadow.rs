@@ -246,7 +246,7 @@ async fn ask_and_compare(
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use std::time::Duration;
@@ -274,7 +274,7 @@ mod tests {
         }
     }
 
-    fn body(a: &Aligned, version: u32) -> String {
+    pub(crate) fn body(a: &Aligned, version: u32) -> String {
         let lines: Vec<serde_json::Value> = a
             .lines
             .iter()
@@ -292,7 +292,7 @@ mod tests {
 
     /// Answers one request with `status` and `reply` once `hold` (if any)
     /// fires; the request body comes back on the receiver.
-    async fn fake(
+    pub(crate) async fn fake(
         status: u16,
         reply: String,
         hold: Option<oneshot::Receiver<()>>,
@@ -335,7 +335,7 @@ mod tests {
         (base, rx)
     }
 
-    fn counts(snapshotter: &Snapshotter) -> Vec<(String, u64)> {
+    pub(crate) fn counts(snapshotter: &Snapshotter) -> Vec<(String, u64)> {
         let mut out: Vec<(String, u64)> = snapshotter
             .snapshot()
             .into_vec()

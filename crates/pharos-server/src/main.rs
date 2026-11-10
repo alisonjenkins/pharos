@@ -1605,13 +1605,16 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
                 .aligner_media_root
                 .clone()
                 .unwrap_or_else(|| std::path::PathBuf::from("/var/lib/pharos/media"));
+            let shadow_url = cfg.lyrics.aligner_shadow_url.clone();
             tracing::info!(
                 url = %url,
+                shadow_url = shadow_url.as_deref().unwrap_or("none"),
                 media_root = %media_root.display(),
                 "lyrics: alignment on"
             );
             let aligner = pharos_server::services::lyrics::align::Aligner::start(
                 url.clone(),
+                shadow_url,
                 media_root,
                 cache_dir,
             );
