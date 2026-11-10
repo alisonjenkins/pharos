@@ -22,7 +22,7 @@ use super::kept::{
     book_key, cache_name, is_books_cache, keep_refusal, KeptBook, KeptFormat, KeptStore, Reason,
     STORE_KEY,
 };
-use super::kept_view::KeepControl;
+use super::kept_view::{KeepControl, KeptList};
 use super::platform;
 use super::reader::size_cap;
 
@@ -444,6 +444,36 @@ pub fn KeepButton(
                     busy.set(false);
                 });
             },
+        }
+    }
+}
+
+/// The list as a signal the Remove buttons update.
+fn use_store() -> (Signal<KeptStore>, EventHandler<String>) {
+    let mut store = use_signal(|| read().unwrap_or_else(|| KeptStore::new("")));
+    let on_remove = EventHandler::new(move |id: String| {
+        spawn(async move {
+            if let Err(e) = remove(&id).await {
+                platform::warn(&format!("pharos: kept remove failed item={id} error={e}"));
+            }
+            store.set(read().unwrap_or_else(|| KeptStore::new("")));
+        });
+    });
+    (store, on_remove)
+}
+
+/// Settings, On this device: the kept books, why, their size and a Remove
+/// for each.
+#[component]
+pub fn OnThisDevice() -> Element {
+    let (store, on_remove) = use_store();
+    rsx! {
+        section { class: "pharos-settings-page pharos-offline-page",
+            h2 { "On this device" }
+            p { class: "pharos-settings-lede",
+                "Books kept to read with no connection. They are removed when you sign out."
+            }
+            KeptList { store: store(), on_remove }
         }
     }
 }
