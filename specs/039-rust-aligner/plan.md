@@ -53,7 +53,7 @@ This is a port of the `cpufwd` spike with its measured choices kept.
 
 ## Chart (`charts/pharos/templates/aligner.yaml`)
 
-- The image is `ghcr.io/alisonjenkins/pharos-aligner`, unchanged. The new image replaces the old one at cutover.
+- The Rust service ships as its own image, `ghcr.io/alisonjenkins/pharos-aligner-rs` (`.#alignerRsOci`), which `aligner.shadow.image` runs. The primary keeps the Python `ghcr.io/alisonjenkins/pharos-aligner` until cutover, when `aligner.image` moves to the Rust image.
 - New values:
   - `aligner.device` (default `auto`)
   - `aligner.gpu.enabled` (default `false`)
