@@ -289,6 +289,28 @@ pub fn track_mode(rust: RustState) -> TrackMode {
     }
 }
 
+/// Whether the browser draws the picked subtitle as cues inside the
+/// `<video>`: a text track is picked, no styled track draws over it and the
+/// Rust renderer is not drawing it. Those cues are laid out in the video's
+/// box, so a crop's stretch and clip carries a bottom line into the cut
+/// bar (B1215).
+pub fn cues_in_video(text_picked: bool, styled_ready: bool, rust: RustState) -> bool {
+    text_picked && !styled_ready && track_mode(rust) == TrackMode::Showing
+}
+
+/// Why a picture crop keeps the bars above and below, if it does: a
+/// burned subtitle may sit in them (V977), and so may the browser's cues
+/// (B1215). The label goes in the crop's log line.
+pub fn rows_kept_for(burned: bool, cues_in_video: bool) -> Option<&'static str> {
+    if burned {
+        Some("burned")
+    } else if cues_in_video {
+        Some("cues")
+    } else {
+        None
+    }
+}
+
 /// Where the Rust renderer is for the picked subtitle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RustState {
@@ -310,6 +332,25 @@ mod tests {
     use pharos_subs::{Mask, MaskKind};
 
     use super::*;
+
+    #[test]
+    fn only_the_browsers_own_cues_count_as_drawn_in_the_video() {
+        use RustState::{Active, Failed, Off, Starting};
+        assert!(cues_in_video(true, false, Failed));
+        assert!(cues_in_video(true, false, Off));
+        assert!(!cues_in_video(true, false, Active));
+        assert!(!cues_in_video(true, false, Starting));
+        assert!(!cues_in_video(true, true, Failed));
+        assert!(!cues_in_video(false, false, Failed));
+    }
+
+    #[test]
+    fn the_bars_stay_for_a_burned_subtitle_or_the_browsers_cues() {
+        assert_eq!(rows_kept_for(true, true), Some("burned"));
+        assert_eq!(rows_kept_for(true, false), Some("burned"));
+        assert_eq!(rows_kept_for(false, true), Some("cues"));
+        assert_eq!(rows_kept_for(false, false), None);
+    }
 
     #[test]
     fn the_cues_glide_between_the_two_insets_instead_of_jumping() {
