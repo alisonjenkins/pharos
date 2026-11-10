@@ -21,6 +21,9 @@ and loaded by a page only when a PDF is opened, so the renderer's size
 
 hayro has no decryption, so encrypted PDFs are refused with an error. A page
 is drawn at most 16384 px on a side. The whole file is held in memory.
+A panic in the engine is caught on the host; on wasm32 it aborts and traps
+the module (its message goes to the console first), so the page must discard
+the instance and load a fresh one.
 
 ## Licence
 

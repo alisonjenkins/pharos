@@ -42,14 +42,23 @@ extern "C" {
     type PdfDoc;
     #[wasm_bindgen(constructor, js_class = "QuirePdfDocument", catch)]
     fn new(bytes: &js_sys::Uint8Array) -> Result<PdfDoc, JsValue>;
-    #[wasm_bindgen(method, js_class = "QuirePdfDocument", js_name = pageCount)]
-    fn page_count(this: &PdfDoc) -> u32;
+    #[wasm_bindgen(method, js_class = "QuirePdfDocument", js_name = pageCount, catch)]
+    fn page_count(this: &PdfDoc) -> Result<u32, JsValue>;
     #[wasm_bindgen(method, js_class = "QuirePdfDocument", js_name = pageAspect, catch)]
     fn page_aspect(this: &PdfDoc, index: u32) -> Result<f64, JsValue>;
     #[wasm_bindgen(method, js_class = "QuirePdfDocument", catch)]
     fn render(this: &PdfDoc, index: u32, height_px: u32) -> Result<web_sys::ImageData, JsValue>;
-    #[wasm_bindgen(method, js_class = "QuirePdfDocument")]
-    fn free(this: &PdfDoc);
+    #[wasm_bindgen(method, js_class = "QuirePdfDocument", catch)]
+    fn free(this: &PdfDoc) -> Result<(), JsValue>;
+}
+
+/// Whether `e` means the module itself is broken: a trap (a panic in the
+/// engine aborts, and an out-of-bounds access or an `unreachable` is a
+/// `WebAssembly.RuntimeError`) or memory that could not grow (`RangeError`).
+/// After one the instance's state cannot be trusted, so it is discarded.
+fn is_fatal(e: &JsValue) -> bool {
+    e.is_instance_of::<js_sys::WebAssembly::RuntimeError>()
+        || e.is_instance_of::<js_sys::RangeError>()
 }
 
 fn describe(e: &JsValue) -> String {
@@ -169,7 +178,8 @@ impl std::ops::Deref for Doc {
 
 impl Drop for Doc {
     fn drop(&mut self) {
-        self.0.free();
+        // A module that trapped throws from here too; nothing is left to free.
+        let _ = self.0.free();
     }
 }
 
@@ -185,6 +195,9 @@ pub struct PdfView {
     fit: Cell<PdfFit>,
     /// Bumped by every resize and turn, so a delayed task can tell it is stale.
     generation: Cell<u64>,
+    /// Set when the module trapped; the view is then done.
+    broken: Cell<bool>,
+    on_broken: Box<dyn Fn(String)>,
     resize: RefCell<Option<Closure<dyn FnMut()>>>,
 }
 
@@ -205,14 +218,19 @@ impl PdfView {
         index: usize,
         fit: PdfFit,
         id: ItemRef,
+        on_broken: Box<dyn Fn(String)>,
     ) -> Result<Rc<Self>, String> {
         let began = platform::now_ms();
         load_module().await?;
         let module_ms = platform::now_ms() - began;
-        let doc =
-            Doc(PdfDoc::new(bytes)
-                .map_err(|e| format!("The PDF cannot be read: {}", describe(&e)))?);
-        let count = doc.page_count() as usize;
+        let unusable = |e: JsValue| {
+            if is_fatal(&e) {
+                discard_module();
+            }
+            format!("The PDF cannot be read: {}", describe(&e))
+        };
+        let doc = Doc(PdfDoc::new(bytes).map_err(unusable)?);
+        let count = doc.page_count().map_err(unusable)? as usize;
         if count == 0 {
             return Err("The PDF has no pages.".to_owned());
         }
@@ -234,6 +252,8 @@ impl PdfView {
             index: Cell::new(index.min(count.saturating_sub(1))),
             fit: Cell::new(fit),
             generation: Cell::new(0),
+            broken: Cell::new(false),
+            on_broken,
             resize: RefCell::new(None),
         });
         let canvas = view.shown.borrow().clone();
@@ -264,6 +284,9 @@ impl PdfView {
     /// Shows the next or previous page. `Ok(false)` at either end of the
     /// book, `Ok(true)` once the page is shown.
     pub fn turn(self: &Rc<Self>, forward: bool) -> Result<bool, String> {
+        if self.broken.get() {
+            return Err("The PDF reader has stopped.".to_owned());
+        }
         let Some(to) = turn_to(self.index.get(), self.count, forward) else {
             return Ok(false);
         };
@@ -305,11 +328,25 @@ impl PdfView {
         self.prerender_later();
     }
 
+    /// The message for a failed call into the module. A trap ends the view:
+    /// the module is discarded (the next open loads a fresh one), the page
+    /// goes, and the reader is told so it can show the error and the download.
+    fn module_error(&self, e: &JsValue, what: &str) -> String {
+        let message = format!("{what}: {}", describe(e));
+        if is_fatal(e) && !self.broken.replace(true) {
+            discard_module();
+            self.generation.set(self.generation.get().wrapping_add(1));
+            self.host.set_text_content(None);
+            (self.on_broken)(format!("{what}, and the PDF reader has stopped."));
+        }
+        message
+    }
+
     fn layout_for(&self, index: usize) -> Result<PdfLayout, String> {
         let aspect = self
             .doc
             .page_aspect(u32::try_from(index).unwrap_or(u32::MAX))
-            .map_err(|e| describe(&e))?;
+            .map_err(|e| self.module_error(&e, "The page's size cannot be read"))?;
         let ratio = web_sys::window().map_or(1.0, |w| w.device_pixel_ratio());
         Ok(pdf_layout(
             f64::from(self.host.client_width()),
@@ -331,10 +368,9 @@ impl PdfView {
                 layout.render_height,
             )
             .map_err(|e| {
-                format!(
-                    "Page {} cannot be drawn: {}",
-                    index.saturating_add(1),
-                    describe(&e)
+                self.module_error(
+                    &e,
+                    &format!("Page {} cannot be drawn", index.saturating_add(1)),
                 )
             })?;
         canvas.set_width(image.width());

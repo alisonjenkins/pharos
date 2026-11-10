@@ -9,6 +9,15 @@ use web_sys::ImageData;
 
 use crate::PdfBook;
 
+/// Logs a panic's message to the console before the module traps, so a
+/// broken page can be told from a bug in the page.
+#[wasm_bindgen(start)]
+pub fn start() {
+    std::panic::set_hook(Box::new(|info| {
+        web_sys::console::error_1(&format!("pharos: quire-pdf panicked: {info}").into());
+    }));
+}
+
 /// An open PDF in the browser.
 #[wasm_bindgen(js_name = QuirePdfDocument)]
 pub struct Document {
