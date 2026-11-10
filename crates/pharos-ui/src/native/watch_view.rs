@@ -154,6 +154,8 @@ pub struct Controls {
     pub version: String,
     /// The speed the viewer picked; 0 (the default) is normal speed.
     pub speed: f64,
+    /// How much later than the file the subtitles show, in ms.
+    pub subtitle_delay_ms: i64,
 }
 
 /// Where playback is. Reading it with `now` in a component's body
@@ -403,6 +405,9 @@ pub enum Control {
     Quality(u64),
     /// Play at this speed, 1.0 being normal (T038-305).
     Speed(f64),
+    /// Show subtitles this many ms later (negative: earlier) than the file
+    /// says (T038-305).
+    SubtitleDelay(i64),
     /// Play the version at this place in [`Controls::versions`] from here
     /// (spec 034 US3).
     Version(usize),
@@ -978,6 +983,7 @@ pub fn WatchView(
                         picture: (eye_w, eye_h),
                         crop: bars,
                         pos,
+                        delay_ms: c.subtitle_delay_ms,
                     }
                 }
                 div { class: "pharos-watch-top",
@@ -1122,14 +1128,14 @@ pub fn WatchView(
                         TimeLabels { segments: c.segments.clone(), pos, total, scrub: Some(scrub) }
                         Volume { media, on_control }
                         span { class: "pharos-control-spacer" }
-                        // Speed waits behind it; on a narrow
+                        // Speed and subtitle delay wait behind it; on a narrow
                         // screen the menus and window-size buttons do too.
                         button {
                             id: SETTINGS_TOGGLE_ID,
                             class: "pharos-control pharos-settings-toggle",
                             r#type: "button",
                             aria_label: "Settings",
-                            title: "Speed and more",
+                            title: "Speed, subtitle delay and more",
                             aria_expanded: if sheet_open() { "true" } else { "false" },
                             aria_controls: SETTINGS_ID,
                             onclick: move |_| sheet_open.toggle(),
@@ -1198,9 +1204,14 @@ pub fn WatchView(
                             version: c.version.clone(),
                             on_pick: move |control| on_control.call(control),
                         }
-                        // Speed is set now and then, so even a
+                        // Speed and delay are set now and then, so even a
                         // wide screen keeps them behind the settings button.
                         div { class: "pharos-control-extra",
+                        SubtitleDelay {
+                            show: c.subtitle_pick.is_some(),
+                            delay_ms: c.subtitle_delay_ms,
+                            on_pick: move |control| on_control.call(control),
+                        }
                         SpeedPicker {
                             speed: c.speed,
                             in_group,
@@ -1693,6 +1704,9 @@ fn ImageSubtitles(
     picture: (u32, u32),
     crop: Option<FrameRect>,
     pos: Position,
+    /// The viewer's subtitle delay (T038-305).
+    #[props(default)]
+    delay_ms: i64,
 ) -> Element {
     let mut cues = use_signal(ImageCues::default);
     use_future(move || {
@@ -1744,7 +1758,7 @@ fn ImageSubtitles(
             div {
                 class: "pharos-image-subs-canvas",
                 style: "width: min(100cqw, calc(100cqh * {aw} / {ah})); aspect-ratio: {aw} / {ah};",
-                for (cue, at) in cues_at(&cues, pos.now()).map(|cue| {
+                for (cue, at) in cues_at(&cues, delayed(pos.now(), delay_ms)).map(|cue| {
                     let at = bars::cue_in_picture(
                         FrameRect {
                             x: share(cue.x, w) / 100.0,
@@ -1869,6 +1883,77 @@ fn ViewModePicker(show: bool, mode: ViewMode, on_pick: EventHandler<Control>) ->
                     selected: each == mode,
                     "{each.label()}"
                 }
+            }
+        }
+    }
+}
+
+/// One step of the subtitle delay, and the most it moves either way.
+pub const SUBTITLE_DELAY_STEP_MS: i64 = 100;
+pub const SUBTITLE_DELAY_MAX_MS: i64 = 30_000;
+
+/// The subtitle delay after `steps` steps from `delay_ms`, kept in range.
+pub fn step_delay(delay_ms: i64, steps: i64) -> i64 {
+    (delay_ms + steps * SUBTITLE_DELAY_STEP_MS).clamp(-SUBTITLE_DELAY_MAX_MS, SUBTITLE_DELAY_MAX_MS)
+}
+
+/// The file's time a subtitle shown at `at_ms` belongs to, with the
+/// subtitles `delay_ms` late: a positive delay shows each cue later.
+pub fn delayed(at_ms: u64, delay_ms: i64) -> u64 {
+    if delay_ms >= 0 {
+        at_ms.saturating_sub(delay_ms.unsigned_abs())
+    } else {
+        at_ms.saturating_add(delay_ms.unsigned_abs())
+    }
+}
+
+/// "+0.3 s", "-1.2 s", "0.0 s".
+pub fn delay_label(delay_ms: i64) -> String {
+    let sign = match delay_ms {
+        d if d > 0 => "+",
+        d if d < 0 => "-",
+        _ => "",
+    };
+    let tenths = delay_ms.unsigned_abs() / 100;
+    format!("{sign}{}.{} s", tenths / 10, tenths % 10)
+}
+
+/// The subtitle delay, while a subtitle is on: earlier and later in 0.1 s
+/// steps around the delay (T038-305).
+#[component]
+fn SubtitleDelay(show: bool, delay_ms: i64, on_pick: EventHandler<Control>) -> Element {
+    if !show {
+        return rsx! {};
+    }
+    let label = delay_label(delay_ms);
+    rsx! {
+        div {
+            class: "pharos-subtitle-delay",
+            role: "group",
+            aria_label: "Subtitle delay",
+            button {
+                class: "pharos-control",
+                r#type: "button",
+                aria_label: "Subtitles earlier",
+                title: "Subtitles 0.1 s earlier",
+                onclick: move |_| on_pick.call(Control::SubtitleDelay(step_delay(delay_ms, -1))),
+                "−"
+            }
+            button {
+                class: "pharos-subtitle-delay-value",
+                r#type: "button",
+                title: "Reset the subtitle delay",
+                aria_label: "Subtitle delay {label}, reset",
+                onclick: move |_| on_pick.call(Control::SubtitleDelay(0)),
+                "Delay {label}"
+            }
+            button {
+                class: "pharos-control",
+                r#type: "button",
+                aria_label: "Subtitles later",
+                title: "Subtitles 0.1 s later",
+                onclick: move |_| on_pick.call(Control::SubtitleDelay(step_delay(delay_ms, 1))),
+                "+"
             }
         }
     }
@@ -2660,6 +2745,33 @@ mod tests {
         assert!(
             grouped.contains(r#"<option value="1" selected=true>Speed: Normal</option>"#),
             "the group plays at normal speed: {grouped}"
+        );
+    }
+
+    #[test]
+    fn the_subtitle_delay_steps_a_tenth_and_moves_the_cues() {
+        assert_eq!(step_delay(0, 1), 100);
+        assert_eq!(step_delay(100, -3), -200);
+        assert_eq!(step_delay(29_950, 1), 30_000, "kept in range");
+        assert_eq!(step_delay(-30_000, -1), -30_000);
+        assert_eq!(
+            delayed(10_000, 500),
+            9_500,
+            "late subtitles show an earlier cue"
+        );
+        assert_eq!(delayed(10_000, -500), 10_500);
+        assert_eq!(delayed(200, 500), 0);
+        assert_eq!(delay_label(0), "0.0 s");
+        assert_eq!(delay_label(300), "+0.3 s");
+        assert_eq!(delay_label(-1_200), "-1.2 s");
+        let mut c = controls();
+        c.subtitle_delay_ms = 300;
+        let html = render(c.clone());
+        assert!(html.contains("Delay +0.3 s"), "{html}");
+        c.subtitle_pick = None;
+        assert!(
+            !render(c).contains("pharos-subtitle-delay"),
+            "no subtitle, no delay"
         );
     }
 
