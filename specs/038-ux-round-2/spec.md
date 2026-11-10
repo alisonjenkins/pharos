@@ -85,6 +85,10 @@ device.
   `played_threshold_pct`. **[ALISON]** values: proposed for video the larger
   of 2% and 60 s; proposed for music, never list a song as resumable under
   60 s. Audiobooks and books are exempt.
+  The minimum applies to the position being stored, not to how long this
+  session played: a stop at a position under the minimum on an item that
+  already has a saved resume point or a played mark leaves that stored state
+  untouched rather than clearing it.
 - **FR-108** A failed read or write on the stop path is logged with its cause,
   counted, and returned to the client as a denial it can retry.
 - **FR-109 [ALISON]** A Continue Watching or Next Up tile plays at once, with
