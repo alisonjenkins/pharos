@@ -318,6 +318,63 @@ test.describe("book reader (spec 023)", () => {
     await second.close();
   });
 
+  test("a place queued offline is sent from the home page once the connection returns (spec 036)", async ({
+    browser,
+    request,
+  }) => {
+    test.setTimeout(150_000);
+    const first = await newReaderContext(browser, { width: 1280, height: 800 });
+    const page = await first.newPage();
+    echoReaderLog(page, "leaver");
+    let reachable = true;
+    const sockets: { close(): void }[] = [];
+    await page.routeWebSocket(/\/pharos\/rpc/, (ws) => {
+      if (!reachable) {
+        ws.close();
+        return;
+      }
+      ws.connectToServer();
+      sockets.push(ws);
+    });
+    await signIn(page, request);
+    await openFromSearch(page, "Reader Fixture", "Reader Fixture");
+    await page.locator("#pharos-main-action").click();
+    await expect(page.locator(".pharos-reader")).toBeVisible({ timeout: 15_000 });
+    await firstWord(page);
+    const pending = () =>
+      page.evaluate(() => JSON.parse(localStorage.getItem("pharos.reader.pending") ?? "{}"));
+
+    reachable = false;
+    await first.setOffline(true);
+    for (const s of sockets) s.close();
+    let placed = "";
+    for (let i = 0; i < 4; i++) placed = await turnForward(page);
+    await expect.poll(async () => Object.keys(await pending()).length).toBe(1);
+
+    // Out of the book and onto home: no reader is open to send it.
+    await page.getByRole("button", { name: "Back" }).click();
+    await page.locator(".pharos-brand").click();
+    await expect(page).toHaveURL(/\/ui\/?$/);
+    expect(Object.keys(await pending()).length).toBe(1);
+
+    reachable = true;
+    await first.setOffline(false);
+    await expect.poll(async () => Object.keys(await pending()).length, { timeout: 90_000 }).toBe(0);
+
+    const second = await newReaderContext(browser, { width: 1280, height: 800 });
+    const other = await second.newPage();
+    echoReaderLog(other, "after-leave");
+    await signIn(other, request);
+    await openFromSearch(other, "Reader Fixture", "Reader Fixture");
+    await other.locator("#pharos-main-action").click();
+    await expect(other.locator(".pharos-reader")).toBeVisible({ timeout: 15_000 });
+    await firstWord(other);
+    await expect.poll(async () => await wordsOnPage(other)).toContain(placed);
+
+    await first.close();
+    await second.close();
+  });
+
   test("a locked Kindle book has no Read button and offers the download (V353)", async ({
     page,
     request,

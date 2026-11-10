@@ -130,16 +130,18 @@ enum Delivery {
 }
 
 /// Sends saves, keeps those the server has not answered on this device
-/// (spec 036 FR-001) and sends them again: when the screen opens, when the
-/// API comes back, when the browser goes online and, while any is queued and
-/// the reader is open, with a growing wait. Nothing runs while the queue is
-/// empty.
+/// (spec 036 FR-001) and sends them again, wherever the user is in the app:
+/// when the app starts, when the API comes back, when the browser goes
+/// online, when the reader opens and, while any is queued, with a growing
+/// wait. Nothing runs while the queue is empty. One lives for the app, in
+/// context.
+#[derive(Clone)]
+pub(super) struct OutboxCtx(Rc<Outbox>);
+
 struct Outbox {
     api: Signal<Option<NativeApi>>,
-    /// The open book, whose queued save the note speaks of.
-    id: ItemRef,
-    note: Signal<bool>,
-    alive: Rc<Cell<bool>>,
+    /// Bumped whenever the queue changes, so what shows it redraws.
+    changed: Signal<u32>,
     /// Counts [`Outbox::kick`]s so an older retry loop stops when a newer one starts.
     generation: Cell<u32>,
 }
@@ -178,10 +180,9 @@ impl Outbox {
     }
 
     fn refresh_note(&self) {
-        if self.alive.get() {
-            let mut note = self.note;
-            note.set(load_pending().contains(self.id));
-        }
+        let mut changed = self.changed;
+        let next = changed.peek().wrapping_add(1);
+        changed.set(next);
     }
 
     /// Sends `save` now; if the server cannot be reached it is queued.
@@ -221,7 +222,7 @@ impl Outbox {
         platform::spawn_detached(async move {
             let mut attempt = 0;
             loop {
-                if !this.alive.get() || this.generation.get() != generation {
+                if this.generation.get() != generation {
                     return;
                 }
                 let queue = load_pending();
@@ -282,6 +283,30 @@ impl Drop for OnlineWatch {
                 .remove_event_listener_with_callback("online", self.0.as_ref().unchecked_ref());
         }
     }
+}
+
+/// Called once by the app: puts the outbox in context and flushes the queue
+/// when the app starts (once the API is up), when the API is replaced by a
+/// reconnect and when the browser goes online.
+pub(super) fn use_pending_flush(api: Signal<Option<NativeApi>>) {
+    let changed = use_signal(|| 0u32);
+    let outbox = use_context_provider(|| {
+        OutboxCtx(Rc::new(Outbox {
+            api,
+            changed,
+            generation: Cell::new(0),
+        }))
+    })
+    .0;
+    use_hook({
+        let outbox = outbox.clone();
+        move || Rc::new(OnlineWatch::new(move || outbox.kick()))
+    });
+    use_effect(move || {
+        if api.read().is_some() && !load_pending().is_empty() {
+            outbox.kick();
+        }
+    });
 }
 
 /// Offers the position to the server when the gate allows.
@@ -673,22 +698,9 @@ pub fn ReaderScreen(id: ItemRef) -> Element {
     let alive = use_hook(|| Rc::new(Cell::new(true)));
     let core = use_hook(|| Rc::new(RefCell::new(None::<Rc<Core>>)));
     let started = use_hook(|| Rc::new(Cell::new(false)));
-    let offline = use_signal(|| load_pending().contains(id));
-    let outbox = use_hook({
-        let alive = alive.clone();
-        move || {
-            Rc::new(Outbox {
-                api: ctx.api,
-                id,
-                note: offline,
-                alive,
-                generation: Cell::new(0),
-            })
-        }
-    });
+    let outbox = use_context::<OutboxCtx>().0;
 
-    // Reads the API, so it runs when the screen opens and again whenever a
-    // reconnect swaps it: both are a chance to send what was queued.
+    // Opening the book is a chance to send what was queued.
     use_effect({
         let outbox = outbox.clone();
         move || {
@@ -870,7 +882,7 @@ pub fn ReaderScreen(id: ItemRef) -> Element {
 
     // Held for the screen's life; each removes its listener on drop.
     use_hook({
-        let (alive, core, outbox) = (alive.clone(), core.clone(), outbox.clone());
+        let (alive, core) = (alive.clone(), core.clone());
         move || {
             let key_alive = alive.clone();
             let key_core = core.clone();
@@ -924,8 +936,7 @@ pub fn ReaderScreen(id: ItemRef) -> Element {
             let (hide_core, hidden_core) = (core.clone(), core);
             let hide = platform::on_page_hide(move || flush(&hide_core));
             let lifecycle = platform::on_page_lifecycle(move || flush(&hidden_core), || {});
-            let online = OnlineWatch::new(move || outbox.kick());
-            Rc::new((keys, hide, lifecycle, online))
+            Rc::new((keys, hide, lifecycle))
         }
     });
 
@@ -966,6 +977,10 @@ pub fn ReaderScreen(id: ItemRef) -> Element {
         }
     });
 
+    let offline = {
+        let _ = outbox.changed.read();
+        load_pending().contains(id)
+    };
     let current = *settings.read();
     let page_background = view_settings(current).theme.background;
     let shown = phase.read().clone();
@@ -1115,7 +1130,7 @@ pub fn ReaderScreen(id: ItemRef) -> Element {
                 aria_valuemax: "100",
                 aria_valuenow: "{super::reader::percent(*fraction.read())}",
                 div { class: "pharos-reader-progress-bar", style: "{width}" }
-                if *offline.read() {
+                if offline {
                     span { class: "pharos-reader-offline", role: "status", "{OFFLINE_NOTE}" }
                 }
                 span { class: "pharos-reader-progress-label", "{label}" }
