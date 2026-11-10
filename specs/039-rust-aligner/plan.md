@@ -69,7 +69,7 @@ This is a port of the `cpufwd` spike with its measured choices kept.
 ## Server change (shadow only)
 
 - `[lyrics].aligner_shadow_url` / `PHAROS_LYRICS_ALIGNER_SHADOW_URL`.
-- After `process_job` stores an answer, a background task sends the same request to the shadow and compares `start_ms` word by word. It logs one line and bumps `pharos_lyrics_shadow_total{outcome}`, then drops the answer.
+- After `process_job` stores an answer, a background task sends the same request to the shadow and compares the whole result: `offset_ms`, the line and word counts, and each word's `at` and `start_ms`. Only `aligner_version` is expected to differ. It logs one line and bumps `pharos_lyrics_shadow_total{outcome}`, then drops the answer.
 - At most one shadow request is in flight at a time, with the same 600 s timeout.
 
 ## Testing
