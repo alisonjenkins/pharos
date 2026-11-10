@@ -116,7 +116,17 @@ test.describe("pharos Dioxus UI watch together: who has seen what", () => {
         timeout: 15_000,
       });
 
-      // A has played the first episode.
+      // A has played the first episode, and nothing else of the show: specs
+      // before this one may have left A part-way into another episode (the
+      // show page's Play now starts the next one, FR-201), which would show
+      // as a part-seen dot. Unmarking clears the position too.
+      for (const ep of shown) {
+        const cleared = await request.delete(
+          `${PHAROS_URL}/Users/${user.Id}/PlayedItems/${ep.Id}`,
+          { headers: api },
+        );
+        expect(cleared.ok(), `clearing ${ep.Id}: ${cleared.status()}`).toBeTruthy();
+      }
       const first = shown.find((i: { IndexNumber?: number }) => i.IndexNumber === 1) ?? shown[0];
       const played = await request.post(
         `${PHAROS_URL}/Users/${user.Id}/PlayedItems/${first.Id}`,
