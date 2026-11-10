@@ -2501,8 +2501,18 @@ body:has(.pharos-stage.is-full) .pharos-status-note {
   z-index: 2;
 }
 .pharos-seek:hover .pharos-seek-knob,
+.pharos-seek:focus-visible .pharos-seek-knob,
+.pharos-seek.is-dragging .pharos-seek-knob,
 .pharos-player.is-paused .pharos-seek-knob {
   transform: scale(1);
+}
+.pharos-seek:focus-visible {
+  outline: 2px solid var(--px-color-focus);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+.pharos-seek.is-dragging .pharos-seek-track {
+  transform: scaleY(1.5);
 }
 .pharos-seek-preview {
   position: absolute;
