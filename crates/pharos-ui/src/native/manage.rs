@@ -340,6 +340,12 @@ pub fn tab_of(query: &str) -> Option<AdminTab> {
         .and_then(AdminTab::from_token)
 }
 
+/// Opens Manage on `tab`.
+pub fn open_manage(nav: super::views::Nav, tab: AdminTab) {
+    nav.0.call(Route::Manage);
+    platform::replace(&format!("{}{}", Route::Manage.path(), manage_query(tab)));
+}
+
 /// Replaces the Manage URL with one naming `tab`, while Manage is shown.
 fn keep_tab_in_url(tab: AdminTab) {
     let query = manage_query(tab);

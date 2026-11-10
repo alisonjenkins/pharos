@@ -2011,14 +2011,22 @@ fn NativeApp(route: Route) -> Element {
     // The library buttons, read again for each signed-in API; a reconnect
     // keeps the last list until the new one arrives.
     let mut libraries = use_signal(Vec::<Item>::new);
+    let mut libraries_failed = use_signal(|| false);
     use_effect(move || {
         let _ = library_rev();
         let Some(api) = api.read().clone() else {
             return;
         };
         spawn(async move {
-            if let Ok(page) = api.views(&call("shell", "libraries")).await {
-                libraries.set(page.items);
+            let info = call("shell", "libraries");
+            let asked = retry_once("libraries", || api.views(&info)).await;
+            match asked {
+                Ok(page) => {
+                    libraries.set(page.items);
+                    libraries_failed.set(false);
+                }
+                // The last list, if any, stays; with none the bar says so.
+                Err(_) => libraries_failed.set(true),
             }
         });
     });
@@ -2033,7 +2041,8 @@ fn NativeApp(route: Route) -> Element {
             let (Some(api), Some(id)) = (api, shown) else {
                 return Vec::new();
             };
-            trail::load(&api, &call("shell", "trail"), id)
+            let info = call("shell", "trail");
+            retry_once("trail", || trail::load(&api, &info, id))
                 .await
                 .unwrap_or_default()
         }
@@ -2088,7 +2097,8 @@ fn NativeApp(route: Route) -> Element {
         let api = api.read().clone();
         async move {
             let api = api?;
-            match api.me(&call("shell", "me")).await {
+            let info = call("shell", "me");
+            match retry_once("me", || api.me(&info)).await {
                 Ok(me) => {
                     reconcile_kept_books(&me.id);
                     claim_queue(queue, held, &me.id);
@@ -2125,6 +2135,7 @@ fn NativeApp(route: Route) -> Element {
         return rsx! {
             Shell {
                 libraries: libraries(),
+                libraries_failed: libraries_failed(),
                 trail: trail.read().clone().unwrap_or_default(),
                 account: rsx! {
                     WhatsNewButton {}
@@ -2342,7 +2353,7 @@ fn Screen(route: Route) -> Element {
         Route::Find => rsx! { FindScreen {} },
         Route::Together => rsx! { TogetherScreen {} },
         Route::TogetherGroup(id) => rsx! { InviteScreen { id } },
-        Route::NotFound(path) => rsx! { ErrorNote { message: format!("Nothing at {path}.") } },
+        Route::NotFound(path) => rsx! { NotFoundView { path } },
     }
 }
 
@@ -4077,6 +4088,45 @@ fn report_failure(failure: &PlayFailure) {
     if let Some(ReportOpen(mut open)) = try_consume_context::<ReportOpen>() {
         open.set(true);
     }
+}
+
+/// A path the app has no page for, with the two ways on (FR-210, A23).
+#[component]
+fn NotFoundView(path: String) -> Element {
+    rsx! {
+        section { class: "pharos-not-found",
+            ErrorNote { message: format!("Nothing at {path}.") }
+            nav { class: "pharos-not-found-links", aria_label: "Go to",
+                super::views::Link { to: Route::Home, class: "pharos-button", "Home" }
+                super::views::Link { to: Route::Find, class: "pharos-button pharos-button-secondary", "Search" }
+            }
+        }
+    }
+}
+
+/// How long the shell waits before asking a failed call once more.
+const SHELL_RETRY_MS: u32 = 1_000;
+
+/// `ask`, and once more after [`SHELL_RETRY_MS`] if it fails (FR-210, A15):
+/// one dropped reply should not leave the shell without its libraries,
+/// trail or name. Each failure is logged with its cause.
+async fn retry_once<T, E: std::fmt::Display, F: std::future::Future<Output = Result<T, E>>>(
+    what: &str,
+    mut ask: impl FnMut() -> F,
+) -> Result<T, E> {
+    let first = ask().await;
+    let Err(e) = first else {
+        return first;
+    };
+    platform::info(&format!("pharos: shell {what} failed, asking again: {e}"));
+    platform::sleep_ms(SHELL_RETRY_MS).await;
+    let again = ask().await;
+    if let Err(e) = &again {
+        platform::warn(&format!(
+            "pharos: shell {what} unavailable after a retry: {e}"
+        ));
+    }
+    again
 }
 
 /// Back one page, or home when there is none to go back to.
