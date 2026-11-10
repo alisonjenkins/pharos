@@ -1511,6 +1511,14 @@ body:has(.pharos-stage.is-full) .pharos-status-note {
   font-size: 0.75rem;
   opacity: 0.7;
 }
+/* The full player's first load: the status and a way out (038 FR-408). */
+.pharos-watch-first-load {
+  display: grid;
+  gap: 1rem;
+  justify-items: center;
+  margin: 3rem auto;
+  text-align: center;
+}
 /* A screen that could not load: plain words, Try again, small print (B823). */
 .pharos-load-failure {
   display: grid;
