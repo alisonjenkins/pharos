@@ -187,6 +187,16 @@ fn not_found(path: &str) -> Route {
     Route::NotFound(path.to_owned())
 }
 
+/// A page address split into its path and its query, `?` kept on the query:
+/// `"/ui/find?q=x"` is `("/ui/find", "?q=x")`. A platform that keeps the
+/// two together answers routing with the path and page state with the query.
+pub fn split_query(address: &str) -> (&str, &str) {
+    match address.find('?') {
+        Some(at) => address.split_at(at),
+        None => (address, ""),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -299,5 +309,13 @@ mod tests {
         assert_eq!(Route::parse("/Ui/Find"), Route::Find);
         assert_eq!(Route::parse("/find"), Route::Find);
         assert_eq!(Route::parse("/ui/ui"), Route::NotFound("/ui/ui".into()));
+    }
+
+    #[test]
+    fn an_address_splits_into_its_path_and_query() {
+        assert_eq!(split_query("/ui/find?q=x&y"), ("/ui/find", "?q=x&y"));
+        assert_eq!(split_query("/ui/find"), ("/ui/find", ""));
+        assert_eq!(split_query("/ui/find?"), ("/ui/find", "?"));
+        assert_eq!(Route::parse(split_query("/ui/find?q=x").0), Route::Find);
     }
 }
