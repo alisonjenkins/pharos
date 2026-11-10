@@ -39,7 +39,7 @@ fn assert_local(refs: &[ArtworkRef], role: ArtworkRole, expected: &Path) {
 #[test]
 fn detects_generic_movie_sidecars() {
     let dir = tempdir().unwrap();
-    let media = touch(dir.path(), "The Matrix (1999).mkv");
+    let media = touch(dir.path(), "The Glass Lattice (1999).mkv");
     let poster = touch(dir.path(), "poster.jpg");
     let fanart = touch(dir.path(), "fanart.jpg");
     let banner = touch(dir.path(), "banner.jpg");

@@ -682,7 +682,7 @@ mod tests {
     #[test]
     fn a_show_folder_episode_is_planned_under_its_show() {
         let td = tempfile::TempDir::new().unwrap();
-        let show = td.path().join("Sword Art Online II");
+        let show = td.path().join("Show W II");
         std::fs::create_dir_all(show.join("SAO II")).unwrap();
         std::fs::write(show.join("tvshow.nfo"), b"<tvshow/>").unwrap();
         let file = show.join("SAO II/SAO II - 14 L@mBerT.mp4");

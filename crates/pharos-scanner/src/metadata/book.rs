@@ -349,14 +349,14 @@ mod tests {
     #[tokio::test]
     async fn a_comics_comicinfo_becomes_ordinary_item_metadata() {
         let td = tempfile::tempdir().unwrap();
-        let p = td.path().join("Batman 001.cbz");
+        let p = td.path().join("Series A 001.cbz");
         let f = std::fs::File::create(&p).unwrap();
         let mut zw = zip::ZipWriter::new(f);
         let opts = zip::write::SimpleFileOptions::default();
         zw.start_file("ComicInfo.xml", opts).unwrap();
         zw.write_all(
-            br#"<ComicInfo><Title>The Dark Knight Returns</Title><Writer>Frank Miller</Writer>
-                <Publisher>DC Comics</Publisher><Summary>Bruce returns.</Summary>
+            br#"<ComicInfo><Title>Comic A</Title><Writer>Writer A</Writer>
+                <Publisher>DC Comics</Publisher><Summary>Alex returns.</Summary>
                 <Year>1986</Year><Month>2</Month><Day>1</Day></ComicInfo>"#,
         )
         .unwrap();
@@ -369,12 +369,12 @@ mod tests {
             .fetch(&req(&p, &probe))
             .await
             .unwrap();
-        assert_eq!(out.title.as_deref(), Some("The Dark Knight Returns"));
-        assert_eq!(out.overview.as_deref(), Some("Bruce returns."));
+        assert_eq!(out.title.as_deref(), Some("Comic A"));
+        assert_eq!(out.overview.as_deref(), Some("Alex returns."));
         assert_eq!(out.production_year, Some(1986));
         assert!(out.premiere_date.is_some());
         assert_eq!(out.studios, vec!["DC Comics".to_string()]);
-        assert_eq!(out.people[0].name, "Frank Miller");
+        assert_eq!(out.people[0].name, "Writer A");
     }
 
     #[tokio::test]
