@@ -203,9 +203,86 @@ pub fn use_live_updates(
     });
 }
 
+/// The topic the Together page follows while it is open.
+const GROUP_TOPICS: [&str; 1] = ["groups"];
+
+/// Whether `batch` changes the list of groups: a groups event, or a resync
+/// that may have lost one.
+pub fn moves_group_list(batch: &[PushEvent]) -> bool {
+    batch
+        .iter()
+        .any(|e| matches!(e, PushEvent::Groups | PushEvent::Resync))
+}
+
+/// Lists the groups again each time the server says they changed, for as
+/// long as the calling screen is shown. Its own subscription, so the topic is
+/// asked for only while someone looks at the list.
+pub fn use_group_list_updates<T: 'static>(api: Signal<Option<NativeApi>>, groups: Resource<T>) {
+    let held = use_hook(|| Rc::new(RefCell::new(None::<EventSubscription>)));
+    let relist = use_coroutine(move |mut rx: UnboundedReceiver<Vec<PushEvent>>| {
+        let mut groups = groups;
+        async move {
+            while let Some(batch) = rx.next().await {
+                let mut moved = moves_group_list(&batch);
+                platform::sleep_ms(COALESCE_MS).await;
+                while let Ok(more) = rx.try_recv() {
+                    moved |= moves_group_list(&more);
+                }
+                if moved {
+                    platform::info("pharos: together relist cause=push");
+                    groups.restart();
+                }
+            }
+        }
+    });
+    use_effect(move || {
+        let Some(api) = api.read().clone() else {
+            held.borrow_mut().take();
+            return;
+        };
+        let held = Rc::clone(&held);
+        spawn(async move {
+            let call = super::app::call("together", "subscribe");
+            let made = api
+                .subscribe_events(
+                    &call,
+                    &GROUP_TOPICS,
+                    &EventCursor::default(),
+                    move |batch| {
+                        relist.send(batch);
+                    },
+                )
+                .await;
+            match made {
+                Ok(sub) => {
+                    platform::info("pharos: together subscribed topic=groups");
+                    *held.borrow_mut() = Some(sub);
+                }
+                // A server from before the topic (it refuses the name) or
+                // before push: the list loads as before, without updates.
+                Err(e) => {
+                    platform::info(&format!("pharos: together live list unavailable error={e}"))
+                }
+            }
+        });
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_groups_event_or_a_resync_moves_the_group_list() {
+        assert!(moves_group_list(&[PushEvent::Groups]));
+        assert!(moves_group_list(&[PushEvent::Resync]));
+        assert!(!moves_group_list(&[PushEvent::Library {
+            added: vec![],
+            updated: vec![],
+            removed: vec![],
+        }]));
+        assert!(!moves_group_list(&[]));
+    }
 
     fn user_data(id: u64, played: bool, position_ms: u64) -> PushEvent {
         PushEvent::UserData {
