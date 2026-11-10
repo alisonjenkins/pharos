@@ -10,6 +10,7 @@ pub mod fs;
 #[cfg(feature = "libav-probe")]
 pub mod libav_prober;
 pub mod metadata;
+pub(crate) mod parts;
 pub mod probe_memo;
 pub mod series_split;
 #[cfg(feature = "watch")]
