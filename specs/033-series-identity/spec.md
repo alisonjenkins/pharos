@@ -263,7 +263,10 @@ the series wire id.
    filename) with the rejected NFO set aside, which resets the provider-derived
    fields (title, overview, premiere date, community rating, provider ids, the
    episode still) to what local evidence alone says, then enriches from the
-   pinned match. Local data that passes the checks (a sidecar, an NFO that names
+   pinned match. A local episode title that is a disc label, a release name or
+   the file stem, and an air date the container tag supplied, lose to the
+   record's (B992); a curated or NFO title, an NFO date and locked fields win.
+   Local data that passes the checks (a sidecar, an NFO that names
    the right show) is re-read and so kept. The episode's rows in the
    translations table (`MetadataTranslationStore`) are deleted in the same step,
    so no language's text from the old show survives a fetch that omits that
