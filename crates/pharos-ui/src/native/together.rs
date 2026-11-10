@@ -241,6 +241,18 @@ impl GroupError {
     pub fn is_gone(&self) -> bool {
         self.0 == Self::GONE
     }
+
+    const SUPERSEDED: &'static str = "The join was superseded";
+
+    /// The viewer left, or began another membership, while the join was in
+    /// flight: not a failure to show them.
+    pub fn superseded() -> Self {
+        Self(Self::SUPERSEDED.into())
+    }
+
+    pub fn is_superseded(&self) -> bool {
+        self.0 == Self::SUPERSEDED
+    }
 }
 
 /// The server's reply to `clock`: the client's timestamp echoed, then when
@@ -775,6 +787,13 @@ impl GroupClient for FakeGroups {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_superseded_join_is_told_apart_from_a_refusal() {
+        assert!(GroupError::superseded().is_superseded());
+        assert!(!GroupError::gone().is_superseded());
+        assert!(!GroupError("The server said no".into()).is_superseded());
+    }
 
     /// A sample whose server clock is `offset` ahead and whose trip took
     /// `rtt` split evenly, sent at `at`; the server answers at once.
