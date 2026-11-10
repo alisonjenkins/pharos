@@ -57,7 +57,7 @@ Every task follows TDD: a failing test first, then the code. Metrics and log lin
 - [x] T028-28 Ease between plain lines that follow closely (B1206, V1166). Two-speaker lines left as the source breaks them.
 - [x] T028-29 Lift lines clear of burned-in text at the bottom of the frame (B1207, V1167). Signs drawn elsewhere in the frame are not looked for.
 - [x] T028-33 Signs read: style-placed signs pass through, CJK brackets as Latin marks, a contrast nudge for sign lettering (B1208-B1210, V1168-V1170).
-- [ ] T028-34 Keep signs pinned to the picture while the player controls show.
+- [x] T028-34 Keep signs pinned to the picture while the player controls show (B1211, V1171).
 - [ ] T028-30 Karaoke timings from the aligner for songs without `\k`.
 - [ ] T028-31 Opt-in speaker colours from speaker detection.
 - [ ] T028-32 Measure the styled track's frame cost on the TV app.
