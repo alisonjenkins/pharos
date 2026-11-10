@@ -230,7 +230,7 @@ async fn resolve(state: &AppState, ids: &[WireId]) -> Result<Vec<(WireId, Target
         .collect();
     let found = futures_util::future::join_all(real.iter().map(|id| async move {
         match state.stores.get(*id).await {
-            Ok(item) => Ok(Some((*id, item.probe.duration_ms))),
+            Ok(item) => Ok(Some((*id, item.probe.run_time_ms()))),
             Err(pharos_core::DomainError::NotFound(_)) => Ok(None),
             Err(_) => Err(SeenError::Unavailable),
         }

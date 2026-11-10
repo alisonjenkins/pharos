@@ -509,6 +509,36 @@ fn media_probe_run_time_ticks_converts_ms_to_jellyfin_ticks() {
     assert_eq!(p.run_time_ticks(), Some(25_000_000));
 }
 
+/// V1150, V1155 — a split film runs for all its parts, and its parts are
+/// neither versions of it nor counted twice.
+#[test]
+fn a_split_films_run_time_spans_its_parts() {
+    let part = |n: u32, ms: u64| AlternateMediaSource {
+        id: format!("part-{n}"),
+        part: Some(n),
+        probe: Some(Box::new(MediaProbe {
+            duration_ms: Some(ms),
+            ..Default::default()
+        })),
+        ..Default::default()
+    };
+    let edition = AlternateMediaSource {
+        id: "extended".into(),
+        duration_ms: Some(9_000),
+        ..Default::default()
+    };
+    let p = MediaProbe {
+        duration_ms: Some(2_000),
+        alternate_sources: vec![part(3, 500), edition, part(2, 1_000)],
+        ..Default::default()
+    };
+    assert_eq!(p.run_time_ticks(), Some(35_000_000));
+    let order: Vec<_> = p.parts().iter().map(|a| a.part).collect();
+    assert_eq!(order, [Some(2), Some(3)]);
+    let versions: Vec<_> = p.versions().map(|a| a.id.as_str()).collect();
+    assert_eq!(versions, ["extended"]);
+}
+
 #[test]
 fn media_probe_frame_rate_round_trips_through_mille() {
     let p = MediaProbe {
