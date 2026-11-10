@@ -9,7 +9,7 @@
 //! that repeats a state already seen is ignored, so a playing song's
 //! progress saves do not reload the page every few seconds.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -219,6 +219,9 @@ pub fn moves_group_list(batch: &[PushEvent]) -> bool {
 /// asked for only while someone looks at the list.
 pub fn use_group_list_updates<T: 'static>(api: Signal<Option<NativeApi>>, groups: Resource<T>) {
     let held = use_hook(|| Rc::new(RefCell::new(None::<EventSubscription>)));
+    // Each connection's attempt; a subscribe that answers after a newer one
+    // started is dropped rather than replacing the live subscription.
+    let attempt = use_hook(|| Rc::new(Cell::new(0u64)));
     let relist = use_coroutine(move |mut rx: UnboundedReceiver<Vec<PushEvent>>| {
         let mut groups = groups;
         async move {
@@ -236,11 +239,13 @@ pub fn use_group_list_updates<T: 'static>(api: Signal<Option<NativeApi>>, groups
         }
     });
     use_effect(move || {
+        let this = attempt.get().wrapping_add(1);
+        attempt.set(this);
         let Some(api) = api.read().clone() else {
             held.borrow_mut().take();
             return;
         };
-        let held = Rc::clone(&held);
+        let (held, attempt) = (Rc::clone(&held), Rc::clone(&attempt));
         spawn(async move {
             let call = super::app::call("together", "subscribe");
             let made = api
@@ -253,6 +258,9 @@ pub fn use_group_list_updates<T: 'static>(api: Signal<Option<NativeApi>>, groups
                     },
                 )
                 .await;
+            if attempt.get() != this {
+                return;
+            }
             match made {
                 Ok(sub) => {
                     platform::info("pharos: together subscribed topic=groups");
