@@ -429,6 +429,12 @@ pub struct MetadataConfig {
     /// repairs a full scan decides; `"apply"` writes them.
     #[serde(default)]
     pub series_identity_repair: pharos_scanner::series_split::RepairMode,
+    /// Artwork whose file is gone from disk is relinked to a same-named file
+    /// in the item's folder, or else dropped so online art can replace it, on
+    /// a daily sweep (B1180). `false` only logs the dead rows and writes
+    /// nothing. Default true.
+    #[serde(default = "default_true")]
+    pub repair_stale_artwork: bool,
 }
 
 fn default_refresh_ttl_days() -> u32 {
@@ -456,6 +462,7 @@ impl Default for MetadataConfig {
             refresh_interval_secs: default_refresh_interval_secs(),
             fetch_translations: true,
             series_identity_repair: pharos_scanner::series_split::RepairMode::DryRun,
+            repair_stale_artwork: true,
         }
     }
 }
