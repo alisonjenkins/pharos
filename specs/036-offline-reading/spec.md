@@ -7,7 +7,7 @@
   reader and the book for that." (Alison, 2026-11-10)
 - **Depends on:** 023 (the reader: EPUB slices 1–4, PDF slice 5 #1162),
   ADR-0047, 017 (native API)
-- **Ids:** requested from the coordinator; ADR number at the same time.
+- **Ids:** bugs B1170–B1179, invariants V1130–V1139, ADR 0110 (service worker and cache design).
 
 ## Problem
 
