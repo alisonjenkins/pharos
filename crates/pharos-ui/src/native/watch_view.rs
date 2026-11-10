@@ -811,7 +811,7 @@ pub fn WatchView(
                 },
                 onwheel: move |evt: WheelEvent| {
                     wake();
-                    shortcuts.wheel(&evt);
+                    shortcuts.wheel_video(&evt, compact);
                 },
                 // The styled subtitle renderer lays its canvas after the
                 // video, so the video sits alone where Dioxus never diffs.
@@ -1958,6 +1958,17 @@ impl Shortcuts {
         }
     }
 
+    /// The video player's wheel (T038-303): only the full view takes it, so
+    /// a page scrolled under the small player scrolls, and a trackpad's
+    /// pixel travel is left to the page rather than summed into volume
+    /// steps a two-finger scroll set off by accident.
+    pub fn wheel_video(self, evt: &WheelEvent, compact: bool) {
+        if compact || trackpad(evt.delta()) {
+            return;
+        }
+        self.wheel(evt);
+    }
+
     /// A left click; true when it was a Shift+click this handled.
     pub fn click(self, evt: &MouseEvent) -> bool {
         let skip = shift_skip(
@@ -2029,6 +2040,17 @@ pub fn wheel_notches(carried: f64, delta: WheelDelta) -> (i32, f64) {
     #[allow(clippy::cast_possible_truncation)]
     let whole = notches.clamp(-1_000.0, 1_000.0) as i32;
     (whole, travel - notches * WHEEL_NOTCH_PX)
+}
+
+/// Whether a wheel event looks like a trackpad's: pixel travel of less than
+/// half a notch, or a fraction of a pixel, where a mouse wheel moves whole
+/// notches of about [`WHEEL_NOTCH_PX`]. Line and page travel is a mouse's.
+pub fn trackpad(delta: WheelDelta) -> bool {
+    let WheelDelta::Pixels(v) = delta else {
+        return false;
+    };
+    let along = if v.y.abs() >= v.x.abs() { v.y } else { v.x };
+    along.abs() < WHEEL_NOTCH_PX / 2.0 || along.fract() != 0.0
 }
 
 /// Which third of the picture a tap landed in, for the double-tap seek.
@@ -3162,6 +3184,31 @@ mod tests {
             wheel_control(sideways, true, media),
             Some(Control::Seek(65_000))
         );
+    }
+
+    #[test]
+    fn the_video_wheel_leaves_a_trackpad_to_the_page() {
+        assert!(
+            trackpad(WheelDelta::pixels(0.0, -4.0, 0.0)),
+            "a trackpad's small steps"
+        );
+        assert!(
+            trackpad(WheelDelta::pixels(0.0, 53.5, 0.0)),
+            "a fraction of a pixel"
+        );
+        assert!(
+            !trackpad(WheelDelta::pixels(0.0, -100.0, 0.0)),
+            "a mouse notch"
+        );
+        assert!(
+            !trackpad(WheelDelta::pixels(120.0, 0.0, 0.0)),
+            "Shift turns it sideways"
+        );
+        assert!(
+            !trackpad(WheelDelta::lines(0.0, 1.0, 0.0)),
+            "Firefox's mouse lines"
+        );
+        assert!(!trackpad(WheelDelta::pages(0.0, 1.0, 0.0)));
     }
 
     #[test]
