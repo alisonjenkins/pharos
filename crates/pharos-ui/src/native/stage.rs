@@ -745,10 +745,10 @@ pub fn queue_label(count: usize) -> String {
     }
 }
 
-const ICON_PLAY: &str = "M8 5v14l11-7L8 5Z";
-const ICON_PAUSE: &str = "M7 5h3.5v14H7zM13.5 5H17v14h-3.5z";
-const ICON_PREVIOUS: &str = "M6 6h2v12H6V6Zm3.5 6 8.5 6V6l-8.5 6Z";
-const ICON_NEXT: &str = "M16 6h2v12h-2V6ZM6 18l8.5-6L6 6v12Z";
+pub(super) const ICON_PLAY: &str = "M8 5v14l11-7L8 5Z";
+pub(super) const ICON_PAUSE: &str = "M7 5h3.5v14H7zM13.5 5H17v14h-3.5z";
+pub(super) const ICON_PREVIOUS: &str = "M6 6h2v12H6V6Zm3.5 6 8.5 6V6l-8.5 6Z";
+pub(super) const ICON_NEXT: &str = "M16 6h2v12h-2V6ZM6 18l8.5-6L6 6v12Z";
 /// Corners pointing out.
 pub const ICON_FULL: &str =
     "M5 5h5v2H7v3H5V5Zm9 0h5v5h-2V7h-3V5ZM5 14h2v3h3v2H5v-5Zm12 3v-3h2v5h-5v-2h3Z";
