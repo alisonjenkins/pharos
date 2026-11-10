@@ -2,9 +2,9 @@
 //! episode is filed under.
 //!
 //! A scraper that misidentifies a show folder writes NFOs, and stills beside
-//! them, for a different show. Jellyfin did this to this library's
-//! `TV/Dragon Ball`: its `tvshow.nfo` and every episode NFO describe Super
-//! Dragon Ball Heroes, and each `<episode>-thumb.jpg` is that show's still.
+//! them, for a different show. That happened to a library's
+//! `TV/Show K`: its `tvshow.nfo` and every episode NFO describe Super
+//! Show K Heroes, and each `<episode>-thumb.jpg` is that show's still.
 //! Read as authoritative, the episodes took that show's titles, plots and
 //! provider ids. The folder name is the user's own statement of what the show
 //! is, so an NFO whose show name does not resemble it is set aside, along with

@@ -4317,8 +4317,8 @@ fn parse_release_folder(name: &str) -> Option<ReleaseFolder> {
     })
 }
 
-/// Lower-cased letters and digits only, so `Person of Interest` and
-/// `Person.of.Interest` compare equal.
+/// Lower-cased letters and digits only, so `Man of Mystery` and
+/// `Man.of.Mystery` compare equal.
 fn fold_name(name: &str) -> String {
     name.chars()
         .filter(|c| c.is_alphanumeric())
@@ -6195,8 +6195,8 @@ mod tests {
     #[tokio::test]
     async fn a_book_path_never_reaches_the_prober() {
         let td = TempDir::new().unwrap();
-        touch(td.path(), "Dune.epub").await;
-        touch(td.path(), "Watchmen.cbz").await;
+        touch(td.path(), "Book A.epub").await;
+        touch(td.path(), "Comic A.cbz").await;
         touch(td.path(), "Manual.pdf").await;
         touch(td.path(), "Sideloaded.azw3").await;
         // One real media file, so the test also proves the branch did not
@@ -6239,8 +6239,8 @@ mod tests {
                 .and_then(|i| i.book.as_ref())
                 .map(|b| b.format)
         };
-        assert_eq!(by_title("Dune"), Some(pharos_core::BookFormat::Epub));
-        assert_eq!(by_title("Watchmen"), Some(pharos_core::BookFormat::Comic));
+        assert_eq!(by_title("Book A"), Some(pharos_core::BookFormat::Epub));
+        assert_eq!(by_title("Comic A"), Some(pharos_core::BookFormat::Comic));
         assert_eq!(by_title("Manual"), Some(pharos_core::BookFormat::Pdf));
         assert_eq!(
             by_title("Sideloaded"),
@@ -6798,13 +6798,13 @@ mod tests {
         let td = TempDir::new().unwrap();
         write_file(
             td.path(),
-            "Forever (US)/Season 1/Forever (1996) - S01E01.mkv",
+            "Show L (US)/Season 1/Show L (1996) - S01E01.mkv",
             b"a",
         )
         .await;
         write_file(
             td.path(),
-            "Forever (US)/Season 1/Forever (1996) - S01E02.mkv",
+            "Show L (US)/Season 1/Show L (1996) - S01E02.mkv",
             b"b",
         )
         .await;
@@ -8217,10 +8217,10 @@ mod tests {
     #[test]
     fn an_nxnn_token_names_an_episode() {
         assert!(has_nxnn_token(
-            "Star Trek The Next Generation - 1x16 - Too Short a Season.avi"
+            "Show M The Next Wave - 1x16 - Too Brief a Spell.avi"
         ));
         assert!(has_nxnn_token(
-            "Star Trek The Next Generation - 1x01x02 - Encounter at Farpoint.avi"
+            "Show M The Next Wave - 1x01x02 - Meeting at the Harbour.avi"
         ));
         assert!(has_nxnn_token("show.1x105.mkv"));
         assert!(!has_nxnn_token("Movie 1920x1080.mkv"));
@@ -8232,13 +8232,13 @@ mod tests {
         assert!(has_nxnn_token("Long Show - 10x05 - Title.mkv"));
         assert!(!has_nxnn_token("Zé1x16.mkv"));
         assert!(is_episode_path(Path::new(
-            "/media/TV/Star Trek The Next Generation/Star Trek The Next Generation - 1x16 - Too Short a Season.avi"
+            "/media/TV/Show M The Next Wave/Show M The Next Wave - 1x16 - Too Brief a Spell.avi"
         )));
         let info = parse_series_info(Path::new(
-            "/media/TV/Star Trek The Next Generation/Star Trek The Next Generation - 1x16 - Too Short a Season.avi",
+            "/media/TV/Show M The Next Wave/Show M The Next Wave - 1x16 - Too Brief a Spell.avi",
         ))
         .expect("series info");
-        assert_eq!(info.series_name, "Star Trek The Next Generation");
+        assert_eq!(info.series_name, "Show M The Next Wave");
         assert_eq!(
             (info.season_number, info.episode_number),
             (Some(1), Some(16))
@@ -8297,7 +8297,7 @@ mod tests {
             Some((None, 14))
         );
         assert_eq!(
-            parse_episode_from_name("Person.of.Interest.S01E03.720p.HDTV.mkv"),
+            parse_episode_from_name("Man.of.Mystery.S01E03.720p.HDTV.mkv"),
             Some((Some(1), 3))
         );
     }
@@ -8369,19 +8369,16 @@ mod tests {
     #[test]
     fn a_release_folder_in_the_library_root_names_its_show() {
         let p = Path::new(
-            "/tv/Person.of.Interest.S01E03.720p.HDTV.x264-IMMERSE/Person.of.Interest.S01E03.720p.HDTV.x264-IMMERSE.mkv",
+            "/tv/Man.of.Mystery.S01E03.720p.HDTV.x264-GRP/Man.of.Mystery.S01E03.720p.HDTV.x264-GRP.mkv",
         );
         let info = parse_series_info(p).expect("series info");
-        assert_eq!(info.series_name, "Person of Interest");
-        assert_eq!(
-            info.series_folder.as_deref(),
-            Some("/tv/Person of Interest")
-        );
+        assert_eq!(info.series_name, "Man of Mystery");
+        assert_eq!(info.series_folder.as_deref(), Some("/tv/Man of Mystery"));
         assert_eq!(info.season_number, Some(1));
         assert_eq!(info.episode_number, Some(3));
 
         let other = parse_series_info(Path::new(
-            "/tv/Person.of.Interest.S01E04.720p.HDTV.x264-LOL/poi.104.mkv",
+            "/tv/Man.of.Mystery.S01E04.720p.HDTV.x264-GRQ/mom.104.mkv",
         ))
         .expect("series info");
         assert_eq!(other.series_key(), info.series_key());
@@ -8390,13 +8387,13 @@ mod tests {
     #[test]
     fn a_release_folder_with_a_bracketed_tag_names_its_show() {
         let p = Path::new(
-            "/tv/The.Vampire.Diaries.S04E21.720p.HDTV.X264-DIMENSION [PublicHD]/The.Vampire.Diaries.S04E21.720p.HDTV.X264-DIMENSION.mkv",
+            "/tv/The.Show.X.Stories.S04E21.720p.HDTV.X264-GRP [PublicHD]/The.Show.X.Stories.S04E21.720p.HDTV.X264-GRP.mkv",
         );
         let info = parse_series_info(p).expect("series info");
-        assert_eq!(info.series_name, "The Vampire Diaries");
+        assert_eq!(info.series_name, "The Show X Stories");
         assert_eq!(
             info.series_folder.as_deref(),
-            Some("/tv/The Vampire Diaries")
+            Some("/tv/The Show X Stories")
         );
         assert_eq!(info.season_number, Some(4));
         assert_eq!(info.episode_number, Some(21));
@@ -8404,17 +8401,16 @@ mod tests {
 
     #[test]
     fn a_release_folder_drops_its_tags_and_keeps_its_year() {
-        let p =
-            Path::new("/tv/The.Vampire.Diaries.S04E21.720p.HDTV.X264-DIMENSION [PublicHD]/x.mkv");
+        let p = Path::new("/tv/The.Show.X.Stories.S04E21.720p.HDTV.X264-GRP [PublicHD]/x.mkv");
         let info = parse_series_info(p).expect("series info");
-        assert_eq!(info.series_name, "The Vampire Diaries");
+        assert_eq!(info.series_name, "The Show X Stories");
         assert_eq!(info.season_number, Some(4));
 
         let pack = parse_series_info(Path::new(
-            "/tv/Doctor.Who.2005.S02.1080p.BluRay.x264-GRP/Doctor.Who.2005.S02E01.mkv",
+            "/tv/Show.K.2005.S02.1080p.BluRay.x264-GRP/Show.K.2005.S02E01.mkv",
         ))
         .expect("series info");
-        assert_eq!(pack.series_name, "Doctor Who");
+        assert_eq!(pack.series_name, "Show K");
         assert_eq!(pack.series_year, Some(2005));
         assert_eq!(pack.season_number, Some(2));
         assert_eq!(pack.episode_number, Some(1));
@@ -8422,14 +8418,13 @@ mod tests {
 
     #[test]
     fn a_release_folder_inside_its_show_folder_keeps_the_show_folder() {
-        let p = Path::new(
-            "/tv/Person of Interest (2011)/Person.of.Interest.S01E03.720p.HDTV.x264-IMMERSE/e.mkv",
-        );
+        let p =
+            Path::new("/tv/Man of Mystery (2011)/Man.of.Mystery.S01E03.720p.HDTV.x264-GRP/e.mkv");
         let info = parse_series_info(p).expect("series info");
-        assert_eq!(info.series_name, "Person of Interest");
+        assert_eq!(info.series_name, "Man of Mystery");
         assert_eq!(
             info.series_folder.as_deref(),
-            Some("/tv/Person of Interest (2011)")
+            Some("/tv/Man of Mystery (2011)")
         );
         assert_eq!(info.series_year, Some(2011));
     }
@@ -8442,27 +8437,25 @@ mod tests {
         assert_eq!(info.series_folder.as_deref(), Some("/tv/Show"));
 
         let rooted = parse_series_info(Path::new(
-            "/tv/Doctor.Who.2005.S02.1080p/Doctor.Who.2005.S02E01.720p-GRP/x.mkv",
+            "/tv/Show.K.2005.S02.1080p/Show.K.2005.S02E01.720p-GRP/x.mkv",
         ))
         .expect("series info");
-        assert_eq!(rooted.series_folder.as_deref(), Some("/tv/Doctor Who"));
+        assert_eq!(rooted.series_folder.as_deref(), Some("/tv/Show K"));
 
-        let in_show = parse_series_info(Path::new(
-            "/tv/Doctor Who/Doctor.Who.2005.S02E01.720p-GRP/x.mkv",
-        ))
-        .expect("series info");
-        assert_eq!(in_show.series_folder.as_deref(), Some("/tv/Doctor Who"));
+        let in_show = parse_series_info(Path::new("/tv/Show K/Show.K.2005.S02E01.720p-GRP/x.mkv"))
+            .expect("series info");
+        assert_eq!(in_show.series_folder.as_deref(), Some("/tv/Show K"));
         assert_eq!(in_show.series_year, Some(2005));
     }
 
     #[test]
     fn a_show_folder_with_a_number_is_not_a_release_folder() {
-        for show in ["Stargate SG-1", "Show 1920x1080", "Ep 12", "Glee"] {
+        for show in ["Show N-1", "Show 1920x1080", "Ep 12", "Show P"] {
             assert!(parse_release_folder(show).is_none(), "{show}");
         }
-        let info = parse_series_info(Path::new("/tv/Stargate SG-1/Season 02/S02E05.mkv"))
-            .expect("series info");
-        assert_eq!(info.series_name, "Stargate SG-1");
+        let info =
+            parse_series_info(Path::new("/tv/Show N-1/Season 02/S02E05.mkv")).expect("series info");
+        assert_eq!(info.series_name, "Show N-1");
     }
 
     // LIB-C11 — two distinct shows sharing a name must yield the SAME
@@ -8489,13 +8482,13 @@ mod tests {
     #[test]
     fn folder_year_only_parsed_from_trailing_parenthesised_4digit() {
         // No year marker → None.
-        let p = Path::new("/tv/Firefly/Season 01/S01E01.mkv");
+        let p = Path::new("/tv/Show O/Season 01/S01E01.mkv");
         let info = parse_series_info(p).expect("series info");
-        assert_eq!(info.series_name, "Firefly");
-        assert_eq!(info.series_folder.as_deref(), Some("/tv/Firefly"));
+        assert_eq!(info.series_name, "Show O");
+        assert_eq!(info.series_folder.as_deref(), Some("/tv/Show O"));
         assert_eq!(info.series_year, None);
         // Falls back to the bare name as identity key when no folder year.
-        assert_eq!(info.series_key(), "/tv/Firefly");
+        assert_eq!(info.series_key(), "/tv/Show O");
 
         // Parenthesised non-year doesn't masquerade as a year.
         assert_eq!(parse_folder_year("Show (Uncut)"), None);
@@ -9617,7 +9610,7 @@ mod tests {
         ]);
         assert_eq!(groups.len(), 3, "{groups:?}");
         assert_eq!(name_show_year("Foo - S01E02 - 1969.mkv"), None);
-        assert_eq!(name_show_year("Show.C.1988.S01E01.mkv"), Some(1988));
+        assert_eq!(name_show_year("Show.K.1988.S01E01.mkv"), Some(1988));
     }
 
     /// A theme song belongs to its title folder: two shows of one name are
