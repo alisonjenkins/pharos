@@ -1,10 +1,12 @@
 //! The lyric word aligner service; see `pharos_align::http` for the API.
 
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
 use actix_web::{web, App, HttpServer};
 use pharos_align::config::Config;
+use pharos_align::device::{self, DeviceMode};
 use pharos_align::forward::cpu::CpuModel;
 use pharos_align::forward::CpuAligner;
 use pharos_align::http::{configure, AppState};
@@ -76,6 +78,100 @@ fn pin_threads(mode: pin::PinMode, threads: usize) -> (pin::Plan, Option<String>
     (plan, err)
 }
 
+/// The CPU pass, its spans tagged with `reason`.
+fn cpu_model(
+    weights: &Path,
+    threads: usize,
+    batch_samples: usize,
+    reason: &str,
+) -> Result<Box<dyn Model>, String> {
+    let weights = Weights::open(weights).map_err(|e| e.to_string())?;
+    let model = CpuModel::load(weights, threads).map_err(|e| e.to_string())?;
+    Ok(Box::new(CpuAligner {
+        model,
+        batch_samples,
+        reason: reason.into(),
+    }))
+}
+
+/// One second of synthetic audio through the GPU pass: an adapter that
+/// cannot run the model is caught at start, not on the first song.
+#[cfg(feature = "vulkan")]
+fn check_gpu(weights: &Path, adapter: &device::Adapter) -> Result<(), String> {
+    use pharos_align::forward::vulkan::VulkanModel;
+    let run = || -> Result<(), String> {
+        let w = Weights::open(weights).map_err(|e| e.to_string())?;
+        let m = VulkanModel::load(&w, device::burn_device(adapter)).map_err(|e| e.to_string())?;
+        let wave: Vec<f32> = (0..16_000).map(|i| (i as f32 * 0.07).sin() * 0.3).collect();
+        m.logits(&pharos_align::forward::normalise(&wave))
+            .map(|_| ())
+    };
+    std::panic::catch_unwind(run).unwrap_or_else(|_| Err("the GPU pass panicked".into()))
+}
+
+/// R10 and R11: probe (unless forced to the CPU), choose, check the GPU,
+/// and log the outcome once.
+fn choose_device(config: &Config) -> Result<device::Choice, String> {
+    let adapters = if config.device == DeviceMode::Cpu {
+        Vec::new()
+    } else {
+        device::probe()
+    };
+    let choice = device::choose(config.device, &adapters).map_err(|e| e.to_string())?;
+    #[cfg(feature = "vulkan")]
+    let choice = match &choice.device {
+        device::Device::Vulkan(a) => {
+            let checked = check_gpu(&config.weights, a);
+            device::after_warmup(config.device, choice.clone(), checked)
+                .map_err(|e| e.to_string())?
+        }
+        device::Device::Cpu => choice,
+    };
+    let adapter = match &choice.device {
+        device::Device::Vulkan(a) => a.name.as_str(),
+        device::Device::Cpu => "none",
+    };
+    let seen: Vec<&str> = adapters.iter().map(|a| a.name.as_str()).collect();
+    tracing::info!(
+        mode = %config.device.label(),
+        device = %choice.device.label(),
+        reason = %choice.reason,
+        adapter = %adapter,
+        adapters_seen = ?seen,
+        "forward device"
+    );
+    Ok(choice)
+}
+
+/// Builds the chosen pass on first use and after an idle unload; on the GPU,
+/// with the CPU pass behind it for songs the GPU fails.
+fn loader(config: &Config, choice: device::Choice) -> Loader {
+    let (weights, threads, batch) = (config.weights.clone(), config.threads, config.batch_samples);
+    let reason = choice.reason;
+    match choice.device {
+        device::Device::Cpu => Box::new(move || cpu_model(&weights, threads, batch, &reason)),
+        #[cfg(feature = "vulkan")]
+        device::Device::Vulkan(adapter) => Box::new(move || {
+            use pharos_align::forward::fallback::Fallback;
+            use pharos_align::forward::vulkan::VulkanModel;
+            use pharos_align::forward::VulkanAligner;
+            let w = Weights::open(&weights).map_err(|e| e.to_string())?;
+            let model =
+                VulkanModel::load(&w, device::burn_device(&adapter)).map_err(|e| e.to_string())?;
+            let gpu = VulkanAligner {
+                model,
+                reason: reason.clone(),
+                adapter: adapter.name.clone(),
+            };
+            let weights = weights.clone();
+            let cpu = Box::new(move || cpu_model(&weights, threads, batch, "gpu_fallback"));
+            Ok(Box::new(Fallback::new(Box::new(gpu), cpu)) as Box<dyn Model>)
+        }),
+        #[cfg(not(feature = "vulkan"))]
+        device::Device::Vulkan(_) => Box::new(|| Err("built without the vulkan feature".into())),
+    }
+}
+
 fn main() -> std::process::ExitCode {
     let config = match Config::from_env(|k| std::env::var(k).ok()) {
         Ok(c) => c,
@@ -117,17 +213,8 @@ async fn run(config: Config, (plan, pin_err): (pin::Plan, Option<String>)) -> Re
     let ffmpeg = std::env::var("PHAROS_ALIGNER_FFMPEG").unwrap_or_else(|_| "ffmpeg".into());
     let decoder: Decoder =
         Box::new(move |path, start, end| pharos_align::audio::decode(&ffmpeg, path, start, end));
-    let (weights, threads, batch_samples) =
-        (config.weights.clone(), config.threads, config.batch_samples);
-    let loader: Loader = Box::new(move || {
-        let weights = Weights::open(&weights).map_err(|e| e.to_string())?;
-        let model = CpuModel::load(weights, threads).map_err(|e| e.to_string())?;
-        Ok(Box::new(CpuAligner {
-            model,
-            batch_samples,
-            reason: "forced_cpu".into(),
-        }) as Box<dyn Model>)
-    });
+    let choice = choose_device(&config)?;
+    let loader = loader(&config, choice);
     let engine = Arc::new(Engine::new(loader, decoder, config.idle_unload));
 
     if let Some(idle) = config.idle_unload {
