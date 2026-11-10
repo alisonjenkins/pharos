@@ -32,6 +32,20 @@ const songBy = (t: Song) => t.AlbumArtist ?? t.Artists?.[0];
 // and the helper returns once the page has moved to that hit and shows it.
 // The shows, seasons, artists and albums listed ahead of titles (V518) are
 // passed over.
+// A library's sort and filter sheet (B1311): every choice is a pill in a
+// labelled group, opened from the bar's Filters pill. Each choice applies at
+// once; the sheet is modal, so it is closed again before the grid is used.
+async function chooseFilter(page: Page, group: string, choice: string): Promise<void> {
+  const sheet = page.getByRole("dialog", { name: "Sort and filter" });
+  await page.getByRole("button", { name: /^Filters/ }).click();
+  await sheet
+    .getByRole("group", { name: group, exact: true })
+    .getByRole("button", { name: choice, exact: true })
+    .click();
+  await sheet.getByRole("button", { name: "Done", exact: true }).click();
+  await expect(sheet).toHaveCount(0);
+}
+
 async function openFirstHit(page: Page, term: string): Promise<void> {
   await page.getByRole("combobox", { name: "Search all libraries" }).fill(term);
   const group = page.locator(".pharos-muted", {
@@ -885,14 +899,14 @@ test.describe("pharos Dioxus UI", () => {
 
       // A filter narrows the listing but keeps it in name order: the rail
       // stays and still jumps (V252).
-      await page.getByLabel("Watched", { exact: true }).selectOption("unwatched");
+      await chooseFilter(page, "Watched", "Unwatched");
       await expect(rail).toBeVisible({ timeout: 15_000 });
       await rail.getByRole("button", { name: "Z", exact: true }).click();
       await expect(tiles.filter({ hasText: /^ZZ Bulk/ }).first()).toBeInViewport({
         timeout: 15_000,
       });
-      await page.getByLabel("Watched", { exact: true }).selectOption({ index: 0 });
-      await page.getByLabel("Genre", { exact: true }).selectOption("Drama");
+      await chooseFilter(page, "Watched", "All");
+      await chooseFilter(page, "Genre", "Drama");
       await expect(tiles).toHaveCount(60, { timeout: 15_000 });
       await expect(rail).toBeVisible({ timeout: 15_000 });
       // The Dramas are the even titles, which run A, C, E ... Y.
@@ -901,11 +915,11 @@ test.describe("pharos Dioxus UI", () => {
       await expect(tiles.filter({ hasText: /^YY Bulk/ }).first()).toBeInViewport({
         timeout: 15_000,
       });
-      await page.getByLabel("Genre", { exact: true }).selectOption({ index: 0 });
+      await chooseFilter(page, "Genre", "All genres");
 
       // A date order jumps by year instead (V256). The Dramas span 40 years,
       // more than the rail shows at once, so it shows every few.
-      await page.getByLabel("Sort", { exact: true }).selectOption("released");
+      await chooseFilter(page, "Sort by", "Release date");
       const years = page.getByRole("navigation", { name: "Jump to year" });
       await expect(years).toBeVisible({ timeout: 15_000 });
       await expect(rail).toHaveCount(0);
@@ -920,8 +934,8 @@ test.describe("pharos Dioxus UI", () => {
       await expect.poll(() => page.evaluate(() => window.scrollY)).toBeGreaterThan(0);
 
       // Date added, newest first: everything arrived this year.
-      await page.getByLabel("Sort", { exact: true }).selectOption("added");
-      await expect(page.getByRole("button", { name: /Sort direction: Newest first/ })).toBeVisible();
+      await chooseFilter(page, "Sort by", "Date added");
+      await expect(page.getByRole("button", { name: "Sort: Date added, Newest first" })).toBeVisible();
       await expect(years.getByRole("button")).toHaveCount(1, { timeout: 15_000 });
       await expect(years.getByRole("button").first()).toHaveText(
         String(new Date().getUTCFullYear()),
@@ -985,8 +999,8 @@ test.describe("pharos Dioxus UI", () => {
       expect(bare.search).toBe("");
 
       // Z to A, unwatched only: both land in the URL.
-      await page.getByRole("button", { name: /^Sort direction/ }).click();
-      await page.getByLabel("Watched", { exact: true }).selectOption("unwatched");
+      await chooseFilter(page, "Order", "Z to A");
+      await chooseFilter(page, "Watched", "Unwatched");
       await expect(page).toHaveURL(/\?dir=desc&watched=unwatched$/);
       await expect(reset).toBeVisible();
 
@@ -1014,10 +1028,8 @@ test.describe("pharos Dioxus UI", () => {
 
       const backTo = async (how: string) => {
         await expect(page).toHaveURL(/\?dir=desc&watched=unwatched$/, { timeout: 15_000 });
-        await expect(page.getByLabel("Watched", { exact: true })).toHaveValue("unwatched");
-        await expect(page.getByRole("button", { name: /^Sort direction/ })).toHaveText(
-          "Z to A",
-        );
+        await expect(page.getByRole("button", { name: "Remove filter: Unwatched" })).toBeVisible();
+        await expect(page.getByRole("button", { name: "Sort: Name, Z to A" })).toBeVisible();
         // `name` came from `innerText`, so compare against the same.
         await expect(tiles.nth(left.at)).toHaveText(name, {
           timeout: 15_000,
@@ -1087,7 +1099,7 @@ test.describe("pharos Dioxus UI", () => {
       await reset.click();
       await expect(page).toHaveURL(new RegExp(`${bare.pathname}$`));
       await expect(reset).toHaveCount(0);
-      await expect(page.getByRole("button", { name: /^Sort direction/ })).toHaveText("A to Z");
+      await expect(page.getByRole("button", { name: "Sort: Name, A to Z" })).toBeVisible();
       await expect(tiles.filter({ hasText: /^AA Bulk/ }).first()).toBeInViewport({
         timeout: 15_000,
       });
