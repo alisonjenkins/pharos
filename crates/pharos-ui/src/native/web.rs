@@ -780,6 +780,7 @@ pub fn show_text_track(video_id: &str, track_id: Option<&str>) {
         return;
     };
     watch_cue_video(video_id);
+    shift_native_cues(video_id);
     for i in 0..tracks.length() {
         if let Some(t) = tracks.get(i) {
             let on = track_id.is_some_and(|id| t.id() == id);
@@ -813,6 +814,91 @@ pub fn hide_text_track(video_id: &str, track_id: &str) {
             } else {
                 web_sys::TextTrackMode::Disabled
             });
+        }
+    }
+}
+
+thread_local! {
+    /// The viewer's subtitle delay in ms (T038-305), which every renderer
+    /// reads: the Rust renderer per frame, JASSUB as its time offset, the
+    /// native `<track>` fallback as shifted cue times.
+    static SUBTITLE_DELAY_MS: Cell<i64> = const { Cell::new(0) };
+    /// The JASSUB instance drawing now, to hand it a new delay.
+    static LIVE_JASSUB: RefCell<Option<JsValue>> = const { RefCell::new(None) };
+}
+
+/// The viewer's subtitle delay in ms: positive shows subtitles later.
+pub fn subtitle_delay_ms() -> i64 {
+    SUBTITLE_DELAY_MS.with(Cell::get)
+}
+
+/// Show every subtitle renderer's cues `delay_ms` later than the file says.
+pub fn set_subtitle_delay(video_id: &str, delay_ms: i64) {
+    SUBTITLE_DELAY_MS.with(|d| d.set(delay_ms));
+    LIVE_JASSUB.with(|j| {
+        if let Some(jassub) = j.borrow().as_ref() {
+            set_jassub_delay(jassub, delay_ms);
+        }
+    });
+    shift_native_cues(video_id);
+}
+
+/// JASSUB draws the script at `mediaTime + timeOffset`, so a later
+/// subtitle is a negative offset.
+fn set_jassub_delay(jassub: &JsValue, delay_ms: i64) {
+    let _ = js_sys::Reflect::set(
+        jassub,
+        &JsValue::from_str("timeOffset"),
+        &JsValue::from_f64(-(delay_ms as f64) / 1000.0),
+    );
+}
+
+/// Moves each loaded `<track>` cue to its file time plus the delay. The
+/// file time is kept on the cue the first time it is moved, so a new delay
+/// replaces the old one instead of adding to it.
+fn shift_native_cues(video_id: &str) {
+    let Some(tracks) = video_element(video_id).and_then(|v| v.text_tracks()) else {
+        return;
+    };
+    let delay_s = subtitle_delay_ms() as f64 / 1000.0;
+    let key = |k: &str| JsValue::from_str(k);
+    for i in 0..tracks.length() {
+        let Some(t) = tracks.get(i) else { continue };
+        let Ok(cues) = js_sys::Reflect::get(&t, &key("cues")) else {
+            continue;
+        };
+        let count = js_sys::Reflect::get(&cues, &key("length"))
+            .ok()
+            .and_then(|n| n.as_f64())
+            .unwrap_or(0.0) as u32;
+        for c in 0..count {
+            let Ok(cue) = js_sys::Reflect::get_u32(&cues, c) else {
+                continue;
+            };
+            let time = |own: &str, file: &str| -> Option<f64> {
+                let kept = js_sys::Reflect::get(&cue, &key(file)).ok()?.as_f64();
+                kept.or_else(|| {
+                    let t = js_sys::Reflect::get(&cue, &key(own)).ok()?.as_f64()?;
+                    let _ = js_sys::Reflect::set(&cue, &key(file), &JsValue::from_f64(t));
+                    Some(t)
+                })
+            };
+            let (Some(start), Some(end)) = (
+                time("startTime", "pharosFileStart"),
+                time("endTime", "pharosFileEnd"),
+            ) else {
+                continue;
+            };
+            let _ = js_sys::Reflect::set(
+                &cue,
+                &key("startTime"),
+                &JsValue::from_f64((start + delay_s).max(0.0)),
+            );
+            let _ = js_sys::Reflect::set(
+                &cue,
+                &key("endTime"),
+                &JsValue::from_f64((end + delay_s).max(0.0)),
+            );
         }
     }
 }
@@ -3408,6 +3494,8 @@ pub async fn styled_subtitles(
     // how a tier drop tells the renderer's cost from the video's (B667).
     set(&options, "debug", &JsValue::TRUE)?;
     let jassub = Jassub::new(&options).map_err(|e| format!("{e:?}"))?;
+    set_jassub_delay(&jassub, subtitle_delay_ms());
+    LIVE_JASSUB.with(|j| *j.borrow_mut() = Some(JsValue::clone(&jassub)));
     // Counting only: its default per-frame console line would flood the log.
     let debug = jassub.debug();
     if debug.is_object() {
