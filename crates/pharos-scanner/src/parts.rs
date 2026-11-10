@@ -257,7 +257,7 @@ pub(crate) fn verdict(
         let Some(stored) = titles.get(path) else {
             return (StackOutcome::Unprobed, path.display().to_string());
         };
-        if stored.duration_ms.is_none() {
+        if stored.duration_ms.unwrap_or(0) == 0 {
             return (StackOutcome::NoDuration, path.display().to_string());
         }
         let Some(title) = stored.title.as_deref().filter(|t| !title_key(t).is_empty()) else {
@@ -479,6 +479,14 @@ mod tests {
         if let Some(cd2) = timeless.get_mut(Path::new("/m/G/G (2003) cd2.mkv")) {
             cd2.duration_ms = None;
         }
+        let mut zero = both.clone();
+        if let Some(cd2) = zero.get_mut(Path::new("/m/G/G (2003) cd2.mkv")) {
+            cd2.duration_ms = Some(0);
+        }
+        assert_eq!(
+            verdict(&pair, &candidates(&pair)[0], &zero).0,
+            StackOutcome::NoDuration
+        );
         let found = candidates(&pair);
         let (outcome, value) = verdict(&pair, &found[0], &timeless);
         assert_eq!(outcome, StackOutcome::NoDuration);
