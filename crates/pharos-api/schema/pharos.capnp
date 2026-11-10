@@ -12,7 +12,7 @@ annotation secret(field, param) :Void;
 
 # Bumped when the schema changes; served as ServerInfo.schemaVersion so a client
 # can tell which methods a server knows (FR-009).
-const schemaVersion :UInt32 = 35;
+const schemaVersion :UInt32 = 36;
 
 # ---- ids and shared types -------------------------------------------------
 struct ItemId {                # mirrors pharos_jellyfin_api::WireId
@@ -399,7 +399,8 @@ interface UserData {
   setPlayed @0 (ctx :CallContext, id :ItemId, played :Bool) -> (result :UserStateResult);
   setFavorite @1 (ctx :CallContext, id :ItemId, favorite :Bool) -> (result :UserStateResult);
   # Refused with Error for a non-book, an unreadable book, a locator over 256 bytes or a fraction outside 0..1. Since schemaVersion 32.
-  setReadPosition @2 (ctx :CallContext, id :ItemId, locator :Text, fraction :Float32) -> (result :UserStateResult);
+  # `readAt` is when the page was read, unix milliseconds on the client's clock; 0 means now, one ahead of the server's clock counts as now. The server keeps the newest reading: an older one is not stored and the state answers with the stored position. Since schemaVersion 36.
+  setReadPosition @2 (ctx :CallContext, id :ItemId, locator :Text, fraction :Float32, readAt :Int64) -> (result :UserStateResult);
 }
 struct UserStateResult { union { state @0 :UserState; error @1 :Error; } }
 
