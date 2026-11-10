@@ -4460,6 +4460,13 @@ body::before {
   --px-gutter: 48px;
   padding: 1.5rem var(--px-gutter) 27px;
 }
+/* B1277: the player's controls keep to the same title-safe area, so the
+   seek bar, and the trick-play preview clamped inside it, never reach a
+   panel's overscan. */
+:root[data-device="tv"] .pharos-controls {
+  padding-inline: 48px;
+  padding-bottom: 27px;
+}
 /* A TV's GPU is the weakest part of it (the G08 is a Mali on 2.4 GB). Each
    poster's translateZ(0) gave it its own compositor layer, hundreds on a
    home page, and the lift drew blurred shadows and 3D tilt; a backdrop
