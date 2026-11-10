@@ -204,6 +204,15 @@ pub trait OnlineEnricher: Send + Sync {
         async { None }
     }
 
+    /// B989 — a backfill pass is starting: a provider may keep what it reads
+    /// once per show (an episode list) until [`end_pass`](Self::end_pass).
+    /// Providers with nothing to keep ignore it.
+    fn begin_pass(&self) {}
+
+    /// B989 — the pass is over: drop everything kept since
+    /// [`begin_pass`](Self::begin_pass). Must be safe to call without one.
+    fn end_pass(&self) {}
+
     /// Spec 033 (B982) — show `id`'s first and last air dates by its series
     /// record. `None` when the request failed or the provider has no record.
     fn series_run(&self, id: &str) -> impl Future<Output = Option<SeriesRun>> + Send {
