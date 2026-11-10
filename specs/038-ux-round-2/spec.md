@@ -205,8 +205,10 @@ command counter. The rest is client-only and proved by browser tests at
   server busy, waiting for a named group member. Today every wait reads
   "Waiting for the server…" (`watch_view.rs:841-850`) [B18].
 - **FR-402** The server tells the client when a play or seek is queued behind
-  busy encoders: a load hint on the grant or a `Server-Timing` figure on the
-  segment response. `queue_wait_ms` is recorded server-side only today
+  busy encoders, and the client must be able to learn it *while* the request
+  is still pending: a load hint on the grant, a push event, or a cheap status
+  call. A figure on the segment response alone arrives after the wait has
+  ended and does not meet this. `queue_wait_ms` is recorded server-side only today
   (`pharos-transcode/src/scheduler.rs:1863-1931`). No new per-session state
   on the server beyond what the scheduler already holds.
 - **FR-403** The failure panel picks its hint from the failure kind (network,
