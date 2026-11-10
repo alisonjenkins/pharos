@@ -475,6 +475,54 @@ fn remember_skip(item: ItemRef, version: &str, from_ms: u64, to_ms: u64) {
     );
 }
 
+/// The tab's queue from before a reload, else an empty one. A record that
+/// cannot be read is logged with its reason and dropped.
+fn restore_queue() -> Queue {
+    let text = match platform::session_get(super::queue::QUEUE_KEY) {
+        Ok(Some(text)) => text,
+        Ok(None) => return Queue::default(),
+        Err(e) => {
+            platform::warn(&format!(
+                "pharos: queue restore failed reason=unreadable error={e}"
+            ));
+            return Queue::default();
+        }
+    };
+    match Queue::restore(&text) {
+        Ok(queue) => {
+            platform::info(&format!(
+                "pharos: queue restored upcoming={} shuffled={}",
+                queue.upcoming().len(),
+                queue.shuffled()
+            ));
+            queue
+        }
+        Err(e) => {
+            platform::warn(&format!(
+                "pharos: queue restore failed reason=invalid error={e}"
+            ));
+            Queue::default()
+        }
+    }
+}
+
+/// Keeps the queue for the tab. A failure is logged once per reason, as the
+/// queue changes with every song.
+fn store_queue(text: &str) {
+    thread_local! {
+        static LAST_ERROR: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+    }
+    let result = platform::session_set(super::queue::QUEUE_KEY, text);
+    LAST_ERROR.with_borrow_mut(|last| match result {
+        Ok(()) => *last = None,
+        Err(e) if last.as_deref() != Some(e.as_str()) => {
+            platform::warn(&format!("pharos: queue not stored error={e}"));
+            *last = Some(e);
+        }
+        Err(_) => {}
+    });
+}
+
 fn store_setting(key: &str, value: &str) {
     if let Err(e) = platform::store_theme(key, value) {
         platform::warn(&signal::storage_failed(key, &e));
@@ -1779,9 +1827,11 @@ fn NativeApp(route: Route) -> Element {
     // Reading saved offline is sent from wherever the user is (spec 036).
     #[cfg(all(feature = "web", target_arch = "wasm32"))]
     super::reader_web::use_pending_flush(api);
-    // The play queue lives as long as the app, across pages and songs.
-    let queue = use_signal(Queue::default);
+    // The play queue lives as long as the app, across pages and songs, and
+    // is kept for the tab so a reload keeps it (FR-704).
+    let queue = use_signal(restore_queue);
     use_context_provider(|| QueueCtx(queue));
+    use_effect(move || store_queue(&queue.read().save()));
     // Films, episodes and music videos queue apart from songs (V853).
     use_context_provider(|| VideoQueueCtx(Signal::new(Queue::default()), Signal::new(false)));
     // The mix that is on keeps the queue topped up (spec 024, B441).
