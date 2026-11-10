@@ -276,7 +276,10 @@ impl Aligner {
         let (tx, mut rx) = mpsc::channel(64);
         let cache = AlignCache::new(cache_dir);
         let base = url.trim_end_matches('/').to_owned();
-        let shadow = shadow_url.map(|u| Shadow::new(http.clone(), &u));
+        let shadow = shadow_url.map(|u| {
+            super::shadow::register_series();
+            Shadow::new(http.clone(), &u)
+        });
         let aligner = Arc::new(Self {
             shadow,
             http,
@@ -722,6 +725,50 @@ mod tests {
             "the mismatch replaced nothing"
         );
         assert_eq!(seen, vec![("song".into(), "mismatch".into(), 1)]);
+    }
+
+    fn shadow_series(body: &str) -> Vec<&str> {
+        use crate::services::lyrics::shadow::SHADOW_TOTAL;
+        body.lines()
+            .filter(|l| l.starts_with(&format!("{SHADOW_TOTAL}{{")))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn every_shadow_series_is_rendered_at_zero_once_a_shadow_is_set() {
+        use crate::services::lyrics::shadow::{Outcome, SHADOW_TOTAL};
+
+        crate::obs::init("info", None).unwrap();
+        let _aligner = Aligner::start(
+            "http://127.0.0.1:9".into(),
+            Some("http://127.0.0.1:9".into()),
+            PathBuf::from("/m"),
+            None,
+        );
+        let body = crate::obs::render();
+        let series = shadow_series(&body);
+        assert_eq!(
+            series.len(),
+            Outcome::ALL.len() * Source::ALL.len(),
+            "{series:?}"
+        );
+        for source in Source::ALL {
+            for outcome in Outcome::ALL {
+                let line = format!(
+                    "{SHADOW_TOTAL}{{outcome=\"{}\",path=\"{}\"}} 0",
+                    outcome.label(),
+                    source.label()
+                );
+                assert!(series.contains(&line.as_str()), "{line} not in {series:?}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn no_shadow_series_is_rendered_without_a_shadow() {
+        crate::obs::init("info", None).unwrap();
+        let _aligner = Aligner::start("http://127.0.0.1:9".into(), None, PathBuf::from("/m"), None);
+        assert_eq!(shadow_series(&crate::obs::render()), Vec::<&str>::new());
     }
 
     #[tokio::test]
