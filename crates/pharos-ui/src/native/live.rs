@@ -29,8 +29,9 @@ pub const COALESCE_MS: u32 = 750;
 /// memory starts again, which costs at most one extra reload.
 const KNOWN_MAX: usize = 4096;
 
-/// The topics the UI follows; scan progress has no screen yet.
-const TOPICS: [&str; 2] = ["userData", "library"];
+/// The topics the UI follows: watched marks, library changes, and scan
+/// progress for Manage.
+const TOPICS: [&str; 3] = ["userData", "library", "task"];
 
 /// Bumped when the library changed, so screens listing it reload.
 #[derive(Clone, Copy)]
@@ -104,20 +105,31 @@ fn follow_scan(scan: &mut Signal<ScanView>, batch: &[PushEvent]) {
 fn fold_tasks(view: &mut ScanView, batch: &[PushEvent]) -> bool {
     let mut changed = false;
     for event in batch {
-        if let PushEvent::Task {
-            id,
-            progress,
-            state,
-            counts,
-        } = event
-        {
-            let counts = ScanCounts {
-                added: counts.added,
-                changed: counts.changed,
-                removed: counts.removed,
-                failed_roots: counts.failed_roots,
-            };
-            changed |= view.apply(id, *progress, state, counts);
+        match event {
+            PushEvent::Task {
+                id,
+                progress,
+                state,
+                counts,
+            } => {
+                let counts = ScanCounts {
+                    added: counts.added,
+                    changed: counts.changed,
+                    removed: counts.removed,
+                    failed_roots: counts.failed_roots,
+                };
+                changed |= view.apply(id, *progress, state, counts);
+            }
+            // Events were lost, the scan's end among them perhaps: a bar
+            // left running would never finish.
+            PushEvent::Resync => {
+                if view.running.is_some() || !view.libraries.is_empty() {
+                    view.running = None;
+                    view.libraries.clear();
+                    changed = true;
+                }
+            }
+            PushEvent::UserData { .. } | PushEvent::Library { .. } => {}
         }
     }
     changed
@@ -266,6 +278,29 @@ mod tests {
         assert!(!fold_tasks(&mut view, &[user_data(1, true, 0)]));
         assert!(fold_tasks(&mut view, &[task(1.0, "done", 2)]));
         assert_eq!(view.last.map(|r| r.counts.added), Some(2));
+    }
+
+    /// Disarm check: with "task" dropped from TOPICS the server never sends
+    /// scan events and Manage shows no bar.
+    #[test]
+    fn the_ui_subscribes_to_scan_progress() {
+        assert!(TOPICS.contains(&"task"));
+    }
+
+    #[test]
+    fn a_resync_ends_a_running_bar_and_keeps_the_last_result() {
+        let mut view = ScanView::default();
+        let task = |progress, state: &str| PushEvent::Task {
+            id: crate::views::scan_progress::LIBRARY_SCAN_TASK.into(),
+            progress,
+            state: state.into(),
+            counts: pharos_client::events::TaskCounts::default(),
+        };
+        fold_tasks(&mut view, &[task(1.0, "done"), task(0.2, "running")]);
+        assert!(fold_tasks(&mut view, &[PushEvent::Resync]));
+        assert_eq!(view.running, None);
+        assert!(view.last.is_some());
+        assert!(!fold_tasks(&mut view, &[PushEvent::Resync]));
     }
 
     #[test]
