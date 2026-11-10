@@ -74,23 +74,8 @@ fn emissions_match_torch_and_give_the_same_ctc_paths() {
     for (i, case) in fixture.cases.iter().enumerate() {
         let alone = m.logits(&refs[i..=i]).remove(0);
         let ours = emission(&batched[i]);
-        assert_eq!(
-            ours.len(),
-            case.frames * CLASSES,
-            "frames for {} samples",
-            case.samples
-        );
         assert_eq!(CpuModel::frames(case.samples), case.frames);
-        let worst = ours
-            .iter()
-            .zip(&case.emission)
-            .map(|(a, b)| (a - b).abs())
-            .fold(0f32, f32::max);
-        assert!(
-            worst <= MAX_ABS,
-            "{} samples: max abs {worst}",
-            case.samples
-        );
+        assert_matches_torch(&ours, case);
         let drift = emission(&alone)
             .iter()
             .zip(&ours)
@@ -101,29 +86,82 @@ fn emissions_match_torch_and_give_the_same_ctc_paths() {
             "{} samples: batched vs alone {drift}",
             case.samples
         );
-        eprintln!(
-            "samples={} frames={} max_abs={worst:e}",
-            case.samples, case.frames
-        );
+    }
+}
 
-        for tokens in [
-            &["la"][..],
-            &["hello", "world"],
-            &["oh", "the", "night", "is", "long", "and", "cold"],
-        ] {
-            let theirs = Emission::new(&case.emission, case.frames, CLASSES).unwrap();
-            let mine = Emission::new(&ours, case.frames, CLASSES).unwrap();
-            for lead in [false, true] {
-                let want = align_line(&theirs, case.samples, tokens, lead);
-                let got = align_line(&mine, case.samples, tokens, lead);
-                assert_eq!(
-                    got, want,
-                    "{} samples, {tokens:?}, lead {lead}",
-                    case.samples
-                );
-            }
+/// The checks the CPU pass meets, for any forward pass: torch's emission
+/// within `MAX_ABS`, and the same CTC paths.
+fn assert_matches_torch(ours: &[f32], case: &Case) {
+    assert_eq!(
+        ours.len(),
+        case.frames * CLASSES,
+        "frames for {} samples",
+        case.samples
+    );
+    let worst = ours
+        .iter()
+        .zip(&case.emission)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0f32, f32::max);
+    assert!(
+        worst <= MAX_ABS,
+        "{} samples: max abs {worst}",
+        case.samples
+    );
+    eprintln!(
+        "samples={} frames={} max_abs={worst:e}",
+        case.samples, case.frames
+    );
+    for tokens in [
+        &["la"][..],
+        &["hello", "world"],
+        &["oh", "the", "night", "is", "long", "and", "cold"],
+    ] {
+        let theirs = Emission::new(&case.emission, case.frames, CLASSES).unwrap();
+        let mine = Emission::new(ours, case.frames, CLASSES).unwrap();
+        for lead in [false, true] {
+            assert_eq!(
+                align_line(&mine, case.samples, tokens, lead),
+                align_line(&theirs, case.samples, tokens, lead),
+                "{} samples, {tokens:?}, lead {lead}",
+                case.samples
+            );
         }
     }
+}
+
+/// V1261: the Vulkan pass meets the CPU pass's bar on the same fixtures.
+/// Skipped, saying why, on a machine with no usable Vulkan adapter.
+#[cfg(feature = "vulkan")]
+#[test]
+#[ignore = "needs PHAROS_ALIGNER_WEIGHTS and a Vulkan GPU; run with --release --features vulkan"]
+fn vulkan_emissions_match_torch_and_give_the_same_ctc_paths() {
+    use burn::backend::{WgpuBackend, WgpuDevice, WgpuDeviceKind};
+    use pharos_align::forward::vulkan::VulkanModel;
+    let fixture: Fixture = serde_json::from_str(include_str!("../fixtures/emission.json")).unwrap();
+    let dir = std::env::var("PHAROS_ALIGNER_WEIGHTS").expect("PHAROS_ALIGNER_WEIGHTS");
+    let weights = Weights::open(std::path::Path::new(&dir)).unwrap();
+    let loaded = std::panic::catch_unwind(|| {
+        let device = WgpuDevice::new(WgpuDeviceKind::DiscreteGpu(0)).on(WgpuBackend::Vulkan);
+        VulkanModel::load(&weights, device.into())
+    });
+    let m = match loaded {
+        Ok(m) => m.unwrap(),
+        Err(_) => {
+            eprintln!("SKIPPED: no discrete Vulkan adapter (wgpu panicked creating it)");
+            return;
+        }
+    };
+    for case in &fixture.cases {
+        let logits = m
+            .logits(&normalise(&wave(case.samples, case.seed)))
+            .unwrap();
+        assert_matches_torch(&emission(&logits), case);
+    }
+    assert!(m
+        .logits(&normalise(&wave(MIN_SAMPLES - 1, 9)))
+        .unwrap()
+        .is_empty());
 }
 
 #[test]
