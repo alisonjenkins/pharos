@@ -420,50 +420,61 @@ pub struct Eviction {
     pub bytes: u64,
 }
 
-/// The automatic books to remove now. Books kept by hand are never in it and
-/// do not count toward the budget. Reading-now books expire a week after
-/// they were last opened; recent books beyond the last N go, then the
-/// automatic books left are removed oldest-opened first while their total
-/// is over the budget. A policy that is off removes the books it kept.
-pub fn plan_eviction(books: &[KeptBook], settings: &AutoKeep, now_ms: i64) -> Vec<Eviction> {
-    let mut gone = Vec::new();
+/// What to do to the automatic books now.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Plan {
+    /// Books to remove.
+    pub evict: Vec<Eviction>,
+    /// Books that stay under another reason: one a policy still wants after
+    /// the one that kept it stopped.
+    pub relabel: Vec<(String, Reason)>,
+}
+
+/// What the automatic books need now. Books kept by hand are never in it
+/// and do not count toward the budget.
+///
+/// A book stays while either active policy wants it: "reading" wants every
+/// book opened within a week, "last N" the N most recently opened automatic
+/// books (ranked across all of them, whatever kept them). A book kept for a
+/// policy that has stopped wanting it but wanted by the other is relabelled.
+/// What no policy wants goes; then, of the automatic books left, the
+/// oldest-opened go while their total is over the budget.
+pub fn plan_eviction(books: &[KeptBook], settings: &AutoKeep, now_ms: i64) -> Plan {
+    let mut by_recency: Vec<&KeptBook> = books.iter().filter(|b| b.reason.is_automatic()).collect();
+    by_recency.sort_by_key(|b| std::cmp::Reverse(b.opened_ms));
+    let mut plan = Plan::default();
     let mut left: Vec<&KeptBook> = Vec::new();
-    for book in books {
-        let why = match book.reason {
-            Reason::Hand => continue,
-            Reason::Reading if !settings.reading => Some(Why::PolicyOff),
-            Reason::Reading if now_ms.saturating_sub(book.opened_ms) > READING_KEEP_MS => {
-                Some(Why::Expired)
+    for (rank, book) in by_recency.iter().enumerate() {
+        let fresh = now_ms.saturating_sub(book.opened_ms) <= READING_KEEP_MS;
+        let reading_wants = settings.reading && fresh;
+        let recent_wants = settings.recent && rank < usize::from(settings.last_n);
+        if reading_wants || recent_wants {
+            let reason = if reading_wants {
+                Reason::Reading
+            } else {
+                Reason::Recent
+            };
+            if reason != book.reason {
+                plan.relabel.push((book.id.clone(), reason));
             }
-            Reason::Recent if !settings.recent => Some(Why::PolicyOff),
-            Reason::Reading | Reason::Recent => None,
+            left.push(book);
+            continue;
+        }
+        let why = if !settings.reading && !settings.recent {
+            Why::PolicyOff
+        } else if book.reason == Reason::Reading && settings.reading {
+            Why::Expired
+        } else if settings.recent {
+            Why::BeyondLast
+        } else {
+            Why::PolicyOff
         };
-        match why {
-            Some(why) => gone.push(Eviction {
-                id: book.id.clone(),
-                why,
-                bytes: book.bytes,
-            }),
-            None => left.push(book),
-        }
-    }
-    left.sort_by_key(|b| std::cmp::Reverse(b.opened_ms));
-    let mut within_last = 0_usize;
-    left.retain(|book| {
-        if book.reason != Reason::Recent {
-            return true;
-        }
-        within_last = within_last.saturating_add(1);
-        if within_last <= usize::from(settings.last_n) {
-            return true;
-        }
-        gone.push(Eviction {
+        plan.evict.push(Eviction {
             id: book.id.clone(),
-            why: Why::BeyondLast,
+            why,
             bytes: book.bytes,
         });
-        false
-    });
+    }
     let mut total = left
         .iter()
         .fold(0_u64, |sum, b| sum.saturating_add(b.bytes));
@@ -472,13 +483,14 @@ pub fn plan_eviction(books: &[KeptBook], settings: &AutoKeep, now_ms: i64) -> Ve
     while total > budget {
         let Some(book) = left.pop() else { break };
         total = total.saturating_sub(book.bytes);
-        gone.push(Eviction {
+        plan.relabel.retain(|(id, _)| *id != book.id);
+        plan.evict.push(Eviction {
             id: book.id.clone(),
             why: Why::OverBudget,
             bytes: book.bytes,
         });
     }
-    gone
+    plan
 }
 
 /// A size for people: whole MB above 10 MB, a decimal below, kB under 1 MB.
@@ -927,6 +939,7 @@ mod tests {
 
     fn plan(books: &[KeptBook], settings: &AutoKeep) -> Vec<(String, Why)> {
         plan_eviction(books, settings, NOW)
+            .evict
             .into_iter()
             .map(|e| (e.id, e.why))
             .collect()
@@ -980,28 +993,97 @@ mod tests {
         );
     }
 
-    #[test]
-    fn reading_books_are_not_counted_against_the_last_n() {
-        let books = [
-            auto("r1", Reason::Reading, MIB, NOW - 10),
-            auto("r2", Reason::Reading, MIB, NOW - 20),
-            auto("c1", Reason::Recent, MIB, NOW - 30),
-            auto("c2", Reason::Recent, MIB, NOW - 40),
-        ];
-        assert!(plan(&books, &on(true, true)).is_empty());
+    fn relabelled(books: &[KeptBook], settings: &AutoKeep) -> Vec<(String, Reason)> {
+        plan_eviction(books, settings, NOW).relabel
     }
 
     #[test]
-    fn turning_a_policy_off_removes_exactly_the_books_it_kept() {
+    fn with_both_on_a_fresh_book_stays_whatever_kept_it() {
+        let books = [
+            auto("r1", Reason::Reading, MIB, NOW - 10),
+            auto("c1", Reason::Recent, MIB, NOW - 30),
+            auto("c2", Reason::Recent, MIB, NOW - 40),
+        ];
+        let s = AutoKeep {
+            last_n: 1,
+            ..on(true, true)
+        };
+        assert!(plan(&books, &s).is_empty());
+        assert_eq!(
+            relabelled(&books, &s),
+            [
+                ("c1".to_owned(), Reason::Reading),
+                ("c2".to_owned(), Reason::Reading)
+            ]
+        );
+    }
+
+    #[test]
+    fn both_on_a_book_expired_as_reading_but_within_the_last_n_is_kept_as_recent() {
+        let books = [
+            auto("fresh", Reason::Reading, MIB, NOW - 10),
+            auto("stale", Reason::Reading, MIB, NOW - 8 * DAY_MS),
+        ];
+        let s = on(true, true);
+        assert!(plan(&books, &s).is_empty());
+        assert_eq!(
+            relabelled(&books, &s),
+            [("stale".to_owned(), Reason::Recent)]
+        );
+    }
+
+    #[test]
+    fn both_on_a_book_expired_and_outside_the_last_n_is_removed() {
+        let books = [
+            auto("fresh", Reason::Reading, MIB, NOW - 10),
+            auto("stale", Reason::Reading, MIB, NOW - 8 * DAY_MS),
+        ];
+        let s = AutoKeep {
+            last_n: 1,
+            ..on(true, true)
+        };
+        assert_eq!(plan(&books, &s), [("stale".to_owned(), Why::Expired)]);
+        assert!(relabelled(&books, &s).is_empty());
+    }
+
+    #[test]
+    fn reading_on_and_last_n_off_an_expired_book_is_removed() {
+        let books = [auto("stale", Reason::Reading, MIB, NOW - 8 * DAY_MS)];
+        assert_eq!(
+            plan(&books, &on(true, false)),
+            [("stale".to_owned(), Why::Expired)]
+        );
+    }
+
+    #[test]
+    fn the_last_n_is_ranked_across_every_automatic_book() {
+        let books = [
+            auto("a", Reason::Recent, MIB, NOW - 8 * DAY_MS),
+            auto("b", Reason::Reading, MIB, NOW - 9 * DAY_MS),
+            auto("c", Reason::Recent, MIB, NOW - 10 * DAY_MS),
+        ];
+        let s = AutoKeep {
+            last_n: 2,
+            ..on(true, true)
+        };
+        assert_eq!(plan(&books, &s), [("c".to_owned(), Why::BeyondLast)]);
+        assert_eq!(relabelled(&books, &s), [("b".to_owned(), Reason::Recent)]);
+    }
+
+    #[test]
+    fn turning_a_policy_off_removes_the_books_only_it_wanted() {
         let books = [
             auto("r", Reason::Reading, MIB, NOW - 10),
-            auto("c", Reason::Recent, MIB, NOW - 20),
+            auto("c", Reason::Recent, MIB, NOW - 20 * DAY_MS),
             book("h", MIB),
         ];
+        // "Last N" alone still wants both, so they stay; the first changes reason.
+        assert!(plan(&books, &on(false, true)).is_empty());
         assert_eq!(
-            plan(&books, &on(false, true)),
-            [("r".to_owned(), Why::PolicyOff)]
+            relabelled(&books, &on(false, true)),
+            [("r".to_owned(), Reason::Recent)]
         );
+        // "Reading" alone wants only the fresh one.
         assert_eq!(
             plan(&books, &on(true, false)),
             [("c".to_owned(), Why::PolicyOff)]
@@ -1085,7 +1167,7 @@ mod tests {
     #[test]
     fn an_eviction_says_the_bytes_it_frees() {
         let books = [auto("1", Reason::Reading, 5 * MIB, NOW - 8 * DAY_MS)];
-        let out = plan_eviction(&books, &on(true, false), NOW);
+        let out = plan_eviction(&books, &on(true, false), NOW).evict;
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].bytes, 5 * MIB);
         assert_eq!(Why::Expired.label(), "expired");
