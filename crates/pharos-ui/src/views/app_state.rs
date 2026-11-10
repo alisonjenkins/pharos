@@ -577,10 +577,20 @@ pub fn AdminPane(
     /// A show's series id the Show identity tab opens its "This show" card on.
     #[props(default)]
     initial_focus: Option<String>,
+    /// Told each tab shown, the first included, so the page can keep it in
+    /// its URL (FR-209).
+    #[props(default)]
+    on_tab: Option<EventHandler<AdminTab>>,
 ) -> Element {
     let reload = use_signal(|| 0u32);
     let status = use_signal::<Option<String>>(|| None);
     let active_tab = use_signal::<AdminTab>(move || initial_tab);
+    use_effect(move || {
+        let tab = *active_tab.read();
+        if let Some(on_tab) = on_tab {
+            on_tab.call(tab);
+        }
+    });
     let users_resource = {
         let base = server_base.clone();
         let token = access_token;
