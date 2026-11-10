@@ -1,6 +1,7 @@
-//! The shadow aligner (spec 039, R21). Each song the primary aligner answers
-//! is sent again to a second service once that answer is stored, and the two
-//! answers are compared in full. The comparison is logged and counted; the
+//! The shadow aligner (spec 039, R21). Each request the primary aligner
+//! answers, a song's lyrics or a video's sung subtitle lines, is sent again
+//! to a second service once that answer is stored, and the two answers are
+//! compared in full. The comparison is logged and counted; the
 //! shadow's answer is never stored or served.
 
 use std::sync::Arc;
@@ -11,7 +12,7 @@ use tokio::sync::Semaphore;
 
 use super::align::{parse_answer, Aligned};
 
-/// `pharos_lyrics_shadow_total{outcome}`: one per finished song while a
+/// `pharos_lyrics_shadow_total{outcome,path}`: one per stored answer while a
 /// shadow is configured.
 pub const SHADOW_TOTAL: &str = "pharos_lyrics_shadow_total";
 
@@ -53,6 +54,26 @@ impl Outcome {
             Self::Error => "error",
             Self::Timeout => "timeout",
             Self::SkippedBusy => "skipped_busy",
+        }
+    }
+}
+
+/// Which aligner path asked; `label()` is the metric's `path`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Source {
+    /// A song's synced lyrics, from the background align queue.
+    Song,
+    /// A video's sung subtitle lines (B1212), asked for and awaited.
+    Lines,
+}
+
+impl Source {
+    pub const ALL: [Self; 2] = [Self::Song, Self::Lines];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Song => "song",
+            Self::Lines => "lines",
         }
     }
 }
@@ -147,19 +168,22 @@ impl Shadow {
     }
 
     /// Sends `body`, the request the primary answered with `primary`, unless
-    /// a shadow request is still in flight, in which case the song is
-    /// counted as skipped. The handle is for tests; callers drop it.
+    /// a shadow request is still in flight, in which case it is counted as
+    /// skipped. Both paths share the one slot. The handle is for tests;
+    /// callers drop it.
     pub fn spawn(
         &self,
         media_id: u64,
+        source: Source,
         body: Vec<u8>,
         primary: Aligned,
         traceparent: Option<String>,
     ) -> Option<tokio::task::JoinHandle<Outcome>> {
         let Ok(permit) = Arc::clone(&self.slot).try_acquire_owned() else {
-            record(Outcome::SkippedBusy);
+            record(Outcome::SkippedBusy, source);
             tracing::info!(
                 media.id = media_id,
+                path = source.label(),
                 outcome = Outcome::SkippedBusy.label(),
                 "lyrics: shadow compared"
             );
@@ -168,15 +192,17 @@ impl Shadow {
         let (http, url) = (self.http.clone(), self.url.clone());
         Some(tokio::spawn(async move {
             let _permit = permit;
-            let outcome = ask_and_compare(&http, &url, media_id, body, &primary, traceparent).await;
-            record(outcome);
+            let outcome =
+                ask_and_compare(&http, &url, media_id, source, body, &primary, traceparent).await;
+            record(outcome, source);
             outcome
         }))
     }
 }
 
-fn record(outcome: Outcome) {
-    metrics::counter!(SHADOW_TOTAL, "outcome" => outcome.label()).increment(1);
+fn record(outcome: Outcome, source: Source) {
+    metrics::counter!(SHADOW_TOTAL, "outcome" => outcome.label(), "path" => source.label())
+        .increment(1);
 }
 
 /// Read apart from the answer: `parse_answer` keeps the answers it would
@@ -190,6 +216,7 @@ async fn ask_and_compare(
     http: &Client,
     url: &str,
     media_id: u64,
+    source: Source,
     body: Vec<u8>,
     primary: &Aligned,
     traceparent: Option<String>,
@@ -198,6 +225,7 @@ async fn ask_and_compare(
     let failed = |outcome: Outcome, error: String| {
         tracing::warn!(
             media.id = media_id,
+            path = source.label(),
             outcome = outcome.label(),
             error = %error,
             elapsed_ms = started.elapsed().as_millis() as u64,
@@ -246,6 +274,7 @@ async fn ask_and_compare(
         None => {
             tracing::info!(
                 media.id = media_id,
+                path = source.label(),
                 outcome = Outcome::Match.label(),
                 lines = primary.lines.len(),
                 words,
@@ -258,6 +287,7 @@ async fn ask_and_compare(
         Some(d) => {
             tracing::warn!(
                 media.id = media_id,
+                path = source.label(),
                 outcome = Outcome::Mismatch.label(),
                 lines = primary.lines.len(),
                 words,
@@ -395,10 +425,42 @@ pub(super) mod tests {
     async fn run(base: &str, primary: &Aligned) -> Outcome {
         let shadow = Shadow::new(crate::http_client::client(), base);
         shadow
-            .spawn(7, b"{}".to_vec(), primary.clone(), None)
+            .spawn(7, Source::Song, b"{}".to_vec(), primary.clone(), None)
             .unwrap()
             .await
             .unwrap()
+    }
+
+    /// `(path, outcome, count)` per series, sorted.
+    pub(crate) fn by_path(snapshotter: &Snapshotter) -> Vec<(String, String, u64)> {
+        let mut out: Vec<_> = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(k, ..)| k.key().name() == SHADOW_TOTAL)
+            .filter_map(|(k, _, _, v)| {
+                let label = |name: &str| {
+                    k.key()
+                        .labels()
+                        .find(|l| l.key() == name)
+                        .map(|l| l.value().to_owned())
+                };
+                match v {
+                    DebugValue::Counter(n) => Some((label("path")?, label("outcome")?, n)),
+                    _ => None,
+                }
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn path_labels_are_distinct() {
+        let mut labels: Vec<_> = Source::ALL.iter().map(|s| s.label()).collect();
+        labels.sort_unstable();
+        labels.dedup();
+        assert_eq!(labels.len(), Source::ALL.len());
     }
 
     #[test]
@@ -516,7 +578,13 @@ pub(super) mod tests {
         let primary = answer(-40, &[&[(0, 900), (4, 1300)]]);
         let (base, sent) = fake(200, body(&primary, SHADOW_VERSION), None).await;
         let shadow = Shadow::new(crate::http_client::client(), &base);
-        let handle = shadow.spawn(7, br#"{"path":"a"}"#.to_vec(), primary.clone(), None);
+        let handle = shadow.spawn(
+            7,
+            Source::Song,
+            br#"{"path":"a"}"#.to_vec(),
+            primary.clone(),
+            None,
+        );
         assert_eq!(handle.unwrap().await.unwrap(), Outcome::Match);
         assert_eq!(sent.await.unwrap(), br#"{"path":"a"}"#.to_vec());
         assert_eq!(counts(&snapshotter), vec![("match".into(), 1)]);
@@ -582,7 +650,9 @@ pub(super) mod tests {
             .build()
             .unwrap();
         let shadow = Shadow::new(http, &base);
-        let handle = shadow.spawn(7, b"{}".to_vec(), primary, None).unwrap();
+        let handle = shadow
+            .spawn(7, Source::Song, b"{}".to_vec(), primary, None)
+            .unwrap();
         assert_eq!(handle.await.unwrap(), Outcome::Timeout);
         assert_eq!(counts(&snapshotter), vec![("timeout".into(), 1)]);
     }
@@ -597,12 +667,12 @@ pub(super) mod tests {
         let (base, sent) = fake(200, body(&primary, SHADOW_VERSION), Some(hold)).await;
         let shadow = Shadow::new(crate::http_client::client(), &base);
         let first = shadow
-            .spawn(7, b"{}".to_vec(), primary.clone(), None)
+            .spawn(7, Source::Song, b"{}".to_vec(), primary.clone(), None)
             .unwrap();
         sent.await.unwrap();
         assert!(
             shadow
-                .spawn(8, b"{}".to_vec(), primary.clone(), None)
+                .spawn(8, Source::Song, b"{}".to_vec(), primary.clone(), None)
                 .is_none(),
             "one in flight"
         );
@@ -618,6 +688,8 @@ pub(super) mod tests {
             url: format!("{base2}/align"),
             ..shadow
         };
-        assert!(again.spawn(9, b"{}".to_vec(), primary, None).is_some());
+        assert!(again
+            .spawn(9, Source::Song, b"{}".to_vec(), primary, None)
+            .is_some());
     }
 }
