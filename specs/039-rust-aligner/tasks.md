@@ -35,14 +35,14 @@
 ## Slice 5 - Warm-up and cache (V1264)
 
 - [x] T039-19 `PHAROS_ALIGNER_CACHE_DIR` wired to cubecl persistence, plus warm-up lengths, before readiness. Start log fields (V1264).
-- [ ] T039-28 `pharos_aligner_forward_seconds{device}` histogram and `aligner.rss_mib` on the song's log line, both named in spec.md's signals table and not yet emitted.
+- [x] T039-28 `pharos_aligner_forward_seconds{device}` histogram and `aligner.rss_mib` on the song's log line, both named in spec.md's signals table and not yet emitted.
 - [ ] T039-20 Measure the cold cost per window length on the RX 9070 node, and settle open question 1. Results go in this file, with ISO 8601 UTC times.
 
 ## Slice 6 - Image and chart (V1265-V1266)
 
-- [ ] T039-21 nix OCI image `pharos-aligner` from the Rust binary, with OpenBLAS, ffmpeg-headless, vulkan-loader, Mesa RADV and the weights. Image size recorded against the Python image.
-- [ ] T039-22 Chart values: `aligner.device`, `aligner.gpu.*`, `aligner.cache.*`, `aligner.shadow.*`. `helm template` tests for the GPU on and off and the shadow on and off (V1265).
-- [ ] T039-23 Readiness waits for warm-up, and the GPU pod gets the render group (V1266).
+- [x] T039-21 nix OCI image `pharos-aligner` from the Rust binary, with OpenBLAS, ffmpeg-headless, vulkan-loader, Mesa RADV and the weights. Image size recorded against the Python image. Built 2026-11-10T14:38Z as `.#alignerRsOci` (image `pharos-aligner-rs`): 2.83 GB, 1.2 GB of it weights; the Python aligner's closure is 3.5 GiB.
+- [x] T039-22 Chart values: `aligner.device`, `aligner.gpu.*`, `aligner.cache.*`, `aligner.shadow.*`. `helm template` tests for the GPU on and off and the shadow on and off (V1265).
+- [x] T039-23 Readiness waits for warm-up, and the GPU pod gets the render group (V1266).
 
 ## Slice 7 - Shadow and cutover (V1267-V1269)
 
