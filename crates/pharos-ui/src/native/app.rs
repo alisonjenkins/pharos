@@ -7043,23 +7043,28 @@ fn Player(
         let skips = skips.clone();
         move || release_track_skips(&skips, skip_owner)
     });
-    let waiting = media_rest().loading && failed().is_none();
+    let me = account.and_then(|a| {
+        a.0.read()
+            .as_ref()
+            .and_then(Option::as_ref)
+            .map(|m| (m.id.clone(), m.name.clone()))
+    });
+    let members_waiting: Vec<String> = match me {
+        Some((id, name)) if group.drives(playing_id) => group
+            .members
+            .iter()
+            .filter(|m| m.buffering && m.id != id && m.name != name)
+            .map(|m| m.name.clone())
+            .collect(),
+        _ => Vec::new(),
+    };
+    // The group can pause a ready player while another member loads; that
+    // is a wait too, and says whom it is for (038 FR-401). Only while paused:
+    // a member catching up behind a player that still plays is not a wait.
+    let rest = media_rest();
+    let waiting =
+        (rest.loading || (rest.paused && !members_waiting.is_empty())) && failed().is_none();
     let wait_caption = if waiting {
-        let me = account.and_then(|a| {
-            a.0.read()
-                .as_ref()
-                .and_then(Option::as_ref)
-                .map(|m| (m.id.clone(), m.name.clone()))
-        });
-        let members_waiting: Vec<String> = match me {
-            Some((id, name)) if group.drives(playing_id) => group
-                .members
-                .iter()
-                .filter(|m| m.buffering && m.id != id && m.name != name)
-                .map(|m| m.name.clone())
-                .collect(),
-            _ => Vec::new(),
-        };
         let facts = super::wait::WaitFacts {
             started: started(),
             seeking_to: seek_wait().map(|w| w.to_ms),
