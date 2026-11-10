@@ -8,13 +8,13 @@ publish.workspace = true
 description = "CTC forced alignment of lyric words to MMS_FA emissions, matching the Python aligner"
 
 [dependencies]
+serde_json.workspace = true
 thiserror.workspace = true
 unicode-normalization = "0.1"
 workspace-hack = { version = "0.1", path = "../../workspace-hack" }
 
 [dev-dependencies]
 serde = { workspace = true, features = ["derive"] }
-serde_json.workspace = true
 
 [lints]
 workspace = true
