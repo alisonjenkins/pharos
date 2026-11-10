@@ -173,6 +173,36 @@ return true;"#
     )
 }
 
+/// The script that loads the visualiser module into the page once, from its
+/// wasm-bindgen `glue` (`--target no-modules`) and its wasm as base64;
+/// concurrent callers share the one load, and a failed load can be retried.
+pub fn visualiser_load_js(glue: &str, wasm_b64: &str) -> String {
+    let glue = serde_json::Value::String(glue.to_owned());
+    let wasm = serde_json::Value::String(wasm_b64.to_owned());
+    // The glue's top-level `let wasm_bindgen` is only reachable by name from
+    // a classic script, so the script itself hands it to `window`. The line
+    // break is JavaScript's `\n` escape: a raw one inside the string literal
+    // is a syntax error that failed the whole load on the TV (B1032).
+    format!(
+        r#"if (!window.__pharosVisLoad) {{
+  window.__pharosVisLoad = (async () => {{
+    const s = document.createElement("script");
+    s.textContent = {glue} + "\nwindow.__pharosVisInit = wasm_bindgen;";
+    document.head.append(s);
+    if (!window.__pharosVisInit) throw new Error("the visualiser glue defined no wasm_bindgen");
+    const b = atob({wasm});
+    const bytes = new Uint8Array(b.length);
+    for (let i = 0; i < b.length; i++) bytes[i] = b.charCodeAt(i);
+    await window.__pharosVisInit({{ module_or_path: bytes }});
+    window.__pharosVis = window.__pharosVisInit;
+    return true;
+  }})();
+  window.__pharosVisLoad.catch(() => {{ window.__pharosVisLoad = null; }});
+}}
+return await window.__pharosVisLoad;"#
+    )
+}
+
 /// The script that stops page visualiser run `id`, or marks it `"gone"` so
 /// a start still on its way does nothing.
 pub fn visualiser_stop_js(id: u64) -> String {
@@ -578,6 +608,24 @@ mod tests {
                 reason: "no_webgl2".into()
             })
         );
+    }
+
+    #[test]
+    fn the_visualiser_load_script_keeps_its_line_break_escaped() {
+        let js = visualiser_load_js("let wasm_bindgen = 1;", "AAEC");
+        assert!(
+            js.contains(r#"s.textContent = "let wasm_bindgen = 1;" + "\nwindow.__pharosVisInit = wasm_bindgen;";"#),
+            "{js}"
+        );
+        // No string literal in the script spans a line.
+        for line in js.lines() {
+            assert_eq!(
+                line.matches('"').count() % 2,
+                0,
+                "unbalanced quotes: {line}"
+            );
+        }
+        assert!(js.contains(r#"atob("AAEC")"#), "{js}");
     }
 
     #[test]

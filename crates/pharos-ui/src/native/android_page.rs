@@ -1530,26 +1530,7 @@ impl Drop for PageVisualiser {
 /// Load the visualiser module into the page once; concurrent callers share
 /// the one load.
 async fn load_visualiser() -> Result<(), String> {
-    let script = format!(
-        r#"if (!window.__pharosVisLoad) {{
-  window.__pharosVisLoad = (async () => {{
-    const s = document.createElement("script");
-    s.textContent = {glue} + "
-window.__pharosVisInit = wasm_bindgen;";
-    document.head.append(s);
-    const b = atob({wasm});
-    const bytes = new Uint8Array(b.length);
-    for (let i = 0; i < b.length; i++) bytes[i] = b.charCodeAt(i);
-    await window.__pharosVisInit({{ module_or_path: bytes }});
-    window.__pharosVis = window.__pharosVisInit;
-    return true;
-  }})();
-  window.__pharosVisLoad.catch(() => {{ window.__pharosVisLoad = null; }});
-}}
-return await window.__pharosVisLoad;"#,
-        glue = js_str(VISUALISER_JS),
-        wasm = js_str(VISUALISER_WASM_B64.trim()),
-    );
+    let script = tv_page::visualiser_load_js(VISUALISER_JS, VISUALISER_WASM_B64.trim());
     let at = now_ms();
     match document::eval(&script).join::<bool>().await {
         Ok(true) => {
