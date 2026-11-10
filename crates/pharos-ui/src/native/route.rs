@@ -54,9 +54,12 @@ pub const MOUNT: &str = "/ui";
 impl Route {
     /// The route for a URL path, with or without the [`MOUNT`] prefix.
     /// Case-insensitive, as the server lowercases paths before routing; a
-    /// trailing slash is ignored.
+    /// trailing slash is ignored, and so is a query or fragment: a library's
+    /// filter rides in its URL (`?genre=…`, B560), and the TV app's history
+    /// hands back the whole path with it (B1276).
     pub fn parse(path: &str) -> Route {
-        let lower = path.to_ascii_lowercase();
+        let bare = path.split(['?', '#']).next().unwrap_or_default();
+        let lower = bare.to_ascii_lowercase();
         let mut segments: Vec<&str> = lower.split('/').filter(|s| !s.is_empty()).collect();
         if segments.first() == Some(&MOUNT.trim_start_matches('/')) {
             segments.remove(0);
@@ -246,6 +249,15 @@ mod tests {
     #[test]
     fn case_and_trailing_slashes_do_not_matter() {
         assert_eq!(Route::parse("/Title/S7/"), Route::Title(ItemRef::Synth(7)));
+        assert_eq!(
+            Route::parse("/ui/browse/s7?genre=animation"),
+            Route::Browse(ItemRef::Synth(7)),
+            "a library's filter query is not part of its route"
+        );
+        assert_eq!(
+            Route::parse("/ui/title/s7#cast"),
+            Route::Title(ItemRef::Synth(7))
+        );
         assert_eq!(Route::parse(""), Route::Home);
     }
 
