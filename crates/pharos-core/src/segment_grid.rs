@@ -184,7 +184,7 @@ mod tests {
     /// ordinary segment — the silent-frame-loss defect, back.
     #[test]
     fn only_the_last_window_of_the_grid_is_final() {
-        // Ant-Man's shape: 7026.771 s → 1172 segments, indices 0..=1171.
+        // Film AV's shape: 7026.771 s → 1172 segments, indices 0..=1171.
         let rate = FrameRate::from_mille(23_976);
         let total = Some(7026.771);
         assert!(

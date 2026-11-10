@@ -716,7 +716,7 @@ fn match_best_an_exact_name_under_the_floor_does_not_shut_out_a_prefix_match() {
 #[test]
 fn title_similarity_ignores_case_and_punctuation() {
     assert!(title_similarity("WALL·E", "wall e") > 0.85);
-    assert!(title_similarity("Se7en", "Seven") < 0.9); // not falsely perfect
+    assert!(title_similarity("Fi5e", "Five") < 0.9); // not falsely perfect
 }
 
 #[test]

@@ -250,7 +250,7 @@ mod tests {
 
     #[test]
     fn an_ordinary_absolute_path_is_local() {
-        let p = PathBuf::from("/media/Movies/Arrival (2016)/Arrival.mkv");
+        let p = PathBuf::from("/media/Movies/Film BC (2016)/Film BC.mkv");
         let origin = Origin::classify(&p);
         assert!(!origin.is_remote());
         assert_eq!(
