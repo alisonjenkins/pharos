@@ -3143,6 +3143,10 @@ pub fn center_child(id: &str, at: u32) -> bool {
     true
 }
 
+/// Room kept clear beside a revealed tab: the focus ring's 3px outline,
+/// its 3px offset and the edge of its glow (B1312).
+const RING_ROOM: f64 = 12.0;
+
 /// Scrolls the sideways row around the element `selector` names so the
 /// element is in sight, moving only that row and never the page: the lit
 /// library tab past the edge of a phone (B1313).
@@ -3157,10 +3161,12 @@ pub fn reveal_across(selector: &str) {
         row.get_bounding_client_rect(),
         el.get_bounding_client_rect(),
     );
-    let shift = if inner.left() < outer.left() {
-        inner.left() - outer.left()
-    } else if inner.right() > outer.right() {
-        inner.right() - outer.right()
+    // Leave the TV focus ring's room inside the row's edge (B1312), not
+    // just the tab's border.
+    let shift = if inner.left() - RING_ROOM < outer.left() {
+        inner.left() - RING_ROOM - outer.left()
+    } else if inner.right() + RING_ROOM > outer.right() {
+        inner.right() + RING_ROOM - outer.right()
     } else {
         return;
     };
