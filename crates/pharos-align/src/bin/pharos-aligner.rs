@@ -18,6 +18,31 @@ const WORKERS: usize = 2;
 /// How often the idle reaper looks, capped by the idle timeout itself.
 const IDLE_CHECK: Duration = Duration::from_secs(30);
 
+/// OpenBLAS is the OpenMP build, and libgomp reads its settings once, as it
+/// loads. Left at its defaults, every GEMM ran a team of one thread a core
+/// that spun between calls on the cores the forward pass's own threads need
+/// next, and a song took twice as long. So the process starts again with the
+/// team sized to `threads` and waiting passively, unless they were set.
+fn openmp_env(threads: usize) {
+    let mut cmd = std::process::Command::new("/proc/self/exe");
+    let mut changed = false;
+    for (name, value) in [
+        ("OMP_NUM_THREADS", threads.to_string()),
+        ("OMP_WAIT_POLICY", "passive".into()),
+    ] {
+        if std::env::var_os(name).is_none() {
+            cmd.env(name, value);
+            changed = true;
+        }
+    }
+    if !changed {
+        return;
+    }
+    use std::os::unix::process::CommandExt as _;
+    let err = cmd.args(std::env::args_os().skip(1)).exec();
+    eprintln!("re-exec with the OpenMP settings failed, songs will run slower: {err}");
+}
+
 fn main() -> std::process::ExitCode {
     let config = match Config::from_env(|k| std::env::var(k).ok()) {
         Ok(c) => c,
@@ -26,6 +51,7 @@ fn main() -> std::process::ExitCode {
             return std::process::ExitCode::FAILURE;
         }
     };
+    openmp_env(config.threads);
     match actix_web::rt::System::new().block_on(run(config)) {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(e) => {
