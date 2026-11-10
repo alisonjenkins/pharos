@@ -7,7 +7,12 @@ license.workspace = true
 publish.workspace = true
 description = "CTC forced alignment of lyric words to MMS_FA emissions, matching the Python aligner"
 
+[features]
+vulkan = ["dep:burn"]
+
 [dependencies]
+# The GPU forward pass: wgpu on Vulkan only (spec 039, R9).
+burn = { version = "0.22.1", default-features = false, features = ["std", "vulkan", "fusion", "autotune"], optional = true }
 actix-web.workspace = true
 gemm = "0.19"
 memmap2 = "0.9"
