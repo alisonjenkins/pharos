@@ -556,6 +556,8 @@ mod tests {
                 end: 30.0,
             }),
             verdict: v,
+            consensus: (v == Verdict::Emitted)
+                .then_some(pharos_transcode::fingerprint::season::Consensus::Endpoints),
         }
     }
 
@@ -620,6 +622,7 @@ mod tests {
                     confidence: 0.0,
                     span: None,
                     verdict: Verdict::NoSpan,
+                    consensus: None,
                 },
             ],
         );
