@@ -357,6 +357,19 @@ pub fn percent_label(fraction: f64) -> String {
     format!("{}%", percent(fraction))
 }
 
+/// The progress line's text: for a PDF the page too, such as `Page 3 of 12 ·
+/// 25%`. `page` is the page index (from 0) and the page count.
+pub fn progress_label(fraction: f64, page: Option<(usize, usize)>) -> String {
+    match page {
+        Some((index, count)) => format!(
+            "Page {} of {count} · {}",
+            index.saturating_add(1),
+            percent_label(fraction)
+        ),
+        None => percent_label(fraction),
+    }
+}
+
 /// The title page's button for a book with a saved place: part read shows
 /// how far, never 0% or 100%.
 pub fn continue_label(fraction: f32) -> Option<String> {
@@ -733,6 +746,12 @@ mod tests {
         assert_eq!(percent_label(7.0), "100%");
         assert_eq!(percent_label(-1.0), "0%");
         assert_eq!(percent_label(f64::NAN), "0%");
+    }
+
+    #[test]
+    fn a_pdf_says_its_page_and_an_epub_only_its_percent() {
+        assert_eq!(progress_label(0.25, Some((2, 12))), "Page 3 of 12 · 25%");
+        assert_eq!(progress_label(0.25, None), "25%");
     }
 
     #[test]
