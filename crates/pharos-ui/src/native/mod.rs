@@ -95,6 +95,7 @@ pub mod reader;
 mod reader_web;
 pub mod report;
 pub mod resume;
+pub mod revisit;
 pub mod route;
 pub mod scrub;
 pub mod seek_wait;
