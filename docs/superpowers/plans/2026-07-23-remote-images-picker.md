@@ -356,7 +356,7 @@ async fn synth_series_logo_serves_cached_file_without_db_locator() {
     use pharos_cache::image_cache::{series_image_path, ImageRole};
     let state = /* build AppState with an ImageCache rooted at a tempdir — copy the
         harness the poster test uses */;
-    let series_key = "Dragon Ball";
+    let series_key = "Anime P";
     // Write a logo into the deterministic slot.
     let root = /* the cache root PathBuf used by state.images */;
     let logo_path = series_image_path(&root, ImageRole::Logo, series_key);
@@ -913,7 +913,7 @@ git commit -m "test(compat): cover RemoteImages/Download route"
 - [ ] `nix develop --command cargo clippy --workspace --all-targets -- -D warnings` — clean.
 - [ ] `nix develop --command cargo build -p pharos-server --no-default-features --features backend-spawn` — spawn backend builds.
 - [ ] If any `Cargo.toml` changed: `just hakari-regen`. (No dep changes expected.)
-- [ ] Manual sanity: `resolve_image_match` returns `tvdb` for a synth Dragon Ball id whose `series_metadata.match_provider = "tvdb"`.
+- [ ] Manual sanity: `resolve_image_match` returns `tvdb` for a synth Anime P id whose `series_metadata.match_provider = "tvdb"`.
 
 ## Notes / non-goals (carried from the spec)
 
