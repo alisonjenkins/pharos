@@ -1804,7 +1804,7 @@ pub fn on_mode_key(mut on_key: impl FnMut(&str) -> bool + 'static) -> KeyListene
                 || e.meta_key()
                 || e.repeat()
                 || e.default_prevented()
-                || in_text_field(&e)
+                || (in_text_field(&e) && !arrow_on_select(&e))
             {
                 return;
             }
@@ -1819,9 +1819,26 @@ pub fn on_mode_key(mut on_key: impl FnMut(&str) -> bool + 'static) -> KeyListene
     KeyListener(listener)
 }
 
-/// What a key can move the focus to: enabled buttons and links. Text and
-/// choice fields are left out, since their keys type: `/` reaches search.
-const KEY_TARGETS: &str = "a[href], button:not([disabled]), [tabindex]:not([tabindex='-1'])";
+/// What a key can move the focus to: enabled buttons, links and choice
+/// selects (FR-208). Text fields are left out, since their keys type: `/`
+/// reaches search. On a select the arrows move on, as they do everywhere
+/// else, and Enter or Space opens its list.
+const KEY_TARGETS: &str = "a[href], button:not([disabled]), select:not([disabled]), \
+                           [tabindex]:not([tabindex='-1'])";
+
+/// Whether `e` is an arrow key on a select. A closed select would step its
+/// value on every arrow, refetching a filtered grid each time and keeping
+/// the focus there; arrows move the focus instead (FR-208).
+fn arrow_on_select(e: &web_sys::KeyboardEvent) -> bool {
+    let arrow = matches!(
+        e.key().as_str(),
+        "ArrowUp" | "ArrowDown" | "ArrowLeft" | "ArrowRight"
+    );
+    arrow
+        && e.target()
+            .and_then(|t| t.dyn_into::<web_sys::Element>().ok())
+            .is_some_and(|el| el.tag_name().eq_ignore_ascii_case("select"))
+}
 
 fn document() -> Option<web_sys::Document> {
     web_sys::window().and_then(|w| w.document())
