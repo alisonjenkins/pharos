@@ -94,7 +94,7 @@ pub struct Split {
 pub const SPLIT_REASONS: [&str; 2] = ["stated_years", "episode_titles"];
 
 impl Split {
-    /// `none:4, 2014:62`, for the log line.
+    /// `none:4, 1996:62`, for the log line.
     pub fn groups_label(&self) -> String {
         self.groups
             .iter()
@@ -649,29 +649,29 @@ mod tests {
     fn a_file_states_its_name_prefix_year_over_its_folders() {
         assert_eq!(
             stated_show_year(Path::new(
-                "/tv/Battlestar Galactica/Season 1/Battlestar Galactica (2003) - S01E01 - 33.mkv"
+                "/tv/Show C/Season 1/Show C (1987) - S01E01 - 33.mkv"
             )),
-            Some(2003)
+            Some(1987)
         );
-        // Filename ▸ folder: the 2014 file in the 1980 folder states 2014.
+        // Filename ▸ folder: the 1996 file in the 1961 folder states 1996.
         assert_eq!(
             stated_show_year(Path::new(
-                "/tv/Cosmos (1980)/Season 1/Cosmos (2014) - S01E01.mkv"
+                "/tv/Show A (1961)/Season 1/Show A (1996) - S01E01.mkv"
             )),
-            Some(2014)
+            Some(1996)
         );
         assert_eq!(
-            stated_show_year(Path::new("/tv/Cosmos (1980)/Season 1/Cosmos - S01E01.mkv")),
-            Some(1980)
+            stated_show_year(Path::new("/tv/Show A (1961)/Season 1/Show A - S01E01.mkv")),
+            Some(1961)
         );
         assert_eq!(
-            stated_show_year(Path::new("/tv/The Flash/Season 1/The Flash - S01E01.mkv")),
+            stated_show_year(Path::new("/tv/Show B/Season 1/Show B - S01E01.mkv")),
             None
         );
         // Another show's name prefix says nothing about this folder's show.
         assert_eq!(
             stated_show_year(Path::new(
-                "/tv/The Flash/Season 1/Doctor Who (2005) - S01E01.mkv"
+                "/tv/Show B/Season 1/Doctor Who (2005) - S01E01.mkv"
             )),
             None
         );
@@ -696,65 +696,62 @@ mod tests {
     #[test]
     fn a_nested_episode_states_its_year_against_its_show() {
         let td = tempfile::TempDir::new().unwrap();
-        let show = td.path().join("Cosmos");
+        let show = td.path().join("Show A");
         std::fs::create_dir_all(show.join("Alternate")).unwrap();
         std::fs::write(show.join("tvshow.nfo"), b"<tvshow/>").unwrap();
-        let file = show.join("Alternate/Cosmos (1980) - S01E01.mkv");
+        let file = show.join("Alternate/Show A (1961) - S01E01.mkv");
         let folders = folders_of(std::slice::from_ref(&file));
         let key = show.to_string_lossy().into_owned();
-        assert_eq!(folders.get(&key), Some(&vec![(file, Some(1980))]));
+        assert_eq!(folders.get(&key), Some(&vec![(file, Some(1961))]));
     }
 
     #[test]
     fn a_folder_whose_files_agree_takes_their_year_without_splitting() {
         let folders = folders_of(&paths(&[
-            "/tv/Battlestar Galactica/Season 1/Battlestar Galactica (2003) - S01E01.mkv",
-            "/tv/Battlestar Galactica/Season 1/Battlestar Galactica (2003) - S01E02.mkv",
-            "/tv/Battlestar Galactica/Season 1/Battlestar Galactica - S01E03.mkv",
+            "/tv/Show C/Season 1/Show C (1987) - S01E01.mkv",
+            "/tv/Show C/Season 1/Show C (1987) - S01E02.mkv",
+            "/tv/Show C/Season 1/Show C - S01E03.mkv",
         ]));
         let plan = plan(&folders, &PlanContext::default(), 7);
         assert!(plan.splits.is_empty());
         assert!(plan.new_owners.is_empty());
         assert_eq!(plan.assignments.len(), 3);
         for a in plan.assignments.values() {
-            assert_eq!(a.series_key, "/tv/Battlestar Galactica");
-            assert_eq!(a.series_year, Some(2003));
+            assert_eq!(a.series_key, "/tv/Show C");
+            assert_eq!(a.series_year, Some(1987));
         }
     }
 
-    fn flash() -> BTreeMap<String, Vec<(PathBuf, Option<u32>)>> {
+    fn show_b() -> BTreeMap<String, Vec<(PathBuf, Option<u32>)>> {
         folders_of(&paths(&[
-            "/tv/The Flash/Season 1/The Flash (1990) - S01E01.mkv",
-            "/tv/The Flash/Season 1/The Flash (2014) - S01E01.mkv",
-            "/tv/The Flash/Season 1/The Flash (2014) - S01E02.mkv",
-            "/tv/The Flash/Season 1/The Flash - S01E03.mkv",
+            "/tv/Show B/Season 1/Show B (1971) - S01E01.mkv",
+            "/tv/Show B/Season 1/Show B (1996) - S01E01.mkv",
+            "/tv/Show B/Season 1/Show B (1996) - S01E02.mkv",
+            "/tv/Show B/Season 1/Show B - S01E03.mkv",
         ]))
     }
 
     #[test]
     fn a_folder_stating_two_years_splits_and_the_largest_group_keeps_the_key() {
-        let plan = plan(&flash(), &PlanContext::default(), 7);
+        let plan = plan(&show_b(), &PlanContext::default(), 7);
         assert_eq!(plan.splits.len(), 1);
         let split = &plan.splits[0];
-        assert_eq!(split.owner_year, 2014);
+        assert_eq!(split.owner_year, 1996);
         assert_eq!(split.owner_by, "largest");
-        assert_eq!(split.groups_label(), "none:1, 1990:1, 2014:2");
+        assert_eq!(split.groups_label(), "none:1, 1971:1, 1996:2");
         let key = |p: &str| plan.assignments[Path::new(p)].series_key.clone();
         assert_eq!(
-            key("/tv/The Flash/Season 1/The Flash (2014) - S01E01.mkv"),
-            "/tv/The Flash"
+            key("/tv/Show B/Season 1/Show B (1996) - S01E01.mkv"),
+            "/tv/Show B"
         );
         // An unyeared file joins the owner.
+        assert_eq!(key("/tv/Show B/Season 1/Show B - S01E03.mkv"), "/tv/Show B");
         assert_eq!(
-            key("/tv/The Flash/Season 1/The Flash - S01E03.mkv"),
-            "/tv/The Flash"
-        );
-        assert_eq!(
-            key("/tv/The Flash/Season 1/The Flash (1990) - S01E01.mkv"),
-            "/tv/The Flash\u{1f}1990"
+            key("/tv/Show B/Season 1/Show B (1971) - S01E01.mkv"),
+            "/tv/Show B\u{1f}1971"
         );
         assert_eq!(plan.new_owners.len(), 1);
-        assert_eq!(plan.new_owners[0].target_year, Some(2014));
+        assert_eq!(plan.new_owners[0].target_year, Some(1996));
         assert_eq!(plan.new_owners[0].source, OverrideSource::Scanner);
         assert_eq!(plan.new_owners[0].created_at, 7);
     }
@@ -762,47 +759,47 @@ mod tests {
     #[test]
     fn the_stored_match_then_a_remembered_owner_decide_who_keeps_the_key() {
         let ctx = PlanContext {
-            premiere_years: HashMap::from([("/tv/The Flash".to_string(), 1991)]),
+            premiere_years: HashMap::from([("/tv/Show B".to_string(), 1972)]),
             ..Default::default()
         };
-        let p = plan(&flash(), &ctx, 7);
+        let p = plan(&show_b(), &ctx, 7);
         assert_eq!(
             (p.splits[0].owner_year, p.splits[0].owner_by),
-            (1990, "stored_match")
+            (1971, "stored_match")
         );
-        assert_eq!(p.new_owners[0].target_year, Some(1990));
+        assert_eq!(p.new_owners[0].target_year, Some(1971));
 
         let remembered = PlanContext {
             overrides: vec![SeriesOverride {
                 id: 1,
-                series_folder: "/tv/The Flash".into(),
+                series_folder: "/tv/Show B".into(),
                 path: None,
-                target_key: "/tv/The Flash".into(),
+                target_key: "/tv/Show B".into(),
                 target_name: None,
-                target_year: Some(1990),
+                target_year: Some(1971),
                 source: OverrideSource::Scanner,
                 created_by: None,
                 created_at: 1,
             }],
-            // A later match against the 2014 show does not move the owner.
-            premiere_years: HashMap::from([("/tv/The Flash".to_string(), 2014)]),
+            // A later match against the 1996 show does not move the owner.
+            premiere_years: HashMap::from([("/tv/Show B".to_string(), 1996)]),
         };
-        let p = plan(&flash(), &remembered, 7);
+        let p = plan(&show_b(), &remembered, 7);
         assert_eq!(
             (p.splits[0].owner_year, p.splits[0].owner_by),
-            (1990, "override")
+            (1971, "override")
         );
         assert!(p.new_owners.is_empty());
     }
 
     #[test]
     fn a_file_an_override_places_goes_where_it_says_admin_first() {
-        let file = "/tv/The Flash/Season 1/The Flash - S01E03.mkv";
+        let file = "/tv/Show B/Season 1/Show B - S01E03.mkv";
         let row = |source, year: u32| SeriesOverride {
             id: 0,
-            series_folder: "/tv/The Flash".into(),
+            series_folder: "/tv/Show B".into(),
             path: Some(file.into()),
-            target_key: split_key("/tv/The Flash", year),
+            target_key: split_key("/tv/Show B", year),
             target_name: None,
             target_year: Some(year),
             source,
@@ -810,18 +807,18 @@ mod tests {
             created_at: 1,
         };
         let folders = folders_of(&paths(&[
-            "/tv/The Flash/Season 3/The Flash (2014) - S03E01.mkv",
+            "/tv/Show B/Season 3/Show B (1996) - S03E01.mkv",
             file,
         ]));
-        // A consensus folder: without the row the file joins the 2014 show.
+        // A consensus folder: without the row the file joins the 1996 show.
         assert_eq!(
             plan(&folders, &PlanContext::default(), 7).assignments[Path::new(file)].series_year,
-            Some(2014)
+            Some(1996)
         );
         let ctx = PlanContext {
             overrides: vec![
-                row(OverrideSource::Admin, 1991),
-                row(OverrideSource::Scanner, 1990),
+                row(OverrideSource::Admin, 1972),
+                row(OverrideSource::Scanner, 1971),
             ],
             ..Default::default()
         };
@@ -829,8 +826,8 @@ mod tests {
         assert_eq!(
             p.assignments[Path::new(file)],
             Assignment {
-                series_key: "/tv/The Flash\u{1f}1991".into(),
-                series_year: Some(1991),
+                series_key: "/tv/Show B\u{1f}1972".into(),
+                series_year: Some(1972),
             }
         );
         assert!(p.splits.is_empty());
@@ -842,29 +839,29 @@ mod tests {
     /// admin's per-path row still moves its file.
     #[test]
     fn an_admin_keep_together_row_keeps_a_two_year_folder_one_show() {
-        let old = "/tv/The Flash/Season 1/The Flash (1990) - S01E01.mkv";
-        let unyeared = "/tv/The Flash/Season 1/The Flash - S01E02 - Out of Control.mkv";
-        let moved = "/tv/The Flash/Season 1/The Flash - S01E03 - Watching the Detectives.mkv";
+        let old = "/tv/Show B/Season 1/Show B (1971) - S01E01.mkv";
+        let unyeared = "/tv/Show B/Season 1/Show B - S01E02 - The Old Second.mkv";
+        let moved = "/tv/Show B/Season 1/Show B - S01E03 - The New Start.mkv";
         let folders = folders_of(&paths(&[
             old,
             unyeared,
             moved,
-            "/tv/The Flash/Season 3/The Flash (2014) - S03E01.mkv",
+            "/tv/Show B/Season 3/Show B (1996) - S03E01.mkv",
         ]));
-        let together = SeriesOverride::keep_together("/tv/The Flash", Some("ali".into()), 5);
+        let together = SeriesOverride::keep_together("/tv/Show B", Some("ali".into()), 5);
         assert!(together.keeps_together());
         let scanner_row = SeriesOverride {
             path: Some(unyeared.into()),
-            target_key: split_key("/tv/The Flash", 1990),
-            target_year: Some(1990),
+            target_key: split_key("/tv/Show B", 1971),
+            target_year: Some(1971),
             source: OverrideSource::Scanner,
             ..together.clone()
         };
         assert!(!scanner_row.keeps_together());
         let admin_move = SeriesOverride {
             path: Some(moved.into()),
-            target_key: "/tv/The Flash (Elsewhere)".into(),
-            target_year: Some(1990),
+            target_key: "/tv/Show B (Elsewhere)".into(),
+            target_year: Some(1971),
             ..together.clone()
         };
         let ctx = PlanContext {
@@ -879,49 +876,46 @@ mod tests {
             assert_eq!(
                 at(path),
                 Assignment {
-                    series_key: "/tv/The Flash".into(),
+                    series_key: "/tv/Show B".into(),
                     series_year: None,
                 }
             );
         }
-        assert_eq!(at(moved).series_key, "/tv/The Flash (Elsewhere)");
+        assert_eq!(at(moved).series_key, "/tv/Show B (Elsewhere)");
     }
 
-    /// V893 — the server's `scanner` rows for the 1990 Season 01 files
-    /// (their episode titles are the 1990 show's) split a folder whose own
-    /// files state only 2014. The stored 1990 match keeps the plain key for
-    /// them; the 2014 files move to the split key.
+    /// V893 — the server's `scanner` rows for the 1971 Season 01 files
+    /// (their episode titles are the 1971 show's) split a folder whose own
+    /// files state only 1996. The stored 1971 match keeps the plain key for
+    /// them; the 1996 files move to the split key.
     #[test]
     fn scanner_rows_from_episode_titles_split_a_one_year_folder() {
-        let pilot = "/tv/The Flash/Season 01/The Flash - S01E01 - Pilot.mkv";
-        let second = "/tv/The Flash/Season 01/The Flash - S01E02 - Out of Control.mkv";
-        let modern = "/tv/The Flash/Season 03/The Flash (2014) - S03E01.mkv";
+        let pilot = "/tv/Show B/Season 01/Show B - S01E01 - Pilot.mkv";
+        let second = "/tv/Show B/Season 01/Show B - S01E02 - The Old Second.mkv";
+        let modern = "/tv/Show B/Season 03/Show B (1996) - S03E01.mkv";
         let folders = folders_of(&paths(&[
             pilot,
             second,
             modern,
-            "/tv/The Flash/Season 03/The Flash (2014) - S03E02.mkv",
-            "/tv/The Flash/Season 03/The Flash (2014) - S03E03.mkv",
+            "/tv/Show B/Season 03/Show B (1996) - S03E02.mkv",
+            "/tv/Show B/Season 03/Show B (1996) - S03E03.mkv",
         ]));
         let evidence = |path: &str| SeriesOverride {
             id: 0,
-            series_folder: "/tv/The Flash".into(),
+            series_folder: "/tv/Show B".into(),
             path: Some(path.into()),
-            target_key: split_key("/tv/The Flash", 1990),
+            target_key: split_key("/tv/Show B", 1971),
             target_name: None,
-            target_year: Some(1990),
+            target_year: Some(1971),
             source: OverrideSource::Scanner,
             created_by: None,
             created_at: 1,
         };
         let mut ctx = PlanContext {
             overrides: vec![evidence(pilot), evidence(second)],
-            premiere_years: HashMap::from([("/tv/The Flash".to_string(), 1990)]),
+            premiere_years: HashMap::from([("/tv/Show B".to_string(), 1971)]),
         };
-        assert_eq!(
-            split_candidates(&folders, &ctx.overrides),
-            ["/tv/The Flash"]
-        );
+        assert_eq!(split_candidates(&folders, &ctx.overrides), ["/tv/Show B"]);
         assert!(split_candidates(&folders, &[]).is_empty());
 
         let p = plan(&folders, &ctx, 7);
@@ -929,44 +923,44 @@ mod tests {
         let split = &p.splits[0];
         assert_eq!(
             (split.owner_year, split.owner_by, split.reason),
-            (1990, "stored_match", "episode_titles")
+            (1971, "stored_match", "episode_titles")
         );
-        assert_eq!(split.groups_label(), "1990:2, 2014:3");
+        assert_eq!(split.groups_label(), "1971:2, 1996:3");
         let at = |path: &str| p.assignments[Path::new(path)].clone();
         for path in [pilot, second] {
             assert_eq!(
                 at(path),
                 Assignment {
-                    series_key: "/tv/The Flash".into(),
-                    series_year: Some(1990),
+                    series_key: "/tv/Show B".into(),
+                    series_year: Some(1971),
                 }
             );
         }
         assert_eq!(
             at(modern),
             Assignment {
-                series_key: "/tv/The Flash\u{1f}2014".into(),
-                series_year: Some(2014),
+                series_key: "/tv/Show B\u{1f}1996".into(),
+                series_year: Some(1996),
             }
         );
 
         // The owner row the server wrote with its evidence decides even after
-        // the folder's match moved to the 2014 show.
+        // the folder's match moved to the 1996 show.
         ctx.overrides.push(SeriesOverride {
             path: None,
-            target_key: "/tv/The Flash".into(),
+            target_key: "/tv/Show B".into(),
             ..evidence(pilot)
         });
-        ctx.premiere_years.insert("/tv/The Flash".to_string(), 2014);
+        ctx.premiere_years.insert("/tv/Show B".to_string(), 1996);
         let p = plan(&folders, &ctx, 7);
         assert_eq!(
             (p.splits[0].owner_year, p.splits[0].owner_by),
-            (1990, "override")
+            (1971, "override")
         );
         assert!(p.new_owners.is_empty());
         assert_eq!(
             p.assignments[Path::new(modern)].series_key,
-            "/tv/The Flash\u{1f}2014"
+            "/tv/Show B\u{1f}1996"
         );
     }
 
@@ -980,21 +974,21 @@ mod tests {
         let year_only = SeriesKeyUpdate {
             path: backfilled.path.clone(),
             series_key: None,
-            series_year: Some(2014),
+            series_year: Some(1996),
         };
         assert!(!moves_key(&year_only, Some(&backfilled)));
         let unkeyed = row("/tv/Forever (US)/S01E02.mkv", folder, None, None);
         assert!(!moves_key(&year_only, Some(&unkeyed)));
         let split = SeriesKeyUpdate {
-            series_key: Some(split_key(folder, 1990)),
+            series_key: Some(split_key(folder, 1971)),
             ..year_only.clone()
         };
         assert!(moves_key(&split, Some(&backfilled)));
         let back = row(
             "/tv/Forever (US)/S01E03.mkv",
             folder,
-            Some(&split_key(folder, 1990)),
-            Some(1990),
+            Some(&split_key(folder, 1971)),
+            Some(1971),
         );
         assert!(moves_key(&year_only, Some(&back)));
         assert!(moves_key(&year_only, None));
@@ -1002,43 +996,43 @@ mod tests {
 
     #[test]
     fn the_diff_writes_only_changes_and_returns_a_vanished_split_to_its_folder() {
-        let mut walked = flash();
+        let mut walked = show_b();
         // A walked folder that no longer states two years.
         walked.extend(folders_of(&paths(&[
-            "/tv/Cosmos/Season 1/Cosmos - S01E01.mkv",
+            "/tv/Show A/Season 1/Show A - S01E01.mkv",
         ])));
         let p = plan(&walked, &PlanContext::default(), 7);
         let stored = vec![
             row(
-                "/tv/The Flash/Season 1/The Flash (1990) - S01E01.mkv",
-                "/tv/The Flash",
+                "/tv/Show B/Season 1/Show B (1971) - S01E01.mkv",
+                "/tv/Show B",
                 None,
                 None,
             ),
             row(
-                "/tv/The Flash/Season 1/The Flash (2014) - S01E01.mkv",
-                "/tv/The Flash",
+                "/tv/Show B/Season 1/Show B (1996) - S01E01.mkv",
+                "/tv/Show B",
                 None,
-                Some(2014),
+                Some(1996),
             ),
             row(
-                "/tv/The Flash/Season 1/The Flash (2014) - S01E02.mkv",
-                "/tv/The Flash",
+                "/tv/Show B/Season 1/Show B (1996) - S01E02.mkv",
+                "/tv/Show B",
                 None,
                 None,
             ),
             row(
-                "/tv/The Flash/Season 1/The Flash - S01E03.mkv",
-                "/tv/The Flash",
+                "/tv/Show B/Season 1/Show B - S01E03.mkv",
+                "/tv/Show B",
                 None,
                 None,
             ),
             // A row a split once moved, whose folder no longer states two years.
             row(
-                "/tv/Cosmos/Season 1/Cosmos - S01E01.mkv",
-                "/tv/Cosmos",
-                Some("/tv/Cosmos\u{1f}2014"),
-                Some(2014),
+                "/tv/Show A/Season 1/Show A - S01E01.mkv",
+                "/tv/Show A",
+                Some("/tv/Show A\u{1f}1996"),
+                Some(1996),
             ),
         ];
         let mut stored = stored;
@@ -1046,8 +1040,8 @@ mod tests {
         stored.push(row(
             "/tv/inner/Show/S01E01.mkv",
             "/tv/inner/Show",
-            Some("/tv/inner/Show\u{1f}1990"),
-            Some(1990),
+            Some("/tv/inner/Show\u{1f}1971"),
+            Some(1971),
         ));
         let mut d = diff(&p, &stored);
         d.sort_by(|a, b| a.path.cmp(&b.path));
@@ -1058,22 +1052,18 @@ mod tests {
         assert_eq!(
             got,
             vec![
-                ("/tv/Cosmos/Season 1/Cosmos - S01E01.mkv", None, Some(2014)),
+                ("/tv/Show A/Season 1/Show A - S01E01.mkv", None, Some(1996)),
                 (
-                    "/tv/The Flash/Season 1/The Flash (1990) - S01E01.mkv",
-                    Some("/tv/The Flash\u{1f}1990"),
-                    Some(1990)
+                    "/tv/Show B/Season 1/Show B (1971) - S01E01.mkv",
+                    Some("/tv/Show B\u{1f}1971"),
+                    Some(1971)
                 ),
                 (
-                    "/tv/The Flash/Season 1/The Flash (2014) - S01E02.mkv",
+                    "/tv/Show B/Season 1/Show B (1996) - S01E02.mkv",
                     None,
-                    Some(2014)
+                    Some(1996)
                 ),
-                (
-                    "/tv/The Flash/Season 1/The Flash - S01E03.mkv",
-                    None,
-                    Some(2014)
-                ),
+                ("/tv/Show B/Season 1/Show B - S01E03.mkv", None, Some(1996)),
             ]
         );
     }
