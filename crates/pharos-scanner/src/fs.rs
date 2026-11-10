@@ -680,7 +680,7 @@ impl<P: Prober> FsScanner<P> {
             }
             None => FoldGuard::default(),
         };
-        let groups = group_by_edition(paths);
+        let (groups, hidden_parts) = hide_parts_held_whole(group_by_edition(paths));
         // A film split across files is stacked before copies are folded, so
         // its first part is never folded as a version of a whole copy (V1150).
         let part_candidates = crate::parts::candidates(&groups);
@@ -700,7 +700,8 @@ impl<P: Prober> FsScanner<P> {
         tally.publish();
         // A file now grouped under another may still hold its own row from an
         // earlier pass; that row is swept, so its viewers' state moves first.
-        let folded = folded_copies(&groups);
+        let mut folded = folded_copies(&groups);
+        folded.extend(hidden_parts);
         let mut outcome = ScanOutcome::default();
         let mut seen = 0i64;
 
@@ -2453,6 +2454,73 @@ fn keep_unreadable_row(row: MediaId, path: &Path, reason: &'static str) {
         "file could not be re-read; keeping its row as it was",
     );
     metrics::counter!("pharos_scan_kept_unreadable_total", "reason" => reason).increment(1);
+}
+
+/// B1289 — a film held both whole and split is shown by its whole file
+/// alone: each part set whose film (its name less the part marker) has a
+/// whole copy elsewhere in the library is taken out of `groups`, so it is
+/// neither stacked into a second film nor offered as a version. Returns the
+/// groups left and, for each hidden part, the whole file its row's viewer
+/// state folds into. Each hidden set is counted and logged as `whole_copy`,
+/// naming the whole file.
+fn hide_parts_held_whole(groups: Vec<Group>) -> (Vec<Group>, Vec<Fold>) {
+    let candidates = crate::parts::candidates(&groups);
+    if candidates.is_empty() {
+        return (groups, Vec::new());
+    }
+    let in_parts: HashSet<usize> = candidates
+        .iter()
+        .flat_map(|c| c.parts.iter().map(|&(i, _)| i))
+        .collect();
+    let buckets = library_buckets(groups.iter().map(|g| g.0.as_path()));
+    let mut held_by: BTreeMap<&CopyBucket, usize> = BTreeMap::new();
+    for (i, bs) in buckets.iter().enumerate() {
+        if in_parts.contains(&i) {
+            continue;
+        }
+        for b in bs {
+            held_by.entry(b).or_insert(i);
+        }
+    }
+    let mut hidden: HashMap<usize, usize> = HashMap::new();
+    for c in &candidates {
+        let whole = c.parts.iter().find_map(|&(i, _)| {
+            let film = crate::parts::without_marker(&groups.get(i)?.0)?;
+            copy_buckets(&film)
+                .iter()
+                .find_map(|b| held_by.get(b).copied())
+        });
+        let Some(whole) = whole else {
+            continue;
+        };
+        let value = groups
+            .get(whole)
+            .map(|g| g.0.display().to_string())
+            .unwrap_or_default();
+        crate::parts::record(&groups, c, crate::parts::StackOutcome::WholeCopy, &value);
+        hidden.extend(c.parts.iter().map(|&(i, _)| (i, whole)));
+    }
+    if hidden.is_empty() {
+        return (groups, Vec::new());
+    }
+    let wholes: HashMap<usize, PathBuf> = hidden
+        .values()
+        .filter_map(|&w| Some((w, groups.get(w)?.0.clone())))
+        .collect();
+    let mut kept = Vec::with_capacity(groups.len() - hidden.len());
+    let mut folds = Vec::with_capacity(hidden.len());
+    for (i, group) in groups.into_iter().enumerate() {
+        match hidden.get(&i).and_then(|w| wholes.get(w)) {
+            // A part's resume point is a time in that part, not in the
+            // whole film (V1152).
+            Some(whole) => folds.push(Fold {
+                copy: group.0,
+                into: vec![(whole.clone(), pharos_core::FoldResume::Drop)],
+            }),
+            None => kept.push(group),
+        }
+    }
+    (kept, folds)
 }
 
 /// B1284 — whether an unchanged video's own NFO (`<stem>.nfo`, or
@@ -8808,6 +8876,129 @@ mod tests {
         let own = alt.probe.as_deref().expect("edition keeps its own probe");
         assert_eq!(own.video_3d_format, Some(Video3DFormat::HalfSideBySide));
         assert!(own.alternate_sources.is_empty());
+    }
+
+    /// B1289 / V1281 — a film held whole and split is shown by its whole
+    /// file alone: a stack already made is undone, no part is offered as a
+    /// version, and the refusal names the whole file.
+    #[tokio::test]
+    async fn a_film_held_whole_is_not_stacked_beside_itself() {
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = pharos_test_metrics::snapshotter(&recorder);
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        let td = TempDir::new().unwrap();
+        write_file(td.path(), "Film W (2015)/Film W (2015) cd1.mkv", b"one").await;
+        write_file(td.path(), "Film W (2015)/Film W (2015) cd2.mkv", b"two").await;
+        let store = MemStore::default();
+        let scanner = FsScanner::new(FakeProber {
+            duration_ms: Some(60_000),
+            ..Default::default()
+        });
+        scanner.scan_into(td.path(), &store).await.unwrap();
+        scanner.scan_into(td.path(), &store).await.unwrap();
+        assert_eq!(
+            store.inner.lock().unwrap().len(),
+            1,
+            "the split film stacked"
+        );
+
+        write_file(
+            td.path(),
+            "Film W (2015)/Film W (2015) Bluray-1080p.mkv",
+            b"whole-film",
+        )
+        .await;
+        scanner.scan_into(td.path(), &store).await.unwrap();
+
+        let items: Vec<MediaItem> = store.inner.lock().unwrap().values().cloned().collect();
+        let paths: Vec<_> = items
+            .iter()
+            .map(|i| {
+                (
+                    &i.path,
+                    i.probe
+                        .alternate_sources
+                        .iter()
+                        .map(|a| (a.id.clone(), a.part))
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect();
+        assert_eq!(items.len(), 1, "one film: {paths:?}");
+        assert!(
+            items[0].path.ends_with("Film W (2015) Bluray-1080p.mkv"),
+            "the whole file is the film: {paths:?}"
+        );
+        assert!(
+            items[0].probe.alternate_sources.is_empty(),
+            "no part is a version or a part of the whole film: {paths:?}"
+        );
+
+        let whole_copy: u64 = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter_map(|(ck, _, _, v)| match v {
+                metrics_util::debugging::DebugValue::Counter(n)
+                    if ck.key().name() == "pharos_scan_part_stack_total"
+                        && ck
+                            .key()
+                            .labels()
+                            .any(|l| l.key() == "outcome" && l.value() == "whole_copy") =>
+                {
+                    Some(n)
+                }
+                _ => None,
+            })
+            .sum();
+        assert_eq!(whole_copy, 1, "refused once the whole file arrived");
+    }
+
+    /// B1289 — whole and split from the first scan: the whole file is the one
+    /// film on every pass, and a set of parts with no whole copy still stacks.
+    #[tokio::test]
+    async fn parts_beside_their_whole_film_are_hidden() {
+        let td = TempDir::new().unwrap();
+        write_file(
+            td.path(),
+            "Film W (2015)/Film W (2015) Bluray-1080p Proper.mkv",
+            b"whole",
+        )
+        .await;
+        write_file(td.path(), "Film W (2015)/Film W (2015) cd1.mkv", b"one").await;
+        write_file(td.path(), "Film W (2015)/Film W (2015) cd2.mkv", b"two").await;
+        write_file(td.path(), "Film X (2016)/Film X (2016) cd1.mkv", b"x-one").await;
+        write_file(td.path(), "Film X (2016)/Film X (2016) cd2.mkv", b"x-two").await;
+        let store = MemStore::default();
+        let scanner = FsScanner::new(FakeProber {
+            duration_ms: Some(60_000),
+            ..Default::default()
+        });
+        for pass in 1..=2 {
+            scanner.scan_into(td.path(), &store).await.unwrap();
+            let items: Vec<MediaItem> = store.inner.lock().unwrap().values().cloned().collect();
+            let whole: Vec<_> = items
+                .iter()
+                .filter(|i| i.path.to_string_lossy().contains("Film W"))
+                .collect();
+            assert_eq!(whole.len(), 1, "pass {pass}: one Film W");
+            assert!(
+                whole[0]
+                    .path
+                    .ends_with("Film W (2015) Bluray-1080p Proper.mkv"),
+                "pass {pass}"
+            );
+            assert!(whole[0].probe.alternate_sources.is_empty(), "pass {pass}");
+            if pass == 2 {
+                let split: Vec<_> = items
+                    .iter()
+                    .filter(|i| i.path.to_string_lossy().contains("Film X"))
+                    .collect();
+                assert_eq!(split.len(), 1, "Film X stacks");
+                assert_eq!(split[0].probe.parts().len(), 1, "cd2 rides on cd1");
+            }
+        }
     }
 
     /// V1150, V1151, V1152 — a split film's parts stay apart until each has
