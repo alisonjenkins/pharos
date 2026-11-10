@@ -18,5 +18,7 @@ pub mod play_state;
 pub mod playback;
 pub mod search;
 pub mod segments;
+pub mod track_settings;
+pub mod user_config;
 pub mod user_data;
 pub mod watch;

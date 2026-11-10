@@ -279,3 +279,165 @@ async fn saved_mixes_are_kept_under_the_clients_key() {
         })
         .await;
 }
+
+const AUDIO: &str = "playback.audio_language";
+const SUB_LANG: &str = "playback.subtitle_language";
+const SUB_MODE: &str = "playback.subtitle_mode";
+
+async fn configuration(fx: &Fixture) -> serde_json::Value {
+    use pharos_core::PreferenceStore;
+    let raw = fx
+        .state
+        .stores
+        .get_user_configuration(fx.user_id)
+        .await
+        .unwrap();
+    serde_json::from_str(&raw.unwrap_or_else(|| "{}".into())).unwrap()
+}
+
+/// FR-702: the three playback keys are fields of the user's Jellyfin
+/// configuration, so each round-trips through the RPC, lands in the blob next
+/// to the fields already there, and is what track selection then reads.
+/// Disarm check: with the `TrackSetting::from_key` branch in `Prefs::write`
+/// removed the values land in `user_prefs` and the blob and
+/// `track_preference` assertions fail.
+#[actix_web::test]
+async fn the_playback_keys_are_kept_in_the_user_configuration_and_drive_selection() {
+    use pharos_core::PreferenceStore;
+    use pharos_server::api::jellyfin::stream_select::SubtitleMode;
+    use pharos_server::api::jellyfin::user_prefs::track_preference;
+    let fx = seed_rich().await;
+    fx.state
+        .stores
+        .set_user_configuration(
+            fx.user_id,
+            r#"{"DescriptionLanguagePreference":"fra","PlayDefaultAudioTrack":false,"SomethingNew":1}"#,
+        )
+        .await
+        .unwrap();
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let prefs = prefs_for(&fx, &fx.user_token).await;
+            for key in [AUDIO, SUB_LANG, SUB_MODE] {
+                assert_eq!(get(&prefs, key).await, Got::NotSet, "{key}");
+            }
+            set(&prefs, AUDIO, b"fr").await.expect("stored");
+            set(&prefs, SUB_LANG, b"eng").await.expect("stored");
+            set(&prefs, SUB_MODE, b"OnlyForced").await.expect("stored");
+            assert_eq!(get(&prefs, AUDIO).await, Got::Value(b"fra".to_vec()));
+            assert_eq!(get(&prefs, SUB_LANG).await, Got::Value(b"eng".to_vec()));
+            assert_eq!(
+                get(&prefs, SUB_MODE).await,
+                Got::Value(b"OnlyForced".to_vec())
+            );
+
+            let cfg = configuration(&fx).await;
+            assert_eq!(cfg["AudioLanguagePreference"], "fra");
+            assert_eq!(cfg["SubtitleLanguagePreference"], "eng");
+            assert_eq!(cfg["SubtitleMode"], "OnlyForced");
+            assert_eq!(cfg["DescriptionLanguagePreference"], "fra");
+            assert_eq!(cfg["PlayDefaultAudioTrack"], false);
+            assert_eq!(cfg["SomethingNew"], 1);
+
+            let pref = track_preference(&fx.state, fx.user_id).await;
+            assert!(pref.audio_languages.contains(&"fra".to_owned()));
+            assert!(pref.subtitle_languages.contains(&"eng".to_owned()));
+            assert_eq!(pref.subtitle_mode, SubtitleMode::OnlyForced);
+            assert!(
+                !pref.prefer_default_audio_track,
+                "other fields are untouched"
+            );
+
+            set(&prefs, AUDIO, b"OriginalLanguage")
+                .await
+                .expect("stored");
+            assert_eq!(
+                get(&prefs, AUDIO).await,
+                Got::Value(b"OriginalLanguage".to_vec())
+            );
+            assert!(
+                track_preference(&fx.state, fx.user_id)
+                    .await
+                    .audio_original_language
+            );
+
+            set(&prefs, AUDIO, b"").await.expect("cleared");
+            set(&prefs, SUB_LANG, b"").await.expect("cleared");
+            assert_eq!(get(&prefs, AUDIO).await, Got::NotSet);
+            assert_eq!(get(&prefs, SUB_LANG).await, Got::NotSet);
+            assert!(track_preference(&fx.state, fx.user_id)
+                .await
+                .audio_languages
+                .is_empty());
+        })
+        .await;
+}
+
+/// A value a key does not accept is refused with a WARN that carries the key
+/// and the size but not the value, and the stored setting stays. Disarm
+/// check: with the `Invalid` arm in `canonical` accepting anything, the bad
+/// mode is stored and the read-back assertion fails.
+#[actix_web::test]
+async fn an_invalid_playback_value_is_refused_logged_without_its_value_and_not_stored() {
+    let fx = seed_rich().await;
+    let logs = Captured::default();
+    let _log = tracing::subscriber::set_default(subscriber(&logs));
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let prefs = prefs_for(&fx, &fx.user_token).await;
+            set(&prefs, SUB_MODE, b"Smart").await.expect("stored");
+            set(&prefs, AUDIO, b"jpn").await.expect("stored");
+            for bad in [&b"hunter2-mode"[..], b"", b"\xff\xfe"] {
+                assert!(set(&prefs, SUB_MODE, bad).await.is_err(), "{bad:?}");
+            }
+            assert!(set(&prefs, AUDIO, b"hunter2 language").await.is_err());
+            assert!(
+                set(&prefs, SUB_LANG, b"OriginalLanguage").await.is_err(),
+                "only the audio preference may be the title's original language"
+            );
+            assert_eq!(get(&prefs, SUB_MODE).await, Got::Value(b"Smart".to_vec()));
+            assert_eq!(get(&prefs, AUDIO).await, Got::Value(b"jpn".to_vec()));
+            assert_eq!(get(&prefs, SUB_LANG).await, Got::NotSet);
+        })
+        .await;
+    let text = logs.text();
+    assert!(
+        text.contains("pref refused: not an accepted value")
+            && text.contains("playback.subtitle_mode")
+            && text.contains("size=12"),
+        "{text}"
+    );
+    assert!(
+        !text.contains("hunter2"),
+        "the value reached the log:\n{text}"
+    );
+}
+
+/// A configuration blob that is not a JSON object is not overwritten by a
+/// playback set. Disarm check: with the `is_object` test in
+/// `set_string_field` removed the blob is replaced and the equality fails.
+#[actix_web::test]
+async fn a_playback_set_does_not_replace_an_unreadable_configuration() {
+    use pharos_core::PreferenceStore;
+    let fx = seed_rich().await;
+    fx.state
+        .stores
+        .set_user_configuration(fx.user_id, "[1,2]")
+        .await
+        .unwrap();
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let prefs = prefs_for(&fx, &fx.user_token).await;
+            assert!(set(&prefs, SUB_MODE, b"Always").await.is_err());
+        })
+        .await;
+    assert_eq!(
+        fx.state
+            .stores
+            .get_user_configuration(fx.user_id)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("[1,2]")
+    );
+}
