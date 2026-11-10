@@ -1722,15 +1722,27 @@ addEventListener("keydown", (e) => {
   player.focus({ preventScroll: true });
   player.dispatchEvent(new KeyboardEvent("keydown", { key: " ", bubbles: true, cancelable: true }));
 }, true);
-// The remote in the video player: Up and Down move between the picture and
-// its controls (the remote has its own volume keys), and Left and Right move
-// between controls once one has the focus; on the picture itself Left and
-// Right still seek. Taken here, before the player's handler hears them.
-// Not the volume slider: it would keep Left and Right for itself, and the
-// remote has volume keys.
+// The remote in the video player and the full music screen: Up and Down
+// move between the player itself and its controls (the remote has its own
+// volume keys), and Left and Right move between controls once one has the
+// focus; on the player itself Left and Right still seek. Taken here, before
+// the player's handler hears them. Not the volume slider: it would keep
+// Left and Right for itself, and the remote has volume keys.
+// A control scrolled out of a panel (a lyrics line) is no stop.
+const inPanels = (el, player, r) => {
+  for (let p = el.parentElement; p && p !== player; p = p.parentElement) {
+    if (getComputedStyle(p).overflowY === "visible") continue;
+    const b = p.getBoundingClientRect();
+    if (r.bottom <= b.top + 0.5 || r.top >= b.bottom - 0.5) return false;
+  }
+  return true;
+};
 const controlsIn = (player) => [...player.querySelectorAll(
   "button:not([disabled]), select:not([disabled]), a[href]"
-)].filter((el) => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; });
+)].filter((el) => {
+  const r = el.getBoundingClientRect();
+  return r.width > 0 && r.height > 0 && inPanels(el, player, r);
+});
 const nearest = (from, els, key) => {
   const f = from.getBoundingClientRect();
   const fx = f.left + f.width / 2, fy = f.top + f.height / 2;
@@ -1751,7 +1763,7 @@ const nearest = (from, els, key) => {
 };
 addEventListener("keydown", (e) => {
   if (!e.isTrusted || !e.key.startsWith("Arrow")) return;
-  const player = document.querySelector('#pharos-player');
+  const player = document.querySelector('__REMOTE_PLAYERS__');
   const at = document.activeElement;
   if (!player || !at || !player.contains(at)) return;
   const vertical = e.key === "ArrowUp" || e.key === "ArrowDown";
@@ -1764,7 +1776,7 @@ addEventListener("keydown", (e) => {
   const els = controlsIn(player);
   let to = null;
   if (onPicture) {
-    to = player.querySelector(".pharos-control-row button") || els[0] || null;
+    to = player.querySelector('__PLAYER_HOME__') || els[0] || null;
   } else {
     to = nearest(at, els, e.key);
     if (!to && e.key === "ArrowUp") to = player;
