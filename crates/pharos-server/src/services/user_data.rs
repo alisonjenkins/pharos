@@ -330,8 +330,9 @@ pub async fn update(
     Ok((item, data))
 }
 
-/// The stored items under synthesised series or season `id` (its 32-hex
-/// wire id) that `user` may see.
+/// The stored items under synthesised series, season, album or artist `id`
+/// (its 32-hex wire id) that `user` may see: an album's tracks, an artist's
+/// tracks as [`by_artist`] files them (B1085).
 pub async fn folder_items(
     state: &AppState,
     user: &User,
@@ -357,10 +358,54 @@ pub async fn folder_items(
         })
         .cloned()
         .collect();
+    if items.is_empty() {
+        items = music_folder_items(state, &all, id).await?;
+    }
     crate::services::access::retain_visible(state, user, &mut items, |e| e.id, "user_data")
         .await
         .map_err(DetailError::Hidden)?;
     Ok(items)
+}
+
+/// The tracks among `all` under album or artist `id`; none when `id` names
+/// neither.
+async fn music_folder_items(
+    state: &AppState,
+    all: &[MediaItem],
+    id: &str,
+) -> Result<Vec<MediaItem>, DetailError> {
+    use crate::api::jellyfin::items::{resolve_parent_filter, ParentResolution};
+    use pharos_core::ParentFilter;
+    let keep: Box<dyn Fn(&MediaItem) -> bool> = match resolve_parent_filter(state, Some(id))
+        .await
+        .map_err(DetailError::Store)?
+    {
+        ParentResolution::Filter(ParentFilter::Album { name }) => {
+            Box::new(move |i| i.probe.album.as_deref() == Some(name.as_str()))
+        }
+        ParentResolution::Filter(ParentFilter::Artist { name }) => {
+            Box::new(move |i| by_artist(i, &name))
+        }
+        _ => return Ok(Vec::new()),
+    };
+    Ok(all
+        .iter()
+        .filter(|i| i.kind == pharos_core::MediaKind::Audio && keep(i))
+        .cloned()
+        .collect())
+}
+
+/// Whether track `item` is by `artist`: its artist or its album artist is
+/// `artist`, in any case. Marking an artist marks every such track, and an
+/// artist is a favourite while every one is (B1085).
+pub fn by_artist(item: &MediaItem, artist: &str) -> bool {
+    [
+        item.probe.artist.as_deref(),
+        item.probe.album_artist.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|a| a.eq_ignore_ascii_case(artist))
 }
 
 /// What `user` has marked on synthesised series or season `id`, from one

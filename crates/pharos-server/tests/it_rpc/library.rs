@@ -2271,7 +2271,7 @@ async fn series_tiles_agree_with_the_jellyfin_route_page_and_follow_library_acce
 /// Adds music libraries at /libMusic (artists "Alpha", with albums "First"
 /// on two discs and "Second", and "Beta", album "Third") and /libOther
 /// (artist "Gamma"), and returns the first's wire id.
-async fn seed_music_libraries(fx: &crate::common::Fixture) -> String {
+pub async fn seed_music_libraries(fx: &crate::common::Fixture) -> String {
     use pharos_core::{
         LibraryKind, LibraryStore as _, MediaItem, MediaKind, MediaProbe, MediaStore as _,
     };
