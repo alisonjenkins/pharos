@@ -382,6 +382,14 @@ pub enum Bridge {
     Root,
     /// The viewport's CSS size.
     Size { w: f64, h: f64 },
+    /// The page was hidden (the app left the screen: Home, another app, the
+    /// TV's input switch) or shown again. `paused` counts the videos the
+    /// page's script paused as it hid (FR-605).
+    Visibility {
+        hidden: bool,
+        #[serde(default)]
+        paused: u32,
+    },
     /// A media element's state, after any of its events.
     Media(Media),
     /// An hls.js event on the player for `id`.
@@ -911,6 +919,13 @@ mod tests {
             parse_bridge(&pop),
             Some(Bridge::Pop {
                 path: "/ui/".into()
+            })
+        );
+        assert_eq!(
+            parse_bridge(&serde_json::json!({"t": "visibility", "hidden": true, "paused": 1})),
+            Some(Bridge::Visibility {
+                hidden: true,
+                paused: 1
             })
         );
         assert_eq!(parse_bridge(&serde_json::json!({"t": "nope"})), None);
