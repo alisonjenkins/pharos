@@ -147,7 +147,7 @@ pub const GROUP_ABANDONED_MS: u64 = 7_200_000;
 /// forces a real `Seek` rather than trusting the ordinary catch-up `Play`
 /// alone to reposition it.
 ///
-/// Live 2026-08-30 (Men in Black): a WAN member's socket dropped and came
+/// Live 2026-08-30 (Film AI): a WAN member's socket dropped and came
 /// back repeatedly over 90 minutes (`pharos_syncplay_socket_gone_seconds`).
 /// Every single reconnect already ran the existing catch-up path and sent a
 /// correctly-extrapolated `Play{position_ms}` — and she still drifted
@@ -5715,7 +5715,7 @@ mod tests {
         );
     }
 
-    /// 2026-08-30 (Men in Black) — a member whose socket was gone long enough
+    /// 2026-08-30 (Film AI) — a member whose socket was gone long enough
     /// that the ordinary catch-up `Play` had already failed to reposition it
     /// once must ALSO get a real `Seek` on reconnect. Sent alone (never
     /// immediately after another message to the same sink): jellyfin-web's
@@ -10277,7 +10277,7 @@ mod tests {
         items.into_iter().map(|i| i.playlist_item_id).collect()
     }
 
-    /// B37 — the poisoned-gate bug behind the Code Geass ep20→21 incident:
+    /// B37 — the poisoned-gate bug behind the Show U ep20→21 incident:
     /// jellyfin-web posts Ready on EVERY player transition, including the OLD
     /// episode's teardown right after NextItem. A Ready naming a stale queue
     /// entry must NOT satisfy the new item's readiness gate — the sender gets
