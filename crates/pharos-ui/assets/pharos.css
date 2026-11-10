@@ -1867,6 +1867,52 @@ body:has(.pharos-stage.is-full) .pharos-status-note {
   animation: pharos-fade-in 250ms ease 8s forwards;
 }
 
+/* A seek that has waited a while (B1196): where it is going, how long, why,
+   and the way back. The overlay ignores the pointer; the card does not. */
+.pharos-seek-wait {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.35rem;
+  max-width: min(26rem, calc(100% - 2rem));
+  padding: 0.8rem 1rem;
+  box-sizing: border-box;
+  border-radius: var(--px-radius);
+  background: rgb(0 0 0 / 0.78); /* not themed: controls sit on the video, whose colours no theme sets */
+  color: #fff; /* not themed: controls sit on the video, whose colours no theme sets */
+  text-align: center;
+  pointer-events: auto;
+}
+.pharos-seek-wait p {
+  margin: 0;
+}
+.pharos-seek-wait-title {
+  font-weight: 600;
+}
+.pharos-seek-wait-time,
+.pharos-seek-wait-reason {
+  font-size: var(--px-type-step--1);
+  opacity: 0.85;
+}
+.pharos-seek-wait-back {
+  margin-top: 0.4rem;
+  padding: 0.45rem 0.9rem;
+  border: 1px solid rgb(255 255 255 / 0.6); /* not themed: controls sit on the video, whose colours no theme sets */
+  border-radius: 6px;
+  background: transparent;
+  color: inherit;
+  font-size: 0.95rem;
+  cursor: pointer;
+}
+.pharos-seek-wait-back:hover,
+.pharos-seek-wait-back:focus-visible {
+  outline: 2px solid var(--px-color-accent);
+  outline-offset: 2px;
+}
+.pharos-stage.is-mini .pharos-seek-wait {
+  display: none;
+}
+
 /* The episode turn (V790): a cube turn onto the episode being opened or
    played next, outside the player so it lives through the swap and is never
    an ancestor of the video. Only transform and opacity change (set inline
