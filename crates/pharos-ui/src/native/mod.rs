@@ -74,6 +74,12 @@ pub fn focus_after_render(id: String) {
 }
 #[cfg(all(feature = "web", target_arch = "wasm32"))]
 mod pdf_web;
+#[cfg(all(feature = "web", target_arch = "wasm32"))]
+mod sw_web;
+/// Registers the shell's service worker (ADR-0110); the browser build calls
+/// it once at start.
+#[cfg(all(feature = "web", target_arch = "wasm32"))]
+pub use sw_web::register as register_service_worker;
 pub mod preplay;
 pub mod privacy;
 pub mod quality;
