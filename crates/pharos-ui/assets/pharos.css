@@ -4577,6 +4577,13 @@ body::before {
 .pharos-track-item:focus-within .pharos-queue-button {
   opacity: 1;
 }
+/* Under a tile in an "In progress" grid: its watched mark (V1160). */
+.pharos-tile-mark .pharos-button {
+  width: 100%;
+  margin-top: 0.35rem;
+  padding: 0.3rem 0.5rem;
+  font-size: 0.85rem;
+}
 /* Over an album's cover, shown while the card is hovered or focused. */
 .pharos-album-tile {
   position: relative;

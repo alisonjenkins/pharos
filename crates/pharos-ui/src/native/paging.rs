@@ -3,7 +3,7 @@
 //! Pure, so the rules run under host tests; the scroll sentinel and the fetch
 //! that feed it live in `browse` and the platform module.
 
-use pharos_client::api::{Item, ItemKind, Listing, Page};
+use pharos_client::api::{Item, ItemKind, ItemRef, Listing, Page};
 
 /// How many tiles before the end of the loaded items the scroll sentinel
 /// sits, so the next page is on its way before the viewer reaches the end.
@@ -54,6 +54,18 @@ impl Pager {
 
     pub fn failed(&self) -> bool {
         self.failed
+    }
+
+    /// A watched mark the server stored for `id`: its loaded tile shows it,
+    /// with the resume position the mark clears (V1160). Whether it was
+    /// loaded.
+    pub fn mark(&mut self, id: ItemRef, played: bool) -> bool {
+        let Some(item) = self.items.iter_mut().find(|i| i.id == id) else {
+            return false;
+        };
+        item.played = played;
+        item.position_ms = 0;
+        true
     }
 
     fn loaded(&self) -> u32 {
@@ -224,7 +236,7 @@ impl Chain {
 
 #[cfg(test)]
 mod tests {
-    use pharos_client::api::{ItemKind, ItemRef};
+    use pharos_client::api::ItemKind;
 
     use super::*;
 
@@ -416,6 +428,19 @@ mod tests {
         let shown = chain(1).shown(&all);
         assert_eq!(shown.len(), 2);
         assert!(shown.iter().all(|i| i.kind == ItemKind::Movie));
+    }
+
+    #[test]
+    fn a_stored_mark_shows_on_its_loaded_tile_and_clears_its_progress() {
+        let mut p = Pager::new(page(0, 2, 6));
+        let id = p.items()[1].id;
+        p.items[1].position_ms = 60_000;
+        assert!(p.mark(id, true));
+        assert!(p.items()[1].played && p.items()[1].position_ms == 0);
+        assert!(!p.items()[0].played, "only that tile");
+        assert!(p.mark(id, false));
+        assert!(!p.items()[1].played);
+        assert!(!p.mark(ItemRef::Real(999), true), "not loaded");
     }
 
     #[test]
