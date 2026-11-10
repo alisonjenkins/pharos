@@ -70,15 +70,17 @@ fn median(sorted: &[i64]) -> f64 {
 /// Finds the shift that moves the stamped lines onto the singing.
 ///
 /// `decode(start_ms, end_ms)` returns the window's samples, empty when the
-/// probe is to be skipped, or an error that ends the estimate (and the song);
-/// `align_wide(samples, tokens)` returns token spans relative to the window,
-/// empty when the line was not found, or likewise an error that ends it.
+/// probe is to be skipped, or an error that ends the estimate (and the song).
+/// Every probe is decoded first; `align_wide` then gets all the non-empty
+/// windows with their tokens at once, since they are independent and can
+/// share forward passes, and returns token spans relative to each window,
+/// empty where the line was not found, or likewise an error that ends it.
 pub fn estimate<D, A, E>(lines: &[Line], mut decode: D, mut align_wide: A) -> Result<Estimate, E>
 where
     D: FnMut(i64, i64) -> Result<Vec<f32>, E>,
-    A: FnMut(&[f32], &[String]) -> Result<Vec<(u64, u64)>, E>,
+    A: FnMut(&[(&[f32], &[String])]) -> Result<Vec<Vec<(u64, u64)>>, E>,
 {
-    let mut probes = Vec::new();
+    let mut windows = Vec::new();
     for i in probe_indices(lines) {
         let line = &lines[i];
         let tokens: Vec<String> = words(&line.text).into_iter().map(|w| w.token).collect();
@@ -88,16 +90,29 @@ where
         let start = (line.start_ms - SEARCH_MS).max(0);
         let end = line.start_ms + sung_ms + SEARCH_MS;
         let pcm = decode(start, end)?;
-        let spans = if pcm.is_empty() {
-            Vec::new()
-        } else {
-            align_wide(&pcm, &tokens)?
-        };
-        probes.push(match spans.first() {
-            None | Some((0, 0)) => None,
-            Some(&(s, _)) => Some(start + i64::try_from(s).unwrap_or(i64::MAX) - line.start_ms),
-        });
+        windows.push((line.start_ms, start, pcm, tokens));
     }
+    let wide: Vec<(&[f32], &[String])> = windows
+        .iter()
+        .filter(|(_, _, pcm, _)| !pcm.is_empty())
+        .map(|(_, _, pcm, tokens)| (pcm.as_slice(), tokens.as_slice()))
+        .collect();
+    let mut spans = if wide.is_empty() {
+        Vec::new()
+    } else {
+        align_wide(&wide)?
+    }
+    .into_iter();
+    let probes: Vec<Option<i64>> = windows
+        .iter()
+        .map(|(stamp, start, pcm, _)| {
+            let got = if pcm.is_empty() { None } else { spans.next() };
+            match got.as_deref().and_then(<[_]>::first) {
+                None | Some((0, 0)) => None,
+                Some(&(s, _)) => Some(start + i64::try_from(s).unwrap_or(i64::MAX) - stamp),
+            }
+        })
+        .collect();
     let mut found: Vec<i64> = probes.iter().flatten().copied().collect();
     if found.len() < MIN_AGREEING {
         let reason = format!("only {} probes found their line", found.len());
