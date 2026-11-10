@@ -47,8 +47,8 @@ use super::playback::{
     LibraryTransition, MediaEvent, MediaState, MseEngine, OnFatal, OnFragment, Outgoing,
     OverlayEffect, PlaybackEngine, RendererFrames, ReportClock, SubtitleSize, SubtitleSwitch, Tier,
     TierDrop, TierVerdict, UpNext, UpNextStep, CROSSFADE_KEY, EFFECTS_LEVEL_KEY,
-    LIBRARY_TRANSITION_KEY, MAX_BITRATE_KEY, MSE_ENGINE_KEY, OVERLAY_EFFECT_KEY, SUBTITLE_SIZE_KEY,
-    TIER_DROP_KEY, VOLUME_KEY,
+    LIBRARY_TRANSITION_KEY, MAX_BITRATE_KEY, MSE_ENGINE_KEY, OVERLAY_EFFECT_KEY,
+    SPEAKER_COLOURS_KEY, SUBTITLE_SIZE_KEY, TIER_DROP_KEY, VOLUME_KEY,
 };
 use super::playback_settings;
 use super::preplay::{self, PlayPicks, TrackChoices};
@@ -850,6 +850,40 @@ fn store_effects_level(level: EffectsLevel) -> Result<(), String> {
     platform::store_theme(EFFECTS_LEVEL_KEY, level.as_str()).inspect_err(|e| {
         platform::warn(&format!(
             "pharos: effects_level storage write failed error={e}"
+        ));
+    })
+}
+
+thread_local! {
+    /// The speaker colours switch set on this page load; it outranks storage
+    /// as [`SESSION_EFFECTS_LEVEL`] does.
+    static SESSION_SPEAKER_COLOURS: Cell<Option<bool>> = const { Cell::new(None) };
+}
+
+/// The viewer's speaker colours switch: this page load's choice, else the
+/// stored one, else off.
+fn stored_speaker_colours() -> bool {
+    if let Some(on) = SESSION_SPEAKER_COLOURS.with(Cell::get) {
+        return on;
+    }
+    match platform::stored_theme(SPEAKER_COLOURS_KEY) {
+        Ok(stored) => stored.as_deref() == Some("on"),
+        Err(e) => {
+            platform::warn(&format!(
+                "pharos: speaker_colours storage read failed error={e}"
+            ));
+            false
+        }
+    }
+}
+
+/// Keep `on` for this page load and try to save it on the device. The
+/// write's error comes back so the page can say the choice was not kept.
+fn store_speaker_colours(on: bool) -> Result<(), String> {
+    SESSION_SPEAKER_COLOURS.with(|s| s.set(Some(on)));
+    platform::store_theme(SPEAKER_COLOURS_KEY, if on { "on" } else { "off" }).inspect_err(|e| {
+        platform::warn(&format!(
+            "pharos: speaker_colours storage write failed error={e}"
         ));
     })
 }
@@ -3451,6 +3485,7 @@ fn AppearanceScreen() -> Element {
     let mut library_transition = use_signal(stored_library_transition);
     let mut overlay_effect = use_signal(stored_overlay_effect);
     let mut effects_level = use_signal(stored_effects_level);
+    let mut speaker_colours = use_signal(stored_speaker_colours);
     let cards = use_memo(move || theme_cards(&themes.catalogue.read()));
     // Leaving the page mid-edit must put the active theme back.
     use_drop(move || {
@@ -3473,6 +3508,7 @@ fn AppearanceScreen() -> Element {
     let library_transition_now = *library_transition.read();
     let overlay_effect_now = *overlay_effect.read();
     let effects_level_now = *effects_level.read();
+    let speaker_colours_now = *speaker_colours.read();
 
     rsx! {
         AppearanceView {
@@ -3505,6 +3541,14 @@ fn AppearanceScreen() -> Element {
                 }
                 effects_level.set(level);
                 platform::info(&format!("pharos: effects_level set={}", level.as_str()));
+            },
+            speaker_colours: speaker_colours_now,
+            on_speaker_colours: move |on: bool| {
+                if let Err(e) = store_speaker_colours(on) {
+                    show(notice, not_saved("the speaker colours", &e, Lasts::UntilReload));
+                }
+                speaker_colours.set(on);
+                platform::info(&format!("pharos: speaker_colours set={on}"));
             },
             on_pick: move |name: String| {
                 editing.set(None);
@@ -5808,6 +5852,7 @@ fn Player(
     // The Appearance page is another route, so the level cannot change while
     // this player is mounted: it is read once, at mount.
     let effects = use_signal(stored_effects_level);
+    let speakers = use_signal(stored_speaker_colours);
     // The generated styled track needs Effects on: with it Off, the viewer
     // moves to the plain track it is made from, else to no subtitle.
     use_effect({
@@ -6371,8 +6416,10 @@ fn Player(
             // Read before any return, so a tier drop, a level change or a
             // size change reloads the script in place.
             let (tier_now, level_now, size_now) = (tier(), effects(), sub_size());
+            let speakers_now = speakers();
             let track = shown.and_then(|i| p.detail.subtitle_tracks.iter().find(|t| t.index == i));
-            let generated = track.and_then(|t| styled_track_url(t, tier_now, level_now, size_now));
+            let generated = track
+                .and_then(|t| styled_track_url(t, tier_now, level_now, size_now, speakers_now));
             // A generated track at Off draws as the plain track beside it,
             // never from its source's raw script.
             let script = generated.clone().or_else(|| {
@@ -7890,6 +7937,13 @@ mod tests {
     #[cfg(not(target_os = "android"))]
     fn the_host_starts_on_the_desktop_tier() {
         assert_eq!(current_starting_tier(), Tier::Desktop);
+    }
+
+    #[test]
+    fn a_chosen_speaker_colours_switch_outlives_a_storage_that_keeps_nothing() {
+        assert!(!stored_speaker_colours());
+        store_speaker_colours(true).unwrap();
+        assert!(stored_speaker_colours());
     }
 
     #[test]
