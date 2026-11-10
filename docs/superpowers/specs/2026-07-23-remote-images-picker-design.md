@@ -6,7 +6,7 @@
 ## Goal
 
 Make jellyfin-web's **Edit Images** dialog functional: for a movie, episode,
-or **series container** (e.g. "Dragon Ball", which today shows a bad
+or **series container** (e.g. "Anime P", which today shows a bad
 auto-extracted tile), the user can browse alternate **Primary (poster)**,
 **Backdrop (fanart)**, and **Logo** images provided by TMDB / TVDB and pick
 one. The chosen image replaces the current art and survives future background

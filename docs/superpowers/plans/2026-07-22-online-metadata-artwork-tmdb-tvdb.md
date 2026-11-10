@@ -151,7 +151,7 @@ Add to `crates/pharos-store-sqlx/tests/sqlite_store.rs`:
 #[tokio::test]
 async fn match_columns_default_null_and_roundtrip() {
     let store = new_test_store().await; // existing helper in this file
-    let mut item = sample_movie("Blade Runner"); // existing helper
+    let mut item = sample_movie("Film Q"); // existing helper
     item.id = 900001;
     store.put(item.clone()).await.unwrap();
     let got = store.get(900001).await.unwrap();
@@ -452,9 +452,9 @@ fn match_best_rejects_below_threshold() {
 }
 #[test]
 fn match_best_year_off_by_one_is_partial_not_zero() {
-    let cands = vec![SearchCandidate { id: "3".into(), title: "Blade Runner".into(), year: Some(1983) }];
+    let cands = vec![SearchCandidate { id: "3".into(), title: "Film Q".into(), year: Some(1983) }];
     // title exact, year ±1 -> still above threshold
-    assert!(match_best("Blade Runner", Some(1982), &cands, 0.7).is_some());
+    assert!(match_best("Film Q", Some(1982), &cands, 0.7).is_some());
 }
 #[test]
 fn title_similarity_ignores_case_and_punctuation() {
@@ -713,21 +713,21 @@ Auth is the risky part — test it against a trait-abstracted transport so no ne
 async fn tvdb_jwt_cached_and_relogin_on_401() {
     let t = FakeTransport::new()
         .push_login("jwt-1")
-        .push_ok(r#"{"data":{"id":121361,"name":"Game of Thrones"}}"#) // first call ok
+        .push_ok(r#"{"data":{"id":931234,"name":"Show L"}}"#) // first call ok
         .push_401()                                                     // token expired
         .push_login("jwt-2")
-        .push_ok(r#"{"data":{"id":121361,"name":"Game of Thrones"}}"#); // retried ok
+        .push_ok(r#"{"data":{"id":931234,"name":"Show L"}}"#); // retried ok
     let c = TvdbClient::with_transport("key".into(), t.clone());
-    assert!(c.get_series("121361").await.is_some());
-    assert!(c.get_series("121361").await.is_some());
+    assert!(c.get_series("931234").await.is_some());
+    assert!(c.get_series("931234").await.is_some());
     assert_eq!(t.login_count(), 2); // logged in once, re-logged once after 401
 }
 #[test]
 fn tvdb_parse_series_search_yields_candidates() {
-    let body = r#"{"data":[{"tvdb_id":"121361","name":"Game of Thrones","year":"2011"}]}"#;
+    let body = r#"{"data":[{"tvdb_id":"931234","name":"Show L","year":"2011"}]}"#;
     let c = super::parse_series_search(body);
     assert_eq!(c.len(), 1);
-    assert_eq!(c[0].id, "121361");
+    assert_eq!(c[0].id, "931234");
     assert_eq!(c[0].year, Some(2011));
 }
 ```
