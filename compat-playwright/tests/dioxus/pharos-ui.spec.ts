@@ -3396,6 +3396,13 @@ test.describe("pharos Dioxus UI music resume", () => {
         timeout: 15_000,
       })
       .toBe(true);
+    // Firefox starts the tap's context a moment after making it, where
+    // Chromium makes it running: pause once it runs (B1141, V1101). A
+    // context that never starts means the browser has no sound output: see
+    // tests/lib/audio-sink.ts (B1140).
+    const started = () => lines.find((l) => l.startsWith("pharos: visualiser tap context=")) ?? "";
+    await expect.poll(started, { timeout: 5_000 }).not.toBe("");
+    expect(started()).toMatch(/ context=started state=running start_ms=\d+$/);
 
     const audio = page.locator("#pharos-video");
     await page.getByRole("button", { name: "Pause" }).click();
