@@ -1006,9 +1006,20 @@ fn renderer_signals(style: Style, fallback: Option<&Fallback>) -> (String, Vec<C
     (line, events)
 }
 
+/// How long a paused visualiser waits between looks for the song playing
+/// again: a few looks a second rather than every frame (FR-706).
+const IDLE_CHECK_MS: u32 = 200;
+
+/// Whether the visualiser has nothing to draw: a frame is up, the song is
+/// paused and the surface needs no frame of its own.
+fn idle(drawn: bool, playing: bool, needs_frame: bool) -> bool {
+    drawn && !playing && !needs_frame
+}
+
 /// Draw every animation frame until the component unmounts (which drops
 /// this future) or the surface fails. A paused song keeps its last frame,
-/// so a headset spends no GPU time on a still picture.
+/// so a headset spends no GPU time on a still picture, and the loop looks
+/// for play again every [`IDLE_CHECK_MS`] rather than every frame.
 async fn draw(
     mut surface: Box<dyn Surface>,
     tap: &Tap,
@@ -1021,7 +1032,12 @@ async fn draw(
     let mut drawn = false;
     loop {
         platform::animation_frame().await;
-        if drawn && !platform::media_playing(media_id) && !surface.needs_frame() {
+        if idle(
+            drawn,
+            platform::media_playing(media_id),
+            surface.needs_frame(),
+        ) {
+            platform::sleep_ms(IDLE_CHECK_MS).await;
             continue;
         }
         let now = platform::now_ms();
@@ -1052,6 +1068,16 @@ mod tests {
 
     use super::*;
     use crate::native::queue::Source;
+
+    /// FR-706: only a paused song with a frame up and a settled surface
+    /// waits; anything else draws on the next frame.
+    #[test]
+    fn a_paused_visualiser_waits_once_its_frame_is_up() {
+        assert!(idle(true, false, false));
+        assert!(!idle(false, false, false), "the first frame is drawn");
+        assert!(!idle(true, true, false), "a playing song draws");
+        assert!(!idle(true, false, true), "a recovering surface draws");
+    }
 
     fn render(title: &str, image: Option<&str>) -> String {
         render_with(title, image, MediaState::default())
