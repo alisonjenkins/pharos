@@ -407,13 +407,9 @@ pub fn rpc_trace_parent(span: &tracing::Span, traceparent: &str) {
 /// distributed trace is never cut in half; only root spans started here are
 /// thinned to `ratio`. At 1.0 this is the SDK default (parent-based always-on).
 fn sampler_for(ratio: f64) -> opentelemetry_sdk::trace::Sampler {
-    use opentelemetry_sdk::trace::Sampler;
-    let root = if ratio >= 1.0 {
-        Sampler::AlwaysOn
-    } else {
-        Sampler::TraceIdRatioBased(ratio.max(0.0))
-    };
-    Sampler::ParentBased(Box::new(root))
+    opentelemetry_sdk::trace::Sampler::ParentBased(Box::new(crate::client_spans::root_sampler(
+        ratio,
+    )))
 }
 
 /// Build the OTLP/gRPC span-export layer pointed at `endpoint`, registering
