@@ -52,7 +52,8 @@ async fn seed() -> (web::Data<AppState>, String, UserId) {
         .await
         .unwrap();
     let min = pharos_server::services::play_state::MinResume::default();
-    let state = web::Data::new(AppState::new(stores, "t".into()).with_min_resume(min.pct, min.secs));
+    let state =
+        web::Data::new(AppState::new(stores, "t".into()).with_min_resume(min.pct, min.secs));
     (state, token.0.expose().to_string(), uid)
 }
 
@@ -316,4 +317,59 @@ async fn a_stop_under_the_minimum_keeps_no_resume_point() {
     assert_eq!(stop!(app, token.as_str(), at(SONG, 900_000_000)), 204);
     assert_eq!(stops(&snap, StopOutcome::Saved), 1);
     assert_eq!(state.stores.resumable_items(uid).await.unwrap(), vec![SONG]);
+}
+
+/// FR-107: a progress report under the minimum is not written either, so
+/// a player that never sends its stop leaves no resume point behind.
+#[actix_web::test]
+async fn a_progress_report_under_the_minimum_is_not_written() {
+    let (state, token, uid) = seed().await;
+    let app = test::init_service(
+        App::new()
+            .app_data(state.clone())
+            .wrap(LowercasePath)
+            .configure(jellyfin::configure),
+    )
+    .await;
+    let recorder = DebuggingRecorder::new();
+    let snap = pharos_test_metrics::snapshotter(&recorder);
+    let _metrics = metrics::set_default_local_recorder(&recorder);
+    let progress = |ticks: u64| {
+        test::TestRequest::post()
+            .uri("/Sessions/Playing/Progress")
+            .insert_header(("X-Emby-Token", token.as_str()))
+            .insert_header(("content-type", "application/json"))
+            .set_payload(format!(
+                r#"{{"ItemId":"{}","PlaySessionId":"s","PositionTicks":{ticks}}}"#,
+                item_wire()
+            ))
+            .to_request()
+    };
+    let skipped = || -> u64 {
+        snap.snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(ck, ..)| {
+                let key = ck.key();
+                key.name() == "pharos_progress_writes_total"
+                    && key
+                        .labels()
+                        .any(|l| l.key() == "reason" && l.value() == "below_minimum")
+            })
+            .map(|(.., v)| match v {
+                DebugValue::Counter(n) => n,
+                _ => 0,
+            })
+            .sum()
+    };
+
+    let resp = test::call_service(&app, progress(100_000_000)).await;
+    assert_eq!(resp.status().as_u16(), 204);
+    assert_eq!(skipped(), 1);
+    assert!(state.stores.resumable_items(uid).await.unwrap().is_empty());
+
+    let resp = test::call_service(&app, progress(TEN_MIN)).await;
+    assert_eq!(resp.status().as_u16(), 204);
+    assert_eq!(skipped(), 1);
+    assert_eq!(state.stores.resumable_items(uid).await.unwrap(), vec![ITEM]);
 }
