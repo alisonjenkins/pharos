@@ -780,7 +780,6 @@ pub fn show_text_track(video_id: &str, track_id: Option<&str>) {
         return;
     };
     watch_cue_video(video_id);
-    shift_native_cues(video_id);
     for i in 0..tracks.length() {
         if let Some(t) = tracks.get(i) {
             let on = track_id.is_some_and(|id| t.id() == id);
@@ -798,6 +797,9 @@ pub fn show_text_track(video_id: &str, track_id: Option<&str>) {
             }
         }
     }
+    // A track only exposes its cues once it is showing or hidden, so the
+    // delay is applied after the modes are set.
+    shift_native_cues(video_id);
 }
 
 /// Loads the text track `track_id` without drawing it: the Rust subtitle
@@ -840,6 +842,12 @@ pub fn set_subtitle_delay(video_id: &str, delay_ms: i64) {
             set_jassub_delay(jassub, delay_ms);
         }
     });
+    shift_native_cues(video_id);
+}
+
+/// Re-applies the delay to cues that loaded after it was set: a `<track>`
+/// fetches its file on its own, after `show_text_track` ran.
+pub fn refresh_subtitle_delay(video_id: &str) {
     shift_native_cues(video_id);
 }
 
