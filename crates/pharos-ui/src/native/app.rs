@@ -3861,25 +3861,26 @@ fn FavouritesScreen() -> Element {
                     .await
                     .into_iter()
                     .collect::<Result<Vec<_>, _>>()?;
-                // A show marked a favourite fills the first episode page
-                // with its own episodes, which fold into its tile (B1084).
-                let shows = favourites::show_names(&pages);
-                if let Some((_, episodes)) = pages
+                // A show or album marked a favourite fills the first page
+                // of episodes or songs with its own, which fold into its
+                // tile (B1084, B1085).
+                let folds = favourites::Folds::of(&pages);
+                for (kind, rail) in pages
                     .iter_mut()
-                    .find(|(kind, _)| *kind == ItemKind::Episode)
+                    .filter(|(kind, _)| favourites::folds(*kind))
                 {
                     for _ in 0..favourites::MAX_EPISODE_TOP_UPS {
-                        if !favourites::wants_more_episodes(&shows, episodes) {
+                        if !folds.wants_more(rail) {
                             break;
                         }
-                        let start = episodes.items.len() as u32;
+                        let start = rail.items.len() as u32;
                         let next = api
-                            .favorites(&call, ItemKind::Episode, start, favourites::PER_KIND)
+                            .favorites(&call, *kind, start, favourites::PER_KIND)
                             .await?;
                         if next.items.is_empty() {
                             break;
                         }
-                        episodes.items.extend(next.items);
+                        rail.items.extend(next.items);
                     }
                 }
                 Ok(pages)
