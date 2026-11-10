@@ -15,6 +15,7 @@ mod glyphs;
 pub mod plan;
 pub mod signals;
 pub mod source;
+mod speakers;
 mod tags;
 mod text;
 pub mod theme;
