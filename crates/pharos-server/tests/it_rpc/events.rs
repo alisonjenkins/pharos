@@ -35,6 +35,9 @@ enum Got {
         /// added, changed, removed, failed roots.
         counts: [u32; 4],
     },
+    Groups {
+        seq: u64,
+    },
     Resync {
         seq: u64,
     },
@@ -46,6 +49,7 @@ impl Got {
             Got::UserData { seq, .. }
             | Got::Library { seq, .. }
             | Got::Task { seq, .. }
+            | Got::Groups { seq }
             | Got::Resync { seq } => *seq,
         }
     }
@@ -118,6 +122,7 @@ impl server::event_sink::Handler for TestSink {
                         ],
                     }
                 }
+                event::GroupsChanged(()) => Got::Groups { seq },
                 event::Resync(()) => Got::Resync { seq },
             };
             let _ = self.0.send(got);
