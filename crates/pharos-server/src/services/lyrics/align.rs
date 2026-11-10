@@ -17,7 +17,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 use tracing::Instrument as _;
 
-use super::shadow::Shadow;
+use super::shadow::{Shadow, Source};
 use super::{Lyrics, WordStamp};
 
 /// Bumped when the aligner's answers change for the same song and lines, so
@@ -338,26 +338,31 @@ impl Aligner {
     }
 
     async fn process_job(&self, job: &Job) -> Result<(), String> {
+        let answered = self.request(&job.path, &job.lines, TIMEOUT).await?;
+        tracing::info!(
+            media.id = job.id,
+            lines = job.lines.len(),
+            offset_ms = answered.aligned.offset_ms,
+            "lyrics: aligned"
+        );
+        self.store(job.id, job.key.clone(), answered, Source::Song);
+        Ok(())
+    }
+
+    /// Caches the primary's answer, then hands the same request to the
+    /// shadow when one is set (spec 039, R21). Stored first: the shadow runs
+    /// on its own task and never holds up, changes or replaces the answer.
+    fn store(&self, id: u64, key: String, answered: Answered, source: Source) -> Aligned {
         let Answered {
             aligned,
             sent,
             traceparent,
-        } = self.request(&job.path, &job.lines, TIMEOUT).await?;
-        tracing::info!(
-            media.id = job.id,
-            lines = job.lines.len(),
-            offset_ms = aligned.offset_ms,
-            "lyrics: aligned"
-        );
-
-        // Stored first: the shadow runs on its own task and never holds up,
-        // changes or replaces the primary's answer.
-        let compared = self.shadow.as_ref().map(|_| aligned.clone());
-        self.cache.put(job.id, job.key.clone(), aligned);
-        if let (Some(shadow), Some(primary)) = (&self.shadow, compared) {
-            drop(shadow.spawn(job.id, sent, primary, traceparent));
+        } = answered;
+        self.cache.put(id, key, aligned.clone());
+        if let Some(shadow) = &self.shadow {
+            drop(shadow.spawn(id, source, sent, aligned.clone(), traceparent));
         }
-        Ok(())
+        aligned
     }
 
     /// One `POST /align` for `lines` of the media-relative `path`.
@@ -457,9 +462,8 @@ impl Aligner {
                 return Ok(hit);
             }
         }
-        let aligned = self.request(rel, lines, SING_TIMEOUT).await?.aligned;
-        self.cache.put(item.id, key, aligned.clone());
-        Ok(aligned)
+        let answered = self.request(rel, lines, SING_TIMEOUT).await?;
+        Ok(self.store(item.id, key, answered, Source::Lines))
     }
 
     /// Check if word timestamps are ready for `lyrics`, or queue a background job.
@@ -680,7 +684,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_primary_answer_is_stored_before_the_shadow_answers_and_never_replaced() {
-        use crate::services::lyrics::shadow::tests::{body, counts, fake};
+        use crate::services::lyrics::shadow::tests::{body, by_path, fake};
         use crate::services::lyrics::shadow::SHADOW_VERSION;
         use metrics_util::debugging::DebuggingRecorder;
         use tokio::sync::oneshot;
@@ -730,8 +734,12 @@ mod tests {
         );
 
         release.send(()).unwrap();
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while counts(&snapshotter).is_empty() {
+        let seen = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let seen = by_path(&snapshotter);
+                if !seen.is_empty() {
+                    break seen;
+                }
                 tokio::task::yield_now().await;
             }
         })
@@ -742,6 +750,70 @@ mod tests {
             Some(primary),
             "the mismatch replaced nothing"
         );
+        assert_eq!(seen, vec![("song".into(), "mismatch".into(), 1)]);
+    }
+
+    #[tokio::test]
+    async fn sung_subtitle_lines_are_shadowed_too_after_the_answer_is_stored() {
+        use crate::services::lyrics::shadow::tests::{body, by_path, fake};
+        use metrics_util::debugging::DebuggingRecorder;
+        use tokio::sync::oneshot;
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let stamp = |at, start_ms| WordStamp { at, start_ms };
+        let primary = Aligned {
+            lines: vec![vec![stamp(0, 1200), stamp(4, 1900)]],
+            offset_ms: 0,
+            scores: vec![Some(610)],
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let media_root = dir.path().join("media");
+        std::fs::create_dir_all(&media_root).unwrap();
+        let file = media_root.join("episode.mkv");
+        std::fs::write(&file, b"x").unwrap();
+        let (primary_base, primary_got) = fake(200, body(&primary, 4), None).await;
+        let (release, hold) = oneshot::channel();
+        let (shadow_base, shadow_got) = fake(200, body(&primary, 5), Some(hold)).await;
+        let cache = AlignCache::new(None);
+        let (tx, _rx) = mpsc::channel(1);
+        let aligner = Aligner {
+            base: primary_base,
+            shadow: Some(Shadow::new(crate::http_client::client(), &shadow_base)),
+            ..test_aligner(media_root, cache.clone(), tx)
+        };
+        let item = MediaItem {
+            kind: pharos_core::MediaKind::Episode,
+            ..sample_item(file)
+        };
+        let lines = vec![(1000, 2500, "Run away".to_owned())];
+
+        // The shadow holds its answer back, and sing still answers.
+        let sung = tokio::time::timeout(Duration::from_secs(5), aligner.sing(&item, &lines))
+            .await
+            .expect("sing waits for no shadow")
+            .unwrap();
+        assert_eq!(sung, primary);
+        assert_eq!(
+            shadow_got.await.unwrap(),
+            primary_got.await.unwrap(),
+            "the shadow is sent the primary's request"
+        );
+
+        release.send(()).unwrap();
+        let seen = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let seen = by_path(&snapshotter);
+                if !seen.is_empty() {
+                    break seen;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(seen, vec![("lines".into(), "match".into(), 1)]);
     }
 
     #[test]
