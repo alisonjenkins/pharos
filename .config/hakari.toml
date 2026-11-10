@@ -32,7 +32,7 @@ platforms = [
 # (017 FR-001). pharos-subs is excluded so the renderer builds for
 # wasm32-unknown-unknown (spec 026 FR-001).
 [final-excludes]
-workspace-members = ["pharos-api", "pharos-client", "pharos-hls", "pharos-subs", "pharos-ui", "quire", "quire-web"]
+workspace-members = ["pharos-api", "pharos-client", "pharos-hls", "pharos-subs", "pharos-ui", "quire", "quire-pdf", "quire-web"]
 
 # Write out exact versions rather than a semver range. (Defaults to false.)
 # exact-versions = true
