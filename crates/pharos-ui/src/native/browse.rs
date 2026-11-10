@@ -411,11 +411,16 @@ pub enum SeasonPick {
 }
 
 impl SeasonPick {
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 9] = [
         Self::Asked,
         Self::FirstRegular,
         Self::First,
         Self::NoSeasons,
+        Self::NextUp,
+        Self::Resume,
+        Self::Unplaced,
+        Self::Finished,
+        Self::WalkLimit,
     ];
 
     pub fn label(self) -> &'static str {
@@ -507,6 +512,10 @@ pub fn default_season(seasons: &[Item]) -> (Option<ItemRef>, SeasonPick) {
 /// episode once the last played one's season is done.
 pub const SEASON_WALK: usize = 2;
 
+/// How many of the most recently played episodes a series page reads to find
+/// the newest one the viewer has started.
+pub const LAST_PLAYED_PEEK: u32 = 4;
+
 /// The listing whose first item is the viewer's most recently played episode
 /// of `series`, a part-watched one included; ties (a season marked watched at
 /// once) go to the latest in airing order.
@@ -518,7 +527,8 @@ pub fn last_played(series: ItemRef) -> Listing {
 }
 
 /// Whether the viewer has started `episode`: watched it or part of it. An
-/// unstarted top of [`last_played`] means nothing of the show is watched.
+/// [`last_played`] peek with none started means nothing of the show is
+/// watched.
 fn started(episode: &Item) -> bool {
     episode.played || episode.position_ms > 0
 }
@@ -676,12 +686,14 @@ pub async fn load<A: PharosApi>(
             // on each other: one round trip for both (FR-205).
             let (seasons, last) = join(
                 list(id, Some(ItemKind::Season), ""),
-                api.query(info, &last_played(id), 0, 1),
+                api.query(info, &last_played(id), 0, LAST_PLAYED_PEEK),
             )
             .await;
             let seasons = seasons?.items;
             let last = match last {
-                Ok(page) => page.items.into_iter().next().filter(started),
+                // An episode marked unwatched keeps its play date, so the
+                // newest started one is the viewer's place, not the top.
+                Ok(page) => page.items.into_iter().find(started),
                 Err(e) => {
                     warn(format!(
                         "pharos: browse {id}: last played episode unavailable: {e}"
@@ -689,55 +701,66 @@ pub async fn load<A: PharosApi>(
                     None
                 }
             };
-            let mut opened = None;
-            if let Some(last) = &last {
+            // The next-up pick is an extra: a listing it needs that fails
+            // leaves the page on its default season, never failing it.
+            let found: Result<_, ClientError> = async {
+                let Some(last) = &last else {
+                    return Ok(None);
+                };
                 if seasons.is_empty() {
                     let episodes = list(id, None, INDEX_ORDER).await?;
                     let (pick, next) = placed(last, after_last(last, &episodes));
-                    opened = Some((None, pick, episodes, next));
-                } else if let Some(at) = last
+                    return Ok(Some((None, pick, episodes, next)));
+                }
+                let Some(at) = last
                     .parent
                     .and_then(|p| seasons.iter().position(|s| s.id == p))
-                {
-                    let season = seasons[at].id;
-                    let episodes = list(season, None, INDEX_ORDER).await?;
-                    if after_last(last, &episodes) == After::Past {
-                        // Its season is done: the next is the first unwatched
-                        // episode of a later regular season, at most
-                        // SEASON_WALK seasons on.
-                        let later: Vec<ItemRef> = seasons[at + 1..]
-                            .iter()
-                            .filter(|s| s.episode != Some(0))
-                            .map(|s| s.id)
-                            .collect();
-                        for &next_season in later.iter().take(SEASON_WALK) {
-                            let page = list(next_season, None, INDEX_ORDER).await?;
-                            if let Some(next) = page.items.iter().find(|e| !e.played) {
-                                let next = next.id;
-                                opened =
-                                    Some((Some(next_season), SeasonPick::NextUp, page, Some(next)));
-                                break;
-                            }
-                            if is_partial(&page) {
-                                opened =
-                                    Some((Some(next_season), SeasonPick::Unplaced, page, None));
-                                break;
-                            }
-                        }
-                        if opened.is_none() {
-                            let pick = if later.len() > SEASON_WALK {
-                                SeasonPick::WalkLimit
-                            } else {
-                                SeasonPick::Finished
-                            };
-                            opened = Some((Some(season), pick, episodes, None));
-                        }
-                    } else {
-                        let (pick, next) = placed(last, after_last(last, &episodes));
-                        opened = Some((Some(season), pick, episodes, next));
+                else {
+                    return Ok(None);
+                };
+                let season = seasons[at].id;
+                let episodes = list(season, None, INDEX_ORDER).await?;
+                if after_last(last, &episodes) != After::Past {
+                    let (pick, next) = placed(last, after_last(last, &episodes));
+                    return Ok(Some((Some(season), pick, episodes, next)));
+                }
+                // Its season is done: the next is the first unwatched
+                // episode of a later regular season, at most SEASON_WALK
+                // seasons on.
+                let later: Vec<ItemRef> = seasons[at + 1..]
+                    .iter()
+                    .filter(|s| s.episode != Some(0))
+                    .map(|s| s.id)
+                    .collect();
+                for &next_season in later.iter().take(SEASON_WALK) {
+                    let page = list(next_season, None, INDEX_ORDER).await?;
+                    if let Some(next) = page.items.iter().find(|e| !e.played) {
+                        let next = next.id;
+                        return Ok(Some((
+                            Some(next_season),
+                            SeasonPick::NextUp,
+                            page,
+                            Some(next),
+                        )));
+                    }
+                    if is_partial(&page) {
+                        return Ok(Some((Some(next_season), SeasonPick::Unplaced, page, None)));
                     }
                 }
+                let pick = if later.len() > SEASON_WALK {
+                    SeasonPick::WalkLimit
+                } else {
+                    SeasonPick::Finished
+                };
+                Ok(Some((Some(season), pick, episodes, None)))
             }
+            .await;
+            let opened = found.unwrap_or_else(|e| {
+                warn(format!(
+                    "pharos: browse {id}: next episode unavailable, opening the default season: {e}"
+                ));
+                None
+            });
             let (selected, pick, episodes, next_up) = match opened {
                 Some(opened) => opened,
                 None => {
@@ -3224,6 +3247,8 @@ mod tests {
         stamped: RefCell<Vec<(String, String, u32, u32)>>,
         /// Refuses every listing.
         refuse_lists: bool,
+        /// Refuses the listings of these parents only.
+        refuse_parents: Vec<ItemRef>,
         /// Whether each listing asked for box sets folded (B1086).
         collapsed: RefCell<Vec<bool>>,
     }
@@ -3262,7 +3287,7 @@ mod tests {
                 start,
                 limit,
             ));
-            if self.refuse_lists {
+            if self.refuse_lists || self.refuse_parents.contains(&parent) {
                 return Err(refused());
             }
             let all = self
@@ -3347,6 +3372,8 @@ mod tests {
     const SPECIALS: ItemRef = ItemRef::Synth(11);
     const S1: ItemRef = ItemRef::Synth(12);
     const S2: ItemRef = ItemRef::Synth(13);
+    const S3: ItemRef = ItemRef::Synth(14);
+    const S4: ItemRef = ItemRef::Synth(15);
 
     fn show_fake() -> Fake {
         let mut fake = Fake::default();
@@ -3522,6 +3549,135 @@ mod tests {
         let show = opened(&fake);
         assert_eq!(show.selected, Some(S1));
         assert_eq!(show.pick, SeasonPick::FirstRegular);
+    }
+
+    /// `n` watched episodes of `season`, numbered from 1, ids from `base`.
+    fn watched(base: u64, season: ItemRef, n: u32) -> Vec<Item> {
+        (1..=n)
+            .map(|i| {
+                let mut e = ep_of(base + u64::from(i), season, i, "Seen");
+                e.played = true;
+                e
+            })
+            .collect()
+    }
+
+    /// The show fake with four regular seasons after the specials.
+    fn long_show_fake() -> Fake {
+        let mut fake = show_fake();
+        let season = |id, n, name| {
+            let mut s = item(id, ItemKind::Season, name);
+            s.episode = Some(n);
+            s
+        };
+        fake.lists.insert(
+            (SERIES, Some(ItemKind::Season)),
+            vec![
+                season(SPECIALS, 0, "Specials"),
+                season(S1, 1, "Season 1"),
+                season(S2, 2, "Season 2"),
+                season(S3, 3, "Season 3"),
+                season(S4, 4, "Season 4"),
+            ],
+        );
+        fake
+    }
+
+    /// The walk reads SEASON_WALK later seasons; all watched with more
+    /// unread, the page stays on the last played episode's season.
+    #[test]
+    fn a_walk_past_its_limit_stays_on_the_last_played_season() {
+        let mut fake = long_show_fake();
+        let s1 = watched(100, S1, 1);
+        fake.lists.insert((S1, None), s1.clone());
+        fake.lists.insert((S2, None), watched(200, S2, 1));
+        fake.lists.insert((S3, None), watched(300, S3, 1));
+        fake.lists
+            .insert((S4, None), vec![ep_of(401, S4, 1, "Unread")]);
+        fake.lists.insert((SERIES, None), s1);
+        let show = opened(&fake);
+        assert_eq!(show.selected, Some(S1));
+        assert_eq!(show.pick, SeasonPick::WalkLimit);
+        assert_eq!(show.next_up, None);
+        assert!(!fake.asked.borrow().iter().any(|(p, _, _)| *p == S4));
+    }
+
+    /// A later season longer than one page, its first page all watched:
+    /// the next episode is past what was read.
+    #[test]
+    fn a_later_season_watched_past_its_first_page_is_unplaced() {
+        let mut fake = show_fake();
+        let s1 = watched(100, S1, 1);
+        fake.lists.insert((S1, None), s1.clone());
+        fake.lists
+            .insert((S2, None), watched(1000, S2, BROWSE_PAGE + 1));
+        fake.lists.insert((SERIES, None), s1);
+        let show = opened(&fake);
+        assert_eq!(show.selected, Some(S2));
+        assert_eq!(show.pick, SeasonPick::Unplaced);
+        assert_eq!(show.next_up, None);
+    }
+
+    /// The last played episode is past the first page of its season: the
+    /// page keeps that season and cannot name the next.
+    #[test]
+    fn a_last_played_episode_past_the_first_page_is_unplaced() {
+        let mut fake = show_fake();
+        let mut s1 = watched(1000, S1, BROWSE_PAGE + 1);
+        s1.push(ep_of(2000, S1, BROWSE_PAGE + 2, "Next"));
+        let last = s1[BROWSE_PAGE as usize].clone();
+        fake.lists.insert((S1, None), s1);
+        fake.lists.insert((SERIES, None), vec![last]);
+        let show = opened(&fake);
+        assert_eq!(show.selected, Some(S1));
+        assert_eq!(show.pick, SeasonPick::Unplaced);
+        assert_eq!(show.next_up, None);
+    }
+
+    /// A watched special: the walk goes on to the first regular season
+    /// after the specials.
+    #[test]
+    fn a_last_played_special_opens_the_next_regular_season() {
+        let mut fake = show_fake();
+        let special = watched(500, SPECIALS, 1);
+        fake.lists.insert((SPECIALS, None), special.clone());
+        fake.lists
+            .insert((S1, None), vec![ep_of(1, S1, 1, "Pilot")]);
+        fake.lists.insert((SERIES, None), special);
+        let show = opened(&fake);
+        assert_eq!(show.selected, Some(S1));
+        assert_eq!(show.pick, SeasonPick::NextUp);
+        assert_eq!(show.next_up, Some(ItemRef::Real(1)));
+    }
+
+    /// An episode marked unwatched keeps its play date and tops the
+    /// listing; the newest started one below it is the viewer's place.
+    #[test]
+    fn an_episode_marked_unwatched_does_not_hide_the_last_started() {
+        let mut fake = show_fake();
+        let mut pilot = ep_of(1, S1, 1, "Pilot");
+        pilot.played = true;
+        fake.lists.insert((S1, None), vec![pilot.clone()]);
+        fake.lists
+            .insert((SERIES, None), vec![ep_of(9, S2, 3, "Unmarked"), pilot]);
+        let show = opened(&fake);
+        assert_eq!(show.selected, Some(S2));
+        assert_eq!(show.pick, SeasonPick::NextUp);
+    }
+
+    /// A listing the next-up search needs fails: the page still opens, on
+    /// its default season.
+    #[test]
+    fn a_failed_next_up_listing_falls_back_to_the_default_season() {
+        let mut fake = show_fake();
+        let mut back = ep_of(2, S2, 1, "Return");
+        back.played = true;
+        fake.lists.insert((SERIES, None), vec![back]);
+        fake.refuse_parents.push(S2);
+        let show = opened(&fake);
+        assert_eq!(show.selected, Some(S1));
+        assert_eq!(show.pick, SeasonPick::FirstRegular);
+        assert_eq!(show.next_up, None);
     }
 
     #[test]
