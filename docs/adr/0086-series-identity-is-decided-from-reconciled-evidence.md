@@ -1,6 +1,6 @@
 # ADR-0086: Series identity is decided from reconciled evidence, and episodes inherit it
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-11-09T14:30:00Z
 - **Deciders:** Alison (open questions answered 2026-11-09T17:27Z)
 
