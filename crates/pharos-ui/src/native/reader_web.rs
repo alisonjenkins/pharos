@@ -26,12 +26,12 @@ use super::keymap::Mode;
 use super::pdf_web::PdfView;
 use super::platform;
 use super::reader::{
-    check_size, download_href, flatten_toc, key_action, margin_label, pdf_key, pdf_locator,
-    pdf_progress, pdf_saved_index, progress_label, retry_delay_ms, retryable, save_is_news,
-    save_key, saved_fraction, saved_locator, size_cap, swipe_action, tap_action, too_big_message,
-    KeyAction, KeyPress, KeyTarget, PageTheme, PdfFit, PdfKey, PendingSave, PendingSaves,
-    ReaderSettings, SaveGate, SizeVerdict, TocRow, Typeface, LINE_HEIGHTS, MARGINS, OFFLINE_NOTE,
-    PENDING_KEY, SETTINGS_KEY,
+    check_size, download_href, flatten_toc, key_action, link_key, margin_label, pdf_key,
+    pdf_locator, pdf_progress, pdf_saved_index, progress_label, retry_delay_ms, retryable,
+    save_is_news, save_key, saved_fraction, saved_locator, size_cap, swipe_action, tap_action,
+    too_big_message, JumpVia, KeyAction, KeyPress, KeyTarget, PageTheme, PdfFit, PdfKey,
+    PendingSave, PendingSaves, ReaderSettings, SaveGate, SizeVerdict, TocRow, Typeface,
+    LINE_HEIGHTS, MARGINS, OFFLINE_NOTE, PENDING_KEY, SETTINGS_KEY,
 };
 use super::route::Route;
 use super::views::{display_name, Nav};
@@ -410,6 +410,9 @@ struct Core {
     alive: Rc<Cell<bool>>,
     fraction: Signal<f64>,
     page: Signal<Option<(usize, usize)>>,
+    /// Where the reader was before the last link they followed, for the
+    /// Return button.
+    back: Signal<Option<Locator>>,
 }
 
 impl Core {
@@ -459,13 +462,65 @@ impl Core {
         }
     }
 
-    async fn go(&self, target: &Target) {
+    /// Follows a link in the book or a contents row. A link offers the way
+    /// back to where it was followed from; a contents row clears it.
+    async fn go(&self, target: &Target, via: JumpVia) {
         let Engine::Epub(view) = &self.engine else {
             return;
         };
+        let from = view.locator();
+        let (id, to, via_label) = (self.saver.id, target.encode(), via.label());
         match view.go(target).await {
-            Ok(_) => self.moved(false),
-            Err(e) => platform::warn(&format!("pharos: reader jump failed error={e}")),
+            Ok(landed) => {
+                platform::info(&format!(
+                    "pharos: reader jump item={id} via={via_label} from={from} to={to} landed={} at={}",
+                    landed.label(),
+                    view.locator()
+                ));
+                super::report::note(&format!(
+                    "reader jump via={via_label} landed={}",
+                    landed.label()
+                ));
+                self.set_back(via.offers_return().then_some(from));
+                self.moved(false);
+            }
+            Err(e) => {
+                super::report::note(&format!("reader jump via={via_label} landed=failed"));
+                platform::warn(&format!(
+                    "pharos: reader jump failed item={id} via={via_label} from={from} to={to} error={e}"
+                ));
+            }
+        }
+    }
+
+    /// Goes back to where the reader was before the last link.
+    async fn go_back(&self) {
+        let Engine::Epub(view) = &self.engine else {
+            return;
+        };
+        let Some(at) = *self.back.peek() else {
+            return;
+        };
+        let (id, from) = (self.saver.id, view.locator());
+        match view.go_to(at).await {
+            Ok(()) => {
+                platform::info(&format!(
+                    "pharos: reader jump item={id} via=return from={from} to={at} landed=place at={}",
+                    view.locator()
+                ));
+                self.set_back(None);
+                self.moved(false);
+            }
+            Err(e) => platform::warn(&format!(
+                "pharos: reader jump failed item={id} via=return from={from} to={at} error={e}"
+            )),
+        }
+    }
+
+    fn set_back(&self, at: Option<Locator>) {
+        if self.alive.get() {
+            let mut back = self.back;
+            back.set(at);
         }
     }
 
@@ -771,6 +826,7 @@ async fn open_book(
     settings: ReaderSettings,
     fraction: Signal<f64>,
     page: Signal<Option<(usize, usize)>>,
+    back: Signal<Option<Locator>>,
     alive: Rc<Cell<bool>>,
     bytes: Vec<u8>,
     on_action: impl Fn(Action) + 'static,
@@ -817,6 +873,7 @@ async fn open_book(
         alive,
         fraction,
         page,
+        back,
     });
     core.set_fraction(core.engine.progress());
     Ok(Opened { core, toc })
@@ -832,6 +889,7 @@ async fn open_pdf(
     settings: ReaderSettings,
     fraction: Signal<f64>,
     page: Signal<Option<(usize, usize)>>,
+    back: Signal<Option<Locator>>,
     alive: Rc<Cell<bool>>,
     bytes: &js_sys::Uint8Array,
     on_broken: Box<dyn Fn(String)>,
@@ -859,6 +917,7 @@ async fn open_pdf(
         alive,
         fraction,
         page,
+        back,
     });
     core.set_fraction(core.engine.progress());
     Ok(Opened {
@@ -946,6 +1005,7 @@ pub fn ReaderScreen(id: ItemRef) -> Element {
     let mut toc = use_signal(Vec::<TocRow>::new);
     let fraction = use_signal(|| 0.0f64);
     let page = use_signal(|| None::<(usize, usize)>);
+    let back = use_signal(|| None::<Locator>);
     let mut is_pdf = use_signal(|| false);
     let swipe_from = use_hook(|| Rc::new(Cell::new(f64::NAN)));
     let swiped = use_hook(|| Rc::new(Cell::new(false)));
@@ -1053,6 +1113,7 @@ pub fn ReaderScreen(id: ItemRef) -> Element {
                         *settings.peek(),
                         fraction,
                         page,
+                        back,
                         alive.clone(),
                         &bytes,
                         // The module trapped: say so, with the download, and
@@ -1135,7 +1196,7 @@ pub fn ReaderScreen(id: ItemRef) -> Element {
                                 c.turn(false).await;
                             }),
                             Action::Jump(target) => platform::spawn_detached(async move {
-                                c.go(&target).await;
+                                c.go(&target, JumpVia::Link).await;
                             }),
                             Action::Relayout => {
                                 if let Engine::Epub(view) = &c.engine {
@@ -1153,6 +1214,7 @@ pub fn ReaderScreen(id: ItemRef) -> Element {
                     *settings.peek(),
                     fraction,
                     page,
+                    back,
                     alive.clone(),
                     bytes,
                     handler,
@@ -1207,6 +1269,23 @@ pub fn ReaderScreen(id: ItemRef) -> Element {
                     return false;
                 }
                 let held = key_core.borrow().clone();
+                if let (Some(forward), Some(Engine::Epub(view))) =
+                    (link_key(press), held.as_ref().map(|c| &c.engine))
+                {
+                    if panel.peek().is_some() {
+                        return false;
+                    }
+                    let moved = view.focus_link(forward);
+                    platform::info(&format!(
+                        "pharos: reader link focus item={id} forward={forward} moved={moved}"
+                    ));
+                    // Up past the first link leaves the links, so the next
+                    // Down starts from the top of the page again.
+                    if !moved && !forward {
+                        platform::focus_by_id(ROOT_ID);
+                    }
+                    return moved;
+                }
                 // A fit-width PDF also takes the vertical arrows, so the
                 // press is read per engine; Escape is common.
                 let pdf_press = match held.as_ref().map(|c| &c.engine) {
@@ -1288,7 +1367,7 @@ pub fn ReaderScreen(id: ItemRef) -> Element {
             platform::focus_by_id(ROOT_ID);
             let held = core.borrow().clone();
             if let Some(c) = held {
-                platform::spawn_detached(async move { c.go(&target).await });
+                platform::spawn_detached(async move { c.go(&target, JumpVia::Contents).await });
             }
         }
     });
@@ -1378,6 +1457,23 @@ pub fn ReaderScreen(id: ItemRef) -> Element {
                         "{PdfFit::Width.label()}"
                     }
                 } else {
+                    if back.read().is_some() {
+                        button {
+                            class: "pharos-control pharos-reader-return",
+                            r#type: "button",
+                            title: "Return to where you were before the link",
+                            onclick: {
+                                let core = core.clone();
+                                move |_| {
+                                    let held = core.borrow().clone();
+                                    if let Some(c) = held {
+                                        platform::spawn_detached(async move { c.go_back().await });
+                                    }
+                                }
+                            },
+                            "↩ Return"
+                        }
+                    }
                     button {
                         class: "pharos-control",
                         r#type: "button",
