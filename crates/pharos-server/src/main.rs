@@ -2066,6 +2066,16 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
             }
         }
     }
+    // B1180 — repair artwork rows whose file is gone. Needs no provider key or
+    // image cache, so it is not gated like the enrichment loop above. It runs
+    // only on the background leader.
+    pharos_server::stale_artwork::spawn(
+        state.stores.clone(),
+        state.bg_io.clone(),
+        state.is_bg_leader.clone(),
+        cfg.metadata.repair_stale_artwork,
+        state.artwork_epoch.clone(),
+    );
     // Cap the extracted-image cache. Unlike the trickplay/HLS caches it has no
     // in-line eviction, so on a large library posters/backdrops/thumbs/scaled
     // artwork can slowly fill the shared cache volume. A periodic janitor
