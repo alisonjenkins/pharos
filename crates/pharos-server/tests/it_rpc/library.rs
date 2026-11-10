@@ -3003,6 +3003,59 @@ async fn a_listing_keeps_to_watched_or_unwatched() {
     );
 }
 
+/// B1199/V1159: `IsResumable` is the filter bar's "In progress": a film part
+/// watched and not finished, and a series tile with something watched (an
+/// episode played or part watched) and something still to watch.
+/// Disarm check: with the started check in `virtual_shows_page` skipped,
+/// both series list.
+#[actix_web::test]
+async fn a_listing_keeps_to_in_progress() {
+    use pharos_core::UserDataStore as _;
+
+    let (server, fx) = crate::revocation::start().await;
+    let (client, _closed) = crate::revocation::connect(&server).await;
+    let session = crate::revocation::signed_in(&client, &fx.user_token).await;
+    seed_movies(&fx).await;
+    let tv = seed_tv_library(&fx).await;
+    let store = |id: u64, data: pharos_core::UserItemData| {
+        let fx = &fx;
+        async move {
+            fx.state
+                .stores
+                .set_user_data(fx.user_id, id, data)
+                .await
+                .unwrap();
+        }
+    };
+    let part_watched = pharos_core::UserItemData {
+        last_played_position_ticks: 600_000_000,
+        ..pharos_core::UserItemData::default()
+    };
+    let played = pharos_core::UserItemData {
+        played: true,
+        ..pharos_core::UserItemData::default()
+    };
+    // Alpha finished, Beta part watched; one episode of "Show" played.
+    store(101, played).await;
+    store(102, part_watched).await;
+    store(601, played).await;
+
+    let lib_a = fx.lib_a_wire.clone();
+    assert_eq!(
+        listed_in(&session, &lib_a, &[], "", &["IsResumable"]).await,
+        ["Beta"]
+    );
+    let in_progress = || listed_in(&session, &tv, &[Kind::Series], "", &["IsResumable"]);
+    assert_eq!(in_progress().await, ["Show"]);
+    // A part-watched episode starts a show too.
+    store(604, part_watched).await;
+    assert_eq!(in_progress().await, ["Mature", "Show"]);
+    // Every episode played: finished, no longer in progress.
+    store(602, played).await;
+    store(603, played).await;
+    assert_eq!(in_progress().await, ["Mature"]);
+}
+
 /// B1081: `IsFavorite` lists a series tile while every episode in it is a
 /// favourite, which is what marking the show writes; one favourite episode
 /// does not make its show one. `IsNotFavorite` lists the rest.
