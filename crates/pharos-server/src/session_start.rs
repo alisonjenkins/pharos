@@ -177,7 +177,7 @@ const MAX_TRACKED_REFETCHES: usize = 16_384;
 
 /// An init segment has no real segment index, but a client stuck re-requesting
 /// it is exactly [`SegmentRefetches`]'s failure shape — the 2026-08-29 SyncPlay
-/// wedge (a Code Geass episode change) was one browser tab re-fetching
+/// wedge (a Show U episode change) was one browser tab re-fetching
 /// `h264cmaf/init.mp4` 291 times in 27s, never advancing to a media segment,
 /// while every existing refetch call site only watched numbered segments. One
 /// sentinel per rendition, chosen far outside any real segment count, so a

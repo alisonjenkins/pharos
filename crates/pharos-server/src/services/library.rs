@@ -1669,7 +1669,7 @@ mod tests {
 
     #[test]
     fn a_leading_article_files_under_the_next_word() {
-        assert_eq!(letter_starts(["The Matrix"]), starts(&[("M", 0)]));
+        assert_eq!(letter_starts(["The Glass Lattice"]), starts(&[("G", 0)]));
     }
 
     #[test]

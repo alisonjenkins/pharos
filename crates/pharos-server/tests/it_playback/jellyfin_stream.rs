@@ -297,7 +297,7 @@ async fn seed_with_sized_file(size: usize) -> (web::Data<AppState>, String, Temp
     (state, token.0.expose().to_string(), td)
 }
 
-// Deadpool — a `<video>` opens a progressive mp4 with an open-ended `bytes=X-`.
+// Film AJ — a `<video>` opens a progressive mp4 with an open-ended `bytes=X-`.
 // Answering the whole `X..EOF` (up to ~1.8 GB) in one body makes a reverse proxy
 // temp-file the remainder before relaying (unbuffered seeks take minutes) and a
 // stalled/reset progressive connection restarts the player at 0. deliver_stream

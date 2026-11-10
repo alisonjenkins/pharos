@@ -2868,7 +2868,7 @@ mod tests {
         let cache_dir = tempfile::tempdir().unwrap();
         let state = seed_state_with_cache(cache_dir.path()).await;
 
-        let series_key = "/tv/Dragon Ball";
+        let series_key = "/tv/Silver Rock";
         // Write a logo into the deterministic series-cache slot.
         let logo_path = series_image_path(cache_dir.path(), ImageRole::Logo, series_key);
         std::fs::create_dir_all(logo_path.parent().unwrap()).unwrap();
@@ -2876,11 +2876,11 @@ mod tests {
 
         let ep = MediaItem {
             id: 601,
-            path: dir.path().join("Dragon Ball/S01E01.mkv"),
-            title: "Dragon Ball S01E01".into(),
+            path: dir.path().join("Silver Rock/S01E01.mkv"),
+            title: "Silver Rock S01E01".into(),
             kind: MediaKind::Episode,
             series: Some(SeriesInfo {
-                series_name: "Dragon Ball".into(),
+                series_name: "Silver Rock".into(),
                 season_number: Some(1),
                 episode_number: Some(1),
                 series_folder: Some(series_key.into()),
@@ -2891,7 +2891,7 @@ mod tests {
         };
         state.stores.put(ep).await.unwrap();
 
-        let synth = series_id_for_key(Some(series_key), "Dragon Ball");
+        let synth = series_id_for_key(Some(series_key), "Silver Rock");
         let token = token_for(&state.stores).await;
         let app = test::init_service(App::new().app_data(state).configure(register)).await;
         let resp = test::call_service(

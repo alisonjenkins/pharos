@@ -338,7 +338,7 @@ mod tests {
         .await
         .unwrap();
         s.upsert_translations(
-            &TranslationOwner::Series("/tv/Dragon Ball".into()),
+            &TranslationOwner::Series("/tv/Silver Rock".into()),
             &[
                 row("jpn", "悟空の冒険。", true),
                 row("deu", "Goku zieht los.", false),
@@ -355,9 +355,9 @@ mod tests {
         let mut items = [episode(1, "Bulma meets Goku.")];
         localize_items_in(s, &lang, items.iter_mut()).await;
         let mut metas = HashMap::from([(
-            "/tv/Dragon Ball".to_string(),
+            "/tv/Silver Rock".to_string(),
             SeriesMetadata {
-                series_key: "/tv/Dragon Ball".into(),
+                series_key: "/tv/Silver Rock".into(),
                 overview: Some("Goku sets out.".into()),
                 ..Default::default()
             },
@@ -365,7 +365,7 @@ mod tests {
         localize_series_in(s, &lang, &mut metas).await;
         (
             items[0].metadata.overview.clone().unwrap(),
-            metas["/tv/Dragon Ball"].overview.clone().unwrap(),
+            metas["/tv/Silver Rock"].overview.clone().unwrap(),
         )
     }
 
@@ -411,9 +411,9 @@ mod tests {
             Some("Admin episode text.")
         );
         let mut metas = HashMap::from([(
-            "/tv/Dragon Ball".to_string(),
+            "/tv/Silver Rock".to_string(),
             SeriesMetadata {
-                series_key: "/tv/Dragon Ball".into(),
+                series_key: "/tv/Silver Rock".into(),
                 overview: Some("Admin show text.".into()),
                 locked,
                 ..Default::default()
@@ -421,7 +421,7 @@ mod tests {
         )]);
         localize_series_in(&s, &lang, &mut metas).await;
         assert_eq!(
-            metas["/tv/Dragon Ball"].overview.as_deref(),
+            metas["/tv/Silver Rock"].overview.as_deref(),
             Some("Admin show text.")
         );
     }

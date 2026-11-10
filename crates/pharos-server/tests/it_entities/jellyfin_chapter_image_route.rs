@@ -43,8 +43,8 @@ async fn seed_movie(cache_dir: &std::path::Path) -> (web::Data<AppState>, u64) {
     stores
         .put(MediaItem {
             id,
-            path: "/media/Deadpool (2016)/Deadpool.mp4".into(),
-            title: "Deadpool".into(),
+            path: "/media/Film AJ (2016)/Film AJ.mp4".into(),
+            title: "Film AJ".into(),
             kind: MediaKind::Movie,
             ..Default::default()
         })

@@ -330,7 +330,7 @@ fn is_placeholder_episode_title(item: &pharos_core::MediaItem, raw: &str) -> boo
         || (!show.is_empty() && title == show)
         // A scene name with no title words after its token (a renamed file's
         // old stem). A token followed by real words, as an NFO title like
-        // "S03E07 - The Enemy (Director's Cut)" has, is the episode's own.
+        // "S03E07 - The Distant Signal (Director's Cut)" has, is the episode's own.
         || (pharos_scanner::fs::has_sxxeyy_token(raw)
             && pharos_scanner::metadata::filename::episode_title(raw).is_none())
 }
@@ -421,9 +421,9 @@ mod tests {
         let episode = |title: &str| pharos_core::MediaItem {
             kind: MediaKind::Episode,
             title: title.into(),
-            path: "/tv/Star Trek/Season 03/Star Trek - S03E07 - WEBRip-1080p.mkv".into(),
+            path: "/tv/Show Y/Season 03/Show Y - S03E07 - WEBRip-1080p.mkv".into(),
             series: Some(pharos_core::SeriesInfo {
-                series_name: "Star Trek The Next Generation".into(),
+                series_name: "Show Y The Next Chapter".into(),
                 ..Default::default()
             }),
             ..Default::default()
@@ -434,35 +434,31 @@ mod tests {
         };
         let counts = pharos_core::EntityCounts::default;
 
-        for placeholder in [
-            "Star Trek: The Next Generation",
-            "Star Trek - S03E07 - WEBRip-1080p",
-        ] {
+        for placeholder in ["Show Y: The Next Chapter", "Show Y - S03E07 - WEBRip-1080p"] {
             let mut item = episode(placeholder);
-            apply_enrichment(&mut item, counts(), &named("The Enemy"));
-            assert_eq!(item.title, "The Enemy", "{placeholder}");
+            apply_enrichment(&mut item, counts(), &named("The Distant Signal"));
+            assert_eq!(item.title, "The Distant Signal", "{placeholder}");
         }
 
-        let mut renamed = episode("Star Trek - S03E07 - WEBRip-720p");
-        apply_enrichment(&mut renamed, counts(), &named("The Enemy"));
-        assert_eq!(renamed.title, "The Enemy");
+        let mut renamed = episode("Show Y - S03E07 - WEBRip-720p");
+        apply_enrichment(&mut renamed, counts(), &named("The Distant Signal"));
+        assert_eq!(renamed.title, "The Distant Signal");
 
-        let mut kept = episode("The Enemy (Director's Cut)");
-        apply_enrichment(&mut kept, counts(), &named("The Enemy"));
-        assert_eq!(kept.title, "The Enemy (Director's Cut)");
+        let mut kept = episode("The Distant Signal (Director's Cut)");
+        apply_enrichment(&mut kept, counts(), &named("The Distant Signal"));
+        assert_eq!(kept.title, "The Distant Signal (Director's Cut)");
 
         // An NFO title that carries its token and a title of its own is kept.
-        let mut tokened = episode("S03E07 - The Enemy (Director's Cut)");
-        apply_enrichment(&mut tokened, counts(), &named("The Enemy"));
-        assert_eq!(tokened.title, "S03E07 - The Enemy (Director's Cut)");
-
-        let mut stem = episode("Star Trek - S03E07 - WEBRip-1080p");
-        apply_enrichment(
-            &mut stem,
-            counts(),
-            &named("Star Trek: The Next Generation"),
+        let mut tokened = episode("S03E07 - The Distant Signal (Director's Cut)");
+        apply_enrichment(&mut tokened, counts(), &named("The Distant Signal"));
+        assert_eq!(
+            tokened.title,
+            "S03E07 - The Distant Signal (Director's Cut)"
         );
-        assert_eq!(stem.title, "Star Trek - S03E07 - WEBRip-1080p");
+
+        let mut stem = episode("Show Y - S03E07 - WEBRip-1080p");
+        apply_enrichment(&mut stem, counts(), &named("Show Y: The Next Chapter"));
+        assert_eq!(stem.title, "Show Y - S03E07 - WEBRip-1080p");
 
         let mut movie = bare_movie();
         movie.title = "Arrival".into();
