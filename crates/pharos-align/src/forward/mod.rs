@@ -4,6 +4,9 @@
 pub mod cpu;
 mod math;
 
+use crate::ctc::Emission;
+use crate::line::align_line;
+use crate::service::{Model, ModelError};
 use crate::tokens::CLASSES;
 
 /// The model's 28 output labels; the star (`tokens::STAR`) is appended after.
@@ -38,6 +41,43 @@ pub fn emission(logits: &[f32]) -> Vec<f32> {
         out.push(0.0);
     }
     out
+}
+
+/// `service::Model` on the CPU pass: the window normalised, forwarded,
+/// turned into log-probabilities and handed to CTC, as `Aligner.align` does.
+pub struct CpuAligner {
+    pub model: cpu::CpuModel,
+}
+
+impl Model for CpuAligner {
+    fn align(
+        &mut self,
+        pcm: &[f32],
+        tokens: &[String],
+        lead_star: bool,
+    ) -> Result<Vec<(u64, u64)>, ModelError> {
+        if pcm.is_empty() || tokens.is_empty() {
+            return Ok(Vec::new());
+        }
+        let wave = normalise(pcm);
+        let logits = tracing::info_span!(
+            "aligner.forward",
+            samples = pcm.len(),
+            aligner.device = "cpu"
+        )
+        .in_scope(|| self.model.logits(&[&wave]))
+        .pop()
+        .unwrap_or_default();
+        let probs = emission(&logits);
+        let frames = probs.len() / CLASSES;
+        tracing::info_span!("aligner.ctc", frames).in_scope(|| {
+            let em = Emission::new(&probs, frames, CLASSES)
+                .map_err(|e| ModelError::Fatal(e.to_string()))?;
+            // torchaudio raises for text its window cannot hold: only that line fails.
+            align_line(&em, pcm.len(), tokens, lead_star)
+                .map_err(|e| ModelError::Line(e.to_string()))
+        })
+    }
 }
 
 #[cfg(test)]
