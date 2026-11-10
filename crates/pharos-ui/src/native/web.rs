@@ -2501,6 +2501,18 @@ pub fn scroll_to_tile(at: u32) -> bool {
     }
 }
 
+/// How far the page is scrolled down, in CSS px.
+pub fn scroll_y() -> Option<f64> {
+    web_sys::window().and_then(|w| w.scroll_y().ok())
+}
+
+/// Scrolls the page to `y` CSS px from its top.
+pub fn scroll_to_y(y: f64) {
+    if let Some(window) = web_sys::window() {
+        window.scroll_to_with_x_and_y(0.0, y);
+    }
+}
+
 /// Scrolls the page back to its top.
 pub fn scroll_to_top() {
     if let Some(window) = web_sys::window() {
