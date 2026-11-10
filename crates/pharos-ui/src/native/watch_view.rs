@@ -2209,7 +2209,7 @@ pub enum TapZone {
 
 /// The third of a picture `width` px wide that `x` falls in.
 pub fn tap_zone(x: f64, width: f64) -> TapZone {
-    if !(width > 0.0) || !x.is_finite() {
+    if width.is_nan() || width <= 0.0 || !x.is_finite() {
         return TapZone::Middle;
     }
     match x / width {
