@@ -1,13 +1,18 @@
 {{- /*
 One aligner Deployment and its Service. Called with a dict: `root` (the
 chart context), `suffix` (the name after the release's fullname), `cfg` (the
-aligner values) and `component`.
+aligner or aligner.shadow values) and `component`.
 */ -}}
 {{- define "pharos.aligner.workload" -}}
 {{- $root := .root }}
 {{- $cfg := .cfg }}
 {{- $name := printf "%s-%s" (include "pharos.fullname" $root) .suffix }}
+{{- /* The primary keeps the selector it always had (selectors are immutable);
+the shadow's name differs, so neither Service selects the other's pods. */}}
 {{- $selector := include "pharos.aligner.selectorLabels" $root }}
+{{- if ne .suffix "aligner" }}
+{{- $selector = printf "app.kubernetes.io/name: %s-%s\napp.kubernetes.io/instance: %s" (include "pharos.name" $root) .suffix $root.Release.Name }}
+{{- end }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -151,4 +156,11 @@ spec:
 # alignment. The server sends it a song's path under the media mount, so both
 # pods mount the same media at the same path.
 {{ include "pharos.aligner.workload" (dict "root" . "suffix" "aligner" "cfg" .Values.aligner "component" "aligner") }}
+{{- end }}
+{{- if and .Values.aligner.enabled .Values.aligner.shadow.enabled }}
+---
+# Spec 039, R21: a second aligner that sees every finished song after the
+# primary answers, for a word-by-word comparison. Its answers are never
+# stored or served.
+{{ include "pharos.aligner.workload" (dict "root" . "suffix" "aligner-shadow" "cfg" .Values.aligner.shadow "component" "aligner-shadow") }}
 {{- end }}
