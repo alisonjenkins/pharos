@@ -943,6 +943,16 @@ input:focus-visible {
   background: var(--px-color-warning);
   color: var(--px-color-bg);
 }
+/* New children on a latest rail's series or album (spec 038 FR-106):
+   bottom left, clear of Watched, 3D and Damaged. */
+.pharos-badge-new {
+  right: auto;
+  left: 0.5rem;
+  top: auto;
+  bottom: 0.6rem;
+  background: var(--px-color-accent);
+  color: var(--px-color-accent-fg);
+}
 .pharos-episode-damaged {
   align-self: flex-start;
   padding: 0.1rem 0.45rem;

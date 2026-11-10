@@ -1072,6 +1072,9 @@ pub fn PosterTile(
                 if item.damaged {
                     span { class: "pharos-badge pharos-badge-damaged", title: "The file is damaged", "Damaged" }
                 }
+                if let Some((short, long)) = new_children_label(&item) {
+                    span { class: "pharos-badge pharos-badge-new", title: "{long}", "aria-label": "{long}", "{short}" }
+                }
                 if let Some(p) = progress {
                     div { class: "pharos-progress", style: "width: {p}%" }
                 }
@@ -1094,6 +1097,22 @@ pub fn PosterTile(
             }
         }
     }
+}
+
+/// A latest rail's series or album tile with several new children: its
+/// badge ("3 new") and the words it stands for ("3 new episodes"), spec 038
+/// FR-106. `None` for any other tile.
+pub fn new_children_label(item: &Item) -> Option<(String, String)> {
+    let n = item.new_children;
+    if n < 2 {
+        return None;
+    }
+    let what = match item.kind {
+        ItemKind::Series => "episodes",
+        ItemKind::Album => "tracks",
+        _ => return None,
+    };
+    Some((format!("{n} new"), format!("{n} new {what}")))
 }
 
 /// What stands where an item has no art: a song or album gets the music tile
@@ -1632,6 +1651,25 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
     use pharos_client::api::{Book, BookFormat, ReadPosition};
+
+    #[test]
+    fn a_latest_group_says_how_many_children_are_new() {
+        let with = |kind, n| Item {
+            new_children: n,
+            ..item(kind)
+        };
+        assert_eq!(
+            super::new_children_label(&with(ItemKind::Series, 3)),
+            Some(("3 new".into(), "3 new episodes".into()))
+        );
+        assert_eq!(
+            super::new_children_label(&with(ItemKind::Album, 12)),
+            Some(("12 new".into(), "12 new tracks".into()))
+        );
+        assert_eq!(super::new_children_label(&with(ItemKind::Series, 1)), None);
+        assert_eq!(super::new_children_label(&with(ItemKind::Series, 0)), None);
+        assert_eq!(super::new_children_label(&with(ItemKind::Movie, 4)), None);
+    }
 
     fn item(kind: ItemKind) -> Item {
         Item {
