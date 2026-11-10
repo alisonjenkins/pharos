@@ -64,6 +64,120 @@ fn book(sections: usize) -> Vec<u8> {
     zip.finish().unwrap().into_inner()
 }
 
+/// A book whose first section links into the others: a deep id, an old
+/// `<a name>` anchor, a footnote in a later section and a same-page note.
+fn linked_book() -> Vec<u8> {
+    let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    let o = zip::write::SimpleFileOptions::default();
+    let mut put = |name: &str, body: &str| {
+        zip.start_file(name, o).unwrap();
+        zip.write_all(body.as_bytes()).unwrap();
+    };
+    put(
+        "META-INF/container.xml",
+        r#"<container><rootfiles><rootfile full-path="c.opf" media-type="application/oebps-package+xml"/></rootfiles></container>"#,
+    );
+    put(
+        "c.opf",
+        r#"<package><metadata/><manifest><item id="toc" href="toc.xhtml" media-type="application/xhtml+xml"/><item id="c" href="text/c%201.xhtml" media-type="application/xhtml+xml"/><item id="n" href="notes.xhtml" media-type="application/xhtml+xml"/></manifest><spine><itemref idref="toc"/><itemref idref="c"/><itemref idref="n" linear="no"/></spine></package>"#,
+    );
+    put(
+        "toc.xhtml",
+        r#"<html xmlns="http://www.w3.org/1999/xhtml"><body><h1>Contents</h1>
+<p><a id="to-deep" href="text/c%201.xhtml#deep">Deep section</a></p>
+<p><a id="to-old" href="text/c%201.xhtml#old">Old anchor</a></p>
+<p><a id="to-start" href="text/c%201.xhtml">Chapter start</a></p>
+<p><a id="to-web" href="https://example.org/">Web page</a></p>
+</body></html>"#,
+    );
+    let paras: String = (0..14)
+        .map(|p| {
+            let words: String = (0..160).map(|w| format!("c.{p}.{w} ")).collect();
+            let mark = match p {
+                8 => r#" id="deep""#.to_owned(),
+                _ => String::new(),
+            };
+            let old = if p == 11 { r#"<a name="old"></a>"# } else { "" };
+            let note = if p == 12 {
+                r#"<a id="ref" href="../notes.xhtml#n1">1</a>"#
+            } else {
+                ""
+            };
+            format!(r##"<p{mark}>{old}Para {p} <a href="#deep">back</a> {note} {words}</p>"##)
+        })
+        .collect();
+    put(
+        "text/c 1.xhtml",
+        &format!(
+            r#"<html xmlns="http://www.w3.org/1999/xhtml"><body><h1>Chapter</h1>{paras}</body></html>"#
+        ),
+    );
+    put(
+        "notes.xhtml",
+        r#"<html xmlns="http://www.w3.org/1999/xhtml"><body><h1>Notes</h1><p id="n1">Note one.</p></body></html>"#,
+    );
+    zip.finish().unwrap().into_inner()
+}
+
+thread_local! {
+    static JUMPS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Mounts [`linked_book`] at its contents page and follows every link the
+/// view reports, as the reader does.
+#[wasm_bindgen]
+pub async fn mount_links(font_px: f64) -> Result<(), JsValue> {
+    let doc = web_sys::window().unwrap().document().unwrap();
+    let host = doc.get_element_by_id("host").unwrap();
+    let book = Rc::new(Publication::open_epub(linked_book()).map_err(|e| e.to_string())?);
+    let settings = Settings {
+        font_size_px: font_px,
+        ..Settings::default()
+    };
+    let v = View::mount(&host, book, settings).map_err(|e| e.to_string())?;
+    VIEW.with(|cell| *cell.borrow_mut() = Some(v.clone()));
+    let weak = v.downgrade();
+    v.on_action(move |a| {
+        if let quire_web::Action::Jump(t) = a {
+            let Some(v) = weak.upgrade() else { return };
+            wasm_bindgen_futures::spawn_local(async move {
+                let landed = v.go(&t).await.map_err(|e| e.to_string());
+                JUMPS.with(|j| j.borrow_mut().push(format!("{} {landed:?}", t.encode())));
+            });
+        }
+    });
+    v.open(0, Start::Beginning)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Every link followed so far, `"<target> <outcome>"`.
+#[wasm_bindgen]
+pub fn jumps() -> Vec<String> {
+    JUMPS.with(|j| j.borrow().clone())
+}
+
+#[wasm_bindgen]
+pub fn focus_link(forward: bool) -> bool {
+    view().focus_link(forward)
+}
+
+#[wasm_bindgen]
+pub fn focused_link() -> Option<String> {
+    view().focused_link().map(|t| t.encode())
+}
+
+#[wasm_bindgen]
+pub fn spine() -> u32 {
+    view().spine() as u32
+}
+
+#[wasm_bindgen]
+pub fn page() -> u32 {
+    view().page()
+}
+
 #[wasm_bindgen]
 pub async fn mount(font_px: f64) -> Result<(), JsValue> {
     let doc = web_sys::window().unwrap().document().unwrap();

@@ -98,6 +98,7 @@ impl Settings {
              .quire-strip :is(sub,sup,small){{font-size:0.75em !important;}}\
              .quire-strip a{{color:{link} !important;}}\
              .quire-strip [data-quire-link]{{cursor:pointer;text-decoration:underline;}}\
+             .quire-strip [data-quire-link]:focus{{outline:2px solid {link};outline-offset:2px;}}\
              .quire-strip img,.quire-strip svg{{max-height:{height}px;height:auto;object-fit:contain;\
              break-inside:avoid;}}\
              .quire-strip pre{{white-space:pre-wrap;}}\

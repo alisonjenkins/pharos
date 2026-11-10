@@ -19,4 +19,4 @@ mod view;
 
 pub use layout::Columns;
 pub use settings::{Font, Settings, Theme};
-pub use view::{Action, Start, View, ViewError, WeakView};
+pub use view::{Action, Landed, Start, View, ViewError, WeakView};
