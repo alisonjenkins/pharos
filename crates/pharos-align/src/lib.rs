@@ -14,6 +14,7 @@ pub mod http;
 pub mod line;
 pub mod obs;
 pub mod offset;
+pub mod pin;
 pub mod plan;
 pub mod service;
 pub mod text;
