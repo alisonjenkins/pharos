@@ -1077,12 +1077,13 @@ pub fn reveal(_list: &str, _id: &str) {}
 
 /// As the browser's: the row around `selector` scrolls sideways so the
 /// element is in sight, and the page stays put.
+/// `r` leaves the TV focus ring's 12px of room inside the row's edge (B1312).
 pub fn reveal_across(selector: &str) {
     run(format!(
         "(() => {{ const el = document.querySelector({}); const row = el && el.parentElement; if (!row) return; \
-         const o = row.getBoundingClientRect(), i = el.getBoundingClientRect(); \
-         if (i.left < o.left) row.scrollLeft += i.left - o.left; \
-         else if (i.right > o.right) row.scrollLeft += i.right - o.right; }})();",
+         const o = row.getBoundingClientRect(), i = el.getBoundingClientRect(), r = 12; \
+         if (i.left - r < o.left) row.scrollLeft += i.left - r - o.left; \
+         else if (i.right + r > o.right) row.scrollLeft += i.right + r - o.right; }})();",
         js_str(selector)
     ));
 }
