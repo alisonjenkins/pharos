@@ -23,6 +23,19 @@ use std::sync::Arc;
 /// The path prefix the bundle is mounted under.
 const MOUNT: &str = "/ui";
 
+/// The bundle key of the service worker template (ADR-0110). It is served
+/// rendered, never as the file.
+const WORKER_KEY: &str = "sw.js";
+
+/// Where the template takes the bundle hash and the shell's URLs.
+const HASH_TOKEN: &str = "\"__PHAROS_BUNDLE_HASH__\"";
+const PRECACHE_TOKEN: &str = "__PHAROS_PRECACHE__";
+
+/// Bundle directories fetched only when a feature needs them, so the worker
+/// does not precache them: the PDF module (ADR-0047), hls.js and JASSUB
+/// (ADR-0035, ADR-0057), the subtitle fonts.
+const LAZY_PREFIXES: [&str; 3] = ["assets/pdf/", "assets/vendor/", "assets/fonts/"];
+
 /// A year: the longest `max-age` caches honour. Only content-hashed assets
 /// get it (see [`is_hashed_asset`]).
 const IMMUTABLE_MAX_AGE: u32 = 31_536_000;
@@ -40,6 +53,8 @@ pub enum UiBundleError {
     CaseCollision { a: PathBuf, b: PathBuf },
     #[error("ui bundle: index.html yields an invalid Content-Security-Policy header")]
     Csp,
+    #[error("ui bundle: sw.js lacks the {token} placeholder")]
+    WorkerTemplate { token: &'static str },
 }
 
 /// A built pharos-ui bundle (`dx build`'s `public/`).
@@ -50,6 +65,9 @@ pub struct UiBundle {
     csp: HeaderValue,
     /// Lowercased path relative to the bundle root, `/`-separated → file.
     files: HashMap<String, PathBuf>,
+    /// `sw.js` with the bundle hash and the shell's URLs filled in, when the
+    /// bundle has one.
+    worker: Option<String>,
 }
 
 impl UiBundle {
@@ -70,12 +88,100 @@ impl UiBundle {
         })?;
         let csp = HeaderValue::from_str(&content_security_policy(&html))
             .map_err(|_| UiBundleError::Csp)?;
-        Ok(Self { index, csp, files })
+        let worker = render_bundle_worker(dir, &files)?;
+        Ok(Self {
+            index,
+            csp,
+            files,
+            worker,
+        })
     }
 
     pub fn file_count(&self) -> usize {
         self.files.len()
     }
+}
+
+/// Fills in `sw.js` from the bundle, or `None` when the bundle has none.
+fn render_bundle_worker(
+    root: &Path,
+    files: &HashMap<String, PathBuf>,
+) -> Result<Option<String>, UiBundleError> {
+    use sha2::Digest as _;
+    use std::io::Read as _;
+    let Some(template_path) = files.get(WORKER_KEY) else {
+        return Ok(None);
+    };
+    let read_err = |source| UiBundleError::Read {
+        dir: root.to_path_buf(),
+        source,
+    };
+    let template = std::fs::read_to_string(template_path).map_err(read_err)?;
+    let mut shell: Vec<(&String, &PathBuf)> =
+        files.iter().filter(|(key, _)| is_shell_file(key)).collect();
+    shell.sort();
+    let mut hasher = sha2::Sha256::new();
+    let mut urls = Vec::with_capacity(shell.len());
+    for (key, path) in shell {
+        hasher.update(key.as_bytes());
+        hasher.update([0]);
+        let mut file = std::fs::File::open(path).map_err(read_err)?;
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            let n = file.read(&mut buf).map_err(read_err)?;
+            let Some(chunk) = buf.get(..n).filter(|c| !c.is_empty()) else {
+                break;
+            };
+            hasher.update(chunk);
+        }
+        hasher.update([0]);
+        let rel = path.strip_prefix(root).unwrap_or(path);
+        urls.push(shell_url(rel));
+    }
+    let hash: String = hasher
+        .finalize()
+        .iter()
+        .take(8)
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    render_worker(&template, &hash, &urls).map(Some)
+}
+
+/// Whether the worker precaches the bundle file at `key`: every file but the
+/// worker itself and the lazy directories.
+fn is_shell_file(key: &str) -> bool {
+    key != WORKER_KEY && !LAZY_PREFIXES.iter().any(|p| key.starts_with(p))
+}
+
+/// The URL a page asks for `rel` by. The case is the file's own, which the
+/// page's links use, not the lowercased key.
+fn shell_url(rel: &Path) -> String {
+    let path = rel
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/");
+    if path == "index.html" {
+        format!("{MOUNT}/")
+    } else {
+        format!("{MOUNT}/{path}")
+    }
+}
+
+/// `template` with the bundle hash and the URLs to precache in place of its
+/// placeholders. A template without both would version nothing, so it is an
+/// error.
+fn render_worker(template: &str, hash: &str, urls: &[String]) -> Result<String, UiBundleError> {
+    for token in [HASH_TOKEN, PRECACHE_TOKEN] {
+        if !template.contains(token) {
+            return Err(UiBundleError::WorkerTemplate { token });
+        }
+    }
+    let quoted = serde_json::to_string(hash).unwrap_or_default();
+    let list = serde_json::to_string(urls).unwrap_or_default();
+    Ok(template
+        .replace(HASH_TOKEN, &quoted)
+        .replace(PRECACHE_TOKEN, &list))
 }
 
 fn walk(
@@ -155,6 +261,7 @@ enum Outcome {
     Asset,
     File,
     Redirect,
+    Worker,
     NotFound,
 }
 
@@ -165,6 +272,7 @@ impl Outcome {
             Outcome::Asset => "asset",
             Outcome::File => "file",
             Outcome::Redirect => "redirect",
+            Outcome::Worker => "worker",
             Outcome::NotFound => "not_found",
         }
     }
@@ -219,6 +327,19 @@ async fn respond(
         headers.insert(header::CACHE_CONTROL, value);
     }
     secured(resp, &bundle.csp)
+}
+
+/// The service worker: always revalidated, so a deploy's new hash reaches
+/// the browser at its next update check (ADR-0110).
+fn worker(bundle: &UiBundle, body: &str) -> HttpResponse {
+    record(Outcome::Worker);
+    secured(
+        HttpResponse::Ok()
+            .content_type("text/javascript; charset=utf-8")
+            .insert_header(CacheControl(vec![CacheDirective::NoCache]))
+            .body(body.to_owned()),
+        &bundle.csp,
+    )
 }
 
 /// Stamps the security headers on a UI response of any status, so no reply
@@ -281,7 +402,11 @@ async fn serve(req: HttpRequest, bundle: web::Data<UiBundle>) -> HttpResponse {
         if key.is_empty() {
             return index(&req, &bundle).await;
         }
-        if let Some(path) = bundle.files.get(key) {
+        if key == WORKER_KEY {
+            if let Some(body) = &bundle.worker {
+                return worker(&bundle, body);
+            }
+        } else if let Some(path) = bundle.files.get(key) {
             let outcome = if is_hashed_asset(key) {
                 Outcome::Asset
             } else {
@@ -297,4 +422,59 @@ async fn serve(req: HttpRequest, bundle: web::Data<UiBundle>) -> HttpResponse {
     tracing::debug!(method = %req.method(), path = req.path(), "ui: no route or file");
     record(Outcome::NotFound);
     secured(HttpResponse::NotFound().finish(), &bundle.csp)
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use super::*;
+
+    #[test]
+    fn the_shell_is_everything_but_the_worker_and_the_lazy_directories() {
+        for key in [
+            "index.html",
+            "assets/pharos.css",
+            "assets/pharos-ui_bg-dxha1b2.wasm",
+            "assets/brand/icon-192.png",
+            "favicon.ico",
+        ] {
+            assert!(is_shell_file(key), "{key}");
+        }
+        for key in [
+            "sw.js",
+            "assets/pdf/quire_pdf_bg.wasm",
+            "assets/vendor/hls.min.js",
+            "assets/fonts/anton-regular.ttf",
+        ] {
+            assert!(!is_shell_file(key), "{key}");
+        }
+    }
+
+    #[test]
+    fn a_shell_url_keeps_the_files_case_and_the_index_is_the_mount() {
+        assert_eq!(shell_url(Path::new("index.html")), "/ui/");
+        assert_eq!(
+            shell_url(Path::new("assets/pharos-ui_bg-dxhA1b2.wasm")),
+            "/ui/assets/pharos-ui_bg-dxhA1b2.wasm"
+        );
+    }
+
+    #[test]
+    fn the_worker_takes_the_hash_and_the_urls_and_refuses_a_bare_template() {
+        let template = "const V = \"__PHAROS_BUNDLE_HASH__\"; const P = __PHAROS_PRECACHE__;";
+        let urls = vec!["/ui/".to_owned(), "/ui/a\"b.css".to_owned()];
+        let out = render_worker(template, "00ff", &urls).unwrap();
+        assert_eq!(
+            out,
+            "const V = \"00ff\"; const P = [\"/ui/\",\"/ui/a\\\"b.css\"];"
+        );
+        assert!(matches!(
+            render_worker("const V = 1;", "00ff", &urls),
+            Err(UiBundleError::WorkerTemplate { .. })
+        ));
+        assert!(matches!(
+            render_worker("\"__PHAROS_BUNDLE_HASH__\"", "00ff", &urls),
+            Err(UiBundleError::WorkerTemplate { .. })
+        ));
+    }
 }
