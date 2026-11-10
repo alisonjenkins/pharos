@@ -2,6 +2,7 @@
 //!
 //! Pure and deterministic: the same inputs give the same bytes.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::budget::{max_animated, max_events_per_line, PASSTHROUGH_PREFIX};
@@ -71,7 +72,8 @@ pub fn compile(
         } else {
             &line.style
         };
-        let mut ev = Event::on(line, i, style, line.raw.clone());
+        let text = crate::glyphs::latin_punctuation(&line.raw).into_owned();
+        let mut ev = Event::on(line, i, style, text);
         ev.name = format!("{PASSTHROUGH_PREFIX}{i}");
         if ev.is_visible() {
             if theme.style(style).is_some() {
@@ -108,6 +110,9 @@ pub fn compile(
         for mut ev in evs {
             if sized {
                 ev.text = crate::tags::scale_sizes(&ev.text, theme.tag_scale);
+            }
+            if let Cow::Owned(t) = crate::glyphs::latin_punctuation(&ev.text) {
+                ev.text = t;
             }
             styles.insert(ev.style.clone());
             events.push((i, ev));
