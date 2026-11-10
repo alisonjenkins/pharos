@@ -79,7 +79,7 @@ use super::versions;
 use super::views::{
     open_route, reveal_palette_row, Busy, ErrorNote, FlashNote, GroupEndedNote, Hits, HomeView,
     LoadError, LoadFailure, Loading, MarkFavorite, MarkPlayed, Nav, PaletteView, PlayFailure,
-    PlayFromStart, PlaybackFailure, SearchBox, Shell, StartFailure, SignInView, StatusView, StoredMark,
+    PlayFromStart, PlaybackFailure, SearchBox, Shell, StartFailure, FirstLoad, SignInView, StatusView, StoredMark,
     TitleView, PALETTE_INPUT,
 };
 use super::watch_view::{
@@ -4827,7 +4827,14 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
             ));
         }
     });
+    // The full view's first load has no player chrome yet, so it carries its
+    // own way out (038 FR-408, V1220).
+    let first_load = ctx_stage.read().view == View::Full
+        && state.as_ref().and_then(Option::as_ref).is_none();
     let body = match start_failure {
+        None if first_load => rsx! {
+            FirstLoad { on_back: move |()| leave_player(nav) }
+        },
         Some(reason) => rsx! {
             PlaybackFailure {
                 failure: PlayFailure::start(reason.clone()),
