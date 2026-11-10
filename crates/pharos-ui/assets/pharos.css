@@ -870,13 +870,63 @@ input:focus-visible {
   }
 }
 
-/* A library's sort and filter bar (V252). */
+/* A library's sort and filter bar (V252), one row on every screen
+   (B1311/V1282): the Sort and Filters pills, a pill per filter that is on,
+   and Reset. A row too long for a phone scrolls sideways, as the library
+   tabs do; the padding keeps a focus ring inside the scroll box. */
 .pharos-filters {
   display: flex;
-  flex-wrap: wrap;
-  align-items: end;
-  gap: 0.75rem 1rem;
-  margin: 0 0 1.25rem;
+  align-items: center;
+  gap: 0.5rem;
+  margin: 0 0 1rem;
+  padding: 6px;
+  margin-inline: -6px;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+.pharos-filters::-webkit-scrollbar {
+  display: none;
+}
+.pharos-filter-pill,
+.pharos-sheet-pills .pharos-chip {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: 0.4rem;
+  min-height: 2.25rem;
+  padding: 0 0.85rem;
+  font-size: 0.9rem;
+  white-space: nowrap;
+}
+.pharos-filter-pill .pharos-icon {
+  width: 1.1rem;
+  height: 1.1rem;
+  flex: none;
+}
+.pharos-filter-pill[data-on],
+.pharos-filter-on {
+  border-color: var(--px-color-accent);
+}
+.pharos-filter-count {
+  display: inline-grid;
+  place-items: center;
+  min-width: 1.25rem;
+  height: 1.25rem;
+  padding: 0 0.3rem;
+  border-radius: 999px;
+  background: var(--px-color-accent);
+  color: var(--px-color-accent-fg);
+  font-size: 0.75rem;
+  font-weight: 700;
+}
+.pharos-filter-x {
+  margin-right: -0.25rem;
+  opacity: 0.7;
+}
+.pharos-filter-reset {
+  border-color: transparent;
+  background: transparent;
+  color: var(--px-color-fg-muted);
 }
 .pharos-filter {
   display: flex;
@@ -895,9 +945,106 @@ input:focus-visible {
   font: inherit;
   font-size: 1rem;
 }
-.pharos-filter-direction,
-.pharos-filter-reset {
-  padding: 0.45rem 1rem;
+
+/* Every sort and filter choice (B1311/V1282): a bottom sheet on a phone, a
+   panel on the right of a wider screen or a TV. */
+.pharos-sheet-scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  background: rgb(0 0 0 / 0.55);
+}
+.pharos-sheet {
+  position: fixed;
+  inset: auto 0 0;
+  z-index: 41;
+  display: flex;
+  flex-direction: column;
+  max-height: 80vh;
+  max-height: 80dvh;
+  border-radius: 16px 16px 0 0;
+  background: var(--px-color-surface-raised);
+  color: var(--px-color-fg);
+  box-shadow: 0 -8px 32px rgb(0 0 0 / 0.4);
+}
+.pharos-sheet::before {
+  content: "";
+  align-self: center;
+  width: 2.5rem;
+  height: 4px;
+  margin-top: 0.5rem;
+  border-radius: 2px;
+  background: var(--px-color-border);
+}
+.pharos-sheet-head {
+  padding: 0.75rem 1rem 0.25rem;
+}
+.pharos-sheet-head h2 {
+  margin: 0;
+  font-size: 1.05rem;
+}
+.pharos-sheet-body {
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 0 1rem 1rem;
+}
+.pharos-sheet-group {
+  padding-top: 0.75rem;
+}
+.pharos-sheet-group h3 {
+  margin: 0 0 0.4rem;
+  color: var(--px-color-fg-muted);
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.pharos-sheet-pills {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  /* Room for a focus ring on the first and last pills. */
+  padding: 4px;
+  margin: -4px;
+}
+.pharos-sheet-foot {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.5rem;
+  padding: 0.6rem 1rem calc(0.6rem + env(safe-area-inset-bottom));
+  border-top: var(--px-border) solid var(--px-color-border);
+}
+@media (min-width: 40rem) {
+  .pharos-sheet {
+    inset: 0 0 0 auto;
+    width: min(24rem, 100vw);
+    max-height: none;
+    border-radius: 0;
+    box-shadow: -8px 0 32px rgb(0 0 0 / 0.4);
+  }
+  .pharos-sheet::before {
+    display: none;
+  }
+}
+@media (prefers-reduced-motion: no-preference) {
+  .pharos-sheet {
+    animation: pharos-sheet-up var(--px-motion-duration) var(--px-motion-easing);
+  }
+  @media (min-width: 40rem) {
+    .pharos-sheet {
+      animation-name: pharos-sheet-in;
+    }
+  }
+}
+@keyframes pharos-sheet-up {
+  from {
+    translate: 0 100%;
+  }
+}
+@keyframes pharos-sheet-in {
+  from {
+    translate: 100% 0;
+  }
 }
 
 /* The A to Z rail on the right edge (V252). Room is kept for it so it never
@@ -7161,4 +7308,24 @@ body:has(.pharos-reader) {
 .pharos-kept-title {
   font-weight: 600;
   overflow-wrap: anywhere;
+}
+
+/* B1311: the filter row and its sheet on a TV: smaller pills, and the
+   sheet's content inside the title-safe area. */
+:root[data-device="tv"] .pharos-filters {
+  margin-bottom: 0.5rem;
+}
+:root[data-device="tv"] .pharos-filter-pill,
+:root[data-device="tv"] .pharos-sheet-pills .pharos-chip {
+  min-height: 1.9rem;
+  font-size: 0.8rem;
+}
+:root[data-device="tv"] .pharos-sheet {
+  width: 22rem;
+  padding-block: 27px;
+}
+:root[data-device="tv"] .pharos-sheet-head,
+:root[data-device="tv"] .pharos-sheet-body,
+:root[data-device="tv"] .pharos-sheet-foot {
+  padding-inline: 1.25rem 48px;
 }
