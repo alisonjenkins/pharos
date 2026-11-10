@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use serde::Serialize;
 
 use crate::audio::DecodeError;
+use crate::line::LineSpans;
 use crate::offset::{estimate, shift};
 use crate::plan::{stamps, window, Line, Stamp};
 use crate::text::words;
@@ -43,13 +44,13 @@ pub struct DeviceUsed {
 
 /// Waveform to word spans: the acoustic model plus CTC, `model.py`'s `Aligner.align`.
 pub trait Model: Send {
-    /// `(start_ms, end_ms)` per token within the window.
+    /// `(start_ms, end_ms)` per token within the window, and the line's score.
     fn align(
         &mut self,
         pcm: &[f32],
         tokens: &[String],
         lead_star: bool,
-    ) -> Result<Vec<(u64, u64)>, ModelError>;
+    ) -> Result<LineSpans, ModelError>;
 
     /// Called before each song's first window.
     fn begin_song(&mut self) {}
@@ -68,7 +69,7 @@ pub trait Model: Send {
         &mut self,
         windows: &[(&[f32], &[String])],
         lead_star: bool,
-    ) -> Vec<Result<Vec<(u64, u64)>, ModelError>> {
+    ) -> Vec<Result<LineSpans, ModelError>> {
         windows
             .iter()
             .map(|(pcm, tokens)| self.align(pcm, tokens, lead_star))
@@ -82,13 +83,33 @@ pub type Loader = Box<dyn Fn() -> Result<Box<dyn Model>, String> + Send + Sync>;
 /// One window of a file to samples; `audio::decode` outside tests.
 pub type Decoder = Box<dyn Fn(&Path, i64, i64) -> Result<Vec<f32>, DecodeError> + Send + Sync>;
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct LineWords {
     pub words: Vec<Stamp>,
+    /// How well the words matched the singing, 0 to 1 to three places as
+    /// server.py sends it; `null` for a line with no words or no times.
+    pub score: Option<f64>,
+}
+
+impl LineWords {
+    /// A line with no words, or none the model could time.
+    pub fn empty() -> Self {
+        Self {
+            words: Vec::new(),
+            score: None,
+        }
+    }
+}
+
+/// `round(score, 3)`, as server.py rounds it. Python rounds the nearest
+/// double half to even, this rounds it away from zero; they can differ by
+/// 0.001 only on an exact tie, within the shadow's tolerance.
+pub fn round_score(score: f64) -> f64 {
+    (score * 1000.0).round() / 1000.0
 }
 
 /// The `/align` answer, fields in the Python service's order.
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct Answer {
     pub lines: Vec<LineWords>,
     pub offset_ms: i64,
@@ -314,7 +335,8 @@ fn run_song(
         });
         got.into_iter()
             .map(|r| match r {
-                Ok(spans) => Ok(spans),
+                // The offset needs only the times.
+                Ok(spans) => Ok(spans.times),
                 Err(ModelError::Line(e)) => {
                     tracing::warn!(path = %rel_path, error = %e, "offset probe failed");
                     Ok(Vec::new())
@@ -341,7 +363,7 @@ fn run_song(
     for (index, line) in lines.iter().enumerate() {
         let w_list = words(&line.text);
         if w_list.is_empty() {
-            out.push(LineWords { words: Vec::new() });
+            out.push(LineWords::empty());
             continue;
         }
         let (w_start, w_end) = window(line, w_list.len(), prev_end_ms);
@@ -371,19 +393,22 @@ fn run_song(
             // A window too short for its text: only that line goes without word times.
             Err(ModelError::Line(e)) => {
                 tracing::warn!(path = %rel_path, line = index, error = %e, "alignment failed");
-                out.push(LineWords { words: Vec::new() });
+                out.push(LineWords::empty());
                 continue;
             }
             Err(e @ (ModelError::Fatal(_) | ModelError::Device(_))) => {
                 return Err(SongError::Internal(e.to_string()))
             }
         };
-        let line_stamps = stamps(&line.text, &w_list, &spans, w_start);
+        let line_stamps = stamps(&line.text, &w_list, &spans.times, w_start);
         if let Some(last) = line_stamps.last() {
             words_aligned += w_list.len();
             prev_end_ms = last.start_ms;
         }
-        out.push(LineWords { words: line_stamps });
+        out.push(LineWords {
+            words: line_stamps,
+            score: spans.score.map(round_score),
+        });
     }
     Ok(Aligned {
         answer: Answer {
