@@ -418,6 +418,9 @@ pub fn WhatsNewView(
     on_page: EventHandler<usize>,
     on_pick: EventHandler<Pick>,
     on_close: EventHandler<Close>,
+    /// Why the last pick could not be kept on this device (FR-213).
+    #[props(default)]
+    not_kept: Option<String>,
 ) -> Element {
     let pages = unseen.pages();
     let last = pages.len().saturating_sub(1);
@@ -444,6 +447,16 @@ pub fn WhatsNewView(
                 tabindex: "-1",
                 onkeydown: move |e: KeyboardEvent| {
                     e.stop_propagation();
+                    // A choice's arrows step along its group, as radios do
+                    // (FR-213).
+                    let step = match e.key() {
+                        Key::Named(NamedKey::ArrowRight | NamedKey::ArrowDown) => Some(1),
+                        Key::Named(NamedKey::ArrowLeft | NamedKey::ArrowUp) => Some(-1),
+                        _ => None,
+                    };
+                    if step.is_some_and(platform::step_radio) {
+                        e.prevent_default();
+                    }
                     if e.key() == Key::Named(NamedKey::Escape) {
                         on_close.call(Close::Later);
                     }
@@ -466,7 +479,7 @@ pub fn WhatsNewView(
                         }
                     },
                     Page::Setting(setting) => rsx! {
-                        SettingPage { setting, choices, replay, on_pick }
+                        SettingPage { setting, choices, replay, on_pick, not_kept: not_kept.clone() }
                     },
                     Page::Notes => rsx! {
                         NotesPage { notes: unseen.notes.clone() }
@@ -527,6 +540,7 @@ fn SettingPage(
     choices: Choices,
     replay: u32,
     on_pick: EventHandler<Pick>,
+    #[props(default)] not_kept: Option<String>,
 ) -> Element {
     rsx! {
         section { class: "pharos-whats-new-page",
@@ -606,8 +620,19 @@ fn SettingPage(
                     }
                 },
             }
-            p { class: "pharos-whats-new-help",
-                "Saved on this device. You can change it later in Settings, under Appearance."
+            match not_kept {
+                // The pick applies now, but the device would not keep it:
+                // say so rather than claim it was saved.
+                Some(why) => rsx! {
+                    p { class: "pharos-whats-new-help pharos-error", role: "alert",
+                        "Couldn't keep this on this device ({why}). It applies until the page is closed."
+                    }
+                },
+                None => rsx! {
+                    p { class: "pharos-whats-new-help",
+                        "Saved on this device. You can change it later in Settings, under Appearance."
+                    }
+                },
             }
         }
     }
@@ -986,6 +1011,33 @@ mod tests {
             .iter()
             .position(|p| *p == want)
             .unwrap()
+    }
+
+    /// FR-213: a pick the device would not keep is not called saved.
+    #[test]
+    fn a_pick_that_was_not_kept_is_not_called_saved() {
+        let at_theme = at(None, Page::Setting(Setting::Theme));
+        let html = render(move || {
+            rsx! {
+                WhatsNewView {
+                    unseen: Unseen::since(None),
+                    choices: choices(),
+                    page: at_theme,
+                    replay: 0,
+                    on_page: |_| {},
+                    on_pick: |_| {},
+                    on_close: |_| {},
+                    not_kept: Some("storage is full".to_owned()),
+                }
+            }
+        });
+        assert!(
+            html.contains("keep this on this device (storage is full)"),
+            "{html}"
+        );
+        assert!(!html.contains("Saved on this device"), "{html}");
+        let kept = page(None, at_theme);
+        assert!(kept.contains("Saved on this device"), "{kept}");
     }
 
     #[test]

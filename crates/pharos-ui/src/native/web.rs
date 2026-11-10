@@ -2475,6 +2475,45 @@ pub fn step_tab(step: i8) -> bool {
     }
 }
 
+/// Move to the radio `step` places from the focused one in its
+/// `role="radiogroup"`, wrapping, and focus and press it (FR-213). Whether
+/// the focus was on such a radio.
+pub fn step_radio(step: i32) -> bool {
+    let Some(el) = focused() else {
+        return false;
+    };
+    if el.get_attribute("role").as_deref() != Some("radio") {
+        return false;
+    }
+    let Some(group) = el.closest("[role='radiogroup']").ok().flatten() else {
+        return false;
+    };
+    let Ok(radios) = group.query_selector_all("[role='radio']") else {
+        return false;
+    };
+    let n = radios.length();
+    let at = (0..n).find(|&i| {
+        radios
+            .item(i)
+            .is_some_and(|r| r.is_same_node(Some(el.as_ref())))
+    });
+    let Some(at) = at else {
+        return false;
+    };
+    let next = (i64::from(at) + i64::from(step)).rem_euclid(i64::from(n));
+    let next = u32::try_from(next).unwrap_or(at);
+    match radios
+        .item(next)
+        .and_then(|r| r.dyn_into::<web_sys::Element>().ok())
+    {
+        Some(radio) => {
+            focus_element(&radio, false);
+            click(&radio)
+        }
+        None => false,
+    }
+}
+
 /// Focus the element `id` without scrolling, unless the focus is already
 /// on something in the page body: a page opened from the keyboard (the
 /// search box, a tile, the palette) puts it on its main action, and one
