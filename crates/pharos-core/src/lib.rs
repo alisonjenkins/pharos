@@ -3262,7 +3262,7 @@ pub struct ScanState {
 // v6 (B169): the container's `creation_time` no longer feeds `year` /
 // `release_date`. It records when the FILE was muxed, so every film carried
 // the date it was copied into the library rather than the date it came out —
-// 139 of them here, "Avatar" as 2026-07-20, "Apocalypse Now" as 2025-05-06.
+// 139 of them here, "Film AE" as 2026-07-20, "Film AC" as 2025-05-06.
 // Re-probe so those rows drop the mux date; the metadata backfill then fills
 // the real year from the provider it had already matched correctly.
 // v7: `video_3d_format` and 3D edition grouping. A skipped (unchanged) primary

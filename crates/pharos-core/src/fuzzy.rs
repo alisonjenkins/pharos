@@ -124,7 +124,7 @@ pub fn osa_distance(a: &[char], b: &[char]) -> usize {
 /// summed cost of every search word's best match, then whether the first
 /// name holds the whole term as typed (its start, then anywhere), then how
 /// many of the first name's words the term left unmatched, then that name's
-/// length. So "Dragon Ball" leads "Dragon Ball GT", and an album named for
+/// length. So "Silver Rock" leads "Silver Rock GT", and an album named for
 /// both words of "go moby" leads one that only holds them with typos.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Score {
@@ -279,10 +279,10 @@ mod tests {
 
     #[test]
     fn closer_matches_rank_first() {
-        let exact = score(&["Dragon Ball"], "dragon ball").unwrap();
-        let longer = score(&["Dragon Ball GT"], "dragon ball").unwrap();
-        let typo = score(&["Dragon Ball"], "dragn ball").unwrap();
-        let prefix = score(&["Dragon Ball"], "drag ball").unwrap();
+        let exact = score(&["Silver Rock"], "silver rock").unwrap();
+        let longer = score(&["Silver Rock GT"], "silver rock").unwrap();
+        let typo = score(&["Silver Rock"], "silvr rock").unwrap();
+        let prefix = score(&["Silver Rock"], "silv rock").unwrap();
         assert!(exact.is_exact());
         assert!(exact < longer && longer < prefix && prefix < typo);
         assert!(typo.has_typo() && !prefix.has_typo());
