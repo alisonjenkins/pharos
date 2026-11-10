@@ -2951,11 +2951,13 @@ mod tests {
     }
 
     #[test]
-    fn a_pdf_says_reading_is_coming_and_offers_the_download() {
+    fn a_pdf_offers_read_and_continue_like_an_epub() {
         let html = book_page(BookFormat::Pdf, None);
-        assert!(!html.contains("/read/"), "{html}");
-        assert!(html.contains("PDF reading is coming"), "{html}");
+        assert!(html.contains(r#"href="/ui/read/1""#), "{html}");
+        assert!(html.contains(">Read<"), "{html}");
         assert!(html.contains(r#"href="/Items/1/Download""#), "{html}");
+        let html = book_page(BookFormat::Pdf, Some(0.5));
+        assert!(html.contains("Continue reading · 50%"), "{html}");
     }
 
     #[test]
