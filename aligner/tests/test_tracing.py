@@ -31,6 +31,11 @@ class FakeAligner:
     def align(self, pcm_f32le: bytes, tokens: list[str], lead_star: bool = False) -> list[tuple[int, int]]:
         return [(i * 100, (i + 1) * 100) for i in range(len(tokens))]
 
+    def align_scored(
+        self, pcm_f32le: bytes, tokens: list[str], lead_star: bool = False
+    ) -> tuple[list[tuple[int, int]], float | None]:
+        return self.align(pcm_f32le, tokens, lead_star), 0.8
+
 
 def fake_decoder(path: str, start_ms: int, end_ms: int, rate: int = 16000) -> bytes:
     return b"\0" * 64
