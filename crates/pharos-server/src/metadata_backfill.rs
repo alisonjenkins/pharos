@@ -1589,10 +1589,11 @@ fn drop_unmatched_provider_show_id(
 }
 
 /// B994 — for each search-matched show whose `tvshow.nfo` names an id at the
-/// provider it is not matched at, drop that id from its episodes. Rows are
-/// read, and written only when an id is dropped, so a settled library costs
-/// reads and a rescan that folds the id back costs one write per episode.
-/// Episodes with their own manual match are skipped.
+/// provider it is not matched at, drop that id from its episodes. Since B995
+/// the scanner no longer folds those ids onto episodes, so this is a cleanup
+/// of rows stored before it. Rows are read, and written only when an id is
+/// dropped, so a settled library costs reads. Episodes with their own manual
+/// match are skipped.
 async fn drop_stale_show_ids_pass<S>(store: &S) -> DomainResult<usize>
 where
     S: MediaStore + SeriesMetadataStore + pharos_core::SeriesIdentityStore,
