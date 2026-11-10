@@ -209,6 +209,9 @@ pub struct Queue {
     /// Read back after a reload: the playing song starting again is the
     /// same song resuming, not a new start that reseeds its album.
     restored: bool,
+    /// The signed-in user the queue was built for, once known: a reload
+    /// keeps it, and another user's queue is dropped rather than shown.
+    owner: Option<String>,
 }
 
 /// The tab's session-storage key the music queue is kept under.
@@ -228,6 +231,9 @@ struct Saved {
     behind: Vec<(String, Source)>,
     current: Option<String>,
     next_key: u64,
+    /// [`Queue::owner`]: a record with songs and no owner is not read.
+    #[serde(default)]
+    user: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -248,6 +254,8 @@ pub enum RestoreError {
     Version(u32),
     /// An item id that does not parse.
     BadId(String),
+    /// Songs saved before any user was known: whose they are is unknown.
+    Unbound,
 }
 
 impl std::fmt::Display for RestoreError {
@@ -256,6 +264,7 @@ impl std::fmt::Display for RestoreError {
             RestoreError::Malformed(e) => write!(f, "malformed: {e}"),
             RestoreError::Version(v) => write!(f, "version {v}, expected {SAVED_VERSION}"),
             RestoreError::BadId(id) => write!(f, "bad item id {id:?}"),
+            RestoreError::Unbound => f.write_str("no signed-in user recorded"),
         }
     }
 }
@@ -558,6 +567,7 @@ impl Queue {
                 .collect(),
             current: self.current.map(|id| id.to_string()),
             next_key: self.next_key,
+            user: self.owner.clone(),
         };
         // Strings, numbers and bools only: serialising cannot fail.
         serde_json::to_string(&saved).unwrap_or_default()
@@ -610,10 +620,36 @@ impl Queue {
             current,
             next_key: saved.next_key.max(top),
             restored: true,
+            owner: saved.user,
             ..Queue::default()
         };
         queue.forget_gone();
+        if queue.owner.is_none() {
+            // Nothing to show is nobody's: an empty record reads as empty.
+            return if queue.upcoming.is_empty() && queue.behind.is_empty() && queue.current.is_none() {
+                Ok(Queue::default())
+            } else {
+                Err(RestoreError::Unbound)
+            };
+        }
         Ok(queue)
+    }
+
+    /// Ties the queue to the signed-in `user`. A queue built for another
+    /// user is emptied first (returns true): a reload whose stored copy was
+    /// not cleared at sign-out never shows one user's songs to the next.
+    pub fn claim(&mut self, user: &str) -> bool {
+        let other = self.owner.as_deref().is_some_and(|owner| owner != user);
+        if other {
+            *self = Queue::default();
+        }
+        self.owner = Some(user.to_owned());
+        other
+    }
+
+    /// Whom the queue was built for, once a user is known.
+    pub fn owner(&self) -> Option<&str> {
+        self.owner.as_deref()
     }
 }
 
@@ -724,6 +760,7 @@ mod tests {
     #[test]
     fn the_queue_survives_a_reload_as_left() {
         let mut q = Queue::default();
+        q.claim("u1");
         q.started(ItemRef::Real(1), Some(&album(&[2, 3, 4])), 0);
         q.add(vec![track(9)]);
         let three = q.upcoming()[1].key;
@@ -748,6 +785,7 @@ mod tests {
     #[test]
     fn a_restored_queue_steps_back_and_adds_rows_of_its_own() {
         let mut q = Queue::default();
+        q.claim("u1");
         q.started(ItemRef::Real(1), Some(&album(&[2])), 0);
         q.started(ItemRef::Real(2), Some(&album(&[])), 0);
         let mut back = Queue::restore(&q.save()).unwrap();
@@ -774,6 +812,26 @@ mod tests {
         ));
         let bad = saved.replace("\"current\":null", "\"current\":\"x1\"");
         assert_eq!(Queue::restore(&bad), Err(RestoreError::BadId("x1".into())));
+    }
+
+    #[test]
+    fn a_saved_queue_is_only_shown_to_the_user_it_was_built_for() {
+        let mut q = Queue::default();
+        q.started(ItemRef::Real(1), Some(&album(&[2, 3])), 0);
+        // Songs saved before anyone was known are nobody's to show.
+        assert_eq!(Queue::restore(&q.save()), Err(RestoreError::Unbound));
+        assert_eq!(Queue::restore(&Queue::default().save()), Ok(Queue::default()));
+
+        assert!(!q.claim("u1"), "a queue no one owned is the first user's");
+        let mut back = Queue::restore(&q.save()).unwrap();
+        assert_eq!(back.owner(), Some("u1"));
+        assert!(!back.claim("u1"), "the same user keeps the queue");
+        assert_eq!(ids(&back), [2, 3]);
+
+        let mut theirs = Queue::restore(&q.save()).unwrap();
+        assert!(theirs.claim("u2"), "another user's queue is dropped");
+        assert!(theirs.upcoming().is_empty());
+        assert_eq!(theirs.owner(), Some("u2"));
     }
 
     #[test]
