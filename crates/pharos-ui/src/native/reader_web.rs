@@ -20,6 +20,8 @@ use wasm_bindgen::closure::Closure;
 use wasm_bindgen::JsCast as _;
 
 use super::app::{call, this_device, Ctx};
+use super::kept::resume_place;
+use super::kept_web;
 use super::keymap::Mode;
 use super::pdf_web::PdfView;
 use super::platform;
@@ -322,6 +324,9 @@ pub(super) fn use_pending_flush(api: Signal<Option<NativeApi>>) {
 struct Saver {
     outbox: Rc<Outbox>,
     id: ItemRef,
+    /// The book is kept on this device: each place is also noted in its
+    /// record, for a resume with no server.
+    kept: bool,
     gate: RefCell<SaveGate>,
 }
 
@@ -341,6 +346,9 @@ impl Saver {
             "pharos: reader save item={} locator={locator} fraction={fraction:.3} forced={forced}",
             self.id
         ));
+        if self.kept {
+            kept_web::note_position(self.id, locator, fraction, read_at_ms);
+        }
         self.outbox.submit(
             self.id,
             PendingSave {
@@ -463,6 +471,94 @@ impl Core {
     }
 }
 
+/// What the reader needs of a book before its bytes: from the server's
+/// detail, or from the record of a kept book.
+struct Head {
+    title: String,
+    format: Option<BookFormat>,
+    saved: Option<String>,
+}
+
+/// The book's bytes: a kept copy first, even online (spec 036 FR-006), then
+/// the network. Says where they came from for the log.
+async fn book_bytes(
+    id: ItemRef,
+    kept_user: Option<&str>,
+    online: bool,
+) -> Result<(js_sys::Uint8Array, &'static str), String> {
+    if let Some(user) = kept_user {
+        match kept_web::cached_book(user, id).await {
+            Some(bytes) => {
+                platform::info(&format!(
+                    "pharos: reader cache hit item={id} bytes={}",
+                    bytes.length()
+                ));
+                return Ok((bytes, "cache"));
+            }
+            None => platform::warn(&format!(
+                "pharos: reader cache miss item={id}; the kept copy is gone"
+            )),
+        }
+    }
+    if !online {
+        return Err("This book is not on this device and there is no connection.".into());
+    }
+    fetch_book(id).await.map(|bytes| (bytes, "network"))
+}
+
+/// Once a kept book is open, asks the server who is signed in, for at most
+/// [`kept_web::SERVER_CHECK_MS`], and closes the book if the copy was kept
+/// by someone else (FR-005). Never delays the book: a dead connection that
+/// still reports online (a tunnel) just leaves it open.
+fn check_user_later(
+    user: String,
+    id: ItemRef,
+    api: Signal<Option<NativeApi>>,
+    alive: Rc<Cell<bool>>,
+    core: Rc<RefCell<Option<Rc<Core>>>>,
+    mut phase: Signal<Phase>,
+) {
+    platform::spawn_detached(async move {
+        // The connection may only come up after the book is open.
+        let Some(api) = api.peek().clone() else {
+            return;
+        };
+        if kept_web::is_offline() {
+            return;
+        }
+        let asked = kept_web::within(kept_web::SERVER_CHECK_MS, api.me(&call("read", "me"))).await;
+        let me = match asked {
+            Some(Ok(me)) => me,
+            Some(Err(e)) => {
+                platform::warn(&format!(
+                    "pharos: reader could not confirm the user item={id} error={e}"
+                ));
+                return;
+            }
+            None => {
+                platform::warn(&format!(
+                    "pharos: reader could not confirm the user item={id} error=no answer in {} ms",
+                    kept_web::SERVER_CHECK_MS
+                ));
+                return;
+            }
+        };
+        if me.id == user || !alive.get() || !kept_web::reconcile(&me.id) {
+            return;
+        }
+        platform::warn(&format!(
+            "pharos: reader closes kept copy item={id} reason=another user"
+        ));
+        let held = core.borrow_mut().take();
+        if let Some(c) = held {
+            c.engine.unmount();
+        }
+        phase.set(Phase::Failed(
+            "This book was kept by another account and has been removed from this device.".into(),
+        ));
+    });
+}
+
 struct Opened {
     core: Rc<Core>,
     toc: Vec<TocRow>,
@@ -524,6 +620,7 @@ async fn fetch_book(id: ItemRef) -> Result<js_sys::Uint8Array, String> {
 #[allow(clippy::too_many_arguments)]
 async fn open_book(
     outbox: Rc<Outbox>,
+    kept: bool,
     id: ItemRef,
     saved: Option<Locator>,
     settings: ReaderSettings,
@@ -566,6 +663,7 @@ async fn open_book(
         saver: Saver {
             outbox,
             id,
+            kept,
             gate: RefCell::new(SaveGate::default()),
         },
         read_at: Cell::new(read_now()),
@@ -582,6 +680,7 @@ async fn open_book(
 #[allow(clippy::too_many_arguments)]
 async fn open_pdf(
     outbox: Rc<Outbox>,
+    kept: bool,
     id: ItemRef,
     saved: Option<&str>,
     settings: ReaderSettings,
@@ -605,6 +704,7 @@ async fn open_pdf(
         saver: Saver {
             outbox,
             id,
+            kept,
             gate: RefCell::new(SaveGate::default()),
         },
         read_at: Cell::new(read_now()),
@@ -723,25 +823,52 @@ pub fn ReaderScreen(id: ItemRef) -> Element {
         let (alive, core, started, outbox) =
             (alive.clone(), core.clone(), started.clone(), outbox.clone());
         move || {
-            let Some(api) = ctx.api.read().clone() else {
+            let api = ctx.api.read().clone();
+            let held = kept_web::read().and_then(|store| {
+                let book = store.find(&id.to_string())?.clone();
+                Some((store.user.clone(), book))
+            });
+            // A kept book opens from the device without waiting for the
+            // server; any other needs the connection.
+            if api.is_none() && held.is_none() {
                 return;
-            };
+            }
             if started.replace(true) {
                 return;
             }
             let (alive, core, outbox) = (alive.clone(), core.clone(), outbox.clone());
+            let live_api = ctx.api;
             spawn(async move {
                 let began = platform::now_ms();
-                let detail = match api.detail(&call("read", "load"), id).await {
-                    Ok(d) => d,
-                    Err(e) => {
-                        platform::warn(&format!("pharos: reader failed item={id} error={e}"));
-                        phase.set(Phase::Failed(format!("The book could not be loaded: {e}")));
-                        return;
+                let head = match (&held, &api) {
+                    (Some((_, book)), _) => {
+                        let queued = load_pending()
+                            .entries()
+                            .into_iter()
+                            .find(|(queued, _)| *queued == id)
+                            .map(|(_, save)| save);
+                        Head {
+                            title: book.title.clone(),
+                            format: Some(book.format.book_format()),
+                            saved: resume_place(book, queued.as_ref()).map(|(locator, _)| locator),
+                        }
                     }
+                    (None, Some(api)) => match api.detail(&call("read", "load"), id).await {
+                        Ok(d) => Head {
+                            title: display_name(&d.item),
+                            format: d.book.as_ref().map(|b| b.format),
+                            saved: d.read_position.as_ref().map(|p| p.locator.clone()),
+                        },
+                        Err(e) => {
+                            platform::warn(&format!("pharos: reader failed item={id} error={e}"));
+                            phase.set(Phase::Failed(format!("The book could not be loaded: {e}")));
+                            return;
+                        }
+                    },
+                    (None, None) => return,
                 };
-                title.set(display_name(&detail.item));
-                let format = detail.book.as_ref().map(|b| b.format);
+                title.set(head.title.clone());
+                let format = head.format;
                 if !matches!(format, Some(BookFormat::Epub | BookFormat::Pdf)) {
                     platform::warn(&format!(
                         "pharos: reader failed item={id} format={format:?} error=not an EPUB or PDF"
@@ -749,9 +876,15 @@ pub fn ReaderScreen(id: ItemRef) -> Element {
                     phase.set(Phase::Failed("This book cannot be opened here.".into()));
                     return;
                 }
+                let kept_user = held.as_ref().map(|(user, _)| user.clone());
+                let kept = kept_user.is_some();
+                let online = api.is_some() && !kept_web::is_offline();
+                if let Some(user) = kept_user.clone() {
+                    check_user_later(user, id, live_api, alive.clone(), core.clone(), phase);
+                }
                 if format == Some(BookFormat::Pdf) {
                     is_pdf.set(true);
-                    let bytes = match fetch_book(id).await {
+                    let (bytes, from) = match book_bytes(id, kept_user.as_deref(), online).await {
                         Ok(b) => b,
                         Err(message) => {
                             platform::warn(&format!(
@@ -762,9 +895,10 @@ pub fn ReaderScreen(id: ItemRef) -> Element {
                         }
                     };
                     let length = bytes.length();
-                    let saved = detail.read_position.as_ref().map(|p| p.locator.clone());
+                    let saved = head.saved.clone();
                     let opened = open_pdf(
                         outbox,
+                        kept,
                         id,
                         saved.as_deref(),
                         *settings.peek(),
@@ -794,7 +928,7 @@ pub fn ReaderScreen(id: ItemRef) -> Element {
                             *core.borrow_mut() = Some(o.core);
                             phase.set(Phase::Reading);
                             platform::info(&format!(
-                                "pharos: reader opened item={id} format=pdf bytes={length} ms={:.0} resumed={} at={}",
+                                "pharos: reader opened item={id} format=pdf from={from} bytes={length} ms={:.0} resumed={} at={}",
                                 platform::now_ms() - began,
                                 saved.is_some(),
                                 at
@@ -810,7 +944,7 @@ pub fn ReaderScreen(id: ItemRef) -> Element {
                     }
                     return;
                 }
-                let bytes = match fetch_book(id).await {
+                let (bytes, from) = match book_bytes(id, kept_user.as_deref(), online).await {
                     Ok(b) => b,
                     Err(message) => {
                         platform::warn(&format!("pharos: reader failed item={id} error={message}"));
@@ -820,10 +954,7 @@ pub fn ReaderScreen(id: ItemRef) -> Element {
                 };
                 let bytes = js_sys::Uint8Array::to_vec(&bytes);
                 let length = bytes.len();
-                let saved = detail
-                    .read_position
-                    .as_ref()
-                    .and_then(|p| saved_locator(&p.locator));
+                let saved = head.saved.as_deref().and_then(saved_locator);
                 // The view calls back from outside the runtime; it holds the
                 // core weakly so the two cannot keep each other alive.
                 let weak = Rc::new(RefCell::new(std::rc::Weak::<Core>::new()));
@@ -853,6 +984,7 @@ pub fn ReaderScreen(id: ItemRef) -> Element {
                 };
                 let opened = open_book(
                     outbox,
+                    kept,
                     id,
                     saved,
                     *settings.peek(),
@@ -871,7 +1003,7 @@ pub fn ReaderScreen(id: ItemRef) -> Element {
                         *core.borrow_mut() = Some(o.core);
                         phase.set(Phase::Reading);
                         platform::info(&format!(
-                            "pharos: reader opened item={id} format=epub bytes={length} ms={:.0} resumed={} at={}",
+                            "pharos: reader opened item={id} format=epub from={from} bytes={length} ms={:.0} resumed={} at={}",
                             platform::now_ms() - began,
                             saved.is_some(),
                             at
