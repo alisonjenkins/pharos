@@ -160,11 +160,14 @@ fn best_cluster(spans: &[Located], tol: f64) -> Option<(Span, u32, f64)> {
 /// returned seconds are the voters' overlap with the region.
 ///
 /// Returns (region, voters, agreed seconds) for the region with the most
-/// agreed seconds that is at least `min_secs` long.
+/// agreed seconds that is at least `min_secs` and at most `max_secs` long.
+/// The cap matters because several bridging spans can chain runs into a
+/// region longer than any one comparison located.
 fn overlap_consensus(
     spans: &[Located],
     min_agreeing: u32,
     min_secs: f64,
+    max_secs: f64,
 ) -> Option<(Span, u32, f64)> {
     let need = min_agreeing.max(1) as i64;
     let mut edges: Vec<(f64, i64)> = spans
@@ -206,7 +209,10 @@ fn overlap_consensus(
     }
 
     let mut best: Option<(Span, u32, f64)> = None;
-    for region in merged.into_iter().filter(|r| r.end - r.start >= min_secs) {
+    for region in merged
+        .into_iter()
+        .filter(|r| (min_secs..=max_secs).contains(&(r.end - r.start)))
+    {
         let mut voters = 0u32;
         let mut agreed = 0.0;
         for s in spans {
@@ -398,9 +404,12 @@ pub fn detect_season_verbose(
         // add Skip buttons but never move or remove one. A dropped episode
         // keeps the endpoint reading's reason, which is what explains it.
         if reading.3 != Verdict::Emitted {
-            if let Some((region, voters, secs)) =
-                overlap_consensus(spans, cfg.min_agreeing, cfg.align.min_duration)
-            {
+            if let Some((region, voters, secs)) = overlap_consensus(
+                spans,
+                cfg.min_agreeing,
+                cfg.align.min_duration,
+                cfg.align.max_duration,
+            ) {
                 let conf = agreement_confidence(spans, secs, voters, matched);
                 if gate(voters, conf) == Verdict::Emitted {
                     reading = (region, voters, conf, Verdict::Emitted);
@@ -750,7 +759,7 @@ mod tests {
     #[test]
     fn overlap_consensus_is_the_common_cover_not_the_union() {
         let spans = located(&[(8.17, 63.0), (8.91, 103.0)]);
-        let (region, voters, _) = overlap_consensus(&spans, 2, 15.0).expect("a region");
+        let (region, voters, _) = overlap_consensus(&spans, 2, 15.0, 120.0).expect("a region");
         assert_eq!(voters, 2);
         assert!(
             (region.start - 8.91).abs() < 1e-9 && (region.end - 63.0).abs() < 1e-9,
@@ -763,7 +772,7 @@ mod tests {
     #[test]
     fn scattered_fragments_form_no_overlap_region() {
         let spans = located(&[(0.0, 17.3), (29.5, 48.0), (70.6, 94.1), (200.0, 230.0)]);
-        assert!(overlap_consensus(&spans, 2, 15.0).is_none());
+        assert!(overlap_consensus(&spans, 2, 15.0, 120.0).is_none());
     }
 
     /// One long spurious span sweeping across a short shared region covers
@@ -772,7 +781,7 @@ mod tests {
     #[test]
     fn a_long_span_sweeping_across_a_region_does_not_vote_for_it() {
         let spans = located(&[(0.0, 120.0), (40.0, 60.0)]);
-        let (_, voters, _) = overlap_consensus(&spans, 2, 15.0).expect("a covered region");
+        let (_, voters, _) = overlap_consensus(&spans, 2, 15.0, 120.0).expect("a covered region");
         assert_eq!(voters, 1, "only the 20 s span lies inside 40..60");
     }
 
@@ -781,7 +790,7 @@ mod tests {
     fn covered_runs_join_only_through_a_bridging_span() {
         // Runs 10..30 and 50..80, both covered twice; no span spans 30..50.
         let apart = located(&[(10.0, 30.0), (5.0, 32.0), (50.0, 80.0), (48.0, 85.0)]);
-        let (region, _, _) = overlap_consensus(&apart, 2, 15.0).expect("a region");
+        let (region, _, _) = overlap_consensus(&apart, 2, 15.0, 120.0).expect("a region");
         assert!(region.start >= 48.0, "the runs must not chain: {region:?}");
 
         let mut bridged = apart.clone();
@@ -789,10 +798,37 @@ mod tests {
             start: 8.0,
             end: 82.0,
         });
-        let (region, _, _) = overlap_consensus(&bridged, 2, 15.0).expect("a region");
+        let (region, _, _) = overlap_consensus(&bridged, 2, 15.0, 120.0).expect("a region");
         assert!(
             region.start <= 10.0 && region.end >= 80.0,
             "one span covering the gap joins them: {region:?}"
+        );
+    }
+
+    /// Bridging spans can chain runs into a region longer than anything a
+    /// comparison located; past `max_secs` it is not an intro.
+    #[test]
+    fn a_chained_region_longer_than_the_cap_is_not_offered() {
+        // Three runs each covered twice (0..40, 60..100, 120..160), chained by
+        // two bridging spans into one 0..160 region.
+        let spans = located(&[
+            (0.0, 40.0),
+            (0.0, 40.0),
+            (60.0, 100.0),
+            (60.0, 100.0),
+            (120.0, 160.0),
+            (120.0, 160.0),
+            (30.0, 70.0),
+            (90.0, 130.0),
+        ]);
+        let (region, _, _) = overlap_consensus(&spans, 2, 15.0, 200.0).expect("a region");
+        assert!(
+            region.end - region.start > 120.0,
+            "precondition: chained {region:?}"
+        );
+        assert!(
+            overlap_consensus(&spans, 2, 15.0, 120.0).is_none(),
+            "a 160 s chain must not pass a 120 s cap"
         );
     }
 
