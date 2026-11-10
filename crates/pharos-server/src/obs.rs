@@ -444,6 +444,7 @@ where
         .with_resource(resource)
         .build();
     let tracer = provider.tracer("pharos");
+    crate::client_spans::set_sampling_ratio(sampling_ratio);
     opentelemetry::global::set_tracer_provider(provider.clone());
     let _ = TRACER_PROVIDER.set(provider);
     Ok(tracing_opentelemetry::layer().with_tracer(tracer))
