@@ -103,6 +103,36 @@ struct Layer {
     f2: Linear,
 }
 
+/// One second of 16 kHz audio.
+const SECOND: usize = 16_000;
+/// Padded window lengths in seconds: each at most half again the last past
+/// 4 s, so padding costs under 50% of a window's work there.
+const BUCKETS_S: [usize; 12] = [1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64];
+/// Past the last bucket, windows round up to a multiple of this.
+const LONG_STEP_S: usize = 32;
+
+/// The padded length a window of `samples` runs at.
+pub fn bucket(samples: usize) -> usize {
+    BUCKETS_S
+        .iter()
+        .map(|s| s * SECOND)
+        .find(|&b| b >= samples)
+        .unwrap_or_else(|| samples.div_ceil(LONG_STEP_S * SECOND) * LONG_STEP_S * SECOND)
+}
+
+/// Every bucketed length a window of at most `max_samples` can run at, for
+/// warm-up to compile ahead of the first song.
+pub fn buckets_up_to(max_samples: usize) -> Vec<usize> {
+    let mut out: Vec<usize> = BUCKETS_S.iter().map(|s| s * SECOND).collect();
+    let mut b = (BUCKETS_S[BUCKETS_S.len() - 1] / LONG_STEP_S + 1) * LONG_STEP_S * SECOND;
+    while b <= bucket(max_samples) {
+        out.push(b);
+        b += LONG_STEP_S * SECOND;
+    }
+    out.retain(|&b| b <= bucket(max_samples));
+    out
+}
+
 pub struct VulkanModel {
     device: Device,
     fe: Vec<FeConv>,
@@ -246,15 +276,41 @@ impl VulkanModel {
     /// is shorter than one frame. An error is the device failing to hand the
     /// result back.
     pub fn logits(&self, wave: &[f32]) -> Result<Vec<f32>, String> {
-        if super::cpu::CpuModel::frames(wave.len()) == 0 {
+        self.logits_padded(wave, bucket(wave.len()))
+    }
+
+    /// [`VulkanModel::logits`] with the window zero-padded to `padded`
+    /// samples. Each new length costs seconds of kernel compile and
+    /// autotune, so windows run at a few fixed lengths; the padding cannot
+    /// reach a real frame (see the comments below), and is cut off the result.
+    pub fn logits_padded(&self, wave: &[f32], padded: usize) -> Result<Vec<f32>, String> {
+        let real = super::cpu::CpuModel::frames(wave.len());
+        if real == 0 {
             return Ok(Vec::new());
         }
-        let mut x: Tensor<3> = tensor(wave, [1, wave.len(), 1], &self.device);
+        let padded = padded.max(wave.len());
+        let mut samples = wave.to_vec();
+        samples.resize(padded, 0.0);
+        // A frame sees only its own 400 samples, so the extractor and the
+        // projection give real frames exactly as without the padding.
+        let mut x: Tensor<3> = tensor(&samples, [1, padded, 1], &self.device);
         for c in &self.fe {
             x = gelu(c.ln.apply(c.apply(x)));
         }
         let mut x = self.fp.apply(self.fp_ln.apply(x));
         let t = x.dims()[1];
+        // Padded frames become zeros, which is what the positional conv's own
+        // zero padding would have shown the real frames next to them.
+        let keep: Vec<f32> = (0..t).map(|i| if i < real { 1.0 } else { 0.0 }).collect();
+        let keep: Tensor<3> = tensor(&keep, [1, t, 1], &self.device);
+        x = x * keep;
+        // And no real frame attends to a padded one.
+        let masked: Vec<bool> = (0..t).map(|i| i >= real).collect();
+        let mask = Tensor::<4, burn::tensor::Bool>::from_data(
+            TensorData::new(masked, [1, 1, 1, t]),
+            &self.device,
+        )
+        .expand([1, HEADS, t, t]);
 
         // Grouped positional conv, pad 64 each side, as one batched matmul
         // over the 16 groups per tap; the even kernel's extra last frame is
@@ -279,7 +335,7 @@ impl VulkanModel {
                 heads(qkv.clone().narrow(2, 0, D)),
                 heads(qkv.clone().narrow(2, D, D)),
                 heads(qkv.narrow(2, 2 * D, D)),
-                None,
+                (real < t).then(|| mask.clone()),
                 None,
                 AttentionModuleOptions::default(),
             );
@@ -287,10 +343,34 @@ impl VulkanModel {
             let h = l.ln2.apply(x.clone());
             x = x.clone() + l.f2.apply(gelu(l.f1.apply(h)));
         }
-        let logits = self.aux.apply(self.final_ln.apply(x));
+        let logits = self.aux.apply(self.final_ln.apply(x.narrow(1, 0, real)));
         logits
             .into_data()
             .try_to_vec::<f32>()
             .map_err(|e| format!("reading the logits back from the GPU: {e:?}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn windows_round_up_to_a_few_lengths() {
+        assert_eq!(bucket(1), SECOND);
+        assert_eq!(bucket(SECOND), SECOND);
+        assert_eq!(bucket(SECOND + 1), 2 * SECOND);
+        assert_eq!(bucket(5 * SECOND), 6 * SECOND);
+        assert_eq!(bucket(64 * SECOND), 64 * SECOND);
+        assert_eq!(bucket(64 * SECOND + 1), 96 * SECOND);
+        assert_eq!(bucket(100 * SECOND), 128 * SECOND);
+        for n in (1..200).map(|s| s * 8_000) {
+            assert!(bucket(n) >= n);
+            if n > 4 * SECOND && n <= 64 * SECOND {
+                assert!(bucket(n) * 2 <= n * 3, "{n} pads to {}", bucket(n));
+            }
+        }
+        assert_eq!(buckets_up_to(30 * SECOND).len(), 10);
+        assert_eq!(buckets_up_to(100 * SECOND).last(), Some(&(128 * SECOND)));
     }
 }
