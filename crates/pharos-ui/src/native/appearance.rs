@@ -28,14 +28,26 @@ pub struct Notice {
     pub error: bool,
 }
 
+/// How long a choice that could not be stored still applies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Lasts {
+    /// Until the page reloads: the setting lives in the app's state.
+    UntilReload,
+    /// For this song: the next song's player reads the stored choice again.
+    ThisSong,
+}
+
 /// The one notice for a choice this device could not store: `what` names
-/// it ("the subtitle size"), `error` is the storage's reason. Used by every
-/// page that keeps choices on the device (FR-705).
-pub fn not_saved(what: &str, error: &str) -> Notice {
+/// it ("the subtitle size"), `error` is the storage's reason, `lasts` how
+/// long it still applies. Used by every page that keeps choices on the
+/// device (FR-705).
+pub fn not_saved(what: &str, error: &str, lasts: Lasts) -> Notice {
+    let lasts = match lasts {
+        Lasts::UntilReload => "It applies until you reload.",
+        Lasts::ThisSong => "It applies to this song only.",
+    };
     Notice {
-        text: format!(
-            "Could not save {what} on this device: {error}. It applies until you reload."
-        ),
+        text: format!("Could not save {what} on this device: {error}. {lasts}"),
         error: true,
     }
 }
@@ -865,11 +877,25 @@ mod tests {
 
     #[test]
     fn a_choice_not_saved_names_itself_the_reason_and_how_long_it_lasts() {
-        let n = not_saved("the subtitle size", "QuotaExceededError");
+        let n = not_saved(
+            "the subtitle size",
+            "QuotaExceededError",
+            Lasts::UntilReload,
+        );
         assert!(n.error);
         assert_eq!(
             n.text,
             "Could not save the subtitle size on this device: QuotaExceededError. It applies until you reload."
+        );
+        let song = not_saved(
+            "the visualiser style",
+            "QuotaExceededError",
+            Lasts::ThisSong,
+        );
+        assert!(
+            song.text.ends_with("It applies to this song only."),
+            "{}",
+            song.text
         );
     }
 
