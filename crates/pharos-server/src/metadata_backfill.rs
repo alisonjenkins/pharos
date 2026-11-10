@@ -263,6 +263,7 @@ where
             tracing::warn!(error = %e, "T9 metadata backfill: show matcher version check failed");
         }
     }
+    let _tvdb_pass = PassScope::open(tvdb);
     let mut series_enriched = 0usize;
     let mut series_work = false;
     // Series-container pass (the series-level record), first: an episode
@@ -339,6 +340,28 @@ where
         }
     }
     Ok(PassStats { enriched, had_work })
+}
+
+/// B989 — holds a provider's per-pass state open for exactly one backfill
+/// pass: begun on creation, ended on drop, so every exit from the pass (an
+/// early `?` included) drops what the provider kept.
+struct PassScope<'a, E: OnlineEnricher>(Option<&'a E>);
+
+impl<'a, E: OnlineEnricher> PassScope<'a, E> {
+    fn open(provider: Option<&'a E>) -> Self {
+        if let Some(p) = provider {
+            p.begin_pass();
+        }
+        Self(provider)
+    }
+}
+
+impl<E: OnlineEnricher> Drop for PassScope<'_, E> {
+    fn drop(&mut self) {
+        if let Some(p) = self.0 {
+            p.end_pass();
+        }
+    }
 }
 
 /// The outcome of resolving one item against a single provider.
@@ -3966,6 +3989,8 @@ mod tests {
         searched: Arc<std::sync::Mutex<usize>>,
         /// Series runs by show id; any other id has none.
         runs: HashMap<String, crate::online_enrich::SeriesRun>,
+        /// `begin_pass` / `end_pass` calls, in order.
+        passes: Arc<std::sync::Mutex<Vec<&'static str>>>,
     }
 
     impl FakeEnricher {
@@ -3983,6 +4008,7 @@ mod tests {
                 listed: Default::default(),
                 searched: Default::default(),
                 runs: HashMap::new(),
+                passes: Default::default(),
             }
         }
 
@@ -4000,6 +4026,7 @@ mod tests {
                 listed: Default::default(),
                 searched: Default::default(),
                 runs: HashMap::new(),
+                passes: Default::default(),
             }
         }
 
@@ -4110,6 +4137,12 @@ mod tests {
     impl OnlineEnricher for FakeEnricher {
         fn provider(&self) -> &'static str {
             self.provider
+        }
+        fn begin_pass(&self) {
+            self.passes.lock().expect("lock").push("begin");
+        }
+        fn end_pass(&self) {
+            self.passes.lock().expect("lock").push("end");
         }
         fn supports(&self, _kind: MediaKind) -> bool {
             true
@@ -6022,6 +6055,35 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(tvdb.asked().len(), 4, "asked again after a day");
+    }
+
+    /// B989: a provider's per-pass state is opened and closed once around a
+    /// whole pass, and the pass scope closes it on an early exit too.
+    #[tokio::test]
+    async fn a_pass_opens_and_closes_the_providers_state_once() {
+        let s = store().await;
+        let (_td, cache) = cache();
+        let tvdb = FakeEnricher::tvdb();
+        run(
+            &s,
+            &sem(2),
+            &cache,
+            None::<&FakeEnricher>,
+            Some(&tvdb),
+            None::<&MusicBrainzClient>,
+            &MetadataConfig::default(),
+            NOW,
+        )
+        .await
+        .unwrap();
+        assert_eq!(*tvdb.passes.lock().unwrap(), ["begin", "end"]);
+
+        let scoped = FakeEnricher::tvdb();
+        {
+            let _scope = PassScope::open(Some(&scoped));
+            assert_eq!(*scoped.passes.lock().unwrap(), ["begin"]);
+        }
+        assert_eq!(*scoped.passes.lock().unwrap(), ["begin", "end"]);
     }
 
     #[tokio::test]
