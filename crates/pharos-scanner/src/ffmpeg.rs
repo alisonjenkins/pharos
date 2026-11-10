@@ -682,7 +682,7 @@ mod tests {
     /// B169 — a container's `creation_time` is when the FILE was muxed, not
     /// when the work was released. Reading it as a release date dated 139
     /// films in the live library by when they were copied in: "300" and "300 -
-    /// Rise of an Empire" both 2026-07-19, "Avatar" 2026-07-20, "Apocalypse
+    /// Rise of an Empire" both 2026-07-19, "Film BA" 2026-07-20, "Apocalypse
     /// Now" 2025-05-06. A file with no real date tag must yield NO date, so
     /// the online provider (which had matched these films correctly all along)
     /// is free to supply the real one.
