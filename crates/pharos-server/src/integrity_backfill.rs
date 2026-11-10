@@ -64,7 +64,8 @@
 use crate::bg_io::BgPermit;
 use crate::integrity_memo::IntegrityMemo;
 use crate::integrity_sweep::{
-    book_report, count_verdict, pass_order, reader_for, scannable, Found, IntegritySweep, Reader,
+    book_report, count_verdict, needs_seek_index_check, pass_order, reader_for, scannable, Found,
+    IntegritySweep, Reader,
 };
 use crate::state::Stores;
 use pharos_core::{MediaItem, MediaStore};
@@ -234,7 +235,9 @@ async fn run_pass(ctx: &Ctx, items: &[MediaItem]) {
             .await
             .ok()
             .map(|m| (mtime_secs(&m), m.len()));
-        if !requested && (ctx.memo.is_scanned(it.id, sig) || ctx.sweep.is_not_checkable(it.id, sig))
+        if !requested
+            && ((ctx.memo.is_scanned(it.id, sig) && !needs_seek_index_check(&ctx.memo, it, sig))
+                || ctx.sweep.is_not_checkable(it.id, sig))
         {
             continue;
         }
@@ -284,6 +287,8 @@ async fn run_pass(ctx: &Ctx, items: &[MediaItem]) {
                         read_errors = report.read_errors,
                         scanned_ms = report.scanned_ms,
                         declared_ms = report.declared_ms,
+                        seek_index = ?report.seek_index,
+                        summary = %report.summary(),
                         elapsed_s = elapsed.as_secs_f64(),
                         "integrity sweep: damaged media file",
                     );
