@@ -66,7 +66,9 @@ device.
 ### Requirements
 
 - **FR-101** Next Up holds one episode per series the viewer has *started*: a
-  series with at least one played or in-progress episode.
+  series with at least one played or in-progress episode. A started series
+  with no eligible episode under FR-102 (everything after the last played
+  one is watched, or nothing follows it) is left out.
 - **FR-102** The episode is the first unplayed episode after the most recently
   played one in airing order. Season 0 is considered only when the viewer's
   last played episode is itself in season 0.
