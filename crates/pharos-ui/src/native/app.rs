@@ -1735,8 +1735,17 @@ fn NativeApp(route: Route) -> Element {
         platform::info(&format!("pharos: group rejoin reason=reload group={id}"));
         let session = together.session(&api);
         let mut error = together.error;
+        let started = platform::unix_ms();
         spawn_forever(async move {
-            if let Err(e) = session.join(&id).await {
+            use super::group_session::{rejoin_event, RejoinOutcome};
+            let joined = session.join(&id).await;
+            let waited = platform::unix_ms().saturating_sub(started);
+            let (outcome, cause) = match &joined {
+                Ok(_) => (RejoinOutcome::Rejoined, None),
+                Err(e) => (RejoinOutcome::Failed, Some(e.0.as_str())),
+            };
+            platform::report_event(rejoin_event("reload", &id, outcome, 1, waited, cause));
+            if let Err(e) = joined {
                 platform::warn(&format!(
                     "pharos: group rejoin failed group={id} error={}",
                     e.0
