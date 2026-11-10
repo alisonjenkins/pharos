@@ -1597,7 +1597,12 @@ async fn queue_hint(grant: &playback_grant::Client) -> Result<(u32, u64, u32, bo
     match reply.get().unwrap().get_result().unwrap().which().unwrap() {
         pharos_api::pharos_capnp::queue_hint_result::Hint(h) => {
             let h = h.unwrap();
-            Ok((h.get_queued(), h.get_waited_ms(), h.get_others_queued(), h.get_busy()))
+            Ok((
+                h.get_queued(),
+                h.get_waited_ms(),
+                h.get_others_queued(),
+                h.get_busy(),
+            ))
         }
         pharos_api::pharos_capnp::queue_hint_result::Error(e) => Err(denial(e.unwrap())),
     }

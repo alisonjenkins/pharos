@@ -2914,7 +2914,10 @@ mod tests {
         assert!(loading < top, "{html}");
         assert!(html.contains(r#"data-loading="true""#), "{html}");
         assert!(html.contains("Loading"), "{html}");
-        assert!(!html.contains("pharos-watch-loading-caption"), "no cause, no caption: {html}");
+        assert!(
+            !html.contains("pharos-watch-loading-caption"),
+            "no cause, no caption: {html}"
+        );
     }
 
     /// 038 FR-407, V1223: a refused autoplay offers a tap to start.
@@ -3085,8 +3088,14 @@ mod tests {
         card.pill = true;
         pill.up_next = Some(card.clone());
         let html = render(pill);
-        assert!(html.contains("pharos-up-next-pill") && html.contains("Up next: The Return"), "{html}");
-        assert!(!html.contains("pharos-up-next-art") && !html.contains("Playing in"), "{html}");
+        assert!(
+            html.contains("pharos-up-next-pill") && html.contains("Up next: The Return"),
+            "{html}"
+        );
+        assert!(
+            !html.contains("pharos-up-next-art") && !html.contains("Playing in"),
+            "{html}"
+        );
 
         let mut compact = controls();
         compact.up_next = Some(card);
@@ -3100,7 +3109,10 @@ mod tests {
         );
         dom.rebuild_in_place();
         let html = dioxus_ssr::render(&dom);
-        assert!(!html.contains("pharos-up-next"), "the stage bar says it: {html}");
+        assert!(
+            !html.contains("pharos-up-next"),
+            "the stage bar says it: {html}"
+        );
 
         let plain = UpNextCard::of(None, 1_000, 15_000);
         assert_eq!((plain.name.as_str(), plain.seconds), ("Next episode", 1));

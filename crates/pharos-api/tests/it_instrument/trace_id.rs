@@ -53,7 +53,10 @@ fn logged_trace_id(o: &crate::support::Observed) -> String {
     let line = o
         .event("rpc call failed")
         .unwrap_or_else(|| panic!("no failure line in:\n{}", o.logs));
-    line["fields"]["trace_id"].as_str().unwrap_or_default().to_owned()
+    line["fields"]["trace_id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned()
 }
 
 #[test]
@@ -142,7 +145,13 @@ fn a_trace_id_the_handler_wrote_is_kept() {
             fill_ctx(req.get().init_ctx());
             let reply = req.send().promise.await.expect("latest answers");
             match reply.get().unwrap().get_result().unwrap().which().unwrap() {
-                items_result::Error(e) => e.unwrap().get_trace_id().unwrap().to_str().unwrap().to_owned(),
+                items_result::Error(e) => e
+                    .unwrap()
+                    .get_trace_id()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .to_owned(),
                 items_result::Page(_) => String::new(),
             }
         })
