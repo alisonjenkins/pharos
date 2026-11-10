@@ -384,6 +384,16 @@ impl EventLog {
                     result: None,
                 });
             }
+            SocketBroadcast::ScanProgress { progress, end } => {
+                #[allow(clippy::cast_possible_truncation)]
+                let fraction = (progress / 100.0).clamp(0.0, 1.0) as f32;
+                self.publish_all(Payload::Task {
+                    id: crate::scan_tasks::TASK_REFRESH_LIBRARY.to_owned(),
+                    progress: if end.is_some() { 1.0 } else { fraction },
+                    state: end.map_or("running", |(outcome, _)| outcome.task_state()),
+                    result: end.map(|(_, tally)| tally),
+                });
+            }
             SocketBroadcast::SessionCommand { .. }
             | SocketBroadcast::DeviceCommand { .. }
             | SocketBroadcast::CastChanged
@@ -723,6 +733,51 @@ mod tests {
                     progress: 1.0,
                     state: "done",
                     result: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_library_scan_is_a_task_that_ends_with_its_counts() {
+        use crate::scan_tasks::{ScanOutcome, ScanTally, TASK_REFRESH_LIBRARY};
+        let log = EventLog::default();
+        let (Catchup::Live { head }, _rx) = log.subscribe(user(1), 0) else {
+            panic!()
+        };
+        let tally = ScanTally {
+            roots: 3,
+            failed_roots: 1,
+            added: 4,
+            changed: 2,
+            removed: 1,
+        };
+        log.translate(SocketBroadcast::ScanProgress {
+            progress: 25.0,
+            end: None,
+        });
+        log.translate(SocketBroadcast::ScanProgress {
+            progress: 100.0,
+            end: Some((ScanOutcome::Partial, tally)),
+        });
+        let Catchup::Replay(events) = log.catch_up(user(1), head) else {
+            panic!()
+        };
+        let tasks: Vec<_> = events.iter().map(|e| (*e.payload).clone()).collect();
+        assert_eq!(
+            tasks,
+            vec![
+                Payload::Task {
+                    id: TASK_REFRESH_LIBRARY.into(),
+                    progress: 0.25,
+                    state: "running",
+                    result: None,
+                },
+                Payload::Task {
+                    id: TASK_REFRESH_LIBRARY.into(),
+                    progress: 1.0,
+                    state: "partial",
+                    result: Some(tally),
                 },
             ]
         );

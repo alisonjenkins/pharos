@@ -7637,6 +7637,9 @@ pub(crate) fn spawn_scan_tracked(
         // than the first pass.
         let num_roots = std::sync::Arc::new(AtomicU64::new(roots.len().max(1) as u64));
         let completed_roots = std::sync::Arc::new(AtomicU64::new(0));
+        // The scanner reports per probe; a frame goes out only when the whole
+        // percent moves, so a scan sends at most about 100 per pass.
+        let last_sent = std::sync::Arc::new(AtomicU64::new(u64::MAX));
         // The scanner checks the cancel flag mid-root (per group + per probe) so
         // DELETE /ScheduledTasks/Running stops a scan promptly, not just between
         // roots.
@@ -7645,11 +7648,18 @@ pub(crate) fn spawn_scan_tracked(
             let item_id = refresh_item_id.clone();
             let done = completed_roots.clone();
             let total = num_roots.clone();
+            let last_sent = last_sent.clone();
             std::sync::Arc::new(move |p: pharos_scanner::ScanProgress| {
                 let n = total.load(Ordering::Relaxed).max(1) as f64;
                 let overall = ((done.load(Ordering::Relaxed) as f64) * 100.0 + p.percent()) / n;
                 st.scan_tasks
                     .set_progress(crate::scan_tasks::TASK_REFRESH_LIBRARY, overall);
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let whole = overall.clamp(0.0, 100.0) as u64;
+                if last_sent.swap(whole, Ordering::Relaxed) == whole {
+                    return;
+                }
+                st.notify_scan_progress(overall, None);
                 if let Some(id) = &item_id {
                     st.notify_refresh_progress(id, overall);
                 }
@@ -7668,6 +7678,7 @@ pub(crate) fn spawn_scan_tracked(
             let planned = plan.iter().map(|(_, g)| g.len()).sum::<usize>();
             num_roots.store(planned.max(1) as u64, Ordering::Relaxed);
             completed_roots.store(0, Ordering::Relaxed);
+            last_sent.store(u64::MAX, Ordering::Relaxed);
             let mut added: Vec<pharos_core::MediaId> = Vec::new();
             let mut removed: Vec<pharos_core::MediaId> = Vec::new();
             let mut cancelled = false;
@@ -7744,11 +7755,9 @@ pub(crate) fn spawn_scan_tracked(
                 state.set_libraries(libs);
             }
             state.notify_library_delta(&added, &removed);
-            crate::scan_tasks::record_scan_end(
-                &tally,
-                tally.outcome(cancelled),
-                pass_started.elapsed(),
-            );
+            let outcome = tally.outcome(cancelled);
+            crate::scan_tasks::record_scan_end(&tally, outcome, pass_started.elapsed());
+            state.notify_scan_progress(100.0, Some((outcome, tally)));
 
             let status = if cancelled {
                 crate::scan_tasks::CompletionStatus::Cancelled

@@ -137,6 +137,17 @@ impl ScanOutcome {
         }
     }
 
+    /// The `TaskProgress.state` a pass that ended this way is sent with.
+    #[must_use]
+    pub fn task_state(self) -> &'static str {
+        match self {
+            ScanOutcome::Completed => "done",
+            ScanOutcome::Partial => "partial",
+            ScanOutcome::Failed => "failed",
+            ScanOutcome::Cancelled => "cancelled",
+        }
+    }
+
     /// Stable metric label; dashboards and alerts key on these strings.
     #[must_use]
     pub fn label(self) -> &'static str {
