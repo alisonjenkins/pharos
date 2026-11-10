@@ -399,7 +399,7 @@ enum Resolved {
 /// these apart: an episode that resolved but whose detail fetch came back
 /// empty (`Transient`), and one whose record simply carried no still
 /// (`HitNoArt`), both end `match_source='nfo_id'`, `metadata_refreshed_at=now`,
-/// no `Primary` — so the "5 of 76 Code Geass episodes got a still" gap is
+/// no `Primary` — so the "some episodes got a still, others did not" gap is
 /// invisible in production without this counter. The reason travels with the
 /// value (provider + external id + season/episode + offered roles) in the
 /// decision log, never a bare class.
@@ -493,7 +493,7 @@ fn search_stem(item: &MediaItem) -> &str {
     }
 }
 
-/// An episode's own name, from its filename ("S01E03 - The Naked Now"): the
+/// An episode's own name, from its filename ("S01E03 - The Quiet Arrival"): the
 /// cross-check that places it in a provider that numbers its season
 /// differently (B570). Not its stored title, which an NFO written in the
 /// provider's numbering may have set to the wrong episode's name.
@@ -2993,7 +2993,7 @@ const ALBUM_MATCH_VERSION_KEY: &str = "musicbrainz_album_match_version";
 /// Drop every MusicBrainz-sourced cover when the matcher that chose them has
 /// changed, so a corrected matcher can revisit its own mistakes.
 ///
-/// B150 — the reason this exists. Owl City's `Fireflies` was given The Attic's
+/// B150 — the reason this exists. Band A's `Song A` was given Other Band's
 /// sleeve, and because `audio_items_needing_art` skips anything that already
 /// has art, no later pass would ever have looked at it again. A cached cover is
 /// only as trustworthy as the matcher that picked it, so the matcher's version
@@ -3142,12 +3142,12 @@ where
     // The album artist is the right key: on a compilation the per-track artist
     // is the performer of that track, which would not match the release-group.
     // Fall back to the track artist when there is no album-artist tag.
-    // B152 — a BLANK tag is an absent tag. Owl City's `Fireflies` carries
-    // `album_artist = ""` alongside `artist = "Owl City"`; `Option::or` sees
+    // B152 — a BLANK tag is an absent tag. Band A's `Song A` carries
+    // `album_artist = ""` alongside `artist = "Band A"`; `Option::or` sees
     // `Some("")` and keeps it, so the good tag was shadowed by an empty one.
     // Downstream that empty string reads as "artist unknown", which the B150
     // consistency check deliberately lets pass — so the track went straight
-    // back to matching any album called Fireflies.
+    // back to matching any album called Song A.
     let non_blank = |s: &Option<String>| {
         s.as_deref()
             .map(str::trim)
@@ -3330,10 +3330,9 @@ where
     Tm: OnlineEnricher,
     S: SeriesMetadataStore + MetadataTranslationStore + pharos_core::SeriesIdentityStore,
 {
-    // B125 — TVDB first (it is the show-shaped provider), then TMDB. 44 of the
-    // deployed library's 178 shows were marked `none` by TVDB alone, almost all
-    // of them anime — Death Note, Dragon Ball GT, Code Geass — which TMDB
-    // carries. A show marked `none` has no poster, so its tile falls back to a
+    // B125 — TVDB first (it is the show-shaped provider), then TMDB. Many
+    // shows were marked `none` by TVDB alone, almost all of them anime, which
+    // TMDB carries. A show marked `none` has no poster, so its tile falls back to a
     // representative episode and then to an extracted frame.
     // B990 — the year the show's own files state, as the survey read it
     // (B980): the stored column is empty for a bare folder until the scan's
@@ -4773,7 +4772,7 @@ mod tests {
         fn hit() -> Self {
             Self(Ok(AlbumArt {
                 mbid: "rg-abc-123".into(),
-                title: "Ocean Eyes".into(),
+                title: "Album A".into(),
                 confidence: 0.99,
                 year: Some(2009),
                 // A real JPEG magic prefix: `download_and_cache_art` writes
@@ -4819,7 +4818,7 @@ mod tests {
     #[tokio::test]
     async fn album_art_pass_caches_a_cover_and_records_the_match() {
         let s = store().await;
-        put_track(&s, 900_400, "Owl City", "Ocean Eyes").await;
+        put_track(&s, 900_400, "Band A", "Album A").await;
         let (_td, cache) = cache();
 
         let (n, had_work) = enrich_audio_pass(
@@ -4907,7 +4906,7 @@ mod tests {
     #[tokio::test]
     async fn provider_outage_leaves_the_track_eligible_for_the_next_pass() {
         let s = store().await;
-        put_track(&s, 900_402, "Owl City", "Ocean Eyes").await;
+        put_track(&s, 900_402, "Band A", "Album A").await;
         let (_td, cache) = cache();
 
         let (n, _) = enrich_audio_pass(
@@ -5008,13 +5007,13 @@ mod tests {
     }
 
     // B150 — a WRONG cover is invisible to the eligibility query, which skips
-    // anything that already has art. Without version-gated invalidation, Owl
-    // City's `Fireflies` would keep The Attic's sleeve forever, however much
+    // anything that already has art. Without version-gated invalidation, Band
+    // A's `Song A` would keep Other Band's sleeve forever, however much
     // the matcher improved.
     #[tokio::test]
     async fn a_matcher_version_bump_drops_its_own_covers_for_a_re_match() {
         let s = store().await;
-        put_track(&s, 900_406, "Owl City", "Fireflies").await;
+        put_track(&s, 900_406, "Band A", "Song A").await;
         // A cover from an older, wrong matcher.
         s.set_artwork(
             900_406,
@@ -5079,7 +5078,7 @@ mod tests {
         // query bump must leave hits alone; the miss marker already re-admits
         // the rows that need re-asking.
         let s = store().await;
-        put_track(&s, 900_420, "Owl City", "Ocean Eyes").await;
+        put_track(&s, 900_420, "Band A", "Album A").await;
         s.set_artwork(
             900_420,
             "Primary",
@@ -5128,7 +5127,7 @@ mod tests {
         // first boot after this split, must adopt the version silently rather
         // than treat "never recorded" as "changed" and wipe the library.
         let s = store().await;
-        put_track(&s, 900_421, "Owl City", "Ocean Eyes").await;
+        put_track(&s, 900_421, "Band A", "Album A").await;
         s.set_artwork(900_421, "Primary", "musicbrainz", "/cache/p.jpg")
             .await
             .unwrap();
@@ -5153,7 +5152,7 @@ mod tests {
     #[tokio::test]
     async fn a_current_matcher_version_leaves_existing_covers_alone() {
         let s = store().await;
-        put_track(&s, 900_407, "Owl City", "Ocean Eyes").await;
+        put_track(&s, 900_407, "Band A", "Album A").await;
         s.set_artwork(
             900_407,
             "Primary",
@@ -5186,8 +5185,8 @@ mod tests {
         assert!(s.get(900_407).await.unwrap().has_primary_art);
     }
 
-    // B152 — Owl City's `Fireflies` carries `album_artist = ""` alongside a
-    // perfectly good `artist = "Owl City"`. `Option::or` keeps the `Some("")`,
+    // B152 — Band A's `Song A` carries `album_artist = ""` alongside a
+    // perfectly good `artist = "Band A"`. `Option::or` keeps the `Some("")`,
     // and an empty artist reads downstream as "unknown", which the B150
     // consistency check lets pass — so the artist verification that fix added
     // was silently switched off for exactly the track that motivated it.
@@ -5197,13 +5196,13 @@ mod tests {
         let item = MediaItem {
             id: 900_408,
             path: "/music/owl city/fireflies.mp3".into(),
-            title: "Fireflies".into(),
+            title: "Song A".into(),
             kind: MediaKind::Audio,
             probe: pharos_core::MediaProbe {
-                album: Some("Fireflies - Single of the Week".into()),
+                album: Some("Song A - Single of the Week".into()),
                 // Exactly the shape found in production: present but empty.
                 album_artist: Some("   ".into()),
-                artist: Some("Owl City".into()),
+                artist: Some("Band A".into()),
                 ..Default::default()
             },
             ..MediaItem::default()
@@ -5219,7 +5218,7 @@ mod tests {
 
         assert_eq!(
             seen.lock().unwrap().as_slice(),
-            [Some("Owl City".to_string())],
+            [Some("Band A".to_string())],
             "the blank album_artist must not shadow the track artist"
         );
     }
@@ -5247,7 +5246,7 @@ mod tests {
     #[tokio::test]
     async fn album_art_pass_ignores_video_items() {
         let s = store().await;
-        put_movie(&s, 900_403, "Dune (2021)").await;
+        put_movie(&s, 900_403, "Film A (2021)").await;
         let (_td, cache) = cache();
 
         let (n, had_work) = enrich_audio_pass(
@@ -5268,11 +5267,11 @@ mod tests {
     #[tokio::test]
     async fn backfill_matches_by_search_and_persists_match_state() {
         let s = store().await;
-        put_movie(&s, 900_100, "Dune (2021)").await; // no NFO id
+        put_movie(&s, 900_100, "Film A (2021)").await; // no NFO id
         let (_td, cache) = cache();
         let tmdb = FakeEnricher::tmdb()
-            .with_search(vec![("438631", "Dune", Some(2021))])
-            .with_detail(enriched_overview("A duke's son..."));
+            .with_search(vec![("910101", "Film A", Some(2021))])
+            .with_detail(enriched_overview("A noble's heir..."));
 
         let n = run(
             &s,
@@ -5291,11 +5290,11 @@ mod tests {
         let got = s.get(900_100).await.unwrap();
         assert_eq!(got.match_provider.as_deref(), Some("tmdb"));
         assert_eq!(got.match_source.as_deref(), Some("search"));
-        assert_eq!(got.match_external_id.as_deref(), Some("438631"));
-        assert_eq!(got.metadata.overview.as_deref(), Some("A duke's son..."));
+        assert_eq!(got.match_external_id.as_deref(), Some("910101"));
+        assert_eq!(got.metadata.overview.as_deref(), Some("A noble's heir..."));
         assert_eq!(got.metadata_refreshed_at, Some(NOW));
         // The matched TMDB id was stamped onto the provider ids.
-        assert_eq!(got.metadata.provider_ids.tmdb.as_deref(), Some("438631"));
+        assert_eq!(got.metadata.provider_ids.tmdb.as_deref(), Some("910101"));
     }
 
     #[tokio::test]
@@ -5306,10 +5305,10 @@ mod tests {
         // or the download step silently drops it (the `continue` at the
         // `!CACHED_ART_ROLES.contains` guard in `enrich_one`).
         let s = store().await;
-        put_movie(&s, 900_103, "Dune (2021)").await;
+        put_movie(&s, 900_103, "Film A (2021)").await;
         let (_td, cache) = cache();
         let tmdb = FakeEnricher::tmdb()
-            .with_search(vec![("438631", "Dune", Some(2021))])
+            .with_search(vec![("910101", "Film A", Some(2021))])
             .with_detail(EnrichedMetadata {
                 artwork: vec![
                     RemoteArt {
@@ -5444,11 +5443,11 @@ mod tests {
         // it). It's stamped with the resolved id + refresh time so it drops out
         // of the eligible set until the TTL re-admits it for a retry.
         let s = store().await;
-        put_movie(&s, 900_104, "Dune (2021)").await;
+        put_movie(&s, 900_104, "Film A (2021)").await;
         let (_td, cache) = cache();
         // Search returns a clean match, but the fake has no detail → fetch
         // returns None → Resolved::Transient.
-        let tmdb = FakeEnricher::tmdb().with_search(vec![("438631", "Dune", Some(2021))]);
+        let tmdb = FakeEnricher::tmdb().with_search(vec![("910101", "Film A", Some(2021))]);
 
         let n = run(
             &s,
@@ -5466,7 +5465,7 @@ mod tests {
 
         let got = s.get(900_104).await.unwrap();
         assert_eq!(got.match_source.as_deref(), Some("search"));
-        assert_eq!(got.match_external_id.as_deref(), Some("438631"));
+        assert_eq!(got.match_external_id.as_deref(), Some("910101"));
         assert_eq!(got.metadata_refreshed_at, Some(NOW));
         // With metadata_refreshed_at = now, a cutoff in the past excludes it —
         // it is no longer re-pulled at the front of the next pass.
@@ -5485,9 +5484,9 @@ mod tests {
         // via `provider_ids`), this would resolve NoMatch and the overview
         // would stay unset — so a set overview proves the direct-fetch path.
         let s = store().await;
-        put_movie(&s, 900_200, "Dune (2021)").await;
+        put_movie(&s, 900_200, "Film A (2021)").await;
         let (_td, cache) = cache();
-        let tmdb = FakeEnricher::tmdb().with_detail(enriched_overview("A duke's son..."));
+        let tmdb = FakeEnricher::tmdb().with_detail(enriched_overview("A noble's heir..."));
 
         apply_manual_match(
             &s,
@@ -5498,7 +5497,7 @@ mod tests {
             &MetadataConfig::default(),
             900_200,
             "tmdb",
-            "438631",
+            "910101",
             NOW,
         )
         .await
@@ -5509,12 +5508,12 @@ mod tests {
         // own internal resolve() would otherwise have recorded.
         assert_eq!(got.match_source.as_deref(), Some("manual"));
         assert_eq!(got.match_provider.as_deref(), Some("tmdb"));
-        assert_eq!(got.match_external_id.as_deref(), Some("438631"));
+        assert_eq!(got.match_external_id.as_deref(), Some("910101"));
         assert_eq!(got.metadata_refreshed_at, Some(NOW));
         // The immediate re-enrich actually ran and merged the chosen
         // record's metadata.
-        assert_eq!(got.metadata.overview.as_deref(), Some("A duke's son..."));
-        assert_eq!(got.metadata.provider_ids.tmdb.as_deref(), Some("438631"));
+        assert_eq!(got.metadata.overview.as_deref(), Some("A noble's heir..."));
+        assert_eq!(got.metadata.provider_ids.tmdb.as_deref(), Some("910101"));
     }
 
     #[tokio::test]
@@ -5525,14 +5524,14 @@ mod tests {
         // window (the row is now "manual" with its own id) and assert the
         // sweep's trailing write does NOT revert the user's override.
         let s = store().await;
-        put_movie(&s, 900_300, "Dune (2021)").await;
+        put_movie(&s, 900_300, "Film A (2021)").await;
         s.set_item_match(900_300, "tmdb", "999", "manual", None, 1)
             .await
             .unwrap();
         let (_td, cache) = cache();
         let tmdb = FakeEnricher::tmdb()
-            .with_search(vec![("438631", "Dune", Some(2021))])
-            .with_detail(enriched_overview("A duke's son..."));
+            .with_search(vec![("910101", "Film A", Some(2021))])
+            .with_detail(enriched_overview("A noble's heir..."));
 
         let item = s.get(900_300).await.unwrap();
         enrich_one(
@@ -5560,7 +5559,7 @@ mod tests {
         // must survive an enrichment pass; a role with no local row is still
         // filled from the provider.
         let s = store().await;
-        put_movie(&s, 900_301, "Dune (2021)").await;
+        put_movie(&s, 900_301, "Film A (2021)").await;
         // B1181 — a local row only blocks online art while its file exists.
         let curated = tempfile::tempdir().unwrap();
         let poster = curated.path().join("poster.jpg");
@@ -5571,7 +5570,7 @@ mod tests {
             .unwrap();
         let (_td, cache) = cache();
         let tmdb = FakeEnricher::tmdb()
-            .with_search(vec![("438631", "Dune", Some(2021))])
+            .with_search(vec![("910101", "Film A", Some(2021))])
             .with_detail(EnrichedMetadata {
                 artwork: vec![
                     RemoteArt {
@@ -5731,30 +5730,30 @@ mod tests {
     }
 
     /// An NFO-identified episode as a scrape in the provider's numbering left
-    /// it: the file is "S01E03 - The Naked Now", its NFO and `-thumb` are
-    /// Code of Honor's.
+    /// it: the file is "S01E03 - The Quiet Arrival", its NFO and `-thumb` are
+    /// Rite of Honour's.
     async fn put_shifted_episode(s: &SqliteStore) -> MediaItem {
-        let dir = "/tv/Star Trek The Next Generation/Season 01";
-        let stem = "Star Trek - The Next Generation - S01E03 - The Naked Now WEBDL-1080p";
+        let dir = "/tv/Show N The Next Wave/Season 01";
+        let stem = "Show N - The Next Wave - S01E03 - The Quiet Arrival WEBDL-1080p";
         let mut item = MediaItem {
             id: 900_570,
             path: format!("{dir}/{stem}.mkv").into(),
-            title: "Code of Honor".into(),
+            title: "Rite of Honour".into(),
             kind: MediaKind::Episode,
             series: Some(pharos_core::SeriesInfo {
-                series_name: "Star Trek The Next Generation".into(),
+                series_name: "Show N The Next Wave".into(),
                 season_number: Some(1),
                 episode_number: Some(3),
-                series_folder: Some("/tv/Star Trek The Next Generation".into()),
+                series_folder: Some("/tv/Show N The Next Wave".into()),
                 series_year: None,
                 series_key: None,
             }),
             ..MediaItem::default()
         };
-        item.metadata.overview = Some("Tasha Yar is kidnapped.".into());
-        item.metadata.provider_ids.tvdb = Some("71470".into());
+        item.metadata.overview = Some("The pilot is kidnapped.".into());
+        item.metadata.provider_ids.tvdb = Some("910105".into());
         s.put(item).await.unwrap();
-        pin_series(s, "/tv/Star Trek The Next Generation", "71470").await;
+        pin_series(s, "/tv/Show N The Next Wave", "910105").await;
         s.set_artwork(
             900_570,
             "Thumb",
@@ -5767,20 +5766,20 @@ mod tests {
             900_570,
             "Primary",
             "local",
-            "/tv/Star Trek The Next Generation/folder.jpg",
+            "/tv/Show N The Next Wave/folder.jpg",
         )
         .await
         .unwrap();
         s.get(900_570).await.unwrap()
     }
 
-    fn naked_now(number: (u32, u32)) -> EnrichedMetadata {
+    fn quiet_arrival(number: (u32, u32)) -> EnrichedMetadata {
         EnrichedMetadata {
-            title: Some("The Naked Now".into()),
+            title: Some("The Quiet Arrival".into()),
             overview: Some("An infection.".into()),
             episode_number: Some(number),
-            neighbour_titles: vec!["Encounter at Farpoint".into(), "Code of Honor".into()],
-            series_id: Some("71470".into()),
+            neighbour_titles: vec!["Encounter at Farpoint".into(), "Rite of Honour".into()],
+            series_id: Some("910105".into()),
             artwork: vec![RemoteArt {
                 role: ArtworkRole::Primary,
                 url: "https://artworks.thetvdb.com/naked-now.jpg".into(),
@@ -5806,7 +5805,7 @@ mod tests {
             .unwrap();
         let (_td, cache) = cache();
         let tvdb = FakeEnricher::tvdb()
-            .with_detail(naked_now((1, 2)))
+            .with_detail(quiet_arrival((1, 2)))
             .with_image_bytes(vec![0xFF, 0xD8, 0xFF]);
         enrich_one(
             &s,
@@ -5822,7 +5821,7 @@ mod tests {
         .unwrap();
 
         let ep = s.get(900_570).await.unwrap();
-        assert_eq!(ep.title, "The Naked Now");
+        assert_eq!(ep.title, "The Quiet Arrival");
         assert_eq!(ep.metadata.overview.as_deref(), Some("An infection."));
         let art = s.artwork_for(900_570).await.unwrap();
         let role = |r: &str| art.iter().find(|(role, _, _)| role == r).cloned();
@@ -5847,7 +5846,7 @@ mod tests {
         let item = put_shifted_episode(&s).await;
         let (_td, cache) = cache();
         let tvdb = FakeEnricher::tvdb()
-            .with_detail(naked_now((1, 3)))
+            .with_detail(quiet_arrival((1, 3)))
             .with_image_bytes(vec![0xFF, 0xD8, 0xFF]);
         enrich_one(
             &s,
@@ -5863,7 +5862,7 @@ mod tests {
         .unwrap();
 
         let ep = s.get(900_570).await.unwrap();
-        assert_eq!(ep.title, "The Naked Now");
+        assert_eq!(ep.title, "The Quiet Arrival");
         assert_eq!(ep.metadata.overview.as_deref(), Some("An infection."));
         let art = s.artwork_for(900_570).await.unwrap();
         assert!(
@@ -5879,11 +5878,11 @@ mod tests {
     async fn an_nfo_title_in_another_language_stays() {
         let s = store().await;
         let mut item = put_shifted_episode(&s).await;
-        item.title = "Le Maintenant Nu".into();
+        item.title = "L'Arrivée Calme".into();
         s.put(item.clone()).await.unwrap();
         let (_td, cache) = cache();
         let tvdb = FakeEnricher::tvdb()
-            .with_detail(naked_now((1, 3)))
+            .with_detail(quiet_arrival((1, 3)))
             .with_image_bytes(vec![0xFF, 0xD8, 0xFF]);
         enrich_one(
             &s,
@@ -5897,7 +5896,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(s.get(900_570).await.unwrap().title, "Le Maintenant Nu");
+        assert_eq!(s.get(900_570).await.unwrap().title, "L'Arrivée Calme");
     }
 
     /// B570, B588 — a record at the file's own number that names neither the
@@ -5909,8 +5908,8 @@ mod tests {
         let (_td, cache) = cache();
         let tvdb = FakeEnricher::tvdb()
             .with_detail(EnrichedMetadata {
-                title: Some("Le Maintenant Nu".into()),
-                ..naked_now((1, 3))
+                title: Some("L'Arrivée Calme".into()),
+                ..quiet_arrival((1, 3))
             })
             .with_image_bytes(vec![0xFF, 0xD8, 0xFF]);
         enrich_one(
@@ -5927,10 +5926,10 @@ mod tests {
         .unwrap();
 
         let ep = s.get(900_570).await.unwrap();
-        assert_eq!(ep.title, "Code of Honor");
+        assert_eq!(ep.title, "Rite of Honour");
         assert_eq!(
             ep.metadata.overview.as_deref(),
-            Some("Tasha Yar is kidnapped.")
+            Some("The pilot is kidnapped.")
         );
         let art = s.artwork_for(900_570).await.unwrap();
         assert!(
@@ -5998,8 +5997,8 @@ mod tests {
     #[tokio::test]
     async fn a_show_tvdb_cannot_match_falls_back_to_tmdb() {
         let s = store().await;
-        put_episode(&s, 1, "Death Note", "/tv/Death Note").await;
-        put_episode(&s, 2, "Death Note", "/tv/Death Note").await;
+        put_episode(&s, 1, "Show L", "/tv/Show L").await;
+        put_episode(&s, 2, "Show L", "/tv/Show L").await;
         let (_td, cache) = cache();
         // TVDB searches and offers nothing that clears the floor.
         let tvdb = FakeEnricher::tvdb().with_search(vec![]);
@@ -6007,7 +6006,7 @@ mod tests {
             // `put_episode` stamps every fixture show with year 1997, and a
             // 9-year gap scores 0.6 — below the floor. A provider result with
             // no year (common on TMDB search rows) is the realistic shape here.
-            .with_search(vec![("13916", "Death Note", None)])
+            .with_search(vec![("910102", "Show L", None)])
             .with_detail(EnrichedMetadata {
                 overview: Some("A shinigami's notebook.".into()),
                 artwork: vec![RemoteArt {
@@ -6032,20 +6031,20 @@ mod tests {
         .unwrap();
 
         let got = s
-            .series_metadata_by_keys(&["/tv/Death Note".into()])
+            .series_metadata_by_keys(&["/tv/Show L".into()])
             .await
             .unwrap();
-        let meta = got.get("/tv/Death Note").expect("show row written");
+        let meta = got.get("/tv/Show L").expect("show row written");
         assert_eq!(
             meta.match_source.as_deref(),
             Some("search"),
             "the fallback matched it, so it must not be frozen as `none`: {meta:?}"
         );
         assert_eq!(meta.match_provider.as_deref(), Some("tmdb"));
-        assert_eq!(meta.match_external_id.as_deref(), Some("13916"));
+        assert_eq!(meta.match_external_id.as_deref(), Some("910102"));
         assert_eq!(
             meta.provider_ids.tmdb.as_deref(),
-            Some("13916"),
+            Some("910102"),
             "a TMDB-matched show carries a TMDB id, not a TVDB one"
         );
         assert!(meta.provider_ids.tvdb.is_none());
@@ -6058,13 +6057,13 @@ mod tests {
     #[tokio::test]
     async fn series_pass_enriches_container_from_tvdb_and_caches_poster() {
         let s = store().await;
-        put_episode(&s, 1, "Buffy", "/tv/Buffy (1997)").await;
-        put_episode(&s, 2, "Buffy", "/tv/Buffy (1997)").await;
+        put_episode(&s, 1, "Show M", "/tv/Show M (1997)").await;
+        put_episode(&s, 2, "Show M", "/tv/Show M (1997)").await;
         let (_td, cache) = cache();
-        // Candidate title matches the folder-derived series_name ("Buffy") so
+        // Candidate title matches the folder-derived series_name ("Show M") so
         // match_best clears the confidence floor.
         let tvdb = FakeEnricher::tvdb()
-            .with_search(vec![("70327", "Buffy", Some(1997))])
+            .with_search(vec![("910104", "Show M", Some(1997))])
             .with_detail(EnrichedMetadata {
                 overview: Some("One girl in all the world.".into()),
                 community_rating: Some(8.7),
@@ -6100,17 +6099,17 @@ mod tests {
         );
 
         let got = s
-            .series_metadata_by_keys(&["/tv/Buffy (1997)".into()])
+            .series_metadata_by_keys(&["/tv/Show M (1997)".into()])
             .await
             .unwrap();
-        let m = got.get("/tv/Buffy (1997)").expect("series row written");
+        let m = got.get("/tv/Show M (1997)").expect("series row written");
         assert_eq!(m.match_provider.as_deref(), Some("tvdb"));
         assert_eq!(m.match_source.as_deref(), Some("search"));
-        assert_eq!(m.match_external_id.as_deref(), Some("70327"));
+        assert_eq!(m.match_external_id.as_deref(), Some("910104"));
         assert_eq!(m.overview.as_deref(), Some("One girl in all the world."));
         assert_eq!(m.community_rating, Some(8.7));
         assert_eq!(m.genres, vec!["Drama".to_string(), "Fantasy".to_string()]);
-        assert_eq!(m.provider_ids.tvdb.as_deref(), Some("70327"));
+        assert_eq!(m.provider_ids.tvdb.as_deref(), Some("910104"));
         assert_eq!(m.provider_ids.tmdb.as_deref(), Some("95"));
         assert_eq!(m.metadata_refreshed_at, Some(NOW));
         // The poster was downloaded + cached, and the locator points at a real
@@ -6187,17 +6186,17 @@ mod tests {
     #[tokio::test]
     async fn a_new_show_matcher_re_admits_searched_shows_and_episodes_once() {
         let s = store().await;
-        put_episode(&s, 1, "Dragon Ball", "/tv/Dragon Ball").await;
-        put_episode(&s, 2, "Dragon Ball", "/tv/Dragon Ball").await;
+        put_episode(&s, 1, "Show K", "/tv/Show K").await;
+        put_episode(&s, 2, "Show K", "/tv/Show K").await;
         s.set_item_match(1, "tvdb", "374456", "search", Some(0.83), NOW)
             .await
             .unwrap();
-        s.set_item_match(2, "tvdb", "76666", "nfo_id", None, NOW)
+        s.set_item_match(2, "tvdb", "910103", "nfo_id", None, NOW)
             .await
             .unwrap();
         s.upsert_series_metadata(SeriesMetadata {
-            series_key: "/tv/Dragon Ball".into(),
-            series_name: "Dragon Ball".into(),
+            series_key: "/tv/Show K".into(),
+            series_name: "Show K".into(),
             match_provider: Some("tvdb".into()),
             match_external_id: Some("374456".into()),
             match_source: Some("search".into()),
@@ -6227,7 +6226,7 @@ mod tests {
         assert_eq!(items, [1], "only the searched episode, not the NFO one");
 
         // Recorded: the next pass re-admits nothing.
-        s.set_item_match(1, "tvdb", "76666", "search", Some(0.85), NOW)
+        s.set_item_match(1, "tvdb", "910103", "search", Some(0.85), NOW)
             .await
             .unwrap();
         readmit(&s).await;
@@ -6241,7 +6240,7 @@ mod tests {
     #[tokio::test]
     async fn a_re_admitted_episode_is_searched_again_not_resolved_by_its_old_id() {
         let s = store().await;
-        put_episode(&s, 1, "Dragon Ball", "/tv/Dragon Ball").await;
+        put_episode(&s, 1, "Show K", "/tv/Show K").await;
         let mut item = s.get(1).await.unwrap();
         item.metadata.provider_ids.tvdb = Some("374456".into());
         s.put(item).await.unwrap();
@@ -6251,8 +6250,8 @@ mod tests {
         readmit(&s).await;
         let (_td, cache) = cache();
         let tvdb = FakeEnricher::tvdb()
-            .with_search(vec![("76666", "Dragon Ball", Some(1997))])
-            .with_detail(enriched_overview("Goku's adventures"));
+            .with_search(vec![("910103", "Show K", Some(1997))])
+            .with_detail(enriched_overview("The hero's adventures"));
 
         run(
             &s,
@@ -6269,8 +6268,8 @@ mod tests {
 
         let got = s.get(1).await.unwrap();
         assert_eq!(got.match_source.as_deref(), Some("search"));
-        assert_eq!(got.match_external_id.as_deref(), Some("76666"));
-        assert_eq!(got.metadata.provider_ids.tvdb.as_deref(), Some("76666"));
+        assert_eq!(got.match_external_id.as_deref(), Some("910103"));
+        assert_eq!(got.metadata.provider_ids.tvdb.as_deref(), Some("910103"));
     }
 
     /// A re-admitted episode whose new search finds nothing loses the id its
@@ -6280,7 +6279,7 @@ mod tests {
     #[tokio::test]
     async fn a_re_admitted_episodes_old_id_is_dropped_when_its_search_finds_nothing() {
         let s = store().await;
-        put_episode(&s, 1, "Dragon Ball", "/tv/Dragon Ball").await;
+        put_episode(&s, 1, "Show K", "/tv/Show K").await;
         let mut item = s.get(1).await.unwrap();
         item.metadata.provider_ids.tvdb = Some("374456".into());
         s.put(item).await.unwrap();
@@ -6321,8 +6320,8 @@ mod tests {
         item.metadata.provider_ids.tvdb = Some("374456".into());
         assert_eq!(trusted_provider_ids(&item).tvdb, None);
 
-        item.metadata.provider_ids.tvdb = Some("76666".into());
-        assert_eq!(trusted_provider_ids(&item).tvdb.as_deref(), Some("76666"));
+        item.metadata.provider_ids.tvdb = Some("910103".into());
+        assert_eq!(trusted_provider_ids(&item).tvdb.as_deref(), Some("910103"));
 
         item.match_source = Some("nfo_id".into());
         item.metadata.provider_ids.tvdb = Some("374456".into());
@@ -6358,11 +6357,11 @@ mod tests {
 
     fn anime_texts() -> Vec<LocalizedText> {
         vec![
-            text("jpn", "ブルマと孫悟空", "ブルマが…", true),
+            text("jpn", "ミアと勇者", "ミアが…", true),
             text(
                 "eng",
-                "The Secret of the Dragon Balls",
-                "Bulma meets Goku.",
+                "The Secret of the Moon Base",
+                "Mia meets the hero.",
                 false,
             ),
         ]
@@ -6370,18 +6369,18 @@ mod tests {
 
     #[test]
     fn adopt_replaces_only_the_base_record_text() {
-        let mut title = "ブルマと孫悟空".to_string();
-        let mut overview = Some(" ブルマが…".to_string());
+        let mut title = "ミアと勇者".to_string();
+        let mut overview = Some(" ミアが…".to_string());
         assert!(adopt_default_text(
             Some(&mut title),
             &mut overview,
             &anime_texts()
         ));
-        assert_eq!(title, "The Secret of the Dragon Balls");
-        assert_eq!(overview.as_deref(), Some("Bulma meets Goku."));
+        assert_eq!(title, "The Secret of the Moon Base");
+        assert_eq!(overview.as_deref(), Some("Mia meets the hero."));
 
         // Local NFO text is not the provider's: left alone.
-        let mut title = "Bulma and Son Goku".to_string();
+        let mut title = "Mia and Son Hero".to_string();
         let mut overview = Some("Une description française.".to_string());
         assert!(!adopt_default_text(
             Some(&mut title),
@@ -6391,7 +6390,7 @@ mod tests {
         assert_eq!(overview.as_deref(), Some("Une description française."));
 
         // No English at TVDB: the original stays.
-        let mut overview = Some("ブルマが…".to_string());
+        let mut overview = Some("ミアが…".to_string());
         assert!(!adopt_default_text(
             None,
             &mut overview,
@@ -6399,8 +6398,8 @@ mod tests {
         ));
 
         // English-made: nothing to replace.
-        let eng_only = [text("eng", "Pilot", "Lord Stark...", true)];
-        let mut overview = Some("Lord Stark...".to_string());
+        let eng_only = [text("eng", "Pilot", "Lord Ash...", true)];
+        let mut overview = Some("Lord Ash...".to_string());
         assert!(!adopt_default_text(None, &mut overview, &eng_only));
     }
 
@@ -6410,35 +6409,35 @@ mod tests {
     async fn put_anime(s: &SqliteStore) {
         let item = MediaItem {
             id: 77,
-            path: "/tv/Dragon Ball/S01E01.mkv".into(),
-            title: "ブルマと孫悟空".into(),
+            path: "/tv/Show K/S01E01.mkv".into(),
+            title: "ミアと勇者".into(),
             kind: MediaKind::Episode,
             series: Some(pharos_core::SeriesInfo {
-                series_name: "Dragon Ball".into(),
+                series_name: "Show K".into(),
                 season_number: Some(1),
                 episode_number: Some(1),
-                series_folder: Some("/tv/Dragon Ball".into()),
+                series_folder: Some("/tv/Show K".into()),
                 series_year: Some(1986),
                 series_key: None,
             }),
             metadata: pharos_core::MediaMetadata {
-                overview: Some("ブルマが…".into()),
+                overview: Some("ミアが…".into()),
                 ..Default::default()
             },
             ..MediaItem::default()
         };
         s.put(item).await.unwrap();
-        s.set_item_match(77, "tvdb", "76666", "nfo_id", Some(0.9), NOW)
+        s.set_item_match(77, "tvdb", "910103", "nfo_id", Some(0.9), NOW)
             .await
             .unwrap();
         s.upsert_series_metadata(SeriesMetadata {
-            series_key: "/tv/Dragon Ball".into(),
-            series_name: "Dragon Ball".into(),
+            series_key: "/tv/Show K".into(),
+            series_name: "Show K".into(),
             match_provider: Some("tvdb".into()),
-            match_external_id: Some("76666".into()),
+            match_external_id: Some("910103".into()),
             match_source: Some("nfo_id".into()),
             metadata_refreshed_at: Some(NOW),
-            overview: Some("悟空の冒険。".into()),
+            overview: Some("勇者の冒険。".into()),
             ..Default::default()
         })
         .await
@@ -6450,42 +6449,42 @@ mod tests {
         let s = store().await;
         put_anime(&s).await;
         let tvdb = FakeEnricher::tvdb().with_texts(vec![
-            text("jpn", "ブルマと孫悟空", "ブルマが…", true),
-            text("jpn", "ドラゴンボール", "悟空の冒険。", true),
+            text("jpn", "ミアと勇者", "ミアが…", true),
+            text("jpn", "ショーK", "勇者の冒険。", true),
             text(
                 "eng",
-                "The Secret of the Dragon Balls",
-                "Bulma meets Goku.",
+                "The Secret of the Moon Base",
+                "Mia meets the hero.",
                 false,
             ),
         ]);
         // One fake answers for show and episode alike; give each its own.
         let ep_texts = anime_texts();
         let show_texts = vec![
-            text("jpn", "ドラゴンボール", "悟空の冒険。", true),
-            text("eng", "Dragon Ball", "Goku sets out.", false),
+            text("jpn", "ショーK", "勇者の冒険。", true),
+            text("eng", "Show K", "The hero sets out.", false),
         ];
         adopt_for_owner(&s, &TranslationOwner::Item(77), &ep_texts)
             .await
             .unwrap();
         adopt_for_owner(
             &s,
-            &TranslationOwner::Series("/tv/Dragon Ball".into()),
+            &TranslationOwner::Series("/tv/Show K".into()),
             &show_texts,
         )
         .await
         .unwrap();
         let ep = s.get(77).await.unwrap();
-        assert_eq!(ep.title, "The Secret of the Dragon Balls");
-        assert_eq!(ep.metadata.overview.as_deref(), Some("Bulma meets Goku."));
+        assert_eq!(ep.title, "The Secret of the Moon Base");
+        assert_eq!(ep.metadata.overview.as_deref(), Some("Mia meets the hero."));
         assert_eq!(ep.match_source.as_deref(), Some("nfo_id"), "still matched");
         let show = s
-            .series_metadata_by_keys(&["/tv/Dragon Ball".into()])
+            .series_metadata_by_keys(&["/tv/Show K".into()])
             .await
             .unwrap();
         assert_eq!(
-            show["/tv/Dragon Ball"].overview.as_deref(),
-            Some("Goku sets out.")
+            show["/tv/Show K"].overview.as_deref(),
+            Some("The hero sets out.")
         );
 
         // The pass stores rows for both owners and asks once each.
@@ -6512,12 +6511,12 @@ mod tests {
         for id in [78u32, 79] {
             let mut item = s.get(77).await.unwrap();
             item.id = u64::from(id);
-            item.path = format!("/tv/Dragon Ball/S01E{id}.mkv").into();
+            item.path = format!("/tv/Show K/S01E{id}.mkv").into();
             if let Some(series) = item.series.as_mut() {
                 series.episode_number = Some(id);
             }
             s.put(item).await.unwrap();
-            s.set_item_match(u64::from(id), "tvdb", "76666", "nfo_id", Some(0.9), NOW)
+            s.set_item_match(u64::from(id), "tvdb", "910103", "nfo_id", Some(0.9), NOW)
                 .await
                 .unwrap();
         }
@@ -6551,7 +6550,7 @@ mod tests {
         .await
         .unwrap();
         let ep = s.get(77).await.unwrap();
-        assert_eq!(ep.metadata.overview.as_deref(), Some("Bulma meets Goku."));
+        assert_eq!(ep.metadata.overview.as_deref(), Some("Mia meets the hero."));
     }
 
     #[tokio::test]
@@ -6578,7 +6577,7 @@ mod tests {
         .unwrap();
         assert!(tvdb.asked().is_empty());
         let ep = s.get(77).await.unwrap();
-        assert_eq!(ep.metadata.overview.as_deref(), Some("ブルマが…"));
+        assert_eq!(ep.metadata.overview.as_deref(), Some("ミアが…"));
     }
 
     /// Records the provider has no such record for (anime numbered
@@ -6592,12 +6591,12 @@ mod tests {
         for id in [78u32, 79, 80, 81] {
             let mut item = s.get(77).await.unwrap();
             item.id = u64::from(id);
-            item.path = format!("/tv/Dragon Ball/S01E{id}.mkv").into();
+            item.path = format!("/tv/Show K/S01E{id}.mkv").into();
             if let Some(series) = item.series.as_mut() {
                 series.episode_number = Some(id);
             }
             s.put(item).await.unwrap();
-            s.set_item_match(u64::from(id), "tvdb", "76666", "nfo_id", Some(0.9), NOW)
+            s.set_item_match(u64::from(id), "tvdb", "910103", "nfo_id", Some(0.9), NOW)
                 .await
                 .unwrap();
         }
@@ -6623,12 +6622,12 @@ mod tests {
         for id in [78u32, 79, 80, 81] {
             let mut item = s.get(77).await.unwrap();
             item.id = u64::from(id);
-            item.path = format!("/tv/Dragon Ball/S01E{id}.mkv").into();
+            item.path = format!("/tv/Show K/S01E{id}.mkv").into();
             if let Some(series) = item.series.as_mut() {
                 series.episode_number = Some(id);
             }
             s.put(item).await.unwrap();
-            s.set_item_match(u64::from(id), "tvdb", "76666", "nfo_id", Some(0.9), NOW)
+            s.set_item_match(u64::from(id), "tvdb", "910103", "nfo_id", Some(0.9), NOW)
                 .await
                 .unwrap();
         }
@@ -6651,19 +6650,19 @@ mod tests {
     /// it with the English text when it is on.
     #[tokio::test]
     async fn the_kill_switch_also_holds_for_a_re_enrichment() {
-        for (fetch, want) in [(false, "砂の惑星…"), (true, "A duke's son...")] {
+        for (fetch, want) in [(false, "乾いた星…"), (true, "A noble's heir...")] {
             let s = store().await;
-            put_movie(&s, 900_400, "Dune (2021)").await;
+            put_movie(&s, 900_400, "Film A (2021)").await;
             let mut item = s.get(900_400).await.unwrap();
-            item.metadata.overview = Some("砂の惑星…".into());
+            item.metadata.overview = Some("乾いた星…".into());
             s.put(item).await.unwrap();
             let (_td, cache) = cache();
             let tmdb = FakeEnricher::tmdb()
-                .with_search(vec![("438631", "Dune", Some(2021))])
+                .with_search(vec![("910101", "Film A", Some(2021))])
                 .with_detail(EnrichedMetadata {
                     texts: vec![
-                        text("jpn", "Dune", "砂の惑星…", true),
-                        text("eng", "Dune", "A duke's son...", false),
+                        text("jpn", "Film A", "乾いた星…", true),
+                        text("eng", "Film A", "A noble's heir...", false),
                     ],
                     ..EnrichedMetadata::default()
                 });
@@ -6767,12 +6766,12 @@ mod tests {
     #[tokio::test]
     async fn enrichment_stores_the_text_rows() {
         let s = store().await;
-        put_episode(&s, 1, "Dragon Ball", "/tv/Dragon Ball").await;
+        put_episode(&s, 1, "Show K", "/tv/Show K").await;
         let (_td, cache) = cache();
         let tvdb = FakeEnricher::tvdb()
-            .with_search(vec![("76666", "Dragon Ball", Some(1997))])
+            .with_search(vec![("910103", "Show K", Some(1997))])
             .with_detail(EnrichedMetadata {
-                overview: Some("Bulma meets Goku.".into()),
+                overview: Some("Mia meets the hero.".into()),
                 texts: anime_texts(),
                 ..EnrichedMetadata::default()
             });
@@ -6795,7 +6794,7 @@ mod tests {
         assert_eq!(rows.len(), 2, "{rows:?}");
         let show = s
             .translations_for(
-                &[TranslationOwner::Series("/tv/Dragon Ball".into())],
+                &[TranslationOwner::Series("/tv/Show K".into())],
                 &["eng".into()],
                 false,
             )
