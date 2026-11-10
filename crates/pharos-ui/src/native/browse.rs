@@ -12,7 +12,7 @@ use futures_util::future::{join, join3, try_join};
 use futures_util::StreamExt as _;
 use pharos_client::api::{
     ClientEvent, ClientEventKind, ClientLevel, Detail, Item, ItemKind, ItemRef, LibraryKind,
-    ListIndex, Listing, Page, PharosApi,
+    ListIndex, Listing, Page, PharosApi, Watched,
 };
 use pharos_client::{CallInfo, ClientError};
 
@@ -123,8 +123,8 @@ pub struct Narrow {
     pub order: Order,
     pub descending: bool,
     pub genre: Option<String>,
-    /// Only watched (`Some(true)`) or unwatched (`Some(false)`) items.
-    pub played: Option<bool>,
+    /// Only items in this play state.
+    pub watched: Option<Watched>,
     /// Only 3D (`Some(true)`) or only 2D (`Some(false)`) titles (V722).
     pub stereo: Option<bool>,
 }
@@ -135,7 +135,7 @@ impl Default for Narrow {
             order: Order::Name,
             descending: false,
             genre: None,
-            played: None,
+            watched: None,
             stereo: None,
         }
     }
@@ -151,7 +151,7 @@ impl Narrow {
                 .map_or_else(|| base.sort_by.clone(), str::to_owned),
             descending: self.descending,
             genre: self.genre.clone(),
-            played: self.played,
+            watched: self.watched,
             stereo: self.stereo,
             ..base.clone()
         }
@@ -190,10 +190,8 @@ impl Narrow {
         if let Some(genre) = &self.genre {
             pairs.push(format!("genre={}", encode_component(genre)));
         }
-        match self.played {
-            Some(true) => pairs.push("watched=watched".to_owned()),
-            Some(false) => pairs.push("watched=unwatched".to_owned()),
-            None => {}
+        if let Some(watched) = self.watched {
+            pairs.push(format!("watched={}", watched_token(watched)));
         }
         match self.stereo {
             Some(true) => pairs.push("3d=3d".to_owned()),
@@ -213,7 +211,7 @@ impl Narrow {
         let mut order = Order::Name;
         let mut descending = None;
         let mut genre = None;
-        let mut played = None;
+        let mut watched = None;
         let mut stereo = None;
         for pair in query.trim_start_matches('?').split('&') {
             let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
@@ -223,8 +221,7 @@ impl Narrow {
                 ("dir", "asc") => descending = Some(false),
                 ("dir", "desc") => descending = Some(true),
                 ("genre", v) if !v.is_empty() => genre = Some(v.to_owned()),
-                ("watched", "watched") => played = Some(true),
-                ("watched", "unwatched") => played = Some(false),
+                ("watched", v) => watched = watched_of(v),
                 ("3d", "3d") => stereo = Some(true),
                 ("3d", "2d") => stereo = Some(false),
                 _ => {}
@@ -234,10 +231,26 @@ impl Narrow {
             order,
             descending: descending.unwrap_or(order.starts_descending()),
             genre,
-            played,
+            watched,
             stereo,
         }
     }
+}
+
+/// The URL and `<option>` value of a play state.
+fn watched_token(watched: Watched) -> &'static str {
+    match watched {
+        Watched::Unwatched => "unwatched",
+        Watched::Watched => "watched",
+        Watched::InProgress => "in-progress",
+    }
+}
+
+/// The play state a URL or `<option>` value names; `None` for any other.
+fn watched_of(token: &str) -> Option<Watched> {
+    [Watched::Unwatched, Watched::InProgress, Watched::Watched]
+        .into_iter()
+        .find(|w| watched_token(*w) == token)
 }
 
 /// `s` with everything but unreserved URL characters percent-encoded.
@@ -853,11 +866,7 @@ fn FilterBar(
 ) -> Element {
     let now = narrow.read().clone();
     let genre = now.genre.clone().unwrap_or_default();
-    let played = match now.played {
-        None => ANY,
-        Some(false) => "unwatched",
-        Some(true) => "watched",
-    };
+    let played = now.watched.map_or(ANY, watched_token);
     let stereo = match now.stereo {
         None => ANY,
         Some(true) => "3d",
@@ -921,16 +930,11 @@ fn FilterBar(
                     value: played,
                     onchange: move |e| {
                         let value = e.value();
-                        narrow.with_mut(|n| {
-                            n.played = match value.as_str() {
-                                "watched" => Some(true),
-                                "unwatched" => Some(false),
-                                _ => None,
-                            }
-                        });
+                        narrow.with_mut(|n| n.watched = watched_of(&value));
                     },
                     option { value: ANY, selected: played == ANY, "All" }
                     option { value: "unwatched", selected: played == "unwatched", "Unwatched" }
+                    option { value: "in-progress", selected: played == "in-progress", "In progress" }
                     option { value: "watched", selected: played == "watched", "Watched" }
                 }
             }
@@ -3489,13 +3493,13 @@ mod tests {
         assert_eq!(listing.group, Some(ItemKind::Series));
         let released = Narrow {
             genre: Some("Drama".into()),
-            played: Some(false),
+            watched: Some(Watched::Unwatched),
             ..Narrow::default().ordered(Order::Released)
         };
         let listing = released.apply(&base);
         assert_eq!(listing.sort_by, "PremiereDate,ProductionYear,SortName");
         assert_eq!(listing.genre.as_deref(), Some("Drama"));
-        assert_eq!(listing.played, Some(false));
+        assert_eq!(listing.watched, Some(Watched::Unwatched));
         let three_d = Narrow {
             stereo: Some(true),
             ..Narrow::default()
@@ -3529,12 +3533,16 @@ mod tests {
             Narrow {
                 descending: false,
                 genre: Some("Sci-Fi & Fantasy".into()),
-                played: Some(false),
+                watched: Some(Watched::Unwatched),
                 ..Narrow::default().ordered(Order::Released)
             },
             Narrow {
                 genre: Some("Comédie+ 100%".into()),
-                played: Some(true),
+                watched: Some(Watched::Watched),
+                ..Narrow::default()
+            },
+            Narrow {
+                watched: Some(Watched::InProgress),
                 ..Narrow::default()
             },
             Narrow {
