@@ -89,6 +89,9 @@ struct Actor {
     distributed: Option<Distributed>,
     /// Announces a group this replica just took over from a persisted snapshot.
     hydrated: broadcast::Sender<GroupHandle>,
+    /// Announces a group whose listing changed; see
+    /// [`GroupRegistry::subscribe_listing`].
+    listing: broadcast::Sender<GroupId>,
     /// Keys leased through [`GroupRegistry::try_lease`], so asking twice from
     /// the holder does not contend with its own lock.
     leases: HashSet<GroupId>,
@@ -130,7 +133,8 @@ impl Actor {
     async fn spawn_for(&mut self, group_id: GroupId) -> GroupHandle {
         let Some(d) = self.distributed.clone() else {
             // Single-replica: always own.
-            let h = GroupHandle::spawn(group_id, self.delivery.clone());
+            let h =
+                GroupHandle::spawn_listed(group_id, self.delivery.clone(), self.listing.clone());
             self.owned.insert(group_id);
             self.groups.insert(group_id, h.clone());
             return h;
@@ -142,12 +146,13 @@ impl Actor {
                 Some((e, j)) => (e, Some(j)),
                 None => (unix_now_ms(), None),
             };
-            let h = GroupHandle::spawn_persistent(
+            let h = GroupHandle::spawn_persistent_listed(
                 group_id,
                 epoch,
                 self.delivery.clone(),
                 d.persistence.clone(),
                 json.as_deref(),
+                Some(self.listing.clone()),
             );
             self.owned.insert(group_id);
             self.groups.insert(group_id, h.clone());
@@ -245,10 +250,14 @@ impl Actor {
 pub struct GroupRegistry {
     tx: mpsc::Sender<Msg>,
     hydrated: broadcast::Sender<GroupHandle>,
+    listing: broadcast::Sender<GroupId>,
 }
 
 /// Groups announced to late subscribers' queues before they lag.
 const HYDRATED_BACKLOG: usize = 64;
+/// Listing changes a slow reader may fall behind by. A reader that lags
+/// knows only that something changed, which is all a list needs.
+const LISTING_BACKLOG: usize = 64;
 
 impl GroupRegistry {
     /// Spawn a single-replica registry. `delivery` reaches members
@@ -269,6 +278,8 @@ impl GroupRegistry {
         let (tx, mut rx) = mpsc::channel::<Msg>(64);
         let (hydrated, _) = broadcast::channel(HYDRATED_BACKLOG);
         let announce = hydrated.clone();
+        let (listing, _) = broadcast::channel(LISTING_BACKLOG);
+        let listed = listing.clone();
         tokio::spawn(async move {
             let mut actor = Actor {
                 groups: HashMap::new(),
@@ -276,6 +287,7 @@ impl GroupRegistry {
                 delivery,
                 distributed,
                 hydrated: announce,
+                listing: listed,
                 leases: HashSet::new(),
             };
             while let Some(msg) = rx.recv().await {
@@ -312,7 +324,19 @@ impl GroupRegistry {
                 }
             }
         });
-        Self { tx, hydrated }
+        Self {
+            tx,
+            hydrated,
+            listing,
+        }
+    }
+
+    /// Groups this replica runs whose listing changed: they started, ended,
+    /// were renamed, gained or lost a member or a leader, or changed what
+    /// they play. A play or pause is not a change. Groups another replica
+    /// runs are not announced here.
+    pub fn subscribe_listing(&self) -> broadcast::Receiver<GroupId> {
+        self.listing.subscribe()
     }
 
     /// Groups this replica takes over from a persisted snapshot (a restart, a
@@ -444,6 +468,70 @@ mod tests {
         let sinks = MemberSinks::new();
         let r = GroupRegistry::spawn(Arc::new(LocalDelivery::new(sinks.clone())));
         (r, sinks)
+    }
+
+    /// The next listing change, or `None` if none comes within 200 ms.
+    async fn next_listing(rx: &mut broadcast::Receiver<GroupId>) -> Option<GroupId> {
+        tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv())
+            .await
+            .ok()
+            .and_then(Result::ok)
+    }
+
+    #[tokio::test]
+    async fn a_group_announces_what_a_list_shows_of_it_and_nothing_else() {
+        use crate::group::GroupMsg;
+        use crate::messages::MemberId;
+        use tokio::sync::{mpsc, oneshot};
+
+        let (r, sinks) = reg();
+        let mut listing = r.subscribe_listing();
+        let h = r.create().await.unwrap();
+        let id = h.group_id;
+        assert_eq!(
+            next_listing(&mut listing).await,
+            None,
+            "an empty new group is unchanged"
+        );
+
+        let (sink, _rx) = mpsc::channel(64);
+        let mid = MemberId::new();
+        sinks.insert(mid, 1, sink);
+        let (reply, joined) = oneshot::channel();
+        h.tx.send(GroupMsg::AddMember {
+            user: None,
+            member_id: mid,
+            name: "x".into(),
+            reply,
+        })
+        .await
+        .unwrap();
+        let _ = joined.await.unwrap();
+        assert_eq!(next_listing(&mut listing).await, Some(id), "a join");
+
+        h.tx.send(GroupMsg::SetGroupName {
+            name: "Friday".into(),
+        })
+        .await
+        .unwrap();
+        assert_eq!(next_listing(&mut listing).await, Some(id), "a rename");
+
+        h.tx.send(GroupMsg::LeaderPause { sender: mid })
+            .await
+            .unwrap();
+        let _ = h.snapshot().await;
+        assert_eq!(
+            next_listing(&mut listing).await,
+            None,
+            "a pause is not a listing change"
+        );
+
+        h.tx.send(GroupMsg::RemoveMember { member_id: mid })
+            .await
+            .unwrap();
+        assert_eq!(next_listing(&mut listing).await, Some(id), "the last leave");
+        assert_eq!(next_listing(&mut listing).await, Some(id), "the end");
+        assert_eq!(next_listing(&mut listing).await, None);
     }
 
     #[tokio::test]

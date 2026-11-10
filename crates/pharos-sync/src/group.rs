@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot};
 use uuid::Uuid;
 
 /// Minimum delay between "server decides to play" and `at_server_ms`.
@@ -873,6 +873,15 @@ pub struct Joined {
     pub members: Vec<MemberSummary>,
     pub group_name: String,
     pub state: GroupPlayState,
+}
+
+/// See [`GroupState::listing`].
+#[derive(Debug, PartialEq, Eq)]
+struct Listing {
+    name: String,
+    members: Vec<(MemberId, String, bool)>,
+    queue: Vec<String>,
+    playing: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -2766,6 +2775,22 @@ impl GroupState {
     /// and a CastSeat bound to the same cast (same TV, same owner); they show as
     /// ONE entry, the Controller's, with the TV as `device`. Derived on every
     /// call and never stored, so the underlying members are untouched.
+    /// What a group list shows of this group: its name, who is in it and
+    /// who leads, and its queue (which decides who may see it). Not its play
+    /// state, which a pause or a member buffering flips.
+    fn listing(&self) -> Listing {
+        Listing {
+            name: self.group_name.clone(),
+            members: self
+                .member_summaries()
+                .into_iter()
+                .map(|m| (m.member_id, m.name, m.is_leader))
+                .collect(),
+            queue: self.queue.items.iter().map(|e| e.item_id.clone()).collect(),
+            playing: self.queue.playing_index,
+        }
+    }
+
     fn member_summaries(&self) -> Vec<MemberSummary> {
         let paired = |cast: &CastBinding| self.cast_is_paired(cast);
         let mut out: Vec<_> = self
@@ -3131,7 +3156,17 @@ impl GroupHandle {
     /// Spawn a fresh group actor delivering through `delivery` (local sinks on
     /// a single replica, the cross-replica bus under Postgres). No persistence.
     pub fn spawn(group_id: GroupId, delivery: Arc<dyn Delivery>) -> Self {
-        Self::spawn_inner(group_id, unix_now_ms(), delivery, None, None)
+        Self::spawn_inner(group_id, unix_now_ms(), delivery, None, None, None)
+    }
+
+    /// [`Self::spawn`], announcing on `listing` each time what a group list
+    /// shows of it changes, and when it ends.
+    pub(crate) fn spawn_listed(
+        group_id: GroupId,
+        delivery: Arc<dyn Delivery>,
+        listing: broadcast::Sender<GroupId>,
+    ) -> Self {
+        Self::spawn_inner(group_id, unix_now_ms(), delivery, None, None, Some(listing))
     }
 
     /// Spawn a group actor that persists its snapshot after every mutation, and
@@ -3146,6 +3181,26 @@ impl GroupHandle {
         persistence: Arc<dyn GroupPersistence>,
         hydrate_from: Option<&str>,
     ) -> Self {
+        Self::spawn_persistent_listed(
+            group_id,
+            epoch_unix_ms,
+            delivery,
+            persistence,
+            hydrate_from,
+            None,
+        )
+    }
+
+    /// [`Self::spawn_persistent`], announcing listing changes as
+    /// [`Self::spawn_listed`] does when `listing` is given.
+    pub(crate) fn spawn_persistent_listed(
+        group_id: GroupId,
+        epoch_unix_ms: u64,
+        delivery: Arc<dyn Delivery>,
+        persistence: Arc<dyn GroupPersistence>,
+        hydrate_from: Option<&str>,
+        listing: Option<broadcast::Sender<GroupId>>,
+    ) -> Self {
         let hydrated =
             hydrate_from.and_then(|json| serde_json::from_str::<PersistState>(json).ok());
         Self::spawn_inner(
@@ -3154,6 +3209,7 @@ impl GroupHandle {
             delivery,
             Some(persistence),
             hydrated,
+            listing,
         )
     }
 
@@ -3163,6 +3219,7 @@ impl GroupHandle {
         delivery: Arc<dyn Delivery>,
         persistence: Option<Arc<dyn GroupPersistence>>,
         hydrate: Option<PersistState>,
+        listing: Option<broadcast::Sender<GroupId>>,
     ) -> Self {
         let (tx, mut rx) = mpsc::channel::<GroupMsg>(256);
         let mut state = GroupState::new(group_id, epoch_unix_ms, delivery, persistence);
@@ -3191,7 +3248,11 @@ impl GroupHandle {
             let mut prune_tick =
                 tokio::time::interval(std::time::Duration::from_millis(MEMBER_PRUNE_TICK_MS));
             prune_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut listed = state.listing();
             loop {
+                // Clock, ping and snapshot traffic is frequent and changes
+                // nothing a list shows, so it skips the comparison below.
+                let mut quiet = false;
                 // Arm the readiness-gate timeout only while waiting, so a
                 // silent/wedged member can never block the group forever.
                 let deadline = state.waiting.as_ref().map(|w| w.deadline);
@@ -3211,6 +3272,7 @@ impl GroupHandle {
                             | GroupMsg::ObserveClock { .. }
                             | GroupMsg::MemberPing { .. });
                         handle(&mut state, msg).await;
+                        quiet = !mutates;
                         if mutates {
                             state.persist();
                         }
@@ -3405,6 +3467,13 @@ impl GroupHandle {
                         }
                     }
                 }
+                if let Some(listing) = listing.as_ref().filter(|_| !quiet) {
+                    let now = state.listing();
+                    if now != listed {
+                        listed = now;
+                        let _ = listing.send(state.id);
+                    }
+                }
                 ever_joined |= !state.members.is_empty();
                 if ever_joined && state.members.is_empty() {
                     // Had members, now empty → terminate. Registry respawns on
@@ -3427,6 +3496,10 @@ impl GroupHandle {
                     }
                     break;
                 }
+            }
+            // Ended: a list must drop it, whatever it showed last.
+            if let Some(listing) = &listing {
+                let _ = listing.send(state.id);
             }
         });
         Self {
