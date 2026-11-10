@@ -962,6 +962,16 @@ pub fn scroll_to_tile(at: u32) -> bool {
     true
 }
 
+/// The WebView answers only through an async eval, so the position is not
+/// read here and Back keeps the WebView's own.
+pub fn scroll_y() -> Option<f64> {
+    None
+}
+
+pub fn scroll_to_y(y: f64) {
+    run(format!("window.scrollTo(0,{y})"));
+}
+
 pub fn scroll_to_top() {
     run(tv_page::SCROLL_TO_TOP_JS.to_owned());
 }

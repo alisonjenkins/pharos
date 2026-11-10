@@ -109,8 +109,13 @@ pub fn Root() -> Element {
     use_context_provider(|| themes);
     use_hook(move || Rc::new(watch_system_preferences(themes)));
     let mut route = use_signal(|| Route::parse(&platform::current_path()));
+    // What Home and title pages last showed, and where each page was left,
+    // for Back to draw them at once (FR-206).
+    let revisit = use_context_provider(super::revisit::Revisit::new);
     use_hook(|| {
+        let mut back = revisit.back;
         Rc::new(platform::on_pop_state(move |path| {
+            back.set(true);
             route.set(Route::parse(&path))
         }))
     });
@@ -204,6 +209,11 @@ pub fn Root() -> Element {
             }
             if *route.peek() != to {
                 turn_on_nav(&route.peek(), &to);
+                let (mut places, mut back) = (revisit.places, revisit.back);
+                if let Some(y) = platform::scroll_y() {
+                    places.write().put(route.peek().path(), y);
+                }
+                back.set(false);
                 platform::push(&to.path());
                 route.set(to);
             }
@@ -4229,12 +4239,47 @@ fn HomeScreen() -> Element {
             ))
         }
     });
+    // The last Home shown stands in while this one loads, and a return by
+    // Back goes to where it was left (FR-206).
+    let revisit = try_use_context::<super::revisit::Revisit>();
+    use_effect(move || {
+        if let (Some(Some(Ok(loaded))), Some(revisit)) = (&*home.read(), revisit) {
+            let mut kept = revisit.home;
+            kept.set(Some(loaded.clone()));
+        }
+    });
     let state = home.read();
+    let fresh = state.as_ref().and_then(Option::as_ref);
+    let stand_in = match fresh {
+        None => revisit.and_then(|r| r.home.peek().clone()).map(Ok),
+        Some(_) => None,
+    };
+    use_place_on_return(Route::Home, fresh.is_some() || stand_in.is_some());
     loaded_or_retry(
-        state.as_ref().and_then(Option::as_ref),
+        fresh.or(stand_in.as_ref()),
         EventHandler::new(move |()| home.restart()),
         |home: &Home| rsx! { HomeView { home: home.clone() } },
     )
+}
+
+/// Once the page at `route` has content (`shown`), scrolls it to where the
+/// viewer left it, if they came back to it by Back or Forward (FR-206).
+fn use_place_on_return(route: Route, shown: bool) {
+    let revisit = try_use_context::<super::revisit::Revisit>();
+    // The page last placed: a title screen stays mounted from one title to
+    // the next (B555), and each arrival is placed once.
+    let mut placed = use_signal(|| None::<String>);
+    let path = route.path();
+    use_effect(use_reactive!(|(shown, path)| {
+        if !shown || placed.peek().as_deref() == Some(path.as_str()) {
+            return;
+        }
+        placed.set(Some(path.clone()));
+        if let Some(y) = revisit.and_then(|r| r.place_for(&path)) {
+            platform::info(&format!("pharos: revisit place path={path} y={y}"));
+            platform::scroll_to_y(y);
+        }
+    }));
 }
 
 #[component]
@@ -4490,12 +4535,31 @@ fn TitleScreen(id: ItemRef) -> Element {
         });
     };
     let mut picked = use_signal(|| stored_version(id));
+    // The title as last shown stands in while it reloads, and a return by
+    // Back goes to where it was left (FR-206).
+    let revisit = try_use_context::<super::revisit::Revisit>();
+    use_effect(move || {
+        if let (Some(Some((asked, Ok(loaded)))), Some(revisit)) = (&*detail.read(), revisit) {
+            let mut kept = revisit.titles;
+            kept.write().put(*asked, loaded.clone());
+        }
+    });
     let state = detail.read();
-    let name = state
+    let fresh = state
         .as_ref()
         .and_then(Option::as_ref)
         .filter(|(asked, _)| *asked == id)
-        .and_then(|(_, r)| r.as_ref().ok())
+        .map(|(_, result)| result);
+    let stand_in = match fresh {
+        None => revisit
+            .and_then(|r| r.titles.peek().get(&id).cloned())
+            .map(Ok),
+        Some(_) => None,
+    };
+    let shown = fresh.or(stand_in.as_ref());
+    use_place_on_return(Route::Title(id), shown.is_some());
+    let name = shown
+        .and_then(|r| r.as_ref().ok())
         .map(|d| super::views::page_name(&d.item));
     use_page_name(id, name);
     rsx! {
@@ -4503,11 +4567,7 @@ fn TitleScreen(id: ItemRef) -> Element {
             ErrorNote { message }
         }
         {loaded_or_retry(
-            state
-                .as_ref()
-                .and_then(Option::as_ref)
-                .filter(|(asked, _)| *asked == id)
-                .map(|(_, result)| result),
+            shown,
             EventHandler::new(move |()| detail.restart()),
             |detail: &Detail| {
                 let version = versions::chosen_version(&detail.versions, picked().as_deref()).to_owned();
@@ -8182,6 +8242,61 @@ mod tests {
         };
         use_context_provider(|| ctx);
         rsx! { AppearanceScreen {} }
+    }
+
+    /// FR-206: while Home loads, the Home last shown stands in; with none
+    /// kept the page says it is loading.
+    #[test]
+    fn home_draws_the_last_home_shown_while_it_loads() {
+        #[component]
+        fn Harness(kept: bool) -> Element {
+            use_context_provider(|| crate::native::views::Nav(EventHandler::new(|_: Route| {})));
+            use_context_provider(|| Ctx {
+                api: Signal::new(None::<NativeApi>),
+                machine: Signal::new(Machine::new()),
+                marks: Signal::new(0),
+            });
+            let revisit = use_context_provider(super::super::revisit::Revisit::new);
+            if kept {
+                let film = pharos_client::api::Item {
+                    id: ItemRef::Real(7),
+                    kind: pharos_client::api::ItemKind::Movie,
+                    name: "An Invented Film".to_owned(),
+                    year: None,
+                    runtime_ms: 600_000,
+                    image: None,
+                    played: false,
+                    favorite: false,
+                    position_ms: 60_000,
+                    series_name: None,
+                    season: None,
+                    episode: None,
+                    parent: None,
+                    library_kind: None,
+                    imdb_rating: None,
+                    critic_rating: None,
+                    artist: None,
+                    stereo: None,
+                    damaged: false,
+                    new_children: 0,
+                };
+                let mut home = revisit.home;
+                home.set(Some(Home {
+                    resume: vec![film],
+                    ..Home::default()
+                }));
+            }
+            rsx! { HomeScreen {} }
+        }
+        let html = |kept| {
+            let mut dom = VirtualDom::new_with_props(Harness, HarnessProps { kept });
+            dom.rebuild_in_place();
+            dioxus_ssr::render(&dom)
+        };
+        let shown = html(true);
+        assert!(shown.contains("An Invented Film"), "{shown}");
+        let bare = html(false);
+        assert!(!bare.contains("An Invented Film"), "{bare}");
     }
 
     #[test]
