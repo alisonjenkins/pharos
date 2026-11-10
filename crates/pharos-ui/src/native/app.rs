@@ -1861,7 +1861,10 @@ fn NativeApp(route: Route) -> Element {
         async move {
             let api = api?;
             match api.me(&call("shell", "me")).await {
-                Ok(me) => Some(me),
+                Ok(me) => {
+                    reconcile_kept_books(&me.id);
+                    Some(me)
+                }
                 Err(e) => {
                     platform::warn(&format!("account: me failed: {e}"));
                     None
@@ -1906,6 +1909,10 @@ fn NativeApp(route: Route) -> Element {
                             spawn(async move {
                                 let reply = platform::sign_out().await;
                                 machine.write().apply(Event::SignOutAnswered(reply));
+                                // Signed out: no kept book stays on the device.
+                                if matches!(machine.peek().phase(), Phase::SignIn { .. }) {
+                                    forget_kept_books("sign-out").await;
+                                }
                             });
                         },
                     }
@@ -2084,6 +2091,24 @@ fn Screen(route: Route) -> Element {
         Route::NotFound(path) => rsx! { ErrorNote { message: format!("Nothing at {path}.") } },
     }
 }
+
+/// Deletes every kept book and its record (spec 036 FR-005).
+#[cfg(all(feature = "web", target_arch = "wasm32"))]
+async fn forget_kept_books(why: &str) {
+    super::kept_web::clear_all(why).await;
+}
+
+#[cfg(not(all(feature = "web", target_arch = "wasm32")))]
+async fn forget_kept_books(_why: &str) {}
+
+/// Drops kept books that another user kept, once the signed-in user is known.
+#[cfg(all(feature = "web", target_arch = "wasm32"))]
+fn reconcile_kept_books(user: &str) {
+    super::kept_web::reconcile(user);
+}
+
+#[cfg(not(all(feature = "web", target_arch = "wasm32")))]
+fn reconcile_kept_books(_user: &str) {}
 
 /// Settings, Offline: the books kept on this device. The cache is the
 /// browser's, so the other builds say so.
