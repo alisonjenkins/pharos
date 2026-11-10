@@ -5,7 +5,8 @@
 //! `dioxus-ssr`.
 
 use crate::client::{
-    series_item_ref, FixDone, FlaggedMatch, HandFix, ShowCandidate, SplitFolder, SplitGroup,
+    series_item_ref, FixDone, FlaggedMatch, HandFix, ShowCandidate, ShowDetail, SplitFolder,
+    SplitGroup,
 };
 use crate::client::{
     ActivityEntry, AdminUser, ApiKey, BrandingConfig, DamageRange, DamagedFile, DeepCheck,
@@ -114,6 +115,12 @@ pub enum AdminAction {
     IdentityRemove {
         id: i64,
     },
+    /// Rebuild these episodes from their show's stored match.
+    IdentityRebuild {
+        ids: Vec<u64>,
+    },
+    /// Close the "This show" card a title page opened the tab on.
+    IdentityUnfocus,
     /// Replace one device's audio direct-play deny list (T130).
     SetDeviceAudioDeny {
         device_id: String,
@@ -326,6 +333,9 @@ pub struct AdminViewProps {
     /// identity tab's listing has answered.
     #[props(default)]
     pub series_identity: Option<Result<SeriesIdentity, String>>,
+    /// The show a title page opened the tab on.
+    #[props(default)]
+    pub identity_focus: IdentityFocus,
     /// The pick form's search: whose it is, and what it found.
     #[props(default)]
     pub identity_search: IdentitySearchState,
@@ -356,6 +366,17 @@ pub struct AdminViewProps {
     /// The item open in the Metadata tab's form.
     #[props(default)]
     pub metadata: MetadataState,
+}
+
+/// The show the Show identity tab was opened on from its title page.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum IdentityFocus {
+    /// Opened from Manage itself: only the lists.
+    #[default]
+    None,
+    Loading,
+    Show(ShowDetail),
+    Failed(String),
 }
 
 /// What the pick form shows for the group or match it was opened on.
@@ -513,6 +534,7 @@ pub fn AdminView(props: AdminViewProps) -> Element {
                         AdminTab::ShowIdentity => rsx! {
                             ShowIdentitySection {
                                 identity: props.series_identity.clone(),
+                                focus: props.identity_focus.clone(),
                                 search: props.identity_search.clone(),
                                 prompt: props.identity_prompt.clone(),
                                 on_action,
@@ -1402,12 +1424,33 @@ fn DuplicatesSection(films: Option<Result<Vec<DuplicateFilm>, String>>) -> Eleme
 #[component]
 fn ShowIdentitySection(
     identity: Option<Result<SeriesIdentity, String>>,
+    #[props(default)] focus: IdentityFocus,
     search: IdentitySearchState,
     prompt: Option<PickPrompt>,
     on_action: EventHandler<AdminAction>,
 ) -> Element {
     rsx! {
         section { class: "pharos-manage-stack pharos-admin-section-identity",
+            match focus {
+                IdentityFocus::None => rsx! {},
+                IdentityFocus::Loading => rsx! { p { class: "pharos-loading", "Opening the show…" } },
+                IdentityFocus::Failed(e) => rsx! {
+                    div { class: "pharos-admin-identity-card",
+                        p { class: "pharos-error", "Could not open the show: {e}" }
+                        div { class: "pharos-manage-card-actions",
+                            button {
+                                r#type: "button",
+                                class: "pharos-admin-identity-unfocus",
+                                onclick: move |_| on_action.call(AdminAction::IdentityUnfocus),
+                                "Close"
+                            }
+                        }
+                    }
+                },
+                IdentityFocus::Show(show) => rsx! {
+                    ThisShowCard { key: "{show.series_id}", show, search: search.clone(), on_action }
+                },
+            }
             match identity {
                 None => rsx! { p { class: "pharos-loading", "Looking at the shows…" } },
                 Some(Err(e)) => rsx! { p { class: "pharos-error", "Could not read the show identity: {e}" } },
@@ -1462,28 +1505,8 @@ fn SplitCard(
     on_action: EventHandler<AdminAction>,
 ) -> Element {
     let status = split_status_label(&folder, &repair_mode);
-    let mut ticked = use_signal(Vec::<String>::new);
+    let ticked = use_signal(Vec::<String>::new);
     let mut picking = use_signal(|| None::<String>);
-    // "" is the new group; anything else is a group's series key.
-    let mut target = use_signal(String::new);
-    let mut new_name = use_signal(|| folder_name(&folder.folder).to_owned());
-    let mut new_year = use_signal(String::new);
-    let ticked_now: Vec<String> = ticked
-        .read()
-        .iter()
-        .filter(|p| folder.groups.iter().any(|g| g.paths.contains(p)))
-        .cloned()
-        .collect();
-    let target_now = target.read().clone();
-    let year_now = new_year.read().trim().to_owned();
-    let new_year_value = year_now.parse::<u32>().ok();
-    let new_group_ok = !new_name.read().trim().is_empty() && new_year_value.is_some();
-    let can_move = !ticked_now.is_empty()
-        && if target_now.is_empty() {
-            new_group_ok
-        } else {
-            true
-        };
     let prompted_key = prompt.as_ref().and_then(|p| {
         folder
             .groups
@@ -1491,9 +1514,7 @@ fn SplitCard(
             .find(|g| g.year == p.year)
             .map(|g| g.series_key.clone())
     });
-    let move_folder = folder.folder.clone();
     let keep_folder = folder.folder.clone();
-    let move_paths = ticked_now.clone();
     rsx! {
         article {
             class: "pharos-admin-identity-card",
@@ -1509,29 +1530,7 @@ fn SplitCard(
                     if prompted_key.as_deref() == Some(g.series_key.as_str()) {
                         p { class: "pharos-admin-identity-prompt", role: "status", "{PICK_PROMPT}" }
                     }
-                    ul { class: "pharos-admin-identity-files",
-                        for path in g.paths.iter() {
-                            li { key: "{path}",
-                                label {
-                                    input {
-                                        r#type: "checkbox",
-                                        checked: ticked.read().contains(path),
-                                        onchange: {
-                                            let path = path.clone();
-                                            move |ev: FormEvent| {
-                                                let mut list = ticked.write();
-                                                list.retain(|p| *p != path);
-                                                if ev.checked() {
-                                                    list.push(path.clone());
-                                                }
-                                            }
-                                        },
-                                    }
-                                    span { class: "pharos-admin-integrity-path", title: "{path}", " {folder_name(path)}" }
-                                }
-                            }
-                        }
-                    }
+                    FileChecklist { paths: g.paths.clone(), ticked }
                     {
                         let key = g.series_key.clone();
                         let open = picking.read().as_deref() == Some(g.series_key.as_str())
@@ -1571,59 +1570,12 @@ fn SplitCard(
                 }
             }
             if !folder.groups.is_empty() {
-            form {
-                class: "pharos-admin-identity-move pharos-manage-inline",
-                onsubmit: move |ev: FormEvent| {
-                    ev.prevent_default();
-                    if !can_move {
-                        return;
-                    }
-                    let to_new = target.read().is_empty();
-                    on_action.call(AdminAction::IdentityMove {
-                        folder: move_folder.clone(),
-                        paths: move_paths.clone(),
-                        target_key: (!to_new).then(|| target.read().clone()),
-                        target_name: to_new.then(|| new_name.read().trim().to_owned()),
-                        target_year: to_new.then_some(new_year_value).flatten(),
-                    });
-                    ticked.set(Vec::new());
-                },
-                label { class: "pharos-manage-field",
-                    span { "Send ticked files to" }
-                    select {
-                        aria_label: "Send ticked files to",
-                        onchange: move |ev| target.set(ev.value()),
-                        for g in folder.groups.iter() {
-                            option { key: "{g.series_key}", value: "{g.series_key}", selected: target_now == g.series_key, "{group_label(g)}" }
-                        }
-                        option { value: "", selected: target_now.is_empty(), "A new group…" }
-                    }
+                MoveForm {
+                    folder: folder.folder.clone(),
+                    groups: folder.groups.clone(),
+                    ticked,
+                    on_action,
                 }
-                if target_now.is_empty() {
-                    label { class: "pharos-manage-field",
-                        span { "Show name" }
-                        input {
-                            r#type: "text",
-                            autocomplete: "off",
-                            value: "{new_name.read()}",
-                            oninput: move |ev| new_name.set(ev.value()),
-                        }
-                    }
-                    label { class: "pharos-manage-field",
-                        span { "Year" }
-                        input {
-                            r#type: "text",
-                            inputmode: "numeric",
-                            autocomplete: "off",
-                            value: "{new_year.read()}",
-                            oninput: move |ev| new_year.set(ev.value()),
-                        }
-                    }
-                }
-                button { r#type: "submit", disabled: !can_move,
-                    "Move {files_label(ticked_now.len())}"
-                }
-            }
             }
             if folder.groups.len() > 1 {
                 div { class: "pharos-manage-card-actions",
@@ -1639,6 +1591,229 @@ fn SplitCard(
             }
         }
     }
+}
+
+/// Files with a tick box each; the ticked paths are shared with the card's
+/// move and rebuild buttons.
+#[component]
+fn FileChecklist(paths: Vec<String>, ticked: Signal<Vec<String>>) -> Element {
+    rsx! {
+        ul { class: "pharos-admin-identity-files",
+            for path in paths.iter() {
+                li { key: "{path}",
+                    label {
+                        input {
+                            r#type: "checkbox",
+                            checked: ticked.read().contains(path),
+                            onchange: {
+                                let path = path.clone();
+                                move |ev: FormEvent| {
+                                    let mut list = ticked.write();
+                                    list.retain(|p| *p != path);
+                                    if ev.checked() {
+                                        list.push(path.clone());
+                                    }
+                                }
+                            },
+                        }
+                        span { class: "pharos-admin-integrity-path", title: "{path}", " {folder_name(path)}" }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Send the ticked files of `folder` to one of `groups` or a new group.
+#[component]
+fn MoveForm(
+    folder: String,
+    groups: Vec<SplitGroup>,
+    ticked: Signal<Vec<String>>,
+    on_action: EventHandler<AdminAction>,
+) -> Element {
+    let mut ticked = ticked;
+    // "" is the new group; anything else is a group's series key.
+    let mut target = use_signal(String::new);
+    let mut new_name = use_signal(|| folder_name(&folder).to_owned());
+    let mut new_year = use_signal(String::new);
+    let ticked_now: Vec<String> = ticked
+        .read()
+        .iter()
+        .filter(|p| groups.iter().any(|g| g.paths.contains(p)))
+        .cloned()
+        .collect();
+    let target_now = target.read().clone();
+    let year_now = new_year.read().trim().to_owned();
+    let new_year_value = year_now.parse::<u32>().ok();
+    let new_group_ok = !new_name.read().trim().is_empty() && new_year_value.is_some();
+    let can_move = !ticked_now.is_empty() && (!target_now.is_empty() || new_group_ok);
+    let move_folder = folder.clone();
+    let move_paths = ticked_now.clone();
+    rsx! {
+        form {
+            class: "pharos-admin-identity-move pharos-manage-inline",
+            onsubmit: move |ev: FormEvent| {
+                ev.prevent_default();
+                if !can_move {
+                    return;
+                }
+                let to_new = target.read().is_empty();
+                on_action.call(AdminAction::IdentityMove {
+                    folder: move_folder.clone(),
+                    paths: move_paths.clone(),
+                    target_key: (!to_new).then(|| target.read().clone()),
+                    target_name: to_new.then(|| new_name.read().trim().to_owned()),
+                    target_year: to_new.then_some(new_year_value).flatten(),
+                });
+                ticked.set(Vec::new());
+            },
+            label { class: "pharos-manage-field",
+                span { "Send ticked files to" }
+                select {
+                    aria_label: "Send ticked files to",
+                    onchange: move |ev| target.set(ev.value()),
+                    for g in groups.iter() {
+                        option { key: "{g.series_key}", value: "{g.series_key}", selected: target_now == g.series_key, "{group_label(g)}" }
+                    }
+                    option { value: "", selected: target_now.is_empty(), "A new group…" }
+                }
+            }
+            if target_now.is_empty() {
+                label { class: "pharos-manage-field",
+                    span { "Show name" }
+                    input {
+                        r#type: "text",
+                        autocomplete: "off",
+                        value: "{new_name.read()}",
+                        oninput: move |ev| new_name.set(ev.value()),
+                    }
+                }
+                label { class: "pharos-manage-field",
+                    span { "Year" }
+                    input {
+                        r#type: "text",
+                        inputmode: "numeric",
+                        autocomplete: "off",
+                        value: "{new_year.read()}",
+                        oninput: move |ev| new_year.set(ev.value()),
+                    }
+                }
+            }
+            button { r#type: "submit", disabled: !can_move,
+                "Move {files_label(ticked_now.len())}"
+            }
+        }
+    }
+}
+
+/// The show a title page's "Fix identity" opened the tab on, flagged or
+/// not: its match, a way to pick another, and its files to move or rebuild.
+#[component]
+fn ThisShowCard(
+    show: ShowDetail,
+    search: IdentitySearchState,
+    on_action: EventHandler<AdminAction>,
+) -> Element {
+    let ticked = use_signal(Vec::<String>::new);
+    let mut picking = use_signal(|| false);
+    let paths: Vec<String> = show.episodes.iter().map(|e| e.path.clone()).collect();
+    let group = SplitGroup {
+        series_key: show.series_key.clone(),
+        year: None,
+        paths: paths.clone(),
+    };
+    let ids = rebuild_ids(&show, &ticked.read());
+    let none_ticked = ids.is_empty();
+    let href =
+        series_item_ref(&show.series_id).map(|id| crate::native::route::Route::Browse(id).path());
+    rsx! {
+        article { class: "pharos-admin-identity-card pharos-admin-identity-this-show",
+            h3 { "This show" }
+            h4 { title: "{show.folder}",
+                match href {
+                    Some(href) => rsx! { a { href: "{href}", "{show.name}" } },
+                    None => rsx! { "{show.name}" },
+                }
+            }
+            p { class: "pharos-admin-identity-facts", "{show_match_facts(&show)}" }
+            p { class: "pharos-admin-identity-count", "{episodes_label(show.episodes.len())}" }
+            if *picking.read() {
+                PickForm {
+                    series_key: show.series_key.clone(),
+                    default_name: show.name.clone(),
+                    default_year: None,
+                    search: search.clone(),
+                    on_action,
+                }
+            } else {
+                button {
+                    r#type: "button",
+                    class: "pharos-admin-identity-pick-open",
+                    onclick: move |_| picking.set(true),
+                    "Pick the show…"
+                }
+            }
+            FileChecklist { paths: paths.clone(), ticked }
+            MoveForm {
+                folder: show.folder.clone(),
+                groups: vec![group],
+                ticked,
+                on_action,
+            }
+            div { class: "pharos-manage-card-actions",
+                button {
+                    r#type: "button",
+                    class: "pharos-admin-identity-rebuild",
+                    disabled: none_ticked,
+                    onclick: move |_| on_action.call(AdminAction::IdentityRebuild { ids: ids.clone() }),
+                    "Rebuild ticked episodes from this show's match"
+                }
+                button {
+                    r#type: "button",
+                    class: "pharos-admin-identity-unfocus",
+                    onclick: move |_| on_action.call(AdminAction::IdentityUnfocus),
+                    "Close"
+                }
+            }
+        }
+    }
+}
+
+/// The media ids of the episodes whose paths are ticked.
+fn rebuild_ids(show: &ShowDetail, ticked: &[String]) -> Vec<u64> {
+    show.episodes
+        .iter()
+        .filter(|e| ticked.contains(&e.path))
+        .map(|e| e.id)
+        .collect()
+}
+
+fn episodes_label(n: usize) -> String {
+    format!("{n} {}", if n == 1 { "episode" } else { "episodes" })
+}
+
+/// "Matched to tvdb 1 (search) · premiered 2014-10-07", or that nothing is
+/// stored.
+fn show_match_facts(show: &ShowDetail) -> String {
+    let Some(m) = show.current_match.as_ref() else {
+        return "No match stored yet.".to_owned();
+    };
+    let mut parts = Vec::new();
+    match (m.provider.as_deref(), m.external_id.as_deref()) {
+        (Some(p), Some(id)) => parts.push(format!(
+            "Matched to {p} {id}{}",
+            m.source
+                .as_deref()
+                .map(|s| format!(" ({s})"))
+                .unwrap_or_default()
+        )),
+        _ => parts.push("No match chosen yet".to_owned()),
+    }
+    if let Some(secs) = m.premiere_date {
+        parts.push(format!("premiered {}", date_label(secs)));
+    }
+    parts.join(" · ")
 }
 
 /// Search by name and optional year, then pick a candidate.
@@ -4700,6 +4875,93 @@ mod tests {
                 ..HandFix::default()
             }],
         }
+    }
+
+    fn remake_show() -> ShowDetail {
+        ShowDetail {
+            series_key: "/tv/Show A".into(),
+            series_id: "000000000000002a000000000000002a".into(),
+            folder: "/tv/Show A".into(),
+            name: "Show A".into(),
+            current_match: Some(crate::client::ShowMatch {
+                provider: Some("tvdb".into()),
+                external_id: Some("900091".into()),
+                source: Some("search".into()),
+                premiere_date: Some(1_100_000_000),
+            }),
+            episodes: vec![
+                crate::client::ShowEpisode {
+                    id: 11,
+                    path: "/tv/Show A/S01E01.mkv".into(),
+                    ..Default::default()
+                },
+                crate::client::ShowEpisode {
+                    id: 12,
+                    path: "/tv/Show A/S01E02.mkv".into(),
+                    ..Default::default()
+                },
+            ],
+        }
+    }
+
+    fn render_focus(focus: IdentityFocus) -> String {
+        let mut dom = VirtualDom::new_with_props(
+            |focus: IdentityFocus| {
+                rsx! {
+                    ShowIdentitySection {
+                        identity: Some(Ok(SeriesIdentity::default())),
+                        focus,
+                        search: IdentitySearchState::default(),
+                        prompt: None,
+                        on_action: |_| {},
+                    }
+                }
+            },
+            focus,
+        );
+        dom.rebuild_in_place();
+        dioxus_ssr::render(&dom)
+    }
+
+    #[test]
+    fn a_focused_show_gets_a_this_show_card_with_its_match_files_and_rebuild() {
+        let html = render_focus(IdentityFocus::Show(remake_show()));
+        for want in [
+            "This show",
+            "Show A",
+            "Matched to tvdb 900091 (search)",
+            "2 episodes",
+            "Pick the show",
+            "S01E02.mkv",
+            "Move 0 files",
+            "Rebuild ticked episodes from this show&#39;s match",
+        ] {
+            assert!(html.contains(want), "{want} missing from {html}");
+        }
+        assert!(!render_focus(IdentityFocus::None).contains("This show"));
+        assert!(render_focus(IdentityFocus::Loading).contains("Opening the show"));
+        assert!(render_focus(IdentityFocus::Failed("no show".into()))
+            .contains("Could not open the show: no show"));
+    }
+
+    #[test]
+    fn rebuild_asks_for_the_ids_of_the_ticked_paths_only() {
+        let show = remake_show();
+        assert_eq!(rebuild_ids(&show, &[]), Vec::<u64>::new());
+        assert_eq!(rebuild_ids(&show, &["/tv/Show A/S01E02.mkv".into()]), [12]);
+        assert_eq!(
+            rebuild_ids(&show, &["/elsewhere.mkv".into()]),
+            Vec::<u64>::new()
+        );
+    }
+
+    #[test]
+    fn a_show_with_no_stored_record_says_so() {
+        let show = ShowDetail {
+            current_match: None,
+            ..remake_show()
+        };
+        assert_eq!(show_match_facts(&show), "No match stored yet.");
     }
 
     #[test]

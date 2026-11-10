@@ -17,17 +17,17 @@ use crate::client::{
     IntegrityReport, ItemChapter, ItemDetail, ItemMetadata, LibraryFolder, LiveChannel,
     LiveProgram, LocalizationCulture, LogEntry, MetadataSaveError, PluginEntry,
     QuickConnectInitiate, RemoteSession, ScheduledTask, SearchHint, SeriesIdentity, ShowCandidate,
-    UserConfiguration,
+    ShowDetail, UserConfiguration,
 };
 use crate::views::admin::{fix_summary, PICK_PROMPT};
 use crate::views::server_picker::{load_saved_servers, save_servers};
 use crate::views::{
     AdminAction, AdminTab, AdminView, CreateUserAttempt, DeepSearchState, DetailAction,
-    IdentitySearchState, ItemDetailView, LibraryView, LiveTvAction, LiveTvStatus, LiveTvView,
-    LoginAttempt, LoginForm, MetadataState, PickPrompt, PlayerView, PrefsAction, PrefsTab,
-    PrefsView, QuickConnectAuthorizeAction, QuickConnectAuthorizeView, QuickConnectGuestAction,
-    QuickConnectGuestStatus, QuickConnectGuestView, RemoteAction, RemoteControlView, SavedServer,
-    SearchStatus, SearchView, ServerPickerAction, ServerPickerView,
+    IdentityFocus, IdentitySearchState, ItemDetailView, LibraryView, LiveTvAction, LiveTvStatus,
+    LiveTvView, LoginAttempt, LoginForm, MetadataState, PickPrompt, PlayerView, PrefsAction,
+    PrefsTab, PrefsView, QuickConnectAuthorizeAction, QuickConnectAuthorizeView,
+    QuickConnectGuestAction, QuickConnectGuestStatus, QuickConnectGuestView, RemoteAction,
+    RemoteControlView, SavedServer, SearchStatus, SearchView, ServerPickerAction, ServerPickerView,
 };
 use dioxus::prelude::*;
 
@@ -574,6 +574,9 @@ pub fn AdminPane(
     /// The tab to open on; the first (Users) when not given.
     #[props(default)]
     initial_tab: AdminTab,
+    /// A show's series id the Show identity tab opens its "This show" card on.
+    #[props(default)]
+    initial_focus: Option<String>,
 ) -> Element {
     let reload = use_signal(|| 0u32);
     let status = use_signal::<Option<String>>(|| None);
@@ -719,6 +722,26 @@ pub fn AdminPane(
             }
         })
     };
+    let focus = use_signal(move || initial_focus.clone());
+    // The focused show's record; read again after every fix.
+    let focus_resource = {
+        let base = server_base.clone();
+        let token = access_token;
+        let reload_signal = reload;
+        use_resource(move || {
+            let _bust = reload_signal.read();
+            let open = *active_tab.read() == AdminTab::ShowIdentity;
+            let wanted = focus.read().clone();
+            let base = base.clone();
+            let token = token.peek().clone();
+            async move {
+                match wanted.filter(|_| open) {
+                    Some(id) => Some(fetch_show_identity(&base, &token, &id).await),
+                    None => None,
+                }
+            }
+        })
+    };
     let identity_search = use_signal(IdentitySearchState::default);
     let identity_prompt = use_signal::<Option<PickPrompt>>(|| None);
     // Plans every folder on the server, so it runs only while its tab is open.
@@ -817,6 +840,7 @@ pub fn AdminPane(
         let mut fetch_err_hidden_signal = fetch_err_hidden;
         let mut identity_search_signal = identity_search;
         let mut identity_prompt_signal = identity_prompt;
+        let mut focus_signal = focus;
         let mut device_deny_saved_signal = device_deny_saved;
         let mut device_saving_signal = device_saving;
         let mut device_save_seq_signal = device_save_seq;
@@ -837,6 +861,10 @@ pub fn AdminPane(
             if let AdminAction::SelectTab(t) = action {
                 active_tab_signal.set(t);
                 status_signal.set(None);
+                return;
+            }
+            if action == AdminAction::IdentityUnfocus {
+                focus_signal.set(None);
                 return;
             }
             // Names, not ids, in what the status line says.
@@ -1152,6 +1180,13 @@ pub fn AdminPane(
                             }
                         }
                     }
+                    AdminAction::IdentityRebuild { ids } => {
+                        match rebuild_episodes(&base, &token, &ids).await {
+                            Ok(done) => status_signal.set(Some(fix_summary(&done))),
+                            Err(e) => status_signal
+                                .set(Some(format!("Couldn't rebuild the episodes: {e}"))),
+                        }
+                    }
                     AdminAction::SaveBranding(cfg) => {
                         match save_branding(&base, &token, &cfg).await {
                             Ok(()) => status_signal.set(Some("Saved.".into())),
@@ -1163,6 +1198,7 @@ pub fn AdminPane(
                     | AdminAction::MetadataSearch { .. }
                     | AdminAction::MetadataOpen { .. }
                     | AdminAction::MetadataSave { .. }
+                    | AdminAction::IdentityUnfocus
                     | AdminAction::DismissStatus => {
                         unreachable!("handled above")
                     }
@@ -1267,6 +1303,15 @@ pub fn AdminPane(
     let duplicates = duplicates_resource.read_unchecked().clone().flatten();
     let integrity = integrity_resource.read_unchecked().clone().flatten();
     let series_identity = identity_resource.read_unchecked().clone().flatten();
+    let identity_focus = match (
+        focus.read().is_some(),
+        focus_resource.read_unchecked().as_ref(),
+    ) {
+        (false, _) => IdentityFocus::None,
+        (true, Some(Some(Ok(show)))) => IdentityFocus::Show(show.clone()),
+        (true, Some(Some(Err(e)))) => IdentityFocus::Failed(e.clone()),
+        (true, _) => IdentityFocus::Loading,
+    };
     let identity_search_now = identity_search.read().clone();
     let identity_prompt_now = identity_prompt.read().clone();
     let integrity_queued = integrity_queued.read().clone();
@@ -1321,6 +1366,7 @@ pub fn AdminPane(
             duplicates: duplicates,
             integrity: integrity,
             series_identity: series_identity,
+            identity_focus: identity_focus,
             identity_search: identity_search_now,
             identity_prompt: identity_prompt_now,
             integrity_queued: integrity_queued,
@@ -2530,6 +2576,38 @@ async fn fetch_series_identity(base: &str, token: &str) -> Result<SeriesIdentity
 #[cfg(not(feature = "web"))]
 async fn fetch_series_identity(_base: &str, _token: &str) -> Result<SeriesIdentity, String> {
     Err("series_identity is only wired in the web build".into())
+}
+
+#[cfg(feature = "web")]
+async fn fetch_show_identity(
+    base: &str,
+    token: &str,
+    series_id: &str,
+) -> Result<ShowDetail, String> {
+    crate::client::web::show_identity(base, token, series_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(not(feature = "web"))]
+async fn fetch_show_identity(
+    _base: &str,
+    _token: &str,
+    _series_id: &str,
+) -> Result<ShowDetail, String> {
+    Err("show_identity is only wired in the web build".into())
+}
+
+#[cfg(feature = "web")]
+async fn rebuild_episodes(base: &str, token: &str, ids: &[u64]) -> Result<FixDone, String> {
+    crate::client::web::rebuild_episodes(base, token, ids)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(not(feature = "web"))]
+async fn rebuild_episodes(_base: &str, _token: &str, _ids: &[u64]) -> Result<FixDone, String> {
+    Err("rebuild_episodes is only wired in the web build".into())
 }
 
 #[cfg(feature = "web")]

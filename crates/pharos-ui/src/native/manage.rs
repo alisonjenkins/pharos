@@ -46,6 +46,12 @@ pub struct HeldManageToken(pub Signal<Option<MediaToken>>);
 #[derive(Clone, Copy)]
 pub struct ManageTab(pub Signal<Option<AdminTab>>);
 
+/// The show a "Fix identity" button asks the Show identity tab to open on,
+/// by its 32-hex series id; taken by the next Manage screen, like
+/// [`ManageTab`].
+#[derive(Clone, Copy)]
+pub struct ManageFocus(pub Signal<Option<String>>);
+
 /// The flagged shows' item refs, asked for once by the first show page an
 /// admin opens (`list` stays `None` until answered), and forgotten when
 /// Manage closes, since a fix there changes the answer.
@@ -199,6 +205,15 @@ pub fn ManageScreen() -> Element {
         })
     })
     .unwrap_or_default();
+    let manage_focus = try_use_context::<ManageFocus>();
+    let initial_focus = use_hook(|| {
+        manage_focus.and_then(|focus| {
+            let mut focus = focus.0;
+            let wanted = focus.peek().clone();
+            focus.set(None);
+            wanted
+        })
+    });
     let flagged_shows = try_use_context::<FlaggedShows>();
     use_drop(move || {
         if let Some(flagged) = flagged_shows {
@@ -294,6 +309,7 @@ pub fn ManageScreen() -> Element {
                 server_base: platform::page_origin(),
                 current_user_id: me_id,
                 initial_tab,
+                initial_focus,
             }
         },
     }
