@@ -77,17 +77,30 @@ pub fn normalise_denied_audio_codecs(codecs: &[String]) -> Result<Vec<String>, D
 /// it. It is dropped here, so the device list never shows it and the next
 /// save, which sends the whole list back, is not refused for it.
 pub async fn denied_audio_codecs(state: &AppState, device_id: &str) -> Vec<String> {
+    match try_denied_audio_codecs(state, device_id).await {
+        Ok(codecs) => codecs,
+        Err(e) => {
+            tracing::warn!(device.id = device_id, error = %e, "device audio deny list unreadable");
+            Vec::new()
+        }
+    }
+}
+
+/// [`denied_audio_codecs`], but a store that cannot be read is an error, not
+/// an empty list. A settings listing uses this: showing an empty list there
+/// would let the next toggle, which saves the whole list, wipe the stored one.
+pub async fn try_denied_audio_codecs(
+    state: &AppState,
+    device_id: &str,
+) -> Result<Vec<String>, String> {
     use pharos_store_sqlx::ServerConfigStore as _;
     let key = denied_audio_codecs_key(device_id);
     let raw = match state.stores.load_named_config(&key).await {
         Ok(Some(raw)) => raw,
-        Ok(None) => return Vec::new(),
-        Err(e) => {
-            tracing::warn!(device.id = device_id, error = %e, "device audio deny list unreadable");
-            return Vec::new();
-        }
+        Ok(None) => return Ok(Vec::new()),
+        Err(e) => return Err(e.to_string()),
     };
-    match serde_json::from_str::<Vec<String>>(&raw) {
+    Ok(match serde_json::from_str::<Vec<String>>(&raw) {
         Ok(mut codecs) => {
             let before = codecs.len();
             codecs.retain(|c| !c.eq_ignore_ascii_case(CONVERSION_AUDIO_CODEC));
@@ -104,7 +117,7 @@ pub async fn denied_audio_codecs(state: &AppState, device_id: &str) -> Vec<Strin
             tracing::warn!(device.id = device_id, value = %raw, error = %e, "device audio deny list is not a JSON list");
             Vec::new()
         }
-    }
+    })
 }
 
 /// [`denied_audio_codecs`] for the device `token` was issued to.

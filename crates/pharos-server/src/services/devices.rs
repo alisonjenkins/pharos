@@ -7,7 +7,8 @@
 use pharos_core::{TokenStore as _, UserId};
 
 use crate::services::playback::{
-    denied_audio_codecs, denied_audio_codecs_key, normalise_denied_audio_codecs, DeniedCodecsError,
+    denied_audio_codecs_key, normalise_denied_audio_codecs, try_denied_audio_codecs,
+    DeniedCodecsError,
 };
 use crate::state::AppState;
 
@@ -81,7 +82,9 @@ pub async fn devices_of(state: &AppState, user: UserId) -> Result<Vec<OwnedDevic
         }
         out.push(OwnedDevice {
             name: display_name(state, &t.device_id).await,
-            denied_audio_codecs: denied_audio_codecs(state, &t.device_id).await,
+            denied_audio_codecs: try_denied_audio_codecs(state, &t.device_id)
+                .await
+                .map_err(|e| format!("sound formats of device {}: {e}", t.device_id))?,
             id: t.device_id,
         });
     }

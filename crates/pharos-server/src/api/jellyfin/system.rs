@@ -923,8 +923,15 @@ async fn devices_list(
                 .flatten()
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| t.device_id.clone());
+            // Fallible: an empty list shown here would let the next save,
+            // which sends the whole list, wipe the stored one.
             let no_direct_play_audio_codecs =
-                crate::services::playback::denied_audio_codecs(&state, &t.device_id).await;
+                crate::services::playback::try_denied_audio_codecs(&state, &t.device_id)
+                    .await
+                    .map_err(|e| {
+                        tracing::warn!(device.id = %t.device_id, error = %e, "device list refused: sound formats unreadable");
+                        error::ErrorInternalServerError(e)
+                    })?;
             items.push(DeviceInfoLite {
                 no_direct_play_audio_codecs,
                 id: t.device_id,
