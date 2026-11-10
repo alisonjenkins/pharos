@@ -12,7 +12,8 @@ import * as path from "path";
 // Spec 023 (B410): the native book reader. The seed (`just
 // compat-dioxus-full`) writes "Reader Fixture.epub", three chapters of
 // unique word tokens ("zq1x4x17"), and "Reader Locked.azw3", a Kindle file
-// the scanner cannot convert (the DRM case, V353).
+// the scanner cannot convert (the DRM case, V353), and "Reader Paged.pdf", five
+// pages with a different drawing each (US5).
 //
 // "On screen" is geometry, not visibility: the pages are CSS columns, so text
 // on another page is in the DOM and `toBeVisible` but clipped away. The
@@ -118,6 +119,36 @@ async function turnForward(page: Page): Promise<string> {
   await page.keyboard.press("ArrowRight");
   await expect.poll(async () => (await wordsOnPage(page))[0], { timeout: 10_000 }).not.toBe(before);
   return (await wordsOnPage(page))[0];
+}
+
+/** Where the PDF reader's canvas stands: its pixel size, CSS width and a hash of what it shows. */
+async function pdfCanvas(
+  page: Page,
+): Promise<{ width: number; height: number; cssWidth: number; hostWidth: number; hash: number }> {
+  return page.evaluate(() => {
+    const host = document.getElementById("pharos-reader-host") as HTMLElement;
+    const c = host.querySelector("canvas") as HTMLCanvasElement | null;
+    if (!c) return { width: 0, height: 0, cssWidth: 0, hostWidth: host.clientWidth, hash: 0 };
+    let hash = 7;
+    const url = c.toDataURL();
+    for (let i = 0; i < url.length; i++) hash = (hash * 31 + url.charCodeAt(i)) >>> 0;
+    return {
+      width: c.width,
+      height: c.height,
+      cssWidth: c.getBoundingClientRect().width,
+      hostWidth: host.clientWidth,
+      hash,
+    };
+  });
+}
+
+/** Waits for the PDF reader to say it is on page `n` of 5 and for a page to be drawn. */
+async function onPdfPage(page: Page, n: number): Promise<void> {
+  await expect(page.locator(".pharos-reader-progress-label")).toHaveText(
+    new RegExp(`^Page ${n} of 5 · \\d+%$`),
+    { timeout: 20_000 },
+  );
+  await expect.poll(async () => (await pdfCanvas(page)).height, { timeout: 20_000 }).toBeGreaterThan(0);
 }
 
 test.describe("book reader (spec 023)", () => {
@@ -232,5 +263,105 @@ test.describe("book reader (spec 023)", () => {
       "href",
       /\/Items\/\d+\/Download$/,
     );
+  });
+
+  test("a PDF opens from a module fetched only then, turns pages and resumes (US5)", async ({
+    browser,
+    request,
+  }) => {
+    const first = await newReaderContext(browser, { width: 1280, height: 800 }, 2);
+    const page = await first.newPage();
+    echoReaderLog(page, "pdf first");
+    const moduleRequests: string[] = [];
+    page.on("request", (r) => {
+      const u = new URL(r.url());
+      if (u.pathname.startsWith("/ui/assets/pdf/")) moduleRequests.push(u.pathname.split("/").pop() ?? "");
+    });
+    await signIn(page, request);
+    await openFromSearch(page, "Reader Paged", "Reader Paged");
+
+    // The main app and the title page have not touched the PDF engine.
+    expect(moduleRequests).toEqual([]);
+    const read = page.locator("#pharos-main-action");
+    await expect(read).toHaveText("Read");
+    await read.click();
+    await expect(page.locator(".pharos-reader")).toBeVisible({ timeout: 15_000 });
+    await onPdfPage(page, 1);
+    expect(moduleRequests).toEqual(expect.arrayContaining(["loader.js", "quire_pdf.js", "quire_pdf_bg.wasm"]));
+
+    // One canvas, a letter page at the window's pixel ratio under the 4096 px cap.
+    const one = await pdfCanvas(page);
+    expect(one.height).toBeLessThanOrEqual(4096);
+    expect(one.width / one.height).toBeCloseTo(612 / 792, 2);
+    expect(one.height).toBeGreaterThan(800); // 2x on a 1280x800 window
+    await expect(page.locator("#pharos-reader-host canvas")).toHaveCount(1);
+
+    // Keys, then the right third of the page, then back.
+    await page.keyboard.press("ArrowRight");
+    await onPdfPage(page, 2);
+    const two = await pdfCanvas(page);
+    expect(two.hash).not.toBe(one.hash);
+    const box = (await page.locator("#pharos-reader-host").boundingBox())!;
+    await page.mouse.click(box.x + box.width - 20, box.y + box.height / 2);
+    await onPdfPage(page, 3);
+    const three = await pdfCanvas(page);
+    expect(three.hash).not.toBe(two.hash);
+    await page.keyboard.press("PageUp");
+    await onPdfPage(page, 2);
+    expect((await pdfCanvas(page)).hash).toBe(two.hash);
+    await page.keyboard.press("ArrowRight");
+    await onPdfPage(page, 3);
+    expect((await pdfCanvas(page)).hash).toBe(three.hash);
+
+    if (SHOTS) {
+      fs.mkdirSync(SHOTS, { recursive: true });
+      await page.screenshot({ path: path.join(SHOTS, "reader-pdf-1280x800-dsf2.png") });
+    }
+
+    // Fit width fills the host's width, and fit page restores the whole page.
+    const fit = page.getByRole("button", { name: "Fit width" });
+    await fit.click();
+    await expect(fit).toHaveAttribute("aria-pressed", "true");
+    await expect
+      .poll(async () => {
+        const c = await pdfCanvas(page);
+        return Math.abs(c.cssWidth - c.hostWidth) < 2;
+      })
+      .toBe(true);
+    await fit.click();
+    await expect
+      .poll(async () => (await pdfCanvas(page)).cssWidth)
+      .toBeLessThan(box.width / 2);
+    expect((await pdfCanvas(page)).hash).toBe(three.hash);
+
+    // Leaving saves page 3; the title page offers to continue at 60%.
+    await page.getByRole("button", { name: "Back" }).click();
+    const resume = page.locator("#pharos-main-action");
+    await expect(resume).toBeVisible({ timeout: 15_000 });
+    await expect
+      .poll(
+        async () => {
+          if ((await resume.textContent()) === "Continue reading · 60%") return true;
+          await page.reload();
+          await expect(page.locator("#pharos-main-action")).toBeVisible({ timeout: 15_000 });
+          return false;
+        },
+        { timeout: 30_000 },
+      )
+      .toBe(true);
+
+    // Another browser at the same size lands on the same page.
+    const second = await newReaderContext(browser, { width: 1280, height: 800 }, 2);
+    const other = await second.newPage();
+    echoReaderLog(other, "pdf second");
+    await signIn(other, request);
+    await openFromSearch(other, "Reader Paged", "Reader Paged");
+    await expect(other.locator("#pharos-main-action")).toHaveText("Continue reading · 60%");
+    await other.locator("#pharos-main-action").click();
+    await onPdfPage(other, 3);
+    expect((await pdfCanvas(other)).hash).toBe(three.hash);
+
+    await first.close();
+    await second.close();
   });
 });
