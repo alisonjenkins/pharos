@@ -151,7 +151,7 @@ thiserror.workspace = true
 
 # 025: the Android TV app's native link to the server (native/android.rs).
 [target.'cfg(target_os = "android")'.dependencies]
-pharos-api = { path = "../pharos-api" }
+pharos-api = { path = "../pharos-api", features = ["rustls-client"] }
 capnp = { workspace = true }
 tokio = { version = "1", features = ["rt", "net", "time", "macros"] }
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
@@ -160,7 +160,6 @@ futures = "0.3"
 android_logger = "0.15"
 # The server proxy (native/android_page.rs): images and streams with the token in a header.
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
-webpki-roots = { workspace = true }
 log = "0.4"
 
 [dev-dependencies]

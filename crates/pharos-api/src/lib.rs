@@ -11,6 +11,8 @@ pub mod instrument;
 pub mod labels;
 pub mod redact;
 pub mod serve;
+#[cfg(feature = "rustls-client")]
+pub mod tls;
 pub mod track_choice;
 
 /// Ids one `Membership.seen` call may ask about; more is `limit`. The server
