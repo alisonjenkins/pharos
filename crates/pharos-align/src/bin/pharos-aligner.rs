@@ -51,6 +51,10 @@ fn main() -> std::process::ExitCode {
             return std::process::ExitCode::FAILURE;
         }
     };
+    if let Err(e) = pharos_align::forward::cpu::check_cpu() {
+        eprintln!("{e}");
+        return std::process::ExitCode::FAILURE;
+    }
     openmp_env(config.threads);
     match actix_web::rt::System::new().block_on(run(config)) {
         Ok(()) => std::process::ExitCode::SUCCESS,
