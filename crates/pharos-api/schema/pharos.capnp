@@ -12,7 +12,7 @@ annotation secret(field, param) :Void;
 
 # Bumped when the schema changes; served as ServerInfo.schemaVersion so a client
 # can tell which methods a server knows (FR-009).
-const schemaVersion :UInt32 = 39;
+const schemaVersion :UInt32 = 40;
 
 # ---- ids and shared types -------------------------------------------------
 struct ItemId {                # mirrors pharos_jellyfin_api::WireId
@@ -469,7 +469,17 @@ struct Event {
   }
   struct UserDataChanged { id @0 :ItemId; state @1 :UserState; }
   struct LibraryChanged { added @0 :List(ItemId); updated @1 :List(ItemId); removed @2 :List(ItemId); }
-  struct TaskProgress { id @0 :Text; progress @1 :Float32; state @2 :Text; }
+  struct TaskProgress {
+    id @0 :Text;
+    progress @1 :Float32;
+    state @2 :Text;            # running, done, partial (some roots failed), failed, cancelled
+    # What a finished library scan did; all 0 while running and for other
+    # tasks. Since schemaVersion 40.
+    added @3 :UInt32;
+    changed @4 :UInt32;
+    removed @5 :UInt32;
+    failedRoots @6 :UInt32;    # folders the scan could not read
+  }
 }
 interface EventSink { push @0 (ctx :CallContext, events :List(Event)) -> (result :Done); }
 interface Subscription { }      # dropping it unsubscribes
