@@ -164,6 +164,17 @@ pub enum ReadError {
     Item(DetailError),
 }
 
+/// The unix second a reading happened, from the client's `readAt` in unix
+/// milliseconds: 0 or less means now (old clients send nothing), and one ahead
+/// of `now_secs` counts as now so a fast clock cannot outrank every later
+/// reading (FR-002). Whole seconds: the `updated_at` column's unit.
+pub fn read_time_secs(read_at_ms: i64, now_secs: i64) -> i64 {
+    if read_at_ms <= 0 {
+        return now_secs;
+    }
+    (read_at_ms / 1000).min(now_secs)
+}
+
 fn count_read_position(outcome: &'static str) {
     metrics::counter!("pharos_read_position_total", "outcome" => outcome).increment(1);
 }
@@ -173,15 +184,19 @@ fn count_read_position(outcome: &'static str) {
 /// book, a locator that is empty or over [`MAX_READ_LOCATOR_BYTES`], or a
 /// fraction that is not in 0 to 1 (V355). A fraction of
 /// [`READ_FINISHED_FRACTION`] or more also marks the book played; the resume
-/// position `last_played_position_ticks` is never written (V354). Answers the
-/// item, the user's play state and the position as stored.
+/// position `last_played_position_ticks` is never written (V354). `read_at_ms`
+/// is when the page was read (see [`read_time_secs`]); a reading older than
+/// the stored one is not stored and does not mark the book played (V1131).
+/// Answers the item, the user's play state, the position as stored and
+/// whether this reading was the one stored.
 pub async fn set_read_position(
     state: &AppState,
     user: &User,
     id: u64,
     locator: &str,
     fraction: f32,
-) -> Result<(MediaItem, UserItemData, ReadPosition), ReadError> {
+    read_at_ms: i64,
+) -> Result<(MediaItem, UserItemData, ReadPosition, bool), ReadError> {
     if let Err(hidden) = crate::services::access::check_item(state, user, id, "read_position").await
     {
         count_read_position("hidden");
@@ -219,13 +234,36 @@ pub async fn set_read_position(
     let position = ReadPosition {
         locator: locator.to_owned(),
         fraction,
-        updated_at: crate::sync_recovery::now_unix_secs(),
+        updated_at: read_time_secs(read_at_ms, crate::sync_recovery::now_unix_secs()),
     };
-    state
+    let stored = state
         .stores
         .set_read_position(user.id, id, position.clone())
         .await
         .map_err(|e| ReadError::Item(DetailError::Store(e)))?;
+    if !stored {
+        let sent_updated_at = position.updated_at;
+        let kept = state
+            .stores
+            .get_read_position(user.id, id)
+            .await
+            .map_err(|e| ReadError::Item(DetailError::Store(e)))?
+            .unwrap_or(position);
+        let data = state
+            .stores
+            .get_user_data(user.id, id)
+            .await
+            .map_err(|e| ReadError::Item(DetailError::Store(e)))?;
+        count_read_position("stale");
+        tracing::info!(
+            media.id = id,
+            user.id = %user.id.0,
+            sent_updated_at,
+            kept_updated_at = kept.updated_at,
+            "read position older than the stored one, kept the stored"
+        );
+        return Ok((item, data, kept, false));
+    }
     let finished = fraction >= READ_FINISHED_FRACTION;
     let data = if finished {
         // Played without `apply_played`, which would zero the resume ticks.
@@ -247,7 +285,7 @@ pub async fn set_read_position(
             .map_err(|e| ReadError::Item(DetailError::Store(e)))?
     };
     count_read_position(if finished { "finished" } else { "saved" });
-    Ok((item, data, position))
+    Ok((item, data, position, true))
 }
 
 /// Applies `change` to `user`'s state on stored item `id`, if they may see
@@ -442,6 +480,19 @@ async fn write_one(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// FR-002: a read time is whole seconds, 0 or less is now, a future one is
+    /// now.
+    #[test]
+    fn read_time_is_clamped_to_now() {
+        assert_eq!(
+            read_time_secs(1_700_000_123_999, 1_800_000_000),
+            1_700_000_123
+        );
+        assert_eq!(read_time_secs(0, 1_800_000_000), 1_800_000_000);
+        assert_eq!(read_time_secs(-5, 1_800_000_000), 1_800_000_000);
+        assert_eq!(read_time_secs(i64::MAX, 1_800_000_000), 1_800_000_000);
+    }
 
     /// A folder is watched, or a favourite, only when every item in it is
     /// (B1080); an empty one is neither.

@@ -798,13 +798,17 @@ impl NativeApi {
     /// Saves where `id`, a book, was left for the signed-in user. The server
     /// refuses anything else, an unreadable book, a locator over 256 bytes
     /// and a fraction outside 0 to 1. A fraction of 0.99 or more also marks
-    /// it read. Answers whether it is now read.
+    /// it read. `read_at_ms` is when the page was read, unix milliseconds
+    /// (0 = now); the server keeps the newest reading, so a late save is
+    /// answered, not stored, when a newer one is there. Answers whether it is
+    /// now read.
     pub async fn set_read_position(
         &self,
         call: &CallInfo,
         id: ItemRef,
         locator: &str,
         fraction: f32,
+        read_at_ms: i64,
     ) -> Result<bool, ClientError> {
         let mut req = self.user_data.set_read_position_request();
         {
@@ -813,6 +817,7 @@ impl NativeApi {
             set_item_ref(p.reborrow().init_id(), id);
             p.set_locator(locator);
             p.set_fraction(fraction);
+            p.set_read_at(read_at_ms);
         }
         let reply = req.send().promise.await?;
         match reply
