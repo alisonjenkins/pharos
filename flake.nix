@@ -124,7 +124,8 @@
           # capnp: pharos-api's build.rs runs capnpc, which shells out to the
           # Cap'n Proto compiler (017).
           nativeBuildInputs = [ pkgs.pkg-config pkgs.rustPlatform.bindgenHook pkgs.capnproto ];
-          buildInputs = [ pkgs.ffmpeg-headless.dev ];
+          # openblas: pharos-align's CPU forward pass calls cblas_sgemm (spec 039).
+          buildInputs = [ pkgs.ffmpeg-headless.dev pkgs.openblas ];
         };
         # Compile the dependency tree ONCE — a store artifact cached across
         # commits (keyed by Cargo.lock + build inputs). A code-only change then
@@ -1390,6 +1391,8 @@
             # have on PATH.
             pkgs.yt-dlp
             pkgs.pkg-config
+            # spec 039: pharos-align links OpenBLAS for its CPU forward pass.
+            pkgs.openblas
             pkgs.git
             pkgs.just
             pkgs.curl
