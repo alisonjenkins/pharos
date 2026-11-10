@@ -19,6 +19,7 @@ use pharos_client::api::{ItemRef, NativeApi};
 use pharos_client::events::{EventCursor, EventSubscription, PushEvent};
 
 use super::platform;
+use crate::views::scan_progress::{ScanCounts, ScanView};
 
 /// How long events gather before one reload: a folder marked watched sends
 /// one event per episode, and a scan sends a burst of library changes.
@@ -91,20 +92,58 @@ impl Known {
     }
 }
 
+/// Folds a batch's task events into `scan`, writing only when what Manage
+/// shows changed.
+fn follow_scan(scan: &mut Signal<ScanView>, batch: &[PushEvent]) {
+    let mut next = scan.peek().clone();
+    if fold_tasks(&mut next, batch) {
+        scan.set(next);
+    }
+}
+
+fn fold_tasks(view: &mut ScanView, batch: &[PushEvent]) -> bool {
+    let mut changed = false;
+    for event in batch {
+        if let PushEvent::Task {
+            id,
+            progress,
+            state,
+            counts,
+        } = event
+        {
+            let counts = ScanCounts {
+                added: counts.added,
+                changed: counts.changed,
+                removed: counts.removed,
+                failed_roots: counts.failed_roots,
+            };
+            changed |= view.apply(id, *progress, state, counts);
+        }
+    }
+    changed
+}
+
 /// Follows the server's events for as long as the app lives: subscribes on
 /// each signed-in connection `api` brings, from where the last one stopped,
 /// and bumps `marks` and `library` when an event changes what they cover.
-pub fn use_live_updates(api: Signal<Option<NativeApi>>, marks: Signal<u32>, library: Signal<u32>) {
+pub fn use_live_updates(
+    api: Signal<Option<NativeApi>>,
+    marks: Signal<u32>,
+    library: Signal<u32>,
+    scan: Signal<ScanView>,
+) {
     let cursor = use_hook(EventCursor::default);
     let held = use_hook(|| Rc::new(RefCell::new(None::<EventSubscription>)));
     let reload = use_coroutine(move |mut rx: UnboundedReceiver<Vec<PushEvent>>| {
-        let (mut marks, mut library) = (marks, library);
+        let (mut marks, mut library, mut scan) = (marks, library, scan);
         async move {
             let mut known = Known::default();
             while let Some(batch) = rx.next().await {
+                follow_scan(&mut scan, &batch);
                 let mut refresh = known.plan(&batch);
                 platform::sleep_ms(COALESCE_MS).await;
                 while let Ok(more) = rx.try_recv() {
+                    follow_scan(&mut scan, &more);
                     refresh.merge(known.plan(&more));
                 }
                 if !refresh.any() {
@@ -208,6 +247,25 @@ mod tests {
         assert!(refresh.user_data && refresh.library);
         // Forgotten: the same state counts as new again.
         assert!(known.plan(&[user_data(1, true, 0)]).user_data);
+    }
+
+    #[test]
+    fn task_events_move_the_scan_view() {
+        let mut view = ScanView::default();
+        let task = |progress, state: &str, added| PushEvent::Task {
+            id: crate::views::scan_progress::LIBRARY_SCAN_TASK.into(),
+            progress,
+            state: state.into(),
+            counts: pharos_client::events::TaskCounts {
+                added,
+                ..Default::default()
+            },
+        };
+        assert!(fold_tasks(&mut view, &[task(0.3, "running", 0)]));
+        assert_eq!(view.running, Some(0.3));
+        assert!(!fold_tasks(&mut view, &[user_data(1, true, 0)]));
+        assert!(fold_tasks(&mut view, &[task(1.0, "done", 2)]));
+        assert_eq!(view.last.map(|r| r.counts.added), Some(2));
     }
 
     #[test]

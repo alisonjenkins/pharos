@@ -2674,6 +2674,26 @@ pub mod web {
         Ok(())
     }
 
+    /// Scans one library: `POST /Items/{id}/Refresh` with the library's item
+    /// id, an incremental scan of its folder.
+    pub async fn admin_scan_library(
+        base: &str,
+        token: &str,
+        item_id: &str,
+    ) -> Result<(), ClientError> {
+        let resp = Request::post(&format!("{base}/Items/{}/Refresh", urlencode(item_id)))
+            .header("X-Emby-Token", token)
+            .body("")
+            .map_err(|e| ClientError::Http(e.to_string()))?
+            .send()
+            .await
+            .map_err(|e| ClientError::Http(e.to_string()))?;
+        if !resp.ok() {
+            return Err(ClientError::Status(resp.status()));
+        }
+        Ok(())
+    }
+
     pub async fn admin_library_refresh(base: &str, token: &str) -> Result<(), ClientError> {
         let resp = Request::post(&format!("{base}/Library/Refresh"))
             .header("X-Emby-Token", token)

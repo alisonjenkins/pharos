@@ -14,6 +14,7 @@ pub mod player;
 pub mod prefs;
 pub mod quick_connect;
 pub mod remote;
+pub mod scan_progress;
 pub mod search;
 pub mod server_picker;
 

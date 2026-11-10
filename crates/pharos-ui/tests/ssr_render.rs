@@ -467,6 +467,79 @@ fn admin_view_libraries_tab_renders_library_list() {
     assert!(html.contains("tvshows"), "{html}");
 }
 
+fn admin_libraries_scanning() -> Element {
+    use pharos_ui::views::scan_progress::ScanView;
+    let mut scan = ScanView {
+        running: Some(0.42),
+        ..ScanView::default()
+    };
+    scan.libraries.insert("lib-2".into(), 0.5);
+    rsx! {
+        AdminView {
+            users: Vec::<AdminUser>::new(),
+            current_user_id: "1".to_string(),
+            status: None,
+            active_tab: AdminTab::Libraries,
+            libraries: vec![
+                LibraryFolder {
+                    item_id: "lib-1".into(),
+                    name: "Movies".into(),
+                    collection_type: "movies".into(),
+                    locations: vec!["/data/movies".into()],
+                },
+                LibraryFolder {
+                    item_id: "lib-2".into(),
+                    name: "Shows".into(),
+                    collection_type: "tvshows".into(),
+                    locations: vec!["/data/tv".into()],
+                },
+            ],
+            scan,
+            on_action: move |_| {},
+        }
+    }
+}
+
+fn admin_tasks_after_scan() -> Element {
+    use pharos_ui::views::scan_progress::{ScanCounts, ScanEnd, ScanResult, ScanView};
+    rsx! {
+        AdminView {
+            users: Vec::<AdminUser>::new(),
+            current_user_id: "1".to_string(),
+            status: None,
+            active_tab: AdminTab::ScheduledTasks,
+            scan: ScanView {
+                last: Some(ScanResult {
+                    end: ScanEnd::Done,
+                    counts: ScanCounts { added: 3, changed: 1, removed: 0, failed_roots: 0 },
+                }),
+                ..ScanView::default()
+            },
+            on_action: move |_| {},
+        }
+    }
+}
+
+/// FR-701: the whole scan's bar on Libraries, a library's own bar in place
+/// of its Scan button, and a Scan button on the others.
+#[test]
+fn admin_libraries_show_scan_progress_and_a_scan_button_each() {
+    let html = render_root(admin_libraries_scanning);
+    assert!(html.contains("Scanning libraries… 42%"), "{html}");
+    assert!(html.contains(r#"aria-label="Scan Movies""#), "{html}");
+    assert!(!html.contains(r#"aria-label="Scan Shows""#), "{html}");
+    assert!(html.contains("Scanning… 50%"), "{html}");
+}
+
+#[test]
+fn admin_tasks_show_the_last_scans_result() {
+    let html = render_root(admin_tasks_after_scan);
+    assert!(
+        html.contains("Scan finished: added 3, changed 1, removed 0."),
+        "{html}"
+    );
+}
+
 #[test]
 fn admin_view_devices_tab_renders_table_rows() {
     let html = render_root(admin_devices_tab);

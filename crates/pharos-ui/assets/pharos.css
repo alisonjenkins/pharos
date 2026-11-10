@@ -5288,6 +5288,32 @@ body:has(.pharos-stage.is-mini) .pharos-main {
   min-width: 0;
   overflow-wrap: anywhere;
 }
+/* FR-701: the library scan's bar and its result line. */
+.pharos-scan-status {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  margin: 0.5rem 0;
+}
+.pharos-scan-status p {
+  margin: 0;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.pharos-scan-bar {
+  flex: 1 1 8rem;
+  max-width: 24rem;
+  height: 0.5rem;
+  accent-color: var(--px-color-accent);
+}
+.pharos-scan-result[data-end="partial"] p,
+.pharos-scan-result[data-end="failed"] p {
+  color: var(--px-color-danger, var(--px-color-fg));
+}
+.pharos-admin-scan-library {
+  margin-top: 0.5rem;
+  min-height: 2.75rem;
+}
 .pharos-settings-page .pharos-manage-dismiss {
   /* A 44 px target: it is the only way to close the status line. */
   min-width: 2.75rem;

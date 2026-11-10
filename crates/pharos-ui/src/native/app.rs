@@ -1688,7 +1688,9 @@ fn NativeApp(route: Route) -> Element {
     // Bumped by a library change the server pushes; marks by a user data one.
     let library_rev = use_signal(|| 0u32);
     use_context_provider(|| super::live::LibraryRev(library_rev));
-    super::live::use_live_updates(api, marks, library_rev);
+    let scan = use_signal(crate::views::scan_progress::ScanView::default);
+    use_context_provider(|| crate::views::scan_progress::ScanWatch(scan));
+    super::live::use_live_updates(api, marks, library_rev, scan);
     let flash = Flash {
         line: use_signal(|| None),
         generation: use_signal(|| 0),
