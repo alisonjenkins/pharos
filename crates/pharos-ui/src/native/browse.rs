@@ -866,6 +866,9 @@ pub const FILTERS_BUTTON_ID: &str = "pharos-filters-open";
 pub const SORT_BUTTON_ID: &str = "pharos-sort-open";
 /// The id of the sort and filter sheet.
 const FILTER_SHEET_ID: &str = "pharos-filter-sheet";
+/// The id of the pill the sheet opens on: the chosen order, or the chosen
+/// play state.
+const FILTER_SHEET_START: &str = "pharos-filter-start";
 
 /// Material "swap vert" and "filter list" glyphs.
 const ICON_SORT: &str = "M16 17.01V10h-2v7.01h-3L15 21l4-3.99h-3zM9 3 5 6.99h3V14h2V6.99h3L9 3z";
@@ -1068,14 +1071,9 @@ fn FilterSheet(
         (Some(Watched::Watched), watched_label(Watched::Watched)),
     ];
     let stereo = [None, Some(true), Some(false)];
-    // The chosen pill of the group the sheet opened on takes the focus.
-    let focus_on = |first: bool| {
-        move |e: MountedEvent| async move {
-            if first {
-                let _ = e.set_focus(true).await;
-            }
-        }
-    };
+    // The chosen pill of the group the sheet opened on takes the focus once
+    // the sheet is in the page, so a remote starts on what is chosen.
+    use_hook(|| super::focus_after_render(FILTER_SHEET_START.to_owned()));
     rsx! {
         div { class: "pharos-filter-sheet-root",
             div { class: "pharos-sheet-scrim", onclick: move |_| open.set(None) }
@@ -1103,7 +1101,7 @@ fn FilterSheet(
                                 class: "pharos-chip",
                                 r#type: "button",
                                 aria_pressed: "{order == now.order}",
-                                onmounted: focus_on(opened == Opened::Sort && order == now.order),
+                                id: (opened == Opened::Sort && order == now.order).then_some(FILTER_SHEET_START),
                                 onclick: move |_| {
                                     if narrow.read().order != order {
                                         let next = narrow.read().ordered(order);
@@ -1133,7 +1131,7 @@ fn FilterSheet(
                                 class: "pharos-chip",
                                 r#type: "button",
                                 aria_pressed: "{state == now.watched}",
-                                onmounted: focus_on(opened == Opened::Filters && state == now.watched),
+                                id: (opened == Opened::Filters && state == now.watched).then_some(FILTER_SHEET_START),
                                 onclick: move |_| narrow.with_mut(|n| n.watched = state),
                                 "{label}"
                             }
