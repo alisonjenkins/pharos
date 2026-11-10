@@ -45,8 +45,8 @@ use crate::online_enrich::{
     RemoteArt, TextsFetch,
 };
 use crate::series_identity::{
-    log_series_match, record_episode_rejected, record_series_match, EpisodeRejectReason,
-    SeriesMatchOutcome,
+    log_series_match, record_episode_rejected, record_rematch, record_series_match,
+    EpisodeRejectReason, RematchStep, SeriesMatchOutcome,
 };
 use crate::state::Stores;
 use crate::tmdb::TmdbEnricher;
@@ -1854,6 +1854,96 @@ async fn search_decide<E: OnlineEnricher>(
     match_decide(title, year, &candidates, cfg.match_min_confidence)
 }
 
+/// B990 — how far a candidate's year may be from the stated year and still
+/// be read as that year, once a search narrowed by the year found nothing: a
+/// provider dates a show by its first episode, which may be a pilot a year or
+/// two before or after the year the folder or files state.
+const STATED_YEAR_SLACK: u32 = 2;
+
+/// Search for a show and decide among its candidates (V891's
+/// [`match_decide`]), leaving out `excluded` ids.
+///
+/// TVDB's `year` and TMDB's `first_air_date_year` keep only shows the
+/// provider dates that year, so a show stated as 2003 that the provider dates
+/// 2005 is lost (B990). A search narrowed by a year that leaves no candidate
+/// is asked again without it; its candidates are ranked nearest year first,
+/// and one within [`STATED_YEAR_SLACK`] reads as the stated year. On either
+/// search, a candidate whose name is the show's name with that year
+/// (`Show (2003)`) reads as that year too, so it is not lost to a bare exact
+/// name of another year.
+async fn series_search_decide<E: OnlineEnricher>(
+    enricher: &E,
+    series_key: &str,
+    title: &str,
+    year: Option<u32>,
+    excluded: &[String],
+    bg_io: &Arc<Semaphore>,
+    cfg: &MetadataConfig,
+) -> MatchDecision {
+    let search = |y: Option<u32>| async move {
+        let _permit = BgPermit::acquire(bg_io).await;
+        enricher.search(MediaKind::Episode, title, y).await
+    };
+    let keep = |c: &pharos_core::SearchCandidate| !excluded.contains(&c.id);
+    let mut candidates: Vec<pharos_core::SearchCandidate> =
+        search(year).await.into_iter().filter(keep).collect();
+    let mut retried = false;
+    if let (true, Some(y)) = (candidates.is_empty(), year) {
+        candidates = search(None).await.into_iter().filter(keep).collect();
+        retried = true;
+        let found: Vec<String> = candidates
+            .iter()
+            .map(|c| match c.year {
+                Some(cy) => format!("{} ({cy})", c.id),
+                None => format!("{} (no year)", c.id),
+            })
+            .collect();
+        tracing::info!(
+            provider = enricher.provider(),
+            series_key,
+            query = title,
+            year = y,
+            candidates = %found.join(", "),
+            "series match: no candidate with the year, searched again without it"
+        );
+        record_rematch(RematchStep::YearRetry);
+    }
+    let candidates = read_stated_year(title, year, candidates, retried);
+    match_decide(title, year, &candidates, cfg.match_min_confidence)
+}
+
+/// B990 — candidates as [`series_search_decide`] scores them against the
+/// stated `year`: one named `"{title} ({year})"` takes that year, and after a
+/// retry without the year they are ordered nearest year first (the order is
+/// [`match_decide`]'s last tie-break) and one within [`STATED_YEAR_SLACK`]
+/// takes it as well.
+fn read_stated_year(
+    title: &str,
+    year: Option<u32>,
+    mut candidates: Vec<pharos_core::SearchCandidate>,
+    retried: bool,
+) -> Vec<pharos_core::SearchCandidate> {
+    let Some(year) = year else {
+        return candidates;
+    };
+    let named = format!("{title} ({year})");
+    if retried {
+        candidates.sort_by_key(|c| c.year.map_or(u32::MAX, |cy| cy.abs_diff(year)));
+    }
+    for c in &mut candidates {
+        let carries = std::iter::once(&c.title)
+            .chain(&c.aliases)
+            .any(|n| pharos_core::title_similarity(n, &named) >= 1.0);
+        let near = retried
+            && c.year
+                .is_some_and(|cy| cy.abs_diff(year) <= STATED_YEAR_SLACK);
+        if carries || near {
+            c.year = Some(year);
+        }
+    }
+    candidates
+}
+
 /// Insert `art` into `chosen` keyed by its role. When a role is already
 /// present, replace it only if `replace` (used to let bridged TMDB art win
 /// over the matched provider's art per role); otherwise the first wins.
@@ -3634,11 +3724,12 @@ where
     // search+fetch (TvdbEnricher: search_series → get_series; TmdbEnricher:
     // search_tv → tv_detail). No nfo id for a synthesised show, so it always
     // searches.
-    let mut decision = search_decide(
+    let mut decision = series_search_decide(
         enricher,
-        MediaKind::Episode,
+        &cand.series_key,
         &cand.series_name,
         cand.series_year,
+        &[],
         bg_io,
         cfg,
     )
@@ -4034,6 +4125,10 @@ mod tests {
         runs: HashMap<String, crate::online_enrich::SeriesRun>,
         /// `begin_pass` / `end_pass` calls, in order.
         passes: Arc<std::sync::Mutex<Vec<&'static str>>>,
+        /// What a search narrowed by a year answers, when set; else `search`.
+        year_search: Option<Vec<SearchCandidate>>,
+        /// The year each search was narrowed by, in order.
+        years: Arc<std::sync::Mutex<Vec<Option<u32>>>>,
     }
 
     impl FakeEnricher {
@@ -4052,6 +4147,8 @@ mod tests {
                 searched: Default::default(),
                 runs: HashMap::new(),
                 passes: Default::default(),
+                year_search: None,
+                years: Default::default(),
             }
         }
 
@@ -4070,20 +4167,25 @@ mod tests {
                 searched: Default::default(),
                 runs: HashMap::new(),
                 passes: Default::default(),
+                year_search: None,
+                years: Default::default(),
             }
         }
 
         fn with_search(mut self, cands: Vec<(&str, &str, Option<u32>)>) -> Self {
-            self.search = cands
-                .into_iter()
-                .map(|(id, title, year)| SearchCandidate {
-                    id: id.to_string(),
-                    title: title.to_string(),
-                    year,
-                    aliases: Vec::new(),
-                })
-                .collect();
+            self.search = fake_candidates(cands);
             self
+        }
+
+        /// A provider whose year filter is strict: a search narrowed by a
+        /// year answers `cands`, one without answers `with_search`'s.
+        fn with_year_search(mut self, cands: Vec<(&str, &str, Option<u32>)>) -> Self {
+            self.year_search = Some(fake_candidates(cands));
+            self
+        }
+
+        fn years(&self) -> Vec<Option<u32>> {
+            self.years.lock().unwrap().clone()
         }
 
         fn with_detail(mut self, detail: EnrichedMetadata) -> Self {
@@ -4177,6 +4279,18 @@ mod tests {
         }
     }
 
+    fn fake_candidates(cands: Vec<(&str, &str, Option<u32>)>) -> Vec<SearchCandidate> {
+        cands
+            .into_iter()
+            .map(|(id, title, year)| SearchCandidate {
+                id: id.to_string(),
+                title: title.to_string(),
+                year,
+                aliases: Vec::new(),
+            })
+            .collect()
+    }
+
     impl OnlineEnricher for FakeEnricher {
         fn provider(&self) -> &'static str {
             self.provider
@@ -4194,10 +4308,14 @@ mod tests {
             &self,
             _kind: MediaKind,
             _title: &str,
-            _year: Option<u32>,
+            year: Option<u32>,
         ) -> Vec<SearchCandidate> {
             *self.searched.lock().unwrap() += 1;
-            self.search.clone()
+            self.years.lock().unwrap().push(year);
+            match (&self.year_search, year) {
+                (Some(narrowed), Some(_)) => narrowed.clone(),
+                _ => self.search.clone(),
+            }
         }
         async fn fetch(
             &self,
@@ -8270,5 +8388,91 @@ mod tests {
             1
         );
         assert!(logs.text().contains("file_title=Pilot"), "{}", logs.text());
+    }
+
+    /// One episode file of an invented show, as the scanner keys it: the
+    /// folder's `(YYYY)` is its stored year and is not in its name.
+    async fn put_show_episode(
+        store: &SqliteStore,
+        id: u64,
+        folder: &str,
+        (season, episode): (u32, u32),
+        file_show: &str,
+    ) {
+        let base = folder.rsplit('/').next().unwrap_or(folder);
+        let year = pharos_scanner::series_split::stated_show_year(std::path::Path::new(&format!(
+            "{folder}/x.mkv"
+        )))
+        .filter(|_| base.ends_with(')'));
+        let name = match year {
+            Some(y) => base.trim_end_matches(&format!(" ({y})")).to_string(),
+            None => base.to_string(),
+        };
+        let item = MediaItem {
+            id,
+            path: format!(
+                "{folder}/Season {season}/{file_show} - S{season:02}E{episode:02} - Part {episode}.mkv"
+            )
+            .into(),
+            title: format!("Part {episode}"),
+            kind: MediaKind::Episode,
+            series: Some(pharos_core::SeriesInfo {
+                series_name: name,
+                season_number: Some(season),
+                episode_number: Some(episode),
+                series_folder: Some(folder.into()),
+                series_year: year,
+                series_key: None,
+            }),
+            ..MediaItem::default()
+        };
+        store.put(item).await.unwrap();
+    }
+
+    /// B990 — a provider's search narrowed by a year keeps only shows it
+    /// dates that year, so a show stated as 2003 that the provider dates
+    /// 2005 is lost. A year search with no candidate is asked again without
+    /// the year, and its candidates ranked by how near their year is.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_year_search_with_no_candidate_is_asked_again_without_the_year() {
+        use metrics_util::debugging::DebuggingRecorder;
+        let recorder = DebuggingRecorder::new();
+        let snap = pharos_test_metrics::snapshotter(&recorder);
+        let _metrics = metrics::set_default_local_recorder(&recorder);
+        let (logs, _log) = log_capture();
+        let s = store().await;
+        const SHOW: &str = "/tv/Show A (2003)";
+        put_show_episode(&s, 1, SHOW, (1, 1), "Show A (2003)").await;
+        let (_td, cache) = cache();
+        let tvdb = FakeEnricher::tvdb()
+            .with_year_search(vec![])
+            .with_search(vec![
+                ("920001", "Show A", Some(1978)),
+                ("920002", "Show A", Some(2009)),
+                ("920003", "Show A", Some(2005)),
+            ])
+            .with_detail(enriched_overview("A fleet."));
+
+        series_pass(&s, &cache, &tvdb).await;
+
+        assert_eq!(tvdb.years(), [Some(2003), None]);
+        let row = series_row(&s, SHOW).await;
+        assert_eq!(row.match_source.as_deref(), Some("search"));
+        assert_eq!(row.match_external_id.as_deref(), Some("920003"));
+        assert_eq!(
+            counter_value(
+                &snap,
+                "pharos_series_identity_repair_rematch_total",
+                &[("step", "year_retry")]
+            ),
+            1
+        );
+        let text = logs.text();
+        let line = text
+            .lines()
+            .find(|l| l.contains("searched again without it"))
+            .unwrap_or_else(|| panic!("no retry line in {text}"));
+        assert!(line.contains("year=2003"), "{line}");
+        assert!(line.contains("920003 (2005)"), "{line}");
     }
 }
