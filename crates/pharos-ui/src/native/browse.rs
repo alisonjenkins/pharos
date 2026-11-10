@@ -727,9 +727,6 @@ pub fn MixedView(title: String, page: Page, chain: Chain) -> Element {
     }
 }
 
-/// The `<option>` value of "every genre" and "watched or not".
-const ANY: &str = "";
-
 /// The `sessionStorage` key of the last filter bar choice for `library`.
 fn choice_key(library: ItemRef) -> String {
     format!("pharos.library.{library}.choice")
@@ -855,7 +852,95 @@ fn LibraryGrid(first: Page, base: Listing, sets: bool) -> Element {
     }
 }
 
-/// Sort, direction, genre and watched state for a library's grid.
+/// The id of the bar's Filters button, where the focus starts and returns.
+pub const FILTERS_BUTTON_ID: &str = "pharos-filters-open";
+/// The id of the bar's Sort button.
+pub const SORT_BUTTON_ID: &str = "pharos-sort-open";
+/// The id of the sort and filter sheet.
+const FILTER_SHEET_ID: &str = "pharos-filter-sheet";
+
+/// Material "sort" and "filter list" glyphs.
+const ICON_SORT: &str = "M3 18h6v-2H3v2zM3 6v2h18V6H3zm0 7h12v-2H3v2z";
+const ICON_FILTER: &str = "M10 18h4v-2h-4v2zM3 6v2h18V6H3zm3 7h12v-2H6v2z";
+
+/// The words for a direction in `order`: A to Z, or newest first.
+pub fn direction_label(order: Order, descending: bool) -> &'static str {
+    match (order, descending) {
+        (Order::Name, false) => "A to Z",
+        (Order::Name, true) => "Z to A",
+        (_, true) => "Newest first",
+        (_, false) => "Oldest first",
+    }
+}
+
+/// The words for a play state.
+fn watched_label(watched: Watched) -> &'static str {
+    match watched {
+        Watched::Unwatched => "Unwatched",
+        Watched::InProgress => "In progress",
+        Watched::Watched => "Watched",
+    }
+}
+
+/// The words for a 3D choice.
+fn stereo_label(stereo: Option<bool>) -> &'static str {
+    match stereo {
+        None => "2D and 3D",
+        Some(true) => "3D only",
+        Some(false) => "2D only",
+    }
+}
+
+/// One way a [`Narrow`] leaves things out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Facet {
+    Watched,
+    Genre,
+    Stereo,
+}
+
+impl Facet {
+    /// `narrow` with this facet back to everything.
+    pub fn cleared(self, narrow: &Narrow) -> Narrow {
+        let mut next = narrow.clone();
+        match self {
+            Facet::Watched => next.watched = None,
+            Facet::Genre => next.genre = None,
+            Facet::Stereo => next.stereo = None,
+        }
+        next
+    }
+}
+
+/// The filters `narrow` has on, each with the words its pill shows, in
+/// the order the sheet lists them (B1311). The order is not one: it is
+/// on the Sort pill.
+pub fn active_filters(narrow: &Narrow) -> Vec<(Facet, String)> {
+    let mut on = Vec::new();
+    if let Some(watched) = narrow.watched {
+        on.push((Facet::Watched, watched_label(watched).to_owned()));
+    }
+    if let Some(genre) = &narrow.genre {
+        on.push((Facet::Genre, genre.clone()));
+    }
+    if narrow.stereo.is_some() {
+        on.push((Facet::Stereo, stereo_label(narrow.stereo).to_owned()));
+    }
+    on
+}
+
+/// Which group of the sheet takes the focus as it opens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Opened {
+    Sort,
+    Filters,
+}
+
+/// A library grid's sort and filters as one row (B1311/V1282): a Sort
+/// pill naming the order, a Filters pill counting what is on, a pill per
+/// filter on that takes it off, and Reset. Either pill opens the one sheet
+/// that holds every choice, the same on a phone, a desktop and a TV; only
+/// where it sits changes with the screen.
 #[component]
 fn FilterBar(
     narrow: Signal<Narrow>,
@@ -865,123 +950,269 @@ fn FilterBar(
     grouped: Option<Signal<bool>>,
 ) -> Element {
     let now = narrow.read().clone();
-    let genre = now.genre.clone().unwrap_or_default();
-    let played = now.watched.map_or(ANY, watched_token);
-    let stereo = match now.stereo {
-        None => ANY,
-        Some(true) => "3d",
-        Some(false) => "2d",
-    };
-    let direction = match (now.order, now.descending) {
-        (Order::Name, false) => "A to Z",
-        (Order::Name, true) => "Z to A",
-        (_, true) => "Newest first",
-        (_, false) => "Oldest first",
-    };
+    let direction = direction_label(now.order, now.descending);
+    let on = active_filters(&now);
+    let count = on.len();
+    let mut open = use_signal(|| None::<Opened>);
     let mut narrow = narrow;
+    let expanded = open.read().is_some();
     rsx! {
         div { class: "pharos-filters", role: "group", aria_label: "Sort and filter",
-            label { class: "pharos-filter",
-                span { aria_hidden: "true", "Sort" }
-                select {
-                    aria_label: "Sort",
-                    value: now.order.token(),
-                    onchange: move |e| {
-                        if let Some(order) = Order::from_token(&e.value()) {
-                            let next = narrow.read().ordered(order);
-                            narrow.set(next);
-                        }
-                    },
-                    for order in Order::ALL {
-                        option { value: order.token(), selected: order == now.order, "{order.label()}" }
-                    }
-                }
+            button {
+                id: SORT_BUTTON_ID,
+                class: "pharos-chip pharos-filter-pill",
+                r#type: "button",
+                aria_haspopup: "dialog",
+                aria_expanded: "{expanded}",
+                aria_controls: FILTER_SHEET_ID,
+                aria_label: "Sort: {now.order.label()}, {direction}",
+                onclick: move |_| open.set(Some(Opened::Sort)),
+                Icon { path: ICON_SORT }
+                span { "{now.order.label()} · {direction}" }
             }
             button {
-                class: "pharos-button pharos-filter-direction",
+                id: FILTERS_BUTTON_ID,
+                class: "pharos-chip pharos-filter-pill",
+                "data-on": (count > 0).then_some("true"),
                 r#type: "button",
-                aria_label: "Sort direction: {direction}",
-                onclick: move |_| narrow.with_mut(|n| n.descending = !n.descending),
-                "{direction}"
-            }
-            label { class: "pharos-filter",
-                span { aria_hidden: "true", "Genre" }
-                select {
-                    aria_label: "Genre",
-                    value: "{genre}",
-                    onchange: move |e| {
-                        let value = e.value();
-                        narrow.with_mut(|n| n.genre = (value != ANY).then_some(value));
-                    },
-                    option { value: ANY, selected: genre.is_empty(), "All genres" }
-                    for g in genres.read().iter().cloned() {
-                        option { value: "{g}", selected: g == genre, "{g}" }
-                    }
-                    // A chosen genre stays offered while the list reloads.
-                    if !genre.is_empty() && !genres.read().contains(&genre) {
-                        option { value: "{genre}", selected: true, "{genre}" }
-                    }
+                aria_haspopup: "dialog",
+                aria_expanded: "{expanded}",
+                aria_controls: FILTER_SHEET_ID,
+                aria_label: if count == 0 { "Filters".to_owned() } else { format!("Filters, {count} on") },
+                onclick: move |_| open.set(Some(Opened::Filters)),
+                Icon { path: ICON_FILTER }
+                span { "Filters" }
+                if count > 0 {
+                    span { class: "pharos-filter-count", aria_hidden: "true", "{count}" }
                 }
             }
-            label { class: "pharos-filter",
-                span { aria_hidden: "true", "Watched" }
-                select {
-                    aria_label: "Watched",
-                    value: played,
-                    onchange: move |e| {
-                        let value = e.value();
-                        narrow.with_mut(|n| n.watched = watched_of(&value));
+            for (facet, label) in on {
+                button {
+                    key: "{facet:?}",
+                    class: "pharos-chip pharos-filter-pill pharos-filter-on",
+                    r#type: "button",
+                    aria_label: "Remove filter: {label}",
+                    onclick: move |_| {
+                        let next = facet.cleared(&narrow.read());
+                        narrow.set(next);
                     },
-                    option { value: ANY, selected: played == ANY, "All" }
-                    option { value: "unwatched", selected: played == "unwatched", "Unwatched" }
-                    option { value: "in-progress", selected: played == "in-progress", "In progress" }
-                    option { value: "watched", selected: played == "watched", "Watched" }
-                }
-            }
-            label { class: "pharos-filter",
-                span { aria_hidden: "true", "3D" }
-                select {
-                    aria_label: "3D",
-                    value: stereo,
-                    onchange: move |e| {
-                        let value = e.value();
-                        narrow.with_mut(|n| {
-                            n.stereo = match value.as_str() {
-                                "3d" => Some(true),
-                                "2d" => Some(false),
-                                _ => None,
-                            }
-                        });
-                    },
-                    option { value: ANY, selected: stereo == ANY, "2D and 3D" }
-                    option { value: "3d", selected: stereo == "3d", "3D only" }
-                    option { value: "2d", selected: stereo == "2d", "2D only" }
-                }
-            }
-            if let Some(mut grouped) = grouped {
-                label { class: "pharos-filter",
-                    span { aria_hidden: "true", "Collections" }
-                    select {
-                        aria_label: "Collections",
-                        value: if *grouped.read() { "grouped" } else { "films" },
-                        onchange: move |e| {
-                            let on = e.value() == "grouped";
-                            keep_collections(on);
-                            grouped.set(on);
-                        },
-                        option { value: "grouped", selected: *grouped.read(), "Grouped" }
-                        option { value: "films", selected: !*grouped.read(), "Each film" }
-                    }
+                    span { "{label}" }
+                    span { class: "pharos-filter-x", aria_hidden: "true", "✕" }
                 }
             }
             if now != Narrow::default() {
                 button {
-                    class: "pharos-button pharos-button-secondary pharos-filter-reset",
+                    class: "pharos-chip pharos-filter-pill pharos-filter-reset",
                     r#type: "button",
                     onclick: move |_| narrow.set(Narrow::default()),
                     "Reset filters"
                 }
             }
+        }
+        if let Some(opened) = *open.read() {
+            FilterSheet { narrow, genres, grouped, opened, open }
+        }
+    }
+}
+
+/// Every sort and filter choice as a row of pills (B1311/V1282): a bottom
+/// sheet on a phone, a panel at the right on a wider screen or a TV. Pills,
+/// not `<select>`s, so a D-pad walks them like any other control, and the
+/// dialog is modal so it never walks out to the grid behind (V1283). A
+/// choice applies at once; Done, Escape, the remote's Back or a tap
+/// outside closes it and gives the focus back to the pill that opened it.
+#[component]
+fn FilterSheet(
+    narrow: Signal<Narrow>,
+    genres: Signal<Vec<String>>,
+    grouped: Option<Signal<bool>>,
+    opened: Opened,
+    open: Signal<Option<Opened>>,
+) -> Element {
+    super::views::use_modal_hold(".pharos-filter-sheet-root");
+    let mut open = open;
+    let mut narrow = narrow;
+    // The remote's Back closes the sheet and stays on the page.
+    use_hook(move || {
+        std::rc::Rc::new(platform::on_back(move || {
+            let shown = open.peek().is_some();
+            if shown {
+                open.set(None);
+            }
+            shown
+        }))
+    });
+    let now = narrow.read().clone();
+    let genre = now.genre.clone().unwrap_or_default();
+    let mut offered = genres.read().clone();
+    // A chosen genre stays offered while the list reloads.
+    if !genre.is_empty() && !offered.contains(&genre) {
+        offered.insert(0, genre.clone());
+    }
+    let directions = [false, true].map(|d| (d, direction_label(now.order, d)));
+    let watched: [(Option<Watched>, &str); 4] = [
+        (None, "All"),
+        (Some(Watched::Unwatched), watched_label(Watched::Unwatched)),
+        (
+            Some(Watched::InProgress),
+            watched_label(Watched::InProgress),
+        ),
+        (Some(Watched::Watched), watched_label(Watched::Watched)),
+    ];
+    let stereo = [None, Some(true), Some(false)];
+    // The chosen pill of the group the sheet opened on takes the focus.
+    let focus_on = |first: bool| {
+        move |e: MountedEvent| async move {
+            if first {
+                let _ = e.set_focus(true).await;
+            }
+        }
+    };
+    rsx! {
+        div { class: "pharos-filter-sheet-root",
+            div { class: "pharos-sheet-scrim", onclick: move |_| open.set(None) }
+            div {
+                id: FILTER_SHEET_ID,
+                class: "pharos-sheet",
+                role: "dialog",
+                "aria-modal": "true",
+                aria_labelledby: "pharos-filter-sheet-title",
+                onkeydown: move |evt: KeyboardEvent| {
+                    if evt.key() == Key::Named(NamedKey::Escape) {
+                        evt.prevent_default();
+                        evt.stop_propagation();
+                        open.set(None);
+                    }
+                },
+                div { class: "pharos-sheet-head",
+                    h2 { id: "pharos-filter-sheet-title", "Sort and filter" }
+                }
+                div { class: "pharos-sheet-body",
+                    SheetGroup { title: "Sort by",
+                        for order in Order::ALL {
+                            button {
+                                key: "{order.token()}",
+                                class: "pharos-chip",
+                                r#type: "button",
+                                aria_pressed: "{order == now.order}",
+                                onmounted: focus_on(opened == Opened::Sort && order == now.order),
+                                onclick: move |_| {
+                                    if narrow.read().order != order {
+                                        let next = narrow.read().ordered(order);
+                                        narrow.set(next);
+                                    }
+                                },
+                                "{order.label()}"
+                            }
+                        }
+                    }
+                    SheetGroup { title: "Order",
+                        for (descending, label) in directions {
+                            button {
+                                key: "{descending}",
+                                class: "pharos-chip",
+                                r#type: "button",
+                                aria_pressed: "{descending == now.descending}",
+                                onclick: move |_| narrow.with_mut(|n| n.descending = descending),
+                                "{label}"
+                            }
+                        }
+                    }
+                    SheetGroup { title: "Watched",
+                        for (state, label) in watched {
+                            button {
+                                key: "{label}",
+                                class: "pharos-chip",
+                                r#type: "button",
+                                aria_pressed: "{state == now.watched}",
+                                onmounted: focus_on(opened == Opened::Filters && state == now.watched),
+                                onclick: move |_| narrow.with_mut(|n| n.watched = state),
+                                "{label}"
+                            }
+                        }
+                    }
+                    SheetGroup { title: "Genre",
+                        button {
+                            class: "pharos-chip",
+                            r#type: "button",
+                            aria_pressed: "{genre.is_empty()}",
+                            onclick: move |_| narrow.with_mut(|n| n.genre = None),
+                            "All genres"
+                        }
+                        for g in offered {
+                            button {
+                                key: "{g}",
+                                class: "pharos-chip",
+                                r#type: "button",
+                                aria_pressed: "{g == genre}",
+                                onclick: {
+                                    let g = g.clone();
+                                    move |_| {
+                                        let g = g.clone();
+                                        narrow.with_mut(|n| n.genre = Some(g));
+                                    }
+                                },
+                                "{g}"
+                            }
+                        }
+                    }
+                    SheetGroup { title: "3D",
+                        for choice in stereo {
+                            button {
+                                key: "{choice:?}",
+                                class: "pharos-chip",
+                                r#type: "button",
+                                aria_pressed: "{choice == now.stereo}",
+                                onclick: move |_| narrow.with_mut(|n| n.stereo = choice),
+                                "{stereo_label(choice)}"
+                            }
+                        }
+                    }
+                    if let Some(mut grouped) = grouped {
+                        SheetGroup { title: "Collections",
+                            for (on, label) in [(true, "Grouped"), (false, "Each film")] {
+                                button {
+                                    key: "{on}",
+                                    class: "pharos-chip",
+                                    r#type: "button",
+                                    aria_pressed: "{on == *grouped.read()}",
+                                    onclick: move |_| {
+                                        keep_collections(on);
+                                        grouped.set(on);
+                                    },
+                                    "{label}"
+                                }
+                            }
+                        }
+                    }
+                }
+                div { class: "pharos-sheet-foot",
+                    button {
+                        class: "pharos-button pharos-button-secondary",
+                        r#type: "button",
+                        disabled: now == Narrow::default(),
+                        onclick: move |_| narrow.set(Narrow::default()),
+                        "Reset all"
+                    }
+                    button {
+                        class: "pharos-button",
+                        r#type: "button",
+                        onclick: move |_| open.set(None),
+                        "Done"
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// One labelled row of pills in the sort and filter sheet.
+#[component]
+fn SheetGroup(title: &'static str, children: Element) -> Element {
+    rsx! {
+        div { class: "pharos-sheet-group", role: "group", aria_label: title,
+            h3 { aria_hidden: "true", "{title}" }
+            div { class: "pharos-sheet-pills", {children} }
         }
     }
 }
@@ -3965,6 +4196,130 @@ mod tests {
         for (i, a) in targets.iter().enumerate() {
             assert!(!targets[i + 1..].contains(a), "{a}");
         }
+    }
+
+    /// B1311/V1282: the bar is one row of pills, with no `<select>`; the
+    /// Filters pill counts the filters on and each has a pill that takes
+    /// it off. Disarm check: back on the old `<select>` bar, the first
+    /// assertion fails.
+    #[test]
+    fn a_library_filter_row_is_pills_that_count_and_remove_what_is_on() {
+        let html = render(|| {
+            let narrow = use_signal(|| Narrow {
+                watched: Some(Watched::Unwatched),
+                genre: Some("Drama".to_owned()),
+                ..Narrow::default()
+            });
+            let genres = use_signal(Vec::new);
+            rsx! { FilterBar { narrow, genres } }
+        });
+        assert!(!html.contains("<select"), "{html}");
+        assert!(html.contains("aria-label=\"Sort: Name, A to Z\""), "{html}");
+        assert!(html.contains("aria-label=\"Filters, 2 on\""), "{html}");
+        assert!(
+            html.contains("aria-label=\"Remove filter: Unwatched\""),
+            "{html}"
+        );
+        assert!(
+            html.contains("aria-label=\"Remove filter: Drama\""),
+            "{html}"
+        );
+        assert!(html.contains("Reset filters"), "{html}");
+        // The sheet opens only on a press.
+        assert!(!html.contains("aria-modal"), "{html}");
+
+        let bare = render(|| {
+            let narrow = use_signal(Narrow::default);
+            let genres = use_signal(Vec::new);
+            rsx! { FilterBar { narrow, genres } }
+        });
+        assert!(bare.contains("aria-label=\"Filters\""), "{bare}");
+        assert!(!bare.contains("pharos-filter-count"), "{bare}");
+        assert!(!bare.contains("Remove filter"), "{bare}");
+        assert!(!bare.contains("Reset filters"), "{bare}");
+    }
+
+    /// B1311/V1283: the sheet is a modal dialog of pills, the chosen one
+    /// in each group pressed, so a D-pad walks it and stays inside it;
+    /// Collections is offered only on a library that groups box sets.
+    #[test]
+    fn the_filter_sheet_offers_every_choice_as_a_pressed_pill() {
+        let sheet = |grouped: bool| {
+            render(move || {
+                let narrow = use_signal(|| Narrow {
+                    order: Order::Added,
+                    descending: true,
+                    watched: Some(Watched::InProgress),
+                    genre: Some("Gone".to_owned()),
+                    stereo: Some(false),
+                });
+                let genres = use_signal(|| vec!["Comedy".to_owned()]);
+                let open = use_signal(|| Some(Opened::Filters));
+                let grouped = grouped.then(|| use_signal(|| true));
+                rsx! { FilterSheet { narrow, genres, grouped, opened: Opened::Filters, open } }
+            })
+        };
+        let html = sheet(true);
+        assert!(!html.contains("<select"), "{html}");
+        assert!(html.contains("role=\"dialog\""), "{html}");
+        assert!(html.contains("aria-modal=\"true\""), "{html}");
+        let pressed: Vec<&str> = html
+            .split("aria-pressed=\"true\"")
+            .skip(1)
+            .filter_map(|rest| rest.split_once('>').and_then(|(_, t)| t.split('<').next()))
+            .collect();
+        // A chosen genre no longer listed is still offered, and chosen.
+        assert_eq!(
+            pressed,
+            [
+                "Date added",
+                "Newest first",
+                "In progress",
+                "Gone",
+                "2D only",
+                "Grouped"
+            ],
+            "{html}"
+        );
+        for group in ["Sort by", "Order", "Watched", "Genre", "3D", "Collections"] {
+            assert!(
+                html.contains(&format!("aria-label=\"{group}\"")),
+                "{group}: {html}"
+            );
+        }
+        assert!(html.contains("Comedy"), "{html}");
+        assert!(!sheet(false).contains("aria-label=\"Collections\""));
+    }
+
+    #[test]
+    fn each_filter_on_has_a_pill_and_clearing_it_keeps_the_rest() {
+        let narrow = Narrow {
+            order: Order::Released,
+            descending: false,
+            genre: Some("Drama".to_owned()),
+            watched: Some(Watched::Watched),
+            stereo: Some(true),
+        };
+        assert_eq!(
+            active_filters(&narrow),
+            [
+                (Facet::Watched, "Watched".to_owned()),
+                (Facet::Genre, "Drama".to_owned()),
+                (Facet::Stereo, "3D only".to_owned()),
+            ]
+        );
+        let cleared = Facet::Genre.cleared(&narrow);
+        assert_eq!(cleared.genre, None);
+        assert_eq!(
+            Narrow {
+                genre: Some("Drama".to_owned()),
+                ..cleared
+            },
+            narrow
+        );
+        assert!(active_filters(&Narrow::default()).is_empty());
+        assert_eq!(direction_label(Order::Released, false), "Oldest first");
+        assert_eq!(direction_label(Order::Name, true), "Z to A");
     }
 
     /// B1312/V1283: the library tabs' scroll box leaves room for the TV's
