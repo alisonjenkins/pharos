@@ -1464,6 +1464,8 @@ body:has(.pharos-stage.is-full) .pharos-status-note {
 }
 .pharos-playback-failure-actions {
   display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
   gap: 0.75rem;
 }
 .pharos-playback-failure-actions button {
@@ -1475,7 +1477,9 @@ body:has(.pharos-stage.is-full) .pharos-status-note {
   font: inherit;
   cursor: pointer;
 }
-.pharos-playback-failure-actions .pharos-playback-failure-retry {
+/* The way forward leads: Skip past damage when offered (B1160), else Try again. */
+.pharos-playback-failure-actions .pharos-playback-failure-skip,
+.pharos-playback-failure-actions .pharos-playback-failure-retry:first-child {
   background: var(--px-color-accent);
   color: var(--px-color-accent-fg);
 }
