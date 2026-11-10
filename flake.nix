@@ -835,6 +835,19 @@
             # Name the platform, bin and feature: with pharos-tv and its `mobile`
             # feature beside them, dx can no longer infer the target triple.
             dx build --platform web --package pharos-ui --bin pharos-ui-web --features web --release --profile wasm-release --debug-symbols false
+            # The PDF renderer is a second, separate wasm module (quire-pdf,
+            # spec 023 slice 5) that the reader loads only when a PDF is
+            # opened; it is never linked into the main wasm above.
+            cargo build --profile wasm-release --package quire-pdf --lib --target wasm32-unknown-unknown
+            wasm-bindgen --target web --no-typescript --out-dir quire-pdf-pkg --out-name quire_pdf \
+              target/wasm32-unknown-unknown/wasm-release/quire_pdf.wasm
+            # Not --all-features: that enables compact imports and string
+            # references, which Chrome refuses to instantiate. These are what
+            # rustc's wasm32 target emits.
+            wasm-opt -Oz --strip-debug --strip-producers \
+              --enable-bulk-memory --enable-bulk-memory-opt --enable-nontrapping-float-to-int \
+              --enable-sign-ext --enable-mutable-globals --enable-multivalue --enable-reference-types \
+              -o quire-pdf-pkg/quire_pdf_bg.opt.wasm quire-pdf-pkg/quire_pdf_bg.wasm
             runHook postBuild
           '';
           installPhase = ''
@@ -871,6 +884,11 @@
             for f in crates/pharos-ui/assets/vendor/jassub/*; do
               install -Dm644 "$f" "$out/assets/vendor/jassub/$(basename "$f")"
             done
+            # quire-pdf's wasm-bindgen module and the loader script that
+            # starts it (ADR-0047); fetched only when a PDF is opened.
+            install -Dm644 crates/pharos-ui/assets/pdf/loader.js $out/assets/pdf/loader.js
+            install -Dm644 quire-pdf-pkg/quire_pdf.js $out/assets/pdf/quire_pdf.js
+            install -Dm644 quire-pdf-pkg/quire_pdf_bg.opt.wasm $out/assets/pdf/quire_pdf_bg.wasm
             # Subtitle fonts (SIL OFL), each with its licence: Liberation Sans,
             # which pharos-subs draws plain text in (spec 026), and the pack
             # the ASS renderer gets for styled tracks (V530). Each is fetched
