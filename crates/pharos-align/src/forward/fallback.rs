@@ -9,6 +9,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use crate::line::LineSpans;
 use crate::service::{DeviceUsed, Loader, Model, ModelError};
 
 pub const DEVICE_FALLBACK_TOTAL: &str = "pharos_aligner_device_fallback_total";
@@ -126,7 +127,7 @@ impl Model for Fallback {
         pcm: &[f32],
         tokens: &[String],
         lead_star: bool,
-    ) -> Result<Vec<(u64, u64)>, ModelError> {
+    ) -> Result<LineSpans, ModelError> {
         if self.song_on_cpu.is_none() {
             let gpu = &mut self.gpu;
             match catch_unwind(AssertUnwindSafe(|| gpu.align(pcm, tokens, lead_star))) {
@@ -208,18 +209,13 @@ mod tests {
             }
         }
 
-        fn align(
-            &mut self,
-            pcm: &[f32],
-            _: &[String],
-            _: bool,
-        ) -> Result<Vec<(u64, u64)>, ModelError> {
+        fn align(&mut self, pcm: &[f32], _: &[String], _: bool) -> Result<LineSpans, ModelError> {
             self.1.fetch_add(1, Ordering::SeqCst);
             match (self.0, pcm[0]) {
                 ("vulkan", 1.0) => Err(ModelError::Device("device lost".into())),
                 ("vulkan", 2.0) => panic!("queue submit failed"),
-                ("vulkan", _) => Ok(vec![(1, 1)]),
-                _ => Ok(vec![(2, 2)]),
+                ("vulkan", _) => Ok(vec![(1, 1)].into()),
+                _ => Ok(vec![(2, 2)].into()),
             }
         }
     }
@@ -247,7 +243,7 @@ mod tests {
         let ok = [0.0f32];
 
         f.begin_song();
-        assert_eq!(f.align(&ok, &t, false).unwrap(), vec![(1, 1)]);
+        assert_eq!(f.align(&ok, &t, false).unwrap().times, vec![(1, 1)]);
         assert_eq!(f.device().device, "vulkan");
         assert_eq!(
             loads.load(Ordering::SeqCst),
@@ -256,8 +252,8 @@ mod tests {
         );
 
         // An error: this window and the rest of the song go to the CPU.
-        assert_eq!(f.align(&[1.0], &t, false).unwrap(), vec![(2, 2)]);
-        assert_eq!(f.align(&ok, &t, false).unwrap(), vec![(2, 2)]);
+        assert_eq!(f.align(&[1.0], &t, false).unwrap().times, vec![(2, 2)]);
+        assert_eq!(f.align(&ok, &t, false).unwrap().times, vec![(2, 2)]);
         assert_eq!(
             f.device(),
             DeviceUsed {
@@ -268,15 +264,15 @@ mod tests {
 
         // The next song starts on the GPU again; a panic counts like an error.
         f.begin_song();
-        assert_eq!(f.align(&ok, &t, false).unwrap(), vec![(1, 1)]);
-        assert_eq!(f.align(&[2.0], &t, false).unwrap(), vec![(2, 2)]);
+        assert_eq!(f.align(&ok, &t, false).unwrap().times, vec![(1, 1)]);
+        assert_eq!(f.align(&[2.0], &t, false).unwrap().times, vec![(2, 2)]);
 
         // A third error latches: later songs never touch the GPU.
         f.begin_song();
-        assert_eq!(f.align(&[1.0], &t, false).unwrap(), vec![(2, 2)]);
+        assert_eq!(f.align(&[1.0], &t, false).unwrap().times, vec![(2, 2)]);
         let before = gpu_calls.load(Ordering::SeqCst);
         f.begin_song();
-        assert_eq!(f.align(&ok, &t, false).unwrap(), vec![(2, 2)]);
+        assert_eq!(f.align(&ok, &t, false).unwrap().times, vec![(2, 2)]);
         assert_eq!(gpu_calls.load(Ordering::SeqCst), before);
         assert_eq!(
             f.device(),

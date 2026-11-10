@@ -121,8 +121,8 @@ fn assert_matches_torch(ours: &[f32], case: &Case) {
         let mine = Emission::new(ours, case.frames, CLASSES).unwrap();
         for lead in [false, true] {
             assert_eq!(
-                align_line(&mine, case.samples, tokens, lead),
-                align_line(&theirs, case.samples, tokens, lead),
+                align_line(&mine, case.samples, tokens, lead).map(|s| s.times),
+                align_line(&theirs, case.samples, tokens, lead).map(|s| s.times),
                 "{} samples, {tokens:?}, lead {lead}",
                 case.samples
             );
@@ -214,11 +214,11 @@ fn synthetic_song(aligner: &mut pharos_align::forward::CpuAligner) -> Vec<Vec<(u
     let mut out: Vec<Vec<(u64, u64)>> = aligner
         .align_many(&windows, true)
         .into_iter()
-        .map(Result::unwrap)
+        .map(|r| r.unwrap().times)
         .collect();
     for secs in [4, 12, 30, 60] {
         let line = wave(secs * 16_000, secs as u64);
-        out.push(aligner.align(&line, &tokens, false).unwrap());
+        out.push(aligner.align(&line, &tokens, false).unwrap().times);
     }
     out
 }

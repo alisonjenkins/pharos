@@ -8,7 +8,7 @@ mod math;
 pub mod vulkan;
 
 use crate::ctc::Emission;
-use crate::line::align_line;
+use crate::line::{align_line, LineSpans};
 use crate::service::{DeviceUsed, Model, ModelError};
 use crate::tokens::CLASSES;
 
@@ -107,7 +107,7 @@ pub(crate) fn spans(
     samples: usize,
     tokens: &[String],
     lead_star: bool,
-) -> Result<Vec<(u64, u64)>, ModelError> {
+) -> Result<LineSpans, ModelError> {
     let probs = emission(logits);
     let frames = probs.len() / CLASSES;
     tracing::info_span!("aligner.ctc", frames).in_scope(|| {
@@ -131,9 +131,9 @@ impl Model for CpuAligner {
         pcm: &[f32],
         tokens: &[String],
         lead_star: bool,
-    ) -> Result<Vec<(u64, u64)>, ModelError> {
+    ) -> Result<LineSpans, ModelError> {
         if pcm.is_empty() || tokens.is_empty() {
-            return Ok(Vec::new());
+            return Ok(LineSpans::default());
         }
         let logits = self.forward(&[pcm]).pop().unwrap_or_default();
         spans(&logits, pcm.len(), tokens, lead_star)
@@ -143,9 +143,9 @@ impl Model for CpuAligner {
         &mut self,
         windows: &[(&[f32], &[String])],
         lead_star: bool,
-    ) -> Vec<Result<Vec<(u64, u64)>, ModelError>> {
-        let mut out: Vec<Result<Vec<(u64, u64)>, ModelError>> =
-            windows.iter().map(|_| Ok(Vec::new())).collect();
+    ) -> Vec<Result<LineSpans, ModelError>> {
+        let mut out: Vec<Result<LineSpans, ModelError>> =
+            windows.iter().map(|_| Ok(LineSpans::default())).collect();
         let live: Vec<usize> = (0..windows.len())
             .filter(|&i| !windows[i].0.is_empty() && !windows[i].1.is_empty())
             .collect();
@@ -185,9 +185,9 @@ impl Model for VulkanAligner {
         pcm: &[f32],
         tokens: &[String],
         lead_star: bool,
-    ) -> Result<Vec<(u64, u64)>, ModelError> {
+    ) -> Result<LineSpans, ModelError> {
         if pcm.is_empty() || tokens.is_empty() {
-            return Ok(Vec::new());
+            return Ok(LineSpans::default());
         }
         let wave = normalise(pcm);
         let logits = tracing::info_span!(
