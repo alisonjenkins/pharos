@@ -248,6 +248,7 @@ fn effect(intent: Intent, intensity: u8, reason: String) -> LineEffect {
         karaoke: Karaoke::None,
         reason,
         static_only: false,
+        syllables: None,
     }
 }
 

@@ -206,6 +206,7 @@ fn effective(
         karaoke: Karaoke::None,
         reason: String::new(),
         static_only: false,
+        syllables: None,
     };
     let Some(fx) = fx else { return plain };
     let mut fx = fx.clone();
@@ -220,7 +221,7 @@ fn effective(
         }
         EffectsLevel::Full => fx.intensity = fx.intensity.min(3),
     }
-    if line.karaoke.is_none() {
+    if line.karaoke.is_none() && fx.syllables.is_none() {
         fx.karaoke = Karaoke::None;
     }
     if fx.intensity == 0 {
@@ -461,7 +462,7 @@ impl Placer {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
-    use crate::source;
+    use crate::source::{self, Syllable};
     use crate::version::DIRECTOR_VERSION;
 
     const SRT: &str = "1\n00:00:01,000 --> 00:00:03,000\nHello <i>there</i>\n\n2\n00:00:04,000 --> 00:00:05,500\n<i>Slanted</i>\nsecond line\n\n3\n00:00:06,000 --> 00:00:07,000\nThe end\n";
@@ -482,6 +483,7 @@ mod tests {
                     karaoke: Karaoke::None,
                     reason: String::new(),
                     static_only: false,
+                    syllables: None,
                 })
                 .collect(),
         }
@@ -508,6 +510,43 @@ mod tests {
 
     fn dialogue(ass: &str) -> Vec<&str> {
         ass.lines().filter(|l| l.starts_with("Dialogue:")).collect()
+    }
+
+    /// B1212: the plan's own timings fill a line whose source has no `\k`,
+    /// and survive a round trip through the stored JSON.
+    #[test]
+    fn a_plans_syllables_fill_a_line_without_k() {
+        let lines = lines();
+        let mut plan = plain_plan(lines.len());
+        let text = lines[0].text.clone();
+        let (head, tail) = text.split_at(text.find(' ').unwrap() + 1);
+        plan.lines[0].intensity = 1;
+        plan.lines[0].karaoke = Karaoke::Sweep;
+        plan.lines[0].syllables = Some(vec![
+            Syllable {
+                dur_ms: 400,
+                text: head.to_owned(),
+            },
+            Syllable {
+                dur_ms: 600,
+                text: tail.to_owned(),
+            },
+        ]);
+        let json = serde_json::to_string(&plan).unwrap();
+        let plan: EffectPlan = serde_json::from_str(&json).unwrap();
+        let ass = run(&plan, &lines, Tier::Desktop, EffectsLevel::Full);
+        let first = dialogue(&ass)[0];
+        assert!(
+            first.contains("\\kf40}") && first.contains("\\kf60}"),
+            "{first}"
+        );
+        // At the low tier the fill is static.
+        let low = run(&plan, &lines, Tier::Low, EffectsLevel::Full);
+        assert!(!dialogue(&low)[0].contains("\\kf"));
+        // A plan without timings stores none.
+        assert!(!serde_json::to_string(&plain_plan(1))
+            .unwrap()
+            .contains("syllables"));
     }
 
     #[test]
@@ -826,6 +865,7 @@ mod tests {
                                 karaoke: Karaoke::None,
                                 reason: String::new(),
                                 static_only: false,
+                                syllables: None,
                             })
                             .collect(),
                     };

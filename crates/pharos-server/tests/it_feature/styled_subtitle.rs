@@ -80,6 +80,7 @@ async fn rig(sidecar_name: &str, body: &str) -> Rig {
         karaoke: pharos_styling::Karaoke::None,
         reason: "test".into(),
         static_only: false,
+        syllables: None,
     }];
     let (source_mtime, source_size) = signature(&item.path);
     let (sidecar_mtime, sidecar_size) = signature(&sidecar);
