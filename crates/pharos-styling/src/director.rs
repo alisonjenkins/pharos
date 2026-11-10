@@ -45,6 +45,9 @@ const SILENCE_LUFS: f32 = -70.0;
 /// Fewest lines a segment kind needs for its own medians; fewer borrow the
 /// whole track's.
 const MIN_GROUP: usize = 3;
+/// Values a spread needs: with fewer, one odd line sets the quartile and the
+/// margins it widens.
+const MIN_SPREAD: usize = 8;
 /// How far above its median a line must be to shout, for a track whose
 /// dialogue spread is [`REFERENCE_SPREAD_LU`]. Every loudness margin below
 /// is scaled by [`Loudness::scale`] (B1204).
@@ -645,7 +648,7 @@ fn medians(lines: &[SourceLine], kinds: &[Option<SegmentKind>], audio: &[Audio])
 /// quieter half counts, so a track full of real shouts does not widen its
 /// own margins; a wide mix is wide on both sides.
 fn spread(v: &mut [f32]) -> Option<f32> {
-    if v.len() < MIN_GROUP {
+    if v.len() < MIN_SPREAD {
         return None;
     }
     v.sort_by(f32::total_cmp);
@@ -1125,6 +1128,16 @@ mod tests {
             &[],
         );
         assert_eq!((few.loudness.spread_lu, few.loudness.scale), (None, 1.0));
+        // One quiet line among a handful does not widen every margin.
+        let outlier = direct(
+            &[line("a"), line("b"), line("c")],
+            &TrackSignals {
+                lines: vec![sig(-40.0), sig(-23.0), sig(-23.0)],
+                cuts_ms: vec![],
+            },
+            &[],
+        );
+        assert_eq!(outlier.loudness.scale, 1.0);
     }
 
     #[test]
