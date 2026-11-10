@@ -736,9 +736,18 @@ test.describe("pharos Dioxus UI", () => {
 
       // Sideways input still moves the rail and leaves the page: a
       // horizontal wheel or trackpad swipe, then Shift+wheel. The page moved,
-      // so point at the rail again.
+      // so point at the rail again, at the middle of the part still on
+      // screen: the rail's own middle can have scrolled off the top, and a
+      // wheel off the viewport reaches no element. Firefox lands the rail
+      // 30 px higher than Chromium does, which put its middle above the top.
       const moved = await rail.boundingBox();
-      await page.mouse.move(moved!.x + moved!.width / 2, moved!.y + moved!.height / 2);
+      const view = page.viewportSize()!;
+      const shown = {
+        top: Math.max(moved!.y, 0),
+        bottom: Math.min(moved!.y + moved!.height, view.height),
+      };
+      expect(shown.bottom - shown.top, "some of the rail is still on screen").toBeGreaterThan(20);
+      await page.mouse.move(moved!.x + moved!.width / 2, (shown.top + shown.bottom) / 2);
       await frames();
       const y = await page.evaluate(() => window.scrollY);
       await page.mouse.wheel(120, 0);
