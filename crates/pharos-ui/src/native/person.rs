@@ -160,7 +160,7 @@ pub fn PersonView(page: PersonPage) -> Element {
         article { class: "pharos-person",
             div { class: "pharos-person-photo",
                 match &page.image_url {
-                    Some(src) => rsx! { img { src: "{src}", alt: "", decoding: "async" } },
+                    Some(src) => rsx! { img { src: super::platform::art_src(src), alt: "", decoding: "async" } },
                     None => rsx! { div { class: "pharos-person-initials", aria_hidden: "true", "{initials(&page.name)}" } },
                 }
             }
