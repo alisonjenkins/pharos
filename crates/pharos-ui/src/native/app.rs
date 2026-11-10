@@ -7,6 +7,7 @@ use std::rc::Rc;
 
 use dioxus::core::spawn_forever;
 use dioxus::prelude::*;
+use futures_util::FutureExt as _;
 use futures_util::StreamExt as _;
 use pharos_client::api::{
     Detail, Home, Item, ItemKind, ItemRef, NativeApi, NativeGrant, PersonPage, PharosApi as _,
@@ -5087,6 +5088,10 @@ fn play_action(view: View) -> &'static str {
     }
 }
 
+/// A Leave on its way to the server, awaitable by more than one caller.
+type LeaveInFlight =
+    futures_util::future::Shared<futures_util::future::LocalBoxFuture<'static, ()>>;
+
 /// Whether the connection to the server is down and being reopened.
 #[derive(Clone, Copy)]
 pub struct ConnectionLost(pub Memo<bool>);
@@ -5290,6 +5295,9 @@ fn Player(
         try_use_context::<ConnectionLost>().is_some_and(|ConnectionLost(lost)| lost());
     // The group just left, while Leave can be undone (FR-505).
     let left_group = use_signal(|| None::<String>);
+    // The leave in flight, which an Undo waits out so the old leave cannot
+    // land after the new join and end it.
+    let leaving = use_hook(|| Rc::new(RefCell::new(None::<LeaveInFlight>)));
     let undo_shown = use_timed_note(
         left_group.read().as_deref().filter(|_| !group.active),
         activity::UNDO_LEAVE_MS,
@@ -6776,16 +6784,20 @@ fn Player(
         let session = session.clone();
         let id = group.id.clone().filter(|_| group.active);
         let mut left_group = left_group;
+        let leaving = Rc::clone(&leaving);
         move |()| {
             if let Some(session) = session() {
                 left_group.set(id.clone());
-                spawn(async move { session.leave().await });
+                let left = async move { session.leave().await }.boxed_local().shared();
+                *leaving.borrow_mut() = Some(left.clone());
+                spawn(left);
             }
         }
     };
     let on_undo_leave = {
         let together = together.clone();
         let mut left_group = left_group;
+        let leaving = Rc::clone(&leaving);
         move |()| {
             let Some(id) = left_group.take() else {
                 return;
@@ -6797,7 +6809,11 @@ fn Player(
             let mut note = together.note;
             note.set(None);
             platform::info(&format!("pharos: group leave undo group={id}"));
+            let left = leaving.borrow_mut().take();
             spawn_forever(async move {
+                if let Some(left) = left {
+                    left.await;
+                }
                 match session.join(&id).await {
                     Ok(_) => platform::info(&format!(
                         "pharos: group leave undone group={id} outcome=rejoined"
