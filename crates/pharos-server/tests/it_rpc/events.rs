@@ -48,10 +48,18 @@ impl Got {
     }
 }
 
-/// Records each push's size; the first push waits for `Gate` when one is set.
+/// Records each push's size; when a `Gate` is set, the first push says it
+/// arrived and then waits to be let through.
 struct TestSink(mpsc::UnboundedSender<Got>, Rc<RefCell<Vec<usize>>>, Gate);
 
-type Gate = Rc<RefCell<Option<tokio::sync::oneshot::Receiver<()>>>>;
+type Gate = Rc<
+    RefCell<
+        Option<(
+            tokio::sync::oneshot::Sender<()>,
+            tokio::sync::oneshot::Receiver<()>,
+        )>,
+    >,
+>;
 
 impl server::event_sink::Handler for TestSink {
     async fn push(
@@ -60,8 +68,9 @@ impl server::event_sink::Handler for TestSink {
         results: &mut event_sink::PushResults,
     ) -> Result<(), capnp::Error> {
         let gate = self.2.borrow_mut().take();
-        if let Some(gate) = gate {
-            let _ = gate.await;
+        if let Some((arrived, open)) = gate {
+            let _ = arrived.send(());
+            let _ = open.await;
         }
         let events = params.get()?.get_events()?;
         self.1.borrow_mut().push(events.len() as usize);
@@ -577,19 +586,23 @@ async fn a_blocked_sink_lags_and_catches_up_without_a_resync() {
             let s = session_for(&connect(&fx), &fx.user_token).await;
             let sizes = Rc::<RefCell<Vec<usize>>>::default();
             let (open, gate) = tokio::sync::oneshot::channel();
+            let (arrived, held) = tokio::sync::oneshot::channel();
             let (_sub, mut rx) = subscribe_gated(
                 &s,
                 &["userData"],
                 0,
                 Rc::clone(&sizes),
-                Rc::new(RefCell::new(Some(gate))),
+                Rc::new(RefCell::new(Some((arrived, gate)))),
             )
             .await
             .unwrap();
             let head = fx.state.events.head(fx.user_id).unwrap();
             fx.state.events.publish(fx.user_id, vec![played_payload(1)]);
-            // Let the pump take that event and block in the sink.
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            // The burst lands only once the sink holds that first push.
+            tokio::time::timeout(Duration::from_secs(5), held)
+                .await
+                .expect("the first push reaches the sink")
+                .unwrap();
             let library = || pharos_server::services::events::Payload::Library {
                 added: Vec::new(),
                 removed: Vec::new(),
