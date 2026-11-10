@@ -12,5 +12,6 @@
 //! pharos-server at it via `[server].ui_dir` in `config.toml`.
 
 fn main() {
+    pharos_ui::native::register_service_worker();
     dioxus_web::launch::launch_cfg(pharos_ui::App, dioxus_web::Config::new());
 }
