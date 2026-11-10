@@ -16,7 +16,7 @@ use wasm_bindgen::prelude::wasm_bindgen;
 use wasm_bindgen::{JsCast as _, JsValue};
 
 use super::platform;
-use super::reader::{pdf_layout, prerender_index, turn_to, PdfFit, PdfLayout};
+use super::reader::{pdf_layout, prerender_index, turn_to, HostScroll, PdfFit, PdfLayout};
 
 /// The loader script beside the wasm-bindgen module (`flake.nix` installs
 /// both under `assets/pdf`). It defines `window.QuirePdfDocument`.
@@ -275,6 +275,25 @@ impl PdfView {
         self.count
     }
 
+    pub fn fit(&self) -> PdfFit {
+        self.fit.get()
+    }
+
+    /// Where the host is scrolled now.
+    pub fn host_scroll(&self) -> HostScroll {
+        HostScroll {
+            top: f64::from(self.host.scroll_top()),
+            client_height: f64::from(self.host.client_height()),
+            scroll_height: f64::from(self.host.scroll_height()),
+        }
+    }
+
+    /// Scrolls the host by `dy` CSS px.
+    pub fn scroll_by(&self, dy: f64) {
+        self.host
+            .set_scroll_top(self.host.scroll_top() + dy.round() as i32);
+    }
+
     pub fn set_fit(self: &Rc<Self>, fit: PdfFit) {
         if self.fit.replace(fit) != fit {
             self.relayout();
@@ -310,7 +329,14 @@ impl PdfView {
             self.spare.borrow_mut().drawn = None;
         }
         self.index.set(to);
-        self.host.set_scroll_top(0);
+        // Going back lands at the foot of a tall page, where the reader left
+        // it; going forward starts at the head.
+        let top = if !forward && self.fit.get() == PdfFit::Width {
+            self.host.scroll_height()
+        } else {
+            0
+        };
+        self.host.set_scroll_top(top);
         self.prerender_later();
         Ok(true)
     }
