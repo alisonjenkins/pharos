@@ -1000,6 +1000,14 @@ pub fn on_page_hide(_on_hide: impl FnMut() + 'static) -> PageHide {
     PageHide
 }
 
+pub fn turn_begin(_item: &str, _dir: super::turn::Direction) -> bool {
+    false
+}
+pub fn turn_expect(_item: &str, _dir: super::turn::Direction) {}
+pub fn turn_open(_item: &str) {}
+pub fn turn_ready(_item: &str, _image: Option<&str>, _title: &str) {}
+pub fn turn_cancel(_item: &str, _reason: &str) {}
+
 pub struct PageLifecycle;
 
 pub fn on_page_lifecycle(
