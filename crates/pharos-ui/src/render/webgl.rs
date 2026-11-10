@@ -26,6 +26,11 @@ const MAX_PIXEL_RATIO: f64 = 1.25;
 /// for its CSS look. A GPU reset or switch restores in well under this.
 const RESTORE_WAIT_MS: f64 = 5000.0;
 
+/// Frames between reads of the canvas's box: a read forces a layout when
+/// the page has changed, which cost the TV 30-47 ms a second read every
+/// frame (B1219, V1179). A resize shows within half a second.
+const BOX_READ_FRAMES: u32 = 30;
+
 type Listener = Closure<dyn FnMut(web_sys::Event)>;
 
 /// Where the context is, as its events report it, with when it was lost
@@ -72,6 +77,9 @@ pub struct WebglSurface {
     lose: Option<web_sys::WebglLoseContext>,
     /// The share of the pixel ratio drawn at (B1218, V1178).
     resolution: Resolution,
+    /// The canvas's CSS box as last read, and frames since.
+    client: (i32, i32),
+    since_read: u32,
 }
 
 pub fn open(canvas_id: &str, program: Program) -> Result<Box<dyn Surface>, Fallback> {
@@ -152,6 +160,8 @@ pub fn open(canvas_id: &str, program: Program) -> Result<Box<dyn Surface>, Fallb
         listeners,
         lose,
         resolution: Resolution::default(),
+        client: (0, 0),
+        since_read: BOX_READ_FRAMES,
     }))
 }
 
@@ -279,16 +289,17 @@ impl WebglSurface {
                 .into(),
             );
         }
+        if self.since_read >= BOX_READ_FRAMES {
+            self.client = (self.canvas.client_width(), self.canvas.client_height());
+            self.since_read = 0;
+        }
+        self.since_read += 1;
         let ratio = web_sys::window()
             .map_or(1.0, |w| w.device_pixel_ratio())
             .min(MAX_PIXEL_RATIO)
             * self.resolution.scale();
-        let width = (f64::from(self.canvas.client_width()) * ratio)
-            .round()
-            .max(1.0) as u32;
-        let height = (f64::from(self.canvas.client_height()) * ratio)
-            .round()
-            .max(1.0) as u32;
+        let width = (f64::from(self.client.0) * ratio).round().max(1.0) as u32;
+        let height = (f64::from(self.client.1) * ratio).round().max(1.0) as u32;
         if self.canvas.width() != width {
             self.canvas.set_width(width);
         }
