@@ -2109,12 +2109,9 @@ pub(super) fn version_denial(e: crate::services::playback::VersionError) -> Deni
 /// The packing a tile badges: the primary's, else the first 3D edition's,
 /// so the badge agrees with the store's `has_3d` (V720).
 fn item_stereo(item: &MediaItem) -> Option<Video3DFormat> {
-    item.probe.video_3d_format.or_else(|| {
-        item.probe
-            .alternate_sources
-            .iter()
-            .find_map(|a| a.video_3d_format)
-    })
+    item.probe
+        .video_3d_format
+        .or_else(|| item.probe.versions().find_map(|a| a.video_3d_format))
 }
 
 fn wire_stereo(format: Option<Video3DFormat>) -> Stereo3d {
@@ -2129,7 +2126,7 @@ fn wire_stereo(format: Option<Video3DFormat>) -> Stereo3d {
 }
 
 fn version_count(item: &MediaItem) -> u32 {
-    u32::try_from(item.probe.alternate_sources.len())
+    u32::try_from(item.probe.versions().count())
         .unwrap_or(u32::MAX)
         .saturating_add(1)
 }
@@ -2146,7 +2143,7 @@ fn write_versions(
     primary.set_primary(true);
     primary.set_stereo(wire_stereo(item.probe.video_3d_format));
     write_version_facts(primary, &item.probe, &item.path, admin);
-    for (i, alt) in (1..out.len()).zip(&item.probe.alternate_sources) {
+    for (i, alt) in (1..out.len()).zip(item.probe.versions()) {
         let mut v = out.reborrow().get(i);
         v.set_id(alt.id.as_str());
         v.set_name(alt.name.as_deref().unwrap_or_default());

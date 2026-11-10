@@ -79,7 +79,7 @@ fn group_dto(versions: Vec<&MediaItem>) -> DuplicateGroupDto {
                 height: m.probe.height,
                 video_codec: m.probe.video_codec.clone(),
                 date_added: m.created_at,
-                edition_count: m.probe.alternate_sources.len(),
+                edition_count: m.probe.versions().count(),
             })
             .collect(),
     }
