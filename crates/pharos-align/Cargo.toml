@@ -9,6 +9,7 @@ description = "CTC forced alignment of lyric words to MMS_FA emissions, matching
 
 [dependencies]
 actix-web.workspace = true
+gemm = "0.19"
 memmap2 = "0.9"
 metrics.workspace = true
 metrics-exporter-prometheus.workspace = true
@@ -16,6 +17,7 @@ metrics-process.workspace = true
 opentelemetry.workspace = true
 opentelemetry-otlp.workspace = true
 opentelemetry_sdk.workspace = true
+rayon = "1"
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 thiserror.workspace = true
