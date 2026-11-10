@@ -353,6 +353,31 @@ aligner:
     enabled: false
     size: 1Gi
     storageClass: ""
+  # A second aligner for the shadow comparison (R21), e.g. the Rust image
+  # beside the Python one. The server calls it once
+  # [lyrics].aligner_shadow_url is wired (T039-24).
+  shadow:
+    enabled: false
+    image:
+      repository: ghcr.io/alisonjenkins/pharos-aligner-rs
+      tag: ""
+      pullPolicy: IfNotPresent
+    device: ""
+    resources:
+      requests:
+        cpu: 500m
+        memory: 2Gi
+      limits:
+        memory: 4Gi
+    gpu:
+      enabled: false
+      resourceName: devic.es/dri
+      count: 1
+      supplementalGroups: []
+    cache:
+      enabled: false
+      size: 1Gi
+      storageClass: ""
 
 # pharos-ui sidecar: the old angie image serving the bundle under /ui/.
 # Superseded by ADR-0033 (pharos serves the UI itself via config.server.uiDir);
