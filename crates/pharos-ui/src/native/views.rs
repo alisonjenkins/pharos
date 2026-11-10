@@ -255,8 +255,11 @@ pub fn Shell(
 pub fn LibraryNav(libraries: Vec<Item>, current: Option<ItemRef>) -> Element {
     // The lit tab can sit past the edge of a phone's row, and a library's
     // grid has no heading of its own to say where it is (B1313).
-    use_effect(use_reactive!(|current| {
-        if current.is_some() {
+    // The libraries can arrive after the trail, so the row's arrival
+    // counts as well as a new current library.
+    let listed = libraries.len();
+    use_effect(use_reactive!(|current, listed| {
+        if current.is_some() && listed > 0 {
             platform::reveal_across(".pharos-library-tab[aria-current='page']");
         }
     }));
