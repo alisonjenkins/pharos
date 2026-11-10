@@ -1,6 +1,6 @@
 # Spec 036: read books offline
 
-- **Status:** draft, choices with Alison
+- **Status:** draft; choice 1 decided 2026-11-10 (all three, configurable)
 - **Created:** 2026-11-10T06:00:00Z
 - **Input:** "I want the option of allowing the user to read offline if they are
   reading on the train and they go through a tunnel. They would need the wasm
@@ -84,16 +84,32 @@ read, not when it reached the server.
   are logged with item ids; the server counts late (client-timed) saves and
   how many lost to a newer position.
 
-## Choices for Alison
+## Decisions
 
-1. **Which books are on the device.** (a) Only those you choose with "Keep
-   offline" (recommended: predictable, no surprise storage use). (b) Also the
-   book you are reading now, kept automatically while it is open and for a
-   while after. (c) The last N opened, automatically.
-2. **Offline app start (US3) now or later.** Doing US1 alone is small and
-   fixes the tunnel with the tab still open. US2 and US3 need the service
-   worker, which every page of pharos then goes through. Recommended: US1
-   first as its own PR, then US2 and US3 together.
+1. **Which books are on the device: all three, configurable** (Alison,
+   2026-11-10T07:01Z: "a and b and c I think. It should be configurable").
+   Settings, per device (local, not synced, since storage is per device):
+   - **Keep offline** on the title page is always offered (a).
+   - **Keep the book I'm reading** (b), default on: the open book is kept
+     while it is open and for 7 days after it was last opened.
+   - **Keep my last N books** (c), default off, N from 1 to 10 (default 3).
+   - **Space for automatic books**, default 512 MiB. Books kept by (b) or (c)
+     are removed oldest-opened first when over it. Books kept by hand (a) are
+     never removed automatically and do not count against it.
+   - The 64 MiB weak-device cap still applies to every kept book.
+   - The "On this device" list shows why each book is kept (by hand, reading
+     now, recent).
+   Defaults and the 512 MiB / 7 day figures are mine, not Alison's; she can
+   change them.
+2. **Order:** save queue first (slice 1, #1172), then the service worker
+   (slice 2), then keeping books (slice 3).
+
+- **FR-008** Automatic keeping (b, c) runs only after a book has opened
+  successfully and never re-downloads a book already fetched for reading:
+  the bytes already in memory are written to the cache.
+- **FR-009** Settings live under Settings, "Offline reading", and are read
+  on each book open, so a change applies without a reload. Turning (b) or
+  (c) off removes the books it kept on the next open of the list or reader.
 
 ## Slices
 
@@ -102,3 +118,4 @@ read, not when it reached the server.
 | 1 | Offline save queue + client read time (FR-001, FR-002) | schema bump, UI queue, server newest-wins |
 | 2 | Service worker for the shell (FR-003) | sw.js, bundle hash, CSP check |
 | 3 | Keep offline + On this device (FR-004–FR-006) | Cache Storage, title page, settings list |
+| 4 | Automatic keeping (FR-008, FR-009) | reading-now and last-N policies, space budget, settings |
