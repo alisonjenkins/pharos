@@ -5560,6 +5560,10 @@ fn Player(
     // provided it.
     let account = try_use_context::<AccountMe>();
     let wait_logged = use_hook(|| Rc::new(RefCell::new(String::new())));
+    // The first `canplay` has checked that autoplay started (038 FR-407),
+    // and whether the browser refused it and waits for a tap.
+    let autoplay_checked = use_hook(|| Rc::new(Cell::new(false)));
+    let mut autoplay_refused = use_signal(|| false);
     // How "Up next" was last shown, for its decision line.
     let up_next_mode = use_hook(|| Rc::new(Cell::new(None::<&'static str>)));
     use_future({
@@ -5572,6 +5576,10 @@ fn Player(
                 let (mut since, mut asked_at, mut gave_up) = (None::<u64>, 0u64, false);
                 loop {
                     platform::sleep_ms(1_000).await;
+                    let refused = platform::autoplay_blocked() && media.peek().paused;
+                    if *autoplay_refused.peek() != refused {
+                        autoplay_refused.set(refused);
+                    }
                     let now = now_ms_u64();
                     if !(media.peek().loading && failed.peek().is_none()) {
                         (since, gave_up) = (None, false);
@@ -6401,9 +6409,22 @@ fn Player(
         let resume = Rc::clone(&resume);
         let music = p.kind == ItemKind::Audio;
         let was_paused = was_paused.clone();
+        let autoplays = autoplay_after(grouped, start_paused);
+        let autoplay_checked = Rc::clone(&autoplay_checked);
         move |event: MediaEvent| {
             if retiring.get() {
                 return;
+            }
+            // The `autoplay` attribute fails silently when the browser
+            // refuses it; a `play()` of our own at the first `canplay` reads
+            // the refusal, so the player can say "Tap to start" (038 FR-407).
+            if matches!(event, MediaEvent::CanPlay)
+                && autoplays
+                && !*started.peek()
+                && !autoplay_checked.replace(true)
+                && platform::media_state(VIDEO_ID).paused
+            {
+                platform::play(VIDEO_ID);
             }
             let resumed = match event {
                 MediaEvent::Playing => {
@@ -7039,6 +7060,7 @@ fn Player(
             ..media_rest()
         },
         wait_caption,
+        tap_to_start: autoplay_refused(),
         runtime_ms: p.detail.item.runtime_ms,
         chapters: p.detail.chapters.clone(),
         segments: p.detail.segments.clone(),
