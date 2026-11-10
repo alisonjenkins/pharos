@@ -18,6 +18,7 @@ pub mod source;
 mod tags;
 mod text;
 pub mod theme;
+mod timing;
 pub mod version;
 
 pub use compile::compile;

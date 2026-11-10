@@ -93,7 +93,7 @@ proptest! {
         cuts in prop::collection::vec(0u64..110_000, 0..6),
         segs in prop::collection::vec(seg(), 0..4),
     ) {
-        let d = direct(&lines, &TrackSignals { lines: sigs, cuts_ms: cuts.clone(), bottom_text: vec![] }, &segs);
+        let d = direct(&lines, &TrackSignals { lines: sigs, cuts_ms: cuts.clone(), bottom_text: vec![], sung: vec![] }, &segs);
         prop_assert_eq!(d.plan.lines.len(), lines.len());
         prop_assert_eq!(d.counts.values().sum::<usize>(), lines.len());
         for (i, fx) in d.plan.lines.iter().enumerate() {
