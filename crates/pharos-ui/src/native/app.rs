@@ -2937,8 +2937,14 @@ fn MyDevicesScreen() -> Element {
         let Some(api) = api else {
             return;
         };
+        let loaded_on = *connection.peek();
         spawn(async move {
-            match api.my_devices(&call("my_devices", "my_devices")).await {
+            let result = api.my_devices(&call("my_devices", "my_devices")).await;
+            if *connection.peek() != loaded_on {
+                platform::warn("my_devices: device list answered after the connection changed; ignored");
+                return;
+            }
+            match result {
                 Ok(devices) => state.set(MyDevicesState::Loaded(devices)),
                 Err(e) => {
                     report(&e, "my devices");
