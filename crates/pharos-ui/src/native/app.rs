@@ -2941,7 +2941,9 @@ fn MyDevicesScreen() -> Element {
         spawn(async move {
             let result = api.my_devices(&call("my_devices", "my_devices")).await;
             if *connection.peek() != loaded_on {
-                platform::warn("my_devices: device list answered after the connection changed; ignored");
+                platform::warn(
+                    "my_devices: device list answered after the connection changed; ignored",
+                );
                 return;
             }
             match result {
