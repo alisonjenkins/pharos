@@ -491,7 +491,7 @@ struct ClientSpan {
 }
 struct ReportResult { union { reportId @0 :Text; error @1 :Error; } }
 struct ReportSummary {         # one stored problem report, without its bundle. Since schemaVersion 35.
-  id @0 :Text; receivedWallMs @1 :UInt64; userName @2 :Text; note @3 :Text; bytes @4 :UInt64;
+  id @0 :Text; receivedWallMs @1 :UInt64; userName @2 :Text; note @3 :Text $secret; bytes @4 :UInt64;
 }
 struct ReportListResult { union { reports @0 :List(ReportSummary); error @1 :Error; } }
 struct ReportDocumentResult { union { document @0 :Data; error @1 :Error; } }   # the stored JSON document

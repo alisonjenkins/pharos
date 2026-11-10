@@ -92,6 +92,17 @@ impl server::telemetry::Handler for TelemetryBoot {
         results.get().init_result().set_report_id("ABCD-EFGH");
         std::future::ready(Ok(()))
     }
+
+    fn list_reports(
+        self: Rc<Self>,
+        _params: telemetry::ListReportsParams,
+        results: &mut telemetry::ListReportsResults,
+    ) -> impl Future<Output = Result<(), capnp::Error>> {
+        let mut row = results.get().init_result().init_reports(1).get(0);
+        row.set_id("ABCD-EFGH");
+        row.set_note(REPORT_NOTE);
+        std::future::ready(Ok(()))
+    }
 }
 
 impl server::playback_grant::Handler for GrantBoot {
@@ -221,6 +232,11 @@ fn call_all() -> Observed {
             r.get().set_bundle(REPORT_BUNDLE.as_bytes());
             r.send().promise.await.unwrap();
 
+            // The note comes back in a listing too.
+            let mut r = tel.list_reports_request();
+            fill_ctx(r.get().init_ctx());
+            r.send().promise.await.unwrap();
+
             let grant: playback_grant::Client =
                 server::playback_grant::client(GrantBoot, &Connection::new());
             let mut r = grant.decision_request();
@@ -248,7 +264,7 @@ fn call_all() -> Observed {
 
 /// Each method listed here is called by `call_all`. A `$secret` added to
 /// another method fails this until the test calls it too.
-const COVERED: [(&str, &str); 11] = [
+const COVERED: [(&str, &str); 12] = [
     ("bootstrap", "resume"),
     ("bootstrap", "login"),
     ("bootstrap", "quick_connect_initiate"),
@@ -256,6 +272,7 @@ const COVERED: [(&str, &str); 11] = [
     ("bootstrap", "submit_anonymous"),
     ("telemetry", "submit"),
     ("telemetry", "report"),
+    ("telemetry", "list_reports"),
     ("playback_grant", "decision"),
     ("session", "change_password"),
     ("session", "media_token"),
@@ -298,7 +315,7 @@ fn secrets_never_reach_logs_or_spans() {
         .collect();
     assert_eq!(
         payloads.len(),
-        22,
+        24,
         "a request and a response per call:\n{}",
         o.logs
     );
