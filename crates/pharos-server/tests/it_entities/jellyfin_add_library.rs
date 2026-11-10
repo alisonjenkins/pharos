@@ -38,7 +38,7 @@ async fn seed(admin: bool) -> (web::Data<AppState>, String, UserId) {
     // Two movies under /media/movies, one episode under /media/tv, one book
     // under /media/books.
     for (id, path, kind) in [
-        (1u64, "/media/movies/Warcraft.mkv", MediaKind::Movie),
+        (1u64, "/media/movies/Film AO.mkv", MediaKind::Movie),
         (2, "/media/movies/Dune.mkv", MediaKind::Movie),
         (3, "/media/tv/Show/S01E01.mkv", MediaKind::Episode),
         (4, "/media/books/Dune.epub", MediaKind::Book),

@@ -33,8 +33,8 @@ async fn seed() -> (web::Data<AppState>, String, UserId) {
     let token = stores.issue(uid, "test").await.unwrap();
 
     for (id, kind, title) in [
-        (200_u64, MediaKind::Movie, "Blade Runner"),
-        (201, MediaKind::Movie, "Blade Runner 2049"),
+        (200_u64, MediaKind::Movie, "Blank Canvas"),
+        (201, MediaKind::Movie, "Blank Canvas 2049"),
         (202, MediaKind::Audio, "Vangelis - Tales of the Future"),
         (203, MediaKind::Episode, "The Expanse - S01E01"),
     ] {
@@ -75,7 +75,7 @@ async fn search_hints_requires_auth() {
     let (state, _t, _u) = seed().await;
     let app = test::init_service(build_app(state)).await;
     let req = test::TestRequest::get()
-        .uri("/Search/Hints?searchTerm=blade")
+        .uri("/Search/Hints?searchTerm=blank")
         .to_request();
     let resp = test::call_service(&app, req).await;
     assert_eq!(resp.status(), 401);
@@ -86,7 +86,7 @@ async fn search_hints_matches_title_substring_case_insensitive() {
     let (state, token, _u) = seed().await;
     let app = test::init_service(build_app(state)).await;
     let req = test::TestRequest::get()
-        .uri("/Search/Hints?searchTerm=BLADE")
+        .uri("/Search/Hints?searchTerm=BLANK")
         .insert_header(("X-Emby-Token", token.as_str()))
         .to_request();
     let body = test::call_and_read_body(&app, req).await;
@@ -97,14 +97,14 @@ async fn search_hints_matches_title_substring_case_insensitive() {
     let names: Vec<&str> = hints.iter().map(|h| h["Name"].as_str().unwrap()).collect();
     assert!(names
         .iter()
-        .all(|n| n.to_ascii_lowercase().contains("blade")));
+        .all(|n| n.to_ascii_lowercase().contains("blank")));
     // Hint shape: ItemId + Id duplicated, Type + MediaType present.
     let first = &hints[0];
     assert!(first["ItemId"].is_string());
     assert_eq!(first["ItemId"], first["Id"]);
     assert!(first["Type"].is_string());
     assert!(first["MediaType"].is_string());
-    assert_eq!(first["MatchedTerm"], "BLADE");
+    assert_eq!(first["MatchedTerm"], "BLANK");
 }
 
 #[actix_web::test]
@@ -201,7 +201,7 @@ async fn search_hints_lowercase_alias_also_works() {
     let (state, token, _u) = seed().await;
     let app = test::init_service(build_app(state)).await;
     let req = test::TestRequest::get()
-        .uri("/search/hints?searchTerm=blade")
+        .uri("/search/hints?searchTerm=blank")
         .insert_header(("X-Emby-Token", token.as_str()))
         .to_request();
     let body = test::call_and_read_body(&app, req).await;
@@ -234,11 +234,11 @@ async fn search_matches_series_name_not_just_title() {
     stores
         .put(MediaItem {
             id: 900,
-            path: "/m/TV/Code Geass/Season 1/e01.mkv".into(),
+            path: "/m/TV/Show U/Season 1/e01.mkv".into(),
             title: "The C's World".into(),
             kind: MediaKind::Episode,
             series: Some(pharos_core::SeriesInfo {
-                series_name: "Code Geass".into(),
+                series_name: "Show U".into(),
                 season_number: Some(1),
                 episode_number: Some(1),
                 ..Default::default()
@@ -270,13 +270,13 @@ async fn search_matches_series_name_not_just_title() {
             serde_json::from_slice::<serde_json::Value>(&body).unwrap()
         }
     };
-    let hints = get("/Search/Hints?searchTerm=Code%20Geass&limit=20".into()).await;
+    let hints = get("/Search/Hints?searchTerm=Show%20U&limit=20".into()).await;
     assert_eq!(
         hints["TotalRecordCount"].as_u64(),
         Some(1),
         "Search/Hints must match series_name: {hints}"
     );
-    let items = get("/Items?SearchTerm=Code%20Geass&Recursive=true".into()).await;
+    let items = get("/Items?SearchTerm=Show%20U&Recursive=true".into()).await;
     assert_eq!(
         items["TotalRecordCount"].as_u64(),
         Some(1),
@@ -293,7 +293,7 @@ async fn search_hints_skip_entity_tables_for_a_short_term() {
     let (state, token, _u) = seed().await;
     state
         .stores
-        .link_item_tags(200, &["Bl".to_string(), "Blades".to_string()])
+        .link_item_tags(200, &["Bl".to_string(), "Blanks".to_string()])
         .await
         .unwrap();
     let app = test::init_service(build_app(state)).await;
@@ -335,7 +335,7 @@ async fn search_hints_skip_entity_tables_for_a_short_term() {
     );
     let long = kinds("bla").await;
     assert!(
-        long.contains(&("Tag".to_string(), "Blades".to_string())),
+        long.contains(&("Tag".to_string(), "Blanks".to_string())),
         "three letters list the tag: {long:?}"
     );
 }

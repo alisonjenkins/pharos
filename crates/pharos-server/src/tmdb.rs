@@ -1110,18 +1110,18 @@ mod tests {
     #[test]
     fn tmdb_parse_tv_search_yields_candidates_from_name_and_first_air_date() {
         let body = r#"{"results":[
-            {"id":1396,"name":"Breaking Bad","first_air_date":"2008-01-20"},
+            {"id":931396,"name":"Show X","first_air_date":"2008-01-20"},
             {"id":94997,"name":"House of the Dragon","first_air_date":"2022-08-21"}]}"#;
         let c = super::parse_tv_search(body);
         assert_eq!(c.len(), 2);
-        assert_eq!(c[0].id, "1396");
-        assert_eq!(c[0].title, "Breaking Bad");
+        assert_eq!(c[0].id, "931396");
+        assert_eq!(c[0].title, "Show X");
         assert_eq!(c[0].year, Some(2008));
     }
 
     #[test]
     fn tmdb_parse_tv_detail_extracts_overview_genres_art() {
-        let body = r#"{"id":1396,"overview":"A high school chemistry teacher...",
+        let body = r#"{"id":931396,"overview":"A high school chemistry teacher...",
             "first_air_date":"2008-01-20","vote_average":8.9,
             "genres":[{"name":"Drama"},{"name":"Crime"}],
             "poster_path":"/tv_p.jpg","backdrop_path":"/tv_b.jpg"}"#;

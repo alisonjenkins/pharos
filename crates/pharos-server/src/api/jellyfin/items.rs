@@ -2663,7 +2663,7 @@ async fn playback_info(
     // jellyfin-web names none and trusts the server's pick (it only appends
     // `AudioStreamIndex` after a manual switch). So the pick that sets
     // `DefaultAudioStreamIndex` was shown selected in the UI while the audio
-    // rendition played the default track: Aliens (three Ukrainian tracks ahead
+    // rendition played the default track: Film AL (three Ukrainian tracks ahead
     // of its English DTS-HD MA) selected English yet played Ukrainian; Campfire
     // (English default ahead of Japanese) selected Japanese yet played English.
     // The index is ABSOLUTE — the same form the client sends on a switch and
@@ -3933,7 +3933,7 @@ async fn list_user_items(
     // `IncludeItemTypes=Series` (or `Season`) browse collapses the scoped
     // episodes into synthetic folder tiles. jellyfin-web's TV-library grid and
     // its "Shows" view both issue this; without the collapse they'd render one
-    // tile per episode instead of one per show, so a series like Code Geass
+    // tile per episode instead of one per show, so a series like Show U
     // never appears as a browsable entry.
     if let Some(resp) = maybe_list_virtual_shows(&state, user.0.id, &user.0.policy, &q).await? {
         return Ok(resp);
@@ -4776,7 +4776,7 @@ pub(crate) fn build_media_query(
     // Season parent) has no meaningful "SortName": ordering by episode TITLE
     // alphabetises the season. Google TV pages a season via
     // /Items?ParentId=<season>&IncludeItemTypes=Episode with NO SortBy, so it
-    // fell through to the SortName default and showed Neon Genesis Evangelion
+    // fell through to the SortName default and showed Show AL
     // S1 as E7 "A Human Work", E3 "A Transfer", E18 "Ambivalence"… (alphabetical).
     // Reused by the explicit-`ParentIndexNumber,IndexNumber` branch below.
     let episode_scoped = mq.kinds.iter().any(|k| matches!(k, MediaKind::Episode))
@@ -6158,7 +6158,7 @@ pub(crate) async fn virtual_shows_page(
 
     // Reuse the full parent/search scoping the media query already implements:
     // fetch the matching EPISODES unpaged, then collapse them in memory. The
-    // SearchTerm→series_name match means a `SearchTerm=Code Geass` browse
+    // SearchTerm→series_name match means a `SearchTerm=Show U` browse
     // narrows to that show before collapsing.
     let parent = resolve_parent_filter(state, parent_id)
         .await
@@ -7740,7 +7740,7 @@ mod audio_index_url_tests {
 
     #[test]
     fn appends_server_selected_index_when_url_has_none() {
-        // Aliens: three Ukrainian tracks then English at absolute index 4. The
+        // Film AL: three Ukrainian tracks then English at absolute index 4. The
         // server selects 4, but the initial URL carried no AudioStreamIndex, so
         // the audio rendition played the container default (Ukrainian). The
         // pick must ride the URL.
@@ -7871,20 +7871,20 @@ mod similarity_score_tests {
 
     #[test]
     fn same_kind_alone_does_not_qualify() {
-        // B83 — "Back to the Future" vs an AWS training clip: both Movie kind,
+        // B83 — "Film AQ" vs an AWS training clip: both Movie kind,
         // different folders, no shared genre. Must score 0 so it never appears
         // in "More Like This" (the `>0` gate in items_similar drops it).
-        let bttf = movie(1, "/media/Movies/Back to the Future (1985)/bttf.mkv", None);
+        let filmaq = movie(1, "/media/Movies/Film AQ (1985)/filmaq.mkv", None);
         let aws = movie(2, "/media/Training/aws-intro/lesson1.mp4", None);
-        assert_eq!(similarity_score(&bttf, &aws), 0);
+        assert_eq!(similarity_score(&filmaq, &aws), 0);
     }
 
     #[test]
     fn shared_genre_qualifies_and_beats_same_folder() {
-        let bttf = movie(1, "/media/Movies/bttf.mkv", Some("Adventure"));
+        let filmaq = movie(1, "/media/Movies/filmaq.mkv", Some("Adventure"));
         let other = movie(2, "/media/Movies/goonies.mkv", Some("Adventure"));
         // genre(20) + same parent dir /media/Movies (15) + same-kind tiebreak(5).
-        assert_eq!(similarity_score(&bttf, &other), 40);
+        assert_eq!(similarity_score(&filmaq, &other), 40);
     }
 
     #[test]
@@ -7939,8 +7939,8 @@ mod alpha_picker_tests {
         assert!(name_matches_letter("Angel", "a"));
         assert!(name_matches_letter("angel", "a"));
         assert!(name_matches_letter("  Angel", "a")); // leading space trimmed
-        assert!(!name_matches_letter("Breaking Bad", "a"));
-        assert!(name_matches_letter("An Idiot Abroad", "an"));
+        assert!(!name_matches_letter("Show X", "a"));
+        assert!(name_matches_letter("An Odd Traveller", "an"));
     }
 
     #[test]

@@ -39,8 +39,8 @@ async fn seed_movie(cache_dir: &std::path::Path) -> (web::Data<AppState>, u64) {
     stores
         .put(MediaItem {
             id,
-            path: "/media/Deadpool (2016)/Deadpool.mp4".into(),
-            title: "Deadpool".into(),
+            path: "/media/Film AJ (2016)/Film AJ.mp4".into(),
+            title: "Film AJ".into(),
             kind: MediaKind::Movie,
             ..Default::default()
         })
@@ -48,7 +48,7 @@ async fn seed_movie(cache_dir: &std::path::Path) -> (web::Data<AppState>, u64) {
         .unwrap();
     // A local Logo sidecar → the list must include the upload-only Logo role.
     stores
-        .set_artwork(id, "Logo", "local", "/media/Deadpool (2016)/logo.png")
+        .set_artwork(id, "Logo", "local", "/media/Film AJ (2016)/logo.png")
         .await
         .unwrap();
     let state = AppState::new(stores, "t".into())

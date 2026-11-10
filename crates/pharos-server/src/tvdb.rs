@@ -1901,8 +1901,8 @@ mod tests {
         );
         assert_eq!(super::decode_entities("&amp;lt;"), "&lt;");
         assert_eq!(
-            super::decode_entities("Cagney & Lacey; &bogus; a&"),
-            "Cagney & Lacey; &bogus; a&"
+            super::decode_entities("Pat & Sam; &bogus; a&"),
+            "Pat & Sam; &bogus; a&"
         );
     }
 

@@ -603,7 +603,7 @@ const HLS_MIN_BITRATE_BPS: u64 = 500_000;
 //
 // B50 raised this 8M→40M to end VP9 graininess — but 40M is unencodable in
 // realtime by the software VP9 encoder: a 1080p segment took 32s (vs the 6s
-// budget), freezing playback (Supergirl VP9, 2026-07-14). The B50 benchmark
+// budget), freezing playback (Show AI VP9, 2026-07-14). The B50 benchmark
 // used synthetic noise, which encodes far faster than real film detail.
 // B52 caps at 12M: a real improvement over the old 8M (measured grain win),
 // still within the ~1.5-2x realtime margin observed for 1080p VP9 on this
@@ -2450,7 +2450,7 @@ async fn vp9_audio_file(
         .audio_hls_file(&dir, &name)
         .await
         // Carry the cache's give-up reason into the response body. A bare
-        // "audio segment not ready" made the Ghost in the Shell stall
+        // "audio segment not ready" made the Film AH stall
         // indistinguishable from a request past the end of the media, and
         // reconstructing which of the three budgets expired took a code read.
         .map_err(|e| error::ErrorNotFound(e.to_string()))?;

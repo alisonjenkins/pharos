@@ -411,7 +411,7 @@ mod tests {
         struct Matrix;
         impl OmdbTransport for Matrix {
             async fn get(&self, params: &[(&str, &str)]) -> (u16, String) {
-                let body = if params.contains(&("i", "tt0133093")) {
+                let body = if params.contains(&("i", "tt9300001")) {
                     r#"{"Year":"1999","Ratings":[{"Source":"Rotten Tomatoes","Value":"83%"}],"imdbRating":"8.7","Response":"True"}"#
                 } else {
                     r#"{"Response":"False","Error":"Movie not found!"}"#
@@ -420,14 +420,14 @@ mod tests {
             }
         }
         let fake = FakeSource {
-            answers: HashMap::from([("tt0133093".to_owned(), Lookup::Found(SCORES))]),
+            answers: HashMap::from([("tt9300001".to_owned(), Lookup::Found(SCORES))]),
             ..Default::default()
         };
         let omdb = OmdbClient::with_transport("k".into(), Matrix);
         let hit = RatingsQuery {
             kind: TitleKind::Movie,
-            imdb_id: Some("tt0133093"),
-            title: "The Matrix",
+            imdb_id: Some("tt9300001"),
+            title: "The Glass Lattice",
             year: Some(1999),
         };
         let miss = RatingsQuery {
