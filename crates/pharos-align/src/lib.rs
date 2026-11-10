@@ -11,6 +11,7 @@ pub mod ctc;
 pub mod line;
 pub mod offset;
 pub mod plan;
+pub mod service;
 pub mod text;
 pub mod tokens;
 
