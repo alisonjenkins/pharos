@@ -210,6 +210,10 @@ config:
     # readers (epub.js / libarchive.js / pdf.js). A books folder left under a
     # `mixed` root still lists and still opens, but presents as a video library.
     libraries: []
+  metadata:
+    # Spec 033: "dry_run" (pharos's default when unset) logs the series
+    # split and key repairs a scan decides; "apply" writes them.
+    seriesIdentityRepair: ""
   database:
     # SQLite on the db PVC by default. Set a postgres:// URL to use Postgres
     # (the db PVC is then not created).
