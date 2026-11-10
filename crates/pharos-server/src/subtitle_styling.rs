@@ -78,7 +78,7 @@ use pharos_transcode::protocol::WorkerError;
 use pharos_transcode::scheduler::TranscodeScheduler;
 use pharos_transcode::subtitle_signals::{SubtitleSignals, SIGNALS_VERSION};
 use pharos_transcode::worker::{LibavWorkerPool, PoolError};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 #[cfg(all(unix, feature = "ffmpeg-lib"))]
 use std::sync::atomic::AtomicBool;
@@ -422,6 +422,8 @@ struct Report {
     bottom_text: String,
     /// Lines passed through as signs in their own style (B1208).
     signs: usize,
+    /// Signs per cause, `tag=n style7=n` (B1208).
+    sign_causes: String,
 }
 
 /// A stored signal pass: the windows it measured and what it found.
@@ -919,6 +921,7 @@ impl<S: JobStore, A: Signals, Q: TranscodeQueue> Styler<S, A, Q> {
             .collect::<Vec<_>>()
             .join(" ");
         report.signs = parsed.lines.iter().filter(|l| l.typeset).count();
+        report.sign_causes = sign_causes(&parsed.lines);
         report.bottom_text = direction
             .bottom_text
             .iter()
@@ -1125,6 +1128,7 @@ impl<S: JobStore, A: Signals, Q: TranscodeQueue> Styler<S, A, Q> {
                     loudness_scale = report.loudness.map(|l| l.scale),
                     bottom_text = %report.bottom_text,
                     signs = report.signs,
+                    sign_causes = %report.sign_causes,
                     outcome = ended.outcome.label(),
                     stage = ended.stage.label(),
                     error = ended.error.as_deref(),
@@ -1306,10 +1310,42 @@ async fn read_source(
     Ok(text.trim_start_matches('\u{feff}').to_owned())
 }
 
+/// `tag=n style<alignment>=n`, so a mis-read style alignment shows by value.
+fn sign_causes(lines: &[pharos_styling::source::SourceLine]) -> String {
+    use pharos_styling::source::SignCause;
+    let mut by: BTreeMap<String, usize> = BTreeMap::new();
+    for cause in lines.iter().filter_map(|l| l.sign_cause()) {
+        let key = match cause {
+            SignCause::Tag => cause.label().to_owned(),
+            SignCause::Style(a) => format!("{}{a}", cause.label()),
+        };
+        *by.entry(key).or_default() += 1;
+    }
+    by.iter()
+        .map(|(k, n)| format!("{k}={n}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn signs_are_counted_by_cause_and_alignment() {
+        let ass = "[V4+ Styles]\n\
+            Format: Name, Fontname, Fontsize, Alignment, MarginV\n\
+            Style: Menu,Arial,36,7,90\n\
+            Style: Default,Arial,48,2,30\n\
+            [Events]\n\
+            Dialogue: 0,0:00:01.00,0:00:02.00,Menu,,0,0,0,,Stats\n\
+            Dialogue: 0,0:00:01.00,0:00:02.00,Menu,,0,0,0,,More\n\
+            Dialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,{\\pos(1,1)}Sign\n\
+            Dialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,Hello\n";
+        let lines = pharos_styling::source::read(ass).unwrap().lines;
+        assert_eq!(sign_causes(&lines), "style7=2 tag=1");
+    }
 
     fn sub(index: u32, lang: Option<&str>, codec: &str) -> SubtitleCandidate {
         SubtitleCandidate {
