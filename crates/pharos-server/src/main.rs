@@ -2358,6 +2358,10 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
     #[cfg(not(feature = "postgres"))]
     let group_registry = local_registry();
     let group_registry = web::Data::new(group_registry);
+    // The Together page's live list (017 groups topic).
+    app_state
+        .events
+        .follow_groups(group_registry.subscribe_listing());
     // T83 — GC orphaned SyncPlay snapshots (a crash/kill skips the actor's
     // own remove-on-empty; without this the sync_groups table grew forever
     // and B24 recovery could re-attach a device to week-old leftovers).
