@@ -18,8 +18,8 @@ use wasm_bindgen::{JsCast as _, JsValue};
 
 use super::machine::{Probe, SignInReply, SignOutReply};
 use super::playback::{
-    cue_chars_per_line, cue_font_px, cue_width_share, is_loading, lifted_line, Engine, FailureKind, Fatal,
-    FragmentLoad, LibraryTransition, MediaState, OnFatal, OnFragment, OverlayEffect,
+    cue_chars_per_line, cue_font_px, cue_width_share, is_loading, lifted_line, Engine, FailureKind,
+    Fatal, FragmentLoad, LibraryTransition, MediaState, OnFatal, OnFragment, OverlayEffect,
     PlaybackEngine, Recovery, RecoveryBudget, SubtitleSize,
 };
 
@@ -545,13 +545,19 @@ fn play_failed(e: &JsValue, source: &'static str) {
         .unwrap_or_default();
     if name != "NotAllowedError" {
         // An AbortError is a newer load or pause overtaking this play.
-        info(&format!("pharos: play() did not start source={source} name={name} reason={}", js_message(e)));
+        info(&format!(
+            "pharos: play() did not start source={source} name={name} reason={}",
+            js_message(e)
+        ));
         return;
     }
     let first = !AUTOPLAY_BLOCKED.with(|b| b.replace(true));
     watch_for_gesture();
     if first {
-        warn(&format!("pharos: autoplay refused source={source} reason={}", js_message(e)));
+        warn(&format!(
+            "pharos: autoplay refused source={source} reason={}",
+            js_message(e)
+        ));
         report_event(ClientEvent {
             kind: ClientEventKind::AutoplayRefused,
             level: ClientLevel::Warn,
@@ -576,7 +582,11 @@ fn watch_for_gesture() {
         }
     });
     for kind in ["pointerdown", "keydown"] {
-        let _ = doc.add_event_listener_with_callback_and_bool(kind, lift.as_ref().unchecked_ref(), true);
+        let _ = doc.add_event_listener_with_callback_and_bool(
+            kind,
+            lift.as_ref().unchecked_ref(),
+            true,
+        );
     }
     // Lives as long as the page.
     lift.forget();

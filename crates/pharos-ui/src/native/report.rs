@@ -566,7 +566,10 @@ mod tests {
         store.trace("4bf92f3577b34da6a3ce929d0e0e4736");
         store.trace("");
         let bundle = build_bundle(&context(&store));
-        assert_eq!(bundle["traceIds"], json!(["4bf92f3577b34da6a3ce929d0e0e4736"]));
+        assert_eq!(
+            bundle["traceIds"],
+            json!(["4bf92f3577b34da6a3ce929d0e0e4736"])
+        );
         for n in 0..20 {
             store.trace(&format!("t{n}"));
         }

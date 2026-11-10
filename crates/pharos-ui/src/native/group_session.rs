@@ -3681,7 +3681,11 @@ mod tests {
             rig.env.now.set(now);
             rig.session.check_drift();
         }
-        assert!(rig.player.log.borrow().is_empty(), "{:?}", rig.player.log.borrow());
+        assert!(
+            rig.player.log.borrow().is_empty(),
+            "{:?}",
+            rig.player.log.borrow()
+        );
         assert_eq!(
             rig.env
                 .logged("pharos: group resume held reason=autoplay_refused position_ms=5000")
@@ -3691,7 +3695,11 @@ mod tests {
         rig.player.blocked.set(false);
         rig.env.now.set(120_000);
         rig.session.check_drift();
-        assert!(rig.player.log.borrow().iter().any(|l| l == "play"), "{:?}", rig.player.log.borrow());
+        assert!(
+            rig.player.log.borrow().iter().any(|l| l == "play"),
+            "{:?}",
+            rig.player.log.borrow()
+        );
     }
 
     /// A player that stays paused (the browser refused the `play()`) is not

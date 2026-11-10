@@ -2108,7 +2108,10 @@ mod tests {
     #[test]
     fn a_start_failure_reads_differently_from_a_broken_stream() {
         let start = PlayFailure::start(StartFailure::new(FailureKind::Unplayable, "no MSE"));
-        assert_ne!(start.headline, PlayFailure::stream(FailureKind::Network, "x").headline);
+        assert_ne!(
+            start.headline,
+            PlayFailure::stream(FailureKind::Network, "x").headline
+        );
         assert_eq!(start.line(), "This video could not be started. no MSE");
     }
 
@@ -2123,7 +2126,12 @@ mod tests {
         assert!(hint(FailureKind::Server).contains("server"));
         assert!(hint(FailureKind::Unplayable).contains("browser"));
         assert!(hint(FailureKind::Damaged).contains("damaged"));
-        let all = [FailureKind::Network, FailureKind::Server, FailureKind::Unplayable, FailureKind::Damaged];
+        let all = [
+            FailureKind::Network,
+            FailureKind::Server,
+            FailureKind::Unplayable,
+            FailureKind::Damaged,
+        ];
         let distinct: std::collections::HashSet<_> = all.iter().map(|&k| hint(k)).collect();
         assert_eq!(distinct.len(), all.len());
     }
@@ -2150,7 +2158,10 @@ mod tests {
                 }
             }
         });
-        assert!(html.contains("(trace 4bf92f3577b34da6a3ce929d0e0e4736)"), "{html}");
+        assert!(
+            html.contains("(trace 4bf92f3577b34da6a3ce929d0e0e4736)"),
+            "{html}"
+        );
         assert!(html.contains("Report a problem"), "{html}");
         assert!(html.contains(r#"data-kind="server""#), "{html}");
         let no_report = render(|| {

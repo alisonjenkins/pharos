@@ -40,12 +40,12 @@ use super::playback::{
     rust_subtitle_url, shown_font_urls, source_of_styled, start_ms, starting_tier,
     starting_tier_line, styled_subtitle_signals, styled_subtitle_url, styled_track_url,
     subtitle_switch, tier_drop_line, tier_drop_report, tier_spared_line, up_next_at, up_next_pill,
-    volume_setting, DeviceClass, EffectsLevel, Engine, EngineReason, FailureKind, Fatal, LibraryTransition,
-    MediaEvent, MediaState, MseEngine, OnFatal, OnFragment, Outgoing, OverlayEffect,
-    PlaybackEngine, RendererFrames, ReportClock, SubtitleSize, SubtitleSwitch, Tier, TierDrop,
-    TierVerdict, UpNext, UpNextStep, CROSSFADE_KEY, EFFECTS_LEVEL_KEY, LIBRARY_TRANSITION_KEY,
-    MAX_BITRATE_KEY, MSE_ENGINE_KEY, OVERLAY_EFFECT_KEY, SUBTITLE_SIZE_KEY, TIER_DROP_KEY,
-    VOLUME_KEY,
+    volume_setting, DeviceClass, EffectsLevel, Engine, EngineReason, FailureKind, Fatal,
+    LibraryTransition, MediaEvent, MediaState, MseEngine, OnFatal, OnFragment, Outgoing,
+    OverlayEffect, PlaybackEngine, RendererFrames, ReportClock, SubtitleSize, SubtitleSwitch, Tier,
+    TierDrop, TierVerdict, UpNext, UpNextStep, CROSSFADE_KEY, EFFECTS_LEVEL_KEY,
+    LIBRARY_TRANSITION_KEY, MAX_BITRATE_KEY, MSE_ENGINE_KEY, OVERLAY_EFFECT_KEY, SUBTITLE_SIZE_KEY,
+    TIER_DROP_KEY, VOLUME_KEY,
 };
 use super::playback_settings;
 use super::preplay::{self, PlayPicks, TrackChoices};
@@ -77,10 +77,10 @@ use super::trail;
 use super::turn::{self, EpisodeTurn, EPISODE_TURN_KEY};
 use super::versions;
 use super::views::{
-    open_route, reveal_palette_row, Busy, ErrorNote, FlashNote, GroupEndedNote, Hits, HomeView,
-    LoadError, LoadFailure, Loading, MarkFavorite, MarkPlayed, Nav, PaletteView, PlayFailure,
-    PlayFromStart, PlaybackFailure, SearchBox, Shell, StartFailure, FirstLoad, SignInView, StatusView, StoredMark,
-    TitleView, PALETTE_INPUT,
+    open_route, reveal_palette_row, Busy, ErrorNote, FirstLoad, FlashNote, GroupEndedNote, Hits,
+    HomeView, LoadError, LoadFailure, Loading, MarkFavorite, MarkPlayed, Nav, PaletteView,
+    PlayFailure, PlayFromStart, PlaybackFailure, SearchBox, Shell, SignInView, StartFailure,
+    StatusView, StoredMark, TitleView, PALETTE_INPUT,
 };
 use super::watch_view::{
     split_position, text_track_id, total_ms, Control, Controls, Skip, UpNextCard, VideoQueueView,
@@ -4829,8 +4829,8 @@ fn WatchScreen(id: ItemRef, slot: Slot) -> Element {
     });
     // The full view's first load has no player chrome yet, so it carries its
     // own way out (038 FR-408, V1220).
-    let first_load = ctx_stage.read().view == View::Full
-        && state.as_ref().and_then(Option::as_ref).is_none();
+    let first_load =
+        ctx_stage.read().view == View::Full && state.as_ref().and_then(Option::as_ref).is_none();
     let body = match start_failure {
         None if first_load => rsx! {
             FirstLoad { on_back: move |()| leave_player(nav) }
@@ -5719,7 +5719,9 @@ fn Player(
                     // Music and groups are offered no skip, but a damaged
                     // file is still named as one (038 FR-403).
                     failed.set(Some(match kind {
-                        FailureKind::Damaged => PlayFailure::damaged(reason, skip.map(|(to, _)| to)),
+                        FailureKind::Damaged => {
+                            PlayFailure::damaged(reason, skip.map(|(to, _)| to))
+                        }
                         kind => PlayFailure::stream(kind, reason),
                     }));
                 }
@@ -5781,7 +5783,10 @@ fn Player(
                             "pharos: playback failure shown item={playing_id} kind=start reason={e}"
                         ));
                         // The engine would not attach to this browser.
-                        failed.set(Some(PlayFailure::start(StartFailure::new(FailureKind::Unplayable, e))));
+                        failed.set(Some(PlayFailure::start(StartFailure::new(
+                            FailureKind::Unplayable,
+                            e,
+                        ))));
                     }
                 }
             });
@@ -6703,7 +6708,10 @@ fn Player(
     let waiting = media_rest().loading && failed().is_none();
     let wait_caption = if waiting {
         let me = account.and_then(|a| {
-            a.0.read().as_ref().and_then(Option::as_ref).map(|m| (m.id.clone(), m.name.clone()))
+            a.0.read()
+                .as_ref()
+                .and_then(Option::as_ref)
+                .map(|m| (m.id.clone(), m.name.clone()))
         });
         let members_waiting: Vec<String> = match me {
             Some((id, name)) if group.drives(playing_id) => group
@@ -6769,8 +6777,11 @@ fn Player(
                 if next.is_none() && p.kind != ItemKind::Episode {
                     "Next".clone_into(&mut card.name);
                 }
-                let credits = up_next_at(&p.detail.segments, total_ms(&media_rest(), p.detail.item.runtime_ms))
-                    .is_some_and(|from| from.credits);
+                let credits = up_next_at(
+                    &p.detail.segments,
+                    total_ms(&media_rest(), p.detail.item.runtime_ms),
+                )
+                .is_some_and(|from| from.credits);
                 card.pill = up_next_pill(credits, left_ms);
                 // The decision line, once per way it is shown (038 FR-405/406).
                 let mode = match (view, card.pill) {

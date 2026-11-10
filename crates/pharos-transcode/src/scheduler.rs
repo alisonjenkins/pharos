@@ -681,7 +681,6 @@ impl std::fmt::Display for SchedError {
 
 impl std::error::Error for SchedError {}
 
-
 /// What one stream's viewer is waiting behind in the queue, read while they
 /// wait so the player can say "the server is busy" before the segment lands
 /// (038 FR-402, V1217). Derived from the queue the scheduler already holds:
@@ -1621,7 +1620,10 @@ impl TranscodeScheduler {
     /// when the scheduler is gone.
     pub async fn stream_wait(&self, stream: StreamKey) -> Option<StreamWait> {
         let (reply, rx) = oneshot::channel();
-        self.tx.send(SchedMsg::StreamWait { stream, reply }).await.ok()?;
+        self.tx
+            .send(SchedMsg::StreamWait { stream, reply })
+            .await
+            .ok()?;
         rx.await.ok()
     }
 
@@ -2094,7 +2096,11 @@ fn handle(state: &mut SchedState, msg: SchedMsg, self_tx: &mpsc::Sender<SchedMsg
         SchedMsg::StreamWait { stream, reply } => {
             let now = Instant::now();
             let mut wait = StreamWait::default();
-            for (_, c) in state.pending.iter().filter(|(_, c)| c.class == JobClass::Interactive) {
+            for (_, c) in state
+                .pending
+                .iter()
+                .filter(|(_, c)| c.class == JobClass::Interactive)
+            {
                 if c.stream == stream && stream != StreamKey::NONE {
                     wait.queued += 1;
                     let waited = now.saturating_duration_since(c.enqueued).as_millis() as u64;
@@ -5488,7 +5494,11 @@ mod tests {
         let s = TranscodeScheduler::spawn(table(), spawner, SchedConfig::default());
         let (mine, theirs) = (StreamKey::of("mine"), StreamKey::of("theirs"));
         let idle = s.stream_wait(mine).await.expect("wait");
-        assert_eq!(idle, StreamWait::default(), "an idle server has nothing queued");
+        assert_eq!(
+            idle,
+            StreamWait::default(),
+            "an idle server has nothing queued"
+        );
 
         let submit = |stream: StreamKey, path: &'static str| {
             let s2 = s.clone();
@@ -5522,7 +5532,10 @@ mod tests {
         assert_eq!(wait.others_queued, 1, "{wait:?}");
         assert!(wait.devices_full, "{wait:?}");
         assert!(wait.oldest_ms > 0, "{wait:?}");
-        let none = s.stream_wait(StreamKey::of("elsewhere")).await.expect("wait");
+        let none = s
+            .stream_wait(StreamKey::of("elsewhere"))
+            .await
+            .expect("wait");
         assert_eq!((none.queued, none.others_queued), (0, 3));
         for h in handles {
             let _ = h.await;

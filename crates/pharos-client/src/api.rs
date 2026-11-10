@@ -1907,7 +1907,12 @@ impl PlaybackGrant for NativeGrant {
         let mut req = self.0.queue_hint_request();
         call.write(req.get().init_ctx());
         let reply = req.send().promise.await?;
-        match reply.get()?.get_result()?.which().map_err(capnp::Error::from)? {
+        match reply
+            .get()?
+            .get_result()?
+            .which()
+            .map_err(capnp::Error::from)?
+        {
             queue_hint_result::Hint(h) => {
                 let h = h?;
                 Ok(QueueHint {
