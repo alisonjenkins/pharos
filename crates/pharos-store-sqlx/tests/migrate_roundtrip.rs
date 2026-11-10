@@ -287,6 +287,75 @@ async fn migrate_sqlite_to_postgres_round_trip() {
         .await
         .unwrap();
 
+    // B1070: a show's metadata row, with a manual match, ratings and an
+    // admin edit (overview locked), must move with everything else.
+    let show_key = "/media/shows/Migrate Show".to_string();
+    pharos_core::SeriesMetadataStore::upsert_series_metadata(
+        &sqlite,
+        pharos_core::SeriesMetadata {
+            series_key: show_key.clone(),
+            series_name: "Migrate Show".into(),
+            match_provider: Some("tvdb".into()),
+            match_external_id: Some("424242".into()),
+            match_source: Some("manual".into()),
+            match_confidence: Some(0.5),
+            metadata_refreshed_at: Some(1_700_000_000),
+            overview: Some("From the provider.".into()),
+            community_rating: Some(7.5),
+            premiere_date: Some(946_684_800),
+            official_rating: Some("TV-14".into()),
+            original_language: Some("en".into()),
+            genres: vec!["Drama".into()],
+            studios: vec!["Migrate Studio".into()],
+            poster_locator: Some("/cache/show-poster.jpg".into()),
+            backdrop_locator: Some("/cache/show-backdrop.jpg".into()),
+            match_flag: Some("ambiguous".into()),
+            match_runner_up_id: Some("777".into()),
+            match_runner_up_score: Some(0.25),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    pharos_core::RatingsStore::set_ratings(
+        &sqlite,
+        &pharos_core::RatingsTarget::Series(show_key.clone()),
+        pharos_core::ExternalRatings {
+            imdb: Some(8.5),
+            tomatometer: Some(93),
+        },
+        1_700_000_123,
+    )
+    .await
+    .unwrap();
+    pharos_core::MetadataEditStore::edit_metadata(
+        &sqlite,
+        &pharos_core::EditTarget::Series {
+            key: show_key.clone(),
+            name: "Migrate Show".into(),
+        },
+        &pharos_core::MetadataEdit {
+            overview: Some(Some("Written by an admin.".into())),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let sqlite_show = pharos_core::SeriesMetadataStore::series_metadata_by_keys(
+        &sqlite,
+        std::slice::from_ref(&show_key),
+    )
+    .await
+    .unwrap()
+    .remove(&show_key)
+    .expect("the seeded show has a row");
+    assert!(
+        sqlite_show
+            .locked
+            .contains(pharos_core::EditableField::Overview),
+        "the seed must lock the edited overview: {sqlite_show:?}"
+    );
+
     // The migrate engine requires an EMPTY target. The shared
     // PHAROS_TEST_POSTGRES_URL database is also written by `backend_conformance`
     // (which runs concurrently under nextest), so migrating into it collides on
@@ -312,6 +381,7 @@ async fn migrate_sqlite_to_postgres_round_trip() {
         "collections",
         "playlists",
         "media_items",
+        "series_metadata",
         "system_identity",
         "server_secrets",
         "runtime_config",
@@ -393,6 +463,31 @@ async fn migrate_sqlite_to_postgres_round_trip() {
     assert_eq!(
         pg_item.metadata.overview.as_deref(),
         Some("A movie about migrating.")
+    );
+
+    // B1070: the show's row arrives whole, edit and lock included.
+    let pg_show = pharos_core::SeriesMetadataStore::series_metadata_by_keys(
+        &postgres,
+        std::slice::from_ref(&show_key),
+    )
+    .await
+    .unwrap()
+    .remove(&show_key)
+    .expect("series_metadata must be copied");
+    assert_eq!(
+        pg_show, sqlite_show,
+        "every show field must survive the copy"
+    );
+    let (fetched_at,): (Option<i64>,) =
+        sqlx::query_as("SELECT ratings_fetched_at FROM series_metadata WHERE series_key = $1")
+            .bind(&show_key)
+            .fetch_one(postgres.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        fetched_at,
+        Some(1_700_000_123),
+        "the ratings lookup time must move, or every show is looked up again"
     );
 
     // media_item_languages is derived, not copied: the insert trigger indexes
