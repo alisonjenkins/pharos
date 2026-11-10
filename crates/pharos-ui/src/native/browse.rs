@@ -4872,10 +4872,15 @@ mod tests {
                 .unwrap_or_default()
                 .to_owned()
         };
-        let tv =
-            rule(":root[data-device=\"tv\"] .pharos-queue-buttons[data-target=\"album_card\"] {");
-        assert!(tv.contains("display: none"), "{tv}");
-        let web = rule("\n.pharos-queue-buttons[data-target=\"album_card\"] {");
+        // The buttons go; the note beside them stays, for a queue key.
+        let tv = rule(
+            "\n:root[data-device=\"tv\"] .pharos-queue-buttons[data-target=\"album_card\"] .pharos-queue-button {\n  display",
+        );
+        assert!(tv.trim_start().starts_with(": none;"), "{tv}");
+        let card = ".pharos-queue-buttons[data-target=\"album_card\"]";
+        let web = rule(&format!("\n{card} {{"));
         assert!(!web.contains("display: none"), "{web}");
+        let tv_card = rule(&format!("\n:root[data-device=\"tv\"] {card} {{"));
+        assert!(!tv_card.contains("display: none"), "{tv_card}");
     }
 }
