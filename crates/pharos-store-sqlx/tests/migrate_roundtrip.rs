@@ -1,10 +1,10 @@
 //! TDD round-trip test for `pharos_store_sqlx::migrate::migrate_sqlite_to_postgres`
-//! (the `pharos admin db-migrate` engine). Seeds a SqliteStore touching every
-//! copied table via the real store trait methods (same pattern as
-//! `backend_conformance.rs`), migrates into a fresh empty Postgres, then
-//! verifies both the returned report and independent row counts on both
-//! sides, plus a few read-back integrity spot-checks through the Postgres
-//! store trait methods.
+//! (the `pharos admin db-migrate` engine). Seeds a SqliteStore with at least
+//! one row in every table on `migrate::COPIED_TABLES`, through the store trait
+//! methods where they reach and raw SQL (`seed_raw`) where they don't, migrates
+//! into a fresh empty Postgres, then checks the report, the row counts on both
+//! sides, every column of every row (`assert_same_rows`, B1071), and a few
+//! read-backs through the Postgres store trait methods.
 
 #![cfg(all(feature = "sqlite", feature = "postgres"))]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -247,6 +247,7 @@ async fn migrate_sqlite_to_postgres_round_trip() {
         .await
         .expect("connect in-memory sqlite");
     let (uid1, uid2, item1) = seed(&sqlite).await;
+    seed_raw(&sqlite).await;
     UserPrefStore::set_user_pref(&sqlite, uid1, "diagnostics.opt_in", b"true")
         .await
         .unwrap();
@@ -371,43 +372,19 @@ async fn migrate_sqlite_to_postgres_round_trip() {
         .expect("migration must succeed");
 
     let counts: HashMap<String, u64> = report.tables.into_iter().collect();
-    for table in [
-        "users",
-        "libraries",
-        "genres",
-        "people",
-        "studios",
-        "tags",
-        "collections",
-        "playlists",
-        "media_items",
-        "series_metadata",
-        "system_identity",
-        "server_secrets",
-        "runtime_config",
-        "named_config",
-        "scan_runs",
-        "auth_tokens",
-        "user_data",
-        "user_configuration",
-        "display_preferences",
-        "user_prefs",
-        "artwork",
-        "item_genres",
-        "item_people",
-        "item_studios",
-        "item_tags",
-        "collection_items",
-        "playlist_items",
-    ] {
-        let n = *counts
-            .get(table)
-            .unwrap_or_else(|| panic!("migration report missing table {table}"));
-        assert!(
-            n > 0,
-            "table {table} must have copied a non-zero row count, got {n}"
-        );
-    }
+    // Every copied table is seeded, so a column the copy mishandles shows
+    // up in the row comparison below: seed a new table in `seed_raw`.
+    let empty: Vec<&str> = pharos_store_sqlx::migrate::COPIED_TABLES
+        .iter()
+        .copied()
+        .filter(|table| {
+            *counts
+                .get(*table)
+                .unwrap_or_else(|| panic!("migration report missing table {table}"))
+                == 0
+        })
+        .collect();
+    assert!(empty.is_empty(), "seed these tables: {empty:?}");
 
     // Independent count verification on both sides.
     for table in counts.keys() {
@@ -425,6 +402,11 @@ async fn migrate_sqlite_to_postgres_round_trip() {
             sqlite_count, pg_count,
             "row count mismatch on {table}: sqlite={sqlite_count} postgres={pg_count}"
         );
+    }
+
+    // B1071: every copied table arrives row for row and column for column.
+    for table in pharos_store_sqlx::migrate::COPIED_TABLES {
+        assert_same_rows(&sqlite, &postgres, table).await;
     }
 
     // Integrity spot-checks via the real Postgres store trait methods.
@@ -549,4 +531,188 @@ async fn migrate_sqlite_to_postgres_round_trip() {
         Some(b"true".as_slice()),
         "migrated user pref must read back through the postgres UserPrefStore"
     );
+}
+
+/// One value as text, read by its postgres column's type on both sides, so
+/// the two backends' rows compare directly. Floats compare at postgres
+/// `real` precision.
+fn render_sqlite(row: &sqlx::sqlite::SqliteRow, i: usize, pg_type: &str) -> String {
+    use sqlx::Row;
+    match pg_type {
+        "bigint" | "integer" | "smallint" => {
+            format!("{:?}", row.try_get_unchecked::<Option<i64>, _>(i).unwrap())
+        }
+        "boolean" => format!(
+            "{:?}",
+            row.try_get_unchecked::<Option<i64>, _>(i)
+                .unwrap()
+                .map(|v| v != 0)
+        ),
+        #[allow(clippy::cast_possible_truncation)]
+        "real" | "double precision" => format!(
+            "{:?}",
+            row.try_get_unchecked::<Option<f64>, _>(i)
+                .unwrap()
+                .map(|v| v as f32)
+        ),
+        "bytea" => format!(
+            "{:?}",
+            row.try_get_unchecked::<Option<Vec<u8>>, _>(i).unwrap()
+        ),
+        _ => format!(
+            "{:?}",
+            row.try_get_unchecked::<Option<String>, _>(i).unwrap()
+        ),
+    }
+}
+
+fn render_pg(row: &sqlx::postgres::PgRow, i: usize, pg_type: &str) -> String {
+    use sqlx::Row;
+    match pg_type {
+        "bigint" | "integer" | "smallint" => {
+            format!("{:?}", row.try_get::<Option<i64>, _>(i).unwrap())
+        }
+        "boolean" => format!("{:?}", row.try_get::<Option<bool>, _>(i).unwrap()),
+        #[allow(clippy::cast_possible_truncation)]
+        "real" | "double precision" => format!(
+            "{:?}",
+            row.try_get::<Option<f64>, _>(i).unwrap().map(|v| v as f32)
+        ),
+        "bytea" => format!("{:?}", row.try_get::<Option<Vec<u8>>, _>(i).unwrap()),
+        _ => format!("{:?}", row.try_get::<Option<String>, _>(i).unwrap()),
+    }
+}
+
+/// Every row of `table` on both sides, compared over every SQLite column.
+/// The one value the copy changes on purpose, a missing media sort name
+/// (derived from the title), is left out and checked on its own.
+async fn assert_same_rows(sqlite: &SqliteStore, postgres: &PostgresStore, table: &str) {
+    let cols: Vec<(String,)> =
+        sqlx::query_as("SELECT name FROM pragma_table_info(?1) ORDER BY cid")
+            .bind(table)
+            .fetch_all(sqlite.pool())
+            .await
+            .unwrap();
+    let pg_types: HashMap<String, String> = sqlx::query_as::<_, (String, String)>(
+        "SELECT column_name::text, data_type::text FROM information_schema.columns \
+         WHERE table_schema = current_schema() AND table_name = $1",
+    )
+    .bind(table)
+    .fetch_all(postgres.pool())
+    .await
+    .unwrap()
+    .into_iter()
+    .collect();
+    let cols: Vec<(String, String)> = cols
+        .into_iter()
+        .map(|(c,)| c)
+        .filter(|c| !(table == "media_items" && c == "sort_name"))
+        .map(|c| {
+            let t = pg_types
+                .get(&c)
+                .unwrap_or_else(|| panic!("postgres has no column {table}.{c}"))
+                .clone();
+            (c, t)
+        })
+        .collect();
+    let sqlite_list = cols
+        .iter()
+        .map(|(c, _)| format!("\"{c}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    // Postgres integers of every width decode as i64 and floats as f64.
+    let pg_list = cols
+        .iter()
+        .map(|(c, t)| match t.as_str() {
+            "integer" | "smallint" => format!("\"{c}\"::bigint"),
+            "real" => format!("\"{c}\"::float8"),
+            _ => format!("\"{c}\""),
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut left: Vec<Vec<String>> = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "SELECT {sqlite_list} FROM \"{table}\""
+    )))
+    .fetch_all(sqlite.pool())
+    .await
+    .unwrap()
+    .iter()
+    .map(|r| {
+        cols.iter()
+            .enumerate()
+            .map(|(i, (_, t))| render_sqlite(r, i, t))
+            .collect()
+    })
+    .collect();
+    let mut right: Vec<Vec<String>> = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "SELECT {pg_list} FROM \"{table}\""
+    )))
+    .fetch_all(postgres.pool())
+    .await
+    .unwrap()
+    .iter()
+    .map(|r| {
+        cols.iter()
+            .enumerate()
+            .map(|(i, (_, t))| render_pg(r, i, t))
+            .collect()
+    })
+    .collect();
+    left.sort();
+    right.sort();
+    for (l, r) in left.iter().zip(&right) {
+        for (i, (c, _)) in cols.iter().enumerate() {
+            assert_eq!(l[i], r[i], "{table}.{c} differs after the copy");
+        }
+    }
+    assert_eq!(left.len(), right.len(), "{table} row count differs");
+}
+
+/// B1071: rows for the tables the store traits make awkward to reach from
+/// here, and values for columns the earlier hand-kept copy lists dropped,
+/// so the row comparison sees each one carried.
+async fn seed_raw(store: &SqliteStore) {
+    for sql in [
+        "INSERT INTO series_overrides (series_folder, path, target_key, target_name, \
+         target_year, source, created_by, created_at) VALUES \
+         ('/media/shows/Cosmos', NULL, 'tvdb:1', 'Cosmos', 1980, 'admin', 'ali', 1700000000)",
+        "INSERT INTO person_details (wire_id, biography, birth_date, death_date, birth_place, \
+         imdb_id, wikidata_id, fetched_at) VALUES \
+         ('p1', 'Bio.', '1950-01-02', NULL, 'Cardiff', 'nm1', 'Q1', 1700000001)",
+        "INSERT INTO metadata_translations (owner_kind, owner_key, language, title, overview, \
+         is_original, fetched_at) VALUES ('item', '1', 'fr', 'Le Film', 'Un film.', 1, 1700000002)",
+        "INSERT INTO sync_groups (group_id, epoch_unix_ms, state_json, updated_at) VALUES \
+         ('g1', 1700000003000, '{\"state\":\"paused\"}', 1700000003)",
+        "INSERT INTO read_positions (user_id, item_id, locator, fraction, updated_at) \
+         SELECT id, 1, 'epubcfi(/6/4)', 0.25, 1700000004 FROM users LIMIT 1",
+        "INSERT INTO episode_fingerprints (item_id, kind, points, schema_version) VALUES \
+         (2, 'intro', X'01020304', 3)",
+        "INSERT INTO media_segments (item_id, kind, start_ms, end_ms, detector, confidence, \
+         schema_version) VALUES (2, 'Intro', 1000, 61000, 'chromaprint', 0.875, 4)",
+        "INSERT INTO media_segment_scans (item_id, schema_version) VALUES (2, 4)",
+        "INSERT INTO media_segments_snapshot (label, item_id, kind, start_ms, end_ms, detector, \
+         confidence, schema_version) VALUES ('before', 2, 'Outro', 5, 9, 'blackframe', 0.5, 2)",
+        "INSERT INTO subtitle_styling (item_id, source_index, source_mtime, source_size, \
+         sidecar_mtime, sidecar_size, director_version, outcome, plan_json, styled_at) VALUES \
+         (1, 2, 1700000005, 4096, 1700000006, 512, 7, 'styled', '{}', 1700000007)",
+        "INSERT INTO transcode_sessions (play_session_id, media_id, decision_json, \
+         source_probe_json, updated_at, burn_subtitle_indices_json, holder_user_id, \
+         holder_token_id) VALUES ('ps1', 1, '{}', '{}', 1700000008, '[3]', 'u1', 't1')",
+        "UPDATE media_items SET track_number = 3, disc_number = 1, release_year = 1979, \
+         production_locations_json = '[\"UK\"]', trailers_json = '[]', synopsis = 'Long.', \
+         content_rating = 'R', network = 'BBC', release_date = 300000000, has_primary_art = 1, \
+         match_provider = 'tmdb', match_external_id = '348', match_source = 'search', \
+         match_confidence = 0.75, metadata_refreshed_at = 1700000009, original_language = 'en', \
+         art_version = 2, book_format = 'epub', book_page_count = 320, book_author = 'A', \
+         book_publisher = 'P', book_series = 'S', book_series_index = 2, book_isbn = '978', \
+         imdb_rating = 8.5, rt_tomatometer = 93, ratings_fetched_at = 1700000010, \
+         series_key = 'show-key', series_reconcile_pending = 1700000011 WHERE id = 1",
+        "UPDATE users SET policy_json = '{\"IsAdministrator\":true}', \
+         failed_login_attempts = 2",
+    ] {
+        sqlx::query(sql)
+            .execute(store.pool())
+            .await
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
 }
