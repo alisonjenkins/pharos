@@ -3062,11 +3062,11 @@ mod tests {
 
     #[test]
     fn parse_show_detail_reads_the_match_and_files() {
-        let body = br#"{"SeriesKey":"/tv/Flash","SeriesId":"ab","Folder":"/tv/Flash","Name":"The Flash",
+        let body = br#"{"SeriesKey":"/tv/Show A","SeriesId":"ab","Folder":"/tv/Show A","Name":"Show A",
             "CurrentMatch":{"Provider":"tvdb","ExternalId":"1","Source":"search","PremiereDate":5},
-            "Episodes":[{"Id":7,"Path":"/tv/Flash/S01E01.mkv","Season":1,"Episode":1,"Title":"Pilot"}]}"#;
+            "Episodes":[{"Id":7,"Path":"/tv/Show A/S01E01.mkv","Season":1,"Episode":1,"Title":"Pilot"}]}"#;
         let v = parse_show_detail_response(body).unwrap();
-        assert_eq!(v.name, "The Flash");
+        assert_eq!(v.name, "Show A");
         assert_eq!(v.current_match.unwrap().external_id.as_deref(), Some("1"));
         assert_eq!(v.episodes[0].id, 7);
         assert_eq!(v.episodes[0].episode, Some(1));
