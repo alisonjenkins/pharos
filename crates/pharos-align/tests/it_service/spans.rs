@@ -104,6 +104,11 @@ fn a_song_traces_its_wait_decodes_and_model_calls_under_one_span() {
     assert!(f("aligner.decode_ms").is_some() && f("aligner.model_ms").is_some());
     assert_eq!(f("otel.kind"), Some("server"));
     assert_eq!(f("otel.status_code"), None);
+    // The song span names where its forward passes ran (R11).
+    assert_eq!(
+        (f("aligner.device"), f("aligner.device_reason")),
+        (Some("cpu"), Some("forced_cpu"))
+    );
 
     let under: Vec<&Recorded> = all
         .iter()
