@@ -346,6 +346,7 @@ pub fn bridge_script(template: &str) -> String {
         .replace("__REMOTE_SKIPS__", REMOTE_SKIPS)
         .replace("__OK_PRESSES__", OK_PRESSES)
         .replace("__OVERLAYS__", OVERLAYS)
+        .replace("__GRID__", GRID)
 }
 
 /// The container list a TV build declares: one no file has, so the server
@@ -393,6 +394,10 @@ pub enum Bridge {
     Root,
     /// The viewport's CSS size.
     Size { w: f64, h: f64 },
+    /// Where the browse grid on `path` stands once its scroll or focus has
+    /// settled: the tile with the focus, else the first in view, and how far
+    /// below the viewport's top it sits (FR-603).
+    Place { path: String, tile: u32, top: f64 },
     /// The remote's Back closed an open dialog or menu (`what`, its class
     /// or role) instead of going back a page (FR-607). With `restore` the
     /// WebView already went back an entry, which Rust puts back.
@@ -615,6 +620,24 @@ return true;
     )
 }
 
+/// Script: put the browse tile at `at` back `top` CSS px below the top of
+/// the viewport, where it was when the grid was left, and focus it (FR-603).
+pub fn scroll_tile_to_js(at: u32, top: f64) -> String {
+    let top = if top.is_finite() { top } else { 0.0 };
+    format!(
+        r#"
+const grid = document.querySelector({grid});
+const tile = grid ? grid.children[{at}] : null;
+if (!tile) return false;
+window.scrollBy(0, tile.getBoundingClientRect().top - ({top}));
+const link = tile.querySelector("a[href], button, [tabindex]") || tile;
+if (link.focus) link.focus({{ preventScroll: true }});
+return true;
+"#,
+        grid = serde_json::Value::String(GRID.to_owned()),
+    )
+}
+
 /// Script: scroll the page back to its top.
 pub const SCROLL_TO_TOP_JS: &str = "window.scrollTo(0, 0);";
 
@@ -697,6 +720,16 @@ mod tests {
         assert_eq!(track_skip("MediaTrackPrevious"), Some(Skip::Previous));
         assert_eq!(track_skip("ArrowRight"), None);
         assert_eq!(track_skip("MediaFastForward"), None);
+    }
+
+    #[test]
+    fn a_kept_place_puts_the_tile_back_where_it_was_and_focuses_it() {
+        let js = scroll_tile_to_js(40, 212.5);
+        assert!(js.contains("grid.children[40]"), "{js}");
+        assert!(js.contains("getBoundingClientRect().top - (212.5)"), "{js}");
+        assert!(js.contains("link.focus({ preventScroll: true })"), "{js}");
+        assert!(scroll_tile_to_js(1, f64::NAN).contains("- (0)"));
+        assert_eq!(bridge_script("__GRID__"), GRID);
     }
 
     #[test]
@@ -1009,6 +1042,16 @@ mod tests {
             Some(Bridge::BackClose {
                 what: "menu".to_owned(),
                 restore: true
+            })
+        );
+        assert_eq!(
+            parse_bridge(
+                &serde_json::json!({"t": "place", "path": "/ui/browse/1", "tile": 40, "top": 212.5})
+            ),
+            Some(Bridge::Place {
+                path: "/ui/browse/1".to_owned(),
+                tile: 40,
+                top: 212.5
             })
         );
         assert_eq!(parse_bridge(&serde_json::json!({"t": "nope"})), None);

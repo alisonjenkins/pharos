@@ -967,8 +967,16 @@ pub fn rail_gestures() -> RailGestures {
     RailGestures
 }
 
+/// Where the browse grid on the page shown stands, as the bridge last said
+/// (FR-603): the tile with the focus, else the first in view. The page's
+/// layout cannot be read synchronously here, so the bridge sends it as the
+/// scroll or focus settles.
 pub fn first_visible_tile() -> Option<u32> {
-    None
+    let here = current_path();
+    lock(&GRID_PLACE)
+        .as_ref()
+        .filter(|(path, _, _)| *path == here)
+        .map(|(_, tile, _)| *tile)
 }
 
 pub fn tile_in_view(_at: u32) -> bool {
@@ -1010,14 +1018,31 @@ pub fn scroll_to_top() {
     run(tv_page::SCROLL_TO_TOP_JS.to_owned());
 }
 
-pub fn tile_top(_at: u32) -> Option<f64> {
-    None
+pub fn tile_top(at: u32) -> Option<f64> {
+    let here = current_path();
+    lock(&GRID_PLACE)
+        .as_ref()
+        .filter(|(path, tile, _)| *path == here && *tile == at)
+        .map(|(_, _, top)| *top)
 }
 
 pub fn stage_arrival(_again: bool) {}
 
-pub fn scroll_tile_to(_at: u32, _top: f64) -> bool {
-    false
+/// Puts the grid's tile `at` back where it was and focuses it (FR-603).
+/// The page answers later: true means asked, and a tile not in the page
+/// logs `placed=false`.
+pub fn scroll_tile_to(at: u32, top: f64) -> bool {
+    let script = tv_page::scroll_tile_to_js(at, top);
+    spawn_detached(async move {
+        match page_eval(&script).join::<bool>().await {
+            Ok(placed) => log::info!(
+                "pharos: grid place restored tile={at} top={top:.0} placed={placed} path={}",
+                current_path()
+            ),
+            Err(e) => log::warn!("pharos: grid place restored tile={at} placed=false error={e}"),
+        }
+    });
+    true
 }
 
 /// The page's query, `?` included, as `location.search` on the web.
@@ -1027,10 +1052,19 @@ pub fn current_search() -> String {
         .to_owned()
 }
 
-pub struct ScrollWatch;
+/// A listener for the grid's place settling, removed on drop.
+pub struct ScrollWatch(u64);
 
-pub fn on_scroll_settled(_on_settled: impl FnMut() + 'static) -> ScrollWatch {
-    ScrollWatch
+impl Drop for ScrollWatch {
+    fn drop(&mut self) {
+        unlisten(self.0);
+    }
+}
+
+/// Call `on_settled` each time the bridge reports where the browse grid
+/// stands, after its scroll or focus settles (FR-603).
+pub fn on_scroll_settled(on_settled: impl FnMut() + 'static) -> ScrollWatch {
+    ScrollWatch(listen(Listener::Settled(Box::new(on_settled))))
 }
 
 /// Scrolls the panel `id` so its child `at` sits in the middle (the lyrics'
@@ -1696,6 +1730,9 @@ static BRIDGED: AtomicBool = AtomicBool::new(false);
 /// Per page path, where the arrow keys last left the focus: a selector
 /// and which match it was (B712's rule, as on the web).
 static LEFT_AT: LazyLock<Mutex<HashMap<String, (String, u32)>>> = LazyLock::new(Mutex::default);
+/// Where the browse grid last stood: its page path, the tile with the
+/// focus (else the first in view) and that tile's top in CSS px (FR-603).
+static GRID_PLACE: Mutex<Option<(String, u32, f64)>> = Mutex::new(None);
 /// Each media element's last pushed state and when it came (`now_ms`).
 static MEDIA: LazyLock<Mutex<HashMap<String, (tv_page::Media, f64)>>> =
     LazyLock::new(Mutex::default);
@@ -1752,6 +1789,8 @@ enum Listener {
     Visualiser(u64, Box<dyn FnMut(String)>),
     /// The page went hidden: the app left the screen.
     Hidden(Box<dyn FnMut()>),
+    /// The browse grid's place settled (`GRID_PLACE`).
+    Settled(Box<dyn FnMut()>),
     /// The remote's next or previous key; true when a player took it.
     Skip(Box<dyn FnMut(super::watch_view::Skip, &'static str) -> bool>),
 }
@@ -1970,6 +2009,26 @@ if (!window.__pharosGuard) {
   history.replaceState("pharos-guard", "", location.href);
   history.pushState("pharos", "", location.href);
 }
+// Where the browse grid stands, for coming back to it (FR-603): the tile
+// with the focus, else the first in view, and how far below the top it
+// sits, sent once the scroll or the focus has settled.
+let placeTimer = 0;
+const gridPlace = () => {
+  clearTimeout(placeTimer);
+  placeTimer = setTimeout(() => {
+    const grid = document.querySelector('__GRID__');
+    if (!grid) return;
+    const tiles = [...grid.children];
+    const at = document.activeElement;
+    let i = at && grid.contains(at) ? tiles.findIndex((t) => t.contains(at)) : -1;
+    if (i < 0) i = tiles.findIndex((t) => t.getBoundingClientRect().bottom > 0);
+    if (i < 0) return;
+    send({ t: "place", path: location.pathname + location.search, tile: i,
+      top: tiles[i].getBoundingClientRect().top });
+  }, 150);
+};
+addEventListener("scroll", gridPlace, { passive: true });
+addEventListener("focusin", gridPlace);
 // Back closes an open dialog or menu before it goes back a page (FR-607),
 // with the Escape each of them already closes on. One that is still open
 // at the next Back, with no key pressed between, does not close on Escape:
@@ -2196,6 +2255,20 @@ fn on_bridge(message: Bridge) {
             }
         }
         Bridge::Size { w, h } => *lock(&VIEWPORT) = (w, h),
+        Bridge::Place { path, tile, top } => {
+            if path != current_path() {
+                return;
+            }
+            log::debug!("pharos: grid place tile={tile} top={top:.0} path={path}");
+            *lock(&GRID_PLACE) = Some((path, tile, top));
+            for f in &listeners {
+                if let Ok(mut f) = f.try_lock() {
+                    if let Listener::Settled(f) = &mut f.0 {
+                        f();
+                    }
+                }
+            }
+        }
         Bridge::BackClose { what, restore } => {
             let here = current_path();
             log::info!("pharos: back closed overlay what={what} path={here}");
