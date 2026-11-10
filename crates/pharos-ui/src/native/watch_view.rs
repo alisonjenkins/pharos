@@ -942,6 +942,8 @@ pub fn WatchView(
                                 src: t.vtt_url.clone().unwrap_or_default(),
                                 srclang: "{t.language}",
                                 label: track_label(&t, 0),
+                                // Its cues arrive after the delay was set.
+                                onload: move |_| platform::refresh_subtitle_delay(VIDEO_ID),
                             }
                         }
                     }
