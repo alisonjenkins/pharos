@@ -21,11 +21,12 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 
-use dioxus::core::spawn_forever;
-use dioxus::prelude::document;
+use dioxus::core::{spawn_forever, try_consume_context};
+use dioxus::prelude::document::{self, Document, Eval};
 
 use super::android::{self, Closed, NetError};
 use super::tv_page::{self, Bridge, Paths};
@@ -396,7 +397,7 @@ async fn probe_capabilities() {
          return out;",
         serde_json::to_string(&mimes).unwrap_or_else(|_| "[]".into())
     );
-    let answers: HashMap<String, (bool, bool)> = match document::eval(&script).join().await {
+    let answers: HashMap<String, (bool, bool)> = match page_eval(&script).join().await {
         Ok(a) => a,
         Err(e) => {
             log::warn!("pharos: capabilities probe failed error={e}");
@@ -887,7 +888,7 @@ pub fn watch_sentinel(
     let stopped = std::sync::Arc::new(AtomicBool::new(false));
     let live = stopped.clone();
     spawn_detached(async move {
-        let mut seen = document::eval(&script);
+        let mut seen = page_eval(&script);
         let mut fired = 0u32;
         loop {
             match seen.recv::<bool>().await {
@@ -939,7 +940,7 @@ pub fn tile_in_view(_at: u32) -> bool {
 pub fn scroll_to_tile(at: u32) -> bool {
     let script = tv_page::scroll_to_tile_js(at);
     spawn_detached(async move {
-        match document::eval(&script).join::<bool>().await {
+        match page_eval(&script).join::<bool>().await {
             Ok(true) => log::debug!("pharos: grid jump tile={at} placed=true"),
             Ok(false) => log::warn!("pharos: grid jump tile={at} placed=false reason=not_in_page"),
             Err(e) => log::warn!("pharos: grid jump tile={at} placed=false error={e}"),
@@ -1046,7 +1047,7 @@ async fn load_hlsjs() -> Result<(), String> {
          return !!window.Hls;",
         js_str(HLSJS)
     );
-    let loaded = match document::eval(&script).join::<bool>().await {
+    let loaded = match page_eval(&script).join::<bool>().await {
         Ok(true) => Ok(()),
         Ok(false) => Err("hls.js ran but defined no Hls".into()),
         Err(e) => Err(format!("hls.js: {e}")),
@@ -1541,7 +1542,7 @@ impl Drop for PageVisualiser {
 async fn load_visualiser() -> Result<(), String> {
     let script = tv_page::visualiser_load_js(VISUALISER_JS, VISUALISER_WASM_B64.trim());
     let at = now_ms();
-    match document::eval(&script).join::<bool>().await {
+    match page_eval(&script).join::<bool>().await {
         Ok(true) => {
             log::info!(
                 "pharos: visualiser module outcome=loaded wasm_b64_bytes={} took_ms={:.0}",
@@ -1679,10 +1680,35 @@ fn js_str(value: &str) -> String {
     serde_json::Value::String(value.to_owned()).to_string()
 }
 
-/// Run `script` in the page without waiting for it.
+thread_local! {
+    static PAGE: RefCell<Option<Rc<dyn Document>>> = const { RefCell::new(None) };
+}
+
+/// The page's `Document`. Dioxus 0.8 provides it in the window's scope, below
+/// the root that `spawn_forever` tasks run in, where `document::eval` finds
+/// none and falls back to a no-op that fails with `EvalError::Finished`. The
+/// first call from inside the window keeps it for the tasks.
+fn page() -> Rc<dyn Document> {
+    if let Some(found) = try_consume_context::<Rc<dyn Document>>() {
+        PAGE.with(|kept| *kept.borrow_mut() = Some(Rc::clone(&found)));
+        return found;
+    }
+    PAGE.with(|kept| kept.borrow().clone()).unwrap_or_else(|| {
+        log::warn!("pharos: eval before the page's document was seen");
+        document::document()
+    })
+}
+
+fn page_eval(script: &str) -> Eval {
+    page().eval(script.to_owned())
+}
+
+/// Run `script` in the page without waiting for it. The eval starts here, in
+/// the caller's scope, so a call from a component reaches the page.
 fn run(script: String) {
+    let eval = page_eval(&script);
     spawn_detached(async move {
-        if let Err(e) = document::eval(&script).await {
+        if let Err(e) = eval.await {
             log::warn!("pharos: eval failed error={e}");
         }
     });
@@ -1883,13 +1909,15 @@ fn install_bridge() {
         return;
     }
     let start = current_path();
+    let page = page();
     spawn_forever(async move {
-        let _ = document::eval(&format!(
-            "history.replaceState('pharos', '', {});",
-            js_str(&start)
-        ))
-        .await;
-        let mut bridge = document::eval(&tv_page::bridge_script(BRIDGE_JS));
+        let _ = page
+            .eval(format!(
+                "history.replaceState('pharos', '', {});",
+                js_str(&start)
+            ))
+            .await;
+        let mut bridge = page.eval(tv_page::bridge_script(BRIDGE_JS));
         log::info!(
             "pharos: bridge installed video_tick_ms={} audio_tick_ms={}",
             tv_page::VIDEO_TICK_MS,
@@ -2152,14 +2180,14 @@ return first ? go(first) : false;
 async fn move_focus_now(dir: super::keymap::Dir) -> Result<(), String> {
     use super::keymap::Dir;
     let first_or_last = matches!(dir, Dir::First | Dir::Last);
-    let found: Targets = document::eval(&targets_js(first_or_last))
+    let found: Targets = page_eval(&targets_js(first_or_last))
         .join()
         .await
         .map_err(|e| e.to_string())?;
     let Some(from) = found.from else {
         let path = current_path();
         let left = lock(&LEFT_AT).get(&path).cloned();
-        document::eval(&arrive_js(left.as_ref()))
+        page_eval(&arrive_js(left.as_ref()))
             .await
             .map_err(|e| e.to_string())?;
         return Ok(());
@@ -2176,7 +2204,7 @@ async fn move_focus_now(dir: super::keymap::Dir) -> Result<(), String> {
     }
     // Only the control moved to is marked for coming back: marking every
     // one ran a document-wide query per control, hundreds on a home page.
-    let (sel, nth): (String, u32) = document::eval(&focus_js(at))
+    let (sel, nth): (String, u32) = page_eval(&focus_js(at))
         .join()
         .await
         .map_err(|e| e.to_string())?;
