@@ -485,7 +485,7 @@ mod tests {
             server_place_to_adopt(&kept, None, Some(&server("", 0)), false),
             None
         );
-        // A server older than schemaVersion 37 sends no time to judge by.
+        // A server older than schemaVersion 39 sends no time to judge by.
         assert_eq!(
             server_place_to_adopt(&book("1", 10), None, Some(&server("theirs", 0)), false),
             None
