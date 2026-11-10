@@ -1766,8 +1766,13 @@ fn NativeApp(route: Route) -> Element {
     // signed-out page never shows the last user's item to the next one.
     let PageNames(mut names) = use_context::<PageNames>();
     use_effect(move || {
-        if matches!(machine.read().phase(), Phase::SignIn { .. }) && !names.peek().is_empty() {
-            names.write().clear();
+        if matches!(machine.read().phase(), Phase::SignIn { .. }) {
+            // Every road to sign-in, a revoked session or a refused resume
+            // included: the next user's report must not carry this trail.
+            report::forget();
+            if !names.peek().is_empty() {
+                names.write().clear();
+            }
         }
     });
     // Signing out ends the session, and the player with it; signing in
@@ -3057,8 +3062,21 @@ fn PrivacyScreen() -> Element {
         let listed = api
             .list_reports(&call("telemetry", "list_reports"), false)
             .await;
+        // A server keeping no reports, or one older than schema 35, is a
+        // normal state: an empty list, not an alert.
+        let quiet = listed.as_ref().err().is_some_and(|e| {
+            e.is_unimplemented()
+                || matches!(
+                    e,
+                    ClientError::Api {
+                        kind: "unavailable",
+                        ..
+                    }
+                )
+        });
         match settle(ctx.machine, listed) {
             Ok(rows) => reports.set(rows),
+            Err(_) if quiet => reports.set(Vec::new()),
             Err(e) => notify(
                 notice,
                 format!("Could not load your problem reports: {e}"),
