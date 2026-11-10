@@ -1812,7 +1812,12 @@ body:has(.pharos-stage.is-full) .pharos-status-note {
    shell's copy under it goes (FR-503). Keyed on that player's note, not the
    stage, so a player still loading, a song handing over (inert) or the mini
    bar leaves the shell's line up. */
+/* The mini bar and floating window keep only the activity line (a command
+   the group missed says so there too), at the top of the picture. */
 .pharos-stage:not(.is-full) .pharos-watch-notes {
+  top: 0.5rem;
+}
+.pharos-stage:not(.is-full) .pharos-watch-notes > :not(.pharos-activity-toast) {
   display: none;
 }
 body:has(.pharos-stage.is-full .pharos-stage-slot:not([inert]) .pharos-connection-lost)
