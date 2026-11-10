@@ -3294,6 +3294,106 @@ test.describe("pharos Dioxus UI", () => {
       expect(lines.some((l) => /playback skip item=/.test(l)), lines.join("\n")).toBe(true);
     });
 
+    test("a slow seek says where it is going and offers the way back", async ({
+      page,
+      request,
+    }) => {
+      test.setTimeout(90_000);
+      const probe = await request.get(`${PHAROS_URL}/pharos/session`, {
+        headers: { Accept: "application/json" },
+      });
+      test.skip(
+        probe.status() !== 405,
+        `native API is not enabled (status ${probe.status()}); skipping native test`,
+      );
+      const auth = await request.post(`${PHAROS_URL}/Users/AuthenticateByName`, {
+        headers: {
+          "Content-Type": "application/json",
+          "X-Emby-Authorization": `MediaBrowser Client="playwright", Device="pw", DeviceId="pw-seekwait-${Date.now()}", Version="0"`,
+        },
+        data: { Username: TEST_USER, Pw: TEST_PASS },
+      });
+      test.skip(!auth.ok(), `pharos has no seeded test user (${TEST_USER})`);
+      const { AccessToken: token, User: user } = await auth.json();
+      const items = await (
+        await request.get(
+          `${PHAROS_URL}/Users/${user.Id}/Items?Recursive=true&IncludeItemTypes=Movie&Fields=Path`,
+          { headers: { "X-Emby-Token": token } },
+        )
+      ).json();
+      const movie = items.Items?.find((i: { Path?: string }) =>
+        i.Path?.endsWith("/fixture-1.webm"),
+      );
+      test.skip(!movie, "pharos has no seeded two-minute fixture");
+      const nativeId = BigInt(`0x${movie.Id}`).toString();
+
+      await page.goto("/ui/");
+      await page.locator("#signin-name").fill(TEST_USER);
+      await page.locator("#signin-password").fill(TEST_PASS);
+      await page.getByRole("button", { name: "Sign in" }).click();
+      await expect(page.locator(".pharos-shell-bar")).toBeVisible({
+        timeout: 15_000,
+      });
+      // A stand-in for a seek into a file with no seek index, which waits on
+      // the server reading from the start: once armed, the first seek never
+      // lands (the element stays `seeking`); the next one is real.
+      await page.addInitScript(() => {
+        const w = window as unknown as { slowSeek: { armed: boolean; held?: number } };
+        w.slowSeek = { armed: false };
+        const real = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, "currentTime")!;
+        Object.defineProperty(HTMLMediaElement.prototype, "currentTime", {
+          configurable: true,
+          get() {
+            return real.get!.call(this);
+          },
+          set(t: number) {
+            if (w.slowSeek.armed && w.slowSeek.held === undefined) {
+              w.slowSeek.held = t;
+              Object.defineProperty(this, "seeking", { configurable: true, get: () => true });
+              this.dispatchEvent(new Event("seeking"));
+              return;
+            }
+            if (w.slowSeek.held !== undefined) {
+              delete (this as { seeking?: boolean }).seeking;
+              w.slowSeek = { armed: false };
+            }
+            real.set!.call(this, t);
+          },
+        });
+      });
+      await page.goto(`/ui/watch/${nativeId}`);
+      // Playing, a few seconds in: that is where "go back" returns to.
+      await expect
+        .poll(
+          () =>
+            page.evaluate(() => {
+              const v = document.querySelector("video");
+              return v && !v.paused ? v.currentTime : 0;
+            }),
+          { timeout: 30_000 },
+        )
+        .toBeGreaterThan(3);
+      await page.evaluate(() => {
+        (window as unknown as { slowSeek: { armed: boolean } }).slowSeek.armed = true;
+      });
+      const from = await page.evaluate(() => document.querySelector("video")!.currentTime);
+      await page.locator(".pharos-watch").hover();
+      await page.keyboard.press("8");
+      const card = page.locator('[data-seek-wait="true"]');
+      await expect(card).toBeVisible({ timeout: 15_000 });
+      const held = await page.evaluate(
+        () => (window as unknown as { slowSeek: { held?: number } }).slowSeek.held,
+      );
+      expect(held, "the seek went to 80%").toBeGreaterThan(from + 10);
+      await expect(card).toContainText(/Jumping to \d+:\d\d…/);
+      await expect(card).toContainText(/Waiting \d+ s/);
+      const back = card.getByRole("button", { name: /Go back to \d+:\d\d/ });
+      await back.click();
+      await expect(card).toHaveCount(0, { timeout: 15_000 });
+      const landed = await page.evaluate(() => document.querySelector("video")!.currentTime);
+      expect(Math.abs(landed - from)).toBeLessThan(3);
+    });
+
     test("the Appearance page applies, keeps, imports, refuses and exports themes", async ({
       page,
       request,
