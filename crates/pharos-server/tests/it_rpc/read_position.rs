@@ -26,7 +26,7 @@ type Saved = (bool, String, f32, u64);
 
 async fn seed_books(fx: &Fixture) {
     for (id, name, format, author) in [
-        (EPUB, "Dune", CoreFormat::Epub, Some("Frank Herbert")),
+        (EPUB, "Book A", CoreFormat::Epub, Some("Author A")),
         (SECOND_EPUB, "Emma", CoreFormat::Epub, None),
         (MOBI, "Locked", CoreFormat::Unreadable, None),
     ] {
@@ -219,7 +219,7 @@ async fn a_saved_position_reads_back_with_the_books_format() {
             let session = session_for(&client, &fx.user_token).await;
             let before = detail(&session, EPUB).await;
             assert_eq!(before.format, Some(BookFormat::Epub));
-            assert_eq!(before.author, "Frank Herbert");
+            assert_eq!(before.author, "Author A");
             assert_eq!(before.saved, (false, String::new(), 0.0, 0));
 
             let saved = save(&session, WireId::Real(EPUB), "epub:3:120", 0.25).await;

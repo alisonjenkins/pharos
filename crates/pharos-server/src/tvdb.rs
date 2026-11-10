@@ -622,7 +622,7 @@ fn encode_query(q: &str) -> String {
 /// without a live API key; malformed JSON or a missing `data` array yields
 /// an empty `Vec` rather than panicking (search is best-effort). TVDB
 /// carries `year` as a string, unlike TMDB's date strings. `name` is the
-/// show's ORIGINAL-language title (`ドラゴンボール` for Dragon Ball), so the
+/// show's ORIGINAL-language title (`ショーK` for Show K), so the
 /// English `translations.eng` and the `aliases` ride along as the candidate's
 /// aliases for [`pharos_core::match_best`] (B557).
 pub(crate) fn parse_series_search(body: &str) -> Vec<SearchCandidate> {
@@ -828,7 +828,7 @@ pub(crate) fn parse_series_detail(body: &str) -> Option<EnrichedMetadata> {
 
 /// Decode the HTML character references TVDB leaves in its text fields
 /// (search names included, so `R&amp;R` can still match a query exactly), once:
-/// its JSON carries `Dragon Ball R&amp;R` for "R&R", and the UI escapes what
+/// its JSON carries `Show K R&amp;R` for "R&R", and the UI escapes what
 /// it is given, so the reference showed on screen (B558). A single left-to-
 /// right pass, so `&amp;lt;` becomes `&lt;` rather than `<`. An unknown or
 /// unterminated reference is kept as written.
@@ -1223,9 +1223,9 @@ const EPISODE_NAME_MAX_SHIFT: u64 = 3;
 /// cross-checked against the episode's own `name` (B570).
 ///
 /// The file's `SxxEyy` and the provider can count a season differently: TVDB
-/// now lists The Next Generation's two-part pilot as one episode, so every
+/// now lists a long-running series' two-part pilot as one episode, so every
 /// later episode sits one number lower than in files named before the
-/// change, and "S01E03 - The Naked Now" is TVDB's S01E02. When the numbered
+/// change, and "S01E03 - The Quiet Arrival" is TVDB's S01E02. When the numbered
 /// record's name does not resemble `name` and exactly one record nearby in
 /// the same season does, that record is the episode. A `name` that is a
 /// stand-in ("Episode 6", a release tag) matches nothing and leaves the
@@ -1306,8 +1306,8 @@ fn names_an_episode(name: &str) -> bool {
     letters >= 3 && !stand_in
 }
 
-/// Whether `a` and `b` carry the same numbers ("Graduation Day (2)" is not
-/// "Graduation Day (1)", though the two read 94% alike).
+/// Whether `a` and `b` carry the same numbers ("Final Exam (2)" is not
+/// "Final Exam (1)", though the two read 94% alike).
 fn same_numbers(a: &str, b: &str) -> bool {
     let numbers = |s: &str| -> Vec<String> {
         s.split(|c: char| !c.is_ascii_digit())
@@ -1787,13 +1787,13 @@ mod tests {
     async fn tvdb_jwt_cached_and_relogin_on_401() {
         let t = FakeTransport::new()
             .push_login("jwt-1")
-            .push_ok(r#"{"data":{"id":121361,"name":"Game of Thrones"}}"#) // first call ok
+            .push_ok(r#"{"data":{"id":910206,"name":"Show S"}}"#) // first call ok
             .push_401() // token expired
             .push_login("jwt-2")
-            .push_ok(r#"{"data":{"id":121361,"name":"Game of Thrones"}}"#); // retried ok
+            .push_ok(r#"{"data":{"id":910206,"name":"Show S"}}"#); // retried ok
         let c = TvdbClient::with_transport("key".into(), t.clone());
-        assert!(c.get_series("121361").await.is_some());
-        assert!(c.get_series("121361").await.is_some());
+        assert!(c.get_series("910206").await.is_some());
+        assert!(c.get_series("910206").await.is_some());
         assert_eq!(t.login_count(), 2); // logged in once, re-logged once after 401
     }
 
@@ -1845,7 +1845,7 @@ mod tests {
     async fn tvdb_login_failure_yields_none_without_panicking() {
         let t = FakeTransport::new(); // no queued login token
         let c = TvdbClient::with_transport("key".into(), t);
-        assert!(c.get_series("121361").await.is_none());
+        assert!(c.get_series("910206").await.is_none());
     }
 
     #[tokio::test]
@@ -1856,48 +1856,45 @@ mod tests {
             .push_login("jwt-2")
             .push_401(); // still failing after re-login
         let c = TvdbClient::with_transport("key".into(), t.clone());
-        assert!(c.get_series("121361").await.is_none());
+        assert!(c.get_series("910206").await.is_none());
         assert_eq!(t.login_count(), 2);
     }
 
     #[test]
     fn tvdb_parse_series_search_yields_candidates() {
-        let body = r#"{"data":[{"tvdb_id":"121361","name":"Game of Thrones","year":"2011"}]}"#;
+        let body = r#"{"data":[{"tvdb_id":"910206","name":"Show S","year":"2011"}]}"#;
         let c = super::parse_series_search(body);
         assert_eq!(c.len(), 1);
-        assert_eq!(c[0].id, "121361");
-        assert_eq!(c[0].title, "Game of Thrones");
+        assert_eq!(c[0].id, "910206");
+        assert_eq!(c[0].title, "Show S");
         assert_eq!(c[0].year, Some(2011));
     }
 
-    /// B557: trimmed from the live `/search?query=Dragon Ball&type=series`
-    /// response (2026-11-05). The real shows are named in Japanese; the fan
+    /// B557: trimmed from a `/search?query=Show K&type=series`
+    /// response. The real shows are named in Japanese; the fan
     /// works ahead of them in TVDB's order are named in English.
-    const DRAGON_BALL_SEARCH: &str = r#"{"data":[
-      {"tvdb_id":"272910","name":"Dragon Ball Absalon","year":"2012","translations":{"eng":"Dragon Ball Absalon"},"aliases":[]},
-      {"tvdb_id":"248580","name":"Dragon Ball Z Abridged","year":"2008","translations":{"eng":"Dragon Ball Z Abridged"},"aliases":["Dragon Ball Z: Abridged","DBZ: Abridged"]},
-      {"tvdb_id":"374456","name":"Dragon Ball R&R","year":"2018","translations":{"eng":"Dragon Ball R&R"}},
-      {"tvdb_id":"76666","name":"ドラゴンボール","year":"1986","translations":{"eng":"Dragon Ball","jpn":"ドラゴンボール"},"aliases":["Dragonball"]},
-      {"tvdb_id":"347734","name":"スーパードラゴンボールヒーローズ","year":"2018","translations":{"eng":"Super Dragon Ball Heroes"}},
-      {"tvdb_id":"81472","name":"ドラゴンボールZ","year":"1989","translations":{"eng":"Dragon Ball Z"},"aliases":["Dragonball Z","Dragon Ball Z (1989)"]}
+    const SHOW_K_SEARCH: &str = r#"{"data":[
+      {"tvdb_id":"910201","name":"Show K Absalon","year":"2012","translations":{"eng":"Show K Absalon"},"aliases":[]},
+      {"tvdb_id":"910202","name":"Show K Z Abridged","year":"2008","translations":{"eng":"Show K Z Abridged"},"aliases":["Show K Z: Abridged","SKZ: Abridged"]},
+      {"tvdb_id":"910203","name":"Show K R&R","year":"2018","translations":{"eng":"Show K R&R"}},
+      {"tvdb_id":"910103","name":"ショーK","year":"1986","translations":{"eng":"Show K","jpn":"ショーK"},"aliases":["Showkay"]},
+      {"tvdb_id":"910204","name":"スーパーショーKヒーローズ","year":"2018","translations":{"eng":"Super Show K Heroes"}},
+      {"tvdb_id":"910205","name":"ショーKZ","year":"1989","translations":{"eng":"Show K Z"},"aliases":["Showkay Z","Show K Z (1989)"]}
     ]}"#;
 
     #[test]
     fn tvdb_series_search_matches_an_anime_by_its_english_translation() {
-        let cands = super::parse_series_search(DRAGON_BALL_SEARCH);
-        let real = cands.iter().find(|c| c.id == "76666").unwrap();
-        assert_eq!(real.aliases, ["Dragon Ball", "Dragonball"]);
+        let cands = super::parse_series_search(SHOW_K_SEARCH);
+        let real = cands.iter().find(|c| c.id == "910103").unwrap();
+        assert_eq!(real.aliases, ["Show K", "Showkay"]);
         let pick = |q| pharos_core::match_best(q, None, &cands, 0.7).unwrap().id;
-        assert_eq!(pick("Dragon Ball"), "76666");
-        assert_eq!(pick("Dragon Ball Z"), "81472");
+        assert_eq!(pick("Show K"), "910103");
+        assert_eq!(pick("Show K Z"), "910205");
     }
 
     #[test]
     fn decode_entities_decodes_tvdb_references_once() {
-        assert_eq!(
-            super::decode_entities("Dragon Ball R&amp;R"),
-            "Dragon Ball R&R"
-        );
+        assert_eq!(super::decode_entities("Show K R&amp;R"), "Show K R&R");
         assert_eq!(
             super::decode_entities("&#39;85 &#x26; &quot;x&quot;"),
             "'85 & \"x\""
@@ -1911,13 +1908,13 @@ mod tests {
 
     #[test]
     fn tvdb_series_detail_overview_has_no_html_references() {
-        let body = r#"{"data":{"id":374456,"name":"Dragon Ball R&amp;R",
-            "overview":"Dragon Ball R&amp;R is a fan-made audio manga drama"}}"#;
+        let body = r#"{"data":{"id":910203,"name":"Show K R&amp;R",
+            "overview":"Show K R&amp;R is a fan-made audio manga drama"}}"#;
         let m = super::parse_series_detail(body).unwrap();
-        assert_eq!(m.title.as_deref(), Some("Dragon Ball R&R"));
+        assert_eq!(m.title.as_deref(), Some("Show K R&R"));
         assert_eq!(
             m.overview.as_deref(),
-            Some("Dragon Ball R&R is a fan-made audio manga drama")
+            Some("Show K R&R is a fan-made audio manga drama")
         );
     }
 
@@ -1929,31 +1926,31 @@ mod tests {
 
     #[test]
     fn tvdb_parse_series_detail_extracts_fields_and_remote_tmdb_id() {
-        let body = r#"{"data":{"id":121361,"name":"Game of Thrones","overview":"Nine noble families...",
-            "year":"2011","firstAired":"2011-04-17","image":"https://artworks.thetvdb.com/banners/posters/121361.jpg",
+        let body = r#"{"data":{"id":910206,"name":"Show S","overview":"Several rival houses...",
+            "year":"2011","firstAired":"2011-04-17","image":"https://artworks.thetvdb.com/banners/posters/910206.jpg",
             "genres":[{"name":"Drama"},{"name":"Fantasy"}],
             "remoteIds":[{"sourceName":"IMDB","id":"tt0944947"},{"sourceName":"TheMovieDB","id":"1399"}]}}"#;
         let e = super::parse_series_detail(body).unwrap();
-        assert_eq!(e.title.as_deref(), Some("Game of Thrones"));
-        assert_eq!(e.overview.as_deref(), Some("Nine noble families..."));
+        assert_eq!(e.title.as_deref(), Some("Show S"));
+        assert_eq!(e.overview.as_deref(), Some("Several rival houses..."));
         assert_eq!(e.production_year, Some(2011));
         assert_eq!(e.genres, vec!["Drama", "Fantasy"]);
-        assert_eq!(e.provider_id.as_deref(), Some("121361"));
+        assert_eq!(e.provider_id.as_deref(), Some("910206"));
         assert_eq!(e.also_tmdb_id.as_deref(), Some("1399"));
         assert!(e
             .artwork
             .iter()
-            .any(|a| a.role == ArtworkRole::Primary && a.url.ends_with("121361.jpg")));
+            .any(|a| a.role == ArtworkRole::Primary && a.url.ends_with("910206.jpg")));
         // firstAired "2011-04-17" -> unix seconds at UTC midnight.
         assert_eq!(e.premiere_date, Some(1_302_998_400));
     }
 
     #[test]
     fn tvdb_parse_series_detail_tolerates_sparse_fixture() {
-        let body = r#"{"data":{"id":121361,"name":"Game of Thrones"}}"#;
+        let body = r#"{"data":{"id":910206,"name":"Show S"}}"#;
         let e = super::parse_series_detail(body).unwrap();
-        assert_eq!(e.title.as_deref(), Some("Game of Thrones"));
-        assert_eq!(e.provider_id.as_deref(), Some("121361"));
+        assert_eq!(e.title.as_deref(), Some("Show S"));
+        assert_eq!(e.provider_id.as_deref(), Some("910206"));
         assert_eq!(e.also_tmdb_id, None);
         assert!(e.artwork.is_empty());
         assert_eq!(e.premiere_date, None); // no firstAired in this sparse fixture
@@ -1965,7 +1962,7 @@ mod tests {
     /// `/series/{id}/extended` body already carries `artworks[]`.
     #[test]
     fn series_detail_takes_backdrop_and_logo_from_artworks() {
-        let body = r#"{"data":{"name":"Death Note","image":"https://art/poster.jpg",
+        let body = r#"{"data":{"name":"Show L","image":"https://art/poster.jpg",
             "artworks":[
               {"type":3,"image":"https://art/fanart-low.jpg","score":10},
               {"type":3,"image":"https://art/fanart-best.jpg","score":99},
@@ -2004,12 +2001,12 @@ mod tests {
     #[test]
     fn tvdb_parse_episode_detail_extracts_matching_episode() {
         let body = r#"{"data":{"episodes":[
-            {"id":1,"seasonNumber":1,"number":1,"name":"Winter Is Coming","overview":"Lord Stark...","aired":"2011-04-17","image":"https://artworks.thetvdb.com/ep1.jpg"},
-            {"id":2,"seasonNumber":1,"number":2,"name":"The Kingsroad","overview":"While Bran...","aired":"2011-04-24"}
+            {"id":1,"seasonNumber":1,"number":1,"name":"The First Frost","overview":"Lord Ash...","aired":"2011-04-17","image":"https://artworks.thetvdb.com/ep1.jpg"},
+            {"id":2,"seasonNumber":1,"number":2,"name":"The Old Highway","overview":"While the heir...","aired":"2011-04-24"}
         ]}}"#;
         let e = super::parse_episode_detail(body, 1, 1, None).unwrap();
-        assert_eq!(e.title.as_deref(), Some("Winter Is Coming"));
-        assert_eq!(e.overview.as_deref(), Some("Lord Stark..."));
+        assert_eq!(e.title.as_deref(), Some("The First Frost"));
+        assert_eq!(e.overview.as_deref(), Some("Lord Ash..."));
         assert_eq!(e.provider_id.as_deref(), Some("1"));
         // B125 — an episode still is its Primary, not its Thumb.
         assert!(e
@@ -2024,7 +2021,7 @@ mod tests {
         assert_eq!(e2.premiere_date, Some(1_303_603_200));
     }
 
-    /// TVDB's season of The Next Generation, which now counts the two-part
+    /// TVDB's season of a long-running series, which now counts the two-part
     /// pilot once: every later episode sits one number below the files'.
     /// B983: TVDB pages `/episodes/default`. A long show's episodes after
     /// the first page (a very long show's after about 500) are read from page 1
@@ -2032,20 +2029,20 @@ mod tests {
     #[tokio::test]
     async fn a_paged_episode_list_is_read_to_its_last_page() {
         const PAGE0: &str = r#"{"data":{"episodes":[
-            {"id":1,"seasonNumber":1,"number":1,"name":"Romance Dawn","aired":"1999-10-20"}]},
-            "links":{"next":"https://api4.thetvdb.com/v4/series/81797/episodes/default?page=1"}}"#;
+            {"id":1,"seasonNumber":1,"number":1,"name":"Opening Voyage","aired":"1999-10-20"}]},
+            "links":{"next":"https://api4.thetvdb.com/v4/series/910004/episodes/default?page=1"}}"#;
         const PAGE1: &str = r#"{"data":{"episodes":[
             {"id":1050,"seasonNumber":21,"number":1,"name":"Honor","aired":"2023-01-29"}]},
             "links":{"next":null}}"#;
         let transport = || {
             FakeTransport::new()
                 .push_login("jwt")
-                .route("/series/81797/episodes/default", 200, PAGE0)
-                .route("/series/81797/episodes/default?page=1", 200, PAGE1)
+                .route("/series/910004/episodes/default", 200, PAGE0)
+                .route("/series/910004/episodes/default?page=1", 200, PAGE1)
         };
         let t = transport();
         let c = TvdbClient::with_transport("key".into(), t.clone());
-        let list = c.episode_list("81797").await.expect("a list");
+        let list = c.episode_list("910004").await.expect("a list");
         assert_eq!(
             list.iter()
                 .map(|l| (l.season, l.episode))
@@ -2055,14 +2052,14 @@ mod tests {
         assert_eq!(
             t.paths(),
             [
-                "/series/81797/episodes/default",
-                "/series/81797/episodes/default?page=1"
+                "/series/910004/episodes/default",
+                "/series/910004/episodes/default?page=1"
             ]
         );
 
         let c = TvdbClient::with_transport("key".into(), transport());
         let md = c
-            .get_episode("81797", 21, 1, Some("Honor"))
+            .get_episode("910004", 21, 1, Some("Honor"))
             .await
             .expect("the episode on the second page");
         assert_eq!(md.title.as_deref(), Some("Honor"));
@@ -2071,20 +2068,20 @@ mod tests {
         // later episodes do not exist.
         let t = FakeTransport::new()
             .push_login("jwt")
-            .route("/series/81797/episodes/default", 200, PAGE0)
-            .route("/series/81797/episodes/default?page=1", 500, "");
+            .route("/series/910004/episodes/default", 200, PAGE0)
+            .route("/series/910004/episodes/default?page=1", 500, "");
         let c = TvdbClient::with_transport("key".into(), t);
-        assert!(c.episode_list("81797").await.is_none());
+        assert!(c.episode_list("910004").await.is_none());
     }
 
-    const TNG_S1: &str = r#"{"data":{"episodes":[
-        {"id":101,"seasonNumber":1,"number":1,"name":"Encounter at Farpoint"},
-        {"id":102,"seasonNumber":1,"number":2,"name":"The Naked Now","overview":"An infection."},
-        {"id":103,"seasonNumber":1,"number":3,"name":"Code of Honor","overview":"Tasha Yar is kidnapped."},
-        {"id":104,"seasonNumber":1,"number":4,"name":"The Last Outpost"},
+    const SHOW_N_S1: &str = r#"{"data":{"episodes":[
+        {"id":101,"seasonNumber":1,"number":1,"name":"Meeting at the Harbour"},
+        {"id":102,"seasonNumber":1,"number":2,"name":"The Quiet Arrival","overview":"An infection."},
+        {"id":103,"seasonNumber":1,"number":3,"name":"Rite of Honour","overview":"The pilot is kidnapped."},
+        {"id":104,"seasonNumber":1,"number":4,"name":"The Far Station"},
         {"id":108,"seasonNumber":1,"number":8,"name":"Pilot"},
-        {"id":201,"seasonNumber":2,"number":1,"name":"Graduation Day (1)"},
-        {"id":202,"seasonNumber":2,"number":2,"name":"Graduation Day (2)"},
+        {"id":201,"seasonNumber":2,"number":1,"name":"Final Exam (1)"},
+        {"id":202,"seasonNumber":2,"number":2,"name":"Final Exam (2)"},
         {"id":209,"seasonNumber":2,"number":9,"name":"Twin"},
         {"id":210,"seasonNumber":2,"number":10,"name":"Twin"}
     ]}}"#;
@@ -2093,8 +2090,8 @@ mod tests {
     /// one number off, not the one its number points at.
     #[test]
     fn an_episode_takes_the_record_its_name_matches() {
-        let e = super::parse_episode_detail(TNG_S1, 1, 3, Some("The Naked Now")).unwrap();
-        assert_eq!(e.title.as_deref(), Some("The Naked Now"));
+        let e = super::parse_episode_detail(SHOW_N_S1, 1, 3, Some("The Quiet Arrival")).unwrap();
+        assert_eq!(e.title.as_deref(), Some("The Quiet Arrival"));
         assert_eq!(e.overview.as_deref(), Some("An infection."));
         assert_eq!(e.provider_id.as_deref(), Some("102"));
         assert_eq!(e.episode_number, Some((1, 2)));
@@ -2107,7 +2104,8 @@ mod tests {
     #[test]
     fn an_episode_keeps_its_numbered_record_without_a_clear_named_one() {
         let pick = |season, episode, name| {
-            super::parse_episode_detail(TNG_S1, season, episode, name).and_then(|e| e.provider_id)
+            super::parse_episode_detail(SHOW_N_S1, season, episode, name)
+                .and_then(|e| e.provider_id)
         };
         assert_eq!(pick(1, 3, Some("Code of Honour")).as_deref(), Some("103"));
         assert_eq!(pick(1, 3, None).as_deref(), Some("103"));
@@ -2121,28 +2119,19 @@ mod tests {
             "five away"
         );
         assert_eq!(
-            pick(2, 1, Some("Encounter at Farpoint")).as_deref(),
+            pick(2, 1, Some("Meeting at the Harbour")).as_deref(),
             Some("201")
         );
-        assert_eq!(
-            pick(2, 1, Some("Graduation Day (1)")).as_deref(),
-            Some("201")
-        );
-        assert_eq!(
-            pick(2, 3, Some("Graduation Day (2)")).as_deref(),
-            Some("202")
-        );
-        assert_eq!(
-            pick(2, 1, Some("Graduation Day (3)")).as_deref(),
-            Some("201")
-        );
+        assert_eq!(pick(2, 1, Some("Final Exam (1)")).as_deref(), Some("201"));
+        assert_eq!(pick(2, 3, Some("Final Exam (2)")).as_deref(), Some("202"));
+        assert_eq!(pick(2, 1, Some("Final Exam (3)")).as_deref(), Some("201"));
         assert_eq!(
             pick(2, 8, Some("Twin")).as_deref(),
             None,
             "a tie keeps the (absent) number"
         );
         assert_eq!(
-            super::parse_episode_detail(TNG_S1, 1, 3, None)
+            super::parse_episode_detail(SHOW_N_S1, 1, 3, None)
                 .unwrap()
                 .episode_number,
             Some((1, 3))
@@ -2153,16 +2142,20 @@ mod tests {
     /// found by its name.
     #[test]
     fn an_episode_record_names_its_neighbours() {
-        let e = super::parse_episode_detail(TNG_S1, 1, 3, Some("Code of Honor")).unwrap();
+        let e = super::parse_episode_detail(SHOW_N_S1, 1, 3, Some("Rite of Honour")).unwrap();
         assert_eq!(
             e.neighbour_titles,
-            ["Encounter at Farpoint", "The Naked Now", "The Last Outpost"]
+            [
+                "Meeting at the Harbour",
+                "The Quiet Arrival",
+                "The Far Station"
+            ]
         );
     }
 
     #[test]
     fn an_episode_past_the_end_of_the_list_is_found_by_its_name() {
-        let e = super::parse_episode_detail(TNG_S1, 1, 5, Some("The Last Outpost")).unwrap();
+        let e = super::parse_episode_detail(SHOW_N_S1, 1, 5, Some("The Far Station")).unwrap();
         assert_eq!(e.provider_id.as_deref(), Some("104"));
     }
 
@@ -2177,13 +2170,13 @@ mod tests {
                 200,
                 r#"{"data":{"id":103,"seriesId":71470,"seasonNumber":1,"number":3}}"#,
             )
-            .route("/series/71470/episodes/default", 200, TNG_S1);
+            .route("/series/71470/episodes/default", 200, SHOW_N_S1);
         let c = TvdbClient::with_transport("key".into(), t.clone());
         let md = c
-            .get_episode("103", 1, 3, Some("The Naked Now"))
+            .get_episode("103", 1, 3, Some("The Quiet Arrival"))
             .await
             .expect("the series' record");
-        assert_eq!(md.title.as_deref(), Some("The Naked Now"));
+        assert_eq!(md.title.as_deref(), Some("The Quiet Arrival"));
         assert_eq!(md.provider_id.as_deref(), Some("102"));
         assert_eq!(
             md.series_id.as_deref(),
@@ -2203,9 +2196,9 @@ mod tests {
                 200,
                 r#"{"data":{"id":102,"seriesId":71470,"seasonNumber":1,"number":2}}"#,
             )
-            .route("/series/71470/episodes/default", 200, TNG_S1);
+            .route("/series/71470/episodes/default", 200, SHOW_N_S1);
         let c = TvdbClient::with_transport("key".into(), t);
-        let md = c.get_episode("102", 1, 3, Some("The Naked Now")).await;
+        let md = c.get_episode("102", 1, 3, Some("The Quiet Arrival")).await;
         assert_eq!(md.and_then(|m| m.provider_id).as_deref(), Some("102"));
 
         // A record with no series id is no episode to read through.
@@ -2216,7 +2209,7 @@ mod tests {
                 200,
                 r#"{"data":{"id":71470,"seriesId":null}}"#,
             )
-            .route("/series/71470/episodes/default", 200, TNG_S1);
+            .route("/series/71470/episodes/default", 200, SHOW_N_S1);
         let c = TvdbClient::with_transport("key".into(), t);
         assert!(c.get_episode("71470", 1, 3, None).await.is_some());
     }
@@ -2234,7 +2227,7 @@ mod tests {
                 200,
                 r#"{"data":{"id":71470,"seriesId":5,"seasonNumber":1,"number":9}}"#,
             )
-            .route("/series/71470/episodes/default", 200, TNG_S1);
+            .route("/series/71470/episodes/default", 200, SHOW_N_S1);
         let c = TvdbClient::with_transport("key".into(), t.clone());
         let md = c.get_episode("71470", 1, 3, None).await.expect("record");
         assert_eq!(md.provider_id.as_deref(), Some("103"));
@@ -2255,7 +2248,7 @@ mod tests {
 
     #[test]
     fn tvdb_parse_episode_detail_none_when_no_match() {
-        let body = r#"{"data":{"episodes":[{"id":1,"seasonNumber":1,"number":1,"name":"Winter Is Coming"}]}}"#;
+        let body = r#"{"data":{"episodes":[{"id":1,"seasonNumber":1,"number":1,"name":"The First Frost"}]}}"#;
         assert!(super::parse_episode_detail(body, 9, 9, None).is_none());
     }
 
@@ -2266,17 +2259,17 @@ mod tests {
     }
 
     /// A Japanese base record with an English translation inline.
-    const ANIME_SERIES: &str = r#"{"data":{"id":76666,"name":"ドラゴンボール",
-        "overview":"悟空の冒険。","originalLanguage":"jpn",
+    const ANIME_SERIES: &str = r#"{"data":{"id":910103,"name":"ショーK",
+        "overview":"勇者の冒険。","originalLanguage":"jpn",
         "translations":{
           "nameTranslations":[
-            {"language":"jpn","name":"ドラゴンボール","isPrimary":true},
-            {"language":"eng","name":"Dragon Ball"},
-            {"language":"eng","name":"DB","isAlias":true}],
+            {"language":"jpn","name":"ショーK","isPrimary":true},
+            {"language":"eng","name":"Show K"},
+            {"language":"eng","name":"SK","isAlias":true}],
           "overviewTranslations":[
-            {"language":"jpn","overview":"悟空の冒険。","isPrimary":true},
-            {"language":"eng","overview":"Goku sets out.","isPrimary":false},
-            {"language":"fra","overview":"Goku part."}]}}}"#;
+            {"language":"jpn","overview":"勇者の冒険。","isPrimary":true},
+            {"language":"eng","overview":"The hero sets out.","isPrimary":false},
+            {"language":"fra","overview":"Le héros part."}]}}}"#;
 
     fn by_lang<'a>(texts: &'a [LocalizedText], lang: &str) -> Option<&'a LocalizedText> {
         texts.iter().find(|t| t.language == lang)
@@ -2286,13 +2279,13 @@ mod tests {
     async fn series_text_is_english_when_tvdb_has_it() {
         let t = FakeTransport::new().push_login("jwt").push_ok(ANIME_SERIES);
         let c = TvdbClient::with_transport("key".into(), t.clone());
-        let md = c.get_series("76666").await.unwrap();
-        assert_eq!(t.paths(), vec!["/series/76666/extended?meta=translations"]);
-        assert_eq!(md.overview.as_deref(), Some("Goku sets out."));
-        assert_eq!(md.title.as_deref(), Some("Dragon Ball"));
+        let md = c.get_series("910103").await.unwrap();
+        assert_eq!(t.paths(), vec!["/series/910103/extended?meta=translations"]);
+        assert_eq!(md.overview.as_deref(), Some("The hero sets out."));
+        assert_eq!(md.title.as_deref(), Some("Show K"));
         let orig = by_lang(&md.texts, "jpn").expect("original kept");
         assert!(orig.is_original);
-        assert_eq!(orig.overview.as_deref(), Some("悟空の冒険。"));
+        assert_eq!(orig.overview.as_deref(), Some("勇者の冒険。"));
         let eng = by_lang(&md.texts, "eng").expect("english row");
         assert!(!eng.is_original);
         assert!(
@@ -2303,13 +2296,13 @@ mod tests {
 
     #[tokio::test]
     async fn series_without_english_keeps_the_original_and_records_the_miss() {
-        let body = r#"{"data":{"id":1,"name":"ドラゴンボール","overview":"悟空の冒険。",
+        let body = r#"{"data":{"id":1,"name":"ショーK","overview":"勇者の冒険。",
             "originalLanguage":"jpn","translations":{"overviewTranslations":[
-            {"language":"jpn","overview":"悟空の冒険。","isPrimary":true}]}}}"#;
+            {"language":"jpn","overview":"勇者の冒険。","isPrimary":true}]}}}"#;
         let t = FakeTransport::new().push_login("jwt").push_ok(body);
         let c = TvdbClient::with_transport("key".into(), t);
         let md = c.get_series("1").await.unwrap();
-        assert_eq!(md.overview.as_deref(), Some("悟空の冒険。"));
+        assert_eq!(md.overview.as_deref(), Some("勇者の冒険。"));
         let eng = by_lang(&md.texts, "eng").expect("a miss is recorded");
         assert_eq!(
             (eng.title.as_deref(), eng.overview.as_deref()),
@@ -2319,23 +2312,23 @@ mod tests {
 
     #[test]
     fn series_texts_fall_back_to_original_language_and_base_text() {
-        let body = r#"{"data":{"name":"Les Revenants","overview":"Un village.",
+        let body = r#"{"data":{"name":"Les Absents","overview":"Un village.",
             "originalLanguage":"fra"}}"#;
         let texts = super::parse_series_texts(body);
         assert_eq!(
             texts,
             vec![LocalizedText {
                 language: "fra".into(),
-                title: Some("Les Revenants".into()),
+                title: Some("Les Absents".into()),
                 overview: Some("Un village.".into()),
                 is_original: true,
             }]
         );
     }
 
-    const ANIME_EPISODES: &str = r#"{"data":{"series":{"id":76666,"originalLanguage":"jpn"},
-        "episodes":[{"id":9,"seasonNumber":1,"number":1,"name":"ブルマと孫悟空",
-        "overview":"ブルマが…","nameTranslations":["jpn","eng"],
+    const ANIME_EPISODES: &str = r#"{"data":{"series":{"id":910103,"originalLanguage":"jpn"},
+        "episodes":[{"id":9,"seasonNumber":1,"number":1,"name":"ミアと勇者",
+        "overview":"ミアが…","nameTranslations":["jpn","eng"],
         "overviewTranslations":["jpn","eng"]},
         {"id":10,"seasonNumber":1,"number":2,"name":"えっ!","overview":"…",
         "nameTranslations":["jpn"],"overviewTranslations":["jpn"]}]}}"#;
@@ -2345,23 +2338,23 @@ mod tests {
         let t = FakeTransport::new()
             .push_login("jwt")
             .push_ok(ANIME_EPISODES)
-            .push_ok(r#"{"data":{"language":"eng","name":"The Secret of the Dragon Balls","overview":"Bulma meets Goku."}}"#);
+            .push_ok(r#"{"data":{"language":"eng","name":"The Secret of the Moon Base","overview":"Mia meets the hero."}}"#);
         let c = TvdbClient::with_transport("key".into(), t.clone());
-        let md = c.get_episode("76666", 1, 1, None).await.unwrap();
+        let md = c.get_episode("910103", 1, 1, None).await.unwrap();
         assert_eq!(
             t.paths(),
             vec![
-                "/episodes/76666",
-                "/series/76666/episodes/default",
+                "/episodes/910103",
+                "/series/910103/episodes/default",
                 "/episodes/9/translations/eng",
                 "/episodes/9/extended"
             ]
         );
-        assert_eq!(md.title.as_deref(), Some("The Secret of the Dragon Balls"));
-        assert_eq!(md.overview.as_deref(), Some("Bulma meets Goku."));
+        assert_eq!(md.title.as_deref(), Some("The Secret of the Moon Base"));
+        assert_eq!(md.overview.as_deref(), Some("Mia meets the hero."));
         let orig = by_lang(&md.texts, "jpn").expect("original kept");
         assert!(orig.is_original);
-        assert_eq!(orig.title.as_deref(), Some("ブルマと孫悟空"));
+        assert_eq!(orig.title.as_deref(), Some("ミアと勇者"));
     }
 
     /// B570 — the episode's name places it for its texts too: the
@@ -2370,8 +2363,8 @@ mod tests {
     async fn an_episodes_texts_come_from_the_record_its_name_places() {
         use crate::online_enrich::OnlineEnricher;
         let body = r#"{"data":{"series":{"originalLanguage":"eng"},"episodes":[
-            {"id":102,"seasonNumber":1,"number":2,"name":"The Naked Now","nameTranslations":["eng","fra"]},
-            {"id":103,"seasonNumber":1,"number":3,"name":"Code of Honor","nameTranslations":["eng"]}
+            {"id":102,"seasonNumber":1,"number":2,"name":"The Quiet Arrival","nameTranslations":["eng","fra"]},
+            {"id":103,"seasonNumber":1,"number":3,"name":"Rite of Honour","nameTranslations":["eng"]}
         ]}}"#;
         let t = FakeTransport::new()
             .push_login("jwt")
@@ -2383,7 +2376,7 @@ mod tests {
                 "71470",
                 Some(1),
                 Some(3),
-                Some("The Naked Now"),
+                Some("The Quiet Arrival"),
                 &["fra".into()],
             )
             .await;
@@ -2412,12 +2405,12 @@ mod tests {
             .push_login("jwt")
             .push_ok(ANIME_EPISODES);
         let c = TvdbClient::with_transport("key".into(), t.clone());
-        let md = c.get_episode("76666", 1, 2, None).await.unwrap();
+        let md = c.get_episode("910103", 1, 2, None).await.unwrap();
         assert_eq!(
             t.paths(),
             vec![
-                "/episodes/76666",
-                "/series/76666/episodes/default",
+                "/episodes/910103",
+                "/series/910103/episodes/default",
                 "/episodes/10/extended"
             ]
         );
@@ -2433,8 +2426,8 @@ mod tests {
             .push_ok(ANIME_EPISODES)
             .push_status(404, "");
         let c = TvdbClient::with_transport("key".into(), t);
-        let md = c.get_episode("76666", 1, 1, None).await.unwrap();
-        assert_eq!(md.overview.as_deref(), Some("ブルマが…"));
+        let md = c.get_episode("910103", 1, 1, None).await.unwrap();
+        assert_eq!(md.overview.as_deref(), Some("ミアが…"));
         assert!(by_lang(&md.texts, "eng").is_some_and(|r| r.overview.is_none()));
 
         let t = FakeTransport::new()
@@ -2442,8 +2435,8 @@ mod tests {
             .push_ok(ANIME_EPISODES)
             .push_status(500, "");
         let c = TvdbClient::with_transport("key".into(), t);
-        let md = c.get_episode("76666", 1, 1, None).await.unwrap();
-        assert_eq!(md.overview.as_deref(), Some("ブルマが…"));
+        let md = c.get_episode("910103", 1, 1, None).await.unwrap();
+        assert_eq!(md.overview.as_deref(), Some("ミアが…"));
         assert!(
             by_lang(&md.texts, "eng").is_none(),
             "a failed request leaves no row, so it is asked again"
@@ -2453,15 +2446,15 @@ mod tests {
     #[tokio::test]
     async fn english_show_needs_no_translation_request() {
         let body = r#"{"data":{"series":{"originalLanguage":"eng"},"episodes":[
-            {"id":1,"seasonNumber":1,"number":1,"name":"Winter Is Coming",
-             "overview":"Lord Stark...","overviewTranslations":["eng","fra"]}]}}"#;
+            {"id":1,"seasonNumber":1,"number":1,"name":"The First Frost",
+             "overview":"Lord Ash...","overviewTranslations":["eng","fra"]}]}}"#;
         let t = FakeTransport::new().push_login("jwt").push_ok(body);
         let c = TvdbClient::with_transport("key".into(), t.clone());
-        let md = c.get_episode("121361", 1, 1, None).await.unwrap();
+        let md = c.get_episode("910206", 1, 1, None).await.unwrap();
         // The series-id check (B584), the list and the extended record; no
         // translation.
         assert_eq!(t.paths().len(), 3);
-        assert_eq!(md.overview.as_deref(), Some("Lord Stark..."));
+        assert_eq!(md.overview.as_deref(), Some("Lord Ash..."));
         assert_eq!(md.texts.len(), 1);
         assert!(md.texts[0].is_original && md.texts[0].language == "eng");
     }
@@ -2481,9 +2474,9 @@ mod tests {
             .push_ok(ANIME_EPISODES)
             .push_ok(ANIME_SERIES);
         let c = TvdbClient::with_transport("key".into(), t);
-        c.get_episode("76666", 1, 1, None).await.unwrap();
-        c.get_episode("76666", 1, 2, None).await.unwrap();
-        c.get_series("76666").await.unwrap();
+        c.get_episode("910103", 1, 1, None).await.unwrap();
+        c.get_episode("910103", 1, 2, None).await.unwrap();
+        c.get_series("910103").await.unwrap();
         let mut seen = Vec::new();
         for (ck, _, _, v) in snapshotter.snapshot().into_vec() {
             if ck.key().name() != "pharos_metadata_translation_total" {
@@ -2519,7 +2512,7 @@ mod tests {
             TvdbEnricher(TvdbClient::with_transport("key".into(), t))
                 .fetch_texts(
                     MediaKind::Episode,
-                    "76666",
+                    "910103",
                     Some(1),
                     Some(1),
                     None,
@@ -2543,7 +2536,7 @@ mod tests {
             TvdbEnricher(TvdbClient::with_transport("key".into(), t))
                 .fetch_texts(
                     MediaKind::Episode,
-                    "76666",
+                    "910103",
                     Some(season),
                     Some(1),
                     None,
@@ -2566,7 +2559,7 @@ mod tests {
         let got = TvdbEnricher(TvdbClient::with_transport("key".into(), series))
             .fetch_texts(
                 MediaKind::Episode,
-                "76666",
+                "910103",
                 None,
                 None,
                 None,
@@ -2591,10 +2584,7 @@ mod tests {
 
     #[test]
     fn encode_query_escapes_spaces_and_keeps_alnum() {
-        assert_eq!(
-            super::encode_query("Game of Thrones"),
-            "Game%20of%20Thrones"
-        );
+        assert_eq!(super::encode_query("Show S"), "Show%20S");
         assert_eq!(super::encode_query("abc-123_.~"), "abc-123_.~");
     }
 
@@ -2676,7 +2666,7 @@ mod tests {
         let ext = r#"{"data":{"id":102,"characters":[{"peopleType":"Actor","personName":"Lead Actor","name":"Main","sort":1,"peopleId":501}]}}"#;
         let t = FakeTransport::new()
             .push_login("jwt")
-            .route("/series/71470/episodes/default", 200, TNG_S1)
+            .route("/series/71470/episodes/default", 200, SHOW_N_S1)
             .route("/episodes/102/extended", 200, ext);
         let c = TvdbClient::with_transport("key".into(), t.clone());
         let ep = c.get_episode("71470", 1, 2, None).await.expect("episode");
@@ -2698,7 +2688,7 @@ mod tests {
         for status in [404, 500] {
             let t = FakeTransport::new()
                 .push_login("jwt")
-                .route("/series/71470/episodes/default", 200, TNG_S1)
+                .route("/series/71470/episodes/default", 200, SHOW_N_S1)
                 .route("/episodes/102/extended", status, "");
             let c = TvdbClient::with_transport("key".into(), t);
             let ep = c.get_episode("71470", 1, 2, None).await.expect("episode");
