@@ -171,7 +171,7 @@ fn run_song(
             span.record("aligner.decode_ms", a.phases.decode_ms());
             span.record("aligner.model_ms", a.phases.model_ms());
             tracing::info!(
-                path = rel_path,
+                path = %rel_path,
                 lines = n_lines,
                 words_aligned = a.words_aligned,
                 offset_ms = a.answer.offset_ms,
@@ -189,7 +189,7 @@ fn run_song(
                 SongError::Ffmpeg(_) => "ffmpeg",
                 SongError::Internal(_) => "internal",
             };
-            tracing::warn!(path = rel_path, failed, duration_ms, error = %e, "song failed");
+            tracing::warn!(path = %rel_path, failed = %failed, duration_ms, error = %e, "song failed");
             failed
         }
     };

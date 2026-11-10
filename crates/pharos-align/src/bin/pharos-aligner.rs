@@ -55,9 +55,9 @@ async fn run(config: Config) -> Result<(), String> {
     tracing::info!(
         listen = %format!("{}:{}", config.host, config.port),
         media_root = %config.media_root.display(),
-        idle_unload_s = config.idle_unload.map_or("off".to_owned(), |d| d.as_secs().to_string()),
+        idle_unload_s = %config.idle_unload.map_or("off".to_owned(), |d| d.as_secs().to_string()),
         threads = config.threads,
-        traces = if traced { config.otlp_endpoint.as_deref().unwrap_or("on") } else { "off" },
+        traces = %if traced { config.otlp_endpoint.as_deref().unwrap_or("on") } else { "off" },
         "serving pharos-aligner"
     );
     let state = web::Data::new(AppState {
