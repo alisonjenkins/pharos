@@ -20,6 +20,7 @@ use wasm_bindgen::closure::Closure;
 use wasm_bindgen::JsCast as _;
 
 use super::app::{call, this_device, Ctx};
+use super::kept_web;
 use super::keymap::Mode;
 use super::pdf_web::PdfView;
 use super::platform;
@@ -89,14 +90,27 @@ fn stored_settings() -> ReaderSettings {
     }
 }
 
-/// Sends the position to the server when the gate allows.
+/// Sends the position to the server when the gate allows, and notes it on
+/// the device for a kept book, so a resume with no connection starts there.
+/// The API is read at each save, so a connection that returns is used.
 struct Saver {
-    api: NativeApi,
+    api: Signal<Option<NativeApi>>,
     id: ItemRef,
+    /// The book is kept on this device.
+    kept: bool,
     gate: RefCell<SaveGate>,
 }
 
 impl Saver {
+    fn new(api: Signal<Option<NativeApi>>, id: ItemRef, kept: bool) -> Self {
+        Self {
+            api,
+            id,
+            kept,
+            gate: RefCell::new(SaveGate::default()),
+        }
+    }
+
     fn send(&self, locator: &str, fraction: f32, forced: bool) {
         let key = save_key(locator, fraction);
         let now = platform::now_ms();
@@ -108,15 +122,29 @@ impl Saver {
             "pharos: reader save item={} locator={locator} fraction={fraction:.3} forced={forced}",
             self.id
         ));
-        let (api, id, locator) = (self.api.clone(), self.id, locator.to_owned());
+        let (id, kept) = (self.id, self.kept);
+        // Unsent until the server has it; the integration point for the
+        // offline save queue (spec 036 FR-001) is here.
+        if kept {
+            kept_web::note_position(id, locator, fraction, true);
+        }
+        let Some(api) = self.api.peek().clone() else {
+            platform::warn(&format!(
+                "pharos: reader save held item={id} locator={locator} reason=no connection"
+            ));
+            return;
+        };
+        let locator = locator.to_owned();
         platform::spawn_detached(async move {
-            if let Err(e) = api
+            match api
                 .set_read_position(&call("read", "save"), id, &locator, fraction)
                 .await
             {
-                platform::warn(&format!(
+                Ok(_) if kept => kept_web::note_position(id, &locator, fraction, false),
+                Ok(_) => {}
+                Err(e) => platform::warn(&format!(
                     "pharos: reader save failed item={id} locator={locator} error={e}"
-                ));
+                )),
             }
         });
     }
@@ -229,6 +257,41 @@ impl Core {
     }
 }
 
+/// What the reader needs of a book before its bytes: from the server's
+/// detail, or from the record of a kept book when there is no connection.
+struct Head {
+    title: String,
+    format: Option<BookFormat>,
+    saved: Option<String>,
+}
+
+/// The book's bytes: a kept copy first, even online (spec 036 FR-006), then
+/// the network. Says where they came from for the log.
+async fn book_bytes(
+    id: ItemRef,
+    kept_user: Option<&str>,
+    online: bool,
+) -> Result<(js_sys::Uint8Array, &'static str), String> {
+    if let Some(user) = kept_user {
+        match kept_web::cached_book(user, id).await {
+            Some(bytes) => {
+                platform::info(&format!(
+                    "pharos: reader cache hit item={id} bytes={}",
+                    bytes.length()
+                ));
+                return Ok((bytes, "cache"));
+            }
+            None => platform::warn(&format!(
+                "pharos: reader cache miss item={id}; the kept copy is gone"
+            )),
+        }
+    }
+    if !online {
+        return Err("This book is not on this device and there is no connection.".into());
+    }
+    fetch_book(id).await.map(|bytes| (bytes, "network"))
+}
+
 struct Opened {
     core: Rc<Core>,
     toc: Vec<TocRow>,
@@ -289,7 +352,7 @@ async fn fetch_book(id: ItemRef) -> Result<js_sys::Uint8Array, String> {
 
 #[allow(clippy::too_many_arguments)]
 async fn open_book(
-    api: NativeApi,
+    saver: Saver,
     id: ItemRef,
     saved: Option<Locator>,
     settings: ReaderSettings,
@@ -329,11 +392,7 @@ async fn open_book(
     }
     let core = Rc::new(Core {
         engine: Engine::Epub(view),
-        saver: Saver {
-            api,
-            id,
-            gate: RefCell::new(SaveGate::default()),
-        },
+        saver,
         at_end: Cell::new(false),
         alive,
         fraction,
@@ -346,7 +405,7 @@ async fn open_book(
 /// Opens a PDF on the page `saved` names, if any.
 #[allow(clippy::too_many_arguments)]
 async fn open_pdf(
-    api: NativeApi,
+    saver: Saver,
     id: ItemRef,
     saved: Option<&str>,
     settings: ReaderSettings,
@@ -367,11 +426,7 @@ async fn open_pdf(
     let view = PdfView::open(host, bytes, wanted, settings.pdf_fit, id, on_broken).await?;
     let core = Rc::new(Core {
         engine: Engine::Pdf(view),
-        saver: Saver {
-            api,
-            id,
-            gate: RefCell::new(SaveGate::default()),
-        },
+        saver,
         at_end: Cell::new(false),
         alive,
         fraction,
@@ -475,25 +530,86 @@ pub fn ReaderScreen(id: ItemRef) -> Element {
     use_effect({
         let (alive, core, started) = (alive.clone(), core.clone(), started.clone());
         move || {
-            let Some(api) = ctx.api.read().clone() else {
+            let api = ctx.api.read().clone();
+            let held = kept_web::read().and_then(|store| {
+                let book = store.find(&id.to_string())?.clone();
+                Some((store.user.clone(), book))
+            });
+            // With no connection the record is all there is; with neither,
+            // wait for the connection.
+            if api.is_none() && held.is_none() {
                 return;
-            };
+            }
             if started.replace(true) {
                 return;
             }
             let (alive, core) = (alive.clone(), core.clone());
+            let saver_api = ctx.api;
             spawn(async move {
                 let began = platform::now_ms();
-                let detail = match api.detail(&call("read", "load"), id).await {
-                    Ok(d) => d,
-                    Err(e) => {
-                        platform::warn(&format!("pharos: reader failed item={id} error={e}"));
-                        phase.set(Phase::Failed(format!("The book could not be loaded: {e}")));
+                let online = api.is_some() && !kept_web::is_offline();
+                let mut held = held;
+                if let (Some(api), Some((user, _)), true) = (&api, &held, online) {
+                    // A record kept by someone else is not this user's book.
+                    match api.me(&call("read", "me")).await {
+                        Ok(me) if me.id != *user => {
+                            platform::warn(&format!(
+                                "pharos: reader ignores kept copy item={id} reason=another user"
+                            ));
+                            kept_web::reconcile(&me.id);
+                            held = None;
+                        }
+                        Ok(_) => {}
+                        Err(e) => platform::warn(&format!(
+                            "pharos: reader could not confirm the user item={id} error={e}"
+                        )),
+                    }
+                }
+                let detail = match (&api, online) {
+                    (Some(api), true) => match api.detail(&call("read", "load"), id).await {
+                        Ok(d) => Some(d),
+                        Err(e) if held.is_some() => {
+                            platform::warn(&format!(
+                                "pharos: reader load failed item={id} error={e}; using the kept copy"
+                            ));
+                            None
+                        }
+                        Err(e) => {
+                            platform::warn(&format!("pharos: reader failed item={id} error={e}"));
+                            phase.set(Phase::Failed(format!("The book could not be loaded: {e}")));
+                            return;
+                        }
+                    },
+                    _ => None,
+                };
+                let head = match (&detail, &held) {
+                    (Some(d), kept) => {
+                        // A place the server never got is newer than its own.
+                        let local = kept
+                            .as_ref()
+                            .filter(|(_, b)| b.unsent)
+                            .and_then(|(_, b)| b.locator.clone());
+                        Head {
+                            title: display_name(&d.item),
+                            format: d.book.as_ref().map(|b| b.format),
+                            saved: local
+                                .or_else(|| d.read_position.as_ref().map(|p| p.locator.clone())),
+                        }
+                    }
+                    (None, Some((_, b))) => Head {
+                        title: b.title.clone(),
+                        format: Some(b.format.book_format()),
+                        saved: b.locator.clone(),
+                    },
+                    (None, None) => {
+                        phase.set(Phase::Failed(
+                            "The book could not be loaded: there is no connection.".into(),
+                        ));
                         return;
                     }
                 };
-                title.set(display_name(&detail.item));
-                let format = detail.book.as_ref().map(|b| b.format);
+                title.set(head.title.clone());
+                let format = head.format;
                 if !matches!(format, Some(BookFormat::Epub | BookFormat::Pdf)) {
                     platform::warn(&format!(
                         "pharos: reader failed item={id} format={format:?} error=not an EPUB or PDF"
@@ -501,9 +617,11 @@ pub fn ReaderScreen(id: ItemRef) -> Element {
                     phase.set(Phase::Failed("This book cannot be opened here.".into()));
                     return;
                 }
+                let kept_user = held.as_ref().map(|(user, _)| user.as_str());
+                let saver = Saver::new(saver_api, id, kept_user.is_some());
                 if format == Some(BookFormat::Pdf) {
                     is_pdf.set(true);
-                    let bytes = match fetch_book(id).await {
+                    let (bytes, from) = match book_bytes(id, kept_user, online).await {
                         Ok(b) => b,
                         Err(message) => {
                             platform::warn(&format!(
@@ -514,9 +632,9 @@ pub fn ReaderScreen(id: ItemRef) -> Element {
                         }
                     };
                     let length = bytes.length();
-                    let saved = detail.read_position.as_ref().map(|p| p.locator.clone());
+                    let saved = head.saved.clone();
                     let opened = open_pdf(
-                        api,
+                        saver,
                         id,
                         saved.as_deref(),
                         *settings.peek(),
@@ -546,7 +664,7 @@ pub fn ReaderScreen(id: ItemRef) -> Element {
                             *core.borrow_mut() = Some(o.core);
                             phase.set(Phase::Reading);
                             platform::info(&format!(
-                                "pharos: reader opened item={id} format=pdf bytes={length} ms={:.0} resumed={} at={}",
+                                "pharos: reader opened item={id} format=pdf from={from} bytes={length} ms={:.0} resumed={} at={}",
                                 platform::now_ms() - began,
                                 saved.is_some(),
                                 at
@@ -562,7 +680,7 @@ pub fn ReaderScreen(id: ItemRef) -> Element {
                     }
                     return;
                 }
-                let bytes = match fetch_book(id).await {
+                let (bytes, from) = match book_bytes(id, kept_user, online).await {
                     Ok(b) => b,
                     Err(message) => {
                         platform::warn(&format!("pharos: reader failed item={id} error={message}"));
@@ -572,10 +690,7 @@ pub fn ReaderScreen(id: ItemRef) -> Element {
                 };
                 let bytes = js_sys::Uint8Array::to_vec(&bytes);
                 let length = bytes.len();
-                let saved = detail
-                    .read_position
-                    .as_ref()
-                    .and_then(|p| saved_locator(&p.locator));
+                let saved = head.saved.as_deref().and_then(saved_locator);
                 // The view calls back from outside the runtime; it holds the
                 // core weakly so the two cannot keep each other alive.
                 let weak = Rc::new(RefCell::new(std::rc::Weak::<Core>::new()));
@@ -604,7 +719,7 @@ pub fn ReaderScreen(id: ItemRef) -> Element {
                     }
                 };
                 let opened = open_book(
-                    api,
+                    saver,
                     id,
                     saved,
                     *settings.peek(),
@@ -623,7 +738,7 @@ pub fn ReaderScreen(id: ItemRef) -> Element {
                         *core.borrow_mut() = Some(o.core);
                         phase.set(Phase::Reading);
                         platform::info(&format!(
-                            "pharos: reader opened item={id} format=epub bytes={length} ms={:.0} resumed={} at={}",
+                            "pharos: reader opened item={id} format=epub from={from} bytes={length} ms={:.0} resumed={} at={}",
                             platform::now_ms() - began,
                             saved.is_some(),
                             at
