@@ -426,6 +426,10 @@ pub fn scroll_y() -> Option<f64> {
 
 pub fn scroll_to_y(_y: f64) {}
 
+pub fn step_radio(_step: i32) -> bool {
+    false
+}
+
 pub fn scroll_to_top() {}
 
 pub fn tile_top(_at: u32) -> Option<f64> {
