@@ -118,7 +118,10 @@ async fn run(config: Config, (plan, pin_err): (pin::Plan, Option<String>)) -> Re
     let loader: Loader = Box::new(move || {
         let weights = Weights::open(&weights).map_err(|e| e.to_string())?;
         let model = CpuModel::load(weights, threads).map_err(|e| e.to_string())?;
-        Ok(Box::new(CpuAligner { model }) as Box<dyn Model>)
+        Ok(Box::new(CpuAligner {
+            model,
+            batch_samples: pharos_align::config::DEFAULT_BATCH_SAMPLES,
+        }) as Box<dyn Model>)
     });
     let engine = Arc::new(Engine::new(loader, decoder, config.idle_unload));
 
