@@ -181,7 +181,7 @@ config:
     # read — the other half of the anime split.
     subtitleMode: "Smart"
     # Jellyfin defaults this true, which lets a container's default-flagged
-    # track BEAT the language preference (Aliens' Ukrainian dub is flagged
+    # track BEAT the language preference (Film AW' Ukrainian dub is flagged
     # default; that is why it played in Ukrainian). False lets the preference
     # decide.
     playDefaultAudioTrack: false
