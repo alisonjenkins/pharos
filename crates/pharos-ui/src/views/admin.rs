@@ -4641,31 +4641,31 @@ mod tests {
     }
 
     fn identity_page() -> SeriesIdentity {
-        let key = |year: u32| format!("/tv/Cosmos{KEY_YEAR_SEP}{year}");
+        let key = |year: u32| format!("/tv/Show A{KEY_YEAR_SEP}{year}");
         SeriesIdentity {
             repair_mode: "dry_run".into(),
             splits: vec![
                 SplitFolder {
-                    folder: "/tv/Cosmos".into(),
+                    folder: "/tv/Show A".into(),
                     status: "pending".into(),
                     groups: vec![
                         SplitGroup {
-                            series_key: key(1980),
-                            year: Some(1980),
-                            paths: vec!["/tv/Cosmos/a.mkv".into()],
+                            series_key: key(1971),
+                            year: Some(1971),
+                            paths: vec!["/tv/Show A/a.mkv".into()],
                         },
                         SplitGroup {
-                            series_key: key(2014),
-                            year: Some(2014),
-                            paths: vec!["/tv/Cosmos/b.mkv".into(), "/tv/Cosmos/c.mkv".into()],
+                            series_key: key(1996),
+                            year: Some(1996),
+                            paths: vec!["/tv/Show A/b.mkv".into(), "/tv/Show A/c.mkv".into()],
                         },
                     ],
                     moves: vec![crate::client::PendingMove {
-                        path: "/tv/Cosmos/b.mkv".into(),
-                        from_key: "/tv/Cosmos".into(),
+                        path: "/tv/Show A/b.mkv".into(),
+                        from_key: "/tv/Show A".into(),
                         from_year: None,
-                        to_key: key(2014),
-                        to_year: Some(2014),
+                        to_key: key(1996),
+                        to_year: Some(1996),
                     }],
                 },
                 SplitFolder {
@@ -4686,7 +4686,7 @@ mod tests {
             }],
             overrides: vec![HandFix {
                 id: 7,
-                folder: "/tv/Cosmos".into(),
+                folder: "/tv/Show A".into(),
                 keeps_together: true,
                 source: "admin".into(),
                 created_by: Some("ali".into()),
@@ -4698,11 +4698,11 @@ mod tests {
 
     #[test]
     fn a_split_key_reads_as_folder_name_and_year_without_the_separator() {
-        let key = format!("/tv/Cosmos{KEY_YEAR_SEP}2014");
-        assert_eq!(key_label(&key, None), "Cosmos (2014)");
-        assert_eq!(key_label("/tv/Cosmos", Some(1980)), "Cosmos (1980)");
-        assert_eq!(key_label("Cosmos", None), "Cosmos");
-        assert_eq!(folder_name("/tv/Cosmos/"), "Cosmos");
+        let key = format!("/tv/Show A{KEY_YEAR_SEP}1996");
+        assert_eq!(key_label(&key, None), "Show A (1996)");
+        assert_eq!(key_label("/tv/Show A", Some(1971)), "Show A (1971)");
+        assert_eq!(key_label("Show A", None), "Show A");
+        assert_eq!(folder_name("/tv/Show A/"), "Show A");
         assert_eq!(folder_name("/"), "/");
     }
 
@@ -4729,7 +4729,7 @@ mod tests {
             None,
         );
         assert!(
-            html.contains("Cosmos (1980)") && html.contains("Cosmos (2014)"),
+            html.contains("Show A (1971)") && html.contains("Show A (1996)"),
             "{html}"
         );
         assert!(html.contains("2 files"), "{html}");
@@ -4737,7 +4737,7 @@ mod tests {
             html.contains("pending (dry run)") && html.contains("applied"),
             "{html}"
         );
-        assert!(html.contains("title=\"/tv/Cosmos\""), "{html}");
+        assert!(html.contains("title=\"/tv/Show A\""), "{html}");
         assert!(html.contains("1 file still to move"), "{html}");
         assert!(html.contains("href=\"/ui/browse/s42\""), "{html}");
         assert!(html.contains("scored 0.80"), "{html}");
@@ -4783,8 +4783,8 @@ mod tests {
             )
         };
         let prompted = render(Some(PickPrompt {
-            folder: "/tv/Cosmos".into(),
-            year: Some(2014),
+            folder: "/tv/Show A".into(),
+            year: Some(1996),
         }));
         assert!(prompted.contains(PICK_PROMPT), "{prompted}");
         // The group's pick form is already open, with its name filled in.
@@ -4795,7 +4795,7 @@ mod tests {
         // A prompt for another folder leaves this one alone.
         let other = render(Some(PickPrompt {
             folder: "/tv/Else".into(),
-            year: Some(2014),
+            year: Some(1996),
         }));
         assert!(!other.contains(PICK_PROMPT), "{other}");
     }
@@ -4833,8 +4833,8 @@ mod tests {
         let hit = ShowCandidate {
             provider: "tvdb".into(),
             id: "81".into(),
-            name: "Cosmos".into(),
-            year: Some(1980),
+            name: "Show A".into(),
+            year: Some(1971),
         };
         let render = |series_key: &str| {
             let search = IdentitySearchState {
@@ -4846,9 +4846,9 @@ mod tests {
                 |search: IdentitySearchState| {
                     rsx! {
                         PickForm {
-                            series_key: "/tv/Cosmos\u{1f}1980".to_string(),
-                            default_name: "Cosmos".to_string(),
-                            default_year: Some(1980),
+                            series_key: "/tv/Show A\u{1f}1971".to_string(),
+                            default_name: "Show A".to_string(),
+                            default_year: Some(1971),
                             search,
                             on_action: |_| {},
                         }
@@ -4859,8 +4859,8 @@ mod tests {
             dom.rebuild_in_place();
             dioxus_ssr::render(&dom)
         };
-        let mine = render("/tv/Cosmos\u{1f}1980");
-        assert!(mine.contains("Cosmos (1980) · tvdb 81"), "{mine}");
+        let mine = render("/tv/Show A\u{1f}1971");
+        assert!(mine.contains("Show A (1971) · tvdb 81"), "{mine}");
         assert!(mine.contains("This is the show"), "{mine}");
         assert!(!render("/tv/Other").contains("This is the show"));
     }
