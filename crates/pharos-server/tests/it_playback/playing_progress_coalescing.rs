@@ -580,6 +580,13 @@ impl UserDataStore for Wrapped {
     ) -> pharos_core::DomainResult<Vec<pharos_core::MediaId>> {
         self.inner.resumable_items(user).await
     }
+    async fn started_items(
+        &self,
+        user: UserId,
+        kind: pharos_core::MediaKind,
+    ) -> pharos_core::DomainResult<Vec<(pharos_core::MediaId, pharos_core::UserItemData)>> {
+        self.inner.started_items(user, kind).await
+    }
 }
 
 /// One held report for item 1, then the stored row aged so the flush lands.

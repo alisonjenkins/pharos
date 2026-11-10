@@ -1728,6 +1728,20 @@ impl UserDataStore for AnyStore {
             AnyStore::Postgres(p) => p.resumable_items(user).await,
         }
     }
+
+    async fn started_items(
+        &self,
+        user: UserId,
+        kind: pharos_core::MediaKind,
+    ) -> DomainResult<Vec<(MediaId, UserItemData)>> {
+        timed("started_items", async {
+            match self {
+                AnyStore::Sqlite(s) => s.started_items(user, kind).await,
+                AnyStore::Postgres(p) => p.started_items(user, kind).await,
+            }
+        })
+        .await
+    }
 }
 
 // ---------------------------------------------------------------------

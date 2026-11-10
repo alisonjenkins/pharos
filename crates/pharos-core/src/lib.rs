@@ -4600,6 +4600,16 @@ pub trait UserDataStore: Send + Sync {
         &self,
         user: UserId,
     ) -> impl std::future::Future<Output = DomainResult<Vec<MediaId>>> + Send;
+
+    /// Every item of `kind` the user has played or has a resume point on,
+    /// with its row, most recently played first (ties by id, highest
+    /// first). Drives Next Up from the user's own rows instead of a scan of
+    /// the whole library (spec 038 FR-105).
+    fn started_items(
+        &self,
+        user: UserId,
+        kind: MediaKind,
+    ) -> impl std::future::Future<Output = DomainResult<Vec<(MediaId, UserItemData)>>> + Send;
 }
 
 /// Where a user left off in a book (023): the reader's opaque locator and the

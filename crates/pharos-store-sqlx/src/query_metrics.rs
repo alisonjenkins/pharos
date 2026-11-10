@@ -165,6 +165,10 @@ mod tests {
                     .user_data_bulk(UserId::default(), &[1, 2])
                     .await
                     .unwrap();
+                store
+                    .started_items(UserId::default(), pharos_core::MediaKind::Episode)
+                    .await
+                    .unwrap();
                 store.mark_seen_batch(&[], 1).await.unwrap();
                 store.put_batch(&[]).await.unwrap();
                 MediaStore::list(&store).await.unwrap();
@@ -186,6 +190,7 @@ mod tests {
             "get_items_by_ids",
             "get_user_data",
             "user_data_bulk",
+            "started_items",
             "mark_seen_batch",
             "put_batch",
             "list",
