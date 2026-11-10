@@ -365,7 +365,10 @@ impl server::playback_grant::Handler for Grant {
     }
 }
 
-fn write_queue_hint(mut out: queue_hint::Builder<'_>, wait: pharos_transcode::scheduler::StreamWait) {
+fn write_queue_hint(
+    mut out: queue_hint::Builder<'_>,
+    wait: pharos_transcode::scheduler::StreamWait,
+) {
     let count = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
     out.set_queued(count(wait.queued));
     out.set_waited_ms(wait.oldest_ms);

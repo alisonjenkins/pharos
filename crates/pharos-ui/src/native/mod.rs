@@ -98,7 +98,6 @@ pub mod resume;
 pub mod route;
 pub mod scrub;
 pub mod seek_wait;
-pub mod wait;
 pub mod seen;
 pub mod settings;
 pub mod show_tracks;
@@ -115,6 +114,7 @@ pub mod trail;
 pub mod turn;
 #[cfg(all(feature = "web", target_arch = "wasm32"))]
 mod turn_web;
+pub mod wait;
 #[cfg(all(feature = "web", target_arch = "wasm32"))]
 mod xr_web;
 // 025: Android TV sign-in logic (backoff, QuickConnect steps); no I/O, builds everywhere.

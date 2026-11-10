@@ -110,7 +110,12 @@ pub fn cause(facts: &WaitFacts<'_>) -> WaitCause {
 pub fn line(item: &str, cause: &WaitCause, facts: &WaitFacts<'_>) -> String {
     let hint = facts.hint.map_or_else(
         || "none".to_owned(),
-        |h| format!("queued:{}/others:{}/busy:{}/waited_ms:{}", h.queued, h.others_queued, h.busy, h.waited_ms),
+        |h| {
+            format!(
+                "queued:{}/others:{}/busy:{}/waited_ms:{}",
+                h.queued, h.others_queued, h.busy, h.waited_ms
+            )
+        },
     );
     format!(
         "pharos: wait caption item={item} cause={} started={} seeking_to={} hint={hint} members_waiting={}",
@@ -140,15 +145,32 @@ mod tests {
     fn each_wait_names_its_cause() {
         let facts = WaitFacts::default();
         assert_eq!(cause(&facts), WaitCause::Starting);
-        let playing = WaitFacts { started: true, ..WaitFacts::default() };
+        let playing = WaitFacts {
+            started: true,
+            ..WaitFacts::default()
+        };
         assert_eq!(cause(&playing), WaitCause::Buffering);
-        let seek = WaitFacts { seeking_to: Some(600_000), ..playing.clone() };
+        let seek = WaitFacts {
+            seeking_to: Some(600_000),
+            ..playing.clone()
+        };
         assert_eq!(cause(&seek), WaitCause::Seeking { to_ms: 600_000 });
-        let busy = WaitFacts { hint: queued(2), ..seek.clone() };
+        let busy = WaitFacts {
+            hint: queued(2),
+            ..seek.clone()
+        };
         assert_eq!(cause(&busy), WaitCause::ServerBusy { others: 2 });
         let names = ["Sam".to_owned()];
-        let group = WaitFacts { members_waiting: &names, ..busy.clone() };
-        assert_eq!(cause(&group), WaitCause::Member { names: names.to_vec() });
+        let group = WaitFacts {
+            members_waiting: &names,
+            ..busy.clone()
+        };
+        assert_eq!(
+            cause(&group),
+            WaitCause::Member {
+                names: names.to_vec()
+            }
+        );
     }
 
     /// A hint saying nothing is queued leaves the player's own cause.
@@ -164,11 +186,25 @@ mod tests {
 
     #[test]
     fn captions_read_as_sentences() {
-        assert_eq!(WaitCause::Seeking { to_ms: 754_000 }.caption(), "Jumping to 12:34…");
-        assert!(WaitCause::ServerBusy { others: 0 }.caption().contains("free encoder"));
-        assert!(WaitCause::ServerBusy { others: 1 }.caption().contains("1 other video."));
-        assert!(WaitCause::ServerBusy { others: 3 }.caption().contains("3 other videos"));
-        let names = |n: &[&str]| WaitCause::Member { names: n.iter().map(|s| (*s).to_owned()).collect() }.caption();
+        assert_eq!(
+            WaitCause::Seeking { to_ms: 754_000 }.caption(),
+            "Jumping to 12:34…"
+        );
+        assert!(WaitCause::ServerBusy { others: 0 }
+            .caption()
+            .contains("free encoder"));
+        assert!(WaitCause::ServerBusy { others: 1 }
+            .caption()
+            .contains("1 other video."));
+        assert!(WaitCause::ServerBusy { others: 3 }
+            .caption()
+            .contains("3 other videos"));
+        let names = |n: &[&str]| {
+            WaitCause::Member {
+                names: n.iter().map(|s| (*s).to_owned()).collect(),
+            }
+            .caption()
+        };
         assert_eq!(names(&["Sam"]), "Waiting for Sam…");
         assert_eq!(names(&["Sam", "Ali", "Bo"]), "Waiting for Sam, Ali and Bo…");
         for c in [WaitCause::Starting, WaitCause::Buffering] {
@@ -191,9 +227,16 @@ mod tests {
 
     #[test]
     fn the_line_carries_the_cause_and_its_facts() {
-        let facts = WaitFacts { started: true, hint: queued(4), ..WaitFacts::default() };
+        let facts = WaitFacts {
+            started: true,
+            hint: queued(4),
+            ..WaitFacts::default()
+        };
         let line = line("9", &cause(&facts), &facts);
         assert!(line.contains("cause=server_busy"), "{line}");
-        assert!(line.contains("hint=queued:1/others:4/busy:true/waited_ms:3000"), "{line}");
+        assert!(
+            line.contains("hint=queued:1/others:4/busy:true/waited_ms:3000"),
+            "{line}"
+        );
     }
 }

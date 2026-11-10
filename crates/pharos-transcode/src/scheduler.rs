@@ -681,7 +681,6 @@ impl std::fmt::Display for SchedError {
 
 impl std::error::Error for SchedError {}
 
-
 /// What one stream's viewer is waiting behind in the queue, read while they
 /// wait so the player can say "the server is busy" before the segment lands
 /// (038 FR-402, V1217). Derived from the queue the scheduler already holds:
@@ -1623,7 +1622,10 @@ impl TranscodeScheduler {
     /// when the scheduler is gone.
     pub async fn stream_wait(&self, stream: StreamKey) -> Option<StreamWait> {
         let (reply, rx) = oneshot::channel();
-        self.tx.send(SchedMsg::StreamWait { stream, reply }).await.ok()?;
+        self.tx
+            .send(SchedMsg::StreamWait { stream, reply })
+            .await
+            .ok()?;
         rx.await.ok()
     }
 
@@ -5496,7 +5498,11 @@ mod tests {
         let s = TranscodeScheduler::spawn(table(), spawner, SchedConfig::default());
         let (mine, theirs) = (StreamKey::of("mine"), StreamKey::of("theirs"));
         let idle = s.stream_wait(mine).await.expect("wait");
-        assert_eq!(idle, StreamWait::default(), "an idle server has nothing queued");
+        assert_eq!(
+            idle,
+            StreamWait::default(),
+            "an idle server has nothing queued"
+        );
 
         let submit = |stream: StreamKey, path: &'static str| {
             let s2 = s.clone();

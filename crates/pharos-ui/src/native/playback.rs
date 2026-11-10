@@ -2979,15 +2979,26 @@ mod tests {
     #[test]
     fn a_failure_names_who_can_fix_it() {
         let kind = |k, d| Fatal::from_hls(k, d).kind;
-        assert_eq!(kind("mediaError", "manifestIncompatibleCodecsError"), FailureKind::Unplayable);
-        assert_eq!(kind("mediaError", "bufferIncompatibleCodecsError"), FailureKind::Unplayable);
+        assert_eq!(
+            kind("mediaError", "manifestIncompatibleCodecsError"),
+            FailureKind::Unplayable
+        );
+        assert_eq!(
+            kind("mediaError", "bufferIncompatibleCodecsError"),
+            FailureKind::Unplayable
+        );
         assert_eq!(kind("networkError", "fragLoadError"), FailureKind::Network);
         assert_eq!(kind("mediaError", "fragParsingError"), FailureKind::Damaged);
         assert_eq!(FailureKind::of_status(404), FailureKind::Server);
         assert_eq!(FailureKind::of_status(503), FailureKind::Server);
         assert_eq!(FailureKind::of_status(0), FailureKind::Network);
-        let labels = [FailureKind::Network, FailureKind::Server, FailureKind::Unplayable, FailureKind::Damaged]
-            .map(FailureKind::label);
+        let labels = [
+            FailureKind::Network,
+            FailureKind::Server,
+            FailureKind::Unplayable,
+            FailureKind::Damaged,
+        ]
+        .map(FailureKind::label);
         let distinct: std::collections::HashSet<_> = labels.iter().collect();
         assert_eq!(distinct.len(), labels.len());
     }

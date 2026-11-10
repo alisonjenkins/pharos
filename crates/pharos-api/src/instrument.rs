@@ -507,7 +507,9 @@ pub fn fill_denied(
 /// and found in the server's log by that id (038 FR-404, V1216). A reply
 /// that is not an error is left as it is.
 pub fn stamp_trace_id(results: dynamic_value::Builder<'_>, trace_id: &str) {
-    let Ok(results) = results.downcast::<capnp::dynamic_struct::Builder<'_>>().get_named("result")
+    let Ok(results) = results
+        .downcast::<capnp::dynamic_struct::Builder<'_>>()
+        .get_named("result")
     else {
         return;
     };
@@ -525,7 +527,10 @@ pub fn stamp_trace_id(results: dynamic_value::Builder<'_>, trace_id: &str) {
         return;
     };
     let mut error = error.downcast::<capnp::dynamic_struct::Builder<'_>>();
-    let has = error.reborrow_as_reader().has_named("traceId").unwrap_or(false);
+    let has = error
+        .reborrow_as_reader()
+        .has_named("traceId")
+        .unwrap_or(false);
     if !has {
         let _ = error.set_named("traceId", dynamic_value::Reader::Text(trace_id.into()));
     }
@@ -610,7 +615,9 @@ mod tests {
         let a = mint_trace_id(1, "1.1");
         let b = mint_trace_id(1, "1.2");
         assert_eq!(a.len(), 32);
-        assert!(a.bytes().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert!(a
+            .bytes()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
         assert_ne!(a, b);
         assert_eq!(trace_id_of(&format!("00-{a}-00f067aa0ba902b7-01")), a);
     }
