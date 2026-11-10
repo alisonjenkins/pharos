@@ -705,7 +705,7 @@ async fn music_similar(
         }
         let excluded = id_set(q.exclude_artist_ids.as_deref());
         // Keep every track; the exclusions below are ALBUM-level.
-        let mut aggs = aggregate_albums(&all, |_| true);
+        let mut aggs = aggregate_albums(all.iter(), |_| true);
         aggs.retain(|a| !a.name.eq_ignore_ascii_case(&album_name));
         if !excluded.is_empty() {
             aggs.retain(|a| {
@@ -2896,11 +2896,13 @@ async fn latest_items(
         .map_err(list_error)?;
     let dtos: Vec<serde_json::Value> = tiles
         .into_iter()
-        .map(|tile| match tile {
-            LatestTile::Item(item, ud) => {
-                serde_json::to_value(dto(item.as_ref(), ud)).unwrap_or(serde_json::Value::Null)
-            }
-            LatestTile::Group { dto, .. } => dto,
+        .filter_map(|tile| match tile {
+            LatestTile::Item(item, ud) => serde_json::to_value(dto(item.as_ref(), ud))
+                .inspect_err(|e| {
+                    tracing::warn!(item = item.id, error = %e, "latest: item DTO did not serialise; left out");
+                })
+                .ok(),
+            LatestTile::Group { dto, .. } => Some(dto),
         })
         .collect();
     Ok(crate::api::jellyfin::wire::json(&dtos))
@@ -3532,7 +3534,10 @@ impl AlbumAgg {
 
 /// Group audio rows into albums. `keep` decides which TRACKS participate
 /// (artist-role filters); an album aggregates only its kept tracks.
-fn aggregate_albums(items: &[MediaItem], keep: impl Fn(&MediaItem) -> bool) -> Vec<AlbumAgg> {
+fn aggregate_albums<'a>(
+    items: impl IntoIterator<Item = &'a MediaItem>,
+    keep: impl Fn(&MediaItem) -> bool,
+) -> Vec<AlbumAgg> {
     use std::collections::HashMap;
     let mut map: HashMap<String, AlbumAgg> = HashMap::new();
     for i in items {
@@ -3621,56 +3626,74 @@ async fn synth_album_dto(state: &AppState, a: &AlbumAgg) -> serde_json::Value {
     .unwrap_or(serde_json::Value::Null)
 }
 
-/// The tile a latest rail shows for several newly added episodes of one show
-/// or tracks of one album (spec 038 FR-106): the series or album DTO, dated by
-/// its newest child, with `ChildCount` the number of new children, as
-/// Jellyfin's grouped Latest reports it. `None` when `children` is neither.
-pub(crate) async fn latest_group_dto(
+/// The tiles a latest rail shows for `folds`, each several newly added
+/// episodes of one show or tracks of one album (spec 038 FR-106): the series
+/// or album DTO, dated by its newest child, with `ChildCount` the number of
+/// new children, as Jellyfin's grouped Latest reports it. The series'
+/// metadata is read in one query. `None` for a fold that is neither.
+pub(crate) async fn latest_group_dtos(
     state: &AppState,
     user_id: UserId,
-    children: &[&MediaItem],
-) -> Result<Option<serde_json::Value>, pharos_core::DomainError> {
+    folds: &[Vec<&MediaItem>],
+) -> Result<Vec<Option<serde_json::Value>>, pharos_core::DomainError> {
     use pharos_core::SeriesMetadataStore;
-    let Some(first) = children.first() else {
-        return Ok(None);
+    use std::collections::HashSet;
+    let keys: Vec<String> = folds
+        .iter()
+        .filter_map(|f| f.first())
+        .filter(|c| c.kind == MediaKind::Episode)
+        .filter_map(|c| c.series.as_ref().map(|s| s.series_key().to_string()))
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    let mut meta = if keys.is_empty() {
+        Default::default()
+    } else {
+        state.stores.series_metadata_by_keys(&keys).await?
     };
-    let newest = children.iter().filter_map(|c| c.created_at).max();
-    let count = u32::try_from(children.len()).unwrap_or(u32::MAX);
-    let mut dto = match (first.kind, first.series.as_ref()) {
-        (MediaKind::Episode, Some(series)) => {
-            let key = series.series_key().to_string();
-            let mut meta = state.stores.series_metadata_by_keys(&[key]).await?;
-            crate::services::metadata_text::localize_series(state, user_id, &mut meta).await;
-            let seasons = children
-                .iter()
-                .filter_map(|c| c.series.as_ref().and_then(|s| s.season_number))
-                .collect::<std::collections::HashSet<_>>()
-                .len();
-            let mut dto = series_dto(
-                &state.server_id,
-                series,
-                u32::try_from(seasons).unwrap_or(u32::MAX),
-                count,
-                meta.get(series.series_key()),
-                library_parent_id(state, first),
-            );
-            dto["ChildCount"] = serde_json::Value::from(count);
+    crate::services::metadata_text::localize_series(state, user_id, &mut meta).await;
+    let mut out = Vec::with_capacity(folds.len());
+    for children in folds {
+        let Some(first) = children.first() else {
+            out.push(None);
+            continue;
+        };
+        let count = u32::try_from(children.len()).unwrap_or(u32::MAX);
+        let dto = match (first.kind, first.series.as_ref()) {
+            (MediaKind::Episode, Some(series)) => {
+                let mut dto = series_dto(
+                    &state.server_id,
+                    series,
+                    count,
+                    count,
+                    meta.get(series.series_key()),
+                    library_parent_id(state, first),
+                );
+                // Only the new episodes were read, so the show's own totals
+                // are not known here; ChildCount is the new ones.
+                if let Some(map) = dto.as_object_mut() {
+                    map.remove("RecursiveItemCount");
+                }
+                Some(dto)
+            }
+            (MediaKind::Audio, _) => match aggregate_albums(children.iter().copied(), |_| true)
+                .into_iter()
+                .next()
+            {
+                Some(album) => Some(synth_album_dto(state, &album).await),
+                None => None,
+            },
+            _ => None,
+        };
+        out.push(dto.map(|mut dto| {
+            if let Some(at) = children.iter().filter_map(|c| c.created_at).max() {
+                dto["DateCreated"] =
+                    serde_json::Value::String(crate::api::jellyfin::dto::format_iso8601(at));
+            }
             dto
-        }
-        (MediaKind::Audio, _) => {
-            let owned: Vec<MediaItem> = children.iter().map(|c| (*c).clone()).collect();
-            let Some(album) = aggregate_albums(&owned, |_| true).into_iter().next() else {
-                return Ok(None);
-            };
-            synth_album_dto(state, &album).await
-        }
-        _ => return Ok(None),
-    };
-    if let Some(at) = newest {
-        dto["DateCreated"] =
-            serde_json::Value::String(crate::api::jellyfin::dto::format_iso8601(at));
+        }));
     }
-    Ok(Some(dto))
+    Ok(out)
 }
 
 /// Sort synthesised albums per the request: each `SortBy` key an album has
@@ -3923,7 +3946,7 @@ async fn maybe_list_music(
         }
         true
     };
-    let mut aggs = aggregate_albums(&all, keep);
+    let mut aggs = aggregate_albums(all.iter(), keep);
     if !exclude_ids.is_empty() {
         aggs.retain(|a| !exclude_ids.contains(&album_id_for(&a.name).to_ascii_lowercase()));
     }

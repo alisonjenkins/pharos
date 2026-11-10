@@ -151,7 +151,7 @@ pub async fn latest(
     kinds: &KindFilter,
     limit: Option<u32>,
 ) -> Result<Vec<(MediaItem, UserItemData)>, ListError> {
-    let mut typed = newest_items(state, user, parent_id, kinds, limit).await?;
+    let mut typed = newest_items(state, user, parent_id, kinds, limit, false).await?;
     crate::services::metadata_text::localize_items(state, user.id, typed.iter_mut()).await;
     items_with_user_data(state, user, typed).await
 }
@@ -178,13 +178,15 @@ async fn items_with_user_data(
         .collect())
 }
 
-/// [`latest`]'s rows, without play state or localised text.
+/// [`latest`]'s rows, without play state or localised text; `shallow`
+/// leaves out the per-stream and long-text fields (`query_shallow`).
 async fn newest_items(
     state: &AppState,
     user: &User,
     parent_id: Option<&str>,
     kinds: &KindFilter,
     limit: Option<u32>,
+    shallow: bool,
 ) -> Result<Vec<MediaItem>, ListError> {
     use crate::api::jellyfin::items::{
         apply_policy_scope, resolve_parent_filter, ParentResolution,
@@ -223,7 +225,12 @@ async fn newest_items(
         ParentResolution::GenreProbe(t) => mq.filters.genre_probe_token = Some(t),
     }
     apply_policy_scope(&mut mq, &user.policy, &state.parental_ratings);
-    let (typed, _total) = state.stores.query(&mq).await.map_err(ListError::Store)?;
+    let (typed, _total) = if shallow {
+        state.stores.query_shallow(&mq).await
+    } else {
+        state.stores.query(&mq).await
+    }
+    .map_err(ListError::Store)?;
     Ok(typed)
 }
 
@@ -250,11 +257,39 @@ enum Fold {
     Album(String),
 }
 
-fn fold_of(item: &MediaItem) -> Fold {
-    match (item.kind, item.series.as_ref(), item.probe.album.as_deref()) {
-        (MediaKind::Episode, Some(series), _) => Fold::Series(series.series_key().to_string()),
-        (MediaKind::Audio, _, Some(album)) if !album.is_empty() => Fold::Album(album.to_owned()),
-        _ => Fold::Own(item.id),
+impl Fold {
+    fn of(item: &MediaItem) -> Self {
+        match (item.kind, item.series.as_ref(), item.probe.album.as_deref()) {
+            (MediaKind::Episode, Some(series), _) => Fold::Series(series.series_key().to_string()),
+            (MediaKind::Audio, _, Some(album)) if !album.is_empty() => {
+                Fold::Album(album.to_owned())
+            }
+            _ => Fold::Own(item.id),
+        }
+    }
+}
+
+/// The kind of tile a latest rail shows. The `label()` strings are a
+/// dashboard contract for `pharos_latest_tiles_total{tile}`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TileKind {
+    /// An item listed on its own.
+    Item,
+    /// A series folding several new episodes.
+    Series,
+    /// An album folding several new tracks.
+    Album,
+}
+
+impl TileKind {
+    pub const ALL: [TileKind; 3] = [TileKind::Item, TileKind::Series, TileKind::Album];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            TileKind::Item => "item",
+            TileKind::Series => "series",
+            TileKind::Album => "album",
+        }
     }
 }
 
@@ -262,7 +297,8 @@ fn fold_of(item: &MediaItem) -> Fold {
 /// episodes of one series and the tracks of one album folded into one tile
 /// placed where its newest child was; a series or album with a single new
 /// child shows that child. At most `limit` tiles (`None` is the cap). Films
-/// and books are unchanged.
+/// and books are unchanged. The fold reads shallow rows; the items listed on
+/// their own are read in full.
 pub async fn latest_tiles(
     state: &AppState,
     user: &User,
@@ -270,73 +306,104 @@ pub async fn latest_tiles(
     kinds: &KindFilter,
     limit: Option<u32>,
 ) -> Result<Vec<LatestTile>, ListError> {
+    use std::collections::HashMap;
     let limit = limit.unwrap_or(LATEST_MAX).min(LATEST_MAX) as usize;
     if limit == 0 {
         return Ok(Vec::new());
     }
-    let newest = newest_items(state, user, parent_id, kinds, Some(LATEST_MAX)).await?;
+    let newest = newest_items(state, user, parent_id, kinds, Some(LATEST_MAX), true).await?;
     let read = newest.len();
-    let mut groups: Vec<Vec<MediaItem>> = Vec::new();
-    let mut at: std::collections::HashMap<Fold, usize> = std::collections::HashMap::new();
+    let mut groups: Vec<(Fold, Vec<MediaItem>)> = Vec::new();
+    let mut at: HashMap<Fold, usize> = HashMap::new();
     for item in newest {
-        match at.get(&fold_of(&item)) {
-            Some(&i) => {
-                if let Some(group) = groups.get_mut(i) {
-                    group.push(item);
-                }
-            }
-            None if groups.len() < limit => {
-                at.insert(fold_of(&item), groups.len());
-                groups.push(vec![item]);
-            }
-            None => {}
+        let fold = Fold::of(&item);
+        if let Some(group) = at.get(&fold).and_then(|&i| groups.get_mut(i)) {
+            group.1.push(item);
+        } else if groups.len() < limit {
+            at.insert(fold.clone(), groups.len());
+            groups.push((fold, vec![item]));
         }
     }
-    let mut singles: Vec<MediaItem> = Vec::new();
-    let mut tiles: Vec<Option<LatestTile>> = Vec::with_capacity(groups.len());
-    for mut group in groups {
+    let folds: Vec<Vec<&MediaItem>> = groups
+        .iter()
+        .filter(|(_, g)| g.len() > 1)
+        .map(|(_, g)| g.iter().collect())
+        .collect();
+    let mut dtos = crate::api::jellyfin::items::latest_group_dtos(state, user.id, &folds)
+        .await
+        .inspect_err(|error| {
+            tracing::warn!(parent = parent_id.unwrap_or("all"), %error, "latest rail: series or album tiles unavailable");
+        })
+        .map_err(ListError::Store)?
+        .into_iter();
+    // Each slot: a folded tile, or the id of the item listed on its own.
+    let mut slots: Vec<Result<(LatestTile, TileKind), u64>> = Vec::with_capacity(groups.len());
+    for (fold, group) in &groups {
+        let newest_id = group.first().map_or(0, |i| i.id);
         if group.len() == 1 {
-            singles.extend(group.pop());
-            tiles.push(None);
+            slots.push(Err(newest_id));
             continue;
         }
-        let children: Vec<&MediaItem> = group.iter().collect();
-        let dto = crate::api::jellyfin::items::latest_group_dto(state, user.id, &children)
-            .await
-            .map_err(ListError::Store)?;
-        match dto {
-            Some(dto) => tiles.push(Some(LatestTile::Group {
-                dto,
-                new_children: u32::try_from(group.len()).unwrap_or(u32::MAX),
-            })),
-            // Not a series or an album after all: list its newest child.
+        let kind = match fold {
+            Fold::Album(_) => TileKind::Album,
+            _ => TileKind::Series,
+        };
+        match dtos.next().flatten() {
+            Some(dto) => slots.push(Ok((
+                LatestTile::Group {
+                    dto,
+                    new_children: u32::try_from(group.len()).unwrap_or(u32::MAX),
+                },
+                kind,
+            ))),
             None => {
-                group.truncate(1);
-                singles.extend(group.pop());
-                tiles.push(None);
+                tracing::warn!(
+                    parent = parent_id.unwrap_or("all"),
+                    ?fold,
+                    children = group.len(),
+                    "latest rail: no tile for a fold, listing its newest child"
+                );
+                slots.push(Err(newest_id));
             }
         }
+    }
+    let single_ids: Vec<u64> = slots
+        .iter()
+        .filter_map(|s| s.as_ref().err().copied())
+        .collect();
+    let mut singles = state
+        .stores
+        .get_many(&single_ids)
+        .await
+        .map_err(ListError::Store)?;
+    crate::services::metadata_text::localize_items(state, user.id, singles.iter_mut()).await;
+    let mut singles: HashMap<u64, (MediaItem, UserItemData)> =
+        items_with_user_data(state, user, singles)
+            .await?
+            .into_iter()
+            .map(|row| (row.0.id, row))
+            .collect();
+    let tiles: Vec<(LatestTile, TileKind)> = slots
+        .into_iter()
+        .filter_map(|slot| match slot {
+            Ok(tile) => Some(tile),
+            // A row deleted since the fold read it is skipped.
+            Err(id) => singles
+                .remove(&id)
+                .map(|(item, data)| (LatestTile::Item(Box::new(item), data), TileKind::Item)),
+        })
+        .collect();
+    for (_, kind) in &tiles {
+        metrics::counter!("pharos_latest_tiles_total", "tile" => kind.label()).increment(1);
     }
     tracing::debug!(
         parent = parent_id.unwrap_or("all"),
         read,
         tiles = tiles.len(),
-        folded = tiles.iter().filter(|t| t.is_some()).count(),
+        folded = tiles.iter().filter(|(_, k)| *k != TileKind::Item).count(),
         "latest rail folded"
     );
-    crate::services::metadata_text::localize_items(state, user.id, singles.iter_mut()).await;
-    let mut singles = items_with_user_data(state, user, singles)
-        .await?
-        .into_iter();
-    Ok(tiles
-        .into_iter()
-        .filter_map(|tile| match tile {
-            Some(group) => Some(group),
-            None => singles
-                .next()
-                .map(|(item, data)| LatestTile::Item(Box::new(item), data)),
-        })
-        .collect())
+    Ok(tiles.into_iter().map(|(tile, _)| tile).collect())
 }
 
 /// One page of a listing, with the number of matching items before paging.
@@ -1913,6 +1980,12 @@ mod tests {
         .into_iter()
         .collect();
         assert_eq!(labels.len(), 5);
+    }
+
+    #[test]
+    fn latest_tile_labels_are_distinct_and_stable() {
+        let labels = super::TileKind::ALL.map(super::TileKind::label);
+        assert_eq!(labels, ["item", "series", "album"]);
     }
 
     #[test]

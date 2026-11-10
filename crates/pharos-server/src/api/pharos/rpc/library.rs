@@ -100,21 +100,36 @@ impl server::library::Handler for Library {
             }
         };
         let state = &self.session.state;
-        let listed = library::latest(state, &user, parent.as_deref(), &KindFilter::Unset, limit)
-            .await
-            .map(|items| {
-                let total = u32::try_from(items.len()).unwrap_or(u32::MAX);
-                ListPage {
-                    items,
-                    total,
-                    start: 0,
+        // Spec 038 FR-106: folded as the home rail is.
+        let listed =
+            library::latest_tiles(state, &user, parent.as_deref(), &KindFilter::Unset, limit).await;
+        let books: Vec<u64> = listed
+            .iter()
+            .flatten()
+            .filter_map(|tile| match tile {
+                library::LatestTile::Item(item, _) if item.kind == MediaKind::Book => Some(item.id),
+                _ => None,
+            })
+            .collect();
+        let reads = Reads::fetch(state, &user, books).await;
+        let out = results.get().init_result();
+        let tiles = match &listed {
+            Ok(tiles) => writable_tiles(tiles),
+            Err(e) => {
+                tracing::warn!(method = "latest", error = %list_error_detail(e), "native library: listing unavailable");
+                Denial::Unavailable {
+                    dependency: "media store",
                 }
-            });
-        let reads = Reads::of(state, &user, listing_rows(&listed)).await;
-        write_listing(
-            results.get().init_result(),
-            listed,
-            "latest",
+                .write(out.init_error());
+                return Ok(());
+            }
+        };
+        let mut page = out.init_page();
+        page.set_total(len_u32(&tiles));
+        page.set_start(0);
+        write_tiles(
+            page.init_items(len_u32(&tiles)),
+            &tiles,
             &state.server_id,
             &state.image_tag_key,
             &DamagedIds::of(state),
@@ -894,9 +909,10 @@ fn write_home(
     for (i, (id, view, items)) in (0..count).zip(&rails) {
         let mut rail = list.reborrow().get(i);
         write_view(rail.reborrow().init_view(), *id, view, key);
+        let tiles = writable_tiles(items);
         write_tiles(
-            rail.init_latest(len_u32(items)),
-            items,
+            rail.init_latest(len_u32(&tiles)),
+            &tiles,
             server_id,
             key,
             damaged,
@@ -945,34 +961,50 @@ fn len_u32<T>(items: &[T]) -> u32 {
     u32::try_from(items.len()).unwrap_or(u32::MAX)
 }
 
-/// A latest rail's `tiles` into `out`, which holds `len_u32(tiles)`
-/// summaries: an item as any listing writes it, a group as its series or
-/// album with its count of new children (spec 038 FR-106).
+/// The tiles of a latest rail a native summary can carry: a group whose id
+/// is not a wire id is logged and left out, so no blank tile is written.
+fn writable_tiles(tiles: &[library::LatestTile]) -> Vec<(&library::LatestTile, Option<WireId>)> {
+    tiles
+        .iter()
+        .filter_map(|tile| match tile {
+            library::LatestTile::Item(..) => Some((tile, None)),
+            library::LatestTile::Group { dto, .. } => match WireId::parse(dto_str(dto, "Id")) {
+                Some(id) => Some((tile, Some(id))),
+                None => {
+                    tracing::warn!(
+                        id = dto_str(dto, "Id"),
+                        "native library: latest group id is not a wire id; skipped"
+                    );
+                    None
+                }
+            },
+        })
+        .collect()
+}
+
+/// A latest rail's tiles into `out`, which holds `len_u32(tiles)`
+/// summaries, from [`writable_tiles`]: an item as any listing writes it, a
+/// group as its series or album with its count of new children (spec 038
+/// FR-106).
 fn write_tiles(
     mut out: capnp::struct_list::Builder<'_, item_summary::Owned>,
-    tiles: &[library::LatestTile],
+    tiles: &[(&library::LatestTile, Option<WireId>)],
     server_id: &str,
     key: &ImageTagKey,
     damaged: &DamagedIds,
     reads: &Reads,
 ) {
-    for (i, tile) in (0..out.len()).zip(tiles) {
+    for (i, (tile, id)) in (0..out.len()).zip(tiles) {
         let mut summary = out.reborrow().get(i);
-        match tile {
-            library::LatestTile::Item(item, user_data) => {
-                write_items_one(summary, item, *user_data, server_id, key, damaged, reads);
-            }
-            library::LatestTile::Group { dto, new_children } => {
-                let Some(id) = WireId::parse(dto_str(dto, "Id")) else {
-                    tracing::warn!(
-                        id = dto_str(dto, "Id"),
-                        "native library: latest group id is not a wire id; written empty"
-                    );
-                    continue;
-                };
-                write_synth_summary(summary.reborrow(), id, dto, key);
+        match (tile, id) {
+            (library::LatestTile::Group { dto, new_children }, Some(id)) => {
+                write_synth_summary(summary.reborrow(), *id, dto, key);
                 summary.set_new_children(*new_children);
             }
+            (library::LatestTile::Item(item, user_data), _) => {
+                write_items_one(summary, item, *user_data, server_id, key, damaged, reads);
+            }
+            (library::LatestTile::Group { .. }, None) => {}
         }
     }
 }
