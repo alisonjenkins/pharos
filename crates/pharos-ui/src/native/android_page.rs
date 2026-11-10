@@ -1913,7 +1913,8 @@ addEventListener("keydown", (e) => {
   const player = document.querySelector(players);
   if (!player) return;
   const at = document.activeElement;
-  const onPlayer = !at || at === document.body || at === player;
+  const onSlider = !!(at && at.matches && at.matches('__REMOTE_SLIDERS__'));
+  const onPlayer = !at || at === document.body || at === player || onSlider;
   const v = player.querySelector("video, audio");
   const paused = !v || v.paused;
   // Stop (FR-609): a song pauses; a video pauses and leaves the player, as
@@ -1944,13 +1945,13 @@ addEventListener("keydown", (e) => {
   if (!toggle) return;
   e.preventDefault();
   e.stopImmediatePropagation();
-  player.focus({ preventScroll: true });
+  if (!onSlider) player.focus({ preventScroll: true });
   player.dispatchEvent(new KeyboardEvent("keydown", { key: " ", bubbles: true, cancelable: true }));
 }, true);
 // The remote in the video player and the full music screen: Up and Down
 // move between the player itself and its controls (the remote has its own
 // volume keys), and Left and Right move between controls once one has the
-// focus; on the player itself Left and Right still seek. Taken here, before
+// focus; on the player itself and on the seek bar Left and Right seek. Taken here, before
 // the player's handler hears them. Not the volume slider: it would keep
 // Left and Right for itself, and the remote has volume keys.
 // A control scrolled out of a panel is no stop, nor is a lyrics line: the
@@ -1964,7 +1965,7 @@ const inPanels = (el, player, r) => {
   return true;
 };
 const controlsIn = (player) => [...player.querySelectorAll(
-  "button:not([disabled]), select:not([disabled]), a[href]"
+  "button:not([disabled]), select:not([disabled]), a[href], __REMOTE_SLIDERS__"
 )].filter((el) => {
   const r = el.getBoundingClientRect();
   return r.width > 0 && r.height > 0 && !el.matches('__REMOTE_SKIPS__') && inPanels(el, player, r);
@@ -1994,7 +1995,7 @@ addEventListener("keydown", (e) => {
   if (!player || !at || !player.contains(at)) return;
   const vertical = e.key === "ArrowUp" || e.key === "ArrowDown";
   const onPicture = at === player;
-  if (!vertical && onPicture) return;
+  if (!vertical && (onPicture || at.matches('__REMOTE_SLIDERS__'))) return;
   e.preventDefault();
   e.stopPropagation();
   // Any key shows the controls; this one does nothing else.
