@@ -1589,3 +1589,39 @@ async fn a_device_audio_deny_list_stops_a_native_direct_play() {
     assert_ne!(denied.method, "direct_play");
     assert_eq!(denied.block, "audio_codec_denied");
 }
+
+async fn queue_hint(grant: &playback_grant::Client) -> Result<(u32, u64, u32, bool), String> {
+    let mut req = grant.queue_hint_request();
+    req.get().init_ctx();
+    let reply = req.send().promise.await.expect("queue hint");
+    match reply.get().unwrap().get_result().unwrap().which().unwrap() {
+        pharos_api::pharos_capnp::queue_hint_result::Hint(h) => {
+            let h = h.unwrap();
+            Ok((h.get_queued(), h.get_waited_ms(), h.get_others_queued(), h.get_busy()))
+        }
+        pharos_api::pharos_capnp::queue_hint_result::Error(e) => Err(denial(e.unwrap())),
+    }
+}
+
+/// 038 FR-402, V1217: a player waiting on its stream can ask what it waits
+/// behind while the wait is on. A server with no encoder queue answers that
+/// nothing is queued, rather than failing. The queue's own counts are pinned
+/// in the scheduler's `stream_wait` test.
+#[actix_web::test]
+async fn a_grant_answers_what_its_playback_waits_behind() {
+    let (server, fx) = crate::revocation::start().await;
+    seed_playable(&fx).await;
+    let (client, _closed) = crate::revocation::connect(&server).await;
+    let session = crate::revocation::signed_in(&client, &fx.user_token).await;
+    let direct = caps(&["h264"], &["aac"], &["mp4"]);
+    let (grant, _) = negotiate(
+        &session,
+        WireId::Real(MOVIE),
+        &direct,
+        Choice::Default,
+        Choice::Default,
+    )
+    .await
+    .unwrap();
+    assert_eq!(queue_hint(&grant).await, Ok((0, 0, 0, false)));
+}
