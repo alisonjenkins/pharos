@@ -90,7 +90,7 @@ Pinning helps torch as much as it helps Rust (song A: 24 s unpinned, 16 s pinned
 | How often do we fall back to the CPU? | `pharos_aligner_device_fallback_total{reason}` on the aligner's `/metrics`; warning `GPU forward failed; this song continues on the CPU error=... latched=...`; the song line's `device=cpu device_reason=gpu_error\|latched` |
 | How long does the forward pass take per device? | `pharos_aligner_forward_seconds{device}` histogram; `aligner.forward` span duration |
 | Did warm-up hit the cache? | Start logs `GPU kernel cache kernel_cache=<dir or off_...>` and `GPU warm-up buckets=12 total_ms=... per_bucket="1s=...ms ..."`. On the desktop RX 9070 XT, an empty cache takes about 35 s and a reused one about 9.6 s |
-| Does the Rust service agree with Python? | Server log `lyrics shadow item=<id> words=N differing=M max_delta_ms=D`; `pharos_lyrics_shadow_total{outcome=match\|differ\|error}` |
+| Does the Rust service agree with Python? | Server log `lyrics: shadow compared` with `media.id`, `outcome`, and on a mismatch `field`, `primary` and `shadow`; `pharos_lyrics_shadow_total{outcome=match\|mismatch\|error\|timeout\|skipped_busy}` |
 | Is memory within budget? | `process_resident_memory_bytes` on `/metrics`; `aligner.rss_mib` on the song's log line |
 
 LogQL: `{namespace="pharos", app_kubernetes_io_component="aligner"} |= "device="`. PromQL: `sum by (reason) (increase(pharos_aligner_device_fallback_total[1d]))`, `sum by (outcome) (increase(pharos_lyrics_shadow_total[7d]))`.
