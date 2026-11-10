@@ -31,6 +31,13 @@ use super::together::Member;
 use super::together_view::{GroupNotes, InvitePanel, MemberStrip, NotesView};
 use super::views::{ends_at, episode_label, use_ends_at_refresh};
 
+/// The settings sheet of a narrow screen, and the button that opens it
+/// (T038-302).
+pub const SETTINGS_ID: &str = "pharos-player-settings";
+const SETTINGS_TOGGLE_ID: &str = "pharos-player-settings-toggle";
+/// Sliders: the settings button.
+const ICON_SETTINGS: &str = "M3 17v2h6v-2H3zM3 5v2h10V5H3zm10 16v-2h8v-2h-8v-2h-2v6h2zM7 9v2H3v2h4v2h2V9H7zm14 4v-2H11v2h10zm-6-4h2V7h4V5h-4V3h-2v6z";
+
 /// The `<video>` the playback engine attaches to.
 pub const VIDEO_ID: &str = "pharos-video";
 /// The `<audio>` of a song handing over to the next, which takes
@@ -573,7 +580,9 @@ pub fn WatchView(
     // The open invite panel holds the chrome up, as the open queue does.
     let invite_open = invite_open && invite.is_some();
     let queue_open = queue.as_ref().is_some_and(|q| q.open);
-    let held = invite_open || queue_open;
+    // The settings sheet a narrow screen keeps the menus in (T038-302).
+    let mut sheet_open = use_signal(|| false);
+    let held = invite_open || queue_open || sheet_open();
     let next_queued = queue.as_ref().is_some_and(|q| q.plays_next(c.next));
     let class = match (media.paused, idle() && !held) {
         (true, _) => "pharos-player is-paused",
@@ -1052,6 +1061,30 @@ pub fn WatchView(
                         TimeLabels { segments: c.segments.clone(), pos, total, scrub: Some(scrub) }
                         Volume { media, on_control }
                         span { class: "pharos-control-spacer" }
+                        // Shown on a narrow screen only, where the menus and
+                        // the window-size buttons wait behind it.
+                        button {
+                            id: SETTINGS_TOGGLE_ID,
+                            class: "pharos-control pharos-settings-toggle",
+                            r#type: "button",
+                            aria_label: "Settings",
+                            title: "Tracks, subtitles and quality",
+                            aria_expanded: if sheet_open() { "true" } else { "false" },
+                            aria_controls: SETTINGS_ID,
+                            onclick: move |_| sheet_open.toggle(),
+                            Icon { path: ICON_SETTINGS }
+                        }
+                        div {
+                            id: SETTINGS_ID,
+                            class: if sheet_open() { "pharos-control-menus is-open" } else { "pharos-control-menus" },
+                            onkeydown: move |evt: KeyboardEvent| {
+                                if sheet_open() && evt.key() == Key::Named(NamedKey::Escape) {
+                                    evt.prevent_default();
+                                    evt.stop_propagation();
+                                    sheet_open.set(false);
+                                    platform::focus_by_id(SETTINGS_TOGGLE_ID);
+                                }
+                            },
                         TrackMode { in_group, own_tracks, on_change: on_own_tracks }
                         TrackPicker {
                             label: "Audio",
@@ -1120,6 +1153,7 @@ pub fn WatchView(
                             title: "Shrink to a small window",
                             onclick: move |_| on_control.call(Control::Shrink),
                             Icon { path: ICON_FLOAT }
+                            span { class: "pharos-sheet-label", "Small window" }
                         }
                         if platform::pip_supported() {
                             button {
@@ -1129,7 +1163,9 @@ pub fn WatchView(
                                 title: "Picture in picture",
                                 onclick: move |_| on_control.call(Control::PictureInPicture),
                                 Icon { path: ICON_PIP }
+                                span { class: "pharos-sheet-label", "Picture in picture" }
                             }
+                        }
                         }
                         button {
                             class: "pharos-control",
@@ -2413,6 +2449,28 @@ mod tests {
 
     /// B569/V482: the knob rides the end of the fill, and a tick the video
     /// has passed is marked so it dims.
+    #[test]
+    fn the_menus_wait_behind_a_settings_button_the_sheet_opens() {
+        let html = render(controls());
+        assert!(
+            html.contains(r#"aria-controls="pharos-player-settings""#)
+                && html.contains(r#"aria-expanded="false""#)
+                && html.contains(r#"class="pharos-control-menus""#),
+            "{html}"
+        );
+        let menus = html
+            .split(r#"id="pharos-player-settings""#)
+            .nth(1)
+            .unwrap_or_default();
+        assert!(
+            menus.contains(r#"aria-label="Subtitles""#) && menus.contains("Small window"),
+            "the menus and the window-size buttons are in the sheet: {menus}"
+        );
+        let sheet = include_str!("../../assets/pharos.css");
+        assert!(sheet.contains(".pharos-control-menus {\n  display: contents;"));
+        assert!(sheet.contains(".pharos-control-menus.is-open {"));
+    }
+
     #[test]
     fn the_seek_bar_marks_passed_chapters_and_the_play_head() {
         let mut c = controls();
