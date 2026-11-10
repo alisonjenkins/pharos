@@ -107,16 +107,20 @@ pub(crate) enum StackOutcome {
     Unprobed,
     /// Two parts' embedded titles name different films.
     TitlesDiffer,
+    /// A part's probe found no duration, so its film's playlist could not
+    /// run on past it.
+    NoDuration,
 }
 
 impl StackOutcome {
     #[cfg(test)]
-    pub(crate) const ALL: [Self; 5] = [
+    pub(crate) const ALL: [Self; 6] = [
         Self::Stacked,
         Self::Numbering,
         Self::Versions,
         Self::Unprobed,
         Self::TitlesDiffer,
+        Self::NoDuration,
     ];
 
     pub(crate) fn label(self) -> &'static str {
@@ -126,6 +130,7 @@ impl StackOutcome {
             Self::Versions => "versions",
             Self::Unprobed => "unprobed",
             Self::TitlesDiffer => "titles_differ",
+            Self::NoDuration => "no_duration",
         }
     }
 }
@@ -158,19 +163,23 @@ pub(crate) fn candidates(groups: &[Group]) -> Vec<Candidate> {
         .collect()
 }
 
-/// What the store says a file holds: `None` when no row has probed it,
-/// `Some(None)` when its probe found no embedded title.
-pub(crate) type StoredTitle = Option<Option<String>>;
+/// What the store says a probed file holds. A file with no entry has never
+/// been probed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct StoredPart {
+    pub(crate) title: Option<String>,
+    pub(crate) duration_ms: Option<u64>,
+}
 
-/// Each candidate file's stored embedded title: from its own row, or from the
+/// Each candidate file's stored title and duration: from its own row, or from the
 /// film it was stacked into on an earlier scan. A store fault leaves the file
 /// unprobed, so the parts stay apart this scan rather than merge blind.
 pub(crate) async fn stored_titles<S: MediaStore>(
     store: &S,
     groups: &[Group],
     candidates: &[Candidate],
-) -> HashMap<PathBuf, StoredTitle> {
-    let mut out: HashMap<PathBuf, StoredTitle> = HashMap::new();
+) -> HashMap<PathBuf, StoredPart> {
+    let mut out: HashMap<PathBuf, StoredPart> = HashMap::new();
     for candidate in candidates {
         for &(i, _) in &candidate.parts {
             let Some((path, _)) = groups.get(i) else {
@@ -196,23 +205,31 @@ pub(crate) async fn stored_titles<S: MediaStore>(
             };
             for alt in &item.probe.alternate_sources {
                 if let Some(probe) = alt.probe.as_ref() {
-                    out.entry(alt.path.clone())
-                        .or_insert_with(|| Some(probe.title.clone()));
+                    out.entry(alt.path.clone()).or_insert_with(|| StoredPart {
+                        title: probe.title.clone(),
+                        duration_ms: probe.duration_ms.or(alt.duration_ms),
+                    });
                 }
             }
-            out.insert(item.path.clone(), Some(item.probe.title.clone()));
+            out.insert(
+                item.path.clone(),
+                StoredPart {
+                    title: item.probe.title.clone(),
+                    duration_ms: item.probe.duration_ms,
+                },
+            );
         }
     }
     out
 }
 
 /// Whether `candidate`'s files are one film's parts, by their numbers, their
-/// versions and their stored embedded titles. On a refusal, the value that
-/// decided it.
+/// versions, their stored embedded titles and their durations. On a refusal,
+/// the value that decided it.
 pub(crate) fn verdict(
     groups: &[Group],
     candidate: &Candidate,
-    titles: &HashMap<PathBuf, StoredTitle>,
+    titles: &HashMap<PathBuf, StoredPart>,
 ) -> (StackOutcome, String) {
     let numbers: Vec<u32> = candidate.parts.iter().map(|&(_, n)| n).collect();
     if numbers.iter().zip(1..).any(|(&n, want)| n != want) {
@@ -240,11 +257,10 @@ pub(crate) fn verdict(
         let Some(stored) = titles.get(path) else {
             return (StackOutcome::Unprobed, path.display().to_string());
         };
-        let Some(title) = stored
-            .as_ref()
-            .and_then(|t| t.as_deref())
-            .filter(|t| !title_key(t).is_empty())
-        else {
+        if stored.duration_ms.is_none() {
+            return (StackOutcome::NoDuration, path.display().to_string());
+        }
+        let Some(title) = stored.title.as_deref().filter(|t| !title_key(t).is_empty()) else {
             continue;
         };
         let key = title_key(title);
@@ -265,7 +281,7 @@ pub(crate) fn verdict(
 pub(crate) fn stack(
     groups: Vec<Group>,
     candidates: &[Candidate],
-    titles: &HashMap<PathBuf, StoredTitle>,
+    titles: &HashMap<PathBuf, StoredPart>,
 ) -> Vec<Group> {
     let mut joins: HashMap<usize, Vec<(u32, usize)>> = HashMap::new();
     let mut taken = vec![false; groups.len()];
@@ -323,10 +339,18 @@ mod tests {
         (PathBuf::from(path), Vec::new())
     }
 
-    fn titles(entries: &[(&str, Option<&str>)]) -> HashMap<PathBuf, StoredTitle> {
+    fn titles(entries: &[(&str, Option<&str>)]) -> HashMap<PathBuf, StoredPart> {
         entries
             .iter()
-            .map(|(p, t)| (PathBuf::from(p), Some(t.map(str::to_string))))
+            .map(|(p, t)| {
+                (
+                    PathBuf::from(p),
+                    StoredPart {
+                        title: t.map(str::to_string),
+                        duration_ms: Some(60_000),
+                    },
+                )
+            })
             .collect()
     }
 
@@ -411,8 +435,8 @@ mod tests {
         assert_eq!(stack(groups, &found, &titles).len(), 3);
     }
 
-    /// V1151 — a gap in the numbers, a part never probed, or a part with
-    /// versions of its own keeps the files apart.
+    /// V1151 — a gap in the numbers, a part never probed, a part with
+    /// versions of its own, or a part with no duration keeps the files apart.
     #[test]
     fn doubtful_parts_stay_apart() {
         let gap = vec![
@@ -450,6 +474,16 @@ mod tests {
             verdict(&versioned, &candidates(&versioned)[0], &both).0,
             StackOutcome::Versions
         );
+
+        let mut timeless = both.clone();
+        if let Some(cd2) = timeless.get_mut(Path::new("/m/G/G (2003) cd2.mkv")) {
+            cd2.duration_ms = None;
+        }
+        let found = candidates(&pair);
+        let (outcome, value) = verdict(&pair, &found[0], &timeless);
+        assert_eq!(outcome, StackOutcome::NoDuration);
+        assert!(value.ends_with("cd2.mkv"), "{value}");
+        assert_eq!(stack(pair, &found, &timeless).len(), 2);
     }
 
     #[test]
