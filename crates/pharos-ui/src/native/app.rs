@@ -3063,20 +3063,27 @@ fn PrivacyScreen() -> Element {
             .list_reports(&call("telemetry", "list_reports"), false)
             .await;
         // A server keeping no reports, or one older than schema 35, is a
-        // normal state: an empty list, not an alert.
-        let quiet = listed.as_ref().err().is_some_and(|e| {
-            e.is_unimplemented()
-                || matches!(
-                    e,
-                    ClientError::Api {
-                        kind: "unavailable",
-                        ..
-                    }
-                )
-        });
+        // normal state: an empty list, not an alert. `unavailable` also
+        // covers a store that failed to read, so it leaves a warning.
+        let older = listed
+            .as_ref()
+            .err()
+            .is_some_and(ClientError::is_unimplemented);
+        let unavailable = matches!(
+            &listed,
+            Err(ClientError::Api {
+                kind: "unavailable",
+                ..
+            })
+        );
         match settle(ctx.machine, listed) {
             Ok(rows) => reports.set(rows),
-            Err(_) if quiet => reports.set(Vec::new()),
+            Err(e) if older || unavailable => {
+                if unavailable {
+                    platform::warn(&format!("pharos: report list unavailable: {e}"));
+                }
+                reports.set(Vec::new());
+            }
             Err(e) => notify(
                 notice,
                 format!("Could not load your problem reports: {e}"),
