@@ -9,6 +9,7 @@
 pub mod audio;
 pub mod config;
 pub mod ctc;
+pub mod forward;
 pub mod http;
 pub mod line;
 pub mod obs;
