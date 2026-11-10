@@ -357,7 +357,7 @@ async fn book_metadata_flows_through_the_existing_resolver() {
     let _guard = metrics::set_default_local_recorder(&recorder);
 
     let td = tempfile::tempdir().unwrap();
-    let titled = td.path().join("Dune.epub");
+    let titled = td.path().join("Book A.epub");
     let untitled = td.path().join("Some Untitled Book.epub");
     let write = |path: &Path, opf: &str| {
         let f = std::fs::File::create(path).unwrap();
@@ -375,8 +375,8 @@ async fn book_metadata_flows_through_the_existing_resolver() {
     write(
         &titled,
         r#"<package><metadata>
-             <dc:title>Dune</dc:title>
-             <dc:description>A desert planet.</dc:description>
+             <dc:title>Book A</dc:title>
+             <dc:description>A dry planet.</dc:description>
              <dc:date>1965-08-01</dc:date>
            </metadata><manifest/></package>"#,
     );
@@ -392,7 +392,7 @@ async fn book_metadata_flows_through_the_existing_resolver() {
         priority: 100,
         supports: MediaKind::Book,
         result: MetadataResult {
-            title: Some("Dune (curated)".into()),
+            title: Some("Book A (curated)".into()),
             ..Default::default()
         },
         fail: false,
@@ -412,13 +412,13 @@ async fn book_metadata_flows_through_the_existing_resolver() {
         .await;
     assert_eq!(
         merged.title.as_deref(),
-        Some("Dune (curated)"),
+        Some("Book A (curated)"),
         "a curated source must still outrank the book file, or a user's edit is \
          silently reverted on the next scan"
     );
     assert_eq!(
         merged.overview.as_deref(),
-        Some("A desert planet."),
+        Some("A dry planet."),
         "dc:description belongs on the ITEM's overview, not on BookMeta (R6)"
     );
     assert_eq!(
