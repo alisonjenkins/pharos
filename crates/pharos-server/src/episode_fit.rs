@@ -2,8 +2,8 @@
 //!
 //! When two or more search candidates match a show's name exactly and no
 //! folder or file year separates them, the provider's order is no reason to
-//! prefer one (B930: it handed every bare "Battlestar Galactica" folder to the
-//! 1978 show). Instead each candidate's episode list is scored against the
+//! prefer one (B930: it handed every bare same-named folder to the
+//! older show). Instead each candidate's episode list is scored against the
 //! local files, and `tvshow.nfo` adds one vote.
 
 use pharos_core::{title_similarity, MatchDecidedBy};
@@ -13,7 +13,7 @@ use crate::online_enrich::EpisodeListing;
 
 /// Most exact-name candidates whose episode lists are fetched: each costs one
 /// request (TVDB) or one per local season (TMDB), and the deployed library's
-/// worst case, Battlestar Galactica, has three.
+/// worst case has three.
 pub(crate) const MAX_SCORED: usize = 3;
 
 /// A winner leading the runner-up by less than this is a close call, flagged
@@ -191,11 +191,11 @@ mod tests {
         }
     }
 
-    /// Battlestar Galactica: the 2004 show has four seasons, the 1978 one one.
+    /// A newer show has four seasons, the older one has one.
     #[test]
     fn coverage_tells_apart_shows_with_different_runs() {
         let files: Vec<_> = (1..=4).map(|s| local(s, 1, None)).collect();
-        let old = [listed(1, 1, "Saga of a Star World")];
+        let old = [listed(1, 1, "The Old Second")];
         let new: Vec<_> = (1..=4).map(|s| listed(s, 1, "x")).collect();
         assert!((fit(&files, &old) - 0.25).abs() < 1e-6);
         assert!((fit(&files, &new) - 1.0).abs() < 1e-6);
@@ -205,10 +205,10 @@ mod tests {
     fn filename_titles_tell_apart_shows_with_the_same_numbers() {
         let files = [
             local(1, 1, Some("Pilot")),
-            local(1, 2, Some("Fastest Man Alive")),
+            local(1, 2, Some("The New Start")),
         ];
-        let old = [listed(1, 1, "Pilot"), listed(1, 2, "Out of Control")];
-        let new = [listed(1, 1, "Pilot"), listed(1, 2, "Fastest Man Alive")];
+        let old = [listed(1, 1, "Pilot"), listed(1, 2, "The Old Second")];
+        let new = [listed(1, 1, "Pilot"), listed(1, 2, "The New Start")];
         assert!((fit(&files, &old) - 0.75).abs() < 1e-6);
         assert!((fit(&files, &new) - 1.0).abs() < 1e-6);
         assert_eq!(fit(&[], &new), 0.0);
@@ -218,23 +218,23 @@ mod tests {
     fn the_nfo_votes_by_id_then_by_a_unique_year() {
         let cands = [
             Candidate {
-                id: "71173".into(),
-                year: Some(1978),
+                id: "900001".into(),
+                year: Some(1960),
             },
             Candidate {
-                id: "73545".into(),
-                year: Some(2004),
+                id: "900002".into(),
+                year: Some(1988),
             },
         ];
         let by_id = ShowNfoEvidence {
-            tvdb: Some("73545".into()),
+            tvdb: Some("900002".into()),
             tmdb: None,
-            year: Some(1978),
+            year: Some(1960),
         };
         assert_eq!(nfo_vote("tvdb", &cands, Some(&by_id)), Some(1));
         assert_eq!(nfo_vote("tmdb", &cands, Some(&by_id)), Some(0), "year");
         let no_year_match = ShowNfoEvidence {
-            year: Some(1990),
+            year: Some(1971),
             ..ShowNfoEvidence::default()
         };
         assert_eq!(nfo_vote("tvdb", &cands, Some(&no_year_match)), None);
