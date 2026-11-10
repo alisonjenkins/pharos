@@ -3256,11 +3256,154 @@ fn AppearanceScreen() -> Element {
     }
 }
 
+/// One account pref the Playback page edits: the value on screen and the
+/// saves that put it on the server.
+#[derive(Clone, Copy)]
+struct AccountPref {
+    value: Signal<String>,
+    /// Set once the viewer picks, so the mount read, if it answers later,
+    /// does not put the stored (older) value back on screen.
+    picked: Signal<bool>,
+    /// Saves run one at a time, so quick picks can't land out of order.
+    saves: Signal<Option<account_settings::SerialPref>>,
+}
+
+/// Read `key` once into a new [`AccountPref`].
+fn use_account_pref(
+    ctx: Ctx,
+    notice: Signal<Option<Notice>>,
+    key: &'static str,
+    what: &'static str,
+) -> AccountPref {
+    let mut pref = AccountPref {
+        value: use_signal(String::new),
+        picked: use_signal(|| false),
+        saves: use_signal(|| None),
+    };
+    use_hook(move || {
+        let Some(api) = ctx.api.peek().clone() else {
+            return;
+        };
+        spawn(async move {
+            match api.pref(&call("playback", what), key).await {
+                Ok(_) if *pref.picked.peek() => {}
+                Ok(value) => pref.value.set(
+                    value
+                        .map(|v| String::from_utf8_lossy(&v).into_owned())
+                        .unwrap_or_default(),
+                ),
+                Err(e) => {
+                    if e.needs_sign_in() {
+                        let mut machine = ctx.machine;
+                        machine.write().apply(Event::NeedsSignIn);
+                    }
+                    platform::warn(&format!("playback: read {what} failed: {e}"));
+                    notify(
+                        notice,
+                        format!("Could not load your {what} setting: {e}"),
+                        true,
+                    );
+                }
+            }
+        });
+    });
+    pref
+}
+
+impl AccountPref {
+    /// The viewer picked `value`: show it, save it, and on a failed save put
+    /// back what the server holds and say so.
+    fn pick(
+        mut self,
+        ctx: Ctx,
+        notice: Signal<Option<Notice>>,
+        key: &'static str,
+        what: &'static str,
+        value: String,
+    ) {
+        let Some(api) = ctx.api.peek().clone() else {
+            return;
+        };
+        self.picked.set(true);
+        let before = self.value.peek().clone();
+        self.value.set(value.clone());
+        let Some(mut next) = self
+            .saves
+            .write()
+            .get_or_insert_with(|| account_settings::SerialPref::new(before))
+            .pick(value)
+        else {
+            return;
+        };
+        spawn(async move {
+            let mut failed = None;
+            loop {
+                let ok = match api
+                    .set_pref(&call("playback", what), key, next.as_bytes())
+                    .await
+                {
+                    Ok(()) => {
+                        platform::info(&format!("playback: {what} set value={next}"));
+                        true
+                    }
+                    Err(e) => {
+                        if e.needs_sign_in() {
+                            let mut machine = ctx.machine;
+                            machine.write().apply(Event::NeedsSignIn);
+                        }
+                        platform::warn(&format!("playback: set {what} failed: {e}"));
+                        failed = Some(account_settings::refusal_message(&e));
+                        false
+                    }
+                };
+                let mut saves = self.saves.write();
+                let Some(saves) = saves.as_mut() else { return };
+                match saves.finished(next, ok) {
+                    Some(queued) => next = queued,
+                    None => {
+                        let saved = saves.saved().to_string();
+                        if *self.value.peek() != saved {
+                            self.value.set(saved);
+                        }
+                        if let Some(reason) = failed {
+                            notify(
+                                notice,
+                                format!("Could not save your {what} setting: {reason}"),
+                                true,
+                            );
+                        }
+                        return;
+                    }
+                }
+            }
+        });
+    }
+}
+
 /// The Playback page: this device's quality ceiling, subtitle size and
 /// crossfade, each kept in local storage.
 #[component]
 fn PlaybackScreen() -> Element {
+    let ctx = use_context::<Ctx>();
     let notice = use_signal(|| None::<Notice>);
+    let audio_language = use_account_pref(
+        ctx,
+        notice,
+        playback_settings::AUDIO_LANGUAGE_PREF,
+        "audio language",
+    );
+    let subtitle_language = use_account_pref(
+        ctx,
+        notice,
+        playback_settings::SUBTITLE_LANGUAGE_PREF,
+        "subtitle language",
+    );
+    let subtitle_mode = use_account_pref(
+        ctx,
+        notice,
+        playback_settings::SUBTITLE_MODE_PREF,
+        "subtitle mode",
+    );
     let mut max_quality = use_signal(|| stored_bitrate(MAX_BITRATE_KEY, parse_max_bitrate));
     let mut subtitle_size = use_signal(stored_subtitle_size);
     let mut crossfade = use_signal(crossfade_seconds);
@@ -3269,6 +3412,18 @@ fn PlaybackScreen() -> Element {
     rsx! {
         playback_settings::PlaybackView {
             notice: notice.read().clone(),
+            audio_language: audio_language.value.read().clone(),
+            on_audio_language: move |value: String| {
+                audio_language.pick(ctx, notice, playback_settings::AUDIO_LANGUAGE_PREF, "audio language", value)
+            },
+            subtitle_language: subtitle_language.value.read().clone(),
+            on_subtitle_language: move |value: String| {
+                subtitle_language.pick(ctx, notice, playback_settings::SUBTITLE_LANGUAGE_PREF, "subtitle language", value)
+            },
+            subtitle_mode: subtitle_mode.value.read().clone(),
+            on_subtitle_mode: move |value: String| {
+                subtitle_mode.pick(ctx, notice, playback_settings::SUBTITLE_MODE_PREF, "subtitle mode", value)
+            },
             episode_turn: episode_turn(),
             on_episode_turn: move |choice: EpisodeTurn| {
                 if let Err(e) = store_episode_turn(choice) {
