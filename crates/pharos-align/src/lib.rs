@@ -8,6 +8,7 @@
 
 pub mod audio;
 pub mod ctc;
+pub mod http;
 pub mod line;
 pub mod offset;
 pub mod plan;
