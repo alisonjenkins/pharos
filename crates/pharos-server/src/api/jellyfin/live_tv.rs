@@ -7,7 +7,10 @@
 //! `stream_url`'s bytes; transcode-on-tune is its own follow-up.
 
 use crate::api::jellyfin::ci_query::CiQuery;
-use crate::{api::jellyfin::auth_extractor::AuthUser, state::AppState};
+use crate::{
+    api::jellyfin::auth_extractor::{AuthUser, MediaUser},
+    state::AppState,
+};
 use actix_web::{http::header, web, HttpResponse, Responder};
 use pharos_core::TunerBackend;
 use pharos_discovery::live_tv::M3uXmltvBackend;
@@ -321,9 +324,12 @@ fn stream_refused(outcome: StreamOutcome, response: HttpResponse) -> HttpRespons
 /// against pharos or name the provider directly.
 async fn stream(
     state: web::Data<AppState>,
-    user: AuthUser,
+    MediaUser(user): MediaUser,
     path: web::Path<String>,
 ) -> impl Responder {
+    // A `<video>` element's fetch: the sign-in cookie authenticates it, so
+    // the URL need not carry the token (B1150, V191).
+    let user = AuthUser(user);
     let Some(backend) = backend_for(&state, &user, "stream") else {
         tracing::info!(user = %user.0.name, "live tv stream asked for with no live tv to serve");
         return stream_refused(
