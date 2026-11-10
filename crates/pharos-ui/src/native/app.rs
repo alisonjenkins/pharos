@@ -5096,6 +5096,10 @@ pub struct ConnectionLost(pub Memo<bool>);
 
 const CONNECTION_LOST: &str = "Connection lost. Reconnecting…";
 
+/// How far past a note's deadline its redraw is timed, so the redraw finds it
+/// expired even when the browser fires the timer a little early.
+const TIMER_SLACK_MS: u64 = 50;
+
 /// Whether `text` still shows, `for_ms` after it first did. Redraws once
 /// when its time is up.
 fn use_timed_note(text: Option<&str>, for_ms: u64) -> bool {
@@ -5106,7 +5110,11 @@ fn use_timed_note(text: Option<&str>, for_ms: u64) -> bool {
     if shown.arm {
         let mut expired = expired;
         spawn(async move {
-            platform::sleep_ms(u32::try_from(for_ms).unwrap_or(u32::MAX)).await;
+            // Past the deadline: a timer can fire before the wall clock agrees.
+            platform::sleep_ms(
+                u32::try_from(for_ms.saturating_add(TIMER_SLACK_MS)).unwrap_or(u32::MAX),
+            )
+            .await;
             expired += 1;
         });
     }
@@ -5126,7 +5134,11 @@ fn use_wait_pill(waiting: &[String], in_group: bool) -> Option<activity::WaitPil
     if arm {
         let mut expired = expired;
         spawn(async move {
-            platform::sleep_ms(u32::try_from(activity::READY_MS).unwrap_or(u32::MAX)).await;
+            platform::sleep_ms(
+                u32::try_from(activity::READY_MS.saturating_add(TIMER_SLACK_MS))
+                    .unwrap_or(u32::MAX),
+            )
+            .await;
             expired += 1;
         });
     }
