@@ -120,6 +120,7 @@ pub(crate) mod testutil {
             typeset: false,
             karaoke: None,
             style_def: None,
+            speaker: None,
         }
     }
 
