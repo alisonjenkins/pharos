@@ -159,11 +159,19 @@ impl server::telemetry::Handler for Telemetry {
         }
         if !spans.is_empty() {
             let tracer = opentelemetry::global::tracer("pharos-ui");
+            let ratio = crate::client_spans::sampling_ratio();
+            let now = std::time::SystemTime::now();
             for span in spans.iter() {
                 match read_span(span) {
                     Ok(Some(span)) => {
-                        count_span(SpanOutcome::Forwarded);
-                        crate::client_spans::forward(&tracer, span);
+                        let outcome = match crate::client_spans::forward(&tracer, span, ratio, now)
+                        {
+                            Ok(()) => SpanOutcome::Forwarded,
+                            Err(crate::client_spans::Refused::OutOfWindow) => {
+                                SpanOutcome::OutOfWindow
+                            }
+                        };
+                        count_span(outcome);
                     }
                     Ok(None) => count_span(SpanOutcome::InvalidId),
                     Err(e) => {
@@ -221,6 +229,7 @@ const MAX_SPAN_NAME_BYTES: usize = 128;
 enum SpanOutcome {
     Forwarded,
     InvalidId,
+    OutOfWindow,
     Unreadable,
 }
 
@@ -229,6 +238,7 @@ impl SpanOutcome {
         match self {
             SpanOutcome::Forwarded => "forwarded",
             SpanOutcome::InvalidId => "invalid_id",
+            SpanOutcome::OutOfWindow => "out_of_window",
             SpanOutcome::Unreadable => "unreadable",
         }
     }
@@ -539,6 +549,7 @@ mod tests {
         let labels = [
             SpanOutcome::Forwarded,
             SpanOutcome::InvalidId,
+            SpanOutcome::OutOfWindow,
             SpanOutcome::Unreadable,
         ]
         .map(SpanOutcome::label);
