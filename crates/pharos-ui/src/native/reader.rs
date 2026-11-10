@@ -494,6 +494,45 @@ pub fn key_action(press: KeyPress<'_>) -> Option<KeyAction> {
     }
 }
 
+/// Up and Down walk the book's links on the page shown, `Some(true)` for
+/// the next (V1287). Down from a control in the bar enters the page's links;
+/// Up there is left alone.
+pub fn link_key(press: KeyPress<'_>) -> Option<bool> {
+    if press.ctrl || press.meta || press.alt || press.shift || press.target == KeyTarget::Field {
+        return None;
+    }
+    match (press.key, press.target) {
+        ("ArrowDown", _) => Some(true),
+        ("ArrowUp", KeyTarget::Page) => Some(false),
+        _ => None,
+    }
+}
+
+/// How the reader reached a place in the book other than by turning pages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JumpVia {
+    /// A link inside the book.
+    Link,
+    /// A row of the contents panel.
+    Contents,
+}
+
+impl JumpVia {
+    /// A stable name for logs.
+    pub fn label(self) -> &'static str {
+        match self {
+            JumpVia::Link => "link",
+            JumpVia::Contents => "contents",
+        }
+    }
+
+    /// A link offers the way back to where it was followed; a contents row
+    /// starts afresh (V1288).
+    pub fn offers_return(self) -> bool {
+        self == JumpVia::Link
+    }
+}
+
 /// How far Space, Page Up and Down and the vertical arrows scroll a fit-width
 /// page, as a share of the host's height (a little under a screenful, so a
 /// line stays in view across the jump).
@@ -1004,6 +1043,48 @@ mod tests {
             shift: false,
             target: KeyTarget::Page,
         }
+    }
+
+    /// V1287: Up and Down walk the page's links, from the page and (Down
+    /// only) from the bar; a field, a modifier or another key is not theirs.
+    #[test]
+    fn up_and_down_walk_the_links() {
+        assert_eq!(link_key(press("ArrowDown")), Some(true));
+        assert_eq!(link_key(press("ArrowUp")), Some(false));
+        let on = |key, target| {
+            link_key(KeyPress {
+                target,
+                ..press(key)
+            })
+        };
+        assert_eq!(on("ArrowDown", KeyTarget::Control), Some(true));
+        assert_eq!(on("ArrowUp", KeyTarget::Control), None);
+        assert_eq!(on("ArrowDown", KeyTarget::Field), None);
+        assert_eq!(
+            link_key(KeyPress {
+                shift: true,
+                ..press("ArrowDown")
+            }),
+            None
+        );
+        assert_eq!(
+            link_key(KeyPress {
+                alt: true,
+                ..press("ArrowUp")
+            }),
+            None
+        );
+        for k in ["ArrowLeft", "ArrowRight", "Enter", " ", "PageDown"] {
+            assert_eq!(link_key(press(k)), None, "{k}");
+        }
+    }
+
+    /// V1288: only a link followed offers the way back.
+    #[test]
+    fn a_link_offers_return_and_contents_does_not() {
+        assert!(JumpVia::Link.offers_return());
+        assert!(!JumpVia::Contents.offers_return());
+        assert_ne!(JumpVia::Link.label(), JumpVia::Contents.label());
     }
 
     #[test]
