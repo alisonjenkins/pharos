@@ -6109,6 +6109,7 @@ pub(crate) async fn music_groups_page(
             .as_deref()
             .map_or(true, |p| name_matches_letter(name, p))
     };
+    let marks = GroupMarks::read(state, user, &tracks, q.filters.as_deref()).await?;
     // Groups are sorted, filtered and paged on their names; only the page
     // returned is built into DTOs, each of which looks up an image tag.
     match grouping {
@@ -6120,7 +6121,7 @@ pub(crate) async fn music_groups_page(
                 q.sort_by.as_deref(),
                 &parse_sort_orders(q.sort_order.as_deref()),
             );
-            aggs.retain(|a| named(&a.name));
+            aggs.retain(|a| named(&a.name) && marks.keeps(MusicGrouping::Album, &a.name));
             let (total, window) = page_window(aggs.len(), q.start_index, q.limit);
             let mut items = Vec::with_capacity(window.len());
             for a in &aggs[window] {
@@ -6133,13 +6134,103 @@ pub(crate) async fn music_groups_page(
             if first_sort_order_descending(q.sort_order.as_deref()) {
                 names.reverse();
             }
-            names.retain(|n| named(n));
+            names.retain(|n| named(n) && marks.keeps(MusicGrouping::Artist, n));
             let (total, window) = page_window(names.len(), q.start_index, q.limit);
             Ok(SynthPage {
                 items: artist_dtos(state, &names[window]).await,
                 total,
             })
         }
+    }
+}
+
+/// A music listing's played and favourite filters (B1085), applied per
+/// album and artist as the series listing applies them per series (B1081):
+/// marking an album or artist marks every track under it, so it is played,
+/// or a favourite, while every track is.
+#[derive(Default)]
+struct GroupMarks {
+    wanted: UserDataFilter,
+    /// The groups with a track that is not a favourite, and with one not
+    /// played: albums by name, artists lower-cased (an artist matches its
+    /// tracks in any case).
+    unfavoured: GroupKeys,
+    unplayed: GroupKeys,
+}
+
+#[derive(Default)]
+struct GroupKeys {
+    albums: std::collections::HashSet<String>,
+    artists: std::collections::HashSet<String>,
+}
+
+impl GroupKeys {
+    fn add(&mut self, track: &MediaItem) {
+        if let Some(album) = track.probe.album.as_deref() {
+            self.albums.insert(album.to_owned());
+        }
+        for name in [
+            track.probe.artist.as_deref(),
+            track.probe.album_artist.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            self.artists.insert(name.to_lowercase());
+        }
+    }
+
+    fn has(&self, group: MusicGrouping, key: &str) -> bool {
+        match group {
+            MusicGrouping::Album => self.albums.contains(key),
+            MusicGrouping::Artist => self.artists.contains(&key.to_lowercase()),
+        }
+    }
+}
+
+impl GroupMarks {
+    /// The marks `filters` asks for, read for `tracks` in one bulk read; no
+    /// read when it asks for neither.
+    async fn read(
+        state: &AppState,
+        user: &pharos_core::User,
+        tracks: &[MediaItem],
+        filters: Option<&str>,
+    ) -> Result<Self, actix_web::Error> {
+        let wanted = filters.map(UserDataFilter::parse).unwrap_or_default();
+        let mut marks = Self {
+            wanted,
+            ..Self::default()
+        };
+        if wanted.is_favorite.is_none() && wanted.is_played.is_none() {
+            return Ok(marks);
+        }
+        let ids: Vec<u64> = tracks.iter().map(|t| t.id).collect();
+        let user_data = state
+            .stores
+            .user_data_bulk(user.id, &ids)
+            .await
+            .map_err(|e| error::ErrorInternalServerError(e.to_string()))?;
+        for (track, ud) in tracks.iter().zip(user_data) {
+            if !ud.is_favorite {
+                marks.unfavoured.add(track);
+            }
+            if !ud.played {
+                marks.unplayed.add(track);
+            }
+        }
+        Ok(marks)
+    }
+
+    /// Whether `group` named `key` stays listed: asked for a mark, only
+    /// when every track under it has it; asked for its absence, when one
+    /// lacks it.
+    fn keeps(&self, group: MusicGrouping, key: &str) -> bool {
+        let fits = |want: Option<bool>, lacking: &GroupKeys| {
+            want.map_or(true, |want| want != lacking.has(group, key))
+        };
+        fits(self.wanted.is_favorite, &self.unfavoured)
+            && fits(self.wanted.is_played, &self.unplayed)
     }
 }
 

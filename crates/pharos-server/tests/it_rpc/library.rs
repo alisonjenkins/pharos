@@ -3081,6 +3081,73 @@ async fn a_listing_keeps_to_favourite_series() {
     assert_eq!(total, 3, "{:?}", names(episodes));
 }
 
+/// B1085: album and artist listings keep to the favourite ones, an album
+/// or artist being one while every track under it is, as a series is.
+/// Disarm check: with `GroupMarks::keeps` keeping every group, "Third"
+/// joins the favourite albums.
+#[actix_web::test]
+async fn a_listing_keeps_to_favourite_albums_and_artists() {
+    use pharos_core::UserDataStore as _;
+
+    let (server, fx) = crate::revocation::start().await;
+    let (client, _closed) = crate::revocation::connect(&server).await;
+    let session = crate::revocation::signed_in(&client, &fx.user_token).await;
+    let music = seed_music_libraries(&fx).await;
+    let favourite = pharos_core::UserItemData {
+        is_favorite: true,
+        ..pharos_core::UserItemData::default()
+    };
+    for id in [701, 702, 703] {
+        fx.state
+            .stores
+            .set_user_data(fx.user_id, id, favourite)
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        listed_in(&session, &music, &[Kind::Album], "", &["IsFavorite"]).await,
+        ["First"]
+    );
+    assert_eq!(
+        listed_in(&session, &music, &[Kind::Album], "", &["IsNotFavorite"]).await,
+        ["Second", "Third"]
+    );
+    assert!(
+        listed_in(&session, &music, &[Kind::Artist], "", &["IsFavorite"])
+            .await
+            .is_empty(),
+        "Alpha's \"Only song\" is no favourite"
+    );
+    fx.state
+        .stores
+        .set_user_data(fx.user_id, 704, favourite)
+        .await
+        .unwrap();
+    assert_eq!(
+        listed_in(&session, &music, &[Kind::Artist], "", &["IsFavorite"]).await,
+        ["Alpha"]
+    );
+    // The Favourites page asks with no parent, one kind at a time.
+    let names = |page: Vec<serde_json::Value>| -> Vec<String> {
+        page.iter()
+            .map(|i| i["Name"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    let (_, albums) = wire_query(
+        &session,
+        None,
+        &[Kind::Album],
+        "SortName",
+        false,
+        "",
+        &["IsFavorite"],
+        0,
+        50,
+    )
+    .await;
+    assert_eq!(names(albums), ["First", "Second"]);
+}
+
 /// One `Library.index` call: each letter and where it starts, then genres.
 async fn wire_index(
     session: &session::Client,
