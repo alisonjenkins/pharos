@@ -6,20 +6,20 @@
 
 ## Context
 
-Shows remade under one name (Battlestar Galactica 1978/2004, The Flash
-1990/2014, Cosmos 1980/2014, Life on Mars UK/US) are confused in the deployed
-library: 176 episode rows carry the other show's metadata (spec 033, read-only
-queries 2026-11-09T14:09Z). LIB-C11 already keys a series on its folder, so
+Shows remade under one name (a 1970s show and its 2000s remake, a 1990s show
+and its 2010s remake, a UK series and its US remake) are confused in the
+deployed library: episode rows carry the other show's metadata (spec 033,
+read-only queries 2026-11-09T14:09Z). LIB-C11 already keys a series on its folder, so
 folders never merge. The faults are elsewhere:
 
-- the show year written in file names (`Battlestar Galactica (2003) - S01E01`)
+- the show year written in file names (`Show A (2003) - S01E01`)
   is ignored, so a bare folder searches with no year and the matcher
   tie-breaks two exact-name candidates by provider order (older show wins);
 - every episode resolves its own provider record, by a fresh series search or
   by its NFO id, with no check that it belongs to the show the folder matched;
-- one folder can hold two shows (The Flash), which a folder key cannot express;
-- `tvshow.nfo` is wrong as often as the search (Cosmos, Life on Mars, Dragon
-  Ball, Forever), so neither source can simply be trusted.
+- one folder can hold two shows (a 1991 series and its 2015 remake), which a folder key cannot express;
+- `tvshow.nfo` is wrong as often as the search (a remake's NFO ids on the
+  original's files, among others), so neither source can simply be trusted.
 
 #1055 (versions) folds copies within one folder by season and episode, so a
 wrong identity there would delete a row that is a different show's episode.
@@ -100,18 +100,18 @@ evidence, and make every episode inherit it:
 - Risk: a stray unyeared file in a yeared folder could split off as its own
   show; the filename-title check re-joins it when it names an episode of the
   yeared show, and every split is logged and listed on Manage → Show identity.
-- Follow-up: the split Flash 2014 group gets a new series wire id; series-level
+- Follow-up: the split 2015 group gets a new series wire id; series-level
   favourites stay with the unyeared group.
 
 ## Alternatives considered
 
-- **Trust `tvshow.nfo` ids first.** Wrong on 4 of the 6 confused folders'
-  evidence; would fix BSG and The Flash and break Cosmos and Life on Mars.
-- **Trust the search, add the filename year only.** Fixes BSG; leaves Cosmos and
-  Life on Mars (episode NFO ids) and B933 (per-episode searches) broken.
+- **Trust `tvshow.nfo` ids first.** Wrong on most of the confused folders'
+  evidence; would fix the bare-folder cases and break the NFO-id cases.
+- **Trust the search, add the filename year only.** Fixes the bare-folder cases;
+  leaves the episode-NFO-id cases and B933 (per-episode searches) broken.
 - **Prefer the newer show on a tie.** Swaps which half of the pairs is wrong.
 - **Never split; only flag mixed folders.** Simpler and touches no wire ids, but
-  leaves The Flash's 62 2014 episodes under one 1990 match until the files are
+  leaves a mixed folder's 2015 episodes under one 1991 match until the files are
   moved. Alison chose the split with hand remapping (2026-11-09).
 - **Leave an undecided show unmatched until picked.** Alison chose a flagged
   best guess instead (2026-11-09).
