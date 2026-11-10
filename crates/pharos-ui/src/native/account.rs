@@ -33,11 +33,11 @@ pub fn initials(name: &str) -> String {
 #[component]
 pub fn AccountMenu(
     me: Option<Me>,
-    kept_books: Callback<(), usize>,
+    kept_books: Callback<(), Option<usize>>,
     on_sign_out: EventHandler<()>,
 ) -> Element {
     let mut open = use_signal(|| false);
-    let mut kept = use_signal(|| 0usize);
+    let mut kept = use_signal(|| Some(0usize));
     let mut confirming = use_signal(|| false);
     rsx! {
         AccountMenuView {
@@ -66,11 +66,13 @@ pub fn AccountMenu(
     }
 }
 
-/// What Sign out says before removing `count` kept books.
-pub fn sign_out_warning(count: usize) -> String {
+/// What Sign out says before removing `count` kept books; `None` when the
+/// record could not be read, which may still leave books in the cache.
+pub fn sign_out_warning(count: Option<usize>) -> String {
     match count {
-        1 => "Signing out removes the book kept on this device. You will need a connection to read it again.".to_owned(),
-        n => format!("Signing out removes the {n} books kept on this device. You will need a connection to read them again."),
+        Some(1) => "Signing out removes the book kept on this device. You will need a connection to read it again.".to_owned(),
+        Some(n) => format!("Signing out removes the {n} books kept on this device. You will need a connection to read them again."),
+        None => "Signing out removes any books kept on this device. You will need a connection to read them again.".to_owned(),
     }
 }
 
@@ -83,8 +85,8 @@ pub fn AccountMenuView(
     on_close: EventHandler<()>,
     on_sign_out: EventHandler<()>,
     /// Books kept on this device; with any, Sign out asks first.
-    #[props(default)]
-    kept_books: usize,
+    #[props(default = Some(0))]
+    kept_books: Option<usize>,
     /// Sign out was pressed once and is asking.
     #[props(default)]
     confirming: bool,
@@ -140,12 +142,21 @@ pub fn AccountMenuView(
                         MenuLink { to: Route::Manage, "Manage" }
                     }
                     if confirming {
-                        div { class: "pharos-account-confirm", role: "group", aria_label: "Sign out",
+                        div {
+                            class: "pharos-account-confirm",
+                            role: "group",
+                            aria_label: "Sign out",
+                            // A click on the warning must not close the menu.
+                            onclick: move |e: MouseEvent| e.stop_propagation(),
                             p { class: "pharos-account-warning", "{sign_out_warning(kept_books)}" }
                             button {
                                 class: "pharos-account-item pharos-account-danger",
                                 r#type: "button",
                                 role: "menuitem",
+                                // The pressed Sign out is gone: keep keyboard focus in the ask.
+                                onmounted: move |e: MountedEvent| async move {
+                                    let _ = e.set_focus(true).await;
+                                },
                                 onclick: move |e: MouseEvent| {
                                     e.stop_propagation();
                                     on_sign_out.call(());
@@ -169,7 +180,7 @@ pub fn AccountMenuView(
                             r#type: "button",
                             role: "menuitem",
                             onclick: move |e: MouseEvent| {
-                                if kept_books > 0 {
+                                if kept_books != Some(0) {
                                     e.stop_propagation();
                                     on_confirm.call(true);
                                 } else {
@@ -228,12 +239,17 @@ mod tests {
     use super::*;
 
     fn render(me: Option<Me>, open: bool) -> String {
-        render_kept(me, open, 0, false)
+        render_kept(me, open, Some(0), false)
     }
 
-    fn render_kept(me: Option<Me>, open: bool, kept_books: usize, confirming: bool) -> String {
+    fn render_kept(
+        me: Option<Me>,
+        open: bool,
+        kept_books: Option<usize>,
+        confirming: bool,
+    ) -> String {
         let mut dom = VirtualDom::new_with_props(
-            |(me, open, kept_books, confirming): (Option<Me>, bool, usize, bool)| {
+            |(me, open, kept_books, confirming): (Option<Me>, bool, Option<usize>, bool)| {
                 use_context_provider(|| Nav(EventHandler::new(|_: Route| {})));
                 rsx! {
                     AccountMenuView {
@@ -258,23 +274,29 @@ mod tests {
     /// fails the first assertion.
     #[test]
     fn sign_out_asks_first_naming_the_kept_books() {
-        let html = render_kept(me("ali", false), true, 3, true);
+        let html = render_kept(me("ali", false), true, Some(3), true);
         assert!(
             html.contains("Signing out removes the 3 books kept on this device."),
             "{html}"
         );
         assert!(html.contains(">Sign out and remove<"), "{html}");
         assert!(html.contains(">Cancel<"), "{html}");
-        let one = render_kept(me("ali", false), true, 1, true);
+        let one = render_kept(me("ali", false), true, Some(1), true);
         assert!(
             one.contains("removes the book kept on this device"),
             "{one}"
+        );
+        // An unreadable record may still leave books cached: ask anyway.
+        let unknown = render_kept(me("ali", false), true, None, true);
+        assert!(
+            unknown.contains("removes any books kept on this device"),
+            "{unknown}"
         );
     }
 
     #[test]
     fn with_nothing_kept_sign_out_is_one_step() {
-        let html = render_kept(me("ali", false), true, 0, false);
+        let html = render_kept(me("ali", false), true, Some(0), false);
         assert!(html.contains(">Sign out<"), "{html}");
         assert!(!html.contains("Signing out removes"), "{html}");
     }
