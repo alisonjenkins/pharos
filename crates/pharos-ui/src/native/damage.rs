@@ -44,6 +44,11 @@ pub fn warning_line(damage: &Damage) -> String {
     match (damage.verdict.as_str(), at.is_empty()) {
         ("short", true) => "Part of this file is missing. It may stop early.".to_owned(),
         ("short", false) => format!("Part of this file is missing at {at}. It may stop early."),
+        // B1162: nothing is broken to mark, but a seek reads the file from
+        // the start, so a jump near the end can take a minute.
+        ("unindexed", _) => {
+            "This file has no seek index. Skipping ahead can take up to a minute.".to_owned()
+        }
         (_, true) => "This file is damaged. Playback may skip or stop.".to_owned(),
         (_, false) => format!("This file is damaged at {at}. Playback may skip or stop there."),
     }
@@ -133,6 +138,14 @@ mod tests {
         assert_eq!(
             warning_line(&nowhere),
             "This file is damaged. Playback may skip or stop."
+        );
+        let unindexed = Damage {
+            verdict: "unindexed".into(),
+            ..Damage::default()
+        };
+        assert_eq!(
+            warning_line(&unindexed),
+            "This file has no seek index. Skipping ahead can take up to a minute."
         );
     }
 

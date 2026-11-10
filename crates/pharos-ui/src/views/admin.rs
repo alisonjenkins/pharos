@@ -2744,6 +2744,8 @@ fn verdict_words(verdict: &str) -> &'static str {
     match verdict {
         "short" => "Shorter than it claims",
         "unreadable" => "Can't be read",
+        // B1162: plays fine, but every seek reads the file from the start.
+        "unindexed" => "No seek index: remux to fix slow seeks",
         _ => "Damaged",
     }
 }
@@ -4567,6 +4569,10 @@ mod tests {
         assert_eq!(verdict_words("damaged"), "Damaged");
         assert_eq!(verdict_words("short"), "Shorter than it claims");
         assert_eq!(verdict_words("unreadable"), "Can't be read");
+        assert_eq!(
+            verdict_words("unindexed"),
+            "No seek index: remux to fix slow seeks"
+        );
         assert_eq!(verdict_words("surprise"), "Damaged");
         assert_eq!(kind_label(Some("audio")), "Audio");
         assert_eq!(kind_label(None), "File");
