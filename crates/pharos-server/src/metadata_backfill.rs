@@ -56,8 +56,8 @@ use pharos_cache::ImageCache;
 use pharos_core::{
     match_decide, ArtworkRole, DomainResult, GenreStore, LocalizedText, MatchDecision,
     MatchOutcome, MediaItem, MediaKind, MediaStore, MetadataTranslationStore, PersonStore,
-    PreferenceStore, ProviderIds, SeriesMatchCandidate, SeriesMetadata, SeriesMetadataStore,
-    TranslationGap, TranslationOwner,
+    PreferenceStore, ProviderIds, ScoredCandidate, SeriesMatchCandidate, SeriesMetadata,
+    SeriesMetadataStore, TranslationGap, TranslationOwner,
 };
 use pharos_scanner::metadata::nfo::ShowNfoEvidence;
 use pharos_scanner::series_split::RepairMode;
@@ -354,7 +354,9 @@ enum Resolved {
     },
     /// Search returned no candidate over the confidence floor — mark `none`
     /// so the row isn't re-searched every pass (TTL still re-admits it later).
-    NoMatch,
+    /// `best` is the highest-scoring candidate that fell under the floor, or
+    /// `None` when the provider returned nothing (or nothing was searched).
+    NoMatch { best: Option<ScoredCandidate> },
     /// The id resolved (via search or a pre-set provider id) but the detail
     /// fetch came back empty — a transient provider miss. Carries the resolved
     /// id so [`enrich_one`] can stamp the row (`match_source` + `external_id` +
@@ -596,7 +598,7 @@ where
                         Some("tmdb") => "tmdb",
                         _ => "tvdb",
                     };
-                    (provider, Resolved::NoMatch)
+                    (provider, Resolved::NoMatch { best: None })
                 }
                 Some((provider, show_id)) => {
                     let at = PinnedFetch {
@@ -677,7 +679,20 @@ where
     };
 
     let (external_id, source, confidence, enriched) = match resolved {
-        Resolved::NoMatch => {
+        Resolved::NoMatch { best } => {
+            // The verdict with its inputs: what was searched and the nearest
+            // miss, so a `none` row can be explained from the log alone.
+            tracing::info!(
+                media.id = item.id,
+                kind = kind_label(item.kind),
+                provider = matched_provider,
+                searched_title = title.as_str(),
+                searched_year = year,
+                best_title = best.as_ref().map(|c| c.title.as_str()),
+                best_year = best.as_ref().and_then(|c| c.year),
+                best_score = best.as_ref().map(|c| c.score),
+                "T9 metadata backfill: no confident match"
+            );
             // No confident hit — record `none` (leaves filename metadata) so
             // the row isn't re-searched until the TTL re-admits it. Guard
             // against a concurrent manual apply that landed while this
@@ -1742,12 +1757,17 @@ async fn resolve<E: OnlineEnricher>(
     let (external_id, source, confidence) = if let Some(id) = nfo_id {
         (id, "nfo_id", None)
     } else {
-        match search_decide(enricher, kind, title, year, bg_io, cfg)
-            .await
-            .chosen
-        {
+        let decision = search_decide(enricher, kind, title, year, bg_io, cfg).await;
+        match decision.chosen {
             Some(o) => (o.id, "search", Some(o.confidence)),
-            None => return Resolved::NoMatch,
+            None => {
+                let best = decision
+                    .candidates
+                    .iter()
+                    .max_by(|a, b| a.score.total_cmp(&b.score))
+                    .cloned();
+                return Resolved::NoMatch { best };
+            }
         }
     };
     let enriched = {
@@ -4851,6 +4871,40 @@ mod tests {
             s.get(900_102).await.unwrap().match_source.as_deref(),
             Some("none")
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_no_confident_match_logs_the_search_and_the_nearest_miss() {
+        let (logs, _log) = log_capture();
+        let s = store().await;
+        put_movie(&s, 900_103, "a film").await;
+        let (_td, cache) = cache();
+        // One candidate, under the floor: it is the nearest miss the log names.
+        let tmdb = FakeEnricher::tmdb().with_search(vec![("5", "Something Else", None)]);
+
+        run(
+            &s,
+            &sem(4),
+            &cache,
+            Some(&tmdb),
+            None::<&FakeEnricher>,
+            None::<&MusicBrainzClient>,
+            &MetadataConfig::default(),
+            NOW,
+        )
+        .await
+        .unwrap();
+        let text = logs.text();
+        let line = text
+            .lines()
+            .find(|l| l.contains("no confident match"))
+            .unwrap_or_default();
+        assert!(line.contains("media.id=900103"), "{line}");
+        assert!(line.contains("provider=\"tmdb\""), "{line}");
+        assert!(line.contains("kind=\"movie\""), "{line}");
+        assert!(line.contains("searched_title=\"a film\""), "{line}");
+        assert!(line.contains("best_title=\"Something Else\""), "{line}");
+        assert!(line.contains("best_score="), "{line}");
     }
 
     #[tokio::test]
