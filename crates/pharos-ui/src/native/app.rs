@@ -559,6 +559,12 @@ fn store_setting(key: &str, value: &str) {
 }
 
 thread_local! {
+    /// The viewer's playback speed this session (T038-305), which a new
+    /// player starts at.
+    static LAST_SPEED: Cell<f64> = const { Cell::new(1.0) };
+}
+
+thread_local! {
     /// The viewer's last volume and mute this page load, so a player keeps it
     /// even where `localStorage` cannot be written.
     static LAST_VOLUME: Cell<Option<(f64, bool)>> = const { Cell::new(None) };
@@ -5624,8 +5630,9 @@ fn Player(
     // it, so a tick does not rebuild the player (B815).
     let mut position = use_signal(|| 0u64);
     let mut buffered = use_signal(|| 0u64);
-    // The viewer's playback speed (T038-305), 1.0 being normal.
-    let mut speed = use_signal(|| 1.0f64);
+    // The viewer's playback speed (T038-305), 1.0 being normal. It lasts
+    // the session, so the next episode plays at the speed the viewer chose.
+    let mut speed = use_signal(|| LAST_SPEED.with(Cell::get));
     // The viewer's subtitle delay in ms (T038-305). A new player starts
     // at none, as a delay fits one file.
     let mut subtitle_delay = use_signal(|| {
@@ -6864,6 +6871,7 @@ fn Player(
                     } else {
                         platform::info(&format!("pharos: speed from={} to={rate}", *speed.peek()));
                         speed.set(rate);
+                        LAST_SPEED.with(|s| s.set(rate));
                         platform::set_speed(VIDEO_ID, rate);
                     }
                 }
