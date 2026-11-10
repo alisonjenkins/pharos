@@ -86,6 +86,13 @@ pharos-ui logs; the crate has no `tracing` subscriber in the browser.
 - A deploy is visible on the next navigation. An already-open old tab keeps
   its loaded shell until reload; the new worker serves its later lazy
   fetches, which hashed filenames keep consistent.
+- On a slow network after a deploy (no answer within 4 s), the old cached
+  shell can start. It is stopped by the check pages already have: on connect
+  `connect` in `native/app.rs` compares the server's `schemaVersion` with the
+  page's (`pharos_client::is_outdated_by`) and, when the server is newer, sets
+  `outdated`, which shows the reload prompt. The worker adds no check of its
+  own; a deploy that changes the shell but not `SCHEMA_VERSION` is not caught
+  by it, only by the next successful network-first navigation.
 - Server start reads every shell file once to hash it (tens of MB; tens of
   ms).
 - The first visit after a deploy downloads the shell twice: once for the page
