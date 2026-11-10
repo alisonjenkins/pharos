@@ -267,6 +267,7 @@ pub async fn keep(
         fraction: place.as_ref().map_or(0.0, |p| p.1),
         locator: place.map(|p| p.0),
         read_at_ms: 0,
+        opened_ms: 0,
     };
     store.keep(book.clone());
     write(&store);
