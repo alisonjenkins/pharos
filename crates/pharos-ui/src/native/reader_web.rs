@@ -25,9 +25,10 @@ use super::pdf_web::PdfView;
 use super::platform;
 use super::reader::{
     check_size, download_href, flatten_toc, key_action, margin_label, pdf_key, pdf_locator,
-    pdf_progress, pdf_saved_index, progress_label, save_key, saved_fraction, saved_locator,
-    size_cap, swipe_action, tap_action, too_big_message, KeyAction, KeyPress, KeyTarget, PageTheme,
-    PdfFit, PdfKey, ReaderSettings, SaveGate, SizeVerdict, TocRow, Typeface, LINE_HEIGHTS, MARGINS,
+    pdf_progress, pdf_saved_index, progress_label, retry_delay_ms, retryable, save_key,
+    saved_fraction, saved_locator, size_cap, swipe_action, tap_action, too_big_message, KeyAction,
+    KeyPress, KeyTarget, PageTheme, PdfFit, PdfKey, PendingSave, PendingSaves, ReaderSettings,
+    SaveGate, SizeVerdict, TocRow, Typeface, LINE_HEIGHTS, MARGINS, OFFLINE_NOTE, PENDING_KEY,
     SETTINGS_KEY,
 };
 use super::route::Route;
@@ -89,15 +90,210 @@ fn stored_settings() -> ReaderSettings {
     }
 }
 
-/// Sends the position to the server when the gate allows.
+/// The saves still waiting for the server, read from this device.
+fn load_pending() -> PendingSaves {
+    match platform::stored_theme(PENDING_KEY) {
+        Ok(Some(text)) => PendingSaves::parse(&text),
+        Ok(None) => PendingSaves::default(),
+        Err(e) => {
+            platform::warn(&format!("pharos: reader pending read failed error={e}"));
+            PendingSaves::default()
+        }
+    }
+}
+
+fn store_pending(queue: &PendingSaves) {
+    if let Err(e) = platform::store_theme(PENDING_KEY, &queue.to_text()) {
+        platform::warn(&format!(
+            "pharos: reader pending write failed queue={} error={e}",
+            queue.len()
+        ));
+    }
+}
+
+/// When the reader read the page now in front of them, on this clock.
+fn read_now() -> i64 {
+    // Whole milliseconds are all `readAt` carries.
+    #[allow(clippy::cast_possible_truncation)]
+    let ms = platform::wall_clock_ms() as i64;
+    ms
+}
+
+/// What the server did with a save.
+enum Delivery {
+    /// It answered: the position was stored, or a newer one was kept.
+    Answered,
+    /// The connection or the server failed; send it again later.
+    Retry,
+    /// The server refused it; sending it again would be refused too.
+    Refused,
+}
+
+/// Sends saves, keeps those the server has not answered on this device
+/// (spec 036 FR-001) and sends them again: when the screen opens, when the
+/// API comes back, when the browser goes online and, while any is queued and
+/// the reader is open, with a growing wait. Nothing runs while the queue is
+/// empty.
+struct Outbox {
+    api: Signal<Option<NativeApi>>,
+    /// The open book, whose queued save the note speaks of.
+    id: ItemRef,
+    note: Signal<bool>,
+    alive: Rc<Cell<bool>>,
+    /// Counts [`Outbox::kick`]s so an older retry loop stops when a newer one starts.
+    generation: Cell<u32>,
+}
+
+impl Outbox {
+    async fn deliver(&self, id: ItemRef, save: &PendingSave) -> Delivery {
+        let Some(api) = self.api.peek().clone() else {
+            return Delivery::Retry;
+        };
+        match api
+            .set_read_position(
+                &call("read", "save"),
+                id,
+                &save.locator,
+                save.fraction,
+                save.read_at_ms,
+            )
+            .await
+        {
+            Ok(_) => Delivery::Answered,
+            Err(e) if retryable(&e) => {
+                platform::warn(&format!(
+                    "pharos: reader save failed item={id} locator={} error={e}",
+                    save.locator
+                ));
+                Delivery::Retry
+            }
+            Err(e) => {
+                platform::warn(&format!(
+                    "pharos: reader save refused item={id} locator={} error={e}",
+                    save.locator
+                ));
+                Delivery::Refused
+            }
+        }
+    }
+
+    fn refresh_note(&self) {
+        if self.alive.get() {
+            let mut note = self.note;
+            note.set(load_pending().contains(self.id));
+        }
+    }
+
+    /// Sends `save` now; if the server cannot be reached it is queued.
+    fn submit(self: &Rc<Self>, id: ItemRef, save: PendingSave) {
+        let this = self.clone();
+        platform::spawn_detached(async move {
+            match this.deliver(id, &save).await {
+                Delivery::Answered => {
+                    if !load_pending().is_empty() {
+                        this.kick();
+                    }
+                }
+                Delivery::Retry => {
+                    let mut queue = load_pending();
+                    queue.queue(id, save.clone());
+                    store_pending(&queue);
+                    platform::info(&format!(
+                        "pharos: reader save queued item={id} locator={} read_at={} queue={}",
+                        save.locator,
+                        save.read_at_ms,
+                        queue.len()
+                    ));
+                    this.refresh_note();
+                    this.kick();
+                }
+                Delivery::Refused => {}
+            }
+        });
+    }
+
+    /// Starts sending what is queued, now, and again with a growing wait
+    /// until it is empty or the reader leaves. A newer kick replaces it.
+    fn kick(self: &Rc<Self>) {
+        let generation = self.generation.get().wrapping_add(1);
+        self.generation.set(generation);
+        let this = self.clone();
+        platform::spawn_detached(async move {
+            let mut attempt = 0;
+            loop {
+                if !this.alive.get() || this.generation.get() != generation {
+                    return;
+                }
+                let queue = load_pending();
+                if queue.is_empty() {
+                    this.refresh_note();
+                    return;
+                }
+                for (id, save) in queue.entries() {
+                    match this.deliver(id, &save).await {
+                        Delivery::Retry => break,
+                        Delivery::Answered | Delivery::Refused => {
+                            let mut now = load_pending();
+                            now.answered(id, &save);
+                            store_pending(&now);
+                            platform::info(&format!(
+                                "pharos: reader save flushed item={id} locator={} queue={}",
+                                save.locator,
+                                now.len()
+                            ));
+                        }
+                    }
+                }
+                this.refresh_note();
+                let left = load_pending();
+                if left.is_empty() {
+                    return;
+                }
+                let wait = retry_delay_ms(attempt);
+                platform::warn(&format!(
+                    "pharos: reader flush waiting queue={} attempt={attempt} retry_ms={wait}",
+                    left.len()
+                ));
+                attempt += 1;
+                platform::sleep_ms(wait).await;
+            }
+        });
+    }
+}
+
+/// A window `online` listener; removed on drop.
+struct OnlineWatch(Closure<dyn FnMut(web_sys::Event)>);
+
+impl OnlineWatch {
+    fn new(mut on_online: impl FnMut() + 'static) -> Self {
+        let listener = Closure::<dyn FnMut(web_sys::Event)>::new(move |_| on_online());
+        if let Some(window) = web_sys::window() {
+            let _ = window
+                .add_event_listener_with_callback("online", listener.as_ref().unchecked_ref());
+        }
+        Self(listener)
+    }
+}
+
+impl Drop for OnlineWatch {
+    fn drop(&mut self) {
+        if let Some(window) = web_sys::window() {
+            let _ = window
+                .remove_event_listener_with_callback("online", self.0.as_ref().unchecked_ref());
+        }
+    }
+}
+
+/// Offers the position to the server when the gate allows.
 struct Saver {
-    api: NativeApi,
+    outbox: Rc<Outbox>,
     id: ItemRef,
     gate: RefCell<SaveGate>,
 }
 
 impl Saver {
-    fn send(&self, locator: &str, fraction: f32, forced: bool) {
+    /// `read_at_ms` is when the reader reached this place, not when it is sent.
+    fn send(&self, locator: &str, fraction: f32, read_at_ms: i64, forced: bool) {
         let key = save_key(locator, fraction);
         let now = platform::now_ms();
         if !self.gate.borrow().due(&key, now, forced) {
@@ -108,17 +304,14 @@ impl Saver {
             "pharos: reader save item={} locator={locator} fraction={fraction:.3} forced={forced}",
             self.id
         ));
-        let (api, id, locator) = (self.api.clone(), self.id, locator.to_owned());
-        platform::spawn_detached(async move {
-            if let Err(e) = api
-                .set_read_position(&call("read", "save"), id, &locator, fraction, 0)
-                .await
-            {
-                platform::warn(&format!(
-                    "pharos: reader save failed item={id} locator={locator} error={e}"
-                ));
-            }
-        });
+        self.outbox.submit(
+            self.id,
+            PendingSave {
+                locator: locator.to_owned(),
+                fraction,
+                read_at_ms,
+            },
+        );
     }
 }
 
@@ -164,6 +357,8 @@ impl Engine {
 struct Core {
     engine: Engine,
     saver: Saver,
+    /// When the reader reached the page now shown (unix ms).
+    read_at: Cell<i64>,
     at_end: Cell<bool>,
     alive: Rc<Cell<bool>>,
     fraction: Signal<f64>,
@@ -183,6 +378,7 @@ impl Core {
     /// The reader has gone to a new page: show how far, and offer a save.
     fn moved(&self, at_end: bool) {
         self.at_end.set(at_end);
+        self.read_at.set(read_now());
         self.set_fraction(if at_end { 1.0 } else { self.engine.progress() });
         self.save(false);
     }
@@ -190,7 +386,8 @@ impl Core {
     fn save(&self, forced: bool) {
         let locator = self.engine.locator();
         let fraction = saved_fraction(self.engine.progress(), self.at_end.get());
-        self.saver.send(&locator, fraction, forced);
+        self.saver
+            .send(&locator, fraction, self.read_at.get(), forced);
     }
 
     async fn turn(&self, forward: bool) {
@@ -289,7 +486,7 @@ async fn fetch_book(id: ItemRef) -> Result<js_sys::Uint8Array, String> {
 
 #[allow(clippy::too_many_arguments)]
 async fn open_book(
-    api: NativeApi,
+    outbox: Rc<Outbox>,
     id: ItemRef,
     saved: Option<Locator>,
     settings: ReaderSettings,
@@ -330,10 +527,11 @@ async fn open_book(
     let core = Rc::new(Core {
         engine: Engine::Epub(view),
         saver: Saver {
-            api,
+            outbox,
             id,
             gate: RefCell::new(SaveGate::default()),
         },
+        read_at: Cell::new(read_now()),
         at_end: Cell::new(false),
         alive,
         fraction,
@@ -346,7 +544,7 @@ async fn open_book(
 /// Opens a PDF on the page `saved` names, if any.
 #[allow(clippy::too_many_arguments)]
 async fn open_pdf(
-    api: NativeApi,
+    outbox: Rc<Outbox>,
     id: ItemRef,
     saved: Option<&str>,
     settings: ReaderSettings,
@@ -368,10 +566,11 @@ async fn open_pdf(
     let core = Rc::new(Core {
         engine: Engine::Pdf(view),
         saver: Saver {
-            api,
+            outbox,
             id,
             gate: RefCell::new(SaveGate::default()),
         },
+        read_at: Cell::new(read_now()),
         at_end: Cell::new(false),
         alive,
         fraction,
@@ -471,9 +670,34 @@ pub fn ReaderScreen(id: ItemRef) -> Element {
     let alive = use_hook(|| Rc::new(Cell::new(true)));
     let core = use_hook(|| Rc::new(RefCell::new(None::<Rc<Core>>)));
     let started = use_hook(|| Rc::new(Cell::new(false)));
+    let offline = use_signal(|| load_pending().contains(id));
+    let outbox = use_hook({
+        let alive = alive.clone();
+        move || {
+            Rc::new(Outbox {
+                api: ctx.api,
+                id,
+                note: offline,
+                alive,
+                generation: Cell::new(0),
+            })
+        }
+    });
+
+    // Reads the API, so it runs when the screen opens and again whenever a
+    // reconnect swaps it: both are a chance to send what was queued.
+    use_effect({
+        let outbox = outbox.clone();
+        move || {
+            if ctx.api.read().is_some() && !load_pending().is_empty() {
+                outbox.kick();
+            }
+        }
+    });
 
     use_effect({
-        let (alive, core, started) = (alive.clone(), core.clone(), started.clone());
+        let (alive, core, started, outbox) =
+            (alive.clone(), core.clone(), started.clone(), outbox.clone());
         move || {
             let Some(api) = ctx.api.read().clone() else {
                 return;
@@ -481,7 +705,7 @@ pub fn ReaderScreen(id: ItemRef) -> Element {
             if started.replace(true) {
                 return;
             }
-            let (alive, core) = (alive.clone(), core.clone());
+            let (alive, core, outbox) = (alive.clone(), core.clone(), outbox.clone());
             spawn(async move {
                 let began = platform::now_ms();
                 let detail = match api.detail(&call("read", "load"), id).await {
@@ -516,7 +740,7 @@ pub fn ReaderScreen(id: ItemRef) -> Element {
                     let length = bytes.length();
                     let saved = detail.read_position.as_ref().map(|p| p.locator.clone());
                     let opened = open_pdf(
-                        api,
+                        outbox,
                         id,
                         saved.as_deref(),
                         *settings.peek(),
@@ -604,7 +828,7 @@ pub fn ReaderScreen(id: ItemRef) -> Element {
                     }
                 };
                 let opened = open_book(
-                    api,
+                    outbox,
                     id,
                     saved,
                     *settings.peek(),
@@ -643,7 +867,7 @@ pub fn ReaderScreen(id: ItemRef) -> Element {
 
     // Held for the screen's life; each removes its listener on drop.
     use_hook({
-        let (alive, core) = (alive.clone(), core.clone());
+        let (alive, core, outbox) = (alive.clone(), core.clone(), outbox.clone());
         move || {
             let key_alive = alive.clone();
             let key_core = core.clone();
@@ -697,7 +921,8 @@ pub fn ReaderScreen(id: ItemRef) -> Element {
             let (hide_core, hidden_core) = (core.clone(), core);
             let hide = platform::on_page_hide(move || flush(&hide_core));
             let lifecycle = platform::on_page_lifecycle(move || flush(&hidden_core), || {});
-            Rc::new((keys, hide, lifecycle))
+            let online = OnlineWatch::new(move || outbox.kick());
+            Rc::new((keys, hide, lifecycle, online))
         }
     });
 
@@ -887,6 +1112,9 @@ pub fn ReaderScreen(id: ItemRef) -> Element {
                 aria_valuemax: "100",
                 aria_valuenow: "{super::reader::percent(*fraction.read())}",
                 div { class: "pharos-reader-progress-bar", style: "{width}" }
+                if *offline.read() {
+                    span { class: "pharos-reader-offline", role: "status", "{OFFLINE_NOTE}" }
+                }
                 span { class: "pharos-reader-progress-label", "{label}" }
             }
             match shown {
