@@ -3189,6 +3189,111 @@ test.describe("pharos Dioxus UI", () => {
       ).toBe(true);
     });
 
+    // B1160/V1120: media that will not decode offers a skip past it, which
+    // carries on from further in, plays, and is remembered on the device.
+    // The decode failure is a stand-in: the first element reports
+    // MEDIA_ERR_DECODE after 2 s of playing, as Firefox does on a broken
+    // packet; where it broke is kept for the checks.
+    test("a decode failure offers a skip past the damage", async ({ page, request }) => {
+      test.setTimeout(60_000);
+      const probe = await request.get(`${PHAROS_URL}/pharos/session`, {
+        headers: { Accept: "application/json" },
+      });
+      test.skip(
+        probe.status() !== 405,
+        `native API is not enabled (status ${probe.status()}); skipping native test`,
+      );
+      const auth = await request.post(`${PHAROS_URL}/Users/AuthenticateByName`, {
+        headers: {
+          "Content-Type": "application/json",
+          "X-Emby-Authorization": `MediaBrowser Client="playwright", Device="pw", DeviceId="pw-skip-${Date.now()}", Version="0"`,
+        },
+        data: { Username: TEST_USER, Pw: TEST_PASS },
+      });
+      test.skip(!auth.ok(), `pharos has no seeded test user (${TEST_USER})`);
+      const { AccessToken: token, User: user } = await auth.json();
+      const items = await (
+        await request.get(
+          `${PHAROS_URL}/Users/${user.Id}/Items?Recursive=true&IncludeItemTypes=Movie&Fields=Path`,
+          { headers: { "X-Emby-Token": token } },
+        )
+      ).json();
+      // A two-minute clip the browser plays directly.
+      const movie = items.Items?.find((i: { Path?: string }) =>
+        i.Path?.endsWith("/fixture-1.webm"),
+      );
+      test.skip(!movie, "pharos has no seeded two-minute fixture");
+      const nativeId = BigInt(`0x${movie.Id}`).toString();
+
+      await page.addInitScript(() => {
+        const first = new WeakMap<HTMLMediaElement, number>();
+        const w = window as unknown as { brokeAt?: number };
+        document.addEventListener(
+          "timeupdate",
+          (e) => {
+            const v = e.target;
+            if (!(v instanceof HTMLVideoElement) || w.brokeAt !== undefined) return;
+            if (!first.has(v)) first.set(v, v.currentTime);
+            if (v.currentTime < (first.get(v) ?? 0) + 2) return;
+            w.brokeAt = v.currentTime;
+            Object.defineProperty(v, "error", {
+              configurable: true,
+              get: () => ({ code: 3, message: "stand-in decode error" }),
+            });
+            v.dispatchEvent(new Event("error"));
+          },
+          true,
+        );
+      });
+      const lines: string[] = [];
+      page.on("console", (m) => {
+        if (/^pharos: playback (failure shown|skip)/.test(m.text())) lines.push(m.text());
+      });
+
+      await page.goto("/ui/");
+      await page.locator("#signin-name").fill(TEST_USER);
+      await page.locator("#signin-password").fill(TEST_PASS);
+      await page.getByRole("button", { name: "Sign in" }).click();
+      await expect(page.locator(".pharos-shell-bar")).toBeVisible({
+        timeout: 15_000,
+      });
+      await page.evaluate((id) => localStorage.removeItem(`pharos.skipped.${id}`), nativeId);
+      await page.goto(`/ui/watch/${nativeId}`);
+      const skip = page.locator(".pharos-playback-failure-skip");
+      await expect(skip).toBeVisible({ timeout: 30_000 });
+      const brokeAt = await page.evaluate(
+        () => (window as unknown as { brokeAt: number }).brokeAt,
+      );
+      // Nothing scanned there: a 10 s step from where it broke.
+      const [m, sec] = (await skip.innerText()).replace("Skip to ", "").split(":").map(Number);
+      expect(m * 60 + sec - brokeAt).toBeGreaterThan(8);
+      expect(m * 60 + sec - brokeAt).toBeLessThan(12);
+      await expect(skip).toBeFocused();
+      await expect(page.getByText(/looks damaged/)).toBeVisible();
+      await skip.click();
+      await expect(page.locator(".pharos-playback-failure")).toHaveCount(0, { timeout: 15_000 });
+      await expect
+        .poll(
+          () =>
+            page.evaluate(() => {
+              const v = document.querySelector("video");
+              return v && !v.paused ? v.currentTime : 0;
+            }),
+          { timeout: 20_000 },
+        )
+        .toBeGreaterThan(brokeAt + 9);
+      const stored = await page.evaluate(
+        (id) => localStorage.getItem(`pharos.skipped.${id}`),
+        nativeId,
+      );
+      expect(stored, "the skipped span is remembered").toMatch(/^\d+-\d+$/);
+      expect(
+        lines.some((l) => /kind=stream media=true .*source=step/.test(l)),
+        lines.join("\n"),
+      ).toBe(true);
+      expect(lines.some((l) => /playback skip item=/.test(l)), lines.join("\n")).toBe(true);
+    });
+
     test("the Appearance page applies, keeps, imports, refuses and exports themes", async ({
       page,
       request,
