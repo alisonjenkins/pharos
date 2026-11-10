@@ -106,10 +106,10 @@ impl Events {
     }
 }
 
-/// The topics a subscriber asked for: empty means all of them.
+/// The topics a subscriber asked for: empty means [`Topic::DEFAULT`].
 fn read_topics(list: capnp::text_list::Reader<'_>) -> Result<HashSet<Topic>, Denial> {
     if list.is_empty() {
-        return Ok(Topic::ALL.into_iter().collect());
+        return Ok(Topic::DEFAULT.into_iter().collect());
     }
     let mut topics = HashSet::new();
     for name in list.iter() {
@@ -598,6 +598,7 @@ fn write_event(mut out: event::Builder<'_>, event: &Event) {
                 task.set_failed_roots(wire(tally.unread_roots()));
             }
         }
+        Payload::Groups => out.set_groups_changed(()),
         Payload::Resync => out.set_resync(()),
     }
 }

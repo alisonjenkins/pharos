@@ -571,6 +571,53 @@ async fn socket_only_announcements_are_not_events() {
         .await;
 }
 
+/// Spec 038 FR-505, V1229: a group starting or ending reaches a subscriber
+/// that names the `groups` topic, and never one that asked for the defaults,
+/// since a client from before schemaVersion 44 refuses a batch holding the arm.
+#[actix_web::test]
+async fn a_group_change_reaches_only_a_subscriber_that_names_the_topic() {
+    use pharos_sync::group::GroupMsg;
+    use pharos_sync::{GroupRegistry, LocalDelivery, MemberId, MemberSinks};
+
+    let fx = seed_rich().await;
+    let sinks = MemberSinks::new();
+    let registry = GroupRegistry::spawn(std::sync::Arc::new(LocalDelivery::new(sinks.clone())));
+    fx.state.events.follow_groups(registry.subscribe_listing());
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let s = session_for(&connect(&fx), &fx.user_token).await;
+            let (_all, mut defaults) = subscribe(&s, &[], 0).await.unwrap();
+            let (_groups, mut rx) = subscribe(&s, &["groups"], 0).await.unwrap();
+
+            let group = registry.create().await.unwrap();
+            let (sink, _member_rx) = mpsc::channel(64);
+            let member = MemberId::new();
+            sinks.insert(member, 1, sink);
+            let (reply, joined) = tokio::sync::oneshot::channel();
+            group
+                .tx
+                .send(GroupMsg::AddMember {
+                    user: None,
+                    member_id: member,
+                    name: "guest".into(),
+                    reply,
+                })
+                .await
+                .unwrap();
+            let _ = joined.await.unwrap();
+            assert!(matches!(next(&mut rx).await, Got::Groups { .. }));
+
+            group
+                .tx
+                .send(GroupMsg::RemoveMember { member_id: member })
+                .await
+                .unwrap();
+            assert!(matches!(next(&mut rx).await, Got::Groups { .. }));
+            quiet(&mut defaults).await;
+        })
+        .await;
+}
+
 fn played_payload(id: u64) -> pharos_server::services::events::Payload {
     pharos_server::services::events::Payload::UserData {
         id: pharos_jellyfin_api::dto::WireId::Real(id),

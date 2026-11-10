@@ -23,6 +23,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use pharos_core::{MediaId, UserId};
 use pharos_jellyfin_api::dto::WireId;
+use pharos_sync::GroupId;
 use tokio::sync::broadcast;
 
 use crate::state::SocketBroadcast;
@@ -51,10 +52,17 @@ pub enum Topic {
     UserData,
     Library,
     Task,
+    /// The groups a user could join changed. Since schemaVersion 44.
+    Groups,
 }
 
 impl Topic {
-    pub const ALL: [Topic; 3] = [Topic::UserData, Topic::Library, Topic::Task];
+    pub const ALL: [Topic; 4] = [Topic::UserData, Topic::Library, Topic::Task, Topic::Groups];
+
+    /// What an empty `topics` list subscribes to. A topic added after
+    /// clients shipped is not in it: a client that cannot read an event's
+    /// arm refuses its whole batch, so it must ask for the topic by name.
+    pub const DEFAULT: [Topic; 3] = [Topic::UserData, Topic::Library, Topic::Task];
 
     /// The name a client passes in `subscribe`'s `topics`.
     pub fn wire(self) -> &'static str {
@@ -62,6 +70,7 @@ impl Topic {
             Topic::UserData => "userData",
             Topic::Library => "library",
             Topic::Task => "task",
+            Topic::Groups => "groups",
         }
     }
 
@@ -75,6 +84,7 @@ impl Topic {
             Topic::UserData => "user_data",
             Topic::Library => "library",
             Topic::Task => "task",
+            Topic::Groups => "groups",
         }
     }
 }
@@ -155,6 +165,9 @@ pub enum Payload {
         state: &'static str,
         result: Option<crate::scan_tasks::ScanTally>,
     },
+    /// A group started, ended, or changed what a group list shows of it.
+    /// Carries nothing, so it says nothing of a group the user may not see.
+    Groups,
     /// Events were lost: refetch everything cached.
     Resync,
 }
@@ -165,6 +178,7 @@ impl Payload {
             Payload::UserData { .. } => Some(Topic::UserData),
             Payload::Library { .. } => Some(Topic::Library),
             Payload::Task { .. } => Some(Topic::Task),
+            Payload::Groups => Some(Topic::Groups),
             Payload::Resync => None,
         }
     }
@@ -417,6 +431,28 @@ impl EventLog {
         for payload in payloads {
             stream.push(Arc::new(payload), now, self.bounds);
         }
+    }
+
+    /// Turns each listing change `groups` announces into a groups event in
+    /// every stream. Changes that arrive together become one event, and a
+    /// reader that fell behind still sends one: an event says only that the
+    /// list changed.
+    pub fn follow_groups(self: &Arc<Self>, mut groups: broadcast::Receiver<GroupId>) {
+        let log = Arc::clone(self);
+        tokio::spawn(async move {
+            loop {
+                match groups.recv().await {
+                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(broadcast::error::RecvError::Closed) => return,
+                }
+                while !matches!(
+                    groups.try_recv(),
+                    Err(broadcast::error::TryRecvError::Empty
+                        | broadcast::error::TryRecvError::Closed)
+                ) {}
+                log.publish_all(Payload::Groups);
+            }
+        });
     }
 
     /// Appends `payload` to every stream and sends it live.
