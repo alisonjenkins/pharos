@@ -1829,10 +1829,15 @@ body:has(.pharos-stage.is-full) .pharos-status-note {
   pointer-events: auto;
   margin-left: 0.5rem;
 }
-/* Once the player says the connection is down itself, the shell's copy
-   under it goes (FR-503). Keyed on the player's note, not the stage, so a
-   player still loading leaves the shell's line up. */
-body:has(.pharos-connection-lost) .pharos-connection-shell {
+/* Once the full player in sight says the connection is down itself, the
+   shell's copy under it goes (FR-503). Keyed on that player's note, not the
+   stage, so a player still loading, a song handing over (inert) or the mini
+   bar leaves the shell's line up. */
+.pharos-stage:not(.is-full) .pharos-watch-notes {
+  display: none;
+}
+body:has(.pharos-stage.is-full .pharos-stage-slot:not([inert]) .pharos-connection-lost)
+  .pharos-connection-shell {
   display: none;
 }
 .pharos-activity-toast {
