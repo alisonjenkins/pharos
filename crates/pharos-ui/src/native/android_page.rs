@@ -1037,13 +1037,23 @@ pub fn turn_open(_item: &str) {}
 pub fn turn_ready(_item: &str, _image: Option<&str>, _title: &str) {}
 pub fn turn_cancel(_item: &str, _reason: &str) {}
 
-pub struct PageLifecycle;
+/// A listener for the page going hidden, removed on drop.
+pub struct PageLifecycle(u64);
 
+impl Drop for PageLifecycle {
+    fn drop(&mut self) {
+        unlisten(self.0);
+    }
+}
+
+/// Call `on_hidden` when the app leaves the screen, which hides the
+/// WebView's page (FR-605); the bridge pauses a playing video first. The
+/// WebView has no back/forward cache, so `on_restored` never runs.
 pub fn on_page_lifecycle(
-    _on_hidden: impl FnMut() + 'static,
+    on_hidden: impl FnMut() + 'static,
     _on_restored: impl FnMut() + 'static,
 ) -> PageLifecycle {
-    PageLifecycle
+    PageLifecycle(listen(Listener::Hidden(Box::new(on_hidden))))
 }
 
 /// hls.js for every HLS stream; the Rust engine (spec 031) is the web
@@ -1721,6 +1731,8 @@ enum Listener {
     MediaError(String, Box<dyn FnMut(u16, String)>),
     /// Page visualiser run `id` could not draw: the fallback's label.
     Visualiser(u64, Box<dyn FnMut(String)>),
+    /// The page went hidden: the app left the screen.
+    Hidden(Box<dyn FnMut()>),
 }
 
 fn listen(listener: Listener) -> u64 {
@@ -1957,6 +1969,19 @@ for (const name of ["timeupdate", "play", "playing", "pause", "waiting", "canpla
   "ratechange", "emptied"]) {
   document.addEventListener(name, media, true);
 }
+// Leaving the app (Home, another app, the TV's input switch) hides the
+// page. A video pauses here, before Rust hears of it, so it never plays on
+// behind the launcher (FR-605); a song plays on, as music does elsewhere.
+document.addEventListener("visibilitychange", () => {
+  const hidden = document.hidden;
+  let paused = 0;
+  if (hidden) {
+    for (const v of document.querySelectorAll("video")) {
+      if (!v.paused) { v.pause(); paused++; }
+    }
+  }
+  send({ t: "visibility", hidden, paused });
+});
 const size = () => send({ t: "size", w: innerWidth, h: innerHeight });
 addEventListener("resize", size);
 size();
@@ -2091,6 +2116,22 @@ fn on_bridge(message: Bridge) {
             }
         }
         Bridge::Size { w, h } => *lock(&VIEWPORT) = (w, h),
+        Bridge::Visibility { hidden, paused } => {
+            log::info!(
+                "pharos: page visibility hidden={hidden} paused_videos={paused} path={}",
+                current_path()
+            );
+            if !hidden {
+                return;
+            }
+            for f in &listeners {
+                if let Ok(mut f) = f.try_lock() {
+                    if let Listener::Hidden(f) = &mut f.0 {
+                        f();
+                    }
+                }
+            }
+        }
         Bridge::Media(media) => {
             let at = now_ms();
             let (id, tick) = (media.id.clone(), media.tick);
