@@ -411,6 +411,8 @@ struct Report {
     /// Seconds of audio the signal pass decoded.
     analysed_s: Option<f32>,
     signals_source: Option<SignalsSource>,
+    /// The dialogue loudness the director measured against (B1204).
+    loudness: Option<pharos_styling::director::Loudness>,
     /// Why a stored pass was not used, when there was one.
     signals_stale: Option<&'static str>,
 }
@@ -870,6 +872,7 @@ impl<S: JobStore, A: Signals, Q: TranscodeQueue> Styler<S, A, Q> {
         };
         let direction = pharos_styling::direct(&parsed.lines, &track, &segments);
         report.direct = Some(t.elapsed());
+        report.loudness = Some(direction.loudness);
         let plan_json = serde_json::to_string(&direction.plan).map_err(|e| Ended {
             outcome: Outcome::Error,
             stage: Stage::Direct,
@@ -1058,6 +1061,9 @@ impl<S: JobStore, A: Signals, Q: TranscodeQueue> Styler<S, A, Q> {
                     analysed_s = report.analysed_s,
                     signals_source = report.signals_source.map(SignalsSource::label),
                     signals_stale = report.signals_stale,
+                    dialogue_lufs = report.loudness.and_then(|l| l.median_lufs),
+                    dialogue_spread_lu = report.loudness.and_then(|l| l.spread_lu),
+                    loudness_scale = report.loudness.map(|l| l.scale),
                     outcome = ended.outcome.label(),
                     stage = ended.stage.label(),
                     error = ended.error.as_deref(),
