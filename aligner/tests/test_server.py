@@ -11,7 +11,7 @@ import urllib.request
 from typing import Iterator
 import pytest
 
-from pharos_aligner.server import create_server
+from pharos_aligner.server import ALIGNER_VERSION, create_server
 
 
 class FakeAligner:
@@ -301,6 +301,20 @@ def test_post_align_a_probe_that_times_out_skips_the_other_probes(tmp_path: Path
         assert data["offset_ms"] == 0
         assert all(line["words"] for line in data["lines"])
         assert len(wide_calls) == 1
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_every_answer_names_the_aligner_version(tmp_path: Path) -> None:
+    (tmp_path / "song.mp3").write_bytes(b"x")
+    server, thread, base_url = _serve(tmp_path, FakeAligner(), fake_decoder)
+    try:
+        payload = {"path": "song.mp3", "lines": [{"start_ms": 1000, "end_ms": 4000, "text": "hello there"}]}
+        with urllib.request.urlopen(_post(base_url, payload)) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        assert data["aligner_version"] == ALIGNER_VERSION
     finally:
         server.shutdown()
         server.server_close()
