@@ -2208,7 +2208,7 @@ pub(crate) const KNOWN_EDITIONS: &[&str] = &[
 /// P41 — split a file stem like `"Movie Title - Director's Cut"` into
 /// its primary title + edition tag. Returns `None` when the trailing
 /// segment isn't in `KNOWN_EDITIONS` so titles that legitimately
-/// contain ` - ` ("Crouching Tiger, Hidden Dragon") aren't mangled.
+/// contain ` - ` ("Crouching Falcon, Hidden Lake") aren't mangled.
 pub fn split_edition_tag(stem: &str) -> Option<(&str, &str)> {
     let (left, right) = stem.rsplit_once(" - ")?;
     let edition = right.trim();
@@ -3085,7 +3085,7 @@ impl FoldGuard {
 }
 
 /// The title a film file gives when neither its name nor its folder's states
-/// a year (`The Secret Life of Pets/The Secret Life of Pets.avi`). Such a
+/// a year (`The Hidden Orchard/The Hidden Orchard.avi`). Such a
 /// file joins a film of that title only when the library holds the title in
 /// a single year (see [`library_buckets`]).
 fn yearless_film_title(path: &Path) -> Option<String> {
@@ -3258,7 +3258,7 @@ fn title_words(name: &str, year: Option<u32>) -> Vec<String> {
     if title.len() > 1 && title.last().is_some_and(article) {
         title.pop();
     }
-    // `The Hobbit The Battle…` and `The.Hobbit.Battle…` name one film.
+    // `The Hollow Road Of…` and `The.Hollow.Road.Of…` name one film.
     if title.len() > 1 {
         title.retain(|w| w != "the");
     }
@@ -3325,7 +3325,7 @@ fn strip_cut<'a>(name: &'a str, year: &str) -> std::borrow::Cow<'a, str> {
     }
 }
 
-/// `name` less a cut that ends it (`The Bourne Identity cd1`), for a name with
+/// `name` less a cut that ends it (`The Silent Ledger cd1`), for a name with
 /// no year to compare with its folder's title.
 fn strip_trailing_cut(name: &str) -> String {
     let name = name.trim_end();
@@ -8305,10 +8305,7 @@ mod tests {
     #[test]
     fn parse_episode_covers_absolute_and_marker_forms() {
         // Episode-only markers → season None (defaulted to 1 upstream).
-        assert_eq!(
-            parse_episode_from_name("Code Geass E01.mkv"),
-            Some((None, 1))
-        );
+        assert_eq!(parse_episode_from_name("Show U E01.mkv"), Some((None, 1)));
         assert_eq!(parse_episode_from_name("Show EP14.mkv"), Some((None, 14)));
         assert_eq!(
             parse_episode_from_name("Series Episode 3.mkv"),
@@ -8316,9 +8313,9 @@ mod tests {
         );
         // Absolute anime numbering — the dominant fansub dash convention.
         for (name, want) in [
-            ("[Group] Code Geass - 01 [1080p].mkv", 1u32),
-            ("Code Geass Lelouch of the Rebellion - 12 [BD].mkv", 12),
-            ("Code Geass - 25v2.mkv", 25),
+            ("[Group] Show U - 01 [1080p].mkv", 1u32),
+            ("Show U Heir of the Dawn - 12 [BD].mkv", 12),
+            ("Show U - 25v2.mkv", 25),
             ("[SubsPlease] Show - 08 (1080p) [ABCD].mkv", 8),
         ] {
             assert_eq!(parse_episode_from_name(name), Some((None, want)), "{name}");
@@ -8341,9 +8338,9 @@ mod tests {
     fn parse_series_info_uses_absolute_number_and_defaults_season_one() {
         // Anime folder, no season dir, no SxxEyy — the absolute number drives
         // ordering and the season defaults to 1 so the episode groups cleanly.
-        let p = Path::new("/anime/Code Geass/[Group] Code Geass - 07 [1080p].mkv");
+        let p = Path::new("/anime/Show U/[Group] Show U - 07 [1080p].mkv");
         let info = parse_series_info(p).expect("series info");
-        assert_eq!(info.series_name, "Code Geass");
+        assert_eq!(info.series_name, "Show U");
         assert_eq!(info.episode_number, Some(7));
         assert_eq!(info.season_number, Some(1));
     }
@@ -8519,8 +8516,8 @@ mod tests {
     #[test]
     fn split_edition_tag_recognises_known_editions() {
         // P41 — the matcher requires the trailing ` - <known>` so a
-        // movie called "Crouching Tiger - Original" splits, but
-        // "Crouching Tiger - Hidden Dragon" does not (Hidden Dragon
+        // movie called "Crouching Falcon - Original" splits, but
+        // "Crouching Falcon - Hidden Lake" does not (Hidden Lake
         // is not a known edition tag).
         assert_eq!(
             split_edition_tag("Movie Title - Director's Cut"),
@@ -8530,7 +8527,7 @@ mod tests {
             split_edition_tag("The Film - Extended"),
             Some(("The Film", "Extended"))
         );
-        assert_eq!(split_edition_tag("Crouching Tiger - Hidden Dragon"), None);
+        assert_eq!(split_edition_tag("Crouching Falcon - Hidden Lake"), None);
     }
 
     #[test]
@@ -8880,8 +8877,12 @@ mod tests {
 
     #[test]
     fn copies_of_an_episode_in_two_season_folders_group_as_one() {
-        let a = PathBuf::from("/tv/Black Mirror/Season 1/Black Mirror - S01E02 - Fifteen Million Merits WEBDL-1080p.mkv");
-        let b = PathBuf::from("/tv/Black Mirror/Season 01/Black Mirror - S01E02 - Fifteen Million Merits WEBDL-1080p.mkv");
+        let a = PathBuf::from(
+            "/tv/Show V/Season 1/Show V - S01E02 - The Quiet Arrival WEBDL-1080p.mkv",
+        );
+        let b = PathBuf::from(
+            "/tv/Show V/Season 01/Show V - S01E02 - The Quiet Arrival WEBDL-1080p.mkv",
+        );
         let groups = group_editions(vec![a.clone(), b.clone()]);
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].0, b);
@@ -8922,8 +8923,8 @@ mod tests {
         let label = |a: &str, b: &str| copy_label(Path::new(a), Path::new(b));
         assert_eq!(
             label(
-                "/m/Transformers Age of Extinction/Transformers - Age of Extinction (2014) WEBDL-1080p.mkv",
-                "/m/Transformers Age of Extinction (2014)/Transformers Age of Extinction (2014) Bluray-1080p.mkv",
+                "/m/Film U Age of Dusk/Film U - Age of Dusk (2014) WEBDL-1080p.mkv",
+                "/m/Film U Age of Dusk (2014)/Film U Age of Dusk (2014) Bluray-1080p.mkv",
             ),
             "Bluray-1080p"
         );
@@ -9209,20 +9210,20 @@ mod tests {
                 "/m/Everest.2015.BluRay.1080p.x264.DTS-HD.MA.7.1-LTT/Everest.2015.BluRay.1080p.x264.DTS-HD.MA.7.1-LTT.mkv",
             ),
             (
-                "/m/Johnny English Reborn (2011)/Johnny English Reborn (2011) WEBRip-1080p.mkv",
-                "/m/Johnny.English.Reborn.2011.1080p.MKV.AC3.DTS.Eng.NL.Subs/Johnny.English.Reborn.2011.1080p.MKV.AC3.DTS.Eng.NL.Subs.mkv",
+                "/m/Film V Reborn (2011)/Film V Reborn (2011) WEBRip-1080p.mkv",
+                "/m/Film.V.Reborn.2011.1080p.MKV.AC3.DTS.Eng.NL.Subs/Film.V.Reborn.2011.1080p.MKV.AC3.DTS.Eng.NL.Subs.mkv",
             ),
             (
                 "/m/Lara Croft Tomb Raider (2001)/Lara Croft - Tomb Raider (2001) WEBDL-1080p.mkv",
                 "/m/Lara Croft Tomb Raider 2001 BluRay 720p DTS x264-3Li/Lara Croft Tomb Raider 2001 3Li BluRay 720p.mkv",
             ),
             (
-                "/m/Superbad (2007)/Superbad (2007) Bluray-1080p.mkv",
-                "/m/Superbad 2007 Unrated Extended 1080p BluRay/Superbad_2007_Unrated_Extended_1080p_BluRay_BHD264_AAC51_MP4-FASM.mp4",
+                "/m/Film W (2007)/Film W (2007) Bluray-1080p.mkv",
+                "/m/Film W 2007 Unrated Extended 1080p BluRay/Film W_2007_Unrated_Extended_1080p_BluRay_BHD264_AAC51_MP4-GRPA.mp4",
             ),
             (
-                "/m/Hobbit The Battle of the Five Armies, The (2014)/The Hobbit - The Battle of the Five Armies (2014) WEBDL-1080p.mkv",
-                "/m/The.Hobbit.Battle.Of.The.Five.Armies.2014.1080p.WEBRip.x264-tomcat12[ETRG]/The.Hobbit.Battle.Of.The.Five.Armies.2014.1080p.WEBRip.x264-tomcat12[ETRG].mp4",
+                "/m/Hollow Road of the Five Rivers, The (2014)/The Hollow Road - Of the Five Rivers (2014) WEBDL-1080p.mkv",
+                "/m/The.Hollow.Road.Of.The.Five.Rivers.2014.1080p.WEBRip.x264-tomcat12[ETRG]/The.Hollow.Road.Of.The.Five.Rivers.2014.1080p.WEBRip.x264-tomcat12[ETRG].mp4",
             ),
         ] {
             let groups = group_editions(vec![PathBuf::from(primary), PathBuf::from(copy)]);
@@ -9230,8 +9231,8 @@ mod tests {
         }
         for (a, b) in [
             (
-                "/m/Final Destination (2000)/Final Destination (2000) BluRay cd1.mkv",
-                "/m/Final Destination (2000)/Final Destination (2000) BluRay cd2.mkv",
+                "/m/Film X (2000)/Film X (2000) BluRay cd1.mkv",
+                "/m/Film X (2000)/Film X (2000) BluRay cd2.mkv",
             ),
             (
                 "/m/Heat (1995)/Heat (1995) Bluray-1080p.mkv",
@@ -9259,25 +9260,25 @@ mod tests {
     fn a_yearless_copy_joins_the_one_year_its_title_is_held_in() {
         for (primary, copy) in [
             (
-                "/m/Secret Life of Pets, The (2016)/The Secret Life of Pets (2016) WEBRip-1080p.mkv",
-                "/m/The Secret Life of Pets/The Secret Life of Pets.avi",
+                "/m/Hidden Orchard, The (2016)/The Hidden Orchard (2016) WEBRip-1080p.mkv",
+                "/m/The Hidden Orchard/The Hidden Orchard.avi",
             ),
             (
-                "/m/Transformers Age of Extinction/Transformers - Age of Extinction (2014) WEBDL-1080p.mkv",
-                "/m/Transformers Age of Extinction/Transformers Age of Extinction.mkv",
+                "/m/Film U Age of Dusk/Film U - Age of Dusk (2014) WEBDL-1080p.mkv",
+                "/m/Film U Age of Dusk/Film U Age of Dusk.mkv",
             ),
             (
-                "/m/Taken 3 (2015)/Taken 3.mkv",
-                "/m/Taken 3/Taken.3.1080p.BluRay.x265-n0m1.mkv",
+                "/m/Film Y 3 (2015)/Film Y 3.mkv",
+                "/m/Film Y 3/Film.Y.3.1080p.BluRay.x265-grpb.mkv",
             ),
         ] {
             let groups = group_editions(vec![PathBuf::from(primary), PathBuf::from(copy)]);
             assert_eq!(groups.len(), 1, "{copy} is a copy of {primary}: {groups:?}");
         }
         let groups = group_editions(vec![
-            PathBuf::from("/m/The Lion King (1994)/The Lion King (1994).mkv"),
-            PathBuf::from("/m/The Lion King (2019)/The Lion King (2019).mkv"),
-            PathBuf::from("/m/Lion King/The Lion King.mkv"),
+            PathBuf::from("/m/The Tall Meadow (1994)/The Tall Meadow (1994).mkv"),
+            PathBuf::from("/m/The Tall Meadow (2019)/The Tall Meadow (2019).mkv"),
+            PathBuf::from("/m/Tall Meadow/The Tall Meadow.mkv"),
         ]);
         assert_eq!(
             groups.len(),
@@ -9301,10 +9302,10 @@ mod tests {
     #[test]
     fn a_film_key_folds_case_and_punctuation() {
         assert_eq!(
-            film_copy_key(Path::new("/f/The.Matrix.1999.1080p.BluRay.mkv")),
-            film_copy_key(Path::new("/g/The Matrix (1999) WEBDL-720p.mp4")),
+            film_copy_key(Path::new("/f/The.Glass.Lattice.1999.1080p.BluRay.mkv")),
+            film_copy_key(Path::new("/g/The Glass Lattice (1999) WEBDL-720p.mp4")),
         );
-        assert_eq!(film_copy_key(Path::new("/f/The Matrix.mkv")), None);
+        assert_eq!(film_copy_key(Path::new("/f/The Glass Lattice.mkv")), None);
     }
 
     /// V846: a name with no year takes its folder's year when it names the
@@ -9321,18 +9322,16 @@ mod tests {
         );
         assert_eq!(
             film_copy_key(Path::new(
-                "/m/X-Men Apocalypse (2016)/X-Men - Apocalypse (2016) 3D HSBS.mkv"
+                "/m/Film Z Dusk (2016)/Film Z - Dusk (2016) 3D HSBS.mkv"
             )),
-            film_copy_key(Path::new(
-                "/m/X-Men - Apocalypse (2016)/X-Men Apocalypse (2016).mkv"
-            )),
+            film_copy_key(Path::new("/m/Film Z - Dusk (2016)/Film Z Dusk (2016).mkv")),
         );
         assert_eq!(
             film_copy_key(Path::new(
-                "/m/X-Men Apocalypse (2016) [3D] [HSBS] [YTS.AG]/X-Men.Apocalypse.2016.3D.HSBS.BluRay.x264-[YTS.AG].mp4"
+                "/m/Film Z Dusk (2016) [3D] [HSBS] [YTS.AG]/Film.Z.Dusk.2016.3D.HSBS.BluRay.x264-[YTS.AG].mp4"
             )),
             film_copy_key(Path::new(
-                "/m/X-Men Apocalypse (2016)/X-Men - Apocalypse (2016) WEBDL-1080p.mkv"
+                "/m/Film Z Dusk (2016)/Film Z - Dusk (2016) WEBDL-1080p.mkv"
             )),
             "a release group is how a copy was made"
         );
@@ -9381,27 +9380,25 @@ mod tests {
             key("/m/Beowulf (2007) [1080p]/Beowulf.2007.1080p.BrRip.x264.Deceit.mp4"),
             beowulf
         );
-        let fd3 = key("/m/Final Destination 3 (2006)/Final Destination 3 (2006) WEBDL-1080p.mkv");
-        assert_eq!(fd3, Some(("final destination 3".to_string(), 2006)));
+        let fd3 = key("/m/Film X 3 (2006)/Film X 3 (2006) WEBDL-1080p.mkv");
+        assert_eq!(fd3, Some(("film x 3".to_string(), 2006)));
         for copy in [
-            "/m/x/Final Destination 3 2006 BluRay 720p DTS x264-MgB [ETRG].mkv",
-            "/m/x/Final.Destination.3.2006.1080p.BluRay.x264.AC3-ETRG.mp4",
-            "/m/x/Final Destination 3 2006 1080p YIFY.mp4",
+            "/m/x/Film X 3 2006 BluRay 720p DTS x264-MgB [ETRG].mkv",
+            "/m/x/Film.X.3.2006.1080p.BluRay.x264.AC3-ETRG.mp4",
+            "/m/x/Film X 3 2006 1080p YIFY.mp4",
         ] {
             assert_eq!(key(copy), fd3, "{copy}");
         }
         assert_eq!(
-            key("/m/x/Captain.America.The.Winter.Soldier.2014.720p.BluRay.x264.DTS-WiKi.mkv"),
-            key("/m/y/Captain America - The Winter Soldier (2014) Bluray-1080p.mkv"),
+            key("/m/x/Film.R.The.Long.Winter.2014.720p.BluRay.x264.DTS-GRPE.mkv"),
+            key("/m/y/Film R - The Long Winter (2014) Bluray-1080p.mkv"),
         );
     }
 
     /// V961: a release group's promo clip is never indexed.
     #[test]
     fn a_release_promo_is_not_walked() {
-        assert!(is_release_promo(Path::new(
-            "/m/Final Destination 3 (2006)/ETRG.mp4"
-        )));
+        assert!(is_release_promo(Path::new("/m/Film X 3 (2006)/ETRG.mp4")));
         assert!(is_release_promo(Path::new("/m/X/RARBG.mkv")));
         assert!(!is_release_promo(Path::new("/m/X/RARBG.txt")));
         assert!(!is_release_promo(Path::new(
@@ -9413,13 +9410,13 @@ mod tests {
     #[test]
     fn a_release_sample_is_not_walked() {
         for sample in [
-            "Black Panther (2018)/Sample/black.panther.2018.1080p.bluray.x264-sparks.sample.mkv",
-            "X/Final Destination 3 2006 BluRay 720p DTS x264-MgB (Sample).mkv",
-            "X/Final.Destination.5.2011.1080p.BluRay.x264.AC3-ETRG.Sample.mp4",
+            "Film S (2018)/Sample/film.s.2018.1080p.bluray.x264-grpc.sample.mkv",
+            "X/Film X 3 2006 BluRay 720p DTS x264-MgB (Sample).mkv",
+            "X/Film.X.5.2011.1080p.BluRay.x264.AC3-ETRG.Sample.mp4",
             "The Golem (2018)/Sample.mkv",
             "Heat (1995)/Heat (1995)-sample.mkv",
             // B1013 / V972
-            "X/sample-The Last Starfighter (1984) 25th Anniversary Ed.mkv",
+            "X/sample-The Last Beacon (1984) 25th Anniversary Ed.mkv",
         ] {
             assert!(is_release_sample(Path::new(sample)), "{sample}");
         }
@@ -9876,7 +9873,7 @@ mod tests {
     #[test]
     fn a_flagged_shows_guard_covers_its_show_folder_copies() {
         let td = TempDir::new().unwrap();
-        let show = td.path().join("Sword Art Online II");
+        let show = td.path().join("Show W II");
         std::fs::create_dir_all(show.join("SAO II")).unwrap();
         std::fs::write(show.join("tvshow.nfo"), b"<tvshow/>").unwrap();
         let paths = vec![
@@ -10346,13 +10343,13 @@ mod tests {
             br#"<?xml version="1.0"?>
 <movie>
   <title>The Real Movie</title>
-  <director>Lana Wachowski</director>
+  <director>Director Q</director>
   <credits>David Mitchell</credits>
   <actor>
-    <name>Keanu Reeves</name>
-    <role>Neo</role>
+    <name>Actor Q</name>
+    <role>Hero A</role>
     <order>0</order>
-    <thumb>http://img/keanu.jpg</thumb>
+    <thumb>http://img/actor.jpg</thumb>
   </actor>
   <actor>
     <name>Carrie-Anne Moss</name>
@@ -10375,34 +10372,34 @@ mod tests {
         // (actors first by sort_order; crew with no order trail).
         let credits = store.people_for_item(id).await.unwrap();
         let names: Vec<&str> = credits.iter().map(|c| c.name.as_str()).collect();
-        assert_eq!(names[0], "Keanu Reeves", "order 0 first");
+        assert_eq!(names[0], "Actor Q", "order 0 first");
         assert_eq!(names[1], "Carrie-Anne Moss", "order 1 second");
-        assert!(names.contains(&"Lana Wachowski"));
+        assert!(names.contains(&"Director Q"));
         assert!(names.contains(&"David Mitchell"));
 
         // Structured kind + character round-trip.
-        let keanu = credits.iter().find(|c| c.name == "Keanu Reeves").unwrap();
-        assert_eq!(keanu.kind, PersonKind::Actor);
-        assert_eq!(keanu.character.as_deref(), Some("Neo"));
-        let dir = credits.iter().find(|c| c.name == "Lana Wachowski").unwrap();
+        let star = credits.iter().find(|c| c.name == "Actor Q").unwrap();
+        assert_eq!(star.kind, PersonKind::Actor);
+        assert_eq!(star.character.as_deref(), Some("Hero A"));
+        let dir = credits.iter().find(|c| c.name == "Director Q").unwrap();
         assert_eq!(dir.kind, PersonKind::Director);
         let wri = credits.iter().find(|c| c.name == "David Mitchell").unwrap();
         assert_eq!(wri.kind, PersonKind::Writer);
 
         // ParentId pivot: person wire id → the crediting item.
         let ids = store
-            .item_ids_for_person(&person_wire_id("Keanu Reeves"))
+            .item_ids_for_person(&person_wire_id("Actor Q"))
             .await
             .unwrap();
         assert_eq!(ids, vec![id]);
 
         // Headshot persisted on the person row.
         let p = store
-            .person_by_wire_id(&person_wire_id("Keanu Reeves"))
+            .person_by_wire_id(&person_wire_id("Actor Q"))
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(p.thumb_url.as_deref(), Some("http://img/keanu.jpg"));
+        assert_eq!(p.thumb_url.as_deref(), Some("http://img/actor.jpg"));
     }
 
     #[tokio::test]
@@ -10544,8 +10541,8 @@ mod tests {
             br#"<?xml version="1.0"?>
 <movie>
   <title>The Real Movie</title>
-  <set><name>The Matrix Collection</name></set>
-  <collection>Wachowski Films</collection>
+  <set><name>The Glass Lattice Collection</name></set>
+  <collection>Zed Films</collection>
 </movie>"#,
         )
         .await;
@@ -10561,17 +10558,17 @@ mod tests {
         // Both the nested <set><name> and the flat <collection> are box sets.
         let counts = store.collections_with_counts().await.unwrap();
         let names: Vec<&str> = counts.iter().map(|c| c.collection.name.as_str()).collect();
-        assert_eq!(names, vec!["The Matrix Collection", "Wachowski Films"]);
+        assert_eq!(names, vec!["The Glass Lattice Collection", "Zed Films"]);
 
         // ParentId pivot: collection wire id → the member item.
         let members = store
-            .collection_items(&collection_wire_id("The Matrix Collection"))
+            .collection_items(&collection_wire_id("The Glass Lattice Collection"))
             .await
             .unwrap();
         assert_eq!(members, vec![id]);
         assert_eq!(
             store
-                .collection_items(&collection_wire_id("Wachowski Films"))
+                .collection_items(&collection_wire_id("Zed Films"))
                 .await
                 .unwrap(),
             vec![id]
@@ -10582,7 +10579,7 @@ mod tests {
         // Idempotent: a rescan keeps a single membership (no dupes).
         let _ = s.scan_into(td.path(), &store).await.unwrap();
         let members = store
-            .collection_items(&collection_wire_id("The Matrix Collection"))
+            .collection_items(&collection_wire_id("The Glass Lattice Collection"))
             .await
             .unwrap();
         assert_eq!(members, vec![id], "rescan keeps one membership");
@@ -11095,7 +11092,7 @@ mod tests {
         for skipped in [
             "To Sort/SG1/title_t00.mkv",
             "Heat (1995)/Sample/heat.sample.mkv",
-            "X/sample-The Last Starfighter (1984).mkv",
+            "X/sample-The Last Beacon (1984).mkv",
             "X/ETRG.mp4",
         ] {
             assert!(walk_skips(&root.join(skipped), root), "{skipped}");

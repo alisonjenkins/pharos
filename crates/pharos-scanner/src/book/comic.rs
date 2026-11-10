@@ -579,8 +579,8 @@ fn take_number(it: &mut std::iter::Peekable<std::str::Bytes<'_>>) -> u128 {
 fn parse_comic_info(xml: &str) -> Result<ComicMetadata, String> {
     let mut reader = quick_xml::Reader::from_str(xml);
     // NOT `trim_text(true)`. Trimming happens per literal RUN, and an entity
-    // splits a run — so `Bruce Wayne &amp; the Mutants` would lose the spaces
-    // either side of the `&` and come back "Bruce Wayne&the Mutants". The
+    // splits a run — so `Alex Doe &amp; the Rivals` would lose the spaces
+    // either side of the `&` and come back "Alex Doe&the Rivals". The
     // element's text is trimmed once, whole, at its `End`.
     reader.config_mut().trim_text(false);
 
@@ -673,12 +673,12 @@ mod tests {
 
     const COMIC_INFO: &str = r#"<?xml version="1.0"?>
 <ComicInfo>
-  <Title>The Dark Knight Returns</Title>
-  <Series>Batman</Series>
+  <Title>Comic A</Title>
+  <Series>Series A</Series>
   <Number>1</Number>
-  <Writer>Frank Miller</Writer>
+  <Writer>Writer A</Writer>
   <Publisher>DC Comics</Publisher>
-  <Summary>Bruce Wayne &amp; the Mutants.</Summary>
+  <Summary>Alex Doe &amp; the Rivals.</Summary>
   <Year>1986</Year>
   <Month>2</Month>
   <Day>1</Day>
@@ -738,7 +738,7 @@ mod tests {
     #[test]
     fn a_comics_page_count_and_comicinfo_are_read() {
         let td = tempfile::tempdir().unwrap();
-        let p = td.path().join("Batman 001.cbz");
+        let p = td.path().join("Series A 001.cbz");
         write_cbz(
             &p,
             &[
@@ -755,18 +755,18 @@ mod tests {
             "two images means two pages; ComicInfo's <PageCount>999</PageCount> \
              must NOT win — it is the tagger's guess, the archive is ground truth"
         );
-        assert_eq!(meta.series_name.as_deref(), Some("Batman"));
+        assert_eq!(meta.series_name.as_deref(), Some("Series A"));
         assert_eq!(meta.series_index, Some(1));
         assert_eq!(
             meta.author.as_deref(),
-            Some("Frank Miller"),
+            Some("Writer A"),
             "ComicInfo has no author field; Writer is the byline"
         );
-        assert_eq!(meta.title.as_deref(), Some("The Dark Knight Returns"));
+        assert_eq!(meta.title.as_deref(), Some("Comic A"));
         assert_eq!(meta.publisher.as_deref(), Some("DC Comics"));
         assert_eq!(
             meta.description.as_deref(),
-            Some("Bruce Wayne & the Mutants."),
+            Some("Alex Doe & the Rivals."),
             "quick-xml delivers `&amp;` as a separate event; a truncated summary \
              here means the entity run was dropped"
         );
@@ -784,7 +784,7 @@ mod tests {
             Some(2),
             "unlike an epub, a comic's page count is viewport-independent"
         );
-        assert_eq!(bm.series_name.as_deref(), Some("Batman"));
+        assert_eq!(bm.series_name.as_deref(), Some("Series A"));
     }
 
     /// T053 — the archive-only path.
@@ -859,7 +859,7 @@ mod tests {
             );
             assert_eq!(
                 meta.series_name.as_deref(),
-                Some("Batman"),
+                Some("Series A"),
                 "{} did not read ComicInfo.xml",
                 p.display()
             );
