@@ -2,11 +2,12 @@
 //! contents (EPUB 3 `nav`, else the EPUB 2 NCX).
 
 use crate::archive::{Archive, ArchiveError};
+use crate::fixed::PageSize;
 use crate::path::{self, Href};
 use crate::section::Target;
 use crate::xml::{self, Element, XmlError};
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct Metadata {
     pub title: Option<String>,
     pub creators: Vec<String>,
@@ -17,6 +18,12 @@ pub struct Metadata {
     pub cover: Option<String>,
     /// `rtl` when the spine says pages progress right to left.
     pub right_to_left: bool,
+    /// `rendition:layout` is `pre-paginated`: each section is one page drawn
+    /// at a fixed size, not text to flow into pages.
+    pub fixed_layout: bool,
+    /// The page size the package names for fixed-layout sections whose own
+    /// documents name none (`<meta name="viewport">` in the package).
+    pub viewport: Option<PageSize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,6 +32,10 @@ pub struct SpineItem {
     pub media_type: String,
     /// `false` for `linear="no"` items (pop-up notes, answer keys).
     pub linear: bool,
+    /// A fixed-layout page: the book is pre-paginated and this item does not
+    /// say `rendition:layout-reflowable`, or the item says
+    /// `rendition:layout-pre-paginated` in a reflowable book.
+    pub fixed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -91,6 +102,7 @@ pub(crate) fn open(archive: &dyn Archive) -> Result<Package, OpenError> {
     })?;
 
     let manifest = manifest(&opf, &opf_path);
+    let mut metadata = metadata(&opf, &manifest);
     let spine_el = opf.elements().find(|e| e.is("spine"));
     let spine: Vec<SpineItem> = spine_el
         .map(|s| {
@@ -104,6 +116,7 @@ pub(crate) fn open(archive: &dyn Archive) -> Result<Package, OpenError> {
                         path: item.path.clone(),
                         media_type: item.media_type.clone(),
                         linear: r.attr("linear") != Some("no"),
+                        fixed: item_is_fixed(r.attr("properties"), metadata.fixed_layout),
                     })
                 })
                 .collect()
@@ -113,7 +126,6 @@ pub(crate) fn open(archive: &dyn Archive) -> Result<Package, OpenError> {
         return Err(OpenError::EmptySpine { path: opf_path });
     }
 
-    let mut metadata = metadata(&opf, &manifest);
     metadata.right_to_left =
         spine_el.and_then(|s| s.attr("page-progression-direction")) == Some("rtl");
 
@@ -185,7 +197,67 @@ fn metadata(opf: &Element, manifest: &[ManifestItem]) -> Metadata {
         publisher: first("publisher"),
         cover,
         right_to_left: false,
+        fixed_layout: all.iter().any(|e| {
+            e.is("meta")
+                && e.attr("property") == Some("rendition:layout")
+                && e.text().trim() == "pre-paginated"
+        }),
+        viewport: all
+            .iter()
+            .filter(|e| e.is("meta"))
+            .filter(|e| {
+                e.attr("name") == Some("viewport")
+                    || e.attr("property") == Some("rendition:viewport")
+            })
+            .find_map(|e| {
+                parse_viewport(
+                    e.attr("content")
+                        .map_or_else(|| e.text(), str::to_owned)
+                        .as_str(),
+                )
+            }),
     }
+}
+
+/// Whether an `itemref` with `properties` is a fixed-layout page in a book
+/// whose own layout is `book_fixed`.
+fn item_is_fixed(properties: Option<&str>, book_fixed: bool) -> bool {
+    let props = properties.unwrap_or_default();
+    let has = |p: &str| props.split_whitespace().any(|t| t == p);
+    if has("rendition:layout-pre-paginated") {
+        true
+    } else if has("rendition:layout-reflowable") {
+        false
+    } else {
+        book_fixed
+    }
+}
+
+/// The size in a viewport declaration such as `width=600, height=800`.
+/// `None` unless both are finite and above zero.
+pub(crate) fn parse_viewport(content: &str) -> Option<PageSize> {
+    let mut width = None;
+    let mut height = None;
+    for part in content.split([',', ';']) {
+        let Some((key, value)) = part.split_once('=') else {
+            continue;
+        };
+        let value = value
+            .trim()
+            .trim_end_matches("px")
+            .parse::<f32>()
+            .ok()
+            .filter(|v| v.is_finite() && *v > 0.0);
+        match key.trim().to_ascii_lowercase().as_str() {
+            "width" => width = value,
+            "height" => height = value,
+            _ => {}
+        }
+    }
+    Some(PageSize {
+        width: width?,
+        height: height?,
+    })
 }
 
 fn target(base: &str, href: &str, spine_of: &dyn Fn(&str) -> Option<usize>) -> Option<Target> {
