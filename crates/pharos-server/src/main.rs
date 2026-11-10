@@ -1976,6 +1976,7 @@ async fn serve(cfg: Config) -> Result<(), AppError> {
         libav_pool.clone(),
         state.subtitles.clone(),
         state.transcode_scheduler.clone(),
+        state.lyrics.aligner(),
     );
     #[cfg(all(unix, feature = "ffmpeg-lib"))]
     {
