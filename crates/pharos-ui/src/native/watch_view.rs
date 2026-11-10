@@ -1446,8 +1446,9 @@ fn SeekBar(
             class,
             role: "slider",
             // Focusable, so the arrow keys (the player's own seek steps)
-            // reach it from Tab.
-            tabindex: 0,
+            // reach it from Tab. Not on a TV, whose D-pad focus order stays
+            // as it was: its left and right already scrub the picture.
+            tabindex: if SCRUB_KEYS { -1 } else { 0 },
             aria_label: "Seek",
             aria_valuemin: 0,
             aria_valuemax: total / 1000,
