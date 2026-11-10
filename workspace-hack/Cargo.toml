@@ -21,7 +21,7 @@ actix-rt = { version = "2" }
 aho-corasick = { version = "1", default-features = false, features = ["perf-literal", "std"] }
 base64 = { version = "0.22" }
 brotli-decompressor = { version = "5" }
-bytemuck = { version = "1", default-features = false, features = ["derive", "extern_crate_alloc", "min_const_generics"] }
+bytemuck = { version = "1", default-features = false, features = ["aarch64_simd", "derive", "extern_crate_alloc", "min_const_generics", "wasm_simd"] }
 byteorder = { version = "1" }
 bytes = { version = "1" }
 clap = { version = "4", features = ["derive", "env"] }
@@ -45,6 +45,7 @@ futures-io = { version = "0.3" }
 futures-sink = { version = "0.3" }
 futures-util = { version = "0.3", features = ["channel", "io", "sink"] }
 getrandom-468e82937335b1c9 = { package = "getrandom", version = "0.3", default-features = false, features = ["std"] }
+half = { version = "2", default-features = false, features = ["bytemuck", "num-traits"] }
 hashbrown-9067fe90e8c1f593 = { package = "hashbrown", version = "0.17" }
 hashbrown-986da7b5efc2b80e = { package = "hashbrown", version = "0.16" }
 image = { version = "0.25", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
@@ -58,7 +59,8 @@ memchr = { version = "2" }
 metrics-util = { version = "0.20" }
 mio = { version = "1", features = ["net", "os-ext"] }
 moxcms = { version = "0.8", features = ["in_place"] }
-num-traits = { version = "0.2", features = ["i128"] }
+num-complex = { version = "0.4", features = ["bytemuck"] }
+num-traits = { version = "0.2", features = ["i128", "libm"] }
 once_cell = { version = "1" }
 percent-encoding = { version = "2" }
 quick-xml = { version = "0.42", features = ["escape-html"] }
@@ -134,7 +136,7 @@ log = { version = "0.4", default-features = false, features = ["std"] }
 md-5 = { version = "0.11" }
 memchr = { version = "2" }
 mio = { version = "1", features = ["net", "os-ext"] }
-num-traits = { version = "0.2", features = ["i128"] }
+num-traits = { version = "0.2", features = ["i128", "libm"] }
 once_cell = { version = "1" }
 percent-encoding = { version = "2" }
 rand-93f6ce9d446188ac = { package = "rand", version = "0.10" }

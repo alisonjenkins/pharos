@@ -2,6 +2,7 @@
 //! naming each tensor's f32 offset and shape (`tools/export_weights.py`).
 
 use std::collections::HashMap;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
@@ -93,6 +94,13 @@ impl Weights {
 
     /// The tensor `name`, which must have exactly `shape`.
     pub fn get(&self, name: &str, shape: &[usize]) -> Result<&[f32], WeightsError> {
+        let range = self.range(name, shape)?;
+        Ok(self.at(&range))
+    }
+
+    /// Where `name` lies in the file, checked as `get` checks it; for a model
+    /// that keeps the weights mapped rather than copying them out.
+    pub fn range(&self, name: &str, shape: &[usize]) -> Result<Range<usize>, WeightsError> {
         let entry = self
             .index
             .get(name)
@@ -104,13 +112,21 @@ impl Weights {
                 got: entry.shape.clone(),
             });
         }
-        let all = self.floats();
+        let len = self.floats().len();
         let end = entry.off.saturating_add(shape.iter().product());
-        all.get(entry.off..end).ok_or(WeightsError::Short {
-            name: name.into(),
-            end,
-            len: all.len(),
-        })
+        if end > len {
+            return Err(WeightsError::Short {
+                name: name.into(),
+                end,
+                len,
+            });
+        }
+        Ok(entry.off..end)
+    }
+
+    /// The floats at a range from [`Weights::range`].
+    pub fn at(&self, range: &Range<usize>) -> &[f32] {
+        &self.floats()[range.clone()]
     }
 }
 
