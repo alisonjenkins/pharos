@@ -1050,6 +1050,15 @@ impl AppState {
 
     /// Clamped so a typo can neither keep every touch nor drop most of a film.
     pub fn with_min_resume(mut self, pct: u32, secs: u32) -> Self {
+        if pct > MIN_RESUME_PCT_MAX || secs > MIN_RESUME_SECS_MAX {
+            tracing::warn!(
+                pct,
+                secs,
+                max_pct = MIN_RESUME_PCT_MAX,
+                max_secs = MIN_RESUME_SECS_MAX,
+                "[server].min_resume_pct or min_resume_secs is over its cap; using the cap"
+            );
+        }
         self.min_resume = crate::services::play_state::MinResume {
             pct: pct.min(MIN_RESUME_PCT_MAX),
             secs: secs.min(MIN_RESUME_SECS_MAX),
