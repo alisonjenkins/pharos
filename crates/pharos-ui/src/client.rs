@@ -2783,16 +2783,16 @@ mod tests {
     #[test]
     fn parse_item_detail_audio_extracts_artists_album() {
         let body = br#"{
-            "Id":"a1","Name":"Tears in Rain","Type":"Audio","RunTimeTicks":1800000000,
-            "Artists":["Vangelis"],"Album":"Blade Runner OST",
-            "AlbumArtists":[{"Name":"Vangelis","Id":"va"}],
+            "Id":"a1","Name":"Track A","Type":"Audio","RunTimeTicks":1800000000,
+            "Artists":["Artist A"],"Album":"Album A",
+            "AlbumArtists":[{"Name":"Artist A","Id":"va"}],
             "ImageTags":{},"BackdropImageTags":["bg1"],
             "UserData":{"Played":true,"PlayCount":4,"IsFavorite":true,"PlaybackPositionTicks":0}
         }"#;
         let d = parse_item_detail_response(body).unwrap();
-        assert_eq!(d.artists, vec!["Vangelis"]);
-        assert_eq!(d.album.as_deref(), Some("Blade Runner OST"));
-        assert_eq!(d.album_artists, vec!["Vangelis"]);
+        assert_eq!(d.artists, vec!["Artist A"]);
+        assert_eq!(d.album.as_deref(), Some("Album A"));
+        assert_eq!(d.album_artists, vec!["Artist A"]);
         assert!(!d.has_primary_image);
         assert!(d.has_backdrop_image);
         assert_eq!(d.play_count, 4);
@@ -3391,8 +3391,8 @@ mod tests {
     #[test]
     fn parse_item_detail_phase3_extracts_people_overview_genres() {
         let body = br#"{
-            "Id":"m1","Name":"Blade Runner","Type":"Movie","RunTimeTicks":70200000000,
-            "Overview":"A blade runner hunts replicants.",
+            "Id":"m1","Name":"Film BE","Type":"Movie","RunTimeTicks":70200000000,
+            "Overview":"A courier crosses a city.",
             "Genres":["Sci-Fi","Drama","Mystery"],
             "People":[
                 {"Id":"p1","Name":"Harrison Ford","Role":"Rick Deckard","Type":"Actor","PrimaryImageTag":"tag1"},
@@ -3401,10 +3401,7 @@ mod tests {
             "UserData":{"Played":false,"PlayCount":0,"IsFavorite":false,"PlaybackPositionTicks":0}
         }"#;
         let d = parse_item_detail_response(body).unwrap();
-        assert_eq!(
-            d.overview.as_deref(),
-            Some("A blade runner hunts replicants.")
-        );
+        assert_eq!(d.overview.as_deref(), Some("A courier crosses a city."));
         assert_eq!(d.genres, vec!["Sci-Fi", "Drama", "Mystery"]);
         assert_eq!(d.people.len(), 2);
         assert_eq!(d.people[0].name, "Harrison Ford");
@@ -3419,7 +3416,7 @@ mod tests {
     #[test]
     fn parse_item_detail_movie_defaults_have_no_episode_fields() {
         let body = br#"{
-            "Id":"m1","Name":"Blade Runner","Type":"Movie","RunTimeTicks":70200000000,
+            "Id":"m1","Name":"Film BE","Type":"Movie","RunTimeTicks":70200000000,
             "UserData":{"Played":false,"PlayCount":0,"IsFavorite":false,"PlaybackPositionTicks":0}
         }"#;
         let d = parse_item_detail_response(body).unwrap();
