@@ -340,7 +340,12 @@ fn summaries_in(dir: &Path) -> std::io::Result<Vec<Summary>> {
     };
     let mut out = Vec::new();
     for entry in entries {
-        let path = entry?.path();
+        let entry = entry?;
+        // A symlink or directory named like a report is not one of ours.
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let path = entry.path();
         let Some(id) = path
             .file_name()
             .and_then(|n| n.to_str())
@@ -457,6 +462,22 @@ mod tests {
         assert!(matches!(err, SaveError::UserFull { held, .. } if held == MAX_REPORTS_PER_USER));
         assert_eq!(err.outcome(), "user_full");
         store.save(report(user()), SystemTime::now()).await.unwrap();
+    }
+
+    /// Disarm check: without the `is_file` filter the report linked in from
+    /// outside the directory is listed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_symlink_named_like_a_report_is_not_listed() {
+        let dir = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let store = ReportStore::new(dir.path().to_path_buf(), DEFAULT_RETENTION_DAYS);
+        let other = ReportStore::new(elsewhere.path().to_path_buf(), DEFAULT_RETENTION_DAYS);
+        let outside = other.save(report(user()), SystemTime::now()).await.unwrap();
+        let name = format!("{outside}.json");
+        std::os::unix::fs::symlink(elsewhere.path().join(&name), dir.path().join(&name)).unwrap();
+        let listed = store.summaries().await.unwrap();
+        assert!(listed.is_empty(), "{listed:?}");
     }
 
     /// Disarm check: with the cutoff comparison inverted the fresh report
