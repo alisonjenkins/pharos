@@ -979,7 +979,6 @@ impl<S: JobStore, A: Signals, Q: TranscodeQueue> Styler<S, A, Q> {
         };
         let (sung, ask) = self.sung(&task.item, &parsed.lines, &segments).await;
         report.sung = Some(ask);
-        metrics::counter!("pharos_subtitle_sung_total", "outcome" => ask.label()).increment(1);
         let t = Instant::now();
         let track = TrackSignals {
             lines: sig.lines.iter().map(line_signals).collect(),
@@ -1034,6 +1033,9 @@ impl<S: JobStore, A: Signals, Q: TranscodeQueue> Styler<S, A, Q> {
                     .record(d.as_secs_f64());
             }
         }
+        // Counted once the item is stored, so a failed store and its retry
+        // do not count the item twice.
+        metrics::counter!("pharos_subtitle_sung_total", "outcome" => ask.label()).increment(1);
         for (timing, n) in &direction.karaoke {
             metrics::counter!("pharos_subtitle_karaoke_total", "timing" => timing.label())
                 .increment(*n as u64);
