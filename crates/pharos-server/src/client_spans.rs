@@ -107,7 +107,18 @@ static SAMPLING_RATIO: OnceLock<f64> = OnceLock::new();
 /// Records the ratio [`forward`] decides a client trace's sampling with,
 /// the same one the provider's root sampler uses.
 pub fn set_sampling_ratio(ratio: f64) {
-    let _ = SAMPLING_RATIO.set(ratio);
+    if SAMPLING_RATIO.set(ratio).is_err() {
+        let kept = sampling_ratio();
+        if kept != ratio {
+            // The provider was rebuilt with another ratio; client traces
+            // keep the first one, so their verdicts can now differ.
+            tracing::warn!(
+                kept,
+                ignored = ratio,
+                "client span sampling ratio already set; ignoring a different one"
+            );
+        }
+    }
 }
 
 /// The ratio in force: 1.0 (keep everything) until OTLP init sets one.
