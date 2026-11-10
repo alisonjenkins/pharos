@@ -50,7 +50,10 @@ device) and never inferred.
   device id; a media or manage token does not count). The person holding the
   device is the one who notices a format playing badly, so making them ask an
   admin makes no sense. `/Devices/Options` accepts either and refuses anyone
-  else 403 with nothing written; `/Devices` lists a non-admin's own devices
+  else 403 with nothing written. The owner rule covers the sound formats
+  only: the device's name shows to everyone who sees the device, so renaming
+  stays with an admin, and an owner's body carrying `CustomName` is refused
+  403; `/Devices` lists a non-admin's own devices
   instead of refusing. The native API gets `Session.myDevices` and
   `Session.setDeviceConvertedAudio` (schemaVersion 38) through the same owner
   rule, and Settings → Devices shows "Your devices" with the same toggles.
