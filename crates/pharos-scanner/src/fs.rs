@@ -647,6 +647,7 @@ impl<P: Prober> FsScanner<P> {
         let WalkOutcome {
             files: paths,
             errors: walk_errors,
+            nfos,
         } = walk(root.to_path_buf(), self.extensions.clone())
             .instrument(tracing::info_span!("scan.walk"))
             .await?;
@@ -843,7 +844,9 @@ impl<P: Prober> FsScanner<P> {
                             // or resized edition must re-put the row, or its
                             // alternate_sources and has_3d go stale.
                             match edition_drift_for(store, row, state.has_editions, &alts).await? {
-                                None if !kind_drift(store, row, &primary).await => {
+                                None if !kind_drift(store, row, &primary).await
+                                    && !nfo_drift(&nfos, row, &primary, state.last_scanned) =>
+                                {
                                     seen_batch.push((row, mtime, size));
                                     seen += 1;
                                     outcome.skipped += 1;
@@ -2418,6 +2421,41 @@ async fn kind_drift<S: MediaStore>(store: &S, row: MediaId, primary: &Path) -> b
         metrics::counter!("pharos_scan_reprobe_total", "reason" => "kind_changed").increment(1);
     }
     drifted
+}
+
+/// B1284 — whether an unchanged video's own NFO (`<stem>.nfo`, or
+/// `movie.nfo` beside it) was written after its row was last stamped.
+/// The NFO is read only while probing, so without this an edit to it alone
+/// never reached the row. `last_scanned` of 0 is a row no scan has stamped
+/// yet; it says nothing about the NFO, so it does not count as an edit.
+/// Query: `{namespace="pharos"} |= "NFO changed since its row was written"`.
+fn nfo_drift(
+    nfos: &HashMap<PathBuf, i64>,
+    row: MediaId,
+    primary: &Path,
+    last_scanned: i64,
+) -> bool {
+    if last_scanned <= 0 {
+        return false;
+    }
+    let own = primary.with_extension("nfo");
+    let dir = primary.parent().map(|d| d.join("movie.nfo"));
+    let Some((nfo, mtime)) = std::iter::once(own)
+        .chain(dir)
+        .find_map(|p| nfos.get(&p).filter(|&&m| m > last_scanned).map(|&m| (p, m)))
+    else {
+        return false;
+    };
+    tracing::info!(
+        media.id = %row,
+        path = %primary.display(),
+        nfo = %nfo.display(),
+        nfo_mtime = mtime,
+        last_scanned,
+        "NFO changed since its row was written; re-reading it",
+    );
+    metrics::counter!("pharos_scan_reprobe_total", "reason" => "nfo_changed").increment(1);
+    true
 }
 
 /// A file grouped this pass as a version of `into`, whose own row (if it
@@ -4675,6 +4713,9 @@ pub(crate) fn walk_skips(path: &Path, root: &Path) -> bool {
 struct WalkOutcome {
     files: Vec<PathBuf>,
     errors: usize,
+    /// Each `.nfo` file the walk passed and its mtime (unix seconds), so an
+    /// unchanged video whose NFO was edited is re-read (B1284).
+    nfos: HashMap<PathBuf, i64>,
 }
 
 /// Recursive walk inside `spawn_blocking`. Returns paths of files whose
@@ -4683,6 +4724,7 @@ async fn walk(root: PathBuf, exts: HashSet<String>) -> DomainResult<WalkOutcome>
     let (outcome, ignored_folders) =
         tokio::task::spawn_blocking(move || -> DomainResult<(WalkOutcome, u64)> {
             let mut out = Vec::new();
+            let mut nfos = HashMap::new();
             let mut errors = 0usize;
             let mut ignored_folders = 0u64;
             let entries = walkdir::WalkDir::new(&root)
@@ -4743,12 +4785,30 @@ async fn walk(root: PathBuf, exts: HashSet<String>) -> DomainResult<WalkOutcome>
                     .and_then(|s| s.to_str())
                     .map(|s| s.to_ascii_lowercase());
                 if let Some(ext) = lower {
-                    if exts.contains(&ext) {
+                    if ext == "nfo" {
+                        match e.metadata() {
+                            Ok(meta) => {
+                                nfos.insert(e.path().to_path_buf(), mtime_secs(&meta));
+                            }
+                            Err(err) => tracing::debug!(
+                                path = %e.path().display(),
+                                error = %err,
+                                "walk: could not stat an NFO; an edit to it waits for its video to change",
+                            ),
+                        }
+                    } else if exts.contains(&ext) {
                         out.push(e.into_path());
                     }
                 }
             }
-            Ok((WalkOutcome { files: out, errors }, ignored_folders))
+            Ok((
+                WalkOutcome {
+                    files: out,
+                    errors,
+                    nfos,
+                },
+                ignored_folders,
+            ))
         })
         .await
         .map_err(|e| DomainError::Backend(format!("walk join: {e}")))??;
@@ -5067,7 +5127,11 @@ mod tests {
                 .insert(
                     id,
                     ScanState {
-                        last_scanned: scan_id, // non-zero so "seen" is observable
+                        // Unix seconds, as the real store stamps it: the
+                        // NFO check compares an NFO's mtime against it.
+                        last_scanned: std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map_or(1, |d| d.as_secs() as i64),
                         file_mtime: mtime,
                         file_size: size,
                         last_seen_scan_id: scan_id,
@@ -10531,6 +10595,80 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(p.thumb_url.as_deref(), Some("http://img/actor.jpg"));
+    }
+
+    /// B1284 / V1247 — an edit to a film's NFO alone reaches its row on the
+    /// next scan, though the video is untouched; an NFO older than the row's
+    /// last stamp leaves the film skipped.
+    #[tokio::test]
+    async fn an_nfo_edit_alone_is_read_on_the_next_scan() {
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = pharos_test_metrics::snapshotter(&recorder);
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        let td = TempDir::new().unwrap();
+        write_file(td.path(), "Film Q (2019)/Film Q (2019).mkv", b"video-bytes").await;
+        let nfo = td.path().join("Film Q (2019)/Film Q (2019).nfo");
+        let write_nfo = |title: &str| {
+            std::fs::write(
+                &nfo,
+                format!("<?xml version=\"1.0\"?>\n<movie><title>{title}</title></movie>"),
+            )
+            .unwrap();
+        };
+        let set_mtime = |offset: i64| {
+            let when = std::time::SystemTime::now()
+                .checked_add(std::time::Duration::from_secs(offset.unsigned_abs()))
+                .filter(|_| offset >= 0)
+                .or_else(|| {
+                    std::time::SystemTime::now()
+                        .checked_sub(std::time::Duration::from_secs(offset.unsigned_abs()))
+                })
+                .unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&nfo)
+                .unwrap()
+                .set_modified(when)
+                .unwrap();
+        };
+        write_nfo("Old Title");
+        set_mtime(-120);
+        let id = stable_id(&td.path().join("Film Q (2019)/Film Q (2019).mkv"));
+        let s = FsScanner::new(FakeProber::default());
+        let store = MemStore::default();
+        s.scan_into(td.path(), &store).await.unwrap();
+        assert_eq!(store.get(id).await.unwrap().title, "Old Title");
+
+        let untouched = s.scan_into(td.path(), &store).await.unwrap();
+        assert_eq!(
+            untouched.skipped, 1,
+            "an NFO older than the row is not an edit"
+        );
+
+        write_nfo("New Title");
+        set_mtime(60);
+        s.scan_into(td.path(), &store).await.unwrap();
+        assert_eq!(store.get(id).await.unwrap().title, "New Title");
+
+        let nfo_changed: u64 = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter_map(|(ck, _, _, v)| match v {
+                metrics_util::debugging::DebugValue::Counter(n)
+                    if ck.key().name() == "pharos_scan_reprobe_total"
+                        && ck
+                            .key()
+                            .labels()
+                            .any(|l| l.key() == "reason" && l.value() == "nfo_changed") =>
+                {
+                    Some(n)
+                }
+                _ => None,
+            })
+            .sum();
+        assert_eq!(nfo_changed, 1);
     }
 
     #[tokio::test]
