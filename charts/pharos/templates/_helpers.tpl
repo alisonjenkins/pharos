@@ -171,6 +171,14 @@ name = {{ .name | quote }}
 kind = {{ .kind | quote }}
 {{- end }}
 {{- end }}
+{{- with (.Values.config.metadata | default dict).seriesIdentityRepair }}
+{{- if not (has . (list "dry_run" "apply")) }}
+{{- fail (printf "config.metadata.seriesIdentityRepair must be dry_run or apply, got %q" .) }}
+{{- end }}
+
+[metadata]
+series_identity_repair = {{ . | quote }}
+{{- end }}
 
 [database]
 url = {{ .Values.config.database.url | quote }}
