@@ -241,6 +241,7 @@ mod tests {
                 critic_rating: None,
                 stereo: None,
                 damaged: false,
+                new_children: 0,
             },
             overview: String::new(),
             genres: Vec::new(),

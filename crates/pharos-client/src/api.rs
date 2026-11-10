@@ -192,6 +192,10 @@ pub struct Item {
     /// The integrity check found its file damaged; [`Detail::damage`] says
     /// where. False from a server older than schemaVersion 30.
     pub damaged: bool,
+    /// On a latest rail, a series or album tile: how many of its children
+    /// are newly added. 0 otherwise, and from a server older than
+    /// schemaVersion 42.
+    pub new_children: u32,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -2117,6 +2121,7 @@ pub(crate) fn read_item(item: item_summary::Reader<'_>) -> Result<Item, capnp::E
         artist: Some(text(item.get_artist())?).filter(|a| !a.is_empty()),
         stereo: read_stereo(item.get_stereo()),
         damaged: item.get_damaged(),
+        new_children: item.get_new_children(),
     })
 }
 
