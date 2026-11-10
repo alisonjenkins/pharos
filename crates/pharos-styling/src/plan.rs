@@ -2,6 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::source::Syllable;
+
 /// What kind of speech a line is. Sarcasm is never picked by the phase 1
 /// director (it needs a model) but the type and compiler carry it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -98,6 +100,10 @@ pub struct LineEffect {
     /// The rule and inputs that chose this, for logs.
     #[serde(default)]
     pub reason: String,
+    /// Fill timings the director worked out for a sung line whose source
+    /// has none (B1212); a source's own `\k` timings win over these.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub syllables: Option<Vec<Syllable>>,
     /// The line crosses a scene cut: keep the intent but draw the Low (still)
     /// form, so no animation runs across the cut (FR-011).
     #[serde(default)]
@@ -218,6 +224,7 @@ mod tests {
                     karaoke: Karaoke::None,
                     reason: "loud".into(),
                     static_only: false,
+                    syllables: None,
                 },
                 LineEffect {
                     line: 4,
@@ -227,6 +234,7 @@ mod tests {
                     karaoke: Karaoke::Ember,
                     reason: String::new(),
                     static_only: false,
+                    syllables: None,
                 },
             ],
         };

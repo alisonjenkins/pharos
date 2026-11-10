@@ -192,6 +192,7 @@ fn plan_of(gen: &[GenLine], cap_intensity: Option<u8>) -> EffectPlan {
                     },
                     reason: String::new(),
                     static_only: false,
+                    syllables: None,
                 })
             })
             .collect(),
