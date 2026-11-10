@@ -135,7 +135,7 @@ impl Metrics {
         metrics::describe_counter!(SONGS_TOTAL, "Songs aligned, by outcome");
         metrics::describe_counter!(
             crate::forward::fallback::DEVICE_FALLBACK_TOTAL,
-            "Songs moved off the GPU: gpu_error per failed window, latched per song after the latch"
+            "Songs moved off the GPU: gpu_error per failed window, latched per song after the latch, reload_failed once when the GPU pass cannot be built again"
         );
         metrics::describe_histogram!(
             SONG_SECONDS,

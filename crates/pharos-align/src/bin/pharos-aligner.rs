@@ -200,15 +200,16 @@ fn loader(config: &Config, choice: device::Choice, warmed: Warmed) -> Loader {
         device::Device::Cpu => Box::new(move || cpu_model(&weights, threads, batch, &reason)),
         #[cfg(feature = "vulkan")]
         device::Device::Vulkan(adapter) => {
+            use pharos_align::forward::fallback::{gpu_or_cpu, Fallback, RELOAD_FAILED};
+            use pharos_align::forward::vulkan::VulkanModel;
+            use pharos_align::forward::VulkanAligner;
             let warmed = std::sync::Mutex::new(warmed);
-            Box::new(move || {
-                use pharos_align::forward::fallback::Fallback;
-                use pharos_align::forward::vulkan::VulkanModel;
-                use pharos_align::forward::VulkanAligner;
+            let gpu_weights = weights.clone();
+            let load_gpu = move || {
                 let model = match warmed.lock().ok().and_then(|mut w| w.take()) {
                     Some(m) => m,
                     None => {
-                        let w = Weights::open(&weights).map_err(|e| e.to_string())?;
+                        let w = Weights::open(&gpu_weights).map_err(|e| e.to_string())?;
                         VulkanModel::load(&w, device::burn_device(&adapter))
                             .map_err(|e| e.to_string())?
                     }
@@ -218,9 +219,12 @@ fn loader(config: &Config, choice: device::Choice, warmed: Warmed) -> Loader {
                     reason: reason.clone(),
                     adapter: adapter.name.clone(),
                 };
-                let weights = weights.clone();
+                let weights = gpu_weights.clone();
                 let cpu = Box::new(move || cpu_model(&weights, threads, batch, "gpu_fallback"));
                 Ok(Box::new(Fallback::new(Box::new(gpu), cpu)) as Box<dyn Model>)
+            };
+            gpu_or_cpu(load_gpu, move || {
+                cpu_model(&weights, threads, batch, RELOAD_FAILED)
             })
         }
         #[cfg(not(feature = "vulkan"))]
