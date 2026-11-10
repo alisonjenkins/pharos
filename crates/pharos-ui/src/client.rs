@@ -1079,6 +1079,41 @@ pub struct FixDone {
     pub rebuilding: usize,
 }
 
+/// A show's stored match, as `/show` states it.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct ShowMatch {
+    pub provider: Option<String>,
+    pub external_id: Option<String>,
+    pub source: Option<String>,
+    /// Unix seconds.
+    pub premiere_date: Option<i64>,
+}
+
+/// One episode file of a show.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct ShowEpisode {
+    pub id: u64,
+    pub path: String,
+    pub season: Option<u32>,
+    pub episode: Option<u32>,
+    pub title: String,
+}
+
+/// One show by item id, flagged or not: where it is stored, its match and
+/// its files.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "PascalCase", default)]
+pub struct ShowDetail {
+    pub series_key: String,
+    pub series_id: String,
+    pub folder: String,
+    pub name: String,
+    pub current_match: Option<ShowMatch>,
+    pub episodes: Vec<ShowEpisode>,
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "PascalCase", default)]
 struct FlaggedIds {
@@ -1093,6 +1128,15 @@ pub fn parse_flagged_ids_response(bytes: &[u8]) -> Result<Vec<String>, ClientErr
     serde_json::from_slice::<FlaggedIds>(bytes)
         .map(|f| f.series_ids)
         .map_err(|e| ClientError::Parse(e.to_string()))
+}
+
+pub fn parse_show_detail_response(bytes: &[u8]) -> Result<ShowDetail, ClientError> {
+    serde_json::from_slice(bytes).map_err(|e| ClientError::Parse(e.to_string()))
+}
+
+/// The body of a Rebuild: the episodes to rebuild from their show's match.
+pub fn rebuild_body(ids: &[u64]) -> String {
+    serde_json::json!({ "ItemIds": ids }).to_string()
 }
 
 pub fn parse_show_candidates_response(bytes: &[u8]) -> Result<Vec<ShowCandidate>, ClientError> {
@@ -2142,6 +2186,33 @@ pub mod web {
         parse_flagged_ids_response(&bytes)
     }
 
+    pub async fn show_identity(
+        base: &str,
+        token: &str,
+        series_id: &str,
+    ) -> Result<ShowDetail, ClientError> {
+        let path = format!("/show?SeriesId={}", urlencode(series_id));
+        let bytes =
+            series_identity_call(base, token, gloo_net::http::Method::GET, &path, None).await?;
+        parse_show_detail_response(&bytes)
+    }
+
+    pub async fn rebuild_episodes(
+        base: &str,
+        token: &str,
+        ids: &[u64],
+    ) -> Result<FixDone, ClientError> {
+        let bytes = series_identity_call(
+            base,
+            token,
+            gloo_net::http::Method::POST,
+            "/rebuild",
+            Some(rebuild_body(ids)),
+        )
+        .await?;
+        parse_fix_done_response(&bytes)
+    }
+
     pub async fn search_shows(
         base: &str,
         token: &str,
@@ -2987,6 +3058,26 @@ mod tests {
         assert_eq!(v.flagged[0].premiere_date, Some(1_100_000_000));
         assert!(v.overrides[0].keeps_together);
         assert_eq!(v.overrides[0].created_by.as_deref(), Some("ali"));
+    }
+
+    #[test]
+    fn parse_show_detail_reads_the_match_and_files() {
+        let body = br#"{"SeriesKey":"/tv/Show A","SeriesId":"ab","Folder":"/tv/Show A","Name":"Show A",
+            "CurrentMatch":{"Provider":"tvdb","ExternalId":"1","Source":"search","PremiereDate":5},
+            "Episodes":[{"Id":7,"Path":"/tv/Show A/S01E01.mkv","Season":1,"Episode":1,"Title":"Pilot"}]}"#;
+        let v = parse_show_detail_response(body).unwrap();
+        assert_eq!(v.name, "Show A");
+        assert_eq!(v.current_match.unwrap().external_id.as_deref(), Some("1"));
+        assert_eq!(v.episodes[0].id, 7);
+        assert_eq!(v.episodes[0].episode, Some(1));
+        let bare = parse_show_detail_response(br#"{"CurrentMatch":null}"#).unwrap();
+        assert!(bare.current_match.is_none() && bare.episodes.is_empty());
+        assert!(parse_show_detail_response(b"{").is_err());
+    }
+
+    #[test]
+    fn rebuild_body_is_pascal_cased_ids() {
+        assert_eq!(rebuild_body(&[3, 4]), r#"{"ItemIds":[3,4]}"#);
     }
 
     #[test]
