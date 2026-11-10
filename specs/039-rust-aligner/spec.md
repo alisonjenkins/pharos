@@ -41,10 +41,10 @@ Pinning helps torch as much as it helps Rust (song A: 24 s unpinned, 16 s pinned
 
 ### Contract (unchanged)
 
-- R1. `POST /align` takes the same JSON body (`path` under the media root, `lines` with `text`, `start_ms`, `end_ms`) and returns the same body: `lines[].words[]` with `at` and `start_ms`, `offset_ms` and `aligner_version`. Error statuses and messages stay: 400 for a bad body or path, 404 for a missing file, 413 over 1 MiB, 500 otherwise. ffmpeg's part is three cases: a line window it fails to decode is 422; an offset probe it fails or times out on is logged, recorded as a `None` probe, and does not fail the song (after one timeout the rest of the probes are skipped); an ffmpeg that is missing or cannot run is 500, as is a line window that times out.
+- R1. `POST /align` takes the same JSON body (`path` under the media root, `lines` with `text`, `start_ms`, `end_ms`) and returns the same body: `lines[].words[]` with `at` and `start_ms`, each line's `score` (the mean probability of its words' character spans, to three places, `null` for a line with no words or none timed, as the Python service sends from its version 4), `offset_ms` and `aligner_version`. Error statuses and messages stay: 400 for a bad body or path, 404 for a missing file, 413 over 1 MiB, 500 otherwise. ffmpeg's part is three cases: a line window it fails to decode is 422; an offset probe it fails or times out on is logged, recorded as a `None` probe, and does not fail the song (after one timeout the rest of the probes are skipped); an ffmpeg that is missing or cannot run is 500, as is a line window that times out.
 - R2. `GET /healthz` answers `{"ok": true}` while an alignment runs.
 - R3. The same environment variables keep their meaning: `PHAROS_ALIGNER_MEDIA_ROOT`, `PHAROS_ALIGNER_LISTEN` (default `0.0.0.0:8790`), `PHAROS_ALIGNER_OTLP_ENDPOINT`, `PHAROS_ALIGNER_THREADS` (default 8), `PHAROS_ALIGNER_IDLE_UNLOAD_SECS` (default 600, 0 keeps the model loaded). One is new: `PHAROS_ALIGNER_FFMPEG` names the ffmpeg to run (default `ffmpeg` on `PATH`), so the image can pin its own.
-- R4. `aligner_version` becomes 3, so each answer shows which service made it. The server does not store the version; it checks it on receipt. The server's `MIN_ALIGNER_VERSION` stays 2: answers from the Python service stay valid.
+- R4. `aligner_version` is 5, so each answer shows which service made it: the Python service answers 4 with `score`, and the Rust service went from 3 to 5 when it gained `score`. The server does not store the version; it checks it on receipt. The server's `MIN_ALIGNER_VERSION` stays 2: answers from the Python service stay valid.
 - R5. One alignment at a time, as today. A request that waits for another is visible as its own span.
 - R6. Spans join the server's trace by `traceparent` (ADR-0105) under the same names: `aligner.align`, `aligner.wait`, `aligner.decode`, `aligner.model`, `aligner.forward`, `aligner.ctc`. The song's log line keeps its fields and phase totals.
 
@@ -79,8 +79,8 @@ Pinning helps torch as much as it helps Rust (song A: 24 s unpinned, 16 s pinned
 
 ### Rollout
 
-- R21. The pharos server gains an optional `[lyrics].aligner_shadow_url`. When it is set, each finished alignment is also sent to the shadow aligner after the primary answer is stored, at most one at a time. The two answers are compared in full (`offset_ms`, line and word counts, and each word's `at` and `start_ms`), and the result is logged and counted; the shadow answer is never stored or served.
-- R22. The cutover points `[lyrics].aligner_url` at the Rust service after the shadow records at least 50 `outcome=match` results: full answers compared as in R21, each from an `aligner_version` 3 shadow answer. Errors and version-2 answers do not count towards the 50. A later slice removes the Python service, its image and its flake outputs.
+- R21. The pharos server gains an optional `[lyrics].aligner_shadow_url`. When it is set, each finished alignment is also sent to the shadow aligner after the primary answer is stored, at most one at a time. The two answers are compared in full (`offset_ms`, line and word counts, each word's `at` and `start_ms`, and each line's `score` within 0.001), and the result is logged and counted; the shadow answer is never stored or served. Only an `aligner_version` 5 shadow answer can match; any other version is `outcome=error`.
+- R22. The cutover points `[lyrics].aligner_url` at the Rust service after a run of at least 50 consecutive `outcome=match` comparisons (R21, `aligner_version` 5) with no `mismatch` in it: any mismatch starts the count again. `error` and `timeout` outcomes do not count towards the 50 and do not break the run, but they must be under 5% of the run's comparisons (`match`, `mismatch`, `error` and `timeout`). `skipped_busy` is not a comparison. The queries that show the gate are in plan.md. A later slice removes the Python service, its image and its flake outputs.
 
 ## Observability (named signals)
 
@@ -104,7 +104,7 @@ LogQL: `{namespace="pharos", app_kubernetes_io_component="aligner"} |= "device="
 | V1252 | A line's word ms equal model.py's for the same emission, including lead stars, short windows and the repeat bound | `it_parity::line` against `line.json` |
 | V1253 | Line windows, stamps, request parsing and path resolution equal plan.py's | parity fixtures from plan.py |
 | V1254 | Probe choice, offset estimate and shift equal offset.py's | parity fixtures from offset.py |
-| V1255 | The HTTP contract matches the Python service: bodies, statuses, error messages, `aligner_version` 3 | service tests mirroring `test_server.py` |
+| V1255 | The HTTP contract matches the Python service: bodies, statuses, error messages, each line's `score`, `aligner_version` 5 | service tests mirroring `test_server.py` |
 | V1256 | Spans keep the ADR-0105 names and attributes, plus `aligner.device` and `aligner.device_reason` | span test, disarmed once |
 | V1257 | The CPU forward pass's log-probs are within 2e-2 of torch on synthetic waveforms, and CTC paths are identical | emission fixtures, weights from the flake |
 | V1258 | Without AVX2 the service refuses to start, naming the feature | unit test on the feature check |
@@ -117,7 +117,7 @@ LogQL: `{namespace="pharos", app_kubernetes_io_component="aligner"} |= "device="
 | V1265 | The chart renders the GPU mount, the render group, the cache PVC and the shadow Deployment only when asked | `helm template` tests |
 | V1266 | Readiness fails until warm-up is done | probe test |
 | V1267 | The shadow comparison never stores or serves the shadow answer, keeps one in flight, and logs and counts each outcome | server unit tests |
-| V1268 | After cutover, every answer the service returns carries `aligner_version` 3, and words cached from version-2 answers are still served | server test plus a query after the deploy |
+| V1268 | After cutover, every answer the service returns carries `aligner_version` 5 and a `score` per line, and words cached from version-2 answers are still served | server test plus a query after the deploy |
 | V1269 | No Python aligner remains in the flake, the chart or CI | `nix flake show` / grep check in CI |
 
 ## Out of scope
