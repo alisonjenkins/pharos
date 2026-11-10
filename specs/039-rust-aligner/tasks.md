@@ -11,30 +11,31 @@
 
 ## Slice 2 - Pipeline and service (V1253-V1256)
 
-- [ ] T039-05 `plan`: windows with the lead clamp, stamps, `parse_request`, `resolve`, with fixtures from `plan.py` (V1253).
-- [ ] T039-06 `offset`: probe choice, estimate and shift, with fixtures from `offset.py` (V1254).
-- [ ] T039-07 `audio`: `ffmpeg` per window with Python's arguments and timeout; a test asserts the exact argv.
-- [ ] T039-08 `bin/pharos-aligner`: `/align`, `/healthz`, `/metrics` and the error statuses (V1255); the one-at-a-time lock with an `aligner.wait` span; idle unload; env parsing with errors naming the value.
-- [ ] T039-09 OTLP spans and the song's log line (V1256). A test asserts the span names and attributes. Disarm it once to see it fail.
+- [x] T039-05 `plan`: windows with the lead clamp, stamps, `parse_request`, `resolve`, with fixtures from `plan.py` (V1253).
+- [x] T039-06 `offset`: probe choice, estimate and shift, with fixtures from `offset.py` (V1254).
+- [x] T039-07 `audio`: `ffmpeg` per window with Python's arguments and timeout; a test asserts the exact argv.
+- [x] T039-08 `bin/pharos-aligner`: `/align`, `/healthz`, `/metrics` and the error statuses (V1255); the one-at-a-time lock with an `aligner.wait` span; idle unload; env parsing with errors naming the value.
+- [x] T039-09 OTLP spans and the song's log line (V1256). A test asserts the span names and attributes. Disarm it once to see it fail.
 
 ## Slice 3 - CPU forward pass (V1257-V1260)
 
-- [ ] T039-10 Weight conversion derivation (`weights.bin`, `weights.json`) in the flake. A check asserts the tensor count (422) and the total f32 count.
-- [ ] T039-11 `weights`: mmap, index lookup and shape checks. A missing or short tensor is an error naming it.
-- [ ] T039-12 `forward::cpu` from the `cpufwd` spike, plus log_softmax and the star column (R9). Emission fixtures from torch on synthetic waveforms, max abs 2e-2, identical CTC paths (V1257).
-- [ ] T039-13 AVX2 check at start, with a refusal naming the feature (V1258).
-- [ ] T039-14 Pinning `auto`/`on`/`off` from sysfs topology. Unit tests on synthetic sysfs trees: one L3 with no SMT gives no pinning; two L3 domains plus SMT gives one thread per core in the largest domain (V1259).
-- [ ] T039-15 Batch cap for the offset probes. RSS test on the synthetic songs at or below 2.6 GiB (V1260).
+- [x] T039-10 Weight conversion derivation (`weights.bin`, `weights.json`) in the flake. A check asserts the tensor count (422) and the total f32 count.
+- [x] T039-11 `weights`: mmap, index lookup and shape checks. A missing or short tensor is an error naming it.
+- [x] T039-12 `forward::cpu` from the `cpufwd` spike, plus log_softmax and the star column (R9). Emission fixtures from torch on synthetic waveforms, max abs 2e-2, identical CTC paths (V1257).
+- [x] T039-13 AVX2 check at start, with a refusal naming the feature (V1258).
+- [x] T039-14 Pinning `auto`/`on`/`off` from sysfs topology. Unit tests on synthetic sysfs trees: one L3 with no SMT gives no pinning; two L3 domains plus SMT gives one thread per core in the largest domain (V1259).
+- [x] T039-15 Batch cap for the offset probes. RSS test on the synthetic songs at or below 2.6 GiB (V1260).
 
 ## Slice 4 - Vulkan forward pass (V1261-V1263)
 
-- [ ] T039-16 `forward::vulkan` in Burn ops from `weights.bin`, f32, same emission fixtures and tolerance (V1261); burn-onnx fallback only if this misses.
-- [ ] T039-17 `device`: the choice and reasons (R10, R11), with llvmpipe refused. Reasons are asserted in tests with a fake adapter list (V1262).
-- [ ] T039-18 Runtime fallback per song and the 3-in-10-minutes latch, `pharos_aligner_device_fallback_total{reason}` (V1263).
+- [x] T039-16 `forward::vulkan` in Burn ops from `weights.bin`, f32, same emission fixtures and tolerance (V1261); burn-onnx fallback only if this misses.
+- [x] T039-17 `device`: the choice and reasons (R10, R11), with llvmpipe refused. Reasons are asserted in tests with a fake adapter list (V1262).
+- [x] T039-18 Runtime fallback per song and the 3-in-10-minutes latch, `pharos_aligner_device_fallback_total{reason}` (V1263).
 
 ## Slice 5 - Warm-up and cache (V1264)
 
-- [ ] T039-19 `PHAROS_ALIGNER_CACHE_DIR` wired to cubecl persistence, plus warm-up lengths, before readiness. Start log fields (V1264).
+- [x] T039-19 `PHAROS_ALIGNER_CACHE_DIR` wired to cubecl persistence, plus warm-up lengths, before readiness. Start log fields (V1264).
+- [ ] T039-28 `pharos_aligner_forward_seconds{device}` histogram and `aligner.rss_mib` on the song's log line, both named in spec.md's signals table and not yet emitted.
 - [ ] T039-20 Measure the cold cost per window length on the RX 9070 node, and settle open question 1. Results go in this file, with ISO 8601 UTC times.
 
 ## Slice 6 - Image and chart (V1265-V1266)
