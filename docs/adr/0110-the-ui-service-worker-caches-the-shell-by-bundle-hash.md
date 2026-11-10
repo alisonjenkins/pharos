@@ -101,6 +101,45 @@ pharos-ui logs; the crate has no `tracing` subscriber in the browser.
   only. Book bytes, which are per user, get their own rules in slice 3
   (spec 036 FR-005).
 
+## Amendment: kept books (spec 036 slice 3, 2026-11-10)
+
+The "seam for slice 3" above left open whether the worker would serve book
+bytes. It does not. The page reads and writes kept books itself, through
+`window.caches` (`native/kept_web.rs`), so V1133 stands: the worker never
+reads, writes or serves a book, and a book is only readable by the page of
+the user who kept it.
+
+- **Cache and key.** Books live in `pharos-books-<userId>`, one cache per
+  user (the id `Session.me` reports), each under the URL the reader would
+  fetch, `/Items/<id>/Download`. The download streams from `fetch` into
+  `cache.put`, never through wasm memory; the size is read back from the
+  stored blob and a book over the weak-device cap (64 MiB) is deleted again.
+- **Record.** One `localStorage` value, `pharos.kept`, holds the user id and,
+  per book, title, format, size, kept-at time, reason (`hand`, the only one
+  in this slice), and the last place read with an `unsent` flag. The offline
+  start and the title page read only this, so nothing runs at start-up on a
+  device with nothing kept. Cache Storage is opened only to read, keep or
+  remove a book.
+- **Offline start.** When the server cannot be reached, or `navigator.onLine`
+  is false, and a book is kept, the app shows the kept books instead of the
+  waiting page, and `/ui/read/<id>` opens the reader without an API. With
+  nothing kept nothing changes.
+- **Position.** The reader notes each place it saves in the record, marked
+  `unsent` until the server accepted it; a kept book resumes from an unsent
+  place rather than the server's. The offline save queue (slice 1) is the
+  retry; until it is on the base, an unsent place reaches the server with the
+  next save made online.
+- **Users.** A reader that has an API asks `me` before it reads a kept copy,
+  and the shell compares the record's user with `me` whenever it is asked:
+  a record kept by someone else is deleted. Signing out (the machine reaching
+  the sign-in phase) deletes every `pharos-books-*` cache and the record. A
+  session the server revokes does not, so a tunnel does not cost the books;
+  the next different user finds them cleared.
+- **PDF module.** Keeping a PDF fetches the module's three files so this
+  worker stores them in the shell cache (it controls the page). A deploy
+  replaces the shell cache, so a kept PDF needs one online open after a
+  deploy before it opens offline again.
+
 ## Alternatives considered
 
 - **Hash at build time in `flake.nix`.** A second source of truth, invisible
