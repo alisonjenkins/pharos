@@ -533,6 +533,12 @@ pub fn WatchView(
     // A tap that only brings the hidden chrome back must not also pause; a
     // paused player's chrome is never hidden.
     let mut woke_by_tap = use_signal(|| false);
+    // Whether the last press on the player was a finger, the last tap on the
+    // picture, and how many taps so far (a later one cancels a waiting
+    // single tap): the double-tap seek (T038-303).
+    let mut touched = use_signal(|| false);
+    let mut last_tap = use_signal(|| None::<Tap>);
+    let mut tap_count = use_signal(|| 0u32);
     let mut wake = move || {
         stirred.set(true);
         if *idle.peek() {
@@ -798,7 +804,9 @@ pub fn WatchView(
                 onkeydown: on_key,
                 onpointermove: move |_| wake(),
                 onpointerdown: move |evt: PointerEvent| {
-                    woke_by_tap.set(evt.pointer_type() == "touch" && idle() && !media.paused);
+                    let touch = evt.pointer_type() == "touch";
+                    touched.set(touch);
+                    woke_by_tap.set(touch && idle() && !media.paused);
                     wake();
                 },
                 onwheel: move |evt: WheelEvent| {
@@ -821,10 +829,56 @@ pub fn WatchView(
                         autoplay,
                         playsinline: true,
                         onclick: move |evt: MouseEvent| {
-                            if woke_by_tap() {
+                            if *touched.peek() {
+                                let now = platform::now_ms();
+                                let zone = tap_zone(
+                                    evt.element_coordinates().x,
+                                    platform::element_width(VIDEO_ID),
+                                );
+                                let seek = double_tap(*last_tap.peek(), zone, now);
+                                last_tap.set(Some(Tap { at: now, zone }));
+                                // A second tap cancels the first's play or pause.
+                                let tap = *tap_count.peek() + 1;
+                                tap_count.set(tap);
+                                if let Some(forward) = seek {
+                                    woke_by_tap.set(false);
+                                    let t = if forward { Transport::SeekForward } else { Transport::SeekBack };
+                                    platform::info(&format!(
+                                        "pharos: double tap seek forward={forward} at {} ms",
+                                        pos.peek()
+                                    ));
+                                    if let Some(control) = transport_control(t, &media_at(media, pos)) {
+                                        on_control.call(control);
+                                    }
+                                    return;
+                                }
+                                if woke_by_tap() {
+                                    woke_by_tap.set(false);
+                                    return;
+                                }
+                                if zone == TapZone::Middle {
+                                    on_control.call(Control::TogglePlay);
+                                    return;
+                                }
+                                // A side tap waits to see whether a second
+                                // one makes it a seek.
+                                spawn(async move {
+                                    platform::sleep_ms(DOUBLE_TAP_MS as u32).await;
+                                    if *tap_count.peek() == tap {
+                                        on_control.call(Control::TogglePlay);
+                                    }
+                                });
+                            } else if woke_by_tap() {
                                 woke_by_tap.set(false);
                             } else if !shortcuts.click(&evt) {
                                 on_control.call(Control::TogglePlay);
+                            }
+                        },
+                        // A mouse double-click toggles fullscreen; a double
+                        // tap is the seek above.
+                        ondoubleclick: move |_| {
+                            if !*touched.peek() {
+                                on_control.call(Control::Fullscreen);
                             }
                         },
                         oncontextmenu: move |evt: MouseEvent| shortcuts.context_menu(&evt),
@@ -1977,6 +2031,49 @@ pub fn wheel_notches(carried: f64, delta: WheelDelta) -> (i32, f64) {
     (whole, travel - notches * WHEEL_NOTCH_PX)
 }
 
+/// Which third of the picture a tap landed in, for the double-tap seek.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TapZone {
+    Left,
+    Middle,
+    Right,
+}
+
+/// The third of a picture `width` px wide that `x` falls in.
+pub fn tap_zone(x: f64, width: f64) -> TapZone {
+    if !(width > 0.0) || !x.is_finite() {
+        return TapZone::Middle;
+    }
+    match x / width {
+        f if f < 1.0 / 3.0 => TapZone::Left,
+        f if f > 2.0 / 3.0 => TapZone::Right,
+        _ => TapZone::Middle,
+    }
+}
+
+/// A tap on the picture, kept to tell a double tap.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Tap {
+    pub at: f64,
+    pub zone: TapZone,
+}
+
+/// Taps closer than this are a double tap.
+pub const DOUBLE_TAP_MS: f64 = 300.0;
+
+/// What a touch tap on the picture does (T038-303): a second tap within
+/// [`DOUBLE_TAP_MS`] on the same side third seeks 10 s that way, and each
+/// further quick tap seeks again. `Some(false)` is back, `Some(true)`
+/// forward; `None` is a single tap.
+pub fn double_tap(prev: Option<Tap>, zone: TapZone, now: f64) -> Option<bool> {
+    let prev = prev.filter(|p| p.zone == zone && (now - p.at) <= DOUBLE_TAP_MS)?;
+    match prev.zone {
+        TapZone::Left => Some(false),
+        TapZone::Right => Some(true),
+        TapZone::Middle => None,
+    }
+}
+
 /// What `notches` of wheel do: change the volume, or with Shift seek.
 pub fn wheel_control(notches: i32, shift: bool, media: MediaState) -> Option<Control> {
     if notches == 0 {
@@ -3065,6 +3162,49 @@ mod tests {
             wheel_control(sideways, true, media),
             Some(Control::Seek(65_000))
         );
+    }
+
+    #[test]
+    fn a_double_tap_on_a_side_third_seeks_that_way() {
+        assert_eq!(tap_zone(50.0, 390.0), TapZone::Left);
+        assert_eq!(tap_zone(195.0, 390.0), TapZone::Middle);
+        assert_eq!(tap_zone(380.0, 390.0), TapZone::Right);
+        assert_eq!(tap_zone(10.0, 0.0), TapZone::Middle, "no width, no side");
+        let left = Some(Tap {
+            at: 1_000.0,
+            zone: TapZone::Left,
+        });
+        assert_eq!(double_tap(left, TapZone::Left, 1_250.0), Some(false));
+        assert_eq!(
+            double_tap(
+                Some(Tap {
+                    at: 0.0,
+                    zone: TapZone::Right
+                }),
+                TapZone::Right,
+                300.0
+            ),
+            Some(true)
+        );
+        assert_eq!(double_tap(left, TapZone::Left, 1_301.0), None, "too slow");
+        assert_eq!(
+            double_tap(left, TapZone::Right, 1_100.0),
+            None,
+            "the other side"
+        );
+        assert_eq!(
+            double_tap(
+                Some(Tap {
+                    at: 0.0,
+                    zone: TapZone::Middle
+                }),
+                TapZone::Middle,
+                100.0
+            ),
+            None,
+            "the middle third does not seek"
+        );
+        assert_eq!(double_tap(None, TapZone::Left, 0.0), None);
     }
 
     #[test]
