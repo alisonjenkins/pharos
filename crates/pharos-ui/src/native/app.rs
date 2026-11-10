@@ -7026,6 +7026,9 @@ fn Player(
             }
             // A video's player stacks this with its other group notes.
             if p.kind == ItemKind::Audio {
+                if let Some(line) = notes.connection.clone() {
+                    p { class: "pharos-status-note pharos-connection-lost", role: "status", "{line}" }
+                }
                 if let Some(message) = notes.status.clone() {
                     GroupEndedNote { message }
                 }
