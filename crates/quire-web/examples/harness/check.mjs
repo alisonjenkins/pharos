@@ -133,6 +133,68 @@ for (const [w, h] of [[1000, 700], [400, 800]]) {
   await f.close();
 }
 
+// V1286: a link inside the book lands on the page that holds its target,
+// across sections, for an `id` and for an old `<a name>` alike.
+const l = await browser.newPage({ viewport: { width: 1000, height: 700 } });
+l.on("pageerror", (e) => console.log("pageerror", e.message));
+await l.goto(url);
+await l.waitForSelector("body[data-ready]");
+// Waits for the `n`th jump; a timeout leaves the checks below to say what is wrong.
+const settle = (n) => l.waitForFunction((n) => window.q.jumps().length >= n, n, { timeout: 5000 }).catch(() => {});
+// Is the element with `id` (or `name`) drawn inside the host, on the page shown?
+const onScreen = (id) => l.evaluate((id) => {
+  const root = document.getElementById("host").shadowRoot;
+  const el = root.getElementById(id) || root.querySelector(`[name="${id}"]`);
+  if (!el) return "missing";
+  const r = el.getBoundingClientRect();
+  return r.left >= 0 && r.left < window.innerWidth ? "shown" : `off page at x=${Math.round(r.left)}`;
+}, id);
+const follow = async (start, link, n) => {
+  await l.evaluate((f) => window.q.mount_links(f), 18);
+  for (let i = 0; i < start; i++) await l.evaluate(() => window.q.next());
+  await l.locator(`#host a#${link}`).click();
+  await settle(n);
+};
+let n = 0;
+await follow(0, "to-deep", ++n);
+check((await l.evaluate(() => window.q.spine())) === 1 && (await l.evaluate(() => window.q.page())) > 0,
+  `a contents link to an id deep in another section opens it past its first page (${(await l.evaluate(() => window.q.jumps())).at(-1)}, page ${await l.evaluate(() => window.q.page())})`);
+check((await onScreen("deep")) === "shown", `and the target is on the page shown (${await onScreen("deep")})`);
+check((await l.evaluate(() => window.q.jumps())).at(-1) === "1#deep Ok(Target)", "and the view reports it found the target");
+await follow(0, "to-old", ++n);
+check((await onScreen("old")) === "shown", `a link to an <a name> anchor shows it (${await onScreen("old")}, page ${await l.evaluate(() => window.q.page())})`);
+await l.evaluate(() => window.q.mount_links(18));
+await l.locator("#host a#to-start").click();
+await settle(++n);
+check((await l.evaluate(() => [window.q.spine(), window.q.page()])).join() === "1,0", "a link with no fragment opens the section at its start");
+// V1287: the keyboard (and a TV remote's D-pad) reaches the links on the
+// page shown in reading order, and Enter follows the one focused.
+await l.evaluate(() => window.q.mount_links(18));
+const walk = [];
+while (await l.evaluate(() => window.q.focus_link(true))) walk.push(await l.evaluate(() => window.q.focused_link()));
+check(walk.join(" ") === "1#deep 1#old 1", `Down walks the page's book links in order (${walk.join(" ")})`);
+check(await l.evaluate(() => window.q.focus_link(false)), "and Up walks back");
+check(await l.evaluate(() => window.q.focused_link()) === "1#old", "to the one before");
+await l.keyboard.press("Enter");
+await settle(++n);
+check((await onScreen("old")) === "shown", `Enter follows the focused link (${(await l.evaluate(() => window.q.jumps())).at(-1)})`);
+check(await l.evaluate(() => window.q.focused_link()) === undefined, "and the focus does not stay on a link that is gone");
+// In a chapter with links on many pages, each link focused is one drawn on
+// the page shown.
+const focusedAt = await l.evaluate(() => {
+  const root = document.getElementById("host").shadowRoot;
+  const xs = [];
+  while (window.q.focus_link(true)) xs.push(Math.round(root.activeElement.getBoundingClientRect().left));
+  return xs;
+});
+const total = await l.evaluate(() => document.getElementById("host").shadowRoot.querySelectorAll("[data-quire-link]").length);
+check(focusedAt.length < total && focusedAt.every((x) => x >= 0 && x < 1000),
+  `only the links on the page shown are focused (${focusedAt.length} of ${total}, at x=${focusedAt.join(",")})`);
+
+await l.evaluate(() => window.q.mount_links(18));
+const web = await l.locator("#host a#to-web").evaluate((a) => [a.target, a.rel].join(" "));
+check(web === "_blank noopener noreferrer", `a web link opens in a new tab without an opener (${web})`);
+
 await browser.close();
 server.close();
 process.exit(failed ? 1 : 0);

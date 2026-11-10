@@ -464,7 +464,7 @@ impl Core {
             return;
         };
         match view.go(target).await {
-            Ok(()) => self.moved(false),
+            Ok(_) => self.moved(false),
             Err(e) => platform::warn(&format!("pharos: reader jump failed error={e}")),
         }
     }

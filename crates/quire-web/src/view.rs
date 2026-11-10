@@ -10,8 +10,8 @@ use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{
     Blob, BlobPropertyBag, Document, Element, Event, EventTarget, FontFace, FontFaceDescriptors,
-    HtmlElement, HtmlImageElement, MouseEvent, PointerEvent, Range, ResizeObserver, ShadowRoot,
-    ShadowRootInit, ShadowRootMode, Text, Url,
+    HtmlElement, HtmlImageElement, KeyboardEvent, MouseEvent, PointerEvent, Range, ResizeObserver,
+    ShadowRoot, ShadowRootInit, ShadowRootMode, Text, Url,
 };
 
 use crate::layout::{self, Columns, Fit};
@@ -27,6 +27,28 @@ pub enum Action {
     Jump(Target),
     /// The view changed size; call [`View::relayout`].
     Relayout,
+}
+
+/// Where [`View::go`] put the reader.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Landed {
+    /// At the section's start: the target named no element.
+    Start,
+    /// On the page holding the element the target names.
+    Target,
+    /// At the section's start, because no element has the target's id.
+    MissingTarget,
+}
+
+impl Landed {
+    /// A stable name for logs.
+    pub fn label(self) -> &'static str {
+        match self {
+            Landed::Start => "start",
+            Landed::Target => "target",
+            Landed::MissingTarget => "missing_target",
+        }
+    }
 }
 
 /// Where in a section to open it.
@@ -229,13 +251,61 @@ impl View {
         self.open(at.spine as usize, Start::Offset(at.offset)).await
     }
 
-    /// Opens a link or table-of-contents target.
-    pub async fn go(&self, target: &Target) -> Result<(), ViewError> {
+    /// Opens a link or table-of-contents target, and says whether the
+    /// element it names was found.
+    pub async fn go(&self, target: &Target) -> Result<Landed, ViewError> {
         let start = target
             .fragment
             .clone()
             .map_or(Start::Beginning, Start::Fragment);
-        self.open(target.spine, start).await
+        self.open(target.spine, start).await?;
+        Ok(match &target.fragment {
+            None => Landed::Start,
+            Some(id) if self.0.shadow.get_element_by_id(id).is_some() => Landed::Target,
+            Some(_) => Landed::MissingTarget,
+        })
+    }
+
+    /// Moves the keyboard focus to the next (or previous) link on the page
+    /// shown, in reading order, starting from the link focused. `false`
+    /// when there is none that way, so the caller can use the key.
+    pub fn focus_link(&self, forward: bool) -> bool {
+        let links = self.0.links_shown();
+        let at = self
+            .0
+            .shadow
+            .active_element()
+            .and_then(|a| links.iter().position(|l| AsRef::<Element>::as_ref(l) == &a));
+        let next = match (at, forward) {
+            (Some(i), true) => i.checked_add(1),
+            (Some(i), false) => i.checked_sub(1),
+            (None, true) => Some(0),
+            (None, false) => links.len().checked_sub(1),
+        };
+        let Some(link) = next.and_then(|i| links.get(i)) else {
+            return false;
+        };
+        let options = web_sys::FocusOptions::new();
+        options.set_prevent_scroll(true);
+        // The browser ignores focus on an inert or hidden link without an error.
+        link.focus_with_options(&options).is_ok()
+            && self
+                .0
+                .shadow
+                .active_element()
+                .is_some_and(|a| &a == AsRef::<Element>::as_ref(link))
+    }
+
+    /// The link the keyboard focus is on, if it is one of the book's.
+    pub fn focused_link(&self) -> Option<Target> {
+        self.0
+            .shadow
+            .active_element()?
+            .closest("[data-quire-link]")
+            .ok()??
+            .get_attribute("data-quire-link")?
+            .parse()
+            .ok()
     }
 
     /// The next page, crossing into the next linear section at a section's
@@ -409,6 +479,26 @@ impl Inner {
             }
         })?;
 
+        let keys = self.actions.clone();
+        self.add(target, "keydown", move |e| {
+            let Some(k) = e.dyn_ref::<KeyboardEvent>() else {
+                return;
+            };
+            if k.key() != "Enter" || k.ctrl_key() || k.meta_key() || k.alt_key() || k.shift_key() {
+                return;
+            }
+            let link = e
+                .target()
+                .and_then(|t| t.dyn_into::<Element>().ok())
+                .and_then(|el| el.closest("[data-quire-link]").ok().flatten())
+                .and_then(|l| l.get_attribute("data-quire-link"))
+                .and_then(|v| v.parse::<Target>().ok());
+            if let Some(t) = link {
+                e.prevent_default();
+                Inner::emit(&keys, Action::Jump(t));
+            }
+        })?;
+
         let (actions, host) = (self.actions.clone(), self.host.clone());
         self.add(target, "click", move |e| {
             if swiped.replace(false) {
@@ -526,7 +616,13 @@ impl Inner {
                 Value::Text(t) => Some(t.clone()),
                 Value::Resource(p) => self.resource_url(p),
                 Value::Style(css) => Some(css.render(&mut |p| self.resource_url(p))),
-                Value::Link(t) => Some(t.encode()),
+                Value::Link(t) => {
+                    // Focusable from script only: a Tab into a later page
+                    // would scroll the frame under the column transform.
+                    node.set_attribute("tabindex", "-1")?;
+                    node.set_attribute("role", "link")?;
+                    Some(t.encode())
+                }
             };
             if let Some(v) = value {
                 node.set_attribute(&a.name, &v)?;
@@ -676,17 +772,30 @@ impl Inner {
     /// Shows `page` and sets the reader's place to `anchor`, or to the
     /// page's first character when none is given.
     fn show(&self, page: u32, anchor: Option<usize>) {
-        let (page, offset) = {
+        let (page, offset, turned) = {
             let mut s = self.state.borrow_mut();
             let page = page.min(s.pages.saturating_sub(1));
+            let turned = page != s.page;
             s.page = page;
-            (page, s.columns.map_or(0.0, |c| c.offset(page)))
+            (page, s.columns.map_or(0.0, |c| c.offset(page)), turned)
         };
         let _ = self
             .strip
             .style()
             .set_property("transform", &format!("translateX({offset}px)"));
         let _ = self.strip.set_attribute("data-page", &page.to_string());
+        // A link focused on the page left, or moved off it by a relayout,
+        // would stay focused off screen; one still shown keeps the focus so
+        // the next Up or Down walks on from it.
+        if let Some(el) = self
+            .shadow
+            .active_element()
+            .and_then(|a| a.dyn_into::<HtmlElement>().ok())
+        {
+            if turned || !self.links_shown().contains(&el) {
+                let _ = el.blur();
+            }
+        }
         let anchor = anchor.unwrap_or_else(|| self.first_visible());
         self.state.borrow_mut().anchor = anchor;
     }
@@ -733,6 +842,27 @@ impl Inner {
             at = 0;
         }
         s.pages.saturating_sub(1)
+    }
+
+    /// The book's links drawn on the page shown, in document order.
+    fn links_shown(&self) -> Vec<HtmlElement> {
+        let Ok(list) = self.strip.query_selector_all("[data-quire-link]") else {
+            return Vec::new();
+        };
+        let frame = self.frame.get_bounding_client_rect();
+        (0..list.length())
+            .filter_map(|i| list.item(i)?.dyn_into::<HtmlElement>().ok())
+            // A link broken across columns has a box per column; any one
+            // on the page shown puts it there.
+            .filter(|l| {
+                let rects = l.get_client_rects();
+                (0..rects.length()).filter_map(|i| rects.item(i)).any(|r| {
+                    (r.width() > 0.0 || r.height() > 0.0)
+                        && r.left() >= frame.left() - 0.5
+                        && r.left() < frame.right()
+                })
+            })
+            .collect()
     }
 
     fn page_of_fragment(&self, id: &str) -> u32 {
