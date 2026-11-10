@@ -127,6 +127,13 @@ pub enum SocketBroadcast {
         /// Percent `0.0..=100.0`; serialized as a string to match Jellyfin.
         progress: f64,
     },
+    /// The whole library scan moved: `progress` is percent `0.0..=100.0`, and
+    /// `end` is how a pass finished and what it did. Native events only;
+    /// jellyfin-web follows the scan through `ScheduledTasksInfo`.
+    ScanProgress {
+        progress: f64,
+        end: Option<(crate::scan_tasks::ScanOutcome, crate::scan_tasks::ScanTally)>,
+    },
     /// A new dashboard activity-log entry (pre-shaped `ActivityLogEntry`
     /// JSON). Admin-only: delivered solely to sockets that sent
     /// `ActivityLogEntryStart` and belong to an admin.
@@ -1480,6 +1487,16 @@ impl AppState {
     /// Fan out a `RefreshProgress` event for a library/collection item so
     /// jellyfin-web's library-card refresh indicator fills as a scan runs.
     /// `item_id` is the library's wire id; `progress` is `0.0..=100.0`.
+    pub fn notify_scan_progress(
+        &self,
+        progress: f64,
+        end: Option<(crate::scan_tasks::ScanOutcome, crate::scan_tasks::ScanTally)>,
+    ) {
+        let _ = self
+            .bus
+            .send(SocketBroadcast::ScanProgress { progress, end });
+    }
+
     pub fn notify_refresh_progress(&self, item_id: &str, progress: f64) {
         let _ = self.bus.send(SocketBroadcast::RefreshProgress {
             item_id: item_id.to_string(),
