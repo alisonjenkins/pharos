@@ -77,3 +77,9 @@ url = "sqlite:./pharos.db?mode=rwc"
 # # audio is a dub keeps playing that dub). Set false for the preference to
 # # decide.
 # play_default_audio_track = false
+
+# [metadata]
+# # Artwork whose file has gone from disk is relinked to a same-named file in
+# # the item's folder, or dropped so online art can replace it (daily sweep).
+# # `false` only logs the dead rows and changes nothing. Default true.
+# repair_stale_artwork = true
