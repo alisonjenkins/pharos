@@ -12,6 +12,16 @@ use crate::line::align_line;
 use crate::service::{DeviceUsed, Model, ModelError};
 use crate::tokens::CLASSES;
 
+/// Runs one forward pass, recording its wall time under `device`, failed
+/// passes included.
+pub(crate) fn timed<T>(device: &'static str, pass: impl FnOnce() -> T) -> T {
+    let started = std::time::Instant::now();
+    let out = pass();
+    metrics::histogram!(crate::obs::FORWARD_SECONDS, "device" => device)
+        .record(started.elapsed().as_secs_f64());
+    out
+}
+
 /// The model's 28 output labels; the star (`tokens::STAR`) is appended after.
 pub const LOGITS: usize = 28;
 
@@ -87,7 +97,7 @@ impl CpuAligner {
             aligner.device = "cpu",
             aligner.device_reason = %self.reason
         )
-        .in_scope(|| self.model.logits(&refs))
+        .in_scope(|| timed("cpu", || self.model.logits(&refs)))
     }
 }
 
@@ -188,7 +198,7 @@ impl Model for VulkanAligner {
             aligner.device_reason = %self.reason,
             aligner.adapter = %self.adapter
         )
-        .in_scope(|| self.model.logits(&wave))
+        .in_scope(|| timed("vulkan", || self.model.logits(&wave)))
         .map_err(ModelError::Device)?;
         spans(&logits, pcm.len(), tokens, lead_star)
     }
@@ -197,6 +207,33 @@ impl Model for VulkanAligner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_forward_pass_is_timed_under_its_device() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        assert_eq!(timed("cpu", || 7), 7);
+        timed("vulkan", || ());
+        timed("vulkan", || ());
+        let snapshot = snapshotter.snapshot().into_vec();
+        let samples = |device: &str| {
+            snapshot
+                .iter()
+                .find(|(k, ..)| {
+                    k.key().name() == crate::obs::FORWARD_SECONDS
+                        && k.key()
+                            .labels()
+                            .any(|l| l.key() == "device" && l.value() == device)
+                })
+                .map(|(.., v)| match v {
+                    DebugValue::Histogram(h) => h.len(),
+                    _ => 0,
+                })
+        };
+        assert_eq!((samples("cpu"), samples("vulkan")), (Some(1), Some(2)));
+    }
 
     #[test]
     fn batches_fill_up_to_the_cap_and_a_long_window_runs_alone() {
