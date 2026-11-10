@@ -16,7 +16,10 @@
 //! its three nearest ancestors, when one exists. Otherwise it drops the row and
 //! re-admits the item for online art, unless the match is `manual`. Provider
 //! cached rows (tmdb, tvdb, musicbrainz) have no sibling, so they are only ever
-//! dropped.
+//! dropped. A row is only judged dead on a definite "not found", and only
+//! repaired while the item's own media file is visible: when the media is
+//! missing too, the share is most likely down, and dropping then would strip
+//! the whole library of its art.
 //!
 //! Signals: `pharos_artwork_stale_total{role,outcome}` per dead row,
 //! `pharos_artwork_stale_rows` (dead rows found in the last pass), one info line
@@ -56,6 +59,9 @@ pub(crate) enum Outcome {
     Missing,
     /// The item the row belongs to no longer exists.
     Orphan,
+    /// The item's own media file could not be seen either, so the share is
+    /// probably down rather than the artwork deleted: left untouched.
+    Unreachable,
 }
 
 impl Outcome {
@@ -65,6 +71,7 @@ impl Outcome {
             Outcome::Dropped => "dropped",
             Outcome::Missing => "missing",
             Outcome::Orphan => "orphan",
+            Outcome::Unreachable => "unreachable",
         }
     }
 }
@@ -78,6 +85,7 @@ pub(crate) struct PassReport {
     pub dropped: u64,
     pub missing: u64,
     pub orphan: u64,
+    pub unreachable: u64,
 }
 
 impl PassReport {
@@ -87,11 +95,12 @@ impl PassReport {
             Outcome::Dropped => self.dropped += 1,
             Outcome::Missing => self.missing += 1,
             Outcome::Orphan => self.orphan += 1,
+            Outcome::Unreachable => self.unreachable += 1,
         }
     }
 
     fn dead(&self) -> u64 {
-        self.relinked + self.dropped + self.missing + self.orphan
+        self.relinked + self.dropped + self.missing + self.orphan + self.unreachable
     }
 }
 
@@ -133,6 +142,7 @@ pub(crate) async fn run_pass<S: MediaStore>(
         dropped = report.dropped,
         missing = report.missing,
         orphan = report.orphan,
+        unreachable = report.unreachable,
         "stale artwork sweep: pass complete"
     );
     Ok(report)
@@ -145,7 +155,9 @@ async fn repair_row<S: MediaStore>(
     row: &ArtworkRow,
     repair: bool,
 ) -> DomainResult<Option<Outcome>> {
-    if matches!(tokio::fs::try_exists(&row.locator).await, Ok(true)) {
+    // Only a definite "not there" counts as dead: an I/O error (a stale NFS
+    // handle, a permission blip) says nothing about the file.
+    if !matches!(tokio::fs::try_exists(&row.locator).await, Ok(false)) {
         return Ok(None);
     }
     let Ok(item) = store.get(row.item_id).await else {
@@ -167,6 +179,26 @@ async fn repair_row<S: MediaStore>(
     };
     // Only a local sidecar has a sibling to relink to. A provider-cached file
     // lives in the cache, not beside the media.
+    // If the media file itself is gone too, the library share is most likely
+    // unmounted or stale. Dropping now would strip every item of its art and
+    // queue a provider download for each, so leave the row for a later pass.
+    if !matches!(tokio::fs::try_exists(&item.path).await, Ok(true)) {
+        tracing::info!(
+            media.id = row.item_id,
+            role = %row.role,
+            locator = %row.locator,
+            media.path = %item.path.display(),
+            outcome = Outcome::Unreachable.label(),
+            "stale artwork row: media file unreachable too; left alone"
+        );
+        metrics::counter!(
+            "pharos_artwork_stale_total",
+            "role" => row.role.clone(),
+            "outcome" => Outcome::Unreachable.label()
+        )
+        .increment(1);
+        return Ok(Some(Outcome::Unreachable));
+    }
     let sibling = if row.source.eq_ignore_ascii_case("local") {
         find_sibling(&item.path, &row.locator).await
     } else {
@@ -273,6 +305,7 @@ mod tests {
             Outcome::Dropped,
             Outcome::Missing,
             Outcome::Orphan,
+            Outcome::Unreachable,
         ]
         .map(Outcome::label);
         let unique: std::collections::BTreeSet<_> = labels.iter().collect();
@@ -285,6 +318,7 @@ mod tests {
         let folder = dir.join("a-film (2000)");
         std::fs::create_dir_all(&folder).unwrap();
         let media = folder.join("film.mkv");
+        std::fs::write(&media, b"video").unwrap();
         stores
             .put(MediaItem {
                 id: 1,
@@ -473,5 +507,31 @@ mod tests {
         assert_eq!(report.dropped, 1, "{report:?}");
         assert_eq!(report.relinked, 0, "{report:?}");
         assert!(stores.artwork_for(id).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_dead_row_whose_media_is_unreachable_is_left_alone() {
+        // The share dropping out makes the media file vanish along with its
+        // art; nothing may be dropped or re-admitted on that evidence.
+        let dir = tempfile::tempdir().unwrap();
+        let (stores, id, folder) = library(dir.path()).await;
+        let poster = folder.join("folder.jpg").to_string_lossy().into_owned();
+        stores
+            .set_artwork(id, "Primary", "local", &poster)
+            .await
+            .unwrap();
+        match_item(&stores, id, "search").await;
+        std::fs::remove_file(folder.join("film.mkv")).unwrap();
+
+        let report = run_pass(&stores, &bg(), true).await.unwrap();
+
+        assert_eq!(report.unreachable, 1, "{report:?}");
+        assert_eq!(report.dropped, 0, "{report:?}");
+        assert_eq!(
+            stores.artwork_for(id).await.unwrap(),
+            vec![("Primary".to_owned(), "local".to_owned(), poster)]
+        );
+        assert!(stores.get(id).await.unwrap().has_primary_art);
+        assert!(due(&stores).await.is_empty(), "not re-admitted");
     }
 }
