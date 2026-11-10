@@ -2150,10 +2150,28 @@ fn Screen(route: Route) -> Element {
             rsx! { SettingsLayout { current: Section::Playback, PlaybackScreen {} } }
         }
         Route::Privacy => rsx! { SettingsLayout { current: Section::Privacy, PrivacyScreen {} } },
+        Route::Offline => rsx! { SettingsLayout { current: Section::Offline, {on_this_device()} } },
         Route::Find => rsx! { FindRedirect {} },
         Route::Together => rsx! { TogetherScreen {} },
         Route::TogetherGroup(id) => rsx! { InviteScreen { id } },
         Route::NotFound(path) => rsx! { ErrorNote { message: format!("Nothing at {path}.") } },
+    }
+}
+
+/// Settings, Offline: the books kept on this device. The cache is the
+/// browser's, so the other builds say so.
+#[cfg(all(feature = "web", target_arch = "wasm32"))]
+fn on_this_device() -> Element {
+    rsx! { super::kept_web::OnThisDevice {} }
+}
+
+#[cfg(not(all(feature = "web", target_arch = "wasm32")))]
+fn on_this_device() -> Element {
+    rsx! {
+        section { class: "pharos-settings-page",
+            h2 { "On this device" }
+            p { class: "pharos-settings-lede", "Keeping books to read offline works in the browser app." }
+        }
     }
 }
 
