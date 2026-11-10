@@ -8175,6 +8175,7 @@ dependencies = [
  "opentelemetry-otlp",
  "opentelemetry_sdk",
  "pkg-config",
+ "pollster",
  "rayon",
  "serde",
  "serde_json",
@@ -8184,6 +8185,7 @@ dependencies = [
  "tracing-subscriber",
  "unicode-normalization",
  "wait-timeout",
+ "wgpu",
  "workspace-hack",
 ]
 
