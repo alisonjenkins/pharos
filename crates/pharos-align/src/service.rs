@@ -191,6 +191,15 @@ impl Engine {
     }
 }
 
+/// `[-33, None, 120]`, as Python prints a probe list, for the offset log line.
+fn probe_list(probes: &[Option<i64>]) -> String {
+    let items: Vec<String> = probes
+        .iter()
+        .map(|p| p.map_or_else(|| "None".to_owned(), |v| v.to_string()))
+        .collect();
+    format!("[{}]", items.join(", "))
+}
+
 fn run_song(
     model: &mut dyn Model,
     decoder: &Decoder,
@@ -219,11 +228,11 @@ fn run_song(
             Ok(pcm) => Ok(pcm),
             Err(e @ DecodeError::TimedOut { .. }) => {
                 probe_timed_out = true;
-                tracing::warn!(path = rel_path, error = %e, "offset probe decode timed out; skipping the rest");
+                tracing::warn!(path = %rel_path, error = %e, "offset probe decode timed out; skipping the rest");
                 Ok(Vec::new())
             }
             Err(e @ DecodeError::Failed { .. }) => {
-                tracing::warn!(path = rel_path, error = %e, "offset probe decode failed");
+                tracing::warn!(path = %rel_path, error = %e, "offset probe decode failed");
                 Ok(Vec::new())
             }
             Err(e) => Err(SongError::Internal(e.to_string())),
@@ -238,7 +247,7 @@ fn run_song(
         match got {
             Ok(spans) => Ok(spans),
             Err(ModelError::Line(e)) => {
-                tracing::warn!(path = rel_path, error = %e, "offset probe failed");
+                tracing::warn!(path = %rel_path, error = %e, "offset probe failed");
                 Ok(Vec::new())
             }
             Err(e @ ModelError::Fatal(_)) => Err(SongError::Internal(e.to_string())),
@@ -246,9 +255,9 @@ fn run_song(
     };
     let found = estimate(&lines, decode_probe, align_wide)?;
     tracing::info!(
-        path = rel_path,
+        path = %rel_path,
         offset_ms = found.offset_ms,
-        probes = ?found.probes,
+        probes = %probe_list(&found.probes),
         reason = %found.reason,
         "offset estimate"
     );
@@ -289,7 +298,7 @@ fn run_song(
             Ok(spans) => spans,
             // A window too short for its text: only that line goes without word times.
             Err(ModelError::Line(e)) => {
-                tracing::warn!(path = rel_path, line = index, error = %e, "alignment failed");
+                tracing::warn!(path = %rel_path, line = index, error = %e, "alignment failed");
                 out.push(LineWords { words: Vec::new() });
                 continue;
             }
@@ -313,4 +322,16 @@ fn run_song(
         reason: found.reason,
         phases,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn probe_list_prints_as_python_does() {
+        assert_eq!(
+            super::probe_list(&[Some(-33), None, Some(120)]),
+            "[-33, None, 120]"
+        );
+        assert_eq!(super::probe_list(&[]), "[]");
+    }
 }
