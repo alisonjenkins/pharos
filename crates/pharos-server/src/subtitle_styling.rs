@@ -42,9 +42,10 @@
 //! pharos_subtitle_styling_total{outcome,stage}   outcome: styled | no_source | undecodable | error | missing | unscanned
 //!                                                stage:   select | read | signals | direct | store
 //! pharos_subtitle_styling_seconds{stage}         read | signals | direct, for styled items
+//!                                                (signals only when measured, not read back)
 //! pharos_subtitle_styling_pending                items needing work at the start of a pass
 //! pharos_subtitle_effect_total{intent,source}    one per styled line; source: rule (phase 1)
-//! pharos_subtitle_signals_total{source}          stored | measured, per item that reached signals
+//! pharos_subtitle_signals_total{source,outcome}  source: stored | measured; outcome: ok | failed
 //! ```
 //!
 //! The signal pass is stored per item (B1202): a re-direct of an unchanged
@@ -814,22 +815,30 @@ impl<S: JobStore, A: Signals, Q: TranscodeQueue> Styler<S, A, Q> {
                 None
             }
         };
+        let from = if stored.is_some() {
+            SignalsSource::Stored
+        } else {
+            SignalsSource::Measured
+        };
         let result = match stored {
-            Some(s) => Ok((s, SignalsSource::Stored)),
+            Some(s) => Ok(s),
             None => {
                 let _permit = BgPermit::acquire(&self.bg_io).await;
                 self.signals
                     .signals(task.item.path.clone(), task.audio_stream, windows.clone())
                     .await
-                    .map(|s| (s, SignalsSource::Measured))
             }
         };
         report.signals = Some(t.elapsed());
+        report.signals_source = Some(from);
+        metrics::counter!(
+            "pharos_subtitle_signals_total",
+            "source" => from.label(),
+            "outcome" => if result.is_ok() { "ok" } else { "failed" },
+        )
+        .increment(1);
         let sig = match result {
-            Ok((s, from)) => {
-                report.signals_source = Some(from);
-                metrics::counter!("pharos_subtitle_signals_total", "source" => from.label())
-                    .increment(1);
+            Ok(s) => {
                 if from == SignalsSource::Measured {
                     report.read_errors = s.read_errors;
                     report.analysed_s = Some(s.analysed_seconds);
@@ -886,9 +895,11 @@ impl<S: JobStore, A: Signals, Q: TranscodeQueue> Styler<S, A, Q> {
         self.put(task, Outcome::Styled, source.index, Some(plan_json))
             .await?;
 
+        // A stored pass is a database read, not the decode this stage times.
+        let measured = report.signals_source == Some(SignalsSource::Measured);
         for (stage, d) in [
             ("read", report.read),
-            ("signals", report.signals),
+            ("signals", report.signals.filter(|_| measured)),
             ("direct", report.direct),
         ] {
             if let Some(d) = d {
@@ -1622,6 +1633,20 @@ mod tests {
                 ("undecodable".to_owned(), "signals".to_owned(), 1),
             ]
         );
+        // A failed measure is counted as well as a good one (V1162).
+        let mut failed = 0;
+        for (ck, _, _, v) in snap.snapshot().into_vec() {
+            if ck.key().name() == "pharos_subtitle_signals_total"
+                && ck
+                    .key()
+                    .labels()
+                    .any(|l| l.key() == "outcome" && l.value() == "failed")
+            {
+                let DebugValue::Counter(c) = v else { panic!() };
+                failed += c;
+            }
+        }
+        assert_eq!(failed, 3);
     }
 
     /// A source that parses as nothing is undecodable at the `read` stage.
@@ -1749,7 +1774,10 @@ mod tests {
         lib.store.put_subtitle_styling(row).await.unwrap();
         job.run_pass(&OnDemand::default()).await;
         let row = lib.store.subtitle_styling(1).await.unwrap().unwrap();
-        assert_eq!(row.director_version, DIRECTOR_VERSION, "older director: redone");
+        assert_eq!(
+            row.director_version, DIRECTOR_VERSION,
+            "older director: redone"
+        );
         assert_eq!(fake.calls().len(), 1, "from the stored signals (V1162)");
 
         std::fs::write(lib.dir.path().join("a.mkv"), b"a longer video file").unwrap();
@@ -1760,7 +1788,11 @@ mod tests {
         job.run_pass(&OnDemand::default()).await;
         let row = lib.store.subtitle_styling(1).await.unwrap().unwrap();
         assert!(row.sidecar_size.is_some_and(|n| n == SRT.len() as u64 + 1));
-        assert_eq!(fake.calls().len(), 2, "changed sidecar, same windows: stored");
+        assert_eq!(
+            fake.calls().len(),
+            2,
+            "changed sidecar, same windows: stored"
+        );
 
         let retimed = SRT.replace("00:00:09,000", "00:00:08,500");
         std::fs::write(lib.dir.path().join("a.en.srt"), retimed).unwrap();
@@ -1790,7 +1822,10 @@ mod tests {
 
         let mut stored = lib.store.subtitle_signals(1).await.unwrap().unwrap();
         stored.signals_version = SIGNALS_VERSION.wrapping_sub(1);
-        lib.store.put_subtitle_signals(stored.clone()).await.unwrap();
+        lib.store
+            .put_subtitle_signals(stored.clone())
+            .await
+            .unwrap();
         redirect().await;
         assert_eq!(fake.calls().len(), 2, "older signal pass: measured");
 
@@ -1804,8 +1839,16 @@ mod tests {
         for (ck, _, _, v) in snap.snapshot().into_vec() {
             if ck.key().name() == "pharos_subtitle_signals_total" {
                 let DebugValue::Counter(c) = v else { panic!() };
-                let src = ck.key().labels().next().unwrap().value().to_owned();
-                by_source.push((src, c));
+                let l = |n: &str| {
+                    ck.key()
+                        .labels()
+                        .find(|l| l.key() == n)
+                        .unwrap()
+                        .value()
+                        .to_owned()
+                };
+                assert_eq!(l("outcome"), "ok");
+                by_source.push((l("source"), c));
             }
         }
         by_source.sort();
@@ -1816,7 +1859,10 @@ mod tests {
         let kept = lib.store.subtitle_signals(1).await.unwrap().unwrap();
         let parsed: StoredSignals = serde_json::from_str(&kept.signals_json).unwrap();
         assert_eq!(parsed.windows.len(), 5);
-        assert!(parsed.signals.keyframes_ms.is_empty(), "keyframes are not kept");
+        assert!(
+            parsed.signals.keyframes_ms.is_empty(),
+            "keyframes are not kept"
+        );
     }
 
     /// V613: after a director bump, an item whose old plan is still being
