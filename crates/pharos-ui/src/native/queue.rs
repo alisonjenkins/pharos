@@ -626,7 +626,10 @@ impl Queue {
         queue.forget_gone();
         if queue.owner.is_none() {
             // Nothing to show is nobody's: an empty record reads as empty.
-            return if queue.upcoming.is_empty() && queue.behind.is_empty() && queue.current.is_none() {
+            return if queue.upcoming.is_empty()
+                && queue.behind.is_empty()
+                && queue.current.is_none()
+            {
                 Ok(Queue::default())
             } else {
                 Err(RestoreError::Unbound)
@@ -821,7 +824,10 @@ mod tests {
         q.started(ItemRef::Real(1), Some(&album(&[2, 3])), 0);
         // Songs saved before anyone was known are nobody's to show.
         assert_eq!(Queue::restore(&q.save()), Err(RestoreError::Unbound));
-        assert_eq!(Queue::restore(&Queue::default().save()), Ok(Queue::default()));
+        assert_eq!(
+            Queue::restore(&Queue::default().save()),
+            Ok(Queue::default())
+        );
 
         assert!(!q.claim("u1"), "a queue no one owned is the first user's");
         let mut back = Queue::restore(&q.save()).unwrap();
