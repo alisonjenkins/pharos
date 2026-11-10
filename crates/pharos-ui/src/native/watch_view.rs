@@ -672,6 +672,15 @@ pub fn WatchView(
         if not_transport(&evt) {
             return;
         }
+        // Escape closes the settings sheet wherever the focus is: on its
+        // button, or on the player after a pick.
+        if *sheet_open.peek() && evt.key() == Key::Named(NamedKey::Escape) {
+            let mut sheet_open = sheet_open;
+            evt.prevent_default();
+            sheet_open.set(false);
+            platform::focus_by_id(SETTINGS_TOGGLE_ID);
+            return;
+        }
         // The invite panel is a dialog: its keys are its own, and Escape
         // closes it.
         if invite_open {
