@@ -1,5 +1,7 @@
 //! Reader settings and the stylesheet that applies them over a book's own.
 
+use crate::layout::Fit;
+
 /// Which typeface the text is set in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Font {
@@ -108,6 +110,29 @@ impl Settings {
     }
 }
 
+impl Settings {
+    /// The view's own stylesheet for a fixed-layout page `page` (its size in
+    /// CSS pixels) placed by `fit`. The book's own sizes, fonts and colours
+    /// are kept: text is placed at exact points over the page's artwork, so
+    /// the reader's font size, line height and colours would break it. Only
+    /// the theme's background shows, around the page.
+    pub(crate) fn fixed_css(&self, page: (f64, f64), fit: Fit) -> String {
+        let background = clean(&self.theme.background);
+        let (w, h) = page;
+        let Fit { scale, left, top } = fit;
+        format!(
+            ":host{{display:block;position:relative;overflow:hidden;background:{background};}}\
+             .quire-sheets{{display:none;}}\
+             .quire-frame{{position:absolute;inset:0;overflow:hidden;}}\
+             .quire-strip{{position:absolute;left:{left}px;top:{top}px;width:{w}px;height:{h}px;\
+             overflow:hidden;transform-origin:0 0;transform:scale({scale}) !important;\
+             touch-action:pan-y;-webkit-user-select:text;user-select:text;}}\
+             .quire-strip>[data-quire-body]{{position:relative;width:100%;height:100%;margin:0;}}\
+             .quire-strip [data-quire-link]{{cursor:pointer;}}"
+        )
+    }
+}
+
 fn family(f: &str) -> String {
     format!(".quire-strip,.quire-strip *{{font-family:{f} !important;}}")
 }
@@ -130,6 +155,29 @@ mod tests {
         let css = s.css(600.0, 80.0, 800.0);
         assert!(css.contains("color:red*display:none !important"));
         assert!(!css.contains("red;}"));
+    }
+
+    #[test]
+    fn a_fixed_page_keeps_the_book_own_sizes_and_colours() {
+        let s = Settings::default();
+        let fit = Fit {
+            scale: 0.5,
+            left: 10.0,
+            top: 0.0,
+        };
+        let css = s.fixed_css((600.0, 800.0), fit);
+        assert!(css.contains("width:600px;height:800px"));
+        assert!(css.contains("transform:scale(0.5) !important"));
+        assert!(css.contains("left:10px;top:0px"));
+        for reflow_only in [
+            "font-size",
+            "line-height",
+            "color:",
+            "column-width",
+            "max-width",
+        ] {
+            assert!(!css.contains(reflow_only), "{reflow_only} in {css}");
+        }
     }
 
     #[test]

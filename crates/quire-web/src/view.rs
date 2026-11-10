@@ -4,7 +4,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use quire::{Content, El, Locator, Publication, Target, Value};
+use quire::{Content, El, Locator, PageSize, Publication, Target, Value};
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
@@ -14,7 +14,7 @@ use web_sys::{
     Text, Url,
 };
 
-use crate::layout::{self, Columns};
+use crate::layout::{self, Columns, Fit};
 use crate::settings::Settings;
 
 /// What a click, swipe or resize inside the view asks for. The view never
@@ -60,6 +60,10 @@ type Observer = (ResizeObserver, Closure<dyn FnMut()>);
 
 /// A swipe shorter than this is a tap.
 const SWIPE_PX: f64 = 40.0;
+
+/// Space kept around a fixed-layout page. Small, because such a page carries
+/// its own margins and every pixel of a phone screen counts.
+const FIXED_GUTTER_PX: f64 = 8.0;
 
 /// A handle to a mounted book; clones share it. Dropping the last one, or
 /// [`View::unmount`], removes its nodes, listeners, observer and `blob:` URLs.
@@ -111,6 +115,8 @@ struct State {
     starts: Vec<usize>,
     lens: Vec<usize>,
     len: usize,
+    /// The section is a fixed-layout page of this size, drawn whole.
+    fixed: Option<PageSize>,
 }
 
 impl View {
@@ -496,6 +502,7 @@ impl Inner {
         let root = self.element(&section.root, &mut state)?;
         self.strip.append_child(&root)?;
         state.spine = spine;
+        state.fixed = section.page;
         *self.state.borrow_mut() = state;
         Ok(())
     }
@@ -554,6 +561,26 @@ impl Inner {
 
     fn apply_settings(&self) {
         let s = self.settings.borrow();
+        let fixed = self.state.borrow().fixed;
+        if let Some(page) = fixed {
+            // The host, not the frame: the frame takes its size from this
+            // stylesheet, which may not have been written yet.
+            let frame = (
+                f64::from(self.host.client_width()),
+                f64::from(self.host.client_height()),
+            );
+            let page = (f64::from(page.width), f64::from(page.height));
+            let css = s.fixed_css(page, Fit::of(page, frame, FIXED_GUTTER_PX));
+            if let Ok(Some(el)) = self.sheets.query_selector("[data-quire-settings]") {
+                el.set_text_content(Some(&css));
+            }
+            // One page, never translated: the strip is the page.
+            self.state.borrow_mut().columns = Some(Columns {
+                width: frame.0.max(1.0),
+                gap: 0.0,
+            });
+            return;
+        }
         let width = f64::from(self.frame.client_width()) - 2.0 * s.margin_px;
         let height = f64::from(self.frame.client_height()) - 2.0 * s.margin_px;
         let columns = Columns {
@@ -568,6 +595,10 @@ impl Inner {
     }
 
     fn measure(&self) {
+        if self.state.borrow().fixed.is_some() {
+            self.state.borrow_mut().pages = 1;
+            return;
+        }
         let pages = self
             .state
             .borrow()
