@@ -4191,6 +4191,87 @@ pub fn tap_peak(id: &str) -> Option<f32> {
     .flatten()
 }
 
+/// Start a new tap's `context` and log how it went (B1141, V1101): Firefox
+/// makes a context suspended and starts it a moment later, and one with no
+/// sound output never starts and its `resume()` never settles (B1140), so a
+/// start still pending after [`super::resume::TAP_START_REPORT_MS`] is
+/// reported stuck.
+fn report_tap_start(context: &web_sys::AudioContext) {
+    use super::resume::{TapStart, TAP_START_REPORT_MS};
+    let made = now_ms();
+    let resume = match context.resume() {
+        Ok(promise) => promise,
+        Err(e) => {
+            log_tap_start(&TapStart::Refused {
+                error: js_error_name(&e),
+            });
+            return;
+        }
+    };
+    // One verdict: the resume races a timer that resolves to `undefined`
+    // (a settled resume resolves to `undefined` too, so the timer's value is
+    // a marker of its own), so a start that settles late is never also
+    // reported stuck.
+    let stuck = JsValue::from_str("pharos-tap-stuck");
+    let timer = {
+        let stuck = stuck.clone();
+        let ms = i32::try_from(TAP_START_REPORT_MS).unwrap_or(i32::MAX);
+        js_sys::Promise::new(&mut |resolve, _| {
+            let stuck = stuck.clone();
+            let fire = Closure::once_into_js(move || {
+                let _ = resolve.call1(&JsValue::NULL, &stuck);
+            });
+            if let Some(window) = web_sys::window() {
+                let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
+                    fire.unchecked_ref(),
+                    ms,
+                );
+            }
+        })
+    };
+    let race = js_sys::Promise::race(&js_sys::Array::of2(&resume, &timer));
+    let context = context.clone();
+    wasm_bindgen_futures::spawn_local(async move {
+        let outcome = wasm_bindgen_futures::JsFuture::from(race).await;
+        let state = context_state(&context);
+        log_tap_start(&match outcome {
+            Ok(v) if v == stuck => TapStart::Stuck { state },
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            Ok(_) => TapStart::Started {
+                state,
+                start_ms: (now_ms() - made).max(0.0) as u64,
+            },
+            Err(e) => TapStart::Rejected {
+                error: js_error_name(&e),
+                state,
+            },
+        });
+    });
+}
+
+fn log_tap_start(start: &super::resume::TapStart) {
+    if start.is_fault() {
+        warn(&start.line());
+    } else {
+        info(&start.line());
+    }
+}
+
+/// A thrown or rejected value's `name` (`NotAllowedError`), one token for a
+/// log field; its debug form when it has none.
+fn js_error_name(e: &JsValue) -> String {
+    js_sys::Reflect::get(e, &JsValue::from_str("name"))
+        .ok()
+        .and_then(|n| n.as_string())
+        .filter(|n| !n.is_empty() && !n.contains(char::is_whitespace))
+        .unwrap_or_else(|| {
+            format!("{e:?}")
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join("_")
+        })
+}
+
 /// Route the media element `media_id` through an analyser. A media element
 /// can be routed once, so the caller keeps the tap for the element's life.
 ///
@@ -4213,7 +4294,7 @@ pub fn audio_tap(media_id: &str) -> Result<Box<dyn super::visualiser::AudioTap>,
     analyser
         .connect_with_audio_node(&context.destination())
         .map_err(js)?;
-    let _ = context.resume();
+    report_tap_start(&context);
     TAPS.with(|taps| {
         taps.borrow_mut().push(TapNodes {
             media: media.clone(),
