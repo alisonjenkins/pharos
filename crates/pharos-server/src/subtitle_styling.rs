@@ -420,6 +420,8 @@ struct Report {
     signals_stale: Option<&'static str>,
     /// Lines per bottom-text verdict, `verdict=n` (B1207).
     bottom_text: String,
+    /// Lines passed through as signs in their own style (B1208).
+    signs: usize,
 }
 
 /// A stored signal pass: the windows it measured and what it found.
@@ -916,6 +918,7 @@ impl<S: JobStore, A: Signals, Q: TranscodeQueue> Styler<S, A, Q> {
             .map(|(i, n)| format!("{}={n}", i.label()))
             .collect::<Vec<_>>()
             .join(" ");
+        report.signs = parsed.lines.iter().filter(|l| l.typeset).count();
         report.bottom_text = direction
             .bottom_text
             .iter()
@@ -1121,6 +1124,7 @@ impl<S: JobStore, A: Signals, Q: TranscodeQueue> Styler<S, A, Q> {
                     dialogue_spread_lu = report.loudness.and_then(|l| l.spread_lu),
                     loudness_scale = report.loudness.map(|l| l.scale),
                     bottom_text = %report.bottom_text,
+                    signs = report.signs,
                     outcome = ended.outcome.label(),
                     stage = ended.stage.label(),
                     error = ended.error.as_deref(),
