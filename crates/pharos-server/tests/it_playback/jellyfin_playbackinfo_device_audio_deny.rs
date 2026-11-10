@@ -283,3 +283,70 @@ async fn a_saved_aac_entry_is_ignored_and_does_not_block_the_next_save() {
     let body = serde_json::json!({ "NoDirectPlayAudioCodecs": next }).to_string();
     assert_eq!(set_options(&fx, "tv", &body).await, StatusCode::NO_CONTENT);
 }
+
+/// A user who is not an admin manages the devices they are signed in on, and
+/// only those: the list shows them alone, and another user's device is
+/// refused with nothing written (ADR-0095).
+#[actix_web::test]
+async fn a_user_manages_the_devices_they_are_signed_in_on_and_no_others() {
+    let fx = setup().await;
+    let auth = BuiltinAuth::new(fx.state.stores.clone());
+    let hash = auth.hash_password(&SecretString::new("q")).unwrap();
+    let jana = UserId::new();
+    fx.state
+        .stores
+        .create(UserRecord {
+            id: jana,
+            name: "jana".into(),
+            password_hash: hash,
+            policy: UserPolicy::default(),
+        })
+        .await
+        .unwrap();
+    let phone = fx.state.stores.issue(jana, "phone").await.unwrap();
+    let phone = phone.0.expose().to_string();
+
+    let set = |device: &'static str, body: &'static str| {
+        test::TestRequest::post()
+            .uri(&format!("/Devices/Options?id={device}"))
+            .insert_header(("content-type", "application/json"))
+            .set_payload(body)
+    };
+    assert_eq!(
+        call(&fx, set("phone", r#"{"NoDirectPlayAudioCodecs":["eac3"]}"#), &phone)
+            .await
+            .0,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        call(&fx, set("tv", r#"{"NoDirectPlayAudioCodecs":["dts"]}"#), &phone)
+            .await
+            .0,
+        StatusCode::FORBIDDEN
+    );
+    assert!(
+        device(&devices(&fx).await, "tv")
+            .get("NoDirectPlayAudioCodecs")
+            .is_none(),
+        "the refused body wrote nothing"
+    );
+
+    let (status, mine) = call(&fx, test::TestRequest::get().uri("/Devices"), &phone).await;
+    assert_eq!(status, StatusCode::OK);
+    let ids: Vec<&str> = mine["Items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|d| d["Id"].as_str())
+        .collect();
+    assert_eq!(ids, ["phone"], "{mine}");
+    assert_eq!(
+        device(&mine, "phone")["NoDirectPlayAudioCodecs"],
+        serde_json::json!(["eac3"])
+    );
+    // The admin's list still has every device, the phone's setting included.
+    assert_eq!(
+        device(&devices(&fx).await, "phone")["NoDirectPlayAudioCodecs"],
+        serde_json::json!(["eac3"])
+    );
+}
