@@ -1981,6 +1981,10 @@ const TV_MATCH_VERSION_KEY: &str = "tv_match_version";
 /// than every pass.
 const TV_MATCH_SURVEY_DRY_RUN_KEY: &str = "tv_match_survey_dry_run";
 
+/// Key recording the [`dry_run_marker`] whose survey `apply` has run, so a
+/// survey revision bump re-runs it under a matcher version already recorded.
+const TV_MATCH_SURVEY_APPLIED_KEY: &str = "tv_match_survey_applied";
+
 /// Bump when [`survey_series_identity`] selects differently, so the next
 /// dry run surveys again under the same matcher version. `apply` records
 /// only [`TV_MATCH_VERSION`]. r2: B982/B983 run window. r3: B984 date 0,
@@ -2004,8 +2008,9 @@ fn dry_run_marker(version: &str) -> String {
 /// again (V940), and only under `series_identity_repair = "apply"`, which
 /// then records the new version. A dry run logs and counts the selection once
 /// per version and leaves the version key alone, so switching to `"apply"`
-/// still runs it. NFO and manual matches are not touched. One or two config
-/// reads per pass once settled.
+/// still runs it. `apply` records the survey revision it ran beside the
+/// version, and surveys again when [`SURVEY_REVISION`] moves. NFO and manual
+/// matches are not touched. One or two config reads per pass once settled.
 async fn readmit_stale_tv_matches<Tv, Tm, S>(
     store: &S,
     providers: &SeriesProviders<'_, Tv, Tm>,
@@ -2023,11 +2028,23 @@ where
     let config =
         |e: pharos_store_sqlx::StoreError| pharos_core::DomainError::Backend(e.to_string());
     let want = TV_MATCH_VERSION.to_string();
+    let marker = dry_run_marker(&want);
+    let mode = cfg.series_identity_repair;
     let have = store
         .load_named_config(TV_MATCH_VERSION_KEY)
         .await
         .map_err(config)?;
-    if have.as_deref() == Some(want.as_str()) {
+    // B990 — under `apply` a recorded version is settled only once this
+    // survey revision ran too, so a revision bump re-asks what it now finds.
+    if have.as_deref() == Some(want.as_str())
+        && (mode == RepairMode::DryRun
+            || store
+                .load_named_config(TV_MATCH_SURVEY_APPLIED_KEY)
+                .await
+                .map_err(config)?
+                .as_deref()
+                == Some(marker.as_str()))
+    {
         return Ok(());
     }
     let Some(from) = have else {
@@ -2038,13 +2055,16 @@ where
             to = want.as_str(),
             "T9 metadata backfill: show matcher version changed, re-matching searched shows and episodes"
         );
+        // Every searched show is asked again, so no survey is owed.
+        store
+            .set_named_config(TV_MATCH_SURVEY_APPLIED_KEY, &marker)
+            .await
+            .map_err(config)?;
         return store
             .set_named_config(TV_MATCH_VERSION_KEY, &want)
             .await
             .map_err(config);
     };
-    let mode = cfg.series_identity_repair;
-    let marker = dry_run_marker(&want);
     if mode == RepairMode::DryRun
         && store
             .load_named_config(TV_MATCH_SURVEY_DRY_RUN_KEY)
@@ -2081,6 +2101,10 @@ where
         to = want.as_str(),
         "series identity repair: show matcher version changed, re-asking the surveyed shows"
     );
+    store
+        .set_named_config(TV_MATCH_SURVEY_APPLIED_KEY, &marker)
+        .await
+        .map_err(config)?;
     store
         .set_named_config(TV_MATCH_VERSION_KEY, &want)
         .await
@@ -8902,5 +8926,51 @@ mod tests {
             .find(|l| l.contains("re-ask left the show flagged: only too-short candidates"))
             .unwrap_or_else(|| panic!("no flagged line in {text}"));
         assert!(line.contains(MINI_ID), "{line}");
+    }
+
+    /// B990 — `apply` surveys again when the survey revision moved under the
+    /// matcher version it already recorded (an install that applied before
+    /// the applied marker existed, or under another revision), and not
+    /// while the marker is current.
+    #[tokio::test(flavor = "current_thread")]
+    async fn apply_surveys_again_after_a_survey_revision_bump() {
+        let s = store().await;
+        const SHOW: &str = "/tv/Show A";
+        put_show_episode(&s, 1, SHOW, (1, 1), "Show A (2003)").await;
+        async fn stale_pin(s: &SqliteStore) {
+            pin(s, SHOW, "920010", NOW).await;
+            let mut row = series_row(s, SHOW).await;
+            // 1978-09-17
+            row.premiere_date = Some(274_838_400);
+            s.upsert_series_metadata(row).await.unwrap();
+        }
+        async fn reasked(s: &SqliteStore) -> bool {
+            !s.series_needing_match(10, NOW - 1)
+                .await
+                .unwrap()
+                .is_empty()
+        }
+        let want = TV_MATCH_VERSION.to_string();
+        let current = dry_run_marker(&want);
+        let tvdb = FakeEnricher::tvdb();
+
+        for stale in [None, Some("2.r1")] {
+            stale_pin(&s).await;
+            set_version(&s, TV_MATCH_VERSION_KEY, &want).await;
+            if let Some(m) = stale {
+                set_version(&s, TV_MATCH_SURVEY_APPLIED_KEY, m).await;
+            }
+            gate(&s, &tvdb, &apply_cfg()).await;
+            assert!(reasked(&s).await, "marker {stale:?} was not re-surveyed");
+            assert_eq!(
+                version(&s, TV_MATCH_SURVEY_APPLIED_KEY).await,
+                Some(current.clone())
+            );
+        }
+
+        stale_pin(&s).await;
+        gate(&s, &tvdb, &apply_cfg()).await;
+        assert!(!reasked(&s).await, "a current marker surveys nothing");
+        assert_eq!(version(&s, TV_MATCH_VERSION_KEY).await, Some(want));
     }
 }
