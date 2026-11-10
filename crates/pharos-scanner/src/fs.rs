@@ -6126,6 +6126,8 @@ mod tests {
         // Overwrite the file with these bytes while it is being probed, as a
         // concurrent writer would.
         rewrite_during: Option<(String, Vec<u8>)>,
+        // Every probe reports this duration.
+        duration_ms: Option<u64>,
     }
 
     impl Prober for FakeProber {
@@ -6164,6 +6166,7 @@ mod tests {
                         None
                     },
                     synopsis: self.synopsis.clone(),
+                    duration_ms: self.duration_ms,
                     ..Default::default()
                 },
             })
@@ -8701,7 +8704,10 @@ mod tests {
         )
         .await;
         let store = MemStore::default();
-        let scanner = FsScanner::new(FakeProber::default());
+        let scanner = FsScanner::new(FakeProber {
+            duration_ms: Some(60_000),
+            ..Default::default()
+        });
         scanner.scan_into(td.path(), &store).await.unwrap();
         assert_eq!(
             store.inner.lock().unwrap().len(),
