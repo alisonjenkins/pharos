@@ -366,6 +366,22 @@ input:focus-visible {
 /* B1314/V1285: with room for it (a desktop, a TV), the brand, the library
    tabs and the search and links share one row, so the page starts a row
    higher. A narrower screen keeps them on rows of their own. */
+/* B1314: on a phone the brand is the mark alone (the name stays for screen
+   readers), so the mark, Favourites, Together and the account fit one row
+   instead of wrapping the account to a row of its own. */
+@media (max-width: 40rem) {
+  .pharos-shell .pharos-lockup span {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
+  }
+}
 @media (min-width: 64rem) {
   .pharos-shell {
     display: grid;
@@ -7232,7 +7248,11 @@ body:has(.pharos-reader) {
   flex: none;
 }
 :root[data-device="tv"] .pharos-shell .pharos-search {
-  flex-basis: 10rem;
+  flex-basis: 7rem;
+  min-width: 6rem;
+}
+:root[data-device="tv"] .pharos-shell .pharos-shell-nav {
+  gap: 0.75rem;
 }
 :root[data-device="tv"] .pharos-shell .pharos-crumbs {
   grid-column: 1 / -1;
