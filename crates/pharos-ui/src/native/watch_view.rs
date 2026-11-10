@@ -1230,7 +1230,7 @@ pub fn WatchView(
                             class: "pharos-control pharos-shrink",
                             r#type: "button",
                             "data-key-action": "shrink",
-                            aria_label: "Shrink",
+                            aria_label: "Small window",
                             title: "Shrink to a small window",
                             onclick: move |_| on_control.call(Control::Shrink),
                             Icon { path: ICON_FLOAT }
@@ -3091,7 +3091,7 @@ mod tests {
         let row = html
             .find(r#"class="pharos-control-row""#)
             .expect("control row");
-        let shrink = html.find(r#"aria-label="Shrink""#).expect("shrink");
+        let shrink = html.find(r#"aria-label="Small window""#).expect("shrink");
         let fullscreen = html.find(r#"aria-label="Fullscreen""#).expect("fullscreen");
         assert!(top < row && row < shrink && shrink < fullscreen, "{html}");
         let between = &html[shrink + 1..fullscreen];
