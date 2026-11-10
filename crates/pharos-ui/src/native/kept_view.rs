@@ -129,6 +129,7 @@ mod tests {
             locator: None,
             fraction: 0.0,
             read_at_ms: 0,
+            opened_ms: 0,
         }
     }
 

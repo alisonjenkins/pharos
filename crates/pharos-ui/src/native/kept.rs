@@ -68,18 +68,39 @@ impl KeptFormat {
     }
 }
 
-/// Why a book is on the device. Slice 4 adds the automatic reasons.
+/// Why a book is on the device. A book kept by hand stays `Hand` however
+/// often it is opened.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Reason {
     Hand,
+    /// "Keep the book I'm reading": while open and for a week after.
+    Reading,
+    /// "Keep my last N books".
+    Recent,
 }
 
 impl Reason {
     pub fn label(self) -> &'static str {
         match self {
             Self::Hand => "kept by hand",
+            Self::Reading => "reading now",
+            Self::Recent => "recent",
         }
+    }
+
+    /// The word the record and the log use.
+    pub fn word(self) -> &'static str {
+        match self {
+            Self::Hand => "hand",
+            Self::Reading => "reading",
+            Self::Recent => "recent",
+        }
+    }
+
+    /// Whether the device may remove the book to make room.
+    pub fn is_automatic(self) -> bool {
+        self != Self::Hand
     }
 }
 
@@ -104,6 +125,11 @@ pub struct KeptBook {
     /// as the save queue stamps its entries.
     #[serde(default)]
     pub read_at_ms: i64,
+    /// When the book was last opened, unix milliseconds on this device's
+    /// clock; what expiry and "oldest first" go by. 0 when never opened
+    /// since it was kept.
+    #[serde(default)]
+    pub opened_ms: i64,
 }
 
 impl KeptBook {
@@ -181,6 +207,20 @@ impl KeptStore {
         true
     }
 
+    /// Notes that the book was opened at `now_ms`, and why it is kept now
+    /// when an automatic policy applies: a book kept by hand stays so.
+    /// Returns whether the book is kept.
+    pub fn note_open(&mut self, id: &str, now_ms: i64, reason: Option<Reason>) -> bool {
+        let Some(book) = self.books.iter_mut().find(|b| b.id == id) else {
+            return false;
+        };
+        book.opened_ms = now_ms;
+        if let (true, Some(reason)) = (book.reason.is_automatic(), reason) {
+            book.reason = reason;
+        }
+        true
+    }
+
     pub fn total_bytes(&self) -> u64 {
         self.books
             .iter()
@@ -252,6 +292,195 @@ pub fn keep_refusal(bytes: u64, cap: Option<u64>) -> Option<String> {
     })
 }
 
+/// Where the automatic-keeping settings are, in `localStorage`. Per
+/// device, never synced: what is kept is per device too (spec 036).
+pub const SETTINGS_KEY: &str = "pharos.kept.settings";
+
+/// How long a book stays "reading now" after it was last opened.
+pub const READING_KEEP_MS: i64 = 7 * 24 * 60 * 60 * 1000;
+
+/// The most books "Keep my last N books" can hold.
+pub const MAX_LAST_N: u8 = 10;
+
+/// The choices for the space automatic books may take, in MiB.
+pub const BUDGET_CHOICES_MIB: [u32; 5] = [128, 256, 512, 1024, 2048];
+
+const DEFAULT_BUDGET_MIB: u32 = 512;
+const DEFAULT_LAST_N: u8 = 3;
+
+/// The settings of automatic keeping (spec 036, Decisions). Read on every
+/// book open and every opening of the list, so a change applies without a
+/// reload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AutoKeep {
+    /// Keep the book I'm reading.
+    pub reading: bool,
+    /// Keep my last N books.
+    pub recent: bool,
+    pub last_n: u8,
+    /// The space automatic books may take together, in MiB.
+    pub budget_mib: u32,
+}
+
+impl Default for AutoKeep {
+    fn default() -> Self {
+        Self {
+            reading: true,
+            recent: false,
+            last_n: DEFAULT_LAST_N,
+            budget_mib: DEFAULT_BUDGET_MIB,
+        }
+    }
+}
+
+impl AutoKeep {
+    /// The stored text, or the defaults when there is none or it is damaged.
+    /// Values out of range are brought into it.
+    pub fn parse(text: Option<&str>) -> Self {
+        let read: Self = text
+            .and_then(|t| serde_json::from_str(t).ok())
+            .unwrap_or_default();
+        Self {
+            last_n: read.last_n.clamp(1, MAX_LAST_N),
+            budget_mib: if read.budget_mib == 0 {
+                DEFAULT_BUDGET_MIB
+            } else {
+                read.budget_mib
+            },
+            ..read
+        }
+    }
+
+    pub fn to_text(self) -> Option<String> {
+        serde_json::to_string(&self).ok()
+    }
+
+    pub fn budget_bytes(&self) -> u64 {
+        u64::from(self.budget_mib).saturating_mul(1024 * 1024)
+    }
+
+    /// Why a book opened now is kept, if a policy keeps it. Reading wins
+    /// when both are on: every book opened in the last week is kept as
+    /// reading, and the last-N rule covers only books kept while it was the
+    /// one on.
+    pub fn reason_on_open(&self) -> Option<Reason> {
+        if self.reading {
+            Some(Reason::Reading)
+        } else if self.recent {
+            Some(Reason::Recent)
+        } else {
+            None
+        }
+    }
+}
+
+/// Why an automatic book is not worth writing, or `None` when it is. The
+/// weak-device cap applies to every kept book; a book bigger than the whole
+/// budget would be removed the moment it was kept.
+pub fn auto_keep_skip(bytes: u64, cap: Option<u64>, settings: &AutoKeep) -> Option<&'static str> {
+    if cap.is_some_and(|cap| bytes > cap) {
+        Some("over the device cap")
+    } else if bytes > settings.budget_bytes() {
+        Some("over the space budget")
+    } else {
+        None
+    }
+}
+
+/// Why the device removes an automatic book.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Why {
+    /// The policy that kept it is off now (FR-009).
+    PolicyOff,
+    /// Reading now, and not opened for a week.
+    Expired,
+    /// Recent, and beyond the last N.
+    BeyondLast,
+    /// Over the space for automatic books, and among the oldest opened.
+    OverBudget,
+}
+
+impl Why {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::PolicyOff => "policy-off",
+            Self::Expired => "expired",
+            Self::BeyondLast => "beyond-last",
+            Self::OverBudget => "over-budget",
+        }
+    }
+}
+
+/// One book to remove, and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Eviction {
+    pub id: String,
+    pub why: Why,
+    pub bytes: u64,
+}
+
+/// The automatic books to remove now. Books kept by hand are never in it and
+/// do not count toward the budget. Reading-now books expire a week after
+/// they were last opened; recent books beyond the last N go, then the
+/// automatic books left are removed oldest-opened first while their total
+/// is over the budget. A policy that is off removes the books it kept.
+pub fn plan_eviction(books: &[KeptBook], settings: &AutoKeep, now_ms: i64) -> Vec<Eviction> {
+    let mut gone = Vec::new();
+    let mut left: Vec<&KeptBook> = Vec::new();
+    for book in books {
+        let why = match book.reason {
+            Reason::Hand => continue,
+            Reason::Reading if !settings.reading => Some(Why::PolicyOff),
+            Reason::Reading if now_ms.saturating_sub(book.opened_ms) > READING_KEEP_MS => {
+                Some(Why::Expired)
+            }
+            Reason::Recent if !settings.recent => Some(Why::PolicyOff),
+            Reason::Reading | Reason::Recent => None,
+        };
+        match why {
+            Some(why) => gone.push(Eviction {
+                id: book.id.clone(),
+                why,
+                bytes: book.bytes,
+            }),
+            None => left.push(book),
+        }
+    }
+    left.sort_by_key(|b| std::cmp::Reverse(b.opened_ms));
+    let mut within_last = 0_usize;
+    left.retain(|book| {
+        if book.reason != Reason::Recent {
+            return true;
+        }
+        within_last = within_last.saturating_add(1);
+        if within_last <= usize::from(settings.last_n) {
+            return true;
+        }
+        gone.push(Eviction {
+            id: book.id.clone(),
+            why: Why::BeyondLast,
+            bytes: book.bytes,
+        });
+        false
+    });
+    let mut total = left
+        .iter()
+        .fold(0_u64, |sum, b| sum.saturating_add(b.bytes));
+    let budget = settings.budget_bytes();
+    // `left` is newest-opened first, so the oldest are at the back.
+    while total > budget {
+        let Some(book) = left.pop() else { break };
+        total = total.saturating_sub(book.bytes);
+        gone.push(Eviction {
+            id: book.id.clone(),
+            why: Why::OverBudget,
+            bytes: book.bytes,
+        });
+    }
+    gone
+}
+
 /// A size for people: whole MB above 10 MB, a decimal below, kB under 1 MB.
 pub fn size_label(bytes: u64) -> String {
     const KB: f64 = 1024.0;
@@ -295,6 +524,7 @@ mod tests {
             locator: None,
             fraction: 0.0,
             read_at_ms: 0,
+            opened_ms: 0,
         }
     }
 
@@ -559,5 +789,305 @@ mod tests {
     #[test]
     fn the_reason_reads_as_the_spec_words_it() {
         assert_eq!(Reason::Hand.label(), "kept by hand");
+        assert_eq!(Reason::Reading.label(), "reading now");
+        assert_eq!(Reason::Recent.label(), "recent");
+        assert_eq!(Reason::Reading.word(), "reading");
+    }
+
+    #[test]
+    fn the_reasons_are_stored_as_words() {
+        let mut store = KeptStore::new("u");
+        store.keep(KeptBook {
+            reason: Reason::Reading,
+            ..book("1", 10)
+        });
+        store.keep(KeptBook {
+            reason: Reason::Recent,
+            ..book("2", 10)
+        });
+        let text = store.to_text().unwrap();
+        assert!(text.contains(r#""reason":"reading""#), "{text}");
+        assert!(text.contains(r#""reason":"recent""#), "{text}");
+        assert_eq!(KeptStore::parse(&text), Ok(Some(store)));
+    }
+
+    #[test]
+    fn a_record_without_an_open_time_reads_as_never_opened() {
+        let text = r#"{"user":"u","books":[{"id":"1","title":"T","format":"epub","bytes":5,
+            "kept_at":"2026-11-10T09:00:00Z","reason":"hand"}]}"#;
+        let store = KeptStore::parse(text).unwrap().unwrap();
+        assert_eq!(store.books[0].opened_ms, 0);
+    }
+
+    #[test]
+    fn opening_notes_the_time_and_only_an_automatic_book_changes_its_reason() {
+        let mut store = KeptStore::new("u");
+        store.keep(book("hand", 10));
+        store.keep(auto("rec", Reason::Recent, 10, 1));
+        assert!(store.note_open("hand", 500, Some(Reason::Reading)));
+        assert!(store.note_open("rec", 600, Some(Reason::Reading)));
+        assert_eq!(store.find("hand").unwrap().reason, Reason::Hand);
+        assert_eq!(store.find("hand").unwrap().opened_ms, 500);
+        assert_eq!(store.find("rec").unwrap().reason, Reason::Reading);
+        assert!(store.note_open("rec", 700, None));
+        assert_eq!(store.find("rec").unwrap().reason, Reason::Reading);
+        assert_eq!(store.find("rec").unwrap().opened_ms, 700);
+        assert!(!store.note_open("missing", 1, None));
+    }
+
+    #[test]
+    fn the_defaults_keep_the_book_being_read_and_nothing_else() {
+        let s = AutoKeep::default();
+        assert!(s.reading && !s.recent);
+        assert_eq!((s.last_n, s.budget_mib), (3, 512));
+        assert_eq!(s.budget_bytes(), 512 * MIB);
+        assert_eq!(s.reason_on_open(), Some(Reason::Reading));
+        assert!(BUDGET_CHOICES_MIB.contains(&s.budget_mib));
+    }
+
+    #[test]
+    fn the_reason_a_book_is_kept_on_open_follows_the_policies() {
+        let both = AutoKeep {
+            recent: true,
+            ..AutoKeep::default()
+        };
+        assert_eq!(both.reason_on_open(), Some(Reason::Reading));
+        let only_recent = AutoKeep {
+            reading: false,
+            recent: true,
+            ..AutoKeep::default()
+        };
+        assert_eq!(only_recent.reason_on_open(), Some(Reason::Recent));
+        let neither = AutoKeep {
+            reading: false,
+            ..AutoKeep::default()
+        };
+        assert_eq!(neither.reason_on_open(), None);
+    }
+
+    #[test]
+    fn the_settings_round_trip_and_a_missing_or_damaged_value_is_the_defaults() {
+        let s = AutoKeep {
+            reading: false,
+            recent: true,
+            last_n: 7,
+            budget_mib: 2048,
+        };
+        let text = s.to_text().unwrap();
+        assert_eq!(AutoKeep::parse(Some(&text)), s);
+        assert_eq!(AutoKeep::parse(None), AutoKeep::default());
+        assert_eq!(AutoKeep::parse(Some("{")), AutoKeep::default());
+        assert_eq!(
+            AutoKeep::parse(Some(r#"{"recent":true}"#)),
+            AutoKeep {
+                recent: true,
+                ..AutoKeep::default()
+            }
+        );
+    }
+
+    #[test]
+    fn a_count_or_budget_out_of_range_is_brought_in() {
+        let low = AutoKeep::parse(Some(r#"{"last_n":0,"budget_mib":0}"#));
+        assert_eq!((low.last_n, low.budget_mib), (1, 512));
+        let high = AutoKeep::parse(Some(r#"{"last_n":99}"#));
+        assert_eq!(high.last_n, MAX_LAST_N);
+    }
+
+    #[test]
+    fn a_book_over_the_cap_or_the_whole_budget_is_not_worth_writing() {
+        let s = AutoKeep {
+            budget_mib: 128,
+            ..AutoKeep::default()
+        };
+        assert_eq!(auto_keep_skip(10 * MIB, Some(64 * MIB), &s), None);
+        assert_eq!(auto_keep_skip(10 * MIB, None, &s), None);
+        assert_eq!(
+            auto_keep_skip(65 * MIB, Some(64 * MIB), &s),
+            Some("over the device cap")
+        );
+        assert_eq!(
+            auto_keep_skip(129 * MIB, None, &s),
+            Some("over the space budget")
+        );
+        assert_eq!(auto_keep_skip(128 * MIB, None, &s), None);
+    }
+
+    const MIB: u64 = 1024 * 1024;
+    const DAY_MS: i64 = 24 * 60 * 60 * 1000;
+    const NOW: i64 = 100 * DAY_MS;
+
+    fn auto(id: &str, reason: Reason, bytes: u64, opened_ms: i64) -> KeptBook {
+        KeptBook {
+            reason,
+            opened_ms,
+            ..book(id, bytes)
+        }
+    }
+
+    fn plan(books: &[KeptBook], settings: &AutoKeep) -> Vec<(String, Why)> {
+        plan_eviction(books, settings, NOW)
+            .into_iter()
+            .map(|e| (e.id, e.why))
+            .collect()
+    }
+
+    fn on(reading: bool, recent: bool) -> AutoKeep {
+        AutoKeep {
+            reading,
+            recent,
+            last_n: 2,
+            budget_mib: 512,
+        }
+    }
+
+    #[test]
+    fn nothing_kept_or_only_fresh_books_within_budget_removes_nothing() {
+        assert!(plan(&[], &on(true, true)).is_empty());
+        let books = [
+            auto("1", Reason::Reading, MIB, NOW - DAY_MS),
+            auto("2", Reason::Recent, MIB, NOW - 2 * DAY_MS),
+        ];
+        assert!(plan(&books, &on(true, true)).is_empty());
+    }
+
+    #[test]
+    fn a_reading_book_expires_a_week_after_it_was_last_opened() {
+        let s = on(true, false);
+        let books = [
+            auto("edge", Reason::Reading, MIB, NOW - READING_KEEP_MS),
+            auto("old", Reason::Reading, MIB, NOW - READING_KEEP_MS - 1),
+        ];
+        assert_eq!(plan(&books, &s), [("old".to_owned(), Why::Expired)]);
+    }
+
+    #[test]
+    fn a_recent_book_does_not_expire_by_age() {
+        let books = [auto("1", Reason::Recent, MIB, NOW - 90 * DAY_MS)];
+        assert!(plan(&books, &on(false, true)).is_empty());
+    }
+
+    #[test]
+    fn recent_books_beyond_the_last_n_go_and_the_newest_opened_stay() {
+        let books = [
+            auto("a", Reason::Recent, MIB, NOW - 3000),
+            auto("b", Reason::Recent, MIB, NOW - 1000),
+            auto("c", Reason::Recent, MIB, NOW - 2000),
+        ];
+        assert_eq!(
+            plan(&books, &on(false, true)),
+            [("a".to_owned(), Why::BeyondLast)]
+        );
+    }
+
+    #[test]
+    fn reading_books_are_not_counted_against_the_last_n() {
+        let books = [
+            auto("r1", Reason::Reading, MIB, NOW - 10),
+            auto("r2", Reason::Reading, MIB, NOW - 20),
+            auto("c1", Reason::Recent, MIB, NOW - 30),
+            auto("c2", Reason::Recent, MIB, NOW - 40),
+        ];
+        assert!(plan(&books, &on(true, true)).is_empty());
+    }
+
+    #[test]
+    fn turning_a_policy_off_removes_exactly_the_books_it_kept() {
+        let books = [
+            auto("r", Reason::Reading, MIB, NOW - 10),
+            auto("c", Reason::Recent, MIB, NOW - 20),
+            book("h", MIB),
+        ];
+        assert_eq!(
+            plan(&books, &on(false, true)),
+            [("r".to_owned(), Why::PolicyOff)]
+        );
+        assert_eq!(
+            plan(&books, &on(true, false)),
+            [("c".to_owned(), Why::PolicyOff)]
+        );
+        assert_eq!(
+            plan(&books, &on(false, false)),
+            [
+                ("r".to_owned(), Why::PolicyOff),
+                ("c".to_owned(), Why::PolicyOff)
+            ]
+        );
+    }
+
+    #[test]
+    fn over_the_budget_the_oldest_opened_automatic_book_goes_first() {
+        let s = AutoKeep {
+            budget_mib: 128,
+            ..on(true, true)
+        };
+        let books = [
+            auto("mid", Reason::Reading, 60 * MIB, NOW - 2000),
+            auto("new", Reason::Recent, 60 * MIB, NOW - 1000),
+            auto("old", Reason::Reading, 60 * MIB, NOW - 3000),
+        ];
+        assert_eq!(plan(&books, &s), [("old".to_owned(), Why::OverBudget)]);
+        let tight = AutoKeep {
+            budget_mib: 100,
+            ..s
+        };
+        assert_eq!(
+            plan(&books, &tight),
+            [
+                ("old".to_owned(), Why::OverBudget),
+                ("mid".to_owned(), Why::OverBudget)
+            ]
+        );
+    }
+
+    #[test]
+    fn exactly_the_budget_is_within_it() {
+        let s = AutoKeep {
+            budget_mib: 128,
+            ..on(true, false)
+        };
+        let books = [
+            auto("1", Reason::Reading, 64 * MIB, NOW - 1),
+            auto("2", Reason::Reading, 64 * MIB, NOW - 2),
+        ];
+        assert!(plan(&books, &s).is_empty());
+    }
+
+    #[test]
+    fn books_kept_by_hand_are_never_removed_and_take_no_budget() {
+        let s = AutoKeep {
+            budget_mib: 128,
+            ..on(true, true)
+        };
+        let books = [
+            book("big-hand", 2000 * MIB),
+            auto("auto", Reason::Reading, 100 * MIB, NOW - 1),
+        ];
+        assert!(plan(&books, &s).is_empty());
+        assert!(plan(&books, &on(false, false))
+            .iter()
+            .all(|(id, _)| id != "big-hand"));
+    }
+
+    #[test]
+    fn a_book_removed_for_one_reason_does_not_also_count_against_the_budget() {
+        let s = AutoKeep {
+            budget_mib: 128,
+            ..on(true, false)
+        };
+        let books = [
+            auto("expired", Reason::Reading, 100 * MIB, NOW - 8 * DAY_MS),
+            auto("fresh", Reason::Reading, 100 * MIB, NOW - 1),
+        ];
+        assert_eq!(plan(&books, &s), [("expired".to_owned(), Why::Expired)]);
+    }
+
+    #[test]
+    fn an_eviction_says_the_bytes_it_frees() {
+        let books = [auto("1", Reason::Reading, 5 * MIB, NOW - 8 * DAY_MS)];
+        let out = plan_eviction(&books, &on(true, false), NOW);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].bytes, 5 * MIB);
+        assert_eq!(Why::Expired.label(), "expired");
     }
 }
