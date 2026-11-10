@@ -29,7 +29,6 @@ pub(crate) fn events(line: &SourceLine, fx: &LineEffect, theme: &Theme, tier: Ti
     let (an, x, y) = anchor(theme, names::GIGGLE, fx.placement);
     let size = theme.style(names::GIGGLE).map_or(76, |s| s.size) as f32;
     let half = (words.chars().count() as f32 * HALF_ADVANCE_PER_PT * size) as i32;
-    let fs = (BUBBLE_FS as f32 * theme.tag_scale).round() as u32;
     let at = format!("\\an{an}\\pos({x},{y})");
     // A bubble leaves the line's left (`side` -1) or right (1) end, a little
     // above its middle, and floats up and outwards, tilting as it goes.
@@ -38,7 +37,7 @@ pub(crate) fn events(line: &SourceLine, fx: &LineEffect, theme: &Theme, tier: Ti
         let (x0, y0) = (x + side * (half + 12), y - (size * 0.6) as i32);
         let tilt = side * 12;
         let tags = format!(
-            "\\an5\\move({x0},{y0},{},{},0,{RISE_MS})\\fs{fs}\\1c{colour}\\alpha&H30&\\frz{}{extra}{}",
+            "\\an5\\move({x0},{y0},{},{},0,{RISE_MS})\\fs{BUBBLE_FS}\\1c{colour}\\alpha&H30&\\frz{}{extra}{}",
             x0 + side * DRIFT,
             y0 - RISE,
             -tilt / 2,
@@ -122,5 +121,27 @@ mod tests {
             assert!(b.end_ms <= b.start_ms + super::RISE_MS);
         }
         assert_eq!(evs[1].start_ms, evs[0].start_ms + super::STAGGER_MS);
+    }
+
+    /// The compiler scales inline sizes to the viewer's subtitle size; the
+    /// effect must not scale them a second time.
+    #[test]
+    fn the_bubble_is_scaled_once() {
+        use crate::plan::{EffectPlan, EffectsLevel};
+        use crate::theme::Theme;
+        let l = line("(laughs)");
+        let mut f = EffectPlan {
+            director_version: 0,
+            lines: vec![fx(Intent::Laugh, 1)],
+        };
+        f.lines[0].line = 0;
+        let ass = crate::compile(
+            &f,
+            &[l],
+            &Theme::pharos().scaled(150),
+            Tier::Tv,
+            EffectsLevel::Full,
+        );
+        assert!(ass.contains("\\fs81"), "{ass}");
     }
 }
