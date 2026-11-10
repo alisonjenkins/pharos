@@ -3026,9 +3026,25 @@ impl MediaProbe {
         parts
     }
 
-    /// Convert duration_ms → Jellyfin's 100-ns ticks (10_000 ticks / ms).
+    /// How long the item plays, in ms: its file's duration, and for a split
+    /// film every part's too (V1155).
+    pub fn run_time_ms(&self) -> Option<u64> {
+        let rest: u64 = self
+            .parts()
+            .iter()
+            .filter_map(|p| {
+                p.probe
+                    .as_ref()
+                    .and_then(|p| p.duration_ms)
+                    .or(p.duration_ms)
+            })
+            .sum();
+        self.duration_ms.map(|ms| ms.saturating_add(rest))
+    }
+
+    /// [`Self::run_time_ms`] in Jellyfin's 100-ns ticks (10_000 ticks / ms).
     pub fn run_time_ticks(&self) -> Option<u64> {
-        self.duration_ms.map(|ms| ms.saturating_mul(10_000))
+        self.run_time_ms().map(|ms| ms.saturating_mul(10_000))
     }
 
     /// P13 — derive the Jellyfin `VideoRange` discriminator (`"HDR"`
