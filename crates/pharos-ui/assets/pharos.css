@@ -4505,7 +4505,9 @@ body::before {
    shrink to ~9 a row and three rails share a screen; no text drops below
    12 CSS px (24 device px), the ten-foot floor. */
 :root[data-device="tv"] .pharos-banner {
-  padding: 20px 48px 0.6rem;
+  /* The top stays at the 27px title-safe inset above; only the bottom
+     tightens. */
+  padding: 27px 48px 0.6rem;
 }
 :root[data-device="tv"] .pharos-library-nav {
   margin-top: 0.4rem;
