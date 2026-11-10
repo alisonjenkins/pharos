@@ -23,6 +23,8 @@ pub enum StopOutcome {
     Finished,
     /// The stop named no item, so there was nothing to store.
     NoItem,
+    /// The item was removed since it started playing.
+    ItemMissing,
     /// The item could not be read, so its runtime is unknown.
     ItemReadFailed,
     /// The user's stored play state could not be read.
@@ -32,10 +34,11 @@ pub enum StopOutcome {
 }
 
 impl StopOutcome {
-    pub const ALL: [StopOutcome; 6] = [
+    pub const ALL: [StopOutcome; 7] = [
         StopOutcome::Saved,
         StopOutcome::Finished,
         StopOutcome::NoItem,
+        StopOutcome::ItemMissing,
         StopOutcome::ItemReadFailed,
         StopOutcome::UserDataReadFailed,
         StopOutcome::UserDataWriteFailed,
@@ -47,6 +50,7 @@ impl StopOutcome {
             StopOutcome::Saved => ("saved", "position"),
             StopOutcome::Finished => ("finished", "past_threshold"),
             StopOutcome::NoItem => ("skipped", "no_item"),
+            StopOutcome::ItemMissing => ("skipped", "item_missing"),
             StopOutcome::ItemReadFailed => ("store_error", "item_read"),
             StopOutcome::UserDataReadFailed => ("store_error", "user_data_read"),
             StopOutcome::UserDataWriteFailed => ("store_error", "user_data_write"),
@@ -308,15 +312,15 @@ pub async fn stop(state: &AppState, user: &User, r: Report<'_>) -> Result<(), Re
         return Ok(());
     };
     let position = r.position_ticks;
-    // The stop below is this session's final write; a report still
-    // held for it is older and must not follow it into the database.
-    state
-        .progress_writes
-        .forget(&ProgressKey::new(user.id, item_id, r.play_session_id));
+    let progress_key = ProgressKey::new(user.id, item_id, r.play_session_id);
     let runtime = match state.stores.get(item_id).await {
         Ok(item) => item.probe.run_time_ticks().unwrap_or(0),
-        // Removed since it started playing: its position is still kept.
-        Err(pharos_core::DomainError::NotFound(_)) => 0,
+        // Removed since it started playing: there is no row to store on.
+        Err(pharos_core::DomainError::NotFound(_)) => {
+            StopOutcome::ItemMissing.record();
+            state.progress_writes.forget(&progress_key);
+            return Ok(());
+        }
         Err(error) => {
             StopOutcome::ItemReadFailed.record();
             tracing::warn!(%error, item = item_id, position, "playback stop: item read failed, nothing stored");
@@ -358,6 +362,10 @@ pub async fn stop(state: &AppState, user: &User, r: Report<'_>) -> Result<(), Re
     }
     match state.stores.set_user_data(user.id, item_id, data).await {
         Ok(()) => {
+            // The stop is this session's final write; a report still held
+            // for it is older. On a failed stop it stays held, so the
+            // background flush still saves the last reported position.
+            state.progress_writes.forget(&progress_key);
             if finished {
                 StopOutcome::Finished.record();
             } else {
