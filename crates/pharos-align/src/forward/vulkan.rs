@@ -64,9 +64,8 @@ struct FeConv {
 
 struct Layer {
     ln1: Norm,
-    q: Linear,
-    k: Linear,
-    v: Linear,
+    /// q, k and v stacked on the output axis.
+    qkv: Linear,
     o: Linear,
     ln2: Norm,
     f1: Linear,
@@ -102,15 +101,40 @@ impl VulkanModel {
                 beta: t1(&format!("{p}.bias"), n)?,
             })
         };
+        // Transposed on the host, so the GPU holds a contiguous [din, dout]
+        // and each matmul reads it in order rather than through a strided view.
+        let host_t = |w: &[f32], dout: usize, din: usize| -> Vec<f32> {
+            let mut t = vec![0f32; w.len()];
+            for o in 0..dout {
+                for i in 0..din {
+                    t[i * dout + o] = w[o * din + i];
+                }
+            }
+            t
+        };
         let linear = |p: &str, dout: usize, din: usize| -> Result<Linear, WeightsError> {
-            let w: Tensor<2> = tensor(
-                weights.get(&format!("{p}.weight"), &[dout, din])?,
-                [dout, din],
-                dev,
-            );
+            let w = weights.get(&format!("{p}.weight"), &[dout, din])?;
             Ok(Linear {
-                wt: w.transpose().unsqueeze::<3>(),
+                wt: tensor(&host_t(w, dout, din), [1, din, dout], dev),
                 b: t1(&format!("{p}.bias"), dout)?,
+            })
+        };
+        // q, k and v as one [D, 3D] matmul, as the CPU pass fuses them.
+        let qkv = |p: &str| -> Result<Linear, WeightsError> {
+            let mut wt = vec![0f32; D * 3 * D];
+            let mut b = Vec::with_capacity(3 * D);
+            for (j, n) in ["q_proj", "k_proj", "v_proj"].iter().enumerate() {
+                let w = weights.get(&format!("{p}.attention.{n}.weight"), &[D, D])?;
+                for o in 0..D {
+                    for i in 0..D {
+                        wt[i * 3 * D + j * D + o] = w[o * D + i];
+                    }
+                }
+                b.extend_from_slice(weights.get(&format!("{p}.attention.{n}.bias"), &[D])?);
+            }
+            Ok(Linear {
+                wt: tensor(&wt, [1, D, 3 * D], dev),
+                b: tensor(&b, [3 * D], dev),
             })
         };
         let fe = FE
@@ -138,9 +162,7 @@ impl VulkanModel {
                 let p = format!("encoder.transformer.layers.{l}");
                 Ok(Layer {
                     ln1: ln(&format!("{p}.layer_norm"), D)?,
-                    q: linear(&format!("{p}.attention.q_proj"), D, D)?,
-                    k: linear(&format!("{p}.attention.k_proj"), D, D)?,
-                    v: linear(&format!("{p}.attention.v_proj"), D, D)?,
+                    qkv: qkv(&p)?,
                     o: linear(&format!("{p}.attention.out_proj"), D, D)?,
                     ln2: ln(&format!("{p}.final_layer_norm"), D)?,
                     f1: linear(&format!("{p}.feed_forward.intermediate_dense"), FF, D)?,
@@ -195,10 +217,11 @@ impl VulkanModel {
         let heads = |y: Tensor<3>| y.reshape([1, t, HEADS, HD]).swap_dims(1, 2);
         for l in &self.layers {
             let h = l.ln1.apply(x.clone());
+            let qkv = l.qkv.apply(h);
             let a = attention(
-                heads(l.q.apply(h.clone())),
-                heads(l.k.apply(h.clone())),
-                heads(l.v.apply(h)),
+                heads(qkv.clone().narrow(2, 0, D)),
+                heads(qkv.clone().narrow(2, D, D)),
+                heads(qkv.narrow(2, 2 * D, D)),
                 None,
                 None,
                 AttentionModuleOptions::default(),
