@@ -1728,7 +1728,8 @@ addEventListener("keydown", (e) => {
 // focus; on the player itself Left and Right still seek. Taken here, before
 // the player's handler hears them. Not the volume slider: it would keep
 // Left and Right for itself, and the remote has volume keys.
-// A control scrolled out of a panel (a lyrics line) is no stop.
+// A control scrolled out of a panel is no stop, nor is a lyrics line: the
+// panel follows the song, so a walk down its lines never left it.
 const inPanels = (el, player, r) => {
   for (let p = el.parentElement; p && p !== player; p = p.parentElement) {
     if (getComputedStyle(p).overflowY === "visible") continue;
@@ -1741,7 +1742,7 @@ const controlsIn = (player) => [...player.querySelectorAll(
   "button:not([disabled]), select:not([disabled]), a[href]"
 )].filter((el) => {
   const r = el.getBoundingClientRect();
-  return r.width > 0 && r.height > 0 && inPanels(el, player, r);
+  return r.width > 0 && r.height > 0 && !el.matches('__REMOTE_SKIPS__') && inPanels(el, player, r);
 });
 const nearest = (from, els, key) => {
   const f = from.getBoundingClientRect();

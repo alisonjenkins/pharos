@@ -262,6 +262,11 @@ pub const REMOTE_PLAYERS: &str = "#pharos-player, .pharos-stage.is-full .pharos-
 /// or the music screen's play button.
 pub const PLAYER_HOME: &str = ".pharos-control-row button, .pharos-listen-play";
 
+/// Controls in a remote player that the arrows pass over: the lyrics
+/// panel's lines, which scroll with the song under a remote walking down
+/// them, so Down never reached the transport (B1034).
+pub const REMOTE_SKIPS: &str = ".pharos-lyrics-line";
+
 /// The bridge script `template` with its tick intervals and player
 /// selectors filled in.
 pub fn bridge_script(template: &str) -> String {
@@ -270,6 +275,7 @@ pub fn bridge_script(template: &str) -> String {
         .replace("__AUDIO_TICK_MS__", &AUDIO_TICK_MS.to_string())
         .replace("__REMOTE_PLAYERS__", REMOTE_PLAYERS)
         .replace("__PLAYER_HOME__", PLAYER_HOME)
+        .replace("__REMOTE_SKIPS__", REMOTE_SKIPS)
 }
 
 /// The container list a TV build declares: one no file has, so the server
@@ -630,6 +636,7 @@ mod tests {
             "the compact music screen is the stage bar's"
         );
         assert!(PLAYER_HOME.split(", ").any(|s| s == ".pharos-listen-play"));
+        assert!(!bridge_script("__REMOTE_SKIPS__").contains("__"));
     }
 
     #[test]
