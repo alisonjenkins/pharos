@@ -873,3 +873,62 @@ async fn a_problem_report_round_trips_through_the_client() {
     api.delete_report(&call, &id).await.expect("delete");
     assert!(api.list_reports(&call, false).await.unwrap().is_empty());
 }
+
+/// B1086: a listing with `collapse` comes back with a box set's films as one
+/// collection tile, and without it as the films.
+/// Disarm check: with the client's query writer not sending
+/// `collapseCollections`, the tile is missing.
+#[actix_web::test]
+async fn a_collapsed_listing_shows_a_box_set_as_one_tile() {
+    use pharos_client::api::{ItemKind, Listing};
+    use pharos_core::{CollectionStore as _, MediaItem, MediaKind};
+
+    let (api, fx, _server) = api().await;
+    for (id, title) in [(321, "Part One"), (322, "Part Two")] {
+        pharos_core::MediaStore::put(
+            &fx.state.stores,
+            MediaItem {
+                id,
+                path: format!("/libA/{title}.mkv").into(),
+                title: title.into(),
+                kind: MediaKind::Movie,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    }
+    pharos_core::LibraryStore::backfill_library_ids(&fx.state.stores)
+        .await
+        .unwrap();
+    fx.state
+        .stores
+        .create_collection("The Parts", &[321, 322])
+        .await
+        .unwrap();
+    let call = CallInfo::default();
+    let library = api.home(&call).await.expect("home").rails[0].library.id;
+    let mut listing = Listing::of(library, None, "SortName");
+    let kinds = |page: &pharos_client::api::Page| -> Vec<(String, ItemKind)> {
+        page.items
+            .iter()
+            .filter(|i| i.name.starts_with("Part") || i.name == "The Parts")
+            .map(|i| (i.name.clone(), i.kind))
+            .collect()
+    };
+    let films = api.query(&call, &listing, 0, 50).await.expect("films");
+    assert_eq!(
+        kinds(&films),
+        [
+            ("Part One".to_owned(), ItemKind::Movie),
+            ("Part Two".to_owned(), ItemKind::Movie)
+        ]
+    );
+    listing.collapse = true;
+    let grouped = api.query(&call, &listing, 0, 50).await.expect("grouped");
+    assert_eq!(
+        kinds(&grouped),
+        [("The Parts".to_owned(), ItemKind::Collection)]
+    );
+    assert_eq!(grouped.total, films.total - 1);
+}
