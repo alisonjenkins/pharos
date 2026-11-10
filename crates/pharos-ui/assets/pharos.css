@@ -5067,8 +5067,9 @@ body::before {
 }
 /* The TV draws no queue buttons over an album's cover: they sat inside the
    tile, so the remote's Down landed on them and OK queued the album instead
-   of opening it (B1322, V1293). The album page offers both. */
-:root[data-device="tv"] .pharos-queue-buttons[data-target="album_card"] {
+   of opening it (B1322, V1293). The album page offers both. The note stays,
+   for a queue key pressed on a TV browser. */
+:root[data-device="tv"] .pharos-queue-buttons[data-target="album_card"] .pharos-queue-button {
   display: none;
 }
 
