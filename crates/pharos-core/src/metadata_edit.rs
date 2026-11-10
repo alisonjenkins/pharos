@@ -501,12 +501,12 @@ mod tests {
     #[test]
     fn normalising_trims_clears_blanks_and_dedups_genres() {
         let edit = MetadataEdit {
-            title: Some("  Alien  ".into()),
+            title: Some("  Film AX  ".into()),
             tagline: Some(Some("   ".into())),
             ..Default::default()
         };
         let n = edit.normalised(&EditTarget::Item(1)).unwrap();
-        assert_eq!(n.title.as_deref(), Some("Alien"));
+        assert_eq!(n.title.as_deref(), Some("Film AX"));
         assert_eq!(n.tagline, Some(None));
         let show = EditTarget::Series {
             key: "k".into(),
