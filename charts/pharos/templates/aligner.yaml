@@ -1,53 +1,70 @@
-{{- if .Values.aligner.enabled }}
-# pharos-aligner (ADR-0066): word times for karaoke by forced alignment. The
-# server sends it a song's path under the media mount, so both pods mount the
-# same media at the same path.
+{{- /*
+One aligner Deployment and its Service. Called with a dict: `root` (the
+chart context), `suffix` (the name after the release's fullname), `cfg` (the
+aligner values) and `component`.
+*/ -}}
+{{- define "pharos.aligner.workload" -}}
+{{- $root := .root }}
+{{- $cfg := .cfg }}
+{{- $name := printf "%s-%s" (include "pharos.fullname" $root) .suffix }}
+{{- $selector := include "pharos.aligner.selectorLabels" $root }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: {{ include "pharos.fullname" . }}-aligner
+  name: {{ $name }}
   labels:
-    {{- include "pharos.labels" . | nindent 4 }}
-    app.kubernetes.io/component: aligner
+    {{- include "pharos.labels" $root | nindent 4 }}
+    app.kubernetes.io/component: {{ .component }}
 spec:
   replicas: 1
   selector:
     matchLabels:
-      {{- include "pharos.aligner.selectorLabels" . | nindent 6 }}
+      {{- $selector | nindent 6 }}
   template:
     metadata:
       labels:
-        {{- include "pharos.aligner.selectorLabels" . | nindent 8 }}
+        {{- $selector | nindent 8 }}
     spec:
-      {{- with .Values.pullSecrets }}
+      {{- with $root.Values.pullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       securityContext:
-        {{- toYaml .Values.podSecurityContext | nindent 8 }}
-      {{- with .Values.nodeSelector }}
+        {{- $psc := deepCopy $root.Values.podSecurityContext }}
+        {{- if and $cfg.gpu.enabled $cfg.gpu.supplementalGroups }}
+        {{- /* The render node's group, so the non-root user may open it. */}}
+        {{- $_ := set $psc "supplementalGroups" $cfg.gpu.supplementalGroups }}
+        {{- end }}
+        {{- toYaml $psc | nindent 8 }}
+      {{- with $root.Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       containers:
         - name: aligner
-          image: "{{ .Values.aligner.image.repository }}:{{ required "aligner.image.tag is required when aligner.enabled" .Values.aligner.image.tag }}"
-          imagePullPolicy: {{ .Values.aligner.image.pullPolicy }}
+          image: "{{ $cfg.image.repository }}:{{ required (printf "%s image.tag is required when it is enabled" .suffix) $cfg.image.tag }}"
+          imagePullPolicy: {{ $cfg.image.pullPolicy }}
           env:
             - name: PHAROS_ALIGNER_MEDIA_ROOT
               value: /var/lib/pharos/media
             - name: PHAROS_ALIGNER_LISTEN
-              value: "0.0.0.0:{{ .Values.aligner.port }}"
-            {{- if .Values.config.obs.otlpEndpoint }}
+              value: "0.0.0.0:{{ $root.Values.aligner.port }}"
+            {{- with $cfg.device }}
+            # Spec 039, R10: auto, vulkan or cpu. The Python image ignores it.
+            - name: PHAROS_ALIGNER_DEVICE
+              value: {{ . | quote }}
+            {{- end }}
+            {{- if $root.Values.config.obs.otlpEndpoint }}
             # ADR-0105: the aligner's spans join the server's trace in Tempo.
             - name: PHAROS_ALIGNER_OTLP_ENDPOINT
-              value: {{ .Values.config.obs.otlpEndpoint | quote }}
+              value: {{ $root.Values.config.obs.otlpEndpoint | quote }}
             {{- end }}
           ports:
             - name: http
-              containerPort: {{ .Values.aligner.port }}
+              containerPort: {{ $root.Values.aligner.port }}
               protocol: TCP
-          # The model loads at start; /healthz answers once it is serving.
+          # /healthz answers once the model is serving; the Rust image warms
+          # every GPU window length first (10 s on a kept cache, ~40 s cold).
           readinessProbe:
             httpGet:
               path: /healthz
@@ -61,35 +78,77 @@ spec:
             periodSeconds: 30
             failureThreshold: 5
           securityContext:
-            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+            {{- toYaml $root.Values.containerSecurityContext | nindent 12 }}
           resources:
-            {{- toYaml .Values.aligner.resources | nindent 12 }}
+            {{- $res := deepCopy $cfg.resources }}
+            {{- if $cfg.gpu.enabled }}
+            {{- /* The render node from the device plugin, merged into the limits. */}}
+            {{- $limits := default dict $res.limits }}
+            {{- $_ := set $limits $cfg.gpu.resourceName $cfg.gpu.count }}
+            {{- $_ := set $res "limits" $limits }}
+            {{- end }}
+            {{- toYaml $res | nindent 12 }}
           volumeMounts:
             - name: media
               mountPath: /var/lib/pharos/media
               readOnly: true
             - name: tmp
               mountPath: /tmp
+            {{- if $cfg.cache.enabled }}
+            - name: kernel-cache
+              mountPath: /var/cache/pharos-aligner
+            {{- end }}
       volumes:
         - name: media
-          {{- include "pharos.mediaVolume" . | trim | nindent 10 }}
+          {{- include "pharos.mediaVolume" $root | trim | nindent 10 }}
         - name: tmp
           emptyDir: {}
+        {{- if $cfg.cache.enabled }}
+        # Spec 039, R14: compiled GPU kernels, kept across restarts.
+        - name: kernel-cache
+          persistentVolumeClaim:
+            claimName: {{ $name }}-cache
+        {{- end }}
 ---
 apiVersion: v1
 kind: Service
 metadata:
-  name: {{ include "pharos.fullname" . }}-aligner
+  name: {{ $name }}
   labels:
-    {{- include "pharos.labels" . | nindent 4 }}
-    app.kubernetes.io/component: aligner
+    {{- include "pharos.labels" $root | nindent 4 }}
+    app.kubernetes.io/component: {{ .component }}
 spec:
   type: ClusterIP
   selector:
-    {{- include "pharos.aligner.selectorLabels" . | nindent 4 }}
+    {{- $selector | nindent 4 }}
   ports:
     - name: http
-      port: {{ .Values.aligner.port }}
+      port: {{ $root.Values.aligner.port }}
       targetPort: http
       protocol: TCP
+{{- if $cfg.cache.enabled }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ $name }}-cache
+  labels:
+    {{- include "pharos.labels" $root | nindent 4 }}
+    app.kubernetes.io/component: {{ .component }}
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: {{ $cfg.cache.size | quote }}
+  {{- with $cfg.cache.storageClass }}
+  storageClassName: {{ . | quote }}
+  {{- end }}
+{{- end }}
+{{- end -}}
+
+{{- if .Values.aligner.enabled }}
+# pharos-aligner (ADR-0066, spec 039): word times for karaoke by forced
+# alignment. The server sends it a song's path under the media mount, so both
+# pods mount the same media at the same path.
+{{ include "pharos.aligner.workload" (dict "root" . "suffix" "aligner" "cfg" .Values.aligner "component" "aligner") }}
 {{- end }}
