@@ -419,11 +419,30 @@ struct Report {
 }
 
 /// A stored signal pass: the windows it measured and what it found.
-/// `keyframes_ms` is dropped before storing; the director uses `cuts_ms`.
-#[derive(serde::Serialize, serde::Deserialize)]
+/// `keyframes_ms` is stored empty; the director uses `cuts_ms`.
+#[derive(serde::Deserialize)]
 struct StoredSignals {
     windows: Vec<(u64, u64)>,
     signals: SubtitleSignals,
+}
+
+/// [`StoredSignals`] borrowed, for writing it without copying the pass.
+#[derive(serde::Serialize)]
+struct StoredSignalsRef<'a> {
+    windows: &'a [(u64, u64)],
+    signals: SignalsRef<'a>,
+}
+
+/// [`SubtitleSignals`] field for field, borrowed, without the keyframes.
+#[derive(serde::Serialize)]
+struct SignalsRef<'a> {
+    lines: &'a [pharos_transcode::subtitle_signals::LineSignals],
+    keyframes_ms: [u64; 0],
+    cuts_ms: &'a [u64],
+    audio_stream: Option<u32>,
+    channel: pharos_transcode::subtitle_signals::ChannelPick,
+    analysed_seconds: f32,
+    read_errors: u32,
 }
 
 /// Where an item's signals came from.
@@ -844,7 +863,7 @@ impl<S: JobStore, A: Signals, Q: TranscodeQueue> Styler<S, A, Q> {
                     report.analysed_s = Some(s.analysed_seconds);
                     // A pass that skipped audio may do better next time.
                     if s.read_errors == 0 {
-                        self.store_signals(task, windows, &s).await;
+                        self.store_signals(task, &windows, &s).await;
                     }
                 }
                 s
@@ -969,10 +988,20 @@ impl<S: JobStore, A: Signals, Q: TranscodeQueue> Styler<S, A, Q> {
 
     /// Keep a fresh signal pass for the next re-direct. A failure costs only
     /// a later re-measure, so it is logged and the item goes on.
-    async fn store_signals(&self, task: &Task, windows: Vec<(u64, u64)>, s: &SubtitleSignals) {
-        let mut signals = s.clone();
-        signals.keyframes_ms = Vec::new();
-        let json = match serde_json::to_string(&StoredSignals { windows, signals }) {
+    async fn store_signals(&self, task: &Task, windows: &[(u64, u64)], s: &SubtitleSignals) {
+        let stored = StoredSignalsRef {
+            windows,
+            signals: SignalsRef {
+                lines: &s.lines,
+                keyframes_ms: [],
+                cuts_ms: &s.cuts_ms,
+                audio_stream: s.audio_stream,
+                channel: s.channel,
+                analysed_seconds: s.analysed_seconds,
+                read_errors: s.read_errors,
+            },
+        };
+        let json = match serde_json::to_string(&stored) {
             Ok(j) => j,
             Err(e) => {
                 tracing::warn!(item = task.item.id, error = %e, "subtitle styling: signals not stored (serialise)");
