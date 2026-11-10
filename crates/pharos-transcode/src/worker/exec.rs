@@ -162,7 +162,7 @@ const WINDOW_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 /// ffprobe. `None` when that cannot be told: a job with no bounded window, or
 /// an ffprobe that failed.
 ///
-/// A title's audio can outrun its video by minutes (Dragon Ball S01E05: video
+/// A title's audio can outrun its video by minutes (Silver Rock S01E05: video
 /// ends at 1244 s, the second audio track at 1350 s), and the segment grid
 /// follows the container duration, so the tail windows hold no picture.
 pub async fn window_has_video(spec: &JobSpec) -> Option<bool> {
@@ -602,7 +602,7 @@ mod tests {
     async fn a_window_past_the_end_of_the_video_has_no_video() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("short.mkv");
-        // 2 s of picture under 6 s of sound: the Dragon Ball shape.
+        // 2 s of picture under 6 s of sound: the Silver Rock shape.
         let status = tokio::process::Command::new(ffmpeg_bin())
             .args([
                 "-hide_banner",
