@@ -228,6 +228,25 @@ fn eases(lines: &[SourceLine]) -> Vec<Ease> {
     // Sorted by start, a line shares the screen with an earlier line when it
     // starts before the latest end so far, and with a later one when the next
     // line starts before it ends.
+    // A sign on screen counts too: an eased line is positioned, so libass
+    // would no longer move it out of the sign's way.
+    let mut signs: Vec<(i64, i64)> = lines
+        .iter()
+        .filter(|l| l.typeset && l.end_ms > l.start_ms)
+        .map(|l| (l.start_ms, l.end_ms))
+        .collect();
+    signs.sort_unstable();
+    let sign_reach: Vec<i64> = signs
+        .iter()
+        .scan(i64::MIN, |reach, &(_, end)| {
+            *reach = (*reach).max(end);
+            Some(*reach)
+        })
+        .collect();
+    let under_sign = |l: &SourceLine| {
+        let n = signs.partition_point(|&(start, _)| start < l.end_ms);
+        n > 0 && sign_reach[n - 1] > l.start_ms
+    };
     let mut alone = Vec::with_capacity(order.len());
     let mut latest_end = i64::MIN;
     for (k, &i) in order.iter().enumerate() {
@@ -235,7 +254,7 @@ fn eases(lines: &[SourceLine]) -> Vec<Ease> {
         let after = order
             .get(k + 1)
             .map_or(true, |&j| lines[j].start_ms >= l.end_ms);
-        alone.push(l.start_ms >= latest_end && after);
+        alone.push(l.start_ms >= latest_end && after && !under_sign(l));
         latest_end = latest_end.max(l.end_ms);
     }
     for k in 1..order.len() {
@@ -550,6 +569,21 @@ mod tests {
             let ass = run(&plan, &lines, tier, EffectsLevel::Full);
             assert_eq!(crate::budget::check(&ass, tier), Ok(()), "{tier:?}");
         }
+    }
+
+    /// A sign on screen keeps a line from easing: the eased line would be
+    /// positioned and drawn over the sign instead of moved clear of it.
+    #[test]
+    fn a_line_under_a_sign_does_not_ease() {
+        let mut lines = source::read(CLOSE).unwrap().lines;
+        let mut sign = lines[1].clone();
+        (sign.start_ms, sign.end_ms, sign.typeset) = (2_200, 2_800, true);
+        lines.push(sign);
+        let flags: Vec<(bool, bool)> = eases(&lines)[..3]
+            .iter()
+            .map(|e| (e.into, e.out_of))
+            .collect();
+        assert_eq!(flags, [(false, false), (false, false), (false, false)]);
     }
 
     #[test]
