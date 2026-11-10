@@ -121,10 +121,11 @@ impl End {
 }
 
 /// The log line a preview's end writes, so a scrub can be followed in the
-/// TV's logs: where it started and ended, how, after how many presses.
+/// TV's logs: where it started and ended, how, after how many presses, and
+/// what drove it (`input=remote` for the D-pad).
 pub fn end_line(s: &Scrub, end: End, now: f64) -> String {
     format!(
-        "pharos: scrub {} from {} ms to {} ms after {} presses in {} ms",
+        "pharos: scrub {} input=remote from {} ms to {} ms after {} presses in {} ms",
         end.label(),
         s.origin_ms,
         s.target_ms,
@@ -268,7 +269,7 @@ mod tests {
         let s = press(Some(s), true, false, 60_000, HOUR, 1_000.0);
         let line = end_line(&s, End::Cancelled, 1_900.0);
         assert_eq!(
-            line, "pharos: scrub cancelled from 60000 ms to 80000 ms after 2 presses in 1900 ms",
+            line, "pharos: scrub cancelled input=remote from 60000 ms to 80000 ms after 2 presses in 1900 ms",
             "the time is the whole preview's, not the last hold's"
         );
         let labels = [End::Settled, End::Confirmed, End::Cancelled].map(End::label);
