@@ -256,7 +256,10 @@ the series wire id.
    fields, so clearing `metadata_refreshed_at` alone would keep the wrong title,
    plot and air date. Reconciliation runs against the newly stored match and is
    retried on later passes until it completes; the pending marker clears only
-   when it has. The rebuild re-runs the local resolver (NFO ▸ sidecar ▸
+   when it has, or when the pinned show's provider answers that it has no
+   record of the episode (B991): the mark then clears, the episode keeps its
+   local text, and it is read again only by the metadata TTL or a hand
+   re-match, never by every pass. The rebuild re-runs the local resolver (NFO ▸ sidecar ▸
    filename) with the rejected NFO set aside, which resets the provider-derived
    fields (title, overview, premiere date, community rating, provider ids, the
    episode still) to what local evidence alone says, then enriches from the
@@ -404,7 +407,10 @@ these):
   `reason` ∈ `match_changed | key_changed` (a row the split moved), with `|= "series identity repair: show match
   changed"`; `pharos_series_reconcile_pending{mode}` is the backlog, which
   `apply` drains to 0 and `dry_run` leaves standing; each rebuild logs
-  `|= "series identity repair: episode rebuilt"`.
+  `|= "series identity repair: episode rebuilt"`;
+  `sum by (outcome) (increase(pharos_series_reconcile_total[1d]))`,
+  `outcome` ∈ `rebuilt | retry | deferred | no_record`, where `no_record`
+  also logs `|= "pinned show has no record of the episode"` once per episode.
 
 After deploy, success is: the dry-run lines list Show B → 2004 (the 2004
 series' provider id), Show A split into its 1990 and 2014 groups, and episode
