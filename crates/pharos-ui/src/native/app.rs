@@ -43,8 +43,8 @@ use super::playback::{
     rust_subtitle_url, shown_font_urls, source_of_styled, start_ms, starting_tier,
     starting_tier_line, styled_subtitle_signals, styled_subtitle_url, styled_track_url,
     subtitle_switch, tier_drop_line, tier_drop_report, tier_spared_line, up_next_at, up_next_pill,
-    volume_setting, DeviceClass, EffectsLevel, Engine, EngineReason, FailureKind, Fatal,
-    LibraryTransition, MediaEvent, MediaState, MseEngine, OnFatal, OnFragment, Outgoing,
+    volume_setting, DeviceClass, EffectsDetail, EffectsLevel, Engine, EngineReason, FailureKind,
+    Fatal, LibraryTransition, MediaEvent, MediaState, MseEngine, OnFatal, OnFragment, Outgoing,
     OverlayEffect, PlaybackEngine, RendererFrames, ReportClock, SubtitleSize, SubtitleSwitch, Tier,
     TierDrop, TierVerdict, UpNext, UpNextStep, CROSSFADE_KEY, EFFECTS_LEVEL_KEY,
     LIBRARY_TRANSITION_KEY, MAX_BITRATE_KEY, MSE_ENGINE_KEY, OVERLAY_EFFECT_KEY,
@@ -969,12 +969,14 @@ fn current_starting_tier() -> Tier {
     let device = this_device();
     let reduced_motion = platform::prefers(REDUCED_MOTION);
     let remembered = stored_tier_drop();
-    let tier = starting_tier(device, reduced_motion, remembered);
+    let detail = EffectsDetail::Auto;
+    let tier = starting_tier(device, reduced_motion, remembered, detail);
     platform::info(&starting_tier_line(
         tier,
         device,
         reduced_motion,
         remembered,
+        detail,
     ));
     tier
 }
