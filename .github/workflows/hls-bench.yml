@@ -1,0 +1,67 @@
+name: hls-bench
+# Spec 031 T031-17: hls.js and the Rust HLS engine on the same seeded stream,
+# in Chromium and Firefox, compared in the job summary. The JSON runs are
+# kept as an artifact so a regression can be read against earlier ones.
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "crates/pharos-hls/**"
+      - "crates/pharos-ui/src/native/hls_web.rs"
+      - "crates/pharos-ui/src/native/hls_trace.rs"
+      - "crates/pharos-ui/src/native/playback.rs"
+      - "compat-playwright/tests/dioxus/hls-bench.spec.ts"
+      - "compat-playwright/playwright.hls-bench.config.ts"
+      - "compat-playwright/tools/hls-bench-compare.cjs"
+      - ".github/workflows/hls-bench.yml"
+  push:
+    branches: [main]
+    paths:
+      - "crates/pharos-hls/**"
+      - "crates/pharos-ui/src/native/hls_web.rs"
+      - "crates/pharos-ui/src/native/hls_trace.rs"
+      - "crates/pharos-ui/src/native/playback.rs"
+      - "compat-playwright/tests/dioxus/hls-bench.spec.ts"
+      - "compat-playwright/playwright.hls-bench.config.ts"
+      - "compat-playwright/tools/hls-bench-compare.cjs"
+      - ".github/workflows/hls-bench.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hls-bench-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  bench:
+    name: HLS engine comparison
+    runs-on: pharos-nix-builder-amd64
+    timeout-minutes: 60
+    # Like syncplay-e2e: feature PRs are measured inside a batch/ PR, and never
+    # for a fork, whose code would run on the home runner.
+    if: github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && (startsWith(github.head_ref, 'batch/') || startsWith(github.head_ref, 'release-please--')))
+    steps:
+      - uses: actions/checkout@v7
+      - uses: alisonjenkins/setup-host-nix@v1.0.1
+        with:
+          max-jobs: 2
+          cores: 16
+      - name: npm install
+        run: nix develop --command bash -c 'cd compat-playwright && npm install --no-audit --no-fund'
+      - name: Run the HLS bench
+        env:
+          PHAROS_HLS_BENCH: "1"
+          PHAROS_BENCH_OUT: ${{ github.workspace }}/compat-playwright/test-results/hls-bench
+        run: nix develop --command just compat-dioxus-full on 8096 playwright.hls-bench.config.ts
+      - name: Compare engines
+        if: ${{ !cancelled() }}
+        run: nix develop --command node compat-playwright/tools/hls-bench-compare.cjs compat-playwright/test-results/hls-bench >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload runs
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: hls-bench-${{ github.sha }}
+          path: compat-playwright/test-results
+          if-no-files-found: warn
+          retention-days: 30
