@@ -198,6 +198,7 @@ jobs:
           nix build .#oci            --no-link --print-out-paths
           nix build .#jellyfinWebOci --no-link --print-out-paths
           nix build .#alignerOci     --no-link --print-out-paths
+          nix build .#alignerRsOci   --no-link --print-out-paths
 
   publish:
     name: publish images (ghcr)
@@ -291,6 +292,8 @@ jobs:
           }
           # ADR-0066, the Python aligner.
           publish_by_hash alignerOci ghcr.io/alisonjenkins/pharos-aligner pharos-aligner-oci
+          # Spec 039, the Rust aligner, under its own name until the cutover.
+          publish_by_hash alignerRsOci ghcr.io/alisonjenkins/pharos-aligner-rs pharos-aligner-rs-oci
 
   compat-playwright:
     name: jellyfin-web crawl
