@@ -19,10 +19,10 @@ use wasm_bindgen_futures::JsFuture;
 
 use super::app::{call, this_device, Ctx};
 use super::kept::{
-    book_key, cache_name, is_books_cache, keep_refusal, KeptBook, KeptFormat, KeptStore, Reason,
-    STORE_KEY,
+    book_key, cache_name, is_books_cache, keep_refusal, plan_eviction, AutoKeep, KeptBook,
+    KeptFormat, KeptStore, Reason, Why, SETTINGS_KEY, STORE_KEY,
 };
-use super::kept_view::{KeepControl, KeptList, OfflineView};
+use super::kept_view::{AutoKeepSettings, KeepControl, KeptList, OfflineView};
 use super::platform;
 use super::reader::size_cap;
 
@@ -85,6 +85,67 @@ fn write(store: &KeptStore) {
     });
     if let Err(e) = result {
         platform::warn(&format!("pharos: kept record not saved error={e}"));
+    }
+}
+
+/// Unix milliseconds on this device's clock.
+fn now_ms() -> i64 {
+    js_sys::Date::now() as i64
+}
+
+/// The automatic-keeping settings of this device: read on every book open
+/// and every opening of the list, so a change applies without a reload.
+pub fn settings() -> AutoKeep {
+    let text = local_storage().and_then(|s| s.get_item(SETTINGS_KEY).map_err(|e| describe(&e)));
+    match text {
+        Ok(text) => AutoKeep::parse(text.as_deref()),
+        Err(e) => {
+            platform::warn(&format!("pharos: kept settings unreadable error={e}"));
+            AutoKeep::default()
+        }
+    }
+}
+
+fn save_settings(settings: &AutoKeep) {
+    let result = local_storage().and_then(|s| match settings.to_text() {
+        Some(text) => s.set_item(SETTINGS_KEY, &text).map_err(|e| describe(&e)),
+        None => Err("settings could not be written".to_owned()),
+    });
+    match result {
+        Ok(()) => platform::info(&format!(
+            "pharos: kept settings reading={} recent={} last_n={} budget_mib={}",
+            settings.reading, settings.recent, settings.last_n, settings.budget_mib
+        )),
+        Err(e) => platform::warn(&format!("pharos: kept settings not saved error={e}")),
+    }
+}
+
+/// Removes the automatic books the settings no longer keep: policy turned
+/// off, a week unopened, beyond the last N, over the space. Nothing is read
+/// but the record, and nothing is done when nothing is kept.
+pub async fn enforce(trigger: &str) {
+    let Some(store) = read() else {
+        return;
+    };
+    let settings = settings();
+    for gone in plan_eviction(&store.books, &settings, now_ms()) {
+        match remove(&gone.id).await {
+            Ok(()) if gone.why == Why::Expired => platform::info(&format!(
+                "pharos: kept expire item={} bytes={} trigger={trigger}",
+                gone.id, gone.bytes
+            )),
+            Ok(()) => platform::info(&format!(
+                "pharos: kept evict item={} why={} bytes={} trigger={trigger}",
+                gone.id,
+                gone.why.label(),
+                gone.bytes
+            )),
+            Err(e) => platform::warn(&format!(
+                "pharos: kept evict failed item={} why={} error={e}",
+                gone.id,
+                gone.why.label()
+            )),
+        }
     }
 }
 
@@ -452,6 +513,13 @@ pub fn KeepButton(
 /// The list as a signal the Remove buttons update.
 fn use_store() -> (Signal<KeptStore>, EventHandler<String>) {
     let mut store = use_signal(|| read().unwrap_or_else(|| KeptStore::new("")));
+    // Opening the list is when books a policy no longer keeps go.
+    use_hook(|| {
+        spawn(async move {
+            enforce("list").await;
+            store.set(read().unwrap_or_else(|| KeptStore::new("")));
+        })
+    });
     let on_remove = EventHandler::new(move |id: String| {
         spawn(async move {
             if let Err(e) = remove(&id).await {
@@ -468,12 +536,25 @@ fn use_store() -> (Signal<KeptStore>, EventHandler<String>) {
 #[component]
 pub fn OnThisDevice() -> Element {
     let (store, on_remove) = use_store();
+    let mut auto = use_signal(settings);
     rsx! {
         section { class: "pharos-settings-page pharos-offline-page",
             h2 { "On this device" }
             p { class: "pharos-settings-lede",
                 "Books kept to read with no connection. They are removed when you sign out."
             }
+            h3 { "Keeping books automatically" }
+            p { class: "pharos-setting-help",
+                "These settings are for this device only. Turning one off removes the books it kept the next time the list or a book opens."
+            }
+            AutoKeepSettings {
+                settings: auto(),
+                on_change: move |next: AutoKeep| {
+                    save_settings(&next);
+                    auto.set(next);
+                },
+            }
+            h3 { "Books on this device" }
             KeptList { store: store(), on_remove }
         }
     }
