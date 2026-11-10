@@ -535,7 +535,7 @@ fn cache_key(tag: &[&str], rel: &str, path: &Path, lines: &[(u64, u64, String)])
 /// Parse the aligner service's JSON response, rejecting line count mismatches.
 /// The error names what was wrong, e.g. serde's "missing field `offset_ms`"
 /// from an aligner older than the offset search.
-fn parse_answer(body: &str, n_lines: usize) -> Result<Aligned, String> {
+pub(super) fn parse_answer(body: &str, n_lines: usize) -> Result<Aligned, String> {
     #[derive(Deserialize)]
     struct Reply {
         lines: Vec<ReplyLine>,
