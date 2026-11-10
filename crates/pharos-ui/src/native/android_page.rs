@@ -569,7 +569,34 @@ pub async fn rust_subtitles(
     Err(super::subtitles::FallbackReason::NoWebgl2)
 }
 
-pub fn set_subtitle_controls_visible(_visible: bool) {}
+/// Whether the player's control bar shows, for the styled canvas's lift.
+static STYLED_CONTROLS_VISIBLE: AtomicBool = AtomicBool::new(false);
+
+/// Moves the styled canvas clear of the control bar while it shows (B634),
+/// by the web build's rule; signs are not held still on the TV yet.
+pub fn set_subtitle_controls_visible(visible: bool) {
+    STYLED_CONTROLS_VISIBLE.store(visible, Ordering::Relaxed);
+    lift_styled_subtitles();
+}
+
+fn lift_styled_subtitles() {
+    let measure = page_eval(tv_page::STYLED_LIFT_MEASURE_JS);
+    spawn_detached(async move {
+        let Ok(Some([canvas_bottom, player_bottom, bar_height])) =
+            measure.join::<Option<[f64; 3]>>().await
+        else {
+            return;
+        };
+        let lift = super::subtitles::styled_lift(
+            STYLED_CONTROLS_VISIBLE.load(Ordering::Relaxed),
+            false,
+            canvas_bottom,
+            player_bottom,
+            bar_height,
+        );
+        run(tv_page::styled_lift_set_js(lift));
+    });
+}
 
 pub fn refresh_subtitle_delay(_video_id: &str) {}
 pub fn set_subtitle_delay(_video_id: &str, _delay_ms: i64) {}
@@ -641,6 +668,8 @@ pub async fn styled_subtitles(
         let took_ms = now_ms() - at;
         if answer == "ready" {
             log::info!("pharos: styled subtitles run={id} outcome=ready took_ms={took_ms:.0}");
+            // The canvas is new: give it the lift the bar already has.
+            lift_styled_subtitles();
             report(Ok(()));
         } else {
             let why = answer
