@@ -1334,6 +1334,9 @@ impl SubtitleSize {
 /// [`EffectsLevel::Subtle`].
 pub const EFFECTS_LEVEL_KEY: &str = "pharos.subtitles.effects";
 
+/// Where the viewer's speaker colours switch is kept: `on`, else off.
+pub const SPEAKER_COLOURS_KEY: &str = "pharos.subtitles.speakers";
+
 /// How much motion the styled subtitle track may carry on this device
 /// (spec 028 FR-018).
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -2800,12 +2803,14 @@ pub fn styled_subtitle_url(track: &Track) -> Option<String> {
 /// The URL of a generated styled track's script at `tier`, `level` and the
 /// viewer's subtitle `size` (spec 028 FR-006, FR-022): `None` for any other
 /// track, and for every track while Effects is Off, where the plain track
-/// draws instead. Medium sends no `size`, the server's default.
+/// draws instead. Medium sends no `size`, the server's default, and
+/// `speakers` off sends nothing either.
 pub fn styled_track_url(
     track: &Track,
     tier: Tier,
     level: EffectsLevel,
     size: SubtitleSize,
+    speakers: bool,
 ) -> Option<String> {
     if level == EffectsLevel::Off {
         return None;
@@ -2815,8 +2820,9 @@ pub fn styled_track_url(
         100 => String::new(),
         p => format!("&size={p}"),
     };
+    let speakers = if speakers { "&speakers=1" } else { "" };
     Some(format!(
-        "{url}?tier={}&effects={}{sized}",
+        "{url}?tier={}&effects={}{sized}{speakers}",
         tier.label(),
         level.as_str()
     ))
@@ -4023,7 +4029,8 @@ mod tests {
                 &styled,
                 Tier::Tv,
                 EffectsLevel::Subtle,
-                SubtitleSize::Medium
+                SubtitleSize::Medium,
+                false
             )
             .as_deref(),
             Some("/videos/7/subtitles/3/stream.ass?tier=tv&effects=subtle")
@@ -4033,7 +4040,8 @@ mod tests {
                 &styled,
                 Tier::Desktop,
                 EffectsLevel::Full,
-                SubtitleSize::Medium
+                SubtitleSize::Medium,
+                false
             )
             .as_deref(),
             Some("/videos/7/subtitles/3/stream.ass?tier=desktop&effects=full")
@@ -4044,26 +4052,56 @@ mod tests {
                 &styled,
                 Tier::Tv,
                 EffectsLevel::Subtle,
-                SubtitleSize::ExtraLarge
+                SubtitleSize::ExtraLarge,
+                false
             )
             .as_deref(),
             Some("/videos/7/subtitles/3/stream.ass?tier=tv&effects=subtle&size=150")
         );
         assert_eq!(
-            styled_track_url(&styled, Tier::Tv, EffectsLevel::Subtle, SubtitleSize::Small)
-                .as_deref(),
+            styled_track_url(
+                &styled,
+                Tier::Tv,
+                EffectsLevel::Subtle,
+                SubtitleSize::Small,
+                false
+            )
+            .as_deref(),
             Some("/videos/7/subtitles/3/stream.ass?tier=tv&effects=subtle&size=75")
         );
         assert_eq!(
-            styled_track_url(&styled, Tier::Low, EffectsLevel::Off, SubtitleSize::Large),
+            styled_track_url(
+                &styled,
+                Tier::Low,
+                EffectsLevel::Off,
+                SubtitleSize::Large,
+                false
+            ),
             None
+        );
+        assert_eq!(
+            styled_track_url(
+                &styled,
+                Tier::Tv,
+                EffectsLevel::Subtle,
+                SubtitleSize::Small,
+                true
+            )
+            .as_deref(),
+            Some("/videos/7/subtitles/3/stream.ass?tier=tv&effects=subtle&size=75&speakers=1")
         );
         let source = Track {
             styled_url: None,
             ..styled
         };
         assert_eq!(
-            styled_track_url(&source, Tier::Tv, EffectsLevel::Full, SubtitleSize::Large),
+            styled_track_url(
+                &source,
+                Tier::Tv,
+                EffectsLevel::Full,
+                SubtitleSize::Large,
+                false
+            ),
             None
         );
     }
