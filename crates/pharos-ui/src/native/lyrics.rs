@@ -539,6 +539,14 @@ mod tests {
         dioxus_ssr::render(&dom)
     }
 
+    /// B1034: the TV remote passes over the lyrics lines by their class.
+    #[test]
+    fn the_tv_remote_skips_name_the_lyrics_lines() {
+        let html = render(synced(&[1_000, 3_000]), 1_500);
+        let class = super::super::tv_page::REMOTE_SKIPS.trim_start_matches('.');
+        assert!(html.contains(&format!(r#"class="{class}""#)), "{html}");
+    }
+
     #[test]
     fn synced_lines_mark_past_current_and_next() {
         let html = render(synced(&[1_000, 3_000, 5_000]), 3_500);
