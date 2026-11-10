@@ -5,7 +5,7 @@
 //! `quire` does no layout and touches no DOM; a renderer (such as
 //! `quire-web`) builds the page from [`Section::root`]. Book content is
 //! untrusted: scripts, event handlers, forms, embedded frames, `@import`,
-//! `@font-face` and every URL that would load from outside the book are
+//! `@font-face` with no font inside the book, and every URL that would load from outside the book are
 //! removed before a [`Section`] is handed out.
 //!
 //! ```no_run
@@ -28,7 +28,7 @@ mod section;
 mod xml;
 
 pub use archive::{Archive, ArchiveError, ZipArchive, MAX_ENTRY_BYTES};
-pub use css::Css;
+pub use css::{Css, FontFace};
 pub use epub::{Metadata, OpenError, SpineItem, TocEntry};
 pub use fixed::{page_progress, FixedLayout, FixedLayoutError, PageSize, Raster};
 pub use locator::{char_index, utf16_offset, Locator, PageLocator, ParseLocatorError};
