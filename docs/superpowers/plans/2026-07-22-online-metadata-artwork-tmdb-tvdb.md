@@ -199,17 +199,17 @@ Add to `crates/pharos-store-sqlx/tests/sqlite_store.rs`:
 #[tokio::test]
 async fn set_item_match_persists_and_excludes_from_needing() {
     let store = new_test_store().await;
-    let mut item = sample_movie("Dune"); item.id = 900010;
+    let mut item = sample_movie("Film AU"); item.id = 900010;
     store.put(item.clone()).await.unwrap();
 
     // Before matching, it is eligible.
     let need = store.items_needing_match(10, i64::MAX).await.unwrap();
     assert!(need.iter().any(|i| i.id == 900010));
 
-    store.set_item_match(900010, "tmdb", "438631", "search", Some(0.92), 1_700_000_000).await.unwrap();
+    store.set_item_match(900010, "tmdb", "932001", "search", Some(0.92), 1_700_000_000).await.unwrap();
     let got = store.get(900010).await.unwrap();
     assert_eq!(got.match_provider.as_deref(), Some("tmdb"));
-    assert_eq!(got.match_external_id.as_deref(), Some("438631"));
+    assert_eq!(got.match_external_id.as_deref(), Some("932001"));
     assert_eq!(got.match_source.as_deref(), Some("search"));
     assert_eq!(got.metadata_refreshed_at, Some(1_700_000_000));
 
@@ -459,7 +459,7 @@ fn match_best_year_off_by_one_is_partial_not_zero() {
 #[test]
 fn title_similarity_ignores_case_and_punctuation() {
     assert!(title_similarity("WALL·E", "wall e") > 0.85);
-    assert!(title_similarity("Se7en", "Seven") < 0.9); // not falsely perfect
+    assert!(title_similarity("Fi5e", "Five") < 0.9); // not falsely perfect
 }
 ```
 
@@ -546,7 +546,7 @@ pub fn match_best(
 - [ ] **Step 4: Run tests**
 
 Run: `nix develop --command bash -lc 'cargo nextest run -p pharos-core match_best title_similarity'`
-Expected: PASS. If `title_similarity_ignores_case_and_punctuation`'s `WALL·E` case falls below 0.85, that is acceptable — adjust the assertion threshold to the actual value rather than weakening the algorithm, but keep the `Se7en`/`Seven` inequality.
+Expected: PASS. If `title_similarity_ignores_case_and_punctuation`'s `WALL·E` case falls below 0.85, that is acceptable — adjust the assertion threshold to the actual value rather than weakening the algorithm, but keep the `Fi5e`/`Seven` inequality.
 
 - [ ] **Step 5: Commit**
 ```bash
@@ -600,16 +600,16 @@ TMDB parsing is pure over `serde_json::Value` (like the existing `parse_profile_
 #[test]
 fn tmdb_parse_search_results_yields_candidates() {
     let body = r#"{"results":[
-        {"id":438631,"title":"Dune","release_date":"2021-10-01"},
-        {"id":438632,"title":"Dune Part Two","release_date":"2024-03-01"}]}"#;
+        {"id":932001,"title":"Film AU","release_date":"2021-10-01"},
+        {"id":932002,"title":"Film AU Part Two","release_date":"2024-03-01"}]}"#;
     let c = super::parse_movie_search(body);
     assert_eq!(c.len(), 2);
-    assert_eq!(c[0].id, "438631");
+    assert_eq!(c[0].id, "932001");
     assert_eq!(c[0].year, Some(2021));
 }
 #[test]
 fn tmdb_parse_movie_detail_extracts_overview_genres_art() {
-    let body = r#"{"id":438631,"overview":"A duke's son...","release_date":"2021-10-01",
+    let body = r#"{"id":932001,"overview":"A duke's son...","release_date":"2021-10-01",
         "vote_average":7.8,"genres":[{"name":"Science Fiction"},{"name":"Adventure"}],
         "poster_path":"/p.jpg","backdrop_path":"/b.jpg"}"#;
     let e = super::parse_movie_detail(body).unwrap();
@@ -879,7 +879,7 @@ Mirror in `postgres.rs`. Add a store test:
 #[tokio::test]
 async fn tmdb_primary_artwork_flips_has_primary_art() {
     let store = new_test_store().await;
-    let mut item = sample_movie("Arrival"); item.id = 900020;
+    let mut item = sample_movie("Film BC"); item.id = 900020;
     store.put(item.clone()).await.unwrap();
     store.set_artwork(900020, "Primary", "tmdb", "/cache/primary/movie/900020.jpg").await.unwrap();
     assert!(store.get(900020).await.unwrap().has_primary_art);
@@ -957,10 +957,10 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 #[tokio::test]
 async fn backfill_matches_by_search_and_persists_match_state() {
     let store = InMemoryStores::new();
-    store.put_movie(900100, "Dune (2021)").await;               // no NFO id
+    store.put_movie(900100, "Film AU (2021)").await;               // no NFO id
     let tmdb = FakeEnricher::tmdb()
-        .with_search("Dune", vec![("438631","Dune",Some(2021))])
-        .with_detail("438631", enriched_overview("A duke's son..."));
+        .with_search("Film AU", vec![("932001","Film AU",Some(2021))])
+        .with_detail("932001", enriched_overview("A duke's son..."));
     let cfg = MetadataConfig::default();
     let n = run(&store, &sem(4), &cache(), &Some(tmdb), &None, &cfg).await.unwrap();
     assert_eq!(n, 1);
@@ -1064,7 +1064,7 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 
 **Interfaces:**
 - `GET /items/{id}/remotesearch/movie` and `/items/{id}/remotesearch/series` → JSON array of candidates `[{Name, ProductionYear, ProviderIds:{Tmdb|Tvdb}, ImageUrl?}]`.
-- `POST /items/{id}/remotesearch/apply` body `{"Provider":"tmdb"|"tvdb","Id":"438631"}` → sets `match_source="manual"`, then runs `enrich_one` immediately for that item; returns 204.
+- `POST /items/{id}/remotesearch/apply` body `{"Provider":"tmdb"|"tvdb","Id":"932001"}` → sets `match_source="manual"`, then runs `enrich_one` immediately for that item; returns 204.
 
 - [ ] **Step 1: Write a handler test**
 
