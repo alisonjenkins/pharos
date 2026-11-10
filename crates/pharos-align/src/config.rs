@@ -4,6 +4,8 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use crate::pin::PinMode;
+
 pub const DEFAULT_LISTEN: &str = "0.0.0.0:8790";
 const DEFAULT_PORT: u16 = 8790;
 /// The model holds over a GiB; reloading it costs seconds, so it stays a
@@ -23,6 +25,7 @@ pub struct Config {
     pub idle_unload: Option<Duration>,
     /// The `alignerWeights` output: `weights.bin` and `weights.json`.
     pub weights: PathBuf,
+    pub pin: PinMode,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -92,6 +95,14 @@ impl Config {
             },
         };
 
+        let pin = match set(get("PHAROS_ALIGNER_PIN")) {
+            None => PinMode::Auto,
+            Some(raw) => raw
+                .trim()
+                .parse()
+                .map_err(|()| invalid("PHAROS_ALIGNER_PIN", "auto, on or off", &raw))?,
+        };
+
         Ok(Self {
             media_root: PathBuf::from(media_root),
             host,
@@ -100,6 +111,7 @@ impl Config {
             threads,
             idle_unload,
             weights: PathBuf::from(weights),
+            pin,
         })
     }
 }
@@ -130,6 +142,7 @@ mod tests {
         assert_eq!(c.idle_unload, Some(Duration::from_secs(600)));
         assert_eq!(c.otlp_endpoint, None);
         assert_eq!(c.weights, PathBuf::from("/w"));
+        assert_eq!(c.pin, PinMode::Auto);
     }
 
     #[test]
@@ -141,8 +154,10 @@ mod tests {
             ("PHAROS_ALIGNER_THREADS", "4"),
             ("PHAROS_ALIGNER_IDLE_UNLOAD_SECS", "0"),
             ("PHAROS_ALIGNER_OTLP_ENDPOINT", "http://otel:4317"),
+            ("PHAROS_ALIGNER_PIN", "off"),
         ]))
         .unwrap();
+        assert_eq!(c.pin, PinMode::Off);
         assert_eq!((c.host.as_str(), c.port, c.threads), ("127.0.0.1", 9000, 4));
         assert_eq!(c.idle_unload, None, "0 keeps the model loaded");
         assert_eq!(c.otlp_endpoint.as_deref(), Some("http://otel:4317"));
@@ -205,6 +220,16 @@ mod tests {
         assert_eq!(
             e.to_string(),
             r#"PHAROS_ALIGNER_LISTEN must be host:port, got "h:port""#
+        );
+        let e = Config::from_env(env(&[
+            ("PHAROS_ALIGNER_MEDIA_ROOT", "/m"),
+            ("PHAROS_ALIGNER_WEIGHTS", "/w"),
+            ("PHAROS_ALIGNER_PIN", "yes"),
+        ]))
+        .unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            r#"PHAROS_ALIGNER_PIN must be auto, on or off, got "yes""#
         );
     }
 }
