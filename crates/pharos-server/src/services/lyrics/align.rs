@@ -28,6 +28,13 @@ use super::{Lyrics, WordStamp};
 ///    tapped late no longer pins its first word late.
 const ALIGN_VERSION: u32 = 5;
 
+/// The oldest aligner whose answers are kept. Its `aligner_version` goes up
+/// with each change to how it times words, so an answer from an aligner
+/// deployed after the server fails the job (retried after `RETRY_AFTER`)
+/// instead of being cached under the new `ALIGN_VERSION` key.
+/// 2: a line's window opens 750 ms before its stamp (B1165).
+const MIN_ALIGNER_VERSION: u32 = 2;
+
 /// Time alignment of a whole song can take on CPU; a worker may run up to this
 /// long before timing out.
 const TIMEOUT: Duration = Duration::from_secs(600);
@@ -452,6 +459,8 @@ fn parse_answer(body: &str, n_lines: usize) -> Result<Aligned, String> {
         /// offset until ALIGN_VERSION next changes (B1007). Rejecting it
         /// fails the job, which is retried after `RETRY_AFTER`.
         offset_ms: i64,
+        /// Required for the same reason, from an aligner older than B1165.
+        aligner_version: u32,
     }
 
     #[derive(Deserialize)]
@@ -467,6 +476,12 @@ fn parse_answer(body: &str, n_lines: usize) -> Result<Aligned, String> {
 
     let reply: Reply =
         serde_json::from_str(body).map_err(|e| format!("invalid aligner response: {e}"))?;
+    if reply.aligner_version < MIN_ALIGNER_VERSION {
+        return Err(format!(
+            "aligner_version {} is older than {MIN_ALIGNER_VERSION}",
+            reply.aligner_version
+        ));
+    }
     if reply.lines.len() != n_lines {
         return Err(format!(
             "invalid aligner response: {} lines for {n_lines} asked",
@@ -777,6 +792,7 @@ mod tests {
     fn parse_answer_validates_and_rejects_line_count_mismatch() {
         let valid_json = r#"{
             "offset_ms": 0,
+            "aligner_version": 2,
             "lines": [
                 {
                     "words": [
@@ -821,7 +837,7 @@ mod tests {
     }
     #[test]
     fn the_aligner_s_offset_is_read_and_moves_line_starts_but_never_below_zero() {
-        let body = r#"{"lines": [{"words": []}], "offset_ms": 3700}"#;
+        let body = r#"{"lines": [{"words": []}], "offset_ms": 3700, "aligner_version": 2}"#;
         let late = parse_answer(body, 1).expect("parses");
         assert_eq!(late.offset_ms, 3_700);
         assert_eq!(late.shift(37_420), 41_120);
@@ -835,9 +851,21 @@ mod tests {
 
     #[test]
     fn an_answer_from_an_aligner_without_the_offset_search_is_not_kept() {
-        let old = r#"{"lines": [{"words": [{"at": 0, "start_ms": 5}]}]}"#;
+        let old = r#"{"lines": [{"words": [{"at": 0, "start_ms": 5}]}], "aligner_version": 2}"#;
         let err = parse_answer(old, 1).expect_err("no offset_ms");
         assert!(err.contains("missing field `offset_ms`"), "{err}");
+    }
+
+    #[test]
+    fn an_answer_from_an_aligner_with_the_narrow_window_is_not_kept() {
+        let unnamed = r#"{"lines": [{"words": []}], "offset_ms": 0}"#;
+        let err = parse_answer(unnamed, 1).expect_err("no aligner_version");
+        assert!(err.contains("missing field `aligner_version`"), "{err}");
+        let older = r#"{"lines": [{"words": []}], "offset_ms": 0, "aligner_version": 1}"#;
+        assert_eq!(
+            parse_answer(older, 1).map(|a| a.offset_ms),
+            Err("aligner_version 1 is older than 2".into())
+        );
     }
 
     #[test]
