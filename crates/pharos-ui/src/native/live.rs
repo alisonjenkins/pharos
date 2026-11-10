@@ -217,6 +217,7 @@ mod tests {
             id: "lib".into(),
             progress: 0.5,
             state: "running".into(),
+            counts: Default::default(),
         }]);
         assert!(!refresh.any());
     }
