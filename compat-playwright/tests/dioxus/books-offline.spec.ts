@@ -87,6 +87,31 @@ const record = (page: Page) =>
     return text === null ? null : JSON.parse(text);
   });
 
+/** The first fixture word lying inside the page frame; "" until the page is laid out. */
+function firstWord(page: Page): Promise<string> {
+  return page.evaluate(() => {
+    const root = document.getElementById("pharos-reader-host")?.shadowRoot;
+    const frame = root?.querySelector(".quire-frame");
+    const strip = root?.querySelector(".quire-strip");
+    if (!frame || !strip) return "";
+    const box = frame.getBoundingClientRect();
+    const walker = document.createTreeWalker(strip, NodeFilter.SHOW_TEXT);
+    for (let n = walker.nextNode(); n; n = walker.nextNode()) {
+      const text = n.nodeValue ?? "";
+      for (const m of text.matchAll(/zq\d+x\d+x\d+/g)) {
+        const range = document.createRange();
+        range.setStart(n, m.index ?? 0);
+        range.setEnd(n, (m.index ?? 0) + m[0].length);
+        const r = range.getClientRects()[0];
+        if (r && r.left >= box.left && r.right <= box.right + 1 && r.top >= box.top && r.bottom <= box.bottom + 1) {
+          return m[0];
+        }
+      }
+    }
+    return "";
+  });
+}
+
 async function keepFixture(page: Page): Promise<void> {
   await openBookPage(page);
   await page.locator("#pharos-keep-offline").click();
@@ -238,6 +263,54 @@ test.describe("books kept on the device (spec 036)", () => {
       )
       .toBe(0);
     await page.context().close();
+  });
+
+  test("a kept book opens at the place another device read since", async ({ browser }) => {
+    // Device A keeps the book, with whatever place the server holds for it.
+    const a = await signedIn(browser);
+    await keepFixture(a.page);
+    const id = (await record(a.page)).books[0].id as string;
+    const placeBefore = (await record(a.page)).books[0].locator as string | null;
+
+    // Device B, the same user online, reads on and leaves, which saves the place.
+    const b = await signedIn(browser);
+    await b.page.goto(`/ui/read/${id}`);
+    await expect(b.page.locator(".pharos-reader")).toBeVisible({ timeout: 20_000 });
+    await expect.poll(() => firstWord(b.page), { timeout: 20_000 }).not.toBe("");
+    let word = await firstWord(b.page);
+    for (let turns = 0; turns < 3; turns++) {
+      const before = word;
+      await b.page.keyboard.press("ArrowRight");
+      await expect.poll(() => firstWord(b.page), { timeout: 10_000 }).not.toBe(before);
+      word = await firstWord(b.page);
+    }
+    expect(word).not.toBe("zq0x0x0");
+    await b.page.getByRole("button", { name: "Back" }).click();
+    await expect(b.page.locator("#pharos-main-action")).toBeVisible({ timeout: 15_000 });
+
+    // The server has it once a fresh online open of the book lands there.
+    await expect
+      .poll(
+        async () => {
+          await b.page.goto(`/ui/read/${id}`);
+          await expect(b.page.locator(".pharos-reader")).toBeVisible({ timeout: 20_000 });
+          await expect.poll(() => firstWord(b.page), { timeout: 20_000 }).not.toBe("");
+          return firstWord(b.page);
+        },
+        { timeout: 40_000 },
+      )
+      .toBe(word);
+
+    // A opens its kept copy: from the cache, then at B's place.
+    await a.page.goto(`/ui/read/${id}`);
+    await expect(a.page.locator(".pharos-reader")).toBeVisible({ timeout: 20_000 });
+    await expect.poll(() => firstWord(a.page), { timeout: 20_000 }).toBe(word);
+    expect(a.logs.some((l) => /^pharos: reader opened item=\d+ format=epub from=cache/.test(l))).toBe(true);
+    expect(a.logs.some((l) => /^pharos: reader moved to the server place item=\d+ /.test(l))).toBe(true);
+    // The record keeps the place too, for the next open with no server.
+    await expect.poll(async () => (await record(a.page)).books[0].locator).not.toBe(placeBefore);
+    await a.page.context().close();
+    await b.page.context().close();
   });
 
   test("keeping a PDF also stores the PDF module for the offline reader", async ({ browser }) => {
