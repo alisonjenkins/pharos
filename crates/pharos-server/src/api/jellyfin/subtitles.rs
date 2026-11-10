@@ -676,6 +676,11 @@ async fn deliver_styled_ass(
             .filter(|p| STYLED_SIZE_PERCENTS.contains(p))
             .ok_or_else(|| error::ErrorBadRequest("unknown subtitle size"))?,
     };
+    let speakers = match query_param(query, "speakers") {
+        None | Some("0") => false,
+        Some("1") => true,
+        Some(_) => return Err(error::ErrorBadRequest("speakers is 0 or 1")),
+    };
     let Some(row) = crate::styled_track::current(&state.stores, item).await else {
         return Err(error::ErrorNotFound("no styled track for this item"));
     };
@@ -693,7 +698,7 @@ async fn deliver_styled_ass(
         director_version: row.director_version,
         plan_stamp: row.styled_at,
         size_percent,
-        speakers: false,
+        speakers,
     };
     let mtime = mtime_secs(&item.path).await;
     let cache = state.subtitles.as_ref();
@@ -708,7 +713,7 @@ async fn deliver_styled_ass(
             return Ok(styled_response(tier, (*bytes).clone()));
         }
     }
-    let script = match styled_script(state, item, &row, tier, level, size_percent).await {
+    let script = match styled_script(state, item, &row, tier, level, size_percent, speakers).await {
         Ok(script) => script,
         Err(e) => {
             tracing::error!(
@@ -717,6 +722,7 @@ async fn deliver_styled_ass(
                 tier = tier.label(),
                 effects = level.label(),
                 size_percent,
+                speakers,
                 error = %e,
                 "styled subtitle could not be compiled"
             );
@@ -758,6 +764,7 @@ async fn styled_script(
     tier: pharos_styling::Tier,
     level: pharos_styling::EffectsLevel,
     size_percent: u16,
+    speakers: bool,
 ) -> Result<Vec<u8>, String> {
     let sidecar_base = sidecar_base_index(&item.probe);
     let embedded_codec = (row.source_index < sidecar_base)
@@ -785,6 +792,11 @@ async fn styled_script(
         let plan = serde_json::from_str::<pharos_styling::EffectPlan>(&plan_json)
             .map_err(|e| format!("plan: {e}"))?;
         let theme = pharos_styling::theme::Theme::pharos().scaled(size_percent);
+        let theme = if speakers {
+            theme.with_speakers()
+        } else {
+            theme
+        };
         Ok(pharos_styling::compile(&plan, &source.lines, &theme, tier, level).into_bytes())
     })
     .await
