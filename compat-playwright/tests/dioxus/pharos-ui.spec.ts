@@ -4038,6 +4038,13 @@ test.describe("pharos Dioxus UI stage", () => {
     await page.mouse.move(box.x + 60, box.y + box.height / 2);
     await page.mouse.down();
     await page.mouse.move(box.x - 2000, box.y - 2000, { steps: 8 });
+    // Playwright's Firefox drops a mouse release off the viewport, so the drag
+    // would never end there: let go at the page's corner instead, where the
+    // window is clamped anyway (B1143). Chromium still lets go off the page,
+    // which the capturing strip must hear.
+    if (page.context().browser()?.browserType().name() === "firefox") {
+      await page.mouse.move(0, 0);
+    }
     await page.mouse.up();
     await expect.poll(async () => (await stage.boundingBox())!.x).toBeLessThan(1);
     expect((await stage.boundingBox())!.y).toBeLessThan(1);
