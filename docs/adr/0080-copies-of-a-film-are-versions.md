@@ -7,8 +7,8 @@
 ## Context
 
 ADR-0079 made copies of one episode one item and left films out. A film can
-be held twice as well: `Heat (1995)/Heat (1995) Bluray-1080p.mkv` beside
-`Heat (1995) [720p]/Heat (1995) HDTV-720p.mkv`, each listed as its own film
+be held twice as well: `Film BB (1995)/Film BB (1995) Bluray-1080p.mkv` beside
+`Film BB (1995) [720p]/Film BB (1995) HDTV-720p.mkv`, each listed as its own film
 with its own watched state. Alison asked that the pattern carry to all media
 pharos manages, with the best quality copy played by default.
 
@@ -19,8 +19,8 @@ episode and whose own file name states a year is keyed by every word of that
 name, lower-cased, less the words that say how the copy was made: the
 resolution, source, codec, audio format and channel layout, and the 3D
 packing (`FILM_RELEASE_WORDS`). Files with one key are copies of one film.
-`Heat (1995) Bluray-1080p` and `Heat.1995.720p.HDTV` are both `heat 1995`;
-`Heat (1995)-trailer`, `Heat (1995) Director's Cut`, `Heat (1995) - part2`
+`Film BB (1995) Bluray-1080p` and `Film BB.1995.720p.HDTV` are both `film bb 1995`;
+`Film BB (1995)-trailer`, `Film BB (1995) Director's Cut`, `Film BB (1995) - part2`
 and `Show (2006) - 01 - Title` each keep the word that makes them another
 title. A 3D rip of a cut is a copy of that cut. The copies rank as an
 episode's do under ADR-0079: 2D before 3D, then the taller picture, then the
@@ -38,7 +38,7 @@ trailer and the sample.
   Version picker lists the copies.
 - The first scan after deploy deletes the copies' rows, with the same
   carry-over and losses as ADR-0079.
-- A copy named without a year (`Heat.mkv`) stays its own film.
+- A copy named without a year (`Film BB.mkv`) stays its own film.
 - Two different films with one title and one year (rare) would merge; the
   primary is still the better file and the other stays playable as a
   version.
