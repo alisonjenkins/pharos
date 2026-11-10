@@ -123,7 +123,7 @@ impl Publication {
                 .ok()
                 .map(|b| String::from_utf8_lossy(&b).into_owned())
         };
-        Ok(section::sanitise(
+        let mut section = section::sanitise(
             &doc,
             &section::Book {
                 path: &item.path,
@@ -131,7 +131,14 @@ impl Publication {
                 spine_of: &spine_of,
                 stylesheet: &stylesheet,
             },
-        ))
+        );
+        // A viewport in a reflowable document is a phone hint, not a page.
+        section.page = if item.fixed {
+            section.page.or(self.metadata.viewport)
+        } else {
+            None
+        };
+        Ok(section)
     }
 
     /// A file inside the book by archive path, as a [`Section`] names it.
