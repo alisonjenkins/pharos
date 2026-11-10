@@ -153,7 +153,8 @@ fn sqlite_of(stores: &Stores) -> &pharos_store_sqlx::sqlite::SqliteStore {
     sqlite
 }
 
-/// A stop whose play-state read fails is counted as a store error.
+/// A stop whose play-state read fails is counted as a store error and
+/// answered 503, so the client can send it again (FR-108).
 #[actix_web::test]
 async fn a_stop_whose_user_data_read_fails_is_counted() {
     let (state, token, _uid) = seed().await;
@@ -173,7 +174,35 @@ async fn a_stop_whose_user_data_read_fails_is_counted() {
         .unwrap();
 
     let body = format!(r#"{{"ItemId":"{}","PositionTicks":50000000}}"#, item_wire());
-    let _status = stop!(app, token.as_str(), body);
+    assert_eq!(stop!(app, token.as_str(), body), 503);
     assert_eq!(stops(&snap, StopOutcome::UserDataReadFailed), 1);
+    assert_eq!(stops(&snap, StopOutcome::Saved), 0);
+}
+
+/// A stop whose play-state write fails is counted and answered 503 (FR-108).
+#[actix_web::test]
+async fn a_stop_whose_user_data_write_fails_is_counted() {
+    let (state, token, _uid) = seed().await;
+    let app = test::init_service(
+        App::new()
+            .app_data(state.clone())
+            .wrap(LowercasePath)
+            .configure(jellyfin::configure),
+    )
+    .await;
+    let recorder = DebuggingRecorder::new();
+    let snap = pharos_test_metrics::snapshotter(&recorder);
+    let _metrics = metrics::set_default_local_recorder(&recorder);
+    sqlx::query(
+        "CREATE TRIGGER refuse_user_data BEFORE INSERT ON user_data
+         BEGIN SELECT RAISE(FAIL, 'refused by the test'); END",
+    )
+    .execute(sqlite_of(&state.stores).pool())
+    .await
+    .unwrap();
+
+    let body = format!(r#"{{"ItemId":"{}","PositionTicks":50000000}}"#, item_wire());
+    assert_eq!(stop!(app, token.as_str(), body), 503);
+    assert_eq!(stops(&snap, StopOutcome::UserDataWriteFailed), 1);
     assert_eq!(stops(&snap, StopOutcome::Saved), 0);
 }
