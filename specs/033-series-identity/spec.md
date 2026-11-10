@@ -331,8 +331,16 @@ not only the stored keys: each folder is marked `applied` (its rows match the
 plan) or `pending` with the rows still to move, so a dry run's held splits and
 would-move files are visible before the switch to `"apply"`.
 
+Any show, flagged or not, can be opened from its own page (V943, B988): a
+Fix identity button (an admin's, in place of Check match on a flagged show)
+opens the tab on a "This show" card fed by `GET /admin/series-identity/show?SeriesId=`
+(key, folder, stored match, episode files; 404 for an unknown id, logged), and
+`POST /admin/series-identity/rebuild` with `{"ItemIds": [...]}` marks the given
+episodes and rebuilds them from their show's stored match (400 for a non-episode,
+404 for an unknown id), as an episode row's Re-match does for one.
+
 Signal: `sum by (action) (increase(pharos_series_override_total[1d]))`,
-`action` ∈ `pick_show | confirm | move_files | keep_together | remove`, and a
+`action` ∈ `pick_show | confirm | move_files | keep_together | remove | rebuild`, and a
 log line naming the admin, paths and old and new series keys.
 
 ### 8. Decisions (Alison, 2026-11-09T17:27Z)
