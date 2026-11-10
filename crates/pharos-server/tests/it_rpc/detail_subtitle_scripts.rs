@@ -220,8 +220,8 @@ async fn a_songs_summary_names_its_artist_for_its_card() {
     let session = crate::revocation::signed_in(&client, &fx.user_token).await;
     let mut tracked = MediaItem {
         id: 305,
-        path: "/libA/Angel.flac".into(),
-        title: "Angel".into(),
+        path: "/libA/Alpha.flac".into(),
+        title: "Alpha".into(),
         kind: MediaKind::Audio,
         ..MediaItem::default()
     };

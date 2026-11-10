@@ -1073,17 +1073,17 @@ mod tests {
     #[test]
     fn tmdb_parse_search_results_yields_candidates() {
         let body = r#"{"results":[
-            {"id":438631,"title":"Dune","release_date":"2021-10-01"},
-            {"id":438632,"title":"Dune Part Two","release_date":"2024-03-01"}]}"#;
+            {"id":932001,"title":"Film AU","release_date":"2021-10-01"},
+            {"id":932002,"title":"Film AU Part Two","release_date":"2024-03-01"}]}"#;
         let c = super::parse_movie_search(body);
         assert_eq!(c.len(), 2);
-        assert_eq!(c[0].id, "438631");
+        assert_eq!(c[0].id, "932001");
         assert_eq!(c[0].year, Some(2021));
     }
 
     #[test]
     fn tmdb_parse_movie_detail_extracts_overview_genres_art() {
-        let body = r#"{"id":438631,"overview":"A duke's son...","release_date":"2021-10-01",
+        let body = r#"{"id":932001,"overview":"A duke's son...","release_date":"2021-10-01",
             "vote_average":7.8,"genres":[{"name":"Science Fiction"},{"name":"Adventure"}],
             "poster_path":"/p.jpg","backdrop_path":"/b.jpg"}"#;
         let e = super::parse_movie_detail(body).unwrap();
@@ -1111,7 +1111,7 @@ mod tests {
     fn tmdb_parse_tv_search_yields_candidates_from_name_and_first_air_date() {
         let body = r#"{"results":[
             {"id":931396,"name":"Show X","first_air_date":"2008-01-20"},
-            {"id":94997,"name":"House of the Dragon","first_air_date":"2022-08-21"}]}"#;
+            {"id":94997,"name":"Show BJ Origins","first_air_date":"2022-08-21"}]}"#;
         let c = super::parse_tv_search(body);
         assert_eq!(c.len(), 2);
         assert_eq!(c[0].id, "931396");

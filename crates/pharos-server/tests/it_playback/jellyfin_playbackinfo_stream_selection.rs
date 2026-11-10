@@ -73,7 +73,7 @@ async fn seed() -> (web::Data<AppState>, String) {
                     pharos_core::SubtitleTrack {
                         stream_index: 5,
                         codec: Some("hdmv_pgs_subtitle".into()),
-                        // Avatar-shaped: the forced-Na'vi track ships
+                        // Film BA-shaped: the forced-alien-language track ships
                         // default+forced so it plays with no user action.
                         is_default: true,
                         is_forced: true,
@@ -390,10 +390,10 @@ async fn h264_capable_client_with_default_image_sub_still_downgrades_to_transcod
 
 #[actix_web::test]
 async fn default_image_sub_is_baked_without_client_pick() {
-    // B44 — Avatar's forced-Na'vi PGS track is default+forced: with NO
+    // B44 — Film BA's forced-alien-language PGS track is default+forced: with NO
     // client subtitle pick the transcode must burn it (the client is told
     // it's active via DefaultSubtitleStreamIndex; not baking it silently
-    // played Na'vi sections unsubtitled).
+    // played alien-language sections unsubtitled).
     let (state, token) = seed().await;
     let app = test::init_service(
         App::new()

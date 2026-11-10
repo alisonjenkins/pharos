@@ -38,7 +38,7 @@ use pharos_core::time::{Ticks, TICKS_PER_SECOND};
 /// Bounded, stable label naming which streaming surface a body came from —
 /// the counterpart to [`DirectPlayDelivery`] for body-COMPLETION
 /// observability, since a delivery decision and whether its body actually
-/// finished are two different questions. 2026-08-31 (House, skip-intro): the
+/// finished are two different questions. 2026-08-31 (Show BJ, skip-intro): the
 /// DirectPlay decision logged a fast, correct 206 in ~2ms, and then the
 /// client went silent for 82s with no signal ANYWHERE — not an abort (the
 /// handler had already returned by then, so `RedMetrics`'s `AbortGuard` never
@@ -1358,7 +1358,7 @@ mod tests {
 
         let local = MediaItem {
             id: 2,
-            path: "/media/Movies/Arrival.mkv".into(),
+            path: "/media/Movies/Film BC.mkv".into(),
             kind: MediaKind::Movie,
             ..Default::default()
         };
@@ -1500,7 +1500,7 @@ mod tests {
         );
     }
 
-    /// 2026-08-31 (House, skip-intro): a body dropped mid-transfer — the
+    /// 2026-08-31 (Show BJ, skip-intro): a body dropped mid-transfer — the
     /// client disconnected or stalled reading it — produced no signal
     /// anywhere. `RedMetrics`'s abort guard only watches the handler's
     /// future, which had already returned by the time this body starts

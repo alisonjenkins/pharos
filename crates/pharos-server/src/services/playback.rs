@@ -876,7 +876,7 @@ pub(crate) fn resolve_selected_subtitle<'a>(
 /// PGS/VOBSUB is the measured expensive case and is what this rule is about.
 ///
 /// By FORCED: a forced track is not a convenience, it is dialogue the viewer
-/// cannot follow without — B44's Avatar case, where the Na'vi sections played
+/// cannot follow without — B44's Film BA case, where the alien-language sections played
 /// unsubtitled until the default+forced PGS was baked in. Its cost is the
 /// price of an intelligible film, and it is bounded: forced tracks cover a
 /// fraction of the runtime. What this declines is the UNFORCED image
@@ -1293,7 +1293,7 @@ pub fn pick_subtitle(
     // The re-selection was the client obeying this field, which is why turning
     // subtitles off appeared to do nothing on Google TV. An explicit pick is
     // echoed back; explicit off answers None; only an absent field falls
-    // through to the container's own preference (so B44's forced-Na'vi track
+    // through to the container's own preference (so B44's forced-alien-language track
     // and B104's default ASS are untouched).
     match explicit {
         // The client stated a choice on THIS request — echo it back, including
@@ -2053,7 +2053,7 @@ mod resolve_selected_subtitle_tests {
         }
     }
 
-    /// B44's Avatar case: default AND forced, i.e. dialogue rather than a
+    /// B44's Film BA case: default AND forced, i.e. dialogue rather than a
     /// convenience.
     fn forced_image_track(idx: u32) -> SubtitleTrack {
         SubtitleTrack {

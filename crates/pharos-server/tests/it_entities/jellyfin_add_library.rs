@@ -39,9 +39,9 @@ async fn seed(admin: bool) -> (web::Data<AppState>, String, UserId) {
     // under /media/books.
     for (id, path, kind) in [
         (1u64, "/media/movies/Film AO.mkv", MediaKind::Movie),
-        (2, "/media/movies/Dune.mkv", MediaKind::Movie),
+        (2, "/media/movies/Film AU.mkv", MediaKind::Movie),
         (3, "/media/tv/Show/S01E01.mkv", MediaKind::Episode),
-        (4, "/media/books/Dune.epub", MediaKind::Book),
+        (4, "/media/books/Book A.epub", MediaKind::Book),
     ] {
         stores
             .put(MediaItem {

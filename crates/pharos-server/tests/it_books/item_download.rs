@@ -49,7 +49,7 @@ async fn seed(dir: &std::path::Path) -> (web::Data<AppState>, String, std::path:
         .unwrap();
     let token = stores.issue(uid, "t").await.unwrap();
 
-    let path = dir.join("Dune.epub");
+    let path = dir.join("Book A.epub");
     std::fs::write(&path, payload()).unwrap();
 
     stores
@@ -57,7 +57,7 @@ async fn seed(dir: &std::path::Path) -> (web::Data<AppState>, String, std::path:
             locked: Default::default(),
             id: 42,
             path: path.clone(),
-            title: "Dune".into(),
+            title: "Book A".into(),
             kind: MediaKind::Book,
             book: Some(BookMeta {
                 format: BookFormat::Epub,
@@ -138,7 +138,7 @@ async fn query_auth_alone_serves_the_exact_bytes() {
         .unwrap_or_default()
         .to_string();
     assert_eq!(ct, "application/epub+zip");
-    assert_eq!(cd, "attachment; filename=\"Dune.epub\"");
+    assert_eq!(cd, "attachment; filename=\"Book A.epub\"");
     assert_eq!(ar, "bytes", "a reader needs range support to seek");
 
     let body = test::read_body(resp).await;
@@ -258,7 +258,7 @@ async fn download_is_not_restricted_to_books() {
     // so a movie must download too.
     let td = TempDir::new().unwrap();
     let (state, token, _) = seed(td.path()).await;
-    let movie_path = td.path().join("Alien.mkv");
+    let movie_path = td.path().join("Film AX.mkv");
     std::fs::write(&movie_path, b"not a book").unwrap();
     state
         .stores
@@ -266,7 +266,7 @@ async fn download_is_not_restricted_to_books() {
             locked: Default::default(),
             id: 43,
             path: movie_path,
-            title: "Alien".into(),
+            title: "Film AX".into(),
             kind: MediaKind::Movie,
             book: None,
             probe: MediaProbe::default(),

@@ -298,10 +298,10 @@ mod tests {
 
     #[test]
     fn a_match_id_links_rows_like_a_provider_id() {
-        let mut a = film(1, "Alien", Some(1979), None);
+        let mut a = film(1, "Film AX", Some(1979), None);
         a.match_provider = Some("tmdb".into());
         a.match_external_id = Some("348".into());
-        let b = film(2, "Alien (Director's Cut)", Some(2003), Some("348"));
+        let b = film(2, "Film AX (Director's Cut)", Some(2003), Some("348"));
         assert_eq!(ids(&group_duplicates(&[a, b])), vec![vec![1, 2]]);
     }
 
@@ -309,7 +309,7 @@ mod tests {
     fn a_blank_provider_id_is_no_id() {
         let movies = [
             film(1, "Film AP", Some(1995), Some("")),
-            film(2, "Alien", Some(1979), Some(" ")),
+            film(2, "Film AX", Some(1979), Some(" ")),
         ];
         assert!(group_duplicates(&movies).is_empty());
     }

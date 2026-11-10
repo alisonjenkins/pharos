@@ -437,9 +437,9 @@ mod tests {
         assert_eq!(stem.title, "Show Y - S03E07 - WEBRip-1080p");
 
         let mut movie = bare_movie();
-        movie.title = "Arrival".into();
-        apply_enrichment(&mut movie, counts(), &named("Arrival (2016)"));
-        assert_eq!(movie.title, "Arrival");
+        movie.title = "Film BC".into();
+        apply_enrichment(&mut movie, counts(), &named("Film BC (2016)"));
+        assert_eq!(movie.title, "Film BC");
     }
 
     #[test]
@@ -466,7 +466,7 @@ mod tests {
         let item = MediaItem {
             id: 900021,
             kind: MediaKind::Movie,
-            title: "Arrival".into(),
+            title: "Film BC".into(),
             ..Default::default()
         };
         store.put(item.clone()).await.unwrap();

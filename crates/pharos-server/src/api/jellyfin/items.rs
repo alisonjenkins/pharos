@@ -7936,9 +7936,9 @@ mod alpha_picker_tests {
 
     #[test]
     fn letter_prefix_is_case_insensitive_and_trims() {
-        assert!(name_matches_letter("Angel", "a"));
-        assert!(name_matches_letter("angel", "a"));
-        assert!(name_matches_letter("  Angel", "a")); // leading space trimmed
+        assert!(name_matches_letter("Alpha", "a"));
+        assert!(name_matches_letter("alpha", "a"));
+        assert!(name_matches_letter("  Alpha", "a")); // leading space trimmed
         assert!(!name_matches_letter("Show X", "a"));
         assert!(name_matches_letter("An Odd Traveller", "an"));
     }
@@ -7948,7 +7948,7 @@ mod alpha_picker_tests {
         assert!(name_matches_letter("24", "#"));
         assert!(name_matches_letter("3%", "#"));
         assert!(name_matches_letter("[REC]", "#"));
-        assert!(!name_matches_letter("Angel", "#"));
+        assert!(!name_matches_letter("Alpha", "#"));
     }
 }
 
@@ -8304,22 +8304,22 @@ mod synth_parent_tests {
         let rec = metrics_util::debugging::DebuggingRecorder::new();
         let _g = metrics::set_default_local_recorder(&rec);
         let state = state_with(&[(1, "Buffy")]).await;
-        let angel = series_id_for_key(Some("/tv/Angel"), "Angel");
+        let alpha = series_id_for_key(Some("/tv/Alpha"), "Alpha");
 
         for _ in 0..2 {
-            let got = resolve_parent_filter(&state, Some(&angel)).await.unwrap();
+            let got = resolve_parent_filter(&state, Some(&alpha)).await.unwrap();
             assert!(matches!(got, ParentResolution::Empty));
         }
         let seen = lookups(&rec);
         assert_eq!(count(&seen, "rebuilt"), 1);
         assert_eq!(count(&seen, "miss"), 1, "a current memo answers no");
 
-        put_episode(&state, 2, "Angel").await;
+        put_episode(&state, 2, "Alpha").await;
         state.notify_library_changed();
-        let got = resolve_parent_filter(&state, Some(&angel)).await.unwrap();
+        let got = resolve_parent_filter(&state, Some(&alpha)).await.unwrap();
         assert!(matches!(
             got,
-            ParentResolution::Filter(ParentFilter::Series { ref name, .. }) if name == "Angel"
+            ParentResolution::Filter(ParentFilter::Series { ref name, .. }) if name == "Alpha"
         ));
         assert_eq!(
             count(&lookups(&rec), "rebuilt"),
@@ -8334,11 +8334,11 @@ mod synth_parent_tests {
         let _g = metrics::set_default_local_recorder(&rec);
         let state = state_with(&[(1, "Buffy")]).await;
         let buffy = series_id_for_key(Some("/tv/Buffy"), "Buffy");
-        let angel = series_id_for_key(Some("/tv/Angel"), "Angel");
+        let alpha = series_id_for_key(Some("/tv/Alpha"), "Alpha");
         resolve_parent_filter(&state, Some(&buffy)).await.unwrap();
         lookups(&rec);
 
-        put_episode(&state, 2, "Angel").await;
+        put_episode(&state, 2, "Alpha").await;
         state.notify_library_changed();
         let got = resolve_parent_filter(&state, Some(&buffy)).await.unwrap();
         assert!(matches!(
@@ -8352,7 +8352,7 @@ mod synth_parent_tests {
         for _ in 0..500 {
             if state
                 .synth_parents_memo()
-                .is_some_and(|m| m.filters.contains_key(&angel))
+                .is_some_and(|m| m.filters.contains_key(&alpha))
             {
                 landed = true;
                 break;
@@ -8360,10 +8360,10 @@ mod synth_parent_tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         assert!(landed, "the background refresh did not land within 5 s");
-        let got = resolve_parent_filter(&state, Some(&angel)).await.unwrap();
+        let got = resolve_parent_filter(&state, Some(&alpha)).await.unwrap();
         assert!(matches!(
             got,
-            ParentResolution::Filter(ParentFilter::Series { ref name, .. }) if name == "Angel"
+            ParentResolution::Filter(ParentFilter::Series { ref name, .. }) if name == "Alpha"
         ));
         assert_eq!(count(&lookups(&rec), "hit"), 1);
     }
