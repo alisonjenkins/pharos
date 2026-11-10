@@ -305,6 +305,17 @@ async fn channel_stream_authenticates_with_the_sign_in_cookie() {
         .to_request();
     let resp = test::call_service(&app, req).await;
     assert_eq!(resp.status(), 200);
+    // The provider picks the type; sandboxed so it never runs as a page.
+    let csp = resp
+        .headers()
+        .get("content-security-policy")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    assert_eq!(csp, "default-src 'none'; sandbox");
+    assert_eq!(
+        resp.headers().get("x-content-type-options").unwrap(),
+        "nosniff"
+    );
     assert_eq!(&test::read_body(resp).await[..], b"TS-PAYLOAD");
 
     let req = test::TestRequest::get()

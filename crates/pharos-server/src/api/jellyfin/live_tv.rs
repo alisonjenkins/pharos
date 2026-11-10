@@ -433,8 +433,15 @@ async fn stream(
     let body = futures_util::StreamExt::chain(futures_util::stream::iter(first.map(Ok)), rest);
     HttpResponse::Ok()
         .insert_header((header::CONTENT_TYPE, content_type))
+        .insert_header((header::CONTENT_SECURITY_POLICY, RELAY_CSP))
+        .insert_header((header::X_CONTENT_TYPE_OPTIONS, "nosniff"))
         .streaming(body)
 }
+
+/// The provider chooses the relayed content type. Opened as a page on
+/// pharos's origin (the sign-in cookie authenticates a navigation too), an
+/// HTML or SVG body runs no script and reaches nothing (B1150, as B255).
+const RELAY_CSP: &str = "default-src 'none'; sandbox";
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
