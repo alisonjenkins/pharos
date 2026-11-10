@@ -5623,6 +5623,7 @@ fn Player(
     // player reads `media_rest` and hands `position` to the leaves that show
     // it, so a tick does not rebuild the player (B815).
     let mut position = use_signal(|| 0u64);
+    let mut buffered = use_signal(|| 0u64);
     let media_rest = use_memo(move || split_position(media()).0);
     // What a wait under the spinner is for (038 FR-401): whether this video
     // has played yet, and, once a wait passes `wait::HINT_AFTER_MS`, the
@@ -6624,6 +6625,10 @@ fn Player(
             if *position.peek() != state.position_ms {
                 position.set(state.position_ms);
             }
+            let to = platform::buffered_to_ms(VIDEO_ID);
+            if *buffered.peek() != to {
+                buffered.set(to);
+            }
             if let Some(next) = up_next_to.get() {
                 let total = total_ms(&state, p.detail.item.runtime_ms);
                 let from = up_next_at(&p.detail.segments, total);
@@ -7214,6 +7219,7 @@ fn Player(
             }
         },
         live_position: Some(position),
+        live_buffered: Some(buffered),
         subtitle_size: sub_size(),
         packing: versions::playing_stereo(&p.detail.versions, &p.version),
         // A burned subtitle may sit in a letterbox bar, so those stay (V977).
