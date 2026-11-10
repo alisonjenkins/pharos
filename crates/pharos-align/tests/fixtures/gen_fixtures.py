@@ -22,6 +22,8 @@ import torchaudio
 import torchaudio.functional as F
 
 from pharos_aligner.model import Aligner
+from pharos_aligner.offset import estimate, probe_indices, shift
+from pharos_aligner.plan import Line, parse_request, stamps, window
 from pharos_aligner.text import words
 
 OUT = Path(sys.argv[1])
@@ -239,11 +241,118 @@ def ms_fixture() -> list[list[int]]:
     return out
 
 
+def plan_fixture() -> dict:
+    rng = random.Random(1167)
+    windows = []
+    for _ in range(300):
+        start = rng.choice([0, 50, 400, 900, rng.randint(0, 600_000)])
+        end = start + rng.choice([0, 300, rng.randint(0, 30_000)])
+        n = rng.randint(1, 12)
+        prev = rng.choice([0, max(0, start - rng.randint(0, 2000)), start + rng.randint(0, 500)])
+        windows.append([start, end, n, prev, list(window(Line(start, end, "x"), n, prev))])
+    stamp_cases = []
+    for _ in range(80):
+        text = " ".join("w" * rng.randint(1, 4) for _ in range(rng.randint(1, 6)))
+        ws = words(text)
+        spans = []
+        for _ in ws:
+            a = rng.randint(0, 5000)
+            spans.append([a, a + rng.randint(0, 900)])
+        if rng.random() < 0.1:
+            spans = spans[:-1]
+        w0 = rng.randint(0, 100_000)
+        got = stamps(text, ws, [tuple(x) for x in spans], w0)
+        stamp_cases.append({"text": text, "spans": spans, "window_start_ms": w0, "stamps": [[d["at"], d["start_ms"]] for d in got]})
+    good_line = {"start_ms": 1, "end_ms": 2, "text": "a"}
+    bodies = [
+        [], "x", 3, None, {}, {"path": 1, "lines": []}, {"path": "", "lines": []}, {"path": "a"},
+        {"path": "a", "lines": {}}, {"path": "a", "lines": [good_line] * 501}, {"path": "a", "lines": [good_line] * 500},
+        {"path": "a", "lines": ["x"]}, {"path": "a", "lines": [{"end_ms": 2, "text": "a"}]},
+        {"path": "a", "lines": [{"start_ms": 1, "text": "a"}]}, {"path": "a", "lines": [{"start_ms": 1, "end_ms": 2}]},
+        {"path": "a", "lines": [{"start_ms": 1.0, "end_ms": 2, "text": "a"}]},
+        {"path": "a", "lines": [{"start_ms": True, "end_ms": 2, "text": "a"}]},
+        {"path": "a", "lines": [{"start_ms": 1, "end_ms": "2", "text": "a"}]},
+        {"path": "a", "lines": [{"start_ms": 1, "end_ms": 2, "text": 5}]},
+        {"path": "a", "lines": [{"start_ms": -1, "end_ms": 2, "text": "a"}]},
+        {"path": "a", "lines": [{"start_ms": 1, "end_ms": -2, "text": "a"}]},
+        {"path": "a", "lines": [{"start_ms": 3, "end_ms": 2, "text": "a"}]},
+        {"path": "a", "lines": [{"start_ms": 1, "end_ms": 2, "text": "\u00e9" * 500}]},
+        {"path": "a", "lines": [{"start_ms": 1, "end_ms": 2, "text": "\u00e9" * 501}]},
+        {"path": "dir/song.flac", "lines": [{"start_ms": 0, "end_ms": 0, "text": ""}, {"start_ms": 5, "end_ms": 9, "text": "b c", "extra": 1}], "extra": True},
+        {"lines": [], "path": "a"},
+    ]
+    parse_cases = []
+    for b in bodies:
+        try:
+            path, lines = parse_request(b)
+            parse_cases.append({"body": b, "path": path, "lines": [list(l) for l in lines]})
+        except ValueError as e:
+            parse_cases.append({"body": b, "error": str(e)})
+    return {"windows": windows, "stamps": stamp_cases, "parse": parse_cases}
+
+
+def offset_fixture() -> list[dict]:
+    """estimate() with a fake decoder and aligner: each probe line's answer is scripted."""
+    rng = random.Random(1168)
+    vocab = ["la", "na", "oh", "yeah", "sun", "rain", "road", "home", "night", "light", "run", "fall"]
+    cases = []
+    for i in range(60):
+        n = rng.randint(1, 30)
+        lines = []
+        t = rng.randint(0, 20_000)
+        for _ in range(n):
+            k = rng.choice([1, 2, 3, 4, 5, 6])
+            text = " ".join(rng.choice(vocab) for _ in range(k)) if rng.random() < 0.85 else "oh oh oh"
+            dur = rng.randint(500, 6000)
+            lines.append(Line(t, t + dur, text))
+            t += dur + rng.randint(0, 3000)
+        base = rng.choice([0, 0, rng.randint(-5000, 5000), rng.randint(-300, 300)])
+        answers = {}
+        for j in probe_indices(lines):
+            r = rng.random()
+            if r < 0.12:
+                answers[j] = None  # decoder returns nothing
+            elif r < 0.2:
+                answers[j] = []  # aligner finds nothing
+            elif r < 0.25:
+                answers[j] = [[0, 0]]
+            else:
+                line = lines[j]
+                start = max(0, line.start_ms - 8000)
+                jitter = rng.randint(-400, 400) if r < 0.85 else rng.randint(-6000, 6000)
+                first = max(0, line.start_ms + base + jitter - start)
+                answers[j] = [[first, first + 300]]
+        calls = []
+
+        def decode(s: int, e: int, _lines=lines, _answers=answers, _calls=calls) -> bytes:
+            j = next(k for k in _answers if max(0, _lines[k].start_ms - 8000) == s and k not in [c[0] for c in _calls])
+            _calls.append((j, s, e))
+            return b"" if _answers[j] is None else b"pcm"
+
+        def align_wide(pcm: bytes, tokens: list[str], _answers=answers, _calls=calls) -> list[tuple[int, int]]:
+            return [tuple(x) for x in _answers[_calls[-1][0]]]
+
+        found = estimate(lines, decode, align_wide)
+        moved = shift(lines, found.offset_ms)
+        cases.append({
+            "lines": [list(l) for l in lines],
+            "probe_indices": probe_indices(lines),
+            "answers": {str(k): v for k, v in answers.items()},
+            "decode_calls": [[s, e] for _, s, e in calls],
+            "offset_ms": found.offset_ms,
+            "probes": found.probes,
+            "reason": found.reason,
+            "shifted": [list(l) for l in moved],
+        })
+    return cases
+
+
 def main() -> None:
     OUT.mkdir(parents=True, exist_ok=True)
     meta = {"torch": torch.__version__, "torchaudio": torchaudio.__version__, "dictionary": torchaudio.pipelines.MMS_FA.get_dict()}
     (OUT / "text.json").write_text(json.dumps(text_fixture(), ensure_ascii=True, separators=(",", ":")) + "\n")
     (OUT / "ctc.json").write_text(json.dumps({**meta, "grid": GRID, "cases": ctc_fixture()}, separators=(",", ":")) + "\n")
+    (OUT / "plan.json").write_text(json.dumps({**plan_fixture(), "offset": offset_fixture()}, separators=(",", ":")) + "\n")
     (OUT / "line.json").write_text(json.dumps({**meta, "grid": GRID, "cases": line_fixture(), "ms": ms_fixture()}, separators=(",", ":")) + "\n")
 
 
