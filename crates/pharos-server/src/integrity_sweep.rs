@@ -172,15 +172,23 @@ pub fn needs_seek_index_check(
     it: &MediaItem,
     sig: Option<(i64, u64)>,
 ) -> bool {
+    // The extensions AVI files go by; the scan itself judges by demuxer name.
     let is_avi = it
         .path
         .extension()
         .and_then(|e| e.to_str())
-        .is_some_and(|e| e.eq_ignore_ascii_case("avi"));
+        .is_some_and(|e| {
+            ["avi", "divx", "xvid"]
+                .iter()
+                .any(|x| e.eq_ignore_ascii_case(x))
+        });
+    // A verdict with no declared duration cannot gain the check (coverage
+    // has nothing to measure against), so reading it again would repeat on
+    // every pass, a whole-file read each time.
     is_avi
-        && memo
-            .get(it.id, sig)
-            .is_some_and(|e| e.report.seek_index.is_none())
+        && memo.get(it.id, sig).is_some_and(|e| {
+            e.report.seek_index.is_none() && e.report.declared_ms.is_some_and(|d| d > 0)
+        })
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -394,7 +402,21 @@ mod tests {
         );
 
         memo.record(1, sig, report(0));
+        assert!(
+            !needs_seek_index_check(&memo, &avi, sig),
+            "no declared duration: the check cannot answer, so reading again would repeat forever"
+        );
+        let timed = IntegrityReport {
+            declared_ms: Some(20_000),
+            ..report(0)
+        };
+        memo.record(1, sig, timed.clone());
         assert!(needs_seek_index_check(&memo, &avi, sig));
+        assert!(needs_seek_index_check(
+            &memo,
+            &local("/movies/Film/Film.divx"),
+            sig
+        ));
         assert!(!needs_seek_index_check(&memo, &mkv, sig));
 
         memo.record(
@@ -402,7 +424,7 @@ mod tests {
             sig,
             IntegrityReport {
                 seek_index: Some(true),
-                ..report(0)
+                ..timed
             },
         );
         assert!(
