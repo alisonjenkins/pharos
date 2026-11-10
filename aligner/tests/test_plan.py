@@ -14,13 +14,30 @@ def test_window_clamps_at_zero() -> None:
     assert window(line_near_zero, 1) == (0, 750)
 
     line_far = Line(start_ms=1000, end_ms=2000, text="test")
-    assert window(line_far, 1) == (750, 2250)
+    assert window(line_far, 1) == (250, 2250)
 
 
 def test_window_stops_short_of_a_long_break() -> None:
     # Three words, then 30 s of music before the next line.
     line = Line(start_ms=10_000, end_ms=40_000, text="one two three")
-    assert window(line, 3) == (9_750, 10_000 + 3 * 700 + 2_000 + 250)
+    assert window(line, 3) == (9_250, 10_000 + 3 * 700 + 2_000 + 250)
+
+
+def test_window_opens_early_enough_for_a_stamp_tapped_late() -> None:
+    # Tapped 600 ms after the singing starts: the window must still hold it.
+    sung_from = 20_000
+    line = Line(start_ms=sung_from + 600, end_ms=25_000, text="one two")
+    assert window(line, 2)[0] <= sung_from
+
+
+def test_window_lead_stops_where_the_line_before_ended() -> None:
+    line = Line(start_ms=20_000, end_ms=25_000, text="one two")
+    # The line before ended 300 ms ahead of this stamp: the lead stops there.
+    assert window(line, 2, prev_end_ms=19_700)[0] == 19_700
+    # It never opens later than the plain margin, even if the line before ran on.
+    assert window(line, 2, prev_end_ms=20_400)[0] == 19_750
+    # Long gone: the full lead.
+    assert window(line, 2, prev_end_ms=10_000)[0] == 19_250
 
 
 def test_stamps_end_stamp_and_non_decreasing() -> None:
