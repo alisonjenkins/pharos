@@ -27,11 +27,11 @@ use super::pdf_web::PdfView;
 use super::platform;
 use super::reader::{
     check_size, download_href, flatten_toc, key_action, margin_label, pdf_key, pdf_locator,
-    pdf_progress, pdf_saved_index, progress_label, retry_delay_ms, retryable, save_key,
-    saved_fraction, saved_locator, size_cap, swipe_action, tap_action, too_big_message, KeyAction,
-    KeyPress, KeyTarget, PageTheme, PdfFit, PdfKey, PendingSave, PendingSaves, ReaderSettings,
-    SaveGate, SizeVerdict, TocRow, Typeface, LINE_HEIGHTS, MARGINS, OFFLINE_NOTE, PENDING_KEY,
-    SETTINGS_KEY,
+    pdf_progress, pdf_saved_index, progress_label, retry_delay_ms, retryable, save_is_news,
+    save_key, saved_fraction, saved_locator, size_cap, swipe_action, tap_action, too_big_message,
+    KeyAction, KeyPress, KeyTarget, PageTheme, PdfFit, PdfKey, PendingSave, PendingSaves,
+    ReaderSettings, SaveGate, SizeVerdict, TocRow, Typeface, LINE_HEIGHTS, MARGINS, OFFLINE_NOTE,
+    PENDING_KEY, SETTINGS_KEY,
 };
 use super::route::Route;
 use super::views::{display_name, Nav};
@@ -432,6 +432,9 @@ impl Core {
     }
 
     fn save(&self, forced: bool) {
+        if !save_is_news(self.turned.get()) {
+            return;
+        }
         let locator = self.engine.locator();
         let fraction = saved_fraction(self.engine.progress(), self.at_end.get());
         self.saver
