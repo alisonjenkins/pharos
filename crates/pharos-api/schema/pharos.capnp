@@ -12,7 +12,7 @@ annotation secret(field, param) :Void;
 
 # Bumped when the schema changes; served as ServerInfo.schemaVersion so a client
 # can tell which methods a server knows (FR-009).
-const schemaVersion :UInt32 = 36;
+const schemaVersion :UInt32 = 38;
 
 # ---- ids and shared types -------------------------------------------------
 struct ItemId {                # mirrors pharos_jellyfin_api::WireId
@@ -154,11 +154,24 @@ interface Session {
   # other user is refused notPermitted. Full scope, issued as a child of this
   # session's token, so signing out ends it; lives one hour at most.
   manageToken @15 (ctx :CallContext) -> (result :MediaTokenResult);
+  # The devices this user is signed in on, each with the sound formats it is
+  # sent converted rather than as they are (T130, ADR 0095). Since
+  # schemaVersion 38.
+  myDevices @16 (ctx :CallContext) -> (result :MyDevicesResult);
+  # Sets which sound formats a device this user is signed in on is sent
+  # converted; an empty list clears it. A device the user is not signed in
+  # on answers notPermitted, a malformed codec name or `aac` (what every
+  # conversion produces) invalid on `codecs`. Since schemaVersion 38.
+  setDeviceConvertedAudio @17 (ctx :CallContext, deviceId :Text, codecs :List(Text)) -> (result :Done);
   # Capability getters return a capability, never fail; a revoked session makes
   # every call on the returned capability fail with Error.kind.revoked.
   # Sessions, Queue, RemoteSources arrive with specs 013/014 (append-only).
 }
 struct AdminResult { union { admin @0 :Admin; error @1 :Error; } }
+# One device the user is signed in on. `current` marks the one this session
+# runs on. Since schemaVersion 38.
+struct MyDevice { id @0 :Text; name @1 :Text; current @2 :Bool; convertedAudio @3 :List(Text); }
+struct MyDevicesResult { union { devices @0 :List(MyDevice); error @1 :Error; } }
 struct AvatarResult { union { tag @0 :Text; error @1 :Error; } }
 struct MediaToken {
   token       @0 :Text $secret;
