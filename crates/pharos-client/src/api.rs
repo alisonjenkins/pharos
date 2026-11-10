@@ -343,11 +343,14 @@ pub struct Book {
 }
 
 /// A book's saved reading position: an opaque locator and how far through
-/// the book it is, 0 to 1.
+/// the book it is, 0 to 1, and when it was read.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ReadPosition {
     pub locator: String,
     pub fraction: f32,
+    /// Unix ms the place was read, to the second; 0 from a server older than
+    /// schemaVersion 37.
+    pub read_at_ms: i64,
 }
 
 /// What the integrity check found wrong with one file.
@@ -2157,6 +2160,7 @@ fn read_read_position(
     Ok((!locator.is_empty()).then(|| ReadPosition {
         locator,
         fraction: state.get_read_fraction(),
+        read_at_ms: state.get_read_at(),
     }))
 }
 
