@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use pharos_align::audio::DecodeError;
+use pharos_align::line::LineSpans;
 use pharos_align::plan::{Line, Stamp};
 use pharos_align::service::{
     Decoder, Engine, Loader, Model, ModelError, SongError, ALIGNER_VERSION,
@@ -17,12 +18,7 @@ struct Even {
 }
 
 impl Model for Even {
-    fn align(
-        &mut self,
-        _: &[f32],
-        tokens: &[String],
-        _: bool,
-    ) -> Result<Vec<(u64, u64)>, ModelError> {
+    fn align(&mut self, _: &[f32], tokens: &[String], _: bool) -> Result<LineSpans, ModelError> {
         if self.fatal {
             return Err(ModelError::Fatal("weights gone".into()));
         }
@@ -33,7 +29,8 @@ impl Model for Even {
         }
         Ok((0..tokens.len() as u64)
             .map(|i| (i * 100, (i + 1) * 100))
-            .collect())
+            .collect::<Vec<_>>()
+            .into())
     }
 }
 
@@ -221,7 +218,7 @@ fn a_probe_that_times_out_skips_the_other_probes() {
 struct Panics;
 
 impl Model for Panics {
-    fn align(&mut self, _: &[f32], _: &[String], _: bool) -> Result<Vec<(u64, u64)>, ModelError> {
+    fn align(&mut self, _: &[f32], _: &[String], _: bool) -> Result<LineSpans, ModelError> {
         panic!("forward pass panicked");
     }
 }

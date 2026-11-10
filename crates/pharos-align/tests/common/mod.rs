@@ -10,8 +10,12 @@ use std::time::Duration;
 
 use actix_web::{web, App, HttpServer};
 use pharos_align::http::{configure, AppState};
+use pharos_align::line::LineSpans;
 use pharos_align::service::{Decoder, Engine, Model, ModelError};
 use serde_json::Value;
+
+/// Every line's score from the fake model; the answer rounds it to 0.813.
+pub const SCORE: f64 = 0.8126;
 
 struct Even {
     /// When set, each align waits for a message first, holding the song lock.
@@ -19,18 +23,16 @@ struct Even {
 }
 
 impl Model for Even {
-    fn align(
-        &mut self,
-        _: &[f32],
-        tokens: &[String],
-        _: bool,
-    ) -> Result<Vec<(u64, u64)>, ModelError> {
+    fn align(&mut self, _: &[f32], tokens: &[String], _: bool) -> Result<LineSpans, ModelError> {
         if let Some(gate) = &self.gate {
             gate.lock().unwrap().recv().unwrap();
         }
-        Ok((0..tokens.len() as u64)
-            .map(|i| (i * 100, (i + 1) * 100))
-            .collect())
+        Ok(LineSpans {
+            times: (0..tokens.len() as u64)
+                .map(|i| (i * 100, (i + 1) * 100))
+                .collect(),
+            score: Some(SCORE),
+        })
     }
 }
 

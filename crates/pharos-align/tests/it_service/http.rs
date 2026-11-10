@@ -7,7 +7,7 @@ use pharos_align::audio::DecodeError;
 use pharos_align::service::{Decoder, ALIGNER_VERSION};
 use serde_json::{json, Value};
 
-use crate::common::{post, raw, serve, silent};
+use crate::common::{self, post, raw, serve, silent};
 
 fn get(addr: SocketAddr, path: &str) -> (u16, Value) {
     raw(addr, &format!("GET {path} HTTP/1.1\r\nHost: t"), b"")
@@ -36,11 +36,31 @@ fn a_song_answers_with_its_words_offset_and_version() {
     assert_eq!(
         body,
         json!({
-            "lines": [{"words": [{"at": 0, "start_ms": 250}, {"at": 6, "start_ms": 350}, {"at": 11, "start_ms": 450}]}],
+            "lines": [{"words": [{"at": 0, "start_ms": 250}, {"at": 6, "start_ms": 350}, {"at": 11, "start_ms": 450}], "score": 0.813}],
             "offset_ms": 0,
             "aligner_version": ALIGNER_VERSION,
         })
     );
+}
+
+#[test]
+fn each_line_answers_its_score_to_three_places_and_null_without_words() {
+    let s = serve("score", silent(), None);
+    let lines = json!({"path": "song.mp3", "lines": [
+        {"start_ms": 1000, "end_ms": 2000, "text": "Hello world"},
+        {"start_ms": 3000, "end_ms": 4000, "text": "..."},
+    ]});
+    let (status, body) = post(s.addr, &lines);
+    assert_eq!(status, 200, "{body}");
+    let scores: Vec<&Value> = body["lines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|l| &l["score"])
+        .collect();
+    // The fake scores 0.8126: rounded, not cut to 0.812.
+    assert_eq!(common::SCORE, 0.8126);
+    assert_eq!(scores, [&json!(0.813), &Value::Null], "{body}");
 }
 
 #[test]
