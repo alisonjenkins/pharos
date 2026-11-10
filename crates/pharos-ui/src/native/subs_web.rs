@@ -168,7 +168,9 @@ impl Core {
             self.measure();
         }
         self.advance_glide();
-        let t_ms = (media_s.unwrap_or_else(|| self.video.current_time()) * 1000.0).round() as i64;
+        // A subtitle delay (T038-305) shows the cue of an earlier file time.
+        let t_ms = (media_s.unwrap_or_else(|| self.video.current_time()) * 1000.0).round() as i64
+            - super::platform::subtitle_delay_ms();
         let frame = self.renderer.frame(t_ms, &self.viewport);
         let drawn = if frame.changed {
             self.compositor.draw(&frame)

@@ -2374,6 +2374,22 @@ body:has(.pharos-stage.is-full) .pharos-status-note {
     transform: scale(1);
   }
 }
+/* The subtitle delay: earlier, the delay (which resets it) and later
+   (T038-305). */
+.pharos-subtitle-delay {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+}
+.pharos-subtitle-delay-value {
+  min-width: 6.5rem;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-variant-numeric: tabular-nums;
+  cursor: pointer;
+}
 /* The menus and the window-size buttons sit in the row on a wide screen;
    on a narrow one they wait in a sheet behind the settings button
    (T038-302), so the row keeps play, time, seek and fullscreen on one
@@ -2390,8 +2406,8 @@ body:has(.pharos-stage.is-full) .pharos-status-note {
   align-items: center;
   justify-content: center;
 }
-/* On a wide screen the settings button opens the speed menu in a small
-   panel above the right of the bar. */
+/* On a wide screen the settings button opens speed and subtitle delay in a
+   small panel above the right of the bar. */
 .pharos-control-menus.is-open > .pharos-control-extra {
   position: absolute;
   right: 0.75rem;
@@ -2406,6 +2422,9 @@ body:has(.pharos-stage.is-full) .pharos-status-note {
   border-radius: 12px;
   background: rgb(16 20 28 / 0.94); /* not themed: controls sit on the video, whose colours no theme sets */
   box-shadow: 0 8px 24px rgb(0 0 0 / 0.5); /* not themed: controls sit on the video, whose colours no theme sets */
+}
+.pharos-control-extra > .pharos-subtitle-delay {
+  justify-content: space-between;
 }
 @media (max-width: 40rem) {
   .pharos-control-row {
