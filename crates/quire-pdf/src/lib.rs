@@ -4,6 +4,11 @@
 //! host (for tests) and in a browser. On `wasm32` the crate also exports a
 //! small wasm-bindgen API (`QuirePdfDocument`) for a module that a page loads
 //! only when a PDF is opened.
+//!
+//! A panic inside the engine is caught and reported as an error on the host
+//! only. On `wasm32` panics abort, which traps the module and leaves its
+//! instance unusable; the page that loaded it must discard the instance and
+//! load a fresh one (the module logs the panic message to the console first).
 
 #![forbid(unsafe_code)]
 
