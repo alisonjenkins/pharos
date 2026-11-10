@@ -13,6 +13,7 @@ pub mod names {
     pub const CAPTION: &str = "Caption";
     pub const ASIDE: &str = "Aside";
     pub const BURST: &str = "Burst";
+    pub const GIGGLE: &str = "Giggle";
     pub const KARAOKE: &str = "Karaoke";
 }
 
@@ -214,6 +215,17 @@ impl Theme {
             margin_v: 120,
             ..StyleDef::base(BURST)
         };
+        // Laughter: the rounded hand face in a warm pink with a deep rose
+        // outline, at the dialogue's spot (B1205).
+        let giggle = StyleDef {
+            font: faces::HAND,
+            size: 76,
+            primary: rgb(255, 204, 228),
+            outline_colour: rgb(118, 22, 70),
+            outline: 4.0,
+            shadow: 1.5,
+            ..StyleDef::base(GIGGLE)
+        };
         // Sung text takes the primary colour, unsung the secondary.
         let karaoke = StyleDef {
             size: 58,
@@ -228,7 +240,7 @@ impl Theme {
             play_res_y: 1080,
             styles: vec![
                 dialogue, shout, scream, whisper, thought, echo, wire, memory, caption, aside,
-                burst, karaoke,
+                burst, giggle, karaoke,
             ],
             tag_scale: 1.0,
         }

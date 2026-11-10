@@ -18,11 +18,14 @@ pub enum Intent {
     Flashback,
     Sarcasm,
     Sfx,
+    /// Laughter: a laugh cue (`(laughs)`, `[giggling]`) or a line that is
+    /// only laughter (`Hahaha!`). Appended last (B1205).
+    Laugh,
 }
 
 impl Intent {
     /// Every intent, in declaration order.
-    pub const ALL: [Intent; 11] = [
+    pub const ALL: [Intent; 12] = [
         Intent::Plain,
         Intent::Shout,
         Intent::Whisper,
@@ -34,6 +37,7 @@ impl Intent {
         Intent::Flashback,
         Intent::Sarcasm,
         Intent::Sfx,
+        Intent::Laugh,
     ];
 
     /// Stable snake_case name, identical to the serde form.
@@ -50,6 +54,7 @@ impl Intent {
             Intent::Flashback => "flashback",
             Intent::Sarcasm => "sarcasm",
             Intent::Sfx => "sfx",
+            Intent::Laugh => "laugh",
         }
     }
 }
