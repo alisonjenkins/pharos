@@ -198,12 +198,10 @@ pub fn AccountMenuView(
                             onclick: move |e: MouseEvent| {
                                 // The menu closes itself on sign-out; a click
                                 // that turns into an ask must not close it.
+                                // The handler counts the kept books afresh
+                                // and asks if any may be kept.
                                 e.stop_propagation();
-                                if must_ask(kept_books) {
-                                    on_confirm.call(true);
-                                } else {
-                                    on_sign_out.call(());
-                                }
+                                on_sign_out.call(());
                             },
                             "Sign out"
                         }
