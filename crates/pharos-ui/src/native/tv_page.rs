@@ -294,6 +294,11 @@ pub const REMOTE_PLAYERS: &str = "#pharos-player, .pharos-stage.is-full .pharos-
 /// or the music screen's play button.
 pub const PLAYER_HOME: &str = ".pharos-control-row button, .pharos-listen-play";
 
+/// A D-pad stop in a remote player whose Left and Right scrub, as they do
+/// on the picture, and whose OK commits or pauses as the picture's does:
+/// the seek bar (B1330).
+pub const REMOTE_SLIDERS: &str = "#pharos-seek";
+
 /// Controls in a remote player that the arrows pass over: the lyrics
 /// panel's lines, which scroll with the song under a remote walking down
 /// them, so Down never reached the transport (B1034).
@@ -354,6 +359,7 @@ pub fn bridge_script(template: &str) -> String {
         .replace("__OK_PRESSES__", OK_PRESSES)
         .replace("__OVERLAYS__", OVERLAYS)
         .replace("__GRID__", GRID)
+        .replace("__REMOTE_SLIDERS__", REMOTE_SLIDERS)
 }
 
 /// The container list a TV build declares: one no file has, so the server
@@ -875,6 +881,12 @@ mod tests {
         assert!(!bridge_script("__REMOTE_SKIPS__").contains("__"));
         assert_eq!(bridge_script("__OK_PRESSES__"), OK_PRESSES);
         assert_eq!(bridge_script("__OVERLAYS__"), OVERLAYS);
+        // B1330: the seek bar is a remote stop that scrubs.
+        assert_eq!(bridge_script("__REMOTE_SLIDERS__"), REMOTE_SLIDERS);
+        assert_eq!(
+            REMOTE_SLIDERS,
+            format!("#{}", crate::native::watch_view::SEEK_ID)
+        );
         // B1222/V1182: the Info key's script is in the bridge, filled in.
         let keys = bridge_script("__BAR_KEYS__");
         assert!(keys.contains(r#"e.key !== "Info""#), "{keys}");
