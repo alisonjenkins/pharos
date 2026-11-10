@@ -2476,14 +2476,18 @@ test.describe("pharos Dioxus UI", () => {
           return /mpegurl|webm|matroska/i.test(type) ? "" : canPlayType.call(this, type);
         };
       });
-      // Hold every segment after the first until released: the seek below
-      // then has to wait on the "server".
+      // Hold every segment but the first one asked for until released: the
+      // seek below then has to wait on the "server". The first is not always
+      // segment 0: an earlier case can leave a resume point, and the page
+      // starts there (B1144).
       let release: () => void = () => {};
       const released = new Promise<void>((r) => (release = r));
       const segment = /\/videos\/[^?]*\/a?(\d+)\.(?:ts|m4s)(?:\?|$)/;
+      let first: number | undefined;
       await page.route(segment, async (route) => {
         const seg = Number(segment.exec(route.request().url())?.[1] ?? 0);
-        if (seg > 0) await released;
+        first ??= seg;
+        if (seg !== first) await released;
         await route.continue();
       });
 
@@ -2501,11 +2505,29 @@ test.describe("pharos Dioxus UI", () => {
       await expect.poll(async () => (await video()).duration, { timeout: 30_000 }).toBeGreaterThan(12);
       const spinner = page.locator(".pharos-watch-loading");
 
-      const { duration } = await video();
+      // Seek well away from where the page started, past the segment it
+      // played: both targets are a held segment (B1144).
+      // Playing from the first segment, so the seek is a real one: Firefox
+      // does not set `seeking` for a seek made with no media data yet.
+      await expect
+        .poll(() => page.evaluate(() => (document.getElementById("pharos-video") as HTMLVideoElement).readyState), {
+          timeout: 30_000,
+        })
+        .toBeGreaterThanOrEqual(2);
+      const { duration, time } = await video();
+      const target = Math.floor(time < duration / 2 ? duration * 0.75 : duration * 0.25);
       await page.evaluate((to) => {
         (document.getElementById("pharos-video") as HTMLVideoElement).currentTime = to;
-      }, Math.floor(duration / 2));
-      await expect(spinner).toBeVisible({ timeout: 5_000 });
+      }, target);
+      // The seek waits on a held segment, so the spinner stays until release
+      // and a long wait cannot pass on a flash. The element says it is seeking
+      // first, so a miss says which side failed.
+      await expect
+        .poll(() => page.evaluate(() => (document.getElementById("pharos-video") as HTMLVideoElement).seeking), {
+          timeout: 15_000,
+        })
+        .toBe(true);
+      await expect(spinner).toBeVisible({ timeout: 15_000 });
       await expect(spinner).toHaveAttribute("role", "status");
       // Still there once the idle chrome has hidden.
       await page.waitForTimeout(3_500);
