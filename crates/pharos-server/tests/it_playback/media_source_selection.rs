@@ -93,6 +93,7 @@ async fn setup(td: &std::path::Path) -> (web::Data<AppState>, String) {
                     name: Some("3D HSBS".into()),
                     video_3d_format: edition_probe.video_3d_format,
                     probe: Some(Box::new(edition_probe)),
+                    part: None,
                 }],
                 ..Default::default()
             },

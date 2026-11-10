@@ -282,6 +282,7 @@ fn alternate_sources_survive_a_reload() {
                 width: Some(3840),
                 ..MediaProbe::default()
             })),
+            part: None,
         };
         let item = MediaItem {
             id: 7,
