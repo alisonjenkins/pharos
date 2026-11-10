@@ -137,7 +137,7 @@ fn assert_matches_torch(ours: &[f32], case: &Case) {
 #[ignore = "needs PHAROS_ALIGNER_WEIGHTS and a Vulkan GPU; run with --release --features vulkan"]
 fn vulkan_emissions_match_torch_and_give_the_same_ctc_paths() {
     use burn::backend::{WgpuBackend, WgpuDevice, WgpuDeviceKind};
-    use pharos_align::forward::vulkan::VulkanModel;
+    use pharos_align::forward::vulkan::{self, VulkanModel};
     let fixture: Fixture = serde_json::from_str(include_str!("../fixtures/emission.json")).unwrap();
     let dir = std::env::var("PHAROS_ALIGNER_WEIGHTS").expect("PHAROS_ALIGNER_WEIGHTS");
     let weights = Weights::open(std::path::Path::new(&dir)).unwrap();
@@ -153,10 +153,28 @@ fn vulkan_emissions_match_torch_and_give_the_same_ctc_paths() {
         }
     };
     for case in &fixture.cases {
-        let logits = m
-            .logits(&normalise(&wave(case.samples, case.seed)))
-            .unwrap();
+        let w = normalise(&wave(case.samples, case.seed));
+        let logits = m.logits(&w).unwrap();
         assert_matches_torch(&emission(&logits), case);
+        // Bucketing pads the window: unpadded, it must give the same paths
+        // and logits within float noise.
+        let exact = m.logits_padded(&w, w.len()).unwrap();
+        assert_matches_torch(&emission(&exact), case);
+        let drift = exact
+            .iter()
+            .zip(&logits)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        eprintln!(
+            "samples={} padded to {} drift={drift:e}",
+            case.samples,
+            vulkan::bucket(case.samples)
+        );
+        assert!(
+            drift < 1e-3,
+            "{} samples: padded vs exact {drift}",
+            case.samples
+        );
     }
     assert!(m
         .logits(&normalise(&wave(MIN_SAMPLES - 1, 9)))
