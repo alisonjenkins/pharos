@@ -30,7 +30,10 @@ impl Visit for Fields<'_> {
     }
 }
 
-struct Capture(Spans);
+/// Each event's message and fields.
+type Events = Arc<Mutex<Vec<HashMap<String, String>>>>;
+
+struct Capture(Spans, Events);
 
 impl<S: tracing::Subscriber + for<'a> LookupSpan<'a>> Layer<S> for Capture {
     fn on_new_span(&self, attrs: &Attributes<'_>, id: &Id, ctx: Context<'_, S>) {
@@ -46,6 +49,12 @@ impl<S: tracing::Subscriber + for<'a> LookupSpan<'a>> Layer<S> for Capture {
         self.0.lock().unwrap().insert(id.into_u64(), rec);
     }
 
+    fn on_event(&self, event: &tracing::Event<'_>, _: Context<'_, S>) {
+        let mut fields = HashMap::new();
+        event.record(&mut Fields(&mut fields));
+        self.1.lock().unwrap().push(fields);
+    }
+
     fn on_record(&self, id: &Id, values: &Record<'_>, _: Context<'_, S>) {
         if let Some(rec) = self.0.lock().unwrap().get_mut(&id.into_u64()) {
             values.record(&mut Fields(&mut rec.fields));
@@ -55,14 +64,15 @@ impl<S: tracing::Subscriber + for<'a> LookupSpan<'a>> Layer<S> for Capture {
 
 /// Every span from every thread of this test binary; other tests' spans are
 /// told apart by their song's line count.
-fn spans() -> Spans {
-    static SPANS: OnceLock<Spans> = OnceLock::new();
-    SPANS
+fn spans() -> (Spans, Events) {
+    static CAPTURED: OnceLock<(Spans, Events)> = OnceLock::new();
+    CAPTURED
         .get_or_init(|| {
-            let spans = Spans::default();
-            let subscriber = tracing_subscriber::registry().with(Capture(Arc::clone(&spans)));
+            let (spans, events) = (Spans::default(), Events::default());
+            let subscriber = tracing_subscriber::registry()
+                .with(Capture(Arc::clone(&spans), Arc::clone(&events)));
             tracing::subscriber::set_global_default(subscriber).unwrap();
-            spans
+            (spans, events)
         })
         .clone()
 }
@@ -79,7 +89,7 @@ fn descends_from(all: &HashMap<u64, Recorded>, mut id: u64, root: u64) -> bool {
 
 #[test]
 fn a_song_traces_its_wait_decodes_and_model_calls_under_one_span() {
-    let spans = spans();
+    let (spans, events) = spans();
     let s = serve("spans", silent(), None);
     let body = json!({"path": "song.mp3", "lines": [
         {"start_ms": 20_000, "end_ms": 30_000, "text": "one line sung here"},
@@ -108,6 +118,27 @@ fn a_song_traces_its_wait_decodes_and_model_calls_under_one_span() {
     assert_eq!(
         (f("aligner.device"), f("aligner.device_reason")),
         (Some("cpu"), Some("forced_cpu"))
+    );
+    // Memory against the R20 budget, on the span and the song's log line.
+    let rss = |v: Option<&str>| v.and_then(|v| v.parse::<u64>().ok()).filter(|&m| m > 0);
+    assert!(
+        rss(f("aligner.rss_mib")).is_some(),
+        "{:?}",
+        f("aligner.rss_mib")
+    );
+    let logged = events
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|e| {
+            e.get("message").map(String::as_str) == Some("song aligned")
+                && e.get("lines").map(String::as_str) == Some("4")
+        })
+        .cloned()
+        .expect("the song's log line");
+    assert!(
+        rss(logged.get("rss_mib").map(String::as_str)).is_some(),
+        "{logged:?}"
     );
 
     let under: Vec<&Recorded> = all
@@ -161,7 +192,7 @@ fn a_song_traces_its_wait_decodes_and_model_calls_under_one_span() {
 
 #[test]
 fn a_failed_song_marks_its_span_as_an_error() {
-    let spans = spans();
+    let (spans, _) = spans();
     let s = serve("spanfail", silent(), None);
     let body = json!({"path": "gone.mp3", "lines": [
         {"start_ms": 0, "end_ms": 1, "text": "a"}, {"start_ms": 1, "end_ms": 2, "text": "b"},
