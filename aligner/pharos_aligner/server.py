@@ -187,9 +187,11 @@ class AlignerHandler(http.server.BaseHTTPRequestHandler):
 
             # Waiting behind another song shows as its own span, so a slow
             # answer that was mostly queueing is told apart from a slow one.
-            with tracer.start_as_current_span("aligner.wait"):
-                ALIGN_LOCK.acquire()
+            acquired = False
             try:
+                with tracer.start_as_current_span("aligner.wait"):
+                    ALIGN_LOCK.acquire()
+                    acquired = True
                 found = estimate(lines, decode_probe, align_wide)
                 logger.info(
                     "path=%s offset_ms=%d probes=%s reason=%s",
@@ -224,7 +226,10 @@ class AlignerHandler(http.server.BaseHTTPRequestHandler):
                     if line_stamps:
                         words_aligned += len(w_list)
             finally:
-                ALIGN_LOCK.release()
+                # Released even if the wait span fails to close after the
+                # lock was taken: a lock left held stops every later song.
+                if acquired:
+                    ALIGN_LOCK.release()
         except subprocess.CalledProcessError as e:
             span.set_status(trace.Status(trace.StatusCode.ERROR, f"ffmpeg failed: {e}"))
             logger.warning(

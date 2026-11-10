@@ -7,12 +7,15 @@ the OpenTelemetry API's no-op tracer makes every span free.
 
 from __future__ import annotations
 
+import logging
 import time
 from contextlib import contextmanager
 from typing import Any, Iterator, Mapping
 
 from opentelemetry import propagate, trace
 from opentelemetry.context import Context
+
+logger = logging.getLogger("pharos_aligner")
 
 # A proxy until `init` installs a provider, so spans started by modules that
 # imported it before `init` ran still reach the exporter.
@@ -28,9 +31,14 @@ def init(endpoint: str | None) -> bool:
     from opentelemetry.sdk.trace import TracerProvider
     from opentelemetry.sdk.trace.export import BatchSpanProcessor
 
-    provider = TracerProvider(resource=Resource.create({"service.name": "pharos-aligner"}))
-    exporter = OTLPSpanExporter(endpoint=endpoint, insecure=not endpoint.startswith("https://"))
-    provider.add_span_processor(BatchSpanProcessor(exporter))
+    try:
+        provider = TracerProvider(resource=Resource.create({"service.name": "pharos-aligner"}))
+        exporter = OTLPSpanExporter(endpoint=endpoint, insecure=not endpoint.startswith("https://"))
+        provider.add_span_processor(BatchSpanProcessor(exporter))
+    except Exception:
+        # Tracing is optional: a bad endpoint must not stop the aligner.
+        logger.warning("traces off: exporter setup for %s failed", endpoint, exc_info=True)
+        return False
     trace.set_tracer_provider(provider)
     return True
 
