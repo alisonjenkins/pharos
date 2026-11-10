@@ -84,19 +84,38 @@ def test_post_align_two_lines(running_server: tuple[str, Path]) -> None:
     assert "lines" in data
     assert len(data["lines"]) == 2
 
-    # Line 0: window start is max(0, 1000 - 250) = 750
+    # Line 0: window start is max(0, 1000 - 750) = 250
     # tokens: ["hello", "world"]
     # fake spans: [(0, 100), (100, 200)]
-    # stamps: word 0: at=0, 750+0=750; word 1: at=6, 750+100=850; end: at=11, 750+200=950
+    # stamps: word 0: at=0, 250+0=250; word 1: at=6, 250+100=350; end: at=11, 250+200=450
     line0_words = data["lines"][0]["words"]
     assert line0_words == [
-        {"at": 0, "start_ms": 750},
-        {"at": 6, "start_ms": 850},
-        {"at": 11, "start_ms": 950},
+        {"at": 0, "start_ms": 250},
+        {"at": 6, "start_ms": 350},
+        {"at": 11, "start_ms": 450},
     ]
 
     # Line 1: no alignable words -> empty words list
     assert data["lines"][1]["words"] == []
+
+
+def test_post_align_a_line_sung_straight_after_another_cannot_take_its_last_word(
+    running_server: tuple[str, Path],
+) -> None:
+    base_url, media_root = running_server
+    (media_root / "test.mp3").write_bytes(b"dummy audio content")
+    payload = {
+        "path": "test.mp3",
+        "lines": [
+            {"start_ms": 1000, "end_ms": 1100, "text": "Hello world"},
+            {"start_ms": 1100, "end_ms": 3000, "text": "next line"},
+        ],
+    }
+    with urllib.request.urlopen(_post(base_url, payload)) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    # Line 0 is aligned to end at 250 + 200 = 450; line 1's lead stops there
+    # rather than reaching back to 1100 - 750 = 350.
+    assert data["lines"][1]["words"][0] == {"at": 0, "start_ms": 450}
 
 
 def test_post_align_bad_input_400(running_server: tuple[str, Path]) -> None:
@@ -224,8 +243,8 @@ def test_post_align_reports_the_whole_song_offset_and_aligns_the_shifted_lines(
     with urllib.request.urlopen(_post(base_url, payload)) as resp:
         data = json.loads(resp.read().decode("utf-8"))
     assert data["offset_ms"] == -8_000
-    # The first line's window now opens MARGIN_MS before 12 000 ms.
-    assert data["lines"][0]["words"][0] == {"at": 0, "start_ms": 11_750}
+    # The first line's window now opens LEAD_MS before 12 000 ms.
+    assert data["lines"][0]["words"][0] == {"at": 0, "start_ms": 11_250}
 
 
 def test_post_align_a_probe_that_cannot_be_decoded_costs_only_the_offset(tmp_path: Path) -> None:

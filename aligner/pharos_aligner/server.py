@@ -194,12 +194,13 @@ class AlignerHandler(http.server.BaseHTTPRequestHandler):
                 lines = shift(lines, found.offset_ms)
                 out_lines: list[dict[str, Any]] = []
                 words_aligned = 0
+                prev_end_ms = 0
                 for index, line in enumerate(lines):
                     w_list = words(line.text)
                     if not w_list:
                         out_lines.append({"words": []})
                         continue
-                    w_start, w_end = window(line, len(w_list))
+                    w_start, w_end = window(line, len(w_list), prev_end_ms)
                     pcm = decoder(full_path, w_start, w_end)
                     tokens = [w.token for w in w_list]
                     try:
@@ -214,6 +215,7 @@ class AlignerHandler(http.server.BaseHTTPRequestHandler):
                     out_lines.append({"words": line_stamps})
                     if line_stamps:
                         words_aligned += len(w_list)
+                        prev_end_ms = line_stamps[-1]["start_ms"]
         except subprocess.CalledProcessError as e:
             self._send_json(422, {"error": f"ffmpeg failed: {e}"})
             return
