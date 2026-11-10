@@ -1718,6 +1718,7 @@ impl<P: Prober> FsScanner<P> {
                             .or_else(|| parse_3d_edition(&edition)),
                         path: alt_path,
                         probe: Some(Box::new(probe)),
+                        part: None,
                     });
                 }
                 Err(err) => {
@@ -8583,6 +8584,7 @@ mod tests {
             name: None,
             video_3d_format: None,
             probe: None,
+            part: None,
         };
         assert_eq!(unique_edition_id(&[], "3D HSBS"), "3d-hsbs");
         let one = [alt("3d-hsbs")];
@@ -10160,6 +10162,7 @@ mod tests {
                 height: Some(2160),
                 ..Default::default()
             })),
+            part: None,
         });
         store.put(item).await.unwrap();
         let facts = copy_facts(

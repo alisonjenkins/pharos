@@ -2893,6 +2893,11 @@ pub struct AlternateMediaSource {
     /// the playback path. `None` on rows probed before schema v9.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub probe: Option<Box<MediaProbe>>,
+    /// Spec 037 — `Some(n)` when this file is part `n` (2 or more) of a film
+    /// split across files (`cd1`/`cd2`), played after the parts before it;
+    /// `None` for a version (an edition or copy) of the whole item.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub part: Option<u32>,
 }
 
 /// One chapter marker. `title` defaults to `Chapter {N}` when ffprobe
@@ -2971,6 +2976,24 @@ impl MediaProbe {
     /// `× 1000` integer storage. Returns `None` if absent.
     pub fn frame_rate_f32(&self) -> Option<f32> {
         self.frame_rate_mille.map(|m| m as f32 / 1000.0)
+    }
+
+    /// Spec 037 — the versions of this item (editions and copies of the whole
+    /// of it): its alternates that are not parts.
+    pub fn versions(&self) -> impl Iterator<Item = &AlternateMediaSource> {
+        self.alternate_sources.iter().filter(|a| a.part.is_none())
+    }
+
+    /// Spec 037 — the files after the first of a film split across files, in
+    /// play order (V1150).
+    pub fn parts(&self) -> Vec<&AlternateMediaSource> {
+        let mut parts: Vec<_> = self
+            .alternate_sources
+            .iter()
+            .filter(|a| a.part.is_some())
+            .collect();
+        parts.sort_by_key(|a| a.part);
+        parts
     }
 
     /// Convert duration_ms → Jellyfin's 100-ns ticks (10_000 ticks / ms).

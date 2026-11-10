@@ -57,9 +57,27 @@ mod tests {
                 video_3d_format: Some(pharos_core::Video3DFormat::HalfSideBySide),
                 ..Default::default()
             })),
+            part: None,
         }];
         let s = encode(&alts).unwrap();
         assert_eq!(decode(Some(s.as_str())), alts);
+    }
+
+    /// V1150 — a split film's part keeps its number through the column, and a
+    /// row written before parts existed decodes as a version.
+    #[test]
+    fn a_part_keeps_its_number() {
+        let alts = vec![AlternateMediaSource {
+            id: "part-2".into(),
+            path: PathBuf::from("/m/Film cd2.avi"),
+            part: Some(2),
+            ..Default::default()
+        }];
+        let s = encode(&alts).unwrap();
+        assert!(s.contains(r#""part":2"#), "{s}");
+        assert_eq!(decode(Some(s.as_str())), alts);
+        let old = decode(Some(r#"[{"id":"3d","path":"/m/Film - 3D.mkv"}]"#));
+        assert_eq!(old[0].part, None);
     }
 
     #[test]
