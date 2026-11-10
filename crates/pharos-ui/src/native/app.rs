@@ -1651,6 +1651,8 @@ fn NativeApp(route: Route) -> Element {
     use_context_provider(|| super::manage::HeldManageToken(held_manage));
     let manage_tab = use_signal(|| None::<crate::views::AdminTab>);
     use_context_provider(|| super::manage::ManageTab(manage_tab));
+    let manage_focus = use_signal(|| None::<String>);
+    use_context_provider(|| super::manage::ManageFocus(manage_focus));
     let mut flagged_list = use_signal(|| None);
     let mut flagged_asked = use_signal(|| false);
     use_context_provider(|| super::manage::FlaggedShows {

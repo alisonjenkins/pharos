@@ -19,7 +19,7 @@ pub mod server_picker;
 
 pub use admin::{
     AdminAction, AdminTab, AdminView, AdminViewProps, CreateUserAttempt, DeepSearchState,
-    IdentitySearchState, MetadataSave, MetadataState, PickPrompt,
+    IdentityFocus, IdentitySearchState, MetadataSave, MetadataState, PickPrompt,
 };
 pub use app_state::{AdminPane, AppRoute, RootApp};
 pub use detail::{DetailAction, ItemDetailView};
