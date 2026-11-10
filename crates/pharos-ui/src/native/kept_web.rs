@@ -662,12 +662,11 @@ pub fn KeepButton(
     }
 }
 
+/// The last removal that failed: the book's id and why.
+type RemoveFailure = Signal<Option<(String, String)>>;
+
 /// The list as a signal the Remove buttons update.
-fn use_store() -> (
-    Signal<KeptStore>,
-    EventHandler<String>,
-    Signal<Option<(String, String)>>,
-) {
+fn use_store() -> (Signal<KeptStore>, EventHandler<String>, RemoveFailure) {
     let mut failed = use_signal(|| None::<(String, String)>);
     let mut store = use_signal(|| read().unwrap_or_else(|| KeptStore::new("")));
     // Opening the list is when books a policy no longer keeps go.
