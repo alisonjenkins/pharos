@@ -10,6 +10,7 @@ use actix_web::http::StatusCode;
 use actix_web::{web, HttpRequest, HttpResponse};
 use serde::Serialize;
 
+use crate::obs::{Metrics, SONGS_TOTAL, SONG_SECONDS};
 use crate::plan::{parse_request, resolve};
 use crate::service::{Engine, SongError};
 
@@ -20,6 +21,8 @@ pub const MAX_BODY_BYTES: usize = 1024 * 1024;
 pub struct AppState {
     pub engine: Arc<Engine>,
     pub media_root: PathBuf,
+    /// `None` answers `/metrics` with an empty body, as before a recorder is installed.
+    pub metrics: Option<Metrics>,
 }
 
 fn json(status: StatusCode, body: &impl Serialize) -> HttpResponse {
@@ -49,6 +52,17 @@ fn error(status: StatusCode, message: impl Into<String>) -> HttpResponse {
 
 async fn healthz() -> HttpResponse {
     json(StatusCode::OK, &serde_json::json!({ "ok": true }))
+}
+
+async fn metrics(state: web::Data<AppState>) -> HttpResponse {
+    let text = state
+        .metrics
+        .as_ref()
+        .map(Metrics::render)
+        .unwrap_or_default();
+    HttpResponse::Ok()
+        .content_type("text/plain; version=0.0.4")
+        .body(text)
 }
 
 async fn not_found() -> HttpResponse {
@@ -112,7 +126,15 @@ async fn align(
             let started = Instant::now();
             let n_lines = lines.len();
             let result = engine.align_song(&rel_path, &full_path, lines);
-            let duration_ms = started.elapsed().as_millis() as u64;
+            let elapsed = started.elapsed();
+            let duration_ms = elapsed.as_millis() as u64;
+            let outcome = match &result {
+                Ok(_) => "ok",
+                Err(SongError::Ffmpeg(_)) => "ffmpeg",
+                Err(SongError::Internal(_)) => "internal",
+            };
+            metrics::counter!(SONGS_TOTAL, "outcome" => outcome).increment(1);
+            metrics::histogram!(SONG_SECONDS).record(elapsed.as_secs_f64());
             match &result {
                 Ok(a) => tracing::info!(
                     path = %rel_path,
@@ -156,6 +178,11 @@ pub fn configure(state: web::Data<AppState>) -> impl FnOnce(&mut web::ServiceCon
             .service(
                 web::resource("/healthz")
                     .route(web::get().to(healthz))
+                    .default_service(web::to(not_found)),
+            )
+            .service(
+                web::resource("/metrics")
+                    .route(web::get().to(metrics))
                     .default_service(web::to(not_found)),
             )
             .service(
