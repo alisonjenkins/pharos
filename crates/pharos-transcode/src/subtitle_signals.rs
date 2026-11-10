@@ -114,6 +114,11 @@ impl LineSignals {
     };
 }
 
+/// Bumped whenever this module or the libav pass would measure the same
+/// audio or video differently. Stored passes carry it, so an older one is
+/// measured again (spec 028, B1202).
+pub const SIGNALS_VERSION: u32 = 1;
+
 /// Everything one `SubtitleSignals` op reports.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SubtitleSignals {

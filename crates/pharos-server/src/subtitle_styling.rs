@@ -73,7 +73,7 @@ use pharos_styling::signals::{LineSignals, Segment, SegmentKind, TrackSignals};
 use pharos_styling::DIRECTOR_VERSION;
 use pharos_transcode::protocol::WorkerError;
 use pharos_transcode::scheduler::TranscodeScheduler;
-use pharos_transcode::subtitle_signals::SubtitleSignals;
+use pharos_transcode::subtitle_signals::{SubtitleSignals, SIGNALS_VERSION};
 use pharos_transcode::worker::{LibavWorkerPool, PoolError};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
@@ -416,10 +416,6 @@ struct Report {
     /// Why a stored pass was not used, when there was one.
     signals_stale: Option<&'static str>,
 }
-
-/// Bumped whenever the signal pass would measure the same audio differently,
-/// so stored passes from the older one are measured again.
-pub const SIGNALS_VERSION: u32 = 1;
 
 /// A stored signal pass: the windows it measured and what it found.
 /// `keyframes_ms` is dropped before storing; the director uses `cuts_ms`.
