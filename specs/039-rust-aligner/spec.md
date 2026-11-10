@@ -4,7 +4,7 @@
 **Created**: 2026-11-10T11:55:00Z
 **Status**: Draft. Slice 1 (CTC, text, tokens) built on `feat/rust-aligner-ctc`, not merged.
 **Scope**: Replace the Python aligner service (`aligner/`, ADR-0066) with one Rust service. It answers the same HTTP contract and runs the MMS_FA forward pass itself: on the GPU through Burn's wgpu backend on Vulkan in f32, or on the CPU through a hand-written OpenBLAS forward pass. The pharos server, its align queue and the stored word times are unchanged, apart from an optional shadow comparison used for the cutover.
-**Decision record**: ADR-0116. **Bugs reserved**: B1290-B1299. **Verification**: V1250-V1269.
+**Decision record**: ADR-0116. **Bugs reserved**: B1290-B1299. **Verification**: V1252-V1271.
 
 ---
 
@@ -99,8 +99,8 @@ LogQL: `{namespace="pharos", app_kubernetes_io_component="aligner"} |= "device="
 
 | Id | Statement | How |
 |---|---|---|
-| V1250 | `words()` gives the Python tokens and code-point offsets for every code point Python assigns, its whitespace set and mixed strings | `it_parity::text` against `text.json` |
-| V1251 | CTC paths and log scores equal torchaudio's bit for bit; span scores within 1e-6; infeasible targets are an error carrying frames, targets and repeats | `it_parity::ctc` against `ctc.json` |
+| V1270 | `words()` gives the Python tokens and code-point offsets for every code point Python assigns, its whitespace set and mixed strings | `it_parity::text` against `text.json` |
+| V1271 | CTC paths and log scores equal torchaudio's bit for bit; span scores within 1e-6; infeasible targets are an error carrying frames, targets and repeats | `it_parity::ctc` against `ctc.json` |
 | V1252 | A line's word ms equal model.py's for the same emission, including lead stars, short windows and the repeat bound | `it_parity::line` against `line.json` |
 | V1253 | Line windows, stamps, request parsing and path resolution equal plan.py's | parity fixtures from plan.py |
 | V1254 | Probe choice, offset estimate and shift equal offset.py's | parity fixtures from offset.py |

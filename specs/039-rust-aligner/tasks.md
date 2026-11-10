@@ -2,11 +2,11 @@
 
 **Input**: [spec.md](spec.md), [plan.md](plan.md), ADR-0116. Ids are local to this spec (`T039-NN`). Every code task is test first. No media titles, paths or ids in code, tests or fixtures.
 
-## Slice 1 - CTC, text and tokens (V1250-V1252), built on `feat/rust-aligner-ctc`
+## Slice 1 - CTC, text and tokens (V1270, V1271, V1252), built on `feat/rust-aligner-ctc`
 
-- [x] T039-01 `crates/pharos-align`: `text::words` matches Python on every assigned code point, its whitespace set and mixed strings (V1250).
+- [x] T039-01 `crates/pharos-align`: `text::words` matches Python on every assigned code point, its whitespace set and mixed strings (V1270).
 - [x] T039-02 `tokens`: the MMS_FA labels and tokenizer, matched against torchaudio's dictionary.
-- [x] T039-03 `ctc`: torchaudio 2.11 `forced_align`, `merge_tokens` and the per-word split. Paths and log scores match bit for bit on 47 synthetic emissions; infeasible targets error (V1251).
+- [x] T039-03 `ctc`: torchaudio 2.11 `forced_align`, `merge_tokens` and the per-word split. Paths and log scores match bit for bit on 47 synthetic emissions; infeasible targets error (V1271).
 - [x] T039-04 `line`: `_align_loaded` after the model, and frame-to-ms (V1252). Locally, real torch emissions for two songs give 658 words with Δ 0.
 
 ## Slice 2 - Pipeline and service (V1253-V1256)
