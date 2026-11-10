@@ -30,7 +30,7 @@ Id blocks (bugs and invariants are written with the fix):
 
 ## G2 — Show page and browse
 
-- [ ] T038-200 Reproduce each G2 problem in a browser (desktop and 390px) and keep the screenshots as the before state.
+- [ ] T038-200 Reproduce each G2 problem in a browser (desktop and 390px), keep the screenshots as the before state, and name or add the signal that shows each one.
 - [ ] T038-201 Show page opens on the season being watched; hero Play is the show's next-up (FR-201).
 - [ ] T038-202 Reproduce the phone episode row at 390px, then stack it (FR-202).
 - [ ] T038-203 Music library letter rail and album sort (FR-203); tab in the URL (FR-204).
@@ -43,7 +43,7 @@ Id blocks (bugs and invariants are written with the fix):
 
 ## G3 — Player controls by touch and pointer
 
-- [ ] T038-300 Reproduce on a touch device profile at 390x844: seek bar ignores touch, control row height, target sizes. Keep the before screenshots.
+- [ ] T038-300 Reproduce on a touch device profile at 390x844: seek bar ignores touch, control row height, target sizes. Keep the before screenshots and name or add the signal that shows each one.
 - [ ] T038-301 Seek bar: drag, touch, buffered range, focus (FR-301), with a group test for one command per scrub.
 - [ ] T038-302 Narrow-screen control bar and settings sheet (FR-302); screenshots at 390x844 for Alison before merge.
 - [ ] T038-303 44px targets and double-tap zones (FR-303); wheel rule (FR-304).
