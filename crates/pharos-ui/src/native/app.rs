@@ -4382,7 +4382,11 @@ fn HomeScreen() -> Element {
         None => revisit.and_then(|r| r.home.peek().clone()).map(Ok),
         Some(_) => None,
     };
-    use_place_on_return(Route::Home, fresh.is_some() || stand_in.is_some());
+    // Placed once content is up: a failure panel would spend the return.
+    use_place_on_return(
+        Route::Home,
+        matches!(fresh.or(stand_in.as_ref()), Some(Ok(_))),
+    );
     loaded_or_retry(
         fresh.or(stand_in.as_ref()),
         EventHandler::new(move |()| home.restart()),
@@ -4685,7 +4689,7 @@ fn TitleScreen(id: ItemRef) -> Element {
         Some(_) => None,
     };
     let shown = fresh.or(stand_in.as_ref());
-    use_place_on_return(Route::Title(id), shown.is_some());
+    use_place_on_return(Route::Title(id), matches!(shown, Some(Ok(_))));
     let name = shown
         .and_then(|r| r.as_ref().ok())
         .map(|d| super::views::page_name(&d.item));
