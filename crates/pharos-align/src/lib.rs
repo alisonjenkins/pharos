@@ -6,6 +6,7 @@
 //! the frame-to-millisecond conversion. Each part is checked bit-for-bit
 //! against the Python code by fixtures in `tests/fixtures`.
 
+pub mod audio;
 pub mod ctc;
 pub mod line;
 pub mod offset;
