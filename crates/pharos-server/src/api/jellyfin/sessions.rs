@@ -254,10 +254,13 @@ async fn playing_stopped(
     Ok(HttpResponse::NoContent().finish())
 }
 
-/// A withheld item answers as a missing one (V187); anything else is a 500.
+/// A withheld item answers as a missing one (V187), a play-state store
+/// failure as a 503, anything else as a 500.
 fn report_error(e: play_state::ReportError) -> actix_web::Error {
     match e {
         play_state::ReportError::Withheld(hidden) => crate::api::jellyfin::access_error(hidden),
+        // FR-108: the client may send the stop again.
+        store @ play_state::ReportError::Store { .. } => error::ErrorServiceUnavailable(store),
         other => error::ErrorInternalServerError(other),
     }
 }
