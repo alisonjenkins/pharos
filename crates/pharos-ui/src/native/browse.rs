@@ -547,12 +547,13 @@ pub enum After {
 /// The viewer's next episode after `last` on `page` (FR-102's rule): `last`
 /// itself while part-watched, else the first unwatched one after it.
 pub fn after_last(last: &Item, page: &Page) -> After {
-    if !last.played && last.position_ms > 0 {
-        return After::Here(last.id);
-    }
+    // Off the page, even a part-watched last is not one Play can start.
     let Some(at) = page.items.iter().position(|e| e.id == last.id) else {
         return After::Unknown;
     };
+    if !last.played && last.position_ms > 0 {
+        return After::Here(last.id);
+    }
     match page.items[at + 1..].iter().find(|e| !e.played) {
         Some(next) => After::Here(next.id),
         None if is_partial(page) => After::Unknown,
@@ -720,8 +721,9 @@ pub async fn load<A: PharosApi>(
                 };
                 let season = seasons[at].id;
                 let episodes = list(season, None, INDEX_ORDER).await?;
-                if after_last(last, &episodes) != After::Past {
-                    let (pick, next) = placed(last, after_last(last, &episodes));
+                let after = after_last(last, &episodes);
+                if after != After::Past {
+                    let (pick, next) = placed(last, after);
                     return Ok(Some((Some(season), pick, episodes, next)));
                 }
                 // Its season is done: the next is the first unwatched
@@ -3633,6 +3635,24 @@ mod tests {
         let last = s1[BROWSE_PAGE as usize].clone();
         fake.lists.insert((S1, None), s1);
         fake.lists.insert((SERIES, None), vec![last]);
+        let show = opened(&fake);
+        assert_eq!(show.selected, Some(S1));
+        assert_eq!(show.pick, SeasonPick::Unplaced);
+        assert_eq!(show.next_up, None);
+    }
+
+    /// Part-watched past the first page: Play could not start it from the
+    /// page, so the page says it cannot place the next rather than "resume".
+    #[test]
+    fn a_part_watched_episode_past_the_first_page_is_unplaced() {
+        let mut fake = show_fake();
+        let mut s1 = watched(1000, S1, BROWSE_PAGE);
+        let mut stopped = ep_of(2000, S1, BROWSE_PAGE + 1, "Stopped");
+        stopped.position_ms = 5_000;
+        stopped.runtime_ms = 60_000;
+        s1.push(stopped.clone());
+        fake.lists.insert((S1, None), s1);
+        fake.lists.insert((SERIES, None), vec![stopped]);
         let show = opened(&fake);
         assert_eq!(show.selected, Some(S1));
         assert_eq!(show.pick, SeasonPick::Unplaced);
