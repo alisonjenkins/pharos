@@ -178,8 +178,12 @@ impl Engine {
         let Some(idle) = self.idle_unload else {
             return false;
         };
-        let Ok(mut slot) = self.slot.try_lock() else {
-            return false;
+        // A song that panicked holding the lock leaves it poisoned; its model
+        // must still be freed, as `align_song_on` still uses it.
+        let mut slot = match self.slot.try_lock() {
+            Ok(slot) => slot,
+            Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return false,
         };
         if slot.model.is_none() || slot.last_used.elapsed() < idle {
             return false;
