@@ -52,6 +52,13 @@ const FE: [(usize, usize, usize); 7] = [
 ];
 /// Samples the feature extractor needs for one frame.
 pub const MIN_SAMPLES: usize = 400;
+/// Samples between frames: the strides' product.
+const FE_HOP: usize = 320;
+/// Frames the extractor makes per pass over a window. Every step of it works
+/// frame by frame, so pieces give the same frames, and its buffers (512
+/// channels at a fifth of the sample rate in the first layer) stay near
+/// 65 MB instead of 800 MB for a minute of audio.
+const FE_CHUNK_FRAMES: usize = 250;
 const POS_K: usize = 128;
 const POS_G: usize = 16;
 const EPS: f32 = 1e-5;
@@ -399,8 +406,21 @@ impl CpuModel {
     }
 
     /// Conv feature extractor and feature projection for one window, appended
-    /// to `x` as [t, D]; returns t.
+    /// to `x` as [t, D], `FE_CHUNK_FRAMES` frames at a time; returns t.
     fn features(&self, wave: &[f32], bf: &mut Bufs, x: &mut Vec<f32>) -> usize {
+        let t = Self::frames(wave.len());
+        let mut f0 = 0;
+        while f0 < t {
+            let f1 = (f0 + FE_CHUNK_FRAMES).min(t);
+            let piece = &wave[f0 * FE_HOP..(f1 - 1) * FE_HOP + MIN_SAMPLES];
+            let got = self.features_piece(piece, bf, x);
+            debug_assert_eq!(got, f1 - f0);
+            f0 = f1;
+        }
+        t
+    }
+
+    fn features_piece(&self, wave: &[f32], bf: &mut Bufs, x: &mut Vec<f32>) -> usize {
         let mut tin = wave.len();
         bf.a.clear();
         bf.a.extend_from_slice(wave);
@@ -644,7 +664,7 @@ fn attention(qkv: &[f32], segs: &[(usize, usize)], out: &mut [f32]) {
 
 #[cfg(test)]
 mod tests {
-    use super::{missing_feature, CpuModel, LoadError};
+    use super::{missing_feature, CpuModel, LoadError, FE, FE_HOP, MIN_SAMPLES};
 
     #[test]
     fn a_cpu_without_avx2_or_fma_is_refused_by_name() {
@@ -658,6 +678,17 @@ mod tests {
         );
         // The machines this runs on have both.
         assert!(super::check_cpu().is_ok());
+    }
+
+    #[test]
+    fn a_frame_sees_its_field_and_frames_are_a_hop_apart() {
+        assert_eq!(FE.iter().map(|&(_, _, s)| s).product::<usize>(), FE_HOP);
+        assert_eq!(CpuModel::frames(MIN_SAMPLES - 1), 0);
+        for c in 1..20 {
+            let samples = MIN_SAMPLES + (c - 1) * FE_HOP;
+            assert_eq!(CpuModel::frames(samples), c);
+            assert_eq!(CpuModel::frames(samples + FE_HOP - 1), c);
+        }
     }
 
     #[test]
