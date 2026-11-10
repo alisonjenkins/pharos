@@ -30,6 +30,11 @@ DecoderFunc = Callable[..., bytes]
 DEFAULT_IDLE_UNLOAD_SECS = 600
 IDLE_CHECK_SECS = 30
 
+# Sent with every answer. The server keeps only answers at or above its
+# minimum, so an aligner deployed after the server can't pin old times.
+# 2: a line's window opens LEAD_MS before its stamp (B1165).
+ALIGNER_VERSION = 2
+
 
 def idle_unload_secs(raw: str | None) -> float | None:
     """Parse PHAROS_ALIGNER_IDLE_UNLOAD_SECS; 0 keeps the model loaded."""
@@ -207,7 +212,7 @@ class AlignerHandler(http.server.BaseHTTPRequestHandler):
             self._send_json(500, {"error": "internal error"})
             return
 
-        self._send_json(200, {"lines": out_lines, "offset_ms": found.offset_ms})
+        self._send_json(200, {"lines": out_lines, "offset_ms": found.offset_ms, "aligner_version": ALIGNER_VERSION})
         duration_ms = int((time.monotonic() - start_time) * 1000)
         logger.info(
             "path=%s lines=%d words_aligned=%d offset_ms=%d duration_ms=%d",
