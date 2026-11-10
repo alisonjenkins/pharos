@@ -365,4 +365,74 @@ test.describe("book reader (spec 023)", () => {
     await first.close();
     await second.close();
   });
+
+  test("a PDF module that traps is replaced on the next open", async ({ browser, request }) => {
+    const ctx = await newReaderContext(browser, { width: 1280, height: 800 });
+    const page = await ctx.newPage();
+    echoReaderLog(page, "pdf trap");
+    const loaders: string[] = [];
+    page.on("request", (r) => {
+      if (new URL(r.url()).pathname === "/ui/assets/pdf/loader.js") loaders.push(new URL(r.url()).search);
+    });
+    await signIn(page, request);
+    await openFromSearch(page, "Reader Paged", "Reader Paged");
+    await page.locator("#pharos-main-action").click();
+    await expect(page.locator(".pharos-reader-progress-label")).toHaveText(/^Page \d of 5 · \d+%$/, {
+      timeout: 20_000,
+    });
+    expect(loaders).toHaveLength(1);
+
+    // The engine "panics": every call into the module now traps. The next
+    // draw (the page drawn ahead) is enough to break the reader.
+    await page.evaluate(() => {
+      const w = window as unknown as { QuirePdfDocument: { prototype: { render: () => never } } };
+      w.QuirePdfDocument.prototype.render = () => {
+        throw new WebAssembly.RuntimeError("unreachable");
+      };
+    });
+    await page.keyboard.press("ArrowLeft");
+    await page.keyboard.press("ArrowRight");
+    const note = page.locator(".pharos-reader-note[role=alert]");
+    await expect(note).toContainText("stopped", { timeout: 10_000 });
+    await expect(note.getByRole("link", { name: "Download" })).toBeVisible();
+
+    // Opening again loads a fresh module instead of reusing the broken one.
+    await page.getByRole("button", { name: "Back" }).click();
+    await page.locator("#pharos-main-action").click();
+    await expect(page.locator(".pharos-reader-progress-label")).toHaveText(/^Page \d of 5 · \d+%$/, {
+      timeout: 20_000,
+    });
+    expect(await pdfCanvas(page).then((c) => c.height)).toBeGreaterThan(0);
+    expect(loaders).toHaveLength(2);
+    expect(new Set(loaders).size).toBe(2);
+    await ctx.close();
+  });
+
+  test("a PDF module that fails to load is tried again on the next open", async ({
+    browser,
+    request,
+  }) => {
+    const ctx = await newReaderContext(browser, { width: 1280, height: 800 });
+    const page = await ctx.newPage();
+    echoReaderLog(page, "pdf retry");
+    let blocked = true;
+    await page.route("**/ui/assets/pdf/quire_pdf_bg.wasm", (route) =>
+      blocked ? route.abort() : route.continue(),
+    );
+    await signIn(page, request);
+    await openFromSearch(page, "Reader Paged", "Reader Paged");
+    await page.locator("#pharos-main-action").click();
+    const note = page.locator(".pharos-reader-note[role=alert]");
+    await expect(note).toBeVisible({ timeout: 20_000 });
+    await expect(note.getByRole("link", { name: "Download" })).toBeVisible();
+
+    blocked = false;
+    await page.getByRole("button", { name: "Back" }).click();
+    await page.locator("#pharos-main-action").click();
+    await expect(page.locator(".pharos-reader-progress-label")).toHaveText(/^Page \d of 5 · \d+%$/, {
+      timeout: 20_000,
+    });
+    await expect(page.locator("script[data-quire-pdf]")).toHaveCount(1);
+    await ctx.close();
+  });
 });
