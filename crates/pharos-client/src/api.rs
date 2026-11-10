@@ -232,10 +232,31 @@ pub struct Listing {
     pub descending: bool,
     /// One genre, by name.
     pub genre: Option<String>,
-    /// Only played (`Some(true)`) or unplayed (`Some(false)`) items.
-    pub played: Option<bool>,
+    /// Only items in this play state.
+    pub watched: Option<Watched>,
     /// Only 3D (`Some(true)`) or only 2D (`Some(false)`) titles.
     pub stereo: Option<bool>,
+}
+
+/// A play state a [`Listing`] keeps to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Watched {
+    Unwatched,
+    Watched,
+    /// Started and not finished: a film part watched, a show with an
+    /// episode watched and one still to watch (V1159).
+    InProgress,
+}
+
+impl Watched {
+    /// The Jellyfin `Filters` token the server narrows by.
+    pub fn filter(self) -> &'static str {
+        match self {
+            Watched::Unwatched => "IsUnplayed",
+            Watched::Watched => "IsPlayed",
+            Watched::InProgress => "IsResumable",
+        }
+    }
 }
 
 impl Listing {
@@ -247,7 +268,7 @@ impl Listing {
             sort_by: sort_by.to_owned(),
             descending: false,
             genre: None,
-            played: None,
+            watched: None,
             stereo: None,
         }
     }
@@ -1958,12 +1979,10 @@ fn write_listing(mut q: item_query::Builder<'_>, listing: &Listing) {
         Some(true) => StereoFilter::Only3d,
         Some(false) => StereoFilter::Only2d,
     });
-    let played = listing
-        .played
-        .map(|p| if p { "IsPlayed" } else { "IsUnplayed" });
-    let mut filters = q.init_filters(u32::from(played.is_some()));
-    if let Some(played) = played {
-        filters.set(0, played);
+    let watched = listing.watched.map(Watched::filter);
+    let mut filters = q.init_filters(u32::from(watched.is_some()));
+    if let Some(watched) = watched {
+        filters.set(0, watched);
     }
 }
 
