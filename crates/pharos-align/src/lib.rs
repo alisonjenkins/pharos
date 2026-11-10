@@ -7,3 +7,11 @@
 //! against the Python code by fixtures in `tests/fixtures`.
 
 pub mod text;
+pub mod tokens;
+
+/// Why a line could not be aligned; each variant carries the values that decided it.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum AlignError {
+    #[error("character {character:?} in token {token:?} has no MMS_FA label")]
+    UnknownCharacter { character: char, token: String },
+}
