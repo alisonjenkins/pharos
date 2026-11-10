@@ -30,8 +30,8 @@ Id blocks (bugs and invariants are written with the fix):
 
 ## G2 — Show page and browse
 
-- [x] T038-200 Reproduce each G2 problem in a browser (desktop and 390px) and keep the screenshots as the before state.
-  Done as SSR tests that state today's behaviour first, plus a static 390px render of the episode rows (the name had 0px); no live-browser pass from the cloud.
+- [ ] T038-200 Reproduce each G2 problem in a browser (desktop and 390px) and keep the screenshots as the before state.
+  Partly done: SSR tests state today's behaviour first, plus a static 390px render of the episode rows (the name had 0px). Open until a live-browser pass at desktop and 390px, which the cloud can't run.
 - [x] T038-201 Show page opens on the season being watched; hero Play is the show's next-up (FR-201).
 - [x] T038-202 Reproduce the phone episode row at 390px, then stack it (FR-202).
 - [x] T038-203 Music library letter rail and album sort (FR-203); tab in the URL (FR-204).
