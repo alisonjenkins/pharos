@@ -625,7 +625,12 @@ test.describe("pharos Dioxus UI", () => {
       await page.locator("section.pharos-rail h2 a").first().click();
       await expect(page).toHaveURL(/\/ui\/browse\/s\d+$/);
       // A library's heading is for screen readers only (B1313): its tab is lit.
-      await expect(page.locator("section.pharos-browse h2")).toBeAttached({
+      // The role locator skips a heading hidden from the accessibility tree.
+      await expect(
+        page
+          .locator("section.pharos-browse")
+          .getByRole("heading", { level: 2 }),
+      ).toBeAttached({
         timeout: 15_000,
       });
       await expect(page.locator("ul.pharos-grid li").first()).toBeVisible();
