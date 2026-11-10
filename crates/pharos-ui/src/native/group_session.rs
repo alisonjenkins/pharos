@@ -42,6 +42,58 @@ pub fn rejoin_failure(reason: &str) -> String {
     format!("Couldn't rejoin your group, so you're watching on your own. ({reason})")
 }
 
+/// How taking a group seat back after a lost connection ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RejoinOutcome {
+    Rejoined,
+    Failed,
+    /// The viewer left, or joined another group, while it ran.
+    Superseded,
+}
+
+impl RejoinOutcome {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Rejoined => "rejoined",
+            Self::Failed => "failed",
+            Self::Superseded => "superseded",
+        }
+    }
+}
+
+/// The client event for a group seat taken back, or not, after the socket it
+/// lived on closed (`reason` is `reconnect` or `reload`). Telemetry has no
+/// other sight of a group lost to a dropped connection (spec 038 FR-503).
+pub fn rejoin_event(
+    reason: &'static str,
+    group: &str,
+    outcome: RejoinOutcome,
+    attempts: u32,
+    waited_ms: i64,
+    error: Option<&str>,
+) -> ClientEvent {
+    let mut fields = vec![
+        ("group", group.to_owned()),
+        ("reason", reason.to_owned()),
+        ("outcome", outcome.label().to_owned()),
+        ("attempts", attempts.to_string()),
+        ("waited_ms", waited_ms.max(0).to_string()),
+    ];
+    if let Some(error) = error {
+        fields.push(("error", error.to_owned()));
+    }
+    ClientEvent {
+        kind: ClientEventKind::WsClosed,
+        level: if outcome == RejoinOutcome::Failed {
+            ClientLevel::Warn
+        } else {
+            ClientLevel::Info
+        },
+        route: "watch".to_owned(),
+        fields,
+    }
+}
+
 /// Keep-alive cadence (T83's ghost prune is 150 s).
 pub const PING_EVERY_S: u64 = 30;
 
@@ -885,6 +937,15 @@ impl<C: GroupClient + Clone + 'static, E: Env + 'static> Session<C, E> {
         };
         self.rejoining.set(false);
         let waited = self.env.now_ms().saturating_sub(started);
+        if reason == "reconnect" {
+            let (verdict, error) = match &outcome {
+                Ok(()) => (RejoinOutcome::Rejoined, None),
+                Err(None) => (RejoinOutcome::Superseded, None),
+                Err(Some(e)) => (RejoinOutcome::Failed, Some(e.0.as_str())),
+            };
+            self.env
+                .report(rejoin_event(reason, &id, verdict, attempts, waited, error));
+        }
         match outcome {
             Ok(()) => self.env.info(&format!(
                 "pharos: group rejoined reason={reason} group={id} attempts={attempts} waited_ms={waited}"
@@ -2521,6 +2582,69 @@ mod tests {
         let _ = rig.session.tick().now_or_never();
         rig.env.settle();
         assert_eq!(calls_with(&rig, "join(g1)").len(), 2, "one rejoin per 30 s");
+    }
+
+    /// FR-503's signal: a reconnect inside a group reports how taking the
+    /// seat back went. Disarm: drop the `report(rejoin_event(..))` call in
+    /// `rejoin` and both assertions go red.
+    #[test]
+    fn a_reconnect_in_a_group_reports_the_rejoin() {
+        let rig = rig();
+        rig.groups.gone_for_joins(1);
+        let _ = rig.session.rejoin("reconnect").now_or_never();
+        rig.env.settle();
+        let reports = rig.env.reports.borrow();
+        let Some(event) = reports.iter().find(|e| e.kind == ClientEventKind::WsClosed) else {
+            panic!("no ws_closed report: {reports:?}");
+        };
+        assert_eq!(event.level, ClientLevel::Info);
+        assert_eq!(
+            event.fields[..4],
+            [
+                ("group", "g1".to_owned()),
+                ("reason", "reconnect".to_owned()),
+                ("outcome", "rejoined".to_owned()),
+                ("attempts", "2".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_reconnect_that_loses_the_group_reports_a_warning_with_the_cause() {
+        let rig = rig();
+        rig.groups.gone_for_joins(u32::MAX);
+        let _ = rig.session.rejoin("reconnect").now_or_never();
+        rig.env.settle();
+        let reports = rig.env.reports.borrow();
+        let Some(event) = reports.iter().find(|e| e.kind == ClientEventKind::WsClosed) else {
+            panic!("no ws_closed report: {reports:?}");
+        };
+        assert_eq!(event.level, ClientLevel::Warn);
+        assert!(event.fields.contains(&("outcome", "failed".to_owned())));
+        assert!(event
+            .fields
+            .contains(&("error", "This group has ended".to_owned())));
+    }
+
+    #[test]
+    fn a_rejoin_after_a_pruned_ping_is_not_a_closed_socket() {
+        let rig = rig();
+        rig.groups.gone_for_joins(1);
+        let _ = rig.session.rejoin("not_a_member").now_or_never();
+        rig.env.settle();
+        assert!(!rig.env.kinds().contains(&ClientEventKind::WsClosed));
+    }
+
+    #[test]
+    fn rejoin_outcome_labels_are_distinct() {
+        let labels = [
+            RejoinOutcome::Rejoined,
+            RejoinOutcome::Failed,
+            RejoinOutcome::Superseded,
+        ]
+        .map(RejoinOutcome::label);
+        let set: std::collections::HashSet<_> = labels.iter().collect();
+        assert_eq!(set.len(), labels.len());
     }
 
     /// Out of a group there is nothing to rejoin.
