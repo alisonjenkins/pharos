@@ -2595,7 +2595,9 @@ test.describe("pharos Dioxus UI", () => {
     // B551: a seek that waits on the server shows a spinner over the video,
     // outside the chrome that hides on idle, and it goes once data arrives.
     test("a seek that waits on the server shows a loading spinner", async ({ page, request }) => {
-      test.setTimeout(120_000);
+      // Its waits alone can take ~170 s (30 + 15 + 30 + 30 + 15 + 15 + 3.5 + 30),
+      // before sign-in and the fixture: a slow transcode must not end it early.
+      test.setTimeout(240_000);
       const probe = await request.get(`${PHAROS_URL}/pharos/session`, {
         headers: { Accept: "application/json" },
       });
@@ -2664,7 +2666,7 @@ test.describe("pharos Dioxus UI", () => {
       // Seek well away from where the page started, past the segment it
       // played: both targets are a held segment (B1144).
       // Playing from the first segment, so the seek is a real one: Firefox
-      // only records a seek made with no media data yet (no `seeking`).
+      // does not set `seeking` for a seek made with no media data yet.
       await expect
         .poll(() => page.evaluate(() => (document.getElementById("pharos-video") as HTMLVideoElement).readyState), {
           timeout: 30_000,
