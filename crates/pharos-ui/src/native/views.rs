@@ -38,6 +38,12 @@ pub struct Nav(pub EventHandler<Route>);
 #[derive(Clone, Copy)]
 pub struct MarkPlayed(pub EventHandler<(ItemRef, bool, String)>);
 
+/// The last watched mark the server stored, `(item, played)`, provided by
+/// the app root: a grid that does not reload with the screen shows it on
+/// its tile (V1160).
+#[derive(Clone, Copy)]
+pub struct StoredMark(pub Signal<Option<(ItemRef, bool)>>);
+
 /// Marks an item one of the viewer's favourites (`true`) or not, provided
 /// by the app root: it stores the mark and reloads the screen. The name is
 /// what a failure says it could not mark.

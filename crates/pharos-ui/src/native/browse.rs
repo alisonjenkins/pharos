@@ -33,8 +33,8 @@ use super::seen::{self, MemberSeen};
 use super::together_view::{InThisGroup, SeenDots};
 use super::views::{
     display_name, episode_label, is_placeholder_episode_name, progress_percent, runtime,
-    ArtPlaceholder, FavoriteToggle, Link, MarkPlayed, PosterTile, Ratings, WatchedToggle,
-    MAIN_ACTION,
+    ArtPlaceholder, FavoriteToggle, Link, MarkPlayed, PosterTile, Ratings, StoredMark,
+    WatchedToggle, MAIN_ACTION,
 };
 use pharos_client::mix::radio;
 
@@ -1120,6 +1120,18 @@ fn PagedGrid(
             }
         }
     });
+    // The grid keeps its loaded pages through a screen reload, so a mark
+    // stored from one of its tiles is shown on that tile here (V1160).
+    let stored = try_use_context::<StoredMark>();
+    use_effect(move || {
+        if let Some((id, played)) = stored.and_then(|s| *s.0.read()) {
+            if pager.peek().items().iter().any(|i| i.id == id) {
+                pager.write().mark(id, played);
+            }
+        }
+    });
+    // An "In progress" grid offers each tile's watched mark (B1200/V1160).
+    let mark = source.watched == Some(Watched::InProgress);
     let mut watch = use_signal(|| None::<platform::SentinelWatch>);
     // Runs once the tiles are in the page, and again after every change to
     // the pager so the observer is re-armed on the tile that is now
@@ -1357,7 +1369,7 @@ fn PagedGrid(
                 }
             }
         }
-        PosterList { page, square, sentinel, arrive_from }
+        PosterList { page, square, sentinel, arrive_from, mark }
         if state.has_more() {
             div { id: END_ID, aria_hidden: "true" }
             p { class: "pharos-muted", "Showing {state.items().len()} of {state.total()}." }
@@ -1472,6 +1484,9 @@ fn PosterList(
     square: Option<bool>,
     sentinel: Option<usize>,
     #[props(default)] arrive_from: usize,
+    /// Each tile gets a button that marks it watched, or unwatched again.
+    #[props(default)]
+    mark: bool,
 ) -> Element {
     // Each tile that arrives is placed in the wave by where it sits on
     // screen, once it is in the page.
@@ -1490,7 +1505,7 @@ fn PosterList(
     });
     rsx! {
         if page.items.is_empty() {
-            p { class: "pharos-empty", "Nothing in here yet." }
+            p { class: "pharos-empty", if mark { "Nothing in progress here." } else { "Nothing in here yet." } }
         }
         ul { class,
             for (at , item , (tile_class , stagger)) in tiles {
@@ -1499,8 +1514,18 @@ fn PosterList(
                     id: if sentinel == Some(at) { SENTINEL_ID },
                     class: tile_class,
                     style: stagger,
-                    "data-key-row": (item.kind == ItemKind::Album).then_some("true"),
+                    "data-key-row": (item.kind == ItemKind::Album || mark).then_some("true"),
                     PosterTile { item: item.clone() }
+                    if mark {
+                        div { class: "pharos-tile-mark",
+                            WatchedToggle {
+                                id: item.id,
+                                played: item.played,
+                                what: (item.kind == ItemKind::Series).then(|| "show".to_owned()),
+                                name: display_name(item),
+                            }
+                        }
+                    }
                     if item.kind == ItemKind::Album {
                         QueueButtons {
                             name: item.name.clone(),
@@ -3309,6 +3334,32 @@ mod tests {
         );
         dom.rebuild_in_place();
         dioxus_ssr::render(&dom)
+    }
+
+    /// B1200 (V1160): an "In progress" grid gives each tile its watched
+    /// mark, a show's naming the show; any other grid gives none.
+    /// Disarm check: with `mark` left false, no button renders.
+    #[test]
+    fn an_in_progress_grid_offers_each_tile_its_watched_mark() {
+        let mut film = item(ItemRef::Real(1), ItemKind::Movie, "Film A");
+        film.position_ms = 60_000;
+        film.runtime_ms = 600_000;
+        let show = item(ItemRef::Synth(2), ItemKind::Series, "Show B");
+        let tiles = page(vec![film, show]);
+        let marked = tiles.clone();
+        let html = render(
+            move || rsx! { PosterList { page: marked.clone(), square: None, sentinel: None, mark: true } },
+        );
+        assert!(html.contains(">Mark watched<"), "{html}");
+        assert!(html.contains(">Mark show watched<"), "{html}");
+        let html = render(
+            move || rsx! { PosterList { page: tiles.clone(), square: None, sentinel: None } },
+        );
+        assert!(!html.contains("Mark "), "{html}");
+        let empty = render(
+            || rsx! { PosterList { page: page(vec![]), square: None, sentinel: None, mark: true } },
+        );
+        assert!(empty.contains("Nothing in progress here."), "{empty}");
     }
 
     /// B801 (V751): an album with no cover heads its page with the music
