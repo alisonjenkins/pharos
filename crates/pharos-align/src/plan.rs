@@ -21,6 +21,10 @@ pub const CAP_EXTRA_MS: i64 = 2000;
 /// Request limits; the server rejects larger bodies with a 400.
 pub const MAX_LINES: usize = 500;
 pub const MAX_TEXT_CHARS: usize = 500;
+/// Latest `start_ms` or `end_ms` a request may carry: about 31 years, past
+/// any song, and far enough below `i64::MAX` that the window and probe
+/// margins added to it cannot overflow.
+pub const MAX_TIMESTAMP_MS: i64 = 1_000_000_000_000;
 
 /// One synced lyric line as the request gives it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,6 +69,8 @@ pub enum RequestError {
     TextNotString,
     #[error("{0} cannot be negative")]
     Negative(&'static str),
+    #[error("{field} cannot exceed {MAX_TIMESTAMP_MS} ms, got {value}")]
+    TooLate { field: &'static str, value: String },
     #[error("end_ms cannot be less than start_ms")]
     EndBeforeStart,
     #[error("text cannot exceed 500 characters")]
@@ -123,7 +129,18 @@ pub fn stamps(
 /// Python's `isinstance(v, int) and not isinstance(v, bool)` on a JSON value.
 fn int_field(v: &Value, field: &'static str) -> Result<i64, RequestError> {
     match v {
-        Value::Number(n) if n.is_i64() || n.is_u64() => Ok(n.as_i64().unwrap_or(i64::MAX)),
+        Value::Number(n) if n.is_i64() || n.is_u64() => match n.as_i64() {
+            Some(ms) if ms > MAX_TIMESTAMP_MS => Err(RequestError::TooLate {
+                field,
+                value: ms.to_string(),
+            }),
+            Some(ms) => Ok(ms),
+            // Past i64::MAX: named as sent, not as the i64 it would clamp to.
+            None => Err(RequestError::TooLate {
+                field,
+                value: n.to_string(),
+            }),
+        },
         _ => Err(RequestError::NotInteger(field)),
     }
 }
@@ -238,6 +255,55 @@ pub fn resolve(media_root: &Path, path: &str) -> Result<PathBuf, RequestError> {
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+
+    #[test]
+    fn a_timestamp_past_the_limit_is_a_request_error_naming_it() {
+        let body = |start: serde_json::Value, end: serde_json::Value| {
+            serde_json::json!({"path": "a.mp3", "lines": [
+                {"start_ms": start, "end_ms": end, "text": "la la"}
+            ]})
+        };
+        let huge = i64::MAX;
+        let err = |b| parse_request(&b).unwrap_err().to_string();
+        assert_eq!(
+            err(body(huge.into(), huge.into())),
+            format!("start_ms cannot exceed 1000000000000 ms, got {huge}")
+        );
+        assert_eq!(
+            err(body(0.into(), (MAX_TIMESTAMP_MS + 1).into())),
+            "end_ms cannot exceed 1000000000000 ms, got 1000000000001"
+        );
+        assert_eq!(
+            err(body(0.into(), u64::MAX.into())),
+            format!("end_ms cannot exceed 1000000000000 ms, got {}", u64::MAX)
+        );
+    }
+
+    /// Lines at the limit go through the line window and the offset probe
+    /// without overflowing; test builds panic on overflow.
+    #[test]
+    fn lines_at_the_limit_plan_their_windows_and_probes() {
+        let max = MAX_TIMESTAMP_MS;
+        let body = serde_json::json!({"path": "a.mp3", "lines": [
+            {"start_ms": max - 3_000, "end_ms": max - 2_000, "text": "one two three"},
+            {"start_ms": max - 2_000, "end_ms": max - 1_000, "text": "four five six"},
+            {"start_ms": max - 1_000, "end_ms": max, "text": "seven eight nine"},
+        ]});
+        let (_, lines) = parse_request(&body).unwrap();
+        let (start, end) = window(&lines[2], 3, lines[1].end_ms);
+        assert!(start < end && end > max, "{start}..{end}");
+        let mut decoded = Vec::new();
+        let Ok(est) = crate::offset::estimate(
+            &lines,
+            |s, e| {
+                decoded.push((s, e));
+                Ok::<_, std::convert::Infallible>(Vec::new())
+            },
+            |_| Ok(Vec::new()),
+        );
+        assert!(!decoded.is_empty() && decoded.iter().all(|&(s, e)| s < e && e > max));
+        assert_eq!(est.offset_ms, 0);
+    }
 
     fn tmp(name: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("pharos-align-{name}-{}", std::process::id()));
