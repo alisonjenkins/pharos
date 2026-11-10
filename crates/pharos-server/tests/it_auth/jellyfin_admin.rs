@@ -290,10 +290,18 @@ async fn library_refresh_admin_only_and_broadcasts() {
         .to_request();
     let resp = test::call_service(&app, req).await;
     assert_eq!(resp.status(), 204);
-    let msg = tokio::time::timeout(std::time::Duration::from_millis(500), bus.recv())
-        .await
-        .expect("broadcast timeout")
-        .expect("recv");
+    // Each pass first says it is running (a 0% `ScanProgress`), then the
+    // scan, even over zero roots, ends with a LibraryChanged broadcast.
+    let msg = tokio::time::timeout(std::time::Duration::from_millis(500), async {
+        loop {
+            match bus.recv().await.expect("recv") {
+                SocketBroadcast::ScanProgress { .. } => continue,
+                other => break other,
+            }
+        }
+    })
+    .await
+    .expect("broadcast timeout");
     assert!(matches!(msg, SocketBroadcast::LibraryChanged { .. }));
 }
 
@@ -421,11 +429,18 @@ async fn scheduled_task_start_refresh_library_runs_and_stops() {
         .insert_header(("X-Emby-Token", token.as_str()))
         .to_request();
     assert_eq!(test::call_service(&app, start).await.status(), 204);
-    // The scan (even over zero roots) completes with a LibraryChanged broadcast.
-    let msg = tokio::time::timeout(std::time::Duration::from_secs(2), bus.recv())
-        .await
-        .expect("broadcast timeout")
-        .expect("recv");
+    // Each pass first says it is running (a 0% `ScanProgress`), then the
+    // scan, even over zero roots, ends with a LibraryChanged broadcast.
+    let msg = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            match bus.recv().await.expect("recv") {
+                SocketBroadcast::ScanProgress { .. } => continue,
+                other => break other,
+            }
+        }
+    })
+    .await
+    .expect("broadcast timeout");
     assert!(matches!(msg, SocketBroadcast::LibraryChanged { .. }));
 
     // DELETE is accepted (204) whether or not a run is live.
