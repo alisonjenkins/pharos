@@ -382,7 +382,9 @@ impl Aligner {
             })?;
         let key = cache_key(&["subtitle"], rel, &item.path, lines);
         if let Some(hit) = self.cache.get(item.id, &key) {
-            if hit.lines.len() == lines.len() {
+            // No score at all is an aligner from before scores: ask again, so
+            // a scoring aligner deployed since is heard.
+            if hit.lines.len() == lines.len() && hit.scores.iter().any(Option::is_some) {
                 return Ok(hit);
             }
         }
@@ -945,6 +947,32 @@ mod tests {
         };
         assert!(aligner.sing(&outside, &lines).await.is_err());
         assert!(aligner.sing(&item, &[]).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn an_unscored_cached_answer_is_asked_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let media_root = dir.path().join("media");
+        std::fs::create_dir_all(&media_root).unwrap();
+        let file = media_root.join("episode.mkv");
+        std::fs::write(&file, b"x").unwrap();
+        let (base, hits) = fake_service(
+            r#"{"offset_ms": 0, "aligner_version": 3, "lines": [
+                {"words": [{"at": 0, "start_ms": 1200}, {"at": 8, "start_ms": 1900}]}
+            ]}"#,
+        )
+        .await;
+        let (tx, _rx) = mpsc::channel(1);
+        let mut aligner = test_aligner(media_root, AlignCache::new(None), tx);
+        aligner.base = base;
+        let item = MediaItem {
+            kind: pharos_core::MediaKind::Episode,
+            ..sample_item(file)
+        };
+        let lines = vec![(1000, 2500, "Run away".to_owned())];
+        assert_eq!(aligner.sing(&item, &lines).await.unwrap().scores, [None]);
+        aligner.sing(&item, &lines).await.unwrap();
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     #[test]
