@@ -193,8 +193,8 @@ fn counter(
         .sum()
 }
 
-/// B914/V875: a track with more lines than one frame holds (79k on a live
-/// One Piece episode) is analysed in chunks, each line keeps its own
+/// B914/V875: a track with more lines than one frame holds (79k on a
+/// long episode) is analysed in chunks, each line keeps its own
 /// signals, and the worker survives.
 #[tokio::test]
 async fn a_track_too_long_for_one_frame_is_analysed_in_chunks() {
