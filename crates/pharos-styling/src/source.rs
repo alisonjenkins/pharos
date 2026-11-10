@@ -415,13 +415,7 @@ fn build_line(
     style_def: Option<Arc<SourceStyle>>,
 ) -> SourceLine {
     let p = parse_text(&raw, format);
-    // A style placed anywhere but bottom centre is a sign's (B1208), unless
-    // the line moves itself back there.
-    let style_placed = p.bottom_centre.is_none()
-        && style_def
-            .as_deref()
-            .and_then(SourceStyle::alignment)
-            .is_some_and(|a| a != 2);
+    let typeset = sign_cause(&p, style_def.as_deref()).is_some();
     let text = join(&p.runs);
     let visible: Vec<&Run> = p
         .runs
@@ -438,10 +432,53 @@ fn build_line(
         style,
         layer,
         italic,
-        typeset: p.typeset || style_placed,
+        typeset,
         karaoke: p.karaoke,
         style_def,
     }
+}
+
+/// Why a line passes through as a sign (B1208).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SignCause {
+    /// The line's own tags place or draw it.
+    Tag,
+    /// Its style sits at this alignment, anywhere but bottom centre.
+    Style(u8),
+}
+
+impl SignCause {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Tag => "tag",
+            Self::Style(_) => "style",
+        }
+    }
+}
+
+impl SourceLine {
+    /// What made this line typeset; `None` when it is not.
+    pub fn sign_cause(&self) -> Option<SignCause> {
+        if !self.typeset {
+            return None;
+        }
+        sign_cause(&parse_text(&self.raw, self.format), self.style_def.as_deref())
+    }
+}
+
+/// A style placed anywhere but bottom centre makes a sign, unless the line
+/// moves itself back there.
+fn sign_cause(p: &Parsed, style_def: Option<&SourceStyle>) -> Option<SignCause> {
+    if p.typeset {
+        return Some(SignCause::Tag);
+    }
+    if p.bottom_centre.is_some() {
+        return None;
+    }
+    style_def
+        .and_then(SourceStyle::alignment)
+        .filter(|&a| a != 2)
+        .map(SignCause::Style)
 }
 
 fn join(runs: &[Run]) -> String {
@@ -822,10 +859,20 @@ mod tests {
         let l = read(ass).unwrap().lines;
         let flags: Vec<bool> = l.iter().map(|l| l.typeset).collect();
         assert_eq!(flags, [true, false, false, false, false]);
-        assert_eq!(
-            l[0].style_def.as_deref().and_then(SourceStyle::alignment),
-            Some(7)
-        );
+        let causes: Vec<_> = l.iter().map(SourceLine::sign_cause).collect();
+        assert_eq!(causes, [Some(SignCause::Style(7)), None, None, None, None]);
+    }
+
+    #[test]
+    fn a_tag_placed_sign_names_its_cause() {
+        let ass = "[V4+ Styles]\n\
+            Format: Name, Fontname, Fontsize, Alignment, MarginV\n\
+            Style: Menu,Times New Roman,36,7,90\n\
+            [Events]\n\
+            Dialogue: 0,0:00:01.00,0:00:02.00,Menu,,0,0,0,,{\\pos(10,10)}Stats\n";
+        let l = read(ass).unwrap().lines;
+        assert_eq!(l[0].sign_cause(), Some(SignCause::Tag));
+        assert_ne!(SignCause::Tag.label(), SignCause::Style(7).label());
     }
 
     #[test]
