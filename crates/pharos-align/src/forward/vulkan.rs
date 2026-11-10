@@ -351,6 +351,18 @@ impl VulkanModel {
     }
 }
 
+/// Keeps compiled kernels and autotune results under `dir` across restarts,
+/// so each bucket compiles once per cache rather than once per process.
+/// Call before the first GPU device starts; false when something read the
+/// kernel settings first, which leaves them per process.
+pub fn use_kernel_cache(dir: &std::path::Path) -> bool {
+    use cubecl_runtime::config::{cache::CacheConfig, CubeClRuntimeConfig, RuntimeConfig};
+    let mut config = CubeClRuntimeConfig::default();
+    config.compilation.cache = true;
+    config.environment.path = CacheConfig::Directory(dir.to_path_buf());
+    CubeClRuntimeConfig::try_set(config)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
