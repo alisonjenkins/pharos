@@ -7,6 +7,7 @@
 //! against the Python code by fixtures in `tests/fixtures`.
 
 pub mod audio;
+pub mod config;
 pub mod ctc;
 pub mod http;
 pub mod line;
