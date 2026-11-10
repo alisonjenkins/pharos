@@ -331,11 +331,32 @@ if the scan path does not already expose one; check first.
 |---|---|
 | Image placeholders (blurhash or dominant colour; the schema field exists, `pharos.capnp:71`) | **[ALISON]** costs bytes per item in rows and lists |
 | Image cache eviction by last hit (`pharos-cache/src/image_cache.rs:1324`) [D15] | **[ALISON]** needs an in-memory hit map |
-| Auth result cache [D9] | **[ALISON]** RAM, and needs revocation rules |
+| Auth result cache [D9] | **[ALISON]** RAM, and it must not weaken sign-in (Alison, 2026-11-10): see the conditions below |
 | Auto quality forgetting a lowered rung between videos (`app.rs:4272-4276`, `quality.rs:129-131`) | **[ALISON]** playback trade-off |
 | A note on the listen view when the audio tap fails (`listen.rs:125`) | **[ALISON]** music screen |
 | Favourites past 60 per kind (`favourites.rs:13`) | Owned by the collections and favourites work |
 | Trigram search index [D10], segment cache eviction scan [D13], sweeps loading the full library [D14] | Not felt at the current library size; memory budget work owns D14 |
+
+### Conditions on an auth result cache, if it is ever built
+
+Set by Alison on 2026-11-10: it must not help an attacker enumerate users or
+learn that a guess is getting closer to a password.
+
+- It caches only the lookup of an already-issued session token (token hash to
+  user, scope, expiry). It never touches the sign-in path: password checks,
+  quick connect and API key creation are not cached and keep their current
+  cost and their current responses.
+- Only successful lookups are cached. A miss, an unknown token and a revoked
+  token take the same uncached path and return the same response as today, so
+  the cache adds no new signal about which users or tokens exist.
+- The key is the token hash, never a user name or a prefix of anything, so
+  there is no notion of a near match.
+- Sign-out, password change, user disable or delete and a policy edit drop the
+  entry at once; the time to live is a backstop, not the revocation mechanism.
+- It ships with a test that a wrong password, an unknown user and a revoked
+  token are indistinguishable in status, body and headers, before and after.
+- A review of response timing on the sign-in path is part of the change, with
+  the result written into its ADR.
 
 ## Out of scope
 
