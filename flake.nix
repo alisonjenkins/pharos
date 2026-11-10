@@ -889,6 +889,8 @@
             install -Dm644 crates/pharos-ui/assets/pdf/loader.js $out/assets/pdf/loader.js
             install -Dm644 quire-pdf-pkg/quire_pdf.js $out/assets/pdf/quire_pdf.js
             install -Dm644 quire-pdf-pkg/quire_pdf_bg.opt.wasm $out/assets/pdf/quire_pdf_bg.wasm
+            # Licences of the crates and the fonts and CMaps built into the module.
+            install -Dm644 crates/pharos-ui/assets/pdf/NOTICE.txt $out/assets/pdf/NOTICE.txt
             # Subtitle fonts (SIL OFL), each with its licence: Liberation Sans,
             # which pharos-subs draws plain text in (spec 026), and the pack
             # the ASS renderer gets for styled tracks (V530). Each is fetched
