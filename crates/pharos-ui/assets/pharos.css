@@ -4500,6 +4500,51 @@ body::before {
   outline-offset: 3px;
   box-shadow: 0 0 0 8px color-mix(in srgb, var(--px-color-focus) 35%, transparent);
 }
+/* 025: ten-foot density. 960 x 540 CSS px is a 1080p panel at 2x, so the
+   phone-sized 9rem poster filled the screen one rail at a time. Posters
+   shrink to ~9 a row and three rails share a screen; no text drops below
+   12 CSS px (24 device px), the ten-foot floor. */
+:root[data-device="tv"] .pharos-banner {
+  padding: 20px 48px 0.6rem;
+}
+:root[data-device="tv"] .pharos-library-nav {
+  margin-top: 0.4rem;
+}
+:root[data-device="tv"] .pharos-library-tab {
+  padding: 0.15rem 0.75rem;
+  font-size: 0.875rem;
+}
+:root[data-device="tv"] .pharos-main {
+  padding-top: 0.75rem;
+}
+:root[data-device="tv"] .pharos-rail {
+  margin-bottom: 0.5rem;
+}
+:root[data-device="tv"] .pharos-rail-title {
+  margin: 0;
+  font-size: 1rem;
+}
+:root[data-device="tv"] .pharos-rail-items {
+  gap: 0.75rem;
+  padding-block: 0.85rem;
+  margin-block: -0.35rem -0.6rem;
+}
+:root[data-device="tv"] .pharos-rail-items .pharos-poster {
+  width: 5.5rem;
+}
+:root[data-device="tv"] .pharos-grid {
+  grid-template-columns: repeat(auto-fill, minmax(5.5rem, 1fr));
+  gap: 0.85rem 0.75rem;
+}
+:root[data-device="tv"] .pharos-poster-name {
+  margin-top: 0.3rem;
+  font-size: 0.75rem;
+  -webkit-line-clamp: 1;
+  line-clamp: 1;
+}
+:root[data-device="tv"] .pharos-poster-placeholder {
+  font-size: 2rem;
+}
 
 @media (prefers-reduced-motion: reduce) {
   /* Focus still shows, by shadow and ring, but nothing moves. */
