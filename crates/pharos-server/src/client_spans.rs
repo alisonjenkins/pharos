@@ -8,6 +8,7 @@
 //! parent, still hang off the right node.
 
 use std::cell::Cell;
+use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use opentelemetry::trace::{
@@ -15,7 +16,9 @@ use opentelemetry::trace::{
     TraceState, Tracer,
 };
 use opentelemetry::{Context, KeyValue};
-use opentelemetry_sdk::trace::{IdGenerator, RandomIdGenerator};
+use opentelemetry_sdk::trace::{
+    IdGenerator, RandomIdGenerator, Sampler, SamplingDecision, ShouldSample,
+};
 
 thread_local! {
     static FORCED: Cell<Option<(TraceId, SpanId)>> = const { Cell::new(None) };
@@ -89,17 +92,86 @@ pub fn parse_span_id(text: &str) -> Option<SpanId> {
         .map(SpanId::from)
 }
 
+/// Oldest client span start accepted: a page that queued spans while
+/// offline flushes them within a day.
+const MAX_SPAN_AGE: Duration = Duration::from_secs(24 * 3600);
+/// Furthest ahead of the server clock a client start may be (clock skew).
+const MAX_SPAN_LEAD: Duration = Duration::from_secs(5 * 60);
+/// Longest client span accepted; a UI action or playback session span is
+/// far shorter.
+const MAX_SPAN_DURATION: Duration = Duration::from_secs(3600);
+
+/// The server's `[obs].sampling_ratio`, set once at OTLP init.
+static SAMPLING_RATIO: OnceLock<f64> = OnceLock::new();
+
+/// Records the ratio [`forward`] decides a client trace's sampling with,
+/// the same one the provider's root sampler uses.
+pub fn set_sampling_ratio(ratio: f64) {
+    let _ = SAMPLING_RATIO.set(ratio);
+}
+
+/// The ratio in force: 1.0 (keep everything) until OTLP init sets one.
+pub fn sampling_ratio() -> f64 {
+    SAMPLING_RATIO.get().copied().unwrap_or(1.0)
+}
+
+/// Whether the provider's root sampler keeps a trace that starts with
+/// `trace_id` at `ratio`. Deterministic on the trace id, so a client child
+/// span's synthetic parent gets the verdict its root span got.
+pub fn trace_sampled(trace_id: TraceId, ratio: f64) -> bool {
+    if ratio >= 1.0 {
+        return true;
+    }
+    Sampler::TraceIdRatioBased(ratio.max(0.0))
+        .should_sample(None, trace_id, "client", &SpanKind::Client, &[], &[])
+        .decision
+        == SamplingDecision::RecordAndSample
+}
+
+/// Why a client span was not forwarded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refused {
+    /// Its start is more than a day old or minutes ahead of the server
+    /// clock, or it lasts over an hour.
+    OutOfWindow,
+}
+
+/// The span's start and end, when they fall inside the accepted window
+/// around `now`.
+fn times(span: &ClientSpan, now: SystemTime) -> Option<(SystemTime, SystemTime)> {
+    let duration = Duration::from_millis(span.duration_ms);
+    if duration > MAX_SPAN_DURATION {
+        return None;
+    }
+    let start = UNIX_EPOCH.checked_add(Duration::from_millis(span.start_wall_ms))?;
+    let end = start.checked_add(duration)?;
+    let earliest = now.checked_sub(MAX_SPAN_AGE).unwrap_or(UNIX_EPOCH);
+    let latest = now.checked_add(MAX_SPAN_LEAD)?;
+    (start >= earliest && start <= latest).then_some((start, end))
+}
+
 /// Starts and ends `span` on `tracer` with the client's ids, times and
-/// status, parented on its parent span when it has one. Whether it is kept
-/// is the provider's sampler's call, as for any server span.
-pub fn forward<T: Tracer>(tracer: &T, span: ClientSpan) {
-    let start = UNIX_EPOCH + Duration::from_millis(span.start_wall_ms);
-    let end = start + Duration::from_millis(span.duration_ms);
+/// status, parented on its parent span when it has one. A root span is kept
+/// or dropped by the provider's sampler; a child's synthetic parent carries
+/// that same verdict for its trace id at `ratio`, so a trace is kept or
+/// dropped whole and a client can't force retention by naming a parent.
+pub fn forward<T: Tracer>(
+    tracer: &T,
+    span: ClientSpan,
+    ratio: f64,
+    now: SystemTime,
+) -> Result<(), Refused> {
+    let (start, end) = times(&span, now).ok_or(Refused::OutOfWindow)?;
     let parent = span.parent_span_id.map_or_else(Context::new, |parent| {
+        let flags = if trace_sampled(span.trace_id, ratio) {
+            TraceFlags::SAMPLED
+        } else {
+            TraceFlags::default()
+        };
         Context::new().with_remote_span_context(SpanContext::new(
             span.trace_id,
             parent,
-            TraceFlags::SAMPLED,
+            flags,
             true,
             TraceState::default(),
         ))
@@ -123,6 +195,7 @@ pub fn forward<T: Tracer>(tracer: &T, span: ClientSpan) {
         started.set_status(Status::error(span.message));
     }
     started.end_with_timestamp(end);
+    Ok(())
 }
 
 /// `t` as milliseconds since the epoch, 0 before it.
@@ -153,9 +226,23 @@ mod tests {
         }
     }
 
+    /// The client spans' start time sits a minute before this.
+    fn now() -> SystemTime {
+        UNIX_EPOCH + Duration::from_millis(1_762_700_060_000)
+    }
+
     fn exported(spans: Vec<ClientSpan>, with_generator: bool) -> Vec<SpanData> {
+        exported_at(spans, with_generator, 1.0)
+    }
+
+    /// Spans exported by a provider sampling like the server's at `ratio`.
+    fn exported_at(spans: Vec<ClientSpan>, with_generator: bool, ratio: f64) -> Vec<SpanData> {
         let sink = Collect::default();
-        let builder = SdkTracerProvider::builder().with_simple_exporter(sink.clone());
+        let builder = SdkTracerProvider::builder()
+            .with_simple_exporter(sink.clone())
+            .with_sampler(Sampler::ParentBased(Box::new(Sampler::TraceIdRatioBased(
+                ratio,
+            ))));
         let builder = if with_generator {
             builder.with_id_generator(ClientIdGenerator::default())
         } else {
@@ -164,7 +251,7 @@ mod tests {
         let provider = builder.build();
         let tracer = provider.tracer("pharos-ui");
         for span in spans {
-            forward(&tracer, span);
+            forward(&tracer, span, ratio, now()).unwrap();
         }
         let out = sink.0.lock().unwrap().clone();
         out
@@ -234,6 +321,60 @@ mod tests {
         let generator = ClientIdGenerator::default();
         assert_ne!(generator.new_span_id().to_string(), ROOT);
         assert_ne!(generator.new_trace_id().to_string(), TRACE);
+    }
+
+    /// At a ratio below 1 a client trace is kept or dropped whole: the
+    /// child's synthetic parent carries the root sampler's verdict. Disarm
+    /// check: with the parent hard-coded `SAMPLED`, the dropped trace's
+    /// child is exported alone.
+    #[test]
+    fn a_sampled_out_trace_drops_its_children_too() {
+        let ratio = 0.5;
+        let pick = |want: bool| {
+            // The ratio sampler reads the id's low 64 bits, so spread them:
+            // small counters all fall under the threshold.
+            (1u128..1_000)
+                .map(|i| TraceId::from(i.wrapping_mul(0x9e37_79b9_7f4a_7c15_f39c_c060_5ced_c835)))
+                .find(|t| trace_sampled(*t, ratio) == want)
+                .unwrap()
+        };
+        for (trace_id, kept) in [(pick(true), 2), (pick(false), 0)] {
+            let root = ClientSpan {
+                trace_id,
+                ..span(ROOT, None, true)
+            };
+            let child = ClientSpan {
+                trace_id,
+                ..span(CHILD, Some(ROOT), true)
+            };
+            assert_eq!(exported_at(vec![root, child], true, ratio).len(), kept);
+        }
+    }
+
+    #[test]
+    fn spans_outside_the_time_window_are_refused() {
+        let provider = SdkTracerProvider::builder().build();
+        let tracer = provider.tracer("pharos-ui");
+        let day_old = ClientSpan {
+            start_wall_ms: 1_762_700_060_000 - 25 * 3_600_000,
+            ..span(ROOT, None, true)
+        };
+        let future = ClientSpan {
+            start_wall_ms: 1_762_700_060_000 + 10 * 60_000,
+            ..span(ROOT, None, true)
+        };
+        let endless = ClientSpan {
+            duration_ms: u64::MAX,
+            ..span(ROOT, None, true)
+        };
+        let far = ClientSpan {
+            start_wall_ms: u64::MAX,
+            ..span(ROOT, None, true)
+        };
+        for bad in [day_old, future, endless, far] {
+            assert_eq!(forward(&tracer, bad, 1.0, now()), Err(Refused::OutOfWindow));
+        }
+        assert_eq!(forward(&tracer, span(ROOT, None, true), 1.0, now()), Ok(()));
     }
 
     #[test]

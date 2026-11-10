@@ -491,6 +491,13 @@ async fn submit_spans(tel: &telemetry::Client, spans: &[(&str, &str, &str)]) -> 
     let mut req = tel.submit_request();
     req.get().init_ctx();
     req.get().init_events(0);
+    let now_ms = u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap();
     let mut list = req.get().init_spans(u32::try_from(spans.len()).unwrap());
     for (i, (trace, span, parent)) in spans.iter().enumerate() {
         let mut out = list.reborrow().get(u32::try_from(i).unwrap());
@@ -498,7 +505,7 @@ async fn submit_spans(tel: &telemetry::Client, spans: &[(&str, &str, &str)]) -> 
         out.set_span_id(span);
         out.set_parent_span_id(parent);
         out.set_name("ui.action play");
-        out.set_start_wall_ms(1_762_700_000_000);
+        out.set_start_wall_ms(now_ms);
         out.set_duration_ms(120);
         out.set_ok(true);
     }
