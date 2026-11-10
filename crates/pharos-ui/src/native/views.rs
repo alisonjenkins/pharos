@@ -1458,7 +1458,7 @@ fn CastFace(credit: Credit) -> Element {
     let c = credit;
     rsx! {
         match &c.image_url {
-            Some(src) => rsx! { img { class: "pharos-cast-photo", src: "{src}", alt: "", loading: "lazy", decoding: "async" } },
+            Some(src) => rsx! { img { class: "pharos-cast-photo", src: platform::art_src(src), alt: "", loading: "lazy", decoding: "async" } },
             None => rsx! { div { class: "pharos-cast-photo pharos-cast-initials", aria_hidden: "true", "{initials(&c.name)}" } },
         }
         span { class: "pharos-cast-name", title: "{c.name}", "{c.name}" }
