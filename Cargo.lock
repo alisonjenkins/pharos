@@ -8763,7 +8763,7 @@ dependencies = [
  "rustc_apfloat",
  "slotmap",
  "smallvec",
- "spin 0.9.9",
+ "spin 0.12.3",
  "thiserror 2.0.21",
  "utf8-chars",
 ]
@@ -9562,6 +9562,20 @@ name = "read-fonts"
 version = "0.46.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bdaa4fffe9ff3ca2c353fa9729792805b9b3e324695ff5a081f860612e81b330"
+dependencies = [
+ "bytemuck",
+ "foldhash 0.2.0",
+ "font-types",
+ "once_cell",
+ "smallvec",
+ "yoke",
+]
+
+[[package]]
+name = "read-fonts"
+version = "0.47.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a39d2f8f681030a7bcbbcf3e8568775ac2393afd51401a2e2133ee89e3953897"
 dependencies = [
  "bytemuck",
  "foldhash 0.2.0",
@@ -10488,14 +10502,14 @@ checksum = "8ee5873ec9cce0195efcb7a4e9507a04cd49aec9c83d0389df45b1ef7ba2e649"
 
 [[package]]
 name = "skera"
-version = "0.9.0"
+version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1304685b8b275337200c0c138d8ca1b0b19be6185e4eb4013aebc9a1c270d761"
+checksum = "02fa4a4dc04b2d2326e4cfdcf890234a58419d00953e512fbf2823d33965d26b"
 dependencies = [
  "foldhash 0.2.0",
  "hashbrown 0.17.1",
- "read-fonts 0.46.0",
- "skrifa 0.49.0",
+ "read-fonts 0.47.0",
+ "skrifa 0.50.0",
  "thiserror 2.0.21",
  "write-fonts",
 ]
@@ -10525,6 +10539,19 @@ dependencies = [
  "bytemuck",
  "once_cell",
  "read-fonts 0.46.0",
+ "smallvec",
+ "yoke",
+]
+
+[[package]]
+name = "skrifa"
+version = "0.50.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e85ba678a6023a063d0a78c8770f1c166674ef46af13523d05eff67430f79dfe"
+dependencies = [
+ "bytemuck",
+ "once_cell",
+ "read-fonts 0.47.0",
  "smallvec",
  "yoke",
 ]
@@ -13523,13 +13550,13 @@ dependencies = [
 
 [[package]]
 name = "write-fonts"
-version = "0.55.0"
+version = "0.56.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3e91ad74b39f48f456560ed1ccc75959efa19bf6f0817d1560751bb49db84f6c"
+checksum = "944049531d52f9002812ea9de23ec8aa4e9577a7bee6869a1d0f297c679817ea"
 dependencies = [
  "font-types",
  "log",
- "read-fonts 0.46.0",
+ "read-fonts 0.47.0",
 ]
 
 [[package]]
