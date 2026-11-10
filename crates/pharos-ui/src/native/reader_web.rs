@@ -13,14 +13,14 @@ use std::rc::Rc;
 
 use dioxus::prelude::*;
 use gloo_net::http::Request;
-use pharos_client::api::{BookFormat, ItemRef, NativeApi, PharosApi as _};
+use pharos_client::api::{BookFormat, ItemRef, NativeApi, PharosApi as _, ReadPosition};
 use quire::{Locator, Publication, Target};
 use quire_web::{Action, Font, Settings, Start, Theme, View};
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::JsCast as _;
 
 use super::app::{call, this_device, Ctx};
-use super::kept::resume_place;
+use super::kept::{resume_place, server_place_to_adopt};
 use super::kept_web;
 use super::keymap::Mode;
 use super::pdf_web::PdfView;
@@ -404,6 +404,8 @@ struct Core {
     saver: Saver,
     /// When the reader reached the page now shown (unix ms).
     read_at: Cell<i64>,
+    /// The reader has turned a page since the book opened.
+    turned: Cell<bool>,
     at_end: Cell<bool>,
     alive: Rc<Cell<bool>>,
     fraction: Signal<f64>,
@@ -423,6 +425,7 @@ impl Core {
     /// The reader has gone to a new page: show how far, and offer a save.
     fn moved(&self, at_end: bool) {
         self.at_end.set(at_end);
+        self.turned.set(true);
         self.read_at.set(read_now());
         self.set_fraction(if at_end { 1.0 } else { self.engine.progress() });
         self.save(false);
@@ -461,6 +464,35 @@ impl Core {
             Ok(()) => self.moved(false),
             Err(e) => platform::warn(&format!("pharos: reader jump failed error={e}")),
         }
+    }
+
+    /// Moves a kept book to the place another device read since this one
+    /// noted its own, and records it as read when that device read it. A
+    /// reader who turned a page meanwhile is left where they are.
+    async fn adopt(&self, place: &ReadPosition) -> Result<(), String> {
+        match &self.engine {
+            Engine::Epub(view) => {
+                let at = saved_locator(&place.locator)
+                    .ok_or_else(|| format!("{} is not an EPUB place", place.locator))?;
+                view.go_to(at).await.map_err(|e| e.to_string())?;
+            }
+            Engine::Pdf(pdf) => {
+                pdf.go_to(pdf_saved_index(&place.locator, usize::MAX))?;
+            }
+        }
+        if self.turned.get() {
+            return Ok(());
+        }
+        self.read_at.set(place.read_at_ms);
+        self.at_end.set(false);
+        self.set_fraction(self.engine.progress());
+        kept_web::note_position(
+            self.saver.id,
+            &place.locator,
+            place.fraction,
+            place.read_at_ms,
+        );
+        Ok(())
     }
 
     fn apply_settings(&self, settings: ReaderSettings) {
@@ -510,6 +542,75 @@ async fn book_bytes(
 /// [`kept_web::SERVER_CHECK_MS`], and closes the book if the copy was kept
 /// by someone else (FR-005). Never delays the book: a dead connection that
 /// still reports online (a tunnel) just leaves it open.
+/// Once a kept book is open, asks the server for its place, for at most
+/// [`kept_web::SERVER_CHECK_MS`], and moves to it when another device read
+/// further since this one did (spec 036 US4). Never delays the book.
+fn check_place_later(
+    id: ItemRef,
+    api: Signal<Option<NativeApi>>,
+    alive: Rc<Cell<bool>>,
+    core: Rc<RefCell<Option<Rc<Core>>>>,
+) {
+    platform::spawn_detached(async move {
+        let Some(api) = api.peek().clone() else {
+            return;
+        };
+        if kept_web::is_offline() {
+            return;
+        }
+        let asked = kept_web::within(
+            kept_web::SERVER_CHECK_MS,
+            api.detail(&call("read", "place"), id),
+        )
+        .await;
+        let detail = match asked {
+            Some(Ok(d)) => d,
+            Some(Err(e)) => {
+                platform::warn(&format!(
+                    "pharos: reader could not fetch the server place item={id} error={e}"
+                ));
+                return;
+            }
+            None => {
+                platform::warn(&format!(
+                    "pharos: reader could not fetch the server place item={id} error=no answer in {} ms",
+                    kept_web::SERVER_CHECK_MS
+                ));
+                return;
+            }
+        };
+        let held = core.borrow().clone();
+        let (true, Some(c), Some(store)) = (alive.get(), held, kept_web::read()) else {
+            return;
+        };
+        let Some(book) = store.find(&id.to_string()) else {
+            return;
+        };
+        let queued = load_pending()
+            .entries()
+            .into_iter()
+            .find(|(queued, _)| *queued == id)
+            .map(|(_, save)| save);
+        let Some(place) = server_place_to_adopt(
+            book,
+            queued.as_ref(),
+            detail.read_position.as_ref(),
+            c.turned.get(),
+        ) else {
+            return;
+        };
+        match c.adopt(place).await {
+            Ok(()) => platform::info(&format!(
+                "pharos: reader moved to the server place item={id} at={} read_at={}",
+                place.locator, place.read_at_ms
+            )),
+            Err(e) => platform::warn(&format!(
+                "pharos: reader could not move to the server place item={id} error={e}"
+            )),
+        }
+    });
+}
+
 fn check_user_later(
     user: String,
     id: ItemRef,
@@ -667,6 +768,7 @@ async fn open_book(
             gate: RefCell::new(SaveGate::default()),
         },
         read_at: Cell::new(read_now()),
+        turned: Cell::new(false),
         at_end: Cell::new(false),
         alive,
         fraction,
@@ -708,6 +810,7 @@ async fn open_pdf(
             gate: RefCell::new(SaveGate::default()),
         },
         read_at: Cell::new(read_now()),
+        turned: Cell::new(false),
         at_end: Cell::new(false),
         alive,
         fraction,
@@ -927,6 +1030,9 @@ pub fn ReaderScreen(id: ItemRef) -> Element {
                             let at = o.core.engine.locator();
                             *core.borrow_mut() = Some(o.core);
                             phase.set(Phase::Reading);
+                            if kept {
+                                check_place_later(id, live_api, alive.clone(), core.clone());
+                            }
                             platform::info(&format!(
                                 "pharos: reader opened item={id} format=pdf from={from} bytes={length} ms={:.0} resumed={} at={}",
                                 platform::now_ms() - began,
@@ -1002,6 +1108,9 @@ pub fn ReaderScreen(id: ItemRef) -> Element {
                         toc.set(o.toc);
                         *core.borrow_mut() = Some(o.core);
                         phase.set(Phase::Reading);
+                        if kept {
+                            check_place_later(id, live_api, alive.clone(), core.clone());
+                        }
                         platform::info(&format!(
                             "pharos: reader opened item={id} format=epub from={from} bytes={length} ms={:.0} resumed={} at={}",
                             platform::now_ms() - began,
