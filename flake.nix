@@ -825,6 +825,8 @@
             doCheck = false;
           }
         );
+        # radv's manifest is named for the CPU it was built for.
+        radvIcd = "${pkgs.mesa}/share/vulkan/icd.d/radeon_icd.${pkgs.stdenv.hostPlatform.parsed.cpu.name}.json";
         alignerRsImage = pkgs.dockerTools.streamLayeredImage {
           # Its own name until the cutover (T039-26), so the Python image's
           # tags and the shadow deployment's never collide.
@@ -855,8 +857,8 @@
               # and the loader then needs radv's manifest. Both names, as
               # older loaders read only the first.
               "LD_LIBRARY_PATH=${pkgs.vulkan-loader}/lib"
-              "VK_ICD_FILENAMES=${pkgs.mesa}/share/vulkan/icd.d/radeon_icd.x86_64.json"
-              "VK_DRIVER_FILES=${pkgs.mesa}/share/vulkan/icd.d/radeon_icd.x86_64.json"
+              "VK_ICD_FILENAMES=${radvIcd}"
+              "VK_DRIVER_FILES=${radvIcd}"
             ];
             Labels = {
               "org.opencontainers.image.source" = "https://github.com/alisonjenkins/pharos";
