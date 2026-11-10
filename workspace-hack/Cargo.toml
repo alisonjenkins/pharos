@@ -18,21 +18,27 @@ publish = false
 actix-http = { version = "3", features = ["compress-brotli", "compress-gzip", "compress-zstd", "http2", "ws"] }
 actix-router = { version = "0.5", default-features = false, features = ["http", "unicode"] }
 actix-rt = { version = "2" }
+ahash = { version = "0.8" }
 aho-corasick = { version = "1", default-features = false, features = ["perf-literal", "std"] }
+arrayvec = { version = "0.7" }
 base64 = { version = "0.22" }
+bitflags = { version = "2", default-features = false, features = ["serde"] }
 brotli-decompressor = { version = "5" }
 bytemuck = { version = "1", default-features = false, features = ["aarch64_simd", "derive", "extern_crate_alloc", "min_const_generics", "wasm_simd"] }
 byteorder = { version = "1" }
 bytes = { version = "1" }
+ciborium = { version = "0.2" }
 clap = { version = "4", features = ["derive", "env"] }
 clap_builder = { version = "4", default-features = false, features = ["color", "env", "help", "std", "suggestions", "usage"] }
 crc32fast = { version = "1" }
 crossbeam-utils = { version = "0.8" }
 crypto-common = { version = "0.1", default-features = false, features = ["std"] }
-derive_more = { version = "2", features = ["add", "add_assign", "as_ref", "deref", "deref_mut", "display", "error", "from"] }
+data-encoding = { version = "2" }
+derive_more = { version = "2", features = ["add", "add_assign", "as_ref", "debug", "deref", "deref_mut", "display", "eq", "error", "from", "into", "mul", "mul_assign", "not"] }
 digest-93f6ce9d446188ac = { package = "digest", version = "0.10", features = ["std"] }
 digest-a6292c17cd707f01 = { package = "digest", version = "0.11", features = ["alloc", "mac", "oid"] }
 either = { version = "1", features = ["serde", "use_std"] }
+event-listener = { version = "5" }
 fastrand = { version = "2" }
 flate2 = { version = "1", features = ["zlib-rs"] }
 foldhash = { version = "0.2" }
@@ -45,12 +51,13 @@ futures-io = { version = "0.3" }
 futures-sink = { version = "0.3" }
 futures-util = { version = "0.3", features = ["channel", "io", "sink"] }
 getrandom-468e82937335b1c9 = { package = "getrandom", version = "0.3", default-features = false, features = ["std"] }
-half = { version = "2", default-features = false, features = ["bytemuck", "num-traits"] }
-hashbrown-9067fe90e8c1f593 = { package = "hashbrown", version = "0.17" }
-hashbrown-986da7b5efc2b80e = { package = "hashbrown", version = "0.16" }
+half = { version = "2", default-features = false, features = ["bytemuck", "num-traits", "serde", "std"] }
+hashbrown-9067fe90e8c1f593 = { package = "hashbrown", version = "0.17", features = ["serde"] }
+hashbrown-986da7b5efc2b80e = { package = "hashbrown", version = "0.16", features = ["serde"] }
 image = { version = "0.25", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
 indexmap = { version = "2" }
-itertools = { version = "0.13" }
+itertools-3575ec1268b04181 = { package = "itertools", version = "0.15" }
+itertools-594e8ee84c453af0 = { package = "itertools", version = "0.13" }
 libsqlite3-sys = { version = "0.30", default-features = false, features = ["bundled", "pkg-config", "unlock_notify", "vcpkg"] }
 log = { version = "0.4", default-features = false, features = ["std"] }
 lzma-rust2 = { version = "0.25", default-features = false, features = ["encoder", "optimization", "std"] }
@@ -59,10 +66,13 @@ memchr = { version = "2" }
 metrics-util = { version = "0.20" }
 mio = { version = "1", features = ["net", "os-ext"] }
 moxcms = { version = "0.8", features = ["in_place"] }
+nom = { version = "8" }
 num-complex = { version = "0.4", features = ["bytemuck"] }
+num-integer = { version = "0.1" }
 num-traits = { version = "0.2", features = ["i128", "libm"] }
 once_cell = { version = "1" }
 percent-encoding = { version = "2" }
+proc-macro2 = { version = "1", features = ["span-locations"] }
 quick-xml = { version = "0.42", features = ["escape-html"] }
 rand-274715c4dabd11b0 = { package = "rand", version = "0.9", default-features = false, features = ["small_rng", "thread_rng"] }
 rand-93f6ce9d446188ac = { package = "rand", version = "0.10" }
@@ -72,7 +82,7 @@ regex-automata = { version = "0.4", default-features = false, features = ["dfa-b
 regex-syntax = { version = "0.8" }
 serde = { version = "1", features = ["alloc", "derive", "rc"] }
 serde_core = { version = "1", default-features = false, features = ["alloc", "rc", "result", "std"] }
-serde_json = { version = "1", features = ["raw_value"] }
+serde_json = { version = "1", features = ["alloc", "raw_value"] }
 sevenz-rust2 = { version = "0.25", default-features = false, features = ["compress", "util"] }
 sha1_smol = { version = "1", default-features = false, features = ["std"] }
 sha2-93f6ce9d446188ac = { package = "sha2", version = "0.10" }
@@ -97,6 +107,8 @@ tracing = { version = "0.1", features = ["log"] }
 tracing-core = { version = "0.1" }
 typenum = { version = "1", default-features = false, features = ["const-generics"] }
 unicode-bidi = { version = "0.3" }
+uuid = { version = "1", features = ["serde", "v4", "v5"] }
+xxhash-rust = { version = "0.8", default-features = false, features = ["const_xxh3", "xxh3"] }
 yoke = { version = "0.8", features = ["derive"] }
 zerocopy = { version = "0.8", default-features = false, features = ["derive", "simd"] }
 zerofrom = { version = "0.1", default-features = false, features = ["alloc", "derive"] }
@@ -109,15 +121,18 @@ zune-jpeg = { version = "0.5" }
 actix-router = { version = "0.5", default-features = false, features = ["http", "unicode"] }
 aho-corasick = { version = "1", default-features = false, features = ["perf-literal", "std"] }
 base64 = { version = "0.22" }
+bitflags = { version = "2", default-features = false, features = ["serde"] }
 byteorder = { version = "1" }
 bytes = { version = "1" }
 cc = { version = "1", default-features = false, features = ["parallel"] }
 crossbeam-utils = { version = "0.8" }
 crypto-common = { version = "0.1", default-features = false, features = ["std"] }
-derive_more-impl = { version = "2", features = ["add", "add_assign", "as_ref", "deref", "deref_mut", "display", "error", "from"] }
+derive_more = { version = "2", features = ["add", "add_assign", "as_ref", "debug", "deref", "deref_mut", "display", "eq", "error", "from", "into", "mul", "mul_assign", "not"] }
+derive_more-impl = { version = "2", features = ["add", "add_assign", "as_ref", "debug", "deref", "deref_mut", "display", "eq", "error", "from", "into", "mul", "mul_assign", "not"] }
 digest-93f6ce9d446188ac = { package = "digest", version = "0.10", features = ["std"] }
 digest-a6292c17cd707f01 = { package = "digest", version = "0.11", features = ["alloc", "mac", "oid"] }
 either = { version = "1", features = ["serde", "use_std"] }
+event-listener = { version = "5" }
 fastrand = { version = "2" }
 foldhash = { version = "0.2" }
 form_urlencoded = { version = "1" }
@@ -127,10 +142,11 @@ futures-executor = { version = "0.3" }
 futures-io = { version = "0.3" }
 futures-sink = { version = "0.3" }
 futures-util = { version = "0.3", features = ["channel", "io", "sink"] }
-hashbrown-9067fe90e8c1f593 = { package = "hashbrown", version = "0.17" }
-hashbrown-986da7b5efc2b80e = { package = "hashbrown", version = "0.16" }
+hashbrown-9067fe90e8c1f593 = { package = "hashbrown", version = "0.17", features = ["serde"] }
+hashbrown-986da7b5efc2b80e = { package = "hashbrown", version = "0.16", features = ["serde"] }
 indexmap = { version = "2" }
-itertools = { version = "0.13" }
+itertools-3575ec1268b04181 = { package = "itertools", version = "0.15" }
+itertools-594e8ee84c453af0 = { package = "itertools", version = "0.13" }
 libsqlite3-sys = { version = "0.30", default-features = false, features = ["bundled", "pkg-config", "unlock_notify", "vcpkg"] }
 log = { version = "0.4", default-features = false, features = ["std"] }
 md-5 = { version = "0.11" }
@@ -139,13 +155,14 @@ mio = { version = "1", features = ["net", "os-ext"] }
 num-traits = { version = "0.2", features = ["i128", "libm"] }
 once_cell = { version = "1" }
 percent-encoding = { version = "2" }
+proc-macro2 = { version = "1", features = ["span-locations"] }
 rand-93f6ce9d446188ac = { package = "rand", version = "0.10" }
 regex = { version = "1" }
 regex-automata = { version = "0.4", default-features = false, features = ["dfa-build", "dfa-onepass", "hybrid", "meta", "nfa-backtrack", "perf-inline", "perf-literal", "std", "unicode"] }
 regex-syntax = { version = "0.8" }
 serde = { version = "1", features = ["alloc", "derive", "rc"] }
 serde_core = { version = "1", default-features = false, features = ["alloc", "rc", "result", "std"] }
-serde_json = { version = "1", features = ["raw_value"] }
+serde_json = { version = "1", features = ["alloc", "raw_value"] }
 sha2-93f6ce9d446188ac = { package = "sha2", version = "0.10" }
 sha2-a6292c17cd707f01 = { package = "sha2", version = "0.11" }
 slab = { version = "0.4" }
@@ -156,7 +173,7 @@ sqlx-macros-core = { version = "0.9", features = ["_rt-tokio", "_tls-rustls-ring
 sqlx-sqlite = { version = "0.9", default-features = false, features = ["bundled", "deserialize", "load-extension", "migrate", "offline", "unlock-notify"] }
 stable_deref_trait = { version = "1" }
 subtle = { version = "2" }
-syn-7b89eefb6aaa9bf3 = { package = "syn", version = "3", features = ["extra-traits", "full", "visit", "visit-mut"] }
+syn-7b89eefb6aaa9bf3 = { package = "syn", version = "3", features = ["extra-traits", "fold", "full", "visit", "visit-mut"] }
 syn-f595c2ba2a3f28df = { package = "syn", version = "2", features = ["extra-traits", "fold", "full", "visit", "visit-mut"] }
 thiserror = { version = "2" }
 tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "parking_lot", "process", "rt-multi-thread", "signal", "test-util"] }
@@ -209,12 +226,16 @@ libc = { version = "0.2" }
 
 [target.aarch64-apple-darwin.dependencies]
 bitflags = { version = "2", default-features = false, features = ["std"] }
+block2 = { version = "0.6" }
+dispatch2 = { version = "0.3", default-features = false, features = ["alloc", "block2", "objc2"] }
 errno = { version = "0.3" }
 futures-task = { version = "0.3", default-features = false, features = ["std"] }
 getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
 hyper = { version = "1", features = ["client", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "client-proxy", "http1"] }
 libc = { version = "0.2", features = ["extra_traits"] }
+objc2 = { version = "0.6" }
+objc2-core-foundation = { version = "0.3" }
 simdutf8 = { version = "0.1", features = ["aarch64_neon", "public_imp"] }
 tower = { version = "0.5", default-features = false, features = ["balance", "buffer", "limit", "load-shed", "retry", "timeout"] }
 
@@ -227,12 +248,16 @@ libc = { version = "0.2", features = ["extra_traits"] }
 
 [target.x86_64-apple-darwin.dependencies]
 bitflags = { version = "2", default-features = false, features = ["std"] }
+block2 = { version = "0.6" }
+dispatch2 = { version = "0.3", default-features = false, features = ["alloc", "block2", "objc2"] }
 errno = { version = "0.3" }
 futures-task = { version = "0.3", default-features = false, features = ["std"] }
 getrandom-9fbad63c4bcf4a8f = { package = "getrandom", version = "0.4", default-features = false, features = ["std", "sys_rng"] }
 hyper = { version = "1", features = ["client", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "client-proxy", "http1"] }
 libc = { version = "0.2", features = ["extra_traits"] }
+objc2 = { version = "0.6" }
+objc2-core-foundation = { version = "0.3" }
 simdutf8 = { version = "0.1", features = ["aarch64_neon", "public_imp"] }
 tower = { version = "0.5", default-features = false, features = ["balance", "buffer", "limit", "load-shed", "retry", "timeout"] }
 

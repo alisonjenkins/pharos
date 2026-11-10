@@ -3,6 +3,8 @@
 
 pub mod cpu;
 mod math;
+#[cfg(feature = "vulkan")]
+pub mod vulkan;
 
 use crate::ctc::Emission;
 use crate::line::align_line;
