@@ -64,6 +64,9 @@ pub struct Aligned {
     /// Added to every line's start to land it on the singing; positive when
     /// the lyrics were early.
     pub offset_ms: i64,
+    /// Per line, how well its words matched the singing in thousandths of
+    /// the mean character probability (aligner 4); empty from an older one.
+    pub scores: Vec<Option<u16>>,
 }
 
 impl Aligned {
@@ -104,6 +107,8 @@ struct WordsRecord {
     lines: Vec<Vec<WordEntry>>,
     #[serde(default)]
     offset_ms: i64,
+    #[serde(default)]
+    scores: Vec<Option<u16>>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -161,6 +166,7 @@ impl AlignCache {
                         })
                         .collect(),
                     offset_ms: record.offset_ms,
+                    scores: record.scores,
                 })
             }
             CacheBackend::Memory(mem) => {
@@ -185,6 +191,7 @@ impl AlignCache {
                 let record = WordsRecord {
                     key,
                     offset_ms: aligned.offset_ms,
+                    scores: aligned.scores.clone(),
                     lines: aligned
                         .lines
                         .iter()
@@ -290,6 +297,19 @@ impl Aligner {
     }
 
     async fn process_job(&self, job: &Job) -> Result<(), String> {
+        let aligned = self.request(&job.path, &job.lines).await?;
+        tracing::info!(
+            media.id = job.id,
+            lines = job.lines.len(),
+            offset_ms = aligned.offset_ms,
+            "lyrics: aligned"
+        );
+        self.cache.put(job.id, job.key.clone(), aligned);
+        Ok(())
+    }
+
+    /// One `POST /align` for `lines` of the media-relative `path`.
+    async fn request(&self, path: &str, lines: &[(u64, u64, String)]) -> Result<Aligned, String> {
         #[derive(Serialize)]
         struct AlignRequest<'a> {
             path: &'a str,
@@ -303,8 +323,7 @@ impl Aligner {
             text: &'a str,
         }
 
-        let req_lines: Vec<AlignRequestLine<'_>> = job
-            .lines
+        let req_lines: Vec<AlignRequestLine<'_>> = lines
             .iter()
             .map(|(start, end, text)| AlignRequestLine {
                 start_ms: *start,
@@ -314,7 +333,7 @@ impl Aligner {
             .collect();
 
         let payload = AlignRequest {
-            path: &job.path,
+            path,
             lines: req_lines,
         };
 
@@ -331,16 +350,45 @@ impl Aligner {
         }
 
         let body = resp.text().await.map_err(|e| format!("body: {e}"))?;
-        let aligned = parse_answer(&body, job.lines.len())?;
-        tracing::info!(
-            media.id = job.id,
-            lines = job.lines.len(),
-            offset_ms = aligned.offset_ms,
-            "lyrics: aligned"
-        );
+        parse_answer(&body, lines.len())
+    }
 
-        self.cache.put(job.id, job.key.clone(), aligned);
-        Ok(())
+    /// Word stamps for sung subtitle lines of a video, `(start, end, text)`
+    /// each (B1212): from the cache, else asked for now and cached. Unlike
+    /// [`Self::words_for`] this waits for the answer, for a background job
+    /// that has nothing to show until it has one.
+    pub async fn sing(
+        &self,
+        item: &MediaItem,
+        lines: &[(u64, u64, String)],
+    ) -> Result<Aligned, String> {
+        if lines.is_empty() || lines.len() > MAX_LINES {
+            return Err(format!(
+                "{} lines; the aligner takes 1 to {MAX_LINES}",
+                lines.len()
+            ));
+        }
+        let rel = item
+            .path
+            .strip_prefix(&self.media_root)
+            .ok()
+            .and_then(|p| p.to_str())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                format!(
+                    "{} is outside the aligner's media root",
+                    item.path.display()
+                )
+            })?;
+        let key = cache_key(&["subtitle"], rel, &item.path, lines);
+        if let Some(hit) = self.cache.get(item.id, &key) {
+            if hit.lines.len() == lines.len() {
+                return Ok(hit);
+            }
+        }
+        let aligned = self.request(rel, lines).await?;
+        self.cache.put(item.id, key, aligned.clone());
+        Ok(aligned)
     }
 
     /// Check if word timestamps are ready for `lyrics`, or queue a background job.
@@ -372,36 +420,7 @@ impl Aligner {
             job_lines.push((start_ms, end_ms, line.text.clone()));
         }
 
-        let (size, mtime) = match std::fs::metadata(&item.path) {
-            Ok(m) => {
-                let size = m.len();
-                let mtime = m
-                    .modified()
-                    .ok()
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map_or(0, |d| d.as_secs());
-                (size, mtime)
-            }
-            Err(_) => (0, 0),
-        };
-
-        let json_bytes = serde_json::to_vec(&serde_json::json!([
-            ALIGN_VERSION,
-            &rel_path,
-            size,
-            mtime,
-            &job_lines,
-        ]))
-        .unwrap_or_default();
-
-        let mut hasher = Sha256::new();
-        hasher.update(&json_bytes);
-        let hash = hasher.finalize();
-        let mut key = String::with_capacity(64);
-        for byte in hash {
-            use std::fmt::Write as _;
-            let _ = write!(key, "{byte:02x}");
-        }
+        let key = cache_key(&[], &rel_path, &item.path, &job_lines);
 
         if let Some(aligned) = self.cache.get(item.id, &key) {
             if aligned.lines.len() == job_lines.len() {
@@ -449,6 +468,43 @@ impl Aligner {
     }
 }
 
+/// The cache key for `lines` of the file at `path` (media-relative `rel`):
+/// the file's size and mtime are in it, so a replaced file aligns again.
+/// `tag` keeps one kind of request's answers apart from another's.
+fn cache_key(tag: &[&str], rel: &str, path: &Path, lines: &[(u64, u64, String)]) -> String {
+    let (size, mtime) = match std::fs::metadata(path) {
+        Ok(m) => {
+            let size = m.len();
+            let mtime = m
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |d| d.as_secs());
+            (size, mtime)
+        }
+        Err(_) => (0, 0),
+    };
+    let mut parts = vec![serde_json::json!(ALIGN_VERSION)];
+    parts.extend(tag.iter().map(|t| serde_json::json!(t)));
+    parts.extend([
+        serde_json::json!(rel),
+        serde_json::json!(size),
+        serde_json::json!(mtime),
+        serde_json::json!(lines),
+    ]);
+    let json_bytes = serde_json::to_vec(&parts).unwrap_or_default();
+
+    let mut hasher = Sha256::new();
+    hasher.update(&json_bytes);
+    let hash = hasher.finalize();
+    let mut key = String::with_capacity(64);
+    for byte in hash {
+        use std::fmt::Write as _;
+        let _ = write!(key, "{byte:02x}");
+    }
+    key
+}
+
 /// Parse the aligner service's JSON response, rejecting line count mismatches.
 /// The error names what was wrong, e.g. serde's "missing field `offset_ms`"
 /// from an aligner older than the offset search.
@@ -468,6 +524,9 @@ fn parse_answer(body: &str, n_lines: usize) -> Result<Aligned, String> {
     #[derive(Deserialize)]
     struct ReplyLine {
         words: Vec<ReplyWord>,
+        /// From aligner 4 on; `null` for a line with no words.
+        #[serde(default)]
+        score: Option<f32>,
     }
 
     #[derive(Deserialize)]
@@ -491,7 +550,17 @@ fn parse_answer(body: &str, n_lines: usize) -> Result<Aligned, String> {
         ));
     }
 
+    let scores = reply
+        .lines
+        .iter()
+        .map(|l| {
+            l.score
+                .filter(|s| s.is_finite())
+                .map(|s| (s.clamp(0.0, 1.0) * 1000.0).round() as u16)
+        })
+        .collect();
     Ok(Aligned {
+        scores,
         lines: reply
             .lines
             .into_iter()
@@ -690,6 +759,7 @@ mod tests {
         let aligned = Aligned {
             lines: stamps,
             offset_ms: 0,
+            scores: Vec::new(),
         };
         aligner.cache.put(item.id, job.key.clone(), aligned.clone());
 
@@ -777,6 +847,7 @@ mod tests {
         let aligned = Aligned {
             lines: stamps,
             offset_ms: -3_700,
+            scores: vec![Some(712), None],
         };
         assert_eq!(cache.get(10, "key_a"), None);
         cache.put(10, "key_a".into(), aligned.clone());
@@ -788,6 +859,103 @@ mod tests {
         let file_path = cache_dir.join("10.words.json");
         std::fs::write(&file_path, b"corrupted json").unwrap();
         assert_eq!(cache.get(10, "key_a"), None);
+    }
+
+    /// Answers every request with `body`, counting them.
+    async fn fake_service(body: &'static str) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&hits);
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut buf = vec![0u8; 64 * 1024];
+                let mut got = Vec::new();
+                // Headers, then as much body as Content-Length says.
+                loop {
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    got.extend_from_slice(&buf[..n]);
+                    let text = String::from_utf8_lossy(&got);
+                    if let Some(end) = text.find("\r\n\r\n") {
+                        let len = text
+                            .lines()
+                            .find_map(|l| {
+                                l.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                            })
+                            .unwrap_or(0);
+                        if got.len() >= end + 4 + len {
+                            break;
+                        }
+                    }
+                }
+                let reply = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(reply.as_bytes()).await;
+            }
+        });
+        (base, hits)
+    }
+
+    #[tokio::test]
+    async fn sung_subtitle_lines_are_asked_for_once_then_read_from_the_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let media_root = dir.path().join("media");
+        std::fs::create_dir_all(&media_root).unwrap();
+        let file = media_root.join("episode.mkv");
+        std::fs::write(&file, b"x").unwrap();
+        let (base, hits) = fake_service(
+            r#"{"offset_ms": 0, "aligner_version": 4, "lines": [
+                {"words": [{"at": 0, "start_ms": 1200}, {"at": 8, "start_ms": 1900}], "score": 0.61}
+            ]}"#,
+        )
+        .await;
+        let (tx, _rx) = mpsc::channel(1);
+        let mut aligner = test_aligner(media_root, AlignCache::new(None), tx);
+        aligner.base = base;
+        let item = MediaItem {
+            kind: pharos_core::MediaKind::Episode,
+            ..sample_item(file)
+        };
+        let lines = vec![(1000, 2500, "Run away".to_owned())];
+
+        let first = aligner.sing(&item, &lines).await.unwrap();
+        assert_eq!(first.scores, [Some(610)]);
+        assert_eq!(
+            first.lines[0][1],
+            WordStamp {
+                at: 8,
+                start_ms: 1900
+            }
+        );
+        assert_eq!(aligner.sing(&item, &lines).await.unwrap(), first);
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let outside = MediaItem {
+            path: PathBuf::from("/elsewhere/x.mkv"),
+            ..item.clone()
+        };
+        assert!(aligner.sing(&outside, &lines).await.is_err());
+        assert!(aligner.sing(&item, &[]).await.is_err());
+    }
+
+    #[test]
+    fn line_scores_are_read_in_thousandths_and_absent_from_an_older_aligner() {
+        let answer = r#"{"offset_ms": 0, "aligner_version": 4, "lines": [
+            {"words": [{"at": 0, "start_ms": 10}, {"at": 3, "start_ms": 90}], "score": 0.4567},
+            {"words": [], "score": null}
+        ]}"#;
+        assert_eq!(parse_answer(answer, 2).unwrap().scores, [Some(457), None]);
+        let older = r#"{"offset_ms": 0, "aligner_version": 2, "lines": [{"words": []}]}"#;
+        assert_eq!(parse_answer(older, 1).unwrap().scores, [None]);
     }
 
     #[test]
@@ -846,6 +1014,7 @@ mod tests {
         let early = Aligned {
             lines: Vec::new(),
             offset_ms: -2_500,
+            scores: Vec::new(),
         };
         assert_eq!(early.shift(10_000), 7_500);
         assert_eq!(early.shift(1_000), 0);
