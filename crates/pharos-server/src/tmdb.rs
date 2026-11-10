@@ -273,6 +273,30 @@ impl TmdbClient {
         Some(md)
     }
 
+    /// B991 — whether TMDB holds the episode: a 404 is "no such record", a
+    /// transport error or any other status is a failed request.
+    pub(crate) async fn episode_status(
+        &self,
+        series_id: &str,
+        season: u32,
+        episode: u32,
+    ) -> crate::online_enrich::TextsFetch {
+        use crate::online_enrich::TextsFetch;
+        let sent = self
+            .http
+            .get(format!(
+                "{API_BASE}/tv/{series_id}/season/{season}/episode/{episode}"
+            ))
+            .query(&[("api_key", self.api_key.as_str())])
+            .send()
+            .await;
+        match sent {
+            Ok(resp) if resp.status().is_success() => TextsFetch::Found(Vec::new()),
+            Ok(resp) if resp.status() == reqwest::StatusCode::NOT_FOUND => TextsFetch::NotFound,
+            _ => TextsFetch::Failed,
+        }
+    }
+
     /// Spec 033 (V891) — the episodes TMDB lists for one season of a show.
     pub(crate) async fn season_episodes(
         &self,
@@ -434,6 +458,16 @@ impl crate::online_enrich::OnlineEnricher for TmdbEnricher {
 
     async fn fetch_image_bytes(&self, url: &str) -> Option<Vec<u8>> {
         self.0.fetch_image_bytes(url).await
+    }
+
+    async fn episode_status(
+        &self,
+        id: &str,
+        season: u32,
+        episode: u32,
+        _name: Option<&str>,
+    ) -> crate::online_enrich::TextsFetch {
+        self.0.episode_status(id, season, episode).await
     }
 
     async fn list_images(
