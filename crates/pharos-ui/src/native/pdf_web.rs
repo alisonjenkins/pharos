@@ -341,6 +341,27 @@ impl PdfView {
         Ok(true)
     }
 
+    /// Shows page `to` (from 0, held inside the book) at its head. `Ok(false)`
+    /// when it is already shown.
+    pub fn go_to(self: &Rc<Self>, to: usize) -> Result<bool, String> {
+        if self.broken.get() {
+            return Err("The PDF reader has stopped.".to_owned());
+        }
+        let to = to.min(self.count.saturating_sub(1));
+        if to == self.index.get() {
+            return Ok(false);
+        }
+        self.generation.set(self.generation.get().wrapping_add(1));
+        self.layout_for(to)?;
+        let canvas = self.shown.borrow().clone();
+        self.draw(&canvas, to)?;
+        self.spare.borrow_mut().drawn = None;
+        self.index.set(to);
+        self.host.set_scroll_top(0);
+        self.prerender_later();
+        Ok(true)
+    }
+
     /// Draws the current page again, for a new window size or fit.
     pub fn relayout(self: &Rc<Self>) {
         let canvas = self.shown.borrow().clone();
