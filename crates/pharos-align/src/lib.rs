@@ -8,6 +8,7 @@
 
 pub mod ctc;
 pub mod line;
+pub mod plan;
 pub mod text;
 pub mod tokens;
 
