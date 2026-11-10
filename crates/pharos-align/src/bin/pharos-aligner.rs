@@ -9,6 +9,7 @@ use pharos_align::forward::cpu::CpuModel;
 use pharos_align::forward::CpuAligner;
 use pharos_align::http::{configure, AppState};
 use pharos_align::obs::{self, Metrics};
+use pharos_align::pin;
 use pharos_align::service::{Decoder, Engine, Loader, Model};
 use pharos_align::weights::Weights;
 
@@ -43,6 +44,35 @@ fn openmp_env(threads: usize) {
     eprintln!("re-exec with the OpenMP settings failed, songs will run slower: {err}");
 }
 
+/// Where the kernel lists each CPU's core and cache siblings.
+const SYSFS_CPU: &str = "/sys/devices/system/cpu";
+
+/// Pins this process before any pool starts, so every worker inherits it.
+/// Returns what was decided, for the start log; a failure only costs speed.
+fn pin_threads(mode: pin::PinMode, threads: usize) -> (pin::Plan, Option<String>) {
+    let allowed = match pin::allowed() {
+        Ok(a) => a,
+        Err(e) => {
+            let plan = pin::Plan {
+                cpus: None,
+                reason: "affinity_unreadable",
+            };
+            return (plan, Some(format!("sched_getaffinity: {e}")));
+        }
+    };
+    let plan = pin::plan(
+        mode,
+        &pin::topology(std::path::Path::new(SYSFS_CPU), &allowed),
+        threads,
+    );
+    let err = plan
+        .cpus
+        .as_deref()
+        .and_then(|cpus| pin::apply(cpus).err())
+        .map(|e| format!("sched_setaffinity {:?}: {e}", plan.cpus));
+    (plan, err)
+}
+
 fn main() -> std::process::ExitCode {
     let config = match Config::from_env(|k| std::env::var(k).ok()) {
         Ok(c) => c,
@@ -56,7 +86,8 @@ fn main() -> std::process::ExitCode {
         return std::process::ExitCode::FAILURE;
     }
     openmp_env(config.threads);
-    match actix_web::rt::System::new().block_on(run(config)) {
+    let pinned = pin_threads(config.pin, config.threads);
+    match actix_web::rt::System::new().block_on(run(config, pinned)) {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(e) => {
             tracing::error!(error = %e, "pharos-aligner stopped");
@@ -65,8 +96,20 @@ fn main() -> std::process::ExitCode {
     }
 }
 
-async fn run(config: Config) -> Result<(), String> {
+async fn run(config: Config, (plan, pin_err): (pin::Plan, Option<String>)) -> Result<(), String> {
     let traced = obs::init(config.otlp_endpoint.as_deref());
+    let cpus = plan
+        .cpus
+        .as_ref()
+        .map_or("unpinned".to_owned(), |c| format!("{c:?}"));
+    match pin_err {
+        None => {
+            tracing::info!(mode = %config.pin.label(), reason = %plan.reason, cpus = %cpus, "thread pinning")
+        }
+        Some(e) => {
+            tracing::warn!(mode = %config.pin.label(), reason = %plan.reason, cpus = %cpus, error = %e, "thread pinning failed, running unpinned")
+        }
+    }
     let metrics = Metrics::install()?;
     let ffmpeg = std::env::var("PHAROS_ALIGNER_FFMPEG").unwrap_or_else(|_| "ffmpeg".into());
     let decoder: Decoder =
