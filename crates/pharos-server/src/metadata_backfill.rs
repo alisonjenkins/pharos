@@ -1908,7 +1908,18 @@ async fn series_search_decide<E: OnlineEnricher>(
         );
         record_rematch(RematchStep::YearRetry);
     }
-    let candidates = read_stated_year(title, year, candidates, retried);
+    let (candidates, read) = read_stated_year(title, year, candidates, retried);
+    if !read.is_empty() {
+        tracing::info!(
+            provider = enricher.provider(),
+            series_key,
+            query = title,
+            year,
+            retried,
+            read = %read.join(", "),
+            "series match: candidates read as the stated year"
+        );
+    }
     match_decide(title, year, &candidates, cfg.match_min_confidence)
 }
 
@@ -1916,16 +1927,18 @@ async fn series_search_decide<E: OnlineEnricher>(
 /// stated `year`: one named `"{title} ({year})"` takes that year, and after a
 /// retry without the year they are ordered nearest year first (the order is
 /// [`match_decide`]'s last tie-break) and one within [`STATED_YEAR_SLACK`]
-/// takes it as well.
+/// takes it as well. Also returns each candidate whose year it changed, as
+/// `id provider_year->year`.
 fn read_stated_year(
     title: &str,
     year: Option<u32>,
     mut candidates: Vec<pharos_core::SearchCandidate>,
     retried: bool,
-) -> Vec<pharos_core::SearchCandidate> {
+) -> (Vec<pharos_core::SearchCandidate>, Vec<String>) {
     let Some(year) = year else {
-        return candidates;
+        return (candidates, Vec::new());
     };
+    let mut read = Vec::new();
     let named = format!("{title} ({year})");
     if retried {
         candidates.sort_by_key(|c| c.year.map_or(u32::MAX, |cy| cy.abs_diff(year)));
@@ -1937,11 +1950,15 @@ fn read_stated_year(
         let near = retried
             && c.year
                 .is_some_and(|cy| cy.abs_diff(year) <= STATED_YEAR_SLACK);
-        if carries || near {
+        if (carries || near) && c.year != Some(year) {
+            read.push(match c.year {
+                Some(cy) => format!("{} {cy}->{year}", c.id),
+                None => format!("{} none->{year}", c.id),
+            });
             c.year = Some(year);
         }
     }
-    candidates
+    (candidates, read)
 }
 
 /// Insert `art` into `chosen` keyed by its role. When a role is already
@@ -8753,6 +8770,11 @@ mod tests {
         for want in ["year=2003", "chosen=\"920011\""] {
             assert!(line.contains(want), "{want} missing from {line}");
         }
+        let read = text
+            .lines()
+            .find(|l| l.contains("candidates read as the stated year"))
+            .unwrap_or_else(|| panic!("no read line in {text}"));
+        assert!(read.contains("920011 2005->2003"), "{read}");
     }
 
     const SHORT_SHOW: &str = "/tv/Show A (2003)";
