@@ -141,7 +141,7 @@ const GEN_VERSION_MARKER: &str = ".gen_version";
 /// interrupted run (heavy-op timeout on a long movie, worker crash, pod
 /// restart mid-deploy) leaves a partial set that used to pass the tile-0
 /// "generated" probe forever — advertised trickplay, grey previews past the
-/// truncation point (observed live: Avatar, tiles ending at 1h39m58s).
+/// truncation point (observed live: Film BA, tiles ending at 1h39m58s).
 const COMPLETE_MARKER: &str = ".complete";
 
 #[derive(Debug)]
@@ -1087,7 +1087,7 @@ mod tests {
         );
     }
 
-    /// B39 — the Avatar failure: an interrupted generation leaves a TRUNCATED
+    /// B39 — the Film BA failure: an interrupted generation leaves a TRUNCATED
     /// sheet set (no completion marker). It must not count as generated, and
     /// ensure_generated must wipe + re-attempt it rather than no-op.
     #[tokio::test]

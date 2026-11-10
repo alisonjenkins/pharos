@@ -1130,7 +1130,7 @@ async fn read_progress(out: &Path) -> Option<(u64, f64)> {
 /// stream. Where audio outruns video — a trailing music cue, a fade over
 /// black, any mux that pads audio — the final window therefore asks for video
 /// the source does not hold, and neither a re-encode nor a longer preroll can
-/// conjure it. T113, live on 2026-08-15: Ant-Man's segment 1171 of 1172 asked
+/// conjure it. T113, live on 2026-08-15: Film AV's segment 1171 of 1172 asked
 /// for 0.773 s against 0.500 s of video and 500'd on all 14 attempts across 7
 /// play sessions, so playing that title to its end produced an error instead
 /// of an end of stream.
@@ -4230,7 +4230,7 @@ impl HlsSegmentCache {
         // is drowning (client consumes 1×; even prefetch can't hide a 3×
         // deficit for long). Surface it at WARN with every dimension needed
         // to attribute the stall — the 170-225 s outliers observed live
-        // (2026-07-14, Avatar burn path) were only findable by correlating
+        // (2026-07-14, Film BA burn path) were only findable by correlating
         // INFO lines after the fact.
         if far_below_realtime(transcode_ms as f64, seg_secs) {
             tracing::warn!(
@@ -5161,7 +5161,7 @@ impl HlsSegmentCache {
     // fresh frame grid at its own seek point, so consecutive segments carry
     // overlapping, phase-misaligned audio — the same instants encoded twice,
     // at different timestamps, from different encoder state. Measured live on
-    // Fringe S01E02: 6.037 s of audio against 6.006 s of video in every
+    // Show AW S01E02: 6.037 s of audio against 6.006 s of video in every
     // segment, and the copies 0.53 of a frame out of phase with each other.
     //
     // The fix is one encode per title, sliced by copy. This produces that
@@ -8692,7 +8692,7 @@ mod tests {
         let source = real_tiny_source(&dir).await;
         let (cache, _) = slow_test_cache(&dir, std::time::Duration::ZERO);
         // A worker that always reports a short (but nonzero) duration — the
-        // Ant-Man shape (T113): video ends before the container's clamp.
+        // Film AV shape (T113): video ends before the container's clamp.
         let real_attempts = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let sched = always_short_until_filler(false, real_attempts.clone());
         let cache = cache.with_scheduler(sched);
@@ -9768,7 +9768,7 @@ mod tests {
         // The observed catastrophic case: the decoder could not rebuild its
         // reference list after the seek and skipped every NALU, so the
         // segment carries audio and no picture — and ffmpeg exited 0. Two
-        // live segments of Fringe S01E02 looked exactly like this.
+        // live segments of Show AW S01E02 looked exactly like this.
         let td = TempDir::new().unwrap();
         let out = td.path().join("seg.ts");
         write_progress(&out, 0, 6.006).await;
@@ -10233,7 +10233,7 @@ mod tests {
         assert_eq!(labels.len(), ALL.len(), "frame results collide: {labels:?}");
     }
 
-    /// T116 — a deficit at the LAST segment is not frame loss. Ant-Man's
+    /// T116 — a deficit at the LAST segment is not frame loss. Film AV's
     /// numbers, measured on the deployed B189 fix: the tail produced 15 of the
     /// 19 frames its container-derived window implied, and those four never
     /// existed to be produced.
@@ -10277,7 +10277,7 @@ mod tests {
     /// The grid, and so the window's clamp, comes from the CONTAINER duration;
     /// the encoder stops at the end of the VIDEO stream. When those differ the
     /// final window asks for video the source does not hold, and no encoder and
-    /// no preroll can produce it. Live on 2026-08-15: Ant-Man's segment 1171 of
+    /// no preroll can produce it. Live on 2026-08-15: Film AV's segment 1171 of
     /// 1172 asked for 0.773 s against 0.500 s of video and returned 500 on all
     /// 14 attempts across 7 play sessions, so playing that title to its end
     /// gave an error instead of an end of stream.
@@ -10288,7 +10288,7 @@ mod tests {
     async fn the_final_segment_is_accepted_when_the_video_track_ended_early() {
         let td = TempDir::new().unwrap();
         let out = td.path().join("seg.ts");
-        // Ant-Man's numbers: 0.500 s produced against a 0.773 s window.
+        // Film AV's numbers: 0.500 s produced against a 0.773 s window.
         write_progress(&out, 12, 0.500).await;
         let got = read_progress(&out).await;
         let mut opts = segment_transcode_opts();
@@ -11200,7 +11200,7 @@ mod tests {
         );
         assert_ne!(local.filename(), remote.filename());
         assert_eq!(
-            SourceGen::for_source(Path::new("/media/Movies/Arrival.mkv")),
+            SourceGen::for_source(Path::new("/media/Movies/Film BC.mkv")),
             SourceGen::LOCAL,
             "an ordinary path is the local, single-generation case"
         );
