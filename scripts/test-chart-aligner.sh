@@ -40,6 +40,15 @@ expect "cache on mounts its claim" present "claimName: p-pharos-aligner-cache" -
   --set aligner.cache.enabled=true
 expect "cache on mounts at R14's path" present "mountPath: /var/cache/pharos-aligner" -- \
   --set aligner.cache.enabled=true
+expect "neither gpu nor cache keeps the default strategy" absent "strategy:" --
+expect "gpu on recreates" present "type: Recreate" -- \
+  --set aligner.gpu.enabled=true
+expect "cache on recreates" present "type: Recreate" -- \
+  --set aligner.cache.enabled=true
+expect "a shadow on the gpu recreates" present "type: Recreate" -- \
+  --set aligner.shadow.enabled=true --set aligner.shadow.image.tag=s --set aligner.shadow.gpu.enabled=true
+expect "a shadow without gpu or cache keeps the default" absent "strategy:" -- \
+  --set aligner.shadow.enabled=true --set aligner.shadow.image.tag=s
 expect "shadow off renders no shadow" absent "aligner-shadow" --
 expect "shadow on renders its deployment" present "name: p-pharos-aligner-shadow" -- \
   --set aligner.shadow.enabled=true --set aligner.shadow.image.tag=s
