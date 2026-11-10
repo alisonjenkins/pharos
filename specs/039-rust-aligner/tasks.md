@@ -48,5 +48,5 @@
 
 - [ ] T039-24 Server: `[lyrics].aligner_shadow_url`, one in flight, the word-by-word comparison, the log line and `pharos_lyrics_shadow_total{outcome}` (V1267).
 - [ ] T039-25 Shadow week on the node. Report the match rate, device split, forward seconds per device and RSS, and the pinning `on` vs `off` result for R18.
-- [ ] T039-26 Cutover: `aligner_url` points to the Rust service; `aligner_version` 3 is seen in stored answers (V1268).
+- [ ] T039-26 Cutover: `aligner_url` points to the Rust service; every answer the server receives carries `aligner_version` 3 (V1268).
 - [ ] T039-27 Remove the Python service: `aligner/`, the flake outputs `aligner`/`alignerOci`, and the CI job (V1269).
