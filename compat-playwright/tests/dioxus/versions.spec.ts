@@ -92,9 +92,14 @@ test.describe("versions and 3D (spec 022)", () => {
   }) => {
     await signIn(page, request);
     await page.locator("section.pharos-rail h2 a", { hasText: /^Stereo$/ }).click();
-    const filter = page.getByRole("combobox", { name: "3D" });
-    await expect(filter).toBeVisible({ timeout: 15_000 });
-    await filter.selectOption({ label: "3D only" });
+    // The 3D choice is a pill in the library's sort and filter sheet (B1311).
+    await page.getByRole("button", { name: /^Filters/ }).click({ timeout: 15_000 });
+    const sheet = page.getByRole("dialog", { name: "Sort and filter" });
+    await sheet
+      .getByRole("group", { name: "3D", exact: true })
+      .getByRole("button", { name: "3D only", exact: true })
+      .click();
+    await sheet.getByRole("button", { name: "Done", exact: true }).click();
     const tiles = page.locator("ul.pharos-grid .pharos-poster");
     await expect(tiles).toHaveCount(2, { timeout: 15_000 });
     await expect(tiles.filter({ hasText: "Stereo Film" })).toHaveCount(1);
