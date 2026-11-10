@@ -270,6 +270,10 @@ compat-dioxus-full native="on" port="8096" config="playwright.dioxus.config.ts":
     trickplay_cache_dir = "$TMP/trickplay"
     transcode_cache_dir = "$TMP/transcode"
     image_seek_seconds = 1
+    # The seeded clips run seconds, under the default 60 s minimum resume
+    # point (FR-107), so a part-watched clip would keep no resume point.
+    min_resume_secs = 0
+    min_resume_pct = 0
 
     [obs]
     log_level = "warn"
@@ -355,6 +359,10 @@ compat-playwright-full:
     # The seeded fixtures are short (~5 s); seek 1 s so poster/thumb
     # extraction lands inside the clip (default 30 s would seek past EOF).
     image_seek_seconds = 1
+    # The seeded clips run seconds, under the default 60 s minimum resume
+    # point (FR-107), so a part-watched clip would keep no resume point.
+    min_resume_secs = 0
+    min_resume_pct = 0
 
     [obs]
     log_level = "warn"
@@ -415,6 +423,10 @@ compat-syncplay:
     trickplay_cache_dir = "$TMP/trickplay"
     transcode_cache_dir = "$TMP/transcode"
     image_seek_seconds = 1
+    # The seeded clips run seconds, under the default 60 s minimum resume
+    # point (FR-107), so a part-watched clip would keep no resume point.
+    min_resume_secs = 0
+    min_resume_pct = 0
     [obs]
     log_level = "warn"
     [media]
