@@ -852,10 +852,13 @@ where
     // A sidecar that was deleted is no curated art, so the provider fills the
     // role. The stale-art sweep removes such rows; this keeps the gap closed
     // until it runs.
+    // When the media file cannot be seen either the share is probably down,
+    // and a missing sidecar proves nothing: keep treating it as curated.
+    let media_visible = matches!(tokio::fs::try_exists(&item.path).await, Ok(true));
     let mut local_roles: std::collections::HashSet<String> = std::collections::HashSet::new();
     for (role, source, locator) in store.artwork_for(item.id).await? {
         if source.eq_ignore_ascii_case("local")
-            && matches!(tokio::fs::try_exists(&locator).await, Ok(true))
+            && (!media_visible || !matches!(tokio::fs::try_exists(&locator).await, Ok(false)))
         {
             local_roles.insert(role.to_ascii_lowercase());
         }
@@ -4964,8 +4967,20 @@ mod tests {
         // B1181 / V1141 — a local Primary whose file has gone is no curated
         // art. The provider's Primary is cached and replaces the dead row.
         let s = store().await;
-        put_movie(&s, 900_302, "a film").await;
-        s.set_artwork(900_302, "Primary", "local", "/gone/folder.jpg")
+        let media_dir = tempfile::tempdir().unwrap();
+        let media = media_dir.path().join("a film.mkv");
+        std::fs::write(&media, b"video").unwrap();
+        s.put(MediaItem {
+            id: 900_302,
+            path: media.clone(),
+            title: "a film".to_string(),
+            kind: MediaKind::Movie,
+            ..MediaItem::default()
+        })
+        .await
+        .unwrap();
+        let dead = media_dir.path().join("folder.jpg");
+        s.set_artwork(900_302, "Primary", "local", &dead.to_string_lossy())
             .await
             .unwrap();
         let (_td, cache) = cache();
@@ -5003,6 +5018,62 @@ mod tests {
             primary.1, "tmdb",
             "provider art replaces the dead local row: {art:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn enrich_one_keeps_a_missing_sidecar_while_the_media_is_unreachable_too() {
+        // B1181 / V1141 — with the media file gone too, the share is probably
+        // down: the missing sidecar proves nothing and must not be replaced.
+        let s = store().await;
+        let media_dir = tempfile::tempdir().unwrap();
+        let media = media_dir.path().join("a film.mkv");
+        std::fs::write(&media, b"video").unwrap();
+        s.put(MediaItem {
+            id: 900_302,
+            path: media.clone(),
+            title: "a film".to_string(),
+            kind: MediaKind::Movie,
+            ..MediaItem::default()
+        })
+        .await
+        .unwrap();
+        let dead = media_dir.path().join("folder.jpg");
+        s.set_artwork(900_302, "Primary", "local", &dead.to_string_lossy())
+            .await
+            .unwrap();
+        let (_td, cache) = cache();
+        let tmdb = FakeEnricher::tmdb()
+            .with_search(vec![("438632", "a film", Some(2021))])
+            .with_detail(EnrichedMetadata {
+                artwork: vec![RemoteArt {
+                    role: ArtworkRole::Primary,
+                    url: "https://image.tmdb.org/t/p/original/p2.jpg".into(),
+                }],
+                ..EnrichedMetadata::default()
+            })
+            .with_image_bytes(vec![0xFF, 0xD8, 0xFF]);
+
+        std::fs::remove_file(&media).unwrap();
+        let item = s.get(900_302).await.unwrap();
+        enrich_one(
+            &s,
+            &sem(4),
+            &cache,
+            Some(&tmdb),
+            None::<&FakeEnricher>,
+            &MetadataConfig::default(),
+            item,
+            NOW,
+        )
+        .await
+        .unwrap();
+
+        let art = s.artwork_for(900_302).await.unwrap();
+        let primary = art
+            .iter()
+            .find(|(role, _, _)| role == "Primary")
+            .expect("primary row present");
+        assert_eq!(primary.1, "local", "the sidecar row stays: {art:?}");
     }
 
     /// An NFO-identified episode as a scrape in the provider's numbering left
