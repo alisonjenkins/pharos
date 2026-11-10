@@ -245,7 +245,8 @@ test.describe("book reader (spec 023)", () => {
       has: other.getByRole("heading", { name: "Continue reading" }),
     });
     await expect(rail).toBeVisible({ timeout: 15_000 });
-    await expect(rail.locator('a[href^="/ui/read/"]')).toHaveCount(1);
+    // Its own tile, by title: other books read in this suite share the rail.
+    await expect(rail.locator('a[href^="/ui/read/"]').filter({ hasText: "Reader Fixture" })).toHaveCount(1);
 
     await first.close();
     await second.close();
