@@ -387,3 +387,10 @@ jobs:
             compat-playwright/playwright-report
           if-no-files-found: ignore
           retention-days: 7
+      # B1333/V1304: the TV app's Android-only modules compile under no
+      # other build, so a shared signature change broke the TV line with
+      # every other check green. Last, and whatever the suites did, so their
+      # results show either way.
+      - name: Type-check the TV app (mobile feature, armv7 Android)
+        if: ${{ !cancelled() }}
+        run: nix develop --command just tv-check
