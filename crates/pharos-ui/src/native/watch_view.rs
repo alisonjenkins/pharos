@@ -3726,6 +3726,11 @@ mod tests {
         let html = render(c);
         assert!(html.contains("Tap to start"), "{html}");
         assert!(html.contains(r#"data-tap-to-start="true""#), "{html}");
+        // B1363: the tap to start is the family's primary button.
+        assert!(
+            html.contains(r#"class="pharos-tap-to-start pharos-button""#),
+            "{html}"
+        );
     }
 
     /// 038 FR-401, V1218: the caption under the spinner is the wait's cause.
@@ -3753,6 +3758,11 @@ mod tests {
         assert!(html.contains("Waiting 12 s"), "{html}");
         assert!(html.contains("no seek index"), "{html}");
         assert!(html.contains("Go back to 1:20:05"), "{html}");
+        // B1363: the way back is a family button of the on-video kind.
+        assert!(
+            html.contains(r#"class="pharos-seek-wait-back pharos-button is-on-video""#),
+            "{html}"
+        );
         assert!(!html.contains("pharos-watch-loading-caption"), "{html}");
     }
 
@@ -3950,6 +3960,15 @@ mod tests {
         );
         assert!(html.contains("--pharos-fill: 52.0%"), "{html}");
         assert!(!html.contains("Skip intro"), "{html}");
+        // B1363: Play now leads as the primary; Cancel is on-video.
+        assert!(
+            html.contains(r#"class="pharos-up-next-play pharos-button""#),
+            "{html}"
+        );
+        assert!(
+            html.contains(r#"class="pharos-up-next-cancel pharos-button is-on-video""#),
+            "{html}"
+        );
         // B1342: Play now carries the id a TV hands the remote's focus to.
         assert!(html.contains(r#"id="pharos-up-next-play""#), "{html}");
         // The pill's Cancel and the card's share an id, so the remote stays
@@ -3969,6 +3988,15 @@ mod tests {
         );
         assert!(
             !html.contains("pharos-up-next-art") && !html.contains("Playing in"),
+            "{html}"
+        );
+        // B1363: the pill's buttons come from the family too.
+        assert!(
+            html.contains(r#"class="pharos-up-next-pill-play pharos-button""#),
+            "{html}"
+        );
+        assert!(
+            html.contains(r#"class="pharos-up-next-pill-cancel pharos-button is-on-video""#),
             "{html}"
         );
         assert!(html.contains(r#"id="pharos-up-next-play""#), "{html}");
