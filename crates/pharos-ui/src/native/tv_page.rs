@@ -358,9 +358,9 @@ try {{
   const frame = () => ({{ mediaTime: v.currentTime, width: v.videoWidth, height: v.videoHeight }});
   const tick = () => new Promise((ok) => requestAnimationFrame(() => ok()));
   try {{
-    await j.manualRender(frame(), true);
-    await tick(); await tick();
-    if (runs[run] && v.paused) await j.manualRender(frame(), true);
+    await within(j.manualRender(frame(), true));
+    await within(tick()); await within(tick());
+    if (runs[run] && v.paused) await within(j.manualRender(frame(), true));
     return "ready paused_redraw=ok";
   }} catch (e) {{
     // A failed draw can leave JASSUB busy for good, so keep the plain cues.
@@ -1131,7 +1131,8 @@ mod tests {
         assert!(js.contains("j.debug.onsubtitleFrameCallback = null"));
         assert!(js.contains(r#"t: "styledresize", run"#));
         assert!(js.contains("runs[run] = { j, own, ro }"));
-        assert!(js.contains("j.manualRender(frame(), true)"));
+        assert!(js.contains("await within(j.manualRender(frame(), true))"), "{js}");
+        assert!(js.contains("await within(tick())"), "{js}");
         assert!(js.contains("paused_redraw=ok"));
         assert!(js.contains(r#"return "failed: paused redraw ""#));
         assert!(js.contains("if (!owned) made.forEach((u) => URL.revokeObjectURL(u))"));
