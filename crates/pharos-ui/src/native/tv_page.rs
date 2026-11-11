@@ -1141,11 +1141,16 @@ mod tests {
         assert!(js.contains("j.debug.onsubtitleFrameCallback = null"));
         assert!(js.contains(r#"t: "styledresize", run"#));
         assert!(js.contains("runs[run] = { j, own, ro }"));
-        assert!(
-            js.contains("await within(j.manualRender(frame(), true))"),
+        // Every redraw and tick of the paused draw races the deadline.
+        assert_eq!(js.matches("j.manualRender(").count(), 2, "{js}");
+        assert_eq!(
+            js.matches("await within(j.manualRender(frame(), true))")
+                .count(),
+            2,
             "{js}"
         );
-        assert!(js.contains("await within(tick())"), "{js}");
+        assert_eq!(js.matches("tick()").count(), 2, "{js}");
+        assert_eq!(js.matches("await within(tick())").count(), 2, "{js}");
         assert!(js.contains("paused_redraw=ok"));
         assert!(js.contains(r#"return "failed: paused redraw ""#));
         assert!(js.contains("if (!owned) made.forEach((u) => URL.revokeObjectURL(u))"));
