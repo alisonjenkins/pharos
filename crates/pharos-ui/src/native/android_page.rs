@@ -731,6 +731,18 @@ pub fn focus_by_id(id: &str) {
     ));
 }
 
+/// Move the focus to the first control shown inside `within`: the remote
+/// lands on the player's settings sheet as it opens (B1338).
+pub fn focus_first_in(within: &str) {
+    run(format!(
+        "const w = document.getElementById({}); \
+         const t = w && [...w.querySelectorAll('button:not([disabled]), select:not([disabled])')] \
+           .find((el) => el.getBoundingClientRect().width > 0); \
+         if (t) t.focus({{preventScroll: true}});",
+        js_str(within)
+    ));
+}
+
 /// A key listener, removed on drop.
 pub struct KeyListener(u64);
 

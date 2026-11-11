@@ -324,6 +324,8 @@ pub fn select_field(_id: &str) {}
 
 pub fn focus_by_id(_id: &str) {}
 
+pub fn focus_first_in(_within: &str) {}
+
 pub fn focus_out_of(_within: &str, _to: &str) {}
 
 pub struct KeyListener;

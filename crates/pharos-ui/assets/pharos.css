@@ -4951,6 +4951,50 @@ body::before {
 :root[data-device="tv"] .pharos-up-next-pill {
   max-width: calc(100% - 96px);
 }
+/* B1338: a TV keeps the player to two rows, the seek bar and one bar of
+   transport, time and the settings button. The track, size and quality
+   menus and Small window wait in the settings sheet, a panel above the
+   right of the bar that the D-pad walks top to bottom; the picture stays
+   clear. The sheet is an overlay the remote's Back closes (FR-607). */
+:root[data-device="tv"] .pharos-control-menus {
+  display: none;
+}
+:root[data-device="tv"] .pharos-control-menus.is-open {
+  position: absolute;
+  right: 48px;
+  bottom: 100%;
+  z-index: 3;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 0.5rem;
+  width: 20rem;
+  max-width: calc(100% - 96px);
+  padding: 0.75rem;
+  border-radius: 12px;
+  background: rgb(16 20 28 / 0.94); /* not themed: controls sit on the video, whose colours no theme sets */
+  box-shadow: 0 8px 24px rgb(0 0 0 / 0.5); /* not themed: controls sit on the video, whose colours no theme sets */
+}
+:root[data-device="tv"] .pharos-control-menus.is-open > *,
+:root[data-device="tv"] .pharos-control-extra > * {
+  width: 100%;
+  max-width: none;
+}
+:root[data-device="tv"] .pharos-control-menus.is-open > .pharos-control {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0 0.5rem;
+  text-align: left;
+}
+/* Its delay (image subtitles only) is just another row of the sheet; the
+   TV sets no speed, so an empty panel leaves no gap. */
+:root[data-device="tv"] .pharos-control-menus.is-open > .pharos-control-extra {
+  display: contents;
+}
+:root[data-device="tv"] .pharos-control-menus.is-open .pharos-sheet-label {
+  display: inline;
+}
 /* A TV's GPU is the weakest part of it (the G08 is a Mali on 2.4 GB). Each
    poster's translateZ(0) gave it its own compositor layer, hundreds on a
    home page, and the lift drew blurred shadows and 3D tilt; a backdrop

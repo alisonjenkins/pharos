@@ -620,6 +620,14 @@ pub fn WatchView(
     let queue_open = queue.as_ref().is_some_and(|q| q.open);
     // The settings sheet a narrow screen keeps the menus in (T038-302).
     let mut sheet_open = use_signal(|| false);
+    // A TV keeps every menu in the sheet (B1338); the remote lands on its
+    // first one as it opens, not on the seek bar the D-pad would find.
+    use_effect(move || {
+        if sheet_open() && REMOTE_FOCUS {
+            platform::info("pharos: player settings opened focus=first");
+            platform::focus_first_in(SETTINGS_ID);
+        }
+    });
     let held = invite_open || queue_open || sheet_open();
     let next_queued = queue.as_ref().is_some_and(|q| q.plays_next(c.next));
     let class = match (media.paused, idle() && !held) {
@@ -1131,7 +1139,9 @@ pub fn WatchView(
                     } else {
                         UpNext { card, on_control }
                     }
-                } else if c.up_next.is_none() {
+                } else if c.up_next.is_none() && !(REMOTE_FOCUS && sheet_open()) {
+                    // On a TV the open settings panel stands where the skip
+                    // card does; the card waits until it closes (B1338).
                     SkipButton { segments: c.segments.clone(), pos, on_control }
                 }
                 div { class: "pharos-controls",
@@ -1171,7 +1181,8 @@ pub fn WatchView(
                         Volume { media, on_control }
                         span { class: "pharos-control-spacer" }
                         // Speed and subtitle delay wait behind it; on a narrow
-                        // screen the menus and window-size buttons do too.
+                        // screen or a TV the menus and window-size buttons do
+                        // too (B1338).
                         button {
                             id: SETTINGS_TOGGLE_ID,
                             class: "pharos-control pharos-settings-toggle",
@@ -3013,6 +3024,34 @@ mod tests {
             .and_then(|r| r.split('}').next())
             .unwrap_or_default();
         assert!(name.contains("var(--pharos-preview-half"), "{name}");
+    }
+
+    /// B1338 / V1309: on a TV the player keeps to two rows. The menus wait
+    /// in the settings sheet, hidden until it opens, and the open sheet is a
+    /// panel inside the title-safe area, not more rows of the bar.
+    #[test]
+    fn on_a_tv_the_menus_wait_in_the_settings_sheet() {
+        let sheet = include_str!("../../assets/pharos.css");
+        let rule = |head: &str| {
+            sheet
+                .split(&format!("\n{head} {{"))
+                .nth(1)
+                .and_then(|r| r.split('}').next())
+                .unwrap_or_default()
+                .to_owned()
+        };
+        let closed = rule(r#":root[data-device="tv"] .pharos-control-menus"#);
+        assert!(closed.contains("display: none;"), "{closed}");
+        let open = rule(r#":root[data-device="tv"] .pharos-control-menus.is-open"#);
+        assert!(open.contains("position: absolute;"), "{open}");
+        assert!(open.contains("right: 48px;"), "{open}");
+        assert!(open.contains("bottom: 100%;"), "{open}");
+        assert!(open.contains("flex-direction: column;"), "{open}");
+        let label =
+            rule(r#":root[data-device="tv"] .pharos-control-menus.is-open .pharos-sheet-label"#);
+        assert!(label.contains("display: inline;"), "{label}");
+        // The sheet is one of the overlays the remote's Back closes.
+        assert!(super::super::tv_page::OVERLAYS.contains(".pharos-control-menus.is-open"));
     }
 
     /// B838: on a phone the wrapped control row would sit under a button
