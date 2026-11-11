@@ -2672,33 +2672,38 @@ pub fn MusicLibraryView(title: String, library: ItemRef, artists: Page, albums: 
             platform::replace(&format!("{}{query}", Route::Browse(library).path()));
         }
     });
+    // The library's tab is lit in the bar above, so its name is for screen
+    // readers only, and the tabs are one compact row: the covers start a
+    // heading higher (B1334/V1305).
     rsx! {
-        section { class: "pharos-browse pharos-music",
+        section { class: "pharos-browse pharos-browse-library pharos-music",
             h2 { "{title}" }
-            div {
-                class: "pharos-tabs",
-                role: "tablist",
-                aria_label: "Music",
-                "data-key-tabs": "music",
-                onkeydown: move |e: KeyboardEvent| {
-                    if let Some(next) = tab().stepped(&e.key()) {
-                        e.prevent_default();
-                        tab.set(next);
-                        platform::focus_by_id(next.id());
-                    }
-                },
-                for t in MusicTab::ALL {
-                    button {
-                        key: "{t.token()}",
-                        r#type: "button",
-                        role: "tab",
-                        id: t.id(),
-                        class: if tab() == t { "pharos-tab pharos-tab-active" } else { "pharos-tab" },
-                        aria_selected: tab() == t,
-                        // One stop in the tab order; the arrows move along.
-                        tabindex: if tab() == t { "0" } else { "-1" },
-                        onclick: move |_| tab.set(t),
-                        "{t.label()}"
+            div { class: "pharos-music-bar",
+                div {
+                    class: "pharos-tabs",
+                    role: "tablist",
+                    aria_label: "Music",
+                    "data-key-tabs": "music",
+                    onkeydown: move |e: KeyboardEvent| {
+                        if let Some(next) = tab().stepped(&e.key()) {
+                            e.prevent_default();
+                            tab.set(next);
+                            platform::focus_by_id(next.id());
+                        }
+                    },
+                    for t in MusicTab::ALL {
+                        button {
+                            key: "{t.token()}",
+                            r#type: "button",
+                            role: "tab",
+                            id: t.id(),
+                            class: if tab() == t { "pharos-tab pharos-tab-active" } else { "pharos-tab" },
+                            aria_selected: tab() == t,
+                            // One stop in the tab order; the arrows move along.
+                            tabindex: if tab() == t { "0" } else { "-1" },
+                            onclick: move |_| tab.set(t),
+                            "{t.label()}"
+                        }
                     }
                 }
             }
@@ -4108,6 +4113,44 @@ mod tests {
         assert_eq!(html.matches("tabindex=\"-1\"").count(), 2, "{html}");
     }
 
+    /// B1334/V1305: a music library's name is lit in the bar above, so its
+    /// heading is for screen readers only, and its tabs sit in the one row
+    /// that holds the Albums order. Artists, the tab it opens on, has no
+    /// order to choose, so no Sort pill.
+    #[test]
+    fn a_music_library_keeps_its_heading_for_readers_and_its_tabs_on_one_row() {
+        let html = render(|| {
+            let api = use_signal(|| None::<pharos_client::api::NativeApi>);
+            let machine = use_signal(super::super::machine::Machine::new);
+            let marks = use_signal(|| 0);
+            use_context_provider(|| Ctx {
+                api,
+                machine,
+                marks,
+            });
+            rsx! {
+                MusicLibraryView {
+                    title: "Music".to_owned(),
+                    library: ItemRef::Real(1),
+                    artists: page(Vec::new()),
+                    albums: page(Vec::new()),
+                }
+            }
+        });
+        assert!(
+            html.contains("class=\"pharos-browse pharos-browse-library pharos-music\""),
+            "{html}"
+        );
+        assert!(html.contains("<h2>Music</h2>"), "{html}");
+        let bar = html
+            .split("class=\"pharos-music-bar\"")
+            .nth(1)
+            .unwrap_or_else(|| panic!("no tab row: {html}"));
+        assert!(bar.contains("role=\"tablist\""), "{html}");
+        assert!(!html.contains("<select"), "{html}");
+        assert!(!html.contains(SORT_BUTTON_ID), "{html}");
+    }
+
     /// FR-210: a failed paging step says why beside its retry.
     #[test]
     fn a_failed_page_says_why() {
@@ -5291,11 +5334,15 @@ mod tests {
             .and_then(|v| v.parse::<f64>().ok())
             .unwrap_or(f64::MAX);
         let reach = outline.max(glow);
-        // The filter row scrolls sideways too (B1311).
-        for row in [nav, rule(".pharos-filters")] {
+        // The filter row scrolls sideways too (B1311), and so does the
+        // music library's tab row (B1334), whose tabs inside it are no
+        // scroll box of their own to clip the ring again.
+        for row in [nav, rule(".pharos-filters"), rule(".pharos-music-bar")] {
             assert!(px(&row, "padding") >= reach, "{row}\nreach {reach}");
             assert!(row.contains("overflow-x: auto"), "{row}");
         }
+        let tabs = rule(".pharos-music-bar .pharos-tabs");
+        assert!(tabs.contains("overflow: visible"), "{tabs}");
     }
 
     #[test]
