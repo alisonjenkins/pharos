@@ -3145,6 +3145,21 @@ fn join_group(ctx: Ctx, together: Together, nav: Nav, id: String) {
     });
 }
 
+/// Leave the group this device is in, from outside the player (B1361). The
+/// leave outlives the page, like a join.
+fn leave_group(together: Together) {
+    let Some(session) = together.current().filter(|s| s.active()) else {
+        platform::info("pharos: group leave skipped from=together cause=not_in_group");
+        return;
+    };
+    let mut error = together.error;
+    error.set(None);
+    platform::info("pharos: group leave from=together");
+    // The session logs a refused leave itself; the device is out of the
+    // group either way, and the server's own prune finishes the job.
+    spawn_forever(async move { session.leave().await });
+}
+
 /// The Together page: the groups running now.
 #[component]
 fn TogetherScreen() -> Element {
@@ -3171,6 +3186,11 @@ fn TogetherScreen() -> Element {
             group_titles(&native, &listed).await
         }
     });
+    // The group this device is in, so the page can offer Leave group (B1361).
+    let current = {
+        let view = (together.view)();
+        view.id.clone().filter(|_| view.active)
+    };
     let state = groups.read();
     match state.as_ref() {
         None => rsx! { Loading {} },
@@ -3193,8 +3213,13 @@ fn TogetherScreen() -> Element {
             }
             TogetherView {
                 groups: listed.clone(),
-                on_join: move |id: String| join_group(ctx, together.clone(), nav, id),
+                on_join: {
+                    let together = together.clone();
+                    move |id: String| join_group(ctx, together.clone(), nav, id)
+                },
                 watching: watching.read().clone().unwrap_or_default(),
+                current: current.clone(),
+                on_leave: move |()| leave_group(together.clone()),
             }
         },
     }

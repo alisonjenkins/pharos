@@ -10,7 +10,9 @@ use super::seen::{initial, SeenRow};
 use super::together::{GroupSummary, Member};
 
 /// The Together page: the groups running now, what each is watching, and a
-/// Join button on each (spec 038 FR-504).
+/// Join button on each (spec 038 FR-504). The group this device is in says
+/// so and offers Leave group in place of Join, so leaving never needs the
+/// player (B1361).
 #[component]
 pub fn TogetherView(
     groups: Vec<GroupSummary>,
@@ -18,11 +20,29 @@ pub fn TogetherView(
     /// What each group is watching, by group id, once looked up.
     #[props(default)]
     watching: Vec<(String, String)>,
+    /// The group this device is in now, if any.
+    #[props(default)]
+    current: Option<String>,
+    #[props(default)] on_leave: EventHandler<()>,
 ) -> Element {
+    // In a group the list does not show (yet, or hidden from this viewer):
+    // still say so, and still offer the way out.
+    let unlisted = current
+        .as_ref()
+        .filter(|id| !groups.iter().any(|g| &g.id == *id))
+        .is_some();
     rsx! {
         section { class: "pharos-together",
             h2 { "Watch together" }
-            if groups.is_empty() {
+            if unlisted {
+                div { class: "pharos-group is-current",
+                    div { class: "pharos-group-text",
+                        span { class: "pharos-group-name", "You're in a group" }
+                    }
+                    LeaveGroup { on_leave }
+                }
+            }
+            if groups.is_empty() && !unlisted {
                 p { class: "pharos-empty", "No one is watching together right now" }
                 p { class: "pharos-muted",
                     "To start a group, open a film or an episode and choose Watch together. "
@@ -31,26 +51,49 @@ pub fn TogetherView(
             }
             ul { class: "pharos-groups",
                 for group in groups {
-                    li { key: "{group.id}", class: "pharos-group",
+                    li {
+                        key: "{group.id}",
+                        class: if current.as_ref() == Some(&group.id) { "pharos-group is-current" } else { "pharos-group" },
                         div { class: "pharos-group-text",
                             span { class: "pharos-group-name", "{group.name}" }
+                            if current.as_ref() == Some(&group.id) {
+                                span { class: "pharos-group-you", "You're in this group" }
+                            }
                             span { class: "pharos-group-watching",
                                 {watching_line(&group, &watching)}
                             }
                             span { class: "pharos-muted", {member_names(&group.members)} }
                         }
-                        button {
-                            class: "pharos-button",
-                            r#type: "button",
-                            onclick: {
-                                let id = group.id.clone();
-                                move |_| on_join.call(id.clone())
-                            },
-                            "Join"
+                        if current.as_ref() == Some(&group.id) {
+                            LeaveGroup { on_leave }
+                        } else {
+                            button {
+                                class: "pharos-button",
+                                r#type: "button",
+                                onclick: {
+                                    let id = group.id.clone();
+                                    move |_| on_join.call(id.clone())
+                                },
+                                "Join"
+                            }
                         }
                     }
                 }
             }
+        }
+    }
+}
+
+/// Leave group, on the Together page: a secondary pill, as leaving is no
+/// emergency and the page's primary action is Join (ADR-0120).
+#[component]
+fn LeaveGroup(on_leave: EventHandler<()>) -> Element {
+    rsx! {
+        button {
+            class: "pharos-button-secondary pharos-group-leave",
+            r#type: "button",
+            onclick: move |_| on_leave.call(()),
+            "Leave group"
         }
     }
 }
@@ -436,6 +479,50 @@ mod tests {
         );
         assert!(html.contains(">Join<"), "{html}");
         assert!(!html.contains("No one is watching"), "{html}");
+    }
+
+    /// B1361 / V1332 — the group this device is in offers Leave group, not
+    /// Join, and says it is yours; the other groups still offer Join.
+    #[test]
+    fn the_group_you_are_in_offers_leave_instead_of_join() {
+        let mut other = group();
+        other.id = "g2".into();
+        other.name = "Other film".into();
+        let html = render(move || {
+            rsx! { TogetherView {
+                groups: vec![group(), other.clone()],
+                on_join: |_| {},
+                current: Some(group().id),
+                on_leave: |_| {},
+            } }
+        });
+        assert_eq!(html.matches(">Leave group<").count(), 1, "{html}");
+        assert_eq!(html.matches(">Join<").count(), 1, "{html}");
+        assert!(html.contains("re in this group"), "{html}");
+        assert!(html.contains("pharos-button-secondary"), "{html}");
+    }
+
+    /// B1361 — in a group the list does not show, the page still says so and
+    /// still offers the way out, even when nothing else is listed.
+    #[test]
+    fn a_group_missing_from_the_list_can_still_be_left() {
+        let html = render(|| {
+            rsx! { TogetherView {
+                groups: vec![],
+                on_join: |_| {},
+                current: Some("gone".to_owned()),
+                on_leave: |_| {},
+            } }
+        });
+        assert!(html.contains("re in a group"), "{html}");
+        assert!(html.contains(">Leave group<"), "{html}");
+        assert!(!html.contains("No one is watching together"), "{html}");
+    }
+
+    #[test]
+    fn outside_a_group_the_page_offers_no_leave() {
+        let html = render(|| rsx! { TogetherView { groups: vec![group()], on_join: |_| {} } });
+        assert!(!html.contains("Leave group"), "{html}");
     }
 
     #[test]
