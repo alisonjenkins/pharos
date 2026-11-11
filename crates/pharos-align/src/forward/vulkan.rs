@@ -282,6 +282,17 @@ impl VulkanModel {
         self.logits_padded(wave, bucket(wave.len()))
     }
 
+    /// Bytes the device's pool holds now, and how many of them are live;
+    /// `None` where the backend does not report it.
+    pub fn pool(&self) -> Option<crate::service::GpuPool> {
+        self.device
+            .memory_pool_usage()
+            .map(|u| crate::service::GpuPool {
+                in_use: u.bytes_in_use,
+                reserved: u.bytes_reserved,
+            })
+    }
+
     /// Runs one window at every bucket up to [`WARM_UP_TO`], so their
     /// kernels are compiled and tuned before the first song. Each window
     /// falls short of its bucket, as nearly every real one does, so the
