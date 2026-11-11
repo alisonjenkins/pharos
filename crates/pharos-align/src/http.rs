@@ -162,7 +162,7 @@ fn run_song(
 ) -> Result<Aligned, SongError> {
     let started = Instant::now();
     let n_lines = lines.len();
-    let (result, used) = engine.align_song_on(rel_path, full_path, lines);
+    let (result, used, _gpu) = engine.align_song_on(rel_path, full_path, lines);
     let (device, device_reason) = used.map_or(("none", String::new()), |u| (u.device, u.reason));
     let elapsed = started.elapsed();
     let duration_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);

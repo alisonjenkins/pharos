@@ -44,6 +44,21 @@ pub struct DeviceUsed {
     pub reason: String,
 }
 
+/// A GPU memory pool's bytes at one moment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GpuPool {
+    pub in_use: u64,
+    pub reserved: u64,
+}
+
+/// The GPU pool at the end of a song (B1352, V1323): `peak`, the most the
+/// song held, and `after` what it keeps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GpuMemory {
+    pub peak: GpuPool,
+    pub after: GpuPool,
+}
+
 /// Waveform to word spans: the acoustic model plus CTC, `model.py`'s `Aligner.align`.
 pub trait Model: Send {
     /// `(start_ms, end_ms)` per token within the window, and the line's score.
@@ -56,6 +71,12 @@ pub trait Model: Send {
 
     /// Called before each song's first window.
     fn begin_song(&mut self) {}
+
+    /// Called after each song's last window, whatever its outcome: a GPU
+    /// model says what its pool held.
+    fn end_song(&mut self) -> Option<GpuMemory> {
+        None
+    }
 
     /// Where the song so far ran.
     fn device(&self) -> DeviceUsed {
@@ -241,7 +262,11 @@ impl Engine {
         rel_path: &str,
         full_path: &Path,
         lines: Vec<Line>,
-    ) -> (Result<Aligned, SongError>, Option<DeviceUsed>) {
+    ) -> (
+        Result<Aligned, SongError>,
+        Option<DeviceUsed>,
+        Option<GpuMemory>,
+    ) {
         let mut slot = tracing::info_span!("aligner.wait").in_scope(|| {
             // A song that panicked mid-way leaves nothing half-written that the
             // next one reads: the model is reloaded below if it was dropped.
@@ -255,7 +280,7 @@ impl Engine {
                 Ok(m) => m,
                 Err(e) => {
                     let e = SongError::Internal(format!("model load failed: {e}"));
-                    return (Err(e), None);
+                    return (Err(e), None, None);
                 }
             };
             tracing::info!(
@@ -268,10 +293,12 @@ impl Engine {
             Some(model) => {
                 model.begin_song();
                 let r = run_song(model, &self.decoder, rel_path, full_path, lines);
-                (r, Some(model.device()))
+                let used = model.device();
+                (r, Some(used), model.end_song())
             }
             None => (
                 Err(SongError::Internal("model missing after load".into())),
+                None,
                 None,
             ),
         };
