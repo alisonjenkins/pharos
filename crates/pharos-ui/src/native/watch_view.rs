@@ -1188,7 +1188,7 @@ pub fn WatchView(
                             }
                         }
                         TimeLabels { segments: c.segments.clone(), pos, total, scrub: Some(scrub) }
-                        Volume { media, on_control, button_class: "pharos-button pharos-button-quiet is-icon" }
+                        Volume { media, on_control, button_class: "pharos-button pharos-button-quiet is-icon pharos-mute" }
                         span { class: "pharos-control-spacer" }
                         // Speed and subtitle delay wait behind it; on a narrow
                         // screen or a TV the menus and window-size buttons do
@@ -1293,6 +1293,7 @@ pub fn WatchView(
                             height: media.video_height,
                             on_pick: move |control| on_control.call(control),
                         }
+                        SheetMute { media, on_control }
                         // The window-size controls sit together at the end of
                         // the row, smallest to largest: a small window, picture
                         // in picture, then fullscreen (B904).
@@ -1702,6 +1703,38 @@ fn drag_end(open: Option<Scrub>, end: scrub::End) -> Option<Control> {
         .map(|s| Control::Seek(s.target_ms))
 }
 
+/// Mute or unmute; unmuting a slider dragged to 0 would stay silent.
+fn toggle_mute(media: MediaState) -> Control {
+    Control::Volume {
+        volume: if media.muted && media.volume == 0.0 {
+            1.0
+        } else {
+            media.volume
+        },
+        muted: !media.muted,
+    }
+}
+
+/// Mute as a labelled row of the settings sheet, for an upright phone whose
+/// bar has no room for the mute button (B1358). Shown only there.
+#[component]
+fn SheetMute(media: MediaState, on_control: EventHandler<Control>) -> Element {
+    if !platform::owns_volume() {
+        return rsx! {};
+    }
+    let shown = if media.muted { 0.0 } else { media.volume };
+    rsx! {
+        button {
+            class: "pharos-button pharos-button-quiet is-icon pharos-sheet-mute",
+            r#type: "button",
+            aria_label: if media.muted { "Unmute" } else { "Mute" },
+            onclick: move |_| on_control.call(toggle_mute(media)),
+            Icon { path: if shown == 0.0 { ICON_MUTED } else { ICON_VOLUME } }
+            span { class: "pharos-sheet-label", if media.muted { "Unmute" } else { "Mute" } }
+        }
+    }
+}
+
 /// The mute button and volume slider. The video page's chrome is the
 /// default; the music page passes its own classes and icon.
 #[component]
@@ -1728,11 +1761,7 @@ pub(super) fn Volume(
             class: button_class,
             r#type: "button",
             aria_label: if media.muted { "Unmute" } else { "Mute" },
-            onclick: move |_| on_control.call(Control::Volume {
-                // Unmuting a slider dragged to 0 would stay silent.
-                volume: if media.muted && media.volume == 0.0 { 1.0 } else { media.volume },
-                muted: !media.muted,
-            }),
+            onclick: move |_| on_control.call(toggle_mute(media)),
             match icon {
                 Some(icon) => icon,
                 None => rsx! {
@@ -3285,6 +3314,20 @@ mod tests {
         assert!(
             sheet.contains(".pharos-player .pharos-button.is-icon {\n  flex-shrink: 0;"),
             "an icon button keeps its touch size on a narrow phone"
+        );
+        assert!(
+            sheet.contains(
+                "@media (max-width: 40rem) and (pointer: coarse) {\n  .pharos-control-row .pharos-mute {\n    display: none;"
+            ),
+            "an upright phone moves mute out of the bar, so the time fits"
+        );
+        let menus = html
+            .split(r#"id="pharos-player-settings""#)
+            .nth(1)
+            .unwrap_or_default();
+        assert!(
+            menus.contains("pharos-sheet-mute") && menus.contains(">Mute</span>"),
+            "and keeps it in the settings sheet: {menus}"
         );
     }
 
