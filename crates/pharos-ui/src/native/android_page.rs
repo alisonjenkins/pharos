@@ -1962,6 +1962,7 @@ fn set_root_attribute(name: &str, value: &str) {
 const BRIDGE_JS: &str = r#"
 const send = (v) => dioxus.send(v);
 __BAR_KEYS__
+__TILE_HOLD__
 // Not a <select>: OK opens its list, and the arrows have to move off it.
 // A field typed into; a checkbox, switch or slider is not (FR-606).
 const notTyped = /^(checkbox|radio|range|button|submit|reset|color|file|image)$/;
