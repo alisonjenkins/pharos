@@ -817,6 +817,32 @@ pub fn focus_by_id(id: &str) {
     ));
 }
 
+/// Give the focus to `to`, a card that just appeared over the video (Skip
+/// intro, Up Next), when the remote is on the picture or the control row:
+/// not while it scrubs on the seek bar or walks the settings sheet (B1342).
+pub fn focus_card(within: &str, to: &str) {
+    run(format!(
+        "const a = document.activeElement; const w = document.getElementById({}); \
+         const t = document.getElementById({}); \
+         const idle = !a || a === document.body || a === w || \
+           (w && w.contains(a) && !a.closest('.pharos-seek, .pharos-control-menus')); \
+         if (w && t && idle) {{ t.focus({{preventScroll: true}}); \
+           console.info('pharos: card focus to=' + t.id); }}",
+        js_str(within),
+        js_str(to)
+    ));
+}
+
+/// Put the focus on `to` when it was lost with a removed element (a card
+/// that closed under it), so the remote keeps a place (B1342).
+pub fn refocus_if_lost(to: &str) {
+    run(format!(
+        "const a = document.activeElement; const t = document.getElementById({}); \
+         if (t && (!a || a === document.body)) t.focus({{preventScroll: true}});",
+        js_str(to)
+    ));
+}
+
 /// Move the focus to the first control shown inside `within`: the remote
 /// lands on the player's settings sheet as it opens (B1338).
 pub fn focus_first_in(within: &str) {
