@@ -95,7 +95,7 @@ tv-check:
 # B1329/V1302: check a built TV APK has the Pharos label, icon, banner, dark
 # launch theme and config changes before it goes near the TV.
 tv-apk-check apk:
-    bash scripts/android-apk-check.sh {{ apk }}
+    bash scripts/android-apk-check.sh {{ quote(apk) }}
 
 # P53 — regenerate the workspace-hack contents after a dep change.
 # Run this whenever a Cargo.toml in any crate gains / drops a dep
