@@ -22,7 +22,7 @@ use super::group_app::Together;
 use super::keymap::Mode;
 use super::keys::{use_arrival_focus, use_key_mode};
 use super::letters::{self, Wheel, LETTERS};
-use super::listen::{Icon, ICON_QUEUE_ADD, ICON_QUEUE_NEXT};
+use super::listen::{Icon, ICON_PLAY, ICON_QUEUE_ADD, ICON_QUEUE_NEXT, ICON_SHUFFLE};
 use super::machine::Event;
 use super::mixes::{self, MixCtx, ICON_MIX};
 use super::paging::{Chain, Pager, Trigger, SENTINEL_LEAD};
@@ -33,7 +33,7 @@ use super::seen::{self, MemberSeen};
 use super::together_view::{InThisGroup, SeenDots};
 use super::views::{
     display_name, episode_label, is_placeholder_episode_name, progress_percent, runtime,
-    ArtPlaceholder, FavoriteToggle, Link, MarkPlayed, PosterTile, Ratings, StoredMark,
+    ArtPlaceholder, FavoriteToggle, Link, MarkPlayed, Nav, PosterTile, Ratings, StoredMark,
     WatchedToggle, MAIN_ACTION,
 };
 use pharos_client::mix::radio;
@@ -2100,6 +2100,10 @@ fn Hero(
     /// For a series, the episode its Play or Resume starts.
     #[props(default)]
     next: Option<Item>,
+    /// An album's own buttons, first in the row of actions; the favourite
+    /// mark then shows as a star alone (B1347/V1318).
+    #[props(default)]
+    lead: Option<Element>,
 ) -> Element {
     let art_class = if square {
         "pharos-hero-art pharos-hero-art-square"
@@ -2131,8 +2135,9 @@ fn Hero(
                 if let Some(d) = detail.as_ref() {
                     Ratings { kind: d.item.kind, imdb: d.item.imdb_rating, critic: d.item.critic_rating, tile: false }
                 }
-                if next.is_some() || ((mark || favourite) && detail.is_some()) {
+                if next.is_some() || lead.is_some() || ((mark || favourite) && detail.is_some()) {
                     div { class: "pharos-actions",
+                        {lead.clone()}
                         if let Some(ep) = next.as_ref() {
                             Link {
                                 to: Route::Watch(ep.id),
@@ -2155,6 +2160,7 @@ fn Hero(
                                 id: d.item.id,
                                 favorite: d.item.favorite,
                                 name: d.item.name.clone(),
+                                icon: lead.is_some(),
                             }
                         }
                     }
@@ -2848,24 +2854,43 @@ pub fn AlbumView(detail: Detail, tracks: Page) -> Element {
     let queued: HashSet<ItemRef> = try_use_context::<QueueCtx>()
         .map(|q| q.0.read().upcoming().iter().map(|e| e.id).collect())
         .unwrap_or_default();
+    // A long album lists past one page; its buttons fetch it whole.
+    let whole = if complete {
+        tracks.items.clone()
+    } else {
+        Vec::new()
+    };
+    let lead = (!tracks.items.is_empty()).then(|| {
+        rsx! {
+            AlbumPlay {
+                album: detail.item.id,
+                name: detail.item.name.clone(),
+                first: first_track,
+                tracks: whole.clone(),
+            }
+            QueueButtons {
+                name: detail.item.name.clone(),
+                tracks: whole.clone(),
+                album: detail.item.id,
+                kind: QueueTarget::AlbumPage,
+            }
+        }
+    });
+    // B1347/V1318: the cover, facts and every album button in a column
+    // beside the list, so the tracks start at the top of the page.
     rsx! {
         section { class: "pharos-album",
-            Hero {
-                title: detail.item.name.clone(),
-                detail: Some(detail.clone()),
-                facts,
-                square: true,
-                favourite: true,
-            }
-            if !tracks.items.is_empty() {
-                QueueButtons {
-                    name: detail.item.name.clone(),
-                    // A long album lists past one page; fetch it whole.
-                    tracks: if complete { tracks.items.clone() } else { Vec::new() },
-                    album: detail.item.id,
-                    kind: QueueTarget::AlbumPage,
+            div { class: "pharos-album-side",
+                Hero {
+                    title: detail.item.name.clone(),
+                    detail: Some(detail.clone()),
+                    facts,
+                    square: true,
+                    favourite: true,
+                    lead,
                 }
             }
+            div { class: "pharos-album-tracks",
             if tracks.items.is_empty() {
                 p { class: "pharos-empty", "No tracks yet." }
             }
@@ -2888,8 +2913,107 @@ pub fn AlbumView(detail: Detail, tracks: Page) -> Element {
                 }
             }
             MoreNote { page: tracks }
+            }
         }
     }
+}
+
+/// An album's Play and Shuffle (B1349/V1320). Play opens its first song,
+/// which queues the rest of the album after it as any song does. Shuffle
+/// turns the queue's shuffle on, queues the album in a random order (the
+/// whole album, fetched when the page holds only part of it) and plays the
+/// first of them.
+#[component]
+fn AlbumPlay(album: ItemRef, name: String, first: Option<ItemRef>, tracks: Vec<Item>) -> Element {
+    let queue = try_use_context::<QueueCtx>().map(|q| q.0);
+    let nav = try_use_context::<Nav>();
+    let ctx = try_use_context::<Ctx>();
+    // A group picks what plays, so no shuffling the queue under it.
+    let in_group = try_use_context::<Together>()
+        .as_ref()
+        .is_some_and(|t| t.view.read().active);
+    let mut note = use_signal(|| None::<String>);
+    let shuffle_label = format!("Shuffle {name}");
+    let shuffle = move |_| {
+        let (Some(mut queue), Some(nav)) = (queue, nav) else {
+            return;
+        };
+        let (tracks, name) = (tracks.clone(), name.clone());
+        spawn(async move {
+            let found = if tracks.is_empty() {
+                match ctx.and_then(|c| c.api.peek().clone()) {
+                    Some(api) => list_all(
+                        &api,
+                        &call("queue", "album_shuffle"),
+                        album,
+                        None,
+                        INDEX_ORDER,
+                    )
+                    .await
+                    .map_err(|e| e.to_string()),
+                    None => Err("not signed in".to_owned()),
+                }
+            } else {
+                Ok(tracks)
+            };
+            match found {
+                Ok(items) => {
+                    let songs: Vec<Track> = items
+                        .iter()
+                        .filter(|i| i.kind == ItemKind::Audio)
+                        .map(Track::from)
+                        .collect();
+                    let count = songs.len();
+                    let start = queue.write().shuffle_album(songs, shuffle_seed());
+                    platform::info(&format!(
+                        "pharos: album shuffle album={album:?} count={count} started={}",
+                        start.is_some()
+                    ));
+                    match start {
+                        Some(id) => nav.0.call(Route::Watch(id)),
+                        None => note.set(Some(format!("{name} has no songs to shuffle."))),
+                    }
+                }
+                Err(e) => {
+                    platform::warn(&format!(
+                        "pharos: album shuffle failed album={album:?} error={e}"
+                    ));
+                    note.set(Some(format!("Could not shuffle {name}.")));
+                }
+            }
+        });
+    };
+    rsx! {
+        if let Some(first) = first {
+            Link {
+                to: Route::Watch(first),
+                class: "pharos-button pharos-album-play",
+                key_action: "play",
+                Icon { path: ICON_PLAY }
+                span { "Play" }
+            }
+        }
+        if queue.is_some() && nav.is_some() && !in_group {
+            button {
+                r#type: "button",
+                class: "pharos-button pharos-button-secondary pharos-album-shuffle",
+                "data-key-action": "shuffle",
+                aria_label: "{shuffle_label}",
+                title: "{shuffle_label}",
+                onclick: shuffle,
+                Icon { path: ICON_SHUFFLE }
+                span { "Shuffle" }
+            }
+        }
+        if let Some(text) = note() {
+            span { class: "pharos-queue-note", role: "status", "{text}" }
+        }
+    }
+}
+
+/// A shuffle seed: a play order needs no more randomness than the clock.
+fn shuffle_seed() -> u64 {
+    platform::now_ms().to_bits()
 }
 
 /// The album page's first track, focused when the page opens.
@@ -3124,7 +3248,9 @@ pub fn QueueButtons(
         });
     };
     let put_end = put.clone();
-    let labelled = matches!(kind, QueueTarget::AlbumPage | QueueTarget::VideoPage);
+    // An album page shows them as round icon pills beside Play and Shuffle
+    // (B1347/V1318); their names stay in the aria-label and title.
+    let labelled = kind == QueueTarget::VideoPage;
     rsx! {
         div { class: "pharos-queue-buttons", "data-target": kind.label(),
             button {
@@ -5070,10 +5196,10 @@ mod tests {
                 "{label}: {html}"
             );
         }
-        // The album's page labels its buttons; a song's row has icons only.
+        // Both are icon pills now, named by their labels (B1347/V1318).
         assert!(html.contains(r#"data-target="album_page""#), "{html}");
         assert!(html.contains(r#"data-target="song""#), "{html}");
-        assert!(html.contains("<span>Play next</span>"), "{html}");
+        assert!(!html.contains("<span>Play next</span>"), "{html}");
         // Buttons are not inside the row's link.
         let link = html
             .split_once(r#"class="pharos-track""#)
@@ -5090,6 +5216,59 @@ mod tests {
         assert!(grid.contains(r#"data-target="album_card""#), "{grid}");
         assert!(grid.contains(r#"aria-label="Play Record next""#), "{grid}");
         assert!(!grid.contains("Play Band next"), "{grid}");
+    }
+
+    /// B1347/V1318, B1349/V1320: the album page puts its cover, facts and
+    /// every album button in a side column ahead of the list: Play (the
+    /// first song), Shuffle, the queue pills and the favourite star, in that
+    /// order. Disarm check: dropping the `lead` from the Hero fails the
+    /// order assertion.
+    #[test]
+    fn an_album_page_has_its_buttons_beside_the_list() {
+        let mut song = item(ItemRef::Real(1), ItemKind::Audio, "Opener");
+        song.episode = Some(1);
+        let album = detail(item(ItemRef::Synth(5), ItemKind::Album, "Record"));
+        let tracks = page(vec![song]);
+        let html = with_queue({
+            let (album, tracks) = (album.clone(), tracks.clone());
+            move || rsx! { AlbumView { detail: album.clone(), tracks: tracks.clone() } }
+        });
+        let side = html
+            .split_once(r#"class="pharos-album-side""#)
+            .and_then(|(_, rest)| rest.split_once(r#"class="pharos-album-tracks""#))
+            .map(|(side, _)| side)
+            .expect("a side column before the track list");
+        let at = |needle: &str| {
+            side.find(needle)
+                .unwrap_or_else(|| panic!("{needle}: {side}"))
+        };
+        let order = [
+            at("pharos-album-play"),
+            at(r#"aria-label="Shuffle Record""#),
+            at(r#"aria-label="Play Record next""#),
+            at(r#"aria-label="Add Record to the queue""#),
+            at("pharos-favorite is-icon"),
+        ];
+        assert!(order.windows(2).all(|w| w[0] < w[1]), "{side}");
+        assert!(side.contains(r#"data-key-action="play""#), "{side}");
+        // The star alone shows; its word stays for screen readers.
+        assert!(
+            side.contains(r#"<span class="pharos-button-label">Favourite</span>"#),
+            "{side}"
+        );
+        // The track list follows, holding the songs.
+        assert!(!side.contains("Opener"), "{side}");
+    }
+
+    #[test]
+    fn an_album_with_no_songs_offers_no_play_or_shuffle() {
+        let album = detail(item(ItemRef::Synth(5), ItemKind::Album, "Record"));
+        let html = with_queue(move || {
+            rsx! { AlbumView { detail: album.clone(), tracks: page(Vec::new()) } }
+        });
+        assert!(!html.contains("pharos-album-play"), "{html}");
+        assert!(!html.contains("pharos-album-shuffle"), "{html}");
+        assert!(html.contains("No tracks yet."), "{html}");
     }
 
     #[test]
