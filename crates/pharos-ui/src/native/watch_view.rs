@@ -3324,6 +3324,12 @@ mod tests {
             "an upright phone moves mute out of the bar, so the time fits; a TV keeps it, \
              as its sheet has no mute row"
         );
+        assert!(
+            sheet.contains(
+                ":root[data-device=\"tv\"] .pharos-control-menus.is-open > .pharos-sheet-mute {\n  display: none;"
+            ),
+            "a TV's open sheet shows no second mute beside the bar's"
+        );
         let menus = html
             .split(r#"id="pharos-player-settings""#)
             .nth(1)
