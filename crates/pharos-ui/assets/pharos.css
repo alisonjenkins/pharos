@@ -2573,6 +2573,17 @@ body:has(.pharos-stage.is-full .pharos-stage-slot:not([inert]) .pharos-connectio
 .pharos-group-name {
   font-weight: 600;
 }
+/* The group this device is in (B1361): marked, with Leave group in place of
+   Join. */
+.pharos-group.is-current {
+  border-left: 3px solid var(--px-color-accent);
+  padding-left: 0.75rem;
+}
+.pharos-group-you {
+  color: var(--px-color-accent);
+  font-size: var(--px-type-step--1);
+  font-weight: 600;
+}
 .pharos-controls {
   position: absolute;
   inset: auto 0 0 0;
