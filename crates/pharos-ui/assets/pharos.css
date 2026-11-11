@@ -5807,10 +5807,17 @@ body::before {
   .pharos-album-tracks {
     max-width: 60rem;
   }
-  /* A long album scrolls past its cover and buttons, which stay put. */
+  /* A long album scrolls past its cover and buttons, which stay put. A
+     column taller than the window (a short or zoomed one, a long
+     overview) scrolls on its own so its buttons stay reachable. */
   .pharos-album-side {
     position: sticky;
     top: 1rem;
+    max-height: calc(100vh - 2rem);
+    overflow-y: auto;
+    /* Room inside the scroll box for the buttons' focus rings. */
+    padding: 0.5rem;
+    margin: -0.5rem;
   }
 }
 @media (max-width: 40rem) {
