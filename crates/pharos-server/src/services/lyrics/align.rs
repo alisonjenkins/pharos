@@ -370,19 +370,7 @@ impl Aligner {
                     Err(_) => worker.eta_lock().abort(job.id),
                 }
                 if let Err(e) = outcome {
-                    let (predicted_ms, actual_ms) = job.observe_eta("failed");
-                    tracing::warn!(
-                        media.id = job.id,
-                        error = %e,
-                        eta.predicted_ms = predicted_ms,
-                        eta.actual_ms = actual_ms,
-                        "lyrics: alignment failed"
-                    );
-                    let retry = std::time::Instant::now() + RETRY_AFTER;
-                    match worker.failed.lock() {
-                        Ok(mut f) => f.insert(job.id, retry),
-                        Err(f) => f.into_inner().insert(job.id, retry),
-                    };
+                    worker.job_failed(&job, &e);
                 }
                 match worker.pending.lock() {
                     Ok(mut p) => {
@@ -404,6 +392,24 @@ impl Aligner {
 
     fn now_ms(&self) -> u64 {
         u64::try_from(self.epoch.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    /// A song job failed: log it with its estimate beside the time taken,
+    /// as the success path does, and hold it off until the retry time.
+    fn job_failed(&self, job: &Job, error: &str) {
+        let (predicted_ms, actual_ms) = job.observe_eta("failed");
+        tracing::warn!(
+            media.id = job.id,
+            error = %error,
+            eta.predicted_ms = predicted_ms,
+            eta.actual_ms = actual_ms,
+            "lyrics: alignment failed"
+        );
+        let retry = std::time::Instant::now() + RETRY_AFTER;
+        match self.failed.lock() {
+            Ok(mut f) => f.insert(job.id, retry),
+            Err(f) => f.into_inner().insert(job.id, retry),
+        };
     }
 
     async fn process_job(&self, job: &Job) -> Result<(), String> {
@@ -1201,8 +1207,50 @@ mod tests {
             .collect()
     }
 
-    /// ODD: the estimate's error is on /metrics. Disarm check: with the
-    /// `histogram!` call in `Job::observe_eta` commented out, this fails.
+    #[derive(Clone, Default)]
+    struct LogBuf(Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for LogBuf {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuf {
+        type Writer = LogBuf;
+        fn make_writer(&'a self) -> LogBuf {
+            self.clone()
+        }
+    }
+
+    /// Captures this thread's log lines until the guard drops.
+    fn capture_logs() -> (LogBuf, tracing::subscriber::DefaultGuard) {
+        let buf = LogBuf::default();
+        let sub = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .finish();
+        (buf.clone(), tracing::subscriber::set_default(sub))
+    }
+
+    /// The captured line holding `message`, which must carry both ETA fields.
+    fn eta_line(buf: &LogBuf, message: &str) -> String {
+        let log = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        let line = log
+            .lines()
+            .find(|l| l.contains(message))
+            .unwrap_or_else(|| panic!("no {message:?} line in {log}"))
+            .to_owned();
+        assert!(line.contains("eta.predicted_ms=2000"), "{line}");
+        assert!(line.contains("eta.actual_ms="), "{line}");
+        line
+    }
+
+    /// ODD: the estimate's error is on /metrics and in the log line. Disarm
+    /// check: with the `histogram!` call in `Job::observe_eta`, or the eta
+    /// fields of "lyrics: aligned", commented out, this fails.
     #[tokio::test]
     async fn a_finished_job_reports_how_far_off_its_estimate_was() {
         use crate::services::lyrics::shadow::tests::{body, fake};
@@ -1211,6 +1259,7 @@ mod tests {
         let recorder = DebuggingRecorder::new();
         let snapshotter = recorder.snapshotter();
         let _guard = metrics::set_default_local_recorder(&recorder);
+        let (logs, _log_guard) = capture_logs();
         let answer = Aligned {
             lines: vec![vec![WordStamp {
                 at: 0,
@@ -1242,6 +1291,42 @@ mod tests {
         let (direction, outcome, seconds) = &seen[0];
         assert_eq!((direction.as_str(), outcome.as_str()), ("late", "aligned"));
         assert!((3.0..4.0).contains(seconds), "{seconds}");
+        eta_line(&logs, "lyrics: aligned");
+    }
+
+    /// ODD symmetry: a failed job reports its estimate's error under
+    /// `outcome="failed"` and logs both ETA fields. Disarm check: with the
+    /// eta fields of "lyrics: alignment failed" commented out, this fails.
+    #[test]
+    fn a_failed_job_reports_how_far_off_its_estimate_was() {
+        use metrics_util::debugging::DebuggingRecorder;
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let (logs, _log_guard) = capture_logs();
+        let (tx, _rx) = mpsc::channel(1);
+        let aligner = test_aligner(PathBuf::from("/m"), AlignCache::new(None), tx);
+        let job = Job {
+            id: 42,
+            path: "a/song.flac".into(),
+            lines: Vec::new(),
+            key: "k".into(),
+            duration_ms: 10_000,
+            // Queued just now with 2 s predicted: about 2 s early.
+            queued_at: Instant::now(),
+            predicted_ms: Some(2_000),
+        };
+        aligner.job_failed(&job, "aligner said no");
+
+        let seen = eta_errors(&snapshotter);
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        let (direction, outcome, seconds) = &seen[0];
+        assert_eq!((direction.as_str(), outcome.as_str()), ("early", "failed"));
+        assert!((1.0..=2.0).contains(seconds), "{seconds}");
+        let line = eta_line(&logs, "lyrics: alignment failed");
+        assert!(line.contains("aligner said no"), "{line}");
+        assert!(aligner.failed.lock().unwrap().contains_key(&42));
     }
 
     #[test]
