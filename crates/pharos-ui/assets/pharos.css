@@ -5875,6 +5875,15 @@ body::before {
 :root[data-device="tv"] .pharos-album .pharos-track {
   padding-block: 0.3rem;
 }
+/* B1348/V1319: a TV reports no hover, so the rule above showed every song
+   row's three buttons at once. On the TV only the row holding the remote's
+   focus shows them; a touch screen keeps them, having no focus to follow. */
+:root[data-device="tv"] .pharos-queue-buttons[data-target="song"] .pharos-queue-button {
+  opacity: 0;
+}
+:root[data-device="tv"] .pharos-track-item:focus-within .pharos-queue-button {
+  opacity: 1;
+}
 
 /* Dynamic mixes (spec 024, B441): the mix line in the queue panel, its
    picker, the rule editor, and why a mix picked a song. */

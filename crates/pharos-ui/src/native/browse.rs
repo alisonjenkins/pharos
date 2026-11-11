@@ -5449,6 +5449,20 @@ mod tests {
         assert!(html.contains("No tracks yet."), "{html}");
     }
 
+    /// B1348/V1319: the TV reports no hover, which shows every song row's
+    /// buttons; its own rules hide them and show them on the focused row,
+    /// after the no-hover rule so they win. Disarm check: deleting the TV
+    /// rules fails the first lookup.
+    #[test]
+    fn the_tv_shows_a_song_rows_buttons_only_on_the_focused_row() {
+        let sheet = include_str!("../../assets/pharos.css");
+        let at = |needle: &str| sheet.find(needle).unwrap_or_else(|| panic!("{needle}"));
+        let hide = at(":root[data-device=\"tv\"] .pharos-queue-buttons[data-target=\"song\"] .pharos-queue-button {\n  opacity: 0;");
+        let show = at(":root[data-device=\"tv\"] .pharos-track-item:focus-within .pharos-queue-button {\n  opacity: 1;");
+        let touch = at("@media (hover: none) {\n  .pharos-queue-buttons[data-target=\"song\"] .pharos-queue-button,");
+        assert!(touch < hide && hide < show);
+    }
+
     #[test]
     fn without_the_apps_queue_there_are_no_queue_buttons() {
         let album = detail(item(ItemRef::Synth(5), ItemKind::Album, "Record"));
