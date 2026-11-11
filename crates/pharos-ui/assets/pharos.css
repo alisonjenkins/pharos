@@ -4972,6 +4972,165 @@ label.pharos-setting {
   white-space: nowrap;
 }
 
+/* B1354/V1325: a show's page in the album page's two columns: art, name,
+   Resume, marks and overview on the left; the seasons and the episodes
+   start at the top on the right. */
+.pharos-show {
+  display: grid;
+  grid-template-columns: 17rem minmax(0, 1fr);
+  gap: 2.25rem;
+  align-items: start;
+  max-width: 80rem;
+}
+.pharos-show-side .pharos-hero {
+  flex-direction: column;
+  gap: 0.75rem;
+  margin-bottom: 0.75rem;
+}
+.pharos-show-side .pharos-hero-art {
+  flex: none;
+  width: 11rem;
+}
+.pharos-show-side .pharos-hero-body h2 {
+  margin: 0 0 0.25rem;
+  font-size: 1.5rem;
+  line-height: 1.2;
+}
+.pharos-show-side .pharos-hero-body > .pharos-muted {
+  margin: 0 0 0.25rem;
+  font-size: 0.9rem;
+}
+.pharos-show-side .pharos-actions {
+  gap: 0.4rem;
+  margin: 0.6rem 0;
+}
+.pharos-show-side .pharos-overview {
+  margin: 0 0 0.4rem;
+  font-size: 0.9rem;
+  line-height: 1.45;
+}
+.pharos-show-main > .pharos-section-title {
+  margin-top: 0;
+}
+/* The season tabs: the music bar's segmented row of pills (B1334), with the
+   season's watched mark beside it. */
+.pharos-show-main .pharos-season-bar {
+  justify-content: flex-start;
+  gap: 0.5rem;
+  margin: 0 0 0.5rem;
+  padding-bottom: 0.5rem;
+  border-bottom: 1px solid var(--px-color-border);
+}
+.pharos-season-bar .pharos-tabs {
+  flex: 0 1 auto;
+  gap: 0.15rem;
+  margin: 0;
+  padding: 0.15rem;
+  border: 1px solid var(--px-color-border);
+  border-radius: 999px;
+  background: var(--px-color-surface);
+}
+.pharos-season-bar .pharos-tab {
+  display: inline-flex;
+  align-items: center;
+  min-height: 1.85rem;
+  padding: 0 0.85rem;
+  border: 0;
+  border-radius: 999px;
+  font-size: 0.9rem;
+  white-space: nowrap;
+}
+.pharos-season-bar .pharos-tab-active {
+  background: var(--px-color-accent);
+  color: var(--px-color-accent-fg);
+}
+.pharos-show-main .pharos-season-bar .pharos-button {
+  margin-left: 0;
+}
+/* B1355/V1326: dense episode rows. A smaller still; the row's Play and queue
+   buttons show on the hovered or focused row only, where a pointer or the
+   remote is, so the list reads as names. Faded, not hidden, so they stay
+   focusable and clickable (B1348 does the same for song rows). */
+.pharos-show-main .pharos-episode {
+  gap: 0.75rem;
+  padding: 0.3rem 0.4rem;
+  border-bottom: 0;
+  border-radius: 6px;
+}
+.pharos-show-main .pharos-episode:hover,
+.pharos-show-main .pharos-episode:focus-within {
+  background: var(--px-color-surface);
+}
+.pharos-show-main .pharos-episode-link {
+  gap: 0.75rem;
+}
+.pharos-show-main .pharos-episode-still {
+  flex-basis: 7.5rem;
+  border-radius: 4px;
+}
+.pharos-show-main .pharos-episode-text {
+  gap: 0.1rem;
+}
+.pharos-show-main .pharos-episode-text .pharos-muted {
+  font-size: 0.8rem;
+}
+.pharos-show-main .pharos-episode-mark {
+  width: 1.6rem;
+  height: 1.6rem;
+}
+.pharos-show-main .pharos-episode-mark svg {
+  width: 0.85rem;
+  height: 0.85rem;
+}
+@media (hover: hover) {
+  .pharos-show-main .pharos-episode .pharos-episode-play,
+  .pharos-show-main .pharos-episode .pharos-queue-buttons[data-target="episode_row"] {
+    opacity: 0;
+  }
+  .pharos-show-main .pharos-episode:hover .pharos-episode-play,
+  .pharos-show-main .pharos-episode:hover .pharos-queue-buttons[data-target="episode_row"],
+  .pharos-show-main .pharos-episode:focus-within .pharos-episode-play,
+  .pharos-show-main .pharos-episode:focus-within .pharos-queue-buttons[data-target="episode_row"] {
+    opacity: 1;
+  }
+}
+@media (max-width: 40rem) {
+  .pharos-title-art,
+  .pharos-title[data-kind="episode"] .pharos-title-art {
+    flex-basis: auto;
+  }
+  .pharos-title[data-kind="movie"] .pharos-title-art {
+    max-width: 10rem;
+  }
+  /* One line an episode: still, name, tick, the "more" control and Play;
+     the queue buttons wrap under it only while "more" is open. */
+  .pharos-show-main .pharos-episode:not(.is-more-open) {
+    flex-wrap: nowrap;
+  }
+  .pharos-show-main .pharos-episode-link {
+    flex: 1 1 auto;
+  }
+  .pharos-show-main .pharos-episode.is-more-open .pharos-episode-link {
+    flex-basis: 100%;
+  }
+  .pharos-show {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 1rem;
+  }
+  .pharos-show-side .pharos-hero {
+    flex-direction: row;
+  }
+  .pharos-show-side .pharos-hero-art {
+    width: 6.5rem;
+  }
+  .pharos-show-main .pharos-season-bar {
+    overflow-x: auto;
+  }
+  .pharos-show-main .pharos-episode-still {
+    flex-basis: 5rem;
+  }
+}
+
 /* Rails (012): no scrollbar; a sideways swipe or Shift+wheel, a mouse
    drag, touch, keyboard focus and the controller still move them. A plain
    vertical wheel turn scrolls the page, never the rail. */
@@ -8033,4 +8192,39 @@ body:has(.pharos-reader) {
   margin: 0;
   clip: auto;
   overflow: visible;
+}
+
+/* B1354-B1355 on a TV: a narrower side column, and an episode row's buttons
+   only on the row holding the remote's focus (the TV reports no hover, like
+   the album page's song rows, B1348). */
+:root[data-device="tv"] .pharos-show {
+  grid-template-columns: 14.5rem minmax(0, 1fr);
+  gap: 1.75rem;
+}
+:root[data-device="tv"] .pharos-show-side .pharos-hero-art {
+  width: 7.5rem;
+}
+:root[data-device="tv"] .pharos-show-side .pharos-hero-body h2 {
+  font-size: 1.2rem;
+}
+:root[data-device="tv"] .pharos-show-side .pharos-overview {
+  font-size: 0.78rem;
+}
+:root[data-device="tv"] .pharos-season-bar .pharos-tab {
+  min-height: 1.65rem;
+  font-size: 0.8rem;
+}
+:root[data-device="tv"] .pharos-show-main .pharos-episode-still {
+  flex-basis: 5rem;
+}
+:root[data-device="tv"] .pharos-show-main .pharos-episode-name {
+  font-size: 0.9rem;
+}
+:root[data-device="tv"] .pharos-show-main .pharos-episode .pharos-episode-play,
+:root[data-device="tv"] .pharos-show-main .pharos-episode .pharos-queue-buttons[data-target="episode_row"] {
+  opacity: 0;
+}
+:root[data-device="tv"] .pharos-show-main .pharos-episode:focus-within .pharos-episode-play,
+:root[data-device="tv"] .pharos-show-main .pharos-episode:focus-within .pharos-queue-buttons[data-target="episode_row"] {
+  opacity: 1;
 }
