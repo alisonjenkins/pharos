@@ -16,7 +16,6 @@ use super::depth;
 use super::find::{self, SUGGEST_LIMIT};
 use super::keymap::Mode;
 use super::keys::{use_arrival_focus, use_key_mode};
-use super::listen::Icon;
 use super::palette::Row;
 use super::platform;
 use super::playback::{ends_at_label, left_to_watch, start_ms, FailureKind, Left};
@@ -1281,7 +1280,7 @@ pub fn PosterTile(
 ) -> Element {
     let play = play && item.kind.playable();
     let nav = use_context::<Nav>();
-    let hold = use_signal(TileHold::default);
+    let mut hold = use_signal(TileHold::default);
     let to = if read {
         Route::Read(item.id)
     } else {
@@ -1296,15 +1295,10 @@ pub fn PosterTile(
         .collect::<Vec<_>>()
         .join(", ");
     let play_label = format!("Play {named}");
-    let class = if hold.read().lit {
-        "pharos-poster is-held"
-    } else {
-        "pharos-poster"
-    };
     let progress = progress_percent(&item);
     let rated = !ratings(item.kind, item.imdb_rating, item.critic_rating).is_empty();
     rsx! {
-        Link { to, class,
+        Link { to, class: "pharos-poster",
             div { class: "pharos-poster-art",
                 onpointermove: move |evt| depth::tilt(&evt),
                 onpointerleave: move |evt| {
@@ -1314,6 +1308,10 @@ pub fn PosterTile(
                     }
                 },
                 onpointerdown: move |evt: PointerEvent| {
+                    let touch = evt.pointer_type() != "mouse";
+                    if play && hold.peek().touch != touch {
+                        hold.write().touch = touch;
+                    }
                     if play && evt.is_primary() && evt.trigger_button() == Some(dioxus::html::input_data::MouseButton::Primary) {
                         hold_start(hold, nav, watch.clone(), evt.pointer_type());
                     }
@@ -1328,8 +1326,13 @@ pub fn PosterTile(
                         hold_clear(hold);
                     }
                 },
-                // A held finger plays rather than opening the link's menu.
-                oncontextmenu: move |evt: MouseEvent| if play { evt.prevent_default() },
+                // A held finger plays rather than opening the link's menu; a
+                // mouse's right click keeps the menu.
+                oncontextmenu: move |evt: MouseEvent| {
+                    if play && hold.peek().touch {
+                        evt.prevent_default();
+                    }
+                },
                 match &item.image {
                     Some(src) => rsx! { Art { src: src.clone(), sizes: POSTER_SIZES } },
                     None => rsx! { ArtPlaceholder { kind: item.kind, name: item.name.clone() } },
@@ -1348,17 +1351,6 @@ pub fn PosterTile(
                 }
                 if let Some(p) = progress {
                     div { class: "pharos-progress", style: "width: {p}%" }
-                }
-                // No info control: a remote never reached one inside a tile,
-                // and a rail of them read as clutter. The tile opens the
-                // title page and a hold plays, which the tile under the
-                // pointer or the focus says (B1340, V1311).
-                if play {
-                    span { class: "pharos-poster-hold", "aria-hidden": "true",
-                        Icon { path: ICON_PLAY_HINT }
-                        span { class: "pharos-poster-hold-tv", "Hold OK" }
-                        span { class: "pharos-poster-hold-pointer", "Hold to play" }
-                    }
                 }
             }
             span { class: "pharos-poster-name", title: "{name}", "{name}" }
@@ -1386,49 +1378,40 @@ pub fn PosterTile(
     }
 }
 
-/// The hold hint's glyph on a tile that plays on a hold (B1340).
-const ICON_PLAY_HINT: &str = "M8 5v14l11-7z";
-
 /// How long a button or finger is held on a tile before it plays; the TV's
 /// OK waits as long (`tv_page::TILE_HOLD_MS`).
 const TILE_HOLD_MS: u32 = super::tv_page::TILE_HOLD_MS;
 
 /// A pointer held on a tile that plays on a hold: which press it is (a
 /// later press or a release makes an older wait moot), whether it is still
-/// down, whether the tile shows it as held, and whether it played.
+/// down, and whether it played.
 #[derive(Clone, Copy, Default, PartialEq)]
 struct TileHold {
     press: u64,
     down: bool,
-    lit: bool,
     fired: bool,
+    /// The last press on the tile was a finger or pen, whose long press
+    /// opens the link's menu; a mouse's right click keeps it (B1340).
+    touch: bool,
 }
 
-/// A press on a tile that plays on a hold: lit once it is plainly not a
-/// click, and played if it is still down at [`TILE_HOLD_MS`].
+/// A press on a tile that plays on a hold: played if it is still down at
+/// [`TILE_HOLD_MS`].
 fn hold_start(mut hold: Signal<TileHold>, nav: Nav, watch: Route, via: String) {
     let press = hold.peek().press.wrapping_add(1);
+    let touch = hold.peek().touch;
     hold.set(TileHold {
         press,
         down: true,
-        lit: false,
         fired: false,
+        touch,
     });
     spawn(async move {
-        platform::sleep_ms(200).await;
+        platform::sleep_ms(TILE_HOLD_MS).await;
         if hold.peek().press != press || !hold.peek().down {
             return;
         }
-        hold.write().lit = true;
-        platform::sleep_ms(TILE_HOLD_MS - 200).await;
-        if hold.peek().press != press || !hold.peek().down {
-            return;
-        }
-        {
-            let mut h = hold.write();
-            h.lit = false;
-            h.fired = true;
-        }
+        hold.write().fired = true;
         platform::info(&format!("pharos: tile hold verdict=play via={via}"));
         nav.0.call(watch);
     });
@@ -1437,12 +1420,8 @@ fn hold_start(mut hold: Signal<TileHold>, nav: Nav, watch: Route, via: String) {
 /// The press ended: a wait still running no longer plays.
 fn hold_release(mut hold: Signal<TileHold>) {
     let h = *hold.peek();
-    if h.down || h.lit {
-        hold.set(TileHold {
-            down: false,
-            lit: false,
-            ..h
-        });
+    if h.down {
+        hold.set(TileHold { down: false, ..h });
     }
 }
 
@@ -3847,9 +3826,9 @@ mod tests {
             !html.contains("pharos-poster-info"),
             "no info control: {html}"
         );
-        assert!(html.contains(r#"class="pharos-poster-hold""#), "{html}");
-        for hint in ["Hold OK", "Hold to play"] {
-            assert!(html.contains(hint), "{hint}: {html}");
+        // No hint either: Alison, 2026-11-11T07:46Z.
+        for hint in ["pharos-poster-hold", "Hold OK", "Hold to play"] {
+            assert!(!html.contains(hint), "{hint}: {html}");
         }
         let css = include_str!("../../assets/pharos.css");
         let rule = |head: &str| -> String {
@@ -3863,11 +3842,6 @@ mod tests {
             rule("\n.pharos-poster-play {").contains("display: none;"),
             "the play link is never drawn, so no arrow or Tab stops on it"
         );
-        assert!(
-            rule(":root[data-device=\"tv\"] .pharos-poster:focus-visible .pharos-poster-hold {")
-                .contains("display: inline-flex;"),
-            "the TV's focused tile shows the hint"
-        );
     }
 
     #[test]
@@ -3875,14 +3849,14 @@ mod tests {
         let series = item(ItemKind::Series);
         let html = render(move || rsx! { PosterTile { item: series.clone(), play: true } });
         assert!(!html.contains("/watch/"), "{html}");
-        assert!(!html.contains("pharos-poster-hold"), "{html}");
+        assert!(!html.contains("pharos-poster-play"), "{html}");
         let film = item(ItemKind::Movie);
         let html = render(move || rsx! { PosterTile { item: film.clone() } });
         assert!(
             !html.contains("/watch/"),
             "a plain tile still opens the title: {html}"
         );
-        assert!(!html.contains("pharos-poster-hold"), "{html}");
+        assert!(!html.contains("pharos-poster-play"), "{html}");
     }
 
     #[test]

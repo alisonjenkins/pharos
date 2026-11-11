@@ -465,8 +465,7 @@ pub const TILE_HOLD_MS: u32 = 600;
 /// press opens its title page, as the WebView's own click would, and a
 /// hold of [`TILE_HOLD_MS`] presses the tile's undrawn play link (Alison,
 /// 2026-11-11). The WebView's own click is held back on every Enter of the
-/// hold, its repeats included, so a hold never opens the page as well; the
-/// tile turns to its held look once the hold is plainly not a press.
+/// hold, its repeats included, so a hold never opens the page as well.
 pub const TILE_HOLD_JS: &str = r#"
 let tileHold = null;
 const tilePlay = (t) => {
@@ -483,10 +482,8 @@ addEventListener("keydown", (e) => {
   if (tileHold) return;
   at.started = performance.now();
   tileHold = at;
-  at.lit = setTimeout(() => at.tile.classList.add("is-held"), 200);
   at.timer = setTimeout(() => {
     at.done = true;
-    at.tile.classList.remove("is-held");
     at.play.click();
     console.info("pharos: keys: tile ok verdict=play held_ms=" + Math.round(performance.now() - at.started));
   }, __TILE_HOLD_MS__);
@@ -495,9 +492,7 @@ addEventListener("keyup", (e) => {
   if (e.key !== "Enter" || !tileHold) return;
   const at = tileHold;
   tileHold = null;
-  clearTimeout(at.lit);
   clearTimeout(at.timer);
-  at.tile.classList.remove("is-held");
   if (at.done) return;
   e.preventDefault();
   at.tile.click();
