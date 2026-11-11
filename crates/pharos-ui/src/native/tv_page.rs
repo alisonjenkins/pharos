@@ -337,6 +337,8 @@ try {{
     modernWasmUrl: at("jassub-worker-modern.wasm"),
     availableFonts, fonts: own, defaultFont: "liberation sans", queryFonts: false, debug: true,
   }});
+  // Keep the counters, drop the console line the debug mode writes per frame.
+  if (j.debug) j.debug.onsubtitleFrameCallback = null;
   runs[run] = {{ j, own }};
   window.__pharosJassub = j;
   await within(j.ready);
@@ -1037,6 +1039,7 @@ mod tests {
         assert!(at("const deadline") < at("blob(dir"), "{js}");
         assert!(js.contains("await within(j.ready)"), "{js}");
         assert!(js.contains(".filter(([family]) => !assets.pack[family]).map(async"));
+        assert!(js.contains("j.debug.onsubtitleFrameCallback = null"));
     }
 
     #[test]
