@@ -2939,7 +2939,8 @@ pub fn AlbumView(detail: Detail, tracks: Page) -> Element {
 }
 
 /// An album's Play and Shuffle (B1349/V1320). Play opens its first song,
-/// which queues the rest of the album after it as any song does. Shuffle
+/// which queues the rest of the album after it as any song does, so it
+/// stops a running mix first (a mix keeps the album's rest out, V382). Shuffle
 /// turns the queue's shuffle on, queues the album in a random order (the
 /// whole album, fetched when the page holds only part of it) and plays the
 /// first of them.
@@ -3017,11 +3018,28 @@ fn AlbumPlay(album: ItemRef, name: String, first: ItemRef, tracks: Vec<Item>) ->
             busy.set(false);
         });
     };
+    let play_href = Route::Watch(first).path();
+    let play = move |evt: MouseEvent| {
+        let Some(nav) = nav else {
+            return;
+        };
+        if !evt.modifiers().is_empty() {
+            return;
+        }
+        evt.prevent_default();
+        if let (Some(mut queue), Some(MixCtx(mut mix))) = (queue, mix) {
+            if mix.peek().is_some() {
+                mixes::stop(&mut queue.write(), &mut mix.write());
+            }
+        }
+        nav.0.call(Route::Watch(first));
+    };
     rsx! {
-        Link {
-            to: Route::Watch(first),
+        a {
+            href: "{play_href}",
             class: "pharos-button pharos-album-play",
-            key_action: "play",
+            "data-key-action": "play",
+            onclick: play,
             Icon { path: ICON_PLAY }
             span { "Play" }
         }
@@ -5470,10 +5488,12 @@ mod tests {
             let (album, items) = (album.clone(), vec![clip.clone(), song]);
             move || rsx! { AlbumView { detail: album.clone(), tracks: page(items.clone()) } }
         });
-        assert!(
-            html.contains(r#"href="/ui/watch/2" class="pharos-button pharos-album-play""#),
-            "{html}"
-        );
+        let play = html
+            .split("<a ")
+            .find(|a| a.contains("pharos-album-play"))
+            .and_then(|a| a.split('>').next())
+            .unwrap_or_default();
+        assert!(play.contains(r#"href="/ui/watch/2""#), "{html}");
         let html = with_queue(move || {
             rsx! { AlbumView { detail: album.clone(), tracks: page(vec![clip.clone()]) } }
         });
