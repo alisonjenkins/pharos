@@ -30,6 +30,7 @@ test.use({
 type Api = {
   user: { Id: string };
   json: (path: string) => Promise<any>;
+  post: (path: string, data: unknown) => Promise<void>;
 };
 
 const nativeSynth = (wireId: string) => `s${BigInt(`0x${wireId.slice(16)}`)}`;
@@ -57,6 +58,10 @@ async function signIn(page: Page, request: APIRequestContext): Promise<Api> {
   const { AccessToken: token, User: user } = await auth.json();
   const json = async (path: string) =>
     (await request.get(`${PHAROS_URL}${path}`, { headers: { "X-Emby-Token": token } })).json();
+  const post = async (path: string, data: unknown) => {
+    const r = await request.post(`${PHAROS_URL}${path}`, { headers: { "X-Emby-Token": token }, data });
+    expect(r.ok(), `POST ${path}: ${r.status()}`).toBe(true);
+  };
 
   const problems: string[] = [];
   page.on("console", (m) => {
@@ -74,7 +79,7 @@ async function signIn(page: Page, request: APIRequestContext): Promise<Api> {
     .poll(() => page.evaluate(() => (window as any).__tvBridgeSent?.some((m: any) => m.t === "size")))
     .toBe(true);
   expect(problems, problems.join("\n")).toEqual([]);
-  return { user, json };
+  return { user, json, post };
 }
 
 /** What has the focus: its id, tag, classes and text, for a readable failure. */
@@ -99,6 +104,11 @@ async function walkTo(page: Page, key: string, selector: string, max = 8): Promi
 
 /** A Bulk film (a few seconds long), its native id. */
 async function aFilm(api: Api): Promise<string> {
+  return (await aFilmIds(api)).native;
+}
+
+/** A Bulk film (a few seconds long), its wire and native ids. */
+async function aFilmIds(api: Api): Promise<{ wire: string; native: string }> {
   const views = await api.json(`/Users/${api.user.Id}/Views`);
   const bulk = views.Items?.find((i: { Name: string }) => i.Name === "Bulk");
   expect(bulk, "the seed has a Bulk library").toBeTruthy();
@@ -113,7 +123,7 @@ async function aFilm(api: Api): Promise<string> {
       { timeout: 60_000 },
     )
     .toBe(true);
-  return nativeId(film!.Id);
+  return { wire: film!.Id, native: nativeId(film!.Id) };
 }
 
 /** Open a film's player, paused, with the remote's focus on the picture. */
@@ -230,5 +240,42 @@ test.describe("Android TV remote (B1332)", () => {
     await expect(page.locator("section.pharos-album h2"), "OK opened the album").toBeVisible({
       timeout: 15_000,
     });
+  });
+
+  // B1340 / V1311: a Continue Watching tile draws no info control (the
+  // remote's arrows never reached one inside the tile). OK on the tile opens
+  // its title page; OK held plays it, through the tile's undrawn play link.
+  test("OK on a Continue Watching tile opens its title and a held OK plays it (B1340)", async ({
+    page,
+    request,
+  }) => {
+    test.setTimeout(120_000);
+    const api = await signIn(page, request);
+    const { wire, native: film } = await aFilmIds(api);
+    await api.post(`/Sessions/Playing/Progress`, {
+      ItemId: wire,
+      PlaySessionId: `pw-tile-hold-${Date.now()}`,
+      PositionTicks: 25_000_000,
+      IsPaused: true,
+    });
+    const tile = page.locator(`section.pharos-rail a.pharos-poster[href$="/ui/title/${film}"]`).first();
+    const home = async () => {
+      await page.goto("/ui/");
+      await expect(tile, "the film is in Continue watching").toBeAttached({ timeout: 30_000 });
+      await page.keyboard.press("ArrowDown");
+      await tile.focus();
+    };
+
+    await home();
+    expect(await page.locator(".pharos-poster-info").count(), "no info control").toBe(0);
+    await expect(tile.locator(".pharos-poster-hold-tv"), "the focused tile says what a hold does").toBeVisible();
+    await page.keyboard.press("Enter");
+    await expect(page, "OK opened the title page").toHaveURL(new RegExp(`/ui/title/${film}$`), { timeout: 15_000 });
+
+    await home();
+    await page.keyboard.down("Enter");
+    await page.waitForTimeout(900);
+    await page.keyboard.up("Enter");
+    await expect(page, "a held OK played").toHaveURL(new RegExp(`/ui/watch/${film}$`), { timeout: 15_000 });
   });
 });
