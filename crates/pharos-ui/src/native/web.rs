@@ -1565,7 +1565,7 @@ pub fn fullscreen_supported() -> bool {
 pub fn focus_card(_within: &str, _to: &str, _keep: &str) {}
 
 /// See [`focus_card`]: nothing to give back in a browser.
-pub fn refocus_if_lost(_to: &str) {}
+pub fn refocus_if_lost(_to: &str, _up_next_gone: bool) {}
 
 /// Moves keyboard focus to the first control inside `within`.
 pub fn focus_first_in(within: &str) {

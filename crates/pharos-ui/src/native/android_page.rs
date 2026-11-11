@@ -786,17 +786,20 @@ const CARD_WATCH: &str = "if (!window.__pharosFocusWatch) { window.__pharosFocus
 /// node may go after this runs, so it looks again a frame or two later.
 /// That focus is not the viewer's choice, so it leaves the remembered id
 /// alone: a pill's Cancel survives into the card that replaces it.
-/// It also stamps the time the card went, and `focus_card` keeps the
-/// remembered button only within a second of it: the pill-to-card swap,
-/// not an Up Next that a seek hid long before this one.
-pub fn refocus_if_lost(to: &str) {
+/// With `up_next_gone` it also stamps the time an Up Next card went, and
+/// `focus_card` keeps the remembered button only within a second of it:
+/// the pill-to-card swap, not an Up Next that a seek hid long before this
+/// one. Skip leaves the stamp alone, so its comings and goings cannot
+/// revive a stale Cancel.
+pub fn refocus_if_lost(to: &str, up_next_gone: bool) {
     run(format!(
-        "window.__pharosCardGoneAt = Date.now(); \
+        "{} \
          const back = () => {{ const a = document.activeElement; \
            const t = document.getElementById({}); \
            if (t && (!a || a === document.body)) {{ window.__pharosRefocusing = true; \
              try {{ t.focus({{preventScroll: true}}); }} finally {{ window.__pharosRefocusing = false; }} }} }}; \
          back(); setTimeout(back, 50); setTimeout(back, 200);",
+        if up_next_gone { "window.__pharosCardGoneAt = Date.now();" } else { "" },
         js_str(to)
     ));
 }
