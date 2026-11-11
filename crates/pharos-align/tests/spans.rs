@@ -145,6 +145,19 @@ fn a_song_traces_its_wait_decodes_and_model_calls_under_one_span() {
         rss(logged.get("rss_mib").map(String::as_str)).is_some(),
         "{logged:?}"
     );
+    // The GPU pool's high-water mark and what it kept (B1352, V1323).
+    assert_eq!(
+        (f("aligner.gpu_peak_mib"), f("aligner.gpu_kept_mib")),
+        (Some("3072"), Some("1024"))
+    );
+    assert_eq!(
+        (
+            logged.get("gpu_peak_mib").map(String::as_str),
+            logged.get("gpu_kept_mib").map(String::as_str)
+        ),
+        (Some("3072"), Some("1024")),
+        "{logged:?}"
+    );
 
     let under: Vec<&Recorded> = all
         .iter()

@@ -13,6 +13,9 @@ pub const SONGS_TOTAL: &str = "pharos_aligner_songs_total";
 pub const SONG_SECONDS: &str = "pharos_aligner_song_seconds";
 /// Wall time of one forward pass, by `device` (`cpu`, `vulkan`).
 pub const FORWARD_SECONDS: &str = "pharos_aligner_forward_seconds";
+/// Bytes the GPU pool held at the end of the last song (B1352, V1323):
+/// `state="peak"` before its empty pages were handed back, `state="kept"` after.
+pub const GPU_POOL_BYTES: &str = "pharos_aligner_gpu_pool_bytes";
 /// A GPU window takes tens of milliseconds, a batched CPU pass seconds.
 const FORWARD_BUCKETS: &[f64] = &[0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0];
 /// A song takes seconds to minutes on the CPU.
@@ -146,6 +149,11 @@ impl Metrics {
             FORWARD_SECONDS,
             metrics::Unit::Seconds,
             "Wall time of one forward pass, by device"
+        );
+        metrics::describe_gauge!(
+            GPU_POOL_BYTES,
+            metrics::Unit::Bytes,
+            "GPU pool bytes at the end of the last song: peak before release, kept after"
         );
         Ok(Self { handle, process })
     }
