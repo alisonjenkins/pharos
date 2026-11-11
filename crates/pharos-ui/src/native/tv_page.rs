@@ -300,6 +300,11 @@ const blob = async (path, type) => {{
   return URL.createObjectURL(new Blob([await r.arrayBuffer()], {{ type }}));
 }};
 const assets = window.__pharosJassubAssets = window.__pharosJassubAssets || {{}};
+// The script's own font URLs, revoked if the start fails before a run owns
+// them, including any a fetch still finishes after the failure.
+const made = [];
+let owned = false, failed = false;
+const ownBlob = (f) => blob(f, "font/ttf").then((u) => {{ if (failed) URL.revokeObjectURL(u); else made.push(u); return u; }});
 // The deadline covers the asset fetches too, so a slow proxy cannot keep
 // plain cues up past it.
 const deadline = new Promise((_, no) => setTimeout(() => no(new Error("not ready after {ready_ms} ms")), {ready_ms}));
@@ -324,10 +329,10 @@ try {{
     }}),
   ]).then(() => Promise.all([
     fetch(sub).then((r) => {{ if (!r.ok) throw new Error("the styled script answered " + r.status); return r.text(); }}),
-    Promise.all(fonts.map((f) => blob(f, "font/ttf").catch(() => null))).then((l) => l.filter(Boolean)),
+    Promise.all(fonts.map((f) => ownBlob(f).catch(() => null))).then((l) => l.filter(Boolean)),
   ])));
   const runs = window.__pharosStyledRuns = window.__pharosStyledRuns || {{}};
-  if (runs[run] === "gone") {{ delete runs[run]; own.forEach((u) => URL.revokeObjectURL(u)); return "failed: stopped before it started"; }}
+  if (runs[run] === "gone") {{ delete runs[run]; throw new Error("stopped before it started"); }}
   const v = document.getElementById(vid);
   if (!v) throw new Error("no <video id=" + vid + ">");
   const availableFonts = {{ "liberation sans": assets.font }};
@@ -343,6 +348,7 @@ try {{
   const ro = new ResizeObserver(() => window.__pharosSend && window.__pharosSend({{ t: "styledresize", run }}));
   if (j._canvas) ro.observe(j._canvas);
   runs[run] = {{ j, own, ro }};
+  owned = true;
   window.__pharosJassub = j;
   await within(j.ready);
   if (!runs[run]) return "failed: stopped while starting";
@@ -361,6 +367,8 @@ try {{
     return "failed: paused redraw " + ((e && e.message) || e);
   }}
 }} catch (e) {{
+  failed = true;
+  if (!owned) made.forEach((u) => URL.revokeObjectURL(u));
   return "failed: " + ((e && e.message) || e);
 }}"#,
         ready_ms = STYLED_READY_MS,
@@ -1126,6 +1134,7 @@ mod tests {
         assert!(js.contains("j.manualRender(frame(), true)"));
         assert!(js.contains("paused_redraw=ok"));
         assert!(js.contains(r#"return "failed: paused redraw ""#));
+        assert!(js.contains("if (!owned) made.forEach((u) => URL.revokeObjectURL(u))"));
         assert!(styled_stop_js(3).contains("r.ro.disconnect()"));
         assert_eq!(
             parse_bridge(&serde_json::json!({"t": "styledresize", "run": 3})),
