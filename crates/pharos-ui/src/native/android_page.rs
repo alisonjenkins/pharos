@@ -2538,6 +2538,10 @@ fn on_bridge(message: Bridge) {
                 }
             }
         }
+        Bridge::StyledResize { run } => {
+            log::debug!("pharos: styled subtitles run={run} canvas resized");
+            lift_styled_subtitles();
+        }
         Bridge::Media(media) => {
             let at = now_ms();
             let (id, tick) = (media.id.clone(), media.tick);

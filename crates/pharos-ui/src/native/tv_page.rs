@@ -339,7 +339,10 @@ try {{
   }});
   // Keep the counters, drop the console line the debug mode writes per frame.
   if (j.debug) j.debug.onsubtitleFrameCallback = null;
-  runs[run] = {{ j, own }};
+  // A resized canvas needs its lift measured again.
+  const ro = new ResizeObserver(() => window.__pharosSend && window.__pharosSend({{ t: "styledresize", run }}));
+  if (j._canvas) ro.observe(j._canvas);
+  runs[run] = {{ j, own, ro }};
   window.__pharosJassub = j;
   await within(j.ready);
   if (!runs[run]) return "failed: stopped while starting";
@@ -370,6 +373,7 @@ pub fn styled_stop_js(run: u64) -> String {
         r#"const runs = window.__pharosStyledRuns = window.__pharosStyledRuns || {{}};
 const r = runs[{run}];
 if (r && r.j) {{
+  if (r.ro) r.ro.disconnect();
   try {{ r.j.destroy(); }} catch (e) {{}}
   r.own.forEach((u) => URL.revokeObjectURL(u));
   if (window.__pharosJassub === r.j) window.__pharosJassub = null;
@@ -642,6 +646,10 @@ pub enum Bridge {
         #[serde(default)]
         paused: u32,
     },
+    /// Styled-subtitle run `run`'s canvas changed size, so its lift is
+    /// measured again.
+    #[serde(rename = "styledresize")]
+    StyledResize { run: u64 },
     /// A media element's state, after any of its events.
     Media(Media),
     /// An hls.js event on the player for `id`.
@@ -1112,8 +1120,15 @@ mod tests {
         assert!(js.contains("await within(j.ready)"), "{js}");
         assert!(js.contains(".filter(([family]) => !assets.pack[family]).map(async"));
         assert!(js.contains("j.debug.onsubtitleFrameCallback = null"));
+        assert!(js.contains(r#"t: "styledresize", run"#));
+        assert!(js.contains("runs[run] = { j, own, ro }"));
         assert!(js.contains("j.manualRender(frame(), true)"));
         assert!(js.contains("paused_redraw=ok"));
+        assert!(styled_stop_js(3).contains("r.ro.disconnect()"));
+        assert_eq!(
+            parse_bridge(&serde_json::json!({"t": "styledresize", "run": 3})),
+            Some(Bridge::StyledResize { run: 3 })
+        );
     }
 
     #[test]
