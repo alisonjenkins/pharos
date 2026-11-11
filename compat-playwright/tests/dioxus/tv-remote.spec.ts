@@ -31,6 +31,7 @@ type Api = {
   user: { Id: string };
   json: (path: string) => Promise<any>;
   post: (path: string, data: unknown) => Promise<void>;
+  del: (path: string) => Promise<void>;
 };
 
 const nativeSynth = (wireId: string) => `s${BigInt(`0x${wireId.slice(16)}`)}`;
@@ -62,6 +63,10 @@ async function signIn(page: Page, request: APIRequestContext): Promise<Api> {
     const r = await request.post(`${PHAROS_URL}${path}`, { headers: { "X-Emby-Token": token }, data });
     expect(r.ok(), `POST ${path}: ${r.status()}`).toBe(true);
   };
+  const del = async (path: string) => {
+    const r = await request.delete(`${PHAROS_URL}${path}`, { headers: { "X-Emby-Token": token } });
+    expect(r.ok(), `DELETE ${path}: ${r.status()}`).toBe(true);
+  };
 
   const problems: string[] = [];
   page.on("console", (m) => {
@@ -79,7 +84,7 @@ async function signIn(page: Page, request: APIRequestContext): Promise<Api> {
     .poll(() => page.evaluate(() => (window as any).__tvBridgeSent?.some((m: any) => m.t === "size")))
     .toBe(true);
   expect(problems, problems.join("\n")).toEqual([]);
-  return { user, json, post };
+  return { user, json, post, del };
 }
 
 /** What has the focus: its id, tag, classes and text, for a readable failure. */
@@ -252,16 +257,24 @@ test.describe("Android TV remote (B1332)", () => {
     test.setTimeout(120_000);
     const api = await signIn(page, request);
     const { wire, native: film } = await aFilmIds(api);
+    // The earlier tests here play this same film, and a scrub near its end
+    // can mark it played, which keeps it off Continue watching whatever
+    // position is posted. Unmark it first, so the tile does not depend on
+    // which tests ran before this one (CI shards the suite).
+    await api.del(`/Users/${api.user.Id}/PlayedItems/${wire}`);
     await api.post(`/Sessions/Playing/Progress`, {
       ItemId: wire,
       PlaySessionId: `pw-tile-hold-${Date.now()}`,
       PositionTicks: 25_000_000,
       IsPaused: true,
     });
+    const state = JSON.stringify((await api.json(`/Users/${api.user.Id}/Items/${wire}`)).UserData ?? null);
     const tile = page.locator(`section.pharos-rail a.pharos-poster[href$="/ui/title/${film}"]`).first();
     const home = async () => {
       await page.goto("/ui/");
-      await expect(tile, "the film is in Continue watching").toBeAttached({ timeout: 30_000 });
+      await expect(tile, `the film is in Continue watching (its play state: ${state})`).toBeAttached({
+        timeout: 30_000,
+      });
       await page.keyboard.press("ArrowDown");
       await tile.focus();
     };
