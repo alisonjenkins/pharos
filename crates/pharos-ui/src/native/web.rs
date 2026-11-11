@@ -1560,6 +1560,25 @@ pub fn fullscreen_supported() -> bool {
     true
 }
 
+/// Moves keyboard focus to the first control inside `within`.
+pub fn focus_first_in(within: &str) {
+    use wasm_bindgen::JsCast;
+    let Some(el) = document()
+        .and_then(|d| d.get_element_by_id(within))
+        .and_then(|w| {
+            w.query_selector("button:not([disabled]), select:not([disabled])")
+                .ok()
+                .flatten()
+        })
+        .and_then(|e| e.dyn_into::<web_sys::HtmlElement>().ok())
+    else {
+        return;
+    };
+    if let Err(e) = el.focus() {
+        warn(&format!("pharos: focus_first_in failed error={e:?}"));
+    }
+}
+
 /// Whether the browser can hand a video to its own picture-in-picture
 /// window (`document.pictureInPictureEnabled`; missing in Firefox).
 pub fn pip_supported() -> bool {
