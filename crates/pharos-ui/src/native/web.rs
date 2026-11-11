@@ -1560,6 +1560,13 @@ pub fn fullscreen_supported() -> bool {
     true
 }
 
+/// A browser keeps its own Tab order: a card that appears over the video
+/// does not take the focus (only the TV's remote does, B1342).
+pub fn focus_card(_within: &str, _to: &str) {}
+
+/// See [`focus_card`]: nothing to give back in a browser.
+pub fn refocus_if_lost(_to: &str) {}
+
 /// Moves keyboard focus to the first control inside `within`.
 pub fn focus_first_in(within: &str) {
     use wasm_bindgen::JsCast;
