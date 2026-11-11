@@ -1504,8 +1504,10 @@ input:focus-visible {
 .pharos-favorite.on {
   border-color: var(--px-color-accent);
 }
+/* The pressed pill is filled with the accent (B1343), so its star takes the
+   accent's foreground, or it vanishes into the fill (B1353). */
 .pharos-favorite.on span {
-  color: var(--px-color-accent);
+  color: var(--px-color-accent-fg);
 }
 .pharos-overview {
   max-width: 60ch;
