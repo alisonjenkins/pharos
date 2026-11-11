@@ -2997,7 +2997,10 @@ fn AlbumPlay(album: ItemRef, name: String, first: ItemRef, tracks: Vec<Item>) ->
                 platform::info(&format!(
                     "pharos: album shuffle dropped album={album:?} reason={reason}"
                 ));
-                busy.set(false);
+                // A later press owns `busy` now; only a mix leaves it ours.
+                if *pressed.peek() == ticket {
+                    busy.set(false);
+                }
                 return;
             }
             match found {
@@ -3043,6 +3046,8 @@ fn AlbumPlay(album: ItemRef, name: String, first: ItemRef, tracks: Vec<Item>) ->
         }
         evt.prevent_default();
         pressed += 1;
+        // Play overtakes a Shuffle still loading, so Shuffle works again.
+        busy.set(false);
         if let (Some(mut queue), Some(MixCtx(mut mix))) = (queue, mix) {
             if mix.peek().is_some() {
                 mixes::stop(&mut queue.write(), &mut mix.write());
