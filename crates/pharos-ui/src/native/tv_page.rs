@@ -722,6 +722,93 @@ mod tests {
         }
     }
 
+    /// The value of `attr="…"` in the first element of `xml` that has it.
+    fn attr<'a>(xml: &'a str, attr: &str) -> Option<&'a str> {
+        let rest = xml.split(&format!("{attr}=\"")).nth(1)?;
+        rest.split('"').next()
+    }
+
+    /// B1329 / V1302: the TV app's launcher label, icon, banner and dark
+    /// launch theme come from the manifest and `android/res`, which
+    /// `scripts/android-apk.sh` lays over dx's project. A TV build lost all
+    /// four once, so each piece the APK checker looks for is pinned here.
+    #[test]
+    fn the_tv_manifest_names_the_pharos_label_icon_banner_and_theme() {
+        let manifest = include_str!("../../android/AndroidManifest.xml");
+        let app = manifest
+            .split("<application")
+            .nth(1)
+            .and_then(|r| r.split('>').next())
+            .unwrap_or_default();
+        assert_eq!(attr(app, "android:label"), Some("Pharos"), "{app}");
+        assert_eq!(attr(app, "android:icon"), Some("@mipmap/ic_launcher"));
+        assert!(attr(app, "android:banner").is_some(), "no banner: {app}");
+        assert_eq!(attr(app, "android:theme"), Some("@style/AppTheme"));
+        assert!(
+            manifest.contains("android.intent.category.LEANBACK_LAUNCHER"),
+            "the TV launcher lists only leanback apps"
+        );
+    }
+
+    /// B1329 / V1302: the overlay's theme keeps the launch window Pharos
+    /// Night, the page's own background, so a TV start shows no white.
+    #[test]
+    fn the_tv_launch_theme_is_pharos_night() {
+        let styles = include_str!("../../android/res/values/styles.xml");
+        let theme = styles
+            .split("<style name=\"AppTheme\"")
+            .nth(1)
+            .and_then(|r| r.split("</style>").next())
+            .unwrap_or_default();
+        assert!(
+            theme.contains(r#"<item name="android:windowBackground">@color/pharos_night</item>"#),
+            "AppTheme's window background is not Pharos Night: {theme}"
+        );
+        let night = styles
+            .split("<color name=\"pharos_night\">")
+            .nth(1)
+            .and_then(|r| r.split('<').next())
+            .unwrap_or_default();
+        let css = include_str!("../../assets/pharos.css");
+        assert!(
+            css.contains(&format!("--px-color-bg: {};", night.to_ascii_lowercase())),
+            "pharos_night {night} is not the page background"
+        );
+    }
+
+    /// B1329 / V1302: the overlay carries its own icon and banner, and the
+    /// build script lays it over dx's project, points the banner at it and
+    /// refuses an APK the checker fails.
+    #[test]
+    fn the_tv_overlay_has_its_icon_and_banner_and_the_build_applies_it() {
+        let banner = include_bytes!("../../android/res/drawable-xhdpi/pharos_banner.png");
+        assert_eq!(&banner[..8], b"\x89PNG\r\n\x1a\n");
+        let size = |at: usize| {
+            u32::from_be_bytes([banner[at], banner[at + 1], banner[at + 2], banner[at + 3]])
+        };
+        assert_eq!((size(16), size(20)), (320, 180), "a TV banner is 320x180");
+        for icon in [
+            include_bytes!("../../android/res/mipmap-mdpi/ic_launcher.webp").as_slice(),
+            include_bytes!("../../android/res/mipmap-hdpi/ic_launcher.webp"),
+            include_bytes!("../../android/res/mipmap-xhdpi/ic_launcher.webp"),
+            include_bytes!("../../android/res/mipmap-xxhdpi/ic_launcher.webp"),
+            include_bytes!("../../android/res/mipmap-xxxhdpi/ic_launcher.webp"),
+        ] {
+            assert_eq!((&icon[..4], &icon[8..12]), (&b"RIFF"[..], &b"WEBP"[..]));
+        }
+        let foreground = include_str!("../../android/res/drawable-v24/ic_launcher_foreground.xml");
+        assert!(foreground.contains("android:pathData="), "{foreground}");
+
+        let script = include_str!("../../../../scripts/android-apk.sh");
+        for step in [
+            "cp -r crates/pharos-ui/android/res/. \"$main_dir/res/\"",
+            "android:banner=\"@drawable/pharos_banner\"",
+            "scripts/android-apk-check.sh\" \"$built\"",
+        ] {
+            assert!(script.contains(step), "android-apk.sh lost: {step}");
+        }
+    }
+
     #[test]
     fn a_paths_search_is_its_query() {
         assert_eq!(
