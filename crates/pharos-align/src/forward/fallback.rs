@@ -139,6 +139,7 @@ impl Model for Fallback {
             metrics::counter!(DEVICE_FALLBACK_TOTAL, "reason" => LATCHED).increment(1);
             Some(LATCHED)
         } else {
+            self.gpu.begin_song();
             None
         };
     }
