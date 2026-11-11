@@ -1168,37 +1168,52 @@ enum Opened {
     Filters,
 }
 
-/// A grid's order and its direction as a select and a button, as a music
-/// library's Albums tab shows them; a library's grid has them on the
-/// [`FilterBar`]'s Sort pill instead (B1311).
+/// The focus goes back to the pill that opened the sort and filter sheet
+/// as it closes. The browser's modal hold does this too; the TV's does
+/// not (V1283).
+fn use_focus_back(open: Signal<Option<Opened>>) {
+    let mut was_open = use_signal(|| None::<Opened>);
+    use_effect(move || {
+        let now = *open.read();
+        if let (None, Some(opener)) = (now, *was_open.peek()) {
+            super::focus_after_render(
+                match opener {
+                    Opened::Sort => SORT_BUTTON_ID,
+                    Opened::Filters => FILTERS_BUTTON_ID,
+                }
+                .to_owned(),
+            );
+        }
+        was_open.set(now);
+    });
+}
+
+/// A grid that has only an order, a music library's albums, as one Sort
+/// pill on the row of its tabs (B1334/V1305). It opens the sort and filter
+/// sheet with only the Sort by and Order groups, so no `<select>` is left
+/// to open the system's picker on a TV remote.
 #[component]
-fn SortControls(narrow: Signal<Narrow>) -> Element {
+fn SortPill(narrow: Signal<Narrow>) -> Element {
     let now = narrow.read().clone();
     let direction = direction_label(now.order, now.descending);
-    let mut narrow = narrow;
+    let mut open = use_signal(|| None::<Opened>);
+    use_focus_back(open);
+    let genres = use_signal(Vec::new);
     rsx! {
-        label { class: "pharos-filter",
-            span { aria_hidden: "true", "Sort" }
-            select {
-                aria_label: "Sort",
-                value: now.order.token(),
-                onchange: move |e| {
-                    if let Some(order) = Order::from_token(&e.value()) {
-                        let next = narrow.read().ordered(order);
-                        narrow.set(next);
-                    }
-                },
-                for order in Order::ALL {
-                    option { value: order.token(), selected: order == now.order, "{order.label()}" }
-                }
-            }
-        }
         button {
-            class: "pharos-button pharos-filter-direction",
+            id: SORT_BUTTON_ID,
+            class: "pharos-chip pharos-filter-pill pharos-sort-pill",
             r#type: "button",
-            aria_label: "Sort direction: {direction}",
-            onclick: move |_| narrow.with_mut(|n| n.descending = !n.descending),
-            "{direction}"
+            aria_haspopup: "dialog",
+            aria_expanded: "{open.read().is_some()}",
+            aria_controls: FILTER_SHEET_ID,
+            aria_label: "Sort: {now.order.label()}, {direction}",
+            onclick: move |_| open.set(Some(Opened::Sort)),
+            Icon { path: ICON_SORT }
+            span { "{now.order.label()} · {direction}" }
+        }
+        if let Some(opened) = *open.read() {
+            FilterSheet { narrow, genres, grouped: None, opened, open, sort_only: true }
         }
     }
 }
@@ -1221,22 +1236,7 @@ fn FilterBar(
     let on = active_filters(&now);
     let count = on.len();
     let mut open = use_signal(|| None::<Opened>);
-    // As the sheet closes the focus goes back to the pill that opened it.
-    // The browser's modal hold does this too; the TV's does not (V1283).
-    let mut was_open = use_signal(|| None::<Opened>);
-    use_effect(move || {
-        let now = *open.read();
-        if let (None, Some(opener)) = (now, *was_open.peek()) {
-            super::focus_after_render(
-                match opener {
-                    Opened::Sort => SORT_BUTTON_ID,
-                    Opened::Filters => FILTERS_BUTTON_ID,
-                }
-                .to_owned(),
-            );
-        }
-        was_open.set(now);
-    });
+    use_focus_back(open);
     let mut narrow = narrow;
     let expanded = open.read().is_some();
     rsx! {
@@ -1311,6 +1311,10 @@ fn FilterSheet(
     grouped: Option<Signal<bool>>,
     opened: Opened,
     open: Signal<Option<Opened>>,
+    /// Only the Sort by and Order groups, for a grid with no filters: a
+    /// music library's albums (B1334).
+    #[props(default)]
+    sort_only: bool,
 ) -> Element {
     super::views::use_modal_hold(".pharos-filter-sheet-root");
     let mut open = open;
@@ -1366,7 +1370,7 @@ fn FilterSheet(
                     }
                 },
                 div { class: "pharos-sheet-head",
-                    h2 { id: "pharos-filter-sheet-title", "Sort and filter" }
+                    h2 { id: "pharos-filter-sheet-title", if sort_only { "Sort" } else { "Sort and filter" } }
                 }
                 div { class: "pharos-sheet-body",
                     SheetGroup { title: "Sort by",
@@ -1399,69 +1403,71 @@ fn FilterSheet(
                             }
                         }
                     }
-                    SheetGroup { title: "Watched",
-                        for (state, label) in watched {
-                            button {
-                                key: "{label}",
-                                class: "pharos-chip",
-                                r#type: "button",
-                                aria_pressed: "{state == now.watched}",
-                                id: (opened == Opened::Filters && state == now.watched).then_some(FILTER_SHEET_START),
-                                onclick: move |_| narrow.with_mut(|n| n.watched = state),
-                                "{label}"
-                            }
-                        }
-                    }
-                    SheetGroup { title: "Genre",
-                        button {
-                            class: "pharos-chip",
-                            r#type: "button",
-                            aria_pressed: "{genre.is_empty()}",
-                            onclick: move |_| narrow.with_mut(|n| n.genre = None),
-                            "All genres"
-                        }
-                        for g in offered {
-                            button {
-                                key: "{g}",
-                                class: "pharos-chip",
-                                r#type: "button",
-                                aria_pressed: "{g == genre}",
-                                onclick: {
-                                    let g = g.clone();
-                                    move |_| {
-                                        let g = g.clone();
-                                        narrow.with_mut(|n| n.genre = Some(g));
-                                    }
-                                },
-                                "{g}"
-                            }
-                        }
-                    }
-                    SheetGroup { title: "3D",
-                        for choice in stereo {
-                            button {
-                                key: "{choice:?}",
-                                class: "pharos-chip",
-                                r#type: "button",
-                                aria_pressed: "{choice == now.stereo}",
-                                onclick: move |_| narrow.with_mut(|n| n.stereo = choice),
-                                "{stereo_label(choice)}"
-                            }
-                        }
-                    }
-                    if let Some(mut grouped) = grouped {
-                        SheetGroup { title: "Collections",
-                            for (on, label) in [(true, "Grouped"), (false, "Each film")] {
+                    if !sort_only {
+                        SheetGroup { title: "Watched",
+                            for (state, label) in watched {
                                 button {
-                                    key: "{on}",
+                                    key: "{label}",
                                     class: "pharos-chip",
                                     r#type: "button",
-                                    aria_pressed: "{on == *grouped.read()}",
-                                    onclick: move |_| {
-                                        keep_collections(on);
-                                        grouped.set(on);
-                                    },
+                                    aria_pressed: "{state == now.watched}",
+                                    id: (opened == Opened::Filters && state == now.watched).then_some(FILTER_SHEET_START),
+                                    onclick: move |_| narrow.with_mut(|n| n.watched = state),
                                     "{label}"
+                                }
+                            }
+                        }
+                        SheetGroup { title: "Genre",
+                            button {
+                                class: "pharos-chip",
+                                r#type: "button",
+                                aria_pressed: "{genre.is_empty()}",
+                                onclick: move |_| narrow.with_mut(|n| n.genre = None),
+                                "All genres"
+                            }
+                            for g in offered {
+                                button {
+                                    key: "{g}",
+                                    class: "pharos-chip",
+                                    r#type: "button",
+                                    aria_pressed: "{g == genre}",
+                                    onclick: {
+                                        let g = g.clone();
+                                        move |_| {
+                                            let g = g.clone();
+                                            narrow.with_mut(|n| n.genre = Some(g));
+                                        }
+                                    },
+                                    "{g}"
+                                }
+                            }
+                        }
+                        SheetGroup { title: "3D",
+                            for choice in stereo {
+                                button {
+                                    key: "{choice:?}",
+                                    class: "pharos-chip",
+                                    r#type: "button",
+                                    aria_pressed: "{choice == now.stereo}",
+                                    onclick: move |_| narrow.with_mut(|n| n.stereo = choice),
+                                    "{stereo_label(choice)}"
+                                }
+                            }
+                        }
+                        if let Some(mut grouped) = grouped {
+                            SheetGroup { title: "Collections",
+                                for (on, label) in [(true, "Grouped"), (false, "Each film")] {
+                                    button {
+                                        key: "{on}",
+                                        class: "pharos-chip",
+                                        r#type: "button",
+                                        aria_pressed: "{on == *grouped.read()}",
+                                        onclick: move |_| {
+                                            keep_collections(on);
+                                            grouped.set(on);
+                                        },
+                                        "{label}"
+                                    }
                                 }
                             }
                         }
@@ -2672,34 +2678,42 @@ pub fn MusicLibraryView(title: String, library: ItemRef, artists: Page, albums: 
             platform::replace(&format!("{}{query}", Route::Browse(library).path()));
         }
     });
+    // The library's tab is lit in the bar above, so its name is for screen
+    // readers only, and the Albums order sits on the row of the tabs: the
+    // covers start a row and a heading higher (B1334/V1305).
     rsx! {
-        section { class: "pharos-browse pharos-music",
+        section { class: "pharos-browse pharos-browse-library pharos-music",
             h2 { "{title}" }
-            div {
-                class: "pharos-tabs",
-                role: "tablist",
-                aria_label: "Music",
-                "data-key-tabs": "music",
-                onkeydown: move |e: KeyboardEvent| {
-                    if let Some(next) = tab().stepped(&e.key()) {
-                        e.prevent_default();
-                        tab.set(next);
-                        platform::focus_by_id(next.id());
+            div { class: "pharos-music-bar",
+                div {
+                    class: "pharos-tabs",
+                    role: "tablist",
+                    aria_label: "Music",
+                    "data-key-tabs": "music",
+                    onkeydown: move |e: KeyboardEvent| {
+                        if let Some(next) = tab().stepped(&e.key()) {
+                            e.prevent_default();
+                            tab.set(next);
+                            platform::focus_by_id(next.id());
+                        }
+                    },
+                    for t in MusicTab::ALL {
+                        button {
+                            key: "{t.token()}",
+                            r#type: "button",
+                            role: "tab",
+                            id: t.id(),
+                            class: if tab() == t { "pharos-tab pharos-tab-active" } else { "pharos-tab" },
+                            aria_selected: tab() == t,
+                            // One stop in the tab order; the arrows move along.
+                            tabindex: if tab() == t { "0" } else { "-1" },
+                            onclick: move |_| tab.set(t),
+                            "{t.label()}"
+                        }
                     }
-                },
-                for t in MusicTab::ALL {
-                    button {
-                        key: "{t.token()}",
-                        r#type: "button",
-                        role: "tab",
-                        id: t.id(),
-                        class: if tab() == t { "pharos-tab pharos-tab-active" } else { "pharos-tab" },
-                        aria_selected: tab() == t,
-                        // One stop in the tab order; the arrows move along.
-                        tabindex: if tab() == t { "0" } else { "-1" },
-                        onclick: move |_| tab.set(t),
-                        "{t.label()}"
-                    }
+                }
+                if tab() == MusicTab::Albums {
+                    SortPill { narrow: order }
                 }
             }
             // Each tab pages through its own listing (B821); switching tabs
@@ -2726,7 +2740,8 @@ pub fn MusicLibraryView(title: String, library: ItemRef, artists: Page, albums: 
     }
 }
 
-/// A music library's albums in the order chosen, with their sort controls.
+/// A music library's albums in the order chosen on the tab row's Sort
+/// pill.
 /// The albums by name were fetched with the page; any other order is
 /// fetched here, and a new order starts the grid afresh.
 #[component]
@@ -2762,9 +2777,6 @@ fn MusicAlbums(library: ItemRef, first: Page, order: Signal<Narrow>) -> Element 
     // A new order keeps the last grid up while it loads: say so (FR-210).
     let busy = listed.pending() && listed.read().is_some();
     rsx! {
-        div { class: "pharos-filters", role: "group", aria_label: "Sort albums",
-            SortControls { narrow: order }
-        }
         if busy {
             p { class: "pharos-muted pharos-filter-busy", role: "status", "Updating…" }
         }
@@ -4108,6 +4120,83 @@ mod tests {
         assert_eq!(html.matches("tabindex=\"-1\"").count(), 2, "{html}");
     }
 
+    /// B1334/V1305: a music library's name is lit in the bar above, so its
+    /// heading is for screen readers only, and its tabs sit in the one row
+    /// that holds the Albums order. Artists, the tab it opens on, has no
+    /// order to choose, so no Sort pill.
+    #[test]
+    fn a_music_library_keeps_its_heading_for_readers_and_its_tabs_on_one_row() {
+        let html = render(|| {
+            let api = use_signal(|| None::<pharos_client::api::NativeApi>);
+            let machine = use_signal(super::super::machine::Machine::new);
+            let marks = use_signal(|| 0);
+            use_context_provider(|| Ctx {
+                api,
+                machine,
+                marks,
+            });
+            rsx! {
+                MusicLibraryView {
+                    title: "Music".to_owned(),
+                    library: ItemRef::Real(1),
+                    artists: page(Vec::new()),
+                    albums: page(Vec::new()),
+                }
+            }
+        });
+        assert!(
+            html.contains("class=\"pharos-browse pharos-browse-library pharos-music\""),
+            "{html}"
+        );
+        assert!(html.contains("<h2>Music</h2>"), "{html}");
+        let bar = html
+            .split("class=\"pharos-music-bar\"")
+            .nth(1)
+            .unwrap_or_else(|| panic!("no tab row: {html}"));
+        assert!(bar.contains("role=\"tablist\""), "{html}");
+        assert!(!html.contains("<select"), "{html}");
+        assert!(!html.contains(SORT_BUTTON_ID), "{html}");
+    }
+
+    /// B1334/V1305: the albums' order is one Sort pill, no `<select>`, and
+    /// it opens the sheet with only the Sort by and Order groups.
+    #[test]
+    fn the_albums_order_is_a_sort_pill_and_a_sort_only_sheet() {
+        let pill = render(|| {
+            let narrow = use_signal(|| Narrow {
+                order: Order::Added,
+                descending: true,
+                ..Narrow::default()
+            });
+            rsx! { SortPill { narrow } }
+        });
+        assert!(!pill.contains("<select"), "{pill}");
+        assert!(
+            pill.contains("aria-label=\"Sort: Date added, Newest first\""),
+            "{pill}"
+        );
+        assert!(pill.contains("aria-haspopup=\"dialog\""), "{pill}");
+        assert!(!pill.contains("aria-modal"), "{pill}");
+
+        let sheet = render(|| {
+            let narrow = use_signal(Narrow::default);
+            let genres = use_signal(|| vec!["Rock".to_owned()]);
+            let open = use_signal(|| Some(Opened::Sort));
+            rsx! {
+                FilterSheet { narrow, genres, grouped: None, opened: Opened::Sort, open, sort_only: true }
+            }
+        });
+        assert!(sheet.contains("aria-modal=\"true\""), "{sheet}");
+        assert!(sheet.contains(">Sort</h2>"), "{sheet}");
+        let groups: Vec<&str> = sheet
+            .split("class=\"pharos-sheet-group\" role=\"group\" aria-label=\"")
+            .skip(1)
+            .filter_map(|rest| rest.split('"').next())
+            .collect();
+        assert_eq!(groups, ["Sort by", "Order"], "{sheet}");
+        assert!(!sheet.contains("Rock"), "{sheet}");
+    }
+
     /// FR-210: a failed paging step says why beside its retry.
     #[test]
     fn a_failed_page_says_why() {
@@ -5291,11 +5380,15 @@ mod tests {
             .and_then(|v| v.parse::<f64>().ok())
             .unwrap_or(f64::MAX);
         let reach = outline.max(glow);
-        // The filter row scrolls sideways too (B1311).
-        for row in [nav, rule(".pharos-filters")] {
+        // The filter row scrolls sideways too (B1311), and so does the
+        // music library's tab row (B1334), whose tabs inside it are no
+        // scroll box of their own to clip the ring again.
+        for row in [nav, rule(".pharos-filters"), rule(".pharos-music-bar")] {
             assert!(px(&row, "padding") >= reach, "{row}\nreach {reach}");
             assert!(row.contains("overflow-x: auto"), "{row}");
         }
+        let tabs = rule(".pharos-music-bar .pharos-tabs");
+        assert!(tabs.contains("overflow: visible"), "{tabs}");
     }
 
     #[test]
