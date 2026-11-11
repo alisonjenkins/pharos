@@ -2493,7 +2493,7 @@ impl Drop for ModalHold {
                 .as_ref()
                 .is_some_and(|root| root.contains(Some(el)))
         };
-        let stranded = focused().is_none_or(|now| inside(&now));
+        let stranded = focused().map_or(true, |now| inside(&now));
         if let Some(opener) = self.opener.take().filter(|o| o.is_connected()) {
             if stranded {
                 focus_element(&opener, false);
