@@ -5101,6 +5101,11 @@ body::before {
   padding: 0 0.5rem;
   text-align: left;
 }
+/* A TV keeps mute in its bar (B1358), so the sheet's Mute row, which the
+   rule above would show, stays hidden. */
+:root[data-device="tv"] .pharos-control-menus.is-open > .pharos-sheet-mute {
+  display: none;
+}
 /* Its delay (image subtitles only) is just another row of the sheet; the
    TV sets no speed, so an empty panel leaves no gap. */
 :root[data-device="tv"] .pharos-control-menus.is-open > .pharos-control-extra {
