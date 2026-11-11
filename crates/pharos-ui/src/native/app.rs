@@ -4644,6 +4644,7 @@ fn use_group_seen(ids: Vec<ItemRef>) -> Vec<MemberSeen> {
         }
     });
     let tick = tick();
+    let shown = ids.clone();
     let found = use_resource(use_reactive!(|(
         ids,
         roster,
@@ -4655,15 +4656,22 @@ fn use_group_seen(ids: Vec<ItemRef>) -> Vec<MemberSeen> {
         async move {
             let _ = (roster, item_changes, tick);
             let (true, Some(session), false) = (active, session, ids.is_empty()) else {
-                return Vec::new();
+                return (ids, Vec::new());
             };
-            session.seen(ids).await.unwrap_or_else(|e| {
+            let seen = session.seen(ids.clone()).await.unwrap_or_else(|e| {
                 platform::warn(&format!("pharos: group seen failed: {}", e.0));
                 Vec::new()
-            })
+            });
+            (ids, seen)
         }
     }));
-    let seen = found.read().clone().unwrap_or_default();
+    // The last answer stands while a refresh for the same items runs, but
+    // not for other items: a show page kept mounted across a season tab
+    // (B1324) would mark the new season's episodes unseen until it lands.
+    let seen = match &*found.read() {
+        Some((asked, seen)) if *asked == shown => seen.clone(),
+        _ => Vec::new(),
+    };
     seen
 }
 
