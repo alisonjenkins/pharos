@@ -1410,10 +1410,10 @@ impl Tier {
 }
 
 /// Where the tier this device last dropped to is kept; absent or unknown
-/// means no cap. Versioned: a cap under the old key came from a detector that
-/// charged every dropped video frame to the subtitles, so it is not trusted
-/// (B666).
-pub const TIER_DROP_KEY: &str = "pharos.subtitles.tier_drop.v2";
+/// means no cap. Versioned: a cap under an older key came from a detector that
+/// charged every dropped video frame to the subtitles (B666, v1) or judged
+/// windows too short to tell (B1357, v2), so it is not trusted.
+pub const TIER_DROP_KEY: &str = "pharos.subtitles.tier_drop.v3";
 
 /// What kind of screen the page runs on, for choosing a [`Tier`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5384,7 +5384,7 @@ mod tests {
 
     #[test]
     fn a_stored_tier_reads_back_and_unknown_is_none() {
-        assert_eq!(TIER_DROP_KEY, "pharos.subtitles.tier_drop.v2");
+        assert_eq!(TIER_DROP_KEY, "pharos.subtitles.tier_drop.v3");
         for tier in Tier::ALL {
             assert_eq!(Tier::parse(tier.label()), Some(tier));
         }
