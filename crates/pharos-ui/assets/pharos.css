@@ -117,6 +117,14 @@ body {
 }
 
 /* The last listing under the next one's load (B822). */
+/* The frame a screen sits in, busy or not, so it is never remounted by
+   going busy (B1324/V1295); idle, it lays nothing out. */
+.pharos-screen-frame {
+  display: contents;
+}
+.pharos-screen-frame.pharos-busy {
+  display: block;
+}
 .pharos-busy {
   opacity: 0.45;
   pointer-events: none;
