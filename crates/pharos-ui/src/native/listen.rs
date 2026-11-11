@@ -1747,4 +1747,52 @@ mod tests {
             "{line}"
         );
     }
+
+    /// B1360/V1331: the top bar never lays one control over another. The
+    /// sides of the picker never shrink below their content, so a narrow
+    /// screen moves the picker aside or wraps; an upright phone gives the
+    /// toggles their own row, which may wrap again.
+    #[test]
+    fn the_top_bar_wraps_rather_than_overlapping_on_a_phone() {
+        let sheet = include_str!("../../assets/pharos.css");
+        let rule = |head: &str| {
+            sheet
+                .split(head)
+                .nth(1)
+                .and_then(|r| r.split('}').next())
+                .unwrap_or_default()
+                .to_owned()
+        };
+        let top = rule("\n.pharos-listen-top {");
+        assert!(top.contains("display: flex;"), "{top}");
+        assert!(top.contains("flex-wrap: wrap;"), "{top}");
+        for side in ["\n.pharos-listen-nav {", "\n.pharos-listen-panels {"] {
+            let r = rule(side);
+            assert!(r.contains("min-width: max-content;"), "{side}: {r}");
+            assert!(r.contains("flex: 1 1 0;"), "{side}: {r}");
+        }
+        assert!(rule("\n.pharos-listen-panels {").contains("flex-wrap: wrap;"));
+        let phone = sheet
+            .split("@media (max-width: 40rem) {")
+            .find_map(|block| {
+                block
+                    .split("\n  .pharos-listen-top .pharos-listen-panels {")
+                    .nth(1)
+            })
+            .and_then(|r| r.split('}').next())
+            .unwrap_or_default();
+        assert!(phone.contains("flex-basis: 100%;"), "{phone}");
+        assert!(phone.contains("min-width: 0;"), "{phone}");
+        let panel = sheet
+            .split("@media (max-width: 40rem) {")
+            .find_map(|block| {
+                block
+                    .split("\n  .pharos-style-picker .pharos-style-panel {")
+                    .nth(1)
+            })
+            .and_then(|r| r.split('}').next())
+            .unwrap_or_default();
+        assert!(panel.contains("right: 0;"), "{panel}");
+        assert!(panel.contains("box-sizing: border-box;"), "{panel}");
+    }
 }
