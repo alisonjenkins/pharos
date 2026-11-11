@@ -8,7 +8,7 @@
 // Only the browser and the TV app submit; the host build compiles this for tests.
 #![allow(dead_code)]
 
-use std::cell::RefCell;
+use std::sync::{LazyLock, Mutex, PoisonError};
 
 use pharos_client::api::{ClientEvent, NativeApi};
 use pharos_client::CallInfo;
@@ -105,18 +105,36 @@ struct Telemetry {
     saves: u64,
 }
 
-thread_local! {
-    static TELEMETRY: RefCell<Telemetry> = RefCell::new(Telemetry::default());
+// Process-wide, not thread-local: on Android, Dioxus runs tasks and event
+// handlers on more than one thread (seen on the TV), so a thread-local the
+// install task wrote was not the one an event handler or a sign-out saw.
+static TELEMETRY: LazyLock<Mutex<Owned>> =
+    LazyLock::new(|| Mutex::new(Owned(Telemetry::default())));
+
+/// The state holds the connection, whose clients are `Rc`s, so it is not
+/// `Send`. Only Dioxus's own tasks and handlers touch it, which Dioxus runs
+/// one at a time even on different threads, and always under the mutex.
+struct Owned(Telemetry);
+
+// SAFETY: see `Owned`: never touched by two threads at once, since every
+// access is under its mutex from code Dioxus runs one at a time.
+unsafe impl Send for Owned {}
+
+/// Runs `f` on the session's state. A poisoned lock still holds usable
+/// state: a panicking handler leaves it whole.
+fn with<R>(f: impl FnOnce(&mut Telemetry) -> R) -> R {
+    let mut guard = TELEMETRY.lock().unwrap_or_else(PoisonError::into_inner);
+    f(&mut guard.0)
 }
 
 /// Whether the signed-in user has opted in to sending diagnostics, as
 /// last read from the server. Off before sign-in and until the read lands.
 pub fn opted_in() -> bool {
-    TELEMETRY.with(|t| t.borrow().opted_in)
+    with(|t| t.opted_in)
 }
 
 fn remember_opt_in(on: bool) {
-    TELEMETRY.with(|t| t.borrow_mut().opted_in = on);
+    with(|t| t.opted_in = on);
 }
 
 /// Forgets the session: the opt-in, the connection events went through
@@ -124,8 +142,7 @@ fn remember_opt_in(on: bool) {
 /// next user's choice is read, and nothing raised before reaches that user's
 /// session. A read or an install still under way is discarded when it lands.
 pub fn forget_opt_in() {
-    TELEMETRY.with(|t| {
-        let mut t = t.borrow_mut();
+    with(|t| {
         let session = t.session.wrapping_add(1);
         *t = Telemetry {
             session,
@@ -136,7 +153,7 @@ pub fn forget_opt_in() {
 
 /// The session a read or an install is begun under; see [`forget_opt_in`].
 pub fn session() -> u64 {
-    TELEMETRY.with(|t| t.borrow().session)
+    with(|t| t.session)
 }
 
 fn prefs_call(action: &str) -> CallInfo {
@@ -181,7 +198,7 @@ struct Ticket {
 }
 
 fn saves() -> u64 {
-    TELEMETRY.with(|t| t.borrow().saves)
+    with(|t| t.saves)
 }
 
 /// Remembers `on` if `ticket` is still the latest: no sign-out and no save
@@ -216,8 +233,7 @@ pub async fn set_opted_in(api: &NativeApi, on: bool) -> Result<(), String> {
 
 /// Starts a save: reads and saves begun before it no longer land.
 fn begin_save() -> Ticket {
-    TELEMETRY.with(|t| {
-        let mut t = t.borrow_mut();
+    with(|t| {
         t.saves = t.saves.wrapping_add(1);
         Ticket {
             session: t.session,
@@ -230,8 +246,7 @@ fn begin_save() -> Ticket {
 /// opted out. An install begun under an earlier session (`begun`, from
 /// [`session`]) does nothing.
 pub fn install(api: NativeApi, opted_in: bool, begun: u64) -> Vec<ClientEvent> {
-    TELEMETRY.with(|t| {
-        let mut t = t.borrow_mut();
+    with(|t| {
         if t.session != begun {
             return Vec::new();
         }
@@ -242,7 +257,7 @@ pub fn install(api: NativeApi, opted_in: bool, begun: u64) -> Vec<ClientEvent> {
 /// The submit to make now for `event`, if any (see [`Sink::report`]).
 pub fn report(event: ClientEvent) -> Option<(NativeApi, ClientEvent)> {
     let opted = opted_in();
-    TELEMETRY.with(|t| t.borrow_mut().sink.report(opted, event))
+    with(|t| t.sink.report(opted, event))
 }
 
 /// Submits `events`, unless the opt-in was turned off since they were
@@ -256,7 +271,7 @@ pub async fn submit(api: &NativeApi, events: &[ClientEvent]) -> Option<String> {
         .submit_events(&prefs_call("submit"), events)
         .await
         .err()?;
-    let first = TELEMETRY.with(|t| !std::mem::replace(&mut t.borrow_mut().failure_logged, true));
+    let first = with(|t| !std::mem::replace(&mut t.failure_logged, true));
     first.then(|| e.to_string())
 }
 
@@ -264,6 +279,13 @@ pub async fn submit(api: &NativeApi, events: &[ClientEvent]) -> Option<String> {
 mod tests {
     use super::*;
     use pharos_client::api::{ClientEventKind, ClientLevel};
+
+    /// The state is process-wide and the test harness runs tests on
+    /// parallel threads: each test that touches it holds this.
+    fn serial() -> std::sync::MutexGuard<'static, ()> {
+        static SERIAL: Mutex<()> = Mutex::new(());
+        SERIAL.lock().unwrap_or_else(PoisonError::into_inner)
+    }
 
     fn event() -> ClientEvent {
         ClientEvent {
@@ -276,9 +298,11 @@ mod tests {
 
     #[test]
     fn sign_out_forgets_the_opt_in_and_the_held_events_and_starts_a_new_session() {
+        let _serial = serial();
+        forget_opt_in();
         remember_opt_in(true);
         assert!(report(event()).is_none(), "no connection yet: held");
-        let held = || TELEMETRY.with(|t| t.borrow().sink.pending_len());
+        let held = || with(|t| t.sink.pending_len());
         assert_eq!(held(), 1);
         let before = session();
         forget_opt_in();
@@ -293,6 +317,8 @@ mod tests {
 
     #[test]
     fn opt_in_reads_only_the_literal_true() {
+        let _serial = serial();
+        forget_opt_in();
         assert!(!opt_in_from(None), "absent must be off");
         assert!(!opt_in_from(Some(b"false")));
         assert!(!opt_in_from(Some(b"garbage")));
@@ -303,6 +329,8 @@ mod tests {
 
     #[test]
     fn toggle_shows_what_the_server_holds_once_a_save_resolves() {
+        let _serial = serial();
+        forget_opt_in();
         assert!(shown_after_save(Ok(true), false), "a stored on must show");
         assert!(!shown_after_save(Ok(false), true), "a stored off must show");
         assert!(
@@ -317,6 +345,8 @@ mod tests {
 
     #[test]
     fn opted_out_submits_nothing_and_holds_nothing() {
+        let _serial = serial();
+        forget_opt_in();
         let mut sink: Sink<u32> = Sink::default();
         assert!(sink.report(false, event()).is_none());
         assert_eq!(sink.pending_len(), 0, "held an event while opted out");
@@ -330,6 +360,8 @@ mod tests {
 
     #[test]
     fn opted_out_drops_events_held_before_install() {
+        let _serial = serial();
+        forget_opt_in();
         let mut sink: Sink<u32> = Sink::default();
         assert!(sink.report(true, event()).is_none());
         assert_eq!(sink.pending_len(), 1);
@@ -342,6 +374,8 @@ mod tests {
 
     #[test]
     fn opted_in_holds_until_install_then_submits_each_event_once() {
+        let _serial = serial();
+        forget_opt_in();
         let mut sink: Sink<u32> = Sink::default();
         assert!(sink.report(true, event()).is_none());
         assert_eq!(sink.pending_len(), 1);
@@ -358,6 +392,8 @@ mod tests {
     /// starts after it, is not remembered for the next user.
     #[test]
     fn an_opt_in_read_from_before_sign_out_is_not_remembered() {
+        let _serial = serial();
+        forget_opt_in();
         forget_opt_in();
         let begun = Ticket {
             session: session(),
@@ -380,6 +416,8 @@ mod tests {
     /// after a later one.
     #[test]
     fn a_read_or_save_from_before_a_later_save_does_not_undo_it() {
+        let _serial = serial();
+        forget_opt_in();
         forget_opt_in();
         let read = Ticket {
             session: session(),
@@ -394,8 +432,35 @@ mod tests {
         forget_opt_in();
     }
 
+    /// An install or a sign-out on one thread is seen on another: on
+    /// Android, Dioxus runs tasks and handlers on more than one thread.
+    #[test]
+    fn the_session_state_is_shared_across_threads() {
+        let _serial = serial();
+        forget_opt_in();
+        let begun = session();
+        std::thread::spawn(|| remember_opt_in(true))
+            .join()
+            .unwrap_or_else(|_| panic!("the other thread panicked"));
+        assert!(
+            opted_in(),
+            "an opt-in remembered on another thread was not seen"
+        );
+        std::thread::spawn(forget_opt_in)
+            .join()
+            .unwrap_or_else(|_| panic!("the other thread panicked"));
+        assert!(!opted_in());
+        assert_ne!(
+            session(),
+            begun,
+            "a sign-out on another thread was not seen"
+        );
+    }
+
     #[test]
     fn hold_before_install_is_bounded() {
+        let _serial = serial();
+        forget_opt_in();
         let mut sink: Sink<u32> = Sink::default();
         for _ in 0..MAX_PENDING + 5 {
             assert!(sink.report(true, event()).is_none());
