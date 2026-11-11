@@ -5972,16 +5972,24 @@ html:has(.pharos-stage.is-mini) {
   scroll-padding-bottom: calc(var(--px-gutter, 1.5rem) + 4rem);
 }
 /* The A to Z rail centres in the space above the bar, and on a phone sits
-   on top of it, so no letter hides under it (B1346). */
+   on top of it, so no letter hides under it (B1346). The bar is 56px with a
+   song, 64px with a video's picture, and 76px while it counts down to the
+   next video (its Cancel button is a 44px touch target). */
+body:has(.pharos-stage.is-mini) {
+  --pharos-mini-h: 4rem;
+}
+body:has(.pharos-stage.is-mini .pharos-stage-next) {
+  --pharos-mini-h: 4.75rem;
+}
 body:has(.pharos-stage.is-mini) .pharos-letters {
-  top: calc((100% - 3.5rem) / 2);
-  height: min(calc(100vh - 9.5rem), 36rem);
+  top: calc((100% - var(--pharos-mini-h)) / 2);
+  height: min(calc(100vh - 6rem - var(--pharos-mini-h)), 36rem);
 }
 @media (max-width: 40rem) {
   body:has(.pharos-stage.is-mini) .pharos-letters {
     top: auto;
-    bottom: 4.25rem;
-    height: min(calc(100dvh - 18.5rem), 36rem);
+    bottom: calc(var(--pharos-mini-h) + 0.75rem);
+    height: min(calc(100dvh - 15rem - var(--pharos-mini-h)), 36rem);
   }
 }
 .pharos-stage.is-mini .pharos-watch {
