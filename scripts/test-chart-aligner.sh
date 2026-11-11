@@ -39,6 +39,10 @@ expect "idle unload sets its variable" present "PHAROS_ALIGNER_IDLE_UNLOAD_SECS"
   --set-string aligner.idleUnloadSecs=120
 expect "idle unload passes its value" present 'value: "120"' -- \
   --set-string aligner.idleUnloadSecs=120
+expect "numeric 0 idle unload sets its variable" present "PHAROS_ALIGNER_IDLE_UNLOAD_SECS" -- \
+  --set aligner.idleUnloadSecs=0
+expect "numeric 0 idle unload passes \"0\"" present 'value: "0"' -- \
+  --set aligner.idleUnloadSecs=0
 expect "no idle unload leaves the variable unset" absent "PHAROS_ALIGNER_IDLE_UNLOAD_SECS" --
 expect "cache off has no claim" absent "PersistentVolumeClaim" --
 expect "cache on mounts its claim" present "claimName: p-pharos-aligner-cache" -- \
