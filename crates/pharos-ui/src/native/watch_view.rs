@@ -1062,6 +1062,8 @@ pub fn WatchView(
                             class: "pharos-button pharos-button-quiet pharos-together-start",
                             r#type: "button",
                             title: "Start a group here so others can join",
+                            // Its label is hidden on a phone or touch screen.
+                            aria_label: "Watch together",
                             onclick: move |_| on_control.call(Control::StartTogether),
                             Icon { path: ICON_TOGETHER }
                             span { class: "pharos-control-label", "Watch together" }
@@ -1095,6 +1097,7 @@ pub fn WatchView(
                     if in_group && invite.is_some() {
                         button {
                             class: "pharos-button pharos-button-quiet pharos-invite-toggle",
+                            aria_label: "Invite",
                             r#type: "button",
                             aria_expanded: if invite_open { "true" } else { "false" },
                             onclick: move |_| on_control.call(Control::ShowInvite(!invite_open)),
@@ -3279,6 +3282,10 @@ mod tests {
             .and_then(|r| r.split('}').next())
             .unwrap_or_default();
         assert!(on_video.contains("color: inherit;"), "{on_video}");
+        assert!(
+            sheet.contains(".pharos-player .pharos-button.is-icon {\n  flex-shrink: 0;"),
+            "an icon button keeps its touch size on a narrow phone"
+        );
     }
 
     /// B838: on a phone the wrapped control row would sit under a button
@@ -3724,6 +3731,9 @@ mod tests {
         assert!(!grouped.contains("pharos-together-start"), "{grouped}");
         assert!(grouped.contains("pharos-invite-toggle"), "{grouped}");
         assert!(grouped.contains(r#"aria-expanded="false""#), "{grouped}");
+        // A touch screen hides both labels, so each keeps a name (B1359).
+        assert!(alone.contains(r#"aria-label="Watch together""#), "{alone}");
+        assert!(grouped.contains(r#"aria-label="Invite""#), "{grouped}");
         // The panel shows only when asked for, never on a join by itself.
         assert!(!grouped.contains("pharos-invite-link"), "{grouped}");
         let open = render_together_open();
