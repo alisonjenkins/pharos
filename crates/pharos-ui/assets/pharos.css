@@ -5375,13 +5375,14 @@ body::before {
   align-items: center;
   gap: 0.25rem;
 }
-.pharos-queue-button {
+/* A row's queue icons; on a page they are family buttons (B1344). */
+.pharos-queue-button:where(:not(.pharos-button)) {
   display: inline-flex;
   align-items: center;
   gap: 0.35rem;
   padding: 0.35rem;
   border: 1px solid transparent;
-  border-radius: 999px;
+  border-radius: calc(var(--px-radius) * 999);
   background: none;
   color: var(--px-color-fg);
   font: inherit;
@@ -5391,8 +5392,8 @@ body::before {
   width: 1.15rem;
   height: 1.15rem;
 }
-.pharos-queue-button:hover,
-.pharos-queue-button:focus-visible {
+.pharos-queue-button:where(:not(.pharos-button)):hover,
+.pharos-queue-button:where(:not(.pharos-button)):focus-visible {
   background: color-mix(in srgb, var(--px-color-fg) 12%, transparent);
 }
 .pharos-queue-button:focus-visible {
@@ -5418,18 +5419,6 @@ body::before {
 .pharos-watch .pharos-queue-total {
   color: var(--px-color-fg);
   opacity: 0.85;
-}
-.pharos-queue-buttons[data-target="album_page"] .pharos-queue-button,
-.pharos-queue-buttons[data-target="video_page"] .pharos-queue-button {
-  padding: 0.45rem 0.9rem;
-  border-color: var(--px-color-border);
-  background: var(--px-color-surface);
-}
-/* Shaped like the Play and Mark watched buttons beside them. */
-.pharos-actions .pharos-queue-buttons[data-target="video_page"] .pharos-queue-button {
-  padding: 0.6rem 1.25rem;
-  border-radius: 4px;
-  font-weight: 600;
 }
 .pharos-track-item {
   display: flex;
