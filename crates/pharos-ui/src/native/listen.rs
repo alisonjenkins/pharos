@@ -1801,5 +1801,13 @@ mod tests {
             .unwrap_or_default();
         assert!(panel.contains("right: 0;"), "{panel}");
         assert!(panel.contains("box-sizing: border-box;"), "{panel}");
+        // The open queue starts below the wrapped rows, so its toggle stays
+        // in reach to close it.
+        let queue = sheet
+            .split("@media (max-width: 40rem) {")
+            .find_map(|block| block.split("\n  .pharos-queue {").nth(1))
+            .and_then(|r| r.split('}').next())
+            .unwrap_or_default();
+        assert!(queue.contains("top: 9.5rem;"), "{queue}");
     }
 }

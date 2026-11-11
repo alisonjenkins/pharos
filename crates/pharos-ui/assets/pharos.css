@@ -5512,10 +5512,11 @@ body::before {
   outline-offset: -2px;
 }
 @media (max-width: 40rem) {
+  /* Below the top bar, whose toggles wrap to a second (or third) row. */
   .pharos-queue {
-    top: 6rem;
+    top: 9.5rem;
     right: 0.5rem;
-    max-height: calc(100% - 20rem);
+    max-height: calc(100% - 23.5rem);
     width: calc(100% - 1rem);
   }
 }
