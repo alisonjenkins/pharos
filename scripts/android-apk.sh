@@ -47,19 +47,36 @@ out=${PHAROS_ANDROID_APK_OUT:-$target_dir/pharos-tv-$profile.apk}
 echo "android-apk: building the page visualiser" >&2
 nix develop -c sh scripts/tv-visualiser.sh
 
-echo "android-apk: building ($profile)" >&2
-nix develop .#android -c dx build --platform android --package pharos-ui \
-  --bin pharos-tv --features mobile --target armv7-linux-androideabi \
-  "${dx_flags[@]}" || {
-  echo "android-apk: dx build failed (see its error above)" >&2
+gradle_root=$target_dir/dx/pharos-tv/$profile/android/app
+main_dir=$gradle_root/app/src/main
+dx_build() {
+  echo "android-apk: building $1 ($profile)" >&2
+  nix develop .#android -c dx build --platform android --package pharos-ui \
+    --bin pharos-tv --features mobile --target "$1" \
+    "${dx_flags[@]}" || {
+    echo "android-apk: dx build for $1 failed (see its error above)" >&2
+    exit 1
+  }
+}
+
+# One APK for every TV: 64-bit boxes (NVIDIA Shield) run arm64-v8a natively,
+# 32-bit-only ones (the TCL G08) take armeabi-v7a. dx builds one target per
+# run into the same gradle project, so build arm64 first, keep its library,
+# and put it back beside the armv7 one before gradle assembles below.
+arm64_lib=$target_dir/pharos-tv-$profile-arm64-v8a.so
+dx_build aarch64-linux-android
+cp "$main_dir/jniLibs/arm64-v8a/libmain.so" "$arm64_lib" || {
+  echo "android-apk: the arm64 build left no jniLibs/arm64-v8a/libmain.so" >&2
   exit 1
 }
+dx_build armv7-linux-androideabi
+mkdir -p "$main_dir/jniLibs/arm64-v8a"
+cp "$arm64_lib" "$main_dir/jniLibs/arm64-v8a/libmain.so"
+rm -f "$arm64_lib"
 
 # dx 0.7 has no setting for the launcher icon, TV banner or app_name: lay
 # crates/pharos-ui/android/res over the gradle project it generated, point
 # the banner at ours, and assemble again (crates/pharos-ui/android/res/README.md).
-gradle_root=$target_dir/dx/pharos-tv/$profile/android/app
-main_dir=$gradle_root/app/src/main
 cp -r crates/pharos-ui/android/res/. "$main_dir/res/"
 rm -f "$main_dir/res/README.md"
 sed -i 's|android:banner="@mipmap/ic_launcher"|android:banner="@drawable/pharos_banner"|' \
