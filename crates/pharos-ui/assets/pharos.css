@@ -3063,6 +3063,24 @@ body:has(.pharos-stage.is-full .pharos-stage-slot:not([inert]) .pharos-connectio
 .pharos-control:focus-visible {
   background: rgb(255 255 255 / 0.15); /* not themed: controls sit on the video, whose colours no theme sets */
 }
+/* B1359: the player's buttons are the family's quiet pills (ADR 0120),
+   round where they hold an icon. On the video they keep white glyphs at
+   the picture's size and a light wash, as no theme sets the video's
+   colours; a TV keeps its player buttons at the size it had. */
+.pharos-player .pharos-button-quiet {
+  color: inherit;
+}
+.pharos-player .pharos-button-quiet:hover,
+.pharos-player .pharos-button-quiet:focus-visible {
+  background: rgb(255 255 255 / 0.15); /* not themed: controls sit on the video, whose colours no theme sets */
+}
+.pharos-player :is(.pharos-watch-top, .pharos-controls) .pharos-button .pharos-icon {
+  width: 1.5rem;
+  height: 1.5rem;
+}
+:root[data-device="tv"] .pharos-player {
+  --pharos-button-h: 2.25rem;
+}
 .pharos-time {
   font-variant-numeric: tabular-nums;
   font-size: 0.9rem;
@@ -5102,9 +5120,10 @@ body::before {
   width: 100%;
   max-width: none;
 }
-:root[data-device="tv"] .pharos-control-menus.is-open > .pharos-control {
+:root[data-device="tv"] .pharos-control-menus.is-open > button {
   display: flex;
   align-items: center;
+  justify-content: flex-start;
   gap: 0.75rem;
   padding: 0 0.5rem;
   text-align: left;
