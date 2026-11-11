@@ -2216,7 +2216,9 @@ const media = (e) => {
     tick = true;
   }
   const q = v.getVideoPlaybackQuality ? v.getVideoPlaybackQuality() : null;
-  const d = window.__pharosJassub ? window.__pharosJassub.debug : null;
+  // Only the video JASSUB draws over carries its counters.
+  const j = window.__pharosJassub;
+  const d = j && j._video === v ? j.debug : null;
   send({
     t: "media", id: v.id, tick, pos: v.currentTime,
     dur: Number.isFinite(v.duration) ? v.duration : null,
