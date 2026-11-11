@@ -48,6 +48,10 @@ pub const VIDEO_ID: &str = "pharos-video";
 pub const OUTGOING_ID: &str = "pharos-video-out";
 /// The element that goes fullscreen: the video with its controls.
 pub const PLAYER_ID: &str = "pharos-player";
+/// The skip intro/credits button, and Up Next's Play now: on a TV each
+/// takes the remote's focus as it appears (B1342).
+const SKIP_ID: &str = "pharos-skip";
+const UP_NEXT_PLAY_ID: &str = "pharos-up-next-play";
 /// The seek bar, whose width turns a pointer offset into a position.
 pub const SEEK_ID: &str = "pharos-seek";
 
@@ -1327,11 +1331,30 @@ pub fn WatchView(
 /// span. It reads the position itself so a tick re-renders it alone.
 #[component]
 fn SkipButton(segments: Vec<Segment>, pos: Position, on_control: EventHandler<Control>) -> Element {
-    let Some(seg) = segment_at(&segments, pos.now()) else {
+    let seg = segment_at(&segments, pos.now());
+    // On a TV the button takes the remote's focus as it appears, and gives
+    // it back to the picture as it goes (B1342).
+    let span = seg.as_ref().map(|s| (s.start_ms, s.end_ms));
+    use_effect(use_reactive!(|span| {
+        if REMOTE_FOCUS {
+            if span.is_some() {
+                platform::focus_card(PLAYER_ID, SKIP_ID);
+            } else {
+                platform::refocus_if_lost(PLAYER_ID);
+            }
+        }
+    }));
+    use_drop(|| {
+        if REMOTE_FOCUS {
+            platform::refocus_if_lost(PLAYER_ID);
+        }
+    });
+    let Some(seg) = seg else {
         return rsx! {};
     };
     rsx! {
         button {
+            id: SKIP_ID,
             class: "pharos-skip",
             r#type: "button",
             onclick: move |_| on_control.call(Control::Seek(seg.end_ms)),
@@ -1371,10 +1394,12 @@ pub fn text_track_id(index: u32) -> String {
 /// that leaves the last scene in view (038 FR-405, V1221).
 #[component]
 fn UpNextPill(card: UpNextCard, on_control: EventHandler<Control>) -> Element {
+    use_card_focus();
     rsx! {
         aside { class: "pharos-up-next-pill", aria_label: "Up next",
             span { class: "pharos-up-next-pill-name", "Up next: {card.name}" }
             button {
+                id: UP_NEXT_PLAY_ID,
                 class: "pharos-up-next-pill-play",
                 r#type: "button",
                 onclick: move |_| on_control.call(Control::PlayNext),
@@ -1391,9 +1416,25 @@ fn UpNextPill(card: UpNextCard, on_control: EventHandler<Control>) -> Element {
     }
 }
 
+/// On a TV, Up Next's Play now takes the remote's focus as the card
+/// appears, and the picture takes it back when the card goes (B1342).
+fn use_card_focus() {
+    use_effect(|| {
+        if REMOTE_FOCUS {
+            platform::focus_card(PLAYER_ID, UP_NEXT_PLAY_ID);
+        }
+    });
+    use_drop(|| {
+        if REMOTE_FOCUS {
+            platform::refocus_if_lost(PLAYER_ID);
+        }
+    });
+}
+
 /// The next episode and a countdown to it, over the end of this one.
 #[component]
 fn UpNext(card: UpNextCard, on_control: EventHandler<Control>) -> Element {
+    use_card_focus();
     let s = card.seconds;
     rsx! {
         aside { class: "pharos-up-next", aria_label: "Up next",
@@ -1415,6 +1456,7 @@ fn UpNext(card: UpNextCard, on_control: EventHandler<Control>) -> Element {
                 }
                 div { class: "pharos-up-next-actions",
                     button {
+                        id: UP_NEXT_PLAY_ID,
                         class: "pharos-up-next-play",
                         r#type: "button",
                         onclick: move |_| on_control.call(Control::PlayNext),
@@ -3103,6 +3145,23 @@ mod tests {
         assert!(sheet.contains(".pharos-player.is-idle .pharos-controls {"));
     }
 
+    /// B1342 / V1313: the skip button carries the id a TV hands the
+    /// remote's focus to as it appears; it is one of OK's presses too.
+    #[test]
+    fn the_skip_button_is_a_focus_target_for_the_remote() {
+        let html = render(controls());
+        assert!(
+            html.contains(r#"<button class="pharos-skip" type="button" id="pharos-skip">"#),
+            "{html}"
+        );
+        for id in [SKIP_ID, UP_NEXT_PLAY_ID] {
+            assert!(
+                super::super::tv_page::OK_PRESSES.contains(&format!(".{id}")),
+                "{id}"
+            );
+        }
+    }
+
     #[test]
     fn s_skips_only_the_segment_whose_button_shows() {
         let seg = Segment {
@@ -3845,6 +3904,8 @@ mod tests {
         );
         assert!(html.contains("--pharos-fill: 52.0%"), "{html}");
         assert!(!html.contains("Skip intro"), "{html}");
+        // B1342: Play now carries the id a TV hands the remote's focus to.
+        assert!(html.contains(r#"id="pharos-up-next-play""#), "{html}");
 
         // 038 FR-405, V1221: over a guessed ending the pill shows instead,
         // and the compact player leaves it to its stage bar (FR-406).
@@ -3861,6 +3922,7 @@ mod tests {
             !html.contains("pharos-up-next-art") && !html.contains("Playing in"),
             "{html}"
         );
+        assert!(html.contains(r#"id="pharos-up-next-play""#), "{html}");
 
         let mut compact = controls();
         compact.up_next = Some(card);
