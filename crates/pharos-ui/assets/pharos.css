@@ -3076,6 +3076,20 @@ body:has(.pharos-stage.is-full .pharos-stage-slot:not([inert]) .pharos-connectio
   white-space: nowrap;
   text-overflow: ellipsis;
 }
+/* An upright phone moves mute from the bar into the settings sheet, so
+   with the episode buttons the time still has room; elsewhere the sheet
+   has no mute of its own. */
+.pharos-sheet-mute {
+  display: none;
+}
+@media (max-width: 40rem) and (pointer: coarse) {
+  .pharos-control-row .pharos-mute {
+    display: none;
+  }
+  :root:not([data-device="tv"]) .pharos-control-menus.is-open > .pharos-sheet-mute {
+    display: flex;
+  }
+}
 .pharos-player :is(.pharos-watch-top, .pharos-controls) .pharos-button .pharos-icon {
   width: 1.5rem;
   height: 1.5rem;
