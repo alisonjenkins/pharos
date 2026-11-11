@@ -936,7 +936,7 @@ fn meta_line(
     (!parts.is_empty()).then(|| parts.join(" · "))
 }
 
-const ICON_PLAY: &str =
+pub(super) const ICON_PLAY: &str =
     "M8 5.5v13a1 1 0 0 0 1.5.86l10.5-6.5a1 1 0 0 0 0-1.72L9.5 4.64A1 1 0 0 0 8 5.5Z";
 const ICON_PAUSE: &str = "M7 5h3.5v14H7zM13.5 5H17v14h-3.5z";
 const ICON_BACK: &str = "M11 7V4L5 9l6 5v-3a5 5 0 1 1-5 5H4a7 7 0 1 0 7-7Z";
@@ -952,7 +952,7 @@ pub(super) const ICON_VOLUME: &str = "M4 9v6h4l5 4V5L8 9H4Zm12.5 3a4.5 4.5 0 0 0
 pub const ICON_QUEUE_NEXT: &str = "M19 9H2v2h17V9Zm0-4H2v2h17V5ZM2 15h13v-2H2v2Zm15-2v6l5-3-5-3Z";
 pub const ICON_QUEUE_ADD: &str =
     "M14 10H3v2h11v-2Zm0-4H3v2h11V6Zm4 8v-4h-2v4h-4v2h4v4h2v-4h4v-2h-4ZM3 16h7v-2H3v2Z";
-const ICON_SHUFFLE: &str = "M10.6 9.2 5.4 4 4 5.4l5.2 5.2 1.4-1.4ZM14.5 4l2 2L4 18.6 5.4 20 18 7.5l2 2V4h-5.5Zm.3 9.4-1.4 1.4 3.1 3.1-2 2.1H20v-5.5l-2 2-3.2-3.1Z";
+pub(super) const ICON_SHUFFLE: &str = "M10.6 9.2 5.4 4 4 5.4l5.2 5.2 1.4-1.4ZM14.5 4l2 2L4 18.6 5.4 20 18 7.5l2 2V4h-5.5Zm.3 9.4-1.4 1.4 3.1 3.1-2 2.1H20v-5.5l-2 2-3.2-3.1Z";
 const ICON_REMOVE: &str = "M19 6.4 17.6 5 12 10.6 6.4 5 5 6.4 10.6 12 5 17.6 6.4 19 12 13.4 17.6 19 19 17.6 13.4 12 19 6.4Z";
 const ICON_UP: &str = "m12 8-6 6 1.4 1.4 4.6-4.6 4.6 4.6L18 14l-6-6Z";
 const ICON_DOWN: &str = "M16.6 8.6 12 13.2 7.4 8.6 6 10l6 6 6-6-1.4-1.4Z";
