@@ -300,26 +300,32 @@ const blob = async (path, type) => {{
   return URL.createObjectURL(new Blob([await r.arrayBuffer()], {{ type }}));
 }};
 const assets = window.__pharosJassubAssets = window.__pharosJassubAssets || {{}};
+// The deadline covers the asset fetches too, so a slow proxy cannot keep
+// plain cues up past it.
+const deadline = new Promise((_, no) => setTimeout(() => no(new Error("not ready after {ready_ms} ms")), {ready_ms}));
+deadline.catch(() => {{}});
+const within = (p) => Promise.race([p, deadline]);
 try {{
   if (!window.JASSUB) {{
-    await new Promise((ok, no) => {{
+    await within(new Promise((ok, no) => {{
       const s = document.createElement("script");
       s.src = dir + "/jassub.js";
       s.onload = ok;
       s.onerror = () => no(new Error("jassub.js did not load"));
       document.head.append(s);
-    }});
+    }}));
   }}
   const at = (file) => new URL(dir + "/" + file, location.href).href;
-  if (!assets.font) assets.font = await blob(dir + "/default.woff2", "font/woff2");
   assets.pack = assets.pack || {{}};
-  for (const [family, file] of pack) {{
-    if (!assets.pack[family]) assets.pack[family] = await blob("/ui/assets/fonts/" + file, "font/ttf").catch(() => null);
-  }}
-  const r = await fetch(sub);
-  if (!r.ok) throw new Error("the styled script answered " + r.status);
-  const subContent = await r.text();
-  const own = (await Promise.all(fonts.map((f) => blob(f, "font/ttf").catch(() => null)))).filter(Boolean);
+  const [subContent, own] = await within(Promise.all([
+    (async () => {{ if (!assets.font) assets.font = await blob(dir + "/default.woff2", "font/woff2"); }})(),
+    ...pack.filter(([family]) => !assets.pack[family]).map(async ([family, file]) => {{
+      assets.pack[family] = await blob("/ui/assets/fonts/" + file, "font/ttf").catch(() => null);
+    }}),
+  ]).then(() => Promise.all([
+    fetch(sub).then((r) => {{ if (!r.ok) throw new Error("the styled script answered " + r.status); return r.text(); }}),
+    Promise.all(fonts.map((f) => blob(f, "font/ttf").catch(() => null))).then((l) => l.filter(Boolean)),
+  ])));
   const runs = window.__pharosStyledRuns = window.__pharosStyledRuns || {{}};
   if (runs[run] === "gone") {{ delete runs[run]; own.forEach((u) => URL.revokeObjectURL(u)); return "failed: stopped before it started"; }}
   const v = document.getElementById(vid);
@@ -333,7 +339,7 @@ try {{
   }});
   runs[run] = {{ j, own }};
   window.__pharosJassub = j;
-  await Promise.race([j.ready, new Promise((_, no) => setTimeout(() => no(new Error("not ready after {ready_ms} ms")), {ready_ms}))]);
+  await within(j.ready);
   return runs[run] ? "ready" : "failed: stopped while starting";
 }} catch (e) {{
   return "failed: " + ((e && e.message) || e);
@@ -1077,6 +1083,19 @@ mod tests {
         assert!(!js.contains("subUrl"), "{js}");
         assert!(js.contains("debug: true"));
         assert!(js.contains(&format!("not ready after {STYLED_READY_MS} ms")));
+    }
+
+    #[test]
+    fn the_styled_start_bounds_its_fetches_quiets_its_log_and_redraws_when_paused() {
+        let js = styled_start_js("v", "/s.ass", &[], &[("bangers", "B.ttf")], 3);
+        let at = |needle: &str| {
+            js.find(needle)
+                .unwrap_or_else(|| panic!("{needle} in {js}"))
+        };
+        // The deadline starts before the first fetch and covers each of them.
+        assert!(at("const deadline") < at("blob(dir"), "{js}");
+        assert!(js.contains("await within(j.ready)"), "{js}");
+        assert!(js.contains(".filter(([family]) => !assets.pack[family]).map(async"));
     }
 
     #[test]
