@@ -54,18 +54,33 @@ pub struct MarkFavorite(pub EventHandler<(ItemRef, bool, String)>);
 /// `favorite`. `aria-pressed` carries the state, so the label stays put and
 /// nothing names the opposite action.
 #[component]
-pub fn FavoriteToggle(id: ItemRef, favorite: bool, #[props(default)] name: String) -> Element {
+pub fn FavoriteToggle(
+    id: ItemRef,
+    favorite: bool,
+    #[props(default)] name: String,
+    /// The star alone, its word kept for screen readers: a round icon pill
+    /// in an album page's row of pills (B1347/V1318).
+    #[props(default)]
+    icon: bool,
+) -> Element {
     let mark = use_context::<MarkFavorite>();
     let star = if favorite { "\u{2605}" } else { "\u{2606}" };
+    let class = match (favorite, icon) {
+        (true, false) => "pharos-button pharos-button-secondary pharos-favorite on",
+        (false, false) => "pharos-button pharos-button-secondary pharos-favorite",
+        (true, true) => "pharos-button pharos-button-secondary pharos-favorite on is-icon",
+        (false, true) => "pharos-button pharos-button-secondary pharos-favorite is-icon",
+    };
     rsx! {
         button {
             r#type: "button",
-            class: if favorite { "pharos-button pharos-button-secondary pharos-favorite on" } else { "pharos-button pharos-button-secondary pharos-favorite" },
+            class,
             "data-key-action": "favorite",
             aria_pressed: if favorite { "true" } else { "false" },
+            title: icon.then_some("Favourite"),
             onclick: move |_| mark.0.call((id, !favorite, name.clone())),
             span { aria_hidden: "true", "{star} " }
-            "Favourite"
+            span { class: "pharos-button-label", "Favourite" }
         }
     }
 }
