@@ -2245,6 +2245,30 @@ mod tests {
         std::env::remove_var("PHAROS_TVDB_API_KEY");
     }
 
+    /// Sets an environment variable for the rest of a test and puts back
+    /// whatever was there when dropped, a panic included.
+    struct EnvVar {
+        key: &'static str,
+        prior: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVar {
+        fn set(key: &'static str, value: &str) -> Self {
+            let prior = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, prior }
+        }
+    }
+
+    impl Drop for EnvVar {
+        fn drop(&mut self) {
+            match self.prior.take() {
+                Some(v) => std::env::set_var(self.key, v),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
     #[test]
     fn lyrics_defaults_and_env_overrides() {
         let s = r#"
@@ -2259,13 +2283,15 @@ mod tests {
         assert_eq!(cfg.lyrics.aligner_shadow_url, None, "no shadow by default");
         assert_eq!(cfg.lyrics.aligner_media_root, None);
 
-        std::env::set_var("PHAROS_LYRICS_ONLINE", "true");
-        std::env::set_var("PHAROS_LYRICS_ALIGNER_URL", "  http://aligner.lan:8790  ");
-        std::env::set_var(
-            "PHAROS_LYRICS_ALIGNER_SHADOW_URL",
-            " http://shadow.lan:8790 ",
-        );
-        std::env::set_var("PHAROS_LYRICS_ALIGNER_MEDIA_ROOT", "  /srv/media  ");
+        let _env = [
+            EnvVar::set("PHAROS_LYRICS_ONLINE", "true"),
+            EnvVar::set("PHAROS_LYRICS_ALIGNER_URL", "  http://aligner.lan:8790  "),
+            EnvVar::set(
+                "PHAROS_LYRICS_ALIGNER_SHADOW_URL",
+                " http://shadow.lan:8790 ",
+            ),
+            EnvVar::set("PHAROS_LYRICS_ALIGNER_MEDIA_ROOT", "  /srv/media  "),
+        ];
 
         let cfg = cfg.apply_env();
         assert!(cfg.lyrics.online);
@@ -2281,11 +2307,6 @@ mod tests {
             cfg.lyrics.aligner_media_root.as_deref(),
             Some(Path::new("/srv/media"))
         );
-
-        std::env::remove_var("PHAROS_LYRICS_ONLINE");
-        std::env::remove_var("PHAROS_LYRICS_ALIGNER_URL");
-        std::env::remove_var("PHAROS_LYRICS_ALIGNER_SHADOW_URL");
-        std::env::remove_var("PHAROS_LYRICS_ALIGNER_MEDIA_ROOT");
     }
 
     #[test]
