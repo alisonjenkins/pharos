@@ -5091,7 +5091,16 @@ label.pharos-setting {
   width: 0.85rem;
   height: 0.85rem;
 }
-@media (hover: hover) {
+/* A touch screen keeps the 44px target (WCAG 2.5.5); the tick stays small. */
+@media (pointer: coarse) {
+  .pharos-show-main .pharos-episode-mark {
+    width: 2.75rem;
+    height: 2.75rem;
+  }
+}
+/* A laptop with a touch screen as well keeps them shown: a finger cannot
+   hover to find them. */
+@media (hover: hover) and (not (any-pointer: coarse)) {
   .pharos-show-main .pharos-episode .pharos-episode-play,
   .pharos-show-main .pharos-episode .pharos-queue-buttons[data-target="episode_row"] {
     opacity: 0;
