@@ -5107,6 +5107,53 @@ mod tests {
         assert!(!grid.contains("Play Band next"), "{grid}");
     }
 
+    /// B1343/V1314 (ADR 0120): every button in the family is the one pill
+    /// shape, and no rule bends a family button or any other button back to
+    /// a 4px block. Disarm check: give `.pharos-leave-undo .pharos-button` a
+    /// `border-radius: 4px` and this fails.
+    #[test]
+    fn every_family_button_is_the_one_pill() {
+        let mut sheet = include_str!("../../assets/pharos.css").to_owned();
+        while let Some(open) = sheet.find("/*") {
+            let close = sheet[open..]
+                .find("*/")
+                .map_or(sheet.len(), |c| open + c + 2);
+            sheet.replace_range(open..close, "");
+        }
+        let pill = "border-radius: calc(var(--px-radius) * 999);";
+        let mut family = 0;
+        for chunk in sheet.split('}') {
+            let Some((head, body)) = chunk.rsplit_once('{') else {
+                continue;
+            };
+            let selector = head.rsplit_once('{').map_or(head, |(_, s)| s).trim();
+            let Some(radius) = body
+                .lines()
+                .map(str::trim)
+                .find(|l| l.starts_with("border-radius:"))
+            else {
+                continue;
+            };
+            if selector == ".pharos-button,\n.pharos-chip" {
+                assert_eq!(radius, pill, "{selector}");
+                family += 1;
+            } else {
+                // A rule kept off family buttons by `:not` is not about them.
+                let about = selector.replace(":where(:not(.pharos-button))", "");
+                for name in ["pharos-button", "pharos-chip"] {
+                    let hit = about
+                        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '-'))
+                        .any(|w| w == name);
+                    assert!(!hit, "{selector} sets its own corner: {radius}");
+                }
+            }
+            if selector.contains("button") {
+                assert_ne!(radius, "border-radius: 4px;", "{selector}");
+            }
+        }
+        assert_eq!(family, 1, "the family rule");
+    }
+
     /// B1344/V1315: the page's queue buttons are secondary family buttons,
     /// the same shape on an album and a film; a row's stay bare icons.
     /// Disarm check: return "pharos-queue-button" for every target.
