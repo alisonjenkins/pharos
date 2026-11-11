@@ -20,8 +20,14 @@ struct Case {
     frames: usize,
     grid: Vec<i32>,
     ms: Option<Vec<(u64, u64)>>,
+    /// model.py's `mean_score`; absent with `error`, `null` when nothing aligned.
+    #[serde(default)]
+    score: Option<f64>,
     error: Option<String>,
 }
+
+/// The shadow's tolerance on a line score (spec 039, R21).
+const SCORE_TOLERANCE: f64 = 0.001;
 
 fn fixture() -> Fixture {
     serde_json::from_str(include_str!("../fixtures/line.json")).unwrap()
@@ -45,18 +51,37 @@ fn lines_match_model_py_end_to_end() {
         f.cases.iter().any(|c| c.error.is_some()),
         "fixture lost its repeat-bound case"
     );
+    for lead_star in [false, true] {
+        assert!(
+            f.cases
+                .iter()
+                .any(|c| c.lead_star == lead_star && c.score.is_some()),
+            "fixture lost its scored lead_star={lead_star} case"
+        );
+        assert!(
+            f.cases
+                .iter()
+                .any(|c| c.lead_star == lead_star && c.ms.as_ref().is_some_and(Vec::is_empty)),
+            "fixture lost its empty lead_star={lead_star} case"
+        );
+    }
     for case in &f.cases {
         let data: Vec<f32> = case.grid.iter().map(|&k| (-k) as f32 / f.grid).collect();
         let em = Emission::new(&data, case.frames, CLASSES).unwrap();
         let got = align_line(&em, case.n_samples, &case.tokens, case.lead_star);
         match (&case.ms, &case.error) {
-            (Some(want), _) => assert_eq!(
-                &got.unwrap().times,
-                want,
-                "{:?} lead_star={}",
-                case.tokens,
-                case.lead_star
-            ),
+            (Some(want), _) => {
+                let got = got.unwrap();
+                let at = format!("{:?} lead_star={}", case.tokens, case.lead_star);
+                assert_eq!(&got.times, want, "{at}");
+                match (got.score, case.score) {
+                    (Some(g), Some(w)) => assert!(
+                        (g - w).abs() <= SCORE_TOLERANCE,
+                        "{at}: score {g} vs python {w}"
+                    ),
+                    (g, w) => assert_eq!(g, w, "{at}: score"),
+                }
+            }
             (None, Some(msg)) => {
                 let err = got.unwrap_err();
                 assert!(
