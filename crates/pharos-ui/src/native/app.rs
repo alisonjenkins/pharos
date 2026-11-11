@@ -982,6 +982,16 @@ fn store_tier_drop(tier: Tier) -> Result<(), String> {
     })
 }
 
+/// Forget this device's tier cap, so the next styled track starts at its own
+/// tier again; the frame-drop watch sets a new cap if it still cannot keep
+/// up (B1214).
+fn clear_tier_drop() -> Result<(), String> {
+    SESSION_TIER_DROP.with(|s| s.set(None));
+    platform::store_theme(TIER_DROP_KEY, "").inspect_err(|e| {
+        platform::warn(&format!("pharos: tier_drop storage clear failed error={e}"));
+    })
+}
+
 /// The media query for a viewer who asked for less motion.
 const REDUCED_MOTION: &str = "(prefers-reduced-motion: reduce)";
 
@@ -3715,8 +3725,16 @@ fn AppearanceScreen() -> Element {
                 if let Err(e) = store_effects_detail(detail) {
                     show(notice, not_saved("the effects detail", &e, Lasts::UntilReload));
                 }
+                // Asking for more is a fresh try: an old drop's cap would
+                // hold Rich at the tier that dropped.
+                let cleared = detail == EffectsDetail::Rich
+                    && stored_tier_drop().is_some()
+                    && clear_tier_drop().is_ok();
                 effects_detail.set(detail);
-                platform::info(&format!("pharos: effects_detail set={}", detail.as_str()));
+                platform::info(&format!(
+                    "pharos: effects_detail set={} tier_cap_cleared={cleared}",
+                    detail.as_str()
+                ));
             },
             on_pick: move |name: String| {
                 editing.set(None);
@@ -8238,6 +8256,14 @@ mod tests {
     #[cfg(not(target_os = "android"))]
     fn the_host_starts_on_the_desktop_tier() {
         assert_eq!(current_starting_tier(), Tier::Desktop);
+    }
+
+    #[test]
+    fn a_cleared_tier_cap_lets_the_device_start_at_its_own_tier_again() {
+        store_tier_drop(Tier::Low).unwrap();
+        assert_eq!(stored_tier_drop(), Some(Tier::Low));
+        clear_tier_drop().unwrap();
+        assert_eq!(stored_tier_drop(), None);
     }
 
     #[test]
