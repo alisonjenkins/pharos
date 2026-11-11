@@ -126,6 +126,17 @@ else
   fail "no android:configChanges on the activity"
 fi
 
+# Native code for both TV ABIs: a 64-bit box (NVIDIA Shield) runs a
+# 32-bit-only APK in compat mode, and a 32-bit-only TV (TCL G08) cannot run
+# an arm64-only one.
+native=$(printf '%s\n' "$badging" | sed -n "s/^native-code: //p" | head -n 1)
+for abi in arm64-v8a armeabi-v7a; do
+  case "$native" in
+    *"'$abi'"*) pass "native code for $abi" ;;
+    *) fail "no native code for $abi (native-code: ${native:-none})" ;;
+  esac
+done
+
 if [ "$failures" -eq 0 ]; then
   echo "android-apk-check: $apk is good"
 else
