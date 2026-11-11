@@ -10,7 +10,7 @@ use actix_web::http::StatusCode;
 use actix_web::{web, HttpRequest, HttpResponse};
 use serde::Serialize;
 
-use crate::obs::{set_remote_parent, Metrics, SONGS_TOTAL, SONG_SECONDS};
+use crate::obs::{set_remote_parent, Metrics, GPU_POOL_BYTES, SONGS_TOTAL, SONG_SECONDS};
 use crate::plan::{parse_request, resolve, Line};
 use crate::service::{Aligned, Engine, SongError};
 
@@ -111,6 +111,8 @@ async fn align(
         aligner.device = tracing::field::Empty,
         aligner.device_reason = tracing::field::Empty,
         aligner.rss_mib = tracing::field::Empty,
+        aligner.gpu_peak_mib = tracing::field::Empty,
+        aligner.gpu_kept_mib = tracing::field::Empty,
     );
     set_remote_parent(&span, req.headers());
     let fail = |status: StatusCode, message: String| {
@@ -162,7 +164,7 @@ fn run_song(
 ) -> Result<Aligned, SongError> {
     let started = Instant::now();
     let n_lines = lines.len();
-    let (result, used, _gpu) = engine.align_song_on(rel_path, full_path, lines);
+    let (result, used, gpu) = engine.align_song_on(rel_path, full_path, lines);
     let (device, device_reason) = used.map_or(("none", String::new()), |u| (u.device, u.reason));
     let elapsed = started.elapsed();
     let duration_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
@@ -171,6 +173,7 @@ fn run_song(
     let rss_mib = crate::obs::rss_mib().unwrap_or(0);
     let span = tracing::Span::current();
     span.record("aligner.rss_mib", rss_mib);
+    let (gpu_peak_mib, gpu_kept_mib) = record_gpu(&span, gpu);
     let outcome = match &result {
         Ok(a) => {
             span.record("aligner.offset_ms", a.answer.offset_ms);
@@ -190,6 +193,8 @@ fn run_song(
                 device = %device,
                 device_reason = %device_reason,
                 rss_mib,
+                gpu_peak_mib,
+                gpu_kept_mib,
                 "song aligned"
             );
             "ok"
@@ -210,6 +215,8 @@ fn run_song(
                 device = %device,
                 device_reason = %device_reason,
                 rss_mib,
+                gpu_peak_mib,
+                gpu_kept_mib,
                 error = %e,
                 "song failed"
             );
@@ -218,6 +225,26 @@ fn run_song(
     };
     metrics::counter!(SONGS_TOTAL, "outcome" => outcome).increment(1);
     result
+}
+
+/// The GPU pool's peak and kept MiB onto the song's span and gauges; `None`
+/// for a song that did not run on a GPU, so its log line has no GPU fields.
+fn record_gpu(
+    span: &tracing::Span,
+    gpu: Option<crate::service::GpuMemory>,
+) -> (Option<u64>, Option<u64>) {
+    let Some(g) = gpu else {
+        return (None, None);
+    };
+    #[allow(clippy::cast_precision_loss)]
+    {
+        metrics::gauge!(GPU_POOL_BYTES, "state" => "peak").set(g.peak.reserved as f64);
+        metrics::gauge!(GPU_POOL_BYTES, "state" => "kept").set(g.after.reserved as f64);
+    }
+    let (peak, kept) = (g.peak.reserved >> 20, g.after.reserved >> 20);
+    span.record("aligner.gpu_peak_mib", peak);
+    span.record("aligner.gpu_kept_mib", kept);
+    (Some(peak), Some(kept))
 }
 
 /// Registers the routes; `state` must be built once, outside the
@@ -241,5 +268,67 @@ pub fn configure(state: web::Data<AppState>) -> impl FnOnce(&mut web::ServiceCon
                     .default_service(web::to(not_found)),
             )
             .default_service(web::to(not_found));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+    use super::record_gpu;
+    use crate::obs::GPU_POOL_BYTES;
+    use crate::service::{GpuMemory, GpuPool};
+
+    fn gauges(recorder: &DebuggingRecorder) -> Vec<(String, f64)> {
+        let mut out: Vec<(String, f64)> = recorder
+            .snapshotter()
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(k, ..)| k.key().name() == GPU_POOL_BYTES)
+            .map(|(k, _, _, v)| {
+                let state = k.key().labels().find(|l| l.key() == "state").unwrap();
+                let DebugValue::Gauge(g) = v else {
+                    panic!("{v:?}")
+                };
+                (state.value().to_owned(), g.into_inner())
+            })
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    #[test]
+    fn a_gpu_song_sets_its_pool_gauges() {
+        let recorder = DebuggingRecorder::new();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let gpu = GpuMemory {
+            peak: GpuPool {
+                in_use: 1,
+                reserved: 3 << 30,
+            },
+            after: GpuPool {
+                in_use: 0,
+                reserved: 1 << 30,
+            },
+        };
+        let mibs = record_gpu(&tracing::Span::none(), Some(gpu));
+        assert_eq!(mibs, (Some(3072), Some(1024)));
+        assert_eq!(
+            gauges(&recorder),
+            vec![
+                ("kept".into(), f64::from(1u32 << 30)),
+                ("peak".into(), 3.0 * f64::from(1u32 << 30))
+            ]
+        );
+    }
+
+    #[test]
+    fn a_song_off_the_gpu_sets_no_pool_gauge() {
+        let recorder = DebuggingRecorder::new();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        assert_eq!(record_gpu(&tracing::Span::none(), None), (None, None));
+        assert!(gauges(&recorder).is_empty());
     }
 }
