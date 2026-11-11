@@ -216,6 +216,33 @@ fn word_progress(line: &LyricLine, end: u64, position_ms: u64) -> f64 {
     (pos / chars * 100.0).clamp(0.0, 100.0)
 }
 
+/// How often the banner's countdown is redrawn.
+const ETA_TICK_MS: u32 = 1_000;
+
+/// The moment, in [`platform::now_ms`] terms, the server expects the word
+/// times by, from the milliseconds it said were left when it answered.
+/// Computed on receipt so the countdown does not depend on the two clocks
+/// agreeing.
+pub fn eta_deadline(eta_ms: Option<u32>, now_ms: f64) -> Option<f64> {
+    eta_ms.map(|ms| now_ms + f64::from(ms))
+}
+
+/// The banner shown while the words are being timed: how long is left when
+/// the server gave a guess, never a negative count once it has passed.
+fn timing_text(deadline_ms: Option<f64>, now_ms: f64) -> String {
+    let Some(deadline) = deadline_ms else {
+        return "Timing the words… the fill is a guess until then".to_owned();
+    };
+    let left = deadline - now_ms;
+    if left <= 0.0 {
+        return "Timing the words… almost done".to_owned();
+    }
+    // Rounded up, so it reads 1 s until it is over; a song's wait fits a u32.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let secs = (left / 1000.0).ceil() as u32;
+    format!("Timing the words… about {secs} s")
+}
+
 #[component]
 pub fn LyricsPanel(
     lyrics: Lyrics,
@@ -224,6 +251,10 @@ pub fn LyricsPanel(
     /// Draw the sung line large and fill it in as it is sung.
     #[props(default)]
     karaoke: bool,
+    /// When the word times are expected, from [`eta_deadline`]; `None` when
+    /// the server could not say.
+    #[props(default)]
+    words_eta_at: Option<f64>,
 ) -> Element {
     let current = current_line(&lyrics, position_ms);
     let karaoke = karaoke && lyrics.synced;
@@ -254,12 +285,33 @@ pub fn LyricsPanel(
     // Outside the panel: its children are the lines, counted by index when
     // the sung line is centred.
     let timing = karaoke && lyrics.words_pending;
+    // Redrawn once a second while the banner shows. A newer run of the effect
+    // ends the loop of the one before it.
+    let mut now = use_signal(platform::now_ms);
+    let mut run = use_signal(|| 0_u32);
+    use_effect(use_reactive!(|timing| {
+        let mine = run.peek().wrapping_add(1);
+        run.set(mine);
+        if !timing {
+            return;
+        }
+        now.set(platform::now_ms());
+        spawn(async move {
+            loop {
+                platform::sleep_ms(ETA_TICK_MS).await;
+                if *run.peek() != mine {
+                    return;
+                }
+                now.set(platform::now_ms());
+            }
+        });
+    }));
     rsx! {
         if timing {
             p {
                 class: "pharos-lyrics-timing",
                 role: "status",
-                "Timing the words… the fill is a guess until then"
+                "{timing_text(words_eta_at, now())}"
             }
         }
         div {
@@ -669,6 +721,56 @@ mod tests {
         l.words_pending = false;
         let timed = render_as(l, 1_500, true);
         assert!(!timed.contains("pharos-lyrics-timing"), "{timed}");
+    }
+
+    #[test]
+    fn the_banner_counts_down_to_the_deadline_and_never_below_zero() {
+        let at = eta_deadline(Some(12_000), 1_000.0);
+        assert_eq!(at, Some(13_000.0));
+        assert_eq!(timing_text(at, 1_000.0), "Timing the words… about 12 s");
+        // Rounded up: 0.1 s left still reads 1 s.
+        assert_eq!(timing_text(at, 12_900.0), "Timing the words… about 1 s");
+        assert_eq!(timing_text(at, 13_000.0), "Timing the words… almost done");
+        assert_eq!(timing_text(at, 90_000.0), "Timing the words… almost done");
+        assert_eq!(
+            timing_text(eta_deadline(Some(0), 5.0), 5.0),
+            "Timing the words… almost done"
+        );
+    }
+
+    #[test]
+    fn with_no_estimate_the_banner_keeps_its_old_words() {
+        assert_eq!(eta_deadline(None, 1_000.0), None);
+        assert_eq!(
+            timing_text(None, 1_000.0),
+            "Timing the words… the fill is a guess until then"
+        );
+        let mut l = synced(&[1_000, 3_000]);
+        l.words_pending = true;
+        let html = render_as(l, 1_500, true);
+        assert!(
+            html.contains("Timing the words… the fill is a guess until then"),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn an_estimate_shows_in_the_banner() {
+        let mut l = synced(&[1_000, 3_000]);
+        l.words_pending = true;
+        let mut dom = VirtualDom::new_with_props(
+            move |()| {
+                let at = Some(platform::now_ms() + 30_000.0);
+                rsx! {
+                    LyricsPanel { lyrics: l.clone(), position_ms: 1_500, on_seek: |_| {}, karaoke: true, words_eta_at: at }
+                }
+            },
+            (),
+        );
+        dom.rebuild_in_place();
+        let html = dioxus_ssr::render(&dom);
+        assert!(html.contains("about "), "{html}");
+        assert!(!html.contains("the fill is a guess"), "{html}");
     }
 
     #[test]

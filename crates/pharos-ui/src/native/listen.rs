@@ -191,6 +191,9 @@ pub fn ListenView(
     /// The lyrics lookup failed, so whether there are any is not known.
     #[props(default)]
     lyrics_failed: bool,
+    /// When the lyrics' word times are expected ([`super::lyrics::eta_deadline`]).
+    #[props(default)]
+    words_eta_at: Option<f64>,
     /// What plays after this song (B435/V375).
     #[props(default)]
     queue: Vec<Entry>,
@@ -422,6 +425,7 @@ pub fn ListenView(
                     position_ms: media.position_ms,
                     on_seek: move |ms| on_control.call(Control::Seek(ms)),
                     karaoke: karaoke(),
+                    words_eta_at,
                 }
             }
             // Not while the screen is out of sight: the compact player docks
