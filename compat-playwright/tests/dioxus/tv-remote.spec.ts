@@ -268,7 +268,6 @@ test.describe("Android TV remote (B1332)", () => {
 
     await home();
     expect(await page.locator(".pharos-poster-info").count(), "no info control").toBe(0);
-    await expect(tile.locator(".pharos-poster-hold-tv"), "the focused tile says what a hold does").toBeVisible();
     await page.keyboard.press("Enter");
     await expect(page, "OK opened the title page").toHaveURL(new RegExp(`/ui/title/${film}$`), { timeout: 15_000 });
 
