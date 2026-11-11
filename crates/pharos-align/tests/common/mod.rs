@@ -11,11 +11,22 @@ use std::time::Duration;
 use actix_web::{web, App, HttpServer};
 use pharos_align::http::{configure, AppState};
 use pharos_align::line::LineSpans;
-use pharos_align::service::{Decoder, Engine, Model, ModelError};
+use pharos_align::service::{Decoder, Engine, GpuMemory, GpuPool, Model, ModelError};
 use serde_json::Value;
 
 /// Every line's score from the fake model; the answer rounds it to 0.813.
 pub const SCORE: f64 = 0.8126;
+/// The fake model's GPU pool at the end of each song: 3 GiB peak, 1 GiB kept.
+pub const GPU: GpuMemory = GpuMemory {
+    peak: GpuPool {
+        in_use: 1 << 30,
+        reserved: 3 << 30,
+    },
+    after: GpuPool {
+        in_use: 0,
+        reserved: 1 << 30,
+    },
+};
 
 struct Even {
     /// When set, each align waits for a message first, holding the song lock.
@@ -33,6 +44,10 @@ impl Model for Even {
                 .collect(),
             score: Some(SCORE),
         })
+    }
+
+    fn end_song(&mut self) -> Option<GpuMemory> {
+        Some(GPU)
     }
 }
 
