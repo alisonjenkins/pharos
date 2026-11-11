@@ -411,9 +411,11 @@ impl Queue {
         // playing: the reload guard in `started` would otherwise keep it
         // queued to play again.
         self.restored = false;
-        // Nor is it a step back still on its way.
-        self.returning = None;
-        self.from_start = None;
+        // Nor is it a step back still on its way. A step back that has
+        // landed keeps its song playing from the start if it remounts.
+        if self.returning.take().is_some() {
+            self.from_start = None;
+        }
         if !self.shuffled {
             self.shuffled = true;
             self.unshuffled = self.upcoming.iter().map(|e| e.key).collect();
@@ -892,6 +894,19 @@ mod tests {
         assert!(!q.plays_from_start(ItemRef::Real(1)));
         q.started(first, None, 0);
         assert!(!q.stepping_back());
+    }
+
+    /// A step back that has landed keeps its song playing from the start
+    /// when a shuffle of an album holding only that song leaves it playing.
+    #[test]
+    fn shuffle_album_keeps_a_landed_step_back_from_the_start() {
+        let mut q = Queue::default();
+        q.started(ItemRef::Real(1), Some(&album(&[2])), 0);
+        q.started(ItemRef::Real(2), None, 0);
+        assert_eq!(q.back(track(2)), Some(ItemRef::Real(1)));
+        q.started(ItemRef::Real(1), None, 0);
+        assert_eq!(q.shuffle_album(vec![track(1)], 3), Some(ItemRef::Real(1)));
+        assert!(q.plays_from_start(ItemRef::Real(1)));
     }
 
     /// The song playing is never the one a shuffle starts: the player keeps
