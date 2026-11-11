@@ -5141,6 +5141,17 @@ label.pharos-setting {
     flex-basis: 5rem;
   }
 }
+/* The narrowest phones leave the name a few letters beside the still and
+   three controls: give the still and name the whole line and put the
+   controls under them (B1355). */
+@media (max-width: 22.5rem) {
+  .pharos-show-main .pharos-episode:not(.is-more-open) {
+    flex-wrap: wrap;
+  }
+  .pharos-show-main .pharos-episode-link {
+    flex-basis: 100%;
+  }
+}
 
 /* Rails (012): no scrollbar; a sideways swipe or Shift+wheel, a mouse
    drag, touch, keyboard focus and the controller still move them. A plain

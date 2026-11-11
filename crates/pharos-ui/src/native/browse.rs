@@ -5683,6 +5683,18 @@ mod tests {
     }
 
     #[test]
+    fn on_the_narrowest_phones_an_episodes_name_gets_a_line_of_its_own() {
+        // B1355: the one-line phone row left a 320px screen a few letters
+        // of the name; the narrow rule must come after the one-line rule.
+        let sheet = include_str!("../../assets/pharos.css");
+        let at = |needle: &str| sheet.find(needle).unwrap_or_else(|| panic!("{needle}"));
+        let one_line =
+            at("  .pharos-show-main .pharos-episode:not(.is-more-open) {\n    flex-wrap: nowrap;");
+        let narrow = at("@media (max-width: 22.5rem) {\n  .pharos-show-main .pharos-episode:not(.is-more-open) {\n    flex-wrap: wrap;\n  }\n  .pharos-show-main .pharos-episode-link {\n    flex-basis: 100%;");
+        assert!(one_line < narrow);
+    }
+
+    #[test]
     fn without_the_apps_queue_there_are_no_queue_buttons() {
         let album = detail(item(ItemRef::Synth(5), ItemKind::Album, "Record"));
         let tracks = page(vec![item(ItemRef::Real(1), ItemKind::Audio, "Opener")]);
