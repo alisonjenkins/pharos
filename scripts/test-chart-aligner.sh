@@ -35,6 +35,11 @@ expect "gpu on adds the render group" present "- 303" -- \
 expect "device is passed through" present 'value: "vulkan"' -- \
   --set aligner.device=vulkan
 expect "no device leaves the variable unset" absent "PHAROS_ALIGNER_DEVICE" --
+expect "idle unload sets its variable" present "PHAROS_ALIGNER_IDLE_UNLOAD_SECS" -- \
+  --set-string aligner.idleUnloadSecs=120
+expect "idle unload passes its value" present 'value: "120"' -- \
+  --set-string aligner.idleUnloadSecs=120
+expect "no idle unload leaves the variable unset" absent "PHAROS_ALIGNER_IDLE_UNLOAD_SECS" --
 expect "cache off has no claim" absent "PersistentVolumeClaim" --
 expect "cache on mounts its claim" present "claimName: p-pharos-aligner-cache" -- \
   --set aligner.cache.enabled=true
