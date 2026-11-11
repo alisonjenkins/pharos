@@ -354,8 +354,21 @@ const tilePlay = (t) => {
   const play = li && li.querySelector(":scope > a.pharos-poster-play");
   return play ? { tile, play } : null;
 };
+// A hold whose tile lost the focus, or whose page was hidden, plays and
+// opens nothing; its OK stays held back until the key comes up. A fresh
+// (not repeated) press with a hold still set means its keyup never came:
+// the old hold is dropped and the press starts anew.
+const dropHold = () => {
+  if (!tileHold) return;
+  clearTimeout(tileHold.timer);
+  tileHold.done = true;
+};
+addEventListener("focusout", (e) => { if (tileHold && e.target === tileHold.tile) dropHold(); }, true);
+addEventListener("blur", dropHold);
+document.addEventListener("visibilitychange", dropHold);
 addEventListener("keydown", (e) => {
   if (!e.isTrusted || e.key !== "Enter") return;
+  if (tileHold && !e.repeat) { dropHold(); tileHold = null; }
   const at = tileHold || tilePlay(e.target);
   if (!at) return;
   e.preventDefault();
@@ -363,6 +376,7 @@ addEventListener("keydown", (e) => {
   at.started = performance.now();
   tileHold = at;
   at.timer = setTimeout(() => {
+    if (tileHold !== at || at.done) return;
     at.done = true;
     at.play.click();
     console.info("pharos: keys: tile ok verdict=play held_ms=" + Math.round(performance.now() - at.started));
@@ -1051,6 +1065,18 @@ mod tests {
         assert!(
             press.contains("at.tile.click();") && !press.contains("at.play.click();"),
             "a press opens the title page: {press}"
+        );
+        // A hold dropped by a focus or page change neither plays nor opens.
+        for drop in [
+            r#"addEventListener("focusout""#,
+            r#"addEventListener("blur", dropHold)"#,
+            "visibilitychange",
+        ] {
+            assert!(held.contains(drop), "{drop}: {held}");
+        }
+        assert!(
+            held.contains("if (tileHold !== at || at.done) return;"),
+            "{held}"
         );
         for verdict in ["verdict=play", "verdict=open"] {
             assert!(hold.contains(verdict), "{verdict} logged: {hold}");
