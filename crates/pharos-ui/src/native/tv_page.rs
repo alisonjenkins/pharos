@@ -248,11 +248,11 @@ pub const STYLED_READY_MS: u32 = 45_000;
 /// subtitle font `pack` (family, file under `/ui/assets/fonts/`). It answers
 /// `"ready"` or `"failed: …"`.
 ///
-/// The worker, its wasm and every font reach JASSUB as `blob:` URLs the page
-/// fetched itself, and the script as `subContent`: requests from inside a
-/// worker are not known to reach the app's proxy (B1216). The worker and
-/// wasm blobs are kept on `window` for the next track, so a TV fetches the
-/// 2 MB wasm once per launch, and only the build its WebView can run.
+/// The worker loads from its own path: it finds its wasm and its pthread
+/// workers relative to `import.meta.url`, which a `blob:` URL cannot resolve
+/// against ("Failed to construct 'URL'", B1216). The fonts reach JASSUB as
+/// `blob:` URLs the page fetched itself, kept on `window` for the next
+/// track, and the script as `subContent`.
 pub fn styled_start_js(
     video_id: &str,
     url: &str,
@@ -289,9 +289,7 @@ try {{
       document.head.append(s);
     }});
   }}
-  const simd = WebAssembly.validate(new Uint8Array([0,97,115,109,1,0,0,0,1,5,1,96,0,1,123,3,2,1,0,10,10,1,8,0,65,0,253,15,253,98,11]));
-  if (!assets.worker) assets.worker = await blob(dir + "/jassub-worker.js", "text/javascript");
-  if (!assets.wasm) assets.wasm = await blob(dir + (simd ? "/jassub-worker-modern.wasm" : "/jassub-worker.wasm"), "application/wasm");
+  const at = (file) => new URL(dir + "/" + file, location.href).href;
   if (!assets.font) assets.font = await blob(dir + "/default.woff2", "font/woff2");
   assets.pack = assets.pack || {{}};
   for (const [family, file] of pack) {{
@@ -308,7 +306,8 @@ try {{
   const availableFonts = {{ "liberation sans": assets.font }};
   for (const [family] of pack) if (assets.pack[family]) availableFonts[family] = assets.pack[family];
   const j = new JASSUB({{
-    video: v, subContent, workerUrl: assets.worker, wasmUrl: assets.wasm, modernWasmUrl: assets.wasm,
+    video: v, subContent, workerUrl: at("jassub-worker.js"), wasmUrl: at("jassub-worker.wasm"),
+    modernWasmUrl: at("jassub-worker-modern.wasm"),
     availableFonts, fonts: own, defaultFont: "liberation sans", queryFonts: false, debug: true,
   }});
   runs[run] = {{ j, own }};
@@ -720,7 +719,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_styled_start_hands_jassub_only_page_fetched_blobs() {
+    fn the_styled_start_loads_the_worker_from_its_own_path() {
         let js = styled_start_js(
             "v",
             "/videos/1/subtitles/2/stream.ass?tier=tv",
@@ -732,8 +731,11 @@ mod tests {
         assert!(js.contains(r#"sub = "/videos/1/subtitles/2/stream.ass?tier=tv""#));
         assert!(js.contains(r#"fonts = ["/videos/1/attachments/a.ttf"]"#));
         assert!(js.contains(r#"pack = [["bangers","Bangers-Regular.ttf"]]"#));
-        // JASSUB is never given a server path to fetch in its worker.
-        assert!(js.contains("subContent, workerUrl: assets.worker, wasmUrl: assets.wasm"));
+        // The worker resolves its wasm against its own URL, so it is never a
+        // blob (B1216); the script itself goes in as content.
+        assert!(js.contains(r#"workerUrl: at("jassub-worker.js")"#), "{js}");
+        assert!(!js.contains("assets.worker"), "{js}");
+        assert!(js.contains("subContent"));
         assert!(!js.contains("subUrl"), "{js}");
         assert!(js.contains("debug: true"));
         assert!(js.contains(&format!("not ready after {STYLED_READY_MS} ms")));
