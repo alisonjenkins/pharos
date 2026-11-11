@@ -356,6 +356,7 @@ mod tests {
                 })
                 .collect(),
             words_pending: false,
+            words_eta_ms: None,
         }
     }
 
@@ -371,6 +372,7 @@ mod tests {
                 })
                 .collect(),
             words_pending: false,
+            words_eta_ms: None,
         }
     }
 
@@ -476,6 +478,7 @@ mod tests {
                 },
             ],
             words_pending: false,
+            words_eta_ms: None,
         };
         assert!((line_progress(&l, 0, 900) - 0.0).abs() < f64::EPSILON);
         assert!((line_progress(&l, 0, 1_250) - 3.0 / 11.0 * 100.0).abs() < 1e-9);
@@ -504,6 +507,7 @@ mod tests {
                 },
             ],
             words_pending: false,
+            words_eta_ms: None,
         };
         // No stamp at 0, so (1000, 0) -> (1500, 6); "world" (1 syllable = 700 ms) ends at 2200.
         assert!((line_progress(&l, 0, 1_250) - 3.0 / 11.0 * 100.0).abs() < 1e-9);
@@ -531,6 +535,7 @@ mod tests {
                 },
             ],
             words_pending: false,
+            words_eta_ms: None,
         };
         // (11000, 0) -> (11000, 2) -> "hello" (2 syllables, 1400 ms) ends at 12400.
         assert!((line_progress(&l, 0, 11_700) - 4.5 / 7.0 * 100.0).abs() < 1e-9);
@@ -549,6 +554,7 @@ mod tests {
                 }],
             }],
             words_pending: false,
+            words_eta_ms: None,
         };
         assert!((line_progress(&l, 0, 5_500) - 0.0).abs() < f64::EPSILON);
     }
@@ -615,6 +621,7 @@ mod tests {
                 synced: false,
                 lines,
                 words_pending: false,
+                words_eta_ms: None,
             },
             0,
         );

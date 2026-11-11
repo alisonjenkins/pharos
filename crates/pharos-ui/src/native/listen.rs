@@ -1282,6 +1282,7 @@ mod tests {
                 words: Vec::new(),
             }],
             words_pending: false,
+            words_eta_ms: None,
         };
         let mini = render_sized(
             "Teardrop",
@@ -1476,6 +1477,7 @@ mod tests {
                 words: Vec::new(),
             }],
             words_pending: false,
+            words_eta_ms: None,
         };
         let html = render_full("Teardrop", None, MediaState::default(), Some(words));
         assert!(html.contains(r#"aria-label="Lyrics""#), "{html}");
@@ -1494,6 +1496,7 @@ mod tests {
                 words: Vec::new(),
             }],
             words_pending: false,
+            words_eta_ms: None,
         };
         let html = render_full("Teardrop", None, MediaState::default(), Some(plain));
         assert!(!html.contains("pharos-karaoke-toggle"), "{html}");
