@@ -5482,7 +5482,8 @@ body::before {
   .pharos-queue {
     top: 9.5rem;
     right: 0.5rem;
-    max-height: calc(100% - 23.5rem);
+    /* A short screen still shows a few songs, over the now-playing card. */
+    max-height: max(calc(100% - 23.5rem), 10rem);
     width: calc(100% - 1rem);
   }
 }
