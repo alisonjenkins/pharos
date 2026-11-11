@@ -1254,6 +1254,34 @@ mod tests {
         assert!(fill.contains("pointer-events: none;"), "{fill}");
     }
 
+    /// B1346/V1317: the room kept above the mini bar works on the page's
+    /// root, where `--px-gutter` is not set: the scroll padding carries a
+    /// fallback (without one the calc() is invalid and computes to `auto`,
+    /// so a focused tile scrolls in under the bar), and the A to Z rail
+    /// keeps clear of the bar too.
+    #[test]
+    fn a_tile_scrolled_into_view_stops_above_the_mini_bar() {
+        let sheet = include_str!("../../assets/pharos.css");
+        let rule = |selector: &str| {
+            sheet
+                .split(&format!("\n{selector} {{"))
+                .nth(1)
+                .and_then(|r| r.split('}').next())
+                .unwrap_or_default()
+                .to_owned()
+        };
+        let root = rule("html:has(.pharos-stage.is-mini)");
+        assert!(
+            root.contains("scroll-padding-bottom: calc(var(--px-gutter, 1.5rem) + 4rem);"),
+            "{root}"
+        );
+        let rail = rule("body:has(.pharos-stage.is-mini) .pharos-letters");
+        assert!(rail.contains("top: calc((100% - 3.5rem) / 2);"), "{rail}");
+        assert!(rail.contains("height: min(calc(100vh - 9.5rem), 36rem);"), "{rail}");
+        let phone = rule("  body:has(.pharos-stage.is-mini) .pharos-letters");
+        assert!(phone.contains("bottom: 4.25rem;"), "{phone}");
+    }
+
     /// B900/V852: music's mini bar has a queue button that counts what
     /// waits and says whether the docked queue is open; a video's has none.
     #[test]
