@@ -389,9 +389,58 @@ input:focus-visible {
 .pharos-library-nav {
   display: flex;
   gap: 0.5rem;
-  margin-top: 0.75rem;
+  /* A scroll box clips what is drawn outside it, which cut the TV's focus
+     ring and glow (8px past the pill) to a broken circle (B1312/V1283):
+     the padding gives the ring room and the margin takes it back. */
+  padding: 12px;
+  margin: calc(0.75rem - 12px) -12px -12px;
   overflow-x: auto;
   scrollbar-width: none;
+}
+
+/* B1314/V1285: with room for it (a desktop, a TV), the brand, the library
+   tabs and the search and links share one row, so the page starts a row
+   higher. A narrower screen keeps them on rows of their own. */
+/* B1314: on a phone the brand is the mark alone (the name stays for screen
+   readers), so the mark, Favourites, Together and the account fit one row
+   instead of wrapping the account to a row of its own. */
+@media (max-width: 40rem) {
+  .pharos-shell .pharos-lockup span {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
+  }
+}
+@media (min-width: 64rem) {
+  .pharos-shell {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr) auto;
+    align-items: center;
+    column-gap: 1.5rem;
+  }
+  .pharos-shell .pharos-shell-bar {
+    display: contents;
+  }
+  .pharos-shell .pharos-brand {
+    grid-area: 1 / 1;
+  }
+  .pharos-shell .pharos-library-nav {
+    grid-area: 1 / 2;
+    margin-block: -12px;
+  }
+  .pharos-shell .pharos-shell-nav {
+    grid-area: 1 / 3;
+    flex: none;
+  }
+  .pharos-shell .pharos-crumbs {
+    grid-column: 1 / -1;
+  }
 }
 .pharos-library-tab {
   flex: none;
@@ -866,13 +915,63 @@ input:focus-visible {
   }
 }
 
-/* A library's sort and filter bar (V252). */
+/* A library's sort and filter bar (V252), one row on every screen
+   (B1311/V1282): the Sort and Filters pills, a pill per filter that is on,
+   and Reset. A row too long for a phone scrolls sideways, as the library
+   tabs do; the padding keeps a focus ring inside the scroll box. */
 .pharos-filters {
   display: flex;
-  flex-wrap: wrap;
-  align-items: end;
-  gap: 0.75rem 1rem;
-  margin: 0 0 1.25rem;
+  align-items: center;
+  gap: 0.5rem;
+  /* Room for the TV's focus ring, as on the library tabs (B1312). */
+  padding: 12px;
+  margin: -12px -12px calc(1rem - 12px);
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+.pharos-filters::-webkit-scrollbar {
+  display: none;
+}
+.pharos-filter-pill,
+.pharos-sheet-pills .pharos-chip {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: 0.4rem;
+  min-height: 2.25rem;
+  padding: 0 0.85rem;
+  font-size: 0.9rem;
+  white-space: nowrap;
+}
+.pharos-filter-pill .pharos-icon {
+  width: 1.1rem;
+  height: 1.1rem;
+  flex: none;
+}
+.pharos-filter-pill[data-on],
+.pharos-filter-on {
+  border-color: var(--px-color-accent);
+}
+.pharos-filter-count {
+  display: inline-grid;
+  place-items: center;
+  min-width: 1.25rem;
+  height: 1.25rem;
+  padding: 0 0.3rem;
+  border-radius: 999px;
+  background: var(--px-color-accent);
+  color: var(--px-color-accent-fg);
+  font-size: 0.75rem;
+  font-weight: 700;
+}
+.pharos-filter-x {
+  margin-right: -0.25rem;
+  opacity: 0.7;
+}
+.pharos-filter-reset {
+  border-color: transparent;
+  background: transparent;
+  color: var(--px-color-fg-muted);
 }
 .pharos-filter {
   display: flex;
@@ -891,9 +990,120 @@ input:focus-visible {
   font: inherit;
   font-size: 1rem;
 }
-.pharos-filter-direction,
-.pharos-filter-reset {
-  padding: 0.45rem 1rem;
+
+/* Every sort and filter choice (B1311/V1282): a bottom sheet on a phone, a
+   panel on the right of a wider screen or a TV. */
+.pharos-sheet-scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  background: color-mix(in srgb, var(--px-color-bg) 70%, transparent);
+}
+.pharos-sheet {
+  position: fixed;
+  inset: auto 0 0;
+  z-index: 41;
+  display: flex;
+  flex-direction: column;
+  max-height: 80vh;
+  max-height: 80dvh;
+  border-radius: 16px 16px 0 0;
+  background: var(--px-color-surface-raised);
+  color: var(--px-color-fg);
+  box-shadow: 0 -8px 32px color-mix(in srgb, var(--px-color-bg) 80%, transparent);
+}
+.pharos-sheet::before {
+  content: "";
+  align-self: center;
+  width: 2.5rem;
+  height: 4px;
+  margin-top: 0.5rem;
+  border-radius: 2px;
+  background: var(--px-color-border);
+}
+.pharos-sheet-head {
+  padding: 0.75rem 1rem 0.25rem;
+}
+.pharos-sheet-head h2 {
+  margin: 0;
+  font-size: 1.05rem;
+}
+.pharos-sheet-body {
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 0 1rem 1rem;
+}
+.pharos-sheet-group {
+  padding-top: 0.75rem;
+}
+.pharos-sheet-group h3 {
+  margin: 0 0 0.4rem;
+  color: var(--px-color-fg-muted);
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.pharos-sheet-pills {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  /* Room for a focus ring on the first and last pills. */
+  padding: 4px;
+  margin: -4px;
+}
+.pharos-sheet-foot {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.5rem;
+  padding: 0.6rem 1rem calc(0.6rem + env(safe-area-inset-bottom));
+  border-top: var(--px-border) solid var(--px-color-border);
+}
+@media (min-width: 40rem) {
+  .pharos-sheet {
+    inset: 0 0 0 auto;
+    width: min(24rem, 100vw);
+    max-height: none;
+    border-radius: 0;
+    box-shadow: -8px 0 32px color-mix(in srgb, var(--px-color-bg) 80%, transparent);
+  }
+  .pharos-sheet::before {
+    display: none;
+  }
+}
+@media (prefers-reduced-motion: no-preference) {
+  .pharos-sheet {
+    animation: pharos-sheet-up var(--px-motion-duration) var(--px-motion-easing);
+  }
+  @media (min-width: 40rem) {
+    .pharos-sheet {
+      animation-name: pharos-sheet-in;
+    }
+  }
+}
+@keyframes pharos-sheet-up {
+  from {
+    translate: 0 100%;
+  }
+}
+@keyframes pharos-sheet-in {
+  from {
+    translate: 100% 0;
+  }
+}
+
+/* A library's own grid: its tab is lit in the bar, so its heading is
+   for screen readers only (B1313/V1284). */
+.pharos-browse-library > h2 {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
 }
 
 /* The A to Z rail on the right edge (V252). Room is kept for it so it never
@@ -913,6 +1123,17 @@ input:focus-visible {
   padding: 0.25rem 0;
   border-radius: 999px;
   background: var(--px-color-overlay);
+}
+/* B1321/V1292: a phone's header is taller than the space the centred rail
+   leaves above it, so the rail sat over the library tabs. On a phone it
+   sits at the foot of the screen, clear of the header. */
+@media (max-width: 40rem) {
+  .pharos-letters {
+    top: auto;
+    bottom: 0.75rem;
+    translate: none;
+    height: min(calc(100dvh - 15rem), 36rem);
+  }
 }
 .pharos-letter {
   flex: 1 1 0;
@@ -7143,4 +7364,56 @@ body:has(.pharos-reader) {
 .pharos-kept-title {
   font-weight: 600;
   overflow-wrap: anywhere;
+}
+
+/* B1314: a TV (960 CSS px wide) gets the one-row bar too, with a shorter
+   search box so the library tabs keep their room. */
+:root[data-device="tv"] .pharos-shell {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  column-gap: 1.25rem;
+}
+:root[data-device="tv"] .pharos-shell .pharos-shell-bar {
+  display: contents;
+}
+:root[data-device="tv"] .pharos-shell .pharos-brand {
+  grid-area: 1 / 1;
+}
+:root[data-device="tv"] .pharos-shell .pharos-library-nav {
+  grid-area: 1 / 2;
+  margin-block: -12px;
+}
+:root[data-device="tv"] .pharos-shell .pharos-shell-nav {
+  grid-area: 1 / 3;
+  flex: none;
+}
+:root[data-device="tv"] .pharos-shell .pharos-search {
+  flex-basis: 7rem;
+  min-width: 6rem;
+}
+:root[data-device="tv"] .pharos-shell .pharos-shell-nav {
+  gap: 0.75rem;
+}
+:root[data-device="tv"] .pharos-shell .pharos-crumbs {
+  grid-column: 1 / -1;
+}
+/* B1311: the filter row and its sheet on a TV: smaller pills, and the
+   sheet's content inside the title-safe area. */
+:root[data-device="tv"] .pharos-filters {
+  margin-bottom: calc(0.5rem - 12px);
+}
+:root[data-device="tv"] .pharos-filter-pill,
+:root[data-device="tv"] .pharos-sheet-pills .pharos-chip {
+  min-height: 1.9rem;
+  font-size: 0.8rem;
+}
+:root[data-device="tv"] .pharos-sheet {
+  width: 22rem;
+  padding-block: 27px;
+}
+:root[data-device="tv"] .pharos-sheet-head,
+:root[data-device="tv"] .pharos-sheet-body,
+:root[data-device="tv"] .pharos-sheet-foot {
+  padding-inline: 1.25rem 48px;
 }

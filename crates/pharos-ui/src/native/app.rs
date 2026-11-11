@@ -3021,6 +3021,7 @@ fn TopSearch() -> Element {
     let ctx = use_context::<Ctx>();
     let search = use_context::<Search>();
     let nav = use_context::<Nav>();
+    let mut palette = use_context::<Palette>();
     let mut open = use_signal(|| false);
     let mut active = use_signal(|| None::<usize>);
     let suggestions = move || match &*search.hits.peek() {
