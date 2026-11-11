@@ -866,8 +866,8 @@ mod tests {
     }
 
     /// The value of `attr="…"` in the first element of `xml` that has it.
-    fn attr<'a>(xml: &'a str, attr: &str) -> Option<&'a str> {
-        let rest = xml.split(&format!("{attr}=\"")).nth(1)?;
+    fn attr<'a>(xml: &'a str, name: &str) -> Option<&'a str> {
+        let rest = xml.split(&format!(" {name}=\"")).nth(1)?;
         rest.split('"').next()
     }
 

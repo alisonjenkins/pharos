@@ -275,6 +275,12 @@ pub fn session_set(_key: &str, _value: &str) -> Result<(), String> {
 
 pub fn toggle_fullscreen() {}
 
+/// The test host draws the player as a browser would, Fullscreen button and
+/// all.
+pub fn fullscreen_supported() -> bool {
+    true
+}
+
 pub fn page_origin() -> String {
     String::new()
 }
@@ -317,6 +323,8 @@ pub fn exit_vr() {}
 pub fn select_field(_id: &str) {}
 
 pub fn focus_by_id(_id: &str) {}
+
+pub fn focus_first_in(_within: &str) {}
 
 pub fn focus_out_of(_within: &str, _to: &str) {}
 

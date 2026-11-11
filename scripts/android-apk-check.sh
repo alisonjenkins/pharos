@@ -1,3 +1,4 @@
+#!/usr/bin/env bash
 # Check a built Android TV APK carries what the TV needs (B1329, V1302):
 # the Pharos label, launcher icon and TV banner from
 # crates/pharos-ui/android/res, the dark AppTheme that keeps the launch
@@ -5,8 +6,8 @@
 # the activity must survive. An APK built by running `dx` directly skips the
 # res overlay in scripts/android-apk.sh and fails here.
 #
-#   nix run .#android-apk-check -- path/to/pharos-tv.apk
-#   sh scripts/android-apk-check.sh path/to/pharos-tv.apk   # from the repo
+#   just tv-apk-check path/to/pharos-tv.apk
+#   bash scripts/android-apk-check.sh path/to/pharos-tv.apk   # from the repo
 #
 # AAPT2 names the aapt2 binary; without it the script asks the `.#android`
 # dev shell for build-tools 35.0.0's. Each check prints `ok` or `FAIL` with
@@ -44,8 +45,14 @@ badging=$("$AAPT2" dump badging "$apk" 2>&1) || {
   echo "android-apk-check: aapt2 could not read $apk: $badging" >&2
   exit 64
 }
-manifest=$("$AAPT2" dump xmltree --file AndroidManifest.xml "$apk" 2>&1)
-resources=$("$AAPT2" dump resources "$apk" 2>&1)
+manifest=$("$AAPT2" dump xmltree --file AndroidManifest.xml "$apk" 2>&1) || {
+  echo "android-apk-check: aapt2 could not dump the manifest of $apk: $manifest" >&2
+  exit 64
+}
+resources=$("$AAPT2" dump resources "$apk" 2>&1) || {
+  echo "android-apk-check: aapt2 could not dump the resources of $apk: $resources" >&2
+  exit 64
+}
 
 # The launcher shows the application label; dx's own is "PharosTv".
 label=$(printf '%s\n' "$badging" | sed -n "s/^application-label:'\(.*\)'$/\1/p" | head -n 1)

@@ -744,6 +744,12 @@ pub fn session_set(key: &str, value: &str) -> Result<(), String> {
 
 pub fn toggle_fullscreen() {}
 
+/// The TV app always fills the screen: it has no fullscreen to toggle, so
+/// the player offers no button for it (B1339).
+pub fn fullscreen_supported() -> bool {
+    false
+}
+
 pub fn page_origin() -> String {
     String::new()
 }
@@ -808,6 +814,18 @@ pub fn focus_by_id(id: &str) {
     run(format!(
         "const el = document.getElementById({}); if (el) el.focus();",
         js_str(id)
+    ));
+}
+
+/// Move the focus to the first control shown inside `within`: the remote
+/// lands on the player's settings sheet as it opens (B1338).
+pub fn focus_first_in(within: &str) {
+    run(format!(
+        "const w = document.getElementById({}); \
+         const t = w && [...w.querySelectorAll('button:not([disabled]), select:not([disabled])')] \
+           .find((el) => el.getBoundingClientRect().width > 0); \
+         if (t) t.focus({{preventScroll: true}});",
+        js_str(within)
     ));
 }
 
