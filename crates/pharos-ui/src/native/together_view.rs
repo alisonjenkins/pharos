@@ -35,12 +35,7 @@ pub fn TogetherView(
         section { class: "pharos-together",
             h2 { "Watch together" }
             if unlisted {
-                div { class: "pharos-group is-current",
-                    div { class: "pharos-group-text",
-                        span { class: "pharos-group-name", "You're in a group" }
-                    }
-                    LeaveGroup { on_leave }
-                }
+                InAGroup { on_leave }
             }
             if groups.is_empty() && !unlisted {
                 p { class: "pharos-empty", "No one is watching together right now" }
@@ -80,6 +75,21 @@ pub fn TogetherView(
                     }
                 }
             }
+        }
+    }
+}
+
+/// "You're in a group" and Leave group, for a group the page cannot show:
+/// one the list leaves out, or any while the list loads or fails, so the way
+/// out never waits on the list (B1361).
+#[component]
+pub fn InAGroup(on_leave: EventHandler<()>) -> Element {
+    rsx! {
+        div { class: "pharos-group is-current",
+            div { class: "pharos-group-text",
+                span { class: "pharos-group-name", "You're in a group" }
+            }
+            LeaveGroup { on_leave }
         }
     }
 }
