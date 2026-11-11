@@ -408,16 +408,19 @@ impl Aligner {
 
     async fn process_job(&self, job: &Job) -> Result<(), String> {
         let answered = self.request(&job.path, &job.lines, TIMEOUT).await?;
+        let offset_ms = answered.aligned.offset_ms;
+        self.store(job.id, job.key.clone(), answered, Source::Song);
+        // Measured once the answer is stored, the point the client can see
+        // it and the estimator's own finish.
         let (predicted_ms, actual_ms) = job.observe_eta("aligned");
         tracing::info!(
             media.id = job.id,
             lines = job.lines.len(),
-            offset_ms = answered.aligned.offset_ms,
+            offset_ms,
             eta.predicted_ms = predicted_ms,
             eta.actual_ms = actual_ms,
             "lyrics: aligned"
         );
-        self.store(job.id, job.key.clone(), answered, Source::Song);
         Ok(())
     }
 
