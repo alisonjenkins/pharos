@@ -2860,13 +2860,21 @@ pub fn AlbumView(detail: Detail, tracks: Page) -> Element {
     } else {
         Vec::new()
     };
+    // Play opens the first song: an album folder can also hold a clip.
+    let first_song = tracks
+        .items
+        .iter()
+        .find(|t| t.kind == ItemKind::Audio)
+        .map(|t| t.id);
     let lead = (!tracks.items.is_empty()).then(|| {
         rsx! {
-            AlbumPlay {
-                album: detail.item.id,
-                name: detail.item.name.clone(),
-                first: first_track,
-                tracks: whole.clone(),
+            if let Some(first) = first_song {
+                AlbumPlay {
+                    album: detail.item.id,
+                    name: detail.item.name.clone(),
+                    first,
+                    tracks: whole.clone(),
+                }
             }
             QueueButtons {
                 name: detail.item.name.clone(),
@@ -2924,7 +2932,7 @@ pub fn AlbumView(detail: Detail, tracks: Page) -> Element {
 /// whole album, fetched when the page holds only part of it) and plays the
 /// first of them.
 #[component]
-fn AlbumPlay(album: ItemRef, name: String, first: Option<ItemRef>, tracks: Vec<Item>) -> Element {
+fn AlbumPlay(album: ItemRef, name: String, first: ItemRef, tracks: Vec<Item>) -> Element {
     let queue = try_use_context::<QueueCtx>().map(|q| q.0);
     let nav = try_use_context::<Nav>();
     let ctx = try_use_context::<Ctx>();
@@ -2984,14 +2992,12 @@ fn AlbumPlay(album: ItemRef, name: String, first: Option<ItemRef>, tracks: Vec<I
         });
     };
     rsx! {
-        if let Some(first) = first {
-            Link {
-                to: Route::Watch(first),
-                class: "pharos-button pharos-album-play",
-                key_action: "play",
-                Icon { path: ICON_PLAY }
-                span { "Play" }
-            }
+        Link {
+            to: Route::Watch(first),
+            class: "pharos-button pharos-album-play",
+            key_action: "play",
+            Icon { path: ICON_PLAY }
+            span { "Play" }
         }
         if queue.is_some() && nav.is_some() && !in_group {
             button {
@@ -5258,6 +5264,28 @@ mod tests {
         );
         // The track list follows, holding the songs.
         assert!(!side.contains("Opener"), "{side}");
+    }
+
+    /// An album folder can hold a clip: Play opens the first song, and an
+    /// album of clips alone offers neither Play nor Shuffle.
+    #[test]
+    fn an_albums_play_opens_its_first_song_not_a_clip() {
+        let album = detail(item(ItemRef::Synth(5), ItemKind::Album, "Record"));
+        let clip = item(ItemRef::Real(1), ItemKind::Movie, "Clip");
+        let song = item(ItemRef::Real(2), ItemKind::Audio, "Opener");
+        let html = with_queue({
+            let (album, items) = (album.clone(), vec![clip.clone(), song]);
+            move || rsx! { AlbumView { detail: album.clone(), tracks: page(items.clone()) } }
+        });
+        assert!(
+            html.contains(r#"href="/ui/watch/2" class="pharos-button pharos-album-play""#),
+            "{html}"
+        );
+        let html = with_queue(move || {
+            rsx! { AlbumView { detail: album.clone(), tracks: page(vec![clip.clone()]) } }
+        });
+        assert!(!html.contains("pharos-album-play"), "{html}");
+        assert!(!html.contains("pharos-album-shuffle"), "{html}");
     }
 
     #[test]
