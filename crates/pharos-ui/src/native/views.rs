@@ -1855,7 +1855,7 @@ fn together_starts(
             (
                 resume,
                 start_ms(item.position_ms, item.played),
-                "pharos-button",
+                "pharos-button pharos-button-secondary",
                 "together",
             ),
             (
@@ -1866,7 +1866,12 @@ fn together_starts(
             ),
         ]
     } else {
-        vec![(fresh, 0, "pharos-button", "together")]
+        vec![(
+            fresh,
+            0,
+            "pharos-button pharos-button-secondary",
+            "together",
+        )]
     }
 }
 
@@ -3262,6 +3267,22 @@ mod tests {
                 ("Watch together from start", 0)
             ]
         );
+    }
+
+    /// B1343/V1314: Play is a title page's one primary button; every
+    /// together start beside it is secondary, in a group or not.
+    #[test]
+    fn together_starts_are_secondary_beside_play() {
+        let mut film = item(ItemKind::Movie);
+        film.runtime_ms = 100 * 60_000;
+        for position_ms in [0, 60_000] {
+            film.position_ms = position_ms;
+            for in_group in [false, true] {
+                for (label, _, class, _) in together_starts(&film, in_group) {
+                    assert_eq!(class, "pharos-button pharos-button-secondary", "{label}");
+                }
+            }
+        }
     }
 
     /// 014 US10: in a group, the together buttons move the group to this
