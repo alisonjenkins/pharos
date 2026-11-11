@@ -3779,6 +3779,8 @@ pub(super) fn js_message(e: &JsValue) -> String {
 #[derive(Default)]
 pub(super) struct HlsJs {
     player: Option<HlsPlayer>,
+    ceiling: Rc<RefCell<super::playback::BufferCeiling>>,
+    url: String,
     _listeners: Vec<Closure<dyn FnMut(JsValue, JsValue)>>,
 }
 
@@ -3800,7 +3802,9 @@ impl PlaybackEngine for HlsJs {
         let budget = Rc::new(RefCell::new(RecoveryBudget::new()));
         let on_error = {
             let (player, budget, url) = (player.clone(), Rc::clone(&budget), url.to_owned());
+            let ceiling = Rc::clone(&self.ceiling);
             Closure::<dyn FnMut(JsValue, JsValue)>::new(move |_event, data: JsValue| {
+                check_ceiling(&player, &ceiling, &url);
                 let field = |name: &str| {
                     js_sys::Reflect::get(&data, &name.into())
                         .ok()
@@ -3838,10 +3842,14 @@ impl PlaybackEngine for HlsJs {
                 }
             })
         };
+        self.ceiling = Rc::new(RefCell::new(super::playback::BufferCeiling::default()));
+        self.url = url.to_owned();
         let on_loaded = {
             let budget = Rc::clone(&budget);
+            let (player, ceiling, url) = (player.clone(), Rc::clone(&self.ceiling), url.to_owned());
             Closure::<dyn FnMut(JsValue, JsValue)>::new(move |_, data: JsValue| {
                 budget.borrow_mut().progressed();
+                check_ceiling(&player, &ceiling, &url);
                 if let Some(load) = fragment_load(&data) {
                     on_fragment(load);
                 }
@@ -3856,6 +3864,22 @@ impl PlaybackEngine for HlsJs {
         self._listeners = vec![on_error, on_loaded];
         Ok(())
     }
+}
+
+/// Reports a cut hls.js made to its forward buffer ceiling since the last
+/// check (B1325).
+fn check_ceiling(player: &HlsPlayer, ceiling: &RefCell<super::playback::BufferCeiling>, url: &str) {
+    let now_s = js_number(player, &["config", "maxMaxBufferLength"]);
+    let Some((from_s, to_s)) = ceiling.borrow_mut().observe(now_s) else {
+        return;
+    };
+    warn(&format!(
+        "pharos: hls.js cut its forward buffer ceiling engine=hlsjs from_s={from_s} to_s={to_s} url={url}"
+    ));
+    let mut event = hls_event(ClientLevel::Warn, "bufferCeiling", "reduced", "none", 0);
+    event.fields.push(("from_s", from_s.to_string()));
+    event.fields.push(("to_s", to_s.to_string()));
+    report_event(event);
 }
 
 /// A number at `path` in the hls.js object `from`, 0 when absent.
@@ -3898,6 +3922,7 @@ fn fragment_load(data: &JsValue) -> Option<FragmentLoad> {
 impl Drop for HlsJs {
     fn drop(&mut self) {
         if let Some(player) = self.player.take() {
+            check_ceiling(&player, &self.ceiling, &self.url);
             player.destroy();
         }
     }
