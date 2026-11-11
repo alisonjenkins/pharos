@@ -76,7 +76,7 @@ use super::subtitles::{
 use super::together::{
     can_watch_together, group_api, GroupClient as _, GroupError, GroupSummary, Groups,
 };
-use super::together_view::{InviteView, NotesView, TogetherView, INVITE_LINK_ID};
+use super::together_view::{InAGroup, InviteView, NotesView, TogetherView, INVITE_LINK_ID};
 use super::track_follow;
 use super::trail;
 use super::turn::{self, EpisodeTurn, EPISODE_TURN_KEY};
@@ -3246,12 +3246,21 @@ fn TogetherScreen() -> Element {
         let view = (together.view)();
         view.id.clone().filter(|_| view.active)
     };
+    // While the list loads or fails, the way out of the group still shows.
+    let leave_now = current.is_some().then(|| {
+        let together = together.clone();
+        rsx! { InAGroup { on_leave: move |()| leave_group(together.clone()) } }
+    });
     let state = groups.read();
     match state.as_ref() {
-        None => rsx! { Loading {} },
+        None => rsx! {
+            {leave_now}
+            Loading {}
+        },
         Some(Err(e)) => {
             platform::warn(&format!("pharos: together list failed error={}", e.0));
             rsx! {
+                {leave_now}
                 LoadFailure {
                     error: LoadError {
                         headline: "We couldn't list the groups watching together.".to_owned(),
