@@ -732,27 +732,50 @@ pub fn focus_by_id(id: &str) {
 }
 
 /// Give the focus to `to`, a card that just appeared over the video (Skip
-/// intro, Up Next), when the remote is on the picture or the control row:
-/// not while it scrubs on the seek bar or walks the settings sheet (B1342).
-pub fn focus_card(within: &str, to: &str) {
+/// intro, Up Next), when the remote is on the picture or its control row,
+/// or the focus went with a card this one replaced: not while it scrubs, nor
+/// in the settings sheet, the queue or the invite panel (B1342). When `keep`
+/// was the last control focused (the pill's Cancel, as the pill grows into
+/// the full card), `keep` takes it instead, so OK still does what it did.
+/// The page applies a render's DOM edits on its own schedule, so the card
+/// may not be there yet: a few tries, a frame apart.
+pub fn focus_card(within: &str, to: &str, keep: &str) {
     run(format!(
-        "const a = document.activeElement; const w = document.getElementById({}); \
-         const t = document.getElementById({}); \
-         const idle = !a || a === document.body || a === w || \
-           (w && w.contains(a) && !a.closest('.pharos-seek, .pharos-control-menus')); \
-         if (w && t && idle) {{ t.focus({{preventScroll: true}}); \
-           console.info('pharos: card focus to=' + t.id); }}",
+        "{CARD_WATCH} \
+         const w = document.getElementById({}); const to = {}; const keep = {}; \
+         const go = (n) => {{ \
+           const t = document.getElementById(keep && window.__pharosLastFocus === keep ? keep : to); \
+           if (!t) {{ if (n > 0) setTimeout(() => go(n - 1), 50); return; }} \
+           const a = document.activeElement; \
+           const lost = !a || a === document.body; \
+           const scrubbing = !!document.querySelector('.pharos-seek.is-scrubbing'); \
+           const row = a && a.closest && a.closest('.pharos-control-row') && \
+             !a.closest('.pharos-control-menus'); \
+           if (w && !scrubbing && (lost || a === w || row)) {{ \
+             t.focus({{preventScroll: true}}); \
+             console.info('pharos: card focus to=' + t.id); \
+           }} \
+         }}; go(4);",
         js_str(within),
-        js_str(to)
+        js_str(to),
+        js_str(keep)
     ));
 }
 
+/// Remembers the id of the last focused element, so a card that replaces
+/// another can tell which of its buttons the remote was on (B1342).
+const CARD_WATCH: &str = "if (!window.__pharosFocusWatch) { window.__pharosFocusWatch = true; \
+  document.addEventListener('focusin', (e) => { window.__pharosLastFocus = (e.target && e.target.id) || ''; }, true); }";
+
 /// Put the focus on `to` when it was lost with a removed element (a card
-/// that closed under it), so the remote keeps a place (B1342).
+/// that closed under it), so the remote keeps a place (B1342). The card's
+/// node may go after this runs, so it looks again a frame or two later.
 pub fn refocus_if_lost(to: &str) {
     run(format!(
-        "const a = document.activeElement; const t = document.getElementById({}); \
-         if (t && (!a || a === document.body)) t.focus({{preventScroll: true}});",
+        "const back = () => {{ const a = document.activeElement; \
+           const t = document.getElementById({}); \
+           if (t && (!a || a === document.body)) t.focus({{preventScroll: true}}); }}; \
+         back(); setTimeout(back, 50); setTimeout(back, 200);",
         js_str(to)
     ));
 }
