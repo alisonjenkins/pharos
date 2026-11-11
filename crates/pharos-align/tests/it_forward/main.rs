@@ -132,25 +132,38 @@ fn assert_matches_torch(ours: &[f32], case: &Case) {
 
 /// V1261: the Vulkan pass meets the CPU pass's bar on the same fixtures.
 /// Skipped, saying why, on a machine with no usable Vulkan adapter.
+/// The Vulkan pass on the adapter the service would pick, or `None` when
+/// this machine has no hardware Vulkan adapter. A load that fails or panics
+/// on a GPU that is there fails the test rather than skipping it.
+#[cfg(feature = "vulkan")]
+fn vulkan_model() -> Option<pharos_align::forward::vulkan::VulkanModel> {
+    use pharos_align::device::{self, Device, DeviceMode};
+    let choice = match device::choose(DeviceMode::Vulkan, &device::probe()) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("SKIPPED: {e}");
+            return None;
+        }
+    };
+    let Device::Vulkan(adapter) = choice.device else {
+        panic!("DeviceMode::Vulkan chose {:?}", choice.device);
+    };
+    let dir = std::env::var("PHAROS_ALIGNER_WEIGHTS").expect("PHAROS_ALIGNER_WEIGHTS");
+    let weights = Weights::open(std::path::Path::new(&dir)).unwrap();
+    Some(
+        pharos_align::forward::vulkan::VulkanModel::load(&weights, device::burn_device(&adapter))
+            .unwrap(),
+    )
+}
+
 #[cfg(feature = "vulkan")]
 #[test]
 #[ignore = "needs PHAROS_ALIGNER_WEIGHTS and a Vulkan GPU; run with --release --features vulkan"]
 fn vulkan_emissions_match_torch_and_give_the_same_ctc_paths() {
-    use burn::backend::{WgpuBackend, WgpuDevice, WgpuDeviceKind};
-    use pharos_align::forward::vulkan::{self, VulkanModel};
+    use pharos_align::forward::vulkan;
     let fixture: Fixture = serde_json::from_str(include_str!("../fixtures/emission.json")).unwrap();
-    let dir = std::env::var("PHAROS_ALIGNER_WEIGHTS").expect("PHAROS_ALIGNER_WEIGHTS");
-    let weights = Weights::open(std::path::Path::new(&dir)).unwrap();
-    let loaded = std::panic::catch_unwind(|| {
-        let device = WgpuDevice::new(WgpuDeviceKind::DiscreteGpu(0)).on(WgpuBackend::Vulkan);
-        VulkanModel::load(&weights, device.into())
-    });
-    let m = match loaded {
-        Ok(m) => m.unwrap(),
-        Err(_) => {
-            eprintln!("SKIPPED: no discrete Vulkan adapter (wgpu panicked creating it)");
-            return;
-        }
+    let Some(m) = vulkan_model() else {
+        return;
     };
     for case in &fixture.cases {
         let w = normalise(&wave(case.samples, case.seed));
@@ -193,21 +206,12 @@ const MAX_GPU_SPARE_BYTES: u64 = 256 << 20;
 #[test]
 #[ignore = "needs PHAROS_ALIGNER_WEIGHTS and a Vulkan GPU; run alone (--exact): the pool is per device"]
 fn the_gpu_pool_gives_back_what_a_song_grew() {
-    use burn::backend::{WgpuBackend, WgpuDevice, WgpuDeviceKind};
-    use pharos_align::forward::vulkan::VulkanModel;
     use pharos_align::forward::VulkanAligner;
     use pharos_align::service::Model;
-    let dir = std::env::var("PHAROS_ALIGNER_WEIGHTS").expect("PHAROS_ALIGNER_WEIGHTS");
-    let weights = Weights::open(std::path::Path::new(&dir)).unwrap();
-    let loaded = std::panic::catch_unwind(|| {
-        let device = WgpuDevice::new(WgpuDeviceKind::DiscreteGpu(0)).on(WgpuBackend::Vulkan);
-        VulkanModel::load(&weights, device.into())
-    });
-    let Ok(model) = loaded else {
-        eprintln!("SKIPPED: no discrete Vulkan adapter (wgpu panicked creating it)");
+    let Some(model) = vulkan_model() else {
         return;
     };
-    let mut gpu = VulkanAligner::new(model.unwrap(), "forced_vulkan".into(), "test".into());
+    let mut gpu = VulkanAligner::new(model, "forced_vulkan".into(), "test".into());
     let tokens: Vec<String> = ["la", "da", "na"].iter().map(|s| (*s).to_owned()).collect();
     // Each song's windows take new shapes, which grow the pool; a long one
     // early lets cubecl free its pages before the song ends.
