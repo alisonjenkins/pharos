@@ -50,7 +50,10 @@ async function signIn(page: Page, request: APIRequestContext): Promise<Api> {
     },
     data: { Username: TEST_USER, Pw: TEST_PASS },
   });
-  test.skip(!auth.ok(), `pharos has no seeded test user (${TEST_USER})`);
+  // With the native API on, the seed is the suite's own (`just
+  // compat-dioxus-full`): a guard that skipped on a missing seed would pass
+  // CI without running, so a missing seed fails instead.
+  expect(auth.ok(), `the seeded test user ${TEST_USER} signs in`).toBe(true);
   const { AccessToken: token, User: user } = await auth.json();
   const json = async (path: string) =>
     (await request.get(`${PHAROS_URL}${path}`, { headers: { "X-Emby-Token": token } })).json();
@@ -98,7 +101,7 @@ async function walkTo(page: Page, key: string, selector: string, max = 8): Promi
 async function aFilm(api: Api): Promise<string> {
   const views = await api.json(`/Users/${api.user.Id}/Views`);
   const bulk = views.Items?.find((i: { Name: string }) => i.Name === "Bulk");
-  test.skip(!bulk, "the seed has no Bulk library");
+  expect(bulk, "the seed has a Bulk library").toBeTruthy();
   let film: { Id: string } | undefined;
   await expect
     .poll(
@@ -207,7 +210,7 @@ test.describe("Android TV remote (B1332)", () => {
       `/Users/${api.user.Id}/Items?Recursive=true&IncludeItemTypes=Audio&Fields=AlbumArtist,Artists,Album`,
     );
     const track: Song | undefined = tracks.Items?.find((t: Song) => t.Album && by(t));
-    test.skip(!track, "the seed has no track tagged with an album and artist");
+    expect(track, "the seed has a track tagged with an album and artist").toBeTruthy();
     const artist = (await api.json(`/Artists`)).Items?.find((a: { Name: string }) => a.Name === by(track!));
     expect(artist, "the track's album artist is listed").toBeTruthy();
 
