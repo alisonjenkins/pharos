@@ -512,6 +512,11 @@ const tilePlay = (t) => {
 // opens nothing; its OK stays held back until the key comes up. A fresh
 // (not repeated) press with a hold still set means its keyup never came:
 // the old hold is dropped and the press starts anew.
+const holdPlay = (at, via) => {
+  at.done = true;
+  at.play.click();
+  console.info("pharos: keys: tile ok verdict=play held_ms=" + Math.round(performance.now() - at.started) + " via=" + via);
+};
 const dropHold = () => {
   if (!tileHold) return;
   clearTimeout(tileHold.timer);
@@ -531,9 +536,7 @@ addEventListener("keydown", (e) => {
   tileHold = at;
   at.timer = setTimeout(() => {
     if (tileHold !== at || at.done) return;
-    at.done = true;
-    at.play.click();
-    console.info("pharos: keys: tile ok verdict=play held_ms=" + Math.round(performance.now() - at.started));
+    holdPlay(at, "timer");
   }, __TILE_HOLD_MS__);
 }, true);
 addEventListener("keyup", (e) => {
@@ -543,8 +546,12 @@ addEventListener("keyup", (e) => {
   clearTimeout(at.timer);
   if (at.done) return;
   e.preventDefault();
+  // A busy page can run the hold's timer late, after the release: an OK
+  // held as long as a hold still plays.
+  const held = performance.now() - at.started;
+  if (held >= __TILE_HOLD_MS__) { holdPlay(at, "release"); return; }
   at.tile.click();
-  console.info("pharos: keys: tile ok verdict=open held_ms=" + Math.round(performance.now() - at.started));
+  console.info("pharos: keys: tile ok verdict=open held_ms=" + Math.round(held));
 }, true);
 "#;
 
@@ -1312,6 +1319,15 @@ mod tests {
             press.contains("at.tile.click();") && !press.contains("at.play.click();"),
             "a press opens the title page: {press}"
         );
+        // An OK released after a full hold plays, even when the hold's
+        // timer has not run yet.
+        assert!(
+            press.contains(&format!(
+                "if (held >= {TILE_HOLD_MS}) {{ holdPlay(at, \"release\"); return; }}"
+            )),
+            "{press}"
+        );
+        assert!(held.contains(r#"holdPlay(at, "timer");"#), "{held}");
         // A hold dropped by a focus or page change neither plays nor opens.
         for drop in [
             r#"addEventListener("focusout""#,
