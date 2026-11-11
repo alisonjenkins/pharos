@@ -868,6 +868,7 @@ mod tests {
         let mut back = Queue::restore(&q.save()).unwrap();
         let first = back.shuffle_album(vec![track(10)], 3).unwrap();
         assert_eq!(first, ItemRef::Real(10));
+        assert!(!back.restored);
         back.started(first, None, 0);
         assert!(back.upcoming().is_empty(), "{:?}", ids(&back));
     }
