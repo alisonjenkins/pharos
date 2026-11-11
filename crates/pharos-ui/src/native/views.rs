@@ -696,6 +696,13 @@ pub fn PlaybackFailure(
     on_report: Option<EventHandler<()>>,
 ) -> Element {
     let skip = failure.skip_to_ms.zip(on_skip);
+    // The way forward leads: Skip past damage when offered (B1160), else
+    // Try again (B1364).
+    let retry_class = if skip.is_some() {
+        "pharos-playback-failure-retry pharos-button is-on-video"
+    } else {
+        "pharos-playback-failure-retry pharos-button"
+    };
     rsx! {
         div { class: "pharos-playback-failure", role: "alert", "data-kind": failure.kind.label(),
             p { class: "pharos-playback-failure-title", "{failure.headline}" }
@@ -703,7 +710,7 @@ pub fn PlaybackFailure(
             div { class: "pharos-playback-failure-actions",
                 if let Some((to_ms, on_skip)) = skip {
                     button {
-                        class: "pharos-playback-failure-skip",
+                        class: "pharos-playback-failure-skip pharos-button",
                         r#type: "button",
                         // Trying again only breaks at the same place.
                         autofocus: true,
@@ -712,7 +719,7 @@ pub fn PlaybackFailure(
                     }
                 }
                 button {
-                    class: "pharos-playback-failure-retry",
+                    class: "{retry_class}",
                     r#type: "button",
                     // A remote or keyboard lands on the way forward (TV, Quest).
                     autofocus: skip.is_none(),
@@ -720,14 +727,14 @@ pub fn PlaybackFailure(
                     "Try again"
                 }
                 button {
-                    class: "pharos-playback-failure-back",
+                    class: "pharos-playback-failure-back pharos-button is-on-video",
                     r#type: "button",
                     onclick: move |_| on_back.call(()),
                     "Back"
                 }
                 if let Some(on_report) = on_report {
                     button {
-                        class: "pharos-playback-failure-report",
+                        class: "pharos-playback-failure-report pharos-button is-on-video",
                         r#type: "button",
                         onclick: move |_| on_report.call(()),
                         "Report a problem"
@@ -2195,6 +2202,52 @@ mod tests {
             "{html}"
         );
         assert!(html.contains(r#"role="alert""#), "{html}");
+    }
+
+    /// B1364/V1335: a playback failure leads with one primary button, the
+    /// skip past damage when offered, else Try again; the rest are on-video
+    /// buttons. Disarm check: give Try again the primary class always.
+    #[test]
+    fn a_playback_failure_has_one_primary_button() {
+        let primary = |html: &str| -> Vec<String> {
+            html.split("<button ")
+                .skip(1)
+                .filter_map(|b| b.split_once("class=\"")?.1.split('"').next())
+                .filter(|c| c.contains("pharos-button") && !c.contains("is-on-video"))
+                .map(str::to_owned)
+                .collect()
+        };
+        let damaged = render(|| {
+            rsx! {
+                PlaybackFailure {
+                    failure: PlayFailure::damaged("code 3", Some(615_000)),
+                    on_retry: |_| {},
+                    on_back: |_| {},
+                    on_skip: |_| {},
+                    on_report: |_| {},
+                }
+            }
+        });
+        assert_eq!(
+            primary(&damaged),
+            vec!["pharos-playback-failure-skip pharos-button".to_owned()],
+            "{damaged}"
+        );
+        let network = render(|| {
+            rsx! {
+                PlaybackFailure {
+                    failure: PlayFailure::stream(FailureKind::Network, "networkError"),
+                    on_retry: |_| {},
+                    on_back: |_| {},
+                    on_report: |_| {},
+                }
+            }
+        });
+        assert_eq!(
+            primary(&network),
+            vec!["pharos-playback-failure-retry pharos-button".to_owned()],
+            "{network}"
+        );
     }
 
     /// B1160: media that would not decode offers a skip past it, first and
