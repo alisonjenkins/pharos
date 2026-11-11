@@ -376,7 +376,20 @@ compat-dioxus-full native="on" port="8096" config="playwright.dioxus.config.ts":
       echo "compat-dioxus-full: pharos not ready on 127.0.0.1:{{ port }} after 120s" >&2
       exit 1
     fi
-    nix develop --command bash -c 'cd compat-playwright && PHAROS_URL=http://127.0.0.1:{{ port }} npx playwright test --config {{ config }}'
+    # PLAYWRIGHT_SHARD=i/n runs one slice of the suite against this server
+    # (CI splits the native-on run over several runners). Sharding needs
+    # --fully-parallel to split inside a spec file, which is where most of the
+    # suite lives; each shard still runs its tests in order on one worker.
+    SHARD_ARGS=""
+    if [[ -n "${PLAYWRIGHT_SHARD:-}" ]]; then
+      if [[ ! "$PLAYWRIGHT_SHARD" =~ ^[1-9][0-9]*/[1-9][0-9]*$ ]]; then
+        echo "compat-dioxus-full: PLAYWRIGHT_SHARD must be i/n, got '$PLAYWRIGHT_SHARD'" >&2
+        exit 2
+      fi
+      SHARD_ARGS="--fully-parallel --shard=$PLAYWRIGHT_SHARD"
+      echo "compat-dioxus-full: running shard $PLAYWRIGHT_SHARD"
+    fi
+    nix develop --command bash -c "cd compat-playwright && PHAROS_URL=http://127.0.0.1:{{ port }} npx playwright test --config {{ config }} $SHARD_ARGS"
 
 # Convenience: spin up pharos with seeded data + run Playwright in one
 # shot. Uses a fresh tmp sqlite db so prior state doesn't leak.
